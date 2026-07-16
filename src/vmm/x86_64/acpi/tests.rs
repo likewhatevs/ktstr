@@ -70,6 +70,7 @@ fn acpi_rejects_slit_dominated_overflow_at_extreme_numa() {
         numa_nodes: 512,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let layout = test_layout(&topo, 512);
     let err = setup_acpi(&mem, &topo, &layout, false, 0, false)
@@ -96,6 +97,7 @@ fn acpi_rejects_cpu_table_overflow_at_extreme_vcpu_count() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let layout = test_layout(&topo, 256);
     let err = setup_acpi(&mem, &topo, &layout, false, 0, false)
@@ -120,6 +122,7 @@ fn acpi_rejects_total_overflow_when_slit_alone_fits() {
         numa_nodes: 361,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let layout = test_layout(&topo, 361);
     let err = setup_acpi(&mem, &topo, &layout, false, 0, false)
@@ -144,6 +147,7 @@ fn acpi_tables_fit_at_wide_smp_topology() {
         numa_nodes: 16,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 4096);
     let end = l.xsdt_addr + l.xsdt_size;
@@ -164,6 +168,7 @@ fn rsdp_signature_and_checksum() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let mut rsdp = [0u8; 20];
@@ -184,6 +189,7 @@ fn rsdt_signature_and_checksum() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let rsdt = read_table(&mem, l.rsdt_addr);
@@ -202,6 +208,7 @@ fn madt_signature_and_checksum() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let madt = read_madt(&mem, &l);
@@ -220,6 +227,7 @@ fn madt_has_correct_cpu_count() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let madt = read_madt(&mem, &l);
@@ -241,6 +249,7 @@ fn madt_apic_ids_match_topology() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let madt = read_madt(&mem, &l);
@@ -274,6 +283,7 @@ fn madt_has_ioapic() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let madt = read_madt(&mem, &l);
@@ -297,6 +307,7 @@ fn rsdp_points_to_rsdt() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let mut rsdp = [0u8; 20];
@@ -318,6 +329,7 @@ fn rsdt_table_pointers() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let mut entry = [0u8; 4];
@@ -357,6 +369,7 @@ fn pci_enabled_emits_mcfg_and_prt_dsdt() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     // Non-PCI baseline: header-only DSDT, no MCFG, 4-entry RSDT.
     let mem_base = test_mem(16);
@@ -434,6 +447,7 @@ fn pci_with_hmat_table_count() {
         numa_nodes: 2,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup_pci(&mem, &topo, 256, 1);
     assert!(l.hmat_size > 0, "HMAT emitted for multi-NUMA");
@@ -468,6 +482,7 @@ fn setup_acpi_emits_one_prt_route_per_nic() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let mem = test_mem(16);
     let l = test_setup_pci(&mem, &topo, 256, 3);
@@ -503,6 +518,7 @@ fn setup_acpi_emits_blk_prt_route_when_disk_attached() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let mem = test_mem(16);
     let layout = test_layout(&topo, 256);
@@ -547,6 +563,7 @@ fn setup_acpi_emits_no_blk_prt_route_without_disk() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let mem = test_mem(16);
     let layout = test_layout(&topo, 256);
@@ -570,6 +587,7 @@ fn madt_has_iso_irq0_gsi2() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let madt = read_madt(&mem, &l);
@@ -589,6 +607,7 @@ fn madt_has_nmi() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let madt = read_madt(&mem, &l);
@@ -606,6 +625,7 @@ fn small_topology_uses_lapic_entries() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let madt = read_madt(&mem, &l);
@@ -626,6 +646,7 @@ fn large_topology_uses_mixed_entries() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let mut has_low = false;
     let mut has_high = false;
@@ -660,6 +681,7 @@ fn x2apic_nmi_fields_correct() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let madt = read_madt(&mem, &l);
@@ -684,6 +706,7 @@ fn lapic_nmi_fields_correct() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let madt = read_madt(&mem, &l);
@@ -718,6 +741,7 @@ fn madt_checksum_representative_topologies() {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let l = test_setup(&mem, &topo, 256);
         let madt = read_madt(&mem, &l);
@@ -747,6 +771,7 @@ fn cpu_entry_type_matches_apic_id() {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let l = test_setup(&mem, &topo, 256);
         let madt = read_madt(&mem, &l);
@@ -782,6 +807,7 @@ fn madt_entry_lengths_valid() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let madt = read_madt(&mem, &l);
@@ -810,6 +836,7 @@ fn madt_total_length_matches_entries() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let madt = read_madt(&mem, &l);
@@ -833,6 +860,7 @@ fn cpu_flags_enabled() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let madt = read_madt(&mem, &l);
@@ -856,6 +884,7 @@ fn rsdp_rev2_structure() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let mut rsdp = [0u8; 36];
@@ -888,6 +917,7 @@ fn xsdt_signature_and_checksum() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let xsdt = read_table(&mem, l.xsdt_addr);
@@ -907,6 +937,7 @@ fn xsdt_table_pointers() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let mut entry = [0u8; 8];
@@ -934,6 +965,7 @@ fn fadt_signature_and_checksum() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let mut fadt = [0u8; 276];
@@ -956,6 +988,7 @@ fn fadt_hw_reduced_flags() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let mut fadt = [0u8; 276];
@@ -983,6 +1016,7 @@ fn fadt_pm_register_blocks() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let mut fadt = [0u8; 276];
@@ -1054,6 +1088,7 @@ fn fadt_extended_gas_blocks_are_zero() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let mut fadt = [0u8; 276];
@@ -1077,6 +1112,7 @@ fn fadt_minor_version() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let mut fadt = [0u8; 276];
@@ -1095,6 +1131,7 @@ fn fadt_dsdt_pointers() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let mut fadt = [0u8; 276];
@@ -1120,6 +1157,7 @@ fn dsdt_signature_and_checksum() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let mut dsdt = [0u8; 36];
@@ -1141,6 +1179,7 @@ fn rsdp_points_to_xsdt() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let mut rsdp = [0u8; 36];
@@ -1182,6 +1221,7 @@ fn srat_cpu_affinity_multi_numa() {
             numa_nodes,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let l = test_setup(&mem, &topo, 256);
         let srat = read_table(&mem, l.srat_addr);
@@ -1221,6 +1261,7 @@ fn srat_memory_split_multi_numa() {
             numa_nodes,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let mem_bytes = 256u64 << 20;
         let l = test_setup(&mem, &topo, 256);
@@ -1267,6 +1308,7 @@ fn slit_distance_matrix_multi_numa() {
             numa_nodes,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let l = test_setup(&mem, &topo, 256);
         let slit = read_table(&mem, l.slit_addr);
@@ -1300,6 +1342,7 @@ fn srat_slit_checksum_multi_numa() {
             numa_nodes,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let l = test_setup(&mem, &topo, 256);
         let srat = read_table(&mem, l.srat_addr);
@@ -1338,6 +1381,7 @@ fn srat_memory_split_remainder() {
         numa_nodes: 3,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let mem_bytes = (memory_mib as u64) << 20;
     let first_two = 86u64 << 20; // 43 hugepages each
@@ -1382,6 +1426,7 @@ fn srat_total_memory() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     let srat = read_table(&mem, l.srat_addr);
@@ -1415,6 +1460,7 @@ fn hmat_not_emitted_single_node() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     assert_eq!(l.hmat_size, 0, "HMAT must not be emitted for single-node");
@@ -1430,6 +1476,7 @@ fn hmat_emitted_multi_numa_without_cxl() {
         numa_nodes: 2,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let l = test_setup(&mem, &topo, 256);
     assert!(l.hmat_size > 0, "HMAT must be emitted for multi-NUMA");

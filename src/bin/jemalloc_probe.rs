@@ -83,11 +83,9 @@
 //! It cannot escalate to adjacent processes — each invocation names
 //! exactly one target and exits when that target is detached.
 
-// The global allocator (jemalloc) is provided centrally by the ktstr
-// library crate (`extern crate self as ktstr` in src/lib.rs). This probe
-// links ktstr (for `ktstr::test_support` / `ktstr::cli` / `ktstr::assert`),
-// so it inherits jemalloc without declaring its own `#[global_allocator]`,
-// keeping allocator policy uniform across the workspace's shipped binaries.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1199,6 +1197,7 @@ fn append_probe_output_to_sidecar(path: &Path, out: &ProbeOutput, exit_code: i32
 }
 
 fn main() {
+    ktstr::host_heap::mark_jemalloc_global_allocator();
     // Restore SIGPIPE so piping the probe's JSON output to `jq |
     // less` or similar doesn't panic inside `print!`.
     ktstr::cli::restore_sigpipe_default();
@@ -2217,6 +2216,8 @@ mod tests {
             periodic_target: 0,
             vcpus: 1,
             cpu_budget: 1,
+            host_dilation: None,
+            throughput_denomination: ktstr::test_support::ThroughputDenomination::CpuSec,
             stimulus_events: Vec::new(),
             work_type: "SpinWait".to_string(),
             verifier_stats: Vec::new(),

@@ -52,39 +52,15 @@ pub struct StimulusEvent {
     pub detail: Option<String>,
     /// Cumulative worker iterations at this event. `Some(_)` for every
     /// event built from the wire (the wire counter is always present —
-    /// see [`Self::from_wire`]); a cumulative counter for which
-    /// `Some(0)` is a legitimate "no iterations accumulated yet"
-    /// baseline, NOT a missing sample. `None` only for synthetic /
-    /// placeholder events that carry no counter (the
-    /// `phase_from_bucket` fallback and test fixtures). Used to
-    /// compute per-phase throughput (iterations/s) as the delta
-    /// between consecutive events.
+    /// see [`Self::from_wire`]); `Some(0)` is a legitimate "no iterations
+    /// accumulated yet" value. `None` is reserved for synthetic or
+    /// placeholder events.
     ///
-    /// SEMANTICS: this is the sum of the iteration counters of the
-    /// worker handles ALIVE at the event instant (step-local +
-    /// Backdrop). Each step emits BOTH a StepStart event (counter at the
-    /// step's start) and a StepEnd event ([`Self::is_step_end`], counter
-    /// at the step's end-of-hold), so the per-phase iteration_rate is the
-    /// STEP-LOCAL delta `StepEnd[k] - StepStart[k]` — each step's OWN
-    /// workers measured start-to-end. That works for workers respawned
-    /// per step (the cross-step `StepStart[k+1] - StepStart[k]` delta
-    /// reads fresh~0 - fresh~0 and is dropped) AND is more accurate for
-    /// persistent (Backdrop) workers (it excludes the inter-step
-    /// teardown/respawn wall-time the cross-step window spanned). Bucket
-    /// `k` is sourced ONLY by its `StepStart[k] -> StepEnd[k]` pair: the
-    /// `iteration_rate` attribution loop in
-    /// [`crate::assert::build_phase_buckets_with_stimulus`] skips any
-    /// `is_step_end` `prev`, so a stalled step whose step-local delta is
-    /// zero (`StepEnd[k] == StepStart[k]`) reports its MEASURED-ZERO rate
-    /// `Some(0.0)` (see `Self::rate_to`) rather than leaking the
-    /// inter-step gap rate from the `StepEnd[k] -> StepStart[k+1]` pair.
-    /// The monitor-only
-    /// [`Timeline::build`] fallback (no snapshot captures) computes the
-    /// SAME step-local `StepStart[k] -> StepEnd[k]` rate — the StepEnd
-    /// events reach it too (they are emitted independent of captures) — and
-    /// falls back to cross-step (or the terminal for the last step) only
-    /// when a step has no StepEnd (sched-died / legacy data); StepEnd is
-    /// filtered only from that path's phase LAYOUT, not its rate.
+    /// This raw boundary telemetry is not divided by `elapsed_ms`.
+    /// `iteration_rate` has one definition throughout ktstr:
+    /// iterations per delivered guest CPU-second from matching per-cgroup
+    /// phase carriers. Deriving another rate here would reintroduce a
+    /// host-contention-sensitive wall-throughput metric.
     pub total_iterations: Option<u64>,
     /// 1-indexed scenario step this event belongs to (the same
     /// encoding the bridge stamps: `1..=N` for Step ordinals), or
@@ -97,23 +73,9 @@ pub struct StimulusEvent {
     pub step_index: Option<u16>,
     /// True only for the synthetic scenario-end boundary the eval
     /// walker appends from the `ScenarioEnd` wire frame's final
-    /// `total_iterations`. On a CLEAN run the last step emits its own
-    /// `StepEnd[N]`, which supplies that step's `iteration_rate` right
-    /// boundary in BOTH rate consumers — the snapshot path
-    /// ([`crate::assert::build_phase_buckets_with_stimulus`], the
-    /// `StepStart[N]` -> `StepEnd[N]` pair) and the monitor-only
-    /// [`Timeline::build`] fallback (which looks up each step's `StepEnd`
-    /// by `step_index`) — and the terminal is then NOT consumed for a
-    /// rate: the snapshot path's attribution loop skips the
-    /// `(StepEnd[N], terminal)` pair via its `is_step_end` guard (before
-    /// `rate_components` is reached), and `Timeline::build` reaches for the
-    /// terminal only when a step's `StepEnd` lookup misses. The terminal
-    /// is consumed as a step's rate boundary ONLY for legacy/synthetic
-    /// data that carries a `ScenarioEnd` frame but no `StepEnd` frames
-    /// (fresh guest output always pairs them). A sched-died step is NOT
-    /// such a case: its early return skips BOTH the `StepEnd` emission AND
-    /// `send_scenario_end`, so neither frame exists and the dead step
-    /// reports no rate via the no-successor path. It is NOT a step start:
+    /// `total_iterations`. It is retained for raw timeline completeness and
+    /// legacy consumers, but is not a denominator for `iteration_rate`. It is
+    /// not a step start:
     /// `step_index` is `None` so it seeds no [`crate::assert::PhaseBucket`]
     /// (excluded from the step-start timeline), and [`Timeline::build`]
     /// skips it when laying out phase boundaries so it never renders a
@@ -123,12 +85,8 @@ pub struct StimulusEvent {
     /// `crate::vmm::wire::MsgType::StepEnd` frame via
     /// [`Self::from_step_end`]). It carries the SAME 1-indexed
     /// `step_index` as its StepStart and its step's end-of-hold
-    /// `total_iterations`, so [`crate::assert::build_phase_buckets_with_stimulus`]'s
-    /// elapsed-sorted `windows(2)` pairs `StepStart[k]` -> `StepEnd[k]`
-    /// first and `or_insert` keeps that step-local rate. NOT a step
-    /// start, so [`Timeline::build`] (the monitor-only fallback's
-    /// index-based cross-step pairing) filters it out of its step-start
-    /// list to avoid a phantom phase.
+    /// `total_iterations`. It is not a step start, so [`Timeline::build`]
+    /// filters it out of its step-start list to avoid a phantom phase.
     pub is_step_end: bool,
 }
 
@@ -147,15 +105,9 @@ impl StimulusEvent {
     /// phase-bucket remap. `total_iterations` is carried verbatim as
     /// `Some(_)`: the wire field is a cumulative counter that is always
     /// populated (the guest sums live worker iterations at every step
-    /// boundary), so `0` is a legitimate baseline reading — the FIRST
-    /// step's frame fires right after its workers spawn and genuinely
-    /// reads ~0. Collapsing that `0` to `None` (the old behavior) made
-    /// the (first, second) delta pair fail the `Some`/`Some` guard in
-    /// both rate consumers, silently dropping the first step's
-    /// `iteration_rate`; carrying `Some(0)` lets the delta compute the
-    /// first step's throughput for the PERSISTENT (Backdrop) population
-    /// (see the `total_iterations` field doc for the persistent-vs-
-    /// step-local semantics this delta measures).
+    /// boundary), so `0` is a legitimate baseline reading — the first
+    /// step's frame fires right after its workers spawn and may genuinely
+    /// read zero.
     pub fn from_wire(ev: &crate::vmm::wire::StimulusEvent) -> Self {
         Self {
             elapsed_ms: ev.elapsed_ms as u64,
@@ -176,12 +128,8 @@ impl StimulusEvent {
     /// frame (reuses the `crate::vmm::wire::StimulusEvent` wire body).
     /// Carries the SAME 1-indexed `step_index` as the step's StepStart
     /// and the step's end-of-hold `total_iterations`, with `is_step_end`
-    /// set. Elapsed-sorted, a step's events order `StepStart[k]` (start) <
-    /// `StepEnd[k]` (end-of-hold) < `StepStart[k+1]`, so
-    /// [`crate::assert::build_phase_buckets_with_stimulus`]'s `windows(2)`
-    /// pairs `StepStart[k]` -> `StepEnd[k]` first and `or_insert` keeps that
-    /// step-local rate. `is_terminal` is false (it is a real per-step
-    /// boundary, not the scenario-end terminal).
+    /// set. `is_terminal` is false (it is a real per-step boundary, not the
+    /// scenario-end terminal).
     pub fn from_step_end(ev: &crate::vmm::wire::StimulusEvent) -> Self {
         Self {
             elapsed_ms: ev.elapsed_ms as u64,
@@ -201,13 +149,7 @@ impl StimulusEvent {
     /// Build the synthetic terminal boundary event from the
     /// `ScenarioEnd` wire frame's final cumulative `total_iterations`
     /// and scenario-relative `elapsed_ms`. Appended once, after every
-    /// per-step [`Self::from_wire`] event. On a clean run `StepEnd[N]`
-    /// supplies the last step's `iteration_rate` right boundary in both
-    /// rate consumers and the terminal is not consumed for a rate; it is
-    /// consumed as a step's boundary ONLY for legacy/synthetic data with a
-    /// `ScenarioEnd` frame but no `StepEnd` frames (a sched-died step has
-    /// neither, since the early return skips both emissions) — see the
-    /// [`Self::is_terminal`] field doc.
+    /// per-step [`Self::from_wire`] event.
     /// `step_index` is `None` (it is not a step start — it seeds no
     /// [`crate::assert::PhaseBucket`]) and `is_terminal` is set so
     /// [`Timeline::build`] treats it as a right boundary only, never a
@@ -225,67 +167,6 @@ impl StimulusEvent {
             is_terminal: true,
             is_step_end: false,
         }
-    }
-
-    /// Iterations-per-second from this event to `next`:
-    /// `(next.total_iterations - self.total_iterations)` over the
-    /// guest-clock elapsed-ms delta between them. Returns `None` ONLY when
-    /// the measurement is genuinely undefined: either event lacks a
-    /// `total_iterations` sample, the window is zero-length, or the count
-    /// went BACKWARD (`next < self` — a counter reset; the delta is
-    /// unmeasurable, not zero). The backward case is reachable only for the
-    /// guard-skipped cross-step pairing or legacy/synthetic data, NOT for
-    /// the live step-local `StepStart[k]` -> `StepEnd[k]` pair: teardown
-    /// runs after `StepEnd` is emitted, so the handle set is stable within
-    /// a step and the per-worker counters are monotone across the pair.
-    ///
-    /// MEASURED ZERO is distinct from not-measured: a step whose workers
-    /// made exactly zero forward progress over a positive hold
-    /// (`next == self`) returns `Some(0.0)`, not `None`. Zero throughput
-    /// is a real, measured value — the strongest degradation signal — so
-    /// it must surface, not vanish. With `Some(0.0)` a phase that
-    /// collapsed to zero IS visible to the throughput-degradation detector
-    /// ([`Timeline::build`] / [`Timeline::from_phase_buckets`]): when the
-    /// prior phase had a positive rate (`before > 0.0`), the relative
-    /// delta is `-1.0` and the drop is flagged. (A phase that was already
-    /// zero before is still not relatively comparable — the detector's
-    /// `before > 0.0` gate avoids a div-by-zero — but an *unchanged* zero
-    /// is not a degradation.)
-    ///
-    /// This is the SINGLE iteration-rate formula, shared via its
-    /// decomposition [`Self::rate_components`] by
-    /// [`crate::assert::build_phase_buckets_with_stimulus`] (per-step
-    /// windows attributed by `step_index`) and [`Timeline::build`]
-    /// (per-phase windows attributed by index) — the two callers pair
-    /// events differently but must compute the rate identically. The
-    /// per-step metric producer inserts the `rate_components` pair (the
-    /// `iteration_rate` Rate's `total_phase_iterations` /
-    /// `total_phase_duration_sec` components); `rate_to` (the quotient) is
-    /// the display/comparison form used by `Timeline::build` and the
-    /// result-helper ratios.
-    pub fn rate_to(&self, next: &StimulusEvent) -> Option<f64> {
-        self.rate_components(next).map(|(iters, secs)| iters / secs)
-    }
-
-    /// The `(iteration_delta, window_seconds)` components of [`Self::rate_to`]
-    /// — same `None` conditions (missing `total_iterations`, backward count,
-    /// or zero-length window). The per-phase metric pipeline inserts these as
-    /// the `total_phase_iterations` / `total_phase_duration_sec` Counter
-    /// components rather than the ready ratio, so the `iteration_rate` Rate
-    /// re-pools across phases/runs as `Σdelta / Σseconds`, not a mean of
-    /// per-phase ratios. The ms→s `/1000` lives HERE (the seconds component)
-    /// because `derive_rate_metrics` does a bare num/den with no scaling.
-    pub fn rate_components(&self, next: &StimulusEvent) -> Option<(f64, f64)> {
-        let s = self.total_iterations?;
-        let e = next.total_iterations?;
-        if e < s {
-            return None;
-        }
-        let duration_ms = next.elapsed_ms.saturating_sub(self.elapsed_ms);
-        if duration_ms == 0 {
-            return None;
-        }
-        Some(((e - s) as f64, duration_ms as f64 / 1000.0))
     }
 
     /// The scenario [`Phase`](crate::assert::Phase) this event belongs to,
@@ -338,12 +219,14 @@ pub struct PhaseMetrics {
     pub avg_nr_running: Option<f64>,
     pub max_dsq_depth: u32,
     pub stuck_count: usize,
-    /// select_cpu_fallback events per second. None when event counters unavailable.
+    /// select_cpu_fallback events per mean delivered vCPU CPU-second.
+    /// `None` when event counters or complete endpoint CPU clocks are unavailable.
     pub fallback_rate: Option<f64>,
-    /// dispatch_keep_last events per second. None when event counters unavailable.
+    /// dispatch_keep_last events per mean delivered vCPU CPU-second.
+    /// `None` under the same conditions as [`Self::fallback_rate`].
     pub keep_last_rate: Option<f64>,
-    /// Worker iterations per second during this phase. Computed from
-    /// cumulative iteration counts in consecutive stimulus events.
+    /// Worker iterations per delivered guest CPU-second during this phase.
+    /// Derived from matching guest per-cgroup iteration and CPU-time carriers.
     pub iteration_rate: Option<f64>,
 }
 
@@ -418,9 +301,9 @@ const DSQ_THRESHOLD: f64 = 3.0;
 /// Minimum delta in mean runqueue depth (avg_nr_running) to flag a change:
 /// one additional runnable task per CPU on average between phases.
 const NR_RUNNING_THRESHOLD: f64 = 1.0;
-/// Minimum delta in fallback rate (events/s) to flag a change.
+/// Minimum delta in fallback rate (events/vCPU-second) to flag a change.
 const FALLBACK_RATE_THRESHOLD: f64 = 10.0;
-/// Minimum delta in keep_last rate (events/s) to flag a change.
+/// Minimum delta in keep_last rate (events/vCPU-second) to flag a change.
 const KEEP_LAST_RATE_THRESHOLD: f64 = 10.0;
 /// Minimum relative change in iteration rate to flag a throughput change.
 /// 0.3 = 30% drop or increase.
@@ -461,14 +344,12 @@ fn detect_change(
 /// Per-boundary change set between two adjacent phases, shared by both
 /// [`Timeline::build`] and [`Timeline::from_phase_buckets`].
 ///
-/// Throughput (`iteration_rate`) is compared whenever BOTH phases carry
-/// a rate and the earlier one is positive — INCLUDING a synthesized
-/// zero-capture step, whose rate is stimulus-derived (total_iterations
-/// deltas) rather than sampled. Throughput is the one metric that
-/// survives a capture gap, so a throughput collapse entering or leaving
-/// a synthesized step must still be flagged; gating it on `sample_count`
-/// (as both call sites did before) silently dropped exactly the
-/// degradation this timeline exists to surface.
+/// Iteration efficiency (`iteration_rate`) is compared whenever BOTH phases
+/// carry a guest-carrier-derived CPU rate and the earlier one is positive —
+/// INCLUDING a synthesized zero-capture step. It survives a capture gap because
+/// its iteration and delivered-CPU components do not depend on periodic
+/// captures; gating it on `sample_count` would silently drop a real phase
+/// transition.
 ///
 /// Asymmetry from the `bi > 0.0` div-by-zero guard: a COLLAPSE into a
 /// zero-rate (incl. a synthesized measured-zero) step is flagged
@@ -484,8 +365,8 @@ fn detect_change(
 /// windows fold into the bucket), but they come from a DIFFERENT
 /// sampling basis (folded monitor window vs captured periodic samples)
 /// than a captured neighbor's, so cross-comparing them is
-/// apples-to-oranges — suppressed. Throughput is exempt because it is
-/// the same stimulus-derived quantity on both sides.
+/// apples-to-oranges — suppressed. Iteration efficiency is exempt because it
+/// uses the same guest-carrier currency on both sides.
 fn detect_boundary_changes(before: &PhaseMetrics, after: &PhaseMetrics) -> Vec<PhaseChange> {
     let mut changes = Vec::new();
 
@@ -631,14 +512,6 @@ impl Timeline {
         // The last event to end-of-data is also a phase.
         let last_monitor_ms = monitor_samples.last().map(|s| s.elapsed_ms).unwrap_or(0);
 
-        // The terminal scenario-end event is a rate right
-        // boundary ONLY — it seeds no phase. Extract it explicitly
-        // rather than relying on it sorting last for positional
-        // alignment: a corrupt / out-of-order step `elapsed_ms` (a u32
-        // read off the wire) could otherwise shift it into the middle
-        // of `events` and misalign the dense phase index against the
-        // step events. `step_events` is the phase-bearing set.
-        let terminal: Option<&StimulusEvent> = events.iter().find(|e| e.is_terminal);
         // StepStart events only — the PHASE-LAYOUT set. Per-step StepEnd
         // events are excluded here because a StepEnd seeds no new phase
         // (it is an end-of-hold marker, not a step boundary); including
@@ -711,55 +584,6 @@ impl Timeline {
                 per_cgroup: std::collections::BTreeMap::new(),
                 not_measured_window: false,
             });
-        }
-
-        // Per-phase iteration rate, STEP-LOCAL: each step's rate is its
-        // own `StepStart[k] -> StepEnd[k]` delta — the step's OWN workers
-        // measured start-to-end-of-hold, matching the snapshot path
-        // (`build_phase_buckets_with_stimulus`). StepEnd events are
-        // present in `events` (emitted independent of snapshot captures)
-        // even on this monitor-only path, so the same step-local model
-        // applies; without it, workers respawned fresh each step read
-        // ~0 -> ~0 cross-step and every fresh-per-step phase but the last
-        // silently reported no throughput. A step with NO StepEnd falls
-        // back to the cross-step successor, or the terminal scenario-end
-        // event for the last step — but that fallback yields a rate only
-        // for legacy/synthetic data (a ScenarioEnd frame present without
-        // per-step StepEnd frames). A sched-died step has neither a
-        // StepEnd nor a terminal (the early return skips both emissions),
-        // so its lookup and fallback both miss and it correctly reports no
-        // rate. Duration is the guest-clock elapsed-ms delta between the
-        // paired events — independent of the metric-sample window above
-        // (whose last phase reaches end-of-monitor-data).
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..phases.len() {
-            let this = step_events[i];
-            // Step-local boundary: this step's own StepEnd (same
-            // step_index). Cross-step successor / terminal only when the
-            // step has no StepEnd.
-            let step_end: Option<&StimulusEvent> = this.step_index.and_then(|k| {
-                events
-                    .iter()
-                    .find(|e| e.is_step_end && e.step_index == Some(k))
-            });
-            let next: Option<&StimulusEvent> = step_end.or_else(|| {
-                if i + 1 < step_events.len() {
-                    Some(step_events[i + 1])
-                } else {
-                    terminal
-                }
-            });
-            // Timeline::build's display fallback: compute this phase's rate
-            // directly via rate_to. The metric-pipeline producer
-            // build_phase_buckets_with_stimulus shares the same rate
-            // semantics via rate_components (it emits the two Counter
-            // components that derive_rate_metrics re-pools into
-            // iteration_rate); this display field reads the quotient.
-            if let Some(next_ev) = next
-                && let Some(rate) = this.rate_to(next_ev)
-            {
-                phases[i].metrics.iteration_rate = Some(rate);
-            }
         }
 
         // Detect changes at each phase boundary. Throughput is compared
@@ -897,36 +721,21 @@ impl Timeline {
                         .map_or_else(|| "n/a".to_string(), |v| format!("{v:.1}")),
                 ));
                 if let Some(fb) = m.fallback_rate {
-                    out.push_str(&format!(" | fallback: {:.0}/s", fb));
+                    out.push_str(&format!(" | fallback: {:.0}/vcpu-s", fb));
                 }
                 if let Some(kl) = m.keep_last_rate {
-                    out.push_str(&format!(" | keep_last: {:.0}/s", kl));
+                    out.push_str(&format!(" | keep_last: {:.0}/vcpu-s", kl));
                 }
                 if let Some(ir) = m.iteration_rate {
-                    // A synthesized (sample_count==0) step's rate is
-                    // stimulus-derived; label it consistently with the
-                    // no-monitor-metrics branch below.
-                    let suffix = if m.sample_count == 0 {
-                        " (stimulus-derived)"
-                    } else {
-                        ""
-                    };
-                    out.push_str(&format!(" | throughput: {ir:.0} iter/s{suffix}"));
+                    out.push_str(&format!(" | iteration rate: {ir:.0} iter/cpu-s"));
                 }
                 out.push('\n');
                 if m.stuck_count > 0 {
                     out.push_str(&format!("  stuck: {}\n", m.stuck_count));
                 }
             } else if let Some(ir) = m.iteration_rate {
-                // Synthesized zero-capture step (the
-                // build_phase_buckets_with_stimulus seam): no periodic
-                // captures landed, but the stimulus StepStart/StepEnd
-                // deltas still yield a throughput. Surface it so a short
-                // interior step's recovered rate is visible in the
-                // rendered timeline, not only via the structured
-                // phase_metric API.
                 out.push_str(&format!(
-                    "  [no samples] | throughput: {ir:.0} iter/s (stimulus-derived)\n"
+                    "  [no samples] | iteration rate: {ir:.0} iter/cpu-s\n"
                 ));
             } else {
                 out.push_str("  [no samples]\n");
@@ -978,19 +787,13 @@ impl Timeline {
     /// | `total_keep_last`       | `keep_last_rate` (rate) |
     /// | `iteration_rate`        | `iteration_rate`        |
     ///
-    /// Rate fields (`fallback_rate`, `keep_last_rate`) are computed
-    /// by dividing the bucket's reduced counter delta by the
-    /// bucket's window duration in seconds
-    /// (`(end_ms - start_ms) / 1000.0`). When the window has zero
-    /// duration (degenerate bucket) the rate stays `None`.
+    /// Rate fields (`fallback_rate`, `keep_last_rate`) are divided by mean
+    /// delivered vCPU CPU-seconds. They stay `None` when complete vCPU CPU
+    /// clock coverage is unavailable.
     ///
-    /// Every PhaseMetrics field has a PhaseBucket source — but
-    /// `iteration_rate` only when build_phase_buckets_with_stimulus
-    /// (not the plain build_phase_buckets) produced the bucket.
-    /// `iteration_rate` requires stimulus events that the per-test
-    /// scenario produces; the plain bucket-builder used by some
-    /// tests doesn't have access to them. Defaults to `None` when
-    /// PhaseBucket.metrics has no `iteration_rate` key.
+    /// `iteration_rate` is present only when matching guest per-cgroup phase
+    /// carriers provide both iterations and positive CPU time. It defaults to
+    /// `None` when `PhaseBucket.metrics` has no such rate.
     ///
     /// `changes` (boundary degradation detection) IS computed
     /// here by diffing adjacent `PhaseMetrics` fields — same
@@ -1013,8 +816,7 @@ impl Timeline {
         // it keeps the correlation set to real step starts only.
         // Per-step StepEnd events are likewise excluded so each bucket's
         // rendered op/detail label correlates to the step's defining
-        // StepStart, not its end-of-hold marker (the bucket's iteration_rate
-        // is already the step-local value computed upstream).
+        // StepStart, not its end-of-hold marker.
         let mut sorted_events: Vec<&StimulusEvent> = stimulus_events
             .iter()
             .filter(|e| !e.is_terminal && !e.is_step_end)
@@ -1028,10 +830,10 @@ impl Timeline {
         // with [`Self::build`]. Walks each adjacent (prev, curr) pair and
         // records significant deltas on the LATER phase's `changes` vec so
         // the operator sees "what changed when entering this phase".
-        // Throughput is compared even when a side is a SYNTHESIZED
-        // zero-capture bucket (build_phase_buckets_with_stimulus): its
-        // `iteration_rate` is stimulus-derived and real, so a throughput
-        // collapse entering or leaving it must surface. The monitor-derived
+        // Iteration rate is compared even when a side is a synthesized
+        // zero-capture bucket: a guest carrier is independent of periodic
+        // captures, so an efficiency collapse entering or leaving it must
+        // surface. The monitor-derived
         // metrics (imbalance / dsq depth / fallback / keep_last) stay gated
         // inside the helper on both phases having real samples, so a
         // partial-metric phase never paints a phantom non-throughput change.
@@ -1085,20 +887,6 @@ impl Timeline {
 /// label / op_kind come from the bucket label so the failure-message
 /// renderer prints a recognizable phase header.
 fn phase_from_bucket(b: &crate::assert::PhaseBucket, sorted_events: &[&StimulusEvent]) -> Phase {
-    let duration_s = if b.end_ms > b.start_ms {
-        (b.end_ms - b.start_ms) as f64 / 1000.0
-    } else {
-        0.0
-    };
-    // Rate computation: counter-delta / duration_s. duration_s == 0
-    // disables the rate (None) — degenerate buckets shouldn't
-    // produce spurious infinities.
-    let rate = |key: &str| -> Option<f64> {
-        if duration_s <= 0.0 {
-            return None;
-        }
-        b.metrics.get(key).map(|v| v / duration_s)
-    };
     let metrics = PhaseMetrics {
         sample_count: b.sample_count,
         avg_imbalance: b.metrics.get("avg_imbalance_ratio").copied(),
@@ -1115,13 +903,9 @@ fn phase_from_bucket(b: &crate::assert::PhaseBucket, sorted_events: &[&StimulusE
             .get("stuck_count")
             .map(|v| v.round() as usize)
             .unwrap_or(0),
-        fallback_rate: rate("total_fallback"),
-        keep_last_rate: rate("total_keep_last"),
-        // iteration_rate is a derived Rate: derive_rate_metrics already
-        // placed the Σiterations/Σseconds quotient into the bucket map, so
-        // read it verbatim — do NOT divide by duration (unlike
-        // fallback_rate / keep_last_rate above, which divide their Counter
-        // by the window).
+        fallback_rate: b.metrics.get("fallback_per_vcpu_sec").copied(),
+        keep_last_rate: b.metrics.get("keep_last_per_vcpu_sec").copied(),
+        // Derived rates are already endpoint-matched and pooled in the bucket.
         iteration_rate: b.metrics.get("iteration_rate").copied(),
     };
     let stimulus = if b.step_index == 0 {
@@ -1351,20 +1135,15 @@ pub(crate) fn compute_metrics(
         }
     }
 
-    // Event counter rates: sum counters across CPUs for first/last valid
-    // samples that have event_counters, compute delta / duration.
-    let has_events = |s: &&MonitorSample| s.cpus.iter().any(|c| c.event_counters.is_some());
+    // Event counter rates use the same first/last event samples for the
+    // numerator and mean-vCPU-CPU-time denominator. Host-preempted wall time
+    // contributes neither, so the rate is dilation-resistant.
+    let has_events = |s: &&MonitorSample| s.has_complete_event_counters();
     let first_ev = valid.iter().copied().find(|s| has_events(s));
     let last_ev = valid.iter().copied().rev().find(|s| has_events(s));
 
     let (fallback_rate, keep_last_rate) = match (first_ev, last_ev) {
-        (Some(first), Some(last)) if first.elapsed_ms < last.elapsed_ms => {
-            // `<` guard above is expected to rule out underflow, but
-            // `saturating_sub` is defense-in-depth: if a future change
-            // loosens the guard, the worst outcome becomes
-            // `duration_s == 0.0` (which disables the rate below) rather
-            // than a panic.
-            let duration_s = last.elapsed_ms.saturating_sub(first.elapsed_ms) as f64 / 1000.0;
+        (Some(first), Some(last)) => {
             // Event counters can reset mid-run (scheduler restart) and
             // produce a negative raw delta. Shared helper clamps to
             // >= 0 so the computed rate never goes negative; same
@@ -1379,10 +1158,13 @@ pub(crate) fn compute_metrics(
                 last.sum_event_field(|e| e.dispatch_keep_last).unwrap_or(0),
                 first.sum_event_field(|e| e.dispatch_keep_last).unwrap_or(0),
             );
-            (
-                Some(fb_delta as f64 / duration_s),
-                Some(kl_delta as f64 / duration_s),
-            )
+            match crate::monitor::MonitorSummary::mean_vcpu_cpu_delta_secs(first, last) {
+                Some(vcpu_sec) => (
+                    Some(fb_delta as f64 / vcpu_sec),
+                    Some(kl_delta as f64 / vcpu_sec),
+                ),
+                None => (None, None),
+            }
         }
         _ => (None, None),
     };
@@ -1577,8 +1359,8 @@ mod tests {
         assert!(formatted.contains("imbalance"));
     }
 
-    /// A synthesized zero-capture step (sample_count==0) still renders its
-    /// stimulus-derived throughput in the formatted timeline, not only
+    /// A synthesized zero-capture step (sample_count==0) still renders a
+    /// carrier-derived throughput metric in the formatted timeline, not only
     /// "[no samples]". Pins the synthesized-step visibility in format_phases. The
     /// BASELINE bucket holds step_index 0 (its phase index, the settle
     /// render) so the synthesized step lands at a Phase index that takes
@@ -1608,8 +1390,8 @@ mod tests {
         let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
         let formatted = t.format_with_context(&TimelineContext::default());
         assert!(
-            formatted.contains("throughput: 1500 iter/s (stimulus-derived)"),
-            "a synthesized step must render its stimulus-derived throughput, \
+            formatted.contains("iteration rate: 1500 iter/cpu-s"),
+            "a synthesized step must render its guest-carrier iteration rate, \
              not only '[no samples]'; got:\n{formatted}",
         );
     }
@@ -2386,7 +2168,7 @@ mod tests {
                     ..Default::default()
                 }),
                 schedstat: None,
-                vcpu_cpu_time_ns: None,
+                vcpu_cpu_time_ns: Some(1_000_000_000),
                 vcpu_perf: None,
                 avg_irq_util: None,
                 sched_domains: None,
@@ -2409,7 +2191,7 @@ mod tests {
                     ..Default::default()
                 }),
                 schedstat: None,
-                vcpu_cpu_time_ns: None,
+                vcpu_cpu_time_ns: Some(2_000_000_000),
                 vcpu_perf: None,
                 avg_irq_util: None,
                 sched_domains: None,
@@ -2417,10 +2199,22 @@ mod tests {
         };
         let refs: Vec<&MonitorSample> = vec![&s1, &s2];
         let m = compute_metrics(&refs, 0);
-        // fallback delta: 110 - 10 = 100 over 1.0s = 100.0/s
+        // fallback delta: 100 over 1.0 delivered vCPU CPU-second.
         assert!((m.fallback_rate.unwrap() - 100.0).abs() < 0.01);
-        // keep_last delta: 55 - 5 = 50 over 1.0s = 50.0/s
+        // keep_last delta: 50 over 1.0 delivered vCPU CPU-second.
         assert!((m.keep_last_rate.unwrap() - 50.0).abs() < 0.01);
+
+        let s2_dilated = MonitorSample {
+            elapsed_ms: 100_600,
+            ..s2.clone()
+        };
+        let dilated_refs = vec![&s1, &s2_dilated];
+        let dilated = compute_metrics(&dilated_refs, 0);
+        assert_eq!(
+            dilated.fallback_rate, m.fallback_rate,
+            "100x host wall dilation must not change the vCPU-denominated rate",
+        );
+        assert_eq!(dilated.keep_last_rate, m.keep_last_rate);
     }
 
     #[test]
@@ -2438,7 +2232,7 @@ mod tests {
         // A scheduler restart between samples resets event counters
         // to smaller (or zero) values. Raw `last - first` then
         // produces a negative delta, which would flow into
-        // `fallback_rate = delta / duration` and report a negative
+        // `fallback_rate = delta / vCPU CPU time` and report a negative
         // rate. The shared counter_delta helper clamps to 0.
         use crate::monitor::ScxEventCounters;
 
@@ -2459,7 +2253,7 @@ mod tests {
                     ..Default::default()
                 }),
                 schedstat: None,
-                vcpu_cpu_time_ns: None,
+                vcpu_cpu_time_ns: Some(1_000_000_000),
                 vcpu_perf: None,
                 avg_irq_util: None,
                 sched_domains: None,
@@ -2482,7 +2276,7 @@ mod tests {
                     ..Default::default()
                 }),
                 schedstat: None,
-                vcpu_cpu_time_ns: None,
+                vcpu_cpu_time_ns: Some(2_000_000_000),
                 vcpu_perf: None,
                 avg_irq_util: None,
                 sched_domains: None,
@@ -2564,16 +2358,14 @@ mod tests {
                         ..Default::default()
                     }),
                     schedstat: None,
-                    vcpu_cpu_time_ns: None,
+                    vcpu_cpu_time_ns: Some(i * 100_000_000),
                     vcpu_perf: None,
                     avg_irq_util: None,
                     sched_domains: None,
                 }],
             });
         }
-        // Phase 1: very high fallback rate.
-        // 10 samples over 1s. Counter goes from 0 to 500.
-        // Rate = 500/1.0 = 500/s, well above threshold 10.0.
+        // Phase 1: very high fallback activity per delivered vCPU CPU-second.
         for i in 15..25 {
             samples.push(MonitorSample {
                 bpf_map_fields: Vec::new(),
@@ -2592,7 +2384,7 @@ mod tests {
                         ..Default::default()
                     }),
                     schedstat: None,
-                    vcpu_cpu_time_ns: None,
+                    vcpu_cpu_time_ns: Some(i * 100_000_000),
                     vcpu_perf: None,
                     avg_irq_util: None,
                     sched_domains: None,
@@ -2946,9 +2738,9 @@ mod tests {
 
     // -- detect_boundary_changes: throughput across synthesized steps --
 
-    /// Throughput is flagged across a SYNTHESIZED zero-capture phase
-    /// (sample_count 0) — its iteration_rate is stimulus-derived and
-    /// real — while monitor-derived metrics stay gated on samples, so
+    /// Iteration efficiency is flagged across a synthesized zero-capture
+    /// phase (sample_count 0) when a guest carrier supplies a real rate,
+    /// while monitor-derived metrics stay gated on samples, so
     /// the synthesized side never paints a phantom imbalance change.
     /// This is the collapse-suppression invariant: a throughput collapse entering or
     /// leaving a capture-free step must not be silently dropped.
@@ -3100,7 +2892,7 @@ mod tests {
     }
 
     /// synthesized -> synthesized boundary (BOTH sides sample_count 0,
-    /// both carrying a real stimulus-derived rate): throughput is still
+    /// both carrying a real guest-carrier-derived rate): throughput is still
     /// compared (the gate is symmetric and sample_count-independent for
     /// throughput) and monitor metrics stay suppressed on both sides.
     /// Pins the zero->zero cell of the transition matrix against a future
@@ -3152,9 +2944,7 @@ mod tests {
     }
 
     #[test]
-    fn iteration_rate_computed_from_consecutive_events() {
-        // Two events with total_iterations: phase 0 spans 0..3000ms
-        // (aligned). iterations: 0 -> 3000 over ~3s = 1000 iter/s.
+    fn consecutive_wall_events_do_not_create_iteration_rate() {
         let events = vec![
             stimulus_with_iters(0, "ScenarioStart", 0),
             stimulus_with_iters(3000, "StepStart[0]", 3000),
@@ -3165,16 +2955,15 @@ mod tests {
         let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 2);
         let rate = t.phases[0].metrics.iteration_rate;
-        assert!(rate.is_some(), "phase 0 should have iteration_rate");
-        let r = rate.unwrap();
-        // Duration is phase boundary difference, not exactly 3s due to
-        // clock alignment offset. Check that the rate is reasonable.
-        assert!(r > 500.0 && r < 2000.0, "rate {r} outside expected range");
+        assert!(
+            rate.is_none(),
+            "wall-only stimulus events must not produce iteration_rate"
+        );
     }
 
     #[test]
-    fn iteration_rate_none_without_total_iterations() {
-        // Events without total_iterations: iteration_rate should be None.
+    fn wall_events_without_iterations_do_not_create_iteration_rate() {
+        // Wall events never create the CPU-denominated iteration rate.
         let events = vec![stimulus(0, "ScenarioStart"), stimulus(3000, "StepStart[0]")];
         let samples: Vec<MonitorSample> = (5..35)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
@@ -3252,10 +3041,7 @@ mod tests {
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
         let t = Timeline::build(&events, &samples, 0);
-        assert!(
-            t.phases[0].metrics.iteration_rate.is_some(),
-            "first phase must get a rate from the 0 baseline",
-        );
+        assert!(t.phases[0].metrics.iteration_rate.is_none());
     }
 
     #[test]
@@ -3278,10 +3064,7 @@ mod tests {
             2,
             "two step events -> two phases; terminal seeds none",
         );
-        assert!(
-            t.phases[1].metrics.iteration_rate.is_some(),
-            "last step must get a rate from the terminal boundary",
-        );
+        assert!(t.phases[1].metrics.iteration_rate.is_none());
     }
 
     #[test]
@@ -3333,15 +3116,8 @@ mod tests {
             2,
             "two StepStart events -> two phases (each StepEnd seeds none)",
         );
-        assert!(
-            t.phases[0].metrics.iteration_rate.is_some(),
-            "phase 0 must get a step-local rate from StepStart[0] -> StepEnd[0], \
-             not the cross-step 0 -> 0 None (the old cross-step fallback bug)",
-        );
-        assert!(
-            t.phases[1].metrics.iteration_rate.is_some(),
-            "phase 1 (respawned workers) must get its own step-local rate",
-        );
+        assert!(t.phases[0].metrics.iteration_rate.is_none());
+        assert!(t.phases[1].metrics.iteration_rate.is_none());
     }
 
     #[test]
@@ -3366,15 +3142,10 @@ mod tests {
         let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 2);
         assert_eq!(
-            t.phases[0].metrics.iteration_rate,
-            Some(0.0),
-            "a stalled step reports measured-zero throughput, not the \
-             cross-step StepStart[0] -> StepStart[1] persistent-leak rate",
+            t.phases[0].metrics.iteration_rate, None,
+            "wall-only events do not produce the delivered-CPU rate",
         );
-        assert!(
-            t.phases[1].metrics.iteration_rate.is_some(),
-            "step 1 still reports its own step-local rate",
-        );
+        assert!(t.phases[1].metrics.iteration_rate.is_none());
     }
 
     #[test]
@@ -3397,20 +3168,11 @@ mod tests {
             1,
             "single step -> one phase; terminal adds none"
         );
-        assert!(
-            t.phases[0].metrics.iteration_rate.is_some(),
-            "single step gets a rate (first == last)",
-        );
+        assert!(t.phases[0].metrics.iteration_rate.is_none());
     }
 
     #[test]
-    fn terminal_event_stalled_last_step_reports_measured_zero() {
-        // Boundary case: the last step's counter did not advance
-        // (terminal count == last step-start count): e == s. That is
-        // MEASURED ZERO throughput — a real value (the strongest
-        // degradation signal), not "unmeasured" — so rate_to returns
-        // Some(0.0), and the zero surfaces to the degradation detector.
-        // Only a counter DECREASE (e < s) is unmeasurable -> None.
+    fn terminal_event_stalled_last_step_does_not_fabricate_cpu_rate() {
         let mut events: Vec<StimulusEvent> = [wire_event(0, 1, 0), wire_event(2000, 2, 4000)]
             .iter()
             .map(StimulusEvent::from_wire)
@@ -3422,9 +3184,8 @@ mod tests {
         let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 2);
         assert_eq!(
-            t.phases[1].metrics.iteration_rate,
-            Some(0.0),
-            "stalled last step (e == s) reports measured-zero, not None",
+            t.phases[1].metrics.iteration_rate, None,
+            "wall-only terminal events do not produce iteration_rate",
         );
     }
 
@@ -3501,9 +3262,8 @@ mod tests {
         // Phase 0 (step 1) still gets its correct rate (0 -> 4000 over
         // 2s = 2000/s): the misordered terminal did not misalign it.
         assert_eq!(
-            t.phases[0].metrics.iteration_rate,
-            Some(2000.0),
-            "early step rate must be correct despite a misordered terminal",
+            t.phases[0].metrics.iteration_rate, None,
+            "misordered wall-only events must not produce iteration_rate",
         );
     }
 
@@ -3522,37 +3282,24 @@ mod tests {
             .collect();
         let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 3);
-        // Phase 0 should have high iteration_rate.
-        assert!(t.phases[0].metrics.iteration_rate.is_some());
-        // Phase 1 should have low iteration_rate.
-        assert!(t.phases[1].metrics.iteration_rate.is_some());
-        let r0 = t.phases[0].metrics.iteration_rate.unwrap();
-        let r1 = t.phases[1].metrics.iteration_rate.unwrap();
         assert!(
-            r0 > r1,
-            "phase 0 rate ({r0}) should exceed phase 1 rate ({r1})"
+            t.phases
+                .iter()
+                .all(|phase| phase.metrics.iteration_rate.is_none())
         );
-
-        // Throughput degradation should be detected at phase 1 boundary.
         let degs: Vec<_> = t
             .degradations()
             .into_iter()
             .filter(|(_, c)| c.metric == "throughput")
             .collect();
-        assert!(!degs.is_empty(), "throughput degradation must be detected");
-        let (phase, change) = &degs[0];
-        assert_eq!(phase.index, 1);
-        assert_eq!(change.direction, ChangeDirection::Degraded);
-        assert!(change.before > change.after);
+        assert!(
+            degs.is_empty(),
+            "wall-only stimulus deltas must not create throughput findings"
+        );
     }
 
     #[test]
-    fn throughput_collapse_to_zero_is_flagged() {
-        // A phase that collapses to ZERO throughput (e == s, measured
-        // zero) must be flagged as a degradation — it is the strongest
-        // degradation signal. Previously the zero phase's rate_to returned
-        // None, so the detector's Some/Some gate dropped it and the worst
-        // degradation went silently unreported.
+    fn wall_counter_collapse_does_not_create_throughput_finding() {
         let events = vec![
             stimulus_with_iters(0, "ScenarioStart", 0),
             stimulus_with_iters(2000, "StepStart[0]", 10000), // phase 0: ~5000/s
@@ -3563,21 +3310,15 @@ mod tests {
             .collect();
         let t = Timeline::build(&events, &samples, 0);
         assert_eq!(
-            t.phases[1].metrics.iteration_rate,
-            Some(0.0),
-            "the collapsed phase must report measured-zero throughput",
+            t.phases[1].metrics.iteration_rate, None,
+            "wall-only events do not create a delivered-CPU zero",
         );
         let degs: Vec<_> = t
             .degradations()
             .into_iter()
             .filter(|(p, c)| p.index == 1 && c.metric == "throughput")
             .collect();
-        assert!(
-            !degs.is_empty(),
-            "a collapse to zero throughput must be flagged as a degradation",
-        );
-        assert_eq!(degs[0].1.direction, ChangeDirection::Degraded);
-        assert_eq!(degs[0].1.after, 0.0);
+        assert!(degs.is_empty());
     }
 
     #[test]
@@ -3601,16 +3342,14 @@ mod tests {
             .filter(|c| c.metric == "throughput" && c.direction == ChangeDirection::Improved)
             .collect();
         assert!(
-            !improvements.is_empty(),
-            "throughput improvement must be detected"
+            improvements.is_empty(),
+            "wall-only stimulus deltas must not create throughput findings"
         );
     }
 
     #[test]
     fn throughput_stable_below_threshold() {
-        // Phase 0: 1000 iter/s
-        // Phase 1: ~900 iter/s (10% drop, below 30% threshold)
-        // No throughput change should be detected.
+        // Wall-only event deltas never create the canonical rate.
         let events = vec![
             stimulus_with_iters(0, "ScenarioStart", 0),
             stimulus_with_iters(2000, "StepStart[0]", 2000),
@@ -3643,6 +3382,7 @@ mod tests {
         s0_metrics.insert("avg_imbalance_ratio".to_string(), 1.8);
         s0_metrics.insert("avg_nr_running".to_string(), 3.0);
         s0_metrics.insert("total_fallback".to_string(), 200.0);
+        s0_metrics.insert("fallback_per_vcpu_sec".to_string(), 40.0);
         let buckets = vec![
             PhaseBucket {
                 per_cgroup: Default::default(),
@@ -3682,14 +3422,12 @@ mod tests {
         // projects to PhaseMetrics.avg_nr_running; phase 0's empty map -> None.
         assert!((t.phases[1].metrics.avg_nr_running.unwrap() - 3.0).abs() < f64::EPSILON);
         assert_eq!(t.phases[0].metrics.avg_nr_running, None);
-        // fallback_rate = 200 / (5000 / 1000) = 40.0 events/s
+        // The canonical CPU-denominated rate is read verbatim; the raw total
+        // is not divided by this bucket's wall window.
         assert_eq!(t.phases[1].metrics.fallback_rate, Some(40.0));
-        // keep_last_rate absent → None (no total_keep_last in metrics map)
+        // keep_last_rate absent because no canonical rate is present.
         assert_eq!(t.phases[1].metrics.keep_last_rate, None);
-        // avg_dsq_depth + avg_imbalance + avg_nr_running are now
-        // all wired (per the doc table). iteration_rate is the only field
-        // PhaseBucket cannot supply directly (depends on stimulus
-        // event totals, not a per-Sample reading).
+        // No guest iteration/CPU carrier was provided.
         assert_eq!(t.phases[1].metrics.iteration_rate, None);
         // Render produces a non-empty timeline block.
         let formatted = t.format_with_context(&TimelineContext::default());
@@ -3708,9 +3446,9 @@ mod tests {
     /// phases[1].changes empty, so this test fails — it is the
     /// regression pin for the removed gate. The producer half — that
     /// build_phase_buckets_with_stimulus actually populates a synthesized
-    /// bucket's iteration_rate from stimulus deltas — is pinned by
-    /// assert::tests_phase_bucket::build_phase_buckets_with_stimulus_synthesizes_zero_capture_step_bucket;
-    /// together they pin the full producer->consumer chain.
+    /// bucket's iteration_rate from a guest carrier — is pinned by the phase
+    /// carrier derivation tests; together they pin the producer-to-consumer
+    /// chain.
     #[test]
     fn from_phase_buckets_flags_throughput_into_synthesized_step() {
         use crate::assert::PhaseBucket;
@@ -4064,10 +3802,7 @@ mod tests {
             .collect();
         let t = Timeline::build(&events, &samples, 0);
         let formatted = t.format_with_context(&TimelineContext::default());
-        assert!(
-            formatted.contains("throughput:"),
-            "format output must contain throughput when iteration_rate is set"
-        );
-        assert!(formatted.contains("iter/s"));
+        assert!(!formatted.contains("iteration rate:"));
+        assert!(!formatted.contains("iter/cpu-s"));
     }
 }

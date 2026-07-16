@@ -1872,6 +1872,38 @@ impl GuestMemMapAccessorOwned {
         Self::from_elf_inner(mem, elf, data, vmlinux, tcr_el1, cr3_pa, phys_base_hint)
     }
 
+    /// Build from vmlinux products already resolved before the VM's live
+    /// helper threads start. Equivalent to [`Self::from_elf_with_hint`], but
+    /// the complete symbol map, bootstrap symbols, and BTF offsets are reused
+    /// instead of re-derived inside an accessor-init/teardown lifetime.
+    pub(crate) fn from_precomputed(
+        mem: std::sync::Arc<GuestMem>,
+        symbols: std::sync::Arc<std::collections::HashMap<String, u64>>,
+        kernel_symbols: &super::symbols::KernelSymbols,
+        offsets: BpfMapOffsets,
+        tcr_el1: u64,
+        cr3_pa: u64,
+        phys_base_hint: u64,
+    ) -> anyhow::Result<Self> {
+        let kernel = super::guest::GuestKernel::from_precomputed(
+            mem,
+            symbols,
+            kernel_symbols,
+            tcr_el1,
+            cr3_pa,
+            phys_base_hint,
+        )?;
+        let map_idr_kva = kernel
+            .symbol_kva("map_idr")
+            .ok_or_else(|| anyhow::anyhow!("map_idr symbol not found in vmlinux"))?;
+        Ok(Self {
+            kernel,
+            map_idr_kva,
+            offsets,
+            per_cpu_offsets_cache: PerCpuOffsetsCache::new(),
+        })
+    }
+
     fn from_elf_inner(
         mem: std::sync::Arc<GuestMem>,
         elf: &goblin::elf::Elf<'_>,

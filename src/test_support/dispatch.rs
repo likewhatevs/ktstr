@@ -1004,7 +1004,7 @@ pub const EXIT_INCONCLUSIVE: i32 = 2;
 /// [`EXIT_INCONCLUSIVE`] on Inconclusive — the 4-state lattice
 /// `Fail > Inconclusive > Pass > Skip` projects to 3 distinct exit
 /// codes (Skip degenerates to [`EXIT_PASS`] because the test never
-/// ran, mirroring `ResourceContention`). A Skip routes through the
+/// ran). A Skip routes through the
 /// dedicated FIRST match arm (`Ok(r) if r.is_skip()`), ahead of the
 /// expect_err arm, so an expect_err test that produced no verdict (e.g.
 /// a `post_vm_skip` on a load-starved placeholder dump) is not inverted
@@ -1012,23 +1012,21 @@ pub const EXIT_INCONCLUSIVE: i32 = 2;
 /// [`EXIT_INCONCLUSIVE`] lets
 /// downstream tooling (CI gates, nextest summary aggregation, the
 /// operator dashboard) triage zero-denominator runs distinctly from
-/// real regressions. `ResourceContention` returns [`EXIT_PASS`] —
-/// the test never ran, not a real failure. The skip sidecar for
-/// this case is written upstream in `run_ktstr_test_inner` at the
-/// ResourceContention propagation site so every caller (including
-/// the library entry point `run_ktstr_test`) records it, not just
-/// the nextest dispatch path.
+/// real regressions.
 ///
-/// `ResourceContention` detection walks the FULL error chain via
-/// [`is_resource_contention`] (chain-walk predicate) plus a
-/// matching `e.chain().find_map(...)` extraction for the reason
-/// string. The eval-side `crate::test_support::eval` `"build ktstr_test VM"` and
-/// `"run ktstr_test VM"` wrappers nest the contention error under
-/// `.context(...)`, so a top-level `downcast_ref` on the outer
-/// error misses the inner cause. Without the chain walk a wrapped
-/// contention would land in the `Err(e)` arm below as a regular
-/// failure (exit 1) rather than the skip path (exit 0), turning
-/// every host-resource-exhausted run into a hard test failure.
+/// `ResourceContention` does NOT map to a skip: the run path WAITS for
+/// a contended reservation to free (see [`crate::vmm::KtstrVm`]'s
+/// the acquisition queue's progress-based patience), so a contention that
+/// still surfaces here means zero queue/acquisition progress for the whole
+/// patience window — a wedged peer. [`classify_host_error`] routes it to
+/// [`HostClass::Fail`] → [`EXIT_FAIL`], a RETRYABLE failure nextest
+/// re-runs once the holder releases. That is the correct mechanism: a
+/// skip is [`EXIT_PASS`], which nextest never retries, so the old
+/// skip-on-contention silently dropped suite coverage whenever a
+/// colocated peer's `LOCK_EX` overlapped the run. Chain-awareness (the
+/// eval-side `"build ktstr_test VM"` / `"run ktstr_test VM"`
+/// `.context(...)` wrappers nest the typed error) is handled inside
+/// `classify_host_error` via the chain-walking `is_*` predicates.
 fn result_to_exit_code(
     result: Result<AssertResult>,
     expect_err: bool,
@@ -1051,9 +1049,11 @@ fn result_to_exit_code(
 fn ok_to_exit_code(r: AssertResult, expect_err: bool, allow_inconclusive: bool) -> i32 {
     // A Skip degenerates to EXIT_PASS regardless of expect_err — the
     // test never evaluated, so there is no guest failure to "expect"
-    // (the `Fail > Inconclusive > Pass > Skip` projection; mirrors the
-    // ResourceContention Err branch in `err_to_exit_code`, but on the
-    // Ok side). Without this guard a post_vm_skip under expect_err
+    // (the `Fail > Inconclusive > Pass > Skip` projection). This is the
+    // `post_vm_skip` / host-incapacity (TopologyInsufficient,
+    // PerfModeUnavailable) skip channel — NOT ResourceContention, which
+    // `err_to_exit_code` routes to EXIT_FAIL (retryable). Without this
+    // guard a post_vm_skip under expect_err
     // falls into the `expect_err` guard below and surfaces as "expected
     // error but test passed" (EXIT_FAIL) — a load-starvation
     // placeholder-dump skip becomes a flaky failure. End-to-end chain:
@@ -1415,10 +1415,11 @@ pub(crate) fn final_outcome(
 
 /// Whether a base test entry is "ignored" (skipped by default).
 ///
-/// Tests whose names start with `demo_` are ignored -- they are
-/// demonstration/benchmarking tests that require manual opt-in.
+/// Entries declared with `#[ktstr_test(ignore)]` carry `ignored = true` from
+/// macro codegen. Tests whose names start with `demo_` are also ignored --
+/// they are demonstration/benchmarking tests that require manual opt-in.
 fn is_ignored(entry: &KtstrTestEntry) -> bool {
-    entry.name.starts_with("demo_")
+    entry.ignored || entry.name.starts_with("demo_")
 }
 
 /// Walk [`KTSTR_TESTS`] once per process and emit a stderr
@@ -1507,8 +1508,9 @@ fn warn_duplicate_test_names_inner<'a, W: std::io::Write>(
 /// - Without `--ignored`: prints ALL tests (ignored and non-ignored).
 /// - With `--ignored`: prints ONLY ignored tests.
 ///
-/// Gauntlet variants are always ignored. Base tests are ignored when
-/// their name starts with `demo_`.
+/// Gauntlet variants are always ignored. Base tests are ignored when their
+/// registered entry carries `ignored = true` or their name starts with
+/// `demo_`.
 ///
 /// When `KTSTR_BUDGET_SECS` is set, applies greedy coverage maximization
 /// to select the subset of tests that maximizes feature coverage within
@@ -1558,6 +1560,18 @@ fn for_each_gauntlet_variant<F>(
 {
     let no_perf_mode = super::runtime::no_perf_mode_for_entry(entry);
     for preset in presets {
+        // Non-uniform presets (per-LLC core counts, e.g. uneven-11llc)
+        // are VERIFIER-ONLY: the gauntlet execution path reconstructs the
+        // topology from a `TopoOverride` (numa/llcs/cores/threads only),
+        // which cannot carry `llc_cores`, so a gauntlet variant would boot
+        // a WRONG uniform shape. The verifier path passes the full
+        // Topology (with llc_cores) directly, so it is the only path that
+        // renders these shapes faithfully. Skip them here regardless of
+        // constraints — this is why uneven-11llc's forced overcommit is
+        // realized only in the verifier battery.
+        if preset.topology.llc_cores.is_some() {
+            continue;
+        }
         // No-perf-mode tests run KVM-emulated topology — guest sees the
         // declared NUMA / LLC / per-LLC layout regardless of host
         // hardware — so the host-side LLC count and per-LLC CPU width
@@ -1884,8 +1898,11 @@ fn query_workspace_member_packages(manifest_dir: &str) -> std::collections::Hash
 /// The topology dimension is [`crate::gauntlet::gauntlet_presets`], gated
 /// per scheduler: the verifier VM always runs no_perf_mode, so a preset
 /// is emitted only when the scheduler's constraints accept it under
-/// [`super::TopologyConstraints::accepts_no_perf_mode`] (declared scope +
-/// host CPU budget). A scheduler that accepts no preset emits no cell.
+/// [`super::TopologyConstraints::accepts_verifier`] — the verifier-only
+/// gate that ignores DEFAULT caps (so an untouched scheduler reaches the
+/// beyond-host battery shapes) and imposes NO host-size bound for the
+/// correctness-only verify cells. A scheduler that accepts no preset
+/// emits no cell.
 ///
 /// Schedulers declared with [`super::SchedulerSpec::Eevdf`] or
 /// [`super::SchedulerSpec::KernelBuiltin`] are skipped at emission time
@@ -1910,7 +1927,9 @@ fn list_verifier_cells_all() {
         return;
     }
     let presets = crate::gauntlet::gauntlet_presets();
-    let (host_cpus, _host_llcs, _host_max_cpus_per_llc) = super::host_capacity();
+    // No host_capacity() read here: verifier preset selection has no
+    // host-size bound (see accepts_verifier) — a battery shape lists on
+    // any host regardless of CPU count.
 
     // `cargo ktstr verifier --scheduler <NAME>` filter (via
     // KTSTR_VERIFIER_SCHEDULER): when set, sweep only the named declared
@@ -1977,10 +1996,12 @@ fn list_verifier_cells_all() {
             // scheduler that bakes topology-derived config into .rodata
             // hands the verifier different known constants, so it
             // processes a different instruction count per topology). The
-            // verifier VM always
-            // runs no_perf_mode, so preset eligibility uses
-            // accepts_no_perf_mode: the KVM-emulated topology is gated by
-            // the scheduler's declared scope + the host CPU budget.
+            // verifier VM always runs no_perf_mode, so preset eligibility
+            // uses accepts_verifier: the KVM-emulated topology is gated by
+            // the scheduler's declared scope, with DEFAULT caps treated as
+            // "no opinion" and NO host-size bound — the correctness-only
+            // verify cells tolerate overcommit at any ratio (storm-validated
+            // + progress-watchdog), so beyond-host shapes always enter.
             for preset in presets.iter() {
                 if preset.name.contains('/') {
                     eprintln!(
@@ -1989,10 +2010,7 @@ fn list_verifier_cells_all() {
                     );
                     continue;
                 }
-                if !sched
-                    .constraints
-                    .accepts_no_perf_mode(&preset.topology, host_cpus)
-                {
+                if !sched.constraints.accepts_verifier(&preset.topology) {
                     continue;
                 }
                 println!(
@@ -2037,6 +2055,7 @@ fn list_verifier_cells_all() {
 fn run_verifier_cell_inner(
     full_name: &str,
     out_stats: &mut Vec<crate::verifier::ProgStats>,
+    out_dilation: &mut Option<f64>,
 ) -> i32 {
     use super::SchedulerSpec;
 
@@ -2192,7 +2211,10 @@ fn run_verifier_cell_inner(
             }
         }
     };
-    let topology = super::TopologyJson::from(preset.topology);
+    // Pass the preset's Topology directly (uneven-11llc's per-LLC core
+    // counts must survive into the guest CPUID; the TopologyJson wire
+    // shape would drop them).
+    let topology = preset.topology;
     let sched_args: Vec<String> = sched.sched_args.iter().map(|s| s.to_string()).collect();
 
     // Raw mode is opt-in via the dispatcher's --raw flag, plumbed
@@ -2208,6 +2230,7 @@ fn run_verifier_cell_inner(
         &kernel_path,
         &sched_args,
         topology,
+        preset.forced_cpu_budget,
     ) {
         Ok(result) => {
             let output = crate::verifier::format_verifier_output("verifier", &result, raw);
@@ -2233,10 +2256,14 @@ fn run_verifier_cell_inner(
                     1
                 }
             };
-            // Hand the per-program verified_insns out to the record writer
-            // so the dispatcher can render the instruction-count tables.
-            // Only this arm has stats; every earlier return (skip, kernel
-            // resolution error, build failure) leaves out_stats empty.
+            // Hand the per-program verified_insns and the host-dilation
+            // sample out to the record writer so the dispatcher can render
+            // the instruction-count tables and the summary grid's
+            // dilation. Only this arm produces them; every earlier return
+            // (skip, kernel resolution error, build failure) leaves both
+            // at their empty/None default. Read dilation (Copy) before
+            // moving `stats` out.
+            *out_dilation = result.dilation;
             *out_stats = result.stats;
             code
         }
@@ -2258,13 +2285,15 @@ fn run_verifier_cell_inner(
 /// final attempt's outcome is the one that lands in the table.
 fn run_verifier_cell(full_name: &str) -> i32 {
     let mut stats = Vec::new();
-    let code = run_verifier_cell_inner(full_name, &mut stats);
+    let mut dilation = None;
+    let code = run_verifier_cell_inner(full_name, &mut stats, &mut dilation);
     if let Some(dir) = std::env::var_os(crate::KTSTR_VERIFIER_RESULT_DIR_ENV) {
         crate::verifier::write_cell_record(
             std::path::Path::new(&dir),
             full_name,
             code == 0,
             &stats,
+            dilation,
         );
     }
     code

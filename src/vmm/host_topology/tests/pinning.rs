@@ -1025,3 +1025,136 @@ fn resource_lock_exclusive_acquires() {
     let fd = try_flock(path, FlockMode::Exclusive).expect("open should succeed");
     assert!(fd.is_some(), "exclusive lock on fresh file should succeed");
 }
+
+// -- per-CPU-grain perf reservation: threshold + placement --
+//
+// Anchors the grain switch against the MEASURED validated-host LLC
+// sizes and perf-cell footprints so a future ratio/floor tweak that
+// would reclassify a validated host trips a red test:
+//   * dev box:  16-CPU L3s
+//   * x86 CI:   ~8-CPU L3s
+//   * armly:     4-CPU L2s
+//   * Graviton: one 96-CPU L3   (the box the grain switch exists for)
+// Perf cells are `cores = 2..4, threads = 1` (2-4 vCPUs per LLC).
+
+/// A single monolithic-LLC host of `n` CPUs on one NUMA node — the
+/// Graviton shape.
+fn monolith_host(n: usize) -> HostTopology {
+    HostTopology::new_for_tests(&[((0..n).collect::<Vec<_>>(), 0)])
+}
+
+/// `k` LLCs of `size` CPUs each on one NUMA node — the x86/dev shape.
+fn multi_llc_host(k: usize, size: usize) -> HostTopology {
+    let groups: Vec<(Vec<usize>, usize)> = (0..k)
+        .map(|i| ((i * size..i * size + size).collect(), 0))
+        .collect();
+    HostTopology::new_for_tests(&groups)
+}
+
+#[test]
+fn perf_grain_switch_fires_only_on_a_huge_llc() {
+    // Graviton: a 2-vCPU cell on a 96-CPU L3 → per-CPU grain (Shared).
+    let host = monolith_host(96);
+    let plan = host
+        .compute_pinning(&Topology::new(1, 1, 2, 1), true, 0)
+        .unwrap();
+    assert_eq!(perf_llc_lock_mode(&host, &plan), LlcLockMode::Shared);
+}
+
+#[test]
+fn perf_grain_stays_exclusive_on_validated_x86_and_dev_and_arm() {
+    // Every validated host keeps whole-LLC Exclusive for BOTH real perf
+    // cell sizes — the behaviour the dilation campaign measured. The
+    // absolute floor (32) makes this hold regardless of how small the
+    // cell is: a pure 0.5-occupancy ratio would flip the 2-vCPU cases.
+    for (k, size) in [(24usize, 8usize), (4, 16), (6, 4)] {
+        // (x86 CI ~8, dev box 16, armly 4)
+        let host = multi_llc_host(k, size);
+        for cores in [2u32, 4] {
+            if cores as usize > size {
+                continue; // cell cannot map — skip the impossible pin
+            }
+            let plan = host
+                .compute_pinning(&Topology::new(1, 1, cores, 1), true, 0)
+                .unwrap();
+            assert_eq!(
+                perf_llc_lock_mode(&host, &plan),
+                LlcLockMode::Exclusive,
+                "validated host {k}×{size}-CPU LLC, {cores}-core cell must stay Exclusive",
+            );
+        }
+    }
+}
+
+#[test]
+fn perf_grain_keeps_exclusive_when_cell_fills_most_of_a_huge_llc() {
+    // A cell wanting >= 1/2 of even a 96-CPU L3 keeps the whole cache:
+    // the occupancy ratio, not just the absolute floor, gates the switch.
+    let host = monolith_host(96);
+    // 48 vCPUs + 1 service = 49 footprint → 49/96 >= 1/2 → Exclusive.
+    let fills = host
+        .compute_pinning(&Topology::new(1, 1, 48, 1), true, 0)
+        .unwrap();
+    assert_eq!(perf_llc_lock_mode(&host, &fills), LlcLockMode::Exclusive);
+    // 46 vCPUs + 1 = 47 footprint → 47/96 < 1/2 → Shared (minority slice).
+    let minority = host
+        .compute_pinning(&Topology::new(1, 1, 46, 1), true, 0)
+        .unwrap();
+    assert_eq!(perf_llc_lock_mode(&host, &minority), LlcLockMode::Shared);
+}
+
+#[test]
+fn compute_pinning_grain_blocks_are_disjoint_including_service() {
+    // Distinct blocks yield fully disjoint host-CPU sets — vCPUs AND
+    // service — the property that lets two perf cells coexist.
+    let host = monolith_host(96);
+    let topo = Topology::new(1, 1, 2, 1); // V = 2 → block size 3
+    let b0 = host.compute_pinning_grain(&topo, 0).unwrap();
+    let b1 = host.compute_pinning_grain(&topo, 1).unwrap();
+
+    // Block 0: vCPUs {0,1}, service 2.  Block 1: vCPUs {3,4}, service 5.
+    assert_eq!(b0.assignments, vec![(0, 0), (1, 1)]);
+    assert_eq!(b0.service_cpu, Some(2));
+    assert_eq!(b1.assignments, vec![(0, 3), (1, 4)]);
+    assert_eq!(b1.service_cpu, Some(5));
+
+    let cpus = |p: &PinningPlan| -> std::collections::HashSet<usize> {
+        let mut s: std::collections::HashSet<usize> =
+            p.assignments.iter().map(|&(_, c)| c).collect();
+        s.extend(p.service_cpu);
+        s
+    };
+    assert!(
+        cpus(&b0).is_disjoint(&cpus(&b1)),
+        "grain blocks must not share any CPU (vCPU or service)",
+    );
+    // And the grain plan itself re-derives as Shared (run-path parity).
+    assert_eq!(perf_llc_lock_mode(&host, &b0), LlcLockMode::Shared);
+}
+
+#[test]
+fn compute_pinning_grain_windows_are_cache_coherent_contiguous() {
+    // Each guest LLC's vCPUs stay a contiguous slice of ONE host LLC —
+    // topology mirroring, never scattered across the cache.
+    let host = monolith_host(96);
+    let topo = Topology::new(1, 1, 4, 1); // V = 4
+    let b2 = host.compute_pinning_grain(&topo, 2).unwrap();
+    // block_size = 5, block 2 starts at CPU 10: vCPUs 10..14, service 14.
+    let cpus: Vec<usize> = b2.assignments.iter().map(|&(_, c)| c).collect();
+    assert_eq!(cpus, vec![10, 11, 12, 13]);
+    assert_eq!(b2.service_cpu, Some(14));
+}
+
+#[test]
+fn compute_pinning_grain_reports_end_of_blocks() {
+    // A 96-CPU LLC / block size 3 seats exactly 32 blocks; block 32 does
+    // not fit and returns TopologyInsufficient (the caller's break).
+    let host = monolith_host(96);
+    let topo = Topology::new(1, 1, 2, 1);
+    assert!(host.compute_pinning_grain(&topo, 31).is_ok());
+    let past = host.compute_pinning_grain(&topo, 32).unwrap_err();
+    assert!(
+        past.downcast_ref::<TopologyInsufficient>().is_some(),
+        "past-last-block must be TopologyInsufficient, got: {past:#}",
+    );
+}

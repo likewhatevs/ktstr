@@ -360,7 +360,7 @@ fn repool_worst_iterations_per_cpu_sec_lowest_wins_none_aware() {
     );
 }
 
-/// The POOLED `iterations_per_cpu_sec` Rate (the cross-cgroup re-pool) is
+/// The pooled canonical `iteration_rate` (the cross-cgroup re-pool) is
 /// Σiterations / Σcpu-seconds across cgroups — NOT a mean of per-cgroup
 /// ratios, NOT the worst single cgroup. Unequal per-cgroup cpu-time makes
 /// the three distinct: re-pool 101.0 vs mean-of-ratios ~500.6 vs worst ~1.11
@@ -368,7 +368,7 @@ fn repool_worst_iterations_per_cpu_sec_lowest_wins_none_aware() {
 /// pooled metric must NOT mutate the existing worst_iterations_per_cpu_sec
 /// (the min-fold starvation selector).
 #[test]
-fn populate_run_pooled_iterations_per_cpu_sec_repools_across_cgroups() {
+fn populate_run_pooled_iteration_rate_repools_across_cgroups() {
     // cg1: 1000 iters over 1.0 cpu-s -> 1000/cpu-s.
     let cg1 = CgroupStats {
         total_iterations: 1000,
@@ -397,15 +397,15 @@ fn populate_run_pooled_iterations_per_cpu_sec_repools_across_cgroups() {
     };
     let mut acc = mk(&cg1);
     acc.merge(mk(&cg2));
-    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+    populate_run_pooled_iteration_rate(&mut acc.stats);
 
     // Σiters / Σcpu-s = (1000 + 10) / ((1e9 + 9e9)/1e9) = 1010 / 10.0 = 101.0.
     assert_eq!(
-        acc.stats.ext_metrics.get("iterations_per_cpu_sec").copied(),
+        acc.stats.ext_metrics.get("iteration_rate").copied(),
         Some(101.0),
         "pooled rate must be Σiters/Σcpu-s = 101.0, NOT mean-of-ratios \
          (~500.6) or the worst cgroup (~1.11); got {:?}",
-        acc.stats.ext_metrics.get("iterations_per_cpu_sec"),
+        acc.stats.ext_metrics.get("iteration_rate"),
     );
     // BOTH cgroups have measured cpu-time, so the ext-only pooled numerator
     // equals the merge-summed typed total_iterations (both Σ over all
@@ -424,7 +424,7 @@ fn populate_run_pooled_iterations_per_cpu_sec_repools_across_cgroups() {
     // The WorstLowest worst_iterations_per_cpu_sec (lowest-wins starvation
     // selector) is DISTINCT from the pooled rate: re-pooled separately by
     // populate_run_distribution_metrics, the lower per-cgroup rate (cg2's
-    // 10/9) wins. The pooled iterations_per_cpu_sec Rate above is unaffected.
+    // 10/9) wins. The pooled iteration_rate above is unaffected.
     populate_run_distribution_metrics(&mut acc.stats);
     let worst = acc
         .stats
@@ -444,7 +444,7 @@ fn populate_run_pooled_iterations_per_cpu_sec_repools_across_cgroups() {
 /// (both-or-neither) so no rate derives — matching
 /// `CgroupStats::iterations_per_cpu_sec`'s None-on-zero.
 #[test]
-fn populate_run_pooled_iterations_per_cpu_sec_absent_on_zero_cpu_time() {
+fn populate_run_pooled_iteration_rate_absent_on_zero_cpu_time() {
     let cg = CgroupStats {
         total_iterations: 500,
         total_cpu_time_ns: 0,
@@ -462,9 +462,9 @@ fn populate_run_pooled_iterations_per_cpu_sec_absent_on_zero_cpu_time() {
         measurements: std::collections::BTreeMap::new(),
         info_notes: vec![],
     };
-    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+    populate_run_pooled_iteration_rate(&mut acc.stats);
     assert!(
-        !acc.stats.ext_metrics.contains_key("iterations_per_cpu_sec"),
+        !acc.stats.ext_metrics.contains_key("iteration_rate"),
         "no pooled rate when Σcpu-time is 0",
     );
     assert!(
@@ -485,7 +485,7 @@ fn populate_run_pooled_iterations_per_cpu_sec_absent_on_zero_cpu_time() {
 /// total_iterations_pooled (measured only) is strictly LESS than the
 /// merge-summed typed total_iterations (which includes both).
 #[test]
-fn populate_run_pooled_iterations_per_cpu_sec_excludes_zero_cpu_cgroup() {
+fn populate_run_pooled_iteration_rate_excludes_zero_cpu_cgroup() {
     // Unmeasured: 500 iters, 0 cpu-time (schedstat unavailable).
     let unmeasured = CgroupStats {
         total_iterations: 500,
@@ -513,15 +513,15 @@ fn populate_run_pooled_iterations_per_cpu_sec_excludes_zero_cpu_cgroup() {
     };
     let mut acc = mk(&unmeasured);
     acc.merge(mk(&measured));
-    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+    populate_run_pooled_iteration_rate(&mut acc.stats);
 
     // Pooled rate excludes the zero-cpu cgroup: 1000 / 1.0 == 1000.0, NOT
     // (500 + 1000) / 1.0 == 1500.0 (which would credit un-costed iters).
     assert_eq!(
-        acc.stats.ext_metrics.get("iterations_per_cpu_sec").copied(),
+        acc.stats.ext_metrics.get("iteration_rate").copied(),
         Some(1000.0),
         "zero-cpu cgroup's iters must NOT inflate the pooled rate; got {:?}",
-        acc.stats.ext_metrics.get("iterations_per_cpu_sec"),
+        acc.stats.ext_metrics.get("iteration_rate"),
     );
     // The pooled numerator counts only the measured cgroup (1000) and is
     // strictly LESS than the merge-summed typed total_iterations (1500).
@@ -538,7 +538,7 @@ fn populate_run_pooled_iterations_per_cpu_sec_excludes_zero_cpu_cgroup() {
 /// Single measured cgroup: the pooled rate is exactly that cgroup's per-cgroup
 /// rate (degenerate Σ over one element).
 #[test]
-fn populate_run_pooled_iterations_per_cpu_sec_single_cgroup() {
+fn populate_run_pooled_iteration_rate_single_cgroup() {
     let cg = CgroupStats {
         total_iterations: 750,
         total_cpu_time_ns: 3_000_000_000,
@@ -556,23 +556,23 @@ fn populate_run_pooled_iterations_per_cpu_sec_single_cgroup() {
         measurements: std::collections::BTreeMap::new(),
         info_notes: vec![],
     };
-    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+    populate_run_pooled_iteration_rate(&mut acc.stats);
     // 750 / 3.0 == 250.0 == the per-cgroup rate.
     assert_eq!(
-        acc.stats.ext_metrics.get("iterations_per_cpu_sec").copied(),
+        acc.stats.ext_metrics.get("iteration_rate").copied(),
         cg.iterations_per_cpu_sec(),
     );
     assert_eq!(
-        acc.stats.ext_metrics.get("iterations_per_cpu_sec").copied(),
+        acc.stats.ext_metrics.get("iteration_rate").copied(),
         Some(250.0),
     );
 }
 
 /// Empty cgroups vec: nothing to pool, no keys inserted (both-or-neither).
 #[test]
-fn populate_run_pooled_iterations_per_cpu_sec_empty_cgroups() {
+fn populate_run_pooled_iteration_rate_empty_cgroups() {
     let mut stats = ScenarioStats::default();
-    populate_run_pooled_iterations_per_cpu_sec(&mut stats);
+    populate_run_pooled_iteration_rate(&mut stats);
     assert!(
         stats.ext_metrics.is_empty(),
         "no components inserted for an empty cgroups vec",
@@ -587,7 +587,7 @@ fn populate_run_pooled_iterations_per_cpu_sec_empty_cgroups() {
 /// the numerator, correctly diluting the cohort rate downward (burning CPU with
 /// no work IS less efficient).
 #[test]
-fn populate_run_pooled_iterations_per_cpu_sec_includes_costed_idle_cgroup() {
+fn populate_run_pooled_iteration_rate_includes_costed_idle_cgroup() {
     // Costed but idle: 0 iters over 2.0 cpu-s.
     let idle = CgroupStats {
         total_iterations: 0,
@@ -615,14 +615,14 @@ fn populate_run_pooled_iterations_per_cpu_sec_includes_costed_idle_cgroup() {
     };
     let mut acc = mk(&idle);
     acc.merge(mk(&busy));
-    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+    populate_run_pooled_iteration_rate(&mut acc.stats);
 
     // The idle cgroup's CPU MUST count: rate = 1000 / ((2e9+1e9)/1e9) = 1000/3.0
     // == ~333.33, NOT 1000/1.0 == 1000 (which would ignore the wasted CPU).
     let rate = acc
         .stats
         .ext_metrics
-        .get("iterations_per_cpu_sec")
+        .get("iteration_rate")
         .copied()
         .expect("pooled rate present");
     assert!(
@@ -650,7 +650,7 @@ fn populate_run_pooled_iterations_per_cpu_sec_includes_costed_idle_cgroup() {
 /// not a tiny one — and the pooled wrapper feeds that same guard. (u64-summed
 /// ns cannot overflow within centuries, so no overflow case is reachable.)
 #[test]
-fn populate_run_pooled_iterations_per_cpu_sec_tiny_denominator_stays_finite() {
+fn populate_run_pooled_iteration_rate_tiny_denominator_stays_finite() {
     let cg = CgroupStats {
         total_iterations: 1000,
         total_cpu_time_ns: 1,
@@ -668,11 +668,11 @@ fn populate_run_pooled_iterations_per_cpu_sec_tiny_denominator_stays_finite() {
         measurements: std::collections::BTreeMap::new(),
         info_notes: vec![],
     };
-    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+    populate_run_pooled_iteration_rate(&mut acc.stats);
     let rate = acc
         .stats
         .ext_metrics
-        .get("iterations_per_cpu_sec")
+        .get("iteration_rate")
         .copied()
         .expect("tiny-denom rate present (finite, not dropped)");
     assert!(
@@ -681,14 +681,16 @@ fn populate_run_pooled_iterations_per_cpu_sec_tiny_denominator_stays_finite() {
     );
 }
 
-/// Whole-run taobench qps + hit Rates re-pool across the run's Taobench
+/// Whole-run taobench throughput + hit Rates re-pool across the run's Taobench
 /// cgroups via sum-of-ops and max-of-wall (the window is shared by the
 /// concurrent cohorts, so it is taken as MAX, never summed — a summed window
 /// would deflate every qps). With cg1 (fast 800, slow 200, 10 s) and cg2 (fast
 /// 300, slow 700, 8 s), the pool is fast 1100, slow 900, ops 2000, wall
-/// MAX(10,8) = 10 s, giving total 200/s, fast 110/s, slow 90/s, and hit
-/// 1100/2000 = 0.55. A summed-wall denominator (18 s) would give total roughly
-/// 111/s, so the MAX window is observable.
+/// MAX(10,8) = 10 s, client CPU Σ(10,8) = 18 s, giving the CPU-second rates
+/// total 2000/18, fast 1100/18, slow 900/18, and hit 1100/2000 = 0.55. The
+/// MAX wall window (10, not Σ 18) stays observable via the wall_sec
+/// component; the SUM CPU window is observable in the rates (a MAX-folded
+/// CPU denominator would give 200/s).
 #[test]
 fn populate_run_pooled_taobench_repools_across_cgroups() {
     let tb = |fast: u64, slow: u64, secs: u64| {
@@ -698,6 +700,9 @@ fn populate_run_pooled_taobench_repools_across_cgroups() {
             fast_ops: fast,
             slow_ops: slow,
             elapsed_ns: secs * 1_000_000_000,
+            // CPU mirrors the wall window per cgroup; unlike the MAX-folded
+            // wall it SUMs across cgroups (the qps denominator).
+            cpu_time_ns: secs * 1_000_000_000,
         })
     };
     let cg1 = CgroupStats {
@@ -724,7 +729,7 @@ fn populate_run_pooled_taobench_repools_across_cgroups() {
     acc.merge(mk(&cg2));
     populate_run_pooled_taobench(&mut acc.stats);
     let e = &acc.stats.ext_metrics;
-    // Counter components: Σ ops, MAX wall.
+    // Counter components: Σ ops, MAX wall, Σ client CPU.
     assert_eq!(e.get("total_taobench_ops").copied(), Some(2000.0));
     assert_eq!(e.get("total_taobench_fast_ops").copied(), Some(1100.0));
     assert_eq!(e.get("total_taobench_slow_ops").copied(), Some(900.0));
@@ -733,10 +738,37 @@ fn populate_run_pooled_taobench_repools_across_cgroups() {
         Some(10.0),
         "wall is MAX(10,8) = 10, not Σ = 18",
     );
-    // Derived Rates = Σnum / Σden over the cohort.
-    assert_eq!(e.get("taobench_total_ops_per_sec").copied(), Some(200.0));
-    assert_eq!(e.get("taobench_fast_ops_per_sec").copied(), Some(110.0));
-    assert_eq!(e.get("taobench_slow_ops_per_sec").copied(), Some(90.0));
+    assert_eq!(
+        e.get("total_taobench_cpu_sec").copied(),
+        Some(18.0),
+        "client CPU is Σ(10,8) = 18 (disjoint per-thread), not MAX",
+    );
+    // Derived Rates = Σnum / Σ CLIENT-CPU-sec over the cohort (CPU-second
+    // denominated: 2000/18 etc.), NOT per wall second.
+    let total = e
+        .get("taobench_total_ops_per_cpu_sec_whole")
+        .copied()
+        .expect("rate derived");
+    assert!(
+        (total - 2000.0 / 18.0).abs() < 1e-9,
+        "Σops/Σcpu = 2000/18, got {total}",
+    );
+    let fast = e
+        .get("taobench_fast_ops_per_cpu_sec_whole")
+        .copied()
+        .expect("rate derived");
+    assert!(
+        (fast - 1100.0 / 18.0).abs() < 1e-9,
+        "Σfast/Σcpu = 1100/18, got {fast}",
+    );
+    let slow = e
+        .get("taobench_slow_ops_per_cpu_sec_whole")
+        .copied()
+        .expect("rate derived");
+    assert!(
+        (slow - 900.0 / 18.0).abs() < 1e-9,
+        "Σslow/Σcpu = 900/18, got {slow}",
+    );
     let hit = e
         .get("taobench_hit_fraction")
         .copied()
@@ -771,11 +803,10 @@ fn populate_run_pooled_taobench_absent_without_taobench_cgroup() {
     assert!(empty.ext_metrics.is_empty(), "no keys for empty cgroups");
 }
 
-/// `taobench_whole` present but `elapsed_ns == 0` (degenerate window): qps is
-/// undefined, so NEITHER components NOR rates are written (both-or-neither gate
-/// on the measured wall window).
+/// A missing wall/CPU window suppresses only denominator-dependent throughput.
+/// Raw counters and denominator-independent hit fractions remain measurable.
 #[test]
-fn populate_run_pooled_taobench_absent_on_zero_wall() {
+fn populate_run_pooled_taobench_zero_windows_keep_independent_metrics() {
     let cg = CgroupStats {
         taobench_whole: Some(crate::workload::taobench::run::TaobenchStats {
             get_cmds: 100,
@@ -783,36 +814,7 @@ fn populate_run_pooled_taobench_absent_on_zero_wall() {
             fast_ops: 90,
             slow_ops: 10,
             elapsed_ns: 0,
-        }),
-        num_workers: 1,
-        ..CgroupStats::default()
-    };
-    let mut stats = ScenarioStats {
-        cgroups: vec![cg],
-        ..ScenarioStats::default()
-    };
-    populate_run_pooled_taobench(&mut stats);
-    assert!(
-        stats.ext_metrics.is_empty(),
-        "no keys when the wall window is 0 (qps undefined)",
-    );
-}
-
-/// Wall window measured but ZERO ops completed (a cohort that issued no
-/// completions): the qps components/rates land at 0, but `taobench_hit_fraction`
-/// stays ABSENT — `derive_rate_metrics` skips its zero denominator (total ops
-/// 0), keeping a no-ops run distinct from a real 0.0 hit fraction. This is the
-/// per-metric gate: qps gated on the wall window, hit_fraction gated on
-/// completed ops via the derive's denominator guard.
-#[test]
-fn populate_run_pooled_taobench_hit_fraction_absent_when_no_ops() {
-    let cg = CgroupStats {
-        taobench_whole: Some(crate::workload::taobench::run::TaobenchStats {
-            get_cmds: 0,
-            get_misses: 0,
-            fast_ops: 0,
-            slow_ops: 0,
-            elapsed_ns: 5_000_000_000,
+            cpu_time_ns: 0,
         }),
         num_workers: 1,
         ..CgroupStats::default()
@@ -823,10 +825,47 @@ fn populate_run_pooled_taobench_hit_fraction_absent_when_no_ops() {
     };
     populate_run_pooled_taobench(&mut stats);
     let e = &stats.ext_metrics;
-    // Components present (wall measured); qps = 0.
+    assert_eq!(e.get("total_taobench_ops").copied(), Some(100.0));
+    assert!((e["taobench_hit_fraction"] - 0.9).abs() < f64::EPSILON);
+    assert!((e["taobench_command_hit_rate"] - 0.9).abs() < f64::EPSILON);
+    assert!(!e.contains_key("total_taobench_wall_sec"));
+    assert!(!e.contains_key("total_taobench_cpu_sec"));
+    assert!(!e.contains_key("taobench_total_ops_per_cpu_sec_whole"));
+}
+
+/// CPU window measured but zero ops completed: the throughput components/rates
+/// land at 0, but `taobench_hit_fraction`
+/// stays ABSENT — `derive_rate_metrics` skips its zero denominator (total ops
+/// 0), keeping a no-ops run distinct from a real 0.0 hit fraction. This is the
+/// per-metric gate: throughput gated on CPU time, hit_fraction gated on
+/// completed ops via the derive's denominator guard.
+#[test]
+fn populate_run_pooled_taobench_hit_fraction_absent_when_no_ops() {
+    let cg = CgroupStats {
+        taobench_whole: Some(crate::workload::taobench::run::TaobenchStats {
+            get_cmds: 0,
+            get_misses: 0,
+            fast_ops: 0,
+            slow_ops: 0,
+            elapsed_ns: 5_000_000_000,
+            cpu_time_ns: 5_000_000_000,
+        }),
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mut stats = ScenarioStats {
+        cgroups: vec![cg],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_taobench(&mut stats);
+    let e = &stats.ext_metrics;
+    // Components present (CPU measured); throughput = 0.
     assert_eq!(e.get("total_taobench_ops").copied(), Some(0.0));
     assert_eq!(e.get("total_taobench_wall_sec").copied(), Some(5.0));
-    assert_eq!(e.get("taobench_total_ops_per_sec").copied(), Some(0.0));
+    assert_eq!(
+        e.get("taobench_total_ops_per_cpu_sec_whole").copied(),
+        Some(0.0)
+    );
     // hit_fraction ABSENT (0/0 skipped), not a false 0.0.
     assert!(
         !e.contains_key("taobench_hit_fraction"),
@@ -860,6 +899,9 @@ fn populate_run_pooled_taobench_command_hit_diverges_from_response() {
             fast_ops: fast,
             slow_ops: slow,
             elapsed_ns: secs * 1_000_000_000,
+            // CPU mirrors the wall window per cgroup; unlike the MAX-folded
+            // wall it SUMs across cgroups (the qps denominator).
+            cpu_time_ns: secs * 1_000_000_000,
         })
     };
     let cg1 = CgroupStats {
@@ -1351,11 +1393,11 @@ fn populate_run_pooled_schbench_saturates_counter_overflow() {
     );
 }
 
-/// populate_run_pooled_iterations_per_cpu_sec folds with saturating arithmetic:
+/// populate_run_pooled_iteration_rate folds with saturating arithmetic:
 /// two cgroups whose total_cpu_time_ns / total_iterations each approach u64::MAX
 /// sum to a saturated u64::MAX (a huge-but-finite total) rather than wrapping.
 #[test]
-fn populate_run_pooled_iterations_per_cpu_sec_saturates_counter_overflow() {
+fn populate_run_pooled_iteration_rate_saturates_counter_overflow() {
     let mut stats = ScenarioStats {
         cgroups: vec![
             CgroupStats {
@@ -1371,7 +1413,7 @@ fn populate_run_pooled_iterations_per_cpu_sec_saturates_counter_overflow() {
         ],
         ..ScenarioStats::default()
     };
-    super::run_metrics::populate_run_pooled_iterations_per_cpu_sec(&mut stats);
+    super::run_metrics::populate_run_pooled_iteration_rate(&mut stats);
     let e = &stats.ext_metrics;
     assert_eq!(
         e.get("total_iterations_pooled").copied(),
@@ -2362,16 +2404,11 @@ fn merge_kind_enum_exhaustively_covers_metric_kind_variants() {
     );
 }
 
-/// merge_matched_phase_buckets must INCLUDE a synthesized
-/// (sample_count==0) bucket's capture-independent iteration_rate when
-/// merging it against a captured bucket at the same step_index. Since
-/// iteration_rate is a MetricKind::Rate, the merge sums each side's
-/// Counter components (total_phase_iterations / total_phase_duration_sec)
-/// and re-derives the rate as Σiters/Σseconds — so the synthesized side's
-/// iterations are pooled in, never dropped. Guards the no-silent-drops
-/// invariant for any cross-result phase merge (e.g. the per-cgroup
-/// phase-bucket fold). Unequal durations make the re-pool (450) distinct
-/// from a mean-of-ratios (500) and a dropped-synthesized result (400).
+/// `merge_matched_phase_buckets` must pool the canonical iteration-rate
+/// components as Σiterations / Σdelivered CPU-seconds. `sample_count == 0`
+/// does not invalidate a guest carrier: captures and worker CPU accounting are
+/// independent. Unequal denominators make the re-pool (450) distinct from a
+/// mean of ratios (500) and from dropping one carrier (400).
 #[test]
 fn merge_matched_phase_buckets_repools_synthesized_zero_count() {
     use std::collections::BTreeMap;
@@ -2381,10 +2418,10 @@ fn merge_matched_phase_buckets_repools_synthesized_zero_count() {
         label: "Step[1]".to_string(),
         start_ms: 2000,
         end_ms: 3000,
-        sample_count: 0, // synthesized zero-capture bucket: 600 iters / 1s
+        sample_count: 0, // zero-capture bucket: 600 iters / 1 CPU-s
         metrics: BTreeMap::from([
-            ("total_phase_iterations".to_string(), 600.0),
-            ("total_phase_duration_sec".to_string(), 1.0),
+            ("total_iterations_pooled".to_string(), 600.0),
+            ("total_cpu_time_sec".to_string(), 1.0),
         ]),
     };
     let captured = PhaseBucket {
@@ -2393,15 +2430,15 @@ fn merge_matched_phase_buckets_repools_synthesized_zero_count() {
         label: "Step[1]".to_string(),
         start_ms: 2000,
         end_ms: 3000,
-        sample_count: 5, // 1200 iters / 3s
+        sample_count: 5, // 1200 iters / 3 CPU-s
         metrics: BTreeMap::from([
-            ("total_phase_iterations".to_string(), 1200.0),
-            ("total_phase_duration_sec".to_string(), 3.0),
+            ("total_iterations_pooled".to_string(), 1200.0),
+            ("total_cpu_time_sec".to_string(), 3.0),
         ]),
     };
     let merged = merge_matched_phase_buckets(synth, captured);
-    // Re-pool: Σiters / Σseconds = (600 + 1200) / (1 + 3) = 1800/4 = 450/s.
-    // The synthesized side's 600 iters are SUMMED in (Counter merge), so
+    // Re-pool: Σiters / ΣCPU-seconds = (600 + 1200) / (1 + 3) = 450.
+    // The zero-capture side's 600 iters are SUMMED in (Counter merge), so
     // 450 — NOT 400 (synthesized dropped, captured 1200/3) and NOT 500
     // (mean of the two ready ratios 600 and 400).
     let r = merged
@@ -2415,7 +2452,7 @@ fn merge_matched_phase_buckets_repools_synthesized_zero_count() {
          not be dropped (400) or averaged as ratios (500); got {r}",
     );
     assert_eq!(
-        merged.metrics.get("total_phase_iterations").copied(),
+        merged.metrics.get("total_iterations_pooled").copied(),
         Some(1800.0),
         "iteration components sum across the merged buckets",
     );

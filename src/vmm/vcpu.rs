@@ -27,6 +27,7 @@ use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 use vmm_sys_util::timerfd::TimerFd;
 
 use super::exit_dispatch;
+use super::result::HostVcpuSchedstat;
 use crate::monitor;
 use crate::sync::Latch;
 
@@ -447,11 +448,25 @@ pub(crate) fn set_thread_cpumask(cpus: &[usize], label: &str) {
 /// Set the calling thread to SCHED_FIFO at the given priority.
 /// Logs success or warning via tracing; does not fail the VM.
 ///
+/// Callers: vCPU / BSP threads (FIFO-1) only under `performance_mode`,
+/// and the watchdog + monitor service threads (FIFO-2) UNCONDITIONALLY
+/// (their sensing must not dilate with the load it measures — see the
+/// freeze-coordinator spawn sites). So this is no longer a perf-mode-only
+/// path, and the messages no longer say so.
+///
 /// Uses `tracing::info!` / `tracing::warn!` rather than `eprintln!`
 /// so the warn-without-CAP_SYS_NICE branch is observable by tests
 /// that install a tracing subscriber (e.g. `tracing-test`).
 /// Previously `eprintln!` made the warning invisible to any test
 /// that didn't fork + redirect fd 2.
+///
+/// The failure warning is emitted at most ONCE per process: the two
+/// service threads now call this on every VM cell, and in
+/// `performance_mode` every vCPU calls it too, so on a host without
+/// CAP_SYS_NICE a single cell would otherwise emit N+2 identical warns —
+/// and a CI fleet running one cell per process would drown in them. The
+/// capability failure is uniform for the whole process, so the first
+/// warn tells the operator everything the rest would repeat.
 pub(crate) fn set_rt_priority(priority: i32, label: &str) {
     let param = libc::sched_param {
         sched_priority: priority,
@@ -461,16 +476,19 @@ pub(crate) fn set_rt_priority(priority: i32, label: &str) {
         tracing::info!(
             label = label,
             priority = priority,
-            "performance_mode: {label} set to SCHED_FIFO priority {priority}",
+            "{label} set to SCHED_FIFO priority {priority}",
         );
     } else {
         let err = std::io::Error::last_os_error();
-        tracing::warn!(
-            label = label,
-            priority = priority,
-            err = %err,
-            "performance_mode: WARNING: SCHED_FIFO for {label}: {err} (need CAP_SYS_NICE)",
-        );
+        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        WARN_ONCE.call_once(|| {
+            tracing::warn!(
+                label = label,
+                priority = priority,
+                err = %err,
+                "WARNING: SCHED_FIFO for {label}: {err} (need CAP_SYS_NICE)",
+            );
+        });
     }
 }
 
@@ -577,6 +595,12 @@ pub(crate) struct VcpuThread {
     /// drops while the coordinator is still iterating its
     /// captured handle Vec.
     pub(crate) alive: Arc<AtomicBool>,
+    /// Final cumulative schedstat sample taken by the AP on its own thread
+    /// immediately before exit. `/proc/self/task/<tid>` disappears when the
+    /// thread returns, so teardown consumers use this slot only when their
+    /// live proc read races that disappearance. One snapshot per vCPU
+    /// lifetime; never sampled from a timer path.
+    pub(crate) schedstat_at_exit: Arc<std::sync::Mutex<Option<HostVcpuSchedstat>>>,
 }
 
 /// Per-AP freeze-rendezvous state held outside `VcpuThread`. Cloned
@@ -1532,6 +1556,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
         let probe_vcpu = vm.vcpus.remove(0);
@@ -1567,6 +1592,7 @@ mod tests {
             immediate_exit: None,
             exit_evt,
             alive,
+            schedstat_at_exit: Arc::new(std::sync::Mutex::new(None)),
         };
 
         // Before the AP signals, wait_for_exit must NOT short-circuit:
@@ -1631,6 +1657,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
         let handle = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
@@ -1668,6 +1695,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
         let h0 = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
@@ -1701,6 +1729,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
         let ie = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
@@ -1747,6 +1776,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
         let ie = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
@@ -1774,6 +1804,7 @@ mod tests {
             immediate_exit: Some(ie),
             exit_evt,
             alive,
+            schedstat_at_exit: Arc::new(std::sync::Mutex::new(None)),
         };
         // Sanity: byte starts at 0 and alive is false — the test's
         // pre-condition.
@@ -1812,6 +1843,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
         let ie = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
@@ -1834,6 +1866,7 @@ mod tests {
             immediate_exit: Some(ie),
             exit_evt,
             alive,
+            schedstat_at_exit: Arc::new(std::sync::Mutex::new(None)),
         };
         let read_byte = || vt.immediate_exit.as_ref().unwrap().read_byte();
         assert_eq!(read_byte(), 0);

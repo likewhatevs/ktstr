@@ -87,6 +87,12 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// hostile guest could in principle resend) skip the eventfd
     /// write.
     pub sys_rdy_evt: &'a mut Option<Arc<EventFd>>,
+    /// Dedicated readiness event for configured host BPF-map writes. A
+    /// CRC-valid empty [`crate::vmm::wire::MsgType::BpfMapWriteReady`]
+    /// frame writes this eventfd; the map-writer thread blocks on it after
+    /// resolving the target and before mutation. `None` on runs without a
+    /// configured write, so ordinary tests allocate no fd and take no arm.
+    pub bpf_map_write_ready_evt: Option<&'a Arc<EventFd>>,
     /// Scheduler-swap notification latch. Set `true` on a CRC-valid
     /// `MSG_TYPE_SCHED_SWAP_NOTIFY` frame; the freeze coordinator's
     /// run-loop reads-and-clears it each iteration and synchronously
@@ -157,14 +163,36 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// defined in `vmlinux.lds.S` on every architecture so the
     /// host-side extraction is cross-arch.
     pub kernel_text_link_kva: u64,
-    /// Watchdog reset atomic + workload duration. SCENARIO_START
-    /// stores `(now - run_start + duration).as_nanos()` so the
-    /// watchdog starts the workload clock from scenario start, not
-    /// from boot or SYS_RDY.
+    /// KERN_ADDRS observability counters for the monitor's pre-latch
+    /// diagnostic: total frames consumed by this arm (CRC-valid or
+    /// not) and the CRC-failed subset. Field data distinguishing
+    /// "publish never arrived" from "publish arrived but a derive
+    /// gate rejected it" on dead-channel runs. Relaxed increments —
+    /// diagnostic-only.
+    pub kern_addrs_frames: &'a std::sync::atomic::AtomicU64,
+    pub kern_addrs_crc_bad: &'a std::sync::atomic::AtomicU64,
+    /// Count of frames whose `msg_type` matched NO known variant —
+    /// the decisive probe for the header-outside-CRC wire gap: the
+    /// 16-byte frame header (including `msg_type`) is NOT covered by
+    /// the payload CRC, so a corrupted type routes a frame here
+    /// INVISIBLY instead of to its real arm. `unknown > 0` alongside
+    /// `kern_addrs_frames == 0` on a dead-channel run fingers the
+    /// wire-format gap; `unknown == 0` exonerates it.
+    pub unknown_type_frames: &'a std::sync::atomic::AtomicU64,
+    /// Watchdog reset atomic + workload duration + `run_start` anchor +
+    /// the parallel provenance tag. SCENARIO_START stores
+    /// `(now - run_start + duration).as_nanos()` so the watchdog starts
+    /// the workload clock from scenario start, not from boot or SYS_RDY;
+    /// SCENARIO_RESUME / SCENARIO_END re-arm it too. Every arm that
+    /// stores `reset_ns` also stamps the tag with
+    /// `WatchdogResetTag::ScenarioStart` (one tag for the whole
+    /// scenario-dispatch subsystem) so the watchdog dump does not read a
+    /// stale earlier writer's tag.
     pub watchdog_reset: Option<(
         &'a std::sync::atomic::AtomicU64,
         std::time::Duration,
         std::time::Instant,
+        &'a std::sync::atomic::AtomicU8,
     )>,
     /// Pause timestamp (nanos since run_start). 0 = not paused.
     /// ScenarioPause stores current elapsed; ScenarioStart clears
@@ -222,6 +250,156 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// once the dispatch loop returns from the frame that
     /// promoted it.
     pub current_step: &'a std::sync::Arc<std::sync::atomic::AtomicU16>,
+    /// Guest scenario-elapsed clock in nanoseconds, published from each
+    /// `MSG_TYPE_WORKLOAD_PROGRESS` heartbeat. The run-loop reads it to
+    /// clock periodic captures off guest progress (0 until the first
+    /// heartbeat, then monotonic).
+    pub periodic_guest_elapsed_ns: &'a std::sync::atomic::AtomicU64,
+    /// Live lifecycle-stage ledger shared with the monitor and (a LATER
+    /// commit) the VM watchdog. The dispatch arms advance it
+    /// FORWARD-ONLY as they observe the guest's lifecycle / scenario
+    /// frames — `SysRdy`→Attach, `PayloadStarting`→Dispatch,
+    /// `WorkloadDispatched`/`ScenarioStart`→Body,
+    /// `ScenarioEnd`/`Exit`/`TestResult`→Teardown — and an `InitStarted`
+    /// lifecycle frame records a boot-progress epoch without moving the
+    /// stage. Each advance also folds a progress epoch (a stage change is
+    /// new-work evidence). `None` for callers that do not wire a ledger
+    /// (the CRC-defense / tx-dispatch unit fixtures); every advance site
+    /// guards on the `Option`, so an unwired caller is a silent no-op.
+    /// Only advanced on `msg.crc_ok` frames — a torn or hostile-guest
+    /// frame must not forge stage progress.
+    pub progress_ledger: Option<&'a crate::monitor::ProgressLedger>,
+    /// Event-anchored host-contention recorder. Production wires the same
+    /// shared recorder the monitor uses for constant-cost PSI samples; unit
+    /// fixtures leave it absent. Called only when the lifecycle ledger accepts
+    /// a real forward transition, so duplicate frames never trigger `/proc`
+    /// work.
+    pub contention_recorder: Option<&'a crate::vmm::freeze_coord::ContentionWitnessRecorder>,
+    /// The host vmlinux's GNU build-id, compared against the booted
+    /// kernel's build-id in the `MSG_TYPE_KERN_BUILD_ID` arm. `None`
+    /// (the vmlinux carried no note, or none was resolved) disables the
+    /// check — an absent expectation never fails a run. On a POSITIVE
+    /// mismatch the arm emits a loud `ktstr: FATAL:` diagnostic naming
+    /// both build-ids, so a stale/mismatched kernel-cache entry surfaces
+    /// as a clear "this vmlinux is not the booted kernel" signal instead
+    /// of downstream garbage offset reads.
+    pub expected_kernel_build_id: Option<&'a [u8]>,
+}
+
+/// Advance the shared lifecycle ledger to `stage`, stamping the frame's
+/// `run_start`-relative wall time. Forward-only and idempotent per
+/// [`crate::monitor::ProgressLedger::advance_phase`], so a duplicate or
+/// out-of-order frame is a no-op. Centralises the `Option`-guard + wall-
+/// time sample shared by every advancing arm. No-op without a wired
+/// ledger (unit fixtures).
+fn advance_stage(sinks: &BulkDispatchSinks<'_>, stage: crate::monitor::LifecycleStage) {
+    if let Some(ledger) = sinks.progress_ledger {
+        let wall_ns = u64::try_from(sinks.run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if ledger.advance_phase(stage as u8, wall_ns)
+            && let Some(recorder) = sinks.contention_recorder
+        {
+            recorder.advance(stage);
+        }
+    }
+}
+
+/// Record a progress epoch WITHOUT a stage change — a boot heartbeat
+/// (`Lifecycle` `InitStarted`) that proves the guest is live during
+/// `Boot` but does not move the coarse stage forward. Folds into
+/// `progress_epoch` exactly like a monitor-observed new-work tick. No-op
+/// without a wired ledger.
+fn record_boot_progress(sinks: &BulkDispatchSinks<'_>) {
+    if let Some(ledger) = sinks.progress_ledger {
+        let wall_ns = u64::try_from(sinks.run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let cpu_ns_now = ledger.cpu_ns_now.load(std::sync::atomic::Ordering::Relaxed);
+        ledger.record_progress(cpu_ns_now, wall_ns);
+    }
+}
+
+/// Arm the watchdog reset deadline to `elapsed + workload_duration` and
+/// stamp `tag` as its provenance, mirroring the [`crate::vmm::wire::MsgType::ScenarioStart`]
+/// arm's arithmetic. `elapsed` is `run_start.elapsed()` sampled by the
+/// caller (so a single clock read serves both the deadline and any
+/// sibling stamp). Plain `Release` store of `reset_ns` (not a max-style
+/// compare) — a fresh confirmed-progress frame re-anchors the workload
+/// clock unconditionally; the tag store is Relaxed (diagnostic only).
+/// No-op without a wired `watchdog_reset` budget (the CRC-defense /
+/// tx-dispatch unit fixtures leave it `None`).
+fn arm_watchdog_reset(
+    sinks: &BulkDispatchSinks<'_>,
+    elapsed: std::time::Duration,
+    tag: crate::vmm::freeze_coord::WatchdogResetTag,
+) {
+    if let Some((reset_ns, duration, _, reset_tag)) = sinks.watchdog_reset.as_ref() {
+        let target_ns = elapsed.as_nanos().saturating_add(duration.as_nanos());
+        let encoded = u64::try_from(target_ns).unwrap_or(u64::MAX).max(1);
+        reset_ns.store(encoded, std::sync::atomic::Ordering::Release);
+        reset_tag.store(tag as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Apply the live-stage side effect of a `Lifecycle` frame: decode the
+/// 1-byte [`crate::vmm::wire::LifecyclePhase`] discriminant (`payload[0]`)
+/// and advance the ledger / record boot progress accordingly. Crc-gated
+/// — a torn frame must not forge stage progress. Pure ledger side
+/// effect; the caller still buckets the frame verbatim. Extracted from
+/// [`dispatch_bulk_message`] so the arm stays a one-liner (and the
+/// per-fn size guard is not perturbed by the phase match).
+fn lifecycle_stage_advance(sinks: &BulkDispatchSinks<'_>, msg: &crate::vmm::bulk::BulkMessage) {
+    if !msg.crc_ok {
+        return;
+    }
+    let Some(phase) = msg
+        .payload
+        .first()
+        .and_then(|b| crate::vmm::wire::LifecyclePhase::from_wire(*b))
+    else {
+        return;
+    };
+    match phase {
+        // InitStarted: boot heartbeat — reached init but still Boot.
+        // Counts as progress (liveness during a slow boot) WITHOUT a
+        // stage advance.
+        crate::vmm::wire::LifecyclePhase::InitStarted => record_boot_progress(sinks),
+        // →Dispatch: guest dispatch is entering the workload preamble.
+        crate::vmm::wire::LifecyclePhase::PayloadStarting => {
+            advance_stage(sinks, crate::monitor::LifecycleStage::Dispatch)
+        }
+        // →Body: a verifier cell proved a worker made forward progress
+        // on-CPU (a test cell reaches Body via ScenarioStart instead —
+        // either advances).
+        crate::vmm::wire::LifecyclePhase::WorkloadDispatched => {
+            advance_stage(sinks, crate::monitor::LifecycleStage::Body)
+        }
+        // SchedulerAttached: a REAL sched_ext scheduler bound with a live
+        // child (see `spawn_scheduler_from_paths`). This lands DURING the
+        // Attach stage — `SysRdy` already moved Boot→Attach and the
+        // →Dispatch/→Body advances come from `PayloadStarting` /
+        // `ScenarioStart` / `WorkloadDispatched` — so it records PROGRESS
+        // (confirmed attach is new-work evidence) WITHOUT advancing the
+        // coarse stage. THE MAIN ACT: arm the watchdog reset to
+        // now + workload_duration, tagged `GuestAttachConfirm`, so the
+        // progress watchdog measures the workload budget from the
+        // guest-confirmed attach moment rather than from VM boot. This is
+        // the authoritative, evented counterpart to the monitor's polled
+        // `*scx_root` latch (now demoted to a CAS fallback in
+        // `monitor::reader`): the guest frame's plain store wins over a
+        // later latch store, and the latch's CAS(0,..) fails once this
+        // frame has armed the deadline.
+        crate::vmm::wire::LifecyclePhase::SchedulerAttached => {
+            record_boot_progress(sinks);
+            arm_watchdog_reset(
+                sinks,
+                sinks.run_start.elapsed(),
+                crate::vmm::freeze_coord::WatchdogResetTag::GuestAttachConfirm,
+            );
+        }
+        // SchedulerDied / SchedulerNotAttached: NO stage change and NO
+        // progress. The guest continues to Phase 5 regardless of an
+        // attach failure, and a failure is not forward progress.
+        crate::vmm::wire::LifecyclePhase::SchedulerDied
+        | crate::vmm::wire::LifecyclePhase::SchedulerNotAttached => {}
+    }
 }
 
 /// Classify and dispatch a single `BulkMessage` from the port-1
@@ -359,7 +537,34 @@ pub(super) fn dispatch_bulk_message(
                      pre-sample wait"
                 );
             }
+            // Boot→Attach: SYS_RDY means the guest reached boot-complete
+            // and the scheduler is attaching to sched_ext. Gate on crc_ok
+            // only — the empty-payload gate above is the anti-smuggle net
+            // for the eventfd, but a CRC-valid boot signal advances the
+            // stage regardless of a (hostile) trailing byte. Forward-only,
+            // so a resent SysRdy is a no-op.
+            if msg.crc_ok {
+                advance_stage(sinks, crate::monitor::LifecycleStage::Attach);
+            }
             // SysRdy is coordinator-internal — do NOT bucket.
+            None
+        }
+        Some(crate::vmm::wire::MsgType::BpfMapWriteReady) => {
+            // Release a configured map writer only on the exact empty-frame
+            // shape. The eventfd is level-triggered and the writer consumes
+            // the edge once, so an early frame remains sticky until map
+            // discovery completes. Coordinator-internal — do NOT bucket.
+            if msg.crc_ok
+                && msg.payload.is_empty()
+                && let Some(evt) = sinks.bpf_map_write_ready_evt
+                && let Err(e) = evt.write(1)
+            {
+                tracing::warn!(
+                    err = %e,
+                    "freeze_coord: BPF-map-write readiness eventfd write failed; \
+                     injection remains safely gated"
+                );
+            }
             None
         }
         Some(crate::vmm::wire::MsgType::SchedSwapNotify) => {
@@ -377,6 +582,49 @@ pub(super) fn dispatch_bulk_message(
                 sinks
                     .sched_swap_notify
                     .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            None
+        }
+        _ if msg.msg_type == crate::vmm::wire::MSG_TYPE_WORKLOAD_PROGRESS => {
+            // Guest scenario-elapsed heartbeat (see
+            // `MSG_TYPE_WORKLOAD_PROGRESS`). Publish the guest clock (ms→ns)
+            // so the run-loop can place periodic captures on guest progress
+            // rather than host wall-clock. CRC-gated and shape-gated to the
+            // exact 8-byte payload so a torn or oversized frame cannot forge
+            // a bogus clock. Coordinator-internal — do NOT bucket.
+            if msg.crc_ok
+                && let Ok(bytes) = <[u8; 8]>::try_from(&*msg.payload)
+            {
+                let elapsed_ns = u64::from_le_bytes(bytes).saturating_mul(1_000_000);
+                sinks
+                    .periodic_guest_elapsed_ns
+                    .store(elapsed_ns, std::sync::atomic::Ordering::Release);
+            }
+            None
+        }
+        _ if msg.msg_type == crate::vmm::wire::MSG_TYPE_KERN_BUILD_ID => {
+            // The booted kernel's GNU build-id (payload) vs the vmlinux
+            // ktstr introspects (`expected_kernel_build_id`). Only a
+            // POSITIVE mismatch — both present and different — latches the
+            // fault; an absent expectation, an empty payload, or a torn
+            // frame leaves the flag clear so a valid run is never failed.
+            if msg.crc_ok
+                && !msg.payload.is_empty()
+                && let Some(expected) = sinks.expected_kernel_build_id
+                && &*msg.payload != expected
+            {
+                let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+                eprintln!(
+                    "ktstr: FATAL: booted-kernel build-id {} does not match the \
+                     vmlinux ktstr is introspecting ({}) — the kernel-cache \
+                     entry is STALE/MISMATCHED: this vmlinux is a different build \
+                     than the running Image, so every host-side symbol/offset \
+                     read this run is garbage. Delete the offending kernel-cache \
+                     entry (its dir under the ktstr kernel cache) and re-run to \
+                     rebuild a consistent Image+vmlinux pair.",
+                    hex(msg.payload.as_ref()),
+                    hex(expected),
+                );
             }
             None
         }
@@ -412,6 +660,18 @@ pub(super) fn dispatch_bulk_message(
             // makes a future protocol extension that appends bytes
             // trip loudly at this arm rather than silently dropping
             // the new bytes.
+            // Observability first (before any gate): count every frame
+            // this arm consumes and the CRC-failed subset, so the
+            // monitor's pre-latch diagnostic can distinguish
+            // "never arrived" from "arrived but rejected".
+            sinks
+                .kern_addrs_frames
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !msg.crc_ok {
+                sinks
+                    .kern_addrs_crc_bad
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if msg.crc_ok
                 && let Some(addrs) = crate::vmm::wire::KernAddrs::from_payload(&msg.payload)
             {
@@ -698,11 +958,24 @@ pub(super) fn dispatch_bulk_message(
                     std::sync::atomic::Ordering::Relaxed,
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                if let Some((reset_ns, duration, _)) = sinks.watchdog_reset.as_ref() {
+                if let Some((reset_ns, duration, _, reset_tag)) = sinks.watchdog_reset.as_ref() {
                     let target_ns = elapsed.as_nanos().saturating_add(duration.as_nanos());
                     let encoded = u64::try_from(target_ns).unwrap_or(u64::MAX).max(1);
                     reset_ns.store(encoded, std::sync::atomic::Ordering::Release);
+                    // Stamp provenance alongside the ns store (Relaxed —
+                    // diagnostic only) so the watchdog dump attributes
+                    // the deadline to scenario dispatch, not a stale tag.
+                    reset_tag.store(
+                        crate::vmm::freeze_coord::WatchdogResetTag::ScenarioStart as u8,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
+                // →Body: a test cell enters its body at ScenarioStart
+                // (a verifier cell reaches Body via WorkloadDispatched in
+                // the Lifecycle arm instead — either advances). Forward-
+                // only, so a workload re-run's later ScenarioStart is a
+                // no-op once Body (or Teardown) has been reached.
+                advance_stage(sinks, crate::monitor::LifecycleStage::Body);
             }
             Some(crate::vmm::wire::ShmEntry {
                 msg_type: msg.msg_type,
@@ -715,7 +988,7 @@ pub(super) fn dispatch_bulk_message(
                 let elapsed = sinks
                     .watchdog_reset
                     .as_ref()
-                    .map(|(_, _, run_start)| run_start.elapsed().as_nanos())
+                    .map(|(_, _, run_start, _)| run_start.elapsed().as_nanos())
                     .unwrap_or(0);
                 let encoded = u64::try_from(elapsed).unwrap_or(u64::MAX).max(1);
                 sinks
@@ -730,7 +1003,7 @@ pub(super) fn dispatch_bulk_message(
         }
         Some(crate::vmm::wire::MsgType::ScenarioResume) => {
             if msg.crc_ok
-                && let Some((reset_ns, _, run_start)) = sinks.watchdog_reset.as_ref()
+                && let Some((reset_ns, _, run_start, reset_tag)) = sinks.watchdog_reset.as_ref()
             {
                 let paused_at = sinks
                     .watchdog_pause_ns
@@ -742,6 +1015,13 @@ pub(super) fn dispatch_bulk_message(
                     let extended = (prior as u128).saturating_add(pause_duration);
                     let encoded = u64::try_from(extended).unwrap_or(u64::MAX).max(1);
                     reset_ns.store(encoded, std::sync::atomic::Ordering::Release);
+                    // Same scenario-dispatch subsystem as ScenarioStart —
+                    // stamp the tag so the dump never shows a stale
+                    // writer after a resume re-arms the deadline.
+                    reset_tag.store(
+                        crate::vmm::freeze_coord::WatchdogResetTag::ScenarioStart as u8,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     // Bump the periodic-capture cumulative pause
                     // counter by the same `pause_duration`. Periodic
                     // boundaries are anchored to workload time, so a
@@ -770,12 +1050,32 @@ pub(super) fn dispatch_bulk_message(
         }
         Some(crate::vmm::wire::MsgType::ScenarioEnd) => {
             if msg.crc_ok
-                && let Some((reset_ns, duration, run_start)) = sinks.watchdog_reset.as_ref()
+                && let Some((reset_ns, duration, run_start, reset_tag)) =
+                    sinks.watchdog_reset.as_ref()
             {
                 let elapsed = run_start.elapsed();
                 let target_ns = elapsed.as_nanos().saturating_add(duration.as_nanos());
                 let encoded = u64::try_from(target_ns).unwrap_or(u64::MAX).max(1);
                 reset_ns.store(encoded, std::sync::atomic::Ordering::Release);
+                // Same scenario-dispatch subsystem — stamp the tag so a
+                // scenario-end re-arm is not attributed to a stale writer.
+                reset_tag.store(
+                    crate::vmm::freeze_coord::WatchdogResetTag::ScenarioStart as u8,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            // →Teardown: the scenario ended; the guest is winding down.
+            // Hoisted OUT of the watchdog_reset gate above so it fires
+            // even when no workload-duration budget was wired. Forward-
+            // only, so a later Exit/TestResult Teardown advance is a
+            // no-op.
+            if msg.crc_ok {
+                if let Some((elapsed_ms, _)) = crate::vmm::wire::parse_scenario_end(&msg.payload)
+                    && let Some(recorder) = sinks.contention_recorder
+                {
+                    recorder.record_guest_body_elapsed_ms(elapsed_ms);
+                }
+                advance_stage(sinks, crate::monitor::LifecycleStage::Teardown);
             }
             Some(crate::vmm::wire::ShmEntry {
                 msg_type: msg.msg_type,
@@ -825,20 +1125,62 @@ pub(super) fn dispatch_bulk_message(
                 crc_ok: msg.crc_ok,
             })
         }
+        Some(crate::vmm::wire::MsgType::Lifecycle) => {
+            // Live stage tracking from the guest's 1-byte lifecycle
+            // discriminant (see [`lifecycle_stage_advance`]). The frame is
+            // STILL bucketed verbatim below: Lifecycle is verdict data the
+            // post-hoc verdict scan reads (attach / dispatch failure
+            // classification), so the stage side effect must NOT consume
+            // it. Mirrors the ScenarioStart arm — act, then return the
+            // verbatim ShmEntry.
+            lifecycle_stage_advance(sinks, msg);
+            Some(crate::vmm::wire::ShmEntry {
+                msg_type: msg.msg_type,
+                payload: msg.payload.to_vec(),
+                crc_ok: msg.crc_ok,
+            })
+        }
+        Some(crate::vmm::wire::MsgType::Exit) => {
+            // →Teardown: the guest payload is exiting. Bucket verbatim
+            // (Exit is verdict data the post-hoc scan reads) AND advance
+            // the stage, forward-only + crc-gated.
+            if msg.crc_ok {
+                advance_stage(sinks, crate::monitor::LifecycleStage::Teardown);
+            }
+            Some(crate::vmm::wire::ShmEntry {
+                msg_type: msg.msg_type,
+                payload: msg.payload.to_vec(),
+                crc_ok: msg.crc_ok,
+            })
+        }
+        Some(crate::vmm::wire::MsgType::TestResult) => {
+            // →Teardown: the guest reported a test verdict; it is winding
+            // down. Same bucket-and-advance shape as Exit.
+            if msg.crc_ok {
+                advance_stage(sinks, crate::monitor::LifecycleStage::Teardown);
+            }
+            Some(crate::vmm::wire::ShmEntry {
+                msg_type: msg.msg_type,
+                payload: msg.payload.to_vec(),
+                crc_ok: msg.crc_ok,
+            })
+        }
         Some(other) if !other.is_coordinator_internal() => {
             // Every other typed verdict-bearing variant
-            // (StepEnd, Exit, TestResult, Crash, PayloadMetrics,
+            // (StepEnd, Crash, PayloadMetrics,
             // Profraw, WprofTrace, WprofTraceChunk,
-            // Stdout, Stderr, SchedLog, Lifecycle, ExecExit, Dmesg,
+            // Stdout, Stderr, SchedLog, ExecExit, Dmesg,
             // ProbeOutput) accumulates into the bucket verbatim. (ExecExit is listed for
             // completeness but is shell-mode-only -- sent only by
             // `cargo ktstr shell --exec` and consumed host-side by
             // `KtstrVm::run_interactive`, not the freeze coordinator;
             // the scheduler-test path never receives one, so it is
-            // never actually bucketed here.) Stimulus and ScenarioEnd
-            // have their own typed arms above (Stimulus decodes
-            // step_index into the host-side mirror, ScenarioEnd arms the
-            // watchdog, both then bucket). StepEnd has NO dedicated arm
+            // never actually bucketed here.) Stimulus, ScenarioEnd,
+            // Lifecycle, Exit, and TestResult have their own typed arms
+            // above (Stimulus decodes step_index into the host-side
+            // mirror; ScenarioEnd/Exit/TestResult advance the lifecycle
+            // ledger to Teardown; Lifecycle advances the ledger per its
+            // 1-byte phase; all then bucket). StepEnd has NO dedicated arm
             // and buckets here: unlike Stimulus it publishes no new
             // step_index for the host mirror — its step_index equals the
             // StepStart frame that already set `current_step` for the
@@ -864,9 +1206,13 @@ pub(super) fn dispatch_bulk_message(
             None
         }
         None => {
-            // Unknown msg_type — log once and drop. A future guest
-            // variant the host does not know about would otherwise
-            // produce a phantom verdict entry.
+            // Unknown msg_type — count (kill-dump probe: see the
+            // `unknown_type_frames` sink doc), log, and drop. A future
+            // guest variant the host does not know about would
+            // otherwise produce a phantom verdict entry.
+            sinks
+                .unknown_type_frames
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 msg_type = msg.msg_type,
                 len = msg.payload.len(),
@@ -874,6 +1220,408 @@ pub(super) fn dispatch_bulk_message(
                 "freeze_coord: unknown MSG_TYPE_* on bulk port; dropping"
             );
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod stage_tests {
+    //! Live lifecycle-stage tracking: drive the production
+    //! [`dispatch_bulk_message`] against synthetic guest frames with a
+    //! wired [`crate::monitor::ProgressLedger`] and assert the coarse
+    //! stage walks `Boot`→`Attach`→`Dispatch`→`Body`→`Teardown`, that
+    //! epochs bump and CPU anchors snapshot on each advance, that the
+    //! advance is monotone (no regress from a late/duplicate frame), that
+    //! an attach-failure lifecycle frame does NOT advance, and that the
+    //! Lifecycle arm still returns the verbatim bucket entry.
+    use super::{BulkDispatchSinks, dispatch_bulk_message};
+    use crate::monitor::{LifecycleStage, ProgressLedger};
+    use crate::vmm::freeze_coord::state::SnapshotRequest;
+    use crate::vmm::wire::{LifecyclePhase, MsgType, ShmEntry};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+    use std::time::Instant;
+    use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
+
+    /// Owns every backing value a [`BulkDispatchSinks`] borrows PLUS a
+    /// real [`ProgressLedger`], so a test can drive the production
+    /// dispatch and then read the ledger's post-state.
+    struct SinkState {
+        ledger: ProgressLedger,
+        kill: Arc<AtomicBool>,
+        kill_evt: Arc<EventFd>,
+        sys_rdy_evt: Option<Arc<EventFd>>,
+        snapshot_requests_pending: Vec<SnapshotRequest>,
+        kernel_op_requests_pending: Vec<crate::vmm::wire::KernelOpRequestPayload>,
+        kern_phys_base: Arc<AtomicU64>,
+        kern_phys_base_evt: EventFd,
+        kern_virt_kaslr: Arc<AtomicU64>,
+        kern_virt_kaslr_evt: EventFd,
+        kern_addrs_frames: AtomicU64,
+        kern_addrs_crc_bad: AtomicU64,
+        unknown_type_frames: AtomicU64,
+        watchdog_pause_ns: AtomicU64,
+        scenario_start_ns: AtomicU64,
+        sched_swap_notify: AtomicBool,
+        scenario_pause_cumulative_ns: AtomicU64,
+        run_start: Instant,
+        current_step: Arc<AtomicU16>,
+        periodic_guest_elapsed_ns: std::sync::atomic::AtomicU64,
+        /// Watchdog-reset deadline atomic + provenance tag. Wired into
+        /// `watchdog_reset` only when `wire_reset` is set (the default is
+        /// `None`, matching the pre-C6 fixture so every stage test that
+        /// does not opt in observes the original no-budget behavior).
+        reset_ns: AtomicU64,
+        reset_tag: std::sync::atomic::AtomicU8,
+        workload_duration: std::time::Duration,
+        wire_reset: bool,
+    }
+
+    impl SinkState {
+        fn new() -> Self {
+            Self {
+                ledger: ProgressLedger::default(),
+                kill: Arc::new(AtomicBool::new(false)),
+                kill_evt: Arc::new(EventFd::new(EFD_NONBLOCK).expect("kill eventfd")),
+                sys_rdy_evt: Some(Arc::new(
+                    EventFd::new(EFD_NONBLOCK).expect("sys_rdy eventfd"),
+                )),
+                snapshot_requests_pending: Vec::new(),
+                kernel_op_requests_pending: Vec::new(),
+                kern_phys_base: Arc::new(AtomicU64::new(0)),
+                kern_phys_base_evt: EventFd::new(EFD_NONBLOCK).expect("phys_base eventfd"),
+                kern_virt_kaslr: Arc::new(AtomicU64::new(0)),
+                kern_virt_kaslr_evt: EventFd::new(EFD_NONBLOCK).expect("virt_kaslr eventfd"),
+                kern_addrs_frames: AtomicU64::new(0),
+                kern_addrs_crc_bad: AtomicU64::new(0),
+                unknown_type_frames: AtomicU64::new(0),
+                watchdog_pause_ns: AtomicU64::new(0),
+                scenario_start_ns: AtomicU64::new(0),
+                sched_swap_notify: AtomicBool::new(false),
+                scenario_pause_cumulative_ns: AtomicU64::new(0),
+                run_start: Instant::now(),
+                current_step: Arc::new(AtomicU16::new(0)),
+                periodic_guest_elapsed_ns: std::sync::atomic::AtomicU64::new(0),
+                reset_ns: AtomicU64::new(0),
+                reset_tag: std::sync::atomic::AtomicU8::new(0),
+                workload_duration: std::time::Duration::from_secs(60),
+                wire_reset: false,
+            }
+        }
+
+        /// Opt this fixture into a wired `watchdog_reset` budget so the
+        /// dispatch arms that arm the deadline (ScenarioStart, ScenarioEnd,
+        /// the SchedulerAttached Lifecycle arm) exercise their reset stores.
+        fn arm_reset(&mut self) {
+            self.wire_reset = true;
+        }
+
+        fn sinks(&mut self) -> BulkDispatchSinks<'_> {
+            BulkDispatchSinks {
+                kill: &self.kill,
+                kill_evt: &self.kill_evt,
+                run_is_wprof: false,
+                sys_rdy_evt: &mut self.sys_rdy_evt,
+                bpf_map_write_ready_evt: None,
+                snapshot_requests_pending: &mut self.snapshot_requests_pending,
+                kernel_op_requests_pending: &mut self.kernel_op_requests_pending,
+                kern_phys_base: &self.kern_phys_base,
+                kern_phys_base_evt: &self.kern_phys_base_evt,
+                kern_virt_kaslr: &self.kern_virt_kaslr,
+                kern_virt_kaslr_evt: &self.kern_virt_kaslr_evt,
+                kernel_text_link_kva: 0,
+                kern_addrs_frames: &self.kern_addrs_frames,
+                kern_addrs_crc_bad: &self.kern_addrs_crc_bad,
+                unknown_type_frames: &self.unknown_type_frames,
+                watchdog_reset: if self.wire_reset {
+                    Some((
+                        &self.reset_ns,
+                        self.workload_duration,
+                        self.run_start,
+                        &self.reset_tag,
+                    ))
+                } else {
+                    None
+                },
+                watchdog_pause_ns: &self.watchdog_pause_ns,
+                scenario_start_ns: &self.scenario_start_ns,
+                sched_swap_notify: &self.sched_swap_notify,
+                scenario_pause_cumulative_ns: &self.scenario_pause_cumulative_ns,
+                run_start: self.run_start,
+                current_step: &self.current_step,
+                periodic_guest_elapsed_ns: &self.periodic_guest_elapsed_ns,
+                progress_ledger: Some(&self.ledger),
+                contention_recorder: None,
+                expected_kernel_build_id: None,
+            }
+        }
+
+        fn dispatch(&mut self, msg: &crate::vmm::bulk::BulkMessage) -> Option<ShmEntry> {
+            let mut sinks = self.sinks();
+            dispatch_bulk_message(msg, &mut sinks)
+        }
+
+        fn phase(&self) -> u8 {
+            self.ledger.phase.load(Ordering::Relaxed)
+        }
+        fn phase_epoch(&self) -> u32 {
+            self.ledger.phase_epoch.load(Ordering::Acquire)
+        }
+        fn progress_epoch(&self) -> u64 {
+            self.ledger.progress_epoch.load(Ordering::Acquire)
+        }
+        fn reset_ns(&self) -> u64 {
+            self.reset_ns.load(Ordering::Acquire)
+        }
+        fn reset_tag(&self) -> u8 {
+            self.reset_tag.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Build a synthetic assembled `BulkMessage` — the shape
+    /// `dispatch_bulk_message` receives after `HostAssembler::feed`.
+    fn frame(msg_type: u32, payload: Vec<u8>, crc_ok: bool) -> crate::vmm::bulk::BulkMessage {
+        crate::vmm::bulk::BulkMessage {
+            msg_type,
+            payload: payload.into(),
+            crc_ok,
+        }
+    }
+
+    fn lifecycle(phase: LifecyclePhase, crc_ok: bool) -> crate::vmm::bulk::BulkMessage {
+        frame(
+            MsgType::Lifecycle.wire_value(),
+            vec![phase.wire_value()],
+            crc_ok,
+        )
+    }
+
+    /// Test cell path: Boot →(SysRdy)→ Attach →(PayloadStarting)→
+    /// Dispatch →(ScenarioStart)→ Body →(Exit)→ Teardown. Each forward
+    /// step bumps both epochs by exactly one. (The Tier-1 CPU anchor is
+    /// monitor-side now, so no `cpu_ns_at_phase` snapshot is asserted here.)
+    #[test]
+    fn test_cell_stage_walk() {
+        let mut s = SinkState::new();
+        assert_eq!(s.phase(), LifecycleStage::Boot as u8);
+        assert_eq!(s.phase_epoch(), 0);
+        assert_eq!(s.progress_epoch(), 0);
+
+        s.dispatch(&frame(MsgType::SysRdy.wire_value(), Vec::new(), true));
+        assert_eq!(s.phase(), LifecycleStage::Attach as u8);
+        assert_eq!(s.phase_epoch(), 1);
+        assert_eq!(s.progress_epoch(), 1);
+
+        s.dispatch(&lifecycle(LifecyclePhase::PayloadStarting, true));
+        assert_eq!(s.phase(), LifecycleStage::Dispatch as u8);
+        assert_eq!(s.phase_epoch(), 2);
+        assert_eq!(s.progress_epoch(), 2);
+
+        s.dispatch(&frame(
+            MsgType::ScenarioStart.wire_value(),
+            Vec::new(),
+            true,
+        ));
+        assert_eq!(s.phase(), LifecycleStage::Body as u8);
+        assert_eq!(s.phase_epoch(), 3);
+        assert_eq!(s.progress_epoch(), 3);
+
+        s.dispatch(&frame(MsgType::Exit.wire_value(), Vec::new(), true));
+        assert_eq!(s.phase(), LifecycleStage::Teardown as u8);
+        assert_eq!(s.phase_epoch(), 4);
+        assert_eq!(s.progress_epoch(), 4);
+    }
+
+    /// Verifier cell path reaches Body via `WorkloadDispatched` (not
+    /// ScenarioStart), and ScenarioEnd drives Teardown.
+    #[test]
+    fn verifier_cell_reaches_body_via_workload_dispatched() {
+        let mut s = SinkState::new();
+        s.dispatch(&frame(MsgType::SysRdy.wire_value(), Vec::new(), true));
+        s.dispatch(&lifecycle(LifecyclePhase::PayloadStarting, true));
+        assert_eq!(s.phase(), LifecycleStage::Dispatch as u8);
+        s.dispatch(&lifecycle(LifecyclePhase::WorkloadDispatched, true));
+        assert_eq!(s.phase(), LifecycleStage::Body as u8);
+        s.dispatch(&frame(MsgType::ScenarioEnd.wire_value(), Vec::new(), true));
+        assert_eq!(s.phase(), LifecycleStage::Teardown as u8);
+    }
+
+    /// Monotone: after Exit drove Teardown, a stray (late/duplicate)
+    /// ScenarioStart must NOT regress the stage back to Body, and must
+    /// bump neither epoch — a duplicate is not fresh progress.
+    #[test]
+    fn no_regress_from_stray_scenario_start_after_exit() {
+        let mut s = SinkState::new();
+        s.dispatch(&frame(MsgType::Exit.wire_value(), Vec::new(), true));
+        assert_eq!(s.phase(), LifecycleStage::Teardown as u8);
+        let pe = s.phase_epoch();
+        let pr = s.progress_epoch();
+
+        s.dispatch(&frame(
+            MsgType::ScenarioStart.wire_value(),
+            Vec::new(),
+            true,
+        ));
+        assert_eq!(
+            s.phase(),
+            LifecycleStage::Teardown as u8,
+            "stray ScenarioStart regressed the stage"
+        );
+        assert_eq!(s.phase_epoch(), pe, "no-op advance bumped phase_epoch");
+        assert_eq!(
+            s.progress_epoch(),
+            pr,
+            "no-op advance bumped progress_epoch"
+        );
+    }
+
+    /// InitStarted is a boot heartbeat: it records PROGRESS but does NOT
+    /// advance the stage off Boot or bump `phase_epoch`.
+    #[test]
+    fn init_started_is_progress_without_stage_advance() {
+        let mut s = SinkState::new();
+        s.dispatch(&lifecycle(LifecyclePhase::InitStarted, true));
+        assert_eq!(s.phase(), LifecycleStage::Boot as u8);
+        assert_eq!(s.phase_epoch(), 0, "InitStarted advanced the stage");
+        assert_eq!(
+            s.progress_epoch(),
+            1,
+            "InitStarted was not counted as progress"
+        );
+    }
+
+    /// An attach-failure lifecycle frame (`SchedulerDied` /
+    /// `SchedulerNotAttached`) must NOT advance the stage or record
+    /// progress — the guest proceeds to Phase 5 regardless, and a failure
+    /// is not forward progress.
+    #[test]
+    fn scheduler_failure_does_not_advance() {
+        let mut s = SinkState::new();
+        // Get to Dispatch first so a regression would be observable.
+        s.dispatch(&frame(MsgType::SysRdy.wire_value(), Vec::new(), true));
+        s.dispatch(&lifecycle(LifecyclePhase::PayloadStarting, true));
+        let pe = s.phase_epoch();
+        let pr = s.progress_epoch();
+
+        s.dispatch(&lifecycle(LifecyclePhase::SchedulerDied, true));
+        assert_eq!(s.phase(), LifecycleStage::Dispatch as u8);
+        assert_eq!(s.phase_epoch(), pe);
+        assert_eq!(s.progress_epoch(), pr);
+
+        s.dispatch(&lifecycle(LifecyclePhase::SchedulerNotAttached, true));
+        assert_eq!(s.phase(), LifecycleStage::Dispatch as u8);
+        assert_eq!(s.phase_epoch(), pe);
+        assert_eq!(s.progress_epoch(), pr);
+    }
+
+    /// `SchedulerAttached` records PROGRESS but does NOT advance the coarse
+    /// stage (it lands during Attach; the stage advances come from
+    /// PayloadStarting / ScenarioStart / WorkloadDispatched), and it does
+    /// NOT bump `phase_epoch`.
+    #[test]
+    fn scheduler_attached_is_progress_without_stage_advance() {
+        let mut s = SinkState::new();
+        // SysRdy first so the stage is Attach when the confirm lands.
+        s.dispatch(&frame(MsgType::SysRdy.wire_value(), Vec::new(), true));
+        assert_eq!(s.phase(), LifecycleStage::Attach as u8);
+        let pe = s.phase_epoch();
+        let pr = s.progress_epoch();
+
+        s.dispatch(&lifecycle(LifecyclePhase::SchedulerAttached, true));
+        assert_eq!(
+            s.phase(),
+            LifecycleStage::Attach as u8,
+            "SchedulerAttached advanced the stage"
+        );
+        assert_eq!(s.phase_epoch(), pe, "SchedulerAttached bumped phase_epoch");
+        assert_eq!(
+            s.progress_epoch(),
+            pr + 1,
+            "SchedulerAttached was not counted as progress"
+        );
+    }
+
+    /// `SchedulerAttached` arms the watchdog reset deadline to
+    /// now + workload_duration and stamps `GuestAttachConfirm` provenance —
+    /// the evented counterpart to the monitor's polled scx_root latch. A
+    /// CRC-bad confirm frame must NOT arm it (a torn frame must not forge a
+    /// deadline).
+    #[test]
+    fn scheduler_attached_arms_watchdog_reset_with_confirm_tag() {
+        let mut s = SinkState::new();
+        s.arm_reset();
+        assert_eq!(s.reset_ns(), 0, "precondition: reset not yet armed");
+
+        // CRC-bad confirm: no arm.
+        s.dispatch(&lifecycle(LifecyclePhase::SchedulerAttached, false));
+        assert_eq!(
+            s.reset_ns(),
+            0,
+            "a torn SchedulerAttached forged a deadline"
+        );
+
+        // CRC-ok confirm: arm + stamp.
+        s.dispatch(&lifecycle(LifecyclePhase::SchedulerAttached, true));
+        assert_ne!(
+            s.reset_ns(),
+            0,
+            "confirmed attach must arm the reset deadline"
+        );
+        assert_eq!(
+            s.reset_tag(),
+            crate::vmm::freeze_coord::WatchdogResetTag::GuestAttachConfirm as u8,
+            "the confirm arm must stamp GuestAttachConfirm provenance",
+        );
+    }
+
+    /// A CRC-bad lifecycle frame must NOT forge stage progress, but STILL
+    /// buckets verbatim (the host-side verdict scan filters on crc_ok).
+    #[test]
+    fn crc_bad_lifecycle_does_not_advance_but_buckets() {
+        let mut s = SinkState::new();
+        let entry = s.dispatch(&lifecycle(LifecyclePhase::PayloadStarting, false));
+        assert_eq!(
+            s.phase(),
+            LifecycleStage::Boot as u8,
+            "torn frame forged a stage advance"
+        );
+        assert_eq!(s.phase_epoch(), 0);
+        let entry = entry.expect("Lifecycle must still bucket even CRC-bad");
+        assert_eq!(entry.msg_type, MsgType::Lifecycle.wire_value());
+        assert!(!entry.crc_ok);
+    }
+
+    /// The Lifecycle arm both acts AND returns the verbatim ShmEntry so
+    /// the post-hoc verdict scan sees the frame (bucketing preserved).
+    #[test]
+    fn lifecycle_arm_returns_verbatim_entry() {
+        let mut s = SinkState::new();
+        let payload = vec![LifecyclePhase::WorkloadDispatched.wire_value()];
+        let entry = s
+            .dispatch(&frame(
+                MsgType::Lifecycle.wire_value(),
+                payload.clone(),
+                true,
+            ))
+            .expect("Lifecycle must bucket");
+        assert_eq!(entry.msg_type, MsgType::Lifecycle.wire_value());
+        assert_eq!(entry.payload, payload, "bucketed payload not verbatim");
+        assert!(entry.crc_ok);
+        // And the act half still fired.
+        assert_eq!(s.phase(), LifecycleStage::Body as u8);
+    }
+
+    /// Exit and TestResult both drive Teardown and bucket verbatim.
+    #[test]
+    fn exit_and_test_result_drive_teardown_and_bucket() {
+        for wire in [MsgType::Exit.wire_value(), MsgType::TestResult.wire_value()] {
+            let mut s = SinkState::new();
+            let entry = s
+                .dispatch(&frame(wire, vec![1, 2, 3], true))
+                .expect("must bucket");
+            assert_eq!(entry.msg_type, wire);
+            assert_eq!(entry.payload, vec![1, 2, 3]);
+            assert_eq!(s.phase(), LifecycleStage::Teardown as u8);
         }
     }
 }

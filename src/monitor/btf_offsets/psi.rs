@@ -91,7 +91,7 @@ pub fn decode_total_us(raw_ns: u64) -> f64 {
 /// surfaces here, not as a silent miscalculation); the element size / window
 /// count / `PSI_AVGS` index are layout constants (hardcoded with the cited
 /// header values, like the `cpu_time` enum indices).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct PsiGroupOffsets {
     /// Offset of `total[NR_PSI_AGGREGATORS][NR_PSI_STATES-1]` (`u64`, ns).
     pub psi_group_total: usize,

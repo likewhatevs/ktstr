@@ -25,6 +25,9 @@
 //! Gated behind the `integration` feature so it is not built by the default
 //! `cargo install` — it is a validation tool, not a shipped CLI.
 
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use clap::Parser;
 
 use ktstr::workload::{
@@ -81,6 +84,7 @@ struct Args {
 }
 
 fn main() {
+    ktstr::host_heap::mark_jemalloc_global_allocator();
     let args = Args::parse();
     let config = SchbenchConfig::default()
         .message_threads(args.message_threads)

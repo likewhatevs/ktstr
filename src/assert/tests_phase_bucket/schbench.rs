@@ -39,6 +39,7 @@ fn sps(loop_count: u64, msg_pc: u64, worker_pc: u64) -> SchbenchPhaseStats {
         worker_run_delay_ns: 80_000,
         worker_pcount: worker_pc,
         loop_count,
+        worker_cpu_ns: 0,
     }
 }
 
@@ -610,9 +611,9 @@ fn schbench_perphase_metrics_registered() {
     assert!(
         matches!(
             metric_def("schbench_loop_count").unwrap().polarity,
-            Polarity::HigherBetter
+            Polarity::Informational
         ),
-        "loop_count is HigherBetter"
+        "raw loop_count is host-dilation-sensitive and informational"
     );
     // The new latency extremes are LowerBetter (a higher min/max latency is worse).
     assert!(
@@ -629,27 +630,27 @@ fn schbench_perphase_metrics_registered() {
         ),
         "latency max is LowerBetter"
     );
-    // The 5 rps metrics are HigherBetter — the min/max INVERT the latency-extreme
-    // polarity (a higher worst/best second rate is better).
+    // Native wall-RPS is preserved for diagnosis but host preemption dilutes it;
+    // the CPU-second loop rate carries directional throughput.
     assert!(
         matches!(
             metric_def("rps_p50").unwrap().polarity,
-            Polarity::HigherBetter
+            Polarity::Informational
         ),
-        "rps percentiles are HigherBetter"
+        "wall-RPS percentiles are informational"
     );
     assert!(
         matches!(
             metric_def("rps_min").unwrap().polarity,
-            Polarity::HigherBetter
+            Polarity::Informational
         ),
-        "rps_min inverts latency-min polarity (HigherBetter)"
+        "wall-RPS min is informational"
     );
     assert!(
         matches!(
             metric_def("rps_max").unwrap().polarity,
-            Polarity::HigherBetter
+            Polarity::Informational
         ),
-        "rps_max inverts latency-max polarity (HigherBetter)"
+        "wall-RPS max is informational"
     );
 }

@@ -334,9 +334,11 @@ fn pairing_key_join_renders_legacy_shape() {
     let row = make_filter_row("test_a", "scx_a", "1n2l", "SpinWait", Some("6.14"));
     let key = PairingKey::from_row(&row, LEGACY_PAIRING_DIMS);
     assert_eq!(
-        key.0.join("/"),
+        key.label(),
         "test_a/1n2l/SpinWait",
-        "legacy-shape join must render the three-segment label",
+        "legacy-shape label must render the three-segment label (the \
+         throughput-denomination slot is a schema-era marker, skipped \
+         from rendered labels)",
     );
 }
 
@@ -367,12 +369,12 @@ fn pairing_key_from_row_includes_kernel_commit_when_pairing() {
     let key_none = PairingKey::from_row(&row_none, pair_dims);
     assert_eq!(
         key_some.0,
-        vec!["scn".to_string(), "kabcde7".to_string()],
+        vec!["scn".to_string(), "wall".to_string(), "kabcde7".to_string()],
         "Some(kernel_commit) must occupy the second slot verbatim",
     );
     assert_eq!(
         key_none.0,
-        vec!["scn".to_string(), String::new()],
+        vec!["scn".to_string(), "wall".to_string(), String::new()],
         "None kernel_commit must collapse to an empty slot per \
              unwrap_or_default policy",
     );
@@ -418,13 +420,16 @@ fn pairing_key_from_row_includes_run_source_when_pairing() {
     let key_none = PairingKey::from_row(&row_none, pair_dims);
     assert_eq!(
         key_local.0,
-        vec!["scn".to_string(), "local".to_string()],
+        vec!["scn".to_string(), "wall".to_string(), "local".to_string()],
         "Some(run_source) must occupy the second slot verbatim",
     );
-    assert_eq!(key_ci.0, vec!["scn".to_string(), "ci".to_string()]);
+    assert_eq!(
+        key_ci.0,
+        vec!["scn".to_string(), "wall".to_string(), "ci".to_string()]
+    );
     assert_eq!(
         key_none.0,
-        vec!["scn".to_string(), String::new()],
+        vec!["scn".to_string(), "wall".to_string(), String::new()],
         "None run_source must collapse to an empty slot per \
              unwrap_or_default policy",
     );
@@ -466,16 +471,24 @@ fn pairing_key_from_row_includes_resolve_source_when_pairing() {
     let key_none = PairingKey::from_row(&row_none, pair_dims);
     assert_eq!(
         key_auto.0,
-        vec!["scn".to_string(), "auto_built".to_string()],
+        vec![
+            "scn".to_string(),
+            "wall".to_string(),
+            "auto_built".to_string()
+        ],
         "Some(resolve_source) must occupy the second slot verbatim",
     );
     assert_eq!(
         key_debug.0,
-        vec!["scn".to_string(), "target_debug".to_string()]
+        vec![
+            "scn".to_string(),
+            "wall".to_string(),
+            "target_debug".to_string()
+        ]
     );
     assert_eq!(
         key_none.0,
-        vec!["scn".to_string(), String::new()],
+        vec!["scn".to_string(), "wall".to_string(), String::new()],
         "None resolve_source must collapse to an empty slot",
     );
     assert_ne!(
@@ -510,11 +523,17 @@ fn pairing_key_from_row_includes_cpu_budget_when_pairing() {
     let key_4 = PairingKey::from_row(&row_4, pair_dims);
     let key_32 = PairingKey::from_row(&row_32, pair_dims);
     let key_none = PairingKey::from_row(&row_none, pair_dims);
-    assert_eq!(key_4.0, vec!["scn".to_string(), "4".to_string()]);
-    assert_eq!(key_32.0, vec!["scn".to_string(), "32".to_string()]);
+    assert_eq!(
+        key_4.0,
+        vec!["scn".to_string(), "wall".to_string(), "4".to_string()]
+    );
+    assert_eq!(
+        key_32.0,
+        vec!["scn".to_string(), "wall".to_string(), "32".to_string()]
+    );
     assert_eq!(
         key_none.0,
-        vec!["scn".to_string(), String::new()],
+        vec!["scn".to_string(), "wall".to_string(), String::new()],
         "None cpu_budget (a skip) collapses to an empty slot",
     );
     assert_ne!(
@@ -561,7 +580,7 @@ fn pairing_key_from_row_strips_dirty_suffix_on_commit() {
     );
     assert_eq!(
         key_clean.0,
-        vec!["scn".to_string(), "abc1234".to_string()],
+        vec!["scn".to_string(), "wall".to_string(), "abc1234".to_string()],
         "key part must be the canonical un-suffixed hex",
     );
 }
@@ -586,7 +605,10 @@ fn pairing_key_from_row_strips_dirty_suffix_on_kernel_commit() {
         "clean and dirty kernel_commit at the same canonical \
              hex must pair together",
     );
-    assert_eq!(key_clean.0, vec!["scn".to_string(), "def5678".to_string()],);
+    assert_eq!(
+        key_clean.0,
+        vec!["scn".to_string(), "wall".to_string(), "def5678".to_string()],
+    );
 }
 
 /// Distinct hexes still differentiate even when one carries
@@ -609,8 +631,10 @@ fn pairing_key_from_row_distinct_hexes_remain_distinct_under_strip() {
         "distinct canonical hexes must remain distinct after the \
              -dirty strip — only the suffix is stripped",
     );
-    assert_eq!(key_a.0[1], "aaa1111");
-    assert_eq!(key_b.0[1], "bbb2222");
+    // Slot 0 is scenario, slot 1 the throughput-denomination era, slot 2
+    // the first pairing dim (the commit under test).
+    assert_eq!(key_a.0[2], "aaa1111");
+    assert_eq!(key_b.0[2], "bbb2222");
 }
 
 /// `None` commit values still collapse to the empty slot
@@ -626,7 +650,12 @@ fn pairing_key_from_row_none_commit_unchanged_under_strip() {
     let key = PairingKey::from_row(&row, pair_dims);
     assert_eq!(
         key.0,
-        vec!["scn".to_string(), String::new(), String::new()],
+        vec![
+            "scn".to_string(),
+            "wall".to_string(),
+            String::new(),
+            String::new()
+        ],
         "None commit and None kernel_commit must collapse to empty slots",
     );
 }

@@ -62,8 +62,16 @@ pub struct Assert {
     /// within their assigned cpuset). Same tri-state semantics as
     /// `not_stuck`.
     pub isolation: Option<bool>,
-    /// Max per-worker scheduling gap in milliseconds. Fails the
-    /// assertion if any worker's longest off-CPU stretch exceeds this.
+    /// Max per-worker progress gap in milliseconds of worker CPU-TIME:
+    /// fails if any worker consumed more than this much
+    /// `CLOCK_THREAD_CPUTIME_ID` between 1024-work-unit progress
+    /// checkpoints (compute-without-progress — a livelock or a
+    /// pathologically expensive iteration). CPU-denominated, so the gate
+    /// is dilation-safe: host preemption and guest run-queue wait accrue
+    /// no CPU. A BLOCKED or starved-runnable worker likewise accrues no
+    /// CPU — blocked-stuck detection is the cell watchdog's domain. The
+    /// historical wall-clock gap rides in the failure message (and
+    /// `WorkerReport::max_gap_wall_ms`) as evidence.
     pub max_gap_ms: Option<u64>,
     /// Max per-cgroup fairness spread as a percentage. Fails if the
     /// range between the most- and least-served workers exceeds this
@@ -107,7 +115,13 @@ pub struct Assert {
     pub max_p99_wake_latency_ns: Option<u64>,
     /// Max wake latency coefficient of variation. Fails if CV exceeds this.
     pub max_wake_latency_cv: Option<f64>,
-    /// Minimum iterations per wall-clock second. Fails if any worker is below.
+    /// Minimum iterations per CPU-second (`iterations / cpu_time_sec`)
+    /// per worker. Fails if any worker is below. CPU-denominated so the
+    /// floor is intrinsically dilation-safe — host preemption inflates
+    /// wall time but not CPU time — measuring the workload, not the
+    /// host. In performance mode (wall ≈ CPU) it matches the historical
+    /// wall-rate number; a worker that spent zero CPU time rates 0 and
+    /// fails any positive floor. See [`assert_benchmarks`].
     pub min_iteration_rate: Option<f64>,
     /// Max migration ratio (migrations/iterations). Fails if any cgroup exceeds this.
     pub max_migration_ratio: Option<f64>,
@@ -126,11 +140,11 @@ pub struct Assert {
     /// monitor threshold before a verdict is raised. Smooths out
     /// single-sample spikes.
     pub sustained_samples: Option<usize>,
-    /// Max `select_cpu_fallback` rate (events/sec). Fails if the
-    /// scx event counter delta over the run exceeds this rate.
+    /// Max `select_cpu_fallback` activity per average delivered vCPU
+    /// CPU-second. Fails if a sustained monitor interval exceeds this rate.
     pub max_fallback_rate: Option<f64>,
-    /// Max `keep_last` rate (events/sec). Fails if the scx event
-    /// counter delta over the run exceeds this rate.
+    /// Max `keep_last` activity per average delivered vCPU CPU-second.
+    /// Fails if a sustained monitor interval exceeds this rate.
     pub max_keep_last_rate: Option<f64>,
     /// Promote monitor threshold violations from report-only to
     /// pass/fail. When `false` (the default), the monitor still walks

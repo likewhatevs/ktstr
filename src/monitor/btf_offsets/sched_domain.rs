@@ -32,7 +32,7 @@ use super::{find_struct, member_byte_offset};
 /// Load balancing stats (`lb_count`, `alb_pushed`, `ttwu_wake_remote`,
 /// etc.) are guarded by `CONFIG_SCHEDSTATS` and resolved separately
 /// into an optional [`SchedDomainStatsOffsets`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SchedDomainOffsets {
     /// Offset of `sd` (pointer) within `struct rq`.
     pub rq_sd: usize,
@@ -74,7 +74,7 @@ pub struct SchedDomainOffsets {
 /// Array fields are `unsigned int field[CPU_MAX_IDLE_TYPES]` where
 /// `CPU_MAX_IDLE_TYPES = 3`. The offset is to element 0; element i
 /// is at `offset + i * 4`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SchedDomainStatsOffsets {
     // Array fields indexed by cpu_idle_type.
     /// Offset of `lb_count[0]` within `struct sched_domain`.

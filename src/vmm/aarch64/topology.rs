@@ -12,7 +12,7 @@ use kvm_ioctls::VcpuFd;
 use crate::vmm::topology::Topology;
 
 /// Maximum cache level supported by arm64 CLIDR_EL1 (7 Ctype fields).
-const MAX_CACHE_LEVEL: u32 = 7;
+pub const MAX_CACHE_LEVEL: u32 = 7;
 
 /// MPIDR_EL1 register ID for KVM_GET_ONE_REG / KVM_SET_ONE_REG.
 /// Encoded as system register (3, 0, 0, 0, 5) per the kernel's
@@ -177,8 +177,34 @@ fn merge_clidr(current: u64, sysfs: u64) -> u64 {
     (current & !REPLACE_MASK) | (sysfs & REPLACE_MASK)
 }
 
+/// Clear Ctype fields above `max_level` and cap LoC to `max_level`.
+///
+/// Used when the guest presents a fixed cache depth (multi-LLC guests
+/// terminate their DT chain at L3) but the host has more cache levels.
+/// Without this cap, CLIDR would report leaves the DT chain lacks:
+/// `init_cache_level` sizes `num_leaves` from CLIDR, then
+/// `cache_setup_of_node` walks the DT chain expecting one node per non-L1
+/// leaf and bails with -ENOENT when it runs out, dropping DT grouping
+/// entirely (the guest falls back to per-CPU arch cache info — no shared
+/// LLC domain). Capping CLIDR to the DT depth keeps the two consistent.
+/// Levels the DT declares *beyond* CLIDR are handled the other way, by the
+/// kernel's `of_find_last_cache_level` external-cache path, so a low cap
+/// here never hides an L3 the DT still adds.
+fn cap_clidr_levels(clidr: u64, max_level: u32) -> u64 {
+    let mut out = clidr;
+    for level in (max_level + 1)..=MAX_CACHE_LEVEL {
+        let shift = CLIDR_CTYPE_BITS * (level - 1);
+        out &= !(0x7u64 << shift);
+    }
+    let loc = (out >> CLIDR_LOC_SHIFT) & 0x7;
+    if loc > max_level as u64 {
+        out = (out & !(0x7u64 << CLIDR_LOC_SHIFT)) | ((max_level as u64) << CLIDR_LOC_SHIFT);
+    }
+    out
+}
+
 /// Override CLIDR_EL1 on each vCPU to match the host's real cache
-/// topology from sysfs.
+/// topology from sysfs, capped to `max_level` cache levels.
 ///
 /// KVM's `reset_clidr` (since host kernel 6.3) fabricates CLIDR_EL1
 /// from CTR_EL0 flags, which can report fewer cache levels than the
@@ -191,11 +217,19 @@ fn merge_clidr(current: u64, sysfs: u64) -> u64 {
 /// preserves LoUU/LoUIS/ICB/Ttype, and writes back to all vCPUs.
 /// On pre-6.3 kernels where CLIDR already passes through the real
 /// value, the write is effectively a no-op.
-pub fn override_clidr(vcpus: &[VcpuFd]) -> Result<()> {
-    let sysfs_clidr = build_clidr_from_sysfs();
+///
+/// `max_level` caps the reported levels so CLIDR agrees with a DT cache
+/// chain that terminates early (multi-LLC guests present an L3 boundary;
+/// pass 3). Single-LLC guests emit no DT cache chain — pass
+/// `MAX_CACHE_LEVEL` to leave the host's levels untouched.
+pub fn override_clidr(vcpus: &[VcpuFd], max_level: u32) -> Result<()> {
+    let mut sysfs_clidr = build_clidr_from_sysfs();
     if sysfs_clidr == 0 {
         tracing::warn!("no cache info from sysfs, skipping CLIDR override");
         return Ok(());
+    }
+    if max_level < MAX_CACHE_LEVEL {
+        sysfs_clidr = cap_clidr_levels(sysfs_clidr, max_level);
     }
 
     let mut cur_clidr_bytes = [0u8; 8];
@@ -220,32 +254,6 @@ pub fn override_clidr(vcpus: &[VcpuFd]) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Return the highest cache level from the host's sysfs. Used to
-/// determine the DT cache chain depth for multi-LLC topologies.
-pub fn host_cache_levels() -> u32 {
-    let mut max_level: u32 = 0;
-    let cache_dir = "/sys/devices/system/cpu/cpu0/cache";
-    let entries = match std::fs::read_dir(cache_dir) {
-        Ok(e) => e,
-        Err(_) => return 0,
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with("index") {
-            continue;
-        }
-        let level_path = entry.path().join("level");
-        if let Ok(s) = std::fs::read_to_string(&level_path)
-            && let Ok(level) = s.trim().parse::<u32>()
-            && level > max_level
-        {
-            max_level = level;
-        }
-    }
-    max_level
 }
 
 /// Mask for the affinity fields used in FDT cpu node `reg` property.
@@ -309,6 +317,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let mpidr = mpidr_from_topology(&t, 0);
         assert_eq!(mpidr & MPIDR_AFF_MASK, 0);
@@ -324,6 +333,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         // cpu 0: LLC 0, core 0, thread 0
         let m0 = mpidr_from_topology(&t, 0);
@@ -379,6 +389,7 @@ mod tests {
                 numa_nodes: 1,
                 nodes: None,
                 distances: None,
+                llc_cores: None,
             };
             let mpidrs: Vec<u64> = (0..t.total_cpus())
                 .map(|i| mpidr_from_topology(&t, i))
@@ -401,6 +412,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         for cpu in 0..t.total_cpus() {
             let mpidr = mpidr_from_topology(&t, cpu);
@@ -425,6 +437,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         for cpu in 0..t.total_cpus() {
             let (llc, core, thread) = t.decompose(cpu);
@@ -433,15 +446,6 @@ mod tests {
             assert_eq!((mpidr >> 8) & 0xFF, core as u64, "cpu {cpu}: aff1 = core");
             assert_eq!((mpidr >> 16) & 0xFF, llc as u64, "cpu {cpu}: aff2 = LLC");
         }
-    }
-
-    #[test]
-    fn host_cache_levels_reads_sysfs() {
-        let level = host_cache_levels();
-        assert!(
-            level >= 1,
-            "host_cache_levels should detect at least 1 cache level, got {level}"
-        );
     }
 
     #[test]
@@ -487,5 +491,37 @@ mod tests {
     fn merge_clidr_identity_when_equal() {
         let val = 0x0000_0000_0200_0023_u64;
         assert_eq!(merge_clidr(val, val), val);
+    }
+
+    #[test]
+    fn cap_clidr_levels_noop_when_within_cap() {
+        // 2-level host (L1 separate, L2 unified, LoC=2). Capping to 3
+        // leaves it untouched — the DT chain adds the L3 beyond LoC.
+        let clidr: u64 = (2 << CLIDR_LOC_SHIFT) | (4 << 3) | 3;
+        assert_eq!(cap_clidr_levels(clidr, 3), clidr);
+    }
+
+    #[test]
+    fn cap_clidr_levels_clears_levels_above_cap() {
+        // 4-level host: Ctype1..4 = Unified, LoC=4. Cap to 3 must clear
+        // Ctype4 and pull LoC down to 3 so CLIDR agrees with a DT chain
+        // that terminates at L3.
+        let clidr: u64 = (4 << CLIDR_LOC_SHIFT)
+            | (CLIDR_CTYPE_UNIFIED << (CLIDR_CTYPE_BITS * 3))  // Ctype4
+            | (CLIDR_CTYPE_UNIFIED << (CLIDR_CTYPE_BITS * 2))  // Ctype3
+            | (CLIDR_CTYPE_UNIFIED << CLIDR_CTYPE_BITS)        // Ctype2
+            | CLIDR_CTYPE_UNIFIED; // Ctype1
+        let capped = cap_clidr_levels(clidr, 3);
+        assert_eq!(
+            (capped >> (CLIDR_CTYPE_BITS * 3)) & 0x7,
+            0,
+            "Ctype4 must be cleared"
+        );
+        assert_eq!(
+            (capped >> (CLIDR_CTYPE_BITS * 2)) & 0x7,
+            CLIDR_CTYPE_UNIFIED,
+            "Ctype3 preserved"
+        );
+        assert_eq!((capped >> CLIDR_LOC_SHIFT) & 0x7, 3, "LoC capped to 3");
     }
 }

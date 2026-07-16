@@ -274,9 +274,13 @@ html:not(.js) {
     min-width: 7.5rem;
 }
 
+/* Chips in table cells wrap BETWEEN tokens only (white-space: normal),
+   never mid-token — `overflow-wrap: anywhere` here used to split names
+   like `KTSTR_NO_PERF_MODE` across lines, which misreads. A single
+   token wider than its cell now widens the table instead; `.content
+   table` scrolls on overflow, so the worst case is a scrollbar. */
 .content table code {
     white-space: normal;
-    overflow-wrap: anywhere;
 }
 
 /* ---------- sidebar ---------- */

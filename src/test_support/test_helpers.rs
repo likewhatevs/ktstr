@@ -239,6 +239,7 @@ pub(crate) static SCHED_TEST: Scheduler = Scheduler {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     },
     constraints: TopologyConstraints::DEFAULT,
     config_file: None,
@@ -286,6 +287,12 @@ pub(crate) fn make_vm_result(
         exit_code,
         duration: std::time::Duration::from_secs(1),
         timed_out,
+        watchdog_kill_reason: None,
+        final_guest_phase: crate::vmm::GuestLifecyclePhase::Boot,
+        final_progress_epoch: 0,
+        bpf_map_writes_delivered: None,
+        periodic_prereqs_ready: None,
+        periodic_window_end: None,
         output: output.to_string(),
         stderr: stderr.to_string(),
         monitor: None,
@@ -294,6 +301,7 @@ pub(crate) fn make_vm_result(
         kvm_stats: None,
         crash_message: None,
         cleanup_duration: None,
+        cleanup_sched_delta: None,
         virtio_blk_counters: None,
         virtio_net_counters: None,
         snapshot_bridge: {
@@ -307,6 +315,8 @@ pub(crate) fn make_vm_result(
         kern_kaslr_offset: 0,
         entry_name: None,
         variant_hash: 0,
+        host_vcpu_schedstat: None,
+        contention_witness: None,
         periodic_series_cache: std::sync::OnceLock::new(),
     }
 }

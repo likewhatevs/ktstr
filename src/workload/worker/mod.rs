@@ -263,6 +263,19 @@ pub(super) fn worker_main(
     numa_node: Option<u32>,
     pipe_fds: Option<(i32, i32)>,
     futex: Option<(*mut u32, usize)>,
+    // Park the worker after it has counted this many outer-loop
+    // iterations instead of spinning to stop. `None` (every workload
+    // but the verifier dispatch probe) runs to stop unchanged. The
+    // knob — not the WorkType — gates the park so a single-dispatch
+    // proof collapses to a sleep-poll under any work body.
+    park_after: Option<u64>,
+    // Signal this eventfd exactly once, after the worker's first counted
+    // iteration, so a waiter (the verifier dispatch probe) can block on the
+    // edge instead of polling `iter_slot`. `-1` (every workload but the
+    // opted-in fork probe, and all thread / pcomm dispatch) disables it.
+    // Independent of `park_after`: the probe sets both, and the signal
+    // fires BEFORE the park below so a parking worker still signals once.
+    first_iter_signal_fd: i32,
     iter_slot: *mut AtomicU64,
     // Single shared phase-epoch word — the SAME pointer for every worker in
     // the group. Allocated non-null for every handle; the scenario engine
@@ -363,9 +376,18 @@ pub(super) fn worker_main(
     // worst-case, more than enough for a non-zero delta.
     let mut last_iter_slot_publish = start;
     const IT_SLOT_PUBLISH_INTERVAL: Duration = Duration::from_millis(1);
+    // Whole-run gap peaks. `max_gap_ns` is the GATE gap — worker CPU-time
+    // between 1024-work-unit checkpoints; `max_gap_wall_ns` is the historical
+    // wall-clock gap kept as EVIDENCE (`max_gap_wall_ms`); see the checkpoint
+    // block below for the full denomination rationale.
     let mut max_gap_ns: u64 = 0;
+    let mut max_gap_wall_ns: u64 = 0;
     let mut max_gap_cpu: usize = last_cpu;
     let mut max_gap_at_ns: u64 = 0;
+    // CLOCK_THREAD_CPUTIME_ID baseline for the checkpoint CPU-gap; advanced
+    // at every checkpoint (blocked time accrues no CPU, so unlike
+    // `last_iter_time` it needs no per-blocking-site resets).
+    let mut last_ckpt_cpu_ns = thread_cpu_time_ns();
     // Lazily allocated per-worker cache buffer (CachePressure, CacheYield, CachePipe, FanOutCompute).
     let mut cache_pressure_buf: Option<Vec<u8>> = None;
     // Separate Vec<u64> for the matrix_multiply helper: the matrix
@@ -514,6 +536,9 @@ pub(super) fn worker_main(
     let mut iteration_costs_ns: Vec<u64> = Vec::with_capacity(MAX_WAKE_SAMPLES);
     let mut iteration_cost_sample_count: u64 = 0;
     let mut iterations: u64 = 0;
+    // One-shot latch for the first-iteration eventfd signal (C6). Flipped
+    // true after the single `write(2)` so the worker signals exactly once.
+    let mut first_iter_signaled = false;
     // AffinityChurn / CrossAffinityChurn: read the effective cpuset
     // once at start via sched_getaffinity (read_effective_cpus).
     // Custom: hand the user function a WorkerCtx. Affinity and
@@ -1654,7 +1679,7 @@ pub(super) fn worker_main(
                 let outcome = crate::workload::taobench::run::run(config, stop, &progress, pe);
                 work_units = work_units.saturating_add(outcome.whole_run.total_ops());
                 // Ship the engine's authoritative whole-run aggregate for the
-                // host-side run-level qps/hit Rate keys (one taobench run per
+                // host-side run-level throughput/hit Rate keys (one taobench run per
                 // worker — the arm breaks below, so this is set at most once).
                 taobench_whole = Some(outcome.whole_run);
                 for (epoch, stats) in outcome.phases {
@@ -3821,6 +3846,64 @@ pub(super) fn worker_main(
             }
         }
 
+        // First-iteration eventfd signal (C6): one-shot `write(2)` of a
+        // `1` the first time this worker counts at least one outer-loop
+        // iteration, so a waiter (the verifier dispatch probe) wakes on the
+        // edge instead of polling `iter_slot`. Placed BEFORE the park block
+        // below so a worker that also parks (the probe sets both knobs)
+        // still signals once before sleeping. The eventfd is EFD_CLOEXEC —
+        // safe because fork workers never `exec` — and counter-mode, so the
+        // per-worker `1`s sum in the fd and the parent's
+        // `wait_first_iteration_all` wakes once `n` workers have advanced.
+        // A `sched_policy_error` worker (EACCES left it SCHED_OTHER but it
+        // still loops and counts iterations) signals too, matching the
+        // probe's "advanced at all" wait contract; the host-side dispatch
+        // gate separately excludes such workers from the verdict.
+        // Independent of `park_after`. `-1` disables it (thread / pcomm /
+        // opt-out workloads).
+        if first_iter_signal_fd >= 0 && !first_iter_signaled && iterations >= 1 {
+            let one: u64 = 1;
+            // SAFETY: `first_iter_signal_fd` is a live eventfd (a fork-time
+            // fd-table copy of the parent's `OwnedFd`); an 8-byte write of a
+            // `u64` is the eventfd(2) contract. EFD_NONBLOCK cannot block; a
+            // spurious short/failed write only delays the parent's wake to
+            // its deadline fallback, so the result is ignored.
+            unsafe {
+                libc::write(
+                    first_iter_signal_fd,
+                    &one as *const u64 as *const libc::c_void,
+                    std::mem::size_of::<u64>(),
+                );
+            }
+            first_iter_signaled = true;
+        }
+
+        // Park once the worker has counted `park_after` iterations:
+        // it has proven whatever the caller needed the iterations to
+        // prove (the verifier probe needs one dispatch), so sleep-poll
+        // for stop instead of burning a CPU. Gated by the knob, not
+        // the WorkType, so it is dead code for every workload that
+        // leaves `park_after` at `None`.
+        if park_after.is_some_and(|n| iterations >= n) {
+            // Force the final count into the slot BEFORE parking,
+            // bypassing the IT_SLOT_PUBLISH_INTERVAL gate above: the
+            // probe's wait-for-all loop polls `snapshot_iterations`
+            // and must observe this worker's terminal value promptly
+            // rather than up to one publish interval late. SAFETY: as
+            // the gated publish above.
+            if !iter_slot.is_null() {
+                unsafe { &*iter_slot }.store(iterations, Ordering::Relaxed);
+            }
+            // Sleep-poll the SAME stop predicate the outer loop checks
+            // so a stop request (SIGUSR1-driven STOP or the per-worker
+            // flag) lands within one poll and the worker falls through
+            // to the normal report path — it still writes its report.
+            while !stop_requested(stop) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            break;
+        }
+
         // Poll the shared phase epoch every outer iteration (one cheap
         // Relaxed load, amortized over the work-type body) so a blocked or
         // low-throughput backdrop worker that does NOT advance work_units
@@ -3835,20 +3918,44 @@ pub(super) fn worker_main(
 
         if work_units.is_multiple_of(1024) || epoch_changed {
             let now = *now_for_gate.get_or_insert_with(Instant::now);
-            let gap = now.duration_since(last_iter_time).as_nanos() as u64;
-            if gap > max_gap_ns {
-                max_gap_ns = gap;
+            // GATE gap: worker CPU-time consumed between checkpoints
+            // (CLOCK_THREAD_CPUTIME_ID delta — one extra clock read per
+            // 1024-work-unit checkpoint, amortized over the work body).
+            // CPU-denominated so the Stuck gate measures the workload
+            // (compute-without-progress: a livelock or a pathologically
+            // expensive iteration), not host/guest scheduling delay — a
+            // BLOCKED or starved-runnable worker accrues no CPU, so
+            // blocked-stuck detection is the cell watchdog's domain, not
+            // this gate's. Checkpoint granularity: the gap resolves to
+            // multiples of the 1024-unit checkpoint interval (plus the
+            // epoch-transition extra sample), same cadence the wall gap
+            // always had.
+            let cpu_now = thread_cpu_time_ns();
+            let cpu_gap = cpu_now.saturating_sub(last_ckpt_cpu_ns);
+            // EVIDENCE gap: the historical wall-clock measure, verbatim
+            // (max over checkpoints, from `last_iter_time` with its
+            // blocking-site resets) — carried as `max_gap_wall_ms` so the
+            // old signal (starvation shows up as wall-without-CPU) stays
+            // visible in reports while the verdict rides the CPU gap.
+            let wall_gap = now.duration_since(last_iter_time).as_nanos() as u64;
+            if cpu_gap > max_gap_ns {
+                max_gap_ns = cpu_gap;
                 max_gap_cpu = last_cpu;
                 max_gap_at_ns = now.duration_since(start).as_nanos() as u64;
             }
-            // Per-phase max gap, argmax-paired with the pre-migration CPU
-            // exactly like the whole-run pair above (a separate threshold
-            // since the per-phase peak resets at each boundary).
-            if gap > phase_max_gap_ns {
-                phase_max_gap_ns = gap;
+            if wall_gap > max_gap_wall_ns {
+                max_gap_wall_ns = wall_gap;
+            }
+            // Per-phase max gap (CPU, like the whole-run gate), argmax-paired
+            // with the pre-migration CPU exactly like the whole-run pair
+            // above (a separate threshold since the per-phase peak resets at
+            // each boundary).
+            if cpu_gap > phase_max_gap_ns {
+                phase_max_gap_ns = cpu_gap;
                 phase_max_gap_cpu = last_cpu;
             }
             last_iter_time = now;
+            last_ckpt_cpu_ns = cpu_now;
 
             let cpu = sched_getcpu();
             phase_cpus_used.insert(cpu);
@@ -4034,6 +4141,7 @@ pub(super) fn worker_main(
         cpus_used,
         migrations,
         max_gap_ms: max_gap_ns / 1_000_000,
+        max_gap_wall_ms: max_gap_wall_ns / 1_000_000,
         max_gap_cpu,
         max_gap_at_ms: max_gap_at_ns / 1_000_000,
         wake_latencies_ns: wake.run,
@@ -4308,7 +4416,7 @@ fn warn_custom_iterations_zero_once(name: &str) {
         eprintln!(
             "workload: Custom worker '{name}' returned work_units>0 but \
              iterations==0; headline throughput (total_iterations / \
-             iterations_per_worker / iterations_per_cpu_sec) reads \
+             iterations_per_worker / iteration_rate) reads \
              WorkerReport::iterations and will read zero — populate iterations \
              (commonly = work_units). See the WorkType::Custom telemetry contract."
         );
@@ -4816,7 +4924,10 @@ pub(crate) fn reservoir_push(buf: &mut Vec<u64>, count: &mut u64, sample: u64, c
 // this file under the per-file line budget. Re-imported via
 // `use sched::*;` so the dispatch arms reference the items without
 // qualification, matching the pre-split call sites.
-mod sched;
+// `pub(crate)`: `sched::thread_cpu_time_ns` is also the CPU-second
+// throughput-denominator clock for the schbench / taobench engines
+// (outside `workload::worker`).
+pub(crate) mod sched;
 use sched::*;
 
 #[cfg(test)]

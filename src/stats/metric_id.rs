@@ -10,7 +10,7 @@
 //!
 //! [`MetricId`] unifies the typed built-in path with the open scheduler-runtime
 //! string path behind one `impl Into<MetricId>` accessor argument:
-//! `phase_metric(BuiltinMetric::TaobenchTotalQps)` and
+//! `phase_metric(BuiltinMetric::TaobenchTotalOpsPerCpuSec)` and
 //! `phase_metric("scx_custom_runtime_key")` both compile through the same
 //! signature — the known one typed and discoverable, the dynamic one a first-class
 //! string escape (existing `&str` call sites keep compiling, canonicalized to the
@@ -77,6 +77,11 @@ builtin_metrics! {
     StuckCount => "stuck_count",
     TotalFallback => "total_fallback",
     TotalKeepLast => "total_keep_last",
+    TotalFallbackPooled => "total_fallback_pooled",
+    TotalKeepLastPooled => "total_keep_last_pooled",
+    TotalEventVcpuSec => "total_event_vcpu_sec",
+    FallbackPerVcpuSec => "fallback_per_vcpu_sec",
+    KeepLastPerVcpuSec => "keep_last_per_vcpu_sec",
     TotalRunDelay => "total_run_delay",
     TotalPcount => "total_pcount",
     TotalSchedCount => "total_sched_count",
@@ -87,15 +92,15 @@ builtin_metrics! {
     TotalRunDelayNsPerSched => "total_run_delay_ns_per_sched",
     TtwuLocalFraction => "ttwu_local_fraction",
     SchedGoidleFraction => "sched_goidle_fraction",
-    // Per-second schedstat rates (total_X / total_schedstat_wall_sec) + the
-    // shared window-seconds denominator.
-    TotalSchedstatWallSec => "total_schedstat_wall_sec",
-    RunDelayPerSec => "run_delay_per_sec",
-    PcountPerSec => "pcount_per_sec",
-    SchedCountPerSec => "sched_count_per_sec",
-    YldCountPerSec => "yld_count_per_sec",
-    TtwuCountPerSec => "ttwu_count_per_sec",
-    SchedGoidlePerSec => "sched_goidle_per_sec",
+    // Dilation-safe schedstat activity densities (total_X divided by mean vCPU
+    // CPU seconds over the same window) + their shared CPU-time denominator.
+    TotalSchedstatVcpuSec => "total_schedstat_vcpu_sec",
+    RunDelayPerVcpuSec => "run_delay_per_vcpu_sec",
+    PcountPerVcpuSec => "pcount_per_vcpu_sec",
+    SchedCountPerVcpuSec => "sched_count_per_vcpu_sec",
+    YldCountPerVcpuSec => "yld_count_per_vcpu_sec",
+    TtwuCountPerVcpuSec => "ttwu_count_per_vcpu_sec",
+    SchedGoidlePerVcpuSec => "sched_goidle_per_vcpu_sec",
     AvgNrRunning => "avg_nr_running",
     WorstP99WakeLatencyUs => "worst_p99_wake_latency_us",
     WorstMedianWakeLatencyUs => "worst_median_wake_latency_us",
@@ -106,22 +111,20 @@ builtin_metrics! {
     WorstTimerLatencyUs => "worst_timer_latency_us",
     IterationRate => "iteration_rate",
     TotalIterations => "total_iterations",
-    TotalPhaseIterations => "total_phase_iterations",
-    TotalPhaseDurationSec => "total_phase_duration_sec",
     TotalCpuTimeSec => "total_cpu_time_sec",
     TotalIterationsPooled => "total_iterations_pooled",
-    IterationsPerCpuSec => "iterations_per_cpu_sec",
-    // Whole-run taobench qps + hit (run-level pool of the WorkType::Taobench
+    // Whole-run taobench CPU-throughput + hit (run-level pool of the WorkType::Taobench
     // engine, derived by populate_run_pooled_taobench). 4 Counter components
     // (RENDER_SUPPRESSED_COMPONENTS) + 4 derived Rates. Distinct from the
-    // per-phase taobench_*_qps below (MetricKind::PerPhase).
+    // per-phase taobench_*_ops_per_cpu_sec below (MetricKind::PerPhase).
     TotalTaobenchOps => "total_taobench_ops",
     TotalTaobenchFastOps => "total_taobench_fast_ops",
     TotalTaobenchSlowOps => "total_taobench_slow_ops",
     TotalTaobenchWallSec => "total_taobench_wall_sec",
-    TaobenchTotalOpsPerSec => "taobench_total_ops_per_sec",
-    TaobenchFastOpsPerSec => "taobench_fast_ops_per_sec",
-    TaobenchSlowOpsPerSec => "taobench_slow_ops_per_sec",
+    TotalTaobenchCpuSec => "total_taobench_cpu_sec",
+    TaobenchTotalOpsPerCpuSecWhole => "taobench_total_ops_per_cpu_sec_whole",
+    TaobenchFastOpsPerCpuSecWhole => "taobench_fast_ops_per_cpu_sec_whole",
+    TaobenchSlowOpsPerCpuSecWhole => "taobench_slow_ops_per_cpu_sec_whole",
     TaobenchHitFraction => "taobench_hit_fraction",
     // taobench whole-run open-loop serve-latency percentiles (PerRunDistribution).
     TaobenchServeP50UsWhole => "taobench_serve_p50_us_whole",
@@ -142,6 +145,9 @@ builtin_metrics! {
     TotalSchbenchWorkerRunDelayNs => "total_schbench_worker_run_delay_ns",
     TotalSchbenchWorkerPcount => "total_schbench_worker_pcount",
     TotalSchbenchLoops => "total_schbench_loops",
+    TotalSchbenchWorkerCpuSec => "total_schbench_worker_cpu_sec",
+    SchbenchTotalLoopsPerCpuSec => "schbench_total_loops_per_cpu_sec",
+    SchbenchLoopsPerCpuSec => "schbench_loops_per_cpu_sec",
     SchbenchMsgRunDelayNsPerSched => "schbench_msg_run_delay_ns_per_sched",
     SchbenchWorkerRunDelayNsPerSched => "schbench_worker_run_delay_ns_per_sched",
     // schbench whole-run distributional metrics (MetricKind::PerRunDistribution),
@@ -166,6 +172,8 @@ builtin_metrics! {
     RpsMaxWhole => "rps_max_whole",
     SystemTimeNs => "system_time_ns",
     UserTimeNs => "user_time_ns",
+    ObservedTaskCpuTimeNs => "observed_task_cpu_time_ns",
+    SystemCpuFraction => "system_cpu_fraction",
     WorstMeanRunDelayUs => "worst_mean_run_delay_us",
     WorstRunDelayUs => "worst_run_delay_us",
     WorstWakeLatencyTailRatio => "worst_wake_latency_tail_ratio",
@@ -194,14 +202,14 @@ builtin_metrics! {
     TotalStealTimeNs => "total_steal_time_ns",
     AvgIrqUtil => "avg_irq_util",
     MaxAvgIrqUtil => "max_avg_irq_util",
-    HardirqRate => "hardirq_rate",
-    NetRxSoftirqRate => "net_rx_softirq_rate",
+    HardirqsPerCpuSec => "hardirqs_per_cpu_sec",
+    NetRxSoftirqsPerCpuSec => "net_rx_softirqs_per_cpu_sec",
     IrqTimeFraction => "irq_time_fraction",
     // Hidden rate-denominator components (accessor |_| None, bucket-derived):
     // the capture-WINDOW duration (first→last freeze span), NOT the full
-    // phase wall-time. _sec backs the count-rates, _ns backs irq_time_fraction.
-    TotalPhaseWallSec => "total_phase_wall_sec",
-    TotalPhaseWallNs => "total_phase_wall_ns",
+    // delivered guest CPU time. _sec backs count-rates; _ns the fraction.
+    TotalPhaseGuestCpuSec => "total_phase_guest_cpu_sec",
+    TotalPhaseGuestCpuNs => "total_phase_guest_cpu_ns",
 
     // Per-CPU IRQ spatial axis (the busiest-CPU dimension; the IRQ counters
     // above are the cross-CPU SUM). Custom per-CPU-delta bucket-fold, NOT a
@@ -261,9 +269,9 @@ builtin_metrics! {
     SchedDelayMsgUs => "sched_delay_msg_us",
     SchedDelayWorkerUs => "sched_delay_worker_us",
     SchbenchLoopCount => "schbench_loop_count",
-    TaobenchTotalQps => "taobench_total_qps",
-    TaobenchFastQps => "taobench_fast_qps",
-    TaobenchSlowQps => "taobench_slow_qps",
+    TaobenchTotalOpsPerCpuSec => "taobench_total_ops_per_cpu_sec",
+    TaobenchFastOpsPerCpuSec => "taobench_fast_ops_per_cpu_sec",
+    TaobenchSlowOpsPerCpuSec => "taobench_slow_ops_per_cpu_sec",
     TaobenchHitRatio => "taobench_hit_ratio",
     TaobenchHitRate => "taobench_hit_rate",
     // taobench per-phase open-loop serve-latency percentiles (PerPhase, µs).
@@ -448,13 +456,13 @@ mod tests {
     /// (the no-guessed-kind guardrail).
     #[test]
     fn metric_id_canonicalizes_builtin_and_quarantines_dynamic() {
-        let typed: MetricId = BuiltinMetric::TaobenchTotalQps.into();
-        let from_str: MetricId = "taobench_total_qps".into();
+        let typed: MetricId = BuiltinMetric::TaobenchTotalOpsPerCpuSec.into();
+        let from_str: MetricId = "taobench_total_ops_per_cpu_sec".into();
         assert_eq!(
             typed, from_str,
             "a built-in string canonicalizes to Builtin"
         );
-        assert_eq!(typed.as_str(), "taobench_total_qps");
+        assert_eq!(typed.as_str(), "taobench_total_ops_per_cpu_sec");
         assert!(typed.def().is_some(), "a built-in carries its registry def");
 
         let dynamic: MetricId = "scx_layered_layer0_depth".into();

@@ -508,9 +508,31 @@ pub fn make_kernel_with_output(
 /// Build the make arguments for a kernel build.
 ///
 /// Returns the argument list that would be passed to `make` for a
-/// parallel kernel build: `["-jN", "KCFLAGS=-Wno-error"]`.
+/// parallel kernel build: `["-jN", "KCFLAGS=-Wno-error", "WERROR=0"]`.
+///
+/// `KCFLAGS=-Wno-error` covers the KERNEL objects but does not reach
+/// the host-tools sub-builds (`tools/bpf/resolve_btfids`, objtool),
+/// whose bundled sources trip new warnings on host compilers released
+/// after the kernel (GCC 14 vs 6.14's libbpf: -Werror=discarded-
+/// qualifiers) and fail the whole build. `WERROR=0` is the kernel's
+/// own knob where tools honor it, and `HOSTCFLAGS` (the documented
+/// user hostcflags knob -- passed as a command-line variable so
+/// sub-makes inherit it) reaches the ones that do not: resolve_btfids
+/// builds its bundled libbpf with `EXTRA_CFLAGS="$(HOSTCFLAGS)"`.
+/// libbpf then does `override CFLAGS += -Werror` AFTER folding
+/// EXTRA_CFLAGS in, so a general `-Wno-error` loses (later flag wins);
+/// the SPECIFIC `-Wno-error=<warning>` forms survive a later general
+/// `-Werror` (GCC gives more-specific options priority independent of
+/// position), so the concrete new-host-compiler warnings are named.
+/// A cache-kernel build never wants a host-toolchain warning to be
+/// fatal.
 pub(super) fn build_make_args(nproc: usize) -> Vec<String> {
-    vec![format!("-j{nproc}"), "KCFLAGS=-Wno-error".into()]
+    vec![
+        format!("-j{nproc}"),
+        "KCFLAGS=-Wno-error".into(),
+        "WERROR=0".into(),
+        "HOSTCFLAGS=-Wno-error -Wno-error=discarded-qualifiers".into(),
+    ]
 }
 
 #[cfg(test)]
@@ -928,13 +950,29 @@ mod tests {
     #[test]
     fn cli_build_make_args_single_core() {
         let args = build_make_args(1);
-        assert_eq!(args, vec!["-j1", "KCFLAGS=-Wno-error"]);
+        assert_eq!(
+            args,
+            vec![
+                "-j1",
+                "KCFLAGS=-Wno-error",
+                "WERROR=0",
+                "HOSTCFLAGS=-Wno-error -Wno-error=discarded-qualifiers"
+            ]
+        );
     }
 
     #[test]
     fn cli_build_make_args_multi_core() {
         let args = build_make_args(16);
-        assert_eq!(args, vec!["-j16", "KCFLAGS=-Wno-error"]);
+        assert_eq!(
+            args,
+            vec![
+                "-j16",
+                "KCFLAGS=-Wno-error",
+                "WERROR=0",
+                "HOSTCFLAGS=-Wno-error -Wno-error=discarded-qualifiers"
+            ]
+        );
     }
 
     // -- run_make_captured --

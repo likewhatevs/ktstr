@@ -270,8 +270,15 @@ impl PairingKey {
     /// field via the `+mixed` marker in
     /// `group_and_average_by`'s `render_mixed_dirty` helper.
     pub fn from_row(row: &GauntletRow, pairing_dims: &[Dimension]) -> Self {
-        let mut parts = Vec::with_capacity(1 + pairing_dims.len());
+        let mut parts = Vec::with_capacity(2 + pairing_dims.len());
         parts.push(row.scenario.clone());
+        // Throughput-denomination era is ALWAYS the second component (not an
+        // operator Dimension): the throughput rate keys kept their names
+        // across the wall→CPU-second denomination change, so a wall-era row
+        // must never pair with — or group-average into — a cpu-era row.
+        // Slot index 1 is a stable contract: `denomination_agnostic` blanks
+        // it to detect cross-era near-misses for the compare diagnostic.
+        parts.push(row.throughput_denomination.as_str().to_string());
         for &dim in pairing_dims {
             parts.push(match dim {
                 Dimension::Kernel => row.kernel_version.clone().unwrap_or_default(),
@@ -290,6 +297,35 @@ impl PairingKey {
             });
         }
         PairingKey(parts)
+    }
+
+    /// The same key with the throughput-denomination slot (index 1, see
+    /// [`Self::from_row`]) blanked. Two rows whose full keys differ but whose
+    /// denomination-agnostic keys match are the SAME logical run pair split
+    /// only by the wall→CPU-second denomination change — the compare path
+    /// counts these as `denomination_mismatches` so the refusal to pair them
+    /// is flagged, not silent.
+    pub fn denomination_agnostic(&self) -> PairingKey {
+        let mut parts = self.0.clone();
+        if parts.len() > 1 {
+            parts[1] = String::new();
+        }
+        PairingKey(parts)
+    }
+
+    /// Human-readable `/`-joined label WITHOUT the throughput-denomination
+    /// slot: the denomination is a schema-era marker, not row identity an
+    /// operator narrows by, and stuttering `wall`/`cpu_sec` into every
+    /// finding label would bloat the tables for zero disambiguation (a
+    /// mixed-era cohort never pairs, so a rendered pair is single-era by
+    /// construction). Render sites use this; the raw `self.0` remains the
+    /// join/uniqueness key.
+    pub fn label(&self) -> String {
+        let mut parts: Vec<&str> = self.0.iter().map(String::as_str).collect();
+        if parts.len() > 1 {
+            parts.remove(1);
+        }
+        parts.join("/")
     }
 }
 
@@ -517,6 +553,7 @@ struct Accumulator<'a> {
     sum_fallback_count: i64,
     sum_keep_last_count: i64,
     sum_total_iterations: u64,
+    max_host_dilation: Option<f64>,
     // sum_page_locality + sum_cross_node_mig removed: both NUMA roll-ups are now
     // ext-sourced (worst_page_locality = WorstLowest, worst_cross_node_migration_ratio
     // = WorstCrossNodeRatio), re-pooled from the per-phase carriers and
@@ -593,6 +630,7 @@ impl<'a> Accumulator<'a> {
             sum_fallback_count: 0,
             sum_keep_last_count: 0,
             sum_total_iterations: 0,
+            max_host_dilation: None,
             max_gap_ms: 0,
             max_imbalance_ratio: 0.0,
             max_max_dsq_depth: 0,
@@ -668,6 +706,12 @@ impl<'a> Accumulator<'a> {
         self.sum_total_iterations = self
             .sum_total_iterations
             .saturating_add(row.total_iterations);
+        if let Some(dilation) = row.host_dilation.filter(|d| d.is_finite()) {
+            self.max_host_dilation = Some(
+                self.max_host_dilation
+                    .map_or(dilation, |current| current.max(dilation)),
+            );
+        }
         // Peak-kind typed fields: cross-RUN aggregation surfaces
         // the worst-instant observed across the cohort, NOT the
         // arithmetic mean (which dilutes a single peak across
@@ -792,6 +836,10 @@ impl<'a> Accumulator<'a> {
             // value is metadata only.
             cpu_budget: acc.first.cpu_budget,
             vcpus: acc.first.vcpus,
+            // First-seen like the fields above — and safe by construction:
+            // the denomination era is an unconditional PairingKey component
+            // (slot 1), so every contributor in a group shares one value.
+            throughput_denomination: acc.first.throughput_denomination,
             // ALL must pass: any failed, inconclusive, or skipped
             // contributor flips the aggregate. A group with zero
             // passes_observed (every contributor failed, was
@@ -830,6 +878,7 @@ impl<'a> Accumulator<'a> {
             fallback_count: round_i64(acc.sum_fallback_count),
             keep_last_count: round_i64(acc.sum_keep_last_count),
             total_iterations: round_u64(acc.sum_total_iterations),
+            host_dilation: acc.max_host_dilation,
             ext_metrics,
             // Carry the Dynamic counter-key tags forward so a second-level
             // cross-RUN fold of these already-aggregated rows keeps SUM-folding
@@ -1127,48 +1176,9 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
             }
         })
         .collect();
-    // System-wide schedstat aggregates, read host-side from guest memory
-    // at freeze (zero observer effect; `MonitorSummary::schedstat_deltas`,
-    // summed across CPUs over the run). Keys ABSENT when CONFIG_SCHEDSTATS
-    // is off (schedstat_deltas == None): absent != 0 for a no-data run, and
-    // a 0 would pollute the cross-run Counter SUM and the Rate denominators
-    // (`total_pcount`, `total_ttwu_count`). All seven
-    // insert under one `if let` so each Rate's numerator/denominator pair is
-    // always co-present (derive_rate_metrics needs both). `u64 -> f64` is
-    // exact below 2^53 and inherently finite, so these skip the finite
-    // filter the payload keys go through. The registry entries are
-    // `Polarity::Informational` Counter raw components that feed nine
-    // `MetricKind::Rate` derivations (per-schedule: total_run_delay_ns_per_sched,
-    // ttwu_local_fraction, sched_goidle_fraction; per-second: run_delay_per_sec,
-    // pcount_per_sec, sched_count_per_sec, yld_count_per_sec, ttwu_count_per_sec,
-    // sched_goidle_per_sec); see [`crate::stats::METRICS`].
-    if let Some(sd) = sc
-        .monitor
-        .as_ref()
-        .and_then(|m| m.schedstat_deltas.as_ref())
-    {
-        ext_metrics.insert("total_run_delay".to_string(), sd.total_run_delay as f64);
-        ext_metrics.insert("total_pcount".to_string(), sd.total_pcount as f64);
-        ext_metrics.insert("total_sched_count".to_string(), sd.total_sched_count as f64);
-        ext_metrics.insert("total_yld_count".to_string(), sd.total_yld_count as f64);
-        ext_metrics.insert(
-            "total_sched_goidle".to_string(),
-            sd.total_sched_goidle as f64,
-        );
-        ext_metrics.insert("total_ttwu_count".to_string(), sd.total_ttwu_count as f64);
-        ext_metrics.insert("total_ttwu_local".to_string(), sd.total_ttwu_local as f64);
-        // Per-second Rate denominator: the schedstat-window span, co-inserted
-        // both-or-neither with the total_* numerators above so every *_per_sec
-        // schedstat Rate has its matching-window denominator present (the
-        // derive_rate_metrics num+den co-presence invariant; the same window the
-        // total_* deltas span, so num/den share a time base).
-        ext_metrics.insert(
-            "total_schedstat_wall_sec".to_string(),
-            sd.total_schedstat_wall_sec,
-        );
-    }
     // Run-level ext-only monitor metrics (avg_nr_running + the PELT IRQ load
-    // pair + the PSI-irq pair), folded from the run's MonitorSummary. Inserted
+    // pair + the PSI-irq pair + event/schedstat CPU-time components), folded
+    // from the run's MonitorSummary. Inserted
     // only when the run has monitor samples (a 0-sample run carries no
     // occupancy / IRQ signal — absent, not a false 0.0); the IRQ fields insert
     // only on Some (loud-absent on a kernel without the source). Shared with
@@ -1198,6 +1208,8 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         // identity, so they don't pair into a "budget 0" bucket.
         cpu_budget: (sc.cpu_budget != 0).then_some(sc.cpu_budget),
         vcpus: (sc.vcpus != 0).then_some(sc.vcpus),
+        host_dilation: sc.host_dilation.filter(|d| d.is_finite()),
+        throughput_denomination: sc.throughput_denomination,
         passed: sc.is_pass(),
         skipped: sc.is_skip(),
         inconclusive: sc.is_inconclusive(),

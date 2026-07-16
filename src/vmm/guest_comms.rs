@@ -540,7 +540,7 @@ pub(crate) fn wprof_trace_frames(buf: &[u8], cap: usize) -> Vec<(u32, &[u8])> {
 /// never cap — no trace bytes are dropped (an oversized single frame would
 /// otherwise be silently dropped by the host `HostAssembler`).
 #[cfg(feature = "wprof")]
-pub fn send_wprof_trace(buf: &[u8]) {
+pub fn send_wprof_trace(buf: &[u8]) -> bool {
     let cap = crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD as usize;
     for (msg_type, chunk) in wprof_trace_frames(buf, cap) {
         if !write_msg(msg_type, chunk) {
@@ -548,9 +548,10 @@ pub fn send_wprof_trace(buf: &[u8]) {
                 "ktstr: send_wprof_trace: bulk-port write failed at a {}-byte frame — wprof trace truncated",
                 chunk.len()
             );
-            return;
+            return false;
         }
     }
+    true
 }
 
 /// Send a stimulus event from the guest step executor.
@@ -671,16 +672,33 @@ pub fn send_scenario_start() {
     );
 }
 
+/// Publish the instrumentation-ready edge for a configured host BPF-map
+/// write. The guest calls this only when the host put
+/// `KTSTR_AWAIT_BPF_MAP_WRITE_READY=1` on the cmdline. By Phase 5 the bulk
+/// port is already established, but use the same bounded reopen/retry policy
+/// as [`send_scenario_start`] so a transient invalidated fd cannot silently
+/// turn a requested crash injection into an uninstrumented race.
+pub fn send_bpf_map_write_ready() -> bool {
+    for attempt in 0..5 {
+        if write_msg(MsgType::BpfMapWriteReady.wire_value(), &[]) {
+            return true;
+        }
+        if attempt + 1 < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    tracing::warn!(
+        "send_bpf_map_write_ready: 5 retries failed — host map injection remains safely gated"
+    );
+    false
+}
+
 /// Send a scenario-end marker. Payload: two LE u64s —
 /// `elapsed_ms` (since scenario start) followed by
 /// `total_iterations`, the final cumulative worker iteration count
-/// summed across every live handle at the LAST step's end. The host
-/// folds the iteration count into a synthetic terminal
-/// [`crate::timeline::StimulusEvent`] so the last step has a successor
-/// to diff its `iteration_rate` against — without it the final step's
-/// throughput is never computed (the per-phase rate is the delta
-/// between consecutive step events, and the last step has no following
-/// step event). Parsed host-side by
+/// summed across every live handle at the LAST step's end. The host preserves
+/// both values as terminal boundary telemetry; CPU-denominated iteration rates
+/// come from guest per-cgroup CPU-time carriers. Parsed host-side by
 /// [`crate::vmm::wire::parse_scenario_end`].
 pub fn send_scenario_end(elapsed_ms: u64, total_iterations: u64) {
     let mut payload = [0u8; crate::vmm::wire::SCENARIO_END_PAYLOAD_SIZE];
@@ -695,6 +713,19 @@ pub fn send_scenario_pause() {
 
 pub fn send_scenario_resume() {
     write_msg(MsgType::ScenarioResume.wire_value(), &[]);
+}
+
+/// Send a workload-progress heartbeat carrying the guest's own
+/// scenario-elapsed time in milliseconds (see
+/// [`crate::vmm::wire::MSG_TYPE_WORKLOAD_PROGRESS`]). Emitted from the
+/// scenario driver's existing scheduler-liveness wakeups so the host can
+/// place periodic captures on the guest clock without a dedicated heartbeat
+/// thread; a no-op when the bulk port is not yet open.
+pub fn send_workload_progress(elapsed_ms: u64) {
+    write_msg(
+        crate::vmm::wire::MSG_TYPE_WORKLOAD_PROGRESS,
+        &elapsed_ms.to_le_bytes(),
+    );
 }
 
 /// Send the boot-complete signal to the host. Payload: empty.
@@ -759,6 +790,121 @@ pub fn send_sys_rdy() -> bool {
 pub fn send_kern_addrs(addrs: &super::wire::KernAddrs) -> bool {
     let payload = addrs.to_payload();
     write_msg(super::wire::MSG_TYPE_KERN_ADDRS, &payload)
+}
+
+/// Send the running kernel's GNU build-id to the host
+/// (`MSG_TYPE_KERN_BUILD_ID`). Returns whether the frame was written
+/// (`false` on an empty build-id or a closed port). Empty is a benign
+/// "could not read" — the host skips the cache-consistency check rather
+/// than treating an absent build-id as a mismatch.
+pub fn send_kern_build_id(build_id: &[u8]) -> bool {
+    if build_id.is_empty() {
+        return false;
+    }
+    write_msg(super::wire::MSG_TYPE_KERN_BUILD_ID, build_id)
+}
+
+/// Read the running kernel's GNU build-id from `/sys/kernel/notes`.
+///
+/// `/sys/kernel/notes` exposes the raw bytes of the kernel image's
+/// `SHT_NOTE` sections. Walk the ELF-note records (each
+/// `namesz|descsz|type` header + 4-byte-aligned name + 4-byte-aligned
+/// desc) and return the descriptor of the `NT_GNU_BUILD_ID` (type 3)
+/// note whose owner name is `"GNU"`. Returns `None` when sysfs is
+/// absent, the file is unreadable, or no build-id note is present — the
+/// caller treats that as "no publish", and the host skips its check.
+/// The descriptor is truncated to `KERN_BUILD_ID_MAX` defensively.
+pub fn read_kernel_build_id() -> Option<Vec<u8>> {
+    let bytes = std::fs::read("/sys/kernel/notes").ok()?;
+    parse_gnu_build_id_note(&bytes)
+}
+
+/// Pure ELF-note walk over a `SHT_NOTE` blob (native endianness, the
+/// only layout `/sys/kernel/notes` exposes): return the descriptor of
+/// the first `NT_GNU_BUILD_ID` (type 3) note owned by `"GNU"`, truncated
+/// to [`super::wire::KERN_BUILD_ID_MAX`]. `None` on absence or a
+/// malformed/truncated record. Split out from [`read_kernel_build_id`]
+/// so the parse is unit-testable without a live sysfs.
+fn parse_gnu_build_id_note(bytes: &[u8]) -> Option<Vec<u8>> {
+    const NT_GNU_BUILD_ID: u32 = 3;
+    let align4 = |n: usize| n.div_ceil(4) * 4;
+    let mut off = 0usize;
+    while off + 12 <= bytes.len() {
+        let namesz = u32::from_ne_bytes(bytes[off..off + 4].try_into().ok()?) as usize;
+        let descsz = u32::from_ne_bytes(bytes[off + 4..off + 8].try_into().ok()?) as usize;
+        let ntype = u32::from_ne_bytes(bytes[off + 8..off + 12].try_into().ok()?);
+        let name_off = off + 12;
+        let desc_off = name_off + align4(namesz);
+        let next = desc_off + align4(descsz);
+        // Malformed/over-long record: stop rather than risk a runaway
+        // or an out-of-bounds slice on a truncated read.
+        if next > bytes.len() || next <= off {
+            break;
+        }
+        if ntype == NT_GNU_BUILD_ID
+            && namesz >= 3
+            && &bytes[name_off..name_off + 3] == b"GNU"
+            && descsz > 0
+        {
+            let end = desc_off + descsz.min(super::wire::KERN_BUILD_ID_MAX);
+            return Some(bytes[desc_off..end].to_vec());
+        }
+        off = next;
+    }
+    None
+}
+
+#[cfg(test)]
+mod build_id_tests {
+    use super::parse_gnu_build_id_note;
+
+    /// Encode one ELF note (native-endian header + 4-byte-aligned name
+    /// and desc), matching the `/sys/kernel/notes` layout.
+    fn note(name: &[u8], ntype: u32, desc: &[u8]) -> Vec<u8> {
+        let pad = |v: &mut Vec<u8>| {
+            while !v.len().is_multiple_of(4) {
+                v.push(0)
+            }
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(&(name.len() as u32).to_ne_bytes());
+        out.extend_from_slice(&(desc.len() as u32).to_ne_bytes());
+        out.extend_from_slice(&ntype.to_ne_bytes());
+        out.extend_from_slice(name);
+        pad(&mut out);
+        out.extend_from_slice(desc);
+        pad(&mut out);
+        out
+    }
+
+    #[test]
+    fn extracts_gnu_build_id_and_skips_other_notes() {
+        let id = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03];
+        let mut blob = note(b"GNU\0", 1, b"other"); // wrong type, skipped
+        blob.extend(note(b"Linux\0\0\0", 3, b"xxxx")); // right type, wrong owner
+        blob.extend(note(b"GNU\0", 3, &id)); // the real build-id
+        assert_eq!(parse_gnu_build_id_note(&blob).as_deref(), Some(&id[..]));
+    }
+
+    #[test]
+    fn none_when_absent_or_truncated() {
+        assert_eq!(parse_gnu_build_id_note(&[]), None);
+        assert_eq!(parse_gnu_build_id_note(&note(b"GNU\0", 1, b"x")), None);
+        // A header claiming a desc longer than the blob is rejected, not
+        // read out of bounds.
+        let mut torn = 4u32.to_ne_bytes().to_vec(); // namesz
+        torn.extend_from_slice(&999u32.to_ne_bytes()); // descsz (overlong)
+        torn.extend_from_slice(&3u32.to_ne_bytes()); // NT_GNU_BUILD_ID
+        torn.extend_from_slice(b"GNU\0");
+        assert_eq!(parse_gnu_build_id_note(&torn), None);
+    }
+
+    #[test]
+    fn caps_overlong_build_id() {
+        let long = vec![0xab; crate::vmm::wire::KERN_BUILD_ID_MAX + 16];
+        let got = parse_gnu_build_id_note(&note(b"GNU\0", 3, &long)).unwrap();
+        assert_eq!(got.len(), crate::vmm::wire::KERN_BUILD_ID_MAX);
+    }
 }
 
 /// Read the runtime virtual address of `_text` (the kernel image
@@ -833,20 +979,40 @@ fn read_kallsyms_symbol_kva(name: &str, allowed_types: &[&str]) -> Option<u64> {
 
 /// Derive the KASLR physical displacement from `/proc/iomem`.
 ///
-/// On both x86_64 and aarch64 the kernel registers a "Kernel code"
-/// resource in `/proc/iomem` whose start address is the physical
-/// load address of `_text`. The KASLR offset is the difference
-/// between this runtime PA and the default (non-KASLR) load PA.
+/// The published value's CONTRACT is "the displacement the host adds
+/// to its text-KVA → PA translations" (`text_kva_to_pa_with_base`'s
+/// `phys_base` argument) — the offset of the kernel IMAGE BASE
+/// (`_text`) from its default load PA.
 ///
-/// x86_64: default load PA = `LOAD_PHYSICAL_ADDR` (0x100_0000,
-/// CONFIG_PHYSICAL_START). `phys_base = code_pa - 0x100_0000`.
+/// x86_64: the "Kernel code" resource starts at `__pa_symbol(_text)`
+/// (arch/x86/kernel/setup.c), and the default load PA is
+/// `LOAD_PHYSICAL_ADDR` (0x100_0000, CONFIG_PHYSICAL_START):
+/// `phys_base = code_pa - 0x100_0000`.
 ///
-/// aarch64: default load PA = DRAM base (`System RAM` start from
-/// iomem) + `TEXT_OFFSET`. `TEXT_OFFSET` is 0 on kernels since
-/// v5.8 (commit 2b5fcc5), so `phys_base = code_pa - ram_start`.
-/// Older kernels with `TEXT_OFFSET = 0x80000` (or randomized via
-/// `CONFIG_ARM64_RANDOMIZE_TEXT_OFFSET`) would produce a biased
-/// value; ktstr.kconfig targets 6.x where `TEXT_OFFSET = 0`.
+/// aarch64: the resource start is VERSION-DEPENDENT —
+/// `__pa_symbol(_stext)` up to v6.14 and `__pa_symbol(_text)` on
+/// newer kernels (arch/arm64/kernel/setup.c:217 in each) — and
+/// `_stext - _text` is the `.head.text` + SEGMENT_ALIGN gap
+/// (0x10000 on our 6.14 4K-granule builds, absorbed into `_text`
+/// on ≥6.15-era layouts). Naively publishing `code_pa − ram_start`
+/// therefore reported the `_stext` bias, NOT a load displacement:
+/// an observed arm64/6.14 guest published `0x10000` and the host's
+/// per-tick adoption displaced every text translation by it,
+/// reading a stable-garbage `__per_cpu_offset[]` page and keeping
+/// the evidence channels dead all run (7.1 kernels publish 0 and
+/// were unaffected — the version split that made the failure
+/// 6.14-only). Subtract the same-boot `_stext − _text` gap from
+/// kallsyms so the resource-start convention cancels on every
+/// kernel generation: with `KERNEL_LOAD_ADDR == DRAM_START` by VMM
+/// construction (aarch64/kvm.rs) and no physical self-relocation on
+/// arm64 (KASLR randomizes the VIRTUAL mapping only), the debiased
+/// value is 0 today — matching the accessor-init worker's
+/// documented `phys_base = 0` decouple invariant
+/// (`freeze_coord/mod.rs`) — and stays correct if a future VMM
+/// loads the Image displaced. When kallsyms is unreadable the
+/// aarch64 arm returns `None` rather than a possibly-biased guess
+/// (the host's CR3-walk fallback and per-tick adoption tolerate an
+/// absent publish; a WRONG publish poisons every translation).
 pub fn read_phys_base_from_iomem() -> Option<u64> {
     let iomem = std::fs::read_to_string("/proc/iomem").ok()?;
     #[cfg(target_arch = "x86_64")]
@@ -866,9 +1032,12 @@ pub fn read_phys_base_from_iomem() -> Option<u64> {
     {
         // First "System RAM" entry = lowest-addressed DRAM region.
         // KERNEL_LOAD_ADDR == DRAM_START by construction in our VMM,
-        // so the kernel always loads at this base.
+        // so the kernel always loads at this base. Parse the "Kernel
+        // code" START (the displacement-bearing quantity) and its END
+        // (the convention discriminator — see below).
         let mut ram_start: Option<u64> = None;
         let mut code_start: Option<u64> = None;
+        let mut code_end: Option<u64> = None;
         for line in iomem.lines() {
             let line = line.trim();
             if ram_start.is_none() && line.ends_with(": System RAM") {
@@ -878,11 +1047,54 @@ pub fn read_phys_base_from_iomem() -> Option<u64> {
             }
             if line.ends_with(": Kernel code") {
                 let range = line.split(':').next()?.trim();
-                let start = range.split('-').next()?.trim();
-                code_start = Some(u64::from_str_radix(start, 16).ok()?);
+                let mut parts = range.split('-');
+                code_start = Some(u64::from_str_radix(parts.next()?.trim(), 16).ok()?);
+                code_end = Some(u64::from_str_radix(parts.next()?.trim(), 16).ok()?);
             }
         }
-        Some(code_start?.wrapping_sub(ram_start?))
+        let delta = code_start?.wrapping_sub(ram_start?);
+        // Debias the resource-start convention CONDITIONALLY. The
+        // resource starts at `__pa_symbol(_stext)` on ≤6.14 arm64 and
+        // `__pa_symbol(_text)` on newer kernels
+        // (arch/arm64/kernel/setup.c:217 in each), while the SYMBOL gap
+        // `_stext − _text` (the `.head.text` + SEGMENT_ALIGN pad,
+        // 0x10000 on our 4K-granule builds) exists on BOTH layouts — an
+        // earlier unconditional subtraction underflowed the 7.1-era
+        // value to −0x10000 and poisoned every host text translation.
+        //
+        // Discriminator: the resource SIZE. The end is `__init_begin−1`
+        // on both generations, so
+        //   size == __init_begin − _stext  ⇔ the start is `_stext`
+        //   size == __init_begin − _text   ⇔ the start is `_text`
+        // Symbol DIFFERENCES from the same-boot kallsyms are exact
+        // (every symbol carries the same virtual KASLR slide) and a
+        // physical load displacement shifts start and end together,
+        // never the size — so this discriminates correctly even under
+        // real physical KASLR, where the naive `delta == gap` test is
+        // ambiguous (delta = displacement + maybe-bias). When the gap
+        // is 0 the conventions coincide and no bias exists. An
+        // unrecognized size (neither candidate — unexpected layout, or
+        // `__init_begin` missing from kallsyms) publishes nothing
+        // rather than a guess: the host tolerates an absent publish
+        // (CR3-walk fallback + per-tick adoption), while a WRONG one
+        // poisons every translation.
+        let stext = read_kallsyms_symbol_kva("_stext", &["T", "t"])?;
+        let text = read_kallsyms_symbol_kva("_text", &["T", "t"])?;
+        let stext_gap = stext.wrapping_sub(text);
+        if stext_gap == 0 {
+            return Some(delta);
+        }
+        let init_begin = read_kallsyms_symbol_kva("__init_begin", &["D", "d", "T", "t", "R", "r"])?;
+        let size = code_end?.wrapping_sub(code_start?).wrapping_add(1);
+        let size_if_stext = init_begin.wrapping_sub(stext);
+        let size_if_text = init_begin.wrapping_sub(text);
+        if size == size_if_stext {
+            Some(delta.wrapping_sub(stext_gap))
+        } else if size == size_if_text {
+            Some(delta)
+        } else {
+            None
+        }
     }
 }
 

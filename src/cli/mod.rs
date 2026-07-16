@@ -27,8 +27,10 @@ pub use kernel_list::{format_entry_row, kernel_clean, kernel_list, kernel_list_r
 
 pub(crate) use kernel_build::critical_config_options;
 pub use kernel_build::{
-    KernelBuildResult, append_extra_kconfig_suffix, kernel_build_pipeline, make_kernel_with_output,
-    read_extra_kconfig, run_make, run_make_with_output, validate_kernel_config,
+    BuildReservation, KernelBuildResult, acquire_build_reservation,
+    acquire_build_reservation_waiting, append_extra_kconfig_suffix, kernel_build_pipeline,
+    make_kernel_with_output, read_extra_kconfig, run_make, run_make_with_output,
+    validate_kernel_config,
 };
 
 pub use parse::{DISK_HELP, parse_disk_arg, parse_disk_size_mib, parse_topology_string};
@@ -42,8 +44,8 @@ pub use resolve::{
 };
 
 pub use stats_cmds::{
-    compare_partitions, compare_partitions_noise, explain_sidecar, list_metrics, list_runs,
-    list_values, print_stats_report, show_host, show_run_host, show_thresholds,
+    compare_partitions, compare_partitions_noise, explain_sidecar, last_run_report, list_metrics,
+    list_runs, list_values, show_host, show_run_host, show_thresholds,
 };
 
 pub use locks::list_locks;

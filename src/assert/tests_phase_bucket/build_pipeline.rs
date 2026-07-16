@@ -457,7 +457,8 @@ fn build_phase_buckets_injects_per_group_cpu_time_delta() {
     assert_eq!(baseline.step_index, 0);
     assert!(
         !baseline.metrics.contains_key("system_time_ns")
-            && !baseline.metrics.contains_key("user_time_ns"),
+            && !baseline.metrics.contains_key("user_time_ns")
+            && !baseline.metrics.contains_key("system_cpu_fraction"),
         "single enriched sample -> CPU-time key omitted (absent != real 0)",
     );
 
@@ -473,6 +474,16 @@ fn build_phase_buckets_injects_per_group_cpu_time_delta() {
         step0.metrics.get("user_time_ns").copied(),
         Some(7000.0),
         "user delta = tgid100 (9000-2000); tgid200 single-appearance -> 0",
+    );
+    assert_eq!(
+        step0.metrics.get("observed_task_cpu_time_ns").copied(),
+        Some(10_000.0),
+        "fraction denominator uses the identical system+user endpoints",
+    );
+    assert_eq!(
+        step0.metrics.get("system_cpu_fraction").copied(),
+        Some(0.3),
+        "3000 / (3000 + 7000) is invariant to delivered CPU duration",
     );
 }
 

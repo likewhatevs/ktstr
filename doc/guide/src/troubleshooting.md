@@ -25,6 +25,7 @@ Find your error message, jump to its section:
 | `scheduler 'NAME' not found` | [Scheduler not found](#scheduler-not-found) |
 | `scheduler process died unexpectedly` | [Scheduler died](#scheduler-died) |
 | `scheduler did not turn on` + verifier log | [Scheduler fails the BPF verifier](#scheduler-fails-the-bpf-verifier) |
+| `ktstr-watchdog: … kicking BSP` / `cause=tierN-…` | [ktstr-watchdog fired](#ktstr-watchdog-fired) |
 | `libbpf: … func_proto … incompatible with vmlinux` | [Scheduler cannot load: kfunc BTF mismatch](#scheduler-cannot-load-kfunc-btf-mismatch) |
 | `send_sys_rdy failed within boot budget` | [send_sys_rdy timeout](#send_sys_rdy-timeout) |
 | `no 2MB hugepages available` | [Insufficient hugepages](#insufficient-hugepages) |
@@ -261,6 +262,39 @@ all failures.
 - Follow [Investigate a Crash](recipes/investigate-crash.md) for the
   crash-to-pin workflow.
 
+## ktstr-watchdog fired
+
+```text
+ktstr-watchdog: tier2-idle-wedge, kicking BSP
+ktstr-watchdog: deadline expired at 18.791573169s from VM start
+  cause=tier2-idle-wedge, hard_timeout_fired=false, kill_set_by_AP=false
+  phase=Teardown (Infra), monitor_live=true, evidence_channels_live=true
+  max_vcpu_cpu_in_phase=54.209745ms vs budget=12s (currency=pthread), ...
+  wall_in_phase=15.036764228s vs backstop=15s
+```
+
+Every watchdog line ktstr emits is prefixed `ktstr-watchdog` — if a
+log says something else fired, it was not ktstr's watchdog. The
+`cause=` token is authoritative:
+
+- `tier1-cpu-budget` — the busiest vCPU burned more guest CPU inside
+  one lifecycle phase than the phase's flat budget without reaching a
+  milestone: a *spinning* wedge (compare `max_vcpu_cpu_in_phase` vs
+  `budget`). Host load cannot cause this — a starved cell accrues no
+  CPU.
+- `tier2-idle-wedge` — an infrastructure phase (boot / attach /
+  dispatch / teardown, never the test body) sat past its wall backstop
+  with nothing runnable in the guest: a *silent* wedge (compare
+  `wall_in_phase` vs `backstop`, and check `runnable_demand=false`).
+- `tier3-deadman-deadline` — the dead-man wall deadline with the cell
+  inert or the monitor dead; healthy-but-slow cells defer it. If this fires,
+  read the rest of the dump: it usually means the progress machinery
+  itself lost its evidence channels.
+
+The dump renders the full progress ledger (phase, milestones, CPU
+currency, per-vCPU trickle evidence) — see the three-tier rules in
+[Run Modes](concepts/run-modes.md#the-progress-watchdog-is-mode-independent).
+
 ## Scheduler fails the BPF verifier
 
 ```text
@@ -361,8 +395,10 @@ the boot budget (10 s plus 150 ms per vCPU, capped at 90 s). The WARN
 itself is non-fatal — the guest continues and the host starts
 sampling anyway — but the test usually then fails through the normal
 VM-teardown path (see [Scheduler died](#scheduler-died)); the
-authoritative deadline is the host watchdog, which scales with host
-overcommit.
+authoritative deadline is the host progress watchdog, whose Tier-3
+dead-man deadline scales with the guest's vCPU count (not host
+overcommit) while its Tier-1/2 progress rules absorb an oversubscribed
+host.
 
 The diagnostic fields split the cause in two:
 

@@ -61,14 +61,14 @@ pub(crate) enum KtstrCommand {
         #[arg(long)]
         no_perf_mode: bool,
         /// Promote hardware-driven test SKIPS to hard failures.
-        /// `ResourceContention` (no LLC slot currently free / KVM fd
-        /// budget exhausted -- transient), `TopologyInsufficient`
-        /// (the VM can't boot on this host), and `PerfModeUnavailable`
-        /// (performance_mode on a too-small host) skips become exit 1
-        /// instead of silent passes. (Only an explicit cpu-budget the
-        /// host can't satisfy, `CpuBudgetUnsatisfiable`, is an
-        /// unconditional hard error NOT gated by this flag.) For CI
-        /// environments
+        /// `TopologyInsufficient` (the VM can't boot on this host) and
+        /// `PerfModeUnavailable` (performance_mode on a too-small host)
+        /// skips become exit 1 instead of silent passes.
+        /// (`ResourceContention` is not gated by this flag: acquisition
+        /// waits out a busy reservation and any residual contention is
+        /// already a retryable failure, never a skip. An explicit
+        /// cpu-budget the host can't satisfy, `CpuBudgetUnsatisfiable`,
+        /// is likewise an unconditional hard error.) For CI environments
         /// where the hardware IS expected to support every test —
         /// a skip means the CI config is wrong, not that the test
         /// is inapplicable. Exports `KTSTR_NO_SKIP_MODE=1`.
@@ -259,22 +259,23 @@ pub(crate) enum KtstrCommand {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// Print sidecar analysis from the most recent test run.
+    /// Inspect the sidecar pool a test run left under
+    /// `{CARGO_TARGET_DIR or "target"}/ktstr/`.
     ///
-    /// Reads sidecar JSON files from the newest subdirectory under
-    /// `{CARGO_TARGET_DIR or "target"}/ktstr/` (overridable with
-    /// `KTSTR_SIDECAR_DIR`) and prints gauntlet analysis, BPF
-    /// verifier stats, callback profile, and KVM stats. Test runs
-    /// are partitioned into `{kernel}-{project_commit}` subdirectories,
-    /// where `{project_commit}` is the project HEAD short hex with
-    /// `-dirty` when the worktree differs; each subdirectory is
-    /// the baseline snapshot of the most recent run at that
-    /// (kernel, project commit) pair (re-running at the same key
-    /// pre-clears prior sidecars before writing the new run).
+    /// The gauntlet analysis (outlier scan, BPF verifier stats,
+    /// callback profile, KVM stats) is NOT auto-printed after a test
+    /// run any more; ask for it explicitly with `stats last-run`.
+    /// Test runs are partitioned into `{kernel}-{project_commit}`
+    /// subdirectories, where `{project_commit}` is the project HEAD
+    /// short hex with `-dirty` when the worktree differs; each
+    /// subdirectory is the baseline snapshot of the most recent run
+    /// at that (kernel, project commit) pair (re-running at the same
+    /// key pre-clears prior sidecars before writing the new run).
     ///
-    /// Single-run inspection (list / list-metrics / list-values /
-    /// show-host / explain-sidecar); `cargo ktstr perf-delta` diffs two
-    /// commits.
+    /// Subcommands: last-run (the gauntlet analysis) / list (run
+    /// table) / list-metrics / list-values / show-host / explain-sidecar;
+    /// `cargo ktstr perf-delta` diffs two commits. Bare
+    /// `cargo ktstr stats` prints this help.
     Stats {
         #[command(subcommand)]
         command: Option<StatsCommand>,
@@ -846,6 +847,41 @@ pub(crate) enum KtstrCommand {
 
 #[derive(Subcommand)]
 pub(crate) enum StatsCommand {
+    /// Print the gauntlet analysis for the most recent test run —
+    /// outlier scan, BPF verifier stats, callback profile, and KVM
+    /// stats — the blob that used to auto-print.
+    ///
+    /// Default source directory (in precedence order):
+    /// 1. `--dir <PATH>` when given — analyzes that directory verbatim
+    ///    (any `{kernel}-{project_commit}` run dir, or an archived copy).
+    /// 2. `KTSTR_SIDECAR_DIR` when set non-empty.
+    /// 3. `--kernel <LABEL>` when given — the newest run dir whose leaf
+    ///    name begins `{LABEL}-` (the `{kernel}` component of
+    ///    `{kernel}-{project_commit}` as the test process detected it,
+    ///    e.g. a version string like `7.1.3`). No match reports "no
+    ///    sidecar data".
+    /// 4. Otherwise the most-recently-modified run dir under the runs
+    ///    root — "the report from my last test run". `cargo ktstr stats`
+    ///    can't reconstruct the `{kernel}-{project_commit}` key itself
+    ///    (it runs no kernel), so the mtime pick stands in for it.
+    ///
+    /// Prints nothing (a "no sidecar data" note on stderr) when the
+    /// resolved directory holds no sidecars — a run that skipped every
+    /// gauntlet test writes none.
+    LastRun {
+        /// Explicit sidecar directory to analyze, mirroring
+        /// `analyze_sidecars(Some(dir))`. Overrides `KTSTR_SIDECAR_DIR`
+        /// and the default newest-run resolution.
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+        /// Narrow the default resolution to the newest run dir whose
+        /// leaf name begins `{LABEL}-`. Ignored when `--dir` or
+        /// `KTSTR_SIDECAR_DIR` is set. The label matches the run dir's
+        /// detected `{kernel}` component (a version string), not the
+        /// raw `--kernel` spec `cargo ktstr test` accepts.
+        #[arg(long)]
+        kernel: Option<String>,
+    },
     /// List test runs under `{CARGO_TARGET_DIR or "target"}/ktstr/`.
     List,
     /// List the registered regression metrics and their default

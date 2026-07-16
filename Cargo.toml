@@ -9,7 +9,7 @@ repository = "https://github.com/likewhatevs/ktstr"
 
 [package]
 name = "ktstr"
-version = "0.33.0"
+version = "0.38.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -154,7 +154,7 @@ virtio-queue = "0.17"
 vm-superio = "0.8.1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 linkme = "0.3"
-ktstr-macros = { version = "0.33.0", path = "ktstr-macros" }
+ktstr-macros = { version = "0.38.0", path = "ktstr-macros" }
 goblin = { version = "0.10.5", features = ["elf64"] }
 # Memory-map /proc/self/exe in the coverage-instrumentation detection
 # probe (`is_coverage_instrumented_binary` / `find_symbol_vaddrs` in
@@ -249,22 +249,22 @@ strsim = "0.11"
 # which matches the intent — that flow is host-tooling, not a
 # downstream-author surface).
 base64 = { version = "0.22", optional = true }
-# jemalloc as global allocator for the ktstr/cargo-ktstr binaries.
-# binary-only — the library stays allocator-agnostic so downstream
-# consumers pick their own allocator. `stats` feature compiles
+# jemalloc as global allocator for the shipped binaries. Each binary
+# declares it at its crate root. Integration-test binaries stay
+# allocator-agnostic because they are also packed as guest `/init`, where
+# jemalloc is unrelated to the scenario and must not expand the guest
+# correctness surface. `stats` compiles
 # jemalloc with internal per-allocation bookkeeping so
 # `tikv-jemalloc-ctl`'s `stats.{allocated,active,resident,mapped}`
 # mallctl reads return populated values instead of failing with
 # EPERM; `host_heap::collect` depends on this.
 #
-# Referenced from the `#[global_allocator]` declaration in `src/lib.rs`
-# (gated on `cli-bins`), which every bin that links the crate inherits;
-# only `ktstr-jemalloc-alloc-worker` (`src/bin/jemalloc_alloc_worker.rs`)
-# declares its own because it links via `#[path]` rather than the crate.
-# Gated behind the `cli-bins`
-# feature; with the feature off, `tikv-jemalloc-ctl`'s mallctl reads
-# return Err and `host_heap::collect` lands `None` as documented on
-# the ctl dep below — same observable shape, no allocator swap.
+# Referenced from the `#[global_allocator]` declarations in the binary crate
+# roots.
+# `tikv-jemallocator` is gated behind the `cli-bins` feature. The ctl
+# dependency below remains unconditional, so allocator-agnostic library
+# consumers can read jemalloc's linked-instance metadata; host-context
+# capture omits it unless a binary explicitly marks jemalloc as global.
 tikv-jemallocator = { version = "0.6", features = ["stats"], optional = true }
 # Safe wrappers for the jemalloc mallctl introspection surface. Used
 # by `host_heap` to capture the running binary's heap footprint
@@ -436,7 +436,7 @@ cli-bins = [
 export = ["dep:base64"]
 # Embed the wprof BPF tracer for Perfetto-format profiling in VMs.
 # Default off: first build clones github.com/anakryiko/wprof and
-# compiles libbpf + blazesym (requires git, make, gcc, clang,
+# compiles libbpf + blazesym (requires git, make, gcc, clang, mold,
 # elfutils-devel, zlib-devel on the host; takes several minutes).
 wprof = ["ktstr-macros/wprof"]
 # Pretty thread-name labels in `ctprof_compare` output. Enables

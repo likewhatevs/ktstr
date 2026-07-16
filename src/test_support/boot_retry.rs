@@ -1,20 +1,27 @@
-//! Host-side bounded retry of a whole guest cold boot when the guest
-//! PID-1 reports the AP-bring-up-gap infra fault.
+//! Host-side bounded retry of a whole guest cold boot on an
+//! AP-bring-up infra fault, detected from either side of the boot.
 //!
 //! On oversubscribed CI hosts an application processor can miss its
 //! INIT-SIPI alive-window (the kernel's `cpuhp_wait_for_sync_state`
 //! gives it 10 s of guest WALL-CLOCK, which host stalls burn while the
-//! AP thread gets no cycles) and land present-but-offline. The guest
-//! PID-1 detects that gap BEFORE any test or scheduler runs
-//! (`crate::vmm::rust_init::topology::all_possible_cpus_online`) and
-//! PANICs — the panic reaches the host as
-//! [`crate::vmm::VmResult::crash_message`] carrying
-//! [`AP_BRINGUP_GAP_MARKER`].
+//! AP thread gets no cycles) and land present-but-offline. Two detectors
+//! feed this retry:
+//!
+//!   * Guest side — the guest PID-1 checks every possible CPU is online
+//!     BEFORE any test or scheduler runs
+//!     (`crate::vmm::rust_init::topology::all_possible_cpus_online`) and
+//!     PANICs on a gap; the panic reaches the host as
+//!     [`crate::vmm::VmResult::crash_message`] carrying
+//!     [`AP_BRINGUP_GAP_MARKER`].
+//!   * Host side — the AP-ready boot gate in `KtstrVm::run_vm` bails with
+//!     [`crate::vmm::freeze_coord::ApGateTimeout`] when an AP host thread
+//!     never reaches `KVM_RUN` within the bring-up cap, so the guest is
+//!     never even released to boot.
 //!
 //! Recovery is a fresh cold boot — exactly what bare metal does — so the
 //! scheduler only ever sees a topology assembled by a clean boot, never
-//! a hotplug-healed one. The fault is pre-test, so retrying is safe and
-//! idempotent: no test or scheduler side effects exist yet.
+//! a hotplug-healed one. Both faults are pre-test, so retrying is safe
+//! and idempotent: no test or scheduler side effects exist yet.
 
 /// Identifying substring of the guest PID-1 AP-bring-up-gap panic
 /// message. The guest formats the full message in
@@ -38,14 +45,25 @@ pub(crate) const AP_GAP_BOOT_ATTEMPTS: u32 = 3;
 /// consumes the builder and `run` consumes the boot, so a retry cannot
 /// reuse the prior VM.
 ///
-/// When the returned result carries a `crash_message` containing
-/// [`AP_BRINGUP_GAP_MARKER`] — the guest PID-1 panicked pre-test because
-/// an AP missed its INIT-SIPI window — the whole boot is re-run, up to
-/// [`AP_GAP_BOOT_ATTEMPTS`] total. EVERY other outcome (a clean run, or
-/// ANY other failure — timeout, scheduler crash, boot failure) returns
-/// immediately: the retry keys STRICTLY on the marker. A build/run
-/// `Err` also propagates immediately (it is not a marker-bearing
-/// result). The common all-online path pays nothing beyond the single
+/// Two distinct AP-bring-up failures are retried, both drawing on the
+/// same [`AP_GAP_BOOT_ATTEMPTS`] budget (a boot that alternates between
+/// the two still caps at that many total attempts):
+///
+///   1. The guest side: the returned result carries a `crash_message`
+///      containing [`AP_BRINGUP_GAP_MARKER`] — the guest PID-1 panicked
+///      pre-test because an AP came up present-but-offline.
+///   2. The host side: the build/run `Err` chain downcasts to
+///      [`crate::vmm::freeze_coord::ApGateTimeout`] — the host-side
+///      AP-ready boot gate tripped because an AP thread never reached
+///      `KVM_RUN`. (`downcast_ref` traverses the anyhow context chain,
+///      so the `.context(...)` both production call sites wrap the error
+///      with does not hide it.)
+///
+/// Both are pre-test infra faults with no test/scheduler side effects
+/// yet, so a fresh cold boot is a safe, idempotent recovery. EVERY other
+/// outcome returns immediately: a clean run, any other `crash_message`
+/// (timeout, scheduler crash), and any other `Err` all propagate as-is.
+/// The common all-online path pays nothing beyond the single
 /// `crash_message` inspection.
 pub(crate) fn run_vm_with_ap_gap_retry<F>(
     mut build_and_run: F,
@@ -55,7 +73,26 @@ where
 {
     let mut attempt = 1u32;
     loop {
-        let result = build_and_run()?;
+        let result = match build_and_run() {
+            Ok(result) => result,
+            Err(err) => {
+                // Host-side AP-ready gate trip: retry the cold boot, same
+                // as the guest-side marker below. Any other Err — and the
+                // gate trip once the attempt budget is spent — propagates.
+                if let Some(gate) = err.downcast_ref::<crate::vmm::freeze_coord::ApGateTimeout>()
+                    && attempt < AP_GAP_BOOT_ATTEMPTS
+                {
+                    eprintln!(
+                        "ktstr: vCPU bring-up gate tripped ({gate}); retrying boot (attempt {}/{})",
+                        attempt + 1,
+                        AP_GAP_BOOT_ATTEMPTS,
+                    );
+                    attempt += 1;
+                    continue;
+                }
+                return Err(err);
+            }
+        };
         let ap_gap = result
             .crash_message
             .as_deref()
@@ -173,8 +210,9 @@ mod tests {
         );
     }
 
-    /// A build/run `Err` propagates immediately — it is not a
-    /// marker-bearing result, so it is never retried.
+    /// A build/run `Err` that is NOT a gate trip propagates immediately —
+    /// it is neither a marker-bearing result nor an [`ApGateTimeout`], so
+    /// it is never retried.
     #[test]
     fn propagates_err_without_retry() {
         let calls = Cell::new(0u32);
@@ -182,7 +220,96 @@ mod tests {
             calls.set(calls.get() + 1);
             Err(anyhow::anyhow!("build failed"))
         });
-        assert_eq!(calls.get(), 1, "an Err must not retry");
+        assert_eq!(calls.get(), 1, "an unrelated Err must not retry");
         assert!(out.is_err());
+    }
+
+    /// An `anyhow::Error` wrapping an [`ApGateTimeout`] — the host-side
+    /// AP-ready gate trip the retry now recognizes. `ctx`, when set, adds
+    /// a `.context(...)` layer to prove the downcast still traverses the
+    /// chain (both production call sites wrap the error with context).
+    fn gate_timeout_err(ctx: Option<&str>) -> anyhow::Error {
+        let e = anyhow::Error::new(crate::vmm::freeze_coord::ApGateTimeout {
+            not_ready: vec![3],
+            elapsed: std::time::Duration::from_secs(30),
+            killed: false,
+            evidence: "  vCPU 3: never scheduled (no TID stamped)\n".to_string(),
+        });
+        match ctx {
+            Some(c) => e.context(c.to_string()),
+            None => e,
+        }
+    }
+
+    /// A persistent host-side gate trip is retried up to the shared
+    /// attempt cap, then the final `Err` propagates as-is.
+    #[test]
+    fn retries_gate_timeout_up_to_cap() {
+        let calls = Cell::new(0u32);
+        let out = run_vm_with_ap_gap_retry(|| {
+            calls.set(calls.get() + 1);
+            Err(gate_timeout_err(None))
+        });
+        assert_eq!(
+            calls.get(),
+            AP_GAP_BOOT_ATTEMPTS,
+            "a persistent gate trip must retry up to the attempt cap",
+        );
+        assert!(
+            out.unwrap_err()
+                .downcast_ref::<crate::vmm::freeze_coord::ApGateTimeout>()
+                .is_some(),
+            "the final gate-trip Err is returned as-is on give-up",
+        );
+    }
+
+    /// A gate trip that clears on a later attempt stops retrying and
+    /// returns the clean result.
+    #[test]
+    fn stops_retrying_once_gate_clears() {
+        let calls = Cell::new(0u32);
+        let out = run_vm_with_ap_gap_retry(|| {
+            let n = calls.get() + 1;
+            calls.set(n);
+            if n == 1 {
+                Err(gate_timeout_err(None))
+            } else {
+                Ok(result_with_crash(None))
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            calls.get(),
+            2,
+            "second boot cleared the gate; no third attempt"
+        );
+        assert!(
+            out.crash_message.is_none(),
+            "the clean retry result is returned"
+        );
+    }
+
+    /// A context-wrapped gate trip still downcasts through the anyhow
+    /// chain, so the `.context(...)` both production call sites add does
+    /// not defeat the retry.
+    #[test]
+    fn retries_context_wrapped_gate_timeout() {
+        let calls = Cell::new(0u32);
+        let out = run_vm_with_ap_gap_retry(|| {
+            let n = calls.get() + 1;
+            calls.set(n);
+            if n == 1 {
+                Err(gate_timeout_err(Some("build and run cell VM")))
+            } else {
+                Ok(result_with_crash(None))
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            calls.get(),
+            2,
+            "a context-wrapped gate trip is still recognized and retried"
+        );
+        assert!(out.crash_message.is_none());
     }
 }

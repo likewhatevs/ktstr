@@ -340,6 +340,43 @@ Size: 42342592
 ";
 
 #[test]
+fn newest_kver_with_debuginfo_falls_back_when_newest_ddeb_lags() {
+    // Two published kernels; the NEWER one's image exists but its dbgsym
+    // ddeb has not landed yet (the hours-long lag). The resolver must
+    // fall back to the older, fully-published kernel rather than fail.
+    let debs = parse_deb_packages(
+        "Package: linux-image-6.17.0-40-generic\nVersion: 6.17.0-40.44~24.04.1\n\n\
+         Package: linux-image-6.17.0-38-generic\nVersion: 6.17.0-38.42~24.04.1\n",
+    );
+    let ddebs = parse_deb_packages(
+        // Only the older kernel has a dbgsym ddeb published.
+        "Package: linux-image-unsigned-6.17.0-38-generic-dbgsym\n\
+         Version: 6.17.0-38.42~24.04.1\n",
+    );
+    assert_eq!(
+        newest_kver_with_debuginfo(&debs, &ddebs).as_deref(),
+        Some("6.17.0-38"),
+        "must fall back to the newest kernel whose ddeb has landed",
+    );
+
+    // Once the newer ddeb lands, the newest is selected.
+    let ddebs_caught_up = parse_deb_packages(
+        "Package: linux-image-6.17.0-40-generic-dbgsym\nVersion: 6.17.0-40.44~24.04.1\n\n\
+         Package: linux-image-unsigned-6.17.0-38-generic-dbgsym\n\
+         Version: 6.17.0-38.42~24.04.1\n",
+    );
+    assert_eq!(
+        newest_kver_with_debuginfo(&debs, &ddebs_caught_up).as_deref(),
+        Some("6.17.0-40"),
+        "signed-dbgsym fallback counts; newest complete kernel wins",
+    );
+
+    // No kernel has debuginfo → None (a genuinely broken archive, which
+    // the caller turns into the mandatory-debuginfo hard error).
+    assert_eq!(newest_kver_with_debuginfo(&debs, &[]), None);
+}
+
+#[test]
 fn parse_deb_packages_and_hwe_chain() {
     let debs = parse_deb_packages(DEB_PACKAGES);
     assert_eq!(debs.len(), 4);

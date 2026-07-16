@@ -217,11 +217,29 @@ impl GuestKernel {
         cr3_pa: u64,
         phys_base_hint: u64,
     ) -> Result<Self> {
+        let kern_syms = super::symbols::KernelSymbols::from_elf(elf)?;
+        Self::from_precomputed(mem, symbols, &kern_syms, tcr_el1, cr3_pa, phys_base_hint)
+    }
+
+    /// Construct from the two symbol products already derived by `run_vm`:
+    /// the complete name→KVA table and the compact bootstrap subset.
+    ///
+    /// This is semantically identical to [`Self::from_elf_with_symbols`] but
+    /// performs no ELF traversal. It exists for live-VM helper threads whose
+    /// lifetime must contain only finite guest-memory reads, not host file
+    /// parsing/allocation that teardown would otherwise have to join.
+    pub(crate) fn from_precomputed(
+        mem: Arc<GuestMem>,
+        symbols: Arc<HashMap<String, u64>>,
+        kern_syms: &super::symbols::KernelSymbols,
+        tcr_el1: u64,
+        cr3_pa: u64,
+        phys_base_hint: u64,
+    ) -> Result<Self> {
         let start_kernel_map = start_kernel_map_for_tcr(tcr_el1).ok_or_else(|| {
             anyhow::anyhow!("could not derive kernel image base from tcr_el1=0x{tcr_el1:x}")
         })?;
-        let kern_syms = super::symbols::KernelSymbols::from_elf(elf)?;
-        let l5_bootstrap = resolve_pgtable_l5(&mem, &kern_syms, start_kernel_map, 0);
+        let l5_bootstrap = resolve_pgtable_l5(&mem, kern_syms, start_kernel_map, 0);
         let walk_cr3 = cr3_pa & !0xFFFu64;
         let phys_base = if phys_base_hint != 0 {
             phys_base_hint
@@ -235,7 +253,7 @@ impl GuestKernel {
             // runtime PA). Under KASLR-off / aarch64 (no
             // `phys_base` symbol), the walk legitimately returns
             // None and 0 IS the correct value — preserve that path.
-            match resolve_phys_base(&mem, &kern_syms, walk_cr3, l5_bootstrap, tcr_el1) {
+            match resolve_phys_base(&mem, kern_syms, walk_cr3, l5_bootstrap, tcr_el1) {
                 Some(v) => v,
                 None if kern_syms.phys_base_kva.is_some() => {
                     anyhow::bail!(
@@ -259,10 +277,10 @@ impl GuestKernel {
         let l5 = if phys_base == 0 {
             l5_bootstrap
         } else {
-            resolve_pgtable_l5(&mem, &kern_syms, start_kernel_map, phys_base)
+            resolve_pgtable_l5(&mem, kern_syms, start_kernel_map, phys_base)
         };
         let page_offset =
-            resolve_page_offset_with_tcr(&mem, &kern_syms, start_kernel_map, tcr_el1, phys_base);
+            resolve_page_offset_with_tcr(&mem, kern_syms, start_kernel_map, tcr_el1, phys_base);
         let aarch64_params = decode_aarch64_params(tcr_el1);
         Ok(Self {
             mem,

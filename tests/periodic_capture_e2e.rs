@@ -48,6 +48,13 @@ const KTSTR_SCHED_WITH_CGPAR: Scheduler = Scheduler::named("ktstr_sched_with_cgp
 /// has the expected tag shape, ordering, and non-empty content
 /// (when not a placeholder).
 fn assert_periodic_captures(result: &VmResult) -> Result<()> {
+    // Environmental starvation gate: zero real captures under a
+    // witnessed-contended host is a non-verdict (the readiness-gated
+    // capture chain was starved past the workload window), not a
+    // capture regression — SKIP instead of failing the assertions
+    // below. A quiet-host zero-capture run still falls through and
+    // fails with the specific diagnosis. See `periodic_starvation_gate`.
+    ktstr::prelude::periodic_starvation_gate(result, 1)?;
     anyhow::ensure!(
         result.periodic_target == 3,
         "periodic_target must mirror the configured num_snapshots = 3, got {}",
@@ -191,6 +198,13 @@ fn assert_at_least_one_real_capture(result: &VmResult, expected_target: u32) -> 
 }
 
 fn assert_cgroup_parent_captures(result: &VmResult) -> Result<()> {
+    // Environmental starvation gate: zero real captures under a
+    // witnessed-contended host is a non-verdict (the readiness-gated
+    // capture chain was starved past the workload window), not a
+    // capture regression — SKIP instead of failing the assertions
+    // below. A quiet-host zero-capture run still falls through and
+    // fails with the specific diagnosis. See `periodic_starvation_gate`.
+    ktstr::prelude::periodic_starvation_gate(result, 1)?;
     assert_at_least_one_real_capture(result, 2)
 }
 

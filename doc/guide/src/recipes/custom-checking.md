@@ -39,9 +39,9 @@ floor it was compared against:
     --- monitor ---
     samples=41 max_imbalance=2.00 max_dsq_depth=0 stuck=0
     avg: imbalance=1.32 nr_running/cpu=1.2 dsq/cpu=0.0
-    events: fallback=0 (0.0/s) keep_last=210 (52.5/s) offline=0
+    events: fallback=0 (0.0/vcpu-s) keep_last=210 (52.5/vcpu-s) offline=0
     events+: refill_slice_dfl=210
-    schedstat: csw=586 (146/s) run_delay=381246314ns/s ttwu=204 goidle=1
+    schedstat: csw=586 (146/vcpu-s) run_delay=381246314ns/vcpu-s ttwu=204 goidle=1
     bpf: ktstr_select_cp cnt=189 145ns/call
     bpf: ktstr_enqueue cnt=373 34ns/call
     bpf: ktstr_dispatch cnt=584 237ns/call

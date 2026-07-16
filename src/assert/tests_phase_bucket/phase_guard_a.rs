@@ -451,19 +451,17 @@ fn build_phase_buckets_avg_dsq_depth_from_snapshot_dsq_states() {
     );
 }
 
-/// iteration_rate per-phase population via
-/// build_phase_buckets_with_stimulus. Synthetic StimulusEvents
-/// with total_iterations deltas at known boundaries produce a
-/// known per-phase rate.
+/// Stimulus boundaries are insufficient to populate a CPU-denominated
+/// `iteration_rate`: iteration counts without a matching guest CPU-time
+/// carrier must not manufacture a wall-throughput metric.
 #[test]
-fn build_phase_buckets_with_stimulus_populates_iteration_rate() {
+fn build_phase_buckets_with_stimulus_does_not_create_wall_iteration_rate() {
     use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
     use crate::timeline::StimulusEvent;
     // Snapshot bridge entries fence two Step windows: Step[0]
-    // at [100, 1100], Step[1] at [1100, 2100]. Stimulus events
-    // carry total_iterations at each boundary. iteration_rate
-    // for Step[1] (curr.elapsed_ms=2100, prev.elapsed_ms=1100,
-    // iter delta 2000) → 2000 / (1000ms/1000) = 2000.0/s.
+    // at [100, 1100], Step[1] at [1100, 2100]. Stimulus events carry
+    // total_iterations at each boundary, but have no guest CPU-time
+    // carrier with which to derive the canonical rate.
     let mk_entry = |tag: &str, step: u16, ms: u64| DrainedSnapshotEntry {
         tag: tag.to_string(),
         report: fixture_report(),
@@ -516,14 +514,9 @@ fn build_phase_buckets_with_stimulus_populates_iteration_rate() {
         .iter()
         .find(|p| p.step_index == 2)
         .expect("Step[1] bucket present");
-    let rate = step1
-        .metrics
-        .get("iteration_rate")
-        .copied()
-        .expect("iteration_rate populated for Step[1]");
     assert!(
-        (rate - 2000.0).abs() < f64::EPSILON,
-        "expected iteration_rate=2000.0 iter/s, got {rate}",
+        !step1.metrics.contains_key("iteration_rate"),
+        "stimulus wall deltas must not produce the CPU-denominated iteration_rate",
     );
 }
 
@@ -637,14 +630,9 @@ fn build_phase_buckets_with_stimulus_synthesizes_zero_capture_step_bucket() {
         .find(|p| p.step_index == 2)
         .expect("zero-capture step 2 must still produce a synthesized bucket");
     assert_eq!(step2.sample_count, 0, "synthesized bucket is capture-free");
-    let rate = step2
-        .metrics
-        .get("iteration_rate")
-        .copied()
-        .expect("step 2's capture-independent iteration_rate must be recovered");
     assert!(
-        (rate - 1000.0).abs() < f64::EPSILON,
-        "step 2 rate = (2000-1000) iters / 1000 ms = 1000/s, got {rate}",
+        !step2.metrics.contains_key("iteration_rate"),
+        "a synthesized wall-only bucket must not fabricate a delivered-CPU rate",
     );
     // Dedup: each captured step keeps a single bucket (no duplicate
     // synthesized bucket for steps 1 and 3) and the vec is step-sorted.
@@ -717,10 +705,10 @@ fn build_phase_buckets_with_stimulus_synthesized_bucket_folds_monitor_imbalance(
         (avg - 3.0).abs() < f64::EPSILON,
         "step 2 in-window monitor imbalance = 6 / max(1, 2) = 3.0, got {avg}",
     );
-    // The stimulus carried total_iterations: None, so no rate is fabricated.
+    // No guest CPU-time carrier was joined, so no rate is fabricated.
     assert!(
         !step2.metrics.contains_key("iteration_rate"),
-        "None total_iterations must yield NO iteration_rate (no fabrication); got {:?}",
+        "missing CPU-time carrier must yield no iteration_rate; got {:?}",
         step2.metrics,
     );
 }
@@ -763,8 +751,8 @@ fn build_phase_buckets_with_stimulus_single_captured_step_no_spurious_synthesis(
 
 /// A sched-died last step (a StepStart with no StepEnd, no successor
 /// start, and no captures) still produces a present-but-empty bucket:
-/// open-ended window (u64::MAX), sample_count 0, and NO iteration_rate
-/// (rate_to has no right boundary) — no panic, no phantom rate.
+/// open-ended window (u64::MAX), sample_count 0, and no iteration rate
+/// because no guest CPU carrier exists.
 #[test]
 fn build_phase_buckets_with_stimulus_sched_died_last_step_yields_empty_present_bucket() {
     use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
@@ -809,7 +797,7 @@ fn build_phase_buckets_with_stimulus_sched_died_last_step_yields_empty_present_b
 }
 
 /// A synthesized (sample_count == 0) bucket between two captured phases:
-/// its STIMULUS-DERIVED throughput (iteration_rate) is a real measurement
+/// its guest-carrier-derived throughput (`iteration_rate`) is a real measurement
 /// that survives the capture gap, so a collapse INTO it and a recovery
 /// OUT of it ARE flagged. Its monitor-derived metrics
 /// (avg_imbalance) come from a different sampling basis on a zero-sample
@@ -833,7 +821,7 @@ fn synthesized_zero_sample_bucket_flags_throughput_not_phantom_monitor() {
     };
     // step 1 + step 3 steady & captured; step 2 synthesized with a WILD
     // imbalance (monitor — must stay gated) AND a real collapsed
-    // stimulus-derived throughput (must flag).
+    // carrier-derived throughput (must flag).
     let buckets = vec![
         captured(1, 1.0, 1000.0),
         crate::assert::PhaseBucket {
@@ -946,15 +934,9 @@ fn build_phase_buckets_with_stimulus_step_end_tie_attributes_step_local_rate() {
         .iter()
         .find(|p| p.step_index == 1)
         .expect("step 1 bucket present");
-    let rate = step1
-        .metrics
-        .get("iteration_rate")
-        .copied()
-        .expect("step 1 iteration_rate populated");
     assert!(
-        (rate - 500.0).abs() < f64::EPSILON,
-        "step 1 must get its LOCAL StepStart[1]->StepEnd[1] rate (500/s), \
-         not the cross-step StepStart[1]->StepStart[2] delta (9000/s); got {rate}",
+        !step1.metrics.contains_key("iteration_rate"),
+        "wall-only stimulus ordering must not fabricate iteration_rate",
     );
 }
 
@@ -1009,7 +991,7 @@ fn build_phase_buckets_with_stimulus_synthesized_bucket_folds_full_monitor_set()
     use crate::monitor::{CpuSnapshot, MonitorReport, MonitorSample, ScxEventCounters};
     use crate::scenario::snapshot::DrainedSnapshotEntry;
     use crate::timeline::StimulusEvent;
-    let cpu = |nr: u32, dsq: u32, rq: u64, ev: Option<ScxEventCounters>| CpuSnapshot {
+    let cpu = |nr: u32, dsq: u32, rq: u64, cpu_ns: u64, ev: Option<ScxEventCounters>| CpuSnapshot {
         nr_running: nr,
         local_dsq_depth: dsq,
         rq_clock: rq,
@@ -1017,7 +999,7 @@ fn build_phase_buckets_with_stimulus_synthesized_bucket_folds_full_monitor_set()
         scx_flags: 0,
         event_counters: ev,
         schedstat: None,
-        vcpu_cpu_time_ns: None,
+        vcpu_cpu_time_ns: Some(cpu_ns),
         vcpu_perf: None,
         avg_irq_util: None,
         sched_domains: None,
@@ -1040,14 +1022,20 @@ fn build_phase_buckets_with_stimulus_synthesized_bucket_folds_full_monitor_set()
                 prog_stats: None,
                 psi_irq: None,
                 elapsed_ms: 1000,
-                cpus: vec![cpu(4, 3, 100, evc(10, 5)), cpu(2, 1, 100, None)],
+                cpus: vec![
+                    cpu(4, 3, 100, 1_000_000_000, evc(10, 5)),
+                    cpu(2, 1, 100, 1_000_000_000, evc(0, 0)),
+                ],
             },
             MonitorSample {
                 bpf_map_fields: Vec::new(),
                 prog_stats: None,
                 psi_irq: None,
                 elapsed_ms: 1500,
-                cpus: vec![cpu(4, 3, 100, evc(110, 55)), cpu(2, 1, 200, None)],
+                cpus: vec![
+                    cpu(4, 3, 100, 1_000_000_000, evc(110, 55)),
+                    cpu(2, 1, 200, 1_100_000_000, evc(0, 0)),
+                ],
             },
         ],
         ..Default::default()
@@ -1077,16 +1065,11 @@ fn build_phase_buckets_with_stimulus_synthesized_bucket_folds_full_monitor_set()
     assert_eq!(g("max_imbalance_ratio"), Some(2.0), "max imbalance");
     assert_eq!(g("avg_dsq_depth"), Some(2.0), "avg dsq depth");
     assert_eq!(g("max_dsq_depth"), Some(3.0), "max dsq depth");
-    assert_eq!(
-        g("total_fallback"),
-        Some(100.0),
-        "fallback counter delta 110-10"
-    );
-    assert_eq!(
-        g("total_keep_last"),
-        Some(50.0),
-        "keep_last counter delta 55-5"
-    );
+    assert_eq!(g("total_fallback_pooled"), Some(100.0));
+    assert_eq!(g("total_keep_last_pooled"), Some(50.0));
+    assert_eq!(g("total_event_vcpu_sec"), Some(0.05));
+    assert_eq!(g("fallback_per_vcpu_sec"), Some(2_000.0));
+    assert_eq!(g("keep_last_per_vcpu_sec"), Some(1_000.0));
     // avg_imbalance_ratio was folded pre-fix too; still present.
     assert_eq!(g("avg_imbalance_ratio"), Some(2.0), "avg imbalance");
     // avg_nr_running is folded for every monitor-bearing bucket (the write side

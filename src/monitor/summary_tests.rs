@@ -375,7 +375,7 @@ fn from_samples_fields_sane_values() {
                         ..Default::default()
                     }),
                     schedstat: None,
-                    vcpu_cpu_time_ns: None,
+                    vcpu_cpu_time_ns: Some(1_000_000_000 + i * 100_000_000),
                     vcpu_perf: None,
                     avg_irq_util: None,
                     sched_domains: None,
@@ -392,7 +392,7 @@ fn from_samples_fields_sane_values() {
                         ..Default::default()
                     }),
                     schedstat: None,
-                    vcpu_cpu_time_ns: None,
+                    vcpu_cpu_time_ns: Some(2_000_000_000 + i * 100_000_000),
                     vcpu_perf: None,
                     avg_irq_util: None,
                     sched_domains: None,
@@ -434,7 +434,7 @@ fn from_samples_fields_sane_values() {
     // counters (sample 0 and sample 4), exactly computable here:
     //   select_cpu_fallback sum: s0 = 0*2 + 0*3 = 0; s4 = 4*2 + 4*3 = 20
     //   dispatch_keep_last sum:  s0 = 0   + 0   = 0; s4 = 4   + 4*2 = 12
-    //   window = last.elapsed_ms - first.elapsed_ms = 400 - 0 = 400ms = 0.4s
+    //   both vCPU CPU clocks advance 400ms, so mean vCPU currency = 0.4s
     let deltas = summary
         .event_deltas
         .as_ref()
@@ -448,13 +448,13 @@ fn from_samples_fields_sane_values() {
         "total_dispatch_keep_last = last_sum(12) - first_sum(0)"
     );
     assert!(
-        (deltas.fallback_rate - 50.0).abs() < f64::EPSILON,
-        "fallback_rate = 20 / 0.4s = 50.0: {}",
+        (deltas.fallback_rate.unwrap() - 50.0).abs() < f64::EPSILON,
+        "fallback_rate = 20 / 0.4 vcpu-s = 50.0: {:?}",
         deltas.fallback_rate
     );
     assert!(
-        (deltas.keep_last_rate - 30.0).abs() < f64::EPSILON,
-        "keep_last_rate = 12 / 0.4s = 30.0: {}",
+        (deltas.keep_last_rate.unwrap() - 30.0).abs() < f64::EPSILON,
+        "keep_last_rate = 12 / 0.4 vcpu-s = 30.0: {:?}",
         deltas.keep_last_rate
     );
     // The per-sample burst max equals the largest consecutive-sample

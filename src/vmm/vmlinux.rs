@@ -132,6 +132,40 @@ pub(crate) struct VmlinuxArtifacts {
     /// per-consumer parse did, while the inline path still gets
     /// `symbols`.
     pub monitor: Option<MonitorArtifacts>,
+    /// Guest `CONFIG_HZ` scanned from the embedded IKCONFIG blob, or
+    /// `None` when the vmlinux carries no IKCONFIG (CONFIG_IKCONFIG off
+    /// or a stripped image). Derived from the same bytes as `symbols`
+    /// so `guest_kernel_hz` reads it off the shared parse (and off the
+    /// `.artifacts` sidecar on a cross-process hit) instead of a second
+    /// full `std::fs::read` + IKCONFIG scan of the ELF.
+    pub guest_hz: Option<u64>,
+    /// This vmlinux's GNU build-id (`.note.gnu.build-id`), or `None` when
+    /// the note is absent. Compared host-side against the booted kernel's
+    /// build-id (published by the guest via `MSG_TYPE_KERN_BUILD_ID`) to
+    /// catch a stale/mismatched cache entry — a vmlinux whose layout or
+    /// symbol addresses differ from the running Image — before its
+    /// offsets silently mis-read guest memory. A pure function of the ELF
+    /// bytes, so it rides the same parse + sidecar as `symbols`.
+    pub build_id: Option<Vec<u8>>,
+}
+
+/// Extract the GNU build-id (`NT_GNU_BUILD_ID`, owner `"GNU"`) from a
+/// parsed vmlinux ELF's note headers. `None` when the note is absent
+/// (a build without `--build-id`) or unreadable.
+fn extract_vmlinux_build_id(elf: &goblin::elf::Elf, data: &[u8]) -> Option<Vec<u8>> {
+    const NT_GNU_BUILD_ID: u32 = 3;
+    let notes = elf.iter_note_headers(data)?;
+    for note in notes.flatten() {
+        if note.n_type == NT_GNU_BUILD_ID && note.name == "GNU" {
+            // Truncate to the same cap the guest applies to its published
+            // build-id ([`crate::vmm::wire::KERN_BUILD_ID_MAX`]) so a
+            // build-id longer than the cap compares equal on both sides
+            // instead of spuriously mismatching.
+            let end = note.desc.len().min(crate::vmm::wire::KERN_BUILD_ID_MAX);
+            return Some(note.desc[..end].to_vec());
+        }
+    }
+    None
 }
 
 /// The monitor-only subset of [`VmlinuxArtifacts`]: the BTF-backed
@@ -164,15 +198,209 @@ fn parse_vmlinux_artifacts(data: &[u8], path: &Path) -> Option<VmlinuxArtifacts>
             btf: Arc::new(btf),
         })
     })();
-    Some(VmlinuxArtifacts { symbols, monitor })
+    // Scan IKCONFIG for CONFIG_HZ off the same bytes. Independent of
+    // the symbol/BTF parse: a vmlinux can carry IKCONFIG without the
+    // scheduler symbols and vice versa, so a failed scan just yields
+    // `None` (guest_kernel_hz then falls back to its .config paths).
+    let guest_hz = crate::monitor::hz_from_vmlinux_bytes(data);
+    let build_id = extract_vmlinux_build_id(&elf, data);
+    Some(VmlinuxArtifacts {
+        symbols,
+        monitor,
+        guest_hz,
+        build_id,
+    })
 }
 
-/// Return the cached parsed products for `path`, parsing once on the
-/// first request for a given (canonical path, mtime) and cloning the
-/// `Arc` on every subsequent hit.
+/// Magic + layout-version tag stamped as the first field of every
+/// `<vmlinux>.artifacts` sidecar.
 ///
-/// Keying, mtime invalidation, and the not-cached error path mirror
-/// [`cached_vmlinux_bytes`] (whose byte cache backs the read here).
+/// The magic disambiguates the file from any other postcard blob; the
+/// embedded `CARGO_PKG_VERSION` gates the LAYOUT of the mirrored offset
+/// structs. postcard is not self-describing, so a ktstr build whose
+/// offset-struct fields changed shape would mis-decode an older
+/// sidecar's later fields. Pinning the tag to the crate version means
+/// any such build stamps a new tag, the version check on load rejects
+/// the stale sidecar, and the artifacts are re-derived + rewritten.
+/// (Sidecar content is a pure function of the vmlinux bytes, so the
+/// mtime freshness rule covers vmlinux changes; only ktstr-version
+/// layout drift needs this tag.)
+const ARTIFACTS_SIDECAR_VERSION: &str =
+    concat!("ktstr-vmlinux-artifacts-v3 ", env!("CARGO_PKG_VERSION"));
+
+/// Plain-old-data mirror of the derived half of [`VmlinuxArtifacts`],
+/// serialized to the `<vmlinux>.artifacts` sidecar via postcard.
+///
+/// Deliberately a parallel struct rather than serde on
+/// `VmlinuxArtifacts` itself: the live type carries an `Arc<Btf>`
+/// ([`MonitorArtifacts::btf`]) that is not serializable — it is
+/// reconstructed from the paired `.btf` sidecar on load. `offsets`
+/// being `Some` is the "monitor was present" marker, mirroring
+/// `VmlinuxArtifacts.monitor.is_some()`; `prog_offsets` / `psi_offsets`
+/// are the monitor's optional sub-tables.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ArtifactsSidecar {
+    /// Magic + ktstr-version tag ([`ARTIFACTS_SIDECAR_VERSION`]). First
+    /// field so a version mismatch is caught before any later field is
+    /// trusted.
+    version: String,
+    symbols: crate::monitor::symbols::KernelSymbols,
+    /// `Some` iff the original parse produced a [`MonitorArtifacts`]
+    /// (BTF loaded and `KernelOffsets` resolved).
+    offsets: Option<crate::monitor::btf_offsets::KernelOffsets>,
+    prog_offsets: Option<crate::monitor::btf_offsets::BpfProgOffsets>,
+    psi_offsets: Option<crate::monitor::btf_offsets::PsiGroupOffsets>,
+    guest_hz: Option<u64>,
+    /// Mirror of [`VmlinuxArtifacts::build_id`].
+    build_id: Option<Vec<u8>>,
+}
+
+/// Sidecar path for a vmlinux: append `.artifacts` to the filename so
+/// it sits next to vmlinux (and next to the `.btf` sidecar) in the same
+/// cache-entry directory. Append-suffix (not `with_extension`) mirrors
+/// the `.btf` sidecar and preserves any existing extension.
+fn artifacts_sidecar_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".artifacts");
+    PathBuf::from(name)
+}
+
+/// Atomically write `bytes` to `dest` via a tempfile in the same
+/// directory + rename, so a concurrent reader sees either the old file
+/// or the new one, never a partial write. Mirrors the `.btf` sidecar's
+/// write path.
+fn atomic_write_sidecar(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let parent = dest.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "artifacts sidecar path has no parent directory",
+        )
+    })?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(dest).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// Try to assemble [`VmlinuxArtifacts`] from the `<vmlinux>.artifacts`
+/// sidecar WITHOUT reading or parsing the multi-hundred-MB vmlinux ELF.
+///
+/// `canon` is the canonicalized vmlinux path (the shared cache key),
+/// used both for the sidecar path and — when the sidecar carries
+/// monitor offsets — to reconstruct the `Arc<Btf>` from the paired
+/// `.btf` sidecar.
+///
+/// Returns `None` (a miss the caller resolves with a full parse) on:
+/// cache-root membership or freshness failure, read/decode failure, a
+/// version-tag mismatch (silently re-derived per the version gate), OR
+/// a monitor-present sidecar whose paired `.btf` sidecar cannot rebuild
+/// the BTF (the offsets are unusable without it). A monitor-absent
+/// sidecar needs no BTF and assembles directly.
+fn load_artifacts_sidecar(canon: &Path) -> Option<VmlinuxArtifacts> {
+    // Same gate as the writer: source trees / distro debug paths are
+    // never trusted for a sidecar they would not have written.
+    if !crate::cache::path_inside_cache_root(canon) {
+        return None;
+    }
+    let sidecar = artifacts_sidecar_path(canon);
+    if !crate::monitor::btf_offsets::sidecar_fresh(&sidecar, canon) {
+        return None;
+    }
+    let bytes = std::fs::read(&sidecar).ok()?;
+    let decoded: ArtifactsSidecar = postcard::from_bytes(&bytes).ok()?;
+    // Version gate: a tag mismatch means the sidecar was written by a
+    // ktstr build with a different offset-struct layout (or is a
+    // foreign blob). Ignore and let the caller re-derive + rewrite.
+    if decoded.version != ARTIFACTS_SIDECAR_VERSION {
+        return None;
+    }
+    let ArtifactsSidecar {
+        version: _,
+        symbols,
+        offsets,
+        prog_offsets,
+        psi_offsets,
+        guest_hz,
+        build_id,
+    } = decoded;
+    let monitor = match offsets {
+        Some(offsets) => {
+            // Monitor was present at parse time — rebuild the shared
+            // `Arc<Btf>` from the paired `.btf` sidecar. Its absence
+            // makes the stored offsets unusable, so treat the whole
+            // load as a miss and fall back to a full parse (which
+            // rewrites both sidecars).
+            let btf = crate::monitor::btf_offsets::load_btf_from_sidecar(canon)?;
+            Some(MonitorArtifacts {
+                offsets,
+                prog_offsets,
+                psi_offsets,
+                btf: Arc::new(btf),
+            })
+        }
+        None => None,
+    };
+    Some(VmlinuxArtifacts {
+        symbols,
+        monitor,
+        guest_hz,
+        build_id,
+    })
+}
+
+/// Best-effort write of the `<vmlinux>.artifacts` sidecar from a
+/// freshly-parsed `artifacts`. Failures are swallowed (logged): the
+/// parse already succeeded; we just miss the cross-process cache on the
+/// next load.
+fn write_artifacts_sidecar(sidecar: &Path, artifacts: &VmlinuxArtifacts) {
+    let payload = ArtifactsSidecar {
+        version: ARTIFACTS_SIDECAR_VERSION.to_string(),
+        symbols: artifacts.symbols.clone(),
+        offsets: artifacts.monitor.as_ref().map(|m| m.offsets.clone()),
+        prog_offsets: artifacts
+            .monitor
+            .as_ref()
+            .and_then(|m| m.prog_offsets.clone()),
+        psi_offsets: artifacts.monitor.as_ref().and_then(|m| m.psi_offsets),
+        guest_hz: artifacts.guest_hz,
+        build_id: artifacts.build_id.clone(),
+    };
+    let bytes = match postcard::to_allocvec(&payload) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(err = %e, "vmlinux .artifacts sidecar encode failed");
+            return;
+        }
+    };
+    if let Err(e) = atomic_write_sidecar(sidecar, &bytes) {
+        tracing::warn!(
+            path = %sidecar.display(),
+            err = %e,
+            "vmlinux .artifacts sidecar write failed; artifacts re-derived on next load",
+        );
+    }
+}
+
+/// Return the cached parsed products for `path`, deriving them once on
+/// the first request for a given (canonical path, mtime) and cloning
+/// the `Arc` on every subsequent hit.
+///
+/// Two cache tiers back this:
+///
+/// - **L1** — the process-global [`VMLINUX_ARTIFACTS_CACHE`] map. Keying,
+///   mtime invalidation, and the not-cached error path mirror
+///   [`cached_vmlinux_bytes`].
+/// - **L2** — the cross-process `<vmlinux>.artifacts` sidecar. nextest
+///   runs each CI cell in its own process, so without L2 every cell
+///   pays a full `fs::read` + goblin ELF parse + BTF parse of a
+///   50-340 MB debug vmlinux. On an L1 miss we first try the sidecar,
+///   which assembles the artifacts from a small postcard blob (+ the
+///   `.btf` sidecar for the `Arc<Btf>`) WITHOUT touching the ELF. Only a
+///   sidecar miss falls through to the full parse, which then best-effort
+///   writes the sidecar for sibling processes.
+///
 /// `None` when the file is unreadable or the ELF/symbol parse fails.
 pub(crate) fn cached_vmlinux_artifacts(path: &Path) -> Option<Arc<VmlinuxArtifacts>> {
     let canon = std::fs::canonicalize(path)
@@ -189,13 +417,42 @@ pub(crate) fn cached_vmlinux_artifacts(path: &Path) -> Option<Arc<VmlinuxArtifac
             return Some(Arc::clone(&entry.artifacts));
         }
     }
-    // Parse outside the write lock so a slow parse doesn't block other
-    // canonical paths' lookups. The byte read is served by
+    // L2: cross-process sidecar. Assembles the artifacts without reading
+    // the ELF; on hit, promote into L1 and return.
+    if let Some(artifacts) = load_artifacts_sidecar(&canon) {
+        let arc = Arc::new(artifacts);
+        slot.write_unpoisoned().insert(
+            canon,
+            CachedArtifacts {
+                mtime,
+                artifacts: Arc::clone(&arc),
+            },
+        );
+        return Some(arc);
+    }
+    // Miss: full parse outside the write lock so a slow parse doesn't
+    // block other canonical paths' lookups. The byte read is served by
     // `cached_vmlinux_bytes` (its own cache + mtime gate).
     let data = cached_vmlinux_bytes(&canon)?;
     let artifacts = Arc::new(parse_vmlinux_artifacts(&data, &canon)?);
-    let mut write = slot.write_unpoisoned();
-    write.insert(
+    // Best-effort write the sidecar for sibling processes, gated on
+    // cache-root membership (never pollute source trees / distro paths).
+    if crate::cache::path_inside_cache_root(&canon) {
+        // Pair constraint: a monitor-present sidecar is only usable if a
+        // fresh `.btf` sidecar can reconstruct its `Arc<Btf>` on load.
+        // `parse_vmlinux_artifacts`' `load_btf_from_elf` already wrote
+        // that `.btf` sidecar (inside the cache) on a successful BTF
+        // load, so this normally holds; the check guards the case where
+        // that write failed — skip the `.artifacts` write rather than
+        // strand offsets that can never be rehydrated. A monitor-absent
+        // parse needs no BTF and always writes.
+        let btf_ok = artifacts.monitor.is_none()
+            || crate::monitor::btf_offsets::btf_sidecar_fresh_for(&canon);
+        if btf_ok {
+            write_artifacts_sidecar(&artifacts_sidecar_path(&canon), &artifacts);
+        }
+    }
+    slot.write_unpoisoned().insert(
         canon,
         CachedArtifacts {
             mtime,
@@ -463,6 +720,304 @@ mod tests {
             "post-rewrite second lookup must return a fresh Arc, \
              not the stale cached one — Arc::ptr_eq returning true \
              means the invalidation path didn't fire."
+        );
+    }
+
+    // -- `<vmlinux>.artifacts` sidecar --
+    //
+    // These exercise the cross-process sidecar (encode/decode, the
+    // version gate, and the mtime freshness rule) directly with
+    // synthetic offset structs — the repo ships no vmlinux fixture with
+    // BTF to drive the full parse path, and the monitor-present Arc<Btf>
+    // reconstruction needs a real `.btf` sidecar. The monitor-absent
+    // path (`monitor: None`) rehydrates without any BTF, so it round-
+    // trips through the real filesystem helpers here.
+
+    fn synthetic_symbols() -> crate::monitor::symbols::KernelSymbols {
+        crate::monitor::symbols::KernelSymbols {
+            runqueues: 0x1000,
+            per_cpu_offset: 0x2000,
+            page_offset_base_kva: Some(0x3000),
+            memstart_addr_kva: None,
+            phys_base_kva: None,
+            scx_root: Some(0x4000),
+            scx_tasks: None,
+            init_top_pgt: Some(0x5000),
+            pgtable_l5_enabled: None,
+            prog_idr: Some(0x6000),
+            scx_watchdog_timeout: None,
+            scx_watchdog_timestamp: Some(0x7000),
+            scx_watchdog_interval: None,
+            jiffies_64: Some(0x8000),
+            entry_syscall_64_kva: None,
+            kernel_text_kva: Some(0x9000),
+            kernel_cpustat: None,
+            kstat: Some(0xa000),
+            tick_cpu_sched: None,
+            node_data: Some(0xb000),
+            psi_system: Some(0xc000),
+            cgrp_dfl_root: None,
+        }
+    }
+
+    fn synthetic_kernel_offsets() -> crate::monitor::btf_offsets::KernelOffsets {
+        use crate::monitor::btf_offsets::{
+            KernelOffsets, SchedstatOffsets, ScxEventOffsets, ScxWatchdogOffsets,
+        };
+        use crate::monitor::btf_offsets::{SchedDomainOffsets, SchedDomainStatsOffsets};
+        KernelOffsets {
+            rq_cpu: 1,
+            rq_nr_running: 2,
+            rq_clock: 3,
+            rq_scx: 4,
+            scx_rq_nr_running: 5,
+            scx_rq_local_dsq: 6,
+            scx_rq_flags: 7,
+            dsq_nr: 8,
+            rq_avg_irq_util_avg: Some(9),
+            event_offsets: Some(ScxEventOffsets {
+                percpu_ptr_off: 10,
+                event_stats_off: 11,
+                ev_select_cpu_fallback: 12,
+                ev_dispatch_local_dsq_offline: 13,
+                ev_dispatch_keep_last: 14,
+                ev_enq_skip_exiting: 15,
+                ev_enq_skip_migration_disabled: 16,
+                ev_reenq_immed: Some(17),
+                ev_reenq_local_repeat: None,
+                ev_refill_slice_dfl: Some(18),
+                ev_bypass_duration: None,
+                ev_bypass_dispatch: Some(19),
+                ev_bypass_activate: None,
+                ev_insert_not_owned: Some(20),
+                ev_sub_bypass_dispatch: None,
+            }),
+            schedstat_offsets: Some(SchedstatOffsets {
+                rq_sched_info: 21,
+                sched_info_run_delay: 22,
+                sched_info_pcount: 23,
+                rq_yld_count: 24,
+                rq_sched_count: 25,
+                rq_sched_goidle: 26,
+                rq_ttwu_count: 27,
+                rq_ttwu_local: 28,
+            }),
+            sched_domain_offsets: Some(SchedDomainOffsets {
+                rq_sd: 29,
+                sd_parent: 30,
+                sd_level: 31,
+                sd_name: 32,
+                sd_flags: 33,
+                sd_span_weight: 34,
+                sd_balance_interval: 35,
+                sd_nr_balance_failed: 36,
+                sd_newidle_call: Some(37),
+                sd_newidle_success: Some(38),
+                sd_newidle_ratio: None,
+                sd_max_newidle_lb_cost: 39,
+                stats_offsets: Some(SchedDomainStatsOffsets {
+                    sd_lb_count: 40,
+                    sd_lb_failed: 41,
+                    sd_lb_balanced: 42,
+                    sd_lb_imbalance_load: 43,
+                    sd_lb_imbalance_util: 44,
+                    sd_lb_imbalance_task: 45,
+                    sd_lb_imbalance_misfit: 46,
+                    sd_lb_gained: 47,
+                    sd_lb_hot_gained: 48,
+                    sd_lb_nobusyg: 49,
+                    sd_lb_nobusyq: 50,
+                    sd_alb_count: 51,
+                    sd_alb_failed: 52,
+                    sd_alb_pushed: 53,
+                    sd_sbe_count: 54,
+                    sd_sbe_balanced: 55,
+                    sd_sbe_pushed: 56,
+                    sd_sbf_count: 57,
+                    sd_sbf_balanced: 58,
+                    sd_sbf_pushed: 59,
+                    sd_ttwu_wake_remote: 60,
+                    sd_ttwu_move_affine: 61,
+                    sd_ttwu_move_balance: 62,
+                }),
+            }),
+            watchdog_offsets: Some(ScxWatchdogOffsets {
+                scx_sched_watchdog_timeout_off: 63,
+            }),
+        }
+    }
+
+    fn synthetic_prog_offsets() -> crate::monitor::btf_offsets::BpfProgOffsets {
+        crate::monitor::btf_offsets::BpfProgOffsets {
+            prog_type: 1,
+            prog_aux: 2,
+            aux_verified_insns: 3,
+            aux_name: 4,
+            aux_used_maps: 5,
+            aux_used_map_cnt: 6,
+            xa_node_slots: 7,
+            xa_node_shift: 8,
+            idr_xa_head: 9,
+            idr_next: 10,
+            prog_stats: 11,
+            stats_cnt: 12,
+            stats_nsecs: 13,
+            stats_misses: 14,
+        }
+    }
+
+    fn synthetic_psi_offsets() -> crate::monitor::btf_offsets::PsiGroupOffsets {
+        crate::monitor::btf_offsets::PsiGroupOffsets {
+            psi_group_total: 100,
+            psi_group_avg: 200,
+            psi_irq_full_idx: Some(6),
+        }
+    }
+
+    /// Write the sidecar from a monitor-absent `VmlinuxArtifacts`, then
+    /// load it back through the real filesystem helpers and assert the
+    /// reconstruction is byte-identical — the derived products survive a
+    /// process boundary without re-touching the ELF.
+    #[test]
+    fn artifacts_sidecar_roundtrip_monitor_absent() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
+        let entry = tmp.path().join("kentry");
+        std::fs::create_dir_all(&entry).unwrap();
+        let vmlinux = entry.join("vmlinux");
+        std::fs::write(&vmlinux, b"fake-elf").unwrap();
+        let canon = std::fs::canonicalize(&vmlinux).unwrap();
+
+        let original = VmlinuxArtifacts {
+            symbols: synthetic_symbols(),
+            monitor: None,
+            guest_hz: Some(1000),
+            build_id: None,
+        };
+        let sidecar = artifacts_sidecar_path(&canon);
+        write_artifacts_sidecar(&sidecar, &original);
+        assert!(sidecar.exists(), "sidecar must be written next to vmlinux");
+
+        let loaded = load_artifacts_sidecar(&canon).expect("fresh in-cache sidecar must load");
+        assert!(loaded.monitor.is_none());
+        assert_eq!(loaded.guest_hz, Some(1000));
+        assert_eq!(
+            postcard::to_allocvec(&loaded.symbols).unwrap(),
+            postcard::to_allocvec(&original.symbols).unwrap(),
+            "reconstructed symbols must equal the written ones",
+        );
+    }
+
+    /// A sidecar whose version tag differs from this build's is silently
+    /// ignored (the caller re-derives + rewrites) — this is how a
+    /// ktstr-version offset-layout change invalidates stale sidecars.
+    #[test]
+    fn artifacts_sidecar_version_mismatch_ignored() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
+        let entry = tmp.path().join("kentry");
+        std::fs::create_dir_all(&entry).unwrap();
+        let vmlinux = entry.join("vmlinux");
+        std::fs::write(&vmlinux, b"fake-elf").unwrap();
+        let canon = std::fs::canonicalize(&vmlinux).unwrap();
+
+        let payload = ArtifactsSidecar {
+            version: "ktstr-vmlinux-artifacts-v1 0.0.0-stale".to_string(),
+            symbols: synthetic_symbols(),
+            offsets: None,
+            prog_offsets: None,
+            psi_offsets: None,
+            guest_hz: Some(250),
+            build_id: None,
+        };
+        let bytes = postcard::to_allocvec(&payload).unwrap();
+        atomic_write_sidecar(&artifacts_sidecar_path(&canon), &bytes).unwrap();
+
+        assert!(
+            load_artifacts_sidecar(&canon).is_none(),
+            "a version-tag mismatch must be treated as a miss",
+        );
+    }
+
+    /// A sidecar older than its vmlinux is stale and ignored, catching
+    /// the "vmlinux rebuilt, sidecar not" case. The freshness rule is
+    /// the same mtime comparison the `.btf` sidecar uses.
+    #[test]
+    #[cfg(unix)]
+    fn artifacts_sidecar_stale_mtime_ignored() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
+        let entry = tmp.path().join("kentry");
+        std::fs::create_dir_all(&entry).unwrap();
+        let vmlinux = entry.join("vmlinux");
+        std::fs::write(&vmlinux, b"fake-elf").unwrap();
+        let canon = std::fs::canonicalize(&vmlinux).unwrap();
+
+        let original = VmlinuxArtifacts {
+            symbols: synthetic_symbols(),
+            monitor: None,
+            guest_hz: Some(1000),
+            build_id: None,
+        };
+        let sidecar = artifacts_sidecar_path(&canon);
+        write_artifacts_sidecar(&sidecar, &original);
+        assert!(
+            load_artifacts_sidecar(&canon).is_some(),
+            "fresh sidecar must load before staling",
+        );
+
+        // Push the sidecar's mtime to 1970-01-02 so vmlinux (written
+        // now) is strictly newer -> stale. libc::utimes rather than a
+        // sleep so the test runs in microseconds regardless of FS mtime
+        // resolution.
+        let sidecar_c = std::ffi::CString::new(sidecar.as_os_str().as_encoded_bytes()).unwrap();
+        let past = libc::timeval {
+            tv_sec: 86_400,
+            tv_usec: 0,
+        };
+        let times = [past, past];
+        // SAFETY: sidecar_c is a valid NUL-terminated path; times is a
+        // 2-element (atime, mtime) array as utimes(2) requires.
+        let rc = unsafe { libc::utimes(sidecar_c.as_ptr(), times.as_ptr()) };
+        assert_eq!(rc, 0, "libc::utimes must succeed on the sidecar");
+
+        assert!(
+            load_artifacts_sidecar(&canon).is_none(),
+            "a sidecar older than its vmlinux must be treated as stale",
+        );
+    }
+
+    /// Every nested offset struct survives a postcard encode/decode
+    /// roundtrip losslessly — proves the serde derives on `KernelOffsets`
+    /// and all of `ScxEventOffsets` / `SchedstatOffsets` /
+    /// `SchedDomainOffsets` / `SchedDomainStatsOffsets` /
+    /// `ScxWatchdogOffsets` / `BpfProgOffsets` / `PsiGroupOffsets` are
+    /// wired up. No filesystem: this pins the wire mirror, not the cache.
+    #[test]
+    fn artifacts_sidecar_postcard_roundtrip_all_offsets() {
+        let payload = ArtifactsSidecar {
+            version: ARTIFACTS_SIDECAR_VERSION.to_string(),
+            symbols: synthetic_symbols(),
+            offsets: Some(synthetic_kernel_offsets()),
+            prog_offsets: Some(synthetic_prog_offsets()),
+            psi_offsets: Some(synthetic_psi_offsets()),
+            guest_hz: Some(1000),
+            build_id: None,
+        };
+        let encoded = postcard::to_allocvec(&payload).unwrap();
+        let decoded: ArtifactsSidecar = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded.version, ARTIFACTS_SIDECAR_VERSION);
+        assert!(decoded.offsets.is_some());
+        let re_encoded = postcard::to_allocvec(&decoded).unwrap();
+        assert_eq!(
+            encoded, re_encoded,
+            "lossless postcard roundtrip through every nested offset struct",
         );
     }
 }

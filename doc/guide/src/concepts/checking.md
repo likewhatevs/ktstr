@@ -43,7 +43,7 @@ runs the opted-in checks against them:
   `max_wake_latency_cv` bound wake-to-run latency for work types
   that block and measure it (see [Work Types](work-types.md) for
   which do); `min_iteration_rate` floors outer-loop iterations per
-  second per worker.
+  delivered CPU-second per worker.
 
 ## The loop, end to end
 
@@ -79,7 +79,7 @@ fn throughput_gate(ctx: &Ctx) -> Result<AssertResult> {
 --- monitor ---
 samples=41 max_imbalance=2.00 max_dsq_depth=0 stuck=0
 avg: imbalance=1.32 nr_running/cpu=1.2 dsq/cpu=0.0
-events: fallback=0 (0.0/s) keep_last=210 (52.5/s) offline=0
+events: fallback=0 (0.0/vcpu-s) keep_last=210 (52.5/vcpu-s) offline=0
 ...
 <span class="t-grn">verdict: monitor OK</span></pre></div>
 
@@ -118,8 +118,8 @@ The defaults `with_monitor_defaults()` applies:
 | `max_local_dsq_depth` | 50 | Per-CPU dispatch queue overflow. Sustained depth above this means the scheduler is not consuming dispatched tasks. |
 | `fail_on_rq_clock_stuck` | true | Fail when `rq_clock` does not advance on a CPU with runnable tasks. Idle CPUs (NOHZ) and preempted vCPUs are exempt. |
 | `sustained_samples` | 5 | At ~100ms sample interval, requires ~500ms of sustained violation. Filters transient spikes from cpuset reconfiguration. |
-| `max_fallback_rate` | 200.0/s | `select_cpu_fallback` events per second across all CPUs. Sustained rate indicates systematic `select_cpu` failure. |
-| `max_keep_last_rate` | 100.0/s | `dispatch_keep_last` events per second across all CPUs. Sustained rate indicates the scheduler keeps reusing the previous dispatch target instead of making progress through the normal path. |
+| `max_fallback_rate` | 200.0/vCPU-s | `select_cpu_fallback` events across all CPUs per delivered average-vCPU CPU-second. Sustained activity indicates systematic `select_cpu` failure. |
+| `max_keep_last_rate` | 100.0/vCPU-s | `dispatch_keep_last` events across all CPUs per delivered average-vCPU CPU-second. Sustained activity indicates the scheduler keeps reusing the previous dispatch target instead of making progress through the normal path. |
 
 Every monitor threshold uses the `sustained_samples` window — a
 violation must persist for N consecutive samples before it counts.
@@ -263,6 +263,80 @@ if r.is_skip() || r.is_inconclusive() { /* no verdict — triage */ }
 `is_pass()` is deliberately strict: inconclusive and all-skip both
 read `false`.
 
+## Wall-latency ceilings under host contention
+
+`max_p99_wake_latency_ns` measures a **guest-wall** interval — the time
+a request waited to run, as the guest saw it. There is no steal-adjusted
+guest clock that subtracts it out, so host-side scheduling delay during
+the measurement (a noisy neighbour starving the vCPU threads) inflates
+the reading directly. A plain `measured <= T` gate would blame the
+scheduler under test for the host's noise.
+
+So the wall-latency verdict is **tri-state**. Each run carries a
+contention *witness* over its Body (measurement) phase — host vCPU
+dilation `D` from lifecycle-boundary schedstat snapshots and a peak-window
+bound `W(L)` from ktstr's host-cgroup CPU-pressure clock. CPU PSI `some` is the
+wall time during which at least one runnable task in that cgroup was stalled
+for CPU. It therefore sees a delayed vCPU even when the competitor is outside
+the cgroup, without charging arbitrary pressure elsewhere on a wide host.
+Other tasks sharing the runner cgroup can only bias the bound upward, toward
+indeterminate. ktstr removes that cross-cell noise by capping the localized
+PSI result with the target VM's complete summed-vCPU run delay over the same
+conservative Body span. Both are upper bounds on one request's host scheduling
+contamination, so taking their minimum is safe; if PSI is unavailable, the
+task-specific cap becomes a coarser whole-span fallback. The gate fires in the
+guest; the host re-judges it with the witness in hand:
+
+| Verdict | Condition | Result |
+|---|---|---|
+| **Pass** | `measured <= T` | always sound — contention only ever *inflates* a wall interval |
+| **Fail (confirmed)** | excess over `T` exceeds `W(measured)` | no witnessed host contention explains it — a real failure at any load; the message gains a `contention-checked` note |
+| **Indeterminate** | excess within `W(measured)` | the failure *might* be host contention — non-blocking (**indeterminate is a pass**), surfaced as a `contention-indeterminate` note carrying measured / threshold / excess / `W` / `D` |
+
+An indeterminate demotion drops the failing outcome; if it was the only
+failure the whole result flips to `Pass`, and the annotation rides the
+[notes channel](#verdict-the-claim-accumulator) so it stays visible in
+the passing run's output and its sidecar. If the Body contention series
+*saturated* (it hit its interval cap and only a prefix survives), `W` is a
+lower bound, so the verdict never confirms on it — it is treated as
+indeterminate with a saturation note.
+
+For an `expect_err` negative test, a run whose only expected failures became
+contention-indeterminate is a `Skip`, not a clean `Pass`: the environment
+prevented the harness from proving whether the expected failure remains. A
+confirmed failure still satisfies `expect_err`, an unrelated failure remains
+blocking, and `--no-skip-mode` promotes the environmental skip to a failure.
+
+New witnesses sample the cumulative pressure clock at both lifecycle edges;
+even one coarse interval can therefore cover the whole Body. Each interval
+also carries its real wall width. The window calculation charges an interval's
+entire pressure delta whenever the latency window could touch it, so a late
+monitor wake only makes `W` larger. ScenarioEnd carries the guest's scenario
+duration: if host starvation queues the start and end frames and their accepted
+span is impossibly short, ktstr rejects the localized series and uses the
+complete whole-vCPU-thread lifetime as one conservative interval. If only
+pressure edge sampling fails, ktstr instead uses the tighter complete Body
+schedstat delta when available (or the lifetime when its opening snapshot is
+unavailable). If neither source can prove coverage, the failure is demoted
+rather than trusting an empty `W = 0`. Legacy sidecars without event-anchored
+widths retain the older ≥2-tick / ≥50%-span coverage gate.
+
+Only ns-denominated latency exemplars take part. `max_wake_latency_cv`
+(a dimensionless ratio) and `max_spread_pct` (an off-CPU percentage)
+have no ns interval for `W` to bound, so they stay **annotate-only**:
+under measured dilation their failure carries a `--- host dilation ---`
+note (D and which ceilings include host preemption), but the verdict is
+unchanged.
+
+**Performance mode is different.** A `performance_mode` cell pins each
+vCPU 1:1 to a host CPU, so it should read `D ≈ 1`. If its Body dilation
+exceeds the perf-mode isolation ceiling, the cell lost that isolation —
+every timing verdict this run produced is untrustworthy. That is a
+`perf-mode isolation violated` failure, recorded **regardless of gate
+outcomes**: it is an infra/isolation fault, not a scheduler-under-test
+fault. Default-mode cells get no such check — the tri-state already
+accounts for their host contention.
+
 ## Beyond attributes {#verdict-the-claim-accumulator}
 
 - **`Verdict` + `claim!`** — the claim accumulator for custom
@@ -286,7 +360,7 @@ read `false`.
   // wakeup latency is lower-better; 60 vs 50 fails, correctly
   v.claim_better(BuiltinMetric::WakeupP99LatencyUs, cand).than(base);
   // require a 10% margin, not just any improvement
-  v.claim_better(BuiltinMetric::TaobenchTotalQps, cand).than_by(base, 0.10);
+  v.claim_better(BuiltinMetric::TaobenchTotalOpsPerCpuSec, cand).than_by(base, 0.10);
   ```
 
   An unregistered metric yields Inconclusive, never a silent pass.

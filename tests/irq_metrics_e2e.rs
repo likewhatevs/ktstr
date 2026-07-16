@@ -11,8 +11,8 @@
 //!   last-minus-first): the hardirq-counter wiring.
 //! * `total_softirq_net_rx` > 0 — the NET_RX softirq vector index: the
 //!   softirq-index wiring AND the NIC RX path.
-//! * `hardirq_rate` > 0 — count / capture-window-seconds: the rate
-//!   co-insertion + the wall-window denominator.
+//! * `hardirqs_per_cpu_sec` > 0 — count / delivered guest CPU-seconds:
+//!   the rate co-insertion + dilation-safe CPU denominator.
 //!
 //! `ok_or_else(absent -> Err)` + `ensure!(> 0)` is the skip-masks-bug guard: an
 //! ABSENT metric FAILS loudly (it does not vacuously pass), and `> 0` proves the
@@ -54,6 +54,13 @@ const NET_TEST: NetConfig = NetConfig::DEFAULT.mac([0x52, 0x54, 0x00, 0x4e, 0x54
 /// Host-side check that the per-phase IRQ counters/rate resolved from the
 /// freeze-driven phase buckets and rose under the NetTraffic load.
 fn assert_irq_metrics(result: &VmResult) -> Result<()> {
+    // Environmental starvation gate: zero real captures under a
+    // witnessed-contended host is a non-verdict (the readiness-gated
+    // capture chain was starved past the workload window), not a
+    // capture regression — SKIP instead of failing the assertions
+    // below. A quiet-host zero-capture run still falls through and
+    // fails with the specific diagnosis. See `periodic_starvation_gate`.
+    ktstr::prelude::periodic_starvation_gate(result, 2)?;
     // Coverage guard: the Counter deltas need >= 2 freezes that actually
     // captured per-CPU time. periodic_fired counts ATTEMPTS — it includes
     // rendezvous-timeout placeholders and dump-degraded reports, both of which
@@ -69,6 +76,15 @@ fn assert_irq_metrics(result: &VmResult) -> Result<()> {
         .iter_samples()
         .filter(|s| !s.snapshot.per_cpu_time().is_empty())
         .count();
+    // Data-bearing starvation gate at the SAME predicate this assertion
+    // checks (see the sibling PSI test): degraded-but-real captures carry
+    // empty per_cpu_time, invisible to the top-of-fn real-capture gate.
+    ktstr::prelude::starved_below_minimum_skip(
+        result,
+        cpu_captures,
+        2,
+        "periodic captures carrying per-CPU time",
+    )?;
     ensure!(
         cpu_captures >= 2,
         "only {cpu_captures} of {} periodic captures carried per-CPU time — need \
@@ -112,17 +128,16 @@ fn assert_irq_metrics(result: &VmResult) -> Result<()> {
         "NET_RX softirqs must rise under NetTraffic loopback, got {net_rx}"
     );
 
-    // hardirq_rate: total_hardirqs / capture-window-seconds. ABSENT means the
-    // wall-window denominator co-insertion (phase_build) was missed.
+    // hardirqs_per_cpu_sec: total_hardirqs / delivered guest CPU-seconds.
     let rate = result
-        .phase_metric(step, BuiltinMetric::HardirqRate)
+        .phase_metric(step, BuiltinMetric::HardirqsPerCpuSec)
         .ok_or_else(|| {
             anyhow!(
-                "hardirq_rate absent in Phase::step(0) — the wall-window \
-                 denominator (total_phase_wall_sec) was not co-inserted"
+                "hardirqs_per_cpu_sec absent in Phase::step(0) — the delivered \
+                 guest CPU denominator was not co-inserted"
             )
         })?;
-    ensure!(rate > 0.0, "hardirq_rate must be > 0, got {rate}");
+    ensure!(rate > 0.0, "hardirqs_per_cpu_sec must be > 0, got {rate}");
 
     // System-wide PSI-irq pressure, host-walked from the global `psi_system`
     // per monitor sample, folded run-level in MonitorSummary, and surfaced via

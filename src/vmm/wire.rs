@@ -259,6 +259,16 @@ pub enum MsgType {
     /// printk via `/dev/hvc0`), which depended on incidental
     /// console traffic rather than an explicit readiness signal.
     SysRdy,
+    /// Guest→host readiness edge for configured host BPF-map writes
+    /// (payload: empty).
+    ///
+    /// Emitted immediately before ScenarioStart, after the guest's probe
+    /// pipeline and optional wprof capture are armed. The host may discover
+    /// and resolve the target map earlier, but waits on this edge before
+    /// mutating it. This prevents a crash injection from killing the
+    /// scheduler before the instrumentation needed to observe that crash is
+    /// live. Coordinator-internal: carries no test verdict.
+    BpfMapWriteReady,
     /// Guest→host scheduler-swap notification (payload: empty).
     ///
     /// Emitted by the guest's `kill_current_scheduler`
@@ -302,6 +312,7 @@ impl MsgType {
             MsgType::KernelOpRequest => MSG_TYPE_KERNEL_OP_REQUEST,
             MsgType::KernelOpReply => MSG_TYPE_KERNEL_OP_REPLY,
             MsgType::SysRdy => MSG_TYPE_SYS_RDY,
+            MsgType::BpfMapWriteReady => MSG_TYPE_BPF_MAP_WRITE_READY,
             MsgType::SchedSwapNotify => MSG_TYPE_SCHED_SWAP_NOTIFY,
             MsgType::Stdout => MSG_TYPE_STDOUT,
             MsgType::Stderr => MSG_TYPE_STDERR,
@@ -339,6 +350,7 @@ impl MsgType {
             MSG_TYPE_KERNEL_OP_REQUEST => Some(MsgType::KernelOpRequest),
             MSG_TYPE_KERNEL_OP_REPLY => Some(MsgType::KernelOpReply),
             MSG_TYPE_SYS_RDY => Some(MsgType::SysRdy),
+            MSG_TYPE_BPF_MAP_WRITE_READY => Some(MsgType::BpfMapWriteReady),
             MSG_TYPE_SCHED_SWAP_NOTIFY => Some(MsgType::SchedSwapNotify),
             MSG_TYPE_STDOUT => Some(MsgType::Stdout),
             MSG_TYPE_STDERR => Some(MsgType::Stderr),
@@ -384,6 +396,8 @@ impl MsgType {
     ///     synchronous periodic-capture accessor teardown the freeze
     ///     coordinator performs on a CRC-valid frame; carries no test
     ///     verdict.
+    ///   - [`MsgType::BpfMapWriteReady`] — releases the configured
+    ///     host-side map writer after guest instrumentation is armed.
     pub const fn is_coordinator_internal(self) -> bool {
         matches!(
             self,
@@ -392,6 +406,7 @@ impl MsgType {
                 | MsgType::KernelOpRequest
                 | MsgType::KernelOpReply
                 | MsgType::SysRdy
+                | MsgType::BpfMapWriteReady
                 | MsgType::SchedSwapNotify
         )
     }
@@ -434,6 +449,24 @@ pub enum LifecyclePhase {
     /// workload — a distinct, worse failure than never attaching. Carries
     /// an empty suffix. Has no legacy COM2 sentinel equivalent.
     WorkloadDispatched,
+    /// A real sched_ext scheduler attached: the scheduler process is
+    /// alive AND `poll_scx_attached` observed `root/ops` registered with
+    /// `state == Enabled` (see `try_spawn_scheduler`). Emitted by the boot
+    /// wrapper `spawn_scheduler_from_paths` on its `Ok(Some(..))` success
+    /// arm — the single site where attach is definitively known with a
+    /// live child — so it is NOT emitted for a no-scheduler / EEVDF run
+    /// (binary absent → `Ok(None)`) nor when the scheduler died or never
+    /// bound (those emit `SchedulerDied` / `SchedulerNotAttached`
+    /// instead). Distinct from `PayloadStarting`: this frame lands at
+    /// Phase-3 end (before `PayloadStarting`, which the guest emits at
+    /// Phase 5 for EVERY run regardless of attach), so its presence is a
+    /// positive, live-scheduler attach proof the host uses to arm the
+    /// progress watchdog's workload deadline from the confirmed-attach
+    /// moment (see `freeze_coord::dispatch`'s Lifecycle arm). Carries an
+    /// empty suffix. Additive — the post-hoc `AttachOutcome` verdict scan
+    /// keys on `PayloadStarting` / `SchedulerDied` / `SchedulerNotAttached`
+    /// only, so this frame passes through it harmlessly.
+    SchedulerAttached,
 }
 
 impl LifecyclePhase {
@@ -447,6 +480,7 @@ impl LifecyclePhase {
             LifecyclePhase::SchedulerDied => 3,
             LifecyclePhase::SchedulerNotAttached => 4,
             LifecyclePhase::WorkloadDispatched => 5,
+            LifecyclePhase::SchedulerAttached => 6,
         }
     }
 
@@ -461,6 +495,7 @@ impl LifecyclePhase {
             3 => Some(LifecyclePhase::SchedulerDied),
             4 => Some(LifecyclePhase::SchedulerNotAttached),
             5 => Some(LifecyclePhase::WorkloadDispatched),
+            6 => Some(LifecyclePhase::SchedulerAttached),
             _ => None,
         }
     }
@@ -544,6 +579,12 @@ pub const MSG_TYPE_SNAPSHOT_REPLY: u32 = 0x534e_5250; // "SNRP"
 /// eventfd. See [`MsgType::SysRdy`] for the protocol contract.
 pub const MSG_TYPE_SYS_RDY: u32 = 0x5352_4459; // "SRDY"
 
+/// Guest→host readiness edge for configured host BPF-map writes.
+/// Empty payload; promoted to a dedicated host eventfd only after CRC and
+/// shape validation. The guest emits it after probes and optional wprof are
+/// ready, immediately before ScenarioStart.
+pub const MSG_TYPE_BPF_MAP_WRITE_READY: u32 = 0x424D_5259; // "BMRY"
+
 /// Guest→host scheduler-swap notification (payload: empty).
 ///
 /// Tag spelled `"SCSW"` (SCheduler SWap) in hex digits; on-wire bytes
@@ -618,6 +659,36 @@ pub const MSG_TYPE_LIFECYCLE: u32 = 0x4c49_4645; // "LIFE"
 /// post-relocation kallsyms table population have all run, so the
 /// values are final regardless of KASLR configuration.
 pub const MSG_TYPE_KERN_ADDRS: u32 = 0x4b41_4452; // "KADR"
+
+/// Guest→host: the running kernel's GNU build-id (from
+/// `/sys/kernel/notes`, `NT_GNU_BUILD_ID`), sent so the host can prove
+/// the vmlinux it is deriving symbols/offsets from is the SAME BUILD as
+/// the booted kernel. A stale/mismatched cache entry (a vmlinux whose
+/// struct layout or symbol addresses differ from the running Image)
+/// otherwise makes every host-side introspection read silent garbage
+/// with no error — see the host-side comparison in `freeze_coord`. The
+/// payload is the raw build-id bytes (typically a 20-byte SHA-1, capped
+/// at [`KERN_BUILD_ID_MAX`]); empty when the guest could not read it
+/// (the host then skips the check rather than false-failing).
+pub const MSG_TYPE_KERN_BUILD_ID: u32 = 0x4b42_4944; // "KBID"
+
+/// Upper bound on a GNU build-id payload. The `--build-id` styles the
+/// kernel uses are `sha1` (20 bytes) and `md5`/`uuid` (16); 64 leaves
+/// generous headroom for any future style without an unbounded read.
+pub const KERN_BUILD_ID_MAX: usize = 64;
+
+/// Guest→host workload-progress heartbeat: the guest's own scenario-elapsed
+/// time in milliseconds (8-byte LE u64), emitted on a fixed GUEST-time
+/// cadence from scenario start through the workload. The host uses it to
+/// place periodic captures on the GUEST clock rather than host wall-clock,
+/// so under host oversubscription the fixed `num_snapshots` samples still
+/// spread across the guest's real phases instead of clustering in whatever
+/// phase the dilated guest is stuck in. It is a HINT, never a trigger: the
+/// host always retains capture control and falls back to wall-clock when
+/// the heartbeats go stale (a wedged scheduler stops running the guest
+/// thread that emits them) so a degraded guest is still captured.
+/// Coordinator-internal — never bucketed into the verdict frame log.
+pub const MSG_TYPE_WORKLOAD_PROGRESS: u32 = 0x5750_5247; // "WPRG"
 
 /// Typed payload for [`MSG_TYPE_KERN_ADDRS`].
 ///
@@ -936,13 +1007,10 @@ pub const SCENARIO_END_PAYLOAD_SIZE: usize = 16;
 /// [`crate::vmm::guest_comms::send_scenario_end`]: `elapsed_ms`
 /// (LE `u64`, scenario-relative) followed by `total_iterations`
 /// (LE `u64`, the cumulative worker iteration count summed across
-/// every live handle at the LAST step's end). The iteration count is
-/// the right boundary the final step's `iteration_rate` delta needs —
-/// the host folds it into a synthetic terminal
-/// [`crate::timeline::StimulusEvent`] (see
-/// [`crate::timeline::StimulusEvent::terminal`]). Returns `None` for a
-/// short/torn payload so a CRC-bad or truncated frame is skipped
-/// rather than misread.
+/// every live handle at the LAST step's end). The host preserves the pair as a
+/// terminal [`crate::timeline::StimulusEvent`]; it is boundary telemetry, not
+/// the CPU-denominated iteration-rate source. Returns `None` for a short/torn
+/// payload so a CRC-bad or truncated frame is skipped rather than misread.
 pub fn parse_scenario_end(payload: &[u8]) -> Option<(u64, u64)> {
     if payload.len() < SCENARIO_END_PAYLOAD_SIZE {
         return None;
@@ -1523,8 +1591,7 @@ mod tests {
 
     /// `parse_scenario_end` round-trips the two LE u64s the guest
     /// writes, and rejects a short/torn payload (returns None rather
-    /// than misreading) — the host folds the parsed iteration count
-    /// into the terminal StimulusEvent for the last step's rate.
+    /// than misreading) before the host builds terminal boundary telemetry.
     #[test]
     fn parse_scenario_end_round_trip_and_short_payload() {
         let mut payload = [0u8; SCENARIO_END_PAYLOAD_SIZE];
@@ -1585,6 +1652,7 @@ mod tests {
             MSG_TYPE_KERNEL_OP_REQUEST,
             MSG_TYPE_KERNEL_OP_REPLY,
             MSG_TYPE_SYS_RDY,
+            MSG_TYPE_BPF_MAP_WRITE_READY,
             MSG_TYPE_SCHED_SWAP_NOTIFY,
             MSG_TYPE_STDOUT,
             MSG_TYPE_STDERR,
@@ -1727,6 +1795,10 @@ mod tests {
             MSG_TYPE_KERNEL_OP_REPLY
         );
         assert_eq!(MsgType::SysRdy.wire_value(), MSG_TYPE_SYS_RDY);
+        assert_eq!(
+            MsgType::BpfMapWriteReady.wire_value(),
+            MSG_TYPE_BPF_MAP_WRITE_READY
+        );
         assert_eq!(MsgType::Stdout.wire_value(), MSG_TYPE_STDOUT);
         assert_eq!(MsgType::Stderr.wire_value(), MSG_TYPE_STDERR);
         assert_eq!(MsgType::SchedLog.wire_value(), MSG_TYPE_SCHED_LOG);
@@ -1832,6 +1904,7 @@ mod tests {
             LifecyclePhase::SchedulerDied,
             LifecyclePhase::SchedulerNotAttached,
             LifecyclePhase::WorkloadDispatched,
+            LifecyclePhase::SchedulerAttached,
         ];
         for p in all {
             let v = p.wire_value();
@@ -1860,6 +1933,7 @@ mod tests {
         assert_eq!(LifecyclePhase::SchedulerDied.wire_value(), 3);
         assert_eq!(LifecyclePhase::SchedulerNotAttached.wire_value(), 4);
         assert_eq!(LifecyclePhase::WorkloadDispatched.wire_value(), 5);
+        assert_eq!(LifecyclePhase::SchedulerAttached.wire_value(), 6);
     }
 
     /// `SnapshotRequestPayload` round-trips through bytes — guards

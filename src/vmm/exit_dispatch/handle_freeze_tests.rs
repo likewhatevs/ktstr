@@ -32,6 +32,7 @@ fn handle_freeze_drain_swallows_eintr_and_resets_state() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let mut vm = KtstrKvm::new(topo, 64, false).unwrap();
     crate::vmm::x86_64::boot::setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();
@@ -89,6 +90,7 @@ fn handle_freeze_no_drain_when_immediate_exit_unsupported() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let mut vm = KtstrKvm::new(topo, 64, false).unwrap();
     crate::vmm::x86_64::boot::setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();
@@ -130,6 +132,7 @@ fn handle_freeze_writes_parked_evt_edge() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let mut vm = KtstrKvm::new(topo, 64, false).unwrap();
     crate::vmm::x86_64::boot::setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();

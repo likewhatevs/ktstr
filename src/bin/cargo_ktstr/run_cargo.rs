@@ -96,8 +96,12 @@ pub(crate) fn profraw_inject_for(
 /// non-empty, so an absent var (cargo-ktstr built without that blob)
 /// yields no pair and the child build falls back to its fetch path.
 /// Pure with respect to its args so a unit test can drive every
-/// present/absent combination.
-fn prebuilt_blob_bin_envs(
+/// present/absent combination. `pub(crate)` because the verifier
+/// dispatcher's reserved warm-up (`verifier.rs`) applies the same
+/// pairs so its pre-build and combined run share one build
+/// fingerprint (`build.rs` watches `KTSTR_BUSYBOX_BIN` /
+/// `KTSTR_WPROF_BIN` via `rerun-if-env-changed`).
+pub(crate) fn prebuilt_blob_bin_envs(
     busybox_path: Option<std::ffi::OsString>,
     wprof_path: Option<std::ffi::OsString>,
 ) -> Vec<(&'static str, std::ffi::OsString)> {
@@ -284,10 +288,16 @@ fn run_cargo_sub(
     // prebuilt_blob_bin_envs). KTSTR_WPROF_PATH uses the literal name —
     // ktstr::KTSTR_WPROF_PATH_ENV is `#[cfg(feature = "wprof")]`, and
     // this propagation is a harmless no-op when wprof was not embedded.
-    for (var, val) in prebuilt_blob_bin_envs(
+    //
+    // Kept in `blob_envs` (not applied-and-dropped) because the reserved
+    // warm-up pre-build below must carry the IDENTICAL build-affecting env:
+    // a differing build env would cache-miss those crates and rebuild them
+    // UNRESERVED in the combined run, defeating the reservation.
+    let blob_envs = prebuilt_blob_bin_envs(
         std::env::var_os(ktstr::KTSTR_BUSYBOX_PATH_ENV),
         std::env::var_os("KTSTR_WPROF_PATH"),
-    ) {
+    );
+    for (var, val) in &blob_envs {
         cmd.env(var, val);
     }
 
@@ -369,11 +379,64 @@ fn run_cargo_sub(
     // anchor is cached in target/ktstr_btf_anchor.h. First build
     // has no anchor (no prior .bpf.o files); second build onward
     // always uses it. Delete the header to regenerate.
-    if let Some(anchor_path) = generate_btf_anchor(&target_dir_path, release) {
-        let existing = std::env::var("BPF_EXTRA_CFLAGS_PRE_INCL").unwrap_or_default();
-        let inject = format!("-include {} {existing}", anchor_path.display());
-        cmd.env("BPF_EXTRA_CFLAGS_PRE_INCL", inject.trim());
-        eprintln!("cargo ktstr: BTF type anchor at {}", anchor_path.display());
+    //
+    // Computed into `btf_anchor_inject` (not applied-and-dropped) so the
+    // reserved warm-up below carries the same `BPF_EXTRA_CFLAGS_PRE_INCL`
+    // — same build-cache-parity reason as `blob_envs` above.
+    let btf_anchor_inject: Option<String> =
+        generate_btf_anchor(&target_dir_path, release).map(|anchor_path| {
+            let existing = std::env::var("BPF_EXTRA_CFLAGS_PRE_INCL").unwrap_or_default();
+            eprintln!("cargo ktstr: BTF type anchor at {}", anchor_path.display());
+            format!("-include {} {existing}", anchor_path.display())
+                .trim()
+                .to_string()
+        });
+    if let Some(inject) = &btf_anchor_inject {
+        cmd.env("BPF_EXTRA_CFLAGS_PRE_INCL", inject);
+    }
+
+    // Reserve + cgroup-confine the harness COMPILE phase only — NOT the
+    // test-running phase (each VM cell takes its own LLC reservation; a
+    // reservation still held here would deadlock/starve them). `cargo
+    // nextest run` builds then runs in ONE process and the build is not
+    // separable, so we run an explicit `cargo nextest run --no-run` warm-up
+    // UNDER the reservation: it compiles every test binary while holding
+    // machine-global LLC LOCK_SH + a cpuset cgroup, releases both, and the
+    // combined run below then finds the build cached — never compiling
+    // UNRESERVED where a colocated runner's harness build could invade a
+    // perf-mode reservation. acquire_build_reservation uses Consolidate
+    // placement (packs onto already-held LLCs, leaving whole LLCs free for
+    // exclusive perf-mode reservations — right for a throughput-elastic
+    // compile). Only the bare-`nextest` `test` path warms up; see
+    // `wants_reserved_prebuild`.
+    if wants_reserved_prebuild(sub_argv) {
+        let mut warm = build_cargo_command(
+            sub_argv,
+            release,
+            profile.as_deref(),
+            nextest_profile.as_deref(),
+            no_perf_mode,
+            no_skip_mode,
+            &prebuild_no_run_args(&args),
+        );
+        for (var, val) in &blob_envs {
+            warm.env(var, val);
+        }
+        if let Some(inject) = &btf_anchor_inject {
+            warm.env("BPF_EXTRA_CFLAGS_PRE_INCL", inject);
+        }
+        // build.rs carries `rerun-if-env-changed=KTSTR_KERNEL` and bakes
+        // `vmlinux.h` from that kernel's BTF, so the warm-up MUST see the
+        // SAME KTSTR_KERNEL the combined run below sets — else build.rs
+        // regenerates vmlinux.h under the run, cache-missing the whole
+        // ktstr crate and recompiling it UNRESERVED (defeating the
+        // warm-up). Mirrors the `cmd.env(KTSTR_KERNEL_ENV, first_dir)`
+        // above; empty `resolved` (auto-discovery) sets neither, so both
+        // inherit the identical process env.
+        if let Some((_, first_dir)) = resolved.first() {
+            warm.env(ktstr::KTSTR_KERNEL_ENV, first_dir);
+        }
+        run_reserved_prebuild(warm, "cargo ktstr")?;
     }
 
     tracing::debug!("cargo ktstr: running {label}");
@@ -460,6 +523,110 @@ fn run_cargo_sub(
                 .map_or("signal".to_string(), |c| c.to_string()),
         ))
     }
+}
+
+/// Does `sub_argv` select a build-then-run-in-one-process path whose
+/// COMPILE phase we warm up under an LLC reservation + cgroup sandbox?
+///
+/// Only the bare `nextest run` (`test`) path. The `coverage`
+/// (`llvm-cov nextest`) and raw `llvm-cov` paths run an
+/// llvm-cov-INSTRUMENTED build that a plain `cargo nextest run --no-run`
+/// warm-up would not match (different RUSTFLAGS) — warming them up would
+/// cache-miss and double-build, so they are intentionally left
+/// unreserved rather than risk that regression.
+fn wants_reserved_prebuild(sub_argv: &[&str]) -> bool {
+    sub_argv == TEST_SUB_ARGV
+}
+
+/// Append `--no-run` to a `cargo nextest run` passthrough argv so the
+/// reserved warm-up COMPILES every test binary but RUNS nothing, and
+/// strip the run-phase flags nextest HARD-REJECTS beside `--no-run`
+/// (`--fail-fast` / `--no-fail-fast` / `--max-fail <N>` — probed on
+/// nextest 0.9: these three error out; the other run-phase flags,
+/// `--test-threads`/`-j`/`--retries`, only warn and are left alone to
+/// keep the argv-parity delta minimal). Run-phase flags never enter the
+/// build fingerprint, so stripping them cannot cache-miss the combined
+/// run.
+///
+/// User filtersets (`-E`) and positional filters are left intact:
+/// `--no-run` ignores the run-selection dimension and builds the whole
+/// set, so the subsequent (filtered) combined run finds every artifact
+/// cached regardless of which subset it selects. `pub(crate)`: the
+/// verifier dispatcher's warm-up (`verifier.rs`) builds its argv the
+/// same way.
+pub(crate) fn prebuild_no_run_args(args: &[String]) -> Vec<String> {
+    let mut v: Vec<String> = Vec::with_capacity(args.len() + 1);
+    let mut skip_value = false;
+    for a in args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        match a.as_str() {
+            "--fail-fast" | "--no-fail-fast" => continue,
+            "--max-fail" => {
+                // Value-taking form `--max-fail N`: drop the value too.
+                skip_value = true;
+                continue;
+            }
+            _ if a.starts_with("--max-fail=") => continue,
+            _ => v.push(a.clone()),
+        }
+    }
+    v.push("--no-run".to_string());
+    v
+}
+
+/// Run `warm_cmd` (a `cargo … --no-run` compile-only invocation) under a
+/// machine-global LLC flock reservation + cgroup-v2 cpuset sandbox, then
+/// release BOTH before returning so the caller's test-running phase
+/// starts unreserved.
+///
+/// Mirrors the kernel build's reservation via the shared
+/// [`ktstr::cli::acquire_build_reservation_waiting`]: same Consolidate
+/// placement, `KTSTR_BYPASS_LLC_LOCKS` / `KTSTR_CARGO_TEST_MODE` /
+/// degraded-sysfs short-circuits, and cgroup-degrade gating as kernel builds,
+/// plus progress-aware waiting when perf-mode tests temporarily own the
+/// required capacity
+/// (hard error iff an explicit cap was set — here only via
+/// `KTSTR_CPU_CAP`, since `cargo ktstr test` exposes no `--cpu-cap` flag;
+/// warn-and-proceed otherwise). Errors abort the run BEFORE any test
+/// starts, matching the kernel build's fail-hard-on-cap semantics.
+/// `pub(crate)`: shared with the verifier dispatcher's warm-up
+/// (`verifier.rs`), whose sweep is the primary colocated-CI workload.
+pub(crate) fn run_reserved_prebuild(mut warm_cmd: Command, cli_label: &str) -> Result<(), String> {
+    // `cargo ktstr test` has no `--cpu-cap` flag; resolve from
+    // `KTSTR_CPU_CAP` (env), else `None` → the same 30%-of-allowed default
+    // a cap-less kernel build uses. acquire_build_reservation_waiting enforces
+    // the `KTSTR_BYPASS_LLC_LOCKS` + cap conflict identically.
+    let cpu_cap = ktstr::cli::CpuCap::resolve(None)
+        .map_err(|e| format!("{cli_label}: resolve harness-build CPU cap: {e:#}"))?;
+    // RAII: `_reservation`'s cgroup sandbox drops before its LLC flocks per
+    // `BuildReservation` field order; both are released when this fn
+    // returns, ahead of the combined build+run the caller then spawns.
+    let reservation = ktstr::cli::acquire_build_reservation_waiting(cli_label, cpu_cap)
+        .map_err(|e| format!("{cli_label}: acquire harness-build reservation: {e:#}"))?;
+    // `CARGO_BUILD_JOBS` is the harness-compile analog of the kernel
+    // build's `make -jN`: cap parallel rustc to the reserved CPU count so
+    // `nproc`-many rustc don't oversubscribe the confined cpuset. `None`
+    // (bypass / degraded sysfs → no plan) leaves cargo on its own default.
+    if let Some(jobs) = reservation.make_jobs() {
+        warm_cmd.env("CARGO_BUILD_JOBS", jobs.to_string());
+    }
+    tracing::debug!("{cli_label}: reserved harness pre-build (cargo … --no-run)");
+    let status = warm_cmd
+        .status()
+        .map_err(|e| format!("{cli_label}: spawn reserved pre-build: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "{cli_label}: reserved pre-build failed ({}) — see cargo output above",
+            status
+                .code()
+                .map_or("signal".to_string(), |c| c.to_string()),
+        ));
+    }
+    Ok(())
+    // `reservation` drops here → cgroup rmdir, then LLC flocks release.
 }
 
 /// Precompute cast analysis for the built scheduler binaries so the
@@ -1801,5 +1968,185 @@ mod tests {
         std::fs::write(out.join("other.bpf.o"), b"x").expect("write other.bpf.o");
         std::fs::write(out.join("bpf.o"), b"x").expect("write bpf.o");
         assert_eq!(generate_btf_anchor(dir.path(), false), None);
+    }
+
+    // ---------------------------------------------------------------
+    // Reserved harness-compile warm-up wiring.
+    // ---------------------------------------------------------------
+
+    /// Only the bare `nextest run` (`test`) path warms up under a
+    /// reservation. The `coverage` / raw `llvm-cov` paths run an
+    /// instrumented build a plain `--no-run` would not match, so they
+    /// must NOT warm up (a mismatch would cache-miss and double-build).
+    #[test]
+    fn wants_reserved_prebuild_gates_test_path_only() {
+        assert!(
+            wants_reserved_prebuild(TEST_SUB_ARGV),
+            "the `test` path must warm up under the reservation",
+        );
+        assert!(
+            !wants_reserved_prebuild(COVERAGE_SUB_ARGV),
+            "coverage's llvm-cov-instrumented build must NOT plain-warm-up",
+        );
+        assert!(
+            !wants_reserved_prebuild(LLVM_COV_SUB_ARGV),
+            "raw llvm-cov passthrough must NOT warm up",
+        );
+    }
+
+    /// `prebuild_no_run_args` appends exactly `--no-run` and preserves
+    /// every user token (filtersets, features, positional filters) in
+    /// order — the warm-up builds the whole test set so the filtered
+    /// combined run finds all artifacts cached.
+    #[test]
+    fn prebuild_no_run_args_appends_no_run_preserving_rest() {
+        let args = strs(&["-E", "test(eevdf)", "--features", "x", "positional"]);
+        let out = prebuild_no_run_args(&args);
+        assert_eq!(
+            out,
+            strs(&[
+                "-E",
+                "test(eevdf)",
+                "--features",
+                "x",
+                "positional",
+                "--no-run"
+            ]),
+        );
+    }
+
+    /// The run-phase flags nextest hard-rejects beside `--no-run` are
+    /// stripped from the warm-up argv — `just test` passes
+    /// `--no-fail-fast`, which killed the reserved pre-build with
+    /// "the argument '--no-fail-fast' cannot be used with '--no-run'".
+    /// Both `--max-fail` forms drop their value; build-affecting args
+    /// around them survive in order.
+    #[test]
+    fn prebuild_no_run_args_strips_no_run_incompatible_flags() {
+        let args = strs(&[
+            "--features",
+            "integration",
+            "--no-fail-fast",
+            "-j",
+            "8",
+            "--fail-fast",
+            "--max-fail",
+            "3",
+            "--max-fail=2",
+            "-E",
+            "test(x)",
+        ]);
+        let out = prebuild_no_run_args(&args);
+        assert_eq!(
+            out,
+            strs(&[
+                "--features",
+                "integration",
+                "-j",
+                "8",
+                "-E",
+                "test(x)",
+                "--no-run"
+            ]),
+            "fail-fast family stripped (values included); -j kept (warns only)",
+        );
+    }
+
+    /// The warm-up command built for the `test` path carries the SAME
+    /// build-affecting argv as the combined run (profile injection,
+    /// nextest profile) PLUS a trailing `--no-run`, so the combined run
+    /// finds the identical build cached. Inspects the pure
+    /// `build_cargo_command` factory the warm-up shares with the run.
+    #[test]
+    fn warmup_command_mirrors_run_argv_plus_no_run() {
+        let user = strs(&["--features", "ktstr-tests"]);
+        let warm = build_cargo_command(
+            TEST_SUB_ARGV,
+            true, // release → `--cargo-profile release`
+            None,
+            Some("ci"),
+            false,
+            false,
+            &prebuild_no_run_args(&user),
+        );
+        let argv: Vec<String> = warm
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            argv,
+            strs(&[
+                "nextest",
+                "run",
+                "--cargo-profile",
+                "release",
+                "--profile",
+                "ci",
+                "--features",
+                "ktstr-tests",
+                "--no-run",
+            ]),
+            "warm-up must equal the run argv (profiles/features) + trailing --no-run",
+        );
+    }
+
+    /// Integration: the harness-compile reservation the warm-up takes
+    /// grabs a machine-global LLC `LOCK_SH` under `KTSTR_LOCK_DIR`
+    /// isolation. Mirrors the host_topology planning tests' flock-presence
+    /// idiom, but drives the exact
+    /// `ktstr::cli::acquire_build_reservation_waiting`
+    /// call `run_reserved_prebuild` makes — proving the cross-binary
+    /// reservation wiring is live, not just the argv shape.
+    ///
+    /// Gated on a plan actually being acquired (sysfs-readable host with
+    /// a free LLC): a sysfs-less or fully-contended host returns no plan
+    /// / an Unavailable error, which the test tolerates (skips) rather
+    /// than fails — same defensive shape as the lib-side
+    /// `acquire_build_reservation_plan_and_make_jobs_consistent`.
+    #[test]
+    fn reserved_prebuild_takes_llc_lock_sh_under_lock_dir_isolation() {
+        let _lock = env_lock();
+        let lock_dir = tempfile::TempDir::new().expect("tempdir");
+        // Isolate the flock namespace into the tempdir and clear every
+        // short-circuit so the reservation actually attempts the flock.
+        let _g_lockdir = EnvVar::set(ktstr::KTSTR_LOCK_DIR_ENV, lock_dir.path());
+        let _g_bypass = EnvVar::remove(ktstr::KTSTR_BYPASS_LLC_LOCKS_ENV);
+        let _g_testmode = EnvVar::remove(ktstr::KTSTR_CARGO_TEST_MODE_ENV);
+        let _g_cap = EnvVar::remove(ktstr::KTSTR_CPU_CAP_ENV);
+
+        match ktstr::cli::acquire_build_reservation_waiting("test", None) {
+            Ok(reservation) => {
+                if reservation.make_jobs().is_none() {
+                    eprintln!(
+                        "no LLC plan on this host (sysfs unreadable / bypass); \
+                         reservation wiring reached but flock skipped — tolerated"
+                    );
+                    return;
+                }
+                // A plan was acquired: its LOCK_SH fds pin one lockfile per
+                // reserved LLC into the isolated dir. Assert at least one
+                // `ktstr-llc-*.lock` landed there while the reservation is
+                // still held.
+                let has_llc_lock = std::fs::read_dir(lock_dir.path())
+                    .expect("read isolated lock dir")
+                    .flatten()
+                    .any(|e| {
+                        e.file_name()
+                            .to_str()
+                            .is_some_and(|n| n.starts_with("ktstr-llc-") && n.ends_with(".lock"))
+                    });
+                assert!(
+                    has_llc_lock,
+                    "an acquired harness-build reservation must leave a \
+                     ktstr-llc-*.lock in KTSTR_LOCK_DIR while held",
+                );
+                // reservation drops here → flocks release, cgroup rmdir.
+            }
+            Err(e) => {
+                // Contended LLCs / sysfs error: the wiring was reached; the
+                // flock outcome is host-dependent, so tolerate.
+                eprintln!("acquire_build_reservation unavailable on this host: {e:#}");
+            }
+        }
     }
 }

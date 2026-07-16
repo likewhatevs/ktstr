@@ -45,7 +45,7 @@ kernel meaning; ktstr terms are defined by ktstr's own behavior.
 | Term | Meaning |
 |---|---|
 | **gauntlet** | One test declaration fanned out across topology presets (and kernels). Variants are named `gauntlet/{test}/{preset}` and skipped unless asked for. |
-| **preset** | A named topology in the gauntlet catalog — `tiny-1llc`, `odd-3llc`, `numa2-8llc`, 24 in all on x86_64. |
+| **preset** | A named topology in the gauntlet catalog — `tiny-1llc`, `odd-3llc`, `numa2-8llc`, 26 in all on x86_64. |
 | **cell** | One (scheduler × kernel × preset) unit of the verifier sweep: verify, attach, dispatch. |
 | **perf-delta** | The regression gate comparing performance metrics between HEAD and a baseline commit, with `--noise-adjust` running both sides fresh. See [Runs](../running-tests/runs.md#perf-delta). |
 | **auto-repro** | On a crash, the failing scenario reruns in a second VM with BPF probes on the crash call chain, capturing argument and struct state on the way to the error. See [Auto-Repro](../running-tests/auto-repro.md). |

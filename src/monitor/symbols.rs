@@ -151,7 +151,7 @@ pub(crate) const VMLINUX_ZERO_DATA_SECTIONS: &[&[u8]] = &[
 ];
 
 /// Kernel symbol addresses extracted from vmlinux ELF.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct KernelSymbols {
     /// Link-time kernel virtual address of the `runqueues` per-CPU
     /// template. Despite living in `.data..percpu`, x86_64 vmlinux
@@ -169,6 +169,15 @@ pub(crate) struct KernelSymbols {
     /// The runtime value must be read from guest memory via
     /// `resolve_page_offset`.
     pub page_offset_base_kva: Option<u64>,
+    /// Kernel virtual address of arm64's `memstart_addr` (`s64`).
+    ///
+    /// `PAGE_OFFSET` maps `memstart_addr`, not necessarily the VMM's first
+    /// RAM GPA. arm64 KASLR may move `memstart_addr` below `DRAM_START`, so
+    /// direct-map KVAs must be rebased before they can index
+    /// [`super::reader::GuestMem`],
+    /// whose offset zero is the VMM's [`crate::vmm::DRAM_BASE`]. Absent on
+    /// x86_64.
+    pub memstart_addr_kva: Option<u64>,
     /// Kernel virtual address of `phys_base`
     /// (`arch/x86/kernel/head_64.S`). Holds the runtime physical
     /// address offset between the kernel image's compile-time
@@ -416,6 +425,7 @@ impl KernelSymbols {
             .context("symbol '__per_cpu_offset' not found in vmlinux")?;
 
         let page_offset_base_kva = sym_addr("page_offset_base");
+        let memstart_addr_kva = sym_addr("memstart_addr");
         // x86_64-only KASLR randomization base; absent on aarch64
         // kernels (their kimage_voffset analogue is derived from
         // `start_kernel_map_for_tcr`, not a static symbol).
@@ -506,6 +516,7 @@ impl KernelSymbols {
             runqueues,
             per_cpu_offset,
             page_offset_base_kva,
+            memstart_addr_kva,
             phys_base_kva,
             scx_root,
             scx_tasks,
@@ -577,20 +588,52 @@ pub(crate) fn resolve_page_offset_with_tcr(
     tcr_el1: u64,
     phys_base: u64,
 ) -> u64 {
-    let Some(pob_kva) = symbols.page_offset_base_kva else {
-        return default_page_offset_for_tcr(tcr_el1);
-    };
-    let pob_pa = text_kva_to_pa_with_base(pob_kva, start_kernel_map, phys_base);
-    let val = mem.read_u64(pob_pa, 0);
-    // Valid PAGE_OFFSET has bit 63 set (upper-half virtual address).
-    // Kernels with CONFIG_RANDOMIZE_MEMORY use values like
-    // 0xff11000000000000 that are below the traditional canonical
-    // boundary (0xffff800000000000), so check bit 63 instead.
-    if val & (1u64 << 63) != 0 {
-        val
+    let architectural_page_offset = if let Some(pob_kva) = symbols.page_offset_base_kva {
+        let pob_pa = text_kva_to_pa_with_base(pob_kva, start_kernel_map, phys_base);
+        let val = mem.read_u64(pob_pa, 0);
+        // Valid PAGE_OFFSET has bit 63 set (upper-half virtual address).
+        // Kernels with CONFIG_RANDOMIZE_MEMORY use values like
+        // 0xff11000000000000 that are below the traditional canonical
+        // boundary (0xffff800000000000), so check bit 63 instead.
+        if val & (1u64 << 63) != 0 {
+            val
+        } else {
+            default_page_offset_for_tcr(tcr_el1)
+        }
     } else {
         default_page_offset_for_tcr(tcr_el1)
+    };
+
+    #[cfg(target_arch = "aarch64")]
+    if let Some(memstart_kva) = symbols.memstart_addr_kva {
+        let memstart_pa = text_kva_to_pa_with_base(memstart_kva, start_kernel_map, phys_base);
+        let memstart_addr = mem.read_u64(memstart_pa, 0);
+        return direct_map_base_for_guest_mem(
+            architectural_page_offset,
+            memstart_addr,
+            crate::vmm::DRAM_BASE,
+        );
     }
+
+    architectural_page_offset
+}
+
+/// Rebase the architectural direct-map base to
+/// [`super::reader::GuestMem`]'s offset zero.
+///
+/// arm64 defines `virt = PAGE_OFFSET | (phys - memstart_addr)`, while ktstr's
+/// `GuestMem` addresses RAM as `phys - guest_ram_base`. arm64's
+/// `__phys_to_virt` uses bitwise OR—not addition—because `memstart_addr` is an
+/// `s64` and a negative value leaves high bits set in the wrapped displacement.
+/// Therefore the base to subtract from a direct-map KVA is
+/// `PAGE_OFFSET | (guest_ram_base - memstart_addr)`.
+#[inline]
+pub(crate) fn direct_map_base_for_guest_mem(
+    page_offset: u64,
+    memstart_addr: u64,
+    guest_ram_base: u64,
+) -> u64 {
+    page_offset | guest_ram_base.wrapping_sub(memstart_addr)
 }
 
 /// Resolve the kernel's runtime `phys_base` value via a page-table
@@ -714,13 +757,12 @@ pub(crate) fn resolve_pgtable_l5(
 /// Translate a kernel virtual address in the direct mapping
 /// (PAGE_OFFSET region) to a DRAM-relative offset for GuestMem.
 ///
-/// On both x86_64 and aarch64, the direct mapping maps DRAM offset 0
-/// at PAGE_OFFSET: `kva = page_offset + dram_offset`. On aarch64 the
-/// kernel's `__phys_to_virt(gpa)` is `(gpa - PHYS_OFFSET) | PAGE_OFFSET`,
-/// and `PHYS_OFFSET = memstart_addr = DRAM_START`, so
-/// `kva = dram_offset | PAGE_OFFSET = PAGE_OFFSET + dram_offset`
-/// (the `|` is equivalent to `+` since the operands don't overlap).
-/// Subtracting PAGE_OFFSET recovers the DRAM offset directly.
+/// `page_offset` here means the direct-map base corresponding to
+/// `GuestMem` offset zero. On x86_64 that is the kernel's PAGE_OFFSET.
+/// On arm64 [`resolve_page_offset_with_tcr`] rebases the architectural
+/// PAGE_OFFSET by `DRAM_BASE - memstart_addr`, because arm64 KASLR may
+/// randomize `memstart_addr` below the VMM's first RAM GPA. Subtracting
+/// this effective base recovers the DRAM-relative offset on both arches.
 pub(crate) fn kva_to_pa(kva: u64, page_offset: u64) -> u64 {
     kva.wrapping_sub(page_offset)
 }
@@ -997,6 +1039,99 @@ pub(crate) fn slid_kernel_kva(link_kva: u64, kaslr_offset: u64) -> u64 {
     link_kva.wrapping_add(slide)
 }
 
+/// Arch-honest "populated" predicate for a freshly read
+/// `__per_cpu_offset[]` table — the gate input that decides the
+/// monitor's `data_valid` latch (see `reader.rs`).
+///
+/// Kernel ground truth (identical on both arches; v6.14
+/// `mm/percpu.c:3296` generic + `drivers/base/arch_numa.c:186` arm64
+/// NUMA): `__per_cpu_offset[cpu] = delta + pcpu_unit_offsets[cpu]`
+/// where `delta = pcpu_base_addr - __per_cpu_start` is a wrapping u64
+/// subtraction of two runtime VAs, filled once by the BSP's
+/// `setup_per_cpu_areas` and never rewritten.
+///
+/// Per-arch value shapes:
+/// - **x86_64**: bit 63 is a real invariant. Zero-based percpu
+///   (≤ v6.14): the entry IS the absolute direct-map KVA
+///   (`0xffff_888…`) of the per-CPU area. High-half percpu (v6.15+):
+///   `delta = direct_map_va − image_va(0xffff_ffff_8…)` has magnitude
+///   `< 2^63`, so the wrapped result stays in the upper half. The
+///   x86 arm therefore keeps the bit-63 check — it rejects
+///   small-magnitude pre-init residue (an observed `0x3`) outright.
+/// - **aarch64**: NO bit-63 invariant exists. `pcpu_base_addr` is a
+///   linear-map (or vmalloc-fallback) VA while `__per_cpu_start` is
+///   the KASLR-slid image VA — arm64 slides land tens of TiB up in
+///   the vmalloc space (`kaslr_early.c` picks from
+///   `[range/2, 3·range/2)`, range ≈ tens of TiB), so `delta`'s sign
+///   — hence bit 63 of every entry — depends on the per-boot draw of
+///   image-above-or-below-the-chunk. Field data: one arm64 6.14 boot
+///   latched with a bit-63 entry, another (slide `0x5221_1d00_0000`)
+///   produced a fully-populated table with bit 63 CLEAR — the old
+///   universal bit-63 gate could never latch there and the evidence
+///   channels stayed dead for the whole run (the Tier-3-instead-of-
+///   Tier-2 arm64/6.14 signature). The aarch64 arm accepts any
+///   non-zero value.
+///
+/// What replaces bit-63's garbage rejection on aarch64 (and
+/// belt-and-braces everywhere): **stability**. The caller passes the
+/// PREVIOUS iteration's table; the predicate requires the fresh read
+/// to match it exactly. The real table is written once at boot and
+/// immutable after, while the pre-init states this gate exists to
+/// reject are transient: BSS zeros fail the non-zero check, and
+/// mid-fill / image-copy residue (observed: `slot0=0` with scattered
+/// high bits at +10 s on a starved wide boot) changes between reads.
+/// The cost is one extra sample tick (~100 ms) of latch latency.
+///
+/// Guarantees:
+/// - never latches on genuinely-unpopulated BSS zeros (non-zero
+///   check — the catastrophic-phantom-walk guard);
+/// - never latches on values still in flux (stability);
+/// - latches on any real populated table on both arches and both
+///   supported kernel generations (nothing version-specific is
+///   assumed beyond the shared `delta + unit` formula).
+pub(crate) fn per_cpu_offsets_populated(prev: &[u64], fresh: &[u64]) -> bool {
+    !fresh.is_empty()
+        && fresh
+            .iter()
+            .all(|&v| v != 0 && per_cpu_offset_slot_plausible(v))
+        && prev == fresh
+}
+
+/// Per-arch slot plausibility for [`per_cpu_offsets_populated`] —
+/// dispatches to the arch-specific helper for the COMPILE arch (the
+/// monitor only ever walks same-arch guests). Both helpers stay
+/// unconditionally compiled so either arm is unit-testable from any
+/// host.
+#[inline]
+fn per_cpu_offset_slot_plausible(v: u64) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        per_cpu_offset_slot_plausible_x86_64(v)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        per_cpu_offset_slot_plausible_aarch64(v)
+    }
+}
+
+/// x86_64: every legitimate entry keeps bit 63 (see
+/// [`per_cpu_offsets_populated`]'s per-arch reasoning) — rejects
+/// small-magnitude pre-init residue like the observed `0x3`.
+#[inline]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) fn per_cpu_offset_slot_plausible_x86_64(v: u64) -> bool {
+    v & (1u64 << 63) != 0
+}
+
+/// aarch64: bit 63 carries no signal (slide-dependent — see
+/// [`per_cpu_offsets_populated`]); any non-zero value is plausible
+/// and the stability conjunct carries the garbage rejection.
+#[inline]
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+pub(crate) fn per_cpu_offset_slot_plausible_aarch64(_v: u64) -> bool {
+    true
+}
+
 /// Compute the physical address of each CPU's `struct rq`.
 ///
 /// Each CPU's rq is at the [`per_cpu_kva`] of `runqueues_kva` for
@@ -1049,6 +1184,36 @@ pub(crate) fn compute_rq_pas(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arm64_direct_map_base_rebases_randomized_memstart_to_guest_offsets() {
+        let page_offset = 0xffff_0000_0000_0000u64;
+        let guest_ram_base = 0x4000_0000u64;
+        // arm64 stores memstart_addr as s64; a KASLR draw below zero is
+        // observed here through its u64 two's-complement representation.
+        let memstart_addr = 0xffff_8a7c_4000_0000u64;
+        let guest_offset = 0x1234_5000u64;
+        let phys = guest_ram_base + guest_offset;
+        let direct_kva = page_offset | phys.wrapping_sub(memstart_addr);
+
+        let base = direct_map_base_for_guest_mem(page_offset, memstart_addr, guest_ram_base);
+        assert_eq!(direct_kva.wrapping_sub(base), guest_offset);
+        assert_eq!(
+            direct_map_base_for_guest_mem(page_offset, guest_ram_base, guest_ram_base),
+            page_offset,
+            "without a memstart displacement, the historical base is unchanged",
+        );
+
+        // Real armly/6.14 witness. Addition produced the low base
+        // 0x000e72e600000000 and a nonsensical 0xfff1... PA; mirroring the
+        // kernel's OR lands the first rq inside the 2 GiB guest.
+        let observed_memstart = 0xfff0_8d1a_4000_0000u64;
+        let observed_rq_kva = 0xffff_72e6_7beb_de40u64;
+        let observed_base =
+            direct_map_base_for_guest_mem(page_offset, observed_memstart, guest_ram_base);
+        assert_eq!(observed_base, 0xffff_72e6_0000_0000);
+        assert_eq!(observed_rq_kva.wrapping_sub(observed_base), 0x7beb_de40);
+    }
 
     #[test]
     fn plausible_cr3_phys_base_accepts_valid_rejects_garbage() {
@@ -1516,6 +1681,64 @@ mod tests {
     /// `template + kaslr + per_cpu_off` overshoots and produces
     /// a PA past `mem.size()`, which is exactly the
     /// `translate_any_kva returned None` failure.
+    /// The populated predicate's arch-independent conjuncts: reject
+    /// empty tables, any-zero-slot tables (BSS / mid-fill), and
+    /// unstable reads (pre-init residue in flux); accept a stable
+    /// all-nonzero table. Uses aarch64-shaped values WITHOUT bit 63 —
+    /// the exact arm64/6.14 field shape the old universal bit-63 gate
+    /// could never latch on — via the aarch64 helper directly so this
+    /// pins the arm even when compiled on x86.
+    #[test]
+    fn per_cpu_offsets_populated_stability_and_nonzero() {
+        // arm64 field shape: delta without bit 63 (image slid above the
+        // percpu chunk), small per-unit increments.
+        let t: Vec<u64> = (0..4)
+            .map(|i| 0x61b6_0000_0000_0000u64 + i * 0x8000)
+            .collect();
+        assert!(t.iter().all(|&v| per_cpu_offset_slot_plausible_aarch64(v)));
+        // Stable + all-nonzero: latches (when the compile-arch helper
+        // accepts the values — asserted for aarch64 above; the
+        // dispatching predicate itself is exercised with compile-arch
+        // values in the x86 test below).
+        // Empty: never.
+        assert!(!per_cpu_offsets_populated(&[], &[]));
+        // BSS zeros: never.
+        assert!(!per_cpu_offsets_populated(&[0, 0], &[0, 0]));
+        // One slot still zero (mid-fill): never, even when stable.
+        let mid = [0x61b6_0000_0000_0000u64, 0];
+        assert!(!per_cpu_offsets_populated(&mid, &mid));
+        // Unstable (residue in flux): never, even all-nonzero.
+        let a = [1u64 << 63, (1u64 << 63) + 1];
+        let b = [1u64 << 63, (1u64 << 63) + 2];
+        assert!(!per_cpu_offsets_populated(&a, &b));
+        // First tick (prev empty, fresh populated): not yet — the
+        // stability conjunct needs a second identical read.
+        assert!(!per_cpu_offsets_populated(&[], &a));
+        // Second identical read: latches.
+        assert!(per_cpu_offsets_populated(&a, &a));
+    }
+
+    /// x86_64 slot invariant: bit 63 required (both percpu storage
+    /// forms produce upper-half values — see the predicate doc), so
+    /// the observed pre-init residue `0x3` is rejected outright even
+    /// if it were stable.
+    #[test]
+    fn per_cpu_offset_slot_plausible_x86_64_requires_bit63() {
+        assert!(per_cpu_offset_slot_plausible_x86_64(0xffff_8880_0000_0000));
+        assert!(per_cpu_offset_slot_plausible_x86_64(1u64 << 63));
+        assert!(!per_cpu_offset_slot_plausible_x86_64(0x3));
+        assert!(!per_cpu_offset_slot_plausible_x86_64(0x7fff_ffff_ffff_ffff));
+        // The x86 compile-arch dispatch enforces it end-to-end: a
+        // stable, nonzero, bit-63-clear table must NOT latch on x86.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let no63 = [0x61b6_0000_0000_0000u64, 0x61b6_0000_0000_8000];
+            assert!(!per_cpu_offsets_populated(&no63, &no63));
+            let with63 = [0xffff_8880_0000_0000u64, 0xffff_8880_0000_8000];
+            assert!(per_cpu_offsets_populated(&with63, &with63));
+        }
+    }
+
     #[test]
     fn compute_rq_pas_zero_based_v614_repro() {
         // 5-level direct-map base, post-RANDOMIZE_MEMORY.
@@ -1558,6 +1781,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
+            memstart_addr_kva: None,
             phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
@@ -1596,6 +1820,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: None,
+            memstart_addr_kva: None,
             phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
@@ -1636,6 +1861,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
+            memstart_addr_kva: None,
             phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
@@ -1679,6 +1905,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
+            memstart_addr_kva: None,
             phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
@@ -1725,6 +1952,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
+            memstart_addr_kva: None,
             phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
@@ -1767,6 +1995,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: None,
+            memstart_addr_kva: None,
             phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
@@ -1806,6 +2035,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: None,
+            memstart_addr_kva: None,
             phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
@@ -1841,6 +2071,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: None,
+            memstart_addr_kva: None,
             phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,

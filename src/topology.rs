@@ -1794,6 +1794,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let _ = TestTopology::from_vm_topology(&bad);
     }

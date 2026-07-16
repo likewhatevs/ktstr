@@ -586,11 +586,10 @@ int main(void) {{
         // default-branch HEAD with no pin — that is how upstream's
         // wpb/wrust sub-crates silently appeared (HEAD moved). Bump
         // deliberately, re-verifying the wprof build at the new rev.
-        // The `--depth 1` bare-SHA fetch below works while the rev stays
-        // reachable from a ref: it does today (master's tip) and stays
-        // reachable as master advances (it becomes an ancestor); it
-        // would only break if upstream rewrote history to orphan it.
-        const WPROF_REV: &str = "53162afea658b0474c88212228a94c8c50891781";
+        // v0.4, the latest published upstream release. Pin the release commit
+        // rather than unreleased master so ktstr does not silently absorb
+        // upstream build/API churn.
+        const WPROF_REV: &str = "9afa9ee5493814c7791586f2179aa93528fde54a";
         let wprof_src = out_dir.join("wprof-src");
 
         // Prefer the wprof binary cargo-ktstr already embedded
@@ -665,13 +664,13 @@ int main(void) {{
         } else if !wprof_bin.exists() {
             println!("cargo:warning=cloning + compiling wprof (first build only)...");
 
-            for tool in ["git", "make", "gcc", "clang"] {
+            for tool in ["git", "make", "gcc", "clang", "mold"] {
                 if Command::new(tool).arg("--version").output().is_err() {
                     panic!(
                         "wprof build requires '{tool}' on PATH — install via your \
                      distro's package manager (build-essential / base-devel for \
-                     make+gcc; clang for BPF skeleton compile; git for \
-                     submodule clone)"
+                     make+gcc; clang+mold for BPF and LTO host compilation; \
+                     git for submodule clone)"
                     );
                 }
             }
@@ -870,9 +869,29 @@ int main(void) {{
             // ktstr's clippy under `-D warnings`, turning wprof's own
             // lints (missing_safety_doc, needless_update) into hard build
             // errors. ktstr does not lint vendored upstream crates.
+            //
+            // The Makefile copies those nested Cargo artifacts from each
+            // sub-crate's own target/ directory. An outer CARGO_TARGET_DIR
+            // redirects them elsewhere without updating the copy source,
+            // producing a false "cannot stat lib*.a" failure. Keep the
+            // outer target choice scoped to ktstr and let wprof use the
+            // layout its Makefile requires.
             let status = Command::new("make")
                 .arg("-j1")
+                // Upstream's host code uses Clang-supported C23 constructs
+                // (including empty initialization of a variable-length
+                // array) and already requires Clang for its BPF objects.
+                // Pin the host compiler too so older distro GCC versions do
+                // not reject unchanged upstream source. Select mold
+                // explicitly so Clang's enabled-by-default LTO never depends
+                // on a distro-provided LLVMgold plugin; this preserves the
+                // upstream optimized build instead of disabling LTO.
+                .env(
+                    "CC",
+                    "clang -fuse-ld=mold -Wno-unused-command-line-argument",
+                )
                 .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("CARGO_TARGET_DIR")
                 .current_dir(wprof_src.join("src"))
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())

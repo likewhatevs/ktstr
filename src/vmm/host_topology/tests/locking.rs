@@ -305,9 +305,12 @@ fn resource_lock_service_cpu_contention() {
 
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Shared).unwrap();
     let reason = expect_unavailable(outcome, Some("when service CPU is held"));
+    // The canonical-order acquire reports the busy LOCKFILE PATH
+    // (service CPU and assignment CPUs share the ktstr-cpu-* family);
+    // the service CPU's index in the path is what identifies it.
     assert!(
-        reason.contains("service CPU") && reason.contains("90901"),
-        "reason should mention service CPU 90901: {reason}",
+        reason.contains("90901") && reason.contains("busy"),
+        "reason should name the busy service-CPU lockfile 90901: {reason}",
     );
 
     // All prior locks should be released (all-or-nothing).
@@ -491,7 +494,7 @@ fn acquire_llc_plan_none_cap_reserves_thirty_percent_cpus() {
     // TestTopology only needs to be a valid synthetic().
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
 
-    let plan = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate)
+    let plan = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate, false)
         .expect("clean pool must allow SH on every selected LLC");
     // 30% of 10 CPUs = ceil(3.0) = 3 CPUs. 2-CPU LLCs: LLC 0
     // contributes 2, LLC 1 contributes 1 (partial-take), total
@@ -539,7 +542,7 @@ fn acquire_llc_plan_bails_on_exclusive_peer() {
         .expect("peer EX must acquire on clean pool");
 
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
-    let err = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate)
+    let err = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate, false)
         .expect_err("EX peer must block SH acquisition of the only LLC");
     let rendered = format!("{err:#}");
     assert!(
@@ -575,13 +578,127 @@ fn acquire_llc_plan_coexists_with_shared_peer() {
         .expect("peer SH must acquire on clean pool");
 
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
-    let plan = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate)
+    let plan = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate, false)
         .expect("second SH caller must coexist with the first");
     assert_eq!(
         plan.locks.len(),
         topo.llc_groups.len(),
         "second SH caller must acquire one fd per LLC group",
     );
+}
+
+/// The bounded-WAIT acquire completes once the holder releases: a peer
+/// holds `LOCK_EX` on the target LLC, a releaser thread drops it after
+/// ~300 ms, and `acquire_resource_locks_waiting` with a generous
+/// deadline returns `Acquired` — it must PARK and pick the lock up,
+/// not bail `Unavailable` on the first busy poll (the pre-wait
+/// behaviour that became a host-skip). The elapsed floor proves it
+/// actually waited through the hold window rather than racing the
+/// release.
+#[test]
+fn resource_lock_wait_acquires_after_peer_release() {
+    let _prefixes = LockPrefixesGuard::new();
+    let plan = PinningPlan {
+        assignments: vec![(0, 90700)],
+        service_cpu: None,
+        llc_indices: vec![90700],
+        locks: Vec::new(),
+    };
+    let lock_path = llc_lock_path(90700);
+    let holder = try_flock(&lock_path, FlockMode::Exclusive)
+        .unwrap()
+        .expect("peer EX must acquire on clean pool");
+    // Releaser: drop the peer's fd after the acquirer has begun
+    // polling. The fd moves into the thread; the thread-local lock
+    // prefix stays on the test thread where the acquire runs.
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(holder);
+    });
+    let start = std::time::Instant::now();
+    let outcome =
+        acquire_resource_locks_waiting(&plan, &[90700usize], LlcLockMode::Exclusive, true).unwrap();
+    let elapsed = start.elapsed();
+    let (_, locks) = unwrap_acquired(outcome, Some("after the peer's timed release"));
+    assert_eq!(locks.len(), 1);
+    assert!(
+        elapsed >= std::time::Duration::from_millis(250),
+        "acquire must have parked through the peer's ~300 ms hold; elapsed={elapsed:?}",
+    );
+    releaser.join().expect("releaser thread must not panic");
+}
+
+/// Progress-based patience is honoured: with the peer's `LOCK_EX`
+/// never released (a "wedged holder"), the head gains nothing, its
+/// no-progress patience (overridden short for the test) expires, and
+/// the acquire returns `Unavailable` (which the run path surfaces as
+/// retryable contention) — it neither bails early nor parks forever.
+/// Timing floor pins that it actually waited through the window.
+#[test]
+fn resource_lock_wait_patience_expiry_returns_unavailable() {
+    let _prefixes = LockPrefixesGuard::new();
+    super::super::protocol::PATIENCE_OVERRIDE.with(|p| {
+        *p.borrow_mut() = Some(std::time::Duration::from_millis(400));
+    });
+    let plan = PinningPlan {
+        assignments: vec![(0, 90800)],
+        service_cpu: None,
+        llc_indices: vec![90800],
+        locks: Vec::new(),
+    };
+    let lock_path = llc_lock_path(90800);
+    let _holder = try_flock(&lock_path, FlockMode::Exclusive)
+        .unwrap()
+        .expect("peer EX must acquire on clean pool");
+    let start = std::time::Instant::now();
+    let outcome =
+        acquire_resource_locks_waiting(&plan, &[90800usize], LlcLockMode::Exclusive, true).unwrap();
+    let elapsed = start.elapsed();
+    super::super::protocol::PATIENCE_OVERRIDE.with(|p| *p.borrow_mut() = None);
+    let reason = expect_unavailable(outcome, Some("with the peer never releasing"));
+    assert!(
+        reason.contains("90800"),
+        "reason should identify the stalled lock: {reason}",
+    );
+    assert!(
+        reason.contains("no acquisition progress"),
+        "reason must frame the bail as a no-progress verdict, not a \
+         wall deadline: {reason}",
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(350),
+        "acquire must wait out the patience window, not bail early; elapsed={elapsed:?}",
+    );
+}
+
+/// The full `acquire_llc_plan` pipeline waits out a REAL `LOCK_EX`
+/// holder when given a wait deadline: with the only LLC held EX (the
+/// exact shape of a colocated peer runner's perf-mode reservation) and
+/// a releaser dropping it after ~400 ms — past the entire ~260 ms
+/// TOCTOU backoff budget that used to be the hard cutoff — the plan
+/// acquisition COMPLETES instead of bailing `ResourceContention`.
+/// This is the end-to-end pin for the CI regression where 205 cells
+/// were host-skipped while peers' perf-mode fixtures held their LLCs.
+#[test]
+fn acquire_llc_plan_waits_out_real_exclusive_peer() {
+    let _llc_prefix = LlcLockPrefixGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![0]);
+    let topo = HostTopology::new_for_tests(&[(vec![0], 0)]);
+
+    let busy_path = llc_lock_path(0);
+    let peer_ex = try_flock(&busy_path, FlockMode::Exclusive)
+        .unwrap()
+        .expect("peer EX must acquire on clean pool");
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        drop(peer_ex);
+    });
+
+    let test_topo = crate::topology::TestTopology::synthetic(4, 1);
+    let plan = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate, true)
+        .expect("wait-enabled acquisition must complete after the peer releases");
+    assert_eq!(plan.locks.len(), 1, "one fd for the single released LLC");
+    releaser.join().expect("releaser thread must not panic");
 }
 
 /// `CpuCap::new(0)` must reject with the "≥ 1 (got 0)" message.
@@ -593,4 +710,66 @@ fn cpu_cap_new_rejects_zero() {
     let msg = format!("{err:#}");
     assert!(msg.contains("≥ 1"), "msg={msg}");
     assert!(msg.contains("got 0"), "msg={msg}");
+}
+
+/// DECISIVE per-CPU-grain proof: on a monolithic huge LLC (the AWS
+/// Graviton's single 96-CPU L3), two disjoint perf cells COEXIST after
+/// the grain switch, where whole-LLC `LOCK_EX` serialized them before.
+///
+/// Uses REAL flocks in a per-test tempdir (both the LLC and per-CPU
+/// prefixes are overridden), a synthetic 96-CPU monolith topology, and
+/// the actual `acquire_resource_locks` fast path — so it reproduces the
+/// Graviton's coordination on ANY host and stands as a permanent
+/// regression pin. Running it ON the Graviton against the sysfs topology
+/// exercises the identical code path (same `perf_llc_lock_mode`
+/// decision, same grain placement).
+#[test]
+fn perf_grain_two_disjoint_cells_coexist_on_huge_llc() {
+    let _prefixes = LockPrefixesGuard::new();
+    // One 96-CPU L3 on a single NUMA node — the Graviton shape.
+    let host = HostTopology::new_for_tests(&[((0..96).collect::<Vec<_>>(), 0)]);
+    // A real perf cell: llcs=1, cores=2, threads=1 → 2 vCPUs + 1 service.
+    let topo = crate::vmm::topology::Topology::new(1, 1, 2, 1);
+
+    // The switch fires: the cell is a tiny slice (3/96) of a huge LLC.
+    let block0 = host.compute_pinning_grain(&topo, 0).unwrap();
+    let block1 = host.compute_pinning_grain(&topo, 1).unwrap();
+    assert_eq!(perf_llc_lock_mode(&host, &block0), LlcLockMode::Shared);
+    assert_eq!(perf_llc_lock_mode(&host, &block1), LlcLockMode::Shared);
+
+    // AFTER: two disjoint grain cells both reserve simultaneously —
+    // shared LLC lock + disjoint per-CPU exclusive locks.
+    let a = acquire_resource_locks(&block0, &block0.llc_indices, LlcLockMode::Shared).unwrap();
+    let b = acquire_resource_locks(&block1, &block1.llc_indices, LlcLockMode::Shared).unwrap();
+    let (a_ok, b_ok) = (
+        matches!(a, LockOutcome::Acquired { .. }),
+        matches!(b, LockOutcome::Acquired { .. }),
+    );
+    assert!(
+        a_ok && b_ok,
+        "two disjoint per-CPU-grain perf cells must COEXIST on the shared \
+         96-CPU LLC (a={a_ok}, b={b_ok})",
+    );
+
+    // BEFORE (contrast): whole-LLC exclusive serializes — a second
+    // exclusive reservation of the same LLC bails while the first holds.
+    // (Fresh tempdir so the grain holders above don't confound; the
+    // point is the exclusive-vs-exclusive contention that the OLD perf
+    // path incurred for EVERY cell on this one-LLC host.)
+    drop((a, b));
+    let _fresh = LockPrefixesGuard::new();
+    let whole = host.compute_pinning(&topo, true, 0).unwrap();
+    let first = acquire_resource_locks(&whole, &whole.llc_indices, LlcLockMode::Exclusive).unwrap();
+    let second =
+        acquire_resource_locks(&whole, &whole.llc_indices, LlcLockMode::Exclusive).unwrap();
+    assert!(
+        matches!(first, LockOutcome::Acquired { .. }),
+        "first whole-LLC exclusive reservation acquires",
+    );
+    assert!(
+        matches!(second, LockOutcome::Unavailable(_)),
+        "a SECOND whole-LLC exclusive cell must bail on the same monolithic \
+         LLC — the serialization the grain switch removes",
+    );
+    drop(first);
 }

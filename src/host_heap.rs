@@ -23,26 +23,23 @@
 //! What differs is the *meaning* of the numbers:
 //!
 //! - When jemalloc IS `#[global_allocator]` (every shipped binary in
-//!   this workspace, via the central `#[global_allocator]` in
-//!   `src/lib.rs` gated on the `cli-bins` feature), every heap
+//!   this workspace declares it at its binary crate root), every heap
 //!   allocation flows through jemalloc and `stats.allocated` /
 //!   `stats.active` report
 //!   real application usage in the tens-to-hundreds of MiB range.
 //! - When jemalloc is linked but is NOT `#[global_allocator]`
 //!   (downstream consumers using ktstr as a library without opting
-//!   into jemallocator), jemalloc still initializes its arenas but
-//!   the application never allocates through it. `stats.allocated`
-//!   and `stats.active` return `Some(0)` in that case.
-//!   `arenas.narenas` is still populated (jemalloc computes it as
-//!   `4 * ncpus` at init time) and `stats.resident` / `stats.mapped`
-//!   reflect jemalloc's own metadata footprint — small but non-zero.
+//!   into jemallocator), the application never allocates through it.
+//!   Calling mallctl still initializes jemalloc and can give its own
+//!   small metadata allocations non-zero `stats.allocated` /
+//!   `stats.active` values, so counter magnitude is not a sound way
+//!   to identify the process allocator.
 //!
-//! [`collect`] collapses the "jemalloc linked but unused" shape
-//! (`allocated_bytes == Some(0) && active_bytes == Some(0)`) to
-//! `None` at the [`HostContext::heap_state`](crate::host_context::HostContext::heap_state)
-//! call site, so sidecars from non-jemallocator consumers do not
-//! carry misleading mostly-zero rows. The `jemalloc-used` signal
-//! (non-zero allocated AND active) is what warrants sidecar space.
+//! Shipped binaries declare jemalloc at their crate roots and mark that
+//! fact once at process entry. Host-context capture checks the marker
+//! before calling [`collect`], so allocator-agnostic integration-test
+//! binaries neither initialize jemalloc nor publish its irrelevant
+//! metadata as application heap usage.
 //!
 //! # `stats` feature is required for stats reads
 //!
@@ -71,6 +68,28 @@
 //! its own refreshed snapshot and the last writer wins in the
 //! caches).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Explicit process-level identity for the allocator selected by the binary
+/// crate root. Mallctl counters cannot infer this: merely reading them
+/// initializes the linked jemalloc instance and creates small allocations even
+/// when Rust uses the system allocator.
+static JEMALLOC_IS_GLOBAL: AtomicBool = AtomicBool::new(false);
+
+/// Mark that this binary crate installed `tikv_jemallocator::Jemalloc` as its
+/// global allocator. Shipped binary entry points call this before doing work;
+/// library and integration-test binaries deliberately do not.
+#[doc(hidden)]
+pub fn mark_jemalloc_global_allocator() {
+    JEMALLOC_IS_GLOBAL.store(true, Ordering::Release);
+}
+
+/// Whether the current binary explicitly selected jemalloc as its global
+/// allocator.
+pub(crate) fn jemalloc_is_global_allocator() -> bool {
+    JEMALLOC_IS_GLOBAL.load(Ordering::Acquire)
+}
+
 /// Heap-state snapshot for the running process's jemalloc allocator.
 ///
 /// Every field is `Option<u64>` (or `Option<usize>` for the arena
@@ -94,16 +113,14 @@ pub struct HostHeapState {
     /// application. A multiple of the page size and `>=`
     /// [`Self::allocated_bytes`]. Populated whenever libjemalloc
     /// was built with `--enable-stats` (the `stats` feature on
-    /// `tikv-jemalloc-ctl` forces this). `Some(0)` when jemalloc
-    /// is linked but is not `#[global_allocator]` — the whole
-    /// [`HostHeapState`] collapses to `None` at the HostContext
-    /// call site in that case (see module doc).
+    /// `tikv-jemalloc-ctl` forces this). Host-context capture only
+    /// publishes this structure when the binary explicitly selected
+    /// jemalloc as `#[global_allocator]` (see module doc).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_bytes: Option<u64>,
     /// `stats.allocated` — total bytes allocated by the
     /// application (sum of live allocations, excluding allocator
-    /// metadata and padding). `Some(0)` when jemalloc is linked
-    /// but not installed as `#[global_allocator]`.
+    /// metadata and padding).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allocated_bytes: Option<u64>,
     /// `stats.resident` — bytes in physically resident data pages
@@ -280,13 +297,12 @@ impl HostHeapState {
 /// jemalloc versions changing the error surface, not an expected
 /// fallback.
 ///
-/// When jemalloc is linked but is not `#[global_allocator]`, the
-/// reads succeed and return small-or-zero values —
-/// [`HostContext::heap_state`](crate::host_context::HostContext)
-/// detects that shape and stores `None` so the sidecar does not
-/// carry an empty row. When jemalloc IS `#[global_allocator]`
-/// (every binary target in this workspace), every field reflects
-/// real runner memory usage.
+/// Direct callers may use this even when jemalloc is not the global
+/// allocator; the reads then describe only jemalloc's own mallctl-triggered
+/// initialization. [`HostContext::heap_state`](crate::host_context::HostContext)
+/// checks the explicit process allocator marker before calling this function,
+/// so sidecars only publish these fields when they represent real application
+/// usage.
 ///
 /// # Cost
 ///
@@ -497,21 +513,18 @@ mod tests {
     /// Under the library-crate test harness, `tikv-jemallocator` is
     /// NOT installed as `#[global_allocator]` — the ktstr library
     /// itself declares no allocator so downstream consumers can
-    /// pick their own. So even though libjemalloc is linked (hard
-    /// dep of `tikv-jemalloc-ctl`) and `collect()` returns a
-    /// populated struct with real mallctl values, `stats.allocated`
-    /// and `stats.active` are both zero because the application
-    /// (the test binary running under libc's malloc) never
-    /// allocates through libjemalloc.
+    /// pick their own. Libjemalloc is still linked (hard dep of
+    /// `tikv-jemalloc-ctl`) and `collect()` initializes it, so its
+    /// own small metadata allocations may make `stats.allocated`
+    /// and `stats.active` non-zero even though Rust allocations use
+    /// libc.
     ///
-    /// Under this shape, the jemalloc invariants `active >=
-    /// allocated`, `resident >= active`, `mapped >= active` all
-    /// hold trivially (`0 >= 0`, small >= 0, small >= 0). They do
-    /// NOT validate jemalloc behavior — they are tautologies.
-    /// Real invariant coverage lives in the shipped ktstr binaries
-    /// that link the ktstr library and so inherit
-    /// `tikv_jemallocator::Jemalloc` as the `#[global_allocator]`
-    /// from `src/lib.rs`; a
+    /// Under this shape, the jemalloc invariants only describe its
+    /// own initialization. They do NOT validate the application's
+    /// allocator behavior.
+    /// Real invariant coverage lives in the shipped ktstr binaries,
+    /// whose crate roots declare `tikv_jemallocator::Jemalloc` as the
+    /// `#[global_allocator]`; a
     /// live production run of any of those binaries exercises the
     /// non-trivial invariants. Documenting rather than
     /// feature-gating because a lib-crate integration test with its
@@ -526,7 +539,7 @@ mod tests {
     /// - `collect()` infallibility on a libjemalloc build — the
     ///   epoch::advance defensive guard does not fire.
     #[test]
-    fn collect_returns_populated_snapshot_under_jemallocator() {
+    fn collect_populates_linked_jemalloc_without_selecting_it() {
         let h = collect();
         // libjemalloc is linked unconditionally, so every field
         // populates. `narenas` in particular is a jemalloc-init
@@ -548,5 +561,17 @@ mod tests {
         assert!(h.active_bytes.is_some());
         assert!(h.resident_bytes.is_some());
         assert!(h.mapped_bytes.is_some());
+        assert!(
+            !jemalloc_is_global_allocator(),
+            "the allocator-agnostic library test binary must not be marked as a jemalloc-global process",
+        );
+        let before = h.allocated_bytes.expect("allocated populated");
+        let held = vec![0u8; 8 * 1024 * 1024];
+        std::hint::black_box(&held);
+        let after = collect().allocated_bytes.expect("allocated populated");
+        assert!(
+            after.saturating_sub(before) < 1024 * 1024,
+            "an 8 MiB Rust allocation must not flow through the linked-but-unselected jemalloc: before={before}, after={after}",
+        );
     }
 }

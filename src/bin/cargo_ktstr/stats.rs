@@ -10,10 +10,34 @@
 use crate::cli::StatsCommand;
 use ktstr::cli;
 
+/// Print the `cargo ktstr stats` subcommand help (usage + subcommand
+/// list) for the bare, no-subcommand invocation. Navigates the
+/// clap-derived command tree to the `stats` node so the rendered help
+/// matches the real subcommand set (last-run / list / list-metrics /
+/// ...) without a hand-maintained copy.
+fn print_stats_help() {
+    use clap::CommandFactory;
+    let mut root = crate::cli::Cargo::command();
+    if let Some(stats) = root
+        .find_subcommand_mut("ktstr")
+        .and_then(|k| k.find_subcommand_mut("stats"))
+    {
+        let _ = stats.print_help();
+    }
+}
+
 pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
     match command {
         None => {
-            if let Some(output) = cli::print_stats_report() {
+            // Bare `cargo ktstr stats` no longer auto-dumps the gauntlet
+            // analysis (that moved to `stats last-run`). Print the family
+            // help so every subcommand — last-run included — is
+            // discoverable instead of silently doing nothing.
+            print_stats_help();
+            Ok(())
+        }
+        Some(StatsCommand::LastRun { dir, kernel }) => {
+            if let Some(output) = cli::last_run_report(dir.as_deref(), kernel.as_deref()) {
                 print!("{output}");
             }
             Ok(())

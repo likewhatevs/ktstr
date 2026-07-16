@@ -19,6 +19,17 @@ fn collect_host_context_returns_populated_struct_on_linux() {
     assert!(ctx.arch.is_some(), "uname machine present");
 }
 
+/// The library test binary uses the system allocator even though jemalloc is
+/// linked by the ctl dependency. Host-context capture must key on the explicit
+/// binary marker, not jemalloc's small mallctl-initialization counters, or
+/// integration-test sidecars would misreport allocator metadata as runner heap.
+#[cfg(target_os = "linux")]
+#[test]
+fn collect_host_context_omits_unselected_jemalloc() {
+    assert!(!crate::host_heap::jemalloc_is_global_allocator());
+    assert!(collect_host_context().heap_state.is_none());
+}
+
 /// `/proc/cmdline` is always readable on a running Linux system
 /// (the kernel exposes it unconditionally). The capture is
 /// verbatim — `read_trimmed_sysfs` trims leading/trailing

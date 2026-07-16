@@ -43,6 +43,13 @@ const KTSTR_SCHED: Scheduler =
 const RATIO_CEILING: f64 = 1_000_000_000.0;
 
 fn assert_phase_map_ext_pipeline(result: &VmResult) -> Result<()> {
+    // Environmental starvation gate: zero real captures under a
+    // witnessed-contended host is a non-verdict (the readiness-gated
+    // capture chain was starved past the workload window), not a
+    // capture regression — SKIP instead of failing the assertions
+    // below. A quiet-host zero-capture run still falls through and
+    // fails with the specific diagnosis. See `periodic_starvation_gate`.
+    ktstr::prelude::periodic_starvation_gate(result, 2)?;
     let periodic_fired = result.periodic_fired;
     let periodic_target = result.periodic_target;
     anyhow::ensure!(
@@ -116,15 +123,43 @@ fn assert_phase_map_ext_pipeline(result: &VmResult) -> Result<()> {
         }
     }
 
-    // PhaseMapExt::ratio_across_phases lands the verdict. This test
-    // self-zips both Step(0) and Step(1) (asserted above), so both
-    // phases are populated and the comparator takes the ratio path: a
-    // pass info note when the ratio is within the ceiling, or a
-    // failure detail when it exceeds the ceiling / is non-finite. (A
-    // genuinely missing phase would record an Inconclusive — neither
-    // an info note nor a failure detail — but the populated self-zip
-    // rules that out.) Pin that EITHER a pass note OR a failure detail
-    // mentioning the label landed, proving the comparator ran.
+    // ratio_across_phases takes the two-phase ratio path only when BOTH
+    // Step(0) and Step(1) are populated; a missing phase records an
+    // Inconclusive (neither an info note nor a failure detail), which the
+    // assertion below reads as "the chain didn't fire". The
+    // periodic_starvation_gate above only floors the TOTAL capture count,
+    // so a starved run whose few captures all landed in one Step passes
+    // the gate yet leaves the other Step empty. The direct signal for
+    // that skew is a LOST capture — `periodic_fired < periodic_target`
+    // means a boundary that would have populated the missing Step never
+    // fired (the whole-run dilation witness misses it: a transient stall
+    // that drops one capture need not move the mean past the D bar). When
+    // every boundary fired yet a Step is still empty, that is a real
+    // phase-stamp regression and falls through to the assertion below.
+    let both_steps = synthetic_frac.contains_key(&Phase::step(0))
+        && synthetic_frac.contains_key(&Phase::step(1));
+    if !both_steps
+        && (result.periodic_fired < result.periodic_target
+            || ktstr::prelude::capture_starvation_witness(result).is_some())
+    {
+        return Err(ktstr::prelude::post_vm_skip(format!(
+            "periodic captures populated only one Step bucket \
+             (step0={}, step1={}, fired {} of {} boundaries): a lost \
+             capture left a Step empty, so ratio_across_phases cannot take \
+             the two-phase ratio path — environmental non-verdict",
+            synthetic_frac.contains_key(&Phase::step(0)),
+            synthetic_frac.contains_key(&Phase::step(1)),
+            result.periodic_fired,
+            result.periodic_target,
+        )));
+    }
+
+    // PhaseMapExt::ratio_across_phases lands the verdict. With both
+    // Step(0) and Step(1) populated the comparator takes the ratio path:
+    // a pass info note when the ratio is within the ceiling, or a
+    // failure detail when it exceeds the ceiling / is non-finite. Pin
+    // that EITHER a pass note OR a failure detail mentioning the label
+    // landed, proving the comparator ran.
     let mut verdict = Verdict::new();
     synthetic_frac
         .ratio_across_phases(

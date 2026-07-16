@@ -104,6 +104,13 @@ pub(crate) struct CompareReport {
     pub excluded_pairs: u32,
     pub new_in_b: u32,
     pub removed_from_a: u32,
+    /// B-side rows whose pairing key misses on A ONLY because the two sides
+    /// carry different throughput denominations (wall-era vs cpu-era
+    /// sidecars — see `ThroughputDenomination`). The throughput rate keys
+    /// kept their names across the denomination change, so such rows are
+    /// refused rather than compared; this counter makes the refusal loud.
+    /// Also counted in `new_in_b` (the row did go unpaired).
+    pub denomination_mismatches: u32,
     pub findings: Vec<Finding>,
     /// Metrics present on exactly one side of a paired row (a metric
     /// appeared or disappeared between runs A and B). Never gated — not
@@ -511,8 +518,15 @@ pub(crate) fn compare_rows_by(
     // shared key is not normally reachable), the
     // earlier-iterated row wins.
     let mut a_by_key: HashMap<PairingKey, &GauntletRow> = HashMap::with_capacity(rows_a.len());
+    // Denomination-agnostic shadow of the A-side key set: a B row that
+    // misses `a_by_key` but hits here is the SAME logical run split only by
+    // the wall→cpu-sec throughput-denomination change — refused from pairing
+    // (the values are not comparable) but counted so the refusal is loud.
+    let mut a_denom_agnostic: std::collections::HashSet<PairingKey> =
+        std::collections::HashSet::with_capacity(rows_a.len());
     for row_a in rows_a {
         let key = PairingKey::from_row(row_a, pairing_dims);
+        a_denom_agnostic.insert(key.denomination_agnostic());
         a_by_key.entry(key).or_insert(row_a);
     }
 
@@ -551,6 +565,9 @@ pub(crate) fn compare_rows_by(
         }
         let Some(&row_a) = a_by_key.get(&key_b) else {
             report.new_in_b += 1;
+            if a_denom_agnostic.contains(&key_b.denomination_agnostic()) {
+                report.denomination_mismatches += 1;
+            }
             continue;
         };
 
@@ -865,23 +882,52 @@ pub(crate) fn render_overcommit_warning(
     let over_b = overcommitted(rows_b);
     let mixed_a = mixed_folded(rows_a);
     let mixed_b = mixed_folded(rows_b);
+    let dilation_range = |rows: &[GauntletRow]| -> Option<(f64, f64)> {
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        for dilation in rows
+            .iter()
+            .filter(|row| !row.is_skip())
+            .filter_map(|row| row.host_dilation)
+            .filter(|dilation| dilation.is_finite() && *dilation > 0.0)
+        {
+            min = min.min(dilation);
+            max = max.max(dilation);
+        }
+        (max > 1.05).then_some((min, max))
+    };
+    let dilation_a = dilation_range(rows_a);
+    let dilation_b = dilation_range(rows_b);
 
-    if over_a.is_empty() && over_b.is_empty() && mixed_a.is_empty() && mixed_b.is_empty() {
+    if over_a.is_empty()
+        && over_b.is_empty()
+        && mixed_a.is_empty()
+        && mixed_b.is_empty()
+        && dilation_a.is_none()
+        && dilation_b.is_none()
+    {
         return None;
     }
 
     let any_overcommit = !over_a.is_empty() || !over_b.is_empty();
+    let any_dilation = dilation_a.is_some() || dilation_b.is_some();
     let mut out = String::new();
-    if any_overcommit {
-        // Host time-slicing actually occurred -> raw timing is confounded.
+    if any_dilation {
+        let _ = writeln!(
+            out,
+            "ktstr: WARNING: measured host dilation exceeds 1.05 in this \
+             comparison. CPU-denominated iteration, event, schedstat, and IRQ \
+             rates exclude host-preempted time; genuinely wall-semantic latency, \
+             off-CPU, gap, PSI, and upstream wall-throughput values remain raw and \
+             must be interpreted with the dilation shown below."
+        );
+    } else if any_overcommit {
         let _ = writeln!(
             out,
             "ktstr: WARNING: CPU-budget hazard in this comparison — a run was \
-             host-overcommitted, so its guest-scheduler timing metrics \
-             (wake-latency / off-CPU / run-delay) are host-contention-confounded. \
-             Compare the overcommit-invariant worst_iterations_per_cpu_sec metric \
-             instead of raw \
-             timing."
+             structurally host-overcommitted. CPU-denominated rates are robust, \
+             while wall-semantic latency / run-delay / off-CPU / gap / PSI / upstream wall-throughput \
+             values may be host-contention-confounded."
         );
     } else {
         // Mixed budgets with NO overcommit: no host contention, the hazard is
@@ -922,6 +968,18 @@ pub(crate) fn render_overcommit_warning(
     };
     emit_side("A", &over_a, &mixed_a);
     emit_side("B", &over_b, &mixed_b);
+    for (label, range) in [("A", dilation_a), ("B", dilation_b)] {
+        if let Some((min, max)) = range {
+            if (max - min).abs() < f64::EPSILON {
+                let _ = writeln!(out, "  side {label}: measured dilation D={max:.3}");
+            } else {
+                let _ = writeln!(
+                    out,
+                    "  side {label}: measured dilation D={min:.3}..{max:.3}"
+                );
+            }
+        }
+    }
     Some(out)
 }
 
@@ -1978,7 +2036,7 @@ pub(crate) fn noise_findings(
         // topology/work_type), joined via pairing_key.0.join. noise_findings groups by the full pairing key,
         // so a scenario run on multiple topologies/work_types forms distinct
         // groups; labeling by scenario alone would render them indistinguishably.
-        let pairing_label = key.0.join("/");
+        let pairing_label = key.label();
         for m in METRICS {
             if is_render_suppressed_component(m.name) {
                 continue;
@@ -3237,7 +3295,7 @@ fn print_scalar_findings_table(report: &CompareReport, label_a: &str, label_b: &
         // renders a shorter identifier. The operator can always
         // cross-reference the "pairing on:" header line above to
         // see what each segment means.
-        let label = f.pairing_key.0.join("/");
+        let label = f.pairing_key.label();
         table.add_row(vec![
             Cell::new(label),
             Cell::new(f.metric.name),
@@ -3287,6 +3345,15 @@ fn print_summary_block(
             report.new_in_b, label_b, label_a,
         );
     }
+    if report.denomination_mismatches > 0 {
+        println!(
+            "  {} of those differ from '{}' ONLY by throughput denomination \
+             (wall-era vs cpu-era sidecars): the throughput rate keys kept their \
+             names across the wall→CPU-second change, so cross-era values are \
+             refused, never compared — re-run the older side to regenerate",
+            report.denomination_mismatches, label_a,
+        );
+    }
     if report.removed_from_a > 0 {
         println!(
             "  {} row(s) removed from '{}' (no matching key in '{}')",
@@ -3323,7 +3390,7 @@ pub(crate) fn format_coverage_diff_lines(
         };
         lines.push(format!(
             "    {} / {} = {:.2} in '{}', absent in '{}'",
-            cd.pairing_key.0.join("/"),
+            cd.pairing_key.label(),
             cd.metric.name,
             cd.value,
             present,

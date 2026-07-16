@@ -951,8 +951,8 @@ fn fold_unions_guest_per_cgroup_into_matching_host_bucket() {
         sample_count: 3,
         metrics: BTreeMap::from([
             ("iteration_rate".to_string(), 50.0),
-            ("total_phase_iterations".to_string(), 1000.0),
-            ("total_phase_duration_sec".to_string(), 20.0),
+            ("total_iterations_pooled".to_string(), 1000.0),
+            ("total_cpu_time_sec".to_string(), 20.0),
             ("worst_spread".to_string(), 0.42),
         ]),
         per_cgroup: BTreeMap::new(),
@@ -999,16 +999,10 @@ fn fold_unions_guest_per_cgroup_into_matching_host_bucket() {
     );
 }
 
-/// Negative direction of the Rate-survival contract: a host bucket carrying a
-/// Rate metric WITHOUT its Counter components LOSES the rate through the carrier
-/// merge — merge_matched_phase_buckets skips Rate keys and re-derives them, and
-/// derive_rate_metrics cannot re-derive from absent components. This drop is
-/// SAFE in production only because build_phase_buckets_with_stimulus co-inserts
-/// total_phase_iterations + total_phase_duration_sec alongside iteration_rate
-/// (and iterations_per_cpu_sec lands only in ext_metrics, never PhaseBucket
-/// metrics), so no production host bucket carries a component-less Rate. This
-/// test pins the failure mode so a future producer violating that contract
-/// surfaces here rather than as a silently-dropped metric.
+/// A host bucket carrying a Rate without its Counter components loses the rate
+/// through the carrier merge: ready ratios are skipped and rates are re-derived.
+/// Production inserts `total_iterations_pooled` and `total_cpu_time_sec`
+/// together, so this pins the failure mode for a future component-less producer.
 #[test]
 fn fold_drops_host_rate_lacking_its_components() {
     let host = PhaseBucket {
@@ -1017,9 +1011,7 @@ fn fold_drops_host_rate_lacking_its_components() {
         start_ms: 0,
         end_ms: 100,
         sample_count: 1,
-        // iteration_rate WITHOUT its total_phase_iterations /
-        // total_phase_duration_sec components — a contract violation no
-        // production path produces.
+        // iteration_rate without its canonical pooled components.
         metrics: BTreeMap::from([("iteration_rate".to_string(), 50.0)]),
         per_cgroup: BTreeMap::new(),
     };

@@ -27,9 +27,53 @@ switches: `performance_mode` on the test or builder, and
 
 | Mode | Selected by | LLC lockfiles | Per-CPU lockfiles | Enforcement |
 |---|---|---|---|---|
-| Performance mode | `performance_mode = true` | exclusive (`LOCK_EX`), one per virtual LLC | none — the exclusive LLC lock covers its CPUs | vCPU pinning, RT scheduling, hugepages, NUMA mbind |
+| Performance mode | `performance_mode = true` | exclusive (`LOCK_EX`), one per virtual LLC — **or** shared (`LOCK_SH`) on a huge LLC (see below) | none — **or** exclusive (`LOCK_EX`) per pinned CPU on a huge LLC | vCPU pinning, RT scheduling, hugepages, NUMA mbind |
 | Budgeted (no-perf-mode) | `--no-perf-mode` / `KTSTR_NO_PERF_MODE` | shared (`LOCK_SH`) on the planned LLC set | none — the cgroup cpuset is the enforcement layer | cgroup v2 cpuset sandbox + soft affinity mask |
 | Default | neither | shared (`LOCK_SH`) on the 1:1 plan's LLCs | exclusive (`LOCK_EX`), one per assigned host CPU | none — reservation only |
+
+### Performance mode on a huge LLC: per-CPU grain
+
+Performance mode's default is whole-LLC exclusion — the cell owns its
+entire cache domain, the strongest isolation. That is right when the
+cell is a large fraction of its LLC (the validated hosts: the dev box's
+16-CPU L3s, x86 CI's ~8-CPU L3s, native arm's 4-CPU L2s, all running
+2-4-vCPU cells). It is pathological when the host presents ONE
+monolithic L3 spanning scores of CPUs: the AWS Graviton exposes a single
+96-CPU L3, so a 2-vCPU perf cell taking `LOCK_EX` on it exclusively locks
+the *whole machine*, and every perf cell serializes globally (a 20-60×
+makespan blowup versus a many-small-LLC x86 host).
+
+So when a host LLC **dwarfs** the cell, performance mode reserves at
+**per-CPU grain** instead: a *shared* (`LOCK_SH`) lock on the giant LLC
+so cells coexist on it, plus *exclusive* (`LOCK_EX`) per-CPU locks over
+exactly the cell's pinned cores and service CPU. Each cell is placed on a
+disjoint, cache-coherent block of the L3 (`vcpus_per_llc + 1` contiguous
+CPUs, service CPU included, so distinct blocks never overlap), and the
+published claim names those actual CPUs — so peers see the freed capacity
+and disjoint perf cells run in parallel. On a 96-CPU L3 a few-CPU
+neighbour perturbs the cell's cache share negligibly, so the `D≈1`
+isolation contract still effectively holds; the dilation witness and the
+`D>1.5` perf-isolation gate catch any residual perturbation.
+
+The switch is gated by two conditions, evaluated per occupied host LLC:
+
+1. **Absolute floor** — the LLC has at least 32 CPUs. This is set
+   comfortably above every validated host's LLC (≤ 16) and well below
+   the Graviton's 96, so *below the floor the reservation is always
+   whole-LLC exclusive* and the measured perf campaign is unchanged on
+   every host it was validated on. The floor is what makes the ratio
+   below safe: the real perf cells are small (2-4 vCPUs), so on a 16-CPU
+   dev-box L3 a cell occupies as little as `2/16 = 0.125` — a pure
+   occupancy ratio alone would misclassify the validated hosts.
+2. **Occupancy ratio** — the cell occupies less than half of that LLC.
+   A cell wanting most of even a huge L3 genuinely needs the cache to
+   itself and keeps whole-LLC exclusion regardless of absolute size.
+
+Both must hold on *every* LLC the plan touches; one modest or
+cell-filling LLC keeps the whole plan exclusive. Per-CPU-grain perf cells
+flow through the same acquisition queue and claim protocol as every other
+reservation (see below) — a queued grain cell holds nothing, and its head
+partials are the plan's exact per-CPU locks.
 
 Lockfiles live at `{KTSTR_LOCK_DIR or /tmp}/ktstr-llc-{N}.lock` and
 `{KTSTR_LOCK_DIR or /tmp}/ktstr-cpu-{C}.lock`. The modes compose:
@@ -39,7 +83,12 @@ default runs share LLCs among themselves, a perf-mode run waits for
 all of them to release, and while a perf-mode run holds its LLCs
 nobody else touches those CPUs. Default runs additionally exclude
 each other per CPU, so two default VMs never time-slice the same
-host CPU. Kernel builds take the budgeted path.
+host CPU. Kernel builds take the budgeted path, and so do
+`cargo ktstr test` / `cargo ktstr verifier` harness compiles: each
+dispatcher runs a reserved `cargo … --no-run` warm-up under the same
+shared LLC locks and cpuset sandbox, releasing both before any cell
+starts — a harness build on one runner never invades a peer runner's
+exclusive reservation, and never contends with its own cells' locks.
 
 <div class="kt-figure"><svg width="700" height="272" viewBox="0 0 700 272" role="img" aria-label="Host LLC lock coordination: a performance-mode run holds whole LLCs under exclusive flock (LOCK_EX) while budgeted no-perf-mode runs share the remaining LLCs under shared flock (LOCK_SH). An exclusive holder blocks every shared acquirer and vice versa; shared holders coexist. Below, when the process cpuset is narrower than the guest vCPU count the CPU budget collapses to it and the host time-slices the vCPU threads.">
   <defs><marker id="kt-arr8" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg)"/></marker></defs>
@@ -85,12 +134,54 @@ host CPU. Kernel builds take the budgeted path.
   </g>
 </svg></div>
 
-When the default path cannot map its topology 1:1 onto the host it
-does not fail: if a plan exists but every slot is busy, the run skips
-with `ResourceContention` and nextest retries; if no plan can exist
-(host too small), the run proceeds *overcommitted* — every vCPU
-thread masked to the allowed CPUs — and warns when that means
-oversubscription (see below).
+## The queue: a second-order scheduler under nextest
+
+nextest is a pure spawner: it launches every test process at once and
+retries failures. The lock dir is the actual scheduler — it decides
+which cells *execute* against host capacity (with the guest scheduler
+under test as the third layer down). The coordination protocol that
+makes this work across disjoint invocations sharing one
+`KTSTR_LOCK_DIR` (colocated runner units, concurrent nextest runs):
+
+- **Fast path.** Every acquirer first tries its whole planned lock
+  set non-blocking, all-or-nothing, in canonical lock order — cells
+  satisfiable *right now* never queue, and no fast-path partial ever
+  persists (everything is released on any bounce).
+- **The queue.** A bounced acquirer joins a single queue flock in the
+  lock dir (arrival order via the kernel's flock wait queue; tickets
+  are flocks, so a crashed waiter vanishes with its process). Waiters
+  are cheap: acquisition runs *before* VM setup, so a queued cell
+  holds a ticket and an inotify fd — no guest memory, no vCPUs. That
+  is what lets nextest admit hundreds of cells at once.
+- **The head license.** The queue holder — the head — is the only
+  agent anywhere allowed to hold a *partial* lock set while waiting
+  for more. One incremental acquirer cannot deadlock (a cycle needs
+  two holders-waiting) and cannot starve (it only accumulates), which
+  is the protocol's core safety argument.
+- **Re-plan on every wake.** The head sleeps on an inotify watch of
+  the lock dir; any lockfile release wakes it, and it re-plans
+  against *live* holder state — plans are never cached across waits,
+  so a freed resource that satisfies a different plan than the one
+  that was busy is taken immediately. Partials the fresh plan still
+  needs are kept; only abandoned ones release.
+- **Claims.** The head publishes its current target set; fast-path
+  planners in every process subtract it from their view of free
+  capacity, so nobody snipes the slots the head is accumulating —
+  while any *other* free capacity stays fair game (work conservation:
+  a small `LOCK_SH` cell never waits behind a hungry `LOCK_EX` head
+  it doesn't overlap).
+- **Progress-based patience.** Waiting is bounded by *progress*, not
+  wall time: as long as the queue turns over (or the head gains
+  locks) a waiter keeps waiting — a cell deep in a busy-but-advancing
+  queue is fine. Only a no-progress window (a wedged holder,
+  genuinely pathological) surfaces a `ResourceContention` *failure*
+  that nextest retries — never a skip, because a skip is a pass
+  nextest does not retry, which silently costs coverage.
+
+When the default path cannot map its topology 1:1 onto the host at
+all (no plan can exist — host too small), the run proceeds
+*overcommitted* — every vCPU thread masked to the allowed CPUs — and
+warns when that means oversubscription (see below).
 
 ## Too-small hosts: who asked determines the verdict
 
@@ -186,7 +277,11 @@ Budgeted acquisition runs three phases:
 3. **Acquire** — non-blocking shared locks on every selected LLC,
    all-or-nothing. If any lock is busy, every held lock is dropped
    and the whole cycle retries a few times with short ascending
-   backoff; after the final attempt it bails with a
+   backoff (absorbing plan/acquire races). Test-run acquisition then
+   joins the acquisition queue and completes as head — re-running
+   DISCOVER → PLAN against live holder state on every lock-dir wake
+   (see the queue section above); build-time and interactive
+   acquisition stop at the short backoff and bail with a
    `ResourceContention` error naming the winning holders.
 
 The lock granularity is per-LLC, but the reserved CPU list holds
@@ -248,6 +343,8 @@ pass through.
 
 ## Related
 
+- [Run Modes](run-modes.md) — how this budgeted path sits alongside the
+  default and performance modes, and the shared reliability machinery.
 - [Performance Mode](performance-mode.md) — the full-isolation mode.
 - [Environment Variables](../reference/environment-variables.md) —
   `KTSTR_CPU_CAP`, `KTSTR_LOCK_DIR`, `KTSTR_BYPASS_LLC_LOCKS`.

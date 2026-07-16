@@ -28,11 +28,11 @@ fn sidecar_to_row_basic() {
             stuck_count: 1,
             event_deltas: Some(monitor::ScxEventDeltas {
                 total_fallback: 7,
-                fallback_rate: 0.5,
+                fallback_rate: Some(0.5),
                 max_fallback_burst: 2,
                 total_dispatch_offline: 0,
                 total_dispatch_keep_last: 3,
-                keep_last_rate: 0.2,
+                keep_last_rate: Some(0.2),
                 total_enq_skip_exiting: 0,
                 total_enq_skip_migration_disabled: 0,
                 ..Default::default()
@@ -110,7 +110,7 @@ fn sidecar_to_row_carries_monitor_schedstat_ext_counters() {
                 total_sched_goidle: 20,
                 total_ttwu_count: 200,
                 total_ttwu_local: 150,
-                total_schedstat_wall_sec: 2.0,
+                total_schedstat_vcpu_sec: Some(2.0),
             }),
             ..Default::default()
         }),
@@ -125,9 +125,8 @@ fn sidecar_to_row_carries_monitor_schedstat_ext_counters() {
         ("total_sched_goidle", 20.0),
         ("total_ttwu_count", 200.0),
         ("total_ttwu_local", 150.0),
-        // The per-second Rate denominator, co-inserted with the counters (the
-        // *_per_sec rates derive total_X / this in the cross-run fold).
-        ("total_schedstat_wall_sec", 2.0),
+        // The CPU-time Rate denominator, co-inserted with the counters.
+        ("total_schedstat_vcpu_sec", 2.0),
     ] {
         assert_eq!(
             row.ext_metrics.get(name).copied(),
@@ -871,7 +870,7 @@ fn metric_def_polarity_inverse_sense() {
     // Polarity is HigherBetter.
     let d = metric_def("total_iterations").unwrap();
     assert!(!d.higher_is_worse());
-    assert_eq!(d.polarity, Polarity::HigherBetter);
+    assert_eq!(d.polarity, Polarity::Informational);
 }
 
 #[test]
@@ -906,13 +905,13 @@ fn metric_def_all_entries_unique() {
     assert_eq!(names.len(), len);
 }
 
-/// Registry integrity: every `MetricKind::Rate`'s numerator and
-/// denominator MUST name a registered `Counter` metric. `derive_rate_metrics`
+/// Registry integrity: every `MetricKind::Rate`'s numerator and denominator
+/// MUST name a registered additive metric. `derive_rate_metrics`
 /// silently skips a Rate whose component key is absent from the map
 /// (`derive_rate_metrics_from` `continue`s on a missing key), so a typo'd
 /// component name would never derive and never fail a value test — pin the
-/// names at the registry level instead. Counter (not Gauge/Peak) because the
-/// re-pool needs Σnum/Σdenom (sum-fold), which only the Counter kind gives.
+/// names at the registry level instead. Counter and PerPhaseDeltaSum both
+/// preserve additive numerator/denominator mass; Gauge/Peak do not.
 #[test]
 fn every_rate_metric_has_registered_counter_components() {
     for m in METRICS.iter() {
@@ -928,8 +927,8 @@ fn every_rate_metric_has_registered_counter_components() {
                 panic!("Rate {} {role} {comp:?} is not a registered metric", m.name)
             });
             assert!(
-                matches!(def.kind, MetricKind::Counter),
-                "Rate {} {role} {comp:?} must be a Counter for the Σ-fold re-pool",
+                matches!(def.kind, MetricKind::Counter | MetricKind::PerPhaseDeltaSum),
+                "Rate {} {role} {comp:?} must be additive for the Σ-fold re-pool",
                 m.name,
             );
         }
@@ -1588,8 +1587,8 @@ fn metric_def_read_prefers_accessor_over_ext_metrics() {
 /// not a high-throughput one. For a scale-varying metric `default_abs` is only an
 /// activity guard; the relative gate (`default_rel`) carries materiality.
 /// A high fixed floor silently masks a large RELATIVE regression on a
-/// low-throughput workload -- the #28 bug (e.g. `sched_count_per_sec`
-/// 50->30/s: rel 0.40 clears `default_rel` but |20| < 100 failed the abs
+/// low-throughput workload -- the #28 bug (e.g. `sched_count_per_vcpu_sec`
+/// 50->30/vcpu-s: rel 0.40 clears `default_rel` but |20| < 100 failed the abs
 /// gate, so the 40% drop was dropped as "unchanged"). Fractions carry unit
 /// `""` and are intrinsically bounded to [0,1], so they keep a fixed
 /// unit-scale floor and are excluded here. This test fails if a rate metric
@@ -1601,17 +1600,22 @@ fn throughput_rate_floors_are_near_idle() {
     const THROUGHPUT_UNITS: &[&str] = &[
         "/s",
         "ns/s",
+        "/vcpu-s",
+        "ns/vcpu-s",
         "ops/s",
         "req/s",
         "irq/s",
         "softirq/s",
+        "irq/cpu-s",
+        "softirq/cpu-s",
         "iter/s",
         "iter/cpu-s",
+        "ops/cpu-s",
     ];
     for m in METRICS {
         // Throughput carriers: Rate, plus the phase-aware kinds that hold a
         // per-time throughput -- SCHBENCH_RPS_* are PerPhase / PerRunDistribution
-        // (req/s), the taobench qps are PerPhase (ops/s), and
+        // (req/s), Taobench CPU throughput is PerPhase (ops/cpu-s), and
         // worst_iterations_per_cpu_sec is WorstLowest (iter/cpu-s). All span
         // orders of magnitude across workloads, so a fixed floor masks a
         // low-throughput regression exactly as a Rate does.
@@ -1659,8 +1663,8 @@ fn throughput_rate_floors_are_near_idle() {
 /// PSI-stall Counter carries `"µs"` (naturally-bounded µs LATENCY metrics are
 /// PerPhase / Distribution / Peak, never Counter, so a Counter-"µs" arm captures
 /// only the accumulator). Second-denominated (`"s"`) metrics are excluded: the
-/// LIVE ones (`total_schedstat_wall_sec`, `total_phase_wall_sec`) are bounded
-/// wall-clock window spans, not orders-of-magnitude counts; `total_cpu_time_sec`
+/// LIVE ones (`total_schedstat_vcpu_sec`, `total_phase_guest_cpu_sec`) are
+/// bounded observation-window currencies, not orders-of-magnitude counts; `total_cpu_time_sec`
 /// IS a scale-varying pooled CPU-time accumulation, but it is a render-suppressed
 /// Rate component (inert floor) whose magnitude is already guarded via its ns twin
 /// `total_cpu_time_ns` (Counter, "ns").
@@ -1814,21 +1818,26 @@ fn all_metric_units_are_known() {
     // The complete set of units the registry uses today. A new unit must be added
     // here AND classified into a floor guard (scale-varying) or left bounded.
     const KNOWN_UNITS: &[&str] = &[
-        "",           // raw counts (varying) / fractions & ratios (bounded)
-        "%",          // percent (bounded)
-        "x",          // ratio (bounded)
-        "ms",         // millisecond latency (bounded)
-        "\u{00b5}s",  // microsecond latency (bounded) / PSI-stall accumulator (varying, Counter)
-        "ns",         // nanosecond accumulation / per-schedule rate (varying)
-        "s",          // second wall-clock window (bounded) / CPU-time accumulator (suppressed)
-        "/s",         // per-second event rate (varying)
-        "ns/s",       // nanoseconds-per-second rate (varying)
-        "ops/s",      // ops throughput (varying)
-        "req/s",      // request throughput (varying)
-        "irq/s",      // IRQ rate (varying)
-        "softirq/s",  // softirq rate (varying)
-        "iter/s",     // iteration rate (varying)
-        "iter/cpu-s", // overcommit-invariant iteration rate (varying)
+        "",              // raw counts (varying) / fractions & ratios (bounded)
+        "%",             // percent (bounded)
+        "x",             // ratio (bounded)
+        "ms",            // millisecond latency (bounded)
+        "\u{00b5}s",     // microsecond latency (bounded) / PSI-stall accumulator (varying, Counter)
+        "ns",            // nanosecond accumulation / per-schedule rate (varying)
+        "s",             // second wall-clock window (bounded) / CPU-time accumulator (suppressed)
+        "/s",            // per-second event rate (varying)
+        "ns/s",          // nanoseconds-per-second rate (varying)
+        "/vcpu-s",       // event rate per mean vCPU CPU second (varying)
+        "ns/vcpu-s",     // delay density per mean vCPU CPU second (varying)
+        "ops/s",         // ops throughput (varying)
+        "req/s",         // request throughput (varying)
+        "irq/s",         // IRQ rate (varying)
+        "softirq/s",     // softirq rate (varying)
+        "irq/cpu-s",     // IRQ activity per delivered guest CPU second (varying)
+        "softirq/cpu-s", // softirq activity per delivered guest CPU second (varying)
+        "iter/s",        // legacy/dynamic wall iteration rate (varying)
+        "iter/cpu-s",    // overcommit-invariant iteration rate (varying)
+        "ops/cpu-s",     // CPU-second-denominated ops throughput (varying)
     ];
     for m in METRICS {
         assert!(

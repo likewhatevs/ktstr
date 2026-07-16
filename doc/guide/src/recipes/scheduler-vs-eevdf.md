@@ -8,20 +8,20 @@ mid-run so the kernel default takes over for a second phase, then compare
 the two phases metric by metric.
 
 The workload must **persist** across the detach — a `Backdrop` population,
-not per-step workers — so its cumulative counters span both phases. That
-shared, continuous measurement is what makes a per-phase delta meaningful
-(per-step workers reset each phase and read ~0).
+not per-step workers — so the same worker population reports both phase
+carriers.
 
 Two readers cover the comparison, both on the `&VmResult` a `post_vm`
 callback receives (the host-side hook that runs after the VM exits):
 
-- `VmResult::throughput_ratio(a, b)` — iterations/sec from the stimulus
-  timeline. The timeline carries per-step boundaries independent of the
-  periodic capture pipeline, so throughput works even for
-  `--cell-parent-cgroup` schedulers.
+- `VmResult::throughput_ratio(a, b)` — the ratio of the canonical
+  `iteration_rate` in each phase: iterations per delivered guest CPU-second.
+  This is an ergonomic alias over the phase metric, not an independent
+  wall-throughput calculation.
 - `VmResult::phase_metric(phase, name)` — any other per-phase metric by
   its registry name (see [Checking](../concepts/checking.md)): CPU
-  overhead (`system_time_ns`, `user_time_ns`) and scheduling quality
+  CPU mix (`system_cpu_fraction`; raw `system_time_ns` and `user_time_ns`
+  remain informational) and scheduling quality
   (`avg_imbalance_ratio`, `avg_dsq_depth`). Wake-latency and run-delay
   distributions are run-level — pooled across cgroups into one whole-run
   value — so they cannot be split into the scheduler phase vs the EEVDF
@@ -55,8 +55,8 @@ fn compare_vs_eevdf(result: &VmResult) -> Result<()> {
     let sched = Phase::step(0); // first Step ran under the scheduler under test
     let eevdf = Phase::step(1); // second Step ran under EEVDF, after the detach
 
-    // Throughput: > 1.0 means the scheduler out-throughputs EEVDF; < 1.0
-    // is a regression.
+    // Iteration efficiency: > 1.0 means more work per delivered CPU-second;
+    // < 1.0 means less.
     let throughput = result
         .throughput_ratio(sched, eevdf)
         .ok_or_else(|| anyhow::anyhow!("no per-phase throughput — did both phases run?"))?;
@@ -76,12 +76,12 @@ fn compare_vs_eevdf(result: &VmResult) -> Result<()> {
         ensure!(s <= e * 1.5, "my_sched imbalance {s:.2} is >1.5x EEVDF {e:.2}");
     }
 
-    // CPU overhead: per-phase kernel (system) CPU time.
+    // CPU overhead mix: kernel CPU as a fraction of observed task CPU.
     if let (Some(s), Some(e)) = (
-        result.phase_metric(sched, "system_time_ns"),
-        result.phase_metric(eevdf, "system_time_ns"),
+        result.phase_metric(sched, "system_cpu_fraction"),
+        result.phase_metric(eevdf, "system_cpu_fraction"),
     ) {
-        ensure!(s <= e * 2.0, "my_sched system time {s:.0}ns is >2x EEVDF {e:.0}ns");
+        ensure!(s <= e * 2.0, "my_sched system CPU fraction {s:.3} is >2x EEVDF {e:.3}");
     }
 
     Ok(())

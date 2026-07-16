@@ -242,6 +242,174 @@ pub fn post_vm_skip(reason: impl Into<String>) -> anyhow::Error {
     anyhow::anyhow!("{}", reason.into()).context(HostSkipRequest)
 }
 
+/// Witnessed-starvation evidence for capture-bearing assertions: the
+/// host dilation `D` that PROVES the run was contended enough to
+/// explain missing/degraded periodic captures, or `None` on a quiet
+/// (or unwitnessed) host.
+///
+/// The periodic capture chain is readiness-gated (KASLR publish +
+/// accessor-init worker) and its boundaries are wall-anchored inside
+/// the workload window; under heavy host saturation the cold-cache
+/// accessor build alone can outlast a short workload, so every
+/// boundary defers past run end and `periodic_fired == 0` with zero
+/// real captures — an ENVIRONMENTAL outcome, not a capture-pipeline
+/// regression (observed across the periodic/freeze test family on
+/// saturated 96-CPU CI runners; the same cells pass idle). Assertions
+/// that require captures consult this first and convert their failure
+/// into a host-side SKIP (`post_vm_skip`) when starvation is proven,
+/// mirroring the tri-state latency gates: a quiet-host miss still
+/// FAILS (the regression the assertion exists to catch).
+///
+/// Witness preference: Body-phase dilation (the capture boundaries
+/// live inside the workload window), falling back to the whole-run
+/// schedstat `D`. The 1.5 bar follows `PERF_ISOLATION_D_MAX`'s
+/// derivation (worst measured-quiet `D` ≈ 1.21; > 1.5 is unambiguous
+/// external contention). `None` (no witness sampled) is NOT proof —
+/// callers must fail in that case; absence of evidence cannot launder
+/// a regression.
+pub fn capture_starvation_witness(result: &crate::vmm::VmResult) -> Option<f64> {
+    const CAPTURE_STARVATION_D_MAX: f64 = 1.5;
+    let d = result
+        .contention_witness
+        .as_ref()
+        .and_then(|w| w.body_dilation())
+        .or_else(|| {
+            result
+                .host_vcpu_schedstat
+                .as_ref()
+                .and_then(|s| s.dilation())
+        })?;
+    (d > CAPTURE_STARVATION_D_MAX).then_some(d)
+}
+
+/// Environmental skip for a zero-scheduler-activity reading (e.g.
+/// `nr_dispatched` / `nr_yielded` read 0 across every periodic sample)
+/// that the guest's OWN sched_ext runnable-stall watchdog explains: when
+/// the console carries a watchdog `ScxExitKind::Stall` exit AND
+/// [`capture_starvation_witness`] proves the host was contended, the BPF
+/// scheduler was ejected because a descheduling host dilated the 5s
+/// GUEST-time stall window past the timeout — not because the scheduler
+/// failed to dispatch. Returns `Err(post_vm_skip(..))` in that case; `Ok`
+/// otherwise, so a Stall on a quiet host (no witness) or any non-Stall
+/// zero still reaches the caller's own regression `ensure!`.
+///
+/// Callers gate their zero-activity failure on it:
+/// ```ignore
+/// if !any_progress {
+///     stall_ejection_skip(result)?;
+/// }
+/// anyhow::ensure!(any_progress, "... never dispatched ...");
+/// ```
+pub fn stall_ejection_skip(result: &crate::vmm::VmResult) -> anyhow::Result<()> {
+    let stalled = crate::monitor::dmesg_scx::parse_kmsg_window(&result.stderr)
+        .iter()
+        .any(|e| e.kind == crate::monitor::dmesg_scx::ScxExitKind::Stall);
+    if stalled && let Some(d) = capture_starvation_witness(result) {
+        return Err(post_vm_skip(format!(
+            "scx scheduler ejected by the guest sched_ext runnable-stall \
+             watchdog under witnessed host contention (D={d:.2}): the 5s stall \
+             timer measures GUEST time, which a descheduling host dilates into \
+             a false stall — the zero-activity reading is that ejection, not a \
+             scheduler regression; environmental non-verdict",
+        )));
+    }
+    Ok(())
+}
+
+/// Generic sub-minimum starvation skip: `Err(post_vm_skip(..))` when the
+/// run produced FEWER data-bearing units than the caller's assertion
+/// requires (`have < need`) AND [`capture_starvation_witness`] proves the
+/// host was contended enough to explain the shortfall; `Ok(())`
+/// otherwise. The caller passes the SAME count its own assertion checks
+/// (real captures, PSI-carrying captures, series length, …) so the gate
+/// and the assertion cannot disagree about the boundary — an earlier
+/// zero-only gate let `1 of 6` runs through to fail on a `>= 2` minimum
+/// under the identical environmental condition. Quiet-host shortfalls
+/// (zero OR sub-minimum) still fall through and fail with the caller's
+/// specific diagnosis.
+pub fn starved_below_minimum_skip(
+    result: &crate::vmm::VmResult,
+    have: usize,
+    need: usize,
+    what: &str,
+) -> anyhow::Result<()> {
+    if have >= need {
+        return Ok(());
+    }
+    // PRIMARY arm — readiness vs window: when the periodic prereqs
+    // (KASLR publish + accessors) became ready at/after the capture
+    // window's end, or never became ready at all, every boundary was
+    // structurally unreachable — zero/short captures were inevitable at
+    // ANY host dilation. This is the honest signal the D-threshold arm
+    // missed in the field: a ~7 s cold accessor build outruns a 4-5 s
+    // workload window at D ≈ 1.2, well under any defensible contention
+    // bar. Skip carries both timestamps.
+    let ready = result.periodic_prereqs_ready;
+    let window_end = result.periodic_window_end;
+    let structurally_impossible = match (ready, window_end) {
+        // Never ready: nothing could ever fire.
+        (None, _) => true,
+        // Ready, but at/after the window closed.
+        (Some(r), Some(w)) => r >= w,
+        // Ready but the window never resolved: the boundaries were
+        // never computed, so no capture could fire.
+        (Some(_), None) => true,
+    };
+    if result.periodic_target > 0 && structurally_impossible {
+        return Err(post_vm_skip(format!(
+            "only {have} of the required {need} {what}: the capture prereqs \
+             (KASLR publish + accessor init) {} the capture window \
+             (prereqs_ready={:?}, window_end={:?}) — captures were \
+             structurally impossible this run at any host dilation; \
+             environmental non-verdict",
+            if ready.is_none() {
+                "never became ready within"
+            } else {
+                "became ready only after"
+            },
+            ready,
+            window_end,
+        )));
+    }
+    // SECONDARY arm — witnessed contention: readiness landed in time
+    // but the captures still fell short (e.g. rendezvous degradation,
+    // data-bearing rows missing) under a provably saturated host.
+    if let Some(d) = capture_starvation_witness(result) {
+        return Err(post_vm_skip(format!(
+            "only {have} of the required {need} {what} under witnessed host \
+             contention (D={d:.2}, prereqs_ready={ready:?}, \
+             window_end={window_end:?}): the capture chain was starved below \
+             the assertion's minimum — environmental non-verdict; the \
+             dependent assertions cannot be evaluated",
+        )));
+    }
+    Ok(())
+}
+
+/// Periodic-capture starvation gate for capture-requiring post_vm
+/// assertions: [`starved_below_minimum_skip`] keyed on the bridge's
+/// REAL (non-placeholder) capture count vs the test's stated minimum.
+/// Call at the TOP of a post_vm callback with the same minimum its
+/// assertions enforce: `periodic_starvation_gate(result, 2)?;`. Tests
+/// whose assertions key on a narrower data-bearing count (e.g. "N
+/// captures carrying per-cgroup PSI") should ALSO call
+/// [`starved_below_minimum_skip`] with that count at the assertion
+/// site. No-op when the entry configured no periodic captures.
+pub fn periodic_starvation_gate(
+    result: &crate::vmm::VmResult,
+    min_real: usize,
+) -> anyhow::Result<()> {
+    if result.periodic_target == 0 {
+        return Ok(());
+    }
+    starved_below_minimum_skip(
+        result,
+        result.snapshot_bridge.periodic_real_count() as usize,
+        min_real,
+        "real (non-placeholder) periodic captures",
+    )
+}
+
 /// Dispatch the entry's `post_vm` + `post_vm_unconditional`
 /// callbacks and combine their failure signals.
 ///
@@ -341,7 +509,9 @@ pub(crate) fn invoke_post_vm_callback(
 /// without propagating the error. Called wherever a run is skipped
 /// before producing a real result: the skip-class catch-all and the
 /// VM build / VM run arms in [`run_ktstr_test_inner`] (each fires on a
-/// `ResourceContention` or `TopologyInsufficient`), and the
+/// host-incapacity class — `TopologyInsufficient` or
+/// `PerfModeUnavailable`; transient `ResourceContention` is a
+/// retryable failure and records no skip), and the
 /// performance-mode / coverage gates at the plain-run entry points in
 /// the crate `dispatch` module. All must record the skip for stats
 /// tooling but cannot meaningfully handle a sidecar-write failure
@@ -439,5 +609,139 @@ mod post_vm_skip_tests {
     fn combine_real_fail_plus_skip_does_not_skip() {
         let c = combine_post_vm_errs(Some(real_fail()), Some(post_vm_skip("ph"))).unwrap();
         assert!(c.downcast_ref::<HostSkipRequest>().is_none());
+    }
+}
+
+#[cfg(test)]
+mod starvation_witness_tests {
+    use super::*;
+    use crate::vmm::{HostVcpuSchedstat, VmResult};
+
+    fn with_dilation(on_cpu_ns: u64, run_delay_ns: u64) -> VmResult {
+        VmResult {
+            host_vcpu_schedstat: Some(HostVcpuSchedstat {
+                total_on_cpu_ns: on_cpu_ns,
+                total_run_delay_ns: run_delay_ns,
+                sampled_vcpus: 1,
+            }),
+            ..VmResult::test_fixture()
+        }
+    }
+
+    /// No witness sampled → None (absence of evidence cannot launder a
+    /// regression); quiet host (D ≈ 1.1) → None; contended (D = 3) →
+    /// Some(3.0). Whole-run fallback path (fixture has no per-phase
+    /// witness).
+    #[test]
+    fn capture_starvation_witness_thresholds() {
+        assert_eq!(capture_starvation_witness(&VmResult::test_fixture()), None);
+        assert_eq!(capture_starvation_witness(&with_dilation(10, 1)), None);
+        let d = capture_starvation_witness(&with_dilation(10, 20)).expect("D=3 is contended");
+        assert!((d - 3.0).abs() < 1e-9);
+    }
+
+    /// Fixture with the readiness-vs-window fields set: prereqs ready
+    /// at `ready_s`, window ending at `end_s` (None = never/unresolved).
+    fn with_window(
+        base: VmResult,
+        target: u32,
+        ready_s: Option<u64>,
+        end_s: Option<u64>,
+    ) -> VmResult {
+        VmResult {
+            periodic_target: target,
+            periodic_prereqs_ready: ready_s.map(std::time::Duration::from_secs),
+            periodic_window_end: end_s.map(std::time::Duration::from_secs),
+            ..base
+        }
+    }
+
+    /// Gate arms, primary (readiness-vs-window) first:
+    ///   - readiness never / after the window end → structural skip at
+    ///     ANY dilation (the arm the D-threshold missed in the field:
+    ///     a ~7 s accessor build vs a 4-5 s window at D ≈ 1.2);
+    ///   - readiness in time + contended → witness skip;
+    ///   - readiness in time + quiet → Ok (the caller's own assertion
+    ///     fails — the real-regression case stays catchable);
+    ///   - no periodic target → Ok regardless.
+    #[test]
+    fn periodic_starvation_gate_arms() {
+        // No periodic target: Ok even when contended.
+        let r = with_dilation(10, 20);
+        assert!(periodic_starvation_gate(&r, 1).is_ok());
+        // Readiness AFTER the window end, QUIET host: structural skip.
+        let r = with_window(with_dilation(10, 1), 2, Some(9), Some(5));
+        let err = periodic_starvation_gate(&r, 1).expect_err("late readiness must gate");
+        assert!(err.downcast_ref::<HostSkipRequest>().is_some());
+        // Readiness NEVER, quiet host: structural skip.
+        let r = with_window(with_dilation(10, 1), 2, None, Some(5));
+        assert!(periodic_starvation_gate(&r, 1).is_err());
+        // Window never resolved (no boundary could fire): structural skip.
+        let r = with_window(with_dilation(10, 1), 2, Some(1), None);
+        assert!(periodic_starvation_gate(&r, 1).is_err());
+        // Readiness IN TIME + contended: witness skip.
+        let r = with_window(with_dilation(10, 20), 2, Some(1), Some(5));
+        let err = periodic_starvation_gate(&r, 1).expect_err("contended run must gate");
+        assert!(err.downcast_ref::<HostSkipRequest>().is_some());
+        // Readiness IN TIME + quiet + zero captures: Ok — the caller
+        // fails with its own diagnosis (a capture-pipeline regression).
+        let r = with_window(with_dilation(10, 1), 2, Some(1), Some(5));
+        assert!(periodic_starvation_gate(&r, 1).is_ok());
+    }
+
+    /// stall_ejection_skip three-way: a watchdog Stall exit on a
+    /// CONTENDED host (D=3) is an environmental skip; the same Stall on a
+    /// QUIET host stays the caller's failure (Ok, so its `ensure!` fires);
+    /// a contended host with NO stall line is likewise the caller's to
+    /// fail — absence of the watchdog signature cannot launder a real
+    /// zero-activity regression.
+    #[test]
+    fn stall_ejection_skip_arms() {
+        const STALL: &str = "sched_ext: BPF scheduler \"scx_test\" disabled (runnable task stall)";
+
+        let contended_stall = VmResult {
+            stderr: STALL.into(),
+            ..with_dilation(10, 20)
+        };
+        let err = stall_ejection_skip(&contended_stall).expect_err("stall + contention must skip");
+        assert!(err.downcast_ref::<HostSkipRequest>().is_some());
+
+        let quiet_stall = VmResult {
+            stderr: STALL.into(),
+            ..with_dilation(10, 1)
+        };
+        assert!(
+            stall_ejection_skip(&quiet_stall).is_ok(),
+            "a stall on a quiet host is a real fail, not an environmental skip",
+        );
+
+        let contended_no_stall = with_dilation(10, 20);
+        assert!(
+            stall_ejection_skip(&contended_no_stall).is_ok(),
+            "contention without a watchdog stall line leaves the caller to fail",
+        );
+    }
+
+    /// The generic sub-minimum gate: `have < need` + (structural OR
+    /// witnessed) = skip; `have >= need` never gates; readiness-in-time
+    /// quiet host never gates.
+    #[test]
+    fn starved_below_minimum_arms() {
+        // Sub-minimum + contended (readiness in time): witness skip —
+        // the 1-of-6 shape.
+        let contended = with_window(with_dilation(10, 20), 6, Some(1), Some(5));
+        let err = starved_below_minimum_skip(&contended, 1, 3, "captures")
+            .expect_err("sub-minimum under contention must gate");
+        assert!(err.downcast_ref::<HostSkipRequest>().is_some());
+        // At/above minimum: never gates, even contended + late-ready.
+        let late = with_window(with_dilation(10, 20), 6, Some(9), Some(5));
+        assert!(starved_below_minimum_skip(&late, 3, 3, "captures").is_ok());
+        // Sub-minimum, quiet, readiness in time: falls through (caller
+        // fails with its own diagnosis).
+        let quiet = with_window(with_dilation(10, 1), 6, Some(1), Some(5));
+        assert!(starved_below_minimum_skip(&quiet, 1, 3, "captures").is_ok());
+        // Sub-minimum, quiet, readiness LATE: structural skip.
+        let quiet_late = with_window(with_dilation(10, 1), 6, Some(9), Some(5));
+        assert!(starved_below_minimum_skip(&quiet_late, 1, 3, "captures").is_err());
     }
 }

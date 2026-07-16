@@ -21,7 +21,8 @@ use super::*;
 ///   (`EMFILE`), the system fd table full (`ENFILE`), or a kernel
 ///   subsystem signalling "try again" (`EAGAIN`). Routed through
 ///   [`crate::vmm::host_topology::ResourceContention`] so the
-///   `#[ktstr_test]` macro SKIPs the run instead of failing it. The
+///   `#[ktstr_test]` macro routes the run to the retryable-contention
+///   verdict (nextest re-runs it) instead of an unclassified fault. The
 ///   `EMFILE` / `ENFILE` arms specifically prevent fd-table pressure
 ///   on `/dev/kvm` open from surfacing as a hard error with a
 ///   misleading "kvm group" hint.
@@ -29,8 +30,8 @@ use super::*;
 ///   infrastructure misconfiguration or a real fault — the device is
 ///   missing, the user lacks permission, or the kernel returned an
 ///   unexpected errno. Surfaced as a hard error with the actionable
-///   "kvm group" hint; SKIP-classifying these would silently mask a
-///   misconfigured runner.
+///   "kvm group" hint; contention-classifying these would hide a
+///   misconfigured runner behind the retry budget.
 pub(crate) fn ensure_kvm() -> Result<()> {
     match std::fs::OpenOptions::new()
         .read(true)
@@ -64,8 +65,8 @@ pub(crate) fn ensure_kvm() -> Result<()> {
                              host resources: {snapshot}\n  \
                              hint: KVM device open failed with a host-resource \
                              errno; another peer may be holding the budget. \
-                             nextest will not retry; the SKIP banner records \
-                             this attempt for stats tooling.",
+                             nextest retries the cell; if the pressure has \
+                             cleared, the retry passes.",
                         ),
                     },
                 ))
@@ -254,12 +255,12 @@ pub(crate) fn acquire_test_kernel_lock_if_cached(
     // is holding the lock — that is host-resource contention, not a
     // kernel fault, so route it through
     // [`crate::vmm::host_topology::ResourceContention`] so the
-    // `#[ktstr_test]` macro SKIPs cleanly and stats tooling records
-    // the attempt via the per-site sidecar. Non-timeout failures
+    // `#[ktstr_test]` macro fires the retryable-contention verdict
+    // (nextest re-runs after the holder finishes). Non-timeout failures
     // (parent-directory creation failure, an unexpected `try_flock`
     // errno other than `EAGAIN`/`EWOULDBLOCK`) propagate as hard
     // errors — they indicate filesystem corruption or a programming
-    // fault that SKIP-skipping would silently mask.
+    // fault a contention verdict would obscure.
     //
     // Detection seam: the flock helper's bail format starts with
     // `flock LOCK_SH on` (or `LOCK_EX`) and contains `timed out
@@ -283,9 +284,9 @@ pub(crate) fn acquire_test_kernel_lock_if_cached(
                              {snapshot}\n  \
                              hint: a concurrent `cargo ktstr kernel build` or \
                              another lockholder is preventing the test VM from \
-                             reading the cached kernel image. nextest will not \
-                             retry; the SKIP banner records this attempt for \
-                             stats tooling. Wait for the holder PIDs above to \
+                             reading the cached kernel image. nextest retries \
+                             the cell after the holder finishes. If the failure \
+                             persists, wait for the holder PIDs above to \
                              finish, or kill them, then retry.",
                         ),
                     },

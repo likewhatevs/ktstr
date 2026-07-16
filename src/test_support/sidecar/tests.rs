@@ -279,6 +279,8 @@ fn sidecar_result_roundtrip() {
         scheduler: "scx_mitosis".to_string(),
         vcpus: 16,
         cpu_budget: 4,
+        host_dilation: Some(1.25),
+        throughput_denomination: ThroughputDenomination::CpuSec,
         scheduler_commit: Some("abc123".to_string()),
         resolve_source: Some("path".to_string()),
         project_commit: Some("def4567".to_string()),
@@ -320,11 +322,11 @@ fn sidecar_result_roundtrip() {
             stuck_count: 0,
             event_deltas: Some(crate::monitor::ScxEventDeltas {
                 total_fallback: 7,
-                fallback_rate: 0.5,
+                fallback_rate: Some(0.5),
                 max_fallback_burst: 2,
                 total_dispatch_offline: 0,
                 total_dispatch_keep_last: 3,
-                keep_last_rate: 0.2,
+                keep_last_rate: Some(0.2),
                 total_enq_skip_exiting: 0,
                 total_enq_skip_migration_disabled: 0,
                 ..Default::default()
@@ -374,6 +376,8 @@ fn sidecar_result_roundtrip() {
         scheduler,
         vcpus,
         cpu_budget,
+        host_dilation,
+        throughput_denomination,
         scheduler_commit,
         project_commit,
         payload,
@@ -410,6 +414,16 @@ fn sidecar_result_roundtrip() {
     // (vcpus, cpu_budget) round-trip — distinct values catch a field swap.
     assert_eq!(vcpus, 16, "vcpus must round-trip the literal");
     assert_eq!(cpu_budget, 4, "cpu_budget must round-trip the literal");
+    assert_eq!(
+        host_dilation,
+        Some(1.25),
+        "host_dilation must round-trip the literal"
+    );
+    assert_eq!(
+        throughput_denomination,
+        ThroughputDenomination::CpuSec,
+        "throughput_denomination must round-trip the literal"
+    );
     // Nullable string metadata fields.
     assert_eq!(scheduler_commit.as_deref(), Some("abc123"));
     assert_eq!(project_commit.as_deref(), Some("def4567"));
@@ -551,6 +565,8 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
         scheduler: "scx_audit".to_string(),
         vcpus: 256,
         cpu_budget: 95,
+        host_dilation: Some(1.4),
+        throughput_denomination: ThroughputDenomination::CpuSec,
         scheduler_commit: Some("deadbeef1234567890abcdef".to_string()),
         resolve_source: Some("auto_built".to_string()),
         project_commit: Some("cafebab-dirty".to_string()),
@@ -577,11 +593,11 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
             }],
             total_workers: 3,
             // ext_metrics carries the derived Rates + their Counter components
-            // (e.g. the pooled iterations_per_cpu_sec re-pool); it is the
+            // (e.g. the pooled iteration_rate re-pool); it is the
             // durable surface every cross-run compare reads, so it MUST survive
             // sidecar serialize -> deserialize.
             ext_metrics: std::collections::BTreeMap::from([
-                ("iterations_per_cpu_sec".to_string(), 101.0),
+                ("iteration_rate".to_string(), 101.0),
                 ("total_iterations_pooled".to_string(), 1010.0),
                 ("total_cpu_time_sec".to_string(), 10.0),
             ]),
@@ -667,15 +683,11 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
     assert_eq!(loaded.stats.total_workers, 3);
     assert_eq!(loaded.stats.cgroups.len(), 1);
     assert_eq!(loaded.stats.cgroups[0].num_workers, 3);
-    // ext_metrics (the pooled iterations_per_cpu_sec Rate + its Counter
+    // ext_metrics (the pooled iteration_rate + its Counter
     // components) must round-trip — the sidecar is the durable surface every
     // cross-run `perf-delta` reads.
     assert_eq!(
-        loaded
-            .stats
-            .ext_metrics
-            .get("iterations_per_cpu_sec")
-            .copied(),
+        loaded.stats.ext_metrics.get("iteration_rate").copied(),
         Some(101.0),
         "pooled rate must survive sidecar serialization",
     );
@@ -3452,17 +3464,59 @@ fn format_footer_empty_without_fresh_artifacts() {
     assert!(format_run_artifact_footer(root.path(), std::time::SystemTime::now()).is_empty());
 }
 
+/// A run that wrote a stats sidecar gets the `stats last-run`
+/// discoverability hint folded into the count line — the gauntlet
+/// analysis is no longer auto-dumped, so this is how an operator
+/// finds it.
+#[test]
+fn format_footer_sidecar_count_line_carries_last_run_hint() {
+    let root = tempfile::TempDir::new().unwrap();
+    let run = root.path().join("7.1.0-abc1234");
+    std::fs::create_dir(&run).unwrap();
+    write_sidecar_fixture(&run, "passed", true, "scx_mitosis", "1n4l4c1t");
+    let out = format_run_artifact_footer(root.path(), std::time::UNIX_EPOCH);
+    assert!(
+        out.contains("1 stats sidecar(s)"),
+        "count line missing: {out}",
+    );
+    assert!(
+        out.contains("cargo ktstr stats last-run"),
+        "sidecar-bearing run must point at `stats last-run`: {out}",
+    );
+}
+
+/// A run that produced only a failure dump (no stats sidecar) reports
+/// `0 stats sidecar(s)` and must NOT carry the `stats last-run` hint —
+/// there is no analysis to point at.
+#[test]
+fn format_footer_no_sidecar_omits_last_run_hint() {
+    let root = tempfile::TempDir::new().unwrap();
+    let run = root.path().join("7.1.0-abc1234");
+    std::fs::create_dir(&run).unwrap();
+    std::fs::write(run.join("load_fail.failure-dump.json"), b"{}").unwrap();
+    let out = format_run_artifact_footer(root.path(), std::time::UNIX_EPOCH);
+    assert!(
+        out.contains("0 stats sidecar(s)"),
+        "count line missing: {out}",
+    );
+    assert!(
+        !out.contains("stats last-run"),
+        "a dump-only run has no analysis — must omit the hint: {out}",
+    );
+}
+
 // -- host-skip block rendering (Task: host-topology skips) --
 
 #[test]
 fn render_host_skips_groups_by_class_with_counts_and_names() {
-    // Two classes; topology_insufficient has two tests, resource
-    // contention one. Rendered one line per class: "<class> (<n>): a, b".
+    // Two classes; topology_insufficient has two tests,
+    // perf_mode_unavailable one. Rendered one line per class:
+    // "<class> (<n>): a, b".
     let skips = vec![
         ("wide_smp".to_string(), "topology_insufficient".to_string()),
         (
             "big_gauntlet".to_string(),
-            "resource_contention".to_string(),
+            "perf_mode_unavailable".to_string(),
         ),
         ("fat_llc".to_string(), "topology_insufficient".to_string()),
     ];
@@ -3476,7 +3530,7 @@ fn render_host_skips_groups_by_class_with_counts_and_names() {
         "grouped class line missing/wrong: {out}"
     );
     assert!(
-        out.contains("resource_contention (1): big_gauntlet"),
+        out.contains("perf_mode_unavailable (1): big_gauntlet"),
         "{out}"
     );
     // Exactly one line per class (plus the header).

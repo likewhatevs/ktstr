@@ -15,7 +15,8 @@
 //! measurement (the second e2e below).
 //!
 //! The gate is the FRAMEWORK INVARIANT: the taobench workload boots, runs its
-//! topology end-to-end, and emits its per-phase `taobench_total_qps` metric --
+//! topology end-to-end, and emits its per-phase
+//! `taobench_total_ops_per_cpu_sec` metric --
 //! proof the cache served ops, the slow-miss path filled + woke clients, and the
 //! per-phase op counts reduced through the metric API into a `PhaseBucket`. It does
 //! NOT gate on absolute qps (scx-ktstr is a fixture, not a performance scheduler);
@@ -38,21 +39,20 @@ use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const TAO_SCX: Scheduler = Scheduler::named("tao_scx").binary(SchedulerSpec::Discover("scx-ktstr"));
 
-/// The per-phase metric the taobench run must emit: total throughput (qps). Its
+/// The per-phase metric the taobench run must emit: total CPU throughput. Its
 /// presence proves the engine's client / fast-worker / slow-dispatcher topology
 /// ran end-to-end in the VM and the per-phase op counts reduced through the metric
-/// API. Present iff the phase had a measured wall window -- always true for a run
-/// that served any ops.
-const QPS_METRIC: &str = "taobench_total_qps";
+/// API. Present iff client CPU time was measured.
+const THROUGHPUT_METRIC: &str = "taobench_total_ops_per_cpu_sec";
 
 /// post_vm: the framework-invariant gate. The taobench workload produced its
-/// per-phase qps -- proves the cache + fast/slow tiers ran to completion in the
+/// per-phase CPU throughput -- proves the cache + fast/slow tiers ran to completion in the
 /// guest (no deadlock, no panic, no stats-plumbing break).
 fn assert_taobench_workload_ran(result: &VmResult) -> Result<()> {
     let phase = Phase::step(0); // the lone hold step (step_index 1)
     anyhow::ensure!(
-        result.phase_metric(phase, QPS_METRIC).is_some(),
-        "taobench phase produced no {QPS_METRIC} -- the taobench workload did not run"
+        result.phase_metric(phase, THROUGHPUT_METRIC).is_some(),
+        "taobench phase produced no {THROUGHPUT_METRIC} -- the taobench workload did not run"
     );
     Ok(())
 }
@@ -106,14 +106,14 @@ fn taobench_runs_in_vm(ctx: &Ctx) -> Result<AssertResult> {
 /// through the metric API into the phase bucket.
 const SERVE_P99_METRIC: &str = "taobench_serve_p99_us";
 
-/// post_vm for the open-loop variant: the qps gate (the workload ran) PLUS the
+/// post_vm for the open-loop variant: the throughput gate (the workload ran) PLUS the
 /// serve-latency gate (the coordinated-omission path produced its p99). The latter
 /// is the open-loop-specific invariant -- absent in the closed-loop run above.
 fn assert_taobench_open_loop_ran(result: &VmResult) -> Result<()> {
     let phase = Phase::step(0); // the lone hold step
     anyhow::ensure!(
-        result.phase_metric(phase, QPS_METRIC).is_some(),
-        "open-loop taobench phase produced no {QPS_METRIC} -- the workload did not run"
+        result.phase_metric(phase, THROUGHPUT_METRIC).is_some(),
+        "open-loop taobench phase produced no {THROUGHPUT_METRIC} -- the workload did not run"
     );
     anyhow::ensure!(
         result.phase_metric(phase, SERVE_P99_METRIC).is_some(),

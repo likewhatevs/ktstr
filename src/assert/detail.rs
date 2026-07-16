@@ -114,6 +114,16 @@ pub enum DetailKind {
     Skip,
     /// Uncategorized — falls through when a detail has no specific kind.
     Other,
+    /// Performance-mode host-isolation fault: a `performance_mode` cell's
+    /// Body-phase dilation `D` exceeded the perf-isolation ceiling
+    /// (`PERF_ISOLATION_D_MAX`, in `vmm::freeze_coord::latency_verdict`),
+    /// so its 1:1-pinned vCPUs lost their dedicated host CPUs. Recorded
+    /// HOST-side at the eval seam (never crosses the guest→host wire), so
+    /// its postcard variant index is unobserved; still appended LAST to
+    /// preserve the append-only wire ordering the other variants rely on.
+    /// This is an infra/isolation fault (the run's timing verdicts are
+    /// untrustworthy), NOT a scheduler-under-test fault.
+    PerfIsolation,
 }
 
 /// Message prefix emitted by every scenario-runner site that
@@ -215,6 +225,34 @@ pub(crate) fn format_sched_died_survives_storm() -> String {
     )
 }
 
+/// Structured wall-latency-gate evidence carried on a failing
+/// [`AssertDetail`] so the host-side seam can re-run the
+/// contention-aware tri-state verdict (the `latency_verdict` core in
+/// `vmm::freeze_coord`).
+///
+/// The wall-latency ceilings fire IN-GUEST (`assert_benchmarks` runs
+/// inside the VM), but the per-phase contention witness — the Body
+/// dilation `D` and the peak-window host-contention series that bound
+/// `W(measured)` — is measured HOST-side (in `vmm::freeze_coord`) and is
+/// not available where the gate tripped. This struct rides the failing
+/// detail across the wire so the host can pair the guest's `measured_ns`
+/// / `threshold_ns` with its own witness and decide Pass / FailConfirmed
+/// / ContentionIndeterminate.
+///
+/// Set ONLY on ns-denominated latency ceilings where the tri-state is
+/// sound (`max_p99_wake_latency_ns`): the p99 exemplar is a single
+/// guest-wall interval whose contamination `W` bounds. NOT set on the CV
+/// or off-CPU-spread gates — those are dimensionless (a ratio / a
+/// percentage), not ns intervals, so the ns-denominated `W` bound cannot
+/// score them; they stay annotate-only via `dilation_annotation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LatencyGate {
+    /// The guest-measured wall-latency exemplar that tripped the gate (ns).
+    pub measured_ns: u64,
+    /// The ceiling it exceeded (ns).
+    pub threshold_ns: u64,
+}
+
 /// A single diagnostic message from an assertion, paired with a
 /// structural [`DetailKind`] so filtering is robust to wording changes.
 ///
@@ -227,6 +265,20 @@ pub(crate) fn format_sched_died_survives_storm() -> String {
 pub struct AssertDetail {
     pub kind: DetailKind,
     pub message: String,
+    /// Structured wall-latency-gate evidence for the host contention
+    /// seam ([`LatencyGate`]); `None` on every detail that is not an
+    /// in-scope ns-latency-ceiling failure. Stamped at the gate site via
+    /// [`Self::with_latency_gate`].
+    ///
+    /// `#[serde(default)]` keeps sidecar JSON written before this field
+    /// existed readable (an absent field deserializes to `None`). NO
+    /// `skip_serializing_if`: [`AssertDetail`] crosses the guest→host
+    /// boundary via postcard, which is not self-describing and always
+    /// expects every field in declaration order — a conditionally-elided
+    /// field would desync the decoder. The `Option` is encoded as its
+    /// 1-byte tag either way, matching the sibling `phase` field.
+    #[serde(default)]
+    pub latency_gate: Option<LatencyGate>,
     /// Scenario phase the detail was emitted under. Mirrors
     /// [`PassDetail::phase`]: `None` outside any [`PhaseGuard`] scope
     /// (boot, BASELINE settle, non-scenario test fixtures), `Some`
@@ -250,7 +302,24 @@ impl AssertDetail {
             kind,
             message: message.into(),
             phase: current_phase_label(),
+            latency_gate: None,
         }
+    }
+
+    /// Builder-style setter for [`Self::latency_gate`]. Consumes self,
+    /// attaches the guest-measured `measured_ns` / `threshold_ns` so the
+    /// host seam can re-run the contention-aware tri-state verdict, and
+    /// returns the updated detail. Chain at the ns-latency-ceiling gate
+    /// sites: `AssertDetail::new(Benchmark, msg).with_latency_gate(p99,
+    /// limit)`. Only the in-scope wall-latency ceilings set this — see
+    /// [`LatencyGate`] for why CV / spread do not.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_latency_gate(mut self, measured_ns: u64, threshold_ns: u64) -> Self {
+        self.latency_gate = Some(LatencyGate {
+            measured_ns,
+            threshold_ns,
+        });
+        self
     }
 
     /// Builder-style setter for [`Self::phase`]. Consumes self,

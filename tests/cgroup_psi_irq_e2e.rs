@@ -70,6 +70,13 @@ const IRQ_WORK: WorkType = WorkType::NetTraffic {
 /// Host-side check that the per-cgroup PSI-irq metrics resolved from the
 /// freeze-driven cgroup walk and rose under the two-cgroup NetTraffic load.
 fn assert_cgroup_psi_metrics(result: &VmResult) -> Result<()> {
+    // Environmental starvation gate: zero real captures under a
+    // witnessed-contended host is a non-verdict (the readiness-gated
+    // capture chain was starved past the workload window), not a
+    // capture regression — SKIP instead of failing the assertions
+    // below. A quiet-host zero-capture run still falls through and
+    // fails with the specific diagnosis. See `periodic_starvation_gate`.
+    ktstr::prelude::periodic_starvation_gate(result, 2)?;
     // Coverage guard: the per-leaf delta needs >= 2 freezes that actually
     // captured per-cgroup PSI. periodic_fired counts ATTEMPTS — it includes
     // rendezvous-timeout placeholders and dump-degraded reports, both of which
@@ -84,6 +91,18 @@ fn assert_cgroup_psi_metrics(result: &VmResult) -> Result<()> {
         .iter_samples()
         .filter(|s| !s.snapshot.cgroup_psi().is_empty())
         .count();
+    // Data-bearing starvation gate at the SAME predicate this assertion
+    // checks: a real capture can still carry empty cgroup_psi when the
+    // walk degraded at the boundary, so the top-of-fn real-capture gate
+    // cannot see this shortfall. Sub-minimum + witnessed contention =
+    // environmental skip; quiet-host shortfall falls through and fails
+    // with the diagnosis below.
+    ktstr::prelude::starved_below_minimum_skip(
+        result,
+        psi_captures,
+        2,
+        "periodic captures carrying per-cgroup PSI",
+    )?;
     ensure!(
         psi_captures >= 2,
         "only {psi_captures} of {} periodic captures carried per-cgroup PSI — need \

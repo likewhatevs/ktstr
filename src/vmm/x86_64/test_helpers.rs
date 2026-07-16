@@ -23,6 +23,7 @@ pub(super) fn single_vcpu_kvm() -> KtstrKvm {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     KtstrKvm::new(topo, 64, false).unwrap()
 }

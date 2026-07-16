@@ -868,7 +868,7 @@ impl MetricCheck {
     /// // The typed checks compose into a `const` table — exactly the
     /// // `&'static [MetricCheck]` a `Payload` carries in `default_checks`:
     /// const CHECKS: &[MetricCheck] = &[
-    ///     MetricCheck::min_builtin(BuiltinMetric::TaobenchTotalQps, 1000.0),
+    ///     MetricCheck::min_builtin(BuiltinMetric::TaobenchTotalOpsPerCpuSec, 1000.0),
     ///     MetricCheck::exists_builtin(BuiltinMetric::SchbenchLoopCount),
     /// ];
     /// assert_eq!(CHECKS.len(), 2);
@@ -1031,16 +1031,16 @@ mod tests {
         // The typed const constructors store the same wire name as the &str
         // form, so a built-in payload check is typo-proof without changing the
         // stored key. (MetricCheck is Copy, not PartialEq, so match on the arm.)
-        match MetricCheck::min_builtin(BuiltinMetric::TaobenchTotalQps, 1000.0) {
+        match MetricCheck::min_builtin(BuiltinMetric::TaobenchTotalOpsPerCpuSec, 1000.0) {
             MetricCheck::Min { metric, value } => {
-                assert_eq!(metric, "taobench_total_qps");
+                assert_eq!(metric, "taobench_total_ops_per_cpu_sec");
                 assert_eq!(value, 1000.0);
             }
             other => panic!("min_builtin must produce Min, got {other:?}"),
         }
-        match MetricCheck::max_builtin(BuiltinMetric::TaobenchSlowQps, 5.0) {
+        match MetricCheck::max_builtin(BuiltinMetric::TaobenchSlowOpsPerCpuSec, 5.0) {
             MetricCheck::Max { metric, value } => {
-                assert_eq!(metric, "taobench_slow_qps");
+                assert_eq!(metric, "taobench_slow_ops_per_cpu_sec");
                 assert_eq!(value, 5.0);
             }
             other => panic!("max_builtin must produce Max, got {other:?}"),
@@ -1067,8 +1067,8 @@ mod tests {
         // `const fn` buys) and documents the intended usage: a typo-proof
         // default_checks table built from BuiltinMetric variants, not bare strings.
         const CHECKS: &[MetricCheck] = &[
-            MetricCheck::min_builtin(BuiltinMetric::TaobenchTotalQps, 1000.0),
-            MetricCheck::max_builtin(BuiltinMetric::TaobenchSlowQps, 5.0),
+            MetricCheck::min_builtin(BuiltinMetric::TaobenchTotalOpsPerCpuSec, 1000.0),
+            MetricCheck::max_builtin(BuiltinMetric::TaobenchSlowOpsPerCpuSec, 5.0),
             MetricCheck::range_builtin(BuiltinMetric::WakeupP99LatencyUs, 1.0, 2.0),
             MetricCheck::exists_builtin(BuiltinMetric::SchbenchLoopCount),
         ];
@@ -1077,14 +1077,14 @@ mod tests {
         assert!(matches!(
             CHECKS[0],
             MetricCheck::Min {
-                metric: "taobench_total_qps",
+                metric: "taobench_total_ops_per_cpu_sec",
                 ..
             }
         ));
         assert!(matches!(
             CHECKS[1],
             MetricCheck::Max {
-                metric: "taobench_slow_qps",
+                metric: "taobench_slow_ops_per_cpu_sec",
                 ..
             }
         ));

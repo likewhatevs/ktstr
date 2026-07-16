@@ -8,9 +8,10 @@
 //! `KVM_CREATE_VM`.
 //!
 //! Outputs flow through [`super::host_topology::ResourceContention`]
-//! so the `#[ktstr_test]` macro layer can SKIP-skip cleanly on a
-//! transient errno without conflating the skip with a real test
-//! failure.
+//! so the `#[ktstr_test]` macro layer classifies a transient errno as
+//! a RETRYABLE failure (nextest re-runs the cell once the pressure
+//! clears) with a diagnostic that names the transient cause — never a
+//! skip and never conflated with a real test failure.
 
 use anyhow::Result;
 use std::time::Duration;
@@ -45,7 +46,8 @@ pub(crate) const KVM_CREATE_VM_EINTR_DELAYS: [Duration; 8] = [
 /// [`map_transient_to_contention`] to convert KVM ioctl failures
 /// into [`host_topology::ResourceContention`] so the
 /// `#[ktstr_test]` macro can route them through the canonical
-/// SKIP-on-contention path instead of panicking the test.
+/// retryable-contention path (a typed, nextest-retried failure)
+/// instead of panicking the test with an unclassified fault.
 ///
 /// - `ENOMEM` — kernel memory allocator could not satisfy a
 ///   GuestMemoryMmap region or KVM internal table allocation.
@@ -75,10 +77,10 @@ pub(crate) const TRANSIENT_HOST_ERRNOS: &[i32] = &[
 /// fanned out to separate string-format and substring-parse paths:
 ///
 /// 1. **Diagnostic banner**: callers embed `{snapshot}` into a
-///    `ResourceContention.reason` so the operator's SKIP banner names
+///    `ResourceContention.reason` so the operator's contention banner names
 ///    `fds=...`, `vmrss=...`, `threads=...`, `near_limit=...`. The
 ///    [`std::fmt::Display`] impl produces the same single-line format the
-///    SKIP banner has always carried, so banner readers and stats
+///    contention banner has always carried, so banner readers and stats
 ///    tooling that grep for these tokens stay backward-compatible.
 /// 2. **Bypass gate**: [`map_transient_to_contention`] reads
 ///    `snapshot.near_limit` directly — a real `bool` field — instead
@@ -112,7 +114,7 @@ impl std::fmt::Display for HostResourceSnapshot {
     /// Single-line diagnostic format embedded in
     /// `ResourceContention.reason` strings. The shape
     /// (`fds=N, vmrss=X, threads=Y, near_limit=B`) is parsed by
-    /// stats tooling reading SKIP banners — pinned by
+    /// stats tooling reading contention banners — pinned by
     /// `host_resource_snapshot_emits_all_keys` and
     /// `host_resource_snapshot_near_limit_is_boolean`. The bypass
     /// gate does NOT consume this string — it reads
@@ -141,7 +143,7 @@ impl std::fmt::Display for HostResourceSnapshot {
 ///
 /// All reads are best-effort: a missing field or unreadable file
 /// folds into `<unknown>` rather than failing the snapshot. The
-/// snapshot exists to give an operator hitting a SKIP banner one
+/// snapshot exists to give an operator hitting a contention banner one
 /// place to start triaging — current resource USAGE (`fds=1023`,
 /// `threads=42`) plus a binary `near_limit` indicator is enough
 /// to distinguish "test hit a host cap" from "kernel had a real
@@ -151,7 +153,7 @@ impl std::fmt::Display for HostResourceSnapshot {
 ///
 /// Returns a [`HostResourceSnapshot`] struct: callers that need the
 /// diagnostic string format embed `{snapshot}` (using the
-/// [`std::fmt::Display`] impl — same format the SKIP banner has
+/// [`std::fmt::Display`] impl — same format the contention banner has
 /// always carried). [`map_transient_to_contention`]'s
 /// `KTSTR_CONTENTION_BYPASS` gate reads
 /// [`HostResourceSnapshot::near_limit`] directly — no substring
@@ -162,7 +164,7 @@ impl std::fmt::Display for HostResourceSnapshot {
 ///
 /// Earlier revisions echoed the `RLIMIT_NOFILE` soft cap and
 /// `RLIMIT_NPROC` soft cap directly. Those values are
-/// host-specific fingerprints that the SKIP banner surfaces into
+/// host-specific fingerprints that the contention banner surfaces into
 /// every CI artifact, sidecar, and user-visible test log. The
 /// operator already knows their host config; the banner does not
 /// need to echo it back. The `near_limit` indicator (computed at
@@ -256,8 +258,8 @@ pub(crate) fn host_resource_snapshot() -> HostResourceSnapshot {
 ///
 /// The contention reason embeds the original errno name and the
 /// caller-supplied context (e.g. `"create VM"` or
-/// `"set TSS address"`) so the `ktstr: SKIP: resource contention:
-/// ...` banner names the exact ioctl that failed and the
+/// `"set TSS address"`) so the `ktstr: FAIL: transient resource
+/// contention: ...` banner names the exact ioctl that failed and the
 /// host-resource snapshot points the operator at the actionable
 /// limit. Non-transient errors (EINVAL, ENOSYS, EPERM, etc.) flow
 /// through unchanged so a real bug never gets misclassified as
@@ -276,8 +278,9 @@ pub(crate) fn host_resource_snapshot() -> HostResourceSnapshot {
 /// - `ENOMEM` — typically host memory pressure (a peer holding
 ///   guest mappings), but the kernel can also return ENOMEM from
 ///   a page allocator leak, a stuck slab cache, or a permanently-
-///   exhausted memory cgroup. SKIP-classifying those silently
-///   masks the regression instead of surfacing it.
+///   exhausted memory cgroup. Contention-classifying those defers
+///   the regression to the end of the retry budget instead of
+///   surfacing it on the first hit.
 /// - `EBUSY` — typically a device-fd or memslot held by a peer,
 ///   but a stuck virtqueue, an unbalanced refcount on a kernel
 ///   object, or a kernel-side state-machine lockup also returns
@@ -287,23 +290,22 @@ pub(crate) fn host_resource_snapshot() -> HostResourceSnapshot {
 ///   the host is otherwise idle.
 /// - `EAGAIN` — defensively included but rarely returned by KVM
 ///   init ioctls; a genuine `EAGAIN` from a kernel subsystem that
-///   never recovers (e.g. a deadlocked workqueue) would also SKIP
-///   on every retry.
+///   never recovers (e.g. a deadlocked workqueue) would also
+///   classify as contention on every retry.
 ///
-/// The classifier accepts these false positives because the
-/// alternative — letting transient host pressure surface as a
-/// hard failure on every CI run — is much worse: every parallel
-/// test slot would fail at once, the SKIP banner would never
-/// fire, and stats tooling would record runner-incompatibility as
-/// product regressions. The cost is that a real kernel bug
-/// matching one of these errnos gets quietly skipped on the
-/// affected test slot until the operator notices the SKIP rate
-/// rising.
+/// The classifier accepts these false positives because the typed
+/// contention verdict is what routes the failure to nextest's retry
+/// budget with a host-pressure diagnostic: genuine transient
+/// pressure clears and a retry passes, while a persistent kernel
+/// bug matching one of these errnos exhausts the retries and fails
+/// the run with the contention banner (mislabelled as pressure, but
+/// visible — never silently dropped).
 ///
-/// The false-positive cost is bounded by [`host_resource_snapshot`]'s
+/// The false-positive labelling cost is bounded by
+/// [`host_resource_snapshot`]'s
 /// `near_limit` flag — operators can grep for `near_limit=false` +
-/// sustained SKIPs to catch a kernel-side regression that the
-/// classifier silently masks. The classifier exposes an opt-in
+/// persistent contention failures to catch a kernel-side regression
+/// hiding behind the pressure framing. The classifier exposes an opt-in
 /// `near_limit`-gated bypass: when `KTSTR_CONTENTION_BYPASS=1` is
 /// set in the environment AND the snapshot reports
 /// `near_limit=false`, the underlying error is surfaced as a hard
@@ -314,8 +316,9 @@ pub(crate) fn host_resource_snapshot() -> HostResourceSnapshot {
 ///
 /// Default-off behaviour: with the env var unset, every transient
 /// errno classifies as `ResourceContention` exactly as before. The
-/// bypass changes observable test outcomes (currently-SKIPped tests
-/// would FAIL), so it must remain opt-in until the operator has run
+/// bypass changes observable test outcomes (a retried-then-passing
+/// transient would instead hard-fail on the first hit), so it must
+/// remain opt-in until the operator has run
 /// a soak window confirming their `near_limit` snapshot is reliable
 /// on the host.
 ///
@@ -325,8 +328,8 @@ pub(crate) fn host_resource_snapshot() -> HostResourceSnapshot {
 ///   host pressured retroactively. The per-thread atomic
 ///   `/proc/self/status` reads bound the inconsistency to a single
 ///   iteration, well within the macro-layer retry budget — but the
-///   risk is that a genuine peer-contention SKIP arrives as a hard
-///   failure on a freshly-drained host. Bypass-on is the
+///   risk is that genuine peer contention arrives as an unretried
+///   hard failure on a freshly-drained host. Bypass-on is the
 ///   "investigate kernel-side regressions aggressively" mode; leave
 ///   it off in steady-state CI.
 /// - The bypass treats every transient errno uniformly. EMFILE /
@@ -334,7 +337,8 @@ pub(crate) fn host_resource_snapshot() -> HostResourceSnapshot {
 ///   so a `near_limit=false` snapshot that reports them means the
 ///   snapshot itself is racy — surfacing them as hard errors lets
 ///   the operator catch an inconsistent snapshot rather than
-///   silently SKIP-skipping. EAGAIN / ENOMEM / EBUSY can each be
+///   quietly absorbing it into the retry budget. EAGAIN / ENOMEM /
+///   EBUSY can each be
 ///   either contention or kernel bugs, and the bypass routes them
 ///   the same way.
 ///
@@ -372,7 +376,8 @@ pub(crate) fn map_transient_to_contention(
         //
         // Default-off: the existing classifier behaviour is preserved
         // unless the operator opts in. The bypass changes observable
-        // test outcomes (currently-SKIPped tests would FAIL) so it
+        // test outcomes (a retried-then-passing transient would
+        // instead hard-fail on the first hit) so it
         // must remain opt-in until the operator has run a soak window
         // confirming their `near_limit` snapshot is reliable on the
         // host.
@@ -398,9 +403,10 @@ pub(crate) fn map_transient_to_contention(
             reason: format!(
                 "{context}: transient KVM errno {errno} ({}): host resources: {snapshot}\n  \
                  hint: KVM ioctl failed with a host-resource errno; another peer may be \
-                 holding the budget. nextest will not retry; the SKIP banner records this \
-                 attempt for stats tooling.\n  \
-                 hint: if `near_limit=false` in the snapshot above and SKIPs persist \
+                 holding the budget. nextest retries the cell; if the pressure has \
+                 cleared, the retry passes.\n  \
+                 hint: if `near_limit=false` in the snapshot above and the failures \
+                 persist \
                  across runs, the errno is likely a kernel-side regression (leak / stuck \
                  device / cgroup-exhausted state) — check `dmesg` for the affected \
                  subsystem rather than retrying the test, or set \
@@ -457,7 +463,7 @@ pub(crate) fn errno_name(errno: i32) -> std::borrow::Cow<'static, str> {
 /// Build the [`host_topology::ResourceContention`] error returned
 /// from [`create_vm_with_retry`] when the EINTR retry budget is
 /// exhausted. Factored out so the format (which appears in the
-/// SKIP banner and is parsed by stats tooling for skip
+/// contention banner and is parsed by stats tooling for
 /// classification) can be pinned by a unit test without the test
 /// having to actually drive the ioctl through a sustained signal
 /// storm.
@@ -471,8 +477,8 @@ fn eintr_exhausted_contention() -> anyhow::Error {
              signal pressure on the host. host resources: {snapshot}\n  \
              hint: a peer process is firing realtime / SIGRTMIN \
              signals at a rate that out-paces the EINTR backoff \
-             schedule. nextest will not retry; the SKIP banner \
-             records this attempt for stats tooling.",
+             schedule. nextest retries the cell; the retry passes \
+             once the signal storm subsides.",
             n = KVM_CREATE_VM_EINTR_DELAYS.len(),
             total_ms = total_delay.as_millis(),
         ),
@@ -488,7 +494,8 @@ fn eintr_exhausted_contention() -> anyhow::Error {
 /// host-resource pressure (`ENOMEM`, `EMFILE`, `ENFILE`, `EBUSY`,
 /// `EAGAIN`), where the right answer is to surface a
 /// [`host_topology::ResourceContention`] so the `#[ktstr_test]`
-/// macro can SKIP-skip cleanly. Anything else (`EINVAL`, `ENOSYS`,
+/// macro routes it to the retryable-contention verdict (nextest
+/// re-runs it). Anything else (`EINVAL`, `ENOSYS`,
 /// `EPERM`, …) is a real fault; surface it as a regular error so
 /// nextest fails the test loudly.
 ///
@@ -507,8 +514,8 @@ fn eintr_exhausted_contention() -> anyhow::Error {
 /// rate that walks faster than the backoff schedule can absorb.
 /// That is a transient host condition, not a kernel fault, so it
 /// classifies as [`host_topology::ResourceContention`] — the
-/// `#[ktstr_test]` macro then SKIPs cleanly and stats tooling
-/// records the skip via the sidecar. Without this branch, the
+/// `#[ktstr_test]` macro routes it to the retryable-contention
+/// verdict (nextest re-runs it). Without this branch, the
 /// terminal EINTR fell through `map_transient_to_contention`
 /// (which doesn't recognize EINTR as transient) and surfaced as a
 /// hard error — every co-located test failed loudly during a CI
@@ -532,8 +539,8 @@ pub(crate) fn create_vm_with_retry(kvm: &kvm_ioctls::Kvm) -> Result<kvm_ioctls::
                 // Exhausted the EINTR retry budget; sustained
                 // signal pressure is a transient host condition,
                 // not a kernel fault. Surface as
-                // ResourceContention so the macro layer SKIPs
-                // cleanly instead of letting EINTR fall through
+                // ResourceContention for the retryable-contention
+                // verdict instead of letting EINTR fall through
                 // `map_transient_to_contention` (which doesn't
                 // include EINTR in `TRANSIENT_HOST_ERRNOS` because
                 // the routine retry path covers the common case).
@@ -550,7 +557,7 @@ mod tests {
 
     /// `host_resource_snapshot`'s [`std::fmt::Display`] impl must produce a
     /// single-line string naming the four key fields the operator
-    /// needs when triaging a `ktstr: SKIP: resource contention:
+    /// needs when triaging a `ktstr: FAIL: transient resource contention:
     /// ...` banner: open-fd count, RSS, thread count, and a
     /// `near_limit` indicator that summarises "are we close to
     /// RLIMIT_NOFILE / RLIMIT_NPROC?" without echoing the cap value
@@ -577,7 +584,7 @@ mod tests {
 
     /// `host_resource_snapshot`'s rendered string must NOT echo raw
     /// RLIMIT_NOFILE / RLIMIT_NPROC values. Those are host-specific
-    /// fingerprints that the SKIP banner surfaces into every CI
+    /// fingerprints that the contention banner surfaces into every CI
     /// artifact and user-visible test log — leaking them lets a
     /// third party reading a public failure dump infer host config.
     /// The `near_limit` derived flag preserves the actionable
@@ -649,7 +656,7 @@ mod tests {
 
     /// Display formatting on a constructed snapshot pins the exact
     /// `fds=N, vmrss=X, threads=Y, near_limit=B` shape that stats
-    /// tooling parses out of SKIP banners. A struct constructor
+    /// tooling parses out of contention banners. A struct constructor
     /// gives the test deterministic values; the runtime
     /// `host_resource_snapshot()` reads vary by host.
     #[test]
@@ -679,7 +686,7 @@ mod tests {
     /// `map_transient_to_contention` must classify the documented
     /// transient errnos (ENOMEM, EMFILE, ENFILE, EBUSY, EAGAIN) as
     /// `ResourceContention` so the macro's contention arm fires
-    /// and the test SKIPs cleanly. Asserts the result downcasts
+    /// the retryable-contention verdict. Asserts the result downcasts
     /// AND that the rendered banner includes the caller-supplied
     /// context plus the errno name and the host-resource snapshot.
     #[test]
@@ -723,12 +730,12 @@ mod tests {
 
     /// Non-transient errnos (EINVAL, ENOSYS, EPERM, EACCES) MUST
     /// flow through unchanged so a real KVM bug never gets
-    /// misclassified as a recoverable SKIP. Pins the negative
+    /// misclassified as recoverable contention. Pins the negative
     /// case: the result must NOT downcast to
     /// `ResourceContention`. The kernel returning EINVAL from
     /// `KVM_CREATE_VM` would mean a programming fault (wrong
-    /// kvm_xen_hvm_config layout, etc.); SKIP-skipping it would
-    /// hide the bug from the test report.
+    /// kvm_xen_hvm_config layout, etc.); contention-classifying it
+    /// would defer the bug behind the retry budget.
     #[test]
     fn map_transient_to_contention_passes_through_hard_errors() {
         for &errno in &[libc::EINVAL, libc::ENOSYS, libc::EPERM, libc::EACCES] {
@@ -753,8 +760,8 @@ mod tests {
     /// EINTR is NOT in `TRANSIENT_HOST_ERRNOS` because the routine
     /// retry loop in `create_vm_with_retry` covers the common
     /// case. Pins that contract: passing EINTR through
-    /// `map_transient_to_contention` directly would silently
-    /// SKIP every test on a single signal interruption — the
+    /// `map_transient_to_contention` directly would classify
+    /// every single signal interruption as contention — the
     /// retry loop's whole reason to exist. The EINTR-exhausted
     /// path uses the dedicated `eintr_exhausted_contention`
     /// helper instead, asserted in the test below.
@@ -776,8 +783,9 @@ mod tests {
     /// `map_transient_to_contention` is the routing layer that
     /// `set_user_memory_region` (in [`super::numa_mem`]) wraps
     /// every memslot install through; the wrap was added so kernel-
-    /// side ENOMEM during region setup classifies as a clean SKIP
-    /// instead of a hard test failure. Pins the routing contract:
+    /// side ENOMEM during region setup classifies as retryable
+    /// contention instead of an unclassified hard failure. Pins the
+    /// routing contract:
     /// every errno in `TRANSIENT_HOST_ERRNOS` produces a
     /// `ResourceContention`, and a non-transient errno (`EINVAL`,
     /// the canonical "you handed me a bad memslot layout" return)
@@ -830,7 +838,7 @@ mod tests {
         }
         // EINVAL is the canonical "bad memslot layout" return — a
         // real layout bug must surface as a hard error so the
-        // operator sees the regression rather than a silent SKIP.
+        // operator sees the regression, not a contention verdict.
         let kvm_err = kvm_ioctls::Error::new(libc::EINVAL);
         let mapped = map_transient_to_contention(kvm_err, "set_user_memory_region");
         assert!(
@@ -839,7 +847,7 @@ mod tests {
                 .is_none(),
             "EINVAL from set_user_memory_region must NOT classify as \
              ResourceContention — bad memslot layout is a programming \
-             fault that SKIP-skipping would hide; got: {mapped:#}",
+             fault a contention verdict would obscure; got: {mapped:#}",
         );
     }
 
@@ -849,7 +857,7 @@ mod tests {
     /// `ResourceContention`. The opt-in exists so an operator
     /// hunting kernel-side regressions (a leak / stuck device that
     /// shares a transient errno with peer contention) can see the
-    /// failure instead of having it SKIP-skipped.
+    /// failure immediately instead of after the retry budget.
     ///
     /// Default-off behaviour is pinned by the
     /// `map_transient_to_contention_classifies_enomem` test above
@@ -1012,7 +1020,7 @@ mod tests {
 
     /// `errno_name` falls through to a `errno=<raw>` rendering for
     /// values not in its mapped table — so an operator looking at
-    /// the SKIP banner can grep for the exact integer instead of
+    /// the contention banner can grep for the exact integer instead of
     /// seeing a useless `<other>`. Pins the fallthrough format
     /// against a regression that goes back to the static `<other>`.
     #[test]

@@ -19,8 +19,8 @@ use super::btf_offsets::{
     SchedstatOffsets, ScxEventOffsets, resolve_map_field_offset_width,
 };
 use super::{
-    BpfMapFieldSample, CpuSnapshot, Kva, MonitorSample, RqSchedstat, SchedDomainSnapshot,
-    SchedDomainStats, ScxEventCounters,
+    BpfMapFieldSample, CpuSnapshot, Kva, MonitorSample, ProgressLedger, RqSchedstat,
+    SchedDomainSnapshot, SchedDomainStats, ScxEventCounters,
 };
 use crate::sync::MutexExt;
 
@@ -1643,6 +1643,10 @@ pub(crate) struct VcpuTiming {
     /// pthread_t handles for each vCPU, indexed by vCPU ID.
     /// Used with `pthread_getcpuclockid()` + `clock_gettime()`.
     pub pthreads: Vec<libc::pthread_t>,
+    /// Shared contention recorder. The monitor only feeds its O(1) CPU-PSI
+    /// interval sampler; lifecycle dispatch owns the rare O(vCPU) schedstat
+    /// boundary snapshots. `None` in pthread-clock-only unit fixtures.
+    pub contention_recorder: Option<Arc<crate::vmm::freeze_coord::ContentionWitnessRecorder>>,
 }
 
 impl VcpuTiming {
@@ -1852,9 +1856,37 @@ pub(crate) struct DumpTrigger {
 /// later samples observe real values once the guest has booted
 /// past percpu setup.
 pub(crate) struct RqRefresh {
-    /// PA of the kernel's `__per_cpu_offset[]` array. Read each
-    /// iteration via [`super::symbols::read_per_cpu_offsets`].
-    pub pco_pa: u64,
+    /// Link-time KVA of the kernel's `__per_cpu_offset[]` array. The
+    /// PA to read from is recomputed EVERY sample iteration as
+    /// `text_kva_to_pa_with_base(per_cpu_offset_kva, start_kernel_map,
+    /// phys_base)`, where `start_kernel_map` is re-derived per tick
+    /// from [`Self::tcr_el1`] (see that field). It is NOT baked once
+    /// at construction for the same reason [`Self::kaslr_offset`] is
+    /// not: on aarch64 the kernel-image base (`KIMAGE_VADDR`) is a
+    /// FUNCTION of `TCR_EL1.T1SZ`/`TG1`, and the BSP loop's lazy
+    /// `tcr_el1_cache` CAS can fire AFTER the monitor thread resolves
+    /// its one-shot `start_kernel_map_for_thread` (which then falls
+    /// back to the 48-bit-VA default). A once-baked PA computed from
+    /// that stale base points the `__per_cpu_offset[]` read at the
+    /// wrong guest PA, every slot reads a silent zero, the bit-63
+    /// `data_valid` latch never fires, and the guest evidence
+    /// channels stay dead for the whole run (`evidence_channels_live`
+    /// false → the progress watchdog degrades to the Tier-3 deadman).
+    /// Re-deriving the base per tick self-heals the moment the guest
+    /// programs `TCR_EL1`, mirroring the kaslr-slide re-read below.
+    /// On x86_64 [`super::symbols::start_kernel_map_for_tcr`] ignores
+    /// `tcr_el1` and returns the compile-time base, so the per-tick
+    /// recompute is a constant and this path is a no-op.
+    pub per_cpu_offset_kva: u64,
+    /// Per-tick source for the aarch64 kernel-image base
+    /// (`KIMAGE_VADDR`). `Some` carries the shared `tcr_el1_cache`
+    /// Arc the BSP run-loop populates lazily; the monitor re-reads it
+    /// each iteration and feeds [`super::symbols::start_kernel_map_for_tcr`]
+    /// to recompute the `__per_cpu_offset[]` read PA (see
+    /// [`Self::per_cpu_offset_kva`]). `None` (x86_64, or when no TCR
+    /// cache is wired) makes the loop fall back to the config's static
+    /// `start_kernel_map`.
+    pub tcr_el1: Option<std::sync::Arc<AtomicU64>>,
     /// KVA of the `runqueues` percpu symbol. Combined with each
     /// CPU's offset to compute the per-CPU rq KVA, then reduced
     /// to a PA via [`super::symbols::kva_to_pa`].
@@ -1879,20 +1911,70 @@ pub(crate) struct RqRefresh {
     /// gates on the raw value being non-zero so a pre-publish sample
     /// never latches garbage PAs.
     pub kaslr_offset: std::sync::Arc<AtomicU64>,
+    /// Shared `+1`-biased guest `phys_base` Arc (`kern_phys_base`),
+    /// **re-read every sample iteration while `data_valid` is
+    /// unlatched**. rust_init (PID 1) reads the authoritative value
+    /// from /proc/iomem and PLAIN-stores it (biased) over KERN_ADDRS;
+    /// the monitor-thread construction path only waits ~10 s for that
+    /// publish and then falls back to a plausibility-gated CR3 walk
+    /// whose result — garbage, or 0 when the walk is rejected — was
+    /// previously latched into every text-mapped PA for the whole
+    /// run. On a slow cold boot (observed: x86_64 6.14 in a 2-CPU
+    /// cgroup) the publish lands AFTER the bounded wait, so the baked
+    /// `phys_base` mis-translates `__per_cpu_offset[]` and
+    /// `page_offset_base` forever, `data_valid` never latches, and
+    /// the evidence channels stay dead (Tier-3 deadman kill). Per-tick
+    /// adoption makes the construction-time value a fast path, never a
+    /// permanent latch: the loop switches to `raw - 1` the instant
+    /// `raw != 0`. The guest's plain KERN_ADDRS store overwrites even
+    /// a fallback-seeded Arc value (the construction path CAS-seeds
+    /// its fallback into this same Arc), so a garbage fallback
+    /// self-heals too. `None` (test path) keeps the config's static
+    /// `phys_base`.
+    pub kern_phys_base: Option<std::sync::Arc<AtomicU64>>,
+    /// Construction-time provenance of [`MonitorConfig::phys_base`]:
+    /// `true` when the guest's KERN_ADDRS publish supplied it inside
+    /// the bounded wait, `false` when it came from the fallback CR3
+    /// walk or stayed 0. Diagnostic-only (surfaced by the pre-latch
+    /// dump so a dead-channel run self-reports which arm produced the
+    /// possibly-bad base).
+    pub phys_base_guest_published: bool,
+    /// Count of KERN_ADDRS frames the coordinator's dispatcher has
+    /// consumed (CRC-valid or not), incremented at the dispatch arm.
+    /// Diagnostic-only, printed by the pre-latch dump: `0` alongside
+    /// `kaslr_raw=0` pins "the guest never sent / the coord never
+    /// consumed the publish" vs a non-zero count pinning "frame
+    /// arrived but a derive gate rejected it" — the discriminator a
+    /// field dead-channel report needs. `None` on the test path.
+    pub kern_addrs_frames: Option<std::sync::Arc<AtomicU64>>,
+    /// Count of KERN_ADDRS frames that failed CRC (a subset of
+    /// [`Self::kern_addrs_frames`]). Same provenance and consumer.
+    pub kern_addrs_crc_bad: Option<std::sync::Arc<AtomicU64>>,
     /// Number of CPUs (entries to read from `__per_cpu_offset[]`).
     pub num_cpus: u32,
-    /// PA of the `page_offset_base` symbol (text-mapped). When
-    /// `Some`, the monitor re-reads `PAGE_OFFSET` each sample so a
-    /// KASLR `CONFIG_RANDOMIZE_MEMORY` value (e.g.
+    /// Link-time KVA of the `page_offset_base` symbol. When `Some`,
+    /// the monitor re-reads `PAGE_OFFSET` each sample so a KASLR
+    /// `CONFIG_RANDOMIZE_MEMORY` value (e.g.
     /// `0xff11_0000_0000_0000`) replaces the
     /// [`super::symbols::DEFAULT_PAGE_OFFSET`] fallback once the
     /// guest kernel finishes randomization (which happens after
     /// the host monitor thread spawns — the same boot race that
-    /// motivates the `__per_cpu_offset[]` refresh). When `None`
-    /// (or when the read returns zero / fails the bit-63 check),
-    /// the per-iteration code keeps using the pre-loop resolved
-    /// `page_offset` value.
-    pub page_offset_base_pa: Option<u64>,
+    /// motivates the `__per_cpu_offset[]` refresh). The read PA is
+    /// recomputed per tick from this KVA + the live kernel-image
+    /// base + the live `phys_base` — baking the PA once at
+    /// construction would freeze a stale/garbage `phys_base` into
+    /// it (see [`Self::per_cpu_offset_kva`] and
+    /// [`Self::kern_phys_base`]). When `None` (or when the read
+    /// returns zero / fails the bit-63 check), the per-iteration
+    /// code keeps using the pre-loop resolved `page_offset` value.
+    pub page_offset_base_kva: Option<u64>,
+    /// Link-time KVA of arm64's `memstart_addr`. The architectural
+    /// `PAGE_OFFSET` maps this physical address, which KASLR may place below
+    /// the VMM's first RAM GPA. Re-read per tick until `data_valid` latches so
+    /// the direct-map base used with `GuestMem` heals if monitor construction
+    /// raced early boot; the semantic `rq.cpu` gate then proves and freezes
+    /// the value. `None` on x86_64.
+    pub memstart_addr_kva: Option<u64>,
     /// Optional refresh inputs for `event_pcpu_pas`. When `None`,
     /// the monitor leaves `event_pcpu_pas` at its initial value
     /// (typically `None` because `scx_root` was null at host
@@ -1957,6 +2039,89 @@ pub(crate) enum WatchdogOverride {
         /// PA of `jiffies_64` global.
         jiffies_64_pa: Option<u64>,
     },
+}
+
+/// Loop-local state for the `scx_watchdog_timestamp` forge latch.
+///
+/// The host forges the guest's `scx_watchdog_timestamp` to bridge the
+/// gap between installing the overridden `scx_watchdog_interval` and the
+/// guest kworker re-arming at that new interval. Forging must be bounded:
+/// `scx_tick` is the guest's last-resort stall detector when the kworker
+/// itself is starved (the attach-then-stall case), and it fires off
+/// `scx_watchdog_timestamp`. Forging forever permanently pacifies it, so a
+/// genuinely stalled scheduler is never evicted. This state ends forging
+/// on either of two conditions (see [`forge_step`]).
+#[derive(Debug, Default)]
+struct WatchdogForgeState {
+    /// Latched once forging has stopped; no further timestamp writes.
+    forge_done: bool,
+    /// The jiffies value written on the previous forging iteration. A
+    /// guest-visible timestamp that differs from this means the guest
+    /// refreshed it independently (kworker fired / scheduler re-attached).
+    last_forged_ts: Option<u64>,
+    /// `jiffies_64` observed on the first forging iteration — the origin
+    /// of the fallback bound below.
+    forge_start_j: Option<u64>,
+    /// The guest's original `watchdog_timeout` (guest jiffies), captured
+    /// before the override clobbered it. Bounds how long the host forges.
+    original_timeout_j: Option<u64>,
+}
+
+/// Outcome of one [`forge_step`] decision.
+enum ForgeAction {
+    /// Do not write the timestamp this iteration.
+    Skip,
+    /// Write this jiffies value to `scx_watchdog_timestamp`.
+    Forge(u64),
+}
+
+/// Clamp the guest's original `watchdog_timeout` (guest jiffies) to a
+/// defensive upper bound. `wd_jiffies` is the override timeout in guest
+/// jiffies (5 s by default → `5 * HZ`), so `6 * wd_jiffies == 30 * HZ ==
+/// SCX_WATCHDOG_MAX_TIMEOUT` for the default and stays a safe ceiling for
+/// larger overrides. The guest kernel already clamps its own
+/// `watchdog_timeout` to `SCX_WATCHDOG_MAX_TIMEOUT`, so this only binds on
+/// a garbage or zero read (the loop reads guest memory before the
+/// scheduler has necessarily written the field), which falls back to the
+/// clamp rather than forging for an absurd duration.
+fn clamp_original_timeout(raw: u64, wd_jiffies: u64) -> u64 {
+    let clamp = wd_jiffies.saturating_mul(6);
+    if raw == 0 || raw > clamp { clamp } else { raw }
+}
+
+/// Decide whether to forge `scx_watchdog_timestamp` this iteration, given
+/// the current guest-visible timestamp `cur_ts` and current `jiffies_64`
+/// `now_j` (both read before this call). Mutates the latch state.
+///
+/// Two stop conditions, either of which hands the guest's last-resort
+/// stall detector back to the guest:
+///   - Takeover: the guest refreshed the timestamp itself (kworker fired
+///     at ~the original interval, or a re-attach) — the healthy path.
+///   - Fallback bound: in a genuinely stalled scheduler the kworker never
+///     fires, so the takeover latch alone would forge forever. Stop after
+///     roughly the guest's original timeout. Worst-case eviction: forge
+///     ≤ `original_timeout` (≤ 30 s) then `scx_tick` fires at
+///     `last_forge + overridden_timeout` (5 s) → `SCX_EXIT_ERROR_STALL` →
+///     bounded clean FAIL, versus the 145-175 s of unbounded forging.
+fn forge_step(st: &mut WatchdogForgeState, cur_ts: u64, now_j: u64, margin_j: u64) -> ForgeAction {
+    if st.forge_done {
+        return ForgeAction::Skip;
+    }
+    if let Some(prev) = st.last_forged_ts
+        && cur_ts != prev
+    {
+        st.forge_done = true;
+        return ForgeAction::Skip;
+    }
+    let start = *st.forge_start_j.get_or_insert(now_j);
+    if let Some(orig) = st.original_timeout_j
+        && now_j.saturating_sub(start) > orig.saturating_add(margin_j)
+    {
+        st.forge_done = true;
+        return ForgeAction::Skip;
+    }
+    st.last_forged_ts = Some(now_j);
+    ForgeAction::Forge(now_j)
 }
 
 /// BPF program stats context for the monitor loop.
@@ -2177,19 +2342,29 @@ pub(crate) struct MonitorConfig<'a> {
     /// it (post-attach) and reads each target per tick into
     /// [`MonitorSample::bpf_map_fields`].
     pub watch_bpf_maps: Option<&'a WatchBpfMapsCfg>,
+    /// Optional lock-free progress/liveness ledger. When `Some`, the
+    /// loop stamps per-tick liveness (`cpu_ns_now`, `cpu_currency`,
+    /// `runnable_demand`, an unconditional `monitor_heartbeat` bump) and
+    /// bumps `progress_epoch` on any tick showing NEW-WORK evidence (see
+    /// [`ProgressLedger`]). Every write is derived from data the loop
+    /// already read this tick — no extra guest-memory reads. `None`
+    /// (test path / callers that don't wire the watchdog) disables it.
+    /// OBSERVABILITY ONLY at this commit: the watchdog that consumes the
+    /// ledger is wired in a later commit.
+    pub progress_ledger: Option<&'a ProgressLedger>,
 }
 
 /// Inputs the monitor needs to push a watchdog-reset deadline when
 /// a scheduler attaches.
 ///
-/// All three fields move together — none of them are useful alone —
-/// so they're bundled to keep [`MonitorConfig`] flat. Construction
-/// is owned by [`crate::vmm::freeze_coord`] inside `start_monitor`,
-/// where `scx_root_pa` is the text-mapped PA of the kernel's
-/// `scx_root` global, `workload_duration` flows from
+/// All fields move together — none of them are useful alone — so
+/// they're bundled to keep [`MonitorConfig`] flat. Construction is
+/// owned by [`crate::vmm::freeze_coord`] inside `start_monitor`, where
+/// `scx_root_pa` is the text-mapped PA of the kernel's `scx_root`
+/// global, `workload_duration` flows from
 /// [`crate::vmm::KtstrVm::workload_duration`] (which mirrors the
-/// test entry's `duration`), and `reset_ns` is shared with the
-/// watchdog thread.
+/// test entry's `duration`), and `reset_ns` / `reset_tag` are shared
+/// with the watchdog thread.
 pub(crate) struct WatchdogReset<'a> {
     /// PA of the `scx_root` global pointer (text mapping). The
     /// loop reads `mem.read_u64(scx_root_pa, 0)` each iteration
@@ -2199,12 +2374,23 @@ pub(crate) struct WatchdogReset<'a> {
     /// as nanoseconds since `run_start` (added to `Instant::now()
     /// - run_start` at attach time and stored into [`reset_ns`]).
     pub workload_duration: Duration,
-    /// Shared atomic written once on the first scheduler-attach
-    /// observation. The watchdog thread reads this each tick and,
-    /// when non-zero, uses `run_start +
-    /// Duration::from_nanos(value)` as its hard deadline (capped
-    /// at the original `timeout`-derived deadline).
+    /// Shared atomic the watchdog thread reads each tick and, when
+    /// non-zero, uses `run_start + Duration::from_nanos(value)` as its hard
+    /// deadline (capped at the original `timeout`-derived deadline). The
+    /// polled latch here is a FALLBACK: it arms this via a
+    /// `compare_exchange(0, ..)` on the first non-null `*scx_root`
+    /// observation, so it only wins when the guest's authoritative
+    /// `LifecyclePhase::SchedulerAttached` frame (dispatch-thread writer,
+    /// `WatchdogResetTag::GuestAttachConfirm`) has not already armed it.
     pub reset_ns: &'a AtomicU64,
+    /// Parallel provenance tag for `reset_ns`, one of the
+    /// `WatchdogResetTag` byte values owned by
+    /// [`crate::vmm::freeze_coord`]. Stamped `ScxRootLatch` (value 1) ONLY
+    /// when this polled latch WINS its `reset_ns` CAS, so a lost CAS (the
+    /// guest attach frame armed the deadline first) leaves the honest
+    /// `GuestAttachConfirm` provenance intact. Relaxed store — diagnostic
+    /// only.
+    pub reset_tag: &'a std::sync::atomic::AtomicU8,
 }
 
 /// One watched scheduler BPF-map field, in monitor-local form. Lowered from
@@ -2583,6 +2769,400 @@ impl<'a> BpfMapWatcher<'a> {
 /// the wait returns within microseconds of the flip and the
 /// `kill.load(Acquire)` re-check at the top of the loop body
 /// observes the new state.
+/// Which CPU-time source the progress ledger bills against, latched once
+/// (see [`select_cpu_currency`]).
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub(crate) enum CurrencySource {
+    /// PMU SW task-clock ns (guest-only, via `exclude_host`).
+    Pmu,
+    /// Per-vCPU pthread clock ns (includes host-side time in the thread).
+    Pthread,
+}
+
+/// Pick `(cpu_ns_now, currency_byte)` for one ledger tick, latching the
+/// SOURCE on the first tick.
+///
+/// LATCH INVARIANT: `latched` is `None` only on the very first tick; this
+/// fn writes it and the caller feeds the SAME cell back forever after, so
+/// the source is chosen exactly once. Task-clock ns and pthread-clock ns
+/// are DIFFERENT magnitudes for the same wall interval (the task clock
+/// excludes host-side time), so mixing them across ticks would make the
+/// ledger's `cpu_ns_now` sum and the per-vCPU max-in-phase anchor
+/// incoherent — a source flip could send `cpu_ns_now` backwards (consumers
+/// `saturating_sub` it, reading the regression as a 0 delta). Capabilities
+/// do not change
+/// mid-run (the counters arm at monitor start), so the first tick's
+/// availability is authoritative: PMU iff EVERY sampled vCPU carried a
+/// task clock on tick 1, else pthread — for the whole run.
+///
+/// ALL-or-fallback (never a mixed sum): PMU is chosen only when the
+/// `task_clocks` slice is non-empty and every entry is `Some`. A single
+/// absent task clock falls the whole tick back to the pthread sum, exactly
+/// as before this currency existed. Under the pthread source the currency
+/// byte is `PTHREAD` when any pthread time was present, else `NONE` (both
+/// pthread-magnitude, so switching between them mid-run is coherent).
+///
+/// `task_clocks[i]` / `pthread[i]` are vCPU `i`'s task-clock and pthread
+/// readings this tick; the two slices are the same length (one entry per
+/// sampled CPU, `None` where that source was absent).
+pub(crate) fn select_cpu_currency(
+    latched: &mut Option<CurrencySource>,
+    task_clocks: &[Option<u64>],
+    pthread: &[Option<u64>],
+) -> (u64, u8) {
+    let source = *latched.get_or_insert_with(|| {
+        if !task_clocks.is_empty() && task_clocks.iter().all(Option::is_some) {
+            CurrencySource::Pmu
+        } else {
+            CurrencySource::Pthread
+        }
+    });
+    match source {
+        // Latched PMU: sum the task clocks. Once latched, capabilities
+        // don't change so every entry stays `Some`; `flatten` is defensive
+        // (a stray `None` contributes 0 rather than aborting) and keeps the
+        // currency byte at PMU so the magnitude never flips mid-run.
+        CurrencySource::Pmu => {
+            let cpu_ns_now = task_clocks
+                .iter()
+                .flatten()
+                .fold(0u64, |a, &t| a.saturating_add(t));
+            (cpu_ns_now, super::CPU_CURRENCY_PMU)
+        }
+        // Latched pthread: identical to the pre-PMU behavior — sum the
+        // available pthread clocks, currency PTHREAD if any present else NONE.
+        CurrencySource::Pthread => {
+            let mut cpu_ns_now = 0u64;
+            let mut any = false;
+            for t in pthread.iter().flatten() {
+                cpu_ns_now = cpu_ns_now.saturating_add(*t);
+                any = true;
+            }
+            let currency = if any {
+                super::CPU_CURRENCY_PTHREAD
+            } else {
+                super::CPU_CURRENCY_NONE
+            };
+            (cpu_ns_now, currency)
+        }
+    }
+}
+
+/// Per-vCPU CPU-time readings (ns) for the LATCHED currency `source`, one
+/// entry per sampled vCPU with an absent reading rendered as 0 (matching
+/// the flatten-to-0 the pthread/PMU sums use). Picking by the SAME latched
+/// source [`select_cpu_currency`] summed keeps the per-vCPU max and the
+/// sum on one magnitude. Index-stable: vCPU `i` is always `readings[i]`.
+fn active_per_vcpu_cpu_ns(
+    source: CurrencySource,
+    task_clocks: &[Option<u64>],
+    pthread: &[Option<u64>],
+) -> Vec<u64> {
+    let active = match source {
+        CurrencySource::Pmu => task_clocks,
+        CurrencySource::Pthread => pthread,
+    };
+    active.iter().map(|o| o.unwrap_or(0)).collect()
+}
+
+/// Monitor-thread-local tracker deriving the ledger's
+/// `max_vcpu_cpu_in_phase_ns` — the MAX over vCPUs of per-vCPU CPU burned
+/// since the current lifecycle phase was entered. Pure state machine (no
+/// atomics, no clocks) so its anchor arithmetic is unit-testable; the
+/// monitor feeds it each tick's active-currency readings
+/// ([`active_per_vcpu_cpu_ns`]) and the ledger's current `phase_epoch`.
+///
+/// WHY MAX, NOT SUM: a spinning wedge is one (or a few) hot thread(s), so
+/// its max-per-vCPU crosses a flat per-phase budget in bounded wall time;
+/// a wide idle guest's diffuse per-vCPU background burn (timer ticks / IPIs
+/// — tens of ms/s/vCPU) sums to seconds across hundreds of vCPUs yet its
+/// MAX stays tens of ms. Width-independent, so Tier-1 never false-fires on
+/// guest width alone (the 256-vCPU wide-SMP false kill this replaces).
+///
+/// RE-ANCHOR DISCIPLINE: it holds a per-vCPU `anchor` vector and the
+/// `phase_epoch` that anchor belongs to. On the FIRST observe, and on any
+/// observe whose `phase_epoch` differs (a lifecycle stage advanced) or
+/// whose vCPU count differs, it RE-ANCHORS to the current readings BEFORE
+/// computing and returns 0 for that tick — so a freshly-entered phase never
+/// charges the prior phase's accumulated CPU. Between re-anchors it returns
+/// `max_i(readings[i] - anchor[i])` (saturating, so an absent or regressed
+/// reading contributes 0 — conservative, never a spurious kill).
+pub(crate) struct MaxVcpuInPhaseTracker {
+    anchor: Vec<u64>,
+    phase_epoch: u32,
+    seeded: bool,
+}
+
+impl MaxVcpuInPhaseTracker {
+    pub(crate) fn new() -> Self {
+        Self {
+            anchor: Vec::new(),
+            phase_epoch: 0,
+            seeded: false,
+        }
+    }
+
+    /// Fold this tick's per-vCPU `readings` (active-currency CPU-time ns,
+    /// absent → 0, index-stable per vCPU) and the ledger's current
+    /// `phase_epoch`; return the max per-vCPU CPU burned since the phase
+    /// was entered. Re-anchors (returns 0) on the first tick, on a
+    /// `phase_epoch` change, or on a vCPU-count change.
+    pub(crate) fn observe(&mut self, readings: &[u64], phase_epoch: u32) -> u64 {
+        if !self.seeded || phase_epoch != self.phase_epoch || self.anchor.len() != readings.len() {
+            self.anchor = readings.to_vec();
+            self.phase_epoch = phase_epoch;
+            self.seeded = true;
+            return 0;
+        }
+        readings
+            .iter()
+            .zip(&self.anchor)
+            .map(|(&r, &a)| r.saturating_sub(a))
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// Cap on the Body-phase per-tick run-delay series
+/// ([`crate::vmm::result::BodyContentionWindow::tick_deltas`]). At the 100 ms
+/// monitor cadence 36 000 ticks is one hour of Body — far past any real test
+/// body (minutes) — so the cap is effectively unreachable; it exists only to
+/// bound the Vec against a runaway/never-exiting cell. On hit the series
+/// stops growing and `saturated` is set, marking `W` as a prefix-only lower
+/// bound (see the field docs).
+#[cfg(test)]
+pub(crate) const BODY_TICK_CAP: usize = 36_000;
+
+/// Monitor-thread-local tracker for the per-phase host-contention witness
+/// (the "weather witness"). Consumes each tick's cumulative host vCPU
+/// schedstat totals ([`crate::vmm::result::HostVcpuSchedstat`], summed over
+/// the vCPU TIDs) and the live lifecycle STAGE, and produces
+/// [`crate::vmm::result::ContentionWitness`]: a per-phase schedstat DELTA
+/// array (each phase's own-span `D`) plus the Body-phase per-tick run-delay
+/// series for the `W(L)` peak-window bound.
+///
+/// Pure state machine (no clocks, no I/O — the caller does the schedstat
+/// read), so the boundary/attribution arithmetic is unit-testable. Mirrors
+/// [`MaxVcpuInPhaseTracker`]'s re-anchor discipline, but anchors on the
+/// STAGE id (not `phase_epoch`) because it attributes schedstat to a specific
+/// [`crate::monitor::LifecycleStage`] slot.
+///
+/// PER-PHASE ATTRIBUTION: it holds the cumulative schedstat `anchor` at the
+/// current stage's start and, each tick, RE-WRITES `per_phase[stage] = cur -
+/// anchor` (a running delta). When the observed stage advances it re-anchors
+/// (`anchor = cur`), which FREEZES the just-ended stage's slot at its last
+/// running value and starts the new stage's slot at 0 — so each slot ends up
+/// holding exactly its own span's schedstat delta. Forward-only staging is
+/// assumed (the ledger's `advance_phase` is monotone); a non-advancing
+/// re-observation of the same stage just keeps extending its running delta.
+///
+/// PER-TICK BODY SERIES: independently, each tick's TOTAL run-delay delta
+/// (`cur.run_delay - prev.run_delay`, saturating) is pushed to the Body
+/// series WHILE the observed stage is Body. The first Body tick's delta spans
+/// the Dispatch→Body transition interval (over-counts Body contention →
+/// larger `W` → more indeterminate = conservative); the final partial Body
+/// interval is ceded to Teardown — the same one-tick boundary slop the
+/// per-phase array carries.
+#[cfg(test)]
+pub(crate) struct PhaseWitnessTracker {
+    /// Cumulative schedstat at the current stage's start.
+    anchor: crate::vmm::result::HostVcpuSchedstat,
+    /// The full cumulative schedstat read on the PREVIOUS tick — both for the
+    /// per-tick run-delay delta AND as the re-anchor point on a stage advance
+    /// (so the new stage absorbs the transition interval rather than dropping
+    /// it; see [`Self::observe`]).
+    prev: crate::vmm::result::HostVcpuSchedstat,
+    /// The stage observed on the previous tick.
+    prev_stage: u8,
+    /// Per-stage running schedstat deltas, indexed by `LifecycleStage as
+    /// usize`.
+    per_phase: crate::vmm::result::PerPhaseSchedstat,
+    /// Body-phase per-tick run-delay deltas (capped at [`BODY_TICK_CAP`]).
+    body_tick_deltas: Vec<u64>,
+    /// True once the Body series hit the cap and later ticks were dropped.
+    body_saturated: bool,
+    /// The monitor tick period (ns) — carried onto the Body window so the
+    /// pure window math can quantise `L` into ticks.
+    tick_ns: u64,
+    /// The previous observation's elapsed-wall timestamp (ns since run start).
+    /// Used as the CONSERVATIVE (earlier) Body-enter wall on the transition
+    /// into Body, and — carried to `finish` — as the fallback Body-exit wall
+    /// when the phase never advanced out of Body.
+    prev_now_ns: u64,
+    /// Elapsed wall (ns) at the OBSERVATION BEFORE the first Body tick — the
+    /// conservative (earlier-than-true) Body-phase start. `None` until a Body
+    /// tick is seen. See [`crate::vmm::result::BodyContentionWindow::body_wall_ns`].
+    body_enter_wall_ns: Option<u64>,
+    /// Elapsed wall (ns) at the first observation AFTER Body (the conservative
+    /// later-than-true Body-phase end). `None` while still in Body / never
+    /// exited; `finish` then falls back to the last observation's wall.
+    body_exit_wall_ns: Option<u64>,
+    /// Elapsed wall (ns) at the FIRST Body tick; with `body_last_tick_wall_ns`
+    /// gives the span the series actually COVERED
+    /// ([`crate::vmm::result::BodyContentionWindow::body_covered_ns`]).
+    body_first_tick_wall_ns: Option<u64>,
+    /// Elapsed wall (ns) at the LAST Body tick observed so far.
+    body_last_tick_wall_ns: Option<u64>,
+    seeded: bool,
+}
+
+#[cfg(test)]
+impl PhaseWitnessTracker {
+    pub(crate) fn new(tick_ns: u64) -> Self {
+        Self {
+            anchor: crate::vmm::result::HostVcpuSchedstat::default(),
+            prev: crate::vmm::result::HostVcpuSchedstat::default(),
+            prev_stage: 0,
+            per_phase: crate::vmm::result::PerPhaseSchedstat::default(),
+            body_tick_deltas: Vec::new(),
+            body_saturated: false,
+            tick_ns,
+            prev_now_ns: 0,
+            body_enter_wall_ns: None,
+            body_exit_wall_ns: None,
+            body_first_tick_wall_ns: None,
+            body_last_tick_wall_ns: None,
+            seeded: false,
+        }
+    }
+
+    /// Fold one tick: `cur` is the cumulative host schedstat over the vCPU
+    /// TIDs THIS tick, `stage` the live [`crate::monitor::LifecycleStage`]
+    /// `as u8`, `now_ns` the monitor's elapsed wall (ns since run start) at
+    /// this observation. The first call seeds the anchors and attributes
+    /// nothing (no prior reading to diff). `stage` out of range is tolerated —
+    /// the `usize` index is bounds-checked against the fixed array via
+    /// [`crate::monitor::LifecycleStage::from_u8`] before use.
+    ///
+    /// `now_ns` drives the Body-phase WALL span used for coverage soundness
+    /// (see [`crate::vmm::result::BodyContentionWindow::body_wall_ns`]): the
+    /// enter/exit walls are pinned CONSERVATIVELY (enter at the observation
+    /// BEFORE the first Body tick, exit at the observation AFTER Body) so the
+    /// span can only be too large — never too small — and the derived
+    /// coverage can only be under-stated, never over-stated.
+    pub(crate) fn observe(
+        &mut self,
+        cur: crate::vmm::result::HostVcpuSchedstat,
+        stage: u8,
+        now_ns: u64,
+    ) {
+        if !self.seeded {
+            self.anchor = cur;
+            self.prev = cur;
+            self.prev_stage = stage;
+            self.prev_now_ns = now_ns;
+            self.seeded = true;
+            return;
+        }
+        // Per-tick TOTAL run-delay delta (saturating: a regressed cumulative
+        // — a TID that vanished then reappeared — contributes 0, never wraps).
+        let tick_delta = cur
+            .total_run_delay_ns
+            .saturating_sub(self.prev.total_run_delay_ns);
+        // Stage advance → re-anchor at the PREVIOUS tick's cumulative (not
+        // `cur`): the monitor sees the advance one tick late, so anchoring at
+        // `prev` gives the transition interval to the NEW stage. This freezes
+        // the ended stage's slot at its last same-stage running value and
+        // starts the new stage covering from the last pre-advance reading —
+        // the documented one-tick boundary slop (each phase absorbs up to one
+        // tick of its predecessor's tail; conservative for the Body window).
+        if stage != self.prev_stage {
+            self.anchor = self.prev;
+            self.prev_stage = stage;
+        }
+        // Running delta for the current stage. Normalise the stage byte
+        // through `from_u8` so a torn/garbled value can't index out of bounds.
+        let idx = crate::monitor::LifecycleStage::from_u8(stage) as usize;
+        self.per_phase.phases[idx] = cur.delta_from(&self.anchor);
+        // Body-phase per-tick series (bounded) + Body wall-span pinning.
+        if crate::monitor::LifecycleStage::from_u8(stage) == crate::monitor::LifecycleStage::Body {
+            // Conservative Body-enter: the observation BEFORE this first Body
+            // tick (`prev_now_ns`) is <= the true Body start, so the recorded
+            // span is >= the true span → coverage under-stated → demote-safe.
+            // Set lazily so a monitor SEEDED already-in-Body still pins an
+            // enter (no Dispatch→Body transition to key on there).
+            if self.body_enter_wall_ns.is_none() {
+                self.body_enter_wall_ns = Some(self.prev_now_ns);
+            }
+            // First/last Body-tick walls bound the span the series COVERED.
+            if self.body_first_tick_wall_ns.is_none() {
+                self.body_first_tick_wall_ns = Some(now_ns);
+            }
+            self.body_last_tick_wall_ns = Some(now_ns);
+            if self.body_tick_deltas.len() < BODY_TICK_CAP {
+                self.body_tick_deltas.push(tick_delta);
+            } else {
+                self.body_saturated = true;
+            }
+        } else if self.body_enter_wall_ns.is_some() && self.body_exit_wall_ns.is_none() {
+            // First observation AFTER Body (lifecycle staging is forward-only,
+            // so Body is a single contiguous span). `now_ns` >= the true Body
+            // end → span over-estimated on this end too → demote-safe.
+            self.body_exit_wall_ns = Some(now_ns);
+        }
+        self.prev = cur;
+        self.prev_now_ns = now_ns;
+    }
+
+    /// Assemble the witness. `None` when nothing was ever observed (never
+    /// seeded — no monitor tick ran with a stage to attribute).
+    pub(crate) fn finish(self) -> Option<crate::vmm::result::ContentionWitness> {
+        if !self.seeded {
+            return None;
+        }
+        // Body wall span for coverage: enter→exit, exit falling back to the
+        // last observation when the phase never advanced out of Body (still in
+        // Body at kill, or the monitor went silent). `0` when no Body tick was
+        // ever seen — the seam reads that (with an empty series) as "witness
+        // never covered Body" and refuses to FailConfirm.
+        let body_wall_ns = match self.body_enter_wall_ns {
+            Some(enter) => self
+                .body_exit_wall_ns
+                .unwrap_or(self.prev_now_ns)
+                .saturating_sub(enter),
+            None => 0,
+        };
+        // Span the ticks actually covered: first→last Body tick. `0` when
+        // fewer than two Body ticks landed (either bound `None`, or equal).
+        let body_covered_ns = match (self.body_first_tick_wall_ns, self.body_last_tick_wall_ns) {
+            (Some(first), Some(last)) => last.saturating_sub(first),
+            _ => 0,
+        };
+        Some(crate::vmm::result::ContentionWitness {
+            per_phase: self.per_phase,
+            body_window: crate::vmm::result::BodyContentionWindow {
+                tick_deltas: self.body_tick_deltas,
+                tick_widths_ns: Vec::new(),
+                tick_ns: self.tick_ns,
+                saturated: self.body_saturated,
+                complete: false,
+                schedstat_cap_ns: 0,
+                schedstat_cap_complete: false,
+                body_wall_ns,
+                body_covered_ns,
+            },
+        })
+    }
+}
+
+/// Semantic validation of candidate per-CPU rq PAs: every slot's
+/// `rq.cpu` field must read back its own index. The kernel stamps
+/// `rq->cpu = i` at `sched_init` for every possible CPU, so a correct
+/// translation chain matches the full identity permutation; stable
+/// garbage from a displaced-but-mapped page does not (probability
+/// ~2^-32 per slot past slot 0). Residue: an OUT-OF-BOUNDS slot-0 PA
+/// silently reads 0 == index 0, so the 1-vCPU case additionally
+/// requires the PA to be in-bounds; a mapped-but-wrong in-bounds page
+/// whose u32 at the rq.cpu offset happens to be 0 remains the (small,
+/// documented) narrow-topology residue.
+fn rq_cpu_fields_match(mem: &GuestMem, rq_pas: &[u64], rq_cpu_off: usize) -> bool {
+    !rq_pas.is_empty()
+        && rq_pas.iter().enumerate().all(|(i, &pa)| {
+            pa.saturating_add(rq_cpu_off as u64 + 4) <= mem.size()
+                && mem.read_u32(pa, rq_cpu_off) == i as u32
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn monitor_loop(
     mem: &GuestMem,
@@ -2615,7 +3195,18 @@ pub(crate) fn monitor_loop(
     // bounds-rejects to zero, so `rq_clock` reads as 0 forever.
     let mut page_offset = cfg.page_offset;
     let start_kernel_map = cfg.start_kernel_map;
-    let phys_base = cfg.phys_base;
+    // Mutable: while `data_valid` is unlatched, each iteration re-reads
+    // the shared `kern_phys_base` Arc and adopts the guest's
+    // authoritative publish the instant it lands, replacing whatever the
+    // construction-time bounded wait / CR3-walk fallback produced (see
+    // [`RqRefresh::kern_phys_base`]). Frozen once `data_valid` latches —
+    // the latch is proof the current value translates correctly, and a
+    // post-latch flip would tear the PAs mid-run.
+    let mut phys_base = cfg.phys_base;
+    // True once the per-tick adoption above replaced the construction
+    // value with a DIFFERENT one from the Arc (diagnostic provenance,
+    // surfaced by the pre-latch dump).
+    let mut phys_base_adopted = false;
     let rq_refresh = cfg.rq_refresh;
     let preemption_threshold_ns = if preemption_threshold_ns > 0 {
         preemption_threshold_ns
@@ -2671,6 +3262,20 @@ pub(crate) fn monitor_loop(
     // arguments — there is no boot race to gate against and the
     // walks must run from the first iteration.
     let mut data_valid: bool = rq_refresh.is_none();
+    // Keep the architectural PAGE_OFFSET separate from `page_offset`: on
+    // arm64 the latter is rebased by `DRAM_BASE - memstart_addr` for
+    // GuestMem. This value persists across ticks so one unstable
+    // `page_offset_base` read cannot revert a previously validated x86 base.
+    let mut architectural_page_offset = if rq_refresh.and_then(|r| r.memstart_addr_kva).is_some() {
+        super::symbols::default_page_offset_for_tcr(
+            rq_refresh
+                .and_then(|r| r.tcr_el1.as_ref())
+                .map(|c| c.load(Ordering::Acquire))
+                .unwrap_or(0),
+        )
+    } else {
+        page_offset
+    };
     // `page_offset` value captured at the instant `data_valid`
     // latched, forwarded onto `MonitorReport.page_offset` via
     // `MonitorLoopResult.page_offset`. Stays 0 when the latch
@@ -2683,6 +3288,14 @@ pub(crate) fn monitor_loop(
     // carries SOME value (initialized from `cfg.page_offset`),
     // so it cannot itself signal "no observation made."
     let mut latched_page_offset: u64 = 0;
+    // Once-only pre-latch diagnostic (see the emission site below). At
+    // the 100 ms sample cadence, `PRE_LATCH_DIAG_TICKS` ticks (~10 s) is
+    // far beyond a healthy boot's latch time yet well under any watchdog
+    // deadline, so a run still unlatched at that point is genuinely stuck
+    // and worth one gate-breakdown line.
+    const PRE_LATCH_DIAG_TICKS: u32 = 100;
+    let mut pre_latch_ticks: u32 = 0;
+    let mut pre_latch_diag_emitted = false;
     // Authoritative CPU count: `rq_refresh` overrides `rq_pas.len()`
     // because the static seed slice may be empty in production
     // (where the boot-race fix sources every PA from the refresh).
@@ -2706,6 +3319,24 @@ pub(crate) fn monitor_loop(
     let mut dump_requested = false;
     let mut cpus: Vec<CpuSnapshot> = Vec::with_capacity(num_cpus);
     let mut perf_read_err_reported = false;
+    // Progress-ledger CPU currency source, latched on the first ledger
+    // tick and never changed (see `select_cpu_currency`).
+    let mut ledger_currency: Option<CurrencySource> = None;
+    // Monitor-side per-vCPU max-in-phase tracker: derives the ledger's
+    // width-independent Tier-1 evidence (`max_vcpu_cpu_in_phase_ns`),
+    // re-anchored on every `phase_epoch` advance it observes. Kept here (not
+    // dispatch-side) so the anchor and the per-vCPU reads it charges come
+    // from the SAME monitor tick — the fix for the cross-thread ~0-anchor
+    // incoherence.
+    let mut max_vcpu_tracker = MaxVcpuInPhaseTracker::new();
+    // Monitor-side CPU-trickle tracker: computes the Tier-3 deadman's
+    // deferral verdict (its only consumer — Tier-2 carries no CPU term)
+    // from the per-vCPU cumulative CPU-time readings (the busiest single
+    // vCPU's windowed accrual vs the currency floor). Kept monitor-side
+    // because the busiest-vCPU quantity needs per-vCPU window anchors the
+    // scalar ledger cannot carry; the watchdog reads the published verdict.
+    // See [`crate::vmm::freeze_coord::watchdog_step::CpuTrickleTracker`].
+    let mut trickle_tracker = crate::vmm::freeze_coord::watchdog_step::CpuTrickleTracker::new();
     let mut vcpu_timing_err_reported: Vec<bool> = vcpu_timing
         .map(|vt| vec![false; vt.pthreads.len()])
         .unwrap_or_default();
@@ -2723,6 +3354,9 @@ pub(crate) fn monitor_loop(
     // null-read or scheduler reload does not stomp the attach
     // moment with a fresh `Instant::now()`.
     let mut watchdog_reset_signaled = false;
+    // Latch state for the `scx_watchdog_timestamp` forge. See
+    // [`WatchdogForgeState`] / [`forge_step`] for why forging is bounded.
+    let mut watchdog_forge = WatchdogForgeState::default();
 
     // Cadence + wake plumbing. `tick_tfd` is a periodic
     // `CLOCK_MONOTONIC` timerfd that fires every `interval` so the
@@ -2868,22 +3502,99 @@ pub(crate) fn monitor_loop(
         // (kernel PAGE_OFFSET is page-aligned by construction), and
         // stability vs the previous read (rejects mid-decompression
         // garbage that briefly satisfied the bit-63 check).
+        // Per-iteration re-derivation of the two translation-base
+        // inputs that can resolve AFTER monitor construction. Hoisted
+        // above every text-KVA translation this iteration performs
+        // (page_offset_base, __per_cpu_offset[]) so they all see the
+        // same live values.
+        //
+        //   * `phys_base`: adopt the guest's authoritative KERN_ADDRS
+        //     publish from the shared Arc the instant it lands (raw
+        //     != 0 → value is `raw - 1`). The construction-time
+        //     bounded wait is only a fast path; its CR3-walk fallback
+        //     (garbage or 0 on a slow cold boot) must never be a
+        //     permanent latch — see [`RqRefresh::kern_phys_base`].
+        //     Only while `data_valid` is unlatched: the latch is proof
+        //     the current base translates correctly, and the guest's
+        //     publish is a boot-time constant thereafter.
+        //   * `iter_start_kernel_map`: aarch64 kernel-image base from
+        //     a freshly re-read TCR_EL1 (x86_64: compile-time
+        //     constant) — see [`RqRefresh::tcr_el1`].
+        let iter_start_kernel_map = rq_refresh
+            .and_then(|r| r.tcr_el1.as_ref())
+            .and_then(|c| super::symbols::start_kernel_map_for_tcr(c.load(Ordering::Acquire)))
+            .unwrap_or(start_kernel_map);
+        if !data_valid && let Some(pb) = rq_refresh.and_then(|r| r.kern_phys_base.as_ref()) {
+            let raw = pb.load(Ordering::Acquire);
+            if raw != 0 {
+                let live = raw.wrapping_sub(1);
+                if live != phys_base {
+                    phys_base = live;
+                    phys_base_adopted = true;
+                }
+            }
+        }
         let mut page_offset_resolved = false;
+        let mut memstart_observation: Option<(u64, u64, u64)> = None;
         if let Some(refresh) = rq_refresh {
-            if let Some(pob_pa) = refresh.page_offset_base_pa {
+            if let Some(pob_kva) = refresh.page_offset_base_kva {
+                // Recompute the read PA per tick from the live bases —
+                // a construction-baked PA would freeze a stale
+                // `phys_base` into every read (the exact permanent-
+                // latch failure the adoption above exists to undo).
+                let pob_pa = super::symbols::text_kva_to_pa_with_base(
+                    pob_kva,
+                    iter_start_kernel_map,
+                    phys_base,
+                );
                 let val = mem.read_u64(pob_pa, 0);
                 let pob_aligned = (val & 0xFFF) == 0;
                 let pob_stable = prev_pob == val;
                 prev_pob = val;
                 if val & (1u64 << 63) != 0 && pob_aligned && pob_stable {
-                    page_offset = val;
+                    architectural_page_offset = val;
                     page_offset_resolved = true;
                 }
-            } else {
-                // No symbol available (aarch64 / stripped vmlinux):
-                // pre-loop `page_offset` is the best we have. Treat
-                // the page-offset side as already resolved.
+            } else if refresh.memstart_addr_kva.is_some() {
+                // On aarch64, derive PAGE_OFFSET from the live TCR_EL1. The
+                // BSP may populate the cached register after monitor
+                // construction, so update this architectural input per tick.
+                // `memstart_addr_kva` is the architecture discriminator here:
+                // host-side fixtures and stripped kernels without either
+                // arm64 symbol must retain the pre-loop `page_offset`, as the
+                // RqRefresh contract promises.
+                architectural_page_offset = super::symbols::default_page_offset_for_tcr(
+                    refresh
+                        .tcr_el1
+                        .as_ref()
+                        .map(|c| c.load(Ordering::Acquire))
+                        .unwrap_or(0),
+                );
                 page_offset_resolved = true;
+            } else {
+                // No live page-offset inputs are available. Keep the
+                // construction-time value rather than interpreting a missing
+                // TCR_EL1 as an arm64 TCR value.
+                page_offset_resolved = true;
+            }
+
+            if let Some(memstart_kva) = refresh.memstart_addr_kva
+                && !data_valid
+            {
+                let memstart_pa = super::symbols::text_kva_to_pa_with_base(
+                    memstart_kva,
+                    iter_start_kernel_map,
+                    phys_base,
+                );
+                let memstart_addr = mem.read_u64(memstart_pa, 0);
+                memstart_observation = Some((memstart_kva, memstart_pa, memstart_addr));
+                page_offset = super::symbols::direct_map_base_for_guest_mem(
+                    architectural_page_offset,
+                    memstart_addr,
+                    crate::vmm::DRAM_BASE,
+                );
+            } else if refresh.memstart_addr_kva.is_none() {
+                page_offset = architectural_page_offset;
             }
         }
         // Scheduler-attach watchdog reset. Read `*scx_root` and,
@@ -2907,7 +3618,40 @@ pub(crate) fn monitor_loop(
                     .as_nanos()
                     .saturating_add(reset.workload_duration.as_nanos());
                 let encoded = u64::try_from(target_ns).unwrap_or(u64::MAX).max(1);
-                reset.reset_ns.store(encoded, Ordering::Release);
+                // FALLBACK arm (C6): the authoritative attach signal is now
+                // the guest's evented `LifecyclePhase::SchedulerAttached`
+                // frame, which the dispatch thread stores as
+                // `WatchdogResetTag::GuestAttachConfirm`. This polled
+                // `*scx_root` latch only arms the deadline when the guest
+                // frame has NOT already done so — a `compare_exchange(0, ..)`,
+                // not the prior unconditional store. Two race orders, both
+                // benign:
+                //   1. Guest frame first: it stored a non-zero `reset_ns`
+                //      under `GuestAttachConfirm`; this CAS(0,..) FAILS, so
+                //      the more-authoritative provenance is NOT downgraded to
+                //      the latch tag (the tag store is gated on CAS success).
+                //   2. Latch first: this CAS wins from 0 and stamps
+                //      `ScxRootLatch`; a later guest frame's PLAIN `Release`
+                //      store overwrites `reset_ns` and re-stamps
+                //      `GuestAttachConfirm`, so the upgrade to the honest
+                //      provenance still happens.
+                // The one-shot local `watchdog_reset_signaled` still latches
+                // off after the first attempt so a transient null-read /
+                // scheduler reload cannot re-arm from a fresh `now`; it
+                // flips on the OBSERVATION (scx_sched_kva != 0), not the CAS
+                // outcome, so a CAS lost to the guest frame does not re-poll.
+                if reset
+                    .reset_ns
+                    .compare_exchange(0, encoded, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    // Stamp provenance only when THIS latch won the arm (value
+                    // 1 = `WatchdogResetTag::ScxRootLatch`). Relaxed —
+                    // diagnostic only; a benign race with the ns store is
+                    // acceptable. On a lost CAS we leave the guest frame's
+                    // `GuestAttachConfirm` tag intact.
+                    reset.reset_tag.store(1, Ordering::Relaxed);
+                }
                 watchdog_reset_signaled = true;
             }
         }
@@ -2948,6 +3692,17 @@ pub(crate) fn monitor_loop(
                 } => (*interval_pa, *timestamp_pa, *jiffies_64_pa),
             };
             if let Some(pa) = write_pa {
+                // Capture the guest's original `watchdog_timeout` ONCE,
+                // before the override write below clobbers it, to bound
+                // how long the host forges the timestamp (see below).
+                // Works for both variants: `pa`/`write_offset` is the
+                // deref'd `sch_pa + watchdog_offset` (ScxSched) or the
+                // static `watchdog_timeout_pa` at offset 0 (StaticGlobal).
+                if !watchdog_forge.forge_done && watchdog_forge.original_timeout_j.is_none() {
+                    let raw = mem.read_u64(pa, write_offset);
+                    watchdog_forge.original_timeout_j =
+                        Some(clamp_original_timeout(raw, wd_jiffies));
+                }
                 mem.write_u64(pa, write_offset, wd_jiffies);
                 if let Some(intv_pa) = interval_pa {
                     let intv = std::cmp::max(wd_jiffies / 2, 1);
@@ -2962,9 +3717,30 @@ pub(crate) fn monitor_loop(
                 // above only takes effect on the kworker's NEXT firing.
                 // Without this, scx_tick sees a 5s threshold but the
                 // timestamp is 15s stale → SCX_EXIT_ERROR_STALL.
-                if let (Some(ts_pa), Some(j64_pa)) = (timestamp_pa, jiffies_64_pa) {
-                    let now = mem.read_u64(j64_pa, 0);
-                    mem.write_u64(ts_pa, 0, now);
+                //
+                // The forge is LATCHED (unlike the timeout/interval writes
+                // above, which stay unconditional — scx_tick reads the
+                // overridden timeout, so keeping it fresh is what makes
+                // post-forge eviction fast). scx_tick is the guest's
+                // last-resort stall detector when the kworker itself is
+                // starved, and it fires off this timestamp; forging it
+                // forever would permanently pacify it and a genuinely
+                // stalled scheduler would never be evicted. `forge_step`
+                // stops on takeover (guest refreshed it) or a fallback
+                // bound (kworker never fires) — see its doc for the math.
+                if let (Some(ts_pa), Some(j64_pa)) = (timestamp_pa, jiffies_64_pa)
+                    && !watchdog_forge.forge_done
+                {
+                    let cur_ts = mem.read_u64(ts_pa, 0);
+                    let now_j = mem.read_u64(j64_pa, 0);
+                    // ~2 s of guest jiffies (`wd_jiffies` == 5 s worth),
+                    // absorbing scx_tick jitter around the bound.
+                    let margin_j = std::cmp::max(wd_jiffies * 2 / 5, 1);
+                    if let ForgeAction::Forge(v) =
+                        forge_step(&mut watchdog_forge, cur_ts, now_j, margin_j)
+                    {
+                        mem.write_u64(ts_pa, 0, v);
+                    }
                 }
                 if watchdog_observation.is_none() {
                     let observed = mem.read_u64(pa, write_offset);
@@ -2987,7 +3763,35 @@ pub(crate) fn monitor_loop(
             // `page_offset` was already refreshed at the top of this
             // iteration (before the watchdog write). `page_offset_resolved`
             // carries the result into the data_valid latch below.
-            let fresh = super::symbols::read_per_cpu_offsets(mem, refresh.pco_pa, refresh.num_cpus);
+            //
+            // Recompute the `__per_cpu_offset[]` read PA per iteration
+            // from the live bases hoisted at the top of this iteration
+            // rather than a construction-time bake. Two once-baked
+            // inputs have burned us with this exact dead-channel
+            // signature:
+            //   * aarch64: the kernel-image base (`KIMAGE_VADDR`) is a
+            //     function of `TCR_EL1.T1SZ`/`TG1`, and the BSP loop's
+            //     lazy `tcr_el1_cache` CAS can land AFTER the monitor
+            //     thread resolved its one-shot base (48-bit-VA default
+            //     when TCR was still 0) — observed on arm64 6.14.
+            //   * x86_64: `phys_base` from the construction-time
+            //     bounded wait can be the CR3-walk fallback's garbage
+            //     (or 0) when the guest's KERN_ADDRS publish lands
+            //     after ~10 s on a slow cold boot — observed on
+            //     x86_64 6.14 under a 2-CPU cgroup budget.
+            // Either stale base points the read at the wrong PA, every
+            // slot reads a silent zero, the bit-63 latch never fires,
+            // and the guest evidence channels stay dead for the whole
+            // run. Re-deriving per tick self-heals the instant the
+            // late input lands — the same per-iteration discipline the
+            // kaslr slide already uses.
+            let pco_start_kernel_map = iter_start_kernel_map;
+            let pco_pa = super::symbols::text_kva_to_pa_with_base(
+                refresh.per_cpu_offset_kva,
+                pco_start_kernel_map,
+                phys_base,
+            );
+            let fresh = super::symbols::read_per_cpu_offsets(mem, pco_pa, refresh.num_cpus);
             // Latch `data_valid` once the guest has populated the
             // percpu offset table AND we've observed (or accepted
             // the absence of) the KASLR base. Both halves are
@@ -3000,27 +3804,19 @@ pub(crate) fn monitor_loop(
             // hold BSS zero. Walks for those APs would compute
             // `runqueues_kva + 0`, wrap to a non-DRAM PA, and
             // silently read zeros — the exact failure mode the gate
-            // exists to prevent. Require every slot to be populated
-            // (and the slice to be non-empty so a degenerate
-            // `num_cpus == 0` cannot vacuously pass).
+            // exists to prevent.
             //
-            // **Kernel-half check (bit 63)**: bare `v != 0` accepts
-            // garbage like `0x3` that can transiently appear when
-            // the host reads `__per_cpu_offset[]` before the guest
-            // BSP has populated it (the bytes at the target PA
-            // are whatever pre-init state holds, not necessarily
-            // zero). Every legitimate `__per_cpu_offset[cpu]` value
-            // has bit 63 set on both supported architectures: x86_64
-            // kernel-half starts at `0xffff_8800_0000_0000`, and on
-            // aarch64 the value is `pcpu_base_addr -
-            // link___per_cpu_start - kaslr_offset +
-            // pcpu_unit_offsets[cpu]` — a u64 subtraction of two
-            // high-half addresses whose result inherits bit 63.
-            // Rejecting `v & (1u64 << 63) == 0` catches `0x3` and
-            // every other small-magnitude garbage without
-            // arch-specific PAGE_OFFSET hardcoding (which would
-            // wrongly reject valid arm64 VA_BITS=47 values when the
-            // gate uses the VA_BITS=48 fallback).
+            // The populated-table judgment is
+            // [`super::symbols::per_cpu_offsets_populated`]: every
+            // slot non-zero (per-arch plausibility: bit 63 required
+            // on x86_64 only — aarch64 entries legitimately carry
+            // either bit-63 state depending on the boot's KASLR
+            // draw, the arm64/6.14 dead-channel root cause) AND the
+            // table identical to the PREVIOUS iteration's read
+            // (`per_cpu_offsets_buf`, assigned at the bottom of this
+            // block), which rejects pre-init residue in flux where a
+            // shape check cannot. See the predicate's doc for the
+            // per-arch kernel-source reasoning.
             // Per-iteration KASLR-slide re-read. The slide Arc may be
             // unpublished (raw 0) when `RqRefresh` is built (the
             // monitor's pre-sample sys_rdy wait can resolve via its
@@ -3031,26 +3827,164 @@ pub(crate) fn monitor_loop(
             // sample computes correct PAs.
             let kaslr_raw = refresh.kaslr_offset.load(Ordering::Acquire);
             let kaslr_live = kaslr_raw.saturating_sub(1);
-            // Gate the latch on the slide being published (raw != 0:
-            // N>=2 is a real offset, 1 is the biased KASLR-off/nokaslr
-            // case, 0 is "no publisher yet"). Without this the latch
-            // could fire on a pre-publish sample whose rq PAs are
-            // garbage (valid per-CPU offsets but a zero slide).
-            if !data_valid
-                && page_offset_resolved
-                && kaslr_raw != 0
-                && !fresh.is_empty()
-                && fresh.iter().all(|&v| v & (1u64 << 63) != 0)
-            {
-                data_valid = true;
-                latched_page_offset = page_offset;
-            }
+            // Candidate per-CPU rq PAs from THIS tick's live inputs —
+            // computed before the latch so the semantic conjunct below
+            // can validate them.
             rq_pas_buf = super::symbols::compute_rq_pas(
                 refresh.runqueues_kva,
                 &fresh,
                 page_offset,
                 kaslr_live,
             );
+            // Gate the latch on the slide being published (raw != 0:
+            // N>=2 is a real offset, 1 is the biased KASLR-off/nokaslr
+            // case, 0 is "no publisher yet"). Without this the latch
+            // could fire on a pre-publish sample whose rq PAs are
+            // garbage (valid per-CPU offsets but a zero slide).
+            //
+            // SEMANTIC conjunct (`rq_cpu_fields_match`): the candidate
+            // rq PAs must read back `rq[i].cpu == i` for EVERY slot.
+            // This validates the ENTIRE translation chain end-to-end
+            // (phys_base, PAGE_OFFSET, kaslr slide, per-CPU offsets,
+            // BTF rq layout) against guest ground truth. Field
+            // motivation: a poisoned phys_base publish (arm64 debias
+            // sign bug) displaced the `__per_cpu_offset[]` read onto a
+            // mapped-but-wrong page whose STABLE nonzero garbage
+            // passed the shape gates (aarch64 carries no bit-63
+            // invariant), latched `data_valid`, and produced FALSE
+            // Tier-2 evidence — `runnable_demand=false` from wrong-PA
+            // rq reads killed a SPINNING guest. Shape heuristics
+            // cannot exclude stable garbage; reading the kernel's own
+            // per-rq CPU id can (a displaced page matching the full
+            // identity permutation is astronomically unlikely at
+            // width; the 1-slot narrow case keeps a small silent-zero
+            // residue, documented at the helper).
+            if !data_valid
+                && page_offset_resolved
+                && kaslr_raw != 0
+                && super::symbols::per_cpu_offsets_populated(&per_cpu_offsets_buf, &fresh)
+                && rq_cpu_fields_match(mem, &rq_pas_buf, offsets.rq_cpu)
+            {
+                data_valid = true;
+                latched_page_offset = page_offset;
+                // Late-latch follow-up to the pre-latch dump below: when
+                // the diag already fired ("will fall back to the Tier-3
+                // deadman") but the channels latched AFTERWARD, say so —
+                // otherwise a log reader pairs the dump with the eventual
+                // kill and concludes the channels were dead all run, when
+                // the truth is a starved/slow boot that recovered (the
+                // observed CI shape: guest at a few % host CPU, KERN_ADDRS
+                // publish landing minutes in, per-tick adoption healing
+                // the latch). The tick count times the sample interval is
+                // the boot-dilation witness for placement debugging.
+                if pre_latch_diag_emitted {
+                    eprintln!(
+                        "monitor: guest evidence channels latched LATE at tick \
+                         {pre_latch_ticks} (~{:.1}s at the sample cadence) — the \
+                         earlier pre-latch dump reflected a starved/slow boot, not \
+                         dead channels; watchdog tiers are live from this point.",
+                        pre_latch_ticks as f64 * interval.as_secs_f64(),
+                    );
+                }
+            }
+            // Bounded once-only resolution diagnostic. When the guest
+            // evidence channels never latch — `data_valid` stays false
+            // and `evidence_channels_live` reads false for the whole run
+            // (observed on aarch64 6.14, where the progress watchdog then
+            // degrades to the Tier-3 deadman) — the watchdog dump gave no
+            // signal for WHICH latch input never resolved. Emit the full
+            // gate breakdown exactly once, after enough sample ticks that
+            // a healthy boot would already have latched, so the failing
+            // arch/kernel leg self-reports the dead input (kaslr publish
+            // vs per_cpu_offset bit-63 vs the `pco_pa` translation base)
+            // without a re-run. Bounded (single emission) and cheap (a
+            // counter compare per tick until it fires once).
+            if !data_valid {
+                pre_latch_ticks = pre_latch_ticks.saturating_add(1);
+                if pre_latch_ticks == PRE_LATCH_DIAG_TICKS && !pre_latch_diag_emitted {
+                    pre_latch_diag_emitted = true;
+                    // bit63_set stays as raw field data (it discriminates the
+                    // per-boot aarch64 delta sign) even though it is no
+                    // longer a gate input; nonzero/stable are the actual
+                    // populated-predicate conjuncts.
+                    let bit63_set = fresh.iter().filter(|&&v| v & (1u64 << 63) != 0).count();
+                    let nonzero = fresh.iter().filter(|&&v| v != 0).count();
+                    let stable = per_cpu_offsets_buf == fresh;
+                    let rq_cpu_match = rq_cpu_fields_match(mem, &rq_pas_buf, offsets.rq_cpu);
+                    let first_rq_pa = rq_pas_buf.first().copied().unwrap_or(u64::MAX);
+                    let first_rq_cpu = if first_rq_pa == u64::MAX {
+                        u32::MAX
+                    } else {
+                        mem.read_u32(first_rq_pa, offsets.rq_cpu)
+                    };
+                    let (memstart_kva, memstart_pa, memstart_addr) =
+                        memstart_observation.unwrap_or((0, 0, 0));
+                    // KERN_ADDRS observability: how many frames the coord
+                    // dispatcher has seen (and how many failed CRC). frames=0
+                    // with kaslr_raw=0 → the guest never sent (or the coord
+                    // never consumed) the publish; frames>0 with kaslr_raw=0
+                    // → the frame arrived but a derive gate rejected it.
+                    let ka_frames = refresh
+                        .kern_addrs_frames
+                        .as_ref()
+                        .map(|c| c.load(Ordering::Relaxed))
+                        .unwrap_or(0);
+                    let ka_crc_bad = refresh
+                        .kern_addrs_crc_bad
+                        .as_ref()
+                        .map(|c| c.load(Ordering::Relaxed))
+                        .unwrap_or(0);
+                    // phys_base provenance: which arm produced the value the
+                    // translations above are using right now. "adopted" = a
+                    // per-tick Arc re-read replaced the construction value
+                    // (guest publish landed after the bounded wait);
+                    // "guest-publish" = the authoritative KERN_ADDRS value
+                    // arrived inside the construction wait; "fallback" = the
+                    // CR3-walk fallback (or 0 when the walk was rejected) and
+                    // no differing Arc value has been adopted since — the
+                    // prime suspect when the pco/pob translations look dead.
+                    let phys_base_src = if phys_base_adopted {
+                        "adopted-from-arc-per-tick"
+                    } else if refresh.phys_base_guest_published {
+                        "guest-publish(pre-loop-wait)"
+                    } else {
+                        "fallback-walk-or-zero(pre-loop)"
+                    };
+                    // eprintln, NOT tracing: the in-VM test binaries wire no
+                    // tracing subscriber, so a tracing::warn here is invisible
+                    // in exactly the CI logs this diagnostic exists for. The
+                    // watchdog dumps use unbuffered stderr for the same reason.
+                    eprintln!(
+                        "monitor: guest evidence channels have not latched \
+                         (data_valid=false) after {PRE_LATCH_DIAG_TICKS} sample ticks; \
+                         the progress watchdog will fall back to the Tier-3 deadman.\n  \
+                         data_valid requires page_offset_resolved && kaslr_raw!=0 && a \
+                         non-empty __per_cpu_offset[] table, all slots nonzero \
+                         (x86_64: also bit-63) and stable across two reads, plus \
+                         rq[i].cpu == i for every candidate rq PA:\n  \
+                         page_offset_resolved={page_offset_resolved} kaslr_raw={kaslr_raw:#x} \
+                         num_cpus={num_cpus} pco_slots={pco_slots} nonzero={nonzero} \
+                         stable={stable} bit63_set={bit63_set} rq_cpu_match={rq_cpu_match}\n  \
+                         kern_addrs_frames={ka_frames} kern_addrs_crc_bad={ka_crc_bad}\n  \
+                         first_pco={first_pco:#x} pco_pa={pco_pa:#x} \
+                         pco_start_kernel_map={pco_start_kernel_map:#x}\n  \
+                         memstart_kva={memstart_kva:#x} memstart_pa={memstart_pa:#x} \
+                         memstart_addr={memstart_addr:#x}\n  \
+                         first_rq_pa={first_rq_pa:#x} first_rq_cpu={first_rq_cpu} \
+                         rq_cpu_offset={rq_cpu_offset:#x}\n  \
+                         per_cpu_offset_kva={per_cpu_offset_kva:#x} \
+                         runqueues_kva={runqueues_kva:#x} page_offset={page_offset:#x} \
+                         phys_base={phys_base:#x} phys_base_source={phys_base_src}",
+                        num_cpus = refresh.num_cpus,
+                        pco_slots = fresh.len(),
+                        first_pco = fresh.first().copied().unwrap_or(0),
+                        rq_cpu_offset = offsets.rq_cpu,
+                        per_cpu_offset_kva = refresh.per_cpu_offset_kva,
+                        runqueues_kva = refresh.runqueues_kva,
+                    );
+                }
+            }
+            // (`rq_pas_buf` was recomputed above, before the latch.)
             // `event_pcpu_pas` requires both fresh `__per_cpu_offset[]`
             // AND a non-null `*scx_root` (a scheduler must be
             // attached). Until the scheduler attaches, `scx_sched_kva`
@@ -3061,6 +3995,33 @@ pub(crate) fn monitor_loop(
             });
             per_cpu_offsets_buf = fresh;
         }
+
+        // Host-side per-vCPU timing sources, read EVERY tick independent
+        // of guest-memory resolution: the pthread CPU clocks and the PMU
+        // SW task-clock read host thread / fd state, not the guest's
+        // `struct rq`. Pre-boot — before the guest populates its per-CPU
+        // runqueue structures and `data_valid` latches, so `cpus` is still
+        // empty — these are the ONLY CPU-time evidence available, so the
+        // progress ledger below sources `cpu_ns_now` from them DIRECTLY
+        // rather than summing (absent) `CpuSnapshot` fields. Stamped into
+        // `cpus` for the stuck-detection paths only when `data_valid`.
+        let pthread_times: Vec<Option<u64>> = vcpu_timing
+            .map(|vt| vt.read_cpu_times(&mut vcpu_timing_err_reported))
+            .unwrap_or_default();
+        let perf_samples: Option<Vec<super::perf_counters::VcpuPerfSample>> =
+            perf_capture.and_then(|pc| match pc.read_all() {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    if !perf_read_err_reported {
+                        tracing::warn!(
+                            err = %e,
+                            "perf counter read failed; vcpu_perf will be None until next successful sample"
+                        );
+                        perf_read_err_reported = true;
+                    }
+                    None
+                }
+            });
 
         // Pre-validity short circuit: skip every guest-memory walk
         // until both `__per_cpu_offset[]` and `page_offset` are
@@ -3112,41 +4073,32 @@ pub(crate) fn monitor_loop(
                 }
             }
 
-            // Stamp vCPU CPU times into the per-CPU snapshots. Reactive
-            // stuck detection below reads these via `is_cpu_stuck`; the
-            // post-hoc `MonitorThresholds::evaluate` path reads them off
-            // the pushed samples.
-            if let Some(vt) = vcpu_timing {
-                let times = vt.read_cpu_times(&mut vcpu_timing_err_reported);
+            // Stamp vCPU CPU times into the per-CPU snapshots from the
+            // `pthread_times` read once above (independent of guest-memory
+            // resolution; the ledger sources its CPU currency from the
+            // same read). Reactive stuck detection below reads these via
+            // `is_cpu_stuck`; the post-hoc `MonitorThresholds::evaluate`
+            // path reads them off the pushed samples.
+            if vcpu_timing.is_some() {
                 for (i, cpu) in cpus.iter_mut().enumerate() {
-                    if let Some(&t) = times.get(i) {
+                    if let Some(&t) = pthread_times.get(i) {
                         cpu.vcpu_cpu_time_ns = t;
                     }
                 }
             }
         }
 
-        // Read per-vCPU PMU counters (cycles / instructions /
-        // cache-misses / branch-misses) into each snapshot. Errors
-        // here are surfaced as `vcpu_perf = None` for that sample;
-        // we don't fail the monitor over a transient read error.
-        if let Some(pc) = perf_capture {
-            match pc.read_all() {
-                Ok(samples) => {
-                    for (i, cpu) in cpus.iter_mut().enumerate() {
-                        if let Some(s) = samples.get(i) {
-                            cpu.vcpu_perf = Some(*s);
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !perf_read_err_reported {
-                        tracing::warn!(
-                            err = %e,
-                            "perf counter read failed; vcpu_perf will be None until next successful sample"
-                        );
-                        perf_read_err_reported = true;
-                    }
+        // Stamp per-vCPU PMU counters (cycles / instructions /
+        // cache-misses / branch-misses) into each snapshot from the
+        // `perf_samples` read once above (hoisted so the ledger can source
+        // its CPU currency from the same read pre-`data_valid`). A read
+        // error left `perf_samples` `None` (warned once), leaving every
+        // `vcpu_perf` at `None` for this sample — we don't fail the
+        // monitor over a transient read error.
+        if let Some(samples) = perf_samples.as_ref() {
+            for (i, cpu) in cpus.iter_mut().enumerate() {
+                if let Some(s) = samples.get(i) {
+                    cpu.vcpu_perf = Some(*s);
                 }
             }
         }
@@ -3322,6 +4274,116 @@ pub(crate) fn monitor_loop(
         } else {
             Vec::new()
         };
+
+        // ProgressLedger writes (OBSERVABILITY ONLY this commit; the
+        // watchdog that consumes it is wired later). Everything here is
+        // derived from data already read into `cpus` this tick — no
+        // extra guest-memory reads. Runs before the sample is pushed so
+        // `samples.last()` is still the PREVIOUS tick (the same
+        // predecessor the reactive stuck-check reads above).
+        if let Some(ledger) = cfg.progress_ledger {
+            // (a) Choose the CPU-time currency and its sum from the
+            // host-side timing sources read at the top of this tick —
+            // NOT from `cpus`, which is EMPTY until `data_valid` latches.
+            // Sourcing them directly is what makes CPU evidence available
+            // from tick 1 of a booting guest (currency=pthread at
+            // minimum), so Tier-1 governs a spinning boot wedge even
+            // before the guest kernel brings up its per-CPU runqueue
+            // structures. Prefer the PMU SW task-clock (guest-only ns, via
+            // exclude_host) when EVERY sampled vCPU carries one; else fall
+            // back to the per-vCPU pthread clock. The source is latched on
+            // the first tick so the magnitude never flips mid-run (see
+            // `select_cpu_currency`). Both slices are one entry per vCPU:
+            // task clock from `perf_samples`, pthread from `pthread_times`,
+            // `None` where that source was absent.
+            let task_clocks: Vec<Option<u64>> = perf_samples
+                .as_ref()
+                .map(|s| s.iter().map(|p| p.task_clock_ns).collect())
+                .unwrap_or_default();
+            let (cpu_ns_now, cpu_currency) =
+                select_cpu_currency(&mut ledger_currency, &task_clocks, &pthread_times);
+            // Tier-1 evidence (width-independent): the MAX over vCPUs of
+            // per-vCPU CPU burned since the current phase was entered. Uses
+            // the SAME latched currency source `select_cpu_currency`
+            // summed, so the max and the sum share one magnitude, and
+            // re-anchors on the ledger's `phase_epoch` (Acquire) so a
+            // freshly-entered phase charges only its own burn — never the
+            // prior phase's accumulated CPU. Computed monitor-side from
+            // this tick's own reads, so the anchor is always coherent.
+            let per_vcpu_cpu_ns = active_per_vcpu_cpu_ns(
+                ledger_currency.expect("select_cpu_currency latched the source"),
+                &task_clocks,
+                &pthread_times,
+            );
+            let phase_epoch = ledger.phase_epoch.load(Ordering::Acquire);
+            let max_vcpu_cpu_in_phase_ns = max_vcpu_tracker.observe(&per_vcpu_cpu_ns, phase_epoch);
+            // Tier-3-deadman deferral verdict (its only consumer — Tier-2
+            // carries no CPU term): the busiest SINGLE vCPU's CPU accrued
+            // over the trailing 10 s window vs the currency floor, from the
+            // SAME per-vCPU active-currency readings as the Tier-1 max
+            // above. Computed here (not watchdog-side) because the
+            // busiest-vCPU quantity `max_i(C_i(now) - C_i(window_start))`
+            // needs per-vCPU window anchors the scalar ledger cannot carry
+            // — the summed and per-tick-max scalars both leak vCPU width (a
+            // wide idle guest's rotating background burn sums above the
+            // per-vCPU floor). The ledger latches the currency on the first
+            // tick, so the floor is constant per run.
+            let now_rel_ns = u64::try_from(run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let cpu_trickle_stalled = trickle_tracker.observe(
+                &per_vcpu_cpu_ns,
+                now_rel_ns,
+                crate::vmm::freeze_coord::watchdog_step::trickle_floor_for_currency(cpu_currency),
+            );
+            let busiest_vcpu_window_ns = trickle_tracker.last_window_accrued();
+            // Evidence channels: per-CPU GUEST data actually resolved this
+            // tick (`data_valid` latched AND `cpus` non-empty). The SAME
+            // condition that makes `runnable_demand` meaningful — false
+            // pre-boot-resolution, true after. The watchdog's Tier-2
+            // (absence-of-demand ⇒ idle
+            // wedge) is only valid when this holds; a starved early-boot
+            // guest reads `runnable_demand=false` purely because the
+            // channel is blind, not because it is idle.
+            let evidence_channels_live = data_valid && !cpus.is_empty();
+            // (d) Runnable demand: any CPU had queued work this sample.
+            // Pre-resolution `cpus` is empty → false, which is exactly why
+            // `evidence_channels_live` must gate Tier-2's use of it.
+            let runnable_demand = cpus
+                .iter()
+                .any(|c| c.nr_running > 0 || c.scx_nr_running > 0 || c.local_dsq_depth > 0);
+            // (a)+(b)+(d): stamp liveness and bump the heartbeat.
+            ledger.record_liveness(
+                cpu_ns_now,
+                max_vcpu_cpu_in_phase_ns,
+                phase_epoch,
+                cpu_trickle_stalled,
+                busiest_vcpu_window_ns,
+                cpu_currency,
+                runnable_demand,
+                evidence_channels_live,
+            );
+            // NO progress-epoch bump here. `progress_epoch` is
+            // MILESTONE-ONLY: bumped exclusively by lifecycle stage
+            // advances (the dispatch thread's `advance_phase` /
+            // boot-heartbeat frames). Kernel scheduling noise is NEVER
+            // progress — a live guest kernel bumps ttwu_count /
+            // sched_count / pcount every tick from background kthread
+            // wakeups (RCU, timers, workqueues, ktstr's own guest poll
+            // threads), and a wakeup bumps ttwu even when the woken task
+            // never runs, so noise-based progress would reset every tick
+            // on ANY live kernel — a SCHED_FIFO spinner and a 60 s idle
+            // teardown sleeper alike would look "progressing" forever.
+            // scx discrete-event counters are equally unsafe (they tick
+            // from enqueue paths under a stalled scheduler). The watchdog
+            // instead governs spinning wedges by the Tier-1 CPU budget and
+            // idle wedges by the Tier-2 trickle-stall test.
+
+            // Constant-cost Body contention series. The shared recorder reads
+            // one runner-cgroup CPU-PSI cumulative counter here; O(vCPU)
+            // schedstat sweeps are driven only by lifecycle transition events.
+            if let Some(recorder) = vcpu_timing.and_then(|vt| vt.contention_recorder.as_ref()) {
+                recorder.sample_pressure();
+            }
+        }
 
         samples.push(MonitorSample {
             bpf_map_fields,
@@ -3596,6 +4658,7 @@ mod tests {
             psi: None,
             watchdog_reset: None,
             watch_bpf_maps: None,
+            progress_ledger: None,
         }
     }
 
@@ -3894,6 +4957,7 @@ mod tests {
             psi: None,
             watchdog_reset: None,
             watch_bpf_maps: None,
+            progress_ledger: None,
         };
         let kernel_offsets = test_offsets();
         let kill = std::sync::Arc::new(AtomicBool::new(false));
@@ -4370,6 +5434,13 @@ mod tests {
         combined[8..16].copy_from_slice(&pco1.to_ne_bytes());
         combined.extend_from_slice(&rq0_buf);
         combined.extend_from_slice(&rq1_buf);
+        // Stamp each rq's `cpu` field with its own index — the latch's
+        // semantic conjunct (`rq_cpu_fields_match`) requires it, exactly
+        // as `sched_init` stamps real runqueues.
+        for (i, pa) in [rq0_pa, rq1_pa].into_iter().enumerate() {
+            let off = pa as usize + offsets.rq_cpu;
+            combined[off..off + 4].copy_from_slice(&(i as u32).to_ne_bytes());
+        }
 
         // SAFETY: combined is a live local buffer (Vec<u8> or stack
         // array) whose backing storage outlives the GuestMem use.
@@ -4378,10 +5449,22 @@ mod tests {
         let kill_evt = test_kill_evt();
 
         let refresh = RqRefresh {
-            pco_pa: 0,
+            // pco_pa is recomputed per tick as
+            // `text_kva_to_pa_with_base(per_cpu_offset_kva, start_kernel_map,
+            // phys_base)`. With `tcr_el1: None` the loop uses the config's
+            // `start_kernel_map` (test_config: START_KERNEL_MAP) and
+            // `phys_base` (0), so `per_cpu_offset_kva == START_KERNEL_MAP`
+            // reproduces the previous `pco_pa: 0`.
+            per_cpu_offset_kva: super::super::symbols::START_KERNEL_MAP,
+            tcr_el1: None,
             runqueues_kva: 0,
             num_cpus: 2,
-            page_offset_base_pa: None,
+            page_offset_base_kva: None,
+            memstart_addr_kva: None,
+            kern_phys_base: None,
+            phys_base_guest_published: false,
+            kern_addrs_frames: None,
+            kern_addrs_crc_bad: None,
             event: None,
             // Biased 1 = "published, KASLR-off" (slide 0): non-zero so the
             // data_valid latch fires, while saturating_sub(1) keeps the
@@ -4415,11 +5498,236 @@ mod tests {
         handle.join().unwrap();
 
         assert!(!samples.is_empty());
-        assert_eq!(samples[0].cpus.len(), 2);
-        assert_eq!(samples[0].cpus[0].rq_clock, 7777);
-        assert_eq!(samples[0].cpus[0].nr_running, 11);
-        assert_eq!(samples[0].cpus[1].rq_clock, 8888);
-        assert_eq!(samples[0].cpus[1].nr_running, 22);
+        // The populated predicate requires TWO identical reads (the
+        // stability conjunct — see `symbols::per_cpu_offsets_populated`),
+        // so the first sample legitimately precedes the latch; assert on
+        // the first latched sample instead of samples[0].
+        let latched = samples
+            .iter()
+            .find(|s| !s.cpus.is_empty())
+            .expect("data_valid never latched on a static, fully-populated table");
+        assert_eq!(latched.cpus.len(), 2);
+        assert_eq!(latched.cpus[0].rq_clock, 7777);
+        assert_eq!(latched.cpus[0].nr_running, 11);
+        assert_eq!(latched.cpus[1].rq_clock, 8888);
+        assert_eq!(latched.cpus[1].nr_running, 22);
+    }
+
+    /// Regression guard for the aarch64-6.14 dead-channel bug: the
+    /// `__per_cpu_offset[]` read PA is derived per tick from the config's
+    /// live kernel-image base (`start_kernel_map`) and `phys_base`, NOT a
+    /// PA baked at `RqRefresh` construction. The old code baked
+    /// `pco_pa = text_kva_to_pa_with_base(per_cpu_offset, start_kernel_map_for_thread, phys_base)`
+    /// once; when that thread-time base was stale (aarch64 `TCR_EL1` not
+    /// yet programmed), every slot read a silent zero, the bit-63 latch
+    /// never fired, and `evidence_channels_live` stayed false for the run.
+    /// Here the offset table sits at a NON-zero guest PA and a NON-zero
+    /// `phys_base` displaces the translation, so `data_valid` can only
+    /// latch (non-empty `cpus`) if the loop recomputes the read PA from
+    /// those base inputs. A regression that ignored the base (read at
+    /// `per_cpu_offset_kva` or a zero PA) would miss the table and leave
+    /// `cpus` empty.
+    #[test]
+    fn monitor_loop_rq_refresh_pco_pa_from_live_base() {
+        let offsets = test_offsets();
+        // 24 bytes of leading padding so the offset table does NOT sit at
+        // guest PA 0 — the base arithmetic must place the read here.
+        const TABLE_PA: u64 = 24;
+        let rq0_buf = make_rq_buffer(&offsets, 33, 1, 1, 4321, 0);
+        let rq1_buf = make_rq_buffer(&offsets, 44, 2, 2, 5432, 0);
+        let rq0_pa = TABLE_PA + 16; // after the 2-slot (16-byte) table
+        let rq1_pa = rq0_pa + rq0_buf.len() as u64;
+        const KERNEL_HALF: u64 = 1u64 << 63;
+        let pco0 = KERNEL_HALF | rq0_pa;
+        let pco1 = KERNEL_HALF | rq1_pa;
+
+        let mut combined = vec![0u8; TABLE_PA as usize];
+        combined.extend_from_slice(&pco0.to_ne_bytes());
+        combined.extend_from_slice(&pco1.to_ne_bytes());
+        combined.extend_from_slice(&rq0_buf);
+        combined.extend_from_slice(&rq1_buf);
+        // Semantic-conjunct stamp: rq[i].cpu = i (see the sibling test).
+        for (i, pa) in [rq0_pa, rq1_pa].into_iter().enumerate() {
+            let off = pa as usize + offsets.rq_cpu;
+            combined[off..off + 4].copy_from_slice(&(i as u32).to_ne_bytes());
+        }
+
+        // SAFETY: combined is a live local buffer whose backing storage
+        // outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(combined.as_ptr() as *mut u8, combined.len() as u64) };
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
+
+        // Non-degenerate base: pco_pa = per_cpu_offset_kva - S + P must
+        // equal TABLE_PA. Pick S/P non-zero so a base-ignoring regression
+        // reads the wrong PA.
+        let s = super::super::symbols::START_KERNEL_MAP;
+        let p: u64 = 0x10_0000; // 1 MiB phys displacement
+        let per_cpu_offset_kva = TABLE_PA.wrapping_add(s).wrapping_sub(p);
+
+        let refresh = RqRefresh {
+            per_cpu_offset_kva,
+            // None → loop falls back to cfg.start_kernel_map (== S below).
+            tcr_el1: None,
+            runqueues_kva: 0,
+            num_cpus: 2,
+            page_offset_base_kva: None,
+            memstart_addr_kva: None,
+            kern_phys_base: None,
+            phys_base_guest_published: false,
+            kern_addrs_frames: None,
+            kern_addrs_crc_bad: None,
+            event: None,
+            kaslr_offset: std::sync::Arc::new(AtomicU64::new(1)),
+        };
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let cfg = MonitorConfig {
+            rq_refresh: Some(&refresh),
+            page_offset: KERNEL_HALF,
+            start_kernel_map: s,
+            phys_base: p,
+            ..test_config()
+        };
+        let MonitorLoopResult { samples, .. } = monitor_loop(
+            &mem,
+            &[],
+            &offsets,
+            Duration::from_millis(10),
+            &kill,
+            &kill_evt,
+            Instant::now(),
+            &cfg,
+        );
+        handle.join().unwrap();
+
+        assert!(!samples.is_empty());
+        let latched = samples.iter().rev().find(|s| !s.cpus.is_empty()).expect(
+            "data_valid never latched — the per-tick pco_pa recompute did not \
+             locate the offset table via the live start_kernel_map/phys_base base",
+        );
+        assert_eq!(latched.cpus.len(), 2);
+        assert_eq!(latched.cpus[0].rq_clock, 4321);
+        assert_eq!(latched.cpus[0].nr_running, 33);
+        assert_eq!(latched.cpus[1].rq_clock, 5432);
+        assert_eq!(latched.cpus[1].nr_running, 44);
+    }
+
+    /// Regression guard for the x86_64-6.14 dead-channel bug: a garbage
+    /// (or zero) construction-time `phys_base` — produced when the guest's
+    /// KERN_ADDRS publish lands after the monitor's ~10 s bounded wait and
+    /// the CR3-walk fallback misfires — must NOT be a permanent latch. The
+    /// monitor re-reads the shared `+1`-biased `kern_phys_base` Arc every
+    /// tick while `data_valid` is unlatched and adopts the authoritative
+    /// value the instant it lands.
+    ///
+    /// Shape: `cfg.phys_base` carries a WRONG displacement, so the pco_pa
+    /// translation initially points past the offset table (silent zeros →
+    /// latch held, cpus empty). Mid-run a helper thread plain-stores the
+    /// CORRECT biased phys_base into the Arc (modeling rust_init's late
+    /// KERN_ADDRS publish overwriting even a fallback-seeded value); the
+    /// next tick must adopt it, land the read on the table, latch
+    /// `data_valid`, and populate `cpus`. A regression to the once-baked
+    /// behavior keeps reading through the garbage base forever → no sample
+    /// ever carries cpus → this test fails on the `expect`.
+    #[test]
+    fn monitor_loop_rq_refresh_adopts_late_phys_base_publish() {
+        let offsets = test_offsets();
+        const TABLE_PA: u64 = 24;
+        let rq0_buf = make_rq_buffer(&offsets, 55, 1, 1, 6543, 0);
+        let rq0_pa = TABLE_PA + 8; // after the 1-slot (8-byte) table
+        const KERNEL_HALF: u64 = 1u64 << 63;
+        let pco0 = KERNEL_HALF | rq0_pa;
+
+        let mut combined = vec![0u8; TABLE_PA as usize];
+        combined.extend_from_slice(&pco0.to_ne_bytes());
+        combined.extend_from_slice(&rq0_buf);
+
+        // SAFETY: combined is a live local buffer whose backing storage
+        // outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(combined.as_ptr() as *mut u8, combined.len() as u64) };
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
+
+        // Correct base: pco_pa = per_cpu_offset_kva - S + P == TABLE_PA.
+        let s = super::super::symbols::START_KERNEL_MAP;
+        let good_p: u64 = 0x10_0000; // authoritative guest phys_base
+        let bad_p: u64 = 0x40_0000; // construction fallback's garbage
+        let per_cpu_offset_kva = TABLE_PA.wrapping_add(s).wrapping_sub(good_p);
+
+        // Arc starts EMPTY (raw 0 = "guest has not published"): the loop
+        // must keep using the garbage cfg value until the publish lands.
+        let phys_base_arc = std::sync::Arc::new(AtomicU64::new(0));
+        let refresh = RqRefresh {
+            per_cpu_offset_kva,
+            tcr_el1: None,
+            runqueues_kva: 0,
+            num_cpus: 1,
+            page_offset_base_kva: None,
+            memstart_addr_kva: None,
+            kern_phys_base: Some(phys_base_arc.clone()),
+            phys_base_guest_published: false,
+            kern_addrs_frames: None,
+            kern_addrs_crc_bad: None,
+            event: None,
+            kaslr_offset: std::sync::Arc::new(AtomicU64::new(1)),
+        };
+
+        // Publish the authoritative value (biased +1, mirroring the
+        // KERN_ADDRS arm's plain store) at ~40 ms, then kill at ~120 ms —
+        // several 10 ms ticks on each side of the publish.
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            let arc = phys_base_arc.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(40));
+                arc.store(good_p.wrapping_add(1), Ordering::Release);
+                std::thread::sleep(Duration::from_millis(80));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let cfg = MonitorConfig {
+            rq_refresh: Some(&refresh),
+            page_offset: KERNEL_HALF,
+            start_kernel_map: s,
+            phys_base: bad_p, // the garbage the bounded wait latched
+            ..test_config()
+        };
+        let MonitorLoopResult { samples, .. } = monitor_loop(
+            &mem,
+            &[],
+            &offsets,
+            Duration::from_millis(10),
+            &kill,
+            &kill_evt,
+            Instant::now(),
+            &cfg,
+        );
+        handle.join().unwrap();
+
+        // Pre-publish ticks ran with the garbage base → gate held.
+        assert!(
+            samples.iter().any(|s| s.cpus.is_empty()),
+            "expected at least one pre-publish sample with the data_valid \
+             gate held (garbage phys_base must not latch)",
+        );
+        // Post-publish: adoption must flip the latch and populate cpus.
+        let latched = samples.iter().rev().find(|s| !s.cpus.is_empty()).expect(
+            "data_valid never latched after the authoritative phys_base \
+             publish — the per-tick kern_phys_base adoption regressed to \
+             the once-baked construction value",
+        );
+        assert_eq!(latched.cpus.len(), 1);
+        assert_eq!(latched.cpus[0].rq_clock, 6543);
+        assert_eq!(latched.cpus[0].nr_running, 55);
     }
 
     /// Regression: the monitor must RE-READ the KASLR-slide Arc each
@@ -4467,6 +5775,11 @@ mod tests {
         combined[8..16].copy_from_slice(&pco1.to_ne_bytes());
         combined.extend_from_slice(&rq0_buf);
         combined.extend_from_slice(&rq1_buf);
+        // Semantic-conjunct stamp: rq[i].cpu = i (see the sibling test).
+        for (i, pa) in [rq0_pa, rq1_pa].into_iter().enumerate() {
+            let off = pa as usize + offsets.rq_cpu;
+            combined[off..off + 4].copy_from_slice(&(i as u32).to_ne_bytes());
+        }
 
         // SAFETY: combined is a live local buffer outliving the GuestMem use.
         let mem = unsafe { GuestMem::new(combined.as_ptr() as *mut u8, combined.len() as u64) };
@@ -4475,10 +5788,22 @@ mod tests {
 
         let kaslr = std::sync::Arc::new(AtomicU64::new(0)); // unpublished
         let refresh = RqRefresh {
-            pco_pa: 0,
+            // pco_pa is recomputed per tick as
+            // `text_kva_to_pa_with_base(per_cpu_offset_kva, start_kernel_map,
+            // phys_base)`. With `tcr_el1: None` the loop uses the config's
+            // `start_kernel_map` (test_config: START_KERNEL_MAP) and
+            // `phys_base` (0), so `per_cpu_offset_kva == START_KERNEL_MAP`
+            // reproduces the previous `pco_pa: 0`.
+            per_cpu_offset_kva: super::super::symbols::START_KERNEL_MAP,
+            tcr_el1: None,
             runqueues_kva: KERNEL_HALF, // high-half → per_cpu_kva applies the slide
             num_cpus: 2,
-            page_offset_base_pa: None,
+            page_offset_base_kva: None,
+            memstart_addr_kva: None,
+            kern_phys_base: None,
+            phys_base_guest_published: false,
+            kern_addrs_frames: None,
+            kern_addrs_crc_bad: None,
             event: None,
             kaslr_offset: std::sync::Arc::clone(&kaslr),
         };
@@ -4564,10 +5889,22 @@ mod tests {
         let kill_evt = test_kill_evt();
 
         let refresh = RqRefresh {
-            pco_pa: 0,
+            // pco_pa is recomputed per tick as
+            // `text_kva_to_pa_with_base(per_cpu_offset_kva, start_kernel_map,
+            // phys_base)`. With `tcr_el1: None` the loop uses the config's
+            // `start_kernel_map` (test_config: START_KERNEL_MAP) and
+            // `phys_base` (0), so `per_cpu_offset_kva == START_KERNEL_MAP`
+            // reproduces the previous `pco_pa: 0`.
+            per_cpu_offset_kva: super::super::symbols::START_KERNEL_MAP,
+            tcr_el1: None,
             runqueues_kva: 0,
             num_cpus: 2,
-            page_offset_base_pa: None,
+            page_offset_base_kva: None,
+            memstart_addr_kva: None,
+            kern_phys_base: None,
+            phys_base_guest_published: false,
+            kern_addrs_frames: None,
+            kern_addrs_crc_bad: None,
             event: None,
             // Raw 0 = "no publisher yet": stays unlatched (this test
             // asserts cpus stays empty; the all-zero offset table also
@@ -4769,6 +6106,144 @@ mod tests {
         );
     }
 
+    /// The scheduler-attach watchdog reset stamps its provenance tag
+    /// (`WatchdogResetTag::ScxRootLatch` == 1) alongside the `reset_ns`
+    /// store on the first non-null `*scx_root` observation, so the
+    /// watchdog dump can attribute the reset to the attach latch.
+    #[test]
+    fn monitor_loop_watchdog_reset_stamps_scx_root_latch_tag() {
+        let offsets = test_offsets();
+        // Layout: rq_buf | scx_root slot (non-null => scheduler
+        // attached). The reset arm only tests the slot for non-zero; it
+        // does not deref the KVA, so any non-zero value arms it.
+        let rq_buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
+        let scx_root_pa = rq_buf.len() as u64;
+        let mut combined = rq_buf;
+        combined.extend_from_slice(&0xDEAD_BEEF_u64.to_ne_bytes());
+        combined.extend_from_slice(&[0u8; 64]);
+
+        // SAFETY: combined is a live local buffer whose backing storage
+        // outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
+
+        let reset_ns = AtomicU64::new(0);
+        let reset_tag = std::sync::atomic::AtomicU8::new(0);
+        let wr = WatchdogReset {
+            scx_root_pa,
+            workload_duration: Duration::from_secs(60),
+            reset_ns: &reset_ns,
+            reset_tag: &reset_tag,
+        };
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let cfg = MonitorConfig {
+            watchdog_reset: Some(wr),
+            ..test_config()
+        };
+        let _ = monitor_loop(
+            &mem,
+            &[0],
+            &offsets,
+            Duration::from_millis(10),
+            &kill,
+            &kill_evt,
+            Instant::now(),
+            &cfg,
+        );
+        handle.join().unwrap();
+
+        assert_ne!(
+            reset_ns.load(Ordering::Acquire),
+            0,
+            "a non-null scx_root must arm the reset deadline",
+        );
+        assert_eq!(
+            reset_tag.load(Ordering::Relaxed),
+            1,
+            "the scx_root attach latch must stamp ScxRootLatch (1)",
+        );
+    }
+
+    /// C6 fallback demotion: when the guest's evented
+    /// `SchedulerAttached` frame has ALREADY armed `reset_ns` (non-zero)
+    /// with `GuestAttachConfirm` provenance, the polled scx_root latch's
+    /// `compare_exchange(0, ..)` FAILS, so it must NOT overwrite the
+    /// deadline and must NOT downgrade the provenance tag to `ScxRootLatch`.
+    #[test]
+    fn monitor_loop_watchdog_reset_latch_yields_to_prearmed_guest_frame() {
+        let offsets = test_offsets();
+        // Non-null scx_root slot so the latch arm's observation fires.
+        let rq_buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
+        let scx_root_pa = rq_buf.len() as u64;
+        let mut combined = rq_buf;
+        combined.extend_from_slice(&0xDEAD_BEEF_u64.to_ne_bytes());
+        combined.extend_from_slice(&[0u8; 64]);
+
+        // SAFETY: combined is a live local buffer whose backing storage
+        // outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
+
+        // Pre-arm reset_ns non-zero (as the dispatch thread's
+        // SchedulerAttached arm would) with GuestAttachConfirm (5).
+        const PREARMED_NS: u64 = 123_456_789;
+        let reset_ns = AtomicU64::new(PREARMED_NS);
+        let guest_confirm_tag =
+            crate::vmm::freeze_coord::WatchdogResetTag::GuestAttachConfirm as u8;
+        let reset_tag = std::sync::atomic::AtomicU8::new(guest_confirm_tag);
+        let wr = WatchdogReset {
+            scx_root_pa,
+            workload_duration: Duration::from_secs(60),
+            reset_ns: &reset_ns,
+            reset_tag: &reset_tag,
+        };
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let cfg = MonitorConfig {
+            watchdog_reset: Some(wr),
+            ..test_config()
+        };
+        let _ = monitor_loop(
+            &mem,
+            &[0],
+            &offsets,
+            Duration::from_millis(10),
+            &kill,
+            &kill_evt,
+            Instant::now(),
+            &cfg,
+        );
+        handle.join().unwrap();
+
+        assert_eq!(
+            reset_ns.load(Ordering::Acquire),
+            PREARMED_NS,
+            "the polled latch overwrote a pre-armed guest deadline",
+        );
+        assert_eq!(
+            reset_tag.load(Ordering::Relaxed),
+            guest_confirm_tag,
+            "the polled latch downgraded GuestAttachConfirm provenance on a lost CAS",
+        );
+    }
+
     #[test]
     fn monitor_loop_watchdog_static_global_writes_directly() {
         let offsets = test_offsets();
@@ -4830,6 +6305,170 @@ mod tests {
         let obs = watchdog_observation.expect("watchdog_observation should be Some");
         assert_eq!(obs.expected_jiffies, 77777);
         assert_eq!(obs.observed_jiffies, 77777);
+    }
+
+    #[test]
+    fn clamp_original_timeout_keeps_sane_reads() {
+        // wd_jiffies == 5 s worth (HZ = 100 here) → clamp == 30 s worth.
+        let wd = 500u64;
+        // A plausible original (15 s) passes through unchanged.
+        assert_eq!(clamp_original_timeout(1500, wd), 1500);
+        // Zero (field not yet written) falls back to the clamp.
+        assert_eq!(clamp_original_timeout(0, wd), 3000);
+        // Garbage above the ceiling falls back to the clamp.
+        assert_eq!(clamp_original_timeout(u64::MAX, wd), 3000);
+    }
+
+    #[test]
+    fn forge_step_stops_at_fallback_bound_when_guest_never_refreshes() {
+        // Stalled scheduler: the kworker never fires, so the guest never
+        // refreshes the timestamp on its own. Forging must stop once
+        // now_j - start exceeds original_timeout + margin.
+        let mut st = WatchdogForgeState {
+            original_timeout_j: Some(15),
+            ..Default::default()
+        };
+        let margin = 2u64;
+        // Guest timestamp memory the host forges into; the guest never
+        // touches it independently, so cur_ts always reads back the last
+        // forged value.
+        let mut guest_ts = 0u64;
+        let mut forges = 0u32;
+        let mut stopped_at = None;
+        // start = first now_j = 100; bound: now_j - 100 > 15 + 2 = 17.
+        for j in 100u64..200 {
+            match forge_step(&mut st, guest_ts, j, margin) {
+                ForgeAction::Forge(v) => {
+                    guest_ts = v;
+                    forges += 1;
+                }
+                ForgeAction::Skip => {
+                    stopped_at = Some(j);
+                    break;
+                }
+            }
+        }
+        assert!(
+            st.forge_done,
+            "forging must latch off at the fallback bound"
+        );
+        // Forged for now_j in 100..=117 (18 iterations), stopped at 118.
+        assert_eq!(forges, 18);
+        assert_eq!(stopped_at, Some(118));
+    }
+
+    #[test]
+    fn forge_step_stops_on_guest_takeover() {
+        // Healthy path: the guest kworker refreshes the timestamp itself.
+        // The takeover latch must stop forging even though the fallback
+        // bound is far away.
+        let mut st = WatchdogForgeState {
+            original_timeout_j: Some(100_000),
+            ..Default::default()
+        };
+        let margin = 2u64;
+        let mut guest_ts = 0u64;
+        let mut forges = 0u32;
+        let mut took_over_at = None;
+        for j in 100u64..200 {
+            // At j == 105 the guest kworker writes a fresh, independent
+            // timestamp before the host's read this iteration.
+            if j == 105 {
+                guest_ts = 999_999;
+            }
+            match forge_step(&mut st, guest_ts, j, margin) {
+                ForgeAction::Forge(v) => {
+                    guest_ts = v;
+                    forges += 1;
+                }
+                ForgeAction::Skip => {
+                    took_over_at = Some(j);
+                    break;
+                }
+            }
+        }
+        assert!(st.forge_done, "forging must latch off on guest takeover");
+        // Forged j in 100..=104 (5 iterations), takeover detected at 105.
+        assert_eq!(forges, 5);
+        assert_eq!(took_over_at, Some(105));
+    }
+
+    #[test]
+    fn monitor_loop_watchdog_forges_and_bounds_timestamp() {
+        // End-to-end wiring: with timestamp_pa + jiffies_64_pa present the
+        // loop forges scx_watchdog_timestamp to the current jiffies_64 and
+        // captures the original timeout for the fallback bound.
+        let offsets = test_offsets();
+        let rq_buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
+        // Layout after rq_buf: watchdog_timeout | interval | timestamp | jiffies_64.
+        let base = rq_buf.len() as u64;
+        let timeout_pa = base;
+        let interval_pa = base + 8;
+        let timestamp_pa = base + 16;
+        let jiffies_64_pa = base + 24;
+
+        let mut combined = rq_buf;
+        combined.extend_from_slice(&1500u64.to_ne_bytes()); // original timeout (15 s @ HZ=100)
+        combined.extend_from_slice(&0u64.to_ne_bytes()); // interval
+        combined.extend_from_slice(&0u64.to_ne_bytes()); // timestamp
+        combined.extend_from_slice(&424242u64.to_ne_bytes()); // jiffies_64
+
+        // SAFETY: combined is a live local buffer whose backing storage
+        // outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
+
+        let wd = WatchdogOverride::StaticGlobal {
+            watchdog_timeout_pa: timeout_pa,
+            jiffies: 500, // override = 5 s @ HZ=100
+            interval_pa: Some(interval_pa),
+            timestamp_pa: Some(timestamp_pa),
+            jiffies_64_pa: Some(jiffies_64_pa),
+        };
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let cfg = MonitorConfig {
+            watchdog_override: Some(&wd),
+            ..test_config()
+        };
+        let MonitorLoopResult { samples, .. } = monitor_loop(
+            &mem,
+            &[0],
+            &offsets,
+            Duration::from_millis(10),
+            &kill,
+            &kill_evt,
+            Instant::now(),
+            &cfg,
+        );
+        handle.join().unwrap();
+
+        assert!(!samples.is_empty());
+        // Override timeout landed.
+        let ts_written = u64::from_ne_bytes(
+            combined[timeout_pa as usize..timeout_pa as usize + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(ts_written, 500);
+        // Timestamp was forged to the (static) jiffies_64 value. jiffies_64
+        // never advances in this fake, so cur_ts == last_forged after the
+        // first write and the loop keeps forging the same value without the
+        // fallback bound ever tripping (now_j - start == 0).
+        let forged = u64::from_ne_bytes(
+            combined[timestamp_pa as usize..timestamp_pa as usize + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(forged, 424242);
     }
 
     #[test]
@@ -5063,7 +6702,10 @@ mod tests {
             .unwrap();
 
         let pt = sleeper.as_pthread_t() as libc::pthread_t;
-        let vcpu_timing = VcpuTiming { pthreads: vec![pt] };
+        let vcpu_timing = VcpuTiming {
+            pthreads: vec![pt],
+            contention_recorder: None,
+        };
 
         let virtio_con = test_virtio_console();
         let trigger = DumpTrigger {
@@ -5148,7 +6790,10 @@ mod tests {
             .unwrap();
 
         let pt = spinner.as_pthread_t() as libc::pthread_t;
-        let vcpu_timing = VcpuTiming { pthreads: vec![pt] };
+        let vcpu_timing = VcpuTiming {
+            pthreads: vec![pt],
+            contention_recorder: None,
+        };
 
         let virtio_con = test_virtio_console();
         let trigger = DumpTrigger {
@@ -6645,5 +8290,526 @@ mod tests {
         );
         // The gap itself stays unbacked (resolve_ptr None's it).
         assert!(mem.host_ptr_for_pa(0xC000_0000, 8).is_none());
+    }
+
+    // ---- select_cpu_currency: currency selection + latch ----
+
+    #[test]
+    fn currency_all_task_clocks_present_selects_pmu() {
+        let mut latch = None;
+        let tc = [Some(10u64), Some(20), Some(30)];
+        let pt = [Some(100u64), Some(200), Some(300)];
+        let (ns, cur) = select_cpu_currency(&mut latch, &tc, &pt);
+        assert_eq!(cur, super::super::CPU_CURRENCY_PMU);
+        assert_eq!(ns, 60, "PMU sums the task clocks, not the pthread clocks");
+        assert_eq!(latch, Some(CurrencySource::Pmu));
+    }
+
+    #[test]
+    fn currency_any_task_clock_absent_falls_back_to_pthread() {
+        let mut latch = None;
+        let tc = [Some(10u64), None, Some(30)];
+        let pt = [Some(100u64), Some(200), Some(300)];
+        let (ns, cur) = select_cpu_currency(&mut latch, &tc, &pt);
+        assert_eq!(cur, super::super::CPU_CURRENCY_PTHREAD);
+        assert_eq!(ns, 600, "pthread source sums the available pthread clocks");
+        assert_eq!(latch, Some(CurrencySource::Pthread));
+    }
+
+    #[test]
+    fn currency_no_source_is_none() {
+        let mut latch = None;
+        let tc = [None, None];
+        let pt = [None, None];
+        let (ns, cur) = select_cpu_currency(&mut latch, &tc, &pt);
+        assert_eq!(cur, super::super::CPU_CURRENCY_NONE);
+        assert_eq!(ns, 0);
+        // Latched to pthread source: NONE is the pthread-magnitude "nothing
+        // present" byte, not a distinct source.
+        assert_eq!(latch, Some(CurrencySource::Pthread));
+    }
+
+    #[test]
+    fn currency_empty_slices_do_not_latch_pmu() {
+        // Guard the `all()`-on-empty trap: an empty task-clock slice must
+        // NOT read as "all present" and latch PMU forever with ns=0.
+        let mut latch = None;
+        let (ns, cur) = select_cpu_currency(&mut latch, &[], &[]);
+        assert_eq!(cur, super::super::CPU_CURRENCY_NONE);
+        assert_eq!(ns, 0);
+        assert_eq!(latch, Some(CurrencySource::Pthread));
+    }
+
+    #[test]
+    fn currency_latch_pmu_stays_pmu_after_flip() {
+        // Tick 1: all task clocks present → latch PMU.
+        let mut latch = None;
+        let (_, cur1) = select_cpu_currency(&mut latch, &[Some(10)], &[Some(100)]);
+        assert_eq!(cur1, super::super::CPU_CURRENCY_PMU);
+        // Tick 2: a task clock vanishes (shouldn't happen mid-run, but the
+        // latch must hold PMU regardless — no flip to pthread magnitude).
+        let (ns2, cur2) = select_cpu_currency(&mut latch, &[None], &[Some(100)]);
+        assert_eq!(cur2, super::super::CPU_CURRENCY_PMU);
+        assert_eq!(ns2, 0, "missing task clock contributes 0 under latched PMU");
+    }
+
+    #[test]
+    fn currency_latch_pthread_stays_pthread_after_flip() {
+        // Tick 1: a task clock is absent → latch pthread.
+        let mut latch = None;
+        let (_, cur1) = select_cpu_currency(&mut latch, &[None, Some(5)], &[Some(50), Some(60)]);
+        assert_eq!(cur1, super::super::CPU_CURRENCY_PTHREAD);
+        // Tick 2: now ALL task clocks present — but the latch holds pthread,
+        // it must NOT flip to PMU magnitude.
+        let (ns2, cur2) =
+            select_cpu_currency(&mut latch, &[Some(5), Some(5)], &[Some(50), Some(60)]);
+        assert_eq!(cur2, super::super::CPU_CURRENCY_PTHREAD);
+        assert_eq!(ns2, 110, "pthread source keeps summing pthread clocks");
+    }
+
+    // ---- MaxVcpuInPhaseTracker: width-independent Tier-1 evidence ----
+
+    #[test]
+    fn active_per_vcpu_picks_source_and_zeros_absent() {
+        let tc = [Some(10), None, Some(30)];
+        let pt = [Some(100), Some(200), None];
+        assert_eq!(
+            active_per_vcpu_cpu_ns(CurrencySource::Pmu, &tc, &pt),
+            vec![10, 0, 30]
+        );
+        assert_eq!(
+            active_per_vcpu_cpu_ns(CurrencySource::Pthread, &tc, &pt),
+            vec![100, 200, 0]
+        );
+    }
+
+    #[test]
+    fn max_vcpu_first_tick_re_anchors_to_zero() {
+        // Boot readings already carry accumulated CPU; the first observe
+        // anchors to them and reports 0 — never charges pre-phase burn.
+        let mut t = MaxVcpuInPhaseTracker::new();
+        assert_eq!(t.observe(&[500_000_000, 600_000_000, 550_000_000], 0), 0);
+    }
+
+    #[test]
+    fn max_vcpu_reports_max_delta_within_a_phase() {
+        let mut t = MaxVcpuInPhaseTracker::new();
+        assert_eq!(t.observe(&[100, 100, 100], 1), 0); // anchor
+        // vCPU 1 burned 250, the others 10/30 → max delta 250.
+        assert_eq!(t.observe(&[110, 350, 130], 1), 250);
+    }
+
+    #[test]
+    fn max_vcpu_re_anchors_on_phase_epoch_change() {
+        // A phase advance re-anchors BEFORE computing, so the tick that
+        // detects the epoch change reads 0 even though the readings jumped
+        // — the new phase never inherits the prior phase's accumulated CPU.
+        let mut t = MaxVcpuInPhaseTracker::new();
+        assert_eq!(t.observe(&[0, 0], 1), 0); // anchor at phase 1
+        assert_eq!(t.observe(&[9_000_000_000, 1_000_000], 1), 9_000_000_000);
+        // phase_epoch 1→2: re-anchor to the huge readings, report 0.
+        assert_eq!(t.observe(&[9_000_000_000, 1_000_000], 2), 0);
+        // Subsequent burn in phase 2 charges only from the re-anchor.
+        assert_eq!(t.observe(&[9_000_005_000, 1_000_000], 2), 5_000);
+    }
+
+    #[test]
+    fn max_vcpu_wide_idle_guest_stays_tiny_while_sum_is_huge() {
+        // THE REGRESSION ROW: 256 vCPUs each accruing a diffuse background
+        // burn (here ~40 ms over the phase) — the SUM is ~10.4 s (which the
+        // old summed Tier-1 evidence would charge against a per-vCPU-linear
+        // budget and false-fire), but the MAX per vCPU is only ~40 ms, so
+        // Tier-1 sees a tiny number and never fires on width alone.
+        let mut t = MaxVcpuInPhaseTracker::new();
+        let anchor = vec![500_000_000u64; 256];
+        assert_eq!(t.observe(&anchor, 5), 0);
+        // Each vCPU advanced by a jittered 30-40 ms; none is a hot spinner.
+        let readings: Vec<u64> = (0..256)
+            .map(|i| 500_000_000 + 30_000_000 + (i as u64 % 11) * 1_000_000)
+            .collect();
+        let max = t.observe(&readings, 5);
+        assert_eq!(max, 40_000_000, "max per vCPU is ~40 ms, not the ~10 s sum");
+    }
+
+    #[test]
+    fn max_vcpu_vcpu_count_change_re_anchors() {
+        // A vCPU-count change (slice length differs) re-anchors rather than
+        // zipping mismatched indices — returns 0 that tick.
+        let mut t = MaxVcpuInPhaseTracker::new();
+        assert_eq!(t.observe(&[100, 200], 1), 0);
+        assert_eq!(t.observe(&[100, 200, 300], 1), 0, "len change re-anchors");
+        assert_eq!(t.observe(&[110, 250, 330], 1), 50);
+    }
+
+    // ---- PhaseWitnessTracker: per-phase schedstat attribution ----
+
+    fn ss(on_cpu: u64, run_delay: u64) -> crate::vmm::result::HostVcpuSchedstat {
+        crate::vmm::result::HostVcpuSchedstat {
+            total_on_cpu_ns: on_cpu,
+            total_run_delay_ns: run_delay,
+            sampled_vcpus: 2,
+        }
+    }
+
+    const BODY: u8 = 3; // LifecycleStage::Body
+    const DISPATCH: u8 = 2;
+    const TEARDOWN: u8 = 4;
+
+    #[test]
+    fn phase_witness_attributes_deltas_to_own_span() {
+        // First tick seeds (attributes nothing). Then two Dispatch ticks, two
+        // Body ticks, one Teardown tick — each stage's slot must hold exactly
+        // its own span's cumulative-schedstat delta, not the whole run's.
+        let mut t = PhaseWitnessTracker::new(100_000_000);
+        const T: u64 = 100_000_000; // one nominal tick of wall
+        t.observe(ss(1_000, 100), DISPATCH, 0); // seed anchor at (1000,100)
+        t.observe(ss(1_500, 150), DISPATCH, T); // Dispatch running: delta (500,50)
+        t.observe(ss(2_000, 200), DISPATCH, 2 * T); // Dispatch running: delta (1000,100)
+        // Advance to Body: re-anchor at (2000,200). Body slot starts from here.
+        t.observe(ss(2_400, 260), BODY, 3 * T); // Body running: delta (400,60)
+        t.observe(ss(3_000, 500), BODY, 4 * T); // Body running: delta (1000,300)
+        // Advance to Teardown: re-anchor at (3000,500).
+        t.observe(ss(3_100, 900), TEARDOWN, 5 * T); // Teardown: delta (100,400)
+        let w = t.finish().expect("seeded");
+        // Body enter = the pre-Body observation (2*T), exit = the post-Body
+        // observation (5*T) → wall 3 ticks. Two closed Body ticks over that.
+        assert_eq!(w.body_window.body_wall_ns, 3 * T);
+        let disp = w
+            .per_phase
+            .for_stage(crate::monitor::LifecycleStage::Dispatch);
+        assert_eq!((disp.total_on_cpu_ns, disp.total_run_delay_ns), (1000, 100));
+        let body = w.per_phase.body();
+        assert_eq!((body.total_on_cpu_ns, body.total_run_delay_ns), (1000, 300));
+        // Body D = 1 + 300/1000 = 1.3.
+        assert_eq!(w.per_phase.body_dilation(), Some(1.3));
+        let tear = w
+            .per_phase
+            .for_stage(crate::monitor::LifecycleStage::Teardown);
+        assert_eq!((tear.total_on_cpu_ns, tear.total_run_delay_ns), (100, 400));
+    }
+
+    #[test]
+    fn phase_witness_body_tick_series_and_tick_ns() {
+        // The per-tick TOTAL run-delay delta is pushed while the stage is
+        // Body. The transition tick into Body pushes its (Dispatch→Body-span)
+        // delta too — over-count = conservative. tick_ns is carried through.
+        let mut t = PhaseWitnessTracker::new(100_000_000);
+        const T: u64 = 100_000_000;
+        t.observe(ss(0, 0), DISPATCH, 0); // seed
+        t.observe(ss(10, 5), DISPATCH, T); // Dispatch tick: NOT in body series
+        t.observe(ss(20, 25), BODY, 2 * T); // first Body tick: run_delay delta = 20
+        t.observe(ss(30, 40), BODY, 3 * T); // Body tick: run_delay delta = 15
+        t.observe(ss(40, 90), BODY, 4 * T); // Body tick: run_delay delta = 50
+        let w = t.finish().expect("seeded");
+        assert_eq!(w.body_window.tick_deltas, vec![20, 15, 50]);
+        assert_eq!(w.body_window.tick_ns, 100_000_000);
+        assert!(!w.body_window.saturated);
+        // Enter = pre-Body observation (T); no post-Body observation → exit
+        // falls back to the last observation (4*T). Wall = 3 ticks.
+        assert_eq!(w.body_window.body_wall_ns, 3 * T);
+        // Body ticks at 2*T, 3*T, 4*T → covered span = 4*T − 2*T = 2 ticks.
+        assert_eq!(w.body_window.body_covered_ns, 2 * T);
+    }
+
+    #[test]
+    fn phase_witness_saturating_delta_never_wraps() {
+        // A cumulative schedstat that REGRESSES (a TID vanished then a fresh
+        // one with a smaller total reappeared) yields a 0 per-tick delta, not
+        // a wrapped huge value.
+        let mut t = PhaseWitnessTracker::new(100_000_000);
+        const T: u64 = 100_000_000;
+        t.observe(ss(0, 0), BODY, 0); // seed (already in Body)
+        t.observe(ss(1_000, 1_000), BODY, T); // delta 1000
+        t.observe(ss(500, 400), BODY, 2 * T); // regressed → saturating 0
+        let w = t.finish().expect("seeded");
+        assert_eq!(w.body_window.tick_deltas, vec![1_000, 0]);
+        // Seeded already in Body: enter pins at the seed observation (0),
+        // exit falls back to the last observation (2*T).
+        assert_eq!(w.body_window.body_wall_ns, 2 * T);
+    }
+
+    #[test]
+    fn phase_witness_no_body_tick_yields_zero_wall_and_span() {
+        // A monitor that ticked (Dispatch, Teardown) but NEVER landed a tick
+        // inside Body — the starved-CI shape that made `W == 0`. The Body
+        // series is empty and both the wall and the covered span are 0, so the
+        // seam has an explicit "witness never covered Body" signal to refuse a
+        // FailConfirm on.
+        let mut t = PhaseWitnessTracker::new(100_000_000);
+        const T: u64 = 100_000_000;
+        t.observe(ss(0, 0), DISPATCH, 0); // seed
+        t.observe(ss(10, 5), DISPATCH, T); // Dispatch
+        t.observe(ss(20, 25), TEARDOWN, 2 * T); // jumped straight past Body
+        let w = t.finish().expect("seeded");
+        assert!(w.body_window.tick_deltas.is_empty());
+        assert_eq!(w.body_window.body_wall_ns, 0);
+        assert_eq!(w.body_window.body_covered_ns, 0);
+    }
+
+    #[test]
+    fn phase_witness_coarse_ticks_span_the_body() {
+        // A STARVED monitor that landed only three Body ticks, spaced ~20 s
+        // apart (time-sliced off the shared host CPU) — but they reach from
+        // near Body start to near Body end. The covered span (first→last tick)
+        // is ~40 s of the ~61 s Body wall, so the series WATCHED most of the
+        // phase: density is coarse but coverage is honest (each tick's delta
+        // still captured the full 20 s gap's run-delay).
+        let mut t = PhaseWitnessTracker::new(100_000_000);
+        const S: u64 = 1_000_000_000; // 1 s
+        t.observe(ss(0, 0), DISPATCH, 0); // seed
+        t.observe(ss(10, 5), BODY, 20 * S); // first Body tick, 20 s in
+        t.observe(ss(20, 25), BODY, 40 * S); // second, +20 s
+        t.observe(ss(30, 40), BODY, 60 * S); // third, +20 s
+        t.observe(ss(40, 50), TEARDOWN, 61 * S); // exit
+        let w = t.finish().expect("seeded");
+        assert_eq!(w.body_window.tick_deltas.len(), 3);
+        // Enter = pre-Body observation (seed, 0), exit = post-Body (61 s).
+        assert_eq!(w.body_window.body_wall_ns, 61 * S);
+        // Covered = last Body tick (60 s) − first Body tick (20 s) = 40 s.
+        assert_eq!(w.body_window.body_covered_ns, 40 * S);
+    }
+
+    #[test]
+    fn phase_witness_clustered_ticks_low_covered_span() {
+        // The dense-then-silent shape: several Body ticks CLUSTERED near the
+        // start, then the monitor is silent until it observes Teardown far
+        // later. The covered span (first→last Body tick) is tiny relative to
+        // the enter→exit Body wall — the seam's under-coverage signal.
+        let mut t = PhaseWitnessTracker::new(100_000_000);
+        const S: u64 = 1_000_000_000; // 1 s
+        t.observe(ss(0, 0), DISPATCH, 0); // seed
+        t.observe(ss(10, 5), BODY, S); // Body ticks cluster at 1..1.2 s
+        t.observe(ss(20, 25), BODY, S + 100_000_000);
+        t.observe(ss(30, 40), BODY, S + 200_000_000);
+        t.observe(ss(40, 50), TEARDOWN, 60 * S); // silent, then exit at 60 s
+        let w = t.finish().expect("seeded");
+        assert_eq!(w.body_window.tick_deltas.len(), 3);
+        // Wall = enter (seed, 0) → exit (60 s). Covered = 1.2 s − 1 s = 0.2 s.
+        assert_eq!(w.body_window.body_wall_ns, 60 * S);
+        assert_eq!(w.body_window.body_covered_ns, 200_000_000);
+    }
+
+    #[test]
+    fn phase_witness_unseeded_is_none() {
+        // No observation → no witness.
+        let t = PhaseWitnessTracker::new(100_000_000);
+        assert!(t.finish().is_none());
+    }
+
+    #[test]
+    fn phase_witness_body_series_saturates_at_cap() {
+        // Filling past BODY_TICK_CAP stops growing the Vec and sets the flag.
+        let mut t = PhaseWitnessTracker::new(1);
+        t.observe(ss(0, 0), BODY, 0); // seed
+        let mut cum = 0u64;
+        for _ in 0..(BODY_TICK_CAP + 5) {
+            cum += 1;
+            t.observe(ss(cum, cum), BODY, cum);
+        }
+        let w = t.finish().expect("seeded");
+        assert_eq!(w.body_window.tick_deltas.len(), BODY_TICK_CAP);
+        assert!(w.body_window.saturated);
+    }
+
+    // ---- ProgressLedger: monitor-loop integration ----
+
+    /// Drive `monitor_loop` for a short run with a `ProgressLedger`
+    /// wired in, killing the loop from a helper thread. Returns the
+    /// ledger for assertions.
+    fn run_ledger_loop(buf: &[u8], run_ms: u64) -> ProgressLedger {
+        let offsets = test_offsets();
+        // SAFETY: buf outlives the GuestMem use (borrowed for this call).
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+        let ledger = ProgressLedger::default();
+        let cfg = MonitorConfig {
+            progress_ledger: Some(&ledger),
+            ..test_config()
+        };
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(run_ms));
+                kill.store(true, Ordering::Release);
+            })
+        };
+        let _ = monitor_loop(
+            &mem,
+            &[0],
+            &offsets,
+            Duration::from_millis(10),
+            &kill,
+            &kill_evt,
+            Instant::now(),
+            &cfg,
+        );
+        handle.join().unwrap();
+        ledger
+    }
+
+    #[test]
+    fn monitor_loop_ledger_heartbeat_advances_static_no_progress() {
+        // Static buffer with queued work, `data_valid` latched (rq_refresh
+        // None → resolved from tick 1): heartbeat pulses every tick, the
+        // guest evidence channels are live, but progress_epoch stays 0
+        // (milestone-only; the monitor never bumps it from kernel noise).
+        let offsets = test_offsets();
+        let buf = make_rq_buffer(&offsets, 2, 1, 3, 500, 0);
+        let ledger = run_ledger_loop(&buf, 50);
+
+        // (a) heartbeat advances across the short (~5-tick) run.
+        assert!(
+            ledger.monitor_heartbeat.load(Ordering::Relaxed) >= 2,
+            "heartbeat did not advance: {}",
+            ledger.monitor_heartbeat.load(Ordering::Relaxed)
+        );
+        // Milestone-only: a static buffer never bumps progress_epoch
+        // (kernel scheduling noise is not progress).
+        assert_eq!(ledger.progress_epoch.load(Ordering::Acquire), 0);
+        // nr_running/dsq queued → demand, and the channels are live so
+        // that reading is trustworthy.
+        assert!(ledger.runnable_demand.load(Ordering::Relaxed));
+        assert!(
+            ledger.evidence_channels_live.load(Ordering::Relaxed),
+            "data_valid + non-empty cpus → channels live"
+        );
+        // No vcpu_timing configured → no CPU-time currency this run.
+        assert_eq!(
+            ledger.cpu_currency.load(Ordering::Relaxed),
+            super::super::CPU_CURRENCY_NONE
+        );
+        assert_eq!(ledger.cpu_ns_now.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn monitor_loop_ledger_no_demand_when_idle() {
+        // All-zero rq: no nr_running, no scx tasks, no DSQ depth → the
+        // guest is idle, not wedged, so runnable_demand must be false
+        // even though the heartbeat keeps pulsing.
+        let offsets = test_offsets();
+        let buf = make_rq_buffer(&offsets, 0, 0, 0, 0, 0);
+        let ledger = run_ledger_loop(&buf, 50);
+
+        assert!(ledger.monitor_heartbeat.load(Ordering::Relaxed) >= 2);
+        assert!(!ledger.runnable_demand.load(Ordering::Relaxed));
+        assert_eq!(ledger.progress_epoch.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn monitor_loop_ledger_pre_resolution_channels_dead_cpu_accrues() {
+        // Fix 1 + Fix 2 together, in the pre-resolution (pre-boot) window:
+        // an rq_refresh whose `__per_cpu_offset[]` never populates keeps
+        // `data_valid` false forever, so `cpus` stays EMPTY every tick
+        // (the guest kernel hasn't brought up its per-CPU rq structures).
+        // With a real vCPU pthread wired, the ledger must STILL accrue CPU
+        // (currency=pthread, sourced host-side directly) while
+        // `evidence_channels_live` stays FALSE (guest channels blind) —
+        // exactly the shape that must NOT be read as a Tier-2 idle wedge.
+        let offsets = test_offsets();
+        // 64 zero bytes: `__per_cpu_offset[]` reads all-zero → never latches.
+        let mem_buf = [0u8; 64];
+        // SAFETY: mem_buf outlives the GuestMem use (borrowed for this call).
+        let mem = unsafe { GuestMem::new(mem_buf.as_ptr() as *mut u8, mem_buf.len() as u64) };
+        let refresh = RqRefresh {
+            // pco_pa is recomputed per tick as
+            // `text_kva_to_pa_with_base(per_cpu_offset_kva, start_kernel_map,
+            // phys_base)`. With `tcr_el1: None` the loop uses the config's
+            // `start_kernel_map` (test_config: START_KERNEL_MAP) and
+            // `phys_base` (0), so `per_cpu_offset_kva == START_KERNEL_MAP`
+            // reproduces the previous `pco_pa: 0`.
+            per_cpu_offset_kva: super::super::symbols::START_KERNEL_MAP,
+            tcr_el1: None,
+            runqueues_kva: 0,
+            num_cpus: 1,
+            page_offset_base_kva: None,
+            memstart_addr_kva: None,
+            kern_phys_base: None,
+            phys_base_guest_published: false,
+            kern_addrs_frames: None,
+            kern_addrs_crc_bad: None,
+            event: None,
+            kaslr_offset: std::sync::Arc::new(AtomicU64::new(0)),
+        };
+
+        // A busy-spinning thread accrues real pthread CPU time so
+        // `cpu_ns_now` advances host-side, independent of guest memory.
+        let spin_kill = std::sync::Arc::new(AtomicBool::new(false));
+        let spin_kill_c = spin_kill.clone();
+        let spinner = std::thread::Builder::new()
+            .name("pre-res-spinner".into())
+            .spawn(move || {
+                let mut x: u64 = 0;
+                while !spin_kill_c.load(Ordering::Acquire) {
+                    x = x.wrapping_add(1);
+                    std::hint::black_box(x);
+                }
+            })
+            .unwrap();
+        let pt = {
+            use std::os::unix::thread::JoinHandleExt;
+            spinner.as_pthread_t() as libc::pthread_t
+        };
+        let vcpu_timing = VcpuTiming {
+            pthreads: vec![pt],
+            contention_recorder: None,
+        };
+
+        let ledger = ProgressLedger::default();
+        let cfg = MonitorConfig {
+            rq_refresh: Some(&refresh),
+            vcpu_timing: Some(&vcpu_timing),
+            progress_ledger: Some(&ledger),
+            ..test_config()
+        };
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(80));
+                kill.store(true, Ordering::Release);
+            })
+        };
+        let MonitorLoopResult { samples, .. } = monitor_loop(
+            &mem,
+            &[],
+            &offsets,
+            Duration::from_millis(10),
+            &kill,
+            &kill_evt,
+            Instant::now(),
+            &cfg,
+        );
+        handle.join().unwrap();
+        spin_kill.store(true, Ordering::Release);
+        let _ = spinner.join();
+
+        // Pre-resolution held the whole run: every pushed sample has empty
+        // cpus (data_valid never latched).
+        assert!(!samples.is_empty());
+        for s in &samples {
+            assert!(
+                s.cpus.is_empty(),
+                "data_valid must never latch on zero offsets"
+            );
+        }
+        // Fix 2: channels stayed blind (guest per-CPU data never resolved).
+        assert!(
+            !ledger.evidence_channels_live.load(Ordering::Relaxed),
+            "evidence_channels_live must be false pre-resolution"
+        );
+        // Fix 1: CPU still accrued from the host pthread clock, with
+        // pthread currency — so Tier-1 governs a spinning boot wedge even
+        // while the guest channels are blind.
+        assert_eq!(
+            ledger.cpu_currency.load(Ordering::Relaxed),
+            super::super::CPU_CURRENCY_PTHREAD,
+            "pthread clock present → currency latches pthread pre-resolution"
+        );
+        assert!(
+            ledger.cpu_ns_now.load(Ordering::Relaxed) > 0,
+            "cpu_ns_now must accrue from the host pthread clock pre-resolution"
+        );
     }
 }

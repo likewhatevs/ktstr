@@ -200,16 +200,19 @@ impl<'a> ScxEventsView<'a> {
         ]
     }
 
-    /// Derived per-second rate fields as `(name, value)` pairs.
+    /// Derived per-vCPU-CPU-second rate fields as `(name, value)` pairs.
     /// Separate from [`Self::total_pairs`] because rates have a
     /// different semantic (rate-bounded asserts, not count-bounded)
     /// and a different value type (f64 vs i64). Order:
     /// `select_cpu_fallback_rate`, `dispatch_keep_last_rate`.
     pub fn rates_pairs(&self) -> Vec<(&'static str, f64)> {
-        vec![
+        [
             ("select_cpu_fallback_rate", self.deltas.fallback_rate),
             ("dispatch_keep_last_rate", self.deltas.keep_last_rate),
         ]
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|value| (name, value)))
+        .collect()
     }
 }
 
@@ -295,12 +298,13 @@ mod tests {
     fn series_monitor_scx_events_pairs_map_to_named_counters() {
         let mut report = MonitorReport::default();
         report.summary.event_deltas = Some(ScxEventDeltas {
+            total_event_vcpu_sec: Some(1.0),
             total_fallback: 1,
-            fallback_rate: 0.5,
+            fallback_rate: Some(0.5),
             max_fallback_burst: 2,
             total_dispatch_offline: 3,
             total_dispatch_keep_last: 4,
-            keep_last_rate: 0.75,
+            keep_last_rate: Some(0.75),
             total_enq_skip_exiting: 5,
             total_enq_skip_migration_disabled: 6,
             total_reenq_immed: 7,

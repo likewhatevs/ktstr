@@ -561,6 +561,33 @@ impl NumaMemoryLayout {
                 ));
             }
 
+            // Opportunistic THP: hint the anonymous 4 KiB-backed region for
+            // 2 MiB transparent hugepages. Self-serve under the host's default
+            // `THP=madvise` policy — with `madvise` the kernel only builds
+            // huge pages for VMAs that ask, so this advice is what turns guest
+            // RAM into 2 MiB backing (fewer EPT/stage-2 walks, fewer TLB
+            // misses). Best-effort by design: a kernel built without THP, or
+            // with `THP=never`, returns EINVAL; there is no failure mode, so
+            // the result is ignored. NOT applied to the perf-mode MAP_HUGETLB
+            // branch above — that already reserves explicit hugetlb 2 MiB pages
+            // and `MADV_HUGEPAGE` is rejected on hugetlb mappings anyway.
+            //
+            // Deferred-min interaction: with `MADV_HUGEPAGE` a single 4 KiB
+            // fault can materialize a full 2 MiB page, so a sparsely-touched
+            // region could inflate RSS. ktstr's boot touches are dense (the
+            // guest faults contiguous early-boot memory), so the 2 MiB pages
+            // this collapses are near-fully used rather than padding untouched
+            // guest RAM into residency.
+            //
+            // SAFETY: `node_ptr`/`va_span` is the mapping just returned by the
+            // `mmap` above (checked != MAP_FAILED); `madvise` only reads/sets
+            // VMA advice over that exact range.
+            if !use_hugepages {
+                unsafe {
+                    libc::madvise(node_ptr, va_span, libc::MADV_HUGEPAGE);
+                }
+            }
+
             // Step 5: Wrap as vm-memory types. build_raw sets owned=false.
             let mmap_region = unsafe {
                 MmapRegion::build_raw(
@@ -1276,6 +1303,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let layout = NumaMemoryLayout::compute(&topo, 8192, 0, X86_GAP).unwrap();
         let top = layout.top_gpa();

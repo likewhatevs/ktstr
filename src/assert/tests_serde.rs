@@ -163,6 +163,49 @@ fn assert_result_postcard_roundtrip() {
     );
 }
 
+/// The `AssertDetail::latency_gate` evidence survives BOTH the postcard
+/// guest→host wire and JSON. Postcard is not self-describing: the field
+/// carries NO `skip_serializing_if`, so `None` still encodes its 1-byte
+/// Option tag and the host decoder stays in sync. `Some((measured,
+/// threshold))` must round-trip intact so the seam can re-run the
+/// tri-state verdict against it.
+#[test]
+fn latency_gate_evidence_roundtrips_postcard_and_json() {
+    use crate::assert::LatencyGate;
+    let detail = AssertDetail::new(DetailKind::Benchmark, "p99 wake latency 8ms exceeds 4ms")
+        .with_latency_gate(8_000_000, 4_000_000);
+    let r = AssertResult {
+        outcomes: vec![Outcome::Fail(detail)],
+        passes: vec![],
+        stats: Default::default(),
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    let want = Some(LatencyGate {
+        measured_ns: 8_000_000,
+        threshold_ns: 4_000_000,
+    });
+
+    let pc: AssertResult =
+        postcard::from_bytes(&postcard::to_allocvec(&r).expect("encode")).expect("decode");
+    assert_eq!(pc.failure_details().next().unwrap().latency_gate, want);
+
+    let js: AssertResult = serde_json::from_str(&serde_json::to_string(&r).expect("json encode"))
+        .expect("json decode");
+    assert_eq!(js.failure_details().next().unwrap().latency_gate, want);
+}
+
+/// A sidecar / detail record written before `latency_gate` existed lacks
+/// the field entirely; `#[serde(default)]` must deserialize it to `None`
+/// rather than erroring, keeping old JSON records readable.
+#[test]
+fn assert_detail_json_without_latency_gate_defaults_none() {
+    let legacy = r#"{"kind":"Benchmark","message":"old record","phase":null}"#;
+    let d: AssertDetail = serde_json::from_str(legacy).expect("legacy record must deserialize");
+    assert_eq!(d.latency_gate, None);
+    assert_eq!(d.message, "old record");
+}
+
 /// Strict-type rejection on `Assert` deserialize. The serde
 /// derive emits typed `invalid type ...: expected $T` errors when
 /// the wire payload supplies the wrong type — a regression that

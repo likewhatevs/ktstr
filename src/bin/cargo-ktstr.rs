@@ -1,6 +1,6 @@
 //! Cargo-integrated `cargo ktstr <SUB>` binary entry point.
 //!
-//! This file is the bin target itself: the inherited global jemalloc
+//! This file is the bin target itself: the global jemalloc
 //! allocator, tracing init, SIGPIPE restore, top-level [`clap::Parser`]
 //! dispatch,
 //! and the `KtstrCommand` match arm that fans out to each subcommand
@@ -43,8 +43,9 @@
 //! would look for `src/bin/cargo-ktstr/<mod>.rs`, an underscore-vs-hyphen
 //! mismatch with the actual `src/bin/cargo_ktstr/` directory.
 
-// Global allocator (jemalloc) is provided centrally by the ktstr
-// library crate (src/lib.rs) and inherited by this bin.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[path = "cargo_ktstr/affected/mod.rs"]
 mod affected;
 #[path = "cargo_ktstr/cli.rs"]
@@ -85,6 +86,7 @@ use ktstr::cli::KernelCommand;
 use crate::cli::{Cargo, CargoSub, KtstrCommand};
 
 fn main() {
+    ktstr::host_heap::mark_jemalloc_global_allocator();
     // Restore SIGPIPE so piping `cargo ktstr ... | head` doesn't
     // panic inside `print!`. See `ktstr::cli::restore_sigpipe_default`
     // for the full rationale; shared across all three ktstr bins so

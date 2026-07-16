@@ -524,6 +524,13 @@ impl KtstrVm {
     pub(super) fn init_virtio_blk(
         &self,
         vm: &kvm::KtstrKvm,
+        // No-perf worker-placement override from `run_vm`'s run-time
+        // replan. `Some` on the no-perf test path — the fresh LLC plan's
+        // CPUs, which name the LLCs the run-scoped flocks hold; the worker
+        // shares that budget. `None` on the interactive path (no replan
+        // runs) and every non-no-perf run, where the placement falls back
+        // to the build-time `self.no_perf_plan.cpus` exactly as before.
+        no_perf_cpus: Option<&[usize]>,
     ) -> Result<Option<Arc<PiMutex<virtio_blk::VirtioBlk>>>> {
         let Some(disk) = self.disk.as_ref() else {
             return Ok(None);
@@ -593,10 +600,15 @@ impl KtstrVm {
         // fallback). The setter only takes effect on the next worker
         // spawn — `with_options` deferred initial spawn to DRIVER_OK
         // (matching the respawn path), so this call lands inside the
-        // window and the first worker observes the placement.
+        // window and the first worker observes the placement. The
+        // run-time-replan `no_perf_cpus` override wins over the
+        // build-time `no_perf_plan.cpus` so the worker binds to the same
+        // LLCs the run-scoped flocks hold.
         let placement = virtio_blk::WorkerPlacement {
             service_cpu: self.pinning_plan.as_ref().and_then(|p| p.service_cpu),
-            no_perf_cpus: self.no_perf_plan.as_ref().map(|p| p.cpus.clone()),
+            no_perf_cpus: no_perf_cpus
+                .map(<[usize]>::to_vec)
+                .or_else(|| self.no_perf_plan.as_ref().map(|p| p.cpus.clone())),
         };
         blk.set_worker_placement(placement);
         blk.set_mem((*vm.guest_mem).clone());
@@ -858,6 +870,10 @@ impl KtstrVm {
         vm: &kvm::KtstrKvm,
         pci_bus: &Arc<PiMutex<pci::PciBus>>,
         msix_sink: Option<Arc<dyn virtio_msix::MsixRouteSink>>,
+        // No-perf worker-placement override — same semantics as the MMIO
+        // twin `init_virtio_blk`: the run-time-replan CPUs when `Some`,
+        // else the build-time `self.no_perf_plan.cpus` fallback.
+        no_perf_cpus: Option<&[usize]>,
     ) -> Result<Option<BlkDeviceHandles>> {
         let Some(disk) = self.disk.as_ref() else {
             return Ok(None);
@@ -876,10 +892,13 @@ impl KtstrVm {
             virtio_blk::VirtioBlk::with_options(backing, capacity, disk.throttle, disk.read_only);
         // Worker placement + guest memory — same as `init_virtio_blk`. Both land
         // before the deferred initial worker spawn (DRIVER_OK), so the first
-        // worker observes the placement and guest memory.
+        // worker observes the placement and guest memory. The run-time-replan
+        // `no_perf_cpus` override wins over the build-time `no_perf_plan.cpus`.
         let placement = virtio_blk::WorkerPlacement {
             service_cpu: self.pinning_plan.as_ref().and_then(|p| p.service_cpu),
-            no_perf_cpus: self.no_perf_plan.as_ref().map(|p| p.cpus.clone()),
+            no_perf_cpus: no_perf_cpus
+                .map(<[usize]>::to_vec)
+                .or_else(|| self.no_perf_plan.as_ref().map(|p| p.cpus.clone())),
         };
         blk.set_worker_placement(placement);
         blk.set_mem((*vm.guest_mem).clone());
@@ -1912,6 +1931,9 @@ impl KtstrVm {
             cmdline.push_str(" KTSTR_WPROF_ARGS=");
             cmdline.push_str(&wprof.args_cmdline());
         }
+        if !self.bpf_map_writes.is_empty() {
+            cmdline.push_str(" KTSTR_AWAIT_BPF_MAP_WRITE_READY=1");
+        }
         if !self.cmdline_extra.is_empty() {
             cmdline.push(' ');
             cmdline.push_str(&self.cmdline_extra);
@@ -2238,6 +2260,9 @@ impl KtstrVm {
             cmdline.push_str(" KTSTR_WPROF_ARGS=");
             cmdline.push_str(&wprof.args_cmdline());
         }
+        if !self.bpf_map_writes.is_empty() {
+            cmdline.push_str(" KTSTR_AWAIT_BPF_MAP_WRITE_READY=1");
+        }
         if !self.cmdline_extra.is_empty() {
             cmdline.push(' ');
             cmdline.push_str(&self.cmdline_extra);
@@ -2265,7 +2290,6 @@ impl KtstrVm {
 
         let mpidrs =
             aarch64::topology::read_mpidrs(&vm.vcpus).context("read vCPU MPIDRs for FDT")?;
-        let hw_cache_level = aarch64::topology::host_cache_levels();
         let guest_l1_unified = aarch64::topology::host_l1_is_unified();
         let dtb = aarch64::fdt::create_fdt(
             &self.topology,
@@ -2274,7 +2298,6 @@ impl KtstrVm {
             &cmdline,
             initrd_addr,
             initrd_size,
-            hw_cache_level,
             guest_l1_unified,
             vm.numa_layout.as_ref().expect(
                 "numa_layout is Some by the time FDT creation runs: \
@@ -2310,6 +2333,46 @@ impl KtstrVm {
         // APs start powered off via PSCI — no register setup needed.
         Ok(())
     }
+}
+
+/// Per-VM halt-poll interval to apply via `KVM_CAP_HALT_POLL`, or `None` to
+/// leave the host's `kvm.halt_poll_ns` module default in place.
+///
+/// Keyed on signals resolved by the time `KtstrVm::run` calls this — the
+/// build-time mode flags plus the run-time `acquire_run_locks` outcome
+/// (`overcommit` is true when the default path fell back to an overcommitted
+/// CPU mask rather than a 1:1 pin, i.e. `RunLocks::default_cpu_mask` is set):
+///
+/// * `no_perf_mode` → `Some(0)`: the guest deliberately shares host CPUs with
+///   peers, so halt polling burns CPU that belongs to others.
+/// * `performance_mode` → `None`: perf mode disables HLT exits and enables the
+///   guest's own haltpoll cpuidle (see `tune_kvm_caps`), which drives
+///   `MSR_KVM_POLL_CONTROL` — host halt polling is redundant, leave the module
+///   default.
+/// * default mode, overcommit fallback → `Some(0)`: vCPUs exceed the acquired
+///   host CPUs, so polling wastes contended CPU time.
+/// * default mode, 1:1 pin → `None`: each vCPU owns a host CPU; leave the
+///   module default (200_000 == KVM_HALT_POLL_NS_DEFAULT on stock x86), which
+///   is exactly what the prior build-time policy set explicitly.
+///
+/// `no_perf_mode` is checked first: `build()` forces `performance_mode=false`
+/// under it, and overcommit only arises on the default path, so the arms are
+/// mutually exclusive — the order only fixes a defensive precedence.
+pub(super) fn halt_poll_policy(
+    no_perf_mode: bool,
+    performance_mode: bool,
+    overcommit: bool,
+) -> Option<u64> {
+    if no_perf_mode {
+        return Some(0);
+    }
+    if performance_mode {
+        return None;
+    }
+    if overcommit {
+        return Some(0);
+    }
+    None
 }
 
 #[cfg(test)]

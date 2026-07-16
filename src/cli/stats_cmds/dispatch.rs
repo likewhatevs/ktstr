@@ -1,7 +1,7 @@
 //! `stats` subcommand dispatch: thin wrappers over the
 //! [`crate::stats`] surface plus host-context render entry points.
 //!
-//! Holds [`print_stats_report`], [`list_runs`], [`list_metrics`],
+//! Holds [`last_run_report`], [`list_runs`], [`list_metrics`],
 //! [`list_values`], [`compare_partitions`], [`show_host`],
 //! [`show_run_host`], [`show_thresholds`] and the per-test /
 //! per-run-key fuzzy-match helpers
@@ -13,27 +13,41 @@ use anyhow::{Result, anyhow, bail};
 
 use crate::stats::{ComparisonPolicy, RowFilter};
 
-/// Read sidecar JSON files and return the gauntlet analysis report.
+/// Read sidecar JSON files and return the gauntlet analysis report
+/// for `cargo ktstr stats last-run`.
 ///
-/// Source directory:
-/// - `KTSTR_SIDECAR_DIR` if set, else
-/// - the most recently modified subdirectory under the cargo target
-///   directory's `ktstr/` (see [`crate::test_support::runs_root`]).
+/// Source directory, in precedence order:
+/// 1. `dir` (the `--dir` flag) when `Some` — analyzed verbatim,
+///    mirroring [`crate::test_support::analyze_sidecars`]`(Some(dir))`.
+/// 2. `KTSTR_SIDECAR_DIR` when set non-empty — the same env override
+///    `analyze_sidecars(None)` honors.
+/// 3. `kernel` (the `--kernel` flag) when `Some` — the most recently
+///    modified run dir whose leaf name begins `{kernel}-` (see
+///    `newest_run_dir_for_kernel`).
+/// 4. Otherwise the most recently modified run dir under the cargo
+///    target directory's `ktstr/` ([`crate::test_support::newest_run_dir`]).
 ///
 /// `cargo ktstr stats` doesn't itself run a kernel, so it can't
 /// reconstruct the `{kernel}-{project_commit}` key the test process
-/// used; the mtime fallback mirrors "show me the report from my
-/// last test run."
+/// used; the mtime fallback (and the `--kernel` prefix match) stand in
+/// for "show me the report from my last test run."
 ///
 /// Returns `None` with a warning on stderr when no sidecars are found.
 /// This is not an error -- regular test runs that skip gauntlet tests
 /// produce no sidecar files.
-pub fn print_stats_report() -> Option<String> {
-    let dir = match std::env::var(crate::KTSTR_SIDECAR_DIR_ENV) {
-        Ok(d) if !d.is_empty() => Some(std::path::PathBuf::from(d)),
-        _ => crate::test_support::newest_run_dir(),
+pub fn last_run_report(dir: Option<&Path>, kernel: Option<&str>) -> Option<String> {
+    let resolved: Option<std::path::PathBuf> = if let Some(d) = dir {
+        Some(d.to_path_buf())
+    } else if let Ok(d) = std::env::var(crate::KTSTR_SIDECAR_DIR_ENV)
+        && !d.is_empty()
+    {
+        Some(std::path::PathBuf::from(d))
+    } else if let Some(k) = kernel {
+        newest_run_dir_for_kernel(k)
+    } else {
+        crate::test_support::newest_run_dir()
     };
-    let report = dir
+    let report = resolved
         .as_deref()
         .map(|d| crate::test_support::analyze_sidecars(Some(d)))
         .filter(|r| !r.is_empty());
@@ -41,6 +55,34 @@ pub fn print_stats_report() -> Option<String> {
         eprintln!("cargo ktstr: no sidecar data found (skipped)");
     }
     report
+}
+
+/// The most recently modified run dir under the runs root whose leaf
+/// name begins `{kernel}-`.
+///
+/// A run dir is keyed `{kernel}-{project_commit}`; matching on the
+/// `{kernel}-` prefix picks the newest run for that kernel without the
+/// stats process (which runs no kernel) having to reconstruct the
+/// project-commit half. `{kernel}` here is the run dir's detected
+/// version component (e.g. `7.1.3`), NOT the raw `--kernel` spec
+/// `cargo ktstr test` accepts (a path / cache key resolves to a
+/// different label). Filters through
+/// [`crate::test_support::is_run_directory`] so the `.locks/` sentinel
+/// can't be selected. Returns `None` when no run dir matches.
+fn newest_run_dir_for_kernel(kernel: &str) -> Option<std::path::PathBuf> {
+    let root = crate::test_support::runs_root();
+    let prefix = format!("{kernel}-");
+    std::fs::read_dir(&root)
+        .ok()?
+        .flatten()
+        .filter(crate::test_support::is_run_directory)
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(&prefix))
+        })
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .map(|e| e.path())
 }
 
 /// List test runs under the cargo target directory's `ktstr/` (see
@@ -283,6 +325,77 @@ pub fn show_thresholds(test_name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `last_run_report(Some(dir), _)` analyzes the explicit directory
+    /// verbatim (mirroring `analyze_sidecars(Some(dir))`) and returns
+    /// the gauntlet-analysis blob — the same output bare `cargo ktstr
+    /// stats` used to auto-print, now gated behind `stats last-run`.
+    /// A one valid sidecar renders the `=== GAUNTLET ANALYSIS ===`
+    /// header; the `--dir` arm bypasses env / newest-run resolution.
+    #[test]
+    fn last_run_report_explicit_dir_renders_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sc = crate::test_support::SidecarResult::test_fixture();
+        let json = serde_json::to_string(&sc).unwrap();
+        std::fs::write(tmp.path().join("t-0000000000000000.ktstr.json"), json).unwrap();
+
+        let out = last_run_report(Some(tmp.path()), None)
+            .expect("a dir with one valid sidecar must render a report");
+        assert!(
+            out.contains("=== GAUNTLET ANALYSIS ==="),
+            "last-run must print the gauntlet analysis header: {out}",
+        );
+    }
+
+    /// `last_run_report(Some(empty_dir), _)` returns `None` — an empty
+    /// run dir has no sidecars, so there is nothing to analyze. The
+    /// caller prints nothing (only the stderr "no sidecar data" note).
+    #[test]
+    fn last_run_report_empty_dir_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            last_run_report(Some(tmp.path()), None).is_none(),
+            "an empty directory must yield no report",
+        );
+    }
+
+    /// `newest_run_dir_for_kernel` matches run dirs whose leaf begins
+    /// `{kernel}-`. Plants two kernels' run dirs under a
+    /// `KTSTR_RUNS_ROOT`-pinned tree; the exact kernel label resolves
+    /// its own dir, and the `{kernel}-` boundary keeps a shorter query
+    /// (`7.1`) from matching a longer version (`7.1.3-*`) — the
+    /// operator passes the full detected label, not a partial.
+    #[test]
+    fn newest_run_dir_for_kernel_prefix_matches() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("7.1.3-abc1234")).unwrap();
+        std::fs::create_dir(tmp.path().join("6.14-def5678")).unwrap();
+        // Route runs_root() at the planted tree so the helper reads
+        // these dirs and not a real target/ktstr/.
+        let _root = EnvVarGuard::set(crate::KTSTR_RUNS_ROOT_ENV, tmp.path());
+
+        assert_eq!(
+            newest_run_dir_for_kernel("7.1.3")
+                .expect("the exact label 7.1.3 must resolve its run dir"),
+            tmp.path().join("7.1.3-abc1234"),
+        );
+        assert_eq!(
+            newest_run_dir_for_kernel("6.14")
+                .expect("the exact label 6.14 must resolve its run dir"),
+            tmp.path().join("6.14-def5678"),
+        );
+        assert!(
+            newest_run_dir_for_kernel("7.1").is_none(),
+            "the `{{kernel}}-` boundary must keep `7.1` from matching \
+             `7.1.3-*` — the query is a full label, not a partial",
+        );
+        assert!(
+            newest_run_dir_for_kernel("5.0").is_none(),
+            "no run dir begins `5.0-` — must yield None",
+        );
+    }
 
     #[test]
     fn show_host_returns_populated_report() {

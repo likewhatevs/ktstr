@@ -13,9 +13,9 @@ Every test report ends with the monitor's summary. From a real run:
 --- monitor ---
 samples=41 max_imbalance=2.00 max_dsq_depth=0 stuck=0
 avg: imbalance=1.32 nr_running/cpu=1.2 dsq/cpu=0.0
-events: fallback=0 (0.0/s) keep_last=210 (52.5/s) offline=0
+events: fallback=0 (0.0/vcpu-s) keep_last=210 (52.5/vcpu-s) offline=0
 events+: refill_slice_dfl=210
-schedstat: csw=586 (146/s) run_delay=381246314ns/s ttwu=204 goidle=1
+schedstat: csw=586 (146/vcpu-s) run_delay=381246314ns/vcpu-s ttwu=204 goidle=1
 bpf: ktstr_select_cp cnt=189 145ns/call
 bpf: ktstr_enqueue cnt=373 34ns/call
 bpf: ktstr_dispatch cnt=584 237ns/call
@@ -92,6 +92,36 @@ ratio, max DSQ depth, stuck-task detection), per-sample averages, and
 event-counter deltas. Averages are computed over valid samples only
 (excluding uninitialized guest memory — see below).
 
+Host-weather sensing uses two paths with different costs:
+
+- CRC-valid lifecycle transitions take cumulative snapshots of the vCPU
+  threads' `/proc/self/task/<tid>/schedstat` (on-CPU vs run-delay). The full
+  O(vCPU) sweep therefore runs a handful of times per cell, not every 100 ms;
+  boundary deltas feed per-phase dilation `D`.
+- During Body, the monitor's existing tick reads one persistent
+  `cpu.pressure` counter (`some total`) from ktstr's host cgroup. Real elapsed
+  widths are stored with the deltas, so a starved monitor produces a coarse
+  conservative interval instead of being treated as though it woke on time.
+  Lifecycle events sample the same counter at the Body edges. ScenarioEnd's
+  guest duration detects when host starvation delivered those lifecycle
+  frames in a burst instead of actually bracketing Body.
+
+The cgroup clock includes every ktstr vCPU even when the competing task is in
+another cgroup, while avoiding pressure from unrelated jobs elsewhere on a
+wide host. Other tasks sharing the runner cgroup can overstate the weather but
+cannot hide a runnable vCPU stalled for CPU. To prevent concurrently running
+cells in that same cgroup from making `W` noisy, the localized PSI result is
+capped by the target VM's complete summed-vCPU schedstat delay over the same
+conservative Body span. Both values independently upper-bound a request's
+host scheduling contamination, so their minimum stays conservative. If scoped
+CPU PSI is unavailable, that lifecycle schedstat delta supplies a coarser
+whole-span fallback. If lifecycle delivery itself was batched, the complete
+whole-vCPU-thread lifetime supplies the enclosing fallback instead. The
+guest-side `struct rq` reads still measure the
+scheduler *under test*; these host-side reads measure the host the cell ran in.
+See
+[Run Modes](../concepts/run-modes.md#dilation-reporting).
+
 ## Threshold evaluation
 
 `MonitorThresholds` defines the pass/fail conditions:
@@ -101,8 +131,8 @@ event-counter deltas. Averages are computed over valid samples only
 | `max_imbalance_ratio` | 4.0 | max/min per-CPU `nr_running` exceeds the ratio |
 | `max_local_dsq_depth` | 50 | any CPU's local DSQ exceeds the depth |
 | `fail_on_rq_clock_stuck` | true | a CPU's `rq_clock` stops advancing (exemptions below) |
-| `max_fallback_rate` | 200.0/s | sustained select-cpu-fallback event rate |
-| `max_keep_last_rate` | 100.0/s | sustained dispatch-keep-last event rate |
+| `max_fallback_rate` | 200.0/vCPU-s | sustained select-cpu-fallback events per delivered average-vCPU CPU-second |
+| `max_keep_last_rate` | 100.0/vCPU-s | sustained dispatch-keep-last events per delivered average-vCPU CPU-second |
 | `sustained_samples` | 5 | — window: a violation must persist this many consecutive samples |
 
 A violation must persist for `sustained_samples` consecutive samples

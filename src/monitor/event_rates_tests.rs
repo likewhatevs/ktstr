@@ -25,6 +25,7 @@ fn sample_with_events(
             CpuSnapshot {
                 nr_running: 2,
                 rq_clock: clock_base,
+                vcpu_cpu_time_ns: Some(1_000_000_000 + elapsed_ms * 1_000_000),
                 event_counters: Some(ScxEventCounters {
                     select_cpu_fallback: fallback,
                     dispatch_keep_last: keep_last,
@@ -35,6 +36,7 @@ fn sample_with_events(
             CpuSnapshot {
                 nr_running: 2,
                 rq_clock: clock_base + 100,
+                vcpu_cpu_time_ns: Some(2_000_000_000 + elapsed_ms * 1_000_000),
                 event_counters: Some(ScxEventCounters {
                     select_cpu_fallback: fallback,
                     dispatch_keep_last: keep_last,
@@ -44,6 +46,51 @@ fn sample_with_events(
             },
         ],
     }
+}
+
+#[test]
+fn event_rates_ignore_elapsed_wall_dilation() {
+    let first = sample_with_events(0, 1_000, 0, 0);
+    let mut undilated = sample_with_events(100, 2_000, 10, 5);
+    let mut dilated = sample_with_events(10_000, 2_000, 10, 5);
+    // Both runs received the same 100 ms on each vCPU. Only host wall elapsed
+    // differs, modeling 100x preemption dilation.
+    for (cpu, ns) in undilated
+        .cpus
+        .iter_mut()
+        .zip([1_100_000_000, 2_100_000_000])
+    {
+        cpu.vcpu_cpu_time_ns = Some(ns);
+    }
+    for (cpu, ns) in dilated.cpus.iter_mut().zip([1_100_000_000, 2_100_000_000]) {
+        cpu.vcpu_cpu_time_ns = Some(ns);
+    }
+
+    let a = MonitorSummary::from_samples(&[first.clone(), undilated])
+        .event_deltas
+        .expect("event deltas");
+    let b = MonitorSummary::from_samples(&[first, dilated])
+        .event_deltas
+        .expect("event deltas");
+    assert_eq!(a.fallback_rate, Some(200.0));
+    assert_eq!(a.keep_last_rate, Some(100.0));
+    assert_eq!(a.fallback_rate, b.fallback_rate);
+    assert_eq!(a.keep_last_rate, b.keep_last_rate);
+    assert_eq!(a.total_event_vcpu_sec, b.total_event_vcpu_sec);
+}
+
+#[test]
+fn event_rates_require_every_vcpu_clock() {
+    let first = sample_with_events(0, 1_000, 0, 0);
+    let mut last = sample_with_events(100, 2_000, 10, 5);
+    last.cpus[1].vcpu_cpu_time_ns = None;
+    let deltas = MonitorSummary::from_samples(&[first, last])
+        .event_deltas
+        .expect("raw event deltas remain available");
+    assert_eq!(deltas.total_fallback, 20);
+    assert_eq!(deltas.fallback_rate, None);
+    assert_eq!(deltas.keep_last_rate, None);
+    assert_eq!(deltas.total_event_vcpu_sec, None);
 }
 
 #[test]
@@ -235,7 +282,7 @@ fn summary_keep_last_rate_computed() {
     ];
     let summary = MonitorSummary::from_samples(&samples);
     let deltas = summary.event_deltas.unwrap();
-    assert!((deltas.keep_last_rate - 100.0).abs() < f64::EPSILON);
+    assert!((deltas.keep_last_rate.unwrap() - 100.0).abs() < f64::EPSILON);
 }
 
 // -- compute_event_deltas edge cases --
@@ -249,12 +296,12 @@ fn event_deltas_none_without_counters() {
 
 #[test]
 fn event_deltas_single_sample() {
-    // Only one sample with events -> first == last, duration=0, rates=0.
+    // Only one sample with events -> first == last, so no CPU-time denominator.
     let samples = vec![sample_with_events(100, 1000, 50, 25)];
     let summary = MonitorSummary::from_samples(&samples);
     let deltas = summary.event_deltas.unwrap();
-    assert_eq!(deltas.fallback_rate, 0.0);
-    assert_eq!(deltas.keep_last_rate, 0.0);
+    assert_eq!(deltas.fallback_rate, None);
+    assert_eq!(deltas.keep_last_rate, None);
 }
 
 #[test]
@@ -293,9 +340,9 @@ fn event_deltas_counter_reset_clamps_to_zero() {
         deltas.total_fallback
     );
     assert!(
-        deltas.fallback_rate >= 0.0,
+        deltas.fallback_rate.unwrap() >= 0.0,
         "reset must not produce negative fallback_rate, got {}",
-        deltas.fallback_rate
+        deltas.fallback_rate.unwrap()
     );
     assert!(
         deltas.total_dispatch_keep_last >= 0,
@@ -303,9 +350,9 @@ fn event_deltas_counter_reset_clamps_to_zero() {
         deltas.total_dispatch_keep_last
     );
     assert!(
-        deltas.keep_last_rate >= 0.0,
+        deltas.keep_last_rate.unwrap() >= 0.0,
         "reset must not produce negative keep_last_rate, got {}",
-        deltas.keep_last_rate
+        deltas.keep_last_rate.unwrap()
     );
 }
 
@@ -367,18 +414,21 @@ fn neg_fallback_rate_threshold_fires() {
     };
     let v = t.evaluate(&report);
     assert!(!v.passed, "fallback rate must be caught");
-    // Format: "fallback rate 200.0/s exceeded threshold 5.0/s for 2 consecutive intervals (ending at sample 2)"
+    // Format: "fallback rate 200.0/vcpu-s exceeded threshold 5.0/vcpu-s ..."
     let detail = v
         .failure_details()
         .find(|d| d.contains("fallback rate"))
         .unwrap();
-    assert!(detail.contains("/s"), "must include rate unit: {detail}");
+    assert!(
+        detail.contains("/vcpu-s"),
+        "must include rate unit: {detail}"
+    );
     assert!(
         detail.contains("exceeded threshold"),
         "must state threshold: {detail}"
     );
     assert!(
-        detail.contains("5.0/s"),
+        detail.contains("5.0/vcpu-s"),
         "must show threshold value: {detail}"
     );
     assert!(
@@ -408,18 +458,21 @@ fn neg_keep_last_rate_threshold_fires() {
     };
     let v = t.evaluate(&report);
     assert!(!v.passed, "keep_last rate must be caught");
-    // Format: "keep_last rate .../s exceeded threshold 5.0/s for 2 consecutive intervals ..."
+    // Format: "keep_last rate .../vcpu-s exceeded threshold 5.0/vcpu-s ..."
     let detail = v
         .failure_details()
         .find(|d| d.contains("keep_last rate"))
         .unwrap();
-    assert!(detail.contains("/s"), "must include rate unit: {detail}");
+    assert!(
+        detail.contains("/vcpu-s"),
+        "must include rate unit: {detail}"
+    );
     assert!(
         detail.contains("exceeded threshold"),
         "must state threshold: {detail}"
     );
     assert!(
-        detail.contains("5.0/s"),
+        detail.contains("5.0/vcpu-s"),
         "must show threshold value: {detail}"
     );
 }

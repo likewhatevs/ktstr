@@ -686,6 +686,12 @@ struct PhaseSnapshot {
     /// Completed work cycles this worker ran in this phase (0 for the message
     /// thread).
     loop_count: u64,
+    /// `CLOCK_THREAD_CPUTIME_ID` delta over this phase — the CPU time this
+    /// WORKER thread actually received (0 for the message thread: the
+    /// CPU-throughput denominator is Σ worker CPU, the CPU-clock analog of
+    /// schbench's Σ worker runtimes, `schbench.c:1697`). Feeds the
+    /// CPU-second-denominated `schbench_loops_per_cpu_sec` throughput.
+    cpu_ns: u64,
 }
 
 /// Per-phase, cross-thread aggregate for one `phase_epoch`: the wakeup + request
@@ -717,6 +723,15 @@ pub(crate) struct SchbenchPhaseStats {
     /// the msg-thread late-drain). Empty for a phase shorter than the ~1s control
     /// cadence -- the host gates on `sample_count() > 0` so a sub-second phase
     /// reads ABSENT, never rps=0. A rate; re-derived from the merged histogram.
+    ///
+    /// DENOMINATION: these per-second samples stay WALL-denominated (an
+    /// exception to the CPU-second throughput policy) — each sample is
+    /// schbench's own per-tick `rps_stats` reading (Δloops over a ~1s wall
+    /// window, upstream parity), and a per-tick CPU denominator would need
+    /// cross-thread cumulative-CPU reads from the control thread every
+    /// second, changing the sampling the upstream comparison validates. The
+    /// CPU-denominated throughput lives in `worker_cpu_ns` / the
+    /// `schbench_loops_per_cpu_sec` metric instead.
     pub(crate) rps: PlatStats,
     /// Σ message-thread `run_delay` (ns) over the phase.
     pub(crate) msg_run_delay_ns: u64,
@@ -728,6 +743,16 @@ pub(crate) struct SchbenchPhaseStats {
     pub(crate) worker_pcount: u64,
     /// Σ completed work cycles across the phase's workers.
     pub(crate) loop_count: u64,
+    /// Σ worker-thread `CLOCK_THREAD_CPUTIME_ID` deltas over the phase (ns) —
+    /// the CPU time the phase's workers actually received, the denominator of
+    /// the CPU-second throughput `schbench_loops_per_cpu_sec` (message-thread
+    /// CPU is excluded, mirroring schbench's Σ worker runtimes). CPU-clock
+    /// denominated so the throughput measures the workload, not host/guest
+    /// scheduling delay; the wall picture reconstructs as `cpu_rate / D` with
+    /// the sidecar's `host_dilation`. `#[serde(default)]`: pre-field sidecars
+    /// deserialize with 0 (the metric then reads absent).
+    #[serde(default)]
+    pub(crate) worker_cpu_ns: u64,
 }
 
 impl SchbenchPhaseStats {
@@ -750,6 +775,7 @@ impl SchbenchPhaseStats {
             .saturating_add(other.worker_run_delay_ns);
         self.worker_pcount = self.worker_pcount.saturating_add(other.worker_pcount);
         self.loop_count = self.loop_count.saturating_add(other.loop_count);
+        self.worker_cpu_ns = self.worker_cpu_ns.saturating_add(other.worker_cpu_ns);
     }
 }
 
@@ -1100,7 +1126,7 @@ fn run_msg_thread(
                 let ss_end = read_schedstat_raw(tid);
                 // SAFETY: this is the thread that owns msg_td (the coordinator
                 // thread of run_one_message_thread).
-                unsafe { drain_phase(msg_td, cur_epoch, phase_ss_start, ss_end, 0) };
+                unsafe { drain_phase(msg_td, cur_epoch, phase_ss_start, ss_end, 0, 0) };
                 cur_epoch = new_epoch;
                 phase_ss_start = ss_end;
             }
@@ -1109,7 +1135,7 @@ fn run_msg_thread(
     // Final drain: close the still-open phase (the sole snapshot when non-phasic).
     let ss_end = read_schedstat_raw(tid);
     // SAFETY: this is the thread that owns msg_td.
-    unsafe { drain_phase(msg_td, cur_epoch, phase_ss_start, ss_end, 0) };
+    unsafe { drain_phase(msg_td, cur_epoch, phase_ss_start, ss_end, 0, 0) };
     // Record the message thread's whole-run mean run-queue wait (`schbench.c:1664`),
     // reusing the cumulative `ss_end` pair just read — one /proc read, so the mean
     // and the final-phase delta derive from one consistent snapshot.
@@ -1274,7 +1300,7 @@ fn run_rps_thread(
             if new_epoch != cur_epoch {
                 let ss_end = read_schedstat_raw(tid);
                 // SAFETY: this thread owns msg_td (the dispatcher's ThreadData).
-                unsafe { drain_phase(msg_td, cur_epoch, phase_ss_start, ss_end, 0) };
+                unsafe { drain_phase(msg_td, cur_epoch, phase_ss_start, ss_end, 0, 0) };
                 cur_epoch = new_epoch;
                 phase_ss_start = ss_end;
             }
@@ -1292,7 +1318,7 @@ fn run_rps_thread(
     // run_msg_thread's exit (`schbench.c:1664`).
     let ss_end = read_schedstat_raw(tid);
     // SAFETY: this thread owns msg_td.
-    unsafe { drain_phase(msg_td, cur_epoch, phase_ss_start, ss_end, 0) };
+    unsafe { drain_phase(msg_td, cur_epoch, phase_ss_start, ss_end, 0, 0) };
     // SAFETY: owner-only access to msg_td's sched_delay_ns cell.
     unsafe { *msg_td.sched_delay_ns.get() = mean_sched_delay(ss_end) };
 }
@@ -1372,6 +1398,7 @@ unsafe fn drain_phase(
     ss_start: (u64, u64),
     ss_end: (u64, u64),
     loop_count: u64,
+    cpu_ns: u64,
 ) {
     // SAFETY: owner-only cell access, per this function's contract.
     unsafe {
@@ -1384,6 +1411,7 @@ unsafe fn drain_phase(
             run_delay_ns: ss_end.0.saturating_sub(ss_start.0),
             pcount: ss_end.1.saturating_sub(ss_start.1),
             loop_count,
+            cpu_ns,
         });
     }
 }
@@ -1450,6 +1478,10 @@ fn worker_loop(td: &ThreadData, ctx: &WorkerCtx) {
     let mut cur_epoch = phase_epoch.map_or(0, |e| e.load(Ordering::Relaxed));
     let mut phase_ss_start = read_schedstat_raw(tid);
     let mut phase_loop_count = 0u64;
+    // CLOCK_THREAD_CPUTIME_ID baseline for the per-phase worker CPU delta
+    // (the `schbench_loops_per_cpu_sec` denominator). Re-baselined at each
+    // drain like `phase_ss_start`.
+    let mut phase_cpu_start = crate::workload::worker::sched::thread_cpu_time_ns();
     // RPS mode iff the per-thread rate is non-zero (the `-R` total covers at
     // least one request/sec per message thread). Below that it rounds to 0 and
     // the worker runs the default message-handshake mode -- matching schbench's
@@ -1539,11 +1571,22 @@ fn worker_loop(td: &ThreadData, ctx: &WorkerCtx) {
             let new_epoch = pe.load(Ordering::Relaxed);
             if new_epoch != cur_epoch {
                 let ss_end = read_schedstat_raw(tid);
+                let cpu_end = crate::workload::worker::sched::thread_cpu_time_ns();
                 // SAFETY: this is the thread that owns `td`.
-                unsafe { drain_phase(td, cur_epoch, phase_ss_start, ss_end, phase_loop_count) };
+                unsafe {
+                    drain_phase(
+                        td,
+                        cur_epoch,
+                        phase_ss_start,
+                        ss_end,
+                        phase_loop_count,
+                        cpu_end.saturating_sub(phase_cpu_start),
+                    )
+                };
                 cur_epoch = new_epoch;
                 phase_ss_start = ss_end;
                 phase_loop_count = 0;
+                phase_cpu_start = cpu_end;
             }
         }
     }
@@ -1563,8 +1606,18 @@ fn worker_loop(td: &ThreadData, ctx: &WorkerCtx) {
     // snapshot (`cur_epoch` 0), so run() builds the whole-run result uniformly
     // from snapshots.
     let ss_end = read_schedstat_raw(tid);
+    let cpu_end = crate::workload::worker::sched::thread_cpu_time_ns();
     // SAFETY: this is the thread that owns `td`.
-    unsafe { drain_phase(td, cur_epoch, phase_ss_start, ss_end, phase_loop_count) };
+    unsafe {
+        drain_phase(
+            td,
+            cur_epoch,
+            phase_ss_start,
+            ss_end,
+            phase_loop_count,
+            cpu_end.saturating_sub(phase_cpu_start),
+        )
+    };
     // Record this worker's whole-run mean run-queue wait at exit — the
     // mean-of-means component for the whole-run SchbenchResult (schbench reads
     // each thread's schedstat for the final aggregate, `schbench.c:1664-1670`).
@@ -1620,6 +1673,13 @@ pub(crate) struct SchbenchResult {
     /// `:1942-1943`/`:1979`), and `Σ worker runtimes ≈ nr_workers * elapsed`, so
     /// the per-worker rate is `achieved_rps / nr_workers`.
     pub(crate) nr_workers: usize,
+    /// Aggregate completed cycles / WALL second over the run window.
+    /// Deliberately wall-denominated: this feeds ONLY the standalone /
+    /// validate surface (`run_standalone` → `ktstr-schbench-validate`),
+    /// whose output must stay byte-identical to upstream schbench's
+    /// wall-clock report. The ktstr sidecar's throughput metric is the
+    /// CPU-second-denominated `schbench_loops_per_cpu_sec` (from the
+    /// per-phase `worker_cpu_ns` carrier), not this field.
     pub(crate) achieved_rps: f64,
     /// Auto-RPS final TOTAL target rate at run exit: the live per-message-thread
     /// rate * message_threads (schbench's `requests_per_sec * message_threads`,
@@ -1753,6 +1813,7 @@ fn run_one_message_thread(
                 e.worker_run_delay_ns = e.worker_run_delay_ns.saturating_add(snap.run_delay_ns);
                 e.worker_pcount = e.worker_pcount.saturating_add(snap.pcount);
                 e.loop_count = e.loop_count.saturating_add(snap.loop_count);
+                e.worker_cpu_ns = e.worker_cpu_ns.saturating_add(snap.cpu_ns);
             }
         }
     }

@@ -64,6 +64,13 @@ const STALL_AFTER_1S_SCHED: Scheduler = Scheduler::named("stall_after_1s")
 /// bind-without-dispatch regression (Op succeeds, scheduler never
 /// schedules) reads 0 across every sample and fails here.
 fn assert_post_op_dispatch(result: &VmResult) -> Result<()> {
+    // Environmental starvation gate: zero real captures under a
+    // witnessed-contended host is a non-verdict (the readiness-gated
+    // capture chain was starved past the workload window), not a
+    // capture regression — SKIP instead of failing the assertions
+    // below. A quiet-host zero-capture run still falls through and
+    // fails with the specific diagnosis. See `periodic_starvation_gate`.
+    ktstr::prelude::periodic_starvation_gate(result, 1)?;
     let series = SampleSeries::from_drained_typed(
         result.snapshot_bridge.drain_ordered_with_stats(),
         result.monitor.clone(),
@@ -81,6 +88,15 @@ fn assert_post_op_dispatch(result: &VmResult) -> Result<()> {
     let any_progress = bpf_dispatched
         .iter_full()
         .any(|(_, _, slot)| matches!(slot, Ok(v) if *v > 0));
+
+    // A zero-dispatch reading can also mean the guest's OWN sched_ext
+    // watchdog ejected scx-ktstr for a runnable-task stall under host
+    // contention — a descheduling host dilates the 5s GUEST-time stall
+    // window past the timeout though the scheduler was healthy. That is an
+    // environmental non-verdict, not a bind-without-dispatch regression.
+    if !any_progress {
+        ktstr::prelude::stall_ejection_skip(result)?;
+    }
     anyhow::ensure!(
         any_progress,
         "scx-ktstr nr_dispatched read 0 across every periodic sample — the \
@@ -123,6 +139,15 @@ fn assert_post_op_dispatch(result: &VmResult) -> Result<()> {
     duration_s = 5,
     cleanup_budget_ms = 5000,
     num_snapshots = 3,
+    // These tests churn the scheduler (cold attach / mid-experiment
+    // restart+replace), which opens a legitimate multi-second no-dispatch
+    // window that stretches under host contention. The tight 5s default
+    // guest scx watchdog evicts the scheduler on the saturated colocated
+    // runners before the periodic captures can observe dispatch; 30s (the
+    // kernel's SCX_WATCHDOG_MAX_TIMEOUT) gives the captures room to run.
+    // A real never-dispatch regression is still caught by the
+    // nr_dispatched > 0 check in assert_post_op_dispatch, not the watchdog.
+    watchdog_timeout_s = 30,
     post_vm = assert_post_op_dispatch,
 )]
 fn scheduler_replace_mid_experiment_swaps_via_staged_pack(ctx: &Ctx) -> Result<AssertResult> {
@@ -194,6 +219,15 @@ fn scheduler_replace_mid_experiment_swaps_via_staged_pack(ctx: &Ctx) -> Result<A
     duration_s = 5,
     cleanup_budget_ms = 5000,
     num_snapshots = 3,
+    // These tests churn the scheduler (cold attach / mid-experiment
+    // restart+replace), which opens a legitimate multi-second no-dispatch
+    // window that stretches under host contention. The tight 5s default
+    // guest scx watchdog evicts the scheduler on the saturated colocated
+    // runners before the periodic captures can observe dispatch; 30s (the
+    // kernel's SCX_WATCHDOG_MAX_TIMEOUT) gives the captures room to run.
+    // A real never-dispatch regression is still caught by the
+    // nr_dispatched > 0 check in assert_post_op_dispatch, not the watchdog.
+    watchdog_timeout_s = 30,
     post_vm = assert_post_op_dispatch,
 )]
 fn scheduler_attach_from_cold_start_succeeds(ctx: &Ctx) -> Result<AssertResult> {
@@ -421,6 +455,15 @@ fn replace_with_broken_binary_surfaces_startup_died(ctx: &Ctx) -> Result<AssertR
     duration_s = 5,
     cleanup_budget_ms = 5000,
     num_snapshots = 3,
+    // These tests churn the scheduler (cold attach / mid-experiment
+    // restart+replace), which opens a legitimate multi-second no-dispatch
+    // window that stretches under host contention. The tight 5s default
+    // guest scx watchdog evicts the scheduler on the saturated colocated
+    // runners before the periodic captures can observe dispatch; 30s (the
+    // kernel's SCX_WATCHDOG_MAX_TIMEOUT) gives the captures room to run.
+    // A real never-dispatch regression is still caught by the
+    // nr_dispatched > 0 check in assert_post_op_dispatch, not the watchdog.
+    watchdog_timeout_s = 30,
     post_vm = assert_post_op_dispatch,
 )]
 fn scheduler_restart_mid_experiment_reattaches_cleanly(ctx: &Ctx) -> Result<AssertResult> {

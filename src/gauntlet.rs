@@ -18,15 +18,44 @@ pub struct TopoPreset {
     /// Memory budget for this preset's VM; read by preset-audit tests only.
     #[allow(dead_code)]
     pub memory_mib: usize,
+    /// Forced no-perf host-CPU budget for cells running this preset.
+    /// `None` (every stock preset) leaves budget resolution to the
+    /// normal path (test's `cpu_budget`, else auto-size to vCPU count).
+    /// `Some(n)` pins the no-perf CPU mask to `n` host CPUs regardless
+    /// of host size, so a preset whose vCPU count exceeds `n` ALWAYS
+    /// time-slices (deliberate, continuous overcommit). Consumed by the
+    /// verifier cell path ([`crate::verifier::collect_verifier_output`]).
+    /// The only preset that sets it (uneven-11llc) is also non-uniform,
+    /// hence verifier-only (the gauntlet path skips `llc_cores` presets —
+    /// see `for_each_gauntlet_variant`), so the forced budget is realized
+    /// exclusively in the verifier battery. A future uniform forced-budget
+    /// preset would additionally need the gauntlet variant path to honor
+    /// this field.
+    pub forced_cpu_budget: Option<u32>,
 }
 
 /// Topology presets used by gauntlet mode.
 ///
-/// Covers topologies from `tiny-1llc` (4 CPUs) up to the
+/// Covers topologies from `tiny-1llc` (4 CPUs) up through the
 /// `max-cpu` / `max-cpu-nosmt` presets (252 CPUs, near the KVM
-/// vCPU limit), spanning SMT, non-SMT (`-nosmt`), and multi-NUMA
-/// (`numa2-*`, `numa4-*`) families. Returned in `defs` / `numa_defs`
-/// declaration order, not by size.
+/// vCPU limit), plus `uneven-11llc` (192 CPUs across 11 NON-uniform
+/// LLCs), spanning SMT, non-SMT (`-nosmt`), and multi-NUMA
+/// (`numa2-*`, `numa4-*`) families. The stock presets are built from
+/// the `defs` / `numa_defs` tuple tables; `uneven-11llc` is appended
+/// explicitly because it carries per-LLC core counts and a forced CPU
+/// budget the uniform tuple shape cannot express.
+///
+/// `uneven-11llc` targets schedulers whose per-LLC math assumes
+/// equal-sized caches: ten LLCs of 18 logical CPUs and one of 12
+/// (`llc_cores = [9;10] + [6]`, packing width 9). It is VERIFIER-ONLY —
+/// the gauntlet execution path reconstructs topology from a uniform
+/// `TopoOverride` that cannot express `llc_cores`, so
+/// `for_each_gauntlet_variant` skips non-uniform presets. The verifier
+/// reaches it via
+/// [`crate::test_support::TopologyConstraints::accepts_verifier`], which
+/// ignores default caps and imposes NO host-size bound. Its
+/// `forced_cpu_budget = Some(96)` guarantees continuous overcommit (192
+/// vCPUs time-slicing over <=96 host CPUs) every time the battery runs.
 ///
 /// The full set is returned unconditionally; the only filter applied
 /// here is the aarch64 retain below, which drops SMT presets
@@ -118,6 +147,21 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
         ),
     ];
     let numa_defs: &[(&str, &str, u32, u32, u32, u32, usize)] = &[
+        // One LLC per node, SMT. The 2 total LLCs split evenly across
+        // the 2 nodes, so a scheduler that conflates node identity with
+        // LLC identity has nowhere to hide the confusion. Excluded from
+        // the default battery by `max_numa_nodes = Some(1)`; reached by
+        // the verifier under `accepts_verifier` (default numa cap
+        // ignored).
+        (
+            "numa2-2llc",
+            "32 CPUs, 2 NUMA nodes, 2 LLCs (one LLC per node, SMT)",
+            2,
+            2,
+            8,
+            2,
+            2048,
+        ),
         (
             "numa2-4llc",
             "16 CPUs, 2 NUMA nodes, 4 LLCs",
@@ -177,8 +221,10 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
                 numa_nodes: 1,
                 nodes: None,
                 distances: None,
+                llc_cores: None,
             },
             memory_mib: m,
+            forced_cpu_budget: None,
         })
         .chain(numa_defs.iter().map(|&(n, d, nn, s, c, t, m)| TopoPreset {
             name: n,
@@ -190,10 +236,40 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
                 numa_nodes: nn,
                 nodes: None,
                 distances: None,
+                llc_cores: None,
             },
             memory_mib: m,
+            forced_cpu_budget: None,
         }))
         .collect();
+
+    // uneven-11llc: 11 LLCs, ten with 9 cores (18 logical CPUs) and one
+    // with 6 (12 logical CPUs) = 192 CPUs. NON-uniform LLC sizing (the
+    // point): schedulers that assume equal-sized LLCs mis-place work on
+    // the short cache. Packing width `cores_per_llc = 9` reserves a
+    // 9-core (32-APIC-ID) block per LLC; `llc_cores` populates ten fully
+    // and one to 6, so the guest sees the uneven layout via the sparse
+    // APIC-block mechanism. `forced_cpu_budget = Some(96)` pins the
+    // no-perf mask to <=96 host CPUs so its 192 vCPUs ALWAYS overcommit
+    // (>=2x) — continuous exercise of the time-slicing path, modeling a
+    // chip larger than the host. Appended out-of-band (the tuple tables
+    // express only uniform shapes with no forced budget).
+    static UNEVEN_11LLC_CORES: [u32; 11] = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 6];
+    presets.push(TopoPreset {
+        name: "uneven-11llc",
+        description: "192 CPUs, 11 LLCs (uneven: ten 18-CPU + one 12-CPU, SMT)",
+        topology: Topology {
+            llcs: 11,
+            cores_per_llc: 9,
+            threads_per_core: 2,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+            llc_cores: Some(&UNEVEN_11LLC_CORES),
+        },
+        memory_mib: 4096,
+        forced_cpu_budget: Some(96),
+    });
 
     // ARM64 has no SMT -- exclude presets with threads_per_core > 1.
     if cfg!(target_arch = "aarch64") {
@@ -274,6 +350,8 @@ mod tests {
             ("near-max-llc", 15, 240),
             #[cfg(not(target_arch = "aarch64"))]
             ("max-cpu", 14, 252),
+            #[cfg(not(target_arch = "aarch64"))]
+            ("uneven-11llc", 11, 192),
             ("medium-4llc-nosmt", 4, 32),
             ("medium-8llc-nosmt", 8, 64),
             ("large-4llc-nosmt", 4, 128),
@@ -281,6 +359,8 @@ mod tests {
             ("near-max-llc-nosmt", 15, 240),
             ("max-cpu-nosmt", 14, 252),
             ("numa2-4llc", 4, 16),
+            #[cfg(not(target_arch = "aarch64"))]
+            ("numa2-2llc", 2, 32),
             #[cfg(not(target_arch = "aarch64"))]
             ("numa2-8llc", 8, 128),
             ("numa2-8llc-nosmt", 8, 128),
@@ -361,6 +441,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert_eq!(t.total_cpus(), 1);
         assert_eq!(t.num_llcs(), 1);
@@ -424,5 +505,49 @@ mod tests {
                 p.name
             );
         }
+    }
+
+    #[test]
+    fn gauntlet_presets_forced_budget_only_on_uneven_11llc() {
+        // Regression pin: the forced-overcommit budget is opt-in per
+        // preset. Exactly `uneven-11llc` carries it; every stock preset
+        // leaves it `None` so their cell budgets resolve unchanged.
+        for p in &gauntlet_presets() {
+            match p.name {
+                "uneven-11llc" => assert_eq!(
+                    p.forced_cpu_budget,
+                    Some(96),
+                    "uneven-11llc must force a 96-CPU budget"
+                ),
+                other => assert_eq!(
+                    p.forced_cpu_budget, None,
+                    "{other} must not carry a forced budget"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "aarch64"))]
+    fn gauntlet_presets_uneven_11llc_is_non_uniform_and_overcommits() {
+        let p = gauntlet_presets()
+            .into_iter()
+            .find(|p| p.name == "uneven-11llc")
+            .expect("uneven-11llc present on x86_64");
+        let t = &p.topology;
+        t.validate().expect("uneven-11llc must validate");
+        assert_eq!(t.num_llcs(), 11);
+        assert_eq!(t.total_cpus(), 192);
+        // Ten 18-CPU LLCs + one 12-CPU LLC: NOT uniform.
+        let sizes: Vec<u32> = (0..t.num_llcs())
+            .map(|l| t.cores_in_llc(l) * t.threads_per_core)
+            .collect();
+        assert_eq!(sizes.iter().filter(|&&s| s == 18).count(), 10);
+        assert_eq!(sizes.iter().filter(|&&s| s == 12).count(), 1);
+        // Forced budget guarantees overcommit: budget < vCPU count.
+        assert!(
+            p.forced_cpu_budget.unwrap() < t.total_cpus(),
+            "forced budget must be below vCPU count to force overcommit"
+        );
     }
 }

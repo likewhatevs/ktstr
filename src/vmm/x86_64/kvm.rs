@@ -303,12 +303,6 @@ const NUM_IOAPIC_PINS: u64 = 24;
 /// APIC IDs above this require x2APIC mode (8-bit xAPIC limit).
 pub(crate) const MAX_XAPIC_ID: u32 = 254;
 
-/// Per-VM halt poll interval (nanoseconds) for non-performance_mode VMs.
-/// Matches the x86 kernel default (KVM_HALT_POLL_NS_DEFAULT in
-/// arch/x86/include/asm/kvm_host.h). Set to 0 for overcommitted
-/// topologies where halt polling wastes host CPU time.
-const HALT_POLL_NS: u64 = 200_000;
-
 /// Required KVM capabilities — Firecracker checks these 14.
 const REQUIRED_CAPS: &[Cap] = &[
     Cap::Irqchip,
@@ -496,7 +490,7 @@ impl KtstrKvm {
 
         let ioapic = Self::setup_irqchip(&vm_fd, split_irqchip)?;
 
-        Self::tune_kvm_caps(&vm_fd, performance_mode, &topo)?;
+        Self::tune_kvm_caps(&vm_fd, performance_mode)?;
 
         let (guest_mem, numa_layout, reservation) = match memory_mib {
             Some(mb) => {
@@ -594,9 +588,17 @@ impl KtstrKvm {
         Ok(split_irqchip.then(|| Arc::new(PiMutex::new(Ioapic::new()))))
     }
 
-    /// Tune per-VM KVM caps: disable PAUSE/HLT exits in performance mode,
-    /// else set the per-VM halt-poll interval (0 when vCPUs overcommit hosts).
-    fn tune_kvm_caps(vm_fd: &VmFd, performance_mode: bool, topo: &Topology) -> Result<()> {
+    /// Tune per-VM KVM caps: disable PAUSE/HLT exits in performance mode.
+    ///
+    /// The per-VM halt-poll interval is NOT set here. It keys on the
+    /// run-lock outcome (1:1 pin vs overcommit fallback vs no-perf), which
+    /// is not resolved until `acquire_run_locks` at run time, so
+    /// `KtstrVm::run` sets `KVM_CAP_HALT_POLL` after that resolves — the cap
+    /// is settable at any time per the KVM API (Documentation/virt/kvm/
+    /// api.rst, 7.20: "This capability can be invoked at any time and any
+    /// number of times"). See `KtstrKvm::set_halt_poll` and
+    /// `KtstrVm::halt_poll_policy`.
+    fn tune_kvm_caps(vm_fd: &VmFd, performance_mode: bool) -> Result<()> {
         // Disable PAUSE and HLT VM exits in performance mode.
         // Two separate enable_cap calls: kvm_disable_exits() uses |=
         // (additive), so multiple calls accumulate. Separate calls
@@ -634,33 +636,36 @@ impl KtstrKvm {
             }
         }
 
-        // Set per-VM halt poll interval. Skipped in performance_mode:
-        // KVM_HINTS_REALTIME enables guest haltpoll cpuidle, which writes
-        // MSR_KVM_POLL_CONTROL=0 per-vCPU (arch_haltpoll_enable →
-        // kvm_disable_host_haltpoll), disabling host halt polling via
-        // kvm_arch_no_poll(). KVM_CAP_HALT_POLL is redundant there.
-        //
-        // When vCPUs exceed online host CPUs (overcommit), halt polling
-        // wastes host CPU time — disable it.
-        if !performance_mode {
-            let host_cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
-            let poll_ns: u64 = if host_cpus > 0 && topo.total_cpus() <= host_cpus as u32 {
-                HALT_POLL_NS
-            } else {
-                0
-            };
-            let mut cap = kvm_enable_cap {
-                cap: KVM_CAP_HALT_POLL,
-                ..Default::default()
-            };
-            cap.args[0] = poll_ns;
-            if let Err(e) = vm_fd.enable_cap(&cap) {
+        Ok(())
+    }
+
+    /// Set the per-VM halt-poll interval via `KVM_CAP_HALT_POLL`.
+    ///
+    /// Called from `KtstrVm::run` after `acquire_run_locks` resolves the
+    /// mode/outcome the policy keys on (see `KtstrVm::halt_poll_policy`). The
+    /// cap is a VM-target capability settable at any time per the KVM API
+    /// (Documentation/virt/kvm/api.rst, 7.20), so setting it post-vCPU-create
+    /// is valid. A `halt_poll_ns` of 0 disables host halt polling for this
+    /// VM; the policy never SETS the module default (a fitting 1:1 default-mode
+    /// VM is left at whatever `kvm.halt_poll_ns` the host module chose,
+    /// matching the prior 200_000 == KVM_HALT_POLL_NS_DEFAULT on stock x86).
+    ///
+    /// Best-effort: a pre-5.9 host without the cap warns once and continues
+    /// on the module default rather than failing the run.
+    pub(crate) fn set_halt_poll(&self, halt_poll_ns: u64) {
+        let mut cap = kvm_enable_cap {
+            cap: KVM_CAP_HALT_POLL,
+            ..Default::default()
+        };
+        cap.args[0] = halt_poll_ns;
+        if let Err(e) = self.vm_fd.enable_cap(&cap) {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
                 eprintln!(
                     "kvm: WARNING: KVM_CAP_HALT_POLL not supported ({e}), using kernel default"
                 );
-            }
+            });
         }
-        Ok(())
     }
 
     /// Create the per-vCPU fds with topology-specific CPUID, after the
@@ -2135,6 +2140,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 128, false);
         assert!(vm.is_ok(), "VM creation failed: {:?}", vm.err());
@@ -2151,6 +2157,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 256, false);
         assert!(vm.is_ok(), "multi-LLC VM creation failed: {:?}", vm.err());
@@ -2167,6 +2174,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 64, false);
         assert!(vm.is_ok());
@@ -2182,6 +2190,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 512, false);
         assert!(vm.is_ok(), "large topology failed: {:?}", vm.err());
@@ -2197,6 +2206,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 128, false);
         assert!(vm.is_ok(), "odd topology failed: {:?}", vm.err());
@@ -2213,6 +2223,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 256, false).unwrap();
         let total: u64 = vm.guest_mem.iter().map(|r| r.len()).sum();
@@ -2245,6 +2256,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         // max APIC ID = apic_id(15) = 1<<3 | 3<<1 | 1 = 15, well under 254
         assert!(max_apic_id(&topo) <= MAX_XAPIC_ID);
@@ -2266,6 +2278,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert!(
             max_apic_id(&topo) > MAX_XAPIC_ID,
@@ -2299,6 +2312,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert!(
             max_apic_id(&small) <= MAX_XAPIC_ID,
@@ -2316,6 +2330,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert!(
             max_apic_id(&still_small) <= MAX_XAPIC_ID,
@@ -2343,6 +2358,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 128, true);
         assert!(
@@ -2361,6 +2377,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm_normal = KtstrKvm::new(topo, 256, false).unwrap();
         let vm_perf = KtstrKvm::new(topo, 256, true).unwrap();
@@ -2368,12 +2385,10 @@ mod tests {
     }
 
     #[test]
-    fn halt_poll_ns_constant() {
-        assert_eq!(HALT_POLL_NS, 200_000);
-    }
-
-    #[test]
-    fn non_perf_mode_succeeds_with_halt_poll() {
+    fn non_perf_mode_vm_constructs() {
+        // Halt polling is no longer set at construction (it moved to
+        // run() keyed on the run-lock outcome); a non-perf VM must still
+        // build cleanly.
         let topo = Topology {
             llcs: 1,
             cores_per_llc: 2,
@@ -2381,13 +2396,31 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 128, false);
         assert!(
             vm.is_ok(),
-            "non-perf VM with halt poll failed: {:?}",
+            "non-perf VM construction failed: {:?}",
             vm.err()
         );
+    }
+
+    #[test]
+    fn set_halt_poll_on_real_vm() {
+        // The cap is settable at any time (api.rst 7.20); 0 disables host
+        // polling for this VM. Best-effort — no panic on an old host.
+        let topo = Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+            llc_cores: None,
+        };
+        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        vm.set_halt_poll(0);
     }
 
     #[test]
@@ -2420,6 +2453,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 64, true).unwrap();
         let clock = vm.vm_fd.get_clock().unwrap();
@@ -2473,6 +2507,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         let raw_fd = vm.vm_fd.as_raw_fd();
@@ -2506,6 +2541,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         let raw_fd = vm.vm_fd.as_raw_fd();
@@ -2535,6 +2571,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         let raw_fd = vm.vm_fd.as_raw_fd();
@@ -2568,6 +2605,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 128, true);
         assert!(

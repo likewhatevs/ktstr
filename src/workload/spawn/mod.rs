@@ -366,13 +366,31 @@ pub struct WorkerReport {
     pub cpus_used: BTreeSet<usize>,
     /// Ordered list of CPU migration events with timestamps.
     pub migrations: Vec<Migration>,
-    /// Longest wall-clock gap observed at 1024-work-unit checkpoints
-    /// (ms). High values indicate the task was preempted or descheduled
-    /// near a checkpoint boundary.
+    /// Longest worker CPU-TIME gap observed between 1024-work-unit
+    /// checkpoints (ms) — the `CLOCK_THREAD_CPUTIME_ID` delta the worker
+    /// consumed without crossing a progress checkpoint. This is the Stuck
+    /// gate's measure (`max_gap_ms` thresholds compare against it): a high
+    /// value means compute-without-progress (livelock, a pathologically
+    /// expensive iteration), which is real at ANY host dilation — CPU time
+    /// excludes host preemption and guest run-queue wait by construction.
+    /// A BLOCKED or starved-runnable worker accrues no CPU here; detecting
+    /// blocked-stuck is the cell watchdog's domain. Granularity: multiples
+    /// of the checkpoint interval (1024 work units, plus one extra sample
+    /// at each phase transition).
     pub max_gap_ms: u64,
-    /// CPU where the longest gap happened.
+    /// Longest WALL-CLOCK gap between checkpoints (ms) — the historical
+    /// pre-CPU-conversion gate measure, kept verbatim (including its
+    /// blocking-site baseline resets) as EVIDENCE: under host dilation or
+    /// guest starvation wall-without-CPU shows up here while
+    /// [`max_gap_ms`](Self::max_gap_ms) stays low. Independent maximum —
+    /// its peak may come from a different checkpoint than the CPU peak.
+    /// `#[serde(default)]`: sidecar JSON written before this field existed
+    /// reads 0 (guest→host postcard is same-binary, always in sync).
+    #[serde(default)]
+    pub max_gap_wall_ms: u64,
+    /// CPU where the longest (CPU-time) gap happened.
     pub max_gap_cpu: usize,
-    /// When the longest gap happened (ms from start).
+    /// When the longest (CPU-time) gap happened (wall ms from start).
     pub max_gap_at_ms: u64,
     /// Per-wakeup latency samples (ns). Measures off-CPU time
     /// between the call that blocks (any blocking primitive — pipe
@@ -455,8 +473,8 @@ pub struct WorkerReport {
     /// [`wake_sample_total`](Self::wake_sample_total) for `timer_latencies_ns`.
     pub timer_sample_total: u64,
     /// Outer-loop iteration count. What `CgroupStats::total_iterations` sums
-    /// and what the derived throughput rates (`iterations_per_worker` /
-    /// `iterations_per_cpu_sec`) and `migration_ratio` divide by; NOT read by
+    /// and what the derived `iteration_rate`, `iterations_per_worker`, and
+    /// `migration_ratio` divide by; NOT read by
     /// the zero-work-units gate, which reads [`work_units`](Self::work_units). A
     /// `Custom` worker that wants the starvation / `min_work_units` gate
     /// honored must also populate [`work_units`](Self::work_units).
@@ -634,7 +652,7 @@ pub struct WorkerReport {
     pub phase_slices: Vec<PhaseSlice>,
     /// Whole-run taobench COUNTER aggregate — `Some` only for a Taobench worker,
     /// `None` otherwise. Shipped so the host can derive run-level qps/hit Rate keys
-    /// (`taobench_*_ops_per_sec` / `taobench_hit_fraction` /
+    /// (`taobench_*_ops_per_cpu_sec_whole` / `taobench_hit_fraction` /
     /// `taobench_command_hit_rate`) for `--noise-adjust` spread analysis. The
     /// per-phase `PhaseSlice::taobench` carriers feed the per-phase metrics + the
     /// serve-latency distribution; this whole-run carrier holds COUNTERS only
@@ -1200,6 +1218,17 @@ pub struct WorkloadHandle {
     /// Thread-mode chain workers don't observe `EBADF` mid-run.
     /// Empty when `work_type` is not `WakeChain { wake: Pipe }`.
     chain_pipes: Vec<Vec<[i32; 2]>>,
+    /// Shared first-iteration signal eventfd. `Some` only when the
+    /// workload set [`WorkloadConfig::signal_first_iteration`] AND the
+    /// dispatch is fork with at least one worker; each fork worker
+    /// `write(2)`s a `1` after its first counted iteration and the parent
+    /// blocks on this fd in
+    /// [`Self::wait_first_iteration_all`]. The [`std::os::fd::OwnedFd`]
+    /// closes the parent's copy on `Drop`; fork children hold their own
+    /// fd-table copies (the fd is `EFD_CLOEXEC`, harmless — fork workers
+    /// never `exec`). `None` for every other workload — the polled
+    /// `snapshot_iterations` path is unchanged.
+    first_iter_signal: Option<std::os::fd::OwnedFd>,
 }
 
 /// Per-variant byte length for the MAP_SHARED futex region.
@@ -1252,6 +1281,80 @@ pub(super) fn futex_region_size_for(work_type: &WorkType) -> usize {
         // needs 8 bytes, not the default single u32.
         WorkType::SignalStorm { .. } => 2 * std::mem::size_of::<u32>(),
         _ => std::mem::size_of::<u32>(),
+    }
+}
+
+/// Block on a counter-mode eventfd `raw` until its accumulated count
+/// reaches `need`, or `deadline` passes. Returns `true` when the count is
+/// reached, `false` on timeout / unexpected error. Extracted from
+/// [`WorkloadHandle::wait_first_iteration_all`] so the poll/accumulate
+/// logic is unit-testable against a raw eventfd without spawning workers.
+///
+/// Each `read(2)` on a counter-mode eventfd returns the current counter
+/// and resets it to 0, so the value is accumulated across reads. `need ==
+/// 0` returns `true` immediately (vacuous). EINTR (poll or read) and a
+/// spurious EFD_NONBLOCK EAGAIN re-poll against the same deadline; any
+/// other error returns `false`.
+fn poll_eventfd_reaches(raw: i32, deadline: Instant, need: u64) -> bool {
+    if need == 0 {
+        return true;
+    }
+    let mut acc: u64 = 0;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let remaining = deadline - now;
+        // poll(2) timeout in ms: truncating `as_millis` under-waits by
+        // <1ms (the outer deadline re-check bounds the total), and the
+        // `.max(1)` avoids a busy-spin on a sub-ms remainder.
+        let timeout_ms = remaining.as_millis().min(i32::MAX as u128).max(1) as i32;
+        let mut pfd = libc::pollfd {
+            fd: raw,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            // EINTR (e.g. SIGCHLD coalescing under the probe's forked
+            // workers): re-poll against the same deadline.
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if ret == 0 {
+            // Timed out this slice; the loop top re-checks the deadline.
+            continue;
+        }
+        if pfd.revents & libc::POLLIN != 0 {
+            // Counter-mode read: returns the summed counter and resets it
+            // to 0, so accumulate across reads.
+            let mut buf: u64 = 0;
+            let r = unsafe {
+                libc::read(
+                    raw,
+                    &mut buf as *mut u64 as *mut libc::c_void,
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            if r == std::mem::size_of::<u64>() as isize {
+                acc = acc.saturating_add(buf);
+                if acc >= need {
+                    return true;
+                }
+            } else if r < 0 {
+                let err = std::io::Error::last_os_error();
+                // EAGAIN: EFD_NONBLOCK spurious wake with no pending count;
+                // EINTR: signal mid-read. Either way re-poll.
+                if matches!(err.raw_os_error(), Some(libc::EAGAIN) | Some(libc::EINTR)) {
+                    continue;
+                }
+                return false;
+            }
+        }
     }
 }
 
@@ -1318,6 +1421,12 @@ pub(super) struct SpawnGuard {
     /// thread, since threads share the parent's address space and
     /// must be drained cooperatively (no `kill` equivalent).
     threads: Vec<ThreadWorker>,
+    /// First-iteration signal eventfd (transferred to the handle on
+    /// success; see [`WorkloadHandle::first_iter_signal`]). The
+    /// [`std::os::fd::OwnedFd`] closes on the guard's `Drop`, so the
+    /// early-bail path releases the fd exactly like the iter_counters
+    /// mmap it is allocated beside — no explicit cleanup needed.
+    first_iter_signal: Option<std::os::fd::OwnedFd>,
 }
 
 impl SpawnGuard {
@@ -1333,6 +1442,7 @@ impl SpawnGuard {
             phase_epoch_bytes: 0,
             children: Vec::new(),
             threads: Vec::new(),
+            first_iter_signal: None,
         }
     }
 
@@ -1360,6 +1470,7 @@ impl SpawnGuard {
         let phase_epoch_bytes = std::mem::replace(&mut self.phase_epoch_bytes, 0);
         let pipe_pairs = std::mem::take(&mut self.pipe_pairs);
         let chain_pipes = std::mem::take(&mut self.chain_pipes);
+        let first_iter_signal = self.first_iter_signal.take();
         WorkloadHandle {
             children,
             threads,
@@ -1372,6 +1483,7 @@ impl SpawnGuard {
             phase_epoch_bytes,
             pipe_pairs,
             chain_pipes,
+            first_iter_signal,
         }
     }
 }
@@ -1610,6 +1722,19 @@ impl SendPhaseEpochPtr {
 #[derive(Clone)]
 pub(super) struct GroupParams {
     work_type: WorkType,
+    /// Park each worker after `n` counted iterations rather than
+    /// running to stop. Only the primary group can carry a non-`None`
+    /// value ([`WorkloadConfig::park_after_iterations`] has no
+    /// [`WorkSpec`] counterpart), so composed groups always inherit
+    /// `None` through [`Self::from_work_spec`].
+    park_after: Option<u64>,
+    /// Signal the handle's first-iteration eventfd after each fork
+    /// worker's first counted iteration. Like `park_after`, only the
+    /// primary group can carry `true`
+    /// ([`WorkloadConfig::signal_first_iteration`] has no [`WorkSpec`]
+    /// counterpart), so composed groups always inherit `false` through
+    /// [`Self::from_work_spec`].
+    signal_first_iteration: bool,
     sched_policy: SchedPolicy,
     mem_policy: MemPolicy,
     mpol_flags: MpolFlags,
@@ -1648,6 +1773,14 @@ impl GroupParams {
     ) -> Self {
         Self {
             work_type: spec.work_type.clone(),
+            // WorkSpec has no park-after knob; `primary` overrides this
+            // from `WorkloadConfig::park_after_iterations`, composed
+            // groups keep `None`.
+            park_after: None,
+            // Same shape as `park_after`: no WorkSpec counterpart, so
+            // `primary` overrides from `WorkloadConfig::signal_first_iteration`
+            // and composed groups keep `false`.
+            signal_first_iteration: false,
             sched_policy: spec.sched_policy,
             mem_policy: spec.mem_policy.clone(),
             mpol_flags: spec.mpol_flags,
@@ -1774,12 +1907,13 @@ impl GroupParams {
             pcomm: None,
             workers_pct: None,
         };
-        Ok(Self::from_work_spec(
-            &spec,
-            0,
-            resolved_affinity,
-            config.num_workers,
-        ))
+        let mut params = Self::from_work_spec(&spec, 0, resolved_affinity, config.num_workers);
+        // The park-after knob lives on WorkloadConfig, not the
+        // synthesised WorkSpec above, so carry it in after the copy.
+        params.park_after = config.park_after_iterations;
+        // Same for the first-iteration signal knob.
+        params.signal_first_iteration = config.signal_first_iteration;
+        Ok(params)
     }
 
     /// Resolve a composed [`WorkSpec`] into per-group parameters,
@@ -1970,6 +2104,11 @@ pub(super) fn spawn_thread_worker(
     worker_futex: Option<(*mut u32, usize)>,
     iter_slot: *mut AtomicU64,
     phase_epoch: *mut AtomicU32,
+    // First-iteration signal fd (`-1` = absent). Always `-1` on this
+    // thread path: the eventfd is allocated only for fork dispatch, so a
+    // thread-mode worker never signals (a plain `i32` copy, captured by
+    // the closure below).
+    first_iter_signal_fd: i32,
 ) -> Result<()> {
     use std::sync::Arc;
     use std::sync::atomic::AtomicI32;
@@ -2010,6 +2149,7 @@ pub(super) fn spawn_thread_worker(
     let tid_thread = Arc::clone(&tid);
     let exit_evt_thread = Arc::clone(&exit_evt);
     let work_type = group.work_type.clone();
+    let park_after = group.park_after;
     let sched_policy = group.sched_policy;
     let mem_policy = group.mem_policy.clone();
     let mpol_flags = group.mpol_flags;
@@ -2105,6 +2245,8 @@ pub(super) fn spawn_thread_worker(
                 numa_node,
                 worker_pipe_fds,
                 futex,
+                park_after,
+                first_iter_signal_fd,
                 slot,
                 epoch,
                 &stop_thread,
@@ -2696,6 +2838,7 @@ pub(super) fn spawn_pcomm_container(
                     let phase_epoch_send = SendPhaseEpochPtr::new(phase_epoch_base);
 
                     let work_type = group.work_type.clone();
+                    let park_after = group.park_after;
                     let sched_policy = group.sched_policy;
                     let mem_policy = group.mem_policy.clone();
                     let mpol_flags = group.mpol_flags;
@@ -2777,6 +2920,13 @@ pub(super) fn spawn_pcomm_container(
                                 numa_node,
                                 worker_pipe_fds,
                                 futex,
+                                park_after,
+                                // pcomm containers run threads inside a
+                                // forked container; the first-iteration
+                                // eventfd is allocated only on the plain
+                                // fork-dispatch path, so pcomm workers never
+                                // signal.
+                                -1,
                                 slot,
                                 epoch,
                                 &STOP,
@@ -3716,6 +3866,37 @@ impl WorkloadHandle {
             guard.phase_epoch_bytes = epoch_size;
         }
 
+        // First-iteration signal eventfd (C6). Allocated BEFORE the fork
+        // loop — like the iter_counters mmap above — so every forked child
+        // inherits its fd-table copy. Only when the workload opted in AND
+        // the dispatch is fork with ≥1 worker: thread / pcomm dispatch pass
+        // a `-1` fd to `worker_main` and never signal, and a zero-worker
+        // spawn has nothing to wait on. Counter mode (`0` initial value)
+        // so the parent's `wait_first_iteration_all` reads the SUM of the
+        // per-worker `1`s. EFD_NONBLOCK keeps the worker's post-first-iter
+        // `write` non-blocking; EFD_CLOEXEC is safe because fork workers
+        // never `exec` (a stale fd across an exec would only leak, not
+        // misbehave). The `OwnedFd` lives on the guard (closed on early
+        // bail) and transfers to the handle on success.
+        if config.signal_first_iteration && matches!(dispatch, Dispatch::Fork) && total_workers > 0
+        {
+            let raw = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+            if raw < 0 {
+                let errno = std::io::Error::last_os_error();
+                anyhow::bail!(
+                    "eventfd(0, EFD_NONBLOCK|EFD_CLOEXEC) for the first-iteration \
+                     signal failed: {errno}; this fd lets the verifier dispatch \
+                     probe block on the first-iteration edge instead of polling \
+                     snapshot_iterations. Remediation: raise the process fd limit \
+                     (RLIMIT_NOFILE).",
+                );
+            }
+            // SAFETY: `raw` is a fresh, exclusively-owned eventfd from the
+            // successful `eventfd(2)` above; wrapping it in OwnedFd takes
+            // sole ownership so it is closed exactly once on Drop.
+            guard.first_iter_signal = Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
+        }
+
         // Spawn each group in declaration order. `iter_offset`
         // tracks the running offset into the iter_counters mmap
         // (slot allocation per the layout commented above). Each
@@ -3983,6 +4164,24 @@ impl WorkloadHandle {
             // workers observe no change and emit no slices.
             let phase_epoch_ptr: *mut AtomicU32 = guard.phase_epoch;
 
+            // First-iteration signal fd for this worker (C6). `-1` (absent)
+            // unless the group opted in AND the handle allocated the
+            // eventfd — which happens only for fork dispatch (thread /
+            // pcomm groups leave `guard.first_iter_signal` None, so this
+            // resolves to `-1` and the worker never signals). A plain `i32`
+            // copy, so it crosses the fork/thread closure boundary without
+            // a Send newtype.
+            let first_iter_signal_fd: i32 = if group.signal_first_iteration {
+                use std::os::unix::io::AsRawFd;
+                guard
+                    .first_iter_signal
+                    .as_ref()
+                    .map(|f| f.as_raw_fd())
+                    .unwrap_or(-1)
+            } else {
+                -1
+            };
+
             // Per-mode dispatch. Thread-mode workers do not need
             // pipes — the rendezvous and report channels are
             // in-process Rust primitives (`mpsc::sync_channel(0)` +
@@ -3998,6 +4197,7 @@ impl WorkloadHandle {
                         worker_futex,
                         iter_slot,
                         phase_epoch_ptr,
+                        first_iter_signal_fd,
                     )?;
                     continue;
                 }
@@ -4655,6 +4855,12 @@ impl WorkloadHandle {
                                 group.numa_node,
                                 worker_pipe_fds,
                                 worker_futex,
+                                group.park_after,
+                                // Fork worker: the real signal fd (or `-1`
+                                // when the group did not opt in). The child
+                                // holds its own fd-table copy of the parent's
+                                // eventfd, inherited across `fork()`.
+                                first_iter_signal_fd,
                                 iter_slot,
                                 phase_epoch_ptr,
                                 &STOP,
@@ -4970,6 +5176,34 @@ impl WorkloadHandle {
             .collect()
     }
 
+    /// Block until at least `n` workers have signalled their first counted
+    /// iteration, or `deadline` passes. Returns `true` on the former,
+    /// `false` on timeout. The evented counterpart to polling
+    /// [`Self::snapshot_iterations`]: workers `write(2)` a `1` into the
+    /// shared first-iteration eventfd (see
+    /// [`WorkloadConfig::signal_first_iteration`]) and this drains the
+    /// counter — which sums those `1`s — accumulating across reads until it
+    /// reaches `n`.
+    ///
+    /// Caller contract: only meaningful when the workload set
+    /// `signal_first_iteration` (and thus spawned fork workers with the
+    /// eventfd). Without the eventfd there is nothing to wait on, so this
+    /// returns `false` immediately (a `debug_assert` catches a misuse in
+    /// debug builds). `n == 0` returns `true` vacuously.
+    pub(crate) fn wait_first_iteration_all(&self, deadline: Instant, n: usize) -> bool {
+        let Some(signal_fd) = self.first_iter_signal.as_ref() else {
+            debug_assert!(
+                false,
+                "wait_first_iteration_all called on a handle with no first-iteration \
+                 eventfd (workload did not set signal_first_iteration, or dispatch \
+                 was not fork)",
+            );
+            return false;
+        };
+        use std::os::unix::io::AsRawFd;
+        poll_eventfd_reaches(signal_fd.as_raw_fd(), deadline, n as u64)
+    }
+
     /// Broadcast the current scenario phase to this handle's workers.
     /// The scenario engine calls this at each step boundary — the
     /// 1-indexed phase (Step k → k + 1) at StepStart, `u32::MAX` (the
@@ -5050,8 +5284,8 @@ impl WorkloadHandle {
     /// (release profile) the worker aborts with `SIGABRT` so the parent
     /// sees `WIFEXITED=false`, `WTERMSIG=6`. Either way, a panicking
     /// worker never finishes `f.write_all(&bytes)` on the report pipe,
-    /// so `poll` + `read_to_end` hands back an empty (or truncated)
-    /// buffer, `postcard::from_bytes` fails, and the
+    /// so the collect poll + bounded read hands back an empty (or
+    /// truncated) buffer, `postcard::from_bytes` fails, and the
     /// sentinel path fires. Partial writes from a panic between successful
     /// `write_all` and `_exit(0)` are not reachable — the write is the
     /// last non-trivial statement inside the catch_unwind closure.
@@ -5067,197 +5301,43 @@ impl WorkloadHandle {
         let was_started = self.started;
         self.start();
 
-        // Event-driven worker-started barrier. Each fork worker writes
-        // a single `b'r'` byte to its report pipe immediately after
-        // the start-pipe handshake completes (see the matching write
-        // inside `worker_main`'s catch_unwind closure). Polling every
-        // worker's report fd for `POLLIN` with a bounded deadline
-        // wakes the moment the slowest worker has finished its
-        // post-fork init — replacing the prior 500 ms blind sleep
-        // that could under-wait on a CPU-contended host (false
-        // starvation if the worker entered its loop after stop was
-        // signalled) and over-wait on an idle host (~500 ms wasted
-        // per `stop_and_collect`).
+        // Event-driven worker-started barrier for the auto-start path.
         //
-        // Thread-mode workers do not need a barrier here: `start()`
-        // above sent on a `mpsc::sync_channel(0)` SyncSender(0)
-        // rendezvous, which blocks the parent until the worker's
-        // matching `recv()` returns — by the time `start()` returns,
-        // every thread worker has crossed its start handshake. Only
-        // the fork-mode pipe-based start signal is fire-and-forget,
-        // so the barrier is gated on `!self.children.is_empty()`.
+        // ORDERING CONSTRAINT: this drain MUST run BEFORE the SIGUSR1
+        // stop signals below. A fork worker signalled before it enters
+        // its measurement loop reports 0 iterations and looks starved
+        // when it was merely slow to start; waiting for each worker's
+        // post-handshake ready byte guarantees stop lands after the
+        // worker is counting. `drain_ready_bytes` documents the poll
+        // mechanics and the POLLHUP-drop semantics.
         //
-        // Deadline budget: 5 s mirrors the existing collect deadline
-        // below. Each iteration polls every still-pending fd with
-        // the remaining budget; a worker that returns `POLLHUP` /
-        // `POLLERR` (died before writing the ready byte — fork-race
-        // close, panic during early init, or the kernel killed it)
-        // is dropped from the pending set and the surrounding
-        // collect path's sentinel-report logic surfaces it. The
-        // worst case (every worker hits the deadline without a
-        // ready byte) bounds the wait at the same 5 s the legacy
-        // sleep + collect path budgeted for the entire stop_and_collect.
+        // Thread-mode workers need no barrier here: `start()` above sent
+        // on a `mpsc::sync_channel(0)` SyncSender(0) rendezvous, which
+        // blocks the parent until the worker's matching `recv()` returns
+        // — by the time `start()` returns every thread worker has
+        // crossed its start handshake. Only the fork-mode pipe-based
+        // start signal is fire-and-forget, so the barrier is gated on
+        // `!self.children.is_empty()`.
+        //
+        // Budget: the 5 s deadline mirrors the collect deadline below;
+        // worst case (no worker ever writes its byte) bounds the wait at
+        // the same 5 s the legacy sleep + collect path budgeted for the
+        // entire stop_and_collect.
         if !was_started && !self.children.is_empty() {
-            let barrier_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            // Pending = (index_into_children, read_fd). We track the
-            // index so a `POLLHUP` worker can be removed from
-            // pending without disturbing the collect loop's
-            // ordering below.
-            let mut pending: Vec<(usize, i32)> = self
-                .children
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (i, c.report_fd))
-                .collect();
-            while !pending.is_empty() {
-                let remaining =
-                    barrier_deadline.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    // Barrier deadline expired with workers still
-                    // pending. Stop waiting and proceed to signal
-                    // stop. The collect path below treats any
-                    // worker whose pipe never produced data as a
-                    // sentinel report — same outcome as a worker
-                    // that started in time but produced an
-                    // unparseable report.
-                    break;
-                }
-                let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
-                let mut pfds: Vec<libc::pollfd> = pending
-                    .iter()
-                    .map(|&(_, fd)| libc::pollfd {
-                        fd,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    })
-                    .collect();
-                // SAFETY: `pfds` is a non-empty owned Vec; nfds
-                // matches its length; `ms >= 0` since the
-                // remaining-zero branch above bails first. Return
-                // codes are interpreted below.
-                let ret = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, ms) };
-                if ret < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::Interrupted {
-                        // EINTR — re-poll with the remaining budget
-                        // on the next iteration. Common during
-                        // teardown when a sibling thread sends a
-                        // signal; the loop's deadline guard bounds
-                        // total wait time regardless of EINTR
-                        // frequency.
-                        continue;
-                    }
-                    // Hard poll failure (EFAULT impossible with an
-                    // owned Vec; ENOMEM extreme). Bail out of the
-                    // barrier and let the collect path's per-fd
-                    // poll handle each worker individually.
-                    tracing::warn!(
-                        %err,
-                        pending = pending.len(),
-                        "WorkloadHandle::stop_and_collect: barrier poll failed; falling \
-                         through to per-worker collect"
-                    );
-                    break;
-                }
-                // ret == 0 means the per-iteration timeout fired
-                // without any fd ready — but we measured this
-                // against `remaining`, so the next iteration's
-                // saturating_duration_since will be zero and the
-                // top-of-loop guard exits. Don't break here: a
-                // future cycle could still be useful if the system
-                // clock jumped backward, and the cost is one extra
-                // iteration that immediately bails.
-                if ret > 0 {
-                    pending.retain(|&(_, fd)| {
-                        // Find this fd's pollfd entry. Linear scan
-                        // is fine: typical worker counts are <100
-                        // and the alternative (HashMap) costs more
-                        // in setup than the linear scan saves.
-                        let pfd = pfds.iter().find(|p| p.fd == fd);
-                        let revents = pfd.map(|p| p.revents).unwrap_or(0);
-                        if revents & libc::POLLIN != 0 {
-                            // Ready byte arrived. Consume exactly
-                            // 1 byte and remove from pending. The
-                            // raw `libc::read` does not take
-                            // ownership of the fd — the collect
-                            // path below still owns it via the
-                            // `children` Vec and will read the
-                            // postcard tail on its own deadline.
-                            let mut byte: u8 = 0;
-                            // SAFETY: `&mut byte` is a valid
-                            // 1-byte buffer; `fd` is the report
-                            // read end the parent owns until
-                            // collect drains it. A 0 / -1 return
-                            // is treated as not-yet-ready; the
-                            // next iteration retries.
-                            let n = unsafe {
-                                libc::read(fd, &mut byte as *mut u8 as *mut libc::c_void, 1)
-                            };
-                            // n == 1 → ready byte consumed; drop
-                            // from pending.
-                            // n == 0 → POLLIN with zero-byte read
-                            // means EOF (writer closed) without
-                            // sending the byte — worker died
-                            // pre-write. Drop from pending; the
-                            // collect path emits a sentinel report.
-                            // n < 0 → transient error (EAGAIN
-                            // shouldn't happen since POLLIN
-                            // signalled readability, but on EINTR
-                            // the next iteration re-polls).
-                            if n >= 0 {
-                                return false;
-                            }
-                            // Negative return: re-check kind.
-                            let err = std::io::Error::last_os_error();
-                            if err.kind() == std::io::ErrorKind::Interrupted {
-                                return true;
-                            }
-                            tracing::warn!(
-                                %err,
-                                fd,
-                                "WorkloadHandle::stop_and_collect: barrier byte read \
-                                 failed; treating worker as ready"
-                            );
-                            return false;
-                        }
-                        if revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-                            // Worker closed the write end without
-                            // sending the ready byte (panic during
-                            // post-fork init, or kernel-killed
-                            // before reaching the write). Drop
-                            // from pending; the collect path's
-                            // `read_to_end` returns 0 bytes and the
-                            // sentinel-report branch fires.
-                            return false;
-                        }
-                        // No POLLIN, no hangup — keep waiting.
-                        true
-                    });
-                }
-            }
+            let pending: Vec<i32> = self.children.iter().map(|c| c.report_fd).collect();
+            drain_ready_bytes(pending, Instant::now() + Duration::from_secs(5));
         }
 
         let mut reports = Vec::new();
         let children = std::mem::take(&mut self.children);
         let threads = std::mem::take(&mut self.threads);
 
-        // Drain the 'r' ready byte from each child's report pipe
-        // so the collect poll below waits for the report payload, not
-        // the already-present ready byte. The barrier section above
-        // consumes it for auto-started workers; explicitly-started
-        // workers (was_started=true) skip the barrier.
-        if was_started {
-            for child in &children {
-                let mut byte: u8 = 0;
-                unsafe {
-                    libc::read(
-                        child.report_fd,
-                        &mut byte as *mut u8 as *mut libc::c_void,
-                        1,
-                    );
-                }
-            }
-        }
+        // NOTE: the explicit-start (was_started) ready-byte drain used
+        // to sit here, ahead of the stop signals, as a blocking 1-byte
+        // read per child. That wedged teardown whenever a worker the
+        // scheduler under test never ran had not yet written its byte
+        // (guest PID-1 blocked forever → VM watchdog). It now runs
+        // AFTER the signals below, via the bounded `drain_ready_bytes`.
 
         // Signal all fork-mode children to stop via SIGUSR1; the
         // signal handler flips that child's process-local STOP, which
@@ -5282,6 +5362,20 @@ impl WorkloadHandle {
         // thread without affecting siblings.
         for tw in &threads {
             tw.stop.store(true, Ordering::Relaxed);
+        }
+
+        // Explicit-start (was_started) ready-byte drain. Signal-first
+        // (above) so healthy workers begin tearing down during any drain
+        // wait, and the drain is bounded (`drain_ready_bytes`, same 5 s
+        // as the barrier) so a worker the scheduler under test never ran
+        // — and thus never wrote its 'r' — cannot wedge teardown on a
+        // blocking read. The stale byte must still be consumed: the
+        // collect poll below routes on POLLIN, so a byte left in the
+        // pipe would send a report-less worker down the payload-read
+        // branch instead of the sentinel path.
+        if was_started {
+            let pending: Vec<i32> = children.iter().map(|c| c.report_fd).collect();
+            drain_ready_bytes(pending, Instant::now() + Duration::from_secs(5));
         }
 
         // Collect reports with a shared 5s deadline across all workers.
@@ -5357,17 +5451,76 @@ impl WorkloadHandle {
 
             let npid = nix::unistd::Pid::from_raw(child.pid);
             if !poll_ready {
-                // Deadline expired — child didn't write a report.
-                // Kill first so read_to_end doesn't block on the
-                // pipe's write end (the child may have written
-                // only the 'r' ready byte but no payload).
+                // Deadline expired without POLLIN — the child produced
+                // no report, so `buf` stays empty (→ sentinel path).
+                // Kill first, then close, so no writer is left blocked
+                // on a pipe the parent has stopped draining (the child
+                // may have written only the 'r' ready byte but no
+                // payload).
                 kill_and_killpg(npid, nix::sys::signal::Signal::SIGKILL);
                 let _ = nix::unistd::close(child.report_fd);
             } else {
-                // Child responded — read the report, then kill.
-                let mut f = unsafe { std::fs::File::from_raw_fd(child.report_fd) };
-                let _ = f.read_to_end(&mut buf);
-                drop(f);
+                // Child responded (POLLIN) — read the payload bounded by
+                // the SHARED collect `deadline`, then close and kill. A
+                // worker that wrote its 'r' (or a partial payload) and
+                // then wedged before EOF would otherwise hold a blocking
+                // `read_to_end` hostage; polling to the deadline and
+                // giving up yields a short/empty buf, so the postcard /
+                // serde decode fails and the existing sentinel path
+                // fires. Preserve read→close→kill order (the old
+                // File-drop close is now an explicit `close`).
+                let mut chunk = [0u8; 64 * 1024];
+                loop {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    // ms == 0 is fine: a zero-timeout poll still drains
+                    // data already buffered in the pipe without
+                    // blocking, which keeps the healthy at-deadline-edge
+                    // case intact (the child exited; payload + EOF are
+                    // buffered and read out in one pass here).
+                    let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+                    let mut pfd = libc::pollfd {
+                        fd: child.report_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // SAFETY: single owned pollfd; nfds == 1; ms >= 0.
+                    let ret = unsafe { libc::poll(&mut pfd, 1, ms) };
+                    if ret < 0 {
+                        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                        {
+                            continue;
+                        }
+                        break;
+                    }
+                    if ret == 0 {
+                        // Timeout — deadline reached with no more data.
+                        break;
+                    }
+                    // SAFETY: `chunk` is a valid owned buffer of
+                    // `chunk.len()` bytes; `report_fd` is the read end
+                    // the parent owns until the close below.
+                    let n = unsafe {
+                        libc::read(
+                            child.report_fd,
+                            chunk.as_mut_ptr() as *mut libc::c_void,
+                            chunk.len(),
+                        )
+                    };
+                    if n > 0 {
+                        buf.extend_from_slice(&chunk[..n as usize]);
+                        continue;
+                    }
+                    if n == 0 {
+                        // EOF — writer closed; payload complete.
+                        break;
+                    }
+                    // n < 0: retry on EINTR, otherwise give up.
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
+                let _ = nix::unistd::close(child.report_fd);
                 kill_and_killpg(npid, nix::sys::signal::Signal::SIGKILL);
             }
             let waited = nix::sys::wait::waitpid(npid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
@@ -5390,16 +5543,16 @@ impl WorkloadHandle {
                     waited
                 };
 
-            // Strip the leading `b'r'` ready byte if the auto-start
-            // barrier above did not consume it. Children write this
-            // byte unconditionally on every success path right after
-            // the start handshake; the barrier polls + reads it when
-            // `stop_and_collect` auto-started children, but
-            // explicit-start callers (`start()` invoked before
-            // `stop_and_collect`) bypass the barrier and the byte
-            // sits in the pipe ahead of the payload. Strip exactly 1
-            // byte if present so the per-kind decoder sees a clean
-            // payload either way.
+            // Strip a leading `b'r'` ready byte if it is still present.
+            // Children write this byte unconditionally on every success
+            // path right after the start handshake; both collect paths
+            // drain it up front now (`drain_ready_bytes`, called from
+            // the auto-start barrier and the explicit-start drain). This
+            // strip is the defensive fallback for the worker that wrote
+            // its byte only after the bounded drain gave up at its
+            // deadline — the byte then sits in the pipe ahead of the
+            // payload here. Strip exactly 1 byte if present so the
+            // per-kind decoder sees a clean payload either way.
             let report_slice: &[u8] = if buf.first() == Some(&b'r') {
                 &buf[1..]
             } else {
@@ -5670,6 +5823,121 @@ impl WorkloadHandle {
     }
 }
 
+/// Bounded drain of the per-worker "ready byte". Each fork worker
+/// writes a single `b'r'` byte to its report pipe immediately after
+/// the start-pipe handshake completes (see the matching write inside
+/// `worker_main`'s catch_unwind closure). This polls every still-
+/// pending fd for `POLLIN` with the remaining budget until `deadline`,
+/// consuming exactly one byte per worker, and returns once every fd
+/// has produced its byte / hung up or the deadline expires.
+///
+/// The raw `libc::read` does NOT take ownership of any fd — the caller
+/// still owns them via the `children` Vec and reads the payload tail on
+/// its own deadline.
+///
+/// Per-fd outcomes:
+///   - `POLLIN`, `read` == 1: ready byte consumed; drop from pending.
+///   - `POLLIN`, `read` == 0: EOF — writer closed without sending the
+///     byte (worker died pre-write). Drop; the collect path reads 0
+///     bytes and the sentinel-report branch fires.
+///   - `POLLIN`, `read` < 0, EINTR: keep pending, re-poll next cycle.
+///   - `POLLIN`, `read` < 0, other: warn and drop (treat as ready).
+///   - `POLLHUP` / `POLLERR` / `POLLNVAL`: worker closed the write end
+///     without sending the byte (panic during post-fork init, or
+///     kernel-killed before the write). Drop; sentinel path fires.
+///   - EINTR on `poll`: re-poll with the remaining budget.
+///   - hard `poll` failure (EFAULT impossible with an owned Vec;
+///     ENOMEM extreme): warn and bail; the collect path's per-fd poll
+///     handles each worker individually.
+///
+/// Bounding is the point: a worker the scheduler under test never ran
+/// never writes its byte, so a blocking read here would wedge teardown
+/// (guest PID-1 blocks forever → host watchdog). The deadline lets a
+/// never-scheduled worker fall through to the collect sentinel path
+/// instead.
+fn drain_ready_bytes(mut pending: Vec<i32>, deadline: Instant) {
+    while !pending.is_empty() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            // Deadline expired with workers still pending. Stop
+            // waiting; the collect path treats any worker whose pipe
+            // never produced data as a sentinel report.
+            break;
+        }
+        let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let mut pfds: Vec<libc::pollfd> = pending
+            .iter()
+            .map(|&fd| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        // SAFETY: `pfds` is a non-empty owned Vec; nfds matches its
+        // length; `ms >= 0` since the remaining-zero branch bails
+        // first. Return codes are interpreted below.
+        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, ms) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                // EINTR — re-poll with the remaining budget. The
+                // deadline guard bounds total wait regardless of EINTR
+                // frequency.
+                continue;
+            }
+            tracing::warn!(
+                %err,
+                pending = pending.len(),
+                "drain_ready_bytes: poll failed; falling through to per-worker collect"
+            );
+            break;
+        }
+        // ret == 0 means the per-iteration timeout fired without any fd
+        // ready — measured against `remaining`, so the next iteration's
+        // saturating_duration_since is zero and the top-of-loop guard
+        // exits. Don't break here: a future cycle stays useful if the
+        // clock jumped backward, at the cost of one bail iteration.
+        if ret > 0 {
+            pending.retain(|&fd| {
+                // Find this fd's pollfd entry. Linear scan is fine:
+                // typical worker counts are <100 and a HashMap costs
+                // more in setup than the scan saves.
+                let pfd = pfds.iter().find(|p| p.fd == fd);
+                let revents = pfd.map(|p| p.revents).unwrap_or(0);
+                if revents & libc::POLLIN != 0 {
+                    let mut byte: u8 = 0;
+                    // SAFETY: `&mut byte` is a valid 1-byte buffer; `fd`
+                    // is the report read end the caller owns until
+                    // collect drains it. 0 / -1 returns handled below.
+                    let n = unsafe { libc::read(fd, &mut byte as *mut u8 as *mut libc::c_void, 1) };
+                    if n >= 0 {
+                        // n == 1: byte consumed. n == 0: EOF pre-write.
+                        // Either way drop from pending.
+                        return false;
+                    }
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        return true;
+                    }
+                    tracing::warn!(
+                        %err,
+                        fd,
+                        "drain_ready_bytes: byte read failed; treating worker as ready"
+                    );
+                    return false;
+                }
+                if revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                    // Worker closed the write end without sending the
+                    // byte. Drop; the sentinel-report branch fires.
+                    return false;
+                }
+                // No POLLIN, no hangup — keep waiting.
+                true
+            });
+        }
+    }
+}
+
 impl Drop for WorkloadHandle {
     fn drop(&mut self) {
         use nix::sys::signal::{Signal, kill};
@@ -5881,3 +6149,213 @@ mod tests_spawn_guard;
 mod tests_thread_mode;
 #[cfg(test)]
 mod tests_wake_chain;
+
+/// Direct tests for the bounded ready-byte drain that fix 1a extracted
+/// from the auto-start barrier. A full fake-child `stop_and_collect`
+/// test would need a hand-rolled fork worker that never writes its
+/// byte; exercising `drain_ready_bytes` against raw pipe fds covers the
+/// three outcomes that matter — never-writes (deadline bound), one byte
+/// consumed exactly, and POLLHUP drop — without that scaffolding.
+#[cfg(test)]
+mod tests_drain_bound {
+    use super::drain_ready_bytes;
+    use std::time::{Duration, Instant};
+
+    // Blocking pipe; returns (read_fd, write_fd). Both fds must be
+    // closed by the caller.
+    fn make_pipe() -> (i32, i32) {
+        let mut fds = [0i32; 2];
+        // SAFETY: `fds` is a valid 2-element buffer.
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "pipe() failed: {}", std::io::Error::last_os_error());
+        (fds[0], fds[1])
+    }
+
+    // A worker the scheduler never ran leaves its write end open with
+    // no data: the drain must block until the deadline (never wedge on
+    // the blocking read the old code used) and then return.
+    #[test]
+    fn writer_never_writes_returns_at_deadline() {
+        let (r, w) = make_pipe();
+        let budget = Duration::from_millis(300);
+        let start = Instant::now();
+        drain_ready_bytes(vec![r], Instant::now() + budget);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "returned before the deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "exceeded the deadline bound: {elapsed:?}"
+        );
+        // SAFETY: both fds are still open and owned here.
+        unsafe {
+            libc::close(r);
+            libc::close(w);
+        }
+    }
+
+    // The ready byte is consumed exactly once: a following payload byte
+    // must remain in the pipe for the collect read.
+    #[test]
+    fn ready_byte_consumed_exactly_one() {
+        let (r, w) = make_pipe();
+        let payload = b"rX";
+        // SAFETY: valid buffer/len; `w` is open.
+        let n = unsafe { libc::write(w, payload.as_ptr() as *const libc::c_void, payload.len()) };
+        assert_eq!(n, 2, "short write");
+        let start = Instant::now();
+        drain_ready_bytes(vec![r], Instant::now() + Duration::from_secs(5));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "did not return promptly after the byte arrived: {:?}",
+            start.elapsed()
+        );
+        let mut buf = [0u8; 8];
+        // SAFETY: valid buffer/len; `r` is open.
+        let got = unsafe { libc::read(r, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        assert_eq!(got, 1, "exactly one byte should remain after the drain");
+        assert_eq!(buf[0], b'X', "the wrong byte was consumed");
+        // SAFETY: both fds still open and owned.
+        unsafe {
+            libc::close(r);
+            libc::close(w);
+        }
+    }
+
+    // Writer closes without sending the byte: POLLHUP must drop the fd
+    // immediately rather than waiting out the deadline.
+    #[test]
+    fn closed_writer_dropped_via_pollhup() {
+        let (r, w) = make_pipe();
+        // SAFETY: `w` is open; closing it makes `r` report POLLHUP.
+        unsafe {
+            libc::close(w);
+        }
+        let start = Instant::now();
+        drain_ready_bytes(vec![r], Instant::now() + Duration::from_secs(5));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "did not drop on POLLHUP: {:?}",
+            start.elapsed()
+        );
+        // SAFETY: `r` still open and owned.
+        unsafe {
+            libc::close(r);
+        }
+    }
+}
+
+/// Direct tests for `poll_eventfd_reaches` (the evented first-iteration
+/// wait's core) against a raw counter-mode eventfd — no worker spawn
+/// needed. Covers the two contract halves the verifier probe relies on:
+/// fewer than `n` signals times out at the deadline; exactly `n` (summed
+/// across writes) wakes early.
+#[cfg(test)]
+mod tests_poll_eventfd {
+    use super::poll_eventfd_reaches;
+    use std::time::{Duration, Instant};
+
+    // Counter-mode eventfd (EFD_NONBLOCK so a drained read cannot block).
+    fn make_eventfd() -> i32 {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        assert!(
+            fd >= 0,
+            "eventfd() failed: {}",
+            std::io::Error::last_os_error()
+        );
+        fd
+    }
+
+    fn signal(fd: i32, times: u64) {
+        for _ in 0..times {
+            let one: u64 = 1;
+            let n = unsafe { libc::write(fd, &one as *const u64 as *const libc::c_void, 8) };
+            assert_eq!(
+                n,
+                8,
+                "eventfd write short: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    /// Fewer than `n` signals: the wait must time out at the deadline and
+    /// return `false` (a never-run worker leaves the count short).
+    #[test]
+    fn under_count_times_out_false() {
+        let fd = make_eventfd();
+        signal(fd, 2); // k = 2 < n = 4
+        let start = Instant::now();
+        let ok = poll_eventfd_reaches(fd, Instant::now() + Duration::from_millis(200), 4);
+        let elapsed = start.elapsed();
+        assert!(!ok, "under-count must not report all-signalled");
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "returned before the deadline: {elapsed:?}",
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "exceeded the deadline bound: {elapsed:?}"
+        );
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    /// Exactly `n` signals (accumulated in the counter): the wait wakes
+    /// early with `true`, well before a generous deadline.
+    #[test]
+    fn full_count_returns_true_early() {
+        let fd = make_eventfd();
+        signal(fd, 4); // n = 4
+        let start = Instant::now();
+        let ok = poll_eventfd_reaches(fd, Instant::now() + Duration::from_secs(5), 4);
+        assert!(ok, "n signals must report all-signalled");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "did not wake promptly on the count: {:?}",
+            start.elapsed(),
+        );
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    /// The count sums across SEPARATE reads: signals that arrive after the
+    /// first drained read still accumulate toward `n`.
+    #[test]
+    fn count_accumulates_across_reads() {
+        let fd = make_eventfd();
+        signal(fd, 3);
+        // First: 3 < 4, short deadline → false, draining the counter to 0.
+        assert!(!poll_eventfd_reaches(
+            fd,
+            Instant::now() + Duration::from_millis(120),
+            4
+        ));
+        // A single further signal added to the fresh (drained) counter is
+        // only 1, so a second call still needs the FULL 4 — the accumulator
+        // is per-call, matching one probe run. Confirm 4 fresh signals wake.
+        signal(fd, 4);
+        assert!(poll_eventfd_reaches(
+            fd,
+            Instant::now() + Duration::from_secs(5),
+            4
+        ));
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    /// `need == 0` (no workers) returns `true` vacuously without polling.
+    #[test]
+    fn zero_need_is_vacuously_true() {
+        let fd = make_eventfd();
+        assert!(poll_eventfd_reaches(fd, Instant::now(), 0));
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}

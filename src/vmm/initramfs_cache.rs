@@ -1078,7 +1078,7 @@ mod tests {
 
     #[test]
     fn shm_store_and_load_roundtrip() {
-        let hash = 0xDEAD_BEEF_CAFE_1234u64;
+        let hash = initramfs::unique_test_shm_hash(7);
         let data = vec![0x07u8, 0x07, 0x01]; // cpio magic prefix
         initramfs::shm_store_base(hash, &data).unwrap();
         let loaded = initramfs::shm_load_base(hash);
@@ -1089,8 +1089,8 @@ mod tests {
 
     #[test]
     fn shm_different_hashes_independent() {
-        let h1 = 0x1111_2222_3333_4444u64;
-        let h2 = 0x5555_6666_7777_8888u64;
+        let h1 = initramfs::unique_test_shm_hash(8);
+        let h2 = initramfs::unique_test_shm_hash(9);
         let d1 = vec![0xAAu8; 16];
         let d2 = vec![0xBBu8; 32];
         initramfs::shm_store_base(h1, &d1).unwrap();
@@ -1172,7 +1172,7 @@ mod tests {
     /// independence as shm_load_base_holds_lock_until_drop).
     #[test]
     fn held_lz4_segment_survives_cleanup_lock_probe() {
-        let hash = 0x9EED_C0DE_9EED_C0DEu64;
+        let hash = initramfs::unique_test_shm_hash(10);
         let name = initramfs::shm_lz4_segment_name(hash);
         let _ = rustix::shm::unlink(name.as_str()); // clean any stale segment
 

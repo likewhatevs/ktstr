@@ -26,6 +26,60 @@ use super::virtio_net::{VirtioNetCounters, VirtioNetCountersSnapshot};
 use super::wire;
 use crate::monitor;
 
+/// Which watchdog rule (if any) killed the VM — the public mirror of
+/// the watchdog-internal `freeze_coord::KillReasonTag`, rendered as
+/// `cause=` in the deadline-expired stderr dump. `None` on
+/// [`VmResult::watchdog_kill_reason`] means no watchdog kill was
+/// recorded (clean exit, crash, or a timeout path that never stamped a
+/// reason).
+///
+/// The variant IS the mechanism assertion e2e fixtures need: a
+/// wedge-injection fixture proves its tier by matching the reason,
+/// which stays correct at ANY host dilation — unlike a wall-time bound,
+/// which conflates detection latency with host CPU share (an observed
+/// arm64 cell proved Tier-1 firing exactly on its 12 s CPU budget while
+/// taking 83 s of wall at ~14% share).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchdogKillReason {
+    /// Tier-1: max per-vCPU CPU burned past the phase budget with no
+    /// milestone — a spinning wedge.
+    Tier1CpuBudget,
+    /// Tier-2: wall past the phase backstop with live evidence channels
+    /// and no runnable demand — a silent idle wedge.
+    Tier2IdleWedge,
+    /// Tier-3: the hard deadline expired and the deadman was not deferred
+    /// (monitor dead, cell inert past the grace, or the current phase
+    /// exhausted the effective-deadline busiest-vCPU CPU budget).
+    Tier3Deadman,
+    /// An AP set the kill flag (panic-driven), not a watchdog expiry.
+    ApKill,
+}
+
+/// Final guest lifecycle stage as tracked by the progress ledger —
+/// the public mirror of `monitor::LifecycleStage` (same forward-only
+/// ordinal order, so `Ord` compares boot progress). Snapshotted at
+/// run teardown onto [`VmResult::final_guest_phase`].
+///
+/// Fixtures use this to distinguish "the guest reached the phase under
+/// test and the watchdog misfired" (a real detection regression) from
+/// "the guest never got there" (an environmental non-verdict: an
+/// observed arm64 cell at 0.3% host CPU share sat in `Boot` for 172 s —
+/// nothing phase-dependent can be asserted about a guest that could
+/// not boot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GuestLifecyclePhase {
+    /// Booting: init up to SYS_RDY.
+    Boot,
+    /// SYS_RDY seen; scheduler attaching.
+    Attach,
+    /// Guest dispatch entering the workload preamble.
+    Dispatch,
+    /// The test body / workload proper.
+    Body,
+    /// Winding down (`ScenarioEnd` / `Exit` / `TestResult` seen).
+    Teardown,
+}
+
 /// Result of a VM execution.
 ///
 /// `Clone` is supported, but two field categories have different
@@ -125,6 +179,46 @@ pub struct VmResult {
     pub duration: Duration,
     /// True when the host hit its watchdog before the guest exited.
     pub timed_out: bool,
+    /// Which watchdog rule killed the VM (see [`WatchdogKillReason`]).
+    /// `None` when no watchdog kill was recorded — clean exits, but
+    /// also crash paths where the kill flag was never watchdog-set.
+    /// Loaded from the watchdog thread's kill-reason latch after its
+    /// join, so the value is final.
+    pub watchdog_kill_reason: Option<WatchdogKillReason>,
+    /// Final guest lifecycle stage per the progress ledger (see
+    /// [`GuestLifecyclePhase`]). Snapshotted at run teardown; stays
+    /// `Boot` when the guest never advanced (or no dispatch thread
+    /// consumed lifecycle frames — e.g. host-only paths).
+    pub final_guest_phase: GuestLifecyclePhase,
+    /// Final milestone count from the progress ledger (the dump's
+    /// `progress_epoch=` value): lifecycle-stage advances plus other
+    /// dispatch-recorded milestones. `0` means the guest never
+    /// published a milestone the host consumed.
+    pub final_progress_epoch: u64,
+    /// Whether the entry's host-triggered BPF-map-write injections
+    /// (`KtstrTestEntry::bpf_map_write` — e.g. the neg_* fixtures'
+    /// crash flag) were delivered: `None` when no writes were
+    /// configured, `Some(true)` when every queued write landed and the
+    /// guest was signalled, `Some(false)` when the injection thread
+    /// never completed (killed mid-retry — e.g. the run ended while a
+    /// starved guest was still booting/attaching). Fixtures that
+    /// expect an injected bug consult this to distinguish "the bug
+    /// never fired because the injection never landed" (environmental
+    /// under witnessed contention) from a real detection failure.
+    pub bpf_map_writes_delivered: Option<bool>,
+    /// Run-relative instant the periodic-capture prereqs (KASLR publish
+    /// and the map/prog accessors) became ready; `None` when they never
+    /// did. With [`Self::periodic_window_end`] this is the READINESS-VS-WINDOW
+    /// evidence: readiness at/after the window end (or never) makes zero
+    /// captures structurally inevitable at ANY host dilation — the
+    /// capture-starvation gates skip on it instead of a dilation
+    /// threshold (a ~7 s cold accessor build outruns a 4-5 s window at
+    /// D ≈ 1.2, below any honest contention bar).
+    pub periodic_prereqs_ready: Option<Duration>,
+    /// Run-relative instant the periodic capture window ends (the
+    /// workload-end clamp); `None` when the window never resolved —
+    /// which itself means no boundary could ever fire.
+    pub periodic_window_end: Option<Duration>,
     /// Captured guest stdout (and any non-dmesg serial console content).
     pub output: String,
     /// Captured guest stderr (separated from `output` when the guest
@@ -169,6 +263,17 @@ pub struct VmResult {
     /// [`SidecarResult`](crate::test_support::SidecarResult) so stats
     /// tooling can flag cleanup regressions across runs.
     pub cleanup_duration: Option<Duration>,
+    /// The cleanup window's OWN dilation evidence: the join/drain
+    /// performer thread's schedstat delta (on-CPU + runnable-wait)
+    /// across exactly the [`Self::cleanup_duration`] window. The
+    /// cleanup-budget gate judges overruns against THIS — the
+    /// per-phase/whole-run witnesses cannot attest the window (the
+    /// monitor that feeds them is itself joined inside it, and join
+    /// wake-latency is a tail phenomenon a whole-run average
+    /// under-attests). `None` when schedstat was unreadable at either
+    /// edge; a `0` on-CPU delta (CONFIG_SCHEDSTATS off) is treated as
+    /// unattested by consumers.
+    pub cleanup_sched_delta: Option<HostVcpuSchedstat>,
     /// Host-side virtio-blk device counters, snapshotted after the
     /// guest has exited. `Some(_)` when the builder attached a disk
     /// via `super::KtstrVmBuilder::disk`; `None` when no disk was
@@ -493,6 +598,25 @@ pub struct VmResult {
     /// variant hash. `0` on a synthesized/fixture result (which has
     /// `entry_name = None` and thus bails before reading this).
     pub variant_hash: u64,
+    /// Host-side vCPU scheduling dilation for this run — RAW schedstat
+    /// totals summed over the vCPU host threads (see
+    /// `HostVcpuSchedstat`). Populated by `run_vm` teardown from live
+    /// `/proc/self/task/<tid>/schedstat` entries plus a one-shot self-snapshot
+    /// each AP stores immediately before exit; `None` on hosts without
+    /// `CONFIG_SCHEDSTATS`, on synthesized/fixture results, and whenever no
+    /// vCPU thread was sampled. Consumers call `HostVcpuSchedstat::dilation`
+    /// for the derived `D` ratio. Purely observational — never affects the
+    /// verdict or exit code.
+    pub host_vcpu_schedstat: Option<HostVcpuSchedstat>,
+    /// Per-phase host-contention witness for the "weather witness" latency
+    /// model (see [`ContentionWitness`]): the Body-phase dilation `D` plus
+    /// the Body-phase peak-window CPU-pressure series that bounds `W(L)`.
+    /// Lifecycle events anchor the series and the monitor adds constant-cost
+    /// cgroup-PSI samples on its existing wakes. `None` when neither PSI nor
+    /// vCPU schedstat supplied evidence. Consumed by a LATER seam pass —
+    /// `latency_verdict` — to make latency threshold verdicts tri-state under
+    /// contention; purely observational until then.
+    pub contention_witness: Option<ContentionWitness>,
     /// Memoized single drain of [`Self::snapshot_bridge`].
     ///
     /// The snapshot bridge yields each capture exactly once, but two
@@ -608,12 +732,9 @@ impl VmResult {
     /// [`crate::timeline::StimulusEvent::terminal`]).
     ///
     /// Fold THIS through
-    /// [`crate::assert::build_phase_buckets_with_stimulus`] — it is the
-    /// SAME timeline the framework's own `evaluate_vm_result` builds,
-    /// so the LAST step gets an `iteration_rate` (the terminal supplies
-    /// its right boundary). A hand-rolled map over only the guest
-    /// `Stimulus` frames would omit the terminal and silently drop the
-    /// final step's rate.
+    /// [`crate::assert::build_phase_buckets_with_stimulus`] to reproduce the
+    /// same phase windows and boundary telemetry as `evaluate_vm_result`.
+    /// Iteration rates are joined separately from guest CPU-time carriers.
     ///
     /// Non-destructive: reads the already-drained `guest_messages` TLV
     /// log (unlike the bridge-cache accessors [`Self::captures_series`]
@@ -638,8 +759,7 @@ impl VmResult {
                 }
                 Some(wire::MsgType::StepEnd) => {
                     // Per-step end-of-hold frame (reuses the StimulusPayload
-                    // body). Paired with its StepStart for step-local
-                    // iteration_rate in build_phase_buckets_with_stimulus.
+                    // body). Retained as raw boundary telemetry.
                     if let Some(ev) = wire::StimulusEvent::from_payload(&entry.payload) {
                         out.push(crate::timeline::StimulusEvent::from_step_end(&ev));
                     }
@@ -660,69 +780,49 @@ impl VmResult {
         out
     }
 
-    /// Worker-iteration throughput (iterations/sec) for one scenario
-    /// [`Phase`](crate::assert::Phase), from the stimulus timeline's
-    /// `StepStart[k]` -> `StepEnd[k]` step-local window (the per-event rate
-    /// via [`crate::timeline::StimulusEvent::rate_to`]).
+    /// Worker-iteration efficiency (iterations per delivered guest CPU-second)
+    /// for one scenario [`Phase`](crate::assert::Phase).
     ///
-    /// `None` when the phase has no `StepStart` ([`crate::assert::Phase::BASELINE`], or a
-    /// step the run never reached), no right boundary (no `StepEnd`, no
-    /// later step, and no scenario-end terminal), or the rate is
-    /// unmeasurable (zero-length window / counter went backward). A step
-    /// whose workers made zero forward progress over a positive hold
-    /// returns `Some(0.0)` (measured zero), not `None`.
+    /// This is an ergonomic alias for the canonical per-phase
+    /// `iteration_rate`; it is not a second wall-throughput calculation.
+    /// Both the iteration numerator and delivered-CPU denominator come from
+    /// the same guest per-cgroup phase carriers, so host preemption does not
+    /// dilute the result.
     ///
-    /// Collapse-immune: the stimulus timeline carries per-step boundaries
-    /// independent of the periodic-capture pipeline, so this works even for
-    /// `--cell-parent-cgroup` schedulers where the capture-derived
-    /// [`PhaseBucket`](crate::assert::PhaseBucket) path can collapse.
+    /// `None` when the phase has no guest carrier or its workers accumulated
+    /// no measurable CPU time. A measured zero iteration count over positive
+    /// CPU time returns `Some(0.0)`.
     pub fn step_throughput(&self, phase: crate::assert::Phase) -> Option<f64> {
-        Self::step_throughput_in(&self.stimulus_timeline(), phase)
+        Self::step_throughput_in(&self.phase_buckets(), phase)
     }
 
     /// Ratio `step_throughput(a) / step_throughput(b)` — e.g.
-    /// scheduler-vs-EEVDF throughput when phase `b` runs on the detached
+    /// scheduler-vs-EEVDF iteration efficiency when phase `b` runs on the detached
     /// kernel default ([`crate::scenario::ops::Op::detach_scheduler`]).
-    /// Walks the stimulus timeline once. `None` when either phase has no
-    /// measurable throughput; a `Some(0.0)` denominator yields `inf` so a
-    /// collapsed/stalled phase `b` surfaces rather than vanishing to `None`.
+    /// Builds the canonical phase buckets once. `None` when either phase has
+    /// no measurable rate; a `Some(0.0)` denominator yields `inf` so a stalled
+    /// phase `b` surfaces rather than vanishing to `None`.
     pub fn throughput_ratio(
         &self,
         a: crate::assert::Phase,
         b: crate::assert::Phase,
     ) -> Option<f64> {
-        let timeline = self.stimulus_timeline();
-        let ta = Self::step_throughput_in(&timeline, a)?;
-        let tb = Self::step_throughput_in(&timeline, b)?;
+        let buckets = self.phase_buckets();
+        let ta = Self::step_throughput_in(&buckets, a)?;
+        let tb = Self::step_throughput_in(&buckets, b)?;
         Some(ta / tb)
     }
 
     /// Shared core for [`Self::step_throughput`] / [`Self::throughput_ratio`]
-    /// over an already-built timeline: pair the phase's `StepStart` with its
-    /// own `StepEnd` (step-local), falling back to the next step's
-    /// `StepStart` then the scenario-end terminal for the last step on
-    /// legacy/sched-died data that lacks a `StepEnd`. Mirrors the boundary
-    /// selection in [`crate::timeline::Timeline::build`].
+    /// over already-built canonical phase buckets.
     fn step_throughput_in(
-        timeline: &[crate::timeline::StimulusEvent],
+        buckets: &[crate::assert::PhaseBucket],
         phase: crate::assert::Phase,
     ) -> Option<f64> {
-        let start = timeline
+        buckets
             .iter()
-            .find(|e| !e.is_terminal && !e.is_step_end && e.phase() == Some(phase))?;
-        let end = timeline
-            .iter()
-            .find(|e| e.is_step_end && e.phase() == Some(phase))
-            .or_else(|| {
-                timeline
-                    .iter()
-                    .filter(|e| {
-                        !e.is_terminal && !e.is_step_end && e.phase().is_some_and(|p| p > phase)
-                    })
-                    .min_by_key(|e| e.elapsed_ms)
-            })
-            .or_else(|| timeline.iter().find(|e| e.is_terminal))?;
-        start.rate_to(end)
+            .find(|b| b.step_index == phase.as_u16())
+            .and_then(|b| b.get("iteration_rate"))
     }
 
     /// The guest-side [`crate::assert::AssertResult`] decoded from this
@@ -745,7 +845,7 @@ impl VmResult {
     ///
     /// This is the GUEST view: the run-level distribution / `ext_metrics`
     /// re-pools (`worst_*` wake-latency / run-delay aggregates, pooled
-    /// `iterations_per_cpu_sec`) are applied HOST-side in `evaluate_vm_result`
+    /// `iteration_rate`) are applied HOST-side in `evaluate_vm_result`
     /// AFTER the body returns and are NOT on this value — only
     /// `stats.phases[].per_cgroup` and the per-cgroup `stats.cgroups`
     /// reductions are guest-authoritative. For the per-phase per-cgroup view
@@ -813,16 +913,10 @@ impl VmResult {
     /// [`Self::periodic_series`] + [`Self::stimulus_timeline`] with the guest
     /// per-cgroup carriers folded in, BEFORE the per-phase scalar derivation
     /// [`Self::phase_buckets`] applies. This is the exact phase state the eval
-    /// layer feeds to the run-level ext-metrics population
-    /// (`populate_run_ext_metrics_from_phases` runs on the pre-derive phases;
-    /// `derive_phase_metrics` runs AFTER, inside `evaluate_vm_result`), so
-    /// [`Self::run_metric`] reuses it to reproduce that sequence by construction
-    /// (eval-faithful): post-derive phases yield the same run-level map today (the
-    /// run-level phase fold skips `is_derived` keys, and the pooled scalars
-    /// `derive_phase_metrics` adds are all `PerPhase`), but the pre-derive fold
-    /// avoids depending on that skip, so a pooled key ever registered as
-    /// non-derived cannot diverge `run_metric` from the eval map. Non-destructive
-    /// on the snapshot bridge, like [`Self::phase_buckets`].
+    /// layer feeds to [`crate::assert::populate_run_ext_all`].
+    /// [`Self::run_metric`] reuses it, and that helper performs the same
+    /// idempotent phase derivation as the eval path before folding run metrics.
+    /// Non-destructive on the snapshot bridge, like [`Self::phase_buckets`].
     fn phase_buckets_pre_derive(&self) -> Vec<crate::assert::PhaseBucket> {
         let host = crate::assert::build_phase_buckets_with_stimulus(
             &self.periodic_series(),
@@ -859,14 +953,14 @@ impl VmResult {
     }
 
     /// One framework-computed per-phase metric for `phase` — the
-    /// metric-name analog of [`Self::step_throughput`] /
+    /// general metric-name form of [`Self::step_throughput`] /
     /// [`Self::throughput_ratio`]. Resolves `metric` (any `impl Into<MetricId>` —
     /// a typed `BuiltinMetric`, typo-proof, or a dynamic scheduler-runtime
     /// string) from the folded
     /// [`Self::phase_buckets`] bucket for `phase`, checking two stores:
     /// 1. [`crate::assert::PhaseBucket::metrics`] (via
     ///    [`crate::assert::PhaseBucket::get`]) — the host-folded
-    ///    per-sample / monitor / stimulus metrics: per-phase CPU time
+    ///    per-sample / monitor / guest-carrier metrics: per-phase CPU time
     ///    (`system_time_ns`, `user_time_ns`), scheduling quality
     ///    (`avg_imbalance_ratio`, `avg_dsq_depth`, ...), and
     ///    `iteration_rate`.
@@ -902,8 +996,8 @@ impl VmResult {
     /// per-cgroup counter returns `Some(0.0)` when carriers exist but
     /// counted zero, `None` only when the phase has no carrier at all. A
     /// started-but-uncaptured step (a `StepStart` with zero captures) DOES
-    /// produce a synthesized bucket, so `phase_metric` returns its
-    /// stimulus-derived `iteration_rate` rather than `None`.
+    /// produce a synthesized bucket, and `phase_metric` can still return its
+    /// guest-carrier-derived `iteration_rate`.
     ///
     /// ```ignore
     /// // Typed (typo-proof) is the primary form; a dynamic scheduler-runtime
@@ -929,7 +1023,7 @@ impl VmResult {
     /// One run-level extensible ("ext") metric by name — the whole-run analog of
     /// [`Self::phase_metric`], for a `post_vm` callback asserting a run-level
     /// aggregate (e.g. `avg_irq_util`, `max_cpu_hardirqs`,
-    /// `worst_p99_wake_latency_us`, `iterations_per_cpu_sec`). SELF-COMPUTES the
+    /// `worst_p99_wake_latency_us`, `iteration_rate`). SELF-COMPUTES the
     /// run-level `ext_metrics` map exactly as the framework's `evaluate_vm_result`
     /// does — a [`VmResult`](Self) carries no stored run-level stats (`post_vm`
     /// runs BEFORE the host populates them) — by replaying the shared
@@ -945,7 +1039,7 @@ impl VmResult {
     /// phase-only ext metrics (`avg_imbalance_ratio`, `iteration_rate`,
     /// `system_time_ns`, `user_time_ns`, the IRQ counters/rates, the per-CPU
     /// spatial maxes `max_cpu_hardirqs` / `max_cpu_softirq_net_rx` and their
-    /// concentrations), the pooled `iterations_per_cpu_sec`, and the run-level
+    /// concentrations), the pooled `iteration_rate`, and the run-level
     /// `Distribution` / `WorstLowest` / `WakeLatencyTailRatio` / `WorstCrossNodeRatio`
     /// re-pools — and for
     /// those keys the two accessors return identical values (this one
@@ -1038,7 +1132,8 @@ impl VmResult {
     /// (`better_than` / `by_at_least`) records the outcome into `verdict`.
     /// "Better" is oriented from the registry polarity, so the SAME call works
     /// for a LowerBetter latency (`BuiltinMetric::WakeupP99LatencyUs`) and a
-    /// HigherBetter throughput (`BuiltinMetric::SchbenchLoopCount`) with no
+    /// HigherBetter CPU-normalized throughput
+    /// (`BuiltinMetric::SchbenchLoopsPerCpuSec`) with no
     /// caller-specified direction.
     ///
     /// A post_vm callback collapses the verdict to its `anyhow::Result` via
@@ -1152,6 +1247,12 @@ impl VmResult {
             exit_code: 0,
             duration: Duration::from_secs(1),
             timed_out: false,
+            watchdog_kill_reason: None,
+            final_guest_phase: GuestLifecyclePhase::Boot,
+            final_progress_epoch: 0,
+            bpf_map_writes_delivered: None,
+            periodic_prereqs_ready: None,
+            periodic_window_end: None,
             output: String::new(),
             stderr: String::new(),
             monitor: None,
@@ -1160,6 +1261,7 @@ impl VmResult {
             kvm_stats: None,
             crash_message: None,
             cleanup_duration: None,
+            cleanup_sched_delta: None,
             virtio_blk_counters: None,
             virtio_net_counters: None,
             snapshot_bridge: empty_snapshot_bridge_for_tests(),
@@ -1170,6 +1272,8 @@ impl VmResult {
             kern_kaslr_offset: 0,
             entry_name: None,
             variant_hash: 0,
+            host_vcpu_schedstat: None,
+            contention_witness: None,
             periodic_series_cache: std::sync::OnceLock::new(),
         }
     }
@@ -1363,6 +1467,256 @@ pub(crate) fn empty_snapshot_bridge_for_tests() -> crate::scenario::snapshot::Sn
     crate::scenario::snapshot::SnapshotBridge::new(cb)
 }
 
+/// Host-side vCPU scheduling-dilation sample, summed over the run's
+/// vCPU host threads.
+///
+/// Dilation `D = 1 + Σrun_delay / Σon_cpu`, where the two sums are
+/// taken over each vCPU host thread's `/proc/self/task/<tid>/schedstat`
+/// (field 1 = time on-CPU ns, field 2 = time runnable-but-not-running
+/// ns). `D == 1.0` means the vCPU threads always got the CPU the instant
+/// they were runnable; `D > 1.0` quantifies host-side scheduling delay
+/// (e.g. `1.03x` = threads waited 3% on top of their run time).
+///
+/// Idle-immune: a halted vCPU is blocked (not runnable), so it accrues
+/// no `run_delay` — halt time never inflates `D`. Measured HOST-side
+/// deliberately: the guest run-queue's own `run_delay` would measure the
+/// scheduler under test, which is the thing being evaluated; the host
+/// thread's schedstat measures the CPU the vCPU thread was starved of by
+/// the HOST, orthogonal to the guest scheduler.
+///
+/// RAW totals are stored (not the ratio) so future consumers can
+/// recompute or re-aggregate; [`Self::dilation`] derives the ratio.
+///
+/// `total_on_cpu_ns == 0` yields `dilation() == None` — this happens
+/// BOTH when no vCPU thread ran at all AND on a host built without
+/// `CONFIG_SCHEDSTATS` (every schedstat line reads `"0 0 0"`). `None` is
+/// thus graceful and distinguishable from a genuine `D == 1.0`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HostVcpuSchedstat {
+    /// Σ schedstat field 1 (time the vCPU threads spent ON-CPU), ns.
+    pub total_on_cpu_ns: u64,
+    /// Σ schedstat field 2 (time the vCPU threads spent runnable but
+    /// not running — host-side scheduling delay), ns.
+    pub total_run_delay_ns: u64,
+    /// Number of vCPU host threads that contributed to the sums (a TID
+    /// still 0 — an AP that never stamped its TID — and an unreadable
+    /// schedstat are both skipped).
+    pub sampled_vcpus: u32,
+}
+
+impl HostVcpuSchedstat {
+    /// Host dilation `D = 1 + Σrun_delay / Σon_cpu`, or `None` when no
+    /// on-CPU time was sampled (no vCPU ran, or the host lacks
+    /// `CONFIG_SCHEDSTATS` and every line read `"0 0 0"`). `None` is
+    /// deliberately distinguishable from a true `D == 1.0` (which needs
+    /// nonzero on-CPU time with zero run-delay).
+    pub fn dilation(&self) -> Option<f64> {
+        (self.total_on_cpu_ns > 0)
+            .then(|| 1.0 + self.total_run_delay_ns as f64 / self.total_on_cpu_ns as f64)
+    }
+
+    /// Field-wise saturating delta `self - anchor` over the two schedstat
+    /// sums — the on-CPU / run-delay accrued BETWEEN two cumulative
+    /// snapshots of the same vCPU threads. `sampled_vcpus` carries `self`'s
+    /// count (the reading the delta closes at). Saturating so a schedstat
+    /// that momentarily regressed (a TID that vanished then reappeared, a
+    /// torn read) contributes 0 rather than wrapping — conservative: a
+    /// per-phase `D` can only be UNDER-stated by such a clamp, never
+    /// fabricated. The result's [`Self::dilation`] is the phase-local `D`.
+    pub fn delta_from(&self, anchor: &HostVcpuSchedstat) -> HostVcpuSchedstat {
+        HostVcpuSchedstat {
+            total_on_cpu_ns: self.total_on_cpu_ns.saturating_sub(anchor.total_on_cpu_ns),
+            total_run_delay_ns: self
+                .total_run_delay_ns
+                .saturating_sub(anchor.total_run_delay_ns),
+            sampled_vcpus: self.sampled_vcpus,
+        }
+    }
+}
+
+/// Number of `LifecycleStage` variants (Boot, Attach,
+/// Dispatch, Body, Teardown) — the length of the per-phase witness array.
+/// Kept in lock-step with that enum; [`PerPhaseSchedstat::for_stage`] indexes
+/// by `stage as usize`, so a new stage variant needs this bumped.
+pub const NUM_LIFECYCLE_STAGES: usize = 5;
+
+/// Array index of the BODY stage (the measurement phase) — pinned to the
+/// enum discriminant so it can never drift from
+/// `LifecycleStage::Body`.
+pub const BODY_STAGE_INDEX: usize = crate::monitor::LifecycleStage::Body as usize;
+
+/// Per-lifecycle-phase host-dilation witness: normally one
+/// [`HostVcpuSchedstat`] DELTA per stage, covering the schedstat accrued
+/// between lifecycle-event boundary snapshots. If the guest-reported
+/// scenario duration proves queued lifecycle frames did not bracket Body,
+/// Body instead carries the complete enclosing vCPU-thread lifetime. That
+/// conservative fallback can overstate Body contention but cannot hide it.
+/// Indexed by `LifecycleStage` `as usize`.
+///
+/// Distinct from the whole-run [`VmResult::host_vcpu_schedstat`] (which is
+/// the verdict-line `D` over the entire run): normally each phase gets its OWN
+/// `D` over its OWN span, so the Body phase's dilation — the only phase whose
+/// contention actually contaminates the workload measurement — is isolated
+/// from the Boot / Attach / Teardown INFRA phases. The batched-delivery
+/// fallback deliberately gives up that localization. `Boot`/`Attach` `D` is
+/// diagnostic; `Body` is the one the latency verdict consumes.
+///
+/// The dispatch path takes each boundary snapshot immediately after accepting
+/// the CRC-valid lifecycle frame. ScenarioEnd's guest duration detects
+/// start/end frames accepted together after a starved dispatch loop. A wide-VM
+/// snapshot is a sequential sweep of the vCPU TIDs rather than an atomic
+/// kernel operation, so its uncertainty is the duration of that rare sweep,
+/// not the monitor's sampling period.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PerPhaseSchedstat {
+    /// Per-stage schedstat delta, indexed by `LifecycleStage as usize`
+    /// (Boot=0 .. Teardown=4). A stage never entered stays at the
+    /// `Default` all-zero value (`dilation() == None`).
+    pub phases: [HostVcpuSchedstat; NUM_LIFECYCLE_STAGES],
+}
+
+impl PerPhaseSchedstat {
+    /// The Body (measurement) phase's schedstat delta — the phase whose
+    /// dilation the latency verdict consumes.
+    pub fn body(&self) -> &HostVcpuSchedstat {
+        &self.phases[BODY_STAGE_INDEX]
+    }
+
+    /// The Body phase's host dilation `D`, or `None` when no on-CPU time was
+    /// sampled in the Body span (schedstats off, or the phase never ran).
+    pub fn body_dilation(&self) -> Option<f64> {
+        self.body().dilation()
+    }
+
+    /// The schedstat delta for one lifecycle stage (diagnostic access to the
+    /// Boot/Attach/Dispatch/Teardown phases). `pub(crate)`: takes the
+    /// crate-internal `LifecycleStage`. `allow(dead_code)`:
+    /// the diagnostic Boot/Attach `D` readers land with the LATER seam pass;
+    /// `body()` is the wired accessor.
+    #[allow(dead_code)]
+    pub(crate) fn for_stage(&self, stage: crate::monitor::LifecycleStage) -> &HostVcpuSchedstat {
+        &self.phases[stage as usize]
+    }
+}
+
+/// Body-phase peak-window contamination series. New witnesses store deltas of
+/// the ktstr runner cgroup's CPU PSI `some total` clock: time during which at
+/// least one runnable task in that cgroup was stalled for CPU. This includes a
+/// delayed vCPU even when its competitor is outside the cgroup, without
+/// charging pressure in unrelated host cgroups. Each entry has its real
+/// observation width in [`Self::tick_widths_ns`], allowing the window
+/// calculation to remain sound when the monitor is starved and wakes much
+/// later than its nominal cadence.
+///
+/// Legacy/deserialized witnesses may have no width vector; those retain the
+/// fixed-grid `tick_ns` interpretation. Bounded storage: observations are
+/// nominally 100 ms apart and Body phases run minutes, so a few thousand
+/// entries is typical; the series is capped at 36,000 intervals and
+/// `saturated` is set if the cap is hit. When
+/// `saturated`, the series is a PREFIX of the phase, so `W` computed from it
+/// is a LOWER bound — a later verdict pass should treat that as reducing
+/// confidence in a `FailConfirmed` rather than trusting a possibly-short `W`.
+///
+/// COVERAGE SOUNDNESS: new witnesses sample the cumulative PSI counter at
+/// accepted lifecycle boundaries as well as monitor wakes, so the first and
+/// last samples explicitly close the entire Body span. A starved monitor may
+/// produce one coarse interval instead of many fine ones, but charging that
+/// interval's entire delta remains an upper bound for every window it can
+/// touch. If either boundary sample fails or storage saturates, `complete` is
+/// false and the seam cannot use the series to confirm a failure.
+///
+/// Legacy witnesses have no explicit completeness bit. For them the seam
+/// retains the old conservative check that the fixed-grid samples span enough
+/// of Body; an empty or clustered series can only demote a result, never
+/// produce a false confirmation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BodyContentionWindow {
+    /// Per-observation CPU-contention delta (ns) over the Body phase, in time
+    /// order. New witnesses use runner-cgroup CPU PSI `some total`; legacy
+    /// witnesses contain summed vCPU schedstat run-delay.
+    pub tick_deltas: Vec<u64>,
+    /// Real wall width (ns) of each corresponding delta interval. Empty on
+    /// legacy witnesses. When present, length matches `tick_deltas` and the
+    /// peak-window calculation uses these widths instead of a nominal grid.
+    #[serde(default)]
+    pub tick_widths_ns: Vec<u64>,
+    /// The nominal monitor tick period (ns) the deltas were sampled at
+    /// (100 ms in production). Used only by legacy witnesses without real
+    /// interval widths.
+    pub tick_ns: u64,
+    /// True when [`Self::tick_deltas`] hit its cap and later Body ticks were
+    /// dropped — the series is then a prefix and `W` from it is a lower bound.
+    pub saturated: bool,
+    /// True when lifecycle-event samples anchored BOTH ends of Body (the
+    /// start is conservatively pulled back to the preceding lifecycle
+    /// boundary to cover virtio dispatch lag), making the cumulative interval
+    /// series complete even if it contains only one coarse interval. A host
+    /// acceptance span shorter than ScenarioEnd's guest duration invalidates
+    /// those edge samples; the complete whole-vCPU-lifetime fallback may then
+    /// restore completeness as one conservative interval. False on legacy
+    /// sampled witnesses, whose coverage is inferred from their first/last
+    /// monitor ticks.
+    #[serde(default)]
+    pub complete: bool,
+    /// Complete summed vCPU schedstat run-delay (ns) over the conservative
+    /// wall span of this series, or (when the preceding lifecycle snapshot
+    /// raced vCPU startup) the enclosing whole-thread lifetime. When
+    /// [`Self::schedstat_cap_complete`] is true, `W(L)` is capped by this
+    /// value: a request cannot absorb more task-specific scheduling delay in
+    /// one window than all vCPUs accumulated over the enclosing span. This
+    /// removes unrelated runner-cgroup PSI without under-bounding the target
+    /// VM's delay.
+    #[serde(default)]
+    pub schedstat_cap_ns: u64,
+    /// True when the closing snapshot sampled the complete live vCPU set and
+    /// the cap is therefore a sound upper bound. An exact matching opening
+    /// snapshot produces the tighter Body delta; otherwise the complete
+    /// whole-thread-life total is used. False for legacy witnesses and
+    /// partial/failed closing reads, in which case the cap is ignored.
+    #[serde(default)]
+    pub schedstat_cap_complete: bool,
+    /// The wall span (ns) covered by the Body witness. Normally the start is
+    /// conservatively pinned to the accepted lifecycle boundary preceding
+    /// Body, covering any time the guest's Body frame waited in virtio
+    /// dispatch; the end is the first accepted transition after Body. It may
+    /// therefore include adjacent-stage time, which makes `W` larger and can
+    /// only bias the verdict toward indeterminate. If that accepted span is
+    /// shorter than ScenarioEnd's guest duration, the guest duration widens
+    /// it for the whole-lifetime fallback. `0` when Body was never observed.
+    pub body_wall_ns: u64,
+    /// The wall span (ns) the series actually covered. For event-anchored
+    /// complete witnesses this equals `body_wall_ns`; for legacy witnesses it
+    /// is the elapsed between the first and last Body monitor tick.
+    pub body_covered_ns: u64,
+}
+
+/// The event-anchored host-contention witness: per-phase vCPU schedstat
+/// dilation plus the Body-phase CPU-pressure interval series. The monitor
+/// contributes constant-cost samples on its existing timer wakes; lifecycle
+/// dispatch anchors the stage boundaries. Carried on
+/// [`VmResult::contention_witness`] so a later seam pass can call
+/// `latency_verdict` to turn a latency threshold into a tri-state,
+/// contention-aware verdict.
+///
+/// `None` on [`VmResult`] when neither vCPU schedstat nor CPU PSI supplied any
+/// evidence. A present but incomplete Body series is retained for diagnostics
+/// but cannot confirm a latency failure.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ContentionWitness {
+    /// Per-lifecycle-phase host-dilation deltas (Boot..Teardown).
+    pub per_phase: PerPhaseSchedstat,
+    /// Body-phase contention intervals for the `W(L)` bound.
+    pub body_window: BodyContentionWindow,
+}
+
+impl ContentionWitness {
+    /// The Body-phase host dilation `D` (annotation for the latency verdict);
+    /// `None` when no Body on-CPU time was sampled.
+    pub fn body_dilation(&self) -> Option<f64> {
+        self.per_phase.body_dilation()
+    }
+}
+
 /// Per-vCPU KVM stats read after VM exit. Each map holds cumulative
 /// counter values from the VM's lifetime.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1443,6 +1797,34 @@ impl KvmStatsTotals {
 pub(crate) struct VmRunState {
     pub(crate) exit_code: i32,
     pub(crate) timed_out: bool,
+    /// Raw kill-reason byte loaded from the watchdog thread's latch
+    /// after its join (`freeze_coord::KillReasonTag` layout; 0 =
+    /// unset). Decoded into [`VmResult::watchdog_kill_reason`] by
+    /// `collect_results`, which owns the tag type.
+    pub(crate) watchdog_kill_reason_raw: u8,
+    /// Raw final lifecycle-stage byte from the progress ledger
+    /// (`monitor::LifecycleStage` layout). Decoded into
+    /// [`VmResult::final_guest_phase`] by `collect_results`.
+    pub(crate) final_guest_phase_raw: u8,
+    /// Final ledger milestone count → [`VmResult::final_progress_epoch`].
+    pub(crate) final_progress_epoch: u64,
+    /// Raw BPF-map-write injection delivery state (0 = none
+    /// configured, 1 = pending/never delivered, 2 = delivered) —
+    /// decoded into [`VmResult::bpf_map_writes_delivered`].
+    pub(crate) bpf_map_write_delivery_raw: u8,
+    /// Cleanup-window-open schedstat snapshot of the run_vm caller
+    /// thread (the join/drain performer) — closed by `collect_results`
+    /// into [`VmResult::cleanup_sched_delta`].
+    pub(crate) cleanup_sched_t0: Option<HostVcpuSchedstat>,
+    /// Run-relative ns when the periodic prereqs (kaslr + accessors)
+    /// became ready (0 = never) → [`VmResult::periodic_prereqs_ready`].
+    pub(crate) periodic_prereqs_ready_ns_raw: u64,
+    /// Run-relative ns of the periodic capture-window end (0 = the
+    /// window never resolved) → [`VmResult::periodic_window_end`].
+    pub(crate) periodic_window_end_ns_raw: u64,
+    /// Event-anchored per-phase dilation + Body contention intervals,
+    /// finalized from live proc entries plus one-shot AP exit snapshots.
+    pub(crate) contention_witness: Option<ContentionWitness>,
     pub(crate) ap_threads: Vec<VcpuThread>,
     pub(crate) monitor_handle: Option<JoinHandle<monitor::reader::MonitorLoopResult>>,
     pub(crate) bpf_write_handle: Option<JoinHandle<()>>,
@@ -1627,6 +2009,12 @@ pub(crate) struct VmRunState {
     /// [`VmResult::periodic_target`] so test code can compute
     /// coverage as `fired / target`.
     pub(crate) periodic_target: u32,
+    /// Host-side vCPU scheduling-dilation sample, read at `run_vm`
+    /// teardown from each vCPU thread's `/proc/self/task/<tid>/schedstat`
+    /// (see [`HostVcpuSchedstat`]). Forwarded verbatim to
+    /// [`VmResult::host_vcpu_schedstat`]. `None` on hosts without
+    /// `CONFIG_SCHEDSTATS` or when no vCPU thread was sampled.
+    pub(crate) host_vcpu_schedstat: Option<HostVcpuSchedstat>,
 }
 #[cfg(test)]
 mod tests {
@@ -1684,60 +2072,76 @@ mod tests {
         assert_eq!(bad.scheduler_log(), "", "crc-bad frame dropped -> empty");
     }
 
-    /// A StepStart/StepEnd/terminal `StimulusEvent` for the
-    /// `step_throughput_in` pairing tests.
-    fn ev(
-        elapsed_ms: u64,
-        step_index: Option<u16>,
-        iters: Option<u64>,
-        is_step_end: bool,
-        is_terminal: bool,
-    ) -> crate::timeline::StimulusEvent {
-        crate::timeline::StimulusEvent {
-            elapsed_ms,
-            label: String::new(),
-            op_kind: None,
-            detail: None,
-            total_iterations: iters,
-            step_index,
-            is_terminal,
-            is_step_end,
+    /// `HostVcpuSchedstat::dilation` = `1 + run_delay/on_cpu`, `None`
+    /// when no on-CPU time was sampled (idle/no-vCPU or a
+    /// CONFIG_SCHEDSTATS-off host reading `0 0 0`). Directional endpoints:
+    /// zero run-delay -> exactly 1.0; run-delay == on-cpu -> 2.0; zero
+    /// on-cpu -> None (distinguishable from a genuine 1.0).
+    #[test]
+    fn host_vcpu_schedstat_dilation_endpoints() {
+        // R == 0 -> D == 1.0 (always got the CPU when runnable).
+        let d = HostVcpuSchedstat {
+            total_on_cpu_ns: 1_000,
+            total_run_delay_ns: 0,
+            sampled_vcpus: 1,
         }
+        .dilation();
+        assert_eq!(d, Some(1.0), "no run delay -> exactly 1.0");
+        // R == C -> D == 2.0 (waited as long as it ran).
+        let d = HostVcpuSchedstat {
+            total_on_cpu_ns: 1_000,
+            total_run_delay_ns: 1_000,
+            sampled_vcpus: 2,
+        }
+        .dilation();
+        assert_eq!(d, Some(2.0), "run delay == on-cpu -> 2.0");
+        // C == 0 -> None (no on-cpu time: idle, no vCPU, or schedstats off).
+        let d = HostVcpuSchedstat {
+            total_on_cpu_ns: 0,
+            total_run_delay_ns: 500,
+            sampled_vcpus: 0,
+        }
+        .dilation();
+        assert_eq!(d, None, "zero on-cpu -> None, not a synthetic 1.0");
     }
 
-    /// `step_throughput_in` pairs `StepStart[k]` -> `StepEnd[k]` of the SAME
-    /// `Phase` for the step-local rate; falls back to the next step then the
-    /// scenario-end terminal when a StepEnd is absent; a flat counter over a
-    /// positive window is measured-zero `Some(0.0)` (not `None`); BASELINE /
-    /// an absent step is `None`.
+    /// `step_throughput_in` reads the canonical CPU-denominated
+    /// `iteration_rate`; it neither reconstructs nor exposes a wall rate.
     #[test]
-    fn step_throughput_in_pairs_step_local_and_handles_edges() {
+    fn step_throughput_in_reads_canonical_iteration_rate() {
         use crate::assert::Phase;
-        let tl = vec![
-            ev(0, Some(1), Some(0), false, false),       // StepStart[0]
-            ev(1000, Some(1), Some(5000), true, false),  // StepEnd[0] -> 5000/s
-            ev(1100, Some(2), Some(5000), false, false), // StepStart[1]
-            ev(2100, Some(2), Some(5000), true, false),  // StepEnd[1] -> 0/s (flat)
-            ev(2200, Some(3), Some(5000), false, false), // StepStart[2] (no StepEnd)
-            crate::timeline::StimulusEvent::terminal(3200, 11000), // right boundary for step 2
+        let buckets = vec![
+            crate::assert::PhaseBucket {
+                step_index: 1,
+                metrics: [("iteration_rate".to_string(), 5_000.0)]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            crate::assert::PhaseBucket {
+                step_index: 2,
+                metrics: [("iteration_rate".to_string(), 0.0)].into_iter().collect(),
+                ..Default::default()
+            },
+            crate::assert::PhaseBucket {
+                step_index: 3,
+                ..Default::default()
+            },
         ];
-        // Step 0: (5000-0)/1s = 5000/s.
         assert_eq!(
-            VmResult::step_throughput_in(&tl, Phase::step(0)),
+            VmResult::step_throughput_in(&buckets, Phase::step(0)),
             Some(5000.0)
         );
-        // Step 1: counter flat over a positive window -> measured zero
-        // Some(0.0), NOT None.
-        assert_eq!(VmResult::step_throughput_in(&tl, Phase::step(1)), Some(0.0));
-        // Step 2: no StepEnd -> falls back to the terminal:
-        // (11000-5000)/1s = 6000/s.
         assert_eq!(
-            VmResult::step_throughput_in(&tl, Phase::step(2)),
-            Some(6000.0)
+            VmResult::step_throughput_in(&buckets, Phase::step(1)),
+            Some(0.0),
         );
-        // BASELINE and an absent step have no StepStart -> None.
-        assert_eq!(VmResult::step_throughput_in(&tl, Phase::BASELINE), None);
-        assert_eq!(VmResult::step_throughput_in(&tl, Phase::step(9)), None);
+        assert_eq!(VmResult::step_throughput_in(&buckets, Phase::step(2)), None);
+        assert_eq!(
+            VmResult::step_throughput_in(&buckets, Phase::BASELINE),
+            None
+        );
+        assert_eq!(VmResult::step_throughput_in(&buckets, Phase::step(9)), None);
     }
 
     #[test]

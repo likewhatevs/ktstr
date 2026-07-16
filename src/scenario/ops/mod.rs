@@ -1090,6 +1090,30 @@ fn finish_scenario(
     result
 }
 
+/// Guest workload-progress publisher. It emits scenario-elapsed time from the
+/// scenario driver's EXISTING scheduler-liveness wakeups (plus lifecycle
+/// boundaries), so the host can clock periodic captures off guest progress
+/// without adding a periodically-runnable guest thread of its own.
+///
+/// The driver's hold path already wakes every 100 ms to inspect the BPF
+/// err-exit latch / sched_ext state. Publishing from those wakes preserves the
+/// heartbeat's cadence while the capture-active workload is running at no
+/// additional scheduler wakeup cost. Setup and paused teardown publish only at
+/// their natural boundaries; there is no useful periodic-capture progress to
+/// report while the driver is not in a workload hold.
+#[derive(Clone, Copy)]
+struct WorkloadHeartbeat {
+    scenario_start: std::time::Instant,
+}
+
+impl WorkloadHeartbeat {
+    fn publish(self) {
+        crate::vmm::guest_comms::send_workload_progress(
+            self.scenario_start.elapsed().as_millis() as u64
+        );
+    }
+}
+
 /// Internal driver: runs Backdrop setup, the Step loop with
 /// per-Step teardown, and final Backdrop teardown.
 fn run_scenario(
@@ -1117,10 +1141,9 @@ fn run_scenario(
     // (scenario-relative elapsed_ms, cumulative worker iteration count)
     // at the END of the most-recently completed step, captured
     // coincidently inside `run_step` while that step's workers are still
-    // alive. Carries the LAST step's pair out of the loop so the
-    // `ScenarioEnd` frame can supply the final step's `iteration_rate`
-    // right boundary. `None` until the first step completes a
-    // hold cleanly.
+    // alive. Carries the LAST step's pair out of the loop for terminal
+    // boundary telemetry. `None` until the first step completes a hold
+    // cleanly.
     let mut final_total_iterations: Option<(u64, u64)> = None;
 
     let scenario_start = std::time::Instant::now();
@@ -1130,6 +1153,19 @@ fn run_scenario(
     // both absent and `send_scenario_start` would log a no-op warning.
     if guest_comms::is_guest() {
         crate::vmm::guest_comms::send_scenario_start();
+    }
+
+    // Workload-progress publisher: drives the host's periodic-capture clock
+    // off guest progress. Only present when this run declares periodic
+    // captures (`KTSTR_AWAIT_PERIODIC_READY`, set iff num_snapshots > 0).
+    // Unlike the old detached heartbeat, this is passive state carried by the
+    // scenario driver; `hold_or_sched_died` publishes from wakeups the driver
+    // already performs for scheduler liveness.
+    let workload_heartbeat = (guest_comms::is_guest()
+        && crate::vmm::rust_init::cmdline_val("KTSTR_AWAIT_PERIODIC_READY").is_some())
+    .then_some(WorkloadHeartbeat { scenario_start });
+    if let Some(heartbeat) = workload_heartbeat {
+        heartbeat.publish();
     }
 
     wait_for_host_map_write(ctx);
@@ -1221,6 +1257,7 @@ fn run_scenario(
             effective_checks,
             &mut sched_died_during_hold,
             &mut final_total_iterations,
+            workload_heartbeat,
         );
 
         // Close this step's hold window for backdrop workers: write the
@@ -1386,7 +1423,11 @@ fn sched_crashed_unexpectedly() -> bool {
     crate::vmm::rust_init::sched_pid().is_some() && dispatch::scx_down()
 }
 
-fn hold_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
+fn hold_or_sched_died(
+    dur: Duration,
+    sched_pid: Option<libc::pid_t>,
+    workload_heartbeat: Option<WorkloadHeartbeat>,
+) -> bool {
     use crate::probe::process::{SchedExitKind, sched_exit_kind};
     use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
@@ -1404,6 +1445,9 @@ fn hold_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
     let crashed = || matches!(sched_exit_kind(), SchedExitKind::Crashed);
 
     if dur.is_zero() {
+        if let Some(heartbeat) = workload_heartbeat {
+            heartbeat.publish();
+        }
         return crashed()
             || (sched_pid.is_some() && dispatch::scx_down())
             || sched_pid.is_some_and(|pid| !process_alive(pid));
@@ -1415,6 +1459,9 @@ fn hold_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
         // crash — poll it in short intervals instead of sleeping blind
         // for the whole window.
         loop {
+            if let Some(heartbeat) = workload_heartbeat {
+                heartbeat.publish();
+            }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 return crashed();
@@ -1489,6 +1536,9 @@ fn hold_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
 
     let mut events = [EpollEvent::empty()];
     loop {
+        if let Some(heartbeat) = workload_heartbeat {
+            heartbeat.publish();
+        }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             // Hold elapsed without a wakeup. Re-probe ALL signals to
@@ -1596,6 +1646,7 @@ fn run_step<'a>(
     // a failed step does not overwrite a prior step's good value with a
     // misleading post-death count.
     final_total_iterations: &mut Option<(u64, u64)>,
+    workload_heartbeat: Option<WorkloadHeartbeat>,
 ) -> Result<()> {
     let mut scenario = ScenarioState::new(step_state, backdrop_state);
 
@@ -1648,7 +1699,11 @@ fn run_step<'a>(
                 // Live `sched_pid()` read so a mid-loop
                 // Op::ReplaceScheduler swap is watched at the NEW
                 // pid, not the stale boot snapshot in ctx.
-                if hold_or_sched_died(remaining.min(interval), crate::vmm::rust_init::sched_pid()) {
+                if hold_or_sched_died(
+                    remaining.min(interval),
+                    crate::vmm::rust_init::sched_pid(),
+                    workload_heartbeat,
+                ) {
                     *sched_died_during_hold = true;
                     return Ok(());
                 }
@@ -1710,7 +1765,11 @@ fn run_step<'a>(
             // Live `sched_pid()` read — matches the loop arm above
             // so the hold watches the post-Op::ReplaceScheduler
             // pid, not the stale boot snapshot.
-            if hold_or_sched_died(hold_dur, crate::vmm::rust_init::sched_pid()) {
+            if hold_or_sched_died(
+                hold_dur,
+                crate::vmm::rust_init::sched_pid(),
+                workload_heartbeat,
+            ) {
                 *sched_died_during_hold = true;
                 return Ok(());
             }
@@ -1723,18 +1782,10 @@ fn run_step<'a>(
     // right after `run_step` returns, so this is the last moment a
     // step-inclusive sum is observable. `run_steps` forwards the LAST
     // step's (elapsed_ms, iterations) pair in the widened `ScenarioEnd`
-    // frame so the final step's `iteration_rate` has a right boundary to
-    // diff against. The elapsed MUST be sampled HERE,
-    // coincident with the count: recomputing it at `ScenarioEnd` send
-    // time would measure past `send_scenario_pause` + the last step's
-    // `collect_step` teardown (100ms–seconds under contention),
-    // inflating the rate's denominator with wall-time during which no
-    // iterations accrued and systematically under-reporting the last
-    // step's throughput (a rate consumer treats counter/duration with
-    // coincident endpoints). Only reached on a clean hold (the
-    // sched-died early returns above skip it — a failed run needs no
-    // terminal rate); gated on `is_guest` so the host-side scenario walk
-    // doesn't sum a handle set that never ran a workload.
+    // frame. Sample both HERE so the terminal telemetry describes one
+    // coincident endpoint rather than mixing a pre-teardown count with a
+    // post-teardown clock. Only reached on a clean hold; gated on `is_guest`
+    // so the host-side scenario walk does not sum a handle set that never ran.
     if guest_comms::is_guest() {
         let end_elapsed_ms = scenario_start.elapsed().as_millis() as u64;
         let end_iterations: u64 = scenario
@@ -1745,13 +1796,10 @@ fn run_step<'a>(
 
         // Emit a per-step StepEnd frame carrying this step's coincident
         // end-of-hold (elapsed_ms, total_iterations) and the SAME
-        // 1-indexed step_index as its StepStart, so the host pairs
-        // StepStart[k] -> StepEnd[k] for step-LOCAL throughput: each
-        // step's OWN workers measured start-to-end, which —
-        // unlike the cross-step StepStart[k] -> StepStart[k+1] delta —
-        // does not read ~0 for workers respawned per step. build_stimulus
-        // supplies the op/cgroup/worker fields + the 1-indexed
-        // step_index; override its recomputed elapsed/iterations with the
+        // 1-indexed step_index as its StepStart. This preserves raw step-local
+        // boundary telemetry; the canonical iteration rate comes from the
+        // CPU-time carrier. build_stimulus supplies the op/cgroup/worker fields
+        // + the step index; override its recomputed elapsed/iterations with the
         // values captured above so the StepEnd pair stays coincident with
         // `final_total_iterations` (no pause/teardown wall-time creep).
         let mut step_end = build_stimulus(&scenario_start, step_idx, &step.ops, &scenario);

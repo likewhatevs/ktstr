@@ -14,6 +14,7 @@ mod kernel_op_dispatch;
 
 use anyhow::{Context, Result};
 use kvm_ioctls::VcpuExit;
+use std::io::{Read, Seek};
 use std::os::fd::AsRawFd;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::Arc;
@@ -31,7 +32,7 @@ use crate::sync::MutexExt;
 use super::exit_dispatch::{self, ExitAction, classify_exit, vcpu_run_loop_unified};
 use super::host_comms::BulkDrainResult;
 use super::pi_mutex::PiMutex;
-use super::result::{VmResult, VmRunState};
+use super::result::{HostVcpuSchedstat, VmResult, VmRunState};
 use super::vcpu::{
     ApFreezeHandles, BpfMapWriteParams, ImmediateExitHandle, VcpuThread, WatchpointArm,
     duration_to_jiffies, load_probe_bss_offset, open_vcpu_perf_capture, pin_current_thread,
@@ -58,10 +59,34 @@ use super::x86_64::kvm;
 use super::DRAM_BASE;
 
 mod dispatch;
+pub(crate) mod latency_verdict;
 mod lazy_init;
 mod snapshot;
 mod state;
+// `pub(crate)` so the monitor can drive `CpuTrickleTracker` /
+// `trickle_floor_for_currency`: the width-sound trickle-stall verdict is
+// computed monitor-side (it owns the per-vCPU CPU data the busiest-vCPU
+// windowed currency needs) and published to the ledger for the watchdog.
+pub(crate) mod watchdog_step;
 mod watchpoint;
+
+/// Guest scx `watchdog_timeout` multiplier for COVERAGE builds only
+/// (cargo-llvm-cov compiles with `--cfg coverage`; plain builds get 1 =
+/// no-op, byte-identical). The in-guest test binary and fixture
+/// schedulers are llvm-cov-instrumented (~2x slower per measured host
+/// cost), and the coverage CI legs' deepened oversubscription on
+/// colocated runners starves single vCPUs long enough that the tight 5 s
+/// default evicts churn-heavy fixture schedulers the uninstrumented legs
+/// run green on the same hosts. 3x (5 s → 15 s) matches the margin the
+/// heaviest fixtures already declare explicitly and stays a fraction of
+/// the kernel's SCX_WATCHDOG_MAX_TIMEOUT (30 s) for the default.
+/// Deliberately compile-time: the tight default keeps its full
+/// stall-detection value in every non-coverage build, so a slow-stall
+/// bug can never hide behind this margin outside coverage runs.
+#[cfg(coverage)]
+const GUEST_SCX_WATCHDOG_COVERAGE_SCALE: u64 = 3;
+#[cfg(not(coverage))]
+const GUEST_SCX_WATCHDOG_COVERAGE_SCALE: u64 = 1;
 
 #[cfg(test)]
 mod bss_tests;
@@ -193,6 +218,287 @@ fn is_probe_output_end_frame(msg: &crate::vmm::bulk::BulkMessage) -> bool {
         && msg.payload.windows(needle.len()).any(|w| w == needle)
 }
 
+/// Order-independent artifact rendezvous for wprof runs.
+///
+/// A healthy probe stays attached until scheduler teardown, so its
+/// `PROBE_OUTPUT_END` normally follows the late wprof trace. A probe that
+/// cannot load (for example, because the guest kernel lacks the optional
+/// `sched_ext_exit` BTF tracepoint) emits its diagnostic payload before the
+/// scenario starts. Remember both events across drain batches so either order
+/// satisfies the rendezvous; requiring the terminator to arrive *after* the
+/// trace loses the already-shipped diagnostic and holds the VM until the grace
+/// backstop.
+#[derive(Default)]
+struct WprofShipState {
+    wprof_trace: bool,
+    probe_output: bool,
+    acknowledged: bool,
+}
+
+impl WprofShipState {
+    /// Observe a bulk-drain batch and return true exactly once, when every
+    /// artifact required by this run has arrived. Plain runs require only the
+    /// terminal trace; dual-snapshot auto-repro runs also require the probe
+    /// terminator. The one-shot return prevents duplicate host→guest acks if a
+    /// later batch happens to contain another matching frame.
+    fn observe(&mut self, messages: &[crate::vmm::bulk::BulkMessage], dual_snapshot: bool) -> bool {
+        self.wprof_trace |= messages.iter().any(is_wprof_ship_frame);
+        self.probe_output |= messages.iter().any(is_probe_output_end_frame);
+        let complete = self.wprof_trace && (!dual_snapshot || self.probe_output);
+        if complete && !self.acknowledged {
+            self.acknowledged = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Provenance tag for the shared `watchdog_reset_ns` deadline atomic.
+///
+/// FOUR independent subsystems store into that single `AtomicU64`
+/// (the monitor's scx_root attach latch, the guest scenario-dispatch
+/// arms, freeze-cycle extension, and wprof-ship grace), so a watchdog
+/// dump keyed only on "was the deadline reset at all" cannot say WHICH
+/// one armed it. Worse, the scenario-start arm fires even when the
+/// scheduler already died, so the old `reset_by_scheduler_attach=`
+/// key mislabeled dead schedulers as attached during triage. This
+/// parallel `AtomicU8` records the last writer so the dump renders the
+/// true provenance.
+///
+/// A SEPARATE atomic (not bit-packed into the u64) because the freeze
+/// and grace writers do load/compare arithmetic on the raw ns value —
+/// a packed tag would corrupt that. Each writer stores its ns and its
+/// tag back-to-back under Relaxed ordering, so a reader can transiently
+/// observe a fresh ns with a stale tag (or vice-versa). That race is
+/// benign: the tag feeds human-facing diagnostics only, never a control
+/// decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum WatchdogResetTag {
+    /// No writer has armed the reset deadline yet (the initial value).
+    Unset = 0,
+    /// The host monitor observed `*scx_root` transition null → non-null
+    /// (a scheduler attached) and reset the deadline to attach-moment +
+    /// workload duration. See `monitor::reader::monitor_loop`'s
+    /// watchdog-reset arm.
+    ScxRootLatch = 1,
+    /// The guest's scenario-dispatch machinery armed/extended the reset:
+    /// a `ScenarioStart` (start the workload clock at scenario start),
+    /// `ScenarioResume` (add the paused span back), or `ScenarioEnd`
+    /// (re-anchor to now + duration) frame — all three carry this one
+    /// tag since they are the same subsystem. NOTE: the `ScenarioStart`
+    /// arm fires even when the scheduler already DIED, so this tag does
+    /// NOT imply a live scheduler — the exact ambiguity that misled the
+    /// old `reset_by_scheduler_attach` key.
+    ScenarioStart = 2,
+    /// A freeze cycle extended the reset by the freeze duration so the
+    /// frozen span does not eat the workload budget
+    /// (`extend_watchdog_for_freeze`).
+    FreezeExtend = 3,
+    /// A wprof-ship grace extended the reset to cover the ship window
+    /// (`extend_watchdog_reset_for_grace`).
+    WprofGrace = 4,
+    /// The guest emitted a `LifecyclePhase::SchedulerAttached` frame — a
+    /// REAL sched_ext scheduler bound with a live child — and the dispatch
+    /// thread re-armed the reset to attach-moment + workload duration. The
+    /// evented, authoritative counterpart to [`Self::ScxRootLatch`]: unlike
+    /// the polled `*scx_root` latch, this frame is only sent on a confirmed
+    /// live-scheduler attach (never for an EEVDF/no-scheduler run or a dead
+    /// scheduler), so — unlike `ScenarioStart` — it DOES imply a live
+    /// scheduler. See `freeze_coord::dispatch`'s Lifecycle arm.
+    GuestAttachConfirm = 5,
+}
+
+impl WatchdogResetTag {
+    /// Decode a raw atomic byte. Any unrecognized value (only reachable
+    /// via a never-written slot) maps to [`WatchdogResetTag::Unset`].
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::ScxRootLatch,
+            2 => Self::ScenarioStart,
+            3 => Self::FreezeExtend,
+            4 => Self::WprofGrace,
+            5 => Self::GuestAttachConfirm,
+            _ => Self::Unset,
+        }
+    }
+
+    /// Human-facing token for the watchdog dump's `reset_armed_by=` key.
+    fn render(self) -> &'static str {
+        match self {
+            Self::Unset => "none",
+            Self::ScxRootLatch => "scx-root-attach-latch",
+            Self::ScenarioStart => "scenario-start",
+            Self::FreezeExtend => "freeze-extend",
+            Self::WprofGrace => "wprof-grace",
+            Self::GuestAttachConfirm => "guest-attach-confirm",
+        }
+    }
+}
+
+/// Which rule fired the watchdog, recorded so the deadline-expired dump
+/// names the true cause. Mirrors [`WatchdogResetTag`]'s shape (a `#[repr(u8)]`
+/// tag with `from_u8`/`render`). The watchdog thread owns the sole
+/// [`std::sync::atomic::AtomicU8`] holding this: it is stored on the fire
+/// path and loaded back for the dump within the same thread, so no
+/// cross-thread ordering is required — the atomic keeps the store/render
+/// idiom uniform with the reset tag and leaves room for a future shared
+/// reader (e.g. the verdict) without reshaping the type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum KillReasonTag {
+    /// No kill recorded yet (the initial value).
+    Unset = 0,
+    /// Tier-1: guest CPU burned past the phase budget with no progress —
+    /// a spinning wedge (`watchdog_step::KillDecision::Tier1CpuBudget`).
+    Tier1Cpu = 1,
+    /// Tier-2: no progress past the phase wall backstop with no runnable
+    /// demand — a silent idle wedge (`KillDecision::Tier2IdleWedge`).
+    Tier2Idle = 2,
+    /// Tier-3: the guest-derived hard deadline expired AND the deadman was
+    /// not deferred — the monitor was dead (`!monitor_live`), the cell was
+    /// inert (CPU trickle-stalled AND no milestone within
+    /// [`watchdog_step::TIER3_PROGRESS_GRACE_NS`]), or the current phase
+    /// exhausted the whole effective-deadline busiest-vCPU budget. NOT an
+    /// unconditional wall clock: a starved-but-alive cell accrues that CPU
+    /// budget slowly, while an active Body livelock is now finite.
+    Tier3Deadman = 3,
+    /// An AP set the kill flag (a panic-driven kill), not a watchdog
+    /// timeout. Distinct so the dump does not mislabel it as an expiry.
+    ApKill = 4,
+}
+
+impl KillReasonTag {
+    /// Decode a raw atomic byte. Any unrecognized value maps to
+    /// [`KillReasonTag::Unset`].
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Tier1Cpu,
+            2 => Self::Tier2Idle,
+            3 => Self::Tier3Deadman,
+            4 => Self::ApKill,
+            _ => Self::Unset,
+        }
+    }
+
+    /// Human-facing token for the watchdog dump's `kill_reason=` key.
+    fn render(self) -> &'static str {
+        match self {
+            Self::Unset => "none",
+            Self::Tier1Cpu => "tier1-cpu-budget",
+            Self::Tier2Idle => "tier2-idle-wedge",
+            Self::Tier3Deadman => "tier3-deadman-deadline",
+            Self::ApKill => "ap-kill",
+        }
+    }
+}
+
+/// Decode the watchdog's raw kill-reason byte into the public
+/// [`crate::vmm::WatchdogKillReason`] mirror for `VmResult`. Kept here
+/// (not in `result.rs`) so the byte layout stays owned by
+/// [`KillReasonTag`]; `Unset` (and any unknown byte, via
+/// `KillReasonTag::from_u8`'s conservative mapping) decodes to `None` —
+/// "no watchdog kill recorded".
+fn decode_watchdog_kill_reason(raw: u8) -> Option<crate::vmm::WatchdogKillReason> {
+    use crate::vmm::WatchdogKillReason as Pub;
+    match KillReasonTag::from_u8(raw) {
+        KillReasonTag::Unset => None,
+        KillReasonTag::Tier1Cpu => Some(Pub::Tier1CpuBudget),
+        KillReasonTag::Tier2Idle => Some(Pub::Tier2IdleWedge),
+        KillReasonTag::Tier3Deadman => Some(Pub::Tier3Deadman),
+        KillReasonTag::ApKill => Some(Pub::ApKill),
+    }
+}
+
+/// Decode the ledger's raw lifecycle-stage byte into the public
+/// [`crate::vmm::GuestLifecyclePhase`] mirror for `VmResult`. Routes
+/// through `LifecycleStage::from_u8` so the conservative unknown→Boot
+/// mapping stays single-sourced.
+fn decode_guest_phase(raw: u8) -> crate::vmm::GuestLifecyclePhase {
+    use crate::vmm::GuestLifecyclePhase as Pub;
+    match monitor::LifecycleStage::from_u8(raw) {
+        monitor::LifecycleStage::Boot => Pub::Boot,
+        monitor::LifecycleStage::Attach => Pub::Attach,
+        monitor::LifecycleStage::Dispatch => Pub::Dispatch,
+        monitor::LifecycleStage::Body => Pub::Body,
+        monitor::LifecycleStage::Teardown => Pub::Teardown,
+    }
+}
+
+/// Decode the BPF-map-write injection delivery byte for
+/// [`crate::vmm::VmResult::bpf_map_writes_delivered`]: 0 = no writes
+/// configured (`None`), 2 = delivered-and-guest-signalled
+/// (`Some(true)`), anything else = configured but never delivered
+/// (`Some(false)` — conservative for unknown bytes: an undelivered
+/// injection must never read as delivered).
+fn decode_bpf_map_write_delivery(raw: u8) -> Option<bool> {
+    match raw {
+        0 => None,
+        2 => Some(true),
+        _ => Some(false),
+    }
+}
+
+/// Block a configured host BPF-map writer until the guest confirms that its
+/// probe pipeline and optional wprof capture are armed. Both readiness and VM
+/// teardown are eventfd edges, so this consumes no periodic wakeups. The
+/// readiness fd is level-triggered: a guest frame that arrives while the host
+/// is still resolving the map remains pending and releases this wait later.
+fn wait_for_bpf_map_write_ready(
+    ready_evt: &EventFd,
+    kill_evt: &EventFd,
+    kill: &AtomicBool,
+) -> bool {
+    loop {
+        if kill.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut fds = [
+            libc::pollfd {
+                fd: ready_evt.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: kill_evt.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: both descriptors are live for the duration of poll; poll
+        // writes only the two `revents` fields.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+        if rc < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            tracing::warn!(err = %e, "BPF-map-write readiness poll failed");
+            return false;
+        }
+        if kill.load(Ordering::Acquire) || fds[1].revents & libc::POLLIN != 0 {
+            return false;
+        }
+        if fds[0].revents & libc::POLLIN != 0 {
+            // EFD_NONBLOCK plus POLLIN makes this read non-blocking and
+            // authoritative. A read error is harmless: the readiness Atomic
+            // is represented by the still-readable counter, so retry poll.
+            if ready_evt.read().is_ok() {
+                return true;
+            }
+            continue;
+        }
+        if fds
+            .iter()
+            .any(|fd| fd.revents & (libc::POLLERR | libc::POLLNVAL) != 0)
+        {
+            tracing::warn!("BPF-map-write readiness poll reported an invalid eventfd");
+            return false;
+        }
+    }
+}
+
 /// Extend the watchdog's reset deadline so it accommodates an armed
 /// wprof-ship grace. The watchdog fires at
 /// `effective_deadline = reset_deadline.max(hard_deadline)` where
@@ -206,6 +512,7 @@ fn is_probe_output_end_frame(msg: &crate::vmm::bulk::BulkMessage) -> bool {
 /// a larger existing reset is never shrunk.
 fn extend_watchdog_reset_for_grace(
     reset_ns: &std::sync::atomic::AtomicU64,
+    reset_tag: &std::sync::atomic::AtomicU8,
     run_start: Instant,
     grace: Duration,
 ) {
@@ -213,6 +520,10 @@ fn extend_watchdog_reset_for_grace(
     let encoded = u64::try_from(target.as_nanos()).unwrap_or(u64::MAX).max(1);
     if encoded > reset_ns.load(Ordering::Acquire) {
         reset_ns.store(encoded, Ordering::Release);
+        // Stamp provenance whenever we win the max-style store, so the
+        // watchdog dump attributes this deadline to the grace and not
+        // to a stale earlier writer. Relaxed is fine — diagnostic only.
+        reset_tag.store(WatchdogResetTag::WprofGrace as u8, Ordering::Relaxed);
     }
 }
 
@@ -224,10 +535,153 @@ fn extend_watchdog_reset_for_grace(
 fn arm_wprof_grace(
     run_start: Instant,
     reset_ns: &std::sync::atomic::AtomicU64,
+    reset_tag: &std::sync::atomic::AtomicU8,
     grace: Duration,
 ) -> Instant {
-    extend_watchdog_reset_for_grace(reset_ns, run_start, grace);
+    extend_watchdog_reset_for_grace(reset_ns, reset_tag, run_start, grace);
     Instant::now() + grace
+}
+
+#[cfg(test)]
+mod watchdog_reset_tag_tests {
+    use super::{KillReasonTag, WatchdogResetTag, decode_guest_phase, decode_watchdog_kill_reason};
+    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// The VmResult plumbing decodes each fired tier's raw byte into the
+    /// public mirror, and the Unset/unknown bytes into `None` — so a clean
+    /// run (watchdog never fired, latch still 0) surfaces
+    /// `watchdog_kill_reason: None` and a fired tier surfaces its variant.
+    #[test]
+    fn watchdog_kill_reason_decode_per_tier_and_none_on_clean() {
+        use crate::vmm::WatchdogKillReason as Pub;
+        // Clean run: the latch stays at the initial Unset byte.
+        assert_eq!(
+            decode_watchdog_kill_reason(KillReasonTag::Unset as u8),
+            None
+        );
+        // Unknown byte (future variant / torn write): conservative None.
+        assert_eq!(decode_watchdog_kill_reason(200), None);
+        for (tag, expected) in [
+            (KillReasonTag::Tier1Cpu, Pub::Tier1CpuBudget),
+            (KillReasonTag::Tier2Idle, Pub::Tier2IdleWedge),
+            (KillReasonTag::Tier3Deadman, Pub::Tier3Deadman),
+            (KillReasonTag::ApKill, Pub::ApKill),
+        ] {
+            assert_eq!(decode_watchdog_kill_reason(tag as u8), Some(expected));
+        }
+    }
+
+    /// Phase decode: each ledger stage byte maps to its public mirror;
+    /// unknown bytes fall back to `Boot` (the ledger's own conservative
+    /// mapping). The public enum's `Ord` follows boot progress so
+    /// fixtures can ask "did the guest reach the wedge phase".
+    /// Injection-delivery decode: 0 (no writes) → None; 2 (delivered)
+    /// → Some(true); 1 and any unknown byte → Some(false) — an
+    /// undelivered injection must never decode as delivered.
+    #[test]
+    fn bpf_map_write_delivery_decode() {
+        assert_eq!(super::decode_bpf_map_write_delivery(0), None);
+        assert_eq!(super::decode_bpf_map_write_delivery(1), Some(false));
+        assert_eq!(super::decode_bpf_map_write_delivery(2), Some(true));
+        assert_eq!(super::decode_bpf_map_write_delivery(99), Some(false));
+    }
+
+    #[test]
+    fn guest_phase_decode_and_progress_order() {
+        use crate::vmm::GuestLifecyclePhase as Pub;
+        for (raw, expected) in [
+            (0u8, Pub::Boot),
+            (1, Pub::Attach),
+            (2, Pub::Dispatch),
+            (3, Pub::Body),
+            (4, Pub::Teardown),
+            (250, Pub::Boot), // unknown → conservative Boot
+        ] {
+            assert_eq!(decode_guest_phase(raw), expected);
+        }
+        assert!(Pub::Boot < Pub::Attach);
+        assert!(Pub::Body < Pub::Teardown);
+    }
+
+    /// The dump-facing tokens and the decode round-trip are stable — the
+    /// watchdog dump's `kill_reason=` key relies on both, and the fire
+    /// path stores each variant into an `AtomicU8` the dump decodes.
+    #[test]
+    fn kill_reason_render_and_decode() {
+        for (tag, token) in [
+            (KillReasonTag::Unset, "none"),
+            (KillReasonTag::Tier1Cpu, "tier1-cpu-budget"),
+            (KillReasonTag::Tier2Idle, "tier2-idle-wedge"),
+            (KillReasonTag::Tier3Deadman, "tier3-deadman-deadline"),
+            (KillReasonTag::ApKill, "ap-kill"),
+        ] {
+            assert_eq!(tag.render(), token);
+            assert_eq!(KillReasonTag::from_u8(tag as u8), tag);
+            // Round-trip through the atomic slot the watchdog stores into.
+            let slot = AtomicU8::new(KillReasonTag::Unset as u8);
+            slot.store(tag as u8, Ordering::Relaxed);
+            assert_eq!(KillReasonTag::from_u8(slot.load(Ordering::Relaxed)), tag);
+        }
+        // Any unknown byte decodes to Unset (a never-written slot).
+        assert_eq!(KillReasonTag::from_u8(200), KillReasonTag::Unset);
+    }
+
+    /// The dump-facing tokens and the decode round-trip are stable — the
+    /// watchdog dump's `reset_armed_by=` key relies on both.
+    #[test]
+    fn tag_render_and_decode() {
+        for (tag, token) in [
+            (WatchdogResetTag::Unset, "none"),
+            (WatchdogResetTag::ScxRootLatch, "scx-root-attach-latch"),
+            (WatchdogResetTag::ScenarioStart, "scenario-start"),
+            (WatchdogResetTag::FreezeExtend, "freeze-extend"),
+            (WatchdogResetTag::WprofGrace, "wprof-grace"),
+            (WatchdogResetTag::GuestAttachConfirm, "guest-attach-confirm"),
+        ] {
+            assert_eq!(tag.render(), token);
+            assert_eq!(WatchdogResetTag::from_u8(tag as u8), tag);
+        }
+        // Any unknown byte decodes to Unset (a never-written slot).
+        assert_eq!(WatchdogResetTag::from_u8(200), WatchdogResetTag::Unset);
+    }
+
+    /// The wprof-grace writer stamps its tag alongside the ns store when
+    /// (and only when) it wins the max-style store.
+    #[test]
+    fn grace_writer_stamps_wprof_tag_on_win() {
+        let reset_ns = AtomicU64::new(0);
+        let reset_tag = AtomicU8::new(WatchdogResetTag::ScxRootLatch as u8);
+        // First arm from a zero deadline: the grace store wins, so both
+        // the ns and the tag move.
+        super::extend_watchdog_reset_for_grace(
+            &reset_ns,
+            &reset_tag,
+            Instant::now(),
+            Duration::from_secs(5),
+        );
+        assert_ne!(reset_ns.load(Ordering::Acquire), 0);
+        assert_eq!(
+            WatchdogResetTag::from_u8(reset_tag.load(Ordering::Relaxed)),
+            WatchdogResetTag::WprofGrace,
+        );
+
+        // A far-future existing deadline is NOT shrunk, so the grace does
+        // not win and must not overwrite the prior tag.
+        let reset_ns = AtomicU64::new(u64::MAX);
+        let reset_tag = AtomicU8::new(WatchdogResetTag::ScxRootLatch as u8);
+        super::extend_watchdog_reset_for_grace(
+            &reset_ns,
+            &reset_tag,
+            Instant::now(),
+            Duration::from_secs(5),
+        );
+        assert_eq!(reset_ns.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(
+            WatchdogResetTag::from_u8(reset_tag.load(Ordering::Relaxed)),
+            WatchdogResetTag::ScxRootLatch,
+        );
+    }
 }
 
 /// Three-way result of polling the BPF probe's `.bss` latch via the
@@ -1067,6 +1521,40 @@ struct RunVmHandles {
     watchdog: Option<JoinHandle<()>>,
 }
 
+/// The AP-ready boot gate in [`KtstrVm::run_vm`] timed out (or was cut short by
+/// `kill`) with one or more AP host threads not yet in `KVM_RUN`. Carries the
+/// facts observed at the trip and NOTHING inferred: the prior fixed
+/// "host CPU starvation" message was empirically refuted (fair-scheduler
+/// contention cannot trip this gate even at 25x oversubscription), so the real
+/// cause — pure starvation, D-state blocking, a wedged AP — is left to the
+/// per-thread kernel evidence in `evidence` rather than asserted.
+///
+/// `pub(crate)` (and a named type, not an anyhow message) so
+/// `test_support::boot_retry::run_vm_with_ap_gap_retry` can
+/// `downcast_ref` it out of the (context-wrapped) error chain and retry the
+/// cold boot, the same recovery the guest-side AP-bring-up-gap marker gets.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "vCPU bring-up gate tripped: vCPU(s) {not_ready:?} did not reach KVM_RUN \
+     within {elapsed:?} of waiting (kill flag: {killed}; when set the wait was \
+     cut short by a panicking/exiting vCPU rather than running out the full \
+     bring-up cap, so `elapsed` is the real wait, not the cap). No cause is \
+     asserted — per-thread kernel evidence follows:\n{evidence}"
+)]
+pub(crate) struct ApGateTimeout {
+    /// Guest CPU ids (BSP is vCPU 0; AP index `i` is vCPU `i + 1`) whose
+    /// boot latch never fired.
+    pub(crate) not_ready: Vec<usize>,
+    /// Real time spent in the gate wait, from the gate-start `Instant`.
+    pub(crate) elapsed: Duration,
+    /// Whether `kill` was set when the wait ended — a set flag means the
+    /// wait broke early, so `elapsed` is below the cap by design.
+    pub(crate) killed: bool,
+    /// Per-not-ready-vCPU kernel evidence, one line each (see the gate's
+    /// dump code for the fields and their meaning).
+    pub(crate) evidence: String,
+}
+
 /// RAII guard that joins the vCPU / monitor / bpf-write / freeze-coordinator /
 /// watchdog threads [`KtstrVm::run_vm`] spawns BEFORE the `vm` local (and its
 /// `guest_mem` mmap) drops, on EVERY exit path. The normal Ok teardown
@@ -1159,6 +1647,45 @@ impl Drop for RunVmThreadGuard {
     }
 }
 
+/// Restores the calling (BSP) thread's CPU affinity on every exit path from
+/// [`KtstrVm::run_vm`]. `run_vm` narrows this thread to the BSP host mask (via
+/// [`pin_current_thread`] / [`set_thread_cpumask`]) and never widens it back,
+/// which leaked the narrowed mask two ways when the same process ran a second
+/// VM (a boot retry, or a subsequent cell in the same process):
+///   (a) AP host threads `clone(2)` from this thread and inherit its affinity
+///       at spawn, so a leaked narrow mask would confine the next VM's APs to
+///       the previous VM's BSP CPU(s); and
+///   (b) [`crate::vmm::host_topology::host_allowed_cpus`] seeds the CPU budget from THIS
+///       thread's `sched_getaffinity`, so a leaked mask would make replanning
+///       compute against the previous VM's cpuset instead of the host's.
+/// Captured BEFORE the narrowing and restored on `Drop`, keeping `run_vm`
+/// affinity-neutral for its caller. Only `run_vm` needs this; the interactive
+/// shell path is one-shot-then-exit.
+struct BspAffinityGuard {
+    /// The pre-narrowing affinity, or `None` if `sched_getaffinity` failed —
+    /// then `Drop` is a no-op (nothing trustworthy to restore).
+    saved: Option<nix::sched::CpuSet>,
+}
+
+impl BspAffinityGuard {
+    /// Snapshot the calling thread's affinity. Call this BEFORE applying the
+    /// BSP mask. Mirrors the module's `sched_setaffinity(Pid::from_raw(0), ..)`
+    /// idiom (pid 0 = calling thread) in the reverse direction.
+    fn capture() -> Self {
+        Self {
+            saved: nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).ok(),
+        }
+    }
+}
+
+impl Drop for BspAffinityGuard {
+    fn drop(&mut self) {
+        if let Some(saved) = &self.saved {
+            let _ = nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), saved);
+        }
+    }
+}
+
 /// RAII guard over `spawn_ap_threads`' partially-built vCPU thread set. Each AP
 /// thread begins `KVM_RUN` against `vm.guest_mem` the instant it spawns, so if a
 /// LATER per-AP `?` fails mid-loop (the exit-eventfd alloc or the thread spawn),
@@ -1195,6 +1722,815 @@ impl Drop for PartialApSpawnGuard {
     }
 }
 
+/// Parse the on-CPU / run-delay pair from a `/proc/<pid>/task/<tid>/schedstat`
+/// line. The file holds three space-separated numbers:
+///   field 1 = time spent on the CPU (ns),
+///   field 2 = time spent runnable-but-not-running (ns),
+///   field 3 = number of timeslices run on this CPU.
+/// Returns `(on_cpu_ns, run_delay_ns)`, or `None` when either of the first
+/// two fields is missing or non-numeric (a short/malformed line). A
+/// CONFIG_SCHEDSTATS-off host renders this as `"0 0 0"`, which parses to
+/// `Some((0, 0))` — the caller's on-cpu==0 folds that into a `None`
+/// dilation, keeping "schedstats unavailable" distinct from a real 1.0.
+///
+/// `pub(crate)`: shared by the lifecycle-boundary contention witness and the
+/// final whole-run snapshot. The monitor's periodic hot path does not read
+/// schedstat.
+pub(crate) fn parse_schedstat_line(line: &str) -> Option<(u64, u64)> {
+    let mut it = line.split_whitespace();
+    let on_cpu = it.next()?.parse::<u64>().ok()?;
+    let run_delay = it.next()?.parse::<u64>().ok()?;
+    Some((on_cpu, run_delay))
+}
+
+/// Sum the host-side schedstat totals over the given vCPU thread TIDs.
+///
+/// Reads `/proc/self/task/<tid>/schedstat` for each TID and accumulates
+/// fields 1 and 2 (see [`parse_schedstat_line`]). A `tid == 0` (an AP that
+/// never stamped its TID — it never scheduled) and any TID whose schedstat
+/// is unreadable or malformed are skipped. Returns `None` when NOTHING was
+/// sampled (every TID skipped); otherwise `Some(HostVcpuSchedstat)` with
+/// the raw sums and the sampled-thread count.
+///
+/// MUST be called while the vCPU threads are still alive (before they are
+/// joined and their `/proc/self/task/<tid>` dirs vanish). Each vCPU thread
+/// lives exactly one VM run, so these whole-thread-life totals ARE this
+/// run's totals — no baseline subtraction is needed.
+///
+/// `pub(crate)`: [`ContentionWitnessRecorder`] calls this at lifecycle
+/// boundaries to derive per-phase deltas and the task-specific Body cap; it is
+/// deliberately absent from the monitor's 100 ms hot path. The whole-run
+/// [`VmResult::host_vcpu_schedstat`] read at teardown uses the same function.
+pub(crate) fn read_host_vcpu_schedstat(tids: &[i32]) -> Option<HostVcpuSchedstat> {
+    read_host_vcpu_schedstat_with_exit_snapshots(tids, &[])
+}
+
+/// Sum live vCPU schedstat, falling back to AP self-snapshots after exit.
+///
+/// A vCPU's proc task directory disappears at thread return. APs publish one
+/// final cumulative self-snapshot before that return; an aligned entry here is
+/// consulted only when the live proc read failed. This closes teardown's
+/// read-vs-exit race without adding any periodic per-vCPU work.
+fn read_host_vcpu_schedstat_with_exit_snapshots(
+    tids: &[i32],
+    exit_snapshots: &[Arc<std::sync::Mutex<Option<HostVcpuSchedstat>>>],
+) -> Option<HostVcpuSchedstat> {
+    let mut acc = HostVcpuSchedstat::default();
+    for (index, &tid) in tids.iter().enumerate() {
+        if tid == 0 {
+            continue;
+        }
+        let live = std::fs::read_to_string(format!("/proc/self/task/{tid}/schedstat"))
+            .ok()
+            .and_then(|line| parse_schedstat_line(line.trim()))
+            .map(|(on_cpu, run_delay)| HostVcpuSchedstat {
+                total_on_cpu_ns: on_cpu,
+                total_run_delay_ns: run_delay,
+                sampled_vcpus: 1,
+            });
+        let sample = live.or_else(|| {
+            exit_snapshots
+                .get(index)
+                .and_then(|slot| *slot.lock_unpoisoned())
+        });
+        let Some(sample) = sample else {
+            continue;
+        };
+        acc.total_on_cpu_ns = acc.total_on_cpu_ns.saturating_add(sample.total_on_cpu_ns);
+        acc.total_run_delay_ns = acc
+            .total_run_delay_ns
+            .saturating_add(sample.total_run_delay_ns);
+        acc.sampled_vcpus = acc.sampled_vcpus.saturating_add(sample.sampled_vcpus);
+    }
+    (acc.sampled_vcpus > 0).then_some(acc)
+}
+
+/// Maximum number of host-pressure intervals retained for one Body phase.
+/// At the monitor's nominal 100 ms cadence this is one hour. The cap bounds a
+/// wedged cell without affecting normal minute-scale scenarios.
+const BODY_CONTENTION_INTERVAL_CAP: usize = 36_000;
+
+/// Persistent reader for the current cgroup's `cpu.pressure` cumulative
+/// `some total`.
+///
+/// CPU PSI `some` is wall time during which at least one runnable host task is
+/// stalled for CPU. Every ktstr vCPU is in the process's cgroup, so a delayed
+/// vCPU is included even when the competing task is outside that cgroup.
+/// Scoping PSI to ktstr's cgroup avoids charging arbitrary pressure elsewhere
+/// on a wide host; other tasks deliberately sharing the runner cgroup can only
+/// increase the counter. The fd is opened once and rewound for each sample;
+/// the hot path performs no allocation.
+struct HostCpuPressureReader {
+    file: std::fs::File,
+}
+
+impl HostCpuPressureReader {
+    fn open() -> std::io::Result<Self> {
+        let cgroup = std::fs::read_to_string("/proc/self/cgroup")?;
+        let relative = parse_unified_cgroup_path(&cgroup).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "missing unified `0::` entry in /proc/self/cgroup",
+            )
+        })?;
+        // On an un-namespaced host, `/` is the machine-wide cgroup and has
+        // the same precision failure as `/proc/pressure/cpu`: unrelated work
+        // anywhere can make W approach wall time. Prefer the complete
+        // lifecycle schedstat fallback in that case. A cgroup namespace can
+        // also render its delegated root as `/`; rejecting it only loses
+        // localization, never witness soundness.
+        if relative == "/" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "current process is in the cgroup-v2 root",
+            ));
+        }
+        let pressure_path = std::path::Path::new("/sys/fs/cgroup")
+            .join(relative.trim_start_matches('/'))
+            .join("cpu.pressure");
+        Ok(Self {
+            file: std::fs::File::open(pressure_path)?,
+        })
+    }
+
+    fn read_some_total_ns(&mut self) -> std::io::Result<u64> {
+        self.file.rewind()?;
+        let mut buf = [0u8; 512];
+        let n = self.file.read(&mut buf)?;
+        let text = std::str::from_utf8(&buf[..n]).map_err(std::io::Error::other)?;
+        parse_cpu_pressure_some_total_us(text)
+            .map(|us| us.saturating_mul(1_000))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing `some ... total=` in cgroup cpu.pressure",
+                )
+            })
+    }
+}
+
+fn parse_unified_cgroup_path(text: &str) -> Option<&str> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .filter(|path| path.starts_with('/'))
+}
+
+fn parse_cpu_pressure_some_total_us(text: &str) -> Option<u64> {
+    let line = text.lines().find(|line| line.starts_with("some "))?;
+    line.split_ascii_whitespace()
+        .find_map(|field| field.strip_prefix("total="))?
+        .parse()
+        .ok()
+}
+
+/// `/sys/fs/cgroup/.../cpu.pressure` exposes a cumulative integer-microsecond
+/// counter. A difference of two truncated endpoints can be almost 1 µs below
+/// the real delta, so charge one full microsecond to every closed interval.
+/// A regressing counter means the source reset or changed and cannot anchor a
+/// complete series.
+fn conservative_pressure_delta_ns(cur_ns: u64, prev_ns: u64) -> Option<u64> {
+    cur_ns
+        .checked_sub(prev_ns)
+        .map(|delta| delta.saturating_add(1_000))
+}
+
+fn complete_schedstat_delay_cap_ns(
+    expected_vcpus: usize,
+    anchor_tids: &[i32],
+    anchor: Option<HostVcpuSchedstat>,
+    current_tids: &[i32],
+    current: Option<HostVcpuSchedstat>,
+    force_current_lifetime: bool,
+) -> Option<u64> {
+    let expected = u32::try_from(expected_vcpus).ok()?;
+    let current = current?;
+    if expected == 0
+        || current_tids.len() != expected_vcpus
+        || current_tids.iter().any(|tid| *tid <= 0)
+        || current.sampled_vcpus != expected
+        // CONFIG_SCHEDSTATS-off lines are readable as `0 0 0`.
+        || current.total_on_cpu_ns == 0
+    {
+        return None;
+    }
+
+    // ScenarioEnd carries the guest's own scenario elapsed time. If queued
+    // lifecycle frames reach the host in a burst, the accepted Body span can
+    // be shorter than that guest duration and no boundary delta covers the
+    // actual workload. The complete current lifetime still encloses it.
+    if force_current_lifetime {
+        return Some(current.total_run_delay_ns);
+    }
+
+    // Prefer the tight delta over the conservatively widened Body span when
+    // the preceding lifecycle snapshot saw the same complete live vCPU set.
+    if anchor_tids == current_tids
+        && let Some(anchor) = anchor
+        && anchor.sampled_vcpus == expected
+        && current.total_on_cpu_ns > anchor.total_on_cpu_ns
+    {
+        return Some(
+            current
+                .total_run_delay_ns
+                .saturating_sub(anchor.total_run_delay_ns),
+        );
+    }
+
+    // The first usable vCPU snapshot can race Body entry (notably when the
+    // process is in cgroup-v2 root and PSI is deliberately unavailable).
+    // Every vCPU thread is born for this VM run and lives through Body, so its
+    // complete cumulative run-delay at Body exit encloses the Body interval.
+    // This is a looser upper bound than a boundary delta, but it cannot turn
+    // host contention into a false confirmed scheduler failure.
+    Some(current.total_run_delay_ns)
+}
+
+fn lifecycle_body_under_covers_guest(
+    body_enter_wall_ns: Option<u64>,
+    guest_body_elapsed_ns: u64,
+    exit_wall_ns: u64,
+) -> bool {
+    guest_body_elapsed_ns > 0
+        && body_enter_wall_ns
+            .is_none_or(|enter| exit_wall_ns.saturating_sub(enter) < guest_body_elapsed_ns)
+}
+
+/// Event-anchored host-contention witness recorder.
+///
+/// Expensive vCPU schedstat sweeps happen only at real lifecycle transitions
+/// (Boot→Attach→Dispatch→Body→Teardown) and once at finalization.
+/// The monitor's already-existing tick calls [`Self::sample_pressure`], which
+/// reads one width-independent runner-cgroup PSI counter to retain a localized
+/// `W(L)` series. Dispatch also samples that counter immediately at Body
+/// entry/exit, making the series complete even when the monitor is starved.
+/// ScenarioEnd's guest duration rejects those edge samples if lifecycle frames
+/// were instead delivered in a burst after Body. A complete task-specific
+/// schedstat delta over the widened Body span caps PSI so concurrent cells
+/// sharing the runner cgroup cannot inflate `W` beyond the target VM's own
+/// accumulated run delay. If the preceding boundary snapshot raced vCPU
+/// startup or lifecycle delivery was batched, the complete whole-thread-life
+/// total is a conservative enclosing fallback.
+pub(crate) struct ContentionWitnessRecorder {
+    inner: std::sync::Mutex<ContentionWitnessRecorderInner>,
+}
+
+struct ContentionWitnessRecorderInner {
+    tids: Vec<Arc<AtomicI32>>,
+    exit_schedstats: Vec<Arc<std::sync::Mutex<Option<HostVcpuSchedstat>>>>,
+    run_start: Instant,
+    stage: crate::monitor::LifecycleStage,
+    schedstat_anchor: Option<HostVcpuSchedstat>,
+    schedstat_anchor_tids: Vec<i32>,
+    saw_schedstat: bool,
+    per_phase: super::result::PerPhaseSchedstat,
+    pressure: Option<HostCpuPressureReader>,
+    pressure_prev_ns: Option<u64>,
+    pressure_prev_wall_ns: u64,
+    body_deltas: Vec<u64>,
+    body_widths_ns: Vec<u64>,
+    body_saturated: bool,
+    body_enter_wall_ns: Option<u64>,
+    body_exit_wall_ns: Option<u64>,
+    body_pressure_anchored: bool,
+    body_pressure_complete: bool,
+    body_schedstat_anchor: Option<HostVcpuSchedstat>,
+    body_schedstat_anchor_tids: Vec<i32>,
+    body_schedstat_cap_ns: u64,
+    body_schedstat_cap_complete: bool,
+    guest_body_elapsed_ns: u64,
+    finalized: bool,
+}
+
+impl ContentionWitnessRecorder {
+    pub(crate) fn new(
+        tids: Vec<Arc<AtomicI32>>,
+        exit_schedstats: Vec<Arc<std::sync::Mutex<Option<HostVcpuSchedstat>>>>,
+        run_start: Instant,
+    ) -> Self {
+        let live_tids = tids
+            .iter()
+            .map(|tid| tid.load(Ordering::Acquire))
+            .collect::<Vec<_>>();
+        let schedstat_anchor = read_host_vcpu_schedstat(&live_tids);
+        let schedstat_anchor_tids = live_tids;
+        let saw_schedstat = schedstat_anchor.is_some();
+        let mut pressure = HostCpuPressureReader::open().ok();
+        let pressure_prev_ns = pressure
+            .as_mut()
+            .and_then(|reader| reader.read_some_total_ns().ok());
+        let now_ns = u64::try_from(run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        Self {
+            inner: std::sync::Mutex::new(ContentionWitnessRecorderInner {
+                tids,
+                exit_schedstats,
+                run_start,
+                stage: crate::monitor::LifecycleStage::Boot,
+                schedstat_anchor,
+                schedstat_anchor_tids,
+                saw_schedstat,
+                per_phase: super::result::PerPhaseSchedstat::default(),
+                pressure,
+                pressure_prev_ns,
+                pressure_prev_wall_ns: now_ns,
+                body_deltas: Vec::new(),
+                body_widths_ns: Vec::new(),
+                body_saturated: false,
+                body_enter_wall_ns: None,
+                body_exit_wall_ns: None,
+                body_pressure_anchored: false,
+                body_pressure_complete: false,
+                body_schedstat_anchor: None,
+                body_schedstat_anchor_tids: Vec::new(),
+                body_schedstat_cap_ns: 0,
+                body_schedstat_cap_complete: false,
+                guest_body_elapsed_ns: 0,
+                finalized: false,
+            }),
+        }
+    }
+
+    /// One constant-cost sample from the monitor's existing timer wake.
+    pub(crate) fn sample_pressure(&self) {
+        let mut inner = self.inner.lock_unpoisoned();
+        if inner.finalized || inner.stage != crate::monitor::LifecycleStage::Body {
+            return;
+        }
+        let now_ns = u64::try_from(inner.run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        inner.sample_pressure_at(now_ns);
+    }
+
+    /// Preserve the guest's event-driven scenario duration before the
+    /// ScenarioEnd transition closes Body. It is an independent check that
+    /// lifecycle delivery actually bracketed the workload rather than
+    /// accepting queued start/end frames together after the guest finished.
+    pub(crate) fn record_guest_body_elapsed_ms(&self, elapsed_ms: u64) {
+        let mut inner = self.inner.lock_unpoisoned();
+        if inner.finalized || inner.stage != crate::monitor::LifecycleStage::Body {
+            return;
+        }
+        inner.guest_body_elapsed_ns = inner
+            .guest_body_elapsed_ns
+            .max(elapsed_ms.saturating_mul(1_000_000));
+    }
+
+    /// Close the old lifecycle stage and enter `new_stage`. The caller invokes
+    /// this only after `ProgressLedger::advance_phase` accepted the forward
+    /// transition, so duplicates and late frames cost nothing.
+    pub(crate) fn advance(&self, new_stage: crate::monitor::LifecycleStage) {
+        let mut inner = self.inner.lock_unpoisoned();
+        if inner.finalized || new_stage as u8 <= inner.stage as u8 {
+            return;
+        }
+        let now_ns = u64::try_from(inner.run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let pressure_anchor_ns = inner.pressure_prev_ns;
+        let pressure_anchor_wall_ns = inner.pressure_prev_wall_ns;
+        let schedstat_cap_anchor = (new_stage == crate::monitor::LifecycleStage::Body)
+            .then_some(inner.schedstat_anchor)
+            .flatten();
+        let schedstat_cap_anchor_tids = if new_stage == crate::monitor::LifecycleStage::Body {
+            inner.schedstat_anchor_tids.clone()
+        } else {
+            Vec::new()
+        };
+        let pressure_ok = inner.sample_pressure_at(now_ns);
+        let body_undercovered = inner.stage == crate::monitor::LifecycleStage::Body
+            && inner.body_acceptance_under_covers_guest(now_ns);
+        inner.close_schedstat_stage(body_undercovered);
+
+        if inner.stage == crate::monitor::LifecycleStage::Body {
+            inner.body_exit_wall_ns = Some(now_ns);
+            inner.body_pressure_complete =
+                inner.body_pressure_anchored && pressure_ok && !body_undercovered;
+        }
+        inner.stage = new_stage;
+        if new_stage == crate::monitor::LifecycleStage::Body {
+            // The lifecycle frame can wait briefly in the virtio TX queue
+            // before dispatch accepts it. Start the W(L) witness at the
+            // PREVIOUS lifecycle boundary and charge that whole prelude to
+            // Body. This may include Dispatch contention (larger W →
+            // indeterminate), but cannot omit early Body contention that
+            // accrued before the host processed ScenarioStart.
+            inner.body_enter_wall_ns = Some(pressure_anchor_wall_ns);
+            inner.body_pressure_anchored = pressure_ok && pressure_anchor_ns.is_some();
+            // Match the PSI witness's deliberately widened start: retain the
+            // schedstat snapshot from the lifecycle boundary PRECEDING Body,
+            // not the just-taken accepted-Body snapshot. The resulting cap
+            // includes the same virtio-dispatch prelude and therefore cannot
+            // undercut early Body delay hidden behind frame delivery.
+            inner.body_schedstat_anchor = schedstat_cap_anchor;
+            inner.body_schedstat_anchor_tids = schedstat_cap_anchor_tids;
+            if let (Some(anchor), Some(cur)) = (pressure_anchor_ns, inner.pressure_prev_ns) {
+                if let Some(delta) = conservative_pressure_delta_ns(cur, anchor) {
+                    inner.push_body_interval(delta, now_ns.saturating_sub(pressure_anchor_wall_ns));
+                } else {
+                    inner.body_pressure_anchored = false;
+                }
+            }
+        }
+    }
+
+    /// Close the final stage and assemble the immutable result passed through
+    /// `VmRunState`. A still-live vCPU is read from proc; an AP that already
+    /// returned contributes its one-shot exit snapshot.
+    pub(crate) fn finish(&self) -> Option<super::result::ContentionWitness> {
+        let mut inner = self.inner.lock_unpoisoned();
+        if inner.finalized {
+            return None;
+        }
+        let now_ns = u64::try_from(inner.run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let pressure_ok = inner.sample_pressure_at(now_ns);
+        let body_undercovered = inner.stage == crate::monitor::LifecycleStage::Body
+            && inner.body_acceptance_under_covers_guest(now_ns);
+        inner.close_schedstat_stage(body_undercovered);
+        if inner.stage == crate::monitor::LifecycleStage::Body {
+            inner.body_exit_wall_ns = Some(now_ns);
+            inner.body_pressure_complete =
+                inner.body_pressure_anchored && pressure_ok && !body_undercovered;
+        }
+        inner.finalized = true;
+
+        let body_wall_ns = inner
+            .body_enter_wall_ns
+            .zip(inner.body_exit_wall_ns)
+            .map(|(enter, exit)| exit.saturating_sub(enter))
+            .unwrap_or(0)
+            .max(inner.guest_body_elapsed_ns);
+        let mut deltas = std::mem::take(&mut inner.body_deltas);
+        let mut widths = std::mem::take(&mut inner.body_widths_ns);
+        let mut saturated = inner.body_saturated;
+        let mut complete = inner.body_pressure_complete
+            && !saturated
+            && !deltas.is_empty()
+            && deltas.len() == widths.len();
+
+        // PSI unavailable, failed mid-Body, or invalidated by batched
+        // lifecycle delivery: use the enclosing summed-vCPU run delay as one
+        // coarse interval. It loses localization but remains a complete upper
+        // bound; never convert a missing or falsely tiny PSI span into W=0.
+        if !complete && body_wall_ns > 0 && inner.body_schedstat_cap_complete {
+            deltas = vec![inner.body_schedstat_cap_ns];
+            widths = vec![body_wall_ns];
+            complete = true;
+            // The replacement is a complete event-boundary delta, not
+            // the truncated PSI prefix that hit the cap.
+            saturated = false;
+        }
+
+        if !inner.saw_schedstat && deltas.is_empty() {
+            return None;
+        }
+        Some(super::result::ContentionWitness {
+            per_phase: inner.per_phase,
+            body_window: super::result::BodyContentionWindow {
+                tick_deltas: deltas,
+                tick_widths_ns: widths,
+                // Retained for legacy readers; new window math consumes the
+                // real widths above.
+                tick_ns: Duration::from_millis(100).as_nanos() as u64,
+                saturated,
+                complete,
+                schedstat_cap_ns: inner.body_schedstat_cap_ns,
+                schedstat_cap_complete: inner.body_schedstat_cap_complete,
+                body_wall_ns,
+                body_covered_ns: if complete { body_wall_ns } else { 0 },
+            },
+        })
+    }
+}
+
+impl ContentionWitnessRecorderInner {
+    fn body_acceptance_under_covers_guest(&self, exit_wall_ns: u64) -> bool {
+        lifecycle_body_under_covers_guest(
+            self.body_enter_wall_ns,
+            self.guest_body_elapsed_ns,
+            exit_wall_ns,
+        )
+    }
+
+    /// Sample PSI at an explicit run-relative wall. Returns true when a valid
+    /// counter value was read and installed as the new anchor.
+    fn sample_pressure_at(&mut self, now_ns: u64) -> bool {
+        let Some(reader) = self.pressure.as_mut() else {
+            return false;
+        };
+        let cur = match reader.read_some_total_ns() {
+            Ok(cur) => cur,
+            Err(e) => {
+                tracing::warn!(err = %e, "host CPU PSI read failed; contention witness will use Body schedstat fallback");
+                self.pressure = None;
+                self.pressure_prev_ns = None;
+                return false;
+            }
+        };
+        if let Some(prev) = self.pressure_prev_ns {
+            let Some(delta) = conservative_pressure_delta_ns(cur, prev) else {
+                tracing::warn!(
+                    previous_ns = prev,
+                    current_ns = cur,
+                    "host CPU PSI counter regressed; contention witness will use Body schedstat fallback"
+                );
+                self.pressure = None;
+                self.pressure_prev_ns = None;
+                return false;
+            };
+            if self.stage == crate::monitor::LifecycleStage::Body {
+                self.push_body_interval(delta, now_ns.saturating_sub(self.pressure_prev_wall_ns));
+            }
+        }
+        self.pressure_prev_ns = Some(cur);
+        self.pressure_prev_wall_ns = now_ns;
+        true
+    }
+
+    fn push_body_interval(&mut self, delta_ns: u64, width_ns: u64) {
+        if self.body_deltas.len() < BODY_CONTENTION_INTERVAL_CAP {
+            self.body_deltas.push(delta_ns);
+            self.body_widths_ns.push(width_ns);
+        } else {
+            self.body_saturated = true;
+        }
+    }
+
+    fn close_schedstat_stage(&mut self, force_current_lifetime: bool) {
+        let tids = self
+            .tids
+            .iter()
+            .map(|tid| tid.load(Ordering::Acquire))
+            .collect::<Vec<_>>();
+        let cur = read_host_vcpu_schedstat_with_exit_snapshots(&tids, &self.exit_schedstats);
+        if self.stage == crate::monitor::LifecycleStage::Body {
+            if let Some(cap) = complete_schedstat_delay_cap_ns(
+                self.tids.len(),
+                &self.body_schedstat_anchor_tids,
+                self.body_schedstat_anchor,
+                &tids,
+                cur,
+                force_current_lifetime,
+            ) {
+                self.body_schedstat_cap_ns = cap;
+                self.body_schedstat_cap_complete = true;
+            } else {
+                self.body_schedstat_cap_complete = false;
+            }
+        }
+        match (self.schedstat_anchor, cur) {
+            (Some(anchor), Some(cur)) => {
+                self.per_phase.phases[self.stage as usize] =
+                    if self.stage == crate::monitor::LifecycleStage::Body && force_current_lifetime
+                    {
+                        cur
+                    } else {
+                        cur.delta_from(&anchor)
+                    };
+                self.schedstat_anchor = Some(cur);
+                self.saw_schedstat = true;
+            }
+            (_, Some(cur)) => {
+                if self.stage == crate::monitor::LifecycleStage::Body && force_current_lifetime {
+                    self.per_phase.phases[self.stage as usize] = cur;
+                }
+                self.schedstat_anchor = Some(cur);
+                self.saw_schedstat = true;
+            }
+            (_, None) => {
+                // Do not carry an old anchor across an unattested boundary;
+                // a later recovery must seed afresh rather than mix phases.
+                self.schedstat_anchor = None;
+            }
+        }
+        self.schedstat_anchor_tids = tids;
+    }
+}
+
+/// Snapshot the CALLING thread's own cumulative schedstat (on-CPU,
+/// run-delay) — the instrument for the cleanup-window dilation
+/// evidence. `read_host_vcpu_schedstat(&[gettid()])` with the same
+/// parser/format contract; `None` when the read fails or
+/// CONFIG_SCHEDSTATS is off (an all-zero line still parses; the
+/// upstream delta then reads 0 on-CPU and consumers treat the window
+/// as unattested).
+pub(crate) fn read_self_thread_schedstat() -> Option<HostVcpuSchedstat> {
+    // SAFETY: gettid(2) takes no arguments and cannot fail.
+    let tid = unsafe { libc::gettid() } as i32;
+    read_host_vcpu_schedstat(&[tid])
+}
+
+#[cfg(test)]
+mod schedstat_tests {
+    use super::{
+        HostCpuPressureReader, complete_schedstat_delay_cap_ns, conservative_pressure_delta_ns,
+        lifecycle_body_under_covers_guest, parse_cpu_pressure_some_total_us, parse_schedstat_line,
+        parse_unified_cgroup_path, read_host_vcpu_schedstat,
+        read_host_vcpu_schedstat_with_exit_snapshots,
+    };
+    use crate::vmm::HostVcpuSchedstat;
+
+    /// A valid three-field line yields `(on_cpu, run_delay)`; a
+    /// two-field line still parses (field 3 is unused); a one-field or
+    /// non-numeric line is `None`. The CONFIG_SCHEDSTATS-off `"0 0 0"`
+    /// parses to `Some((0, 0))` (folded to a `None` dilation upstream).
+    #[test]
+    fn parse_schedstat_line_valid_malformed_short() {
+        assert_eq!(parse_schedstat_line("12345 678 9"), Some((12345, 678)));
+        assert_eq!(parse_schedstat_line("100 200"), Some((100, 200)));
+        assert_eq!(parse_schedstat_line("0 0 0"), Some((0, 0)));
+        assert_eq!(parse_schedstat_line(""), None, "empty line");
+        assert_eq!(parse_schedstat_line("42"), None, "short: one field");
+        assert_eq!(parse_schedstat_line("abc def"), None, "non-numeric");
+        assert_eq!(parse_schedstat_line("100 x"), None, "second field bad");
+    }
+
+    #[test]
+    fn parse_cpu_pressure_some_total_ignores_averages_and_full() {
+        let text = "some avg10=1.25 avg60=2.50 avg300=3.75 total=987654\n\
+                    full avg10=0.00 avg60=0.00 avg300=0.00 total=42\n";
+        assert_eq!(parse_cpu_pressure_some_total_us(text), Some(987_654));
+        assert_eq!(parse_cpu_pressure_some_total_us("full total=42\n"), None);
+        assert_eq!(
+            parse_cpu_pressure_some_total_us("some avg10=0 total=wat\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn pressure_delta_rounds_up_and_rejects_counter_regression() {
+        assert_eq!(conservative_pressure_delta_ns(12_000, 10_000), Some(3_000));
+        assert_eq!(conservative_pressure_delta_ns(10_000, 10_000), Some(1_000));
+        assert_eq!(conservative_pressure_delta_ns(9_999, 10_000), None);
+        assert_eq!(conservative_pressure_delta_ns(u64::MAX, 0), Some(u64::MAX));
+    }
+
+    #[test]
+    fn guest_elapsed_detects_batched_lifecycle_delivery() {
+        assert!(lifecycle_body_under_covers_guest(
+            Some(10_000),
+            12_000,
+            10_071,
+        ));
+        assert!(lifecycle_body_under_covers_guest(None, 12_000, 50_000));
+        assert!(!lifecycle_body_under_covers_guest(
+            Some(10_000),
+            12_000,
+            22_000,
+        ));
+        assert!(!lifecycle_body_under_covers_guest(Some(10_000), 0, 10_071,));
+    }
+
+    #[test]
+    fn schedstat_cap_uses_tight_delta_or_complete_lifetime_fallback() {
+        let anchor = HostVcpuSchedstat {
+            total_on_cpu_ns: 1_000,
+            total_run_delay_ns: 100,
+            sampled_vcpus: 2,
+        };
+        let current = HostVcpuSchedstat {
+            total_on_cpu_ns: 2_000,
+            total_run_delay_ns: 350,
+            sampled_vcpus: 2,
+        };
+        assert_eq!(
+            complete_schedstat_delay_cap_ns(
+                2,
+                &[101, 102],
+                Some(anchor),
+                &[101, 102],
+                Some(current),
+                false,
+            ),
+            Some(250)
+        );
+        assert_eq!(
+            complete_schedstat_delay_cap_ns(
+                2,
+                &[101, 102],
+                Some(anchor),
+                &[101, 102],
+                Some(current),
+                true,
+            ),
+            Some(350),
+            "a batched lifecycle uses the complete enclosing lifetime"
+        );
+        assert_eq!(
+            complete_schedstat_delay_cap_ns(
+                2,
+                &[101, 102],
+                Some(anchor),
+                &[101, 103],
+                Some(current),
+                false,
+            ),
+            Some(350),
+            "a mismatched anchor falls back to the complete current lifetime"
+        );
+        assert_eq!(
+            complete_schedstat_delay_cap_ns(2, &[], None, &[101, 102], Some(current), false),
+            Some(350),
+            "a missing pre-Body anchor still has a sound whole-lifetime bound"
+        );
+        assert_eq!(
+            complete_schedstat_delay_cap_ns(
+                2,
+                &[101, 102],
+                Some(anchor),
+                &[101, 0],
+                Some(current),
+                false,
+            ),
+            None,
+            "an unstamped vCPU makes the cap partial"
+        );
+        assert_eq!(
+            complete_schedstat_delay_cap_ns(
+                2,
+                &[101, 102],
+                Some(anchor),
+                &[101, 102],
+                Some(HostVcpuSchedstat {
+                    sampled_vcpus: 1,
+                    ..current
+                }),
+                false,
+            ),
+            None,
+            "a failed schedstat read makes the cap partial"
+        );
+        assert_eq!(
+            complete_schedstat_delay_cap_ns(
+                2,
+                &[101, 102],
+                Some(HostVcpuSchedstat {
+                    total_on_cpu_ns: 0,
+                    total_run_delay_ns: 0,
+                    sampled_vcpus: 2,
+                }),
+                &[101, 102],
+                Some(HostVcpuSchedstat {
+                    total_on_cpu_ns: 0,
+                    total_run_delay_ns: 0,
+                    sampled_vcpus: 2,
+                }),
+                false,
+            ),
+            None,
+            "CONFIG_SCHEDSTATS-off zeros are not a complete cap"
+        );
+    }
+
+    #[test]
+    fn schedstat_sum_uses_exit_snapshot_after_proc_task_disappears() {
+        let missing_tid = i32::MAX;
+        let saved = HostVcpuSchedstat {
+            total_on_cpu_ns: 4_000,
+            total_run_delay_ns: 9_000,
+            sampled_vcpus: 1,
+        };
+        let slots = vec![std::sync::Arc::new(std::sync::Mutex::new(Some(saved)))];
+        assert_eq!(
+            read_host_vcpu_schedstat_with_exit_snapshots(&[missing_tid], &slots),
+            Some(saved),
+        );
+        assert_eq!(
+            read_host_vcpu_schedstat_with_exit_snapshots(&[missing_tid], &[]),
+            None,
+            "without the aligned exit slot a vanished proc task is unavailable",
+        );
+    }
+
+    #[test]
+    fn unified_cgroup_path_requires_the_v2_entry_and_absolute_path() {
+        assert_eq!(
+            parse_unified_cgroup_path("11:cpu:/old\n0::/runner/job\n"),
+            Some("/runner/job")
+        );
+        assert_eq!(parse_unified_cgroup_path("0::/\n"), Some("/"));
+        assert_eq!(parse_unified_cgroup_path("0::relative\n"), None);
+        assert_eq!(parse_unified_cgroup_path("11:cpu:/old\n"), None);
+    }
+
+    #[test]
+    fn cpu_pressure_reader_rewinds_between_samples_when_available() {
+        let Ok(mut reader) = HostCpuPressureReader::open() else {
+            // CPU PSI is optional at runtime; parsing is covered separately.
+            return;
+        };
+        let first = reader.read_some_total_ns().expect("first PSI sample");
+        let second = reader.read_some_total_ns().expect("second PSI sample");
+        assert!(second >= first, "the cumulative PSI clock cannot decrease");
+    }
+
+    /// An all-zero (or empty) TID list samples nothing -> `None`. tid==0
+    /// is skipped without a read attempt.
+    #[test]
+    fn read_host_vcpu_schedstat_none_when_nothing_sampled() {
+        assert!(read_host_vcpu_schedstat(&[]).is_none(), "empty -> None");
+        assert!(
+            read_host_vcpu_schedstat(&[0, 0]).is_none(),
+            "all tid==0 skipped -> None"
+        );
+    }
+}
+
 impl KtstrVm {
     /// Spawn threads and run the BSP. Returns all state needed for
     /// `collect_results`.
@@ -1216,6 +2552,14 @@ impl KtstrVm {
         mut vm: kvm::KtstrKvm,
         default_cpu_mask: Option<&[usize]>,
         effective_pinning_plan: Option<&super::host_topology::PinningPlan>,
+        // Refreshed no-perf CPU list from `acquire_run_locks`' run-time
+        // replan. `Some` only on the no-perf path; used in preference to
+        // the stale build-time `self.no_perf_plan.cpus` for every affinity
+        // mask below (vCPU-thread mask, BSP mask, virtio-blk worker
+        // placement) so those masks match the LLCs the run-scoped flocks
+        // hold. `None` keeps the pre-replan `no_perf_plan` / default-mask
+        // fallback (the interactive path and every non-no-perf run).
+        effective_no_perf_cpus: Option<&[usize]>,
     ) -> Result<VmRunState> {
         let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
         let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
@@ -1481,15 +2825,17 @@ impl KtstrVm {
         #[cfg(target_arch = "x86_64")]
         let (virtio_blk, blk_device, _blk_resample_evt): (Option<_>, Option<_>, Option<_>) =
             match pci_bus_handle.as_ref() {
-                Some(bus) => match self.init_virtio_blk_pci(&vm, bus, msix_sink)? {
-                    Some(h) => (None, Some(h.device), h.resample_evt),
-                    None => (None, None, None),
-                },
+                Some(bus) => {
+                    match self.init_virtio_blk_pci(&vm, bus, msix_sink, effective_no_perf_cpus)? {
+                        Some(h) => (None, Some(h.device), h.resample_evt),
+                        None => (None, None, None),
+                    }
+                }
                 None => (None, None, None),
             };
         #[cfg(not(target_arch = "x86_64"))]
         let (virtio_blk, blk_device): (Option<_>, Option<_>) = {
-            let dev = self.init_virtio_blk(&vm)?;
+            let dev = self.init_virtio_blk(&vm, effective_no_perf_cpus)?;
             (dev.clone(), dev)
         };
         // Plumb the shared parked_evt into the device (both transports) so its
@@ -1664,10 +3010,15 @@ impl KtstrVm {
         // No-perf + --cpu-cap: flat CPU list from the LLC plan gets
         // sched_setaffinity'd on every vCPU thread as a mask (not a
         // hard pin). Mutually exclusive with perf-mode's pin_targets.
-        let no_perf_mask: Option<&[usize]> = self
-            .no_perf_plan
-            .as_ref()
-            .map(|p| p.cpus.as_slice())
+        // The run-time replan's `effective_no_perf_cpus` wins over the
+        // build-time `no_perf_plan.cpus`: they name the LLCs the
+        // run-scoped flocks actually hold, whereas the build-time plan
+        // may have Spread-planned against then-truthful-now-stale holder
+        // counts. Falls through to `no_perf_plan` (interactive path,
+        // where no replan runs) and finally `default_cpu_mask`
+        // (overcommit).
+        let no_perf_mask: Option<&[usize]> = effective_no_perf_cpus
+            .or(self.no_perf_plan.as_ref().map(|p| p.cpus.as_slice()))
             .or(default_cpu_mask);
 
         // Per-AP TID slots — each AP thread stamps gettid() into its
@@ -1752,6 +3103,14 @@ impl KtstrVm {
         // coordinator / watchdog handles as they spawn; the Ok path `disarm`s it.
         // Declared after `bsp` (above) so it joins the watchdog + coordinator
         // (which hold bsp's ImmediateExitHandle) before `bsp` drops.
+        //
+        // Snapshot the BSP thread's affinity BEFORE the mask narrowing below,
+        // and declare the restore guard BEFORE `RunVmThreadGuard` so — Rust
+        // dropping locals in reverse declaration order — the thread-join guard
+        // drops FIRST (joining every AP) and this guard restores affinity
+        // AFTER, leaving `run_vm` affinity-neutral for any retry/next VM in the
+        // same process. See [`BspAffinityGuard`] for why the leak matters.
+        let _bsp_affinity_guard = BspAffinityGuard::capture();
         let mut guard = RunVmThreadGuard {
             ap_threads,
             monitor: None,
@@ -1806,6 +3165,18 @@ impl KtstrVm {
             std::iter::once((bsp_tid_slot, bsp_latch))
                 .chain(ap_tid_slots.iter().cloned())
                 .collect();
+        // AP proc task directories disappear at thread return. Each AP keeps
+        // one final self-schedstat snapshot in its VcpuThread handle; align
+        // those slots with `vcpu_tid_slots`. The BSP remains live through
+        // witness finalization, so its fallback slot is intentionally empty.
+        let vcpu_exit_schedstats = std::iter::once(Arc::new(std::sync::Mutex::new(None)))
+            .chain(
+                guard
+                    .ap_threads
+                    .iter()
+                    .map(|thread| Arc::clone(&thread.schedstat_at_exit)),
+            )
+            .collect::<Vec<_>>();
 
         // Open per-vCPU `perf_event_open` counters once at run-vm
         // scope so both the monitor thread (per-tick timeline) and
@@ -1860,6 +3231,25 @@ impl KtstrVm {
         // watchdog setup site.
         let watchdog_reset_ns: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Parallel provenance tag for `watchdog_reset_ns` — records
+        // which of the four writers last armed the reset deadline so the
+        // watchdog dump can name it (see [`WatchdogResetTag`]). Cloned to
+        // each writer alongside the ns atomic; the two are always stored
+        // back-to-back.
+        let watchdog_reset_tag: Arc<std::sync::atomic::AtomicU8> = Arc::new(
+            std::sync::atomic::AtomicU8::new(WatchdogResetTag::Unset as u8),
+        );
+        // Lock-free progress/liveness ledger. The monitor thread writes
+        // it every tick (heartbeat, cpu_ns, progress epochs); the VM
+        // watchdog and freeze coordinator will read it in LATER commits
+        // to distinguish a genuinely wedged guest from one that is idle
+        // or still making scheduling progress. Declared here beside
+        // `watchdog_reset_tag` and cloned into `start_monitor` so the
+        // monitor closure owns a producer handle; consumers are wired
+        // later (this commit is observability only, so the Arc has a
+        // single clone — no unused-binding warnings).
+        let progress_ledger: Arc<monitor::ProgressLedger> =
+            Arc::new(monitor::ProgressLedger::default());
         let kern_phys_base: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
         let kern_phys_base_evt = Arc::new(EventFd::new(0).expect("eventfd for kern_phys_base"));
@@ -1903,10 +3293,20 @@ impl KtstrVm {
         // KVAs back distinct derivations that produce identical
         // offsets — guaranteeing the two writers don't race on
         // different values.
+        let host_vmlinux_path: Option<std::path::PathBuf> = find_vmlinux(&self.kernel);
+        let host_vmlinux_artifacts = host_vmlinux_path
+            .as_ref()
+            .and_then(|p| super::vmlinux::cached_vmlinux_artifacts(p));
         let host_kernel_symbols: Option<crate::monitor::symbols::KernelSymbols> =
-            find_vmlinux(&self.kernel)
-                .and_then(|p| super::vmlinux::cached_vmlinux_artifacts(&p))
-                .map(|a| a.symbols.clone());
+            host_vmlinux_artifacts.as_ref().map(|a| a.symbols.clone());
+        // This vmlinux's GNU build-id — compared in the KERN_BUILD_ID
+        // dispatch arm against the booted kernel's build-id to catch a
+        // stale/mismatched cache entry before its symbols/offsets
+        // silently mis-read guest memory. `None` (no note) disables the
+        // check.
+        let host_vmlinux_build_id: Option<Vec<u8>> = host_vmlinux_artifacts
+            .as_ref()
+            .and_then(|a| a.build_id.clone());
         let kernel_text_link_kva: u64 = host_kernel_symbols
             .as_ref()
             .and_then(|s| s.kernel_text_kva)
@@ -1917,27 +3317,92 @@ impl KtstrVm {
             .unwrap_or(0);
         let accessor_ready_evt = Arc::new(EventFd::new(0).expect("eventfd for accessor_ready"));
 
+        // TID handles for the per-phase contention witness — one per
+        // `vcpu_tid_slots` entry (index 0 BSP, 1.. APs). The recorder reads
+        // them only at lifecycle boundaries and finalization; monitor ticks
+        // perform a single O(1) CPU-pressure read. Cloned (not moved) so the
+        // teardown whole-run schedstat read still has `vcpu_tid_slots`.
+        let vcpu_tid_atomics: Vec<Arc<AtomicI32>> = vcpu_tid_slots
+            .iter()
+            .map(|(slot, _)| slot.clone())
+            .collect();
+        // Per-phase host-contention recorder. It owns the live TID handles for
+        // rare lifecycle-boundary schedstat sweeps and a persistent O(1) CPU
+        // PSI reader sampled from the monitor's existing timer wake.
+        let contention_recorder = Arc::new(ContentionWitnessRecorder::new(
+            vcpu_tid_atomics,
+            vcpu_exit_schedstats.clone(),
+            run_start,
+        ));
+        // KERN_ADDRS observability counters (frames consumed / CRC-failed),
+        // incremented by the coordinator's dispatch arm and read by the
+        // monitor's pre-latch diagnostic (see `RqRefresh::kern_addrs_frames`):
+        // a dead-channel run self-reports "publish never arrived" (0) vs
+        // "arrived but a derive gate rejected it" (non-zero). Created here,
+        // before the monitor spawn, so both consumers share one instance.
+        let kern_addrs_frames: Arc<std::sync::atomic::AtomicU64> =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let kern_addrs_crc_bad: Arc<std::sync::atomic::AtomicU64> =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let kern_addrs_frames_for_coord = kern_addrs_frames.clone();
+        let kern_addrs_crc_bad_for_coord = kern_addrs_crc_bad.clone();
+        // Expected (vmlinux) build-id moved into the coord dispatch
+        // closure for the KERN_BUILD_ID consistency check.
+        let host_vmlinux_build_id_for_coord = host_vmlinux_build_id.clone();
+        // Unknown-msg_type frame counter (the header-outside-CRC probe —
+        // see `BulkDispatchSinks::unknown_type_frames`).
+        let unknown_type_frames: Arc<std::sync::atomic::AtomicU64> =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let unknown_type_frames_for_coord = unknown_type_frames.clone();
+        // Readiness-vs-window evidence for the capture-starvation gates
+        // (run-relative ns; 0 = never): WHEN the periodic prereqs (kaslr
+        // publish + both accessors) became ready, and WHERE the capture
+        // window ends. Readiness at-or-after the window end makes zero
+        // captures STRUCTURALLY inevitable at any host dilation — the
+        // honest environmental-skip signal the D-threshold missed (a
+        // ~7 s cold accessor build outruns a 4-5 s window at D ≈ 1.2).
+        let periodic_prereqs_ready_at: Arc<std::sync::atomic::AtomicU64> =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let periodic_window_end_at: Arc<std::sync::atomic::AtomicU64> =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let periodic_prereqs_ready_for_coord = periodic_prereqs_ready_at.clone();
+        let periodic_window_end_for_coord = periodic_window_end_at.clone();
         let monitor_handle = self.start_monitor(
             &vm,
             &kill,
             &kill_evt,
             run_start,
             vcpu_pthreads,
+            contention_recorder.clone(),
             perf_capture.clone(),
             Some(virtio_con.clone()),
             sys_rdy_evt.clone(),
             tcr_el1_cache.clone(),
             cr3_cache.clone(),
             watchdog_reset_ns.clone(),
+            watchdog_reset_tag.clone(),
+            progress_ledger.clone(),
             kern_phys_base.clone(),
             kern_phys_base_evt.clone(),
             kern_virt_kaslr.clone(),
+            kern_addrs_frames,
+            kern_addrs_crc_bad,
         )?;
         // Hand the monitor handle to the guard so an early-return past here
         // joins it before guest_mem drops (the monitor holds a bare raw pointer
         // into guest_mem). Reclaimed by `guard.disarm()` on the Ok path.
         guard.monitor = monitor_handle;
         let watchdog_reset_for_coord = watchdog_reset_ns.clone();
+        let watchdog_reset_tag_for_coord = watchdog_reset_tag.clone();
+        // Second clone of the progress ledger for the coordinator's
+        // dispatch sinks: the first (above) went to `start_monitor` as
+        // the monitor's producer handle; this one lets the scenario-
+        // dispatch arms advance the live lifecycle stage as guest
+        // lifecycle / scenario frames arrive. Both hold the same Arc, so
+        // dispatch's forward-only stage stores and the monitor's per-tick
+        // liveness stores land in one ledger.
+        let progress_ledger_for_coord = progress_ledger.clone();
+        let contention_recorder_for_coord = contention_recorder.clone();
         let watchdog_pause_ns: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
         let watchdog_pause_for_coord = watchdog_pause_ns.clone();
@@ -2002,6 +3467,30 @@ impl KtstrVm {
         let periodic_fired_for_coord = periodic_fired_slot.clone();
 
         // BPF map write thread: sleeps, discovers a BPF map, writes a value.
+        // Delivery evidence for host-triggered BPF-map-write injections
+        // (0 = no writes configured, 1 = configured but not yet
+        // delivered, 2 = delivered — see `VmResult::bpf_map_writes_delivered`).
+        // The injection thread stamps 2 after signalling the guest; the
+        // neg_* fixtures' starvation gates read the decoded value to
+        // distinguish "expected crash absent because the injection never
+        // landed" from a real detection failure.
+        let bpf_map_write_delivery: Arc<std::sync::atomic::AtomicU8> = Arc::new(
+            std::sync::atomic::AtomicU8::new(if self.bpf_map_writes.is_empty() { 0 } else { 1 }),
+        );
+        // Dedicated guest-instrumentation readiness edge for configured
+        // BPF-map writes. The map writer may resolve its target as soon as the
+        // scheduler loads, but must not mutate it until Phase 5 has armed the
+        // probe pipeline and optional wprof tracer. Runs without map writes
+        // allocate no fd and emit no guest frame.
+        let bpf_map_write_ready_evt = if self.bpf_map_writes.is_empty() {
+            None
+        } else {
+            Some(Arc::new(
+                EventFd::new(EFD_NONBLOCK)
+                    .context("create guest-ready eventfd for BPF map writes")?,
+            ))
+        };
+        let freeze_coord_bpf_map_write_ready_evt = bpf_map_write_ready_evt.clone();
         let bpf_write_handle = self.start_bpf_map_write(
             &vm,
             &kill,
@@ -2011,6 +3500,8 @@ impl KtstrVm {
             cr3_cache.clone(),
             virtio_con.clone(),
             kern_phys_base.clone(),
+            bpf_map_write_delivery.clone(),
+            bpf_map_write_ready_evt,
         )?;
         // Same as the monitor: the bpf-map-write thread holds a raw pointer into
         // guest_mem, so the guard must join it on an early-return past here.
@@ -2051,7 +3542,6 @@ impl KtstrVm {
         // instead of polling on a 100 ms thread::sleep cadence.
         let kill_evt_for_watchdog = kill_evt.clone();
         let bsp_done_evt_for_wd = bsp_done_evt.clone();
-        let rt_watchdog = self.performance_mode;
         let wd_service_cpu = effective_pinning_plan.and_then(|p| p.service_cpu);
         // Clone the virtio-console Arc into the watchdog so the
         // soft-deadline path can push `SIGNAL_VC_SHUTDOWN` to
@@ -2068,7 +3558,38 @@ impl KtstrVm {
         // time when `workload_duration_for_wd` is `None` — see
         // the watchdog's per-tick reset block.
         let watchdog_reset_for_wd = watchdog_reset_ns.clone();
+        let watchdog_reset_tag_for_wd = watchdog_reset_tag.clone();
         let workload_duration_for_wd = self.workload_duration;
+        // Progress-ledger consumer handle for the watchdog. The monitor
+        // (producer) took its clone at the `start_monitor` site above and
+        // the coordinator's dispatch sinks another; this third clone lets
+        // the watchdog READ the ledger each tick to fold the Tier-1/2
+        // progress verdicts alongside the Tier-3 deadline. All three hold
+        // the same Arc, so the watchdog sees the monitor's liveness/CPU
+        // stores and dispatch's phase advances in one ledger.
+        let progress_ledger_for_wd = progress_ledger.clone();
+        // Fourth ledger clone, read once at `VmRunState` build: the final
+        // phase / progress_epoch land on `VmResult` so mechanism-asserting
+        // fixtures can distinguish "guest reached the phase under test"
+        // from "guest never booted" (see `VmResult::final_guest_phase`).
+        let progress_ledger_for_result = progress_ledger.clone();
+        // Kill-reason latch, shared between the watchdog thread (sole
+        // writer, on its fire path) and the `VmRunState` build (read after
+        // the watchdog join, so the value is final). Surfaces the dump's
+        // `cause=` verdict on `VmResult::watchdog_kill_reason` — the
+        // mechanism signal wedge fixtures assert instead of wall bounds.
+        let watchdog_kill_reason: Arc<std::sync::atomic::AtomicU8> =
+            Arc::new(std::sync::atomic::AtomicU8::new(KillReasonTag::Unset as u8));
+        let watchdog_kill_reason_for_wd = watchdog_kill_reason.clone();
+        // Kill-time publish-state evidence for the watchdog dump (see the
+        // `kern_addrs_frames= (kill-time)` line): the pre-latch diag's
+        // one-shot ~10 s snapshot cannot distinguish a publish that never
+        // arrived from one that arrived late, so the dump re-reads the
+        // live counters at the kill.
+        let kern_addrs_frames_for_wd = kern_addrs_frames_for_coord.clone();
+        let unknown_type_frames_for_wd = unknown_type_frames.clone();
+        let kern_virt_kaslr_for_wd = kern_virt_kaslr.clone();
+        let kern_phys_base_for_wd = kern_phys_base.clone();
 
         // Freeze coordinator thread: triggers a failure-dump freeze when
         // the BPF probe's `ktstr_err_exit_detected` .bss latch fires
@@ -2136,6 +3657,12 @@ impl KtstrVm {
         // variants get independent atomics.
         let host_current_step: Arc<AtomicU16> = Arc::new(AtomicU16::new(0));
         let freeze_coord_current_step = Arc::clone(&host_current_step);
+        // Guest scenario-elapsed clock (ns) published by the workload-progress
+        // heartbeat; the run-loop reads it to clock periodic captures off
+        // guest progress. 0 until the first heartbeat.
+        let host_periodic_guest_elapsed: Arc<std::sync::atomic::AtomicU64> =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let freeze_coord_periodic_guest_elapsed = Arc::clone(&host_periodic_guest_elapsed);
         // Optional virtio-blk handle for the failure-dump
         // worker-pause rendezvous. None when no disk is attached.
         // Cloned into the closure so the dump path can call
@@ -2244,6 +3771,23 @@ impl KtstrVm {
                     None
                 }
             });
+        // Accessor-init consumes the same complete symbol map and BTF offset
+        // tables that run_vm already derived before any live-VM helper starts.
+        // Sharing these products keeps the worker's lifetime to finite guest-
+        // memory reads; it no longer reparses ELF/BTF or allocates a duplicate
+        // full symbol HashMap while teardown is waiting to join it.
+        let freeze_coord_guest_symbols = freeze_coord_symbol_cache
+            .as_ref()
+            .map(|cache| cache.symbols_arc());
+        let freeze_coord_kernel_symbols = host_kernel_symbols.clone();
+        let freeze_coord_bpf_map_offsets = host_vmlinux_artifacts
+            .as_ref()
+            .and_then(|a| a.monitor.as_ref())
+            .and_then(|m| crate::monitor::btf_offsets::BpfMapOffsets::from_btf(&m.btf).ok());
+        let freeze_coord_bpf_prog_offsets = host_vmlinux_artifacts
+            .as_ref()
+            .and_then(|a| a.monitor.as_ref())
+            .and_then(|m| m.prog_offsets.clone());
         // Optional file sink for the failure-dump JSON. Cloned out
         // of the builder field so the closure owns a copy and the
         // freeze coord can write the file without touching the env
@@ -2629,6 +4173,24 @@ impl KtstrVm {
         let freeze_coord_handle = std::thread::Builder::new()
             .name("vmm-freeze-coord".into())
             .spawn(move || {
+                // The hang detector's own sensing must not dilate with the
+                // load it measures. This thread runs the dispatch sinks whose
+                // `advance_stage` -> `ProgressLedger::record_progress` bumps
+                // `progress_epoch` — the MILESTONE anchor the Tier-3 deadman
+                // reads as `wall_since_milestone_ns`. If it starves under host
+                // dilation, a milestone the guest already earned lands late,
+                // `wall_since_milestone` grows, and it feeds an inert misread.
+                // So it gets the same UNCONDITIONAL FIFO-2 as the watchdog and
+                // monitor. It is NOT pinned, deliberately: the watchdog and
+                // monitor pin to the single reserved `service_cpu`, and this
+                // thread's freeze-time guest-memory scans would head-of-line
+                // block those same-priority FIFO threads if colocated there —
+                // the exact monitor starvation being fixed. Left unpinned it
+                // may briefly preempt a FIFO-1 vCPU on wake in perf mode
+                // (intended, sensing wins) but is epoll-idle between events,
+                // so it does not erode perf-mode vCPU isolation during a body
+                // run. Best-effort — warns once/process without CAP_SYS_NICE.
+                set_rt_priority(2, "freeze-coord");
                 // Per-CPU runnable_at scanner context. Holds every
                 // input the scanner needs, all resolved once and
                 // cached for the rest of the run. Only built when
@@ -2699,8 +4261,8 @@ impl KtstrVm {
                     kaslr_offset: u64,
                 }
                 // Lazy-construct BpfMapAccessorOwned. The constructor
-                // parses vmlinux ELF (goblin) and BTF (~MB-scale
-                // work) and reads guest-memory bootstrap symbols
+                // reuses the pre-parsed vmlinux symbol/BTF products and
+                // reads guest-memory bootstrap symbols
                 // (`page_offset_base`, `pgtable_l5_enabled`,
                 // `init_top_pgt`); the latter aren't readable until
                 // the guest kernel has populated them, so a
@@ -2708,49 +4270,28 @@ impl KtstrVm {
                 // a still-booting guest. The fix is the same lazy-
                 // discovery pattern that `cached_bss_pa` uses below:
                 // try each iteration until success, then cache —
-                // gated on `owned_accessor.is_none()` so the heavy
-                // parse runs at most once per coordinator (only the
-                // failed attempts re-pay it, and only until the
-                // first success). A single one-shot construct at
+                // gated on `owned_accessor.is_none()`. Failed attempts
+                // now repeat only the finite guest-memory handshake; the
+                // host-side parse/allocation work was completed once at
+                // run_vm setup. A single one-shot construct at
                 // coord-start would have left the accessor None
                 // permanently if the guest hadn't booted yet,
                 // disabling freeze detection AND the dump for the
                 // entire run.
-                // Cached vmlinux bytes shared across every retry of
-                // `try_init_owned_accessor` and
-                // `try_init_owned_prog_accessor`. The previous code
-                // re-ran `std::fs::read(vmlinux)` inside both helpers
-                // on every scan tick — at 50-340 MB per call on cold
-                // disk cache the pair could exceed the 12 s post-
-                // BSP-done kill timer before the coord ever reached
-                // its epoll wait. Reading once at coord scope cuts
-                // the per-iteration cost to a few-millisecond
-                // `goblin::elf::Elf::parse` against the cached bytes.
-                //
-                // The borrow lifetime constraint blocks caching the
-                // parsed `Elf<'static>` (it borrows from the Vec); the
-                // helpers re-parse the cached bytes per call instead.
-                // Parsing is microseconds — only the file read was
-                // slow.
+                // Cached vmlinux bytes remain available to dump/render
+                // consumers below, but accessor init does not touch them.
                 let _tvmr = std::time::Instant::now();
                 let vmlinux_data: Option<Arc<Vec<u8>>> = vmlinux_data_shared.clone();
                 // Worker-populated accessor pair. Built off the freeze
-                // coordinator thread so the slow ELF + BTF parse +
-                // symbol HashMap (~4 s on debug vmlinux) does not
-                // block the coordinator from servicing TOKEN_TX
-                // events on its epoll loop. The worker writes both
-                // accessors atomically via `OnceLock::set` once the
-                // GuestKernel handshake succeeds and both BTF parses
-                // land. Subsequent reads from the coordinator are
-                // nanosecond-scale `OnceLock::get` calls.
-                //
-                // `Arc<OnceLock<(...)>>` shape: `Arc` so the worker
-                // and coordinator share ownership; `OnceLock` so the
-                // publish is one-shot and lock-free on read; the
-                // tuple shape so both accessors land atomically — a
-                // failure-dump path that builds a `ScxWalkerCapture`
-                // must also have the matching `prog_runtime_stats`
-                // accessor, so partial pairs would skew the dump.
+                // coordinator thread because the guest bootstrap handshake
+                // can transiently fail while the kernel comes up. All host
+                // ELF/BTF/symbol work is already complete, so the worker can
+                // be cancelled and joined without host file I/O or a large
+                // allocation in flight. After the GuestKernel handshake,
+                // the worker publishes the map accessor and its optional
+                // program accessor together in one mutex-protected slot
+                // replacement; the coordinator adopts the same pair with
+                // one `take()`.
                 //
                 // `GuestMemMapAccessorOwned` and
                 // `GuestMemProgAccessorOwned` are `Send` because they
@@ -2875,20 +4416,23 @@ impl KtstrVm {
                 // Re-init drops the per-iteration 60 s budget — by
                 // the time the first re-init fires the guest has
                 // already booted to the point of having a live
-                // scheduler attached, so `from_elf_with_hint` should
+                // scheduler attached, so `from_precomputed` should
                 // succeed on the first attempt; the inner retry
                 // still tolerates the brief slab-reuse window between
                 // an old scheduler's BPF map free and the new
                 // scheduler's BPF map load.
                 let accessor_init_handle: Option<std::thread::JoinHandle<()>> = match (
                     freeze_coord_mem.as_ref(),
-                    freeze_coord_vmlinux.as_ref(),
-                    vmlinux_data.as_deref(),
+                    freeze_coord_guest_symbols.as_ref(),
+                    freeze_coord_kernel_symbols.as_ref(),
+                    freeze_coord_bpf_map_offsets.as_ref(),
                 ) {
-                    (Some(mem), Some(vmlinux), Some(data)) => {
+                    (Some(mem), Some(symbols), Some(kernel_symbols), Some(map_offsets)) => {
                         let mem_for_worker = mem.clone();
-                        let vmlinux_for_worker = vmlinux.clone();
-                        let data_for_worker = data.clone();
+                        let symbols_for_worker = symbols.clone();
+                        let kernel_symbols_for_worker = kernel_symbols.clone();
+                        let map_offsets_for_worker = map_offsets.clone();
+                        let prog_offsets_for_worker = freeze_coord_bpf_prog_offsets.clone();
                         let tcr_for_worker = freeze_coord_tcr_el1.clone();
                         let cr3_for_worker = freeze_coord_cr3.clone();
                         let kern_phys_base_for_worker = kern_phys_base.clone();
@@ -2916,31 +4460,6 @@ impl KtstrVm {
                                 let reinit_fd = {
                                     use std::os::unix::io::AsRawFd;
                                     reinit_for_worker.as_raw_fd()
-                                };
-                                let elf = match goblin::elf::Elf::parse(&data_for_worker) {
-                                    Ok(e) => e,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "accessor-init: vmlinux ELF parse failed"
-                                        );
-                                        // Mark FAILED_PERMANENTLY so
-                                        // a swap-op wait surfaces the
-                                        // terminal-worker diagnostic
-                                        // rather than the generic
-                                        // deadline-exceeded message.
-                                        worker_state_for_worker.store(
-                                            crate::scenario::snapshot::bridge::accessor_worker_state::FAILED_PERMANENTLY,
-                                            Ordering::Release,
-                                        );
-                                        // Wake any pending dispatcher
-                                        // wait so it surfaces the
-                                        // FAILED_PERMANENTLY bail
-                                        // immediately instead of
-                                        // waiting for its deadline.
-                                        let _ = dispatcher_wake_for_worker.write(1);
-                                        return;
-                                    }
                                 };
                                 let mut first_init = true;
                                 'reinit: loop {
@@ -3078,11 +4597,11 @@ impl KtstrVm {
                                             continue;
                                         };
                                         let map_res = crate::monitor::bpf_map::GuestMemMapAccessorOwned
-                                            ::from_elf_with_hint(
+                                            ::from_precomputed(
                                                 mem_for_worker.clone(),
-                                                &elf,
-                                                &data_for_worker,
-                                                &vmlinux_for_worker,
+                                                symbols_for_worker.clone(),
+                                                &kernel_symbols_for_worker,
+                                                map_offsets_for_worker.clone(),
                                                 tcr_val,
                                                 cr3_val,
                                                 pb_hint,
@@ -3127,16 +4646,18 @@ impl KtstrVm {
                                             // publish past the periodic-capture window so
                                             // no snapshot ever fired (periodic_fired=0).
                                             // Cloning shares the Arc-backed `mem` +
-                                            // `symbols` — cheap — and `finish` only adds the
-                                            // prog IDR symbol + BTF offsets.
-                                            let prog_res =
-                                                crate::monitor::bpf_prog::GuestMemProgAccessorOwned::finish(
-                                                    map.guest_kernel().clone(),
-                                                    &elf,
-                                                    &data_for_worker,
-                                                    &vmlinux_for_worker,
-                                                );
-                                            break Some((map, prog_res.ok()));
+                                            // `symbols` — cheap — and the precomputed prog
+                                            // offsets make completion an O(1) symbol lookup.
+                                            let prog = prog_offsets_for_worker.clone().and_then(
+                                                |offsets| {
+                                                    crate::monitor::bpf_prog::GuestMemProgAccessorOwned::finish_with_offsets(
+                                                        map.guest_kernel().clone(),
+                                                        offsets,
+                                                    )
+                                                    .ok()
+                                                },
+                                            );
+                                            break Some((map, prog));
                                         }
                                         // Wait on kill_evt with 200ms
                                         // timeout. Wakes instantly on
@@ -3878,6 +5399,31 @@ impl KtstrVm {
                 // post-workload idle. 0 = not yet ready.
                 let mut periodic_prereqs_ready_ns: u64 = 0;
                 let mut next_periodic_idx: u32 = 0;
+                // Periodic-capture clock, driven off GUEST progress. The
+                // boundaries below are sliced over the workload in scenario-
+                // relative time; comparing them against host wall-clock makes
+                // every boundary fire while a host-oversubscribed (dilated)
+                // guest is still in its FIRST phase, starving later phases. So
+                // fire each boundary when the GUEST'S OWN scenario-elapsed clock
+                // (published by the workload-progress heartbeat) crosses it —
+                // the same fixed num_snapshots samples then spread across the
+                // guest's real phases regardless of host dilation, WITHOUT any
+                // extra captures/freezes. `periodic_prev_guest_elapsed_ns` is
+                // the last-seen guest clock; `periodic_last_hb_wall_ns` is the
+                // run-relative wall time it last ADVANCED, used to tell a wedge
+                // (heartbeats STOP) from load (they merely SLOW): past the
+                // staleness bound the host resumes on wall-clock so a degraded
+                // guest's stuck state is still captured. Both 0 until the first
+                // heartbeat, when the clock falls back to wall-clock exactly as
+                // before (old guest / pre-heartbeat window).
+                let mut periodic_prev_guest_elapsed_ns: u64 = 0;
+                let mut periodic_last_hb_wall_ns: u64 = 0;
+                // Wall-clock gap with no heartbeat advance that flips the clock
+                // from guest-progress back to wall-clock (wedge backstop). Must
+                // exceed the heartbeat cadence times the largest dilation a
+                // healthy-but-slow guest reaches, so load never looks like a
+                // wedge; 4 s covers the 100 ms cadence out past ~40x.
+                const PERIODIC_HB_STALE_NS: u64 = 4_000_000_000;
                 // Consecutive parked-vCPU rendezvous failures during
                 // periodic capture. Reset to 0 on every successful
                 // `freeze_and_dispatch(..)`. After 2 consecutive
@@ -3944,6 +5490,11 @@ impl KtstrVm {
                 // shipping. `None` = no ship pending (non-wprof runs never
                 // arm it).
                 let mut wprof_ship_deadline: Option<Instant> = None;
+                // Auto-repro additionally preserves the probe payload. The
+                // trace and probe terminator can arrive in either order and
+                // in different bulk-drain batches, so retain both edges until
+                // the rendezvous is complete.
+                let mut wprof_ship = WprofShipState::default();
                 // Mirror of `bsp_done_final_pass` for the SCHED_EXIT
                 // kill-promotion-without-bsp-done case: kill can be
                 // promoted by sources other than a clean BSP_DONE —
@@ -4006,9 +5557,10 @@ impl KtstrVm {
                             let grace_expired = bsp_done_final_pass_start
                                 .map(|t| t.elapsed() >= DEFERRED_DRAIN_GRACE)
                                 .unwrap_or(false);
-                            if !any_deferred
-                                || owned_accessor.is_some()
-                                || grace_expired
+                            if wprof_ship_deadline.is_none()
+                                && (!any_deferred
+                                    || owned_accessor.is_some()
+                                    || grace_expired)
                             {
                                 if grace_expired && any_deferred {
                                     eprintln!(
@@ -4020,12 +5572,14 @@ impl KtstrVm {
                                 }
                                 break 'coord;
                             }
-                            eprintln!(
-                                "freeze-coord: staying alive for deferred requests: captures={} kernel_ops={} accessor={}",
-                                capture_requests_deferred.len(),
-                                kernel_op_requests_deferred.len(),
-                                owned_accessor.is_some()
-                            );
+                            if any_deferred {
+                                eprintln!(
+                                    "freeze-coord: staying alive for deferred requests: captures={} kernel_ops={} accessor={}",
+                                    capture_requests_deferred.len(),
+                                    kernel_op_requests_deferred.len(),
+                                    owned_accessor.is_some()
+                                );
+                            }
                         } else {
                             bsp_done_final_pass_start = Some(Instant::now());
                         }
@@ -4042,7 +5596,16 @@ impl KtstrVm {
                         // — no deferred-capture-stay-alive semantics
                         // here because the scheduler has crashed,
                         // not exited cleanly.
-                        if sched_exit_final_pass {
+                        // A pending wprof ship outranks the ordinary one-extra-
+                        // iteration exit. The loop guard deliberately stays
+                        // live while the grace is armed; breaking here anyway
+                        // used to let an AP/watchdog kill terminate an
+                        // auto-repro VM roughly two seconds after its crash,
+                        // before the concurrently probing wprof process could
+                        // finish emitting. Once the trace/probe rendezvous or
+                        // grace backstop clears the deadline, this final pass
+                        // exits normally on the next iteration.
+                        if sched_exit_final_pass && wprof_ship_deadline.is_none() {
                             break 'coord;
                         }
                         sched_exit_final_pass = true;
@@ -4198,6 +5761,8 @@ impl KtstrVm {
                                         kill_evt: &freeze_coord_kill_evt,
                                         run_is_wprof: freeze_coord_wprof,
                                         sys_rdy_evt: &mut freeze_coord_sys_rdy_evt,
+                                        bpf_map_write_ready_evt:
+                                            freeze_coord_bpf_map_write_ready_evt.as_ref(),
                                         snapshot_requests_pending:
                                             &mut snapshot_requests_pending,
                                         kernel_op_requests_pending:
@@ -4207,8 +5772,16 @@ impl KtstrVm {
                                         kern_virt_kaslr: &kern_virt_kaslr,
                                         kern_virt_kaslr_evt: &kern_virt_kaslr_evt,
                                         kernel_text_link_kva,
+                                        kern_addrs_frames: &kern_addrs_frames_for_coord,
+                                        kern_addrs_crc_bad: &kern_addrs_crc_bad_for_coord,
+                                        unknown_type_frames: &unknown_type_frames_for_coord,
                                         watchdog_reset: workload_duration_for_coord.map(|d| {
-                                            (watchdog_reset_for_coord.as_ref(), d, run_start)
+                                            (
+                                                watchdog_reset_for_coord.as_ref(),
+                                                d,
+                                                run_start,
+                                                watchdog_reset_tag_for_coord.as_ref(),
+                                            )
                                         }),
                                         watchdog_pause_ns: watchdog_pause_for_coord.as_ref(),
                                         scenario_start_ns: scenario_start_ns_for_coord.as_ref(),
@@ -4218,6 +5791,16 @@ impl KtstrVm {
                                             scenario_pause_cumulative_for_coord.as_ref(),
                                         run_start,
                                         current_step: &freeze_coord_current_step,
+                                        periodic_guest_elapsed_ns:
+                                            &freeze_coord_periodic_guest_elapsed,
+                                        progress_ledger: Some(
+                                            progress_ledger_for_coord.as_ref(),
+                                        ),
+                                        contention_recorder: Some(
+                                            contention_recorder_for_coord.as_ref(),
+                                        ),
+                                        expected_kernel_build_id:
+                                            host_vmlinux_build_id_for_coord.as_deref(),
                                     };
                                     for msg in &drained.messages {
                                         if let Some(entry) =
@@ -4248,7 +5831,7 @@ impl KtstrVm {
                                              arming wprof ship grace ({WPROF_SHIP_GRACE:?})"
                                         );
                                         wprof_ship_deadline =
-                                            Some(arm_wprof_grace(run_start, &watchdog_reset_for_coord, WPROF_SHIP_GRACE));
+                                            Some(arm_wprof_grace(run_start, &watchdog_reset_for_coord, &watchdog_reset_tag_for_coord, WPROF_SHIP_GRACE));
                                     }
                                     // wprof-ship grace: if an error-exit arm
                                     // (or the SCHED_EXIT arm above) armed
@@ -4266,52 +5849,51 @@ impl KtstrVm {
                                     // backstop below a no-op afterward.
                                     //
                                     // EXCEPTION — auto-repro (dual_snapshot)
-                                    // runs with an active probe stack: the
-                                    // guest ships its probe payload (Phase 6b,
-                                    // `PROBE_OUTPUT_END` over stdout,
-                                    // init.rs `finalize_probe_after_unwind`)
-                                    // AFTER the Phase-5 wprof trace. Killing on
-                                    // the WprofTrace frame here would preempt
-                                    // Phase 6b, so the `=== AUTO-PROBE ... ===`
-                                    // report never ships. On those runs, hold
-                                    // for the probe payload: skip the kill on
-                                    // the trace and instead promote it when the
-                                    // `PROBE_OUTPUT_END` stdout frame drains
-                                    // (arm below). The `WPROF_SHIP_GRACE`
-                                    // backstop still bounds teardown if the
-                                    // guest wedges before shipping the payload
-                                    // (e.g. a stall-exit repro that skipped
-                                    // probe attachment ships no payload) —
-                                    // keeping 7fe5cc7e's anti-hang property.
-                                    if freeze_coord_dual_snapshot {
-                                        if wprof_ship_deadline.is_some()
-                                            && drained
-                                                .messages
-                                                .iter()
-                                                .any(is_probe_output_end_frame)
-                                        {
-                                            eprintln!(
-                                                "freeze-coord: probe payload shipped \
-                                                 (PROBE_OUTPUT_END); kill triggered after ship"
-                                            );
+                                    // runs preserve BOTH the wprof trace and
+                                    // probe payload. Healthy probes emit
+                                    // PROBE_OUTPUT_END after the trace; a
+                                    // capability/load failure emits its
+                                    // diagnostic payload before the scenario
+                                    // starts. Retain both edges across drain
+                                    // batches and kill only after the
+                                    // order-independent rendezvous completes.
+                                    // The WPROF_SHIP_GRACE backstop still
+                                    // bounds a genuinely missing event (for
+                                    // example, a stall repro with no probe
+                                    // payload).
+                                    if freeze_coord_wprof
+                                        && wprof_ship.observe(
+                                            &drained.messages,
+                                            freeze_coord_dual_snapshot,
+                                        )
+                                    {
+                                        // Ack only after every artifact this
+                                        // run requires has reached host memory.
+                                        // The guest waits on this sticky edge
+                                        // after probe finalisation and before
+                                        // reboot, closing the virtio reset race.
+                                        freeze_coord_virtio_con.lock().queue_input(&[
+                                            crate::vmm::virtio_console::SIGNAL_WPROF_ARTIFACTS_RECEIVED,
+                                        ]);
+
+                                        if wprof_ship_deadline.is_some() {
+                                            if freeze_coord_dual_snapshot {
+                                                eprintln!(
+                                                    "freeze-coord: wprof trace and probe payload \
+                                                     shipped; kill triggered after rendezvous"
+                                                );
+                                            } else {
+                                                eprintln!(
+                                                    "freeze-coord: wprof trace received; \
+                                                     kill triggered after ship"
+                                                );
+                                            }
                                             trigger_freeze_coord_kill(
                                                 &freeze_coord_kill,
                                                 &freeze_coord_kill_evt,
                                             );
                                             wprof_ship_deadline = None;
                                         }
-                                    } else if wprof_ship_deadline.is_some()
-                                        && drained.messages.iter().any(is_wprof_ship_frame)
-                                    {
-                                        eprintln!(
-                                            "freeze-coord: wprof trace received; \
-                                             kill triggered after ship"
-                                        );
-                                        trigger_freeze_coord_kill(
-                                            &freeze_coord_kill,
-                                            &freeze_coord_kill_evt,
-                                        );
-                                        wprof_ship_deadline = None;
                                     }
                                     // Append the verdict-bearing entries
                                     // to the shared bucket so
@@ -7445,6 +9027,11 @@ impl KtstrVm {
                                 prior_ns.saturating_add(freeze_duration.as_nanos());
                             let encoded = u64::try_from(new_target_ns).unwrap_or(u64::MAX).max(1);
                             watchdog_reset_for_coord.store(encoded, Ordering::Release);
+                            // Stamp provenance so the watchdog dump
+                            // attributes the deadline to the freeze
+                            // extension. Relaxed — diagnostic only.
+                            watchdog_reset_tag_for_coord
+                                .store(WatchdogResetTag::FreezeExtend as u8, Ordering::Relaxed);
                         }
                     };
                     // Helper: persist the JSON to the optional file
@@ -8522,6 +10109,25 @@ impl KtstrVm {
                         periodic_prereqs_ready_ns = u64::try_from(run_start.elapsed().as_nanos())
                             .unwrap_or(u64::MAX)
                             .max(1);
+                        // Export for the post-run readiness-vs-window gate.
+                        periodic_prereqs_ready_for_coord
+                            .store(periodic_prereqs_ready_ns, Ordering::Release);
+                        // Signal a periodic-capture guest that ALL prereqs now
+                        // hold, so it can open the capture window (send its
+                        // ScenarioStart / start the workload) with the full
+                        // duration ahead of it instead of racing the KASLR
+                        // publish. Only meaningful when the run declares
+                        // periodic captures; the guest gates its wait on the
+                        // matching `KTSTR_AWAIT_PERIODIC_READY` karg, so the
+                        // byte is inert (sticky RX, consumed by the poll loop,
+                        // no waiter) on non-periodic runs — but skip the queue
+                        // push entirely on those to avoid needless RX traffic.
+                        // Fires once (the `== 0` stamp guard is one-shot).
+                        if freeze_coord_num_snapshots > 0 {
+                            super::host_comms::request_periodic_prereqs_ready(
+                                &freeze_coord_virtio_con,
+                            );
+                        }
                     }
                     if freeze_coord_num_snapshots > 0 && !periodic_abandoned {
                         if periodic_boundaries_ns.is_none()
@@ -8625,7 +10231,28 @@ impl KtstrVm {
                                     "freeze-coord: periodic snapshot boundaries computed"
                                 );
                                 periodic_anchor_ns = window.anchor_ns;
+                                // Export for the post-run readiness-vs-window
+                                // gate. `window_end_ns` is in the SAME
+                                // run-relative frame as the prereq stamp,
+                                // `.max(1)` vs the 0 sentinel.
+                                periodic_window_end_for_coord
+                                    .store(window.window_end_ns.max(1), Ordering::Release);
                                 periodic_boundaries_ns = Some(boundaries);
+                            }
+                        }
+                        // Advance the guest-progress clock once per tick: when
+                        // the workload-progress heartbeat has published a newer
+                        // scenario-elapsed than last seen, adopt it and stamp
+                        // the wall time it advanced (the wedge-vs-load
+                        // discriminator the fire loop reads).
+                        {
+                            let g = freeze_coord_periodic_guest_elapsed
+                                .load(Ordering::Acquire);
+                            if g > periodic_prev_guest_elapsed_ns {
+                                periodic_prev_guest_elapsed_ns = g;
+                                periodic_last_hb_wall_ns =
+                                    u64::try_from(run_start.elapsed().as_nanos())
+                                        .unwrap_or(u64::MAX);
                             }
                         }
                         if let Some(ref boundaries) = periodic_boundaries_ns {
@@ -8658,7 +10285,33 @@ impl KtstrVm {
                                 let now_ns = raw_now_ns
                                     .saturating_sub(cumulative_pause)
                                     .saturating_sub(in_flight_pause);
-                                if boundaries[next_periodic_idx as usize] > now_ns {
+                                // Fire this boundary when the GUEST'S scenario
+                                // clock reaches it (see the periodic-clock state
+                                // above), not host wall-clock, so the fixed
+                                // num_snapshots budget spreads across the guest's
+                                // real phases under dilation. No heartbeat yet →
+                                // pause-adjusted wall-clock, byte-identical to
+                                // the prior behavior. Stale heartbeat (a wedge:
+                                // heartbeats stopped) → resume on wall-clock so
+                                // the stuck state is still captured. `boundaries`
+                                // and `periodic_anchor_ns` are run-relative, so
+                                // the boundary's scenario-relative offset shares
+                                // the guest clock's frame (both 0 at scenario
+                                // start).
+                                let boundary_offset = boundaries[next_periodic_idx as usize]
+                                    .saturating_sub(periodic_anchor_ns);
+                                let effective_scenario_elapsed = if periodic_last_hb_wall_ns == 0 {
+                                    now_ns.saturating_sub(periodic_anchor_ns)
+                                } else {
+                                    let stale =
+                                        raw_now_ns.saturating_sub(periodic_last_hb_wall_ns);
+                                    if stale > PERIODIC_HB_STALE_NS {
+                                        periodic_prev_guest_elapsed_ns.saturating_add(stale)
+                                    } else {
+                                        periodic_prev_guest_elapsed_ns
+                                    }
+                                };
+                                if boundary_offset > effective_scenario_elapsed {
                                     break;
                                 }
                                 if freeze_coord_kill.load(Ordering::Acquire) {
@@ -10032,7 +11685,7 @@ impl KtstrVm {
                                          awaiting wprof ship (grace {WPROF_SHIP_GRACE:?})"
                                     );
                                     wprof_ship_deadline =
-                                        Some(arm_wprof_grace(run_start, &watchdog_reset_for_coord, WPROF_SHIP_GRACE));
+                                        Some(arm_wprof_grace(run_start, &watchdog_reset_for_coord, &watchdog_reset_tag_for_coord, WPROF_SHIP_GRACE));
                                 } else {
                                     eprintln!(
                                         "freeze-coord: kill triggered after \
@@ -10203,7 +11856,7 @@ impl KtstrVm {
                                          awaiting wprof ship (grace {WPROF_SHIP_GRACE:?})"
                                     );
                                     wprof_ship_deadline =
-                                        Some(arm_wprof_grace(run_start, &watchdog_reset_for_coord, WPROF_SHIP_GRACE));
+                                        Some(arm_wprof_grace(run_start, &watchdog_reset_for_coord, &watchdog_reset_tag_for_coord, WPROF_SHIP_GRACE));
                                 } else {
                                     eprintln!(
                                         "freeze-coord: kill triggered after \
@@ -10712,14 +12365,27 @@ impl KtstrVm {
         guard.freeze_coord = Some(freeze_coord_handle);
 
         let watchdog = std::thread::Builder::new()
-            .name("vmm-watchdog".into())
+            .name("ktstr-watchdog".into())
             .spawn(move || {
                 if let Some(cpu) = wd_service_cpu {
-                    pin_current_thread(cpu, "watchdog");
+                    pin_current_thread(cpu, "ktstr-watchdog");
                 }
-                if rt_watchdog {
-                    set_rt_priority(2, "watchdog");
-                }
+                // The hang detector's own sensing must not dilate with the
+                // load it measures. FIFO-2 is therefore UNCONDITIONAL (not
+                // perf-mode-gated): under extreme host dilation a SCHED_OTHER
+                // watchdog misses its own 100 ms tick / 2 s monitor-liveness
+                // window, so `monitor_live` latches false and the deadman
+                // fires on wall-clock against a cell that was actively
+                // progressing (an observed dump had a milestone 6 s before
+                // the kill). The thread burns ~µs per 100 ms tick, so FIFO-2
+                // grants scheduling immunity at no meaningful CPU cost: in
+                // perf mode vCPUs at FIFO-1 stay below it; in no-perf/default
+                // mode it now outranks SCHED_OTHER vCPUs — intended, sensing
+                // must win. Best-effort — warns once/process without
+                // CAP_SYS_NICE (see `set_rt_priority`). The service-CPU PIN
+                // above stays perf-mode-gated: `wd_service_cpu` is `None`
+                // without a reserved CPU, so there is nothing to pin to.
+                set_rt_priority(2, "ktstr-watchdog");
                 let hard_deadline = Instant::now() + timeout;
                 // Soft phase needs enough headroom for the guest to
                 // flush serial and reboot. Skip when timeout < 5s.
@@ -10729,6 +12395,19 @@ impl KtstrVm {
                     None
                 };
                 let mut soft_fired = false;
+                // Progress-tier state. `monitor_liveness` tracks whether
+                // the monitor's heartbeat is still advancing (a dead
+                // monitor suppresses both progress tiers — see
+                // `watchdog_step::MonitorLiveness`). `kill_reason` records
+                // which rule fires so the dump names the true cause
+                // (Tier-1/2 progress verdict, the Tier-3 hard deadline, or
+                // an AP-set kill) — see [`KillReasonTag`]. The Arc is
+                // shared with `run_vm`, which loads the final value after
+                // this thread's join and surfaces it as
+                // `VmResult::watchdog_kill_reason` (no cross-thread
+                // ordering subtleties: the join is the synchronization).
+                let mut monitor_liveness = watchdog_step::MonitorLiveness::new();
+                let kill_reason = watchdog_kill_reason_for_wd;
                 // Cached scheduler-attach reset deadline. Decoded
                 // lazily from `watchdog_reset_for_wd` after the
                 // host monitor stores a non-zero value (the
@@ -10748,8 +12427,14 @@ impl KtstrVm {
                 // is set; absent, the load is skipped entirely
                 // (no workload duration → nothing to reset to).
                 let mut reset_deadline: Option<Instant> = None;
+                // Tier-3 deadman deferral bookkeeping. `deadman_deferrals`
+                // counts ticks the wall deadline was reached but the
+                // deadman deferred (cell alive); folded into the eventual
+                // kill dump so a deferred-then-killed cell shows its
+                // history.
+                let mut deadman_deferrals: u64 = 0;
                 if crate::vmm::debug_logging_enabled() {
-                    eprintln!("watchdog: started, timeout={timeout:?}");
+                    eprintln!("ktstr-watchdog: started, timeout={timeout:?}");
                 }
 
                 // Wake plumbing. `tick_tfd` is a periodic 100 ms
@@ -10768,19 +12453,19 @@ impl KtstrVm {
                 let mut tick_tfd = match TimerFd::new() {
                     Ok(t) => t,
                     Err(e) => {
-                        tracing::error!(err = %e, "watchdog: timerfd_create failed");
+                        tracing::error!(err = %e, "ktstr-watchdog: timerfd_create failed");
                         return;
                     }
                 };
                 let tick = Duration::from_millis(100);
                 if let Err(e) = tick_tfd.reset(tick, Some(tick)) {
-                    tracing::error!(err = %e, "watchdog: timerfd_settime failed");
+                    tracing::error!(err = %e, "ktstr-watchdog: timerfd_settime failed");
                     return;
                 }
                 let epoll = match Epoll::new() {
                     Ok(e) => e,
                     Err(e) => {
-                        tracing::error!(err = %e, "watchdog: epoll_create1 failed");
+                        tracing::error!(err = %e, "ktstr-watchdog: epoll_create1 failed");
                         return;
                     }
                 };
@@ -10792,7 +12477,7 @@ impl KtstrVm {
                     tick_fd,
                     EpollEvent::new(EventSet::IN, tick_fd as u64),
                 ) {
-                    tracing::error!(err = %e, "watchdog: epoll_ctl add timerfd failed");
+                    tracing::error!(err = %e, "ktstr-watchdog: epoll_ctl add timerfd failed");
                     return;
                 }
                 if let Err(e) = epoll.ctl(
@@ -10800,7 +12485,7 @@ impl KtstrVm {
                     kill_fd,
                     EpollEvent::new(EventSet::IN, kill_fd as u64),
                 ) {
-                    tracing::error!(err = %e, "watchdog: epoll_ctl add kill_evt failed");
+                    tracing::error!(err = %e, "ktstr-watchdog: epoll_ctl add kill_evt failed");
                     return;
                 }
                 if let Err(e) = epoll.ctl(
@@ -10808,7 +12493,7 @@ impl KtstrVm {
                     bsp_done_fd,
                     EpollEvent::new(EventSet::IN, bsp_done_fd as u64),
                 ) {
-                    tracing::error!(err = %e, "watchdog: epoll_ctl add bsp_done_evt failed");
+                    tracing::error!(err = %e, "ktstr-watchdog: epoll_ctl add bsp_done_evt failed");
                     return;
                 }
                 let mut epoll_buf = [EpollEvent::default(); 3];
@@ -10816,7 +12501,7 @@ impl KtstrVm {
                 loop {
                     if bsp_done_for_wd.load(Ordering::Acquire) {
                         if crate::vmm::debug_logging_enabled() {
-                            eprintln!("watchdog: BSP done, returning");
+                            eprintln!("ktstr-watchdog: BSP done, returning");
                         }
                         return;
                     }
@@ -10837,7 +12522,7 @@ impl KtstrVm {
                                 reset_deadline = Some(candidate);
                                 if crate::vmm::debug_logging_enabled() {
                                     eprintln!(
-                                        "watchdog: scheduler attach observed, hard \
+                                        "ktstr-watchdog: scheduler attach observed, hard \
                                          deadline reset to {:?} from VM start",
                                         candidate.saturating_duration_since(run_start),
                                     );
@@ -10845,29 +12530,117 @@ impl KtstrVm {
                             }
                         }
                     }
+                    // Progress-tier evaluation, BEFORE the deadline
+                    // compare so a wedge is caught on its phase budget
+                    // rather than waiting out the full Tier-3 deadline.
+                    // Read the ledger once, fold monitor liveness, and run
+                    // the pure `watchdog_step` tiers. `now_wall_ns` is
+                    // `run_start`-relative — the same anchor the monitor
+                    // stamps `wall_ns_at_progress` with — so the wall
+                    // deltas align. `snapshot` and `monitor_live` are read
+                    // here and reused by the dump in this same iteration. A
+                    // dead monitor makes `evaluate_progress` return None
+                    // (both tiers off), so a degraded / no-monitor host
+                    // naturally falls back to Tier-3-only.
+                    let snapshot = progress_ledger_for_wd.snapshot();
+                    let monitor_live = monitor_liveness.observe(snapshot.monitor_heartbeat);
+                    let now_wall_ns = run_start.elapsed().as_nanos() as u64;
+                    // CPU-trickle verdict for this tick — the Tier-3
+                    // deadman's deferral discriminator (its ONLY consumer;
+                    // Tier-2 carries no CPU term). The MONITOR computes it
+                    // (it owns the per-vCPU CPU data the busiest-vCPU
+                    // windowed currency needs — see
+                    // `watchdog_step::CpuTrickleTracker`); the watchdog just
+                    // reads the published verdict. `true` = the guest's
+                    // busiest single vCPU accrued below the currency floor
+                    // over the trailing window.
+                    let cpu_trickle_stalled = snapshot.cpu_trickle_stalled;
+                    // Wall time since the last MILESTONE (progress_epoch
+                    // anchor) — milestone-only, so a live kernel's
+                    // scheduling noise never resets it. Same quantity as
+                    // Tier-2's `wall_in_phase` (a phase entry is a
+                    // milestone); reused by the deadman deferral gate.
+                    let wall_since_milestone_ns =
+                        now_wall_ns.saturating_sub(snapshot.wall_ns_at_progress);
+                    let progress_decision =
+                        watchdog_step::evaluate_progress(&snapshot, now_wall_ns, monitor_live);
+                    let tier_fire = !matches!(progress_decision, watchdog_step::KillDecision::None);
                     let effective_deadline =
                         reset_deadline.map_or(hard_deadline, |r| r.max(hard_deadline));
-                    if kill_for_watchdog.load(Ordering::Acquire)
-                        || Instant::now() >= effective_deadline
-                    {
-                        // Either an AP set kill or hard timeout expired.
+                    let effective_deadline_budget_ns = effective_deadline
+                        .saturating_duration_since(run_start)
+                        .as_nanos()
+                        .min(u64::MAX as u128) as u64;
+                    let deadman_cpu_budget = watchdog_step::deadman_cpu_budget_ns(
+                        effective_deadline_budget_ns,
+                        snapshot.cpu_currency,
+                    );
+                    let deadman_cpu_budget_exhausted =
+                        watchdog_step::deadman_cpu_budget_exhausted(
+                            snapshot.max_vcpu_cpu_in_phase_ns,
+                            effective_deadline_budget_ns,
+                            snapshot.cpu_currency,
+                        );
+                    let kill_set = kill_for_watchdog.load(Ordering::Acquire);
+                    let hard_deadline_reached = Instant::now() >= effective_deadline;
+                    // Tier-3 deadman deferral: reaching the wall deadline
+                    // only KILLS when the monitor is dead, the cell is
+                    // inert (CPU trickle-stalled AND no milestone within
+                    // the grace), or the current phase has burned more
+                    // busiest-vCPU CPU than the VM's entire effective
+                    // deadline budget. That last bound closes Body's
+                    // intentional Tier-1 exemption without reintroducing
+                    // wall-clock false kills under host contention. See
+                    // [`watchdog_step::deadman_should_fire`].
+                    let deadman_fire = hard_deadline_reached
+                        && watchdog_step::deadman_should_fire(
+                            monitor_live,
+                            wall_since_milestone_ns,
+                            cpu_trickle_stalled,
+                            snapshot.max_vcpu_cpu_in_phase_ns,
+                            effective_deadline_budget_ns,
+                            snapshot.cpu_currency,
+                        );
+                    if kill_set || deadman_fire || tier_fire {
+                        // A progress tier fired, an AP set kill, or the
+                        // hard timeout expired.
                         // Re-check bsp_done: if the BSP already exited its
                         // run loop, the VcpuFd (and kvm_run mmap backing
                         // bsp_ie) may be dropped. Writing to ie after drop
                         // is a use-after-free.
                         if bsp_done_for_wd.load(Ordering::Acquire) {
                             if crate::vmm::debug_logging_enabled() {
-                                eprintln!("watchdog: BSP already done, returning");
+                                eprintln!("ktstr-watchdog: BSP already done, returning");
                             }
                             return;
                         }
-                        let hard_timeout_fired = Instant::now() >= effective_deadline;
-                        let reason = if hard_timeout_fired {
-                            "hard timeout expired"
-                        } else {
-                            "kill set by AP"
+                        // The deadman is the CAUSE only when it actually
+                        // fired (wall deadline reached AND not deferred),
+                        // not merely because the wall deadline passed while
+                        // the cell stayed alive. So a kill_set arriving
+                        // past a deferred deadline is labeled AP-kill, not
+                        // Tier-3, and does not set `timed_out`.
+                        let hard_timeout_fired = deadman_fire;
+                        // Cause precedence: a progress-tier verdict is the
+                        // most specific (it names WHICH wedge), so it wins
+                        // over the generic hard deadline; the AP-set kill
+                        // is last (and, unlike the tiers/deadline, is not a
+                        // timeout). Mirrors the old hard-over-AP order.
+                        let reason_tag = match progress_decision {
+                            watchdog_step::KillDecision::Tier1CpuBudget => KillReasonTag::Tier1Cpu,
+                            watchdog_step::KillDecision::Tier2IdleWedge => KillReasonTag::Tier2Idle,
+                            watchdog_step::KillDecision::None if hard_timeout_fired => {
+                                KillReasonTag::Tier3Deadman
+                            }
+                            watchdog_step::KillDecision::None => KillReasonTag::ApKill,
                         };
-                        eprintln!("watchdog: {reason}, kicking BSP");
+                        kill_reason.store(reason_tag as u8, Ordering::Relaxed);
+                        // Decode back through the atomic the fire path just
+                        // stored into, mirroring the reset-tag round-trip;
+                        // this token is the dump's authoritative kill cause.
+                        let kill_reason_str =
+                            KillReasonTag::from_u8(kill_reason.load(Ordering::Relaxed)).render();
+                        eprintln!("ktstr-watchdog: {kill_reason_str}, kicking BSP");
                         // Actionable diagnostics. Without this dump the
                         // operator-visible failure is just `timed_out =
                         // true` with no clue why. Print the deadline
@@ -10891,16 +12664,150 @@ impl KtstrVm {
                             effective_deadline.saturating_duration_since(run_start);
                         let hard_offset = hard_deadline.saturating_duration_since(run_start);
                         let elapsed = now.saturating_duration_since(run_start);
-                        let was_reset = reset_deadline.is_some();
-                        eprintln!("watchdog: deadline expired at {elapsed:?} from VM start");
+                        // Decode WHICH writer last armed the reset
+                        // deadline, not merely whether one did. The old
+                        // `reset_by_scheduler_attach` key keyed on
+                        // `reset_deadline.is_some()`, which reads true
+                        // even when the scenario-start arm (not a live
+                        // scheduler) armed it — mislabeling dead
+                        // schedulers during triage. Relaxed load pairs
+                        // with the writers' Relaxed stores; a benign race
+                        // with `watchdog_reset_for_wd` can show a fresh
+                        // deadline against a stale tag, acceptable for a
+                        // human-facing dump.
+                        let reset_armed_by = WatchdogResetTag::from_u8(
+                            watchdog_reset_tag_for_wd.load(Ordering::Relaxed),
+                        )
+                        .render();
+                        // Evidence for the dump, from this tick's ledger
+                        // snapshot. `max_vcpu_cpu_in_phase` (the busiest
+                        // vCPU's CPU burned since the phase was entered) is
+                        // what Tier-1 compares against the currency-widened
+                        // budget — width-independent; the summed `cpu_ns_now`
+                        // is rendered alongside as pure context (it feeds no
+                        // tier). `wall_in_phase` (wall since the last
+                        // milestone) is what Tier-2 / the deadman compare
+                        // against the backstop / grace. The `u64::MAX`
+                        // sentinel budgets (Body / unmodeled phase) render as
+                        // `off` rather than an absurd Duration.
+                        let stage = crate::monitor::LifecycleStage::from_u8(snapshot.phase);
+                        let max_vcpu_cpu_in_phase = snapshot.max_vcpu_cpu_in_phase_ns;
+                        let wall_in_phase =
+                            now_wall_ns.saturating_sub(snapshot.wall_ns_at_progress);
+                        let cpu_budget = watchdog_step::widened_cpu_budget_ns(
+                            snapshot.phase,
+                            snapshot.cpu_currency,
+                        );
+                        let wall_backstop =
+                            crate::test_support::runtime::phase_wall_backstop_ns(snapshot.phase);
+                        // Sentinel-aware ns→Duration renderer for a budget.
+                        let render_budget = |ns: u64| {
+                            if ns == u64::MAX {
+                                "off".to_string()
+                            } else {
+                                format!("{:?}", Duration::from_nanos(ns))
+                            }
+                        };
+                        let cpu_currency_str = match snapshot.cpu_currency {
+                            crate::monitor::CPU_CURRENCY_PMU => "pmu",
+                            crate::monitor::CPU_CURRENCY_PTHREAD => "pthread",
+                            _ => "none",
+                        };
+                        // A pre-attach (Boot) progress-tier kill is an
+                        // infrastructure fault, not a test failure — prefix
+                        // the header with a greppable marker so triage can
+                        // separate framework wedges from workload timeouts.
+                        let infra_fault = matches!(
+                            reason_tag,
+                            KillReasonTag::Tier1Cpu | KillReasonTag::Tier2Idle
+                        ) && snapshot.phase
+                            == crate::monitor::LifecycleStage::Boot as u8;
+                        let header_prefix = if infra_fault {
+                            "ktstr infra fault: "
+                        } else {
+                            ""
+                        };
                         eprintln!(
-                            "  cause={reason}, hard_timeout_fired={hard_timeout_fired}, \
-                             kill_set_by_AP={}",
-                            !hard_timeout_fired
+                            "{header_prefix}ktstr-watchdog: deadline expired at {elapsed:?} from VM start"
+                        );
+                        eprintln!(
+                            "  cause={kill_reason_str}, \
+                             hard_timeout_fired={hard_timeout_fired}, kill_set_by_AP={}",
+                            reason_tag == KillReasonTag::ApKill
+                        );
+                        // Evidence block. `monitor_live` gates BOTH
+                        // progress tiers; `evidence_channels_live` gates
+                        // Tier-2 specifically (per-CPU guest reads
+                        // resolved this tick) — when false, `runnable_demand`
+                        // is blind and Tier-2 was suppressed, so an
+                        // early-boot kill here is Tier-1 / Tier-3 only.
+                        eprintln!(
+                            "  phase={stage:?} ({:?}), monitor_live={monitor_live}, \
+                             evidence_channels_live={}",
+                            stage.class(),
+                            snapshot.evidence_channels_live,
+                        );
+                        eprintln!(
+                            "  max_vcpu_cpu_in_phase={:?} vs budget={} \
+                             (currency={cpu_currency_str}), cpu_sum={:?}, \
+                             cpu_trickle_stalled={cpu_trickle_stalled}",
+                            Duration::from_nanos(max_vcpu_cpu_in_phase),
+                            render_budget(cpu_budget),
+                            Duration::from_nanos(snapshot.cpu_ns_now),
+                        );
+                        eprintln!(
+                            "  tier3_cpu_backstop={:?} vs budget={} (exhausted={})",
+                            Duration::from_nanos(max_vcpu_cpu_in_phase),
+                            render_budget(deadman_cpu_budget),
+                            deadman_cpu_budget_exhausted,
+                        );
+                        // Deadman trickle evidence: the BUSIEST single
+                        // vCPU's CPU accrued over the last closed 10 s
+                        // window (monitor-computed via per-vCPU window
+                        // anchors) vs the currency floor — what latched (or
+                        // deferred) `cpu_trickle_stalled` above. Deadman-
+                        // only; Tier-2 carries no CPU term.
+                        eprintln!(
+                            "  busiest_vcpu_window={:?} vs trickle_floor={:?}",
+                            Duration::from_nanos(snapshot.busiest_vcpu_window_ns),
+                            Duration::from_nanos(watchdog_step::trickle_floor_for_currency(
+                                snapshot.cpu_currency
+                            )),
+                        );
+                        eprintln!(
+                            "  wall_in_phase={:?} vs backstop={}",
+                            Duration::from_nanos(wall_in_phase),
+                            render_budget(wall_backstop),
+                        );
+                        eprintln!(
+                            "  progress_epoch={} (milestones), wall_since_milestone={:?}, \
+                             runnable_demand={}, deadman_deferrals={deadman_deferrals}",
+                            snapshot.progress_epoch,
+                            Duration::from_nanos(wall_since_milestone_ns),
+                            snapshot.runnable_demand,
+                        );
+                        // KILL-TIME publish-state evidence. The monitor's
+                        // pre-latch diag prints the same counters ONCE at
+                        // ~10 s; a starved boot can deliver KERN_ADDRS long
+                        // after that, so only a kill-time read separates
+                        // "the publish NEVER arrived across the whole run"
+                        // (frames=0 here — guest never sent, or the frame
+                        // was lost/mistyped upstream of the dispatcher)
+                        // from "arrived late but a derive input was absent"
+                        // (frames>0 with kaslr_raw=0 — e.g. the guest's
+                        // kallsyms `_text` read failed so the frame carried
+                        // no runtime KVA).
+                        eprintln!(
+                            "  kern_addrs_frames={} (kill-time), kaslr_raw={:#x}, \
+                             phys_base_raw={:#x}, unknown_type_frames={}",
+                            kern_addrs_frames_for_wd.load(Ordering::Relaxed),
+                            kern_virt_kaslr_for_wd.load(Ordering::Acquire),
+                            kern_phys_base_for_wd.load(Ordering::Acquire),
+                            unknown_type_frames_for_wd.load(Ordering::Relaxed),
                         );
                         eprintln!(
                             "  effective_deadline={effective_offset:?} from VM start \
-                             (reset_by_scheduler_attach={was_reset})"
+                             (reset_armed_by={reset_armed_by})"
                         );
                         eprintln!("  hard_deadline={hard_offset:?} from VM start (timeout knob)");
                         eprintln!(
@@ -10914,12 +12821,13 @@ impl KtstrVm {
                              derived as max(watchdog_timeout, duration) so raising \
                              duration also extends the host watchdog deadline"
                         );
-                        // Set `timed_out` ONLY for the hard-deadline
-                        // branch. The "kill set by AP" path is not a
-                        // watchdog timeout — propagating it as
-                        // `timed_out=true` would mislabel a panic-
-                        // driven kill as a deadline expiry.
-                        if hard_timeout_fired {
+                        // All watchdog VERDICT timeouts set `timed_out`: the
+                        // Tier-3 hard deadline AND the Tier-1/2 progress
+                        // tiers (a wedge is a timeout by another name). The
+                        // AP-set-kill path does NOT — it is a panic-driven
+                        // kill, and propagating it as `timed_out=true` would
+                        // mislabel it as a deadline expiry.
+                        if hard_timeout_fired || tier_fire {
                             timed_out_for_watchdog.store(true, Ordering::Release);
                         }
                         // Propagate kill so handle_freeze's poll loop
@@ -10932,7 +12840,7 @@ impl KtstrVm {
                         unsafe {
                             libc::pthread_kill(bsp_tid, vcpu_signal());
                         }
-                        eprintln!("watchdog: BSP kicked");
+                        eprintln!("ktstr-watchdog: BSP kicked");
                         return;
                     }
                     // Soft deadline: request graceful shutdown by
@@ -10957,11 +12865,37 @@ impl KtstrVm {
                     // no soft phase configured) — the reset path
                     // inherits that decision rather than
                     // synthesising a soft phase out of nothing.
+                    //
+                    // Tier-3 deferral consistency: the soft request PRECEDES
+                    // the hard fire (3 s before), so it is gated by the SAME
+                    // deferral predicate — only nudge the guest toward a
+                    // flush+reboot when the deadman WOULD fire (monitor dead
+                    // or cell inert). A starved-but-alive cell is deferred,
+                    // so it must never be told to shut down: that would kill
+                    // the very cell the deferral protects. Once the wall
+                    // deadline is reached but deferred, count it (no
+                    // per-tick log — would spam for the whole deferral span)
+                    // and skip soft entirely.
                     let effective_soft = soft_deadline
                         .and_then(|_| effective_deadline.checked_sub(Duration::from_secs(3)));
-                    if !soft_fired && effective_soft.is_some_and(|d| Instant::now() >= d) {
+                    if hard_deadline_reached {
+                        // Reached the wall deadline this tick but did not
+                        // fire (deadman deferred; kill/tier not set) — the
+                        // cell is alive but past its budget.
+                        deadman_deferrals = deadman_deferrals.saturating_add(1);
+                    } else if !soft_fired
+                        && effective_soft.is_some_and(|d| Instant::now() >= d)
+                        && watchdog_step::deadman_should_fire(
+                            monitor_live,
+                            wall_since_milestone_ns,
+                            cpu_trickle_stalled,
+                            snapshot.max_vcpu_cpu_in_phase_ns,
+                            effective_deadline_budget_ns,
+                            snapshot.cpu_currency,
+                        )
+                    {
                         soft_fired = true;
-                        eprintln!("watchdog: soft deadline, requesting graceful shutdown");
+                        eprintln!("ktstr-watchdog: soft deadline, requesting graceful shutdown");
                         super::host_comms::request_shutdown(&wd_virtio_con);
                     }
                     // Block until the next tick or a kill_evt /
@@ -10993,7 +12927,7 @@ impl KtstrVm {
                         }
                         Err(e) => {
                             if e.raw_os_error() != Some(libc::EINTR) {
-                                tracing::warn!(err = %e, "watchdog: epoll_wait failed");
+                                tracing::warn!(err = %e, "ktstr-watchdog: epoll_wait failed");
                                 // Fall through to the next iteration
                                 // so the deadline check still runs;
                                 // a persistent failure is eventually
@@ -11036,7 +12970,10 @@ impl KtstrVm {
             // VM at 120s, so a 30s bring-up cap sits comfortably below it while
             // staying generous for a badly oversubscribed host.
             const AP_READY_TIMEOUT: Duration = Duration::from_secs(30);
-            let deadline = Instant::now() + AP_READY_TIMEOUT;
+            // Real gate-start instant so the error can report the ACTUAL wait,
+            // not the cap — a kill-break can trip the gate at ~0s elapsed.
+            let gate_start = Instant::now();
+            let deadline = gate_start + AP_READY_TIMEOUT;
             for latch in &ap_boot_latches {
                 while !latch.is_set() {
                     if kill.load(Ordering::Acquire) {
@@ -11058,11 +12995,84 @@ impl KtstrVm {
                 .map(|(i, _)| i + 1)
                 .collect();
             if !not_ready.is_empty() {
-                anyhow::bail!(
-                    "vCPU threads {not_ready:?} not ready after {}s — host CPU \
-                     starvation during bring-up",
-                    AP_READY_TIMEOUT.as_secs()
-                );
+                // Evidence dump — runs ONLY on the trip path. The old fixed
+                // "host CPU starvation" message was empirically refuted (fair
+                // scheduler contention cannot trip this gate even at 25x
+                // oversubscription), so instead of asserting a cause we collect
+                // per-thread kernel state and let the reader judge. For each AP
+                // whose boot latch never fired, read its published TID slot: the
+                // TID is stamped as the FIRST act of the AP closure, so a slot
+                // still 0 means the host thread ran zero instructions — the pure
+                // "never scheduled" signal. Comm-based attribution is NOT used:
+                // Rust sets a thread's name via prctl from INSIDE the thread, so
+                // a never-scheduled thread still carries the parent's comm. For a
+                // thread that did run, read
+                // /proc/self/task/{tid}/{stat,schedstat,wchan,status} once and
+                // pull the starved-vs-blocked discriminators. All reads are
+                // best-effort — a vanished TID yields "?" rather than failing.
+                use std::fmt::Write as _;
+                let mut evidence = String::new();
+                for (i, (tid_slot, _)) in ap_tid_slots.iter().enumerate() {
+                    if ap_boot_latches[i].is_set() {
+                        continue;
+                    }
+                    let vcpu_id = i + 1;
+                    let tid = tid_slot.load(Ordering::Acquire);
+                    if tid == 0 {
+                        let _ = writeln!(
+                            evidence,
+                            "  vCPU {vcpu_id}: never scheduled (no TID stamped) — \
+                             the host thread ran zero instructions of its closure \
+                             (pure starvation)"
+                        );
+                        continue;
+                    }
+                    let base = format!("/proc/self/task/{tid}");
+                    let read1 = |f: &str| {
+                        std::fs::read_to_string(format!("{base}/{f}"))
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_default()
+                    };
+                    // Split off everything after "(comm) " so a comm containing
+                    // ") " (or spaces) can't shift field indices. In that tail
+                    // field 0 is `state` (proc stat field 3); `processor` (last
+                    // CPU) is stat field 39, i.e. tail index 36.
+                    let stat = read1("stat");
+                    let tail = stat.rsplit(") ").next().unwrap_or("");
+                    let sf: Vec<&str> = tail.split(' ').collect();
+                    let state = sf.first().copied().unwrap_or("?");
+                    let last_cpu = sf.get(36).copied().unwrap_or("?");
+                    // schedstat field 2 = time runnable-but-not-running (ns):
+                    // large here means "wanted the CPU, didn't get it"
+                    // (starvation); near-zero with a kernel `wchan` means the
+                    // thread was blocked in-kernel, not starved.
+                    let schedstat = read1("schedstat");
+                    let wait_ns = schedstat.split_whitespace().nth(1).unwrap_or("?");
+                    let wchan = read1("wchan");
+                    let wchan = if wchan.is_empty() {
+                        "?"
+                    } else {
+                        wchan.as_str()
+                    };
+                    let status = read1("status");
+                    let nonvol = status
+                        .lines()
+                        .find_map(|l| l.strip_prefix("nonvoluntary_ctxt_switches:"))
+                        .map(str::trim)
+                        .unwrap_or("?");
+                    let _ = writeln!(
+                        evidence,
+                        "  vCPU {vcpu_id} (tid {tid}): state={state} \
+                         last_cpu={last_cpu} runnable_wait_ns={wait_ns} \
+                         wchan={wchan} nonvoluntary_ctxt_switches={nonvol}"
+                    );
+                }
+                return Err(anyhow::Error::new(ApGateTimeout {
+                    not_ready,
+                    elapsed: gate_start.elapsed(),
+                    killed: kill.load(Ordering::Acquire),
+                    evidence,
+                }));
             }
         }
 
@@ -11168,6 +13178,15 @@ impl KtstrVm {
         // `Instant::now()` at the end and the difference becomes
         // `VmResult::cleanup_duration`.
         let cleanup_start = Instant::now();
+        // Cleanup-window dilation instrument: snapshot THIS thread's
+        // schedstat at the window open. run_vm and collect_results run on
+        // the same caller thread (the BSP thread), which performs every
+        // join/drain in the window, so the delta across the window is the
+        // cleanup performer's own on-CPU + runnable-wait — the evidence
+        // the cleanup-budget gate judges overruns against (the per-phase
+        // witness CANNOT attest this window: the monitor that feeds it is
+        // itself joined inside it).
+        let cleanup_sched_t0 = read_self_thread_schedstat();
         // `code` here is the run-loop sentinel (0 only on a BSP-
         // observed `ExitAction::Shutdown`, -1 otherwise — see
         // [`BspExitReason`] and the preceding `BSP: loop exit
@@ -11322,9 +13341,49 @@ impl KtstrVm {
             cr3_cache.store(val, Ordering::Release);
         }
 
+        // Host-side vCPU scheduling-dilation sample. Read HERE — after the
+        // watchdog/freeze-coord joins above but BEFORE `ap_threads` move
+        // into `VmRunState` (they are joined only later, in
+        // `collect_results`). A live vCPU is read from proc; an AP that
+        // already returned contributes the one-shot self-snapshot it stored
+        // immediately before exit. TIDs come from the same
+        // `vcpu_tid_slots` the monitor uses — index 0 is the BSP (this
+        // thread), 1.. are the AP slots each AP stamped before entering
+        // KVM_RUN; a slot still 0 means that AP never scheduled and is
+        // skipped by `read_host_vcpu_schedstat`. Each vCPU thread lives
+        // exactly one VM run (BSP is this thread; APs are spawned fresh
+        // per `run_vm` in `spawn_ap_threads` and never reused), so the
+        // whole-thread-life schedstat totals are this run's totals — no
+        // baseline subtraction is needed.
+        let host_vcpu_tids: Vec<i32> = vcpu_tid_slots
+            .iter()
+            .map(|(slot, _)| slot.load(Ordering::Acquire))
+            .collect();
+        let host_vcpu_schedstat =
+            read_host_vcpu_schedstat_with_exit_snapshots(&host_vcpu_tids, &vcpu_exit_schedstats);
+        // Finalize before the AP handles move into VmRunState. Vanished proc
+        // task directories are covered by the aligned exit snapshots. The
+        // monitor may take a later no-op sample, but the recorder's finalized
+        // latch prevents post-result mutation.
+        let contention_witness = contention_recorder.finish();
+
+        // Final ledger snapshot for the VmResult phase/milestone fields.
+        // The dispatch consumers that advance these are joined/dead by
+        // now, so this is the run's final state.
+        let final_ledger = progress_ledger_for_result.snapshot();
+
         Ok(VmRunState {
             exit_code,
             timed_out,
+            // Final kill-reason byte: the watchdog thread joined above, so
+            // this load observes its last store (the join synchronizes).
+            watchdog_kill_reason_raw: watchdog_kill_reason.load(Ordering::Acquire),
+            final_guest_phase_raw: final_ledger.phase,
+            final_progress_epoch: final_ledger.progress_epoch,
+            bpf_map_write_delivery_raw: bpf_map_write_delivery.load(Ordering::Acquire),
+            periodic_prereqs_ready_ns_raw: periodic_prereqs_ready_at.load(Ordering::Acquire),
+            periodic_window_end_ns_raw: periodic_window_end_at.load(Ordering::Acquire),
+            contention_witness,
             ap_threads,
             monitor_handle,
             bpf_write_handle,
@@ -11340,6 +13399,7 @@ impl KtstrVm {
             freeze,
             vm,
             cleanup_start,
+            cleanup_sched_t0,
             virtio_blk_counters,
             virtio_net_counters,
             // Snapshot bridge owning every report stored by the
@@ -11397,6 +13457,10 @@ impl KtstrVm {
             // invalidate `kind_host_ptr` and `request_kva` after
             // every vCPU thread joins but before `vm` drops.
             watchpoint,
+            // Host-side vCPU dilation sample read just above from live proc
+            // entries plus one-shot AP exit snapshots. Forwarded verbatim to
+            // `VmResult::host_vcpu_schedstat` by `collect_results`.
+            host_vcpu_schedstat,
         })
     }
 
@@ -11476,6 +13540,8 @@ impl KtstrVm {
             let pci_bus_clone = pci_bus.cloned();
             let exited = Arc::new(AtomicBool::new(false));
             let exited_clone = exited.clone();
+            let schedstat_at_exit = Arc::new(std::sync::Mutex::new(None));
+            let schedstat_at_exit_thread = Arc::clone(&schedstat_at_exit);
             let parked = Arc::new(AtomicBool::new(false));
             let parked_clone = parked.clone();
             let regs = Arc::new(std::sync::Mutex::new(None));
@@ -11616,6 +13682,20 @@ impl KtstrVm {
                             thaw_evt_clone.as_ref(),
                         );
                     });
+                    // `/proc/self/task/<tid>` vanishes as soon as this closure
+                    // returns. Preserve one final self-snapshot so host
+                    // contention finalization cannot lose an AP that exited
+                    // between the last lifecycle frame and result assembly.
+                    // This is a single read per AP lifetime, never polling.
+                    if let Ok(line) = std::fs::read_to_string("/proc/thread-self/schedstat")
+                        && let Some((on_cpu, run_delay)) = parse_schedstat_line(line.trim())
+                    {
+                        *schedstat_at_exit_thread.lock_unpoisoned() = Some(HostVcpuSchedstat {
+                            total_on_cpu_ns: on_cpu,
+                            total_run_delay_ns: run_delay,
+                            sampled_vcpus: 1,
+                        });
+                    }
                     // wp_clone is held for the AP's entire lifetime
                     // so the strong count never drops to zero before
                     // the freeze coordinator joins.
@@ -11637,6 +13717,7 @@ impl KtstrVm {
                 immediate_exit: ie_handle,
                 exit_evt,
                 alive,
+                schedstat_at_exit,
             });
             freeze_parked.push(parked);
             freeze_regs.push(regs);
@@ -11661,15 +13742,20 @@ impl KtstrVm {
         kill_evt: &Arc<EventFd>,
         run_start: Instant,
         vcpu_pthreads: Vec<libc::pthread_t>,
+        contention_recorder: Arc<ContentionWitnessRecorder>,
         perf_capture: Arc<Option<monitor::perf_counters::PerfCountersCapture>>,
         virtio_con: Option<Arc<PiMutex<virtio_console::VirtioConsole>>>,
         sys_rdy_evt: Option<Arc<EventFd>>,
         tcr_el1: Option<Arc<std::sync::atomic::AtomicU64>>,
         cr3: Arc<std::sync::atomic::AtomicU64>,
         watchdog_reset_ns: Arc<std::sync::atomic::AtomicU64>,
+        watchdog_reset_tag: Arc<std::sync::atomic::AtomicU8>,
+        progress_ledger: Arc<monitor::ProgressLedger>,
         kern_phys_base_shared: Arc<std::sync::atomic::AtomicU64>,
         kern_phys_base_evt: Arc<EventFd>,
         kern_virt_kaslr_shared: Arc<std::sync::atomic::AtomicU64>,
+        kern_addrs_frames: Arc<std::sync::atomic::AtomicU64>,
+        kern_addrs_crc_bad: Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<Option<JoinHandle<monitor::reader::MonitorLoopResult>>> {
         let Some(vmlinux) = find_vmlinux(&self.kernel) else {
             return Ok(None);
@@ -11804,9 +13890,30 @@ impl KtstrVm {
         let hz = monitor::guest_kernel_hz(Some(&self.kernel));
         // ms-precision conversion lives in [`duration_to_jiffies`];
         // see its doc for why the seconds-based form is wrong.
-        let watchdog_jiffies = self.watchdog_timeout.map(|d| duration_to_jiffies(d, hz));
+        //
+        // Under coverage instrumentation (cargo-llvm-cov builds set
+        // `--cfg coverage`) the guest scx watchdog timeout is scaled by
+        // [`GUEST_SCX_WATCHDOG_COVERAGE_SCALE`]: the in-guest test binary
+        // and fixture schedulers run instrumented (~2x slower), and the
+        // coverage CI legs run on colocated runners whose deepened
+        // oversubscription starves individual vCPUs asymmetrically — the
+        // measured combination that tripped the tight 5 s default on
+        // churn-heavy fixtures while the SAME tests pass uninstrumented
+        // on the SAME runners. Compile-time-gated so non-coverage builds
+        // are byte-identical and the tight default keeps its full bug-
+        // sorting value everywhere else; the loud log line below keeps a
+        // coverage-log reader from chasing a 15 s eviction as a mystery.
+        let watchdog_jiffies = self.watchdog_timeout.map(|d| {
+            let j = duration_to_jiffies(d, hz);
+            if GUEST_SCX_WATCHDOG_COVERAGE_SCALE > 1 {
+                eprintln!(
+                    "ktstr: coverage build — guest scx watchdog_timeout scaled \
+                     {GUEST_SCX_WATCHDOG_COVERAGE_SCALE}x ({d:?} base)",
+                );
+            }
+            j.saturating_mul(GUEST_SCX_WATCHDOG_COVERAGE_SCALE)
+        });
         let preemption_threshold_ns = monitor::vcpu_preemption_threshold_ns(Some(&self.kernel));
-        let rt_monitor = self.performance_mode;
         let service_cpu = self.pinning_plan.as_ref().and_then(|p| p.service_cpu);
         // Workload duration captured for the scheduler-attach
         // watchdog reset. `Some(d)` enables the reset; the
@@ -11825,9 +13932,22 @@ impl KtstrVm {
                 if let Some(cpu) = service_cpu {
                     pin_current_thread(cpu, "monitor");
                 }
-                if rt_monitor {
-                    set_rt_priority(2, "monitor");
-                }
+                // The hang detector's own sensing must not dilate with the
+                // load it measures. FIFO-2 is UNCONDITIONAL (not perf-mode-
+                // gated): the monitor bumps `monitor_heartbeat` and writes
+                // the ledger the watchdog reads, so a SCHED_OTHER monitor
+                // that slips its ~100 ms sample under extreme host dilation
+                // makes the watchdog latch `monitor_live=false` and fire the
+                // deadman on a still-progressing cell (the monitor-starvation
+                // residual). The per-tick cost is ~µs, so FIFO-2 grants
+                // scheduling immunity at no meaningful CPU cost: perf-mode
+                // vCPUs at FIFO-1 stay below it; in no-perf/default mode it
+                // now outranks SCHED_OTHER vCPUs — intended, sensing must
+                // win. Best-effort — warns once/process without CAP_SYS_NICE
+                // (see `set_rt_priority`). The service-CPU PIN above stays
+                // perf-mode-gated: `service_cpu` is `None` without a reserved
+                // CPU.
+                set_rt_priority(2, "monitor");
                 // Pre-resolution boot-complete wait, hoisted ABOVE
                 // the `phys_base` / `pco_pa` / scx_root_pa /
                 // watchdog_pa / `page_offset_base_pa` resolution
@@ -12000,8 +14120,17 @@ impl KtstrVm {
                 // from the guest's authoritative KERN_ADDRS publish, with
                 // a plausibility-gated CR3 page-table walk only as a last
                 // resort — see the inner comments for why the walk is not
-                // the primary path.
-                let phys_base = {
+                // the primary path. This bounded resolve is a FAST PATH
+                // only: the monitor loop re-reads `kern_phys_base_shared`
+                // per tick while `data_valid` is unlatched and adopts the
+                // guest publish the instant it lands (see
+                // `RqRefresh::kern_phys_base`), so a slow cold boot that
+                // outlives the ~10 s wait no longer freezes the fallback's
+                // garbage/zero into every translation for the whole run.
+                // `phys_base_guest_published` records which arm supplied
+                // the value (diagnostic provenance for the monitor's
+                // pre-latch dump).
+                let (phys_base, phys_base_guest_published) = {
                     let mut pb = 0u64;
                     let pb_fd = {
                         use std::os::unix::io::AsRawFd;
@@ -12069,7 +14198,7 @@ impl KtstrVm {
                             }
                         }
                     }
-                    pb
+                    (pb, guest_published)
                 };
                 if phys_base != 0 {
                     let _ = kern_phys_base_shared.compare_exchange(
@@ -12135,15 +14264,13 @@ impl KtstrVm {
                 // `start_kernel` populates every slot before SMP
                 // bringup IN THE GUEST — but the host monitor thread
                 // spawns before the guest BSP enters KVM_RUN, so a
-                // pre-loop one-shot read sees BSS zeros. Pass the
-                // PAs that drive the recompute through `RqRefresh`
-                // so the loop body re-reads each sample; see
-                // [`monitor::reader::RqRefresh`].
-                let pco_pa = monitor::symbols::text_kva_to_pa_with_base(
-                    symbols.per_cpu_offset,
-                    start_kernel_map_for_thread,
-                    phys_base,
-                );
+                // pre-loop one-shot read sees BSS zeros. The read PA
+                // itself is recomputed per sample inside the monitor
+                // loop from `RqRefresh::per_cpu_offset_kva` +
+                // `RqRefresh::tcr_el1`, so no base is baked here (a
+                // baked base off a not-yet-programmed TCR_EL1 would
+                // pin the read at the wrong PA for the whole run —
+                // see [`monitor::reader::RqRefresh`]).
 
                 let watchdog_override = watchdog_jiffies.and_then(|jiffies| {
                     // 7.1+ path: deref scx_root -> scx_sched.watchdog_timeout.
@@ -12274,23 +14401,35 @@ impl KtstrVm {
                 // `KernelSymbols::from_vmlinux` returns `None` on
                 // aarch64 and on kernels built without the symbol —
                 // the per-iteration refresh tolerates that and
-                // leaves `page_offset` at the pre-loop default.
-                let page_offset_base_pa = symbols.page_offset_base_kva.map(|kva| {
-                    monitor::symbols::text_kva_to_pa_with_base(
-                        kva, start_kernel_map_for_thread, phys_base,
-                    )
-                });
+                // leaves `page_offset` at the pre-loop default. The
+                // read PA is recomputed per tick inside the loop (no
+                // base is baked here — see `RqRefresh`).
                 let rq_refresh = monitor::reader::RqRefresh {
-                    pco_pa,
+                    // Carry link-time KVAs plus the live-input Arcs
+                    // (TCR_EL1 cache, biased kern_phys_base) so the
+                    // monitor recomputes every read PA per tick against
+                    // the LIVE kernel-image base and phys_base, rather
+                    // than the one-shot values this closure resolved —
+                    // which can predate the guest's TCR_EL1 program
+                    // (aarch64) or its KERN_ADDRS phys_base publish
+                    // (both arches) — see `RqRefresh`.
+                    per_cpu_offset_kva: symbols.per_cpu_offset,
+                    tcr_el1: tcr_el1.clone(),
+                    kern_phys_base: Some(kern_phys_base_shared.clone()),
+                    phys_base_guest_published,
+                    kern_addrs_frames: Some(kern_addrs_frames.clone()),
+                    kern_addrs_crc_bad: Some(kern_addrs_crc_bad.clone()),
                     runqueues_kva: symbols.runqueues,
                     kaslr_offset: kern_virt_kaslr_shared.clone(),
                     num_cpus,
-                    page_offset_base_pa,
+                    page_offset_base_kva: symbols.page_offset_base_kva,
+                    memstart_addr_kva: symbols.memstart_addr_kva,
                     event: event_refresh,
                 };
 
                 let vcpu_timing = monitor::reader::VcpuTiming {
                     pthreads: vcpu_pthreads,
+                    contention_recorder: Some(contention_recorder),
                 };
 
                 // The legacy SHM signal slot 1 (`SIGNAL_PROBES_READY`)
@@ -12471,6 +14610,7 @@ impl KtstrVm {
                         scx_root_pa,
                         workload_duration,
                         reset_ns: watchdog_reset_ns.as_ref(),
+                        reset_tag: watchdog_reset_tag.as_ref(),
                     },
                 );
                 // Named-BPF-map watch config: present only when the test
@@ -12544,6 +14684,10 @@ impl KtstrVm {
                     }),
                     watchdog_reset: watchdog_reset_cfg,
                     watch_bpf_maps: watch_cfg.as_ref(),
+                    // Producer handle for the progress/liveness ledger.
+                    // The `move` closure owns the `progress_ledger` Arc;
+                    // borrow it for the loop's per-tick writes.
+                    progress_ledger: Some(progress_ledger.as_ref()),
                 };
                 // `rq_pas` empty: the loop sources every per-CPU
                 // PA from `rq_refresh` per iteration so the static
@@ -12607,10 +14751,15 @@ impl KtstrVm {
         cr3: Arc<std::sync::atomic::AtomicU64>,
         virtio_con: Arc<PiMutex<virtio_console::VirtioConsole>>,
         kern_phys_base: Arc<std::sync::atomic::AtomicU64>,
+        delivery: Arc<std::sync::atomic::AtomicU8>,
+        ready_evt: Option<Arc<EventFd>>,
     ) -> Result<Option<JoinHandle<()>>> {
         if self.bpf_map_writes.is_empty() {
             return Ok(None);
         }
+        let ready_evt = ready_evt.context(
+            "configured BPF map writes require a guest-instrumentation readiness eventfd",
+        )?;
         let Some(vmlinux) = find_vmlinux(&self.kernel) else {
             eprintln!("bpf_map_write: vmlinux not found, skipping");
             return Ok(None);
@@ -12681,8 +14830,22 @@ impl KtstrVm {
                     }
                 };
                 let mem = Arc::new(mem);
-                let phase1_deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(30);
+                // NO wall deadline: this phase's success condition IS guest
+                // progress (phys_base published, MMU + page tables up), so
+                // it completes exactly when the guest reaches the state the
+                // injection targets — the milestone anchoring. A previous
+                // 30 s wall deadline here (counted from THREAD START,
+                // ticking through the whole guest boot) permanently aborted
+                // the injection on saturated hosts where boot alone outran
+                // it — the guest then ran wedge-free and the neg_* fixtures'
+                // "expected bug did not fire" was an injection no-show, not
+                // a detection regression. The retry is kill-bounded (the
+                // run's watchdog deadman is the outer clock) and stays loud:
+                // a progress line every ~30 s so a genuinely-stuck accessor
+                // build (config typo, unresolvable vmlinux) still surfaces
+                // in stderr instead of silently spinning to run end.
+                let phase1_t0 = std::time::Instant::now();
+                let mut phase1_last_log = phase1_t0;
                 let owned = loop {
                     let biased = kern_phys_base.load(std::sync::atomic::Ordering::Acquire);
                     if biased == 0 {
@@ -12707,9 +14870,13 @@ impl KtstrVm {
                             if kill_clone.load(Ordering::Acquire) {
                                 return;
                             }
-                            if std::time::Instant::now() >= phase1_deadline {
-                                eprintln!("bpf_map_write: accessor init timed out: {e:#}");
-                                return;
+                            if phase1_last_log.elapsed() >= std::time::Duration::from_secs(30) {
+                                phase1_last_log = std::time::Instant::now();
+                                eprintln!(
+                                    "bpf_map_write: accessor init still retrying after {:?} \
+                                     (kill-bounded, no wall deadline): {e:#}",
+                                    phase1_t0.elapsed(),
+                                );
                             }
                             poll_eventfd_until_ready_or_timeout(&probes_ready_evt, 200);
                         }
@@ -12757,8 +14924,16 @@ impl KtstrVm {
                         return;
                     }
                 };
-                let retry_deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(30);
+                // NO wall deadline (mirrors phase 1): a map with the
+                // requested field appears exactly when the scheduler's BPF
+                // object loads — guest progress, which saturated hosts
+                // dilate arbitrarily. The prior 30 s wall here aborted the
+                // injection while the scheduler was still attaching. Kill-
+                // bounded, with a loud ~30 s progress line so a genuinely
+                // unresolvable field (typo, wrong map suffix) still
+                // surfaces in stderr instead of spinning silently.
+                let phase2_t0 = std::time::Instant::now();
+                let mut phase2_last_log = phase2_t0;
                 let mut resolved: Vec<(BpfMapWriteParams, monitor::bpf_map::BpfMapInfo, usize, usize)> =
                     Vec::with_capacity(writes.len());
                 for params in writes.iter() {
@@ -12807,12 +14982,16 @@ impl KtstrVm {
                             eprintln!("bpf_map_write: VM exited during map/field search");
                             return;
                         }
-                        if std::time::Instant::now() >= retry_deadline {
+                        if phase2_last_log.elapsed() >= std::time::Duration::from_secs(30) {
+                            phase2_last_log = std::time::Instant::now();
                             eprintln!(
-                                "bpf_map_write: field '{}' unresolved in any '{}' map after {} attempts",
-                                params.field, params.map_name_suffix, attempt,
+                                "bpf_map_write: field '{}' still unresolved in any '{}' map \
+                                 after {} attempts / {:?} (kill-bounded, no wall deadline)",
+                                params.field,
+                                params.map_name_suffix,
+                                attempt,
+                                phase2_t0.elapsed(),
                             );
-                            return;
                         }
                         // Back off ~200 ms before re-walking the IDR, waking
                         // early on kill. Poll `kill_evt` rather than the shared,
@@ -12837,12 +15016,18 @@ impl KtstrVm {
 
                 // Phase 3: run every queued write.
                 //
-                // The legacy SHM signal slot 1 (`SIGNAL_PROBES_READY`)
-                // gate that waited for the guest's probe pipeline to
-                // attach has been removed along with the SHM
-                // signal-slot infrastructure. The writes now race
-                // against probe attachment; replacing the rendezvous
-                // with a virtio-console signal is a follow-up.
+                // The target is now fully resolved, but do not mutate it until
+                // the guest's explicit Phase-5 edge proves the probe pipeline
+                // and optional wprof tracer are armed. The dedicated eventfd
+                // is sticky if the guest got here first and is polled together
+                // with kill_evt, so both success and teardown wake immediately
+                // without a timeout or periodic retry.
+                if !wait_for_bpf_map_write_ready(&ready_evt, &kill_evt_clone, &kill_clone) {
+                    eprintln!(
+                        "bpf_map_write: VM exited before guest instrumentation became ready"
+                    );
+                    return;
+                }
 
                 // Rebind a fresh accessor for the writes. As in the retry
                 // loop, `maps()`/`load_program_btf` snapshot the map IDR once
@@ -12904,6 +15089,12 @@ impl KtstrVm {
                 // when the latch fires. Replaces the legacy SHM signal
                 // slot 0 notification.
                 super::host_comms::request_bpf_map_write_done(&virtio_con);
+                // Delivery evidence: every queued write landed and the guest
+                // was signalled. The neg_* starvation gates read the decoded
+                // `VmResult::bpf_map_writes_delivered` — `Some(true)` here
+                // means an absent expected-crash is a REAL detection failure,
+                // never an injection no-show.
+                delivery.store(2, Ordering::Release);
                 let _ = (&kill_clone, &probes_ready_evt, &mem);
             })
             .context("spawn bpf-map-write thread")?;
@@ -13600,9 +15791,8 @@ impl KtstrVm {
         // derived on demand from these entries via
         // `VmResult::stimulus_timeline()` — no separate pre-extracted
         // stimulus vec is stored, so every consumer sees the same
-        // complete timeline (the previous wire-only field omitted the
-        // terminal and silently dropped the last step's iteration_rate
-        // for post_vm re-derivation).
+        // complete boundary telemetry (the previous wire-only field omitted
+        // the terminal from post_vm reconstruction).
         let guest_messages =
             if !mid_flight_drain.entries.is_empty() || !bulk_drain.entries.is_empty() {
                 let mut all_entries = mid_flight_drain.entries;
@@ -13756,6 +15946,14 @@ impl KtstrVm {
         // the result so the `Instant::now()` here is the latest possible
         // read.
         let cleanup_duration = Some(run.cleanup_start.elapsed());
+        // Close the cleanup-window dilation instrument on the same
+        // thread that opened it (see `cleanup_sched_t0`): the delta's
+        // run-delay is the wall the host scheduler ADDED to this
+        // window; its dilation D_cleanup feeds the budget gate.
+        let cleanup_sched_delta = match (run.cleanup_sched_t0, read_self_thread_schedstat()) {
+            (Some(t0), Some(t1)) => Some(t1.delta_from(&t0)),
+            _ => None,
+        };
         tracing::info!(
             elapsed_ms = collect_results_start.elapsed().as_millis() as u64,
             cleanup_window_ms = cleanup_duration.map(|d| d.as_millis() as u64).unwrap_or(0),
@@ -13800,6 +15998,22 @@ impl KtstrVm {
             exit_code,
             duration: start.elapsed(),
             timed_out,
+            // Mechanism verdicts for wedge fixtures: WHICH watchdog rule
+            // killed the run (the dump's `cause=`) and how far the guest
+            // got (final ledger phase / milestone count). Decoded from the
+            // raw bytes VmRunState captured post-join.
+            watchdog_kill_reason: decode_watchdog_kill_reason(run.watchdog_kill_reason_raw),
+            final_guest_phase: decode_guest_phase(run.final_guest_phase_raw),
+            final_progress_epoch: run.final_progress_epoch,
+            // Injection delivery evidence (see the field doc): 0 = no
+            // writes configured, 1 = configured but never delivered,
+            // 2 = delivered-and-guest-signalled.
+            bpf_map_writes_delivered: decode_bpf_map_write_delivery(run.bpf_map_write_delivery_raw),
+            // Readiness-vs-window evidence (0 sentinel → None).
+            periodic_prereqs_ready: (run.periodic_prereqs_ready_ns_raw != 0)
+                .then(|| Duration::from_nanos(run.periodic_prereqs_ready_ns_raw)),
+            periodic_window_end: (run.periodic_window_end_ns_raw != 0)
+                .then(|| Duration::from_nanos(run.periodic_window_end_ns_raw)),
             output: app_output,
             stderr: console_output,
             monitor: monitor_report,
@@ -13808,6 +16022,7 @@ impl KtstrVm {
             kvm_stats: None,
             crash_message,
             cleanup_duration,
+            cleanup_sched_delta,
             // Snapshot at assignment, not earlier: VmRunState owns
             // the device's Arc<AtomicU64> counter handle until this
             // point. The sole sources of QUEUE_NOTIFY kicks for both
@@ -13856,6 +16071,13 @@ impl KtstrVm {
             // vm.run() returns, alongside entry_name; freeze_coord is
             // entry-agnostic, so `0` here is correct and overwritten.
             variant_hash: 0,
+            // Host-side vCPU scheduling dilation, read at `run_vm` teardown
+            // from live proc entries plus one-shot AP exit snapshots. Purely
+            // observational — never affects `success` above or the exit code.
+            host_vcpu_schedstat: run.host_vcpu_schedstat,
+            // Event-anchored per-phase schedstat + constant-cost CPU-pressure
+            // series, finalized from live proc entries plus AP exit snapshots.
+            contention_witness: run.contention_witness,
             // Empty cache: the single bridge drain is deferred to the
             // first `captures_series()` call on the host (post_vm or
             // evaluate_vm_result). See the `periodic_series_cache`
@@ -14080,9 +16302,11 @@ mod wprof_grace_tests {
     //! [`is_sched_exit_frame`] (which drained frame ARMS the grace on a
     //! wprof run), [`is_probe_output_end_frame`] (which drained frame
     //! ends the grace on an auto-repro probe run), and
-    //! [`wprof_grace_should_kill`] (the bounded deadline backstop).
+    //! [`WprofShipState`] (the order-independent artifact
+    //! rendezvous), and [`wprof_grace_should_kill`] (the bounded deadline
+    //! backstop).
     use super::{
-        is_probe_output_end_frame, is_sched_exit_frame, is_wprof_ship_frame,
+        WprofShipState, is_probe_output_end_frame, is_sched_exit_frame, is_wprof_ship_frame,
         wprof_grace_should_kill,
     };
     use crate::vmm::bulk::BulkMessage;
@@ -14155,6 +16379,45 @@ mod wprof_grace_tests {
             !is_probe_output_end_frame(&frame(MSG_TYPE_WPROF_TRACE, end, true)),
             "the marker on a non-stdout frame type does not count"
         );
+    }
+
+    #[test]
+    fn auto_repro_ship_rendezvous_accepts_both_orders_across_batches() {
+        let end = crate::test_support::PROBE_OUTPUT_END.as_bytes();
+        let probe = frame(MSG_TYPE_STDOUT, end, true);
+        let trace = frame(MSG_TYPE_WPROF_TRACE, b"pb", true);
+
+        let mut probe_first = WprofShipState::default();
+        assert!(!probe_first.observe(std::slice::from_ref(&probe), true));
+        assert!(probe_first.observe(std::slice::from_ref(&trace), true));
+        assert!(!probe_first.observe(std::slice::from_ref(&trace), true));
+
+        let mut trace_first = WprofShipState::default();
+        assert!(!trace_first.observe(std::slice::from_ref(&trace), true));
+        assert!(trace_first.observe(std::slice::from_ref(&probe), true));
+    }
+
+    #[test]
+    fn auto_repro_ship_rendezvous_rejects_torn_or_incomplete_frames() {
+        let end = crate::test_support::PROBE_OUTPUT_END.as_bytes();
+        let mut state = WprofShipState::default();
+        assert!(!state.observe(
+            &[
+                frame(MSG_TYPE_WPROF_TRACE, b"pb", false),
+                frame(MSG_TYPE_STDOUT, end, false),
+            ],
+            true
+        ));
+        assert!(!state.observe(&[frame(MSG_TYPE_WPROF_TRACE, b"pb", true)], true));
+        assert!(!state.observe(&[frame(MSG_TYPE_STDOUT, b"not the marker", true)], true));
+    }
+
+    #[test]
+    fn plain_wprof_rendezvous_requires_only_trace_and_acks_once() {
+        let trace = frame(MSG_TYPE_WPROF_TRACE, b"pb", true);
+        let mut state = WprofShipState::default();
+        assert!(state.observe(std::slice::from_ref(&trace), false));
+        assert!(!state.observe(std::slice::from_ref(&trace), false));
     }
 
     #[test]

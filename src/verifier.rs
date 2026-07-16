@@ -786,15 +786,21 @@ pub struct VerifierVmResult {
     /// dispatch, unlike an scx-specific `nr_dispatched` counter.
     pub dispatched: bool,
     /// The host watchdog fired (hard-deadline hang) before the guest
-    /// exited. Orthogonal to [`Self::attach`]: the attach verdict already
-    /// fails a guest that vanished BEFORE the dispatch phase — an early
-    /// kernel panic reboots via `panic=-1` (an i8042 reset →
-    /// `ExitAction::Shutdown`, `timed_out == false`) and is
-    /// [`AttachOutcome::Unconfirmed`]. This flag catches the remaining
-    /// case: a guest that wedges AFTER attaching (during teardown), which
-    /// leaves `attach == Attached` but never exits. A verifier cell FAILs
-    /// on it too — but NOT on the guest exit code, which is `1` even on
-    /// the verifier success path (no `#[ktstr_test]` body to dispatch).
+    /// exited. NOT orthogonal to [`Self::attach`] in the way the message
+    /// once implied: a hang can occur EITHER after attach (a teardown
+    /// wedge, leaving `attach == Attached`) OR before it (a scheduler
+    /// that died / never reached `enabled` DURING BPF load and then
+    /// wedged without rebooting, leaving `attach` at
+    /// [`AttachOutcome::Died`] / [`AttachOutcome::NotAttached`] /
+    /// [`AttachOutcome::Unconfirmed`]). An early kernel panic is the one
+    /// case this flag does NOT cover: `panic=-1` reboots via an i8042
+    /// reset (`ExitAction::Shutdown`, `timed_out == false`), caught by
+    /// the attach gate as [`AttachOutcome::Unconfirmed`] instead. Because
+    /// the hang is not attach-implying, [`Self::cell_verdict`] words the
+    /// timeout message per [`Self::attach`] rather than always claiming
+    /// "after attach". A verifier cell FAILs on a hang — but NOT on the
+    /// guest exit code, which is `1` even on the verifier success path
+    /// (no `#[ktstr_test]` body to dispatch).
     pub timed_out: bool,
     /// The guest's structured crash message (a `PANIC:`-prefixed line
     /// routed through the host's `extract_panic_message` into
@@ -804,26 +810,50 @@ pub struct VerifierVmResult {
     /// attach/dispatch gates, mirroring `test_support::eval`'s
     /// crash_message priority. `None` on the common no-crash path.
     pub crash_message: Option<String>,
+    /// Host-side vCPU scheduling dilation for this cell's VM run —
+    /// `D = 1 + Σrun_delay/Σon_cpu` over the vCPU host threads (see
+    /// `vmm::result::HostVcpuSchedstat`). `None` on hosts
+    /// without `CONFIG_SCHEDSTATS` or when no vCPU thread was sampled.
+    /// Purely observational: surfaced in the per-cell output and the
+    /// summary grid but NEVER folded into [`Self::cell_verdict`] or the
+    /// exit code.
+    pub dilation: Option<f64>,
 }
 
 impl VerifierVmResult {
     /// The verifier cell PASS/FAIL verdict: `Ok(())` when the scheduler
     /// verified its BPF, attached (sched_ext `enabled`), AND dispatched
     /// the injected workload; `Err(reason)` naming the first failing gate
-    /// otherwise. Gate order — `timed_out` (a post-attach teardown hang),
-    /// then attach (did it turn on?), then dispatch (did it schedule a
-    /// task?) — so the root-cause failure is reported first: an attach
+    /// otherwise. Gate order — `timed_out` (a hang: a post-attach
+    /// teardown wedge OR a scheduler that died mid-load and then wedged
+    /// without rebooting), then attach (did it turn on?), then dispatch
+    /// (did it schedule a task?) — so the root-cause failure is reported
+    /// first: an attach
     /// failure is named before the dispatch gate it necessarily also
     /// trips. Does NOT key on the guest exit code, which is `1` even on
     /// the verifier success path (no `#[ktstr_test]` body to dispatch).
     pub fn cell_verdict(&self) -> Result<(), String> {
-        // A hard-deadline hang. The attach verdict (Unconfirmed) already
-        // fails a guest that vanished BEFORE the dispatch phase (an early
-        // panic reboots via panic=-1 with timed_out=false), so this
-        // catches the orthogonal case: a guest that wedges AFTER attaching,
-        // during teardown.
+        // A hard-deadline hang, reported FIRST (outranks crash_message
+        // and the attach/dispatch gates). The hang is NOT proof of a
+        // post-attach wedge: the watchdog also fires when the scheduler
+        // died / never reached `enabled` during BPF load and the guest
+        // then wedged without rebooting. So keep the exact historical
+        // "after attach" wording ONLY when attach was positively
+        // confirmed; otherwise say the timeout carried no confirmed
+        // attach and fold in the attach failure reason. Both arms keep
+        // the "timed out" substring the gate-order test asserts.
         if self.timed_out {
-            return Err("VM timed out (hung after attach, before exit)".to_string());
+            return Err(match self.attach {
+                AttachOutcome::Attached => {
+                    "VM timed out (hung after attach, before exit)".to_string()
+                }
+                _ => match self.attach.failure_reason() {
+                    Some(reason) => {
+                        format!("VM timed out (hung with no confirmed scheduler attach — {reason})")
+                    }
+                    None => "VM timed out (hung with no confirmed scheduler attach)".to_string(),
+                },
+            });
         }
         // A self-describing guest infra fault outranks the attach/dispatch
         // gates: the guest PID-1 panicked before the scheduler ran (most
@@ -875,16 +905,21 @@ pub fn collect_verifier_output(
     ktstr_bin: &std::path::Path,
     kernel: &std::path::Path,
     extra_sched_args: &[String],
-    topology: crate::test_support::TopologyJson,
+    topology: crate::vmm::topology::Topology,
+    forced_cpu_budget: Option<u32>,
 ) -> anyhow::Result<VerifierVmResult> {
     use anyhow::Context;
 
-    // Pre-validate via TryFrom so a clean "topology rejected" error
-    // surfaces here instead of the builder's Topology::new panic on
-    // bad input.
-    let validated: crate::vmm::topology::Topology = topology
-        .try_into()
-        .map_err(|e: String| anyhow::anyhow!("invalid topology {topology:?}: {e}"))?;
+    // Take the Topology directly (not the lossy TopologyJson wire shape,
+    // which drops `nodes` / `distances` / `llc_cores`): a preset like
+    // uneven-11llc carries per-LLC core counts that MUST reach the guest
+    // CPUID synthesis, so round-tripping through TopologyJson here would
+    // silently boot a uniform shape instead. Validate directly so a bad
+    // topology surfaces a clean error instead of the builder's panic.
+    let validated = topology;
+    validated
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid topology {validated:?}: {e}"))?;
 
     let sched_args: Vec<String> = extra_sched_args.to_vec();
 
@@ -927,7 +962,7 @@ pub fn collect_verifier_output(
     // builder and `run` consumes the boot. Every other failure returns
     // on the first attempt — the retry keys strictly on the marker.
     let result = crate::test_support::run_vm_with_ap_gap_retry(|| {
-        let vm = crate::vmm::KtstrVm::builder()
+        let mut builder = crate::vmm::KtstrVm::builder()
             .kernel(kernel)
             // Prebuilt distro kernels ship virtio as modules; embed the
             // ordered boot-module set from the cache entry (no-op for built
@@ -945,9 +980,11 @@ pub fn collect_verifier_output(
             .topology(validated)
             .memory_deferred_min(memory_min_mib)
             // Timeout mirrors the `#[ktstr_test]` path's shape: a flat
-            // lifecycle base plus oversubscription-scaled boot headroom
-            // (`vm_timeout_from_entry`'s split), so a wide cell booting
-            // slowly under CI concurrency is not killed mid-attach.
+            // lifecycle base plus vCPU-scaled dead-man boot headroom
+            // (`vm_timeout_from_entry`'s split). This is only Tier-3 —
+            // the progress watchdog governs wedges, and a wide cell
+            // booting slowly under CI concurrency is progress-protected
+            // rather than deadline-raced.
             // `workload_duration` arms the watchdog's attach reset: a
             // slow boot cannot eat the probe/teardown budget (the reset
             // is extend-only).
@@ -955,9 +992,26 @@ pub fn collect_verifier_output(
                 validated.total_cpus(),
             ))
             .workload_duration(crate::test_support::runtime::VERIFIER_WORKLOAD_BUDGET)
-            .no_perf_mode(true)
-            .build()
-            .context("build verifier VM")?;
+            .no_perf_mode(true);
+        // A preset with a forced CPU budget (uneven-11llc) pins the
+        // no-perf mask to that many host CPUs so its vCPUs ALWAYS
+        // overcommit — the deliberate, continuous time-slicing path.
+        // Absent (every stock preset) leaves budget auto-sized to the
+        // vCPU count, unchanged. no_perf_mode is already set above, so
+        // cpu_budget is on its valid path.
+        //
+        // Clamp to the host's allowed CPUs: the forced budget exists to
+        // FORCE overcommit, so on a host smaller than the budget it must
+        // COLLAPSE to what is available (deeper overcommit — e.g. 192
+        // vCPUs over 64 CPUs = 3x on this dev box) rather than hard-error
+        // the way an explicit per-test `cpu_budget` would. That collapse
+        // is the intended, storm-validated behavior. `.max(1)` guards the
+        // barely-runnable host whose allowed set reads empty.
+        if let Some(budget) = forced_cpu_budget {
+            let allowed = crate::vmm::host_topology::host_allowed_cpus().len().max(1) as u32;
+            builder = builder.cpu_budget(budget.min(allowed));
+        }
+        let vm = builder.build().context("build verifier VM")?;
 
         vm.run().context("run verifier VM")
     })?;
@@ -1009,6 +1063,13 @@ pub fn collect_verifier_output(
         dispatched,
         timed_out: result.timed_out,
         crash_message: result.crash_message.clone(),
+        // Host-side vCPU dilation, derived from the run's raw schedstat
+        // totals. `None` when schedstats were unavailable or no vCPU was
+        // sampled — carried through untouched, never gating the verdict.
+        dilation: result
+            .host_vcpu_schedstat
+            .as_ref()
+            .and_then(|s| s.dilation()),
     })
 }
 
@@ -1114,6 +1175,20 @@ pub fn format_verifier_output(label: &str, result: &VerifierVmResult, raw: bool)
             }
             Some(reason) => out.push_str(&format!("  scheduler: NOT ATTACHED — {reason}\n")),
         }
+    }
+    // Host-side vCPU scheduling dilation. `D = 1 + run_delay/on_cpu`, so
+    // the fraction of the CPU the vCPUs actually received when runnable is
+    // `on_cpu/(on_cpu+run_delay) == 1/D` exactly — rendered as a whole
+    // percent. `None` (schedstats off / nothing sampled) is stated as
+    // such, distinct from a genuine 1.00x.
+    match result.dilation {
+        Some(d) => {
+            let pct = (100.0 / d).round() as u32;
+            out.push_str(&format!(
+                "  host dilation: {d:.2}x (vCPUs received {pct}% of the CPU they were runnable for)\n"
+            ));
+        }
+        None => out.push_str("  host dilation: n/a (host schedstat unavailable)\n"),
     }
     for ps in &result.stats {
         out.push_str(&format!(
@@ -1252,7 +1327,10 @@ pub fn format_verifier_diff(
 /// (scheduler, kernel, topology): the verifier sweeps each declared
 /// scheduler across topologies, so topology IS a result axis — a
 /// scheduler can pass on one topology and fail on another.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+// No `Eq`: the `dilation: Option<f64>` field carries an `f64`, which is
+// `PartialEq` but not `Eq` (NaN). Record equality is only used in tests
+// (`assert_eq!` on built records), for which `PartialEq` suffices.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VerifierCellRecord {
     /// Declared scheduler name (the `<sched>` cell-name segment).
     pub scheduler: String,
@@ -1270,6 +1348,16 @@ pub struct VerifierCellRecord {
     /// kernel, cell = the count summarized across topologies) that the
     /// dispatcher prints before the PASS/FAIL grids.
     pub stats: Vec<ProgStats>,
+    /// Host-side vCPU scheduling dilation for the cell's VM run
+    /// (`D = 1 + Σrun_delay/Σon_cpu`), copied from
+    /// [`VerifierVmResult::dilation`]. `None` when host schedstats were
+    /// unavailable or no vCPU was sampled. Rendered inside the glyph
+    /// cell of [`render_result_table`]; observational only, never part
+    /// of the pass/fail decision. `#[serde(default)]` so records written
+    /// by an older cell binary (no `dilation` key) still deserialize —
+    /// the dispatcher and cells can skew across a rolling upgrade.
+    #[serde(default)]
+    pub dilation: Option<f64>,
 }
 
 /// Map a cell's full name to a filesystem-safe record filename: every
@@ -1303,6 +1391,7 @@ pub(crate) fn write_cell_record(
     full_name: &str,
     passed: bool,
     stats: &[ProgStats],
+    dilation: Option<f64>,
 ) {
     let Some(rest) = full_name.strip_prefix("verifier/") else {
         return;
@@ -1317,6 +1406,7 @@ pub(crate) fn write_cell_record(
         topology: parts[2].to_string(),
         passed,
         stats: stats.to_vec(),
+        dilation,
     };
     let path = dir.join(cell_record_filename(full_name));
     match serde_json::to_vec(&record) {
@@ -1516,6 +1606,11 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
     // triple passed. Normally one record per triple; a defensive
     // duplicate carrying any fail flips the cell to FAIL.
     let mut agg: BTreeMap<String, BTreeMap<(String, String), bool>> = BTreeMap::new();
+    // scheduler -> (topology, kernel) -> MAX host dilation across the
+    // triple's records. A duplicate fold keeps the highest (worst)
+    // dilation; `None` throughout means no record reported one (host
+    // schedstats unavailable) -> the cell renders the glyph alone.
+    let mut agg_dil: BTreeMap<String, BTreeMap<(String, String), Option<f64>>> = BTreeMap::new();
     for r in records {
         schedulers.insert(r.scheduler.clone());
         sched_rows
@@ -1532,6 +1627,14 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
             .entry((r.topology.clone(), r.kernel.clone()))
             .or_insert(true);
         *all_passed &= r.passed;
+        let dil = agg_dil
+            .entry(r.scheduler.clone())
+            .or_default()
+            .entry((r.topology.clone(), r.kernel.clone()))
+            .or_insert(None);
+        if let Some(d) = r.dilation {
+            *dil = Some(dil.map_or(d, |cur| cur.max(d)));
+        }
     }
 
     let mut out =
@@ -1550,19 +1653,31 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
         for topo in rows {
             let mut line: Vec<comfy_table::Cell> = vec![comfy_table::Cell::new(topo)];
             for kernel in cols {
+                // Max host dilation for this (topology, kernel) cell, if
+                // any record reported one. Rendered INSIDE the glyph cell
+                // (`✓  1.03`) so the number rides along with the verdict
+                // without adding a column; `None` -> glyph alone.
+                let dil = agg_dil[sched]
+                    .get(&(topo.clone(), kernel.clone()))
+                    .copied()
+                    .flatten();
+                let with_dil = |glyph: &str| match dil {
+                    Some(d) => format!("{glyph}  {d:.2}"),
+                    None => glyph.to_string(),
+                };
                 // An entry only exists with >= 1 record; `true` means
                 // every record passed, `false` means at least one failed.
                 let cell = match cells.get(&(topo.clone(), kernel.clone())).copied() {
                     None => comfy_table::Cell::new("-"),
                     Some(true) => {
                         n_pass += 1;
-                        comfy_table::Cell::new("✓")
+                        comfy_table::Cell::new(with_dil("✓"))
                             .fg(comfy_table::Color::Green)
                             .add_attribute(comfy_table::Attribute::Bold)
                     }
                     Some(false) => {
                         n_fail += 1;
-                        comfy_table::Cell::new("✗")
+                        comfy_table::Cell::new(with_dil("✗"))
                             .fg(comfy_table::Color::Red)
                             .add_attribute(comfy_table::Attribute::Bold)
                     }
@@ -1702,11 +1817,11 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mk temp dir");
         // Malformed: no verifier/ prefix, and a 2-segment name (no
         // <preset> after the kernel) — both skipped.
-        write_cell_record(&dir, "not_a_cell", true, &[]);
-        write_cell_record(&dir, "verifier/only/two", true, &[]);
+        write_cell_record(&dir, "not_a_cell", true, &[], None);
+        write_cell_record(&dir, "verifier/only/two", true, &[], None);
         // Well-formed cell: fail, then a retry passes -> overwrites.
         let name = "verifier/scx_a/kernel_6_14/tiny-1llc";
-        write_cell_record(&dir, name, false, &[]);
+        write_cell_record(&dir, name, false, &[], None);
         // The retry passes and carries per-program verified_insns, so the
         // final record has both the PASS outcome and the stats.
         let stats = [
@@ -1719,7 +1834,7 @@ mod tests {
                 verified_insns: 123,
             },
         ];
-        write_cell_record(&dir, name, true, &stats);
+        write_cell_record(&dir, name, true, &stats, Some(1.05));
         let recs = read_cell_records(&dir);
         assert_eq!(
             recs.len(),
@@ -1736,6 +1851,9 @@ mod tests {
         // Per-program verified_insns survive the JSON roundtrip and reflect
         // the final (retry) write, not the earlier stat-less fail.
         assert_eq!(recs[0].stats, stats, "stats roundtrip via serde");
+        // Host dilation survives the JSON roundtrip and reflects the final
+        // (retry) write.
+        assert_eq!(recs[0].dilation, Some(1.05), "dilation roundtrip via serde");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1759,12 +1877,16 @@ mod tests {
         let recs = vec![
             // scx_a across two kernels and two topologies; the
             // (large-4llc, kernel_6_15) cell has no record -> `-`.
+            // scx_a's cells all lack a dilation sample (None) -> each
+            // renders the glyph alone, so its whole section carries no
+            // decimal number (the None-rendering case).
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_14".into(),
                 topology: "tiny-1llc".into(),
                 passed: true,
                 stats: vec![],
+                dilation: None,
             },
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
@@ -1772,6 +1894,7 @@ mod tests {
                 topology: "tiny-1llc".into(),
                 passed: false,
                 stats: vec![],
+                dilation: None,
             },
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
@@ -1779,15 +1902,19 @@ mod tests {
                 topology: "large-4llc".into(),
                 passed: true,
                 stats: vec![],
+                dilation: None,
             },
             // scx_b: a duplicate (scheduler, kernel, topology) triple with
-            // one pass AND one fail -> ✗ (any failure means failure).
+            // one pass AND one fail -> ✗ (any failure means failure). The
+            // two records also carry different dilations (1.10 and 1.40);
+            // the fold keeps the MAX (1.40), rendered in-glyph.
             VerifierCellRecord {
                 scheduler: "scx_b".into(),
                 kernel: "kernel_6_14".into(),
                 topology: "tiny-1llc".into(),
                 passed: true,
                 stats: vec![],
+                dilation: Some(1.10),
             },
             VerifierCellRecord {
                 scheduler: "scx_b".into(),
@@ -1795,6 +1922,7 @@ mod tests {
                 topology: "tiny-1llc".into(),
                 passed: false,
                 stats: vec![],
+                dilation: Some(1.40),
             },
         ];
         let out = render_result_table(&recs).expect("non-empty records -> Some");
@@ -1863,6 +1991,25 @@ mod tests {
             b_tiny.contains('✗') && !b_tiny.contains('✓'),
             "a pass+fail duplicate-record cell renders ✗: {b_tiny}"
         );
+        // Host dilation rides INSIDE the glyph cell. scx_a's cells are all
+        // dilation-None -> glyph alone, so no decimal number appears in
+        // its section (kernel labels / topology names / the tally carry
+        // no '.').
+        assert!(
+            !a_sec.contains('.'),
+            "None-dilation cells render the glyph alone, no number: {a_sec}"
+        );
+        // scx_b's duplicate (pass+fail) triple folds to one ✗ cell whose
+        // in-glyph dilation is the MAX across the folded records — 1.40,
+        // not the lower 1.10 — keeping the ✓/✗ styling around it.
+        assert!(
+            b_sec.contains("✗  1.40"),
+            "folded fail cell shows the max dilation in-glyph: {b_sec}"
+        );
+        assert!(
+            !b_sec.contains("1.10"),
+            "duplicate fold keeps the max dilation, drops the lower: {b_sec}"
+        );
         // Emoji stay OFF the grid rows (they drift box-drawing columns in
         // GitHub's log viewer); the retired glyphs and flat list are gone.
         for row in out.lines().filter(|l| l.contains('│')) {
@@ -1905,6 +2052,7 @@ mod tests {
                         verified_insns: 64,
                     },
                 ],
+                dilation: None,
             },
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
@@ -1921,6 +2069,7 @@ mod tests {
                         verified_insns: 64,
                     },
                 ],
+                dilation: None,
             },
             // scx_a / kernel_6_15: ktstr_dispatch DIFFERS across topologies
             // -> `lo..hi` range; ktstr_enqueue is absent on this kernel
@@ -1934,6 +2083,7 @@ mod tests {
                     name: "ktstr_dispatch".into(),
                     verified_insns: 130,
                 }],
+                dilation: None,
             },
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
@@ -1944,6 +2094,7 @@ mod tests {
                     name: "ktstr_dispatch".into(),
                     verified_insns: 150,
                 }],
+                dilation: None,
             },
             // scx_b: a separate section (its own declaration).
             VerifierCellRecord {
@@ -1955,6 +2106,7 @@ mod tests {
                     name: "ktstr_dispatch".into(),
                     verified_insns: 200,
                 }],
+                dilation: None,
             },
             // scx_a / kernel_6_16: a record but NO stats — every cell died
             // during BPF load, so no program existed to introspect. It must
@@ -1965,6 +2117,7 @@ mod tests {
                 topology: "tiny".into(),
                 passed: false,
                 stats: vec![],
+                dilation: None,
             },
         ];
         let out = render_instruction_count_tables(&recs).expect("stats present -> Some");
@@ -2038,6 +2191,7 @@ mod tests {
             topology: "tiny".into(),
             passed: false,
             stats: vec![],
+            dilation: None,
         }];
         assert!(
             render_instruction_count_tables(&bare).is_none(),
@@ -2351,6 +2505,7 @@ mod tests {
             dispatched,
             timed_out,
             crash_message: None,
+            dilation: None,
         };
 
         // Verified + attached + dispatched, no hang -> PASS.
@@ -2381,10 +2536,50 @@ mod tests {
         );
 
         // timed_out wins over everything, even a clean attach + dispatch.
+        // With a CONFIRMED attach the historical post-attach wording is
+        // preserved verbatim.
         let hung = base(AttachOutcome::Attached, true, true).cell_verdict();
+        assert_eq!(
+            hung,
+            Err("VM timed out (hung after attach, before exit)".to_string()),
+            "timed_out + Attached keeps the exact post-attach message: {hung:?}",
+        );
+
+        // A hang WITHOUT a confirmed attach (scheduler died / never
+        // reached `enabled` / unconfirmed during BPF load, then wedged)
+        // must NOT claim "after attach": it says the timeout carried no
+        // confirmed attach and folds in the attach failure reason, while
+        // still containing the "timed out" substring the gate-order
+        // machinery keys on.
+        for attach in [
+            AttachOutcome::Died,
+            AttachOutcome::NotAttached(String::new()),
+            AttachOutcome::NotAttached("sysfs absent".to_string()),
+            AttachOutcome::Unconfirmed,
+        ] {
+            let verdict = base(attach.clone(), false, true).cell_verdict();
+            let msg = verdict.as_ref().unwrap_err();
+            assert!(
+                msg.contains("timed out"),
+                "timeout must keep the 'timed out' substring for {attach:?}: {verdict:?}",
+            );
+            assert!(
+                msg.contains("no confirmed scheduler attach"),
+                "un-attached timeout must say so for {attach:?}: {verdict:?}",
+            );
+            assert!(
+                !msg.contains("hung after attach"),
+                "un-attached timeout must not claim post-attach for {attach:?}: {verdict:?}",
+            );
+        }
+
+        // timed_out still outranks the crash_message gate.
+        let mut hung_crash = base(AttachOutcome::Died, false, true);
+        hung_crash.crash_message = Some("PANIC: guest infra fault".to_string());
+        let verdict = hung_crash.cell_verdict();
         assert!(
-            hung.as_ref().unwrap_err().contains("timed out"),
-            "timed_out must win: {hung:?}",
+            verdict.as_ref().unwrap_err().contains("timed out"),
+            "timed_out must outrank crash_message: {verdict:?}",
         );
 
         // Attach failure outranks a co-present dispatch failure (root
@@ -2458,6 +2653,7 @@ mod tests {
             dispatched: false,
             timed_out: true,
             crash_message: None,
+            dilation: None,
         };
         let out = format_verifier_output("verifier", &result, false);
         assert!(
@@ -2486,6 +2682,7 @@ mod tests {
             dispatched: false,
             timed_out: false,
             crash_message: None,
+            dilation: None,
         };
         let out = format_verifier_output("verifier", &result, false);
         assert!(
@@ -3341,6 +3538,7 @@ tail\n";
             dispatched: false,
             timed_out: true,
             crash_message: None,
+            dilation: None,
         };
         let out = format_verifier_output("verifier", &result, false);
         assert!(
@@ -3373,6 +3571,7 @@ tail\n";
             dispatched: false,
             timed_out: false,
             crash_message: None,
+            dilation: None,
         };
         // Live stderr arrived, live stdout empty: the merged dump (same
         // bytes as stderr here) must NOT render on stdout.
@@ -3405,6 +3604,7 @@ tail\n";
             dispatched: true,
             timed_out: false,
             crash_message: None,
+            dilation: None,
         };
         assert_eq!(
             format_verifier_stderr("verifier", &empty, false),
@@ -3427,6 +3627,7 @@ tail\n";
             dispatched: false,
             timed_out: false,
             crash_message: None,
+            dilation: None,
         };
         let s = format_verifier_stderr("verifier", &with_err, false);
         assert!(
@@ -3475,6 +3676,7 @@ tail\n";
             dispatched: true,
             timed_out: false,
             crash_message: None,
+            dilation: None,
         };
         insta::assert_snapshot!(format_verifier_output("default", &result, false));
     }
@@ -3501,6 +3703,7 @@ processed 42 insns (limit 1000000) max_states_per_insn 1 total_states 10 peak_st
             dispatched: false,
             timed_out: false,
             crash_message: None,
+            dilation: None,
         };
         insta::assert_snapshot!(format_verifier_output("llc+steal", &result, false));
     }

@@ -329,6 +329,35 @@ pub(crate) fn accessor_ready_latch() -> Arc<Latch> {
         .clone()
 }
 
+/// Shared `periodic_prereqs_ready` latch — fired by `hvc0_poll_loop` on
+/// [`crate::vmm::virtio_console::SIGNAL_PERIODIC_READY`], awaited by the
+/// dispatch path before `send_scenario_start` when the run declares
+/// periodic captures (`KTSTR_AWAIT_PERIODIC_READY=1`). Mirrors
+/// [`ACCESSOR_READY_LATCH`] but carries the KASLR-inclusive prereq
+/// state so the capture window opens only once ALL prereqs hold.
+static PERIODIC_PREREQS_READY_LATCH: OnceLock<Arc<Latch>> = OnceLock::new();
+
+/// Lazily materialise and return the shared `periodic_prereqs_ready`
+/// latch. Mirrors [`accessor_ready_latch`].
+pub(crate) fn periodic_prereqs_ready_latch() -> Arc<Latch> {
+    PERIODIC_PREREQS_READY_LATCH
+        .get_or_init(|| Arc::new(Latch::new()))
+        .clone()
+}
+
+/// Shared wprof-artifact acknowledgement latch. The host fires this only
+/// after it has drained the terminal trace frame and, for auto-repro, the
+/// probe payload terminator. Guest init waits after probe finalisation and
+/// before reboot, so the wait is outside the measured scenario and adds no
+/// workload wakeups.
+static WPROF_ARTIFACTS_RECEIVED_LATCH: OnceLock<Arc<Latch>> = OnceLock::new();
+
+pub(crate) fn wprof_artifacts_received_latch() -> Arc<Latch> {
+    WPROF_ARTIFACTS_RECEIVED_LATCH
+        .get_or_init(|| Arc::new(Latch::new()))
+        .clone()
+}
+
 /// Start the hvc0 wake-byte poll loop.
 ///
 /// Spawns a background thread that polls `/dev/hvc0` for host→guest
@@ -533,6 +562,12 @@ fn hvc0_poll_loop(
         }
         if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_ACCESSOR_READY) {
             accessor_ready_latch().set();
+        }
+        if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_PERIODIC_READY) {
+            periodic_prereqs_ready_latch().set();
+        }
+        if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_WPROF_ARTIFACTS_RECEIVED) {
+            wprof_artifacts_received_latch().set();
         }
         if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_VC_SHUTDOWN) {
             tracing::info!("ktstr-init: shutdown request received, draining");

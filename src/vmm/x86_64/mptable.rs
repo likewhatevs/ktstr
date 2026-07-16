@@ -216,6 +216,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         setup_mptable(&mem, &topo).unwrap();
         // Verify MP floating pointer magic
@@ -235,6 +236,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         setup_mptable(&mem, &topo).unwrap();
         let mut magic = [0u8; 4];
@@ -259,6 +261,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         setup_mptable(&mem, &topo).unwrap();
         let mut mpf = [0u8; 16];
@@ -278,6 +281,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         setup_mptable(&mem, &topo).unwrap();
 
@@ -305,6 +309,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         setup_mptable(&mem, &topo).unwrap();
 
@@ -331,6 +336,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         setup_mptable(&mem, &topo).unwrap();
 
@@ -359,6 +365,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert_eq!(topo.total_cpus(), 240);
         // max APIC ID = apic_id(239) = 14<<4 | 7<<1 | 1 = 239 <= 254, so the
@@ -385,6 +392,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert!(max_apic_id(&at_limit) <= MAX_XAPIC_ID);
         assert!(mptable_applies(&at_limit));
@@ -397,6 +405,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert!(max_apic_id(&wide) > MAX_XAPIC_ID);
         assert!(!mptable_applies(&wide));
@@ -416,6 +425,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert_eq!(topo.total_cpus(), 252);
         assert!(max_apic_id(&topo) > MAX_XAPIC_ID);

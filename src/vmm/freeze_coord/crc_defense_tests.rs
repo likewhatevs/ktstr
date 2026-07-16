@@ -61,12 +61,16 @@ struct SinkState {
     kern_phys_base_evt: EventFd,
     kern_virt_kaslr: Arc<AtomicU64>,
     kern_virt_kaslr_evt: EventFd,
+    kern_addrs_frames: AtomicU64,
+    kern_addrs_crc_bad: AtomicU64,
+    unknown_type_frames: AtomicU64,
     watchdog_pause_ns: AtomicU64,
     scenario_start_ns: AtomicU64,
     sched_swap_notify: AtomicBool,
     scenario_pause_cumulative_ns: AtomicU64,
     run_start: Instant,
     current_step: Arc<AtomicU16>,
+    periodic_guest_elapsed_ns: AtomicU64,
 }
 
 impl SinkState {
@@ -84,12 +88,16 @@ impl SinkState {
             kern_phys_base_evt: EventFd::new(EFD_NONBLOCK).expect("phys_base eventfd"),
             kern_virt_kaslr: Arc::new(AtomicU64::new(0)),
             kern_virt_kaslr_evt: EventFd::new(EFD_NONBLOCK).expect("virt_kaslr eventfd"),
+            kern_addrs_frames: AtomicU64::new(0),
+            kern_addrs_crc_bad: AtomicU64::new(0),
+            unknown_type_frames: AtomicU64::new(0),
             watchdog_pause_ns: AtomicU64::new(0),
             scenario_start_ns: AtomicU64::new(0),
             sched_swap_notify: AtomicBool::new(false),
             scenario_pause_cumulative_ns: AtomicU64::new(0),
             run_start: Instant::now(),
             current_step: Arc::new(AtomicU16::new(0)),
+            periodic_guest_elapsed_ns: AtomicU64::new(0),
         }
     }
 
@@ -99,6 +107,7 @@ impl SinkState {
             kill_evt: &self.kill_evt,
             run_is_wprof: self.run_is_wprof,
             sys_rdy_evt: &mut self.sys_rdy_evt,
+            bpf_map_write_ready_evt: None,
             snapshot_requests_pending: &mut self.snapshot_requests_pending,
             kernel_op_requests_pending: &mut self.kernel_op_requests_pending,
             kern_phys_base: &self.kern_phys_base,
@@ -106,6 +115,9 @@ impl SinkState {
             kern_virt_kaslr: &self.kern_virt_kaslr,
             kern_virt_kaslr_evt: &self.kern_virt_kaslr_evt,
             kernel_text_link_kva: 0,
+            kern_addrs_frames: &self.kern_addrs_frames,
+            kern_addrs_crc_bad: &self.kern_addrs_crc_bad,
+            unknown_type_frames: &self.unknown_type_frames,
             watchdog_reset: None,
             watchdog_pause_ns: &self.watchdog_pause_ns,
             scenario_start_ns: &self.scenario_start_ns,
@@ -113,6 +125,14 @@ impl SinkState {
             scenario_pause_cumulative_ns: &self.scenario_pause_cumulative_ns,
             run_start: self.run_start,
             current_step: &self.current_step,
+            periodic_guest_elapsed_ns: &self.periodic_guest_elapsed_ns,
+            // No ledger wired: these CRC-gate fixtures do not assert
+            // lifecycle-stage side effects, so every advance site no-ops.
+            progress_ledger: None,
+            contention_recorder: None,
+            // No expected build-id: the KERN_BUILD_ID arm's check is
+            // disabled (a `None` expectation never flags a mismatch).
+            expected_kernel_build_id: None,
         }
     }
 }

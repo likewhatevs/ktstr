@@ -1,15 +1,24 @@
 use anyhow::{Context, Result};
 use kvm_bindings::{
     KVM_ARM_VCPU_PMU_V3_CTRL, KVM_ARM_VCPU_PMU_V3_INIT, KVM_ARM_VCPU_PMU_V3_IRQ,
-    KVM_ARM_VCPU_PVTIME_CTRL, KVM_ARM_VCPU_PVTIME_IPA, KVM_DEV_ARM_VGIC_CTRL_INIT,
-    KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_DEV_ARM_VGIC_GRP_CTRL, KVM_DEV_ARM_VGIC_GRP_NR_IRQS,
-    KVM_IRQ_ROUTING_IRQCHIP, KVM_VGIC_V3_ADDR_TYPE_DIST, KVM_VGIC_V3_ADDR_TYPE_REDIST,
-    KvmIrqRouting, kvm_create_device, kvm_device_attr, kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3,
-    kvm_irq_routing_entry, kvm_irq_routing_entry__bindgen_ty_1, kvm_irq_routing_irqchip,
+    KVM_ARM_VCPU_PVTIME_CTRL, KVM_ARM_VCPU_PVTIME_IPA, KVM_CAP_HALT_POLL,
+    KVM_DEV_ARM_VGIC_CTRL_INIT, KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_DEV_ARM_VGIC_GRP_CTRL,
+    KVM_DEV_ARM_VGIC_GRP_NR_IRQS, KVM_IRQ_ROUTING_IRQCHIP, KVM_VGIC_V3_ADDR_TYPE_DIST,
+    KVM_VGIC_V3_ADDR_TYPE_REDIST, KvmIrqRouting, kvm_create_device, kvm_device_attr,
+    kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3, kvm_enable_cap, kvm_irq_routing_entry,
+    kvm_irq_routing_entry__bindgen_ty_1, kvm_irq_routing_irqchip,
 };
 use kvm_ioctls::{Cap, DeviceFd, Kvm, VcpuFd, VmFd};
 use std::mem::ManuallyDrop;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
+use vmm_sys_util::ioctl_iow_nr;
+
+// `kvm_ioctls::VmFd::enable_cap` is cfg-gated to x86_64/s390x/powerpc even
+// though `KVM_ENABLE_CAP` on a VM fd is "Architectures: all" in the kernel
+// (Documentation/virt/kvm/api.rst 7.x; include/uapi/linux/kvm.h:
+// `_IOW(KVMIO, 0xa3, struct kvm_enable_cap)`), so arm64 issues the ioctl
+// directly — same raw-ioctl pattern as `kvm_stats::KVM_GET_STATS_FD`.
+ioctl_iow_nr!(KVM_ENABLE_CAP_VM, kvm_bindings::KVMIO, 0xa3, kvm_enable_cap);
 
 use crate::vmm::numa_mem::{NumaMemoryLayout, ReservationGuard};
 use crate::vmm::topology::Topology;
@@ -235,6 +244,43 @@ impl KtstrKvm {
         Ok(())
     }
 
+    /// Set the per-VM halt-poll interval via `KVM_CAP_HALT_POLL`.
+    ///
+    /// Called from `KtstrVm::run` after `acquire_run_locks` resolves the
+    /// mode/outcome the policy keys on (see `KtstrVm::halt_poll_policy`).
+    /// `KVM_CAP_HALT_POLL` is a VM-target capability, "Architectures: all",
+    /// settable at any time per the KVM API (Documentation/virt/kvm/api.rst,
+    /// 7.20), so setting it post-vCPU-create is valid on arm64 as on x86. A
+    /// `halt_poll_ns` of 0 disables host halt polling for this VM.
+    ///
+    /// Best-effort: a host without the cap warns once and continues on the
+    /// module default rather than failing the run.
+    pub(crate) fn set_halt_poll(&self, halt_poll_ns: u64) {
+        let mut cap = kvm_enable_cap {
+            cap: KVM_CAP_HALT_POLL,
+            ..Default::default()
+        };
+        cap.args[0] = halt_poll_ns;
+        // Raw ioctl: `VmFd::enable_cap` is not exposed on aarch64 by
+        // kvm-ioctls (cfg-gated to x86_64/s390x/powerpc) though the VM-fd
+        // ioctl itself is architecture-generic — see the
+        // `KVM_ENABLE_CAP_VM` definition at the top of this file.
+        // SAFETY: `vm_fd` is a live KVM VM fd for the whole `&self` borrow;
+        // `cap` is a properly initialized `kvm_enable_cap` matching the
+        // ioctl's write-only argument struct.
+        let ret =
+            unsafe { vmm_sys_util::ioctl::ioctl_with_ref(&*self.vm_fd, KVM_ENABLE_CAP_VM(), &cap) };
+        if ret < 0 {
+            let e = std::io::Error::last_os_error();
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "kvm: WARNING: KVM_CAP_HALT_POLL not supported ({e}), using kernel default"
+                );
+            });
+        }
+    }
+
     fn new_inner(
         topo: Topology,
         memory_mib: Option<u32>,
@@ -374,10 +420,18 @@ impl KtstrKvm {
             vcpus.push(vcpu);
         }
 
-        // Override CLIDR_EL1 on each vCPU to match the host's real
-        // cache topology. Must happen after vcpu_init and before FDT
-        // creation so CLIDR and DT cache nodes agree on leaf counts.
-        super::topology::override_clidr(&vcpus)
+        // Override CLIDR_EL1 on each vCPU to match the host's real cache
+        // topology. Must happen after vcpu_init and before FDT creation so
+        // CLIDR and DT cache nodes agree on leaf counts. Multi-LLC guests
+        // present their LLC as L3 (the FDT chain terminates at level 3), so
+        // cap CLIDR at 3 levels; single-LLC guests emit no DT cache chain
+        // and keep the host's real level count.
+        let clidr_max_level = if topo.llcs > 1 {
+            super::fdt::GUEST_LLC_CACHE_LEVEL
+        } else {
+            super::topology::MAX_CACHE_LEVEL
+        };
+        super::topology::override_clidr(&vcpus, clidr_max_level)
             .context("override CLIDR_EL1 to match host cache topology")?;
 
         // Create GICv3 via KVM_CREATE_DEVICE.
@@ -636,6 +690,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 128, false);
         assert!(vm.is_ok(), "VM creation failed: {:?}", vm.err());
@@ -652,6 +707,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 256, false);
         assert!(vm.is_ok(), "multi-LLC VM creation failed: {:?}", vm.err());
@@ -668,6 +724,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 64, false);
         assert!(vm.is_ok());
@@ -684,6 +741,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 256, false).unwrap();
         let total: u64 = vm.guest_mem.iter().map(|r| r.len()).sum();
@@ -700,6 +758,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         let region = vm.guest_mem.iter().next().unwrap();
@@ -719,6 +778,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         assert!(vm.has_immediate_exit);
@@ -781,6 +841,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert_eq!(topo.total_cpus(), MAX_VCPUS + 1);
         // `let Err` rather than `expect_err` (which needs the Ok type

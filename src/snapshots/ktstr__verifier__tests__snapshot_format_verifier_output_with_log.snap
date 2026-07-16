@@ -1,10 +1,12 @@
 ---
 source: src/verifier.rs
+assertion_line: 3690
 expression: "format_verifier_output(\"llc+steal\", &result, false)"
 ---
 
 llc+steal
   scheduler: NOT ATTACHED — scheduler process exited during BPF load/startup
+  host dilation: n/a (host schedstat unavailable)
   enqueue                                  verified_insns=42
 
 llc+steal --- verifier stats ---

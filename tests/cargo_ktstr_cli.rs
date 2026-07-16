@@ -518,17 +518,32 @@ fn shell_invalid_topology() {
 // -- stats --
 
 #[test]
-fn stats_no_data() {
-    // Pin the read path to an empty directory via KTSTR_SIDECAR_DIR
-    // so the test is independent of whatever sits under the
-    // developer's target/ktstr/. Bare `cargo ktstr stats` honors
-    // KTSTR_SIDECAR_DIR (cli::print_stats_report honors it). With nothing
-    // there to read the empty-state notice goes to stderr and
-    // stdout stays clean.
+fn stats_bare_prints_family_help() {
+    // Bare `cargo ktstr stats` no longer auto-dumps the gauntlet
+    // analysis (that moved behind `stats last-run`); it prints the
+    // stats family's help so the verbs are discoverable. Success exit,
+    // and the listing names the analysis verb.
     let tmp = tempfile::tempdir().unwrap();
     cargo_ktstr()
         .env(ktstr::KTSTR_SIDECAR_DIR_ENV, tmp.path())
         .args(["stats"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("last-run"));
+}
+
+#[test]
+fn stats_last_run_no_data() {
+    // Pin the read path to an empty directory via KTSTR_SIDECAR_DIR
+    // so the test is independent of whatever sits under the
+    // developer's target/ktstr/. With nothing there to read, the
+    // empty-state notice goes to stderr and stdout stays clean --
+    // the contract the old bare-`stats` path carried, now on the
+    // last-run verb that inherited the report.
+    let tmp = tempfile::tempdir().unwrap();
+    cargo_ktstr()
+        .env(ktstr::KTSTR_SIDECAR_DIR_ENV, tmp.path())
+        .args(["stats", "last-run"])
         .assert()
         .success()
         .stderr(predicate::str::contains("no sidecar data found"))

@@ -771,6 +771,8 @@ mod tests {
             scheduler: "synth".into(),
             vcpus: 1,
             cpu_budget: 1,
+            host_dilation: None,
+            throughput_denomination: ktstr::test_support::ThroughputDenomination::CpuSec,
             scheduler_commit: None,
             resolve_source: None,
             project_commit: None,

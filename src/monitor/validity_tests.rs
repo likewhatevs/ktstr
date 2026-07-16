@@ -212,7 +212,7 @@ fn sum_event_field_sums_across_cpus() {
 }
 
 #[test]
-fn sum_event_field_mixed_some_none() {
+fn sum_event_field_none_when_any_cpu_is_missing_counters() {
     let s = MonitorSample {
         bpf_map_fields: Vec::new(),
         prog_stats: None,
@@ -229,7 +229,7 @@ fn sum_event_field_mixed_some_none() {
             CpuSnapshot::default(),
         ],
     };
-    assert_eq!(s.sum_event_field(|e| e.dispatch_keep_last), Some(7));
+    assert_eq!(s.sum_event_field(|e| e.dispatch_keep_last), None);
 }
 
 // -- sample_looks_valid tests --

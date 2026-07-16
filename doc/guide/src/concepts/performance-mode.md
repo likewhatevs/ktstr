@@ -108,10 +108,14 @@ A single perf-mode test needs `(llcs * cores * threads) + 1` online
 CPUs and `llcs` free physical LLC groups — the test holds an
 exclusive lock on one host LLC group per virtual LLC for the run's
 duration. To run `K` perf-mode tests concurrently without contention
-skips, the host needs `K * llcs` free LLC groups; with fewer, the
-excess tests skip with `ResourceContention` and nextest retries them
-after a holder releases. The `vm-perf` test group in
-`.config/nextest.toml` caps how many run at once.
+delays, the host needs `K * llcs` free LLC groups; with fewer, the
+excess tests join the lock-dir acquisition queue and proceed as each
+holder releases (progress-based patience: waiting continues as long
+as anything advances). Contention that outlives a zero-progress
+patience window — a wedged holder — surfaces as a retryable
+`ResourceContention` failure that nextest re-runs — never a skip. The
+`vm-perf` test group in `.config/nextest.toml` caps how many run at
+once.
 
 ## Failure modes
 
@@ -128,8 +132,10 @@ for.
   `KTSTR_NO_SKIP_MODE` for runs that demand execution.
 - **`ResourceContention`** — transient: another run holds a lock on
   a needed LLC or CPU (the reason names it, e.g. `LLC 3 busy`).
-  Skips with the same `SKIP:` banner; a retry after the holder
-  finishes succeeds.
+  Acquisition queues and waits for the holder (progress-based
+  patience); only a zero-progress window fails, with a `FAIL:
+  transient resource contention` banner that nextest retries — it is
+  never a skip, so a busy host costs throughput, not coverage.
 - **Warnings (non-fatal)** — insufficient free hugepages (regular
   pages used); high host load (`procs_running` above half the vCPU
   count — results may be noisy); unstable TSC (x86_64, common in
@@ -145,6 +151,7 @@ a hard error, and what the default path does instead — is in
 `performance_mode = false` and routes the run through the budgeted
 coordination path: a shared LLC reservation sized to a CPU budget,
 enforced by a cgroup cpuset instead of pinning — none of the
-isolation features above apply. The mode comparison, the CPU budget,
-and the `--cpu-cap` flag live in
+isolation features above apply. [Run Modes](run-modes.md) sets this mode
+beside the default and performance modes; the CPU budget, the `--cpu-cap`
+flag, and the coordination-mode comparison live in
 [Resource Budget](resource-budget.md#the-three-coordination-modes).

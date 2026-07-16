@@ -475,9 +475,11 @@ fn entry_bare_allow_inconclusive() {
 
 #[test]
 fn entry_bare_ignore_registered() {
+    let entry = ktstr::test_support::find_test("bare_ignore_compile")
+        .expect("bare `ignore` must compile and register the test");
     assert!(
-        ktstr::test_support::find_test("bare_ignore_compile").is_some(),
-        "bare `ignore` must compile and register the test"
+        entry.ignored,
+        "bare `ignore` must mark the custom-harness entry ignored too"
     );
 }
 

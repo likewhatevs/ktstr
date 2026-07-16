@@ -342,9 +342,9 @@ fn claim_better_orients_by_polarity_and_quarantines_unregistered_metrics() {
         "LowerBetter: candidate 60 > baseline 50 is worse -> Fail",
     );
 
-    // HigherBetter (loop_count): candidate better -> Pass.
+    // HigherBetter (loops_per_cpu_sec): candidate better -> Pass.
     let mut v = Verdict::new();
-    v.claim_better(BuiltinMetric::SchbenchLoopCount, 200.0)
+    v.claim_better(BuiltinMetric::SchbenchLoopsPerCpuSec, 200.0)
         .than(100.0);
     assert!(
         v.into_result().is_pass(),

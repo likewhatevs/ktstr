@@ -902,7 +902,7 @@ fn is_deleted_self_returns_false_for_current() {
 
 #[test]
 fn shm_store_load_unlink_roundtrip() {
-    let hash = 0xABCD_EF01_2345_6789u64;
+    let hash = unique_test_shm_hash(0);
     let data = vec![0x42u8; 1024];
     shm_store_base(hash, &data).unwrap();
     let loaded = shm_load_base(hash);
@@ -915,7 +915,7 @@ fn shm_store_load_unlink_roundtrip() {
 
 #[test]
 fn shm_load_nonexistent_returns_none() {
-    let hash = 0xFFFF_FFFF_FFFF_FFFFu64;
+    let hash = unique_test_shm_hash(1);
     shm_unlink_base(hash); // ensure clean
     assert!(shm_load_base(hash).is_none());
 }
@@ -928,7 +928,7 @@ fn shm_store_last_writer_wins_even_with_size_change() {
     // callers to derive the hash from the actual content — this test
     // deliberately uses differently-sized payloads to prove the
     // writer does NOT assume the old name's size is still valid.
-    let hash = 0x1234_5678_9ABC_DEF0u64;
+    let hash = unique_test_shm_hash(2);
     let d1 = vec![0x11u8; 64];
     let d2 = vec![0x22u8; 128];
     shm_store_base(hash, &d1).unwrap();
@@ -951,7 +951,7 @@ fn shm_segment_name_unique_per_hash() {
 #[test]
 fn shm_unlink_nonexistent_is_noop() {
     // Should not panic.
-    shm_unlink_base(0xDEAD_DEAD_DEAD_DEADu64);
+    shm_unlink_base(unique_test_shm_hash(3));
 }
 
 #[test]
@@ -971,7 +971,7 @@ fn shm_load_base_holds_lock_until_drop() {
     // This is the core invariant — if it regresses, shm_store's
     // ftruncate can race with a live reader and cause SIGBUS on
     // the mapped pages.
-    let hash = 0xD0D0_BEEF_F00D_BA5Eu64;
+    let hash = unique_test_shm_hash(4);
     shm_unlink_base(hash); // clean any stale segment
     shm_store_base(hash, &vec![0x55u8; 256]).unwrap();
     let loaded = shm_load_base(hash).expect("load must succeed");
@@ -1022,7 +1022,7 @@ fn shm_store_skips_write_when_reader_holds_lock_sh() {
     // Same-process flock conflict: the reader's fd holds LOCK_SH and
     // shm_store opens a second fd for LOCK_EX; flock(2) treats the two
     // fds independently, so the writer genuinely contends.
-    let hash = 0x5117_F10C_5117_F10Cu64;
+    let hash = unique_test_shm_hash(5);
     shm_unlink_base(hash); // clean any stale segment
 
     let original = [0x55u8; 256];
@@ -1059,7 +1059,7 @@ fn shm_load_lz4_roundtrips_and_rejects_non_lz4() {
     // shm_load_lz4 (the #2 shared loader): round-trips an LZ4-magic
     // segment, and rejects a segment whose first bytes are not the LZ4
     // legacy magic (a stale zstd/gzip segment or a truncated write).
-    let hash = 0x0CA5_E1F2_0CA5_E1F2u64;
+    let hash = unique_test_shm_hash(6);
     let lz4_name = shm_lz4_segment_name(hash);
     let _ = rustix::shm::unlink(lz4_name.as_str()); // clean any stale segment
 

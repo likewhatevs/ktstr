@@ -34,10 +34,13 @@ use super::topo::TopoOverride;
 use super::{KtstrTestEntry, SchedulerSpec, Topology};
 mod kernel;
 mod post_vm;
-pub use post_vm::post_vm_skip;
 pub(crate) use post_vm::{
     ExpectAutoReproSatisfied, HostSkipRequest, PostVmAssertionFailure, SchedulerBuildRefused,
     ScxBpfErrorMatcherMismatch, SurvivesStormViolated, record_skip_sidecar, run_post_vm_callbacks,
+};
+pub use post_vm::{
+    capture_starvation_witness, periodic_starvation_gate, post_vm_skip, stall_ejection_skip,
+    starved_below_minimum_skip,
 };
 mod reporting;
 mod scheduler;
@@ -177,11 +180,13 @@ pub(crate) fn run_ktstr_test_inner(
     if let Err(ref e) = result
         && let Some(host_skip_class) = super::host_skip_class(e)
     {
-        // Late catch-all for a skip-class error (ResourceContention,
-        // TopologyInsufficient, or PerfModeUnavailable) from any early-bail
+        // Late catch-all for a PERMANENT host-incapacity skip-class error
+        // (TopologyInsufficient or PerfModeUnavailable) from any early-bail
         // path before the
         // existing per-site `record_skip_sidecar` calls in
-        // builder.build()/vm.run() arms below. All three predicates walk
+        // builder.build()/vm.run() arms below. ResourceContention is NOT in
+        // this set — `host_skip_class` excludes it, so transient contention
+        // never lands a `.host-skip.json` marker. The predicates walk
         // the FULL `anyhow::Error` chain via `e.chain().any(...)` so an error
         // wrapped in `.context(...)` (e.g. the `"build ktstr_test VM"` and
         // `"run ktstr_test VM"` wrappers in `evaluate_vm_result`) is still
@@ -464,8 +469,8 @@ fn write_placeholder_failure_dump_if_missing(path: &std::path::Path, result: &vm
 /// unit-testable without booting a VM (the sibling `performance_mode` /
 /// `perf_only` skips are env-driven; this one is topology-driven). When
 /// the host cannot run the BOOTED topology (`resolve_vm_topology`, which
-/// honors a gauntlet/CLI preset override) without racing the
-/// oversub-scaled boot watchdog
+/// honors a gauntlet/CLI preset override) without an overcommit so
+/// severe boot cannot complete usefully
 /// ([`super::runtime::overcommit_skip_reason`]), emits the operator SKIP
 /// banner, records the skip sidecar, and returns the skip
 /// [`AssertResult`]; otherwise returns `None` to proceed to boot. Only
@@ -686,8 +691,8 @@ fn run_ktstr_test_inner_impl(
         return Ok(AssertResult::skip(REASON));
     }
     // Auto-skip a default/no-perf overcommit so severe the guest boot
-    // would race even the oversub-scaled host watchdog — the "overcommit
-    // OR auto-skip, never hard-fail" contract. See `overcommit_skip` for
+    // serves no purpose even though the progress watchdog would tolerate
+    // it — the "overcommit OR auto-skip, never hard-fail" contract. See `overcommit_skip` for
     // the full rationale; it skips ONLY the auto-collapse case past
     // `OVERCOMMIT_SKIP_RATIO`, so an explicit `cpu_budget` and the CI
     // ~1.3x case both RUN and are validated here, never masked.
@@ -1510,6 +1515,7 @@ fn run_ktstr_test_inner_impl(
                 | Some(crate::vmm::wire::MsgType::KernelOpRequest)
                 | Some(crate::vmm::wire::MsgType::KernelOpReply)
                 | Some(crate::vmm::wire::MsgType::SysRdy)
+                | Some(crate::vmm::wire::MsgType::BpfMapWriteReady)
                 | Some(crate::vmm::wire::MsgType::SchedSwapNotify) => {}
                 None => {
                     tracing::warn!(
@@ -1615,6 +1621,35 @@ fn run_ktstr_test_inner_impl(
         &repro_fn,
         post_vm_err.as_ref(),
     );
+    // `expect_err` asks the run to prove a failure. When the ONLY blocking
+    // wall-latency failures were demoted because the host-contention witness
+    // can explain them, the run did not prove either the expected failure or
+    // a clean pass: this host could not evaluate the negative assertion.
+    // Project that environmental outcome to SKIP before expect_err inversion.
+    // A confirmed latency failure (or any unrelated failure) remains Err and
+    // follows the ordinary expect_err path. Under KTSTR_NO_SKIP_MODE leave the
+    // contention-indeterminate pass intact, so expect_err promotes it to the
+    // usual hard failure instead of silently accepting a skip.
+    if let Ok(check_result) = &mut eval_result
+        && let Some(skip_reason) =
+            expect_err_contention_indeterminate_skip_reason(entry.expect_err, check_result)
+    {
+        if std::env::var_os(crate::KTSTR_NO_SKIP_MODE_ENV).is_some() {
+            eprintln!(
+                "ktstr: FAIL: {}: {skip_reason} \
+                 [KTSTR_NO_SKIP_MODE: contention skip promoted to fail]",
+                entry.name
+            );
+        } else {
+            crate::report::test_skip(format_args!("{}: {skip_reason}", entry.name));
+            // evaluate_vm_result already persisted the full telemetry-rich
+            // sidecar. Preserve that result (including the contention note,
+            // stats, and measurements) and replace only its terminal outcome;
+            // run_ktstr_test_inner finalizes the existing sidecar to SKIP.
+            check_result.outcomes.clear();
+            check_result.record_skip(skip_reason);
+        }
+    }
     // Reclassify a no-guest-result run that is a contention-caused
     // SchedulerNotAttached — the scheduler enable was still in flight
     // (state=enabling) when the startup budget expired under host
@@ -1962,20 +1997,84 @@ fn evaluate_verdict_folds(
     // `Ok(AssertResult)` (e.g. `Ok(AssertResult::pass())`) before
     // teardown begins, otherwise the budget knob is silently
     // inert.
+    // The budget is a WALL bound on a join/drain sequence (watchdog
+    // join, AP joins, monitor join, bulk drain — see
+    // `VmResult::cleanup_duration`) whose duration under host
+    // saturation is the wake latency of the JOINED threads, not work.
+    //
+    // Evidence-source history, because both prior instruments were
+    // field-falsified:
+    //   - whole-run/per-phase witness D as the demotion signal:
+    //     under-attested (a 7.06 s cleanup failed a 5 s budget at
+    //     whole-run D = 1.21 on a saturated box);
+    //   - the joiner thread's own window schedstat delta
+    //     (`VmResult::cleanup_sched_delta`): measures the WRONG
+    //     threads — every failing arm cell read `run-delay 0.001s,
+    //     D_cleanup=1.00` at 7-9 s measured, because the joiner SLEEPS
+    //     in `join(2)` while the joined vCPUs/APs/monitor (SCHED_OTHER
+    //     on CI) are starved through their exit paths; joiner sleep
+    //     never appears in joiner run-delay. Direct instrumentation of
+    //     the exiting threads is not cleanly possible (their /proc
+    //     task entries vanish mid-window).
+    //
+    // RE-SCOPE to what the assertion can honestly measure: it exists
+    // to catch host-side teardown REGRESSIONS (an added sleep, a busy
+    // drain), and those reproduce on quiet hosts. ENFORCE the budget
+    // only when the whole-run witness attests a QUIET host
+    // (D ≤ 1.1: the captured quiet-host whole-run measurements in
+    // `dilation_validation.md` read ≈ 1.08 at the noisy end, so 1.1
+    // sits just above the measured-quiet spread — any host that
+    // cannot even keep vCPUs at D ≤ 1.1 was carrying load, and wall
+    // in the join window cannot be attributed). Everything else —
+    // contended OR unattested (schedstats off) — demotes to the loud
+    // warning + metric: the measurement and the window-local
+    // instrument's readings stay in both message paths so a
+    // regression hunt on a busy box still has the numbers.
+    const CLEANUP_ENFORCE_QUIET_D_MAX: f64 = 1.1;
     if let (Some(budget), Some(measured)) = (entry.cleanup_budget, result.cleanup_duration)
         && measured > budget
     {
-        check_result.merge(AssertResult::fail(crate::assert::AssertDetail::new(
-            crate::assert::DetailKind::Other,
-            format!(
-                "vm cleanup overran budget: measured {:.3}s, budget {:.3}s. \
-                 Likely a regression in host-side teardown — investigate \
-                 the post-BSP-exit join/drain path \
-                 (`vmm::KtstrVm::collect_results`).",
+        let whole_run_d = result
+            .host_vcpu_schedstat
+            .as_ref()
+            .and_then(|s| s.dilation());
+        let delta = result.cleanup_sched_delta.as_ref();
+        let delay_ns = delta.map(|d| d.total_run_delay_ns).unwrap_or(0);
+        let d_cleanup = delta.and_then(|d| d.dilation());
+        let render_d = |d: Option<f64>| d.map_or("unsampled".to_string(), |d| format!("{d:.2}"));
+        let attested_quiet = whole_run_d.is_some_and(|d| d <= CLEANUP_ENFORCE_QUIET_D_MAX);
+        if attested_quiet {
+            check_result.merge(AssertResult::fail(crate::assert::AssertDetail::new(
+                crate::assert::DetailKind::Other,
+                format!(
+                    "vm cleanup overran budget on an attested-quiet host: \
+                     measured {:.3}s, budget {:.3}s (whole-run D={}, \
+                     joiner-window run-delay {:.3}s, D_cleanup={}). Likely a \
+                     regression in host-side teardown — investigate the \
+                     post-BSP-exit join/drain path \
+                     (`vmm::KtstrVm::collect_results`).",
+                    measured.as_secs_f64(),
+                    budget.as_secs_f64(),
+                    render_d(whole_run_d),
+                    delay_ns as f64 / 1e9,
+                    render_d(d_cleanup),
+                ),
+            )));
+        } else {
+            eprintln!(
+                "vm cleanup overran budget on a non-quiet (or unattested) host: \
+                 measured {:.3}s, budget {:.3}s, whole-run D={}, joiner-window \
+                 run-delay {:.3}s, D_cleanup={} — non-blocking; join/drain wall \
+                 is the JOINED threads' exit-path starvation, which no \
+                 host-side instrument can attribute once they exit. A \
+                 quiet-host (D<={CLEANUP_ENFORCE_QUIET_D_MAX}) overrun fails here.",
                 measured.as_secs_f64(),
                 budget.as_secs_f64(),
-            ),
-        )));
+                render_d(whole_run_d),
+                delay_ns as f64 / 1e9,
+                render_d(d_cleanup),
+            );
+        }
     }
 
     // Reproducer-mode scx_bpf_error matcher. Runs the configured
@@ -2051,26 +2150,17 @@ fn populate_run_stats_and_folded_timeline(
         guest_phase_buckets,
     );
     // Populate the full run-level ext_metrics family (the read_sample registry
-    // metrics, the phase-only fold, the pooled iterations_per_cpu_sec, and the
+    // metrics, the phase-only fold, the pooled iteration_rate, and the
     // Distribution / WorstLowest re-pools) in the canonical order — the SAME
     // sequence VmResult::run_metric self-computes, so an in-test run_metric read
     // matches what the sidecar records. MUST run here: AFTER the cgroup-bearing
     // merges (check_result.stats.cgroups is complete) and the per-cgroup carrier
-    // fold above, BEFORE the sidecar write, and BEFORE the derive_phase_metrics
-    // below — it feeds on the PRE-derive phases (the eval-faithful input shape
-    // VmResult::run_metric reuses; post-derive yields the same map today via the
-    // is_derived skip, but pre-derive avoids depending on it). The trailing
-    // monitor-verdict merge below is verdict-only (inconclusive, empty stats),
-    // so it is safe to follow. See populate_run_ext_all for the step order.
+    // fold above, BEFORE the sidecar write. The helper itself derives the
+    // per-phase scalars before folding the run metrics, so there is no second
+    // derivation pass. The trailing monitor-verdict merge below is verdict-only
+    // (inconclusive, empty stats), so it is safe to follow. See
+    // populate_run_ext_all for the step order.
     crate::assert::populate_run_ext_all(&mut check_result.stats, early_periodic_series);
-    // Per-phase scalars: derive into each phase bucket from the folded per_cgroup
-    // carriers (post-fold, so the merge's is_derived skip can't drop them) — the
-    // non-schbench carrier scalars (every cgroup) into each pc.metrics, and the
-    // schbench scalars into pc.metrics + the pooled bucket.metrics. A no-op only
-    // when no phase carries a per-cgroup carrier. Mirrors the
-    // VmResult::phase_buckets derive so the sidecar / timeline render and the
-    // per-phase A/B claim agree.
-    crate::assert::derive_phase_metrics(&mut check_result.stats.phases);
 
     // POST-fold timeline for this (guest-AssertResult) path: rebuild from
     // the folded `check_result.stats.phases` so the per-cgroup sub-block
@@ -2086,6 +2176,300 @@ fn populate_run_stats_and_folded_timeline(
             &crate::timeline::TimelineContext::default(),
         )
     })
+}
+
+/// Greppable prefix on the `contention-indeterminate` annotation block
+/// [`apply_contention_verdict`] pushes when it demotes a wall-latency
+/// failure the witnessed host contention could explain. Rides both the
+/// [`crate::assert::InfoNote`] stream (sidecar + failure-block `--- info
+/// ---`) and the stderr echo, so a passing-after-demotion run's captured
+/// output still names the demoted gate.
+pub(crate) const CONTENTION_INDETERMINATE_PREFIX: &str = "contention-indeterminate:";
+
+/// Explain why an `expect_err` run whose only latency failures became
+/// contention-indeterminate must skip rather than fail the inversion.
+///
+/// Pure so the boundary is pinned without a VM: ordinary passing runs, tests
+/// without `expect_err`, and results that retain any blocking outcome return
+/// `None`. Only a passing result carrying at least one annotation emitted by
+/// [`apply_contention_verdict`] qualifies. The caller then replaces only the
+/// result's terminal outcomes, preserving its telemetry and notes.
+fn expect_err_contention_indeterminate_skip_reason(
+    expect_err: bool,
+    check_result: &AssertResult,
+) -> Option<String> {
+    if !expect_err || !check_result.is_pass() {
+        return None;
+    }
+    let demoted = check_result
+        .info_notes
+        .iter()
+        .filter(|note| note.message.starts_with(CONTENTION_INDETERMINATE_PREFIX))
+        .count();
+    (demoted > 0).then(|| {
+        format!(
+            "expected wall-latency failure could not be confirmed: {demoted} \
+             latency gate(s) were contention-indeterminate because witnessed \
+             host contention could account for the excess"
+        )
+    })
+}
+
+/// Greppable prefix on the LOUD perf-mode host-isolation-fault verdict
+/// [`apply_contention_verdict`] records for a `performance_mode` cell
+/// whose Body dilation exceeded
+/// [`crate::vmm::freeze_coord::latency_verdict::PERF_ISOLATION_D_MAX`].
+pub(crate) const PERF_ISOLATION_VIOLATED_PREFIX: &str = "perf-mode isolation violated:";
+
+/// Format a ns duration as milliseconds for the contention annotations —
+/// the seam speaks ms because the excess / `W` figures are workload-scale
+/// (tens of ms), where ns is unreadable.
+fn contention_ms(ns: u64) -> String {
+    format!("{:.1}ms", ns as f64 / 1e6)
+}
+
+/// Host-side contention re-evaluation of the guest's wall-latency gate
+/// failures — the seam that consumes the tri-state verdict core
+/// ([`crate::vmm::freeze_coord::latency_verdict`]).
+///
+/// The ns-latency ceilings (`max_p99_wake_latency_ns`) fire IN-GUEST and
+/// stamp their failing [`AssertDetail`](crate::assert::AssertDetail) with
+/// [`LatencyGate`](crate::assert::LatencyGate) evidence; the Body-phase
+/// contention witness lives only HOST-side. This walks
+/// `check_result.outcomes`, and for every failing detail carrying that
+/// evidence, WHEN a witness is present, re-runs `latency_verdict` against
+/// the Body dilation `D` and the peak-window contamination bound
+/// `W(measured)`:
+///
+///   - FailConfirmed → the detail STAYS a failure; its message gains a
+///     `(contention-checked: excess X > W Y — no witnessed host
+///     contention explains it)` note.
+///   - ContentionIndeterminatePass → USER RULING: indeterminate == pass.
+///     The failing outcome is DROPPED (demoted to non-blocking) and a
+///     loud `contention-indeterminate` [`InfoNote`](crate::assert::InfoNote)
+///     carrying measured / threshold / excess / W / D is pushed so it
+///     stays visible even when the demotion flips the whole result to
+///     passing. `info_notes` is the pass-with-notes channel (rendered in
+///     the failure block's `--- info ---` section and persisted to the
+///     sidecar); it is ALSO echoed to stderr here so a passing-after-
+///     demotion run's captured output still shows the annotation.
+///   - SATURATED Body series → `W` is a prefix-only LOWER bound (later
+///     Body ticks were dropped past the cap), so a FailConfirmed on it
+///     cannot be trusted; treated as indeterminate (demoted) with a
+///     saturation note. NEVER FailConfirm on a saturated series.
+///   - UNDER-COVERING Body series → the witness watched too little of the
+///     Body phase for `W` to bound the excess (a starved monitor that
+///     ticked rarely or never inside Body — an empty series reads `W == 0`
+///     and would wrongly confirm a contention-caused failure). Confirmed
+///     ONLY when the series SPANNED the phase
+///     ([`body_series_covers_phase`](crate::vmm::freeze_coord::latency_verdict::body_series_covers_phase):
+///     at least 2 ticks AND the first→last Body-tick span covers at least half
+///     the real Body wall); otherwise demoted with an under-coverage note. This is the
+///     soundness rule that forbids the one wrong verdict the design must never
+///     emit. A COARSE but spanning series still confirms — density is not
+///     coverage (see the const docs).
+///
+/// No witness (`None`) → the failure is left untouched (the render-time
+/// `dilation_annotation` still applies). A latency-gate detail re-derives
+/// `measured > threshold` from the same guest numbers, so `latency_verdict`
+/// never returns `Pass` here; the defensive `Pass` arm leaves the failure
+/// intact rather than silently passing it.
+///
+/// Independently, for a `performance_mode` cell whose Body dilation `D`
+/// exceeds [`PERF_ISOLATION_D_MAX`](crate::vmm::freeze_coord::latency_verdict::PERF_ISOLATION_D_MAX),
+/// a LOUD isolation-fault failure is recorded REGARDLESS of any gate
+/// outcome: the 1:1-pinned vCPUs lost their host CPUs, so every timing
+/// verdict this run produced is untrustworthy — an infra/isolation fault,
+/// not a scheduler-under-test fault. Default-mode cells get no such check
+/// (the tri-state already covers their host contention).
+///
+/// Runs at the eval seam BEFORE the sidecar write and the pass/fail
+/// projection, so both the demotions and the isolation fault are captured
+/// in the persisted verdict.
+pub(crate) fn apply_contention_verdict(
+    check_result: &mut crate::assert::AssertResult,
+    result: &vmm::VmResult,
+    performance_mode: bool,
+) {
+    use crate::assert::{AssertDetail, DetailKind, InfoNote, Outcome};
+    use crate::vmm::freeze_coord::latency_verdict::{
+        LatencyVerdict, PERF_ISOLATION_D_MAX, body_series_covers_phase, latency_verdict,
+        peak_window_delay_ns_with_widths, perf_isolation_violated,
+    };
+
+    let witness = result.contention_witness.as_ref();
+
+    // Tri-state re-evaluation of every latency-gate failure. Rebuild the
+    // outcomes vec so demoted failures can be dropped while confirmed ones
+    // keep (with an appended note) and every non-latency outcome passes
+    // through untouched.
+    let mut kept: Vec<Outcome> = Vec::with_capacity(check_result.outcomes.len());
+    let mut demotions: Vec<String> = Vec::new();
+    for outcome in std::mem::take(&mut check_result.outcomes) {
+        let Outcome::Fail(mut detail) = outcome else {
+            kept.push(outcome);
+            continue;
+        };
+        let Some(gate) = detail.latency_gate else {
+            kept.push(Outcome::Fail(detail));
+            continue;
+        };
+        let Some(w) = witness else {
+            // No host witness — leave the failure exactly as the guest
+            // reported it (dilation_annotation still fires at render).
+            kept.push(Outcome::Fail(detail));
+            continue;
+        };
+        let phase_d = w.body_dilation();
+        let saturated = w.body_window.saturated;
+        let n_ticks = w.body_window.tick_deltas.len();
+        // COVERAGE SOUNDNESS: a `FailConfirmed` refutes the failure with
+        // "excess > W", but `W` is only a trustworthy bound if the witness
+        // series actually WATCHED the Body phase. A starved monitor (no
+        // CAP_SYS_NICE, sharing a 1-host-CPU budget with the guest vCPUs) can
+        // tick rarely or never inside Body: an empty series reads `W == 0` and
+        // a bare "excess > W" would then CONFIRM a purely contention-caused
+        // failure — the exact false verdict this gate prevents. Only confirm
+        // when the series SPANNED enough of the phase. Legacy sampled
+        // witnesses require >=2 ticks and >=50% first→last span; a new
+        // lifecycle-anchored cumulative series can prove completeness with
+        // one closed interval.
+        let covered = body_series_covers_phase(
+            n_ticks,
+            w.body_window.body_covered_ns,
+            w.body_window.body_wall_ns,
+            w.body_window.complete,
+        );
+        let verdict = latency_verdict(gate.measured_ns, gate.threshold_ns, phase_d, |l| {
+            let interval_bound = peak_window_delay_ns_with_widths(
+                &w.body_window.tick_deltas,
+                &w.body_window.tick_widths_ns,
+                w.body_window.tick_ns,
+                l,
+            );
+            if w.body_window.schedstat_cap_complete {
+                interval_bound.min(w.body_window.schedstat_cap_ns)
+            } else {
+                interval_bound
+            }
+        });
+        // `saturated` forces indeterminate: `W` is a lower bound, so an
+        // "excess > W" refutation is not sound. Extract the excess / W the
+        // verdict carried (FailConfirmed and ContentionIndeterminatePass
+        // both carry them); a defensive Pass keeps the failure intact.
+        let (excess_ns, window_bound_ns) = match verdict {
+            LatencyVerdict::FailConfirmed {
+                excess_ns,
+                window_bound_ns,
+                ..
+            }
+            | LatencyVerdict::ContentionIndeterminatePass {
+                excess_ns,
+                window_bound_ns,
+                ..
+            } => (excess_ns, window_bound_ns),
+            LatencyVerdict::Pass => {
+                // Unreachable in practice (the gate fired on measured >
+                // threshold), but never silently pass a recorded failure.
+                kept.push(Outcome::Fail(detail));
+                continue;
+            }
+        };
+        // Confirm ONLY when the refutation is sound on every axis: the verdict
+        // refuted (`excess > W`), the series is not `saturated` (W would be a
+        // prefix-only lower bound) AND the series `covered` the Body phase (W
+        // built from too few samples is not a trustworthy bound). Any of the
+        // three failing demotes to a non-blocking indeterminate pass.
+        let confirmed = verdict.is_blocking() && !saturated && covered;
+        if verdict.is_blocking() && !saturated && !covered {
+            // Belt cross-check: the series claimed a refutable `W` yet
+            // under-covered the phase — the whole-run `D` (annotation) and
+            // this thin `W` disagree. Demote and record why at debug level.
+            tracing::debug!(
+                measured_ns = gate.measured_ns,
+                excess_ns,
+                window_bound_ns,
+                body_wall_ns = w.body_window.body_wall_ns,
+                body_covered_ns = w.body_window.body_covered_ns,
+                n_ticks,
+                phase_d = phase_d.unwrap_or(f64::NAN),
+                "contention seam: excess > W but the Body witness under-covered \
+                 the phase — demoting to indeterminate instead of confirming (W \
+                 is not a trustworthy bound: the ticks did not span the Body phase)"
+            );
+        }
+        if confirmed {
+            detail.message.push_str(&format!(
+                " (contention-checked: excess {} > W {} — no witnessed host contention explains it)",
+                contention_ms(excess_ns),
+                contention_ms(window_bound_ns),
+            ));
+            kept.push(Outcome::Fail(detail));
+        } else {
+            // Demote: drop the failing outcome, keep a loud annotation.
+            let d_str = phase_d.map_or_else(|| "n/a".to_string(), |d| format!("{d:.2}x"));
+            let sat_note = if saturated {
+                " (Body contention series saturated — W is a prefix-only lower bound)"
+            } else {
+                ""
+            };
+            // Under-coverage note: the witness watched too little of the Body
+            // phase for W to bound the excess. `N ticks spanning X of Y` — N
+            // ticks reached across X of the Y-long Body wall.
+            let cover_note = if !covered {
+                format!(
+                    " (witness under-covered the Body phase: {n_ticks} ticks spanning {} of {} Body wall — W is not a trustworthy bound)",
+                    contention_ms(w.body_window.body_covered_ns),
+                    contention_ms(w.body_window.body_wall_ns),
+                )
+            } else {
+                String::new()
+            };
+            // Neutral `excess vs W` rather than `excess <= W`: for the
+            // plain indeterminate case `excess <= W` holds, but a
+            // saturated OR under-covering series can demote a would-be
+            // FailConfirmed where `excess > W` — the notes explain W is only a
+            // lower / untrustworthy bound there, so asserting the inequality
+            // would be false. Both figures are shown; the operator compares.
+            demotions.push(format!(
+                "{CONTENTION_INDETERMINATE_PREFIX} {} — measured {} vs threshold {}: excess {} vs contention bound W {} (Body dilation D={d_str}){sat_note}{cover_note}; non-blocking pass, witnessed host contention could account for the excess",
+                detail.message,
+                contention_ms(gate.measured_ns),
+                contention_ms(gate.threshold_ns),
+                contention_ms(excess_ns),
+                contention_ms(window_bound_ns),
+            ));
+        }
+    }
+    check_result.outcomes = kept;
+    for block in demotions {
+        // Loud on stderr so a passing-after-demotion run's captured output
+        // shows it; structured on info_notes for the sidecar + failure
+        // block's `--- info ---` section.
+        eprintln!("{block}");
+        check_result.info_notes.push(InfoNote::new(block));
+    }
+
+    // Perf-mode host-isolation fault: LOUD failure regardless of the gate
+    // outcomes above. Only performance_mode cells (1:1-pinned) have the
+    // isolation expectation this checks.
+    if performance_mode
+        && let Some(w) = witness
+        && perf_isolation_violated(w.body_dilation())
+    {
+        let d_str = w
+            .body_dilation()
+            .map_or_else(|| "n/a".to_string(), |d| format!("{d:.2}x"));
+        check_result.record_fail(AssertDetail::new(
+            DetailKind::PerfIsolation,
+            format!(
+                "{PERF_ISOLATION_VIOLATED_PREFIX} Body dilation D={d_str} exceeds the \
+                 performance-mode isolation ceiling {PERF_ISOLATION_D_MAX:.1}x — the 1:1-pinned \
+                 vCPUs lost their dedicated host CPUs, so this run's timing verdicts are \
+                 untrustworthy (an infra/isolation fault, not a scheduler-under-test fault)"
+            ),
+        ));
+    }
 }
 
 /// Render the failure-verdict message for a non-passing `check_result` and
@@ -2235,14 +2619,25 @@ fn render_failure_verdict_message(
     } else {
         "failed"
     };
+    // Host-dilation evidence: when this run was measurably dilated
+    // (vCPU threads starved by the host) AND a wall-clock latency gate
+    // tripped, append the measured D and a note that those ceilings
+    // include host preemption. Evidence only — no verdict change. D is
+    // a host-side measurement (result.host_vcpu_schedstat), unavailable
+    // in-guest where the gate fired, so it is stamped here at render.
+    let dilation_section = crate::assert::dilation_annotation(
+        result.host_vcpu_schedstat.and_then(|s| s.dilation()),
+        check_result,
+    );
     let msg = format!(
-        "{}{}ktstr_test '{}'{} [topo={}] {verdict_word}:\n  {}{}{}{}{}{}{}{}{}{}{}",
+        "{}{}ktstr_test '{}'{} [topo={}] {verdict_word}:\n  {}{}{}{}{}{}{}{}{}{}{}{}",
         fingerprint_line,
         bug_summary_line(),
         entry.name,
         sched_label,
         topo,
         details,
+        dilation_section,
         info_section,
         stats_section,
         console_section,
@@ -2414,22 +2809,20 @@ fn render_no_result_message(
         // test-output message.
         let vm_timeout = vm_timeout_from_entry(entry, topo.total_cpus());
         let watchdog_section = format!(
-            "\n\n--- watchdog ---\n\
+            "\n\n--- ktstr-watchdog ---\n\
              elapsed={:?} (VM run wall-clock)\n\
-             vm_timeout={:?} (host watchdog deadline = max(watchdog_timeout, \
-             duration, 1s) + overcommit-scaled vCPU vm_boot_headroom [+ 30s \
-             cold-BTF budget for bpf_map_write tests])\n\
+             vm_timeout={:?} (Tier-3 dead-man deadline = max(watchdog_timeout, \
+             duration, 1s) + vCPU-scaled vm_boot_headroom x deadman multiplier \
+             [+ 30s cold-BTF budget for bpf_map_write tests])\n\
              watchdog_timeout={:?} (scx_sched.watchdog_timeout override)\n\
              duration={:?} (workload duration)\n\
              hint: if the test body needs more wall time, increase \
              duration (the `duration` field on `KtstrTestEntry` / \
-             `#[ktstr_test(duration_ms = ...)]`); the VM timeout adds \
-             vCPU-scaled boot headroom — itself multiplied by the host \
-             overcommit ratio (vCPUs / allowed host CPUs, clamped) so an \
-             oversubscribed boot gets proportionally longer — on top of \
-             max(watchdog_timeout, duration, 1s). Raising duration extends \
-             the deadline; widening the process cpuset shrinks the \
-             overcommit multiplier",
+             `#[ktstr_test(duration_ms = ...)]`). Note this wall deadline \
+             is only the dead-man backstop: the progress watchdog (Tiers \
+             1-2) kills a wedged VM on its per-phase progress budget long \
+             before this fires, and a slow-but-progressing VM is never \
+             killed by host load alone",
             result.duration, vm_timeout, entry.watchdog_timeout, entry.duration,
         );
         let timeout_reason = {
@@ -2705,6 +3098,15 @@ fn evaluate_vm_result(
             stimulus_events,
         );
 
+        // Host-side contention seam: re-run the tri-state verdict over the
+        // guest's wall-latency gate failures with the Body-phase witness in
+        // hand — confirm the refutation-proof ones, demote the ones the
+        // witnessed host contention could explain (indeterminate == pass),
+        // and record a loud perf-mode isolation fault when a 1:1-pinned
+        // cell lost its host CPUs. Runs BEFORE write_sidecar so the persisted
+        // verdict and its info_notes reflect the final tri-state outcome.
+        apply_contention_verdict(&mut check_result, result, entry.performance_mode);
+
         // Write sidecar before checking pass/fail so both outcomes are captured.
         // A sidecar write failure is logged but not propagated: the test
         // verdict itself is still valid — only post-run stats tooling
@@ -2805,6 +3207,8 @@ fn evaluate_vm_result(
 
 #[cfg(test)]
 mod eval_tests;
+#[cfg(test)]
+mod eval_tests_contention;
 #[cfg(test)]
 mod eval_tests_eval;
 #[cfg(test)]

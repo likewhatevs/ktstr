@@ -224,12 +224,16 @@ fixed-rate arrival with coordinated-omission serve latency, and
 `slow_path_p99_us` adds a heavy-tailed Pareto service time to the
 miss path. Same `workers(1)` rule as schbench.
 
-Per phase and whole-run it emits `taobench_total_qps`,
-`taobench_{fast,slow}_qps`, `taobench_hit_ratio`, and — open-loop
+Per phase it emits `taobench_total_ops_per_cpu_sec`,
+`taobench_{fast,slow}_ops_per_cpu_sec`, `taobench_hit_ratio`, and — open-loop
 only — `taobench_serve_{p50,p90,p99,p999}_us` measured from intended
 arrival, so queueing delay is charged to the scheduler rather than
 hidden (see
 [taobench_e2e.rs](https://github.com/likewhatevs/ktstr/blob/main/tests/taobench_e2e.rs)).
+Whole-run counterparts add the `_whole` suffix. These throughput keys
+are operations per delivered client CPU-second (`ops/cpu-s`), not wall
+QPS; sidecars also record the denomination so pre-0.37 wall-era
+results are never compared against them.
 Its
 [validation.md](https://github.com/likewhatevs/ktstr/blob/main/src/workload/taobench/validation.md)
 documents the structural match against the reference (same hit-ratio

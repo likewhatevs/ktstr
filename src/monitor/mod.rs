@@ -179,6 +179,7 @@ pub(crate) fn guest_kernel_hz(kernel_path: Option<&std::path::Path>) -> u64 {
 }
 
 use crate::vmm::find_vmlinux;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 /// IKCONFIG marker: gzip data starts immediately after this 8-byte sequence.
 const IKCONFIG_MAGIC: &[u8] = b"IKCFG_ST";
@@ -194,18 +195,38 @@ pub(crate) const VMLINUX_KEEP_SECTIONS: &[&[u8]] = &[
 
 /// Extract CONFIG_HZ from the embedded IKCONFIG blob in a vmlinux ELF.
 ///
+/// Prefers the cross-process `<vmlinux>.artifacts` sidecar (via
+/// [`crate::vmm::cached_vmlinux_artifacts`]): the derived `guest_hz`
+/// is scanned once at parse time and stored there, so a sidecar hit
+/// returns it WITHOUT re-reading the multi-hundred-MB ELF. The
+/// artifacts cache returns `None` only when the ELF is unreadable or
+/// the mandatory-symbol parse fails; in that case we still recover HZ
+/// from a process-cached byte read + a direct IKCONFIG scan, matching
+/// the pre-cache behaviour (HZ resolution does not depend on symbols).
+fn read_hz_from_ikconfig(vmlinux_path: &std::path::Path) -> Option<u64> {
+    if let Some(artifacts) = crate::vmm::cached_vmlinux_artifacts(vmlinux_path) {
+        return artifacts.guest_hz;
+    }
+    let data = crate::vmm::cached_vmlinux_bytes(vmlinux_path)?;
+    hz_from_vmlinux_bytes(&data)
+}
+
+/// Scan raw vmlinux ELF bytes for the embedded IKCONFIG blob and parse
+/// CONFIG_HZ from it.
+///
 /// The kernel (when built with CONFIG_IKCONFIG) embeds a gzip-compressed
 /// copy of `.config` in `.rodata`, bracketed by `IKCFG_ST` / `IKCFG_ED`
-/// markers. This function scans the raw bytes for the marker, decompresses
-/// the gzip data, and parses CONFIG_HZ from the result.
-fn read_hz_from_ikconfig(vmlinux_path: &std::path::Path) -> Option<u64> {
-    let data = std::fs::read(vmlinux_path).ok()?;
+/// markers. This scans the raw bytes for the marker, decompresses the
+/// gzip data, and parses CONFIG_HZ from the result. Called once per
+/// (path, mtime) at vmlinux-artifacts parse time so the derived HZ can
+/// be cached in the `.artifacts` sidecar.
+pub(crate) fn hz_from_vmlinux_bytes(data: &[u8]) -> Option<u64> {
     // vmlinux images are tens of MB; the old
     // `windows(8).position(|w| w == IKCFG_ST)` was a naive O(n)
     // byte-wise scan. memchr's two-way matcher uses the available
     // SIMD path (x86_64 AVX2 / aarch64 Neon) and cuts scan time by
     // a constant factor on every host we care about.
-    let pos = memchr::memmem::find(&data, IKCONFIG_MAGIC)?;
+    let pos = memchr::memmem::find(data, IKCONFIG_MAGIC)?;
     let gz_start = pos + IKCONFIG_MAGIC.len();
     if gz_start >= data.len() {
         return None;
@@ -565,18 +586,28 @@ impl MonitorSample {
         imbalance_ratio_of(&self.cpus)
     }
 
+    /// Whether every CPU in this non-empty sample has event counters.
+    pub(crate) fn has_complete_event_counters(&self) -> bool {
+        !self.cpus.is_empty() && self.cpus.iter().all(|cpu| cpu.event_counters.is_some())
+    }
+
+    /// Whether every CPU in this non-empty sample has runqueue schedstat data.
+    fn has_complete_schedstat(&self) -> bool {
+        !self.cpus.is_empty() && self.cpus.iter().all(|cpu| cpu.schedstat.is_some())
+    }
+
     /// Sum a field from event counters across all CPUs.
-    /// Returns `None` if no CPU has event counters.
+    ///
+    /// Returns `None` unless every CPU in this non-empty sample has counters.
+    /// A partial cross-CPU sum is not a valid numerator for rates whose
+    /// denominator covers every vCPU.
     pub fn sum_event_field(&self, f: fn(&ScxEventCounters) -> i64) -> Option<i64> {
-        let mut total = 0i64;
-        let mut any = false;
-        for cpu in &self.cpus {
-            if let Some(ev) = &cpu.event_counters {
-                total += f(ev);
-                any = true;
-            }
-        }
-        any.then_some(total)
+        self.has_complete_event_counters().then(|| {
+            self.cpus
+                .iter()
+                .map(|cpu| f(cpu.event_counters.as_ref().expect("completeness checked")))
+                .sum()
+        })
     }
 }
 
@@ -599,6 +630,629 @@ pub(crate) fn imbalance_ratio_of(cpus: &[CpuSnapshot]) -> f64 {
         max_nr = max_nr.max(cpu.nr_running);
     }
     max_nr as f64 / min_nr.max(1) as f64
+}
+
+/// [`ProgressLedger::cpu_currency`]: no per-vCPU CPU-time source was
+/// available this tick (every `vcpu_cpu_time_ns` was `None`).
+pub(crate) const CPU_CURRENCY_NONE: u8 = 0;
+/// [`ProgressLedger::cpu_currency`]: CPU-time sourced from the per-vCPU
+/// pthread clock (`CpuSnapshot::vcpu_cpu_time_ns`).
+pub(crate) const CPU_CURRENCY_PTHREAD: u8 = 1;
+/// [`ProgressLedger::cpu_currency`]: CPU-time sourced from the host PMU
+/// SW task-clock (`PERF_COUNT_SW_TASK_CLOCK` with `exclude_host=1`),
+/// counting only ns the vCPU executed inside the guest. Written by the
+/// monitor loop when every sampled vCPU carries a task clock on the
+/// first tick (see [`reader::select_cpu_currency`]); the source is
+/// latched for the whole run so this never mixes with pthread-magnitude
+/// ns mid-run.
+pub(crate) const CPU_CURRENCY_PMU: u8 = 2;
+
+/// Coarse lifecycle stage of a guest cell, tracked live in the
+/// [`ProgressLedger`] by the scenario-dispatch thread as it observes
+/// the guest's port-1 lifecycle / scenario frames.
+///
+/// Distinct from [`crate::vmm::wire::LifecyclePhase`] (the on-wire
+/// 1-byte frame discriminant): this is the host-side stage the watchdog
+/// charges CPU time against, collapsing several wire frames into one
+/// stage. The class stack is `Boot`/`Attach`/`Dispatch`/`Teardown` =
+/// INFRA (framework overhead) and `Body` = BODY (the test's own work).
+///
+/// The ordinal IS the monotone advance order: a stage may only move
+/// FORWARD (see [`ProgressLedger::advance_phase`]). `Boot` is `0` so the
+/// zero-initialised `phase` atomic starts there without an explicit
+/// store.
+#[repr(u8)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub(crate) enum LifecycleStage {
+    /// Booting: init / devtmpfs / initramfs up to SYS_RDY. INFRA.
+    Boot = 0,
+    /// SYS_RDY seen; the scheduler is attaching to sched_ext. INFRA.
+    Attach = 1,
+    /// PayloadStarting seen; guest dispatch is entering the workload /
+    /// test-body preamble. INFRA.
+    Dispatch = 2,
+    /// The test body / injected workload is running (`WorkloadDispatched`
+    /// for a verifier cell, `ScenarioStart` for a test cell). BODY — the
+    /// only stage whose CPU time is the test's own.
+    Body = 3,
+    /// Teardown: `ScenarioEnd` / `Exit` / `TestResult` seen; the guest is
+    /// winding down. INFRA.
+    Teardown = 4,
+}
+
+/// Coarse class of a [`LifecycleStage`]: whether CPU time charged to it
+/// is framework INFRA overhead or the test's own BODY work. Consumed by
+/// the watchdog (a LATER commit) to pick a deadline model; `allow`ed
+/// until that reader lands.
+#[allow(dead_code)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub(crate) enum StageClass {
+    /// Framework overhead — boot, attach, dispatch preamble, teardown.
+    Infra,
+    /// The test body / injected workload proper.
+    Body,
+}
+
+impl LifecycleStage {
+    /// Class of this stage. Only [`LifecycleStage::Body`] is BODY; every
+    /// other stage is framework INFRA. Consumed by the watchdog (a LATER
+    /// commit); `allow`ed until that reader lands.
+    #[allow(dead_code)]
+    pub(crate) fn class(self) -> StageClass {
+        match self {
+            LifecycleStage::Body => StageClass::Body,
+            _ => StageClass::Infra,
+        }
+    }
+
+    /// Reverse the `phase` atomic byte into a stage. Conservative on an
+    /// unknown value: an out-of-range byte (a torn read, or a future
+    /// stage this build predates) maps to `Boot` — the earliest, most-
+    /// lenient stage — so a garbled phase never charges the test body's
+    /// tighter deadline model. Consumed by the watchdog (a LATER commit);
+    /// `allow`ed until that reader lands.
+    #[allow(dead_code)]
+    pub(crate) fn from_u8(v: u8) -> Self {
+        match v {
+            1 => LifecycleStage::Attach,
+            2 => LifecycleStage::Dispatch,
+            3 => LifecycleStage::Body,
+            4 => LifecycleStage::Teardown,
+            // 0 and every unknown byte: conservative Boot.
+            _ => LifecycleStage::Boot,
+        }
+    }
+}
+
+/// Lock-free progress/liveness ledger shared from the monitor thread to
+/// the VM watchdog. The watchdog that will later read this runs
+/// SCHED_FIFO priority 2 and must NEVER block on the monitor, so every
+/// field is an atomic — no `Mutex`, no lock of any kind.
+///
+/// Benign one-tick-staleness contract (same discipline as the
+/// `watchdog_reset_ns` deadline atomic — see
+/// `vmm::freeze_coord::WatchdogResetTag`): the watchdog reads these
+/// fields racing the monitor's next store, so it can observe values up
+/// to one monitor tick stale, or (across the epoch/payload pair) a torn
+/// combination. Every such race is deliberately biased so a stale or
+/// torn read only makes a FUTURE kill decision MORE conservative (more
+/// likely to see recent progress / demand, hence less likely to kill),
+/// never less. The epoch fields carry Release/Acquire ordering so a
+/// reader that observes a bumped epoch also sees the payload stored
+/// before it; the scalar liveness/demand fields are Relaxed (a one-tick
+/// stale scalar only defers a kill).
+#[derive(Debug, Default)]
+pub(crate) struct ProgressLedger {
+    /// Seqlock guarding the dispatch-owned lifecycle transition payload
+    /// (`phase`, `phase_epoch`, and the progress wall anchor). Even values
+    /// are quiescent; odd values mean a transition is being published.
+    /// Stage changes are rare, so serializing their writers and making the
+    /// watchdog retry a concurrent read has negligible cost and prevents a
+    /// new stage from being paired with the previous stage's anchors.
+    phase_transition_seq: AtomicU32,
+    /// Lifecycle stage id ([`LifecycleStage`]; 0 = `Boot`, the initial
+    /// value). Written FORWARD-ONLY by the guest scenario-dispatch thread
+    /// via [`ProgressLedger::advance_phase`]. Not written by the monitor.
+    /// The watchdog reader that folds it lands in a LATER commit.
+    pub(crate) phase: AtomicU8,
+    /// Bumped by the dispatch thread on every lifecycle stage advance
+    /// (see [`ProgressLedger::advance_phase`]). A stage advance is itself
+    /// progress evidence, so the watchdog folds this epoch alongside
+    /// `progress_epoch`. Release store / Acquire load. Not written by the
+    /// monitor. The watchdog reader lands in a LATER commit.
+    pub(crate) phase_epoch: AtomicU32,
+    /// The Tier-1 spinning-wedge evidence: the MAXIMUM over vCPUs of the
+    /// per-vCPU CPU-time (ns) burned since the current phase was entered,
+    /// as of the latest monitor tick. Written by the MONITOR (which reads
+    /// per-vCPU CPU times each tick and keeps its own per-vCPU anchor
+    /// vector, re-anchored on every `phase_epoch` change it observes), NOT
+    /// by the dispatch thread — so the anchor and the reading are always
+    /// coherent (same thread, same tick), curing the cross-thread ~0-anchor
+    /// incoherence the old dispatch-snapshotted `cpu_ns_at_phase` suffered.
+    /// WIDTH-INDEPENDENT by construction: a spinning wedge is one (or a
+    /// few) hot thread(s), so the max crosses a flat per-phase budget; a
+    /// wide idle guest's diffuse per-vCPU background burn (ticks/IPIs) keeps
+    /// the max tiny no matter how many vCPUs sum into `cpu_ns_now`. Relaxed
+    /// — one-tick staleness only under-counts, deferring a kill.
+    pub(crate) max_vcpu_cpu_in_phase_ns: AtomicU64,
+    /// The `phase_epoch` for which
+    /// [`Self::max_vcpu_cpu_in_phase_ns`] was computed. The monitor publishes
+    /// the CPU value before this Release store; the watchdog Acquire-loads
+    /// the tag and accepts the value only when it matches the current phase
+    /// epoch. This closes the transition window where dispatch has entered a
+    /// new stage but the 100 ms monitor has not yet re-anchored its tracker.
+    max_vcpu_cpu_phase_epoch: AtomicU32,
+
+    /// Summed available per-vCPU CPU-time (ns) as of the latest monitor
+    /// tick. Relaxed — a one-tick-stale total only under-counts consumed
+    /// CPU, deferring a kill. Absent vCPU times are skipped (see
+    /// `cpu_currency`). Retained for dilation context and the failure dump;
+    /// NO LONGER feeds a kill tier — the summed currency is width-unsound
+    /// (a wide idle guest's `Σ`-of-background-burn grows with vCPU count),
+    /// so the Tier-3 deadman consumes the busiest-vCPU
+    /// `cpu_trickle_stalled` verdict and Tier-2 carries no CPU term at all.
+    pub(crate) cpu_ns_now: AtomicU64,
+    /// The Tier-3-deadman deferral verdict (its ONLY consumer — Tier-2
+    /// carries no CPU term), computed MONITOR-side each tick (the monitor
+    /// owns the per-vCPU CPU data the busiest-vCPU windowed currency needs
+    /// — see
+    /// [`CpuTrickleTracker`](crate::vmm::freeze_coord::watchdog_step::CpuTrickleTracker)):
+    /// `true` when the guest's BUSIEST single vCPU accrued below the currency
+    /// floor over the trailing window (two consecutive sub-floor windows).
+    /// The watchdog reads this verdict rather than re-deriving it, because
+    /// the busiest-vCPU quantity — `max_i(C_i(now) - C_i(window_start))` over
+    /// the per-vCPU cumulatives — needs per-vCPU window anchors the scalar
+    /// ledger cannot carry. Relaxed — a one-tick-stale bool only defers a
+    /// kill (the monitor-live gate dominates a dead monitor anyway).
+    pub(crate) cpu_trickle_stalled: AtomicBool,
+    /// Busiest-single-vCPU CPU (ns) accrued over the most recently closed
+    /// trickle window (0 before the first close). Diagnostic evidence for
+    /// the watchdog failure dump's `busiest_vcpu_window` line — the quantity
+    /// `cpu_trickle_stalled` compares against the floor. Relaxed.
+    pub(crate) busiest_vcpu_window_ns: AtomicU64,
+    /// Bumped UNCONDITIONALLY every monitor tick — pure liveness. A
+    /// stalled `monitor_heartbeat` means the monitor thread itself is
+    /// wedged (distinct from the guest making no progress), which the
+    /// watchdog must not misread as a guest hang. Relaxed.
+    pub(crate) monitor_heartbeat: AtomicU64,
+    /// Bumped only on a MILESTONE (see the LOAD-BEARING invariant below).
+    /// Release store / Acquire load so a reader observing a fresh epoch
+    /// also sees the `cpu_ns_at_progress` / `wall_ns_at_progress` payload
+    /// stored before it.
+    ///
+    /// LOAD-BEARING PROGRESS INVARIANT (hard invariant — do not relax):
+    /// `progress_epoch` counts MILESTONES ONLY — a guest-driven lifecycle
+    /// stage advance (the dispatch thread's [`Self::advance_phase`]) or a
+    /// guest boot-heartbeat frame (dispatch's `record_boot_progress`).
+    /// KERNEL SCHEDULING NOISE IS NEVER PROGRESS. The monitor does NOT bump
+    /// this from schedstat / scx-event / DSQ-drain deltas: a live guest
+    /// kernel bumps ttwu_count / sched_count / pcount every tick from
+    /// background kthread wakeups (RCU, timers, workqueues, ktstr's own
+    /// guest poll threads at ~200 ms), and a wakeup bumps ttwu even when
+    /// the woken task never runs — so noise-based progress would reset
+    /// every tick on ANY live kernel, making a SCHED_FIFO spinner and a
+    /// 60 s idle-teardown sleeper alike look "progressing" forever and
+    /// rendering both immortal to the watchdog (empirically confirmed in
+    /// e2e runs). scx discrete-event counters are equally unsafe (they
+    /// tick from enqueue paths under a stalled scheduler). Likewise
+    /// jiffies / `rq_clock` advance is never progress. The watchdog
+    /// governs spinning wedges by the Tier-1 per-phase CPU budget and idle
+    /// wedges by the Tier-2 CPU-trickle-stall test — NOT by this epoch;
+    /// the epoch's sole watchdog role is the Tier-3 "no milestone within
+    /// the grace" deferral gate.
+    pub(crate) progress_epoch: AtomicU64,
+    /// `cpu_ns_now` captured at the last `progress_epoch` bump. Relaxed
+    /// store paired with the epoch's Release (payload-before-epoch).
+    pub(crate) cpu_ns_at_progress: AtomicU64,
+    /// `run_start`-relative wall time (ns) at the last `progress_epoch`
+    /// bump. Relaxed store paired with the epoch's Release.
+    pub(crate) wall_ns_at_progress: AtomicU64,
+    /// True when the latest sample saw queued work anywhere
+    /// (`nr_running`, `scx_nr_running`, or `local_dsq_depth` non-zero on
+    /// any CPU). Distinguishes "idle, nothing to do" (no demand, never a
+    /// hang) from "work queued but not progressing" (a real wedge).
+    /// Relaxed — one-tick staleness only over-reports demand, deferring
+    /// a kill.
+    pub(crate) runnable_demand: AtomicBool,
+    /// Provenance of `cpu_ns_now`: [`CPU_CURRENCY_NONE`],
+    /// [`CPU_CURRENCY_PTHREAD`], or [`CPU_CURRENCY_PMU`]. Latched to one
+    /// source on the first tick (see [`reader::select_cpu_currency`]) so
+    /// PMU and pthread magnitudes never mix mid-run. Relaxed —
+    /// diagnostic-adjacent; a stale currency never changes a kill
+    /// decision by itself.
+    pub(crate) cpu_currency: AtomicU8,
+    /// Whether the latest monitor tick actually resolved per-CPU GUEST
+    /// evidence channels — `data_valid` latched and the per-CPU snapshot
+    /// vec was non-empty with real reads. This is the SAME condition that
+    /// makes `runnable_demand` meaningful: before the guest kernel brings
+    /// up its per-CPU runqueue structures the monitor's guest-memory reads
+    /// resolve nothing, so
+    /// `runnable_demand` reads false and no progress term can fire — not
+    /// because the guest is idle, but because the channel is blind. The
+    /// watchdog's Tier-2 (absence-of-demand ⇒ idle wedge) is only valid
+    /// when this is true; a starved early-boot guest is otherwise
+    /// indistinguishable from an idle wedge (the acceptance-storm's 33
+    /// false kills). Set each tick by the monitor's ledger write. Relaxed
+    /// — a one-tick-stale value only defers a Tier-2 kill. Distinct from
+    /// `cpu_currency`: CPU evidence is host-side (pthread/PMU clocks) and
+    /// accrues even while these guest channels are blind.
+    pub(crate) evidence_channels_live: AtomicBool,
+}
+
+impl ProgressLedger {
+    /// Stamp the per-tick liveness fields and bump `monitor_heartbeat`
+    /// unconditionally. Called every monitor tick regardless of whether
+    /// progress was observed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_liveness(
+        &self,
+        cpu_ns_now: u64,
+        max_vcpu_cpu_in_phase_ns: u64,
+        max_vcpu_cpu_phase_epoch: u32,
+        cpu_trickle_stalled: bool,
+        busiest_vcpu_window_ns: u64,
+        cpu_currency: u8,
+        runnable_demand: bool,
+        evidence_channels_live: bool,
+    ) {
+        self.cpu_ns_now.store(cpu_ns_now, Ordering::Relaxed);
+        self.max_vcpu_cpu_in_phase_ns
+            .store(max_vcpu_cpu_in_phase_ns, Ordering::Relaxed);
+        self.max_vcpu_cpu_phase_epoch
+            .store(max_vcpu_cpu_phase_epoch, Ordering::Release);
+        self.cpu_trickle_stalled
+            .store(cpu_trickle_stalled, Ordering::Relaxed);
+        self.busiest_vcpu_window_ns
+            .store(busiest_vcpu_window_ns, Ordering::Relaxed);
+        self.cpu_currency.store(cpu_currency, Ordering::Relaxed);
+        self.runnable_demand
+            .store(runnable_demand, Ordering::Relaxed);
+        self.evidence_channels_live
+            .store(evidence_channels_live, Ordering::Relaxed);
+        // Unconditional — this is the monitor's own liveness pulse.
+        self.monitor_heartbeat.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a NEW-WORK observation: publish the payload, then bump
+    /// `progress_epoch`. The payload stores are Relaxed and the epoch
+    /// RMW is Release, so an Acquire reader that observes the new epoch
+    /// also observes this payload (payload-before-epoch).
+    pub(crate) fn record_progress(&self, cpu_ns_now: u64, wall_ns: u64) {
+        self.cpu_ns_at_progress.store(cpu_ns_now, Ordering::Relaxed);
+        self.wall_ns_at_progress.store(wall_ns, Ordering::Relaxed);
+        self.progress_epoch.fetch_add(1, Ordering::Release);
+    }
+
+    /// Advance the lifecycle stage to `new_stage` ([`LifecycleStage`] as
+    /// `u8`), FORWARD-ONLY. A stage advance is itself new-work evidence,
+    /// so on a real advance this ALSO bumps `phase_epoch` and folds the
+    /// transition into `progress_epoch` (term (1) of the progress
+    /// invariant) via [`Self::record_progress`].
+    ///
+    /// MONOTONE (hard invariant): the stage never regresses. A late,
+    /// duplicated, or out-of-order frame — e.g. a stray `ScenarioStart`
+    /// arriving after `Exit` already moved the cell to `Teardown` — must
+    /// NOT pull the stage back, or the watchdog would charge later CPU
+    /// time against an earlier (wrong) stage's deadline model. The CAS
+    /// loop drops any non-forward move: `new_stage <= current` returns
+    /// `false` WITHOUT touching an epoch (no phantom progress from a
+    /// duplicate). Dispatch is single-threaded today, but the CAS keeps
+    /// the monotone invariant self-contained in the atomic rather than
+    /// relying on caller serialisation.
+    ///
+    /// `wall_ns` is the `run_start`-relative wall time the caller (the
+    /// dispatch thread) sampled for the triggering frame; it lands in
+    /// `wall_ns_at_progress` via `record_progress`. Returns `true` iff
+    /// the stage actually advanced.
+    pub(crate) fn advance_phase(&self, new_stage: u8, wall_ns: u64) -> bool {
+        // Serialize transition writers and mark the lifecycle payload
+        // unstable. Dispatch is normally single-threaded, but keeping the
+        // exclusion here makes the ledger's atomic contract self-contained.
+        let mut transition_seq = self.phase_transition_seq.load(Ordering::Acquire);
+        loop {
+            if transition_seq & 1 != 0 {
+                std::hint::spin_loop();
+                transition_seq = self.phase_transition_seq.load(Ordering::Acquire);
+                continue;
+            }
+            match self.phase_transition_seq.compare_exchange_weak(
+                transition_seq,
+                transition_seq.wrapping_add(1),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => transition_seq = observed,
+            }
+        }
+
+        let mut cur = self.phase.load(Ordering::Relaxed);
+        loop {
+            // Forward-only: equal or lower is a no-op (never regress).
+            if new_stage <= cur {
+                self.phase_transition_seq
+                    .store(transition_seq.wrapping_add(2), Ordering::Release);
+                return false;
+            }
+            match self.phase.compare_exchange_weak(
+                cur,
+                new_stage,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+        // Publish the phase epoch (Release) so an Acquire reader that sees
+        // the bump also sees the milestone payload (payload-before-epoch).
+        // The Tier-1 CPU anchor is NO LONGER snapshotted here: the monitor
+        // Acquire-loads this epoch to re-anchor its own per-vCPU
+        // max-in-phase tracker on the stage just entered, keeping the
+        // anchor coherent with the per-vCPU reads it charges (the old
+        // cross-thread `cpu_ns_now` snapshot could read ~0 before the
+        // monitor's first publish, producing a phantom multi-second
+        // in-phase burn). The advance is progress, so also fold it into
+        // `progress_epoch`.
+        let cpu_ns_now = self.cpu_ns_now.load(Ordering::Relaxed);
+        self.phase_epoch.fetch_add(1, Ordering::Release);
+        self.record_progress(cpu_ns_now, wall_ns);
+        self.phase_transition_seq
+            .store(transition_seq.wrapping_add(2), Ordering::Release);
+        true
+    }
+
+    /// Read every field the watchdog folds each tick in one shot, under
+    /// the payload-before-epoch contract. `progress_epoch` is loaded
+    /// FIRST with Acquire ordering so the `wall_ns_at_progress` payload
+    /// read that follows is ordered after it: the writer stores that
+    /// payload (Relaxed) then bumps the epoch
+    /// (Release — see [`Self::record_progress`]), so an Acquire load
+    /// observing a given epoch also observes its payload. The remaining
+    /// fields are Relaxed (per the ledger's one-tick-staleness contract);
+    /// a torn combination only makes a kill decision MORE conservative. A
+    /// lifecycle transition is the exception: `phase_transition_seq` makes
+    /// the read retry until stage + anchors are from one stable generation,
+    /// while the max-vCPU epoch tag suppresses Tier-1 until the monitor has
+    /// re-anchored and published evidence for that generation.
+    pub(crate) fn snapshot(&self) -> LedgerSnapshot {
+        loop {
+            let transition_seq = self.phase_transition_seq.load(Ordering::Acquire);
+            if transition_seq & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+
+            let progress_epoch = self.progress_epoch.load(Ordering::Acquire);
+            let wall_ns_at_progress = self.wall_ns_at_progress.load(Ordering::Relaxed);
+            let phase = self.phase.load(Ordering::Relaxed);
+            let phase_epoch = self.phase_epoch.load(Ordering::Acquire);
+            // Load the Release-published tag before its Relaxed payload.
+            let max_vcpu_cpu_phase_epoch = self.max_vcpu_cpu_phase_epoch.load(Ordering::Acquire);
+            let max_vcpu_cpu_in_phase_ns = self.max_vcpu_cpu_in_phase_ns.load(Ordering::Relaxed);
+
+            let snapshot = LedgerSnapshot {
+                phase,
+                cpu_ns_now: self.cpu_ns_now.load(Ordering::Relaxed),
+                // A mismatched tag means this is the previous phase's CPU
+                // burn. Zero is the conservative Tier-1 sentinel until the
+                // next monitor tick re-anchors and publishes this epoch.
+                max_vcpu_cpu_in_phase_ns: if max_vcpu_cpu_phase_epoch == phase_epoch {
+                    max_vcpu_cpu_in_phase_ns
+                } else {
+                    0
+                },
+                cpu_trickle_stalled: self.cpu_trickle_stalled.load(Ordering::Relaxed),
+                busiest_vcpu_window_ns: self.busiest_vcpu_window_ns.load(Ordering::Relaxed),
+                wall_ns_at_progress,
+                progress_epoch,
+                monitor_heartbeat: self.monitor_heartbeat.load(Ordering::Relaxed),
+                runnable_demand: self.runnable_demand.load(Ordering::Relaxed),
+                cpu_currency: self.cpu_currency.load(Ordering::Relaxed),
+                evidence_channels_live: self.evidence_channels_live.load(Ordering::Relaxed),
+            };
+
+            // Full reader barrier: none of the payload loads above may move
+            // after the validation load below, or a transition could begin
+            // between them and still appear stable.
+            std::sync::atomic::fence(Ordering::SeqCst);
+            if self.phase_transition_seq.load(Ordering::Acquire) == transition_seq {
+                return snapshot;
+            }
+        }
+    }
+}
+
+/// Immutable one-tick snapshot of the [`ProgressLedger`] fields the VM
+/// watchdog folds into a kill decision, taken via
+/// [`ProgressLedger::snapshot`] so the memory-ordering contract stays
+/// co-located with the ledger. A plain value struct — the watchdog
+/// evaluates it against the pure `vmm::freeze_coord::watchdog_step`
+/// tiers without holding any atomic across the decision.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LedgerSnapshot {
+    /// Live lifecycle stage id ([`LifecycleStage`] as `u8`).
+    pub(crate) phase: u8,
+    /// Summed per-vCPU CPU-time (ns) as of the latest monitor tick. Dilation
+    /// context / dump only — no longer a kill-tier input (the summed
+    /// currency is width-unsound; see `cpu_trickle_stalled`).
+    pub(crate) cpu_ns_now: u64,
+    /// The Tier-1 evidence: MAX over vCPUs of per-vCPU CPU burned since the
+    /// current phase was entered, published by the monitor (see
+    /// [`ProgressLedger::max_vcpu_cpu_in_phase_ns`]). Width-independent, so
+    /// a spinning wedge crosses a flat per-phase budget while a wide idle
+    /// guest never does.
+    pub(crate) max_vcpu_cpu_in_phase_ns: u64,
+    /// The Tier-3-deadman deferral verdict (monitor-computed; see
+    /// [`ProgressLedger::cpu_trickle_stalled`]): the guest's busiest single
+    /// vCPU accrued below the currency floor over the trailing window. Its
+    /// only consumer is `deadman_should_fire` — Tier-2 carries no CPU term.
+    pub(crate) cpu_trickle_stalled: bool,
+    /// Busiest-single-vCPU CPU (ns) over the last closed trickle window —
+    /// dump evidence for the `busiest_vcpu_window` line (see
+    /// [`ProgressLedger::busiest_vcpu_window_ns`]).
+    pub(crate) busiest_vcpu_window_ns: u64,
+    /// `run_start`-relative wall time (ns) at the last milestone
+    /// (`progress_epoch` bump); the watchdog's `wall_in_phase` /
+    /// `wall_since_milestone` anchor.
+    pub(crate) wall_ns_at_progress: u64,
+    /// Monotone count of MILESTONES (lifecycle stage advances / boot
+    /// heartbeats). Kernel scheduling noise never bumps it.
+    pub(crate) progress_epoch: u64,
+    /// Monitor liveness pulse (bumped unconditionally every tick).
+    pub(crate) monitor_heartbeat: u64,
+    /// The guest had queued work at the latest sample.
+    pub(crate) runnable_demand: bool,
+    /// Provenance of `cpu_ns_now` ([`CPU_CURRENCY_NONE`]/`PTHREAD`/`PMU`).
+    pub(crate) cpu_currency: u8,
+    /// Whether per-CPU guest evidence channels resolved this tick (see
+    /// [`ProgressLedger::evidence_channels_live`]). Gates the watchdog's
+    /// Tier-2: absence-of-demand is only evidence when the demand channel
+    /// exists.
+    pub(crate) evidence_channels_live: bool,
+}
+
+#[cfg(test)]
+mod progress_ledger_tests {
+    //! Direct unit coverage for [`ProgressLedger::advance_phase`]'s
+    //! forward-only (monotone) contract and its epoch/anchor bookkeeping,
+    //! independent of the dispatch driver.
+    use super::{CPU_CURRENCY_PTHREAD, LifecycleStage, ProgressLedger, StageClass};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn record_liveness_and_snapshot_roundtrip_evidence_channels_live() {
+        // Field roundtrip: `record_liveness` stamps `evidence_channels_live`
+        // and `snapshot()` reflects it; default is false, and it can drop
+        // back to false on a later tick (blind channels after a resolved
+        // one is impossible in practice, but the field must track exactly
+        // what the monitor last wrote).
+        let l = ProgressLedger::default();
+        assert!(!l.snapshot().evidence_channels_live, "default is false");
+
+        l.record_liveness(123, 45, 0, true, 30, CPU_CURRENCY_PTHREAD, true, true);
+        let s = l.snapshot();
+        assert!(s.evidence_channels_live);
+        assert_eq!(s.cpu_ns_now, 123);
+        assert_eq!(s.max_vcpu_cpu_in_phase_ns, 45);
+        assert!(s.cpu_trickle_stalled);
+        assert_eq!(s.busiest_vcpu_window_ns, 30);
+        assert_eq!(s.cpu_currency, CPU_CURRENCY_PTHREAD);
+        assert!(s.runnable_demand);
+
+        // The trickle verdict and window tracks exactly what the monitor
+        // last wrote (both can drop back on a later tick).
+        l.record_liveness(200, 0, 0, false, 12, CPU_CURRENCY_PTHREAD, false, false);
+        let s2 = l.snapshot();
+        assert!(!s2.evidence_channels_live);
+        assert_eq!(s2.cpu_ns_now, 200);
+        assert_eq!(s2.max_vcpu_cpu_in_phase_ns, 0);
+        assert!(!s2.cpu_trickle_stalled);
+        assert_eq!(s2.busiest_vcpu_window_ns, 12);
+    }
+
+    #[test]
+    fn phase_advance_suppresses_stale_max_vcpu_cpu_until_monitor_reanchors() {
+        let l = ProgressLedger::default();
+        // Simulate the last Body-adjacent monitor tick carrying enough CPU
+        // burn to exceed Teardown's Tier-1 budget.
+        l.record_liveness(
+            20_000_000_000,
+            18_000_000_000,
+            0,
+            false,
+            0,
+            CPU_CURRENCY_PTHREAD,
+            true,
+            true,
+        );
+        assert_eq!(l.snapshot().max_vcpu_cpu_in_phase_ns, 18_000_000_000);
+
+        assert!(l.advance_phase(LifecycleStage::Teardown as u8, 123));
+        let after_advance = l.snapshot();
+        assert_eq!(after_advance.phase, LifecycleStage::Teardown as u8);
+        assert_eq!(
+            after_advance.max_vcpu_cpu_in_phase_ns, 0,
+            "the new phase must not inherit the previous phase's CPU burn"
+        );
+
+        // The next monitor tick observes epoch 1, re-anchors, and publishes
+        // current-generation evidence. It becomes eligible immediately.
+        l.record_liveness(
+            20_100_000_000,
+            42,
+            1,
+            false,
+            0,
+            CPU_CURRENCY_PTHREAD,
+            false,
+            true,
+        );
+        assert_eq!(l.snapshot().max_vcpu_cpu_in_phase_ns, 42);
+    }
+
+    #[test]
+    fn advance_phase_walks_forward_bumping_epochs_and_wall_anchor() {
+        let l = ProgressLedger::default();
+        assert_eq!(l.phase.load(Ordering::Relaxed), LifecycleStage::Boot as u8);
+
+        // Boot→Attach: both epochs bump and the wall milestone anchor
+        // stamps. The Tier-1 CPU anchor is NOT touched here — it lives
+        // monitor-side (`max_vcpu_cpu_in_phase_ns`), re-anchored when the
+        // monitor observes this `phase_epoch` bump.
+        assert!(l.advance_phase(LifecycleStage::Attach as u8, 11));
+        assert_eq!(
+            l.phase.load(Ordering::Relaxed),
+            LifecycleStage::Attach as u8
+        );
+        assert_eq!(l.phase_epoch.load(Ordering::Acquire), 1);
+        assert_eq!(l.progress_epoch.load(Ordering::Acquire), 1);
+        assert_eq!(l.wall_ns_at_progress.load(Ordering::Relaxed), 11);
+
+        // Attach→Body (a skip is still forward): epochs + wall anchor move.
+        assert!(l.advance_phase(LifecycleStage::Body as u8, 22));
+        assert_eq!(l.phase.load(Ordering::Relaxed), LifecycleStage::Body as u8);
+        assert_eq!(l.phase_epoch.load(Ordering::Acquire), 2);
+        assert_eq!(l.progress_epoch.load(Ordering::Acquire), 2);
+        assert_eq!(l.wall_ns_at_progress.load(Ordering::Relaxed), 22);
+    }
+
+    #[test]
+    fn advance_phase_never_regresses() {
+        let l = ProgressLedger::default();
+        assert!(l.advance_phase(LifecycleStage::Teardown as u8, 5));
+        let pe = l.phase_epoch.load(Ordering::Acquire);
+        let pr = l.progress_epoch.load(Ordering::Acquire);
+        let wall = l.wall_ns_at_progress.load(Ordering::Relaxed);
+
+        // Lower stage: no-op, returns false, touches nothing.
+        assert!(!l.advance_phase(LifecycleStage::Body as u8, 6));
+        // Equal stage (duplicate): no-op too.
+        assert!(!l.advance_phase(LifecycleStage::Teardown as u8, 7));
+
+        assert_eq!(
+            l.phase.load(Ordering::Relaxed),
+            LifecycleStage::Teardown as u8
+        );
+        assert_eq!(l.phase_epoch.load(Ordering::Acquire), pe);
+        assert_eq!(l.progress_epoch.load(Ordering::Acquire), pr);
+        assert_eq!(l.wall_ns_at_progress.load(Ordering::Relaxed), wall);
+    }
+
+    #[test]
+    fn stage_class_and_from_u8_are_conservative() {
+        assert_eq!(LifecycleStage::Boot.class(), StageClass::Infra);
+        assert_eq!(LifecycleStage::Attach.class(), StageClass::Infra);
+        assert_eq!(LifecycleStage::Dispatch.class(), StageClass::Infra);
+        assert_eq!(LifecycleStage::Body.class(), StageClass::Body);
+        assert_eq!(LifecycleStage::Teardown.class(), StageClass::Infra);
+
+        assert_eq!(LifecycleStage::from_u8(0), LifecycleStage::Boot);
+        assert_eq!(LifecycleStage::from_u8(3), LifecycleStage::Body);
+        assert_eq!(LifecycleStage::from_u8(4), LifecycleStage::Teardown);
+        // Unknown byte → conservative Boot.
+        assert_eq!(LifecycleStage::from_u8(200), LifecycleStage::Boot);
+    }
 }
 
 /// Per-CPU state read from guest VM memory.
@@ -947,9 +1601,10 @@ pub struct BpfMapFieldValue {
 /// Aggregate schedstat deltas computed from first/last monitor samples.
 ///
 /// All values are summed across CPUs and represent the delta over the
-/// monitoring window. `total_schedstat_wall_sec` carries that window's span in
-/// seconds — the denominator for the per-second schedstat Rate metrics
-/// (`*_per_sec`, derived in the metric registry).
+/// monitoring window. `total_schedstat_vcpu_sec` carries the average vCPU
+/// pthread CPU-clock advance over that same window — the denominator for the
+/// dilation-safe schedstat activity-density metrics (`*_per_vcpu_sec`, derived
+/// in the metric registry).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SchedstatDeltas {
     /// Total scheduling delay increase (ns) across all CPUs.
@@ -966,10 +1621,12 @@ pub struct SchedstatDeltas {
     pub total_ttwu_count: u64,
     /// Total ttwu_local count increase across all CPUs.
     pub total_ttwu_local: u64,
-    /// Monitor-window span in seconds (last-first schedstat-bearing sample) —
-    /// the denominator for the per-second schedstat Rate metrics; 0.0 on a
-    /// degenerate single-sample window.
-    pub total_schedstat_wall_sec: f64,
+    /// Mean vCPU pthread CPU-clock advance in seconds over the first/last
+    /// schedstat-bearing samples. This is the CPU time an average vCPU actually
+    /// received, so host preemption does not inflate the denominator. `None`
+    /// when an endpoint lacks any vCPU clock, the vCPU vectors differ, a clock
+    /// regresses, or no CPU time accrued.
+    pub total_schedstat_vcpu_sec: Option<f64>,
 }
 
 /// Per-domain-level CFS load-balance counter deltas over the monitoring window.
@@ -1025,18 +1682,25 @@ pub struct SchedDomainLbDelta {
 /// Aggregate event counter statistics computed from first/last samples.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ScxEventDeltas {
+    /// Mean vCPU pthread CPU-clock advance over the event-counter endpoints.
+    /// Shared denominator for dilation-safe event activity rates.
+    pub total_event_vcpu_sec: Option<f64>,
     /// Total select_cpu_fallback events across all CPUs over the window.
     pub total_fallback: i64,
-    /// Fallback events per second (total_fallback / duration_secs).
-    pub fallback_rate: f64,
+    /// Fallback events per average vCPU CPU-second. The denominator is the
+    /// mean pthread CPU-clock advance across every vCPU over the same window,
+    /// so host preemption cannot dilute the rate. `None` when any endpoint
+    /// lacks a vCPU CPU clock or the window accrued no vCPU CPU time.
+    pub fallback_rate: Option<f64>,
     /// Max single-sample delta of fallback across all CPUs.
     pub max_fallback_burst: i64,
     /// Total dispatch_local_dsq_offline events.
     pub total_dispatch_offline: i64,
     /// Total dispatch_keep_last events.
     pub total_dispatch_keep_last: i64,
-    /// Keep-last events per second (total_dispatch_keep_last / duration_secs).
-    pub keep_last_rate: f64,
+    /// Keep-last events per average vCPU CPU-second. Same denominator and
+    /// loud-absent rules as [`Self::fallback_rate`].
+    pub keep_last_rate: Option<f64>,
     /// Total enq_skip_exiting events.
     pub total_enq_skip_exiting: i64,
     /// Total enq_skip_migration_disabled events.
@@ -1060,6 +1724,30 @@ pub struct ScxEventDeltas {
 }
 
 impl MonitorSummary {
+    /// Mean per-vCPU pthread CPU-clock advance between two monitor samples.
+    ///
+    /// Requiring a complete, stable vCPU vector is deliberate: event and
+    /// schedstat numerators are summed over every guest CPU, so estimating the
+    /// denominator from only the surviving clocks would silently fabricate a
+    /// rate. A blocked/idle vCPU contributes zero CPU time, which is correct for
+    /// this activity-density currency; host-preempted time contributes nothing.
+    pub(crate) fn mean_vcpu_cpu_delta_secs(
+        first: &MonitorSample,
+        last: &MonitorSample,
+    ) -> Option<f64> {
+        if first.cpus.is_empty() || first.cpus.len() != last.cpus.len() {
+            return None;
+        }
+        let mut total_ns = 0u64;
+        for (a, b) in first.cpus.iter().zip(&last.cpus) {
+            let (Some(a), Some(b)) = (a.vcpu_cpu_time_ns, b.vcpu_cpu_time_ns) else {
+                return None;
+            };
+            total_ns = total_ns.checked_add(b.checked_sub(a)?)?;
+        }
+        (total_ns > 0).then(|| total_ns as f64 / first.cpus.len() as f64 / 1_000_000_000.0)
+    }
+
     /// Summarize a run's monitor samples using the derived default
     /// preemption threshold (equivalent to
     /// [`from_samples_with_threshold`](Self::from_samples_with_threshold)
@@ -1106,22 +1794,48 @@ impl MonitorSummary {
         ext: &mut std::collections::BTreeMap<String, f64>,
         counter_keys: &mut std::collections::BTreeSet<String>,
     ) {
-        if self.total_samples == 0 {
-            return;
+        if self.total_samples > 0 {
+            ext.entry("avg_nr_running".to_string())
+                .or_insert(self.avg_nr_running);
+            if let Some(v) = self.avg_irq_util {
+                ext.entry("avg_irq_util".to_string()).or_insert(v);
+            }
+            if let Some(v) = self.max_avg_irq_util {
+                ext.entry("max_avg_irq_util".to_string()).or_insert(v);
+            }
+            if let Some(v) = self.psi_irq_full_avg10 {
+                ext.entry("psi_irq_full_avg10".to_string()).or_insert(v);
+            }
+            if let Some(v) = self.total_irq_pressure_us {
+                ext.entry("total_irq_pressure_us".to_string()).or_insert(v);
+            }
         }
-        ext.entry("avg_nr_running".to_string())
-            .or_insert(self.avg_nr_running);
-        if let Some(v) = self.avg_irq_util {
-            ext.entry("avg_irq_util".to_string()).or_insert(v);
+        if let Some(events) = &self.event_deltas
+            && let Some(vcpu_sec) = events.total_event_vcpu_sec
+        {
+            ext.entry("total_fallback_pooled".to_string())
+                .or_insert(events.total_fallback as f64);
+            ext.entry("total_keep_last_pooled".to_string())
+                .or_insert(events.total_dispatch_keep_last as f64);
+            ext.entry("total_event_vcpu_sec".to_string())
+                .or_insert(vcpu_sec);
         }
-        if let Some(v) = self.max_avg_irq_util {
-            ext.entry("max_avg_irq_util".to_string()).or_insert(v);
-        }
-        if let Some(v) = self.psi_irq_full_avg10 {
-            ext.entry("psi_irq_full_avg10".to_string()).or_insert(v);
-        }
-        if let Some(v) = self.total_irq_pressure_us {
-            ext.entry("total_irq_pressure_us".to_string()).or_insert(v);
+        if let Some(sd) = &self.schedstat_deltas {
+            for (key, value) in [
+                ("total_run_delay", sd.total_run_delay),
+                ("total_pcount", sd.total_pcount),
+                ("total_sched_count", sd.total_sched_count),
+                ("total_yld_count", sd.total_yld_count),
+                ("total_sched_goidle", sd.total_sched_goidle),
+                ("total_ttwu_count", sd.total_ttwu_count),
+                ("total_ttwu_local", sd.total_ttwu_local),
+            ] {
+                ext.entry(key.to_string()).or_insert(value as f64);
+            }
+            if let Some(vcpu_sec) = sd.total_schedstat_vcpu_sec {
+                ext.entry("total_schedstat_vcpu_sec".to_string())
+                    .or_insert(vcpu_sec);
+            }
         }
         // Per-domain-level CFS load-balance counters: one key set per topology
         // level present in the run, level-suffixed (e.g. lb_failed_mc). These
@@ -1335,8 +2049,8 @@ impl MonitorSummary {
     /// Compute event counter deltas from the sample series.
     /// Returns None if no samples have event counters.
     fn compute_event_deltas(samples: &[MonitorSample]) -> Option<ScxEventDeltas> {
-        // Find first and last samples that have event counters on any CPU.
-        let has_events = |s: &MonitorSample| s.cpus.iter().any(|c| c.event_counters.is_some());
+        // Find first and last samples with complete cross-vCPU event evidence.
+        let has_events = MonitorSample::has_complete_event_counters;
         let first = samples.iter().find(|s| has_events(s))?;
         let last = samples.iter().rev().find(|s| has_events(s))?;
 
@@ -1351,19 +2065,13 @@ impl MonitorSummary {
             first.sum_event_field(|e| e.dispatch_keep_last).unwrap_or(0),
         );
 
-        // Compute rates.
-        let duration_ms = last.elapsed_ms.saturating_sub(first.elapsed_ms);
-        let duration_secs = duration_ms as f64 / 1000.0;
-        let fallback_rate = if duration_secs > 0.0 {
-            total_fallback as f64 / duration_secs
-        } else {
-            0.0
-        };
-        let keep_last_rate = if duration_secs > 0.0 {
-            total_keep_last as f64 / duration_secs
-        } else {
-            0.0
-        };
+        // Dilation-safe activity density over the SAME endpoint pair as the
+        // event deltas. Dividing by mean vCPU CPU time preserves the historical
+        // total-events-per-second magnitude on an undilated fully-busy VM while
+        // excluding host-stolen time. Missing CPU-clock evidence stays absent.
+        let vcpu_secs = Self::mean_vcpu_cpu_delta_secs(first, last);
+        let fallback_rate = vcpu_secs.map(|secs| total_fallback as f64 / secs);
+        let keep_last_rate = vcpu_secs.map(|secs| total_keep_last as f64 / secs);
 
         // Max per-sample fallback burst: largest delta between consecutive
         // samples, summed across all CPUs. A counter reset between
@@ -1371,8 +2079,12 @@ impl MonitorSummary {
         // letting it decrease the running max.
         let mut max_fallback_burst: i64 = 0;
         for w in samples.windows(2) {
-            let prev_sum = w[0].sum_event_field(|e| e.select_cpu_fallback).unwrap_or(0);
-            let curr_sum = w[1].sum_event_field(|e| e.select_cpu_fallback).unwrap_or(0);
+            let (Some(prev_sum), Some(curr_sum)) = (
+                w[0].sum_event_field(|e| e.select_cpu_fallback),
+                w[1].sum_event_field(|e| e.select_cpu_fallback),
+            ) else {
+                continue;
+            };
             let delta = counter_delta(curr_sum, prev_sum);
             if delta > max_fallback_burst {
                 max_fallback_burst = delta;
@@ -1387,6 +2099,7 @@ impl MonitorSummary {
         };
 
         Some(ScxEventDeltas {
+            total_event_vcpu_sec: vcpu_secs,
             total_fallback,
             fallback_rate,
             max_fallback_burst,
@@ -1407,22 +2120,22 @@ impl MonitorSummary {
     }
 
     /// Compute schedstat deltas from the sample series.
-    /// Returns None if no samples have schedstat data on any CPU.
+    /// Returns None if no sample has complete cross-vCPU schedstat data.
     fn compute_schedstat_deltas(samples: &[MonitorSample]) -> Option<SchedstatDeltas> {
-        let has_schedstat = |s: &MonitorSample| s.cpus.iter().any(|c| c.schedstat.is_some());
+        let has_schedstat = MonitorSample::has_complete_schedstat;
         let first = samples.iter().find(|s| has_schedstat(s))?;
         let last = samples.iter().rev().find(|s| has_schedstat(s))?;
 
         let sum_field = |s: &MonitorSample, f: fn(&RqSchedstat) -> u64| -> u64 {
             s.cpus
                 .iter()
-                .filter_map(|c| c.schedstat.as_ref().map(&f))
+                .map(|c| f(c.schedstat.as_ref().expect("completeness checked")))
                 .sum()
         };
         let sum_field_u32 = |s: &MonitorSample, f: fn(&RqSchedstat) -> u32| -> u64 {
             s.cpus
                 .iter()
-                .filter_map(|c| c.schedstat.as_ref().map(|ss| f(ss) as u64))
+                .map(|c| f(c.schedstat.as_ref().expect("completeness checked")) as u64)
                 .sum()
         };
 
@@ -1441,14 +2154,10 @@ impl MonitorSummary {
         let total_ttwu_local = sum_field_u32(last, |ss| ss.ttwu_local)
             .saturating_sub(sum_field_u32(first, |ss| ss.ttwu_local));
 
-        // Window span over the SAME first/last schedstat-bearing samples the
-        // total_* deltas span — the provenance-correct per-second denominator
-        // (a different window than the IRQ total_phase_wall_sec, so this carries
-        // its own). The registry per-second Rates divide the total_* numerators
-        // by this; 0.0 on a single-sample window disables the rate (Rate
-        // derivation skips a zero/non-finite denominator).
-        let duration_ms = last.elapsed_ms.saturating_sub(first.elapsed_ms);
-        let duration_secs = duration_ms as f64 / 1000.0;
+        // CPU currency over the SAME first/last schedstat-bearing samples the
+        // total_* deltas span. Unlike wall duration, this does not grow while
+        // the host has preempted the guest's vCPU threads.
+        let total_schedstat_vcpu_sec = Self::mean_vcpu_cpu_delta_secs(first, last);
 
         Some(SchedstatDeltas {
             total_run_delay,
@@ -1458,7 +2167,7 @@ impl MonitorSummary {
             total_sched_goidle,
             total_ttwu_count,
             total_ttwu_local,
-            total_schedstat_wall_sec: duration_secs,
+            total_schedstat_vcpu_sec,
         })
     }
 
@@ -1740,9 +2449,11 @@ pub struct MonitorThresholds {
     pub fail_on_rq_clock_stuck: bool,
     /// Number of consecutive samples that must violate a threshold before flagging.
     pub sustained_samples: usize,
-    /// Max sustained select_cpu_fallback events/s across all CPUs.
+    /// Max sustained select_cpu_fallback events per average vCPU CPU-second
+    /// across all CPUs.
     pub max_fallback_rate: f64,
-    /// Max sustained dispatch_keep_last events/s across all CPUs.
+    /// Max sustained dispatch_keep_last events per average vCPU CPU-second
+    /// across all CPUs.
     pub max_keep_last_rate: f64,
     /// Promote threshold violations from report-only to pass/fail.
     /// When `false` (the default),
@@ -1814,10 +2525,10 @@ impl MonitorThresholds {
     ///   reconfiguration, cgroup creation, and scheduler restart.
     /// - max_fallback_rate 200.0: select_cpu_fallback fires when the
     ///   scheduler's ops.select_cpu() fails to find a CPU. Sustained
-    ///   200/s across all CPUs indicates systematic select_cpu failure.
+    ///   200/vCPU-s across all CPUs indicates systematic select_cpu failure.
     /// - max_keep_last_rate 100.0: dispatch_keep_last fires when a CPU
     ///   re-dispatches the previously running task because the scheduler
-    ///   provided nothing. Sustained 100/s indicates dispatch starvation.
+    ///   provided nothing. Sustained 100/vCPU-s indicates dispatch starvation.
     pub const fn new() -> Self {
         Self {
             max_imbalance_ratio: 4.0,
@@ -2072,7 +2783,7 @@ impl MonitorThresholds {
         if fallback_rate.sustained(self.sustained_samples) {
             failed = true;
             details.push(format!(
-                "fallback rate {:.1}/s exceeded threshold {:.1}/s for {} consecutive intervals (ending at sample {})",
+                "fallback rate {:.1}/vcpu-s exceeded threshold {:.1}/vcpu-s for {} consecutive intervals (ending at sample {})",
                 fallback_rate.worst_value,
                 self.max_fallback_rate,
                 fallback_rate.worst_run,
@@ -2082,7 +2793,7 @@ impl MonitorThresholds {
         if keep_last_rate.sustained(self.sustained_samples) {
             failed = true;
             details.push(format!(
-                "keep_last rate {:.1}/s exceeded threshold {:.1}/s for {} consecutive intervals (ending at sample {})",
+                "keep_last rate {:.1}/vcpu-s exceeded threshold {:.1}/vcpu-s for {} consecutive intervals (ending at sample {})",
                 keep_last_rate.worst_value,
                 self.max_keep_last_rate,
                 keep_last_rate.worst_run,
@@ -2178,12 +2889,11 @@ impl MonitorThresholds {
         stuck
     }
 
-    /// Per-interval event-counter rate computation against fallback /
-    /// keep_last thresholds. Returns `(fallback, keep_last)` trackers
-    /// keyed by sample index. Intervals with zero or negative duration,
-    /// or with missing event counters on either side, record a
-    /// non-violation `0.0` so the sustained-window state machine
-    /// continues to advance.
+    /// Per-interval event-counter activity density against fallback /
+    /// keep_last thresholds. The denominator is mean vCPU CPU-seconds, not
+    /// wall time, so host preemption cannot make a broken scheduler look quiet.
+    /// Intervals lacking a complete CPU-clock denominator or event counters
+    /// record a non-violation and reset the sustained streak.
     fn track_event_rates(
         &self,
         samples: &[MonitorSample],
@@ -2194,12 +2904,11 @@ impl MonitorThresholds {
         for i in 1..samples.len() {
             let prev = &samples[i - 1];
             let curr = &samples[i];
-            let interval_s = curr.elapsed_ms.saturating_sub(prev.elapsed_ms) as f64 / 1000.0;
-            if interval_s <= 0.0 {
+            let Some(interval_s) = MonitorSummary::mean_vcpu_cpu_delta_secs(prev, curr) else {
                 fallback_rate.record(false, 0.0, i);
                 keep_last_rate.record(false, 0.0, i);
                 continue;
-            }
+            };
 
             if let (Some(prev_fb), Some(curr_fb)) = (
                 prev.sum_event_field(|e| e.select_cpu_fallback),

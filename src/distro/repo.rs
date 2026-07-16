@@ -945,12 +945,37 @@ fn resolve_ubuntu(release: Option<&str>, arch: &str) -> Result<ResolvedDistroKer
     };
 
     let debs = fetch_deb_packages(archive_base, &codename, deb_arch)?;
+    // Fetch debuginfo metadata up front: the chosen kernel version
+    // depends on which kernels actually have a published dbgsym ddeb.
+    let ddebs = fetch_deb_packages(UBUNTU_DDEBS, &codename, deb_arch)?;
     let meta_name = format!("linux-image-generic-hwe-{version}");
     let meta_pkg = newest_deb(&debs, &meta_name).ok_or_else(|| {
         anyhow!("HWE meta {meta_name} not found in {codename}-updates/{deb_arch}")
     })?;
-    let kver = hwe_kver(meta_pkg)
+    let preferred_kver = hwe_kver(meta_pkg)
         .ok_or_else(|| anyhow!("{meta_name} Depends has no linux-image-*-generic"))?;
+
+    // The HWE meta names the newest supported kernel, but its -dbgsym
+    // ddeb can lag the image publish by hours on ddebs.ubuntu.com. Rather
+    // than hard-fail during that window, resolve the NEWEST kernel that
+    // is FULLY published — image AND debuginfo both present. Debuginfo
+    // stays mandatory (see [`newest_kver_with_debuginfo`]); we just don't
+    // demand the bleeding edge when an equally-valid, complete kernel is
+    // one step back. A hard error remains only when NO kernel in the
+    // series has debuginfo — a genuinely broken archive, not a lag.
+    let kver = newest_kver_with_debuginfo(&debs, &ddebs).ok_or_else(|| {
+        anyhow!(
+            "no Ubuntu {codename}-updates/{deb_arch} kernel has both an image and \
+             a dbgsym ddeb on ddebs.ubuntu.com — debuginfo is mandatory"
+        )
+    })?;
+    if kver != preferred_kver {
+        eprintln!(
+            "ktstr: newest HWE kernel {preferred_kver} has no dbgsym ddeb yet \
+             (Ubuntu ddebs lag a publish by hours); using {kver}, the newest \
+             fully-published kernel with debuginfo"
+        );
+    }
 
     // The HWE meta's Depends chain: linux-image (vmlinuz) ->
     // linux-modules, plus linux-modules-extra (the meta depends on it
@@ -965,22 +990,60 @@ fn resolve_ubuntu(release: Option<&str>, arch: &str) -> Result<ResolvedDistroKer
 
     // Debuginfo: the -dbgsym ddeb carries vmlinux. The unsigned image's
     // dbgsym is the canonical vmlinux carrier; fall back to the signed
-    // one. ddebs can lag a kernel publish by hours — a miss is a hard
-    // error since debuginfo is mandatory here.
-    let ddebs = fetch_deb_packages(UBUNTU_DDEBS, &codename, deb_arch)?;
+    // one. `kver` was chosen above to guarantee one of these exists, so
+    // this resolves — the bail is defensive.
     let dbg_names = [
         format!("linux-image-unsigned-{kver}-generic-dbgsym"),
         format!("linux-image-{kver}-generic-dbgsym"),
     ];
     let debuginfo = ubuntu_dbgsym_refs(&ddebs, &dbg_names, &kver, &codename, deb_arch)?;
 
+    // Report the CHOSEN kernel's image version (a fallback may be older
+    // than the HWE meta's), not the meta package's.
+    let kernel_release = newest_deb(&debs, &format!("linux-image-{kver}-generic"))
+        .map(|p| p.version.clone())
+        .unwrap_or_else(|| meta_pkg.version.clone());
+
     Ok(ResolvedDistroKernel {
         distro: format!("ubuntu{version}-hwe"),
-        kernel_release: meta_pkg.version.clone(),
+        kernel_release,
         arch: deb_arch.to_string(),
         packages,
         debuginfo,
     })
+}
+
+/// Newest kernel `{kver}` (e.g. `6.17.0-38`) in the `-updates` `debs`
+/// that is FULLY published: it has a `linux-image-{kver}-generic` image
+/// deb AND a matching dbgsym ddeb (unsigned preferred, signed fallback)
+/// in `ddebs`. Ordered by the image package's Debian version, newest
+/// first. `None` only when no kernel in the series has debuginfo at all.
+///
+/// This is the fallback that tolerates the hours-long window where a
+/// just-published kernel's ddeb has not yet landed on ddebs.ubuntu.com:
+/// the newest kernel whose debuginfo IS present is picked instead of
+/// hard-failing on the bleeding edge. `{kver}` candidates come from the
+/// image debs (not the ddebs) so a stray dbgsym without a matching image
+/// can never be selected; the digit-prefix filter drops meta/unsigned/
+/// flavored names, leaving only concrete `MAJOR.MINOR.PATCH-ABI` kvers.
+fn newest_kver_with_debuginfo(debs: &[DebPkg], ddebs: &[DebPkg]) -> Option<String> {
+    let has_ddeb = |kver: &str| {
+        ddebs.iter().any(|p| {
+            p.package == format!("linux-image-unsigned-{kver}-generic-dbgsym")
+                || p.package == format!("linux-image-{kver}-generic-dbgsym")
+        })
+    };
+    debs.iter()
+        .filter_map(|p| {
+            p.package
+                .strip_prefix("linux-image-")
+                .and_then(|s| s.strip_suffix("-generic"))
+                .filter(|kver| kver.chars().next().is_some_and(|c| c.is_ascii_digit()))
+                .map(|kver| (kver.to_string(), p))
+        })
+        .filter(|(kver, _)| has_ddeb(kver))
+        .max_by(|(_, a), (_, b)| deb_version_cmp(&a.version, &b.version))
+        .map(|(kver, _)| kver)
 }
 
 /// Fetch and parse `{codename}-updates` `Packages.gz` for `deb_arch`.

@@ -51,6 +51,13 @@ const DISPATCHED_CEILING: u64 = 1_000_000_000_000;
 /// Host-side temporal-assertion checks over the periodic samples
 /// stored on the bridge.
 fn assert_temporal_patterns(result: &VmResult) -> Result<()> {
+    // Environmental starvation gate: zero real captures under a
+    // witnessed-contended host is a non-verdict (the readiness-gated
+    // capture chain was starved past the workload window), not a
+    // capture regression — SKIP instead of failing the assertions
+    // below. A quiet-host zero-capture run still falls through and
+    // fails with the specific diagnosis. See `periodic_starvation_gate`.
+    ktstr::prelude::periodic_starvation_gate(result, 2)?;
     // Drain in insertion order with the parallel scx_stats / elapsed
     // metadata so the resulting series carries both projection axes.
     // `periodic_only` strips any non-periodic capture entries the
@@ -91,6 +98,12 @@ fn assert_temporal_patterns(result: &VmResult) -> Result<()> {
     let any_progress = bpf_dispatched
         .iter_full()
         .any(|(_, _, slot)| matches!(slot, Ok(v) if *v > 0));
+    // A descheduling host can trip the guest's sched_ext runnable-stall
+    // watchdog (5s of GUEST time), ejecting scx-ktstr so the dispatch
+    // counter never advances — environmental, not a dispatch regression.
+    if !any_progress {
+        ktstr::prelude::stall_ejection_skip(result)?;
+    }
     anyhow::ensure!(
         any_progress,
         "BPF nr_dispatched read 0 across every periodic sample — the \

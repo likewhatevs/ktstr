@@ -400,6 +400,14 @@ fn eval_cleanup_budget_overshoot_folds_failing_detail() {
     entry.cleanup_budget = Some(std::time::Duration::from_secs(1));
     let mut result = make_vm_result_with_assert("", "", 0, false, &assert);
     result.cleanup_duration = Some(std::time::Duration::from_secs(10));
+    // Attest a QUIET host (whole-run D = 1.05 ≤ the 1.1 enforcement
+    // bar): the re-scoped gate enforces the budget only when the
+    // witness proves the box was idle enough for wall attribution.
+    result.host_vcpu_schedstat = Some(crate::vmm::HostVcpuSchedstat {
+        total_on_cpu_ns: 100,
+        total_run_delay_ns: 5,
+        sampled_vcpus: 1,
+    });
     let assertions = crate::assert::Assert::NO_OVERRIDES;
     let msg = format!(
         "{}",
@@ -426,6 +434,51 @@ fn eval_cleanup_budget_overshoot_folds_failing_detail() {
     assert!(
         msg.contains("budget 1.000s"),
         "budget must be rendered, got: {msg}",
+    );
+}
+
+/// Cleanup-budget contention demotion: the SAME overshoot as
+/// `eval_cleanup_budget_overshoot_folds_failing_detail`, but with a
+/// whole-run witness proving the host was NOT quiet (D = 3.0 > the
+/// 1.1 enforcement bar) — the overrun demotes to a non-blocking
+/// stderr warning and the guest's passing verdict survives. The
+/// join/drain teardown dilates with host load by design; only a
+/// quiet-host overrun is a teardown regression.
+#[test]
+fn eval_cleanup_budget_overshoot_demotes_under_witnessed_contention() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    let assert = build_assert_result(true, vec![]);
+    let mut entry = eevdf_entry("__eval_cleanup_overshoot_contended__");
+    entry.cleanup_budget = Some(std::time::Duration::from_secs(1));
+    let mut result = make_vm_result_with_assert("", "", 0, false, &assert);
+    result.cleanup_duration = Some(std::time::Duration::from_secs(10));
+    // NON-quiet whole-run witness (D = 3.0 > the 1.1 enforcement bar):
+    // the re-scoped gate demotes — join/drain wall on a loaded box is
+    // the joined threads' exit-path starvation, unattributable from
+    // the host side (the joiner-window instrument was field-falsified:
+    // it read D_cleanup = 1.00 on starved runs because the joiner
+    // SLEEPS while the joined threads starve).
+    result.host_vcpu_schedstat = Some(crate::vmm::HostVcpuSchedstat {
+        total_on_cpu_ns: 10,
+        total_run_delay_ns: 20,
+        sampled_vcpus: 1,
+    });
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let res = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    );
+    assert!(
+        res.is_ok(),
+        "a witnessed-contended overrun must not fail the verdict, got: {:?}",
+        res.err(),
     );
 }
 
@@ -710,6 +763,12 @@ fn eval_monitor_fail_has_fingerprint() {
         exit_code: 0,
         duration: std::time::Duration::from_secs(1),
         timed_out: false,
+        watchdog_kill_reason: None,
+        final_guest_phase: crate::vmm::GuestLifecyclePhase::Boot,
+        final_progress_epoch: 0,
+        bpf_map_writes_delivered: None,
+        periodic_prereqs_ready: None,
+        periodic_window_end: None,
         output,
         stderr: String::new(),
         monitor: Some(crate::monitor::MonitorReport {
@@ -730,6 +789,7 @@ fn eval_monitor_fail_has_fingerprint() {
         kvm_stats: None,
         crash_message: None,
         cleanup_duration: None,
+        cleanup_sched_delta: None,
         virtio_blk_counters: None,
         virtio_net_counters: None,
         snapshot_bridge: {
@@ -743,6 +803,8 @@ fn eval_monitor_fail_has_fingerprint() {
         kern_kaslr_offset: 0,
         entry_name: None,
         variant_hash: 0,
+        host_vcpu_schedstat: None,
+        contention_witness: None,
         periodic_series_cache: std::sync::OnceLock::new(),
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES
@@ -1059,6 +1121,12 @@ fn eval_sched_exit_includes_monitor() {
         exit_code: 1,
         duration: std::time::Duration::from_secs(1),
         timed_out: false,
+        watchdog_kill_reason: None,
+        final_guest_phase: crate::vmm::GuestLifecyclePhase::Boot,
+        final_progress_epoch: 0,
+        bpf_map_writes_delivered: None,
+        periodic_prereqs_ready: None,
+        periodic_window_end: None,
         output: String::new(),
         stderr: String::new(),
         monitor: Some(crate::monitor::MonitorReport {
@@ -1088,6 +1156,7 @@ fn eval_sched_exit_includes_monitor() {
         kvm_stats: None,
         crash_message: None,
         cleanup_duration: None,
+        cleanup_sched_delta: None,
         virtio_blk_counters: None,
         virtio_net_counters: None,
         snapshot_bridge: {
@@ -1101,6 +1170,8 @@ fn eval_sched_exit_includes_monitor() {
         kern_kaslr_offset: 0,
         entry_name: None,
         variant_hash: 0,
+        host_vcpu_schedstat: None,
+        contention_witness: None,
         periodic_series_cache: std::sync::OnceLock::new(),
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES;
@@ -1177,6 +1248,12 @@ fn eval_monitor_fail_includes_sched_log() {
         exit_code: 0,
         duration: std::time::Duration::from_secs(1),
         timed_out: false,
+        watchdog_kill_reason: None,
+        final_guest_phase: crate::vmm::GuestLifecyclePhase::Boot,
+        final_progress_epoch: 0,
+        bpf_map_writes_delivered: None,
+        periodic_prereqs_ready: None,
+        periodic_window_end: None,
         output,
         stderr: String::new(),
         monitor: Some(crate::monitor::MonitorReport {
@@ -1197,6 +1274,7 @@ fn eval_monitor_fail_includes_sched_log() {
         kvm_stats: None,
         crash_message: None,
         cleanup_duration: None,
+        cleanup_sched_delta: None,
         virtio_blk_counters: None,
         virtio_net_counters: None,
         snapshot_bridge: {
@@ -1210,6 +1288,8 @@ fn eval_monitor_fail_includes_sched_log() {
         kern_kaslr_offset: 0,
         entry_name: None,
         variant_hash: 0,
+        host_vcpu_schedstat: None,
+        contention_witness: None,
         periodic_series_cache: std::sync::OnceLock::new(),
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES
@@ -1410,7 +1490,7 @@ fn phase_buckets_equals_stats_phases_with_guest_per_cgroup_carriers() {
 /// A guest `AssertResult` carrying ONE measured cgroup (counters + wake/run-delay
 /// reductions), TLV-encoded into a [`crate::vmm::VmResult`] with three stamped
 /// periodic captures. The shared fixture for the `run_metric` parity / boundary
-/// tests below: its `stats.cgroups` drives the pooled `iterations_per_cpu_sec`
+/// tests below: its `stats.cgroups` drives the pooled `iteration_rate`
 /// (family 4) and the `WorstLowest` / Distribution re-pools (family 5) — the
 /// families `VmResult::run_metric` must reconstruct from the guest cgroups.
 #[cfg(test)]
@@ -1445,7 +1525,7 @@ fn run_metric_fixture(cg: crate::assert::CgroupStats) -> crate::vmm::VmResult {
 /// run-level `ext_metrics` `evaluate_vm_result` writes — for every key the eval
 /// path produces, `run_metric` resolves the identical value. Exercises the
 /// families that need the guest per-cgroup roll-up (pooled
-/// `iterations_per_cpu_sec` + the `WorstLowest` / Distribution re-pools), the
+/// `iteration_rate` + the `WorstLowest` / Distribution re-pools), the
 /// reconstruction that makes `run_metric` possible: `check_result.stats.cgroups`
 /// equals `guest_assert_result().stats.cgroups` (the host adds no cgroups —
 /// `evaluate_verdict_folds` merges only empty-cgroup `fail()`s, and
@@ -1487,7 +1567,7 @@ fn run_metric_equals_evaluate_run_level_ext() {
     );
     // Family-4 anchor: the pooled rate is a real ratio in the eval map.
     assert_eq!(
-        ar.stats.ext_metrics.get("iterations_per_cpu_sec").copied(),
+        ar.stats.ext_metrics.get("iteration_rate").copied(),
         Some(500.0),
         "1000 iters / 2.0 cpu-sec = 500 — the pooled rate must be in the eval map",
     );
@@ -1503,7 +1583,7 @@ fn run_metric_equals_evaluate_run_level_ext() {
     }
     // The typed Into<MetricId> path resolves the same value as the &str path.
     assert_eq!(
-        result.run_metric(crate::stats::BuiltinMetric::IterationsPerCpuSec),
+        result.run_metric(crate::stats::BuiltinMetric::IterationRate),
         Some(500.0),
     );
     // A registered ext metric this run did not produce -> None (loud-absent,
@@ -1526,11 +1606,11 @@ fn run_metric_is_non_destructive_alongside_phase_reads() {
         total_cpu_time_ns: 3_000_000_000,
         ..Default::default()
     });
-    let first = result.run_metric("iterations_per_cpu_sec");
+    let first = result.run_metric("iteration_rate");
     // Interleave the other bridge-draining accessors.
     let _pm = result.phase_metric(crate::assert::Phase::step(0), "system_time_ns");
     let _buckets = result.phase_buckets();
-    let second = result.run_metric("iterations_per_cpu_sec");
+    let second = result.run_metric("iteration_rate");
     assert_eq!(first, Some(200.0), "600 iters / 3.0 cpu-sec = 200");
     assert_eq!(
         first, second,
@@ -1541,7 +1621,7 @@ fn run_metric_is_non_destructive_alongside_phase_reads() {
 /// LOUD-ABSENT: `None` means absent (an unregistered key, or a registered
 /// key this run did not produce); `Some(0.0)` means a real measured zero — never
 /// conflated. A cgroup with zero iterations over positive on-CPU time makes
-/// `iterations_per_cpu_sec` a measured `Some(0.0)`.
+/// `iteration_rate` a measured `Some(0.0)`.
 #[test]
 fn run_metric_loud_absent_distinct_from_measured_zero() {
     let _lock = lock_env();
@@ -1554,7 +1634,7 @@ fn run_metric_loud_absent_distinct_from_measured_zero() {
         ..Default::default()
     });
     // measured zero (0 iters over 1.0 cpu-sec) -> Some(0.0)
-    assert_eq!(result.run_metric("iterations_per_cpu_sec"), Some(0.0));
+    assert_eq!(result.run_metric("iteration_rate"), Some(0.0));
     // unregistered dynamic key -> None
     assert_eq!(result.run_metric("scx_totally_made_up_key"), None);
     // registered ext metric this run did not produce -> None
@@ -1589,7 +1669,7 @@ fn run_metric_resolves_typed_excludes_monitor_metrics() {
     assert_eq!(result.run_metric("max_imbalance_ratio"), None);
     assert_eq!(result.run_metric("stuck_count"), None);
     // the ext-sourced pooled rate IS resolved (1000 iters / 2 s).
-    assert_eq!(result.run_metric("iterations_per_cpu_sec"), Some(500.0));
+    assert_eq!(result.run_metric("iteration_rate"), Some(500.0));
 }
 
 /// HOST-ONLY / EMPTY: a `VmResult` with no guest verdict and no captures
@@ -1598,7 +1678,7 @@ fn run_metric_resolves_typed_excludes_monitor_metrics() {
 #[test]
 fn run_metric_host_only_run_yields_none() {
     let result = crate::vmm::VmResult::test_fixture();
-    assert_eq!(result.run_metric("iterations_per_cpu_sec"), None);
+    assert_eq!(result.run_metric("iteration_rate"), None);
     assert_eq!(result.run_metric("total_hardirqs"), None);
     assert_eq!(result.run_metric("worst_p99_wake_latency_us"), None);
     assert_eq!(result.run_metric("scx_made_up"), None);
@@ -1618,7 +1698,7 @@ fn run_metric_absent_rate_is_none_not_inf() {
         total_cpu_time_ns: 0,
         ..Default::default()
     });
-    let v = result.run_metric("iterations_per_cpu_sec");
+    let v = result.run_metric("iteration_rate");
     assert_eq!(v, None, "zero-denominator rate must be absent, not inf/NaN");
 }
 
@@ -1651,6 +1731,7 @@ fn phase_buckets_derives_schbench_perphase_metrics() {
         worker_run_delay_ns: 0,
         worker_pcount: 0,
         loop_count: 42,
+        worker_cpu_ns: 0,
     };
     let mut guest_assert = build_assert_result(true, vec![]);
     let mut pc = std::collections::BTreeMap::new();
@@ -1740,6 +1821,7 @@ fn better_across_phases_orients_by_polarity_end_to_end() {
                 worker_run_delay_ns: 0,
                 worker_pcount: 0,
                 loop_count: loops,
+                worker_cpu_ns: 1_000_000_000,
             }),
             ..Default::default()
         }
@@ -1814,13 +1896,12 @@ fn better_across_phases_orients_by_polarity_end_to_end() {
         v3.into_anyhow_or_log().is_err(),
         "absent metric -> inconclusive -> Err (no silent pass)"
     );
-    // HigherBetter through production: schbench_loop_count is HigherBetter, so
-    // scx (candidate, loop 200) beats EEVDF (baseline, loop 50) — proving the
-    // SAME call orients a HigherBetter metric, direction from the registry (not
-    // just the LowerBetter latency above).
+    // HigherBetter through production: CPU-second throughput is directional,
+    // while the raw loop count is informational. With one worker CPU-second on
+    // each side, the derived values equal the loop counts.
     let mut v4 = crate::assert::Verdict::new();
     result
-        .better_across_phases(&mut v4, eevdf, scx, "schbench_loop_count")
+        .better_across_phases(&mut v4, eevdf, scx, "schbench_loops_per_cpu_sec")
         .better_than();
     assert!(
         v4.into_anyhow_or_log().is_ok(),
@@ -1828,7 +1909,7 @@ fn better_across_phases_orients_by_polarity_end_to_end() {
     );
     let mut v5 = crate::assert::Verdict::new();
     result
-        .better_across_phases(&mut v5, scx, eevdf, "schbench_loop_count")
+        .better_across_phases(&mut v5, scx, eevdf, "schbench_loops_per_cpu_sec")
         .better_than();
     assert!(
         v5.into_anyhow_or_log().is_err(),
@@ -1878,6 +1959,7 @@ fn phase_cgroup_metric_and_better_across_phases_cgroup_end_to_end() {
                 worker_run_delay_ns: 0,
                 worker_pcount: 0,
                 loop_count: loops,
+                worker_cpu_ns: 1_000_000_000,
             }),
             total_migrations: migs,
             ..Default::default()
@@ -1930,11 +2012,11 @@ fn phase_cgroup_metric_and_better_across_phases_cgroup_end_to_end() {
     let eevdf = crate::assert::Phase::step(1); // step_index 2
     // phase_cgroup_metric reads the NAMED cgroup, distinct per cgroup (not pooled).
     assert_eq!(
-        result.phase_cgroup_metric(scx, "cg_a", "schbench_loop_count"),
+        result.phase_cgroup_metric(scx, "cg_a", "schbench_loops_per_cpu_sec"),
         Some(200.0)
     );
     assert_eq!(
-        result.phase_cgroup_metric(scx, "cg_b", "schbench_loop_count"),
+        result.phase_cgroup_metric(scx, "cg_b", "schbench_loops_per_cpu_sec"),
         Some(80.0)
     );
     // Counter fallback (carrier field, not a derived metric): cg_a step-1 migrations 7.
@@ -1944,18 +2026,18 @@ fn phase_cgroup_metric_and_better_across_phases_cgroup_end_to_end() {
     );
     // None taxonomy: missing cgroup, typo metric.
     assert_eq!(
-        result.phase_cgroup_metric(scx, "missing", "schbench_loop_count"),
+        result.phase_cgroup_metric(scx, "missing", "schbench_loops_per_cpu_sec"),
         None
     );
     assert_eq!(
         result.phase_cgroup_metric(scx, "cg_a", "not_a_metric"),
         None
     );
-    // better_across_phases_cgroup orients per-cgroup: cg_a scx loop 200 > eevdf 50
-    // (HigherBetter) -> better; the reverse framing -> Err.
+    // better_across_phases_cgroup orients the named cgroup's CPU-second
+    // throughput; the reverse framing must fail.
     let mut v = crate::assert::Verdict::new();
     result
-        .better_across_phases_cgroup(&mut v, eevdf, scx, "cg_a", "schbench_loop_count")
+        .better_across_phases_cgroup(&mut v, eevdf, scx, "cg_a", "schbench_loops_per_cpu_sec")
         .better_than();
     assert!(
         v.into_anyhow_or_log().is_ok(),
@@ -1963,7 +2045,7 @@ fn phase_cgroup_metric_and_better_across_phases_cgroup_end_to_end() {
     );
     let mut v2 = crate::assert::Verdict::new();
     result
-        .better_across_phases_cgroup(&mut v2, scx, eevdf, "cg_a", "schbench_loop_count")
+        .better_across_phases_cgroup(&mut v2, scx, eevdf, "cg_a", "schbench_loops_per_cpu_sec")
         .better_than();
     assert!(
         v2.into_anyhow_or_log().is_err(),
@@ -1973,7 +2055,7 @@ fn phase_cgroup_metric_and_better_across_phases_cgroup_end_to_end() {
     // scx is NOT better for cg_b — proving the lookup reads cg_b, not the pool.
     let mut v3 = crate::assert::Verdict::new();
     result
-        .better_across_phases_cgroup(&mut v3, eevdf, scx, "cg_b", "schbench_loop_count")
+        .better_across_phases_cgroup(&mut v3, eevdf, scx, "cg_b", "schbench_loops_per_cpu_sec")
         .better_than();
     assert!(
         v3.into_anyhow_or_log().is_err(),
@@ -2236,9 +2318,9 @@ fn evaluate_failure_message_renders_per_cgroup_via_folded_timeline() {
 
 /// Through the production eval path: with stimulus StepStarts
 /// spanning steps 1..3 but periodic captures landing only in step 1,
-/// evaluate_vm_result's stats.phases must contain a SYNTHESIZED bucket
-/// (sample_count==0) for the uncaptured steps carrying their
-/// stimulus-derived iteration_rate. This is the --cell-parent-cgroup
+/// evaluate_vm_result's stats.phases must contain a synthesized bucket
+/// (sample_count==0) for the uncaptured steps, without fabricating an
+/// iteration rate from stimulus wall time. This is the --cell-parent-cgroup
 /// short-interior-step scenario, pinned through
 /// evaluate_vm_result (not just build_phase_buckets_with_stimulus): the
 /// non-empty synthesized buckets also flip timeline selection onto the
@@ -2311,9 +2393,8 @@ fn evaluate_synthesizes_phase_buckets_for_uncaptured_steps() {
     assert_eq!(step2.sample_count, 0, "synthesized bucket is capture-free");
     assert_eq!(
         step2.metrics.get("iteration_rate").copied(),
-        Some(1000.0),
-        "synthesized step 2 carries its stimulus-derived rate \
-         (StepStart[2]=1000 -> StepStart[3]=2000 over 1s) through evaluate",
+        None,
+        "a synthesized wall-only step must not fabricate iteration_rate",
     );
 }
 
@@ -2511,8 +2592,8 @@ fn acquire_test_kernel_lock_if_cached_returns_none_outside_cache() {
 /// substring contract so a rewording in
 /// `crate::flock`'s bail message that drops either substring is
 /// caught here rather than silently degrading flock-timeout
-/// classification (a SKIP-able `ResourceContention`) into a
-/// hard-error plain anyhow.
+/// classification (a typed, retryable `ResourceContention`) into an
+/// unclassified plain anyhow.
 ///
 /// The test feeds the seam a representative shared-lock-timeout
 /// rendering (matching the literal format produced at
@@ -2604,7 +2685,7 @@ fn eval_timeout_sched_exited_reason_override() {
         "the override must replace the default ERR_TIMED_OUT_NO_RESULT body, got: {msg}",
     );
     assert!(
-        msg.contains("--- watchdog ---"),
+        msg.contains("--- ktstr-watchdog ---"),
         "watchdog diagnostic block must render on the timed-out arm, got: {msg}",
     );
 }
@@ -2646,7 +2727,7 @@ fn eval_timeout_sched_exited_empty_message() {
         "the override must replace the default ERR_TIMED_OUT_NO_RESULT body, got: {msg}",
     );
     assert!(
-        msg.contains("--- watchdog ---"),
+        msg.contains("--- ktstr-watchdog ---"),
         "watchdog diagnostic block must render, got: {msg}",
     );
 }
@@ -3097,6 +3178,12 @@ fn eval_monitor_inconclusive_folds_into_verdict() {
         exit_code: 0,
         duration: std::time::Duration::from_secs(1),
         timed_out: false,
+        watchdog_kill_reason: None,
+        final_guest_phase: crate::vmm::GuestLifecyclePhase::Boot,
+        final_progress_epoch: 0,
+        bpf_map_writes_delivered: None,
+        periodic_prereqs_ready: None,
+        periodic_window_end: None,
         output: String::new(),
         stderr: String::new(),
         monitor: Some(crate::monitor::MonitorReport {
@@ -3117,6 +3204,7 @@ fn eval_monitor_inconclusive_folds_into_verdict() {
         kvm_stats: None,
         crash_message: None,
         cleanup_duration: None,
+        cleanup_sched_delta: None,
         virtio_blk_counters: None,
         virtio_net_counters: None,
         snapshot_bridge: {
@@ -3130,6 +3218,8 @@ fn eval_monitor_inconclusive_folds_into_verdict() {
         kern_kaslr_offset: 0,
         entry_name: None,
         variant_hash: 0,
+        host_vcpu_schedstat: None,
+        contention_witness: None,
         periodic_series_cache: std::sync::OnceLock::new(),
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES

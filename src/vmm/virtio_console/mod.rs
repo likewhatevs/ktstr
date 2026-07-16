@@ -125,6 +125,31 @@ pub const SIGNAL_BPF_WRITE_DONE: u8 = 0xBF;
 /// accessor-adoption point.
 pub const SIGNAL_ACCESSOR_READY: u8 = 0xAC;
 
+/// RX wake byte: the host freeze coordinator has stamped its periodic-
+/// capture PREREQS ready — KASLR published AND both accessors adopted,
+/// the exact triad the periodic boundary window anchors on
+/// (`periodic_prereqs_ready_ns`). A periodic-capture guest (one whose
+/// host set `KTSTR_AWAIT_PERIODIC_READY=1` from `num_snapshots > 0`)
+/// blocks its `send_scenario_start` on the matching latch so the
+/// capture WINDOW opens only once prereqs hold — otherwise, on a slow
+/// host where the KASLR publish (guest KERN_ADDRS handshake / its
+/// background retry) lands mid-workload, the window
+/// `[max(anchor, prereqs_ready), anchor + duration]` collapses from the
+/// start side and few/no boundaries fire. Distinct from
+/// [`SIGNAL_ACCESSOR_READY`] (0xAC), which fires on accessor adoption
+/// ALONE — insufficient here because it can precede the KASLR publish
+/// on aarch64 (the accessor build is MMU-only, decoupled from
+/// KERN_ADDRS). Host side: `host_comms::request_periodic_prereqs_ready`.
+pub const SIGNAL_PERIODIC_READY: u8 = 0xAD;
+
+/// RX wake byte: the host has drained every artifact required for the
+/// current wprof run. A normal run requires the terminal WprofTrace frame;
+/// an auto-repro run additionally requires PROBE_OUTPUT_END. Guest init waits
+/// on the matching latch after probe finalisation and before reboot, closing
+/// the virtio-reset race where a successful bulk write was discarded before
+/// the host consumed its descriptor.
+pub const SIGNAL_WPROF_ARTIFACTS_RECEIVED: u8 = 0xAE;
+
 // `NUM_PORTS` lives in [`super::wire`]; re-exported here so existing
 // call sites keep working. Port 0 = console (hvc0); port 1 = bulk
 // TLV stream (`/dev/vport0p1`); port 2 = scheduler-stats relay

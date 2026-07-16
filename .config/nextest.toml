@@ -1,9 +1,28 @@
 # ── Profiles ──────────────────────────────────────────────────────────
 
-# ResourceContention SKIPs cleanly at the macro layer so retries
-# only fire on true transient flakes, which typically resolve by
-# retry 2-3. max-delay=5s keeps the per-failure budget tight:
-# worst case 8 retries × 5s = 40s of delay (plus test execution).
+# SCHEDULING MODEL: nextest is a pure SPAWNER; the lock-dir queue is
+# the actual scheduler (see host_topology::protocol — the
+# "second-order scheduler"). nextest admits every cell at once; cells
+# park CHEAPLY in the acquisition queue (a ticket flock + an inotify
+# fd, no guest memory — acquisition runs before VM setup) until host
+# capacity frees. Consequences for this config:
+#
+#  - Reported per-test DURATIONS INCLUDE LOCK-QUEUE TIME. That is
+#    accepted; no effort is spent excluding queue wait from timings
+#    or slow-test flagging.
+#  - slow-timeout rails for lock-taking cells must exceed the FULL
+#    suite drain, not one cell's runtime, because the deepest-queued
+#    cell's wall approaches the whole makespan. The in-cell progress
+#    watchdog is the real hang detector and the queue's progress-based
+#    patience is the wedged-holder detector, so nextest terminate-after
+#    is a rail of LAST RESORT and generosity costs little detection
+#    quality. See the vm-cell override block below for the sizing
+#    derivation.
+#  - A ResourceContention that surfaces to nextest is a RETRYABLE
+#    failure (only a no-progress patience expiry — a wedged holder —
+#    produces one), never a skip; these retries re-run it, alongside
+#    the true transient flakes, which typically resolve by retry 2-3.
+#    max-delay keeps the per-failure budget tight.
 #
 # test-threads = 16 caps parallelism well below `num-cpus` on
 # high-core dev boxes so VM-pinning,
@@ -21,9 +40,19 @@ test-threads = 16
 [profile.default.junit]
 path = "junit.xml"
 
+# ci: test-threads = 64 so VM cells are ADMITTED (spawned into the
+# lock-dir queue) quickly instead of trickling in behind non-lock-
+# taking unit tests at the default 16-wide schedule. Queued waiters
+# are cheap (see the scheduling-model note above), so a wide spawn
+# costs ~nothing; the lock dir — not nextest — decides how many cells
+# actually execute. 64 rather than "all cells at once" because the
+# non-lock-taking unit tests interleaved in the same schedule DO use
+# real CPU, and 64 concurrent short tests already saturate admission
+# within seconds.
 [profile.ci]
 slow-timeout = { period = "90s", terminate-after = 3 }
 retries = { backoff = "exponential", count = 6, delay = "1s", jitter = true, max-delay = "3s" }
+test-threads = 64
 failure-output = "final"
 fail-fast = false
 
@@ -33,6 +62,27 @@ path = "junit.xml"
 # CI overrides — mirrors profile.default.overrides. nextest does not
 # inherit overrides across profiles, so every override that should
 # apply under --profile ci must be duplicated here.
+
+# LOCK-TAKING VM CELLS: last-resort rail sized for FULL-SUITE DRAIN,
+# not per-cell runtime (overrides are first-match per setting, so this
+# must stay FIRST to win slow-timeout for these filters; later
+# blocks still contribute retries / test-groups). Derivation: nextest
+# admits every cell at once and the lock-dir queue serializes to host
+# capacity, so the deepest-queued cell's nextest-visible wall ≈ the
+# whole VM-suite makespan (its reported duration INCLUDES queue time —
+# accepted). Measured local reference (64-CPU / 4-LLC dev box, full
+# `just test 7.1.3` at 64 test-threads): ~500 lock-taking cells, suite
+# nextest wall 413 s, worst single cell 359 s (queue-inclusive), 82
+# cells above 60 s. CI runners are ~200 CPUs / 24 LLCs but share the
+# lock dir across colocated runner units, so leave roughly three local
+# drains plus a long-cell tail. 180 s × 7 = 21 min: enough for the
+# measured queue-inclusive drain while still bounding a defect outside
+# the in-cell progress watchdog (or an unforeseen queue bug) near the
+# expected CI envelope instead of wasting an hour. A contention-killed
+# cell remains retryable and normally retries after the queue has drained.
+[[profile.ci.overrides]]
+filter = "test(/^ktstr\\//) | test(/^verifier\\//) | test(demo_) | test(gauntlet/) | test(boot_kernel) | test(bench_boot) | test(sched_perf_) | test(shell_exec_) | test(eevdf_) | test(disk_template_e2e) | test(cached_releases_with_non_singleton_bypasses_cache)"
+slow-timeout = { period = "180s", terminate-after = 7 }
 
 [[profile.ci.overrides]]
 filter = "test(boot_kernel) | test(bench_boot)"
@@ -84,6 +134,20 @@ retries = 6
 filter = "test(eevdf_)"
 slow-timeout = { period = "75s", terminate-after = 3 }
 retries = 6
+
+# Progress-watchdog wedge fixtures: two of the three deliberately inject a
+# forever-wedge the watchdog must kill on Tier-1/Tier-2, so a watchdog
+# timeout is the EXPECTED outcome, never a transient flake — retries=0 (a
+# re-run burns the same ~25-50s again). The Tier-3 dead-man deadline for
+# these 1-vCPU, watchdog_timeout_s=90 cells is ~150s (see the binary's
+# module doc); 150s x 2 keeps the framework watchdog — not nextest — the
+# arbiter on the idle regression path. The terminate-after remains the
+# final rail if both Tier-1 and Tier-3's active-cell CPU backstop regress on
+# the spin shape.
+[[profile.ci.overrides]]
+filter = "binary(progress_watchdog_e2e)"
+slow-timeout = { period = "150s", terminate-after = 2 }
+retries = 0
 
 [[profile.ci.overrides]]
 filter = "test(shell_exec_)"
@@ -139,6 +203,14 @@ threads-required = 1
 # sibling would not accidentally inherit). Any current or future
 # sibling in the same binary picks up the budget — the cold-load
 # contention is binary-wide, not per-test.
+# LOCK-TAKING VM CELLS, default profile: same full-suite-drain rail as
+# profile.ci (see that block's derivation) — kept first so it wins
+# slow-timeout for these filters; later blocks still contribute their
+# other settings.
+[[profile.default.overrides]]
+filter = "test(/^ktstr\\//) | test(/^verifier\\//) | test(demo_) | test(gauntlet/) | test(boot_kernel) | test(bench_boot) | test(sched_perf_) | test(shell_exec_) | test(eevdf_) | test(disk_template_e2e) | test(cached_releases_with_non_singleton_bypasses_cache)"
+slow-timeout = { period = "180s", terminate-after = 7 }
+
 [[profile.default.overrides]]
 filter = "test(vmm::sched_stats::)"
 slow-timeout = { period = "180s", terminate-after = 1 }
@@ -151,21 +223,22 @@ retries = 3
 
 # Wide-SMP boot tests: every ~256-vCPU topology (16-LLC × 16-core, or
 # 14×9×2) overcommits its vCPU threads onto the host cpuset (~1.3x on a
-# 192-CPU runner). The boot wall-clock grows with the overcommit ratio,
-# so `vm_timeout_from_entry` scales the boot headroom by that ratio
-# (clamped at 6x), giving each VM a per-VM framework watchdog of up to
-# ~470s at the near-6x auto-skip boundary (base max(watchdog_timeout_s,
-# duration, 1) + vm_boot_headroom(256)=58.4s × 6). The binding case is
-# pos_expect_auto_repro_satisfied_wide_smp: it boots TWO 256-vCPU VMs
-# sequentially (primary + auto-repro), each with its OWN ~470s watchdog,
-# so a healthy two-VM run can reach ~940s. That two-VM wprof-inversion
-# chain now auto-skips above EXPECT_AUTO_REPRO_SKIP_RATIO (2.0x) — far
-# below the 6x boot cap — because its repro-VM trace transport is fragile
-# under host time-slicing; so it RUNS (and can reach ~940s) only on a host
-# with MORE than 128 CPUs (256 vCPUs at < 2.0x; exactly 128 CPUs = 2.0x
-# SKIPS, the cap being inclusive) and SKIPS cleanly on a 96-CPU runner
-# (2.7x) instead of hard-failing, while single-VM wide-SMP boot tests keep
-# the 6x cap. slow-timeout 960s/terminate-after 1 covers that two-VM
+# 192-CPU runner). Boot wall-clock stretches under that overcommit, but
+# the wall deadline no longer scales with it: `vm_timeout_from_entry` is
+# the Tier-3 dead-man formula (base max(watchdog_timeout_s, duration, 1)
+# + vm_boot_headroom(256)=58.4s × DEADMAN_HEADROOM_MULT=3 ≈ 235s for
+# these tests), and a slow-but-progressing boot is protected by the
+# progress watchdog instead of a ratio-scaled deadline. The binding case
+# is pos_expect_auto_repro_satisfied_wide_smp: it boots TWO 256-vCPU VMs
+# sequentially (primary + auto-repro), each with its OWN ~235s deadman,
+# so a healthy two-VM run can reach ~470s. That two-VM wprof-inversion
+# chain auto-skips above EXPECT_AUTO_REPRO_SKIP_RATIO (2.0x) — far below
+# the OVERCOMMIT_SKIP_RATIO (6x) boot-or-skip gate — because its repro-VM
+# trace transport is fragile under host time-slicing; so it RUNS only on
+# a host with MORE than 128 CPUs (256 vCPUs at < 2.0x; exactly 128 CPUs =
+# 2.0x SKIPS, the cap being inclusive) and SKIPS cleanly on a 96-CPU
+# runner (2.7x) instead of hard-failing, while single-VM wide-SMP boot
+# tests keep the 6x skip gate. slow-timeout 960s/terminate-after 1 covers that two-VM
 # worst running case so the per-VM framework watchdog fires FIRST (a
 # clean failure dump) rather than nextest blunt-killing a still-booting
 # second VM; single-VM wide tests fail at their ≤470s watchdog long
@@ -198,11 +271,12 @@ slow-timeout = { period = "10s", terminate-after = 2 }
 filter = "test(boot_kernel) | test(bench_boot)"
 slow-timeout = { period = "180s", terminate-after = 2 }
 
-# Verifier cells: the internal VM watchdog is a 120s lifecycle base
-# plus vCPU/oversubscription-scaled boot headroom plus the extend-only
-# scheduler-attach reset (`verifier_vm_timeout` +
+# Verifier cells: the internal VM wall deadline (Tier-3 dead-man) is a
+# 120s lifecycle base plus vm_boot_headroom(vcpus) x 3 plus the
+# extend-only scheduler-attach reset (`verifier_vm_timeout` +
 # `VERIFIER_WORKLOAD_BUDGET` in test_support/runtime.rs) — worst case
-# ~440s for a 128-vCPU preset at the 6x headroom cap. nextest must
+# ~415s for a 256-vCPU preset (295.2s + 60s); wedges die far earlier on
+# the progress watchdog's per-phase budgets. nextest must
 # exceed that so the watchdog verdict, not a nextest kill, decides the
 # cell (240s x 2 = 480s; the ci profile's 180s x 3 = 540s already
 # clears it). Cell names are slash-delimited
@@ -273,10 +347,24 @@ filter = "test(eevdf_)"
 slow-timeout = { period = "75s", terminate-after = 2 }
 retries = 0
 
+# Progress-watchdog wedge fixtures (mirror of the profile.ci override —
+# nextest does not inherit overrides across profiles). Two fixtures inject
+# a forever-wedge the watchdog must kill on Tier-1/Tier-2, so a watchdog
+# timeout is the EXPECTED outcome — retries=0. 150s x 2 sits above the
+# ~150s Tier-3 deadman of these 1-vCPU watchdog_timeout_s=90 cells so the
+# framework watchdog decides the cell on the idle regression path, and the
+# terminate-after remains the last rail if both Tier-1 and Tier-3's
+# active-cell CPU backstop regress. See the binary's module doc for the
+# full timing derivation.
+[[profile.default.overrides]]
+filter = "binary(progress_watchdog_e2e)"
+slow-timeout = { period = "150s", terminate-after = 2 }
+retries = 0
+
 # Wide-SMP boot tests: mirror of the profile.ci override (nextest does
 # not inherit overrides across profiles). 960s/terminate-after 1 covers
 # the two-VM auto-repro test's worst running case so the per-VM framework
-# watchdog (vm_timeout_from_entry, oversub-scaled boot headroom) fires
+# watchdog (vm_timeout_from_entry, flat dead-man boot headroom) fires
 # before nextest's kill even under a local dev box's higher overcommit
 # ratio; the wide-smp test-group serializes the heavy 256-vCPU boots.
 # See the profile.ci copy for the full rationale.

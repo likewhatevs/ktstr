@@ -85,7 +85,10 @@ mod probe;
 pub(crate) use probe::PROBE_OUTPUT_END;
 mod probe_metrics;
 mod profraw;
-pub use eval::post_vm_skip;
+pub use eval::{
+    capture_starvation_witness, periodic_starvation_gate, post_vm_skip, stall_ejection_skip,
+    starved_below_minimum_skip,
+};
 pub use profraw::current_binary_is_coverage_instrumented;
 pub mod runtime;
 mod shell_descriptor;
@@ -132,9 +135,9 @@ pub(crate) use runtime::{append_base_sched_args, content_hash, scratch_dir, sys_
 #[cfg(test)]
 pub(crate) use sidecar::enriched_parse_error_message_for_test;
 pub use sidecar::{
-    PerfDeltaAssertionRecord, SidecarResult, collect_pool, detect_kernel_commit,
-    format_run_artifact_footer, newest_run_dir, repo_is_dirty, runs_root, sidecar_dir,
-    source_dir_for,
+    PerfDeltaAssertionRecord, SidecarResult, ThroughputDenomination, collect_pool,
+    detect_kernel_commit, format_run_artifact_footer, newest_run_dir, repo_is_dirty, runs_root,
+    sidecar_dir, source_dir_for,
 };
 pub(crate) use sidecar::{
     SidecarIoError, SidecarParseError, apply_archive_source_override, collect_sidecars,

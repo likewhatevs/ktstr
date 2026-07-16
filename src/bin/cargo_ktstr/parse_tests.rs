@@ -1234,6 +1234,62 @@ fn parse_stats_list() {
     assert!(m.is_ok(), "{}", m.err().unwrap());
 }
 
+/// `cargo ktstr stats last-run` parses with no flags to
+/// `StatsCommand::LastRun { dir: None, kernel: None }` — the default
+/// newest-run resolution path.
+#[test]
+fn parse_stats_last_run_bare() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "stats", "last-run"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Stats {
+        command: Some(StatsCommand::LastRun { dir, kernel }),
+        ..
+    } = k.command
+    else {
+        panic!("expected Stats LastRun");
+    };
+    assert!(dir.is_none(), "bare last-run must default --dir to None");
+    assert!(
+        kernel.is_none(),
+        "bare last-run must default --kernel to None",
+    );
+}
+
+/// `cargo ktstr stats last-run --dir PATH --kernel LABEL` round-trips
+/// both flags. Pins the flag names so a clap-derive kebab-case rename
+/// can't drift, and that `--dir` mirrors the `--dir` other stats
+/// subcommands (list-values / show-host) carry.
+#[test]
+fn parse_stats_last_run_dir_and_kernel() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "stats",
+        "last-run",
+        "--dir",
+        "/tmp/archived-run",
+        "--kernel",
+        "7.1.3",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Stats {
+        command: Some(StatsCommand::LastRun { dir, kernel }),
+        ..
+    } = k.command
+    else {
+        panic!("expected Stats LastRun");
+    };
+    assert_eq!(
+        dir.as_deref(),
+        Some(std::path::Path::new("/tmp/archived-run")),
+    );
+    assert_eq!(kernel.as_deref(), Some("7.1.3"));
+}
+
 /// `cargo ktstr stats list-metrics` parses (no flags required)
 /// and dispatches to the `ListMetrics` variant with `json=false`.
 #[test]

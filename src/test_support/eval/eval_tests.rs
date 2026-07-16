@@ -778,6 +778,7 @@ fn wide_smp_topology() -> crate::vmm::topology::Topology {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     }
 }
 

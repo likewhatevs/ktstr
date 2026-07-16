@@ -52,6 +52,15 @@ pub struct KernelBuildResult {
 /// depending on kernel source, enabling integration tests that
 /// exercise the reservation logic against synthetic topologies.
 ///
+/// Also acquired directly by `cargo-ktstr`'s harness-compile path
+/// (`bin/cargo_ktstr/run_cargo.rs`) so a colocated runner's
+/// `cargo build`/`nextest --no-run` warm-up coordinates against the
+/// SAME machine-global LLC flock namespace + cgroup cpuset as a
+/// kernel build — hence `pub` (the bin holds this as an opaque RAII
+/// guard, dropping it before the test-running phase). Fields stay
+/// `pub(crate)`: external holders only need the RAII lifetime and the
+/// [`BuildReservation::make_jobs`] accessor, not field access.
+///
 /// Drop order is load-bearing: `_sandbox` is declared first and
 /// drops first per Rust's declaration-order field-drop rule;
 /// this ensures the cgroup sandbox is removed before the LLC
@@ -59,7 +68,7 @@ pub struct KernelBuildResult {
 /// released before the cgroup is gone and mint a conflicting
 /// plan.
 #[derive(Debug)]
-pub(crate) struct BuildReservation {
+pub struct BuildReservation {
     /// cgroup v2 sandbox. `None` when `plan` is `None` (no reservation
     /// to enforce). Drops FIRST per struct field order — cgroup
     /// rmdir runs while LLC flocks are still held. `_` prefix
@@ -77,11 +86,31 @@ pub(crate) struct BuildReservation {
     pub(crate) make_jobs: Option<usize>,
 }
 
+impl BuildReservation {
+    /// Reserved-CPU parallelism hint (`plan.cpus.len()`), or `None`
+    /// when no reservation was acquired (bypass / degraded sysfs).
+    /// The kernel-build path feeds it to `make -jN`; the cargo
+    /// harness-compile path feeds it to `CARGO_BUILD_JOBS` so parallel
+    /// rustc is capped to the reserved cpuset instead of exploding to
+    /// `nproc` inside a confined cgroup. `None` leaves the child build
+    /// on its own default.
+    pub fn make_jobs(&self) -> Option<usize> {
+        self.make_jobs
+    }
+}
+
 /// Acquire the two-phase reservation (LLC flocks + cgroup sandbox)
-/// for a kernel build. Factored out of [`kernel_build_pipeline`]
-/// so integration tests can exercise the cpu_cap → acquire →
-/// sandbox → make_jobs decision tree without requiring a real
-/// kernel source tree.
+/// for a kernel OR harness build. Factored out of
+/// [`kernel_build_pipeline`] so integration tests can exercise the
+/// cpu_cap → acquire → sandbox → make_jobs decision tree without
+/// requiring a real kernel source tree, and so `cargo-ktstr`'s
+/// harness-compile warm-up (`bin/cargo_ktstr/run_cargo.rs`) can take
+/// the identical reservation before a colocated runner's `cargo`
+/// build invades a perf-mode LLC reservation. `pub` for that
+/// cross-binary reuse; the escape hatches (`KTSTR_BYPASS_LLC_LOCKS`,
+/// `KTSTR_CARGO_TEST_MODE` inside `acquire_llc_plan`), degraded-sysfs
+/// warn/hard-error gating, and cgroup-degrade semantics are shared
+/// verbatim between both callers.
 ///
 /// Returns a `BuildReservation` whose fields are the three values
 /// `kernel_build_pipeline` used to bind inline. `_sandbox` is
@@ -95,9 +124,32 @@ pub(crate) struct BuildReservation {
 /// [`CpuCap::resolve`](crate::vmm::host_topology::CpuCap::resolve);
 /// `None` means "reserve 30% of the calling process's allowed-CPU
 /// set", applied inside the planner at acquire time.
-pub(crate) fn acquire_build_reservation(
+pub fn acquire_build_reservation(
     cli_label: &str,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
+) -> Result<BuildReservation> {
+    acquire_build_reservation_impl(cli_label, cpu_cap, false)
+}
+
+/// Acquire a build reservation, joining the progress-aware host queue when
+/// perf-mode work temporarily owns too much LLC capacity.
+///
+/// Harness prebuilds use this variant because many independent CI invocations
+/// compile concurrently and have no source-tree lock to serialize them. A
+/// transient `LOCK_EX` holder must delay compilation, not abort the entire
+/// test job after four nonblocking probes. Kernel builds retain
+/// [`acquire_build_reservation`]'s interactive nonblocking behavior.
+pub fn acquire_build_reservation_waiting(
+    cli_label: &str,
+    cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
+) -> Result<BuildReservation> {
+    acquire_build_reservation_impl(cli_label, cpu_cap, true)
+}
+
+fn acquire_build_reservation_impl(
+    cli_label: &str,
+    cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
+    wait: bool,
 ) -> Result<BuildReservation> {
     let bypass = crate::bypass_llc_locks_active();
     // INVARIANT: `_sandbox` is declared first and drops first per
@@ -128,6 +180,7 @@ pub(crate) fn acquire_build_reservation(
             &test_topo,
             cpu_cap,
             crate::vmm::host_topology::PlacementPolicy::Consolidate,
+            wait,
         )?;
         crate::vmm::host_topology::warn_if_cross_node_spill(&acquired_plan, &host_topo);
         Some(acquired_plan)

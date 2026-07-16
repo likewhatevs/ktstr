@@ -301,13 +301,14 @@ pub struct CgroupStats {
     /// [`Self::total_cpu_time_ns`] — not a reduced ratio: the run-level
     /// cross-cgroup pool [`crate::assert::populate_run_pooled_taobench`] folds it
     /// into the `total_taobench_*` Counter components and the derived
-    /// `taobench_*_per_sec` / `taobench_hit_fraction` / `taobench_command_hit_rate`
+    /// `taobench_*_ops_per_cpu_sec_whole` / `taobench_hit_fraction` /
+    /// `taobench_command_hit_rate`
     /// Rates in [`Self::ext_metrics`] (whole-run keys visible to `--noise-adjust`
-    /// spread, unlike the per-phase `taobench_*_qps` which are
+    /// spread, unlike the per-phase `taobench_*_ops_per_cpu_sec` which are
     /// `MetricKind::PerPhase`). Whole-run, NOT summable from the per-phase
     /// `PhaseCgroupStats::taobench` carriers (per-phase `elapsed_ns` is
     /// MAX-merged across concurrent threads, so summing phase windows is the
-    /// wrong qps denominator), so the engine's authoritative whole-run aggregate
+    /// wrong throughput denominator), so the engine's authoritative whole-run aggregate
     /// is shipped from the worker. Holds COUNTERS only
     /// ([`TaobenchStats`](crate::workload::taobench::run::TaobenchStats)) — the
     /// serve-latency histogram is per-phase data on `PhaseCgroupStats::taobench`,

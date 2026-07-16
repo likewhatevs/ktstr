@@ -31,6 +31,92 @@ fn ap_gap_check_with_fault_injection() -> Result<(), String> {
     all_possible_cpus_online()
 }
 
+/// Teardown-stage progress-watchdog fault injection, gated on a host-set
+/// kernel-cmdline token. Sibling to [`ap_gap_check_with_fault_injection`]:
+/// the host injects the token via the test scheduler's `kargs`, the guest
+/// reads it with [`cmdline_val`] and fabricates a deterministic wedge in
+/// the Teardown lifecycle stage so the progress-watchdog e2e fixtures
+/// (`tests/progress_watchdog_e2e.rs`) can drive the Tier-1 / Tier-2 kill
+/// rules end-to-end on an otherwise-healthy guest:
+///   - `KTSTR_FAULT_TEARDOWN_WEDGE=spin`: busy-loop FOREVER — the guest
+///     burns CPU in-phase with no milestone, tripping Tier-1 once the
+///     busiest vCPU's in-phase burn (`max_vcpu_cpu_in_phase_ns`) exceeds
+///     the flat Teardown `phase_cpu_budget_ns`.
+///   - `KTSTR_FAULT_TEARDOWN_WEDGE=idle`: sleep FOREVER — the guest goes
+///     fully quiescent (no runnable demand, ISR-only CPU trickle),
+///     tripping Tier-2 once the trickle-stall discriminator latches and
+///     `wall_in_phase` exceeds the Teardown `phase_wall_backstop_ns`.
+///
+/// The wedge is deliberately unbounded: the watchdog MUST be what ends the
+/// VM (`timed_out = true`), so the fixture's host-side timing assertion can
+/// discriminate a progress-tier kill from the Tier-3 dead-man deadline. On
+/// a tier regression the idle shape is still bounded by the deadman (an
+/// inert cell fires it at the wall deadline) and the spin shape by
+/// nextest's `terminate-after` (a CPU-accruing cell defers the deadman by
+/// design) — both surface as a red fixture, never a hung suite.
+///
+/// Emitting `ScenarioEnd` first advances the host lifecycle stage to
+/// Teardown — a MILESTONE that re-anchors the monitor's per-vCPU
+/// max-in-phase tracker and stamps `wall_ns_at_progress` at the wedge
+/// start, so the in-phase deltas the tiers charge are exactly the wedge's
+/// own burn/wall. An empty-body
+/// `#[ktstr_test]` otherwise sits in the Body stage (`send_scenario_start`
+/// fires unconditionally at dispatch), where both tiers are structurally
+/// off via the `u64::MAX` Body budgets. The advance is forward-only on the
+/// host, so a scenario body that already emitted `ScenarioEnd` makes this a
+/// host-side no-op.
+///
+/// Call site: the END of Phase 6, after the background threads
+/// (vc-poll, stats relay, trace_pipe reader) have been stopped and joined —
+/// the guest's only remaining activity is kernel ISR trickle, giving the
+/// idle arm the truly-quiescent shape Tier-2's sub-1ms/10s trickle floor
+/// discriminates on. The test body has already published its PASS
+/// AssertResult (`publish_result_and_collect` runs at end-of-dispatch), so
+/// the host records a passing base verdict and the fixture's
+/// `post_vm_unconditional` timing gate owns the pass/fail decision.
+/// `send_exit` has NOT been sent, so the host cannot mistake the wedge for
+/// a clean exit.
+///
+/// Absent the token (every production run) the hook is one `/proc/cmdline`
+/// read and a return — the same cost class as the AP-gap hook's lookup.
+fn maybe_inject_teardown_wedge_fault() {
+    let Some(mode) = cmdline_val("KTSTR_FAULT_TEARDOWN_WEDGE") else {
+        return;
+    };
+    // Force the host stage to Teardown (a milestone) so the wedge is
+    // charged against the Teardown budgets from a fresh anchor.
+    crate::vmm::guest_comms::send_scenario_end(0, 0);
+    match mode.trim() {
+        "spin" => {
+            // Tier-1 shape: burn guest CPU forever in a loop the optimizer
+            // cannot elide, so the per-vCPU CPU clocks genuinely accrue
+            // against the Teardown budget.
+            let mut acc: u64 = 0;
+            loop {
+                for _ in 0..4096 {
+                    acc = acc.wrapping_add(std::hint::black_box(1));
+                }
+                std::hint::black_box(acc);
+            }
+        }
+        "idle" => {
+            // Tier-2 shape: fully quiesced forever — off-CPU, no runnable
+            // demand, ISR-only trickle.
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+        }
+        other => {
+            // Unknown mode: loud and inert — a typo'd fixture must fail on
+            // its own "expected timed_out" assertion, not silently wedge.
+            eprintln!(
+                "ktstr-init: KTSTR_FAULT_TEARDOWN_WEDGE={other:?} not \
+                 recognized (expected \"spin\" or \"idle\"); ignoring"
+            );
+        }
+    }
+}
+
 /// Full guest init lifecycle. Called from the ctor when PID 1 is
 /// detected. Mounts filesystems, then either runs the test lifecycle
 /// (scheduler + dispatch + reboot) or drops into an interactive
@@ -662,14 +748,91 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // Phase 5: Dispatch.
     let _s_phase5 = tracing::debug_span!("phase5_dispatch").entered();
     tracing::debug!("dispatching test");
+    // Periodic-capture window anchoring: the FIRST ScenarioStart stamps
+    // the host's `scenario_anchor`, which opens the periodic-capture
+    // window. On a run that declares periodic captures the host sets
+    // `KTSTR_AWAIT_PERIODIC_READY=1`; here we block that first
+    // ScenarioStart until the host has stamped its periodic prereqs
+    // (KASLR published + both accessors adopted — the triad the window
+    // anchors at) and fired SIGNAL_PERIODIC_READY. Without this the
+    // workload — and thus the window — can start before the KASLR
+    // publish lands (the guest KERN_ADDRS handshake, or its detached
+    // background retry on a slow boot), collapsing the clamped window
+    // `[max(anchor, prereqs_ready), anchor + duration]` from the start
+    // and firing few/no boundaries. Bounded: no signal within the bound
+    // (a genuinely stuck host) falls through and the workload runs
+    // anyway — the host-side readiness-vs-window skip gate then records
+    // the environmental non-verdict. NO deadlock: the host's prereqs
+    // (KASLR via the boot-independent KERN_ADDRS retry, accessors via
+    // the MMU-only early build) resolve without the workload running.
+    // The hvc0 poll loop that sets the latch started in Phase 4, and
+    // the latch is sticky, so a signal that arrives before this wait
+    // (warm boot) returns immediately — no penalty when prereqs are
+    // already up.
+    if crate::vmm::rust_init::cmdline_val("KTSTR_AWAIT_PERIODIC_READY").is_some() {
+        // 45 s: comfortably covers the host's 60 s accessor-init budget's
+        // common case plus the KASLR-publish tail on a slow arm box,
+        // while staying well inside the watchdog deadline so a stuck
+        // prereq falls through to the skip gate rather than the deadman.
+        let latch = crate::vmm::rust_init::periodic_prereqs_ready_latch();
+        let fired = latch.wait_timeout(std::time::Duration::from_secs(45));
+        if fired {
+            tracing::debug!("periodic prereqs ready; opening the capture window");
+        } else {
+            tracing::warn!(
+                "ktstr-init: periodic prereqs not signalled within 45s; \
+                 opening the capture window anyway (host-side readiness gate \
+                 will record the shortfall)"
+            );
+        }
+    }
     crate::vmm::guest_comms::send_lifecycle(crate::vmm::wire::LifecyclePhase::PayloadStarting, "");
-    crate::vmm::guest_comms::send_scenario_start();
 
     #[cfg(feature = "wprof")]
-    let wprof_handle = spawn_wprof_if_configured();
+    let wprof_requested = crate::vmm::rust_init::cmdline_val("KTSTR_WPROF_ARGS").is_some();
+    #[cfg(feature = "wprof")]
+    let wprof_capture = spawn_wprof_if_configured();
+    #[cfg(feature = "wprof")]
+    let wprof_ready = match wprof_capture.as_ref() {
+        Some(capture) => capture.wait_until_ready(),
+        None => !wprof_requested,
+    };
+
+    #[cfg(feature = "wprof")]
+    let instrumentation_ready = wprof_ready;
+    #[cfg(not(feature = "wprof"))]
+    let instrumentation_ready = true;
+
+    // Host BPF-map writes are intentionally held behind a guest edge. The
+    // host can resolve the target map as soon as the scheduler loads it, but
+    // mutating a crash/stall field before the probe pipeline and optional
+    // wprof tracer are ready destroys the very observability the injection is
+    // meant to exercise. Only configured map-write runs carry the cmdline
+    // token, so ordinary runs send no frame and pay no cost.
+    let bpf_map_write_ready = if instrumentation_ready
+        && crate::vmm::rust_init::cmdline_val("KTSTR_AWAIT_BPF_MAP_WRITE_READY").is_some()
+    {
+        crate::vmm::guest_comms::send_bpf_map_write_ready()
+    } else {
+        true
+    };
+    let dispatch_ready = instrumentation_ready && bpf_map_write_ready;
+
+    // Do not open the host's scenario clock until optional instrumentation is
+    // actually armed. In particular, wprof emits `Running...` only after its
+    // BPF setup is complete; starting a crash workload before that edge can
+    // disable the scheduler while the tracer is still loading and lose the
+    // auto-repro artifact. The readiness wait is event-driven on wprof's
+    // existing stderr + pidfd and adds no guest thread or polling wake.
+    crate::vmm::guest_comms::send_scenario_start();
 
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
-    let code = if crate::test_support::is_verifier_workload(&args) {
+    let code = if !dispatch_ready {
+        eprintln!(
+            "ktstr-init: workload not dispatched because required instrumentation readiness failed"
+        );
+        1
+    } else if crate::test_support::is_verifier_workload(&args) {
         // Verifier sweep VM: no `#[ktstr_test]` body to dispatch. Instead
         // run the dispatch probe — spawn a SpinWait workload and, on
         // confirmed worker progress after the scheduler attached, emit a
@@ -687,11 +850,13 @@ pub(crate) fn ktstr_guest_init() -> ! {
     crate::vmm::guest_comms::send_scenario_pause();
 
     #[cfg(feature = "wprof")]
-    if let Some(handle) = wprof_handle
-        && let Ok(Some(pb_bytes)) = handle.join()
-    {
-        crate::vmm::guest_comms::send_wprof_trace(&pb_bytes);
-    }
+    let wprof_trace_sent = match wprof_capture {
+        Some(capture) => match capture.join() {
+            Ok(Some(pb_bytes)) => crate::vmm::guest_comms::send_wprof_trace(&pb_bytes),
+            _ => false,
+        },
+        None => false,
+    };
 
     drop(_s_phase5);
 
@@ -795,6 +960,27 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // (single-phase ctor path or EEVDF runs), the call is a no-op.
     crate::test_support::finalize_probe_after_unwind();
 
+    // A successful write to virtio-console means the descriptor was offered,
+    // not that the host consumed it. Reboot resets the device and can discard
+    // an offered trace/probe tail before the freeze coordinator drains it —
+    // particularly in auto-repro, where Phase 6 can finish within hundreds of
+    // milliseconds of the crash. Wait event-driven on the host's artifact
+    // rendezvous acknowledgement before stopping hvc0 or rebooting. The latch
+    // is sticky, so the normal case (host already drained the artifacts) is
+    // immediate. This is teardown-only: ScenarioPause was sent before the
+    // trace, so the wait cannot alter workload metrics or runtime behavior.
+    #[cfg(feature = "wprof")]
+    if wprof_trace_sent {
+        let acknowledged =
+            wprof_artifacts_received_latch().wait_timeout(std::time::Duration::from_secs(30));
+        if !acknowledged {
+            tracing::warn!(
+                "ktstr-init: host did not acknowledge wprof artifacts within 30s; \
+                 continuing bounded teardown"
+            );
+        }
+    }
+
     // Stop remaining background threads.
     if let Some(ref stop) = vc_poll_stop {
         stop.store(true, Ordering::Release);
@@ -860,6 +1046,14 @@ pub(crate) fn ktstr_guest_init() -> ! {
             libc::tcdrain(com1.as_raw_fd());
         }
     }
+
+    // Progress-watchdog fault injection (Teardown-stage wedge). Placed at
+    // the end of Phase 6 — every background thread above is stopped, so
+    // the idle arm is truly quiescent — and BEFORE Phase 7's send_exit, so
+    // the host watchdog (not a clean exit) ends the VM. No-op without the
+    // KTSTR_FAULT_TEARDOWN_WEDGE cmdline token; never returns with it (for
+    // a recognized mode).
+    maybe_inject_teardown_wedge_fault();
 
     // Phase 7: Exit.
     // Push buffered stdout/stderr bytes into the pipe write ends so

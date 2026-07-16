@@ -20,7 +20,7 @@
 use anyhow::Result;
 use ktstr::assert::{AssertResult, Verdict};
 use ktstr::ktstr_test;
-use ktstr::prelude::{SampleSeries, VmResult, WorkType, post_vm_skip};
+use ktstr::prelude::{SampleSeries, VmResult, WorkType, post_vm_skip, stall_ejection_skip};
 use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
@@ -63,6 +63,12 @@ fn assert_yielded_advanced(result: &VmResult) -> Result<()> {
     let any_progress = yielded
         .iter_full()
         .any(|(_, _, slot)| matches!(slot, Ok(v) if *v > 0));
+    // If a descheduling host tripped the guest's sched_ext runnable-stall
+    // watchdog, scx-ktstr was ejected and ops.yield could never fire —
+    // environmental, not a missing-handler regression.
+    if !any_progress {
+        stall_ejection_skip(result)?;
+    }
     anyhow::ensure!(
         any_progress,
         "nr_yielded read 0 across every periodic sample — ops.yield \
