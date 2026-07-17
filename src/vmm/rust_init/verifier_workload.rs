@@ -3,13 +3,12 @@
 //! booted with `--ktstr-verifier-workload` (the `cargo ktstr verifier`
 //! sweep path — a VM with no `#[ktstr_test]` body).
 //!
-//! After the scheduler has attached (Phase 3) and Phase 5 has emitted the
-//! `PayloadStarting` frame, this spawns a SpinWait workload — as
-//! SCHED_EXT tasks, so the BPF scheduler dispatches them under any switch
-//! mode (full or `SCX_OPS_SWITCH_PARTIAL`) — sized to the guest's online
-//! CPU count, waits (by BLOCKING on a shared first-iteration eventfd the
-//! workers signal, not a blind fixed sleep or a polled counter) until
-//! every worker has advanced at least one
+//! In Phase 5, after `PayloadStarting`, this spawns a SpinWait workload —
+//! as SCHED_EXT tasks, so an attached BPF scheduler dispatches them under
+//! any switch mode (full or `SCX_OPS_SWITCH_PARTIAL`) — sized to the
+//! guest's online CPU count, waits (by BLOCKING on a shared
+//! first-iteration eventfd the workers signal, not a blind fixed sleep or
+//! a polled counter) until every worker has advanced at least one
 //! iteration or a bounded deadline elapses, then stops the workload. The
 //! workers are configured to park (`park_after_iterations(Some(1))`)
 //! after their first counted iteration rather than spinning until stop:
@@ -20,21 +19,22 @@
 //! are unchanged. It
 //! emits a [`LifecyclePhase::WorkloadDispatched`] frame
 //! only for a worker that BOTH advanced non-zero `iterations` AND had its
-//! SCHED_EXT set succeed (`sched_policy_error` is None) — so a fair-class
-//! fallback cannot false-confirm — proof the scheduler actually
-//! dispatched a task onto a CPU. The deadline scales with the worker
+//! SCHED_EXT set succeed (`sched_policy_error` is None). Schedulerless
+//! SCHED_EXT tasks may still advance through the kernel fallback, so this
+//! progress frame is dispatch proof only when paired with the independent
+//! `SchedulerAttached` frame. The deadline scales with the worker
 //! count ([`dispatch_deadline`]): wall clock is not guest CPU time on
 //! a wide, host-time-sliced topology, so a flat window gives a
 //! 64+-CPU guest under CI concurrency almost no per-vCPU compute
 //! before the probe gives up on a working scheduler. The host
 //! verdict ([`crate::verifier::collect_verifier_output`]) PASSes a cell
-//! only when BOTH `PayloadStarting` (attached) AND `WorkloadDispatched`
-//! (dispatched) frames arrive.
+//! only when BOTH `SchedulerAttached` and `WorkloadDispatched` frames
+//! arrive.
 //!
 //! On any failure — workload spawn error, or zero progress within the
 //! deadline — NO frame is emitted and the function returns quietly. The
-//! host reads the absence, given `PayloadStarting`, as "attached but did
-//! not dispatch": a distinct, worse failure than a failed attach. It
+//! host reads the absence, given `SchedulerAttached`, as "attached but did
+//! not dispatch": a distinct failure from a failed attach. It
 //! never panics; a guest panic reboots via `panic=-1` (an i8042 reset →
 //! `ExitAction::Shutdown`), which would strand the run with no clean
 //! verdict signal.
@@ -94,12 +94,14 @@ pub(crate) fn run_and_confirm_dispatch() {
         // under a partial-switch scheduler would advance `iterations`
         // while running in fair — falsely confirming dispatch; SCHED_EXT
         // forces `task_should_scx` true via the policy arm under BOTH
-        // switch modes, so non-zero iterations prove the BPF scheduler
-        // dispatched the worker. The set can be rejected with EACCES if
-        // the scheduler set `scx.disallow` on the worker (leaving it
-        // SCHED_OTHER); the dispatch check below excludes any worker
-        // whose `sched_policy_error` is set, so a fair-class fallback
-        // cannot false-confirm dispatch.
+        // switch modes, so non-zero iterations prove dispatch once the
+        // host has independently received SchedulerAttached. Without a
+        // scheduler, SCHED_EXT tasks may still advance through the kernel
+        // fallback; the attach gate deliberately rejects that case. The
+        // policy set can also be rejected with EACCES if the scheduler set
+        // `scx.disallow` on the worker (leaving it SCHED_OTHER); the
+        // dispatch check below excludes any worker whose
+        // `sched_policy_error` is set.
         .sched_policy(SchedPolicy::Ext)
         // Park each worker the instant it counts its first iteration:
         // one counted iteration under SCHED_EXT is the whole proof the

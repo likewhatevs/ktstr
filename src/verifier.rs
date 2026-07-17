@@ -623,24 +623,24 @@ pub fn build_b_map(stats_b: &[ProgStats]) -> HashMap<String, u64> {
 /// on and is scheduling — not merely that its BPF loaded.
 ///
 /// The verdict is POSITIVE-confirmation, not absence-of-failure: a
-/// verifier cell PASSes only when the guest reached its post-attach
-/// dispatch phase — a `PayloadStarting` lifecycle frame, emitted at
-/// `ktstr_guest_init` Phase 5, which is reached ONLY if `start_scheduler`
-/// succeeded in Phase 3. On attach failure the guest emits
-/// `SchedulerDied` / `SchedulerNotAttached` and force-reboots in Phase 3
-/// BEFORE Phase 5, so no `PayloadStarting` arrives. A guest that vanishes
-/// before Phase 5 with NO frame at all — e.g. a kernel panic, which
-/// reboots via the guest's `panic=-1` (an i8042 reset →
-/// `ExitAction::Shutdown`, NOT a host watchdog timeout) — is
-/// [`AttachOutcome::Unconfirmed`], also a FAIL. Absence-of-failure alone
-/// would false-PASS that vanish case. [`collect_verifier_output`]
+/// verifier cell PASSes only when the guest emitted the definitive
+/// `SchedulerAttached` lifecycle frame. The guest emits that frame at the
+/// one site where the scheduler child is alive and sched_ext reached
+/// `enabled`. In particular, `PayloadStarting` is not attach evidence:
+/// Phase 5 emits it for schedulerless runs too. Treating it as evidence
+/// lets a schedulerless verifier workload running under the kernel's
+/// fallback policy false-PASS.
+///
+/// On attach failure the guest emits `SchedulerDied` /
+/// `SchedulerNotAttached`; a guest that vanishes without any conclusive
+/// frame — e.g. a kernel panic which reboots via `panic=-1` — is
+/// [`AttachOutcome::Unconfirmed`], also a FAIL. [`collect_verifier_output`]
 /// consumes this verdict instead of discarding it. Scheduler-agnostic
 /// (kernel sysfs state), so it holds for every declared scheduler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttachOutcome {
-    /// The guest reached its post-attach dispatch phase (a
-    /// `PayloadStarting` frame) with no failure frame: the scheduler
-    /// loaded, stayed alive, and reached sched_ext `enabled`.
+    /// The guest emitted `SchedulerAttached` with no failure frame: the
+    /// scheduler loaded, stayed alive, and reached sched_ext `enabled`.
     Attached,
     /// Scheduler process exited during BPF load / startup
     /// (`LifecyclePhase::SchedulerDied`).
@@ -649,11 +649,9 @@ pub enum AttachOutcome {
     /// (`LifecyclePhase::SchedulerNotAttached`); carries the guest's
     /// reason suffix when present.
     NotAttached(String),
-    /// No failure frame AND no `PayloadStarting` frame: the guest never
-    /// reached the post-attach dispatch phase, so attach was never
-    /// positively confirmed (e.g. an early guest kernel panic that
-    /// reboots via `panic=-1` before Phase 3 — emitting no lifecycle
-    /// frame and NOT tripping the host watchdog).
+    /// No failure frame AND no `SchedulerAttached` frame: attach was never
+    /// positively confirmed. This includes an early guest kernel panic
+    /// and a schedulerless run which proceeds to `PayloadStarting`.
     Unconfirmed,
 }
 
@@ -672,8 +670,8 @@ impl AttachOutcome {
                 "scheduler never reached sched_ext 'enabled': {reason}"
             )),
             AttachOutcome::Unconfirmed => Some(
-                "scheduler attach unconfirmed — guest never reached the dispatch phase \
-                 (no PayloadStarting frame; possible early guest kernel panic)"
+                "scheduler attach unconfirmed \
+                 (no SchedulerAttached frame; scheduler may be absent or guest may have crashed)"
                     .to_string(),
             ),
         }
@@ -686,12 +684,10 @@ impl AttachOutcome {
 ///   a process that exited cannot have attached);
 /// - else a `SchedulerNotAttached` frame ⇒ [`AttachOutcome::NotAttached`]
 ///   (with its reason suffix);
-/// - else a `PayloadStarting` frame ⇒ [`AttachOutcome::Attached`] (the
-///   guest reached its post-attach dispatch phase, so the scheduler
-///   turned on);
+/// - else a `SchedulerAttached` frame ⇒ [`AttachOutcome::Attached`];
 /// - else [`AttachOutcome::Unconfirmed`] — no failure AND no positive
-///   frame, so attach was never confirmed (e.g. an early guest kernel
-///   panic that reboots before Phase 5 without emitting any frame).
+///   frame, so attach was never confirmed (including a schedulerless run
+///   which nevertheless reaches `PayloadStarting`).
 ///
 /// Corrupt frames (`crc_ok == false`) and empty payloads are skipped. A
 /// `None` `guest_messages` (no frames at all) is
@@ -703,7 +699,7 @@ pub(crate) fn attach_outcome_from_messages(
         return AttachOutcome::Unconfirmed;
     };
     let mut not_attached: Option<String> = None;
-    let mut payload_starting = false;
+    let mut scheduler_attached = false;
     for e in &drain.entries {
         if e.msg_type != crate::vmm::wire::MSG_TYPE_LIFECYCLE || !e.crc_ok || e.payload.is_empty() {
             continue;
@@ -713,15 +709,15 @@ pub(crate) fn attach_outcome_from_messages(
             Some(crate::vmm::wire::LifecyclePhase::SchedulerNotAttached) => {
                 not_attached = Some(String::from_utf8_lossy(&e.payload[1..]).into_owned());
             }
-            Some(crate::vmm::wire::LifecyclePhase::PayloadStarting) => {
-                payload_starting = true;
+            Some(crate::vmm::wire::LifecyclePhase::SchedulerAttached) => {
+                scheduler_attached = true;
             }
             _ => {}
         }
     }
     if let Some(reason) = not_attached {
         AttachOutcome::NotAttached(reason)
-    } else if payload_starting {
+    } else if scheduler_attached {
         AttachOutcome::Attached
     } else {
         AttachOutcome::Unconfirmed
@@ -733,9 +729,10 @@ pub(crate) fn attach_outcome_from_messages(
 /// the run's bulk-port frames. Emitted by `ktstr_guest_init` Phase 5 only
 /// when the injected SpinWait workload recorded a worker with non-zero
 /// `iterations` under a confirmed SCHED_EXT policy (`sched_policy_error`
-/// is None) after the scheduler attached — so a fair-class fallback
-/// cannot false-confirm — a positive, scheduler-agnostic proof the
-/// scheduler dispatched a task onto a CPU.
+/// is None). Combined with a definitive `SchedulerAttached` frame, this
+/// is a positive, scheduler-agnostic proof the scheduler dispatched a
+/// task onto a CPU. Alone it is not attach proof: schedulerless SCHED_EXT
+/// tasks may make progress through the kernel fallback.
 /// Corrupt frames (`crc_ok == false`) and empty payloads are skipped. A
 /// `None` `guest_messages` (no frames at all) is `false`.
 fn dispatch_confirmed_from_messages(
@@ -784,19 +781,19 @@ pub struct VerifierVmResult {
     /// Whether the scheduler positively confirmed attach. Derived from
     /// the guest's lifecycle frames ([`AttachOutcome`]). Attach is
     /// necessary but NOT sufficient for a cell PASS: this must be
-    /// [`AttachOutcome::Attached`] (the guest reached its post-attach
-    /// dispatch phase) AND [`Self::dispatched`] must be true. Verification
-    /// alone (non-empty `stats`) is not enough — a scheduler whose BPF
-    /// loads but never reaches sched_ext `enabled`, or a guest that
-    /// vanishes before the dispatch phase, is a real failure.
+    /// [`AttachOutcome::Attached`] (the guest emitted the definitive
+    /// `SchedulerAttached` frame) AND [`Self::dispatched`] must be true.
+    /// Verification alone (non-empty `stats`) is not enough — a scheduler
+    /// whose BPF loads but never reaches sched_ext `enabled`, or a guest
+    /// that vanishes before attach, is a real failure.
     pub attach: AttachOutcome,
     /// Whether the guest confirmed the injected verifier workload
     /// dispatched — a `WorkloadDispatched` lifecycle frame, emitted by
     /// `ktstr_guest_init` Phase 5 when the SpinWait probe recorded a
-    /// worker with non-zero `iterations` under a confirmed SCHED_EXT
-    /// policy after attach (so a fair-class fallback cannot false-confirm).
-    /// A cell PASSes only
-    /// when this is true AND [`Self::attach`] is
+    /// worker with non-zero `iterations` after requesting SCHED_EXT
+    /// policy. This progress signal is not independent attach proof:
+    /// schedulerless SCHED_EXT tasks may run through the kernel fallback.
+    /// A cell PASSes only when this is true AND [`Self::attach`] is
     /// [`AttachOutcome::Attached`]: a scheduler that turns on (sched_ext
     /// `enabled`) but never dispatches a runnable task is a real, distinct
     /// failure — worse than never attaching — that the attach verdict
@@ -835,9 +832,8 @@ pub struct VerifierVmResult {
     /// `D = 1 + Σrun_delay/Σon_cpu` over the vCPU host threads (see
     /// `vmm::result::HostVcpuSchedstat`). `None` on hosts
     /// without `CONFIG_SCHEDSTATS` or when no vCPU thread was sampled.
-    /// Purely observational: surfaced in the per-cell output and the
-    /// summary grid but NEVER folded into [`Self::cell_verdict`] or the
-    /// exit code.
+    /// Purely observational: surfaced in the per-cell output but NEVER
+    /// folded into [`Self::cell_verdict`] or the exit code.
     pub dilation: Option<f64>,
 }
 
@@ -1369,10 +1365,7 @@ pub fn format_verifier_diff(
 /// (scheduler, kernel, topology): the verifier sweeps each declared
 /// scheduler across topologies, so topology IS a result axis — a
 /// scheduler can pass on one topology and fail on another.
-// No `Eq`: the `dilation: Option<f64>` field carries an `f64`, which is
-// `PartialEq` but not `Eq` (NaN). Record equality is only used in tests
-// (`assert_eq!` on built records), for which `PartialEq` suffices.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VerifierCellRecord {
     /// Declared scheduler name (the `<sched>` cell-name segment).
     pub scheduler: String,
@@ -1397,16 +1390,6 @@ pub struct VerifierCellRecord {
     /// kernel, cell = the count summarized across topologies) that the
     /// dispatcher prints before the PASS/FAIL grids.
     pub stats: Vec<ProgStats>,
-    /// Host-side vCPU scheduling dilation for the cell's VM run
-    /// (`D = 1 + Σrun_delay/Σon_cpu`), copied from
-    /// [`VerifierVmResult::dilation`]. `None` when host schedstats were
-    /// unavailable or no vCPU was sampled. Rendered inside the glyph
-    /// cell of [`render_result_table`]; observational only, never part
-    /// of the pass/fail decision. `#[serde(default)]` so records written
-    /// by an older cell binary (no `dilation` key) still deserialize —
-    /// the dispatcher and cells can skew across a rolling upgrade.
-    #[serde(default)]
-    pub dilation: Option<f64>,
 }
 
 /// Map a cell's full name to a filesystem-safe record filename: every
@@ -1441,7 +1424,6 @@ pub(crate) fn write_cell_record(
     passed: bool,
     skipped: bool,
     stats: &[ProgStats],
-    dilation: Option<f64>,
 ) {
     debug_assert!(
         !(passed && skipped),
@@ -1461,7 +1443,6 @@ pub(crate) fn write_cell_record(
         passed,
         skipped,
         stats: stats.to_vec(),
-        dilation,
     };
     let path = dir.join(cell_record_filename(full_name));
     match serde_json::to_vec(&record) {
@@ -1666,11 +1647,6 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
     // scheduler -> (topology, kernel) -> folded disposition. Failure
     // dominates pass, which dominates skip, for defensive duplicates.
     let mut agg: BTreeMap<String, BTreeMap<(String, String), CellDisposition>> = BTreeMap::new();
-    // scheduler -> (topology, kernel) -> MAX host dilation across the
-    // triple's records. A duplicate fold keeps the highest (worst)
-    // dilation; `None` throughout means no record reported one (host
-    // schedstats unavailable) -> the cell renders the glyph alone.
-    let mut agg_dil: BTreeMap<String, BTreeMap<(String, String), Option<f64>>> = BTreeMap::new();
     for r in records {
         schedulers.insert(r.scheduler.clone());
         sched_rows
@@ -1693,14 +1669,6 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
         } else {
             disposition.any_fail = true;
         }
-        let dil = agg_dil
-            .entry(r.scheduler.clone())
-            .or_default()
-            .entry((r.topology.clone(), r.kernel.clone()))
-            .or_insert(None);
-        if let Some(d) = r.dilation {
-            *dil = Some(dil.map_or(d, |cur| cur.max(d)));
-        }
     }
 
     let mut out =
@@ -1719,29 +1687,17 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
         for topo in rows {
             let mut line: Vec<comfy_table::Cell> = vec![comfy_table::Cell::new(topo)];
             for kernel in cols {
-                // Max host dilation for this (topology, kernel) cell, if
-                // any record reported one. Rendered INSIDE the glyph cell
-                // (`✓  1.03`) so the number rides along with the verdict
-                // without adding a column; `None` -> glyph alone.
-                let dil = agg_dil[sched]
-                    .get(&(topo.clone(), kernel.clone()))
-                    .copied()
-                    .flatten();
-                let with_dil = |glyph: &str| match dil {
-                    Some(d) => format!("{glyph}  {d:.2}"),
-                    None => glyph.to_string(),
-                };
                 let cell = match cells.get(&(topo.clone(), kernel.clone())).copied() {
                     None => comfy_table::Cell::new("-"),
                     Some(d) if d.any_fail => {
                         n_fail += 1;
-                        comfy_table::Cell::new(with_dil("✗"))
+                        comfy_table::Cell::new("✗")
                             .fg(comfy_table::Color::Red)
                             .add_attribute(comfy_table::Attribute::Bold)
                     }
                     Some(d) if d.any_pass => {
                         n_pass += 1;
-                        comfy_table::Cell::new(with_dil("✓"))
+                        comfy_table::Cell::new("✓")
                             .fg(comfy_table::Color::Green)
                             .add_attribute(comfy_table::Attribute::Bold)
                     }
@@ -1885,11 +1841,11 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mk temp dir");
         // Malformed: no verifier/ prefix, and a 2-segment name (no
         // <preset> after the kernel) — both skipped.
-        write_cell_record(&dir, "not_a_cell", true, false, &[], None);
-        write_cell_record(&dir, "verifier/only/two", true, false, &[], None);
+        write_cell_record(&dir, "not_a_cell", true, false, &[]);
+        write_cell_record(&dir, "verifier/only/two", true, false, &[]);
         // Well-formed cell: fail, then a retry passes -> overwrites.
         let name = "verifier/scx_a/kernel_6_14/tiny-1llc";
-        write_cell_record(&dir, name, false, false, &[], None);
+        write_cell_record(&dir, name, false, false, &[]);
         // The retry passes and carries per-program verified_insns, so the
         // final record has both the PASS outcome and the stats.
         let stats = [
@@ -1902,7 +1858,7 @@ mod tests {
                 verified_insns: 123,
             },
         ];
-        write_cell_record(&dir, name, true, false, &stats, Some(1.05));
+        write_cell_record(&dir, name, true, false, &stats);
         let recs = read_cell_records(&dir);
         assert_eq!(
             recs.len(),
@@ -1919,9 +1875,6 @@ mod tests {
         // Per-program verified_insns survive the JSON roundtrip and reflect
         // the final (retry) write, not the earlier stat-less fail.
         assert_eq!(recs[0].stats, stats, "stats roundtrip via serde");
-        // Host dilation survives the JSON roundtrip and reflects the final
-        // (retry) write.
-        assert_eq!(recs[0].dilation, Some(1.05), "dilation roundtrip via serde");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1937,7 +1890,6 @@ mod tests {
             false,
             true,
             &[],
-            None,
         );
         let recs = read_cell_records(&dir);
         assert_eq!(recs.len(), 1);
@@ -1966,9 +1918,6 @@ mod tests {
         let recs = vec![
             // scx_a across two kernels and two topologies; the
             // (large-4llc, kernel_6_15) cell has no record -> `-`.
-            // scx_a's cells all lack a dilation sample (None) -> each
-            // renders the glyph alone, so its whole section carries no
-            // decimal number (the None-rendering case).
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_14".into(),
@@ -1976,7 +1925,6 @@ mod tests {
                 passed: true,
                 skipped: false,
                 stats: vec![],
-                dilation: None,
             },
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
@@ -1985,7 +1933,6 @@ mod tests {
                 passed: false,
                 skipped: false,
                 stats: vec![],
-                dilation: None,
             },
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
@@ -1994,7 +1941,6 @@ mod tests {
                 passed: true,
                 skipped: false,
                 stats: vec![],
-                dilation: None,
             },
             // Explicit kernel/topology SKIP. It renders the same neutral
             // `-` as an inapplicable matrix intersection and contributes
@@ -2006,12 +1952,9 @@ mod tests {
                 passed: false,
                 skipped: true,
                 stats: vec![],
-                dilation: None,
             },
             // scx_b: a duplicate (scheduler, kernel, topology) triple with
-            // one pass AND one fail -> ✗ (any failure means failure). The
-            // two records also carry different dilations (1.10 and 1.40);
-            // the fold keeps the MAX (1.40), rendered in-glyph.
+            // one pass AND one fail -> ✗ (any failure means failure).
             VerifierCellRecord {
                 scheduler: "scx_b".into(),
                 kernel: "kernel_6_14".into(),
@@ -2019,7 +1962,6 @@ mod tests {
                 passed: true,
                 skipped: false,
                 stats: vec![],
-                dilation: Some(1.10),
             },
             VerifierCellRecord {
                 scheduler: "scx_b".into(),
@@ -2028,7 +1970,6 @@ mod tests {
                 passed: false,
                 skipped: false,
                 stats: vec![],
-                dilation: Some(1.40),
             },
         ];
         let out = render_result_table(&recs).expect("non-empty records -> Some");
@@ -2097,24 +2038,12 @@ mod tests {
             b_tiny.contains('✗') && !b_tiny.contains('✓'),
             "a pass+fail duplicate-record cell renders ✗: {b_tiny}"
         );
-        // Host dilation rides INSIDE the glyph cell. scx_a's cells are all
-        // dilation-None -> glyph alone, so no decimal number appears in
-        // its section (kernel labels / topology names / the tally carry
-        // no '.').
+        // Summary cells contain only their verdict glyph. Runtime
+        // measurements belong in the detailed per-cell output and must
+        // not widen or misalign this matrix.
         assert!(
-            !a_sec.contains('.'),
-            "None-dilation cells render the glyph alone, no number: {a_sec}"
-        );
-        // scx_b's duplicate (pass+fail) triple folds to one ✗ cell whose
-        // in-glyph dilation is the MAX across the folded records — 1.40,
-        // not the lower 1.10 — keeping the ✓/✗ styling around it.
-        assert!(
-            b_sec.contains("✗  1.40"),
-            "folded fail cell shows the max dilation in-glyph: {b_sec}"
-        );
-        assert!(
-            !b_sec.contains("1.10"),
-            "duplicate fold keeps the max dilation, drops the lower: {b_sec}"
+            !out.contains('.'),
+            "summary grid must not render runtime measurements: {out}"
         );
         // Emoji stay OFF the grid rows (they drift box-drawing columns in
         // GitHub's log viewer); the retired glyphs and flat list are gone.
@@ -2129,6 +2058,32 @@ mod tests {
             "retired ❎ / 🟡 / failing-combinations list must not appear: {out}"
         );
         assert!(render_result_table(&[]).is_none(), "empty -> None");
+    }
+
+    /// Result records from v0.40 carried a `dilation` field. Serde ignores
+    /// that now-unknown field during a rolling upgrade, and the summary
+    /// still renders a glyph-only verdict cell.
+    #[test]
+    fn legacy_record_dilation_is_ignored_by_summary() {
+        let record: VerifierCellRecord = serde_json::from_str(
+            r#"{
+                "scheduler": "scx_a",
+                "kernel": "kernel_6_14",
+                "topology": "tiny-1llc",
+                "passed": true,
+                "skipped": false,
+                "stats": [],
+                "dilation": 11.62
+            }"#,
+        )
+        .expect("v0.40 record with dilation still deserializes");
+
+        let out = render_result_table(&[record]).expect("record renders a summary");
+        assert!(out.contains('✓'), "pass glyph is present: {out}");
+        assert!(
+            !out.contains("11.62"),
+            "legacy dilation must not enter the summary cell: {out}"
+        );
     }
 
     /// Per-scheduler verified_insns tables: one section per declared
@@ -2159,7 +2114,6 @@ mod tests {
                         verified_insns: 64,
                     },
                 ],
-                dilation: None,
             },
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
@@ -2177,7 +2131,6 @@ mod tests {
                         verified_insns: 64,
                     },
                 ],
-                dilation: None,
             },
             // scx_a / kernel_6_15: ktstr_dispatch DIFFERS across topologies
             // -> `lo..hi` range; ktstr_enqueue is absent on this kernel
@@ -2192,7 +2145,6 @@ mod tests {
                     name: "ktstr_dispatch".into(),
                     verified_insns: 130,
                 }],
-                dilation: None,
             },
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
@@ -2204,7 +2156,6 @@ mod tests {
                     name: "ktstr_dispatch".into(),
                     verified_insns: 150,
                 }],
-                dilation: None,
             },
             // scx_b: a separate section (its own declaration).
             VerifierCellRecord {
@@ -2217,7 +2168,6 @@ mod tests {
                     name: "ktstr_dispatch".into(),
                     verified_insns: 200,
                 }],
-                dilation: None,
             },
             // scx_a / kernel_6_16: a record but NO stats — every cell died
             // during BPF load, so no program existed to introspect. It must
@@ -2229,7 +2179,6 @@ mod tests {
                 passed: false,
                 skipped: false,
                 stats: vec![],
-                dilation: None,
             },
         ];
         let out = render_instruction_count_tables(&recs).expect("stats present -> Some");
@@ -2304,7 +2253,6 @@ mod tests {
             passed: false,
             skipped: false,
             stats: vec![],
-            dilation: None,
         }];
         assert!(
             render_instruction_count_tables(&bare).is_none(),
@@ -2424,11 +2372,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// attach_outcome_from_messages positive-confirmation rule:
-    /// Died > NotAttached > PayloadStarting(=Attached) > Unconfirmed.
-    /// Absence of a positive PayloadStarting frame is Unconfirmed (FAIL),
-    /// NOT a blind pass — this is what catches an early guest panic that
-    /// reboots emitting no frame. Corrupt / empty / non-LIFECYCLE /
-    /// unknown frames are skipped.
+    /// Died > NotAttached > SchedulerAttached > Unconfirmed. A
+    /// PayloadStarting frame alone is Unconfirmed (FAIL), because the
+    /// guest emits it for schedulerless runs. Corrupt / empty /
+    /// non-LIFECYCLE / unknown frames are skipped.
     #[test]
     fn attach_outcome_from_lifecycle_frames() {
         use crate::vmm::host_comms::BulkDrainResult;
@@ -2452,20 +2399,32 @@ mod tests {
             AttachOutcome::Unconfirmed,
         );
 
-        // Reached init but NOT the dispatch phase -> Unconfirmed.
+        // Reached init but no definitive attach -> Unconfirmed.
         let init_only = drain(vec![frame(LifecyclePhase::InitStarted, "")]);
         assert_eq!(
             attach_outcome_from_messages(Some(&init_only)),
             AttachOutcome::Unconfirmed,
         );
 
-        // Reached the dispatch phase (PayloadStarting), no failure -> Attached.
-        let progress = drain(vec![
+        // Schedulerless runs also reach PayloadStarting. That is not
+        // positive attach evidence.
+        let schedulerless = drain(vec![
             frame(LifecyclePhase::InitStarted, ""),
             frame(LifecyclePhase::PayloadStarting, ""),
         ]);
         assert_eq!(
-            attach_outcome_from_messages(Some(&progress)),
+            attach_outcome_from_messages(Some(&schedulerless)),
+            AttachOutcome::Unconfirmed,
+        );
+
+        // Only the explicit SchedulerAttached frame confirms attach.
+        let attached = drain(vec![
+            frame(LifecyclePhase::InitStarted, ""),
+            frame(LifecyclePhase::SchedulerAttached, ""),
+            frame(LifecyclePhase::PayloadStarting, ""),
+        ]);
+        assert_eq!(
+            attach_outcome_from_messages(Some(&attached)),
             AttachOutcome::Attached,
         );
 
@@ -2477,9 +2436,9 @@ mod tests {
         );
 
         // A failure frame wins over a (defensively) co-present
-        // PayloadStarting.
+        // SchedulerAttached.
         let fail_beats_positive = drain(vec![
-            frame(LifecyclePhase::PayloadStarting, ""),
+            frame(LifecyclePhase::SchedulerAttached, ""),
             frame(LifecyclePhase::SchedulerNotAttached, "sysfs absent"),
         ]);
         assert_eq!(
@@ -2502,9 +2461,9 @@ mod tests {
             assert_eq!(attach_outcome_from_messages(Some(&d)), AttachOutcome::Died);
         }
 
-        // Died wins even over a PayloadStarting.
+        // Died wins even over SchedulerAttached.
         let died_beats_positive = drain(vec![
-            frame(LifecyclePhase::PayloadStarting, ""),
+            frame(LifecyclePhase::SchedulerAttached, ""),
             frame(LifecyclePhase::SchedulerDied, ""),
         ]);
         assert_eq!(
@@ -2513,10 +2472,11 @@ mod tests {
         );
 
         // Skipped frames (corrupt crc / empty payload / non-LIFECYCLE /
-        // unknown discriminant) must NOT suppress a real PayloadStarting:
-        // pairing each with a valid PayloadStarting must still resolve
-        // Attached — proving the frame was skipped, not acted on (a
-        // corrupt/non-LIFECYCLE Died byte would otherwise force Died).
+        // unknown discriminant) must NOT suppress a real
+        // SchedulerAttached: pairing each with a valid SchedulerAttached
+        // must still resolve Attached — proving the frame was skipped,
+        // not acted on (a corrupt/non-LIFECYCLE Died byte would otherwise
+        // force Died).
         let corrupt_died = ShmEntry {
             msg_type: MSG_TYPE_LIFECYCLE,
             payload: vec![LifecyclePhase::SchedulerDied.wire_value()],
@@ -2538,13 +2498,60 @@ mod tests {
             crc_ok: true,
         };
         for skipped in [corrupt_died, empty, non_lifecycle_died, unknown_phase] {
-            let d = drain(vec![skipped, frame(LifecyclePhase::PayloadStarting, "")]);
+            let d = drain(vec![skipped, frame(LifecyclePhase::SchedulerAttached, "")]);
             assert_eq!(
                 attach_outcome_from_messages(Some(&d)),
                 AttachOutcome::Attached,
-                "a skipped frame must not suppress a valid PayloadStarting",
+                "a skipped frame must not suppress a valid SchedulerAttached",
             );
         }
+    }
+
+    /// A schedulerless verifier run can reach Phase 5 and make progress
+    /// under the kernel fallback policy. PayloadStarting plus
+    /// WorkloadDispatched therefore must not be enough to PASS without
+    /// the definitive SchedulerAttached frame.
+    #[test]
+    fn schedulerless_payload_progress_cannot_pass_verification() {
+        use crate::vmm::host_comms::BulkDrainResult;
+        use crate::vmm::wire::{LifecyclePhase, MSG_TYPE_LIFECYCLE, ShmEntry};
+
+        let messages = BulkDrainResult {
+            entries: [
+                LifecyclePhase::PayloadStarting,
+                LifecyclePhase::WorkloadDispatched,
+            ]
+            .into_iter()
+            .map(|phase| ShmEntry {
+                msg_type: MSG_TYPE_LIFECYCLE,
+                payload: vec![phase.wire_value()],
+                crc_ok: true,
+            })
+            .collect(),
+        };
+        let result = VerifierVmResult {
+            stats: Vec::new(),
+            scheduler_log: String::new(),
+            scheduler_stdout: String::new(),
+            scheduler_stderr: String::new(),
+            attach: attach_outcome_from_messages(Some(&messages)),
+            dispatched: dispatch_confirmed_from_messages(Some(&messages)),
+            timed_out: false,
+            crash_message: None,
+            dilation: None,
+        };
+
+        assert_eq!(result.attach, AttachOutcome::Unconfirmed);
+        assert!(
+            result.dispatched,
+            "the fallback-running probe made progress"
+        );
+        assert!(
+            result
+                .cell_verdict()
+                .expect_err("no scheduler attached, so the cell must fail")
+                .contains("no SchedulerAttached frame"),
+        );
     }
 
     /// dispatch_confirmed_from_messages: true only when a crc-ok,
@@ -2567,14 +2574,13 @@ mod tests {
         // No frames at all -> false.
         assert!(!dispatch_confirmed_from_messages(None));
 
-        // PayloadStarting but no WorkloadDispatched -> false (attached,
-        // never dispatched).
-        let attached_only = drain(vec![frame(LifecyclePhase::PayloadStarting)]);
+        // SchedulerAttached but no WorkloadDispatched -> false.
+        let attached_only = drain(vec![frame(LifecyclePhase::SchedulerAttached)]);
         assert!(!dispatch_confirmed_from_messages(Some(&attached_only)));
 
         // WorkloadDispatched present -> true.
         let dispatched = drain(vec![
-            frame(LifecyclePhase::PayloadStarting),
+            frame(LifecyclePhase::SchedulerAttached),
             frame(LifecyclePhase::WorkloadDispatched),
         ]);
         assert!(dispatch_confirmed_from_messages(Some(&dispatched)));

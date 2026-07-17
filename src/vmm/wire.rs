@@ -462,16 +462,16 @@ pub enum LifecyclePhase {
     /// reason suffix lives in the bytes after the 1-byte phase
     /// header.
     SchedulerNotAttached,
-    /// The injected verifier workload dispatched: after attach, at least
-    /// one worker of the `--ktstr-verifier-workload` run made forward
-    /// progress on-CPU (a positive, scheduler-agnostic dispatch proof).
-    /// Emitted by `ktstr_guest_init` Phase 5 only when a verifier-workload
-    /// run recorded a worker with non-zero `iterations` under a confirmed
-    /// SCHED_EXT policy (so a fair-class fallback cannot false-confirm).
-    /// Given a `PayloadStarting` frame, the ABSENCE of this frame means the
-    /// scheduler attached (sched_ext `enabled`) but never dispatched the
-    /// workload — a distinct, worse failure than never attaching. Carries
-    /// an empty suffix. Has no legacy COM2 sentinel equivalent.
+    /// The injected verifier workload made forward progress: at least one
+    /// worker of the `--ktstr-verifier-workload` run advanced on-CPU after
+    /// requesting SCHED_EXT policy. Combined with `SchedulerAttached`, it
+    /// is a positive, scheduler-agnostic dispatch proof. Alone it is not
+    /// attach proof: schedulerless SCHED_EXT tasks may run through the
+    /// kernel fallback. Given a `SchedulerAttached` frame, the ABSENCE of
+    /// this frame means the scheduler attached (sched_ext `enabled`) but
+    /// never dispatched the workload — a distinct failure from never
+    /// attaching. Carries an empty suffix. Has no legacy COM2 sentinel
+    /// equivalent.
     WorkloadDispatched,
     /// A real sched_ext scheduler attached: the scheduler process is
     /// alive AND `poll_scx_attached` observed `root/ops` registered with
@@ -487,9 +487,9 @@ pub enum LifecyclePhase {
     /// positive, live-scheduler attach proof the host uses to arm the
     /// progress watchdog's workload deadline from the confirmed-attach
     /// moment (see `freeze_coord::dispatch`'s Lifecycle arm). Carries an
-    /// empty suffix. Additive — the post-hoc `AttachOutcome` verdict scan
-    /// keys on `PayloadStarting` / `SchedulerDied` / `SchedulerNotAttached`
-    /// only, so this frame passes through it harmlessly.
+    /// empty suffix. The post-hoc `AttachOutcome` verdict scan keys on
+    /// this definitive frame rather than `PayloadStarting`, which is also
+    /// emitted for schedulerless runs.
     SchedulerAttached,
 }
 
