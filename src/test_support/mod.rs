@@ -62,6 +62,8 @@ mod boot_retry;
 // Shared by the guest (rust_init formats the AP-gap panic around the
 // marker) and the host cell layer (verifier + eval retry the whole boot
 // when a run's crash_message carries it).
+#[cfg(target_arch = "x86_64")]
+pub(crate) use boot_retry::guest_kernel_rejected_wide_apic;
 pub(crate) use boot_retry::{AP_BRINGUP_GAP_MARKER, run_vm_with_ap_gap_retry};
 mod dispatch;
 mod entry;

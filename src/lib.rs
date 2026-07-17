@@ -1558,7 +1558,7 @@ pub const KTSTR_KERNEL_HINT: &str = "set KTSTR_KERNEL to one of: \
     `~`-prefixed path, local kernel package (`*.rpm`, `*.deb`, or \
     `*.pkg.tar.zst`), distro kernel (`fedora`/`fedora-44`/`f44`, \
     `ubuntu`/`ubuntu-24.04`, `amazonlinux`/`amazonlinux-2023`/`al2023`, \
-    `steamos`/`steamos-3.8`), or \
+    `steamos`/`steamos-3.8`, `gke`/`gke-129`), or \
     cache key. List \
     cached keys with `cargo ktstr kernel list`; build new ones with \
     `cargo ktstr kernel build`";

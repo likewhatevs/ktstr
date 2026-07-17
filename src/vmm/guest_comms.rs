@@ -23,7 +23,7 @@
 use crate::sync::MutexExt;
 use crate::vmm::wire::{
     KERNEL_OP_REPLY_MAX, KernelOpReplyPayload, KernelOpRequestPayload, KernelOpRequestResult,
-    LifecyclePhase, MSG_TYPE_KERNEL_OP_REPLY, MSG_TYPE_SNAPSHOT_REPLY, MsgType,
+    LifecyclePhase, MSG_TYPE_KERNEL_OP_REPLY, MSG_TYPE_SNAPSHOT_REPLY, MsgType, PORT1_NAME,
     SNAPSHOT_REASON_MAX, SNAPSHOT_STATUS_ERR, SNAPSHOT_STATUS_OK, SNAPSHOT_TAG_MAX, ShmMessage,
     SnapshotReplyPayload, SnapshotRequestPayload, SnapshotRequestResult,
 };
@@ -31,7 +31,7 @@ use zerocopy::{FromBytes, IntoBytes};
 
 /// Mutex serializing guest-side bulk-port writes. Every guest writer
 /// (`write_msg`) takes this lock before submitting bytes to
-/// `/dev/vport0p1`, so the in-stream order of bytes on port 1 stays
+/// the port advertised as [`PORT1_NAME`], so the in-stream order of bytes stays
 /// `[header][payload]` regardless of which producer (step executor,
 /// sched-exit-mon, profraw flusher) emitted the frame.
 pub static GUEST_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -130,14 +130,68 @@ fn assert_guest_context(fn_name: &str, msg_type: u32) -> bool {
     true
 }
 
-/// Virtio-console bulk-port device path. Single source of truth for
-/// the guest's bulk-channel filesystem location — referenced by
-/// [`try_open_bulk_port`] (the actual open call) and by
-/// `vmm::rust_init::send_sys_rdy_with_retry` (the existence probe
-/// during boot).
-pub(crate) const BULK_PORT_DEV: &str = "/dev/vport0p1";
+/// Sysfs class populated by the kernel virtio-console driver. Device
+/// numbering (`vport0p1`, `vport1p1`, ...) depends on virtio device
+/// probe order, so ktstr resolves ports by the stable names advertised
+/// by the host instead of assuming a particular numeric prefix.
+pub(crate) const VIRTIO_PORT_CLASS_DIR: &str = "/sys/class/virtio-ports";
+const SYS_CLASS_DIR: &str = "/sys/class";
 
-/// Cached `BULK_PORT_DEV` writer. Opened lazily on the first
+/// Map a host-advertised virtio-console port name to its guest device
+/// node. `class_dir` and `dev_dir` are parameters so the filesystem
+/// mapping can be covered without a booted VM.
+fn named_virtio_port_path_in(
+    class_dir: &std::path::Path,
+    dev_dir: &std::path::Path,
+    port_name: &str,
+) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(class_dir).ok()?;
+    for entry in entries.flatten() {
+        let Ok(name) = std::fs::read_to_string(entry.path().join("name")) else {
+            continue;
+        };
+        if name.trim() == port_name {
+            return Some(dev_dir.join(entry.file_name()));
+        }
+    }
+    None
+}
+
+/// Resolve a host-advertised virtio-console port name to `/dev`.
+///
+/// The host publishes [`PORT1_NAME`] / [`crate::vmm::wire::PORT2_NAME`]
+/// through `PORT_NAME` control messages. Linux exposes those names at
+/// `/sys/class/virtio-ports/vportNpM/name`; the directory basename is
+/// the corresponding `/dev/vportNpM` node.
+pub(crate) fn named_virtio_port_path(port_name: &str) -> Option<std::path::PathBuf> {
+    named_virtio_port_path_in(
+        std::path::Path::new(VIRTIO_PORT_CLASS_DIR),
+        std::path::Path::new("/dev"),
+        port_name,
+    )
+}
+
+/// Existing directory whose inotify events can lead to a named port.
+///
+/// Before `virtio_console` registers its class, watch `/sys/class` for
+/// the class directory itself. Once registered, watch the class for
+/// port devices. This keeps early boot event-driven without assuming
+/// the class already existed when init armed its first wait.
+pub(crate) fn virtio_port_watch_dir() -> &'static std::path::Path {
+    let class = std::path::Path::new(VIRTIO_PORT_CLASS_DIR);
+    if class.is_dir() {
+        class
+    } else {
+        std::path::Path::new(SYS_CLASS_DIR)
+    }
+}
+
+/// Resolve the guest-to-host bulk channel by its stable advertised name.
+pub(crate) fn bulk_port_path() -> Option<std::path::PathBuf> {
+    named_virtio_port_path(PORT1_NAME)
+}
+
+/// Cached bulk-port writer. Opened lazily on the first
 /// successful `write_to_bulk_port` call after the kernel's
 /// virtio_console driver creates the device node (post multiport
 /// handshake). `OnceLock<Option<...>>` so repeated open failures
@@ -159,11 +213,8 @@ static BULK_PORT_FD: std::sync::OnceLock<std::sync::Mutex<Option<std::fs::File>>
 pub(crate) static BULK_PORT_WRITE_ATTEMPTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Try to open [`BULK_PORT_DEV`] for writing. Returns None when the
-/// device is not yet present — the kernel virtio_console driver
-/// creates it via `device_create` inside `add_port`
-/// (drivers/char/virtio_console.c) only after the host emits
-/// PORT_ADD on the c_ivq for port 1.
+/// Try to resolve and open the named bulk port. Returns None while
+/// the kernel has not yet received both PORT_ADD and PORT_NAME.
 ///
 /// Open mode: read+write, blocking. O_RDWR is required because the
 /// kernel's `port_fops_open` (drivers/char/virtio_console.c) sets
@@ -173,15 +224,16 @@ pub(crate) static BULK_PORT_WRITE_ATTEMPTS: std::sync::atomic::AtomicU64 =
 /// reply reader. The port-2 stats relay already uses O_RDWR
 /// (rust_init/relay.rs `start_sched_stats_relay`).
 fn try_open_bulk_port() -> Option<std::fs::File> {
+    let path = bulk_port_path()?;
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(BULK_PORT_DEV)
+        .open(path)
         .ok()
 }
 
 /// Write a TLV-framed message to the host through the bulk channel
-/// (virtio-console port 1, [`BULK_PORT_DEV`]). The frame format is
+/// (the virtio-console port named [`PORT1_NAME`]). The frame format is
 /// 16-byte [`ShmMessage`] header + `payload.len()` bytes; the host
 /// parses the same byte stream via [`super::host_comms::parse_tlv_stream`].
 ///
@@ -211,7 +263,7 @@ fn write_msg(msg_type: u32, payload: &[u8]) -> bool {
     write_to_bulk_port(msg_type, payload)
 }
 
-/// Try to write a TLV-framed message to `/dev/vport0p1`. Returns
+/// Try to write a TLV-framed message to the named bulk port. Returns
 /// true when the message was fully written, false when the bulk
 /// port is not yet available or the write failed.
 ///
@@ -737,7 +789,9 @@ pub fn send_teardown_barrier_and_wait() -> Result<(), String> {
     }
     let _rpc_guard = SNAPSHOT_REQUEST_LOCK.lock_unpoisoned();
     if !write_msg(MsgType::TeardownBarrier.wire_value(), &[]) {
-        return Err("failed to publish TeardownBarrier on /dev/vport0p1".into());
+        return Err(format!(
+            "failed to publish TeardownBarrier on named virtio-console port {PORT1_NAME:?}"
+        ));
     }
 
     let read_slot = BULK_PORT_FD.get_or_init(|| std::sync::Mutex::new(None));
@@ -746,9 +800,10 @@ pub fn send_teardown_barrier_and_wait() -> Result<(), String> {
         match try_open_bulk_port() {
             Some(f) => *read_guard = Some(f),
             None => {
-                return Err(
-                    "/dev/vport0p1 not yet open (multiport handshake still in flight)".into(),
-                );
+                return Err(format!(
+                    "named virtio-console port {PORT1_NAME:?} not yet open \
+                     (multiport handshake still in flight)"
+                ));
             }
         }
     }
@@ -797,7 +852,7 @@ pub fn send_workload_progress(elapsed_ms: u64) {
 /// Returns `true` when the frame was fully written, `false` when the
 /// bulk port is not yet open (the multiport handshake completes
 /// asynchronously during kernel virtio_console init, so
-/// `/dev/vport0p1` may not exist on the first call after
+/// the named bulk-port device may not exist on the first call after
 /// `mount_filesystems()` returns) or the write failed.
 ///
 /// Frames an empty payload with [`MsgType::SysRdy`] and routes
@@ -1446,7 +1501,7 @@ fn bounded_read_exact(
 }
 
 /// Read a single TLV frame (16-byte header + payload bytes) from
-/// `/dev/vport0p1`. Returns the parsed message type and payload on
+/// the named bulk port. Returns the parsed message type and payload on
 /// success.
 ///
 /// When `deadline` is `Some`, reads the header and payload with
@@ -1579,9 +1634,10 @@ pub fn request_snapshot(
             Some(f) => *read_guard = Some(f),
             None => {
                 return SnapshotRequestResult::TransportError {
-                    reason: "/dev/vport0p1 not yet open \
-                             (multiport handshake still in flight)"
-                        .into(),
+                    reason: format!(
+                        "named virtio-console port {PORT1_NAME:?} not yet open \
+                         (multiport handshake still in flight)"
+                    ),
                 };
             }
         }
@@ -1777,9 +1833,10 @@ pub fn request_kernel_op(
             Some(f) => *read_guard = Some(f),
             None => {
                 return KernelOpRequestResult::TransportError {
-                    reason: "/dev/vport0p1 not yet open \
-                             (multiport handshake still in flight)"
-                        .into(),
+                    reason: format!(
+                        "named virtio-console port {PORT1_NAME:?} not yet open \
+                         (multiport handshake still in flight)"
+                    ),
                 };
             }
         }
@@ -1876,6 +1933,48 @@ mod tests {
     //! `tests/`.
 
     use super::*;
+
+    #[test]
+    fn named_virtio_port_resolves_by_advertised_name_not_device_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let class_dir = tmp.path().join("sys/class/virtio-ports");
+        let dev_dir = tmp.path().join("dev");
+        std::fs::create_dir_all(class_dir.join("vport0p0")).unwrap();
+        std::fs::create_dir_all(class_dir.join("vport1p1")).unwrap();
+        std::fs::create_dir_all(class_dir.join("vport1p2")).unwrap();
+        std::fs::create_dir_all(&dev_dir).unwrap();
+        std::fs::write(class_dir.join("vport0p0/name"), "com.redhat.spice.0\n").unwrap();
+        std::fs::write(class_dir.join("vport1p1/name"), PORT1_NAME).unwrap();
+        std::fs::write(
+            class_dir.join("vport1p2/name"),
+            crate::vmm::wire::PORT2_NAME,
+        )
+        .unwrap();
+
+        assert_eq!(
+            named_virtio_port_path_in(&class_dir, &dev_dir, PORT1_NAME),
+            Some(dev_dir.join("vport1p1")),
+        );
+        assert_eq!(
+            named_virtio_port_path_in(&class_dir, &dev_dir, crate::vmm::wire::PORT2_NAME),
+            Some(dev_dir.join("vport1p2")),
+        );
+    }
+
+    #[test]
+    fn named_virtio_port_ignores_entries_without_readable_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let class_dir = tmp.path().join("class");
+        let dev_dir = tmp.path().join("dev");
+        std::fs::create_dir_all(class_dir.join("vport0p0")).unwrap();
+        std::fs::create_dir_all(class_dir.join("vport2p1")).unwrap();
+        std::fs::write(class_dir.join("vport2p1/name"), PORT1_NAME).unwrap();
+
+        assert_eq!(
+            named_virtio_port_path_in(&class_dir, &dev_dir, PORT1_NAME),
+            Some(dev_dir.join("vport2p1")),
+        );
+    }
 
     /// Run `f` (a host-context sender call) and assert it did NOT
     /// enter `write_to_bulk_port` — i.e. the `is_guest()` gate in

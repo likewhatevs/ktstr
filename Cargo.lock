@@ -3703,7 +3703,7 @@ dependencies = [
 
 [[package]]
 name = "ktstr"
-version = "0.39.0"
+version = "0.40.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -3741,6 +3741,7 @@ dependencies = [
  "linkme",
  "linux-loader",
  "lz4_flex",
+ "md-5",
  "memchr",
  "memmap2",
  "mockito",
@@ -3800,7 +3801,7 @@ dependencies = [
 
 [[package]]
 name = "ktstr-macros"
-version = "0.39.0"
+version = "0.40.0"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -389,7 +389,7 @@ pub enum Op {
     /// **Guest → host wire.** In-guest scenarios submit the request
     /// over the virtio-console port-1 TLV stream: `request_snapshot`
     /// builds a `SnapshotRequestPayload` and writes it via
-    /// `write_msg(MsgType::SnapshotRequest, ...)` to `/dev/vport0p1`
+    /// `write_msg(MsgType::SnapshotRequest, ...)` to the named bulk port
     /// (`src/vmm/guest_comms.rs`). The host coordinator decodes the
     /// `MSG_TYPE_SNAPSHOT_REQUEST` frame, runs
     /// `freeze_and_dispatch(FreezeMode::Capture { .. })`, and the

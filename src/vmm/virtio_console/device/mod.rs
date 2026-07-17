@@ -444,7 +444,7 @@ impl VirtioConsole {
     /// `pub fn drain_bulk` alone catches only what `process_tx`
     /// has already deposited; on the eevdf-style failure path the
     /// guest writes a `MSG_TYPE_LIFECYCLE` and a `MSG_TYPE_EXIT`
-    /// frame to `/dev/vport0p1` and immediately calls `force_reboot`,
+    /// frame to the named bulk port and immediately calls `force_reboot`,
     /// and the userspace write's `virtqueue_kick` MMIO can lag
     /// behind so the chains land in the avail ring without a
     /// matching host-side notify. A single explicit `process_tx`
@@ -1039,7 +1039,7 @@ impl VirtioConsole {
                     // case creates the sysfs `name` attribute, which
                     // udev rules consume to symlink the port; sending
                     // PORT_OPEN first races udev's symlink creation
-                    // against userspace opens of /dev/vport0p{1,2}.
+                    // against userspace opens of the named device nodes.
                     self.control_out.push_back(ControlOut::Name { id, name });
                     self.control_out
                         .push_back(ControlOut::Cmd(VirtioConsoleControl {

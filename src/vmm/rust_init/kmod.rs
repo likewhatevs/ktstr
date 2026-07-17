@@ -6,7 +6,7 @@
 //! loaded. The host packs the required `.ko` images into the initramfs
 //! (`initramfs::build_suffix`), and this loads them — in the
 //! caller-chosen order — right after devtmpfs is mounted and BEFORE
-//! init opens `/dev/vport0p1`, `/dev/vda`, or `/dev/hvc0`.
+//! init opens the named virtio-console ports, `/dev/vda`, or `/dev/hvc0`.
 //!
 //! Split from rust_init.rs; the shared consts/imports live in the
 //! parent module (`super`), reached via the glob below.
@@ -59,7 +59,7 @@ pub(crate) fn load_kernel_modules() {
     // console/block/net devices via `virtio_mmio.device=...@...:...`
     // cmdline tokens (see `vmm::setup`), so for a modular virtio_mmio
     // those tokens must be forwarded as load args or the driver binds no
-    // device and `/dev/hvc0` / `/dev/vport0p1` never appear (init then
+    // device and `/dev/hvc0` / named bulk port never appear (init then
     // hangs waiting for the control port). Reproduce the builtin
     // behavior: pass each module the matching `modname.*` cmdline params.
     let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();

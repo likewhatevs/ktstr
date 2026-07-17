@@ -54,6 +54,8 @@ cargo ktstr test --kernel fedora                      # prebuilt distro kernel (
 cargo ktstr test --kernel ubuntu                      # latest LTS HWE kernel (ubuntu-24.04 pins the LTS)
 cargo ktstr test --kernel amazonlinux                 # AL2023's newest kernel stream (al2023 works too)
 cargo ktstr test --kernel steamos                     # Valve's linux-neptune (x86_64 only; steamos-3.8 pins)
+cargo ktstr test --kernel gke                         # latest GKE-promoted COS kernel (x86_64)
+cargo ktstr test --kernel gke-129                     # newest promoted revision within COS milestone 129
 cargo ktstr test --kernel ./kernel-core.rpm           # local package (.rpm / .deb / .pkg.tar.zst)
 cargo ktstr test --kernel 6.14.2 --kernel 7.0         # repeatable → multi-kernel matrix
 ```
@@ -78,7 +80,25 @@ older kernel) warn up front instead of failing mid-run. Local
 `.rpm`/`.deb`/`.pkg.tar.zst` files take the same path — note Fedora
 and Ubuntu split the kernel image and its modules across packages,
 so for those use the distro spec (which fetches the full set) rather
-than a single file.
+than a single file. GKE is the deliberate exception to the package
+shape: ktstr downloads Google's exact GKE-promoted bootable `vmlinux`,
+matching prepared headers and source from `cos-tools`, then builds only
+the missing virtio/Btrfs loadable modules against those exact artifacts.
+The Google kernel is not rebuilt or modified; all downloads are
+generation-pinned and MD5-verified before the normal atomic cache
+install.
+
+Bare `gke` is deliberately rolling: every resolution scans Google's
+current GKE release notes and chooses the numerically newest complete
+`cos-MILESTONE-BUILD-PATCH-REVISION` image named there. This means the
+newest GKE-promoted COS kernel, not specifically the Kubernetes Stable
+release channel. `gke-129` constrains the search to COS milestone 129
+but still follows that milestone's newest promoted build, patch, and
+revision. For an immutable rerun, resolve once and use the resulting
+generation-specific cache key shown by `cargo ktstr kernel list`.
+Whichever form is used, ktstr refuses an image that lacks its required
+sched_ext, BPF, debug, virtio, or module capabilities rather than
+silently falling back to a reduced-capability kernel.
 
 When `--kernel` resolves to two or more kernels, the kernel becomes
 another gauntlet dimension: each (test × preset × kernel) tuple is a
@@ -330,6 +350,8 @@ cargo ktstr kernel build --kernel 6.14.2        # specific version
 cargo ktstr kernel build --kernel 6.12          # latest 6.12.x patch release
 cargo ktstr kernel build --kernel 6.11..6.14    # every release in the range
 cargo ktstr kernel build --kernel ../linux      # local source tree
+cargo ktstr kernel build --kernel gke           # official GKE COS kernel + exact-source modules
+cargo ktstr kernel build --kernel gke-129       # newest promoted revision in COS milestone 129
 cargo ktstr kernel build --force --kernel 6.14.2
 ```
 

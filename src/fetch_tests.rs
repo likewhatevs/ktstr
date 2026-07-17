@@ -1956,6 +1956,24 @@ fn download_stream_finalizes_sha256_over_streamed_bytes() {
     );
 }
 
+/// The same byte stream also produces the standard-base64 MD5 format
+/// published by Google Cloud Storage. This pins both the digest bytes
+/// and the encoding expected by the GKE artifact verifier.
+#[test]
+fn download_stream_finalizes_gcs_md5_over_streamed_bytes() {
+    let payload: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
+    let mut stream =
+        super::DownloadStream::with_progress(std::io::Cursor::new(payload.clone()), None);
+    std::io::copy(&mut stream, &mut std::io::sink()).expect("copy must drain Cursor");
+    let (got_base64, bytes_total) = stream.finalize_md5_base64();
+    let expected = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        md5::Md5::digest(&payload),
+    );
+    assert_eq!(got_base64, expected);
+    assert_eq!(bytes_total as usize, payload.len());
+}
+
 /// `DownloadStream::read` errors with `ErrorKind::TimedOut` when
 /// the no-progress window elapses before a byte-producing read.
 /// Constructs the wrapper with a synthetically-old
@@ -1968,7 +1986,8 @@ fn download_stream_finalizes_sha256_over_streamed_bytes() {
 fn download_stream_errors_on_no_progress_timeout() {
     let mut stream = super::DownloadStream {
         inner: std::io::Cursor::new(vec![0u8; 1024]),
-        hasher: sha2::Sha256::new(),
+        sha256: sha2::Sha256::new(),
+        md5: md5::Md5::new(),
         bytes_total: 0,
         // Simulate "last byte received an hour ago" — the
         // elapsed comparison against `no_progress_timeout`
@@ -2005,7 +2024,8 @@ fn download_stream_resets_progress_clock_on_byte_producing_read() {
     let payload = vec![42u8; 8];
     let mut stream = super::DownloadStream {
         inner: std::io::Cursor::new(payload.clone()),
-        hasher: sha2::Sha256::new(),
+        sha256: sha2::Sha256::new(),
+        md5: md5::Md5::new(),
         bytes_total: 0,
         last_progress: std::time::Instant::now() - std::time::Duration::from_secs(30),
         // Generous timeout: the test's wall-clock between the
@@ -2036,7 +2056,8 @@ fn download_stream_resets_progress_clock_on_byte_producing_read() {
 fn download_stream_eof_does_not_reset_progress_clock() {
     let mut stream = super::DownloadStream {
         inner: std::io::Cursor::new(Vec::<u8>::new()), // immediate EOF
-        hasher: sha2::Sha256::new(),
+        sha256: sha2::Sha256::new(),
+        md5: md5::Md5::new(),
         bytes_total: 0,
         // 30 minutes ago — well outside any reasonable timeout
         // but still finite so the test can observe whether

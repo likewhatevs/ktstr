@@ -714,18 +714,27 @@ pub(crate) fn vm_boot_headroom(vcpus: u32) -> Duration {
 /// this fn is deliberately phrased over the raw `u8` so it carries no
 /// dependency on that enum and stays testable in isolation.
 ///
-/// WIDTH-INDEPENDENT (no `vcpus` term): Tier-1's evidence is now the MAX
-/// per-vCPU CPU burned in-phase (the monitor's
+/// Tier-1's evidence is the MAX per-vCPU CPU burned in-phase (the monitor's
 /// `max_vcpu_cpu_in_phase_ns`), not the SUM across vCPUs. A spinning wedge
 /// is one (or a few) hot thread(s), so the sound budget is what a SINGLE
 /// vCPU may legitimately burn in the phase — a per-vCPU-linear budget
 /// against a summed evidence was the wide-SMP false-kill bug (256 idle
 /// vCPUs summed ~141 s of diffuse background burn and crossed a 64 s
-/// budget with zero wedge). Each flat budget carries 2-3x margin over the
-/// heaviest single-vCPU burn observed for that phase:
-///   - Boot (15 s): a cold guest's per-vCPU boot cost (AP bring-up, this
-///     vCPU's virtio-console handshake, kernel init) is a few CPU-seconds
-///     on the busiest CPU; 15 s is ~3x margin.
+/// budget with zero wedge).
+///
+/// Boot is the deliberate exception to otherwise width-independent
+/// per-vCPU budgets. The BSP serially enumerates and initializes every AP,
+/// so the Busiest-vCPU signal contains legitimate O(vCPU-count) work even
+/// though the signal itself is a MAX rather than a SUM. The budget is a
+/// 15 s base plus 50 ms for every AP. A 240-vCPU distro guest that was
+/// still actively booting consumed 22.55 s of BSP pthread CPU; the old
+/// flat 22.5 s currency-widened ceiling killed it with 190 s left on the
+/// VM deadline. The width term gives that legitimate enumeration 26.95 s
+/// raw / 40.425 s pthread while still bounding a Boot spinner far below
+/// the whole-VM deadman.
+///
+/// Every other phase stays flat because its legitimate busiest-vCPU work
+/// does not scale with guest width:
 ///   - Attach (35 s): single-threaded BPF load + verifier time dominates
 ///     and lands on one vCPU; host-side cold-BTF/vmlinux waits accrue NO
 ///     guest CPU (the guest is blocked, not spinning), so even a cold
@@ -745,23 +754,24 @@ pub(crate) fn vm_boot_headroom(vcpus: u32) -> Duration {
 /// must never be killed on a CPU budget it cannot justify. The pthread
 /// currency's 3/2 widening (`widen_budget_for_currency`) still applies on
 /// top of these in the watchdog.
-pub(crate) const fn phase_cpu_budget_ns(phase: u8) -> u64 {
+pub(crate) const fn phase_cpu_budget_ns(phase: u8, vcpus: u32) -> u64 {
     const S_TO_NS: u64 = 1_000_000_000;
-    let s = match phase {
-        // Boot
-        0 => 15u64,
+    match phase {
+        // Boot: the BSP's AP enumeration is serial O(vCPU-count).
+        0 => 15u64
+            .saturating_mul(S_TO_NS)
+            .saturating_add((vcpus.saturating_sub(1) as u64).saturating_mul(50_000_000)),
         // Attach
-        1 => 35u64,
+        1 => 35u64.saturating_mul(S_TO_NS),
         // Dispatch
-        2 => 8u64,
+        2 => 8u64.saturating_mul(S_TO_NS),
         // Body — Tier-1 off (see doc).
-        3 => return u64::MAX,
+        3 => u64::MAX,
         // Teardown
-        4 => 8u64,
+        4 => 8u64.saturating_mul(S_TO_NS),
         // Unknown phase → never kill.
-        _ => return u64::MAX,
-    };
-    s.saturating_mul(S_TO_NS)
+        _ => u64::MAX,
+    }
 }
 
 /// Per-phase WALL-time backstop (nanoseconds) for the progress
@@ -2923,25 +2933,29 @@ mod tests {
     // -- phase_cpu_budget_ns / phase_wall_backstop_ns --
 
     #[test]
-    fn phase_cpu_budget_ns_flat_width_independent() {
+    fn phase_cpu_budget_ns_boot_scales_with_width_only() {
         const S: u64 = 1_000_000_000;
-        // Flat per-phase budgets — NO vcpu term (Tier-1's evidence is the
-        // max per-vCPU burn, so a single vCPU's legitimate in-phase cost
-        // sets the budget, independent of guest width).
-        assert_eq!(phase_cpu_budget_ns(0), 15 * S); // Boot
-        assert_eq!(phase_cpu_budget_ns(1), 35 * S); // Attach
-        assert_eq!(phase_cpu_budget_ns(2), 8 * S); // Dispatch
-        assert_eq!(phase_cpu_budget_ns(4), 8 * S); // Teardown
+        // Boot's BSP serially initializes every AP, so only that phase
+        // carries a width term. The remaining phases stay flat against
+        // the max-per-vCPU evidence.
+        assert_eq!(phase_cpu_budget_ns(0, 1), 15 * S);
+        assert_eq!(phase_cpu_budget_ns(0, 240), 26_950_000_000);
+        assert_eq!(phase_cpu_budget_ns(1, 1), 35 * S);
+        assert_eq!(phase_cpu_budget_ns(1, 240), 35 * S);
+        assert_eq!(phase_cpu_budget_ns(2, 1), 8 * S);
+        assert_eq!(phase_cpu_budget_ns(2, 240), 8 * S);
+        assert_eq!(phase_cpu_budget_ns(4, 1), 8 * S);
+        assert_eq!(phase_cpu_budget_ns(4, 240), 8 * S);
     }
 
     #[test]
     fn phase_cpu_budget_ns_body_and_unknown_are_sentinel() {
         // Body (3): Tier-1 structurally off — the sentinel makes any
         // `cpu > budget` comparison unsatisfiable.
-        assert_eq!(phase_cpu_budget_ns(3), u64::MAX);
+        assert_eq!(phase_cpu_budget_ns(3, 240), u64::MAX);
         // Unknown phase ids never carry a killable budget.
-        assert_eq!(phase_cpu_budget_ns(5), u64::MAX);
-        assert_eq!(phase_cpu_budget_ns(u8::MAX), u64::MAX);
+        assert_eq!(phase_cpu_budget_ns(5, 240), u64::MAX);
+        assert_eq!(phase_cpu_budget_ns(u8::MAX, 240), u64::MAX);
     }
 
     #[test]

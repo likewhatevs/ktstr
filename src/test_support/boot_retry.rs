@@ -32,6 +32,33 @@
 /// `rust_init/tests.rs` pins the guest format against it.
 pub(crate) const AP_BRINGUP_GAP_MARKER: &str = "failed to come online (AP bring-up failed";
 
+/// Kernel log evidence that a guest rejected ktstr's x2APIC setup because
+/// it has neither interrupt remapping nor the KVM guest callback which
+/// advertises extended MSI destination IDs.
+const X2APIC_REJECTED_MARKER: &str = "IRQ remapping doesn't support X2APIC mode";
+
+/// Kernel log evidence that the AP gap is the deterministic 8-bit xAPIC
+/// ceiling, not an AP which transiently missed its INIT-SIPI window.
+const XAPIC_ID_LIMIT_MARKER: &str = "has invalid APIC ID";
+
+/// Whether a guest-side AP gap is a deterministic guest-kernel capability
+/// mismatch rather than a transient AP scheduling miss.
+///
+/// ktstr enables x2APIC for a topology whose APIC IDs exceed 254. Some
+/// distro kernels subsequently disable it when built without the KVM guest
+/// hooks and without an interrupt-remapping IOMMU. Linux then rejects the
+/// first AP at the 8-bit xAPIC ceiling. A cold retry cannot change either
+/// kernel capability; requiring the AP-gap panic plus both explicit kernel
+/// messages keeps this classification narrower than a generic AP failure.
+pub(crate) fn guest_kernel_rejected_wide_apic(result: &crate::vmm::VmResult) -> bool {
+    result
+        .crash_message
+        .as_deref()
+        .is_some_and(|m| m.contains(AP_BRINGUP_GAP_MARKER))
+        && result.output.contains(X2APIC_REJECTED_MARKER)
+        && result.output.contains(XAPIC_ID_LIMIT_MARKER)
+}
+
 /// Total boot attempts (including the first) before giving up on the
 /// AP-bring-up-gap fault. On the final attempt the result is returned
 /// as-is — every downstream path behaves exactly as it would without
@@ -59,12 +86,15 @@ pub(crate) const AP_GAP_BOOT_ATTEMPTS: u32 = 3;
 ///      so the `.context(...)` both production call sites wrap the error
 ///      with does not hide it.)
 ///
-/// Both are pre-test infra faults with no test/scheduler side effects
-/// yet, so a fresh cold boot is a safe, idempotent recovery. EVERY other
-/// outcome returns immediately: a clean run, any other `crash_message`
-/// (timeout, scheduler crash), and any other `Err` all propagate as-is.
-/// The common all-online path pays nothing beyond the single
-/// `crash_message` inspection.
+/// Both are pre-test infra faults with no test/scheduler side effects yet,
+/// so a fresh cold boot is a safe, idempotent recovery. The one
+/// deterministic AP-gap class — an explicit x2APIC rejection followed by
+/// an invalid 8-bit APIC ID — returns immediately because another cold boot
+/// cannot change the guest kernel's capabilities. EVERY other outcome
+/// returns immediately: a clean run, any other `crash_message` (timeout,
+/// scheduler crash), and any other `Err` all propagate as-is. The common
+/// all-online path pays nothing beyond the single `crash_message`
+/// inspection.
 pub(crate) fn run_vm_with_ap_gap_retry<F>(
     mut build_and_run: F,
 ) -> anyhow::Result<crate::vmm::VmResult>
@@ -100,6 +130,13 @@ where
         if !ap_gap || attempt >= AP_GAP_BOOT_ATTEMPTS {
             return Ok(result);
         }
+        if guest_kernel_rejected_wide_apic(&result) {
+            eprintln!(
+                "ktstr: guest kernel rejected x2APIC and hit the 8-bit APIC-ID \
+                 ceiling; another cold boot cannot change this kernel capability"
+            );
+            return Ok(result);
+        }
         // Failure-story diagnostic (ungated), mirroring the watchdog /
         // send_sys_rdy timeout WARNs. Only fires on the rare AP-gap
         // path — the all-online case never reaches here.
@@ -125,6 +162,47 @@ mod tests {
         let mut r = crate::test_support::test_helpers::make_vm_result("", "", 1, false);
         r.crash_message = msg.map(str::to_string);
         r
+    }
+
+    /// A deterministic x2APIC capability rejection is returned after the
+    /// first boot. Retrying cannot change the guest kernel config.
+    #[test]
+    fn no_retry_on_explicit_xapic_ceiling() {
+        let calls = Cell::new(0u32);
+        let msg = format!("CPUs [144] {AP_BRINGUP_GAP_MARKER}; 144/192 online)");
+        let out = run_vm_with_ap_gap_retry(|| {
+            calls.set(calls.get() + 1);
+            let mut result = result_with_crash(Some(&msg));
+            result.output = format!(
+                "x2apic: {X2APIC_REJECTED_MARKER}\n\
+                 smpboot: CPU 144 {XAPIC_ID_LIMIT_MARKER} 100. Aborting bringup"
+            );
+            Ok(result)
+        })
+        .unwrap();
+        assert_eq!(
+            calls.get(),
+            1,
+            "a guest kernel capability mismatch must not consume cold retries"
+        );
+        assert!(guest_kernel_rejected_wide_apic(&out));
+    }
+
+    /// One suggestive kernel line is not sufficient to suppress the normal
+    /// AP-gap retry; the narrow classifier requires the complete story.
+    #[test]
+    fn partial_xapic_evidence_still_retries() {
+        let calls = Cell::new(0u32);
+        let msg = format!("CPUs [144] {AP_BRINGUP_GAP_MARKER}; 144/192 online)");
+        let out = run_vm_with_ap_gap_retry(|| {
+            calls.set(calls.get() + 1);
+            let mut result = result_with_crash(Some(&msg));
+            result.output = X2APIC_REJECTED_MARKER.to_string();
+            Ok(result)
+        })
+        .unwrap();
+        assert_eq!(calls.get(), AP_GAP_BOOT_ATTEMPTS);
+        assert!(!guest_kernel_rejected_wide_apic(&out));
     }
 
     /// A clean run (no crash_message) returns on the first attempt — the

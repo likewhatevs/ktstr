@@ -238,6 +238,7 @@ jobs:
       - run: just distro-boot ubuntu generic
       - run: just distro-boot amazonlinux amzn2023
       - run: just distro-boot steamos neptune
+      - run: just gke-boot
       - run: just local-package-boot 6.14
 
   distro-boot-arm64:

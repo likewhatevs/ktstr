@@ -223,7 +223,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
 
     // Phase 1b: Load initramfs-embedded kernel modules BEFORE any
     // virtio device is touched. Prebuilt distro kernels ship virtio
-    // (blk/console/net) as modules, so /dev/vport0p1, /dev/vda, and
+    // (blk/console/net) as modules, so the named bulk port, /dev/vda, and
     // /dev/hvc0 do not exist until the drivers load; devtmpfs (mounted
     // just above) then materialises the nodes. No-op for the ktstr-built
     // kernels, which pin virtio =y and ship no modules. Diagnostics for
@@ -299,7 +299,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // `/dev/hvc0`), which depended on incidental console traffic
     // rather than an explicit readiness signal.
     //
-    // `/dev/vport0p1` may not yet exist at this point: the kernel
+    // the named bulk port may not yet exist at this point: the kernel
     // virtio_console driver's multiport handshake (DEVICE_READY →
     // PORT_ADD → PORT_READY → PORT_OPEN, see
     // `drivers/char/virtio_console.c`) completes asynchronously
@@ -380,12 +380,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     let vcpus = count_online_cpus().unwrap_or(1);
 
     let budget = std::time::Duration::from_millis(crate::test_support::sys_rdy_budget_ms(vcpus));
-    send_sys_rdy_with_retry(
-        budget,
-        vcpus,
-        &kern_addrs,
-        std::path::Path::new(crate::vmm::guest_comms::BULK_PORT_DEV),
-    );
+    send_sys_rdy_with_retry(budget, vcpus, &kern_addrs, None);
 
     // Phase 1.5: Auto-mount the user data disk at /mnt/disk0 if the
     // host pre-formatted it (KTSTR_DISK0_FS=<tag> on the cmdline).
@@ -420,9 +415,8 @@ pub(crate) fn ktstr_guest_init() -> ! {
     //
     // By this point `redirect_stdio_to_bulk_port` has run (line
     // above) and the bulk port has been opened, which proves the
-    // multiport handshake completed; `/dev/vport0p2` is already
-    // present, so the relay's first port-2 open succeeds without
-    // retry.
+    // multiport handshake completed; the stats relay resolves port 2
+    // by its advertised name rather than a probe-order-dependent path.
     let stats_relay_stop = start_sched_stats_relay();
 
     tracing::debug!(

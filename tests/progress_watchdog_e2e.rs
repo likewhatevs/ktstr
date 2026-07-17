@@ -12,7 +12,7 @@
 //! anchors progress on MILESTONES (lifecycle stage advances) only, and
 //! reasons about a phase's CPU burn and runnable demand:
 //!   - **Tier-1** — the busiest vCPU's `max_vcpu_cpu_in_phase` exceeded the
-//!     phase's flat `phase_cpu_budget_ns` without reaching a milestone: a
+//!     phase's `phase_cpu_budget_ns` without reaching a milestone: a
 //!     *spinning* wedge.
 //!   - **Tier-2** — an INFRA phase sat past its `phase_wall_backstop_ns`
 //!     with live evidence channels and no runnable demand: a *silent idle*

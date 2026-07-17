@@ -2036,6 +2036,17 @@ fn scheduler_accepts_verifier_preset(
         && !sched.verifier_exclude_topologies.contains(&preset.name)
 }
 
+/// Whether a verifier-cell error is a typed guest-kernel/topology
+/// incompatibility. Chain-aware so the collection path may add context
+/// without turning an unsupported cell back into a scheduler failure.
+fn is_verifier_topology_unsupported(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::verifier::VerifierTopologyUnsupported>()
+            .is_some()
+    })
+}
+
 /// Parse `verifier/<sched_name>/<kernel_label>/<preset_name>`, look up
 /// the declared scheduler in [`super::KTSTR_SCHEDULERS`] + the gauntlet
 /// preset in [`crate::gauntlet::gauntlet_presets`] + the kernel in
@@ -2070,6 +2081,7 @@ fn run_verifier_cell_inner(
     full_name: &str,
     out_stats: &mut Vec<crate::verifier::ProgStats>,
     out_dilation: &mut Option<f64>,
+    out_skipped: &mut bool,
 ) -> i32 {
     use super::SchedulerSpec;
 
@@ -2178,12 +2190,14 @@ fn run_verifier_cell_inner(
         // direct `--exact verifier/<eevdf>/...` invocation outside
         // nextest.
         SchedulerSpec::Eevdf => {
+            *out_skipped = true;
             println!(
                 "ktstr verifier: SKIP cell {full_name} (Eevdf has no userspace binary to verify)",
             );
             return 0;
         }
         SchedulerSpec::KernelBuiltin { .. } => {
+            *out_skipped = true;
             println!(
                 "ktstr verifier: SKIP cell {full_name} (KernelBuiltin has no userspace binary to verify)",
             );
@@ -2281,6 +2295,11 @@ fn run_verifier_cell_inner(
             *out_stats = result.stats;
             code
         }
+        Err(e) if is_verifier_topology_unsupported(&e) => {
+            *out_skipped = true;
+            println!("ktstr verifier: SKIP cell {full_name} ({e:#})");
+            0
+        }
         Err(e) => {
             eprintln!("ktstr verifier: cell {full_name} FAILED: {e:#}");
             1
@@ -2289,9 +2308,9 @@ fn run_verifier_cell_inner(
 }
 
 /// Run a verifier cell and, when the `cargo ktstr verifier` dispatcher
-/// set [`crate::KTSTR_VERIFIER_RESULT_DIR_ENV`], record its PASS/FAIL
-/// outcome there so the dispatcher can render the run-summary table after
-/// nextest returns. Best-effort + env-gated: a direct
+/// set [`crate::KTSTR_VERIFIER_RESULT_DIR_ENV`], record its
+/// PASS/FAIL/SKIP outcome there so the dispatcher can render the
+/// run-summary table after nextest returns. Best-effort + env-gated: a direct
 /// `--exact verifier/...` invocation (env unset) behaves exactly as
 /// [`run_verifier_cell_inner`], and a record-write failure never changes
 /// the cell's exit code. A nextest RETRY re-runs this wrapper and
@@ -2300,12 +2319,14 @@ fn run_verifier_cell_inner(
 fn run_verifier_cell(full_name: &str) -> i32 {
     let mut stats = Vec::new();
     let mut dilation = None;
-    let code = run_verifier_cell_inner(full_name, &mut stats, &mut dilation);
+    let mut skipped = false;
+    let code = run_verifier_cell_inner(full_name, &mut stats, &mut dilation, &mut skipped);
     if let Some(dir) = std::env::var_os(crate::KTSTR_VERIFIER_RESULT_DIR_ENV) {
         crate::verifier::write_cell_record(
             std::path::Path::new(&dir),
             full_name,
-            code == 0,
+            code == 0 && !skipped,
+            skipped,
             &stats,
             dilation,
         );

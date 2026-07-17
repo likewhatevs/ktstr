@@ -151,9 +151,9 @@ pub const SIGNAL_PERIODIC_READY: u8 = 0xAD;
 pub const SIGNAL_WPROF_ARTIFACTS_RECEIVED: u8 = 0xAE;
 
 // `NUM_PORTS` lives in [`super::wire`]; re-exported here so existing
-// call sites keep working. Port 0 = console (hvc0); port 1 = bulk
-// TLV stream (`/dev/vport0p1`); port 2 = scheduler-stats relay
-// (`/dev/vport0p2`). Three ports → eight queues per virtio-v1.2 §5.3.5
+// call sites keep working. Port 0 = console (hvc0); port 1 = named bulk
+// TLV stream; port 2 = named scheduler-stats relay. Three ports →
+// eight queues per virtio-v1.2 §5.3.5
 // (`2 + 2 * num_ports`).
 pub use super::wire::NUM_PORTS;
 
@@ -219,7 +219,7 @@ const CONTROL_CHAINS_PER_CALL_MAX: usize = 32;
 /// expected to bound MMIO-handler latency. Cap drains at 64 chains
 /// per call: legitimate traffic posts a small number of multi-KB
 /// chains (kernel virtio-console driver allocates PAGE_SIZE buffers
-/// per chain for hvc0, larger for `/dev/vport0p1`); 64 is well
+/// per chain for hvc0, larger for the bulk port); 64 is well
 /// above any single-notify legitimate fan-out while still bounding
 /// the adversarial latency. Remaining chains stay in the avail
 /// ring for the next QUEUE_NOTIFY (or the next host-side push).
@@ -332,8 +332,8 @@ impl ControlOut {
 }
 
 /// Per-port state for the three virtio-console ports. Indexed by
-/// `port_id` (0 = console / hvc0, 1 = bulk TLV stream / vport0p1,
-/// 2 = scheduler-stats relay / vport0p2).
+/// `port_id` (0 = console / hvc0, 1 = named bulk TLV stream,
+/// 2 = named scheduler-stats relay).
 ///
 /// `tx_buf` accumulates guest→host TX bytes pending host drain;
 /// `pending_rx` accumulates host→guest RX bytes pending delivery

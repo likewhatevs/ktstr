@@ -1971,7 +1971,7 @@ pub(crate) struct VmRunState {
     /// they identify the KASLR-randomized kernel layout.
     pub kern_kaslr_offset: u64,
     /// Virtio-console device shared with vCPU threads. Carries the
-    /// port-1 (`/dev/vport0p1`) bulk TLV stream from guest to host;
+    /// port-1 (`ktstr-bulk`) TLV stream from guest to host;
     /// `collect_results` calls `drain_bulk()` after the run to feed
     /// `parse_tlv_stream` and produce the `BulkDrainResult` that
     /// `VmResult.guest_messages` exposes to test verdicts.

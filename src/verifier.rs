@@ -16,6 +16,27 @@
 
 use std::collections::HashMap;
 
+/// A verifier topology which this guest kernel cannot boot without
+/// changing the topology being verified.
+///
+/// This is intentionally verifier-specific rather than a generic host
+/// insufficiency: ktstr and KVM can represent the requested topology, but
+/// a distro kernel may explicitly disable x2APIC and fall back to the
+/// 8-bit xAPIC limit. The cell is unsupported for that kernel, not a
+/// scheduler failure, and the verifier dispatcher records it as SKIP.
+#[derive(Debug)]
+pub(crate) struct VerifierTopologyUnsupported {
+    pub reason: String,
+}
+
+impl std::fmt::Display for VerifierTopologyUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for VerifierTopologyUnsupported {}
+
 /// Delimiter the guest's rust_init emits over the bulk port (as a
 /// `MSG_TYPE_SCHED_LOG` frame) immediately before the scheduler log
 /// block. Paired with [`SCHED_OUTPUT_END`].
@@ -1016,6 +1037,27 @@ pub fn collect_verifier_output(
         vm.run().context("run verifier VM")
     })?;
 
+    // A cold retry is useful when an AP merely misses its INIT-SIPI
+    // window under host contention. It is useless when the guest kernel
+    // explicitly disables x2APIC and then rejects a topology APIC ID at
+    // the 8-bit ceiling: another boot cannot change that kernel build.
+    // Nor may the verifier compact IDs — Linux derives cache domains from
+    // those topology bit fields, so compacting this shape would verify a
+    // different topology under the original preset name. Surface a typed
+    // unsupported-cell result; the dispatcher records SKIP, not scheduler
+    // FAIL.
+    #[cfg(target_arch = "x86_64")]
+    if crate::test_support::guest_kernel_rejected_wide_apic(&result) {
+        let max_apic_id = crate::vmm::x86_64::topology::max_apic_id(&validated);
+        return Err(anyhow::Error::new(VerifierTopologyUnsupported {
+            reason: format!(
+                "guest kernel disabled x2APIC, but topology requires APIC IDs \
+                 through {max_apic_id} (xAPIC supports 0..=254); compacting IDs \
+                 would change the requested LLC topology"
+            ),
+        }));
+    }
+
     // Concatenate bulk-port `MSG_TYPE_SCHED_LOG` chunks, then run
     // the marker-pair extractor on the merged stream — the
     // SCHED_OUTPUT_START/END markers travel verbatim inside chunk
@@ -1322,7 +1364,7 @@ pub fn format_verifier_diff(
 /// (via `write_cell_record`) into the directory named by
 /// [`crate::KTSTR_VERIFIER_RESULT_DIR_ENV`]; after nextest returns the
 /// dispatcher reads them back (via [`read_cell_records`]) and renders one
-/// PASS/FAIL grid per scheduler (rows = topology, cols = kernel). A cell
+/// PASS/FAIL/SKIP grid per scheduler (rows = topology, cols = kernel). A cell
 /// is one
 /// (scheduler, kernel, topology): the verifier sweeps each declared
 /// scheduler across topologies, so topology IS a result axis — a
@@ -1338,8 +1380,15 @@ pub struct VerifierCellRecord {
     pub kernel: String,
     /// Gauntlet topology preset (the `<preset>` cell-name segment).
     pub topology: String,
-    /// Whether the cell passed (exit 0 from the cell handler).
+    /// Whether the cell passed. False for both FAIL and SKIP; consult
+    /// [`Self::skipped`] to distinguish them.
     pub passed: bool,
+    /// Whether the cell was unsupported for this guest kernel. Mutually
+    /// exclusive with `passed`; rendered as `-` and excluded from both
+    /// pass and fail tallies. `serde(default)` accepts records from ktstr
+    /// versions which predate the explicit verifier-skip state.
+    #[serde(default)]
+    pub skipped: bool,
     /// Per-program stats (program name + its `verified_insns` count)
     /// captured for this cell, copied from the VM run's
     /// [`VerifierVmResult::stats`]. Empty when the cell failed before
@@ -1375,7 +1424,7 @@ fn cell_record_filename(full_name: &str) -> String {
     s
 }
 
-/// Write a cell's PASS/FAIL record into `dir`. Parses `full_name`
+/// Write a cell's PASS/FAIL/SKIP record into `dir`. Parses `full_name`
 /// (`verifier/<sched>/<kernel>/<preset>`); a name that does not fit that
 /// shape is skipped (the cell already errored on the malformed name).
 /// Best-effort: a write failure is logged and swallowed — the summary
@@ -1390,9 +1439,14 @@ pub(crate) fn write_cell_record(
     dir: &std::path::Path,
     full_name: &str,
     passed: bool,
+    skipped: bool,
     stats: &[ProgStats],
     dilation: Option<f64>,
 ) {
+    debug_assert!(
+        !(passed && skipped),
+        "a verifier cell cannot be both passed and skipped"
+    );
     let Some(rest) = full_name.strip_prefix("verifier/") else {
         return;
     };
@@ -1405,6 +1459,7 @@ pub(crate) fn write_cell_record(
         kernel: parts[1].to_string(),
         topology: parts[2].to_string(),
         passed,
+        skipped,
         stats: stats.to_vec(),
         dilation,
     };
@@ -1558,7 +1613,7 @@ pub fn build_nextest_args(nextest_profile: Option<&str>, forward: &[String]) -> 
     args
 }
 
-/// Render the per-cell records into one PASS/FAIL grid PER declared
+/// Render the per-cell records into one PASS/FAIL/SKIP grid PER declared
 /// scheduler (BTreeSet-sorted). Each scheduler's section is a tally line
 /// followed by a bordered grid whose rows are the topology presets that
 /// ran the scheduler (BTreeSet) and whose columns are the kernels that
@@ -1569,8 +1624,8 @@ pub fn build_nextest_args(nextest_profile: Option<&str>, forward: &[String]) -> 
 /// - `✗` (bold red) — any record for it failed; this also absorbs the
 ///   defensive duplicate-record case where one triple somehow carries
 ///   both a pass and a fail — any failure means failure,
-/// - `-` (plain) — no record (the scheduler's constraints rejected the
-///   preset on that kernel, or the cell never ran).
+/// - `-` (plain) — every record for it skipped, or no record (the
+///   scheduler's constraints rejected the preset on that kernel).
 ///
 /// Cells are single-width glyphs (U+2713 / U+2717), not emoji: emoji
 /// are not exactly two monospace cells in GitHub's log viewer / code
@@ -1602,10 +1657,15 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
     let mut sched_rows: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     // scheduler -> kernel columns that ran it.
     let mut sched_cols: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    // scheduler -> (topology, kernel) -> whether EVERY record for the
-    // triple passed. Normally one record per triple; a defensive
-    // duplicate carrying any fail flips the cell to FAIL.
-    let mut agg: BTreeMap<String, BTreeMap<(String, String), bool>> = BTreeMap::new();
+    #[derive(Clone, Copy, Default)]
+    struct CellDisposition {
+        any_pass: bool,
+        any_fail: bool,
+        any_skip: bool,
+    }
+    // scheduler -> (topology, kernel) -> folded disposition. Failure
+    // dominates pass, which dominates skip, for defensive duplicates.
+    let mut agg: BTreeMap<String, BTreeMap<(String, String), CellDisposition>> = BTreeMap::new();
     // scheduler -> (topology, kernel) -> MAX host dilation across the
     // triple's records. A duplicate fold keeps the highest (worst)
     // dilation; `None` throughout means no record reported one (host
@@ -1621,12 +1681,18 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
             .entry(r.scheduler.clone())
             .or_default()
             .insert(r.kernel.clone());
-        let all_passed = agg
+        let disposition = agg
             .entry(r.scheduler.clone())
             .or_default()
             .entry((r.topology.clone(), r.kernel.clone()))
-            .or_insert(true);
-        *all_passed &= r.passed;
+            .or_default();
+        if r.skipped {
+            disposition.any_skip = true;
+        } else if r.passed {
+            disposition.any_pass = true;
+        } else {
+            disposition.any_fail = true;
+        }
         let dil = agg_dil
             .entry(r.scheduler.clone())
             .or_default()
@@ -1665,21 +1731,23 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
                     Some(d) => format!("{glyph}  {d:.2}"),
                     None => glyph.to_string(),
                 };
-                // An entry only exists with >= 1 record; `true` means
-                // every record passed, `false` means at least one failed.
                 let cell = match cells.get(&(topo.clone(), kernel.clone())).copied() {
                     None => comfy_table::Cell::new("-"),
-                    Some(true) => {
+                    Some(d) if d.any_fail => {
+                        n_fail += 1;
+                        comfy_table::Cell::new(with_dil("✗"))
+                            .fg(comfy_table::Color::Red)
+                            .add_attribute(comfy_table::Attribute::Bold)
+                    }
+                    Some(d) if d.any_pass => {
                         n_pass += 1;
                         comfy_table::Cell::new(with_dil("✓"))
                             .fg(comfy_table::Color::Green)
                             .add_attribute(comfy_table::Attribute::Bold)
                     }
-                    Some(false) => {
-                        n_fail += 1;
-                        comfy_table::Cell::new(with_dil("✗"))
-                            .fg(comfy_table::Color::Red)
-                            .add_attribute(comfy_table::Attribute::Bold)
+                    Some(d) => {
+                        debug_assert!(d.any_skip);
+                        comfy_table::Cell::new("-")
                     }
                 };
                 line.push(cell);
@@ -1817,11 +1885,11 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mk temp dir");
         // Malformed: no verifier/ prefix, and a 2-segment name (no
         // <preset> after the kernel) — both skipped.
-        write_cell_record(&dir, "not_a_cell", true, &[], None);
-        write_cell_record(&dir, "verifier/only/two", true, &[], None);
+        write_cell_record(&dir, "not_a_cell", true, false, &[], None);
+        write_cell_record(&dir, "verifier/only/two", true, false, &[], None);
         // Well-formed cell: fail, then a retry passes -> overwrites.
         let name = "verifier/scx_a/kernel_6_14/tiny-1llc";
-        write_cell_record(&dir, name, false, &[], None);
+        write_cell_record(&dir, name, false, false, &[], None);
         // The retry passes and carries per-program verified_insns, so the
         // final record has both the PASS outcome and the stats.
         let stats = [
@@ -1834,7 +1902,7 @@ mod tests {
                 verified_insns: 123,
             },
         ];
-        write_cell_record(&dir, name, true, &stats, Some(1.05));
+        write_cell_record(&dir, name, true, false, &stats, Some(1.05));
         let recs = read_cell_records(&dir);
         assert_eq!(
             recs.len(),
@@ -1854,6 +1922,27 @@ mod tests {
         // Host dilation survives the JSON roundtrip and reflects the final
         // (retry) write.
         assert_eq!(recs[0].dilation, Some(1.05), "dilation roundtrip via serde");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A verifier SKIP is distinct from both PASS and FAIL in the persisted
+    /// record, including across JSON round-trip.
+    #[test]
+    fn cell_record_skip_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("ktstr-verif-skip-rec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mk temp dir");
+        write_cell_record(
+            &dir,
+            "verifier/scx_a/kernel_steamos/uneven-11llc",
+            false,
+            true,
+            &[],
+            None,
+        );
+        let recs = read_cell_records(&dir);
+        assert_eq!(recs.len(), 1);
+        assert!(!recs[0].passed);
+        assert!(recs[0].skipped);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1885,6 +1974,7 @@ mod tests {
                 kernel: "kernel_6_14".into(),
                 topology: "tiny-1llc".into(),
                 passed: true,
+                skipped: false,
                 stats: vec![],
                 dilation: None,
             },
@@ -1893,6 +1983,7 @@ mod tests {
                 kernel: "kernel_6_15".into(),
                 topology: "tiny-1llc".into(),
                 passed: false,
+                skipped: false,
                 stats: vec![],
                 dilation: None,
             },
@@ -1901,6 +1992,19 @@ mod tests {
                 kernel: "kernel_6_14".into(),
                 topology: "large-4llc".into(),
                 passed: true,
+                skipped: false,
+                stats: vec![],
+                dilation: None,
+            },
+            // Explicit kernel/topology SKIP. It renders the same neutral
+            // `-` as an inapplicable matrix intersection and contributes
+            // to neither the pass nor fail tally.
+            VerifierCellRecord {
+                scheduler: "scx_a".into(),
+                kernel: "kernel_6_15".into(),
+                topology: "large-4llc".into(),
+                passed: false,
+                skipped: true,
                 stats: vec![],
                 dilation: None,
             },
@@ -1913,6 +2017,7 @@ mod tests {
                 kernel: "kernel_6_14".into(),
                 topology: "tiny-1llc".into(),
                 passed: true,
+                skipped: false,
                 stats: vec![],
                 dilation: Some(1.10),
             },
@@ -1921,6 +2026,7 @@ mod tests {
                 kernel: "kernel_6_14".into(),
                 topology: "tiny-1llc".into(),
                 passed: false,
+                skipped: false,
                 stats: vec![],
                 dilation: Some(1.40),
             },
@@ -1956,7 +2062,7 @@ mod tests {
             a_sec.contains("kernel_6_14") && a_sec.contains("kernel_6_15"),
             "scx_a kernel columns present: {a_sec}"
         );
-        // The (large-4llc, kernel_6_15) triple has no record -> `-`,
+        // The (large-4llc, kernel_6_15) triple explicitly SKIPped -> `-`,
         // alongside the (large-4llc, kernel_6_14) ✓. The space-padded
         // " - " match avoids the hyphens inside topology names.
         let a_large = a_sec
@@ -1965,7 +2071,7 @@ mod tests {
             .expect("scx_a large-4llc row");
         assert!(
             a_large.contains('✓') && a_large.contains(" - "),
-            "missing-record cell renders `-`: {a_large}"
+            "skipped cell renders `-`: {a_large}"
         );
         // tiny-1llc row: kernel_6_14 ✓, kernel_6_15 ✗ — the failing
         // kernel is named by its own column, no separate failing list.
@@ -2042,6 +2148,7 @@ mod tests {
                 kernel: "kernel_6_14".into(),
                 topology: "tiny".into(),
                 passed: true,
+                skipped: false,
                 stats: vec![
                     ProgStats {
                         name: "ktstr_dispatch".into(),
@@ -2059,6 +2166,7 @@ mod tests {
                 kernel: "kernel_6_14".into(),
                 topology: "large".into(),
                 passed: true,
+                skipped: false,
                 stats: vec![
                     ProgStats {
                         name: "ktstr_dispatch".into(),
@@ -2079,6 +2187,7 @@ mod tests {
                 kernel: "kernel_6_15".into(),
                 topology: "tiny".into(),
                 passed: true,
+                skipped: false,
                 stats: vec![ProgStats {
                     name: "ktstr_dispatch".into(),
                     verified_insns: 130,
@@ -2090,6 +2199,7 @@ mod tests {
                 kernel: "kernel_6_15".into(),
                 topology: "large".into(),
                 passed: true,
+                skipped: false,
                 stats: vec![ProgStats {
                     name: "ktstr_dispatch".into(),
                     verified_insns: 150,
@@ -2102,6 +2212,7 @@ mod tests {
                 kernel: "kernel_6_14".into(),
                 topology: "tiny".into(),
                 passed: true,
+                skipped: false,
                 stats: vec![ProgStats {
                     name: "ktstr_dispatch".into(),
                     verified_insns: 200,
@@ -2116,6 +2227,7 @@ mod tests {
                 kernel: "kernel_6_16".into(),
                 topology: "tiny".into(),
                 passed: false,
+                skipped: false,
                 stats: vec![],
                 dilation: None,
             },
@@ -2190,6 +2302,7 @@ mod tests {
             kernel: "kernel_6_14".into(),
             topology: "tiny".into(),
             passed: false,
+            skipped: false,
             stats: vec![],
             dilation: None,
         }];

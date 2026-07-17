@@ -9,7 +9,7 @@ repository = "https://github.com/likewhatevs/ktstr"
 
 [package]
 name = "ktstr"
-version = "0.39.0"
+version = "0.40.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -154,7 +154,7 @@ virtio-queue = "0.17"
 vm-superio = "0.8.1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 linkme = "0.3"
-ktstr-macros = { version = "0.39.0", path = "ktstr-macros" }
+ktstr-macros = { version = "0.40.0", path = "ktstr-macros" }
 goblin = { version = "0.10.5", features = ["elf64"] }
 # Memory-map /proc/self/exe in the coverage-instrumentation detection
 # probe (`is_coverage_instrumented_binary` / `find_symbol_vaddrs` in
@@ -234,21 +234,14 @@ strum = { version = "0.28", features = ["derive"] }
 # the intent explicit and survives a future clap version that drops
 # the transitive exposure.
 strsim = "0.11"
-# Base64 encoder for `cargo ktstr export`'s self-extracting .run files
-# — embeds a gzip tarball after a `__ARCHIVE__` shell-script marker
-# so the bash preamble can `base64 -d | tar xz` the binaries on the
-# target host. Lightweight crate, well-audited, used only at export
-# time (not on the test hot path).
+# Base64 codec for `cargo ktstr export`'s self-extracting .run files
+# and Google Cloud Storage's published MD5 artifact digests.
 #
-# Only referenced from `src/export.rs`. Gated behind the `export`
-# feature; the `cli-bins` feature pulls it in transitively so the
-# bin-install flow is unchanged, and the test-binary dispatch path
-# in `test_support/dispatch.rs::maybe_dispatch_export` is compiled
-# out when the feature is off (a downstream `default-features =
-# false` test binary cannot respond to `cargo ktstr export <name>`,
-# which matches the intent — that flow is host-tooling, not a
-# downstream-author surface).
-base64 = { version = "0.22", optional = true }
+# The export code itself remains feature-gated; the small codec is
+# unconditional because `--kernel gke` acquisition is core runtime
+# functionality.
+base64 = "0.22"
+md-5 = "0.10"
 # jemalloc as global allocator for the shipped binaries. Each binary
 # declares it at its crate root. Integration-test binaries stay
 # allocator-agnostic because they are also packed as guest `/init`, where
@@ -429,11 +422,11 @@ cli-bins = [
     "export",
 ]
 # `cargo ktstr export` self-extracting `.run` file generator
-# (`src/export.rs`). Gates `base64`. Off-by-default for a
+# (`src/export.rs`). Off-by-default for a
 # `default-features = false` library consumer; the `cli-bins`
 # umbrella feature pulls it in so the bin install flow still has the
 # `export` subcommand wired through the test-binary dispatch path.
-export = ["dep:base64"]
+export = []
 # Embed the wprof BPF tracer for Perfetto-format profiling in VMs.
 # Default off: first build clones github.com/anakryiko/wprof and
 # compiles libbpf + blazesym (requires git, make, gcc, clang, mold,

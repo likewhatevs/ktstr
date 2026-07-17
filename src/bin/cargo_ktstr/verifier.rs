@@ -307,7 +307,7 @@ pub(crate) fn run_verifier(
     match ktstr::verifier::classify_run_outcome(
         status.success(),
         records.is_empty(),
-        records.iter().any(|r| !r.passed),
+        records.iter().any(|r| !r.passed && !r.skipped),
         scheduler.as_deref(),
         status.code(),
     ) {
