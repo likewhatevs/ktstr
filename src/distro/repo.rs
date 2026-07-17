@@ -959,16 +959,17 @@ fn resolve_ubuntu(release: Option<&str>, arch: &str) -> Result<ResolvedDistroKer
     // ddeb can lag the image publish by hours on ddebs.ubuntu.com. Rather
     // than hard-fail during that window, resolve the NEWEST kernel that
     // is FULLY published — image AND debuginfo both present. Debuginfo
-    // stays mandatory (see [`newest_kver_with_debuginfo`]); we just don't
+    // stays mandatory (see [`newest_kernel_with_debuginfo`]); we just don't
     // demand the bleeding edge when an equally-valid, complete kernel is
     // one step back. A hard error remains only when NO kernel in the
     // series has debuginfo — a genuinely broken archive, not a lag.
-    let kver = newest_kver_with_debuginfo(&debs, &ddebs).ok_or_else(|| {
+    let selected = newest_kernel_with_debuginfo(&debs, &ddebs).ok_or_else(|| {
         anyhow!(
             "no Ubuntu {codename}-updates/{deb_arch} kernel has both an image and \
              a dbgsym ddeb on ddebs.ubuntu.com — debuginfo is mandatory"
         )
     })?;
+    let kver = selected.kver.as_str();
     if kver != preferred_kver {
         eprintln!(
             "ktstr: newest HWE kernel {preferred_kver} has no dbgsym ddeb yet \
@@ -990,19 +991,15 @@ fn resolve_ubuntu(release: Option<&str>, arch: &str) -> Result<ResolvedDistroKer
 
     // Debuginfo: the -dbgsym ddeb carries vmlinux. The unsigned image's
     // dbgsym is the canonical vmlinux carrier; fall back to the signed
-    // one. `kver` was chosen above to guarantee one of these exists, so
-    // this resolves — the bail is defensive.
-    let dbg_names = [
-        format!("linux-image-unsigned-{kver}-generic-dbgsym"),
-        format!("linux-image-{kver}-generic-dbgsym"),
-    ];
-    let debuginfo = ubuntu_dbgsym_refs(&ddebs, &dbg_names, &kver, &codename, deb_arch)?;
+    // one. The exact ddeb stanza is carried by `selected`, making kernel
+    // version selection and debuginfo selection one atomic operation.
+    // There is deliberately no second name lookup that could disagree
+    // with the fallback decision.
+    let debuginfo = vec![deb_package_ref(selected.dbgsym, UBUNTU_DDEBS)?];
 
     // Report the CHOSEN kernel's image version (a fallback may be older
     // than the HWE meta's), not the meta package's.
-    let kernel_release = newest_deb(&debs, &format!("linux-image-{kver}-generic"))
-        .map(|p| p.version.clone())
-        .unwrap_or_else(|| meta_pkg.version.clone());
+    let kernel_release = selected.image.version.clone();
 
     Ok(ResolvedDistroKernel {
         distro: format!("ubuntu{version}-hwe"),
@@ -1013,7 +1010,15 @@ fn resolve_ubuntu(release: Option<&str>, arch: &str) -> Result<ResolvedDistroKer
     })
 }
 
-/// Newest kernel `{kver}` (e.g. `6.17.0-38`) in the `-updates` `debs`
+/// One fully-published Ubuntu kernel and the exact image/dbgsym stanzas
+/// selected for it.
+struct UbuntuKernelSelection<'a> {
+    kver: String,
+    image: &'a DebPkg,
+    dbgsym: &'a DebPkg,
+}
+
+/// Newest kernel (e.g. `6.17.0-38`) in the `-updates` `debs`
 /// that is FULLY published: it has a `linux-image-{kver}-generic` image
 /// deb AND a matching dbgsym ddeb (unsigned preferred, signed fallback)
 /// in `ddebs`. Ordered by the image package's Debian version, newest
@@ -1026,24 +1031,34 @@ fn resolve_ubuntu(release: Option<&str>, arch: &str) -> Result<ResolvedDistroKer
 /// image debs (not the ddebs) so a stray dbgsym without a matching image
 /// can never be selected; the digit-prefix filter drops meta/unsigned/
 /// flavored names, leaving only concrete `MAJOR.MINOR.PATCH-ABI` kvers.
-fn newest_kver_with_debuginfo(debs: &[DebPkg], ddebs: &[DebPkg]) -> Option<String> {
-    let has_ddeb = |kver: &str| {
-        ddebs.iter().any(|p| {
-            p.package == format!("linux-image-unsigned-{kver}-generic-dbgsym")
-                || p.package == format!("linux-image-{kver}-generic-dbgsym")
-        })
-    };
+fn newest_kernel_with_debuginfo<'a>(
+    debs: &'a [DebPkg],
+    ddebs: &'a [DebPkg],
+) -> Option<UbuntuKernelSelection<'a>> {
     debs.iter()
         .filter_map(|p| {
             p.package
                 .strip_prefix("linux-image-")
                 .and_then(|s| s.strip_suffix("-generic"))
                 .filter(|kver| kver.chars().next().is_some_and(|c| c.is_ascii_digit()))
-                .map(|kver| (kver.to_string(), p))
+                .and_then(|kver| {
+                    ubuntu_dbgsym(ddebs, kver).map(|dbgsym| UbuntuKernelSelection {
+                        kver: kver.to_string(),
+                        image: p,
+                        dbgsym,
+                    })
+                })
         })
-        .filter(|(kver, _)| has_ddeb(kver))
-        .max_by(|(_, a), (_, b)| deb_version_cmp(&a.version, &b.version))
-        .map(|(kver, _)| kver)
+        .max_by(|a, b| deb_version_cmp(&a.image.version, &b.image.version))
+}
+
+/// Return the exact dbgsym stanza for `kver`, preferring the unsigned
+/// image package (Ubuntu's canonical vmlinux carrier) over the signed
+/// fallback.
+fn ubuntu_dbgsym<'a>(ddebs: &'a [DebPkg], kver: &str) -> Option<&'a DebPkg> {
+    let unsigned = format!("linux-image-unsigned-{kver}-generic-dbgsym");
+    let signed = format!("linux-image-{kver}-generic-dbgsym");
+    newest_deb(ddebs, &unsigned).or_else(|| newest_deb(ddebs, &signed))
 }
 
 /// Fetch and parse `{codename}-updates` `Packages.gz` for `deb_arch`.
@@ -1084,27 +1099,6 @@ fn ubuntu_package_refs(
         }
     }
     Ok(out)
-}
-
-/// Pick the first available dbgsym name (unsigned preferred), erroring
-/// with a clear message when none is present.
-fn ubuntu_dbgsym_refs(
-    ddebs: &[DebPkg],
-    names: &[String],
-    kver: &str,
-    codename: &str,
-    deb_arch: &str,
-) -> Result<Vec<PackageRef>> {
-    for name in names {
-        if let Some(p) = newest_deb(ddebs, name) {
-            return Ok(vec![deb_package_ref(p, UBUNTU_DDEBS)?]);
-        }
-    }
-    bail!(
-        "no dbgsym ddeb for linux-image-{kver}-generic in \
-         {codename}-updates/{deb_arch} on ddebs.ubuntu.com — debuginfo \
-         is mandatory; ddebs may lag a kernel publish by a few hours"
-    )
 }
 
 fn deb_package_ref(p: &DebPkg, base: &str) -> Result<PackageRef> {

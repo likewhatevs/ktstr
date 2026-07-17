@@ -3057,6 +3057,7 @@ mod tests {
             config_file: None,
             config_file_def: Some(("--config={file}", "/include-files/p.json")),
             kernels: &[],
+            verifier_exclude_topologies: &[],
             manifest_dir: env!("CARGO_MANIFEST_DIR"),
         };
         fn func(_: &Ctx) -> anyhow::Result<crate::assert::AssertResult> {
@@ -3116,6 +3117,7 @@ mod tests {
             config_file: None,
             config_file_def: Some(("--config={file}", "/include-files/p.json")),
             kernels: &[],
+            verifier_exclude_topologies: &[],
             manifest_dir: env!("CARGO_MANIFEST_DIR"),
         };
         fn func(_: &Ctx) -> anyhow::Result<crate::assert::AssertResult> {

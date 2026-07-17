@@ -109,11 +109,10 @@ where
 /// is the right home.
 ///
 /// [`ResourceContention`] is DELIBERATELY excluded: a busy slot is
-/// TRANSIENT, not a host-shape fact. The run path now WAITS for a
-/// holder to release (see [`crate::vmm::KtstrVm`]'s
-/// the acquisition queue's progress-based patience), and any contention
-/// that still surfaces is
-/// routed to a RETRYABLE failure by [`classify_host_error`], never a
+/// TRANSIENT, not a host-shape fact. Queue-based lock acquisition
+/// waits for authoritative release, while other transient host
+/// resource failures are routed to a RETRYABLE failure by
+/// [`classify_host_error`], never a
 /// host-skip marker — so a colocated peer's `LOCK_EX` can never be
 /// mislabelled "this host cannot run". The unconditional hard-fail
 /// types and `KernelUnavailable` ("harness not configured", not a
@@ -201,13 +200,13 @@ pub fn classify_host_error(e: &anyhow::Error, no_skip: bool) -> HostClass {
     }
     if is_resource_contention(e) {
         let reason = extract_reason::<ResourceContention, _>(e, |rc| rc.reason.clone());
-        // TRANSIENT contention, never permanent host incapacity. Two
-        // producers reach here: the run-lock path (which already queued
-        // and waited with progress-based patience — reaching here means
-        // ZERO progress for the whole window: a wedged peer) and the
-        // transient-KVM-errno mapper in
-        // `crate::vmm::contention` (ENOMEM / EMFILE / EBUSY under host
-        // pressure). Both resolve on re-run, so route to a RETRYABLE
+        // TRANSIENT contention, never permanent host incapacity.
+        // Producers include one-shot non-waiting lock acquisition and
+        // the transient-KVM-errno mapper in `crate::vmm::contention`
+        // (ENOMEM / EMFILE / EBUSY under host pressure). Queue-based
+        // test acquisition waits for authoritative flock release and
+        // does not invent this verdict from elapsed wall time. The
+        // remaining producers resolve on re-run, so route to a RETRYABLE
         // failure nextest re-runs — NOT a silent skip (a skip is a pass
         // nextest never retries, which silently guts suite coverage) and
         // NOT a "this host cannot run" host-skip. `no_skip` does not

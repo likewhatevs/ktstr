@@ -2226,9 +2226,11 @@ pub(crate) struct MonitorLoopResult {
     /// instant the scheduler process drops its last prog reference
     /// (last fd close on guest teardown), BEFORE the RCU-deferred prog
     /// free — so a post-exit walk finds an empty `prog_idr` and loses
-    /// `verified_insns`. `verified_insns` is fixed once at load
-    /// (`bpf_prog_aux->verified_insns`, written once in `bpf_check`), so
-    /// the first non-empty mid-run capture is authoritative for the run.
+    /// `verified_insns`. Each program's count is fixed once at load
+    /// (`bpf_prog_aux->verified_insns`, written once in `bpf_check`), but
+    /// the set of programs grows while libbpf loads the object. The
+    /// monitor therefore keeps the largest pre-attach snapshot and only
+    /// finalizes the capture after observing scheduler attach.
     /// Empty when no struct_ops scheduler was observed (the loop never
     /// saw a live prog) — [`crate::vmm::freeze_coord`] then falls back to
     /// the post-teardown walk.
@@ -3163,6 +3165,44 @@ fn rq_cpu_fields_match(mem: &GuestMem, rq_pas: &[u64], rq_cpu_off: usize) -> boo
         })
 }
 
+/// Mid-run verifier-stat capture state.
+///
+/// libbpf inserts each successfully loaded program into `prog_idr`
+/// separately. A non-empty walk can therefore be only a prefix of the
+/// scheduler object (for example, layered's `select_cpu` and `enqueue`
+/// programs while its remaining callbacks are still verifying). Before
+/// attach, retain the largest prefix seen. Once `*scx_root != 0` proves
+/// the struct_ops scheduler attached, every referenced program has
+/// finished loading, so that snapshot is complete and can be finalized.
+///
+/// On kernels where the attach signal cannot be resolved, the
+/// largest-snapshot fallback continues through the run. It also prevents
+/// teardown's shrinking/empty `prog_idr` from erasing a useful capture.
+#[derive(Default)]
+struct VerifierStatsCapture {
+    stats: Vec<super::bpf_prog::ProgVerifierStats>,
+    finalized: bool,
+}
+
+impl VerifierStatsCapture {
+    fn observe(
+        &mut self,
+        candidate: Vec<super::bpf_prog::ProgVerifierStats>,
+        scheduler_attached: bool,
+    ) {
+        if self.finalized || candidate.is_empty() {
+            return;
+        }
+
+        if scheduler_attached {
+            self.stats = candidate;
+            self.finalized = true;
+        } else if candidate.len() > self.stats.len() {
+            self.stats = candidate;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn monitor_loop(
     mem: &GuestMem,
@@ -3303,11 +3343,12 @@ pub(crate) fn monitor_loop(
         .map(|r| r.num_cpus as usize)
         .unwrap_or(rq_pas.len());
     let mut samples: Vec<MonitorSample> = Vec::new();
-    // One-shot mid-run capture of load-time `verified_insns` while the
-    // scheduler's BPF progs are still live in `prog_idr`. See
-    // `MonitorLoopResult::verified_insns` for why this must not wait for
-    // post-teardown cleanup (synchronous `idr_remove` race).
-    let mut verified_insns_capture: Vec<super::bpf_prog::ProgVerifierStats> = Vec::new();
+    // Mid-run capture of load-time `verified_insns` while the scheduler's
+    // BPF progs are still live in `prog_idr`. It finalizes only after
+    // scheduler attach; see `VerifierStatsCapture` for the partial-load
+    // race and `MonitorLoopResult::verified_insns` for why this must not
+    // wait for post-teardown cleanup (synchronous `idr_remove` race).
+    let mut verified_insns_capture = VerifierStatsCapture::default();
     // Reactive threshold trackers — reuse the post-hoc
     // `SustainedViolationTracker` so "sustained for N samples"
     // means the same thing to the reactive SysRq-D dump and to
@@ -4214,14 +4255,16 @@ pub(crate) fn monitor_loop(
             None
         };
 
-        // One-shot mid-run `verified_insns` capture (see
-        // `MonitorLoopResult::verified_insns`). Runs only until the first
-        // non-empty result: `verified_insns` is fixed once at load, so
-        // one live capture suffices, and skipping once captured avoids a
-        // redundant `prog_idr` walk every tick. Gated on `data_valid`
-        // like the runtime walk (pre-validity reads return phantom zeros).
+        // Mid-run `verified_insns` capture (see
+        // `MonitorLoopResult::verified_insns`). A program's count is fixed
+        // after its own verification, but the program SET grows while
+        // libbpf loads the object. Keep sampling until the scheduler-attach
+        // latch proves the set is complete; on kernels without that latch,
+        // retain the largest set observed through the run. Gated on
+        // `data_valid` like the runtime walk (pre-validity reads return
+        // phantom zeros).
         if data_valid
-            && verified_insns_capture.is_empty()
+            && !verified_insns_capture.finalized
             && let Some(ctx) = prog_stats_ctx
         {
             let live_walk = WalkContext {
@@ -4231,7 +4274,7 @@ pub(crate) fn monitor_loop(
                 ),
                 ..ctx.walk
             };
-            verified_insns_capture = super::bpf_prog::find_struct_ops_progs(
+            let candidate = super::bpf_prog::find_struct_ops_progs(
                 mem,
                 live_walk,
                 ctx.prog_idr_kva,
@@ -4239,6 +4282,7 @@ pub(crate) fn monitor_loop(
                 ctx.start_kernel_map,
                 ctx.phys_base,
             );
+            verified_insns_capture.observe(candidate, watchdog_reset_signaled);
         }
 
         // System-wide PSI-irq host-walk. `psi.psi_system_pa` is the
@@ -4435,7 +4479,7 @@ pub(crate) fn monitor_loop(
         preemption_threshold_ns,
         boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
         scx_event_counters_supported: false,
-        verified_insns: verified_insns_capture,
+        verified_insns: verified_insns_capture.stats,
     }
 }
 
@@ -4860,9 +4904,8 @@ mod tests {
     /// `MonitorLoopResult.verified_insns` WHILE running (not at
     /// post-teardown cleanup, which races `idr_remove`). CI-runnable (no
     /// VM/kernel) companion to the host-gated demo_verifier e2e — pins
-    /// the capture guard (`data_valid && is_empty`), the one-shot latch,
-    /// and the field threading that the e2e masks when it skips without a
-    /// kernel.
+    /// the capture guard and field threading that the e2e masks when it
+    /// skips without a kernel.
     #[test]
     fn monitor_loop_captures_verified_insns_mid_run() {
         use super::super::symbols::START_KERNEL_MAP;
@@ -4987,6 +5030,56 @@ mod tests {
         );
         assert_eq!(result.verified_insns[0].name, "sched_prog");
         assert_eq!(result.verified_insns[0].verified_insns, 4242);
+    }
+
+    /// libbpf publishes programs to `prog_idr` one at a time. A first
+    /// non-empty snapshot containing only layered's early callbacks must
+    /// not become authoritative: the complete snapshot observed at attach
+    /// replaces it, and later teardown shrinkage cannot erase it.
+    #[test]
+    fn verifier_stats_capture_waits_for_complete_attached_snapshot() {
+        use super::super::bpf_prog::ProgVerifierStats;
+
+        let stats = |names: &[&str]| {
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| ProgVerifierStats {
+                    name: (*name).to_string(),
+                    verified_insns: (i as u32 + 1) * 100,
+                })
+                .collect()
+        };
+
+        let mut capture = VerifierStatsCapture::default();
+        capture.observe(stats(&["layered_select_", "layered_enqueue"]), false);
+        assert_eq!(capture.stats.len(), 2);
+        assert!(!capture.finalized);
+
+        capture.observe(
+            stats(&[
+                "layered_select_",
+                "layered_enqueue",
+                "layered_dispatch",
+                "layered_tick",
+                "layered_runnable",
+                "layered_running",
+            ]),
+            true,
+        );
+        assert_eq!(capture.stats.len(), 6);
+        assert!(capture.finalized);
+        assert!(
+            capture.stats.iter().any(|p| p.name == "layered_dispatch"),
+            "attached snapshot must replace the partial load prefix",
+        );
+
+        capture.observe(stats(&["layered_exit"]), false);
+        assert_eq!(
+            capture.stats.len(),
+            6,
+            "post-attach teardown shrinkage must not replace the complete set",
+        );
     }
 
     #[test]

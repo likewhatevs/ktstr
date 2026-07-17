@@ -244,6 +244,20 @@ pub enum MsgType {
     /// need no such marker — their in-band `SCHED_OUTPUT_START/END` content
     /// delimiters, not the framing, bound their payloads.
     WprofTraceChunk,
+    /// Guest→host ordered teardown barrier (payload: empty).
+    ///
+    /// Emitted only by the progress-watchdog teardown-wedge fault
+    /// injector, after its `ScenarioEnd` and test-result frames. The
+    /// coordinator advances the lifecycle to Teardown, persists every
+    /// earlier frame in the same ordered bulk stream, then replies with
+    /// [`MsgType::TeardownBarrierAck`] on port 1 RX. The guest must not
+    /// enter its intentional infinite wedge until that reply arrives.
+    /// Coordinator-internal: carries no test verdict.
+    TeardownBarrier,
+    /// Host→guest acknowledgement for [`MsgType::TeardownBarrier`]
+    /// (payload: empty). A guest TX frame stamped with this host-only
+    /// tag is illegitimate and is filtered as coordinator-internal.
+    TeardownBarrierAck,
     /// Guest→host system-ready signal (payload: empty).
     ///
     /// Emitted by the guest's `ktstr_guest_init` after
@@ -307,6 +321,8 @@ impl MsgType {
             MsgType::Profraw => MSG_TYPE_PROFRAW,
             MsgType::WprofTrace => MSG_TYPE_WPROF_TRACE,
             MsgType::WprofTraceChunk => MSG_TYPE_WPROF_TRACE_CHUNK,
+            MsgType::TeardownBarrier => MSG_TYPE_TEARDOWN_BARRIER,
+            MsgType::TeardownBarrierAck => MSG_TYPE_TEARDOWN_BARRIER_ACK,
             MsgType::SnapshotRequest => MSG_TYPE_SNAPSHOT_REQUEST,
             MsgType::SnapshotReply => MSG_TYPE_SNAPSHOT_REPLY,
             MsgType::KernelOpRequest => MSG_TYPE_KERNEL_OP_REQUEST,
@@ -345,6 +361,8 @@ impl MsgType {
             MSG_TYPE_PROFRAW => Some(MsgType::Profraw),
             MSG_TYPE_WPROF_TRACE => Some(MsgType::WprofTrace),
             MSG_TYPE_WPROF_TRACE_CHUNK => Some(MsgType::WprofTraceChunk),
+            MSG_TYPE_TEARDOWN_BARRIER => Some(MsgType::TeardownBarrier),
+            MSG_TYPE_TEARDOWN_BARRIER_ACK => Some(MsgType::TeardownBarrierAck),
             MSG_TYPE_SNAPSHOT_REQUEST => Some(MsgType::SnapshotRequest),
             MSG_TYPE_SNAPSHOT_REPLY => Some(MsgType::SnapshotReply),
             MSG_TYPE_KERNEL_OP_REQUEST => Some(MsgType::KernelOpRequest),
@@ -389,6 +407,10 @@ impl MsgType {
     ///     kernel-op roundtrip); the request carries no test verdict.
     ///   - [`MsgType::KernelOpReply`] — host→guest only on port-1 RX,
     ///     same illegitimate-guest-TX reasoning as `SnapshotReply`.
+    ///   - [`MsgType::TeardownBarrier`] — ordered guest→host fence used
+    ///     by the progress-watchdog fault injector; carries no verdict.
+    ///   - [`MsgType::TeardownBarrierAck`] — host→guest-only reply to
+    ///     that fence.
     ///   - [`MsgType::SysRdy`] — its only semantic is the eventfd
     ///     promotion that releases the monitor's pre-sample
     ///     `epoll_wait`.
@@ -405,6 +427,8 @@ impl MsgType {
                 | MsgType::SnapshotReply
                 | MsgType::KernelOpRequest
                 | MsgType::KernelOpReply
+                | MsgType::TeardownBarrier
+                | MsgType::TeardownBarrierAck
                 | MsgType::SysRdy
                 | MsgType::BpfMapWriteReady
                 | MsgType::SchedSwapNotify
@@ -561,6 +585,17 @@ pub const MSG_TYPE_WPROF_TRACE: u32 = 0x5750_5246; // "WPRF"
 /// [`MSG_TYPE_WPROF_TRACE`] frame carrying the final slice). See
 /// [`MsgType::WprofTraceChunk`].
 pub const MSG_TYPE_WPROF_TRACE_CHUNK: u32 = 0x5750_5243; // "WPRC"
+
+/// Guest→host ordered teardown barrier (payload: empty).
+///
+/// Tag spelled `"TDBR"` (TeaDown BaRrier). The coordinator replies
+/// with [`MSG_TYPE_TEARDOWN_BARRIER_ACK`] only after all preceding
+/// guest frames are persisted and the lifecycle is in Teardown.
+pub const MSG_TYPE_TEARDOWN_BARRIER: u32 = 0x5444_4252; // "TDBR"
+
+/// Host→guest acknowledgement for [`MSG_TYPE_TEARDOWN_BARRIER`]
+/// (payload: empty). Tag spelled `"TDBA"` (TeaDown Barrier Ack).
+pub const MSG_TYPE_TEARDOWN_BARRIER_ACK: u32 = 0x5444_4241; // "TDBA"
 
 /// Guest→host on-demand snapshot request
 /// (payload: [`SnapshotRequestPayload`]).
@@ -1722,11 +1757,14 @@ mod tests {
             MsgType::Profraw,
             MsgType::WprofTrace,
             MsgType::WprofTraceChunk,
+            MsgType::TeardownBarrier,
+            MsgType::TeardownBarrierAck,
             MsgType::SnapshotRequest,
             MsgType::SnapshotReply,
             MsgType::KernelOpRequest,
             MsgType::KernelOpReply,
             MsgType::SysRdy,
+            MsgType::BpfMapWriteReady,
             MsgType::SchedSwapNotify,
             MsgType::Stdout,
             MsgType::Stderr,
@@ -1782,6 +1820,14 @@ mod tests {
             MSG_TYPE_WPROF_TRACE_CHUNK
         );
         assert_eq!(
+            MsgType::TeardownBarrier.wire_value(),
+            MSG_TYPE_TEARDOWN_BARRIER
+        );
+        assert_eq!(
+            MsgType::TeardownBarrierAck.wire_value(),
+            MSG_TYPE_TEARDOWN_BARRIER_ACK
+        );
+        assert_eq!(
             MsgType::SnapshotRequest.wire_value(),
             MSG_TYPE_SNAPSHOT_REQUEST
         );
@@ -1815,8 +1861,9 @@ mod tests {
     }
 
     /// `is_coordinator_internal` flips on for SnapshotRequest,
-    /// SnapshotReply, KernelOpRequest, KernelOpReply, SysRdy, and
-    /// SchedSwapNotify and stays off for every test-verdict-bearing
+    /// SnapshotReply, KernelOpRequest, KernelOpReply, TeardownBarrier,
+    /// TeardownBarrierAck, SysRdy, BpfMapWriteReady, and SchedSwapNotify
+    /// and stays off for every test-verdict-bearing
     /// variant. The
     /// Reply variants are host→guest only on port-1 RX; a guest TX
     /// frame stamped with one of those tags is illegitimate and
@@ -1835,7 +1882,10 @@ mod tests {
             MsgType::SnapshotReply,
             MsgType::KernelOpRequest,
             MsgType::KernelOpReply,
+            MsgType::TeardownBarrier,
+            MsgType::TeardownBarrierAck,
             MsgType::SysRdy,
+            MsgType::BpfMapWriteReady,
             MsgType::SchedSwapNotify,
         ];
         let verdict = [

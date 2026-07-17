@@ -110,10 +110,10 @@ exclusive lock on one host LLC group per virtual LLC for the run's
 duration. To run `K` perf-mode tests concurrently without contention
 delays, the host needs `K * llcs` free LLC groups; with fewer, the
 excess tests join the lock-dir acquisition queue and proceed as each
-holder releases (progress-based patience: waiting continues as long
-as anything advances). Contention that outlives a zero-progress
-patience window — a wedged holder — surfaces as a retryable
-`ResourceContention` failure that nextest re-runs — never a skip. The
+holder releases. The queue does not infer that a live holder is wedged
+from elapsed wall time: the holder's VM watchdog owns guest progress,
+nextest owns the final process-lifecycle rail, and a crash releases the
+flock in the kernel. The
 `vm-perf` test group in `.config/nextest.toml` caps how many run at
 once.
 
@@ -130,12 +130,12 @@ for.
   visible banner (`ktstr: SKIP: <reason>` on stderr, exit 0, skip
   recorded in the run sidecar); promoted to a hard fail under
   `KTSTR_NO_SKIP_MODE` for runs that demand execution.
-- **`ResourceContention`** — transient: another run holds a lock on
-  a needed LLC or CPU (the reason names it, e.g. `LLC 3 busy`).
-  Acquisition queues and waits for the holder (progress-based
-  patience); only a zero-progress window fails, with a `FAIL:
-  transient resource contention` banner that nextest retries — it is
-  never a skip, so a busy host costs throughput, not coverage.
+- **`ResourceContention`** — transient host-resource pressure outside
+  queued test acquisition (for example retryable KVM allocation
+  errors), or a busy reservation in a one-shot non-waiting command.
+  It produces a `FAIL: transient resource contention` banner that
+  nextest retries — never a skip. Queued tests wait for a lock holder,
+  so a busy host costs throughput, not coverage.
 - **Warnings (non-fatal)** — insufficient free hugepages (regular
   pages used); high host load (`procs_running` above half the vCPU
   count — results may be noisy); unstable TSC (x86_64, common in

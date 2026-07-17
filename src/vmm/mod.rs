@@ -806,12 +806,12 @@ impl KtstrVm {
         // setup. Under the lock-dir queue ("second-order scheduler"
         // — see host_topology::protocol), nextest admits every cell
         // at once and cells park here until capacity frees; a queued
-        // cell must be CHEAP: what it holds is this process, a
-        // blocked flock ticket, and an inotify fd — NOT a guest
-        // memory map with a resident kernel image, not vCPU fds.
-        // Acquisition WAITS on contention (wait = true) with
-        // progress-based patience rather than converting a transient
-        // peer hold into a host-skip.
+        // cell must be CHEAP: what it holds is this process and a
+        // blocked flock ticket (plus one inotify fd only while it is
+        // queue head) — NOT a guest memory map with a resident kernel
+        // image, not vCPU fds. Acquisition WAITS on contention
+        // (wait = true) for the authoritative flock release rather
+        // than converting a transient peer hold into a host-skip.
         let run_locks = self.acquire_run_locks(true)?;
 
         let initramfs_handle = self.spawn_initramfs_resolve();
@@ -938,9 +938,9 @@ impl KtstrVm {
     /// flock from the cached pinning / LLC plan and this fn re-takes
     /// them at the TOP of `run()` — before the initramfs build, KVM
     /// VM creation, and kernel load — so a cell parked in the
-    /// acquisition queue is CHEAP (a ticket flock + an inotify fd,
-    /// no guest memory). The no-perf path additionally HOLDS its
-    /// build-time `LOCK_SH` fds (parked in
+    /// acquisition queue is CHEAP (a ticket flock, plus one inotify
+    /// fd only as head; no guest memory). The no-perf path additionally
+    /// HOLDS its build-time `LOCK_SH` fds (parked in
     /// [`Self::no_perf_build_locks`]) so peers' holder counts stay
     /// truthful, releasing them either the instant its replan adopts
     /// fresh locks or BEFORE queueing on contention (a queued waiter
@@ -955,10 +955,9 @@ impl KtstrVm {
     /// acquirers wait for exclusive holders; see
     /// [`host_topology::protocol`]) instead of surfacing contention;
     /// the interactive path passes `false` for the single-shot
-    /// fast-path-only behaviour. Contention that outlives the
-    /// progress-based patience surfaces as a typed
-    /// `ResourceContention` — a RETRYABLE failure at the classifier,
-    /// never a host-skip.
+    /// fast-path-only behaviour. The holder's VM watchdog and
+    /// nextest process rail own lifecycle bounds; the lock layer
+    /// never turns a slow live holder into `ResourceContention`.
     ///
     /// Branch table (mirrors `build()`'s plan switch):
     /// * `no_perf_mode` + cached `no_perf_plan`: re-runs the full
@@ -974,9 +973,7 @@ impl KtstrVm {
     /// * `performance_mode` + `pinning_plan`: reuses the stored
     ///   plan's `llc_indices` to take `LOCK_EX` via
     ///   `acquire_resource_locks_waiting` (fast path, then queue +
-    ///   head accumulation under `wait`). Residual
-    ///   ResourceContention surfaces verbatim for the classifier's
-    ///   retryable-failure routing.
+    ///   head accumulation under `wait`).
     /// * default else: walks LLC offsets, computing a
     ///   `compute_pinning` candidate per offset and taking `LOCK_SH`
     ///   on the LLC plus `LOCK_EX` on each assigned CPU via
@@ -985,9 +982,8 @@ impl KtstrVm {
     ///   by perf-mode `LOCK_EX`). If a 1:1 candidate exists but every
     ///   offset is busy (a perf-mode `LOCK_EX` peer on the LLC, or a
     ///   non-perf peer on the per-CPU `LOCK_EX` set) it queues and,
-    ///   as head, probes every candidate on each lock-dir wake —
-    ///   yielding `ResourceContention` (transient → retryable
-    ///   failure) only if progress-based patience expires. If NO offset can
+    ///   as head, probes every candidate on each lock-dir wake until
+    ///   the authoritative flock release. If NO offset can
     ///   map the topology (the host is too small), or no host topology
     ///   was cached at build time (sysfs unreadable), it OVERCOMMITS
     ///   instead of skipping (via `acquire_default_run_locks` ->
@@ -1229,10 +1225,10 @@ impl KtstrVm {
     ///   completes it accumulates the primary candidate (maximum
     ///   overlap with already-held locks, ties to the pid-staggered
     ///   scan order) under the head license, publishing it as the
-    ///   claim. Progress-based patience: only a no-gain window
-    ///   ([`host_topology::protocol::ACQUIRE_NO_PROGRESS_PATIENCE`])
-    ///   surfaces `ResourceContention`, which the run path routes to
-    ///   a RETRYABLE failure (nextest re-runs).
+    ///   claim. It waits for the authoritative flock release; the
+    ///   holder's VM watchdog and nextest process rail own lifecycle
+    ///   bounds, so host preemption cannot be misclassified as
+    ///   contention.
     ///
     /// Associated fn (no `&self`) over host_topo/topology/watchdog so
     /// the overcommit-vs-contention decision is unit-testable with a
@@ -1321,28 +1317,16 @@ impl KtstrVm {
         }
         // Contended: queue up (holding NOTHING — every bounce above
         // released everything), then acquire as head.
-        Self::acquire_default_as_head(&candidates, max_slots)
+        Self::acquire_default_as_head(&candidates)
     }
 
     /// Queue-and-head phase of [`Self::acquire_default_run_locks`]:
     /// see that method's doc for the probe-all / accumulate-primary
     /// re-plan model. Split out so the wait machinery reads as one
     /// unit.
-    fn acquire_default_as_head(
-        candidates: &[host_topology::PinningPlan],
-        max_slots: usize,
-    ) -> Result<RunLocks> {
+    fn acquire_default_as_head(candidates: &[host_topology::PinningPlan]) -> Result<RunLocks> {
         use host_topology::protocol;
-        let Some(_queue) = protocol::wait_for_queue_turn()? else {
-            return Err(anyhow::Error::new(host_topology::ResourceContention {
-                reason: format!(
-                    "all {max_slots} LLC slots busy (LOCK_SH) and the \
-                     acquisition queue made no progress for {:?} — a peer \
-                     holder appears wedged",
-                    protocol::patience(),
-                ),
-            }));
-        };
+        let _queue = protocol::wait_for_queue_turn()?;
         // Pre-compute each candidate's canonical lock order and claim.
         let targets: Vec<Vec<(String, crate::flock::FlockMode)>> = candidates
             .iter()
@@ -1384,7 +1368,7 @@ impl KtstrVm {
                 .expect("candidates is non-empty — checked by caller");
             let target = &targets[primary];
             held.retain_paths(&target.iter().map(|(p, _)| p.clone()).collect());
-            let gained = held.sweep(target)? > 0;
+            held.sweep(target)?;
             if held.covers(target) {
                 // A holder released between the probe pass and this
                 // sweep and the sweep finished the set — complete now
@@ -1401,8 +1385,6 @@ impl KtstrVm {
                     llcs: candidate.llc_indices.iter().copied().collect(),
                     cpus: claim_cpus,
                 },
-                gained,
-                stalled_on: held.first_missing(target).unwrap_or("<none>").to_string(),
             })
         })?;
         match outcome {
@@ -1412,18 +1394,6 @@ impl KtstrVm {
                 pinning_plan: Some(candidates[i].clone_unlocked()),
                 no_perf_cpus: None,
             }),
-            protocol::HeadOutcome::TimedOut { stalled_on, waited } => {
-                Err(anyhow::Error::new(host_topology::ResourceContention {
-                    reason: format!(
-                        "all {max_slots} LLC slots busy (LOCK_SH); no \
-                         acquisition progress for {:?} after waiting \
-                         {waited:?} for a peer to release (stalled on \
-                         {stalled_on}) — the holder appears wedged\n  \
-                         hint: a performance_mode test may hold LOCK_EX",
-                        protocol::patience(),
-                    ),
-                }))
-            }
             protocol::HeadOutcome::Aborted { reason } => {
                 Err(anyhow::Error::new(host_topology::ResourceContention {
                     reason,

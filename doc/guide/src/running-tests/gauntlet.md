@@ -26,7 +26,7 @@ test case instead of a production report.
     <rect x="520" y="78" width="100" height="26" rx="6" fill="var(--kt-accent-soft)" stroke="var(--kt-rule)"/><text x="570" y="95" fill="var(--fg)" text-anchor="middle">medium-8llc</text>
     <rect x="300" y="116" width="100" height="26" rx="6" fill="var(--kt-accent-soft)" stroke="var(--kt-rule)"/><text x="350" y="133" fill="var(--fg)" text-anchor="middle">large-4llc</text>
     <g opacity=".5">
-      <rect x="410" y="116" width="100" height="26" rx="6" fill="none" stroke="var(--kt-rule)"/><text x="460" y="133" fill="var(--fg)" text-anchor="middle">near-max-llc</text>
+      <rect x="410" y="116" width="100" height="26" rx="6" fill="none" stroke="var(--kt-rule)"/><text x="460" y="133" font-size="8.5" fill="var(--fg)" text-anchor="middle">240cpu-15llc-smt2</text>
       <line x1="414" y1="140" x2="506" y2="118" stroke="var(--kt-rule)" stroke-width="1"/>
       <rect x="520" y="116" width="100" height="26" rx="6" fill="none" stroke="var(--kt-rule)"/><text x="570" y="133" fill="var(--fg)" text-anchor="middle">numa2-4llc</text>
       <line x1="524" y1="140" x2="616" y2="118" stroke="var(--kt-rule)" stroke-width="1"/>
@@ -79,9 +79,10 @@ the label format.
 > Multi-NUMA and scale-boundary presets are **opt-in**. The default
 > constraints (`max_numa_nodes = 1`, `max_llcs = 12`,
 > `max_cpus = 192`) exclude the six `numa*` presets plus
-> `near-max-llc`, `max-cpu`, and their `-nosmt` variants — 15 of the
-> 25 gauntlet presets are active by default. Raise `max_numa_nodes`,
-> `max_llcs`, or `max_cpus` on the test to opt in.
+> `240cpu-15llc-smt2`, `240cpu-15llc-nosmt`, `252cpu-14llc-smt2`, and
+> `252cpu-14llc-nosmt` — 15 of the 25 gauntlet presets are active by
+> default. Raise `max_numa_nodes`, `max_llcs`, or `max_cpus` on the
+> test to opt in.
 >
 > The catalog has one further preset, `uneven-11llc` (26 in all), that
 > is **verifier-only**: its non-uniform LLC sizing cannot be expressed
@@ -102,15 +103,15 @@ the label format.
 | `medium-8llc` | 1n8l4c2t | 64 | 8 | 1 | Medium, many LLCs |
 | `large-4llc` | 1n4l16c2t | 128 | 4 | 1 | Large, few LLCs |
 | `large-8llc` | 1n8l8c2t | 128 | 8 | 1 | Large, many LLCs |
-| `near-max-llc` | 1n15l8c2t | 240 | 15 | 1 | Near maximum |
-| `max-cpu` | 1n14l9c2t | 252 | 14 | 1 | Near KVM vCPU limit |
+| `240cpu-15llc-smt2` | 1n15l8c2t | 240 | 15 | 1 | 15-LLC SMT topology |
+| `252cpu-14llc-smt2` | 1n14l9c2t | 252 | 14 | 1 | Near KVM vCPU limit |
 | `uneven-11llc` | 1n11l\*c2t | 192 | 11 | 1 | **Verifier-only.** Non-uniform LLCs — ten of 18 CPUs + one of 12. Forces continuous overcommit (`forced_cpu_budget = 96`) so 192 vCPUs always time-slice. Targets schedulers assuming equal-sized caches. |
 | `medium-4llc-nosmt` | 1n4l8c1t | 32 | 4 | 1 | Medium, no SMT |
 | `medium-8llc-nosmt` | 1n8l8c1t | 64 | 8 | 1 | Medium, many LLCs, no SMT |
 | `large-4llc-nosmt` | 1n4l32c1t | 128 | 4 | 1 | Large, no SMT |
 | `large-8llc-nosmt` | 1n8l16c1t | 128 | 8 | 1 | Large, many LLCs, no SMT |
-| `near-max-llc-nosmt` | 1n15l16c1t | 240 | 15 | 1 | Near maximum, no SMT |
-| `max-cpu-nosmt` | 1n14l18c1t | 252 | 14 | 1 | Near KVM vCPU limit, no SMT |
+| `240cpu-15llc-nosmt` | 1n15l16c1t | 240 | 15 | 1 | 15-LLC topology, no SMT |
+| `252cpu-14llc-nosmt` | 1n14l18c1t | 252 | 14 | 1 | Near KVM vCPU limit, no SMT |
 | `numa2-2llc` | 2n2l8c2t | 32 | 2 | 2 | Multi-NUMA, 2 nodes, one LLC per node, SMT |
 | `numa2-4llc` | 2n4l4c1t | 16 | 4 | 2 | Multi-NUMA, 2 nodes |
 | `numa2-8llc` | 2n8l8c2t | 128 | 8 | 2 | Multi-NUMA, 2 nodes, SMT |
@@ -157,8 +158,8 @@ A test with `min_llcs = 2`, `requires_smt = true`, and default
 - `tiny-1llc` (1 LLC): excluded — below `min_llcs`
 - All non-SMT presets (`tiny-2llc`, `odd-*`, `*-nosmt`):
   excluded — `requires_smt`
-- `near-max-llc` (15 LLCs): excluded — above default `max_llcs = 12`
-- `max-cpu` (252 CPUs, 14 LLCs): excluded — above default
+- `240cpu-15llc-smt2` (15 LLCs): excluded — above default `max_llcs = 12`
+- `252cpu-14llc-smt2` (252 CPUs, 14 LLCs): excluded — above default
   `max_cpus = 192` (also above default `max_llcs = 12`)
 - All `numa*` presets: excluded — above default `max_numa_nodes = 1`
 
@@ -191,6 +192,6 @@ by default, gauntlet variants included.
   [budget-based selection](../running-tests.md#budget-based-test-selection).
 - **Memory.** Each gauntlet VM gets
   `max(cpus × 64 MiB, 256 MiB, entry.memory_mib)` of guest RAM (plus
-  an initramfs-derived floor). For the 252-CPU `max-cpu` presets that
-  is at least 16128 MiB — the host needs that much free memory to run
-  the variant.
+  an initramfs-derived floor). For the `252cpu-14llc-*` presets that is
+  at least 16128 MiB — the host needs that much free memory to run the
+  variant.

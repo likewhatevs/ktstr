@@ -1,28 +1,11 @@
 //! Acquisition-protocol tests: inotify wake mechanics, claim
-//! visibility/subtraction, queue progress patience, re-plan-on-wake,
+//! visibility/subtraction, queue lifecycle ownership, re-plan-on-wake,
 //! and work conservation. Everything runs against real flocks in a
 //! per-test tempdir (the lock-prefix override guards).
 
 use super::super::protocol;
 use super::super::*;
 use super::*;
-
-/// RAII patience shortener so expiry tests run in milliseconds. Reset
-/// on drop even when an assertion panics mid-test.
-struct PatienceGuard;
-
-impl PatienceGuard {
-    fn new(d: std::time::Duration) -> Self {
-        protocol::PATIENCE_OVERRIDE.with(|p| *p.borrow_mut() = Some(d));
-        PatienceGuard
-    }
-}
-
-impl Drop for PatienceGuard {
-    fn drop(&mut self) {
-        protocol::PATIENCE_OVERRIDE.with(|p| *p.borrow_mut() = None);
-    }
-}
 
 /// True when the machine's 1-minute loadavg exceeds 60% of its core
 /// count. The CI runners are colocated and routinely saturated, which
@@ -192,16 +175,13 @@ fn fast_path_subtracts_live_claim_but_takes_disjoint_capacity() {
     assert_eq!(locks.len(), 3, "two LLC SH + one CPU EX");
 }
 
-/// Progress-based patience, advancing side: a queue whose holder KEEPS
-/// CHANGING never times a waiter out, even when the total wait far
-/// exceeds the patience window — every observed turnover resets the
-/// clock. Five successive 220 ms holders against a 500 ms patience
-/// give a ~1.1 s total wait that the old wall-deadline semantics would
-/// have failed.
+/// A waiter keeps one kernel ticket while a chain of queue holders
+/// advances, then acquires after the last release. Five successive
+/// holders make the wait long enough to expose reopen/poll schemes
+/// that lose their queue position.
 #[test]
-fn queue_turnover_resets_patience() {
+fn queue_ticket_survives_multiple_holder_turns() {
     let _prefixes = LockPrefixesGuard::new();
-    let _patience = PatienceGuard::new(std::time::Duration::from_millis(500));
     let qpath = protocol::queue_lock_path();
 
     // Handover chain: five successive holder GENERATIONS, each a
@@ -238,7 +218,7 @@ fn queue_turnover_resets_patience() {
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
     let start = std::time::Instant::now();
-    let ticket = protocol::wait_for_queue_turn().expect("queue wait must not error");
+    let _ticket = protocol::wait_for_queue_turn().expect("queue wait must not error");
     let elapsed = start.elapsed();
     for pid in children {
         // SAFETY: reaping our own forked children.
@@ -247,27 +227,18 @@ fn queue_turnover_resets_patience() {
         }
     }
     assert!(
-        ticket.is_some(),
-        "an ADVANCING queue must never time a waiter out — turnover \
-         resets patience (elapsed {elapsed:?})",
-    );
-    assert!(
         elapsed >= std::time::Duration::from_millis(700),
-        "the waiter must actually have out-waited multiple holders \
-         beyond one patience window; elapsed={elapsed:?}",
+        "the waiter must actually have waited through multiple holders; \
+         elapsed={elapsed:?}",
     );
 }
 
-/// A production [`protocol::QueueTurn`] release must wake both the kernel
-/// flock waiter and its generation-futex monitor. The latter is load-bearing:
-/// if only flock woke, `wait_for_queue_turn` would acquire the lock and then
-/// hang while joining a monitor parked until the full patience deadline.
+/// A production [`protocol::QueueTurn`] release grants the next
+/// blocking flock waiter directly.
 #[test]
-fn queue_turn_release_wakes_generation_monitor() {
+fn queue_turn_release_grants_waiter() {
     let _prefixes = LockPrefixesGuard::new();
-    let holder = protocol::wait_for_queue_turn()
-        .expect("initial queue acquire")
-        .expect("fresh queue must be available");
+    let holder = protocol::wait_for_queue_turn().expect("initial queue acquire");
 
     // Lock-prefix overrides are thread-local. Copy them so the helper joins
     // this test's isolated queue instead of the production one.
@@ -278,59 +249,54 @@ fn queue_turn_release_wakes_generation_monitor() {
     let waiter = std::thread::spawn(move || {
         LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = llc_prefix);
         CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = cpu_prefix);
-        let _patience = PatienceGuard::new(std::time::Duration::from_secs(20));
         started_tx.send(()).expect("announce waiter start");
         let start = std::time::Instant::now();
-        let acquired = protocol::wait_for_queue_turn()
-            .expect("queue wait must not error")
-            .is_some();
-        done_tx
-            .send((acquired, start.elapsed()))
-            .expect("report queue acquire");
+        protocol::wait_for_queue_turn().expect("queue wait must not error");
+        done_tx.send(start.elapsed()).expect("report queue acquire");
     });
 
     started_rx.recv().expect("waiter start");
     std::thread::sleep(std::time::Duration::from_millis(100));
     drop(holder);
 
-    let (acquired, elapsed) = done_rx
+    let elapsed = done_rx
         .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("queue release must wake the futex monitor before patience expires");
+        .expect("queue release must grant the blocking waiter");
     waiter.join().expect("queue waiter thread");
-    assert!(acquired, "released queue turn must pass to its waiter");
     assert!(
         elapsed >= std::time::Duration::from_millis(80),
         "the waiter must actually block behind the initial turn; elapsed={elapsed:?}",
     );
 }
 
-/// Progress-based patience, wedged side: a queue holder that never
-/// releases (and never changes) times the waiter out within the
-/// no-progress window — the retryable-fail rail for a genuinely
-/// wedged peer.
+/// The queue does not diagnose a live holder from elapsed wall time.
+/// It remains blocked until that holder's authoritative flock release;
+/// holder crash cleanup and the external process rail own the wedged
+/// case.
 #[test]
-fn wedged_queue_holder_times_out_within_patience() {
+fn queue_wait_defers_to_holder_lifecycle() {
     let _prefixes = LockPrefixesGuard::new();
-    let _patience = PatienceGuard::new(std::time::Duration::from_millis(600));
     let qpath = protocol::queue_lock_path();
-    let _wedged = crate::flock::try_flock(&qpath, crate::flock::FlockMode::Exclusive)
+    let holder = crate::flock::try_flock(&qpath, crate::flock::FlockMode::Exclusive)
         .expect("open queue")
         .expect("EX on fresh queue");
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        drop(holder);
+    });
     let start = std::time::Instant::now();
-    let ticket = protocol::wait_for_queue_turn().expect("queue wait must not error");
+    let _ticket = protocol::wait_for_queue_turn().expect("queue wait must not error");
     let elapsed = start.elapsed();
+    releaser.join().expect("holder release thread");
     assert!(
-        ticket.is_none(),
-        "a wedged holder must produce the no-progress timeout",
-    );
-    assert!(
-        elapsed >= std::time::Duration::from_millis(550),
-        "must wait out the patience window before bailing; elapsed={elapsed:?}",
+        elapsed >= std::time::Duration::from_millis(700),
+        "the queue must wait for the holder's release, not invent an \
+         earlier lifecycle verdict; elapsed={elapsed:?}",
     );
     if !host_appears_loaded() {
         assert!(
             elapsed < std::time::Duration::from_secs(5),
-            "timeout must land near the patience window, not wander; elapsed={elapsed:?}",
+            "the waiter must acquire promptly after release; elapsed={elapsed:?}",
         );
     }
 }
@@ -445,7 +411,7 @@ fn small_shared_cell_proceeds_while_head_hungers() {
     // disjoint-capacity cell to wait behind the head and return
     // `Unavailable`, which `unwrap_acquired` would have panicked on. The
     // wall-time bound below additionally proves the fast path incurred no
-    // patience/queue delay — but that latency is only measurable on a
+    // queue delay — but that latency is only measurable on a
     // quiet host. On a saturated CI runner the elapsed time is dominated
     // by thread-scheduling latency, so enforce the bound only when the
     // host is not loaded (the semantic proof holds unconditionally).

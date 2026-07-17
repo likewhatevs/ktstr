@@ -1696,7 +1696,7 @@ fn resolve_cpu_budget(
 /// failure: the build-time acquire is a free-offset PROBE — `build()`
 /// strips the returned fds immediately and `run()` re-acquires the
 /// plan's `llc_indices` through the acquisition queue (fast path,
-/// then head accumulation with progress-based patience). So on
+/// then head accumulation until the authoritative flock release). So on
 /// all-busy the probe returns the FIRST mappable candidate with an
 /// empty lock set and lets the run path queue for it. Bailing here —
 /// the old behaviour — made perf cells fail instantly (~0.2 s,

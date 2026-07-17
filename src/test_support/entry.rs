@@ -931,8 +931,9 @@ impl TopologyConstraints {
     /// no SMT requirement, 1-192 CPUs. Accepts most single-node
     /// gauntlet presets ktstr ships while rejecting multi-NUMA presets
     /// (numa2-*, numa4-*) and the scale-boundary single-node presets
-    /// that exceed the CPU/LLC caps (near-max-llc, max-cpu, and their
-    /// -nosmt variants). Test authors that want broader coverage must
+    /// that exceed the CPU/LLC caps (240cpu-15llc-{smt2,nosmt},
+    /// 252cpu-14llc-{smt2,nosmt}, and related variants). Test authors
+    /// that want broader coverage must
     /// raise `max_numa_nodes`, `max_llcs`, or `max_cpus` explicitly.
     ///
     /// The canonical const handle — use directly when you need an
@@ -1341,6 +1342,20 @@ pub struct Scheduler {
     /// Empty (`&[]`) means no filter — the scheduler verifies
     /// against every entry in `KTSTR_KERNEL_LIST`.
     pub kernels: &'static [&'static str],
+    /// Gauntlet preset names omitted from this scheduler's verifier
+    /// matrix.
+    ///
+    /// This is a named exception layer applied after
+    /// [`Self::constraints`]. It is intended for cases where a topology
+    /// is valid in general but irrelevant or unsupported for this
+    /// scheduler, and a structural min/max constraint would exclude
+    /// additional useful presets. It affects only `cargo ktstr
+    /// verifier`; ordinary tests and gauntlet variants are unchanged.
+    ///
+    /// `declare_scheduler!` exposes this as
+    /// `verifier_exclude_topologies = ["preset-name", ...]`.
+    /// Empty means no named exclusions.
+    pub verifier_exclude_topologies: &'static [&'static str],
     /// Manifest directory of the crate that DECLARED this scheduler —
     /// the `CARGO_MANIFEST_DIR` captured at the `declare_scheduler!`
     /// call site. A [`SchedulerSpec::Discover`] scheduler is built with
@@ -1407,6 +1422,7 @@ impl Scheduler {
         config_file: None,
         config_file_def: None,
         kernels: &[],
+        verifier_exclude_topologies: &[],
         manifest_dir: env!("CARGO_MANIFEST_DIR"),
     };
 
@@ -1442,6 +1458,8 @@ impl Scheduler {
     /// - `kernels`: empty slice — verifies against every kernel
     ///   in the operator's `--kernel` set (no per-scheduler
     ///   filter).
+    /// - `verifier_exclude_topologies`: empty slice — no named
+    ///   verifier-only topology exclusions.
     /// - `manifest_dir`: ktstr's own `CARGO_MANIFEST_DIR` (the
     ///   workspace root in this repo). `declare_scheduler!` overrides
     ///   this with the invoking crate's dir; a direct builder user
@@ -1469,6 +1487,7 @@ impl Scheduler {
             config_file: None,
             config_file_def: None,
             kernels: &[],
+            verifier_exclude_topologies: &[],
             manifest_dir: env!("CARGO_MANIFEST_DIR"),
         }
     }
@@ -1639,6 +1658,13 @@ impl Scheduler {
     /// accepted string shapes.
     pub const fn kernels(mut self, kernels: &'static [&'static str]) -> Self {
         self.kernels = kernels;
+        self
+    }
+
+    /// Exclude named gauntlet topology presets from this scheduler's
+    /// verifier matrix without changing ordinary gauntlet selection.
+    pub const fn verifier_exclude_topologies(mut self, presets: &'static [&'static str]) -> Self {
+        self.verifier_exclude_topologies = presets;
         self
     }
 
@@ -2904,6 +2930,9 @@ pub struct SchedulerJson {
     pub sched_args: Vec<String>,
     /// Kernel specs (consumed by `cargo_ktstr::kernel::resolve_kernel_set`).
     pub kernels: Vec<String>,
+    /// Named topology presets excluded only from the verifier matrix.
+    #[serde(default)]
+    pub verifier_exclude_topologies: Vec<String>,
     /// Gauntlet preset constraints (filter the verifier's topology sweep).
     pub constraints: TopologyConstraintsJson,
 }
@@ -3079,6 +3108,11 @@ impl SchedulerJson {
             },
             sched_args: s.sched_args.iter().map(|a| a.to_string()).collect(),
             kernels: s.kernels.iter().map(|k| k.to_string()).collect(),
+            verifier_exclude_topologies: s
+                .verifier_exclude_topologies
+                .iter()
+                .map(|p| p.to_string())
+                .collect(),
             constraints: TopologyConstraintsJson {
                 min_numa_nodes: s.constraints.min_numa_nodes,
                 max_numa_nodes: s.constraints.max_numa_nodes,
@@ -4319,6 +4353,7 @@ mod tests {
             config_file: None,
             config_file_def: Some(("--config {file}", "/include-files/cfg.json")),
             kernels: &[],
+            verifier_exclude_topologies: &[],
             manifest_dir: env!("CARGO_MANIFEST_DIR"),
         };
         fn good_test_func(_: &Ctx) -> Result<AssertResult> {
@@ -4403,6 +4438,7 @@ mod tests {
             config_file: None,
             config_file_def: Some(("f:{file}", "/include-files/p.json")),
             kernels: &[],
+            verifier_exclude_topologies: &[],
             manifest_dir: env!("CARGO_MANIFEST_DIR"),
         };
         fn good_test_func(_: &Ctx) -> Result<AssertResult> {
@@ -5287,6 +5323,7 @@ mod tests {
             config_file: None,
             config_file_def: None,
             kernels: &[],
+            verifier_exclude_topologies: &[],
             manifest_dir: env!("CARGO_MANIFEST_DIR"),
         };
         let entry = KtstrTestEntry {
@@ -6778,7 +6815,7 @@ mod tests {
     }
 
     /// `from_scheduler` copies `name`, the four topology dimensions,
-    /// `sched_args`, `kernels`, and every constraint field into the
+    /// `sched_args`, `kernels`, verifier exclusions, and every constraint field into the
     /// wire shape. `EEVDF` defaults the topology to
     /// 1 numa × 1 llc × 2 cores × 1 thread (see `Scheduler::EEVDF`),
     /// and the constraints to `TopologyConstraints::DEFAULT`. Pins
@@ -6796,6 +6833,7 @@ mod tests {
         // EEVDF carries no sched_args, no kernel filter.
         assert!(json.sched_args.is_empty());
         assert!(json.kernels.is_empty());
+        assert!(json.verifier_exclude_topologies.is_empty());
         // Constraints mirror TopologyConstraints::DEFAULT.
         assert_eq!(json.constraints.min_numa_nodes, 1);
         assert_eq!(json.constraints.max_numa_nodes, Some(1));
@@ -6817,12 +6855,14 @@ mod tests {
     fn from_scheduler_projects_overridden_fields_verbatim() {
         static ARGS: &[&str] = &["--slice-us", "20000"];
         static KERNELS: &[&str] = &["6.14", "6.15..6.16"];
+        static VERIFIER_EXCLUDES: &[&str] = &["240cpu-15llc-nosmt"];
         let s = Scheduler::named("custom")
             .binary_discover("scx_custom")
             // 2 numa × 4 llcs × 8 cores × 2 threads
             .topology(2, 4, 8, 2)
             .sched_args(ARGS)
             .kernels(KERNELS)
+            .verifier_exclude_topologies(VERIFIER_EXCLUDES)
             .constraints(
                 TopologyConstraints::DEFAULT
                     .with_min_numa_nodes(2)
@@ -6841,6 +6881,7 @@ mod tests {
         assert_eq!(json.topology.threads_per_core, 2);
         assert_eq!(json.sched_args, vec!["--slice-us", "20000"]);
         assert_eq!(json.kernels, vec!["6.14", "6.15..6.16"]);
+        assert_eq!(json.verifier_exclude_topologies, vec!["240cpu-15llc-nosmt"],);
         assert_eq!(json.constraints.min_numa_nodes, 2);
         assert_eq!(json.constraints.max_numa_nodes, Some(4));
         assert!(json.constraints.requires_smt);

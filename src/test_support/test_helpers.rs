@@ -245,6 +245,7 @@ pub(crate) static SCHED_TEST: Scheduler = Scheduler {
     config_file: None,
     config_file_def: None,
     kernels: &[],
+    verifier_exclude_topologies: &[],
     manifest_dir: env!("CARGO_MANIFEST_DIR"),
 };
 

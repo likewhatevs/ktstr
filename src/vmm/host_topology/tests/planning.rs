@@ -1272,55 +1272,6 @@ fn acquire_llc_plan_wait_phase_acquires_beyond_the_seam() {
     );
 }
 
-/// Progress-based patience expiry in the wait phase: a peer holds
-/// `LOCK_EX` on the only LLC and never releases (a wedged holder), so
-/// the head gains nothing and the (test-shortened) no-progress window
-/// expires. The bail must be a `ResourceContention` whose message
-/// records that it WAITED (the "after waiting" clause) and frames the
-/// verdict as no-progress — the operator-facing proof that the
-/// residual contention is a wedged peer, not a first-touch busy
-/// signal.
-#[test]
-fn acquire_llc_plan_wait_patience_expiry_bails_with_waited_diagnostic() {
-    let _llc_prefix = LlcLockPrefixGuard::new();
-    let _allowed = AllowedCpusGuard::new(vec![93800]);
-    let topo = synth_host_topo(&[(vec![93800], 0)]);
-    let test_topo = crate::topology::TestTopology::synthetic(1, 1);
-    super::super::protocol::PATIENCE_OVERRIDE.with(|p| {
-        *p.borrow_mut() = Some(std::time::Duration::from_millis(400));
-    });
-    // Wedged peer: LOCK_EX on the only LLC, never released.
-    let _peer_ex = crate::flock::try_flock(llc_lock_path(0), crate::flock::FlockMode::Exclusive)
-        .unwrap()
-        .expect("peer EX must acquire on clean pool");
-
-    let err = acquire_llc_plan_with_acquire_fn(
-        &topo,
-        &test_topo,
-        None,
-        PlacementPolicy::Consolidate,
-        true,
-        try_acquire_llc_plan_locks,
-    )
-    .expect_err("holder never releases — must bail once patience expires");
-    super::super::protocol::PATIENCE_OVERRIDE.with(|p| *p.borrow_mut() = None);
-    assert!(
-        err.downcast_ref::<ResourceContention>().is_some(),
-        "must surface as ResourceContention: {err:#}",
-    );
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("after waiting"),
-        "message must record the wait so residual contention reads as a \
-         wedged peer, not a first-touch busy signal: {msg}",
-    );
-    assert!(
-        msg.contains("no acquisition progress"),
-        "message must frame the bail as no-progress patience, not a \
-         wall deadline: {msg}",
-    );
-}
-
 /// `plan_from_snapshots` MUST-CONSOLIDATE invariant: on a
 /// single-node host where every fresh LLC is ascending, the
 /// single peer-held LLC at index 3 MUST be selected over any

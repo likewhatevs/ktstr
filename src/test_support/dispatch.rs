@@ -1014,13 +1014,11 @@ pub const EXIT_INCONCLUSIVE: i32 = 2;
 /// operator dashboard) triage zero-denominator runs distinctly from
 /// real regressions.
 ///
-/// `ResourceContention` does NOT map to a skip: the run path WAITS for
-/// a contended reservation to free (see [`crate::vmm::KtstrVm`]'s
-/// the acquisition queue's progress-based patience), so a contention that
-/// still surfaces here means zero queue/acquisition progress for the whole
-/// patience window — a wedged peer. [`classify_host_error`] routes it to
-/// [`HostClass::Fail`] → [`EXIT_FAIL`], a RETRYABLE failure nextest
-/// re-runs once the holder releases. That is the correct mechanism: a
+/// `ResourceContention` does NOT map to a skip. Queue-based lock
+/// acquisition waits for authoritative release; the type still
+/// represents retryable host-resource syscall failures.
+/// [`classify_host_error`] routes it to [`HostClass::Fail`] →
+/// [`EXIT_FAIL`], a RETRYABLE failure nextest re-runs. That is the correct mechanism: a
 /// skip is [`EXIT_PASS`], which nextest never retries, so the old
 /// skip-on-contention silently dropped suite coverage whenever a
 /// colocated peer's `LOCK_EX` overlapped the run. Chain-awareness (the
@@ -1904,6 +1902,11 @@ fn query_workspace_member_packages(manifest_dir: &str) -> std::collections::Hash
 /// correctness-only verify cells. A scheduler that accepts no preset
 /// emits no cell.
 ///
+/// After structural constraints, the scheduler's
+/// [`super::Scheduler::verifier_exclude_topologies`] list removes exact
+/// preset-name matches. This named exception applies only to verifier
+/// cells; ordinary gauntlet variants are unaffected.
+///
 /// Schedulers declared with [`super::SchedulerSpec::Eevdf`] or
 /// [`super::SchedulerSpec::KernelBuiltin`] are skipped at emission time
 /// because neither has a userspace binary to load BPF programs from.
@@ -2010,7 +2013,7 @@ fn list_verifier_cells_all() {
                     );
                     continue;
                 }
-                if !sched.constraints.accepts_verifier(&preset.topology) {
+                if !scheduler_accepts_verifier_preset(sched, preset) {
                     continue;
                 }
                 println!(
@@ -2020,6 +2023,17 @@ fn list_verifier_cells_all() {
             }
         }
     }
+}
+
+/// Apply the verifier-only topology policy for one scheduler/preset
+/// pair. Kept separate from emission so named exclusions are directly
+/// unit-testable without capturing a process-wide nextest listing.
+fn scheduler_accepts_verifier_preset(
+    sched: &super::Scheduler,
+    preset: &crate::gauntlet::TopoPreset,
+) -> bool {
+    sched.constraints.accepts_verifier(&preset.topology)
+        && !sched.verifier_exclude_topologies.contains(&preset.name)
 }
 
 /// Parse `verifier/<sched_name>/<kernel_label>/<preset_name>`, look up

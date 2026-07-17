@@ -103,7 +103,8 @@ use self::lazy_init::{
 #[allow(unused_imports)]
 use self::snapshot::{
     VmlinuxSymbolCache, arm_user_watchpoint, decode_snapshot_request, frame_kernel_op_reply,
-    frame_snapshot_reply, poll_eventfd_until_ready_or_timeout, snapshot_tagged_path,
+    frame_snapshot_reply, frame_teardown_barrier_ack, poll_eventfd_until_ready_or_timeout,
+    snapshot_tagged_path,
 };
 use self::state::{
     BspExitReason, FREEZE_RENDEZVOUS_TIMEOUT, FreezeState, SnapshotRequest,
@@ -197,6 +198,17 @@ fn wprof_grace_should_kill(deadline: Option<Instant>, now: Instant) -> bool {
 /// frames do not arm — a torn/hostile frame must not force the grace.
 fn is_sched_exit_frame(msg: &crate::vmm::bulk::BulkMessage) -> bool {
     msg.crc_ok && msg.msg_type == crate::vmm::wire::MSG_TYPE_SCHED_EXIT
+}
+
+/// True iff `msg` is the guest's ordered teardown barrier. The empty
+/// payload and CRC gates must both hold before the coordinator promotes
+/// Teardown or acknowledges the fence; otherwise a torn or hostile frame
+/// could make the guest enter its intentional infinite wedge before the
+/// verdict stream is durable in host memory.
+fn is_teardown_barrier_frame(msg: &crate::vmm::bulk::BulkMessage) -> bool {
+    msg.crc_ok
+        && msg.payload.is_empty()
+        && msg.msg_type == crate::vmm::wire::MSG_TYPE_TEARDOWN_BARRIER
 }
 
 /// True iff `msg` is a crc-valid guest stdout frame carrying the
@@ -5756,6 +5768,10 @@ impl KtstrVm {
                                     // discipline as the prior code.
                                     let mut bucket: Vec<crate::vmm::wire::ShmEntry> =
                                         Vec::new();
+                                    let teardown_barrier_pending = drained
+                                        .messages
+                                        .iter()
+                                        .any(is_teardown_barrier_frame);
                                     let mut sinks = BulkDispatchSinks {
                                         kill: &freeze_coord_kill,
                                         kill_evt: &freeze_coord_kill_evt,
@@ -5918,6 +5934,19 @@ impl KtstrVm {
                                         let mut buf = freeze_coord_bulk_messages_for_closure
                                             .lock_unpoisoned();
                                         buf.extend(bucket);
+                                    }
+                                    // The barrier reply is an ordered
+                                    // durability acknowledgement, not merely
+                                    // a virtqueue receipt. Queue it only after
+                                    // dispatch has promoted Teardown AND the
+                                    // verdict-bearing entries preceding the
+                                    // barrier in this byte stream have been
+                                    // copied into the run-wide bucket.
+                                    if teardown_barrier_pending {
+                                        let ack = frame_teardown_barrier_ack();
+                                        freeze_coord_virtio_con
+                                            .lock()
+                                            .queue_input_port1(&ack);
                                     }
                                 }
                                 _ => {}
@@ -16306,11 +16335,13 @@ mod wprof_grace_tests {
     //! rendezvous), and [`wprof_grace_should_kill`] (the bounded deadline
     //! backstop).
     use super::{
-        WprofShipState, is_probe_output_end_frame, is_sched_exit_frame, is_wprof_ship_frame,
-        wprof_grace_should_kill,
+        WprofShipState, is_probe_output_end_frame, is_sched_exit_frame, is_teardown_barrier_frame,
+        is_wprof_ship_frame, wprof_grace_should_kill,
     };
     use crate::vmm::bulk::BulkMessage;
-    use crate::vmm::wire::{MSG_TYPE_SCHED_EXIT, MSG_TYPE_STDOUT, MSG_TYPE_WPROF_TRACE};
+    use crate::vmm::wire::{
+        MSG_TYPE_SCHED_EXIT, MSG_TYPE_STDOUT, MSG_TYPE_TEARDOWN_BARRIER, MSG_TYPE_WPROF_TRACE,
+    };
     use std::time::{Duration, Instant};
 
     fn frame(msg_type: u32, payload: &[u8], crc_ok: bool) -> BulkMessage {
@@ -16355,6 +16386,30 @@ mod wprof_grace_tests {
             !is_sched_exit_frame(&frame(MSG_TYPE_WPROF_TRACE, b"pb", true)),
             "a WprofTrace is not a SCHED_EXIT"
         );
+    }
+
+    #[test]
+    fn teardown_barrier_accepts_only_crc_valid_empty_request() {
+        assert!(is_teardown_barrier_frame(&frame(
+            MSG_TYPE_TEARDOWN_BARRIER,
+            b"",
+            true
+        )));
+        assert!(!is_teardown_barrier_frame(&frame(
+            MSG_TYPE_TEARDOWN_BARRIER,
+            b"",
+            false
+        )));
+        assert!(!is_teardown_barrier_frame(&frame(
+            MSG_TYPE_TEARDOWN_BARRIER,
+            b"smuggled",
+            true
+        )));
+        assert!(!is_teardown_barrier_frame(&frame(
+            MSG_TYPE_SCHED_EXIT,
+            b"",
+            true
+        )));
     }
 
     #[test]

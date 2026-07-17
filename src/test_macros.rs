@@ -146,11 +146,11 @@ mod tests {
     };
 
     /// A ResourceContention — wrapped in `.context(...)` or not — is a
-    /// RETRYABLE FAILURE, not a skip: the run path already waited the
-    /// holder out (the acquisition queue's progress-based patience,
-    /// `ACQUIRE_NO_PROGRESS_PATIENCE`), so a residual contention
-    /// must panic here (nextest re-runs the test), never silently green
-    /// the cell as a skip. Chain-awareness still matters: the classifier
+    /// RETRYABLE FAILURE, not a skip. Queue-based lock acquisition
+    /// waits for authoritative release; `ResourceContention` still
+    /// covers transient host-resource syscall failures and must panic
+    /// here (nextest re-runs the test), never silently green the cell
+    /// as a skip. Chain-awareness still matters: the classifier
     /// must find the typed error under the context layers and produce
     /// the transient-contention Fail wording, not fall into the
     /// NotHostClass catch-all.
