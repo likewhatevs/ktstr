@@ -110,6 +110,10 @@ required; every other key is optional.
   (exact versions, inclusive ranges, paths, git specs); empty means
   no filter. Match semantics live in
   [BPF Verifier Sweep](../running-tests/verifier.md).
+- `verifier_exclude_topologies = ["240cpu-15llc-nosmt"]` — removes
+  exact preset names only from this scheduler's verifier matrix when a
+  topology is irrelevant or unsupported. It does not change ordinary
+  tests or gauntlet variants.
 
 ### Manual definition {#manual-definition}
 

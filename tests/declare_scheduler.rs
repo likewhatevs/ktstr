@@ -39,6 +39,11 @@ fn minimal_expansion_emits_scheduler() {
         SchedulerSpec::Discover("scx-ktstr")
     ));
     assert!(DECLARE_SCHEDULER_MINIMAL.kernels.is_empty());
+    assert!(
+        DECLARE_SCHEDULER_MINIMAL
+            .verifier_exclude_topologies
+            .is_empty()
+    );
     assert!(DECLARE_SCHEDULER_MINIMAL.sched_args.is_empty());
     assert!(DECLARE_SCHEDULER_MINIMAL.sysctls.is_empty());
     assert!(DECLARE_SCHEDULER_MINIMAL.kargs.is_empty());
@@ -52,6 +57,7 @@ declare_scheduler!(DECLARE_SCHEDULER_FULL, {
     binary = "scx-full",
     sched_args = ["--a", "--b"],
     kernels = ["6.14", "7.0..7.2"],
+    verifier_exclude_topologies = ["240cpu-15llc-smt2", "240cpu-15llc-nosmt"],
     cgroup_parent = "/declare_scheduler_full",
     kargs = ["nosmt"],
     sysctls = [Sysctl::new("kernel.k", "v")],
@@ -70,6 +76,10 @@ fn full_field_set_roundtrips() {
     assert_eq!(DECLARE_SCHEDULER_FULL.name, "declare_scheduler_full");
     assert_eq!(DECLARE_SCHEDULER_FULL.sched_args, &["--a", "--b"]);
     assert_eq!(DECLARE_SCHEDULER_FULL.kernels, &["6.14", "7.0..7.2"]);
+    assert_eq!(
+        DECLARE_SCHEDULER_FULL.verifier_exclude_topologies,
+        &["240cpu-15llc-smt2", "240cpu-15llc-nosmt"],
+    );
     assert_eq!(DECLARE_SCHEDULER_FULL.kargs, &["nosmt"]);
     assert_eq!(DECLARE_SCHEDULER_FULL.sysctls.len(), 1);
     assert_eq!(DECLARE_SCHEDULER_FULL.sysctls[0].key(), "kernel.k");
@@ -629,6 +639,10 @@ fn scheduler_json_serde_roundtrip() {
     );
     assert_eq!(back.sched_args, vec!["--a", "--b"]);
     assert_eq!(back.kernels, vec!["6.14", "7.0..7.2"]);
+    assert_eq!(
+        back.verifier_exclude_topologies,
+        vec!["240cpu-15llc-smt2", "240cpu-15llc-nosmt"],
+    );
     assert_eq!(back.constraints.min_llcs, 1);
     assert_eq!(back.constraints.max_llcs, Some(8));
     assert_eq!(back.constraints.max_cpus, Some(64));
@@ -639,6 +653,19 @@ fn scheduler_json_serde_roundtrip() {
     assert_eq!(back.topology.num_llcs, 2);
     assert_eq!(back.topology.cores_per_llc, 4);
     assert_eq!(back.topology.threads_per_core, 1);
+}
+
+#[test]
+fn scheduler_json_old_payload_defaults_verifier_exclusions_empty() {
+    let mut value = serde_json::to_value(SchedulerJson::from_scheduler(&DECLARE_SCHEDULER_MINIMAL))
+        .expect("serialize SchedulerJson");
+    value
+        .as_object_mut()
+        .expect("SchedulerJson object")
+        .remove("verifier_exclude_topologies");
+    let back: SchedulerJson =
+        serde_json::from_value(value).expect("deserialize pre-exclusion SchedulerJson");
+    assert!(back.verifier_exclude_topologies.is_empty());
 }
 
 #[test]

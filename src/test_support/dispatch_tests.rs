@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::sync::MutexExt;
+use crate::test_support::Scheduler;
 
 // ---------------------------------------------------------------
 // is_test_sentinel — convention-based sentinel-name predicate
@@ -2875,6 +2876,43 @@ fn list_tests_budget_valid_routes_to_budget_lister() {
 // ---------------------------------------------------------------
 // list_verifier_cells_all — empty / scheduler-free kernel list
 // ---------------------------------------------------------------
+
+#[test]
+fn verifier_named_topology_exclusion_does_not_change_gauntlet_constraints() {
+    let presets = crate::gauntlet::gauntlet_presets();
+    let excluded = presets
+        .iter()
+        .find(|p| p.name == "medium-4llc-nosmt")
+        .expect("named verifier exclusion fixture preset");
+    let retained = presets
+        .iter()
+        .find(|p| p.name == "medium-8llc-nosmt")
+        .expect("retained verifier fixture preset");
+    let sched = Scheduler::named("verifier_exclusion_fixture")
+        .verifier_exclude_topologies(&["medium-4llc-nosmt"]);
+
+    assert!(
+        sched.constraints.accepts_verifier(&excluded.topology),
+        "the structural verifier constraints must still accept the preset",
+    );
+    assert!(
+        !scheduler_accepts_verifier_preset(&sched, excluded),
+        "the named verifier exception must suppress exactly that cell",
+    );
+    assert!(
+        scheduler_accepts_verifier_preset(&sched, retained),
+        "unlisted verifier topologies must remain eligible",
+    );
+    assert!(
+        sched.constraints.accepts(
+            &excluded.topology,
+            excluded.topology.total_cpus(),
+            excluded.topology.num_llcs(),
+            excluded.topology.cores_per_llc * excluded.topology.threads_per_core,
+        ),
+        "the verifier-only exclusion must not alter ordinary gauntlet constraints",
+    );
+}
 
 /// With KTSTR_KERNEL_LIST unset, `list_verifier_cells_all` returns
 /// immediately and emits nothing. Pins the

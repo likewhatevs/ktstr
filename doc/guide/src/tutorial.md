@@ -113,7 +113,8 @@ Other commonly used fields: `topology = (numa, llcs, cores,
 threads)` sets a default VM topology that per-test attributes can
 override; `sched_args = ["--flag"]` prepends CLI args to every test
 using this scheduler; `kernels = [...]` lists kernel specs for the
-verifier sweep. For the full surface (`sysctls`, `kargs`,
+verifier sweep; `verifier_exclude_topologies = ["preset"]` removes
+named topology exceptions from that sweep only. For the full surface (`sysctls`, `kargs`,
 `config_file`, gauntlet constraints, scheduler-level assertion
 overrides) and the manual-builder path for programmatic composition,
 see [Scheduler Definitions](writing-tests/scheduler-definitions.md).

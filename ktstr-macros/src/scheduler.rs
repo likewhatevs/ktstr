@@ -125,6 +125,8 @@ pub(crate) fn declare_scheduler_inner(
     let mut sched_kargs_set = false;
     let mut sched_kernels: Vec<String> = Vec::new();
     let mut sched_kernels_set = false;
+    let mut sched_verifier_exclude_topologies: Vec<String> = Vec::new();
+    let mut sched_verifier_exclude_topologies_set = false;
     let mut sched_constraints: Option<syn::Expr> = None;
     let mut sched_config_file: Option<String> = None;
     let mut sched_assert: Option<syn::Expr> = None;
@@ -403,6 +405,34 @@ pub(crate) fn declare_scheduler_inner(
                     sched_kernels.push(s);
                 }
             }
+            "verifier_exclude_topologies" => {
+                sched_verifier_exclude_topologies_set = true;
+                let arr = expect_array(&value, &key, "verifier_exclude_topologies")?;
+                for elem in &arr.elems {
+                    let preset = expect_str_lit_element(elem, "verifier_exclude_topologies")?;
+                    check_visible_lit(&preset, elem, "verifier_exclude_topologies entry")?;
+                    if preset.contains('/') {
+                        return Err(syn::Error::new_spanned(
+                            elem,
+                            format!(
+                                "declare_scheduler!: verifier topology preset \
+                                 `{preset}` must not contain `/` because verifier \
+                                 cell names use `/` as a path separator"
+                            ),
+                        ));
+                    }
+                    if sched_verifier_exclude_topologies.contains(&preset) {
+                        return Err(syn::Error::new_spanned(
+                            elem,
+                            format!(
+                                "declare_scheduler!: duplicate \
+                                 `verifier_exclude_topologies` entry `{preset}`"
+                            ),
+                        ));
+                    }
+                    sched_verifier_exclude_topologies.push(preset);
+                }
+            }
             "constraints" => {
                 // `constraints` lands in a `pub static`, so the
                 // expression must be const-evaluable. Reject the
@@ -673,6 +703,13 @@ pub(crate) fn declare_scheduler_inner(
     }
     if sched_kernels_set {
         builder_chain = quote! { #builder_chain.kernels(&[#(#sched_kernels),*]) };
+    }
+    if sched_verifier_exclude_topologies_set {
+        builder_chain = quote! {
+            #builder_chain.verifier_exclude_topologies(
+                &[#(#sched_verifier_exclude_topologies),*]
+            )
+        };
     }
     if let Some(tc) = &sched_constraints {
         builder_chain = quote! { #builder_chain.constraints(#tc) };

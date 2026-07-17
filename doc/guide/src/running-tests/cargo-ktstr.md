@@ -176,7 +176,7 @@ gates and dashboards can triage runs:
 | Code | Verdict | Meaning |
 |------|---------|---------|
 | `0` | Pass / Skip | Assertions passed, or the test never ran (host too small, perf mode unavailable). Skips degrade to pass unless `--no-skip-mode`. |
-| `1` | Fail | An assertion failed; transient resource contention that made zero progress for the whole patience window (a wedged peer; retryable — nextest re-runs it); an operator `--cpu-cap` the host cannot satisfy; a skip under `--no-skip-mode`; or `expect_err = true` and the test passed. |
+| `1` | Fail | An assertion failed; a retryable transient host-resource failure; an operator `--cpu-cap` the host cannot satisfy; a skip under `--no-skip-mode`; or `expect_err = true` and the test passed. |
 | `2` | Inconclusive | A zero-denominator ratio gate could not evaluate — the workload produced no signal to ratio against. |
 
 Exit code `2` is the silent-pass guard: a Pass at a `≤ threshold`

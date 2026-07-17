@@ -13,16 +13,14 @@
 #  - slow-timeout rails for lock-taking cells must exceed the FULL
 #    suite drain, not one cell's runtime, because the deepest-queued
 #    cell's wall approaches the whole makespan. The in-cell progress
-#    watchdog is the real hang detector and the queue's progress-based
-#    patience is the wedged-holder detector, so nextest terminate-after
-#    is a rail of LAST RESORT and generosity costs little detection
-#    quality. See the vm-cell override block below for the sizing
-#    derivation.
-#  - A ResourceContention that surfaces to nextest is a RETRYABLE
-#    failure (only a no-progress patience expiry — a wedged holder —
-#    produces one), never a skip; these retries re-run it, alongside
-#    the true transient flakes, which typically resolve by retry 2-3.
-#    max-delay keeps the per-failure budget tight.
+#    watchdog owns guest-lifecycle detection; nextest terminate-after
+#    owns the process-lifecycle final rail. The lock queue does not
+#    guess that a healthy holder is wedged from wall time. See the
+#    vm-cell override block below for the sizing derivation.
+#  - ResourceContention from transient host syscalls is a RETRYABLE
+#    failure, never a skip; these retries re-run it alongside the true
+#    transient flakes, which typically resolve by retry 2-3. max-delay
+#    keeps the per-failure budget tight.
 #
 # test-threads = 16 caps parallelism well below `num-cpus` on
 # high-core dev boxes so VM-pinning,

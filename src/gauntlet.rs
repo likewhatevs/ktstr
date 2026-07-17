@@ -37,9 +37,9 @@ pub struct TopoPreset {
 /// Topology presets used by gauntlet mode.
 ///
 /// Covers topologies from `tiny-1llc` (4 CPUs) up through the
-/// `max-cpu` / `max-cpu-nosmt` presets (252 CPUs, near the KVM
-/// vCPU limit), plus `uneven-11llc` (192 CPUs across 11 NON-uniform
-/// LLCs), spanning SMT, non-SMT (`-nosmt`), and multi-NUMA
+/// `252cpu-14llc-smt2` / `252cpu-14llc-nosmt` presets (252 CPUs,
+/// near the KVM vCPU limit), plus `uneven-11llc` (192 CPUs across 11
+/// NON-uniform LLCs), spanning SMT, non-SMT (`-nosmt`), and multi-NUMA
 /// (`numa2-*`, `numa4-*`) families. The stock presets are built from
 /// the `defs` / `numa_defs` tuple tables; `uneven-11llc` is appended
 /// explicitly because it carries per-LLC core counts and a forced CPU
@@ -80,22 +80,22 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
         ("large-4llc", "128 CPUs, 4 LLCs", 4, 16, 2, 2048),
         ("large-8llc", "128 CPUs, 8 LLCs", 8, 8, 2, 2048),
         (
-            "near-max-llc",
-            "240 CPUs, 15 LLCs (near max)",
+            "240cpu-15llc-smt2",
+            "240 CPUs, 15 LLCs with SMT",
             15,
             8,
             2,
             2048,
         ),
         (
-            "max-cpu",
+            "252cpu-14llc-smt2",
             "252 CPUs, 14 LLCs (near KVM vCPU limit)",
             14,
             9,
             2,
             4096,
         ),
-        // Non-SMT medium/large/max presets for ARM64 coverage.
+        // Non-SMT medium/large/scale presets for ARM64 coverage.
         // These also run on x86_64 to test non-SMT topologies at scale.
         (
             "medium-4llc-nosmt",
@@ -130,7 +130,7 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
             2048,
         ),
         (
-            "near-max-llc-nosmt",
+            "240cpu-15llc-nosmt",
             "240 CPUs, 15 LLCs (no SMT)",
             15,
             16,
@@ -138,7 +138,7 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
             2048,
         ),
         (
-            "max-cpu-nosmt",
+            "252cpu-14llc-nosmt",
             "252 CPUs, 14 LLCs (no SMT, near KVM vCPU limit)",
             14,
             18,
@@ -347,17 +347,17 @@ mod tests {
             #[cfg(not(target_arch = "aarch64"))]
             ("large-8llc", 8, 128),
             #[cfg(not(target_arch = "aarch64"))]
-            ("near-max-llc", 15, 240),
+            ("240cpu-15llc-smt2", 15, 240),
             #[cfg(not(target_arch = "aarch64"))]
-            ("max-cpu", 14, 252),
+            ("252cpu-14llc-smt2", 14, 252),
             #[cfg(not(target_arch = "aarch64"))]
             ("uneven-11llc", 11, 192),
             ("medium-4llc-nosmt", 4, 32),
             ("medium-8llc-nosmt", 8, 64),
             ("large-4llc-nosmt", 4, 128),
             ("large-8llc-nosmt", 8, 128),
-            ("near-max-llc-nosmt", 15, 240),
-            ("max-cpu-nosmt", 14, 252),
+            ("240cpu-15llc-nosmt", 15, 240),
+            ("252cpu-14llc-nosmt", 14, 252),
             ("numa2-4llc", 4, 16),
             #[cfg(not(target_arch = "aarch64"))]
             ("numa2-2llc", 2, 32),
@@ -405,15 +405,15 @@ mod tests {
     }
 
     #[test]
-    fn gauntlet_presets_max_cpu_near_limit() {
+    fn gauntlet_presets_252_cpu_near_limit() {
         let presets = gauntlet_presets();
         let max_presets: Vec<_> = presets
             .iter()
-            .filter(|p| p.name.starts_with("max-cpu"))
+            .filter(|p| p.name.starts_with("252cpu-14llc-"))
             .collect();
         assert!(
             !max_presets.is_empty(),
-            "at least one max-cpu preset must exist"
+            "at least one 252cpu-14llc preset must exist"
         );
         for p in &max_presets {
             let cpus = p.topology.total_cpus();

@@ -329,6 +329,29 @@ verifies, and exits (no timing or perf assertions):
   progress watchdog's deadman scales with vCPU count, and forced-budget
   shapes make deep overcommit the deliberately-exercised path.
 
+For an exact topology exception that would be awkward or over-broad as
+a min/max constraint, exclude the preset by name on the scheduler
+declaration:
+
+```rust,ignore
+use ktstr::declare_scheduler;
+
+declare_scheduler!(MY_SCHED, {
+    name = "my_sched",
+    binary = "scx_my_sched",
+    verifier_exclude_topologies = [
+        "240cpu-15llc-smt2",
+        "240cpu-15llc-nosmt",
+    ],
+});
+```
+
+The exclusion removes only `verifier/<scheduler>/<kernel>/<preset>`
+cells. It does not affect ordinary `#[ktstr_test]` execution or
+gauntlet variants. Individual `#[ktstr_test]` functions do not
+participate in the verifier matrix in the first place; verifier cells
+come from `declare_scheduler!` registrations.
+
 Two catalog shapes exist mainly for this wider battery: `numa2-2llc`
 (2 nodes, one LLC each, SMT) and `uneven-11llc` — 192 vCPUs across
 **non-uniform** LLCs (ten of 18 CPUs, one of 12) that breaks per-LLC

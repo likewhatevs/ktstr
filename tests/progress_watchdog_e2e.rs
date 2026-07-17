@@ -46,8 +46,13 @@
 //! scheduler's `kargs`; at the end of guest teardown (background threads
 //! stopped, `send_exit` not yet sent) the guest advances the host stage to
 //! Teardown via `ScenarioEnd` — a milestone, anchoring the in-phase deltas
-//! at the wedge start — and then sleeps or spins FOREVER. The watchdog is
-//! what ends the VM.
+//! at the wedge start — then waits for an ordered host acknowledgement on
+//! the same bulk stream. The acknowledgement is sent only after the host
+//! has persisted the earlier PASS result and promoted Teardown; without
+//! that fence, an immediate single-vCPU spin can outrun virtio-console
+//! consumption and leave Tier-1 structurally disabled in Body. Only after
+//! the acknowledgement does the guest sleep or spin FOREVER. The watchdog
+//! is what ends the VM.
 //!
 //! The body publishes `AssertResult::pass()` BEFORE the wedge, so the
 //! host's parse-success arm records a passing base verdict (`timed_out`
@@ -155,8 +160,9 @@ const TEARDOWN_SPIN_WIDE_SCHED: Scheduler =
 /// is INFRA too, with its own backstop) reads as environmental SKIP
 /// rather than a false proof that the injected Teardown wedge was
 /// detected. A starved run can also leave the final ledger phase below
-/// Teardown when the kill outran the host's consumption of the guest's
-/// Teardown frame — likewise a non-verdict, not a regression.
+/// Teardown when the pre-wedge deadman outran the ordered barrier
+/// round-trip; the guest refuses to enter the wedge without that
+/// acknowledgement, so this is likewise a non-verdict, not a regression.
 fn assert_wedge_kill_mechanism(
     result: &VmResult,
     expected: WatchdogKillReason,

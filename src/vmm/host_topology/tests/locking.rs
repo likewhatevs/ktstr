@@ -628,49 +628,6 @@ fn resource_lock_wait_acquires_after_peer_release() {
     releaser.join().expect("releaser thread must not panic");
 }
 
-/// Progress-based patience is honoured: with the peer's `LOCK_EX`
-/// never released (a "wedged holder"), the head gains nothing, its
-/// no-progress patience (overridden short for the test) expires, and
-/// the acquire returns `Unavailable` (which the run path surfaces as
-/// retryable contention) — it neither bails early nor parks forever.
-/// Timing floor pins that it actually waited through the window.
-#[test]
-fn resource_lock_wait_patience_expiry_returns_unavailable() {
-    let _prefixes = LockPrefixesGuard::new();
-    super::super::protocol::PATIENCE_OVERRIDE.with(|p| {
-        *p.borrow_mut() = Some(std::time::Duration::from_millis(400));
-    });
-    let plan = PinningPlan {
-        assignments: vec![(0, 90800)],
-        service_cpu: None,
-        llc_indices: vec![90800],
-        locks: Vec::new(),
-    };
-    let lock_path = llc_lock_path(90800);
-    let _holder = try_flock(&lock_path, FlockMode::Exclusive)
-        .unwrap()
-        .expect("peer EX must acquire on clean pool");
-    let start = std::time::Instant::now();
-    let outcome =
-        acquire_resource_locks_waiting(&plan, &[90800usize], LlcLockMode::Exclusive, true).unwrap();
-    let elapsed = start.elapsed();
-    super::super::protocol::PATIENCE_OVERRIDE.with(|p| *p.borrow_mut() = None);
-    let reason = expect_unavailable(outcome, Some("with the peer never releasing"));
-    assert!(
-        reason.contains("90800"),
-        "reason should identify the stalled lock: {reason}",
-    );
-    assert!(
-        reason.contains("no acquisition progress"),
-        "reason must frame the bail as a no-progress verdict, not a \
-         wall deadline: {reason}",
-    );
-    assert!(
-        elapsed >= std::time::Duration::from_millis(350),
-        "acquire must wait out the patience window, not bail early; elapsed={elapsed:?}",
-    );
-}
-
 /// The full `acquire_llc_plan` pipeline waits out a REAL `LOCK_EX`
 /// holder when given a wait deadline: with the only LLC held EX (the
 /// exact shape of a colocated peer runner's perf-mode reservation) and

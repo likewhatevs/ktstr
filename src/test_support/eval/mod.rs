@@ -1514,6 +1514,8 @@ fn run_ktstr_test_inner_impl(
                 Some(crate::vmm::wire::MsgType::SnapshotRequest)
                 | Some(crate::vmm::wire::MsgType::KernelOpRequest)
                 | Some(crate::vmm::wire::MsgType::KernelOpReply)
+                | Some(crate::vmm::wire::MsgType::TeardownBarrier)
+                | Some(crate::vmm::wire::MsgType::TeardownBarrierAck)
                 | Some(crate::vmm::wire::MsgType::SysRdy)
                 | Some(crate::vmm::wire::MsgType::BpfMapWriteReady)
                 | Some(crate::vmm::wire::MsgType::SchedSwapNotify) => {}

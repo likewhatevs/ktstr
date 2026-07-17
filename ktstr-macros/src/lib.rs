@@ -274,6 +274,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     cgroup_parent = "/ktstr",
 ///     sched_args = ["--exit-dump-len", "1048576"],
 ///     kernels = ["6.14", "7.0..=7.2"],
+///     verifier_exclude_topologies = ["240cpu-15llc-nosmt"],
 ///     constraints = TopologyConstraints {
 ///         min_llcs: 1, max_llcs: Some(8), max_cpus: Some(64),
 ///         ..TopologyConstraints::DEFAULT
@@ -337,6 +338,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// | `sysctls = [Sysctl::new("k", "v"), ..]` | no | Guest sysctls. |
 /// | `kargs = [..]` | no | Extra guest kernel cmdline args. |
 /// | `kernels = ["6.14", "7.0..=7.2", ..]` | no | Kernel specs the verifier sweeps. Same parser as the `--kernel` CLI flag — accepts exact versions, ranges (`..` or `..=`, both inclusive), git refs (`git+URL#tag=NAME`), paths, and cache keys. Each entry is validated at macro-expand time via the same `KernelId::parse` + `validate` the verifier uses at runtime; empty entries, inverted ranges, and `..`-containing strings whose endpoints aren't version-shaped (e.g. `"abc..def"`) are rejected. |
+/// | `verifier_exclude_topologies = ["preset", ..]` | no | Exact gauntlet preset names omitted only from this scheduler's verifier matrix. Use for named topology exceptions that cannot be expressed without over-broad min/max constraints. Ordinary tests and gauntlet variants are unchanged. Empty means no exclusions; empty, duplicate, and `/`-containing entries are rejected at macro-expand time. |
 /// | `constraints = TopologyConstraints { .. }` | no | Gauntlet preset constraints — maps directly onto `Scheduler::constraints`. Filters which gauntlet topology presets exercise this scheduler. When given as a struct literal, the macro additionally cross-checks each literal field against the effective topology (explicit `topology` field if present, otherwise the `(1, 1, 2, 1)` default from `Scheduler::named`) and rejects infeasible pairings; non-struct-literal forms (e.g. `OTHER::CONST_CONSTRAINTS`) skip that check. |
 /// | `assert = Assert::NO_OVERRIDES.method().chain()` | no | Scheduler-wide assertion overrides — maps directly onto `Scheduler::assert`. Merged with `Assert::default_checks()` and the per-test `assert` at runtime (`default ← scheduler ← per-test`). Accepts any const-evaluable expression: a const path like `Assert::NO_OVERRIDES`, a const-fn call like `Assert::default_checks()`, or a chain of const-fn setters like `Assert::NO_OVERRIDES.check_not_stuck().max_gap_ms(50)`. The macro accepts MethodCall chains and Path-rooted (type/module-prefixed) Calls — only bare single-segment lowercase Calls like `helper()` are rejected as non-const free-fn patterns; non-const methods on a Path receiver slip through and surface as a deep const-eval failure at the spread site. |
 /// | `config_file = "..."` | no | Host-side config file path. |
@@ -1274,6 +1276,39 @@ mod tests {
         assert!(
             err.to_string().contains("appears twice"),
             "expected pairwise-dupe diagnostic, got: {err}"
+        );
+    }
+
+    #[test]
+    fn declare_scheduler_rejects_duplicate_verifier_topology_exclusions() {
+        let err = scheduler::declare_scheduler_inner(quote! {
+            TEST_SCHED, {
+                name = "test_sched",
+                binary = "scx_test",
+                verifier_exclude_topologies = ["tiny-1llc", "tiny-1llc"],
+            }
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("duplicate `verifier_exclude_topologies` entry `tiny-1llc`"),
+            "unexpected diagnostic: {err}",
+        );
+    }
+
+    #[test]
+    fn declare_scheduler_rejects_slash_in_verifier_topology_exclusion() {
+        let err = scheduler::declare_scheduler_inner(quote! {
+            TEST_SCHED, {
+                name = "test_sched",
+                binary = "scx_test",
+                verifier_exclude_topologies = ["tiny/1llc"],
+            }
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("must not contain `/`"),
+            "unexpected diagnostic: {err}",
         );
     }
 }

@@ -7,14 +7,15 @@
 //! [`crate::vmm::wire::ShmEntry`] for the run-wide bucket or `None`
 //! for a frame whose only dispatch effect is on `sinks`. The
 //! `None`-returning arms (no bucket entry) are `SysRdy` (fire-once
-//! sys-rdy eventfd), `SchedSwapNotify` (periodic-capture +
+//! sys-rdy eventfd), `TeardownBarrier` (ordered stream fence +
+//! Teardown promotion), `SchedSwapNotify` (periodic-capture +
 //! watchpoint-invalidation latch), `KERN_ADDRS` (phys-base / KASLR
 //! stores + eventfds), and `SnapshotRequest` / `KernelOpRequest`
 //! (decode-and-stash of a request payload). Several arms return
 //! `Some` AND stamp `sinks`: `SchedExit` (`kill` flag + eventfd,
 //! bucketed only when `crc_ok`), `ScenarioStart` (scenario anchor +
 //! watchdog reset), `ScenarioPause` / `ScenarioResume` (watchdog
-//! pause / cumulative-pause), `ScenarioEnd` (watchdog reset), and
+//! pause / cumulative-pause), `ScenarioEnd` (watchdog reset + Teardown), and
 //! `Stimulus` (host-side step-index mirror). For a variant without
 //! an explicit arm the catch-all consults
 //! [`crate::vmm::wire::MsgType::is_coordinator_internal`] — verbatim
@@ -336,6 +337,19 @@ fn arm_watchdog_reset(
         reset_ns.store(encoded, std::sync::atomic::Ordering::Release);
         reset_tag.store(tag as u8, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// Apply the host-side effects shared by `ScenarioEnd` and the
+/// ordered teardown barrier. The barrier repeats this promotion so its
+/// acknowledgement proves Teardown even if the immediately preceding
+/// `ScenarioEnd` write failed before reaching the host.
+fn promote_teardown(sinks: &BulkDispatchSinks<'_>) {
+    arm_watchdog_reset(
+        sinks,
+        sinks.run_start.elapsed(),
+        crate::vmm::freeze_coord::WatchdogResetTag::ScenarioStart,
+    );
+    advance_stage(sinks, crate::monitor::LifecycleStage::Teardown);
 }
 
 /// Apply the live-stage side effect of a `Lifecycle` frame: decode the
@@ -1049,21 +1063,6 @@ pub(super) fn dispatch_bulk_message(
             })
         }
         Some(crate::vmm::wire::MsgType::ScenarioEnd) => {
-            if msg.crc_ok
-                && let Some((reset_ns, duration, run_start, reset_tag)) =
-                    sinks.watchdog_reset.as_ref()
-            {
-                let elapsed = run_start.elapsed();
-                let target_ns = elapsed.as_nanos().saturating_add(duration.as_nanos());
-                let encoded = u64::try_from(target_ns).unwrap_or(u64::MAX).max(1);
-                reset_ns.store(encoded, std::sync::atomic::Ordering::Release);
-                // Same scenario-dispatch subsystem — stamp the tag so a
-                // scenario-end re-arm is not attributed to a stale writer.
-                reset_tag.store(
-                    crate::vmm::freeze_coord::WatchdogResetTag::ScenarioStart as u8,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            }
             // →Teardown: the scenario ended; the guest is winding down.
             // Hoisted OUT of the watchdog_reset gate above so it fires
             // even when no workload-duration budget was wired. Forward-
@@ -1075,13 +1074,22 @@ pub(super) fn dispatch_bulk_message(
                 {
                     recorder.record_guest_body_elapsed_ms(elapsed_ms);
                 }
-                advance_stage(sinks, crate::monitor::LifecycleStage::Teardown);
+                promote_teardown(sinks);
             }
             Some(crate::vmm::wire::ShmEntry {
                 msg_type: msg.msg_type,
                 payload: msg.payload.to_vec(),
                 crc_ok: msg.crc_ok,
             })
+        }
+        Some(crate::vmm::wire::MsgType::TeardownBarrier) => {
+            if super::is_teardown_barrier_frame(msg) {
+                promote_teardown(sinks);
+            }
+            // Coordinator-internal stream fence: the run-loop sends its
+            // host→guest acknowledgement only after the verdict bucket is
+            // persisted, so no entry is exposed to post-run consumers.
+            None
         }
         Some(crate::vmm::wire::MsgType::Stimulus) => {
             // Decode the published step_index into the host-side
@@ -1443,6 +1451,47 @@ mod stage_tests {
         s.dispatch(&lifecycle(LifecyclePhase::WorkloadDispatched, true));
         assert_eq!(s.phase(), LifecycleStage::Body as u8);
         s.dispatch(&frame(MsgType::ScenarioEnd.wire_value(), Vec::new(), true));
+        assert_eq!(s.phase(), LifecycleStage::Teardown as u8);
+    }
+
+    /// The ordered barrier is a coordinator-internal stream fence:
+    /// a valid empty frame promotes Teardown but never lands in the
+    /// verdict bucket. CRC-bad or non-empty shapes do neither, so the
+    /// run-loop cannot acknowledge a hostile/torn barrier.
+    #[test]
+    fn teardown_barrier_promotes_only_valid_empty_frame_and_never_buckets() {
+        let mut s = SinkState::new();
+        s.dispatch(&frame(
+            MsgType::ScenarioStart.wire_value(),
+            Vec::new(),
+            true,
+        ));
+        assert_eq!(s.phase(), LifecycleStage::Body as u8);
+
+        assert!(
+            s.dispatch(&frame(
+                MsgType::TeardownBarrier.wire_value(),
+                Vec::new(),
+                false,
+            ))
+            .is_none()
+        );
+        assert_eq!(s.phase(), LifecycleStage::Body as u8);
+
+        assert!(
+            s.dispatch(&frame(MsgType::TeardownBarrier.wire_value(), vec![1], true,))
+                .is_none()
+        );
+        assert_eq!(s.phase(), LifecycleStage::Body as u8);
+
+        assert!(
+            s.dispatch(&frame(
+                MsgType::TeardownBarrier.wire_value(),
+                Vec::new(),
+                true,
+            ))
+            .is_none()
+        );
         assert_eq!(s.phase(), LifecycleStage::Teardown as u8);
     }
 

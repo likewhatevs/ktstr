@@ -59,7 +59,12 @@ fn ap_gap_check_with_fault_injection() -> Result<(), String> {
 /// Teardown — a MILESTONE that re-anchors the monitor's per-vCPU
 /// max-in-phase tracker and stamps `wall_ns_at_progress` at the wedge
 /// start, so the in-phase deltas the tiers charge are exactly the wedge's
-/// own burn/wall. An empty-body
+/// own burn/wall. The guest then performs an ordered teardown-barrier
+/// round trip on the same bulk port. A successful virtio write only
+/// offers a descriptor; it does not prove host consumption. The barrier
+/// reply proves that the host has persisted the earlier PASS result and
+/// ScenarioEnd and has promoted Teardown before this function monopolizes
+/// the vCPU forever. An empty-body
 /// `#[ktstr_test]` otherwise sits in the Body stage (`send_scenario_start`
 /// fires unconditionally at dispatch), where both tiers are structurally
 /// off via the `u64::MAX` Body budgets. The advance is forward-only on the
@@ -83,10 +88,29 @@ fn maybe_inject_teardown_wedge_fault() {
     let Some(mode) = cmdline_val("KTSTR_FAULT_TEARDOWN_WEDGE") else {
         return;
     };
+    let mode = mode.trim();
+    if mode != "spin" && mode != "idle" {
+        eprintln!(
+            "ktstr-init: KTSTR_FAULT_TEARDOWN_WEDGE={mode:?} not \
+             recognized (expected \"spin\" or \"idle\"); ignoring"
+        );
+        return;
+    }
     // Force the host stage to Teardown (a milestone) so the wedge is
     // charged against the Teardown budgets from a fresh anchor.
     crate::vmm::guest_comms::send_scenario_end(0, 0);
-    match mode.trim() {
+    if let Err(e) = crate::vmm::guest_comms::send_teardown_barrier_and_wait() {
+        // Never enter the unbounded fault without proof that the host
+        // consumed the verdict and armed Teardown. Returning lets normal
+        // teardown publish Exit, producing a bounded, diagnostic failure
+        // instead of recreating the Body-stage immortal wedge.
+        eprintln!(
+            "ktstr-init: teardown-wedge barrier failed; refusing to enter \
+             {mode:?} wedge before host confirms Teardown: {e}"
+        );
+        return;
+    }
+    match mode {
         "spin" => {
             // Tier-1 shape: burn guest CPU forever in a loop the optimizer
             // cannot elide, so the per-vCPU CPU clocks genuinely accrue
@@ -106,14 +130,7 @@ fn maybe_inject_teardown_wedge_fault() {
                 std::thread::sleep(std::time::Duration::from_secs(60));
             }
         }
-        other => {
-            // Unknown mode: loud and inert — a typo'd fixture must fail on
-            // its own "expected timed_out" assertion, not silently wedge.
-            eprintln!(
-                "ktstr-init: KTSTR_FAULT_TEARDOWN_WEDGE={other:?} not \
-                 recognized (expected \"spin\" or \"idle\"); ignoring"
-            );
-        }
+        _ => unreachable!("mode validated before teardown barrier"),
     }
 }
 

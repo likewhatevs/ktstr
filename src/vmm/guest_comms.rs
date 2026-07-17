@@ -707,6 +707,71 @@ pub fn send_scenario_end(elapsed_ms: u64, total_iterations: u64) {
     write_msg(MsgType::ScenarioEnd.wire_value(), &payload);
 }
 
+/// Publish an ordered teardown barrier and wait for the host to
+/// acknowledge it over port 1 RX.
+///
+/// This is deliberately stronger than a successful [`write_msg`]:
+/// virtio-console returns once the guest has offered a descriptor, not
+/// once the host has consumed it. The progress-watchdog fault injector
+/// enters an infinite spin immediately after this call, so it needs proof
+/// that the coordinator has already persisted every earlier bulk frame
+/// (notably `TestResult` and `ScenarioEnd`) and promoted the lifecycle to
+/// Teardown. The host sends a zero-payload
+/// [`MsgType::TeardownBarrierAck`] only after those effects are complete.
+///
+/// Shares [`SNAPSHOT_REQUEST_LOCK`] with the other port-1 RPCs because
+/// their replies use the same O_RDWR file description and cannot be
+/// demultiplexed safely by concurrent readers.
+///
+/// Unlike ordinary request/reply RPCs, this rendezvous intentionally has no
+/// guest-side wall-clock deadline. Its caller is about to inject a watchdog
+/// fixture, and a wall deadline here would race the very host contention that
+/// the progress watchdog is designed to tolerate. The blocking virtio read
+/// consumes no guest CPU while the host coordinator is descheduled; the VM
+/// watchdog and nextest's outer rail remain the owners of lifecycle bounds.
+pub fn send_teardown_barrier_and_wait() -> Result<(), String> {
+    if !is_guest() {
+        return Err("send_teardown_barrier_and_wait called from host context \
+             (virtio-console port 1 is reachable only from inside the guest)"
+            .into());
+    }
+    let _rpc_guard = SNAPSHOT_REQUEST_LOCK.lock_unpoisoned();
+    if !write_msg(MsgType::TeardownBarrier.wire_value(), &[]) {
+        return Err("failed to publish TeardownBarrier on /dev/vport0p1".into());
+    }
+
+    let read_slot = BULK_PORT_FD.get_or_init(|| std::sync::Mutex::new(None));
+    let mut read_guard = read_slot.lock_unpoisoned();
+    if read_guard.is_none() {
+        match try_open_bulk_port() {
+            Some(f) => *read_guard = Some(f),
+            None => {
+                return Err(
+                    "/dev/vport0p1 not yet open (multiport handshake still in flight)".into(),
+                );
+            }
+        }
+    }
+    let f = read_guard
+        .as_mut()
+        .expect("bulk port handle just installed");
+    let (msg_type, payload) = match read_bulk_port_frame(f, 0, None) {
+        Ok(frame) => frame,
+        Err(e) => {
+            *read_guard = None;
+            return Err(format!("teardown barrier acknowledgement failed: {e}"));
+        }
+    };
+    if msg_type != MsgType::TeardownBarrierAck.wire_value() || !payload.is_empty() {
+        return Err(format!(
+            "unexpected teardown barrier reply: msg_type=0x{msg_type:08x}, \
+             payload_len={} (expected empty TDBA)",
+            payload.len()
+        ));
+    }
+    Ok(())
+}
+
 pub fn send_scenario_pause() {
     write_msg(MsgType::ScenarioPause.wire_value(), &[]);
 }
@@ -1384,10 +1449,11 @@ fn bounded_read_exact(
 /// `/dev/vport0p1`. Returns the parsed message type and payload on
 /// success.
 ///
-/// Reads the header with `bounded_read_exact`, decodes the length, then
-/// reads the payload with `bounded_read_exact`. On any I/O failure
-/// (premature EOF, EINTR, etc.) the cached handle is dropped so a
-/// subsequent call retries the open.
+/// When `deadline` is `Some`, reads the header and payload with
+/// [`bounded_read_exact`]. When it is `None`, uses the port's blocking
+/// read mode and lets the VM lifecycle watchdog own the bound. On any
+/// I/O failure (premature EOF, EINTR, etc.) the cached handle is
+/// dropped so a subsequent call retries the open.
 ///
 /// `max_payload_size` caps the payload allocation against a hostile
 /// or corrupted host that frames an oversized length. Callers pass
@@ -1400,10 +1466,23 @@ fn bounded_read_exact(
 fn read_bulk_port_frame(
     f: &mut std::fs::File,
     max_payload_size: usize,
-    deadline: std::time::Instant,
+    deadline: Option<std::time::Instant>,
 ) -> std::io::Result<(u32, Vec<u8>)> {
+    use std::io::Read;
+
+    fn read_exact(
+        f: &mut std::fs::File,
+        buf: &mut [u8],
+        deadline: Option<std::time::Instant>,
+    ) -> std::io::Result<()> {
+        match deadline {
+            Some(deadline) => bounded_read_exact(f, buf, deadline),
+            None => f.read_exact(buf),
+        }
+    }
+
     let mut header = [0u8; std::mem::size_of::<ShmMessage>()];
-    bounded_read_exact(f, &mut header, deadline)?;
+    read_exact(f, &mut header, deadline)?;
     let msg = ShmMessage::read_from_bytes(&header).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1422,7 +1501,7 @@ fn read_bulk_port_frame(
     }
     let mut payload = vec![0u8; length];
     if length > 0 {
-        bounded_read_exact(f, &mut payload, deadline)?;
+        read_exact(f, &mut payload, deadline)?;
     }
     let computed = crc32fast::hash(&payload);
     if computed != msg.crc32 {
@@ -1526,29 +1605,30 @@ pub fn request_snapshot(
                 ),
             };
         }
-        let frame =
-            match read_bulk_port_frame(f, std::mem::size_of::<SnapshotReplyPayload>(), deadline) {
-                Ok(frame) => frame,
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    return SnapshotRequestResult::TransportError {
-                        reason: format!(
-                            "snapshot reply deadline elapsed before frame complete \
+        let frame = match read_bulk_port_frame(
+            f,
+            std::mem::size_of::<SnapshotReplyPayload>(),
+            Some(deadline),
+        ) {
+            Ok(frame) => frame,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                return SnapshotRequestResult::TransportError {
+                    reason: format!(
+                        "snapshot reply deadline elapsed before frame complete \
                          (request_id={request_id}, kind={kind}): {e}"
-                        ),
-                    };
-                }
-                Err(e) => {
-                    // I/O error on the read fd — drop the cached
-                    // handle so the next call retries the open and
-                    // surface the failure to the caller.
-                    *read_guard = None;
-                    return SnapshotRequestResult::TransportError {
-                        reason: format!(
-                            "snapshot reply read failed (request_id={request_id}): {e}"
-                        ),
-                    };
-                }
-            };
+                    ),
+                };
+            }
+            Err(e) => {
+                // I/O error on the read fd — drop the cached
+                // handle so the next call retries the open and
+                // surface the failure to the caller.
+                *read_guard = None;
+                return SnapshotRequestResult::TransportError {
+                    reason: format!("snapshot reply read failed (request_id={request_id}): {e}"),
+                };
+            }
+        };
         let (msg_type, frame_payload) = frame;
         if msg_type != MSG_TYPE_SNAPSHOT_REPLY {
             tracing::warn!(
@@ -1718,7 +1798,7 @@ pub fn request_kernel_op(
                 ),
             };
         }
-        let frame = match read_bulk_port_frame(f, KERNEL_OP_REPLY_MAX, deadline) {
+        let frame = match read_bulk_port_frame(f, KERNEL_OP_REPLY_MAX, Some(deadline)) {
             Ok(frame) => frame,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                 return KernelOpRequestResult::TransportError {
@@ -1880,6 +1960,19 @@ mod tests {
     fn send_scenario_start_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
         assert_no_bulk_write("send_scenario_start", send_scenario_start);
+    }
+
+    /// The ordered teardown barrier is a guest-only RPC. Host context
+    /// must fail before touching the bulk-port writer or trying to wait
+    /// for a reply that can never arrive.
+    #[test]
+    fn teardown_barrier_from_host_context_is_rejected_without_write() {
+        let _g = IsGuestOverrideGuard::new(false);
+        assert_no_bulk_write("send_teardown_barrier_and_wait", || {
+            let err = send_teardown_barrier_and_wait()
+                .expect_err("host-context teardown barrier must be rejected");
+            assert!(err.contains("host context"), "unexpected error: {err}");
+        });
     }
 
     /// `send_sched_swap_notify` from host context suppresses the write.
@@ -2050,7 +2143,7 @@ mod tests {
         drop(write_end);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let err = read_bulk_port_frame(&mut read_end, 100, deadline)
+        let err = read_bulk_port_frame(&mut read_end, 100, Some(deadline))
             .expect_err("cap=100 must reject length=200");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         let msg = err.to_string();
@@ -2101,7 +2194,7 @@ mod tests {
         let err = read_bulk_port_frame(
             &mut read_end,
             std::mem::size_of::<SnapshotReplyPayload>(),
-            deadline,
+            Some(deadline),
         )
         .expect_err("oversized length must be rejected");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -2146,11 +2239,59 @@ mod tests {
         let (msg_type, body) = read_bulk_port_frame(
             &mut read_end,
             std::mem::size_of::<SnapshotReplyPayload>(),
-            deadline,
+            Some(deadline),
         )
         .expect("exact-size payload must succeed");
         assert_eq!(msg_type, MSG_TYPE_SNAPSHOT_REPLY);
         assert_eq!(body.len(), std::mem::size_of::<SnapshotReplyPayload>());
+    }
+
+    /// An ordered lifecycle fence has no local wall-clock deadline:
+    /// it must remain blocked until the host supplies the frame instead
+    /// of turning host descheduling into a transport timeout.
+    #[test]
+    fn read_bulk_port_frame_without_deadline_waits_for_host_frame() {
+        use std::io::Write;
+        use std::os::unix::io::FromRawFd;
+
+        let mut fds = [0i32; 2];
+        // SAFETY: standard pipe(2) call with a valid two-fd output array.
+        let r = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(r, 0, "pipe(2) failed: {}", std::io::Error::last_os_error());
+        // SAFETY: pipe(2) returned two owned descriptors; each transfers
+        // to exactly one File and is closed on drop.
+        let mut read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let mut write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = read_bulk_port_frame(&mut read_end, 0, None);
+            result_tx.send(result).expect("publish read result");
+        });
+
+        assert!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_millis(25))
+                .is_err(),
+            "no-deadline read returned before the host frame arrived"
+        );
+
+        let header = ShmMessage {
+            msg_type: MsgType::TeardownBarrierAck.wire_value(),
+            length: 0,
+            crc32: crc32fast::hash(&[]),
+            _pad: 0,
+        };
+        write_end.write_all(header.as_bytes()).expect("write ack");
+        drop(write_end);
+
+        let (msg_type, payload) = result_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("blocking reader did not wake for host frame")
+            .expect("read host frame");
+        reader.join().expect("reader thread panicked");
+        assert_eq!(msg_type, MsgType::TeardownBarrierAck.wire_value());
+        assert!(payload.is_empty());
     }
 
     #[test]

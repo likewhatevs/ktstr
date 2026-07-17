@@ -170,13 +170,14 @@ makes this work across disjoint invocations sharing one
   while any *other* free capacity stays fair game (work conservation:
   a small `LOCK_SH` cell never waits behind a hungry `LOCK_EX` head
   it doesn't overlap).
-- **Progress-based patience.** Waiting is bounded by *progress*, not
-  wall time: as long as the queue turns over (or the head gains
-  locks) a waiter keeps waiting — a cell deep in a busy-but-advancing
-  queue is fine. Only a no-progress window (a wedged holder,
-  genuinely pathological) surfaces a `ResourceContention` *failure*
-  that nextest retries — never a skip, because a skip is a pass
-  nextest does not retry, which silently costs coverage.
+- **Lifecycle-owned bounds.** The lock layer waits for the
+  authoritative flock release. It cannot infer that a live holder is
+  wedged from elapsed wall time: coverage instrumentation, host
+  preemption, and a legitimately long cell make that inference false.
+  A crash releases flocks in the kernel, the holder's VM watchdog
+  bounds guest progress, and nextest's slow-timeout is the final
+  process-lifecycle rail. One slow healthy holder therefore cannot
+  fail every waiter behind it.
 
 When the default path cannot map its topology 1:1 onto the host at
 all (no plan can exist — host too small), the run proceeds

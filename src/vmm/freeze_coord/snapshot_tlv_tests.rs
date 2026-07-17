@@ -10,9 +10,10 @@
 //! payload encode / decode boundary.
 use super::*;
 use crate::vmm::wire::{
-    FRAME_HEADER_SIZE, MSG_TYPE_SNAPSHOT_REPLY, SNAPSHOT_KIND_CAPTURE, SNAPSHOT_KIND_NONE,
-    SNAPSHOT_KIND_WATCH, SNAPSHOT_REASON_MAX, SNAPSHOT_STATUS_ERR, SNAPSHOT_STATUS_OK,
-    SNAPSHOT_TAG_MAX, ShmMessage, SnapshotReplyPayload, SnapshotRequestPayload,
+    FRAME_HEADER_SIZE, MSG_TYPE_SNAPSHOT_REPLY, MSG_TYPE_TEARDOWN_BARRIER_ACK,
+    SNAPSHOT_KIND_CAPTURE, SNAPSHOT_KIND_NONE, SNAPSHOT_KIND_WATCH, SNAPSHOT_REASON_MAX,
+    SNAPSHOT_STATUS_ERR, SNAPSHOT_STATUS_OK, SNAPSHOT_TAG_MAX, ShmMessage, SnapshotReplyPayload,
+    SnapshotRequestPayload,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -130,6 +131,19 @@ fn frame_reply_size_and_crc() {
     );
     let payload_bytes = &bytes[FRAME_HEADER_SIZE..];
     assert_eq!(header.crc32, crc32fast::hash(payload_bytes));
+}
+
+/// The teardown-barrier acknowledgement is an empty, CRC-valid TLV.
+/// The guest blocks on exactly this frame before entering the
+/// intentional infinite wedge.
+#[test]
+fn teardown_barrier_ack_is_empty_crc_valid_tlv() {
+    let bytes = frame_teardown_barrier_ack();
+    assert_eq!(bytes.len(), FRAME_HEADER_SIZE);
+    let header = ShmMessage::read_from_bytes(&bytes).expect("header decodes");
+    assert_eq!(header.msg_type, MSG_TYPE_TEARDOWN_BARRIER_ACK);
+    assert_eq!(header.length, 0);
+    assert_eq!(header.crc32, crc32fast::hash(&[]));
 }
 
 /// Reply payload round-trips through bytes — the request_id

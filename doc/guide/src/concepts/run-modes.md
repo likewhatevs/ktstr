@@ -124,9 +124,8 @@ exclusive per-CPU locks are what keep two default VMs from ever
 time-slicing the same host CPU. If a 1:1 candidate *maps* but every offset
 is busy, the run does not overcommit onto a peer's CPUs — it joins
 the lock-dir acquisition queue and, as head, re-probes every offset
-on each lock-dir wake (see the resource-budget page's queue section);
-only a zero-progress patience window yields a retryable
-`ResourceContention` failure that nextest re-runs.
+on each lock-dir wake until a candidate's authoritative flock release
+(see the resource-budget page's queue section).
 
 When no 1:1 plan can exist because the host is simply too small,
 the default path falls back to
@@ -138,7 +137,7 @@ run work, overcommit only when nothing else is possible — and the stamped
 `cpu_budget` in the sidecar drops below the vCPU count so an A/B against an
 overcommitted run is flagged, not silently confounded.
 
-<div class="kt-figure"><svg width="700" height="452" viewBox="0 0 700 452" role="img" aria-label="Default-mode run-lock decision walk. From run()'s acquire_default_run_locks: if the host topology was not cached (sysfs unreadable) the run goes straight to the overcommit fallback. Otherwise a per-offset candidate walk starts at a pid-windowed offset and wraps over max_slots: compute_pinning produces a 1:1 candidate for the offset; if it maps, the run takes a shared LLC flock plus an exclusive per-CPU flock — acquired means a 1:1 pinned run with the module-default halt-poll; a busy lock or an unmappable offset moves to the next offset. When all offsets are tried: if any offset produced a candidate the run queues and re-probes every offset on each lock-dir wake, failing with a retryable transient ResourceContention only if a zero-progress patience window expires (nextest re-runs it); if none could map, the run overcommits — vCPUs masked to the allowed cpuset, budget rewritten with a warning, halt-poll zero.">
+<div class="kt-figure"><svg width="700" height="452" viewBox="0 0 700 452" role="img" aria-label="Default-mode run-lock decision walk. From run()'s acquire_default_run_locks: if the host topology was not cached (sysfs unreadable) the run goes straight to the overcommit fallback. Otherwise a per-offset candidate walk starts at a pid-windowed offset and wraps over max_slots: compute_pinning produces a 1:1 candidate for the offset; if it maps, the run takes a shared LLC flock plus an exclusive per-CPU flock — acquired means a 1:1 pinned run with the module-default halt-poll; a busy lock or an unmappable offset moves to the next offset. When all offsets are tried: if any offset produced a candidate the run queues and re-probes every offset on each lock-dir wake until release, then runs pinned; if none could map, the run overcommits — vCPUs masked to the allowed cpuset, budget rewritten with a warning, halt-poll zero.">
   <defs><marker id="rm-arrA" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg)"/></marker></defs>
   <rect x="20" y="16" width="200" height="44" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.4"/>
   <text x="36" y="34" font-size="11" font-weight="700" fill="var(--fg)">default mode</text>
@@ -178,9 +177,10 @@ overcommitted run is flagged, not silently confounded.
   <text x="36" y="405" font-size="8.5" fill="var(--fg)" opacity=".8">each vCPU owns a host CPU</text>
   <text x="36" y="418" font-size="8.5" fill="var(--fg)" opacity=".8">halt-poll: module default</text>
   <rect x="250" y="370" width="200" height="64" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.4"/>
-  <text x="266" y="390" font-size="11" font-weight="700" fill="var(--fg)">ResourceContention</text>
-  <text x="266" y="405" font-size="8.5" fill="var(--fg)" opacity=".8">queue + re-plan on wake; fail</text>
-  <text x="266" y="418" font-size="8.5" fill="var(--fg)" opacity=".8">only on zero-progress patience</text>
+  <text x="266" y="390" font-size="11" font-weight="700" fill="var(--fg)">queued acquisition</text>
+  <text x="266" y="405" font-size="8.5" fill="var(--fg)" opacity=".8">re-plan on every lock-dir wake</text>
+  <text x="266" y="418" font-size="8.5" fill="var(--fg)" opacity=".8">wait for authoritative release</text>
+  <path d="M250 402 L 224 402" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#rm-arrA)"/>
   <rect x="480" y="370" width="200" height="64" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.4" stroke-dasharray="5 4"/>
   <text x="496" y="390" font-size="11" font-weight="700" fill="var(--fg)">overcommit fallback</text>
   <text x="496" y="404" font-size="8.5" fill="var(--fg)" opacity=".8">vCPUs masked to allowed cpuset</text>

@@ -14,8 +14,8 @@ use anyhow::{Context, Result};
 use crate::flock::{FlockMode, try_flock};
 
 // Cross-invocation acquisition protocol: the ticket queue, the head
-// license + claim visibility, the inotify wait, and progress-based
-// patience. See protocol.rs's module doc for the full model.
+// license + claim visibility, the inotify wait, and lifecycle-bound
+// blocking. See protocol.rs's module doc for the full model.
 pub(crate) mod protocol;
 
 /// Resource contention error — LLC slots or CPUs unavailable.
@@ -1060,12 +1060,11 @@ pub fn acquire_resource_locks(
 /// holding partials, waking on lock-dir inotify events as holders
 /// release, re-sweeping on every wake. This is the resource-budget
 /// model's contract — a budgeted / shared acquirer WAITS for an
-/// exclusive holder — with progress-based patience: waiting continues
-/// as long as the queue advances or the sweep gains locks, and only
-/// [`protocol::ACQUIRE_NO_PROGRESS_PATIENCE`] of ZERO progress (a
-/// wedged holder) yields `Unavailable`, which the run path surfaces
-/// as a RETRYABLE contention failure (nextest re-runs the cell) —
-/// never a silent "this host cannot run" skip.
+/// exclusive holder. It waits for the authoritative flock release;
+/// holder crashes are cleaned up by the kernel, while the holder's VM
+/// watchdog and nextest process rail own lifecycle bounds. The lock
+/// scheduler never guesses that a live holder is wedged from elapsed
+/// wall time.
 ///
 /// The fixed set is the degenerate re-plan case: the target cannot
 /// change, so "re-plan on every wake" reduces to re-sweeping the same
@@ -1098,12 +1097,7 @@ pub fn acquire_resource_locks_waiting(
     }
     // Contended: queue up (arrival order, crash-safe ticket), then
     // accumulate as head.
-    let Some(_queue) = protocol::wait_for_queue_turn()? else {
-        return Ok(LockOutcome::Unavailable(format!(
-            "queue for {first_reason} made no progress for {:?} — a peer              holder appears wedged",
-            protocol::patience(),
-        )));
-    };
+    let _queue = protocol::wait_for_queue_turn()?;
     let target = protocol::canonical_lock_order(
         llc_indices,
         match llc_mode {
@@ -1114,29 +1108,17 @@ pub fn acquire_resource_locks_waiting(
     );
     let claim = claim_for(llc_indices, plan, llc_mode);
     let outcome = protocol::acquire_as_head(|held| {
-        let gained = held.sweep(&target)? > 0;
+        held.sweep(&target)?;
         if held.covers(&target) {
             Ok(protocol::HeadStep::Complete(held.take(&target)))
         } else {
             Ok(protocol::HeadStep::Waiting {
                 claim: claim.clone(),
-                gained,
-                stalled_on: held.first_missing(&target).unwrap_or("<none>").to_string(),
             })
         }
     })?;
     Ok(match outcome {
         protocol::HeadOutcome::Acquired(locks) => LockOutcome::Acquired { llc_offset, locks },
-        protocol::HeadOutcome::TimedOut { stalled_on, waited } => {
-            LockOutcome::Unavailable(format!(
-                "no acquisition progress for {:?} after waiting {waited:?}                  (stalled on {stalled_on}; holders: {}) — a peer holder                  appears wedged",
-                protocol::patience(),
-                crate::flock::format_holder_list(
-                    &crate::flock::read_holders(std::path::Path::new(&stalled_on))
-                        .unwrap_or_default()
-                ),
-            ))
-        }
         protocol::HeadOutcome::Aborted { reason } => LockOutcome::Unavailable(reason),
     })
 }
@@ -1986,8 +1968,8 @@ fn try_acquire_llc_plan_locks(
 /// budget is spent. `wait == true` (the test run path) then joins the
 /// cross-invocation queue and, as head, RE-PLANS AGAINST LIVE HOLDER
 /// STATE ON EVERY WAKE — plans are never cached across waits — waiting
-/// out a genuine holder (a colocated perf-mode `LOCK_EX`) with
-/// progress-based patience rather than skipping.
+/// for a genuine holder's authoritative flock release rather than
+/// skipping.
 /// On
 /// success returns an [`LlcPlan`] holding the selected LLCs, their
 /// flattened CPUs (intersected with the calling process's allowed
@@ -2113,9 +2095,9 @@ pub fn acquire_llc_plan(
 /// lock-dir wake — the re-plan-on-wake contract — accumulating
 /// `LOCK_SH` on the freshly selected LLCs under the head license
 /// (partials retained across re-plans exactly when the new plan still
-/// selects them) until the plan completes or progress-based patience
-/// expires. Waiting is event-driven (inotify on the lock dir), never
-/// polled.
+/// selects them) until the plan completes. Waiting is event-driven
+/// (inotify on the lock dir), never polled; lifecycle bounds belong to
+/// the holder's VM watchdog and the nextest process rail.
 fn acquire_llc_plan_with_acquire_fn<F>(
     topo: &HostTopology,
     test_topo: &crate::topology::TestTopology,
@@ -2302,16 +2284,7 @@ where
     // holds NO resource locks (every fast-phase attempt above was
     // all-or-nothing); as head, its `LOCK_SH` partials are retained
     // across re-plans exactly when the fresh plan still selects them.
-    let Some(_queue) = protocol::wait_for_queue_turn()? else {
-        return Err(anyhow::Error::new(ResourceContention {
-            reason: format!(
-                "acquire_llc_plan: acquisition queue made no progress \
-                 for {:?} — a peer holder appears wedged. Run `ktstr \
-                 locks --json` to see every ktstr lock on this host.",
-                protocol::patience(),
-            ),
-        }));
-    };
+    let _queue = protocol::wait_for_queue_turn()?;
     let outcome = protocol::acquire_as_head(|held| {
         // RE-PLAN against live holder state on every wake — plans are
         // never cached across waits. The freed capacity may satisfy a
@@ -2339,7 +2312,7 @@ where
         }
         let target = protocol::canonical_lock_order(&selected, FlockMode::Shared, &[]);
         held.retain_paths(&target.iter().map(|(p, _)| p.clone()).collect());
-        let gained = held.sweep(&target)? > 0;
+        held.sweep(&target)?;
         if held.covers(&target) {
             let locks = held.take(&target);
             Ok(protocol::HeadStep::Complete((selected, snapshots, locks)))
@@ -2349,8 +2322,6 @@ where
                     llcs: selected.iter().copied().collect(),
                     cpus: std::collections::BTreeSet::new(),
                 },
-                gained,
-                stalled_on: held.first_missing(&target).unwrap_or("<none>").to_string(),
             })
         }
     })?;
@@ -2363,22 +2334,6 @@ where
             &allowed,
             target_cpus,
         )),
-        protocol::HeadOutcome::TimedOut { stalled_on, waited } => {
-            Err(anyhow::Error::new(ResourceContention {
-                reason: format!(
-                    "acquire_llc_plan: no acquisition progress for {:?} \
-                     after waiting {waited:?} for a peer to release \
-                     (stalled on {stalled_on}; holders: {}) — the holder \
-                     appears wedged. Run `ktstr locks --json` to see every \
-                     ktstr lock on this host.",
-                    protocol::patience(),
-                    crate::flock::format_holder_list(
-                        &crate::flock::read_holders(std::path::Path::new(&stalled_on))
-                            .unwrap_or_default()
-                    ),
-                ),
-            }))
-        }
         protocol::HeadOutcome::Aborted { reason } => {
             Err(anyhow::Error::new(ResourceContention { reason }))
         }

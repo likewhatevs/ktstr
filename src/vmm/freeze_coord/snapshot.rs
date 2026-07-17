@@ -30,6 +30,25 @@ use super::super::vcpu::{ImmediateExitHandle, WatchpointArm, vcpu_signal};
 use super::state::SnapshotRequest;
 use crate::vmm::KERNEL_HALF_CANONICAL as KERNEL_HALF_CANONICAL_4LEVEL;
 
+/// Frame the empty host→guest acknowledgement for the ordered
+/// teardown barrier. The coordinator queues this only after it has
+/// persisted every earlier guest frame and advanced the lifecycle to
+/// Teardown.
+pub(super) fn frame_teardown_barrier_ack() -> [u8; crate::vmm::wire::FRAME_HEADER_SIZE] {
+    use crate::vmm::wire::{MSG_TYPE_TEARDOWN_BARRIER_ACK, ShmMessage};
+    use zerocopy::IntoBytes;
+
+    let header = ShmMessage {
+        msg_type: MSG_TYPE_TEARDOWN_BARRIER_ACK,
+        length: 0,
+        crc32: crc32fast::hash(&[]),
+        _pad: 0,
+    };
+    let mut frame = [0u8; crate::vmm::wire::FRAME_HEADER_SIZE];
+    frame.copy_from_slice(header.as_bytes());
+    frame
+}
+
 /// Frame a `MSG_TYPE_KERNEL_OP_REPLY` TLV — header (16 bytes) plus
 /// the postcard-encoded [`crate::vmm::wire::KernelOpReplyPayload`]
 /// — into a single buffer the coordinator pushes through
