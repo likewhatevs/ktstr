@@ -2805,11 +2805,21 @@ fn render_no_result_message(
         // override applied to the guest kernel), the workload
         // duration (`entry.duration`, what the test body asked for),
         // and the wall-clock the run actually consumed
-        // (`result.duration`). The hint mirrors the watchdog-thread
-        // diagnostic in `freeze_coord/mod.rs` so the operator sees
-        // the same direction whether they read VM stderr or this
-        // test-output message.
+        // (`result.duration`). The duration hint is only actionable for a
+        // Tier-3 deadline in the Body phase; Boot/Attach/Dispatch progress
+        // faults cannot be fixed by lengthening the test body.
         let vm_timeout = vm_timeout_from_entry(entry, topo.total_cpus());
+        let duration_hint = if result.watchdog_kill_reason
+            == Some(crate::vmm::WatchdogKillReason::Tier3Deadman)
+            && result.final_guest_phase == crate::vmm::GuestLifecyclePhase::Body
+        {
+            "\n\
+             hint: if the test body needs more wall time, increase \
+             duration (the `duration` field on `KtstrTestEntry` / \
+             `#[ktstr_test(duration_ms = ...)]`)"
+        } else {
+            ""
+        };
         let watchdog_section = format!(
             "\n\n--- ktstr-watchdog ---\n\
              elapsed={:?} (VM run wall-clock)\n\
@@ -2817,15 +2827,8 @@ fn render_no_result_message(
              duration, 1s) + vCPU-scaled vm_boot_headroom x deadman multiplier \
              [+ 30s cold-BTF budget for bpf_map_write tests])\n\
              watchdog_timeout={:?} (scx_sched.watchdog_timeout override)\n\
-             duration={:?} (workload duration)\n\
-             hint: if the test body needs more wall time, increase \
-             duration (the `duration` field on `KtstrTestEntry` / \
-             `#[ktstr_test(duration_ms = ...)]`). Note this wall deadline \
-             is only the dead-man backstop: the progress watchdog (Tiers \
-             1-2) kills a wedged VM on its per-phase progress budget long \
-             before this fires, and a slow-but-progressing VM is never \
-             killed by host load alone",
-            result.duration, vm_timeout, entry.watchdog_timeout, entry.duration,
+             duration={:?} (workload duration){}",
+            result.duration, vm_timeout, entry.watchdog_timeout, entry.duration, duration_hint,
         );
         let timeout_reason = {
             let scx_exits = crate::monitor::dmesg_scx::parse_kmsg_window(&result.stderr);

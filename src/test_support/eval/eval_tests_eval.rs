@@ -2732,6 +2732,57 @@ fn eval_timeout_sched_exited_empty_message() {
     );
 }
 
+#[test]
+fn eval_timeout_duration_hint_only_for_body_tier3() {
+    let entry = sched_entry("__eval_timeout_duration_hint__");
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    for (reason, phase, expect_hint) in [
+        (
+            crate::vmm::WatchdogKillReason::Tier1CpuBudget,
+            crate::vmm::GuestLifecyclePhase::Boot,
+            false,
+        ),
+        (
+            crate::vmm::WatchdogKillReason::Tier3Deadman,
+            crate::vmm::GuestLifecyclePhase::Boot,
+            false,
+        ),
+        (
+            crate::vmm::WatchdogKillReason::Tier1CpuBudget,
+            crate::vmm::GuestLifecyclePhase::Body,
+            false,
+        ),
+        (
+            crate::vmm::WatchdogKillReason::Tier3Deadman,
+            crate::vmm::GuestLifecyclePhase::Body,
+            true,
+        ),
+    ] {
+        let mut result = make_vm_result("", "guest stalled...", -1, true);
+        result.watchdog_kill_reason = Some(reason);
+        result.final_guest_phase = phase;
+        let msg = format!(
+            "{}",
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &[],
+                &EVAL_TOPO,
+                &no_repro,
+                None,
+            )
+            .unwrap_err()
+        );
+        assert_eq!(
+            msg.contains("if the test body needs more wall time"),
+            expect_hint,
+            "duration hint polarity for {reason:?}/{phase:?}: {msg}",
+        );
+    }
+}
+
 // -- timed-out arm: crash_section dual-fire (the `crash_section` binding in evaluate_vm_result's `if result.timed_out` arm) --
 
 /// Timed-out run that ALSO carries a structured `crash_message`: both

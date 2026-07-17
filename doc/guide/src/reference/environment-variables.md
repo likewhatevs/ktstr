@@ -56,7 +56,7 @@ interact; the first two are mutually exclusive at every entry point.
 
 | Variable | Effect | Accepted values | Default |
 |---|---|---|---|
-| `KTSTR_CPU_CAP` | Cap the host CPUs reserved by a no-perf-mode VM or kernel build. Flag `--cpu-cap N` takes precedence. | Integer ≥ 1; `0` / non-numeric rejected | Kernel build: 30% of allowed CPUs (min 1). No-perf VM: the vCPU count, floored at 30%. |
+| `KTSTR_CPU_CAP` | Cap the host CPUs reserved by a no-perf-mode VM or kernel build. Flag `--cpu-cap N` takes precedence. | Integer ≥ 1; `0` / non-numeric rejected | Kernel build: 30% of allowed CPUs (min 1). No-perf VM: `min(vCPUs + 1, allowed CPUs)` (min 1). |
 | `KTSTR_BYPASS_LLC_LOCKS` | Skip host-side LLC flock acquisition entirely — no coordination against concurrent runs. | Any non-empty value | Coordinate |
 | `KTSTR_LOCK_DIR` | Directory for the per-LLC / per-CPU flock files. Use when `/tmp` is constrained on a runner. | Directory path | `/tmp` |
 | `KTSTR_CONTENTION_BYPASS` | Make transient KVM errnos immediate hard failures instead of retryable `ResourceContention` failures (only when the host is not near its limits) — stricter, for catching kernel-side regressions. | Exactly `"1"` | Retryable contention failure |

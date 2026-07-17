@@ -105,14 +105,19 @@ pub(crate) fn install_initial_sched_exit_monitor(
 /// sending the `MSG_TYPE_SCHED_EXIT` message that the host's
 /// freeze coordinator would otherwise promote into the run-wide
 /// kill flag (per `src/vmm/freeze_coord/dispatch.rs` SchedExit
-/// arm). Idempotent — a no-op when the slot is already empty.
-pub(crate) fn stop_sched_exit_monitor() {
+/// arm). Returns true when the monitor observed scheduler exit (including
+/// the race where stop suppressed the frame) or the monitor failed, so
+/// verifier cleanup can fail closed.
+/// Idempotent — returns false when the slot is already empty.
+pub(crate) fn stop_sched_exit_monitor() -> bool {
     let Some(slot) = SCHED_EXIT_MONITOR_SLOT.get() else {
-        return;
+        return false;
     };
     let prev = slot.lock().unwrap().take();
     if let Some(stop) = prev {
-        stop.stop_and_join();
+        stop.stop_and_join()
+    } else {
+        false
     }
 }
 
@@ -164,7 +169,7 @@ pub(crate) fn restart_sched_exit_monitor_with_log(log_path: Option<&str>) {
     // that window observe "no monitor", which is correct since
     // the new monitor hasn't been spawned yet.
     if let Some(prev) = guard.take() {
-        prev.stop_and_join();
+        let _ = prev.stop_and_join();
     }
     *guard = start_sched_exit_monitor(
         sched_pid().map(|p| p as u32),

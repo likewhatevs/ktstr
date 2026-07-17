@@ -405,30 +405,27 @@ fn drain_probe_pipeline(drain: Option<&ProbeDrain>, timeout: std::time::Duration
 /// exit: the crash-grace caller calls this BEFORE `child.kill()` (giving
 /// a self-unregistering scheduler a chance to exit on its own within the
 /// grace), and the post-grace caller calls it AFTER `child.kill()` (to
-/// reap the pending SIGKILL). Returns `true` iff reaped within the
-/// window; on timeout the child is left for the VM reboot to reap —
-/// teardown must not block unboundedly on a wedged process (see
+/// reap the pending SIGKILL). Returns the real terminal status iff reaped
+/// within the window; on timeout the child is left for the VM reboot to
+/// reap — teardown must not block unboundedly on a wedged process (see
 /// [`SCHED_REAP_TIMEOUT`]).
-pub(crate) fn reap_child_bounded(
+pub(crate) fn reap_child_bounded_status(
     child: &mut std::process::Child,
     timeout: std::time::Duration,
-) -> bool {
+) -> Option<std::process::ExitStatus> {
     // Fast path: already exited (e.g. a clean scheduler that took the
     // SIGKILL immediately).
-    if let Ok(Some(_)) = child.try_wait() {
-        return true;
+    if let Ok(Some(status)) = child.try_wait() {
+        return Some(status);
     }
     match crate::sync::pidfd_poll_exited(child.id() as libc::pid_t, timeout) {
         // Readable => zombie => the reap is now non-blocking.
-        crate::sync::PidfdWait::Exited => {
-            let _ = child.wait();
-            true
-        }
+        crate::sync::PidfdWait::Exited => child.wait().ok(),
         // Timed out: still alive — leave it for the VM reboot.
-        crate::sync::PidfdWait::TimedOut => false,
+        crate::sync::PidfdWait::TimedOut => None,
         // pidfd_open failed (ESRCH/gone or env defect): one non-blocking
         // reap attempt, then give up to the reboot.
-        crate::sync::PidfdWait::NoPidfd => matches!(child.try_wait(), Ok(Some(_))),
+        crate::sync::PidfdWait::NoPidfd => child.try_wait().ok().flatten(),
     }
 }
 

@@ -16,20 +16,22 @@
 //! across the concurrent CI cells would dominate the host load and
 //! starve other cells' bring-up. A parked worker still publishes its
 //! final count and responds to stop, so the wait and the dispatch verdict
-//! are unchanged. It
-//! emits a [`LifecyclePhase::WorkloadDispatched`] frame
-//! only for a worker that BOTH advanced non-zero `iterations` AND had its
-//! SCHED_EXT set succeed (`sched_policy_error` is None). Schedulerless
-//! SCHED_EXT tasks may still advance through the kernel fallback, so this
-//! progress frame is dispatch proof only when paired with the independent
-//! `SchedulerAttached` frame. The deadline scales with the worker
+//! are unchanged. It emits a [`LifecyclePhase::WorkloadDispatched`] frame
+//! only when a worker BOTH advanced non-zero `iterations` and had its
+//! SCHED_EXT set succeed (`sched_policy_error` is None), AND the scheduler
+//! child is still alive with sched_ext still `enabled` at the completion
+//! edge. Schedulerless SCHED_EXT tasks may advance through the kernel
+//! fallback; the contemporaneous liveness/state gate prevents that later
+//! fallback progress from being combined with a stale historical attach
+//! frame. The deadline scales with the worker
 //! count ([`dispatch_deadline`]): wall clock is not guest CPU time on
 //! a wide, host-time-sliced topology, so a flat window gives a
 //! 64+-CPU guest under CI concurrency almost no per-vCPU compute
 //! before the probe gives up on a working scheduler. The host
-//! verdict ([`crate::verifier::collect_verifier_output`]) PASSes a cell
-//! only when BOTH `SchedulerAttached` and `WorkloadDispatched` frames
-//! arrive.
+//! verdict ([`crate::verifier::collect_verifier_output`]) also requires
+//! no scheduler-exit evidence and an explicit terminal guest `EXIT(0)`.
+//! The guest publishes that zero only after cleanup proves the scheduler
+//! remained live and enabled until ktstr's intentional termination.
 //!
 //! On any failure — workload spawn error, or zero progress within the
 //! deadline — NO frame is emitted and the function returns quietly. The
@@ -44,8 +46,9 @@
 //! `KTSTR_GUEST_INIT` env var, which [`super::init`] sets before Phase 5
 //! and which is inherited across fork.
 
+use crate::scenario::ops::{ScxState, scx_state};
 use crate::vmm::wire::LifecyclePhase;
-use crate::workload::{SchedPolicy, WorkType, WorkloadConfig, WorkloadHandle};
+use crate::workload::{SchedPolicy, WorkType, WorkerReport, WorkloadConfig, WorkloadHandle};
 use std::time::{Duration, Instant};
 
 /// Base wait for the scheduler to dispatch the probe workers before
@@ -81,9 +84,26 @@ fn dispatch_deadline(workers: usize) -> Duration {
         .min(DISPATCH_DEADLINE_CAP)
 }
 
-/// Run the SpinWait probe and, on confirmed dispatch, emit
-/// [`LifecyclePhase::WorkloadDispatched`]. See the module docs.
-pub(crate) fn run_and_confirm_dispatch() {
+/// Whether terminal probe evidence is contemporaneously valid.
+///
+/// Kept pure so the attach-then-exit regression is testable without a live
+/// sched_ext kernel: historical worker progress is insufficient unless the
+/// scheduler process is still alive and the kernel still reports `enabled`.
+fn dispatch_completion_is_valid(
+    reports: &[WorkerReport],
+    scheduler_alive: bool,
+    state: Option<ScxState>,
+) -> bool {
+    let worker_progress = reports
+        .iter()
+        .any(|r| r.iterations >= 1 && r.sched_policy_error.is_none());
+    worker_progress && scheduler_alive && state == Some(ScxState::Enabled)
+}
+
+/// Run the SpinWait probe and, on confirmed dispatch by a scheduler that
+/// remains alive and enabled, emit [`LifecyclePhase::WorkloadDispatched`].
+/// Returns true only when that terminal success edge was emitted.
+pub(crate) fn run_and_confirm_dispatch(sched_child: Option<&mut std::process::Child>) -> bool {
     let workers = super::topology::count_online_cpus().unwrap_or(1).max(1) as usize;
     let cfg = WorkloadConfig::default()
         .work_type(WorkType::SpinWait)
@@ -121,7 +141,7 @@ pub(crate) fn run_and_confirm_dispatch() {
         Ok(h) => h,
         Err(e) => {
             tracing::warn!(error = %e, "verifier workload: spawn failed; no dispatch frame");
-            return;
+            return false;
         }
     };
     handle.start();
@@ -152,16 +172,24 @@ pub(crate) fn run_and_confirm_dispatch() {
     // rejected stayed SCHED_OTHER; its progress could be fair-class work
     // under a partial-switch scheduler, so it is NOT counted.
     let reports = handle.stop_and_collect();
-    if reports
-        .iter()
-        .any(|r| r.iterations >= 1 && r.sched_policy_error.is_none())
-    {
+    // SchedulerAttached is historical evidence. A scheduler can attach,
+    // hit a runtime error, unregister, and leave SCHED_EXT tasks runnable
+    // through the kernel fallback. Re-check the child and kernel state at
+    // the same edge as worker progress so those two moments cannot be
+    // composed into a false PASS.
+    let scheduler_alive = sched_child.is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+    let state = scx_state();
+    if dispatch_completion_is_valid(&reports, scheduler_alive, state) {
         crate::vmm::guest_comms::send_lifecycle(LifecyclePhase::WorkloadDispatched, "");
+        true
     } else {
         tracing::warn!(
-            "verifier workload: no worker confirmed dispatched (0 iterations, or the \
-             SCHED_EXT set was rejected leaving the worker in fair)"
+            scheduler_alive,
+            state = ?state,
+            "verifier workload: terminal dispatch not confirmed (no qualifying worker \
+             progress, scheduler child exited, or sched_ext is no longer enabled)"
         );
+        false
     }
 }
 
@@ -188,5 +216,41 @@ mod tests {
             "probe cap must leave post-attach room for teardown inside \
              the host's workload budget",
         );
+    }
+
+    #[test]
+    fn dispatch_completion_requires_progress_and_live_enabled_scheduler() {
+        let progressed = WorkerReport {
+            iterations: 1,
+            ..WorkerReport::default()
+        };
+        let no_progress = WorkerReport::default();
+
+        assert!(dispatch_completion_is_valid(
+            std::slice::from_ref(&progressed),
+            true,
+            Some(ScxState::Enabled),
+        ));
+        assert!(!dispatch_completion_is_valid(
+            &[no_progress],
+            true,
+            Some(ScxState::Enabled),
+        ));
+        assert!(!dispatch_completion_is_valid(
+            std::slice::from_ref(&progressed),
+            false,
+            Some(ScxState::Enabled),
+        ));
+        for state in [
+            None,
+            Some(ScxState::Enabling),
+            Some(ScxState::Disabling),
+            Some(ScxState::Disabled),
+        ] {
+            assert!(
+                !dispatch_completion_is_valid(std::slice::from_ref(&progressed), true, state),
+                "historical progress must not survive terminal state {state:?}",
+            );
+        }
     }
 }

@@ -4,6 +4,26 @@
 //! parent module (`super`), reached via the glob below.
 use super::*;
 
+/// Whether verifier cleanup proved that a live scheduler was terminated by
+/// ktstr's intentional SIGKILL.
+///
+/// `kill(2)` can return success for a zombie, so the syscall result alone is
+/// not liveness evidence. The reaped wait status must say SIGKILL.
+pub(crate) fn verifier_cleanup_kill_confirmed(
+    kill_sent: bool,
+    status: Option<&std::process::ExitStatus>,
+) -> bool {
+    kill_sent && status.and_then(|status| status.signal()) == Some(libc::SIGKILL)
+}
+
+/// Verifier cleanup state gate, factored so both the initial cleanup boundary
+/// and the pre-kill recheck use the same fail-closed predicate.
+pub(crate) fn verifier_cleanup_state_confirmed(
+    state: Option<crate::scenario::ops::ScxState>,
+) -> bool {
+    state == Some(crate::scenario::ops::ScxState::Enabled)
+}
+
 /// AP-bring-up-gap check with a host-controlled fault-injection hook.
 ///
 /// The production verdict is [`all_possible_cpus_online`] — a pure
@@ -43,9 +63,9 @@ fn ap_gap_check_with_fault_injection() -> Result<(), String> {
 ///     busiest vCPU's in-phase burn (`max_vcpu_cpu_in_phase_ns`) exceeds
 ///     the flat Teardown `phase_cpu_budget_ns`.
 ///   - `KTSTR_FAULT_TEARDOWN_WEDGE=idle`: sleep FOREVER — the guest goes
-///     fully quiescent (no runnable demand, ISR-only CPU trickle),
-///     tripping Tier-2 once the trickle-stall discriminator latches and
-///     `wall_in_phase` exceeds the Teardown `phase_wall_backstop_ns`.
+///     fully quiescent (no runnable demand), tripping Tier-2 once
+///     `wall_in_phase` exceeds the Teardown `phase_wall_backstop_ns` while
+///     the guest evidence channels remain live.
 ///
 /// The wedge is deliberately unbounded: the watchdog MUST be what ends the
 /// VM (`timed_out = true`), so the fixture's host-side timing assertion can
@@ -74,8 +94,8 @@ fn ap_gap_check_with_fault_injection() -> Result<(), String> {
 /// Call site: the END of Phase 6, after the background threads
 /// (vc-poll, stats relay, trace_pipe reader) have been stopped and joined —
 /// the guest's only remaining activity is kernel ISR trickle, giving the
-/// idle arm the truly-quiescent shape Tier-2's sub-1ms/10s trickle floor
-/// discriminates on. The test body has already published its PASS
+/// idle arm a truly quiescent no-runnable-demand shape. The test body has
+/// already published its PASS
 /// AssertResult (`publish_result_and_collect` runs at end-of-dispatch), so
 /// the host records a passing base verdict and the fixture's
 /// `post_vm_unconditional` timing gate owns the pass/fail decision.
@@ -721,9 +741,11 @@ pub(crate) fn ktstr_guest_init() -> ! {
     drop(_s_phase4);
 
     // Phase 4b: Scheduler death monitor.
-    // Spawn a thread that polls /proc/{pid}. If the scheduler exits during
-    // the test, the thread writes MSG_TYPE_SCHED_EXIT via bulk port so the host
-    // can detect early death without waiting for the watchdog.
+    // Spawn a thread that blocks on the scheduler pidfd plus a stop eventfd.
+    // If the scheduler exits during the test, pidfd readiness is authoritative
+    // (including while the child is a zombie) and the thread writes
+    // MSG_TYPE_SCHED_EXIT via the bulk port so the host detects the death
+    // without waiting for the watchdog.
     //
     // When probes are active, `suppress_sched_log` suppresses only the
     // bulk-port scheduler-log dump (the monitor waits on the probe's
@@ -838,26 +860,37 @@ pub(crate) fn ktstr_guest_init() -> ! {
     crate::vmm::guest_comms::send_scenario_start();
 
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
-    let code = if !dispatch_ready {
+    let verifier_workload = crate::test_support::is_verifier_workload(&args);
+    let mut code = if !dispatch_ready {
         eprintln!(
             "ktstr-init: workload not dispatched because required instrumentation readiness failed"
         );
         1
-    } else if crate::test_support::is_verifier_workload(&args) {
+    } else if verifier_workload {
         // Verifier sweep VM: no `#[ktstr_test]` body to dispatch. Instead
-        // run the dispatch probe — spawn a SpinWait workload and, on
-        // confirmed worker progress after the scheduler attached, emit a
-        // `WorkloadDispatched` frame. Exit 1 like the no-test-fn path: the
-        // host verifier verdict keys on lifecycle frames, never on the
-        // guest exit code (which is 1 even on the verifier success path).
-        super::verifier_workload::run_and_confirm_dispatch();
-        1
+        // run the dispatch probe. Success is terminal and positive: worker
+        // progress, a live scheduler child, and sched_ext still enabled at
+        // the same edge. Exit 0 only for that contract so the host can
+        // reject an attach-then-crash run even if historical lifecycle
+        // frames survive in the drain.
+        if super::verifier_workload::run_and_confirm_dispatch(sched_child.as_mut()) {
+            0
+        } else {
+            1
+        }
     } else if let Some(pa) = probe_phase_a {
         crate::test_support::maybe_dispatch_vm_test_with_phase_a(&args, pa).unwrap_or(1)
     } else {
         crate::test_support::maybe_dispatch_vm_test_with_args(&args).unwrap_or(1)
     };
-    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+    // Verifier cleanup needs the scheduler's real wait status to prove that
+    // the process was alive until our intentional SIGKILL. Keep SIGCHLD at
+    // SIG_DFL through that cleanup; restoring SIG_IGN here would auto-reap
+    // the child and collapse "we killed it" and "it died on its own" into
+    // the same ECHILD result.
+    if !verifier_workload {
+        unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+    }
     crate::vmm::guest_comms::send_scenario_pause();
 
     #[cfg(feature = "wprof")]
@@ -882,27 +915,66 @@ pub(crate) fn ktstr_guest_init() -> ! {
     let _s_phase6 = tracing::debug_span!("phase6_cleanup").entered();
 
     // Stop the sched-exit monitor BEFORE killing the scheduler.
-    // Without this ordering, child.kill() makes the scheduler
-    // exit, the monitor's pidfd poll wakes, it sees /proc/{pid}
-    // gone and emits MSG_TYPE_SCHED_EXIT on the bulk port, the
-    // host promotes kill=true, and the BSP exits with ExternalKill
-    // before the guest reaches send_exit — producing exit_code=-1
-    // on an otherwise clean run.
+    // Without this ordering, child.kill() makes the scheduler pidfd readable
+    // (even while SIGCHLD=SIG_DFL leaves a zombie and `/proc/{pid}` still
+    // exists). The monitor can then emit MSG_TYPE_SCHED_EXIT on the bulk
+    // port, the host promotes kill=true, and the BSP exits with ExternalKill
+    // before the guest reaches send_exit — producing exit_code=-1 on an
+    // otherwise clean run.
     //
     // `stop_and_join` sets stop=true (Release), writes the wake
-    // eventfd to drop poll wake latency from 250 ms to
-    // microseconds, then joins the monitor thread. Joining is
-    // event-driven: the monitor's loop checks stop at the top,
-    // exits cleanly after `poll(2)` returns, and the join
-    // returns. After this call the monitor is guaranteed to have
-    // exited without sending MSG_TYPE_SCHED_EXIT, so the
-    // subsequent child.kill() cannot trigger the race.
+    // eventfd to drop poll wake latency from 250 ms to microseconds, then
+    // joins the monitor thread. After `poll(2)` returns, the monitor checks
+    // the stop flag before sending a frame. A scheduler-exit edge that
+    // preceded or raced the stop is preserved in the returned bool (and a
+    // frame may already have been sent), so verifier cleanup fails closed.
+    // After the join, the subsequent child.kill() cannot generate a new
+    // MSG_TYPE_SCHED_EXIT frame.
     // Stop the live sched_exit_monitor (whichever scheduler PID it
     // was last installed for — boot or post-Op::Replace) before
     // tearing down the scheduler child below. The slot may be
     // empty if the test ran Op::DetachScheduler without a
     // re-attach; the helper handles that case as a no-op.
-    stop_sched_exit_monitor();
+    let scheduler_exit_observed = stop_sched_exit_monitor();
+    let scheduler_already_dead = if verifier_workload && code == 0 {
+        match sched_child.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(Some(status)) => {
+                    tracing::warn!(
+                        ?status,
+                        "verifier workload: scheduler exited before cleanup boundary"
+                    );
+                    true
+                }
+                Ok(None) => false,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "verifier workload: could not confirm scheduler liveness at cleanup boundary"
+                    );
+                    true
+                }
+            },
+            None => true,
+        }
+    } else {
+        false
+    };
+    let cleanup_scx_state = crate::scenario::ops::scx_state();
+    if verifier_workload
+        && code == 0
+        && (scheduler_exit_observed
+            || scheduler_already_dead
+            || !verifier_cleanup_state_confirmed(cleanup_scx_state))
+    {
+        tracing::warn!(
+            scheduler_exit_observed,
+            scheduler_already_dead,
+            state = ?cleanup_scx_state,
+            "verifier workload: scheduler stopped or disabled before cleanup boundary"
+        );
+        code = 1;
+    }
 
     if let Some(ref mut child) = sched_child {
         // On a crash the scheduler is shutting down and flushing its
@@ -925,27 +997,90 @@ pub(crate) fn ktstr_guest_init() -> ! {
         // wedge teardown.
         let sched_crashed =
             crate::vmm::rust_init::sched_pid().is_some() && crate::scenario::ops::scx_down();
-        let exited_in_grace = (scx_dump_started_latch().is_set() || sched_crashed)
-            && reap_child_bounded(child, SCHED_KILL_GRACE);
+        if verifier_workload && code == 0 && sched_crashed {
+            tracing::warn!(
+                "verifier workload: sched_ext disabled after the cleanup-boundary check"
+            );
+            code = 1;
+        }
+        let grace_status = if scx_dump_started_latch().is_set() || sched_crashed {
+            reap_child_bounded_status(child, SCHED_KILL_GRACE)
+        } else {
+            None
+        };
+        let exited_in_grace = grace_status.is_some();
+        if verifier_workload && code == 0 && exited_in_grace {
+            tracing::warn!(
+                status = ?grace_status,
+                "verifier workload: scheduler exited during pre-cleanup crash grace"
+            );
+            code = 1;
+        }
         if !exited_in_grace {
-            let _ = child.kill();
+            // State can transition Enabled -> Disabled while crash grace is
+            // running even if the userspace scheduler remains alive. Recheck
+            // immediately before our intentional kill; otherwise SIGKILL's
+            // wait status could make that already-disabled scheduler look
+            // like a clean verifier completion.
+            let pre_kill_scx_state = crate::scenario::ops::scx_state();
+            if verifier_workload
+                && code == 0
+                && !verifier_cleanup_state_confirmed(pre_kill_scx_state)
+            {
+                tracing::warn!(
+                    state = ?pre_kill_scx_state,
+                    "verifier workload: sched_ext disabled before intentional cleanup kill"
+                );
+                code = 1;
+            }
+            let kill_sent = match child.kill() {
+                Ok(()) => true,
+                Err(e) => {
+                    if verifier_workload && code == 0 {
+                        tracing::warn!(
+                            error = %e,
+                            "verifier workload: scheduler was not live at cleanup kill boundary"
+                        );
+                    }
+                    false
+                }
+            };
             // Bounded, evented reap. A SIGKILL'd scheduler normally exits
             // <<1s — post-crash bypass keeps it CFS-schedulable and it is
             // not held in the kernel disable (see `SCHED_REAP_TIMEOUT`).
             // The bound caps the rare case where the process can't take its
             // pending SIGKILL promptly; the VM reboot below reaps any
             // straggler, so cap the wait rather than risk blocking teardown.
-            if !reap_child_bounded(child, SCHED_REAP_TIMEOUT) {
+            let terminal_status = reap_child_bounded_status(child, SCHED_REAP_TIMEOUT);
+            if terminal_status.is_none() {
                 tracing::warn!(
                     ?SCHED_REAP_TIMEOUT,
                     "scheduler did not exit within the reap bound after SIGKILL \
                      (still uninterruptible — unexpected); leaving it for VM reboot to reap"
                 );
             }
+            // A successful kill(2) call is not enough: Linux accepts signals
+            // for zombies. Require the wait status produced by our SIGKILL,
+            // which distinguishes an intentionally terminated live scheduler
+            // from one that exited just before cleanup and remained a zombie.
+            if verifier_workload
+                && code == 0
+                && !verifier_cleanup_kill_confirmed(kill_sent, terminal_status.as_ref())
+            {
+                tracing::warn!(
+                    kill_sent,
+                    status = ?terminal_status,
+                    "verifier workload: scheduler did not survive until intentional cleanup kill"
+                );
+                code = 1;
+            }
         }
         if let Some(ref log_path) = sched_log_path {
             dump_sched_output(log_path);
         }
+    }
+    if verifier_workload {
+        unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
     }
     dump_staged_scheduler_logs();
     exec_shell_script("/sched_disable");

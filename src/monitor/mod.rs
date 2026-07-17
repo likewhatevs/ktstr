@@ -769,11 +769,12 @@ pub(crate) struct ProgressLedger {
     /// by the dispatch thread — so the anchor and the reading are always
     /// coherent (same thread, same tick), curing the cross-thread ~0-anchor
     /// incoherence the old dispatch-snapshotted `cpu_ns_at_phase` suffered.
-    /// WIDTH-INDEPENDENT by construction: a spinning wedge is one (or a
-    /// few) hot thread(s), so the max crosses a flat per-phase budget; a
-    /// wide idle guest's diffuse per-vCPU background burn (ticks/IPIs) keeps
-    /// the max tiny no matter how many vCPUs sum into `cpu_ns_now`. Relaxed
-    /// — one-tick staleness only under-counts, deferring a kill.
+    /// WIDTH-INDEPENDENT evidence by construction: a spinning wedge is one
+    /// (or a few) hot thread(s), so the max crosses the phase budget; only
+    /// Boot's budget scales with width for legitimate serial AP bring-up.
+    /// A wide idle guest's diffuse per-vCPU background burn (ticks/IPIs)
+    /// keeps the max tiny no matter how many vCPUs sum into `cpu_ns_now`.
+    /// Relaxed — one-tick staleness only under-counts, deferring a kill.
     pub(crate) max_vcpu_cpu_in_phase_ns: AtomicU64,
     /// The `phase_epoch` for which
     /// [`Self::max_vcpu_cpu_in_phase_ns`] was computed. The monitor publishes
@@ -837,7 +838,8 @@ pub(crate) struct ProgressLedger {
     /// tick from enqueue paths under a stalled scheduler). Likewise
     /// jiffies / `rq_clock` advance is never progress. The watchdog
     /// governs spinning wedges by the Tier-1 per-phase CPU budget and idle
-    /// wedges by the Tier-2 CPU-trickle-stall test — NOT by this epoch;
+    /// wedges by Tier-2's live-channel, no-runnable-demand wall backstop —
+    /// NOT by this epoch;
     /// the epoch's sole watchdog role is the Tier-3 "no milestone within
     /// the grace" deferral gate.
     pub(crate) progress_epoch: AtomicU64,
@@ -1079,9 +1081,10 @@ pub(crate) struct LedgerSnapshot {
     pub(crate) cpu_ns_now: u64,
     /// The Tier-1 evidence: MAX over vCPUs of per-vCPU CPU burned since the
     /// current phase was entered, published by the monitor (see
-    /// [`ProgressLedger::max_vcpu_cpu_in_phase_ns`]). Width-independent, so
-    /// a spinning wedge crosses a flat per-phase budget while a wide idle
-    /// guest never does.
+    /// [`ProgressLedger::max_vcpu_cpu_in_phase_ns`]). The evidence is
+    /// width-independent; only Boot's budget scales with width for serial
+    /// AP bring-up. A wide idle guest still never crosses it from diffuse
+    /// background burn alone.
     pub(crate) max_vcpu_cpu_in_phase_ns: u64,
     /// The Tier-3-deadman deferral verdict (monitor-computed; see
     /// [`ProgressLedger::cpu_trickle_stalled`]): the guest's busiest single

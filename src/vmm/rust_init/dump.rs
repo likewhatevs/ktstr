@@ -656,10 +656,11 @@ fn drain_probe_for_shutdown(
 /// on the scheduler), the cleanup site MUST call
 /// [`SchedExitStop::stop_and_join`] (or its equivalent of
 /// `store(true, Release)` + [`SchedExitStop::wake`] + joining the
-/// thread). Otherwise the monitor races: it sees `/proc/{pid}` gone
-/// after the kill, takes the `if exited` branch, and emits
-/// `MSG_TYPE_SCHED_EXIT` to the host, which terminates the VM
-/// before the orderly `MSG_TYPE_EXIT` frame can be sent.
+/// thread). Otherwise the monitor races: the kill makes the pidfd readable
+/// (including while a zombie still has a `/proc/{pid}` entry), the monitor
+/// takes the `if exited` branch, and emits `MSG_TYPE_SCHED_EXIT` to the host,
+/// which terminates the VM before the orderly `MSG_TYPE_EXIT` frame can be
+/// sent.
 ///
 /// The bool is the source of truth; the eventfd write delivers the
 /// edge that pulls the thread out of an indefinite `poll`. The
@@ -667,21 +668,21 @@ fn drain_probe_for_shutdown(
 /// monitor thread on the reader side; both sides drop their fds when
 /// the run ends, so the kernel-side counter is reclaimed cleanly.
 pub(crate) struct SchedExitStop {
-    /// Stop flag the monitor thread polls under `Acquire` ordering at
-    /// every loop iteration. Setting `true` is the only way to make
-    /// the thread exit through its top-of-loop early-return arm; the
-    /// eventfd below is the wake-edge that pairs with this store.
+    /// Stop flag the monitor thread loads under `Acquire` after every
+    /// `poll(2)` wake and before emitting an exit frame. The eventfd below
+    /// supplies the wake edge paired with this source-of-truth flag.
     pub(crate) stop: Arc<AtomicBool>,
     /// Owned eventfd write side. `wake()` writes `1` here; the
     /// monitor's `poll(2)` returns within microseconds. `None` when
-    /// `eventfd(2)` failed at monitor spawn (legacy 250 ms timeout
-    /// still bounds wake latency in that degraded path).
+    /// `eventfd(2)` failed or its writer-side `dup(2)` failed at monitor
+    /// spawn (the legacy 250 ms timeout still bounds wake latency in that
+    /// degraded path).
     wake_fd: Option<OwnedFd>,
     /// Monitor thread join handle. `None` when
     /// `std::thread::Builder::spawn` failed (the monitor never
     /// started; nothing to join). Consumed by
     /// [`SchedExitStop::stop_and_join`].
-    join_handle: Option<std::thread::JoinHandle<()>>,
+    join_handle: Option<std::thread::JoinHandle<bool>>,
 }
 
 impl SchedExitStop {
@@ -714,22 +715,52 @@ impl SchedExitStop {
     /// Atomically request stop and wait for the monitor thread to
     /// exit. Sets `stop=true` (Release) and writes the wake eventfd
     /// so the monitor's `poll(2)` returns within microseconds, then
-    /// joins the thread. After this returns, the monitor has
-    /// observed `stop=true` at the top of its loop and exited
-    /// without sending `MSG_TYPE_SCHED_EXIT` — making it safe for
-    /// the caller to proceed with actions (like killing the
-    /// scheduler child) that the monitor would otherwise interpret
-    /// as an unexpected scheduler exit.
+    /// joins the thread. Returns true when the monitor observed the
+    /// scheduler's pidfd exit edge, including when that edge raced with the
+    /// stop request and therefore produced no SchedExit frame. A monitor
+    /// spawn failure or panic also returns true so verifier cleanup fails
+    /// closed when liveness could not be observed.
+    /// After this returns the monitor thread is gone, so the caller can
+    /// intentionally kill the scheduler without generating a new
+    /// `MSG_TYPE_SCHED_EXIT`. A frame for an earlier unexpected exit may
+    /// already have been sent; the true return preserves that fact.
     ///
-    /// `JoinHandle::join` propagates a panic from the monitor closure
-    /// as `Err`; it is consumed and ignored — a panicked monitor is
-    /// already dead and there is no recovery path during teardown.
-    pub(crate) fn stop_and_join(self) {
+    /// `JoinHandle::join` propagates a panic from the monitor closure as
+    /// `Err`; verifier cleanup treats that as lost liveness evidence.
+    pub(crate) fn stop_and_join(self) -> bool {
         self.stop.store(true, Ordering::Release);
         self.wake();
-        if let Some(handle) = self.join_handle {
-            let _ = handle.join();
+        match self.join_handle {
+            Some(handle) => handle.join().unwrap_or(true),
+            None => true,
         }
+    }
+}
+
+/// Interpret a scheduler pidfd poll result.
+///
+/// Pidfd readiness is authoritative even while `/proc/<pid>` still exists:
+/// under `SIGCHLD=SIG_DFL` an exited child remains a zombie until `waitpid`,
+/// and zombies retain their proc entry. The old proc-only check therefore
+/// busy-spun on a readable pidfd and could suppress the scheduler-exit frame
+/// during cleanup. The proc check remains as a fallback for an odd poll
+/// result.
+pub(crate) fn sched_exit_observed(pidfd_revents: libc::c_short, proc_alive: bool) -> bool {
+    let exit_events = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+    pidfd_revents & exit_events != 0 || !proc_alive
+}
+
+/// Poll timeout for the exit monitor. An indefinite wait is safe only when
+/// both sides of the stop eventfd exist; otherwise the stop flag needs the
+/// legacy bounded recheck.
+pub(crate) fn sched_exit_poll_timeout(
+    stop_fd: libc::c_int,
+    wake_writer_available: bool,
+) -> libc::c_int {
+    if stop_fd >= 0 && wake_writer_available {
+        -1
+    } else {
+        250
     }
 }
 
@@ -738,10 +769,10 @@ impl SchedExitStop {
 /// Blocks the monitor thread in `poll(2)` against the scheduler's
 /// pidfd plus a stop-eventfd; the wait returns when either the
 /// child exits (pidfd POLLIN edge from the kernel's `do_notify_pidfd`)
-/// or the cleanup site fires the stop-eventfd. `/proc/{pid}` is
-/// re-checked post-wake to catch the rare "pidfd opened after kernel
-/// reaped" race. On the scheduler's exit two things are gated
-/// independently:
+/// or the cleanup site fires the stop-eventfd. Pidfd readiness is
+/// authoritative even for zombies; `/proc/{pid}` presence is consulted only
+/// as a fallback when poll returns without a recognized pidfd exit event. On
+/// the scheduler's exit two things are gated independently:
 ///   - `suppress_sched_log` gates the scheduler-log dump only: false
 ///     (normal mode) dumps the log over the bulk port (`dump_sched_output`
 ///     -> `send_sched_log`); true (probes active) instead waits on the
@@ -755,8 +786,11 @@ impl SchedExitStop {
 ///     genuine crash it still fires, but only after the `output_done` wait
 ///     above, so the probe payload is already out.
 ///
-/// Uses procfs instead of waitpid because SIGCHLD is SIG_IGN (the kernel
-/// auto-reaps children, making waitpid return ECHILD).
+/// Uses pidfd readiness rather than waitpid because most guest-init phases
+/// run with SIGCHLD ignored (the kernel auto-reaps children, making waitpid
+/// return ECHILD). Procfs is only a fallback: verifier dispatch temporarily
+/// uses SIGCHLD=SIG_DFL, so an exited scheduler may remain a zombie with its
+/// `/proc/<pid>` entry still present.
 ///
 /// The returned [`SchedExitStop`] carries the `Arc<AtomicBool>` the
 /// monitor reads, an eventfd the cleanup site writes via
@@ -768,11 +802,12 @@ impl SchedExitStop {
 /// an unexpected scheduler exit.
 ///
 /// Returns None when no scheduler is running.
-pub(crate) fn start_sched_exit_monitor(
+fn start_sched_exit_monitor_inner(
     sched_pid: Option<u32>,
     log_path: Option<&str>,
     suppress_sched_log: Arc<AtomicBool>,
     probe_output_done: Option<Arc<crate::sync::Latch>>,
+    create_wake_writer: bool,
 ) -> Option<SchedExitStop> {
     let pid = sched_pid?;
     let proc_path = format!("/proc/{pid}");
@@ -814,6 +849,10 @@ pub(crate) fn start_sched_exit_monitor(
             // the wake path (degrades to the no-eventfd branch).
             let monitor_fd = unsafe { OwnedFd::from_raw_fd(raw) };
             match monitor_fd.try_clone() {
+                Ok(writer_fd) if !create_wake_writer => {
+                    drop(writer_fd);
+                    (Some(monitor_fd), None)
+                }
                 Ok(writer_fd) => (Some(monitor_fd), Some(writer_fd)),
                 Err(e) => {
                     tracing::warn!(
@@ -827,21 +866,21 @@ pub(crate) fn start_sched_exit_monitor(
         }
     };
 
+    let wake_writer_available = writer_fd.is_some();
     let join_handle = std::thread::Builder::new()
         .name("sched-exit-mon".into())
         .spawn(move || {
-            // pidfd_open lets us block on SIGCHLD-equivalent
-            // notification for the scheduler process exit instead
-            // of polling /proc/{pid} on a sleep cadence.
+            // pidfd_open lets us block on SIGCHLD-equivalent notification
+            // for scheduler process exit instead of polling /proc/{pid} on a
+            // sleep cadence. Procfs remains only a post-poll fallback.
             // SAFETY: pid is the scheduler's stable pid for the
             // run; pidfd_open(2) accepts any process the caller
             // can signal (we are pid 1). pidfd_open has been
             // available since kernel 5.3 (2019); ktstr targets
-            // 6.16+ where it is unconditionally present, so the
-            // procfs fallback is dead code. A failure here means
-            // the kernel rejected the syscall entirely (sandbox /
-            // seccomp filter); abort the monitor rather than
-            // fabricate a polling fallback that hides the
+            // 6.16+ where it is unconditionally present. A failure
+            // here means the kernel rejected the syscall entirely
+            // (sandbox / seccomp filter); abort the monitor rather
+            // than fabricate a polling-only monitor that hides the
             // configuration error.
             let pidfd = unsafe {
                 libc::syscall(libc::SYS_pidfd_open, pid as libc::c_int, 0u32) as libc::c_int
@@ -852,7 +891,7 @@ pub(crate) fn start_sched_exit_monitor(
                     err = %std::io::Error::last_os_error(),
                     "ktstr-init: pidfd_open failed for sched — sched exit monitor disabled",
                 );
-                return;
+                return true;
             }
             // The monitor-side stop fd's raw value, or `-1` when the
             // caller's eventfd allocation or dup failed. `-1` in a
@@ -861,16 +900,12 @@ pub(crate) fn start_sched_exit_monitor(
             // on the degraded path with a finite timeout that
             // re-checks `stop` periodically.
             let stop_fd = monitor_fd.as_ref().map(|f| f.as_raw_fd()).unwrap_or(-1);
-            // Poll timeout policy: when the stop eventfd is live
-            // (`stop_fd >= 0`), a stop request fires the eventfd
-            // edge and the wait returns within microseconds — so an
-            // indefinite `-1` timeout is correct; the loop never has
-            // to wake just to re-check `stop`. When the eventfd
-            // allocation degraded to `None`, the legacy 250 ms
-            // cadence is the only path that pulls the thread out
-            // of the wait, so we fall back to that timeout.
-            let poll_timeout: i32 = if stop_fd >= 0 { -1 } else { 250 };
-            while !stop_clone.load(Ordering::Acquire) {
+            // Poll timeout policy: an indefinite wait is safe only when the
+            // monitor read fd and caller-owned writer both exist. If eventfd
+            // allocation or writer duplication failed, the legacy 250 ms
+            // cadence periodically rechecks the stop flag.
+            let poll_timeout = sched_exit_poll_timeout(stop_fd, wake_writer_available);
+            loop {
                 let exited = {
                     // pidfd POLLIN fires at child exit (kernel
                     // `pidfd_poll` in `fs/pidfs.c` checks
@@ -882,14 +917,11 @@ pub(crate) fn start_sched_exit_monitor(
                     // `poll` timeout) to the kernel's eventfd
                     // wakeup latency (microseconds).
                     //
-                    // Re-checking proc_path post-`poll` is a
-                    // belt-and-suspenders against the rare
-                    // "pidfd was opened but the kernel reaped
-                    // before we entered poll" race — an exited
-                    // child's pidfd POLLIN may already be latched
-                    // by the time we add it to the poll set;
-                    // checking proc_path independently catches
-                    // that case.
+                    // Pidfd revents are the primary exit evidence, including
+                    // for zombies whose proc entry persists until waitpid.
+                    // Procfs is a fail-closed fallback if poll returns
+                    // without a recognized pidfd event after an auto-reaped
+                    // child has already disappeared.
                     let mut pfds = [
                         libc::pollfd {
                             fd: pidfd,
@@ -905,14 +937,13 @@ pub(crate) fn start_sched_exit_monitor(
                     // SAFETY: pfds is a 2-element pollfd array on
                     // the local stack; nfds matches. A `stop_fd`
                     // value of `-1` is valid per poll(2) — the
-                    // kernel skips that slot. Return value not
-                    // consulted — the loop re-checks the stop
-                    // flag and the proc path each iteration
-                    // regardless.
+                    // kernel skips that slot. The pidfd revents are
+                    // authoritative for a zombie, whose proc entry remains
+                    // present until waitpid reaps it.
                     let _ = unsafe {
                         libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, poll_timeout)
                     };
-                    !Path::new(&proc_path).exists()
+                    sched_exit_observed(pfds[0].revents, Path::new(&proc_path).exists())
                 };
                 if exited {
                     if suppress_sched_log.load(Ordering::Acquire) {
@@ -942,7 +973,7 @@ pub(crate) fn start_sched_exit_monitor(
                         unsafe {
                             libc::close(pidfd);
                         }
-                        return;
+                        return true;
                     }
                     let exit_code: i32 = 1;
                     crate::vmm::guest_comms::send_sched_exit(exit_code);
@@ -956,15 +987,24 @@ pub(crate) fn start_sched_exit_monitor(
                     // the read side of the stop eventfd. The
                     // writer-side `OwnedFd` lives on the
                     // SchedExitStop returned to the caller.
-                    return;
+                    return true;
+                }
+                // Prioritise a simultaneous pidfd edge over the orderly stop
+                // edge. The caller also checks Child::try_wait after joining,
+                // covering an exit immediately after this poll snapshot.
+                if stop_clone.load(Ordering::Acquire) {
+                    unsafe {
+                        libc::close(pidfd);
+                    }
+                    return false;
                 }
                 // Drain any pending stop-eventfd reads so the next
                 // `poll` doesn't immediately re-fire on the same
                 // edge. The `stop` AtomicBool is the source of
-                // truth (re-checked at the top of the loop); the
-                // eventfd is purely a wake-edge, so a missed read
-                // is benign — the next iteration's poll wakes
-                // either way. EAGAIN under EFD_NONBLOCK (counter
+                // truth (re-checked after each poll); the eventfd is purely
+                // a wake-edge, so a missed read is benign — the next
+                // iteration's poll wakes either way. EAGAIN under
+                // EFD_NONBLOCK (counter
                 // already 0 from a racing reader, or no edge
                 // arrived) is the steady-state non-stop case.
                 if stop_fd >= 0 {
@@ -981,10 +1021,6 @@ pub(crate) fn start_sched_exit_monitor(
                     };
                 }
             }
-            // SAFETY: same as above — close on exit path.
-            unsafe {
-                libc::close(pidfd);
-            }
             // `monitor_fd` drops here as the closure returns.
         })
         .ok();
@@ -994,6 +1030,34 @@ pub(crate) fn start_sched_exit_monitor(
         wake_fd: writer_fd,
         join_handle,
     })
+}
+
+pub(crate) fn start_sched_exit_monitor(
+    sched_pid: Option<u32>,
+    log_path: Option<&str>,
+    suppress_sched_log: Arc<AtomicBool>,
+    probe_output_done: Option<Arc<crate::sync::Latch>>,
+) -> Option<SchedExitStop> {
+    start_sched_exit_monitor_inner(
+        sched_pid,
+        log_path,
+        suppress_sched_log,
+        probe_output_done,
+        true,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn start_sched_exit_monitor_without_wake_writer_for_test(
+    sched_pid: u32,
+) -> Option<SchedExitStop> {
+    start_sched_exit_monitor_inner(
+        Some(sched_pid),
+        None,
+        Arc::new(AtomicBool::new(false)),
+        None,
+        false,
+    )
 }
 
 /// Execute shell-script-like commands from a file.

@@ -1398,10 +1398,11 @@ fn default_cpu_budget(allowed_cpus: usize) -> usize {
 /// ~95 pCPUs = 2.7x), the HOST scheduler time-slices them, so guest vCPUs
 /// stall for reasons unrelated to the workload — a host-contention confound
 /// that invalidates the guest-scheduler measurement (the silent-wrong-answer
-/// class the project guards against). Sizing the budget to `== vcpus` gives
-/// the guest's CPUs real host CPUs, so its scheduler view tracks real
-/// concurrency. (A wide boot also drops ~0.7s as the kernel's parallel AP
-/// bring-up runs unthrottled, but that is incidental.)
+/// class the project guards against). Sizing the budget to `vcpus + 1` when
+/// host capacity permits gives the guest's CPUs real host CPUs and leaves
+/// service-thread headroom, so its scheduler view tracks real concurrency.
+/// (A wide boot also drops ~0.7s as the kernel's parallel AP bring-up runs
+/// unthrottled, but that is incidental.)
 ///
 /// NOT floored at the 30% `default_cpu_budget`. That floor was a bug: it made
 /// a SMALL VM over-reserve on a LARGE host — a 2-vCPU interactive shell on a
@@ -1457,8 +1458,9 @@ impl CpuCap {
     /// meaning "use the caller's auto-sized default": the
     /// kernel-build/planner path expands `None` to `default_cpu_budget`
     /// (30% of the allowed set); the no-perf VM-builder path expands it to
-    /// `no_perf_cpu_budget` (the vCPU count clamped to the allowed cpuset —
-    /// the topology's exact need, NOT floored at 30%).
+    /// `no_perf_cpu_budget` (`vcpus + 1`, clamped to the allowed cpuset and
+    /// at least 1). The extra CPU leaves room for the VMM/control threads;
+    /// this default is NOT floored at 30%.
     ///
     /// Env var is `KTSTR_CPU_CAP` (integer ≥ 1, CPU count). An empty
     /// or unset env var is treated as absent; a non-numeric value
@@ -1512,8 +1514,8 @@ impl CpuCap {
                      Cpus_allowed_list). Pick a value ≤ {allowed_cpus}, \
                      release the cgroup/taskset constraint restricting this \
                      process, or omit --cpu-cap to use the auto-sized default \
-                     (30% of the allowed set for kernel builds; the vCPU \
-                     count, floored at 30%, for VMs)."
+                     (30% of the allowed set for kernel builds; \
+                     min(vCPUs + 1, allowed CPUs) for no-perf VMs)."
                 ),
             }));
         }
@@ -2548,20 +2550,14 @@ fn should_warn_cross_node(mems: &std::collections::BTreeSet<usize>) -> bool {
     mems.len() > 1
 }
 
-/// Warning text when the effective host-CPU budget is below the guest's
-/// vCPU count, else `None`. Under `effective_host_cpus < vcpus` the host
-/// time-slices the vCPU threads, so absolute work scales ~`1/oversub` and
-/// guest-scheduler timing metrics (run_delay, off-CPU, wake latency, gaps)
-/// become host-contention artifacts — the silent-wrong-answer class the
-/// no-perf budget sizing guards against (see [`no_perf_cpu_budget`]).
+/// Diagnostic text when the effective host-CPU budget is below the guest's
+/// vCPU count, else `None`.
 ///
-/// `explicit` splits severity: a per-test `cpu_budget` / `--cpu-cap` below
-/// the vCPU count is a deliberate opt-in (the test asked to oversubscribe —
-/// an INFO note), whereas an auto-collapse (the calling process's cpuset is
-/// smaller than the vCPU count, so [`no_perf_cpu_budget`]'s
-/// `vcpus.min(allowed)` floored the budget to the allowed set) is the
-/// truly-silent case nothing opted into — a louder WARNING. `watchdog_secs`
-/// folds in the tight-watchdog false-eject caveat when small.
+/// `intentional` splits severity: no-perf / an explicit CPU budget requested
+/// shared execution, while the default placement fallback only overcommits
+/// because the host cannot provide a 1:1 mapping. Keep the text factual: this
+/// is a placement observation, not a performance-model recommendation or a
+/// claim about the guest scheduler's own watchdog tuning.
 ///
 /// Pure (returns the text) so a test pins the message + the
 /// `None`-when-not-oversubscribed polarity without capturing stderr; the
@@ -2570,40 +2566,23 @@ fn should_warn_cross_node(mems: &std::collections::BTreeSet<usize>) -> bool {
 pub(crate) fn overcommit_warning(
     effective_host_cpus: usize,
     vcpus: usize,
-    explicit: bool,
-    watchdog_secs: Option<u64>,
+    intentional: bool,
 ) -> Option<String> {
     if effective_host_cpus >= vcpus {
         return None;
     }
     let oversub = vcpus as f64 / effective_host_cpus.max(1) as f64;
-    let mut msg = if explicit {
+    let msg = if intentional {
         format!(
-            "ktstr: cpu_budget {effective_host_cpus} host CPUs < {vcpus} vCPUs \
-             ({oversub:.1}x oversubscription, opt-in): the host time-slices the \
-             vCPU threads, so absolute iterations scale ~1/{oversub:.0} and \
-             guest-scheduler timing metrics (run_delay, off-CPU, wake latency, \
-             gaps) are host-contention artifacts. Use worst_iterations_per_cpu_sec \
-             for an overcommit-invariant per-cgroup rate."
+            "ktstr: {vcpus} guest vCPUs share {effective_host_cpus} host CPUs \
+             ({oversub:.1}x oversubscribed; no-perf/cpu-budget mode)"
         )
     } else {
         format!(
-            "ktstr: WARNING: only {effective_host_cpus} host CPUs available for \
-             {vcpus} vCPUs ({oversub:.1}x oversubscription) — the process cpuset \
-             is smaller than the guest, so the auto-sized CPU budget collapsed \
-             to it. NOTHING opted into this. The host time-slices the vCPU \
-             threads, confounding guest-scheduler measurement (absolute work \
-             scales ~1/{oversub:.0}; timing metrics are host artifacts). Widen \
-             the process cpuset, or shrink the guest topology."
+            "ktstr: WARNING: {vcpus} guest vCPUs share {effective_host_cpus} host \
+             CPUs ({oversub:.1}x oversubscribed; host capacity is below guest width)"
         )
     };
-    if watchdog_secs.is_some_and(|w| w <= 5) {
-        let w = watchdog_secs.unwrap();
-        msg.push_str(&format!(
-            " Also: watchdog_timeout_s={w} is tight under oversubscription — a \
-             host-descheduled vCPU can trip the scheduler watchdog (false stall)."
-        ));
-    }
     Some(msg)
 }
 

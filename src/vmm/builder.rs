@@ -71,8 +71,9 @@ pub struct KtstrVmBuilder {
     pub(crate) memory_mib: Option<u32>,
     memory_min_mib: u32,
     /// Per-test no-perf host-CPU budget override (`#[ktstr_test(cpu_budget)]`).
-    /// `None` auto-sizes to the vCPU count; `Some(n)` forces that budget
-    /// (n < vcpus → overcommit). An explicit `--cpu-cap` still wins.
+    /// `None` auto-sizes to `min(vcpus + 1, allowed CPUs)`; `Some(n)` forces
+    /// that budget (n < vcpus → overcommit). An explicit `--cpu-cap` still
+    /// wins.
     pub(crate) cpu_budget: Option<u32>,
     pub(crate) cmdline_extra: String,
     pub(crate) timeout: Duration,
@@ -451,7 +452,8 @@ impl KtstrVmBuilder {
 
     /// Override the no-perf host-CPU budget — the number of host CPUs the
     /// VM's vCPU threads share. The default (unset) auto-sizes to the VM's
-    /// vCPU count; setting `budget` < vcpus forces CPU overcommit (used by
+    /// vCPU count plus one service CPU, clamped to the allowed cpuset;
+    /// setting `budget` < vcpus forces CPU overcommit (used by
     /// `#[ktstr_test(cpu_budget = N)]` for contention tests). Only takes
     /// effect on the no-perf path; an explicit `--cpu-cap` / `KTSTR_CPU_CAP`
     /// overrides it. This setter stores `budget` verbatim; a value of 0 is
@@ -1265,14 +1267,16 @@ impl KtstrVmBuilder {
             //
             // When the cap is absent (`CpuCap::resolve(None) ==
             // Ok(None)`), `resolve_cpu_budget` below auto-sizes the
-            // budget to the VM's own vCPU count via `no_perf_cpu_budget`
-            // (NOT the 30%-of-allowed `default_cpu_budget`, which is the
-            // kernel-build default) and passes it to the planner as an
-            // explicit `Some(cap)`. The resulting plan reserves a subset
-            // of host LLCs sized to the guest topology — a 2-vCPU VM asks
-            // ~2 CPUs, not ~30% — so no-perf-mode VMs never over-reserve
-            // and fight concurrent builds or perf-mode peers for the full
-            // host, regardless of whether the user set the flag.
+            // budget to `min(vcpus + 1, allowed CPUs)` via
+            // `no_perf_cpu_budget` (NOT the 30%-of-allowed
+            // `default_cpu_budget`, which is the kernel-build default) and
+            // passes it to the planner as an explicit `Some(cap)`. The
+            // extra CPU leaves room for VMM/control threads. The resulting
+            // plan reserves a subset of host LLCs sized to the guest
+            // topology — a 2-vCPU VM asks for 3 CPUs, not ~30% — so
+            // no-perf-mode VMs never over-reserve and fight concurrent
+            // builds or perf-mode peers for the full host, regardless of
+            // whether the user set the flag.
             //
             // `cached` returning `Err` (non-Linux, sysfs absent — the
             // process-wide cache replays the first sysfs probe's
@@ -1305,9 +1309,10 @@ impl KtstrVmBuilder {
             } else if let Ok(host_topo) = host_topology::HostTopology::cached() {
                 let test_topo = crate::topology::TestTopology::from_system()?;
                 // Effective budget: an explicit --cpu-cap / KTSTR_CPU_CAP
-                // wins; otherwise size the budget to the VM's own vCPU count
-                // so a wide VM's boot-time parallel AP bringup is not
-                // throttled by the 30% default mask (the "8 vs 200" boot
+                // wins; otherwise size the budget to the VM's vCPU count
+                // plus one service CPU, clamped to the allowed cpuset, so a
+                // wide VM's boot-time parallel AP bringup is not throttled
+                // by the 30% default mask (the "8 vs 200" boot
                 // oversubscription). Computed here rather than folded into
                 // `cpu_cap` so the bypass-conflict check above still keys on
                 // the *explicit* cap only.
@@ -1317,27 +1322,21 @@ impl KtstrVmBuilder {
                     host_topology::host_allowed_cpus().len(),
                     self.topology.total_cpus() as usize,
                 )?;
-                // Oversubscription warning: when the resolved host-CPU
-                // budget is below the guest vCPU count the host time-slices
-                // the vCPU threads, confounding guest-scheduler measurement
-                // (see host_topology::overcommit_warning). Computed HERE —
-                // after effective_cap resolves — so the explicit
-                // --cpu-cap arm (which short-circuits the match above and
-                // never reaches the vcpus comparison) is covered too, not
-                // just the auto-size arm. `explicit` keys severity:
-                // cpu_budget / --cpu-cap is an opt-in; an auto-collapse to a
-                // too-small process cpuset is the silent case.
+                // Oversubscription note: when the resolved host-CPU budget
+                // is below the guest vCPU count, record that the vCPUs share
+                // the host mask (see host_topology::overcommit_warning).
+                // Computed HERE —
+                // after effective_cap resolves — so the explicit --cpu-cap
+                // arm (which short-circuits the match above and never reaches
+                // the vcpus comparison) is covered too, not just the
+                // auto-size arm. This whole branch is no-perf, so sharing is
+                // intentional even when neither explicit cap knob was
+                // supplied.
                 if let Some(cap) = effective_cap {
                     let allowed = host_topology::host_allowed_cpus().len();
                     let vcpus = self.topology.total_cpus() as usize;
                     let eff = cap.effective_count(allowed).unwrap_or(allowed);
-                    let explicit = cpu_cap.is_some() || self.cpu_budget.is_some();
-                    if let Some(msg) = host_topology::overcommit_warning(
-                        eff,
-                        vcpus,
-                        explicit,
-                        self.watchdog_timeout.map(|d| d.as_secs()),
-                    ) {
+                    if let Some(msg) = host_topology::overcommit_warning(eff, vcpus, true) {
                         // KTSTR_CARGO_TEST_MODE does not enforce the budget
                         // (acquire_llc_plan masks to the full allowed cpuset
                         // and ignores cpu_cap), so the would-be-overcommit
@@ -1636,9 +1635,10 @@ fn resolve_effective_cpu_budget(
 ///   provenance split: the operator knob (`--cpu-cap`, validated in
 ///   [`host_topology::CpuCap::effective_count`]) FAILS when unsatisfiable; the
 ///   author attribute SKIPS.
-/// - Absent both, the budget auto-sizes to the VM's vCPU count via
-///   [`host_topology::no_perf_cpu_budget`] so a wide VM's boot-time parallel AP
-///   bringup is not throttled by the 30% default mask.
+/// - Absent both, the budget auto-sizes to `min(vcpus + 1, allowed CPUs)` via
+///   [`host_topology::no_perf_cpu_budget`]. The extra CPU leaves room for
+///   VMM/control threads, while a wide VM's boot-time parallel AP bringup is
+///   not throttled by the 30% kernel-build default.
 ///
 /// Extracted from `build()` as a pure function so the budget-resolution policy
 /// is unit-testable without booting a VM.

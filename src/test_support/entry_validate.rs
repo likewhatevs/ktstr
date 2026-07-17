@@ -194,7 +194,8 @@ impl crate::test_support::KtstrTestEntry {
             anyhow::bail!(
                 "KtstrTestEntry '{}'.cpu_budget=Some(0) — a zero host-CPU \
                  budget cannot run a VM. Use a positive budget, or drop \
-                 cpu_budget to auto-size the no-perf mask to the vCPU count.",
+                 cpu_budget to auto-size the no-perf mask from the vCPU count \
+                 plus service-thread headroom.",
                 self.name,
             );
         }

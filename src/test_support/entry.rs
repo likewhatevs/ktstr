@@ -1728,8 +1728,9 @@ pub struct KtstrTestEntry {
     /// VM-launch is `value << 20` bytes, not `value * 1_000_000`).
     pub memory_mib: u32,
     /// Host-CPU budget for the no-perf vCPU mask — the number of host
-    /// CPUs the VM's vCPU threads share. `None` auto-sizes to the vCPU
-    /// count (so a wide VM's parallel AP bringup isn't throttled);
+    /// CPUs the VM's vCPU threads share. `None` auto-sizes from the vCPU
+    /// count plus one service CPU, capped by the allowed host cpuset (so
+    /// a wide VM's parallel AP bringup isn't needlessly throttled);
     /// `Some(n)` with `n` < vCPU count forces CPU overcommit for
     /// contention testing. `Some(0)` is rejected (a zero budget cannot
     /// run a VM). Requires `no_perf_mode`: the budget sizes only the
@@ -2486,8 +2487,9 @@ impl KtstrTestEntry {
 
     /// Override `cpu_budget` (the no-perf host-CPU budget; `n` below the
     /// vCPU count forces overcommit). Sets `Some(n)`; the default is
-    /// `None` (auto-size to the vCPU count). `validate` rejects `Some(0)`
-    /// and rejects a budget set without `no_perf_mode`.
+    /// `None` (auto-size to the vCPU count plus one service CPU, clamped
+    /// to the allowed cpuset). `validate` rejects `Some(0)` and rejects a
+    /// budget set without `no_perf_mode`.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn with_cpu_budget(mut self, cpu_budget: u32) -> Self {
         self.cpu_budget = Some(cpu_budget);
@@ -2495,7 +2497,7 @@ impl KtstrTestEntry {
     }
 
     /// Clear `cpu_budget` (auto-size the no-perf vCPU mask to the vCPU
-    /// count).
+    /// count plus one service CPU, clamped to the allowed cpuset).
     #[must_use = "builder methods consume self; bind the result"]
     pub fn without_cpu_budget(mut self) -> Self {
         self.cpu_budget = None;

@@ -1007,7 +1007,7 @@ fn check_ktstr_version_compat() -> Result<(), String> {
 /// Multiple filtersets, by contrast, UNION among themselves (`exprs.iter().any`
 /// in `matches_expression`), so they MUST be folded into one `&`-composed
 /// expression to narrow rather than widen.
-fn extract_nextest_filtersets(args: Vec<String>) -> (Vec<String>, Vec<String>) {
+pub(crate) fn extract_nextest_filtersets(args: Vec<String>) -> (Vec<String>, Vec<String>) {
     let mut filters = Vec::new();
     let mut rest = Vec::new();
     let mut it = args.into_iter();

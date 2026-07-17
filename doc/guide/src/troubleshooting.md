@@ -266,7 +266,7 @@ all failures.
 
 ```text
 ktstr-watchdog: tier2-idle-wedge, kicking BSP
-ktstr-watchdog: deadline expired at 18.791573169s from VM start
+ktstr-watchdog: progress watchdog fired at 18.791573169s from VM start
   cause=tier2-idle-wedge, hard_timeout_fired=false, kill_set_by_AP=false
   phase=Teardown (Infra), monitor_live=true, evidence_channels_live=true
   max_vcpu_cpu_in_phase=54.209745ms vs budget=12s (currency=pthread), ...
@@ -278,10 +278,12 @@ log says something else fired, it was not ktstr's watchdog. The
 `cause=` token is authoritative:
 
 - `tier1-cpu-budget` — the busiest vCPU burned more guest CPU inside
-  one lifecycle phase than the phase's flat budget without reaching a
+  one lifecycle phase than that phase's budget without reaching a
   milestone: a *spinning* wedge (compare `max_vcpu_cpu_in_phase` vs
-  `budget`). Host load cannot cause this — a starved cell accrues no
-  CPU.
+  `budget`). Boot reuses the width-scaled boot-headroom allowance;
+  attach, dispatch, and teardown use flat budgets, and the test body
+  has Tier-1 disabled. Host load cannot cause this — a starved cell
+  accrues no CPU.
 - `tier2-idle-wedge` — an infrastructure phase (boot / attach /
   dispatch / teardown, never the test body) sat past its wall backstop
   with nothing runnable in the guest: a *silent* wedge (compare

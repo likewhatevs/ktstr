@@ -333,7 +333,7 @@ fn head_replans_to_freed_alternative_candidate() {
     });
 
     let start = std::time::Instant::now();
-    let rl = crate::vmm::KtstrVm::acquire_default_run_locks(Some(&host), &topo, None, true)
+    let rl = crate::vmm::KtstrVm::acquire_default_run_locks(Some(&host), &topo, true)
         .expect("acquisition must complete via the freed alternative");
     let elapsed = start.elapsed();
     releaser.join().expect("releaser thread");

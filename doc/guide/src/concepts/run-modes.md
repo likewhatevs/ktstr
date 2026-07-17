@@ -292,11 +292,12 @@ makes the same decisions regardless of mode — it reasons about a phase's
 CPU burn and runnable demand, not about pinning:
 
 - **Tier-1 (spinning wedge)** — the busiest single vCPU's in-phase CPU
-  burn crossed the phase's *flat, width-independent* budget without
-  reaching a milestone. The evidence is the max per-vCPU burn, so a wide
-  idle guest's diffuse background CPU does not trip it; a lone spinner
-  does. The budget is widened 3/2 under the pthread CPU currency to absorb
-  VM-exit overhead.
+  burn crossed the phase's budget without reaching a milestone. Boot
+  reuses the width-scaled boot-headroom allowance; attach, dispatch, and
+  teardown keep flat, width-independent budgets, while Body has Tier-1
+  disabled. The evidence is the max per-vCPU burn, so a wide idle guest's
+  diffuse background CPU does not trip it; a lone spinner does. The budget
+  is widened 3/2 under the pthread CPU currency to absorb VM-exit overhead.
 - **Tier-2 (silent idle wedge)** — an INFRA phase sat past its wall
   backstop with live evidence channels and no runnable demand. The
   runnable conjunct is the load-bearing idea: a starved-but-alive cell
@@ -426,7 +427,7 @@ per-resource lock table and the planning phases are in
 |---|---|---|---|
 | **Measurement fidelity** | reservation only — host noise remains | highest — host variance removed | lowest — vCPUs float on shared CPUs |
 | **Host sharing** | shares LLCs, owns its CPUs | owns whole LLCs exclusively | shares a budgeted LLC subset |
-| **Contention behaviour** | wait for holders, then retryable fail (or overcommit if the host is too small) | wait + retryable fail (`ResourceContention`) | shared pool — peers wait, not race |
+| **Contention behaviour** | wait for holders, then retryable fail (or overcommit if the host is too small) | wait + retryable fail (`ResourceContention`) | shared pool — compatible peers coexist; wait only for `LOCK_EX` |
 | **Cost** | none beyond the reservation | needs `(llcs·cores·threads)+1` CPUs, free LLCs, hugepages, `CAP_SYS_NICE` | one CPU budget, no privileges |
 | **Use when** | correctness tests where pass/fail is binary | timing thresholds — gaps, spreads, wake-latency, A/B against the same host | multi-tenant CI, kernel builds beside perf runs, deliberate oversubscription |
 
@@ -435,7 +436,7 @@ against how densely the host can be shared, and each fails contention
 differently. Positions are ordered by the documented mechanisms; the
 dilation figures are the [measured reference points](#validation-evidence):
 
-<div class="kt-figure"><svg width="700" height="290" viewBox="0 0 700 290" role="img" aria-label="The mode tradeoff space: measurement fidelity on the vertical axis against host sharing and parallel density on the horizontal axis. Performance mode sits top-left — highest fidelity, exclusive host use, dilation about 1.0 when pinned, and contention resolves as skip plus retry. Default mode sits mid-chart — a reservation without isolation, sharing LLCs while owning its CPUs, busy slots resolving as skip plus retry. No-perf mode sits lower right — a shared pool where peers wait rather than race, with the measured wide near-1:1 dilation about 1.13 and the +40 percent wakeup-p99 tail from FIFO-2 sensing. A dashed arrow from Default leads to its overcommit fallback at the bottom right: when the host is too small the run proceeds masked and oversubscribed, where timing metrics are host artifacts.">
+<div class="kt-figure"><svg width="700" height="290" viewBox="0 0 700 290" role="img" aria-label="The mode tradeoff space: measurement fidelity on the vertical axis against host sharing and parallel density on the horizontal axis. Performance mode sits top-left — highest fidelity, exclusive host use, dilation about 1.0 when pinned, and contention resolves as skip plus retry. Default mode sits mid-chart — a reservation without isolation, sharing LLCs while owning its CPUs, busy slots resolving as skip plus retry. No-perf mode sits lower right — a shared pool where compatible peers coexist and only an exclusive holder makes them wait, with the measured wide near-1:1 dilation about 1.13 and the +40 percent wakeup-p99 tail from FIFO-2 sensing. A dashed arrow from Default leads to its overcommit fallback at the bottom right: when the host is too small the run proceeds masked and oversubscribed, where timing metrics are host artifacts.">
   <defs><marker id="rm-arrC" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg)"/></marker></defs>
   <text x="48" y="20" font-size="10" font-weight="700" fill="var(--fg)" opacity=".8">measurement fidelity</text>
   <path d="M60 250 L 60 30" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#rm-arrC)"/>
@@ -451,7 +452,7 @@ dilation figures are the [measured reference points](#validation-evidence):
   <text x="336" y="145" font-size="9" fill="var(--fg)" opacity=".75">busy slots → skip + retry</text>
   <circle cx="470" cy="158" r="7" fill="var(--kt-accent)"/>
   <text x="486" y="153" font-size="10.5" font-weight="700" fill="var(--fg)">No-perf</text>
-  <text x="486" y="167" font-size="9" fill="var(--fg)" opacity=".75">shared pool — peers wait, not race</text>
+  <text x="486" y="167" font-size="9" fill="var(--fg)" opacity=".75">shared pool — compatible peers coexist</text>
   <text x="486" y="180" font-size="9" fill="var(--fg)" opacity=".75">wide near-1:1: D ≈ 1.13,</text>
   <text x="486" y="193" font-size="9" fill="var(--fg)" opacity=".75">+40% wakeup-p99 tail</text>
   <path d="M328 130 C 360 215, 450 240, 598 237" stroke="var(--fg)" stroke-width="1.2" fill="none" stroke-dasharray="5 4" opacity=".7" marker-end="url(#rm-arrC)"/>
@@ -506,14 +507,12 @@ cost in its place — wide wakeup-**p50** shifts from ~6.5 µs to ~15.8 µs
 (+9.3 µs, spreads disjoint), the per-wakeup preemption charge of the RT
 sensing threads spread uniformly instead of erratically. It surfaces only
 at width (narrow wakeups are identical to the µs on both sides), only on
-the wakeup median, and only in a mode whose contract already declines
-timing fidelity: no-perf mode masks rather than pins, and its
-oversubscription warning states plainly that under it *"timing metrics
-are host artifacts."* Throughput is unaffected (rps +0.9%, loop count
-+0.5%, in-envelope) and the wide request median is reproducibly ~8%
-*faster*. A cross-commit absolute baseline on wide-cell wakeup-p50 should
-be re-taken; a threshold test, which gates on metric presence, is
-unaffected.
+the wakeup median, and only in no-perf mode, whose contract masks rather
+than pins and does not promise timing isolation. Throughput is unaffected
+(rps +0.9%, loop count +0.5%, in-envelope) and the wide request median is
+reproducibly ~8% *faster*. A cross-commit absolute baseline on wide-cell
+wakeup-p50 should be re-taken; a threshold test, which gates on metric
+presence, is unaffected.
 
 **The contention witness no longer scales its hot-path file reads with VM
 width.** Earlier validation laddered the original per-tick O(vCPU) schedstat

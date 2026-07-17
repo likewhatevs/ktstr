@@ -50,8 +50,12 @@
 //! resolve_test_kernel single-kernel fallback that would silently
 //! run a cell against an unrelated kernel).
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
+
+use cargo_metadata::semver::Version;
+use cargo_metadata::{CargoOpt, Metadata, MetadataCommand, PackageId};
 
 use crate::kernel::{
     encode_kernel_list, path_kernel_label, resolve_kernel_image, resolve_kernel_set,
@@ -98,6 +102,431 @@ fn sweep_stale_result_dirs(temp_root: &std::path::Path) {
     }
 }
 
+/// One workspace package whose test-link closure contains only the
+/// cargo-ktstr CLI's ktstr version, so its verifier declarations are safe to
+/// enumerate with this CLI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompatibleVerifierPackage {
+    name: String,
+}
+
+/// One workspace package whose test-link closure contains an older ktstr.
+///
+/// Exclusion is package-wide: cargo metadata cannot attribute distributed
+/// scheduler registrations to one test target when a package links multiple
+/// ktstr versions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OlderVerifierPackage {
+    name: String,
+    versions: Vec<Version>,
+}
+
+/// One workspace package whose test-link closure contains ktstr newer than
+/// this cargo-ktstr CLI. Unlike an older package, this is an error when the
+/// package is in the requested Cargo selection: the CLI predates its protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NewerVerifierPackage {
+    name: String,
+    versions: Vec<Version>,
+}
+
+/// Package-level compatibility partition for verifier test discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifierPackagePlan {
+    compatible: Vec<CompatibleVerifierPackage>,
+    older: Vec<OlderVerifierPackage>,
+    newer: Vec<NewerVerifierPackage>,
+}
+
+/// Whether one cargo-metadata dependency edge can be linked into a test target.
+///
+/// The workspace member's own dev-dependencies participate in its tests.
+/// Development dependencies of a dependency do not; normal dependencies keep
+/// traversing at every depth. Empty `dep_kinds` is cargo metadata's
+/// backwards-compatible spelling for a normal dependency.
+fn test_link_edge(dep: &cargo_metadata::NodeDep, workspace_root: bool) -> bool {
+    dep.dep_kinds.is_empty()
+        || dep.dep_kinds.iter().any(|kind| {
+            matches!(kind.kind, cargo_metadata::DependencyKind::Normal)
+                || (workspace_root
+                    && matches!(kind.kind, cargo_metadata::DependencyKind::Development))
+        })
+}
+
+/// Collect every ktstr version in one workspace member's package-level test
+/// link closure.
+///
+/// This deliberately walks beyond the direct edge. A current ktstr test
+/// package can also link a dependency carrying an old ktstr and therefore an
+/// old distributed scheduler registry. Package-level metadata cannot prove
+/// which individual test binary retains that dependency, so any such mixed
+/// package is excluded conservatively.
+fn linked_ktstr_versions(
+    member_id: &PackageId,
+    packages: &HashMap<&PackageId, &cargo_metadata::Package>,
+    nodes: &HashMap<&PackageId, &cargo_metadata::Node>,
+) -> Vec<Version> {
+    let mut versions = Vec::new();
+    let mut seen = HashSet::new();
+    let mut pending = vec![(member_id, true)];
+
+    while let Some((package_id, workspace_root)) = pending.pop() {
+        if !seen.insert(package_id.clone()) {
+            continue;
+        }
+        let Some(package) = packages.get(package_id).copied() else {
+            continue;
+        };
+        if package.name == "ktstr" {
+            versions.push(package.version.clone());
+            // A ktstr package cannot contribute a second scheduler registry
+            // through its own ordinary dependencies.
+            continue;
+        }
+        let Some(node) = nodes.get(package_id).copied() else {
+            continue;
+        };
+        for dep in &node.deps {
+            if !test_link_edge(dep, workspace_root) {
+                continue;
+            }
+            pending.push((&dep.pkg, false));
+        }
+    }
+
+    versions.sort_by(|a, b| a.cmp_precedence(b));
+    versions.dedup_by(|a, b| a.cmp_precedence(b).is_eq());
+    versions
+}
+
+/// Partition workspace members by the ktstr versions linked into their tests.
+///
+/// - no linked ktstr: irrelevant to verifier declaration discovery;
+/// - exactly the CLI version: compatible;
+/// - any older version (including old+current): skip the whole package;
+/// - any newer version: record an error candidate; the caller first applies
+///   explicit Cargo package selection so an unrelated newer package cannot
+///   abort a deliberately scoped current-package run.
+fn verifier_package_plan(meta: &Metadata, cli: &Version) -> Result<VerifierPackagePlan, String> {
+    let resolve = meta
+        .resolve
+        .as_ref()
+        .ok_or_else(|| "cargo metadata omitted the dependency resolve graph".to_string())?;
+    let packages: HashMap<_, _> = meta.packages.iter().map(|p| (&p.id, p)).collect();
+    let nodes: HashMap<_, _> = resolve.nodes.iter().map(|n| (&n.id, n)).collect();
+    let mut compatible = Vec::new();
+    let mut older = Vec::new();
+    let mut newer = Vec::new();
+
+    for member_id in &meta.workspace_members {
+        let Some(member) = packages.get(member_id).copied() else {
+            continue;
+        };
+        let versions = linked_ktstr_versions(member_id, &packages, &nodes);
+        if versions.is_empty() {
+            continue;
+        }
+        if versions.iter().any(|v| v.cmp_precedence(cli).is_gt()) {
+            newer.push(NewerVerifierPackage {
+                name: member.name.to_string(),
+                versions,
+            });
+        } else if versions.iter().any(|v| v.cmp_precedence(cli).is_lt()) {
+            older.push(OlderVerifierPackage {
+                name: member.name.to_string(),
+                versions,
+            });
+        } else {
+            compatible.push(CompatibleVerifierPackage {
+                name: member.name.to_string(),
+            });
+        }
+    }
+
+    compatible.sort_by(|a, b| a.name.cmp(&b.name));
+    older.sort_by(|a, b| a.name.cmp(&b.name));
+    newer.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(VerifierPackagePlan {
+        compatible,
+        older,
+        newer,
+    })
+}
+
+/// Cargo options which affect dependency resolution and are safe to replay on
+/// the verifier's metadata preflight. Feature selection is intentionally not
+/// copied: the preflight always uses all features so optional ktstr test edges
+/// (such as scx's `ktstr-tests`) are visible before nextest builds anything.
+fn metadata_passthrough_options(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if matches!(arg.as_str(), "--locked" | "--offline" | "--frozen") {
+            out.push(arg.clone());
+        } else if matches!(arg.as_str(), "--config" | "--manifest-path") {
+            out.push(arg.clone());
+            if let Some(value) = it.next() {
+                out.push(value.clone());
+            }
+        } else if arg.starts_with("--config=") || arg.starts_with("--manifest-path=") {
+            out.push(arg.clone());
+        }
+    }
+    out
+}
+
+/// Resolve the verifier package partition before either nextest warm-up or run.
+///
+/// `cargo_path("cargo")` is load-bearing for local development: unlike
+/// cargo_metadata's `$CARGO` default, it honors the PATH cargo wrapper used to
+/// patch crates.io ktstr to a checkout.
+fn query_verifier_package_plan(args: &[String]) -> Result<VerifierPackagePlan, String> {
+    let cli = Version::parse(env!("CARGO_PKG_VERSION"))
+        .expect("cargo-ktstr's own CARGO_PKG_VERSION is valid semver");
+    let mut command = MetadataCommand::new();
+    command
+        .cargo_path("cargo")
+        .features(CargoOpt::AllFeatures)
+        .other_options(metadata_passthrough_options(args));
+    let metadata = command
+        .exec()
+        .map_err(|e| format!("cargo ktstr verifier: cargo metadata failed: {e}"))?;
+    verifier_package_plan(&metadata, &cli)
+}
+
+fn format_older_package_skip(package: &OlderVerifierPackage) -> String {
+    let versions = package
+        .versions
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("/");
+    format!(
+        "cargo ktstr verifier: skipping {} (ktstr {versions}): this test is older; update or exclude it",
+        package.name,
+    )
+}
+
+/// Recover a Cargo package name from the common `-p` package-id spellings.
+///
+/// Exact names and `name@version` cover normal verifier use. A full package ID
+/// (`registry+...#name@version` / `path+...#name@version`) is reduced to its
+/// fragment. Anything with Cargo package-spec syntax this small parser cannot
+/// prove is left unresolved, causing selection filtering to stay conservative.
+fn package_spec_name(spec: &str) -> Option<&str> {
+    let tail = spec.rsplit_once('#').map_or(spec, |(_, tail)| tail);
+    let name = tail.split(['@', ':']).next()?;
+    (!name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+    .then_some(name)
+}
+
+/// Exact package names requested by `-p` / `--package`, or `None` for the
+/// unscoped / `--workspace` case (and for package-id syntax we cannot prove).
+fn explicit_package_selection(args: &[String]) -> Option<HashSet<String>> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--workspace" | "--all"))
+    {
+        return None;
+    }
+    let mut selected = HashSet::new();
+    let mut saw_package = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let spec = if matches!(arg.as_str(), "-p" | "--package") {
+            saw_package = true;
+            index += 1;
+            args.get(index).map(String::as_str)
+        } else if let Some(spec) = arg.strip_prefix("--package=") {
+            saw_package = true;
+            Some(spec)
+        } else if let Some(spec) = arg.strip_prefix("-p")
+            && !spec.is_empty()
+        {
+            saw_package = true;
+            Some(spec)
+        } else {
+            None
+        };
+        if let Some(spec) = spec {
+            let name = package_spec_name(spec)?;
+            selected.insert(name.to_string());
+        } else if saw_package && matches!(arg.as_str(), "-p" | "--package") {
+            // A missing selector value is invalid Cargo syntax. Do not infer a
+            // narrower compatibility scope from it.
+            return None;
+        }
+        index += 1;
+    }
+    saw_package.then_some(selected)
+}
+
+fn explicit_package_exclusions(args: &[String]) -> HashSet<String> {
+    let mut excluded = HashSet::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let spec = if arg == "--exclude" {
+            index += 1;
+            args.get(index).map(String::as_str)
+        } else {
+            arg.strip_prefix("--exclude=")
+        };
+        if let Some(name) = spec.and_then(package_spec_name) {
+            excluded.insert(name.to_string());
+        }
+        index += 1;
+    }
+    excluded
+}
+
+fn restrict_plan_to_explicit_selection(
+    mut plan: VerifierPackagePlan,
+    args: &[String],
+) -> VerifierPackagePlan {
+    let excluded = explicit_package_exclusions(args);
+    plan.compatible
+        .retain(|package| !excluded.contains(&package.name));
+    plan.older
+        .retain(|package| !excluded.contains(&package.name));
+    plan.newer
+        .retain(|package| !excluded.contains(&package.name));
+
+    let Some(selected) = explicit_package_selection(args) else {
+        return plan;
+    };
+    plan.compatible
+        .retain(|package| selected.contains(&package.name));
+    plan.older
+        .retain(|package| selected.contains(&package.name));
+    plan.newer
+        .retain(|package| selected.contains(&package.name));
+    plan
+}
+
+/// Remove exact `-p` selectors for packages already classified as old.
+///
+/// This matters for a mixed explicit selection: the invariant nextest package
+/// gate prevents an old binary from listing, but dropping its Cargo selector
+/// also prevents its obsolete dependency stack from being compiled at all.
+fn drop_older_package_selectors(args: &[String], older: &[OlderVerifierPackage]) -> Vec<String> {
+    let old_names: HashSet<&str> = older.iter().map(|package| package.name.as_str()).collect();
+    let mut out = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if matches!(arg.as_str(), "-p" | "--package") {
+            if let Some(spec) = args.get(index + 1)
+                && package_spec_name(spec).is_some_and(|name| old_names.contains(name))
+            {
+                index += 2;
+                continue;
+            }
+            out.push(arg.clone());
+            if let Some(spec) = args.get(index + 1) {
+                out.push(spec.clone());
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        let old_equals = arg
+            .strip_prefix("--package=")
+            .or_else(|| arg.strip_prefix("-p").filter(|spec| !spec.is_empty()))
+            .and_then(package_spec_name)
+            .is_some_and(|name| old_names.contains(name));
+        if !old_equals {
+            out.push(arg.clone());
+        }
+        index += 1;
+    }
+    out
+}
+
+fn has_package_selector(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "-p" | "--package" | "--workspace" | "--all" | "--exclude"
+        ) || arg.starts_with("--package=")
+            || arg.starts_with("--exclude=")
+            || (arg.starts_with("-p") && arg.len() > 2)
+    })
+}
+
+fn has_workspace_selector(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.as_str(), "--workspace" | "--all"))
+}
+
+/// Build the one invariant nextest filter used by both warm-up and run.
+///
+/// Nextest unions multiple `-E` arguments, so forwarded user filtersets are
+/// extracted and intersected with the verifier/package gate. This prevents a
+/// user filter from widening discovery back into a test binary linked against
+/// old ktstr.
+fn build_scoped_nextest_args(
+    nextest_profile: Option<&str>,
+    forward: &[String],
+    plan: &VerifierPackagePlan,
+) -> Vec<String> {
+    let (user_filtersets, rest) = crate::run_cargo::extract_nextest_filtersets(forward.to_vec());
+    let cell_gate = "test(/^verifier/) & !test(/^verifier::/)";
+    let package_gate = plan
+        .compatible
+        .iter()
+        .map(|package| format!("package(={})", package.name))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let invariant = if package_gate.is_empty() {
+        cell_gate.to_string()
+    } else {
+        format!("({cell_gate}) & ({package_gate})")
+    };
+    let filter = if user_filtersets.is_empty() {
+        invariant
+    } else {
+        let user_union = user_filtersets
+            .iter()
+            .map(|filter| format!("({filter})"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        format!("({invariant}) & ({user_union})")
+    };
+
+    let mut args = ktstr::verifier::build_nextest_args(nextest_profile, &[]);
+    let filter_index = args
+        .iter()
+        .position(|arg| arg == "-E")
+        .map(|index| index + 1)
+        .expect("build_nextest_args always carries -E <filter>");
+    args[filter_index] = filter;
+
+    // The unscoped one-shot path selects ONLY packages that can enumerate
+    // current verifier declarations. This keeps old ktstr (and every unrelated
+    // workspace package) out of the compile itself. Existing explicit package
+    // selection is preserved rather than widened; the invariant package gate
+    // above still prevents an old binary from listing or running cells.
+    if has_workspace_selector(&rest) {
+        for package in &plan.older {
+            args.push("--exclude".to_string());
+            args.push(package.name.clone());
+        }
+    } else if !has_package_selector(&rest) {
+        for package in &plan.compatible {
+            args.push("-p".to_string());
+            args.push(package.name.clone());
+        }
+    }
+    args.extend(rest);
+    args
+}
+
 /// Dispatch the `cargo ktstr verifier` subcommand.
 ///
 /// The trailing `args` are forwarded verbatim to the inner
@@ -123,6 +552,33 @@ pub(crate) fn run_verifier(
     include_eol: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
+    let package_plan =
+        restrict_plan_to_explicit_selection(query_verifier_package_plan(&args)?, &args);
+    if let Some(package) = package_plan.newer.first() {
+        let versions = package
+            .versions
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("/");
+        return Err(format!(
+            "package {} uses ktstr {versions}, newer than cargo-ktstr {}; update cargo-ktstr",
+            package.name,
+            env!("CARGO_PKG_VERSION"),
+        ));
+    }
+    for package in &package_plan.older {
+        eprintln!("{}", format_older_package_skip(package));
+    }
+    // Every verifier-bearing workspace member is old. Excluding those tests is
+    // explicitly a non-error, and there is nothing current to ask nextest to
+    // build or enumerate.
+    if package_plan.compatible.is_empty() && !package_plan.older.is_empty() {
+        return Ok(());
+    }
+    let args = drop_older_package_selectors(&args, &package_plan.older);
+    let nextest_args = build_scoped_nextest_args(nextest_profile.as_deref(), &args, &package_plan);
+
     let mut cmd = Command::new("cargo");
     // The nextest argument vector — base flags (`--run-ignored all`, the
     // load-bearing `--no-tests pass`, and the `verifier/...`-cell filter),
@@ -134,10 +590,7 @@ pub(crate) fn run_verifier(
     // so a passthrough token cannot shadow it; no `--` separator is needed
     // (the bin's argsplit rewrite routes native flags to ktstr and the
     // passthrough to the `last = true` `args` field before clap parses).
-    cmd.args(ktstr::verifier::build_nextest_args(
-        nextest_profile.as_deref(),
-        &args,
-    ));
+    cmd.args(&nextest_args);
 
     // Hand the child build cargo-ktstr's embedded busybox / wprof
     // (mirrors run_cargo_sub): `build.rs` watches `KTSTR_BUSYBOX_BIN` /
@@ -225,9 +678,7 @@ pub(crate) fn run_verifier(
     // handling: the verifier dispatcher injects none, so warm-up and run
     // inherit the identical process env.
     let mut warm = Command::new("cargo");
-    warm.args(crate::run_cargo::prebuild_no_run_args(
-        &ktstr::verifier::build_nextest_args(nextest_profile.as_deref(), &args),
-    ));
+    warm.args(crate::run_cargo::prebuild_no_run_args(&nextest_args));
     for (var, val) in &blob_envs {
         warm.env(var, val);
     }
@@ -323,6 +774,293 @@ pub(crate) fn run_verifier(
 mod tests {
     use super::*;
 
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn package_json(name: &str, version: &str, id: &str) -> String {
+        format!(
+            r#"{{"name":"{name}","version":"{version}","id":"{id}","source":null,"description":null,"dependencies":[],"license":null,"license_file":null,"targets":[],"features":{{}},"manifest_path":"/w/{name}/Cargo.toml","readme":null,"repository":null,"homepage":null,"documentation":null,"links":null,"publish":null,"default_run":null}}"#
+        )
+    }
+
+    fn scx_version_fixture() -> Metadata {
+        let layered = "scx_layered 1.0.0 (path+file:///w/scx_layered)";
+        let lavd = "scx_lavd 1.0.0 (path+file:///w/scx_lavd)";
+        let mitosis = "scx_mitosis 1.0.0 (path+file:///w/scx_mitosis)";
+        let unrelated = "unrelated 1.0.0 (path+file:///w/unrelated)";
+        let helper = "helper 1.0.0 (path+file:///w/helper)";
+        let current = "ktstr 0.41.0 (path+file:///checkout/ktstr)";
+        let old = "ktstr 0.18.0 (registry+https://github.com/rust-lang/crates.io-index)";
+        let json = format!(
+            r#"{{
+              "packages":[{layered_pkg},{lavd_pkg},{mitosis_pkg},{unrelated_pkg},{helper_pkg},{current_pkg},{old_pkg}],
+              "workspace_members":["{layered}","{lavd}","{mitosis}","{unrelated}"],
+              "resolve":{{
+                "root":null,
+                "nodes":[
+                  {{"id":"{layered}","deps":[{{"name":"ktstr","pkg":"{current}","dep_kinds":[{{"kind":null,"target":null}}]}}],"dependencies":["{current}"],"features":["ktstr-tests"]}},
+                  {{"id":"{lavd}","deps":[{{"name":"helper","pkg":"{helper}","dep_kinds":[{{"kind":null,"target":null}}]}}],"dependencies":["{helper}"],"features":["ktstr-tests"]}},
+                  {{"id":"{mitosis}","deps":[{{"name":"ktstr","pkg":"{old}","dep_kinds":[{{"kind":"dev","target":null}}]}}],"dependencies":["{old}"],"features":["ktstr-tests"]}},
+                  {{"id":"{unrelated}","deps":[{{"name":"ktstr","pkg":"{old}","dep_kinds":[{{"kind":"build","target":null}}]}}],"dependencies":["{old}"],"features":[]}},
+                  {{"id":"{helper}","deps":[{{"name":"ktstr","pkg":"{current}","dep_kinds":[{{"kind":null,"target":null}}]}}],"dependencies":["{current}"],"features":[]}},
+                  {{"id":"{current}","deps":[],"dependencies":[],"features":[]}},
+                  {{"id":"{old}","deps":[],"dependencies":[],"features":[]}}
+                ]
+              }},
+              "workspace_root":"/w","target_directory":"/w/target","version":1
+            }}"#,
+            layered_pkg = package_json("scx_layered", "1.0.0", layered),
+            lavd_pkg = package_json("scx_lavd", "1.0.0", lavd),
+            mitosis_pkg = package_json("scx_mitosis", "1.0.0", mitosis),
+            unrelated_pkg = package_json("unrelated", "1.0.0", unrelated),
+            helper_pkg = package_json("helper", "1.0.0", helper),
+            current_pkg = package_json("ktstr", "0.41.0", current),
+            old_pkg = package_json("ktstr", "0.18.0", old),
+        );
+        serde_json::from_str(&json).expect("cargo metadata fixture deserializes")
+    }
+
+    #[test]
+    fn package_plan_keeps_current_and_skips_old_test_closures() {
+        let plan =
+            verifier_package_plan(&scx_version_fixture(), &Version::parse("0.41.0").unwrap())
+                .expect("fixture has no newer ktstr");
+        assert_eq!(
+            plan.compatible,
+            vec![
+                CompatibleVerifierPackage {
+                    name: "scx_lavd".to_string(),
+                },
+                CompatibleVerifierPackage {
+                    name: "scx_layered".to_string(),
+                },
+            ],
+            "direct and transitive current ktstr links are both eligible",
+        );
+        assert_eq!(
+            plan.older,
+            vec![OlderVerifierPackage {
+                name: "scx_mitosis".to_string(),
+                versions: vec![Version::parse("0.18.0").unwrap()],
+            }],
+            "the old dev edge is excluded; the unrelated build-only edge is ignored",
+        );
+    }
+
+    #[test]
+    fn package_plan_records_newer_ktstr_for_scope_aware_error() {
+        let plan =
+            verifier_package_plan(&scx_version_fixture(), &Version::parse("0.17.0").unwrap())
+                .expect("fixture has a resolve graph");
+        assert_eq!(
+            plan.newer
+                .iter()
+                .map(|package| package.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["scx_lavd", "scx_layered", "scx_mitosis"],
+        );
+    }
+
+    fn scoped_plan() -> VerifierPackagePlan {
+        VerifierPackagePlan {
+            compatible: vec![
+                CompatibleVerifierPackage {
+                    name: "scx_cosmos".to_string(),
+                },
+                CompatibleVerifierPackage {
+                    name: "scx_layered".to_string(),
+                },
+            ],
+            older: vec![OlderVerifierPackage {
+                name: "scx_mitosis".to_string(),
+                versions: vec![Version::parse("0.18.0").unwrap()],
+            }],
+            newer: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn unscoped_verifier_selects_only_current_packages() {
+        let args = build_scoped_nextest_args(
+            None,
+            &strings(&["--features", "ktstr-tests"]),
+            &scoped_plan(),
+        );
+        assert!(
+            args.windows(2).any(|pair| pair == ["-p", "scx_cosmos"]),
+            "{args:?}",
+        );
+        assert!(
+            args.windows(2).any(|pair| pair == ["-p", "scx_layered"]),
+            "{args:?}",
+        );
+        assert!(!args.iter().any(|arg| arg == "scx_mitosis"), "{args:?}");
+        assert!(args.iter().any(|arg| {
+            arg == "(test(/^verifier/) & !test(/^verifier::/)) & \
+                    (package(=scx_cosmos) | package(=scx_layered))"
+        }));
+    }
+
+    #[test]
+    fn explicit_package_selection_is_not_widened() {
+        let args = build_scoped_nextest_args(
+            None,
+            &strings(&["-p", "scx_layered", "--features", "ktstr-tests"]),
+            &scoped_plan(),
+        );
+        let selected = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-p")
+            .map(|pair| pair[1].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(selected, vec!["scx_layered"]);
+    }
+
+    #[test]
+    fn explicit_old_package_becomes_non_error_empty_plan() {
+        let selected =
+            restrict_plan_to_explicit_selection(scoped_plan(), &strings(&["-p", "scx_mitosis"]));
+        assert!(selected.compatible.is_empty());
+        assert_eq!(selected.older[0].name, "scx_mitosis");
+        assert!(selected.newer.is_empty());
+    }
+
+    #[test]
+    fn mixed_explicit_selection_drops_old_cargo_package() {
+        let args = strings(&[
+            "-p",
+            "scx_layered",
+            "--package=scx_mitosis@1.1.2",
+            "--features",
+            "ktstr-tests",
+        ]);
+        let selected = restrict_plan_to_explicit_selection(scoped_plan(), &args);
+        let rewritten = drop_older_package_selectors(&args, &selected.older);
+        assert_eq!(
+            rewritten,
+            strings(&["-p", "scx_layered", "--features", "ktstr-tests"]),
+        );
+    }
+
+    #[test]
+    fn package_spec_name_handles_exact_version_and_full_id() {
+        assert_eq!(package_spec_name("scx_layered"), Some("scx_layered"));
+        assert_eq!(package_spec_name("scx_layered@1.1.2"), Some("scx_layered"),);
+        assert_eq!(
+            package_spec_name("path+file:///w#scx_layered@1.1.2"),
+            Some("scx_layered"),
+        );
+        assert_eq!(package_spec_name("scx_*"), None);
+    }
+
+    #[test]
+    fn explicit_current_scope_ignores_unrelated_newer_package() {
+        let mut plan = scoped_plan();
+        plan.newer.push(NewerVerifierPackage {
+            name: "future_tests".to_string(),
+            versions: vec![Version::parse("0.42.0").unwrap()],
+        });
+        let selected = restrict_plan_to_explicit_selection(plan, &strings(&["-p", "scx_layered"]));
+        assert_eq!(
+            selected.compatible,
+            vec![CompatibleVerifierPackage {
+                name: "scx_layered".to_string(),
+            }],
+        );
+        assert!(selected.older.is_empty());
+        assert!(selected.newer.is_empty());
+    }
+
+    #[test]
+    fn workspace_exclude_removes_old_and_newer_from_plan() {
+        let mut plan = scoped_plan();
+        plan.newer.push(NewerVerifierPackage {
+            name: "future_tests".to_string(),
+            versions: vec![Version::parse("0.42.0").unwrap()],
+        });
+        let selected = restrict_plan_to_explicit_selection(
+            plan,
+            &strings(&[
+                "--workspace",
+                "--exclude",
+                "scx_mitosis",
+                "--exclude=future_tests@1.0.0",
+            ]),
+        );
+        assert!(selected.older.is_empty());
+        assert!(selected.newer.is_empty());
+        assert_eq!(selected.compatible.len(), 2);
+    }
+
+    #[test]
+    fn workspace_selection_excludes_old_package_from_compile() {
+        let args = build_scoped_nextest_args(
+            None,
+            &strings(&["--workspace", "--features", "ktstr-tests"]),
+            &scoped_plan(),
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--exclude", "scx_mitosis"]),
+            "{args:?}",
+        );
+    }
+
+    #[test]
+    fn user_filtersets_are_intersected_with_package_gate() {
+        let args = build_scoped_nextest_args(
+            None,
+            &strings(&[
+                "-p",
+                "scx_layered",
+                "-E",
+                "test(large)",
+                "--filterset=test(kernel_gke)",
+            ]),
+            &scoped_plan(),
+        );
+        assert_eq!(args.iter().filter(|arg| *arg == "-E").count(), 1);
+        let filter = args
+            .windows(2)
+            .find(|pair| pair[0] == "-E")
+            .map(|pair| pair[1].as_str())
+            .expect("one folded filter");
+        assert!(filter.contains("package(=scx_cosmos) | package(=scx_layered)"));
+        assert!(filter.contains("(test(large)) | (test(kernel_gke))"));
+    }
+
+    #[test]
+    fn older_package_message_stays_short_and_actionable() {
+        assert_eq!(
+            format_older_package_skip(&scoped_plan().older[0]),
+            "cargo ktstr verifier: skipping scx_mitosis (ktstr 0.18.0): \
+             this test is older; update or exclude it",
+        );
+    }
+
+    #[test]
+    fn metadata_passthrough_keeps_only_resolution_options() {
+        assert_eq!(
+            metadata_passthrough_options(&strings(&[
+                "--locked",
+                "--features",
+                "ktstr-tests",
+                "--config",
+                "patch.crates-io.ktstr.path='../ktstr'",
+                "--offline",
+                "-p",
+                "scx_layered",
+            ])),
+            strings(&[
+                "--locked",
+                "--config",
+                "patch.crates-io.ktstr.path='../ktstr'",
+                "--offline",
+            ]),
+        );
+    }
+
     #[test]
     fn sweep_removes_dead_pid_result_dirs_keeps_live() {
         // A result dir owned by a dead pid is reclaimed; one owned by our
@@ -354,7 +1092,15 @@ mod tests {
     #[test]
     fn verifier_warmup_argv_is_run_argv_plus_no_run() {
         let forwarded = vec!["--cargo-profile".to_string(), "release".to_string()];
-        let run_argv = ktstr::verifier::build_nextest_args(Some("ci"), &forwarded);
+        let run_argv = build_scoped_nextest_args(
+            Some("ci"),
+            &forwarded,
+            &VerifierPackagePlan {
+                compatible: Vec::new(),
+                older: Vec::new(),
+                newer: Vec::new(),
+            },
+        );
         let warm_argv = crate::run_cargo::prebuild_no_run_args(&run_argv);
         assert_eq!(
             warm_argv[..warm_argv.len() - 1],

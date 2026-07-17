@@ -2875,11 +2875,12 @@ fn active_per_vcpu_cpu_ns(
 /// ([`active_per_vcpu_cpu_ns`]) and the ledger's current `phase_epoch`.
 ///
 /// WHY MAX, NOT SUM: a spinning wedge is one (or a few) hot thread(s), so
-/// its max-per-vCPU crosses a flat per-phase budget in bounded wall time;
-/// a wide idle guest's diffuse per-vCPU background burn (timer ticks / IPIs
+/// its max-per-vCPU crosses the phase budget in bounded wall time. Only
+/// Boot's budget scales with width for legitimate serial AP bring-up. A
+/// wide idle guest's diffuse per-vCPU background burn (timer ticks / IPIs
 /// — tens of ms/s/vCPU) sums to seconds across hundreds of vCPUs yet its
-/// MAX stays tens of ms. Width-independent, so Tier-1 never false-fires on
-/// guest width alone (the 256-vCPU wide-SMP false kill this replaces).
+/// MAX stays tens of ms, so Tier-1 never false-fires on guest width alone
+/// (the 256-vCPU wide-SMP false kill this replaces).
 ///
 /// RE-ANCHOR DISCIPLINE: it holds a per-vCPU `anchor` vector and the
 /// `phase_epoch` that anchor belongs to. On the FIRST observe, and on any
@@ -4419,7 +4420,8 @@ pub(crate) fn monitor_loop(
             // scx discrete-event counters are equally unsafe (they tick
             // from enqueue paths under a stalled scheduler). The watchdog
             // instead governs spinning wedges by the Tier-1 CPU budget and
-            // idle wedges by the Tier-2 trickle-stall test.
+            // idle wedges by Tier-2's live-channel, no-runnable-demand wall
+            // backstop.
 
             // Constant-cost Body contention series. The shared recorder reads
             // one runner-cgroup CPU-PSI cumulative counter here; O(vCPU)
