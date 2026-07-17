@@ -17,7 +17,8 @@ sandbox.
   coordinates with the perf-mode exclusive lock, so `make` never
   stomps a measurement in progress.
 - **Concurrent no-perf-mode VMs** — a cap of `N` CPUs bounds how much
-  capacity each run reserves; peers wait instead of racing for CPU.
+  capacity each run reserves. Shared-lock peers coexist; they wait only
+  behind an incompatible performance-mode exclusive holder.
 
 ## The three coordination modes
 
@@ -207,20 +208,23 @@ both numbers:
 sched_getaffinity / Cpus_allowed_list). Pick a value ≤ 64, release the
 cgroup/taskset constraint restricting this process, or omit --cpu-cap
 to use the auto-sized default (30% of the allowed set for kernel
-builds; the vCPU count, floored at 30%, for VMs).
+builds; min(vCPUs + 1, allowed CPUs) for no-perf VMs).
 ```
 
-The default-mode overcommit warning fires only when the allowed CPU
-set is genuinely smaller than the vCPU count (a CI runner or systemd
-slice can be narrower than the online host):
+No-perf mode records intentional sharing without prescribing a metric or
+changing placement:
 
 ```text
-ktstr: WARNING: only 8 host CPUs available for 16 vCPUs (2.0x
-oversubscription) — the process cpuset is smaller than the guest, so
-the auto-sized CPU budget collapsed to it. NOTHING opted into this.
-The host time-slices the vCPU threads, confounding guest-scheduler
-measurement (absolute work scales ~1/2; timing metrics are host
-artifacts). Widen the process cpuset, or shrink the guest topology.
+ktstr: 16 guest vCPUs share 8 host CPUs (2.0x oversubscribed;
+no-perf/cpu-budget mode)
+```
+
+The unrestricted fallback emits a warning when host capacity is below
+guest width:
+
+```text
+ktstr: WARNING: 16 guest vCPUs share 8 host CPUs (2.0x oversubscribed;
+host capacity is below guest width)
 ```
 
 The stamped `cpu_budget` in the run's sidecar also drops below the
@@ -234,11 +238,12 @@ The budget is resolved in precedence order:
 1. `--cpu-cap N` on the command line.
 2. `KTSTR_CPU_CAP=N` when the flag is absent (empty string = unset).
 3. Neither: kernel builds get 30% of the allowed CPUs (rounded up,
-   minimum 1); no-perf-mode VMs get `max(30%, min(vcpus, allowed))`
-   so a wide VM's vCPU threads are not host-oversubscribed by the
-   30% mask — an oversubscribed guest measures host contention, not
-   its own scheduler. An explicit cap *below* the vCPU count is the
-   deliberate opt-in to oversubscription for contention testing.
+   minimum 1); no-perf-mode VMs get `min(vcpus + 1, allowed)` (minimum
+   1). The extra host CPU leaves room for the VMM/control threads without
+   making a small VM reserve 30% of a large host. If the allowed cpuset
+   is narrower than the guest, the budget clamps to that cpuset and the
+   sharing note above is emitted. An explicit cap below the vCPU count is
+   the deliberate opt-in to oversubscription.
 
 `0` is rejected with `--cpu-cap must be ≥ 1 CPU (got 0)` — zero is a
 scripting sentinel, not a silent "no cap".

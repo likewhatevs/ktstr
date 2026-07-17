@@ -168,9 +168,6 @@ pub struct VerifierStats {
     pub total_states: u64,
     /// Peak concurrent explored states.
     pub peak_states: u64,
-    /// Total verification wall time in microseconds, when
-    /// BPF_LOG_STATS emitted a "verification time" line.
-    pub time_usec: Option<u64>,
     /// Stack depth in the format `"<prog>+<subprog>+<main>"` (e.g.
     /// `"32+16+8"`) when BPF_LOG_STATS emitted a "stack depth" line.
     pub stack_depth: Option<String>,
@@ -222,19 +219,19 @@ fn parse_or_warn(raw: &str, field: &str) -> u64 {
 /// Parse verifier stats from the log output.
 ///
 /// The kernel always emits a "processed N insns ..." line. When
-/// BPF_LOG_STATS is set, it also emits "verification time" and
-/// "stack depth" lines.
+/// BPF_LOG_STATS is set, it may also emit a "stack depth" line.
+/// Verification wall time is deliberately ignored: it is a noisy
+/// environment-dependent measurement and does not belong in verifier
+/// result output.
 pub fn parse_verifier_stats(log: &str) -> VerifierStats {
     let mut stats = VerifierStats {
         processed_insns: 0,
         total_states: 0,
         peak_states: 0,
-        time_usec: None,
         stack_depth: None,
     };
 
     let mut found_insns = false;
-    let mut found_time = false;
     let mut found_stack = false;
 
     for line in log.lines().rev() {
@@ -257,15 +254,6 @@ pub fn parse_verifier_stats(log: &str) -> VerifierStats {
                 }
             }
         }
-        if !found_time && line.contains("verification time") {
-            found_time = true;
-            for word in line.split_whitespace() {
-                if let Ok(n) = word.parse::<u64>() {
-                    stats.time_usec = Some(n);
-                    break;
-                }
-            }
-        }
         if !found_stack && line.contains("stack depth") {
             found_stack = true;
             if let Some(pos) = line.find("stack depth") {
@@ -276,7 +264,7 @@ pub fn parse_verifier_stats(log: &str) -> VerifierStats {
                 }
             }
         }
-        if found_insns && found_time && found_stack {
+        if found_insns && found_stack {
             break;
         }
     }
@@ -750,6 +738,41 @@ fn dispatch_confirmed_from_messages(
     })
 }
 
+/// Whether the guest's scheduler-exit monitor observed the scheduler child
+/// exiting unexpectedly. Unlike `SchedulerDied`, which is a startup
+/// lifecycle outcome, `MSG_TYPE_SCHED_EXIT` covers a scheduler that attached
+/// and then died while the verifier workload was running. A crc-invalid frame
+/// is not evidence.
+fn scheduler_exited_from_messages(
+    guest_messages: Option<&crate::vmm::host_comms::BulkDrainResult>,
+) -> bool {
+    let Some(drain) = guest_messages else {
+        return false;
+    };
+    drain
+        .entries
+        .iter()
+        .any(|e| e.msg_type == crate::vmm::wire::MSG_TYPE_SCHED_EXIT && e.crc_ok)
+}
+
+/// Decode the verifier guest's explicit terminal exit frame.
+///
+/// This deliberately does not use `VmResult::exit_code`: the BSP run loop
+/// assigns zero to a generic guest shutdown even when no `MSG_TYPE_EXIT`
+/// arrived. Verifier success needs positive terminal evidence, so only a
+/// crc-valid four-byte frame written by `guest_comms::send_exit` counts.
+fn terminal_guest_exit_from_messages(
+    guest_messages: Option<&crate::vmm::host_comms::BulkDrainResult>,
+) -> Option<i32> {
+    let drain = guest_messages?;
+    drain
+        .entries
+        .iter()
+        .rev()
+        .find(|e| e.msg_type == crate::vmm::wire::MSG_TYPE_EXIT && e.crc_ok && e.payload.len() == 4)
+        .map(|e| i32::from_le_bytes(e.payload[..4].try_into().unwrap()))
+}
+
 /// Result of collecting verifier output from a VM run.
 pub struct VerifierVmResult {
     /// Per-program verifier statistics from host-side memory
@@ -803,6 +826,17 @@ pub struct VerifierVmResult {
     /// `SCX_OPS_SWITCH_PARTIAL`) and non-zero worker progress proves
     /// dispatch, unlike an scx-specific `nr_dispatched` counter.
     pub dispatched: bool,
+    /// The guest scheduler-exit monitor observed the scheduler process
+    /// disappear after startup. This is independent of the historical
+    /// `SchedulerAttached` frame: attach-at-t1 followed by exit-at-t2 is a
+    /// failure even if SCHED_EXT fallback later lets a probe worker run.
+    pub scheduler_exited: bool,
+    /// Explicit terminal verifier guest exit code from a crc-valid
+    /// `MSG_TYPE_EXIT` frame. The verifier guest emits 0 only after worker
+    /// progress, a live scheduler child, and sched_ext `enabled` are observed
+    /// at the same completion edge. `None` is a failure: a generic VM
+    /// shutdown is not terminal verifier evidence.
+    pub guest_exit_code: Option<i32>,
     /// The host watchdog fired (hard-deadline hang) before the guest
     /// exited. NOT orthogonal to [`Self::attach`] in the way the message
     /// once implied: a hang can occur EITHER after attach (a teardown
@@ -816,9 +850,7 @@ pub struct VerifierVmResult {
     /// the attach gate as [`AttachOutcome::Unconfirmed`] instead. Because
     /// the hang is not attach-implying, [`Self::cell_verdict`] words the
     /// timeout message per [`Self::attach`] rather than always claiming
-    /// "after attach". A verifier cell FAILs on a hang — but NOT on the
-    /// guest exit code, which is `1` even on the verifier success path
-    /// (no `#[ktstr_test]` body to dispatch).
+    /// "after attach". A verifier cell FAILs on a hang.
     pub timed_out: bool,
     /// The guest's structured crash message (a `PANIC:`-prefixed line
     /// routed through the host's `extract_panic_message` into
@@ -841,14 +873,11 @@ impl VerifierVmResult {
     /// The verifier cell PASS/FAIL verdict: `Ok(())` when the scheduler
     /// verified its BPF, attached (sched_ext `enabled`), AND dispatched
     /// the injected workload; `Err(reason)` naming the first failing gate
-    /// otherwise. Gate order — `timed_out` (a hang: a post-attach
-    /// teardown wedge OR a scheduler that died mid-load and then wedged
-    /// without rebooting), then attach (did it turn on?), then dispatch
-    /// (did it schedule a task?) — so the root-cause failure is reported
-    /// first: an attach
-    /// failure is named before the dispatch gate it necessarily also
-    /// trips. Does NOT key on the guest exit code, which is `1` even on
-    /// the verifier success path (no `#[ktstr_test]` body to dispatch).
+    /// otherwise. Gate order is timeout, guest crash, observed scheduler
+    /// exit, attach, dispatch, then explicit terminal guest exit. Root cause
+    /// is reported first: an attach failure is named before the dispatch
+    /// gate it necessarily also trips, and a terminal guest exit of 0 is
+    /// required after all positive gates.
     pub fn cell_verdict(&self) -> Result<(), String> {
         // A hard-deadline hang, reported FIRST (outranks crash_message
         // and the attach/dispatch gates). The hang is NOT proof of a
@@ -881,6 +910,9 @@ impl VerifierVmResult {
         if let Some(crash) = &self.crash_message {
             return Err(crash.clone());
         }
+        if self.scheduler_exited {
+            return Err("scheduler exited during the verifier workload".to_string());
+        }
         // PASS requires the scheduler to have turned ON, not just to have
         // loaded + verified its BPF.
         if let Some(reason) = self.attach.failure_reason() {
@@ -896,6 +928,17 @@ impl VerifierVmResult {
                 "scheduler attached but did not dispatch the injected workload (0 iterations)"
                     .to_string(),
             );
+        }
+        match self.guest_exit_code {
+            Some(0) => {}
+            Some(code) => {
+                return Err(format!(
+                    "verifier guest did not complete successfully (exit code {code})"
+                ));
+            }
+            None => {
+                return Err("verifier guest did not publish a terminal exit status".to_string());
+            }
         }
         Ok(())
     }
@@ -1013,9 +1056,10 @@ pub fn collect_verifier_output(
         // A preset with a forced CPU budget (uneven-11llc) pins the
         // no-perf mask to that many host CPUs so its vCPUs ALWAYS
         // overcommit — the deliberate, continuous time-slicing path.
-        // Absent (every stock preset) leaves budget auto-sized to the
-        // vCPU count, unchanged. no_perf_mode is already set above, so
-        // cpu_budget is on its valid path.
+        // Absent (every stock preset) leaves budget on the unchanged
+        // auto-sized path: vCPU count plus service-thread headroom,
+        // capped by the allowed host cpuset. no_perf_mode is already set
+        // above, so cpu_budget is on its valid path.
         //
         // Clamp to the host's allowed CPUs: the forced budget exists to
         // FORCE overcommit, so on a host smaller than the budget it must
@@ -1091,6 +1135,8 @@ pub fn collect_verifier_output(
 
     let attach = attach_outcome_from_messages(result.guest_messages.as_ref());
     let dispatched = dispatch_confirmed_from_messages(result.guest_messages.as_ref());
+    let scheduler_exited = scheduler_exited_from_messages(result.guest_messages.as_ref());
+    let guest_exit_code = terminal_guest_exit_from_messages(result.guest_messages.as_ref());
 
     Ok(VerifierVmResult {
         stats,
@@ -1099,6 +1145,8 @@ pub fn collect_verifier_output(
         scheduler_stderr,
         attach,
         dispatched,
+        scheduler_exited,
+        guest_exit_code,
         timed_out: result.timed_out,
         crash_message: result.crash_message.clone(),
         // Host-side vCPU dilation, derived from the run's raw schedstat
@@ -1199,6 +1247,8 @@ pub fn format_verifier_output(label: &str, result: &VerifierVmResult, raw: bool)
     out.push_str(&format!("\n{label}\n"));
     if result.timed_out {
         out.push_str("  scheduler: UNKNOWN — VM timed out before exit\n");
+    } else if result.scheduler_exited {
+        out.push_str("  scheduler: EXITED during verifier workload\n");
     } else {
         match result.attach.failure_reason() {
             None => {
@@ -1261,9 +1311,6 @@ pub fn format_verifier_output(label: &str, result: &VerifierVmResult, raw: bool)
                 "  processed={}  states={}/{}",
                 vs.processed_insns, vs.peak_states, vs.total_states
             ));
-            if let Some(t) = vs.time_usec {
-                out.push_str(&format!("  time={t}us"));
-            }
             if let Some(ref s) = vs.stack_depth {
                 out.push_str(&format!("  stack={s}"));
             }
@@ -2536,6 +2583,8 @@ mod tests {
             scheduler_stderr: String::new(),
             attach: attach_outcome_from_messages(Some(&messages)),
             dispatched: dispatch_confirmed_from_messages(Some(&messages)),
+            scheduler_exited: scheduler_exited_from_messages(Some(&messages)),
+            guest_exit_code: Some(0),
             timed_out: false,
             crash_message: None,
             dilation: None,
@@ -2552,6 +2601,110 @@ mod tests {
                 .expect_err("no scheduler attached, so the cell must fail")
                 .contains("no SchedulerAttached frame"),
         );
+    }
+
+    /// A scheduler that attached and then died cannot PASS by combining
+    /// its historical attach frame with probe progress made later through
+    /// the kernel's SCHED_EXT fallback.
+    #[test]
+    fn attached_then_scheduler_exit_cannot_pass_verification() {
+        use crate::vmm::host_comms::BulkDrainResult;
+        use crate::vmm::wire::{LifecyclePhase, MSG_TYPE_LIFECYCLE, MSG_TYPE_SCHED_EXIT, ShmEntry};
+
+        let lifecycle = |phase: LifecyclePhase| ShmEntry {
+            msg_type: MSG_TYPE_LIFECYCLE,
+            payload: vec![phase.wire_value()],
+            crc_ok: true,
+        };
+        let messages = BulkDrainResult {
+            entries: vec![
+                lifecycle(LifecyclePhase::SchedulerAttached),
+                lifecycle(LifecyclePhase::WorkloadDispatched),
+                ShmEntry {
+                    msg_type: MSG_TYPE_SCHED_EXIT,
+                    payload: 1i32.to_le_bytes().to_vec(),
+                    crc_ok: true,
+                },
+            ],
+        };
+        let result = VerifierVmResult {
+            stats: Vec::new(),
+            scheduler_log: String::new(),
+            scheduler_stdout: String::new(),
+            scheduler_stderr: String::new(),
+            attach: attach_outcome_from_messages(Some(&messages)),
+            dispatched: dispatch_confirmed_from_messages(Some(&messages)),
+            scheduler_exited: scheduler_exited_from_messages(Some(&messages)),
+            guest_exit_code: Some(0),
+            timed_out: false,
+            crash_message: None,
+            dilation: None,
+        };
+
+        assert_eq!(result.attach, AttachOutcome::Attached);
+        assert!(result.dispatched);
+        assert!(result.scheduler_exited);
+        assert!(
+            result
+                .cell_verdict()
+                .expect_err("post-attach scheduler exit must fail")
+                .contains("scheduler exited"),
+        );
+
+        let mut torn = messages;
+        torn.entries.last_mut().unwrap().crc_ok = false;
+        assert!(
+            !scheduler_exited_from_messages(Some(&torn)),
+            "crc-invalid scheduler-exit frame is not evidence",
+        );
+    }
+
+    #[test]
+    fn terminal_guest_exit_requires_explicit_valid_exit_frame() {
+        use crate::vmm::host_comms::BulkDrainResult;
+        use crate::vmm::wire::{LifecyclePhase, MSG_TYPE_EXIT, MSG_TYPE_LIFECYCLE, ShmEntry};
+
+        assert_eq!(terminal_guest_exit_from_messages(None), None);
+
+        let lifecycle_only = BulkDrainResult {
+            entries: vec![ShmEntry {
+                msg_type: MSG_TYPE_LIFECYCLE,
+                payload: vec![LifecyclePhase::WorkloadDispatched.wire_value()],
+                crc_ok: true,
+            }],
+        };
+        assert_eq!(
+            terminal_guest_exit_from_messages(Some(&lifecycle_only)),
+            None,
+            "a generic shutdown plus lifecycle transcript is not terminal evidence",
+        );
+
+        for invalid in [
+            ShmEntry {
+                msg_type: MSG_TYPE_EXIT,
+                payload: 0i32.to_le_bytes().to_vec(),
+                crc_ok: false,
+            },
+            ShmEntry {
+                msg_type: MSG_TYPE_EXIT,
+                payload: vec![0, 0, 0],
+                crc_ok: true,
+            },
+        ] {
+            let drain = BulkDrainResult {
+                entries: vec![invalid],
+            };
+            assert_eq!(terminal_guest_exit_from_messages(Some(&drain)), None);
+        }
+
+        let explicit = BulkDrainResult {
+            entries: vec![ShmEntry {
+                msg_type: MSG_TYPE_EXIT,
+                payload: 7i32.to_le_bytes().to_vec(),
+                crc_ok: true,
+            }],
+        };
+        assert_eq!(terminal_guest_exit_from_messages(Some(&explicit)), Some(7));
     }
 
     /// dispatch_confirmed_from_messages: true only when a crc-ok,
@@ -2612,7 +2765,8 @@ mod tests {
     }
 
     /// VerifierVmResult::cell_verdict gate order + messages: timed_out >
-    /// attach failure > dispatch failure > PASS.
+    /// scheduler exit > attach failure > dispatch failure > terminal exit
+    /// > PASS.
     #[test]
     fn cell_verdict_gate_order_and_messages() {
         let base = |attach: AttachOutcome, dispatched: bool, timed_out: bool| VerifierVmResult {
@@ -2622,12 +2776,15 @@ mod tests {
             scheduler_stderr: String::new(),
             attach,
             dispatched,
+            scheduler_exited: false,
+            guest_exit_code: Some(0),
             timed_out,
             crash_message: None,
             dilation: None,
         };
 
-        // Verified + attached + dispatched, no hang -> PASS.
+        // Verified + attached + dispatched, no scheduler-exit evidence,
+        // and explicit terminal exit 0 -> PASS.
         assert_eq!(
             base(AttachOutcome::Attached, true, false).cell_verdict(),
             Ok(()),
@@ -2641,6 +2798,33 @@ mod tests {
                 .unwrap_err()
                 .contains("did not dispatch"),
             "dispatch gate must name the failure: {no_dispatch:?}",
+        );
+
+        let mut exited = base(AttachOutcome::Attached, true, false);
+        exited.scheduler_exited = true;
+        assert!(
+            exited
+                .cell_verdict()
+                .expect_err("scheduler exit must fail")
+                .contains("scheduler exited"),
+        );
+
+        let mut guest_failed = base(AttachOutcome::Attached, true, false);
+        guest_failed.guest_exit_code = Some(1);
+        assert!(
+            guest_failed
+                .cell_verdict()
+                .expect_err("non-zero terminal exit must fail")
+                .contains("exit code 1"),
+        );
+
+        let mut no_terminal_exit = base(AttachOutcome::Attached, true, false);
+        no_terminal_exit.guest_exit_code = None;
+        assert!(
+            no_terminal_exit
+                .cell_verdict()
+                .expect_err("missing terminal frame must fail")
+                .contains("did not publish"),
         );
 
         // Attach failure -> FAIL naming attach, even if dispatched is
@@ -2770,6 +2954,8 @@ mod tests {
             scheduler_stderr: String::new(),
             attach: AttachOutcome::Attached,
             dispatched: false,
+            scheduler_exited: false,
+            guest_exit_code: None,
             timed_out: true,
             crash_message: None,
             dilation: None,
@@ -2799,6 +2985,8 @@ mod tests {
             scheduler_stderr: String::new(),
             attach: AttachOutcome::Attached,
             dispatched: false,
+            scheduler_exited: false,
+            guest_exit_code: Some(1),
             timed_out: false,
             crash_message: None,
             dilation: None,
@@ -2814,6 +3002,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn format_verifier_output_omits_verification_time() {
+        let result = VerifierVmResult {
+            stats: Vec::new(),
+            scheduler_log: String::new(),
+            scheduler_stdout: String::new(),
+            scheduler_stderr: "processed 1234 insns (limit 1000000) \
+                max_states_per_insn 5 total_states 200 peak_states 50 mark_read 10\n\
+                verification time 424242 usec\n\
+                stack depth 32+0\n"
+                .to_string(),
+            attach: AttachOutcome::Attached,
+            dispatched: true,
+            scheduler_exited: false,
+            guest_exit_code: Some(0),
+            timed_out: false,
+            crash_message: None,
+            dilation: None,
+        };
+        let out = format_verifier_output("verifier", &result, false);
+        assert!(out.contains("processed=1234  states=50/200  stack=32+0"));
+        assert!(
+            !out.contains("time=") && !out.contains("424242"),
+            "derived verifier output must not contain environment-dependent time: {out}",
+        );
+    }
+
     // -----------------------------------------------------------------------
     // parse_verifier_stats
     // -----------------------------------------------------------------------
@@ -2825,7 +3040,6 @@ mod tests {
         assert_eq!(vs.processed_insns, 1234);
         assert_eq!(vs.total_states, 200);
         assert_eq!(vs.peak_states, 50);
-        assert_eq!(vs.time_usec, Some(42));
         assert_eq!(vs.stack_depth.as_deref(), Some("32+0"));
     }
 
@@ -2836,7 +3050,6 @@ mod tests {
         assert_eq!(vs.processed_insns, 500);
         assert_eq!(vs.total_states, 10);
         assert_eq!(vs.peak_states, 3);
-        assert!(vs.time_usec.is_none());
         assert!(vs.stack_depth.is_none());
     }
 
@@ -2846,7 +3059,6 @@ mod tests {
         assert_eq!(vs.processed_insns, 0);
         assert_eq!(vs.total_states, 0);
         assert_eq!(vs.peak_states, 0);
-        assert!(vs.time_usec.is_none());
         assert!(vs.stack_depth.is_none());
     }
 
@@ -2856,15 +3068,13 @@ mod tests {
         let vs = parse_verifier_stats(log);
         assert_eq!(vs.processed_insns, 0);
         assert_eq!(vs.total_states, 0);
-        assert!(vs.time_usec.is_none());
     }
 
     #[test]
-    fn parse_verifier_stats_time_without_insns() {
+    fn parse_verifier_stats_ignores_time_without_insns() {
         let log = "verification time 100 usec\nstack depth 64\n";
         let vs = parse_verifier_stats(log);
         assert_eq!(vs.processed_insns, 0);
-        assert_eq!(vs.time_usec, Some(100));
         assert_eq!(vs.stack_depth.as_deref(), Some("64"));
     }
 
@@ -2889,7 +3099,6 @@ stack depth 48+0
         assert_eq!(vs.processed_insns, 999);
         assert_eq!(vs.total_states, 77);
         assert_eq!(vs.peak_states, 20);
-        assert_eq!(vs.time_usec, Some(7));
         assert_eq!(vs.stack_depth.as_deref(), Some("48+0"));
     }
 
@@ -2926,7 +3135,6 @@ stack depth 48+0
         assert_eq!(vs.processed_insns, 999999);
         assert_eq!(vs.total_states, 50000);
         assert_eq!(vs.peak_states, 12345);
-        assert_eq!(vs.time_usec, Some(123456));
     }
 
     #[test]
@@ -2967,7 +3175,6 @@ stack depth 96+32
         assert_eq!(vs.processed_insns, 131071);
         assert_eq!(vs.total_states, 9999);
         assert_eq!(vs.peak_states, 5000);
-        assert_eq!(vs.time_usec, Some(250000));
         assert_eq!(vs.stack_depth.as_deref(), Some("96+32"));
     }
 
@@ -2981,7 +3188,6 @@ R1 type=ctx expected=fp
         let vs = parse_verifier_stats(log);
         assert_eq!(vs.processed_insns, 0);
         assert_eq!(vs.total_states, 0);
-        assert!(vs.time_usec.is_none());
         assert!(vs.stack_depth.is_none());
     }
 
@@ -2997,7 +3203,6 @@ verification time 100 usec
         assert_eq!(vs.processed_insns, 500);
         assert_eq!(vs.total_states, 40);
         assert_eq!(vs.peak_states, 15);
-        assert_eq!(vs.time_usec, Some(100));
     }
 
     #[test]
@@ -3025,10 +3230,11 @@ verification time 100 usec
     }
 
     #[test]
-    fn parse_verifier_stats_verification_time_no_number() {
+    fn parse_verifier_stats_verification_time_is_ignored() {
         let log = "verification time unknown usec\n";
         let vs = parse_verifier_stats(log);
-        assert!(vs.time_usec.is_none());
+        assert_eq!(vs.processed_insns, 0);
+        assert!(vs.stack_depth.is_none());
     }
 
     #[test]
@@ -3052,7 +3258,6 @@ verification time 100 usec
         let log = "processed 42 insns (limit 1000000) max_states_per_insn 1 total_states 5 peak_states 2 mark_read 0\r\nverification time 10 usec\r\nstack depth 16\r\n";
         let vs = parse_verifier_stats(log);
         assert_eq!(vs.processed_insns, 42);
-        assert_eq!(vs.time_usec, Some(10));
         assert!(vs.stack_depth.is_some());
     }
 
@@ -3484,7 +3689,6 @@ libbpf: failed to load BPF skeleton 'ktstr_ops': -22
         assert_eq!(vs.processed_insns, 131071);
         assert_eq!(vs.total_states, 9999);
         assert_eq!(vs.peak_states, 5000);
-        assert_eq!(vs.time_usec, Some(250000));
         assert_eq!(vs.stack_depth.as_deref(), Some("96+32"));
 
         // Without extraction, parsing the full blob must also work
@@ -3655,6 +3859,8 @@ tail\n";
             scheduler_stderr: String::new(),
             attach: AttachOutcome::Attached,
             dispatched: false,
+            scheduler_exited: false,
+            guest_exit_code: None,
             timed_out: true,
             crash_message: None,
             dilation: None,
@@ -3688,6 +3894,8 @@ tail\n";
             scheduler_stderr: stderr.to_string(),
             attach: AttachOutcome::Died,
             dispatched: false,
+            scheduler_exited: false,
+            guest_exit_code: Some(1),
             timed_out: false,
             crash_message: None,
             dilation: None,
@@ -3721,6 +3929,8 @@ tail\n";
             scheduler_stderr: String::new(),
             attach: AttachOutcome::Attached,
             dispatched: true,
+            scheduler_exited: false,
+            guest_exit_code: Some(0),
             timed_out: false,
             crash_message: None,
             dilation: None,
@@ -3744,6 +3954,8 @@ tail\n";
             ),
             attach: AttachOutcome::Died,
             dispatched: false,
+            scheduler_exited: false,
+            guest_exit_code: Some(1),
             timed_out: false,
             crash_message: None,
             dilation: None,
@@ -3793,6 +4005,8 @@ tail\n";
             scheduler_stderr: String::new(),
             attach: AttachOutcome::Attached,
             dispatched: true,
+            scheduler_exited: false,
+            guest_exit_code: Some(0),
             timed_out: false,
             crash_message: None,
             dilation: None,
@@ -3820,6 +4034,8 @@ processed 42 insns (limit 1000000) max_states_per_insn 1 total_states 10 peak_st
             // trace then exited — the SchedulerDied failure path.
             attach: AttachOutcome::Died,
             dispatched: false,
+            scheduler_exited: false,
+            guest_exit_code: Some(1),
             timed_out: false,
             crash_message: None,
             dilation: None,

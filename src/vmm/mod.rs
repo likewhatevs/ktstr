@@ -1152,12 +1152,7 @@ impl KtstrVm {
             // ResourceContention → nextest retries after the holding
             // peer finishes; if no offset maps the topology, overcommit
             // (see the produced_candidate split below).
-            Self::acquire_default_run_locks(
-                self.host_topo.as_ref(),
-                &self.topology,
-                self.watchdog_timeout,
-                wait,
-            )
+            Self::acquire_default_run_locks(self.host_topo.as_ref(), &self.topology, wait)
         }
     }
 
@@ -1230,7 +1225,7 @@ impl KtstrVm {
     ///   bounds, so host preemption cannot be misclassified as
     ///   contention.
     ///
-    /// Associated fn (no `&self`) over host_topo/topology/watchdog so
+    /// Associated fn (no `&self`) over host_topo/topology so
     /// the overcommit-vs-contention decision is unit-testable with a
     /// synthetic HostTopology (acquire_resource_locks short-circuits
     /// to Acquired in cargo-test mode, so a fitting host yields a pin
@@ -1238,7 +1233,6 @@ impl KtstrVm {
     fn acquire_default_run_locks(
         host_topo: Option<&host_topology::HostTopology>,
         topology: &Topology,
-        watchdog_timeout: Option<std::time::Duration>,
         wait: bool,
     ) -> Result<RunLocks> {
         let Some(host_topo) = host_topo else {
@@ -1247,7 +1241,6 @@ impl KtstrVm {
             return Ok(Self::build_overcommit_run_locks(
                 host_topology::host_allowed_cpus(),
                 topology.total_cpus() as usize,
-                watchdog_timeout,
             ));
         };
         let num_llcs = host_topo.llc_groups.len();
@@ -1285,7 +1278,6 @@ impl KtstrVm {
             return Ok(Self::build_overcommit_run_locks(
                 host_topology::host_allowed_cpus(),
                 topology.total_cpus() as usize,
-                watchdog_timeout,
             ));
         }
         // FAST PATH: one non-blocking, all-or-nothing bounce per
@@ -1421,17 +1413,8 @@ impl KtstrVm {
     ///
     /// Pure (the allowed set is passed in) so the mask + warning policy is
     /// unit-testable without reading the host cpuset.
-    fn build_overcommit_run_locks(
-        allowed: Vec<usize>,
-        vcpus: usize,
-        watchdog_timeout: Option<std::time::Duration>,
-    ) -> RunLocks {
-        if let Some(w) = host_topology::overcommit_warning(
-            allowed.len(),
-            vcpus,
-            false,
-            watchdog_timeout.map(|d| d.as_secs()),
-        ) {
+    fn build_overcommit_run_locks(allowed: Vec<usize>, vcpus: usize) -> RunLocks {
+        if let Some(w) = host_topology::overcommit_warning(allowed.len(), vcpus, false) {
             eprintln!("{w}");
         }
         RunLocks {

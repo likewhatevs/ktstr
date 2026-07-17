@@ -232,8 +232,9 @@ wedge anywhere. The fix moves Tier-1 to a monitor-owned **max single-vCPU
 in-phase** burn against a phase budget; Attach, Dispatch, and Teardown stay
 flat and width-independent. Boot later gained a narrow width term because
 the BSP serially initializes every AP, so its legitimate max-vCPU work is
-O(vCPU-count). The summed CPU still feeds Tier-2 trickle-stall and the
-Tier-3 deadman. This section is the captured evidence that the reworked
+O(vCPU-count). At that point the summed CPU still fed Tier-2 trickle-stall
+and the Tier-3 deadman; the later Tier-2 CPU-term removal is recorded in
+§4. This section is the captured evidence that the reworked
 wide paths (a) still emit performance measurements out of a wide cell, (b)
 still catch a real wide spinning wedge fast, and (c) leave a
 legitimately-idle wide cell alive — plus the honest limit of the
@@ -336,7 +337,7 @@ background burn false-fired the old summed Tier-1.
 
 ```
 watchdog: tier1-cpu-budget, kicking BSP
-watchdog: deadline expired at 16.473224173s from VM start
+watchdog: progress watchdog fired at 16.473224173s from VM start
   cause=tier1-cpu-budget, hard_timeout_fired=false, kill_set_by_AP=false
   phase=Teardown (Infra), monitor_live=true, evidence_channels_live=true
   max_vcpu_cpu_in_phase=12.031525413s vs budget=12s (currency=pthread), cpu_sum=18.557365599s, cpu_trickle_stalled=false
@@ -386,7 +387,7 @@ recorded-in-doc confirmation they are green (256 vCPUs = 16 LLC × 16 core,
 | test | result |
 |---|---|
 | `wide_smp_guest_boots_all_cpus_online` | **PASS** (exit 0) — guest reports `total_cpus=256 online='0-255' n_online=256`: every vCPU online, no watchdog fire during the 4 s idle body |
-| `snapshot_real_capture_wide_smp` | **PASS** (exit 0) — all 256 `vcpu_regs` slots captured through the freeze rendezvous; the "4.0x oversubscription" line is the expected informational warning (state capture, not timing) and non-fatal |
+| `snapshot_real_capture_wide_smp` | **PASS** (exit 0) — all 256 `vcpu_regs` slots captured through the freeze rendezvous; the oversubscription placement note is expected (state capture, not timing) and non-fatal |
 
 Both survive the long wide-idle phases the old Tier-1 killed at 6 s.
 
@@ -431,7 +432,7 @@ immortal (`busiest_vcpu_window=38.6ms` > the 25 ms floor):
 
 ```
 ktstr-watchdog: tier2-idle-wedge, kicking BSP
-ktstr-watchdog: deadline expired at 18.791573169s from VM start
+ktstr-watchdog: progress watchdog fired at 18.791573169s from VM start
   cause=tier2-idle-wedge, hard_timeout_fired=false, kill_set_by_AP=false
   phase=Teardown (Infra), monitor_live=true, evidence_channels_live=true
   max_vcpu_cpu_in_phase=54.209745ms vs budget=12s (currency=pthread), cpu_sum=4.832328108s, cpu_trickle_stalled=false

@@ -1456,50 +1456,37 @@ fn no_perf_cpu_budget_sizes_to_vcpus_not_30_percent() {
 }
 
 /// `overcommit_warning`: `None` when the budget covers the vCPUs; `Some`
-/// with the right severity (explicit opt-in vs silent auto-collapse) and
-/// the tight-watchdog caveat when the budget is below the vCPU count.
+/// with the right severity for intentional sharing vs default fallback.
 #[test]
 fn overcommit_warning_severity_and_polarity() {
     // Budget >= vcpus: not oversubscribed -> no warning, either severity.
-    assert_eq!(overcommit_warning(32, 32, false, None), None);
-    assert_eq!(overcommit_warning(40, 32, true, None), None);
+    assert_eq!(overcommit_warning(32, 32, false), None);
+    assert_eq!(overcommit_warning(40, 32, true), None);
 
-    // Explicit opt-in (cpu_budget / --cpu-cap below vcpus): an opt-in note
-    // that points at the overcommit-invariant rate.
-    let m = overcommit_warning(4, 32, true, None).expect("4 < 32 => Some");
+    // No-perf / explicit cpu-budget sharing is a compact factual note.
+    let m = overcommit_warning(4, 32, true).expect("4 < 32 => Some");
     assert!(
-        m.contains("opt-in"),
-        "explicit case must read as opt-in: {m}"
+        m.contains("no-perf/cpu-budget mode"),
+        "intentional case must name the mode: {m}"
     );
     assert!(
-        m.contains("worst_iterations_per_cpu_sec"),
-        "must point at the per-cgroup overcommit-invariant rate \
-         (worst_iterations_per_cpu_sec, matching the stats.rs compare hint): {m}",
+        !m.contains("worst_iterations_per_cpu_sec"),
+        "placement note must not prescribe a workload metric: {m}",
     );
     assert!(
-        !m.contains("NOTHING opted into"),
-        "explicit case must not use the silent-case wording: {m}",
+        !m.contains("watchdog"),
+        "placement note must not guess at watchdog tuning: {m}",
     );
 
-    // Auto-collapse (process cpuset smaller than the guest): the loud,
-    // nobody-opted-in case.
-    let m = overcommit_warning(4, 32, false, None).expect("4 < 32 => Some");
+    // Default fallback remains visibly a warning.
+    let m = overcommit_warning(4, 32, false).expect("4 < 32 => Some");
     assert!(
         m.contains("WARNING"),
         "auto case must be a louder WARNING: {m}"
     );
     assert!(
-        m.contains("NOTHING opted into"),
-        "auto case must name the silent condition: {m}",
-    );
-
-    // A tight watchdog folds in the false-eject caveat; a roomy one omits it.
-    let tight = overcommit_warning(4, 32, true, Some(5)).unwrap();
-    assert!(tight.contains("watchdog"), "tight watchdog caveat: {tight}");
-    let roomy = overcommit_warning(4, 32, true, Some(30)).unwrap();
-    assert!(
-        !roomy.contains("watchdog"),
-        "roomy watchdog must not add the caveat: {roomy}",
+        m.contains("host capacity is below guest width"),
+        "fallback case must name the capacity mismatch: {m}",
     );
 }
 

@@ -12736,7 +12736,10 @@ impl KtstrVm {
                             vcpus_for_wd,
                         );
                         let wall_backstop =
-                            crate::test_support::runtime::phase_wall_backstop_ns(snapshot.phase);
+                            crate::test_support::runtime::phase_wall_backstop_ns(
+                                snapshot.phase,
+                                vcpus_for_wd,
+                            );
                         // Sentinel-aware ns→Duration renderer for a budget.
                         let render_budget = |ns: u64| {
                             if ns == u64::MAX {
@@ -12764,8 +12767,15 @@ impl KtstrVm {
                         } else {
                             ""
                         };
+                        let fire_event = if tier_fire {
+                            "progress watchdog fired"
+                        } else if hard_timeout_fired {
+                            "deadline expired"
+                        } else {
+                            "guest/AP kill observed"
+                        };
                         eprintln!(
-                            "{header_prefix}ktstr-watchdog: deadline expired at {elapsed:?} from VM start"
+                            "{header_prefix}ktstr-watchdog: {fire_event} at {elapsed:?} from VM start"
                         );
                         eprintln!(
                             "  cause={kill_reason_str}, \
@@ -12851,13 +12861,18 @@ impl KtstrVm {
                             "  timeout={timeout:?}, workload_duration={:?}",
                             workload_duration_for_wd
                         );
-                        eprintln!(
-                            "  hint: if the test body needs more wall time, increase \
-                             duration (the `duration` field on `KtstrTestEntry` / \
-                             `#[ktstr_test(duration_ms = ...)]`); the VM timeout is \
-                             derived as max(watchdog_timeout, duration) so raising \
-                             duration also extends the host watchdog deadline"
-                        );
+                        if hard_timeout_fired
+                            && snapshot.phase
+                                == crate::monitor::LifecycleStage::Body as u8
+                        {
+                            eprintln!(
+                                "  hint: if the test body needs more wall time, increase \
+                                 duration (the `duration` field on `KtstrTestEntry` / \
+                                 `#[ktstr_test(duration_ms = ...)]`); the VM timeout is \
+                                 derived as max(watchdog_timeout, duration) so raising \
+                                 duration also extends the host watchdog deadline"
+                            );
+                        }
                         // All watchdog VERDICT timeouts set `timed_out`: the
                         // Tier-3 hard deadline AND the Tier-1/2 progress
                         // tiers (a wedge is a timeout by another name). The

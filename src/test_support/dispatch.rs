@@ -2056,10 +2056,12 @@ fn is_verifier_topology_unsupported(e: &anyhow::Error) -> bool {
 /// and print the rendered output. Returns 0 only when the scheduler
 /// verified (BPF loaded), turned on (the guest attach gate reached
 /// sched_ext `enabled`, surfaced via [`crate::verifier::AttachOutcome`]),
-/// AND dispatched the injected workload (a `WorkloadDispatched` frame) on
-/// this topology — the three gates `VerifierVmResult::cell_verdict`
-/// enforces; returns 1 on a verify / attach / dispatch failure, a
-/// post-attach teardown hang (`timed_out`), or a malformed cell name.
+/// dispatched the injected workload while the scheduler child was live and
+/// sched_ext remained enabled, survived to ktstr's intentional cleanup kill,
+/// and published an explicit CRC-valid guest exit frame carrying code 0.
+/// [`crate::verifier::VerifierVmResult::cell_verdict`] also rejects a
+/// scheduler-exit frame, a missing terminal frame, a teardown hang
+/// (`timed_out`), or a malformed cell name.
 ///
 /// The per-cell kernel directory is resolved by sanitized-label
 /// lookup in `KTSTR_KERNEL_LIST` — the
@@ -2270,12 +2272,12 @@ fn run_verifier_cell_inner(
             if !sched_stderr.is_empty() {
                 eprint!("{sched_stderr}");
             }
-            // PASS requires verify + attach (sched_ext `enabled`) +
-            // dispatch (the injected workload made progress).
-            // `cell_verdict` names the first failing gate (timed_out →
-            // attach → dispatch, root cause first) and never keys on the
-            // guest exit code, which is 1 even on the verifier success
-            // path (no #[ktstr_test] body to dispatch).
+            // PASS requires verify + attach, contemporaneous dispatch
+            // progress with a live/enabled scheduler, no observed scheduler
+            // exit, cleanup liveness confirmation, and an explicit terminal
+            // guest exit 0. `cell_verdict` names the first failing host-side
+            // gate (timed_out / scheduler-exit → attach → dispatch → terminal
+            // exit, root cause first).
             let code = match result.cell_verdict() {
                 Ok(()) => 0,
                 Err(reason) => {

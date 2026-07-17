@@ -193,9 +193,9 @@ pub(crate) const fn trickle_floor_for_currency(cpu_currency: u8) -> u64 {
 ///   - `max_vcpu_cpu_in_phase_ns`: the MAX over vCPUs of per-vCPU guest CPU
 ///     burned since this phase was entered (the last milestone) — the
 ///     monitor's width-independent Tier-1 evidence. A spinning wedge is a
-///     hot thread, so its max crosses a flat budget; a wide idle guest's
-///     summed background burn does NOT (that summed number lives in
-///     `cpu_ns_now`, which no longer feeds any tier).
+///     hot thread, so its max crosses the phase budget (flat outside Boot);
+///     a wide idle guest's summed background burn does NOT (that summed
+///     number lives in `cpu_ns_now`, which no longer feeds any tier).
 ///   - `wall_in_phase_ns`: wall time since this phase was entered (the
 ///     last milestone).
 ///   - `runnable_demand`: the guest had queued-or-running tasks anywhere —
@@ -283,7 +283,7 @@ pub(crate) fn watchdog_step(
     if class == PhaseClass::Infra
         && channels_live
         && !runnable_demand
-        && wall_in_phase_ns > phase_wall_backstop_ns(phase)
+        && wall_in_phase_ns > phase_wall_backstop_ns(phase, vcpus)
     {
         return KillDecision::Tier2IdleWedge;
     }
@@ -644,12 +644,13 @@ mod tests {
 
     const S: u64 = 1_000_000_000;
 
-    // Boot(0): 15 s base at one vCPU, wall backstop 45 s.
+    // Boot(0): authoritative boot headroom at one vCPU (20.15 s), wall
+    // backstop 45 s (the width-scaled backstop retains this floor).
     fn boot_budget_ns() -> u64 {
         phase_cpu_budget_ns(BOOT, TEST_VCPUS)
     }
     fn boot_backstop_ns() -> u64 {
-        phase_wall_backstop_ns(BOOT)
+        phase_wall_backstop_ns(BOOT, TEST_VCPUS)
     }
 
     /// Common Boot/INFRA, monitor-live caller. Each row varies the inputs
@@ -763,24 +764,24 @@ mod tests {
         }
     }
 
-    /// Regression for the 240-vCPU Cosmos verifier false kill: Boot was
-    /// alive (pthread CPU still accruing), but the BSP's legitimate
-    /// width-scaled AP initialization crossed the old flat 22.5 s
-    /// pthread ceiling by 53 ms. With 240 vCPUs, Boot's raw budget is
-    /// 26.95 s and pthread widens it to 40.425 s, so Tier-1 stays quiet.
-    /// Evidence channels were not yet live, which independently keeps
-    /// the 98 s wall interval out of Tier-2.
+    /// Regression for the 240-vCPU Cosmos verifier false kill. The old
+    /// separately fitted Boot formula produced a 40.425 s pthread budget
+    /// and killed a live boot at 40.487 s despite ~190 s remaining on its
+    /// existing VM deadline. Boot now reuses the authoritative 56 s
+    /// boot-headroom contract, widened to 84 s for pthread currency.
+    /// Evidence channels were not yet live, which independently keeps the
+    /// wall interval out of Tier-2.
     #[test]
-    fn cosmos_240cpu_live_boot_does_not_hit_old_flat_budget() {
-        let observed_bsp_cpu = 22_553_294_795;
+    fn cosmos_240cpu_live_boot_uses_authoritative_headroom() {
+        let observed_bsp_cpu = 40_487_683_525;
         let widened = widened_cpu_budget_ns(BOOT, CPU_CURRENCY_PTHREAD, 240);
-        assert_eq!(widened, 40_425_000_000);
+        assert_eq!(widened, 84_000_000_000);
         assert_eq!(
             watchdog_step(
                 BOOT,
                 PhaseClass::Infra,
                 observed_bsp_cpu,
-                98_375_818_338,
+                126_326_546_832,
                 false,
                 false,
                 true,

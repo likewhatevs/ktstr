@@ -832,6 +832,153 @@ impl Drop for SigchldGuard {
     }
 }
 
+/// Regression for the verifier false-green race: under SIGCHLD=SIG_DFL an
+/// exited scheduler is a zombie, so its pidfd is readable while `/proc/<pid>`
+/// still exists. The scheduler-exit monitor must treat the pidfd edge as exit,
+/// and cleanup must reject the zombie even though kill(2) accepts SIGKILL for
+/// it.
+#[test]
+fn verifier_cleanup_rejects_pidfd_ready_zombie() {
+    let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
+    let _restore = SigchldGuard::install(libc::SIG_DFL);
+
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 7"])
+        .spawn()
+        .expect("spawn exiting child");
+    let pid = child.id() as libc::pid_t;
+    assert_eq!(
+        crate::sync::pidfd_poll_exited(pid, std::time::Duration::from_secs(5)),
+        crate::sync::PidfdWait::Exited,
+    );
+    assert!(
+        Path::new(&format!("/proc/{pid}")).exists(),
+        "SIGCHLD=SIG_DFL keeps the exited child as a proc-visible zombie",
+    );
+    assert!(
+        sched_exit_observed(libc::POLLIN, true),
+        "pidfd POLLIN must outrank a still-present zombie proc entry",
+    );
+    assert!(!sched_exit_observed(0, true));
+    assert!(sched_exit_observed(0, false));
+
+    // Linux accepts a signal directed at a zombie. That syscall success must
+    // not be mistaken for proof that cleanup killed a live scheduler.
+    let kill_sent = unsafe { libc::kill(pid, libc::SIGKILL) } == 0;
+    assert!(
+        kill_sent,
+        "Linux should accept SIGKILL for the still-unreaped zombie"
+    );
+    let status = child.wait().expect("reap zombie");
+    assert_eq!(status.code(), Some(7));
+    assert!(
+        !verifier_cleanup_kill_confirmed(kill_sent, Some(&status)),
+        "natural exit status must fail even when kill(2) returned success",
+    );
+}
+
+#[test]
+fn sched_exit_monitor_reports_an_unreaped_zombie() {
+    let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
+    let _restore = SigchldGuard::install(libc::SIG_DFL);
+
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 9"])
+        .spawn()
+        .expect("spawn exiting scheduler stand-in");
+    let pid = child.id() as libc::pid_t;
+    assert_eq!(
+        crate::sync::pidfd_poll_exited(pid, std::time::Duration::from_secs(5)),
+        crate::sync::PidfdWait::Exited,
+    );
+    assert!(
+        Path::new(&format!("/proc/{pid}")).exists(),
+        "the child must remain an unreaped proc-visible zombie",
+    );
+
+    let stop = start_sched_exit_monitor(
+        Some(pid as u32),
+        None,
+        Arc::new(AtomicBool::new(false)),
+        None,
+    )
+    .expect("start monitor on zombie");
+    assert!(
+        stop.stop_and_join(),
+        "pidfd readiness must propagate through the actual monitor join result",
+    );
+
+    let status = child.wait().expect("reap scheduler stand-in");
+    assert_eq!(status.code(), Some(9));
+}
+
+#[test]
+fn sched_exit_monitor_only_waits_forever_with_a_wake_writer() {
+    assert_eq!(sched_exit_poll_timeout(7, true), -1);
+    assert_eq!(sched_exit_poll_timeout(7, false), 250);
+    assert_eq!(sched_exit_poll_timeout(-1, true), 250);
+    assert_eq!(sched_exit_poll_timeout(-1, false), 250);
+}
+
+#[test]
+fn sched_exit_monitor_without_wake_writer_stops_on_finite_poll() {
+    let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
+    let _restore = SigchldGuard::install(libc::SIG_DFL);
+
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn live child");
+    let stop = start_sched_exit_monitor_without_wake_writer_for_test(child.id())
+        .expect("start scheduler-exit monitor");
+    let started = std::time::Instant::now();
+    assert!(
+        !stop.stop_and_join(),
+        "a live child stopped by the caller is not an observed scheduler exit",
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "missing wake writer must fall back to a finite poll instead of deadlocking",
+    );
+    child.kill().expect("kill test child");
+    child.wait().expect("reap test child");
+}
+
+#[test]
+fn verifier_cleanup_requires_enabled_state() {
+    use crate::scenario::ops::ScxState;
+
+    assert!(verifier_cleanup_state_confirmed(Some(ScxState::Enabled)));
+    for state in [
+        None,
+        Some(ScxState::Enabling),
+        Some(ScxState::Disabling),
+        Some(ScxState::Disabled),
+    ] {
+        assert!(
+            !verifier_cleanup_state_confirmed(state),
+            "cleanup must fail closed for {state:?}",
+        );
+    }
+}
+
+#[test]
+fn verifier_cleanup_accepts_its_own_sigkill_status() {
+    let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
+    let _restore = SigchldGuard::install(libc::SIG_DFL);
+
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn live child");
+    child.kill().expect("send intentional SIGKILL");
+    let status = child.wait().expect("reap SIGKILLed child");
+    assert!(
+        verifier_cleanup_kill_confirmed(true, Some(&status)),
+        "wait status from ktstr's SIGKILL is the positive cleanup proof",
+    );
+}
+
 /// Regression: with SIGCHLD set to `SIG_IGN`, a bare
 /// `Command::status()` returns `Err(ECHILD)` because the kernel
 /// auto-reaps the child before `waitpid` can observe it.
@@ -1066,19 +1213,22 @@ fn scan_dump_markers_fires_latches_across_chunk_seam() {
     );
 }
 
-/// T3 regression: `reap_child_bounded` reaps a child that exits within
+/// T3 regression: `reap_child_bounded_status` reaps a child that exits within
 /// the bound, and gives up (false) on a still-live child once the
 /// bound elapses — so a process that can't take its pending SIGKILL
 /// promptly (the defensive case `SCHED_REAP_TIMEOUT` caps) cannot stall
 /// teardown.
 #[test]
-fn reap_child_bounded_reaps_quick_and_times_out_on_live() {
+fn reap_child_bounded_status_reaps_quick_and_times_out_on_live() {
+    let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
+    let _restore = SigchldGuard::install(libc::SIG_DFL);
+
     let mut quick = std::process::Command::new("sleep")
         .arg("0.1")
         .spawn()
         .expect("spawn sleep 0.1");
     assert!(
-        reap_child_bounded(&mut quick, std::time::Duration::from_secs(10)),
+        reap_child_bounded_status(&mut quick, std::time::Duration::from_secs(10)).is_some(),
         "a child that exits within the bound is reaped"
     );
 
@@ -1087,7 +1237,7 @@ fn reap_child_bounded_reaps_quick_and_times_out_on_live() {
         .spawn()
         .expect("spawn sleep 30");
     assert!(
-        !reap_child_bounded(&mut live, std::time::Duration::from_millis(200)),
+        reap_child_bounded_status(&mut live, std::time::Duration::from_millis(200)).is_none(),
         "a still-live child is not reaped within the bound"
     );
     live.kill().unwrap();

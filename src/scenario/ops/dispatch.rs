@@ -1916,7 +1916,7 @@ fn kill_current_scheduler(op_label: &str) -> Result<libc::pid_t> {
     // SchedExitStop.stop_and_join joins the monitor thread before
     // returning, so the kill below is safe from the prior
     // monitor's pidfd race.
-    crate::vmm::rust_init::stop_sched_exit_monitor();
+    let _ = crate::vmm::rust_init::stop_sched_exit_monitor();
     // Pin the post-stop invariant for Restart+Replace dispatch
     // sites: after `stop_sched_exit_monitor` returns, the slot
     // MUST be empty so the subsequent spawn's

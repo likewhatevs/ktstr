@@ -20,7 +20,8 @@ pub struct TopoPreset {
     pub memory_mib: usize,
     /// Forced no-perf host-CPU budget for cells running this preset.
     /// `None` (every stock preset) leaves budget resolution to the
-    /// normal path (test's `cpu_budget`, else auto-size to vCPU count).
+    /// normal path (test's `cpu_budget`, else auto-size to vCPU count plus
+    /// one service CPU, clamped to the allowed cpuset).
     /// `Some(n)` pins the no-perf CPU mask to `n` host CPUs regardless
     /// of host size, so a preset whose vCPU count exceeds `n` ALWAYS
     /// time-slices (deliberate, continuous overcommit). Consumed by the

@@ -695,15 +695,23 @@ pub(crate) const fn sys_rdy_budget_ms(vcpus: u32) -> u64 {
 /// [`sys_rdy_budget_ms`]'s base + per-vCPU budget (the pre-sys_rdy
 /// virtio-console handshake budget); the two add together to form
 /// the full [`vm_boot_headroom`].
-const KERNEL_INIT_HEADROOM: Duration = Duration::from_secs(10);
+const KERNEL_INIT_HEADROOM_MS: u64 = 10_000;
+
+/// The authoritative boot allowance in milliseconds. Kept as a const
+/// integer helper so the wall-clock VM deadline and the progress
+/// watchdog's Boot CPU budget consume the same contract instead of
+/// maintaining independently calibrated width formulas.
+pub(crate) const fn vm_boot_headroom_ms(vcpus: u32) -> u64 {
+    KERNEL_INIT_HEADROOM_MS.saturating_add(sys_rdy_budget_ms(vcpus))
+}
 
 /// Total boot headroom: covers kernel init + scheduler attach + BPF
-/// verifier time ([`KERNEL_INIT_HEADROOM`]) plus the guest's scaled
+/// verifier time ([`KERNEL_INIT_HEADROOM_MS`]) plus the guest's scaled
 /// `send_sys_rdy` retry loop ([`sys_rdy_budget_ms`]) before the
 /// workload phase begins. Scales with vCPU count so the host timeout
 /// doesn't fire while the guest is still inside its sys_rdy budget.
 pub(crate) fn vm_boot_headroom(vcpus: u32) -> Duration {
-    KERNEL_INIT_HEADROOM + Duration::from_millis(sys_rdy_budget_ms(vcpus))
+    Duration::from_millis(vm_boot_headroom_ms(vcpus))
 }
 
 /// Per-phase CPU-time budget (nanoseconds) charged against a single
@@ -724,14 +732,14 @@ pub(crate) fn vm_boot_headroom(vcpus: u32) -> Duration {
 ///
 /// Boot is the deliberate exception to otherwise width-independent
 /// per-vCPU budgets. The BSP serially enumerates and initializes every AP,
-/// so the Busiest-vCPU signal contains legitimate O(vCPU-count) work even
-/// though the signal itself is a MAX rather than a SUM. The budget is a
-/// 15 s base plus 50 ms for every AP. A 240-vCPU distro guest that was
-/// still actively booting consumed 22.55 s of BSP pthread CPU; the old
-/// flat 22.5 s currency-widened ceiling killed it with 190 s left on the
-/// VM deadline. The width term gives that legitimate enumeration 26.95 s
-/// raw / 40.425 s pthread while still bounding a Boot spinner far below
-/// the whole-VM deadman.
+/// so the busiest-vCPU signal contains legitimate O(vCPU-count) work even
+/// though the signal itself is a MAX rather than a SUM. Its budget reuses
+/// [`vm_boot_headroom_ms`], the existing semantic allowance that already
+/// governs kernel init, scheduler attach, BPF verification, and the
+/// vCPU-scaled sys-rdy handshake. This keeps one source of truth for a
+/// healthy boot instead of fitting another base-plus-slope formula to
+/// whichever wide distro image happened to fail last. The pthread
+/// currency widening is applied by the watchdog on top.
 ///
 /// Every other phase stays flat because its legitimate busiest-vCPU work
 /// does not scale with guest width:
@@ -757,10 +765,8 @@ pub(crate) fn vm_boot_headroom(vcpus: u32) -> Duration {
 pub(crate) const fn phase_cpu_budget_ns(phase: u8, vcpus: u32) -> u64 {
     const S_TO_NS: u64 = 1_000_000_000;
     match phase {
-        // Boot: the BSP's AP enumeration is serial O(vCPU-count).
-        0 => 15u64
-            .saturating_mul(S_TO_NS)
-            .saturating_add((vcpus.saturating_sub(1) as u64).saturating_mul(50_000_000)),
+        // Boot: share the authoritative boot-headroom contract.
+        0 => vm_boot_headroom_ms(vcpus).saturating_mul(1_000_000),
         // Attach
         1 => 35u64.saturating_mul(S_TO_NS),
         // Dispatch
@@ -786,8 +792,9 @@ pub(crate) const fn phase_cpu_budget_ns(phase: u8, vcpus: u32) -> u64 {
 /// governs the same phase, so Tier-2 is a last-resort backstop that only
 /// fires after the phase's own in-band deadline has already had its
 /// chance — never a competing, earlier kill:
-///   - Boot 45s: above the boot-headroom band; a genuinely silent boot
-///     (no epochs, no demand) past this is wedged, not merely slow.
+///   - Boot: at least 45s and always 5s above
+///     [`vm_boot_headroom_ms`]. A genuinely silent boot (no epochs,
+///     no demand) past this is wedged, not merely slow.
 ///   - Attach 40s: above [`COLD_BTF_PHASE1_BUDGET`] (30s) — the host's
 ///     own cold-BTF accessor-build deadline — plus slack, so a slow but
 ///     live BTF parse is never mistaken for a silent attach wedge.
@@ -803,11 +810,22 @@ pub(crate) const fn phase_cpu_budget_ns(phase: u8, vcpus: u32) -> u64 {
 ///
 /// Unknown phases (>4) return `u64::MAX` — never kill on a wall backstop
 /// this fn does not model.
-pub(crate) const fn phase_wall_backstop_ns(phase: u8) -> u64 {
+pub(crate) const fn phase_wall_backstop_ns(phase: u8, vcpus: u32) -> u64 {
     const S_TO_NS: u64 = 1_000_000_000;
+    const MS_TO_NS: u64 = 1_000_000;
     let s = match phase {
-        // Boot
-        0 => 45u64,
+        // Boot is width-sensitive. Preserve the historical 45s floor for
+        // small guests while keeping Tier-2 strictly after the authoritative
+        // boot allowance for wide guests.
+        0 => {
+            let scaled_ms = vm_boot_headroom_ms(vcpus).saturating_add(5_000);
+            let backstop_ms = if scaled_ms > 45_000 {
+                scaled_ms
+            } else {
+                45_000
+            };
+            return backstop_ms.saturating_mul(MS_TO_NS);
+        }
         // Attach — > COLD_BTF_PHASE1_BUDGET (30s).
         1 => 40u64,
         // Dispatch — > guest DISPATCH_DEADLINE_CAP (30s).
@@ -1105,8 +1123,8 @@ pub(crate) fn build_vm_builder_base(
         .no_perf_mode(no_perf_mode);
 
     // Per-test no-perf CPU budget override (#[ktstr_test(cpu_budget = N)]).
-    // None leaves the builder's auto-size (vCPU count) in place; only the
-    // no-perf path consumes it.
+    // None leaves the builder's auto-size (vCPU count plus one service CPU,
+    // clamped to the allowed cpuset) in place; only the no-perf path consumes it.
     if let Some(budget) = entry.cpu_budget {
         builder = builder.cpu_budget(budget);
     }
@@ -2921,9 +2939,8 @@ mod tests {
         // KERNEL_INIT_HEADROOM (10 s) + sys_rdy_budget_ms(vcpus).
         assert_eq!(vm_boot_headroom(1), Duration::from_millis(20_150));
         assert_eq!(vm_boot_headroom(126), Duration::from_millis(38_900));
-        // 256-vCPU wide-SMP: 10 s + 48.4 s = 58.4 s (un-oversubscribed
-        // headroom; vm_timeout_from_entry scales THIS by the host
-        // overcommit ratio).
+        // 256-vCPU wide-SMP: 10 s + 48.4 s = 58.4 s. Host overcommit
+        // does not change this flat deadman component.
         assert_eq!(vm_boot_headroom(256), Duration::from_millis(58_400));
         // 512-vCPU MAX_VCPUS budget (86.8 s) → 96.8 s headroom, uncapped
         // under the 90 s ceiling.
@@ -2933,13 +2950,16 @@ mod tests {
     // -- phase_cpu_budget_ns / phase_wall_backstop_ns --
 
     #[test]
-    fn phase_cpu_budget_ns_boot_scales_with_width_only() {
+    fn phase_cpu_budget_ns_boot_reuses_vm_boot_headroom() {
         const S: u64 = 1_000_000_000;
-        // Boot's BSP serially initializes every AP, so only that phase
-        // carries a width term. The remaining phases stay flat against
-        // the max-per-vCPU evidence.
-        assert_eq!(phase_cpu_budget_ns(0, 1), 15 * S);
-        assert_eq!(phase_cpu_budget_ns(0, 240), 26_950_000_000);
+        // Boot consumes the same allowance as the VM deadline. The
+        // remaining phases stay flat against max-per-vCPU evidence.
+        assert_eq!(phase_cpu_budget_ns(0, 1), 20_150_000_000);
+        assert_eq!(phase_cpu_budget_ns(0, 240), 56 * S);
+        assert_eq!(
+            phase_cpu_budget_ns(0, 240),
+            vm_boot_headroom(240).as_nanos() as u64,
+        );
         assert_eq!(phase_cpu_budget_ns(1, 1), 35 * S);
         assert_eq!(phase_cpu_budget_ns(1, 240), 35 * S);
         assert_eq!(phase_cpu_budget_ns(2, 1), 8 * S);
@@ -2961,21 +2981,29 @@ mod tests {
     #[test]
     fn phase_wall_backstop_ns_values_sit_above_in_band_deadlines() {
         const S: u64 = 1_000_000_000;
-        assert_eq!(phase_wall_backstop_ns(0), 45 * S);
+        assert_eq!(phase_wall_backstop_ns(0, 1), 45 * S);
+        assert_eq!(phase_wall_backstop_ns(0, 240), 61 * S);
+        assert_eq!(phase_wall_backstop_ns(0, 512), 101_800_000_000);
+        for vcpus in [1, 240, 512] {
+            assert!(
+                phase_wall_backstop_ns(0, vcpus) > vm_boot_headroom(vcpus).as_nanos() as u64,
+                "Boot Tier-2 must sit after the authoritative allowance at {vcpus} vCPUs",
+            );
+        }
         // Attach backstop must clear the host cold-BTF phase-1 budget.
-        assert_eq!(phase_wall_backstop_ns(1), 40 * S);
-        assert!(phase_wall_backstop_ns(1) > COLD_BTF_PHASE1_BUDGET.as_nanos() as u64);
+        assert_eq!(phase_wall_backstop_ns(1, 1), 40 * S);
+        assert!(phase_wall_backstop_ns(1, 512) > COLD_BTF_PHASE1_BUDGET.as_nanos() as u64);
         // Dispatch backstop must clear the guest probe's 30s cap.
-        assert_eq!(phase_wall_backstop_ns(2), 35 * S);
-        assert_eq!(phase_wall_backstop_ns(4), 15 * S);
+        assert_eq!(phase_wall_backstop_ns(2, 1), 35 * S);
+        assert_eq!(phase_wall_backstop_ns(4, 1), 15 * S);
     }
 
     #[test]
     fn phase_wall_backstop_ns_body_and_unknown_are_sentinel() {
         // Body (3) and unknown ids: Tier-2 structurally off.
-        assert_eq!(phase_wall_backstop_ns(3), u64::MAX);
-        assert_eq!(phase_wall_backstop_ns(5), u64::MAX);
-        assert_eq!(phase_wall_backstop_ns(u8::MAX), u64::MAX);
+        assert_eq!(phase_wall_backstop_ns(3, 240), u64::MAX);
+        assert_eq!(phase_wall_backstop_ns(5, 240), u64::MAX);
+        assert_eq!(phase_wall_backstop_ns(u8::MAX, 240), u64::MAX);
     }
 
     /// Two calls to `content_hash` with the same input must return

@@ -11,7 +11,7 @@ pub(crate) use std::fs;
 pub(crate) use std::io::{Read, Write};
 pub(crate) use std::os::unix::fs::OpenOptionsExt;
 pub(crate) use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-pub(crate) use std::os::unix::process::CommandExt;
+pub(crate) use std::os::unix::process::{CommandExt, ExitStatusExt};
 pub(crate) use std::path::Path;
 pub(crate) use std::process::{Child, Command, Stdio};
 pub(crate) use std::sync::Arc;
@@ -83,7 +83,7 @@ static SCHED_PID: AtomicI32 = AtomicI32::new(0);
 /// comfortably in one frame even with the 16-byte header.
 const STDIO_CHUNK_BYTES: usize = 4 * 1024;
 
-/// Bound on [`reap_child_bounded`]: how long teardown waits for a
+/// Bound on [`reap_child_bounded_status`]: how long teardown waits for a
 /// SIGKILL'd scheduler to exit before giving up and letting the VM reboot
 /// reap it. A SIGKILL'd scheduler normally exits <<1s — post-crash bypass
 /// keeps it CFS-schedulable, and it is NOT held in the kernel scx disable:

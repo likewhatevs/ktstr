@@ -44,6 +44,11 @@ cargo ktstr verifier --raw
 See [cargo-ktstr verifier](cargo-ktstr.md#verifier) for the flag
 list.
 
+In a workspace with multiple ktstr versions, the one-shot command
+enumerates only packages linked to the current cargo-ktstr version.
+Older test packages are skipped with a short update-or-exclude message;
+current scheduler declarations continue in the same run.
+
 ## A real sweep
 
 Three real schedulers from the [scx](https://github.com/sched-ext/scx)
@@ -209,16 +214,22 @@ column while the other stays ✓.
    reached `enabled`. The kernel sets `enabled` only after `ops.init`,
    per-task init, and switching eligible tasks to the sched_ext class,
    so this proves the scheduler is scheduling, not merely that its BPF
-   loaded. Attach is confirmed only when the guest reaches its
-   post-attach dispatch phase — a guest that vanishes early (e.g. a
-   panic before any frame is emitted) fails rather than passing by
-   default.
+   loaded. The attach frame is historical evidence, not by itself a
+   terminal pass: a guest that vanishes early (e.g. a panic before any
+   frame is emitted) fails rather than passing by default.
 3. **Dispatch probe** — the verifier VM has no `#[ktstr_test]` body,
    so it injects a SpinWait workload sized to the guest's online CPUs,
-   running as SCHED_EXT. A cell passes only when a worker makes
-   forward progress after attach: a scheduler that attaches but never
-   dispatches a runnable task is a distinct, worse failure the attach
-   gate alone cannot catch.
+   running as SCHED_EXT. Dispatch is confirmed only when a worker makes
+   forward progress, the scheduler child is still alive, and sched_ext
+   is still `enabled` at that same completion edge. A scheduler that
+   attaches and then exits while kernel fallback runs the workers
+   therefore cannot pass on stale attach/dispatch evidence.
+4. **Terminal liveness** — cleanup rechecks the scheduler process and
+   sched_ext state, then requires the reaped wait status to prove that
+   ktstr's own SIGKILL terminated a still-live scheduler. The host also
+   rejects any scheduler-exit frame and accepts completion only from an
+   explicit, CRC-valid guest exit frame carrying code 0; a generic VM
+   shutdown is not pass evidence.
 
 Every cell boots with performance mode disabled
 ([no_perf_mode](../concepts/performance-mode.md)) — `verified_insns`
