@@ -383,7 +383,7 @@ fn send_sys_rdy_retry_exits_when_budget_exhausted() {
     // interaction in unit tests.
     let port_path = std::path::Path::new("/tmp/ktstr-test-nonexistent-port-please-do-not-create");
     let t0 = std::time::Instant::now();
-    send_sys_rdy_with_retry(budget, 1, &addrs, port_path);
+    send_sys_rdy_with_retry(budget, 1, &addrs, Some(port_path));
     let elapsed = t0.elapsed();
     assert!(
         elapsed < std::time::Duration::from_secs(2),
@@ -427,7 +427,7 @@ fn send_sys_rdy_retry_respects_budget_across_sizes() {
     for &(budget_ms, vcpus) in &[(50u64, 1u32), (150, 2), (250, 8), (500, 32)] {
         let budget = std::time::Duration::from_millis(budget_ms);
         let t0 = std::time::Instant::now();
-        send_sys_rdy_with_retry(budget, vcpus, &addrs, port_path);
+        send_sys_rdy_with_retry(budget, vcpus, &addrs, Some(port_path));
         let elapsed = t0.elapsed();
         assert!(
             elapsed >= budget,
@@ -453,8 +453,8 @@ fn send_sys_rdy_retry_respects_budget_across_sizes() {
 /// resolves, the loop takes the `if port_path.exists()` arm
 /// and calls `send_kern_addrs` / `send_sys_rdy`. In host
 /// context those calls no-op via `assert_guest_context` (and
-/// `write_to_bulk_port`'s hardcoded `/dev/vport0p1` open will
-/// fail too), so kern_addrs_sent stays false and the loop
+/// the production named-port resolver cannot use the injected
+/// tempfile), so kern_addrs_sent stays false and the loop
 /// exhausts the budget. The WARN must report
 /// `port_exists=true, kern_addrs_sent=false` — the
 /// diagnostic combination the troubleshooting doc explains as
@@ -463,10 +463,10 @@ fn send_sys_rdy_retry_respects_budget_across_sizes() {
 #[tracing_test::traced_test]
 fn send_sys_rdy_retry_reports_port_exists_when_path_resolves() {
     let tmpfile =
-        tempfile::NamedTempFile::new().expect("create tempfile to stand in for /dev/vport0p1");
+        tempfile::NamedTempFile::new().expect("create tempfile to stand in for the bulk port");
     let budget = std::time::Duration::from_millis(150);
     let addrs = crate::vmm::wire::KernAddrs::new(0, 0, None);
-    send_sys_rdy_with_retry(budget, 4, &addrs, tmpfile.path());
+    send_sys_rdy_with_retry(budget, 4, &addrs, Some(tmpfile.path()));
     assert!(
         logs_contain("port_exists=true"),
         "WARN must report port_exists=true when the path resolves",
@@ -494,11 +494,11 @@ fn send_sys_rdy_retry_reports_port_exists_when_path_resolves() {
 fn send_sys_rdy_retry_throttles_fast_fail_does_not_hot_spin() {
     use std::sync::atomic::Ordering;
     let tmpfile =
-        tempfile::NamedTempFile::new().expect("create tempfile to stand in for /dev/vport0p1");
+        tempfile::NamedTempFile::new().expect("create tempfile to stand in for the bulk port");
     let budget = std::time::Duration::from_millis(400);
     let addrs = crate::vmm::wire::KernAddrs::new(0, 0, None);
     SEND_SYS_RDY_RETRY_ITERS.store(0, Ordering::Relaxed);
-    send_sys_rdy_with_retry(budget, 4, &addrs, tmpfile.path());
+    send_sys_rdy_with_retry(budget, 4, &addrs, Some(tmpfile.path()));
     let iters = SEND_SYS_RDY_RETRY_ITERS.load(Ordering::Relaxed);
     // ~budget/100ms ≈ 4-5 throttled iterations; allow generous slack for
     // scheduling jitter. A dropped throttle would spin into the

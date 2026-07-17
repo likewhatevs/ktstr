@@ -2573,6 +2573,25 @@ fn analyze_sidecars_single_fixture_renders_rows_only() {
 // syntactically-valid 3-part name would fall through to
 // check_kvm() and is intentionally NOT tested here.
 
+/// Guest-kernel/topology unsupported errors remain verifier SKIPs through
+/// anyhow context, while an ordinary scheduler/build error remains a FAIL.
+#[test]
+fn verifier_topology_unsupported_classifier_is_typed_and_chain_aware() {
+    let direct = anyhow::Error::new(crate::verifier::VerifierTopologyUnsupported {
+        reason: "guest disabled x2APIC".to_string(),
+    });
+    assert!(is_verifier_topology_unsupported(&direct));
+
+    let wrapped = anyhow::Error::new(crate::verifier::VerifierTopologyUnsupported {
+        reason: "guest disabled x2APIC".to_string(),
+    })
+    .context("collect verifier output");
+    assert!(is_verifier_topology_unsupported(&wrapped));
+    assert!(!is_verifier_topology_unsupported(&anyhow::anyhow!(
+        "scheduler failed to attach"
+    )));
+}
+
 /// A name lacking the `verifier/` prefix exits 1 with the
 /// missing-prefix diagnostic. Pins the strip_prefix None arm.
 #[test]

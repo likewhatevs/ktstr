@@ -500,11 +500,11 @@ pub(crate) static SEND_SYS_RDY_RETRY_ITERS: std::sync::atomic::AtomicU64 =
 /// `drivers/char/virtio_console.c`) completes asynchronously in two
 /// stages this function waits on WITHOUT polling:
 ///
-/// 1. **Node appearance.** `/dev/vport0p1` is created by `add_port`'s
-///    `device_create` when PORT_ADD arrives. We block on
-///    `kernfs_evented_wait` over an inotify watch of the port's
-///    parent directory (`IN_CREATE` / `IN_MOVED_TO`) so we wake on the
-///    exact devtmpfs create edge, with a 1 s guard-rail cadence
+/// 1. **Named port appearance.** PORT_ADD creates a device node and
+///    PORT_NAME publishes `ktstr-bulk` under the virtio-ports sysfs
+///    class. We block on `kernfs_evented_wait` over an inotify watch
+///    of that class (`IN_CREATE` / `IN_MOVED_TO`) and resolve the
+///    matching `/dev/vportNp1` basename, with a 1 s guard-rail cadence
 ///    bounding wake latency if the best-effort inotify source misses.
 ///    This replaces a former 100 ms existence poll whose stacked sleep
 ///    latency on a cold / oversubscribed boot delayed KERN_ADDRS (and
@@ -557,11 +557,38 @@ pub(crate) static SEND_SYS_RDY_RETRY_ITERS: std::sync::atomic::AtomicU64 =
 /// late SYS_RDY harmless (fire-once). See
 /// `doc/guide/src/troubleshooting.md#send_sys_rdy-timeout` for the
 /// operator-facing diagnosis flow.
+#[derive(Clone)]
+struct BulkPortLocator {
+    fixed_path: Option<std::path::PathBuf>,
+}
+
+impl BulkPortLocator {
+    fn new(fixed_path: Option<&std::path::Path>) -> Self {
+        Self {
+            fixed_path: fixed_path.map(std::path::Path::to_path_buf),
+        }
+    }
+
+    fn resolve(&self) -> Option<std::path::PathBuf> {
+        self.fixed_path
+            .clone()
+            .or_else(crate::vmm::guest_comms::bulk_port_path)
+    }
+
+    fn watch_dir(&self) -> std::path::PathBuf {
+        if let Some(parent) = self.fixed_path.as_deref().and_then(std::path::Path::parent) {
+            parent.to_path_buf()
+        } else {
+            crate::vmm::guest_comms::virtio_port_watch_dir().to_path_buf()
+        }
+    }
+}
+
 pub(crate) fn send_sys_rdy_with_retry(
     budget: std::time::Duration,
     vcpus: u32,
     kern_addrs: &crate::vmm::wire::KernAddrs,
-    port_path: &std::path::Path,
+    fixed_port_path: Option<&std::path::Path>,
 ) {
     use crate::vmm::freeze_coord::evented_wait::{KernfsWaitOutcome, kernfs_evented_wait};
     use nix::sys::inotify::AddWatchFlags;
@@ -572,11 +599,10 @@ pub(crate) fn send_sys_rdy_with_retry(
     // inotify source misses the device-create edge; the real wake is
     // the inotify event. Not a poll — see `kernfs_evented_wait`.
     let cadence = std::time::Duration::from_secs(1);
-    // The port node lives directly under /dev; watch that directory for
-    // its creation. `/dev` is the parent of `/dev/vport0p1`.
-    let watch_dir = port_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("/dev"));
+    let locator = BulkPortLocator::new(fixed_port_path);
+    // Production waits for the stable PORT_NAME entry in sysfs. Tests
+    // may inject a fixed path and watch its parent directory.
+    let watch_dir = locator.watch_dir();
 
     // Structured WARN shared by the timeout and no-evented-source exits.
     // Snapshots `port_exists` so the field reports the last-attempt
@@ -600,7 +626,7 @@ pub(crate) fn send_sys_rdy_with_retry(
     // publish still lights the evidence channels. The WARN remains the
     // operator signal that the budget was exceeded.
     let warn_timeout = |kern_addrs_sent: bool| {
-        let port_exists_snapshot = port_path.exists();
+        let port_exists_snapshot = locator.resolve().is_some_and(|path| path.exists());
         tracing::warn!(
             budget_ms = budget.as_millis() as u64,
             vcpus,
@@ -625,16 +651,16 @@ pub(crate) fn send_sys_rdy_with_retry(
     loop {
         #[cfg(test)]
         SEND_SYS_RDY_RETRY_ITERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Stage 1: block (evented) until `/dev/vport0p1` appears. On a
+        // Stage 1: block (evented) until the named bulk port appears. On a
         // send-failure retry the node already exists, so the fast-path
         // predicate returns immediately.
         match kernfs_evented_wait(
-            watch_dir,
+            &watch_dir,
             AddWatchFlags::IN_CREATE | AddWatchFlags::IN_MOVED_TO,
             None::<&std::path::Path>,
             cadence,
             deadline,
-            || port_path.exists().then_some(()),
+            || locator.resolve().filter(|path| path.exists()).map(|_| ()),
         ) {
             KernfsWaitOutcome::Done(()) => {
                 // Stage 2: the sends' blocking writev parks on the port
@@ -688,7 +714,7 @@ pub(crate) fn send_sys_rdy_with_retry(
                         "ktstr-init: publish budget expired with KERN_ADDRS UNSENT; \
                          background retry spawned"
                     });
-                    spawn_background_publish_retry(kern_addrs_sent, *kern_addrs, port_path);
+                    spawn_background_publish_retry(kern_addrs_sent, *kern_addrs, locator.clone());
                     return;
                 }
                 // The send failed and reset the cached FD. Most send
@@ -712,7 +738,7 @@ pub(crate) fn send_sys_rdy_with_retry(
                     "ktstr-init: publish budget expired waiting for the port node; \
                      background retry spawned",
                 );
-                spawn_background_publish_retry(kern_addrs_sent, *kern_addrs, port_path);
+                spawn_background_publish_retry(kern_addrs_sent, *kern_addrs, locator.clone());
                 return;
             }
         }
@@ -740,19 +766,15 @@ pub(crate) fn send_sys_rdy_with_retry(
 fn spawn_background_publish_retry(
     kern_addrs_sent: bool,
     kern_addrs: crate::vmm::wire::KernAddrs,
-    port_path: &std::path::Path,
+    locator: BulkPortLocator,
 ) {
     use crate::vmm::freeze_coord::evented_wait::{KernfsWaitOutcome, kernfs_evented_wait};
     use nix::sys::inotify::AddWatchFlags;
 
-    let port_path = port_path.to_path_buf();
     let spawn_res = std::thread::Builder::new()
         .name("ktstr-publish-retry".into())
         .spawn(move || {
-            let watch_dir = port_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("/dev"))
-                .to_path_buf();
+            let watch_dir = locator.watch_dir();
             let cadence = std::time::Duration::from_secs(1);
             let mut kern_addrs_sent = kern_addrs_sent;
             let retry_t0 = std::time::Instant::now();
@@ -769,7 +791,7 @@ fn spawn_background_publish_retry(
                     None::<&std::path::Path>,
                     cadence,
                     deadline,
-                    || port_path.exists().then_some(()),
+                    || locator.resolve().filter(|path| path.exists()).map(|_| ()),
                 ) {
                     KernfsWaitOutcome::Done(()) => {
                         attempts += 1;
@@ -805,10 +827,20 @@ fn spawn_background_publish_retry(
                         // Fast-fail throttle, mirroring the foreground loop.
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     }
-                    KernfsWaitOutcome::Timeout | KernfsWaitOutcome::NoEventedSource => {
-                        // Node still absent after an hour-scale horizon (or
-                        // no inotify available): re-arm and keep waiting —
-                        // the loop stays evented either way.
+                    KernfsWaitOutcome::Timeout => {
+                        // Node still absent after an hour-scale horizon:
+                        // recompute the watch directory (the virtio-ports
+                        // class may now exist), re-arm, and keep waiting.
+                    }
+                    KernfsWaitOutcome::NoEventedSource => {
+                        // There is no honest event-driven fallback if both
+                        // inotify setup and the kernfs source are unavailable.
+                        // Exit instead of hot-spinning a detached thread.
+                        crate::vmm::rust_init::console_breadcrumb(
+                            "ktstr-init: publish retry stopped: no evented \
+                             virtio-port source",
+                        );
+                        return;
                     }
                 }
             }
@@ -828,7 +860,7 @@ fn spawn_background_publish_retry(
 fn spawn_background_publish_retry(
     _kern_addrs_sent: bool,
     _kern_addrs: crate::vmm::wire::KernAddrs,
-    _port_path: &std::path::Path,
+    _locator: BulkPortLocator,
 ) {
 }
 

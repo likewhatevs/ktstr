@@ -45,8 +45,8 @@
 //!
 //! # Guest → host wire: virtio-console port-1 TLV request/reply
 //!
-//! The guest-driven capture trigger rides the virtio-console bulk
-//! port (`/dev/vport0p1`), not an ioeventfd/MMIO doorbell.
+//! The guest-driven capture trigger rides the named virtio-console bulk
+//! port, not an ioeventfd/MMIO doorbell.
 //!
 //! 1. The guest [`Op::CaptureSnapshot`](crate::scenario::ops::Op::CaptureSnapshot)
 //!    handler calls

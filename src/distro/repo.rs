@@ -136,6 +136,9 @@ pub(crate) fn resolve_for_arch(
         DistroKind::Ubuntu => resolve_ubuntu(release, arch),
         DistroKind::AmazonLinux => resolve_amazonlinux(release, arch),
         DistroKind::SteamOs => resolve_steamos(release, arch),
+        DistroKind::Gke => {
+            bail!("GKE kernels use Google COS image metadata, not a distro package repository")
+        }
     }
 }
 

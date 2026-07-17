@@ -49,25 +49,48 @@ const APIC_MODE_EXTINT: u32 = 0x7;
 
 /// Result of loading a kernel.
 pub struct KernelLoadResult {
-    /// 64-bit entry point as a guest physical address (kernel_load +
-    /// STARTUP64_OFFSET). The guest starts executing here in long mode.
+    /// 64-bit entry point as a guest physical address. For bzImage this
+    /// is `kernel_load + STARTUP64_OFFSET`; for a bootable ELF it is the
+    /// ELF header's physical entry point. The guest starts executing
+    /// here in long mode.
     pub entry: u64,
-    /// Setup header from the bzImage. Always `Some` when loaded from a
-    /// bzImage; the `Option` wrapper exists for future non-bzImage paths.
+    /// Setup header from the bzImage, or `None` for a bootable ELF.
     pub setup_header: Option<linux_loader::loader::bootparam::setup_header>,
 }
 
-/// Load a bzImage kernel into guest memory.
+/// Load a bzImage or bootable ELF kernel into guest memory.
 /// Returns the entry point and setup header for boot_params construction.
 pub fn load_kernel(
     guest_mem: &GuestMemoryMmap,
     kernel_path: &std::path::Path,
 ) -> Result<KernelLoadResult> {
-    use linux_loader::loader::{KernelLoader, bzimage::BzImage};
+    use linux_loader::loader::{KernelLoader, bzimage::BzImage, elf::Elf};
     use std::fs::File;
+    use std::io::{Read, Seek};
 
     let mut kernel_file = File::open(kernel_path)
         .with_context(|| format!("open kernel: {}", kernel_path.display()))?;
+    let mut magic = [0u8; 4];
+    kernel_file
+        .read_exact(&mut magic)
+        .with_context(|| format!("read kernel magic: {}", kernel_path.display()))?;
+    kernel_file
+        .rewind()
+        .context("rewind kernel after magic probe")?;
+
+    if magic == *b"\x7fELF" {
+        let result = Elf::load(
+            guest_mem,
+            None,
+            &mut kernel_file,
+            Some(GuestAddress(HIMEM_START)),
+        )
+        .context("load bootable ELF")?;
+        return Ok(KernelLoadResult {
+            entry: result.kernel_load.raw_value(),
+            setup_header: None,
+        });
+    }
 
     let result = BzImage::load(
         guest_mem,
@@ -598,6 +621,53 @@ mod tests {
         let mem = test_mem(16);
         let long = "x".repeat(CMDLINE_MAX + 1);
         assert!(write_cmdline(&mem, &long).is_err());
+    }
+
+    #[test]
+    fn load_kernel_accepts_bootable_elf() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        // Minimal ELF64 with one PT_LOAD segment. Keep the entry and
+        // physical load address at HIMEM_START so it exercises the same
+        // direct long-mode path used by Google GKE's bootable vmlinux.
+        let mut image = vec![0u8; 0x104];
+        image[0..4].copy_from_slice(b"\x7fELF");
+        image[4] = 2; // ELFCLASS64
+        image[5] = 1; // ELFDATA2LSB
+        image[6] = 1; // EV_CURRENT
+        image[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        image[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+        image[20..24].copy_from_slice(&1u32.to_le_bytes());
+        image[24..32].copy_from_slice(&HIMEM_START.to_le_bytes()); // e_entry
+        image[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        image[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        image[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        image[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+
+        let ph = 64usize;
+        image[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        image[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes()); // R|X
+        image[ph + 8..ph + 16].copy_from_slice(&0x100u64.to_le_bytes()); // p_offset
+        image[ph + 16..ph + 24].copy_from_slice(&HIMEM_START.to_le_bytes()); // p_vaddr
+        image[ph + 24..ph + 32].copy_from_slice(&HIMEM_START.to_le_bytes()); // p_paddr
+        image[ph + 32..ph + 40].copy_from_slice(&4u64.to_le_bytes()); // p_filesz
+        image[ph + 40..ph + 48].copy_from_slice(&4u64.to_le_bytes()); // p_memsz
+        image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+        image[0x100..0x104].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+
+        let mut file = tempfile::NamedTempFile::new().expect("tempfile");
+        file.write_all(&image).expect("write ELF");
+        file.flush().expect("flush ELF");
+        file.seek(SeekFrom::Start(0)).expect("rewind ELF");
+
+        let mem = test_mem(4);
+        let loaded = load_kernel(&mem, file.path()).expect("load ELF");
+        assert_eq!(loaded.entry, HIMEM_START);
+        assert!(loaded.setup_header.is_none());
+        let mut payload = [0u8; 4];
+        mem.read_slice(&mut payload, GuestAddress(HIMEM_START))
+            .expect("read loaded segment");
+        assert_eq!(payload, [0xde, 0xad, 0xbe, 0xef]);
     }
 
     #[test]

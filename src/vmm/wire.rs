@@ -201,8 +201,8 @@ pub enum MsgType {
     /// and replies with [`MsgType::SnapshotReply`] on port 1 RX.
     SnapshotRequest,
     /// Host→guest snapshot reply (payload: [`SnapshotReplyPayload`]).
-    /// Sent on port 1 RX so the guest's blocking read on
-    /// `/dev/vport0p1` wakes within microseconds. Reply payload
+    /// Sent on port 1 RX so the guest's blocking read on the port
+    /// advertised as [`PORT1_NAME`] wakes within microseconds. Reply payload
     /// carries the matching request_id, the status, and a UTF-8
     /// reason buffer for the failure path.
     SnapshotReply,
@@ -1601,20 +1601,20 @@ const _VIRTIO_CONSOLE_CONTROL_SIZE: () = assert!(std::mem::size_of::<VirtioConso
 /// Number of multiport ports the device exposes.
 ///
 /// Port 0 is the kernel console (`/dev/hvc0`); port 1 is the
-/// host-bound bulk TLV stream (`/dev/vport0p1`); port 2 is the
-/// scheduler stats bridge (`/dev/vport0p2`) carrying raw byte
+/// host-bound bulk TLV stream advertised as [`PORT1_NAME`]; port 2 is the
+/// scheduler stats bridge advertised as [`PORT2_NAME`], carrying raw byte
 /// passthrough between the host's [`super::sched_stats::SchedStatsClient`]
 /// and the guest's `scx_stats` Unix-socket relay. Three ports →
 /// eight queues per virtio-v1.2 §5.3.5 (`2 + 2 * num_ports`).
 pub const NUM_PORTS: u32 = 3;
 
 /// Port-1 device-name advertised to the guest. The kernel exposes
-/// this as `/sys/class/virtio-ports/vport0p1/name`; the guest init
+/// this as `/sys/class/virtio-ports/vportNpM/name`; the guest init
 /// reads from this path to discover the bulk channel device node.
 pub const PORT1_NAME: &str = "ktstr-bulk";
 
 /// Port-2 device-name advertised to the guest. The kernel exposes
-/// this as `/sys/class/virtio-ports/vport0p2/name`; the guest init
+/// this as `/sys/class/virtio-ports/vportNpM/name`; the guest init
 /// reads from this path to discover the scheduler-stats relay
 /// device node and connects it to the scheduler's
 /// `/var/run/scx/root/stats` Unix socket.

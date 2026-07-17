@@ -2,7 +2,7 @@
 //! channel.
 //!
 //! The guest writes [`super::wire::ShmMessage`]-prefixed messages through
-//! `/dev/vport0p1`. The host VMM accumulates the byte stream into
+//! the virtio-console port advertised as `ktstr-bulk`. The host VMM accumulates the byte stream into
 //! [`super::virtio_console::VirtioConsole::drain_bulk`] and feeds each
 //! drain into [`HostAssembler::feed`] which yields complete
 //! `BulkMessage` values; partial trailing bytes are preserved across

@@ -20,7 +20,7 @@
 //! The ktstr guest boots off the initramfs (no root disk — see
 //! `src/vmm/setup/mod.rs` `rdinit=/init`), so the only devices EVERY
 //! boot touches are the virtio-console control ports
-//! (`/dev/vport0p1` sys_rdy handshake and `/dev/hvc0`), presented over
+//! (the named `ktstr-bulk` sys_rdy channel and `/dev/hvc0`), presented over
 //! the virtio-MMIO transport on both arches
 //! (`src/vmm/setup/mod.rs` console `virtio_mmio.device=`,
 //! `src/vmm/aarch64/fdt.rs` `virtio,mmio` nodes) and loaded before any
@@ -333,7 +333,7 @@ fn select_boot_modules(extracted: &ExtractedKernel, gate: &GateResult) -> Result
 /// config gate and boot-module selection run in the caller (before this)
 /// so the distro path can gate a kernel before downloading its
 /// debuginfo.
-fn install_extracted(
+pub(crate) fn install_extracted(
     cache_key: &str,
     extracted: &ExtractedKernel,
     modules: &[PathBuf],
@@ -366,7 +366,7 @@ fn install_extracted(
 /// so the final reflink-copy into the cache stays on one filesystem.
 /// Dot-prefixed, which `CacheDir::list` skips, so it never surfaces as
 /// a cache entry even mid-run.
-fn scratch_dir() -> Result<tempfile::TempDir> {
+pub(crate) fn scratch_dir() -> Result<tempfile::TempDir> {
     let root = crate::cache::resolve_cache_root_with_suffix("kernels")?;
     fs::create_dir_all(&root).with_context(|| format!("create cache root {}", root.display()))?;
     tempfile::Builder::new()
@@ -466,6 +466,9 @@ pub fn acquire_distro_kernel(
     cli_label: &str,
     mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<PathBuf> {
+    if kind == DistroKind::Gke {
+        return crate::distro::gke::acquire_gke_kernel(release, cli_label, mp);
+    }
     let resolved =
         resolve_distro_kernel(kind, release).with_context(|| "resolve distro kernel metadata")?;
     let cache_key = distro_cache_key(&resolved)?;

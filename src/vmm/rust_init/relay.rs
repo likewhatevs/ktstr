@@ -10,14 +10,6 @@ use super::*;
 /// running.
 const SCHED_STATS_SOCKET: &str = "/var/run/scx/root/stats";
 
-/// Path of the guest-side stats relay's port-2 device node. The
-/// kernel virtio-console driver creates this node in its PORT_ADD
-/// handler (`add_port` -> cdev_add + device_create); the PORT_NAME
-/// control message only populates the sysfs `name` attribute
-/// (`/sys/class/virtio-ports/vport0p2/name`); see
-/// [`crate::vmm::wire::PORT2_NAME`].
-const SCHED_STATS_PORT_DEV: &str = "/dev/vport0p2";
-
 /// Per-iteration scratch buffer size. Matches
 /// [`crate::vmm::sched_stats::MAX_REQUEST_BYTES`] (256 KiB) so a
 /// single legitimate request or response fits in one read. Larger
@@ -73,8 +65,9 @@ impl RelayStopSignal {
 
 /// Spawn the scheduler-stats relay thread.
 ///
-/// Event-driven design: the relay opens [`SCHED_STATS_PORT_DEV`]
-/// once (no retry — `redirect_stdio_to_bulk_port` already proved
+/// Event-driven design: the relay resolves and opens the port advertised
+/// as [`crate::vmm::wire::PORT2_NAME`] once (no retry —
+/// `redirect_stdio_to_bulk_port` already proved
 /// the multiport handshake completed by the time this is called),
 /// then runs an outer loop that:
 ///
@@ -131,7 +124,7 @@ pub(crate) fn start_sched_stats_relay() -> RelayStopSignal {
 /// `WaitSocketResult::Stopped` exits the thread.
 ///
 /// The stats-port reader can return Ok(0) when the host
-/// hasn't connected its end of `/dev/vport0p2` yet, when the host
+/// hasn't connected its end of the named stats port yet, when the host
 /// closes its console connection, or when the kernel virtio-console
 /// driver hits a transient disconnect. A single Ok(0) is recoverable
 /// (the inner functions exit cleanly, the outer loop re-arms via
@@ -168,17 +161,26 @@ enum RelaySessionExit {
 /// inotify-wait → connect → poll-relay-session cycle until `stop`
 /// flips.
 fn sched_stats_relay_loop(stop: Arc<AtomicBool>, stop_evt: Arc<vmm_sys_util::eventfd::EventFd>) {
+    let Some(port_path) =
+        crate::vmm::guest_comms::named_virtio_port_path(crate::vmm::wire::PORT2_NAME)
+    else {
+        tracing::warn!(
+            port_name = crate::vmm::wire::PORT2_NAME,
+            "stats relay: named virtio-console port not found; relay disabled"
+        );
+        return;
+    };
     let mut port = match fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(SCHED_STATS_PORT_DEV)
+        .open(&port_path)
     {
         Ok(f) => f,
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                path = SCHED_STATS_PORT_DEV,
-                "stats relay: open vport0p2 failed; relay disabled"
+                path = %port_path.display(),
+                "stats relay: open named stats port failed; relay disabled"
             );
             return;
         }
@@ -219,7 +221,7 @@ fn sched_stats_relay_loop(stop: Arc<AtomicBool>, stop_evt: Arc<vmm_sys_util::eve
                 if consecutive_port_eof >= SCHED_STATS_RELAY_MAX_CONSECUTIVE_PORT_EOF {
                     tracing::warn!(
                         consecutive_port_eof,
-                        "stats relay: vport0p2 returned Ok(0) on \
+                        "stats relay: named stats port returned Ok(0) on \
                          {SCHED_STATS_RELAY_MAX_CONSECUTIVE_PORT_EOF} consecutive \
                          relay sessions — assuming the port is permanently dead and \
                          exiting the relay thread to avoid a busy-loop"
@@ -232,7 +234,7 @@ fn sched_stats_relay_loop(stop: Arc<AtomicBool>, stop_evt: Arc<vmm_sys_util::eve
                 if consecutive_port_eof >= SCHED_STATS_RELAY_MAX_CONSECUTIVE_PORT_EOF {
                     tracing::warn!(
                         consecutive_port_eof,
-                        "stats relay: vport0p2 returned Ok(0) on \
+                        "stats relay: named stats port returned Ok(0) on \
                          {SCHED_STATS_RELAY_MAX_CONSECUTIVE_PORT_EOF} consecutive \
                          inotify-wait drains — assuming the port is permanently \
                          dead and exiting the relay thread to avoid a busy-loop"
@@ -641,7 +643,7 @@ fn poll_relay_fds(
 /// I/O within microseconds.
 ///
 /// Single-thread serialization: the relay is the only writer and
-/// the only reader of `/dev/vport0p2` inside the guest, so no
+/// the only reader of the named stats port inside the guest, so no
 /// userspace mutex around the port fd is required. scx_stats
 /// requests are strictly request/response on a single socket
 /// connection — no req-id multiplexing — so the natural ordering

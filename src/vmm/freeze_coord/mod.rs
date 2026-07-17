@@ -2994,6 +2994,7 @@ impl KtstrVm {
             Arc::new(std::sync::Mutex::new(None));
 
         let has_immediate_exit = vm.has_immediate_exit;
+        let vcpus_for_wd = self.topology.total_cpus();
         let mut vcpus = std::mem::take(&mut vm.vcpus);
         let mut bsp = vcpus.remove(0);
 
@@ -5312,7 +5313,7 @@ impl KtstrVm {
                 // If the accessor never adopts (worker permanently
                 // failed past its 60 s deadline), the queue is
                 // dropped at coord exit and the guest's blocking
-                // reader on `/dev/vport0p1` times out at the per-Op
+                // reader on the named bulk port times out at the per-Op
                 // 30 s deadline — same observable behaviour as a
                 // late-boot rendezvous timeout. WATCH requests are
                 // NOT deferred: WATCH only needs the symbol cache,
@@ -5344,7 +5345,7 @@ impl KtstrVm {
                 // If the accessor never adopts (worker permanently
                 // failed past its 60 s deadline), the queue is
                 // dropped at coord exit and the guest's blocking
-                // reader on `/dev/vport0p1` times out at the per-Op
+                // reader on the named bulk port times out at the per-Op
                 // 30 s deadline — same observable behaviour as a
                 // late-boot rendezvous timeout. Symmetric with
                 // `capture_requests_deferred`.
@@ -9419,7 +9420,7 @@ impl KtstrVm {
                     // tag, then frames a `MSG_TYPE_SNAPSHOT_REPLY`
                     // TLV (header + 72-byte payload) and pushes it
                     // through `queue_input_port1` so the guest's
-                    // blocking reader on `/dev/vport0p1` wakes
+                    // blocking reader on the named bulk port wakes
                     // within microseconds and observes
                     // `reply.request_id == request.request_id`.
                     // WATCH resolves the symbol via the cached
@@ -12591,8 +12592,12 @@ impl KtstrVm {
                     // milestone); reused by the deadman deferral gate.
                     let wall_since_milestone_ns =
                         now_wall_ns.saturating_sub(snapshot.wall_ns_at_progress);
-                    let progress_decision =
-                        watchdog_step::evaluate_progress(&snapshot, now_wall_ns, monitor_live);
+                    let progress_decision = watchdog_step::evaluate_progress(
+                        &snapshot,
+                        now_wall_ns,
+                        monitor_live,
+                        vcpus_for_wd,
+                    );
                     let tier_fire = !matches!(progress_decision, watchdog_step::KillDecision::None);
                     let effective_deadline =
                         reset_deadline.map_or(hard_deadline, |r| r.max(hard_deadline));
@@ -12712,8 +12717,10 @@ impl KtstrVm {
                         // snapshot. `max_vcpu_cpu_in_phase` (the busiest
                         // vCPU's CPU burned since the phase was entered) is
                         // what Tier-1 compares against the currency-widened
-                        // budget — width-independent; the summed `cpu_ns_now`
-                        // is rendered alongside as pure context (it feeds no
+                        // budget. The signal is width-independent; only
+                        // Boot's budget scales because the BSP serially
+                        // initializes every AP. The summed `cpu_ns_now` is
+                        // rendered alongside as pure context (it feeds no
                         // tier). `wall_in_phase` (wall since the last
                         // milestone) is what Tier-2 / the deadman compare
                         // against the backstop / grace. The `u64::MAX`
@@ -12726,6 +12733,7 @@ impl KtstrVm {
                         let cpu_budget = watchdog_step::widened_cpu_budget_ns(
                             snapshot.phase,
                             snapshot.cpu_currency,
+                            vcpus_for_wd,
                         );
                         let wall_backstop =
                             crate::test_support::runtime::phase_wall_backstop_ns(snapshot.phase);
@@ -15752,7 +15760,7 @@ impl KtstrVm {
         // Drain the virtio-console port-1 TX accumulator: the guest
         // wrote bulk TLV-framed messages (STIMULUS, EXIT, SCHED_EXIT,
         // PAYLOAD_METRICS, etc.) to
-        // `/dev/vport0p1`; the host side accumulated them into
+        // the named bulk port; the host side accumulated them into
         // `port1_tx_buf` and we parse them here through
         // `parse_tlv_stream`. Port-1 uses backpressure rather than
         // drops — every byte the guest emitted is delivered, in

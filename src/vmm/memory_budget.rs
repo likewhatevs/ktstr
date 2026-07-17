@@ -159,7 +159,9 @@ pub(crate) struct MemoryBudget {
 /// x86_64 bzImage: reads `init_size` from setup_header at file offset
 /// 0x260 (setup_header starts at 0x1F1, `init_size` is at byte 111
 /// within it). This is the kernel's declared contiguous memory
-/// requirement during boot decompression.
+/// requirement during boot decompression. For a bootable ELF, returns
+/// the highest end address (`p_paddr + p_memsz`) among PT_LOAD program
+/// headers so the memory budget always contains every loaded segment.
 ///
 /// aarch64 Image: reads `image_size` from the arm64 image header at
 /// file offset 16 (after code0 + code1 + text_offset). For gzip-
@@ -172,6 +174,49 @@ pub(crate) fn read_kernel_init_size(kernel_path: &Path) -> Result<u64> {
 
     #[cfg(target_arch = "x86_64")]
     {
+        let mut magic = [0u8; 4];
+        f.read_exact(&mut magic).context("read kernel magic")?;
+        if magic == *b"\x7fELF" {
+            // ELF64_Ehdr layout (little-endian): e_phoff at 0x20,
+            // e_phentsize at 0x36, and e_phnum at 0x38.
+            let mut ehdr = [0u8; 64];
+            ehdr[..4].copy_from_slice(&magic);
+            f.read_exact(&mut ehdr[4..]).context("read ELF64 header")?;
+            anyhow::ensure!(ehdr[4] == 2, "kernel ELF is not ELF64");
+            anyhow::ensure!(ehdr[5] == 1, "kernel ELF is not little-endian");
+            let phoff = u64::from_le_bytes(ehdr[32..40].try_into().unwrap());
+            let phentsize = u16::from_le_bytes(ehdr[54..56].try_into().unwrap());
+            let phnum = u16::from_le_bytes(ehdr[56..58].try_into().unwrap());
+            anyhow::ensure!(
+                phentsize as usize >= 56,
+                "kernel ELF program header is too small: {phentsize}"
+            );
+            anyhow::ensure!(phnum > 0, "kernel ELF has no program headers");
+
+            let mut max_end = 0u64;
+            let mut phdr = vec![0u8; phentsize as usize];
+            for index in 0..phnum {
+                let offset = phoff
+                    .checked_add(u64::from(index) * u64::from(phentsize))
+                    .context("kernel ELF program-header offset overflow")?;
+                f.seek(SeekFrom::Start(offset))
+                    .context("seek to ELF program header")?;
+                f.read_exact(&mut phdr).context("read ELF program header")?;
+                let p_type = u32::from_le_bytes(phdr[0..4].try_into().unwrap());
+                if p_type != 1 {
+                    continue;
+                }
+                let p_paddr = u64::from_le_bytes(phdr[24..32].try_into().unwrap());
+                let p_memsz = u64::from_le_bytes(phdr[40..48].try_into().unwrap());
+                let end = p_paddr
+                    .checked_add(p_memsz)
+                    .context("kernel ELF PT_LOAD address overflow")?;
+                max_end = max_end.max(end);
+            }
+            anyhow::ensure!(max_end > 0, "kernel ELF has no non-empty PT_LOAD segments");
+            return Ok(max_end);
+        }
+
         // setup_header starts at 0x1F1, init_size at offset 111.
         f.seek(SeekFrom::Start(0x260))
             .context("seek to init_size in bzImage")?;
@@ -831,6 +876,38 @@ mod tests {
 
         let got = read_kernel_init_size(f.path()).expect("read init_size");
         assert_eq!(got, init_size as u64);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn read_kernel_init_size_x86_64_reads_elf_load_extent() {
+        use std::io::Write;
+
+        let mut image = vec![0u8; 64 + 2 * 56];
+        image[0..4].copy_from_slice(b"\x7fELF");
+        image[4] = 2; // ELFCLASS64
+        image[5] = 1; // ELFDATA2LSB
+        image[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        image[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        image[56..58].copy_from_slice(&2u16.to_le_bytes()); // e_phnum
+
+        for (index, (paddr, memsz)) in
+            [(0x0100_0000u64, 0x0020_0000u64), (0x0340_0000, 0x00d0_0000)]
+                .into_iter()
+                .enumerate()
+        {
+            let ph = 64 + index * 56;
+            image[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+            image[ph + 24..ph + 32].copy_from_slice(&paddr.to_le_bytes());
+            image[ph + 40..ph + 48].copy_from_slice(&memsz.to_le_bytes());
+        }
+
+        let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+        f.write_all(&image).expect("write ELF");
+        f.flush().expect("flush ELF");
+
+        let got = read_kernel_init_size(f.path()).expect("read ELF load extent");
+        assert_eq!(got, 0x0410_0000);
     }
 
     /// Reading a file shorter than 0x264 bytes (the high end of the

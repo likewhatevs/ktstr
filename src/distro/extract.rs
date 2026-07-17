@@ -612,7 +612,19 @@ fn extract_data_tar(name: &str, data: Vec<u8>, dest: &Path) -> Result<()> {
 
 /// Hardened tar extraction: absolute anchors are stripped, `..` is a
 /// hard error, and escaping symlinks are skipped.
-fn extract_tar<R: Read>(reader: R, dest: &Path) -> Result<()> {
+pub(crate) fn extract_tar<R: Read>(reader: R, dest: &Path) -> Result<()> {
+    extract_tar_matching(reader, dest, |_| true)
+}
+
+/// Hardened selective tar extraction using the same path and symlink
+/// checks as [`extract_tar`]. `include` receives the sanitized relative
+/// path, so callers can extract a small source subset from a large
+/// archive without duplicating archive-hardening logic.
+pub(crate) fn extract_tar_matching<R: Read, F: FnMut(&Path) -> bool>(
+    reader: R,
+    dest: &Path,
+    mut include: F,
+) -> Result<()> {
     let mut archive = tar::Archive::new(reader);
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -621,6 +633,9 @@ fn extract_tar<R: Read>(reader: R, dest: &Path) -> Result<()> {
             Some(rel) => rel,
             None => continue,
         };
+        if !include(&rel) {
+            continue;
+        }
         let out = dest.join(&rel);
         match entry.header().entry_type() {
             tar::EntryType::Directory => {

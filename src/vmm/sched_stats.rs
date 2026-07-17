@@ -10,11 +10,11 @@
 //! 2. The request bytes (a complete `\n`-terminated JSON line) are
 //!    pushed onto port 2 RX via
 //!    [`super::virtio_console::VirtioConsole::queue_input_port2`].
-//! 3. The guest's relay thread reads `/dev/vport0p2` and forwards
+//! 3. The guest's relay thread reads the port advertised as `ktstr-stats` and forwards
 //!    the bytes to `/var/run/scx/root/stats`.
 //! 4. The scheduler's response — also a `\n`-terminated JSON line —
 //!    travels back through the same path: scheduler writes the Unix
-//!    socket; relay forwards it to `/dev/vport0p2`; the device
+//!    socket; relay forwards it to the named stats port; the device
 //!    accumulates the bytes in `ports[2].tx_buf` and signals
 //!    `stats_tx_evt`.
 //! 5. The drainer thread this client owns wakes on `stats_tx_evt`,

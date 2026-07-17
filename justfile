@@ -121,7 +121,7 @@ test-doc:
 # module so it never sweeps in the VM-gauntlet `live_host_*` tests. The
 # `ci` profile's retries absorb transient CDN hiccups.
 test-distro-resolve:
-    cargo nextest run -p ktstr --profile ci --run-ignored only -E 'test(/distro::repo::tests::live_/)'
+    cargo nextest run -p ktstr --profile ci --run-ignored only -E 'test(/distro::(repo|gke)::tests::live_/)'
 
 # Acquire a prebuilt distro kernel into the cache (`kernel build`) and
 # boot it (`shell --exec 'uname -r'`), asserting the guest's kernel
@@ -142,6 +142,27 @@ distro-boot spec pattern:
     printf 'boot %-12s uname -r => %s\n' '{{spec}}' "$rel"
     grep -Eq '{{pattern}}' <<<"$rel" \
         || { echo "FAIL: {{spec}} booted kernel '$rel', not matching /{{pattern}}/"; exit 1; }
+
+# Official GKE COS acquire+capability smoke. Attaching the disk before
+# virtio-console deliberately makes Linux enumerate the MIMO ports under
+# vport1 on current Google kernels, so the SYS_RDY handshake also guards
+# stable-name port discovery (not a hardcoded /dev/vport0p1). The command
+# checks the exact-source virtio-blk and Btrfs modules before printing the
+# Google kernel release.
+gke-boot:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo run --bin cargo-ktstr -- ktstr kernel build --kernel gke
+    errlog=$(mktemp)
+    rel=$(cargo run --bin cargo-ktstr -- ktstr shell --kernel gke --no-perf-mode \
+        --disk 256mib \
+        --exec 'test -b /dev/vda && grep -qw btrfs /proc/filesystems && uname -r' \
+        2>"$errlog") \
+        || { echo "FAIL: gke disk/Btrfs boot exited nonzero; stderr:"; cat "$errlog"; rm -f "$errlog"; exit 1; }
+    rm -f "$errlog"
+    printf 'boot %-12s uname -r => %s\n' 'gke' "$rel"
+    grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\+' <<<"$rel" \
+        || { echo "FAIL: gke booted unexpected kernel release '$rel'"; exit 1; }
 
 # Hermetic (zero-network) local-package acquire+boot e2e. Pack the
 # already-built kernel `ver` (its tarball cache entry — build it first

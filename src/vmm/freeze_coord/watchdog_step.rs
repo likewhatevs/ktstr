@@ -209,6 +209,8 @@ pub(crate) const fn trickle_floor_for_currency(cpu_currency: u8) -> u64 {
 ///     writes.
 ///   - `cpu_currency`: provenance of `max_vcpu_cpu_in_phase_ns`
 ///     ([`CPU_CURRENCY_NONE`]/`PTHREAD`/`PMU`).
+///   - `vcpus`: total guest width. Only Boot consumes it because the BSP
+///     serially initializes every AP; other phase budgets remain flat.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn watchdog_step(
     phase: u8,
@@ -219,6 +221,7 @@ pub(crate) fn watchdog_step(
     channels_live: bool,
     monitor_live: bool,
     cpu_currency: u8,
+    vcpus: u32,
 ) -> KillDecision {
     // A dead monitor invalidates BOTH tiers' evidence. Tier-1's CPU signal
     // comes from monitor ledger writes, so a stale monitor makes it
@@ -240,7 +243,7 @@ pub(crate) fn watchdog_step(
     // budget is the `u64::MAX` sentinel, so Tier-1 is structurally off for
     // Body via the budget table, not a class check.
     if cpu_currency != CPU_CURRENCY_NONE {
-        let budget = widen_budget_for_currency(phase_cpu_budget_ns(phase), cpu_currency);
+        let budget = widen_budget_for_currency(phase_cpu_budget_ns(phase, vcpus), cpu_currency);
         // Strict `>`: a phase whose busiest vCPU burned *exactly* the budget
         // has not yet exceeded it.
         if max_vcpu_cpu_in_phase_ns > budget {
@@ -293,9 +296,9 @@ pub(crate) fn watchdog_step(
 /// compares `max_vcpu_cpu_in_phase_ns` against. Exposed so the watchdog's
 /// failure dump can render `max_vcpu_cpu_in_phase vs budget` against the
 /// effective (currency-widened) budget rather than the raw
-/// [`phase_cpu_budget_ns`]. Width-independent — no vCPU count.
-pub(crate) fn widened_cpu_budget_ns(phase: u8, cpu_currency: u8) -> u64 {
-    widen_budget_for_currency(phase_cpu_budget_ns(phase), cpu_currency)
+/// [`phase_cpu_budget_ns`]. `vcpus` affects Boot only.
+pub(crate) fn widened_cpu_budget_ns(phase: u8, cpu_currency: u8, vcpus: u32) -> u64 {
+    widen_budget_for_currency(phase_cpu_budget_ns(phase, vcpus), cpu_currency)
 }
 
 /// Width- and dilation-independent CPU backstop for Tier-3 deferral.
@@ -358,6 +361,7 @@ pub(crate) fn evaluate_progress(
     snap: &LedgerSnapshot,
     now_wall_ns: u64,
     monitor_live: bool,
+    vcpus: u32,
 ) -> KillDecision {
     let wall_in_phase = now_wall_ns.saturating_sub(snap.wall_ns_at_progress);
     let class = match LifecycleStage::from_u8(snap.phase).class() {
@@ -373,6 +377,7 @@ pub(crate) fn evaluate_progress(
         snap.evidence_channels_live,
         monitor_live,
         snap.cpu_currency,
+        vcpus,
     )
 }
 
@@ -635,12 +640,13 @@ mod tests {
     // against the raw ids so this stays independent of that enum).
     const BOOT: u8 = 0;
     const BODY: u8 = 3;
+    const TEST_VCPUS: u32 = 1;
 
     const S: u64 = 1_000_000_000;
 
-    // Boot(0): flat cpu budget 15 s, wall backstop 45 s.
+    // Boot(0): 15 s base at one vCPU, wall backstop 45 s.
     fn boot_budget_ns() -> u64 {
-        phase_cpu_budget_ns(BOOT)
+        phase_cpu_budget_ns(BOOT, TEST_VCPUS)
     }
     fn boot_backstop_ns() -> u64 {
         phase_wall_backstop_ns(BOOT)
@@ -665,6 +671,7 @@ mod tests {
             channels,
             true, // monitor_live
             currency,
+            TEST_VCPUS,
         )
     }
 
@@ -707,6 +714,7 @@ mod tests {
             true,
             true,
             CPU_CURRENCY_PMU,
+            TEST_VCPUS,
         );
         assert_eq!(d, KillDecision::None);
     }
@@ -749,9 +757,38 @@ mod tests {
                 true,
                 true,
                 currency,
+                256,
             );
             assert_eq!(d, KillDecision::None, "currency={currency}");
         }
+    }
+
+    /// Regression for the 240-vCPU Cosmos verifier false kill: Boot was
+    /// alive (pthread CPU still accruing), but the BSP's legitimate
+    /// width-scaled AP initialization crossed the old flat 22.5 s
+    /// pthread ceiling by 53 ms. With 240 vCPUs, Boot's raw budget is
+    /// 26.95 s and pthread widens it to 40.425 s, so Tier-1 stays quiet.
+    /// Evidence channels were not yet live, which independently keeps
+    /// the 98 s wall interval out of Tier-2.
+    #[test]
+    fn cosmos_240cpu_live_boot_does_not_hit_old_flat_budget() {
+        let observed_bsp_cpu = 22_553_294_795;
+        let widened = widened_cpu_budget_ns(BOOT, CPU_CURRENCY_PTHREAD, 240);
+        assert_eq!(widened, 40_425_000_000);
+        assert_eq!(
+            watchdog_step(
+                BOOT,
+                PhaseClass::Infra,
+                observed_bsp_cpu,
+                98_375_818_338,
+                false,
+                false,
+                true,
+                CPU_CURRENCY_PTHREAD,
+                240,
+            ),
+            KillDecision::None,
+        );
     }
 
     #[test]
@@ -843,6 +880,7 @@ mod tests {
             true,
             true,
             CPU_CURRENCY_PMU,
+            TEST_VCPUS,
         );
         assert_eq!(d, KillDecision::None);
     }
@@ -882,6 +920,7 @@ mod tests {
             true,
             false, // monitor dead
             CPU_CURRENCY_PMU,
+            TEST_VCPUS,
         );
         assert_eq!(tier1_shape, KillDecision::None);
 
@@ -894,6 +933,7 @@ mod tests {
             true,
             false, // monitor dead
             CPU_CURRENCY_PMU,
+            TEST_VCPUS,
         );
         assert_eq!(tier2_shape, KillDecision::None);
     }
@@ -930,9 +970,12 @@ mod tests {
     fn widened_cpu_budget_matches_currency_widening() {
         // pthread widens the raw Boot budget 3/2; PMU leaves it raw.
         let raw = boot_budget_ns();
-        assert_eq!(widened_cpu_budget_ns(BOOT, CPU_CURRENCY_PMU), raw);
         assert_eq!(
-            widened_cpu_budget_ns(BOOT, CPU_CURRENCY_PTHREAD),
+            widened_cpu_budget_ns(BOOT, CPU_CURRENCY_PMU, TEST_VCPUS),
+            raw
+        );
+        assert_eq!(
+            widened_cpu_budget_ns(BOOT, CPU_CURRENCY_PTHREAD, TEST_VCPUS),
             raw + raw / 2
         );
     }
@@ -950,6 +993,7 @@ mod tests {
             true,
             true,
             CPU_CURRENCY_PMU,
+            TEST_VCPUS,
         );
         assert_eq!(d, KillDecision::None);
     }
@@ -1421,6 +1465,7 @@ mod tests {
             &snap(BOOT, 0, 0, false, true, CPU_CURRENCY_PMU),
             now,
             true, // monitor_live
+            TEST_VCPUS,
         );
         assert_eq!(d, KillDecision::Tier2IdleWedge);
     }
@@ -1430,7 +1475,12 @@ mod tests {
         // Same idle shape but channels dead (the storm's early-boot blind
         // window) → Tier-2 suppressed → None.
         let now = boot_backstop_ns() + S;
-        let d = evaluate_progress(&snap(BOOT, 0, 0, false, false, CPU_CURRENCY_PMU), now, true);
+        let d = evaluate_progress(
+            &snap(BOOT, 0, 0, false, false, CPU_CURRENCY_PMU),
+            now,
+            true,
+            TEST_VCPUS,
+        );
         assert_eq!(d, KillDecision::None);
     }
 
@@ -1444,6 +1494,7 @@ mod tests {
             &snap(BOOT, over, 0, false, false, CPU_CURRENCY_PTHREAD),
             0,
             true,
+            TEST_VCPUS,
         );
         assert_eq!(d, KillDecision::Tier1CpuBudget);
     }
@@ -1464,6 +1515,7 @@ mod tests {
             ),
             0,
             true,
+            TEST_VCPUS,
         );
         assert_eq!(d, KillDecision::Tier1CpuBudget);
     }
@@ -1475,6 +1527,7 @@ mod tests {
             &snap(BOOT, 0, 0, false, true, CPU_CURRENCY_PMU),
             now,
             false, // monitor dead
+            TEST_VCPUS,
         );
         assert_eq!(d, KillDecision::None);
     }
@@ -1486,6 +1539,7 @@ mod tests {
             &snap(BODY, u64::MAX - 1, 0, false, true, CPU_CURRENCY_PMU),
             now,
             true,
+            TEST_VCPUS,
         );
         assert_eq!(d, KillDecision::None);
     }

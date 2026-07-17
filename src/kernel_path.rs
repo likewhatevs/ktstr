@@ -56,7 +56,7 @@ pub const KERNEL_ID_GRAMMAR: &str = "exact version (`6.14`), inclusive range (`6
      `git+URL#sha=<40-hex>`), absolute or `~`-prefixed path, local kernel package \
      (`*.rpm`, `*.deb`, or `*.pkg.tar.zst`), distro kernel (`fedora`/`fedora-44`/`f44`, \
      `ubuntu`/`ubuntu-24.04`, `amazonlinux`/`amazonlinux-2023`/`al2023`, \
-     `steamos`/`steamos-3.8`), or cache key";
+     `steamos`/`steamos-3.8`, `gke`/`gke-129`), or cache key";
 
 /// Kernel identifier: filesystem path, version string, cache key,
 /// stable-release range, or git source.
@@ -71,7 +71,7 @@ pub const KERNEL_ID_GRAMMAR: &str = "exact version (`6.14`), inclusive range (`6
 ///   [`KernelId::Range`] (inclusive on both endpoints)
 /// - Matches `MAJOR.MINOR[.PATCH][-rcN]`: [`KernelId::Version`]
 /// - A distro name (`fedora` / `ubuntu` / `amazonlinux` /
-///   `steamos`, an explicit-release `NAME-REL`, or shorthand `f44` /
+///   `steamos` / `gke`, an explicit-release `NAME-REL`, or shorthand `f44` /
 ///   `al2023`): [`KernelId::Distro`]
 /// - Otherwise: [`KernelId::CacheKey`]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,7 +158,7 @@ pub enum KernelId {
     /// (`fedora`) leaves `release` `None` — the resolver picks the
     /// distro's default; an explicit release (`fedora-44`, `f44`,
     /// `ubuntu-24.04`, `amazonlinux-2023`, `al2023`,
-    /// `steamos-3.8`) pins one. The
+    /// `steamos-3.8`, `gke-129`) pins one. The
     /// release string's grammar is distro-specific and enforced by
     /// [`KernelId::validate`], not `parse`: a distro name with a
     /// malformed release parses to this variant and is rejected at
@@ -186,6 +186,11 @@ pub enum DistroKind {
     /// SteamOS (`steamos`, or a pinned channel `steamos-3.8`).
     /// x86_64 only — Valve publishes no other architecture.
     SteamOs,
+    /// Google Kubernetes Engine COS node image (`gke`, or a constrained
+    /// COS milestone such as `gke-129`). Bare `gke` tracks the newest
+    /// GKE-promoted image; the milestone form tracks the newest promoted
+    /// revision within that milestone. x86_64 only today.
+    Gke,
 }
 
 /// Which git ref namespace a [`KernelId::Git`]'s `git_ref` names,
@@ -470,6 +475,11 @@ impl KernelId {
                                 && all_digits(maj) && all_digits(min)),
                         "a `MAJOR.MINOR` channel version (e.g. `steamos-3.8`)",
                     ),
+                    // COS milestone, e.g. `129`.
+                    DistroKind::Gke => (
+                        (2..=3).contains(&rel.len()) && all_digits(rel),
+                        "a 2- or 3-digit COS milestone (e.g. `gke-129`)",
+                    ),
                 };
                 if ok {
                     Ok(())
@@ -538,6 +548,7 @@ impl DistroKind {
             DistroKind::Ubuntu => "ubuntu",
             DistroKind::AmazonLinux => "amazonlinux",
             DistroKind::SteamOs => "steamos",
+            DistroKind::Gke => "gke",
         }
     }
 }
@@ -565,6 +576,7 @@ fn parse_distro(s: &str) -> Option<KernelId> {
         ("ubuntu", DistroKind::Ubuntu),
         ("amazonlinux", DistroKind::AmazonLinux),
         ("steamos", DistroKind::SteamOs),
+        ("gke", DistroKind::Gke),
     ] {
         if s == name {
             return Some(KernelId::Distro {
@@ -2063,6 +2075,7 @@ mod tests {
             ("ubuntu", DistroKind::Ubuntu),
             ("amazonlinux", DistroKind::AmazonLinux),
             ("steamos", DistroKind::SteamOs),
+            ("gke", DistroKind::Gke),
         ] {
             assert_eq!(
                 KernelId::parse(spec),
@@ -2103,6 +2116,13 @@ mod tests {
             KernelId::Distro {
                 kind: DistroKind::SteamOs,
                 release: Some("3.8".to_string()),
+            },
+        );
+        assert_eq!(
+            KernelId::parse("gke-129"),
+            KernelId::Distro {
+                kind: DistroKind::Gke,
+                release: Some("129".to_string()),
             },
         );
     }
@@ -2223,6 +2243,8 @@ mod tests {
             "steamos",
             "steamos-3.7",
             "steamos-3.8",
+            "gke",
+            "gke-129",
         ] {
             assert!(
                 KernelId::parse(spec).validate().is_ok(),
@@ -2267,6 +2289,16 @@ mod tests {
                 "steamos reject for {spec:?} must cite the grammar: {err}",
             );
         }
+        // GKE: milestone only, 2-3 decimal digits.
+        for spec in ["gke-1", "gke-129.1", "gke-1234", "gke-latest"] {
+            let err = KernelId::parse(spec)
+                .validate()
+                .expect_err("gke spec must be rejected");
+            assert!(
+                err.contains("gke") && err.contains("milestone"),
+                "gke reject for {spec:?} must cite the grammar: {err}",
+            );
+        }
     }
 
     /// Distro Display renders the canonical long form; shorthand and
@@ -2295,6 +2327,8 @@ mod tests {
             "al2023",
             "steamos",
             "steamos-3.8",
+            "gke",
+            "gke-129",
         ] {
             let id = KernelId::parse(spec);
             assert_eq!(

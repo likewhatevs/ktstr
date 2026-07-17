@@ -244,13 +244,15 @@ pub const KERNEL_HELP_NO_RAW: &str = "Kernel identifier — one of: \
      (6) a prebuilt distro kernel — `fedora` / `fedora-44` / `f44`, \
      `ubuntu` / `ubuntu-24.04` (resolves to the latest LTS HWE kernel), \
      `amazonlinux` / `amazonlinux-2023` / `al2023`, \
-     `steamos` / `steamos-3.8` (a bare distro name picks \
-     the distro's current release); or \
+     `steamos` / `steamos-3.8`, or `gke` / `gke-129` \
+     (official GKE COS kernel; x86_64 only; bare `gke` picks the newest \
+     image in Google's current GKE release notes, while `gke-129` tracks \
+     the newest promoted revision within COS milestone 129); or \
      (7) a cache key (see `kernel list`). Raw \
      image files are rejected. Source directories auto-build (can be slow \
      on a fresh tree); versions auto-download from kernel.org on cache \
-     miss; distro kernels download the prebuilt kernel + debuginfo from the \
-     distro's official repos (cached like a built kernel). Ubuntu splits its \
+     miss; distro kernels download official kernel + debuginfo/source artifacts \
+     (cached like a built kernel). Ubuntu splits its \
      image and modules across two debs, so a modular Ubuntu image needs the \
      `ubuntu` distro form (which downloads both) rather than a single local \
      `.deb`. The flag is REPEATABLE on `test`, `coverage`, and `llvm-cov` \
@@ -279,11 +281,11 @@ pub const KERNEL_HELP_RAW_OK: &str = "Kernel identifier — one of: \
      (5) a prebuilt distro kernel — `fedora` / `fedora-44` / `f44`, \
      `ubuntu` / `ubuntu-24.04` (resolves to the latest LTS HWE kernel), \
      `amazonlinux` / `amazonlinux-2023` / `al2023`, \
-     `steamos` / `steamos-3.8`; or \
+     `steamos` / `steamos-3.8`, or `gke` / `gke-129`; or \
      (6) a cache key (see `kernel list`). Source directories auto-build \
      (can be slow on a fresh tree); versions auto-download from kernel.org \
-     on cache miss; distro kernels download the prebuilt kernel + debuginfo \
-     from the distro's official repos (cached like a built kernel). When \
+     on cache miss; distro kernels download official kernel + debuginfo/source \
+     artifacts (cached like a built kernel). When \
      absent, resolves via cache then filesystem, falling back to downloading \
      the latest stable kernel. Version ranges (`START..END`) and git sources \
      (`git+URL#tag=NAME`) are not supported here — pass a single kernel.";
@@ -313,7 +315,7 @@ pub const KERNEL_HELP_BUILD: &str = "Kernel to build (or, for a prebuilt \
      or (6) a prebuilt distro kernel — `fedora` / `fedora-44` / `f44`, \
      `ubuntu` / `ubuntu-24.04` (resolves to the latest LTS HWE kernel), \
      `amazonlinux` / `amazonlinux-2023` / `al2023`, \
-     `steamos` / `steamos-3.8`. Omitted, the latest \
+     `steamos` / `steamos-3.8`, or `gke` / `gke-129` (x86_64 only). Omitted, the latest \
      stable release is built. For a local package or distro spec, `build` \
      downloads/unpacks the prebuilt kernel into the cache rather than \
      compiling. A cache key (an already-built entry from `kernel list`) is \

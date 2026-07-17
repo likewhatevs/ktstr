@@ -16,6 +16,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use md5::{Digest as _, Md5};
 use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
 
@@ -528,15 +530,10 @@ const DOWNLOAD_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
 ///    BEFORE the inner `read()` so a stalled inner reader cannot
 ///    out-block the watchdog.
 ///
-/// 2. **Streaming SHA-256.** Updates a [`Sha256`] hasher with every
-///    byte that flows past, so the caller can verify the finalized
-///    digest against an expected value (parsed out of
-///    `sha256sums.asc`) without a second pass over the data. The
-///    hasher only sees bytes that were actually consumed by the
-///    decoder + tar extractor, which is the same set of bytes that
-///    landed on disk — so a partial download that errored midway
-///    produces a hash over only what we successfully streamed,
-///    preventing false-positive verifications on truncated input.
+/// 2. **Streaming checksums.** Updates SHA-256 and MD5 hashers with
+///    every byte that flows past, so kernel.org/distro SHA-256 and
+///    Google Cloud Storage MD5 metadata can both use this one
+///    watchdog/progress stream without a second pass over the data.
 ///
 /// Sits between [`reqwest::blocking::Response`] and the
 /// decompression layer (`XzDecoder` / `GzDecoder`); both
@@ -554,7 +551,10 @@ struct DownloadStream<R: Read> {
     /// by value); the call site recovers the wrapper from inside
     /// the decoder + tar archive chain via `into_inner` before
     /// finalizing.
-    hasher: Sha256,
+    sha256: Sha256,
+    /// Running MD5 hasher for GCS `md5Hash` verification. GCS exposes
+    /// this digest as standard base64 rather than hexadecimal.
+    md5: Md5,
     /// Total body bytes read so far. Surfaced in the watchdog
     /// error message so an operator triaging "no progress" can see
     /// how many bytes did arrive before the stall — distinguishing
@@ -600,7 +600,8 @@ impl<R: Read> DownloadStream<R> {
     fn with_progress(inner: R, progress: Option<indicatif::ProgressBar>) -> Self {
         Self {
             inner,
-            hasher: Sha256::new(),
+            sha256: Sha256::new(),
+            md5: Md5::new(),
             bytes_total: 0,
             last_progress: Instant::now(),
             no_progress_timeout: DOWNLOAD_NO_PROGRESS_TIMEOUT,
@@ -613,7 +614,16 @@ impl<R: Read> DownloadStream<R> {
     /// `sha256sums.asc`, so the caller can do a direct
     /// `eq_ignore_ascii_case` comparison without re-encoding.
     fn finalize(self) -> (String, u64) {
-        (hex::encode(self.hasher.finalize()), self.bytes_total)
+        (hex::encode(self.sha256.finalize()), self.bytes_total)
+    }
+
+    /// Consume the wrapper and return the GCS-style standard-base64
+    /// MD5 digest plus the byte total.
+    fn finalize_md5_base64(self) -> (String, u64) {
+        (
+            BASE64_STANDARD.encode(self.md5.finalize()),
+            self.bytes_total,
+        )
     }
 }
 
@@ -648,7 +658,8 @@ impl<R: Read> Read for DownloadStream<R> {
                 Ok(0)
             }
             Ok(n) => {
-                self.hasher.update(&buf[..n]);
+                self.sha256.update(&buf[..n]);
+                self.md5.update(&buf[..n]);
                 self.bytes_total += n as u64;
                 self.last_progress = Instant::now();
                 // Advance the bar in lockstep with `bytes_total` (same
@@ -1605,8 +1616,55 @@ pub fn download_verified_file(
     cli_label: &str,
     mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<()> {
+    download_verified_file_with_checksum(
+        url,
+        dest,
+        DownloadChecksum::Sha256(expected_sha256),
+        label,
+        cli_label,
+        mp,
+    )
+}
+
+/// Download a single file with the shared retry/watchdog/progress
+/// pipeline and verify its Google Cloud Storage `md5Hash` (standard
+/// base64). This is the GKE artifact counterpart to
+/// [`download_verified_file`]; the transport and progress behavior are
+/// deliberately identical.
+pub(crate) fn download_verified_md5_file(
+    url: &str,
+    dest: &Path,
+    expected_md5_base64: &str,
+    label: &str,
+    cli_label: &str,
+    mp: Option<&crate::cli::FetchProgress>,
+) -> Result<()> {
+    download_verified_file_with_checksum(
+        url,
+        dest,
+        DownloadChecksum::Md5Base64(expected_md5_base64),
+        label,
+        cli_label,
+        mp,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum DownloadChecksum<'a> {
+    Sha256(&'a str),
+    Md5Base64(&'a str),
+}
+
+fn download_verified_file_with_checksum(
+    url: &str,
+    dest: &Path,
+    checksum: DownloadChecksum<'_>,
+    label: &str,
+    cli_label: &str,
+    mp: Option<&crate::cli::FetchProgress>,
+) -> Result<()> {
     let client = shared_client();
-    tracing::info!(%url, "downloading distro kernel package (requires network)");
+    tracing::info!(%url, "downloading verified kernel artifact (requires network)");
     let response = get_with_transient_retry(
         client,
         url,
@@ -1630,12 +1688,32 @@ pub fn download_verified_file(
         std::fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
     std::io::copy(&mut stream, &mut file)
         .with_context(|| format!("stream {url} to {}", dest.display()))?;
-    let (actual_hex, _bytes) = stream.finalize();
     if let Some(bar) = &download_bar {
         bar.finish();
     }
-    verify_sha256(&actual_hex, expected_sha256, url)?;
+    match checksum {
+        DownloadChecksum::Sha256(expected) => {
+            let (actual, _bytes) = stream.finalize();
+            verify_sha256(&actual, expected, url)?;
+        }
+        DownloadChecksum::Md5Base64(expected) => {
+            let (actual, _bytes) = stream.finalize_md5_base64();
+            verify_md5_base64(&actual, expected, url)?;
+        }
+    }
     Ok(())
+}
+
+fn verify_md5_base64(actual: &str, expected: &str, url: &str) -> Result<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "md5 mismatch for {url}: expected {expected}, got {actual}. \
+             The object generation may have changed; retry so ktstr can \
+             resolve fresh Google Cloud Storage metadata."
+        );
+    }
 }
 
 /// Parse the patch level from a kernel version string.

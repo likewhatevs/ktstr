@@ -229,13 +229,16 @@ into Attach: the phase anchor was incoherent and the budget was denominated
 in **summed** CPU, so a wide guest's diffuse idle-vCPU background burn
 (ticks + IPIs across 256 vCPUs) crossed a per-vCPU-linear budget with no
 wedge anywhere. The fix moves Tier-1 to a monitor-owned **max single-vCPU
-in-phase** burn against a **flat, width-independent** budget; the summed CPU
-still feeds Tier-2 trickle-stall and the Tier-3 deadman. This section is the
-captured evidence that the reworked wide paths (a) still emit performance
-measurements out of a wide cell, (b) still catch a real wide spinning wedge
-fast, and (c) leave a legitimately-idle wide cell alive — plus the honest
-limit of the summed-trickle detectors at width. (That §2 idle-wedge limit
-was subsequently REMOVED by the Tier-2 CPU-term drop — see the addendum §4.)
+in-phase** burn against a phase budget; Attach, Dispatch, and Teardown stay
+flat and width-independent. Boot later gained a narrow width term because
+the BSP serially initializes every AP, so its legitimate max-vCPU work is
+O(vCPU-count). The summed CPU still feeds Tier-2 trickle-stall and the
+Tier-3 deadman. This section is the captured evidence that the reworked
+wide paths (a) still emit performance measurements out of a wide cell, (b)
+still catch a real wide spinning wedge fast, and (c) leave a
+legitimately-idle wide cell alive — plus the honest limit of the
+summed-trickle detectors at width. (That §2 idle-wedge limit was
+subsequently REMOVED by the Tier-2 CPU-term drop — see the addendum §4.)
 
 ### Why a wide shape needs near-1:1 — the CI-only regime
 
@@ -291,9 +294,9 @@ Branch-only observational: host dilation avg **1.1323** [1.1198–1.1518] over
 the 6 branch runs — near-1:1, undiluted, confirming the CI regime is
 reproduced (not a diluted-oversubscribed shape). **No watchdog tier fired on
 any of the 6 branch runs** — every run exit 0, no `cause=` line in any run's
-stderr: the reworked width-independent Tier-1 does not false-kill a near-1:1
-wide perf cell, and the wide cell still yields the full schbench metric set on
-both sides.
+stderr: the reworked max-per-vCPU Tier-1 does not false-kill a near-1:1 wide
+perf cell, and the wide cell still yields the full schbench metric set on both
+sides.
 
 - **[W1] wakeup p99 — the one systematic out-of-envelope cell, flagged for
   review.** Branch avg 14266.7 sits above the baseline envelope (the edges
