@@ -110,7 +110,7 @@ fn outcome_at_deadline<T>(
 /// Convert a positive duration to poll's millisecond timeout without
 /// truncating a sub-millisecond remainder to an immediate return.
 fn poll_timeout_ceil(duration: Duration) -> PollTimeout {
-    let has_submillisecond_remainder = duration.subsec_nanos() % 1_000_000 != 0;
+    let has_submillisecond_remainder = !duration.subsec_nanos().is_multiple_of(1_000_000);
     let millis = duration
         .as_millis()
         .saturating_add(u128::from(has_submillisecond_remainder))
