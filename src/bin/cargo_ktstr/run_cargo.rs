@@ -1901,6 +1901,89 @@ mod tests {
     }
 
     #[test]
+    fn llvm_cov_nextest_honors_target_specific_test_only_dependency_and_attached_selector() {
+        let mut metadata = llvm_cov_feature_metadata();
+        let renamed = metadata
+            .packages
+            .iter_mut()
+            .find(|package| package.name.as_str() == "renamed-scheduler")
+            .expect("renamed fixture package");
+        let dependency = renamed
+            .dependencies
+            .iter_mut()
+            .find(|dependency| dependency.name == "ktstr")
+            .expect("renamed fixture ktstr dependency");
+        dependency.kind = cargo_metadata::DependencyKind::Development;
+        dependency.target = Some(
+            r#"cfg(target_os = "linux")"#
+                .parse()
+                .expect("valid Linux target predicate"),
+        );
+
+        let args = strs(&[
+            "nextest",
+            "--package=renamed-scheduler",
+            "--no-default-features",
+            "--target=x86_64-unknown-linux-gnu",
+            "--test=scheduler-registry",
+        ]);
+        let linux = crate::feature_discovery::TargetContext::named(
+            "x86_64-unknown-linux-gnu",
+            vec![
+                cargo_platform::Cfg::Name("unix".to_string()),
+                cargo_platform::Cfg::KeyPair("target_os".to_string(), "linux".to_string()),
+            ],
+        );
+        let selected = prepare_llvm_cov_args_with(args.clone(), |args| {
+            Ok(
+                crate::feature_discovery::augment_test_features_from_metadata_for_context(
+                    args,
+                    &metadata,
+                    Some(&linux),
+                ),
+            )
+        })
+        .expect("Linux nextest preparation succeeds");
+        assert_eq!(
+            selected,
+            [
+                "nextest",
+                "--package=renamed-scheduler",
+                "--no-default-features",
+                "--target=x86_64-unknown-linux-gnu",
+                "--test=scheduler-registry",
+                "--features",
+                "renamed-scheduler/verify-schedulers",
+            ]
+            .map(ToString::to_string),
+            "raw llvm-cov nextest must infer a renamed optional dev-dependency only on its \
+             matching target while preserving attached target selection",
+        );
+
+        let windows = crate::feature_discovery::TargetContext::named(
+            "x86_64-pc-windows-msvc",
+            vec![
+                cargo_platform::Cfg::Name("windows".to_string()),
+                cargo_platform::Cfg::KeyPair("target_os".to_string(), "windows".to_string()),
+            ],
+        );
+        let unselected = prepare_llvm_cov_args_with(args.clone(), |args| {
+            Ok(
+                crate::feature_discovery::augment_test_features_from_metadata_for_context(
+                    args,
+                    &metadata,
+                    Some(&windows),
+                ),
+            )
+        })
+        .expect("Windows nextest preparation succeeds");
+        assert_eq!(
+            unselected, args,
+            "the same test-only dependency must not activate for an opposite target cfg",
+        );
+    }
+
+    #[test]
     fn llvm_cov_non_test_modes_never_run_feature_preparation() {
         for args in [
             strs(&[]),
