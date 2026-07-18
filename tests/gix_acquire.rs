@@ -8,7 +8,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Barrier, Mutex};
 use std::time::{Duration, Instant};
 
 use ahash as gix_acquire_ahash;
@@ -71,6 +71,26 @@ fn write_sentinel_script(script: &Path, marker: &Path, stdout: Option<&str>) {
         .permissions();
     permissions.set_mode(0o700);
     std::fs::set_permissions(script, permissions).expect("make credential sentinel executable");
+}
+
+fn accept_until_cancelled(
+    listener: &TcpListener,
+    cancelled: &std::sync::mpsc::Receiver<()>,
+) -> std::io::Result<Option<std::net::TcpStream>> {
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return Ok(Some(stream)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                match cancelled.try_recv() {
+                    Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => return Ok(None),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn commit_entries(
@@ -701,28 +721,13 @@ fn public_http_authentication_cannot_execute_configured_credentials_programs() {
         .expect("authentication fixture address");
     listener
         .set_nonblocking(true)
-        .expect("make authentication fixture accept bounded");
-    let server_done = Arc::new(AtomicBool::new(false));
-    let server_done_worker = Arc::clone(&server_done);
+        .expect("make authentication fixture cancellable");
+    let (server_lifetime, server_cancelled) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
         let mut requests = Vec::new();
-        while !server_done_worker.load(Ordering::Acquire) || requests.is_empty() {
-            assert!(
-                Instant::now() < deadline,
-                "authentication fixture did not finish"
-            );
-            let (mut stream, _) = match listener.accept() {
-                Ok(connection) => connection,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                Err(error) => panic!("accept authentication request: {error}"),
-            };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .expect("bound authentication fixture read");
+        while let Some(mut stream) = accept_until_cancelled(&listener, &server_cancelled)
+            .expect("accept authentication request")
+        {
             let mut request = Vec::new();
             let mut byte = [0u8; 1];
             while !request.ends_with(b"\r\n\r\n") {
@@ -735,6 +740,7 @@ fn public_http_authentication_cannot_execute_configured_credentials_programs() {
                     "unbounded authentication request"
                 );
             }
+            requests.push(request);
             stream
                 .write_all(
                     b"HTTP/1.1 401 Unauthorized\r\n\
@@ -743,7 +749,6 @@ fn public_http_authentication_cannot_execute_configured_credentials_programs() {
                       Connection: close\r\n\r\n",
                 )
                 .expect("write authentication challenge");
-            requests.push(request);
         }
         requests
     });
@@ -823,13 +828,12 @@ fn public_http_authentication_cannot_execute_configured_credentials_programs() {
         gix::progress::Discard,
         gix::remote::ref_map::Options::default(),
     );
-    server_done.store(true, Ordering::Release);
-    let requests = server.join().expect("join authentication fixture");
-
+    drop(server_lifetime);
     assert!(
         result.is_err(),
         "a public source requiring credentials must be rejected"
     );
+    let requests = server.join().expect("join authentication fixture");
     assert_eq!(
         requests.len(),
         1,
@@ -857,24 +861,14 @@ fn stalled_smart_http_response_is_aborted_by_the_real_gix_transport() {
     let address = listener.local_addr().expect("fixture address");
     listener
         .set_nonblocking(true)
-        .expect("make fixture accept bounded");
+        .expect("make fixture cancellable");
+    let (server_lifetime, server_cancelled) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let (mut stream, _) = loop {
-            match listener.accept() {
-                Ok(connection) => break connection,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("accept gix request: {error}"),
-            }
+        let Some(mut stream) =
+            accept_until_cancelled(&listener, &server_cancelled).expect("accept gix request")
+        else {
+            return None;
         };
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("set fixture read timeout");
         let mut request = Vec::new();
         let mut byte = [0u8; 1];
         while !request.ends_with(b"\r\n\r\n") {
@@ -882,11 +876,6 @@ fn stalled_smart_http_response_is_aborted_by_the_real_gix_transport() {
             request.push(byte[0]);
             assert!(request.len() < 64 * 1024, "unbounded fixture request");
         }
-        assert!(
-            request.starts_with(b"GET /repository.git/info/refs?service=git-upload-pack "),
-            "unexpected smart-HTTP request: {}",
-            String::from_utf8_lossy(&request)
-        );
         stream
             .write_all(
                 b"HTTP/1.1 200 OK\r\n\
@@ -895,16 +884,17 @@ fn stalled_smart_http_response_is_aborted_by_the_real_gix_transport() {
                   Connection: close\r\n\r\n",
             )
             .expect("write stalled response headers");
+        let headers_published = Instant::now();
         // Send no advertised-ref body. The production curl backend's
         // low-speed policy must close this connection rather than wait
         // indefinitely.
         let mut drain = [0u8; 1];
         let _ = stream.read(&mut drain);
+        Some((request, headers_published))
     });
 
     let temp = tempfile::tempdir().expect("tempdir");
     let reporter = gix_acquire::ProgressReporter::new("stalled transport fixture");
-    let started = Instant::now();
     let result = gix_acquire::clone_one_with_transport_limits_for_test(
         &format!("http://{address}/repository.git"),
         "refs/heads/main",
@@ -914,10 +904,27 @@ fn stalled_smart_http_response_is_aborted_by_the_real_gix_transport() {
         1024,
         1,
     );
-    let elapsed = started.elapsed();
+    let completed_at = Instant::now();
+    drop(server_lifetime);
     drop(reporter);
-    server.join().expect("join stalled HTTP fixture");
-    assert!(result.is_err(), "stalled smart HTTP unexpectedly succeeded");
+    assert!(
+        result.is_err(),
+        "stalled smart HTTP unexpectedly succeeded: {result:?}"
+    );
+    let (request, headers_published) = server
+        .join()
+        .expect("join stalled HTTP fixture")
+        .expect("gix transport failed without sending a request");
+    assert!(
+        request.starts_with(b"GET /repository.git/info/refs?service=git-upload-pack "),
+        "unexpected smart-HTTP request: {}",
+        String::from_utf8_lossy(&request)
+    );
+    assert!(
+        headers_published <= completed_at,
+        "gix transport failed before the stalled response headers were published: {result:?}"
+    );
+    let elapsed = completed_at.saturating_duration_since(headers_published);
     assert!(
         elapsed < Duration::from_secs(5),
         "in-process gix transport ignored its low-speed bound for {elapsed:?}: {result:?}"
