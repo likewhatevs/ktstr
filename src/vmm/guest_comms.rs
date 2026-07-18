@@ -1262,14 +1262,11 @@ pub fn send_stderr_chunk(buf: &[u8]) -> bool {
 /// module) keeps slicing the log without changes. Replaces the
 /// prior COM2 dump path in `dump_sched_output`.
 ///
-/// Required: caller chunks at sub-cap boundaries; same constraint
-/// as [`send_stdout_chunk`].
-pub fn send_sched_log(buf: &[u8]) {
-    let _ = try_send_sched_log(buf);
-}
-
 /// Fallible scheduler-log frame send used by the idempotent dump transaction.
 /// A `true` result means the complete TLV frame reached the kernel port write.
+///
+/// Required: caller chunks at sub-cap boundaries; same constraint as
+/// [`send_stdout_chunk`].
 pub(crate) fn try_send_sched_log(buf: &[u8]) -> bool {
     write_msg(MsgType::SchedLog.wire_value(), buf)
 }
@@ -1282,7 +1279,7 @@ pub(crate) fn try_send_sched_log(buf: &[u8]) -> bool {
 /// this sender as it arrives, so the stdout stream survives a watchdog
 /// timeout that never reaches the teardown `dump_sched_output`. Same
 /// chunked semantics and not-yet-open-port fallback as
-/// [`send_stdout_chunk`]; unlike [`send_sched_log`] the payload carries
+/// [`send_stdout_chunk`]; unlike [`try_send_sched_log`] the payload carries
 /// NO `SCHED_OUTPUT_START/END` framing — it is the raw child stream.
 pub fn send_sched_stdout_chunk(buf: &[u8]) -> bool {
     write_msg(MsgType::SchedStdout.wire_value(), buf)
@@ -2182,12 +2179,12 @@ mod tests {
         assert!(!send_stderr_chunk(b"oops"));
     }
 
-    /// `send_sched_log` from host context suppresses the write.
+    /// `try_send_sched_log` from host context returns false without writing.
     #[test]
-    fn send_sched_log_from_host_context_is_noop() {
+    fn try_send_sched_log_from_host_context_returns_false() {
         let _g = IsGuestOverrideGuard::new(false);
-        assert_no_bulk_write("send_sched_log", || {
-            send_sched_log(b"---SCHED_OUTPUT_START---\n")
+        assert_no_bulk_write("try_send_sched_log", || {
+            assert!(!try_send_sched_log(b"---SCHED_OUTPUT_START---\n"));
         });
     }
 

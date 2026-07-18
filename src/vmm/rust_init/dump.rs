@@ -7,7 +7,7 @@ use std::io::{Seek, SeekFrom};
 use std::sync::atomic::AtomicUsize;
 
 /// Maximum scheduler-log chunk emitted in a single
-/// [`crate::vmm::guest_comms::send_sched_log`] frame. Sub-cap of
+/// [`crate::vmm::guest_comms::try_send_sched_log`] frame. Sub-cap of
 /// [`crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD`] so a chunk fits
 /// comfortably inside one TLV frame; chunks above this size are
 /// split before emission.
@@ -1290,7 +1290,8 @@ fn drain_probe_for_shutdown(
 
 /// Terminal scheduler state observed through its exact pidfd.
 ///
-/// This is also the typed error returned by [`SchedExitStop::commit`].
+/// This is also carried by [`SchedExitCommitError::Terminal`] when
+/// [`SchedExitStop::commit_with`] rejects a provisional owner.
 /// A scheduler which has already exited cannot be published as the current
 /// owner, and a pidfd whose readiness can no longer be observed is equally
 /// unsafe to publish.
@@ -1489,6 +1490,7 @@ impl SchedExitPublicationGate {
         Ok(value)
     }
 
+    #[cfg(test)]
     fn commit(&self, pidfd: &OwnedFd) -> Result<(), SchedExitTerminal> {
         match self.commit_with(pidfd, || Ok::<(), std::convert::Infallible>(())) {
             Ok(()) => Ok(()),
@@ -1538,10 +1540,10 @@ fn sched_exit_terminal_now(pidfd: &OwnedFd) -> Option<SchedExitTerminal> {
 
 /// Pending/committed stop handle for the sched-exit monitor. Carries the
 /// `Arc<AtomicBool>` source-of-truth flag, an exact pidfd clone used by
-/// [`Self::commit`], a writable eventfd handle the cleanup site uses to wake
-/// the monitor thread out of `poll(2)` without waiting for the legacy 250 ms
-/// cadence, and the monitor thread's `JoinHandle` so the cleanup site can wait
-/// for the thread to actually exit before proceeding.
+/// [`Self::commit_with`], a writable eventfd handle the cleanup site uses to
+/// wake the monitor thread out of `poll(2)` without waiting for the legacy
+/// 250 ms cadence, and the monitor thread's `JoinHandle` so the cleanup site
+/// can wait for the thread to actually exit before proceeding.
 ///
 /// Cleanup contract: before any action that could be misinterpreted
 /// by the monitor as an unexpected scheduler exit (e.g. `child.kill()`
@@ -1591,6 +1593,7 @@ impl SchedExitStop {
     /// `Pending -> Committed` transition share the publication mutex, so there
     /// is no interval in which a dead process can be committed merely because
     /// its monitor thread has not yet run.
+    #[cfg(test)]
     pub(crate) fn commit(&self) -> Result<(), SchedExitTerminal> {
         self.publication.commit(&self.commit_pidfd)
     }
@@ -2053,9 +2056,9 @@ where
 /// This is the scheduler-owner handoff primitive. The caller installs its
 /// `Child`, retained original pidfd, log path, scheduler identity, and this
 /// handle into the single current-process owner, then calls
-/// [`SchedExitStop::commit`]. Until commit succeeds, scheduler exit or pidfd
-/// observer failure is retained as a typed terminal value and emits neither a
-/// log drain nor a `SchedExit` frame.
+/// [`SchedExitStop::commit_with`]. Until commit succeeds, scheduler exit or
+/// pidfd observer failure is retained as a typed terminal value and emits
+/// neither a log drain nor a `SchedExit` frame.
 pub(crate) fn start_pending_sched_exit_monitor(
     pid: u32,
     pidfd: OwnedFd,
@@ -2082,6 +2085,7 @@ pub(crate) fn start_pending_sched_exit_monitor(
 /// and commit only after the process owner is installed. Even on this
 /// immediate path, an already-terminal exact pidfd is rejected rather than
 /// emitting a result for a scheduler the caller never successfully published.
+#[cfg(test)]
 pub(crate) fn start_sched_exit_monitor(
     pid: u32,
     pidfd: OwnedFd,

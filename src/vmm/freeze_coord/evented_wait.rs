@@ -1,6 +1,6 @@
 //! Evented wait primitives shared by the scheduler-lifecycle paths.
 //!
-//! Both [`kernfs_evented_wait`] and [`pidfd_wait_exit`] follow the
+//! Both [`kernfs_evented_wait`] and the test-only `pidfd_wait_exit` follow the
 //! same shape: subscribe to one or more kernel-evented sources,
 //! poll(2) for any of them with a deadline-bounded timeout, and
 //! inspect the returned revents before deciding the outcome.
@@ -76,6 +76,7 @@ fn validate_inotify_revents(revents: PollFlags) {
     }
 }
 
+#[cfg(test)]
 fn pidfd_revents_mean_exit(pid: u32, revents: PollFlags) -> bool {
     let rejected = revents & (PollFlags::POLLERR | PollFlags::POLLNVAL);
     if !rejected.is_empty() {
@@ -316,6 +317,7 @@ where
 /// polling cannot recover from. Same for nix's poll(2) failures
 /// beyond EINTR; EINTR is treated as a normal wake and retries
 /// after the source-of-truth predicate is sampled.
+#[cfg(test)]
 pub(crate) fn pidfd_wait_exit(
     pid: u32,
     deadline: Instant,

@@ -1319,6 +1319,7 @@ fn download_stable_tarball_from_url(
 /// expected inner directory is missing, or when the rename fails.
 /// The caller's `TempDir` outlives this helper, so its Drop sweeps
 /// any residual staging contents whether this returns Ok or Err.
+#[cfg(test)]
 fn promote_staged_kernel_tree(
     staging: &tempfile::TempDir,
     dest_dir: &Path,
@@ -1370,6 +1371,7 @@ fn promote_staged_kernel_tree_transaction(
 /// check rejects rather than following) — is rejected before anything
 /// lands in `dest_dir`; the `TempDir`'s `Drop` sweeps every entry the
 /// archive left.
+#[cfg(test)]
 fn promote_single_kernel_tree(
     staging: &tempfile::TempDir,
     dest_dir: &Path,
@@ -2696,6 +2698,7 @@ pub fn git_clone(
 /// [`git_clone_kinded`]) uses this path for every remote, including
 /// GitHub. The pruned/EOL tarball recovery is a separately reported
 /// archive fallback in [`download_tarball`].
+#[cfg(test)]
 pub(crate) fn git_clone_tag(
     url: &str,
     tag: &str,
@@ -2727,6 +2730,7 @@ pub(crate) fn git_clone_tag(
 ///   tag/branch.
 /// - `Unknown` → a hard error; [`crate::kernel_path::KernelId::validate`]
 ///   rejects it upstream, so this is a defensive backstop.
+#[cfg(test)]
 pub(crate) fn git_clone_kinded(
     url: &str,
     git_ref: &str,
@@ -3024,6 +3028,7 @@ enum ExactRefFetch<T> {
     Skipped { commit_id: gix::ObjectId, token: T },
 }
 
+#[cfg(test)]
 fn fetch_exact_ref_and_checkout(
     url: &str,
     git_ref: &str,
@@ -3278,7 +3283,7 @@ fn materialize_local_exact_ref_gated<T>(
     let _copy_progress =
         clone_progress.map(|progress| progress.item_named("copying local exact ref"));
     ensure_git_operation_not_interrupted(interrupt, "before preparing local clone")?;
-    let repo = gix::ThreadSafeRepository::init_opts(
+    let mut repo = gix::ThreadSafeRepository::init_opts(
         clone_dir,
         gix::create::Kind::WithWorktree,
         gix::create::Options::default(),
@@ -3423,6 +3428,7 @@ fn copy_local_tree_objects(
 
 fn write_local_object(destination: &gix::Repository, object: &gix::Object<'_>) -> Result<()> {
     let written = gix::objs::Write::write_buf(destination, object.kind, &object.data)
+        .map_err(anyhow::Error::from_boxed)
         .with_context(|| format!("write local source object {}", object.id))?;
     if written != object.id {
         anyhow::bail!(

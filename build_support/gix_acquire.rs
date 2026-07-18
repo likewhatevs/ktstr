@@ -572,7 +572,7 @@ fn fetch_source_node_once(
 
     let refspec = format!("+{}:{FETCHED_REF}", source.selector);
     let mut remote = repo
-        .remote_at_without_url_rewrite(&source.canonical_url)
+        .remote_at_without_url_rewrite(source.canonical_url.as_str())
         .map_err(|err| format!("prepare exact remote {}: {err}", source.canonical_url))?
         .with_fetch_tags(gix::remote::fetch::Tags::None);
     remote

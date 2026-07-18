@@ -4230,15 +4230,17 @@ fn exact_clone_never_replaces_preexisting_destination() {
     let existing = dest.path().join("linux");
     std::fs::create_dir(&existing).unwrap();
     std::fs::write(existing.join("owned-by-caller"), b"keep").unwrap();
-    let err = git_clone_kinded(
+    let err = match git_clone_kinded(
         &fixture.url(),
         "same",
         crate::kernel_path::GitRefKind::Branch,
         dest.path(),
         "test",
         None,
-    )
-    .expect_err("RENAME_NOREPLACE must reject an existing destination");
+    ) {
+        Ok(_) => panic!("RENAME_NOREPLACE must reject an existing destination"),
+        Err(err) => err,
+    };
     assert!(format!("{err:#}").contains("RENAME_NOREPLACE"));
     assert_eq!(
         std::fs::read(existing.join("owned-by-caller")).unwrap(),
@@ -4264,7 +4266,10 @@ fn exact_clone_rolls_back_transaction_owned_post_promote_cancellation() {
     );
     TEST_INTERRUPT_AFTER_CLONE_PROMOTE.store(false, Ordering::Release);
     set_git_operation_interrupted(false);
-    let err = result.expect_err("post-promote cancellation must reject publication");
+    let err = match result {
+        Ok(_) => panic!("post-promote cancellation must reject publication"),
+        Err(err) => err,
+    };
     assert!(format!("{err:#}").contains("after promoting exact clone"));
     assert!(
         !dest.path().join("linux").exists(),
@@ -4311,7 +4316,10 @@ fn exact_local_clone_cancels_during_object_materialization() {
     );
     TEST_INTERRUPT_DURING_LOCAL_COPY.store(false, Ordering::Release);
     set_git_operation_interrupted(false);
-    let err = result.expect_err("local object materialization must observe cancellation");
+    let err = match result {
+        Ok(_) => panic!("local object materialization must observe cancellation"),
+        Err(err) => err,
+    };
     assert!(
         format!("{err:#}").contains("while copying local checkout tree"),
         "unexpected cancellation boundary: {err:#}"
@@ -4396,15 +4404,17 @@ fn helper_capable_runtime_transports_are_rejected_before_connect() {
     .enumerate()
     {
         let dest = tempfile::TempDir::new().expect("clone dest");
-        let err = git_clone_kinded(
+        let err = match git_clone_kinded(
             url,
             "main",
             crate::kernel_path::GitRefKind::Branch,
             dest.path(),
             "test",
             None,
-        )
-        .expect_err("helper-capable transport must be rejected");
+        ) {
+            Ok(_) => panic!("helper-capable transport must be rejected"),
+            Err(err) => err,
+        };
         assert!(
             format!("{err:#}").contains("can start an external helper"),
             "unexpected rejection for {url}: {err:#}"
@@ -4490,7 +4500,10 @@ fn exact_clone_rejects_cancellation_during_final_index_write_and_rolls_back() {
     TEST_INTERRUPT_AFTER_INDEX_WRITE.store(false, Ordering::Release);
     set_git_operation_interrupted(false);
 
-    let err = result.expect_err("a signal landing in final index write must reject the clone");
+    let err = match result {
+        Ok(_) => panic!("a signal landing in final index write must reject the clone"),
+        Err(err) => err,
+    };
     assert!(
         format!("{err:#}").contains("after writing exact clone index"),
         "the final post-publication check must surface in the diagnostic: {err:#}",
@@ -4663,10 +4676,7 @@ fn anon_open_opts_disables_ambient_config_sources() {
         Some(false)
     );
     let transport = repo
-        .transport_options(
-            "https://fixture.invalid/repository.git".as_bytes().into(),
-            None,
-        )
+        .transport_options("https://fixture.invalid/repository.git".as_bytes(), None)
         .expect("resolve runtime HTTP transport policy")
         .expect("HTTPS transport options");
     let transport = transport

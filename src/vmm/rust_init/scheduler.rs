@@ -1761,10 +1761,6 @@ fn sched_child_stdio_inner(
 /// The child receives the pipe WRITE ends; after `Command::spawn` the
 /// parent's copies are closed by the spawn machinery, so the child is
 /// the sole holder and the forwarders' `read`s see EOF on child exit.
-fn try_stream_sched_stdio(log_file: Option<&fs::File>, log_path: &str) -> Option<(Stdio, Stdio)> {
-    try_stream_sched_stdio_inner(log_file, log_path, None)
-}
-
 fn try_stream_sched_stdio_inner(
     log_file: Option<&fs::File>,
     log_path: &str,

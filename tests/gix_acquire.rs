@@ -445,7 +445,7 @@ fn bounded_source_workers_obey_budget_and_cancel_the_remaining_queue() {
         (0..6usize).collect(),
         2,
         &cancelled,
-        |value, cancelled| {
+        |value, cancelled| -> Result<usize, String> {
             started.lock().unwrap().push(value);
             failing_batch.wait();
             if value == 0 {
@@ -622,10 +622,7 @@ fn hermetic_open_options_disable_terminal_credentials_prompting() {
     assert!(!permissions.attributes.git);
     assert!(!permissions.attributes.git_binary);
     let transport = repo
-        .transport_options(
-            "https://fixture.invalid/repository.git".as_bytes().into(),
-            None,
-        )
+        .transport_options("https://fixture.invalid/repository.git".as_bytes(), None)
         .expect("resolve hermetic transport options")
         .expect("HTTPS transport options");
     let transport = transport
