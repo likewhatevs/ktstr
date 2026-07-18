@@ -802,7 +802,8 @@ fn hash_pinned_file(file: &File, identity: StableFileIdentity) -> Result<u64> {
     // this streaming read, so a fixed-size pread buffer is cheap and safe.
     let mut hasher = fixed_hasher();
     let mut offset = 0u64;
-    let mut buffer = vec![0u8; padded_payload_len.min(1 << 20)];
+    let buffer_len = usize::try_from(identity.size.min(1 << 20))?;
+    let mut buffer = vec![0u8; buffer_len];
     while offset < identity.size {
         let remaining = usize::try_from((identity.size - offset).min(buffer.len() as u64))?;
         let read = file
