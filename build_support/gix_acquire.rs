@@ -563,9 +563,6 @@ fn fetch_source_node_once(
     )
     .map_err(|err| format!("initialize exact bare source node: {err}"))?
     .to_thread_local();
-    let _ = repo
-        .committer_or_set_generic_fallback()
-        .map_err(|err| format!("configure source-node fallback identity: {err}"))?;
     repo.config_snapshot_mut()
         .set_value(&gix::config::tree::Pack::THREADS, "1")
         .map_err(|err| format!("limit source-node pack workers: {err}"))?;
@@ -584,9 +581,11 @@ fn fetch_source_node_once(
         "negotiating {}@{}",
         source.canonical_url, source.selector
     ));
-    let prepare = remote
+    let mut connection = remote
         .connect(gix::remote::Direction::Fetch)
-        .map_err(|err| format!("connect exact remote {}: {err}", source.canonical_url))?
+        .map_err(|err| format!("connect exact remote {}: {err}", source.canonical_url))?;
+    connection.set_credentials(gix_policy::reject_credentials);
+    let prepare = connection
         .prepare_fetch(negotiate, gix::remote::ref_map::Options::default())
         .map_err(|err| format!("map exact selector {}: {err}", source.selector))?
         .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
@@ -1274,9 +1273,6 @@ fn clone_one_with_options(
     )
     .map_err(|err| format!("initialize exact checkout: {err}"))?
     .to_thread_local();
-    let _ = repo
-        .committer_or_set_generic_fallback()
-        .map_err(|err| format!("configure exact-checkout fallback identity: {err}"))?;
 
     // Callers that still use this non-CAS compatibility seam get the same
     // bounded worker shape as source nodes. Recursive production acquisition
@@ -1306,9 +1302,11 @@ fn clone_one_with_options(
         .map_err(|err| format!("configure exact refspec {source}: {err}"))?;
 
     let negotiate = progress.item("negotiating exact shallow fetch");
-    let prepare = remote
+    let mut connection = remote
         .connect(gix::remote::Direction::Fetch)
-        .map_err(|err| format!("connect exact remote {url}: {err}"))?
+        .map_err(|err| format!("connect exact remote {url}: {err}"))?;
+    connection.set_credentials(gix_policy::reject_credentials);
+    let prepare = connection
         .prepare_fetch(negotiate, gix::remote::ref_map::Options::default())
         .map_err(|err| format!("map exact revision {revision}: {err}"))?
         .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
@@ -1425,6 +1423,13 @@ pub(crate) fn materialize_commit_for_test(
 
 pub(crate) fn open_options() -> gix::open::Options {
     gix_policy::open_options()
+}
+
+#[cfg(test)]
+pub(crate) fn reject_credentials_for_test(
+    action: gix::credentials::helper::Action,
+) -> gix::credentials::protocol::Result {
+    gix_policy::reject_credentials(action)
 }
 
 #[cfg(test)]

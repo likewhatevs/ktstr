@@ -4663,6 +4663,17 @@ fn anon_open_opts_disables_ambient_config_sources() {
     assert!(!cfg.env, "GIT_CONFIG_* env config must not load");
     assert!(!cfg.git_binary, "git-binary config must not load");
     assert!(!cfg.includes, "config include files must not load");
+    let environment = repo.open_options().permissions.env;
+    assert_eq!(
+        environment.git_prefix,
+        gix::sec::Permission::Deny,
+        "GIT_* credential and askpass environment must not load"
+    );
+    assert_eq!(
+        environment.ssh_prefix,
+        gix::sec::Permission::Deny,
+        "SSH_ASKPASS must not load"
+    );
     let attributes = repo.open_options().permissions.attributes;
     assert!(!attributes.system, "system attributes must not load");
     assert!(!attributes.git, "user attributes must not load");
@@ -4674,6 +4685,21 @@ fn anon_open_opts_disables_ambient_config_sources() {
         repo.config_snapshot()
             .boolean("gitoxide.credentials.terminalPrompt"),
         Some(false)
+    );
+    let credential_url =
+        gix::Url::from_bytes(b"https://fixture.invalid/repository.git".as_slice().into())
+            .expect("credential fixture URL");
+    let (cascade, _, prompt) = repo
+        .config_snapshot()
+        .credential_helpers(credential_url)
+        .expect("resolve runtime credential policy");
+    assert!(cascade.programs.is_empty());
+    assert_eq!(prompt.mode, gix::prompt::Mode::Disable);
+    assert!(prompt.askpass.is_none());
+    assert_eq!(
+        repo.refs.write_reflog,
+        gix::refs::store::WriteReflog::Disable,
+        "runtime exact acquisition must not require reflog identity"
     );
     let transport = repo
         .transport_options("https://fixture.invalid/repository.git".as_bytes(), None)

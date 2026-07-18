@@ -92,8 +92,13 @@ pub(crate) fn open_options_with_transport_limits(
     options.permissions.attributes.system = false;
     options.permissions.attributes.git = false;
     options.permissions.attributes.git_binary = false;
+    options.permissions.env.git_prefix = gix::sec::Permission::Deny;
+    options.permissions.env.ssh_prefix = gix::sec::Permission::Deny;
 
     let mut overrides = vec![
+        "core.logAllRefUpdates=false".to_string(),
+        "credential.helper=".to_string(),
+        "core.askPass=".to_string(),
         "gitoxide.credentials.terminalPrompt=false".to_string(),
         format!("gitoxide.http.connectTimeout={connect_timeout_ms}"),
         format!("http.lowSpeedLimit={low_speed_limit}"),
@@ -103,6 +108,18 @@ pub(crate) fn open_options_with_transport_limits(
         overrides.push(format!("gitoxide.http.noProxy={no_proxy}"));
     }
     options.config_overrides(overrides)
+}
+
+/// Refuse authentication uniformly for public source acquisition.
+///
+/// Installing this callback on every HTTP connection bypasses gix's
+/// configured credential cascade entirely. The open policy above also clears
+/// helpers and askpass so proxy authentication and policy inspection stay
+/// hermetic.
+pub(crate) fn reject_credentials(
+    _action: gix::credentials::helper::Action,
+) -> gix::credentials::protocol::Result {
+    Ok(None)
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
 use ahash as gix_acquire_ahash;
@@ -49,6 +49,25 @@ fn copy_dir_all(source: &Path, destination: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn write_sentinel_script(script: &Path, marker: &Path, stdout: Option<&str>) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let marker = marker.to_string_lossy().replace('\'', "'\"'\"'");
+    let stdout = stdout
+        .map(|value| format!("printf '%s\\n' '{value}'\n"))
+        .unwrap_or_default();
+    std::fs::write(
+        script,
+        format!("#!/bin/sh\n: > '{marker}'\n{stdout}exit 0\n"),
+    )
+    .expect("write credential sentinel");
+    let mut permissions = std::fs::metadata(script)
+        .expect("stat credential sentinel")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(script, permissions).expect("make credential sentinel executable");
 }
 
 fn commit_entries(
@@ -595,6 +614,14 @@ fn hermetic_open_options_disable_terminal_credentials_prompting() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = gix::init(temp.path()).expect("initialize fixture repository");
     drop(repo);
+    let mut config = std::fs::OpenOptions::new()
+        .append(true)
+        .open(temp.path().join(".git/config"))
+        .expect("open fixture repository config");
+    config
+        .write_all(b"\n[credential]\n\thelper = !exit 91\n[core]\n\taskPass = /never/run/askpass\n")
+        .expect("write hostile credential fixture");
+    drop(config);
 
     let repo = gix::open_opts(temp.path(), gix_acquire::open_options())
         .expect("open with hermetic options");
@@ -607,20 +634,39 @@ fn hermetic_open_options_disable_terminal_credentials_prompting() {
     let credential_url =
         gix::Url::from_bytes(b"https://fixture.invalid/repository.git".as_slice().into())
             .expect("credential fixture URL");
-    let (_, _, prompt) = repo
+    let (cascade, _, prompt) = repo
         .config_snapshot()
         .credential_helpers(credential_url)
         .expect("resolve credential policy");
+    assert!(
+        cascade.programs.is_empty(),
+        "repository-local credential helpers must be cleared"
+    );
     assert_eq!(prompt.mode, gix::prompt::Mode::Disable);
     assert!(
         prompt.askpass.is_none(),
         "hermetic public acquisition must not invoke an askpass program"
     );
     let permissions = repo.open_options().permissions;
+    assert_eq!(
+        permissions.env.git_prefix,
+        gix::sec::Permission::Deny,
+        "GIT_* credential and askpass environment must be ignored"
+    );
+    assert_eq!(
+        permissions.env.ssh_prefix,
+        gix::sec::Permission::Deny,
+        "SSH_ASKPASS must be ignored"
+    );
     assert!(!permissions.config.includes);
     assert!(!permissions.attributes.system);
     assert!(!permissions.attributes.git);
     assert!(!permissions.attributes.git_binary);
+    assert_eq!(
+        repo.refs.write_reflog,
+        gix::refs::store::WriteReflog::Disable,
+        "exact acquisition repositories must never require reflog identity"
+    );
     let transport = repo
         .transport_options("https://fixture.invalid/repository.git".as_bytes(), None)
         .expect("resolve hermetic transport options")
@@ -641,6 +687,164 @@ fn hermetic_open_options_disable_terminal_credentials_prompting() {
                 )
                 .is_some()),
         "the gix HTTP transport must be in-process curl so low-speed limits are enforced"
+    );
+}
+
+#[test]
+fn public_http_authentication_cannot_execute_configured_credentials_programs() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind authentication fixture");
+    let address = listener
+        .local_addr()
+        .expect("authentication fixture address");
+    listener
+        .set_nonblocking(true)
+        .expect("make authentication fixture accept bounded");
+    let server_done = Arc::new(AtomicBool::new(false));
+    let server_done_worker = Arc::clone(&server_done);
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut requests = Vec::new();
+        while !server_done_worker.load(Ordering::Acquire) || requests.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "authentication fixture did not finish"
+            );
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("accept authentication request: {error}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("bound authentication fixture read");
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream
+                    .read_exact(&mut byte)
+                    .expect("read authentication request");
+                request.push(byte[0]);
+                assert!(
+                    request.len() < 64 * 1024,
+                    "unbounded authentication request"
+                );
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\n\
+                      WWW-Authenticate: Basic realm=\"ktstr-test\"\r\n\
+                      Content-Length: 0\r\n\
+                      Connection: close\r\n\r\n",
+                )
+                .expect("write authentication challenge");
+            requests.push(request);
+        }
+        requests
+    });
+
+    let temp = tempfile::tempdir().expect("authentication tempdir");
+    let helper_marker = temp.path().join("credential-helper-ran");
+    let askpass_marker = temp.path().join("askpass-ran");
+    let helper = temp.path().join("credential-helper");
+    let askpass = temp.path().join("askpass");
+    write_sentinel_script(&helper, &helper_marker, None);
+    write_sentinel_script(&askpass, &askpass_marker, Some("sentinel-secret"));
+
+    let repository = temp.path().join("repository");
+    let mut repo = gix::ThreadSafeRepository::init_opts(
+        &repository,
+        gix::create::Kind::WithWorktree,
+        gix::create::Options::default(),
+        gix_acquire::open_options(),
+    )
+    .expect("initialize authentication repository")
+    .to_thread_local();
+    let overrides: Vec<gix::bstr::BString> = [
+        format!("credential.helper={}", helper.display()),
+        format!("core.askPass={}", askpass.display()),
+        "gitoxide.credentials.terminalPrompt=true".to_string(),
+        "gitoxide.http.noProxy=*".to_string(),
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
+    let mut snapshot = repo.config_snapshot_mut();
+    snapshot
+        .append_config(&overrides, gix::config::Source::Api)
+        .expect("append hostile credential overrides");
+    snapshot
+        .commit()
+        .expect("commit hostile credential overrides");
+
+    let url = format!("http://{address}/repository.git");
+    let credential_url =
+        gix::Url::from_bytes(url.as_bytes().into()).expect("parse authentication fixture URL");
+    let (cascade, _, prompt) = repo
+        .config_snapshot()
+        .credential_helpers(credential_url)
+        .expect("resolve hostile credential fixture");
+    assert_eq!(
+        cascade.programs.len(),
+        1,
+        "the test must configure an executable credential helper"
+    );
+    assert_eq!(
+        prompt.askpass.as_deref(),
+        Some(askpass.as_path()),
+        "the test must configure an executable askpass program"
+    );
+    assert_ne!(
+        prompt.mode,
+        gix::prompt::Mode::Disable,
+        "the test must override terminal prompting after the production policy"
+    );
+
+    let mut remote = repo
+        .remote_at_without_url_rewrite(url.as_str())
+        .expect("prepare authentication fixture remote")
+        .with_fetch_tags(gix::remote::fetch::Tags::None);
+    remote
+        .replace_refspecs(
+            ["+refs/heads/main:refs/ktstr/auth-fixture"],
+            gix::remote::Direction::Fetch,
+        )
+        .expect("configure authentication fixture refspec");
+    let mut connection = remote
+        .connect(gix::remote::Direction::Fetch)
+        .expect("connect authentication fixture");
+    connection.set_credentials(gix_acquire::reject_credentials_for_test);
+    let result = connection.prepare_fetch(
+        gix::progress::Discard,
+        gix::remote::ref_map::Options::default(),
+    );
+    server_done.store(true, Ordering::Release);
+    let requests = server.join().expect("join authentication fixture");
+
+    assert!(
+        result.is_err(),
+        "a public source requiring credentials must be rejected"
+    );
+    assert_eq!(
+        requests.len(),
+        1,
+        "credential rejection must not retry with authentication"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0])
+            .to_ascii_lowercase()
+            .contains("\r\nauthorization:"),
+        "the sole public-source request must remain anonymous"
+    );
+    assert!(
+        !helper_marker.exists(),
+        "the public-source path executed a configured credential helper"
+    );
+    assert!(
+        !askpass_marker.exists(),
+        "the public-source path executed a configured askpass program"
     );
 }
 
@@ -819,8 +1023,16 @@ fn recursive_checkout_uses_committed_gitlink_not_any_child_tip() {
             };
             copy_dir_all(&source.join(".git"), &destination.join(".git"))
                 .map_err(|err| format!("copy fixture object store: {err}"))?;
-            let repo = gix::open_opts(destination, gix::open::Options::isolated())
+            let copied_logs = destination.join(".git/logs");
+            if copied_logs.exists() {
+                std::fs::remove_dir_all(&copied_logs)
+                    .map_err(|err| format!("remove copied fixture reflogs: {err}"))?;
+            }
+            let repo = gix::open_opts(destination, gix_acquire::open_options())
                 .map_err(|err| format!("open copied fixture repository: {err}"))?;
+            if repo.refs.write_reflog != gix::refs::store::WriteReflog::Disable {
+                return Err("fixture repository unexpectedly enables reflogs".to_string());
+            }
             let commit = if revision.starts_with("refs/") {
                 repo.find_reference(revision)
                     .map_err(|err| format!("find fixture ref {revision}: {err}"))?
@@ -846,6 +1058,27 @@ fn recursive_checkout_uses_committed_gitlink_not_any_child_tip() {
         b"pinned child",
         "recursive checkout must materialize the parent's gitlink, not child HEAD"
     );
+    for (repository, expected) in [
+        (output.clone(), parent_commit),
+        (output.join("child"), pinned),
+    ] {
+        assert!(
+            !repository.join(".git/logs/HEAD").exists(),
+            "exact acquisition must not create a reflog in {}",
+            repository.display()
+        );
+        let repo = gix::open_opts(&repository, gix_acquire::open_options())
+            .expect("reopen materialized exact repository");
+        assert!(
+            repo.head().expect("read exact HEAD").is_detached(),
+            "exact acquisition HEAD must remain detached"
+        );
+        assert_eq!(
+            repo.head_commit().expect("read exact HEAD commit").id,
+            expected,
+            "exact acquisition must publish the pinned commit"
+        );
+    }
 }
 
 #[test]

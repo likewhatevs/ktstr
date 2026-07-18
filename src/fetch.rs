@@ -2630,16 +2630,17 @@ fn discover_remote_refs(
     // checked on both sides of that non-interruptible boundary.
     let discovery_progress = progress.item_named("discovering refs");
     ensure_git_operation_not_interrupted(interrupt, "before connecting for ref discovery")?;
-    let conn = remote
+    let mut connection = remote
         .connect(gix::remote::Direction::Fetch)
         .with_context(|| format!("connect to {url} for ref discovery"))?;
+    connection.set_credentials(gix_policy::reject_credentials);
     ensure_git_operation_not_interrupted(interrupt, "after connecting for ref discovery")?;
     let options = gix::remote::ref_map::Options {
         prefix_from_spec_as_filter_on_remote: exact_ref.is_some(),
         ..Default::default()
     };
     ensure_git_operation_not_interrupted(interrupt, "before reading remote refs")?;
-    let (refmap, _handshake) = conn
+    let (refmap, _handshake) = connection
         .ref_map(discovery_progress, options)
         .with_context(|| format!("read remote refs from {url}"))?;
     #[cfg(test)]
@@ -3099,11 +3100,6 @@ fn fetch_exact_ref_and_checkout_gated<T>(
     .with_context(|| "prepare clone")?
     .to_thread_local();
     ensure_git_operation_not_interrupted(interrupt, "after preparing clone")?;
-    ensure_git_operation_not_interrupted(interrupt, "before configuring clone identity")?;
-    let _ = repo
-        .committer_or_set_generic_fallback()
-        .with_context(|| "configure fallback identity for clone reflog")?;
-    ensure_git_operation_not_interrupted(interrupt, "after configuring clone identity")?;
 
     // Pack indexing runs on the caller thread. Checkout separately
     // leases machine-wide optional workers immediately before it starts;
@@ -3135,6 +3131,8 @@ fn fetch_exact_ref_and_checkout_gated<T>(
     let connection = remote
         .connect(gix::remote::Direction::Fetch)
         .with_context(|| format!("connect to {url}"))?;
+    let mut connection = connection;
+    connection.set_credentials(gix_policy::reject_credentials);
     ensure_git_operation_not_interrupted(interrupt, "after connecting")?;
     ensure_git_operation_not_interrupted(interrupt, "before mapping exact remote ref")?;
     let prepare = match discovery_progress {
@@ -3283,7 +3281,7 @@ fn materialize_local_exact_ref_gated<T>(
     let _copy_progress =
         clone_progress.map(|progress| progress.item_named("copying local exact ref"));
     ensure_git_operation_not_interrupted(interrupt, "before preparing local clone")?;
-    let mut repo = gix::ThreadSafeRepository::init_opts(
+    let repo = gix::ThreadSafeRepository::init_opts(
         clone_dir,
         gix::create::Kind::WithWorktree,
         gix::create::Options::default(),
@@ -3291,9 +3289,6 @@ fn materialize_local_exact_ref_gated<T>(
     )
     .with_context(|| "prepare local clone")?
     .to_thread_local();
-    let _ = repo
-        .committer_or_set_generic_fallback()
-        .with_context(|| "configure fallback identity for local clone reflog")?;
     ensure_git_operation_not_interrupted(interrupt, "before copying local exact objects")?;
     copy_local_exact_ref_objects(&source, &repo, unpeeled_id, commit_id, interrupt)?;
     ensure_git_operation_not_interrupted(interrupt, "after copying local exact objects")?;
