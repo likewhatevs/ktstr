@@ -1858,6 +1858,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolved_ktstr_versions_follow_effective_target_cfg() {
+        let crates_io = r#""registry+https://github.com/rust-lang/crates.io-index""#;
+        let root = "userproj 0.1.0 (path+file:///w/userproj)";
+        let linux_ktstr = "ktstr 0.42.0 (registry+https://github.com/rust-lang/crates.io-index)";
+        let windows_ktstr = "ktstr 0.43.0 (registry+https://github.com/rust-lang/crates.io-index)";
+        let json = format!(
+            r#"{{
+              "packages":[{up},{linux},{windows}],
+              "workspace_members":["{root}"],
+              "resolve":{{
+                "root":"{root}",
+                "nodes":[
+                  {{"id":"{root}","deps":[
+                    {{"name":"linux_ktstr","pkg":"{linux_ktstr}","dep_kinds":[{{"kind":null,"target":"cfg(target_os = \"linux\")"}}]}},
+                    {{"name":"windows_ktstr","pkg":"{windows_ktstr}","dep_kinds":[{{"kind":null,"target":"cfg(target_os = \"windows\")"}}]}}
+                  ],"dependencies":["{linux_ktstr}","{windows_ktstr}"],"features":[]}},
+                  {{"id":"{linux_ktstr}","deps":[],"dependencies":[],"features":[]}},
+                  {{"id":"{windows_ktstr}","deps":[],"dependencies":[],"features":[]}}
+                ]
+              }},
+              "workspace_root":"/w","target_directory":"/w/target","version":1
+            }}"#,
+            up = pkg_json("userproj", "0.1.0", root, "null"),
+            linux = pkg_json("ktstr", "0.42.0", linux_ktstr, crates_io),
+            windows = pkg_json("ktstr", "0.43.0", windows_ktstr, crates_io),
+        );
+        let meta: cargo_metadata::Metadata =
+            serde_json::from_str(&json).expect("target fixture deserializes");
+        let root_id = meta.workspace_members.first().expect("workspace root");
+        let linux = crate::feature_discovery::TargetContext::named(
+            "x86_64-unknown-linux-gnu",
+            vec![cargo_platform::Cfg::KeyPair(
+                "target_os".to_string(),
+                "linux".to_string(),
+            )],
+        );
+        let windows = crate::feature_discovery::TargetContext::named(
+            "x86_64-pc-windows-msvc",
+            vec![cargo_platform::Cfg::KeyPair(
+                "target_os".to_string(),
+                "windows".to_string(),
+            )],
+        );
+        assert_eq!(
+            linked_ktstr_versions_for_context(&meta, root_id, Some(&linux)),
+            vec![&v("0.42.0")],
+        );
+        assert_eq!(
+            linked_ktstr_versions_for_context(&meta, root_id, Some(&windows)),
+            vec![&v("0.43.0")],
+        );
+    }
+
     /// Virtual workspace: no root package (`resolve.root` = null) — the
     /// walk falls back to every workspace member; a member linking ktstr
     /// resolves to that version.

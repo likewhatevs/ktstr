@@ -650,15 +650,6 @@ fn compatible_ktstr_member(member: &str, aliases: &HashSet<&str>) -> Option<bool
 /// set, so both exact target tables and `cfg(...)` expressions are evaluated
 /// with Cargo's own platform matcher. The optional legacy test wrapper keeps
 /// `None` as "unknown" and therefore declines target-specific activation.
-#[cfg(test)]
-fn dependency_matches_requested_target(
-    dependency: &cargo_metadata::Dependency,
-    target: Option<&str>,
-) -> bool {
-    let context = target.map(|target| TargetContext::named(target, Vec::new()));
-    dependency_matches_target_context(dependency, context.as_ref())
-}
-
 fn dependency_matches_target_context(
     dependency: &cargo_metadata::Dependency,
     target: Option<&TargetContext>,
@@ -1736,12 +1727,9 @@ unrelated-mode = []
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn real_workspace_host_cfg_inference_and_package_scoped_feature_resolution() {
-        assert!(
-            cfg!(target_os = "linux"),
-            "this regression exercises Linux cfg"
-        );
         let workspace = real_feature_workspace();
         let manifest = workspace.path().join("Cargo.toml");
         let args = strings(&[

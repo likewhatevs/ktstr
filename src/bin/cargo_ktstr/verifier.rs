@@ -72,7 +72,7 @@ use crate::feature_discovery::{
 #[cfg(test)]
 use crate::feature_discovery::{
     explicit_package_exclusions, explicit_package_selection, infer_ktstr_feature_roots,
-    infer_ktstr_feature_roots_for_target, selected_activations,
+    selected_activations,
 };
 use crate::kernel::{
     encode_kernel_list, path_kernel_label, resolve_kernel_image, resolve_kernel_set,
@@ -277,23 +277,6 @@ fn dep_kind_matches_target_context(
 /// old distributed scheduler registry. Package-level metadata cannot prove
 /// which individual test binary retains that dependency, so any such mixed
 /// package is excluded conservatively.
-#[cfg(test)]
-fn linked_ktstr_versions(
-    member_id: &PackageId,
-    packages: &HashMap<&PackageId, &cargo_metadata::Package>,
-    nodes: &HashMap<&PackageId, &cargo_metadata::Node>,
-    requested_target: Option<&str>,
-) -> Vec<Version> {
-    let target = requested_target.map(TargetContext::named_for_test);
-    linked_ktstr_versions_for_context(
-        member_id,
-        packages,
-        nodes,
-        target.as_ref(),
-        requested_target.is_none(),
-    )
-}
-
 fn linked_ktstr_versions_for_context(
     member_id: &PackageId,
     packages: &HashMap<&PackageId, &cargo_metadata::Package>,
