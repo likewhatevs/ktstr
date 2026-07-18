@@ -24,8 +24,9 @@ pub(crate) enum MetadataMode {
     /// inference and avoids resolving every optional dependency.
     NoDeps,
     /// Cargo's normal, requested-feature resolve graph. `test` and `coverage`
-    /// use this for their version guard; when inference adds a previously
-    /// inactive optional ktstr, they resolve the targeted result once more.
+    /// (including raw `llvm-cov nextest`) use this for their version guard;
+    /// when inference adds a previously inactive optional ktstr, they resolve
+    /// the targeted result once more.
     Default,
 }
 

@@ -25,9 +25,8 @@ use std::process::Command;
 use cargo_metadata::semver::Version;
 
 use crate::feature_discovery::{
-    MetadataMode, augment_test_features, augment_test_features_from_metadata_for_context,
-    effective_target_context, query_metadata_for_target, query_resolved_metadata,
-    selected_workspace_packages,
+    MetadataMode, augment_test_features_from_metadata_for_context, effective_target_context,
+    query_metadata_for_target, query_resolved_metadata, selected_workspace_packages,
 };
 use crate::kernel::{encode_kernel_list, resolve_kernel_set};
 
@@ -101,6 +100,27 @@ fn llvm_cov_uses_nextest(args: &[String]) -> bool {
         index += if takes_separate_value { 2 } else { 1 };
     }
     false
+}
+
+/// Apply the ordinary nextest metadata preflight to the raw llvm-cov
+/// passthrough only when it explicitly selects llvm-cov's `nextest`
+/// subcommand.
+///
+/// Keeping the preparer injectable makes the routing contract independently
+/// testable without running Cargo metadata. Production passes
+/// [`prepare_test_args`], so `cargo ktstr llvm-cov nextest` cannot drift from
+/// `test` / `coverage` in package selection, target filtering, inferred
+/// features, or version checks. Non-test llvm-cov modes never call the
+/// preparer and retain their exact argv.
+fn prepare_llvm_cov_args_with(
+    args: Vec<String>,
+    prepare: impl FnOnce(Vec<String>) -> Result<Vec<String>, String>,
+) -> Result<Vec<String>, String> {
+    if llvm_cov_uses_nextest(&args) {
+        prepare(args)
+    } else {
+        Ok(args)
+    }
 }
 
 /// Decide whether to inject `LLVM_PROFILE_FILE` for a given cargo
@@ -1500,18 +1520,12 @@ pub(crate) fn run_llvm_cov(
     // None` here mean "don't inject any profile ourselves"; the user
     // decides via the raw args.
     //
-    // No ktstr version guard here (unlike `test` / `coverage`): a
-    // passthrough subcommand like `llvm-cov report` does NOT rebuild or
-    // run the tests, so guarding would wrongly block a pure-report
-    // invocation under a version-skewed project. A `cargo ktstr llvm-cov
-    // nextest` that DOES run tests is the user's explicit raw-passthrough
-    // choice; they own the version in that case.
-    let args = if llvm_cov_uses_nextest(&args) {
-        augment_test_features(args)
-            .map_err(|error| format!("cargo ktstr llvm-cov nextest: {error}"))?
-    } else {
-        args
-    };
+    // Report/clean/show-env and other non-test modes do not build or enumerate
+    // ktstr tests, so they retain exact passthrough semantics. Explicit
+    // `llvm-cov nextest` is the same test suite as `coverage`, and therefore
+    // goes through the identical target-aware feature and version preflight.
+    let args = prepare_llvm_cov_args_with(args, prepare_test_args)
+        .map_err(|error| format!("cargo ktstr llvm-cov nextest: {error}"))?;
     run_cargo_sub(
         LLVM_COV_SUB_ARGV,
         "llvm-cov",
@@ -1622,6 +1636,120 @@ mod tests {
                 !llvm_cov_uses_nextest(&args),
                 "raw/report mode must preserve its exact feature selection: {args:?}",
             );
+        }
+    }
+
+    #[test]
+    fn llvm_cov_nextest_forwards_the_same_targeted_features_as_coverage() {
+        let activations = [crate::feature_discovery::PackageFeatureActivation {
+            package: "scx_lavd".to_string(),
+            features: vec!["ktstr-tests".to_string()],
+        }];
+        let coverage_args = strs(&[
+            "--workspace",
+            "--target",
+            "aarch64-unknown-linux-gnu",
+            "--features",
+            "integration",
+        ]);
+        let coverage_args =
+            crate::feature_discovery::inject_feature_activations(coverage_args, &activations);
+        let raw_args = prepare_llvm_cov_args_with(
+            strs(&[
+                "nextest",
+                "--workspace",
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                "--features",
+                "integration",
+            ]),
+            |args| {
+                Ok(crate::feature_discovery::inject_feature_activations(
+                    args,
+                    &activations,
+                ))
+            },
+        )
+        .expect("nextest preparation succeeds");
+
+        let coverage = build_cargo_command(
+            COVERAGE_SUB_ARGV,
+            false,
+            None,
+            None,
+            false,
+            false,
+            &coverage_args,
+        );
+        let raw = build_cargo_command(
+            LLVM_COV_SUB_ARGV,
+            false,
+            None,
+            None,
+            false,
+            false,
+            &raw_args,
+        );
+        let coverage_argv = coverage.get_args().collect::<Vec<_>>();
+        let raw_argv = raw.get_args().collect::<Vec<_>>();
+        assert_eq!(
+            raw_argv, coverage_argv,
+            "both frontends must hand cargo-llvm-cov the same nextest argv",
+        );
+        assert_eq!(
+            raw_argv,
+            [
+                "llvm-cov",
+                "nextest",
+                "--workspace",
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                "--features",
+                "integration",
+                "--features",
+                "scx_lavd/ktstr-tests",
+            ]
+            .map(std::ffi::OsStr::new),
+        );
+        assert!(
+            !raw_argv
+                .iter()
+                .any(|argument| *argument == std::ffi::OsStr::new("--all-features")),
+            "targeted inference must never widen into --all-features",
+        );
+
+        let explicit_all = prepare_llvm_cov_args_with(
+            strs(&["nextest", "--workspace", "--all-features"]),
+            |args| {
+                Ok(crate::feature_discovery::inject_feature_activations(
+                    args,
+                    &activations,
+                ))
+            },
+        )
+        .expect("explicit all-features remains valid");
+        assert_eq!(
+            explicit_all,
+            strs(&["nextest", "--workspace", "--all-features"]),
+            "an explicit user --all-features remains authoritative",
+        );
+    }
+
+    #[test]
+    fn llvm_cov_non_test_modes_never_run_feature_preparation() {
+        for args in [
+            strs(&[]),
+            strs(&["test", "--features", "explicit"]),
+            strs(&["report", "--features", "explicit"]),
+            strs(&["clean", "--workspace"]),
+            strs(&["show-env"]),
+            strs(&["run", "--bin", "scheduler"]),
+        ] {
+            let prepared = prepare_llvm_cov_args_with(args.clone(), |_| {
+                panic!("non-nextest llvm-cov mode must not run metadata preparation")
+            })
+            .expect("raw passthrough cannot fail");
+            assert_eq!(prepared, args);
         }
     }
 
