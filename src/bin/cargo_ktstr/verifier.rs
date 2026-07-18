@@ -1780,7 +1780,7 @@ mod tests {
         let dependencies = format!(
             r#"[{{"name":"ktstr","source":null,"req":"{ktstr_req}","kind":{kind},"rename":{rename},"optional":true,"uses_default_features":true,"features":[],"target":null,"registry":null,"path":null}}]"#
         );
-        package_json_with(name, version, id, &dependencies, &features)
+        package_json_with(name, version, id, &dependencies, features)
     }
 
     fn scx_version_fixture() -> Metadata {

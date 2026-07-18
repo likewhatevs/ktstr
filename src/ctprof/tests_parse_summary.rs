@@ -11,6 +11,9 @@ use crate::metric_types::MonotonicCount;
 use crate::sync::MutexExt;
 use std::path::Path;
 
+const POOL_FAILURE_THREAD_PROBE_ENV: &str = "KTSTR_CTPROF_POOL_FAILURE_THREAD_PROBE";
+const POOL_FAILURE_THREAD_PROBE_MARKER: &str = "ctprof-pool-failure-thread-probe-ok";
+
 // ------------------------------------------------------------
 // CtprofParseSummary: per-file read-failure tally
 // ------------------------------------------------------------
@@ -855,6 +858,121 @@ fn capture_with_non_utf8_pcomm_treated_as_absent() {
         "non-UTF-8 pcomm collapses to empty (read_to_string returns Err \
          on invalid UTF-8 and unwrap_or_default → \"\")",
     );
+}
+
+/// Run the forced pool-build failure in an exact-test child so no
+/// unrelated Rayon user can have initialized the process-global pool
+/// before the assertion. The child verifies both the retained-thread
+/// invariant and the ordinary per-tgid panic/accounting contract.
+#[test]
+fn capture_with_pool_build_failure_is_sequential_and_preserves_accounting() {
+    if std::env::var_os(POOL_FAILURE_THREAD_PROBE_ENV).is_some() {
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .env(POOL_FAILURE_THREAD_PROBE_ENV, "1")
+        .arg("--exact")
+        .arg(
+            "ctprof::tests_parse_summary::\
+             capture_with_pool_build_failure_is_sequential_and_preserves_accounting_child",
+        )
+        .arg("--nocapture")
+        .arg("--test-threads=1")
+        .output()
+        .expect("spawn isolated ctprof pool-failure probe");
+    let transcript = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "isolated ctprof pool-failure probe failed:\n{transcript}"
+    );
+    assert!(
+        transcript.contains(POOL_FAILURE_THREAD_PROBE_MARKER),
+        "isolated helper did not run (wrong libtest exact name?):\n{transcript}"
+    );
+}
+
+#[test]
+fn capture_with_pool_build_failure_is_sequential_and_preserves_accounting_child() {
+    if std::env::var_os(POOL_FAILURE_THREAD_PROBE_ENV).is_none() {
+        return;
+    }
+    let proc_tmp = tempfile::TempDir::new().unwrap();
+    let cgroup_tmp = tempfile::TempDir::new().unwrap();
+    let sys_tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(proc_tmp.path().join("loadavg"), "0.0 0.0 0.0 1/1 1\n").unwrap();
+
+    let survivor_tgid = 99_200;
+    let survivor_tid = 99_202;
+    let panic_tgid = 99_201;
+    let panic_tid = 99_203;
+    stage_synthetic_proc(
+        proc_tmp.path(),
+        survivor_tgid,
+        survivor_tid,
+        "ok-pcomm",
+        "ok-comm",
+    );
+    stage_synthetic_proc(
+        proc_tmp.path(),
+        panic_tgid,
+        panic_tid,
+        "panic-pcomm",
+        "panic-comm",
+    );
+
+    let task_count = || {
+        std::fs::read_dir("/proc/self/task")
+            .expect("read /proc/self/task")
+            .count()
+    };
+    let requested_threads = std::cell::Cell::new(0);
+    let saved_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_info| {}));
+    PANIC_INJECT_TGID.store(panic_tgid, std::sync::atomic::Ordering::Release);
+    let before = task_count();
+    let snap = capture_with_pool_builder(
+        proc_tmp.path(),
+        cgroup_tmp.path(),
+        sys_tmp.path(),
+        true,
+        |threads| {
+            requested_threads.set(threads);
+            Err("forced pool build failure".to_string())
+        },
+    );
+    let after = task_count();
+    PANIC_INJECT_TGID.store(0, std::sync::atomic::Ordering::Release);
+    std::panic::set_hook(saved_hook);
+
+    assert!(
+        requested_threads.get() >= 1,
+        "pool builder seam was not called"
+    );
+    assert_eq!(
+        after, before,
+        "failed bounded-pool construction initialized retained global workers: \
+         before={before}, after={after}"
+    );
+    assert_eq!(
+        snap.threads.len(),
+        2,
+        "sequential fallback must still walk both staged tgids"
+    );
+    let summary = snap
+        .probe_summary
+        .expect("production-mode capture must populate probe summary");
+    assert_eq!(summary.tgids_walked, 2);
+    assert_eq!(summary.failed, 1);
+    assert_eq!(
+        summary.dominant_failure.as_deref(),
+        Some("worker-panic"),
+        "sequential fallback must preserve the shared catch/accounting path"
+    );
+    eprintln!("{POOL_FAILURE_THREAD_PROBE_MARKER}");
 }
 
 /// Y1: panic-injection harness for rayon worker panics.

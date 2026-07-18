@@ -457,10 +457,17 @@ pub(crate) fn resolve_kernel_set(
 /// the first Err it observes — which version surfaces is not
 /// deterministic under concurrency, but a single failure still
 /// aborts the whole resolve just as the sequential loop did.
+#[derive(Clone, Copy)]
+enum ResolveExecution {
+    Parallel,
+    Sequential,
+}
+
 fn resolve_one_spec(
     trimmed: String,
     mp: &ktstr::cli::FetchProgress,
     include_eol: bool,
+    execution: ResolveExecution,
 ) -> Vec<Result<(String, PathBuf), String>> {
     use ktstr::kernel_path::KernelId;
 
@@ -474,10 +481,20 @@ fn resolve_one_spec(
     match id {
         KernelId::Range { start, end, .. } => {
             match ktstr::cli::expand_kernel_range(&start, &end, "cargo ktstr", include_eol) {
-                Ok(versions) => resolve_versions_parallel(versions, |ver| {
-                    resolve_one_with_progress(KernelId::Version(ver.to_string()), mp)
-                        .map_err(|e| format!("resolve kernel {ver}: {e}"))
-                }),
+                Ok(versions) => {
+                    let resolve_version = |ver: &str| {
+                        resolve_one_with_progress(KernelId::Version(ver.to_string()), mp)
+                            .map_err(|e| format!("resolve kernel {ver}: {e}"))
+                    };
+                    match execution {
+                        ResolveExecution::Parallel => {
+                            resolve_versions_parallel(versions, resolve_version)
+                        }
+                        ResolveExecution::Sequential => {
+                            resolve_versions_sequential(versions, resolve_version)
+                        }
+                    }
+                }
                 Err(e) => vec![Err(format!("{e:#}"))],
             }
         }
@@ -513,6 +530,22 @@ where
 {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     versions.into_par_iter().map(|ver| resolve(&ver)).collect()
+}
+
+/// Resource-exhaustion counterpart to [`resolve_versions_parallel`].
+///
+/// Used only when the enclosing bounded pool could not create its
+/// workers. A Range must stay sequential too: calling the parallel
+/// helper outside `pool.install` would lazily initialize Rayon's
+/// host-sized global pool and recreate the failure at the nested level.
+fn resolve_versions_sequential<R>(
+    versions: Vec<String>,
+    resolve: R,
+) -> Vec<Result<(String, PathBuf), String>>
+where
+    R: Fn(&str) -> Result<(String, PathBuf), String>,
+{
+    versions.into_iter().map(|ver| resolve(&ver)).collect()
 }
 
 /// `resolve_one` plus per-resolve progress feedback.
@@ -567,6 +600,27 @@ fn resolve_specs_parallel(
     mp: &ktstr::cli::FetchProgress,
     include_eol: bool,
 ) -> Result<Vec<(String, PathBuf)>, String> {
+    resolve_specs_parallel_with_pool_builder(specs, mp, include_eol, |max_threads| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(max_threads)
+            .build()
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// [`resolve_specs_parallel`] with an injected bounded-pool builder.
+///
+/// The seam lets tests force the `pthread_create` failure path without
+/// changing process limits. Production passes Rayon's real builder.
+fn resolve_specs_parallel_with_pool_builder<B>(
+    specs: &[String],
+    mp: &ktstr::cli::FetchProgress,
+    include_eol: bool,
+    build_pool: B,
+) -> Result<Vec<(String, PathBuf)>, String>
+where
+    B: FnOnce(usize) -> Result<rayon::ThreadPool, String>,
+{
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
     // Cap rayon parallelism via a bounded ThreadPool installed
@@ -604,37 +658,48 @@ fn resolve_specs_parallel(
     //
     // Bounded ThreadPool via `pool.install(|| ...)` scopes the
     // cap to this pipeline only — the global rayon pool is
-    // unaffected, so any other rayon-using code in the same
-    // process (test parallelism in nextest's harness, polars'
-    // groupby, etc.) keeps its own width. Falls back to the
-    // global pool if `ThreadPoolBuilder::build` fails (e.g. on
-    // a host that's already maxed its thread limits) — better
-    // to run the resolve under the default global pool than
-    // bail with a cap-construction error that has nothing to
-    // do with the user's `--kernel` input.
+    // unaffected. If construction fails because pthread creation
+    // is already exhausted, the entire pipeline (including versions
+    // nested under a Range) runs sequentially. Falling through to a
+    // parallel iterator here would lazily create Rayon's host-sized
+    // global pool at exactly the point thread creation is failing.
     let max_threads = ktstr::cli::resolve_kernel_parallelism();
-    let bounded_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(max_threads)
-        .build()
-        .ok();
+    let pool_result = build_pool(max_threads);
+    let nonempty_spec = |raw: &String| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    };
 
     let resolve_in_pool = || -> Result<Vec<(String, PathBuf)>, String> {
         specs
             .into_par_iter()
-            .filter_map(|raw| {
-                let trimmed = raw.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
+            .filter_map(&nonempty_spec)
+            .flat_map_iter(|trimmed| {
+                resolve_one_spec(trimmed, mp, include_eol, ResolveExecution::Parallel).into_iter()
             })
-            .flat_map_iter(|trimmed| resolve_one_spec(trimmed, mp, include_eol).into_iter())
             .collect::<Result<Vec<_>, _>>()
     };
-    match bounded_pool {
-        Some(pool) => pool.install(resolve_in_pool),
-        None => resolve_in_pool(),
+    match pool_result {
+        Ok(pool) => pool.install(resolve_in_pool),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                max_threads,
+                "rayon ThreadPoolBuilder failed; falling back to sequential kernel resolution"
+            );
+            specs
+                .iter()
+                .filter_map(&nonempty_spec)
+                .flat_map(|trimmed| {
+                    resolve_one_spec(trimmed, mp, include_eol, ResolveExecution::Sequential)
+                        .into_iter()
+                })
+                .collect::<Result<Vec<_>, _>>()
+        }
     }
 }
 
@@ -972,6 +1037,9 @@ fn cache_lookup(cache: &CacheDir, cache_key: &str) -> Option<CacheEntry> {
 mod tests {
     use super::*;
 
+    const POOL_FAILURE_THREAD_PROBE_ENV: &str = "KTSTR_KERNEL_POOL_FAILURE_THREAD_PROBE";
+    const POOL_FAILURE_THREAD_PROBE_MARKER: &str = "kernel-pool-failure-thread-probe-ok";
+
     // ---------------------------------------------------------------
     // format_built_age — cache-hit log line age suffix
     // ---------------------------------------------------------------
@@ -1204,6 +1272,90 @@ mod tests {
             out.iter().enumerate().all(|(i, r)| (i == 7) == r.is_err()),
             "only the 6.7 slot (input index 7) is Err; order preserved"
         );
+    }
+
+    #[test]
+    fn resolve_versions_sequential_preserves_order_and_calling_thread() {
+        let caller = std::thread::current().id();
+        let versions: Vec<String> = (0..16).map(|i| format!("6.{i}")).collect();
+        let out = resolve_versions_sequential(versions.clone(), |ver| {
+            assert_eq!(
+                std::thread::current().id(),
+                caller,
+                "sequential Range fallback escaped onto a worker"
+            );
+            Ok((ver.to_string(), std::path::PathBuf::from(ver)))
+        });
+        let labels: Vec<String> = out.into_iter().map(|result| result.unwrap().0).collect();
+        assert_eq!(labels, versions);
+    }
+
+    /// Exercise the real outer filtering / validation / error path with
+    /// a deterministically failed pool builder in an isolated process.
+    /// The child task count catches any fallback to a global parallel
+    /// iterator without depending on test order in this large binary.
+    #[test]
+    fn resolve_specs_pool_build_failure_is_sequential() {
+        if std::env::var_os(POOL_FAILURE_THREAD_PROBE_ENV).is_some() {
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env(POOL_FAILURE_THREAD_PROBE_ENV, "1")
+            .arg("--exact")
+            .arg("kernel::tests::resolve_specs_pool_build_failure_is_sequential_child")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .output()
+            .expect("spawn isolated kernel resolver pool-failure probe");
+        let transcript = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "isolated kernel resolver pool-failure probe failed:\n{transcript}"
+        );
+        assert!(
+            transcript.contains(POOL_FAILURE_THREAD_PROBE_MARKER),
+            "isolated helper did not run (wrong libtest exact name?):\n{transcript}"
+        );
+    }
+
+    #[test]
+    fn resolve_specs_pool_build_failure_is_sequential_child() {
+        if std::env::var_os(POOL_FAILURE_THREAD_PROBE_ENV).is_none() {
+            return;
+        }
+        let specs = vec!["   ".to_string(), " 6.20..6.10 ".to_string()];
+        let progress = ktstr::cli::FetchProgress::new();
+        let requested_threads = std::cell::Cell::new(0);
+        let task_count = || {
+            std::fs::read_dir("/proc/self/task")
+                .expect("read /proc/self/task")
+                .count()
+        };
+        let before = task_count();
+        let err = resolve_specs_parallel_with_pool_builder(&specs, &progress, false, |threads| {
+            requested_threads.set(threads);
+            Err("forced pool build failure".to_string())
+        })
+        .expect_err("inverted Range must retain its validation error");
+        let after = task_count();
+        assert!(
+            requested_threads.get() >= 1,
+            "pool builder seam was not called"
+        );
+        assert!(
+            err.contains("6.20") && err.contains("6.10"),
+            "sequential fallback lost the original validation error: {err}"
+        );
+        assert_eq!(
+            after, before,
+            "failed bounded-pool construction initialized retained global workers: \
+             before={before}, after={after}"
+        );
+        eprintln!("{POOL_FAILURE_THREAD_PROBE_MARKER}");
     }
 
     // ---------------------------------------------------------------
