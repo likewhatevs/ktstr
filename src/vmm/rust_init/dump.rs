@@ -2272,11 +2272,10 @@ mod tests {
     use super::{
         HvcControlDecoder, HvcControlEvent, SchedExitCommitError, SchedExitMonitorConfig,
         SchedExitPublicationGate, SchedExitTerminal, SchedLogDumpAttempt, SchedLogWireCoordinator,
-        SchedLogWireLease,
-        drain_probe_for_shutdown, dump_sched_output_before_terminal_with, dump_sched_output_with,
-        dump_sched_output_with_wire, send_synthetic_sched_output_before_terminal_with,
-        spawn_sched_exit_monitor_thread, staged_scheduler_log_paths,
-        start_sched_exit_monitor_inner,
+        SchedLogWireLease, drain_probe_for_shutdown, dump_sched_output_before_terminal_with,
+        dump_sched_output_with, dump_sched_output_with_wire,
+        send_synthetic_sched_output_before_terminal_with, spawn_sched_exit_monitor_thread,
+        staged_scheduler_log_paths, start_sched_exit_monitor_inner,
     };
     use crate::sync::Latch;
     use crate::vmm::wire::{AttachCancelCause, AttachControlPacket};

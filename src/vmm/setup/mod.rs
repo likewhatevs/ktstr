@@ -208,7 +208,7 @@ fn validate_prepared_split_host_address(host_addr: *mut u8, split_alignment: usi
 /// 2 MiB file-offset requirement.
 fn validate_prepared_file_offset(file_offset: u64, host_page_size: usize) -> Result<()> {
     anyhow::ensure!(
-        file_offset % host_page_size as u64 == 0,
+        file_offset.is_multiple_of(host_page_size as u64),
         "prepared initrd file offset is not aligned to the \
          {host_page_size}-byte host page size"
     );

@@ -152,6 +152,7 @@ where
     let lock_path = root.join(format!(".{id}.lock"));
     let lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)
@@ -1057,7 +1058,7 @@ pub(crate) fn checkout_exact_recursive_with(
     expected_commit: &str,
     destination: &Path,
     progress: &ProgressReporter,
-    materialize: &dyn Fn(&str, &str, &Path, &ProgressReporter) -> Result<(), String>,
+    materialize: &MaterializeRevision<'_>,
 ) -> Result<(), String> {
     checkout_exact_inner(
         url,
@@ -1070,6 +1071,9 @@ pub(crate) fn checkout_exact_recursive_with(
     )
 }
 
+type MaterializeRevision<'a> =
+    dyn Fn(&str, &str, &Path, &ProgressReporter) -> Result<(), String> + 'a;
+
 fn checkout_exact_inner(
     url: &str,
     revision: &str,
@@ -1077,7 +1081,7 @@ fn checkout_exact_inner(
     destination: &Path,
     progress: &ProgressReporter,
     depth: usize,
-    materialize: &dyn Fn(&str, &str, &Path, &ProgressReporter) -> Result<(), String>,
+    materialize: &MaterializeRevision<'_>,
 ) -> Result<(), String> {
     if depth > MAX_SUBMODULE_DEPTH {
         return Err(format!(
@@ -1426,11 +1430,7 @@ pub(crate) fn open_options() -> gix::open::Options {
 }
 
 #[cfg(test)]
-pub(crate) fn reject_credentials_for_test(
-    action: gix::credentials::helper::Action,
-) -> gix::credentials::protocol::Result {
-    gix_policy::reject_credentials(action)
-}
+pub(crate) use gix_policy::reject_credentials as reject_credentials_for_test;
 
 #[cfg(test)]
 fn open_options_with_transport_limits(

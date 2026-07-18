@@ -3029,35 +3029,37 @@ fn git_builder_election_process_helper() {
     }
 }
 
-fn spawn_git_builder_helper(
-    exe: &std::path::Path,
-    root: &std::path::Path,
-    cache_key: &str,
-    ready: &std::path::Path,
-    attempts: &std::path::Path,
-    published: &std::path::Path,
-    mode: &str,
-    locked: Option<&std::path::Path>,
-    release: Option<&std::path::Path>,
-) -> std::process::Child {
-    let mut command = std::process::Command::new(exe);
+struct GitBuilderHelper<'a> {
+    exe: &'a std::path::Path,
+    root: &'a std::path::Path,
+    cache_key: &'a str,
+    ready: &'a std::path::Path,
+    attempts: &'a std::path::Path,
+    published: &'a std::path::Path,
+    mode: &'a str,
+    locked: Option<&'a std::path::Path>,
+    release: Option<&'a std::path::Path>,
+}
+
+fn spawn_git_builder_helper(helper: GitBuilderHelper<'_>) -> std::process::Child {
+    let mut command = std::process::Command::new(helper.exe);
     command
         .arg("--ignored")
         .arg("--exact")
         .arg("--color=never")
         .arg("cache::cache_dir::tests::git_builder_election_process_helper")
-        .env("KTSTR_TEST_BUILDER_ROOT", root)
-        .env("KTSTR_TEST_BUILDER_KEY", cache_key)
-        .env("KTSTR_TEST_BUILDER_READY", ready)
-        .env("KTSTR_TEST_BUILDER_ATTEMPTS", attempts)
-        .env("KTSTR_TEST_BUILDER_PUBLISHED", published)
-        .env("KTSTR_TEST_BUILDER_MODE", mode)
+        .env("KTSTR_TEST_BUILDER_ROOT", helper.root)
+        .env("KTSTR_TEST_BUILDER_KEY", helper.cache_key)
+        .env("KTSTR_TEST_BUILDER_READY", helper.ready)
+        .env("KTSTR_TEST_BUILDER_ATTEMPTS", helper.attempts)
+        .env("KTSTR_TEST_BUILDER_PUBLISHED", helper.published)
+        .env("KTSTR_TEST_BUILDER_MODE", helper.mode)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    if let Some(path) = locked {
+    if let Some(path) = helper.locked {
         command.env("KTSTR_TEST_BUILDER_LOCKED", path);
     }
-    if let Some(path) = release {
+    if let Some(path) = helper.release {
         command.env("KTSTR_TEST_BUILDER_RELEASE", path);
     }
     command.spawn().expect("spawn builder helper")
@@ -3093,9 +3095,17 @@ fn git_builder_election_has_exactly_one_cross_process_producer() {
     let mut children: Vec<_> = ready
         .iter()
         .map(|path| {
-            spawn_git_builder_helper(
-                &exe, &root, cache_key, path, &attempts, &published, "publish", None, None,
-            )
+            spawn_git_builder_helper(GitBuilderHelper {
+                exe: &exe,
+                root: &root,
+                cache_key,
+                ready: path,
+                attempts: &attempts,
+                published: &published,
+                mode: "publish",
+                locked: None,
+                release: None,
+            })
         })
         .collect();
     wait_for_test_paths(&ready);
@@ -3137,18 +3147,18 @@ fn git_builder_failure_allows_cross_process_takeover() {
     let failed_locked = tmp.path().join("failed-locked");
     let failed_release = tmp.path().join("failed-release");
     let exe = std::env::current_exe().unwrap();
-    let mut failing = spawn_git_builder_helper(
-        &exe,
-        &root,
+    let mut failing = spawn_git_builder_helper(GitBuilderHelper {
+        exe: &exe,
+        root: &root,
         cache_key,
-        &failed_ready,
-        &attempts,
-        &published,
-        "fail-hold",
-        Some(&failed_locked),
-        Some(&failed_release),
-    );
-    wait_for_test_paths(&[failed_locked.clone()]);
+        ready: &failed_ready,
+        attempts: &attempts,
+        published: &published,
+        mode: "fail-hold",
+        locked: Some(&failed_locked),
+        release: Some(&failed_release),
+    });
+    wait_for_test_paths(std::slice::from_ref(&failed_locked));
 
     let ready: Vec<_> = (0..4)
         .map(|idx| tmp.path().join(format!("takeover-ready-{idx}")))
@@ -3156,9 +3166,17 @@ fn git_builder_failure_allows_cross_process_takeover() {
     let mut waiters: Vec<_> = ready
         .iter()
         .map(|path| {
-            spawn_git_builder_helper(
-                &exe, &root, cache_key, path, &attempts, &published, "publish", None, None,
-            )
+            spawn_git_builder_helper(GitBuilderHelper {
+                exe: &exe,
+                root: &root,
+                cache_key,
+                ready: path,
+                attempts: &attempts,
+                published: &published,
+                mode: "publish",
+                locked: None,
+                release: None,
+            })
         })
         .collect();
     wait_for_test_paths(&ready);

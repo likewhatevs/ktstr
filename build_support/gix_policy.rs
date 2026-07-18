@@ -115,11 +115,9 @@ pub(crate) fn open_options_with_transport_limits(
     // rustls_client_config_builder_build() without any verifier and every
     // HTTPS request fails before the handshake. Point gix at the host's
     // ordinary system bundle explicitly while keeping verification enabled.
-    if let Some(ca_bundle) = first_existing_regular_file(
-        SYSTEM_CA_BUNDLES
-            .iter()
-            .map(|candidate| std::path::Path::new(candidate)),
-    ) {
+    if let Some(ca_bundle) =
+        first_existing_regular_file(SYSTEM_CA_BUNDLES.iter().map(std::path::Path::new))
+    {
         overrides.push(format!("http.sslCAInfo={}", ca_bundle.display()));
     }
     if let Some(no_proxy) = no_proxy {
@@ -143,6 +141,11 @@ fn first_existing_regular_file<'a>(
 /// configured credential cascade entirely. The open policy above also clears
 /// helpers and askpass so proxy authentication and policy inspection stay
 /// hermetic.
+///
+/// gix fixes the callback's return type to its protocol error. The error is
+/// never constructed here, but clippy still measures the required `Result`
+/// layout.
+#[allow(clippy::result_large_err)]
 pub(crate) fn reject_credentials(
     _action: gix::credentials::helper::Action,
 ) -> gix::credentials::protocol::Result {

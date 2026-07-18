@@ -1213,7 +1213,7 @@ pub(crate) fn poll_startup(
 /// flush probe output before calling `force_reboot()`, and to the hvc0
 /// graceful-shutdown handler so it can drain on the watchdog
 /// soft-shutdown path. The success path's drain runs in
-/// [`start_sched_exit_monitor`] instead — it sees the scheduler exit
+/// [`super::dump::start_pending_sched_exit_monitor`] instead — it sees the scheduler exit
 /// notification and waits on `output_done` there. The payload travels
 /// the virtio bulk port (the probe thread `println!`s it to stdout,
 /// which `redirect_stdio_to_bulk_port` ships over the bulk port), NOT

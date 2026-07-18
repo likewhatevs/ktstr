@@ -2456,16 +2456,10 @@ mod tests {
 
     #[test]
     fn lifecycle_priority_suppresses_only_redundant_scheduler_live_copies() {
-        assert!(!lifecycle_priority_drops(
-            MsgType::SchedStdout.wire_value()
-        ));
+        assert!(!lifecycle_priority_drops(MsgType::SchedStdout.wire_value()));
         let priority = reserve_bulk_lifecycle_priority();
-        assert!(lifecycle_priority_drops(
-            MsgType::SchedStdout.wire_value()
-        ));
-        assert!(lifecycle_priority_drops(
-            MsgType::SchedStderr.wire_value()
-        ));
+        assert!(lifecycle_priority_drops(MsgType::SchedStdout.wire_value()));
+        assert!(lifecycle_priority_drops(MsgType::SchedStderr.wire_value()));
         assert!(
             !lifecycle_priority_drops(MsgType::Lifecycle.wire_value()),
             "required lifecycle traffic must bypass its own reservation"
@@ -2475,9 +2469,7 @@ mod tests {
             "authoritative non-scheduler frames must not be collateral drops"
         );
         drop(priority);
-        assert!(!lifecycle_priority_drops(
-            MsgType::SchedStdout.wire_value()
-        ));
+        assert!(!lifecycle_priority_drops(MsgType::SchedStdout.wire_value()));
     }
 
     #[test]

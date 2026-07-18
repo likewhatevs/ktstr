@@ -864,11 +864,8 @@ fn stalled_smart_http_response_is_aborted_by_the_real_gix_transport() {
         .expect("make fixture cancellable");
     let (server_lifetime, server_cancelled) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
-        let Some(mut stream) =
-            accept_until_cancelled(&listener, &server_cancelled).expect("accept gix request")
-        else {
-            return None;
-        };
+        let mut stream =
+            accept_until_cancelled(&listener, &server_cancelled).expect("accept gix request")?;
         let mut request = Vec::new();
         let mut byte = [0u8; 1];
         while !request.ends_with(b"\r\n\r\n") {

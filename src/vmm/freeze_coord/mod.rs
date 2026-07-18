@@ -582,33 +582,38 @@ fn watchdog_hard_deadline(run_start: Instant, timeout: Duration) -> Instant {
 /// Apply the attach-overlay gate at the watchdog caller, before ordinary
 /// Tier-3 or its soft-shutdown prefire can consume stale/dead monitor
 /// evidence. AP kill and attach-specific fail-closed bypass this helper.
-fn ordinary_watchdog_boundary_should_fire(
-    attach_overlay_active: bool,
-    boundary_reached: bool,
+struct DeadmanEvidence {
     monitor_live: bool,
     wall_since_milestone_ns: u64,
     cpu_trickle_stalled: bool,
     max_vcpu_cpu_in_phase_ns: u64,
     effective_deadline_budget_ns: u64,
     cpu_currency: u8,
+}
+
+fn ordinary_watchdog_boundary_should_fire(
+    attach_overlay_active: bool,
+    boundary_reached: bool,
+    evidence: DeadmanEvidence,
 ) -> bool {
     !attach_overlay_active
         && boundary_reached
         && watchdog_step::deadman_should_fire(
-            monitor_live,
-            wall_since_milestone_ns,
-            cpu_trickle_stalled,
-            max_vcpu_cpu_in_phase_ns,
-            effective_deadline_budget_ns,
-            cpu_currency,
+            evidence.monitor_live,
+            evidence.wall_since_milestone_ns,
+            evidence.cpu_trickle_stalled,
+            evidence.max_vcpu_cpu_in_phase_ns,
+            evidence.effective_deadline_budget_ns,
+            evidence.cpu_currency,
         )
 }
 
 #[cfg(test)]
 mod watchdog_reset_tag_tests {
     use super::{
-        KillReasonTag, WatchdogResetTag, decode_guest_phase, decode_watchdog_kill_reason,
-        ordinary_watchdog_boundary_should_fire, watchdog_hard_deadline,
+        DeadmanEvidence, KillReasonTag, WatchdogResetTag, decode_guest_phase,
+        decode_watchdog_kill_reason, ordinary_watchdog_boundary_should_fire,
+        watchdog_hard_deadline,
     };
     use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
@@ -619,12 +624,14 @@ mod watchdog_reset_tag_tests {
             ordinary_watchdog_boundary_should_fire(
                 overlay_active,
                 boundary_reached,
-                false, // dead monitor would ordinarily fire immediately
-                u64::MAX,
-                true,
-                u64::MAX,
-                1,
-                crate::monitor::CPU_CURRENCY_PMU,
+                DeadmanEvidence {
+                    monitor_live: false, // would ordinarily fire immediately
+                    wall_since_milestone_ns: u64::MAX,
+                    cpu_trickle_stalled: true,
+                    max_vcpu_cpu_in_phase_ns: u64::MAX,
+                    effective_deadline_budget_ns: 1,
+                    cpu_currency: crate::monitor::CPU_CURRENCY_PMU,
+                },
             )
         };
         assert!(otherwise_terminal(false, true));
@@ -13091,12 +13098,14 @@ impl KtstrVm {
                     let deadman_fire = ordinary_watchdog_boundary_should_fire(
                         attach_step.active,
                         hard_deadline_reached,
-                        monitor_live,
-                        wall_since_milestone_ns,
-                        cpu_trickle_stalled,
-                        snapshot.max_vcpu_cpu_in_phase_ns,
-                        effective_deadline_budget_ns,
-                        snapshot.cpu_currency,
+                        DeadmanEvidence {
+                            monitor_live,
+                            wall_since_milestone_ns,
+                            cpu_trickle_stalled,
+                            max_vcpu_cpu_in_phase_ns: snapshot.max_vcpu_cpu_in_phase_ns,
+                            effective_deadline_budget_ns,
+                            cpu_currency: snapshot.cpu_currency,
+                        },
                     );
                     if kill_set
                         || deadman_fire
@@ -13439,12 +13448,14 @@ impl KtstrVm {
                         && ordinary_watchdog_boundary_should_fire(
                             attach_step.active,
                             effective_soft.is_some_and(|d| Instant::now() >= d),
-                            monitor_live,
-                            wall_since_milestone_ns,
-                            cpu_trickle_stalled,
-                            snapshot.max_vcpu_cpu_in_phase_ns,
-                            effective_deadline_budget_ns,
-                            snapshot.cpu_currency,
+                            DeadmanEvidence {
+                                monitor_live,
+                                wall_since_milestone_ns,
+                                cpu_trickle_stalled,
+                                max_vcpu_cpu_in_phase_ns: snapshot.max_vcpu_cpu_in_phase_ns,
+                                effective_deadline_budget_ns,
+                                cpu_currency: snapshot.cpu_currency,
+                            },
                         )
                     {
                         soft_fired = true;

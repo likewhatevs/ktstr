@@ -88,9 +88,11 @@ required-features = ["{feature}"]
         ),
     )
     .expect("write member manifest");
-    let dependency_alias = (dependency != "ktstr")
-        .then(|| format!("extern crate {dependency} as ktstr;\n\n"))
-        .unwrap_or_default();
+    let dependency_alias = if dependency == "ktstr" {
+        String::new()
+    } else {
+        format!("extern crate {dependency} as ktstr;\n\n")
+    };
     std::fs::write(
         root.join("tests/scheduler.rs"),
         format!(

@@ -1617,7 +1617,7 @@ fn download_rc_tarball(
 /// commit cannot be read back from the tree. Modeled on
 /// [`download_rc_tarball`] (gzip decode; codeload carries no sha256
 /// manifest, so extraction is structurally verified —
-/// [`promote_single_kernel_tree`] rejects any top level that is not a
+/// [`promote_single_kernel_tree_transaction`] rejects any top level that is not a
 /// single plain directory (multi-entry, a file, or a symlink) — and
 /// the streamed digest is logged, not compared).
 pub(crate) fn download_github_archive(
@@ -2670,7 +2670,7 @@ fn anon_open_opts() -> gix::open::Options {
 /// receiving / resolving / checkout phases that gix reports a bounded
 /// total for; see the `crate::cli::progress` module.
 ///
-/// For a TAG ref use [`git_clone_tag`]. Both entry points share the
+/// For a TAG ref use the test-visible `git_clone_tag` wrapper. Both entry points share the
 /// same lower-level exact-ref fetch; the wrapper selects the native
 /// `refs/heads/*` or `refs/tags/*` source namespace.
 pub fn git_clone(
@@ -2758,7 +2758,7 @@ pub(crate) fn git_clone_kinded(
 }
 
 /// Shared shallow-clone implementation for [`git_clone`] (branch) and
-/// [`git_clone_tag`] (tag).
+/// `git_clone_tag` (tag).
 ///
 /// This deliberately uses gix's lower-level fetch API rather than
 /// `clone::PrepareFetch`. The clone helper adds the remote's `HEAD` to
@@ -2977,7 +2977,7 @@ impl GixCheckoutWorkerLease {
 
     fn acquire_in(lock_dir: &Path, wanted: usize) -> Self {
         let wanted = wanted.min(GIX_WORKERS_PER_OPERATION.saturating_sub(1));
-        if let Err(err) = std::fs::create_dir_all(&lock_dir) {
+        if let Err(err) = std::fs::create_dir_all(lock_dir) {
             tracing::warn!(
                 %err,
                 path = %lock_dir.display(),
