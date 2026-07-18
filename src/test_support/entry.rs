@@ -2900,13 +2900,27 @@ where
     map
 }
 
+/// Ordered JSON representation of one [`Sysctl`].
+///
+/// A scheduler may declare the same key more than once and the last write
+/// wins, so [`SchedulerJson::sysctls`] uses a sequence of these records rather
+/// than a JSON object. That preserves declaration order and duplicate keys as
+/// part of the scheduler's execution identity.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SysctlJson {
+    /// Dotted sysctl key (for example, `"kernel.sched_rr_timeslice_ms"`).
+    pub key: String,
+    /// Value written to the sysctl.
+    pub value: String,
+}
+
 /// JSON shape projected from a registered [`Scheduler`]. Each entry
-/// carries scheduler name, a [`BinaryKindJson`]-tagged binary
-/// specification (Discover / Path / Eevdf / KernelBuiltin),
-/// per-scheduler default [`TopologyJson`], always-on scheduler
-/// args, declared kernel set, and gauntlet constraints. Internal
-/// fields (assertion overrides, sysctls, kargs, cgroup parent,
-/// config-file plumbing) are intentionally omitted.
+/// carries the complete execution identity needed to compare declarations:
+/// scheduler name, a [`BinaryKindJson`]-tagged binary specification
+/// (Discover / Path / Eevdf / KernelBuiltin), guest setup, static scheduler
+/// configuration, per-scheduler default [`TopologyJson`], always-on scheduler
+/// args, declared kernel set, and gauntlet constraints. Assertion overrides
+/// and inline per-test config-file content are intentionally omitted.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchedulerJson {
     /// Scheduler name — the `name = "..."` value supplied to
@@ -2940,6 +2954,21 @@ pub struct SchedulerJson {
     pub topology: TopologyJson,
     /// Always-on scheduler CLI args.
     pub sched_args: Vec<String>,
+    /// Guest sysctls applied before scheduler startup, in declaration order.
+    ///
+    /// This remains a sequence instead of a map because duplicate keys are
+    /// meaningful: the last declared value wins.
+    #[serde(default)]
+    pub sysctls: Vec<SysctlJson>,
+    /// Extra guest kernel command-line arguments.
+    #[serde(default)]
+    pub kargs: Vec<String>,
+    /// Optional scheduler cgroup parent path.
+    #[serde(default)]
+    pub cgroup_parent: Option<String>,
+    /// Optional host-side static scheduler config-file path.
+    #[serde(default)]
+    pub config_file: Option<String>,
     /// Kernel specs (consumed by `cargo_ktstr::kernel::resolve_kernel_set`).
     pub kernels: Vec<String>,
     /// Named topology presets excluded only from the verifier matrix.
@@ -3198,6 +3227,17 @@ impl SchedulerJson {
                 threads_per_core: s.topology.threads_per_core,
             },
             sched_args: s.sched_args.iter().map(|a| a.to_string()).collect(),
+            sysctls: s
+                .sysctls
+                .iter()
+                .map(|sysctl| SysctlJson {
+                    key: sysctl.key().to_string(),
+                    value: sysctl.value().to_string(),
+                })
+                .collect(),
+            kargs: s.kargs.iter().map(|arg| arg.to_string()).collect(),
+            cgroup_parent: s.cgroup_parent.map(|parent| parent.as_str().to_string()),
+            config_file: s.config_file.map(str::to_string),
             kernels: s.kernels.iter().map(|k| k.to_string()).collect(),
             verifier_exclude_topologies: s
                 .verifier_exclude_topologies
@@ -6906,8 +6946,8 @@ mod tests {
     }
 
     /// `from_scheduler` copies `name`, the four topology dimensions,
-    /// `sched_args`, `kernels`, verifier exclusions, and every constraint field into the
-    /// wire shape. `EEVDF` defaults the topology to
+    /// execution setup, `sched_args`, `kernels`, verifier exclusions, and
+    /// every constraint field into the wire shape. `EEVDF` defaults the topology to
     /// 1 numa × 1 llc × 2 cores × 1 thread (see `Scheduler::EEVDF`),
     /// and the constraints to `TopologyConstraints::DEFAULT`. Pins
     /// every projected field so a mis-mapped dimension (e.g. swapping
@@ -6924,6 +6964,10 @@ mod tests {
         assert_eq!(json.topology.threads_per_core, 1);
         // EEVDF carries no sched_args, no kernel filter.
         assert!(json.sched_args.is_empty());
+        assert!(json.sysctls.is_empty());
+        assert!(json.kargs.is_empty());
+        assert!(json.cgroup_parent.is_none());
+        assert!(json.config_file.is_none());
         assert!(json.kernels.is_empty());
         assert!(json.verifier_exclude_topologies.is_empty());
         // Constraints mirror TopologyConstraints::DEFAULT.
@@ -6937,8 +6981,9 @@ mod tests {
     }
 
     /// Non-default fields round-trip through the projection: a
-    /// scheduler with an overridden topology, explicit `sched_args`,
-    /// `kernels`, and tightened `constraints` projects each verbatim.
+    /// scheduler with an overridden topology, explicit guest setup,
+    /// `sched_args`, `kernels`, and tightened `constraints` projects each
+    /// verbatim.
     /// `Scheduler::topology(numa, llcs, cores, threads)` maps the
     /// argument order to the `Topology` fields, so this also pins
     /// that the projection reads `num_numa_nodes()`/`num_llcs()`
@@ -6946,6 +6991,12 @@ mod tests {
     #[test]
     fn from_scheduler_projects_overridden_fields_verbatim() {
         static ARGS: &[&str] = &["--slice-us", "20000"];
+        static SYSCTLS: &[Sysctl] = &[
+            Sysctl::new("kernel.sched_rr_timeslice_ms", "10"),
+            Sysctl::new("kernel.sched_rr_timeslice_ms", "25"),
+            Sysctl::new("kernel.numa_balancing", "0"),
+        ];
+        static KARGS: &[&str] = &["nosmt", "iomem=relaxed"];
         static KERNELS: &[&str] = &["6.14", "6.15..6.16"];
         static VERIFIER_EXCLUDES: &[&str] = &["240cpu-15llc-nosmt"];
         let s = Scheduler::named("custom")
@@ -6953,6 +7004,10 @@ mod tests {
             // 2 numa × 4 llcs × 8 cores × 2 threads
             .topology(2, 4, 8, 2)
             .sched_args(ARGS)
+            .sysctls(SYSCTLS)
+            .kargs(KARGS)
+            .cgroup_parent("/custom")
+            .config_file("scheduler.toml")
             .kernels(KERNELS)
             .verifier_exclude_topologies(VERIFIER_EXCLUDES)
             .constraints(
@@ -6972,6 +7027,27 @@ mod tests {
         assert_eq!(json.topology.cores_per_llc, 8);
         assert_eq!(json.topology.threads_per_core, 2);
         assert_eq!(json.sched_args, vec!["--slice-us", "20000"]);
+        assert_eq!(
+            json.sysctls,
+            vec![
+                SysctlJson {
+                    key: "kernel.sched_rr_timeslice_ms".into(),
+                    value: "10".into(),
+                },
+                SysctlJson {
+                    key: "kernel.sched_rr_timeslice_ms".into(),
+                    value: "25".into(),
+                },
+                SysctlJson {
+                    key: "kernel.numa_balancing".into(),
+                    value: "0".into(),
+                },
+            ],
+            "sysctl projection must preserve order and duplicate keys",
+        );
+        assert_eq!(json.kargs, vec!["nosmt", "iomem=relaxed"]);
+        assert_eq!(json.cgroup_parent.as_deref(), Some("/custom"));
+        assert_eq!(json.config_file.as_deref(), Some("scheduler.toml"));
         assert_eq!(json.kernels, vec!["6.14", "6.15..6.16"]);
         assert_eq!(json.verifier_exclude_topologies, vec!["240cpu-15llc-nosmt"],);
         assert_eq!(json.constraints.min_numa_nodes, 2);
@@ -7022,6 +7098,71 @@ mod tests {
         let back: SchedulerJson =
             serde_json::from_value(value).expect("legacy SchedulerJson deserializes");
         assert!(back.manifest_dir.is_empty());
+    }
+
+    /// Execution-identity fields were added after the original scheduler-list
+    /// wire protocol. A CLI must still deserialize an older linked test binary
+    /// and treat every omitted field as its no-op declaration default.
+    #[test]
+    fn scheduler_json_missing_execution_identity_fields_default_empty() {
+        static SYSCTLS: &[Sysctl] = &[Sysctl::new("kernel.numa_balancing", "0")];
+        let json = SchedulerJson::from_scheduler(
+            &Scheduler::named("legacy")
+                .sysctls(SYSCTLS)
+                .kargs(&["nosmt"])
+                .cgroup_parent("/legacy")
+                .config_file("legacy.toml"),
+        );
+        let mut value = serde_json::to_value(json).expect("serialize SchedulerJson");
+        let object = value
+            .as_object_mut()
+            .expect("SchedulerJson serializes as an object");
+        for field in ["sysctls", "kargs", "cgroup_parent", "config_file"] {
+            assert!(
+                object.remove(field).is_some(),
+                "fixture must contain {field}"
+            );
+        }
+        let back: SchedulerJson =
+            serde_json::from_value(value).expect("legacy SchedulerJson deserializes");
+        assert!(back.sysctls.is_empty());
+        assert!(back.kargs.is_empty());
+        assert!(back.cgroup_parent.is_none());
+        assert!(back.config_file.is_none());
+    }
+
+    /// `SchedulerJson` equality is the declaration identity used by recursive
+    /// verifier discovery. Every execution setup field must therefore make an
+    /// otherwise same-name declaration unequal.
+    #[test]
+    fn scheduler_json_execution_fields_participate_in_identity() {
+        static SYSCTLS: &[Sysctl] = &[Sysctl::new("kernel.numa_balancing", "0")];
+        static SYSCTLS_AB: &[Sysctl] = &[
+            Sysctl::new("kernel.sched_rr_timeslice_ms", "10"),
+            Sysctl::new("kernel.sched_rr_timeslice_ms", "25"),
+        ];
+        static SYSCTLS_BA: &[Sysctl] = &[
+            Sysctl::new("kernel.sched_rr_timeslice_ms", "25"),
+            Sysctl::new("kernel.sched_rr_timeslice_ms", "10"),
+        ];
+        let baseline = SchedulerJson::from_scheduler(&Scheduler::named("same"));
+        let variants = [
+            SchedulerJson::from_scheduler(&Scheduler::named("same").sysctls(SYSCTLS)),
+            SchedulerJson::from_scheduler(&Scheduler::named("same").kargs(&["nosmt"])),
+            SchedulerJson::from_scheduler(&Scheduler::named("same").cgroup_parent("/identity")),
+            SchedulerJson::from_scheduler(&Scheduler::named("same").config_file("identity.toml")),
+        ];
+        for variant in variants {
+            assert_ne!(
+                variant, baseline,
+                "execution setup must participate in SchedulerJson identity",
+            );
+        }
+        assert_ne!(
+            SchedulerJson::from_scheduler(&Scheduler::named("same").sysctls(SYSCTLS_AB)),
+            SchedulerJson::from_scheduler(&Scheduler::named("same").sysctls(SYSCTLS_BA)),
+            "sysctl declaration order must participate in SchedulerJson identity",
+        );
     }
 
     /// [`SchedulerListEntry`] — the `--ktstr-list-schedulers` wire element (a

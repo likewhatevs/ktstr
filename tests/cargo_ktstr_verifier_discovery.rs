@@ -2,8 +2,8 @@
 //!
 //! The fixture uses two workspace members whose scheduler declarations live in
 //! differently named, feature-gated integration-test binaries. Both declare
-//! the same scheduler name with intentionally different arguments. The real
-//! cargo-ktstr process must therefore:
+//! the same scheduler name with intentionally different guest execution
+//! settings. The real cargo-ktstr process must therefore:
 //!
 //! 1. widen a bare verifier invocation to the full workspace;
 //! 2. infer and package-qualify both optional-ktstr feature roots;
@@ -49,7 +49,8 @@ fn write_member(
     package: &str,
     dependency: &str,
     feature: &str,
-    scheduler_args: &str,
+    identity: &str,
+    sysctl_value: &str,
     ktstr_root: &Path,
 ) {
     let root = workspace.join(package);
@@ -97,11 +98,16 @@ required-features = ["{feature}"]
         root.join("tests/scheduler.rs"),
         format!(
             r#"{dependency_alias}use ktstr::declare_scheduler;
+use ktstr::test_support::Sysctl;
 
 declare_scheduler!(RECURSIVE_DISCOVERY_SCHEDULER, {{
     name = "recursive-discovery-shared",
     binary_path = "/bin/true",
-    sched_args = ["{scheduler_args}"],
+    sched_args = ["--shared"],
+    sysctls = [Sysctl::new("kernel.numa_balancing", "{sysctl_value}")],
+    kargs = ["identity={identity}"],
+    cgroup_parent = "/{identity}",
+    config_file = "{identity}.toml",
 }});
 
 #[test]
@@ -131,7 +137,8 @@ fn bare_verifier_recursively_discovers_feature_gated_workspace_test_binaries() {
         "alpha",
         "ktstr",
         "scheduler-tests",
-        "--from-alpha",
+        "alpha",
+        "0",
         &ktstr_root,
     );
     write_member(
@@ -139,7 +146,8 @@ fn bare_verifier_recursively_discovers_feature_gated_workspace_test_binaries() {
         "beta",
         "test_harness",
         "verifier-fixtures",
-        "--from-beta",
+        "beta",
+        "1",
         &ktstr_root,
     );
 
@@ -180,10 +188,21 @@ fn bare_verifier_recursively_discovers_feature_gated_workspace_test_binaries() {
             && stderr.contains("recursive-discovery-shared"),
         "both registries should meet at declaration conflict detection:\n{stderr}",
     );
-    assert!(
-        stderr.contains("--from-alpha") && stderr.contains("--from-beta"),
-        "the conflict must contain declarations from both feature-gated test binaries:\n{stderr}",
-    );
+    for marker in [
+        "kernel.numa_balancing",
+        "identity=alpha",
+        "identity=beta",
+        "/alpha",
+        "/beta",
+        "alpha.toml",
+        "beta.toml",
+    ] {
+        assert!(
+            stderr.contains(marker),
+            "the conflict must include execution-identity marker {marker:?} from both \
+             feature-gated test binaries:\n{stderr}",
+        );
+    }
     assert!(
         !stderr.contains("dispatching to nextest (verifier/ cells only)"),
         "the discovery conflict must abort before the KVM-running nextest phase:\n{stderr}",

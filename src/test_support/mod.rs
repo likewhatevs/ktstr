@@ -156,8 +156,8 @@ pub use dispatch::{
 pub use entry::{
     BinaryKindJson, BpfMapAgg, BpfMapWrite, CgroupPath, KTSTR_SCHEDULERS, KTSTR_TESTS,
     KtstrTestEntry, MemSideCache, NumaDistance, NumaNode, PerfDeltaAssertion, Scheduler,
-    SchedulerJson, SchedulerListEntry, SchedulerSpec, SchedulerTestJson, Sysctl, Topology,
-    TopologyConstraints, TopologyConstraintsJson, TopologyJson, WatchBpfMap,
+    SchedulerJson, SchedulerListEntry, SchedulerSpec, SchedulerTestJson, Sysctl, SysctlJson,
+    Topology, TopologyConstraints, TopologyConstraintsJson, TopologyJson, WatchBpfMap,
     default_post_vm_periodic_fired, find_scheduler, find_test,
 };
 pub use eval::{KernelUnavailable, ResolveSource, resolve_scheduler, resolve_test_kernel};

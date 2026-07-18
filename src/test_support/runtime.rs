@@ -211,9 +211,13 @@ pub(crate) fn perf_only_skips_entry(entry: &KtstrTestEntry) -> bool {
 }
 
 /// Derive initramfs archive path, host path, and guest path from a
-/// scheduler's `config_file`. Returns `None` when no config file is set.
-pub(crate) fn config_file_parts(entry: &KtstrTestEntry) -> Option<(String, PathBuf, String)> {
-    let config_path = entry.scheduler.config_file?;
+/// scheduler's static `config_file`. This scheduler-only projection is shared
+/// by ordinary test VMs and generated verifier cells so both launch the same
+/// declaration instead of silently dropping the verifier's config.
+pub(crate) fn scheduler_config_file_parts(
+    scheduler: &super::entry::Scheduler,
+) -> Option<(String, PathBuf, String)> {
+    let config_path = scheduler.config_file?;
     let file_name = Path::new(config_path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -221,6 +225,11 @@ pub(crate) fn config_file_parts(entry: &KtstrTestEntry) -> Option<(String, PathB
     let archive_path = format!("include-files/{file_name}");
     let guest_path = format!("/include-files/{file_name}");
     Some((archive_path, PathBuf::from(config_path), guest_path))
+}
+
+/// Entry-shaped compatibility wrapper for the ordinary test launch paths.
+pub(crate) fn config_file_parts(entry: &KtstrTestEntry) -> Option<(String, PathBuf, String)> {
+    scheduler_config_file_parts(entry.scheduler)
 }
 
 /// Stable u64 hash of arbitrary string content.
@@ -301,14 +310,25 @@ pub(crate) fn config_content_parts(
 /// `unknown-unknown` fallback. Anything the two VM-launch sites
 /// (`run_ktstr_test_inner` and `attempt_auto_repro`) previously
 /// re-implemented side-by-side lives here.
-pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    for s in entry.scheduler.sysctls {
+/// Ordered guest-kernel cmdline tokens owned by a scheduler declaration.
+///
+/// Keep this projection independent of `KtstrTestEntry`: generated verifier
+/// cells have a scheduler but no test entry, and booting them without these
+/// tokens can change scheduler startup, BPF rodata, and verifier instruction
+/// counts. Sysctls precede raw kargs exactly as on the ordinary test path.
+pub(crate) fn scheduler_cmdline_tokens(scheduler: &super::entry::Scheduler) -> Vec<String> {
+    let mut parts = Vec::new();
+    for s in scheduler.sysctls {
         parts.push(format!("sysctl.{}={}", s.key(), s.value()));
     }
-    for &karg in entry.scheduler.kargs {
+    for &karg in scheduler.kargs {
         parts.push(karg.to_string());
     }
+    parts
+}
+
+pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
+    let mut parts = scheduler_cmdline_tokens(entry.scheduler);
     // Per-test KASLR opt-out (see `KtstrTestEntry.kaslr` doc). The base
     // cmdline `base_guest_cmdline` at `src/vmm/setup/mod.rs` does NOT
     // inject `nokaslr` by default — KASLR is on. A test that needs determinism sets `kaslr = false` in

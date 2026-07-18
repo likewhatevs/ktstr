@@ -638,6 +638,15 @@ fn scheduler_json_serde_roundtrip() {
         BinaryKindJson::Discover("scx-full".to_string())
     );
     assert_eq!(back.sched_args, vec!["--a", "--b"]);
+    assert_eq!(back.sysctls.len(), 1);
+    assert_eq!(back.sysctls[0].key, "kernel.k");
+    assert_eq!(back.sysctls[0].value, "v");
+    assert_eq!(back.kargs, vec!["nosmt"]);
+    assert_eq!(
+        back.cgroup_parent.as_deref(),
+        Some("/declare_scheduler_full"),
+    );
+    assert_eq!(back.config_file.as_deref(), Some("cfg.toml"));
     assert_eq!(back.kernels, vec!["6.14", "7.0..7.2"]);
     assert_eq!(
         back.verifier_exclude_topologies,

@@ -1167,6 +1167,55 @@ impl VerifierVmResult {
     }
 }
 
+/// Complete scheduler-owned launch environment for one verifier VM.
+///
+/// Generated cells build this from the linked [`crate::test_support::Scheduler`]
+/// declaration so verifier and ordinary test boots agree on every
+/// scheduler-wide input which can affect startup or BPF verification. Direct
+/// API callers retain their historical explicit-CLI-only behavior through
+/// [`Self::direct`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifierSchedulerLaunchPlan {
+    sched_args: Vec<String>,
+    cmdline_extra: String,
+    include_files: Vec<(String, PathBuf)>,
+    scheduler_cgroup_parent: Option<String>,
+}
+
+impl VerifierSchedulerLaunchPlan {
+    fn direct(extra_sched_args: &[String]) -> Self {
+        Self {
+            sched_args: extra_sched_args.to_vec(),
+            cmdline_extra: String::new(),
+            include_files: Vec::new(),
+            scheduler_cgroup_parent: None,
+        }
+    }
+
+    pub(crate) fn from_scheduler(scheduler: &crate::test_support::Scheduler) -> Self {
+        let mut sched_args = Vec::new();
+        let mut include_files = Vec::new();
+        if let Some((archive_path, host_path, guest_path)) =
+            crate::test_support::runtime::scheduler_config_file_parts(scheduler)
+        {
+            include_files.push((archive_path, host_path));
+            sched_args.push("--config".to_string());
+            sched_args.push(guest_path);
+        }
+        sched_args.extend(scheduler.sched_args.iter().map(|arg| arg.to_string()));
+
+        Self {
+            sched_args,
+            cmdline_extra: crate::test_support::runtime::scheduler_cmdline_tokens(scheduler)
+                .join(" "),
+            include_files,
+            scheduler_cgroup_parent: scheduler
+                .cgroup_parent
+                .map(|parent| parent.as_str().to_string()),
+        }
+    }
+}
+
 /// Boot a VM and collect verifier statistics via host-side memory
 /// introspection. Per-program `verified_insns` comes from
 /// `bpf_prog_aux->verified_insns` read through the guest's physical
@@ -1192,11 +1241,12 @@ pub fn collect_verifier_output(
     forced_cpu_budget: Option<u32>,
 ) -> anyhow::Result<VerifierVmResult> {
     let memory_min_mib = crate::test_support::runtime::cpu_scaled_memory_mib(topology.total_cpus());
+    let launch = VerifierSchedulerLaunchPlan::direct(extra_sched_args);
     collect_verifier_output_with_memory_min(
         sched_bin,
         ktstr_bin,
         kernel,
-        extra_sched_args,
+        &launch,
         topology,
         memory_min_mib,
         forced_cpu_budget,
@@ -1213,7 +1263,7 @@ pub(crate) fn collect_verifier_output_with_memory_min(
     sched_bin: &std::path::Path,
     ktstr_bin: &std::path::Path,
     kernel: &std::path::Path,
-    extra_sched_args: &[String],
+    launch: &VerifierSchedulerLaunchPlan,
     topology: crate::vmm::topology::Topology,
     memory_min_mib: u32,
     forced_cpu_budget: Option<u32>,
@@ -1230,8 +1280,6 @@ pub(crate) fn collect_verifier_output_with_memory_min(
     validated
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid topology {validated:?}: {e}"))?;
-
-    let sched_args: Vec<String> = extra_sched_args.to_vec();
 
     // The verifier only loads the scheduler's BPF and reads the kernel
     // verifier's load-time `verified_insns` counts via host-side
@@ -1280,7 +1328,8 @@ pub(crate) fn collect_verifier_output_with_memory_min(
             .initrd_compression(crate::cache::initrd_compression_for_image(kernel))
             .init_binary(ktstr_bin)
             .scheduler_binary(sched_bin)
-            .sched_args(&sched_args)
+            .sched_args(&launch.sched_args)
+            .cmdline(&launch.cmdline_extra)
             // Boot the guest into the verifier dispatch probe: the sweep VM
             // has no `#[ktstr_test]` body, so Phase 5 spawns a SpinWait
             // workload and emits `WorkloadDispatched` on confirmed progress.
@@ -1302,6 +1351,12 @@ pub(crate) fn collect_verifier_output_with_memory_min(
             ))
             .workload_duration(crate::test_support::runtime::VERIFIER_WORKLOAD_BUDGET)
             .no_perf_mode(true);
+        if !launch.include_files.is_empty() {
+            builder = builder.include_files(launch.include_files.clone());
+        }
+        if let Some(parent) = launch.scheduler_cgroup_parent.as_ref() {
+            builder = builder.scheduler_cgroup_parent(parent.clone());
+        }
         // A preset with a forced CPU budget (192cpu-11llc-smt) pins the
         // no-perf mask to that many host CPUs so its vCPUs ALWAYS
         // overcommit — the deliberate, continuous time-slicing path.
@@ -2132,6 +2187,72 @@ pub fn render_instruction_count_tables(records: &[VerifierCellRecord]) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_scheduler_launch_plan_preserves_boot_environment_and_order() {
+        use crate::test_support::{Scheduler, Sysctl};
+
+        const SYSCTLS: &[Sysctl] = &[
+            Sysctl::new("kernel.ktstr_first", "1"),
+            Sysctl::new("kernel.ktstr_second", "2"),
+        ];
+        const KARGS: &[&str] = &["ktstr_first_karg=one", "ktstr_second_karg=two"];
+        const SCHED_ARGS: &[&str] = &["--mode", "verifier"];
+        let scheduler = Scheduler::named("launch-plan")
+            .sysctls(SYSCTLS)
+            .kargs(KARGS)
+            .cgroup_parent("/ktstr-verifier")
+            .config_file("/host/configs/verifier.toml")
+            .sched_args(SCHED_ARGS);
+
+        let plan = VerifierSchedulerLaunchPlan::from_scheduler(&scheduler);
+        assert_eq!(
+            plan.cmdline_extra,
+            "sysctl.kernel.ktstr_first=1 sysctl.kernel.ktstr_second=2 \
+             ktstr_first_karg=one ktstr_second_karg=two"
+        );
+        assert_eq!(
+            plan.include_files,
+            vec![(
+                "include-files/verifier.toml".to_string(),
+                PathBuf::from("/host/configs/verifier.toml"),
+            )]
+        );
+        assert_eq!(
+            plan.sched_args,
+            [
+                "--config",
+                "/include-files/verifier.toml",
+                "--mode",
+                "verifier"
+            ]
+        );
+        assert_eq!(
+            plan.scheduler_cgroup_parent.as_deref(),
+            Some("/ktstr-verifier")
+        );
+    }
+
+    #[test]
+    fn inline_config_definition_without_test_content_is_not_fabricated() {
+        use crate::test_support::Scheduler;
+
+        let scheduler = Scheduler::named("inline-template")
+            .config_file_def("--config={file}", "/include-files/inline.json")
+            .sched_args(&["--mode", "baseline"]);
+        let plan = VerifierSchedulerLaunchPlan::from_scheduler(&scheduler);
+        assert!(plan.include_files.is_empty());
+        assert_eq!(plan.sched_args, ["--mode", "baseline"]);
+    }
+
+    #[test]
+    fn direct_verifier_api_retains_explicit_cli_only_launch_shape() {
+        let plan = VerifierSchedulerLaunchPlan::direct(&["--direct".into(), "value".into()]);
+        assert_eq!(plan.sched_args, ["--direct", "value"]);
+        assert!(plan.cmdline_extra.is_empty());
+        assert!(plan.include_files.is_empty());
+        assert!(plan.scheduler_cgroup_parent.is_none());
+    }
 
     #[test]
     fn terminal_scheduler_stream_requires_completion_and_overrides_live_atomically() {

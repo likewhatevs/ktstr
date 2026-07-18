@@ -2257,7 +2257,7 @@ fn run_verifier_cell_inner(
     let topology = preset.topology;
     let memory_min_mib =
         super::runtime::verifier_preset_memory_min_mib(topology.total_cpus(), preset.memory_mib);
-    let sched_args: Vec<String> = sched.sched_args.iter().map(|s| s.to_string()).collect();
+    let launch = crate::verifier::VerifierSchedulerLaunchPlan::from_scheduler(sched);
 
     // Raw mode is opt-in via the dispatcher's --raw flag, plumbed
     // through KTSTR_VERIFIER_RAW_ENV. Presence (any value, including
@@ -2270,7 +2270,7 @@ fn run_verifier_cell_inner(
         &sched_bin,
         &ktstr_bin,
         &kernel_path,
-        &sched_args,
+        &launch,
         topology,
         memory_min_mib,
         preset.forced_cpu_budget,
