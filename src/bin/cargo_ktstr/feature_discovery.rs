@@ -667,10 +667,6 @@ fn dependency_matches_target_context(
 /// Whether one target participates in `cargo test`/nextest harness discovery.
 fn target_has_test_harness(target: &cargo_metadata::Target) -> bool {
     target.test
-        && target
-            .kind
-            .iter()
-            .any(|kind| matches!(kind, cargo_metadata::TargetKind::Test))
 }
 
 fn semantic_name_mentions_ktstr(name: &str, aliases: &HashSet<&str>) -> bool {
@@ -1764,6 +1760,16 @@ unrelated-mode = []
             "test":true,
             "doc":false
         },{
+            "name":"scheduler_test_cli",
+            "kind":["bin"],
+            "crate_types":["bin"],
+            "required-features":["ktstr-bin-tests"],
+            "src_path":"/w/scheduler/src/bin/scheduler_test_cli.rs",
+            "edition":"2024",
+            "doctest":false,
+            "test":true,
+            "doc":false
+        },{
             "name":"unrelated_cli",
             "kind":["bin"],
             "crate_types":["bin"],
@@ -1780,6 +1786,7 @@ unrelated-mode = []
             "=0.42.0",
             r#"{
                 "ktstr-tests":[],
+                "ktstr-bin-tests":[],
                 "other-tests":[],
                 "bin-mode":[],
                 "mixed-mode":["unrelated"],
@@ -1792,9 +1799,10 @@ unrelated-mode = []
             serde_json::from_str(&json).expect("required-feature package fixture deserializes");
         assert_eq!(
             infer_ktstr_feature_roots(&package, VersionScope::Any),
-            vec!["ktstr-tests"],
-            "a semantically named empty source gate is enabled for the verifier target, while \
-             unrelated empty/composite gates cannot broaden inference",
+            vec!["ktstr-bin-tests", "ktstr-tests"],
+            "semantically named empty source gates are enabled for integration-test and \
+             test-enabled binary harnesses, while unrelated empty/composite gates cannot \
+             broaden inference",
         );
     }
 

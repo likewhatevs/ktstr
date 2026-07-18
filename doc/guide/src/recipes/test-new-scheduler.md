@@ -257,14 +257,18 @@ fn my_sched_runs(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-Build a kernel once (section 3), then run the gated tests. The
-feature flag rides the nextest passthrough after `--`:
+Build a kernel once (section 3), then run the gated tests:
 
 ```sh
 cargo ktstr kernel build --kernel /path/to/linux
-cargo ktstr test --kernel /path/to/linux -- --features ktstr-tests
+cargo ktstr test --kernel /path/to/linux
 ```
 
-`cargo ktstr test` forwards everything after `--` to
-`cargo nextest run`, which routes `--features ktstr-tests` to the
-test compile.
+`cargo ktstr test` inspects Cargo metadata and automatically enables
+the narrow `ktstr-tests = ["dep:ktstr"]` feature for the selected
+package. A gate that also enables unrelated functionality cannot be
+proven ktstr-only and remains explicit through the nextest passthrough:
+
+```sh
+cargo ktstr test --kernel /path/to/linux -- --features ktstr-with-extra
+```
