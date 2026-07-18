@@ -358,6 +358,63 @@ pub(crate) fn wprof_artifacts_received_latch() -> Arc<Latch> {
         .clone()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HvcControlEvent {
+    Signal(u8),
+    AttachControl(crate::vmm::wire::AttachControlPacket),
+}
+
+#[derive(Default)]
+struct HvcControlDecoder {
+    attach_control: Vec<u8>,
+}
+
+impl HvcControlDecoder {
+    fn push(&mut self, bytes: &[u8]) -> Vec<HvcControlEvent> {
+        let mut events = Vec::new();
+        for &byte in bytes {
+            self.push_byte(byte, &mut events);
+        }
+        events
+    }
+
+    fn push_byte(&mut self, byte: u8, events: &mut Vec<HvcControlEvent>) {
+        use crate::vmm::wire::{
+            ATTACH_CONTROL_PACKET_SIZE, decode_attach_control, is_attach_control_signal,
+        };
+
+        if self.attach_control.is_empty() {
+            if is_attach_control_signal(byte) {
+                self.attach_control.push(byte);
+            } else {
+                events.push(HvcControlEvent::Signal(byte));
+            }
+            return;
+        }
+
+        if byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase() {
+            self.attach_control.push(byte);
+            if self.attach_control.len() == ATTACH_CONTROL_PACKET_SIZE {
+                match decode_attach_control(&self.attach_control) {
+                    Some(packet) => events.push(HvcControlEvent::AttachControl(packet)),
+                    None => tracing::warn!(
+                        "ktstr-init: rejected malformed scheduler-attach control packet"
+                    ),
+                }
+                self.attach_control.clear();
+            }
+            return;
+        }
+
+        // A malformed suffix does not swallow the byte which exposed it.
+        // Re-run that byte through the idle state so a regular control signal
+        // or a fresh typed packet prefix is still delivered.
+        tracing::warn!("ktstr-init: discarded malformed scheduler-attach control prefix");
+        self.attach_control.clear();
+        self.push_byte(byte, events);
+    }
+}
+
 /// Start the hvc0 wake-byte poll loop.
 ///
 /// Spawns a background thread that polls `/dev/hvc0` for host→guest
@@ -384,18 +441,70 @@ pub(crate) fn wprof_artifacts_received_latch() -> Arc<Latch> {
 pub(crate) fn start_hvc0_poll(
     trace_stop: Option<Arc<AtomicBool>>,
     probe_drain: Option<super::scheduler::ProbeDrain>,
-) -> Option<Arc<AtomicBool>> {
+) -> std::io::Result<Arc<AtomicBool>> {
+    let hvc0 = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(HVC0)?;
+    let mut tio = nix::sys::termios::tcgetattr(&hvc0)
+        .map_err(|error| std::io::Error::other(format!("tcgetattr({HVC0}): {error}")))?;
+    nix::sys::termios::cfmakeraw(&mut tio);
+    nix::sys::termios::tcsetattr(&hvc0, nix::sys::termios::SetArg::TCSANOW, &tio)
+        .map_err(|error| std::io::Error::other(format!("tcsetattr({HVC0}): {error}")))?;
+    super::scheduler::scheduler_attach_control_reader_started().map_err(|error| {
+        std::io::Error::other(format!(
+            "publish hvc0 scheduler-attach control reader start: {error}"
+        ))
+    })?;
+
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();
 
-    std::thread::Builder::new()
+    let spawn_result = std::thread::Builder::new()
         .name("hvc0-poll".into())
         .spawn(move || {
-            hvc0_poll_loop(&stop_clone, trace_stop.as_deref(), probe_drain.as_ref());
-        })
-        .ok();
+            let reason = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                hvc0_poll_loop(
+                    hvc0,
+                    &stop_clone,
+                    trace_stop.as_deref(),
+                    probe_drain.as_ref(),
+                )
+            })) {
+                Ok(reason) => reason,
+                Err(payload) => {
+                    let detail = payload
+                        .downcast_ref::<&str>()
+                        .map(|message| (*message).to_owned())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic payload".into());
+                    format!("hvc0 control reader panicked: {detail}")
+                }
+            };
+            if let Err(error) =
+                super::scheduler::scheduler_attach_control_reader_terminated(reason.clone())
+            {
+                tracing::error!(
+                    reason,
+                    error = %error,
+                    "ktstr-init: failed to publish hvc0 control-reader termination"
+                );
+            }
+        });
+    if let Err(error) = spawn_result {
+        let reason = format!("spawn hvc0 control reader: {error}");
+        if let Err(publish_error) =
+            super::scheduler::scheduler_attach_control_reader_terminated(reason.clone())
+        {
+            tracing::error!(
+                error = %publish_error,
+                "ktstr-init: failed to publish hvc0 control-reader spawn failure"
+            );
+        }
+        return Err(std::io::Error::other(reason));
+    }
 
-    Some(stop)
+    Ok(stop)
 }
 
 /// Poll `/dev/hvc0` for host→guest wake bytes and dispatch SysRq-D /
@@ -420,83 +529,30 @@ pub(crate) fn start_hvc0_poll(
 ///      pipeline so it emits over the bulk port, set `trace_stop`,
 ///      disable tracing, flush stdio + serial) and breaks.
 fn hvc0_poll_loop(
+    hvc0: fs::File,
     stop: &AtomicBool,
     trace_stop: Option<&AtomicBool>,
     probe_drain: Option<&super::scheduler::ProbeDrain>,
-) {
+) -> String {
     use std::os::unix::io::AsRawFd;
 
-    // Open the virtio-console wake fd. Failure here used to be
-    // `.expect()`d, which panicked the worker thread; the
-    // process-wide panic hook installed at PID-1 entry calls
-    // `force_reboot()`, so a transient open failure (e.g. devtmpfs
-    // not yet populated when the thread spawns) tore the VM down
-    // before any test could dispatch. Log + return instead so the
-    // poll loop simply doesn't deliver wake bytes for this boot —
-    // tests that rely on `bpf_map_write` notification will time out
-    // on their `wait_for_map_write` latch with a recoverable error
-    // instead of a forced reboot.
-    let hvc0 = match fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(HVC0)
-    {
-        Ok(f) => f,
-        Err(e) => {
-            write_com2(&format!(
-                "ktstr-init: hvc0 poll loop disabled — open {HVC0}: {e}"
-            ));
-            return;
-        }
-    };
-    // /dev/hvc0 is an hvc tty whose kernel-default termios has ICANON
-    // set. N_TTY canonical mode only makes input visible to
-    // poll(POLLIN)/read() on a line boundary: __receive_buf returns
-    // before the EPOLLIN wake when `icanon && !L_EXTPROC`, and
-    // input_available_p reports readable only once canon_head advances
-    // (on a `\n`/EOL). The host's wake bytes (SIGNAL_VC_DUMP,
-    // SIGNAL_BPF_WRITE_DONE, SIGNAL_ACCESSOR_READY, SIGNAL_VC_SHUTDOWN)
-    // are single non-newline bytes, so in canonical mode they sit in the
-    // canon buffer and never wake this loop. hvc registers
-    // TTY_DRIVER_REAL_RAW, but n_tty_set_termios forces real_raw=0 while
-    // ICANON is set, so the driver flag is inert until userspace clears
-    // ICANON. Put the fd in raw mode (clearing ICANON) so every byte is
-    // immediately poll-visible — mirrors the COM2 raw-mode setup in
-    // `modes.rs`. The host-side virtio-console delivery is already
-    // correct (RX descriptors are posted at probe, the byte is written
-    // and the guest IRQ is raised); this gate is purely the guest
-    // reader's line discipline, so the fix belongs here, not host-side.
-    // A tcgetattr/tcsetattr failure is logged rather than swallowed:
-    // without raw mode the loop reverts to canonical gating and silently
-    // misses single-byte wakes — the exact silent hang this exists to
-    // kill — so the failure must be diagnosable.
-    match nix::sys::termios::tcgetattr(&hvc0) {
-        Ok(mut tio) => {
-            nix::sys::termios::cfmakeraw(&mut tio);
-            if let Err(e) =
-                nix::sys::termios::tcsetattr(&hvc0, nix::sys::termios::SetArg::TCSANOW, &tio)
-            {
-                write_com2(&format!(
-                    "ktstr-init: hvc0 raw-mode tcsetattr failed: {e}; poll loop \
-                     stays canonical and may miss single-byte wake signals"
-                ));
-            }
-        }
-        Err(e) => write_com2(&format!(
-            "ktstr-init: hvc0 raw-mode tcgetattr failed: {e}; poll loop stays \
-             canonical and may miss single-byte wake signals"
-        )),
-    }
+    // The caller opened the device and established raw mode synchronously
+    // before spawning this thread. AttachStarted cannot be published until
+    // that succeeds, so every host cancellation has a live reader.
     let poll_timeout_ms: PollTimeout = 1000u16.into();
+    let mut decoder = HvcControlDecoder::default();
 
-    while !stop.load(Ordering::Acquire) {
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return "hvc0 control reader stop flag set".into();
+        }
         let borrowed = unsafe { BorrowedFd::borrow_raw(hvc0.as_raw_fd()) };
         let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
         match poll(&mut fds, poll_timeout_ms) {
             Ok(0) => continue,
             Ok(_) => {}
             Err(nix::errno::Errno::EINTR) => continue,
-            Err(_) => break,
+            Err(error) => return format!("poll({HVC0}) failed: {error}"),
         }
         // Inspect revents before reading: a host-side virtio-console
         // disconnect raises POLLHUP/POLLERR permanently, and without
@@ -509,16 +565,16 @@ fn hvc0_poll_loop(
         // skip the read on a wake without POLLIN.
         if let Some(revents) = fds[0].revents() {
             if revents.intersects(PollFlags::POLLERR | PollFlags::POLLNVAL) {
-                break;
+                return format!("poll({HVC0}) returned terminal revents {revents:?}");
             }
             if !revents.contains(PollFlags::POLLIN) {
                 if revents.contains(PollFlags::POLLHUP) {
-                    break;
+                    return format!("poll({HVC0}) returned hangup without readable data");
                 }
                 continue;
             }
         }
-        let mut buf = [0u8; 16];
+        let mut buf = [0u8; 64];
         let mut hvc_ref: &fs::File = &hvc0;
         // Retry on EINTR (the read was interrupted by a signal before
         // returning data). The previous `unwrap_or(0)` collapsed both
@@ -526,50 +582,79 @@ fn hvc0_poll_loop(
         // (drops a real wake byte) and permanent device errors (silent
         // hang in the next poll iteration). Treat:
         //   - Ok(n): consume n bytes and dispatch signals below. An
-        //     `Ok(0)` here is rare (poll already confirmed POLLIN)
-        //     but harmless — the byte-contains checks no-op and the
-        //     outer loop iterates normally, same as the original
-        //     `unwrap_or(0)` behaviour for that case.
+        //     `Ok(0)` after POLLIN means the control stream reached EOF,
+        //     so terminate the reader and publish that exact health reason.
         //   - EINTR: retry the read inline; poll already confirmed
         //     POLLIN, so the wake byte is still in the device's RX
         //     queue waiting to be drained.
-        //   - other Err: log via tracing::warn and break the outer
-        //     poll loop. A non-EINTR read error after POLLIN means
+        //   - other Err: log via tracing::warn and terminate the reader
+        //     with the exact I/O error. A non-EINTR error after POLLIN means
         //     the device is in an unrecoverable state (host-side
         //     disconnect that didn't surface as POLLHUP, kernel-side
         //     I/O error, fd revoked) and continuing would either
         //     spin on the same error or silently miss every wake
         //     byte for the rest of the run.
-        let n = 'read_retry: loop {
+        let n = loop {
             match hvc_ref.read(&mut buf) {
-                Ok(n) => break 'read_retry Some(n),
+                Ok(0) => return format!("read({HVC0}) returned EOF"),
+                Ok(n) => break n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => {
                     tracing::warn!(
                         err = %e,
                         "ktstr-init: hvc0 read failed; aborting poll loop"
                     );
-                    break 'read_retry None;
+                    return format!("read({HVC0}) failed: {e}");
                 }
             }
         };
-        let Some(n) = n else { break };
-        if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_VC_DUMP) {
-            let _ = fs::write("/proc/sysrq-trigger", "D");
+        let mut shutdown = false;
+        for event in decoder.push(&buf[..n]) {
+            match event {
+                HvcControlEvent::AttachControl(packet) => {
+                    let delivery = match packet {
+                        crate::vmm::wire::AttachControlPacket::StartedAck { generation } => {
+                            super::scheduler::acknowledge_scheduler_attach_started(generation)
+                        }
+                        crate::vmm::wire::AttachControlPacket::FinishedAck { generation } => {
+                            super::scheduler::acknowledge_scheduler_attach_finished(generation)
+                        }
+                        crate::vmm::wire::AttachControlPacket::Cancel { generation, cause } => {
+                            super::scheduler::cancel_scheduler_attach(generation, cause)
+                        }
+                    };
+                    if let Err(error) = delivery {
+                        tracing::error!(
+                            ?packet,
+                            error = %error,
+                            "ktstr-init: failed to deliver scheduler-attach control packet"
+                        );
+                    }
+                }
+                HvcControlEvent::Signal(crate::vmm::virtio_console::SIGNAL_VC_DUMP) => {
+                    let _ = fs::write("/proc/sysrq-trigger", "D");
+                }
+                HvcControlEvent::Signal(crate::vmm::virtio_console::SIGNAL_BPF_WRITE_DONE) => {
+                    bpf_map_write_done_latch().set();
+                }
+                HvcControlEvent::Signal(crate::vmm::virtio_console::SIGNAL_ACCESSOR_READY) => {
+                    accessor_ready_latch().set();
+                }
+                HvcControlEvent::Signal(crate::vmm::virtio_console::SIGNAL_PERIODIC_READY) => {
+                    periodic_prereqs_ready_latch().set();
+                }
+                HvcControlEvent::Signal(
+                    crate::vmm::virtio_console::SIGNAL_WPROF_ARTIFACTS_RECEIVED,
+                ) => {
+                    wprof_artifacts_received_latch().set();
+                }
+                HvcControlEvent::Signal(crate::vmm::virtio_console::SIGNAL_VC_SHUTDOWN) => {
+                    shutdown = true;
+                }
+                HvcControlEvent::Signal(_) => {}
+            }
         }
-        if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_BPF_WRITE_DONE) {
-            bpf_map_write_done_latch().set();
-        }
-        if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_ACCESSOR_READY) {
-            accessor_ready_latch().set();
-        }
-        if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_PERIODIC_READY) {
-            periodic_prereqs_ready_latch().set();
-        }
-        if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_WPROF_ARTIFACTS_RECEIVED) {
-            wprof_artifacts_received_latch().set();
-        }
-        if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_VC_SHUTDOWN) {
+        if shutdown {
             tracing::info!("ktstr-init: shutdown request received, draining");
             // Drain the probe pipeline FIRST so any crash-arg probe events
             // captured so far are EMITTED (via println! -> the stdout
@@ -605,7 +690,7 @@ fn hvc0_poll_loop(
                     libc::tcdrain(std::os::unix::io::AsRawFd::as_raw_fd(&f));
                 }
             }
-            break;
+            return "hvc0 control reader received host shutdown request".into();
         }
     }
 }
@@ -678,11 +763,11 @@ pub(crate) struct SchedExitStop {
     /// spawn (the legacy 250 ms timeout still bounds wake latency in that
     /// degraded path).
     wake_fd: Option<OwnedFd>,
-    /// Monitor thread join handle. `None` when
-    /// `std::thread::Builder::spawn` failed (the monitor never
-    /// started; nothing to join). Consumed by
+    /// Monitor thread join handle. Construction cannot succeed without a
+    /// live monitor thread: `std::thread::Builder::spawn` errors are returned
+    /// synchronously to the caller. Consumed by
     /// [`SchedExitStop::stop_and_join`].
-    join_handle: Option<std::thread::JoinHandle<bool>>,
+    join_handle: std::thread::JoinHandle<bool>,
 }
 
 impl SchedExitStop {
@@ -718,8 +803,8 @@ impl SchedExitStop {
     /// joins the thread. Returns true when the monitor observed the
     /// scheduler's pidfd exit edge, including when that edge raced with the
     /// stop request and therefore produced no SchedExit frame. A monitor
-    /// spawn failure or panic also returns true so verifier cleanup fails
-    /// closed when liveness could not be observed.
+    /// panic also returns true so verifier cleanup fails closed when liveness
+    /// could not be observed.
     /// After this returns the monitor thread is gone, so the caller can
     /// intentionally kill the scheduler without generating a new
     /// `MSG_TYPE_SCHED_EXIT`. A frame for an earlier unexpected exit may
@@ -730,24 +815,22 @@ impl SchedExitStop {
     pub(crate) fn stop_and_join(self) -> bool {
         self.stop.store(true, Ordering::Release);
         self.wake();
-        match self.join_handle {
-            Some(handle) => handle.join().unwrap_or(true),
-            None => true,
-        }
+        self.join_handle.join().unwrap_or(true)
     }
 }
 
 /// Interpret a scheduler pidfd poll result.
 ///
-/// Pidfd readiness is authoritative even while `/proc/<pid>` still exists:
-/// under `SIGCHLD=SIG_DFL` an exited child remains a zombie until `waitpid`,
-/// and zombies retain their proc entry. The old proc-only check therefore
-/// busy-spun on a readable pidfd and could suppress the scheduler-exit frame
-/// during cleanup. The proc check remains as a fallback for an odd poll
-/// result.
-pub(crate) fn sched_exit_observed(pidfd_revents: libc::c_short, proc_alive: bool) -> bool {
-    let exit_events = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
-    pidfd_revents & exit_events != 0 || !proc_alive
+/// The handed-in pidfd is the scheduler's stable process identity, and its
+/// readiness remains authoritative after the numeric pid has been reaped or
+/// reused. No `/proc/<pid>` observation participates in this decision.
+pub(crate) fn sched_exit_observed(pidfd_revents: libc::c_short) -> Result<bool, String> {
+    if pidfd_revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+        return Err(format!(
+            "scheduler pidfd returned invalid poll events {pidfd_revents:#x}"
+        ));
+    }
+    Ok(pidfd_revents & (libc::POLLIN | libc::POLLHUP) != 0)
 }
 
 /// Poll timeout for the exit monitor. An indefinite wait is safe only when
@@ -770,9 +853,9 @@ pub(crate) fn sched_exit_poll_timeout(
 /// pidfd plus a stop-eventfd; the wait returns when either the
 /// child exits (pidfd POLLIN edge from the kernel's `do_notify_pidfd`)
 /// or the cleanup site fires the stop-eventfd. Pidfd readiness is
-/// authoritative even for zombies; `/proc/{pid}` presence is consulted only
-/// as a fallback when poll returns without a recognized pidfd exit event. On
-/// the scheduler's exit two things are gated independently:
+/// authoritative even after the task is reaped; numeric pid and procfs
+/// observations never participate in exit detection. On the scheduler's exit
+/// two things are gated independently:
 ///   - `suppress_sched_log` gates the scheduler-log dump only: false
 ///     (normal mode) dumps the log over the bulk port (`dump_sched_output`
 ///     -> `send_sched_log`); true (probes active) instead waits on the
@@ -786,11 +869,11 @@ pub(crate) fn sched_exit_poll_timeout(
 ///     genuine crash it still fires, but only after the `output_done` wait
 ///     above, so the probe payload is already out.
 ///
-/// Uses pidfd readiness rather than waitpid because most guest-init phases
-/// run with SIGCHLD ignored (the kernel auto-reaps children, making waitpid
-/// return ECHILD). Procfs is only a fallback: verifier dispatch temporarily
-/// uses SIGCHLD=SIG_DFL, so an exited scheduler may remain a zombie with its
-/// `/proc/<pid>` entry still present.
+/// Uses the pidfd opened at scheduler spawn rather than waitpid because most
+/// guest-init phases run with SIGCHLD ignored (the kernel auto-reaps children,
+/// making waitpid return ECHILD). Carrying that exact descriptor through
+/// attach and into this monitor also closes the numeric-pid reuse gap between
+/// scheduler readiness and monitor installation.
 ///
 /// The returned [`SchedExitStop`] carries the `Arc<AtomicBool>` the
 /// monitor reads, an eventfd the cleanup site writes via
@@ -801,16 +884,30 @@ pub(crate) fn sched_exit_poll_timeout(
 /// (e.g. `child.kill()`) the monitor would otherwise interpret as
 /// an unexpected scheduler exit.
 ///
-/// Returns None when no scheduler is running.
-fn start_sched_exit_monitor_inner(
-    sched_pid: Option<u32>,
+/// Thread creation is part of installation: a spawn failure is returned
+/// synchronously and no stop handle is published.
+type SchedExitMonitorTask = Box<dyn FnOnce() -> bool + Send + 'static>;
+
+fn spawn_sched_exit_monitor_thread(
+    task: SchedExitMonitorTask,
+) -> std::io::Result<std::thread::JoinHandle<bool>> {
+    std::thread::Builder::new()
+        .name("sched-exit-mon".into())
+        .spawn(task)
+}
+
+fn start_sched_exit_monitor_inner<F>(
+    pid: u32,
+    pidfd: OwnedFd,
     log_path: Option<&str>,
     suppress_sched_log: Arc<AtomicBool>,
     probe_output_done: Option<Arc<crate::sync::Latch>>,
     create_wake_writer: bool,
-) -> Option<SchedExitStop> {
-    let pid = sched_pid?;
-    let proc_path = format!("/proc/{pid}");
+    spawn_thread: F,
+) -> std::io::Result<SchedExitStop>
+where
+    F: FnOnce(SchedExitMonitorTask) -> std::io::Result<std::thread::JoinHandle<bool>>,
+{
     let log_path = log_path.map(|s| s.to_string());
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();
@@ -867,165 +964,159 @@ fn start_sched_exit_monitor_inner(
     };
 
     let wake_writer_available = writer_fd.is_some();
-    let join_handle = std::thread::Builder::new()
-        .name("sched-exit-mon".into())
-        .spawn(move || {
-            // pidfd_open lets us block on SIGCHLD-equivalent notification
-            // for scheduler process exit instead of polling /proc/{pid} on a
-            // sleep cadence. Procfs remains only a post-poll fallback.
-            // SAFETY: pid is the scheduler's stable pid for the
-            // run; pidfd_open(2) accepts any process the caller
-            // can signal (we are pid 1). pidfd_open has been
-            // available since kernel 5.3 (2019); ktstr targets
-            // 6.16+ where it is unconditionally present. A failure
-            // here means the kernel rejected the syscall entirely
-            // (sandbox / seccomp filter); abort the monitor rather
-            // than fabricate a polling-only monitor that hides the
-            // configuration error.
-            let pidfd = unsafe {
-                libc::syscall(libc::SYS_pidfd_open, pid as libc::c_int, 0u32) as libc::c_int
-            };
-            if pidfd < 0 {
-                tracing::error!(
-                    pid,
-                    err = %std::io::Error::last_os_error(),
-                    "ktstr-init: pidfd_open failed for sched — sched exit monitor disabled",
-                );
-                return true;
-            }
-            // The monitor-side stop fd's raw value, or `-1` when the
-            // caller's eventfd allocation or dup failed. `-1` in a
-            // pollfd entry is valid: the kernel ignores the slot
-            // (returns revents=0), so the same `poll(2)` call works
-            // on the degraded path with a finite timeout that
-            // re-checks `stop` periodically.
-            let stop_fd = monitor_fd.as_ref().map(|f| f.as_raw_fd()).unwrap_or(-1);
-            // Poll timeout policy: an indefinite wait is safe only when the
-            // monitor read fd and caller-owned writer both exist. If eventfd
-            // allocation or writer duplication failed, the legacy 250 ms
-            // cadence periodically rechecks the stop flag.
-            let poll_timeout = sched_exit_poll_timeout(stop_fd, wake_writer_available);
-            loop {
-                let exited = {
-                    // pidfd POLLIN fires at child exit (kernel
-                    // `pidfd_poll` in `fs/pidfs.c` checks
-                    // `exit_state`, woken via `do_notify_pidfd`
-                    // from `exit_notify`). Adding the stop eventfd
-                    // alongside makes a stop request also wake the
-                    // poll, so cleanup latency drops from the
-                    // legacy 250 ms (re-checking `stop` after each
-                    // `poll` timeout) to the kernel's eventfd
-                    // wakeup latency (microseconds).
-                    //
-                    // Pidfd revents are the primary exit evidence, including
-                    // for zombies whose proc entry persists until waitpid.
-                    // Procfs is a fail-closed fallback if poll returns
-                    // without a recognized pidfd event after an auto-reaped
-                    // child has already disappeared.
-                    let mut pfds = [
-                        libc::pollfd {
-                            fd: pidfd,
-                            events: libc::POLLIN,
-                            revents: 0,
-                        },
-                        libc::pollfd {
-                            fd: stop_fd,
-                            events: libc::POLLIN,
-                            revents: 0,
-                        },
-                    ];
-                    // SAFETY: pfds is a 2-element pollfd array on
-                    // the local stack; nfds matches. A `stop_fd`
-                    // value of `-1` is valid per poll(2) — the
-                    // kernel skips that slot. The pidfd revents are
-                    // authoritative for a zombie, whose proc entry remains
-                    // present until waitpid reaps it.
-                    let _ = unsafe {
-                        libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, poll_timeout)
-                    };
-                    sched_exit_observed(pfds[0].revents, Path::new(&proc_path).exists())
+    let monitor_task: SchedExitMonitorTask = Box::new(move || {
+        // The monitor-side stop fd's raw value, or `-1` when the
+        // caller's eventfd allocation or dup failed. `-1` in a
+        // pollfd entry is valid: the kernel ignores the slot
+        // (returns revents=0), so the same `poll(2)` call works
+        // on the degraded path with a finite timeout that
+        // re-checks `stop` periodically.
+        let stop_fd = monitor_fd.as_ref().map(|f| f.as_raw_fd()).unwrap_or(-1);
+        // Poll timeout policy: an indefinite wait is safe only when the
+        // monitor read fd and caller-owned writer both exist. If eventfd
+        // allocation or writer duplication failed, the legacy 250 ms
+        // cadence periodically rechecks the stop flag.
+        let poll_timeout = sched_exit_poll_timeout(stop_fd, wake_writer_available);
+        loop {
+            let exited = {
+                // pidfd POLLIN fires at child exit (kernel
+                // `pidfd_poll` in `fs/pidfs.c` checks
+                // `exit_state`, woken via `do_notify_pidfd`
+                // from `exit_notify`). Adding the stop eventfd
+                // alongside makes a stop request also wake the
+                // poll, so cleanup latency drops from the
+                // legacy 250 ms (re-checking `stop` after each
+                // `poll` timeout) to the kernel's eventfd
+                // wakeup latency (microseconds).
+                //
+                // Pidfd revents are the sole exit evidence, including
+                // for zombies and tasks which have already been reaped.
+                let mut pfds = [
+                    libc::pollfd {
+                        fd: pidfd.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: stop_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                // SAFETY: pfds is a 2-element pollfd array on
+                // the local stack; nfds matches. A `stop_fd`
+                // value of `-1` is valid per poll(2) — the
+                // kernel skips that slot. The pidfd's stable identity
+                // remains authoritative independently of task reaping.
+                let poll_result = unsafe {
+                    libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, poll_timeout)
                 };
-                if exited {
-                    if suppress_sched_log.load(Ordering::Acquire) {
-                        // Probes active: wait event-driven on the
-                        // probe thread's `output_done` latch.
-                        // Outer wall-clock VM timeout is the
-                        // safety net for a hung probe — adding a
-                        // local timer would cap teardown latency
-                        // but also truncate slow-but-progressing
-                        // probe drains, which is the exact bug
-                        // we're avoiding here.
-                        if let Some(ref done) = probe_output_done {
-                            done.wait();
-                        }
-                    } else if let Some(ref path) = log_path {
-                        dump_sched_output(path);
+                if poll_result < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
                     }
-                    // Suppress SchedExit when the host cleanup
-                    // initiated the kill (stop flag set before
-                    // child.kill). Without this gate, Phase 6
-                    // child.kill → pidfd POLLIN → monitor enters
-                    // this branch → sends SchedExit → host sets
-                    // kill=true → BSP exits with ExternalKill
-                    // before the guest reaches send_exit,
-                    // producing exit_code=-1 on a clean run.
-                    if stop_clone.load(Ordering::Acquire) {
-                        unsafe {
-                            libc::close(pidfd);
+                    tracing::error!(
+                        pid,
+                        err = %error,
+                        "ktstr-init: sched-exit pidfd poll failed",
+                    );
+                    return true;
+                }
+                match sched_exit_observed(pfds[0].revents) {
+                    Ok(exited) => exited,
+                    Err(error) => {
+                        tracing::error!(
+                            pid,
+                            error = %error,
+                            "ktstr-init: scheduler exit monitor lost pidfd observation"
+                        );
+                        if !stop_clone.load(Ordering::Acquire) {
+                            crate::vmm::guest_comms::send_sched_exit(1);
                         }
                         return true;
                     }
-                    let exit_code: i32 = 1;
-                    crate::vmm::guest_comms::send_sched_exit(exit_code);
-                    // SAFETY: pidfd is owned by this thread
-                    // and is no longer used after close.
-                    unsafe {
-                        libc::close(pidfd);
-                    }
-                    // `monitor_fd` (Option<OwnedFd>) drops here on
-                    // function return — the OwnedFd's Drop closes
-                    // the read side of the stop eventfd. The
-                    // writer-side `OwnedFd` lives on the
-                    // SchedExitStop returned to the caller.
+                }
+            };
+            if exited {
+                // An orderly teardown may race the exit edge. Observe the
+                // stop request before entering probe/log drains so monitor
+                // shutdown cannot block behind work whose only purpose is
+                // reporting an unexpected exit.
+                if stop_clone.load(Ordering::Acquire) {
                     return true;
                 }
-                // Prioritise a simultaneous pidfd edge over the orderly stop
-                // edge. The caller also checks Child::try_wait after joining,
-                // covering an exit immediately after this poll snapshot.
-                if stop_clone.load(Ordering::Acquire) {
-                    unsafe {
-                        libc::close(pidfd);
+                if suppress_sched_log.load(Ordering::Acquire) {
+                    // Probes active: wait event-driven on the
+                    // probe thread's `output_done` latch.
+                    // Outer wall-clock VM timeout is the
+                    // safety net for a hung probe — adding a
+                    // local timer would cap teardown latency
+                    // but also truncate slow-but-progressing
+                    // probe drains, which is the exact bug
+                    // we're avoiding here.
+                    if let Some(ref done) = probe_output_done {
+                        while !done.wait_timeout(std::time::Duration::from_millis(100)) {
+                            if stop_clone.load(Ordering::Acquire) {
+                                return true;
+                            }
+                        }
                     }
-                    return false;
+                } else if let Some(ref path) = log_path {
+                    dump_sched_output(path);
                 }
-                // Drain any pending stop-eventfd reads so the next
-                // `poll` doesn't immediately re-fire on the same
-                // edge. The `stop` AtomicBool is the source of
-                // truth (re-checked after each poll); the eventfd is purely
-                // a wake-edge, so a missed read is benign — the next
-                // iteration's poll wakes either way. EAGAIN under
-                // EFD_NONBLOCK (counter
-                // already 0 from a racing reader, or no edge
-                // arrived) is the steady-state non-stop case.
-                if stop_fd >= 0 {
-                    let mut buf = [0u8; 8];
-                    // SAFETY: `stop_fd` is the borrowed read side
-                    // of an eventfd, valid for the lifetime of
-                    // this thread (the OwnedFd is owned by the
-                    // closure's `monitor_fd` and not dropped
-                    // until the closure returns). `buf` is an
-                    // 8-byte stack slot matching eventfd(2)'s
-                    // 8-byte read requirement.
-                    let _ = unsafe {
-                        libc::read(stop_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-                    };
+                // Suppress SchedExit when the host cleanup
+                // initiated the kill (stop flag set before
+                // child.kill). Without this gate, Phase 6
+                // child.kill → pidfd POLLIN → monitor enters
+                // this branch → sends SchedExit → host sets
+                // kill=true → BSP exits with ExternalKill
+                // before the guest reaches send_exit,
+                // producing exit_code=-1 on a clean run.
+                if stop_clone.load(Ordering::Acquire) {
+                    return true;
                 }
+                let exit_code: i32 = 1;
+                crate::vmm::guest_comms::send_sched_exit(exit_code);
+                // `pidfd` and `monitor_fd` are both `OwnedFd`s captured
+                // by this task. They close exactly once when the task
+                // returns; the writer side remains in SchedExitStop.
+                return true;
             }
-            // `monitor_fd` drops here as the closure returns.
-        })
-        .ok();
+            // Prioritise a simultaneous pidfd edge over the orderly stop
+            // edge. The caller also checks Child::try_wait after joining,
+            // covering an exit immediately after this poll snapshot.
+            if stop_clone.load(Ordering::Acquire) {
+                return false;
+            }
+            // Drain any pending stop-eventfd reads so the next
+            // `poll` doesn't immediately re-fire on the same
+            // edge. The `stop` AtomicBool is the source of
+            // truth (re-checked after each poll); the eventfd is purely
+            // a wake-edge, so a missed read is benign — the next
+            // iteration's poll wakes either way. EAGAIN under
+            // EFD_NONBLOCK (counter
+            // already 0 from a racing reader, or no edge
+            // arrived) is the steady-state non-stop case.
+            if stop_fd >= 0 {
+                let mut buf = [0u8; 8];
+                // SAFETY: `stop_fd` is the borrowed read side
+                // of an eventfd, valid for the lifetime of
+                // this thread (the OwnedFd is owned by the
+                // closure's `monitor_fd` and not dropped
+                // until the closure returns). `buf` is an
+                // 8-byte stack slot matching eventfd(2)'s
+                // 8-byte read requirement.
+                let _ = unsafe {
+                    libc::read(stop_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                };
+            }
+        }
+        // `pidfd` and `monitor_fd` drop here as the closure returns.
+    });
+    let join_handle = spawn_thread(monitor_task)?;
 
-    Some(SchedExitStop {
+    Ok(SchedExitStop {
         stop,
         wake_fd: writer_fd,
         join_handle,
@@ -1033,30 +1124,56 @@ fn start_sched_exit_monitor_inner(
 }
 
 pub(crate) fn start_sched_exit_monitor(
-    sched_pid: Option<u32>,
+    pid: u32,
+    pidfd: OwnedFd,
     log_path: Option<&str>,
     suppress_sched_log: Arc<AtomicBool>,
     probe_output_done: Option<Arc<crate::sync::Latch>>,
-) -> Option<SchedExitStop> {
+) -> std::io::Result<SchedExitStop> {
     start_sched_exit_monitor_inner(
-        sched_pid,
+        pid,
+        pidfd,
         log_path,
         suppress_sched_log,
         probe_output_done,
         true,
+        spawn_sched_exit_monitor_thread,
     )
 }
 
 #[cfg(test)]
 pub(crate) fn start_sched_exit_monitor_without_wake_writer_for_test(
     sched_pid: u32,
-) -> Option<SchedExitStop> {
+    pidfd: OwnedFd,
+) -> std::io::Result<SchedExitStop> {
     start_sched_exit_monitor_inner(
-        Some(sched_pid),
+        sched_pid,
+        pidfd,
         None,
         Arc::new(AtomicBool::new(false)),
         None,
         false,
+        spawn_sched_exit_monitor_thread,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn start_sched_exit_monitor_with_spawn_failure_for_test(
+    sched_pid: u32,
+    pidfd: OwnedFd,
+) -> std::io::Result<SchedExitStop> {
+    start_sched_exit_monitor_inner(
+        sched_pid,
+        pidfd,
+        None,
+        Arc::new(AtomicBool::new(false)),
+        None,
+        true,
+        |_task| {
+            Err(std::io::Error::other(
+                "injected sched-exit monitor thread spawn failure",
+            ))
+        },
     )
 }
 
@@ -1150,11 +1267,135 @@ pub(crate) fn exec_shell_line(line: &str) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use super::super::scheduler::ProbeDrain;
-    use super::drain_probe_for_shutdown;
+    use super::{HvcControlDecoder, HvcControlEvent, drain_probe_for_shutdown};
     use crate::sync::Latch;
+    use crate::vmm::wire::{AttachCancelCause, AttachControlPacket};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn hvc_control_decoder_preserves_split_and_coalesced_typed_packets() {
+        let started = AttachControlPacket::StartedAck {
+            generation: 0x1234_abcd_9876_ef01,
+        };
+        let finished = AttachControlPacket::FinishedAck {
+            generation: 0x1234_abcd_9876_ef01,
+        };
+        let cancelled = AttachControlPacket::Cancel {
+            generation: 0xfeed_face_cafe_beef,
+            cause: AttachCancelCause::ServiceBudget,
+        };
+        let started_packet = crate::vmm::wire::encode_attach_control(started);
+        let finished_packet = crate::vmm::wire::encode_attach_control(finished);
+        let cancelled_packet = crate::vmm::wire::encode_attach_control(cancelled);
+
+        for (packet, expected) in [
+            (started_packet, started),
+            (finished_packet, finished),
+            (cancelled_packet, cancelled),
+        ] {
+            for split in 1..packet.len() {
+                let mut decoder = HvcControlDecoder::default();
+                assert!(
+                    decoder.push(&packet[..split]).is_empty(),
+                    "split {split} emitted a partial {expected:?}"
+                );
+                assert_eq!(
+                    decoder.push(&packet[split..]),
+                    vec![HvcControlEvent::AttachControl(expected)],
+                    "split {split} lost or changed {expected:?}"
+                );
+            }
+        }
+
+        let mut decoder = HvcControlDecoder::default();
+        let mut coalesced = started_packet.to_vec();
+        coalesced.extend_from_slice(&finished_packet);
+        coalesced.extend_from_slice(&cancelled_packet);
+        coalesced.push(crate::vmm::virtio_console::SIGNAL_VC_DUMP);
+        assert_eq!(
+            decoder.push(&coalesced),
+            vec![
+                HvcControlEvent::AttachControl(started),
+                HvcControlEvent::AttachControl(finished),
+                HvcControlEvent::AttachControl(cancelled),
+                HvcControlEvent::Signal(crate::vmm::virtio_console::SIGNAL_VC_DUMP),
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_attach_control_reprocesses_a_fresh_typed_prefix() {
+        let finished = AttachControlPacket::FinishedAck {
+            generation: 0x1122_3344_5566_7788,
+        };
+        let finished_packet = crate::vmm::wire::encode_attach_control(finished);
+        let mut decoder = HvcControlDecoder::default();
+
+        let mut bytes = vec![crate::vmm::wire::SIGNAL_ATTACH_STARTED_ACK, b'0', b'1'];
+        bytes.extend_from_slice(&finished_packet);
+        assert_eq!(
+            decoder.push(&bytes),
+            vec![HvcControlEvent::AttachControl(finished)]
+        );
+
+        for signal in [
+            crate::vmm::virtio_console::SIGNAL_VC_DUMP,
+            crate::vmm::virtio_console::SIGNAL_BPF_WRITE_DONE,
+            crate::vmm::virtio_console::SIGNAL_ACCESSOR_READY,
+            crate::vmm::virtio_console::SIGNAL_PERIODIC_READY,
+            crate::vmm::virtio_console::SIGNAL_WPROF_ARTIFACTS_RECEIVED,
+            crate::vmm::virtio_console::SIGNAL_VC_SHUTDOWN,
+        ] {
+            let mut decoder = HvcControlDecoder::default();
+            assert!(
+                decoder
+                    .push(&[crate::vmm::wire::SIGNAL_ATTACH_STARTED_ACK, b'0'])
+                    .is_empty()
+            );
+            assert_eq!(
+                decoder.push(&[signal]),
+                vec![HvcControlEvent::Signal(signal)],
+                "malformed packet swallowed legacy signal {signal:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn hvc_control_decoder_rejects_zero_and_uppercase_generations() {
+        let mut decoder = HvcControlDecoder::default();
+        let mut zero_packet = [b'0'; crate::vmm::wire::ATTACH_CONTROL_PACKET_SIZE];
+        zero_packet[0] = crate::vmm::wire::SIGNAL_ATTACH_STARTED_ACK;
+        assert!(decoder.push(&zero_packet).is_empty());
+
+        assert!(
+            decoder
+                .push(&[crate::vmm::wire::SIGNAL_ATTACH_FINISHED_ACK, b'0', b'1',])
+                .is_empty()
+        );
+        assert_eq!(decoder.push(&[b'A']), vec![HvcControlEvent::Signal(b'A')]);
+    }
+
+    #[test]
+    fn hvc_control_decoder_preserves_coalesced_legacy_signals() {
+        let signals = [
+            crate::vmm::virtio_console::SIGNAL_VC_DUMP,
+            crate::vmm::virtio_console::SIGNAL_BPF_WRITE_DONE,
+            crate::vmm::virtio_console::SIGNAL_ACCESSOR_READY,
+            crate::vmm::virtio_console::SIGNAL_PERIODIC_READY,
+            crate::vmm::virtio_console::SIGNAL_WPROF_ARTIFACTS_RECEIVED,
+            crate::vmm::virtio_console::SIGNAL_VC_SHUTDOWN,
+        ];
+        let mut decoder = HvcControlDecoder::default();
+        assert_eq!(
+            decoder.push(&signals),
+            signals
+                .into_iter()
+                .map(HvcControlEvent::Signal)
+                .collect::<Vec<_>>()
+        );
+    }
 
     /// `drain_probe_for_shutdown` is the bounded probe drain the
     /// graceful-shutdown (watchdog soft-shutdown) handler runs so captured

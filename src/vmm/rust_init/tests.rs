@@ -856,11 +856,14 @@ fn verifier_cleanup_rejects_pidfd_ready_zombie() {
         "SIGCHLD=SIG_DFL keeps the exited child as a proc-visible zombie",
     );
     assert!(
-        sched_exit_observed(libc::POLLIN, true),
+        sched_exit_observed(libc::POLLIN).expect("valid pidfd event"),
         "pidfd POLLIN must outrank a still-present zombie proc entry",
     );
-    assert!(!sched_exit_observed(0, true));
-    assert!(sched_exit_observed(0, false));
+    assert!(
+        !sched_exit_observed(0).expect("empty pidfd event"),
+        "numeric pid/proc disappearance is not scheduler identity evidence",
+    );
+    assert!(sched_exit_observed(libc::POLLNVAL).is_err());
 
     // Linux accepts a signal directed at a zombie. That syscall success must
     // not be mistaken for proof that cleanup killed a live scheduler.
@@ -875,6 +878,19 @@ fn verifier_cleanup_rejects_pidfd_ready_zombie() {
         !verifier_cleanup_kill_confirmed(kill_sent, Some(&status)),
         "natural exit status must fail even when kill(2) returned success",
     );
+}
+
+fn open_pidfd_for_sched_exit_test(pid: u32) -> OwnedFd {
+    // SAFETY: pidfd_open on a child owned by this test with flags zero. A
+    // non-negative return is a new descriptor transferred into OwnedFd.
+    let raw =
+        unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0u32) as libc::c_int };
+    assert!(
+        raw >= 0,
+        "pidfd_open({pid}) failed: {}",
+        std::io::Error::last_os_error(),
+    );
+    unsafe { OwnedFd::from_raw_fd(raw) }
 }
 
 #[test]
@@ -896,8 +912,10 @@ fn sched_exit_monitor_reports_an_unreaped_zombie() {
         "the child must remain an unreaped proc-visible zombie",
     );
 
+    let pidfd = open_pidfd_for_sched_exit_test(pid as u32);
     let stop = start_sched_exit_monitor(
-        Some(pid as u32),
+        pid as u32,
+        pidfd,
         None,
         Arc::new(AtomicBool::new(false)),
         None,
@@ -910,6 +928,59 @@ fn sched_exit_monitor_reports_an_unreaped_zombie() {
 
     let status = child.wait().expect("reap scheduler stand-in");
     assert_eq!(status.code(), Some(9));
+}
+
+#[test]
+fn sched_exit_monitor_accepts_an_already_readable_handed_off_pidfd() {
+    let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
+    let _restore = SigchldGuard::install(libc::SIG_DFL);
+
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn scheduler stand-in");
+    let pid = child.id();
+    let pidfd = open_pidfd_for_sched_exit_test(pid);
+    child.kill().expect("kill scheduler stand-in");
+    child.wait().expect("reap scheduler stand-in");
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "the numeric pid must be gone before monitor installation",
+    );
+
+    let stop = start_sched_exit_monitor(pid, pidfd, None, Arc::new(AtomicBool::new(false)), None)
+        .expect("install monitor from the handed-off readable pidfd");
+    assert!(
+        stop.stop_and_join(),
+        "an already-readable pidfd must be observed without reopening the numeric pid",
+    );
+}
+
+#[test]
+fn sched_exit_monitor_thread_spawn_failure_is_synchronous() {
+    let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
+    let _restore = SigchldGuard::install(libc::SIG_DFL);
+
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn scheduler stand-in");
+    let pid = child.id();
+    let pidfd = open_pidfd_for_sched_exit_test(pid);
+    let error = match start_sched_exit_monitor_with_spawn_failure_for_test(pid, pidfd) {
+        Ok(_) => panic!("injected thread spawn failure unexpectedly installed a monitor"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert!(
+        error
+            .to_string()
+            .contains("injected sched-exit monitor thread spawn failure"),
+        "unexpected spawn error: {error}",
+    );
+
+    child.kill().expect("kill scheduler stand-in");
+    child.wait().expect("reap scheduler stand-in");
 }
 
 #[test]
@@ -929,7 +1000,8 @@ fn sched_exit_monitor_without_wake_writer_stops_on_finite_poll() {
         .arg("30")
         .spawn()
         .expect("spawn live child");
-    let stop = start_sched_exit_monitor_without_wake_writer_for_test(child.id())
+    let pidfd = open_pidfd_for_sched_exit_test(child.id());
+    let stop = start_sched_exit_monitor_without_wake_writer_for_test(child.id(), pidfd)
         .expect("start scheduler-exit monitor");
     let started = std::time::Instant::now();
     assert!(

@@ -693,6 +693,30 @@ pub(crate) fn ktstr_guest_init() -> ! {
     let probes_active = probe_phase_a.is_some();
     drop(_s_phase2b);
 
+    // Bring up the host→guest control reader before scheduler spawn. The
+    // attach-attempt watchdog returns its generation-tagged cancellation over
+    // hvc0, so starting this reader after attach would leave the boot attempt
+    // unable to receive the same service-budget decision used by lifecycle
+    // Ops.
+    let _s_phase2c = tracing::debug_span!("phase2c_control_readers").entered();
+    let (trace_stop, trace_handle) = start_trace_pipe();
+    let hvc0_probe_drain = probe_phase_a.as_ref().map(|pa| ProbeDrain {
+        stop: pa.pipeline.stop.clone(),
+        output_done: pa.pipeline.output_done.clone(),
+    });
+    let vc_poll_stop = match start_hvc0_poll(trace_stop.clone(), hvc0_probe_drain) {
+        Ok(stop) => stop,
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "ktstr-init: host control reader could not start"
+            );
+            crate::vmm::guest_comms::send_exit(1);
+            force_reboot();
+        }
+    };
+    drop(_s_phase2c);
+
     // Phase 3: Cgroup parent + Scheduler.
     // Create the cgroup parent directory before starting the scheduler
     // so it exists when the scheduler looks for it.
@@ -722,61 +746,124 @@ pub(crate) fn ktstr_guest_init() -> ! {
         stop: pa.pipeline.stop.clone(),
         output_done: pa.pipeline.output_done.clone(),
     });
-    let (mut sched_child, sched_log_path) = start_scheduler(probe_drain);
-    drop(_s_phase3);
+    let mut spawned_scheduler = start_scheduler(probe_drain);
 
-    // Phase 4: hvc0 polling + trace pipe (background threads).
-    let _s_phase4 = tracing::debug_span!("phase4_vc_poll").entered();
-    let (trace_stop, trace_handle) = start_trace_pipe();
-    // Thread the probe pipeline's `stop` + `output_done` into the hvc0 poll
-    // loop so its graceful-shutdown (watchdog soft-shutdown) handler can drain
-    // captured crash-arg probe output (emitted over the virtio bulk port via
-    // the stdout forwarder) before the guest reboots — the only drain site for
-    // a repro scenario that hangs inside the test function.
-    let hvc0_probe_drain = probe_phase_a.as_ref().map(|pa| ProbeDrain {
-        stop: pa.pipeline.stop.clone(),
-        output_done: pa.pipeline.output_done.clone(),
-    });
-    let vc_poll_stop = start_hvc0_poll(trace_stop.clone(), hvc0_probe_drain);
-    drop(_s_phase4);
-
-    // Phase 4b: Scheduler death monitor.
-    // Spawn a thread that blocks on the scheduler pidfd plus a stop eventfd.
-    // If the scheduler exits during the test, pidfd readiness is authoritative
-    // (including while the child is a zombie) and the thread writes
-    // MSG_TYPE_SCHED_EXIT via the bulk port so the host detects the death
-    // without waiting for the watchdog.
-    //
-    // When probes are active, `suppress_sched_log` suppresses only the
-    // bulk-port scheduler-log dump (the monitor waits on the probe's
-    // output_done instead, keeping the VM alive for the probe to emit its
-    // payload); the probe pipeline handles crash detection via
-    // tp_btf/sched_ext_exit. The SCHED_EXIT signal is gated independently by
-    // the stop flag (host-initiated kill), not by this flag.
+    // Install continuous death observation from the exact pidfd retained by
+    // the attach wait before either the host attempt overlay is closed or the
+    // legacy SchedulerAttached proof is published.
     let suppress_sched_log = Arc::new(AtomicBool::new(probes_active));
     let probe_output_done = probe_phase_a
         .as_ref()
         .map(|pa| pa.pipeline.output_done.clone());
-    // Install the boot-time scheduler-exit monitor handle into
-    // the module-level slot via `install_initial_sched_exit_monitor`
-    // so the scheduler-lifecycle Op dispatcher in
-    // `src/scenario/ops/mod.rs` can swap the monitor across
-    // Op::AttachScheduler / DetachScheduler / RestartScheduler /
-    // ReplaceScheduler. The earlier local-binding pattern held
-    // the SchedExitStop in this stack frame, which made it
-    // unreachable from the Op dispatch path. The shutdown cascade
-    // below calls `stop_sched_exit_monitor` instead of the
-    // pre-refactor local `stop_and_join`. Cloning the Arcs is
-    // cheap and the boot start_sched_exit_monitor call retains
-    // its original semantics — the only difference is the
-    // ownership chain after spawn.
-    let boot_stop = start_sched_exit_monitor(
-        sched_child.as_ref().map(|c| c.id()),
-        sched_log_path.as_deref(),
-        suppress_sched_log.clone(),
-        probe_output_done.clone(),
-    );
+    let boot_stop = match spawned_scheduler.as_mut() {
+        Some(spawned) => {
+            let monitor_pidfd = match spawned.clone_pidfd() {
+                Ok(pidfd) => pidfd,
+                Err(error) => {
+                    let cleanup = spawned.terminate_after_monitor_failure();
+                    tracing::error!(
+                        error = %error,
+                        ?cleanup,
+                        "ktstr-init: scheduler pidfd handoff failed"
+                    );
+                    crate::vmm::guest_comms::send_lifecycle(
+                        crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
+                        "scheduler pidfd handoff failed",
+                    );
+                    crate::vmm::guest_comms::send_exit(1);
+                    let drain = probe_phase_a.as_ref().map(|pa| ProbeDrain {
+                        stop: pa.pipeline.stop.clone(),
+                        output_done: pa.pipeline.output_done.clone(),
+                    });
+                    drain_probe_pipeline(drain.as_ref(), crate::test_support::PROBE_DRAIN_GRACE);
+                    force_reboot();
+                }
+            };
+            match start_sched_exit_monitor(
+                spawned.child.id(),
+                monitor_pidfd,
+                Some(&spawned.log_path),
+                suppress_sched_log.clone(),
+                probe_output_done.clone(),
+            ) {
+                Ok(stop) => Some(stop),
+                Err(error) => {
+                    let cleanup = spawned.terminate_after_monitor_failure();
+                    tracing::error!(
+                        error = %error,
+                        ?cleanup,
+                        "ktstr-init: scheduler exit-monitor installation failed"
+                    );
+                    crate::vmm::guest_comms::send_lifecycle(
+                        crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
+                        "scheduler exit-monitor installation failed",
+                    );
+                    crate::vmm::guest_comms::send_exit(1);
+                    let drain = probe_phase_a.as_ref().map(|pa| ProbeDrain {
+                        stop: pa.pipeline.stop.clone(),
+                        output_done: pa.pipeline.output_done.clone(),
+                    });
+                    drain_probe_pipeline(drain.as_ref(), crate::test_support::PROBE_DRAIN_GRACE);
+                    force_reboot();
+                }
+            }
+        }
+        None => None,
+    };
     install_initial_sched_exit_monitor(boot_stop, suppress_sched_log, probe_output_done);
+
+    if let Some(spawned) = spawned_scheduler.as_mut() {
+        if let Err(error) = spawned.confirm_alive_after_monitor_install() {
+            let _ = stop_sched_exit_monitor();
+            let cleanup = spawned.terminate_after_monitor_failure();
+            tracing::error!(
+                error = %error,
+                ?cleanup,
+                "ktstr-init: scheduler exited during exit-monitor handoff"
+            );
+            crate::vmm::guest_comms::send_lifecycle(
+                crate::vmm::wire::LifecyclePhase::SchedulerDied,
+                "",
+            );
+            crate::vmm::guest_comms::send_exit(1);
+            let drain = probe_phase_a.as_ref().map(|pa| ProbeDrain {
+                stop: pa.pipeline.stop.clone(),
+                output_done: pa.pipeline.output_done.clone(),
+            });
+            drain_probe_pipeline(drain.as_ref(), crate::test_support::PROBE_DRAIN_GRACE);
+            force_reboot();
+        }
+        if let Err(error) = spawned.finish_attach_attempt() {
+            let _ = stop_sched_exit_monitor();
+            let cleanup = spawned.terminate_after_monitor_failure();
+            tracing::error!(
+                error = %error,
+                ?cleanup,
+                "ktstr-init: failed to publish scheduler attach completion"
+            );
+            crate::vmm::guest_comms::send_lifecycle(
+                crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
+                "scheduler attach completion was not delivered",
+            );
+            crate::vmm::guest_comms::send_exit(1);
+            let drain = probe_phase_a.as_ref().map(|pa| ProbeDrain {
+                stop: pa.pipeline.stop.clone(),
+                output_done: pa.pipeline.output_done.clone(),
+            });
+            drain_probe_pipeline(drain.as_ref(), crate::test_support::PROBE_DRAIN_GRACE);
+            force_reboot();
+        }
+        crate::vmm::guest_comms::send_lifecycle(
+            crate::vmm::wire::LifecyclePhase::SchedulerAttached,
+            "",
+        );
+    }
+
+    let (mut sched_child, sched_log_path) = match spawned_scheduler {
+        Some(spawned) => (Some(spawned.child), Some(spawned.log_path)),
+        None => (None, None),
+    };
+    drop(_s_phase3);
 
     // Phase 5: Dispatch.
     let _s_phase5 = tracing::debug_span!("phase5_dispatch").entered();
@@ -1128,9 +1215,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     }
 
     // Stop remaining background threads.
-    if let Some(ref stop) = vc_poll_stop {
-        stop.store(true, Ordering::Release);
-    }
+    vc_poll_stop.store(true, Ordering::Release);
     stats_relay_stop.signal_stop();
 
     // Flush COM1 trace data before reboot. The reader thread runs on

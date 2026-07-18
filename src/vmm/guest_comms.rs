@@ -22,10 +22,11 @@
 
 use crate::sync::MutexExt;
 use crate::vmm::wire::{
-    KERNEL_OP_REPLY_MAX, KernelOpReplyPayload, KernelOpRequestPayload, KernelOpRequestResult,
-    LifecyclePhase, MSG_TYPE_KERNEL_OP_REPLY, MSG_TYPE_SNAPSHOT_REPLY, MsgType, PORT1_NAME,
-    SNAPSHOT_REASON_MAX, SNAPSHOT_STATUS_ERR, SNAPSHOT_STATUS_OK, SNAPSHOT_TAG_MAX, ShmMessage,
-    SnapshotReplyPayload, SnapshotRequestPayload, SnapshotRequestResult,
+    AttachAttemptEvent, KERNEL_OP_REPLY_MAX, KernelOpReplyPayload, KernelOpRequestPayload,
+    KernelOpRequestResult, LifecyclePhase, MSG_TYPE_KERNEL_OP_REPLY, MSG_TYPE_SNAPSHOT_REPLY,
+    MsgType, PORT1_NAME, SNAPSHOT_REASON_MAX, SNAPSHOT_STATUS_ERR, SNAPSHOT_STATUS_OK,
+    SNAPSHOT_TAG_MAX, ShmMessage, SnapshotReplyPayload, SnapshotRequestPayload,
+    SnapshotRequestResult,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -1312,6 +1313,17 @@ pub fn send_lifecycle(phase: LifecyclePhase, reason: &str) {
     buf.push(phase.wire_value());
     buf.extend_from_slice(reason.as_bytes());
     write_msg(MsgType::Lifecycle.wire_value(), &buf);
+}
+
+/// Publish one generation-tagged scheduler attach boundary.
+///
+/// Returns the underlying bulk-write result so the spawn path can fail
+/// closed if the host never received the `Started` boundary. All terminal
+/// paths for a generation must send the matching `Finished` event; the host
+/// ignores stale or mismatched generations rather than letting a delayed
+/// completion close a newer lifecycle-Op attempt.
+pub fn send_attach_attempt(event: AttachAttemptEvent) -> bool {
+    write_msg(MsgType::AttachAttempt.wire_value(), &event.to_payload())
 }
 
 /// Send a shell-exec exit code to the host. Payload: 4-byte LE

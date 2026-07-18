@@ -3,10 +3,12 @@
 //! Both [`kernfs_evented_wait`] and [`pidfd_wait_exit`] follow the
 //! same shape: subscribe to one or more kernel-evented sources,
 //! poll(2) for any of them with a deadline-bounded timeout, and
-//! re-check the source-of-truth predicate on every wake. The
-//! cadence cap on each poll(2) iteration bounds wake latency
-//! against the narrow cases where neither evented source fires
-//! (verified per-call-site rationale in each caller — see
+//! inspect the returned revents before deciding the outcome.
+//! Kernfs wakes re-check their source-of-truth predicate; pidfd
+//! POLLIN/POLLHUP is itself authoritative for the referenced task.
+//! The cadence cap on each kernfs poll(2) iteration bounds wake
+//! latency against the narrow cases where neither evented source
+//! fires (verified per-call-site rationale in each caller — see
 //! `poll_scx_attached` in `src/vmm/rust_init/scheduler.rs` and
 //! `wait_for_scx_disabled` in `src/scenario/ops/dispatch.rs`).
 //!
@@ -31,10 +33,56 @@ pub(crate) enum KernfsWaitOutcome<T> {
     Done(T),
     /// Deadline elapsed without `check_done` returning `Some`.
     Timeout,
-    /// Both the attribute fd open AND the inotify watch failed —
-    /// no evented source available, no point looping. Caller
+    /// Both the attribute fd and the inotify watch are unavailable
+    /// after one final source-of-truth predicate sample. Caller
     /// surfaces this as the appropriate kernel-defect error.
     NoEventedSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KernfsAttrPollDisposition {
+    Keep,
+    Drop,
+}
+
+fn revents_or_panic(pfd: &PollFd<'_>, source: &str) -> PollFlags {
+    pfd.revents()
+        .unwrap_or_else(|| panic!("evented_wait: {source} returned unknown poll revents"))
+}
+
+/// kernfs attributes report `sysfs_notify()` as POLLERR|POLLPRI,
+/// so POLLERR is a notification rather than an observer failure.
+/// POLLHUP means the attribute vanished and this best-effort source
+/// can no longer contribute; POLLNVAL means our owned fd became
+/// invalid and is an internal invariant violation.
+fn kernfs_attr_poll_disposition(revents: PollFlags) -> KernfsAttrPollDisposition {
+    if revents.contains(PollFlags::POLLNVAL) {
+        panic!("evented_wait: kernfs attribute fd returned POLLNVAL");
+    }
+    if revents.contains(PollFlags::POLLHUP) {
+        KernfsAttrPollDisposition::Drop
+    } else {
+        // POLLPRI and POLLERR both cause the source-of-truth
+        // predicate to be sampled below. Empty revents are also
+        // valid when the cadence timeout expires.
+        KernfsAttrPollDisposition::Keep
+    }
+}
+
+fn validate_inotify_revents(revents: PollFlags) {
+    let rejected = revents & (PollFlags::POLLERR | PollFlags::POLLNVAL | PollFlags::POLLHUP);
+    if !rejected.is_empty() {
+        panic!("evented_wait: inotify fd returned invalid revents {rejected:?}");
+    }
+}
+
+fn pidfd_revents_mean_exit(pid: u32, revents: PollFlags) -> bool {
+    let rejected = revents & (PollFlags::POLLERR | PollFlags::POLLNVAL);
+    if !rejected.is_empty() {
+        panic!("evented_wait: pidfd for pid {pid} returned invalid revents {rejected:?}");
+    }
+
+    revents.intersects(PollFlags::POLLIN | PollFlags::POLLHUP)
 }
 
 /// Resolve a deadline edge without letting the guard rail hide a
@@ -87,9 +135,10 @@ fn poll_timeout_ceil(duration: Duration) -> PollTimeout {
 ///    its own `File::open` since reusing the same fd across reads
 ///    requires `lseek(0)` (which kernfs may not honor cleanly).
 ///
-/// If BOTH sources fail to subscribe, returns `NoEventedSource`
-/// immediately — no polling fallback per the project rule "no
-/// polling fallbacks for evented paths".
+/// If BOTH sources fail to subscribe, samples `check_done` once
+/// more to close the subscription race and then returns
+/// `NoEventedSource` — no polling fallback per the project rule
+/// "no polling fallbacks for evented paths".
 ///
 /// `cadence` caps each `poll(2)` wait so the upper bound on wake
 /// latency stays bounded when neither evented source has anything
@@ -129,7 +178,7 @@ where
             }
         });
 
-    let attr_fd: Option<OwnedFd> = attr_path.and_then(|path| {
+    let mut attr_fd: Option<OwnedFd> = attr_path.and_then(|path| {
         // nix has no wrapper for `open` that returns OwnedFd
         // ergonomically without exposing a raw flag set; fall
         // back to libc::open + OwnedFd::from_raw_fd. The single
@@ -153,7 +202,10 @@ where
     });
 
     if inotify.is_none() && attr_fd.is_none() {
-        return KernfsWaitOutcome::NoEventedSource;
+        return match check_done() {
+            Some(value) => KernfsWaitOutcome::Done(value),
+            None => KernfsWaitOutcome::NoEventedSource,
+        };
     }
 
     // PollFds borrow from the OwnedFds for their lifetime. Build
@@ -174,12 +226,16 @@ where
         // — borrow from OwnedFd / Inotify here, scope to this
         // iteration.
         let mut pfds: Vec<PollFd<'_>> = Vec::with_capacity(2);
-        if let Some(ref fd) = attr_fd {
+        let attr_index = attr_fd.as_ref().map(|fd| {
+            let index = pfds.len();
             pfds.push(PollFd::new(fd.as_fd(), PollFlags::POLLPRI));
-        }
-        if let Some(ref inot) = inotify {
+            index
+        });
+        let inotify_index = inotify.as_ref().map(|inot| {
+            let index = pfds.len();
             pfds.push(PollFd::new(inot.as_fd(), PollFlags::POLLIN));
-        }
+            index
+        });
 
         // EINTR is a normal wake: the predicate remains the source
         // of truth and the next iteration recomputes the remaining
@@ -187,23 +243,59 @@ where
         // cannot be trusted, so fail loudly rather than silently
         // spinning until a misleading timeout.
         match poll(&mut pfds, timeout) {
-            Ok(_) | Err(Errno::EINTR) => {}
+            Ok(_) => {}
+            Err(Errno::EINTR) => {
+                if let Some(value) = check_done() {
+                    return KernfsWaitOutcome::Done(value);
+                }
+                continue;
+            }
             Err(err) => {
                 panic!("evented_wait::kernfs_evented_wait: poll failed: {err}");
             }
+        }
+
+        let attr_disposition = attr_index
+            .map(|index| {
+                kernfs_attr_poll_disposition(revents_or_panic(&pfds[index], "kernfs attribute fd"))
+            })
+            .unwrap_or(KernfsAttrPollDisposition::Drop);
+        let inotify_readable = inotify_index
+            .map(|index| {
+                let revents = revents_or_panic(&pfds[index], "inotify fd");
+                validate_inotify_revents(revents);
+                revents.contains(PollFlags::POLLIN)
+            })
+            .unwrap_or(false);
+
+        // PollFds borrow the owned descriptors. End those borrows
+        // before dropping a hung-up best-effort attribute source.
+        drop(pfds);
+        if attr_disposition == KernfsAttrPollDisposition::Drop {
+            attr_fd = None;
         }
 
         // Drain inotify events so the fd doesn't stay readable
         // across iterations and spin the next poll. We don't
         // care about the event contents — the predicate re-read
         // is the source of truth.
-        if let Some(ref inot) = inotify {
-            // Ignore EAGAIN (no events) and any read error.
-            let _ = inot.read_events();
+        if inotify_readable {
+            let inot = inotify
+                .as_ref()
+                .expect("readable inotify index requires a live inotify fd");
+            match inot.read_events() {
+                Ok(_) | Err(Errno::EAGAIN) => {}
+                Err(err) => {
+                    panic!("evented_wait::kernfs_evented_wait: read inotify events: {err}");
+                }
+            }
         }
 
         if let Some(v) = check_done() {
             return KernfsWaitOutcome::Done(v);
+        }
+        if inotify.is_none() && attr_fd.is_none() {
+            return KernfsWaitOutcome::NoEventedSource;
         }
     }
 }
@@ -211,10 +303,12 @@ where
 /// Wait for `pid` to exit, polling the kernel-evented pidfd. The
 /// kernel fires POLLIN on the pidfd when the task enters
 /// EXIT_ZOMBIE (`do_notify_pidfd` from `exit_notify` in
-/// `kernel/exit.c`). Returns `true` the first time `still_alive`
-/// returns `false` (the pidfd POLLIN may fire before our re-check
-/// resolves, but the re-check is the source of truth). Returns
-/// `false` if the deadline elapses with the pid still alive.
+/// `kernel/exit.c`). POLLIN or POLLHUP is authoritative for the
+/// process represented by the pidfd; it returns `true` directly
+/// instead of re-reading a numeric PID that may already have been
+/// reused. `still_alive` closes the races before `pidfd_open` and
+/// at the deadline. Returns `false` if neither source observes exit
+/// by the deadline.
 ///
 /// Panics on non-ESRCH `pidfd_open` failure: pidfd_open shipped
 /// unconditionally in Linux 5.3, so a non-ESRCH error
@@ -264,15 +358,30 @@ pub(crate) fn pidfd_wait_exit(
     let pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
 
     loop {
-        // Re-check predicate at the top of the loop: the exit edge
-        // may have fired between any prior step and now.
+        // The fallback predicate closes pre-poll races. A ready
+        // pidfd below remains authoritative even if this numeric
+        // PID is subsequently reused.
         if !still_alive() {
             return true;
         }
         let now = Instant::now();
         if now >= deadline {
-            // Final re-probe to catch a race where the pid exited
-            // between the last poll-return and the deadline check.
+            // Sample the pidfd once at the boundary before the
+            // fallback predicate. This catches an exit whose pid
+            // was already reused before /proc could be re-read.
+            let mut pfds = [PollFd::new(pidfd.as_fd(), PollFlags::POLLIN)];
+            match poll(&mut pfds, PollTimeout::ZERO) {
+                Ok(_) => {
+                    let revents = revents_or_panic(&pfds[0], "pidfd");
+                    if pidfd_revents_mean_exit(pid, revents) {
+                        return true;
+                    }
+                }
+                Err(Errno::EINTR) => {}
+                Err(err) => {
+                    panic!("evented_wait::pidfd_wait_exit: poll(pid={pid}) failed: {err}");
+                }
+            }
             return !still_alive();
         }
         let remaining = deadline - now;
@@ -280,7 +389,13 @@ pub(crate) fn pidfd_wait_exit(
 
         let mut pfds = [PollFd::new(pidfd.as_fd(), PollFlags::POLLIN)];
         match poll(&mut pfds, timeout) {
-            Ok(_) | Err(Errno::EINTR) => {}
+            Ok(_) => {
+                let revents = revents_or_panic(&pfds[0], "pidfd");
+                if pidfd_revents_mean_exit(pid, revents) {
+                    return true;
+                }
+            }
+            Err(Errno::EINTR) => {}
             Err(err) => {
                 panic!("evented_wait::pidfd_wait_exit: poll(pid={pid}) failed: {err}");
             }
@@ -291,6 +406,98 @@ pub(crate) fn pidfd_wait_exit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_subscriptions_recheck_predicate_before_no_source() {
+        let tmp = tempfile::TempDir::new().expect("create temporary directory");
+        let missing = tmp.path().join("missing");
+        let mut checks = 0;
+
+        let outcome = kernfs_evented_wait(
+            &missing,
+            AddWatchFlags::IN_CREATE,
+            Some(&missing),
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(1),
+            || {
+                checks += 1;
+                (checks == 2).then_some(29)
+            },
+        );
+
+        assert!(matches!(outcome, KernfsWaitOutcome::Done(29)));
+        assert_eq!(checks, 2);
+    }
+
+    #[test]
+    fn real_pipe_hup_drops_kernfs_attribute_source() {
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("create pipe");
+        drop(write_fd);
+
+        let mut pfds = [PollFd::new(read_fd.as_fd(), PollFlags::POLLIN)];
+        assert_eq!(
+            poll(&mut pfds, PollTimeout::from(100u16)).expect("poll pipe"),
+            1
+        );
+        let revents = revents_or_panic(&pfds[0], "test pipe");
+        assert!(revents.contains(PollFlags::POLLHUP));
+        assert_eq!(
+            kernfs_attr_poll_disposition(revents),
+            KernfsAttrPollDisposition::Drop
+        );
+    }
+
+    #[test]
+    fn kernfs_pollerr_is_a_notification_not_an_error() {
+        assert_eq!(
+            kernfs_attr_poll_disposition(PollFlags::POLLERR | PollFlags::POLLPRI),
+            KernfsAttrPollDisposition::Keep
+        );
+    }
+
+    #[test]
+    fn inotify_rejects_terminal_poll_states() {
+        for revents in [PollFlags::POLLERR, PollFlags::POLLNVAL, PollFlags::POLLHUP] {
+            assert!(
+                std::panic::catch_unwind(|| validate_inotify_revents(revents)).is_err(),
+                "{revents:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn pidfd_readiness_is_authoritative_without_proc_recheck() {
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        let mut liveness_checks = 0;
+
+        let exited = pidfd_wait_exit(pid, Instant::now() + Duration::from_secs(5), || {
+            liveness_checks += 1;
+            // Model a reused numeric PID: a /proc lookup keeps
+            // reporting alive even after the original task exits.
+            true
+        });
+
+        assert!(exited);
+        assert!(
+            liveness_checks >= 1,
+            "test must exercise the misleading fallback predicate"
+        );
+        child.wait().expect("reap short-lived child");
+    }
+
+    #[test]
+    fn pidfd_hup_is_exit_but_error_states_are_rejected() {
+        assert!(pidfd_revents_mean_exit(7, PollFlags::POLLHUP));
+        for revents in [PollFlags::POLLERR, PollFlags::POLLNVAL] {
+            assert!(
+                std::panic::catch_unwind(|| pidfd_revents_mean_exit(7, revents)).is_err(),
+                "{revents:?} must be rejected"
+            );
+        }
+    }
 
     #[test]
     fn deadline_edge_gives_done_precedence_over_timeout() {

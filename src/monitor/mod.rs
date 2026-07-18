@@ -816,6 +816,16 @@ pub(crate) struct ProgressLedger {
     /// wedged (distinct from the guest making no progress), which the
     /// watchdog must not misread as a guest hang. Relaxed.
     pub(crate) monitor_heartbeat: AtomicU64,
+    /// Monotone terminal/unavailable sensor for the host monitor.
+    ///
+    /// `false` means a monitor may still publish evidence for this run.
+    /// `true` means no monitor exists, or the monitor thread exited while
+    /// the run kill flag was not set. The monitor thread's RAII terminal
+    /// guard publishes this on both ordinary unexpected return and unwind;
+    /// setup paths publish it directly when no monitor can be created.
+    /// Once true it never clears. Release/Acquire pairs the terminal edge
+    /// with any diagnostics emitted before the monitor stopped.
+    pub(crate) monitor_terminal: AtomicBool,
     /// Bumped only on a MILESTONE (see the LOAD-BEARING invariant below).
     /// Release store / Acquire load so a reader observing a fresh epoch
     /// also sees the `cpu_ns_at_progress` / `wall_ns_at_progress` payload
@@ -823,8 +833,11 @@ pub(crate) struct ProgressLedger {
     ///
     /// LOAD-BEARING PROGRESS INVARIANT (hard invariant — do not relax):
     /// `progress_epoch` counts MILESTONES ONLY — a guest-driven lifecycle
-    /// stage advance (the dispatch thread's [`Self::advance_phase`]) or a
-    /// guest boot-heartbeat frame (dispatch's `record_boot_progress`).
+    /// stage advance (the dispatch thread's [`Self::advance_phase`]), a
+    /// guest boot-heartbeat frame (dispatch's `record_boot_progress`), or an
+    /// accepted generation-tagged scheduler-attach boundary
+    /// ([`Self::reanchor_phase_cpu`]). Replayed/rejected attach frames do not
+    /// bump it.
     /// KERNEL SCHEDULING NOISE IS NEVER PROGRESS. The monitor does NOT bump
     /// this from schedstat / scx-event / DSQ-drain deltas: a live guest
     /// kernel bumps ttwu_count / sched_count / pcount every tick from
@@ -915,6 +928,15 @@ impl ProgressLedger {
         self.monitor_heartbeat.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Publish that the host monitor is terminal or unavailable.
+    ///
+    /// This is intentionally a one-way latch. Monitor setup calls it when no
+    /// monitor can be created; [`reader::MonitorTerminalGuard`] calls it when
+    /// a live monitor thread leaves unexpectedly.
+    pub(crate) fn publish_monitor_terminal(&self) {
+        self.monitor_terminal.store(true, Ordering::Release);
+    }
+
     /// Record a NEW-WORK observation: publish the payload, then bump
     /// `progress_epoch`. The payload stores are Relaxed and the epoch
     /// RMW is Release, so an Acquire reader that observes the new epoch
@@ -923,6 +945,51 @@ impl ProgressLedger {
         self.cpu_ns_at_progress.store(cpu_ns_now, Ordering::Relaxed);
         self.wall_ns_at_progress.store(wall_ns, Ordering::Relaxed);
         self.progress_epoch.fetch_add(1, Ordering::Release);
+    }
+
+    /// Re-anchor the monitor-owned max-per-vCPU CPU tracker without changing
+    /// the forward-only coarse lifecycle stage.
+    ///
+    /// Scheduler lifecycle Ops may start a fresh sched_ext attach while the
+    /// coarse stage is already `Body`. The attach watchdog needs the same
+    /// width-sound `max_i(C_i(now) - C_i(anchor))` currency as Tier-1, but
+    /// must not regress `phase` back to `Attach`. Bumping `phase_epoch`
+    /// gives the monitor's existing [`reader::MaxVcpuInPhaseTracker`] a new
+    /// coherent anchor while leaving `phase` untouched. The boundary is also
+    /// a real guest milestone, so it records progress at `wall_ns`.
+    ///
+    /// Serialized by the same transition seqlock as [`Self::advance_phase`]:
+    /// a watchdog snapshot can observe either the complete old generation or
+    /// the complete new one, never a fresh CPU epoch paired with the old wall
+    /// anchor. Returns the new CPU-accounting epoch.
+    pub(crate) fn reanchor_phase_cpu(&self, wall_ns: u64) -> u32 {
+        let mut transition_seq = self.phase_transition_seq.load(Ordering::Acquire);
+        loop {
+            if transition_seq & 1 != 0 {
+                std::hint::spin_loop();
+                transition_seq = self.phase_transition_seq.load(Ordering::Acquire);
+                continue;
+            }
+            match self.phase_transition_seq.compare_exchange_weak(
+                transition_seq,
+                transition_seq.wrapping_add(1),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => transition_seq = observed,
+            }
+        }
+
+        let cpu_ns_now = self.cpu_ns_now.load(Ordering::Relaxed);
+        let next_epoch = self
+            .phase_epoch
+            .fetch_add(1, Ordering::Release)
+            .wrapping_add(1);
+        self.record_progress(cpu_ns_now, wall_ns);
+        self.phase_transition_seq
+            .store(transition_seq.wrapping_add(2), Ordering::Release);
+        next_epoch
     }
 
     /// Advance the lifecycle stage to `new_stage` ([`LifecycleStage`] as
@@ -1035,6 +1102,7 @@ impl ProgressLedger {
 
             let snapshot = LedgerSnapshot {
                 phase,
+                phase_epoch,
                 cpu_ns_now: self.cpu_ns_now.load(Ordering::Relaxed),
                 // A mismatched tag means this is the previous phase's CPU
                 // burn. Zero is the conservative Tier-1 sentinel until the
@@ -1049,6 +1117,7 @@ impl ProgressLedger {
                 wall_ns_at_progress,
                 progress_epoch,
                 monitor_heartbeat: self.monitor_heartbeat.load(Ordering::Relaxed),
+                monitor_terminal: self.monitor_terminal.load(Ordering::Acquire),
                 runnable_demand: self.runnable_demand.load(Ordering::Relaxed),
                 cpu_currency: self.cpu_currency.load(Ordering::Relaxed),
                 evidence_channels_live: self.evidence_channels_live.load(Ordering::Relaxed),
@@ -1075,6 +1144,12 @@ impl ProgressLedger {
 pub(crate) struct LedgerSnapshot {
     /// Live lifecycle stage id ([`LifecycleStage`] as `u8`).
     pub(crate) phase: u8,
+    /// Exact CPU-accounting generation paired with
+    /// `max_vcpu_cpu_in_phase_ns`. Consumers which open a finer-grained
+    /// overlay around a [`ProgressLedger::reanchor_phase_cpu`] boundary use
+    /// this tag to reject a watchdog snapshot taken immediately before the
+    /// boundary.
+    pub(crate) phase_epoch: u32,
     /// Summed per-vCPU CPU-time (ns) as of the latest monitor tick. Dilation
     /// context / dump only — no longer a kill-tier input (the summed
     /// currency is width-unsound; see `cpu_trickle_stalled`).
@@ -1099,11 +1174,16 @@ pub(crate) struct LedgerSnapshot {
     /// (`progress_epoch` bump); the watchdog's `wall_in_phase` /
     /// `wall_since_milestone` anchor.
     pub(crate) wall_ns_at_progress: u64,
-    /// Monotone count of MILESTONES (lifecycle stage advances / boot
-    /// heartbeats). Kernel scheduling noise never bumps it.
+    /// Monotone count of MILESTONES (lifecycle stage advances, boot
+    /// heartbeats, and accepted attach boundaries). Kernel scheduling noise
+    /// never bumps it.
     pub(crate) progress_epoch: u64,
     /// Monitor liveness pulse (bumped unconditionally every tick).
     pub(crate) monitor_heartbeat: u64,
+    /// True once the host monitor is known to be terminal or unavailable.
+    /// Unlike heartbeat-derived liveness, this is an explicit monotone
+    /// terminal edge and should wake/abort observers immediately.
+    pub(crate) monitor_terminal: bool,
     /// The guest had queued work at the latest sample.
     pub(crate) runnable_demand: bool,
     /// Provenance of `cpu_ns_now` ([`CPU_CURRENCY_NONE`]/`PTHREAD`/`PMU`).
@@ -1122,6 +1202,19 @@ mod progress_ledger_tests {
     //! independent of the dispatch driver.
     use super::{CPU_CURRENCY_PTHREAD, LifecycleStage, ProgressLedger, StageClass};
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn monitor_terminal_defaults_false_and_publication_is_monotone() {
+        let l = ProgressLedger::default();
+        assert!(!l.snapshot().monitor_terminal);
+
+        l.publish_monitor_terminal();
+        assert!(l.snapshot().monitor_terminal);
+
+        // Later liveness samples cannot make a terminal monitor live again.
+        l.record_liveness(1, 2, 0, false, 3, CPU_CURRENCY_PTHREAD, false, true);
+        assert!(l.snapshot().monitor_terminal);
+    }
 
     #[test]
     fn record_liveness_and_snapshot_roundtrip_evidence_channels_live() {
@@ -1192,6 +1285,29 @@ mod progress_ledger_tests {
             true,
         );
         assert_eq!(l.snapshot().max_vcpu_cpu_in_phase_ns, 42);
+    }
+
+    #[test]
+    fn cpu_reanchor_keeps_coarse_phase_and_publishes_one_milestone() {
+        let l = ProgressLedger::default();
+        l.advance_phase(LifecycleStage::Body as u8, 10);
+        let phase_before = l.phase.load(Ordering::Relaxed);
+        let phase_epoch_before = l.phase_epoch.load(Ordering::Acquire);
+        let progress_before = l.progress_epoch.load(Ordering::Acquire);
+
+        let new_epoch = l.reanchor_phase_cpu(77);
+
+        assert_eq!(l.phase.load(Ordering::Relaxed), phase_before);
+        assert_eq!(new_epoch, phase_epoch_before.wrapping_add(1));
+        assert_eq!(l.phase_epoch.load(Ordering::Acquire), new_epoch);
+        assert_eq!(
+            l.progress_epoch.load(Ordering::Acquire),
+            progress_before + 1
+        );
+        assert_eq!(l.snapshot().wall_ns_at_progress, 77);
+        // The monitor has not published the new epoch yet, so stale
+        // max-vCPU evidence is suppressed to zero.
+        assert_eq!(l.snapshot().max_vcpu_cpu_in_phase_ns, 0);
     }
 
     #[test]

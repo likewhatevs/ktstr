@@ -153,7 +153,7 @@ const TRICKLE_STALL_CONSECUTIVE_WINDOWS: u32 = 2;
 /// (integer `b + b/2`) so that overhead does not push a healthy phase
 /// over its Tier-1 budget. Saturating so a `u64::MAX` (Body sentinel)
 /// budget cannot wrap.
-const fn widen_budget_for_currency(budget: u64, cpu_currency: u8) -> u64 {
+pub(crate) const fn widen_budget_for_currency(budget: u64, cpu_currency: u8) -> u64 {
     match cpu_currency {
         // pthread time includes VM-exit overhead — degrade the budget by
         // widening it 3/2 (integer math).
@@ -1439,6 +1439,7 @@ mod tests {
     ) -> LedgerSnapshot {
         LedgerSnapshot {
             phase,
+            phase_epoch: 0,
             // evaluate_progress reads only the max-per-vCPU field (Tier-1)
             // and the demand/channel/wall fields (Tier-2); the ledger's
             // cpu_trickle_stalled / cpu_ns_now / busiest_vcpu_window_ns feed
@@ -1450,6 +1451,7 @@ mod tests {
             wall_ns_at_progress,
             progress_epoch: 0,
             monitor_heartbeat: 0,
+            monitor_terminal: false,
             runnable_demand,
             cpu_currency,
             evidence_channels_live: channels_live,

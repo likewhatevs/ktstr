@@ -7,21 +7,571 @@ use crate::scenario::ops::ScxState;
 
 const SYSFS_SCHED_EXT_STATE: &str = "/sys/kernel/sched_ext/state";
 
-/// Scheduler CPU service allowed between semantic attach-progress edges.
+/// The guest attach observer has no local time budget.
 ///
-/// This is deliberately CPU time, not PID 1 wall time. Under a verifier
-/// storm a scheduler can be runnable but receive a small fraction of a host
-/// CPU for many wall seconds; charging that descheduled time made the old
-/// fixed 10-second window reject healthy cells. Thirty-five seconds matches
-/// the host Attach-stage service allowance while remaining far above a
-/// normal BPF open/load/attach.
-const SCHED_ATTACH_SERVICE_BUDGET: std::time::Duration = std::time::Duration::from_secs(35);
+/// Guest clocks cannot distinguish runnable guest work from host
+/// descheduling on every supported architecture (notably arm64 without
+/// PVTIME). The host attach-attempt watchdog owns the single authoritative
+/// max-vCPU service budget and wakes this observer through its cancellation
+/// event source. Keeping the guest loop purely event-driven makes the same
+/// rule apply at boot and during Attach/Replace/Restart operations.
+const SCHED_ATTACH_OBSERVER_CADENCE: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Last-resort guard for a scheduler that consumes no service and makes no
-/// progress (for example, a permanently blocked userspace loader). The host's
-/// phase-aware watchdog remains authoritative; this guard is intentionally
-/// much wider than the old 10-second wall window.
-const SCHED_ATTACH_WALL_GUARD: std::time::Duration = std::time::Duration::from_secs(90);
+/// Retransmission cadence for a boundary whose exact host ACK has not arrived.
+///
+/// This is not a guest verdict timeout: retries continue indefinitely. The
+/// host max-vCPU watchdog remains the only attach budget authority.
+const ATTACH_BOUNDARY_RETRY_CADENCE: std::time::Duration = std::time::Duration::from_millis(250);
+
+static NEXT_ATTACH_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum AttachControlReaderHealth {
+    #[default]
+    NotStarted,
+    Live,
+    Terminal(String),
+}
+
+#[derive(Debug, Default)]
+struct AttachControlSnapshot {
+    active_generation: Option<u64>,
+    started_acked: bool,
+    finished_acked: bool,
+    cancellation: Option<crate::vmm::wire::AttachCancelCause>,
+    reader: AttachControlReaderHealth,
+}
+
+impl AttachControlSnapshot {
+    fn register_generation(&mut self, generation: u64) -> Result<(), String> {
+        if generation == 0 {
+            return Err("register zero scheduler-attach generation".into());
+        }
+        if let Some(active) = self.active_generation {
+            return Err(format!(
+                "scheduler-attach generation {active} is already active; \
+                 cannot register concurrent generation {generation}"
+            ));
+        }
+        self.active_generation = Some(generation);
+        self.started_acked = false;
+        self.finished_acked = false;
+        self.cancellation = None;
+        Ok(())
+    }
+
+    fn clear_generation(&mut self, generation: u64) {
+        if self.active_generation != Some(generation) {
+            return;
+        }
+        self.active_generation = None;
+        self.started_acked = false;
+        self.finished_acked = false;
+        self.cancellation = None;
+    }
+
+    fn observe_packet(&mut self, packet: crate::vmm::wire::AttachControlPacket) -> bool {
+        if self.active_generation != Some(packet.generation()) {
+            return false;
+        }
+        use crate::vmm::wire::AttachControlPacket;
+        match packet {
+            AttachControlPacket::StartedAck { .. } => {
+                self.started_acked = true;
+            }
+            AttachControlPacket::FinishedAck { .. } => {
+                self.finished_acked = true;
+            }
+            AttachControlPacket::Cancel { cause, .. } => {
+                self.cancellation = Some(cause);
+            }
+        }
+        true
+    }
+
+    fn view(&self, generation: u64) -> AttachControlView {
+        let exact = self.active_generation == Some(generation);
+        AttachControlView {
+            started_acked: exact && self.started_acked,
+            finished_acked: exact && self.finished_acked,
+            cancellation: exact.then_some(self.cancellation).flatten(),
+            reader_error: match &self.reader {
+                AttachControlReaderHealth::NotStarted => {
+                    Some("hvc0 scheduler-attach control reader has not started".into())
+                }
+                AttachControlReaderHealth::Live => None,
+                AttachControlReaderHealth::Terminal(reason) => Some(reason.clone()),
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AttachControlView {
+    started_acked: bool,
+    finished_acked: bool,
+    cancellation: Option<crate::vmm::wire::AttachCancelCause>,
+    reader_error: Option<String>,
+}
+
+struct AttachControlState {
+    snapshot: std::sync::Mutex<AttachControlSnapshot>,
+    eventfd: OwnedFd,
+}
+
+static ATTACH_CONTROL_STATE: OnceLock<Result<AttachControlState, String>> = OnceLock::new();
+
+fn attach_control_state() -> Result<&'static AttachControlState, String> {
+    ATTACH_CONTROL_STATE
+        .get_or_init(|| {
+            // SAFETY: eventfd has no pointer arguments. The returned
+            // descriptor is wrapped exactly once below.
+            let raw = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+            if raw < 0 {
+                return Err(format!(
+                    "create scheduler-attach cancellation eventfd: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(AttachControlState {
+                snapshot: std::sync::Mutex::new(AttachControlSnapshot::default()),
+                // SAFETY: eventfd returned this fresh descriptor and ownership
+                // transfers to the process-wide attach control state.
+                eventfd: unsafe { OwnedFd::from_raw_fd(raw) },
+            })
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+fn wake_attach_control(state: &AttachControlState) -> Result<(), String> {
+    let value = 1u64.to_ne_bytes();
+    // SAFETY: state.eventfd is a live nonblocking counter-mode eventfd and
+    // eventfd writes require exactly one u64.
+    let written = unsafe {
+        libc::write(
+            state.eventfd.as_raw_fd(),
+            value.as_ptr().cast::<libc::c_void>(),
+            value.len(),
+        )
+    };
+    if written == value.len() as isize {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return Ok(());
+    }
+    Err(format!("wake scheduler-attach control eventfd: {error}"))
+}
+
+fn deliver_scheduler_attach_control(
+    packet: crate::vmm::wire::AttachControlPacket,
+) -> Result<(), String> {
+    if packet.generation() == 0 {
+        return Err("deliver zero scheduler-attach control generation".into());
+    }
+    let state = attach_control_state()?;
+    {
+        let mut snapshot = state
+            .snapshot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        snapshot.observe_packet(packet);
+    }
+    wake_attach_control(state)
+}
+
+fn register_attach_control_generation(generation: u64) -> Result<(), String> {
+    let state = attach_control_state()?;
+    let mut snapshot = state
+        .snapshot
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    snapshot.register_generation(generation)
+}
+
+fn clear_attach_control_generation(generation: u64) {
+    let Ok(state) = attach_control_state() else {
+        return;
+    };
+    state
+        .snapshot
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clear_generation(generation);
+}
+
+pub(crate) fn acknowledge_scheduler_attach_started(generation: u64) -> Result<(), String> {
+    deliver_scheduler_attach_control(crate::vmm::wire::AttachControlPacket::StartedAck {
+        generation,
+    })
+}
+
+pub(crate) fn acknowledge_scheduler_attach_finished(generation: u64) -> Result<(), String> {
+    deliver_scheduler_attach_control(crate::vmm::wire::AttachControlPacket::FinishedAck {
+        generation,
+    })
+}
+
+/// Deliver a typed host attach-budget cancellation to the exact guest attempt.
+pub(crate) fn cancel_scheduler_attach(
+    generation: u64,
+    cause: crate::vmm::wire::AttachCancelCause,
+) -> Result<(), String> {
+    deliver_scheduler_attach_control(crate::vmm::wire::AttachControlPacket::Cancel {
+        generation,
+        cause,
+    })
+}
+
+/// Publish control-reader health before any scheduler attempt can begin.
+pub(crate) fn scheduler_attach_control_reader_started() -> Result<(), String> {
+    let state = attach_control_state()?;
+    let mut snapshot = state
+        .snapshot
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    match &snapshot.reader {
+        AttachControlReaderHealth::NotStarted => {
+            snapshot.reader = AttachControlReaderHealth::Live;
+            Ok(())
+        }
+        AttachControlReaderHealth::Live => {
+            Err("hvc0 scheduler-attach control reader already started".into())
+        }
+        AttachControlReaderHealth::Terminal(reason) => Err(format!(
+            "hvc0 scheduler-attach control reader already terminated: {reason}"
+        )),
+    }
+}
+
+/// Mark the hvc0 control reader terminal and wake every attach ACK/observer
+/// wait. The reason is retained so a wake cannot degrade into a generic hang.
+pub(crate) fn scheduler_attach_control_reader_terminated(
+    reason: impl Into<String>,
+) -> Result<(), String> {
+    let state = attach_control_state()?;
+    {
+        let mut snapshot = state
+            .snapshot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        snapshot.reader = AttachControlReaderHealth::Terminal(reason.into());
+    }
+    wake_attach_control(state)
+}
+
+fn attach_control_view(generation: u64) -> Result<AttachControlView, String> {
+    let state = attach_control_state()?;
+    let snapshot = state
+        .snapshot
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    Ok(snapshot.view(generation))
+}
+
+fn wait_attach_control_wake(fd: &OwnedFd, timeout: std::time::Duration) -> Result<(), String> {
+    let timeout_ms = timeout
+        .as_millis()
+        .saturating_add(u128::from(
+            !timeout.subsec_nanos().is_multiple_of(1_000_000),
+        ))
+        .min(i32::MAX as u128) as libc::c_int;
+    let mut pfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: fd is owned for the duration of poll and poll only writes
+    // `revents`.
+    let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if rc < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(());
+        }
+        return Err(format!("scheduler-attach control poll failed: {error}"));
+    }
+    if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+        return Err(format!(
+            "scheduler-attach control eventfd returned terminal events {:#x}",
+            pfd.revents
+        ));
+    }
+    if pfd.revents & libc::POLLIN == 0 {
+        return Ok(());
+    }
+
+    let mut value = [0u8; 8];
+    // SAFETY: fd is a live counter-mode eventfd and the destination is exactly
+    // one u64 wide.
+    let read = unsafe {
+        libc::read(
+            fd.as_raw_fd(),
+            value.as_mut_ptr().cast::<libc::c_void>(),
+            value.len(),
+        )
+    };
+    if read == value.len() as isize {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if read < 0 && error.kind() == std::io::ErrorKind::WouldBlock {
+        return Ok(());
+    }
+    Err(if read < 0 {
+        format!("drain scheduler-attach control eventfd: {error}")
+    } else {
+        format!("short scheduler-attach control eventfd read: {read}")
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachTerminalPhase {
+    Open,
+    Finishing,
+    FinishedAcked,
+    Settled,
+}
+
+impl AttachTerminalPhase {
+    const fn drop_retry(self) -> Option<crate::vmm::wire::AttachAttemptTransition> {
+        match self {
+            Self::Open | Self::Finishing => {
+                Some(crate::vmm::wire::AttachAttemptTransition::Finished)
+            }
+            Self::FinishedAcked => Some(crate::vmm::wire::AttachAttemptTransition::Settled),
+            Self::Settled => None,
+        }
+    }
+}
+
+struct SchedulerAttachAttempt {
+    generation: u64,
+    kind: crate::vmm::wire::AttachAttemptKind,
+    control_fd: OwnedFd,
+    started_published: bool,
+    terminal_phase: AttachTerminalPhase,
+    cancellation: Option<crate::vmm::wire::AttachCancelCause>,
+}
+
+impl SchedulerAttachAttempt {
+    fn begin(kind: crate::vmm::wire::AttachAttemptKind) -> Result<Self, String> {
+        let generation = NEXT_ATTACH_GENERATION.fetch_add(1, Ordering::AcqRel);
+        if generation == 0 {
+            return Err("scheduler-attach generation counter wrapped".into());
+        }
+        let state = attach_control_state()?;
+        let control_fd = state
+            .eventfd
+            .try_clone()
+            .map_err(|error| format!("clone scheduler-attach control eventfd: {error}"))?;
+        register_attach_control_generation(generation)?;
+        let mut attempt = Self {
+            generation,
+            kind,
+            control_fd,
+            started_published: false,
+            terminal_phase: AttachTerminalPhase::Open,
+            cancellation: None,
+        };
+        if !attempt.emit(crate::vmm::wire::AttachAttemptTransition::Started) {
+            return Err(format!(
+                "publish scheduler-attach start for generation {generation}"
+            ));
+        }
+        attempt.started_published = true;
+        if let Err(error) = attempt.await_started_ack() {
+            let close = attempt.close_terminal();
+            return Err(match close {
+                Ok(()) => error,
+                Err(close_error) => {
+                    format!("{error}; scheduler-attach terminal close failed: {close_error}")
+                }
+            });
+        }
+        Ok(attempt)
+    }
+
+    fn emit(&self, transition: crate::vmm::wire::AttachAttemptTransition) -> bool {
+        crate::vmm::guest_comms::send_attach_attempt(crate::vmm::wire::AttachAttemptEvent {
+            transition,
+            kind: self.kind,
+            generation: self.generation,
+        })
+    }
+
+    fn cancellation_error(&self, cause: crate::vmm::wire::AttachCancelCause) -> String {
+        format!(
+            "scheduler-attach generation {} cancelled: cause={}",
+            self.generation,
+            cause.label()
+        )
+    }
+
+    fn await_started_ack(&mut self) -> Result<(), String> {
+        loop {
+            let view = attach_control_view(self.generation)?;
+            if let Some(cause) = view.cancellation {
+                self.cancellation = Some(cause);
+                return Err(self.cancellation_error(cause));
+            }
+            if view.started_acked {
+                return Ok(());
+            }
+            if let Some(reason) = view.reader_error {
+                return Err(format!(
+                    "scheduler-attach Started ACK reader terminated for generation {}: {reason}",
+                    self.generation
+                ));
+            }
+
+            wait_attach_control_wake(&self.control_fd, ATTACH_BOUNDARY_RETRY_CADENCE)?;
+            if !self.emit(crate::vmm::wire::AttachAttemptTransition::Started) {
+                tracing::warn!(
+                    generation = self.generation,
+                    kind = ?self.kind,
+                    "retry of scheduler-attach Started boundary was not queued"
+                );
+            }
+        }
+    }
+
+    /// Publish Finished and wait event-driven for the exact host ACK. The
+    /// attempt deliberately remains in `Finishing` after this returns; the
+    /// owner commit must happen before [`Self::settle`].
+    fn await_finished_ack(&mut self) -> Result<(), String> {
+        match self.terminal_phase {
+            AttachTerminalPhase::Open => {
+                self.terminal_phase = AttachTerminalPhase::Finishing;
+                if !self.emit(crate::vmm::wire::AttachAttemptTransition::Finished) {
+                    tracing::warn!(
+                        generation = self.generation,
+                        kind = ?self.kind,
+                        "initial scheduler-attach Finished boundary was not queued"
+                    );
+                }
+            }
+            AttachTerminalPhase::Finishing => {}
+            AttachTerminalPhase::FinishedAcked => {
+                return self
+                    .cancellation
+                    .map_or(Ok(()), |cause| Err(self.cancellation_error(cause)));
+            }
+            AttachTerminalPhase::Settled => {
+                return Err("scheduler attach attempt already settled".into());
+            }
+        }
+
+        loop {
+            let view = attach_control_view(self.generation)?;
+            if let Some(cause) = view.cancellation {
+                self.cancellation = Some(cause);
+            }
+            if view.finished_acked {
+                self.terminal_phase = AttachTerminalPhase::FinishedAcked;
+                return self
+                    .cancellation
+                    .map_or(Ok(()), |cause| Err(self.cancellation_error(cause)));
+            }
+            if let Some(reason) = view.reader_error {
+                return Err(format!(
+                    "scheduler-attach Finished ACK reader terminated for generation {}: {reason}",
+                    self.generation
+                ));
+            }
+
+            wait_attach_control_wake(&self.control_fd, ATTACH_BOUNDARY_RETRY_CADENCE)?;
+            if !self.emit(crate::vmm::wire::AttachAttemptTransition::Finished) {
+                tracing::warn!(
+                    generation = self.generation,
+                    kind = ?self.kind,
+                    "retry of scheduler-attach Finished boundary was not queued"
+                );
+            }
+        }
+    }
+
+    /// Reliably queue Settled after FinishedAck. Port-1 writes are FIFO, so
+    /// every later guest frame is necessarily ordered after this close.
+    fn settle(mut self) -> Result<(), String> {
+        if self.terminal_phase != AttachTerminalPhase::FinishedAcked {
+            return Err(format!(
+                "settle scheduler-attach generation {} before Finished ACK",
+                self.generation
+            ));
+        }
+        loop {
+            if self.emit(crate::vmm::wire::AttachAttemptTransition::Settled) {
+                self.terminal_phase = AttachTerminalPhase::Settled;
+                return Ok(());
+            }
+            tracing::warn!(
+                generation = self.generation,
+                kind = ?self.kind,
+                "retrying scheduler-attach Settled boundary"
+            );
+            wait_attach_control_wake(&self.control_fd, ATTACH_BOUNDARY_RETRY_CADENCE)?;
+        }
+    }
+
+    fn complete_terminal(mut self, surface_cancellation: bool) -> Result<(), String> {
+        let ack = self.await_finished_ack();
+        if self.terminal_phase != AttachTerminalPhase::FinishedAcked {
+            return ack;
+        }
+        // FinishedAck is exact, so the only error paired with an acknowledged
+        // terminal phase is a typed host cancellation. Failure cleanup already
+        // owns that cause and only needs proof the overlay closed; success
+        // commit must preserve it and fail.
+        let outcome_error = ack.err();
+        let settled = self.settle();
+        settled?;
+        if surface_cancellation {
+            outcome_error.map_or(Ok(()), Err)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Complete the three-way terminal protocol on every non-success path:
+    /// Finished → exact FinishedAck → Settled. The failure path already owns
+    /// any typed cancellation cause, so successful closure itself returns Ok.
+    fn close_terminal(self) -> Result<(), String> {
+        self.complete_terminal(false)
+    }
+
+    /// Complete the same protocol for a would-be success and preserve a
+    /// simultaneous typed cancellation as a failure after Settled is queued.
+    fn finish_terminal(self) -> Result<(), String> {
+        self.complete_terminal(true)
+    }
+}
+
+impl Drop for SchedulerAttachAttempt {
+    fn drop(&mut self) {
+        // The host treats both terminal boundaries as generation-tagged,
+        // idempotent state transitions. Drop emits exactly one best-effort
+        // retry appropriate to the phase: Finished before its ACK, Settled
+        // after the ACK. It never manufactures a new generation or reanchors
+        // a duplicate.
+        if self.started_published
+            && let Some(transition) = self.terminal_phase.drop_retry()
+        {
+            let sent = self.emit(transition);
+            if !sent {
+                tracing::error!(
+                    generation = self.generation,
+                    kind = ?self.kind,
+                    ?transition,
+                    "failed to publish idempotent scheduler-attach terminal boundary from Drop"
+                );
+            }
+        }
+        clear_attach_control_generation(self.generation);
+    }
+}
 
 /// Outcome of [`poll_scx_attached`].
 #[derive(Debug, PartialEq, Eq)]
@@ -40,10 +590,9 @@ enum ScxAttachStatus {
     /// Attach made a terminal backwards transition (registered/enabling to
     /// disabling/disabled).
     Rejected(AttachDiagnostic),
-    /// No semantic progress consumed the allowed scheduler CPU service.
-    ServiceBudgetExceeded(AttachDiagnostic),
-    /// Last-resort wall guard fired while service remained below its budget.
-    WallGuardExceeded(AttachDiagnostic),
+    /// The host's max-vCPU attach-service budget expired for this exact
+    /// attach generation.
+    Cancelled(AttachDiagnostic, crate::vmm::wire::AttachCancelCause),
     /// The stable `/sys/kernel/sched_ext/state` node is absent. A missing
     /// dynamic `root/ops` node is normal before registration and never maps
     /// to this variant.
@@ -110,17 +659,15 @@ enum AttachProgress {
 struct AttachDiagnostic {
     snapshot: ScxAttachSnapshot,
     wall: std::time::Duration,
-    service: std::time::Duration,
 }
 
 impl AttachDiagnostic {
     fn reason(&self, cause: &str) -> String {
         format!(
-            "cause={cause} state={} ops={} wall_ms={} service_ms={}",
+            "cause={cause} state={} ops={} wall_ms={}",
             self.snapshot.state_label(),
             self.snapshot.ops_label(),
             self.wall.as_millis(),
-            self.service.as_millis(),
         )
     }
 }
@@ -180,30 +727,19 @@ fn classify_attach_snapshot(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct AttachWaitPolicy {
-    cadence: std::time::Duration,
-    service_budget: std::time::Duration,
-    wall_guard: std::time::Duration,
-}
-
 trait AttachWaitIo {
     fn child_exited(&mut self) -> Result<bool, String>;
+    fn cancelled(&mut self) -> Result<Option<crate::vmm::wire::AttachCancelCause>, String>;
+    fn control_reader_error(&mut self) -> Result<Option<String>, String>;
     fn snapshot(&mut self) -> Result<ScxAttachSnapshot, String>;
-    fn service_elapsed(&mut self) -> Result<std::time::Duration, String>;
     fn wall_elapsed(&mut self) -> std::time::Duration;
     fn wait(&mut self, timeout: std::time::Duration) -> Result<(), String>;
 }
 
-/// Policy loop split from Linux fd setup so deadline/process/state precedence is
-/// deterministic under unit tests.
-fn wait_scx_attach_with(io: &mut impl AttachWaitIo, policy: AttachWaitPolicy) -> ScxAttachStatus {
+/// Observer loop split from Linux fd setup so process/state/cancellation
+/// precedence is deterministic under unit tests.
+fn wait_scx_attach_with(io: &mut impl AttachWaitIo) -> ScxAttachStatus {
     let mut high_water = AttachProgress::Loading;
-    let mut service_checkpoint = match io.service_elapsed() {
-        Ok(service) => service,
-        Err(error) => return ScxAttachStatus::ObserverError(error),
-    };
-    let mut last_service = service_checkpoint;
 
     loop {
         // Death wins over a stale `enabled` snapshot. Check both around the
@@ -223,32 +759,9 @@ fn wait_scx_attach_with(io: &mut impl AttachWaitIo, policy: AttachWaitPolicy) ->
             Err(error) => return ScxAttachStatus::ObserverError(error),
         }
 
-        let wall = io.wall_elapsed();
-        let service = match io.service_elapsed() {
-            Ok(service) => service,
-            Err(error) => {
-                // A clock lookup can race process exit. Re-check pidfd before
-                // classifying it as an observer failure.
-                return match io.child_exited() {
-                    Ok(true) => ScxAttachStatus::Died,
-                    Ok(false) => ScxAttachStatus::ObserverError(error),
-                    Err(pidfd_error) => ScxAttachStatus::ObserverError(format!(
-                        "{error}; pidfd recheck also failed: {pidfd_error}"
-                    )),
-                };
-            }
-        };
-        if service < last_service {
-            return ScxAttachStatus::ObserverError(format!(
-                "scheduler CPU service clock regressed from {:?} to {:?}",
-                last_service, service
-            ));
-        }
-        last_service = service;
         let diagnostic = AttachDiagnostic {
             snapshot: snapshot.clone(),
-            wall,
-            service,
+            wall: io.wall_elapsed(),
         };
 
         // The source-of-truth predicate is evaluated before either budget.
@@ -266,51 +779,57 @@ fn wait_scx_attach_with(io: &mut impl AttachWaitIo, policy: AttachWaitPolicy) ->
             AttachProbe::Pending(progress) => {
                 if progress > high_water {
                     high_water = progress;
-                    service_checkpoint = service;
                 }
             }
         }
 
-        if service.saturating_sub(service_checkpoint) >= policy.service_budget {
-            return ScxAttachStatus::ServiceBudgetExceeded(diagnostic);
+        match io.cancelled() {
+            Ok(Some(cause)) => return ScxAttachStatus::Cancelled(diagnostic, cause),
+            Ok(None) => {}
+            Err(error) => return ScxAttachStatus::ObserverError(error),
         }
-        if wall >= policy.wall_guard {
-            return ScxAttachStatus::WallGuardExceeded(diagnostic);
+        match io.control_reader_error() {
+            Ok(Some(error)) => return ScxAttachStatus::ObserverError(error),
+            Ok(None) => {}
+            Err(error) => return ScxAttachStatus::ObserverError(error),
         }
 
-        let remaining_wall = policy.wall_guard.saturating_sub(wall);
-        if let Err(error) = io.wait(policy.cadence.min(remaining_wall)) {
+        if let Err(error) = io.wait(SCHED_ATTACH_OBSERVER_CADENCE) {
             return ScxAttachStatus::ObserverError(error);
         }
     }
 }
 
 struct LinuxAttachWait {
+    attempt: SchedulerAttachAttempt,
     pidfd: OwnedFd,
     state_file: fs::File,
     inotify: nix::sys::inotify::Inotify,
-    service_clock: libc::clockid_t,
-    service_start: std::time::Duration,
     wall_start: std::time::Instant,
 }
 
-impl LinuxAttachWait {
-    fn new(pid: u32) -> Result<Self, ScxAttachStatus> {
-        let raw_pidfd =
-            unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0u32) as libc::c_int };
-        if raw_pidfd < 0 {
-            let error = std::io::Error::last_os_error();
-            return if error.raw_os_error() == Some(libc::ESRCH) {
-                Err(ScxAttachStatus::Died)
-            } else {
-                Err(ScxAttachStatus::ObserverError(format!(
-                    "pidfd_open({pid}) failed: {error}"
-                )))
-            };
-        }
-        // SAFETY: pidfd_open returned a new descriptor owned by this value.
-        let pidfd = unsafe { OwnedFd::from_raw_fd(raw_pidfd) };
+fn open_scheduler_pidfd(pid: u32) -> Result<OwnedFd, ScxAttachStatus> {
+    let raw_pidfd =
+        unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0u32) as libc::c_int };
+    if raw_pidfd < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Err(ScxAttachStatus::Died)
+        } else {
+            Err(ScxAttachStatus::ObserverError(format!(
+                "pidfd_open({pid}) failed: {error}"
+            )))
+        };
+    }
+    // SAFETY: pidfd_open returned a new descriptor owned by this value.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw_pidfd) })
+}
 
+impl LinuxAttachWait {
+    fn new(
+        pidfd: OwnedFd,
+        attempt: SchedulerAttachAttempt,
+    ) -> Result<Self, (ScxAttachStatus, OwnedFd, SchedulerAttachAttempt)> {
         let state_file = match fs::File::open(SYSFS_SCHED_EXT_STATE) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -318,94 +837,65 @@ impl LinuxAttachWait {
                     state: StateObservation::Missing,
                     ops: OpsObservation::Missing,
                 };
-                return Err(ScxAttachStatus::SysfsAbsent(AttachDiagnostic {
-                    snapshot,
-                    wall: std::time::Duration::ZERO,
-                    service: std::time::Duration::ZERO,
-                }));
+                return Err((
+                    ScxAttachStatus::SysfsAbsent(AttachDiagnostic {
+                        snapshot,
+                        wall: std::time::Duration::ZERO,
+                    }),
+                    pidfd,
+                    attempt,
+                ));
             }
             Err(error) => {
-                return Err(ScxAttachStatus::ObserverError(format!(
-                    "open {SYSFS_SCHED_EXT_STATE}: {error}"
-                )));
+                return Err((
+                    ScxAttachStatus::ObserverError(format!(
+                        "open {SYSFS_SCHED_EXT_STATE}: {error}"
+                    )),
+                    pidfd,
+                    attempt,
+                ));
             }
         };
 
         use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
-        let inotify =
-            Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC).map_err(|error| {
-                ScxAttachStatus::ObserverError(format!("inotify_init1 for sched_ext: {error}"))
-            })?;
-        inotify
-            .add_watch(
-                "/sys/kernel/sched_ext/",
-                AddWatchFlags::IN_CREATE
-                    | AddWatchFlags::IN_MOVED_TO
-                    | AddWatchFlags::IN_DELETE
-                    | AddWatchFlags::IN_MOVED_FROM,
-            )
-            .map_err(|error| {
-                ScxAttachStatus::ObserverError(format!(
-                    "inotify_add_watch(/sys/kernel/sched_ext): {error}"
-                ))
-            })?;
-
-        let mut service_clock: libc::clockid_t = 0;
-        // SAFETY: `service_clock` is a valid output pointer and pid identifies
-        // the child just spawned by this process.
-        let rc = unsafe { libc::clock_getcpuclockid(pid as libc::pid_t, &mut service_clock) };
-        if rc != 0 {
-            return if rc == libc::ESRCH {
-                Err(ScxAttachStatus::Died)
-            } else {
-                Err(ScxAttachStatus::ObserverError(format!(
-                    "clock_getcpuclockid({pid}) failed: {}",
-                    std::io::Error::from_raw_os_error(rc)
-                )))
-            };
-        }
-        let service_start = match read_cpu_clock(service_clock) {
-            Ok(service) => service,
-            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
-                return Err(ScxAttachStatus::Died);
-            }
+        let inotify = match Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC) {
+            Ok(inotify) => inotify,
             Err(error) => {
-                return Err(ScxAttachStatus::ObserverError(format!(
-                    "read scheduler CPU service clock: {error}"
-                )));
+                return Err((
+                    ScxAttachStatus::ObserverError(format!("inotify_init1 for sched_ext: {error}")),
+                    pidfd,
+                    attempt,
+                ));
             }
         };
+        if let Err(error) = inotify.add_watch(
+            "/sys/kernel/sched_ext/",
+            AddWatchFlags::IN_CREATE
+                | AddWatchFlags::IN_MOVED_TO
+                | AddWatchFlags::IN_DELETE
+                | AddWatchFlags::IN_MOVED_FROM,
+        ) {
+            return Err((
+                ScxAttachStatus::ObserverError(format!(
+                    "inotify_add_watch(/sys/kernel/sched_ext): {error}"
+                )),
+                pidfd,
+                attempt,
+            ));
+        }
 
         Ok(Self {
+            attempt,
             pidfd,
             state_file,
             inotify,
-            service_clock,
-            service_start,
             wall_start: std::time::Instant::now(),
         })
     }
-}
 
-fn read_cpu_clock(clock: libc::clockid_t) -> Result<std::time::Duration, std::io::Error> {
-    let mut value = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `value` is a valid output pointer and `clock` came from
-    // clock_getcpuclockid.
-    if unsafe { libc::clock_gettime(clock, &mut value) } != 0 {
-        return Err(std::io::Error::last_os_error());
+    fn into_parts(self) -> (OwnedFd, SchedulerAttachAttempt) {
+        (self.pidfd, self.attempt)
     }
-    if value.tv_sec < 0 || value.tv_nsec < 0 {
-        return Err(std::io::Error::other(
-            "scheduler CPU clock returned a negative value",
-        ));
-    }
-    Ok(std::time::Duration::new(
-        value.tv_sec as u64,
-        value.tv_nsec as u32,
-    ))
 }
 
 fn read_state_observation(file: &mut fs::File) -> StateObservation {
@@ -465,18 +955,19 @@ impl AttachWaitIo for LinuxAttachWait {
         Ok(pfd.revents & (libc::POLLIN | libc::POLLHUP) != 0)
     }
 
+    fn cancelled(&mut self) -> Result<Option<crate::vmm::wire::AttachCancelCause>, String> {
+        Ok(attach_control_view(self.attempt.generation)?.cancellation)
+    }
+
+    fn control_reader_error(&mut self) -> Result<Option<String>, String> {
+        Ok(attach_control_view(self.attempt.generation)?.reader_error)
+    }
+
     fn snapshot(&mut self) -> Result<ScxAttachSnapshot, String> {
         Ok(ScxAttachSnapshot {
             state: read_state_observation(&mut self.state_file),
             ops: read_ops_observation(),
         })
-    }
-
-    fn service_elapsed(&mut self) -> Result<std::time::Duration, String> {
-        let now = read_cpu_clock(self.service_clock)
-            .map_err(|error| format!("read scheduler CPU service clock: {error}"))?;
-        now.checked_sub(self.service_start)
-            .ok_or_else(|| "scheduler CPU service clock regressed below its baseline".into())
     }
 
     fn wall_elapsed(&mut self) -> std::time::Duration {
@@ -506,8 +997,13 @@ impl AttachWaitIo for LinuxAttachWait {
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: self.attempt.control_fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
-        // SAFETY: all three descriptors are owned by self for the duration of
+        // SAFETY: all descriptors are owned by self for the duration of
         // poll; poll only writes the revents fields.
         let rc = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as _, timeout_ms) };
         if rc < 0 {
@@ -526,22 +1022,50 @@ impl AttachWaitIo for LinuxAttachWait {
         // kernfs conventionally reports a notified attribute as
         // POLLPRI|POLLERR, so POLLERR is a wake bit for this fd, not a broken
         // source. POLLNVAL still means our stable state fd became invalid.
-        if pfds[1].revents & libc::POLLNVAL != 0 {
+        if pfds[1].revents & (libc::POLLHUP | libc::POLLNVAL) != 0 {
             return Err(format!(
-                "sched_ext state returned invalid-fd poll events {:#x}",
+                "sched_ext state returned terminal poll events {:#x}",
                 pfds[1].revents
             ));
         }
-        if pfds[2].revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+        if pfds[2].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
             return Err(format!(
                 "sched_ext inotify returned unexpected poll events {:#x}",
                 pfds[2].revents
             ));
         }
         if pfds[2].revents & libc::POLLIN != 0 {
-            self.inotify
-                .read_events()
-                .map_err(|error| format!("drain sched_ext inotify events: {error}"))?;
+            match self.inotify.read_events() {
+                Ok(_) | Err(nix::errno::Errno::EAGAIN) => {}
+                Err(error) => {
+                    return Err(format!("drain sched_ext inotify events: {error}"));
+                }
+            }
+        }
+        if pfds[3].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(format!(
+                "scheduler-attach cancellation eventfd returned unexpected poll events {:#x}",
+                pfds[3].revents
+            ));
+        }
+        if pfds[3].revents & libc::POLLIN != 0 {
+            let mut value = [0u8; 8];
+            // SAFETY: control_fd is a live counter-mode eventfd and the
+            // destination is exactly one u64 wide.
+            let read = unsafe {
+                libc::read(
+                    self.attempt.control_fd.as_raw_fd(),
+                    value.as_mut_ptr().cast::<libc::c_void>(),
+                    value.len(),
+                )
+            };
+            if read < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock
+            {
+                return Err(format!(
+                    "drain scheduler-attach control eventfd: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
         }
         Ok(())
     }
@@ -599,22 +1123,21 @@ pub(crate) fn scx_attach_ready(root_ops_contents: &str, state: Option<ScxState>)
 /// can run against a fully-up scheduler. Before that point, pidfd readiness
 /// wins over a stale sysfs snapshot and reports the scheduler's actual exit.
 ///
-/// The progress budget is denominated in scheduler process CPU service, not
-/// guest wall time. Host descheduling under a 52-cell storm therefore cannot
-/// consume the attach allowance.
-fn poll_scx_attached(pid: u32) -> ScxAttachStatus {
-    let mut io = match LinuxAttachWait::new(pid) {
+/// The host's attach-attempt overlay owns the max-vCPU service budget. This
+/// observer waits only for semantic sysfs edges, scheduler death, or the exact
+/// generation's cancellation edge, so host descheduling under a verifier storm
+/// cannot consume a second guest-local timeout.
+fn poll_scx_attached(
+    pidfd: OwnedFd,
+    attempt: SchedulerAttachAttempt,
+) -> (ScxAttachStatus, OwnedFd, SchedulerAttachAttempt) {
+    let mut io = match LinuxAttachWait::new(pidfd, attempt) {
         Ok(io) => io,
-        Err(status) => return status,
+        Err(outcome) => return outcome,
     };
-    wait_scx_attach_with(
-        &mut io,
-        AttachWaitPolicy {
-            cadence: std::time::Duration::from_millis(50),
-            service_budget: SCHED_ATTACH_SERVICE_BUDGET,
-            wall_guard: SCHED_ATTACH_WALL_GUARD,
-        },
-    )
+    let status = wait_scx_attach_with(&mut io);
+    let (pidfd, attempt) = io.into_parts();
+    (status, pidfd, attempt)
 }
 
 /// Test-only pin for the standalone pidfd liveness primitive which preceded
@@ -736,7 +1259,10 @@ pub(crate) struct ProbeDrain {
 ///
 /// `drain` is `None` when no probe stack was supplied — every caller is a
 /// no-op in that case.
-fn drain_probe_pipeline(drain: Option<&ProbeDrain>, timeout: std::time::Duration) -> bool {
+pub(crate) fn drain_probe_pipeline(
+    drain: Option<&ProbeDrain>,
+    timeout: std::time::Duration,
+) -> bool {
     let Some(d) = drain else { return true };
     d.stop.store(true, Ordering::Release);
     let drained = d.output_done.wait_timeout(timeout);
@@ -781,8 +1307,9 @@ pub(crate) fn reap_child_bounded_status(
 
 /// Start the boot scheduler binary if it exists. Thin wrapper around
 /// [`spawn_scheduler_from_paths`] supplying the boot-time paths
-/// (`/scheduler` + `/sched_args` + `/tmp/sched.log`). Returns the
-/// child process and the path to its log file.
+/// (`/scheduler` + `/sched_args` + `/tmp/sched.log`). The returned object
+/// retains the exact attach pidfd for the caller to transfer into the exit
+/// monitor before publishing attach success.
 ///
 /// Mid-experiment scheduler-lifecycle Op dispatch
 /// ([`Op::AttachScheduler`](crate::scenario::ops::Op::AttachScheduler) /
@@ -791,7 +1318,7 @@ pub(crate) fn reap_child_bounded_status(
 /// `/staging/schedulers/<name>/` so swap binaries don't shadow the
 /// boot slot.
 #[tracing::instrument(skip(probe_drain))]
-pub(crate) fn start_scheduler(probe_drain: Option<ProbeDrain>) -> (Option<Child>, Option<String>) {
+pub(crate) fn start_scheduler(probe_drain: Option<ProbeDrain>) -> Option<SpawnedScheduler> {
     spawn_scheduler_from_paths("/scheduler", "/sched_args", "/tmp/sched.log", probe_drain)
 }
 
@@ -865,11 +1392,11 @@ impl std::fmt::Display for SpawnSchedulerError {
                 write!(
                     f,
                     "scheduler stayed alive but did not complete sched_ext attach: \
-                     {reason}. Attach progress is charged in scheduler CPU service, \
-                     so host descheduling does not consume the allowance. Log \
-                     captured at {log_path}; the framework terminated the \
-                     unattached process and cleared SCHED_PID before surfacing this \
-                     error."
+                     {reason}. The host charges the attempt in max-vCPU service, so \
+                     host descheduling does not consume the allowance. Log captured \
+                     at {log_path}; the framework terminated the unattached process \
+                     through its pinned pidfd and cleared SCHED_PID before surfacing \
+                     this error."
                 )
             }
         }
@@ -877,6 +1404,169 @@ impl std::fmt::Display for SpawnSchedulerError {
 }
 
 impl std::error::Error for SpawnSchedulerError {}
+
+/// Scheduler spawn whose process identity is pinned from the attach observer
+/// through exit-monitor installation.
+pub(crate) struct SpawnedScheduler {
+    pub(crate) child: Child,
+    pub(crate) log_path: String,
+    pidfd: Option<OwnedFd>,
+    attach_attempt: Option<SchedulerAttachAttempt>,
+}
+
+impl SpawnedScheduler {
+    /// Duplicate the already-open pidfd for monitor ownership. This is a
+    /// `dup`, not a second `pidfd_open`; `self` retains the original until
+    /// monitor installation and completion publication both succeed.
+    pub(crate) fn clone_pidfd(&self) -> Result<OwnedFd, String> {
+        self.pidfd
+            .as_ref()
+            .ok_or_else(|| "scheduler pidfd is unavailable".to_string())?
+            .try_clone()
+            .map_err(|error| format!("duplicate scheduler pidfd for exit monitor: {error}"))
+    }
+
+    pub(crate) fn terminate_after_monitor_failure(&mut self) -> Result<(), String> {
+        let result = match self.pidfd.as_ref() {
+            Some(pidfd) => terminate_scheduler_via_pidfd(&mut self.child, pidfd),
+            None => Err("scheduler pidfd is unavailable".to_string()),
+        };
+        SCHED_PID.store(0, Ordering::Release);
+        let attach_close = self.close_failed_attach_attempt();
+        match (result, attach_close) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(cleanup), Ok(())) => Err(cleanup),
+            (Ok(()), Err(close)) => Err(format!("scheduler-attach terminal close failed: {close}")),
+            (Err(cleanup), Err(close)) => Err(format!(
+                "{cleanup}; scheduler-attach terminal close failed: {close}"
+            )),
+        }
+    }
+
+    /// Revalidate the retained process identity after the monitor thread is
+    /// installed and immediately before attach completion is published.
+    pub(crate) fn confirm_alive_after_monitor_install(&self) -> Result<(), String> {
+        let pidfd = self
+            .pidfd
+            .as_ref()
+            .ok_or_else(|| "scheduler pidfd is unavailable".to_string())?;
+        let mut pfd = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one retained pidfd and a nonblocking readiness probe.
+        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if rc < 0 {
+            return Err(format!(
+                "post-monitor scheduler pidfd poll: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(format!(
+                "post-monitor scheduler pidfd returned invalid events {:#x}",
+                pfd.revents
+            ));
+        }
+        if pfd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            return Err("scheduler exited before attach completion publication".into());
+        }
+        Ok(())
+    }
+
+    /// Close the host attach-budget overlay only after the caller installed
+    /// the handed-off pidfd in the scheduler-exit monitor.
+    pub(crate) fn finish_attach_attempt(&mut self) -> Result<(), String> {
+        self.attach_attempt
+            .take()
+            .ok_or_else(|| "scheduler attach attempt already finished".to_string())?
+            .finish_terminal()
+    }
+
+    /// Publish Finished and wait for its exact host ACK while retaining the
+    /// non-charging Finishing overlay. A later owner-commit step calls
+    /// [`Self::settle_attach_attempt`] only after publishing the final process
+    /// ownership state.
+    #[allow(dead_code)] // consumed by the single-owner commit handoff
+    pub(crate) fn await_attach_finished_ack(&mut self) -> Result<(), String> {
+        self.attach_attempt
+            .as_mut()
+            .ok_or_else(|| "scheduler attach attempt already finished".to_string())?
+            .await_finished_ack()
+    }
+
+    /// Reliably publish Settled after the exact Finished ACK was consumed.
+    #[allow(dead_code)] // consumed by the single-owner commit handoff
+    pub(crate) fn settle_attach_attempt(&mut self) -> Result<(), String> {
+        self.attach_attempt
+            .take()
+            .ok_or_else(|| "scheduler attach attempt already finished".to_string())?
+            .settle()
+    }
+
+    /// Close an attach attempt owned by a scheduler path which cannot commit
+    /// success (monitor handoff failure, final pidfd failure, or caller abort).
+    pub(crate) fn close_failed_attach_attempt(&mut self) -> Result<(), String> {
+        match self.attach_attempt.take() {
+            Some(attempt) => attempt.close_terminal(),
+            None => Ok(()),
+        }
+    }
+}
+
+fn terminate_scheduler_via_pidfd(child: &mut Child, pidfd: &OwnedFd) -> Result<(), String> {
+    // SAFETY: pidfd is the descriptor opened for this exact child; siginfo is
+    // null and flags zero per pidfd_send_signal(2).
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0u32,
+        )
+    };
+    if rc < 0 {
+        let error = std::io::Error::last_os_error();
+        // ESRCH means the pinned task has already exited. The same pidfd still
+        // becomes readable and remains authoritative below.
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(format!("pidfd_send_signal(SIGKILL): {error}"));
+        }
+    }
+
+    loop {
+        let mut pfd = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live pidfd and an indefinite, event-driven wait.
+        let poll_rc = unsafe { libc::poll(&mut pfd, 1, -1) };
+        if poll_rc < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!("wait for SIGKILLed scheduler pidfd: {error}"));
+        }
+        if pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(format!(
+                "SIGKILLed scheduler pidfd returned unexpected poll events {:#x}",
+                pfd.revents
+            ));
+        }
+        if pfd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            // SIGCHLD is ignored during boot and default during scenario Ops.
+            // `wait` reaps in the latter case and harmlessly returns ECHILD in
+            // the former; pidfd readiness already proved identity-specific
+            // exit either way.
+            let _ = child.wait();
+            return Ok(());
+        }
+    }
+}
 
 /// Live stdio-forwarder threads still draining a scheduler child's
 /// pipes, keyed by the log path they append to.
@@ -1063,7 +1753,8 @@ pub(crate) fn try_spawn_scheduler(
     binary_path: &str,
     args_path: &str,
     log_path: &str,
-) -> Result<Option<(Child, String)>, SpawnSchedulerError> {
+    attach_kind: crate::vmm::wire::AttachAttemptKind,
+) -> Result<Option<SpawnedScheduler>, SpawnSchedulerError> {
     if !Path::new(binary_path).exists() {
         return Ok(None);
     }
@@ -1099,13 +1790,33 @@ pub(crate) fn try_spawn_scheduler(
         Err(_) => "info,scx_utils::libbpf_logger=warn".to_string(),
     };
 
-    let mut child = Command::new(binary_path)
+    let attempt = SchedulerAttachAttempt::begin(attach_kind).map_err(|error| {
+        SpawnSchedulerError::SpawnFailed(std::io::Error::other(format!(
+            "prepare scheduler attach observer: {error}"
+        )))
+    })?;
+
+    let mut child = match Command::new(binary_path)
         .args(&args)
         .env("RUST_LOG", &sched_rust_log)
         .stdout(stdout)
         .stderr(stderr)
         .spawn()
-        .map_err(SpawnSchedulerError::SpawnFailed)?;
+    {
+        Ok(child) => child,
+        Err(error) => {
+            let kind = error.kind();
+            let close = attempt.close_terminal();
+            let error = match close {
+                Ok(()) => error,
+                Err(close_error) => std::io::Error::new(
+                    kind,
+                    format!("{error}; scheduler-attach terminal close failed: {close_error}"),
+                ),
+            };
+            return Err(SpawnSchedulerError::SpawnFailed(error));
+        }
+    };
 
     // Publish the scheduler PID via the [`SCHED_PID`] atomic side
     // channel — readers retrieve it through [`sched_pid`]. The
@@ -1126,25 +1837,65 @@ pub(crate) fn try_spawn_scheduler(
     // exact.
     SCHED_PID.store(child.id() as i32, Ordering::Release);
 
-    let status = poll_scx_attached(child.id());
+    let pidfd = match open_scheduler_pidfd(child.id()) {
+        Ok(pidfd) => pidfd,
+        Err(ScxAttachStatus::Died) => {
+            if let Err(error) = attempt.close_terminal() {
+                tracing::error!(
+                    error = %error,
+                    "failed to close scheduler-attach generation after pre-pidfd death"
+                );
+            }
+            SCHED_PID.store(0, Ordering::Release);
+            return Err(SpawnSchedulerError::StartupDied {
+                log_path: log_path.to_string(),
+            });
+        }
+        Err(status) => {
+            let mut reason = match status {
+                ScxAttachStatus::ObserverError(error) => {
+                    format!("cause=observer-error detail={error:?}")
+                }
+                _ => unreachable!("pidfd open returns only Died or ObserverError"),
+            };
+            if let Err(error) = attempt.close_terminal() {
+                reason.push_str(&format!(" attach_close_error={error:?}"));
+            }
+            SCHED_PID.store(0, Ordering::Release);
+            return Err(SpawnSchedulerError::NotAttached {
+                reason,
+                log_path: log_path.to_string(),
+            });
+        }
+    };
+
+    let (status, pidfd, attempt) = poll_scx_attached(pidfd, attempt);
     match status {
-        ScxAttachStatus::Attached => Ok(Some((child, log_path.to_string()))),
+        ScxAttachStatus::Attached => Ok(Some(SpawnedScheduler {
+            child,
+            log_path: log_path.to_string(),
+            pidfd: Some(pidfd),
+            attach_attempt: Some(attempt),
+        })),
         ScxAttachStatus::Died => {
             // The dead child is auto-reaped under SIGCHLD=SIG_IGN. SCHED_PID
             // was published optimistically at spawn; clear it before any
             // caller can install an exit monitor against the stale pid.
+            if let Err(error) = attempt.close_terminal() {
+                tracing::error!(
+                    error = %error,
+                    "failed to close scheduler-attach generation after scheduler death"
+                );
+            }
             SCHED_PID.store(0, Ordering::Release);
             Err(SpawnSchedulerError::StartupDied {
                 log_path: log_path.to_string(),
             })
         }
         status => {
-            let reason = match status {
+            let mut reason = match status {
                 ScxAttachStatus::Rejected(diagnostic) => diagnostic.reason("rejected-enable"),
-                ScxAttachStatus::ServiceBudgetExceeded(diagnostic) => {
-                    diagnostic.reason("service-budget")
-                }
-                ScxAttachStatus::WallGuardExceeded(diagnostic) => diagnostic.reason("wall-guard"),
+                ScxAttachStatus::Cancelled(diagnostic, cause) => diagnostic.reason(cause.label()),
                 ScxAttachStatus::SysfsAbsent(diagnostic) => diagnostic.reason("sysfs-absent"),
                 ScxAttachStatus::ObserverError(error) => {
                     format!("cause=observer-error detail={error:?}")
@@ -1157,14 +1908,20 @@ pub(crate) fn try_spawn_scheduler(
                 "scheduler did not complete sched_ext attach"
             );
 
-            // The process is still alive but not attached. Kill it
-            // deterministically so it cannot late-bind and pollute a later
-            // Attach/Replace operation.
-            let pid = child.id() as libc::pid_t;
-            unsafe {
-                let _ = libc::kill(pid, libc::SIGKILL);
+            // The process is still alive but not attached. Signal and wait on
+            // the exact pidfd retained by the observer so PID reuse can never
+            // redirect cleanup to another process.
+            if let Err(cleanup_error) = terminate_scheduler_via_pidfd(&mut child, &pidfd) {
+                tracing::error!(
+                    pid = child.id(),
+                    error = %cleanup_error,
+                    "failed to prove unattached scheduler cleanup through pidfd"
+                );
+                reason.push_str(&format!(" cleanup_error={cleanup_error:?}"));
             }
-            let _ = child.wait();
+            if let Err(close_error) = attempt.close_terminal() {
+                reason.push_str(&format!(" attach_close_error={close_error:?}"));
+            }
             SCHED_PID.store(0, Ordering::Release);
             Err(SpawnSchedulerError::NotAttached {
                 reason,
@@ -1188,7 +1945,7 @@ pub(crate) fn try_spawn_scheduler(
 /// typed test-failure diagnostics instead of rebooting the VM.
 ///
 /// `Ok(None)` from `try_spawn_scheduler` (binary missing) returns
-/// `(None, None)` — preserves the prior contract where an absent
+/// `None` — preserves the prior contract where an absent
 /// `/scheduler` is "no scheduler configured" rather than a
 /// failure.
 ///
@@ -1207,30 +1964,18 @@ pub(crate) fn spawn_scheduler_from_paths(
     args_path: &str,
     log_path: &str,
     probe_drain: Option<ProbeDrain>,
-) -> (Option<Child>, Option<String>) {
-    match try_spawn_scheduler(binary_path, args_path, log_path) {
-        Ok(None) => (None, None),
-        Ok(Some((child, log))) => {
-            // Attach is DEFINITIVELY confirmed here and only here on the
-            // boot path: `try_spawn_scheduler` returns `Ok(Some(..))` only
-            // after `poll_scx_attached` observed `root/ops` registered with
-            // `state == Enabled` AND the child is alive. Emit
-            // `SchedulerAttached` so the host arms the progress watchdog's
-            // workload deadline from this confirmed-attach moment. NOT
-            // emitted on `Ok(None)` (no scheduler configured / EEVDF run —
-            // binary absent) nor on any `Err` arm (Died / NotAttached each
-            // send their own frame + force_reboot below), so the frame's
-            // presence is an unambiguous live-scheduler attach proof. The
-            // Op-dispatch re-attach path calls `try_spawn_scheduler`
-            // directly and emits no lifecycle frame, matching the
-            // Died/NotAttached asymmetry — this boot wrapper is the sole
-            // lifecycle-emitting attach site.
-            crate::vmm::guest_comms::send_lifecycle(
-                crate::vmm::wire::LifecyclePhase::SchedulerAttached,
-                "",
-            );
-            (Some(child), Some(log))
-        }
+) -> Option<SpawnedScheduler> {
+    match try_spawn_scheduler(
+        binary_path,
+        args_path,
+        log_path,
+        crate::vmm::wire::AttachAttemptKind::Boot,
+    ) {
+        Ok(None) => None,
+        // The caller installs the exit monitor from `spawned.pidfd` before
+        // emitting SchedulerAttached. This wrapper deliberately cannot
+        // publish a success that is not yet continuously monitored.
+        Ok(Some(spawned)) => Some(spawned),
         Err(SpawnSchedulerError::SpawnFailed(e)) => {
             tracing::error!(err = %e, "ktstr-init: spawn scheduler failed");
             // Synthesize a minimal sched-log payload framed by
@@ -1285,6 +2030,114 @@ pub(crate) fn spawn_scheduler_from_paths(
 mod tests {
     use super::*;
 
+    #[test]
+    fn attach_control_snapshot_matches_exact_generation_and_retains_cause() {
+        let mut snapshot = AttachControlSnapshot {
+            reader: AttachControlReaderHealth::Live,
+            ..AttachControlSnapshot::default()
+        };
+        snapshot.register_generation(7).unwrap();
+        assert!(
+            snapshot.observe_packet(crate::vmm::wire::AttachControlPacket::StartedAck {
+                generation: 7,
+            })
+        );
+        assert!(
+            snapshot.observe_packet(crate::vmm::wire::AttachControlPacket::FinishedAck {
+                generation: 7,
+            })
+        );
+        assert!(
+            snapshot.observe_packet(crate::vmm::wire::AttachControlPacket::Cancel {
+                generation: 7,
+                cause: crate::vmm::wire::AttachCancelCause::ServiceBudget,
+            })
+        );
+
+        let exact = snapshot.view(7);
+        assert!(exact.started_acked);
+        assert!(exact.finished_acked);
+        assert_eq!(
+            exact.cancellation,
+            Some(crate::vmm::wire::AttachCancelCause::ServiceBudget)
+        );
+        assert_eq!(exact.reader_error, None);
+
+        let stale = snapshot.view(6);
+        assert!(!stale.started_acked);
+        assert!(!stale.finished_acked);
+        assert_eq!(stale.cancellation, None);
+
+        assert_eq!(
+            snapshot.register_generation(8),
+            Err(
+                "scheduler-attach generation 7 is already active; cannot register concurrent \
+                 generation 8"
+                    .into()
+            )
+        );
+    }
+
+    #[test]
+    fn wrong_generation_control_is_discarded_not_cached_for_a_future_attempt() {
+        let mut snapshot = AttachControlSnapshot {
+            reader: AttachControlReaderHealth::Live,
+            ..AttachControlSnapshot::default()
+        };
+        snapshot.register_generation(20).unwrap();
+        assert!(
+            !snapshot.observe_packet(crate::vmm::wire::AttachControlPacket::StartedAck {
+                generation: 21
+            })
+        );
+        assert!(
+            !snapshot.observe_packet(crate::vmm::wire::AttachControlPacket::Cancel {
+                generation: 19,
+                cause: crate::vmm::wire::AttachCancelCause::ServiceBudget,
+            })
+        );
+        assert!(!snapshot.view(20).started_acked);
+        assert_eq!(snapshot.view(20).cancellation, None);
+
+        snapshot.clear_generation(20);
+        snapshot.register_generation(21).unwrap();
+        assert!(
+            !snapshot.view(21).started_acked,
+            "future ACK from generation 20 was cached into generation 21"
+        );
+        assert_eq!(snapshot.view(21).cancellation, None);
+    }
+
+    #[test]
+    fn attach_control_terminal_health_is_visible_to_every_wait() {
+        let snapshot = AttachControlSnapshot {
+            reader: AttachControlReaderHealth::Terminal("hvc0 control stream disconnected".into()),
+            ..AttachControlSnapshot::default()
+        };
+        assert_eq!(
+            snapshot.view(1).reader_error,
+            Some("hvc0 control stream disconnected".into())
+        );
+    }
+
+    #[test]
+    fn attach_drop_retry_is_phase_specific_and_idempotent() {
+        use crate::vmm::wire::AttachAttemptTransition;
+        assert_eq!(
+            AttachTerminalPhase::Open.drop_retry(),
+            Some(AttachAttemptTransition::Finished)
+        );
+        assert_eq!(
+            AttachTerminalPhase::Finishing.drop_retry(),
+            Some(AttachAttemptTransition::Finished)
+        );
+        assert_eq!(
+            AttachTerminalPhase::FinishedAcked.drop_retry(),
+            Some(AttachAttemptTransition::Settled)
+        );
+        assert_eq!(AttachTerminalPhase::Settled.drop_retry(), None);
+    }
+
     fn snapshot(state: ScxState, ops: OpsObservation) -> ScxAttachSnapshot {
         ScxAttachSnapshot {
             state: StateObservation::Value(state),
@@ -1307,19 +2160,26 @@ mod tests {
     #[derive(Clone)]
     struct FakeAttachFrame {
         wall: std::time::Duration,
-        service: std::time::Duration,
         exited: bool,
+        cancelled: Option<crate::vmm::wire::AttachCancelCause>,
+        control_reader_error: Option<String>,
         snapshot: ScxAttachSnapshot,
     }
 
     impl FakeAttachFrame {
-        fn new(wall_s: f64, service_s: f64, exited: bool, snapshot: ScxAttachSnapshot) -> Self {
+        fn new(wall_s: f64, exited: bool, cancelled: bool, snapshot: ScxAttachSnapshot) -> Self {
             Self {
                 wall: std::time::Duration::from_secs_f64(wall_s),
-                service: std::time::Duration::from_secs_f64(service_s),
                 exited,
+                cancelled: cancelled.then_some(crate::vmm::wire::AttachCancelCause::ServiceBudget),
+                control_reader_error: None,
                 snapshot,
             }
+        }
+
+        fn with_control_reader_error(mut self, error: impl Into<String>) -> Self {
+            self.control_reader_error = Some(error.into());
+            self
         }
     }
 
@@ -1349,12 +2209,16 @@ mod tests {
             Ok(self.frame().exited)
         }
 
-        fn snapshot(&mut self) -> Result<ScxAttachSnapshot, String> {
-            Ok(self.frame().snapshot.clone())
+        fn cancelled(&mut self) -> Result<Option<crate::vmm::wire::AttachCancelCause>, String> {
+            Ok(self.frame().cancelled)
         }
 
-        fn service_elapsed(&mut self) -> Result<std::time::Duration, String> {
-            Ok(self.frame().service)
+        fn control_reader_error(&mut self) -> Result<Option<String>, String> {
+            Ok(self.frame().control_reader_error.clone())
+        }
+
+        fn snapshot(&mut self) -> Result<ScxAttachSnapshot, String> {
+            Ok(self.frame().snapshot.clone())
         }
 
         fn wall_elapsed(&mut self) -> std::time::Duration {
@@ -1374,42 +2238,30 @@ mod tests {
         }
     }
 
-    fn test_policy() -> AttachWaitPolicy {
-        AttachWaitPolicy {
-            cadence: std::time::Duration::from_millis(50),
-            service_budget: std::time::Duration::from_secs(35),
-            wall_guard: std::time::Duration::from_secs(90),
-        }
+    /// Guest wall time never consumes attach allowance. The host's
+    /// max-single-vCPU overlay is the only budget authority.
+    #[test]
+    fn attach_wait_ignores_guest_wall_dilation() {
+        let mut io = FakeAttachIo::new(vec![
+            FakeAttachFrame::new(0.0, false, false, loading_snapshot()),
+            FakeAttachFrame::new(120.0, false, false, loading_snapshot()),
+            FakeAttachFrame::new(600.0, false, false, enabling_snapshot()),
+            FakeAttachFrame::new(601.0, false, false, attached_snapshot()),
+        ]);
+        assert_eq!(wait_scx_attach_with(&mut io), ScxAttachStatus::Attached);
     }
 
-    /// Host starvation no longer consumes attach allowance: more than the old
-    /// ten wall seconds may pass while scheduler CPU service remains small.
+    /// Readiness is sampled before cancellation, so an attach confirmed on the
+    /// same host-service edge wins and the host may clear the attempt normally.
     #[test]
-    fn attach_wait_charges_service_not_wall() {
-        let mut io = FakeAttachIo::new(vec![
-            FakeAttachFrame::new(0.0, 0.0, false, loading_snapshot()),
-            FakeAttachFrame::new(12.0, 1.0, false, loading_snapshot()),
-            FakeAttachFrame::new(20.0, 2.0, false, enabling_snapshot()),
-            FakeAttachFrame::new(21.0, 2.5, false, attached_snapshot()),
-        ]);
-        assert_eq!(
-            wait_scx_attach_with(&mut io, test_policy()),
-            ScxAttachStatus::Attached
-        );
-    }
-
-    /// Readiness is sampled before the wall guard, so an attach that completed
-    /// while PID 1 was descheduled across the exact boundary wins.
-    #[test]
-    fn attach_at_wall_guard_is_success() {
-        let mut io = FakeAttachIo::new(vec![
-            FakeAttachFrame::new(0.0, 0.0, false, loading_snapshot()),
-            FakeAttachFrame::new(90.0, 1.0, false, attached_snapshot()),
-        ]);
-        assert_eq!(
-            wait_scx_attach_with(&mut io, test_policy()),
-            ScxAttachStatus::Attached
-        );
+    fn attach_ready_wins_over_simultaneous_cancel() {
+        let mut io = FakeAttachIo::new(vec![FakeAttachFrame::new(
+            35.0,
+            false,
+            true,
+            attached_snapshot(),
+        )]);
+        assert_eq!(wait_scx_attach_with(&mut io), ScxAttachStatus::Attached);
     }
 
     /// The pidfd remains in the wait through the whole attach, not only the
@@ -1417,13 +2269,10 @@ mod tests {
     #[test]
     fn scheduler_death_after_old_startup_gate_is_immediate() {
         let mut io = FakeAttachIo::new(vec![
-            FakeAttachFrame::new(0.0, 0.0, false, loading_snapshot()),
-            FakeAttachFrame::new(2.0, 0.2, true, loading_snapshot()),
+            FakeAttachFrame::new(0.0, false, false, loading_snapshot()),
+            FakeAttachFrame::new(2.0, true, false, loading_snapshot()),
         ]);
-        assert_eq!(
-            wait_scx_attach_with(&mut io, test_policy()),
-            ScxAttachStatus::Died
-        );
+        assert_eq!(wait_scx_attach_with(&mut io), ScxAttachStatus::Died);
     }
 
     /// A dead child wins over a stale `enabled` sysfs snapshot.
@@ -1431,14 +2280,11 @@ mod tests {
     fn simultaneous_death_and_ready_prefers_death() {
         let mut io = FakeAttachIo::new(vec![FakeAttachFrame::new(
             2.0,
-            0.2,
+            true,
             true,
             attached_snapshot(),
         )]);
-        assert_eq!(
-            wait_scx_attach_with(&mut io, test_policy()),
-            ScxAttachStatus::Died
-        );
+        assert_eq!(wait_scx_attach_with(&mut io), ScxAttachStatus::Died);
     }
 
     /// The dynamic root kobject is intentionally absent before registration;
@@ -1446,12 +2292,15 @@ mod tests {
     #[test]
     fn missing_root_ops_is_loading_not_sysfs_absent() {
         let mut io = FakeAttachIo::new(vec![
-            FakeAttachFrame::new(0.0, 0.0, false, loading_snapshot()),
-            FakeAttachFrame::new(40.0, 35.0, false, loading_snapshot()),
+            FakeAttachFrame::new(0.0, false, false, loading_snapshot()),
+            FakeAttachFrame::new(40.0, false, true, loading_snapshot()),
         ]);
-        let status = wait_scx_attach_with(&mut io, test_policy());
+        let status = wait_scx_attach_with(&mut io);
         assert!(
-            matches!(status, ScxAttachStatus::ServiceBudgetExceeded(_)),
+            matches!(
+                status,
+                ScxAttachStatus::Cancelled(_, crate::vmm::wire::AttachCancelCause::ServiceBudget)
+            ),
             "missing lazy root/ops was misclassified: {status:?}"
         );
     }
@@ -1462,7 +2311,7 @@ mod tests {
     fn missing_state_is_sysfs_absent() {
         let mut io = FakeAttachIo::new(vec![FakeAttachFrame::new(
             0.0,
-            0.0,
+            false,
             false,
             ScxAttachSnapshot {
                 state: StateObservation::Missing,
@@ -1470,62 +2319,84 @@ mod tests {
             },
         )]);
         assert!(matches!(
-            wait_scx_attach_with(&mut io, test_policy()),
+            wait_scx_attach_with(&mut io),
             ScxAttachStatus::SysfsAbsent(_)
         ));
     }
 
-    /// A semantic forward edge resets the per-progress service checkpoint.
+    /// A host cancellation is generation-specific and terminates a pending
+    /// semantic attach without inventing a guest clock verdict.
     #[test]
-    fn attach_progress_resets_service_budget() {
+    fn host_service_cancel_terminates_pending_attach() {
         let mut io = FakeAttachIo::new(vec![
-            FakeAttachFrame::new(0.0, 0.0, false, loading_snapshot()),
-            FakeAttachFrame::new(34.0, 34.0, false, loading_snapshot()),
-            FakeAttachFrame::new(35.0, 34.5, false, enabling_snapshot()),
-            FakeAttachFrame::new(60.0, 60.0, false, enabling_snapshot()),
-            FakeAttachFrame::new(61.0, 60.5, false, attached_snapshot()),
+            FakeAttachFrame::new(0.0, false, false, loading_snapshot()),
+            FakeAttachFrame::new(400.0, false, false, enabling_snapshot()),
+            FakeAttachFrame::new(401.0, false, true, enabling_snapshot()),
         ]);
-        assert_eq!(
-            wait_scx_attach_with(&mut io, test_policy()),
-            ScxAttachStatus::Attached
-        );
+        assert!(matches!(
+            wait_scx_attach_with(&mut io),
+            ScxAttachStatus::Cancelled(_, crate::vmm::wire::AttachCancelCause::ServiceBudget)
+        ));
     }
 
     #[test]
-    fn service_clock_regression_is_observer_error() {
-        let mut io = FakeAttachIo::new(vec![
-            FakeAttachFrame::new(0.0, 1.0, false, loading_snapshot()),
-            FakeAttachFrame::new(1.0, 0.5, false, loading_snapshot()),
-        ]);
-        assert!(matches!(
-            wait_scx_attach_with(&mut io, test_policy()),
-            ScxAttachStatus::ObserverError(ref error) if error.contains("regressed")
-        ));
+    fn pidfd_cleanup_kills_only_the_pinned_scheduler() {
+        let mut scheduler = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn scheduler stand-in");
+        let mut bystander = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn bystander");
+        let pidfd = open_scheduler_pidfd(scheduler.id()).expect("open scheduler pidfd");
+
+        terminate_scheduler_via_pidfd(&mut scheduler, &pidfd)
+            .expect("terminate scheduler through its pidfd");
+        assert!(
+            bystander.try_wait().expect("query bystander").is_none(),
+            "pidfd cleanup affected a process outside the pinned identity"
+        );
+
+        bystander.kill().expect("kill bystander");
+        bystander.wait().expect("reap bystander");
     }
 
     #[test]
     fn event_source_error_is_not_a_timeout() {
         let mut io = FakeAttachIo::new(vec![FakeAttachFrame::new(
             0.0,
-            0.0,
+            false,
             false,
             loading_snapshot(),
         )]);
         io.wait_error = Some("poll source failed".into());
         assert_eq!(
-            wait_scx_attach_with(&mut io, test_policy()),
+            wait_scx_attach_with(&mut io),
             ScxAttachStatus::ObserverError("poll source failed".into())
+        );
+    }
+
+    #[test]
+    fn terminal_control_reader_wakes_pending_attach_as_observer_error() {
+        let mut io = FakeAttachIo::new(vec![
+            FakeAttachFrame::new(0.0, false, false, loading_snapshot())
+                .with_control_reader_error("hvc0 control reader disconnected"),
+        ]);
+        assert_eq!(
+            wait_scx_attach_with(&mut io),
+            ScxAttachStatus::ObserverError("hvc0 control reader disconnected".into())
         );
     }
 
     #[test]
     fn backwards_enable_transition_is_rejected_immediately() {
         let mut io = FakeAttachIo::new(vec![
-            FakeAttachFrame::new(0.0, 0.0, false, enabling_snapshot()),
-            FakeAttachFrame::new(1.0, 1.0, false, loading_snapshot()),
+            FakeAttachFrame::new(0.0, false, false, enabling_snapshot()),
+            FakeAttachFrame::new(1.0, false, false, loading_snapshot()),
         ]);
         assert!(matches!(
-            wait_scx_attach_with(&mut io, test_policy()),
+            wait_scx_attach_with(&mut io),
             ScxAttachStatus::Rejected(_)
         ));
     }

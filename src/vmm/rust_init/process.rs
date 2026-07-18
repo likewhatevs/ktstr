@@ -82,10 +82,9 @@ static SCHED_EXIT_MONITOR_BOOT_CTX: OnceLock<SchedExitMonitorBootCtx> = OnceLock
 /// needs to spawn replacement monitors. Called once at boot
 /// after [`start_sched_exit_monitor`] returns.
 ///
-/// `boot_stop` may be `None` when [`start_sched_exit_monitor`]
-/// returned None (no scheduler configured at boot); the slot
-/// stays empty and the first Op::AttachScheduler dispatch
-/// populates it via [`restart_sched_exit_monitor_with_log`].
+/// `boot_stop` is `None` when no scheduler is configured at boot; the
+/// slot stays empty and the first Op::AttachScheduler dispatch populates
+/// it via [`restart_sched_exit_monitor_with_log`].
 pub(crate) fn install_initial_sched_exit_monitor(
     boot_stop: Option<SchedExitStop>,
     suppress_sched_log: Arc<AtomicBool>,
@@ -141,25 +140,39 @@ pub(crate) fn sched_exit_monitor_slot_is_empty() -> bool {
     slot.lock().unwrap().is_none()
 }
 
-/// Spawn a fresh scheduler-exit monitor for the live SCHED_PID
-/// and install it into the slot. Op handler calls this AFTER the
-/// new scheduler is spawned and SCHED_PID is published, so the
-/// monitor watches the post-Op PID. `log_path` is the per-spawn
-/// log file path — all three lifecycle Ops (Attach, Replace,
-/// Restart) pass the seq-suffixed path from
-/// `staged_scheduler_log_path`.
+/// Spawn a fresh scheduler-exit monitor for the live SCHED_PID and install it
+/// into the slot. The Op handler hands in the exact pidfd opened for the
+/// scheduler at spawn, closing both the post-attach `pidfd_open` gap and
+/// numeric-pid reuse ambiguity. `log_path` is the per-spawn log file path —
+/// all three lifecycle Ops (Attach, Replace, Restart) pass the seq-suffixed
+/// path from `staged_scheduler_log_path`.
 ///
 /// Uses the boot-captured `suppress_sched_log` + `probe_output_done`
-/// so the new monitor behaves identically to the boot monitor. If
-/// the boot ctx was never installed (degenerate test environment
-/// where `install_initial_sched_exit_monitor` never ran) the
-/// helper is a no-op and the new scheduler stays unmonitored —
-/// the boot path is the only legitimate context that installs
-/// the ctx.
-pub(crate) fn restart_sched_exit_monitor_with_log(log_path: Option<&str>) {
-    let Some(ctx) = SCHED_EXIT_MONITOR_BOOT_CTX.get() else {
-        return;
-    };
+/// so the new monitor behaves identically to the boot monitor. Missing boot
+/// context or SCHED_PID is a synchronous error: lifecycle-Op success can
+/// never be reported while the replacement scheduler is unmonitored.
+pub(crate) fn restart_sched_exit_monitor_with_log(
+    pidfd: OwnedFd,
+    log_path: Option<&str>,
+) -> std::io::Result<()> {
+    let ctx = SCHED_EXIT_MONITOR_BOOT_CTX.get().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "scheduler-exit monitor boot context is not installed",
+        )
+    })?;
+    let pid = sched_pid().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "cannot install scheduler-exit monitor: SCHED_PID is unset",
+        )
+    })?;
+    let pid = u32::try_from(pid).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("cannot install scheduler-exit monitor for invalid pid {pid}"),
+        )
+    })?;
     let slot = SCHED_EXIT_MONITOR_SLOT.get_or_init(|| std::sync::Mutex::new(None));
     let mut guard = slot.lock().unwrap();
     // Defensive: if the Op handler skipped stop_sched_exit_monitor
@@ -171,12 +184,15 @@ pub(crate) fn restart_sched_exit_monitor_with_log(log_path: Option<&str>) {
     if let Some(prev) = guard.take() {
         let _ = prev.stop_and_join();
     }
-    *guard = start_sched_exit_monitor(
-        sched_pid().map(|p| p as u32),
+    let stop = start_sched_exit_monitor(
+        pid,
+        pidfd,
         log_path,
         ctx.suppress_sched_log.clone(),
         ctx.probe_output_done.clone(),
-    );
+    )?;
+    *guard = Some(stop);
+    Ok(())
 }
 
 /// Read the scheduler PID published by [`start_scheduler`]. Returns

@@ -16,7 +16,7 @@ pub(crate) use std::path::Path;
 pub(crate) use std::process::{Child, Command, Stdio};
 pub(crate) use std::sync::Arc;
 pub(crate) use std::sync::OnceLock;
-pub(crate) use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+pub(crate) use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 pub(crate) use crate::sync::Latch;
 

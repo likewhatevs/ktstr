@@ -33,6 +33,37 @@ use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::timerfd::TimerFd;
 
+/// RAII sensor armed for the lifetime of the host monitor thread.
+///
+/// A monitor may leave through an ordinary error path or by unwinding, so a
+/// tail call cannot reliably publish the terminal edge. Keeping this guard
+/// alive for the whole thread makes both paths converge in [`Drop`].
+/// Kill-driven shutdown is the expected terminal path and must not be
+/// reported as a monitor failure, so the run kill flag gates publication.
+pub(crate) struct MonitorTerminalGuard<'a> {
+    ledger: &'a ProgressLedger,
+    kill: &'a AtomicBool,
+}
+
+impl<'a> MonitorTerminalGuard<'a> {
+    /// Arm the terminal sensor for one monitor thread.
+    ///
+    /// Construct this as the first local in the spawned monitor closure.
+    /// Monitor setup paths which return without spawning a thread should
+    /// instead call [`ProgressLedger::publish_monitor_terminal`] directly.
+    pub(crate) fn new(ledger: &'a ProgressLedger, kill: &'a AtomicBool) -> Self {
+        Self { ledger, kill }
+    }
+}
+
+impl Drop for MonitorTerminalGuard<'_> {
+    fn drop(&mut self) {
+        if !self.kill.load(Ordering::Acquire) {
+            self.ledger.publish_monitor_terminal();
+        }
+    }
+}
+
 /// Per-NUMA-node host memory region within a GuestMem.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MemRegion {
@@ -4428,9 +4459,11 @@ pub(crate) fn monitor_loop(
                 evidence_channels_live,
             );
             // NO progress-epoch bump here. `progress_epoch` is
-            // MILESTONE-ONLY: bumped exclusively by lifecycle stage
-            // advances (the dispatch thread's `advance_phase` /
-            // boot-heartbeat frames). Kernel scheduling noise is NEVER
+            // MILESTONE-ONLY: bumped by lifecycle stage advances, boot
+            // heartbeats, and accepted generation-tagged attach boundaries
+            // (the dispatch thread's `advance_phase`,
+            // `record_boot_progress`, and `reanchor_phase_cpu`). Kernel
+            // scheduling noise is NEVER
             // progress — a live guest kernel bumps ttwu_count /
             // sched_count / pcount every tick from background kthread
             // wakeups (RCU, timers, workqueues, ktstr's own guest poll
@@ -4512,6 +4545,39 @@ mod tests {
     use std::os::unix::thread::JoinHandleExt;
 
     const THRESHOLD_NS: u64 = 10_000_000;
+
+    #[test]
+    fn monitor_terminal_guard_publishes_on_unexpected_return() {
+        let ledger = ProgressLedger::default();
+        let kill = AtomicBool::new(false);
+        {
+            let _guard = MonitorTerminalGuard::new(&ledger, &kill);
+        }
+        assert!(ledger.snapshot().monitor_terminal);
+    }
+
+    #[test]
+    fn monitor_terminal_guard_publishes_during_unwind() {
+        let ledger = ProgressLedger::default();
+        let kill = AtomicBool::new(false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = MonitorTerminalGuard::new(&ledger, &kill);
+            panic!("exercise monitor terminal unwind guard");
+        }));
+        assert!(result.is_err());
+        assert!(ledger.snapshot().monitor_terminal);
+    }
+
+    #[test]
+    fn monitor_terminal_guard_ignores_kill_driven_exit() {
+        let ledger = ProgressLedger::default();
+        let kill = AtomicBool::new(false);
+        {
+            let _guard = MonitorTerminalGuard::new(&ledger, &kill);
+            kill.store(true, Ordering::Release);
+        }
+        assert!(!ledger.snapshot().monitor_terminal);
+    }
 
     /// A monitor resolves its pthread CPU clocks once, then every sample reads
     /// the cached IDs directly. Pin the live-thread success path and the

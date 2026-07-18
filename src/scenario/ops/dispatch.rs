@@ -2005,9 +2005,11 @@ fn spawn_scheduler_for_op(
     args_path: &str,
     log_path: &str,
     expected_scheduler_name: &str,
-) -> Result<()> {
-    match crate::vmm::rust_init::try_spawn_scheduler(binary_path, args_path, log_path) {
-        Ok(Some(_)) => Ok(()),
+    attach_kind: crate::vmm::wire::AttachAttemptKind,
+) -> Result<crate::vmm::rust_init::SpawnedScheduler> {
+    match crate::vmm::rust_init::try_spawn_scheduler(binary_path, args_path, log_path, attach_kind)
+    {
+        Ok(Some(spawned)) => Ok(spawned),
         Ok(None) => anyhow::bail!(
             "{op_label}: scheduler binary for '{expected_scheduler_name}' is missing at \
              {binary_path}. The staging cpio pack at initramfs build time should have \
@@ -2022,6 +2024,49 @@ fn spawn_scheduler_for_op(
              startup-died vs not-attached) instead of a bare reboot signal."
         ),
     }
+}
+
+fn install_spawned_scheduler_monitor(
+    op_label: &str,
+    spawned: &mut crate::vmm::rust_init::SpawnedScheduler,
+    log_path: &str,
+) -> Result<()> {
+    let monitor_pidfd = match spawned.clone_pidfd() {
+        Ok(pidfd) => pidfd,
+        Err(error) => {
+            let cleanup = spawned.terminate_after_monitor_failure();
+            anyhow::bail!(
+                "{op_label}: scheduler attached but pidfd handoff failed: {error}; \
+                 pidfd cleanup result: {cleanup:?}"
+            );
+        }
+    };
+    if let Err(error) =
+        crate::vmm::rust_init::restart_sched_exit_monitor_with_log(monitor_pidfd, Some(log_path))
+    {
+        let cleanup = spawned.terminate_after_monitor_failure();
+        anyhow::bail!(
+            "{op_label}: scheduler attached but exit-monitor installation failed: \
+             {error}; pidfd cleanup result: {cleanup:?}"
+        );
+    }
+    if let Err(error) = spawned.confirm_alive_after_monitor_install() {
+        let _ = crate::vmm::rust_init::stop_sched_exit_monitor();
+        let cleanup = spawned.terminate_after_monitor_failure();
+        anyhow::bail!(
+            "{op_label}: scheduler exited during exit-monitor handoff: {error}; \
+             pidfd cleanup result: {cleanup:?}"
+        );
+    }
+    if let Err(error) = spawned.finish_attach_attempt() {
+        let _ = crate::vmm::rust_init::stop_sched_exit_monitor();
+        let cleanup = spawned.terminate_after_monitor_failure();
+        anyhow::bail!(
+            "{op_label}: scheduler attached and was monitored, but the host attach-attempt \
+             completion could not be published: {error}; pidfd cleanup result: {cleanup:?}"
+        );
+    }
+    Ok(())
 }
 
 /// Op::AttachScheduler dispatch. Spawns the named staged scheduler
@@ -2080,13 +2125,20 @@ pub(super) fn dispatch_attach_scheduler(
     let binary = crate::test_support::staged::staged_scheduler_binary_path(scheduler.name);
     let args = crate::test_support::staged::staged_scheduler_args_path(scheduler.name);
     let log = staged_scheduler_log_path(scheduler.name);
-    spawn_scheduler_for_op("Op::AttachScheduler", &binary, &args, &log, scheduler.name)?;
+    let mut spawned = spawn_scheduler_for_op(
+        "Op::AttachScheduler",
+        &binary,
+        &args,
+        &log,
+        scheduler.name,
+        crate::vmm::wire::AttachAttemptKind::Attach,
+    )?;
     // Install a fresh sched_exit_monitor against the just-spawned
     // SCHED_PID so the post-Op scheduler retains death detection.
     // No prior monitor existed for this slot (Attach is the
     // "first scheduler" or post-Detach attach); the restart helper
     // handles the empty-slot case as a fresh install.
-    crate::vmm::rust_init::restart_sched_exit_monitor_with_log(Some(&log));
+    install_spawned_scheduler_monitor("Op::AttachScheduler", &mut spawned, &log)?;
     // 30 s deadline: the coord's Published-arm pulse + worker's
     // no-deadline reinit budget (post-boot the 60 s gate is gone)
     // typically lands in <500 ms (one scan tick + tens of ms for
@@ -2132,14 +2184,15 @@ pub(super) fn dispatch_detach_scheduler() -> Result<()> {
 pub(super) fn dispatch_restart_scheduler() -> Result<()> {
     let prev_pid = kill_current_scheduler("Op::RestartScheduler")?;
     let log = staged_scheduler_log_path("boot");
-    spawn_scheduler_for_op(
+    let mut spawned = spawn_scheduler_for_op(
         "Op::RestartScheduler",
         "/scheduler",
         "/sched_args",
         &log,
         "boot",
+        crate::vmm::wire::AttachAttemptKind::Restart,
     )?;
-    crate::vmm::rust_init::restart_sched_exit_monitor_with_log(Some(&log));
+    install_spawned_scheduler_monitor("Op::RestartScheduler", &mut spawned, &log)?;
     tracing::info!(
         op = "RestartScheduler",
         prev_pid = prev_pid,
@@ -2160,12 +2213,19 @@ pub(super) fn dispatch_replace_scheduler(
     let binary = crate::test_support::staged::staged_scheduler_binary_path(scheduler.name);
     let args = crate::test_support::staged::staged_scheduler_args_path(scheduler.name);
     let log = staged_scheduler_log_path(scheduler.name);
-    spawn_scheduler_for_op("Op::ReplaceScheduler", &binary, &args, &log, scheduler.name)?;
+    let mut spawned = spawn_scheduler_for_op(
+        "Op::ReplaceScheduler",
+        &binary,
+        &args,
+        &log,
+        scheduler.name,
+        crate::vmm::wire::AttachAttemptKind::Replace,
+    )?;
     // Re-install monitor against the replacement scheduler's pid
     // so death detection persists past the swap. The seq-suffixed
     // log path matches the spawn_scheduler_for_op log arg above so
     // failure-dump output goes to the new scheduler's own file.
-    crate::vmm::rust_init::restart_sched_exit_monitor_with_log(Some(&log));
+    install_spawned_scheduler_monitor("Op::ReplaceScheduler", &mut spawned, &log)?;
     // Quiesce the worker before capturing the baseline seqno.
     // Symmetric with Op::AttachScheduler's wait at L2074:
     // without this gate, a coord scan tick that fired during

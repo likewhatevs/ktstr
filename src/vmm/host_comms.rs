@@ -15,10 +15,11 @@
 //!   per-frame CRC mismatches (`crc_ok=false` on the affected entry,
 //!   parsing continues for subsequent frames).
 //!
-//! - [`request_dump`] and [`request_shutdown`] push virtio-console
-//!   RX wake bytes that the guest's `hvc0_poll_loop` recognises
-//!   directly. The SysRq-D dispatch is triggered by the
-//!   `SIGNAL_VC_DUMP` wake byte alone.
+//! - [`request_dump`], [`request_shutdown`],
+//!   [`acknowledge_attach_started`], [`acknowledge_attach_finished`], and
+//!   [`request_attach_cancel`] push virtio-console RX control packets that the
+//!   guest's `hvc0_poll_loop` recognises directly. The SysRq-D dispatch is
+//!   triggered by the `SIGNAL_VC_DUMP` wake byte alone.
 //!
 //! # No drop counter
 //!
@@ -195,6 +196,39 @@ pub fn request_shutdown(virtio_con: &Arc<PiMutex<VirtioConsole>>) {
     virtio_con.lock().queue_input(&[SIGNAL_VC_SHUTDOWN]);
 }
 
+/// Ask the guest to cancel the exact scheduler-attach generation whose host
+/// service budget expired.
+///
+/// The fixed-size packet is queued atomically into the port-0 pending FIFO;
+/// virtio may split it across guest reads, so the hvc0 side retains decoder
+/// state until all generation digits arrive.
+pub fn request_attach_cancel(
+    virtio_con: &Arc<PiMutex<VirtioConsole>>,
+    generation: u64,
+    cause: super::wire::AttachCancelCause,
+) {
+    let packet = super::wire::encode_attach_cancel(generation, cause);
+    virtio_con.lock().queue_input(&packet);
+}
+
+/// Acknowledge that the host accepted and CPU-reanchored one scheduler-attach
+/// `Started` generation. The guest waits for this rendezvous before spawning
+/// the scheduler, so host starvation cannot collapse Started and Finished
+/// into a zero-observation interval.
+pub fn acknowledge_attach_started(virtio_con: &Arc<PiMutex<VirtioConsole>>, generation: u64) {
+    let packet = super::wire::encode_attach_started_ack(generation);
+    virtio_con.lock().queue_input(&packet);
+}
+
+/// Acknowledge that the host accepted and CPU-reanchored one
+/// scheduler-attach `Finished` generation. The guest does not report attach
+/// success until this exact rendezvous arrives. Duplicate terminal frames are
+/// deliberately re-acknowledged without moving the accounting anchor.
+pub fn acknowledge_attach_finished(virtio_con: &Arc<PiMutex<VirtioConsole>>, generation: u64) {
+    let packet = super::wire::encode_attach_finished_ack(generation);
+    virtio_con.lock().queue_input(&packet);
+}
+
 /// Notify the guest that the host's `bpf-map-write` thread finished
 /// applying every queued `bpf_map_write`. Pushes
 /// `SIGNAL_BPF_WRITE_DONE` through the virtio-console RX queue; the
@@ -336,6 +370,46 @@ mod tests {
         let mut dev = VirtioConsole::new();
         let r = drain_bulk(&mut dev);
         assert!(r.entries.is_empty());
+    }
+
+    #[test]
+    fn attach_cancel_delivery_queues_exact_generation_packet() {
+        let dev = Arc::new(PiMutex::new(VirtioConsole::new()));
+        request_attach_cancel(
+            &dev,
+            0x1234_abcd_9876_ef01,
+            super::super::wire::AttachCancelCause::ServiceBudget,
+        );
+
+        assert_eq!(
+            dev.lock().pending_rx_bytes_for_test(),
+            super::super::wire::encode_attach_cancel(
+                0x1234_abcd_9876_ef01,
+                super::super::wire::AttachCancelCause::ServiceBudget,
+            ),
+        );
+    }
+
+    #[test]
+    fn attach_started_ack_delivery_queues_exact_generation_packet() {
+        let dev = Arc::new(PiMutex::new(VirtioConsole::new()));
+        acknowledge_attach_started(&dev, 0x1020_3040_5060_7080);
+
+        assert_eq!(
+            dev.lock().pending_rx_bytes_for_test(),
+            super::super::wire::encode_attach_started_ack(0x1020_3040_5060_7080),
+        );
+    }
+
+    #[test]
+    fn attach_finished_ack_delivery_queues_exact_generation_packet() {
+        let dev = Arc::new(PiMutex::new(VirtioConsole::new()));
+        acknowledge_attach_finished(&dev, 0x1122_3344_5566_7788);
+
+        assert_eq!(
+            dev.lock().pending_rx_bytes_for_test(),
+            super::super::wire::encode_attach_finished_ack(0x1122_3344_5566_7788),
+        );
     }
 
     /// Hostile-input guard: a header announcing

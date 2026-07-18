@@ -53,6 +53,13 @@ pub enum WatchdogKillReason {
     Tier3Deadman,
     /// An AP set the kill flag (panic-driven), not a watchdog expiry.
     ApKill,
+    /// A scheduler attach consumed its host-measured service budget, then
+    /// failed to acknowledge the host's generation-tagged cancellation
+    /// within the fail-closed grace.
+    AttachCancelUnacknowledged,
+    /// The host monitor became terminal or was unavailable while a
+    /// scheduler attach attempt still owned the lifecycle watchdog.
+    AttachMonitorUnavailable,
 }
 
 /// Final guest lifecycle stage as tracked by the progress ledger —

@@ -134,6 +134,8 @@ impl SinkState {
             // lifecycle-stage side effects, so every advance site no-ops.
             progress_ledger: None,
             contention_recorder: None,
+            attach_attempts: None,
+            attach_control_console: None,
             expected_kernel_build_id: None,
         }
     }

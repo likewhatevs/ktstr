@@ -1465,7 +1465,8 @@ fn run_ktstr_test_inner_impl(
                 | Some(crate::vmm::wire::MsgType::TeardownBarrierAck)
                 | Some(crate::vmm::wire::MsgType::SysRdy)
                 | Some(crate::vmm::wire::MsgType::BpfMapWriteReady)
-                | Some(crate::vmm::wire::MsgType::SchedSwapNotify) => {}
+                | Some(crate::vmm::wire::MsgType::SchedSwapNotify)
+                | Some(crate::vmm::wire::MsgType::AttachAttempt) => {}
                 None => {
                     tracing::warn!(
                         msg_type = bulk_entry.msg_type,

@@ -8,6 +8,7 @@
 //! Reopens [`impl KtstrVm`](super::KtstrVm) so the canonical struct
 //! definition stays in [`super`].
 
+mod attach_watchdog;
 pub(crate) mod evented_wait;
 mod gate;
 mod kernel_op_dispatch;
@@ -94,6 +95,7 @@ mod bss_tests;
 #[cfg(test)]
 mod early_snapshot_guard_tests;
 
+use self::attach_watchdog::{AttachAttemptTracker, AttachWatchdogDecision};
 use self::dispatch::{BulkDispatchSinks, dispatch_bulk_message};
 #[allow(unused_imports)]
 use self::lazy_init::{
@@ -379,6 +381,14 @@ pub(crate) enum KillReasonTag {
     /// An AP set the kill flag (a panic-driven kill), not a watchdog
     /// timeout. Distinct so the dump does not mislabel it as an expiry.
     ApKill = 4,
+    /// The host exhausted the attach service budget, sent a
+    /// generation-tagged cancellation, and the guest failed to acknowledge
+    /// it within the additional delivered-service grace.
+    AttachCancelUnacked = 5,
+    /// The monitor reached a known terminal state while a scheduler attach
+    /// attempt still owned the lifecycle watchdog. This is an infrastructure
+    /// sensor failure, not an unacknowledged guest cancellation.
+    AttachMonitorUnavailable = 6,
 }
 
 impl KillReasonTag {
@@ -390,6 +400,8 @@ impl KillReasonTag {
             2 => Self::Tier2Idle,
             3 => Self::Tier3Deadman,
             4 => Self::ApKill,
+            5 => Self::AttachCancelUnacked,
+            6 => Self::AttachMonitorUnavailable,
             _ => Self::Unset,
         }
     }
@@ -402,6 +414,8 @@ impl KillReasonTag {
             Self::Tier2Idle => "tier2-idle-wedge",
             Self::Tier3Deadman => "tier3-deadman-deadline",
             Self::ApKill => "ap-kill",
+            Self::AttachCancelUnacked => "attach-cancel-unacknowledged",
+            Self::AttachMonitorUnavailable => "attach-monitor-unavailable",
         }
     }
 }
@@ -420,6 +434,8 @@ fn decode_watchdog_kill_reason(raw: u8) -> Option<crate::vmm::WatchdogKillReason
         KillReasonTag::Tier2Idle => Some(Pub::Tier2IdleWedge),
         KillReasonTag::Tier3Deadman => Some(Pub::Tier3Deadman),
         KillReasonTag::ApKill => Some(Pub::ApKill),
+        KillReasonTag::AttachCancelUnacked => Some(Pub::AttachCancelUnacknowledged),
+        KillReasonTag::AttachMonitorUnavailable => Some(Pub::AttachMonitorUnavailable),
     }
 }
 
@@ -563,14 +579,58 @@ fn watchdog_hard_deadline(run_start: Instant, timeout: Duration) -> Instant {
     run_start + timeout
 }
 
+/// Apply the attach-overlay gate at the watchdog caller, before ordinary
+/// Tier-3 or its soft-shutdown prefire can consume stale/dead monitor
+/// evidence. AP kill and attach-specific fail-closed bypass this helper.
+fn ordinary_watchdog_boundary_should_fire(
+    attach_overlay_active: bool,
+    boundary_reached: bool,
+    monitor_live: bool,
+    wall_since_milestone_ns: u64,
+    cpu_trickle_stalled: bool,
+    max_vcpu_cpu_in_phase_ns: u64,
+    effective_deadline_budget_ns: u64,
+    cpu_currency: u8,
+) -> bool {
+    !attach_overlay_active
+        && boundary_reached
+        && watchdog_step::deadman_should_fire(
+            monitor_live,
+            wall_since_milestone_ns,
+            cpu_trickle_stalled,
+            max_vcpu_cpu_in_phase_ns,
+            effective_deadline_budget_ns,
+            cpu_currency,
+        )
+}
+
 #[cfg(test)]
 mod watchdog_reset_tag_tests {
     use super::{
         KillReasonTag, WatchdogResetTag, decode_guest_phase, decode_watchdog_kill_reason,
-        watchdog_hard_deadline,
+        ordinary_watchdog_boundary_should_fire, watchdog_hard_deadline,
     };
     use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn attach_overlay_gates_tier3_and_soft_prefire_at_the_caller() {
+        let otherwise_terminal = |overlay_active, boundary_reached| {
+            ordinary_watchdog_boundary_should_fire(
+                overlay_active,
+                boundary_reached,
+                false, // dead monitor would ordinarily fire immediately
+                u64::MAX,
+                true,
+                u64::MAX,
+                1,
+                crate::monitor::CPU_CURRENCY_PMU,
+            )
+        };
+        assert!(otherwise_terminal(false, true));
+        assert!(!otherwise_terminal(true, true));
+        assert!(!otherwise_terminal(false, false));
+    }
 
     /// The VmResult plumbing decodes each fired tier's raw byte into the
     /// public mirror, and the Unset/unknown bytes into `None` — so a clean
@@ -591,6 +651,14 @@ mod watchdog_reset_tag_tests {
             (KillReasonTag::Tier2Idle, Pub::Tier2IdleWedge),
             (KillReasonTag::Tier3Deadman, Pub::Tier3Deadman),
             (KillReasonTag::ApKill, Pub::ApKill),
+            (
+                KillReasonTag::AttachCancelUnacked,
+                Pub::AttachCancelUnacknowledged,
+            ),
+            (
+                KillReasonTag::AttachMonitorUnavailable,
+                Pub::AttachMonitorUnavailable,
+            ),
         ] {
             assert_eq!(decode_watchdog_kill_reason(tag as u8), Some(expected));
         }
@@ -639,6 +707,14 @@ mod watchdog_reset_tag_tests {
             (KillReasonTag::Tier2Idle, "tier2-idle-wedge"),
             (KillReasonTag::Tier3Deadman, "tier3-deadman-deadline"),
             (KillReasonTag::ApKill, "ap-kill"),
+            (
+                KillReasonTag::AttachCancelUnacked,
+                "attach-cancel-unacknowledged",
+            ),
+            (
+                KillReasonTag::AttachMonitorUnavailable,
+                "attach-monitor-unavailable",
+            ),
         ] {
             assert_eq!(tag.render(), token);
             assert_eq!(KillReasonTag::from_u8(tag as u8), tag);
@@ -3537,6 +3613,12 @@ impl KtstrVm {
         // single clone — no unused-binding warnings).
         let progress_ledger: Arc<monitor::ProgressLedger> =
             Arc::new(monitor::ProgressLedger::default());
+        // Scheduler attach-attempt overlay. Guest begin/end frames mutate this
+        // from the coordinator thread; the watchdog reads it each tick against
+        // the monitor's host-measured max-vCPU currency. It is deliberately
+        // independent of the forward-only coarse lifecycle stage so
+        // Attach/Restart/Replace Ops remain bounded while that stage is Body.
+        let attach_attempts = Arc::new(AttachAttemptTracker::default());
         let kern_phys_base: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
         let kern_phys_base_evt = Arc::new(EventFd::new(0).expect("eventfd for kern_phys_base"));
@@ -3689,6 +3771,7 @@ impl KtstrVm {
         // dispatch's forward-only stage stores and the monitor's per-tick
         // liveness stores land in one ledger.
         let progress_ledger_for_coord = progress_ledger.clone();
+        let attach_attempts_for_coord = attach_attempts.clone();
         let contention_recorder_for_coord = contention_recorder.clone();
         let watchdog_pause_ns: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -3855,6 +3938,7 @@ impl KtstrVm {
         // the same Arc, so the watchdog sees the monitor's liveness/CPU
         // stores and dispatch's phase advances in one ledger.
         let progress_ledger_for_wd = progress_ledger.clone();
+        let attach_attempts_for_wd = attach_attempts.clone();
         // Fourth ledger clone, read once at `VmRunState` build: the final
         // phase / progress_epoch land on `VmResult` so mechanism-asserting
         // fixtures can distinguish "guest reached the phase under test"
@@ -6089,6 +6173,12 @@ impl KtstrVm {
                                         ),
                                         contention_recorder: Some(
                                             contention_recorder_for_coord.as_ref(),
+                                        ),
+                                        attach_attempts: Some(
+                                            attach_attempts_for_coord.as_ref(),
+                                        ),
+                                        attach_control_console: Some(
+                                            &freeze_coord_virtio_con,
                                         ),
                                         expected_kernel_build_id:
                                             host_vmlinux_build_id_for_coord.as_deref(),
@@ -12846,9 +12936,103 @@ impl KtstrVm {
                     // dead monitor makes `evaluate_progress` return None
                     // (both tiers off), so a degraded / no-monitor host
                     // naturally falls back to Tier-3-only.
-                    let snapshot = progress_ledger_for_wd.snapshot();
-                    let monitor_live = monitor_liveness.observe(snapshot.monitor_heartbeat);
                     let now_wall_ns = run_start.elapsed().as_nanos() as u64;
+                    // Scheduler attach is an overlay rather than a coarse
+                    // lifecycle regression: lifecycle Ops may attach while
+                    // the forward-only stage remains Body. The guest supplies
+                    // only generation-tagged boundaries; this host tick owns
+                    // the budget using the monitor's max-single-vCPU currency.
+                    //
+                    // While active, suppress every ordinary watchdog path:
+                    // coarse Tier-1/2, Tier-3, and the Tier-3 soft-shutdown
+                    // prefire. The overlay applies a 35 s delivered-service
+                    // budget, then asks the guest to cancel so an Op can
+                    // surface a typed failure. Both the budget and grace are
+                    // host max-vCPU currency: stale idle/dead-monitor evidence
+                    // is not safe while an ACK/cancel packet may be waiting
+                    // for a starved vCPU. An explicit monitor-terminal edge,
+                    // AP kill, and the overlay's own post-cancel fail-closed
+                    // remain authoritative.
+                    let attach_tick = attach_attempts_for_wd.watchdog_tick(
+                        progress_ledger_for_wd.as_ref(),
+                        now_wall_ns,
+                        &mut monitor_liveness,
+                        &wd_virtio_con,
+                    );
+                    let snapshot = attach_tick.snapshot;
+                    let monitor_live = attach_tick.monitor_live;
+                    let attach_step = attach_tick.attach;
+                    match attach_step.decision {
+                        AttachWatchdogDecision::RequestCancel {
+                            generation,
+                            kind,
+                            cause,
+                            service_ns,
+                            trigger_elapsed_ns,
+                            trigger_budget_ns,
+                        } => {
+                            eprintln!(
+                                "ktstr-watchdog: scheduler attach cancellation requested: \
+                                 generation={generation}, kind={kind:?}, cause={cause:?}, \
+                                 max_vcpu_service={:?}, trigger_elapsed={:?}, \
+                                 trigger_budget={:?}",
+                                Duration::from_nanos(service_ns),
+                                Duration::from_nanos(trigger_elapsed_ns),
+                                Duration::from_nanos(trigger_budget_ns),
+                            );
+                        }
+                        AttachWatchdogDecision::None
+                        | AttachWatchdogDecision::FailClosed { .. }
+                        | AttachWatchdogDecision::SensorTerminal { .. } => {}
+                    }
+                    let attach_failure = match attach_step.decision {
+                        AttachWatchdogDecision::FailClosed {
+                            generation,
+                            kind,
+                            cause,
+                            service_after_cancel_ns,
+                            grace_budget_ns,
+                        } => {
+                            eprintln!(
+                                "ktstr-watchdog: scheduler attach cancellation was not \
+                                 acknowledged; failing closed: generation={generation}, \
+                                 kind={kind:?}, cause={cause:?}, \
+                                 max_vcpu_service_since_cancel={:?}, grace_budget={:?}",
+                                Duration::from_nanos(service_after_cancel_ns),
+                                Duration::from_nanos(grace_budget_ns),
+                            );
+                            Some((
+                                generation,
+                                kind,
+                                cause,
+                                service_after_cancel_ns,
+                                grace_budget_ns,
+                            ))
+                        }
+                        AttachWatchdogDecision::None
+                        | AttachWatchdogDecision::RequestCancel { .. }
+                        | AttachWatchdogDecision::SensorTerminal { .. } => None,
+                    };
+                    let attach_fail_closed = attach_failure.is_some();
+                    let attach_monitor_failure = match attach_step.decision {
+                        AttachWatchdogDecision::SensorTerminal {
+                            generation,
+                            kind,
+                            finishing,
+                        } => {
+                            let attach_phase = if finishing { "finishing" } else { "active" };
+                            eprintln!(
+                                "ktstr-watchdog: scheduler attach monitor unavailable; \
+                                 failing immediately: generation={generation}, kind={kind:?}, \
+                                 attach_phase={attach_phase}"
+                            );
+                            Some((generation, kind, attach_phase))
+                        }
+                        AttachWatchdogDecision::None
+                        | AttachWatchdogDecision::RequestCancel { .. }
+                        | AttachWatchdogDecision::FailClosed { .. } => None,
+                    };
+                    let attach_monitor_unavailable = attach_monitor_failure.is_some();
                     // CPU-trickle verdict for this tick — the Tier-3
                     // deadman's deferral discriminator (its ONLY consumer;
                     // Tier-2 carries no CPU term). The MONITOR computes it
@@ -12866,12 +13050,16 @@ impl KtstrVm {
                     // milestone); reused by the deadman deferral gate.
                     let wall_since_milestone_ns =
                         now_wall_ns.saturating_sub(snapshot.wall_ns_at_progress);
-                    let progress_decision = watchdog_step::evaluate_progress(
-                        &snapshot,
-                        now_wall_ns,
-                        monitor_live,
-                        vcpus_for_wd,
-                    );
+                    let progress_decision = if attach_step.active {
+                        watchdog_step::KillDecision::None
+                    } else {
+                        watchdog_step::evaluate_progress(
+                            &snapshot,
+                            now_wall_ns,
+                            monitor_live,
+                            vcpus_for_wd,
+                        )
+                    };
                     let tier_fire = !matches!(progress_decision, watchdog_step::KillDecision::None);
                     let effective_deadline =
                         reset_deadline.map_or(hard_deadline, |r| r.max(hard_deadline));
@@ -12900,16 +13088,22 @@ impl KtstrVm {
                     // intentional Tier-1 exemption without reintroducing
                     // wall-clock false kills under host contention. See
                     // [`watchdog_step::deadman_should_fire`].
-                    let deadman_fire = hard_deadline_reached
-                        && watchdog_step::deadman_should_fire(
-                            monitor_live,
-                            wall_since_milestone_ns,
-                            cpu_trickle_stalled,
-                            snapshot.max_vcpu_cpu_in_phase_ns,
-                            effective_deadline_budget_ns,
-                            snapshot.cpu_currency,
-                        );
-                    if kill_set || deadman_fire || tier_fire {
+                    let deadman_fire = ordinary_watchdog_boundary_should_fire(
+                        attach_step.active,
+                        hard_deadline_reached,
+                        monitor_live,
+                        wall_since_milestone_ns,
+                        cpu_trickle_stalled,
+                        snapshot.max_vcpu_cpu_in_phase_ns,
+                        effective_deadline_budget_ns,
+                        snapshot.cpu_currency,
+                    );
+                    if kill_set
+                        || deadman_fire
+                        || tier_fire
+                        || attach_fail_closed
+                        || attach_monitor_unavailable
+                    {
                         // A progress tier fired, an AP set kill, or the
                         // hard timeout expired.
                         // Re-check bsp_done: if the BSP already exited its
@@ -12935,6 +13129,10 @@ impl KtstrVm {
                         // is last (and, unlike the tiers/deadline, is not a
                         // timeout). Mirrors the old hard-over-AP order.
                         let reason_tag = match progress_decision {
+                            _ if attach_monitor_unavailable => {
+                                KillReasonTag::AttachMonitorUnavailable
+                            }
+                            _ if attach_fail_closed => KillReasonTag::AttachCancelUnacked,
                             watchdog_step::KillDecision::Tier1CpuBudget => KillReasonTag::Tier1Cpu,
                             watchdog_step::KillDecision::Tier2IdleWedge => KillReasonTag::Tier2Idle,
                             watchdog_step::KillDecision::None if hard_timeout_fired => {
@@ -13031,17 +13229,22 @@ impl KtstrVm {
                         // infrastructure fault, not a test failure — prefix
                         // the header with a greppable marker so triage can
                         // separate framework wedges from workload timeouts.
-                        let infra_fault = matches!(
-                            reason_tag,
-                            KillReasonTag::Tier1Cpu | KillReasonTag::Tier2Idle
-                        ) && snapshot.phase
-                            == crate::monitor::LifecycleStage::Boot as u8;
+                        let infra_fault = reason_tag == KillReasonTag::AttachMonitorUnavailable
+                            || (matches!(
+                                reason_tag,
+                                KillReasonTag::Tier1Cpu | KillReasonTag::Tier2Idle
+                            ) && snapshot.phase
+                                == crate::monitor::LifecycleStage::Boot as u8);
                         let header_prefix = if infra_fault {
                             "ktstr infra fault: "
                         } else {
                             ""
                         };
-                        let fire_event = if tier_fire {
+                        let fire_event = if attach_monitor_unavailable {
+                            "attach monitor unavailable"
+                        } else if attach_fail_closed {
+                            "attach cancellation grace exhausted"
+                        } else if tier_fire {
                             "progress watchdog fired"
                         } else if hard_timeout_fired {
                             "deadline expired"
@@ -13064,10 +13267,33 @@ impl KtstrVm {
                         // early-boot kill here is Tier-1 / Tier-3 only.
                         eprintln!(
                             "  phase={stage:?} ({:?}), monitor_live={monitor_live}, \
-                             evidence_channels_live={}",
+                             monitor_terminal={}, evidence_channels_live={}",
                             stage.class(),
+                            snapshot.monitor_terminal,
                             snapshot.evidence_channels_live,
                         );
+                        if let Some((
+                            generation,
+                            kind,
+                            cause,
+                            service_after_cancel_ns,
+                            grace_budget_ns,
+                        )) = attach_failure
+                        {
+                            eprintln!(
+                                "  attach_overlay=generation:{generation} kind:{kind:?} \
+                                 cancel_cause:{cause:?}, \
+                                 max_vcpu_service_since_cancel={:?} vs grace_budget={:?}",
+                                Duration::from_nanos(service_after_cancel_ns),
+                                Duration::from_nanos(grace_budget_ns),
+                            );
+                        }
+                        if let Some((generation, kind, attach_phase)) = attach_monitor_failure {
+                            eprintln!(
+                                "  attach_overlay=generation:{generation} kind:{kind:?} \
+                                 phase:{attach_phase}, monitor_terminal=true"
+                            );
+                        }
                         eprintln!(
                             "  max_vcpu_cpu_in_phase={:?} vs budget={} \
                              (currency={cpu_currency_str}), cpu_sum={:?}, \
@@ -13153,7 +13379,7 @@ impl KtstrVm {
                         // AP-set-kill path does NOT — it is a panic-driven
                         // kill, and propagating it as `timed_out=true` would
                         // mislabel it as a deadline expiry.
-                        if hard_timeout_fired || tier_fire {
+                        if hard_timeout_fired || tier_fire || attach_fail_closed {
                             timed_out_for_watchdog.store(true, Ordering::Release);
                         }
                         // Propagate kill so handle_freeze's poll loop
@@ -13204,14 +13430,15 @@ impl KtstrVm {
                     // and skip soft entirely.
                     let effective_soft = soft_deadline
                         .and_then(|_| effective_deadline.checked_sub(Duration::from_secs(3)));
-                    if hard_deadline_reached {
+                    if !attach_step.active && hard_deadline_reached {
                         // Reached the wall deadline this tick but did not
                         // fire (deadman deferred; kill/tier not set) — the
                         // cell is alive but past its budget.
                         deadman_deferrals = deadman_deferrals.saturating_add(1);
                     } else if !soft_fired
-                        && effective_soft.is_some_and(|d| Instant::now() >= d)
-                        && watchdog_step::deadman_should_fire(
+                        && ordinary_watchdog_boundary_should_fire(
+                            attach_step.active,
+                            effective_soft.is_some_and(|d| Instant::now() >= d),
                             monitor_live,
                             wall_since_milestone_ns,
                             cpu_trickle_stalled,
@@ -13996,6 +14223,7 @@ impl KtstrVm {
         kern_addrs_crc_bad: Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<Option<JoinHandle<monitor::reader::MonitorLoopResult>>> {
         let Some(vmlinux) = find_vmlinux(&self.kernel) else {
+            progress_ledger.publish_monitor_terminal();
             return Ok(None);
         };
         // Parse the vmlinux once per (path, mtime) per process and
@@ -14013,6 +14241,7 @@ impl KtstrVm {
         // owned, so the monitor closure below clones them out of the
         // shared `Arc` exactly as if it had parsed them itself.
         let Some(artifacts) = super::vmlinux::cached_vmlinux_artifacts(&vmlinux) else {
+            progress_ledger.publish_monitor_terminal();
             return Ok(None);
         };
         // `monitor: None` means the BTF load or `KernelOffsets`
@@ -14021,6 +14250,7 @@ impl KtstrVm {
         // resolving but `monitor` absent is the same "symbols Ok,
         // offsets Err → Ok(None)" the old `(Ok, Ok)` gate produced.
         let Some(mon) = artifacts.monitor.as_ref() else {
+            progress_ledger.publish_monitor_terminal();
             return Ok(None);
         };
         let symbols = artifacts.symbols.clone();
@@ -14038,7 +14268,10 @@ impl KtstrVm {
         // pre-cache "unreadable vmlinux → no monitor" early return.
         let vmlinux_data_arc = match super::vmlinux::cached_vmlinux_bytes(&vmlinux) {
             Some(d) => d,
-            None => return Ok(None),
+            None => {
+                progress_ledger.publish_monitor_terminal();
+                return Ok(None);
+            }
         };
         // BTF-capability probe for the `SCX_EV_*` event counters:
         // `event_offsets` resolves only on kernels that expose the
@@ -14169,9 +14402,15 @@ impl KtstrVm {
         let vcpu_timing =
             monitor::reader::VcpuTiming::from_pthreads(vcpu_pthreads, Some(contention_recorder));
 
+        let progress_ledger_for_spawn_failure = Arc::clone(&progress_ledger);
         let handle = std::thread::Builder::new()
             .name("vmm-monitor".into())
             .spawn(move || {
+                let _monitor_terminal_guard =
+                    monitor::reader::MonitorTerminalGuard::new(
+                        progress_ledger.as_ref(),
+                        kill_clone.as_ref(),
+                    );
                 if let Some(cpu) = service_cpu {
                     pin_current_thread(cpu, "monitor");
                 }
@@ -14950,8 +15189,14 @@ impl KtstrVm {
                 // survives to `MonitorReport`.
                 __mlr.scx_event_counters_supported = scx_event_counters_supported;
                 __mlr
-            })
-            .context("spawn monitor thread")?;
+            });
+        let handle = match handle {
+            Ok(handle) => handle,
+            Err(error) => {
+                progress_ledger_for_spawn_failure.publish_monitor_terminal();
+                return Err(error).context("spawn monitor thread");
+            }
+        };
 
         Ok(Some(handle))
     }
