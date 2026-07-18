@@ -7,7 +7,8 @@
 //! follows only ktstr-specific feature chains and emits package-qualified
 //! selectors, avoiding a broad `--all-features` build.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 
 use cargo_metadata::semver::{Version, VersionReq};
 use cargo_metadata::{Metadata, MetadataCommand};
@@ -43,12 +44,57 @@ pub(crate) struct PackageFeatureActivation {
     pub(crate) features: Vec<String>,
 }
 
-/// The Cargo arguments relevant to a metadata preflight.
+/// The explicitly requested Cargo compilation target, if any.
+///
+/// Stop at `--`, after which a `--target` token belongs to the test binary.
+/// Named target triples are reused both for Cargo metadata's
+/// `--filter-platform` and for target-aware dependency-edge classification.
+/// Custom target JSON paths remain available to scheduler builds but cannot
+/// safely be interpreted as cargo-platform expressions.
+pub(crate) fn requested_target(args: &[String]) -> Option<String> {
+    let args = cargo_args(args);
+    let mut requested = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--target" {
+            index += 1;
+            requested = args.get(index).cloned();
+        } else if let Some(target) = arg.strip_prefix("--target=")
+            && !target.is_empty()
+        {
+            requested = Some(target.to_string());
+        }
+        index += 1;
+    }
+    requested
+}
+
+/// The Cargo arguments relevant to a top-level metadata preflight.
 ///
 /// Feature selection is deliberately omitted: package manifests expose every
 /// feature definition without activating it. Stop at `--`, after which tokens
-/// belong to the test binary rather than Cargo.
+/// belong to the test binary rather than Cargo. Cargo metadata names the
+/// compilation-target option `--filter-platform`, so an explicit Cargo
+/// `--target` is translated rather than forwarded verbatim.
 pub(crate) fn metadata_passthrough_options(args: &[String]) -> Vec<String> {
+    metadata_context_options(args, true, None)
+}
+
+/// Cargo context for metadata run from a declaration's own manifest directory.
+///
+/// The caller deliberately supplies that workspace through `current_dir`, so
+/// forwarding the outer command's `--manifest-path` would point Cargo back at
+/// the wrong workspace. Resolution controls and target filtering still apply.
+pub(crate) fn declaring_metadata_options(args: &[String], invocation_dir: &Path) -> Vec<String> {
+    metadata_context_options(args, false, Some(invocation_dir))
+}
+
+fn metadata_context_options(
+    args: &[String],
+    include_manifest_path: bool,
+    rebase_from: Option<&Path>,
+) -> Vec<String> {
     let mut out = Vec::new();
     let mut index = 0;
     while index < args.len() {
@@ -58,13 +104,179 @@ pub(crate) fn metadata_passthrough_options(args: &[String]) -> Vec<String> {
         }
         if matches!(arg.as_str(), "--locked" | "--offline" | "--frozen") {
             out.push(arg.clone());
-        } else if matches!(arg.as_str(), "--config" | "--manifest-path") {
+        } else if arg == "--config" {
+            out.push(arg.clone());
+            index += 1;
+            if let Some(value) = args.get(index) {
+                out.push(rebase_config_value(value, rebase_from));
+            }
+        } else if arg == "--manifest-path" {
+            index += 1;
+            if include_manifest_path && let Some(value) = args.get(index) {
+                out.push(arg.clone());
+                out.push(value.clone());
+            }
+        } else if let Some(value) = arg.strip_prefix("--config=") {
+            out.push(format!(
+                "--config={}",
+                rebase_config_value(value, rebase_from)
+            ));
+        } else if arg == "-Z" {
             out.push(arg.clone());
             index += 1;
             if let Some(value) = args.get(index) {
                 out.push(value.clone());
             }
-        } else if arg.starts_with("--config=") || arg.starts_with("--manifest-path=") {
+        } else if (arg.starts_with("-Z") && arg.len() > 2)
+            || (include_manifest_path && arg.starts_with("--manifest-path="))
+        {
+            out.push(arg.clone());
+        } else if arg == "--target" {
+            index += 1;
+            if let Some(value) = args.get(index)
+                && named_filter_platform(value)
+            {
+                out.push("--filter-platform".to_string());
+                out.push(value.clone());
+            }
+        } else if let Some(value) = arg.strip_prefix("--target=")
+            && named_filter_platform(value)
+        {
+            out.push(format!("--filter-platform={value}"));
+        }
+        index += 1;
+    }
+    out
+}
+
+fn named_filter_platform(target: &str) -> bool {
+    !target.is_empty()
+        && !target.ends_with(".json")
+        && !target.contains('/')
+        && !target.contains('\\')
+}
+
+fn rebase_path(value: &str, invocation_dir: &Path) -> String {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        value.to_string()
+    } else {
+        invocation_dir.join(path).to_string_lossy().into_owned()
+    }
+}
+
+fn rebase_config_value(value: &str, invocation_dir: Option<&Path>) -> String {
+    match invocation_dir {
+        Some(invocation_dir) if !value.contains('=') => rebase_path(value, invocation_dir),
+        Some(invocation_dir) => {
+            rebase_inline_config_path(value, invocation_dir).unwrap_or_else(|| value.to_string())
+        }
+        _ => value.to_string(),
+    }
+}
+
+/// Rebase scalar Cargo config values whose schema defines a filesystem path.
+///
+/// `--config KEY=VALUE` resolves relative paths against Cargo's current
+/// directory. Scheduler discovery/build changes that directory, so the common
+/// path-bearing keys (especially `[patch].*.path`) need the same treatment as
+/// a `--config path.toml` argument. Bare executable names remain PATH lookups.
+fn rebase_inline_config_path(value: &str, invocation_dir: &Path) -> Option<String> {
+    let (key, raw_value) = value.split_once('=')?;
+    let key = key.trim();
+    let raw_value = raw_value.trim();
+    let decoded = if raw_value.starts_with('"') && raw_value.ends_with('"') {
+        serde_json::from_str::<String>(raw_value).ok()?
+    } else if raw_value.len() >= 2 && raw_value.starts_with('\'') && raw_value.ends_with('\'') {
+        raw_value[1..raw_value.len() - 1].to_string()
+    } else {
+        return None;
+    };
+    let non_executable_path =
+        key.ends_with(".path") || matches!(key, "build.target-dir" | "build.dep-info-basedir");
+    let executable_path = matches!(
+        key,
+        "build.rustc"
+            | "build.rustc-wrapper"
+            | "build.rustc-workspace-wrapper"
+            | "build.rustdoc"
+            | "doc.browser"
+    ) || key.ends_with(".linker")
+        || key.ends_with(".runner");
+    if !non_executable_path
+        && !(executable_path && (decoded.contains('/') || decoded.contains('\\')))
+    {
+        return None;
+    }
+    let rebased = rebase_path(&decoded, invocation_dir);
+    Some(format!(
+        "{key}={}",
+        serde_json::to_string(&rebased).expect("a Rust string always serializes as JSON")
+    ))
+}
+
+/// Cargo controls whose semantics must also govern parent-owned scheduler
+/// builds.
+///
+/// Package selection and scheduler profile are supplied by the prebuild
+/// planner itself. Resolution, target, and artifact-placement controls remain
+/// relevant. Feature flags deliberately do not: declaration-test features
+/// name the consumer workspace and can fail or broaden a distinct scheduler
+/// package, so they stay on metadata/nextest rather than leaking into this
+/// parent-owned build.
+///
+/// Relative path-valued controls are rebased before the scheduler command
+/// changes its current directory to the declaring workspace.
+pub(crate) fn scheduler_build_options(args: &[String], invocation_dir: &Path) -> Vec<String> {
+    let args = cargo_args(args);
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if matches!(
+            arg.as_str(),
+            "--locked" | "--offline" | "--frozen" | "--ignore-rust-version"
+        ) {
+            out.push(arg.clone());
+        } else if matches!(
+            arg.as_str(),
+            "--config" | "--target" | "--target-dir" | "-Z"
+        ) {
+            out.push(arg.clone());
+            index += 1;
+            if let Some(value) = args.get(index) {
+                let value = match arg.as_str() {
+                    "--config" => rebase_config_value(value, Some(invocation_dir)),
+                    "--target-dir" => rebase_path(value, invocation_dir),
+                    "--target"
+                        if value.ends_with(".json")
+                            || value.contains('/')
+                            || value.contains('\\') =>
+                    {
+                        rebase_path(value, invocation_dir)
+                    }
+                    _ => value.clone(),
+                };
+                out.push(value);
+            }
+        } else if let Some(value) = arg.strip_prefix("--config=") {
+            out.push(format!(
+                "--config={}",
+                rebase_config_value(value, Some(invocation_dir))
+            ));
+        } else if let Some(value) = arg.strip_prefix("--target-dir=") {
+            out.push(format!(
+                "--target-dir={}",
+                rebase_path(value, invocation_dir)
+            ));
+        } else if let Some(value) = arg.strip_prefix("--target=") {
+            let value = if value.ends_with(".json") || value.contains('/') || value.contains('\\') {
+                rebase_path(value, invocation_dir)
+            } else {
+                value.to_string()
+            };
+            out.push(format!("--target={value}"));
+        } else if arg.starts_with("-Z") && arg.len() > 2 {
             out.push(arg.clone());
         }
         index += 1;
@@ -148,6 +360,111 @@ fn compatible_ktstr_member(member: &str, aliases: &HashSet<&str>) -> Option<bool
     }
 }
 
+/// Whether a manifest dependency can participate in the requested target.
+///
+/// With no explicit `--target`, keep the existing conservative rule: a
+/// manifest-only pass cannot evaluate target cfgs, so do not auto-activate
+/// them. With an explicit named target, exact target-table entries are safe to
+/// match. `cfg(...)` expressions remain deliberately explicit: evaluating
+/// them would require rustc's complete cfg set for the target, and Default
+/// metadata cannot recover an optional edge that this manifest pass never
+/// activated. The subsequent resolved metadata pass still receives
+/// `--filter-platform`, so already-active dependency versions are classified
+/// against Cargo's authoritative platform evaluation.
+fn dependency_matches_requested_target(
+    dependency: &cargo_metadata::Dependency,
+    target: Option<&str>,
+) -> bool {
+    let Some(platform) = dependency.target.as_ref() else {
+        return true;
+    };
+    let Some(target) = target else {
+        return false;
+    };
+    let platform = platform.to_string();
+    !platform.starts_with("cfg(") && platform == target
+}
+
+/// Whether one target participates in `cargo test`/nextest harness discovery.
+fn target_has_test_harness(target: &cargo_metadata::Target) -> bool {
+    target.test
+        && target
+            .kind
+            .iter()
+            .any(|kind| matches!(kind, cargo_metadata::TargetKind::Test))
+}
+
+fn semantic_name_mentions_ktstr(name: &str, aliases: &HashSet<&str>) -> bool {
+    fn normalized(value: &str) -> String {
+        value
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    }
+
+    let name = format!("-{}-", normalized(name));
+    std::iter::once("ktstr")
+        .chain(aliases.iter().copied())
+        .map(normalized)
+        .any(|alias| !alias.is_empty() && name.contains(&format!("-{alias}-")))
+}
+
+/// A target-required feature can supplement graph-based ktstr activation only
+/// when enabling it remains narrow.
+///
+/// An empty required feature is a source-level gate with no Cargo dependency
+/// side effects, but metadata cannot otherwise associate it with ktstr. It is
+/// therefore admitted only when the feature or integration-test target name
+/// contains `ktstr` (or the dependency's rename) as a delimited component. A
+/// non-empty gate must walk exclusively through local features and ktstr
+/// dependency-feature forwarding, and must actually mention ktstr; an empty
+/// descendant is rejected so a composite mode cannot smuggle an unrelated
+/// source-only feature into an otherwise ktstr-looking wrapper.
+fn required_feature_is_narrow(
+    start: &str,
+    features: &BTreeMap<String, Vec<String>>,
+    aliases: &HashSet<&str>,
+    allow_empty: bool,
+) -> bool {
+    let Some(start_members) = features.get(start) else {
+        return false;
+    };
+    if start_members.is_empty() {
+        return allow_empty;
+    }
+
+    let mut pending = vec![start];
+    let mut seen = HashSet::new();
+    let mut mentions_ktstr = false;
+    while let Some(feature) = pending.pop() {
+        if !seen.insert(feature) {
+            continue;
+        }
+        let Some(members) = features.get(feature) else {
+            return false;
+        };
+        if feature != start && members.is_empty() {
+            return false;
+        }
+        for member in members {
+            if compatible_ktstr_member(member, aliases).is_some() {
+                mentions_ktstr = true;
+            } else if features.contains_key(member) {
+                pending.push(member);
+            } else {
+                return false;
+            }
+        }
+    }
+    mentions_ktstr
+}
+
 /// Whether `start` transitively enables the local Cargo feature `target`.
 fn local_feature_reaches<'a>(
     start: &'a str,
@@ -179,22 +496,26 @@ fn local_feature_reaches<'a>(
 /// `default` is never selected as an automatic root. Treating it as a normal
 /// root would silently undo an operator's `--no-default-features`; a narrower
 /// ktstr-only descendant is selected instead when one exists.
+#[cfg(test)]
 pub(crate) fn infer_ktstr_feature_roots(
     package: &cargo_metadata::Package,
     scope: VersionScope<'_>,
 ) -> Vec<String> {
-    let aliases = package
+    infer_ktstr_feature_roots_for_target(package, scope, None)
+}
+
+/// Target-aware feature-root inference.
+pub(crate) fn infer_ktstr_feature_roots_for_target(
+    package: &cargo_metadata::Package,
+    scope: VersionScope<'_>,
+    requested_target: Option<&str>,
+) -> Vec<String> {
+    let eligible_dependencies = package
         .dependencies
         .iter()
         .filter(|dependency| {
             dependency.name == "ktstr"
-                && dependency.optional
-                // Cargo features are package-global, while a target-specific
-                // dependency may be absent for the requested host/target. A
-                // metadata-only preflight does not have Cargo's full cfg set,
-                // so leave such gates explicit instead of risking activation
-                // of source that cannot link its ktstr dependency.
-                && dependency.target.is_none()
+                && dependency_matches_requested_target(dependency, requested_target)
                 && matches!(
                     dependency.kind,
                     cargo_metadata::DependencyKind::Normal
@@ -205,6 +526,12 @@ pub(crate) fn infer_ktstr_feature_roots(
                     VersionScope::Matches(version) => dependency.req.matches(version),
                 }
         })
+        .collect::<Vec<_>>();
+    let has_nonoptional_ktstr = eligible_dependencies
+        .iter()
+        .any(|dependency| !dependency.optional);
+    let aliases = eligible_dependencies
+        .into_iter()
         .map(|dependency| {
             dependency
                 .rename
@@ -314,7 +641,53 @@ pub(crate) fn infer_ktstr_feature_roots(
         }
     }
 
-    roots.into_iter().map(ToString::to_string).collect()
+    let mut selected = roots
+        .into_iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    // A nonoptional ktstr is already linked, so a test target may use a local
+    // required feature solely as its source-level declaration gate. Add the
+    // exact required feature only when its Cargo graph is empty or exclusively
+    // ktstr/local forwarding, and only when no graph-derived root already
+    // enables it. This admits `required-features = ["ktstr-tests"]` with
+    // `ktstr-tests = []` without approximating `--all-features`.
+    if has_nonoptional_ktstr {
+        let mut required = package
+            .targets
+            .iter()
+            .filter(|target| target_has_test_harness(target))
+            .filter(|target| {
+                let target_mentions_ktstr = semantic_name_mentions_ktstr(&target.name, &aliases);
+                target.required_features.iter().all(|feature| {
+                    feature == "default"
+                        || required_feature_is_narrow(
+                            feature,
+                            &package.features,
+                            &aliases,
+                            target_mentions_ktstr
+                                || semantic_name_mentions_ktstr(feature, &aliases),
+                        )
+                })
+            })
+            .flat_map(|target| target.required_features.iter())
+            .filter(|feature| feature.as_str() != "default")
+            .cloned()
+            .collect::<Vec<_>>();
+        required.sort();
+        required.dedup();
+        for feature in required {
+            if !selected
+                .iter()
+                .any(|root| local_feature_reaches(root, &feature, &local_edges))
+            {
+                selected.push(feature);
+            }
+        }
+    }
+    selected.sort();
+    selected.dedup();
+    selected
 }
 
 /// Recover a Cargo package name from common `-p` package-id spellings.
@@ -438,7 +811,7 @@ pub(crate) fn explicit_package_selection(args: &[String]) -> Option<HashSet<Stri
         .collect()
 }
 
-fn explicit_package_exclusion_specs(args: &[String]) -> Vec<String> {
+fn explicit_package_exclusion_specs(args: &[String]) -> Option<Vec<String>> {
     let args = cargo_args(args);
     let mut excluded = Vec::new();
     let mut index = 0;
@@ -446,22 +819,26 @@ fn explicit_package_exclusion_specs(args: &[String]) -> Vec<String> {
         let arg = &args[index];
         let spec = if matches!(arg.as_str(), "--exclude" | "--exclude-from-test") {
             index += 1;
-            args.get(index).map(String::as_str)
+            Some(args.get(index)?.as_str())
         } else {
             arg.strip_prefix("--exclude=")
                 .or_else(|| arg.strip_prefix("--exclude-from-test="))
         };
         if let Some(spec) = spec {
+            if spec.is_empty() {
+                return None;
+            }
             excluded.push(spec.to_string());
         }
         index += 1;
     }
-    excluded
+    Some(excluded)
 }
 
 #[cfg(test)]
 pub(crate) fn explicit_package_exclusions(args: &[String]) -> HashSet<String> {
     explicit_package_exclusion_specs(args)
+        .unwrap_or_default()
         .into_iter()
         .filter_map(|spec| package_spec_name(&spec).map(ToString::to_string))
         .collect()
@@ -516,7 +893,7 @@ pub(crate) fn selected_workspace_packages<'metadata>(
             &metadata.workspace_members
         };
     let default_ids = default_ids.iter().collect::<HashSet<_>>();
-    let exclusion_specs = explicit_package_exclusion_specs(args);
+    let exclusion_specs = explicit_package_exclusion_specs(args)?;
 
     let mut packages = metadata
         .packages
@@ -552,11 +929,13 @@ pub(crate) fn selected_activations(
     args: &[String],
     scope: VersionScope<'_>,
 ) -> Vec<PackageFeatureActivation> {
+    let requested_target = requested_target(args);
     let mut activations = selected_workspace_packages(metadata, args)
         .unwrap_or_default()
         .into_iter()
         .filter_map(|package| {
-            let features = infer_ktstr_feature_roots(package, scope);
+            let features =
+                infer_ktstr_feature_roots_for_target(package, scope, requested_target.as_deref());
             (!features.is_empty()).then(|| PackageFeatureActivation {
                 package: package.name.to_string(),
                 features,
@@ -786,6 +1165,27 @@ mod tests {
     }
 
     #[test]
+    fn malformed_package_selectors_decline_inference_and_remain_unchanged() {
+        let metadata = selection_metadata();
+        for args in [
+            strings(&["-p"]),
+            strings(&["--package="]),
+            strings(&["--workspace", "--exclude"]),
+            strings(&["--workspace", "--exclude="]),
+        ] {
+            assert!(
+                selected_workspace_packages(&metadata, &args).is_none(),
+                "malformed Cargo selector must not be guessed: {args:?}",
+            );
+            assert_eq!(
+                augment_test_features_from_metadata(args.clone(), &metadata),
+                args,
+                "Cargo's eventual parser receives the original malformed argv",
+            );
+        }
+    }
+
+    #[test]
     fn default_wrapper_yields_narrow_descendant_not_default_feature() {
         let json = optional_ktstr_package_json(
             "scheduler",
@@ -798,6 +1198,95 @@ mod tests {
         assert_eq!(
             infer_ktstr_feature_roots(&package, VersionScope::Any),
             vec!["ktstr-tests"],
+        );
+    }
+
+    #[test]
+    fn nonoptional_ktstr_forwarding_feature_is_inferred_narrowly() {
+        let json = optional_ktstr_package_json(
+            "scheduler",
+            "1.0.0",
+            "=0.42.0",
+            r#"{
+                "verify":["ktstr/test-support"],
+                "unrelated":[],
+                "everything":["verify","unrelated"]
+            }"#,
+        )
+        .replacen(r#""optional":true"#, r#""optional":false"#, 1);
+        let package: cargo_metadata::Package =
+            serde_json::from_str(&json).expect("nonoptional package fixture deserializes");
+        assert_eq!(
+            infer_ktstr_feature_roots(&package, VersionScope::Any),
+            vec!["verify"],
+            "dependency-feature forwarding is a narrow gate even when ktstr itself is nonoptional",
+        );
+    }
+
+    #[test]
+    fn nonoptional_ktstr_test_targets_add_only_wholly_narrow_required_gates() {
+        let targets = r#"[{
+            "name":"verifier_cells",
+            "kind":["test"],
+            "crate_types":["bin"],
+            "required-features":["ktstr-tests"],
+            "src_path":"/w/scheduler/tests/verifier_cells.rs",
+            "edition":"2024",
+            "doctest":false,
+            "test":true,
+            "doc":false
+        },{
+            "name":"mixed_mode",
+            "kind":["test"],
+            "crate_types":["bin"],
+            "required-features":["ktstr-tests","mixed-mode"],
+            "src_path":"/w/scheduler/tests/mixed_mode.rs",
+            "edition":"2024",
+            "doctest":false,
+            "test":true,
+            "doc":false
+        },{
+            "name":"other_cells",
+            "kind":["test"],
+            "crate_types":["bin"],
+            "required-features":["other-tests"],
+            "src_path":"/w/scheduler/tests/other_cells.rs",
+            "edition":"2024",
+            "doctest":false,
+            "test":true,
+            "doc":false
+        },{
+            "name":"unrelated_cli",
+            "kind":["bin"],
+            "crate_types":["bin"],
+            "required-features":["bin-mode"],
+            "src_path":"/w/scheduler/src/main.rs",
+            "edition":"2024",
+            "doctest":false,
+            "test":true,
+            "doc":false
+        }]"#;
+        let json = optional_ktstr_package_json(
+            "scheduler",
+            "1.0.0",
+            "=0.42.0",
+            r#"{
+                "ktstr-tests":[],
+                "other-tests":[],
+                "bin-mode":[],
+                "mixed-mode":["unrelated"],
+                "unrelated":[]
+            }"#,
+        )
+        .replacen(r#""optional":true"#, r#""optional":false"#, 1)
+        .replacen(r#""targets":[]"#, &format!(r#""targets":{targets}"#), 1);
+        let package: cargo_metadata::Package =
+            serde_json::from_str(&json).expect("required-feature package fixture deserializes");
+        assert_eq!(
+            infer_ktstr_feature_roots(&package, VersionScope::Any),
+            vec!["ktstr-tests"],
+            "a semantically named empty source gate is enabled for the verifier target, while \
+             unrelated empty/composite gates cannot broaden inference",
         );
     }
 
@@ -819,6 +1308,50 @@ mod tests {
         assert!(
             infer_ktstr_feature_roots(&package, VersionScope::Any).is_empty(),
             "metadata inference must not guess whether a target-specific dependency is active",
+        );
+        assert!(
+            infer_ktstr_feature_roots_for_target(
+                &package,
+                VersionScope::Any,
+                Some("x86_64-unknown-linux-gnu"),
+            )
+            .is_empty(),
+            "even an explicit named target lacks rustc's full cfg set in the NoDeps pass; \
+             users can still request that feature explicitly",
+        );
+    }
+
+    #[test]
+    fn named_target_specific_ktstr_matches_only_explicit_cargo_target() {
+        let json = optional_ktstr_package_json(
+            "scheduler",
+            "1.0.0",
+            "=0.42.0",
+            r#"{"ktstr-tests":["dep:ktstr"]}"#,
+        )
+        .replacen(
+            r#""target":null"#,
+            r#""target":"aarch64-unknown-linux-gnu""#,
+            1,
+        );
+        let package: cargo_metadata::Package =
+            serde_json::from_str(&json).expect("named-target fixture deserializes");
+        assert_eq!(
+            infer_ktstr_feature_roots_for_target(
+                &package,
+                VersionScope::Any,
+                Some("aarch64-unknown-linux-gnu"),
+            ),
+            vec!["ktstr-tests"],
+        );
+        assert!(
+            infer_ktstr_feature_roots_for_target(
+                &package,
+                VersionScope::Any,
+                Some("x86_64-unknown-linux-gnu"),
+            )
+            .is_empty(),
+            "a dependency from another named target cannot activate verifier source",
         );
     }
 
@@ -927,6 +1460,97 @@ mod tests {
                 "--offline",
             ])),
             strings(&["--locked", "--manifest-path", "consumer/Cargo.toml"]),
+        );
+    }
+
+    #[test]
+    fn cargo_context_replay_is_scoped_and_rebases_changed_current_dirs() {
+        let args = strings(&[
+            "--manifest-path",
+            "consumer/Cargo.toml",
+            "--locked",
+            "--config",
+            "config/ci.toml",
+            "--config=net.offline=true",
+            "--config",
+            "patch.crates-io.ktstr.path='../ktstr'",
+            "-Z",
+            "bindeps",
+            "--target",
+            "aarch64-unknown-linux-gnu",
+            "--target-dir=artifacts",
+            "--features",
+            "consumer/ktstr-tests",
+            "--all-features",
+            "--no-default-features",
+            "--ignore-rust-version",
+            "--",
+            "--offline",
+        ]);
+        assert_eq!(
+            metadata_passthrough_options(&args),
+            strings(&[
+                "--manifest-path",
+                "consumer/Cargo.toml",
+                "--locked",
+                "--config",
+                "config/ci.toml",
+                "--config=net.offline=true",
+                "--config",
+                "patch.crates-io.ktstr.path='../ktstr'",
+                "-Z",
+                "bindeps",
+                "--filter-platform",
+                "aarch64-unknown-linux-gnu",
+            ]),
+            "top-level metadata keeps its own manifest and current-directory semantics",
+        );
+        assert_eq!(
+            declaring_metadata_options(&args, Path::new("/invoke")),
+            strings(&[
+                "--locked",
+                "--config",
+                "/invoke/config/ci.toml",
+                "--config=net.offline=true",
+                "--config",
+                r#"patch.crates-io.ktstr.path="/invoke/../ktstr""#,
+                "-Z",
+                "bindeps",
+                "--filter-platform",
+                "aarch64-unknown-linux-gnu",
+            ]),
+            "declaration metadata omits the outer manifest and rebases config paths",
+        );
+        assert_eq!(
+            scheduler_build_options(&args, Path::new("/invoke")),
+            strings(&[
+                "--locked",
+                "--config",
+                "/invoke/config/ci.toml",
+                "--config=net.offline=true",
+                "--config",
+                r#"patch.crates-io.ktstr.path="/invoke/../ktstr""#,
+                "-Z",
+                "bindeps",
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                "--target-dir=/invoke/artifacts",
+                "--ignore-rust-version",
+            ]),
+            "scheduler builds replay only resolution/platform controls, never consumer features",
+        );
+    }
+
+    #[test]
+    fn custom_target_json_is_rebased_for_build_but_not_metadata_filtering() {
+        let args = strings(&["--target", "targets/custom.json"]);
+        assert!(
+            metadata_passthrough_options(&args).is_empty(),
+            "a JSON path is not a cargo-platform expression",
+        );
+        assert_eq!(
+            scheduler_build_options(&args, Path::new("/invoke")),
+            strings(&["--target", "/invoke/targets/custom.json"]),
         );
     }
 

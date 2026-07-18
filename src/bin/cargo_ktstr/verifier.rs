@@ -63,12 +63,15 @@ use cargo_metadata::semver::Version;
 use cargo_metadata::{Metadata, PackageId};
 
 use crate::feature_discovery::{
-    MetadataMode, PackageFeatureActivation, VersionScope, has_package_selector,
-    has_workspace_selector, infer_ktstr_feature_roots, inject_feature_activations,
-    package_spec_name, query_metadata, selected_workspace_packages,
+    MetadataMode, PackageFeatureActivation, VersionScope, declaring_metadata_options,
+    has_package_selector, has_workspace_selector, infer_ktstr_feature_roots_for_target,
+    inject_feature_activations, package_spec_name, query_metadata, requested_target,
+    scheduler_build_options, selected_activations, selected_workspace_packages,
 };
 #[cfg(test)]
-use crate::feature_discovery::{explicit_package_exclusions, explicit_package_selection};
+use crate::feature_discovery::{
+    explicit_package_exclusions, explicit_package_selection, infer_ktstr_feature_roots,
+};
 use crate::kernel::{
     encode_kernel_list, path_kernel_label, resolve_kernel_image, resolve_kernel_set,
 };
@@ -216,13 +219,47 @@ struct VerifierPackagePlan {
 /// Development dependencies of a dependency do not; normal dependencies keep
 /// traversing at every depth. Empty `dep_kinds` is cargo metadata's
 /// backwards-compatible spelling for a normal dependency.
-fn test_link_edge(dep: &cargo_metadata::NodeDep, workspace_root: bool) -> bool {
+fn test_link_edge(
+    dep: &cargo_metadata::NodeDep,
+    workspace_root: bool,
+    requested_target: Option<&str>,
+) -> bool {
     dep.dep_kinds.is_empty()
         || dep.dep_kinds.iter().any(|kind| {
-            matches!(kind.kind, cargo_metadata::DependencyKind::Normal)
+            let linked_kind = matches!(kind.kind, cargo_metadata::DependencyKind::Normal)
                 || (workspace_root
-                    && matches!(kind.kind, cargo_metadata::DependencyKind::Development))
+                    && matches!(kind.kind, cargo_metadata::DependencyKind::Development));
+            linked_kind && dep_kind_matches_requested_target(kind, requested_target)
         })
+}
+
+fn dep_kind_matches_requested_target(
+    kind: &cargo_metadata::DepKindInfo,
+    requested_target: Option<&str>,
+) -> bool {
+    let Some(platform) = kind.target.as_ref() else {
+        return true;
+    };
+    let Some(requested_target) = requested_target else {
+        // Without a Cargo --target, the metadata graph is intentionally
+        // unfiltered. Preserve every possibly host-linked edge rather than
+        // guessing the runtime host cfg.
+        return true;
+    };
+    if requested_target.ends_with(".json")
+        || requested_target.contains('/')
+        || requested_target.contains('\\')
+    {
+        // Cargo metadata cannot use a custom target JSON path as
+        // --filter-platform. Keep the conservative unfiltered behavior.
+        return true;
+    }
+    let platform = platform.to_string();
+    // Cargo already evaluates cfg(...) entries when Default metadata receives
+    // --filter-platform. Named target-table entries can additionally be
+    // rejected exactly, which protects fixture/older-Cargo graphs that retain
+    // multiple dep_kinds on one package edge.
+    platform.starts_with("cfg(") || platform == requested_target
 }
 
 /// Collect every ktstr version in one workspace member's package-level test
@@ -237,6 +274,7 @@ fn linked_ktstr_versions(
     member_id: &PackageId,
     packages: &HashMap<&PackageId, &cargo_metadata::Package>,
     nodes: &HashMap<&PackageId, &cargo_metadata::Node>,
+    requested_target: Option<&str>,
 ) -> Vec<Version> {
     let mut versions = Vec::new();
     let mut seen = HashSet::new();
@@ -259,7 +297,7 @@ fn linked_ktstr_versions(
             continue;
         };
         for dep in &node.deps {
-            if !test_link_edge(dep, workspace_root) {
+            if !test_link_edge(dep, workspace_root, requested_target) {
                 continue;
             }
             pending.push((&dep.pkg, false));
@@ -279,7 +317,11 @@ fn linked_ktstr_versions(
 /// - any newer version: record an error candidate; the caller first applies
 ///   explicit Cargo package selection so an unrelated newer package cannot
 ///   abort a deliberately scoped current-package run.
-fn verifier_package_plan(meta: &Metadata, cli: &Version) -> Result<VerifierPackagePlan, String> {
+fn verifier_package_plan(
+    meta: &Metadata,
+    cli: &Version,
+    requested_target: Option<&str>,
+) -> Result<VerifierPackagePlan, String> {
     let resolve = meta
         .resolve
         .as_ref()
@@ -294,7 +336,7 @@ fn verifier_package_plan(meta: &Metadata, cli: &Version) -> Result<VerifierPacka
         let Some(member) = packages.get(member_id).copied() else {
             continue;
         };
-        let versions = linked_ktstr_versions(member_id, &packages, &nodes);
+        let versions = linked_ktstr_versions(member_id, &packages, &nodes, requested_target);
         if versions.is_empty() {
             continue;
         }
@@ -311,7 +353,11 @@ fn verifier_package_plan(meta: &Metadata, cli: &Version) -> Result<VerifierPacka
         } else {
             compatible.push(CompatibleVerifierPackage {
                 name: member.name.to_string(),
-                verifier_features: infer_ktstr_feature_roots(member, VersionScope::Matches(cli)),
+                verifier_features: infer_ktstr_feature_roots_for_target(
+                    member,
+                    VersionScope::Matches(cli),
+                    requested_target,
+                ),
             });
         }
     }
@@ -326,6 +372,20 @@ fn verifier_package_plan(meta: &Metadata, cli: &Version) -> Result<VerifierPacka
     })
 }
 
+/// Cargo package selection used by verifier discovery.
+///
+/// A bare verifier intentionally scans all members, unlike ordinary test
+/// commands' default-member semantics. A lone exclusion likewise needs an
+/// implicit workspace base. Exact/glob package selectors remain untouched.
+fn verifier_selection_args(args: &[String]) -> Vec<String> {
+    if has_workspace_selector(args) || has_explicit_package_selector(args) {
+        return args.to_vec();
+    }
+    std::iter::once("--workspace".to_string())
+        .chain(args.iter().cloned())
+        .collect()
+}
+
 /// Resolve the verifier package partition before either nextest warm-up or run.
 fn query_verifier_package_plan(args: &[String]) -> Result<VerifierPackagePlan, String> {
     let cli = Version::parse(env!("CARGO_PKG_VERSION"))
@@ -336,51 +396,44 @@ fn query_verifier_package_plan(args: &[String]) -> Result<VerifierPackagePlan, S
     // exact graph compilation will use without a broad all-features resolve.
     let manifests = query_metadata(args, MetadataMode::NoDeps)
         .map_err(|error| format!("cargo ktstr verifier: {error}"))?;
-    let member_ids = manifests.workspace_members.iter().collect::<HashSet<_>>();
-    let activations = manifests
-        .packages
-        .iter()
-        .filter(|package| member_ids.contains(&package.id))
-        .filter_map(|package| {
-            let features = infer_ktstr_feature_roots(package, VersionScope::Any);
-            (!features.is_empty()).then(|| PackageFeatureActivation {
-                package: package.name.to_string(),
-                features,
-            })
-        })
-        .collect::<Vec<_>>();
+    // Selection must precede optional feature activation. Otherwise an
+    // unrelated workspace member can pull an old/new ktstr into Default
+    // metadata even though Cargo was asked to verify one different package.
+    let selection_args = verifier_selection_args(args);
+    if selected_workspace_packages(&manifests, &selection_args).is_none() {
+        // Do not guess at malformed/missing Cargo selector syntax. An empty
+        // compatibility plan injects no features or package widening; the
+        // unchanged selector reaches nextest/Cargo, which remains the
+        // authoritative parser and diagnostic source.
+        return Ok(VerifierPackagePlan {
+            compatible: Vec::new(),
+            older: Vec::new(),
+            newer: Vec::new(),
+        });
+    }
+    let activations = selected_activations(&manifests, &selection_args, VersionScope::Any);
     let resolution_args = inject_feature_activations(args.to_vec(), &activations);
     let metadata = query_metadata(&resolution_args, MetadataMode::Default)
         .map_err(|error| format!("cargo ktstr verifier: {error}"))?;
-    let mut plan = verifier_package_plan(&metadata, &cli)?;
+    let requested_target = requested_target(args);
+    let mut plan = verifier_package_plan(&metadata, &cli, requested_target.as_deref())?;
 
     // A bare verifier deliberately widens beyond Cargo's default members.
     // Once the operator supplies package selection, however, classify only
     // the exact/globbed workspace packages Cargo selected. A lone --exclude
     // applies to that widened workspace selection, so synthesize --workspace
     // for metadata selection without changing the forwarded Cargo argv.
-    if has_package_selector(args) {
-        let selection_args;
-        let args = if has_workspace_selector(args) || has_explicit_package_selector(args) {
-            args
-        } else {
-            selection_args = std::iter::once("--workspace".to_string())
-                .chain(args.iter().cloned())
-                .collect::<Vec<_>>();
-            &selection_args
-        };
-        if let Some(packages) = selected_workspace_packages(&metadata, args) {
-            let selected = packages
-                .into_iter()
-                .map(|package| package.name.to_string())
-                .collect::<HashSet<_>>();
-            plan.compatible
-                .retain(|package| selected.contains(&package.name));
-            plan.older
-                .retain(|package| selected.contains(&package.name));
-            plan.newer
-                .retain(|package| selected.contains(&package.name));
-        }
+    if let Some(packages) = selected_workspace_packages(&metadata, &selection_args) {
+        let selected = packages
+            .into_iter()
+            .map(|package| package.name.to_string())
+            .collect::<HashSet<_>>();
+        plan.compatible
+            .retain(|package| selected.contains(&package.name));
+        plan.older
+            .retain(|package| selected.contains(&package.name));
+        plan.newer
+            .retain(|package| selected.contains(&package.name));
     }
     Ok(plan)
 }
@@ -712,6 +765,7 @@ fn declaring_workspace(
     scheduler: &str,
     package: &str,
     manifest_dir: &str,
+    metadata_options: &[String],
 ) -> Result<Option<(PathBuf, PackageId)>, String> {
     let manifest_dir = Path::new(manifest_dir);
     if !manifest_dir.is_dir() {
@@ -726,6 +780,7 @@ fn declaring_workspace(
     command
         .cargo_path("cargo")
         .current_dir(manifest_dir)
+        .other_options(metadata_options.to_vec())
         .no_deps();
     let metadata = command.exec().map_err(|error| {
         format!(
@@ -763,6 +818,7 @@ fn selected_discover_requests(
     scheduler_filter: Option<&str>,
     resolved_kernels: &[(String, String)],
     presets: &[ktstr::gauntlet::TopoPreset],
+    metadata_options: &[String],
 ) -> Result<Vec<DiscoverSchedulerRequest>, String> {
     let mut workspaces: BTreeMap<(String, String), Option<(PathBuf, PackageId)>> = BTreeMap::new();
     let selected =
@@ -799,8 +855,12 @@ fn selected_discover_requests(
                     }
                     let key = (scheduler.manifest_dir.clone(), package.clone());
                     if !workspaces.contains_key(&key) {
-                        let resolution =
-                            declaring_workspace(&scheduler.name, package, &scheduler.manifest_dir)?;
+                        let resolution = declaring_workspace(
+                            &scheduler.name,
+                            package,
+                            &scheduler.manifest_dir,
+                            metadata_options,
+                        )?;
                         workspaces.insert(key.clone(), resolution);
                     }
                     Ok(workspaces
@@ -926,20 +986,43 @@ fn map_scheduler_artifacts(
     Ok(artifacts)
 }
 
-fn build_scheduler_workspace(
+fn scheduler_workspace_build_args(
     group: &WorkspaceSchedulerBuild,
     profile: &str,
-) -> Result<BTreeMap<String, PathBuf>, String> {
-    let mut command = Command::new("cargo");
-    command.current_dir(&group.root).args([
+    build_options: &[String],
+) -> Vec<String> {
+    let mut args = [
         "build",
         "--message-format=json-render-diagnostics",
         "--profile",
         profile,
-    ]);
+    ]
+    .into_iter()
+    .map(ToString::to_string)
+    .collect::<Vec<_>>();
     for package in group.packages.keys() {
-        command.args(["-p", package]);
+        args.extend(["-p".to_string(), package.clone()]);
     }
+    // Cargo accepts build options after package selectors. Keeping the
+    // planner-owned argv prefix stable makes the replayed context visibly
+    // separate from package/profile ownership.
+    args.extend_from_slice(build_options);
+    args
+}
+
+fn build_scheduler_workspace(
+    group: &WorkspaceSchedulerBuild,
+    profile: &str,
+    build_options: &[String],
+) -> Result<BTreeMap<String, PathBuf>, String> {
+    let mut command = Command::new("cargo");
+    command
+        .current_dir(&group.root)
+        .args(scheduler_workspace_build_args(
+            group,
+            profile,
+            build_options,
+        ));
     let output = crate::run_cargo::run_reserved_build_output(
         command,
         "cargo ktstr verifier",
@@ -1047,20 +1130,31 @@ fn snapshot_scheduler_artifact_from_open_file(
     })
 }
 
+struct SchedulerPrebuildContext<'a> {
+    resolved_kernels: &'a [(String, String)],
+    presets: &'a [ktstr::gauntlet::TopoPreset],
+    result_dir: &'a Path,
+    metadata_options: &'a [String],
+    build_options: &'a [String],
+    interrupt_guard: &'a crate::interrupt::InterruptGuard,
+}
+
 fn prebuild_scheduler_manifest(
     declarations: &[ktstr::test_support::SchedulerListEntry],
     scheduler_filter: Option<&str>,
     profile: &str,
-    resolved_kernels: &[(String, String)],
-    presets: &[ktstr::gauntlet::TopoPreset],
-    result_dir: &Path,
-    interrupt_guard: &crate::interrupt::InterruptGuard,
+    context: SchedulerPrebuildContext<'_>,
 ) -> Result<ktstr::verifier::VerifierSchedulerArtifactManifest, String> {
-    if interrupt_guard.interrupted().is_some() {
+    if context.interrupt_guard.interrupted().is_some() {
         return Err("cargo ktstr verifier interrupted before scheduler prebuild".to_string());
     }
-    let requests =
-        selected_discover_requests(declarations, scheduler_filter, resolved_kernels, presets)?;
+    let requests = selected_discover_requests(
+        declarations,
+        scheduler_filter,
+        context.resolved_kernels,
+        context.presets,
+        context.metadata_options,
+    )?;
     let groups = plan_workspace_scheduler_builds(&requests)?;
     let package_count: usize = groups.iter().map(|group| group.packages.len()).sum();
     if package_count > 0 {
@@ -1073,11 +1167,11 @@ fn prebuild_scheduler_manifest(
     let mut entries = Vec::with_capacity(requests.len());
     let mut snapshots: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
     for group in &groups {
-        if interrupt_guard.interrupted().is_some() {
+        if context.interrupt_guard.interrupted().is_some() {
             return Err("cargo ktstr verifier interrupted during scheduler prebuild".to_string());
         }
-        let artifacts = build_scheduler_workspace(group, profile)?;
-        if interrupt_guard.interrupted().is_some() {
+        let artifacts = build_scheduler_workspace(group, profile, context.build_options)?;
+        if context.interrupt_guard.interrupted().is_some() {
             return Err("cargo ktstr verifier interrupted during scheduler prebuild".to_string());
         }
         for request in &group.requests {
@@ -1094,7 +1188,8 @@ fn prebuild_scheduler_manifest(
             let snapshot = if let Some(snapshot) = snapshots.get(&path) {
                 snapshot.clone()
             } else {
-                let snapshot = snapshot_scheduler_artifact(&path, result_dir, snapshots.len())?;
+                let snapshot =
+                    snapshot_scheduler_artifact(&path, context.result_dir, snapshots.len())?;
                 snapshots.insert(path, snapshot.clone());
                 snapshot
             };
@@ -1186,6 +1281,8 @@ pub(crate) fn run_verifier(
     include_eol: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
+    let invocation_dir = std::env::current_dir()
+        .map_err(|error| format!("cargo ktstr verifier: read invocation directory: {error}"))?;
     let package_plan = query_verifier_package_plan(&args)?;
     if let Some(package) = package_plan.newer.first() {
         let versions = package
@@ -1216,6 +1313,8 @@ pub(crate) fn run_verifier(
     };
     let nextest_args = build_scoped_nextest_args(nextest_profile.as_deref(), &args, &package_plan);
     let scheduler_profile = scheduler_profile_for_run(profile.as_deref());
+    let declaring_cargo_options = declaring_metadata_options(&args, &invocation_dir);
+    let scheduler_cargo_options = scheduler_build_options(&args, &invocation_dir);
 
     let mut cmd = Command::new("cargo");
     // The nextest argument vector — base flags (`--run-ignored all`, the
@@ -1366,10 +1465,14 @@ pub(crate) fn run_verifier(
             &declarations,
             scheduler.as_deref(),
             &scheduler_profile,
-            &resolved_kernel_labels,
-            &presets,
-            result_dir.path(),
-            &interrupt_guard,
+            SchedulerPrebuildContext {
+                resolved_kernels: &resolved_kernel_labels,
+                presets: &presets,
+                result_dir: result_dir.path(),
+                metadata_options: &declaring_cargo_options,
+                build_options: &scheduler_cargo_options,
+                interrupt_guard: &interrupt_guard,
+            },
         )?;
         if interrupt_guard.interrupted().is_some() {
             return Ok(None);
@@ -1575,7 +1678,7 @@ mod tests {
         let fixture = discover_declaration("sched", "fixture_only", &manifest_dir);
         let (kernels, presets) = verifier_matrix();
 
-        let selected = selected_discover_requests(&[fixture, valid], None, &kernels, &presets)
+        let selected = selected_discover_requests(&[fixture, valid], None, &kernels, &presets, &[])
             .expect("nonmember declaration is an emission-side skip");
 
         assert_eq!(selected.len(), 1);
@@ -1609,6 +1712,7 @@ mod tests {
             None,
             &kernels,
             &presets,
+            &[],
         )
         .expect("non-emitting declarations do not conflict");
         assert!(selected.is_empty());
@@ -1736,6 +1840,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scheduler_workspace_argv_replays_only_safe_rebased_cargo_context() {
+        let a: PackageId = serde_json::from_str(r#""scx_a 1.0.0 (path+file:///w/scx_a)""#).unwrap();
+        let b: PackageId = serde_json::from_str(r#""scx_b 1.0.0 (path+file:///w/scx_b)""#).unwrap();
+        let group = WorkspaceSchedulerBuild {
+            root: PathBuf::from("/w"),
+            packages: BTreeMap::from([("scx_b".to_string(), b), ("scx_a".to_string(), a)]),
+            requests: Vec::new(),
+        };
+        let outer = strings(&[
+            "--locked",
+            "--offline",
+            "--config",
+            "config/ci.toml",
+            "--config",
+            "patch.crates-io.ktstr.path='../ktstr'",
+            "--target",
+            "aarch64-unknown-linux-gnu",
+            "--target-dir",
+            "target/ci",
+            "--features",
+            "consumer/ktstr-tests",
+            "--all-features",
+            "--no-default-features",
+        ]);
+        let controls = scheduler_build_options(&outer, Path::new("/invoke"));
+        assert_eq!(
+            scheduler_workspace_build_args(&group, "release-ci", &controls),
+            strings(&[
+                "build",
+                "--message-format=json-render-diagnostics",
+                "--profile",
+                "release-ci",
+                "-p",
+                "scx_a",
+                "-p",
+                "scx_b",
+                "--locked",
+                "--offline",
+                "--config",
+                "/invoke/config/ci.toml",
+                "--config",
+                r#"patch.crates-io.ktstr.path="/invoke/../ktstr""#,
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                "--target-dir",
+                "/invoke/target/ci",
+            ]),
+            "consumer feature modes never leak into the parent-owned scheduler workspace",
+        );
+    }
+
+    #[test]
+    fn resolved_dep_kinds_reject_other_named_targets() {
+        let dependency: cargo_metadata::NodeDep = serde_json::from_str(
+            r#"{
+                "name":"ktstr",
+                "pkg":"ktstr 0.42.0 (path+file:///w/ktstr)",
+                "dep_kinds":[{
+                    "kind":null,
+                    "target":"aarch64-unknown-linux-gnu"
+                }]
+            }"#,
+        )
+        .expect("target-specific NodeDep fixture");
+        assert!(test_link_edge(
+            &dependency,
+            true,
+            Some("aarch64-unknown-linux-gnu"),
+        ));
+        assert!(
+            !test_link_edge(&dependency, true, Some("x86_64-unknown-linux-gnu"),),
+            "a target-specific old/current ktstr edge cannot classify another --target",
+        );
+        assert!(
+            test_link_edge(&dependency, true, None),
+            "an unfiltered host graph remains conservative",
+        );
+    }
+
     fn package_json_with(
         name: &str,
         version: &str,
@@ -1829,9 +2013,12 @@ mod tests {
 
     #[test]
     fn package_plan_keeps_current_and_skips_old_test_closures() {
-        let plan =
-            verifier_package_plan(&scx_version_fixture(), &Version::parse("0.41.0").unwrap())
-                .expect("fixture has no newer ktstr");
+        let plan = verifier_package_plan(
+            &scx_version_fixture(),
+            &Version::parse("0.41.0").unwrap(),
+            None,
+        )
+        .expect("fixture has no newer ktstr");
         assert_eq!(
             plan.compatible,
             vec![
@@ -1853,6 +2040,30 @@ mod tests {
                 versions: vec![Version::parse("0.18.0").unwrap()],
             }],
             "the old dev edge is excluded; the unrelated build-only edge is ignored",
+        );
+    }
+
+    #[test]
+    fn verifier_feature_inference_is_scoped_before_default_resolution() {
+        let manifests = scx_version_fixture();
+        let all =
+            selected_activations(&manifests, &verifier_selection_args(&[]), VersionScope::Any);
+        assert_eq!(
+            all,
+            vec![PackageFeatureActivation {
+                package: "scx_layered".to_string(),
+                features: vec!["ktstr-tests".to_string()],
+            }],
+            "a bare verifier intentionally considers every workspace declaration gate",
+        );
+        assert!(
+            selected_activations(
+                &manifests,
+                &verifier_selection_args(&strings(&["-p", "scx_lavd"])),
+                VersionScope::Any,
+            )
+            .is_empty(),
+            "an optional gate from unselected scx_layered must not enter Default metadata",
         );
     }
 
@@ -1970,9 +2181,12 @@ mod tests {
 
     #[test]
     fn package_plan_records_newer_ktstr_for_scope_aware_error() {
-        let plan =
-            verifier_package_plan(&scx_version_fixture(), &Version::parse("0.17.0").unwrap())
-                .expect("fixture has a resolve graph");
+        let plan = verifier_package_plan(
+            &scx_version_fixture(),
+            &Version::parse("0.17.0").unwrap(),
+            None,
+        )
+        .expect("fixture has a resolve graph");
         assert_eq!(
             plan.newer
                 .iter()
