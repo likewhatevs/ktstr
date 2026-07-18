@@ -1799,7 +1799,7 @@ unrelated-mode = []
     }
 
     #[test]
-    fn target_specific_optional_ktstr_remains_explicit() {
+    fn legacy_target_name_helpers_do_not_guess_missing_rustc_cfgs() {
         let json = optional_ktstr_package_json(
             "scheduler",
             "1.0.0",
@@ -1815,7 +1815,7 @@ unrelated-mode = []
             serde_json::from_str(&json).expect("target-specific fixture deserializes");
         assert!(
             infer_ktstr_feature_roots(&package, VersionScope::Any).is_empty(),
-            "metadata inference must not guess whether a target-specific dependency is active",
+            "the legacy context-free helper must not guess whether a target-specific dependency is active",
         );
         assert!(
             infer_ktstr_feature_roots_for_target(
@@ -1824,8 +1824,8 @@ unrelated-mode = []
                 Some("x86_64-unknown-linux-gnu"),
             )
             .is_empty(),
-            "even an explicit named target lacks rustc's full cfg set in the NoDeps pass; \
-             users can still request that feature explicitly",
+            "the legacy target-name-only helper deliberately lacks rustc's full cfg set; \
+             production inference uses TargetContext with rustc-reported cfgs",
         );
     }
 
