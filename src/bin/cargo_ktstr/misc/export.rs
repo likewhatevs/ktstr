@@ -370,8 +370,7 @@ mod tests {
                 "aarch64-unknown-linux-gnu",
                 "--cargo-profile",
                 "ci",
-                "--test",
-                "scheduler_registry",
+                "--test=scheduler_registry",
             ]
             .map(ToString::to_string),
             true,
@@ -393,8 +392,7 @@ mod tests {
                 "aarch64-unknown-linux-gnu",
                 "--profile",
                 "ci",
-                "--test",
-                "scheduler_registry",
+                "--test=scheduler_registry",
             ]
             .map(ToString::to_string),
             "nextest and llvm-cov-nextest controls must select the same registry build",

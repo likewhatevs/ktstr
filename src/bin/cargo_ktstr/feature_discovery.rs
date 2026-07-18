@@ -517,6 +517,10 @@ pub(crate) fn test_registry_build_options(args: &[String]) -> Vec<String> {
         // Attached long forms.
         if argument.starts_with("--package=")
             || argument.starts_with("--exclude=")
+            || argument.starts_with("--bin=")
+            || argument.starts_with("--example=")
+            || argument.starts_with("--test=")
+            || argument.starts_with("--bench=")
             || argument.starts_with("--features=")
             || argument.starts_with("--target=")
             || argument.starts_with("--target-dir=")
