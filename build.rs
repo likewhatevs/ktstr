@@ -15,10 +15,47 @@ use std::process::{Command, Stdio};
 #[cfg(feature = "vendored")]
 use libbpf_cargo::SkeletonBuilder;
 
+#[cfg(feature = "wprof")]
+use build_ahash as gix_acquire_ahash;
+#[cfg(feature = "wprof")]
+use build_fs2 as gix_acquire_fs2;
+#[cfg(feature = "wprof")]
+use build_gix as gix_acquire_gix;
+#[cfg(feature = "wprof")]
+use build_jobserver as gix_acquire_jobserver;
+#[cfg(feature = "wprof")]
+#[path = "build_support/gix_acquire.rs"]
+mod gix_acquire;
+
 include!("src/kernel_path.rs");
 include!("src/build_helpers.rs");
 
+/// Construct GNU make so it participates in Cargo's inherited jobserver.
+///
+/// Cargo exposes the jobserver authentication in `CARGO_MAKEFLAGS`, while
+/// GNU make consumes it from `MAKEFLAGS`. Propagating it lets every native
+/// build use otherwise-idle capacity without creating a second,
+/// oversubscribed worker pool.
+#[cfg(any(feature = "vendored", feature = "wprof"))]
+fn cargo_coordinated_make() -> Command {
+    let mut command = Command::new("make");
+    // SAFETY: Cargo owns the authenticated jobserver descriptors inherited by
+    // this build script. `configure()` marks those descriptors inheritable by
+    // GNU make instead of merely copying their numeric names.
+    if let Some(client) = unsafe { build_jobserver::Client::from_env() } {
+        client.configure(&mut command);
+    }
+    // GNU make consumes MAKEFLAGS directly. Retain Cargo's compatibility
+    // spelling after `configure()` has authenticated descriptor inheritance.
+    if let Some(makeflags) = std::env::var_os("CARGO_MAKEFLAGS") {
+        command.env("MAKEFLAGS", makeflags);
+    }
+    command
+}
+
 fn main() {
+    #[cfg(feature = "wprof")]
+    println!("cargo:rerun-if-changed=build_support/gix_acquire.rs");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     // docs.rs / non-`vendored` builds cannot compile the vendored libbpf
@@ -504,7 +541,7 @@ int main(void) {{
         }
 
         // Configure busybox.
-        let status = Command::new("make")
+        let status = cargo_coordinated_make()
             .arg("defconfig")
             .current_dir(&busybox_src)
             .stdout(Stdio::inherit())
@@ -524,7 +561,7 @@ int main(void) {{
         // Resolve patched config non-interactively. Busybox's Kbuild
         // lacks olddefconfig; pipe empty input to oldconfig so every
         // NEW prompt accepts its default without blocking on stdin.
-        let status = Command::new("make")
+        let status = cargo_coordinated_make()
             .arg("oldconfig")
             .current_dir(&busybox_src)
             .stdin(Stdio::null())
@@ -534,16 +571,10 @@ int main(void) {{
             .expect("make oldconfig");
         assert!(status.success(), "busybox make oldconfig failed");
 
-        // Build busybox.  Single-threaded `-j1`: busybox is a pure-C
-        // build dominated by gcc invocations that are already
-        // parallelisable inside gcc's own job server when invoked
-        // from a parallel parent; for a one-shot build out of a
-        // build.rs the wall-time difference between `-j1` and
-        // `-jN` is small (single-digit seconds on a developer box),
-        // and `-j1` keeps the build deterministic + race-free
-        // across hosts.
-        let status = Command::new("make")
-            .arg("-j1")
+        // Build through Cargo's jobserver. This shares the host-wide Cargo
+        // concurrency budget instead of serializing the C build or starting
+        // an unrelated, oversubscribed pool.
+        let status = cargo_coordinated_make()
             .current_dir(&busybox_src)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -574,343 +605,278 @@ int main(void) {{
     }
     #[cfg(feature = "wprof")]
     {
-        println!("cargo:rerun-if-env-changed=KTSTR_SKIP_WPROF_BUILD");
-        println!("cargo:rerun-if-env-changed=KTSTR_WPROF_BIN");
-        let skip_wprof = std::env::var("KTSTR_SKIP_WPROF_BUILD")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_some();
+        prepare_wprof(&out_dir, &wprof_bin);
+    } // #[cfg(feature = "wprof")]
+}
 
-        // Pin to a fixed rev so a clean fetch is reproducible. The
-        // former `git clone --depth=1` only resolved the remote's
-        // default-branch HEAD with no pin — that is how upstream's
-        // wpb/wrust sub-crates silently appeared (HEAD moved). Bump
-        // deliberately, re-verifying the wprof build at the new rev.
-        // v0.4, the latest published upstream release. Pin the release commit
-        // rather than unreleased master so ktstr does not silently absorb
-        // upstream build/API churn.
-        const WPROF_REV: &str = "9afa9ee5493814c7791586f2179aa93528fde54a";
-        let wprof_src = out_dir.join("wprof-src");
+#[cfg(feature = "wprof")]
+fn prepare_wprof(out_dir: &std::path::Path, wprof_bin: &std::path::Path) {
+    const WPROF_URL: &str = "https://github.com/anakryiko/wprof.git";
+    // v0.4 release commit. Every root/submodule checkout below is depth-one
+    // and detached at the exact committed object id.
+    const WPROF_REF: &str = "refs/tags/v0.4";
+    const WPROF_REV: &str = "9afa9ee5493814c7791586f2179aa93528fde54a";
+    const WPROF_STAMP: &str = ".wprof-content-key";
 
-        // Prefer the wprof binary cargo-ktstr already embedded
-        // (KTSTR_WPROF_BIN -> the extracted WPROF_BYTES); copying it
-        // skips the recursive git clone + compile. Computed before the
-        // rev-enforcement below so a copied binary is not mistaken for a
-        // stale clone and wiped. Unset/empty/missing/0-byte falls
-        // through to the clone+build (first-ever build, or a SKIP-built
-        // cargo-ktstr).
-        let copied_wprof = !skip_wprof
-            && !wprof_bin.exists()
-            && copy_prebuilt_blob(
-                std::env::var("KTSTR_WPROF_BIN").ok().as_deref(),
-                &wprof_bin,
-                "wprof",
-            );
+    println!("cargo:rerun-if-env-changed=KTSTR_SKIP_WPROF_BUILD");
+    println!("cargo:rerun-if-env-changed=KTSTR_WPROF_BIN");
+    for variable in [
+        "CFLAGS",
+        "CPPFLAGS",
+        "EXTRA_CFLAGS",
+        "EXTRA_LDFLAGS",
+        "LDFLAGS",
+        "CARGO",
+        "RUSTC",
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+    ] {
+        println!("cargo:rerun-if-env-changed={variable}");
+    }
+    let skip = std::env::var("KTSTR_SKIP_WPROF_BUILD")
+        .ok()
+        .is_some_and(|value| !value.is_empty());
+    let stamp_path = out_dir.join(WPROF_STAMP);
+    let existing_stamp = std::fs::read_to_string(&stamp_path).unwrap_or_default();
 
-        // Make the pin authoritative over a cached build. The gate
-        // below (`!wprof_bin.exists()`) builds wprof once and reuses the
-        // cached binary, and `is_wprof_clone_complete` (.git/HEAD +
-        // src/Makefile) does NOT encode the rev — so without this a
-        // cached tree at a DIFFERENT rev (a WPROF_REV bump, a pre-pin
-        // clone that tracked HEAD, or a 0-byte skip placeholder) would
-        // be reused and the pin would be merely advisory. Wipe the clone
-        // AND its binary whenever the clone is incomplete OR not at
-        // WPROF_REV, so the gate re-fetches the pinned rev. A failed
-        // rev-parse (init-only partial clone with no commit) yields
-        // None → treated as a mismatch → wipe (never a panic); the rev
-        // read uses the same hermetic GIT_CONFIG env as the fetch.
-        // One-time on a rev change, then stable. Skipped under
-        // KTSTR_SKIP_WPROF_BUILD (that path writes a rev-less
-        // placeholder by design).
-        let wprof_clone_rev = |dir: &std::path::Path| -> Option<String> {
-            let out = Command::new("git")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .current_dir(dir)
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .ok()?;
-            out.status
-                .success()
-                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        };
-        if !copied_wprof
-            && !skip_wprof
-            && (!is_wprof_clone_complete(&wprof_src)
-                || wprof_clone_rev(&wprof_src).as_deref() != Some(WPROF_REV))
-        {
-            if wprof_src.exists() {
-                std::fs::remove_dir_all(&wprof_src).expect("remove stale/incomplete wprof-src");
-            }
-            if wprof_bin.exists() {
-                std::fs::remove_file(&wprof_bin).expect("remove stale wprof binary");
-            }
-        }
+    // A cargo-ktstr parent can hand this build the already embedded binary.
+    // Keep that zero-network path ahead of tool probing and source acquisition.
+    let copied = !skip
+        && !wprof_bin.exists()
+        && copy_prebuilt_blob(
+            std::env::var("KTSTR_WPROF_BIN").ok().as_deref(),
+            wprof_bin,
+            "wprof",
+        );
+    if copied {
+        std::fs::write(&stamp_path, format!("embedded:{WPROF_REV}"))
+            .expect("stamp embedded wprof binary");
+        return;
+    }
 
-        if skip_wprof {
-            println!(
-                "cargo:warning=KTSTR_SKIP_WPROF_BUILD set — writing 0-byte \
+    if skip {
+        println!(
+            "cargo:warning=KTSTR_SKIP_WPROF_BUILD set — writing 0-byte \
              $OUT_DIR/wprof placeholder; do NOT use the resulting \
              cargo-ktstr binary for wprof capture"
-            );
-            if !wprof_bin.exists() {
-                std::fs::write(&wprof_bin, b"").unwrap_or_else(|e| {
-                    panic!(
-                        "write 0-byte wprof placeholder {}: {e}",
-                        wprof_bin.display()
-                    )
-                });
-            }
-        } else if !wprof_bin.exists() {
-            println!("cargo:warning=cloning + compiling wprof (first build only)...");
+        );
+        // The opt-out must remain authoritative when this OUT_DIR already
+        // contains a real binary from an earlier non-skipped build.
+        std::fs::write(wprof_bin, b"").unwrap_or_else(|err| {
+            panic!(
+                "write 0-byte wprof placeholder {}: {err}",
+                wprof_bin.display()
+            )
+        });
+        std::fs::write(&stamp_path, format!("skipped:{WPROF_REV}"))
+            .expect("stamp skipped wprof placeholder");
+        return;
+    }
 
-            for tool in ["git", "make", "gcc", "clang", "mold"] {
-                if Command::new(tool).arg("--version").output().is_err() {
-                    panic!(
-                        "wprof build requires '{tool}' on PATH — install via your \
-                     distro's package manager (build-essential / base-devel for \
-                     make+gcc; clang+mold for BPF and LTO host compilation; \
-                     git for submodule clone)"
-                    );
+    if existing_stamp == format!("embedded:{WPROF_REV}")
+        && std::fs::metadata(wprof_bin).is_ok_and(|meta| meta.len() > 0)
+    {
+        return;
+    }
+
+    let toolchain = wprof_toolchain_fingerprint();
+    let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown-target".to_string());
+    let host = std::env::var("HOST").unwrap_or_else(|_| "unknown-host".to_string());
+    let key_parts = [
+        "wprof-binary-v1",
+        WPROF_URL,
+        WPROF_REF,
+        WPROF_REV,
+        target.as_str(),
+        host.as_str(),
+        toolchain.as_str(),
+    ];
+    let build_id = gix_acquire::content_id(&key_parts);
+    let expected_stamp = format!("built:{build_id}");
+    if existing_stamp == expected_stamp
+        && std::fs::metadata(wprof_bin).is_ok_and(|meta| meta.len() > 0)
+    {
+        return;
+    }
+    if wprof_bin.exists() {
+        std::fs::remove_file(wprof_bin).expect("remove stale wprof binary");
+    }
+    let _ = std::fs::remove_file(&stamp_path);
+    // Clean up the old pre-CAS per-OUT_DIR clone once. The new builder always
+    // uses a private staged checkout and publishes only its immutable binary.
+    let old_source = out_dir.join("wprof-src");
+    if old_source.exists() {
+        if !is_wprof_clone_complete(&old_source) {
+            println!("cargo:warning=removing incomplete legacy wprof source checkout");
+        }
+        std::fs::remove_dir_all(&old_source).expect("remove legacy wprof source checkout");
+    }
+
+    let binary_cache_root = gix_acquire::cache_root("wprof")
+        .unwrap_or_else(|| out_dir.join(".ktstr-content-cache").join("wprof"));
+    let source_cache_root = gix_acquire::cache_root("source-nodes")
+        .unwrap_or_else(|| out_dir.join(".ktstr-content-cache").join("source-nodes"));
+    let cached = gix_acquire::ensure_cached(
+        &binary_cache_root,
+        &key_parts,
+        "wprof exact source + binary",
+        |entry| std::fs::metadata(entry.join("wprof")).is_ok_and(|meta| meta.len() > 0),
+        |stage, progress| {
+            let source = stage.join("source");
+            gix_acquire::assemble_exact_recursive_cached(
+                &source_cache_root,
+                WPROF_URL,
+                WPROF_REF,
+                WPROF_REV,
+                &source,
+                progress,
+            )?;
+            // Upstream's Makefile contains `git submodule update` fallbacks.
+            // The exact source graph must make every guard true so the build
+            // cannot cross back into an executable transport.
+            for required in ["libbpf/src", "bpftool/src", "blazesym/src"] {
+                if !source.join(required).is_dir() {
+                    return Err(format!(
+                        "exact wprof source graph is missing {required}; refusing \
+                         upstream's executable submodule fallback"
+                    ));
                 }
             }
-
-            // Clone into OUT_DIR like busybox — re-fetches on `cargo
-            // clean` and stays per-workspace-isolated (matches the
-            // shape of the other vendored binary).
-            //
-            // The wprof Makefile runs a standalone `cargo build` for
-            // each of its three `src/` sub-crates (demangle, wpb,
-            // wrust → lib*_c.a), none of which carries a `[workspace]`
-            // table. `isolate_wprof_subcrate_workspaces` (invoked below,
-            // before make) appends the sentinel to each so cargo's
-            // upward workspace walk stops at the sub-crate instead of
-            // reaching ktstr-root's `[workspace]` via target/ — see that
-            // helper's doc for the mechanism and scope. blazesym (a
-            // sibling submodule with its own `[workspace]`) and
-            // vmlinux.h (a header dir the Makefile never cargo-builds)
-            // are correctly left untouched.
-            //
-            // Tradeoff acknowledged: `cargo clean && cargo build`
-            // re-fetches the FULL wprof tree (~590MB working tree of
-            // which ~20MB is .git after the `--depth 1` pinned fetch +
-            // shallow submodules) — measured 60+ seconds wall time on
-            // slow CI links. Within a single cargo invocation, build.rs
-            // runs ONCE per (package, profile, feature-combo) thanks to
-            // cargo's build-script dedup, so multi-target builds against
-            // the same ktstr package amortise the fetch. Across
-            // different cargo invocations (e.g. dev iteration switching
-            // between debug and release), each does its own fetch. The
-            // cost buys: (1) per-workspace isolation — different ktstr
-            // checkouts can't share a stale wprof tree; (2) `cargo
-            // clean` consistency — no out-of-band
-            // `~/.cache/ktstr/wprof-src` rm needed; (3) a fixed,
-            // reproducible wprof rev (WPROF_REV) instead of whatever
-            // upstream HEAD happened to be at fetch time. Operators who
-            // want incremental builds should prefer `cargo build -p
-            // ktstr` over `cargo clean`.
-            // The rev-enforcement above already wiped any incomplete or
-            // off-rev clone, so reaching here means wprof_src is either
-            // a complete clone at WPROF_REV (reuse) or absent (fetch).
-            let wprof_makefile = wprof_src.join("src").join("Makefile");
-            if !wprof_makefile.exists() {
-                let git_url = "https://github.com/anakryiko/wprof.git";
-                // The pinned shallow fetch (init + fetch --depth 1 +
-                // checkout + submodule update) is multi-step and not
-                // atomic: a failure partway (commonly a submodule fetch
-                // over a flaky network: libbpf, bpftool, blazesym,
-                // vmlinux.h, usdt, strobelight-libs) leaves wprof_src
-                // half-populated. Retry with bounded attempts +
-                // exponential backoff via the shared
-                // `retry_with_backoff` helper (also used by the
-                // busybox tarball download with `MAX_TARBALL_ATTEMPTS
-                // = 4`). Both call sites share backoff timing,
-                // attempt counting, and log wording.
-                //
-                // Per-attempt cleanup of partial wprof_src lives
-                // INSIDE the closure.
-                println!(
-                    "cargo:warning=fetching {git_url} @ {WPROF_REV} into {} (recursive — \
-                 pulls libbpf, bpftool, blazesym, vmlinux.h, usdt, \
-                 strobelight-libs)",
-                    wprof_src.display()
-                );
-                const MAX_CLONE_ATTEMPTS: u32 = 4;
-                let clone_attempt = |i: u32| -> Result<(), String> {
-                    // After a failed attempt, wprof_src may be in a
-                    // partial-fetch state. Wipe before retry so `git
-                    // init` starts from an empty dir; swallow cleanup
-                    // errors with a log so the retry still proceeds (if
-                    // the partial state genuinely blocks the next
-                    // attempt, git will surface the error in this
-                    // iteration's status). First attempt skips because
-                    // the outer !exists() check above guaranteed the dir
-                    // is empty.
-                    if i > 1
-                        && let Err(e) = std::fs::remove_dir_all(&wprof_src)
-                    {
-                        println!(
-                            "cargo:warning=wprof partial-fetch cleanup before attempt {i} \
-                         failed: {e}; continuing to next attempt anyway"
-                        );
-                    }
-                    // GIT_CONFIG_GLOBAL=/dev/null +
-                    // GIT_CONFIG_SYSTEM=/dev/null bypass any host-level
-                    // `~/.gitconfig` / `/etc/gitconfig` rewriting
-                    // (e.g. `url.<base>.insteadOf`) that would re-route
-                    // the public github.com URL through a private proxy.
-                    // Build.rs must work reproducibly on any host AND
-                    // must never bake host-private endpoints into the
-                    // build graph. Repository URL stays the upstream
-                    // public one.
-                    //
-                    // GIT_TERMINAL_PROMPT=0 + GIT_ASKPASS=/bin/false
-                    // prevent git from blocking the build on a stdin
-                    // credential prompt when an HTTP 401/403 hits.
-                    // A retry that hangs on a prompt
-                    // is worse than no retry — fail fast and let the
-                    // outer panic surface the error.
-                    //
-                    // http.lowSpeedLimit=1000 + http.lowSpeedTime=60
-                    // bound each attempt: git aborts the transfer if
-                    // throughput stays below 1 KB/s for 60 s. Without
-                    // this, a half-open TCP connection (NAT timeout,
-                    // blackholed route) hangs git until the OS TCP
-                    // keepalive fires — typically minutes to hours
-                    // per attempt. Passing via `-c key=value` rather
-                    // than env vars keeps the setting scoped to this
-                    // single invocation.
-                    let run_git = |args: &[&str]| -> Result<(), String> {
-                        let status = Command::new("git")
-                            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                            .env("GIT_TERMINAL_PROMPT", "0")
-                            .env("GIT_ASKPASS", "/bin/false")
-                            .arg("-c")
-                            .arg("http.lowSpeedLimit=1000")
-                            .arg("-c")
-                            .arg("http.lowSpeedTime=60")
-                            .current_dir(&wprof_src)
-                            .args(args)
-                            .stdout(Stdio::inherit())
-                            .stderr(Stdio::inherit())
-                            .status()
-                            .map_err(|e| format!("spawn git {}: {e}", args.join(" ")))?;
-                        if status.success() {
-                            Ok(())
-                        } else {
-                            Err(format!("git {} exited {status}", args.join(" ")))
-                        }
-                    };
-                    // `git clone --depth=1` only resolves a ref tip, so
-                    // it cannot pin an arbitrary rev. Init an empty repo,
-                    // fetch exactly WPROF_REV at depth 1 (GitHub serves
-                    // any commit reachable from an advertised ref),
-                    // detach onto it, then init submodules pinned by that
-                    // tree's recorded gitlink SHAs. `current_dir` is the
-                    // freshly-created wprof_src for every step.
-                    std::fs::create_dir_all(&wprof_src)
-                        .map_err(|e| format!("create wprof_src dir: {e}"))?;
-                    run_git(&["init", "-q"])?;
-                    run_git(&["remote", "add", "origin", git_url])?;
-                    run_git(&["fetch", "-q", "--depth", "1", "origin", WPROF_REV])?;
-                    run_git(&["checkout", "-q", "--detach", "FETCH_HEAD"])?;
-                    run_git(&[
-                        "submodule",
-                        "update",
-                        "--init",
-                        "--recursive",
-                        "--depth",
-                        "1",
-                    ])
-                };
-                if let Err(err) =
-                    retry_with_backoff("wprof pinned fetch", MAX_CLONE_ATTEMPTS, clone_attempt)
-                {
-                    panic!(
-                        "wprof pinned fetch failed after {MAX_CLONE_ATTEMPTS} attempts \
-                     (last error: {err}). Check network connectivity to \
-                     {git_url}; if the cache directory is in an \
-                     unrecoverable state, `rm -rf {}` and re-run `cargo build`.",
-                        wprof_src.display()
-                    );
-                }
-            }
-
-            // Isolate every wprof src/ sub-crate from ktstr's workspace
-            // before invoking make, which runs a standalone `cargo
-            // build` per sub-crate (demangle, wpb, wrust → lib*_c.a).
-            // See `isolate_wprof_subcrate_workspaces` for why the
-            // sentinel is required and why the scope is src/ children
-            // only (the blazesym submodule is its own workspace).
-            isolate_wprof_subcrate_workspaces(&wprof_src);
-
-            // Build wprof.  Single-threaded `-j1` instead of `-j{nproc}`:
-            // the upstream wprof Makefile has a missing prerequisite
-            // edge between the `libdemangle_c.a` build (a recursive
-            // `cargo build` inside the demangle sub-crate) and the
-            // sibling `cp` that copies the produced archive into
-            // wprof's OUTPUT dir.  Under `-jN` the `cp` races the
-            // cargo build and fires before the .a exists, surfacing
-            // as `cp: cannot stat .../libdemangle_c.a` → `wprof build
-            // failed`.  `-j1` serialises the recipe so the dependency
-            // ordering the Makefile *intends* is the ordering it gets.
-            // The wall-time cost is small in practice: the dominant
-            // builds (blazesym, demangle) are individual `cargo build`
-            // invocations that already parallelise internally per
-            // CARGO_BUILD_JOBS / `--jobs`, so `make`'s outer
-            // parallelism would only overlap distinct cargo
-            // invocations against each other — which is exactly the
-            // pattern that triggers the race.
-            // Clear RUSTC_WORKSPACE_WRAPPER (set to clippy-driver by an
-            // outer `cargo clippy`): the Makefile's inner `cargo build`
-            // of each wprof sub-crate (wpb/wrust/demangle) would
-            // otherwise inherit it and run UPSTREAM wprof code through
-            // ktstr's clippy under `-D warnings`, turning wprof's own
-            // lints (missing_safety_doc, needless_update) into hard build
-            // errors. ktstr does not lint vendored upstream crates.
-            //
-            // The Makefile copies those nested Cargo artifacts from each
-            // sub-crate's own target/ directory. An outer CARGO_TARGET_DIR
-            // redirects them elsewhere without updating the copy source,
-            // producing a false "cannot stat lib*.a" failure. Keep the
-            // outer target choice scoped to ktstr and let wprof use the
-            // layout its Makefile requires.
-            let status = Command::new("make")
+            isolate_wprof_subcrate_workspaces(&source);
+            progress.set_phase("compiling wprof");
+            let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+            let status = cargo_coordinated_make()
+                // v0.4's outer Makefile is missing the prerequisite edge
+                // between its recursive demangle Cargo build and the sibling
+                // archive copy. Parallel outer recipes deterministically race
+                // (`cp: cannot stat .../libdemangle_c.a`) in CI. Keep only
+                // this outer make serial; recursive Cargo/sub-makes still use
+                // the authenticated Cargo jobserver configured above.
                 .arg("-j1")
-                // Upstream's host code uses Clang-supported C23 constructs
-                // (including empty initialization of a variable-length
-                // array) and already requires Clang for its BPF objects.
-                // Pin the host compiler too so older distro GCC versions do
-                // not reject unchanged upstream source. Select mold
-                // explicitly so Clang's enabled-by-default LTO never depends
-                // on a distro-provided LLVMgold plugin; this preserves the
-                // upstream optimized build instead of disabling LTO.
+                // Pin Makefile policy inputs that are not supported ktstr
+                // overrides. Supported compiler/linker flags remain inherited
+                // and are part of the content key below.
+                .args([
+                    "CLANG=clang",
+                    "AWK=awk",
+                    "DEBUG=",
+                    "BLAZESYM_DEBUG=",
+                    "STATIC=",
+                    "LTO=1",
+                    "DESTDIR=",
+                    "CROSS_COMPILE=",
+                    "AR=ar",
+                    "LD=ld",
+                    "NM=nm",
+                    "OBJCOPY=objcopy",
+                    "RANLIB=ranlib",
+                    "STRIP=strip",
+                ])
+                .arg(format!("CARGO={cargo}"))
+                .arg("CC=clang -fuse-ld=mold -Wno-unused-command-line-argument")
                 .env(
                     "CC",
                     "clang -fuse-ld=mold -Wno-unused-command-line-argument",
                 )
+                .env_remove("ARCH")
+                .env_remove("BPFTOOL")
+                .env_remove("BPFTOOL_OUTPUT")
+                .env_remove("BPFTOOL_OUTPUT_ABS")
+                .env_remove("CLANG_BPF_SYS_INCLUDES")
                 .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("CARGO_BUILD_TARGET")
                 .env_remove("CARGO_TARGET_DIR")
-                .current_dir(wprof_src.join("src"))
+                .current_dir(source.join("src"))
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
                 .status()
-                .expect("spawn make for wprof");
-            assert!(status.success(), "wprof build failed");
+                .map_err(|err| format!("spawn make for wprof: {err}"))?;
+            if !status.success() {
+                return Err(format!("wprof make exited {status}"));
+            }
+            let built = source.join("src/wprof");
+            if !built.is_file() {
+                return Err(format!(
+                    "wprof build succeeded but binary is missing at {}",
+                    built.display()
+                ));
+            }
+            std::fs::copy(&built, stage.join("wprof"))
+                .map_err(|err| format!("stage completed wprof binary: {err}"))?;
+            // The cache publishes only the immutable result. Source/build state
+            // is private to the elected builder and never shared with `make`.
+            std::fs::remove_dir_all(&source)
+                .map_err(|err| format!("remove private wprof build tree: {err}"))?;
+            Ok(())
+        },
+    )
+    .unwrap_or_else(|err| panic!("obtain exact wprof binary: {err}"));
+    std::fs::copy(cached.join("wprof"), wprof_bin)
+        .unwrap_or_else(|err| panic!("copy cached wprof binary: {err}"));
+    std::fs::write(&stamp_path, expected_stamp).expect("stamp cached wprof binary");
+}
 
-            // The wprof Makefile emits the binary at src/wprof (the
-            // submodule-init + libbpf-link pattern in
-            // github.com/anakryiko/wprof/src/Makefile).
-            let built_bin = wprof_src.join("src").join("wprof");
-            assert!(
-                built_bin.exists(),
-                "wprof build succeeded but binary not found at expected path: {}",
-                built_bin.display()
+#[cfg(feature = "wprof")]
+fn wprof_toolchain_fingerprint() -> String {
+    fn version(tool: &str, args: &[&str]) -> String {
+        let output = Command::new(tool)
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "wprof build requires '{tool}' on PATH: {err}. Install the \
+                     build toolchain (make, gcc, clang, mold, and rustc)."
+                )
+            });
+        if !output.status.success() {
+            panic!(
+                "wprof build requires a working '{tool}', but `{tool} {}` exited {}",
+                args.join(" "),
+                output.status
             );
-            std::fs::copy(&built_bin, &wprof_bin).expect("copy wprof binary to OUT_DIR");
         }
-    } // #[cfg(feature = "wprof")]
+        format!(
+            "{tool}\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let versions = [
+        version("make", &["--version"]),
+        version("gcc", &["--version"]),
+        version("clang", &["--version"]),
+        version("mold", &["--version"]),
+        version("ar", &["--version"]),
+        version("ld", &["--version"]),
+        version("nm", &["--version"]),
+        version("objcopy", &["--version"]),
+        version("ranlib", &["--version"]),
+        version("strip", &["--version"]),
+        version(&rustc, &["-vV"]),
+        version(&cargo, &["-vV"]),
+    ];
+    let environment: Vec<String> = [
+        "CFLAGS",
+        "CPPFLAGS",
+        "EXTRA_CFLAGS",
+        "EXTRA_LDFLAGS",
+        "LDFLAGS",
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+    ]
+    .into_iter()
+    .map(|name| format!("{name}={}", std::env::var(name).unwrap_or_default()))
+    .collect();
+    let parts: Vec<&str> = versions
+        .iter()
+        .chain(environment.iter())
+        .map(String::as_str)
+        .collect();
+    gix_acquire::content_id(&parts)
 }
 
 /// SHA-256 hex digest of the upstream busybox-1.36.1 release tarball

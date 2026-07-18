@@ -69,7 +69,7 @@ crc32fast = "1.5"
 # requirements, no format-pinning headaches.
 postcard = { version = "1", features = ["use-std"] }
 itoa = "1"
-gix = { version = "0.83", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation", "status", "revision", "progress-tree", "tree-editor", "parallel"] }
+gix = { version = "0.83", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-curl-rustls", "worktree-mutation", "status", "revision", "progress-tree", "tree-editor", "parallel"] }
 reqwest = { version = "0.13", features = ["blocking"] }
 # Streaming XML pull-parser for distro repo metadata (repomd.xml and
 # the multi-MB primary.xml the Fedora / Amazon Linux resolvers walk in
@@ -433,10 +433,15 @@ cli-bins = [
 # `export` subcommand wired through the test-binary dispatch path.
 export = []
 # Embed the wprof BPF tracer for Perfetto-format profiling in VMs.
-# Default off: first build clones github.com/anakryiko/wprof and
-# compiles libbpf + blazesym (requires git, make, gcc, clang, mold,
-# elfutils-devel, zlib-devel on the host; takes several minutes).
-wprof = ["ktstr-macros/wprof"]
+# Default off: one elected build fetches github.com/anakryiko/wprof through
+# in-process gix and compiles libbpf + blazesym (requires make, gcc, clang,
+# mold, elfutils-devel, zlib-devel on the host; takes several minutes cold).
+wprof = [
+    "ktstr-macros/wprof",
+    "dep:build_ahash",
+    "dep:build_fs2",
+    "dep:build_gix",
+]
 # Pretty thread-name labels in `ctprof_compare` output. Enables
 # `grex` regex synthesis to render multi-member buckets as a
 # minimal regex (e.g. `tokio-runtime-worker-[0-3]`). With this
@@ -459,6 +464,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_
 
 [dev-dependencies]
 assert_cmd = "2"
+fs2 = "0.4"
+jobserver = "0.1"
 insta = "1"
 predicates = "3"
 proptest = "1"
@@ -511,6 +518,12 @@ mockito = "1"
 virtio-queue = { version = "0.17", features = ["test-utils"] }
 
 [build-dependencies]
+build_ahash = { package = "ahash", version = "0.8", optional = true }
+build_fs2 = { package = "fs2", version = "0.4", optional = true }
+# Optional with `wprof`: default builds do not compile a second host-side gix
+# graph merely for a build-script path that is disabled.
+build_gix = { package = "gix", version = "0.83", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-curl-rustls", "worktree-mutation", "progress-tree", "parallel"], optional = true }
+build_jobserver = { package = "jobserver", version = "0.1" }
 cc = "1"
 flate2 = "1"
 # BPF skeleton generator, invoked by build.rs. Optional + pulled in by
