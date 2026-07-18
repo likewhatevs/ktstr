@@ -5,10 +5,9 @@
 //! Init setup is handled by Rust code in `vmm::rust_init`.
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap};
-use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 
 /// Result of shared library resolution for a binary.
 #[derive(Debug, Clone)]
@@ -19,6 +18,45 @@ pub(crate) struct SharedLibs {
     pub missing: Vec<MissingLib>,
     /// The binary's PT_INTERP path, if present (e.g. `/lib64/ld-linux-x86-64.so.2`).
     pub interpreter: Option<String>,
+    /// Stable identities of every ELF file parsed while resolving this
+    /// closure. The cache preparer uses these to prove that the fds it pins
+    /// for keying/building are the exact revisions the resolver inspected.
+    pub observed_files: Vec<(PathBuf, ResolverFileIdentity)>,
+    /// Search directories observed, in priority order up to each resolution
+    /// decision. Both existing and missing paths are recorded so adding a
+    /// higher-priority soname invalidates a persistent closure memo.
+    pub search_paths: Vec<ResolverPathObservation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResolverFileIdentity {
+    pub dev: u64,
+    pub ino: u64,
+    pub size: u64,
+    pub mtime_secs: i64,
+    pub mtime_nsecs: i64,
+    pub ctime_secs: i64,
+    pub ctime_nsecs: i64,
+}
+
+impl ResolverFileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            size: metadata.size(),
+            mtime_secs: metadata.mtime(),
+            mtime_nsecs: metadata.mtime_nsec(),
+            ctime_secs: metadata.ctime(),
+            ctime_nsecs: metadata.ctime_nsec(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResolverPathObservation {
+    pub path: PathBuf,
+    pub identity: Option<ResolverFileIdentity>,
 }
 
 /// A shared library dependency that could not be resolved.
@@ -40,9 +78,6 @@ pub(crate) struct MissingLib {
 ///   - 48-byte header: `magic[20] + nlibs[4] + len_strings[4] + flags[4] + unused[16]`
 ///   - nlibs entries of 24 bytes: `flags[4] + key[4] + value[4] + osversion[4] + hwcap[8]`
 ///   - String table: key/value are absolute byte offsets from file start
-static LD_SO_CACHE: LazyLock<HashMap<String, PathBuf>> =
-    LazyLock::new(|| parse_ld_so_cache(Path::new("/etc/ld.so.cache")));
-
 /// Magic bytes at the start of the glibc new-format `ld.so.cache`.
 const LD_CACHE_MAGIC: &[u8; 20] = b"glibc-ld.so.cache1.1";
 /// Header size: magic(20) + nlibs(4) + len_strings(4) + flags(4) + unused(16).
@@ -110,6 +145,34 @@ fn read_cstr(data: &[u8], offset: usize) -> Option<&str> {
     std::str::from_utf8(&data[offset..offset + end]).ok()
 }
 
+fn read_file_stable(path: &Path) -> Result<(Vec<u8>, ResolverFileIdentity)> {
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("open ELF source {}", path.display()))?;
+    let before_metadata = file
+        .metadata()
+        .with_context(|| format!("stat ELF source {}", path.display()))?;
+    anyhow::ensure!(
+        before_metadata.is_file(),
+        "ELF source is not a regular file: {}",
+        path.display()
+    );
+    let before = ResolverFileIdentity::from_metadata(&before_metadata);
+    let mut data = Vec::with_capacity(usize::try_from(before.size).unwrap_or(0));
+    file.read_to_end(&mut data)
+        .with_context(|| format!("read ELF source {}", path.display()))?;
+    let after = ResolverFileIdentity::from_metadata(
+        &file
+            .metadata()
+            .with_context(|| format!("restat ELF source {}", path.display()))?,
+    );
+    anyhow::ensure!(
+        before == after,
+        "ELF source changed while resolving dependencies: {}",
+        path.display()
+    );
+    Ok((data, before))
+}
+
 /// Resolve shared library dependencies for a dynamically-linked ELF binary.
 /// Parses the ELF dynamic section to read DT_NEEDED entries, then resolves
 /// each soname to a host path matching the host dynamic linker's search
@@ -122,7 +185,42 @@ fn read_cstr(data: &[u8], offset: usize) -> Option<&str> {
 /// Walks transitive deps via level-parallel BFS. Returns empty result
 /// for static binaries or non-ELF files.
 pub(crate) fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
-    resolve_shared_libs_inner(binary, &[])
+    let loader_cwd = loader_current_dir()?;
+    let ld_library_path_dirs = current_ld_library_path_dirs();
+    let ld_so_cache = parse_ld_so_cache(Path::new("/etc/ld.so.cache"));
+    resolve_shared_libs_inner(
+        binary,
+        binary,
+        &[],
+        &loader_cwd,
+        &ld_library_path_dirs,
+        &ld_so_cache,
+    )
+}
+
+/// Resolve a pinned binary fd while retaining its original pathname for
+/// `$ORIGIN` expansion and diagnostics. The loader inputs are supplied by
+/// the cache preparer so the resolution, persistent key, and archive build
+/// all observe the same pinned `/etc/ld.so.cache` revision and raw
+/// `LD_LIBRARY_PATH` value.
+pub(crate) fn resolve_shared_libs_from_pinned(
+    pinned_source: &Path,
+    original_path: &Path,
+    loader_cwd: &Path,
+    ld_library_path_dirs: &[PathBuf],
+    pinned_ld_so_cache: Option<&Path>,
+) -> Result<SharedLibs> {
+    let ld_so_cache = pinned_ld_so_cache
+        .map(parse_ld_so_cache)
+        .unwrap_or_default();
+    resolve_shared_libs_inner(
+        pinned_source,
+        original_path,
+        &[],
+        loader_cwd,
+        ld_library_path_dirs,
+        &ld_so_cache,
+    )
 }
 
 /// Like [`resolve_shared_libs`] but seeds the BFS with additional
@@ -136,7 +234,17 @@ fn resolve_shared_libs_with_extra_interp_hints(
     binary: &Path,
     extra_interp_hints: &[PathBuf],
 ) -> Result<SharedLibs> {
-    resolve_shared_libs_inner(binary, extra_interp_hints)
+    let loader_cwd = loader_current_dir()?;
+    let ld_library_path_dirs = current_ld_library_path_dirs();
+    let ld_so_cache = parse_ld_so_cache(Path::new("/etc/ld.so.cache"));
+    resolve_shared_libs_inner(
+        binary,
+        binary,
+        extra_interp_hints,
+        &loader_cwd,
+        &ld_library_path_dirs,
+        &ld_so_cache,
+    )
 }
 
 /// Resolve a non-standard interpreter's *own* shared-library dependencies.
@@ -158,6 +266,8 @@ pub(crate) fn resolve_interpreter_deps(interp: &str) -> Result<SharedLibs> {
             found: vec![],
             missing: vec![],
             interpreter: None,
+            observed_files: vec![],
+            search_paths: vec![],
         });
     }
     let interp_path = Path::new(interp);
@@ -172,26 +282,65 @@ pub(crate) fn resolve_interpreter_deps(interp: &str) -> Result<SharedLibs> {
     resolve_shared_libs_with_extra_interp_hints(interp_path, &interp_hints)
 }
 
-#[tracing::instrument(skip_all, fields(binary = %binary.display(), extra_hints = extra_interp_hints.len()))]
-fn resolve_shared_libs_inner(binary: &Path, extra_interp_hints: &[PathBuf]) -> Result<SharedLibs> {
-    // Cache results by canonical path AND extra-hint set — avoids
-    // re-resolving the same binary across concurrent initramfs builds
-    // (nextest parallelism). Hints are part of the key so a second
-    // call on the same binary with different hint sets does not return
-    // the prior result.
-    type LibCache = LazyLock<std::sync::Mutex<HashMap<(PathBuf, Vec<PathBuf>), SharedLibs>>>;
-    static CACHE: LibCache = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
-
-    let canon = std::fs::canonicalize(binary).unwrap_or_else(|_| binary.to_path_buf());
-    let cache_key = (canon.clone(), extra_interp_hints.to_vec());
-    if let Ok(cache) = CACHE.lock()
-        && let Some(cached) = cache.get(&cache_key)
-    {
-        return Ok(cached.clone());
+/// Resolve the dependency chain of an interpreter through a pinned fd and
+/// the same loader environment used for its parent binary.
+pub(crate) fn resolve_interpreter_deps_from_pinned(
+    pinned_source: &Path,
+    original_path: &Path,
+    loader_cwd: &Path,
+    ld_library_path_dirs: &[PathBuf],
+    pinned_ld_so_cache: Option<&Path>,
+) -> Result<SharedLibs> {
+    let mut interp_hints = Vec::new();
+    if let Some(parent) = original_path.parent() {
+        interp_hints.push(parent.to_path_buf());
+        if let Some(grandparent) = parent.parent() {
+            interp_hints.push(grandparent.join("lib"));
+            interp_hints.push(grandparent.join("lib64"));
+        }
     }
+    let ld_so_cache = pinned_ld_so_cache
+        .map(parse_ld_so_cache)
+        .unwrap_or_default();
+    resolve_shared_libs_inner(
+        pinned_source,
+        original_path,
+        &interp_hints,
+        loader_cwd,
+        ld_library_path_dirs,
+        &ld_so_cache,
+    )
+}
 
-    let data =
-        std::fs::read(binary).with_context(|| format!("read binary: {}", binary.display()))?;
+fn current_ld_library_path_dirs() -> Vec<PathBuf> {
+    std::env::var_os("LD_LIBRARY_PATH")
+        .map(|value| std::env::split_paths(&value).collect())
+        .unwrap_or_default()
+}
+
+fn loader_current_dir() -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("read loader current directory")?;
+    std::fs::canonicalize(&cwd)
+        .with_context(|| format!("canonicalize loader current directory {}", cwd.display()))
+}
+
+#[tracing::instrument(skip_all, fields(binary = %binary_origin.display(), extra_hints = extra_interp_hints.len()))]
+fn resolve_shared_libs_inner(
+    binary_source: &Path,
+    binary_origin: &Path,
+    extra_interp_hints: &[PathBuf],
+    loader_cwd: &Path,
+    ld_library_path_dirs: &[PathBuf],
+    ld_so_cache: &HashMap<String, PathBuf>,
+) -> Result<SharedLibs> {
+    // Cross-process memoisation and builder election live in
+    // initramfs_cache. Keeping no path-only process cache here avoids stale
+    // closures after a long-lived process observes a rebuilt ELF at the same
+    // pathname.
+    let (data, root_identity) = read_file_stable(binary_source)
+        .with_context(|| format!("read binary: {}", binary_origin.display()))?;
+    let mut observed_files = vec![(binary_origin.to_path_buf(), root_identity)];
+    let mut search_observations = Vec::new();
     let elf = match goblin::elf::Elf::parse(&data) {
         Ok(e) => e,
         Err(_) => {
@@ -200,6 +349,8 @@ fn resolve_shared_libs_inner(binary: &Path, extra_interp_hints: &[PathBuf]) -> R
                 found: vec![],
                 missing: vec![],
                 interpreter: None,
+                observed_files,
+                search_paths: search_observations,
             });
         }
     };
@@ -212,13 +363,14 @@ fn resolve_shared_libs_inner(binary: &Path, extra_interp_hints: &[PathBuf]) -> R
             found: vec![],
             missing: vec![],
             interpreter,
+            observed_files,
+            search_paths: search_observations,
         });
     }
 
     // Extract DT_NEEDED, DT_RUNPATH, and DT_RPATH from the root binary.
     let root_needed: Vec<String> = elf.libraries.iter().map(|s| s.to_string()).collect();
-    let root_search = elf_search_paths(&elf, binary);
-
+    let root_search = elf_search_paths(&elf, binary_origin);
     // When the binary uses a non-standard interpreter (custom toolchain),
     // collect the interpreter's parent dir and sibling lib dirs. These
     // are passed to resolve_soname as `interp_hints` alongside the
@@ -260,11 +412,13 @@ fn resolve_shared_libs_inner(binary: &Path, extra_interp_hints: &[PathBuf]) -> R
         }
     }
 
-    // Resolve the full transitive closure via level-parallel BFS.
-    // Each level's file reads (read + ELF parse) run in parallel via
-    // rayon. Soname resolution (resolve_soname) is cheap (cache lookups
-    // + stat calls), so it stays sequential per level.
-    use rayon::prelude::*;
+    // Resolve the full transitive closure level by level. Keep the
+    // per-level reads sequential: a normal userspace payload has only a
+    // handful of DT_NEEDED entries, while starting rayon's process-global
+    // pool creates one worker per host CPU. Under a verifier sweep every
+    // nextest cell is a separate process, so the old `par_iter()` turned a
+    // few tiny ELF reads into thousands of runnable helper threads before
+    // the cross-process initramfs cache gate was even reached.
 
     let mut found: Vec<(String, PathBuf)> = Vec::new();
     let mut missing: Vec<MissingLib> = Vec::new();
@@ -283,7 +437,15 @@ fn resolve_shared_libs_inner(binary: &Path, extra_interp_hints: &[PathBuf]) -> R
             if !visited.insert(soname.clone()) {
                 continue;
             }
-            if let Some(host_path) = resolve_soname(soname, search_paths, &interp_search_dirs) {
+            if let Some(host_path) = resolve_soname(
+                soname,
+                search_paths,
+                &interp_search_dirs,
+                loader_cwd,
+                ld_library_path_dirs,
+                ld_so_cache,
+                &mut search_observations,
+            )? {
                 let canonical =
                     std::fs::canonicalize(&host_path).unwrap_or_else(|_| host_path.clone());
                 let canon_str = canonical.to_string_lossy();
@@ -328,28 +490,27 @@ fn resolve_shared_libs_inner(binary: &Path, extra_interp_hints: &[PathBuf]) -> R
             }
         }
 
-        // Phase 2: read + parse resolved libs in parallel to discover
-        // their DT_NEEDED entries and search paths. The interp-relative
-        // dirs apply uniformly to every resolve_soname call (via the
-        // top-level `interp_search_dirs` slice), so transitive deps
-        // don't need them threaded through per-level.
-        let next_deps: Vec<(String, ElfSearchPaths)> = resolved
-            .par_iter()
-            .flat_map(|(_, _, canonical)| {
-                let Ok(lib_data) = std::fs::read(canonical) else {
-                    return Vec::new();
-                };
-                let Ok(lib_elf) = goblin::elf::Elf::parse(&lib_data) else {
-                    return Vec::new();
-                };
-                let lib_search = elf_search_paths(&lib_elf, canonical);
+        // Phase 2: read + parse resolved libs to discover their DT_NEEDED
+        // entries and search paths. The interp-relative dirs apply
+        // uniformly to every resolve_soname call (via the top-level
+        // `interp_search_dirs` slice), so transitive deps don't need them
+        // threaded through per-level.
+        let mut next_deps: Vec<(String, ElfSearchPaths)> = Vec::new();
+        for (_, _, canonical) in &resolved {
+            let (lib_data, identity) = read_file_stable(canonical)
+                .with_context(|| format!("read resolved shared library {}", canonical.display()))?;
+            observed_files.push((canonical.clone(), identity));
+            let lib_elf = goblin::elf::Elf::parse(&lib_data).with_context(|| {
+                format!("parse resolved shared library {}", canonical.display())
+            })?;
+            let lib_search = elf_search_paths(&lib_elf, canonical);
+            next_deps.extend(
                 lib_elf
                     .libraries
                     .iter()
-                    .map(|name| (name.to_string(), lib_search.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+                    .map(|name| (name.to_string(), lib_search.clone())),
+            );
+        }
 
         // Build next level from discovered deps, skipping already-visited.
         level = next_deps
@@ -362,11 +523,9 @@ fn resolve_shared_libs_inner(binary: &Path, extra_interp_hints: &[PathBuf]) -> R
         found,
         missing,
         interpreter,
+        observed_files,
+        search_paths: search_observations,
     };
-
-    if let Ok(mut cache) = CACHE.lock() {
-        cache.insert(cache_key, result.clone());
-    }
 
     Ok(result)
 }
@@ -490,16 +649,37 @@ const DEFAULT_LIB_PATHS: &[&str] = &[
     "/usr/lib/aarch64-linux-gnu",
 ];
 
-/// Directories from the `LD_LIBRARY_PATH` environment variable, parsed
-/// once on first access. Empty when the variable is unset or empty.
-static LD_LIBRARY_PATH_DIRS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
-    std::env::var("LD_LIBRARY_PATH")
-        .unwrap_or_default()
-        .split(':')
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .collect()
-});
+fn observe_search_path(path: &Path, observations: &mut Vec<ResolverPathObservation>) -> Result<()> {
+    let identity = std::fs::metadata(path)
+        .ok()
+        .map(|metadata| ResolverFileIdentity::from_metadata(&metadata));
+    if let Some(previous) = observations
+        .iter()
+        .find(|observation| observation.path == path)
+    {
+        anyhow::ensure!(
+            previous.identity == identity,
+            "dynamic-library search path changed during resolution: {}",
+            path.display()
+        );
+    } else {
+        observations.push(ResolverPathObservation {
+            path: path.to_path_buf(),
+            identity,
+        });
+    }
+    Ok(())
+}
+
+fn normalize_loader_search_dir(path: &Path, loader_cwd: &Path) -> PathBuf {
+    if path.as_os_str().is_empty() {
+        loader_cwd.to_path_buf()
+    } else if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        loader_cwd.join(path)
+    }
+}
 
 /// Resolve a soname to a host path.
 /// Search order matches the host dynamic linker (ld.so):
@@ -522,30 +702,40 @@ fn resolve_soname(
     soname: &str,
     elf_paths: &ElfSearchPaths,
     interp_hints: &[PathBuf],
-) -> Option<PathBuf> {
+    loader_cwd: &Path,
+    ld_library_path_dirs: &[PathBuf],
+    ld_so_cache: &HashMap<String, PathBuf>,
+    observations: &mut Vec<ResolverPathObservation>,
+) -> Result<Option<PathBuf>> {
     // 1. DT_RPATH (legacy). Non-empty only when DT_RUNPATH is absent
     //    per `elf_search_paths`; matches glibc's "DT_RPATH before
     //    LD_LIBRARY_PATH" rule for pre-RUNPATH binaries.
     for dir in &elf_paths.rpath {
+        let dir = normalize_loader_search_dir(dir, loader_cwd);
+        observe_search_path(&dir, observations)?;
         let candidate = dir.join(soname);
         if candidate.is_file() {
-            return Some(candidate);
+            return Ok(Some(candidate));
         }
     }
 
     // 2. LD_LIBRARY_PATH.
-    for dir in LD_LIBRARY_PATH_DIRS.iter() {
+    for dir in ld_library_path_dirs {
+        let dir = normalize_loader_search_dir(dir, loader_cwd);
+        observe_search_path(&dir, observations)?;
         let candidate = dir.join(soname);
         if candidate.is_file() {
-            return Some(candidate);
+            return Ok(Some(candidate));
         }
     }
 
     // 3. DT_RUNPATH (modern).
     for dir in &elf_paths.runpath {
+        let dir = normalize_loader_search_dir(dir, loader_cwd);
+        observe_search_path(&dir, observations)?;
         let candidate = dir.join(soname);
         if candidate.is_file() {
-            return Some(candidate);
+            return Ok(Some(candidate));
         }
     }
 
@@ -554,30 +744,34 @@ fn resolve_soname(
     //    toolchain libs resolvable without requiring the user to
     //    set LD_LIBRARY_PATH.
     for dir in interp_hints {
+        let dir = normalize_loader_search_dir(dir, loader_cwd);
+        observe_search_path(&dir, observations)?;
         let candidate = dir.join(soname);
         if candidate.is_file() {
-            return Some(candidate);
+            return Ok(Some(candidate));
         }
     }
 
     // 5. ld.so.cache — the binary cache is the real dynamic linker's
     //    primary lookup mechanism. Catches libraries in directories
     //    added via `ldconfig /path` that don't appear in ld.so.conf.
-    if let Some(cached_path) = LD_SO_CACHE.get(soname) {
-        return Some(cached_path.clone());
+    if let Some(cached_path) = ld_so_cache.get(soname) {
+        return Ok(Some(cached_path.clone()));
     }
 
     // 6. Default paths. (ld.so.conf step dropped: ldconfig already
     //    ingests conf paths into ld.so.cache above, so a separate
     //    walk here was redundant per glibc's search algorithm.)
     for dir in DEFAULT_LIB_PATHS {
-        let candidate = Path::new(dir).join(soname);
+        let dir = Path::new(dir);
+        observe_search_path(dir, observations)?;
+        let candidate = dir.join(soname);
         if candidate.is_file() {
-            return Some(candidate);
+            return Ok(Some(candidate));
         }
     }
 
-    None
+    Ok(None)
 }
 
 /// ELF magic bytes: `\x7fELF`.
@@ -810,8 +1004,57 @@ pub fn build_initramfs_base(
         extra_binaries,
         &validated_includes,
         &shared_libs,
+        None,
     )?;
 
+    Ok(archive)
+}
+
+/// Build a base archive from an already-resolved, caller-pinned dependency
+/// closure.
+///
+/// Every host path is normally `/proc/<preparer-pid>/fd/N`. The persistent
+/// closure record and [`crate::vmm::initramfs_cache`] retain those exact fds
+/// through semantic key construction and this write, so the builder never
+/// reopens a mutable original pathname or repeats ELF resolution on a CAS hit.
+pub(crate) fn build_initramfs_base_from_resolved(
+    extra_binaries: &[(&str, &Path)],
+    include_files: &[(&str, &Path)],
+    busybox_bytes: Option<&[u8]>,
+    shared_libs: &[(String, PathBuf, u64, u64)],
+) -> Result<Vec<u8>> {
+    let validated_includes = validate_include_files(include_files)?;
+    let mut dirs = BTreeSet::new();
+    if busybox_bytes.is_some() {
+        dirs.insert("bin".to_string());
+    }
+    for (archive_path, _, _) in &validated_includes {
+        register_parent_dirs(&mut dirs, archive_path);
+    }
+    for (archive_path, _) in extra_binaries {
+        register_parent_dirs(&mut dirs, archive_path);
+    }
+    for (guest_path, _, _, _) in shared_libs {
+        register_parent_dirs(&mut dirs, guest_path);
+    }
+    let shared_sources: Vec<(String, PathBuf)> = shared_libs
+        .iter()
+        .map(|(guest, host, _, _)| (guest.clone(), host.clone()))
+        .collect();
+    let content_keys: Vec<(u64, u64)> = shared_libs
+        .iter()
+        .map(|(_, _, size, hash)| (*size, *hash))
+        .collect();
+    let mut archive = Vec::new();
+    write_archive_entries(
+        &mut archive,
+        &dirs,
+        busybox_bytes,
+        extra_binaries,
+        &validated_includes,
+        &shared_sources,
+        Some(&content_keys),
+    )?;
     Ok(archive)
 }
 
@@ -1015,6 +1258,7 @@ fn write_archive_entries(
     extra_binaries: &[(&str, &Path)],
     validated_includes: &[(&str, &Path, u32)],
     shared_libs: &[(String, PathBuf)],
+    shared_lib_content_keys: Option<&[(u64, u64)]>,
 ) -> Result<()> {
     let _s_write = tracing::debug_span!("write_cpio").entered();
     // Directory entries
@@ -1056,11 +1300,32 @@ fn write_archive_entries(
     // file as cpio symlinks. This avoids duplicating large libraries in
     // the initramfs (e.g. libc appearing under both lib64/ and usr/lib64/).
     {
-        // canonical host path -> first guest_path written for this file
-        let mut written_files: HashMap<PathBuf, String> = HashMap::new();
-        for (guest_path, host_path) in shared_libs {
-            let canonical = std::fs::canonicalize(host_path).unwrap_or_else(|_| host_path.clone());
-            if let Some(first_guest) = written_files.get(&canonical) {
+        // Open-file identity -> first guest_path written for this file. This
+        // remains stable for `/proc/<pid>/fd/N` sources even after the
+        // original pathname is replaced or unlinked.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        enum SharedLibDedupKey {
+            Identity(u64, u64),
+            Content(u64, u64),
+        }
+        if let Some(keys) = shared_lib_content_keys {
+            anyhow::ensure!(
+                keys.len() == shared_libs.len(),
+                "prepared shared-library content-key count mismatch"
+            );
+        }
+        let mut written_files: HashMap<SharedLibDedupKey, String> = HashMap::new();
+        for (index, (guest_path, host_path)) in shared_libs.iter().enumerate() {
+            let key = if let Some(keys) = shared_lib_content_keys {
+                let (size, hash) = keys[index];
+                SharedLibDedupKey::Content(size, hash)
+            } else {
+                let metadata = std::fs::metadata(host_path).with_context(|| {
+                    format!("stat shared lib '{}': {}", guest_path, host_path.display())
+                })?;
+                SharedLibDedupKey::Identity(metadata.dev(), metadata.ino())
+            };
+            if let Some(first_guest) = written_files.get(&key) {
                 // Already written — emit a symlink to the first guest path.
                 let target = format!("/{first_guest}");
                 write_symlink_entry(archive, guest_path, &target)?;
@@ -1069,7 +1334,7 @@ fn write_archive_entries(
                     format!("read shared lib '{}': {}", guest_path, host_path.display())
                 })?;
                 write_entry(archive, guest_path, &data, 0o100755)?;
-                written_files.insert(canonical, guest_path.clone());
+                written_files.insert(key, guest_path.clone());
             }
         }
     }
@@ -1151,28 +1416,80 @@ pub struct SuffixParams<'a> {
     pub kernel_modules: &'a [PathBuf],
 }
 
-/// Build the suffix that completes a base archive: `/init` (the
-/// `strip_debug`'d test binary), `/args` and `/sched_args` entries,
-/// optional `/sched_enable` and `/sched_disable` shell scripts for
-/// kernel-built schedulers, optional `/exec_cmd`, the `.ktstr_init_ok`
-/// sentinel (last entry — its absence flags incomplete extraction),
-/// trailer, and 512-byte
-/// padding. `base_len` is needed to compute the padding. `/init` lives
-/// here, not the base, so a payload recompile is a base-cache hit; it
-/// dominates the suffix size (the other entries are ~200 bytes total).
+/// Compatibility helper for suffix-shape tests.
+///
+/// Production prepares three independent archive fragments: the stripped
+/// `/init` entry, the stable kernel-module set, and the tiny per-cell tail.
+/// Keeping this wrapper in tests preserves the old "one suffix Vec" fixtures
+/// while exercising the same split builders used by the CAS.
+#[cfg(test)]
 pub fn build_suffix(base_len: usize, params: &SuffixParams<'_>) -> Result<Vec<u8>> {
     let mut suffix = Vec::new();
-
-    // Test binary as /init — detects PID 1 and runs all setup before the
-    // test (see `vmm::rust_init`). It lives in the per-run suffix, not the
-    // cached base, so the base archive is independent of payload
-    // recompiles; `strip_debug` here is the per-run cost. `None` only in
-    // suffix-shape unit tests.
     if let Some(payload) = params.payload {
-        let binary = strip_debug(payload)
-            .with_context(|| format!("strip/read init binary: {}", payload.display()))?;
-        write_entry(&mut suffix, "init", &binary, 0o100755)?;
+        suffix.extend(build_payload_part_from_pinned(payload)?);
     }
+    let modules: Vec<(String, PathBuf)> = params
+        .kernel_modules
+        .iter()
+        .map(|module| {
+            let file_name = module
+                .file_name()
+                .and_then(|name| name.to_str())
+                .with_context(|| {
+                    format!(
+                        "kernel module path has no valid filename: {}",
+                        module.display()
+                    )
+                })?
+                .to_owned();
+            Ok((file_name, module.clone()))
+        })
+        .collect::<Result<_>>()?;
+    suffix.extend(build_modules_part_from_pinned(&modules)?);
+    suffix.extend(build_dynamic_tail(base_len + suffix.len(), params)?);
+    Ok(suffix)
+}
+
+/// Build the immutable archive fragment containing only `/init`.
+///
+/// `payload` normally names `/proc/<preparer-pid>/fd/N`; the preparer keeps
+/// that fd open and verifies its identity again before publication. This
+/// expensive strip is therefore elected and cached independently of per-cell
+/// arguments.
+pub(crate) fn build_payload_part_from_pinned(payload: &Path) -> Result<Vec<u8>> {
+    let binary = strip_debug(payload)
+        .with_context(|| format!("strip/read pinned init binary: {}", payload.display()))?;
+    let mut part = Vec::new();
+    write_entry(&mut part, "init", &binary, 0o100755)?;
+    Ok(part)
+}
+
+/// Build the immutable archive fragment containing a stable module set.
+///
+/// Archive names stay separate from fd paths because the latter end in a
+/// descriptor number. Empty input deliberately returns an empty fragment.
+pub(crate) fn build_modules_part_from_pinned(modules: &[(String, PathBuf)]) -> Result<Vec<u8>> {
+    if modules.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut part = Vec::new();
+    write_entry(&mut part, "modules", &[], 0o40755)?;
+    for (idx, (file_name, module)) in modules.iter().enumerate() {
+        let data = std::fs::read(module)
+            .with_context(|| format!("read pinned kernel module: {}", module.display()))?;
+        let archive_path = format!("modules/{idx:03}-{file_name}");
+        write_entry(&mut part, &archive_path, &data, 0o100644)?;
+    }
+    Ok(part)
+}
+
+/// Build the tiny per-cell tail that closes the cpio archive.
+///
+/// This contains every invocation-varying byte, the completion sentinel,
+/// trailer, and final 512-byte archive padding. `prefix_len` is the exact
+/// uncompressed length of all immutable fragments before this tail.
+pub(crate) fn build_dynamic_tail(prefix_len: usize, params: &SuffixParams<'_>) -> Result<Vec<u8>> {
+    let mut suffix = Vec::new();
 
     // Args file
     let args_data = params.args.join("\n");
@@ -1258,39 +1575,6 @@ pub fn build_suffix(base_len: usize, params: &SuffixParams<'_>) -> Result<Vec<u8
         write_entry(&mut suffix, &archive_path, data.as_bytes(), 0o100644)?;
     }
 
-    // Kernel modules for the guest to load before touching any virtio
-    // device. Emitted only when non-empty so the zero-module suffix is
-    // byte-identical to the pre-module output. The `modules` directory
-    // entry is written first — the base archive never registers it, and
-    // the kernel's cpio extractor silently drops a file whose parent
-    // directory entry has not yet appeared (same requirement documented
-    // in `build_initramfs_base`'s `register_parent_dirs` loop). Each
-    // module rides at `modules/NNN-<filename>`: the zero-padded index
-    // makes the guest's lexical readdir sort reproduce this slice's
-    // caller-chosen load order (see
-    // `rust_init::load_kernel_modules`). Modules are copied verbatim —
-    // they are already-decompressed `.ko` images the caller resolved
-    // from the target kernel, so no `strip_debug` (which only knows the
-    // userspace ELF section set).
-    if !params.kernel_modules.is_empty() {
-        write_entry(&mut suffix, "modules", &[], 0o40755)?;
-        for (idx, module) in params.kernel_modules.iter().enumerate() {
-            let file_name = module
-                .file_name()
-                .and_then(|n| n.to_str())
-                .with_context(|| {
-                    format!(
-                        "kernel module path has no valid filename: {}",
-                        module.display()
-                    )
-                })?;
-            let data = std::fs::read(module)
-                .with_context(|| format!("read kernel module: {}", module.display()))?;
-            let archive_path = format!("modules/{idx:03}-{file_name}");
-            write_entry(&mut suffix, &archive_path, &data, 0o100644)?;
-        }
-    }
-
     // Sentinel: the LAST entry before the trailer. The kernel extracts the
     // whole initramfs before exec'ing /init, so this file's ABSENCE means
     // the kernel silently dropped late cpio entries under memory pressure
@@ -1302,7 +1586,7 @@ pub fn build_suffix(base_len: usize, params: &SuffixParams<'_>) -> Result<Vec<u8
     cpio::newc::trailer(&mut suffix as &mut dyn Write).context("write cpio trailer")?;
 
     // Pad to 512-byte boundary (initramfs convention)
-    let total = base_len + suffix.len();
+    let total = prefix_len + suffix.len();
     let pad = (512 - (total % 512)) % 512;
     suffix.extend(std::iter::repeat_n(0u8, pad));
 
@@ -1317,15 +1601,16 @@ pub fn build_suffix(base_len: usize, params: &SuffixParams<'_>) -> Result<Vec<u8
 /// a host running a foreign-arch ktstr binary (cross-arch developer
 /// boxes that share `/dev/shm`) cannot collide with ours. Selected
 /// at compile time so a single binary always emits one tag.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) const SHM_ARCH_TAG: &str = "x86_64";
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(test, target_arch = "aarch64"))]
 pub(crate) const SHM_ARCH_TAG: &str = "aarch64";
 
 /// Derive an shm segment name from a content hash. Each distinct
 /// combination of payload + scheduler binaries gets its own segment.
 /// The target arch is included so an x86_64 binary cannot mmap a
 /// segment written by an aarch64 binary on the same host.
+#[cfg(test)]
 pub(crate) fn shm_segment_name(content_hash: u64) -> String {
     format!("/ktstr-base-{SHM_ARCH_TAG}-{content_hash:016x}")
 }
@@ -1372,6 +1657,7 @@ pub(crate) fn shm_segment_name(content_hash: u64) -> String {
 /// set under arbitrary signal arrival. Accepting the bounded leak
 /// is the design tradeoff from the panic-strategy decision
 /// (panic=abort with audited threads).
+#[cfg(test)]
 pub(crate) struct MappedShm {
     ptr: *const u8,
     len: usize,
@@ -1382,9 +1668,12 @@ pub(crate) struct MappedShm {
 // contents are held stable for the mapping's lifetime by a shared
 // flock retained in `fd`. The pointer and length are valid for the
 // lifetime of the mapping.
+#[cfg(test)]
 unsafe impl Send for MappedShm {}
+#[cfg(test)]
 unsafe impl Sync for MappedShm {}
 
+#[cfg(test)]
 impl AsRef<[u8]> for MappedShm {
     fn as_ref(&self) -> &[u8] {
         // SAFETY: ptr/len are set by a successful mmap in
@@ -1396,6 +1685,7 @@ impl AsRef<[u8]> for MappedShm {
     }
 }
 
+#[cfg(test)]
 impl Drop for MappedShm {
     fn drop(&mut self) {
         // Note: under `panic = "abort"` this Drop is skipped entirely.
@@ -1432,6 +1722,7 @@ impl Drop for MappedShm {
 /// by an unrelated tool) bypasses this scheme. All callers within
 /// this crate cooperate, which is the closed-world guarantee we
 /// rely on.
+#[cfg(test)]
 pub(crate) fn shm_load_base(content_hash: u64) -> Option<MappedShm> {
     use std::os::fd::AsRawFd;
 
@@ -1515,6 +1806,7 @@ pub(crate) fn shm_load_base(content_hash: u64) -> Option<MappedShm> {
 /// that writes DIFFERENT data to an already-used hash (e.g. the
 /// rename-test pattern) will overwrite — the store does not enforce
 /// idempotence itself.
+#[cfg(test)]
 fn shm_store(name: &str, data: &[u8]) -> Result<()> {
     use std::os::fd::AsRawFd;
 
@@ -1606,6 +1898,7 @@ fn shm_store(name: &str, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn shm_store_base(content_hash: u64, data: &[u8]) -> Result<()> {
     shm_store(&shm_segment_name(content_hash), data)
 }
@@ -1627,6 +1920,7 @@ pub(crate) fn shm_unlink_base(content_hash: u64) {
 /// previous compression formats (zstd, gzip). The target arch tag
 /// keeps cross-arch caches separate on hosts where both ktstr
 /// binaries share `/dev/shm`.
+#[cfg(test)]
 pub(crate) fn shm_lz4_segment_name(content_hash: u64) -> String {
     format!("/ktstr-lz4-{SHM_ARCH_TAG}-{content_hash:016x}")
 }
@@ -1635,6 +1929,7 @@ pub(crate) fn shm_lz4_segment_name(content_hash: u64) -> String {
 /// The fd has a shared flock held; drop the OwnedFd (via
 /// [`shm_close_fd`] or scope exit) to release the lock and close.
 /// Returns `None` on miss or error.
+#[cfg(test)]
 pub(crate) fn shm_open_lz4(content_hash: u64) -> Option<(std::os::fd::OwnedFd, usize)> {
     let name = shm_lz4_segment_name(content_hash);
     let fd = rustix::shm::open(
@@ -1653,6 +1948,7 @@ pub(crate) fn shm_open_lz4(content_hash: u64) -> Option<(std::os::fd::OwnedFd, u
 }
 
 /// Store compressed initramfs data into an LZ4 SHM segment.
+#[cfg(test)]
 pub(crate) fn shm_store_lz4(content_hash: u64, data: &[u8]) -> Result<()> {
     shm_store(&shm_lz4_segment_name(content_hash), data)
 }
@@ -1667,6 +1963,7 @@ pub(crate) fn shm_store_lz4(content_hash: u64, data: &[u8]) -> Result<()> {
 /// [`shm_load_base`] (which returns a borrowed `MappedShm`); the LZ4
 /// GET path hands the bytes back to the caller and does not retain
 /// the fd.
+#[cfg(test)]
 pub(crate) fn shm_load_lz4(content_hash: u64) -> Option<Vec<u8>> {
     use std::os::fd::AsRawFd;
     let (fd, len) = shm_open_lz4(content_hash)?;
@@ -1728,7 +2025,7 @@ pub(crate) struct CowOverlayGuard {
 }
 
 impl CowOverlayGuard {
-    fn new(fd: std::os::fd::OwnedFd) -> Self {
+    pub(crate) fn new(fd: std::os::fd::OwnedFd) -> Self {
         Self { fd }
     }
 }
@@ -1744,13 +2041,10 @@ impl Drop for CowOverlayGuard {
 }
 
 /// COW-overlay `len` bytes from `shm_fd` at `host_addr` using
-/// `MAP_PRIVATE | MAP_FIXED | MAP_POPULATE`. The guest sees the SHM
-/// content but writes go to private anonymous pages (copy-on-write).
-/// `MAP_POPULATE` pre-faults the pages so the initial accesses skip
-/// the filemap fault path; the lock guard still protects against
-/// truncate of pages that may be refaulted from the page cache
-/// (MAP_POPULATE alone is not sufficient — truncate invalidates the
-/// page cache via `unmap_mapping_range`).
+/// `MAP_PRIVATE | MAP_FIXED`. The guest sees the backing content but writes
+/// go to private anonymous pages (copy-on-write). Deliberately omit
+/// `MAP_POPULATE`: verifier storms should demand-page only what a VM touches,
+/// not fault every hundreds-of-MiB initrd page into every cell at setup.
 ///
 /// On success, returns `Some(CowOverlayGuard)` — the guard owns
 /// `shm_fd` and holds `LOCK_SH` for the mapping's lifetime. The
@@ -1773,37 +2067,80 @@ impl Drop for CowOverlayGuard {
 /// level. The caller is also responsible for ensuring `shm_fd` is a
 /// valid, open file descriptor with `LOCK_SH` already held (the
 /// guard inherits both).
+#[cfg(test)]
 pub(crate) unsafe fn cow_overlay(
     host_addr: *mut u8,
     len: usize,
     shm_fd: std::os::fd::OwnedFd,
 ) -> Option<CowOverlayGuard> {
+    unsafe { cow_overlay_file(host_addr, len, shm_fd, 0) }.ok()
+}
+
+/// Strict offset-aware variant used by the prepared-initrd CAS.
+///
+/// Unlike [`cow_overlay`], failures are returned with their OS error so the
+/// uniform direct-mapping loader can fail closed instead of copying bytes.
+///
+/// # Safety
+///
+/// The caller must uphold the same complete destination-range invariant as
+/// [`cow_overlay`]. `file_offset` must be host-page aligned and the backing
+/// file must cover the kernel-rounded mapping length.
+#[cfg(test)]
+pub(crate) unsafe fn cow_overlay_file(
+    host_addr: *mut u8,
+    len: usize,
+    backing_fd: std::os::fd::OwnedFd,
+    file_offset: u64,
+) -> Result<CowOverlayGuard> {
+    unsafe { cow_overlay_file_borrowed(host_addr, len, &backing_fd, file_offset) }?;
+    Ok(CowOverlayGuard::new(backing_fd))
+}
+
+/// Map one range while leaving ownership of the locked backing fd with the
+/// caller.
+///
+/// This is used when one logical prepared range crosses aligned guest-memory
+/// region boundaries: every subrange maps from the same open file description,
+/// and one [`CowOverlayGuard`] retains its `LOCK_SH` for all of them. Duplicated
+/// fds would share the same flock and the first guard drop could unlock while
+/// sibling mappings remained live.
+///
+/// # Safety
+///
+/// The caller must validate the complete destination range before the first
+/// MAP_FIXED and keep `backing_fd` locked/alive until every resulting VMA is
+/// torn down.
+pub(crate) unsafe fn cow_overlay_file_borrowed(
+    host_addr: *mut u8,
+    len: usize,
+    backing_fd: &std::os::fd::OwnedFd,
+    file_offset: u64,
+) -> Result<()> {
     use std::os::fd::AsRawFd;
 
     // SAFETY: caller guarantees [host_addr, host_addr + len) is
-    // entirely within a single valid guest memory region and shm_fd
+    // entirely within a single valid guest memory region and backing_fd
     // is a valid fd holding LOCK_SH. See function-level docs.
     let ptr = unsafe {
         libc::mmap(
             host_addr as *mut libc::c_void,
             len,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_POPULATE,
-            shm_fd.as_raw_fd(),
-            0,
+            libc::MAP_PRIVATE | libc::MAP_FIXED,
+            backing_fd.as_raw_fd(),
+            libc::off_t::try_from(file_offset).context("COW file offset exceeds off_t")?,
         )
     };
     if ptr == libc::MAP_FAILED {
-        // Drop the OwnedFd on the failure path so the caller expects
-        // no cleanup responsibility on the None branch; drop releases
-        // the LOCK_SH and closes the descriptor.
-        let _ = rustix::fs::flock(&shm_fd, rustix::fs::FlockOperation::Unlock);
-        return None;
+        let error = std::io::Error::last_os_error();
+        return Err(error).context("MAP_PRIVATE prepared initrd overlay");
     }
-    Some(CowOverlayGuard::new(shm_fd))
+    Ok(())
 }
 
 /// Close a SHM fd and release its shared flock.
+#[cfg(test)]
 pub(crate) fn shm_close_fd(fd: std::os::fd::OwnedFd) {
     // Explicit flock-unlock so a cooperating writer waiting on LOCK_EX
     // observes ordering with our earlier reads (LOCK_SH); the OwnedFd
@@ -1817,6 +2154,7 @@ pub(crate) fn shm_close_fd(fd: std::os::fd::OwnedFd) {
 /// copy into a monolithic `Vec` that the split base/suffix production
 /// path would otherwise need. Returns (address, total_size) for
 /// boot_params.
+#[cfg(test)]
 pub fn load_initramfs_parts(
     guest_mem: &vm_memory::GuestMemoryMmap,
     parts: &[&[u8]],
@@ -1900,14 +2238,14 @@ const LZ4_CHUNK_SIZE: usize = 8 << 20;
 /// initramfs decompressor. The format is:
 ///   [4-byte magic] ([4-byte compressed_size LE] [compressed block])*
 ///
-/// Input is split into `LZ4_CHUNK_SIZE` (8MB) chunks, compressed in
-/// parallel with rayon, then assembled sequentially.
+/// Input is split into `LZ4_CHUNK_SIZE` (8MB) chunks and compressed
+/// sequentially. CAS publication already elects one compressor for an exact
+/// object; using rayon here created a host-sized process-global worker pool
+/// in every distinct winner process and left those workers alive for the
+/// whole VM, collapsing colocated verifier storms.
 pub(crate) fn lz4_legacy_compress(data: &[u8]) -> Vec<u8> {
-    use rayon::prelude::*;
-
-    // Compress all chunks in parallel.
     let compressed_chunks: Vec<Vec<u8>> = data
-        .par_chunks(LZ4_CHUNK_SIZE)
+        .chunks(LZ4_CHUNK_SIZE)
         .map(lz4_flex::block::compress)
         .collect();
 

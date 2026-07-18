@@ -17,7 +17,14 @@ use std::time::Instant;
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use super::KtstrVm;
-use super::initramfs_cache::{BaseKey, BaseRef, get_or_build_base, get_or_compress_base_shm};
+#[cfg(test)]
+use super::initramfs_cache::BaseKey;
+#[cfg(target_arch = "aarch64")]
+use super::initramfs_cache::PREPARED_MAPPING_GRANULE;
+use super::initramfs_cache::{
+    PreparedBase, PreparedInitrd, complete_prepared_initrd, get_or_prepare_base,
+    prepare_base_inputs,
+};
 use super::memory_budget::{
     MemoryBudget, TmpfsFraction, initramfs_min_memory_mib, read_kernel_init_size,
     read_kernel_version, read_kernel_version_from_metadata_sidecar,
@@ -121,8 +128,13 @@ fn aarch64_initrd_addr(memory_mib: u32, total_cpus: u32, initrd_max_size: u64) -
     // initramfs and the guest's /init never starts. Anchor the whole initrd
     // below pvtime_base so it stays in advertised RAM, clear of the carve.
     let ceiling = aarch64::fdt::pvtime_base(memory_mib, total_cpus);
-    let page_size = host_page_size();
+    let page_size = PREPARED_MAPPING_GRANULE as u64;
     let mask = !(page_size - 1);
+    let mapped_size = initrd_max_size
+        .checked_add(page_size - 1)
+        .map(|size| size & mask)
+        .context("compressed initrd rounded mapping length overflows u64")?;
+    let aligned_ceiling = ceiling & mask;
     // Place initrd just below the PVTIME carve, host-page-aligned. Use
     // checked_sub: a compressed initramfs larger than the advertised RAM
     // span [DRAM_START, pvtime_base) would otherwise wrap the u64 (debug:
@@ -134,16 +146,13 @@ fn aarch64_initrd_addr(memory_mib: u32, total_cpus: u32, initrd_max_size: u64) -
     // within advertised RAM: an initrd above pvtime_base is outside the
     // advertised /memory and the guest kernel never memblock-reserves it
     // (see this function's header comment).
-    let load_addr = ceiling
-        .checked_sub(initrd_max_size)
-        .map(|top| top & mask)
-        .with_context(|| {
-            format!(
-                "compressed initrd ({initrd_max_size} bytes) exceeds the \
+    let load_addr = aligned_ceiling.checked_sub(mapped_size).with_context(|| {
+        format!(
+            "compressed initrd ({initrd_max_size} bytes) exceeds the \
                  RAM span below the PVTIME carve (pvtime_base={ceiling:#x}): \
                  reduce initramfs size or increase VM memory"
-            )
-        })?;
+        )
+    })?;
     anyhow::ensure!(
         load_addr >= kvm::DRAM_START,
         "initrd load address {load_addr:#x} underflows DRAM_START {:#x} \
@@ -307,6 +316,7 @@ fn numa_balancing_cmdline_token(topology: &crate::vmm::topology::Topology) -> &'
 /// in `src/test_support/runtime.rs` uses the same allow for the
 /// same reason.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn assemble_extras_and_key<'a>(
     payload: &'a std::path::Path,
     scheduler: Option<&'a std::path::Path>,
@@ -1064,8 +1074,12 @@ impl KtstrVm {
 
     /// Spawn initramfs resolution on a background thread.
     /// Returns the handle to join later (after KVM creation completes).
-    pub(super) fn spawn_initramfs_resolve(&self) -> Option<JoinHandle<Result<(BaseRef, BaseKey)>>> {
-        let bin = self.init_binary.as_ref()?;
+    pub(super) fn spawn_initramfs_resolve(
+        &self,
+    ) -> Result<Option<JoinHandle<Result<PreparedBase>>>> {
+        let Some(bin) = self.init_binary.as_ref() else {
+            return Ok(None);
+        };
         let payload = bin.clone();
         let scheduler = self.scheduler_binary.clone();
         let probe = self.jemalloc_probe_binary.clone();
@@ -1073,11 +1087,12 @@ impl KtstrVm {
         let include_files = self.include_files.clone();
         let staged_schedulers = self.staged_schedulers.clone();
         let busybox_bytes = self.busybox_bytes.clone();
+        let compression = self.initrd_compression;
         #[cfg(feature = "wprof")]
         let wprof_host_path: Option<PathBuf> = self.wprof.as_ref().map(|w| w.host_path.clone());
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("initramfs-resolve".into())
-            .spawn(move || -> Result<(BaseRef, BaseKey)> {
+            .spawn(move || -> Result<PreparedBase> {
                 // Extras are stripped by `build_initramfs_base`
                 // before write. The scheduler and probe can lose
                 // their DWARF without functional impact — the probe
@@ -1112,8 +1127,6 @@ impl KtstrVm {
                         )
                     })
                     .collect();
-                let has_jemalloc_extras = probe.as_deref().is_some() || worker.as_deref().is_some();
-
                 // Merge include_files with worker so both the cache
                 // key and the actual archive build see the same
                 // worker entry; the probe is added to extras inside
@@ -1135,32 +1148,31 @@ impl KtstrVm {
                     merged_includes.push(("bin/wprof".to_string(), wprof_path.to_path_buf()));
                 }
 
-                let (extras, key) = assemble_extras_and_key(
+                let mut extras: Vec<(&str, &std::path::Path)> = Vec::new();
+                if let Some(scheduler) = scheduler.as_deref() {
+                    extras.push(("scheduler", scheduler));
+                }
+                if let Some(probe) = probe.as_deref() {
+                    extras.push(("bin/ktstr-jemalloc-probe", probe));
+                }
+                for (index, staged) in staged_schedulers.iter().enumerate() {
+                    extras.push((staged_extras_names[index].as_str(), staged.binary.as_path()));
+                }
+                let inputs = prepare_base_inputs(
                     &payload,
-                    scheduler.as_deref(),
-                    probe.as_deref(),
-                    worker.as_deref(),
-                    &staged_schedulers,
-                    &staged_extras_names,
+                    &extras,
                     &merged_includes,
                     busybox_bytes.as_deref(),
-                    has_jemalloc_extras,
                 )?;
-
-                let include_refs: Vec<(&str, &std::path::Path)> = merged_includes
-                    .iter()
-                    .map(|(a, p)| (a.as_str(), p.as_path()))
-                    .collect();
-                let base =
-                    get_or_build_base(&payload, &extras, &include_refs, busybox_bytes, &key)?;
-                Ok((base, key))
+                let key = inputs.key().clone();
+                get_or_prepare_base(&key, compression, || inputs.build())
             })
-            .ok()
+            .context("spawn initramfs-resolve thread")?;
+        Ok(Some(handle))
     }
 
-    /// Compress base+suffix as separate LZ4 legacy streams, load into
-    /// guest memory via COW overlay (falling back to write_slice), and
-    /// verify the write. Returns `total_compressed_size`.
+    /// Map a prepared initrd's immutable CAS ranges directly into guest RAM.
+    /// Returns `total_compressed_size`.
     ///
     /// On a successful COW overlay, the returned `CowOverlayGuard` is
     /// pushed onto `vm.cow_overlay_guards` IMMEDIATELY — before any
@@ -1173,91 +1185,162 @@ impl KtstrVm {
     /// guard onto `vm` transfers ownership to the VM, where Drop
     /// order is structurally enforced (guard drops AFTER
     /// `_reservation` munmaps the COW VMAs).
-    fn compress_and_load_initrd(
+    fn load_prepared_initrd(
         &self,
         vm: &mut kvm::KtstrKvm,
-        base_bytes: &[u8],
-        suffix: &[u8],
-        key: &BaseKey,
+        prepared: PreparedInitrd,
         load_addr: u64,
     ) -> Result<u32> {
-        let uncompressed_size = base_bytes.len() + suffix.len();
+        let total_compressed = prepared.compressed_len();
+        let page_size = prepared.mapping_granule();
+        anyhow::ensure!(
+            load_addr & (page_size as u64 - 1) == 0,
+            "prepared initrd load address {load_addr:#x} is not aligned to the \
+             {page_size}-byte prepared mapping granule"
+        );
+        let plan = prepared.plan();
+        let cache_hits = prepared.cache_hits();
+        let ranges = prepared.into_ranges();
+        anyhow::ensure!(!ranges.is_empty(), "prepared initrd has no mapping ranges");
 
-        // Compress base and suffix as separate streams of the guest
-        // kernel's format (LZ4 legacy unless the kernel lacks RD_LZ4).
-        // The kernel's unpack_to_rootfs loop decodes one concatenated
-        // archive per iteration whatever the format (and the LZ4
-        // decoder additionally resets on re-encountering the magic
-        // mid-stream). Keeping base and suffix separate lets us
-        // COW-map the LZ4 base from SHM.
+        // Validate the complete geometry before the first MAP_FIXED mutates
+        // guest RAM. The ranges must form one contiguous, granule-sized
+        // overlay starting at initrd byte zero; only the final range may
+        // extend beyond the boot-visible compressed length as zero padding.
+        let mut mapped_len = 0usize;
+        for range in &ranges {
+            anyhow::ensure!(
+                range.guest_offset == mapped_len as u64,
+                "prepared initrd ranges contain a gap, overlap, or reordering"
+            );
+            anyhow::ensure!(
+                range.map_len > 0 && range.map_len % page_size == 0,
+                "prepared initrd mapping length is not aligned to the prepared granule"
+            );
+            anyhow::ensure!(
+                range.file_offset % page_size as u64 == 0,
+                "prepared initrd file offset is not aligned to the prepared granule"
+            );
+            mapped_len = mapped_len
+                .checked_add(range.map_len)
+                .context("prepared initrd mapped length overflow")?;
+        }
+        anyhow::ensure!(
+            total_compressed <= mapped_len
+                && mapped_len.saturating_sub(total_compressed) < page_size,
+            "prepared initrd mapped padding is inconsistent with compressed length"
+        );
+        load_addr
+            .checked_add(mapped_len as u64)
+            .context("prepared initrd final guest address overflow")?;
+        struct ValidatedSubrange {
+            guest_addr: u64,
+            host_addr: *mut u8,
+            file_offset: u64,
+            len: usize,
+        }
+        struct ValidatedRange {
+            range: super::initramfs_cache::PreparedMapping,
+            subranges: Vec<ValidatedSubrange>,
+        }
+
+        // GuestMemoryMmap is one region per NUMA memory slot; adjacent guest
+        // addresses may therefore have unrelated host VAs. Split only at
+        // region boundaries that preserve the 2 MiB prepared geometry.
+        // Every slice and every file offset is validated before MAP_FIXED.
+        let mut validated = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let guest_addr = load_addr
+                .checked_add(range.guest_offset)
+                .context("prepared initrd guest address overflow")?;
+            let mut consumed = 0usize;
+            let mut subranges = Vec::new();
+            for slice in vm
+                .guest_mem
+                .get_slices(GuestAddress(guest_addr), range.map_len)
+            {
+                let slice = slice.context("prepared initrd crosses a guest-memory hole")?;
+                let len = slice.len();
+                anyhow::ensure!(
+                    len > 0 && len % page_size == 0,
+                    "prepared initrd crosses a guest-memory region boundary that is not \
+                     aligned to the {page_size}-byte mapping granule"
+                );
+                let sub_guest = guest_addr
+                    .checked_add(consumed as u64)
+                    .context("prepared initrd subrange guest address overflow")?;
+                let host_addr = vm
+                    .guest_mem
+                    .get_host_address(GuestAddress(sub_guest))
+                    .context("resolve prepared initrd subrange host address")?;
+                anyhow::ensure!(
+                    (host_addr as usize) % page_size == 0,
+                    "prepared initrd host address is not aligned to the \
+                     {page_size}-byte mapping granule"
+                );
+                let file_offset = range
+                    .file_offset
+                    .checked_add(consumed as u64)
+                    .context("prepared initrd subrange file offset overflow")?;
+                anyhow::ensure!(
+                    file_offset % page_size as u64 == 0,
+                    "prepared initrd split produced a misaligned file offset"
+                );
+                subranges.push(ValidatedSubrange {
+                    guest_addr: sub_guest,
+                    host_addr,
+                    file_offset,
+                    len,
+                });
+                consumed = consumed
+                    .checked_add(len)
+                    .context("prepared initrd split length overflow")?;
+            }
+            anyhow::ensure!(
+                consumed == range.map_len,
+                "prepared initrd guest-memory split did not cover the complete range"
+            );
+            validated.push(ValidatedRange { range, subranges });
+        }
         let t0 = Instant::now();
-        let lz4_base = self.get_or_compress_base(base_bytes, key)?;
-        let lz4_suffix = initramfs::compress_initrd_part(self.initrd_compression, suffix)?;
-        let total_compressed = lz4_base.len() + lz4_suffix.len();
+        for validated_range in validated {
+            let fd = validated_range.range.fd;
+            for subrange in validated_range.subranges {
+                let mapped = unsafe {
+                    initramfs::cow_overlay_file_borrowed(
+                        subrange.host_addr,
+                        subrange.len,
+                        &fd,
+                        subrange.file_offset,
+                    )
+                };
+                if let Err(error) = mapped {
+                    // Earlier subranges from this fd may already be live.
+                    // Transfer the single shared-lock owner before unwinding.
+                    vm.cow_overlay_guards
+                        .push(initramfs::CowOverlayGuard::new(fd));
+                    return Err(error).with_context(|| {
+                        format!(
+                            "direct-map prepared initrd subrange at guest {:#x} \
+                             (len={}, file_offset={:#x})",
+                            subrange.guest_addr, subrange.len, subrange.file_offset
+                        )
+                    });
+                }
+            }
+            // One fd/LOCK_SH protects every VMA split from this source.
+            vm.cow_overlay_guards
+                .push(initramfs::CowOverlayGuard::new(fd));
+        }
         tracing::debug!(
             elapsed_us = t0.elapsed().as_micros(),
-            uncompressed = uncompressed_size,
-            lz4_base = lz4_base.len(),
-            lz4_suffix = lz4_suffix.len(),
-            ratio = format!("{:.1}x", uncompressed_size as f64 / total_compressed as f64),
-            "lz4_initramfs",
+            range_count = vm.cow_overlay_guards.len(),
+            cache_hits,
+            part_count = plan.part_count,
+            direct_ranges = plan.direct_ranges,
+            stitch_pages = plan.stitch_pages,
+            "initrd_direct_map"
         );
-
-        tracing::debug!(
-            base_magic = format!(
-                "{:02x}{:02x}{:02x}{:02x}",
-                lz4_base[0], lz4_base[1], lz4_base[2], lz4_base[3]
-            ),
-            suffix_magic = format!(
-                "{:02x}{:02x}{:02x}{:02x}",
-                lz4_suffix[0], lz4_suffix[1], lz4_suffix[2], lz4_suffix[3]
-            ),
-            base_len = lz4_base.len(),
-            suffix_len = lz4_suffix.len(),
-            total = total_compressed,
-            load_addr = format!("{:#x}", load_addr),
-            suffix_addr = format!("{:#x}", load_addr + lz4_base.len() as u64),
-            "initrd_load_debug",
-        );
-
-        // Try COW overlay: mmap compressed base from SHM fd directly
-        // into guest memory, sharing physical pages across VMs. LZ4
-        // only — the SHM segment always holds the LZ4 encoding of the
-        // base, which is not what a non-LZ4 boot wrote into lz4_base.
-        let t0 = Instant::now();
-        let cow_guard = (self.initrd_compression == initramfs::InitrdCompression::Lz4)
-            .then(|| Self::try_cow_overlay(&vm.guest_mem, key, lz4_base.len(), load_addr))
-            .flatten();
-        // IMPORTANT: stash the guard on the VM IMMEDIATELY — before
-        // any fallible operation below. If a `?` unwinds this function
-        // with a locally-held guard still on the stack, the guard
-        // drops first, releasing LOCK_SH while the COW VMAs are still
-        // live. Owned by `vm`, the guard drops with the VM's
-        // declared-order Drop, which is strictly after
-        // `_reservation` (and thus the COW VMAs). See
-        // `try_cow_overlay_rejects_cross_region_span` and the C4
-        // comment on `cow_overlay_guards` in kvm.rs.
-        let cow_active = cow_guard.is_some();
-        if let Some(guard) = cow_guard {
-            vm.cow_overlay_guards.push(guard);
-        }
-        if cow_active {
-            vm.guest_mem
-                .write_slice(&lz4_suffix, GuestAddress(load_addr + lz4_base.len() as u64))
-                .context("write lz4 suffix after COW base")?;
-            tracing::debug!(
-                elapsed_us = t0.elapsed().as_micros(),
-                cow = true,
-                "initrd_write"
-            );
-        } else {
-            initramfs::load_initramfs_parts(&vm.guest_mem, &[&lz4_base, &lz4_suffix], load_addr)?;
-            tracing::debug!(
-                elapsed_us = t0.elapsed().as_micros(),
-                cow = false,
-                "initrd_write"
-            );
-        }
 
         // Read back first 8 bytes from guest memory to check write.
         let mut check_buf = [0u8; 8];
@@ -1280,7 +1363,7 @@ impl KtstrVm {
             "initrd_verify",
         );
 
-        Ok(total_compressed as u32)
+        u32::try_from(total_compressed).context("compressed initrd exceeds u32 boot-size field")
     }
 
     /// Select the guest rootfs tmpfs fraction for the budget formula by
@@ -1288,9 +1371,8 @@ impl KtstrVm {
     /// (mainline 6.18+ or a stable series at/above its backport floor)
     /// via [`TmpfsFraction::for_kernel_version`].
     ///
-    /// Mirrors [`Self::init_payload_coverage_reserve`]: a `&self` accessor
-    /// that derives a conservatively-defaulting value threaded into
-    /// [`MemoryBudget`] at every budget call site. The version is read
+    /// This conservatively-derived value is threaded into [`MemoryBudget`]
+    /// at every budget call site. The version is read
     /// from the image's own setup_header where it is embedded
     /// ([`read_kernel_version`], the x86_64 bzImage), falling
     /// back to the cache `metadata.json` sidecar
@@ -1304,80 +1386,6 @@ impl KtstrVm {
         let version = read_kernel_version(&self.kernel)
             .or_else(|| read_kernel_version_from_metadata_sidecar(&self.kernel));
         TmpfsFraction::for_kernel_version(version)
-    }
-
-    /// Probe the `/init` payload for LLVM coverage instrumentation and,
-    /// when instrumented, compute the extra resident memory the
-    /// instrumented runtime needs.
-    ///
-    /// Returns `(instrumented, reserve_bytes)`:
-    /// - `instrumented` is `true` when the payload's `.symtab` carries
-    ///   `__llvm_profile_write_buffer` / `__llvm_profile_get_size_for_buffer`
-    ///   (the same function-shaped symbols
-    ///   [`crate::test_support::try_flush_profraw`] resolves; chosen over
-    ///   the bare `__llvm_profile_runtime` marker because the marker can
-    ///   be dead-stripped entirely under `--gc-sections` while these
-    ///   function symbols are kept alive by that flush call's link
-    ///   reference). This probes the
-    ///   PAYLOAD bytes (`self.init_binary`), NOT the host process — the
-    ///   guest `/init` may be instrumented even when the host VMM binary
-    ///   is not (and vice versa), so
-    ///   `current_binary_is_coverage_instrumented` (which probes
-    ///   `/proc/self/exe`) is the wrong signal here.
-    /// - `reserve_bytes` is the summed `sh_size` of the payload's
-    ///   `__llvm_prf_cnts` + `__llvm_prf_data` sections — the live
-    ///   coverage-counter and profile-metadata arrays. This is the floor
-    ///   on the heap buffer `__llvm_profile_write_buffer` serializes into
-    ///   at flush time. `0` (and `instrumented = false`) on any failure
-    ///   path (no payload, unreadable file, ELF parse error, symbols
-    ///   absent) — the conservative outcome, leaving the budget at its
-    ///   non-instrumented size.
-    ///
-    /// Reads the payload via `memmap2::Mmap` (matching the
-    /// `try_flush_profraw` idiom) so a ~1 GiB coverage binary is not
-    /// copied into the heap just to read its section table.
-    fn init_payload_coverage_reserve(&self) -> (bool, u64) {
-        let Some(path) = self.init_binary.as_ref() else {
-            return (false, 0);
-        };
-        let Ok(file) = std::fs::File::open(path) else {
-            return (false, 0);
-        };
-        // SAFETY: `path` is the test-author-supplied `/init` payload;
-        // ktstr never writes to it during a VM build, satisfying
-        // memmap2's no-concurrent-modification invariant. The fd pins
-        // the inode for the mapping's lifetime.
-        let Ok(mmap) = (unsafe { memmap2::Mmap::map(&file) }) else {
-            return (false, 0);
-        };
-        let Ok(elf) = goblin::elf::Elf::parse(&mmap) else {
-            return (false, 0);
-        };
-
-        let vaddrs = crate::test_support::find_symbol_vaddrs(
-            &elf,
-            &[
-                "__llvm_profile_write_buffer",
-                "__llvm_profile_get_size_for_buffer",
-            ],
-        );
-        let instrumented = vaddrs.iter().any(|v| matches!(v, Some(va) if *va != 0));
-        if !instrumented {
-            return (false, 0);
-        }
-
-        // Sum the live profile sections' resident sizes. `sh_size` is
-        // the in-memory size (the counter/metadata arrays the runtime
-        // keeps resident and serializes at flush time).
-        let mut reserve_bytes: u64 = 0;
-        for sh in &elf.section_headers {
-            if let Some(name) = elf.shdr_strtab.get_at(sh.sh_name)
-                && (name == "__llvm_prf_cnts" || name == "__llvm_prf_data")
-            {
-                reserve_bytes = reserve_bytes.saturating_add(sh.sh_size);
-            }
-        }
-        (true, reserve_bytes)
     }
 
     /// Join the initramfs thread and load the result into guest memory.
@@ -1394,24 +1402,25 @@ impl KtstrVm {
     fn join_and_load_initramfs(
         &self,
         vm: &mut kvm::KtstrKvm,
-        handle: JoinHandle<Result<(BaseRef, BaseKey)>>,
+        handle: JoinHandle<Result<PreparedBase>>,
         load_addr: u64,
     ) -> Result<(Option<u64>, Option<u32>)> {
         let t0 = Instant::now();
-        let (base, key) = handle
+        let prepared_base = handle
             .join()
             .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "initramfs_join");
-        let base_bytes: &[u8] = base.as_ref();
 
         let t0 = Instant::now();
-        let suffix = initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
-        let uncompressed_size = base_bytes.len() + suffix.len();
+        let prepared = complete_prepared_initrd(prepared_base, &self.suffix_params())?;
+        let uncompressed_size = prepared.uncompressed_len();
+        let compressed_size = prepared.compressed_len();
         tracing::debug!(
             elapsed_us = t0.elapsed().as_micros(),
-            base_bytes = base_bytes.len(),
-            suffix_bytes = suffix.len(),
-            "build_suffix",
+            uncompressed_bytes = uncompressed_size,
+            compressed_bytes = compressed_size,
+            cache_hits = prepared.cache_hits(),
+            "prepare_initrd",
         );
 
         // Enforce minimum memory for initramfs extraction.
@@ -1420,13 +1429,8 @@ impl KtstrVm {
             "join_and_load_initramfs called in deferred mode; \
              use join_compute_memory_and_load instead",
         );
-        // Compress first to get actual compressed size for validation.
-        let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
-        let lz4_suffix = initramfs::compress_initrd_part(self.initrd_compression, &suffix)?;
-        let compressed_size = lz4_base.len() + lz4_suffix.len();
         let kernel_init_size = read_kernel_init_size(&self.kernel)?;
-        let (init_coverage_instrumented, instrumented_reserve_bytes) =
-            self.init_payload_coverage_reserve();
+        let (init_coverage_instrumented, instrumented_reserve_bytes) = prepared.coverage();
         let budget = MemoryBudget {
             uncompressed_initramfs_bytes: uncompressed_size as u64,
             compressed_initrd_bytes: compressed_size as u64,
@@ -1449,7 +1453,7 @@ impl KtstrVm {
             );
         }
 
-        let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
+        let size = self.load_prepared_initrd(vm, prepared, load_addr)?;
         Ok((Some(load_addr), Some(size)))
     }
 
@@ -1467,30 +1471,28 @@ impl KtstrVm {
     fn join_compute_memory_and_load(
         &self,
         vm: &mut kvm::KtstrKvm,
-        handle: JoinHandle<Result<(BaseRef, BaseKey)>>,
+        handle: JoinHandle<Result<PreparedBase>>,
         load_addr: u64,
     ) -> Result<(Option<u64>, Option<u32>, u32)> {
         let t0 = Instant::now();
-        let (base, key) = handle
+        let prepared_base = handle
             .join()
             .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "initramfs_join");
-        let base_bytes: &[u8] = base.as_ref();
 
         let t0 = Instant::now();
-        let suffix = initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
-        let uncompressed_size = base_bytes.len() + suffix.len();
+        let prepared = complete_prepared_initrd(prepared_base, &self.suffix_params())?;
+        let uncompressed_size = prepared.uncompressed_len();
+        let compressed_size = prepared.compressed_len();
         tracing::debug!(
             elapsed_us = t0.elapsed().as_micros(),
-            base_bytes = base_bytes.len(),
-            suffix_bytes = suffix.len(),
-            "build_suffix",
+            uncompressed_bytes = uncompressed_size,
+            compressed_bytes = compressed_size,
+            cache_hits = prepared.cache_hits(),
+            "prepare_initrd",
         );
 
         let t0_compress = Instant::now();
-        let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
-        let lz4_suffix = initramfs::compress_initrd_part(self.initrd_compression, &suffix)?;
-        let compressed_size = lz4_base.len() + lz4_suffix.len();
         tracing::debug!(
             elapsed_us = t0_compress.elapsed().as_micros(),
             uncompressed = uncompressed_size,
@@ -1502,8 +1504,7 @@ impl KtstrVm {
         // Compute memory from actual sizes, honoring the
         // topology-requested minimum when non-zero.
         let kernel_init_size = read_kernel_init_size(&self.kernel)?;
-        let (init_coverage_instrumented, instrumented_reserve_bytes) =
-            self.init_payload_coverage_reserve();
+        let (init_coverage_instrumented, instrumented_reserve_bytes) = prepared.coverage();
         let budget = MemoryBudget {
             uncompressed_initramfs_bytes: uncompressed_size as u64,
             compressed_initrd_bytes: compressed_size as u64,
@@ -1528,10 +1529,9 @@ impl KtstrVm {
         vm.allocate_and_register_memory(memory_mib)
             .with_context(|| format!("allocate deferred memory ({memory_mib}MiB)"))?;
 
-        // Load pre-compressed data into guest memory. The base is already
-        // in the LZ4 SHM cache from get_or_compress_base above, so
-        // compress_and_load_initrd will hit the cache.
-        let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
+        // Load the exact buffers used for sizing; neither part is
+        // recompressed after deferred memory has been allocated.
+        let size = self.load_prepared_initrd(vm, prepared, load_addr)?;
         Ok((Some(load_addr), Some(size), memory_mib))
     }
 
@@ -1543,18 +1543,6 @@ impl KtstrVm {
                 let total_bytes: u64 = guest_mem.iter().map(|r| r.len()).sum();
                 (total_bytes >> 20) as u32
             }
-        }
-    }
-
-    /// Get or build the compressed base. LZ4 delegates to the SHM
-    /// one-compressor election in `initramfs_cache` (which uses no
-    /// builder state, only the content hash); any other format —
-    /// the prebuilt-distro fallback for kernels without RD_LZ4 —
-    /// compresses locally, outside the LZ4-shaped SHM/COW machinery.
-    fn get_or_compress_base(&self, base_bytes: &[u8], key: &BaseKey) -> Result<Vec<u8>> {
-        match self.initrd_compression {
-            initramfs::InitrdCompression::Lz4 => Ok(get_or_compress_base_shm(key.0, base_bytes)),
-            other => initramfs::compress_initrd_part(other, base_bytes),
         }
     }
 
@@ -1572,6 +1560,7 @@ impl KtstrVm {
     /// `guest_mem`, touching no VM instance state. Keeping it
     /// `self`-free lets the unit test drive the real overlay logic
     /// without constructing a full `KtstrVm`.
+    #[cfg(test)]
     fn try_cow_overlay(
         guest_mem: &GuestMemoryMmap,
         key: &BaseKey,
@@ -1720,14 +1709,14 @@ impl KtstrVm {
         &self,
         vm: &mut kvm::KtstrKvm,
         kernel_result: Option<boot::KernelLoadResult>,
-        initramfs_handle: Option<JoinHandle<Result<(BaseRef, BaseKey)>>>,
+        initramfs_handle: Option<JoinHandle<Result<PreparedBase>>>,
     ) -> Result<boot::KernelLoadResult> {
         // Deferred memory path: join initramfs first to learn its size,
         // then allocate memory, load kernel, and load initramfs — all in
         // one shot with no estimation.
         let (kernel_result, initrd_addr, initrd_size) = if let Some(kr) = kernel_result {
             // Non-deferred: memory already allocated, kernel already loaded.
-            // compress_and_load_initrd transfers the CowOverlayGuard
+            // load_prepared_initrd transfers the CowOverlayGuard
             // directly onto vm.cow_overlay_guards before any fallible
             // operation, so a mid-function `?` cannot drop the guard
             // before the COW VMAs are torn down.
@@ -1983,8 +1972,8 @@ impl KtstrVm {
     ///
     /// Uses the same LZ4 SHM compress cache and COW overlay path as the
     /// x86_64 `Self::setup_memory` flow. The shared helpers
-    /// ([`Self::get_or_compress_base`], [`Self::compress_and_load_initrd`],
-    /// [`Self::try_cow_overlay`]) are arch-neutral; this function differs
+    /// ([`Self::load_prepared_initrd`] and the prepared-initrd CAS range
+    /// planner) are arch-neutral; this function differs
     /// from the x86_64 driver only in (a) computing the initrd load
     /// address from the dynamic FDT placement (`aarch64_initrd_addr`)
     /// instead of the fixed `INITRD_ADDR`, and (b) handing off to
@@ -1994,12 +1983,12 @@ impl KtstrVm {
         &self,
         vm: &mut kvm::KtstrKvm,
         kernel_result: Option<boot::KernelLoadResult>,
-        initramfs_handle: Option<JoinHandle<Result<(BaseRef, BaseKey)>>>,
+        initramfs_handle: Option<JoinHandle<Result<PreparedBase>>>,
     ) -> Result<boot::KernelLoadResult> {
         // Deferred memory path for aarch64.
         let (kernel_result, initrd_addr, initrd_size) = if let Some(kr) = kernel_result {
             // Non-deferred: memory already allocated, kernel already loaded.
-            // compress_and_load_initrd transfers the CowOverlayGuard
+            // load_prepared_initrd transfers the CowOverlayGuard
             // directly onto vm.cow_overlay_guards before any fallible
             // operation, so a mid-function `?` cannot drop the guard
             // before the COW VMAs are torn down.
@@ -2051,45 +2040,37 @@ impl KtstrVm {
     /// compressed size, validate that `memory_mib` is sufficient, compute
     /// the FDT-relative load address, then COW-or-copy the compressed
     /// stream into guest memory via the shared
-    /// [`Self::compress_and_load_initrd`] path.
+    /// [`Self::load_prepared_initrd`] path.
     fn join_and_load_initramfs_aarch64(
         &self,
         vm: &mut kvm::KtstrKvm,
-        handle: JoinHandle<Result<(BaseRef, BaseKey)>>,
+        handle: JoinHandle<Result<PreparedBase>>,
         memory_mib: u32,
     ) -> Result<(Option<u64>, Option<u32>)> {
         let t0 = Instant::now();
-        let (base, key) = handle
+        let prepared_base = handle
             .join()
             .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "initramfs_join");
-        let base_bytes: &[u8] = base.as_ref();
 
         let t0 = Instant::now();
-        let suffix = initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
-        let uncompressed_size = base_bytes.len() + suffix.len();
+        let prepared = complete_prepared_initrd(prepared_base, &self.suffix_params())?;
+        let uncompressed_size = prepared.uncompressed_len();
+        let compressed_size = prepared.compressed_len();
         tracing::debug!(
             elapsed_us = t0.elapsed().as_micros(),
-            base_bytes = base_bytes.len(),
-            suffix_bytes = suffix.len(),
-            "build_suffix",
+            uncompressed_bytes = uncompressed_size,
+            compressed_bytes = compressed_size,
+            cache_hits = prepared.cache_hits(),
+            "prepare_initrd",
         );
-
-        // Compress to learn the compressed size for the load_addr
-        // calculation. Primes the LZ4 SHM cache so the subsequent
-        // compress_and_load_initrd call hits the cache instead of
-        // recompressing.
-        let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
-        let lz4_suffix = initramfs::compress_initrd_part(self.initrd_compression, &suffix)?;
-        let compressed_size = lz4_base.len() + lz4_suffix.len();
 
         // Validate the operator-supplied memory_mib against the
         // initramfs budget. Mirrors the x86_64 join_and_load_initramfs
         // contract: a builder with too-small memory_mib fails fast here
         // instead of OOMing during boot.
         let kernel_init_size = read_kernel_init_size(&self.kernel)?;
-        let (init_coverage_instrumented, instrumented_reserve_bytes) =
-            self.init_payload_coverage_reserve();
+        let (init_coverage_instrumented, instrumented_reserve_bytes) = prepared.coverage();
         let budget = MemoryBudget {
             uncompressed_initramfs_bytes: uncompressed_size as u64,
             compressed_initrd_bytes: compressed_size as u64,
@@ -2117,7 +2098,7 @@ impl KtstrVm {
             self.topology.total_cpus(),
             compressed_size as u64,
         )?;
-        let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
+        let size = self.load_prepared_initrd(vm, prepared, load_addr)?;
         Ok((Some(load_addr), Some(size)))
     }
 
@@ -2128,32 +2109,29 @@ impl KtstrVm {
     fn join_compute_memory_and_load_aarch64(
         &self,
         vm: &mut kvm::KtstrKvm,
-        handle: JoinHandle<Result<(BaseRef, BaseKey)>>,
+        handle: JoinHandle<Result<PreparedBase>>,
     ) -> Result<(Option<u64>, Option<u32>)> {
         let t0 = Instant::now();
-        let (base, key) = handle
+        let prepared_base = handle
             .join()
             .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "initramfs_join");
-        let base_bytes: &[u8] = base.as_ref();
 
         let t0 = Instant::now();
-        let suffix = initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
-        let uncompressed_size = base_bytes.len() + suffix.len();
+        let prepared = complete_prepared_initrd(prepared_base, &self.suffix_params())?;
+        let uncompressed_size = prepared.uncompressed_len();
+        let compressed_size = prepared.compressed_len();
         tracing::debug!(
             elapsed_us = t0.elapsed().as_micros(),
-            base_bytes = base_bytes.len(),
-            suffix_bytes = suffix.len(),
-            "build_suffix",
+            uncompressed_bytes = uncompressed_size,
+            compressed_bytes = compressed_size,
+            cache_hits = prepared.cache_hits(),
+            "prepare_initrd",
         );
 
-        // Compress before computing memory so the budget formula uses
-        // actual compressed size. Primes the LZ4 SHM cache so the
-        // subsequent compress_and_load_initrd call hits it.
+        // Prepare before computing memory so the budget formula and load
+        // use the same exact compressed bytes.
         let t0_compress = Instant::now();
-        let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
-        let lz4_suffix = initramfs::compress_initrd_part(self.initrd_compression, &suffix)?;
-        let compressed_size = lz4_base.len() + lz4_suffix.len();
         tracing::debug!(
             elapsed_us = t0_compress.elapsed().as_micros(),
             uncompressed = uncompressed_size,
@@ -2163,8 +2141,7 @@ impl KtstrVm {
         );
 
         let kernel_init_size = read_kernel_init_size(&self.kernel)?;
-        let (init_coverage_instrumented, instrumented_reserve_bytes) =
-            self.init_payload_coverage_reserve();
+        let (init_coverage_instrumented, instrumented_reserve_bytes) = prepared.coverage();
         let budget = MemoryBudget {
             uncompressed_initramfs_bytes: uncompressed_size as u64,
             compressed_initrd_bytes: compressed_size as u64,
@@ -2197,7 +2174,7 @@ impl KtstrVm {
             compressed_size as u64,
         )?;
 
-        let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
+        let size = self.load_prepared_initrd(vm, prepared, load_addr)?;
         Ok((Some(load_addr), Some(size)))
     }
 
