@@ -31,7 +31,7 @@ use super::memory_budget::{
 };
 use super::numa_mem::MemoryBacking;
 use super::pi_mutex::PiMutex;
-use super::{disk_config, disk_template, host_topology, initramfs, virtio_blk, virtio_net};
+use super::{disk_config, disk_template, initramfs, virtio_blk, virtio_net};
 // The virtio-PCI transport, its MSI-X state, and the INTx resample eventfd are
 // x86_64-only (aarch64 is virtio-MMIO + GICv3 with no PCI); their only users are
 // the `#[cfg(target_arch = "x86_64")]` PCI setup paths below.
@@ -1032,28 +1032,20 @@ impl KtstrVm {
         &self,
     ) -> Result<(kvm::KtstrKvm, Option<boot::KernelLoadResult>)> {
         let t0 = Instant::now();
-        let use_hugepages = self.performance_mode
-            && self.memory_mib.is_some_and(|mib| {
-                host_topology::hugepages_free() >= host_topology::hugepages_needed(mib)
-            });
 
         // `mut` is used only on x86_64, where `vm.pci_enabled` is assigned below;
         // on aarch64 (no PCI field) `vm` is never mutated after construction.
         #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
         let mut vm = match self.memory_mib {
-            Some(mib) => {
-                if use_hugepages {
-                    kvm::KtstrKvm::new_with_hugepages(self.topology, mib, self.performance_mode)
-                        .context("create VM with hugepages")?
-                } else {
-                    kvm::KtstrKvm::new(self.topology, mib, self.performance_mode)
-                        .context("create VM")?
-                }
-            }
-            None => {
-                kvm::KtstrKvm::new_deferred(self.topology, use_hugepages, self.performance_mode)
-                    .context("create VM (deferred memory)")?
-            }
+            // Performance-mode hugepages are opportunistic. The allocator
+            // serializes its free-count check with MAP_HUGETLB so a process
+            // storm cannot all spend the same observed pool. Passing the
+            // explicit-hugepage bit here would bypass that distinction and
+            // turn a racy pre-check into a strict no-fallback request.
+            Some(mib) => kvm::KtstrKvm::new(self.topology, mib, self.performance_mode)
+                .context("create VM")?,
+            None => kvm::KtstrKvm::new_deferred(self.topology, false, self.performance_mode)
+                .context("create VM (deferred memory)")?,
         };
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "kvm_create");
 
@@ -1182,8 +1174,7 @@ impl KtstrVm {
                     &merged_includes,
                     busybox_bytes.as_deref(),
                 )?;
-                let key = inputs.key().clone();
-                get_or_prepare_base(&key, compression, || inputs.build())
+                get_or_prepare_base(inputs, compression)
             })
             .context("spawn initramfs-resolve thread")?;
         Ok(Some(handle))

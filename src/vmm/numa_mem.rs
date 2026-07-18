@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use std::os::fd::OwnedFd;
+use std::path::{Path, PathBuf};
 use vm_memory::mmap::{GuestRegionMmap, MmapRegion};
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
 
@@ -36,6 +38,53 @@ pub(crate) struct AllocatedMemory {
 pub(crate) enum MemoryBacking {
     BasePages,
     HugeTlb2M,
+}
+
+const HUGEPAGE_ALLOCATION_LOCK: &str = "ktstr-hugepage-allocation-v1.lock";
+
+fn hugepage_allocation_lock_path() -> PathBuf {
+    crate::cache::resolve_lock_dir().join(HUGEPAGE_ALLOCATION_LOCK)
+}
+
+fn acquire_hugepage_allocation_lock_at(path: &Path) -> Result<OwnedFd> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "create hugepage allocation lock directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    crate::flock::block_flock(path, crate::flock::FlockMode::Exclusive)
+        .with_context(|| format!("lock hugepage allocation transaction {}", path.display()))
+}
+
+fn acquire_hugepage_allocation_lock() -> Result<OwnedFd> {
+    acquire_hugepage_allocation_lock_at(&hugepage_allocation_lock_path())
+}
+
+#[derive(Debug)]
+struct HugepageReservationUnavailable {
+    operation: String,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for HugepageReservationUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.operation, self.source)
+    }
+}
+
+impl std::error::Error for HugepageReservationUnavailable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+struct MappedReservation {
+    guard: ReservationGuard,
+    base: *mut libc::c_void,
+    va_spans: Vec<usize>,
 }
 
 /// Per-NUMA-node guest physical address range.
@@ -211,13 +260,18 @@ impl NumaMemoryLayout {
         use_hugepages: bool,
         performance_mode: bool,
         hugepages_free: u64,
-    ) -> MemoryBacking {
+    ) -> Result<MemoryBacking> {
+        anyhow::ensure!(
+            !use_hugepages || self.hugetlb_compatible(),
+            "explicit hugepage backing requires every internal NUMA boundary \
+             to be 2 MiB-aligned"
+        );
         if self.hugetlb_compatible()
             && (use_hugepages || (performance_mode && hugepages_free >= self.hugepages_needed()))
         {
-            MemoryBacking::HugeTlb2M
+            Ok(MemoryBacking::HugeTlb2M)
         } else {
-            MemoryBacking::BasePages
+            Ok(MemoryBacking::BasePages)
         }
     }
 
@@ -418,59 +472,105 @@ impl NumaMemoryLayout {
         use_hugepages: bool,
         performance_mode: bool,
     ) -> Result<AllocatedMemory> {
-        // Gate hugepages on what the per-node mmaps will actually
-        // reserve: each node's MAP_HUGETLB span is round_up(region.size,
-        // 2 MiB), so the count is the sum of per-region div_ceil, not
-        // div_ceil(total_mib). They coincide for the snapped even-split
-        // path, but a with_nodes topology with multiple non-2 MiB nodes
-        // reserves more (per-region rounding), so gating on the global
-        // total would under-count and let a MAP_HUGETLB mmap fail on a
-        // short pool (it routes to a clean contention SKIP, but the gate
-        // should be accurate).
-        let backing = self.choose_memory_backing(
-            use_hugepages,
-            performance_mode,
-            super::host_topology::hugepages_free(),
-        );
-        let use_hugepages = backing == MemoryBacking::HugeTlb2M;
+        let hugetlb_compatible = self.hugetlb_compatible();
+        self.choose_memory_backing(use_hugepages, false, 0)?;
+        let opportunistic_hugepages = !use_hugepages && performance_mode && hugetlb_compatible;
 
-        // Hugepage host-VA layout. MAP_HUGETLB | MAP_FIXED rejects
-        // (EINVAL, fs/hugetlbfs/inode.c hugetlb_get_unmapped_area) any
-        // mapping whose ADDR is not 2 MiB-aligned, so every per-node
-        // MAP_FIXED base must land on a 2 MiB boundary. The kernel
-        // auto-rounds the anonymous MAP_HUGETLB mmap LENGTH up, but a
-        // cumulative base only stays aligned if each node's VA span is a
-        // 2 MiB multiple -- so the host-VA layout is rounded up per node
-        // and the reservation base is 2 MiB-aligned. The KVM slot
-        // memory_size + the MmapRegion keep the exact region.size, so the
-        // guest topology is unchanged: a rounded tail is mapped-but-
-        // unregistered (KVM permits a userspace mapping larger than
-        // memory_size -- virt/kvm/kvm_main.c access_ok spans only
-        // memory_size). For the snapped even-split path region.size is
-        // already a 2 MiB multiple so the round is a no-op. A caller-
-        // caller-declared internal GPA boundary that is not 2 MiB aligned
-        // selects base-page backing above. That preserves the exact topology
-        // and lets the direct-initrd loader split on host pages; an explicit
-        // hugetlb VMA could only be replaced on a 2 MiB boundary. An odd final
-        // tail remains compatible because it creates no later boundary.
-        // Base pages need no host-VA span rounding (align 1).
+        // Serialize the free-count decision with the actual MAP_HUGETLB
+        // reservation. The lock is held only during memory allocation, never
+        // for the VM lifetime: once the VMAs exist the kernel has already
+        // deducted those pages and the next process observes the new count.
+        let (mapped, backing) = if use_hugepages || opportunistic_hugepages {
+            let allocation_lock = acquire_hugepage_allocation_lock()?;
+            let desired_backing = self.choose_memory_backing(
+                use_hugepages,
+                performance_mode,
+                super::host_topology::hugepages_free(),
+            )?;
+            if desired_backing == MemoryBacking::HugeTlb2M {
+                match self.map_reservation(true) {
+                    Ok(mapped) => {
+                        drop(allocation_lock);
+                        (mapped, MemoryBacking::HugeTlb2M)
+                    }
+                    Err(error)
+                        if opportunistic_hugepages
+                            && error
+                                .downcast_ref::<HugepageReservationUnavailable>()
+                                .is_some() =>
+                    {
+                        // A non-ktstr consumer can still spend pages without
+                        // taking our advisory lock. The failed attempt owns no
+                        // KVM slots and its ReservationGuard has already
+                        // unmapped every partial VMA, so retrying with base
+                        // pages is exact and retains the same direct-COW loader.
+                        tracing::debug!(
+                            %error,
+                            "opportunistic hugepage reservation lost to an external consumer; \
+                             retrying with base-page backing"
+                        );
+                        drop(allocation_lock);
+                        (self.map_reservation(false)?, MemoryBacking::BasePages)
+                    }
+                    Err(error) => {
+                        if use_hugepages
+                            && let Some(unavailable) =
+                                error.downcast_ref::<HugepageReservationUnavailable>()
+                        {
+                            let errno = unavailable.source.raw_os_error().unwrap_or(libc::ENOMEM);
+                            return Err(super::map_transient_to_contention(
+                                kvm_ioctls::Error::new(errno),
+                                unavailable.operation.clone(),
+                            ));
+                        }
+                        return Err(error);
+                    }
+                }
+            } else {
+                drop(allocation_lock);
+                (self.map_reservation(false)?, MemoryBacking::BasePages)
+            }
+        } else {
+            (self.map_reservation(false)?, MemoryBacking::BasePages)
+        };
+
+        // Register only after every host VMA has been allocated. A failed
+        // opportunistic hugepage attempt can therefore be dropped and retried
+        // without leaving partially registered KVM memory slots behind.
+        let guest_regions = self.register_mapped_regions(vm_fd, mapped.base, &mapped.va_spans)?;
+        let guest_mem = GuestMemoryMmap::from_regions(guest_regions)
+            .context("create multi-region GuestMemoryMmap")?;
+
+        Ok(AllocatedMemory {
+            guest_mem,
+            reservation: mapped.guard,
+            backing,
+        })
+    }
+
+    /// Reserve one contiguous host-VA span and install every per-node mapping.
+    /// No KVM slot is registered until all mmaps succeed, so an opportunistic
+    /// hugetlb failure can drop this value and retry with base pages without
+    /// leaving any kernel-visible partial state.
+    fn map_reservation(&self, use_hugepages: bool) -> Result<MappedReservation> {
         const HUGE_2MB: usize = 2 * 1024 * 1024;
         let va_align = if use_hugepages { HUGE_2MB } else { 1 };
-        let round_up = |n: usize| (n + va_align - 1) & !(va_align - 1);
-        // Per-node host-VA span: hugepage-rounded when hugepages are
-        // used, exact otherwise. Drives the MAP_FIXED layout only; the
-        // KVM/MmapRegion sizes below stay at the exact region.size.
+        let round_up = |value: usize| {
+            value
+                .checked_add(va_align - 1)
+                .map(|value| value & !(va_align - 1))
+                .context("NUMA host-VA span overflow")
+        };
         let va_spans: Vec<usize> = self
             .regions
             .iter()
-            .map(|r| round_up(r.size as usize))
-            .collect();
-        // Over-reserve by one alignment unit so the reservation base
-        // (a NULL-addr mmap is only PAGE_SIZE-aligned) can be rounded up
-        // to a 2 MiB boundary without spilling past the reservation end.
-        let reserve_size: usize = va_spans.iter().sum::<usize>() + (va_align - 1);
-
-        // Step 1: Reserve contiguous VA with PROT_NONE.
+            .map(|region| round_up(region.size as usize))
+            .collect::<Result<_>>()?;
+        let reserve_size = va_spans.iter().try_fold(va_align - 1, |total, span| {
+            total
+                .checked_add(*span)
+                .context("NUMA reservation overflow")
+        })?;
         let reservation = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -482,69 +582,18 @@ impl NumaMemoryLayout {
             )
         };
         if reservation == libc::MAP_FAILED {
-            // mmap can fail with the same host-resource errnos that
-            // [`super::map_transient_to_contention`] classifies — most
-            // commonly ENOMEM under host memory pressure when a peer is
-            // holding the GuestMemoryMmap budget. Routing through the
-            // classifier turns those into a SKIP banner instead of a
-            // hard test failure; non-transient errnos flow through
-            // unchanged so a real bug never gets misclassified.
-            let io_err = std::io::Error::last_os_error();
-            let errno = io_err.raw_os_error().unwrap_or(0);
+            let io_error = std::io::Error::last_os_error();
+            let errno = io_error.raw_os_error().unwrap_or(0);
             return Err(super::map_transient_to_contention(
                 kvm_ioctls::Error::new(errno),
-                format!("mmap VA reservation ({} bytes) failed", reserve_size),
+                format!("mmap VA reservation ({reserve_size} bytes) failed"),
             ));
         }
-
         let guard = ReservationGuard {
             addr: reservation,
             size: reserve_size,
         };
-
-        // 2 MiB-align the layout base within the over-reserved span when
-        // using hugepages (no-op for base pages: va_align == 1).
-        let base = round_up(reservation as usize) as *mut libc::c_void;
-
-        // Per-node MAP_FIXED into the reservation + KVM slot registration.
-        // `guard` is held here across the call, so the reservation backing
-        // every sub-mapping outlives the loop; it is moved into the
-        // returned `AllocatedMemory` on success.
-        let guest_regions = self.map_and_register_regions(vm_fd, base, &va_spans, use_hugepages)?;
-
-        // Step 6: Build multi-region GuestMemoryMmap.
-        let guest_mem = GuestMemoryMmap::from_regions(guest_regions)
-            .context("create multi-region GuestMemoryMmap")?;
-
-        Ok(AllocatedMemory {
-            guest_mem,
-            reservation: guard,
-            backing,
-        })
-    }
-
-    /// MAP_FIXED each node into the VA reservation at `base` and register
-    /// its KVM memory slot, returning the per-node `GuestRegionMmap`s.
-    ///
-    /// `base` must point into a PROT_NONE reservation (owned by the
-    /// caller's `ReservationGuard`) that stays mapped for the whole call
-    /// and is at least `sum(va_spans) + (va_align - 1)` bytes; `va_spans`
-    /// is per-node host-VA span (hugepage-rounded when `use_hugepages`)
-    /// and must have one entry per `self.regions` entry in order.
-    ///
-    /// SAFETY: each `libc::mmap(MAP_FIXED)` writes within the caller's
-    /// reservation (packed offsets sum to <= the reservation size); the
-    /// resulting pointers are passed to `MmapRegion::build_raw` (owned=
-    /// false, so Drop is a no-op) and to KVM, all within the reservation's
-    /// lifetime guaranteed by the caller holding the guard across the call.
-    fn map_and_register_regions(
-        &self,
-        vm_fd: &kvm_ioctls::VmFd,
-        base: *mut libc::c_void,
-        va_spans: &[usize],
-        use_hugepages: bool,
-    ) -> Result<Vec<GuestRegionMmap>> {
-        let mut guest_regions: Vec<GuestRegionMmap> = Vec::with_capacity(self.regions.len());
+        let base = round_up(reservation as usize)? as *mut libc::c_void;
 
         // Host VA is PACKED (gap-free): the reservation is sum-of-sizes,
         // so each region's VA offset is the running cumulative size, NOT
@@ -556,14 +605,12 @@ impl NumaMemoryLayout {
         let mut va_offset = 0usize;
         for (i, region) in self.regions.iter().enumerate() {
             let offset = va_offset;
-            // va_span drives the host-VA layout (hugepage-rounded);
-            // node_size is the exact size for the KVM slot + MmapRegion.
             let va_span = va_spans[i];
-            let node_size = region.size as usize;
-            va_offset += va_span;
+            va_offset = va_offset
+                .checked_add(va_span)
+                .context("NUMA mapped host-VA offset overflow")?;
             let node_addr = unsafe { (base as *mut u8).add(offset) as *mut libc::c_void };
 
-            // Step 2: Per-node MAP_FIXED mmap.
             let mut flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED;
             if use_hugepages {
                 flags |= libc::MAP_HUGETLB | libc::MAP_HUGE_2MB;
@@ -580,20 +627,21 @@ impl NumaMemoryLayout {
                 )
             };
             if node_ptr == libc::MAP_FAILED {
-                // mmap can fail with the same host-resource errnos that
-                // [`super::map_transient_to_contention`] classifies —
-                // most commonly ENOMEM (or EAGAIN under MAP_HUGETLB
-                // when 2MiB pages are exhausted). Route through the
-                // classifier so transient host pressure SKIPs cleanly
-                // instead of failing the test as a hard fault.
-                let io_err = std::io::Error::last_os_error();
-                let errno = io_err.raw_os_error().unwrap_or(0);
+                let io_error = std::io::Error::last_os_error();
+                let errno = io_error.raw_os_error().unwrap_or(0);
+                let operation = format!(
+                    "MAP_FIXED mmap for node {} ({} bytes) failed",
+                    region.node_id, va_span
+                );
+                if use_hugepages && matches!(errno, libc::ENOMEM | libc::EAGAIN | libc::ENOSPC) {
+                    return Err(anyhow::Error::new(HugepageReservationUnavailable {
+                        operation,
+                        source: io_error,
+                    }));
+                }
                 return Err(super::map_transient_to_contention(
                     kvm_ioctls::Error::new(errno),
-                    format!(
-                        "MAP_FIXED mmap for node {} ({} bytes) failed",
-                        region.node_id, va_span
-                    ),
+                    operation,
                 ));
             }
 
@@ -623,11 +671,37 @@ impl NumaMemoryLayout {
                     libc::madvise(node_ptr, va_span, libc::MADV_HUGEPAGE);
                 }
             }
+        }
+
+        Ok(MappedReservation {
+            guard,
+            base,
+            va_spans,
+        })
+    }
+
+    /// Wrap a fully mapped reservation as `vm-memory` regions and publish all
+    /// KVM memory slots. `base` and `va_spans` come from
+    /// [`Self::map_reservation`] and remain owned by its guard.
+    fn register_mapped_regions(
+        &self,
+        vm_fd: &kvm_ioctls::VmFd,
+        base: *mut libc::c_void,
+        va_spans: &[usize],
+    ) -> Result<Vec<GuestRegionMmap>> {
+        let mut guest_regions = Vec::with_capacity(self.regions.len());
+        let mut va_offset = 0usize;
+        for (index, region) in self.regions.iter().enumerate() {
+            let node_addr = unsafe { (base as *mut u8).add(va_offset) };
+            va_offset = va_offset
+                .checked_add(va_spans[index])
+                .context("NUMA registration host-VA offset overflow")?;
+            let node_size = region.size as usize;
 
             // Step 5: Wrap as vm-memory types. build_raw sets owned=false.
             let mmap_region = unsafe {
                 MmapRegion::build_raw(
-                    node_ptr as *mut u8,
+                    node_addr,
                     node_size,
                     libc::PROT_READ | libc::PROT_WRITE,
                     libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
@@ -669,7 +743,7 @@ impl NumaMemoryLayout {
                 slot: region.slot,
                 guest_phys_addr: region.gpa_start,
                 memory_size: region.size,
-                userspace_addr: node_ptr as u64,
+                userspace_addr: node_addr as u64,
                 flags: 0,
             };
             unsafe {
@@ -1161,6 +1235,135 @@ mod tests {
 
     static ODD_NODES: [NumaNode; 2] = [NumaNode::new(2, 33), NumaNode::new(2, 33)];
 
+    const HUGEPAGE_LOCK_CHILD_TEST: &str =
+        "vmm::numa_mem::tests::hugepage_allocation_lock_cross_process_child";
+    const HUGEPAGE_LOCK_CHILD_ROOT: &str = "KTSTR_HUGEPAGE_LOCK_CHILD_ROOT";
+    const HUGEPAGE_LOCK_CHILD_INDEX: &str = "KTSTR_HUGEPAGE_LOCK_CHILD_INDEX";
+
+    #[test]
+    fn hugepage_allocation_lock_cross_process_child() {
+        let Some(root) = std::env::var_os(HUGEPAGE_LOCK_CHILD_ROOT).map(PathBuf::from) else {
+            return;
+        };
+        let index = std::env::var(HUGEPAGE_LOCK_CHILD_INDEX).unwrap();
+        std::fs::write(root.join("ready").join(&index), b"ready").unwrap();
+
+        let _transaction =
+            acquire_hugepage_allocation_lock_at(&root.join("hugepage-allocation.lock")).unwrap();
+        let active = root.join("active-transaction");
+        let _active = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&active)
+            .expect("two processes entered the hugepage allocation transaction together");
+        // Keep the critical section open long enough that a missing
+        // cross-process flock cannot pass merely because the children happened
+        // to be scheduled one at a time.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let budget_path = root.join("free-pages");
+        let available: u64 = std::fs::read_to_string(&budget_path)
+            .unwrap()
+            .parse()
+            .unwrap();
+        if available >= 64 {
+            std::fs::write(&budget_path, b"0").unwrap();
+            std::fs::write(root.join("winner"), index).unwrap();
+        }
+        std::fs::remove_file(active).unwrap();
+    }
+
+    #[test]
+    fn opportunistic_hugepage_budget_is_spent_once_under_52_process_contention() {
+        const CONTENDERS: usize = 52;
+        const RESERVATION_PAGES: u64 = 64;
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join("hugepage-allocation.lock");
+        std::fs::create_dir(temp.path().join("ready")).unwrap();
+        std::fs::write(
+            temp.path().join("free-pages"),
+            RESERVATION_PAGES.to_string(),
+        )
+        .unwrap();
+        // Queue every child behind an actual process-shared lock before
+        // releasing the herd, so the test exercises one observed budget with
+        // the same check -> mmap transaction ordering as production.
+        let parent_transaction = acquire_hugepage_allocation_lock_at(&lock_path).unwrap();
+
+        struct Children(Vec<std::process::Child>);
+        impl Drop for Children {
+            fn drop(&mut self) {
+                for child in &mut self.0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        let mut children = Children(Vec::with_capacity(CONTENDERS));
+        for index in 0..CONTENDERS {
+            children.0.push(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("--exact")
+                    .arg(HUGEPAGE_LOCK_CHILD_TEST)
+                    .arg("--nocapture")
+                    .arg("--test-threads=1")
+                    .env(HUGEPAGE_LOCK_CHILD_ROOT, temp.path())
+                    .env(HUGEPAGE_LOCK_CHILD_INDEX, index.to_string())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let ready = std::fs::read_dir(temp.path().join("ready"))
+                .unwrap()
+                .count();
+            if ready == CONTENDERS {
+                break;
+            }
+            for child in &mut children.0 {
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("hugepage lock child exited before release with {status}");
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {ready}/{CONTENDERS} hugepage lock children reached the barrier"
+            );
+            std::thread::yield_now();
+        }
+        drop(parent_transaction);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        for child in &mut children.0 {
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "hugepage lock child failed with {status}");
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "hugepage lock process storm did not drain"
+                );
+                std::thread::yield_now();
+            }
+        }
+        children.0.clear();
+
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("free-pages")).unwrap(),
+            "0"
+        );
+        assert!(
+            temp.path().join("winner").exists(),
+            "exactly one process must spend the shared hugepage budget"
+        );
+    }
+
     #[test]
     fn custom_odd_internal_boundary_selects_base_page_backing() {
         let topo = Topology::with_nodes(4, 2, &ODD_NODES);
@@ -1169,8 +1372,12 @@ mod tests {
         assert_eq!(layout.regions()[1].size, 33 << 20);
         assert_eq!(layout.regions()[1].gpa_start, 33 << 20);
         assert_eq!(
-            layout.choose_memory_backing(true, true, u64::MAX),
+            layout.choose_memory_backing(false, true, u64::MAX).unwrap(),
             MemoryBacking::BasePages
+        );
+        assert!(
+            layout.choose_memory_backing(true, true, u64::MAX).is_err(),
+            "an explicit hugepage request must not silently fall back"
         );
     }
 
@@ -1187,7 +1394,7 @@ mod tests {
             vec![34, 34, 33]
         );
         assert_eq!(
-            layout.choose_memory_backing(true, false, 0),
+            layout.choose_memory_backing(true, false, 0).unwrap(),
             MemoryBacking::HugeTlb2M
         );
     }

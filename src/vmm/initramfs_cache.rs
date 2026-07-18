@@ -386,7 +386,7 @@ impl AsRef<[u8]> for BaseRef {
 // The production prepared-initrd CAS lives alongside a cfg(test)-only
 // compatibility cache for older base/suffix fixtures.
 
-const PREPARED_CAS_SCHEMA: u32 = 4;
+const PREPARED_CAS_SCHEMA: u32 = 5;
 const PREPARED_CAS_MAGIC: &[u8; 8] = b"KTSTRIR\0";
 const PREPARED_CAS_HEADER_LEN: usize = 128;
 const PREPARED_CAS_MAX_BYTES: u64 = 8 << 30;
@@ -402,12 +402,12 @@ const CLOSURE_RECORD_HEADER_LEN: usize = 40;
 // binaries do not participate in the namespace-gate protocol below; keeping
 // their objects, memos, and locks in separate directories prevents an old GC
 // from unlinking a live object coordinated by this version's lock inode.
-const PREPARED_OBJECTS_DIR: &str = "prepared-initrd-v4-objects";
-const PREPARED_LOCKS_DIR: &str = ".prepared-initrd-v4-locks";
-const PREPARED_DIGESTS_DIR: &str = "prepared-initrd-v4-digests";
-const PREPARED_PROBES_DIR: &str = "prepared-initrd-v4-probes";
-const PREPARED_CLOSURES_DIR: &str = "prepared-initrd-v4-closures";
-const PREPARED_GC_STAMP: &str = ".prepared-initrd-v4-gc-stamp";
+const PREPARED_OBJECTS_DIR: &str = "prepared-initrd-v5-objects";
+const PREPARED_LOCKS_DIR: &str = ".prepared-initrd-v5-locks";
+const PREPARED_DIGESTS_DIR: &str = "prepared-initrd-v5-digests";
+const PREPARED_PROBES_DIR: &str = "prepared-initrd-v5-probes";
+const PREPARED_CLOSURES_DIR: &str = "prepared-initrd-v5-closures";
+const PREPARED_GC_STAMP: &str = ".prepared-initrd-v5-gc-stamp";
 const PREPARED_NAMESPACE_GATE: &str = "namespace-v1.lock";
 const PREPARED_GC_LOCK: &str = "gc.lock";
 /// Uniform direct-map granule. It is host-page aligned on every supported
@@ -592,6 +592,17 @@ impl StableFileIdentity {
         }
     }
 
+    /// Compare the byte version behind an already-open fd. Replacing or
+    /// unlinking its pathname updates ctime but cannot alter the pinned
+    /// contents; size and mtime still reject ordinary in-place mutation.
+    fn same_open_content_version(self, other: Self) -> bool {
+        self.dev == other.dev
+            && self.ino == other.ino
+            && self.size == other.size
+            && self.mtime_secs == other.mtime_secs
+            && self.mtime_nsecs == other.mtime_nsecs
+    }
+
     fn hash_into(self, hasher: &mut AHasher) {
         hash_u64(hasher, self.dev);
         hash_u64(hasher, self.ino);
@@ -646,7 +657,7 @@ impl PinnedInput {
     fn verify_unchanged(&self) -> Result<()> {
         let after = StableFileIdentity::from_file(&self.file)?;
         anyhow::ensure!(
-            after == self.identity,
+            after.same_open_content_version(self.identity),
             "prepared initrd input changed while in use: {}",
             self.display_path.display()
         );
@@ -726,11 +737,12 @@ fn open_namespace_gate(root: &Path) -> Result<File> {
 
 /// A per-key coordination inode opened while holding the namespace gate.
 ///
-/// The shared namespace lock remains held until this file successfully takes
-/// either its exclusive builder lock or shared waiter lock. GC takes the
-/// namespace lock exclusively before unlinking idle per-key files, closing
-/// the otherwise unavoidable open-before-flock race where a waiter could lock
-/// an already-unlinked inode while a new builder creates a replacement inode.
+/// The shared namespace lock remains held until the caller explicitly releases
+/// it or this value drops. Memo paths release it once the per-key lock protects
+/// their record; prepared-object paths retain it through object LOCK_SH. GC
+/// takes the namespace lock exclusively before unlinking idle per-key files,
+/// closing both the open-before-flock race and the per-key-to-object lock-order
+/// inversion.
 struct CoordinationFile {
     file: File,
     namespace_gate: Option<File>,
@@ -738,22 +750,30 @@ struct CoordinationFile {
 
 impl CoordinationFile {
     fn try_lock_exclusive(&mut self) -> rustix::io::Result<()> {
-        let result = rustix::fs::flock(
+        rustix::fs::flock(
             &self.file,
             rustix::fs::FlockOperation::NonBlockingLockExclusive,
-        );
-        if result.is_ok() {
-            self.namespace_gate.take();
-        }
-        result
+        )
     }
 
     fn lock_shared(&mut self) -> rustix::io::Result<()> {
-        let result = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::LockShared);
-        if result.is_ok() {
-            self.namespace_gate.take();
-        }
-        result
+        rustix::fs::flock(&self.file, rustix::fs::FlockOperation::LockShared)
+    }
+
+    /// Join the successor queue after a builder disappeared without
+    /// publishing. Unlike repeatedly probing `LOCK_EX` and falling back to
+    /// `LOCK_SH`, a blocking exclusive request gives the kernel a real writer
+    /// to wake and cannot be starved by a herd continuously overlapping shared
+    /// locks.
+    fn lock_exclusive(&mut self) -> rustix::io::Result<()> {
+        rustix::fs::flock(&self.file, rustix::fs::FlockOperation::LockExclusive)
+    }
+
+    /// Release the namespace gate after the protected inode chain has become
+    /// self-sufficient. Memo records need only the per-key lock; prepared
+    /// objects retain the gate until their immutable inode has taken LOCK_SH.
+    fn release_namespace_gate(&mut self) {
+        self.namespace_gate.take();
     }
 }
 
@@ -770,7 +790,10 @@ fn open_coord_file(root: &Path, path: &Path) -> Result<CoordinationFile> {
 
 fn hash_pinned_file(file: &File, identity: StableFileIdentity) -> Result<u64> {
     let before = StableFileIdentity::from_file(file)?;
-    anyhow::ensure!(before == identity, "pinned input changed before hashing");
+    anyhow::ensure!(
+        before.same_open_content_version(identity),
+        "pinned input changed before hashing"
+    );
     // Never mmap a mutable input here: a concurrent in-place truncate can
     // SIGBUS an mmap reader before the post-stat check gets a chance to turn
     // the mutation into a normal error. Exactly one elected process performs
@@ -795,7 +818,7 @@ fn hash_pinned_file(file: &File, identity: StableFileIdentity) -> Result<u64> {
     let digest = hasher.finish();
     let after = StableFileIdentity::from_file(file)?;
     anyhow::ensure!(
-        after == identity,
+        after.same_open_content_version(identity),
         "pinned input changed while hashing its content"
     );
     Ok(digest)
@@ -867,10 +890,17 @@ fn cached_file_digest(root: &Path, file: &File, identity: StableFileIdentity) ->
     let lock_path = root
         .join(PREPARED_LOCKS_DIR)
         .join(format!("digest-{identity_key:016x}.lock"));
+    let mut wait_for_successor = false;
     loop {
         let mut coordination = open_coord_file(root, &lock_path)?;
-        match coordination.try_lock_exclusive() {
+        let election = if wait_for_successor {
+            coordination.lock_exclusive()
+        } else {
+            coordination.try_lock_exclusive()
+        };
+        match election {
             Ok(()) => {
+                coordination.release_namespace_gate();
                 if let Some(digest) = read_file_digest_record(&record_path, identity)? {
                     return Ok(digest);
                 }
@@ -907,9 +937,11 @@ fn cached_file_digest(root: &Path, file: &File, identity: StableFileIdentity) ->
                 coordination
                     .lock_shared()
                     .with_context(|| format!("wait for file digest {}", record_path.display()))?;
+                coordination.release_namespace_gate();
                 if let Some(digest) = read_file_digest_record(&record_path, identity)? {
                     return Ok(digest);
                 }
+                wait_for_successor = true;
             }
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -1035,10 +1067,17 @@ fn cached_coverage_probe(root: &Path, payload: &PinnedInput) -> Result<(bool, u6
     let lock_path = root
         .join(PREPARED_LOCKS_DIR)
         .join(format!("coverage-{key:016x}.lock"));
+    let mut wait_for_successor = false;
     loop {
         let mut coordination = open_coord_file(root, &lock_path)?;
-        match coordination.try_lock_exclusive() {
+        let election = if wait_for_successor {
+            coordination.lock_exclusive()
+        } else {
+            coordination.try_lock_exclusive()
+        };
+        match election {
             Ok(()) => {
+                coordination.release_namespace_gate();
                 if let Some(result) = read_coverage_probe_record(&record_path, key)? {
                     return Ok(result);
                 }
@@ -1074,9 +1113,11 @@ fn cached_coverage_probe(root: &Path, payload: &PinnedInput) -> Result<(bool, u6
                 coordination.lock_shared().with_context(|| {
                     format!("wait for coverage probe {}", record_path.display())
                 })?;
+                coordination.release_namespace_gate();
                 if let Some(result) = read_coverage_probe_record(&record_path, key)? {
                     return Ok(result);
                 }
+                wait_for_successor = true;
             }
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -1546,10 +1587,17 @@ fn get_or_resolve_pinned_closure(
     let lock_path = root
         .join(PREPARED_LOCKS_DIR)
         .join(format!("closure-{key:016x}.lock"));
+    let mut wait_for_successor = false;
     loop {
         let mut coordination = open_coord_file(root, &lock_path)?;
-        match coordination.try_lock_exclusive() {
+        let election = if wait_for_successor {
+            coordination.lock_exclusive()
+        } else {
+            coordination.try_lock_exclusive()
+        };
+        match election {
             Ok(()) => {
+                coordination.release_namespace_gate();
                 if let Some(closure) = read_pinned_closure_record(&record_path, key)? {
                     return Ok(closure);
                 }
@@ -1570,9 +1618,11 @@ fn get_or_resolve_pinned_closure(
                 coordination.lock_shared().with_context(|| {
                     format!("wait for loader closure {}", record_path.display())
                 })?;
+                coordination.release_namespace_gate();
                 if let Some(closure) = read_pinned_closure_record(&record_path, key)? {
                     return Ok(closure);
                 }
+                wait_for_successor = true;
             }
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -1588,14 +1638,14 @@ struct PreparedObjectHeader {
     kind: PreparedObjectKind,
     compression: initramfs::InitrdCompression,
     key: u64,
-    page_size: u64,
+    mapping_granule: u64,
     payload_len: u64,
     payload_hash: u64,
     part_uncompressed_len: u64,
     part_compressed_len: u64,
     leading_pad: u64,
     stream_offset_mod: u64,
-    reserved_shape: u64,
+    file_alignment: u64,
     parent_key: u64,
     reserved_len: u64,
 }
@@ -1609,14 +1659,14 @@ impl PreparedObjectHeader {
         out.push(compression_tag(self.compression));
         out.extend_from_slice(&[0; 2]);
         out.extend_from_slice(&self.key.to_le_bytes());
-        out.extend_from_slice(&self.page_size.to_le_bytes());
+        out.extend_from_slice(&self.mapping_granule.to_le_bytes());
         out.extend_from_slice(&self.payload_len.to_le_bytes());
         out.extend_from_slice(&self.payload_hash.to_le_bytes());
         out.extend_from_slice(&self.part_uncompressed_len.to_le_bytes());
         out.extend_from_slice(&self.part_compressed_len.to_le_bytes());
         out.extend_from_slice(&self.leading_pad.to_le_bytes());
         out.extend_from_slice(&self.stream_offset_mod.to_le_bytes());
-        out.extend_from_slice(&self.reserved_shape.to_le_bytes());
+        out.extend_from_slice(&self.file_alignment.to_le_bytes());
         out.extend_from_slice(&self.parent_key.to_le_bytes());
         out.extend_from_slice(&self.reserved_len.to_le_bytes());
         out.resize(PREPARED_CAS_HEADER_LEN, 0);
@@ -1658,37 +1708,45 @@ impl PreparedObjectHeader {
             kind: PreparedObjectKind::from_tag(bytes[12])?,
             compression: compression_from_tag(bytes[13])?,
             key: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
-            page_size: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+            mapping_granule: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
             payload_len: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
             payload_hash: u64::from_le_bytes(bytes[40..48].try_into().unwrap()),
             part_uncompressed_len: u64::from_le_bytes(bytes[48..56].try_into().unwrap()),
             part_compressed_len: u64::from_le_bytes(bytes[56..64].try_into().unwrap()),
             leading_pad: u64::from_le_bytes(bytes[64..72].try_into().unwrap()),
             stream_offset_mod: u64::from_le_bytes(bytes[72..80].try_into().unwrap()),
-            reserved_shape: u64::from_le_bytes(bytes[80..88].try_into().unwrap()),
+            file_alignment: u64::from_le_bytes(bytes[80..88].try_into().unwrap()),
             parent_key: u64::from_le_bytes(bytes[88..96].try_into().unwrap()),
             reserved_len: u64::from_le_bytes(bytes[96..104].try_into().unwrap()),
         })
     }
 
     fn validate_shape(self) -> Result<()> {
-        let page = usize::try_from(self.page_size).context("page size exceeds usize")?;
-        anyhow::ensure!(page.is_power_of_two(), "cached page size is invalid");
+        let granule =
+            usize::try_from(self.mapping_granule).context("mapping granule exceeds usize")?;
         anyhow::ensure!(
-            page >= PREPARED_CAS_HEADER_LEN,
-            "cached mapping granule is smaller than the header"
+            granule.is_power_of_two(),
+            "cached mapping granule is invalid"
+        );
+        let file_alignment =
+            usize::try_from(self.file_alignment).context("file alignment exceeds usize")?;
+        anyhow::ensure!(
+            file_alignment.is_power_of_two()
+                && file_alignment >= PREPARED_CAS_HEADER_LEN
+                && granule.is_multiple_of(file_alignment),
+            "cached prepared-object file alignment is incompatible with its mapping granule"
         );
         let leading =
             usize::try_from(self.leading_pad).context("part leading pad exceeds usize")?;
         let compressed =
             usize::try_from(self.part_compressed_len).context("part length exceeds usize")?;
         anyhow::ensure!(
-            leading < page && self.stream_offset_mod == self.leading_pad,
+            leading < file_alignment && self.stream_offset_mod == self.leading_pad,
             "cached part leading-pad geometry is inconsistent"
         );
         anyhow::ensure!(
-            self.reserved_shape == 0 && self.reserved_len == 0,
-            "cached prepared object reserved shape fields changed"
+            self.reserved_len == 0,
+            "cached prepared object reserved length changed"
         );
 
         match self.kind {
@@ -1718,8 +1776,8 @@ impl PreparedObjectHeader {
             PreparedObjectKind::Stitch => {
                 anyhow::ensure!(
                     leading == 0
-                        && self.payload_len == self.page_size
-                        && self.part_compressed_len == self.page_size
+                        && self.payload_len == self.mapping_granule
+                        && self.part_compressed_len == self.mapping_granule
                         && self.part_uncompressed_len == 0,
                     "stitch object must contain exactly one page"
                 );
@@ -1734,7 +1792,8 @@ struct PreparedObjectExpectation {
     kind: PreparedObjectKind,
     compression: initramfs::InitrdCompression,
     key: u64,
-    page_size: u64,
+    mapping_granule: u64,
+    file_alignment: u64,
     leading_pad: Option<u64>,
     parent_key: Option<u64>,
 }
@@ -1748,8 +1807,12 @@ impl PreparedObjectExpectation {
         );
         anyhow::ensure!(header.key == self.key, "prepared object key mismatch");
         anyhow::ensure!(
-            header.page_size == self.page_size,
-            "prepared object page-size mismatch"
+            header.mapping_granule == self.mapping_granule,
+            "prepared object mapping-granule mismatch"
+        );
+        anyhow::ensure!(
+            header.file_alignment == self.file_alignment,
+            "prepared object file-alignment mismatch"
         );
         if let Some(expected) = self.leading_pad {
             anyhow::ensure!(
@@ -1855,8 +1918,8 @@ fn validate_open_prepared_object(
         .with_context(|| format!("lock prepared initrd object {}", path.display()))?;
     let header = read_header_at(&file)?;
     expected.validate(header)?;
-    let data_offset =
-        usize::try_from(header.page_size).context("prepared object data offset exceeds usize")?;
+    let data_offset = usize::try_from(header.file_alignment)
+        .context("prepared object data offset exceeds usize")?;
     anyhow::ensure!(
         data_offset >= PREPARED_CAS_HEADER_LEN,
         "host page is too small for prepared object header"
@@ -1882,8 +1945,38 @@ fn validate_open_prepared_object(
 }
 
 fn try_open_prepared_object(
+    root: &Path,
     path: &Path,
     expected: PreparedObjectExpectation,
+) -> Result<Option<PreparedObject>> {
+    try_open_prepared_object_with_open_hook(root, path, expected, || {})
+}
+
+fn try_open_prepared_object_with_open_hook(
+    root: &Path,
+    path: &Path,
+    expected: PreparedObjectExpectation,
+    after_open: impl FnOnce(),
+) -> Result<Option<PreparedObject>> {
+    // Close the object open→LOCK_SH race with GC. GC holds this gate
+    // exclusively while it takes the per-key/object locks and unlinks. Once
+    // validation below acquires object LOCK_SH, that object lock itself
+    // protects the inode and the namespace gate can be released.
+    let namespace_gate = open_namespace_gate(root)?;
+    rustix::fs::flock(&namespace_gate, rustix::fs::FlockOperation::LockShared)
+        .context("lock prepared initrd object namespace")?;
+    let result = try_open_prepared_object_under_namespace(path, expected, after_open);
+    drop(namespace_gate);
+    result
+}
+
+/// Open and lock an object while the caller already holds the namespace gate
+/// shared. Coordination paths use this form to preserve the global lock order:
+/// namespace gate -> per-key coordination -> immutable object.
+fn try_open_prepared_object_under_namespace(
+    path: &Path,
+    expected: PreparedObjectExpectation,
+    after_open: impl FnOnce(),
 ) -> Result<Option<PreparedObject>> {
     let file = match File::open(path) {
         Ok(file) => file,
@@ -1893,6 +1986,7 @@ fn try_open_prepared_object(
                 .with_context(|| format!("open prepared initrd object {}", path.display()));
         }
     };
+    after_open();
     validate_open_prepared_object(path, file, expected).map(Some)
 }
 
@@ -1916,13 +2010,14 @@ fn publish_prepared_object(
         ahash_bytes(&built.payload) == built.header.payload_hash,
         "prepared object builder payload digest mismatch"
     );
-    let page = usize::try_from(built.header.page_size).context("page size exceeds usize")?;
+    let file_alignment =
+        usize::try_from(built.header.file_alignment).context("file alignment exceeds usize")?;
     anyhow::ensure!(
-        page >= PREPARED_CAS_HEADER_LEN && page.is_power_of_two(),
+        file_alignment >= PREPARED_CAS_HEADER_LEN && file_alignment.is_power_of_two(),
         "invalid prepared object data alignment"
     );
-    let padded_payload_len = round_up(built.payload.len(), page)?;
-    let file_len = page
+    let padded_payload_len = round_up(built.payload.len(), file_alignment)?;
+    let file_len = file_alignment
         .checked_add(padded_payload_len)
         .context("prepared object file length overflow")?;
 
@@ -1944,10 +2039,22 @@ fn publish_prepared_object(
     temp.write_all(&built.header.encode())
         .context("write prepared object header")?;
     temp.as_file_mut()
-        .seek(SeekFrom::Start(built.header.page_size))
+        .seek(SeekFrom::Start(built.header.file_alignment))
         .context("seek prepared object payload")?;
-    temp.write_all(&built.payload)
-        .context("write prepared object payload")?;
+    // Preserve complete all-zero host pages as holes. Boundary stitches are
+    // one guest granule wide but commonly contain only a few KiB of a tiny
+    // per-cell tail; eagerly writing the zero suffix made every cell consume
+    // another physical 2 MiB despite those bytes never carrying content.
+    for chunk in built.payload.chunks(file_alignment) {
+        if chunk.iter().all(|byte| *byte == 0) {
+            temp.as_file_mut()
+                .seek(SeekFrom::Current(i64::try_from(chunk.len())?))
+                .context("seek across sparse prepared-object payload page")?;
+        } else {
+            temp.write_all(chunk)
+                .context("write prepared object payload page")?;
+        }
+    }
     temp.as_file()
         .sync_all()
         .context("sync prepared object temp")?;
@@ -1971,6 +2078,20 @@ fn publish_prepared_object(
     Ok(())
 }
 
+#[cfg(test)]
+fn note_prepared_object_waiter_for_test() -> Result<()> {
+    if std::env::var("KTSTR_PREPARED_CHILD_MODE").as_deref() != Ok("wait-killed-builder") {
+        return Ok(());
+    }
+    let ready = std::env::var_os("KTSTR_PREPARED_CHILD_READY")
+        .map(PathBuf::from)
+        .context("waiter child has no ready directory")?;
+    let index = std::env::var("KTSTR_PREPARED_CHILD_INDEX").context("waiter child has no index")?;
+    std::fs::write(ready.join(index), b"waiting")
+        .context("publish prepared-object waiter state")?;
+    Ok(())
+}
+
 fn get_or_build_prepared_object<F>(
     root: &Path,
     expected: PreparedObjectExpectation,
@@ -1980,29 +2101,40 @@ where
     F: FnOnce() -> Result<BuiltPreparedObject>,
 {
     let final_path = prepared_object_path(root, expected.kind, expected.key);
-    if let Some(opened) = try_open_prepared_object(&final_path, expected).with_context(|| {
-        format!(
-            "prepared initrd CAS object is corrupt (refusing copy fallback): {}",
-            final_path.display()
-        )
-    })? {
+    if let Some(opened) =
+        try_open_prepared_object(root, &final_path, expected).with_context(|| {
+            format!(
+                "prepared initrd CAS object is corrupt (refusing copy fallback): {}",
+                final_path.display()
+            )
+        })?
+    {
         return Ok(opened);
     }
 
     let lock_path = prepared_object_lock_path(root, expected.kind, expected.key);
     let mut build = Some(build);
+    let mut wait_for_successor = false;
     loop {
         let mut coordination = open_coord_file(root, &lock_path)?;
-        match coordination.try_lock_exclusive() {
+        let election = if wait_for_successor {
+            coordination.lock_exclusive()
+        } else {
+            coordination.try_lock_exclusive()
+        };
+        match election {
             Ok(()) => {
-                if let Some(opened) =
-                    try_open_prepared_object(&final_path, expected).with_context(|| {
-                        format!(
-                            "prepared initrd CAS object is corrupt (refusing copy fallback): {}",
-                            final_path.display()
-                        )
-                    })?
-                {
+                if let Some(opened) = try_open_prepared_object_under_namespace(
+                    &final_path,
+                    expected,
+                    || {},
+                )
+                .with_context(|| {
+                    format!(
+                        "prepared initrd CAS object is corrupt (refusing copy fallback): {}",
+                        final_path.display()
+                    )
+                })? {
                     return Ok(opened);
                 }
 
@@ -2014,13 +2146,15 @@ where
                     built.header.kind == expected.kind
                         && built.header.compression == expected.compression
                         && built.header.key == expected.key
-                        && built.header.page_size == expected.page_size,
+                        && built.header.mapping_granule == expected.mapping_granule
+                        && built.header.file_alignment == expected.file_alignment,
                     "prepared object builder returned a different recipe"
                 );
                 expected.validate(built.header)?;
                 publish_prepared_object(root, &final_path, &built)?;
-                let mut opened = try_open_prepared_object(&final_path, expected)?
-                    .context("published prepared object disappeared before open")?;
+                let mut opened =
+                    try_open_prepared_object_under_namespace(&final_path, expected, || {})?
+                        .context("published prepared object disappeared before open")?;
                 opened.cache_hit = false;
                 // `opened` takes LOCK_SH on the immutable object before the
                 // coordination EX lock drops. GC takes the same per-key lock
@@ -2029,22 +2163,30 @@ where
                 return Ok(opened);
             }
             Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
+                #[cfg(test)]
+                note_prepared_object_waiter_for_test()?;
                 coordination.lock_shared().with_context(|| {
                     format!("wait for prepared initrd object {}", final_path.display())
                 })?;
-                if let Some(opened) =
-                    try_open_prepared_object(&final_path, expected).with_context(|| {
-                        format!(
-                            "prepared initrd CAS object is corrupt (refusing copy fallback): {}",
-                            final_path.display()
-                        )
-                    })?
-                {
+                if let Some(opened) = try_open_prepared_object_under_namespace(
+                    &final_path,
+                    expected,
+                    || {},
+                )
+                .with_context(|| {
+                    format!(
+                        "prepared initrd CAS object is corrupt (refusing copy fallback): {}",
+                        final_path.display()
+                    )
+                })? {
                     return Ok(opened);
                 }
                 // A killed/failed winner dropped EX without publishing.
                 // Release our shared lock by dropping `coordination`, then
-                // race to elect exactly one successor.
+                // enter the kernel's blocking writer queue. This guarantees
+                // progress even when a large reader herd survived the dead
+                // winner.
+                wait_for_successor = true;
             }
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -2494,11 +2636,25 @@ struct PinnedSuffixInputs {
 }
 
 impl PinnedSuffixInputs {
-    fn pin(root: &Path, params: &initramfs::SuffixParams<'_>) -> Result<Self> {
-        let payload = params
-            .payload
-            .map(|path| pin_input(root, path))
-            .transpose()?;
+    fn pin(
+        root: &Path,
+        params: &initramfs::SuffixParams<'_>,
+        payload: Option<PinnedInput>,
+    ) -> Result<Self> {
+        match (&payload, params.payload) {
+            (Some(pinned), Some(path)) => {
+                anyhow::ensure!(
+                    pinned.display_path == path,
+                    "prepared base payload path changed before initrd completion: {} != {}",
+                    pinned.display_path.display(),
+                    path.display()
+                );
+            }
+            (None, None) => {}
+            _ => anyhow::bail!(
+                "prepared base and suffix disagree about whether an init payload is present"
+            ),
+        }
         let mut modules = Vec::with_capacity(params.kernel_modules.len());
         for path in params.kernel_modules {
             let archive_name = path
@@ -2539,24 +2695,32 @@ impl PinnedSuffixInputs {
 
 fn recipe_prefix(
     domain: &[u8],
-    page_size: usize,
+    mapping_granule: usize,
+    file_alignment: usize,
     compression: initramfs::InitrdCompression,
 ) -> AHasher {
     let mut hasher = fixed_hasher();
     hash_len_prefixed(&mut hasher, domain);
     hash_u32(&mut hasher, PREPARED_CAS_SCHEMA);
     hash_len_prefixed(&mut hasher, std::env::consts::ARCH.as_bytes());
-    hash_u64(&mut hasher, page_size as u64);
+    hash_u64(&mut hasher, mapping_granule as u64);
+    hash_u64(&mut hasher, file_alignment as u64);
     hash_u8(&mut hasher, compression_tag(compression));
     hasher
 }
 
 fn base_recipe_key(
     base_key: &BaseKey,
-    page_size: usize,
+    mapping_granule: usize,
+    file_alignment: usize,
     compression: initramfs::InitrdCompression,
 ) -> u64 {
-    let mut hasher = recipe_prefix(b"ktstr-prepared-initrd-base", page_size, compression);
+    let mut hasher = recipe_prefix(
+        b"ktstr-prepared-initrd-base",
+        mapping_granule,
+        file_alignment,
+        compression,
+    );
     hash_u64(&mut hasher, base_key.0);
     hasher.finish()
 }
@@ -2564,10 +2728,16 @@ fn base_recipe_key(
 fn payload_recipe_key(
     payload: &PinnedInput,
     coverage: (bool, u64),
-    page_size: usize,
+    mapping_granule: usize,
+    file_alignment: usize,
     compression: initramfs::InitrdCompression,
 ) -> u64 {
-    let mut hasher = recipe_prefix(b"ktstr-prepared-initrd-payload", page_size, compression);
+    let mut hasher = recipe_prefix(
+        b"ktstr-prepared-initrd-payload",
+        mapping_granule,
+        file_alignment,
+        compression,
+    );
     hash_u64(&mut hasher, payload.identity.size);
     hash_u64(&mut hasher, payload.content_hash);
     hash_u8(&mut hasher, u8::from(coverage.0));
@@ -2577,10 +2747,16 @@ fn payload_recipe_key(
 
 fn modules_recipe_key(
     modules: &[PinnedModule],
-    page_size: usize,
+    mapping_granule: usize,
+    file_alignment: usize,
     compression: initramfs::InitrdCompression,
 ) -> u64 {
-    let mut hasher = recipe_prefix(b"ktstr-prepared-initrd-modules", page_size, compression);
+    let mut hasher = recipe_prefix(
+        b"ktstr-prepared-initrd-modules",
+        mapping_granule,
+        file_alignment,
+        compression,
+    );
     hash_u64(&mut hasher, modules.len() as u64);
     for module in modules {
         hash_len_prefixed(&mut hasher, module.archive_name.as_bytes());
@@ -2594,10 +2770,16 @@ fn part_view_recipe_key(
     canonical_key: u64,
     kind: PreparedObjectKind,
     leading_pad: usize,
-    page_size: usize,
+    mapping_granule: usize,
+    file_alignment: usize,
     compression: initramfs::InitrdCompression,
 ) -> u64 {
-    let mut hasher = recipe_prefix(b"ktstr-prepared-initrd-part-view", page_size, compression);
+    let mut hasher = recipe_prefix(
+        b"ktstr-prepared-initrd-part-view",
+        mapping_granule,
+        file_alignment,
+        compression,
+    );
     hash_u8(&mut hasher, kind as u8);
     hash_u64(&mut hasher, canonical_key);
     hash_u64(&mut hasher, leading_pad as u64);
@@ -2607,11 +2789,17 @@ fn part_view_recipe_key(
 fn tail_recipe_key(
     prefix_uncompressed_len: usize,
     leading_pad: usize,
-    page_size: usize,
+    mapping_granule: usize,
+    file_alignment: usize,
     compression: initramfs::InitrdCompression,
     params: &initramfs::SuffixParams<'_>,
 ) -> u64 {
-    let mut hasher = recipe_prefix(b"ktstr-prepared-initrd-tail", page_size, compression);
+    let mut hasher = recipe_prefix(
+        b"ktstr-prepared-initrd-tail",
+        mapping_granule,
+        file_alignment,
+        compression,
+    );
     hash_u64(&mut hasher, prefix_uncompressed_len as u64);
     hash_u64(&mut hasher, leading_pad as u64);
     hash_string_slice(&mut hasher, params.args);
@@ -2640,10 +2828,16 @@ struct PageSegment {
 fn stitch_recipe_key(
     segments: &[PageSegment],
     parts: &[PreparedPart],
-    page_size: usize,
+    mapping_granule: usize,
+    file_alignment: usize,
     compression: initramfs::InitrdCompression,
 ) -> u64 {
-    let mut hasher = recipe_prefix(b"ktstr-prepared-initrd-stitch", page_size, compression);
+    let mut hasher = recipe_prefix(
+        b"ktstr-prepared-initrd-stitch",
+        mapping_granule,
+        file_alignment,
+        compression,
+    );
     hash_u64(&mut hasher, segments.len() as u64);
     for segment in segments {
         hash_u64(&mut hasher, parts[segment.part_index].object.header.key);
@@ -2716,8 +2910,14 @@ impl PreparedInitrd {
 pub(crate) struct PreparedBase {
     root: PathBuf,
     object: PreparedObject,
-    page_size: usize,
+    mapping_granule: usize,
+    file_alignment: usize,
     compression: initramfs::InitrdCompression,
+    // Keep the exact open file description used to derive the base's loader
+    // closure alive through /init stripping. Reopening the pathname after KVM
+    // setup could otherwise combine revision A's libraries with revision B's
+    // executable.
+    payload: Option<PinnedInput>,
 }
 
 #[derive(Debug)]
@@ -3030,18 +3230,29 @@ struct PreparedPart {
     compressed_len: usize,
 }
 
+#[derive(Clone, Copy)]
+struct PreparedGeometry {
+    mapping_granule: usize,
+    file_alignment: usize,
+    compression: initramfs::InitrdCompression,
+}
+
 fn get_or_build_part<F>(
     root: &Path,
     kind: PreparedObjectKind,
     key: u64,
     leading_pad: usize,
-    page_size: usize,
-    compression: initramfs::InitrdCompression,
+    geometry: PreparedGeometry,
     build: F,
 ) -> Result<PreparedObject>
 where
     F: FnOnce() -> Result<Vec<u8>>,
 {
+    let PreparedGeometry {
+        mapping_granule,
+        file_alignment,
+        compression,
+    } = geometry;
     anyhow::ensure!(
         kind != PreparedObjectKind::Base && kind != PreparedObjectKind::Stitch,
         "generic archive part has an invalid kind"
@@ -3050,7 +3261,8 @@ where
         kind,
         compression,
         key,
-        page_size: page_size as u64,
+        mapping_granule: mapping_granule as u64,
+        file_alignment: file_alignment as u64,
         leading_pad: Some(leading_pad as u64),
         parent_key: Some(key),
     };
@@ -3064,14 +3276,14 @@ where
             kind,
             compression,
             key,
-            page_size: page_size as u64,
+            mapping_granule: mapping_granule as u64,
             payload_len: layout.len() as u64,
             payload_hash: ahash_bytes(&layout),
             part_uncompressed_len: uncompressed.len() as u64,
             part_compressed_len: compressed.len() as u64,
             leading_pad: leading_pad as u64,
             stream_offset_mod: leading_pad as u64,
-            reserved_shape: 0,
+            file_alignment: file_alignment as u64,
             parent_key: key,
             reserved_len: 0,
         };
@@ -3087,15 +3299,19 @@ fn get_or_build_part_view(
     canonical: &PreparedObject,
     view_kind: PreparedObjectKind,
     leading_pad: usize,
-    page_size: usize,
-    compression: initramfs::InitrdCompression,
+    geometry: PreparedGeometry,
 ) -> Result<PreparedObject> {
+    let PreparedGeometry {
+        mapping_granule,
+        file_alignment,
+        compression,
+    } = geometry;
     anyhow::ensure!(
         matches!(
             view_kind,
             PreparedObjectKind::PayloadView | PreparedObjectKind::ModulesView
         ) && leading_pad > 0
-            && leading_pad < page_size,
+            && leading_pad < file_alignment,
         "invalid shifted prepared-part view geometry"
     );
     anyhow::ensure!(
@@ -3106,14 +3322,16 @@ fn get_or_build_part_view(
         canonical.header.key,
         view_kind,
         leading_pad,
-        page_size,
+        mapping_granule,
+        file_alignment,
         compression,
     );
     let expectation = PreparedObjectExpectation {
         kind: view_kind,
         compression,
         key,
-        page_size: page_size as u64,
+        mapping_granule: mapping_granule as u64,
+        file_alignment: file_alignment as u64,
         leading_pad: Some(leading_pad as u64),
         parent_key: Some(canonical.header.key),
     };
@@ -3127,14 +3345,14 @@ fn get_or_build_part_view(
             kind: view_kind,
             compression,
             key,
-            page_size: page_size as u64,
+            mapping_granule: mapping_granule as u64,
             payload_len: layout.len() as u64,
             payload_hash: ahash_bytes(&layout),
             part_uncompressed_len: canonical.header.part_uncompressed_len,
             part_compressed_len: canonical.header.part_compressed_len,
             leading_pad: leading_pad as u64,
             stream_offset_mod: leading_pad as u64,
-            reserved_shape: 0,
+            file_alignment: file_alignment as u64,
             parent_key: canonical.header.key,
             reserved_len: 0,
         };
@@ -3150,42 +3368,40 @@ fn get_or_build_part_view(
 /// The semantic [`BaseKey`] is available before any cpio bytes exist, so it
 /// elects one cross-process builder. Cache-hit cells never materialize the
 /// uncompressed base at all; the closure runs only in the elected winner.
-pub(crate) fn get_or_prepare_base<F>(
-    semantic_base_key: &BaseKey,
+pub(crate) fn get_or_prepare_base(
+    inputs: PreparedBaseInputs,
     compression: initramfs::InitrdCompression,
-    build: F,
-) -> Result<PreparedBase>
-where
-    F: FnOnce() -> Result<Vec<u8>>,
-{
+) -> Result<PreparedBase> {
     let root = prepared_cache_root()?;
     ensure_prepared_cache_dirs(&root)?;
     maybe_gc_prepared_cache(&root);
-    let page_size = PREPARED_MAPPING_GRANULE;
-    let base_key = base_recipe_key(semantic_base_key, page_size, compression);
+    let mapping_granule = PREPARED_MAPPING_GRANULE;
+    let file_alignment = prepared_file_alignment()?;
+    let base_key = base_recipe_key(inputs.key(), mapping_granule, file_alignment, compression);
     let expectation = PreparedObjectExpectation {
         kind: PreparedObjectKind::Base,
         compression,
         key: base_key,
-        page_size: page_size as u64,
+        mapping_granule: mapping_granule as u64,
+        file_alignment: file_alignment as u64,
         leading_pad: Some(0),
         parent_key: Some(base_key),
     };
     let object = get_or_build_prepared_object(&root, expectation, || {
-        let uncompressed = build()?;
+        let uncompressed = inputs.build()?;
         let compressed = initramfs::compress_initrd_part(compression, &uncompressed)?;
         let header = PreparedObjectHeader {
             kind: PreparedObjectKind::Base,
             compression,
             key: base_key,
-            page_size: page_size as u64,
+            mapping_granule: mapping_granule as u64,
             payload_len: compressed.len() as u64,
             payload_hash: ahash_bytes(&compressed),
             part_uncompressed_len: uncompressed.len() as u64,
             part_compressed_len: compressed.len() as u64,
             leading_pad: 0,
             stream_offset_mod: 0,
-            reserved_shape: 0,
+            file_alignment: file_alignment as u64,
             parent_key: base_key,
             reserved_len: 0,
         };
@@ -3194,11 +3410,14 @@ where
             payload: compressed,
         })
     })?;
+    let payload = inputs.payload;
     Ok(PreparedBase {
         root,
         object,
-        page_size,
+        mapping_granule,
+        file_alignment,
         compression,
+        payload: Some(payload),
     })
 }
 
@@ -3285,7 +3504,7 @@ fn plan_prepared_mappings(
                 .context("prepared part layout offset overflow")?;
             let payload_len = usize::try_from(part.object.header.payload_len)
                 .context("prepared part payload length exceeds usize")?;
-            let padded_payload_len = round_up(payload_len, page_size)?;
+            let padded_payload_len = round_up(payload_len, file_alignment)?;
             let mapping_end = layout_offset
                 .checked_add(page_size)
                 .context("prepared direct mapping end overflow")?;
@@ -3323,12 +3542,14 @@ fn plan_prepared_mappings(
             continue;
         }
 
-        let stitch_key = stitch_recipe_key(&segments, parts, page_size, compression);
+        let stitch_key =
+            stitch_recipe_key(&segments, parts, page_size, file_alignment, compression);
         let expectation = PreparedObjectExpectation {
             kind: PreparedObjectKind::Stitch,
             compression,
             key: stitch_key,
-            page_size: page_size as u64,
+            mapping_granule: page_size as u64,
+            file_alignment: file_alignment as u64,
             leading_pad: Some(0),
             parent_key: Some(stitch_key),
         };
@@ -3347,14 +3568,14 @@ fn plan_prepared_mappings(
                 kind: PreparedObjectKind::Stitch,
                 compression,
                 key: stitch_key,
-                page_size: page_size as u64,
+                mapping_granule: page_size as u64,
                 payload_len: page_size as u64,
                 payload_hash: ahash_bytes(&page),
                 part_uncompressed_len: 0,
                 part_compressed_len: page_size as u64,
                 leading_pad: 0,
                 stream_offset_mod: 0,
-                reserved_shape: 0,
+                file_alignment: file_alignment as u64,
                 parent_key: stitch_key,
                 reserved_len: 0,
             };
@@ -3415,11 +3636,17 @@ pub(crate) fn complete_prepared_initrd(
     let PreparedBase {
         root,
         object: base,
-        page_size,
+        mapping_granule,
+        file_alignment,
         compression,
+        payload,
     } = prepared_base;
-    let file_alignment = prepared_file_alignment()?;
-    let pinned = PinnedSuffixInputs::pin(&root, params)?;
+    let geometry = PreparedGeometry {
+        mapping_granule,
+        file_alignment,
+        compression,
+    };
+    let pinned = PinnedSuffixInputs::pin(&root, params, payload)?;
     let coverage = pinned
         .payload
         .as_ref()
@@ -3449,21 +3676,20 @@ pub(crate) fn complete_prepared_initrd(
 
     if let Some(payload) = &pinned.payload {
         let leading_pad = stream_offset % file_alignment;
-        let key = payload_recipe_key(payload, coverage, page_size, compression);
-        let payload_path = payload.proc_path();
-        let canonical = get_or_build_part(
-            &root,
-            PreparedObjectKind::Payload,
-            key,
-            0,
-            page_size,
+        let key = payload_recipe_key(
+            payload,
+            coverage,
+            mapping_granule,
+            file_alignment,
             compression,
-            || {
+        );
+        let payload_path = payload.proc_path();
+        let canonical =
+            get_or_build_part(&root, PreparedObjectKind::Payload, key, 0, geometry, || {
                 let part = initramfs::build_payload_part_from_pinned(&payload_path)?;
                 payload.verify_unchanged()?;
                 Ok(part)
-            },
-        )?;
+            })?;
         payload.verify_unchanged()?;
         cache_hits += usize::from(canonical.cache_hit);
         let object = if leading_pad == 0 {
@@ -3474,8 +3700,7 @@ pub(crate) fn complete_prepared_initrd(
                 &canonical,
                 PreparedObjectKind::PayloadView,
                 leading_pad,
-                page_size,
-                compression,
+                geometry,
             )?;
             cache_hits += usize::from(view.cache_hit);
             view
@@ -3498,21 +3723,19 @@ pub(crate) fn complete_prepared_initrd(
 
     if !pinned.modules.is_empty() {
         let leading_pad = stream_offset % file_alignment;
-        let key = modules_recipe_key(&pinned.modules, page_size, compression);
-        let module_sources = pinned.module_sources();
-        let canonical = get_or_build_part(
-            &root,
-            PreparedObjectKind::Modules,
-            key,
-            0,
-            page_size,
+        let key = modules_recipe_key(
+            &pinned.modules,
+            mapping_granule,
+            file_alignment,
             compression,
-            || {
+        );
+        let module_sources = pinned.module_sources();
+        let canonical =
+            get_or_build_part(&root, PreparedObjectKind::Modules, key, 0, geometry, || {
                 let part = initramfs::build_modules_part_from_pinned(&module_sources)?;
                 pinned.verify_unchanged()?;
                 Ok(part)
-            },
-        )?;
+            })?;
         pinned.verify_unchanged()?;
         cache_hits += usize::from(canonical.cache_hit);
         let object = if leading_pad == 0 {
@@ -3523,8 +3746,7 @@ pub(crate) fn complete_prepared_initrd(
                 &canonical,
                 PreparedObjectKind::ModulesView,
                 leading_pad,
-                page_size,
-                compression,
+                geometry,
             )?;
             cache_hits += usize::from(view.cache_hit);
             view
@@ -3549,7 +3771,8 @@ pub(crate) fn complete_prepared_initrd(
     let tail_key = tail_recipe_key(
         uncompressed_len,
         leading_pad,
-        page_size,
+        mapping_granule,
+        file_alignment,
         compression,
         params,
     );
@@ -3558,8 +3781,7 @@ pub(crate) fn complete_prepared_initrd(
         PreparedObjectKind::Tail,
         tail_key,
         leading_pad,
-        page_size,
-        compression,
+        geometry,
         || initramfs::build_dynamic_tail(uncompressed_len, params),
     )?;
     let tail_uncompressed_len = usize::try_from(tail.header.part_uncompressed_len)?;
@@ -3587,8 +3809,13 @@ pub(crate) fn complete_prepared_initrd(
         uncompressed_len
     );
     let part_count = parts.len();
-    let (ranges, direct_ranges, stitch_pages, stitch_cache_hits) =
-        plan_prepared_mappings(&root, &mut parts, page_size, file_alignment, compression)?;
+    let (ranges, direct_ranges, stitch_pages, stitch_cache_hits) = plan_prepared_mappings(
+        &root,
+        &mut parts,
+        mapping_granule,
+        file_alignment,
+        compression,
+    )?;
     cache_hits += stitch_cache_hits;
     let plan = PreparedRangePlan {
         part_count,
@@ -3602,7 +3829,7 @@ pub(crate) fn complete_prepared_initrd(
         ranges,
         cache_hits,
         plan,
-        mapping_granule: page_size,
+        mapping_granule,
         coverage_instrumented: coverage.0,
         coverage_reserve_bytes: coverage.1,
     })
@@ -4413,20 +4640,25 @@ mod tests {
         base_cache().lock().unwrap().remove(&key);
     }
 
-    fn test_base_object(key: u64, page: usize, payload: Vec<u8>) -> BuiltPreparedObject {
+    fn test_base_object(
+        key: u64,
+        mapping_granule: usize,
+        file_alignment: usize,
+        payload: Vec<u8>,
+    ) -> BuiltPreparedObject {
         BuiltPreparedObject {
             header: PreparedObjectHeader {
                 kind: PreparedObjectKind::Base,
                 compression: initramfs::InitrdCompression::Lz4,
                 key,
-                page_size: page as u64,
+                mapping_granule: mapping_granule as u64,
                 payload_len: payload.len() as u64,
                 payload_hash: ahash_bytes(&payload),
                 part_uncompressed_len: payload.len() as u64,
                 part_compressed_len: payload.len() as u64,
                 leading_pad: 0,
                 stream_offset_mod: 0,
-                reserved_shape: 0,
+                file_alignment: file_alignment as u64,
                 parent_key: key,
                 reserved_len: 0,
             },
@@ -4434,12 +4666,17 @@ mod tests {
         }
     }
 
-    fn test_base_expectation(key: u64, page: usize) -> PreparedObjectExpectation {
+    fn test_base_expectation(
+        key: u64,
+        mapping_granule: usize,
+        file_alignment: usize,
+    ) -> PreparedObjectExpectation {
         PreparedObjectExpectation {
             kind: PreparedObjectKind::Base,
             compression: initramfs::InitrdCompression::Lz4,
             key,
-            page_size: page as u64,
+            mapping_granule: mapping_granule as u64,
+            file_alignment: file_alignment as u64,
             leading_pad: Some(0),
             parent_key: Some(key),
         }
@@ -4449,7 +4686,8 @@ mod tests {
         root: &Path,
         kind: PreparedObjectKind,
         key: u64,
-        page: usize,
+        mapping_granule: usize,
+        file_alignment: usize,
         leading_pad: usize,
         compressed_len: usize,
     ) -> PreparedObject {
@@ -4457,7 +4695,8 @@ mod tests {
             kind,
             compression: initramfs::InitrdCompression::Lz4,
             key,
-            page_size: page as u64,
+            mapping_granule: mapping_granule as u64,
+            file_alignment: file_alignment as u64,
             leading_pad: Some(leading_pad as u64),
             parent_key: Some(key),
         };
@@ -4469,14 +4708,14 @@ mod tests {
                     kind,
                     compression: initramfs::InitrdCompression::Lz4,
                     key,
-                    page_size: page as u64,
+                    mapping_granule: mapping_granule as u64,
                     payload_len: payload.len() as u64,
                     payload_hash: ahash_bytes(&payload),
                     part_uncompressed_len: compressed_len as u64,
                     part_compressed_len: compressed_len as u64,
                     leading_pad: leading_pad as u64,
                     stream_offset_mod: leading_pad as u64,
-                    reserved_shape: 0,
+                    file_alignment: file_alignment as u64,
                     parent_key: key,
                     reserved_len: 0,
                 },
@@ -4492,13 +4731,15 @@ mod tests {
         compression: initramfs::InitrdCompression,
         uncompressed: &[u8],
     ) -> PreparedBase {
-        let page = PREPARED_MAPPING_GRANULE;
+        let mapping_granule = PREPARED_MAPPING_GRANULE;
+        let file_alignment = prepared_file_alignment().unwrap();
         let compressed = initramfs::compress_initrd_part(compression, uncompressed).unwrap();
         let expectation = PreparedObjectExpectation {
             kind: PreparedObjectKind::Base,
             compression,
             key,
-            page_size: page as u64,
+            mapping_granule: mapping_granule as u64,
+            file_alignment: file_alignment as u64,
             leading_pad: Some(0),
             parent_key: Some(key),
         };
@@ -4508,14 +4749,14 @@ mod tests {
                     kind: PreparedObjectKind::Base,
                     compression,
                     key,
-                    page_size: page as u64,
+                    mapping_granule: mapping_granule as u64,
                     payload_len: compressed.len() as u64,
                     payload_hash: ahash_bytes(&compressed),
                     part_uncompressed_len: uncompressed.len() as u64,
                     part_compressed_len: compressed.len() as u64,
                     leading_pad: 0,
                     stream_offset_mod: 0,
-                    reserved_shape: 0,
+                    file_alignment: file_alignment as u64,
                     parent_key: key,
                     reserved_len: 0,
                 },
@@ -4526,8 +4767,10 @@ mod tests {
         PreparedBase {
             root: root.to_path_buf(),
             object,
-            page_size: page,
+            mapping_granule,
+            file_alignment,
             compression,
+            payload: None,
         }
     }
 
@@ -4637,14 +4880,112 @@ mod tests {
     }
 
     #[test]
+    fn prepared_completion_keeps_the_base_payload_open_description() {
+        let temp = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(temp.path()).unwrap();
+        let payload_path = temp.path().join("payload");
+        std::fs::copy("/bin/true", &payload_path).unwrap();
+
+        let pinned = pin_input(temp.path(), &payload_path).unwrap();
+        let old_identity = pinned.identity;
+        let expected_payload_part =
+            initramfs::build_payload_part_from_pinned(&pinned.proc_path()).unwrap();
+
+        let replacement = temp.path().join("replacement");
+        std::fs::write(&replacement, b"revision B must never become /init").unwrap();
+        std::fs::rename(&replacement, &payload_path).unwrap();
+        assert_ne!(
+            StableFileIdentity::from_metadata(&std::fs::metadata(&payload_path).unwrap()),
+            old_identity,
+            "the pathname replacement must exercise a genuinely different inode"
+        );
+
+        let mut prepared_base = test_prepared_base(
+            temp.path(),
+            0xb001,
+            initramfs::InitrdCompression::Uncompressed,
+            &[],
+        );
+        prepared_base.payload = Some(pinned);
+        let params = initramfs::SuffixParams {
+            payload: Some(&payload_path),
+            ..Default::default()
+        };
+        let prepared = complete_prepared_initrd(prepared_base, &params).unwrap();
+        let archive = read_prepared_stream(prepared);
+        assert!(
+            archive.starts_with(&expected_payload_part),
+            "completion must strip and archive the exact payload fd pinned during base preparation"
+        );
+        assert!(
+            !archive
+                .windows(b"revision B must never become /init".len())
+                .any(|window| window == b"revision B must never become /init"),
+            "the replacement pathname revision leaked into the prepared image"
+        );
+    }
+
+    #[test]
+    fn many_distinct_tails_are_host_page_aligned_and_sparse() {
+        const CELLS: usize = 52;
+        let temp = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(temp.path()).unwrap();
+        let compression = initramfs::InitrdCompression::Uncompressed;
+        let file_alignment = prepared_file_alignment().unwrap();
+
+        for index in 0..CELLS {
+            let args = vec![format!("cell-{index:02}-has-distinct-tail-content")];
+            let params = initramfs::SuffixParams {
+                args: &args,
+                ..Default::default()
+            };
+            let prepared_base = test_prepared_base(temp.path(), 0xb002, compression, &[]);
+            let expected = (index == 0).then(|| initramfs::build_dynamic_tail(0, &params).unwrap());
+            let prepared = complete_prepared_initrd(prepared_base, &params).unwrap();
+            if let Some(expected) = expected {
+                assert_eq!(
+                    read_prepared_stream(prepared),
+                    expected,
+                    "sparse storage must preserve the exact directly mapped stream"
+                );
+            }
+        }
+
+        let mut logical_bytes = 0u64;
+        let mut allocated_bytes = 0u64;
+        for entry in std::fs::read_dir(temp.path().join(PREPARED_OBJECTS_DIR)).unwrap() {
+            let metadata = entry.unwrap().metadata().unwrap();
+            if metadata.is_file() {
+                logical_bytes += metadata.len();
+                allocated_bytes += metadata.blocks() * 512;
+            }
+        }
+
+        let compact_upper_bound = (CELLS as u64)
+            * (PREPARED_MAPPING_GRANULE as u64 + 4 * file_alignment as u64)
+            + 4 * file_alignment as u64;
+        assert!(
+            logical_bytes <= compact_upper_bound,
+            "{CELLS} tiny tails consumed {logical_bytes} logical bytes, above the \
+             host-page-aligned bound {compact_upper_bound}"
+        );
+        assert!(
+            allocated_bytes * 4 < logical_bytes,
+            "zero padding was physically allocated: {allocated_bytes} allocated of \
+             {logical_bytes} logical bytes"
+        );
+    }
+
+    #[test]
     fn prepared_planner_uses_host_page_file_alignment_not_mapping_granule() {
         let page = PREPARED_MAPPING_GRANULE;
-        let first_len = 0x1_2345;
+        let first_len = 0x3_2345;
 
         for (index, file_alignment) in [0x1000, 0x4000, 0x1_0000, page].into_iter().enumerate() {
             let temp = tempfile::tempdir().unwrap();
             ensure_prepared_cache_dirs(temp.path()).unwrap();
             let leading_pad = first_len % file_alignment;
+            let second_len = page * 2 - first_len;
             let mut parts = vec![
                 PreparedPart {
                     object: test_prepared_part(
@@ -4652,6 +4993,7 @@ mod tests {
                         PreparedObjectKind::Payload,
                         0x100 + index as u64,
                         page,
+                        file_alignment,
                         0,
                         first_len,
                     ),
@@ -4665,12 +5007,13 @@ mod tests {
                         PreparedObjectKind::PayloadView,
                         0x200 + index as u64,
                         page,
+                        file_alignment,
                         leading_pad,
-                        page * 2,
+                        second_len,
                     ),
                     stream_offset: first_len,
-                    uncompressed_len: page * 2,
-                    compressed_len: page * 2,
+                    uncompressed_len: second_len,
+                    compressed_len: second_len,
                 },
             ];
 
@@ -4724,6 +5067,7 @@ mod tests {
                     PreparedObjectKind::Payload,
                     0xc001,
                     page,
+                    file_alignment,
                     0,
                     first_len,
                 ),
@@ -4737,6 +5081,7 @@ mod tests {
                     PreparedObjectKind::PayloadView,
                     0xc002,
                     page,
+                    file_alignment,
                     leading_pad,
                     10 << 10,
                 ),
@@ -4768,9 +5113,12 @@ mod tests {
         let key = 0x4142;
         let path = prepared_object_path(temp.path(), PreparedObjectKind::Base, key);
         std::fs::write(&path, b"torn").unwrap();
-        assert!(try_open_prepared_object(&path, test_base_expectation(key, 4096)).is_err());
+        assert!(
+            try_open_prepared_object(temp.path(), &path, test_base_expectation(key, 4096, 4096),)
+                .is_err()
+        );
 
-        let built = test_base_object(key, 4096, vec![7; 5000]);
+        let built = test_base_object(key, 4096, 4096, vec![7; 5000]);
         std::fs::remove_file(&path).unwrap();
         publish_prepared_object(temp.path(), &path, &built).unwrap();
         let mut corrupted = std::fs::read(&path).unwrap();
@@ -4781,7 +5129,8 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, corrupted).unwrap();
         assert!(
-            try_open_prepared_object(&path, test_base_expectation(key, 4096)).is_err(),
+            try_open_prepared_object(temp.path(), &path, test_base_expectation(key, 4096, 4096),)
+                .is_err(),
             "header checksum must reject metadata corruption in O(1)"
         );
     }
@@ -5117,10 +5466,10 @@ mod tests {
             let barrier = barrier.clone();
             workers.push(std::thread::spawn(move || {
                 barrier.wait();
-                get_or_build_prepared_object(&root, test_base_expectation(key, 4096), || {
+                get_or_build_prepared_object(&root, test_base_expectation(key, 4096, 4096), || {
                     builds.fetch_add(1, Ordering::SeqCst);
                     std::thread::sleep(std::time::Duration::from_millis(20));
-                    Ok(test_base_object(key, 4096, vec![0x2a; 8193]))
+                    Ok(test_base_object(key, 4096, 4096, vec![0x2a; 8193]))
                 })
                 .unwrap()
             }));
@@ -5276,24 +5625,34 @@ mod tests {
         }
 
         let page = PREPARED_MAPPING_GRANULE;
-        let object = get_or_build_prepared_object(&root, test_base_expectation(key, page), || {
-            let mut attempts = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&counter)
-                .unwrap();
-            writeln!(attempts, "{mode}:{index}").unwrap();
-            attempts.sync_all().unwrap();
-            if mode == "kill-builder" {
-                std::fs::write(&winner, b"exclusive-lock-held").unwrap();
-                loop {
-                    std::thread::park();
+        let file_alignment = prepared_file_alignment().unwrap();
+        let object = get_or_build_prepared_object(
+            &root,
+            test_base_expectation(key, page, file_alignment),
+            || {
+                let mut attempts = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&counter)
+                    .unwrap();
+                writeln!(attempts, "{mode}:{index}").unwrap();
+                attempts.sync_all().unwrap();
+                if mode == "kill-builder" {
+                    std::fs::write(&winner, b"exclusive-lock-held").unwrap();
+                    loop {
+                        std::thread::park();
+                    }
                 }
-            }
-            // Large enough to make duplicate transformations/publications
-            // visible without adding an artificial sleep.
-            Ok(test_base_object(key, page, vec![0x6d; 8 << 20]))
-        })
+                // Large enough to make duplicate transformations/publications
+                // visible without adding an artificial sleep.
+                Ok(test_base_object(
+                    key,
+                    page,
+                    file_alignment,
+                    vec![0x6d; 8 << 20],
+                ))
+            },
+        )
         .unwrap();
 
         let fd = object.fd.as_ref().unwrap();
@@ -5416,6 +5775,7 @@ mod tests {
 
     #[test]
     fn prepared_object_killed_builder_elects_successor() {
+        const WAITERS: usize = 52;
         let temp = tempfile::tempdir().unwrap();
         ensure_prepared_cache_dirs(temp.path()).unwrap();
         let counter = temp.path().join("attempts");
@@ -5434,8 +5794,8 @@ mod tests {
             winner: &winner,
         };
         let key = 0xd002;
-        let mut children = ChildProcesses(Vec::new());
-        children.push(spawn_prepared_child(&paths, "kill-builder", 0, key));
+        let mut children = ChildProcesses(Vec::with_capacity(WAITERS + 1));
+        children.push(spawn_prepared_child(&paths, "kill-builder", WAITERS, key));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !winner.exists() {
             if let Some(status) = children.0[0].as_mut().unwrap().try_wait().unwrap() {
@@ -5447,27 +5807,225 @@ mod tests {
             );
             std::thread::yield_now();
         }
+        for index in 0..WAITERS {
+            children.push(spawn_prepared_child(
+                &paths,
+                "wait-killed-builder",
+                index,
+                key,
+            ));
+        }
+        wait_for_child_files(
+            &ready,
+            WAITERS,
+            &mut children,
+            std::time::Duration::from_secs(30),
+        );
+
         let mut killed = children.0[0].take().unwrap();
         killed.kill().unwrap();
         assert!(!killed.wait().unwrap().success());
 
-        children.push(spawn_prepared_child(&paths, "successor", 1, key));
         children.wait_all_success(std::time::Duration::from_secs(60));
         assert_eq!(
             std::fs::read_to_string(&counter).unwrap().lines().count(),
             2,
             "one killed attempt and one elected successor must run"
         );
+        let mut inodes = std::collections::HashSet::new();
+        let mut cache_hits = 0usize;
+        for index in 0..WAITERS {
+            let result = std::fs::read_to_string(results.join(index.to_string())).unwrap();
+            let fields: Vec<u64> = result
+                .split_whitespace()
+                .map(|field| field.parse().unwrap())
+                .collect();
+            assert_eq!(fields.len(), 5);
+            inodes.insert((fields[0], fields[1]));
+            cache_hits += fields[4] as usize;
+        }
+        assert_eq!(
+            inodes.len(),
+            1,
+            "every surviving waiter must reuse the successor's inode"
+        );
+        assert_eq!(
+            cache_hits,
+            WAITERS - 1,
+            "exactly one waiter must become the successor builder"
+        );
         let object_path = prepared_object_path(temp.path(), PreparedObjectKind::Base, key);
         assert!(object_path.exists());
         assert!(
             try_open_prepared_object(
+                temp.path(),
                 &object_path,
-                test_base_expectation(key, PREPARED_MAPPING_GRANULE),
+                test_base_expectation(
+                    key,
+                    PREPARED_MAPPING_GRANULE,
+                    prepared_file_alignment().unwrap(),
+                ),
             )
             .unwrap()
             .is_some()
         );
+    }
+
+    #[test]
+    fn prepared_object_coordination_cannot_invert_with_gc_namespace_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(temp.path()).unwrap();
+        let key = 0xd00a;
+        let expected = test_base_expectation(key, 4096, 4096);
+        drop(
+            get_or_build_prepared_object(temp.path(), expected, || {
+                Ok(test_base_object(key, 4096, 4096, vec![0x41; 8193]))
+            })
+            .unwrap(),
+        );
+
+        let object_path = prepared_object_path(temp.path(), PreparedObjectKind::Base, key);
+        let lock_path = prepared_object_lock_path(temp.path(), PreparedObjectKind::Base, key);
+        let mut coordination = open_coord_file(temp.path(), &lock_path).unwrap();
+        coordination.try_lock_exclusive().unwrap();
+
+        assert!(
+            try_lock_gc_namespace(temp.path()).unwrap().is_none(),
+            "a per-key holder must retain namespace LOCK_SH until object LOCK_SH \
+             closes the gate -> per-key -> object lock chain"
+        );
+        let opened = try_open_prepared_object_under_namespace(&object_path, expected, || {})
+            .unwrap()
+            .expect("published object must open under the retained namespace gate");
+
+        coordination.release_namespace_gate();
+        let namespace = try_lock_gc_namespace(temp.path())
+            .unwrap()
+            .expect("object LOCK_SH makes the inode self-protecting after namespace release");
+        drop(coordination);
+        assert!(
+            !try_collect_object(
+                temp.path(),
+                &GcCandidate {
+                    path: object_path.clone(),
+                    kind: PreparedObjectKind::Base,
+                    key,
+                    modified_secs: 0,
+                    len: std::fs::metadata(&object_path).unwrap().len(),
+                },
+                &namespace,
+            )
+            .unwrap(),
+            "the opened object's LOCK_SH must prevent GC after the gate is released"
+        );
+        drop(opened);
+        assert!(
+            try_collect_object(
+                temp.path(),
+                &GcCandidate {
+                    path: object_path,
+                    kind: PreparedObjectKind::Base,
+                    key,
+                    modified_secs: 0,
+                    len: 0,
+                },
+                &namespace,
+            )
+            .unwrap(),
+            "the object becomes collectible only after its shared lock drops"
+        );
+    }
+
+    #[test]
+    fn gc_object_open_is_namespace_safe_and_reuses_only_the_published_inode() {
+        let temp = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(temp.path()).unwrap();
+        let key = 0xd003;
+        let expected = test_base_expectation(key, 4096, 4096);
+        let object = get_or_build_prepared_object(temp.path(), expected, || {
+            Ok(test_base_object(key, 4096, 4096, vec![0x31; 8193]))
+        })
+        .unwrap();
+        let object_path = prepared_object_path(temp.path(), PreparedObjectKind::Base, key);
+        let old_stat = rustix::fs::fstat(object.fd.as_ref().unwrap()).unwrap();
+        drop(object);
+
+        let namespace = try_lock_gc_namespace(temp.path())
+            .unwrap()
+            .expect("no other operation should hold the private test namespace");
+        let coordination = open_lock_file(&prepared_object_lock_path(
+            temp.path(),
+            PreparedObjectKind::Base,
+            key,
+        ))
+        .unwrap();
+        rustix::fs::flock(&coordination, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        let old_inode = File::open(&object_path).unwrap();
+        rustix::fs::flock(&old_inode, rustix::fs::FlockOperation::LockExclusive).unwrap();
+
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let root = temp.path().to_path_buf();
+        let reader_path = object_path.clone();
+        let reader = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            try_open_prepared_object_with_open_hook(&root, &reader_path, expected, || {
+                opened_tx.send(()).unwrap();
+                continue_rx.recv().unwrap();
+            })
+            .unwrap()
+        });
+        attempted_rx.recv().unwrap();
+        let opened_before_gc = opened_rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_ok();
+
+        std::fs::remove_file(&object_path).unwrap();
+        drop(coordination);
+        drop(namespace);
+
+        if opened_before_gc {
+            // Let a buggy open-before-namespace reader continue and unblock
+            // it from the unlinked old inode so the regression fails cleanly
+            // instead of leaving a stuck test thread behind.
+            continue_tx.send(()).unwrap();
+            drop(old_inode);
+            let observed = reader.join().unwrap();
+            assert!(
+                observed.is_none(),
+                "a reader opened the object before taking the namespace gate"
+            );
+            return;
+        }
+
+        assert!(
+            reader.join().unwrap().is_none(),
+            "the path was absent when the namespace gate admitted the reader"
+        );
+        let replacement = get_or_build_prepared_object(temp.path(), expected, || {
+            Ok(test_base_object(key, 4096, 4096, vec![0x32; 8193]))
+        })
+        .unwrap();
+        let replacement_stat = rustix::fs::fstat(replacement.fd.as_ref().unwrap()).unwrap();
+        assert_ne!(
+            (replacement_stat.st_dev, replacement_stat.st_ino),
+            (old_stat.st_dev, old_stat.st_ino),
+            "the still-open unlinked inode cannot be the replacement namespace object"
+        );
+        drop(old_inode);
+
+        for _ in 0..8 {
+            let reopened = try_open_prepared_object(temp.path(), &object_path, expected)
+                .unwrap()
+                .expect("replacement object must remain published");
+            let stat = rustix::fs::fstat(reopened.fd.as_ref().unwrap()).unwrap();
+            assert_eq!(
+                (stat.st_dev, stat.st_ino),
+                (replacement_stat.st_dev, replacement_stat.st_ino),
+                "all cache hits must reuse the currently published inode"
+            );
+        }
     }
 
     #[test]
@@ -5497,6 +6055,7 @@ mod tests {
             // retains it while blocking for the per-key shared lock.
             opened_tx.send(()).unwrap();
             coordination.lock_shared().unwrap();
+            coordination.release_namespace_gate();
             acquired_tx.send(()).unwrap();
             release_rx.recv().unwrap();
         });
@@ -5556,6 +6115,7 @@ mod tests {
             PreparedObjectKind::Payload,
             object_key,
             4096,
+            4096,
             0,
             1024,
         );
@@ -5572,6 +6132,7 @@ mod tests {
             prepared_object_lock_path(temp.path(), PreparedObjectKind::Payload, temp_key);
         let mut temp_holder = open_coord_file(temp.path(), &temp_lock_path).unwrap();
         temp_holder.try_lock_exclusive().unwrap();
+        temp_holder.release_namespace_gate();
 
         let namespace = try_lock_gc_namespace(temp.path())
             .unwrap()

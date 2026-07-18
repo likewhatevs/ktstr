@@ -199,6 +199,10 @@ impl KtstrKvm {
     }
 
     /// Create a new KVM VM with hugepage-backed guest memory.
+    // Standard setup requests hugepages opportunistically through
+    // `performance_mode`; retain this constructor as the strict, no-fallback
+    // API for callers that explicitly require hugetlb backing.
+    #[allow(dead_code)]
     pub fn new_with_hugepages(
         topo: Topology,
         memory_mib: u32,
