@@ -78,6 +78,7 @@ pub(crate) struct MissingLib {
 ///   - 48-byte header: `magic[20] + nlibs[4] + len_strings[4] + flags[4] + unused[16]`
 ///   - nlibs entries of 24 bytes: `flags[4] + key[4] + value[4] + osversion[4] + hwcap[8]`
 ///   - String table: key/value are absolute byte offsets from file start
+///
 /// Magic bytes at the start of the glibc new-format `ld.so.cache`.
 const LD_CACHE_MAGIC: &[u8; 20] = b"glibc-ld.so.cache1.1";
 /// Header size: magic(20) + nlibs(4) + len_strings(4) + flags(4) + unused(16).
@@ -1407,7 +1408,7 @@ pub struct SuffixParams<'a> {
     /// Parent directories (`staging`, `staging/schedulers`,
     /// `staging/schedulers/<name>`) are registered when the
     /// matching staged scheduler binary is packed into the base
-    /// archive by [`build_initramfs_base`] (its
+    /// archive by the prepared base builder (its
     /// `register_parent_dirs` loop walks every extras entry's
     /// path components). The base + suffix split is deliberate:
     /// binary content is stable enough to benefit from the

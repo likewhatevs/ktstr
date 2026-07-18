@@ -19,7 +19,7 @@ use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 use super::KtstrVm;
 #[cfg(test)]
 use super::initramfs_cache::BaseKey;
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", test))]
 use super::initramfs_cache::PREPARED_MAPPING_GRANULE;
 use super::initramfs_cache::{
     PreparedBase, PreparedInitrd, complete_prepared_initrd, get_or_prepare_base,
@@ -181,6 +181,16 @@ pub(crate) fn host_page_size() -> u64 {
         let sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if sz > 0 { sz as u64 } else { 0x1000 }
     })
+}
+
+fn validate_prepared_host_address(host_addr: *mut u8) -> Result<()> {
+    let host_page = host_page_size() as usize;
+    anyhow::ensure!(
+        (host_addr as usize).is_multiple_of(host_page),
+        "prepared initrd host address is not aligned to the \
+         {host_page}-byte host page size"
+    );
+    Ok(())
 }
 
 /// Build the auto-mount cmdline tokens for one disk. Returns an
@@ -1273,11 +1283,12 @@ impl KtstrVm {
                     .guest_mem
                     .get_host_address(GuestAddress(sub_guest))
                     .context("resolve prepared initrd subrange host address")?;
-                anyhow::ensure!(
-                    (host_addr as usize) % page_size == 0,
-                    "prepared initrd host address is not aligned to the \
-                     {page_size}-byte mapping granule"
-                );
+                // MAP_FIXED requires destination alignment to the runtime
+                // host page size. The file/range geometry remains 2 MiB so
+                // the same objects can also replace hugetlb-backed guest
+                // VMAs; ordinary anonymous GuestMemory regions are not
+                // required to begin on a 2 MiB host virtual address.
+                validate_prepared_host_address(host_addr)?;
                 let file_offset = range
                     .file_offset
                     .checked_add(consumed as u64)

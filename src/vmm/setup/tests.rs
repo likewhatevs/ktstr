@@ -1,5 +1,27 @@
 use super::*;
 
+#[test]
+fn prepared_host_address_accepts_page_aligned_non_hugepage_va() {
+    let host_page = host_page_size() as usize;
+    assert!(
+        host_page < PREPARED_MAPPING_GRANULE,
+        "test requires the supported host page size to be below 2 MiB"
+    );
+    let address = host_page;
+    assert!(address.is_multiple_of(host_page));
+    assert_ne!(
+        address % PREPARED_MAPPING_GRANULE,
+        0,
+        "fixture must be host-page aligned but not 2 MiB aligned"
+    );
+    validate_prepared_host_address(address as *mut u8)
+        .expect("ordinary host-page-aligned GuestMemory VA must be accepted");
+    assert!(
+        validate_prepared_host_address((address + 1) as *mut u8).is_err(),
+        "a truly host-page-misaligned destination must still be rejected"
+    );
+}
+
 /// Regression for the PVTIME/initrd overlap: the initrd top
 /// must stay below pvtime_base, never entering the steal-time carve
 /// `[pvtime_base, fdt_addr)`. Otherwise the host clobbers the initramfs

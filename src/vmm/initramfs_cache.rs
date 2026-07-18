@@ -47,13 +47,10 @@ use ahash::AHasher;
 
 use super::initramfs;
 
-/// Cache key for base initramfs. Derived from the payload's shared-lib
-/// SET + interpreter (NOT the payload's content — its /init bytes ride
-/// the per-run suffix), plus the content hashes of the optional
-/// scheduler / probe / worker binaries packed into the base and their
-/// shared libs. Shell mode additionally mixes in a sentinel, include
-/// files, and the busybox flag; see [`Self::new`] and [`Self::new_shell`]
-/// for per-constructor inputs.
+/// Semantic cache key for a prepared base initramfs. It covers the exact
+/// normalized archive recipe: packed binary and include contents, modes,
+/// busybox bytes, and the content-addressed shared-library closure. `/init`
+/// itself lives in an independently cached payload part.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BaseKey(pub(crate) u64);
 
