@@ -134,50 +134,37 @@ fn build_test_binaries_argv(package: Option<&str>, release: bool) -> Vec<String>
     argv
 }
 
-/// Compile the workspace's test binaries via
-/// `cargo build --tests --message-format=json` and collect the
-/// resulting executable paths.
+/// Assemble a registry-discovery build from an already-prepared
+/// nextest/cargo-llvm-cov-nextest argv.
 ///
-/// Filters to artifacts where `executable != null` AND either
-/// `target.kind` contains `"test"` (integration tests under
-/// `tests/`) or `profile.test == true` (unit-test binaries built
-/// from `[lib]` / `[bin]` targets). Both shapes carry the
-/// `#[ktstr_test]` distributed-slice registry that the export
-/// dispatcher reads, so both are valid candidates.
-pub(crate) fn build_test_binaries(
-    package: Option<&str>,
-    release: bool,
-) -> Result<Vec<PathBuf>, String> {
-    // Reuse an already-built test binary instead of re-running
-    // `cargo build --tests` when the caller points us at one via
-    // KTSTR_TEST_BINARY (e.g. an integration test already running inside a
-    // freshly-built test binary under nextest, which sets it to its own
-    // `current_exe`). Without this, resolving a `cargo ktstr shell --test`
-    // fixture from inside a nextest run triggers a cold `cargo build
-    // --tests` (DEV profile) that re-compiles the whole test set — the
-    // running test binary was built TEST profile, so the fingerprints miss
-    // — over the shared target slot, blowing past nextest's slow-timeout
-    // (the test is SIGTERM'd mid-`Compiling`). The named binary carries the
-    // same `#[ktstr_test]` distributed-slice registry the probe reads, so
-    // resolution is identical, just build-free.
-    if let Ok(bin) = std::env::var("KTSTR_TEST_BINARY")
-        && !bin.is_empty()
-    {
-        return Ok(vec![PathBuf::from(bin)]);
+/// Unlike the workspace-wide export/shell probe above, `--relevant` must
+/// inspect exactly the registries the eventual run selected. `cargo test
+/// --no-run` preserves Cargo's default-member behavior and makes explicit
+/// target selectors (`--lib`, `--test`, ...) select test harnesses rather
+/// than ordinary non-test artifacts. The caller's native `--release` is
+/// threaded separately because cargo-ktstr consumes it before constructing
+/// the nextest passthrough.
+fn contextual_test_binaries_argv(args: &[String], release: bool) -> Vec<String> {
+    let mut argv = vec![
+        "test".to_string(),
+        "--no-run".to_string(),
+        "--message-format=json".to_string(),
+    ];
+    if release {
+        argv.push("--release".to_string());
     }
-    let mut self_features = Vec::new();
-    if cfg!(feature = "wprof") {
-        self_features.push("wprof");
-    }
-    if cfg!(feature = "integration") {
-        self_features.push("integration");
-    }
-    let argv = crate::feature_discovery::augment_test_features_with_workspace_package_features(
-        build_test_binaries_argv(package, release),
-        env!("CARGO_PKG_NAME"),
-        &self_features,
-    )
-    .map_err(|error| format!("discover ktstr test features: {error}"))?;
+    argv.extend(crate::feature_discovery::test_registry_build_options(args));
+    argv
+}
+
+fn test_binary_override() -> Option<Vec<PathBuf>> {
+    std::env::var("KTSTR_TEST_BINARY")
+        .ok()
+        .filter(|binary| !binary.is_empty())
+        .map(|binary| vec![PathBuf::from(binary)])
+}
+
+fn execute_test_binary_build(argv: Vec<String>, description: &str) -> Result<Vec<PathBuf>, String> {
     let mut cmd = Command::new("cargo");
     cmd.args(argv);
     cmd.stdout(std::process::Stdio::piped())
@@ -185,10 +172,10 @@ pub(crate) fn build_test_binaries(
 
     let out = cmd
         .output()
-        .map_err(|e| format!("spawn cargo build --tests: {e}"))?;
+        .map_err(|e| format!("spawn {description}: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "cargo build --tests failed (exit {})",
+            "{description} failed (exit {})",
             out.status.code().unwrap_or(-1),
         ));
     }
@@ -226,9 +213,77 @@ pub(crate) fn build_test_binaries(
     Ok(bins)
 }
 
+/// Compile the workspace's test binaries via
+/// `cargo build --tests --message-format=json` and collect the
+/// resulting executable paths.
+///
+/// Filters to artifacts where `executable != null` AND either
+/// `target.kind` contains `"test"` (integration tests under
+/// `tests/`) or `profile.test == true` (unit-test binaries built
+/// from `[lib]` / `[bin]` targets). Both shapes carry the
+/// `#[ktstr_test]` distributed-slice registry that the export
+/// dispatcher reads, so both are valid candidates.
+pub(crate) fn build_test_binaries(
+    package: Option<&str>,
+    release: bool,
+) -> Result<Vec<PathBuf>, String> {
+    // Reuse an already-built test binary instead of re-running
+    // `cargo build --tests` when the caller points us at one via
+    // KTSTR_TEST_BINARY (e.g. an integration test already running inside a
+    // freshly-built test binary under nextest, which sets it to its own
+    // `current_exe`). Without this, resolving a `cargo ktstr shell --test`
+    // fixture from inside a nextest run triggers a cold `cargo build
+    // --tests` (DEV profile) that re-compiles the whole test set — the
+    // running test binary was built TEST profile, so the fingerprints miss
+    // — over the shared target slot, blowing past nextest's slow-timeout
+    // (the test is SIGTERM'd mid-`Compiling`). The named binary carries the
+    // same `#[ktstr_test]` distributed-slice registry the probe reads, so
+    // resolution is identical, just build-free.
+    if let Some(binaries) = test_binary_override() {
+        return Ok(binaries);
+    }
+    let mut self_features = Vec::new();
+    if cfg!(feature = "wprof") {
+        self_features.push("wprof");
+    }
+    if cfg!(feature = "integration") {
+        self_features.push("integration");
+    }
+    let argv = crate::feature_discovery::augment_test_features_with_workspace_package_features(
+        build_test_binaries_argv(package, release),
+        env!("CARGO_PKG_NAME"),
+        &self_features,
+    )
+    .map_err(|error| format!("discover ktstr test features: {error}"))?;
+    execute_test_binary_build(argv, "cargo build --tests")
+}
+
+/// Compile exactly the test registries selected by an already-prepared
+/// nextest/cargo-llvm-cov-nextest argv.
+///
+/// This is the registry source for `--relevant`. The same metadata-driven
+/// feature preparation that shapes the final test run has already augmented
+/// `args`, so this path must not infer a second, potentially different feature
+/// set. Package/default-member selection, explicit exclusions, target
+/// selectors/triple, Cargo profile, and every explicit feature mode are
+/// normalized onto `cargo test --no-run` by
+/// [`crate::feature_discovery::test_registry_build_options`].
+pub(crate) fn build_contextual_test_binaries(
+    args: &[String],
+    release: bool,
+) -> Result<Vec<PathBuf>, String> {
+    if let Some(binaries) = test_binary_override() {
+        return Ok(binaries);
+    }
+    execute_test_binary_build(
+        contextual_test_binaries_argv(args, release),
+        "cargo test --no-run for --relevant registry discovery",
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::build_test_binaries_argv;
+    use super::{build_test_binaries_argv, contextual_test_binaries_argv};
 
     /// An unscoped probe promises every workspace test registry, including
     /// packages excluded from Cargo's default-members. Compile-time features
@@ -266,6 +321,103 @@ mod tests {
         assert!(
             !argv.iter().any(|argument| argument == "--features"),
             "self features are added only after metadata proves package scope: {argv:?}",
+        );
+    }
+
+    #[test]
+    fn contextual_argv_preserves_composite_features_and_no_default_mode() {
+        let argv = contextual_test_binaries_argv(
+            &[
+                "--features",
+                "alpha,beta gamma",
+                "-Fdelta,epsilon",
+                "--no-default-features",
+                "-E",
+                "test(irrelevant_runtime_filter)",
+                "--",
+                "--ignored",
+            ]
+            .map(ToString::to_string),
+            false,
+        );
+        assert_eq!(
+            argv,
+            [
+                "test",
+                "--no-run",
+                "--message-format=json",
+                "--features",
+                "alpha,beta gamma",
+                "-Fdelta,epsilon",
+                "--no-default-features",
+            ]
+            .map(ToString::to_string),
+            "composite expressions remain one Cargo value and the binary suffix is opaque",
+        );
+    }
+
+    #[test]
+    fn contextual_argv_keeps_package_exclusions_and_effective_build_context() {
+        let argv = contextual_test_binaries_argv(
+            &[
+                "-p",
+                "selected",
+                "--workspace",
+                "--exclude",
+                "ordinary",
+                "--exclude-from-test=coverage-only",
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                "--cargo-profile",
+                "ci",
+                "--test",
+                "scheduler_registry",
+            ]
+            .map(ToString::to_string),
+            true,
+        );
+        assert_eq!(
+            argv,
+            [
+                "test",
+                "--no-run",
+                "--message-format=json",
+                "--release",
+                "-p",
+                "selected",
+                "--workspace",
+                "--exclude",
+                "ordinary",
+                "--exclude=coverage-only",
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                "--profile",
+                "ci",
+                "--test",
+                "scheduler_registry",
+            ]
+            .map(ToString::to_string),
+            "nextest and llvm-cov-nextest controls must select the same registry build",
+        );
+    }
+
+    #[test]
+    fn contextual_argv_preserves_explicit_all_features_without_inference() {
+        let argv = contextual_test_binaries_argv(
+            &["--all-features", "--exclude-from-report", "report-only"].map(ToString::to_string),
+            false,
+        );
+        assert_eq!(
+            argv,
+            [
+                "test",
+                "--no-run",
+                "--message-format=json",
+                "--all-features",
+            ]
+            .map(ToString::to_string),
+            "explicit --all-features remains authoritative and report-only coverage flags do not \
+             shape the test registry",
         );
     }
 }

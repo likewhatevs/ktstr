@@ -837,8 +837,22 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
     // produces no sidecars and the empty-perf-set guard below exits cleanly (0)). The
     // composed expression intersects (`&`) so it narrows, never widens.
     let relevant_expr = if args.relevant {
-        crate::affected::relevant_test_filter(args.base, args.base_ref, args.default_branch)
-            .context("compute --relevant perf-delta test set")?
+        // The child `cargo ktstr test` applies this same metadata-driven
+        // feature preparation before its nextest run. Do it once in the HEAD
+        // workspace for the registry probe too, so feature-gated perf tests
+        // and the caller's package/target/profile selection cannot disappear
+        // from (or leak into) the relevant filter.
+        let registry_args = crate::run_cargo::prepare_nextest_args(args.passthrough.to_vec())
+            .map_err(anyhow::Error::msg)
+            .context("prepare --relevant perf-delta registry selection")?;
+        crate::affected::relevant_test_filter(
+            args.base,
+            args.base_ref,
+            args.default_branch,
+            &registry_args,
+            false,
+        )
+        .context("compute --relevant perf-delta test set")?
     } else {
         None
     };

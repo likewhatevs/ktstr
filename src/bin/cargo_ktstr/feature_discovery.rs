@@ -444,6 +444,103 @@ pub(crate) fn metadata_resolution_options(args: &[String]) -> Vec<String> {
     out
 }
 
+/// Cargo options that must shape a registry-discovery `cargo test --no-run`
+/// exactly like the caller's eventual nextest build.
+///
+/// `cargo ktstr test` and `cargo ktstr coverage` accept nextest (or
+/// cargo-llvm-cov-nextest) argv, not raw `cargo test` argv. Most build-shaping
+/// spellings are shared, but nextest calls the harness profile
+/// `--cargo-profile`, its compile parallelism `--build-jobs`, and
+/// cargo-llvm-cov calls a test-only workspace exclusion
+/// `--exclude-from-test`. Normalize those three onto Cargo's spellings while
+/// preserving package, target, feature, resolution, and artifact-placement
+/// controls byte-for-byte. Runtime filters and test-binary arguments are
+/// deliberately omitted: they cannot change which distributed registry is
+/// linked, and `--` makes the remaining suffix opaque.
+///
+/// The caller passes the argv *after* metadata-driven smart feature
+/// preparation. Consequently inferred package-qualified roots and explicit
+/// feature modes (`--all-features`, `--no-default-features`, composite
+/// `--features` expressions) all reach the registry build through the same
+/// path as the final nextest invocation.
+pub(crate) fn test_registry_build_options(args: &[String]) -> Vec<String> {
+    let args = cargo_args(args);
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+
+        let (output_flag, takes_value) = match argument.as_str() {
+            // Package selection.
+            "-p" | "--package" | "--exclude" => (Some(argument.as_str()), true),
+            "--exclude-from-test" => (Some("--exclude"), true),
+            "--workspace" => (Some("--workspace"), false),
+            "--all" => (Some("--workspace"), false),
+
+            // Cargo target selection. `cargo test --no-run` gives these the
+            // same unit/integration harness semantics as nextest.
+            "--lib" | "--bins" | "--examples" | "--tests" | "--benches" | "--all-targets" => {
+                (Some(argument.as_str()), false)
+            }
+            "--bin" | "--example" | "--test" | "--bench" => (Some(argument.as_str()), true),
+
+            // Feature modes.
+            "-F" | "--features" => (Some(argument.as_str()), true),
+            "--all-features" | "--no-default-features" => (Some(argument.as_str()), false),
+
+            // Compilation context. `-r` is nextest's short spelling too.
+            "-r" | "--release" => (Some("--release"), false),
+            "--cargo-profile" => (Some("--profile"), true),
+            "--target" | "--target-dir" => (Some(argument.as_str()), true),
+            "--build-jobs" => (Some("--jobs"), true),
+
+            // Cargo resolution / manifest context.
+            "--manifest-path" | "--config" | "-Z" => (Some(argument.as_str()), true),
+            "--frozen" | "--locked" | "--offline" | "--ignore-rust-version" => {
+                (Some(argument.as_str()), false)
+            }
+            _ => (None, false),
+        };
+
+        if let Some(output_flag) = output_flag {
+            out.push(output_flag.to_string());
+            if takes_value {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    out.push(value.clone());
+                }
+            }
+            index += 1;
+            continue;
+        }
+
+        // Attached long forms.
+        if argument.starts_with("--package=")
+            || argument.starts_with("--exclude=")
+            || argument.starts_with("--features=")
+            || argument.starts_with("--target=")
+            || argument.starts_with("--target-dir=")
+            || argument.starts_with("--manifest-path=")
+            || argument.starts_with("--config=")
+        {
+            out.push(argument.clone());
+        } else if let Some(value) = argument.strip_prefix("--exclude-from-test=") {
+            out.push(format!("--exclude={value}"));
+        } else if let Some(value) = argument.strip_prefix("--cargo-profile=") {
+            out.push(format!("--profile={value}"));
+        } else if let Some(value) = argument.strip_prefix("--build-jobs=") {
+            out.push(format!("--jobs={value}"));
+        } else if (argument.starts_with("-p") && argument.len() > 2)
+            || (argument.starts_with("-F") && argument.len() > 2)
+            || (argument.starts_with("-Z") && argument.len() > 2)
+        {
+            out.push(argument.clone());
+        }
+        index += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 fn metadata_other_options(args: &[String], mode: MetadataMode) -> Vec<String> {
     let mut options = metadata_passthrough_options(args);

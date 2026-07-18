@@ -1434,6 +1434,7 @@ fn apply_relevant_narrowing(
     base: Option<String>,
     base_ref: Option<String>,
     default_branch: String,
+    release: bool,
 ) -> Result<Vec<String>, String> {
     if !relevant {
         return Ok(args);
@@ -1442,6 +1443,8 @@ fn apply_relevant_narrowing(
         base.as_deref(),
         base_ref.as_deref(),
         &default_branch,
+        &args,
+        release,
     ) {
         Ok(Some(expr)) => Ok(compose_relevant_filter(args, &expr)),
         Ok(None) => Ok(args),
@@ -1466,8 +1469,11 @@ pub(crate) fn run_test(
 ) -> Result<(), String> {
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     ktstr::cli::check_tools(&["cargo-nextest"]).map_err(|e| format!("{e:#}"))?;
-    let args = apply_relevant_narrowing(args, relevant, base, base_ref, default_branch)?;
+    // Smart feature inference must precede registry discovery: `--relevant`
+    // probes the exact feature/package/target/profile selection the eventual
+    // nextest run will build, rather than a second workspace-wide default.
     let args = prepare_nextest_args(args)?;
+    let args = apply_relevant_narrowing(args, relevant, base, base_ref, default_branch, release)?;
     run_cargo_sub(
         TEST_SUB_ARGV,
         "tests",
@@ -1499,10 +1505,10 @@ pub(crate) fn run_coverage(
 ) -> Result<(), String> {
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     ktstr::cli::check_tools(&["cargo-nextest", "cargo-llvm-cov"]).map_err(|e| format!("{e:#}"))?;
-    let args = apply_relevant_narrowing(args, relevant, base, base_ref, default_branch)?;
     // `coverage` runs the same suite through `cargo llvm-cov nextest`, so use
     // the same version guard and targeted feature inference as `test`.
     let args = prepare_nextest_args(args)?;
+    let args = apply_relevant_narrowing(args, relevant, base, base_ref, default_branch, release)?;
     run_cargo_sub(
         COVERAGE_SUB_ARGV,
         "coverage",
@@ -2035,8 +2041,9 @@ mod tests {
     #[test]
     fn apply_relevant_narrowing_off_is_noop() {
         let args = strs(&["-E", "test(x)", "--features", "y"]);
-        let out = apply_relevant_narrowing(args.clone(), false, None, None, "main".to_string())
-            .expect("no-op path never errors");
+        let out =
+            apply_relevant_narrowing(args.clone(), false, None, None, "main".to_string(), false)
+                .expect("no-op path never errors");
         assert_eq!(out, args);
     }
 

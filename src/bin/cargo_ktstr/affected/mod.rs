@@ -115,19 +115,23 @@ fn package_schedulers(schedulers: &[SchedulerInfo]) -> Vec<String> {
 /// `test_count` across binaries (a scheduler may be registered in more than
 /// one test binary).
 fn enumerate_schedulers() -> Result<Vec<SchedulerInfo>> {
-    let per_binary: Vec<Vec<ktstr::test_support::SchedulerListEntry>> = crate::misc::probe_collect(
-        None,
-        false,
-        |bin| {
-            let mut c = Command::new(bin);
-            c.arg("--ktstr-list-schedulers");
-            c
-        },
-        |_bin, out| {
-            serde_json::from_slice::<Vec<ktstr::test_support::SchedulerListEntry>>(&out.stdout)
-                .map_err(|e| format!("parse --ktstr-list-schedulers output: {e}"))
-        },
-    )
+    enumerate_schedulers_from_bins(None)
+}
+
+fn enumerate_schedulers_from_bins(bins: Option<&[PathBuf]>) -> Result<Vec<SchedulerInfo>> {
+    let configure = |bin: &Path| {
+        let mut command = Command::new(bin);
+        command.arg("--ktstr-list-schedulers");
+        command
+    };
+    let parse = |_bin: &Path, out: &std::process::Output| {
+        serde_json::from_slice::<Vec<ktstr::test_support::SchedulerListEntry>>(&out.stdout)
+            .map_err(|e| format!("parse --ktstr-list-schedulers output: {e}"))
+    };
+    let per_binary: Vec<Vec<ktstr::test_support::SchedulerListEntry>> = match bins {
+        Some(bins) => crate::misc::probe_collect_from_bins(bins, configure, parse),
+        None => crate::misc::probe_collect(None, false, configure, parse),
+    }
     .map_err(|e| anyhow!("probe test binaries for declared schedulers: {e:?}"))?;
 
     let mut by_name: BTreeMap<String, SchedulerInfo> = BTreeMap::new();
@@ -149,25 +153,24 @@ fn enumerate_schedulers() -> Result<Vec<SchedulerInfo>> {
     Ok(by_name.into_values().collect())
 }
 
-/// Enumerate declared tests with their scheduler by probing the target's built
-/// test binaries with `--ktstr-list-scheduler-tests`. Used by
-/// [`relevant_test_filter`] to map each test onto its scheduler's package.
-/// Deduplicates by test name (a test is registered in exactly one binary; the
-/// probe visits each binary, so re-seen entries are idempotent).
-fn enumerate_scheduler_tests() -> Result<Vec<ktstr::test_support::SchedulerTestJson>> {
-    let per_binary: Vec<Vec<ktstr::test_support::SchedulerTestJson>> = crate::misc::probe_collect(
-        None,
-        false,
-        |bin| {
-            let mut c = Command::new(bin);
-            c.arg("--ktstr-list-scheduler-tests");
-            c
-        },
-        |_bin, out| {
-            serde_json::from_slice::<Vec<ktstr::test_support::SchedulerTestJson>>(&out.stdout)
-                .map_err(|e| format!("parse --ktstr-list-scheduler-tests output: {e}"))
-        },
-    )
+/// Enumerate declared tests with their scheduler from the exact registry
+/// executables selected for `--relevant`.
+fn enumerate_scheduler_tests_from_bins(
+    bins: Option<&[PathBuf]>,
+) -> Result<Vec<ktstr::test_support::SchedulerTestJson>> {
+    let configure = |bin: &Path| {
+        let mut command = Command::new(bin);
+        command.arg("--ktstr-list-scheduler-tests");
+        command
+    };
+    let parse = |_bin: &Path, out: &std::process::Output| {
+        serde_json::from_slice::<Vec<ktstr::test_support::SchedulerTestJson>>(&out.stdout)
+            .map_err(|e| format!("parse --ktstr-list-scheduler-tests output: {e}"))
+    };
+    let per_binary: Vec<Vec<ktstr::test_support::SchedulerTestJson>> = match bins {
+        Some(bins) => crate::misc::probe_collect_from_bins(bins, configure, parse),
+        None => crate::misc::probe_collect(None, false, configure, parse),
+    }
     .map_err(|e| anyhow!("probe test binaries for declared tests: {e:?}"))?;
 
     let mut by_name: BTreeMap<String, ktstr::test_support::SchedulerTestJson> = BTreeMap::new();
@@ -344,8 +347,19 @@ pub(crate) fn relevant_test_filter(
     base: Option<&str>,
     base_ref: Option<&str>,
     default_branch: &str,
+    registry_args: &[String],
+    release: bool,
 ) -> Result<Option<String>> {
-    let schedulers = enumerate_schedulers().context("enumerate declared schedulers")?;
+    // Build once from the caller's already-prepared nextest selection, then
+    // reuse the exact executable set for scheduler and per-test enumeration.
+    // Rebuilding through the workspace-wide probe here would silently discard
+    // `-p`/`--exclude`, target, harness profile, and feature modes and can
+    // discover a different registry than the final test/coverage run.
+    let bins = crate::misc::build_contextual_test_binaries(registry_args, release)
+        .map_err(anyhow::Error::msg)
+        .context("build selected test registries")?;
+    let schedulers =
+        enumerate_schedulers_from_bins(Some(&bins)).context("enumerate declared schedulers")?;
     let (outcome, _testable) = compute_outcome(base, base_ref, default_branch, true, &schedulers)?;
 
     // RunAll / Empty resolve without the per-test scheduler map, so skip the
@@ -358,7 +372,8 @@ pub(crate) fn relevant_test_filter(
         .iter()
         .map(|s| (s.name.as_str(), s.package.as_deref()))
         .collect();
-    let tests = enumerate_scheduler_tests().context("enumerate declared tests")?;
+    let tests =
+        enumerate_scheduler_tests_from_bins(Some(&bins)).context("enumerate declared tests")?;
     Ok(select_relevant_tests(&outcome, &pkg_of, &tests))
 }
 
