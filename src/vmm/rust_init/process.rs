@@ -188,10 +188,7 @@ fn spawn_with_pidfd_inner(
         )),
     };
 
-    let mut child = match spawn_result {
-        Ok(child) => child,
-        Err(error) => return Err(error),
-    };
+    let mut child = spawn_result?;
 
     // A successful exec proves the child received PIDFD_RIGHTS_ACK. The
     // receiver sends that ACK only after this bounded channel owns the exact
@@ -701,6 +698,29 @@ pub(crate) enum PidfdSignalOutcome {
     AlreadyExited,
 }
 
+#[derive(Debug)]
+pub(crate) enum SchedulerReapOutcome {
+    Status(std::process::ExitStatus),
+    /// The retained pidfd proved terminal readiness, but SIGCHLD=SIG_IGN
+    /// auto-reaped the child before `Child::wait` could recover a status.
+    TerminalWithoutStatus,
+    TimedOut,
+    ObserverError(String),
+}
+
+impl SchedulerReapOutcome {
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(self, Self::Status(_) | Self::TerminalWithoutStatus)
+    }
+
+    pub(crate) fn status(&self) -> Option<&std::process::ExitStatus> {
+        match self {
+            Self::Status(status) => Some(status),
+            Self::TerminalWithoutStatus | Self::TimedOut | Self::ObserverError(_) => None,
+        }
+    }
+}
+
 impl CurrentSchedulerProcess {
     pub(crate) fn pid(&self) -> libc::pid_t {
         self.child.id() as libc::pid_t
@@ -743,24 +763,41 @@ impl CurrentSchedulerProcess {
     pub(crate) fn reap_bounded_status(
         &mut self,
         timeout: std::time::Duration,
-    ) -> Option<std::process::ExitStatus> {
-        let status = self.reap_bounded_status_inner(timeout);
-        self.drop_reap_exhausted = status.is_none();
-        status
+    ) -> SchedulerReapOutcome {
+        let outcome = self.reap_bounded_status_inner(timeout);
+        self.drop_reap_exhausted = matches!(
+            &outcome,
+            SchedulerReapOutcome::TimedOut | SchedulerReapOutcome::ObserverError(_)
+        );
+        outcome
     }
 
-    fn reap_bounded_status_inner(
-        &mut self,
-        timeout: std::time::Duration,
-    ) -> Option<std::process::ExitStatus> {
-        if let Ok(Some(status)) = self.child.try_wait() {
-            return Some(status);
+    fn reap_bounded_status_inner(&mut self, timeout: std::time::Duration) -> SchedulerReapOutcome {
+        match self.child.try_wait() {
+            Ok(Some(status)) => return SchedulerReapOutcome::Status(status),
+            Ok(None) => {}
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => match self.is_alive() {
+                Ok(false) => return SchedulerReapOutcome::TerminalWithoutStatus,
+                Ok(true) => {}
+                Err(error) => return SchedulerReapOutcome::ObserverError(error),
+            },
+            Err(error) => {
+                tracing::warn!(
+                    pid = self.pid(),
+                    error = %error,
+                    "scheduler Child::try_wait failed before pidfd terminal observation"
+                );
+            }
         }
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let now = std::time::Instant::now();
             if now >= deadline {
-                return self.child.try_wait().ok().flatten();
+                return match self.is_alive() {
+                    Ok(false) => self.status_after_pidfd_terminal(),
+                    Ok(true) => SchedulerReapOutcome::TimedOut,
+                    Err(error) => SchedulerReapOutcome::ObserverError(error),
+                };
             }
             let remaining = deadline.saturating_duration_since(now);
             let timeout_ms =
@@ -782,13 +819,13 @@ impl CurrentSchedulerProcess {
                     error = %error,
                     "scheduler pidfd terminal wait failed"
                 );
-                return self.child.try_wait().ok().flatten();
+                return SchedulerReapOutcome::ObserverError(error.to_string());
             }
             if rc == 0 {
                 continue;
             }
             if pfd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-                return self.child.wait().ok();
+                return self.status_after_pidfd_terminal();
             }
             if pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
                 tracing::warn!(
@@ -796,8 +833,23 @@ impl CurrentSchedulerProcess {
                     revents = pfd.revents,
                     "scheduler pidfd returned invalid terminal wait events"
                 );
-                return self.child.try_wait().ok().flatten();
+                return SchedulerReapOutcome::ObserverError(format!(
+                    "scheduler pidfd returned invalid terminal wait events {:#x}",
+                    pfd.revents
+                ));
             }
+        }
+    }
+
+    fn status_after_pidfd_terminal(&mut self) -> SchedulerReapOutcome {
+        match self.child.wait() {
+            Ok(status) => SchedulerReapOutcome::Status(status),
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                SchedulerReapOutcome::TerminalWithoutStatus
+            }
+            Err(error) => SchedulerReapOutcome::ObserverError(format!(
+                "scheduler pidfd was terminal but Child::wait failed: {error}"
+            )),
         }
     }
 }
@@ -850,9 +902,9 @@ impl SchedulerProcessOwnerGuard<'_> {
     pub(crate) fn install(
         &mut self,
         process: CurrentSchedulerProcess,
-    ) -> Result<(), CurrentSchedulerProcess> {
+    ) -> Result<(), Box<CurrentSchedulerProcess>> {
         if self.guard.is_some() {
-            return Err(process);
+            return Err(Box::new(process));
         }
         *self.guard = Some(process);
         Ok(())

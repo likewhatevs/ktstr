@@ -117,7 +117,14 @@ impl Latch {
     /// loop re-checks the flag and recomputes the remaining duration
     /// against an absolute deadline.
     pub fn wait_timeout(&self, timeout: std::time::Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
+        self.wait_until(std::time::Instant::now() + timeout)
+    }
+
+    /// Block until `set` is called or the caller's shared absolute deadline
+    /// arrives. Unlike repeated relative `wait_timeout` calls, handing the
+    /// same deadline through a retry loop cannot silently multiply its total
+    /// wait budget.
+    pub fn wait_until(&self, deadline: std::time::Instant) -> bool {
         let mut guard = self.set.lock().unwrap();
         while !*guard {
             let now = std::time::Instant::now();

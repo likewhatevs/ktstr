@@ -363,12 +363,19 @@ fn dump_sched_output_with(
     wait_for_forwarders: impl FnOnce(&str) -> bool,
     send: impl FnMut(&[u8]) -> bool,
 ) -> bool {
-    dump_sched_output_with_wire(log_path, wait_for_forwarders, send, None)
+    dump_sched_output_with_wire(
+        log_path,
+        std::time::Instant::now() + super::scheduler::SCHED_FORWARDER_DRAIN_BOUND,
+        |path, _deadline| wait_for_forwarders(path),
+        send,
+        None,
+    )
 }
 
 fn dump_sched_output_with_wire(
     log_path: &str,
-    wait_for_forwarders: impl FnOnce(&str) -> bool,
+    forwarder_deadline: std::time::Instant,
+    wait_for_forwarders: impl FnOnce(&str, std::time::Instant) -> bool,
     mut send: impl FnMut(&[u8]) -> bool,
     mut wire: Option<&mut SchedLogWireLease<'_>>,
 ) -> bool {
@@ -389,7 +396,7 @@ fn dump_sched_output_with_wire(
     // reaped, but the forwarders may still be draining the final pipe
     // bytes. Wait (bounded) so the dumped file — and the live
     // SchedStdout/SchedStderr streams — carry the complete output.
-    if !wait_for_forwarders(log_path) {
+    if !wait_for_forwarders(log_path, forwarder_deadline) {
         return false;
     }
 
@@ -423,7 +430,7 @@ fn dump_sched_output_with_wire(
         if !send(crate::verifier::SCHED_OUTPUT_START.as_bytes()) {
             return false;
         }
-        if let Some(wire) = wire.as_deref_mut() {
+        if let Some(wire) = wire.as_mut() {
             wire.mark_open();
         }
         lease.mark_start_sent();
@@ -456,7 +463,7 @@ fn dump_sched_output_with_wire(
         if !send(crate::verifier::SCHED_OUTPUT_END.as_bytes()) {
             return false;
         }
-        if let Some(wire) = wire.as_deref_mut() {
+        if let Some(wire) = wire.as_mut() {
             wire.mark_closed();
         }
         lease.mark_end_sent();
@@ -488,9 +495,10 @@ pub(crate) fn dump_sched_output_before_terminal(log_path: &str) -> bool {
         sched_log_wire_coordinator(),
         &owner,
         log_path,
-        |wire| {
+        |wire, forwarder_deadline| {
             let complete = dump_sched_output_with_wire(
                 log_path,
+                forwarder_deadline,
                 super::scheduler::wait_sched_forwarders_drained,
                 crate::vmm::guest_comms::try_send_sched_log,
                 Some(wire),
@@ -505,7 +513,7 @@ fn dump_sched_output_before_terminal_with(
     coordinator: &SchedLogWireCoordinator,
     owner: &str,
     log_path: &str,
-    mut dump: impl FnMut(&mut SchedLogWireLease<'_>) -> SchedLogDumpAttempt,
+    mut dump: impl FnMut(&mut SchedLogWireLease<'_>, std::time::Instant) -> SchedLogDumpAttempt,
     mut diagnose: impl FnMut(&str),
 ) -> bool {
     let mut lease = match coordinator.acquire(owner.to_owned()) {
@@ -518,8 +526,10 @@ fn dump_sched_output_before_terminal_with(
             return false;
         }
     };
+    let forwarder_deadline =
+        std::time::Instant::now() + super::scheduler::SCHED_FORWARDER_DRAIN_BOUND;
     for _ in 0..TERMINAL_SCHED_LOG_DUMP_ATTEMPTS {
-        let attempt = dump(&mut lease);
+        let attempt = dump(&mut lease, forwarder_deadline);
         if attempt.complete {
             lease.mark_closed();
             lease.finish();
@@ -633,7 +643,7 @@ fn send_synthetic_sched_output_before_terminal_with(
         coordinator,
         owner,
         owner,
-        |wire| {
+        |wire, _forwarder_deadline| {
             while next_frame < frames.len() {
                 if !send(frames[next_frame]) {
                     return SchedLogDumpAttempt { complete: false };
@@ -1762,19 +1772,32 @@ fn spawn_sched_exit_monitor_thread(
         .spawn(task)
 }
 
-fn start_sched_exit_monitor_inner<F>(
+struct SchedExitMonitorConfig<'a> {
     pid: u32,
     pidfd: OwnedFd,
-    log_path: Option<&str>,
+    log_path: Option<&'a str>,
     suppress_sched_log: Arc<AtomicBool>,
     probe_output_done: Option<Arc<crate::sync::Latch>>,
     publish_sched_exit: SchedExitPublisher,
     create_wake_writer: bool,
+}
+
+fn start_sched_exit_monitor_inner<F>(
+    config: SchedExitMonitorConfig<'_>,
     spawn_thread: F,
 ) -> std::io::Result<SchedExitStop>
 where
     F: FnOnce(SchedExitMonitorTask) -> std::io::Result<std::thread::JoinHandle<bool>>,
 {
+    let SchedExitMonitorConfig {
+        pid,
+        pidfd,
+        log_path,
+        suppress_sched_log,
+        probe_output_done,
+        publish_sched_exit,
+        create_wake_writer,
+    } = config;
     let log_path = log_path.map(|s| s.to_string());
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();
@@ -2067,13 +2090,15 @@ pub(crate) fn start_pending_sched_exit_monitor(
     probe_output_done: Option<Arc<crate::sync::Latch>>,
 ) -> std::io::Result<SchedExitStop> {
     start_sched_exit_monitor_inner(
-        pid,
-        pidfd,
-        log_path,
-        suppress_sched_log,
-        probe_output_done,
-        Arc::new(crate::vmm::guest_comms::send_sched_exit),
-        true,
+        SchedExitMonitorConfig {
+            pid,
+            pidfd,
+            log_path,
+            suppress_sched_log,
+            probe_output_done,
+            publish_sched_exit: Arc::new(crate::vmm::guest_comms::send_sched_exit),
+            create_wake_writer: true,
+        },
         spawn_sched_exit_monitor_thread,
     )
 }
@@ -2113,13 +2138,15 @@ pub(crate) fn start_sched_exit_monitor_without_wake_writer_for_test(
     pidfd: OwnedFd,
 ) -> std::io::Result<SchedExitStop> {
     let monitor = start_sched_exit_monitor_inner(
-        sched_pid,
-        pidfd,
-        None,
-        Arc::new(AtomicBool::new(false)),
-        None,
-        Arc::new(crate::vmm::guest_comms::send_sched_exit),
-        false,
+        SchedExitMonitorConfig {
+            pid: sched_pid,
+            pidfd,
+            log_path: None,
+            suppress_sched_log: Arc::new(AtomicBool::new(false)),
+            probe_output_done: None,
+            publish_sched_exit: Arc::new(crate::vmm::guest_comms::send_sched_exit),
+            create_wake_writer: false,
+        },
         spawn_sched_exit_monitor_thread,
     )?;
     if let Err(terminal) = monitor.commit() {
@@ -2135,13 +2162,15 @@ pub(crate) fn start_sched_exit_monitor_with_spawn_failure_for_test(
     pidfd: OwnedFd,
 ) -> std::io::Result<SchedExitStop> {
     start_sched_exit_monitor_inner(
-        sched_pid,
-        pidfd,
-        None,
-        Arc::new(AtomicBool::new(false)),
-        None,
-        Arc::new(crate::vmm::guest_comms::send_sched_exit),
-        true,
+        SchedExitMonitorConfig {
+            pid: sched_pid,
+            pidfd,
+            log_path: None,
+            suppress_sched_log: Arc::new(AtomicBool::new(false)),
+            probe_output_done: None,
+            publish_sched_exit: Arc::new(crate::vmm::guest_comms::send_sched_exit),
+            create_wake_writer: true,
+        },
         |_task| {
             Err(std::io::Error::other(
                 "injected sched-exit monitor thread spawn failure",
@@ -2241,8 +2270,9 @@ pub(crate) fn exec_shell_line(line: &str) -> Result<(), ()> {
 mod tests {
     use super::super::scheduler::ProbeDrain;
     use super::{
-        HvcControlDecoder, HvcControlEvent, SchedExitCommitError, SchedExitPublicationGate,
-        SchedExitTerminal, SchedLogDumpAttempt, SchedLogWireCoordinator, SchedLogWireLease,
+        HvcControlDecoder, HvcControlEvent, SchedExitCommitError, SchedExitMonitorConfig,
+        SchedExitPublicationGate, SchedExitTerminal, SchedLogDumpAttempt, SchedLogWireCoordinator,
+        SchedLogWireLease,
         drain_probe_for_shutdown, dump_sched_output_before_terminal_with, dump_sched_output_with,
         dump_sched_output_with_wire, send_synthetic_sched_output_before_terminal_with,
         spawn_sched_exit_monitor_thread, staged_scheduler_log_paths,
@@ -2274,15 +2304,17 @@ mod tests {
         publications: Arc<AtomicUsize>,
     ) -> super::SchedExitStop {
         start_sched_exit_monitor_inner(
-            pid,
-            pidfd,
-            None,
-            Arc::new(AtomicBool::new(false)),
-            None,
-            Arc::new(move |_exit_code| {
-                publications.fetch_add(1, Ordering::SeqCst);
-            }),
-            true,
+            SchedExitMonitorConfig {
+                pid,
+                pidfd,
+                log_path: None,
+                suppress_sched_log: Arc::new(AtomicBool::new(false)),
+                probe_output_done: None,
+                publish_sched_exit: Arc::new(move |_exit_code| {
+                    publications.fetch_add(1, Ordering::SeqCst);
+                }),
+                create_wake_writer: true,
+            },
             spawn_sched_exit_monitor_thread,
         )
         .expect("start counted scheduler-exit monitor")
@@ -2305,7 +2337,13 @@ mod tests {
         wire: &mut SchedLogWireLease<'_>,
         send: impl FnMut(&[u8]) -> bool,
     ) -> SchedLogDumpAttempt {
-        let complete = dump_sched_output_with_wire(path, |_| true, send, Some(wire));
+        let complete = dump_sched_output_with_wire(
+            path,
+            std::time::Instant::now(),
+            |_, _| true,
+            send,
+            Some(wire),
+        );
         SchedLogDumpAttempt { complete }
     }
 
@@ -2664,13 +2702,14 @@ mod tests {
             &coordinator,
             "terminal-resume",
             &path,
-            |wire| {
+            |wire, forwarder_deadline| {
                 let attempt = attempts;
                 attempts += 1;
                 let mut frame = 0usize;
                 let complete = dump_sched_output_with_wire(
                     &path,
-                    |_| true,
+                    forwarder_deadline,
+                    |_, _| true,
                     |chunk| {
                         let reject = (attempt == 0 && frame == 2) || (attempt == 1 && frame == 1);
                         frame += 1;
@@ -2709,6 +2748,7 @@ mod tests {
     fn terminal_dump_exhaustion_is_bounded_and_diagnosed_once() {
         let path = "/tmp/sched_exhausted_18446744073709551615.log";
         let mut attempts = 0usize;
+        let mut forwarder_deadlines = Vec::new();
         let mut diagnostics = Vec::<String>::new();
         let coordinator = SchedLogWireCoordinator::new();
 
@@ -2716,8 +2756,9 @@ mod tests {
             &coordinator,
             "terminal-exhaustion",
             path,
-            |_wire| {
+            |_wire, forwarder_deadline| {
                 attempts += 1;
+                forwarder_deadlines.push(forwarder_deadline);
                 SchedLogDumpAttempt { complete: false }
             },
             |diagnostic| diagnostics.push(diagnostic.to_owned()),
@@ -2727,6 +2768,12 @@ mod tests {
             attempts,
             super::TERMINAL_SCHED_LOG_DUMP_ATTEMPTS,
             "terminal publication must not retry without a fixed bound"
+        );
+        assert!(
+            forwarder_deadlines
+                .windows(2)
+                .all(|pair| pair[0] == pair[1]),
+            "terminal retries must share one absolute drain deadline"
         );
         assert_eq!(
             diagnostics.len(),
@@ -2751,7 +2798,7 @@ mod tests {
             &coordinator,
             "open-path",
             "/tmp/sched_open_1.log",
-            |wire| {
+            |wire, _forwarder_deadline| {
                 wire.mark_open();
                 SchedLogDumpAttempt { complete: false }
             },
@@ -2789,7 +2836,7 @@ mod tests {
                 &before_start,
                 "panic-before-start",
                 "/tmp/panic-before-start.log",
-                |_wire| panic!("injected pre-START panic"),
+                |_wire, _forwarder_deadline| panic!("injected pre-START panic"),
                 |_| panic!("panic path must not diagnose"),
             );
         }));
@@ -2813,7 +2860,7 @@ mod tests {
                 &after_start,
                 "panic-after-start",
                 "/tmp/panic-after-start.log",
-                |wire| {
+                |wire, _forwarder_deadline| {
                     wire.mark_open();
                     panic!("injected post-START panic");
                 },
@@ -2856,7 +2903,7 @@ mod tests {
                 &first_coordinator,
                 "first-path",
                 &first_path,
-                |wire| {
+                |wire, _forwarder_deadline| {
                     sched_log_path_attempt_for_test(&first_path, wire, |chunk| {
                         first_frames
                             .lock()
@@ -2887,7 +2934,7 @@ mod tests {
                 &second_coordinator,
                 "second-path",
                 &second_path,
-                |wire| {
+                |wire, _forwarder_deadline| {
                     sched_log_path_attempt_for_test(&second_path, wire, |chunk| {
                         second_frames
                             .lock()
@@ -2944,7 +2991,7 @@ mod tests {
                 &path_coordinator,
                 "path",
                 &path,
-                |wire| {
+                |wire, _forwarder_deadline| {
                     sched_log_path_attempt_for_test(&path, wire, |chunk| {
                         path_frames
                             .lock()
@@ -3475,7 +3522,7 @@ mod tests {
                 .push(&[crate::vmm::wire::SIGNAL_ATTACH_FINISHED_ACK, b'0', b'1',])
                 .is_empty()
         );
-        assert_eq!(decoder.push(&[b'A']), vec![HvcControlEvent::Signal(b'A')]);
+        assert_eq!(decoder.push(b"A"), vec![HvcControlEvent::Signal(b'A')]);
     }
 
     #[test]

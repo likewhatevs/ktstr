@@ -1608,58 +1608,62 @@ impl Drop for SpawnedScheduler {
 /// [`wait_sched_forwarders_drained`] lets the dump paths restore the
 /// old completeness guarantee by waiting (bounded) on this registry
 /// before reading the file.
+struct SchedulerForwarder {
+    handle: std::thread::JoinHandle<()>,
+    drained: Arc<crate::sync::Latch>,
+}
+
+impl SchedulerForwarder {
+    fn join(self) {
+        let _ = self.handle.join();
+    }
+}
+
+struct ForwarderDrainOnDrop(Arc<crate::sync::Latch>);
+
+impl Drop for ForwarderDrainOnDrop {
+    fn drop(&mut self) {
+        self.0.set();
+    }
+}
+
 static SCHED_FWD_THREADS: OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, Vec<std::thread::JoinHandle<()>>>>,
+    std::sync::Mutex<std::collections::HashMap<String, Vec<SchedulerForwarder>>>,
 > = OnceLock::new();
+
+pub(crate) const SCHED_FORWARDER_DRAIN_BOUND: std::time::Duration =
+    std::time::Duration::from_secs(5);
 
 /// Wait (bounded) for the stdio forwarders registered against
 /// `log_path` to finish draining the dead child's pipes, so the merged
 /// log file and the live `SchedStdout`/`SchedStderr` streams both carry
 /// the child's complete output. Callers run AFTER the child was
 /// reaped, so EOF is already pending on both pipes and the wait is
-/// normally a few polls; the bound only trips if a forwarder wedges
+/// normally an immediate latch observation; the bound only trips if a
+/// forwarder wedges
 /// (e.g. blocked on virtio backpressure the host never drains). On that
 /// bound the handles remain registered and `false` makes the log transaction
 /// retryable; it never frames a knowingly incomplete file. No-op success when
 /// no forwarder was registered for the path (file-only fallback wiring, or a
 /// completed prior drain).
-pub(crate) fn wait_sched_forwarders_drained(log_path: &str) -> bool {
-    use std::time::{Duration, Instant};
-    const DRAIN_BOUND: Duration = Duration::from_secs(5);
+pub(crate) fn wait_sched_forwarders_drained(log_path: &str, deadline: std::time::Instant) -> bool {
     let Some(map) = SCHED_FWD_THREADS.get() else {
         return true;
     };
-    let deadline = Instant::now() + DRAIN_BOUND;
-    loop {
-        let (finished, all_drained) = {
-            let mut registry = map
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(handles) = registry.get_mut(log_path) else {
-                return true;
-            };
-            let mut finished = Vec::new();
-            let mut index = 0;
-            while index < handles.len() {
-                if handles[index].is_finished() {
-                    finished.push(handles.swap_remove(index));
-                } else {
-                    index += 1;
-                }
-            }
-            let all_drained = handles.is_empty();
-            if all_drained {
-                registry.remove(log_path);
-            }
-            (finished, all_drained)
-        };
-        for handle in finished {
-            let _ = handle.join();
-        }
-        if all_drained {
+    let drained = {
+        let registry = map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(forwarders) = registry.get(log_path) else {
             return true;
-        }
-        if Instant::now() >= deadline {
+        };
+        forwarders
+            .iter()
+            .map(|forwarder| forwarder.drained.clone())
+            .collect::<Vec<_>>()
+    };
+    for completion in drained {
+        if !completion.wait_until(deadline) {
             tracing::warn!(
                 log_path,
                 "scheduler stdio forwarders still draining at dump time; \
@@ -1667,8 +1671,17 @@ pub(crate) fn wait_sched_forwarders_drained(log_path: &str) -> bool {
             );
             return false;
         }
-        std::thread::sleep(Duration::from_millis(2));
     }
+
+    let handles = map
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(log_path)
+        .unwrap_or_default();
+    for handle in handles {
+        handle.join();
+    }
+    true
 }
 
 /// Forwarder thread for one scheduler-child pipe: read chunks from
@@ -1695,15 +1708,18 @@ fn spawn_sched_log_forwarder(
     name: &'static str,
     sender: fn(&[u8]) -> bool,
     force_spawn_failure: bool,
-) -> std::io::Result<std::thread::JoinHandle<()>> {
+) -> std::io::Result<SchedulerForwarder> {
     if force_spawn_failure {
         return Err(std::io::Error::other(
             "injected scheduler forwarder spawn failure",
         ));
     }
-    std::thread::Builder::new()
+    let drained = Arc::new(crate::sync::Latch::new());
+    let drain_on_drop = ForwarderDrainOnDrop(drained.clone());
+    let handle = std::thread::Builder::new()
         .name(name.into())
         .spawn(move || {
+            let _drain_on_drop = drain_on_drop;
             let mut buf = [0u8; STDIO_CHUNK_BYTES];
             loop {
                 match read_end.read(&mut buf) {
@@ -1718,7 +1734,8 @@ fn spawn_sched_log_forwarder(
                     Err(_) => break,
                 }
             }
-        })
+        })?;
+    Ok(SchedulerForwarder { handle, drained })
 }
 
 /// Build the `(stdout, stderr)` [`Stdio`] pair for the scheduler child,
@@ -1807,7 +1824,7 @@ fn try_stream_sched_stdio_inner(
             // file descriptors for its fallback child wiring.
             drop(stdout_w);
             drop(stderr_w);
-            let _ = stdout_handle.join();
+            stdout_handle.join();
             tracing::warn!(
                 log_path,
                 error = %error,
@@ -2133,6 +2150,58 @@ mod tests {
                 "partial forwarder setup must not publish a drain registry entry"
             );
         }
+    }
+
+    #[test]
+    fn forwarder_drain_wait_uses_completion_event_and_shared_deadline() {
+        let path = "/tmp/ktstr-forwarder-latch-regression.log";
+        let completion = Arc::new(crate::sync::Latch::new());
+        let thread_completion = completion.clone();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let _signal_on_exit = ForwarderDrainOnDrop(thread_completion);
+            release_rx.recv().expect("release synthetic forwarder");
+        });
+        SCHED_FWD_THREADS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                path.to_string(),
+                vec![SchedulerForwarder {
+                    handle,
+                    drained: completion,
+                }],
+            );
+
+        assert!(
+            !wait_sched_forwarders_drained(path, std::time::Instant::now()),
+            "an expired shared deadline must return without polling"
+        );
+        assert!(
+            SCHED_FWD_THREADS
+                .get()
+                .expect("forwarder registry initialized")
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(path),
+            "a timeout must retain the join handle for a later retry"
+        );
+
+        release_tx.send(()).expect("release synthetic forwarder");
+        assert!(wait_sched_forwarders_drained(
+            path,
+            std::time::Instant::now() + std::time::Duration::from_secs(2)
+        ));
+        assert!(
+            !SCHED_FWD_THREADS
+                .get()
+                .expect("forwarder registry initialized")
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(path),
+            "completed forwarders must be joined and removed"
+        );
     }
 
     #[test]

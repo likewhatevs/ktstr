@@ -967,6 +967,29 @@ fn pidfd_liveness_does_not_consume_child_wait_status() {
 }
 
 #[test]
+fn sigchld_ignored_terminal_reap_is_not_reported_as_timeout() {
+    let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
+    let _restore = SigchldGuard::install(libc::SIG_IGN);
+    let mut owned = scheduler_owner_test_process(44, "/tmp/owner-sigign.log", &OWNER_TEST_SPEC_A);
+    let _ = owned.stop_monitor();
+    assert_eq!(
+        owned.send_signal(libc::SIGKILL),
+        Ok(PidfdSignalOutcome::Delivered)
+    );
+
+    let outcome = owned.reap_bounded_status(std::time::Duration::from_secs(5));
+    assert!(
+        matches!(outcome, SchedulerReapOutcome::TerminalWithoutStatus),
+        "pidfd terminal readiness under SIGCHLD=SIG_IGN must be distinguished \
+         from a live-process timeout (got {outcome:?})"
+    );
+    assert!(
+        !owned.drop_reap_exhausted,
+        "an auto-reaped terminal process must not consume Drop's reap budget"
+    );
+}
+
+#[test]
 fn sched_exit_monitor_reports_an_unreaped_zombie() {
     let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
     let _restore = SigchldGuard::install(libc::SIG_DFL);

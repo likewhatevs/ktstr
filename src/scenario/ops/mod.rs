@@ -1484,7 +1484,6 @@ fn hold_or_sched_died(
         }
         (None, None) => None,
     };
-    #[cfg(not(test))]
     if sched_pid.is_some() && exact_scheduler.is_none() {
         // The caller observed an owner immediately before this clone and a
         // concurrent orderly transition removed it. Treat that exact owner as

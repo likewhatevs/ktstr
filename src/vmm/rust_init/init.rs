@@ -1000,15 +1000,17 @@ pub(crate) fn ktstr_guest_init() -> ! {
             );
             code = 1;
         }
-        let grace_status = if scx_dump_started_latch().is_set() || sched_crashed {
-            process.reap_bounded_status(SCHED_KILL_GRACE)
+        let grace_reap = if scx_dump_started_latch().is_set() || sched_crashed {
+            Some(process.reap_bounded_status(SCHED_KILL_GRACE))
         } else {
             None
         };
-        let exited_in_grace = grace_status.is_some();
+        let exited_in_grace = grace_reap
+            .as_ref()
+            .is_some_and(SchedulerReapOutcome::is_terminal);
         if verifier_workload && code == 0 && exited_in_grace {
             tracing::warn!(
-                status = ?grace_status,
+                outcome = ?grace_reap,
                 "verifier workload: scheduler exited during pre-cleanup crash grace"
             );
             code = 1;
@@ -1049,13 +1051,22 @@ pub(crate) fn ktstr_guest_init() -> ! {
             // The bound caps the rare case where the process can't take its
             // pending SIGKILL promptly; the VM reboot below reaps any
             // straggler, so cap the wait rather than risk blocking teardown.
-            let terminal_status = process.reap_bounded_status(SCHED_REAP_TIMEOUT);
-            if terminal_status.is_none() {
-                tracing::warn!(
-                    ?SCHED_REAP_TIMEOUT,
-                    "scheduler did not exit within the reap bound after SIGKILL \
-                     (still uninterruptible — unexpected); leaving it for VM reboot to reap"
-                );
+            let terminal_reap = process.reap_bounded_status(SCHED_REAP_TIMEOUT);
+            match &terminal_reap {
+                SchedulerReapOutcome::TimedOut => {
+                    tracing::warn!(
+                        ?SCHED_REAP_TIMEOUT,
+                        "scheduler did not exit within the reap bound after SIGKILL \
+                         (still uninterruptible — unexpected); leaving it for VM reboot to reap"
+                    );
+                }
+                SchedulerReapOutcome::ObserverError(error) => {
+                    tracing::warn!(
+                        %error,
+                        "scheduler reap lost exact pidfd observation after SIGKILL"
+                    );
+                }
+                SchedulerReapOutcome::Status(_) | SchedulerReapOutcome::TerminalWithoutStatus => {}
             }
             // A successful kill(2) call is not enough: Linux accepts signals
             // for zombies. Require the wait status produced by our SIGKILL,
@@ -1063,11 +1074,11 @@ pub(crate) fn ktstr_guest_init() -> ! {
             // from one that exited just before cleanup and remained a zombie.
             if verifier_workload
                 && code == 0
-                && !verifier_cleanup_kill_confirmed(kill_sent, terminal_status.as_ref())
+                && !verifier_cleanup_kill_confirmed(kill_sent, terminal_reap.status())
             {
                 tracing::warn!(
                     kill_sent,
-                    status = ?terminal_status,
+                    outcome = ?terminal_reap,
                     "verifier workload: scheduler did not survive until intentional cleanup kill"
                 );
                 code = 1;

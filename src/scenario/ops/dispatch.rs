@@ -3,7 +3,7 @@
 //! [`apply_ops`] is the per-step dispatch loop that drives the [`Op`]
 //! enum against a [`super::ScenarioState`] view, plus its tightly-coupled
 //! per-op helper bundle: scheduler lifecycle ([`spawn_scheduler_for_op`],
-//! [`kill_current_scheduler`], the four `dispatch_*_scheduler` fns,
+//! [`retire_current_scheduler`], the four `dispatch_*_scheduler` fns,
 //! the two `wait_for_*_or_bail` quiesce helpers, [`wait_for_scx_disabled`]),
 //! kernel-Op wire helpers ([`build_kernel_op_request`],
 //! [`write_entries_from_writes`], [`merge_adjacent_cold_writes`],
@@ -1844,10 +1844,24 @@ fn wait_for_scx_disabled(timeout: std::time::Duration) -> Result<std::time::Dura
 /// Both normally resolve together but a slow workqueue can decouple them. The
 /// exact owner pidfd supplies identity-stable SIGTERM/SIGKILL while sysfs
 /// supplies the kernel-state barrier.
-fn kill_current_scheduler(
+struct RetiredScheduler {
+    op_label: &'static str,
+    pid: libc::pid_t,
+    log_path: String,
+    monitor_observed_exit: bool,
+    failures: Vec<String>,
+}
+
+impl RetiredScheduler {
+    fn has_failures(&self) -> bool {
+        !self.failures.is_empty()
+    }
+}
+
+fn retire_current_scheduler(
     owner: &mut crate::vmm::rust_init::SchedulerProcessOwnerGuard<'_>,
-    op_label: &str,
-) -> Result<libc::pid_t> {
+    op_label: &'static str,
+) -> Result<RetiredScheduler> {
     let current = owner.current_mut().ok_or_else(|| {
         anyhow::anyhow!(
             "{op_label}: no scheduler attached (no scheduler process is currently owned); \
@@ -1924,20 +1938,8 @@ fn kill_current_scheduler(
     // move a large diagnostic payload, so it must not extend the stale-accessor
     // invalidation window.
     crate::vmm::guest_comms::send_sched_swap_notify();
-    // Preserve the exact retiring generation's log after owner cleanup;
-    // the coordinated terminal helper independently waits for both pipe
-    // readers to reach EOF and resumes any accepted prefix without duplicate
-    // framing. It also keeps another scheduler's SchedLog transaction from
-    // interleaving before this generation's END.
-    let retired_log_dump_complete =
-        crate::vmm::rust_init::dump_sched_output_before_terminal(&retired_log_path);
 
     let mut failures = Vec::new();
-    if !retired_log_dump_complete {
-        failures.push(format!(
-            "retired scheduler log transaction did not complete: {retired_log_path}"
-        ));
-    }
     if monitor_observed_exit {
         failures.push("exit monitor observed scheduler death before transition".to_string());
     }
@@ -1952,16 +1954,51 @@ fn kill_current_scheduler(
     if let Some(error) = cleanup_error {
         failures.push(format!("exact scheduler process cleanup failed: {error}"));
     }
-    if !failures.is_empty() {
-        anyhow::bail!("{op_label}: {}", failures.join("; "));
+    Ok(RetiredScheduler {
+        op_label,
+        pid,
+        log_path: retired_log_path,
+        monitor_observed_exit,
+        failures,
+    })
+}
+
+/// Drain the retired generation's diagnostic log only after the process-owner
+/// transition guard has been released. The log transaction may wait for pipe
+/// EOF and move a large payload; neither operation needs to serialize scheduler
+/// ownership.
+fn finish_retired_scheduler(mut retired: RetiredScheduler) -> Result<libc::pid_t> {
+    if !crate::vmm::rust_init::dump_sched_output_before_terminal(&retired.log_path) {
+        retired.failures.push(format!(
+            "retired scheduler log transaction did not complete: {}",
+            retired.log_path
+        ));
+    }
+    if !retired.failures.is_empty() {
+        anyhow::bail!("{}: {}", retired.op_label, retired.failures.join("; "));
     }
     tracing::debug!(
-        op = op_label,
-        pid,
-        monitor_observed_exit,
+        op = retired.op_label,
+        pid = retired.pid,
+        monitor_observed_exit = retired.monitor_observed_exit,
         "retired exact scheduler owner"
     );
-    Ok(pid)
+    Ok(retired.pid)
+}
+
+fn finish_retired_after_transition<T>(
+    retired: RetiredScheduler,
+    transition: Result<T>,
+) -> Result<T> {
+    let retirement = finish_retired_scheduler(retired);
+    match (transition, retirement) {
+        (Ok(value), Ok(_pid)) => Ok(value),
+        (Err(error), Ok(_pid)) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(transition), Err(retirement)) => Err(anyhow::anyhow!(
+            "{transition:#}; retired scheduler diagnostics also failed: {retirement:#}"
+        )),
+    }
 }
 
 /// Spawn helper shared by Attach / Restart / Replace arms.
@@ -2117,7 +2154,9 @@ pub(super) fn dispatch_attach_scheduler(
 /// scheduler via the shared exact-owner kill helper.
 pub(super) fn dispatch_detach_scheduler() -> Result<()> {
     let mut owner = crate::vmm::rust_init::lock_scheduler_process_owner();
-    let pid = kill_current_scheduler(&mut owner, "Op::DetachScheduler")?;
+    let retired = retire_current_scheduler(&mut owner, "Op::DetachScheduler")?;
+    drop(owner);
+    let pid = finish_retired_scheduler(retired)?;
     tracing::info!(
         op = "DetachScheduler",
         killed_pid = pid,
@@ -2135,22 +2174,31 @@ pub(super) fn dispatch_detach_scheduler() -> Result<()> {
 /// scheduler survives detach + reattach cleanly) is covered.
 pub(super) fn dispatch_restart_scheduler() -> Result<()> {
     let mut owner = crate::vmm::rust_init::lock_scheduler_process_owner();
-    let prev_pid = kill_current_scheduler(&mut owner, "Op::RestartScheduler")?;
+    let retired = retire_current_scheduler(&mut owner, "Op::RestartScheduler")?;
+    let prev_pid = retired.pid;
+    if retired.has_failures() {
+        drop(owner);
+        return finish_retired_scheduler(retired).map(|_| ());
+    }
     let log = staged_scheduler_log_path("boot");
-    let mut spawned = spawn_scheduler_for_op(
-        "Op::RestartScheduler",
-        "/scheduler",
-        "/sched_args",
-        &log,
-        "boot",
-        crate::vmm::wire::AttachAttemptKind::Restart,
-    )?;
-    commit_spawned_scheduler_owner(
-        "Op::RestartScheduler",
-        &mut owner,
-        &mut spawned,
-        crate::vmm::rust_init::boot_scheduler(),
-    )?;
+    let transition = (|| {
+        let mut spawned = spawn_scheduler_for_op(
+            "Op::RestartScheduler",
+            "/scheduler",
+            "/sched_args",
+            &log,
+            "boot",
+            crate::vmm::wire::AttachAttemptKind::Restart,
+        )?;
+        commit_spawned_scheduler_owner(
+            "Op::RestartScheduler",
+            &mut owner,
+            &mut spawned,
+            crate::vmm::rust_init::boot_scheduler(),
+        )
+    })();
+    drop(owner);
+    finish_retired_after_transition(retired, transition)?;
     tracing::info!(
         op = "RestartScheduler",
         prev_pid = prev_pid,
@@ -2168,33 +2216,41 @@ pub(super) fn dispatch_replace_scheduler(
     scheduler: &'static crate::test_support::Scheduler,
 ) -> Result<()> {
     let mut owner = crate::vmm::rust_init::lock_scheduler_process_owner();
-    let prev_pid = kill_current_scheduler(&mut owner, "Op::ReplaceScheduler")?;
+    let retired = retire_current_scheduler(&mut owner, "Op::ReplaceScheduler")?;
+    let prev_pid = retired.pid;
+    if retired.has_failures() {
+        drop(owner);
+        return finish_retired_scheduler(retired).map(|_| ());
+    }
     let binary = crate::test_support::staged::staged_scheduler_binary_path(scheduler.name);
     let args = crate::test_support::staged::staged_scheduler_args_path(scheduler.name);
     let log = staged_scheduler_log_path(scheduler.name);
-    let mut spawned = spawn_scheduler_for_op(
-        "Op::ReplaceScheduler",
-        &binary,
-        &args,
-        &log,
-        scheduler.name,
-        crate::vmm::wire::AttachAttemptKind::Replace,
-    )?;
-    // Re-install monitor against the replacement scheduler's pid
-    // so death detection persists past the swap. The seq-suffixed
-    // log path matches the spawn_scheduler_for_op log arg above so
-    // failure-dump output goes to the new scheduler's own file.
-    commit_spawned_scheduler_owner(
-        "Op::ReplaceScheduler",
-        &mut owner,
-        &mut spawned,
-        Some(&scheduler.binary),
-    )?;
+    let transition = (|| {
+        let mut spawned = spawn_scheduler_for_op(
+            "Op::ReplaceScheduler",
+            &binary,
+            &args,
+            &log,
+            scheduler.name,
+            crate::vmm::wire::AttachAttemptKind::Replace,
+        )?;
+        // Re-install monitor against the replacement scheduler's pid
+        // so death detection persists past the swap. The seq-suffixed
+        // log path matches the spawn_scheduler_for_op log arg above so
+        // failure-dump output goes to the new scheduler's own file.
+        commit_spawned_scheduler_owner(
+            "Op::ReplaceScheduler",
+            &mut owner,
+            &mut spawned,
+            Some(&scheduler.binary),
+        )
+    })();
     drop(owner);
+    finish_retired_after_transition(retired, transition)?;
     // Quiesce the worker before capturing the baseline seqno.
     // Symmetric with Op::AttachScheduler's wait at L2074:
     // without this gate, a coord scan tick that fired during
-    // kill_current_scheduler (which can take up to
+    // retire_current_scheduler (which can take up to
     // SCHED_LIFECYCLE_KILL_GRACE = 10 s) may still be in a
     // TRYING worker-state when we capture seqno_before. If that
     // in-flight publish completes between our seqno_before snapshot
