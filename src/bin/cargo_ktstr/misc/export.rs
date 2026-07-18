@@ -98,40 +98,35 @@ pub(crate) fn run_export(
     }
 }
 
-/// Assemble the `cargo build --tests --message-format=json` argv,
-/// forwarding the cargo features the running cargo-ktstr was built with.
+/// Assemble the workspace-wide (or explicitly package-scoped)
+/// `cargo build --tests --message-format=json` argv.
 ///
 /// `cargo build --tests` rebuilds every test target AND its
 /// `CARGO_BIN_EXE` dependencies — cargo-ktstr itself included — over the
-/// shared `target/<profile>/cargo-ktstr` slot. The ktstr crate has no
-/// default features and `wprof` is opt-in (default-off), so omitting the
-/// feature flags rebuilds at `{}`, stripping the embedded wprof blob from
-/// the very binary that sibling integration tests spawn via
+/// shared `target/<profile>/cargo-ktstr` slot. `wprof` is opt-in
+/// (default-off), so omitting that capability can strip the embedded wprof
+/// blob from the very binary that sibling integration tests spawn via
 /// `env!("CARGO_BIN_EXE_cargo-ktstr")` — surfacing downstream as a
 /// spurious `/bin/wprof: No such file` inside the guest (the no-wprof
 /// binary's shell-mode path compiles the wprof include out, no error).
-/// Forwarding the running binary's exact feature set makes the rebuild a
-/// fingerprint hit against the already-built artifacts — no downgrade.
+/// [`build_test_binaries`] preserves those capabilities only after metadata
+/// proves that ktstr itself is a selected workspace member, and then uses
+/// package-qualified selectors. They must never be forwarded here as
+/// unqualified features into a consumer workspace.
 fn build_test_binaries_argv(package: Option<&str>, release: bool) -> Vec<String> {
     let mut argv = vec![
         "build".to_string(),
         "--tests".to_string(),
         "--message-format=json".to_string(),
     ];
-    let mut forwarded: Vec<&str> = Vec::new();
-    if cfg!(feature = "wprof") {
-        forwarded.push("wprof");
-    }
-    if cfg!(feature = "integration") {
-        forwarded.push("integration");
-    }
-    if !forwarded.is_empty() {
-        argv.push("--features".to_string());
-        argv.push(forwarded.join(","));
-    }
     if let Some(p) = package {
         argv.push("--package".to_string());
         argv.push(p.to_string());
+    } else {
+        // Probes promise to inspect every workspace registry. Cargo's bare
+        // build selection is only the workspace's default members, which can
+        // omit scheduler/test packages explicitly kept out of default-members.
+        argv.push("--workspace".to_string());
     }
     if release {
         argv.push("--release".to_string());
@@ -170,9 +165,19 @@ pub(crate) fn build_test_binaries(
     {
         return Ok(vec![PathBuf::from(bin)]);
     }
-    let argv =
-        crate::feature_discovery::augment_test_features(build_test_binaries_argv(package, release))
-            .map_err(|error| format!("discover ktstr test features: {error}"))?;
+    let mut self_features = Vec::new();
+    if cfg!(feature = "wprof") {
+        self_features.push("wprof");
+    }
+    if cfg!(feature = "integration") {
+        self_features.push("integration");
+    }
+    let argv = crate::feature_discovery::augment_test_features_with_workspace_package_features(
+        build_test_binaries_argv(package, release),
+        env!("CARGO_PKG_NAME"),
+        &self_features,
+    )
+    .map_err(|error| format!("discover ktstr test features: {error}"))?;
     let mut cmd = Command::new("cargo");
     cmd.args(argv);
     cmd.stdout(std::process::Stdio::piped())
@@ -225,46 +230,26 @@ pub(crate) fn build_test_binaries(
 mod tests {
     use super::build_test_binaries_argv;
 
-    /// Regression pin for the wprof-clobber bug: the test-binary rebuild
-    /// must forward the features the running cargo-ktstr carries, so it
-    /// cannot downgrade the shared `target/<profile>/cargo-ktstr` slot (a
-    /// `CARGO_BIN_EXE` dependency of every test) to a wprof-less binary
-    /// that sibling tests would then spawn. Exercised by both CI legs: the
-    /// no-wprof leg pins the absent-wprof path, the wprof leg pins
-    /// forwarding.
+    /// An unscoped probe promises every workspace test registry, including
+    /// packages excluded from Cargo's default-members. Compile-time features
+    /// of the running cargo-ktstr are deliberately absent here: metadata may
+    /// add them later only as safe `ktstr/FEATURE` selectors when ktstr itself
+    /// is a selected workspace member.
     #[test]
-    fn argv_forwards_running_binary_features() {
+    fn unscoped_argv_selects_workspace_without_unqualified_self_features() {
         let argv = build_test_binaries_argv(None, false);
-        assert_eq!(argv[0], "build");
-        assert_eq!(argv[1], "--tests");
-        assert_eq!(argv[2], "--message-format=json");
-        let features = argv
-            .iter()
-            .position(|a| a == "--features")
-            .map(|i| argv[i + 1].clone());
-        match (cfg!(feature = "wprof"), cfg!(feature = "integration")) {
-            (false, false) => assert!(
-                features.is_none(),
-                "a no-feature build must not pass --features (got {features:?})"
-            ),
-            (want_wprof, want_integration) => {
-                let f = features.expect("a feature build must forward --features");
-                let set: Vec<&str> = f.split(',').collect();
-                assert_eq!(
-                    set.contains(&"wprof"),
-                    want_wprof,
-                    "wprof forwarding (got {f:?})"
-                );
-                assert_eq!(
-                    set.contains(&"integration"),
-                    want_integration,
-                    "integration forwarding (got {f:?})"
-                );
-            }
-        }
+        assert_eq!(
+            argv,
+            ["build", "--tests", "--message-format=json", "--workspace"].map(ToString::to_string),
+        );
+        assert!(
+            !argv.iter().any(|argument| argument == "--features"),
+            "consumer workspaces must never receive unqualified cargo-ktstr features: {argv:?}",
+        );
     }
 
-    /// `--package` and `--release` are threaded through verbatim.
+    /// `--package` remains narrower than the unscoped workspace build and
+    /// `--release` is threaded through verbatim.
     #[test]
     fn argv_threads_package_and_release() {
         let argv = build_test_binaries_argv(Some("scx-ktstr"), true);
@@ -274,5 +259,13 @@ mod tests {
             "argv: {argv:?}"
         );
         assert!(argv.iter().any(|a| a == "--release"), "argv: {argv:?}");
+        assert!(
+            !argv.iter().any(|argument| argument == "--workspace"),
+            "an explicit package probe must not widen to the workspace: {argv:?}",
+        );
+        assert!(
+            !argv.iter().any(|argument| argument == "--features"),
+            "self features are added only after metadata proves package scope: {argv:?}",
+        );
     }
 }

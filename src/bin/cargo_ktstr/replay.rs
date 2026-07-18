@@ -122,6 +122,25 @@ use ktstr::host_context::{HostContext, collect_host_context};
 /// with any real test name astronomically unlikely.
 const EMPTY_POOL_FILTER: &str = "test(/^__ktstr_no_failures_to_replay__$/)";
 
+/// Route replay's `--exec` Cargo arguments through the same preflight as every
+/// other cargo-ktstr nextest frontend.
+///
+/// Keeping the preparer injectable gives the routing contract a metadata-free
+/// unit test. Production always supplies [`crate::run_cargo::prepare_nextest_args`],
+/// which owns target-aware feature inference, selected-graph version checks,
+/// and the established best-effort behavior when metadata itself is
+/// unavailable.
+fn prepare_exec_args_with(
+    args: &[String],
+    prepare: impl FnOnce(Vec<String>) -> Result<Vec<String>, String>,
+) -> Result<Vec<String>> {
+    prepare(args.to_vec()).map_err(anyhow::Error::msg)
+}
+
+fn prepare_exec_args(args: &[String]) -> Result<Vec<String>> {
+    prepare_exec_args_with(args, crate::run_cargo::prepare_nextest_args)
+}
+
 /// Entry point for the `cargo ktstr replay` subcommand.
 ///
 /// `dir` overrides the sidecar root (default:
@@ -218,11 +237,11 @@ pub(crate) fn run_replay(
     // post-exec re-scan that builds a fresh pool Vec.
     let queued: BTreeSet<String> = failed_names.iter().map(|s| s.to_string()).collect();
 
-    // Only the --exec path builds test binaries. Discover the same narrow
-    // optional-ktstr feature roots as `cargo ktstr test`; dry-run and empty
-    // selections above do no metadata work.
-    let args = crate::feature_discovery::augment_test_features(args.to_vec())
-        .map_err(anyhow::Error::msg)?;
+    // Only the --exec path builds test binaries. Use the exact shared nextest
+    // preflight: target-aware narrow feature inference, selected resolved-graph
+    // version compatibility, and best-effort forwarding on metadata failures.
+    // Dry-run and empty selections above do no metadata work.
+    let args = prepare_exec_args(args)?;
     // Discovery above is preflight and retains ordinary signal termination.
     // Cross into cleanup ownership only when --exec is about to create the
     // nextest process tree, so the shared anchored runner can forward the
@@ -767,6 +786,60 @@ fn invoke_nextest(
 mod tests {
     use super::*;
     use ktstr::test_support::SidecarResult;
+
+    #[test]
+    fn exec_routes_complete_cargo_selection_through_shared_nextest_preflight() {
+        let original = vec![
+            "--workspace".to_string(),
+            "--exclude".to_string(),
+            "old-tests".to_string(),
+            "--no-default-features".to_string(),
+            "--features".to_string(),
+            "explicit".to_string(),
+        ];
+        let prepared = prepare_exec_args_with(&original, |received| {
+            assert_eq!(
+                received, original,
+                "replay must not pre-parse or narrow Cargo selectors before shared preflight",
+            );
+            let mut received = received;
+            received.extend([
+                "--features".to_string(),
+                "scheduler/ktstr-tests".to_string(),
+            ]);
+            Ok(received)
+        })
+        .expect("injected shared preflight succeeds");
+        assert_eq!(
+            prepared,
+            [
+                "--workspace",
+                "--exclude",
+                "old-tests",
+                "--no-default-features",
+                "--features",
+                "explicit",
+                "--features",
+                "scheduler/ktstr-tests",
+            ]
+            .map(ToString::to_string),
+            "replay forwards the shared preparer's exact augmented argv",
+        );
+    }
+
+    #[test]
+    fn exec_surfaces_shared_version_guard_rejection() {
+        let error = prepare_exec_args_with(&["-p".to_string(), "future-tests".to_string()], |_| {
+            Err("package future-tests uses newer ktstr".to_string())
+        })
+        .expect_err("a version incompatibility remains fatal");
+        assert!(
+            error
+                .to_string()
+                .contains("package future-tests uses newer ktstr"),
+            "{error:#}",
+        );
+    }
 
     /// Build a minimal SidecarResult fixture for the scan-path
     /// tests. The selector consults `passed`/`skipped`/`inconclusive`

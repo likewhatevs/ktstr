@@ -1285,19 +1285,65 @@ pub(crate) fn inject_feature_activations(
     args
 }
 
-/// Discover and inject targeted ktstr test features for an ordinary Cargo test
-/// build/run from a manifest-only metadata pass.
-pub(crate) fn augment_test_features(args: Vec<String>) -> Result<Vec<String>, String> {
+/// Select features on one workspace package only when Cargo will build that
+/// package, retaining only requested features its manifest actually declares.
+///
+/// This is used for cargo-ktstr's own compile-time capabilities when a probe is
+/// building the ktstr workspace itself. Package qualification is load-bearing:
+/// forwarding `--features wprof` into an arbitrary consumer workspace can
+/// either fail on an unknown feature or accidentally enable an unrelated
+/// same-named feature. A dependency named `ktstr` is not enough; it must be a
+/// selected workspace member.
+fn selected_workspace_package_feature_activation(
+    metadata: &Metadata,
+    args: &[String],
+    package_name: &str,
+    requested_features: &[&str],
+) -> Option<PackageFeatureActivation> {
+    let package = selected_workspace_packages(metadata, args)?
+        .into_iter()
+        .find(|package| package.name.as_str() == package_name)?;
+    let mut features = requested_features
+        .iter()
+        .copied()
+        .filter(|feature| package.features.contains_key(*feature))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    features.sort();
+    features.dedup();
+    (!features.is_empty()).then(|| PackageFeatureActivation {
+        package: package.name.to_string(),
+        features,
+    })
+}
+
+/// Discover ordinary ktstr registry gates and, when present in the selected
+/// workspace, safely preserve a named package's already-active capabilities.
+///
+/// `workspace_package_features` never become unqualified Cargo features. They
+/// are injected as `PACKAGE/FEATURE` only after metadata proves that PACKAGE is
+/// a selected workspace member and declares FEATURE.
+pub(crate) fn augment_test_features_with_workspace_package_features(
+    args: Vec<String>,
+    workspace_package: &str,
+    workspace_package_features: &[&str],
+) -> Result<Vec<String>, String> {
     if explicit_all_features(&args) {
         return Ok(args);
     }
     let target = effective_target_context(&args)?;
     let metadata = query_metadata_for_target(&args, MetadataMode::NoDeps, &target)?;
-    Ok(augment_test_features_from_metadata_for_context(
-        args,
+    let mut activations =
+        selected_activations_for_context(&metadata, &args, VersionScope::Any, Some(&target));
+    if let Some(activation) = selected_workspace_package_feature_activation(
         &metadata,
-        Some(&target),
-    ))
+        &args,
+        workspace_package,
+        workspace_package_features,
+    ) {
+        activations.push(activation);
+    }
+    Ok(inject_feature_activations(args, &activations))
 }
 
 /// Inject ordinary test features from metadata a caller already queried.
@@ -1568,6 +1614,61 @@ unrelated-mode = []
                 package: "cosmos".to_string(),
                 features: vec!["ktstr-tests".to_string()],
             }],
+        );
+    }
+
+    #[test]
+    fn workspace_package_capabilities_are_selected_declared_and_package_qualified() {
+        let metadata = selection_metadata();
+        let selected = selected_workspace_package_feature_activation(
+            &metadata,
+            &[],
+            "cosmos",
+            &["missing", "ktstr-tests"],
+        );
+        assert_eq!(
+            selected,
+            Some(PackageFeatureActivation {
+                package: "cosmos".to_string(),
+                features: vec!["ktstr-tests".to_string()],
+            }),
+            "only a declared feature on Cargo's default member is retained",
+        );
+        assert_eq!(
+            inject_feature_activations(
+                strings(&["--workspace"]),
+                std::slice::from_ref(selected.as_ref().expect("selected activation")),
+            ),
+            strings(&["--workspace", "--features", "cosmos/ktstr-tests"]),
+            "the capability is emitted only in package-qualified form",
+        );
+        assert_eq!(
+            selected_workspace_package_feature_activation(&metadata, &[], "lavd", &["verify"],),
+            None,
+            "an unselected workspace member must not receive a feature",
+        );
+        assert_eq!(
+            selected_workspace_package_feature_activation(
+                &metadata,
+                &strings(&["-p", "lavd"]),
+                "lavd",
+                &["verify"],
+            ),
+            Some(PackageFeatureActivation {
+                package: "lavd".to_string(),
+                features: vec!["verify".to_string()],
+            }),
+            "an explicitly selected member may retain its declared capability",
+        );
+        assert_eq!(
+            selected_workspace_package_feature_activation(
+                &metadata,
+                &strings(&["--workspace"]),
+                "not-a-member",
+                &["verify"],
+            ),
+            None,
+            "a dependency or unrelated package name can never receive consumer features",
         );
     }
 

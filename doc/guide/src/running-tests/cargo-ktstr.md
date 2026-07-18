@@ -173,8 +173,9 @@ inference.
 Cargo metadata cannot identify arbitrary source-level `cfg` expressions.
 Only ktstr-specific feature chains are inferred; composite gates and
 transitive optional-helper arrangements remain explicit. Target-specific
-optional ktstr dependencies also remain explicit because a metadata-only
-preflight does not have Cargo's complete target cfg evaluation.
+optional ktstr dependencies are inferred only when they match the effective
+Cargo target: cargo-ktstr asks rustc for that target's complete cfg set and
+evaluates the manifest platform expression before enabling the gate.
 
 A real single-test run against a local kernel tree looks like this.
 The source tree was already built, so ktstr resolved it to a cache key

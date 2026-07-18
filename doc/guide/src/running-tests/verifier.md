@@ -56,8 +56,9 @@ Conventional feature-gated declarations are therefore discovered by a
 bare `cargo ktstr verifier`; older workspace packages remain outside the
 selection. Cargo metadata cannot identify arbitrary source-level `cfg`
 expressions, so other arrangements such as a transitive optional helper or
-a composite gate remain opt-in through `--features`. Target-specific
-optional ktstr dependencies remain explicit for the same reason.
+a composite gate remain opt-in through `--features`. Target-specific optional
+ktstr dependencies are inferred when their manifest platform expression
+matches the effective Cargo target and its rustc-reported cfg set.
 
 ## A real sweep
 

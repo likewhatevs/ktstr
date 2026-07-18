@@ -42,6 +42,43 @@ pub(crate) const COVERAGE_SUB_ARGV: &[&str] = &["llvm-cov", "nextest"];
 /// subcommand (`report`, `clean`, `show-env`, ...).
 pub(crate) const LLVM_COV_SUB_ARGV: &[&str] = &["llvm-cov"];
 
+/// cargo-llvm-cov global options whose space-separated spelling consumes the
+/// following token. Keep this table aligned with cargo-llvm-cov's CLI; the
+/// detector tests exercise every entry with a value literally named `nextest`
+/// so no option value can be mistaken for the subcommand.
+const LLVM_COV_GLOBAL_VALUE_OPTIONS: &[&str] = &[
+    "--output-path",
+    "--output-dir",
+    "--failure-mode",
+    "--ignore-filename-regex",
+    "--fail-under-functions",
+    "--fail-under-lines",
+    "--fail-under-file-lines",
+    "--fail-under-regions",
+    "--fail-uncovered-lines",
+    "--fail-uncovered-regions",
+    "--fail-uncovered-functions",
+    "--dep-coverage",
+    "--bin",
+    "--example",
+    "--test",
+    "--bench",
+    "-p",
+    "--package",
+    "--exclude",
+    "--exclude-from-test",
+    "--exclude-from-report",
+    "-j",
+    "--jobs",
+    "--profile",
+    "-F",
+    "--features",
+    "--target",
+    "--color",
+    "--manifest-path",
+    "-Z",
+];
+
 /// Whether the raw `cargo ktstr llvm-cov` passthrough explicitly selects
 /// cargo-llvm-cov's nextest subcommand.
 ///
@@ -64,39 +101,7 @@ fn llvm_cov_uses_nextest(args: &[String]) -> bool {
         // cargo-llvm-cov accepts its global options before the subcommand.
         // Skip the value of every current value-taking global option so a
         // value literally named `nextest` is not mistaken for the subcommand.
-        let takes_separate_value = matches!(
-            argument.as_str(),
-            "--output-path"
-                | "--output-dir"
-                | "--failure-mode"
-                | "--ignore-filename-regex"
-                | "--fail-under-functions"
-                | "--fail-under-lines"
-                | "--fail-under-file-lines"
-                | "--fail-under-regions"
-                | "--fail-uncovered-lines"
-                | "--fail-uncovered-regions"
-                | "--fail-uncovered-functions"
-                | "--dep-coverage"
-                | "--bin"
-                | "--example"
-                | "--test"
-                | "--bench"
-                | "-p"
-                | "--package"
-                | "--exclude"
-                | "--exclude-from-test"
-                | "--exclude-from-report"
-                | "-j"
-                | "--jobs"
-                | "--profile"
-                | "-F"
-                | "--features"
-                | "--target"
-                | "--color"
-                | "--manifest-path"
-                | "-Z"
-        );
+        let takes_separate_value = LLVM_COV_GLOBAL_VALUE_OPTIONS.contains(&argument.as_str());
         index += if takes_separate_value { 2 } else { 1 };
     }
     false
@@ -108,7 +113,7 @@ fn llvm_cov_uses_nextest(args: &[String]) -> bool {
 ///
 /// Keeping the preparer injectable makes the routing contract independently
 /// testable without running Cargo metadata. Production passes
-/// [`prepare_test_args`], so `cargo ktstr llvm-cov nextest` cannot drift from
+/// [`prepare_nextest_args`], so `cargo ktstr llvm-cov nextest` cannot drift from
 /// `test` / `coverage` in package selection, target filtering, inferred
 /// features, or version checks. Non-test llvm-cov modes never call the
 /// preparer and retain their exact argv.
@@ -1283,14 +1288,19 @@ fn check_ktstr_version_compat(
     Ok(())
 }
 
+/// Shared preflight for every cargo-ktstr frontend that directly invokes
+/// `cargo nextest run` (including cargo-llvm-cov's nextest delegation).
+///
 /// Reuse one manifest-only metadata result for targeted optional ktstr feature
 /// inference, then resolve the exact selected/augmented feature set for the
-/// version guard.
+/// version guard. Keeping this callable by replay prevents a second nextest
+/// route from drifting in package selection, target cfg evaluation, version
+/// compatibility, or metadata-failure behavior.
 ///
 /// Metadata inspection has historically been best-effort on these general test
 /// paths. Preserve that behavior: if it fails, warn and let the underlying
 /// Cargo command diagnose (or successfully handle) its own arguments.
-fn prepare_test_args(args: Vec<String>) -> Result<Vec<String>, String> {
+pub(crate) fn prepare_nextest_args(args: Vec<String>) -> Result<Vec<String>, String> {
     let target = match effective_target_context(&args) {
         Ok(target) => target,
         Err(error) => {
@@ -1457,7 +1467,7 @@ pub(crate) fn run_test(
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     ktstr::cli::check_tools(&["cargo-nextest"]).map_err(|e| format!("{e:#}"))?;
     let args = apply_relevant_narrowing(args, relevant, base, base_ref, default_branch)?;
-    let args = prepare_test_args(args)?;
+    let args = prepare_nextest_args(args)?;
     run_cargo_sub(
         TEST_SUB_ARGV,
         "tests",
@@ -1492,7 +1502,7 @@ pub(crate) fn run_coverage(
     let args = apply_relevant_narrowing(args, relevant, base, base_ref, default_branch)?;
     // `coverage` runs the same suite through `cargo llvm-cov nextest`, so use
     // the same version guard and targeted feature inference as `test`.
-    let args = prepare_test_args(args)?;
+    let args = prepare_nextest_args(args)?;
     run_cargo_sub(
         COVERAGE_SUB_ARGV,
         "coverage",
@@ -1524,7 +1534,7 @@ pub(crate) fn run_llvm_cov(
     // ktstr tests, so they retain exact passthrough semantics. Explicit
     // `llvm-cov nextest` is the same test suite as `coverage`, and therefore
     // goes through the identical target-aware feature and version preflight.
-    let args = prepare_llvm_cov_args_with(args, prepare_test_args)
+    let args = prepare_llvm_cov_args_with(args, prepare_nextest_args)
         .map_err(|error| format!("cargo ktstr llvm-cov nextest: {error}"))?;
     run_cargo_sub(
         LLVM_COV_SUB_ARGV,
@@ -1548,6 +1558,71 @@ mod tests {
 
     fn v(s: &str) -> Version {
         Version::parse(s).expect("test version literal is valid semver")
+    }
+
+    fn llvm_cov_feature_metadata() -> cargo_metadata::Metadata {
+        let renamed = "renamed-scheduler 1.0.0 (path+file:///w/renamed-scheduler)";
+        let ordinary = "ordinary-scheduler 1.0.0 (path+file:///w/ordinary-scheduler)";
+        let package = |name: &str, id: &str, rename: &str, features: &str| -> String {
+            format!(
+                r#"{{
+                    "name":"{name}",
+                    "version":"1.0.0",
+                    "id":"{id}",
+                    "source":null,
+                    "description":null,
+                    "dependencies":[{{
+                        "name":"ktstr",
+                        "source":null,
+                        "req":"=0.42.0",
+                        "kind":null,
+                        "rename":{rename},
+                        "optional":true,
+                        "uses_default_features":true,
+                        "features":[],
+                        "target":null,
+                        "registry":null,
+                        "path":null
+                    }}],
+                    "license":null,
+                    "license_file":null,
+                    "targets":[],
+                    "features":{features},
+                    "manifest_path":"/w/{name}/Cargo.toml",
+                    "readme":null,
+                    "repository":null,
+                    "homepage":null,
+                    "documentation":null,
+                    "links":null,
+                    "publish":null,
+                    "default_run":null
+                }}"#
+            )
+        };
+        serde_json::from_str(&format!(
+            r#"{{
+                "packages":[{renamed_package},{ordinary_package}],
+                "workspace_members":["{renamed}","{ordinary}"],
+                "workspace_default_members":["{renamed}"],
+                "resolve":null,
+                "workspace_root":"/w",
+                "target_directory":"/w/target",
+                "version":1
+            }}"#,
+            renamed_package = package(
+                "renamed-scheduler",
+                renamed,
+                r#""test-harness""#,
+                r#"{"operator-choice":[],"verify-schedulers":["dep:test-harness"]}"#,
+            ),
+            ordinary_package = package(
+                "ordinary-scheduler",
+                ordinary,
+                "null",
+                r#"{"ktstr-tests":["dep:ktstr"]}"#,
+            ),
+        ))
+        .expect("raw llvm-cov feature metadata fixture deserializes")
     }
 
     #[test]
@@ -1637,6 +1712,35 @@ mod tests {
                 "raw/report mode must preserve its exact feature selection: {args:?}",
             );
         }
+    }
+
+    #[test]
+    fn llvm_cov_nextest_detector_skips_every_global_option_value() {
+        for option in LLVM_COV_GLOBAL_VALUE_OPTIONS {
+            let value_named_nextest = vec![(*option).to_string(), "nextest".to_string()];
+            assert!(
+                !llvm_cov_uses_nextest(&value_named_nextest),
+                "{option} consumes the following `nextest` token as its value",
+            );
+
+            let followed_by_subcommand = vec![
+                (*option).to_string(),
+                "ordinary-value".to_string(),
+                "nextest".to_string(),
+            ];
+            assert!(
+                llvm_cov_uses_nextest(&followed_by_subcommand),
+                "{option}'s value must be skipped before detecting the real subcommand",
+            );
+        }
+        assert!(
+            llvm_cov_uses_nextest(&strs(&[
+                "--output-path=nextest",
+                "--features=nextest",
+                "nextest",
+            ])),
+            "equals spellings carry their value in-token and cannot hide the subcommand",
+        );
     }
 
     #[test]
@@ -1732,6 +1836,61 @@ mod tests {
             explicit_all,
             strs(&["nextest", "--workspace", "--all-features"]),
             "an explicit user --all-features remains authoritative",
+        );
+    }
+
+    #[test]
+    fn llvm_cov_nextest_inference_honors_no_default_rename_package_and_exclude_scope() {
+        let metadata = llvm_cov_feature_metadata();
+        let selected_renamed = prepare_llvm_cov_args_with(
+            strs(&[
+                "nextest",
+                "-p",
+                "renamed-scheduler",
+                "--no-default-features",
+                "--features",
+                "operator-choice",
+            ]),
+            |args| {
+                Ok(crate::feature_discovery::augment_test_features_from_metadata(args, &metadata))
+            },
+        )
+        .expect("renamed package preparation succeeds");
+        assert_eq!(
+            selected_renamed,
+            [
+                "nextest",
+                "-p",
+                "renamed-scheduler",
+                "--no-default-features",
+                "--features",
+                "operator-choice",
+                "--features",
+                "renamed-scheduler/verify-schedulers",
+            ]
+            .map(ToString::to_string),
+            "raw llvm-cov preserves explicit/no-default modes and infers through dep:<rename>",
+        );
+
+        let excluded_renamed = prepare_llvm_cov_args_with(
+            strs(&["nextest", "--workspace", "--exclude", "renamed-scheduler"]),
+            |args| {
+                Ok(crate::feature_discovery::augment_test_features_from_metadata(args, &metadata))
+            },
+        )
+        .expect("workspace exclusion preparation succeeds");
+        assert_eq!(
+            excluded_renamed,
+            [
+                "nextest",
+                "--workspace",
+                "--exclude",
+                "renamed-scheduler",
+                "--features",
+                "ordinary-scheduler/ktstr-tests",
+            ]
+            .map(ToString::to_string),
+            "excluded packages receive no inferred selector while selected workspace peers do",
         );
     }
 
