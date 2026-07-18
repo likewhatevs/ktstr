@@ -6,7 +6,9 @@
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
+#[cfg(test)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// Result of shared library resolution for a binary.
@@ -1087,16 +1089,21 @@ pub fn build_initramfs_base(
 /// reopens a mutable original pathname or repeats ELF resolution on a CAS hit.
 pub(crate) fn build_initramfs_base_from_resolved(
     extra_binaries: &[(&str, &Path)],
-    include_files: &[(&str, &Path)],
+    include_files: &[(&str, &Path, u32)],
     busybox_bytes: Option<&[u8]>,
     shared_libs: &[(String, PathBuf, u64, u64)],
 ) -> Result<Vec<u8>> {
-    let validated_includes = validate_include_files(include_files)?;
     let mut dirs = BTreeSet::new();
     if busybox_bytes.is_some() {
         dirs.insert("bin".to_string());
     }
-    for (archive_path, _, _) in &validated_includes {
+    for (archive_path, _, mode) in include_files {
+        validate_include_archive_path(archive_path)?;
+        anyhow::ensure!(
+            mode & libc::S_IFMT == libc::S_IFREG,
+            "resolved include file '{}' has non-regular archive mode {mode:#o}",
+            archive_path
+        );
         register_parent_dirs(&mut dirs, archive_path);
     }
     for (archive_path, _) in extra_binaries {
@@ -1119,7 +1126,7 @@ pub(crate) fn build_initramfs_base_from_resolved(
         &dirs,
         busybox_bytes,
         extra_binaries,
-        &validated_includes,
+        include_files,
         &shared_sources,
         Some(&content_keys),
     )?;
@@ -1133,6 +1140,7 @@ pub(crate) fn build_initramfs_base_from_resolved(
 /// non-regular files. The returned `(archive_path, host_path, mode)`
 /// triples reuse the stat result so the write loop avoids a second
 /// stat syscall per file.
+#[cfg(test)]
 fn validate_include_files<'a>(
     include_files: &'a [(&'a str, &'a Path)],
 ) -> Result<Vec<(&'a str, &'a Path, u32)>> {
@@ -1140,20 +1148,7 @@ fn validate_include_files<'a>(
     // loop to avoid a second stat syscall per file).
     let mut validated_includes: Vec<(&str, &Path, u32)> = Vec::with_capacity(include_files.len());
     for (archive_path, host_path) in include_files {
-        // Reject path traversal.
-        if Path::new(archive_path)
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            anyhow::bail!("include_files archive path contains '..': {}", archive_path);
-        }
-        // Reject paths that collide with internal sentinel files.
-        if archive_path.starts_with(".ktstr_") {
-            anyhow::bail!(
-                "include_files archive path must not start with '.ktstr_': {}",
-                archive_path
-            );
-        }
+        validate_include_archive_path(archive_path)?;
         // Follow symlinks: include_files entries are explicitly
         // specified by the test author, so a symlink to a regular
         // file is intentional (e.g. package-manager symlinks in
@@ -1178,6 +1173,19 @@ fn validate_include_files<'a>(
         validated_includes.push((archive_path, host_path, meta.permissions().mode()));
     }
     Ok(validated_includes)
+}
+
+fn validate_include_archive_path(archive_path: &str) -> Result<()> {
+    if Path::new(archive_path)
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        anyhow::bail!("include_files archive path contains '..': {archive_path}");
+    }
+    if archive_path.starts_with(".ktstr_") {
+        anyhow::bail!("include_files archive path must not start with '.ktstr_': {archive_path}");
+    }
+    Ok(())
 }
 
 /// Resolve the shared-library closure for the init payload, extra
@@ -2101,7 +2109,7 @@ impl Drop for CowOverlayGuard {
         // Release LOCK_SH explicitly so GC waiting on LOCK_EX observes
         // ordering with the VM's reads. OwnedFd closes the descriptor
         // after this function returns.
-        let _ = rustix::fs::flock(&self.fd, rustix::fs::FlockOperation::Unlock);
+        let _ = super::initramfs_cache::flock_retry(&self.fd, rustix::fs::FlockOperation::Unlock);
     }
 }
 

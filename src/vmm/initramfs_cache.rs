@@ -386,7 +386,7 @@ impl AsRef<[u8]> for BaseRef {
 // The production prepared-initrd CAS lives alongside a cfg(test)-only
 // compatibility cache for older base/suffix fixtures.
 
-const PREPARED_CAS_SCHEMA: u32 = 5;
+const PREPARED_CAS_SCHEMA: u32 = 6;
 const PREPARED_CAS_MAGIC: &[u8; 8] = b"KTSTRIR\0";
 const PREPARED_CAS_HEADER_LEN: usize = 128;
 const PREPARED_CAS_MAX_BYTES: u64 = 8 << 30;
@@ -400,16 +400,24 @@ const COVERAGE_PROBE_MAGIC: &[u8; 8] = b"KTSTRCV\0";
 const COVERAGE_PROBE_RECORD_LEN: usize = 48;
 const CLOSURE_RECORD_MAGIC: &[u8; 8] = b"KTSTRCL\0";
 const CLOSURE_RECORD_HEADER_LEN: usize = 40;
+const CLOSURE_RECORD_MAX_PAYLOAD_LEN: usize = 16 << 20;
+const CLOSURE_RECORD_MAX_LEN: usize = CLOSURE_RECORD_HEADER_LEN + CLOSURE_RECORD_MAX_PAYLOAD_LEN;
+const CLOSURE_RECORD_MAX_ENTRY_COUNT: usize = 16 << 10;
+const CLOSURE_RECORD_MAX_SEARCH_PATH_COUNT: usize = 128 << 10;
+const CLOSURE_RECORD_MAX_ENTRY_PATH_LEN: usize = 4096;
+const CLOSURE_RECORD_MAX_SEARCH_PATH_LEN: usize = 1 << 20;
+const CLOSURE_RECORD_MAX_INITIAL_SEQUENCE_ALLOCATION: usize = 1 << 20;
 // Version the complete namespace, not only the object recipes. Older ktstr
 // binaries do not participate in the namespace-gate protocol below; keeping
 // their objects, memos, and locks in separate directories prevents an old GC
 // from unlinking a live object coordinated by this version's lock inode.
-const PREPARED_OBJECTS_DIR: &str = "prepared-initrd-v5-objects";
-const PREPARED_LOCKS_DIR: &str = ".prepared-initrd-v5-locks";
-const PREPARED_DIGESTS_DIR: &str = "prepared-initrd-v5-digests";
-const PREPARED_PROBES_DIR: &str = "prepared-initrd-v5-probes";
-const PREPARED_CLOSURES_DIR: &str = "prepared-initrd-v5-closures";
-const PREPARED_GC_STAMP: &str = ".prepared-initrd-v5-gc-stamp";
+const PREPARED_OBJECTS_DIR: &str = "prepared-initrd-v6-objects";
+const PREPARED_LOCKS_DIR: &str = ".prepared-initrd-v6-locks";
+const PREPARED_DIGESTS_DIR: &str = "prepared-initrd-v6-digests";
+const PREPARED_PROBES_DIR: &str = "prepared-initrd-v6-probes";
+const PREPARED_CLOSURES_DIR: &str = "prepared-initrd-v6-closures";
+const PREPARED_GC_STAMP: &str = ".prepared-initrd-v6-gc-stamp";
+const CONTENT_HASH_CHUNK_LEN: usize = 1 << 20;
 const PREPARED_NAMESPACE_GATE: &str = "namespace-v1.lock";
 const PREPARED_GC_LOCK: &str = "gc.lock";
 /// Uniform direct-map granule. It is host-page aligned on every supported
@@ -501,6 +509,37 @@ fn ahash_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = fixed_hasher();
     hasher.write(bytes);
     hasher.finish()
+}
+
+/// Hash a prepared payload with fixed call boundaries.
+///
+/// `Hasher::write(a); write(b)` is not required to equal `write(a || b)`.
+/// Builders hold the complete payload while cache-hit validation streams it,
+/// so both sides must use the same content-derived chunking.
+fn content_hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hasher = fixed_hasher();
+    for chunk in bytes.chunks(CONTENT_HASH_CHUNK_LEN) {
+        hasher.write(chunk);
+    }
+    hasher.finish()
+}
+
+fn pread_exact(file: &File, mut offset: u64, mut buffer: &mut [u8], subject: &str) -> Result<()> {
+    while !buffer.is_empty() {
+        let read = loop {
+            match file.read_at(buffer, offset) {
+                Ok(read) => break read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error).with_context(|| format!("pread {subject}")),
+            }
+        };
+        anyhow::ensure!(read > 0, "{subject} was truncated while reading");
+        offset = offset
+            .checked_add(u64::try_from(read)?)
+            .with_context(|| format!("{subject} offset overflow"))?;
+        buffer = &mut buffer[read..];
+    }
+    Ok(())
 }
 
 fn hash_u8(hasher: &mut AHasher, value: u8) {
@@ -667,12 +706,16 @@ impl PinnedInput {
     }
 
     fn is_elf(&self) -> Result<bool> {
+        self.verify_unchanged()?;
+        if self.identity.size < 4 {
+            self.verify_unchanged()?;
+            return Ok(false);
+        }
         let mut magic = [0u8; 4];
-        let read = self
-            .file
-            .read_at(&mut magic, 0)
+        pread_exact(&self.file, 0, &mut magic, "ELF input")
             .with_context(|| format!("probe ELF input {}", self.display_path.display()))?;
-        Ok(read == magic.len() && magic == *b"\x7fELF")
+        self.verify_unchanged()?;
+        Ok(magic == *b"\x7fELF")
     }
 
     fn read_owned_stable(&self) -> Result<Vec<u8>> {
@@ -686,10 +729,17 @@ impl PinnedInput {
         let mut bytes = vec![0u8; len];
         let mut offset = 0usize;
         while offset < bytes.len() {
-            let read = self
-                .file
-                .read_at(&mut bytes[offset..], offset as u64)
-                .with_context(|| format!("pread input {}", self.display_path.display()))?;
+            let read = loop {
+                match self.file.read_at(&mut bytes[offset..], offset as u64) {
+                    Ok(read) => break read,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("pread input {}", self.display_path.display())
+                        });
+                    }
+                }
+            };
             anyhow::ensure!(
                 read > 0,
                 "input was truncated while reading: {}",
@@ -750,16 +800,28 @@ struct CoordinationFile {
     namespace_gate: Option<File>,
 }
 
+pub(super) fn flock_retry(
+    file: impl std::os::fd::AsFd,
+    operation: rustix::fs::FlockOperation,
+) -> rustix::io::Result<()> {
+    loop {
+        match rustix::fs::flock(&file, operation) {
+            Err(error) if error == rustix::io::Errno::INTR => continue,
+            result => return result,
+        }
+    }
+}
+
 impl CoordinationFile {
     fn try_lock_exclusive(&mut self) -> rustix::io::Result<()> {
-        rustix::fs::flock(
+        flock_retry(
             &self.file,
             rustix::fs::FlockOperation::NonBlockingLockExclusive,
         )
     }
 
     fn lock_shared(&mut self) -> rustix::io::Result<()> {
-        rustix::fs::flock(&self.file, rustix::fs::FlockOperation::LockShared)
+        flock_retry(&self.file, rustix::fs::FlockOperation::LockShared)
     }
 
     /// Join the successor queue after a builder disappeared without
@@ -768,7 +830,7 @@ impl CoordinationFile {
     /// to wake and cannot be starved by a herd continuously overlapping shared
     /// locks.
     fn lock_exclusive(&mut self) -> rustix::io::Result<()> {
-        rustix::fs::flock(&self.file, rustix::fs::FlockOperation::LockExclusive)
+        flock_retry(&self.file, rustix::fs::FlockOperation::LockExclusive)
     }
 
     /// Release the namespace gate after the protected inode chain has become
@@ -781,7 +843,7 @@ impl CoordinationFile {
 
 fn open_coord_file(root: &Path, path: &Path) -> Result<CoordinationFile> {
     let namespace_gate = open_namespace_gate(root)?;
-    rustix::fs::flock(&namespace_gate, rustix::fs::FlockOperation::LockShared)
+    flock_retry(&namespace_gate, rustix::fs::FlockOperation::LockShared)
         .context("lock prepared initrd coordination namespace")?;
     let file = open_lock_file(path)?;
     Ok(CoordinationFile {
@@ -802,20 +864,19 @@ fn hash_pinned_file(file: &File, identity: StableFileIdentity) -> Result<u64> {
     // this streaming read, so a fixed-size pread buffer is cheap and safe.
     let mut hasher = fixed_hasher();
     let mut offset = 0u64;
-    let buffer_len = usize::try_from(identity.size.min(1 << 20))?;
+    let buffer_len = usize::try_from(identity.size.min(CONTENT_HASH_CHUNK_LEN as u64))?;
     let mut buffer = vec![0u8; buffer_len];
     while offset < identity.size {
         let remaining = usize::try_from((identity.size - offset).min(buffer.len() as u64))?;
-        let read = file
-            .read_at(&mut buffer[..remaining], offset)
-            .context("pread pinned input for digest")?;
-        anyhow::ensure!(
-            read > 0,
-            "pinned input was truncated while hashing its content"
-        );
-        hasher.write(&buffer[..read]);
+        pread_exact(
+            file,
+            offset,
+            &mut buffer[..remaining],
+            "pinned input for digest",
+        )?;
+        hasher.write(&buffer[..remaining]);
         offset = offset
-            .checked_add(read as u64)
+            .checked_add(u64::try_from(remaining)?)
             .context("pinned input digest offset overflow")?;
     }
     let digest = hasher.finish();
@@ -827,23 +888,58 @@ fn hash_pinned_file(file: &File, identity: StableFileIdentity) -> Result<u64> {
     Ok(digest)
 }
 
+fn open_cache_record(path: &Path, subject: &str) -> Result<Option<(File, StableFileIdentity)>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("open {subject} {}", path.display()));
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("stat {subject} {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "{subject} is not a regular file: {}",
+        path.display()
+    );
+    Ok(Some((file, StableFileIdentity::from_metadata(&metadata))))
+}
+
+fn read_fixed_cache_record<const N: usize>(path: &Path, subject: &str) -> Result<Option<[u8; N]>> {
+    let Some((file, identity)) = open_cache_record(path, subject)? else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        identity.size == N as u64,
+        "{subject} has invalid length {}: {}",
+        identity.size,
+        path.display()
+    );
+    let mut bytes = [0u8; N];
+    pread_exact(&file, 0, &mut bytes, subject)?;
+    anyhow::ensure!(
+        StableFileIdentity::from_file(&file)? == identity,
+        "{subject} changed while reading: {}",
+        path.display()
+    );
+    Ok(Some(bytes))
+}
+
 fn read_file_digest_record(
     record_path: &Path,
     identity: StableFileIdentity,
 ) -> Result<Option<u64>> {
-    let bytes = match std::fs::read(record_path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("read file digest memo {}", record_path.display()));
-        }
+    let Some(bytes) =
+        read_fixed_cache_record::<FILE_DIGEST_RECORD_LEN>(record_path, "file digest memo")?
+    else {
+        return Ok(None);
     };
-    anyhow::ensure!(
-        bytes.len() == FILE_DIGEST_RECORD_LEN,
-        "file digest memo is truncated: {}",
-        record_path.display()
-    );
     anyhow::ensure!(
         &bytes[..8] == FILE_DIGEST_MAGIC,
         "file digest memo magic mismatch"
@@ -955,9 +1051,20 @@ fn cached_file_digest(root: &Path, file: &File, identity: StableFileIdentity) ->
     }
 }
 
+/// Open an explicit or recorded host input without blocking on a substituted
+/// FIFO. Deliberately follow symlinks: package-manager and linker paths
+/// commonly use them, and the open file description is pinned immediately
+/// afterward by its regular-file identity.
+fn open_pinned_input_path(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
 fn pin_input(root: &Path, path: &Path) -> Result<PinnedInput> {
-    let file =
-        File::open(path).with_context(|| format!("open prepared input {}", path.display()))?;
+    let file = open_pinned_input_path(path)
+        .with_context(|| format!("open prepared input {}", path.display()))?;
     let identity = StableFileIdentity::from_file(&file)
         .with_context(|| format!("stat prepared input {}", path.display()))?;
     let content_hash = cached_file_digest(root, &file, identity)
@@ -971,19 +1078,11 @@ fn pin_input(root: &Path, path: &Path) -> Result<PinnedInput> {
 }
 
 fn read_coverage_probe_record(path: &Path, key: u64) -> Result<Option<(bool, u64)>> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("read coverage probe memo {}", path.display()));
-        }
+    let Some(bytes) =
+        read_fixed_cache_record::<COVERAGE_PROBE_RECORD_LEN>(path, "coverage probe memo")?
+    else {
+        return Ok(None);
     };
-    anyhow::ensure!(
-        bytes.len() == COVERAGE_PROBE_RECORD_LEN,
-        "coverage probe memo is truncated: {}",
-        path.display()
-    );
     anyhow::ensure!(
         &bytes[..8] == COVERAGE_PROBE_MAGIC,
         "coverage probe memo magic mismatch"
@@ -1131,7 +1230,7 @@ fn cached_coverage_probe(root: &Path, payload: &PinnedInput) -> Result<(bool, u6
     }
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize)]
 struct ClosureEntryRecord {
     guest_path: String,
     host_path: PathBuf,
@@ -1139,16 +1238,230 @@ struct ClosureEntryRecord {
     content_hash: u64,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize)]
 struct ClosureSearchRecord {
     path: PathBuf,
     identity: Option<StableFileIdentity>,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize)]
 struct ClosureRecord {
     entries: Vec<ClosureEntryRecord>,
     search_paths: Vec<ClosureSearchRecord>,
+}
+
+#[derive(Debug)]
+struct BoundedStr<'a, const MAX_LEN: usize>(&'a str);
+
+impl<'de: 'a, 'a, const MAX_LEN: usize> serde::Deserialize<'de> for BoundedStr<'a, MAX_LEN> {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BoundedStrVisitor<'a, const MAX_LEN: usize>(std::marker::PhantomData<&'a str>);
+
+        impl<'de: 'a, 'a, const MAX_LEN: usize> serde::de::Visitor<'de> for BoundedStrVisitor<'a, MAX_LEN> {
+            type Value = BoundedStr<'a, MAX_LEN>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "a UTF-8 path no longer than {MAX_LEN} bytes")
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'de str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.len() > MAX_LEN {
+                    return Err(E::invalid_length(value.len(), &self));
+                }
+                Ok(BoundedStr(value))
+            }
+        }
+
+        deserializer.deserialize_str(BoundedStrVisitor::<MAX_LEN>(std::marker::PhantomData))
+    }
+}
+
+#[derive(Debug)]
+struct BoundedVec<T, const MAX_LEN: usize>(Vec<T>);
+
+impl<'de, T, const MAX_LEN: usize> serde::Deserialize<'de> for BoundedVec<T, MAX_LEN>
+where
+    T: serde::Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BoundedVecVisitor<T, const MAX_LEN: usize>(std::marker::PhantomData<T>);
+
+        struct RejectExcessElement;
+
+        impl<'de> serde::de::DeserializeSeed<'de> for RejectExcessElement {
+            type Value = ();
+
+            fn deserialize<D>(self, _deserializer: D) -> std::result::Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                Err(serde::de::Error::custom(
+                    "loader closure sequence exceeds its element limit",
+                ))
+            }
+        }
+
+        impl<'de, T, const MAX_LEN: usize> serde::de::Visitor<'de> for BoundedVecVisitor<T, MAX_LEN>
+        where
+            T: serde::Deserialize<'de>,
+        {
+            type Value = BoundedVec<T, MAX_LEN>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "a sequence with at most {MAX_LEN} elements")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let hint = sequence.size_hint();
+                if hint.is_some_and(|length| length > MAX_LEN) {
+                    return Err(serde::de::Error::invalid_length(
+                        hint.unwrap_or(usize::MAX),
+                        &self,
+                    ));
+                }
+                let allocation_element_size = std::mem::size_of::<T>().max(1);
+                let initial_capacity = hint
+                    .unwrap_or(0)
+                    .min(MAX_LEN)
+                    .min(CLOSURE_RECORD_MAX_INITIAL_SEQUENCE_ALLOCATION / allocation_element_size);
+                let mut values = Vec::with_capacity(initial_capacity);
+                loop {
+                    if values.len() == MAX_LEN {
+                        if sequence.next_element_seed(RejectExcessElement)?.is_none() {
+                            return Ok(BoundedVec(values));
+                        }
+                        unreachable!("reject seed never returns a decoded element");
+                    }
+                    match sequence.next_element()? {
+                        Some(value) => values.push(value),
+                        None => return Ok(BoundedVec(values)),
+                    }
+                }
+            }
+        }
+
+        deserializer.deserialize_seq(BoundedVecVisitor::<T, MAX_LEN>(std::marker::PhantomData))
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ClosureEntryRecordWire<'a> {
+    #[serde(borrow)]
+    guest_path: BoundedStr<'a, CLOSURE_RECORD_MAX_ENTRY_PATH_LEN>,
+    #[serde(borrow)]
+    host_path: BoundedStr<'a, CLOSURE_RECORD_MAX_ENTRY_PATH_LEN>,
+    identity: StableFileIdentity,
+    content_hash: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ClosureSearchRecordWire<'a> {
+    #[serde(borrow)]
+    path: BoundedStr<'a, CLOSURE_RECORD_MAX_SEARCH_PATH_LEN>,
+    identity: Option<StableFileIdentity>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ClosureRecordWire<'a> {
+    #[serde(borrow)]
+    entries: BoundedVec<ClosureEntryRecordWire<'a>, CLOSURE_RECORD_MAX_ENTRY_COUNT>,
+    #[serde(borrow)]
+    search_paths: BoundedVec<ClosureSearchRecordWire<'a>, CLOSURE_RECORD_MAX_SEARCH_PATH_COUNT>,
+}
+
+impl From<ClosureRecordWire<'_>> for ClosureRecord {
+    fn from(record: ClosureRecordWire<'_>) -> Self {
+        Self {
+            entries: record
+                .entries
+                .0
+                .into_iter()
+                .map(|entry| ClosureEntryRecord {
+                    guest_path: entry.guest_path.0.to_owned(),
+                    host_path: PathBuf::from(entry.host_path.0),
+                    identity: entry.identity,
+                    content_hash: entry.content_hash,
+                })
+                .collect(),
+            search_paths: record
+                .search_paths
+                .0
+                .into_iter()
+                .map(|search| ClosureSearchRecord {
+                    path: PathBuf::from(search.path.0),
+                    identity: search.identity,
+                })
+                .collect(),
+        }
+    }
+}
+
+fn validate_closure_record_limits(record: &ClosureRecord) -> Result<()> {
+    anyhow::ensure!(
+        record.entries.len() <= CLOSURE_RECORD_MAX_ENTRY_COUNT,
+        "loader closure has more than {} entries",
+        CLOSURE_RECORD_MAX_ENTRY_COUNT
+    );
+    anyhow::ensure!(
+        record.search_paths.len() <= CLOSURE_RECORD_MAX_SEARCH_PATH_COUNT,
+        "loader closure has more than {} search paths",
+        CLOSURE_RECORD_MAX_SEARCH_PATH_COUNT
+    );
+    for entry in &record.entries {
+        anyhow::ensure!(
+            entry.guest_path.len() <= CLOSURE_RECORD_MAX_ENTRY_PATH_LEN,
+            "loader closure guest path exceeds {} bytes",
+            CLOSURE_RECORD_MAX_ENTRY_PATH_LEN
+        );
+        let host_path = entry.host_path.to_str().with_context(|| {
+            format!(
+                "loader closure host path is not UTF-8: {}",
+                entry.host_path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            host_path.len() <= CLOSURE_RECORD_MAX_ENTRY_PATH_LEN,
+            "loader closure host path exceeds {} bytes",
+            CLOSURE_RECORD_MAX_ENTRY_PATH_LEN
+        );
+    }
+    for search in &record.search_paths {
+        let path = search.path.to_str().with_context(|| {
+            format!(
+                "loader closure search path is not UTF-8: {}",
+                search.path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            path.len() <= CLOSURE_RECORD_MAX_SEARCH_PATH_LEN,
+            "loader closure search path exceeds {} bytes",
+            CLOSURE_RECORD_MAX_SEARCH_PATH_LEN
+        );
+    }
+    Ok(())
+}
+
+fn decode_closure_record(payload: &[u8]) -> Result<ClosureRecord> {
+    let (record, trailing) = postcard::take_from_bytes::<ClosureRecordWire<'_>>(payload)
+        .context("decode bounded loader closure payload")?;
+    anyhow::ensure!(
+        trailing.is_empty(),
+        "loader closure payload has {} trailing bytes",
+        trailing.len()
+    );
+    Ok(record.into())
 }
 
 #[derive(Debug)]
@@ -1254,7 +1567,7 @@ fn path_identity(path: &Path) -> Result<Option<StableFileIdentity>> {
 }
 
 fn open_recorded_closure_entry(record: &ClosureEntryRecord) -> Result<Option<PinnedClosureEntry>> {
-    let file = match File::open(&record.host_path) {
+    let file = match open_pinned_input_path(&record.host_path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -1287,13 +1600,22 @@ fn open_recorded_closure_entry(record: &ClosureEntryRecord) -> Result<Option<Pin
 }
 
 fn encode_closure_record(record: &ClosureRecord, key: u64) -> Result<Vec<u8>> {
+    validate_closure_record_limits(record)?;
     let payload = postcard::to_stdvec(record).context("encode loader closure payload")?;
-    let mut bytes = Vec::with_capacity(CLOSURE_RECORD_HEADER_LEN + payload.len());
+    anyhow::ensure!(
+        payload.len() <= CLOSURE_RECORD_MAX_PAYLOAD_LEN,
+        "loader closure payload exceeds {} bytes",
+        CLOSURE_RECORD_MAX_PAYLOAD_LEN
+    );
+    let record_len = CLOSURE_RECORD_HEADER_LEN
+        .checked_add(payload.len())
+        .context("loader closure envelope length overflow")?;
+    let mut bytes = Vec::with_capacity(record_len);
     bytes.extend_from_slice(CLOSURE_RECORD_MAGIC);
     bytes.extend_from_slice(&PREPARED_CAS_SCHEMA.to_le_bytes());
     bytes.extend_from_slice(&[0; 4]);
     bytes.extend_from_slice(&key.to_le_bytes());
-    bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&u64::try_from(payload.len())?.to_le_bytes());
     bytes.extend_from_slice(&0u64.to_le_bytes());
     bytes.extend_from_slice(&payload);
     let checksum = ahash_bytes(&bytes);
@@ -1305,32 +1627,52 @@ fn read_pinned_closure_record(
     record_path: &Path,
     expected_key: u64,
 ) -> Result<Option<PinnedClosure>> {
-    let mut bytes = match std::fs::read(record_path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("read loader closure {}", record_path.display()));
-        }
+    let subject = "loader closure";
+    let Some((file, identity)) = open_cache_record(record_path, subject)? else {
+        return Ok(None);
     };
     anyhow::ensure!(
-        bytes.len() >= CLOSURE_RECORD_HEADER_LEN,
+        identity.size >= CLOSURE_RECORD_HEADER_LEN as u64,
         "loader closure envelope is truncated: {}",
         record_path.display()
     );
     anyhow::ensure!(
-        &bytes[..8] == CLOSURE_RECORD_MAGIC
-            && u32::from_le_bytes(bytes[8..12].try_into().unwrap()) == PREPARED_CAS_SCHEMA
-            && bytes[12..16] == [0; 4]
-            && u64::from_le_bytes(bytes[16..24].try_into().unwrap()) == expected_key,
+        identity.size <= CLOSURE_RECORD_MAX_LEN as u64,
+        "loader closure envelope exceeds {} bytes: {}",
+        CLOSURE_RECORD_MAX_LEN,
+        record_path.display()
+    );
+    let mut header = [0u8; CLOSURE_RECORD_HEADER_LEN];
+    pread_exact(&file, 0, &mut header, subject)?;
+    anyhow::ensure!(
+        &header[..8] == CLOSURE_RECORD_MAGIC
+            && u32::from_le_bytes(header[8..12].try_into().unwrap()) == PREPARED_CAS_SCHEMA
+            && header[12..16] == [0; 4]
+            && u64::from_le_bytes(header[16..24].try_into().unwrap()) == expected_key,
         "loader closure envelope recipe mismatch: {}",
         record_path.display()
     );
-    let payload_len = usize::try_from(u64::from_le_bytes(bytes[24..32].try_into().unwrap()))
+    let payload_len = usize::try_from(u64::from_le_bytes(header[24..32].try_into().unwrap()))
         .context("loader closure payload length exceeds usize")?;
+    let record_len = CLOSURE_RECORD_HEADER_LEN
+        .checked_add(payload_len)
+        .context("loader closure envelope length overflow")?;
     anyhow::ensure!(
-        bytes.len() == CLOSURE_RECORD_HEADER_LEN + payload_len,
+        record_len == usize::try_from(identity.size)?,
         "loader closure envelope length mismatch: {}",
+        record_path.display()
+    );
+    let mut bytes = vec![0u8; record_len];
+    bytes[..CLOSURE_RECORD_HEADER_LEN].copy_from_slice(&header);
+    pread_exact(
+        &file,
+        CLOSURE_RECORD_HEADER_LEN as u64,
+        &mut bytes[CLOSURE_RECORD_HEADER_LEN..],
+        subject,
+    )?;
+    anyhow::ensure!(
+        StableFileIdentity::from_file(&file)? == identity,
+        "loader closure changed while reading: {}",
         record_path.display()
     );
     let recorded_checksum = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
@@ -1340,7 +1682,7 @@ fn read_pinned_closure_record(
         "loader closure checksum mismatch: {}",
         record_path.display()
     );
-    let record: ClosureRecord = postcard::from_bytes(&bytes[CLOSURE_RECORD_HEADER_LEN..])
+    let record = decode_closure_record(&bytes[CLOSURE_RECORD_HEADER_LEN..])
         .with_context(|| format!("decode loader closure {}", record_path.display()))?;
     for search in &record.search_paths {
         if path_identity(&search.path)? != search.identity {
@@ -1872,7 +2214,11 @@ impl PreparedObject {
                 )
             };
             if read < 0 {
-                return Err(std::io::Error::last_os_error()).context("pread prepared object");
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error).context("pread prepared object");
             }
             anyhow::ensure!(read != 0, "prepared object truncated during pread");
             done += read as usize;
@@ -1932,63 +2278,13 @@ fn read_prepared_validation_record(
     identity: StableFileIdentity,
     data_offset: usize,
 ) -> Result<Option<PreparedPayloadValidation>> {
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(record_path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "read prepared-object validation memo {}",
-                    record_path.display()
-                )
-            });
-        }
+    let Some(bytes) = read_fixed_cache_record::<PREPARED_VALIDATION_RECORD_LEN>(
+        record_path,
+        "prepared-object validation memo",
+    )?
+    else {
+        return Ok(None);
     };
-    let metadata = file.metadata().with_context(|| {
-        format!(
-            "stat prepared-object validation memo {}",
-            record_path.display()
-        )
-    })?;
-    anyhow::ensure!(
-        metadata.is_file(),
-        "prepared-object validation memo is not a regular file: {}",
-        record_path.display()
-    );
-    anyhow::ensure!(
-        metadata.len() == PREPARED_VALIDATION_RECORD_LEN as u64,
-        "prepared-object validation memo has invalid length {}: {}",
-        metadata.len(),
-        record_path.display()
-    );
-    let mut bytes = [0u8; PREPARED_VALIDATION_RECORD_LEN];
-    let mut done = 0usize;
-    while done < bytes.len() {
-        let read = loop {
-            match file.read_at(&mut bytes[done..], done as u64) {
-                Ok(read) => break read,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "read prepared-object validation memo {}",
-                            record_path.display()
-                        )
-                    });
-                }
-            }
-        };
-        anyhow::ensure!(
-            read > 0,
-            "prepared-object validation memo was truncated while reading: {}",
-            record_path.display()
-        );
-        done += read;
-    }
     anyhow::ensure!(
         &bytes[..8] == PREPARED_VALIDATION_MAGIC,
         "prepared-object validation memo magic mismatch"
@@ -2115,33 +2411,46 @@ fn hash_prepared_payload(
     note_prepared_payload_hash_for_test()?;
 
     let mut hasher = fixed_hasher();
-    let mut done = 0usize;
-    let mut padding_is_zero = true;
-    let mut buffer = vec![0u8; 1 << 20];
-    while done < padded_payload_len {
-        let remaining = (padded_payload_len - done).min(buffer.len());
+    let mut buffer = vec![0u8; CONTENT_HASH_CHUNK_LEN];
+    let mut payload_done = 0usize;
+    while payload_done < payload_len {
+        let chunk_len = (payload_len - payload_done).min(buffer.len());
         let file_offset = data_offset
-            .checked_add(done)
+            .checked_add(payload_done)
             .context("prepared payload validation offset overflow")?;
-        let read = loop {
-            match file.read_at(&mut buffer[..remaining], u64::try_from(file_offset)?) {
-                Ok(read) => break read,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => {
-                    return Err(error).context("pread prepared object payload for validation");
-                }
-            }
-        };
-        anyhow::ensure!(
-            read > 0,
-            "prepared object was truncated while validating its payload"
-        );
-        let payload_bytes = payload_len.saturating_sub(done).min(read);
-        hasher.write(&buffer[..payload_bytes]);
-        padding_is_zero &= buffer[payload_bytes..read].iter().all(|byte| *byte == 0);
-        done = done
-            .checked_add(read)
+        pread_exact(
+            file,
+            u64::try_from(file_offset)?,
+            &mut buffer[..chunk_len],
+            "prepared object payload for validation",
+        )?;
+        hasher.write(&buffer[..chunk_len]);
+        payload_done = payload_done
+            .checked_add(chunk_len)
             .context("prepared payload validation length overflow")?;
+    }
+
+    let padding_len = padded_payload_len
+        .checked_sub(payload_len)
+        .context("prepared padded payload is shorter than its content")?;
+    let mut padding_done = 0usize;
+    let mut padding_is_zero = true;
+    while padding_done < padding_len {
+        let chunk_len = (padding_len - padding_done).min(buffer.len());
+        let file_offset = data_offset
+            .checked_add(payload_len)
+            .and_then(|offset| offset.checked_add(padding_done))
+            .context("prepared padding validation offset overflow")?;
+        pread_exact(
+            file,
+            u64::try_from(file_offset)?,
+            &mut buffer[..chunk_len],
+            "prepared object padding for validation",
+        )?;
+        padding_is_zero &= buffer[..chunk_len].iter().all(|byte| *byte == 0);
+        padding_done = padding_done
+            .checked_add(chunk_len)
+            .context("prepared padding validation length overflow")?;
     }
     let digest = hasher.finish();
     let after = StableFileIdentity::from_file(file)?;
@@ -2279,7 +2588,7 @@ fn validate_open_prepared_object(
         "prepared initrd object is writable rather than immutable: {}",
         path.display()
     );
-    rustix::fs::flock(&file, rustix::fs::FlockOperation::LockShared)
+    flock_retry(&file, rustix::fs::FlockOperation::LockShared)
         .with_context(|| format!("lock prepared initrd object {}", path.display()))?;
     let header = read_header_at(&file)?;
     expected.validate(header)?;
@@ -2341,7 +2650,7 @@ fn try_open_prepared_object_with_open_hook(
     // validation below acquires object LOCK_SH, that object lock itself
     // protects the inode and the namespace gate can be released.
     let namespace_gate = open_namespace_gate(root)?;
-    rustix::fs::flock(&namespace_gate, rustix::fs::FlockOperation::LockShared)
+    flock_retry(&namespace_gate, rustix::fs::FlockOperation::LockShared)
         .context("lock prepared initrd object namespace")?;
     let result = try_open_prepared_object_under_namespace(root, path, expected, after_open);
     drop(namespace_gate);
@@ -2394,7 +2703,7 @@ fn publish_prepared_object(
         "prepared object builder payload length mismatch"
     );
     anyhow::ensure!(
-        ahash_bytes(&built.payload) == built.header.payload_hash,
+        content_hash_bytes(&built.payload) == built.header.payload_hash,
         "prepared object builder payload digest mismatch"
     );
     let file_alignment =
@@ -2631,11 +2940,27 @@ where
 }
 
 fn read_gc_stamp(path: &Path) -> Option<u64> {
-    let bytes = std::fs::read(path).ok()?;
-    if bytes.len() != 8 {
-        return None;
-    }
-    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+    let bytes = read_fixed_cache_record::<8>(path, "prepared initrd GC stamp")
+        .ok()
+        .flatten()?;
+    Some(u64::from_le_bytes(bytes))
+}
+
+fn publish_gc_stamp(root: &Path, path: &Path, now: u64) -> Result<()> {
+    let mut temp = tempfile::Builder::new()
+        .prefix(".tmp-prepared-gc-stamp-")
+        .tempfile_in(root)
+        .context("create prepared initrd GC stamp temp")?;
+    temp.write_all(&now.to_le_bytes())
+        .context("write prepared initrd GC stamp")?;
+    temp.as_file()
+        .sync_all()
+        .context("sync prepared initrd GC stamp")?;
+    temp.persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("publish prepared initrd GC stamp {}", path.display()))?;
+    crate::cache::fsync_parent(path).context("sync prepared initrd GC stamp parent")?;
+    Ok(())
 }
 
 fn unix_now_secs() -> u64 {
@@ -2767,7 +3092,7 @@ struct GcNamespaceGuard {
 
 fn try_lock_gc_namespace(root: &Path) -> Result<Option<GcNamespaceGuard>> {
     let file = open_namespace_gate(root)?;
-    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+    match flock_retry(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => Ok(Some(GcNamespaceGuard { _file: file })),
         Err(error) if error == rustix::io::Errno::WOULDBLOCK => Ok(None),
         Err(error) => Err(error).context("lock prepared initrd coordination namespace for GC"),
@@ -2776,7 +3101,7 @@ fn try_lock_gc_namespace(root: &Path) -> Result<Option<GcNamespaceGuard>> {
 
 fn try_collect_temp(path: &Path, lock_path: &Path, _namespace: &GcNamespaceGuard) -> Result<bool> {
     let coordination = open_lock_file(lock_path)?;
-    if rustix::fs::flock(
+    if flock_retry(
         &coordination,
         rustix::fs::FlockOperation::NonBlockingLockExclusive,
     )
@@ -2800,7 +3125,7 @@ fn try_collect_object(
 ) -> Result<bool> {
     let lock_path = prepared_object_lock_path(root, candidate.kind, candidate.key);
     let coord = open_lock_file(&lock_path)?;
-    if rustix::fs::flock(&coord, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_err() {
+    if flock_retry(&coord, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_err() {
         return Ok(false);
     }
     let object = match File::open(&candidate.path) {
@@ -2808,7 +3133,7 @@ fn try_collect_object(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
         Err(error) => return Err(error.into()),
     };
-    if rustix::fs::flock(
+    if flock_retry(
         &object,
         rustix::fs::FlockOperation::NonBlockingLockExclusive,
     )
@@ -2919,7 +3244,7 @@ fn sweep_idle_coordination_locks(root: &Path, _namespace: &GcNamespaceGuard) -> 
                     .with_context(|| format!("open idle coordination lock {}", path.display()));
             }
         };
-        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        match flock_retry(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => {}
             Err(error) if error == rustix::io::Errno::WOULDBLOCK => continue,
             Err(error) => {
@@ -3034,7 +3359,7 @@ fn maybe_gc_prepared_cache(root: &Path) {
     let Ok(gc_lock) = open_lock_file(&gc_lock_path) else {
         return;
     };
-    if rustix::fs::flock(
+    if flock_retry(
         &gc_lock,
         rustix::fs::FlockOperation::NonBlockingLockExclusive,
     )
@@ -3054,7 +3379,7 @@ fn maybe_gc_prepared_cache(root: &Path) {
     if let Err(error) = run_prepared_cache_gc(root, now, &namespace) {
         tracing::warn!(%error, "prepared initrd CAS GC failed");
     }
-    if let Err(error) = std::fs::write(&stamp_path, now.to_le_bytes()) {
+    if let Err(error) = publish_gc_stamp(root, &stamp_path, now) {
         tracing::warn!(%error, "prepared initrd CAS GC stamp write failed");
     }
 }
@@ -3418,11 +3743,11 @@ impl PreparedBaseInputs {
             .iter()
             .map(|entry| entry.input.proc_path())
             .collect();
-        let includes: Vec<(&str, &Path)> = self
+        let includes: Vec<(&str, &Path, u32)> = self
             .includes
             .iter()
             .zip(&include_paths)
-            .map(|(entry, path)| (entry.archive_name.as_str(), path.as_path()))
+            .map(|(entry, path)| (entry.archive_name.as_str(), path.as_path(), entry.mode))
             .collect();
         let shared_paths: Vec<PathBuf> = self
             .shared_libs
@@ -3719,7 +4044,7 @@ where
             key,
             mapping_granule: mapping_granule as u64,
             payload_len: layout.len() as u64,
-            payload_hash: ahash_bytes(&layout),
+            payload_hash: content_hash_bytes(&layout),
             part_uncompressed_len: uncompressed.len() as u64,
             part_compressed_len: compressed.len() as u64,
             leading_pad: leading_pad as u64,
@@ -3788,7 +4113,7 @@ fn get_or_build_part_view(
             key,
             mapping_granule: mapping_granule as u64,
             payload_len: layout.len() as u64,
-            payload_hash: ahash_bytes(&layout),
+            payload_hash: content_hash_bytes(&layout),
             part_uncompressed_len: canonical.header.part_uncompressed_len,
             part_compressed_len: canonical.header.part_compressed_len,
             leading_pad: leading_pad as u64,
@@ -3837,7 +4162,7 @@ pub(crate) fn get_or_prepare_base(
             key: base_key,
             mapping_granule: mapping_granule as u64,
             payload_len: compressed.len() as u64,
-            payload_hash: ahash_bytes(&compressed),
+            payload_hash: content_hash_bytes(&compressed),
             part_uncompressed_len: uncompressed.len() as u64,
             part_compressed_len: compressed.len() as u64,
             leading_pad: 0,
@@ -4011,7 +4336,7 @@ fn plan_prepared_mappings(
                 key: stitch_key,
                 mapping_granule: page_size as u64,
                 payload_len: page_size as u64,
-                payload_hash: ahash_bytes(&page),
+                payload_hash: content_hash_bytes(&page),
                 part_uncompressed_len: 0,
                 part_compressed_len: page_size as u64,
                 leading_pad: 0,
@@ -4942,11 +5267,19 @@ mod tests {
             .unwrap();
         let tmp = _tempdir_keep_alive.path();
         let f = tmp.join("big");
-        // 16KB file — spans multiple pages in the mmap.
-        let data: Vec<u8> = (0..16384).map(|i| (i % 256) as u8).collect();
+        // Cross two complete logical digest chunks and end on a short chunk.
+        // The file reader must make the same Hasher::write calls as the
+        // in-memory content path even if pread itself returns short.
+        let data: Vec<u8> = (0..CONTENT_HASH_CHUNK_LEN * 2 + 173)
+            .map(|i| (i % 251) as u8)
+            .collect();
         std::fs::write(&f, &data).unwrap();
         let h = hash_file(&f).unwrap();
-        // Same content should produce same hash.
+        assert_eq!(
+            h,
+            content_hash_bytes(&data),
+            "file and in-memory content hashing must use identical fixed boundaries"
+        );
         assert_eq!(h, hash_file(&f).unwrap());
     }
 
@@ -5095,7 +5428,7 @@ mod tests {
                 key,
                 mapping_granule: mapping_granule as u64,
                 payload_len: payload.len() as u64,
-                payload_hash: ahash_bytes(&payload),
+                payload_hash: content_hash_bytes(&payload),
                 part_uncompressed_len: payload.len() as u64,
                 part_compressed_len: payload.len() as u64,
                 leading_pad: 0,
@@ -5152,7 +5485,7 @@ mod tests {
                     key,
                     mapping_granule: mapping_granule as u64,
                     payload_len: payload.len() as u64,
-                    payload_hash: ahash_bytes(&payload),
+                    payload_hash: content_hash_bytes(&payload),
                     part_uncompressed_len: compressed_len as u64,
                     part_compressed_len: compressed_len as u64,
                     leading_pad: leading_pad as u64,
@@ -5193,7 +5526,7 @@ mod tests {
                     key,
                     mapping_granule: mapping_granule as u64,
                     payload_len: compressed.len() as u64,
-                    payload_hash: ahash_bytes(&compressed),
+                    payload_hash: content_hash_bytes(&compressed),
                     part_uncompressed_len: uncompressed.len() as u64,
                     part_compressed_len: compressed.len() as u64,
                     leading_pad: 0,
@@ -5867,6 +6200,180 @@ mod tests {
     }
 
     #[test]
+    fn fixed_cache_record_reader_rejects_unsafe_or_wrong_sized_paths_promptly() {
+        const RECORD_LEN: usize = 8;
+
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        assert!(
+            read_fixed_cache_record::<RECORD_LEN>(&missing, "test cache record")
+                .unwrap()
+                .is_none(),
+            "a missing record is a cache miss"
+        );
+
+        let valid = temp.path().join("valid");
+        let expected = *b"12345678";
+        std::fs::write(&valid, expected).unwrap();
+        assert_eq!(
+            read_fixed_cache_record::<RECORD_LEN>(&valid, "test cache record")
+                .unwrap()
+                .unwrap(),
+            expected
+        );
+
+        let symlink = temp.path().join("symlink");
+        std::os::unix::fs::symlink(&valid, &symlink).unwrap();
+        assert!(
+            read_fixed_cache_record::<RECORD_LEN>(&symlink, "test cache record").is_err(),
+            "O_NOFOLLOW must reject a record symlink even when its target is valid"
+        );
+
+        let directory = temp.path().join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        let error =
+            read_fixed_cache_record::<RECORD_LEN>(&directory, "test cache record").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not a regular file"),
+            "a record directory must fail closed: {error:#}"
+        );
+
+        let short = temp.path().join("short");
+        std::fs::write(&short, vec![0u8; RECORD_LEN - 1]).unwrap();
+        let error = read_fixed_cache_record::<RECORD_LEN>(&short, "test cache record").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("invalid length"),
+            "an N-1 record must be rejected before reading: {error:#}"
+        );
+
+        let long = temp.path().join("long");
+        std::fs::write(&long, vec![0u8; RECORD_LEN + 1]).unwrap();
+        let error = read_fixed_cache_record::<RECORD_LEN>(&long, "test cache record").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("invalid length"),
+            "an N+1 record must be rejected before reading: {error:#}"
+        );
+
+        let fifo = temp.path().join("fifo");
+        let fifo_c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) },
+            0,
+            "create cache-record FIFO fixture: {}",
+            std::io::Error::last_os_error()
+        );
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let fifo_for_reader = fifo.clone();
+        let reader = std::thread::spawn(move || {
+            sender
+                .send(read_fixed_cache_record::<RECORD_LEN>(
+                    &fifo_for_reader,
+                    "test cache record",
+                ))
+                .unwrap();
+        });
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("O_NONBLOCK cache-record FIFO rejection must return promptly");
+        reader.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not a regular file"),
+            "a record FIFO must fail closed: {error:#}"
+        );
+    }
+
+    #[test]
+    fn oversized_sparse_closure_record_is_rejected_before_payload_read() {
+        let root = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(root.path()).unwrap();
+        let key = 0xabc0_5678;
+        let path = root
+            .path()
+            .join(PREPARED_CLOSURES_DIR)
+            .join(format!("{key:016x}.closure"));
+        let file = File::create(&path).unwrap();
+        file.set_len((CLOSURE_RECORD_MAX_LEN + 1) as u64).unwrap();
+        drop(file);
+
+        let error = read_pinned_closure_record(&path, key).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("envelope exceeds"),
+            "the fstat length gate must reject an oversized sparse record before allocating or \
+             parsing its payload: {error:#}"
+        );
+    }
+
+    #[test]
+    fn gc_stamp_reader_rejects_invalid_paths_promptly_and_publish_replaces_them() {
+        let root = tempfile::tempdir().unwrap();
+        let stamp = root.path().join(PREPARED_GC_STAMP);
+
+        publish_gc_stamp(root.path(), &stamp, 11).unwrap();
+        assert_eq!(read_gc_stamp(&stamp), Some(11));
+
+        let target = root.path().join("symlink-target");
+        let target_bytes = 0xfeed_face_cafe_beefu64.to_le_bytes();
+        std::fs::write(&target, target_bytes).unwrap();
+        std::fs::remove_file(&stamp).unwrap();
+        std::os::unix::fs::symlink(&target, &stamp).unwrap();
+        assert_eq!(
+            read_gc_stamp(&stamp),
+            None,
+            "O_NOFOLLOW must reject a substituted GC stamp symlink"
+        );
+        publish_gc_stamp(root.path(), &stamp, 22).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&stamp)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "atomic publication must replace the symlink with a regular inode"
+        );
+        assert_eq!(read_gc_stamp(&stamp), Some(22));
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            target_bytes,
+            "GC stamp publication must not write through the substituted symlink"
+        );
+
+        std::fs::remove_file(&stamp).unwrap();
+        let fifo_c = std::ffi::CString::new(stamp.to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) },
+            0,
+            "create GC-stamp FIFO fixture: {}",
+            std::io::Error::last_os_error()
+        );
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let fifo_for_reader = stamp.clone();
+        let reader = std::thread::spawn(move || {
+            sender.send(read_gc_stamp(&fifo_for_reader)).unwrap();
+        });
+        assert_eq!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("O_NONBLOCK GC-stamp FIFO rejection must return promptly"),
+            None
+        );
+        reader.join().unwrap();
+        publish_gc_stamp(root.path(), &stamp, 33).unwrap();
+        assert_eq!(
+            read_gc_stamp(&stamp),
+            Some(33),
+            "atomic publication must replace a FIFO without opening it"
+        );
+
+        std::fs::remove_file(&stamp).unwrap();
+        std::fs::create_dir(&stamp).unwrap();
+        assert_eq!(
+            read_gc_stamp(&stamp),
+            None,
+            "a GC stamp directory is stale rather than readable metadata"
+        );
+    }
+
+    #[test]
     fn prepared_validation_record_rejects_nonregular_or_wrong_sized_entries() {
         let temp = tempfile::tempdir().unwrap();
         ensure_prepared_cache_dirs(temp.path()).unwrap();
@@ -5993,6 +6500,84 @@ mod tests {
     }
 
     #[test]
+    fn closure_record_decode_is_exact_and_count_bounded_before_allocation() {
+        let record = ClosureRecord {
+            entries: Vec::new(),
+            search_paths: Vec::new(),
+        };
+        let mut payload = postcard::to_stdvec(&record).unwrap();
+        assert!(
+            decode_closure_record(&payload).is_ok(),
+            "the bounded wire representation must remain compatible with records we publish"
+        );
+        payload.push(0);
+        let error = decode_closure_record(&payload).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("trailing bytes"),
+            "valid postcard followed by unconsumed bytes must fail closed: {error:#}"
+        );
+
+        let excessive_count = CLOSURE_RECORD_MAX_ENTRY_COUNT + 1;
+        let mut count_payload = postcard::to_stdvec(&excessive_count).unwrap();
+        // Postcard reports a sequence size hint only when at least one input
+        // byte remains per claimed element. Supply that cheap hostile shape:
+        // the bounded visitor must reject the count before decoding or
+        // reserving storage for any entry.
+        count_payload.resize(count_payload.len() + excessive_count, 0);
+        assert!(
+            decode_closure_record(&count_payload).is_err(),
+            "an excessive declared entry count must fail before element allocation"
+        );
+    }
+
+    #[test]
+    fn closure_record_encode_enforces_the_decode_limits() {
+        let oversized_entry_path = "x".repeat(CLOSURE_RECORD_MAX_ENTRY_PATH_LEN + 1);
+        let entry_error = encode_closure_record(
+            &ClosureRecord {
+                entries: vec![ClosureEntryRecord {
+                    guest_path: oversized_entry_path,
+                    host_path: PathBuf::from("/valid/host/path"),
+                    identity: StableFileIdentity {
+                        dev: 0,
+                        ino: 0,
+                        size: 0,
+                        mtime_secs: 0,
+                        mtime_nsecs: 0,
+                        ctime_secs: 0,
+                        ctime_nsecs: 0,
+                    },
+                    content_hash: 0,
+                }],
+                search_paths: Vec::new(),
+            },
+            1,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{entry_error:#}").contains("guest path exceeds"),
+            "the writer must not publish a record its bounded decoder rejects: {entry_error:#}"
+        );
+
+        let oversized_search_path = "x".repeat(CLOSURE_RECORD_MAX_SEARCH_PATH_LEN + 1);
+        let search_error = encode_closure_record(
+            &ClosureRecord {
+                entries: Vec::new(),
+                search_paths: vec![ClosureSearchRecord {
+                    path: PathBuf::from(oversized_search_path),
+                    identity: None,
+                }],
+            },
+            2,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{search_error:#}").contains("search path exceeds"),
+            "search-path limits must be identical on encode and decode: {search_error:#}"
+        );
+    }
+
+    #[test]
     fn digest_record_checksum_and_schema_namespace_fail_closed() {
         let root = tempfile::tempdir().unwrap();
         ensure_prepared_cache_dirs(root.path()).unwrap();
@@ -6043,6 +6628,75 @@ mod tests {
         assert!(result.is_err(), "mid-read truncate must be a normal error");
     }
 
+    #[test]
+    fn pinned_input_elf_probe_handles_short_files_symlinks_and_fifos() {
+        let root = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(root.path()).unwrap();
+
+        let short = root.path().join("short");
+        std::fs::write(&short, b"\x7fEL").unwrap();
+        let short_input = pin_input(root.path(), &short).unwrap();
+        assert!(
+            !short_input.is_elf().unwrap(),
+            "a short ELF prefix is an ordinary non-ELF input"
+        );
+
+        let elf = root.path().join("elf");
+        let elf_symlink = root.path().join("elf-link");
+        std::fs::write(&elf, b"\x7fELFfixture").unwrap();
+        std::os::unix::fs::symlink(&elf, &elf_symlink).unwrap();
+        let symlink_input = pin_input(root.path(), &elf_symlink).unwrap();
+        assert!(
+            symlink_input.is_elf().unwrap(),
+            "the nonblocking opener must preserve intentional symlink following"
+        );
+
+        let fifo = root.path().join("fifo");
+        let fifo_c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) },
+            0,
+            "create pinned-input FIFO fixture: {}",
+            std::io::Error::last_os_error()
+        );
+        let cache_root = root.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result = pin_input(&cache_root, &fifo).map_err(|error| format!("{error:#}"));
+            sender.send(result).unwrap();
+        });
+        let error = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("O_NONBLOCK pinned-input FIFO rejection must return promptly")
+            .unwrap_err();
+        worker.join().unwrap();
+        assert!(
+            error.contains("not a regular file"),
+            "a FIFO input must fail the regular-file identity gate: {error}"
+        );
+
+        let record = ClosureEntryRecord {
+            guest_path: "lib64/libfifo.so".to_owned(),
+            host_path: root.path().join("fifo"),
+            identity: short_input.identity,
+            content_hash: short_input.content_hash,
+        };
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result = open_recorded_closure_entry(&record).map_err(|error| format!("{error:#}"));
+            sender.send(result).unwrap();
+        });
+        let error = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("O_NONBLOCK recorded-dependency FIFO rejection must return promptly")
+            .unwrap_err();
+        worker.join().unwrap();
+        assert!(
+            error.contains("not a regular file"),
+            "a recorded FIFO dependency must fail the regular-file identity gate: {error}"
+        );
+    }
+
     fn pinned_closure_entry(root: &Path, guest_path: &str, host_path: &Path) -> PinnedClosureEntry {
         PinnedClosureEntry {
             guest_path: guest_path.to_owned(),
@@ -6061,6 +6715,89 @@ mod tests {
             input: pin_input(root, host_path).unwrap(),
             mode,
         }
+    }
+
+    fn newc_entry_mode(archive: &[u8], target: &str) -> u32 {
+        let mut offset = 0usize;
+        while offset
+            .checked_add(110)
+            .is_some_and(|header_end| header_end <= archive.len())
+        {
+            let header = &archive[offset..offset + 110];
+            assert_eq!(&header[..6], b"070701", "invalid newc header");
+            let field = |range: std::ops::Range<usize>| {
+                u32::from_str_radix(std::str::from_utf8(&header[range]).unwrap(), 16).unwrap()
+            };
+            let mode = field(14..22);
+            let file_size = field(54..62) as usize;
+            let name_size = field(94..102) as usize;
+            let name_start = offset + 110;
+            let name_end = name_start + name_size;
+            assert!(name_size > 0 && name_end <= archive.len());
+            let name = std::str::from_utf8(&archive[name_start..name_end - 1]).unwrap();
+            if name == target {
+                return mode;
+            }
+            let data_start = (name_end + 3) & !3;
+            offset = (data_start + file_size + 3) & !3;
+        }
+        panic!("newc archive has no entry named {target}");
+    }
+
+    #[test]
+    fn prepared_base_build_uses_the_include_mode_captured_by_its_key() {
+        let root = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(root.path()).unwrap();
+        let payload_path = root.path().join("payload");
+        let include_path = root.path().join("include");
+        std::fs::write(&payload_path, b"not an ELF payload").unwrap();
+        std::fs::write(&include_path, b"verbatim include bytes").unwrap();
+        let mut permissions = std::fs::metadata(&include_path).unwrap().permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&include_path, permissions).unwrap();
+        let captured_mode = std::fs::metadata(&include_path)
+            .unwrap()
+            .permissions()
+            .mode();
+
+        let payload = pin_input(root.path(), &payload_path).unwrap();
+        let include = pinned_archive_entry(
+            root.path(),
+            "include-files/mode-fixture",
+            &include_path,
+            captured_mode,
+        );
+        let key = prepared_base_semantic_key(&[], std::slice::from_ref(&include), &[], None);
+        let changed_mode_include = pinned_archive_entry(
+            root.path(),
+            "include-files/mode-fixture",
+            &include_path,
+            captured_mode | 0o111,
+        );
+        let changed_mode_key =
+            prepared_base_semantic_key(&[], std::slice::from_ref(&changed_mode_include), &[], None);
+        assert_ne!(
+            key, changed_mode_key,
+            "the captured include mode must participate in the semantic key"
+        );
+        let inputs = PreparedBaseInputs {
+            key,
+            payload,
+            extras: Vec::new(),
+            includes: vec![include],
+            shared_libs: Vec::new(),
+            busybox_bytes: None,
+        };
+
+        let mut permissions = std::fs::metadata(&include_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&include_path, permissions).unwrap();
+        let archive = inputs.build().unwrap();
+        assert_eq!(
+            newc_entry_mode(&archive, "include-files/mode-fixture"),
+            captured_mode,
+            "archive mode must remain the mode represented by the semantic key"
+        );
     }
 
     #[test]
@@ -6343,7 +7080,7 @@ mod tests {
             .env(PREPARED_CHILD_RESULTS, paths.results)
             .env(PREPARED_CHILD_WINNER, paths.winner)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
             .spawn()
             .unwrap()
     }

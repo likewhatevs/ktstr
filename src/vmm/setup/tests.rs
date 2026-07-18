@@ -196,6 +196,228 @@ fn prepared_subrange_validation_covers_adjacent_regions_and_rejects_holes() {
 }
 
 #[test]
+fn prepared_multi_region_direct_cow_preserves_offsets_and_private_writes() {
+    use std::io::Write as _;
+    use std::os::unix::fs::{FileExt as _, PermissionsExt as _};
+    use vm_memory::mmap::{GuestRegionMmap, MmapRegion};
+
+    struct Reservation {
+        base: *mut libc::c_void,
+        len: usize,
+    }
+
+    impl Drop for Reservation {
+        fn drop(&mut self) {
+            // SAFETY: `base` and `len` are the unchanged result and length of
+            // the successful reservation mmap below. MAP_FIXED replacements
+            // preserve that complete virtual-address extent.
+            let _ = unsafe { libc::munmap(self.base, self.len) };
+        }
+    }
+
+    let granule = PREPARED_MAPPING_GRANULE;
+    let host_page = host_page_size() as usize;
+    let reservation_len = 4 * granule;
+
+    // Declare the backing-fd guards first so the VA reservation is always
+    // torn down before they unlock and close, including during unwinding.
+    let mut cow_guards = Vec::new();
+
+    // SAFETY: this creates a fresh inaccessible arena owned by `reservation`.
+    let base = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            reservation_len,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(
+        base,
+        libc::MAP_FAILED,
+        "reserve test address space: {}",
+        std::io::Error::last_os_error()
+    );
+    let reservation = Reservation {
+        base,
+        len: reservation_len,
+    };
+
+    let first_host = base.cast::<u8>();
+    // Adjacent guest regions deliberately live at unrelated host VMAs. Two
+    // whole prepared granules remain PROT_NONE between them, so treating the
+    // first HVA as a contiguous base deterministically faults.
+    // SAFETY: the offset remains inside the reserved four-granule arena.
+    let second_host = unsafe { first_host.add(3 * granule) };
+    for host in [first_host, second_host] {
+        // SAFETY: each target is an aligned, non-overlapping granule wholly
+        // inside our PROT_NONE reservation. MAP_FIXED replaces only that slot.
+        let mapped = unsafe {
+            libc::mmap(
+                host.cast(),
+                granule,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        assert_eq!(
+            mapped,
+            host.cast(),
+            "map test guest region at {host:p}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    let mut named = tempfile::NamedTempFile::new().unwrap();
+    let mut backing_bytes = vec![0x31; 2 * granule];
+    backing_bytes[..initramfs::LZ4_LEGACY_MAGIC.len()]
+        .copy_from_slice(&initramfs::LZ4_LEGACY_MAGIC);
+    backing_bytes[granule..].fill(0x72);
+    named.write_all(&backing_bytes).unwrap();
+    named.as_file().sync_all().unwrap();
+    let backing_path = named.into_temp_path();
+    std::fs::set_permissions(&backing_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let backing = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&backing_path)
+        .unwrap();
+    let observer = backing.try_clone().unwrap();
+    rustix::fs::flock(&backing, rustix::fs::FlockOperation::LockShared).unwrap();
+
+    // SAFETY: both raw regions describe the complete live anonymous VMAs
+    // installed above. `Reservation` owns and outlives these non-owning
+    // vm-memory wrappers.
+    let first_region = unsafe {
+        MmapRegion::build_raw(
+            first_host,
+            granule,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+        )
+        .unwrap()
+    };
+    // SAFETY: same invariant as `first_region`, for the discontiguous slot.
+    let second_region = unsafe {
+        MmapRegion::build_raw(
+            second_host,
+            granule,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+        )
+        .unwrap()
+    };
+    let guest_mem = GuestMemoryMmap::from_regions(vec![
+        GuestRegionMmap::new(first_region, GuestAddress(0)).unwrap(),
+        GuestRegionMmap::new(second_region, GuestAddress(granule as u64)).unwrap(),
+    ])
+    .unwrap();
+
+    let ranges = vec![PreparedMapping {
+        fd: backing.into(),
+        file_offset: 0,
+        guest_offset: 0,
+        map_len: backing_bytes.len(),
+    }];
+    assert_eq!(
+        validate_prepared_load(
+            backing_bytes.len(),
+            initramfs::InitrdCompression::Lz4,
+            granule,
+            host_page,
+            0,
+            &ranges,
+        )
+        .unwrap(),
+        backing_bytes.len() as u32
+    );
+    let validated =
+        validate_prepared_subranges(&guest_mem, ranges, 0, host_page, host_page).unwrap();
+    assert_eq!(validated.len(), 1);
+    assert_eq!(validated[0].subranges.len(), 2);
+    assert_eq!(validated[0].subranges[0].guest_addr, 0);
+    assert_eq!(validated[0].subranges[0].host_addr, first_host);
+    assert_eq!(validated[0].subranges[0].file_offset, 0);
+    assert_eq!(validated[0].subranges[0].len, granule);
+    assert_eq!(validated[0].subranges[1].guest_addr, granule as u64);
+    assert_eq!(validated[0].subranges[1].host_addr, second_host);
+    assert_eq!(validated[0].subranges[1].file_offset, granule as u64);
+    assert_eq!(validated[0].subranges[1].len, granule);
+    assert_eq!(second_host as usize, first_host as usize + 3 * granule);
+
+    map_validated_prepared_ranges(
+        &mut cow_guards,
+        validated,
+        |subrange, fd| {
+            // SAFETY: production validation above proved that each complete
+            // destination subrange lies inside one live guest-memory region.
+            unsafe {
+                initramfs::cow_overlay_file_borrowed(
+                    subrange.host_addr,
+                    subrange.len,
+                    fd,
+                    subrange.file_offset,
+                )
+            }
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        cow_guards.len(),
+        1,
+        "both split mappings must retain one locked backing fd"
+    );
+
+    let mut magic = [0; 4];
+    guest_mem.read_slice(&mut magic, GuestAddress(0)).unwrap();
+    assert_eq!(magic, initramfs::LZ4_LEGACY_MAGIC);
+    let mut first_byte = [0];
+    guest_mem
+        .read_slice(&mut first_byte, GuestAddress(host_page as u64))
+        .unwrap();
+    assert_eq!(first_byte, [0x31]);
+    let mut second_byte = [0];
+    guest_mem
+        .read_slice(&mut second_byte, GuestAddress((granule + host_page) as u64))
+        .unwrap();
+    assert_eq!(
+        second_byte,
+        [0x72],
+        "the second guest region must map from the second file offset"
+    );
+
+    let private_write_offset = granule + host_page;
+    guest_mem
+        .write_slice(&[0xe5], GuestAddress(private_write_offset as u64))
+        .unwrap();
+    guest_mem
+        .read_slice(&mut second_byte, GuestAddress(private_write_offset as u64))
+        .unwrap();
+    assert_eq!(second_byte, [0xe5]);
+    assert_eq!(
+        observer
+            .read_at(&mut second_byte, private_write_offset as u64)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        second_byte,
+        [0x72],
+        "MAP_PRIVATE guest writes must not modify the immutable backing object"
+    );
+
+    // Preserve the production lifetime order explicitly: wrappers first,
+    // mapped reservation second, and the locked backing-fd guard last.
+    drop(guest_mem);
+    drop(reservation);
+    drop(cow_guards);
+}
+
+#[test]
 fn prepared_mapper_keeps_guards_on_partial_map_and_numa_failures() {
     let page = host_page_size() as usize;
     let subranges = vec![
