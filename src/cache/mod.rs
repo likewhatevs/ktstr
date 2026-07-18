@@ -61,6 +61,7 @@ pub(crate) mod shared_test_helpers;
 
 pub(crate) use cache_dir::GitBuilderLockGuard;
 pub use cache_dir::{CacheDir, ExclusiveLockGuard, SharedLockGuard};
+pub(crate) use metadata::kernel_config_include_for_image;
 pub use metadata::{
     CacheArtifacts, CacheEntry, KconfigStatus, KernelMetadata, KernelSource, ListedEntry,
     boot_modules_for_image, initrd_compression_for_image, ordered_boot_modules_in,

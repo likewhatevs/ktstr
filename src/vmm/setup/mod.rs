@@ -1369,6 +1369,7 @@ impl KtstrVm {
         let probe = self.jemalloc_probe_binary.clone();
         let worker = self.jemalloc_alloc_worker_binary.clone();
         let include_files = self.include_files.clone();
+        let kernel_config = crate::cache::kernel_config_include_for_image(&self.kernel);
         let staged_schedulers = self.staged_schedulers.clone();
         let busybox_bytes = self.busybox_bytes.clone();
         let compression = self.initrd_compression;
@@ -1421,6 +1422,9 @@ impl KtstrVm {
                 // without that, wprof fails to load inside the
                 // guest.
                 let mut merged_includes: Vec<(String, PathBuf)> = include_files.clone();
+                if let Some((archive_path, host_path)) = kernel_config {
+                    merged_includes.push((archive_path, host_path));
+                }
                 if let Some(w) = worker.as_deref() {
                     merged_includes.push((
                         "bin/ktstr-jemalloc-alloc-worker".to_string(),
