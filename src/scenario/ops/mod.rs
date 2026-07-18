@@ -1375,8 +1375,9 @@ fn run_scenario(
 /// scheduler process to monitor), behaves exactly like
 /// [`thread::sleep`] and always returns `false`.
 ///
-/// Implementation uses `pidfd_open(2)` + `epoll_wait` so the waiter
-/// is kernel-blocked on the pidfd until either the scheduler exits
+/// Implementation duplicates the pidfd retained by the coherent scheduler
+/// owner and waits with `epoll_wait`, so the waiter is kernel-blocked on the
+/// exact process identity until either the scheduler exits
 /// (pidfd becomes readable) or the per-step hold elapses. This
 /// drops crash-detection latency from one poll-tick (the previous
 /// 100 ms cadence) to ~0: the kernel wakes the epoll waiter as
@@ -1388,18 +1389,16 @@ fn run_scenario(
 /// `saturating_duration_since` each iteration so `EINTR` restarts
 /// narrow the remaining window rather than extending it.
 ///
-/// Failure handling: if `pidfd_open` returns `ESRCH`, the scheduler
-/// is already gone — return `true` immediately without sleeping. Any
-/// other failure mode (pidfd_open non-ESRCH, epoll_create1,
-/// epoll_ctl ADD, EpollTimeout::try_from, epoll_wait) panics with an
-/// operator-actionable message. Polling fallbacks were removed per
-/// the project-wide "no polling fallbacks for evented paths" rule:
-/// pidfd_open has shipped since Linux 5.3 and epoll has been
-/// universally available for longer, so a failure here indicates a
-/// catastrophic environment defect (memory pressure exhausting fds,
-/// kernel feature compiled out) rather than a recoverable transient.
-/// A loud panic surfaces the defect immediately; the prior silent
-/// sleep+probe fallback masked it as test flakiness.
+/// Failure handling: if the owner disappears between the caller's snapshot and
+/// the pidfd duplication, the exact scheduler is already terminal and the
+/// function returns `true`. Descriptor duplication, epoll creation/registration,
+/// timeout conversion, and wait failures panic with an operator-actionable
+/// message. Polling fallbacks were removed per the project-wide "no polling
+/// fallbacks for evented paths" rule: these failures indicate a catastrophic
+/// environment defect rather than a recoverable transient. A loud panic
+/// surfaces the defect immediately; the prior silent sleep+probe fallback
+/// masked it as test flakiness. Numeric `pidfd_open` exists only in the
+/// host-unit-test seam below, whose synthetic scheduler PID has no guest owner.
 ///
 /// Scheduling jitter under load can leave the actual elapsed time
 /// modestly above `dur`.

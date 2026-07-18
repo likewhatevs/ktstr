@@ -2282,20 +2282,22 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
     let stack_display_names: Vec<&str> = Vec::new(); // Discovery uses empty hint list
     let bpf_syms = discover_bpf_symbols(&stack_display_names);
     if bpf_syms.is_empty() {
-        let sched_alive = crate::vmm::rust_init::sched_pid()
-            .is_some_and(|pid| unsafe { libc::kill(pid, 0) == 0 });
-        if sched_alive {
-            tracing::warn!(
+        match crate::vmm::rust_init::current_scheduler_liveness() {
+            Ok(Some(true)) => tracing::warn!(
                 "phase_b: bpf_discover returned 0 programs while scheduler is \
                  still alive — verify ProgInfoIter access permissions or BTF \
                  (this is the unexpected case; the auto-repro pipeline is now \
                  attached to no BPF struct_ops callbacks)"
-            );
-        } else {
-            tracing::info!(
+            ),
+            Ok(Some(false) | None) => tracing::info!(
                 "phase_b: bpf_discover returned 0 programs — scheduler exited \
                  before the discovery window (expected for fast-crash paths)"
-            );
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                "phase_b: bpf_discover returned 0 programs and retained-pidfd \
+                 scheduler liveness could not be determined"
+            ),
         }
     }
     // Update Phase A's pipeline-diag counter with the Phase B

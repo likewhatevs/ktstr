@@ -76,14 +76,20 @@ use std::time::Duration;
 
 use anyhow::Result;
 
+#[cfg(test)]
 use nix::sys::signal::kill;
+#[cfg(test)]
 use nix::unistd::Pid;
 
 use crate::assert::AssertResult;
 use crate::topology::TestTopology;
 use crate::workload::*;
 
-/// Check if a process is alive via kill(pid, 0).
+/// Test-only synthetic-PID liveness seam.
+///
+/// Production scheduler liveness is derived from the exact pidfd retained by
+/// `CurrentSchedulerProcess`; host unit tests cannot install that guest owner
+/// and use this numeric helper only for injected fixtures.
 ///
 /// Returns `false` for pid 0: `kill(0, ...)` targets the caller's
 /// process group rather than a single process, so the syscall would
@@ -118,11 +124,24 @@ use crate::workload::*;
 /// silently, because existing callers rely on the EPERM-as-false
 /// behavior when walking /proc on heavily-forking hosts where pid
 /// reuse can land a foreign-UID process on the old slot.
+#[cfg(test)]
 fn process_alive(pid: libc::pid_t) -> bool {
     if pid <= 0 {
         return false;
     }
     kill(Pid::from_raw(pid), None).is_ok()
+}
+
+#[cfg(not(test))]
+fn configured_scheduler_alive(_snapshot_pid: libc::pid_t) -> Result<bool> {
+    crate::vmm::rust_init::current_scheduler_liveness()
+        .map(|alive| alive.unwrap_or(false))
+        .map_err(anyhow::Error::msg)
+}
+
+#[cfg(test)]
+fn configured_scheduler_alive(snapshot_pid: libc::pid_t) -> Result<bool> {
+    Ok(process_alive(snapshot_pid))
 }
 
 // Re-export AffinityIntent from workload so existing `use super::*` in
@@ -1429,14 +1448,23 @@ pub fn setup_cgroups<'a>(
     // `active_sched_pid()` returns `None` when no scheduler was
     // configured (kernel-default path) OR when the caller planted a
     // `<= 0` sentinel; both cases skip the liveness-based bail.
-    if let Some(pid) = ctx.active_sched_pid()
-        && !process_alive(pid)
-    {
-        anyhow::bail!(
-            "{} after cgroup creation (pid={})",
-            crate::assert::SCHED_DIED_PREFIX,
-            pid,
-        );
+    if let Some(pid) = ctx.active_sched_pid() {
+        let alive = configured_scheduler_alive(pid).map_err(|error| {
+            anyhow::anyhow!(
+                "{} after cgroup creation: retained scheduler pidfd liveness \
+                 failed (snapshot pid={}): {}",
+                crate::assert::SCHED_DIED_PREFIX,
+                pid,
+                error,
+            )
+        })?;
+        if !alive {
+            anyhow::bail!(
+                "{} after cgroup creation (snapshot pid={})",
+                crate::assert::SCHED_DIED_PREFIX,
+                pid,
+            );
+        }
     }
     let names: Vec<String> = (0..n).map(|i| format!("cg_{i}")).collect();
     let handles = spawn_and_move(ctx, &names, |_, _| Ok(wl.clone()))?;
