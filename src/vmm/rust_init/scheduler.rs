@@ -351,6 +351,7 @@ struct SchedulerAttachAttempt {
     generation: u64,
     kind: crate::vmm::wire::AttachAttemptKind,
     control_fd: OwnedFd,
+    _bulk_lifecycle_priority: crate::vmm::guest_comms::BulkLifecyclePriorityGuard,
     started_published: bool,
     terminal_phase: AttachTerminalPhase,
     cancellation: Option<crate::vmm::wire::AttachCancelCause>,
@@ -368,10 +369,12 @@ impl SchedulerAttachAttempt {
             .try_clone()
             .map_err(|error| format!("clone scheduler-attach control eventfd: {error}"))?;
         register_attach_control_generation(generation)?;
+        let bulk_lifecycle_priority = crate::vmm::guest_comms::reserve_bulk_lifecycle_priority();
         let mut attempt = Self {
             generation,
             kind,
             control_fd,
+            _bulk_lifecycle_priority: bulk_lifecycle_priority,
             started_published: false,
             terminal_phase: AttachTerminalPhase::Open,
             cancellation: None,
@@ -1694,8 +1697,7 @@ fn spawn_sched_log_forwarder(
     force_spawn_failure: bool,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     if force_spawn_failure {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             "injected scheduler forwarder spawn failure",
         ));
     }

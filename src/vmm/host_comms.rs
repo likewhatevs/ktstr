@@ -32,7 +32,7 @@
 use std::sync::Arc;
 use zerocopy::FromBytes;
 
-use super::bulk::MAX_BULK_FRAME_PAYLOAD;
+use super::bulk::{MAX_BULK_FRAME_PAYLOAD, find_next_valid_frame};
 use super::pi_mutex::PiMutex;
 use super::virtio_console::{
     SIGNAL_ACCESSOR_READY, SIGNAL_BPF_WRITE_DONE, SIGNAL_PERIODIC_READY, SIGNAL_VC_DUMP,
@@ -94,9 +94,9 @@ pub fn drain_bulk(dev: &mut VirtioConsole) -> BulkDrainResult {
 /// allocating the per-frame `Vec<u8>` payload. Mirrors the same
 /// check applied by [`super::bulk::HostAssembler`] so the
 /// streaming and one-shot consumers agree on what counts as a
-/// legitimate frame. On rejection, the walk stops — subsequent
-/// bytes cannot be trusted (the announced length cannot be relied
-/// on to advance past the bogus payload).
+/// legitimate frame. If the remaining bytes contain a complete,
+/// CRC-valid frame with a known FourCC, the parser resynchronizes at
+/// that self-authenticating boundary; otherwise the walk stops.
 pub fn parse_tlv_stream(buf: &[u8]) -> BulkDrainResult {
     let mut entries: Vec<ShmEntry> = Vec::new();
     let mut pos = 0usize;
@@ -136,6 +136,17 @@ pub fn parse_tlv_stream(buf: &[u8]) -> BulkDrainResult {
         // cursor past the bogus payload, so any trailing bytes
         // are unparseable.
         if msg.length > MAX_BULK_FRAME_PAYLOAD {
+            if let Some(next) = find_next_valid_frame(buf, pos + 1) {
+                tracing::warn!(
+                    abandoned = next - pos,
+                    next,
+                    msg_type = msg.msg_type,
+                    length = msg.length,
+                    "parse_tlv_stream: resynchronized after an oversized/abandoned prefix"
+                );
+                pos = next;
+                continue;
+            }
             tracing::warn!(
                 msg_type = msg.msg_type,
                 length = msg.length,
@@ -148,6 +159,17 @@ pub fn parse_tlv_stream(buf: &[u8]) -> BulkDrainResult {
         // payload than the buffer holds. Stop parsing rather than
         // attempting an over-read or oversized allocation.
         if (msg.length as usize) > buf.len().saturating_sub(hdr_end) {
+            if let Some(next) = find_next_valid_frame(buf, pos + 1) {
+                tracing::warn!(
+                    abandoned = next - pos,
+                    next,
+                    msg_type = msg.msg_type,
+                    length = msg.length,
+                    "parse_tlv_stream: resynchronized past an incomplete abandoned frame"
+                );
+                pos = next;
+                continue;
+            }
             break;
         }
         let payload_end = hdr_end + msg.length as usize;
@@ -155,6 +177,21 @@ pub fn parse_tlv_stream(buf: &[u8]) -> BulkDrainResult {
         let computed_crc = crc32fast::hash(&payload);
         let crc_ok = computed_crc == msg.crc32;
         if !crc_ok {
+            if let Some(next) = find_next_valid_frame(buf, pos + 1)
+                && next < payload_end
+            {
+                tracing::warn!(
+                    abandoned = next - pos,
+                    next,
+                    msg_type = msg.msg_type,
+                    length = msg.length,
+                    expected_crc = msg.crc32,
+                    computed_crc,
+                    "parse_tlv_stream: CRC mismatch exposed an abandoned partial frame; resynchronized"
+                );
+                pos = next;
+                continue;
+            }
             // Surface per-frame CRC mismatches for diagnostics —
             // Mirrors the assembly path so a corrupted bulk-stream frame
             // appears in the operator log instead of being dropped
@@ -502,14 +539,11 @@ mod tests {
         assert!(r.entries[0].crc_ok);
     }
 
-    /// An oversized header followed by a fully-valid frame: the
-    /// walk stops at the oversized header and the trailing valid
-    /// frame is NOT returned. The bogus `length` cannot be trusted
-    /// to advance the cursor past its claimed payload, so any
-    /// bytes that follow are unparseable — even when those bytes
-    /// happen to encode a structurally legitimate frame.
+    /// A fresh complete frame after an abandoned oversized header is a
+    /// self-authenticating retry boundary (known FourCC + cap + CRC), so the
+    /// one-shot final drain recovers it just like `HostAssembler`.
     #[test]
-    fn parse_stops_at_oversized_does_not_return_subsequent_valid() {
+    fn parse_resynchronizes_at_valid_frame_after_oversized_prefix() {
         use zerocopy::IntoBytes;
         let bad = ShmMessage {
             msg_type: MSG_TYPE_STIMULUS,
@@ -524,10 +558,10 @@ mod tests {
         // stopping, this frame would be picked up.
         combined.extend_from_slice(&frame_bytes(MSG_TYPE_EXIT, b"valid"));
         let r = parse_tlv_stream(&combined);
-        assert!(
-            r.entries.is_empty(),
-            "no entries: parser must stop at the oversized header and not resume on the trailing valid frame"
-        );
+        assert_eq!(r.entries.len(), 1);
+        assert_eq!(r.entries[0].msg_type, MSG_TYPE_EXIT);
+        assert_eq!(r.entries[0].payload, b"valid");
+        assert!(r.entries[0].crc_ok);
     }
 
     /// Every new postcard-migration MsgType variant round-trips

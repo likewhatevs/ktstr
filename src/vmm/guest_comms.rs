@@ -35,7 +35,34 @@ use zerocopy::{FromBytes, IntoBytes};
 /// the port advertised as [`PORT1_NAME`], so the in-stream order of bytes stays
 /// `[header][payload]` regardless of which producer (step executor,
 /// sched-exit-mon, profraw flusher) emitted the frame.
-pub static GUEST_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static GUEST_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Number of scheduler-attach transactions which currently reserve the bulk
+/// stream for their generation-tagged control boundaries.
+///
+/// Scheduler stdout/stderr already lands in the merged log file before the
+/// live-copy send is attempted. Dropping those best-effort live copies while
+/// an attach transaction is open keeps a noisy scheduler from sitting ahead
+/// of Started/Finished/Settled on the one virtio-console TX stream; the
+/// terminal log transaction still ships the authoritative bytes afterwards.
+static BULK_LIFECYCLE_PRIORITY: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII reservation for a scheduler-attach control transaction.
+pub(crate) struct BulkLifecyclePriorityGuard;
+
+impl Drop for BulkLifecyclePriorityGuard {
+    fn drop(&mut self) {
+        let previous = BULK_LIFECYCLE_PRIORITY.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        debug_assert!(previous > 0, "bulk lifecycle priority underflow");
+    }
+}
+
+/// Give scheduler-attach boundaries priority over best-effort bulk traffic.
+pub(crate) fn reserve_bulk_lifecycle_priority() -> BulkLifecyclePriorityGuard {
+    BULK_LIFECYCLE_PRIORITY.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    BulkLifecyclePriorityGuard
+}
 
 // ---------------------------------------------------------------------------
 // is_guest detection
@@ -217,20 +244,56 @@ pub(crate) static BULK_PORT_WRITE_ATTEMPTS: std::sync::atomic::AtomicU64 =
 /// Try to resolve and open the named bulk port. Returns None while
 /// the kernel has not yet received both PORT_ADD and PORT_NAME.
 ///
-/// Open mode: read+write, blocking. O_RDWR is required because the
+/// Open mode: read+write and nonblocking. O_RDWR is required because the
 /// kernel's `port_fops_open` (drivers/char/virtio_console.c) sets
 /// `guest_connected = true` on the first open and returns EBUSY on
 /// any subsequent open of the same port. A write-only open would
 /// block a later read-only open needed by `request_snapshot`'s
 /// reply reader. The port-2 stats relay already uses O_RDWR
-/// (rust_init/relay.rs `start_sched_stats_relay`).
+/// (rust_init/relay.rs `start_sched_stats_relay`). O_NONBLOCK lets the
+/// lifecycle path make a bounded try-write instead of parking behind a full
+/// virtqueue. Ordinary senders explicitly poll POLLOUT and retain their prior
+/// blocking semantics.
 fn try_open_bulk_port() -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
     let path = bulk_port_path()?;
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
+        .custom_flags(libc::O_NONBLOCK)
         .open(path)
         .ok()
+}
+
+/// Clone the process's one O_RDWR bulk-port open description without holding
+/// the cache mutex for the lifetime of a blocking reply read. `try_clone`
+/// duplicates the fd and therefore does not trip virtio-console's one-open
+/// EBUSY rule; writers can continue using the cached sibling while an RPC
+/// waits for host RX.
+fn clone_or_open_bulk_port() -> std::io::Result<std::fs::File> {
+    let slot = BULK_PORT_FD.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = slot.lock_unpoisoned();
+    if guard.is_none() {
+        *guard = try_open_bulk_port();
+    }
+    guard
+        .as_ref()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "named virtio-console port {PORT1_NAME:?} not yet open \
+                     (multiport handshake still in flight)"
+                ),
+            )
+        })?
+        .try_clone()
+}
+
+fn invalidate_bulk_port() {
+    let slot = BULK_PORT_FD.get_or_init(|| std::sync::Mutex::new(None));
+    *slot.lock_unpoisoned() = None;
 }
 
 /// Write a TLV-framed message to the host through the bulk channel
@@ -260,8 +323,119 @@ fn write_msg(msg_type: u32, payload: &[u8]) -> bool {
     if !assert_guest_context("write_msg", msg_type) {
         return false;
     }
+    if lifecycle_priority_drops(msg_type) {
+        return false;
+    }
     let _guard = GUEST_WRITE_LOCK.lock_unpoisoned();
-    write_to_bulk_port(msg_type, payload)
+    // Recheck after taking the mutex: an attach reservation may have arrived
+    // while this ordinary sender was queued behind a previous writer.
+    if lifecycle_priority_drops(msg_type) {
+        return false;
+    }
+    write_to_bulk_port(msg_type, payload, BulkWriteMode::Blocking)
+}
+
+fn lifecycle_priority_drops(msg_type: u32) -> bool {
+    BULK_LIFECYCLE_PRIORITY.load(std::sync::atomic::Ordering::Acquire) != 0
+        && matches!(
+            MsgType::from_wire(msg_type),
+            Some(MsgType::SchedStdout | MsgType::SchedStderr)
+        )
+}
+
+/// Nonblocking control-frame attempt. Contention, port backpressure, or a
+/// transient fd error returns `false` immediately; the caller owns retry
+/// cadence. A partial prefix is safe because the host assembler resynchronizes
+/// at the next complete CRC-valid known frame.
+fn try_write_msg(msg_type: u32, payload: &[u8]) -> bool {
+    if !assert_guest_context("try_write_msg", msg_type) {
+        return false;
+    }
+    let Ok(_guard) = GUEST_WRITE_LOCK.try_lock() else {
+        return false;
+    };
+    write_to_bulk_port(msg_type, payload, BulkWriteMode::Immediate)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BulkWriteMode {
+    Blocking,
+    Immediate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BulkWriteProgress {
+    complete: bool,
+    written: usize,
+    failure: Option<BulkWriteFailure>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BulkWriteFailure {
+    Backpressured,
+    Fatal,
+}
+
+/// Drive one contiguous frame through an injected writer.
+///
+/// The helper is deliberately independent of the virtio fd so tests can force
+/// positive partial writes followed by EAGAIN/EIO deterministically. Blocking
+/// mode invokes `wait_writable` on EAGAIN; immediate mode returns at once.
+fn write_frame_with(
+    frame: &[u8],
+    mode: BulkWriteMode,
+    mut write: impl FnMut(&[u8]) -> std::io::Result<usize>,
+    mut wait_writable: impl FnMut() -> std::io::Result<()>,
+) -> BulkWriteProgress {
+    let mut written = 0usize;
+    while written < frame.len() {
+        match write(&frame[written..]) {
+            Ok(0) => {
+                return BulkWriteProgress {
+                    complete: false,
+                    written,
+                    failure: Some(BulkWriteFailure::Fatal),
+                };
+            }
+            Ok(n) => {
+                let remaining = frame.len() - written;
+                if n > remaining {
+                    return BulkWriteProgress {
+                        complete: false,
+                        written,
+                        failure: Some(BulkWriteFailure::Fatal),
+                    };
+                }
+                written += n;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if mode == BulkWriteMode::Immediate || wait_writable().is_err() {
+                    return BulkWriteProgress {
+                        complete: false,
+                        written,
+                        failure: Some(if mode == BulkWriteMode::Immediate {
+                            BulkWriteFailure::Backpressured
+                        } else {
+                            BulkWriteFailure::Fatal
+                        }),
+                    };
+                }
+            }
+            Err(_) => {
+                return BulkWriteProgress {
+                    complete: false,
+                    written,
+                    failure: Some(BulkWriteFailure::Fatal),
+                };
+            }
+        }
+    }
+    BulkWriteProgress {
+        complete: true,
+        written,
+        failure: None,
+    }
 }
 
 /// Try to write a TLV-framed message to the named bulk port. Returns
@@ -274,18 +448,15 @@ fn write_msg(msg_type: u32, payload: &[u8]) -> bool {
 /// retry the open on every call until it succeeds; once cached,
 /// subsequent writes go through the cached `File`.
 ///
-/// Submission shape: header and payload are submitted together via
-/// `writev(2)` with two `iovec` slices, avoiding a per-call concat
-/// allocation. The host's [`super::bulk::HostAssembler`] tolerates
-/// partial frames in the byte stream, so any per-iovec virtqueue
-/// submissions reassemble correctly. The kernel virtio_console driver
-/// caps each write at 32 KiB (`port_fops_write` does `count = min(32*1024,
-/// count)` and returns the capped byte count), so a frame larger than
-/// 32 KiB — e.g. a [`MsgType::WprofTraceChunk`] up to
-/// [`super::bulk::MAX_BULK_FRAME_PAYLOAD`] — ALWAYS spans multiple `writev`
-/// iterations; the `advance_slices` loop below is REQUIRED for correctness,
-/// not merely a partial-writev nicety.
-fn write_to_bulk_port(msg_type: u32, payload: &[u8]) -> bool {
+/// Submission shape: header and payload are concatenated into one immutable
+/// frame buffer before the first syscall. Every positive partial write resumes
+/// at that buffer's exact unwritten suffix. The kernel virtio_console driver
+/// caps each write at 32 KiB (`port_fops_write` does
+/// `count = min(32*1024, count)`), so a larger frame necessarily spans
+/// multiple syscalls. If a later syscall fails, a lifecycle retry starts a
+/// complete fresh frame and the host's CRC-valid-known-FourCC resynchronizer
+/// discards the abandoned prefix.
+fn write_to_bulk_port(msg_type: u32, payload: &[u8], mode: BulkWriteMode) -> bool {
     // Test-only: record that the guest-only write path was entered.
     // Reached only after `write_msg`'s `is_guest()` gate passes, so a
     // host-context sender call never bumps this. See
@@ -293,7 +464,15 @@ fn write_to_bulk_port(msg_type: u32, payload: &[u8]) -> bool {
     #[cfg(test)]
     BULK_PORT_WRITE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let slot = BULK_PORT_FD.get_or_init(|| std::sync::Mutex::new(None));
-    let mut guard = slot.lock_unpoisoned();
+    let mut guard = match mode {
+        BulkWriteMode::Blocking => slot.lock_unpoisoned(),
+        BulkWriteMode::Immediate => {
+            let Ok(guard) = slot.try_lock() else {
+                return false;
+            };
+            guard
+        }
+    };
     if guard.is_none() {
         match try_open_bulk_port() {
             Some(f) => *guard = Some(f),
@@ -316,63 +495,84 @@ fn write_to_bulk_port(msg_type: u32, payload: &[u8]) -> bool {
         _pad: 0,
     };
     let header_bytes = msg.as_bytes();
-    let total = header_bytes.len() + payload.len();
+    let mut frame = Vec::with_capacity(header_bytes.len() + payload.len());
+    frame.extend_from_slice(header_bytes);
+    frame.extend_from_slice(payload);
     let fd = std::os::unix::io::AsRawFd::as_raw_fd(f);
-    let mut iovs = [
-        std::io::IoSlice::new(header_bytes),
-        std::io::IoSlice::new(payload),
-    ];
-    let mut bufs: &mut [std::io::IoSlice<'_>] = &mut iovs[..];
-    let mut written: usize = 0;
-    while !bufs.is_empty() {
-        // SAFETY: `bufs` is a non-empty slice of `IoSlice<'_>`, which
-        // is `#[repr(transparent)]` over `libc::iovec` on unix targets.
-        // Casting `*const IoSlice` to `*const libc::iovec` is sound.
-        // `fd` is a borrowed raw fd from the cached `File`; the
-        // `File` outlives the syscall because `guard` keeps it owned.
-        let r = unsafe {
-            libc::writev(
-                fd,
-                bufs.as_ptr() as *const libc::iovec,
-                bufs.len() as libc::c_int,
-            )
+    let progress = write_frame_with(
+        &frame,
+        mode,
+        |remaining| {
+            // SAFETY: `remaining` is a live byte slice and `fd` remains owned
+            // by `guard` for the entire helper call.
+            let result = unsafe {
+                libc::write(
+                    fd,
+                    remaining.as_ptr().cast::<libc::c_void>(),
+                    remaining.len(),
+                )
+            };
+            if result < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(result as usize)
+            }
+        },
+        || wait_bulk_port_writable(fd),
+    );
+    if progress.complete {
+        return true;
+    }
+
+    // A hard error may arrive after a positive partial write. The next
+    // lifecycle retry deliberately starts a fresh complete frame; the host's
+    // CRC-validated resynchronizer discards this abandoned prefix. Preserve a
+    // live fd across ordinary nonblocking backpressure, but invalidate it for
+    // zero writes and terminal I/O failures so a later attempt can reopen.
+    if progress.failure == Some(BulkWriteFailure::Fatal) {
+        *guard = None;
+    }
+    if progress.failure == Some(BulkWriteFailure::Backpressured) {
+        return false;
+    }
+    tracing::warn!(
+        msg_type,
+        len = payload.len(),
+        written = progress.written,
+        mode = ?mode,
+        "write_to_bulk_port: frame was not completed"
+    );
+    false
+}
+
+fn wait_bulk_port_writable(fd: libc::c_int) -> std::io::Result<()> {
+    loop {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
         };
-        if r < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
+        // SAFETY: one borrowed live fd; an infinite poll preserves the former
+        // blocking semantics for ordinary traffic without making the fd itself
+        // blocking for lifecycle try-writes.
+        let result = unsafe { libc::poll(&mut pfd, 1, -1) };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            tracing::warn!(
-                %err,
-                msg_type,
-                len = payload.len(),
-                "write_to_bulk_port: writev failed"
-            );
-            // Drop the cached handle so the next call retries the open
-            // (the device may have transiently closed during a guest
-            // reset path).
-            *guard = None;
-            return false;
+            return Err(error);
         }
-        if r == 0 {
-            // `writev` returning 0 with no error is unexpected for a
-            // char device; treat as an EOF-like failure.
-            tracing::warn!(
-                msg_type,
-                len = payload.len(),
-                written,
-                total,
-                "write_to_bulk_port: writev returned 0"
-            );
-            *guard = None;
-            return false;
+        if pfd.revents & libc::POLLOUT != 0 {
+            return Ok(());
         }
-        let n = r as usize;
-        written += n;
-        std::io::IoSlice::advance_slices(&mut bufs, n);
+        if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(std::io::Error::other(format!(
+                "bulk port writable poll returned terminal events {:#x}",
+                pfd.revents
+            )));
+        }
     }
-    debug_assert_eq!(written, total);
-    true
 }
 
 // ---------------------------------------------------------------------------
@@ -795,26 +995,12 @@ pub fn send_teardown_barrier_and_wait() -> Result<(), String> {
         ));
     }
 
-    let read_slot = BULK_PORT_FD.get_or_init(|| std::sync::Mutex::new(None));
-    let mut read_guard = read_slot.lock_unpoisoned();
-    if read_guard.is_none() {
-        match try_open_bulk_port() {
-            Some(f) => *read_guard = Some(f),
-            None => {
-                return Err(format!(
-                    "named virtio-console port {PORT1_NAME:?} not yet open \
-                     (multiport handshake still in flight)"
-                ));
-            }
-        }
-    }
-    let f = read_guard
-        .as_mut()
-        .expect("bulk port handle just installed");
-    let (msg_type, payload) = match read_bulk_port_frame(f, 0, None) {
+    let mut read_file = clone_or_open_bulk_port().map_err(|error| error.to_string())?;
+    let (msg_type, payload) = match read_bulk_port_frame(&mut read_file, 0, None) {
         Ok(frame) => frame,
         Err(e) => {
-            *read_guard = None;
+            drop(read_file);
+            invalidate_bulk_port();
             return Err(format!("teardown barrier acknowledgement failed: {e}"));
         }
     };
@@ -1346,9 +1532,14 @@ fn send_required_frame_with(mut send: impl FnMut() -> bool, mut wait: impl FnMut
 /// observer. Returns an error after bounded reopen retries instead of silently
 /// allowing a later `SchedExit` frame to overtake a missing proof.
 pub(crate) fn send_lifecycle_required(phase: LifecyclePhase, reason: &str) -> Result<(), String> {
+    // Keep the attach transaction's priority continuously through the first
+    // SchedulerAttached send. `SchedulerAttachAttempt::settle` consumes its
+    // own guard immediately before this callback runs, and otherwise a noisy
+    // scheduler forwarder can win that handoff race.
+    let _priority = reserve_bulk_lifecycle_priority();
     let payload = lifecycle_payload(phase, reason);
     if send_required_frame_with(
-        || write_msg(MsgType::Lifecycle.wire_value(), &payload),
+        || try_write_msg(MsgType::Lifecycle.wire_value(), &payload),
         || std::thread::sleep(std::time::Duration::from_millis(100)),
     ) {
         Ok(())
@@ -1368,7 +1559,7 @@ pub(crate) fn send_lifecycle_required(phase: LifecyclePhase, reason: &str) -> Re
 /// ignores stale or mismatched generations rather than letting a delayed
 /// completion close a newer lifecycle-Op attempt.
 pub fn send_attach_attempt(event: AttachAttemptEvent) -> bool {
-    write_msg(MsgType::AttachAttempt.wire_value(), &event.to_payload())
+    try_write_msg(MsgType::AttachAttempt.wire_value(), &event.to_payload())
 }
 
 /// Send a shell-exec exit code to the host. Payload: 4-byte LE
@@ -1551,6 +1742,7 @@ fn bounded_read_exact(
                 filled += n;
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) => return Err(e),
         }
     }
@@ -1580,8 +1772,6 @@ fn read_bulk_port_frame(
     max_payload_size: usize,
     deadline: Option<std::time::Instant>,
 ) -> std::io::Result<(u32, Vec<u8>)> {
-    use std::io::Read;
-
     fn read_exact(
         f: &mut std::fs::File,
         buf: &mut [u8],
@@ -1589,7 +1779,7 @@ fn read_bulk_port_frame(
     ) -> std::io::Result<()> {
         match deadline {
             Some(deadline) => bounded_read_exact(f, buf, deadline),
-            None => f.read_exact(buf),
+            None => unbounded_poll_read_exact(f, buf),
         }
     }
 
@@ -1626,6 +1816,68 @@ fn read_bulk_port_frame(
         ));
     }
     Ok((msg.msg_type, payload))
+}
+
+/// Event-driven exact read for the lifecycle fence, whose bound is owned by
+/// the outer VM watchdog rather than a local wall clock. The cached bulk fd is
+/// O_NONBLOCK so terminal control writes can fail immediately; an indefinite
+/// `poll(POLLIN)` restores blocking semantics here without holding any shared
+/// userspace mutex.
+fn unbounded_poll_read_exact(f: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<()> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let mut pfd = libc::pollfd {
+            fd: f.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` describes the live borrowed file descriptor and stays
+        // valid for the duration of this one-fd poll call.
+        let ready = unsafe { libc::poll(&mut pfd, 1, -1) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if pfd.revents & libc::POLLIN == 0
+            && pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "bulk port read poll returned terminal events {:#x}",
+                    pfd.revents
+                ),
+            ));
+        }
+        match f.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "bulk port read returned 0 after {filled} of {} bytes",
+                        buf.len()
+                    ),
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// Request a host-driven snapshot. Publishes a snapshot request via
@@ -1684,24 +1936,14 @@ pub fn request_snapshot(
     // per port (EBUSY on second open), so a separate read-only
     // open would fail. The write fd is opened O_RDWR by
     // try_open_bulk_port.
-    let read_slot = BULK_PORT_FD.get_or_init(|| std::sync::Mutex::new(None));
-    let mut read_guard = read_slot.lock_unpoisoned();
-    if read_guard.is_none() {
-        match try_open_bulk_port() {
-            Some(f) => *read_guard = Some(f),
-            None => {
-                return SnapshotRequestResult::TransportError {
-                    reason: format!(
-                        "named virtio-console port {PORT1_NAME:?} not yet open \
-                         (multiport handshake still in flight)"
-                    ),
-                };
-            }
+    let mut read_file = match clone_or_open_bulk_port() {
+        Ok(file) => file,
+        Err(error) => {
+            return SnapshotRequestResult::TransportError {
+                reason: error.to_string(),
+            };
         }
-    }
-    let f = read_guard
-        .as_mut()
-        .expect("bulk port handle just installed");
+    };
     // Read TLV reply frames until we observe one whose payload
     // request_id matches ours. Frames addressed to other request ids
     // (none in current protocol — the host only writes replies in
@@ -1719,7 +1961,7 @@ pub fn request_snapshot(
             };
         }
         let frame = match read_bulk_port_frame(
-            f,
+            &mut read_file,
             std::mem::size_of::<SnapshotReplyPayload>(),
             Some(deadline),
         ) {
@@ -1736,7 +1978,8 @@ pub fn request_snapshot(
                 // I/O error on the read fd — drop the cached
                 // handle so the next call retries the open and
                 // surface the failure to the caller.
-                *read_guard = None;
+                drop(read_file);
+                invalidate_bulk_port();
                 return SnapshotRequestResult::TransportError {
                     reason: format!("snapshot reply read failed (request_id={request_id}): {e}"),
                 };
@@ -1828,17 +2071,11 @@ pub fn request_snapshot(
 /// the shared `BULK_PORT_FD` read handle cannot safely demux two
 /// concurrent reply streams.
 ///
-/// **Throughput note.** This helper holds the `BULK_PORT_FD` slot
-/// lock for the entire reply-wait loop (up to `timeout`, default
-/// 30 s for the cold-path freeze-rendezvous round-trip). Concurrent
-/// guest writers (`write_msg` callers — stimulus producers, scenario
-/// lifecycle events) on the same port-1 transport BLOCK on the
-/// shared slot lock until the reply lands. Deadlock potential is
-/// zero (the `GUEST_WRITE_LOCK` and `SNAPSHOT_REQUEST_LOCK` are
-/// acquired in independent orders by independent paths, and no
-/// path holds both simultaneously), but a long-running cold-op
-/// rendezvous serializes against unrelated TX traffic during its
-/// reply wait.
+/// The reply reader uses a dup of the cached O_RDWR file description, so it
+/// does not hold the `BULK_PORT_FD` cache mutex while waiting (up to `timeout`,
+/// normally 30 s for a cold-path freeze rendezvous). Concurrent guest writers
+/// therefore retain normal port-level backpressure instead of serializing
+/// behind an unrelated userspace mutex.
 pub fn request_kernel_op(
     request: KernelOpRequestPayload,
     timeout: std::time::Duration,
@@ -1883,24 +2120,14 @@ pub fn request_kernel_op(
     // Read replies from the same O_RDWR fd used for writes. See
     // `request_snapshot` for the bulk-port handle lifecycle notes;
     // both helpers share `BULK_PORT_FD`.
-    let read_slot = BULK_PORT_FD.get_or_init(|| std::sync::Mutex::new(None));
-    let mut read_guard = read_slot.lock_unpoisoned();
-    if read_guard.is_none() {
-        match try_open_bulk_port() {
-            Some(f) => *read_guard = Some(f),
-            None => {
-                return KernelOpRequestResult::TransportError {
-                    reason: format!(
-                        "named virtio-console port {PORT1_NAME:?} not yet open \
-                         (multiport handshake still in flight)"
-                    ),
-                };
-            }
+    let mut read_file = match clone_or_open_bulk_port() {
+        Ok(file) => file,
+        Err(error) => {
+            return KernelOpRequestResult::TransportError {
+                reason: error.to_string(),
+            };
         }
-    }
-    let f = read_guard
-        .as_mut()
-        .expect("bulk port handle just installed");
+    };
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let now = std::time::Instant::now();
@@ -1912,7 +2139,8 @@ pub fn request_kernel_op(
                 ),
             };
         }
-        let frame = match read_bulk_port_frame(f, KERNEL_OP_REPLY_MAX, Some(deadline)) {
+        let frame = match read_bulk_port_frame(&mut read_file, KERNEL_OP_REPLY_MAX, Some(deadline))
+        {
             Ok(frame) => frame,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                 return KernelOpRequestResult::TransportError {
@@ -1923,7 +2151,8 @@ pub fn request_kernel_op(
                 };
             }
             Err(e) => {
-                *read_guard = None;
+                drop(read_file);
+                invalidate_bulk_port();
                 return KernelOpRequestResult::TransportError {
                     reason: format!("kernel-op reply read failed (request_id={request_id}): {e}"),
                 };
@@ -2225,6 +2454,127 @@ mod tests {
         assert_eq!(waits.get(), REQUIRED_FRAME_ATTEMPTS - 1);
     }
 
+    #[test]
+    fn lifecycle_priority_suppresses_only_redundant_scheduler_live_copies() {
+        assert!(!lifecycle_priority_drops(
+            MsgType::SchedStdout.wire_value()
+        ));
+        let priority = reserve_bulk_lifecycle_priority();
+        assert!(lifecycle_priority_drops(
+            MsgType::SchedStdout.wire_value()
+        ));
+        assert!(lifecycle_priority_drops(
+            MsgType::SchedStderr.wire_value()
+        ));
+        assert!(
+            !lifecycle_priority_drops(MsgType::Lifecycle.wire_value()),
+            "required lifecycle traffic must bypass its own reservation"
+        );
+        assert!(
+            !lifecycle_priority_drops(MsgType::TestResult.wire_value()),
+            "authoritative non-scheduler frames must not be collateral drops"
+        );
+        drop(priority);
+        assert!(!lifecycle_priority_drops(
+            MsgType::SchedStdout.wire_value()
+        ));
+    }
+
+    #[test]
+    fn immediate_frame_write_reports_partial_backpressure_without_waiting() {
+        let calls = std::cell::Cell::new(0usize);
+        let waits = std::cell::Cell::new(0usize);
+        let progress = write_frame_with(
+            b"complete-frame",
+            BulkWriteMode::Immediate,
+            |remaining| {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 0 {
+                    Ok(4.min(remaining.len()))
+                } else {
+                    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                }
+            },
+            || {
+                waits.set(waits.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            progress,
+            BulkWriteProgress {
+                complete: false,
+                written: 4,
+                failure: Some(BulkWriteFailure::Backpressured),
+            }
+        );
+        assert_eq!(waits.get(), 0, "immediate lifecycle writes never poll");
+    }
+
+    #[test]
+    fn blocking_frame_write_resumes_same_suffix_after_backpressure() {
+        let calls = std::cell::Cell::new(0usize);
+        let waits = std::cell::Cell::new(0usize);
+        let mut observed_suffixes = Vec::new();
+        let progress = write_frame_with(
+            b"complete-frame",
+            BulkWriteMode::Blocking,
+            |remaining| {
+                observed_suffixes.push(remaining.to_vec());
+                let call = calls.get();
+                calls.set(call + 1);
+                match call {
+                    0 => Ok(4),
+                    1 => Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+                    _ => Ok(remaining.len()),
+                }
+            },
+            || {
+                waits.set(waits.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            progress,
+            BulkWriteProgress {
+                complete: true,
+                written: b"complete-frame".len(),
+                failure: None,
+            }
+        );
+        assert_eq!(waits.get(), 1);
+        assert_eq!(&observed_suffixes[1], b"lete-frame");
+        assert_eq!(&observed_suffixes[2], b"lete-frame");
+    }
+
+    #[test]
+    fn partial_hard_failure_is_distinct_from_retryable_backpressure() {
+        let calls = std::cell::Cell::new(0usize);
+        let progress = write_frame_with(
+            b"complete-frame",
+            BulkWriteMode::Immediate,
+            |remaining| {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 0 {
+                    Ok(3.min(remaining.len()))
+                } else {
+                    Err(std::io::Error::other("injected hard write failure"))
+                }
+            },
+            || panic!("hard failures must not wait"),
+        );
+        assert_eq!(
+            progress,
+            BulkWriteProgress {
+                complete: false,
+                written: 3,
+                failure: Some(BulkWriteFailure::Fatal),
+            }
+        );
+    }
+
     /// `send_exec_exit` from host context suppresses the write.
     #[test]
     fn send_exec_exit_from_host_context_is_noop() {
@@ -2301,7 +2651,6 @@ mod tests {
         // File closes them on drop.
         let mut read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
         let mut write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
-
         // Frame a header with length = 200 but cap at 100. The
         // function must reject WITHOUT reading the (forged) payload.
         let header = ShmMessage {
@@ -2436,6 +2785,22 @@ mod tests {
         // to exactly one File and is closed on drop.
         let mut read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
         let mut write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        // Match the production bulk-port open disposition. The no-deadline
+        // reader must provide blocking behavior through poll, not by relying
+        // on a blocking file descriptor.
+        let flags = unsafe { libc::fcntl(fds[0], libc::F_GETFL) };
+        assert!(
+            flags >= 0,
+            "F_GETFL failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let set = unsafe { libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        assert_eq!(
+            set,
+            0,
+            "F_SETFL failed: {}",
+            std::io::Error::last_os_error()
+        );
 
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let reader = std::thread::spawn(move || {
