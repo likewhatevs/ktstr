@@ -2309,14 +2309,67 @@ fn dangling_loader_candidate_target_appearance_invalidates_observation() {
     let candidate = temp.path().join("libfuture.so");
     symlink(&target, &candidate).unwrap();
     let mut observations = Vec::new();
-    observe_search_path(&candidate, &mut observations).unwrap();
+    observe_search_candidate(&candidate, &mut observations).unwrap();
     assert_eq!(observations.len(), 1);
     assert_eq!(observations[0].identity, None);
 
     std::fs::write(&target, b"now present").unwrap();
     assert!(
-        observe_search_path(&candidate, &mut observations).is_err(),
+        observe_search_candidate(&candidate, &mut observations).is_err(),
         "creating a dangling candidate's target must invalidate the cached closure"
+    );
+}
+
+#[test]
+fn loader_observations_ignore_sibling_churn_but_reject_selected_file_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let search_dir = temp.path().join("deps");
+    std::fs::create_dir(&search_dir).unwrap();
+    let soname = "libselected.so";
+    let selected = search_dir.join(soname);
+    std::fs::write(&selected, b"selected revision one").unwrap();
+
+    let mut observations = Vec::new();
+    let resolved = resolve_soname_with_loader(
+        soname,
+        &ElfSearchPaths {
+            rpath: Vec::new(),
+            runpath: vec![search_dir.clone()],
+        },
+        &[],
+        temp.path(),
+        &[],
+        &LdSoCache::default(),
+        &mut observations,
+    )
+    .unwrap();
+    assert_eq!(resolved, Some(selected.clone()));
+    assert_eq!(
+        observations.len(),
+        1,
+        "only the exact candidate affects this resolution decision"
+    );
+    assert_eq!(observations[0].path, selected);
+    assert!(observations[0].identity.is_some());
+
+    std::fs::write(search_dir.join("unrelated-cargo-artifact"), b"unrelated").unwrap();
+    observe_search_candidate(&selected, &mut observations)
+        .expect("unrelated search-directory churn must leave the selected candidate stable");
+
+    std::fs::write(&selected, b"selected revision two is a different size").unwrap();
+    assert!(
+        observe_search_candidate(&selected, &mut observations).is_err(),
+        "in-place selected-candidate mutation must invalidate the closure"
+    );
+
+    let mut replacement_observations = Vec::new();
+    observe_search_candidate(&selected, &mut replacement_observations).unwrap();
+    let replacement = search_dir.join("replacement");
+    std::fs::write(&replacement, b"replacement inode").unwrap();
+    std::fs::rename(&replacement, &selected).unwrap();
+    assert!(
+        observe_search_candidate(&selected, &mut replacement_observations).is_err(),
+        "selected-candidate inode replacement must invalidate the closure"
     );
 }
 

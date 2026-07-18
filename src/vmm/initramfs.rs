@@ -24,9 +24,10 @@ pub(crate) struct SharedLibs {
     /// closure. The cache preparer uses these to prove that the fds it pins
     /// for keying/building are the exact revisions the resolver inspected.
     pub observed_files: Vec<(PathBuf, ResolverFileIdentity)>,
-    /// Search directories observed, in priority order up to each resolution
-    /// decision. Both existing and missing paths are recorded so adding a
-    /// higher-priority soname invalidates a persistent closure memo.
+    /// Exact candidate paths observed, in priority order up to each
+    /// resolution decision. Both existing and missing candidates are
+    /// recorded so adding a higher-priority soname invalidates a persistent
+    /// closure memo without coupling it to unrelated directory churn.
     pub search_paths: Vec<ResolverPathObservation>,
 }
 
@@ -683,7 +684,10 @@ const DEFAULT_LIB_PATHS: &[&str] = &[
     "/usr/lib/aarch64-linux-gnu",
 ];
 
-fn observe_search_path(path: &Path, observations: &mut Vec<ResolverPathObservation>) -> Result<()> {
+fn observe_search_candidate(
+    path: &Path,
+    observations: &mut Vec<ResolverPathObservation>,
+) -> Result<()> {
     let identity = std::fs::metadata(path)
         .ok()
         .map(|metadata| ResolverFileIdentity::from_metadata(&metadata));
@@ -693,7 +697,7 @@ fn observe_search_path(path: &Path, observations: &mut Vec<ResolverPathObservati
     {
         anyhow::ensure!(
             previous.identity == identity,
-            "dynamic-library search path changed during resolution: {}",
+            "dynamic-library search candidate changed during resolution: {}",
             path.display()
         );
     } else {
@@ -746,9 +750,8 @@ fn resolve_soname_with_loader(
     //    LD_LIBRARY_PATH" rule for pre-RUNPATH binaries.
     for dir in &elf_paths.rpath {
         let dir = normalize_loader_search_dir(dir, loader_cwd);
-        observe_search_path(&dir, observations)?;
         let candidate = dir.join(soname);
-        observe_search_path(&candidate, observations)?;
+        observe_search_candidate(&candidate, observations)?;
         if candidate.is_file() {
             return Ok(Some(candidate));
         }
@@ -757,9 +760,8 @@ fn resolve_soname_with_loader(
     // 2. LD_LIBRARY_PATH.
     for dir in ld_library_path_dirs {
         let dir = normalize_loader_search_dir(dir, loader_cwd);
-        observe_search_path(&dir, observations)?;
         let candidate = dir.join(soname);
-        observe_search_path(&candidate, observations)?;
+        observe_search_candidate(&candidate, observations)?;
         if candidate.is_file() {
             return Ok(Some(candidate));
         }
@@ -768,9 +770,8 @@ fn resolve_soname_with_loader(
     // 3. DT_RUNPATH (modern).
     for dir in &elf_paths.runpath {
         let dir = normalize_loader_search_dir(dir, loader_cwd);
-        observe_search_path(&dir, observations)?;
         let candidate = dir.join(soname);
-        observe_search_path(&candidate, observations)?;
+        observe_search_candidate(&candidate, observations)?;
         if candidate.is_file() {
             return Ok(Some(candidate));
         }
@@ -782,9 +783,8 @@ fn resolve_soname_with_loader(
     //    set LD_LIBRARY_PATH.
     for dir in interp_hints {
         let dir = normalize_loader_search_dir(dir, loader_cwd);
-        observe_search_path(&dir, observations)?;
         let candidate = dir.join(soname);
-        observe_search_path(&candidate, observations)?;
+        observe_search_candidate(&candidate, observations)?;
         if candidate.is_file() {
             return Ok(Some(candidate));
         }
@@ -795,7 +795,7 @@ fn resolve_soname_with_loader(
     //    added via `ldconfig /path` that don't appear in ld.so.conf.
     if let Some(candidates) = ld_so_cache.candidates.get(soname) {
         for cached_path in candidates {
-            observe_search_path(cached_path, observations)?;
+            observe_search_candidate(cached_path, observations)?;
             if cached_path.is_file() {
                 return Ok(Some(cached_path.clone()));
             }
@@ -807,9 +807,8 @@ fn resolve_soname_with_loader(
     //    walk here was redundant per glibc's search algorithm.)
     for dir in DEFAULT_LIB_PATHS {
         let dir = Path::new(dir);
-        observe_search_path(dir, observations)?;
         let candidate = dir.join(soname);
-        observe_search_path(&candidate, observations)?;
+        observe_search_candidate(&candidate, observations)?;
         if candidate.is_file() {
             return Ok(Some(candidate));
         }
