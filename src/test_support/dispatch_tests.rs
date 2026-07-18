@@ -808,7 +808,12 @@ fn format_unknown_kernel_label_error_empty_present_renders_empty_brackets() {
     // (string equality drifted) but the present slice the caller
     // assembles is empty — still surfaces the bracket pair so the
     // diagnostic format is uniform with the non-empty case.
-    let s = format_unknown_kernel_label_error("verifier/foo/kernel_x/tiny", "kernel_x", "foo", &[]);
+    let s = format_unknown_kernel_label_error(
+        "verifier/foo/kernel_x/4cpu-1llc-nosmt",
+        "kernel_x",
+        "foo",
+        &[],
+    );
     assert!(
         s.contains("Present labels: []"),
         "missing empty brackets: {s}"
@@ -821,7 +826,7 @@ fn format_unknown_kernel_label_error_joins_present_with_comma_space() {
     // to match the `present.join(", ")` contract.
     let present = vec!["a", "b", "c"];
     let s = format_unknown_kernel_label_error(
-        "verifier/foo/kernel_x/tiny",
+        "verifier/foo/kernel_x/4cpu-1llc-nosmt",
         "kernel_x",
         "foo",
         &present,
@@ -1009,8 +1014,9 @@ fn strip_kernel_suffix_single_kernel_passthrough() {
         sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_14_2"),
         kernel_dir: PathBuf::from("/a"),
     }];
-    let (stripped, entry) = strip_kernel_suffix("gauntlet/eevdf/2llc", &kernel_list).unwrap();
-    assert_eq!(stripped, "gauntlet/eevdf/2llc");
+    let (stripped, entry) =
+        strip_kernel_suffix("gauntlet/eevdf/4cpu-2llc-nosmt", &kernel_list).unwrap();
+    assert_eq!(stripped, "gauntlet/eevdf/4cpu-2llc-nosmt");
     assert!(entry.is_none());
 
     let (stripped, entry) = strip_kernel_suffix("ktstr/eevdf", &[]).unwrap();
@@ -1035,13 +1041,13 @@ fn strip_kernel_suffix_multi_kernel_peels_suffix() {
         },
     ];
     let (stripped, entry) =
-        strip_kernel_suffix("gauntlet/eevdf/2llc/kernel_6_14_2", &kernel_list).unwrap();
-    assert_eq!(stripped, "gauntlet/eevdf/2llc");
+        strip_kernel_suffix("gauntlet/eevdf/4cpu-2llc-nosmt/kernel_6_14_2", &kernel_list).unwrap();
+    assert_eq!(stripped, "gauntlet/eevdf/4cpu-2llc-nosmt");
     assert_eq!(entry.unwrap().kernel_dir, PathBuf::from("/a"));
 
     let (stripped, entry) =
-        strip_kernel_suffix("gauntlet/eevdf/2llc/kernel_6_15_0", &kernel_list).unwrap();
-    assert_eq!(stripped, "gauntlet/eevdf/2llc");
+        strip_kernel_suffix("gauntlet/eevdf/4cpu-2llc-nosmt/kernel_6_15_0", &kernel_list).unwrap();
+    assert_eq!(stripped, "gauntlet/eevdf/4cpu-2llc-nosmt");
     assert_eq!(entry.unwrap().kernel_dir, PathBuf::from("/b"));
 }
 
@@ -1064,7 +1070,7 @@ fn strip_kernel_suffix_multi_kernel_missing_suffix_errors() {
             kernel_dir: PathBuf::from("/b"),
         },
     ];
-    let err = strip_kernel_suffix("gauntlet/eevdf/2llc", &kernel_list)
+    let err = strip_kernel_suffix("gauntlet/eevdf/4cpu-2llc-nosmt", &kernel_list)
         .expect_err("missing suffix in multi-kernel mode must error");
     assert!(
         err.contains("no recognised kernel suffix"),
@@ -1090,14 +1096,14 @@ fn strip_kernel_suffix_does_not_peel_preset_segment() {
             kernel_dir: PathBuf::from("/b"),
         },
     ];
-    // The preset name is `2llc`, NOT `kernel_6_14_2` — the
+    // The preset name is `4cpu-2llc-nosmt`, NOT `kernel_6_14_2` — the
     // peeler must require an EXACT match against a known
     // sanitized label, not just any `/<word>` ending.
     let (stripped, entry) =
-        strip_kernel_suffix("gauntlet/eevdf/2llc/kernel_6_14_2", &kernel_list).unwrap();
+        strip_kernel_suffix("gauntlet/eevdf/4cpu-2llc-nosmt/kernel_6_14_2", &kernel_list).unwrap();
     // Stripped name still contains both of the original path
-    // segments (eevdf, 2llc).
-    assert_eq!(stripped, "gauntlet/eevdf/2llc");
+    // segments (eevdf, 4cpu-2llc-nosmt).
+    assert_eq!(stripped, "gauntlet/eevdf/4cpu-2llc-nosmt");
     assert!(entry.is_some());
 }
 
