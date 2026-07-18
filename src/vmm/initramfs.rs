@@ -184,6 +184,7 @@ fn read_file_stable(path: &Path) -> Result<(Vec<u8>, ResolverFileIdentity)> {
 /// lib dirs feed the interp hints and are propagated to transitive deps.
 /// Walks transitive deps via level-parallel BFS. Returns empty result
 /// for static binaries or non-ELF files.
+#[cfg(test)]
 pub(crate) fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
     let loader_cwd = loader_current_dir()?;
     let ld_library_path_dirs = current_ld_library_path_dirs();
@@ -230,6 +231,7 @@ pub(crate) fn resolve_shared_libs_from_pinned(
 /// hint set is empty and toolchain-local libs (interp→libA→libB chains
 /// through `/opt/toolchain/lib`) would otherwise fall off the BFS at
 /// libA's resolution step.
+#[cfg(test)]
 fn resolve_shared_libs_with_extra_interp_hints(
     binary: &Path,
     extra_interp_hints: &[PathBuf],
@@ -260,6 +262,7 @@ fn resolve_shared_libs_with_extra_interp_hints(
 /// no PT_INTERP of its own, so the auto-derived hint set would be empty) so the
 /// linker's toolchain-local deps resolve against the same dirs the parent
 /// binary's resolution used.
+#[cfg(test)]
 pub(crate) fn resolve_interpreter_deps(interp: &str) -> Result<SharedLibs> {
     if is_standard_interpreter(interp) {
         return Ok(SharedLibs {
@@ -312,12 +315,14 @@ pub(crate) fn resolve_interpreter_deps_from_pinned(
     )
 }
 
+#[cfg(test)]
 fn current_ld_library_path_dirs() -> Vec<PathBuf> {
     std::env::var_os("LD_LIBRARY_PATH")
         .map(|value| std::env::split_paths(&value).collect())
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn loader_current_dir() -> Result<PathBuf> {
     let cwd = std::env::current_dir().context("read loader current directory")?;
     std::fs::canonicalize(&cwd)
@@ -437,7 +442,7 @@ fn resolve_shared_libs_inner(
             if !visited.insert(soname.clone()) {
                 continue;
             }
-            if let Some(host_path) = resolve_soname(
+            if let Some(host_path) = resolve_soname_with_loader(
                 soname,
                 search_paths,
                 &interp_search_dirs,
@@ -698,7 +703,7 @@ fn normalize_loader_search_dir(path: &Path, loader_cwd: &Path) -> PathBuf {
 /// priority over `LD_LIBRARY_PATH` when it is the binary's only
 /// rpath-style entry, and DT_RUNPATH is consulted only AFTER
 /// `LD_LIBRARY_PATH` so an admin override still wins.
-fn resolve_soname(
+fn resolve_soname_with_loader(
     soname: &str,
     elf_paths: &ElfSearchPaths,
     interp_hints: &[PathBuf],
@@ -774,10 +779,35 @@ fn resolve_soname(
     Ok(None)
 }
 
+#[cfg(test)]
+fn resolve_soname(
+    soname: &str,
+    elf_paths: &ElfSearchPaths,
+    interp_hints: &[PathBuf],
+) -> Option<PathBuf> {
+    let loader_cwd = loader_current_dir().ok()?;
+    let ld_library_path_dirs = current_ld_library_path_dirs();
+    let ld_so_cache = parse_ld_so_cache(Path::new("/etc/ld.so.cache"));
+    let mut observations = Vec::new();
+    resolve_soname_with_loader(
+        soname,
+        elf_paths,
+        interp_hints,
+        &loader_cwd,
+        &ld_library_path_dirs,
+        &ld_so_cache,
+        &mut observations,
+    )
+    .ok()
+    .flatten()
+}
+
 /// ELF magic bytes: `\x7fELF`.
+#[cfg(test)]
 const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
 
 /// Check if the first 4 bytes of a file match ELF magic.
+#[cfg(test)]
 fn is_elf(path: &Path) -> bool {
     std::fs::File::open(path)
         .and_then(|mut f| {
@@ -944,6 +974,7 @@ fn register_parent_dirs(dirs: &mut BTreeSet<String>, guest_path: &str) {
 /// read only for shared-lib resolution (its `/init` bytes are written by
 /// [`build_suffix`]).
 #[tracing::instrument(skip_all, fields(payload = %payload.display(), includes = include_files.len()))]
+#[cfg(test)]
 pub fn build_initramfs_base(
     payload: &Path,
     extra_binaries: &[(&str, &Path)],
@@ -1122,6 +1153,7 @@ fn validate_include_files<'a>(
 /// `resolve_all_libs` span (and its dir-registration phase) is held
 /// entered by the caller; the per-binary `resolve_shared_libs` span is
 /// created here.
+#[cfg(test)]
 fn resolve_all_shared_libs(
     payload: &Path,
     extra_binaries: &[(&str, &Path)],
