@@ -2225,15 +2225,6 @@ pub(crate) fn resolve_ref_commit(
     pick_ref_object(&ls_remote_refs(url)?, &target).map(|object| format!("{object}"))
 }
 
-/// True when `git_ref` is a full 40-char hex commit id — recognizable
-/// as a sha without a remote handshake. A 39/41-char ref, or any
-/// 40-char ref carrying a non-hex byte, is a name (branch/tag) and
-/// falls through to ls-remote. Case is not normalized here (the caller
-/// lowercases the full hash to match `git_clone`'s rendering).
-fn is_full_sha(git_ref: &str) -> bool {
-    git_ref.len() == 40 && git_ref.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
 /// ls-remote `url` and return EVERY advertised ref WITHOUT fetching a
 /// pack. Best-effort: `None` on any failure (network, auth). Shared by
 /// [`resolve_ref_commit`] (resolve one kind-directed ref → commit),
@@ -2329,7 +2320,14 @@ pub fn git_clone(
     cli_label: &str,
     mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<AcquiredSource> {
-    git_clone_inner(url, git_ref, dest_dir, cli_label, mp, None)
+    git_clone_inner(
+        url,
+        git_ref,
+        crate::kernel_path::GitRefKind::Branch,
+        dest_dir,
+        cli_label,
+        mp,
+    )
 }
 
 /// Shallow-clone a git repository at a TAG ref (e.g. `v6.14.11`).
@@ -2351,8 +2349,14 @@ pub(crate) fn git_clone_tag(
     cli_label: &str,
     mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<AcquiredSource> {
-    let extra_refspec = format!("+refs/tags/{tag}:refs/heads/{tag}");
-    git_clone_inner(url, tag, dest_dir, cli_label, mp, Some(extra_refspec))
+    git_clone_inner(
+        url,
+        tag,
+        crate::kernel_path::GitRefKind::Tag,
+        dest_dir,
+        cli_label,
+        mp,
+    )
 }
 
 /// Clone a git source at `git_ref`, dispatching on `ref_kind` to the
@@ -2401,35 +2405,23 @@ pub(crate) fn git_clone_kinded(
 /// Shared shallow-clone implementation for [`git_clone`] (branch) and
 /// [`git_clone_tag`] (tag).
 ///
-/// `extra_refspec`, when `Some`, is appended to the remote's fetch
-/// refspecs via `configure_remote` before the fetch (the tag path uses
-/// it to fetch `refs/tags/*`). `None` leaves the branch clone
-/// byte-identical to the historical behavior.
+/// This deliberately uses gix's lower-level fetch API rather than
+/// `clone::PrepareFetch`. The clone helper adds the remote's `HEAD` to
+/// every fetch and, for its ordinary shallow branch path, changes tag
+/// handling to `Tags::All`. On a kernel repository that turns a
+/// depth-one branch checkout into a fetch and pack-index of every
+/// release tag. An exact fully-qualified refspec keeps negotiation to
+/// the one branch or tag the caller requested. Branches and tags use
+/// the same fetch and checkout path; only their source namespace
+/// differs.
 fn git_clone_inner(
     url: &str,
     git_ref: &str,
+    ref_kind: crate::kernel_path::GitRefKind,
     dest_dir: &Path,
     cli_label: &str,
     mp: Option<&crate::cli::FetchProgress>,
-    extra_refspec: Option<String>,
 ) -> Result<AcquiredSource> {
-    // Any 40-hex `git_ref` cannot be cloned here, whatever kind the
-    // operator meant it as: gix's `with_ref_name(<40-hex>)` treats it as
-    // an object-id (its own `# Panics` doc: "an object-id as hex-hash"
-    // panics at `fetch_then_checkout`, gix `clone/access.rs`), and
-    // fetching a bare commit needs server-side allow-sha-in-want this
-    // path does not implement. Reject with an actionable error rather
-    // than panic. Placed at the single clone entry so every caller is
-    // covered — including a `#branch=`/`#tag=` whose NAME is 40 hex.
-    if is_full_sha(git_ref) {
-        anyhow::bail!(
-            "git+{url}#{git_ref}: cannot fetch a kernel by a raw commit SHA — \
-             gix's shallow clone treats any 40-hex ref as a commit id (even a \
-             branch/tag named 40 hex chars). Use a branch or tag name that is \
-             not 40 hex chars, or on github.com `#sha=<40-hex>` (codeload \
-             fetches the commit)."
-        );
-    }
     let cloning = format!("{cli_label}: cloning {url} (ref: {git_ref}, depth: 1)");
     match mp {
         Some(fp) => fp.println(&cloning),
@@ -2438,39 +2430,6 @@ fn git_clone_inner(
 
     let clone_dir = dest_dir.join("linux");
 
-    // Build the clone with anon_open_opts() (repo-local config only)
-    // rather than gix::prepare_clone, whose open opts load the user's
-    // gitconfig and would apply an `insteadOf` HTTPS->SSH rewrite,
-    // prompting for a key passphrase. Mirrors gix::prepare_clone's
-    // (WithWorktree, default create opts) otherwise.
-    let mut prep = gix::clone::PrepareFetch::new(
-        url,
-        &clone_dir,
-        gix::create::Kind::WithWorktree,
-        gix::create::Options::default(),
-        anon_open_opts(),
-    )
-    .with_context(|| "prepare clone")?
-    .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
-        NonZeroU32::new(1).expect("1 is nonzero"),
-    ))
-    .with_ref_name(Some(git_ref))
-    .with_context(|| "set ref name")?;
-
-    // Tag path only: gix's single-branch-shallow fetch derives its
-    // refspec from `with_ref_name` via Category::LocalBranch
-    // (`refs/heads/{ref}`), which never matches a `refs/tags/*` ref.
-    // Append the caller's `+refs/tags/{tag}:refs/heads/{tag}` so the
-    // tag is fetched into the branch ref the checkout resolves.
-    // `with_refspecs` APPENDS (keeping gix's own single-branch spec),
-    // so a branch clone that reaches here would still match its spec —
-    // but the branch path passes `None` and skips this entirely.
-    if let Some(spec) = extra_refspec {
-        prep = prep.configure_remote(move |remote| {
-            Ok(remote.with_refspecs(Some(spec.as_str()), gix::remote::Direction::Fetch)?)
-        });
-    }
-
     // Drive a determinate clone bar from gix's progress tree (see
     // [`crate::cli::progress::CloneProgress`]). `None` when no progress
     // group is threaded in; the gix calls then pass `Discard` exactly
@@ -2478,23 +2437,22 @@ fn git_clone_inner(
     // phases, matching the prior per-call `AtomicBool::new(false)`.
     let clone_progress = mp.map(|fp| fp.clone_progress(git_ref));
     let interrupt = std::sync::atomic::AtomicBool::new(false);
-
-    let (mut checkout, _outcome) = match &clone_progress {
-        Some(cp) => prep
-            .fetch_then_checkout(cp.item(), &interrupt)
-            .with_context(|| "clone fetch")?,
-        None => prep
-            .fetch_then_checkout(gix::progress::Discard, &interrupt)
-            .with_context(|| "clone fetch")?,
-    };
-
-    let (_repo, _outcome) = match &clone_progress {
-        Some(cp) => checkout
-            .main_worktree(cp.item(), &interrupt)
-            .with_context(|| "checkout")?,
-        None => checkout
-            .main_worktree(gix::progress::Discard, &interrupt)
-            .with_context(|| "checkout")?,
+    let commit_id = match fetch_exact_ref_and_checkout(
+        url,
+        git_ref,
+        ref_kind,
+        &clone_dir,
+        clone_progress.as_ref(),
+        &interrupt,
+    ) {
+        Ok(id) => id,
+        Err(err) => {
+            // `PrepareCheckout` used to own this rollback. The exact-ref
+            // path is assembled from lower-level gix operations, so keep
+            // the same all-or-nothing destination contract explicitly.
+            let _ = std::fs::remove_dir_all(&clone_dir);
+            return Err(err);
+        }
     };
 
     // Clone + checkout done — stop the poll thread, join it, clear the
@@ -2504,12 +2462,10 @@ fn git_clone_inner(
         cp.finish();
     }
 
-    let repo = gix::open(&clone_dir).with_context(|| "open cloned repo")?;
-    let head = repo.head_id().with_context(|| "read HEAD")?;
     // FULL commit hash keys the cache (see `git_cache_key` — a 7-hex
     // prefix risks a moved-tip collision serving a stale build); the
     // 7-hex `short_hash` is kept only for the human-facing source record.
-    let commit_hash = format!("{head}");
+    let commit_hash = format!("{commit_id}");
     let short_hash = commit_hash.chars().take(7).collect::<String>();
 
     let cache_key = git_cache_key(git_ref, &commit_hash);
@@ -2530,6 +2486,150 @@ fn git_clone_inner(
         is_dirty: false,
         is_git: true,
     })
+}
+
+/// Fetch one fully-qualified branch or tag at depth one and materialize
+/// its peeled commit into `clone_dir`.
+fn fetch_exact_ref_and_checkout(
+    url: &str,
+    git_ref: &str,
+    ref_kind: crate::kernel_path::GitRefKind,
+    clone_dir: &Path,
+    clone_progress: Option<&crate::cli::progress::CloneProgress>,
+    interrupt: &std::sync::atomic::AtomicBool,
+) -> Result<gix::ObjectId> {
+    use crate::kernel_path::GitRefKind;
+
+    let source_ref = match ref_kind {
+        GitRefKind::Branch => format!("refs/heads/{git_ref}"),
+        GitRefKind::Tag => format!("refs/tags/{git_ref}"),
+        GitRefKind::Sha | GitRefKind::Unknown => {
+            anyhow::bail!("exact shallow fetch requires a branch or tag")
+        }
+    };
+    // A fixed private destination means arbitrary valid branch/tag names
+    // never have to be re-encoded as a local branch name.
+    const FETCHED_REF: &str = "refs/ktstr/source";
+    let refspec = format!("+{source_ref}:{FETCHED_REF}");
+
+    let repo = gix::ThreadSafeRepository::init_opts(
+        clone_dir,
+        gix::create::Kind::WithWorktree,
+        gix::create::Options::default(),
+        anon_open_opts(),
+    )
+    .with_context(|| "prepare clone")?
+    .to_thread_local();
+
+    let mut remote = repo
+        .remote_at_without_url_rewrite(url)
+        .with_context(|| "prepare clone remote")?
+        .with_fetch_tags(gix::remote::fetch::Tags::None);
+    remote
+        .replace_refspecs([refspec.as_str()], gix::remote::Direction::Fetch)
+        .with_context(|| format!("set exact fetch refspec for {source_ref}"))?;
+
+    let connection = remote
+        .connect(gix::remote::Direction::Fetch)
+        .with_context(|| format!("connect to {url}"))?;
+    let prepare = match clone_progress {
+        Some(progress) => connection
+            .prepare_fetch(progress.item(), gix::remote::ref_map::Options::default())
+            .with_context(|| format!("map exact remote ref {source_ref}"))?,
+        None => connection
+            .prepare_fetch(
+                gix::progress::Discard,
+                gix::remote::ref_map::Options::default(),
+            )
+            .with_context(|| format!("map exact remote ref {source_ref}"))?,
+    }
+    .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
+        NonZeroU32::new(1).expect("1 is nonzero"),
+    ));
+
+    match clone_progress {
+        Some(progress) => prepare
+            .receive(progress.item(), interrupt)
+            .with_context(|| format!("fetch exact remote ref {source_ref}"))?,
+        None => prepare
+            .receive(gix::progress::Discard, interrupt)
+            .with_context(|| format!("fetch exact remote ref {source_ref}"))?,
+    };
+
+    let commit_id = repo
+        .find_reference(FETCHED_REF)
+        .with_context(|| format!("find fetched ref {source_ref}"))?
+        .peel_to_id()
+        .with_context(|| format!("peel fetched ref {source_ref} to a commit"))?
+        .detach();
+
+    // Both branch and tag clones are snapshots for ktstr, so a detached
+    // HEAD is the uniform representation of the exact peeled commit.
+    repo.reference(
+        "HEAD",
+        commit_id,
+        gix::refs::transaction::PreviousValue::Any,
+        "clone: checkout exact ktstr source",
+    )
+    .with_context(|| "set cloned repository HEAD")?;
+
+    match clone_progress {
+        Some(progress) => {
+            checkout_exact_commit(&repo, commit_id, progress.item(), interrupt)?;
+        }
+        None => {
+            checkout_exact_commit(&repo, commit_id, gix::progress::Discard, interrupt)?;
+        }
+    }
+    Ok(commit_id)
+}
+
+/// Materialize `commit_id` into the main worktree and persist its index.
+fn checkout_exact_commit(
+    repo: &gix::Repository,
+    commit_id: gix::ObjectId,
+    mut progress: impl gix::Progress,
+    interrupt: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    let workdir = repo
+        .workdir()
+        .with_context(|| "exact clone repository has no worktree")?;
+    let tree_id = repo
+        .find_object(commit_id)
+        .with_context(|| format!("find fetched commit {commit_id}"))?
+        .peel_to_tree()
+        .with_context(|| format!("peel fetched commit {commit_id} to its tree"))?
+        .id;
+    let mut index = repo
+        .index_from_tree(&tree_id)
+        .with_context(|| format!("build index from fetched tree {tree_id}"))?;
+    let mut opts = repo
+        .checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)
+        .with_context(|| "build exact clone checkout options")?;
+    opts.destination_is_initially_empty = true;
+    opts.keep_going = false;
+
+    progress.init(Some(index.entries().len()), gix::progress::count("files"));
+    let objects = repo
+        .objects
+        .clone()
+        .into_arc()
+        .with_context(|| "build thread-safe object handle for exact clone checkout")?;
+    gix::worktree::state::checkout(
+        &mut index,
+        workdir,
+        objects,
+        &progress,
+        &gix::progress::Discard,
+        interrupt,
+        opts,
+    )
+    .with_context(|| format!("check out fetched commit {commit_id}"))?;
+
+    index
+        .write(Default::default())
+        .with_context(|| "write exact clone index")?;
+    Ok(())
 }
 
 /// Use a local kernel source tree.

@@ -3653,45 +3653,6 @@ fn pick_ref_object_skips_unborn() {
     assert!(pick_ref_object(&refs, "refs/heads/new").is_none());
 }
 
-#[test]
-fn is_full_sha_gate_recognizes_only_40_char_hex() {
-    // Exactly 40 hex chars (either case) is a sha -> fast path.
-    assert!(is_full_sha(&"a".repeat(40)), "40 lowercase hex is a sha");
-    assert!(is_full_sha(&"A".repeat(40)), "40 uppercase hex is a sha");
-    // Off-by-one lengths are names, not shas -> fall through to ls-remote.
-    assert!(!is_full_sha(&"a".repeat(39)), "39 chars is not a sha");
-    assert!(!is_full_sha(&"a".repeat(41)), "41 chars is not a sha");
-    // 40 chars but a non-hex byte is a ref name, not a sha.
-    assert!(
-        !is_full_sha(&format!("{}g", "a".repeat(39))),
-        "40-char non-hex is not a sha"
-    );
-}
-
-#[test]
-fn git_clone_rejects_raw_sha_git_ref_without_panic() {
-    // A raw 40-hex commit SHA must be rejected with an actionable error
-    // rather than the gix `with_ref_name(<object-id>)` panic. The check
-    // is at git_clone's entry, BEFORE any network, so the bogus URL is
-    // never contacted (the test is deterministic + offline).
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sha = "1234567890abcdef1234567890abcdef12345678";
-    let err = git_clone(
-        "https://invalid.invalid/nope.git",
-        sha,
-        tmp.path(),
-        "test",
-        None,
-    )
-    .err()
-    .expect("a raw SHA git_ref must be rejected, not cloned");
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("raw commit SHA") && msg.contains("branch or tag"),
-        "the error must be actionable (use a branch or tag): {msg}"
-    );
-}
-
 /// `git_clone_tag` shallow-clones an annotated TAG — the `#tag=`
 /// git-source clone path (via `git_clone_kinded`) for a non-GitHub
 /// remote. A plain `with_ref_name` shallow clone
