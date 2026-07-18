@@ -1567,7 +1567,8 @@ pub(crate) fn run_verifier(
         // Decide the outcome from nextest's exit + the records. With
         // `--no-tests pass` a zero-cell selection exits 0, so an empty record
         // set on success is diagnosed here (a `--scheduler` typo, no scheduler
-        // declared, or no topology preset fits this host) rather than
+        // declared, or declaration-level topology constraints / verifier-only
+        // exclusions reject every selected preset) rather than
         // surfacing nextest's generic no-tests error. A real build/exec
         // failure still exits non-zero and is surfaced verbatim — EXCEPT when
         // the failure is a real cell failure the grid above already shows
