@@ -1,5 +1,5 @@
 //! Interrupt guard for the child-run CLI paths (`cargo ktstr test`,
-//! `perf-delta`).
+//! `cargo ktstr verifier`, and `perf-delta`).
 //!
 //! The parent (cargo-ktstr) shells `cargo nextest run` and blocks in
 //! [`std::process::Command::status`] at the default SIGINT/SIGTERM
@@ -46,6 +46,17 @@ extern "C" fn handler(sig: libc::c_int) {
     let _ = CAUGHT_SIGNAL.compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst);
     // Abort any in-progress gix checkout polling this flag.
     INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn record_for_test(sig: libc::c_int) {
+    handler(sig);
+}
+
+#[cfg(test)]
+pub(crate) fn test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// RAII guard that routes SIGINT + SIGTERM to [`handler`] for its
@@ -99,14 +110,31 @@ impl InterruptGuard {
     }
 }
 
-/// The signal recorded by a live [`InterruptGuard`], if any — a
-/// free-standing read for code running under a guard a caller installed
-/// (e.g. perf-delta's `noise_dual_run` short-circuiting between child runs).
+/// The signal recorded by the most recently installed [`InterruptGuard`], if
+/// any. The value remains available after the guard restores its handlers and
+/// is cleared by the next [`InterruptGuard::install`]. This is both the
+/// free-standing read for code running under a caller-owned guard (for example
+/// perf-delta short-circuiting between child runs) and the post-restore read
+/// used by [`restore_and_caught`].
 pub(crate) fn caught() -> Option<libc::c_int> {
     match CAUGHT_SIGNAL.load(Ordering::SeqCst) {
         0 => None,
         sig => Some(sig),
     }
+}
+
+/// Restore the dispositions saved by `guard` and return the first signal
+/// caught across the entire handoff.
+///
+/// Reading once before `Drop` is not sufficient: SIGINT/SIGTERM can arrive
+/// between that read and the corresponding `sigaction` restore, run our
+/// handler, and otherwise go unobserved. Re-reading the first-signal slot
+/// after restoration closes that window. A signal delivered after its prior
+/// disposition is restored follows that disposition normally.
+pub(crate) fn restore_and_caught(guard: InterruptGuard) -> Option<libc::c_int> {
+    let caught_before_restore = guard.interrupted();
+    drop(guard);
+    caught_before_restore.or_else(caught)
 }
 
 impl Drop for InterruptGuard {
@@ -163,6 +191,7 @@ mod tests {
     /// process, so mutating global signal state here is test-isolated.
     #[test]
     fn install_records_and_restores() {
+        let _serial = test_serial_guard();
         // Install a SIG_IGN sentinel we can prove was restored.
         // SAFETY: SIG_IGN is a valid disposition; out-params are zeroed.
         let (mut pre_int, mut pre_term) = unsafe {
@@ -209,7 +238,12 @@ mod tests {
         handler(libc::SIGTERM);
         assert_eq!(guard.interrupted(), Some(libc::SIGINT));
 
-        drop(guard);
+        let restored_caught = restore_and_caught(guard);
+        assert_eq!(
+            restored_caught,
+            Some(libc::SIGINT),
+            "first signal remains visible across handler restoration",
+        );
         assert_eq!(current(libc::SIGINT), libc::SIG_IGN, "drop restores SIGINT");
         assert_eq!(
             current(libc::SIGTERM),

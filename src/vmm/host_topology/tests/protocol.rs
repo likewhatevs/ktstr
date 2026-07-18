@@ -106,9 +106,24 @@ fn live_claim_requires_marker_holder() {
     assert!(live.llcs.contains(&3) && live.llcs.contains(&5) && live.cpus.contains(&12));
 
     drop(marker);
+    // A concurrent test thread can fork while the marker fd is live. CLOEXEC
+    // closes the inherited copy at exec, but the raw-fork queue test retains
+    // it until `_exit`, so the marker may remain live briefly after our local
+    // close. That is an eventual-close contract, not a leaked claim: poll
+    // through the bounded fork-child window and still fail diagnostically if
+    // the marker persists.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let final_claim = loop {
+        let claim = protocol::read_live_claim();
+        if claim.is_empty() || std::time::Instant::now() >= deadline {
+            break claim;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
     assert!(
-        protocol::read_live_claim().is_empty(),
-        "claim must die with the marker flock (crashed-head safety)",
+        final_claim.is_empty(),
+        "claim must die with the marker flock (crashed-head safety); \
+         still live after fork-child grace period: {final_claim:?}",
     );
 }
 

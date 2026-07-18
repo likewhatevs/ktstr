@@ -297,7 +297,7 @@ stderr warns:
 
 ```text
 ktstr: reserving LLCs [0 (node 0), 2 (node 1)] across 2 NUMA nodes
-(preferred single-node contiguous unavailable). Build will run;
+(preferred single-node contiguous unavailable). Work will proceed;
 memory-access latency may be higher.
 ```
 

@@ -612,60 +612,11 @@ fn run_ktstr_test_inner_impl(
     if let Some(t) = topo {
         t.validate().context("TopoOverride validation")?;
     }
-    // Pin rayon's global thread pool to the test's allowed CPUs.
-    // The pool is created lazily on first rayon use (initramfs
-    // build) — configuring it here ensures workers inherit the
-    // test's cpuset instead of spreading across all host CPUs.
-    //
-    // `build_global` succeeds only once per process. Track the
-    // first call's cpuset in a `OnceLock<Vec<usize>>`; subsequent
-    // tests with a DIFFERENT cpuset can't repin the pool, so emit
-    // a warning so the operator sees that the second test's
-    // workers may run on the first test's CPUs.
-    static FIRST_RAYON_CPUSET: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
-    let host_cpus = crate::vmm::host_topology::host_allowed_cpus();
-    if !host_cpus.is_empty() {
-        let cpus = host_cpus.clone();
-        let n = cpus.len();
-        let range = format!("{}-{}", cpus[0], cpus[n - 1]);
-        let cpus_for_handler = cpus.clone();
-        let built = rayon::ThreadPoolBuilder::new()
-            .num_threads(n.min(32))
-            .start_handler(move |_idx| {
-                let mut cpuset = nix::sched::CpuSet::new();
-                for &cpu in &cpus_for_handler {
-                    let _ = cpuset.set(cpu);
-                }
-                let _ = nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &cpuset);
-            })
-            .build_global()
-            .is_ok();
-        if built {
-            // First successful pin in this process. Record the
-            // cpuset so later tests can compare.
-            let _ = FIRST_RAYON_CPUSET.set(cpus);
-            eprintln!("no_perf_mode: rayon pool pinned to {n} CPUs ({range})");
-        } else if let Some(first) = FIRST_RAYON_CPUSET.get()
-            && first != &host_cpus
-        {
-            // build_global fails on every call after the first.
-            // When the second test's cpuset differs, warn — the
-            // pool is still pinned to `first`, not to the
-            // requested `host_cpus`, so workers run on a stale
-            // cpuset until process exit.
-            let first_n = first.len();
-            let first_range = if first_n > 0 {
-                format!("{}-{}", first[0], first[first_n - 1])
-            } else {
-                "empty".to_string()
-            };
-            eprintln!(
-                "no_perf_mode: WARNING: rayon pool already pinned to {first_n} CPUs \
-                 ({first_range}); requested {n} CPUs ({range}) won't take effect — \
-                 build_global is one-shot per process",
-            );
-        }
-    }
+    // Do not initialize Rayon globally here. A verifier storm is
+    // process-per-cell, so even a cache-hit cell would retain every global
+    // worker for its full VM lifetime. Expensive preparation paths use
+    // bounded, short-lived local work only on the elected cache builder;
+    // cache consumers therefore create no compression workers at all.
     if entry.performance_mode && super::runtime::no_perf_mode_active() {
         // One canonical reason string for both the stderr banner
         // (prefixed with the entry name for multi-test context)
@@ -696,6 +647,7 @@ fn run_ktstr_test_inner_impl(
     // the full rationale; it skips ONLY the auto-collapse case past
     // `OVERCOMMIT_SKIP_RATIO`, so an explicit `cpu_budget` and the CI
     // ~1.3x case both RUN and are validated here, never masked.
+    let host_cpus = crate::vmm::host_topology::host_allowed_cpus();
     if let Some(skip) = overcommit_skip(entry, &host_cpus, topo) {
         return Ok(skip);
     }

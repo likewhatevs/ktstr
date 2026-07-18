@@ -411,6 +411,18 @@ pub(crate) fn cpu_scaled_memory_mib(cpus: u32) -> u32 {
     (cpus * 64).max(256)
 }
 
+/// Memory floor for one verifier topology preset.
+///
+/// Verifier VMs use deferred sizing, so the actual initramfs budget may raise
+/// this floor. The preset budget caps only the topology-derived CPU scaling:
+/// a 252-vCPU synthetic topology must not advertise 16 GiB merely because it
+/// has many vCPUs when the preset explicitly budgets 4 GiB. Small presets keep
+/// the ordinary 64 MiB/vCPU floor.
+pub(crate) fn verifier_preset_memory_min_mib(cpus: u32, preset_memory_mib: usize) -> u32 {
+    let preset_cap = u32::try_from(preset_memory_mib).unwrap_or(u32::MAX);
+    cpu_scaled_memory_mib(cpus).min(preset_cap)
+}
+
 /// Derive the test VM's memory floor from a CPU count + entry.
 ///
 /// Returns `max(cpu_scaled_memory_mib(cpus), entry.memory_mib)`. When
@@ -1697,10 +1709,18 @@ mod tests {
     }
 
     #[test]
+    fn verifier_preset_memory_caps_synthetic_cpu_scaling() {
+        assert_eq!(verifier_preset_memory_min_mib(4, 2048), 256);
+        assert_eq!(verifier_preset_memory_min_mib(32, 2048), 2048);
+        assert_eq!(verifier_preset_memory_min_mib(64, 2048), 2048);
+        assert_eq!(verifier_preset_memory_min_mib(252, 4096), 4096);
+    }
+
+    #[test]
     fn cpu_scaled_memory_mib_backs_derive_test_memory_mib() {
         // The entry-aware wrapper must reduce to the shared core when no
         // per-entry override raises it — the invariant that lets the
-        // verifier cell reuse cpu_scaled_memory_mib directly.
+        // direct verifier API reuse cpu_scaled_memory_mib directly.
         let entry = KtstrTestEntry {
             name: "shared",
             memory_mib: 0,

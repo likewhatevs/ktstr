@@ -112,16 +112,16 @@ Each scheduler's `kernels = [...]` declaration filters the
 operator-supplied set; an empty or omitted `kernels` field runs
 against every kernel in the sweep.
 
-<!-- captured: cargo ktstr verifier --kernel 7.0 --scheduler ktstr_sched --test kaslr_axis_e2e tiny-1llc tiny-2llc odd-3llc smt-2llc | ktstr 0.23.0 | kernel 7.0.14 -->
+<!-- captured: cargo ktstr verifier --kernel 7.0 --scheduler ktstr_sched --test kaslr_axis_e2e 4cpu-1llc-nosmt 4cpu-2llc-nosmt 9cpu-3llc-nosmt 8cpu-2llc-smt | ktstr 0.23.0 | kernel 7.0.14 -->
 <div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr verifier --kernel 7.0 --scheduler ktstr_sched</span></div>
 
 <pre>cargo ktstr: resolved kernel "7.0"
 ...
     Starting 4 tests across 1 binary (55 tests skipped)
-        PASS [  12.406s] (1/4) ktstr::kaslr_axis_e2e verifier/ktstr_sched/kernel_7_0/odd-3llc
-        PASS [  12.432s] (2/4) ktstr::kaslr_axis_e2e verifier/ktstr_sched/kernel_7_0/smt-2llc
-        PASS [  12.656s] (3/4) ktstr::kaslr_axis_e2e verifier/ktstr_sched/kernel_7_0/tiny-1llc
-        PASS [  12.929s] (4/4) ktstr::kaslr_axis_e2e verifier/ktstr_sched/kernel_7_0/tiny-2llc
+        PASS [  12.406s] (1/4) ktstr::kaslr_axis_e2e verifier/ktstr_sched/kernel_7_0/9cpu-3llc-nosmt
+        PASS [  12.432s] (2/4) ktstr::kaslr_axis_e2e verifier/ktstr_sched/kernel_7_0/8cpu-2llc-smt
+        PASS [  12.656s] (3/4) ktstr::kaslr_axis_e2e verifier/ktstr_sched/kernel_7_0/4cpu-1llc-nosmt
+        PASS [  12.929s] (4/4) ktstr::kaslr_axis_e2e verifier/ktstr_sched/kernel_7_0/4cpu-2llc-nosmt
 ────────────
      Summary [  12.929s] 4 tests run: 4 passed, 55 skipped
 
@@ -134,17 +134,17 @@ ktstr_sched:
 verifier results (per scheduler; rows: topology, cols: kernel):
 
 <span class="t-grn">ktstr_sched: 4 ✅  0 ❌</span>
-┌───────────┬────────────┐
-│ topology  │ kernel_7_0 │
-╞═══════════╪════════════╡
-│ odd-3llc  │ <span class="t-grn">✓</span>          │
-├───────────┼────────────┤
-│ smt-2llc  │ <span class="t-grn">✓</span>          │
-├───────────┼────────────┤
-│ tiny-1llc │ <span class="t-grn">✓</span>          │
-├───────────┼────────────┤
-│ tiny-2llc │ <span class="t-grn">✓</span>          │
-└───────────┴────────────┘</pre></div>
+┌─────────────────┬────────────┐
+│ topology        │ kernel_7_0 │
+╞═════════════════╪════════════╡
+│ 4cpu-1llc-nosmt │ <span class="t-grn">✓</span>          │
+├─────────────────┼────────────┤
+│ 4cpu-2llc-nosmt │ <span class="t-grn">✓</span>          │
+├─────────────────┼────────────┤
+│ 8cpu-2llc-smt   │ <span class="t-grn">✓</span>          │
+├─────────────────┼────────────┤
+│ 9cpu-3llc-nosmt │ <span class="t-grn">✓</span>          │
+└─────────────────┴────────────┘</pre></div>
 
 One glance shows where the complexity lives (`ktstr_init_task` at
 ~29k verified instructions dwarfs every other program) and that all

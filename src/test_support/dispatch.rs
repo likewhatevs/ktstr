@@ -1558,14 +1558,14 @@ fn for_each_gauntlet_variant<F>(
 {
     let no_perf_mode = super::runtime::no_perf_mode_for_entry(entry);
     for preset in presets {
-        // Non-uniform presets (per-LLC core counts, e.g. uneven-11llc)
+        // Non-uniform presets (per-LLC core counts, e.g. 192cpu-11llc-smt)
         // are VERIFIER-ONLY: the gauntlet execution path reconstructs the
         // topology from a `TopoOverride` (numa/llcs/cores/threads only),
         // which cannot carry `llc_cores`, so a gauntlet variant would boot
         // a WRONG uniform shape. The verifier path passes the full
         // Topology (with llc_cores) directly, so it is the only path that
         // renders these shapes faithfully. Skip them here regardless of
-        // constraints — this is why uneven-11llc's forced overcommit is
+        // constraints — this is why 192cpu-11llc-smt's forced overcommit is
         // realized only in the verifier battery.
         if preset.topology.llc_cores.is_some() {
             continue;
@@ -1715,40 +1715,25 @@ fn list_tests_all(ignored_only: bool) {
 ///   produce identical sanitized labels.
 ///
 /// [`KernelId`]: crate::kernel_path::KernelId
+#[cfg(test)]
 fn sched_kernel_filter_accepts(declared: &[&'static str], entry: &KernelEntry) -> bool {
-    if declared.is_empty() {
-        return true;
-    }
-    declared.iter().any(|spec| entry_matches_spec(entry, spec))
+    super::entry::verifier_kernel_specs_accept(
+        declared.iter().copied(),
+        &entry.label,
+        entry.sanitized.as_str(),
+    )
 }
 
 /// Single-spec match helper for [`sched_kernel_filter_accepts`].
 /// Parses `spec` via [`crate::kernel_path::KernelId::parse`] and
 /// dispatches on the variant. Pure logic — no network, no FS.
+#[cfg(test)]
 fn entry_matches_spec(entry: &KernelEntry, spec: &str) -> bool {
-    use crate::kernel_path::{KernelId, decompose_version_for_compare};
-    match KernelId::parse(spec) {
-        KernelId::Version(spec_ver) => {
-            entry.label == spec_ver || entry.sanitized.as_str() == sanitize_kernel_label(&spec_ver)
-        }
-        KernelId::Range { start, end, .. } => {
-            let Some(entry_t) = decompose_version_for_compare(&entry.label) else {
-                return false;
-            };
-            let Some(start_t) = decompose_version_for_compare(&start) else {
-                return false;
-            };
-            let Some(end_t) = decompose_version_for_compare(&end) else {
-                return false;
-            };
-            entry_t >= start_t && entry_t <= end_t
-        }
-        KernelId::CacheKey(_)
-        | KernelId::Path(_)
-        | KernelId::Git { .. }
-        | KernelId::Package { .. }
-        | KernelId::Distro { .. } => entry.sanitized.as_str() == sanitize_kernel_label(spec),
-    }
+    super::entry::verifier_kernel_specs_accept(
+        std::iter::once(spec),
+        &entry.label,
+        entry.sanitized.as_str(),
+    )
 }
 
 /// Format the `KTSTR_KERNEL_LIST is empty` diagnostic emitted by
@@ -1986,8 +1971,19 @@ fn list_verifier_cells_all() {
             }
             _ => {}
         }
+        let scheduler_json = super::SchedulerJson::from_scheduler(sched);
+        if !scheduler_json.has_accepted_verifier_cell(
+            kernel_list
+                .iter()
+                .map(|entry| (entry.label.as_str(), entry.sanitized.as_str())),
+            &presets,
+        ) {
+            continue;
+        }
         for kernel_entry in &kernel_list {
-            if !sched_kernel_filter_accepts(sched.kernels, kernel_entry) {
+            if !scheduler_json
+                .accepts_verifier_kernel(&kernel_entry.label, kernel_entry.sanitized.as_str())
+            {
                 continue;
             }
             // One cell per (scheduler, kernel, topology preset). The
@@ -2013,7 +2009,7 @@ fn list_verifier_cells_all() {
                     );
                     continue;
                 }
-                if !scheduler_accepts_verifier_preset(sched, preset) {
+                if !scheduler_json.accepts_verifier_preset(preset) {
                     continue;
                 }
                 println!(
@@ -2028,12 +2024,12 @@ fn list_verifier_cells_all() {
 /// Apply the verifier-only topology policy for one scheduler/preset
 /// pair. Kept separate from emission so named exclusions are directly
 /// unit-testable without capturing a process-wide nextest listing.
+#[cfg(test)]
 fn scheduler_accepts_verifier_preset(
     sched: &super::Scheduler,
     preset: &crate::gauntlet::TopoPreset,
 ) -> bool {
-    sched.constraints.accepts_verifier(&preset.topology)
-        && !sched.verifier_exclude_topologies.contains(&preset.name)
+    super::SchedulerJson::from_scheduler(sched).accepts_verifier_preset(preset)
 }
 
 /// Whether a verifier-cell error is a typed guest-kernel/topology
@@ -2162,17 +2158,31 @@ fn run_verifier_cell_inner(
     };
 
     let sched_bin: std::path::PathBuf = match sched.binary {
-        // Build the scheduler in the DECLARING crate's workspace with
-        // `cargo build -p <pkg>` run from `sched.manifest_dir` — the same
-        // workspace whose membership the emission-time gate in
-        // `list_verifier_cells_all` checked, so an emitted cell always
-        // names a buildable package. Cargo owns freshness (rebuild when
-        // sources changed, no-op when up to date, fail when unbuildable).
+        // A cargo-ktstr parent prebuilds every selected Discover package once
+        // and exports an immutable exact-identity manifest. A direct/manual
+        // cell invocation has no manifest and retains the legacy on-demand
+        // build. Once a manifest is present, lookup failure is fatal and MUST
+        // NOT silently rebuild: doing so would recreate one shared-target
+        // Cargo lock waiter per verifier topology cell.
         SchedulerSpec::Discover(pkg) => {
-            match crate::build_and_find_binary(pkg, sched.manifest_dir) {
-                Ok(p) => p,
+            match crate::verifier::verifier_scheduler_artifact_from_env(
+                sched.name,
+                pkg,
+                sched.manifest_dir,
+            ) {
+                Ok(Some(path)) => path,
+                Ok(None) => match crate::build_and_find_binary(pkg, sched.manifest_dir) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        eprintln!("ktstr verifier: build scheduler {pkg:?}: {e:#}");
+                        return 1;
+                    }
+                },
                 Err(e) => {
-                    eprintln!("ktstr verifier: build scheduler {pkg:?}: {e:#}");
+                    eprintln!(
+                        "ktstr verifier: resolve prebuilt scheduler {sched_name:?} \
+                         (package {pkg:?}): {e:#}"
+                    );
                     return 1;
                 }
             }
@@ -2240,10 +2250,12 @@ fn run_verifier_cell_inner(
             }
         }
     };
-    // Pass the preset's Topology directly (uneven-11llc's per-LLC core
+    // Pass the preset's Topology directly (192cpu-11llc-smt's per-LLC core
     // counts must survive into the guest CPUID; the TopologyJson wire
     // shape would drop them).
     let topology = preset.topology;
+    let memory_min_mib =
+        super::runtime::verifier_preset_memory_min_mib(topology.total_cpus(), preset.memory_mib);
     let sched_args: Vec<String> = sched.sched_args.iter().map(|s| s.to_string()).collect();
 
     // Raw mode is opt-in via the dispatcher's --raw flag, plumbed
@@ -2253,12 +2265,13 @@ fn run_verifier_cell_inner(
     // `cmd.env(KTSTR_VERIFIER_RAW_ENV, "1")` setter.
     let raw = std::env::var_os(crate::KTSTR_VERIFIER_RAW_ENV).is_some();
 
-    match crate::verifier::collect_verifier_output(
+    match crate::verifier::collect_verifier_output_with_memory_min(
         &sched_bin,
         &ktstr_bin,
         &kernel_path,
         &sched_args,
         topology,
+        memory_min_mib,
         preset.forced_cpu_budget,
     ) {
         Ok(result) => {

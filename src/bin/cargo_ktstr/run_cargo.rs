@@ -554,8 +554,7 @@ fn run_cargo_sub(
     // run, propagate it as the conventional 128+signal exit (130 / 143)
     // now that teardown has completed. Drop the guard first so the signal
     // is back at its prior disposition before we re-raise.
-    let caught = interrupt_guard.interrupted();
-    drop(interrupt_guard);
+    let caught = crate::interrupt::restore_and_caught(interrupt_guard);
     if let Some(sig) = caught {
         crate::interrupt::reraise(sig);
     }
@@ -647,6 +646,115 @@ pub(crate) fn prebuild_no_run_args(args: &[String]) -> Vec<String> {
     v
 }
 
+/// Build the verifier warm-up argv and force Cargo's machine-readable stream.
+///
+/// Nextest forwards Cargo JSON to stdout only when
+/// `--cargo-message-format` requests it. The verifier parent needs that stream
+/// to capture the exact test executables selected by the already-scoped warm
+/// build; probing through a second `cargo build --tests` would lose package and
+/// feature scoping. Any user-supplied cargo message format is replaced for the
+/// warm-up only (the real run keeps the user's output choice), and the option
+/// is inserted before an inner `--`.
+pub(crate) fn prebuild_no_run_json_args(args: &[String]) -> Vec<String> {
+    let warmed = prebuild_no_run_args(args);
+    let separator = warmed
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(warmed.len());
+    let mut out = Vec::with_capacity(warmed.len() + 1);
+    let mut index = 0;
+    while index < separator {
+        let argument = &warmed[index];
+        if argument == "--cargo-message-format" {
+            // Drop its separate value as well. A missing value remains Cargo's
+            // error on the real command; the warm-up still gets a valid
+            // forced format so artifact discovery is deterministic.
+            index += 2;
+            continue;
+        }
+        if argument.starts_with("--cargo-message-format=") {
+            index += 1;
+            continue;
+        }
+        out.push(argument.clone());
+        index += 1;
+    }
+    out.push("--cargo-message-format=json-render-diagnostics".to_string());
+    out.extend_from_slice(&warmed[separator..]);
+    out
+}
+
+/// Parse the Cargo JSON stream emitted by a nextest no-run warm-up and return
+/// the exact test executables it built.
+///
+/// Integration tests identify themselves with target kind `test`; unit-test
+/// harnesses built from lib/bin targets carry `profile.test = true`. Both can
+/// link distributed scheduler declarations and therefore must be probed.
+fn test_executables_from_cargo_json(stdout: &[u8]) -> Vec<PathBuf> {
+    let mut bins = Vec::new();
+    for line in stdout.split(|byte| *byte == b'\n') {
+        let Ok(message) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        if message.get("reason").and_then(|value| value.as_str()) != Some("compiler-artifact") {
+            continue;
+        }
+        let Some(executable) = message.get("executable").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let target_is_test = message
+            .get("target")
+            .and_then(|target| target.get("kind"))
+            .and_then(|kind| kind.as_array())
+            .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("test")));
+        let profile_is_test = message
+            .get("profile")
+            .and_then(|profile| profile.get("test"))
+            .and_then(|test| test.as_bool())
+            == Some(true);
+        if target_is_test || profile_is_test {
+            bins.push(PathBuf::from(executable));
+        }
+    }
+    bins.sort();
+    bins.dedup();
+    bins
+}
+
+/// Acquire and apply the shared compile reservation to one warm command.
+fn prepare_reserved_prebuild(
+    warm_cmd: &mut Command,
+    cli_label: &str,
+) -> Result<ktstr::cli::BuildReservation, String> {
+    let cpu_cap = ktstr::cli::CpuCap::resolve(None)
+        .map_err(|e| format!("{cli_label}: resolve harness-build CPU cap: {e:#}"))?;
+    let reservation = ktstr::cli::acquire_build_reservation_waiting(cli_label, cpu_cap)
+        .map_err(|e| format!("{cli_label}: acquire harness-build reservation: {e:#}"))?;
+    if let Some(jobs) = reservation.make_jobs() {
+        warm_cmd.env("CARGO_BUILD_JOBS", jobs.to_string());
+    }
+    Ok(reservation)
+}
+
+/// Run one compile command under the shared LLC/cgroup build reservation and
+/// capture its Cargo JSON stdout while leaving diagnostics attached to the
+/// operator's stderr.
+pub(crate) fn run_reserved_build_output(
+    mut command: Command,
+    cli_label: &str,
+    description: &str,
+) -> Result<std::process::Output, String> {
+    let reservation = prepare_reserved_prebuild(&mut command, cli_label)?;
+    tracing::debug!("{cli_label}: reserved {description}");
+    let output = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .map_err(|error| format!("{cli_label}: spawn {description}: {error}"))?;
+    drop(reservation);
+    Ok(output)
+}
+
 /// Run `warm_cmd` (a `cargo … --no-run` compile-only invocation) under a
 /// machine-global LLC flock reservation + cgroup-v2 cpuset sandbox, then
 /// release BOTH before returning so the caller's test-running phase
@@ -665,24 +773,10 @@ pub(crate) fn prebuild_no_run_args(args: &[String]) -> Vec<String> {
 /// `pub(crate)`: shared with the verifier dispatcher's warm-up
 /// (`verifier.rs`), whose sweep is the primary colocated-CI workload.
 pub(crate) fn run_reserved_prebuild(mut warm_cmd: Command, cli_label: &str) -> Result<(), String> {
-    // `cargo ktstr test` has no `--cpu-cap` flag; resolve from
-    // `KTSTR_CPU_CAP` (env), else `None` → the same 30%-of-allowed default
-    // a cap-less kernel build uses. acquire_build_reservation_waiting enforces
-    // the `KTSTR_BYPASS_LLC_LOCKS` + cap conflict identically.
-    let cpu_cap = ktstr::cli::CpuCap::resolve(None)
-        .map_err(|e| format!("{cli_label}: resolve harness-build CPU cap: {e:#}"))?;
     // RAII: `_reservation`'s cgroup sandbox drops before its LLC flocks per
     // `BuildReservation` field order; both are released when this fn
     // returns, ahead of the combined build+run the caller then spawns.
-    let reservation = ktstr::cli::acquire_build_reservation_waiting(cli_label, cpu_cap)
-        .map_err(|e| format!("{cli_label}: acquire harness-build reservation: {e:#}"))?;
-    // `CARGO_BUILD_JOBS` is the harness-compile analog of the kernel
-    // build's `make -jN`: cap parallel rustc to the reserved CPU count so
-    // `nproc`-many rustc don't oversubscribe the confined cpuset. `None`
-    // (bypass / degraded sysfs → no plan) leaves cargo on its own default.
-    if let Some(jobs) = reservation.make_jobs() {
-        warm_cmd.env("CARGO_BUILD_JOBS", jobs.to_string());
-    }
+    let _reservation = prepare_reserved_prebuild(&mut warm_cmd, cli_label)?;
     tracing::debug!("{cli_label}: reserved harness pre-build (cargo … --no-run)");
     let status = warm_cmd
         .status()
@@ -696,7 +790,42 @@ pub(crate) fn run_reserved_prebuild(mut warm_cmd: Command, cli_label: &str) -> R
         ));
     }
     Ok(())
-    // `reservation` drops here → cgroup rmdir, then LLC flocks release.
+    // `_reservation` drops here → cgroup rmdir, then LLC flocks release.
+}
+
+/// Reserved warm-up variant used by verifier discovery.
+///
+/// Captures stdout (Cargo JSON) while inheriting stderr so normal Cargo and
+/// rustc diagnostics remain visible, then returns the exact executable paths
+/// selected by nextest's scoped build. The compile reservation is released
+/// before the caller probes those binaries or starts verifier cells.
+pub(crate) fn run_reserved_prebuild_collect_test_bins(
+    warm_cmd: Command,
+    cli_label: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let output = run_reserved_build_output(
+        warm_cmd,
+        cli_label,
+        "harness pre-build with Cargo artifact discovery",
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "{cli_label}: reserved pre-build failed ({}) — see cargo output above",
+            output
+                .status
+                .code()
+                .map_or("signal".to_string(), |code| code.to_string()),
+        ));
+    }
+    let bins = test_executables_from_cargo_json(&output.stdout);
+    if bins.is_empty() {
+        return Err(format!(
+            "{cli_label}: reserved nextest pre-build emitted no test executable \
+             artifacts in its Cargo JSON stream; cannot discover linked \
+             declare_scheduler! registrations"
+        ));
+    }
+    Ok(bins)
 }
 
 /// Precompute cast analysis for the built scheduler binaries so the
@@ -2366,6 +2495,48 @@ mod tests {
                 "--max-fail",
                 "3",
             ]),
+        );
+    }
+
+    #[test]
+    fn prebuild_json_args_force_format_before_inner_separator() {
+        let args = strs(&[
+            "--cargo-message-format",
+            "human",
+            "--features",
+            "integration",
+            "--",
+            "--cargo-message-format=json",
+        ]);
+        assert_eq!(
+            prebuild_no_run_json_args(&args),
+            strs(&[
+                "--features",
+                "integration",
+                "--no-run",
+                "--cargo-message-format=json-render-diagnostics",
+                "--",
+                "--cargo-message-format=json",
+            ]),
+        );
+    }
+
+    #[test]
+    fn cargo_json_test_executable_filter_sorts_and_deduplicates() {
+        let stream = br#"
+{"reason":"compiler-artifact","executable":"/tmp/z-unit","target":{"kind":["lib"]},"profile":{"test":true}}
+{"reason":"compiler-artifact","executable":"/tmp/a-integration","target":{"kind":["test"]},"profile":{"test":false}}
+{"reason":"compiler-artifact","executable":"/tmp/z-unit","target":{"kind":["bin"]},"profile":{"test":true}}
+{"reason":"compiler-artifact","executable":"/tmp/not-a-test","target":{"kind":["bin"]},"profile":{"test":false}}
+{"reason":"build-finished","success":true}
+nextest non-json output is ignored
+"#;
+        assert_eq!(
+            test_executables_from_cargo_json(stream),
+            vec![
+                PathBuf::from("/tmp/a-integration"),
+                PathBuf::from("/tmp/z-unit"),
+            ],
         );
     }
 

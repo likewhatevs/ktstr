@@ -33,12 +33,12 @@ is the user-visible label in nextest output, sidecars, and the CLI.
 Rename either independently. Once declared, the scheduler shows up
 in the verifier sweep's cells with no further wiring:
 
-<!-- captured: cargo ktstr verifier --kernel 7.0 -- --test kaslr_axis_e2e tiny-1llc tiny-2llc odd-3llc smt-2llc | ktstr 0.23.0 | kernel 7.0.14 -->
+<!-- captured: cargo ktstr verifier --kernel 7.0 -- --test kaslr_axis_e2e 4cpu-1llc-nosmt 4cpu-2llc-nosmt 9cpu-3llc-nosmt 8cpu-2llc-smt | ktstr 0.23.0 | kernel 7.0.14 -->
 ```text
  Nextest run ID 3522bea7-... with nextest profile: default
     Starting 4 tests across 1 binary (55 tests skipped)
-        PASS [  12.406s] (1/4) ktstr::kaslr_axis_e2e verifier/ktstr_sched/kernel_7_0/odd-3llc
-        PASS [  12.432s] (2/4) ktstr::kaslr_axis_e2e verifier/ktstr_sched/kernel_7_0/smt-2llc
+        PASS [  12.406s] (1/4) ktstr::kaslr_axis_e2e verifier/ktstr_sched/kernel_7_0/9cpu-3llc-nosmt
+        PASS [  12.432s] (2/4) ktstr::kaslr_axis_e2e verifier/ktstr_sched/kernel_7_0/8cpu-2llc-smt
 ...
 ```
 

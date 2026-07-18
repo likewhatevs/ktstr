@@ -644,7 +644,7 @@ fn assert_per_step_cpuset_changes_metrics(result: &VmResult) -> Result<()> {
     // didn't push the DSQ on either side, so the metric carries no
     // signal. Distinct from "both equal at a positive value" which
     // would indicate the per-step cpuset never reached the kernel
-    // (failure class). On a small topology (e.g. tiny-2llc: 4 CPUs
+    // (failure class). On a small topology (e.g. 4cpu-2llc-nosmt: 4 CPUs
     // / 2 LLCs / 4 workers) the SpinWait workload may not crowd
     // either cpuset enough to register depth > 0, and we don't
     // want a zero-signal observation to red-flag the test.

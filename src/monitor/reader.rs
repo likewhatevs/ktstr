@@ -1640,9 +1640,10 @@ pub(crate) fn resolve_event_pcpu_pas(
 /// stuck CPUs (vCPU running but clock stuck) from host preemption
 /// (vCPU not scheduled, clock can't advance).
 pub(crate) struct VcpuTiming {
-    /// pthread_t handles for each vCPU, indexed by vCPU ID.
-    /// Used with `pthread_getcpuclockid()` + `clock_gettime()`.
-    pub pthreads: Vec<libc::pthread_t>,
+    /// CPU clock IDs for each vCPU, indexed by vCPU ID. Resolved exactly once
+    /// from the live pthread handles when the monitor is created; the hot
+    /// sampling loop only calls `clock_gettime()`.
+    clock_ids: Vec<Option<libc::clockid_t>>,
     /// Shared contention recorder. The monitor only feeds its O(1) CPU-PSI
     /// interval sampler; lifecycle dispatch owns the rare O(vCPU) schedstat
     /// boundary snapshots. `None` in pthread-clock-only unit fixtures.
@@ -1650,6 +1651,41 @@ pub(crate) struct VcpuTiming {
 }
 
 impl VcpuTiming {
+    /// Resolve each vCPU pthread's CPU clock once for this monitor lifetime.
+    ///
+    /// POSIX pthread APIs return their error number directly rather than
+    /// setting `errno`, so a failed `pthread_getcpuclockid` is reported from
+    /// `ret` itself. Keeping the resulting clock IDs avoids an O(vCPU)
+    /// pthread lookup on every monitor tick.
+    pub(crate) fn from_pthreads(
+        pthreads: Vec<libc::pthread_t>,
+        contention_recorder: Option<Arc<crate::vmm::freeze_coord::ContentionWitnessRecorder>>,
+    ) -> Self {
+        let clock_ids = pthreads
+            .into_iter()
+            .enumerate()
+            .map(|(vcpu, pt)| {
+                let mut clock_id: libc::clockid_t = 0;
+                let ret = unsafe { libc::pthread_getcpuclockid(pt, &mut clock_id) };
+                if ret == 0 {
+                    Some(clock_id)
+                } else {
+                    tracing::warn!(
+                        vcpu,
+                        errno = ret,
+                        error = %std::io::Error::from_raw_os_error(ret),
+                        "pthread_getcpuclockid failed; stuck gating unavailable for this vCPU"
+                    );
+                    None
+                }
+            })
+            .collect();
+        Self {
+            clock_ids,
+            contention_recorder,
+        }
+    }
+
     /// Read CPU time for each vCPU thread. Returns `Some(ns)` per vCPU
     /// on success, `None` when the per-thread clock could not be read.
     ///
@@ -1668,31 +1704,16 @@ impl VcpuTiming {
     /// `reported_err`) naming the failing syscall + errno so a user
     /// can diagnose why stuck gating has degraded to "no data".
     fn read_cpu_times(&self, reported_err: &mut [bool]) -> Vec<Option<u64>> {
-        self.pthreads
+        self.clock_ids
             .iter()
             .enumerate()
-            .map(|(vcpu, &pt)| {
-                let mut clk: libc::clockid_t = 0;
-                let ret = unsafe { libc::pthread_getcpuclockid(pt, &mut clk) };
-                if ret != 0 {
-                    if let Some(slot) = reported_err.get_mut(vcpu)
-                        && !*slot
-                    {
-                        tracing::warn!(
-                            vcpu,
-                            ret,
-                            errno = std::io::Error::last_os_error().raw_os_error(),
-                            "pthread_getcpuclockid failed; stuck gating unavailable for this vCPU"
-                        );
-                        *slot = true;
-                    }
-                    return None;
-                }
+            .map(|(vcpu, clock_id)| {
+                let &clock_id = clock_id.as_ref()?;
                 let mut ts = libc::timespec {
                     tv_sec: 0,
                     tv_nsec: 0,
                 };
-                let ret = unsafe { libc::clock_gettime(clk, &mut ts) };
+                let ret = unsafe { libc::clock_gettime(clock_id, &mut ts) };
                 if ret != 0 {
                     if let Some(slot) = reported_err.get_mut(vcpu)
                         && !*slot
@@ -3380,7 +3401,7 @@ pub(crate) fn monitor_loop(
     // See [`crate::vmm::freeze_coord::watchdog_step::CpuTrickleTracker`].
     let mut trickle_tracker = crate::vmm::freeze_coord::watchdog_step::CpuTrickleTracker::new();
     let mut vcpu_timing_err_reported: Vec<bool> = vcpu_timing
-        .map(|vt| vec![false; vt.pthreads.len()])
+        .map(|vt| vec![false; vt.clock_ids.len()])
         .unwrap_or_default();
     let shm_entries: Vec<crate::vmm::wire::ShmEntry> = Vec::new();
     let mut watchdog_observation: Option<super::WatchdogObservation> = None;
@@ -4491,6 +4512,29 @@ mod tests {
     use std::os::unix::thread::JoinHandleExt;
 
     const THRESHOLD_NS: u64 = 10_000_000;
+
+    /// A monitor resolves its pthread CPU clocks once, then every sample reads
+    /// the cached IDs directly. Pin the live-thread success path and the
+    /// monotonic CPU-time contract without involving guest memory.
+    #[test]
+    fn vcpu_timing_caches_clock_ids_for_monitor_lifetime() {
+        let timing = VcpuTiming::from_pthreads(vec![unsafe { libc::pthread_self() }], None);
+        assert_eq!(timing.clock_ids.len(), 1);
+        assert!(
+            timing.clock_ids[0].is_some(),
+            "the current live pthread must expose a CPU clock"
+        );
+
+        let mut reported_err = vec![false];
+        let first =
+            timing.read_cpu_times(&mut reported_err)[0].expect("cached clock ID must be readable");
+        std::hint::black_box((0..10_000).fold(0usize, |acc, n| acc.wrapping_add(n)));
+        let second = timing.read_cpu_times(&mut reported_err)[0]
+            .expect("cached clock ID must remain readable");
+
+        assert!(second >= first, "pthread CPU clocks are monotonic");
+        assert!(!reported_err[0]);
+    }
 
     /// `select_cr3` prefers the live `cr3_cache` value (masked `& !0xFFF`,
     /// preserving bit 12 — the guest is mitigations=off so bit 12 is a real
@@ -6797,10 +6841,7 @@ mod tests {
             .unwrap();
 
         let pt = sleeper.as_pthread_t() as libc::pthread_t;
-        let vcpu_timing = VcpuTiming {
-            pthreads: vec![pt],
-            contention_recorder: None,
-        };
+        let vcpu_timing = VcpuTiming::from_pthreads(vec![pt], None);
 
         let virtio_con = test_virtio_console();
         let trigger = DumpTrigger {
@@ -6885,10 +6926,7 @@ mod tests {
             .unwrap();
 
         let pt = spinner.as_pthread_t() as libc::pthread_t;
-        let vcpu_timing = VcpuTiming {
-            pthreads: vec![pt],
-            contention_recorder: None,
-        };
+        let vcpu_timing = VcpuTiming::from_pthreads(vec![pt], None);
 
         let virtio_con = test_virtio_console();
         let trigger = DumpTrigger {
@@ -8845,10 +8883,7 @@ mod tests {
             use std::os::unix::thread::JoinHandleExt;
             spinner.as_pthread_t() as libc::pthread_t
         };
-        let vcpu_timing = VcpuTiming {
-            pthreads: vec![pt],
-            contention_recorder: None,
-        };
+        let vcpu_timing = VcpuTiming::from_pthreads(vec![pt], None);
 
         let ledger = ProgressLedger::default();
         let cfg = MonitorConfig {

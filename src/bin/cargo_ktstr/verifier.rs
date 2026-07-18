@@ -54,8 +54,9 @@
 //! resolve_test_kernel single-kernel fallback that would silently
 //! run a cell against an unrelated kernel).
 
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cargo_metadata::semver::Version;
@@ -72,12 +73,69 @@ use crate::kernel::{
     encode_kernel_list, path_kernel_label, resolve_kernel_image, resolve_kernel_set,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiscoverSchedulerRequest {
+    scheduler: String,
+    package: String,
+    manifest_dir: String,
+    workspace_root: PathBuf,
+    package_id: PackageId,
+}
+
+#[derive(Debug)]
+struct WorkspaceSchedulerBuild {
+    root: PathBuf,
+    /// package name -> Cargo package ID
+    packages: BTreeMap<String, PackageId>,
+    requests: Vec<DiscoverSchedulerRequest>,
+}
+
+/// Own one verifier result directory from creation through final report
+/// rendering. `Drop` is the error-path cleanup: once this guard exists, any
+/// later `?` (harness warm-up, declaration probe, scheduler prebuild,
+/// snapshot, manifest write, or nextest spawn) removes the partially prepared
+/// run instead of orphaning it.
+struct VerifierResultDir {
+    path: PathBuf,
+    #[cfg(test)]
+    cleanup_count: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl VerifierResultDir {
+    fn create(temp_root: &Path) -> Result<Self, String> {
+        sweep_stale_result_dirs(temp_root);
+        let path = temp_root.join(format!("ktstr-verifier-results-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path)
+            .map_err(|error| format!("create verifier result dir {}: {error}", path.display()))?;
+        Ok(Self {
+            path,
+            #[cfg(test)]
+            cleanup_count: None,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for VerifierResultDir {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(count) = &self.cleanup_count {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Sweep verifier result dirs orphaned by interrupted prior runs.
 ///
-/// The result dir is keyed on the dispatcher pid, so a run killed before
-/// its post-run `remove_dir_all` (Ctrl-C / SIGKILL / crash) orphans its
-/// dir — and nothing reclaims it later, since the per-run wipe only
-/// targets the CURRENT pid. This runs at startup and removes every
+/// The result dir is keyed on the dispatcher pid. The outer interrupt guard
+/// lets SIGINT/SIGTERM reach `VerifierResultDir::drop`, but SIGKILL and
+/// abort-style crashes cannot run Rust cleanup and therefore orphan the dir.
+/// This runs at startup and removes every
 /// `ktstr-verifier-results-<pid>` dir whose owning pid is no longer alive
 /// (`kill(pid, 0)` -> ESRCH), mirroring `cleanup_stale_shm`'s next-run
 /// reclamation. A dir owned by a LIVE pid is a concurrent verifier run and
@@ -569,6 +627,539 @@ fn build_scoped_nextest_args(
     args
 }
 
+fn probe_scheduler_declarations(
+    test_bins: &[PathBuf],
+) -> Result<Vec<ktstr::test_support::SchedulerListEntry>, String> {
+    if test_bins.is_empty() {
+        return Ok(Vec::new());
+    }
+    let per_binary: Vec<Vec<ktstr::test_support::SchedulerListEntry>> =
+        match crate::misc::probe_collect_from_bins(
+            test_bins,
+            |bin| {
+                let mut command = Command::new(bin);
+                command.arg("--ktstr-list-schedulers");
+                command
+            },
+            |bin, output| {
+                serde_json::from_slice(&output.stdout).map_err(|error| {
+                    format!(
+                        "parse --ktstr-list-schedulers output from {}: {error}",
+                        bin.display()
+                    )
+                })
+            },
+        ) {
+            Ok(entries) => entries,
+            // None of the warmed executables linked the scheduler-list ctor.
+            // Preserve verifier's established zero-cell diagnosis instead of
+            // turning "no declare_scheduler!" into a probe setup failure.
+            Err(crate::misc::ProbeError::Miss(_)) => Vec::new(),
+            Err(error @ crate::misc::ProbeError::Setup(_)) => {
+                return Err(format!(
+                    "probe warmed test binaries for declared schedulers: {error:?}"
+                ));
+            }
+        };
+    Ok(per_binary.into_iter().flatten().collect())
+}
+
+/// Apply the scheduler-name filter and child-emission eligibility before
+/// comparing declarations. Every surviving name must have one full
+/// [`SchedulerJson`](ktstr::test_support::SchedulerJson) meaning; exact
+/// duplicates from multiple warmed test binaries collapse, while any
+/// differing field is an ambiguity because all cells share the same
+/// `verifier/<scheduler>/...` namespace.
+fn selected_emitting_scheduler_declarations(
+    declarations: &[ktstr::test_support::SchedulerListEntry],
+    scheduler_filter: Option<&str>,
+    mut emits: impl FnMut(&ktstr::test_support::SchedulerJson) -> Result<bool, String>,
+) -> Result<Vec<ktstr::test_support::SchedulerJson>, String> {
+    let mut identities: BTreeMap<String, ktstr::test_support::SchedulerJson> = BTreeMap::new();
+    for entry in declarations {
+        let scheduler = &entry.scheduler;
+        if scheduler_filter.is_some_and(|wanted| scheduler.name != wanted) {
+            continue;
+        }
+        if !emits(scheduler)? {
+            continue;
+        }
+        if let Some(previous) = identities.get(&scheduler.name) {
+            if previous != scheduler {
+                return Err(format!(
+                    "conflicting declarations for scheduler {:?}: first {previous:?}, \
+                     later {scheduler:?}; a verifier cell name must identify exactly one \
+                     full scheduler declaration",
+                    scheduler.name,
+                ));
+            }
+        } else {
+            identities.insert(scheduler.name.clone(), scheduler.clone());
+        }
+    }
+    Ok(identities.into_values().collect())
+}
+
+fn scheduler_profile_for_run(cli_profile: Option<&str>) -> String {
+    match cli_profile {
+        Some(profile) if !profile.is_empty() => profile.to_string(),
+        Some(_) => "release".to_string(),
+        None => ktstr::scheduler_profile_name(),
+    }
+}
+
+fn declaring_workspace(
+    scheduler: &str,
+    package: &str,
+    manifest_dir: &str,
+) -> Result<Option<(PathBuf, PackageId)>, String> {
+    let manifest_dir = Path::new(manifest_dir);
+    if !manifest_dir.is_dir() {
+        return Err(format!(
+            "scheduler {:?} declaration manifest directory does not exist or is not a \
+             directory: {}",
+            scheduler,
+            manifest_dir.display(),
+        ));
+    }
+    let mut command = cargo_metadata::MetadataCommand::new();
+    command
+        .cargo_path("cargo")
+        .current_dir(manifest_dir)
+        .no_deps();
+    let metadata = command.exec().map_err(|error| {
+        format!(
+            "cargo metadata from scheduler {:?} manifest directory {} failed: {error}",
+            scheduler,
+            manifest_dir.display(),
+        )
+    })?;
+    let member_ids: HashSet<&PackageId> = metadata.workspace_members.iter().collect();
+    let package = metadata
+        .packages
+        .iter()
+        .find(|candidate| member_ids.contains(&candidate.id) && candidate.name.as_str() == package);
+    let Some(package) = package else {
+        // Match child listing: fixture/nonmember Discover packages emit no
+        // cells, so they are absent from both conflict detection and builds.
+        return Ok(None);
+    };
+    let workspace_root =
+        std::fs::canonicalize(metadata.workspace_root.as_std_path()).map_err(|error| {
+            format!(
+                "canonicalize scheduler {:?} workspace root {}: {error}",
+                scheduler, metadata.workspace_root,
+            )
+        })?;
+    Ok(Some((workspace_root, package.id.clone())))
+}
+
+/// Mirror every parent-visible child-listing gate before conflict detection or
+/// scheduler build planning. Workspace metadata resolutions are cached by raw
+/// declaring directory + package so exact declarations across test binaries
+/// run Cargo metadata once.
+fn selected_discover_requests(
+    declarations: &[ktstr::test_support::SchedulerListEntry],
+    scheduler_filter: Option<&str>,
+    resolved_kernels: &[(String, String)],
+    presets: &[ktstr::gauntlet::TopoPreset],
+) -> Result<Vec<DiscoverSchedulerRequest>, String> {
+    let mut workspaces: BTreeMap<(String, String), Option<(PathBuf, PackageId)>> = BTreeMap::new();
+    let selected =
+        selected_emitting_scheduler_declarations(declarations, scheduler_filter, |scheduler| {
+            use ktstr::test_support::BinaryKindJson;
+
+            if scheduler.name.contains('/') {
+                return Ok(false);
+            }
+            if matches!(
+                scheduler.binary_kind,
+                BinaryKindJson::Eevdf | BinaryKindJson::KernelBuiltin
+            ) {
+                return Ok(false);
+            }
+            if !scheduler.has_accepted_verifier_cell(
+                resolved_kernels
+                    .iter()
+                    .map(|(label, sanitized)| (label.as_str(), sanitized.as_str())),
+                presets,
+            ) {
+                return Ok(false);
+            }
+            match &scheduler.binary_kind {
+                BinaryKindJson::Path(path) => Ok(Path::new(path).exists()),
+                BinaryKindJson::Discover(package) => {
+                    if scheduler.manifest_dir.is_empty() {
+                        return Err(format!(
+                            "declared scheduler {:?} (package {:?}) did not report its manifest \
+                             directory; rebuild its test binary with the current ktstr before \
+                             running cargo ktstr verifier",
+                            scheduler.name, package,
+                        ));
+                    }
+                    let key = (scheduler.manifest_dir.clone(), package.clone());
+                    if !workspaces.contains_key(&key) {
+                        let resolution =
+                            declaring_workspace(&scheduler.name, package, &scheduler.manifest_dir)?;
+                        workspaces.insert(key.clone(), resolution);
+                    }
+                    Ok(workspaces
+                        .get(&key)
+                        .expect("workspace resolution inserted above")
+                        .is_some())
+                }
+                BinaryKindJson::Eevdf | BinaryKindJson::KernelBuiltin => Ok(false),
+            }
+        })?;
+
+    let mut requests = Vec::new();
+    for scheduler in selected {
+        let ktstr::test_support::BinaryKindJson::Discover(package) = scheduler.binary_kind else {
+            continue;
+        };
+        let key = (scheduler.manifest_dir.clone(), package.clone());
+        let (workspace_root, package_id) = workspaces
+            .get(&key)
+            .cloned()
+            .flatten()
+            .expect("emitting Discover declaration has a member resolution");
+        requests.push(DiscoverSchedulerRequest {
+            scheduler: scheduler.name,
+            package,
+            manifest_dir: scheduler.manifest_dir,
+            workspace_root,
+            package_id,
+        });
+    }
+    requests.sort_by(|left, right| {
+        (&left.scheduler, &left.package, &left.manifest_dir).cmp(&(
+            &right.scheduler,
+            &right.package,
+            &right.manifest_dir,
+        ))
+    });
+    Ok(requests)
+}
+
+fn plan_workspace_scheduler_builds(
+    requests: &[DiscoverSchedulerRequest],
+) -> Result<Vec<WorkspaceSchedulerBuild>, String> {
+    let mut groups: BTreeMap<PathBuf, WorkspaceSchedulerBuild> = BTreeMap::new();
+    for request in requests {
+        let root = request.workspace_root.clone();
+        let package_id = request.package_id.clone();
+        let group = groups
+            .entry(root.clone())
+            .or_insert_with(|| WorkspaceSchedulerBuild {
+                root,
+                packages: BTreeMap::new(),
+                requests: Vec::new(),
+            });
+        if let Some(previous) = group
+            .packages
+            .insert(request.package.clone(), package_id.clone())
+            && previous != package_id
+        {
+            return Err(format!(
+                "workspace {} resolved package {:?} to conflicting Cargo package IDs: \
+                 {previous} and {package_id}",
+                group.root.display(),
+                request.package,
+            ));
+        }
+        group.requests.push(request.clone());
+    }
+    Ok(groups.into_values().collect())
+}
+
+fn map_scheduler_artifacts(
+    stdout: &[u8],
+    group: &WorkspaceSchedulerBuild,
+) -> Result<BTreeMap<String, PathBuf>, String> {
+    let expected_by_id: HashMap<&PackageId, &str> = group
+        .packages
+        .iter()
+        .map(|(name, id)| (id, name.as_str()))
+        .collect();
+    let mut artifacts: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for message in cargo_metadata::Message::parse_stream(BufReader::new(stdout)) {
+        let message = message.map_err(|error| {
+            format!(
+                "parse cargo build JSON from workspace {}: {error}",
+                group.root.display()
+            )
+        })?;
+        let cargo_metadata::Message::CompilerArtifact(artifact) = message else {
+            continue;
+        };
+        if !artifact.target.is_bin() || artifact.profile.test {
+            continue;
+        }
+        let Some(package) = expected_by_id.get(&artifact.package_id) else {
+            continue;
+        };
+        let Some(executable) = artifact.executable else {
+            continue;
+        };
+        let path = PathBuf::from(executable.as_str());
+        if let Some(previous) = artifacts.insert((*package).to_string(), path.clone()) {
+            return Err(format!(
+                "scheduler package {:?} in workspace {} emitted multiple [[bin]] \
+                 executables ({} and {}); Discover requires one unambiguous binary",
+                package,
+                group.root.display(),
+                previous.display(),
+                path.display(),
+            ));
+        }
+    }
+    for package in group.packages.keys() {
+        if !artifacts.contains_key(package) {
+            return Err(format!(
+                "cargo build succeeded but emitted no non-test [[bin]] executable for \
+                 scheduler package {:?} in workspace {}",
+                package,
+                group.root.display(),
+            ));
+        }
+    }
+    Ok(artifacts)
+}
+
+fn build_scheduler_workspace(
+    group: &WorkspaceSchedulerBuild,
+    profile: &str,
+) -> Result<BTreeMap<String, PathBuf>, String> {
+    let mut command = Command::new("cargo");
+    command.current_dir(&group.root).args([
+        "build",
+        "--message-format=json-render-diagnostics",
+        "--profile",
+        profile,
+    ]);
+    for package in group.packages.keys() {
+        command.args(["-p", package]);
+    }
+    let output = crate::run_cargo::run_reserved_build_output(
+        command,
+        "cargo ktstr verifier",
+        "scheduler workspace pre-build",
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "scheduler prebuild in workspace {} failed ({}) — see Cargo output above",
+            group.root.display(),
+            output
+                .status
+                .code()
+                .map_or("signal".to_string(), |code| code.to_string()),
+        ));
+    }
+    map_scheduler_artifacts(&output.stdout, group)
+}
+
+/// Copy one Cargo-emitted scheduler executable into the parent-owned result
+/// directory through an already-open source descriptor.
+///
+/// Opening first pins the source inode against a concurrent Cargo atomic
+/// replacement. The destination is populated under a private temporary name,
+/// made read-only executable, synced, and renamed into place atomically; cells
+/// never observe a partial file and the manifest never points back into a
+/// mutable Cargo target directory.
+fn snapshot_scheduler_artifact(
+    source_path: &Path,
+    result_dir: &Path,
+    ordinal: usize,
+) -> Result<PathBuf, String> {
+    let source = std::fs::File::open(source_path).map_err(|error| {
+        format!(
+            "open scheduler artifact {} for immutable snapshot: {error}",
+            source_path.display()
+        )
+    })?;
+    snapshot_scheduler_artifact_from_open_file(source, source_path, result_dir, ordinal)
+}
+
+fn snapshot_scheduler_artifact_from_open_file(
+    mut source: std::fs::File,
+    source_path: &Path,
+    result_dir: &Path,
+    ordinal: usize,
+) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let source_metadata = source.metadata().map_err(|error| {
+        format!(
+            "stat opened scheduler artifact {}: {error}",
+            source_path.display()
+        )
+    })?;
+    if !source_metadata.is_file() {
+        return Err(format!(
+            "scheduler artifact is not a file: {}",
+            source_path.display()
+        ));
+    }
+    if source_metadata.permissions().mode() & 0o111 == 0 {
+        return Err(format!(
+            "scheduler artifact is not executable: {}",
+            source_path.display()
+        ));
+    }
+
+    let final_path = result_dir.join(format!("scheduler-executable-{ordinal}"));
+    let mut temporary = tempfile::NamedTempFile::new_in(result_dir).map_err(|error| {
+        format!(
+            "create temporary scheduler snapshot in {}: {error}",
+            result_dir.display()
+        )
+    })?;
+    std::io::copy(&mut source, temporary.as_file_mut()).map_err(|error| {
+        format!(
+            "copy scheduler artifact {} into immutable snapshot: {error}",
+            source_path.display()
+        )
+    })?;
+    temporary
+        .as_file_mut()
+        .flush()
+        .map_err(|error| format!("flush scheduler snapshot: {error}"))?;
+    temporary
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o555))
+        .map_err(|error| format!("make scheduler snapshot read-only executable: {error}"))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| format!("sync scheduler snapshot: {error}"))?;
+    temporary.persist(&final_path).map_err(|error| {
+        format!(
+            "atomically install scheduler snapshot {}: {}",
+            final_path.display(),
+            error.error,
+        )
+    })?;
+    std::fs::canonicalize(&final_path).map_err(|error| {
+        format!(
+            "canonicalize scheduler snapshot {}: {error}",
+            final_path.display()
+        )
+    })
+}
+
+fn prebuild_scheduler_manifest(
+    declarations: &[ktstr::test_support::SchedulerListEntry],
+    scheduler_filter: Option<&str>,
+    profile: &str,
+    resolved_kernels: &[(String, String)],
+    presets: &[ktstr::gauntlet::TopoPreset],
+    result_dir: &Path,
+    interrupt_guard: &crate::interrupt::InterruptGuard,
+) -> Result<ktstr::verifier::VerifierSchedulerArtifactManifest, String> {
+    if interrupt_guard.interrupted().is_some() {
+        return Err("cargo ktstr verifier interrupted before scheduler prebuild".to_string());
+    }
+    let requests =
+        selected_discover_requests(declarations, scheduler_filter, resolved_kernels, presets)?;
+    let groups = plan_workspace_scheduler_builds(&requests)?;
+    let package_count: usize = groups.iter().map(|group| group.packages.len()).sum();
+    if package_count > 0 {
+        eprintln!(
+            "cargo ktstr verifier: prebuilding {package_count} scheduler package(s) \
+             in {} workspace batch(es) with profile {profile:?}",
+            groups.len(),
+        );
+    }
+    let mut entries = Vec::with_capacity(requests.len());
+    let mut snapshots: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+    for group in &groups {
+        if interrupt_guard.interrupted().is_some() {
+            return Err("cargo ktstr verifier interrupted during scheduler prebuild".to_string());
+        }
+        let artifacts = build_scheduler_workspace(group, profile)?;
+        if interrupt_guard.interrupted().is_some() {
+            return Err("cargo ktstr verifier interrupted during scheduler prebuild".to_string());
+        }
+        for request in &group.requests {
+            let emitted = artifacts
+                .get(&request.package)
+                .expect("artifact completeness checked above");
+            let path = std::fs::canonicalize(emitted).map_err(|error| {
+                format!(
+                    "canonicalize scheduler {:?} artifact {}: {error}",
+                    request.scheduler,
+                    emitted.display(),
+                )
+            })?;
+            let snapshot = if let Some(snapshot) = snapshots.get(&path) {
+                snapshot.clone()
+            } else {
+                let snapshot = snapshot_scheduler_artifact(&path, result_dir, snapshots.len())?;
+                snapshots.insert(path, snapshot.clone());
+                snapshot
+            };
+            entries.push(ktstr::verifier::VerifierSchedulerArtifactEntry {
+                scheduler: request.scheduler.clone(),
+                package: request.package.clone(),
+                manifest_dir: request.manifest_dir.clone(),
+                path: snapshot,
+            });
+        }
+    }
+    entries.sort_by(|left, right| {
+        (
+            &left.scheduler,
+            &left.package,
+            &left.manifest_dir,
+            &left.path,
+        )
+            .cmp(&(
+                &right.scheduler,
+                &right.package,
+                &right.manifest_dir,
+                &right.path,
+            ))
+    });
+    Ok(ktstr::verifier::VerifierSchedulerArtifactManifest {
+        version: ktstr::verifier::VERIFIER_SCHEDULER_ARTIFACT_MANIFEST_VERSION,
+        profile: profile.to_string(),
+        entries,
+    })
+}
+
+fn write_scheduler_manifest(
+    result_dir: &Path,
+    manifest: &ktstr::verifier::VerifierSchedulerArtifactManifest,
+) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let final_path = result_dir.join("scheduler-artifacts-v1.json");
+    let mut temporary = tempfile::NamedTempFile::new_in(result_dir).map_err(|error| {
+        format!(
+            "create temporary scheduler artifact manifest in {}: {error}",
+            result_dir.display()
+        )
+    })?;
+    serde_json::to_writer_pretty(temporary.as_file_mut(), manifest)
+        .map_err(|error| format!("serialize scheduler artifact manifest: {error}"))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| format!("sync scheduler artifact manifest: {error}"))?;
+    temporary
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o444))
+        .map_err(|error| format!("make scheduler artifact manifest read-only: {error}"))?;
+    temporary.persist(&final_path).map_err(|error| {
+        format!(
+            "atomically install scheduler artifact manifest {}: {}",
+            final_path.display(),
+            error.error,
+        )
+    })?;
+    Ok(final_path)
+}
+
 /// Dispatch the `cargo ktstr verifier` subcommand.
 ///
 /// The trailing `args` are forwarded verbatim to the inner
@@ -580,10 +1171,10 @@ fn build_scoped_nextest_args(
 /// manual `--features` passthrough or broad `--all-features`.
 ///
 /// `profile` is the scheduler-under-test's cargo BUILD profile
-/// (`--profile <NAME>`): set as `KTSTR_SCHEDULER_PROFILE` so
-/// [`ktstr::build_and_find_binary`] passes `cargo build -p <scheduler>
-/// --profile <name>`. Omitted, the scheduler builds `release` (that
-/// default lives in `build_and_find_binary`). `nextest_profile` is the
+/// (`--profile <NAME>`): set as `KTSTR_SCHEDULER_PROFILE` and used by the
+/// parent-owned, workspace-batched scheduler prebuild. Omitted, schedulers
+/// build with the `release` default from [`ktstr::scheduler_profile_name`].
+/// `nextest_profile` is the
 /// NEXTEST test profile (`--nextest-profile <NAME>`), emitted as
 /// nextest's own `--profile <NAME>` before the user's trailing args.
 pub(crate) fn run_verifier(
@@ -624,6 +1215,7 @@ pub(crate) fn run_verifier(
         drop_older_package_selectors(&args, &package_plan.older)
     };
     let nextest_args = build_scoped_nextest_args(nextest_profile.as_deref(), &args, &package_plan);
+    let scheduler_profile = scheduler_profile_for_run(profile.as_deref());
 
     let mut cmd = Command::new("cargo");
     // The nextest argument vector — base flags (`--run-ignored all`, the
@@ -657,12 +1249,11 @@ pub(crate) fn run_verifier(
         cmd.env(ktstr::KTSTR_VERIFIER_RAW_ENV, "1");
     }
 
-    // `--profile <NAME>` sets the scheduler-under-test's cargo BUILD
-    // profile via `KTSTR_SCHEDULER_PROFILE`; absent, `build_and_find_binary`
-    // defaults it to `release`.
-    if let Some(p) = &profile {
-        cmd.env(ktstr::KTSTR_SCHEDULER_PROFILE_ENV, p);
-    }
+    // Export the EFFECTIVE profile, not the raw CLI token. The parent build,
+    // immutable manifest, and every child validation therefore share one
+    // source of truth. In particular `--profile ""` resolves to release and
+    // overrides a non-empty inherited KTSTR_SCHEDULER_PROFILE everywhere.
+    cmd.env(ktstr::KTSTR_SCHEDULER_PROFILE_ENV, &scheduler_profile);
 
     // `--scheduler <NAME>` restricts the sweep to a single declared
     // scheduler: forwarded via KTSTR_VERIFIER_SCHEDULER so the cell
@@ -711,9 +1302,10 @@ pub(crate) fn run_verifier(
     // machine-global LLC LOCK_SH + cpuset cgroup (Consolidate placement —
     // a compile is throughput-elastic; packing leaves whole LLCs free for
     // exclusive perf-mode reservations), then releases BOTH before the
-    // combined run below, whose cells take their own reservations
-    // (the in-cell `build_and_find_binary` scheduler build is test-runtime
-    // work those reservations already cover). The verifier sweep is the
+    // combined run below, whose cells take their own reservations. The
+    // scheduler binaries are then prebuilt once per workspace batch under
+    // the same compile-reservation semantics and passed to cells through an
+    // immutable manifest. The verifier sweep is the
     // primary colocated-CI workload, so this is the path where an
     // unreserved harness compile would invade a peer runner's perf-mode
     // reservation. Cache parity with the combined run: identical nextest
@@ -723,96 +1315,146 @@ pub(crate) fn run_verifier(
     // vars are runtime-only). No BTF-anchor `BPF_EXTRA_CFLAGS_PRE_INCL`
     // handling: the verifier dispatcher injects none, so warm-up and run
     // inherit the identical process env.
-    let mut warm = Command::new("cargo");
-    warm.args(crate::run_cargo::prebuild_no_run_args(&nextest_args));
-    for (var, val) in &blob_envs {
-        warm.env(var, val);
-    }
-    warm.env(ktstr::KTSTR_KERNEL_ENV, &resolved[0].1);
-    crate::run_cargo::run_reserved_prebuild(warm, "cargo ktstr verifier")?;
-
-    // Per-cell result dir: each verifier cell writes its PASS/FAIL record
-    // here (via KTSTR_VERIFIER_RESULT_DIR), and after nextest returns we
-    // read them back to render the summary table. Unique per dispatcher pid
-    // so concurrent `cargo ktstr verifier` runs don't cross-read. First
-    // sweep dirs orphaned by dead-pid prior runs (an interrupted run skips
-    // the post-run wipe below), then wipe our own pid's dir in case a prior
-    // run reused this pid.
-    let temp_root = std::env::temp_dir();
-    sweep_stale_result_dirs(&temp_root);
-    let result_dir = temp_root.join(format!("ktstr-verifier-results-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&result_dir);
-    if let Err(e) = std::fs::create_dir_all(&result_dir) {
-        return Err(format!(
-            "create verifier result dir {}: {e}",
-            result_dir.display()
-        ));
-    }
-    cmd.env(ktstr::KTSTR_VERIFIER_RESULT_DIR_ENV, &result_dir);
-
-    let kernel_count = resolved.len();
-
-    eprintln!(
-        "cargo ktstr verifier: dispatching to nextest (verifier/ cells only) \
-         on {kernel_count} resolved kernel(s){raw}{fwd}",
-        raw = if raw { " (raw output)" } else { "" },
-        fwd = if args.is_empty() {
-            String::new()
-        } else {
-            format!(" forwarding to nextest: {}", args.join(" "))
-        },
-    );
-
-    // Survive Ctrl-C / SIGTERM so the result-dir cleanup below runs; nextest
-    // tears down its own test children (see crate::interrupt).
+    //
+    // Install one outer signal guard BEFORE creating any run-owned state or
+    // spawning any compile/probe child. Every `?` below exits this closure,
+    // dropping `result_dir` before the guard is removed and the caught signal
+    // is re-raised as 130/143. SIGKILL cannot run Rust cleanup; the existing
+    // dead-pid sweep remains the next-run recovery for that case.
     let interrupt_guard = crate::interrupt::InterruptGuard::install();
-    let status = cmd
-        .status()
-        .map_err(|e| format!("spawn cargo nextest run: {e}"))?;
+    let guarded_result = (|| -> Result<Option<i32>, String> {
+        // Per-cell result dir: each verifier cell writes its PASS/FAIL record
+        // here (via KTSTR_VERIFIER_RESULT_DIR), and after nextest returns we
+        // read them back to render the summary table. Creating it before the
+        // warm-up makes the same RAII owner cover harness compilation,
+        // declaration probes, scheduler prebuild/snapshots, manifest write,
+        // and the final nextest run.
+        let result_dir = VerifierResultDir::create(&std::env::temp_dir())?;
+        if interrupt_guard.interrupted().is_some() {
+            return Ok(None);
+        }
 
-    // From the records each cell wrote into `result_dir`: print the
-    // per-scheduler verified_insns tables first, then the per-scheduler
-    // topology × kernel PASS/FAIL grids LAST so the operator's final view
-    // is the pass/fail matrix. Both print on success AND failure so
-    // failing cells stay visible. Best-effort: no records (e.g. 0 cells
-    // ran) -> the renderers return None and nothing prints.
-    let records = ktstr::verifier::read_cell_records(&result_dir);
-    if let Some(tables) = ktstr::verifier::render_instruction_count_tables(&records) {
-        print!("{tables}");
-    }
-    if let Some(table) = ktstr::verifier::render_result_table(&records) {
-        print!("{table}");
-    }
-    let _ = std::fs::remove_dir_all(&result_dir);
-    // Cleanup done; if interrupted, propagate as 128+signal now.
-    let caught = interrupt_guard.interrupted();
-    drop(interrupt_guard);
+        let mut warm = Command::new("cargo");
+        warm.args(crate::run_cargo::prebuild_no_run_json_args(&nextest_args));
+        for (var, val) in &blob_envs {
+            warm.env(var, val);
+        }
+        warm.env(ktstr::KTSTR_KERNEL_ENV, &resolved[0].1);
+        let test_bins = crate::run_cargo::run_reserved_prebuild_collect_test_bins(
+            warm,
+            "cargo ktstr verifier",
+        )?;
+        if interrupt_guard.interrupted().is_some() {
+            return Ok(None);
+        }
+        let declarations = probe_scheduler_declarations(&test_bins)?;
+        if interrupt_guard.interrupted().is_some() {
+            return Ok(None);
+        }
+        cmd.env(ktstr::KTSTR_VERIFIER_RESULT_DIR_ENV, result_dir.path());
+        let resolved_kernel_labels = resolved
+            .iter()
+            .map(|(label, _)| {
+                (
+                    label.clone(),
+                    ktstr::test_support::sanitize_kernel_label(label),
+                )
+            })
+            .collect::<Vec<_>>();
+        let presets = ktstr::gauntlet::gauntlet_presets();
+        let scheduler_manifest = prebuild_scheduler_manifest(
+            &declarations,
+            scheduler.as_deref(),
+            &scheduler_profile,
+            &resolved_kernel_labels,
+            &presets,
+            result_dir.path(),
+            &interrupt_guard,
+        )?;
+        if interrupt_guard.interrupted().is_some() {
+            return Ok(None);
+        }
+        let scheduler_manifest_path =
+            write_scheduler_manifest(result_dir.path(), &scheduler_manifest)?;
+        if interrupt_guard.interrupted().is_some() {
+            return Ok(None);
+        }
+        cmd.env(
+            ktstr::KTSTR_VERIFIER_SCHEDULER_MANIFEST_ENV,
+            scheduler_manifest_path,
+        );
+
+        let kernel_count = resolved.len();
+
+        eprintln!(
+            "cargo ktstr verifier: dispatching to nextest (verifier/ cells only) \
+         on {kernel_count} resolved kernel(s){raw}{fwd}",
+            raw = if raw { " (raw output)" } else { "" },
+            fwd = if args.is_empty() {
+                String::new()
+            } else {
+                format!(" forwarding to nextest: {}", args.join(" "))
+            },
+        );
+
+        // The outer guard survives Ctrl-C / SIGTERM so the result-dir cleanup
+        // below runs; nextest tears down its own test children.
+        if interrupt_guard.interrupted().is_some() {
+            return Ok(None);
+        }
+        let status = cmd
+            .status()
+            .map_err(|e| format!("spawn cargo nextest run: {e}"))?;
+
+        // From the records each cell wrote into `result_dir`: print the
+        // per-scheduler verified_insns tables first, then the per-scheduler
+        // topology × kernel PASS/FAIL grids LAST so the operator's final view
+        // is the pass/fail matrix. Both print on success AND failure so
+        // failing cells stay visible. Best-effort: no records (e.g. 0 cells
+        // ran) -> the renderers return None and nothing prints.
+        let records = ktstr::verifier::read_cell_records(result_dir.path());
+        if let Some(tables) = ktstr::verifier::render_instruction_count_tables(&records) {
+            print!("{tables}");
+        }
+        if let Some(table) = ktstr::verifier::render_result_table(&records) {
+            print!("{table}");
+        }
+        // Decide the outcome from nextest's exit + the records. With
+        // `--no-tests pass` a zero-cell selection exits 0, so an empty record
+        // set on success is diagnosed here (a `--scheduler` typo, no scheduler
+        // declared, or no topology preset fits this host) rather than
+        // surfacing nextest's generic no-tests error. A real build/exec
+        // failure still exits non-zero and is surfaced verbatim — EXCEPT when
+        // the failure is a real cell failure the grid above already shows
+        // (SilentExit): there the process exits with nextest's code but emits
+        // no stderr error line, which would otherwise interleave into the
+        // stdout report under CI's unordered pipes.
+        match ktstr::verifier::classify_run_outcome(
+            status.success(),
+            records.is_empty(),
+            records.iter().any(|r| !r.passed && !r.skipped),
+            scheduler.as_deref(),
+            status.code(),
+        ) {
+            ktstr::verifier::RunOutcome::Success => Ok(None),
+            ktstr::verifier::RunOutcome::Failed(msg) => Err(msg),
+            // Report + cleanup already ran above. Defer the silent exit until the
+            // outer signal guard has restored the prior dispositions.
+            ktstr::verifier::RunOutcome::SilentExit(code) => Ok(Some(code)),
+        }
+    })();
+
+    // `guarded_result` owns no result-dir guard here: every success/error path
+    // dropped it inside the closure. Restore the prior signal dispositions,
+    // then preserve the first caught SIGINT/SIGTERM as the process outcome.
+    let caught = crate::interrupt::restore_and_caught(interrupt_guard);
     if let Some(sig) = caught {
         crate::interrupt::reraise(sig);
     }
-
-    // Decide the outcome from nextest's exit + the records. With
-    // `--no-tests pass` a zero-cell selection exits 0, so an empty record
-    // set on success is diagnosed here (a `--scheduler` typo, no scheduler
-    // declared, or no topology preset fits this host) rather than
-    // surfacing nextest's generic no-tests error. A real build/exec
-    // failure still exits non-zero and is surfaced verbatim — EXCEPT when
-    // the failure is a real cell failure the grid above already shows
-    // (SilentExit): there the process exits with nextest's code but emits
-    // no stderr error line, which would otherwise interleave into the
-    // stdout report under CI's unordered pipes.
-    match ktstr::verifier::classify_run_outcome(
-        status.success(),
-        records.is_empty(),
-        records.iter().any(|r| !r.passed && !r.skipped),
-        scheduler.as_deref(),
-        status.code(),
-    ) {
-        ktstr::verifier::RunOutcome::Success => Ok(()),
-        ktstr::verifier::RunOutcome::Failed(msg) => Err(msg),
-        // Report + cleanup already ran above; exit silently with nextest's
-        // own code.
-        ktstr::verifier::RunOutcome::SilentExit(code) => std::process::exit(code),
+    match guarded_result {
+        Ok(Some(code)) => std::process::exit(code),
+        Ok(None) => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -822,6 +1464,276 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn discover_declaration(
+        scheduler: &str,
+        package: &str,
+        manifest_dir: &str,
+    ) -> ktstr::test_support::SchedulerListEntry {
+        let mut scheduler_json = ktstr::test_support::SchedulerJson::from_scheduler(
+            &ktstr::test_support::Scheduler::EEVDF,
+        );
+        scheduler_json.name = scheduler.to_string();
+        scheduler_json.manifest_dir = manifest_dir.to_string();
+        scheduler_json.binary_kind =
+            ktstr::test_support::BinaryKindJson::Discover(package.to_string());
+        ktstr::test_support::SchedulerListEntry {
+            scheduler: scheduler_json,
+            test_count: 1,
+        }
+    }
+
+    #[test]
+    fn emitting_declarations_compare_full_scheduler_json_semantics() {
+        let a = discover_declaration("a", "scx_a", "/w/a");
+        let b = discover_declaration("b", "scx_b", "/w/b");
+        let mut duplicate_with_other_test_count = a.clone();
+        duplicate_with_other_test_count.test_count = 999;
+        let selected = selected_emitting_scheduler_declarations(
+            &[a.clone(), duplicate_with_other_test_count, b],
+            Some("a"),
+            |_| Ok(true),
+        )
+        .expect("selected declarations");
+        assert_eq!(
+            selected,
+            vec![a.scheduler.clone()],
+            "exact duplicates collapse after the name filter",
+        );
+
+        let mut variants = Vec::new();
+        let mut changed = a.scheduler.clone();
+        changed.binary_kind = ktstr::test_support::BinaryKindJson::Discover("scx_other".into());
+        variants.push(("binary", changed));
+        let mut changed = a.scheduler.clone();
+        changed.manifest_dir = "/w/other".into();
+        variants.push(("manifest_dir", changed));
+        let mut changed = a.scheduler.clone();
+        changed.sched_args.push("--slice-us=5000".into());
+        variants.push(("scheduler args", changed));
+        let mut changed = a.scheduler.clone();
+        changed.kernels.push("6.18".into());
+        variants.push(("kernels", changed));
+        let mut changed = a.scheduler.clone();
+        changed.topology.cores_per_llc += 1;
+        variants.push(("topology", changed));
+        let mut changed = a.scheduler.clone();
+        changed.constraints.min_cpus += 1;
+        variants.push(("constraints", changed));
+        let mut changed = a.scheduler.clone();
+        changed
+            .verifier_exclude_topologies
+            .push("4cpu-1llc-nosmt".into());
+        variants.push(("verifier exclusions", changed));
+
+        for (field, conflicting) in variants {
+            let error = selected_emitting_scheduler_declarations(
+                &[
+                    a.clone(),
+                    ktstr::test_support::SchedulerListEntry {
+                        scheduler: conflicting,
+                        test_count: 99,
+                    },
+                ],
+                None,
+                |_| Ok(true),
+            )
+            .expect_err(field);
+            assert!(
+                error.contains("conflicting declarations for scheduler \"a\""),
+                "{field} must be part of scheduler identity: {error}",
+            );
+        }
+    }
+
+    fn verifier_matrix() -> (Vec<(String, String)>, Vec<ktstr::gauntlet::TopoPreset>) {
+        (
+            vec![("6.14.2".into(), "kernel_6_14_2".into())],
+            ktstr::gauntlet::gauntlet_presets(),
+        )
+    }
+
+    #[test]
+    fn discover_planning_skips_same_name_nonmember_before_conflict() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let member = workspace.path().join("member");
+        std::fs::create_dir_all(member.join("src")).expect("create member source dir");
+        std::fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\nresolver = \"2\"\n",
+        )
+        .expect("write workspace manifest");
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"valid_sched\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("write member manifest");
+        std::fs::write(member.join("src/main.rs"), "fn main() {}\n").expect("write member main");
+        let manifest_dir = member.to_string_lossy().into_owned();
+        let valid = discover_declaration("sched", "valid_sched", &manifest_dir);
+        let fixture = discover_declaration("sched", "fixture_only", &manifest_dir);
+        let (kernels, presets) = verifier_matrix();
+
+        let selected = selected_discover_requests(&[fixture, valid], None, &kernels, &presets)
+            .expect("nonmember declaration is an emission-side skip");
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].scheduler, "sched");
+        assert_eq!(selected[0].package, "valid_sched");
+        assert_eq!(
+            selected[0].workspace_root,
+            std::fs::canonicalize(workspace.path()).expect("canonical workspace"),
+        );
+    }
+
+    #[test]
+    fn every_nonemitting_declaration_is_filtered_before_conflict_or_build() {
+        let (kernels, presets) = verifier_matrix();
+        let slash = discover_declaration("ignored/name", "never_queried", "/missing");
+        let mut missing_path = slash.clone();
+        missing_path.scheduler.name = "ignored".into();
+        missing_path.scheduler.binary_kind =
+            ktstr::test_support::BinaryKindJson::Path("/definitely/missing/ktstr-sched".into());
+        let mut eevdf = missing_path.clone();
+        eevdf.scheduler.binary_kind = ktstr::test_support::BinaryKindJson::Eevdf;
+        let mut builtin = missing_path.clone();
+        builtin.scheduler.binary_kind = ktstr::test_support::BinaryKindJson::KernelBuiltin;
+        let mut no_kernel = discover_declaration("ignored", "never_queried", "/missing");
+        no_kernel.scheduler.kernels = vec!["9.99".into()];
+        let mut no_preset = discover_declaration("ignored", "never_queried", "/missing");
+        no_preset.scheduler.constraints.min_cpus = u32::MAX;
+
+        let selected = selected_discover_requests(
+            &[slash, missing_path, eevdf, builtin, no_kernel, no_preset],
+            None,
+            &kernels,
+            &presets,
+        )
+        .expect("non-emitting declarations do not conflict");
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn scheduler_snapshot_uses_pinned_source_and_is_read_only_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("cargo-target-scheduler");
+        std::fs::write(&source, b"old scheduler bytes").expect("write source");
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod source");
+        let pinned = std::fs::File::open(&source).expect("pin source fd");
+
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, b"new scheduler bytes").expect("write replacement");
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod replacement");
+        std::fs::rename(&replacement, &source).expect("replace Cargo target path atomically");
+
+        let result_dir = dir.path().join("results");
+        std::fs::create_dir(&result_dir).expect("create result dir");
+        let snapshot = snapshot_scheduler_artifact_from_open_file(pinned, &source, &result_dir, 0)
+            .expect("snapshot pinned scheduler");
+
+        assert_eq!(
+            std::fs::read(&snapshot).expect("read snapshot"),
+            b"old scheduler bytes",
+            "the copy follows the pinned source inode, not a replaced target path",
+        );
+        let mode = std::fs::metadata(&snapshot)
+            .expect("snapshot metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o222, 0, "snapshot must be read-only");
+        assert_eq!(mode & 0o111, 0o111, "snapshot must remain executable");
+        assert_eq!(
+            snapshot.parent(),
+            Some(
+                std::fs::canonicalize(&result_dir)
+                    .expect("canonical result dir")
+                    .as_path()
+            ),
+            "manifestable path lives in the parent result directory",
+        );
+    }
+
+    #[test]
+    fn verifier_result_dir_guard_cleans_error_paths() {
+        let root = tempfile::tempdir().expect("temp root");
+        let path = {
+            let guard = VerifierResultDir::create(root.path()).expect("create result dir");
+            let path = guard.path().to_path_buf();
+            std::fs::write(path.join("partial"), b"partial prebuild").expect("write partial file");
+            path
+        };
+        assert!(!path.exists(), "Drop removes a partially prepared run");
+    }
+
+    #[test]
+    fn outer_interrupt_guard_preserves_first_signal_and_cleans_once() {
+        let _serial = crate::interrupt::test_serial_guard();
+        let root = tempfile::tempdir().expect("temp root");
+        let interrupt_guard = crate::interrupt::InterruptGuard::install();
+        let cleanup_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let path = {
+            let mut result_dir =
+                VerifierResultDir::create(root.path()).expect("create guarded result dir");
+            result_dir.cleanup_count = Some(cleanup_count.clone());
+            let path = result_dir.path().to_path_buf();
+            std::fs::write(path.join("partial-snapshot"), b"partial")
+                .expect("write partial snapshot");
+            crate::interrupt::record_for_test(libc::SIGTERM);
+            crate::interrupt::record_for_test(libc::SIGINT);
+            assert_eq!(interrupt_guard.interrupted(), Some(libc::SIGTERM));
+            path
+        };
+
+        assert!(
+            !path.exists(),
+            "result-dir RAII runs while the outer signal guard is still live",
+        );
+        assert_eq!(
+            cleanup_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the signal path owns exactly one result-dir cleanup",
+        );
+        assert_eq!(interrupt_guard.interrupted(), Some(libc::SIGTERM));
+        drop(interrupt_guard);
+        assert_eq!(
+            crate::interrupt::caught(),
+            Some(libc::SIGTERM),
+            "the first signal remains readable across handler restoration",
+        );
+    }
+
+    #[test]
+    fn verifier_effective_scheduler_profile_normalizes_cli_empty() {
+        assert_eq!(scheduler_profile_for_run(Some("")), "release");
+        assert_eq!(scheduler_profile_for_run(Some("ci-release")), "ci-release");
+    }
+
+    #[test]
+    fn scheduler_artifact_json_maps_by_package_id_not_target_name() {
+        let package_id: PackageId = serde_json::from_str(r#""scx_a 1.0.0 (path+file:///w/scx_a)""#)
+            .expect("PackageId fixture");
+        let group = WorkspaceSchedulerBuild {
+            root: PathBuf::from("/w"),
+            packages: BTreeMap::from([("scx_a".to_string(), package_id)]),
+            requests: Vec::new(),
+        };
+        let stream = concat!(
+            r#"{"reason":"compiler-artifact","package_id":"scx_a 1.0.0 (path+file:///w/scx_a)","target":{"name":"different_bin_name","kind":["bin"],"src_path":"/w/scx_a/src/main.rs"},"profile":{"opt_level":"3","debug_assertions":false,"overflow_checks":false,"test":false},"features":[],"filenames":["/w/target/release/different_bin_name"],"executable":"/w/target/release/different_bin_name","fresh":true}"#,
+            "\n",
+            r#"{"reason":"build-finished","success":true}"#,
+            "\n",
+        );
+        let artifacts =
+            map_scheduler_artifacts(stream.as_bytes(), &group).expect("map Cargo artifacts");
+        assert_eq!(
+            artifacts.get("scx_a"),
+            Some(&PathBuf::from("/w/target/release/different_bin_name")),
+        );
     }
 
     fn package_json_with(

@@ -554,9 +554,21 @@ fn arm_wprof_grace(
     Instant::now() + grace
 }
 
+/// Anchor the watchdog's original timeout budget to the authoritative VM
+/// start instant. The watchdog thread can itself be delayed before its closure
+/// first runs (especially while a large AP set is being brought up), so using
+/// `Instant::now()` inside that closure would silently add the scheduling delay
+/// to every deadline derived from this one.
+fn watchdog_hard_deadline(run_start: Instant, timeout: Duration) -> Instant {
+    run_start + timeout
+}
+
 #[cfg(test)]
 mod watchdog_reset_tag_tests {
-    use super::{KillReasonTag, WatchdogResetTag, decode_guest_phase, decode_watchdog_kill_reason};
+    use super::{
+        KillReasonTag, WatchdogResetTag, decode_guest_phase, decode_watchdog_kill_reason,
+        watchdog_hard_deadline,
+    };
     use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
@@ -692,6 +704,25 @@ mod watchdog_reset_tag_tests {
         assert_eq!(
             WatchdogResetTag::from_u8(reset_tag.load(Ordering::Relaxed)),
             WatchdogResetTag::ScxRootLatch,
+        );
+    }
+
+    /// A late-scheduled watchdog must not receive a fresh timeout budget when
+    /// its closure finally starts: the deadline stays exactly `timeout` after
+    /// the VM's run-start anchor.
+    #[test]
+    fn hard_deadline_is_anchored_to_vm_start() {
+        let run_start = Instant::now()
+            .checked_sub(Duration::from_secs(7))
+            .expect("test instant can move into the recent past");
+        let timeout = Duration::from_secs(30);
+
+        let deadline = watchdog_hard_deadline(run_start, timeout);
+
+        assert_eq!(deadline.duration_since(run_start), timeout);
+        assert!(
+            deadline.duration_since(Instant::now()) < timeout,
+            "watchdog startup delay must consume, not extend, the VM budget"
         );
     }
 }
@@ -1473,6 +1504,19 @@ fn has_bpf_scheduler_attached_inner<P: AsRef<std::path::Path>>(
 /// (re-kicking each cycle), then joins every handle. Shared by
 /// [`KtstrVm::collect_results`] and [`RunVmThreadGuard`]'s `Drop` so both
 /// drain the vCPU threads through the identical, deadlock-safe sequence.
+fn retire_ap_waiter(waiting: &mut [bool], index: usize, exited: bool) -> bool {
+    if exited && waiting[index] {
+        waiting[index] = false;
+        true
+    } else {
+        false
+    }
+}
+
+fn ap_join_wait_quantum(left: Duration) -> Duration {
+    left.min(Duration::from_millis(10))
+}
+
 fn kick_and_join_ap_threads(ap_threads: Vec<VcpuThread>) {
     for vt in &ap_threads {
         if !vt.exited.load(Ordering::Acquire) {
@@ -1480,45 +1524,108 @@ fn kick_and_join_ap_threads(ap_threads: Vec<VcpuThread>) {
         }
         vt.handle.thread().unpark();
     }
-    let mut remaining = ap_threads.len();
-    if remaining > 0
-        && let Ok(epoll) = Epoll::new()
-    {
-        for (i, vt) in ap_threads.iter().enumerate() {
-            if vt.exited.load(Ordering::Acquire) {
-                remaining -= 1;
-                continue;
-            }
+    let mut waiting = vec![false; ap_threads.len()];
+    let mut remaining = 0usize;
+    let mut epoll = Epoll::new().ok();
+    for (i, vt) in ap_threads.iter().enumerate() {
+        if vt.exited.load(Ordering::Acquire) {
+            continue;
+        }
+        waiting[i] = true;
+        remaining += 1;
+        if let Some(epoll) = &epoll {
             let _ = epoll.ctl(
                 ControlOperation::Add,
                 vt.exit_evt.as_raw_fd(),
                 EpollEvent::new(EventSet::IN, i as u64),
             );
         }
-        if remaining > 0 {
-            let mut events = vec![EpollEvent::default(); remaining];
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while remaining > 0 {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    break;
-                }
-                let ms = left.as_millis().min(i32::MAX as u128) as i32;
+    }
+    if remaining > 0 {
+        let mut events = vec![EpollEvent::default(); remaining];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while remaining > 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            // A timeout is intentional: no exit event means the AP did
+            // not respond to the prior kick, so wake and re-kick instead
+            // of sleeping for the full two-second drain deadline.
+            let quantum = ap_join_wait_quantum(left);
+            let ms = quantum.as_millis().max(1).min(i32::MAX as u128) as i32;
+            let mut epoll_failed = false;
+            if let Some(epoll) = &epoll {
                 match epoll.wait(ms, &mut events) {
-                    Ok(0) => break,
-                    Ok(n) => remaining = remaining.saturating_sub(n),
-                    Err(_) => break,
-                }
-                for vt in &ap_threads {
-                    if !vt.exited.load(Ordering::Acquire) {
-                        vt.kick();
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "AP teardown epoll wait failed; using timed re-kick");
+                        epoll_failed = true;
                     }
+                }
+            } else {
+                std::thread::sleep(quantum);
+            }
+            if epoll_failed {
+                epoll = None;
+                std::thread::sleep(quantum);
+            }
+            for (i, vt) in ap_threads.iter().enumerate() {
+                if retire_ap_waiter(&mut waiting, i, vt.exited.load(Ordering::Acquire)) {
+                    remaining -= 1;
+                    if let Some(epoll) = &epoll {
+                        let _ = epoll.ctl(
+                            ControlOperation::Delete,
+                            vt.exit_evt.as_raw_fd(),
+                            EpollEvent::default(),
+                        );
+                    }
+                    let _ = vt.exit_evt.read();
+                } else if waiting[i] {
+                    vt.kick();
+                    vt.handle.thread().unpark();
                 }
             }
         }
     }
     for vt in ap_threads {
         let _ = vt.handle.join();
+    }
+}
+
+#[cfg(test)]
+mod ap_join_accounting_tests {
+    use super::{ap_join_wait_quantum, retire_ap_waiter};
+    use std::time::Duration;
+
+    #[test]
+    fn level_triggered_exit_is_retired_once_per_ap_index() {
+        let mut waiting = vec![true, true];
+
+        assert!(retire_ap_waiter(&mut waiting, 0, true));
+        assert_eq!(waiting, [false, true]);
+
+        // An unread level-triggered eventfd can report AP 0 again. It must
+        // not decrement the run-wide remaining count a second time.
+        assert!(!retire_ap_waiter(&mut waiting, 0, true));
+        assert_eq!(waiting, [false, true]);
+
+        assert!(!retire_ap_waiter(&mut waiting, 1, false));
+        assert!(retire_ap_waiter(&mut waiting, 1, true));
+        assert_eq!(waiting, [false, false]);
+    }
+
+    #[test]
+    fn wait_quantum_preserves_ten_millisecond_rekick_cadence() {
+        assert_eq!(
+            ap_join_wait_quantum(Duration::from_secs(2)),
+            Duration::from_millis(10),
+        );
+        assert_eq!(
+            ap_join_wait_quantum(Duration::from_millis(3)),
+            Duration::from_millis(3),
+        );
     }
 }
 
@@ -1533,9 +1640,11 @@ struct RunVmHandles {
     watchdog: Option<JoinHandle<()>>,
 }
 
-/// The AP-ready boot gate in [`KtstrVm::run_vm`] timed out (or was cut short by
-/// `kill`) with one or more AP host threads not yet in `KVM_RUN`. Carries the
-/// facts observed at the trip and NOTHING inferred: the prior fixed
+/// An AP-ready boot gate timed out (or was cut short by `kill`) with one or
+/// more AP host threads not yet in `KVM_RUN`. The progressive gate runs inside
+/// [`KtstrVm::spawn_ap_threads`], with an outer all-AP gate in
+/// [`KtstrVm::run_vm`] as defense. Carries the facts observed at the trip and
+/// NOTHING inferred: the prior fixed
 /// "host CPU starvation" message was empirically refuted (fair-scheduler
 /// contention cannot trip this gate even at 25x oversubscription), so the real
 /// cause — pure starvation, D-state blocking, a wedged AP — is left to the
@@ -1565,6 +1674,168 @@ pub(crate) struct ApGateTimeout {
     /// Per-not-ready-vCPU kernel evidence, one line each (see the gate's
     /// dump code for the fields and their meaning).
     pub(crate) evidence: String,
+}
+
+/// One run-wide cap for AP host-thread bring-up. Progressive spawning reuses a
+/// single `gate_start` across every AP instead of granting this budget once per
+/// vCPU; the outer all-AP gate starts a fresh defensive check only after every
+/// progressive wait has already succeeded (and is therefore uncontended).
+const AP_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Await every boot latch in `ap_boot_latches` against one shared deadline and
+/// construct the typed, evidence-bearing failure used by boot retry when any
+/// latch remains unset. `first_vcpu_id` maps the first latch in the slice to its
+/// guest vCPU id, letting the progressive caller wait only on the just-spawned
+/// AP while the outer defense checks the complete slice.
+fn wait_for_ap_boot_gate(
+    ap_boot_latches: &[Arc<crate::sync::Latch>],
+    ap_tid_slots: &[(Arc<AtomicI32>, Arc<crate::sync::Latch>)],
+    first_vcpu_id: usize,
+    kill: &AtomicBool,
+    gate_start: Instant,
+) -> std::result::Result<(), ApGateTimeout> {
+    debug_assert_eq!(ap_boot_latches.len(), ap_tid_slots.len());
+    let deadline = gate_start + AP_READY_TIMEOUT;
+    for latch in ap_boot_latches {
+        while !latch.is_set() {
+            if kill.load(Ordering::Acquire) {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            latch.wait_timeout((deadline - now).min(Duration::from_millis(100)));
+        }
+    }
+
+    // Report by guest CPU id: AP index `i` is thread `vcpu-{i+1}` (the
+    // BSP is vCPU 0), matching the spawn-loop naming.
+    let not_ready: Vec<usize> = ap_boot_latches
+        .iter()
+        .enumerate()
+        .filter(|(_, latch)| !latch.is_set())
+        .map(|(i, _)| first_vcpu_id + i)
+        .collect();
+    if not_ready.is_empty() {
+        return Ok(());
+    }
+
+    // Evidence dump — runs ONLY on the trip path. The old fixed "host CPU
+    // starvation" message was empirically refuted (fair scheduler contention
+    // cannot trip this gate even at 25x oversubscription), so instead of
+    // asserting a cause we collect per-thread kernel state and let the reader
+    // judge. For each AP whose boot latch never fired, read its published TID
+    // slot: the TID is stamped as the FIRST act of the AP closure, so a slot
+    // still 0 means the host thread ran zero instructions — the pure "never
+    // scheduled" signal. Comm-based attribution is NOT used: Rust sets a
+    // thread's name via prctl from INSIDE the thread, so a never-scheduled
+    // thread still carries the parent's comm. For a thread that did run, read
+    // /proc/self/task/{tid}/{stat,schedstat,wchan,status} once and pull the
+    // starved-vs-blocked discriminators. All reads are best-effort — a
+    // vanished TID yields "?" rather than failing.
+    use std::fmt::Write as _;
+    let mut evidence = String::new();
+    for (i, (tid_slot, _)) in ap_tid_slots.iter().enumerate() {
+        if ap_boot_latches[i].is_set() {
+            continue;
+        }
+        let vcpu_id = first_vcpu_id + i;
+        let tid = tid_slot.load(Ordering::Acquire);
+        if tid == 0 {
+            let _ = writeln!(
+                evidence,
+                "  vCPU {vcpu_id}: never scheduled (no TID stamped) — \
+                 the host thread ran zero instructions of its closure \
+                 (pure starvation)"
+            );
+            continue;
+        }
+        let base = format!("/proc/self/task/{tid}");
+        let read1 = |f: &str| {
+            std::fs::read_to_string(format!("{base}/{f}"))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default()
+        };
+        // Split off everything after "(comm) " so a comm containing ") " (or
+        // spaces) can't shift field indices. In that tail field 0 is `state`
+        // (proc stat field 3); `processor` (last CPU) is stat field 39, i.e.
+        // tail index 36.
+        let stat = read1("stat");
+        let tail = stat.rsplit(") ").next().unwrap_or("");
+        let sf: Vec<&str> = tail.split(' ').collect();
+        let state = sf.first().copied().unwrap_or("?");
+        let last_cpu = sf.get(36).copied().unwrap_or("?");
+        // schedstat field 2 = time runnable-but-not-running (ns): large here
+        // means "wanted the CPU, didn't get it" (starvation); near-zero with a
+        // kernel `wchan` means the thread was blocked in-kernel, not starved.
+        let schedstat = read1("schedstat");
+        let wait_ns = schedstat.split_whitespace().nth(1).unwrap_or("?");
+        let wchan = read1("wchan");
+        let wchan = if wchan.is_empty() {
+            "?"
+        } else {
+            wchan.as_str()
+        };
+        let status = read1("status");
+        let nonvol = status
+            .lines()
+            .find_map(|line| line.strip_prefix("nonvoluntary_ctxt_switches:"))
+            .map(str::trim)
+            .unwrap_or("?");
+        let _ = writeln!(
+            evidence,
+            "  vCPU {vcpu_id} (tid {tid}): state={state} \
+             last_cpu={last_cpu} runnable_wait_ns={wait_ns} \
+             wchan={wchan} nonvoluntary_ctxt_switches={nonvol}"
+        );
+    }
+
+    Err(ApGateTimeout {
+        not_ready,
+        elapsed: gate_start.elapsed(),
+        killed: kill.load(Ordering::Acquire),
+        evidence,
+    })
+}
+
+#[cfg(test)]
+mod ap_boot_gate_tests {
+    use super::{AP_READY_TIMEOUT, wait_for_ap_boot_gate};
+    use crate::sync::Latch;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicI32};
+    use std::time::Instant;
+
+    fn tid_slots(n: usize) -> Vec<(Arc<AtomicI32>, Arc<Latch>)> {
+        (0..n)
+            .map(|_| (Arc::new(AtomicI32::new(0)), Arc::new(Latch::new())))
+            .collect()
+    }
+
+    /// The progressive caller passes only the just-spawned AP. Its one shared,
+    /// already-expired deadline trips immediately, maps the slice back to the
+    /// current guest vCPU id, and retains the typed evidence used by boot retry.
+    #[test]
+    fn progressive_ap_uses_shared_cap_and_typed_evidence() {
+        let latches = vec![Arc::new(Latch::new())];
+        let slots = tid_slots(latches.len());
+        let kill = AtomicBool::new(false);
+        let gate_start = Instant::now()
+            .checked_sub(AP_READY_TIMEOUT)
+            .expect("test instant can move into the recent past");
+
+        let err = wait_for_ap_boot_gate(&latches, &slots, 2, &kill, gate_start)
+            .expect_err("the unset AP must trip the gate");
+
+        assert_eq!(err.not_ready, vec![2]);
+        assert!(err.elapsed >= AP_READY_TIMEOUT);
+        assert!(!err.killed);
+        assert!(
+            err.evidence.contains("vCPU 2: never scheduled"),
+            "zero TID retains the existing never-scheduled evidence"
+        );
+    }
 }
 
 /// RAII guard that joins the vCPU / monitor / bpf-write / freeze-coordinator /
@@ -1637,7 +1908,8 @@ impl Drop for RunVmThreadGuard {
         // COORDINATOR first: they hold the vCPUs' `ImmediateExitHandle`s, so
         // joining a vCPU (which drops its `kvm_run` mmap) while a coordinator
         // still kicks it would be a use-after-free — the kickers must be
-        // quiesced before their targets.
+        // quiesced before their targets. Join the monitor next: its cached
+        // pthread CPU clock IDs remain valid only while every AP thread lives.
         self.bsp_done.store(true, Ordering::Release);
         let _ = self.bsp_done_evt.write(1);
         self.kill.store(true, Ordering::Release);
@@ -1649,10 +1921,10 @@ impl Drop for RunVmThreadGuard {
         if let Some(h) = self.freeze_coord.take() {
             let _ = h.join();
         }
-        kick_and_join_ap_threads(std::mem::take(&mut self.ap_threads));
         if let Some(h) = self.monitor.take() {
             let _ = h.join();
         }
+        kick_and_join_ap_threads(std::mem::take(&mut self.ap_threads));
         if let Some(h) = self.bpf_write.take() {
             let _ = h.join();
         }
@@ -1700,8 +1972,9 @@ impl Drop for BspAffinityGuard {
 
 /// RAII guard over `spawn_ap_threads`' partially-built vCPU thread set. Each AP
 /// thread begins `KVM_RUN` against `vm.guest_mem` the instant it spawns, so if a
-/// LATER per-AP `?` fails mid-loop (the exit-eventfd alloc or the thread spawn),
-/// the already-spawned APs are live. Without this guard the local
+/// LATER per-AP `?` fails mid-loop (the exit-eventfd alloc, thread spawn, or
+/// progressive boot-gate wait), the already-spawned APs are live. Without this
+/// guard the local
 /// `Vec<VcpuThread>` would drop and DETACH them (`VcpuThread` has no `Drop`), and
 /// the caller's `vm` would then munmap guest_mem under them — the same host-side
 /// use-after-free [`RunVmThreadGuard`] covers, but for the window INSIDE
@@ -3055,22 +3328,23 @@ impl KtstrVm {
         // Per-AP boot-ordering latches — each AP fires its latch at the
         // instant it is about to enter `vcpu_run_loop_unified` (after
         // signal-handler registration, affinity, and RT-prio setup,
-        // immediately before its first KVM_RUN). The BSP blocks on all of
-        // them below before it starts executing guest code.
+        // immediately before its first KVM_RUN). `spawn_ap_threads` waits
+        // progressively after each spawn; the BSP also checks the complete
+        // set below before it starts executing guest code.
         //
         // Why this gate exists: the guest kernel's `do_boot_cpu` brings APs
         // up strictly sequentially, INIT-SIPI'ing each one and then waiting a
         // bounded ~10s for it to check in before moving on. KVM buffers the
         // INIT/SIPI for a vCPU already blocked in KVM_RUN with
         // MP_STATE_UNINITIALIZED, so an AP that is inside its run loop cannot
-        // miss its wakeup. But `spawn_ap_threads` only *creates* the host
-        // threads and returns — on an oversubscribed host an AP host-thread
-        // that the scheduler hasn't yet run into KVM_RUN when its INIT-SIPI
-        // arrives misses the window, and the guest marks that CPU
+        // miss its wakeup. Creating the whole host-thread set at once can
+        // starve later AP closures behind the already-running prefix on an
+        // oversubscribed host; an AP that has not reached KVM_RUN when its
+        // INIT-SIPI arrives misses the window, and the guest marks that CPU
         // present-but-offline (observed in CI as 128-vCPU guests
-        // intermittently losing 1-2 mid-range CPUs). Gating guest boot on
-        // every AP being in KVM_RUN closes that race. One-shot `Latch` per AP
-        // (many producers, single BSP waiter) — reusing the module's existing
+        // intermittently losing 1-2 mid-range CPUs). Progressive spawn plus
+        // the outer all-AP gate ensures every AP reaches KVM_RUN before guest
+        // boot. One-shot `Latch` per AP — reusing the module's existing
         // primitive rather than a new counter type.
         let ap_boot_latches: Vec<Arc<crate::sync::Latch>> = (0..vcpus.len())
             .map(|_| Arc::new(crate::sync::Latch::new()))
@@ -12416,7 +12690,7 @@ impl KtstrVm {
                 // above stays perf-mode-gated: `wd_service_cpu` is `None`
                 // without a reserved CPU, so there is nothing to pin to.
                 set_rt_priority(2, "ktstr-watchdog");
-                let hard_deadline = Instant::now() + timeout;
+                let hard_deadline = watchdog_hard_deadline(run_start, timeout);
                 // Soft phase needs enough headroom for the guest to
                 // flush serial and reboot. Skip when timeout < 5s.
                 let soft_deadline = if timeout > Duration::from_secs(5) {
@@ -13018,114 +13292,11 @@ impl KtstrVm {
         // gate at once rather than waiting out the full timeout, and the
         // subsequent not-ready check turns that into a propagated error.
         {
-            // Milliseconds on the fast path. The run watchdog covers the whole
-            // VM at 120s, so a 30s bring-up cap sits comfortably below it while
-            // staying generous for a badly oversubscribed host.
-            const AP_READY_TIMEOUT: Duration = Duration::from_secs(30);
             // Real gate-start instant so the error can report the ACTUAL wait,
             // not the cap — a kill-break can trip the gate at ~0s elapsed.
             let gate_start = Instant::now();
-            let deadline = gate_start + AP_READY_TIMEOUT;
-            for latch in &ap_boot_latches {
-                while !latch.is_set() {
-                    if kill.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let now = Instant::now();
-                    if now >= deadline {
-                        break;
-                    }
-                    latch.wait_timeout((deadline - now).min(Duration::from_millis(100)));
-                }
-            }
-            // Report by guest CPU id: AP index `i` is thread `vcpu-{i+1}`
-            // (the BSP is vCPU 0), matching the spawn-loop naming.
-            let not_ready: Vec<usize> = ap_boot_latches
-                .iter()
-                .enumerate()
-                .filter(|(_, l)| !l.is_set())
-                .map(|(i, _)| i + 1)
-                .collect();
-            if !not_ready.is_empty() {
-                // Evidence dump — runs ONLY on the trip path. The old fixed
-                // "host CPU starvation" message was empirically refuted (fair
-                // scheduler contention cannot trip this gate even at 25x
-                // oversubscription), so instead of asserting a cause we collect
-                // per-thread kernel state and let the reader judge. For each AP
-                // whose boot latch never fired, read its published TID slot: the
-                // TID is stamped as the FIRST act of the AP closure, so a slot
-                // still 0 means the host thread ran zero instructions — the pure
-                // "never scheduled" signal. Comm-based attribution is NOT used:
-                // Rust sets a thread's name via prctl from INSIDE the thread, so
-                // a never-scheduled thread still carries the parent's comm. For a
-                // thread that did run, read
-                // /proc/self/task/{tid}/{stat,schedstat,wchan,status} once and
-                // pull the starved-vs-blocked discriminators. All reads are
-                // best-effort — a vanished TID yields "?" rather than failing.
-                use std::fmt::Write as _;
-                let mut evidence = String::new();
-                for (i, (tid_slot, _)) in ap_tid_slots.iter().enumerate() {
-                    if ap_boot_latches[i].is_set() {
-                        continue;
-                    }
-                    let vcpu_id = i + 1;
-                    let tid = tid_slot.load(Ordering::Acquire);
-                    if tid == 0 {
-                        let _ = writeln!(
-                            evidence,
-                            "  vCPU {vcpu_id}: never scheduled (no TID stamped) — \
-                             the host thread ran zero instructions of its closure \
-                             (pure starvation)"
-                        );
-                        continue;
-                    }
-                    let base = format!("/proc/self/task/{tid}");
-                    let read1 = |f: &str| {
-                        std::fs::read_to_string(format!("{base}/{f}"))
-                            .map(|s| s.trim().to_string())
-                            .unwrap_or_default()
-                    };
-                    // Split off everything after "(comm) " so a comm containing
-                    // ") " (or spaces) can't shift field indices. In that tail
-                    // field 0 is `state` (proc stat field 3); `processor` (last
-                    // CPU) is stat field 39, i.e. tail index 36.
-                    let stat = read1("stat");
-                    let tail = stat.rsplit(") ").next().unwrap_or("");
-                    let sf: Vec<&str> = tail.split(' ').collect();
-                    let state = sf.first().copied().unwrap_or("?");
-                    let last_cpu = sf.get(36).copied().unwrap_or("?");
-                    // schedstat field 2 = time runnable-but-not-running (ns):
-                    // large here means "wanted the CPU, didn't get it"
-                    // (starvation); near-zero with a kernel `wchan` means the
-                    // thread was blocked in-kernel, not starved.
-                    let schedstat = read1("schedstat");
-                    let wait_ns = schedstat.split_whitespace().nth(1).unwrap_or("?");
-                    let wchan = read1("wchan");
-                    let wchan = if wchan.is_empty() {
-                        "?"
-                    } else {
-                        wchan.as_str()
-                    };
-                    let status = read1("status");
-                    let nonvol = status
-                        .lines()
-                        .find_map(|l| l.strip_prefix("nonvoluntary_ctxt_switches:"))
-                        .map(str::trim)
-                        .unwrap_or("?");
-                    let _ = writeln!(
-                        evidence,
-                        "  vCPU {vcpu_id} (tid {tid}): state={state} \
-                         last_cpu={last_cpu} runnable_wait_ns={wait_ns} \
-                         wchan={wchan} nonvoluntary_ctxt_switches={nonvol}"
-                    );
-                }
-                return Err(anyhow::Error::new(ApGateTimeout {
-                    not_ready,
-                    elapsed: gate_start.elapsed(),
-                    killed: kill.load(Ordering::Acquire),
-                    evidence,
-                }));
-            }
+            wait_for_ap_boot_gate(&ap_boot_latches, &ap_tid_slots, 1, &kill, gate_start)
+                .map_err(anyhow::Error::new)?;
         }
 
         // BSP run loop. Wrapped in the same `with_vcpu_panic_ctx`
@@ -13223,8 +13394,8 @@ impl KtstrVm {
         let _ = kill_evt.write(1);
         // Sample cleanup start at the earliest moment after BSP exit so
         // every host-side teardown step lands inside the window, in
-        // execution order: watchdog join (immediately below), AP joins,
-        // monitor join, BPF writer join, bulk drain, exit-code and
+        // execution order: watchdog + coordinator joins, monitor join, AP
+        // joins, BPF writer join, bulk drain, exit-code and
         // crash-message extraction, and verifier-stat read (the rest
         // run inside `collect_results`). `collect_results` reads
         // `Instant::now()` at the end and the difference becomes
@@ -13574,6 +13745,13 @@ impl KtstrVm {
         let mut freeze_parked: Vec<Arc<AtomicBool>> = Vec::with_capacity(n);
         let mut freeze_regs: Vec<Arc<std::sync::Mutex<Option<exit_dispatch::VcpuRegSnapshot>>>> =
             Vec::with_capacity(n);
+        // Bring APs up progressively: after spawning vCPU N, wait until its
+        // boot latch fires before creating vCPU N+1. A single run-wide deadline
+        // bounds the entire loop, so a large topology does not multiply the
+        // 30-second safety cap. Any gate error returns while `spawn_guard`
+        // still owns every partial thread, preserving its kill/kick/join
+        // teardown before the caller can drop guest memory.
+        let ap_gate_start = Instant::now();
         for (i, mut vcpu) in vcpus.into_iter().enumerate() {
             let ie_handle = if has_immediate_exit {
                 Some(ImmediateExitHandle::from_vcpu(&mut vcpu))
@@ -13773,6 +13951,14 @@ impl KtstrVm {
             });
             freeze_parked.push(parked);
             freeze_regs.push(regs);
+            wait_for_ap_boot_gate(
+                &ap_boot_latches[i..=i],
+                &ap_tid_slots[i..=i],
+                i + 1,
+                kill,
+                ap_gate_start,
+            )
+            .map_err(anyhow::Error::new)?;
         }
         // All APs spawned — reclaim the set so the guard's Drop is a no-op.
         let ap_threads = spawn_guard.disarm();
@@ -13977,6 +14163,11 @@ impl KtstrVm {
         // [`monitor::reader::MonitorConfig::watchdog_reset`] as
         // `None`, and the loop's reset detection short-circuits.
         let workload_duration = self.workload_duration;
+        // Resolve pthread CPU clock IDs while every AP handle is known-live.
+        // The monitor samples these cached IDs for its entire lifetime; both
+        // normal and RAII teardown join the monitor before joining AP threads.
+        let vcpu_timing =
+            monitor::reader::VcpuTiming::from_pthreads(vcpu_pthreads, Some(contention_recorder));
 
         let handle = std::thread::Builder::new()
             .name("vmm-monitor".into())
@@ -14477,11 +14668,6 @@ impl KtstrVm {
                     page_offset_base_kva: symbols.page_offset_base_kva,
                     memstart_addr_kva: symbols.memstart_addr_kva,
                     event: event_refresh,
-                };
-
-                let vcpu_timing = monitor::reader::VcpuTiming {
-                    pthreads: vcpu_pthreads,
-                    contention_recorder: Some(contention_recorder),
                 };
 
                 // The legacy SHM signal slot 1 (`SIGNAL_PROBES_READY`)
@@ -15674,10 +15860,19 @@ impl KtstrVm {
         if let Some(h) = run.freeze_coordinator {
             let _ = h.join();
         }
+        // The monitor owns CPU clock IDs derived from the AP pthread handles.
+        // Join it while every AP is still alive; `kill_evt` above wakes its
+        // epoll loop promptly, so this does not wait for the sample cadence.
+        let monitor_loop_result = run.monitor_handle.and_then(|h| h.join().ok());
+        if crate::vmm::debug_logging_enabled() {
+            eprintln!("CLEANUP: monitor joined");
+        }
         // Kick + join every vCPU thread via the shared helper — the same
         // deadlock-safe drain (kick + unpark + epoll-wait with deadline, then
         // join) that `RunVmThreadGuard`'s `Drop` runs on the early-return path.
         // `kill` / `kill_evt` / `freeze` were set above, as the helper requires.
+        // This must remain after the monitor join above: pthread CPU clock IDs
+        // are not a safe lifetime token for a terminated thread.
         kick_and_join_ap_threads(run.ap_threads);
         if crate::vmm::debug_logging_enabled() {
             eprintln!("CLEANUP: all AP threads joined");
@@ -15721,48 +15916,44 @@ impl KtstrVm {
             slot.hit.store(false, Ordering::Release);
         }
 
-        let (monitor_report, mid_flight_drain, mid_run_verified_insns) =
-            match run.monitor_handle.and_then(|h| h.join().ok()) {
-                Some(monitor::reader::MonitorLoopResult {
+        let (monitor_report, mid_flight_drain, mid_run_verified_insns) = match monitor_loop_result {
+            Some(monitor::reader::MonitorLoopResult {
+                samples,
+                drain,
+                watchdog_observation,
+                page_offset,
+                preemption_threshold_ns,
+                boot_wait_outcome,
+                scx_event_counters_supported,
+                verified_insns,
+            }) => {
+                // `preemption_threshold_ns` was resolved once
+                // inside `start_monitor` (and threaded through
+                // `monitor_loop`'s 0-fallback) so the cleanup
+                // path does NOT re-read the vmlinux to recompute
+                // CONFIG_HZ. The previous structure called
+                // `monitor::vcpu_preemption_threshold_ns(Some(
+                // &self.kernel))` here, which re-read the
+                // vmlinux ELF every cleanup just to derive the
+                // same value the monitor thread already had in
+                // hand.
+                let summary = monitor::MonitorSummary::from_samples_with_threshold(
+                    &samples,
+                    preemption_threshold_ns,
+                );
+                let report = monitor::MonitorReport {
                     samples,
-                    drain,
+                    summary,
+                    preemption_threshold_ns,
                     watchdog_observation,
                     page_offset,
-                    preemption_threshold_ns,
                     boot_wait_outcome,
                     scx_event_counters_supported,
-                    verified_insns,
-                }) => {
-                    // `preemption_threshold_ns` was resolved once
-                    // inside `start_monitor` (and threaded through
-                    // `monitor_loop`'s 0-fallback) so the cleanup
-                    // path does NOT re-read the vmlinux to recompute
-                    // CONFIG_HZ. The previous structure called
-                    // `monitor::vcpu_preemption_threshold_ns(Some(
-                    // &self.kernel))` here, which re-read the
-                    // vmlinux ELF every cleanup just to derive the
-                    // same value the monitor thread already had in
-                    // hand.
-                    let summary = monitor::MonitorSummary::from_samples_with_threshold(
-                        &samples,
-                        preemption_threshold_ns,
-                    );
-                    let report = monitor::MonitorReport {
-                        samples,
-                        summary,
-                        preemption_threshold_ns,
-                        watchdog_observation,
-                        page_offset,
-                        boot_wait_outcome,
-                        scx_event_counters_supported,
-                    };
-                    (Some(report), drain, verified_insns)
-                }
-                None => (None, BulkDrainResult::default(), Vec::new()),
-            };
-        if crate::vmm::debug_logging_enabled() {
-            eprintln!("CLEANUP: monitor joined");
-        }
+                };
+                (Some(report), drain, verified_insns)
+            }
+            None => (None, BulkDrainResult::default(), Vec::new()),
+        };
         let cleanup_t = std::time::Instant::now();
 
         if let Some(h) = run.bpf_write_handle {
@@ -15991,9 +16182,9 @@ impl KtstrVm {
         // Sample cleanup elapsed AFTER every blocking step that runs on
         // the post-BSP-exit critical path so the duration captures the
         // full host-side teardown cost, not a partial window. The full
-        // ordered set is: watchdog join (in `run_vm`, before
-        // `cleanup_start` is stored on `VmRunState`), AP joins, monitor
-        // join, BPF writer join, bulk drain, exit-code and crash-message
+        // ordered set is: watchdog + coordinator joins (in `run_vm`, before
+        // `cleanup_start` is stored on `VmRunState`), monitor join, AP joins,
+        // BPF writer join, bulk drain, exit-code and crash-message
         // extraction, verifier-stat read. Captured before constructing
         // the result so the `Instant::now()` here is the latest possible
         // read.

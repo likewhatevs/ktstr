@@ -151,7 +151,7 @@ fn run_gauntlet_test_rejects_unknown_test_name() {
     // Well-formed two-part name whose test is not registered
     // in KTSTR_TESTS. Returns 1 via the find_test None branch,
     // never reaching preset lookup or VM spawn.
-    let exit = run_gauntlet_test("__not_a_test__/tiny-1llc");
+    let exit = run_gauntlet_test("__not_a_test__/4cpu-1llc-nosmt");
     assert_eq!(exit, 1);
 }
 
@@ -746,11 +746,11 @@ fn filter_rejects_when_no_declared_spec_matches() {
 
 #[test]
 fn format_empty_kernel_list_error_names_cell_and_dispatcher() {
-    let s = format_empty_kernel_list_error("verifier/sched_foo/kernel_6_14_2/tiny-1llc");
+    let s = format_empty_kernel_list_error("verifier/sched_foo/kernel_6_14_2/4cpu-1llc-nosmt");
     // Cell name appears verbatim so the operator can grep their
     // own invocation for the failing cell.
     assert!(
-        s.contains("verifier/sched_foo/kernel_6_14_2/tiny-1llc"),
+        s.contains("verifier/sched_foo/kernel_6_14_2/4cpu-1llc-nosmt"),
         "missing cell name in: {s}",
     );
     // Root cause is named explicitly.
@@ -770,7 +770,7 @@ fn format_empty_kernel_list_error_names_cell_and_dispatcher() {
 fn format_unknown_kernel_label_error_lists_present_labels_and_both_fix_paths() {
     let present = vec!["kernel_6_14_2", "kernel_6_15_0"];
     let s = format_unknown_kernel_label_error(
-        "verifier/sched_foo/kernel_7_0_0/tiny-1llc",
+        "verifier/sched_foo/kernel_7_0_0/4cpu-1llc-nosmt",
         "kernel_7_0_0",
         "sched_foo",
         &present,
@@ -778,7 +778,7 @@ fn format_unknown_kernel_label_error_lists_present_labels_and_both_fix_paths() {
     // Cell name + missing label appear so operators see exactly
     // which lookup failed.
     assert!(
-        s.contains("verifier/sched_foo/kernel_7_0_0/tiny-1llc"),
+        s.contains("verifier/sched_foo/kernel_7_0_0/4cpu-1llc-nosmt"),
         "missing cell name: {s}",
     );
     // Debug-formatted missing label (`{kernel_label:?}` produces
@@ -2901,14 +2901,14 @@ fn verifier_named_topology_exclusion_does_not_change_gauntlet_constraints() {
     let presets = crate::gauntlet::gauntlet_presets();
     let excluded = presets
         .iter()
-        .find(|p| p.name == "medium-4llc-nosmt")
+        .find(|p| p.name == "32cpu-4llc-nosmt")
         .expect("named verifier exclusion fixture preset");
     let retained = presets
         .iter()
-        .find(|p| p.name == "medium-8llc-nosmt")
+        .find(|p| p.name == "64cpu-8llc-nosmt")
         .expect("retained verifier fixture preset");
     let sched = Scheduler::named("verifier_exclusion_fixture")
-        .verifier_exclude_topologies(&["medium-4llc-nosmt"]);
+        .verifier_exclude_topologies(&["32cpu-4llc-nosmt"]);
 
     assert!(
         sched.constraints.accepts_verifier(&excluded.topology),
@@ -3039,8 +3039,9 @@ fn run_verifier_cell_unknown_scheduler_exits_one() {
     let (code, captured) = capture_stderr(|| {
         // Banner goes to stdout; swallow it so only the diagnostic
         // is examined. The 3 parts are sched/kernel/preset.
-        let (code, _stdout) =
-            capture_stdout(|| run_verifier_cell("verifier/__no_such_sched__/kernel_x/tiny-1llc"));
+        let (code, _stdout) = capture_stdout(|| {
+            run_verifier_cell("verifier/__no_such_sched__/kernel_x/4cpu-1llc-nosmt")
+        });
         code
     });
     assert_eq!(code, 1, "unknown scheduler cell must exit 1");
@@ -3135,12 +3136,12 @@ fn run_gauntlet_test_perf_mode_entry_derives_topo_then_skips() {
     let sidecar_dir = tempfile::tempdir().expect("create sidecar tempdir");
     let _sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, sidecar_dir.path());
 
-    // `tiny-1llc` is the first gauntlet preset (the first tuple in
+    // `4cpu-1llc-nosmt` is the first gauntlet preset (the first tuple in
     // `gauntlet::gauntlet_presets()`) — a
     // real preset so the preset-lookup guard passes and topo
     // derivation runs.
     let (code, captured) =
-        capture_stderr(|| run_gauntlet_test(&format!("{PERF_MODE_SKIP_NAME}/tiny-1llc")));
+        capture_stderr(|| run_gauntlet_test(&format!("{PERF_MODE_SKIP_NAME}/4cpu-1llc-nosmt")));
     assert_eq!(
         code, 0,
         "perf_mode gauntlet variant under --no-perf-mode must skip → exit 0 \

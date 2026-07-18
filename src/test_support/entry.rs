@@ -930,9 +930,9 @@ impl TopologyConstraints {
     /// Conservative default constraints: single NUMA node, 1-12 LLCs,
     /// no SMT requirement, 1-192 CPUs. Accepts most single-node
     /// gauntlet presets ktstr ships while rejecting multi-NUMA presets
-    /// (numa2-*, numa4-*) and the scale-boundary single-node presets
-    /// that exceed the CPU/LLC caps (240cpu-15llc-{smt2,nosmt},
-    /// 252cpu-14llc-{smt2,nosmt}, and related variants). Test authors
+    /// (`2numa-*`, `4numa-*`) and the scale-boundary single-node presets
+    /// that exceed the CPU/LLC caps (`240cpu-15llc-{smt,nosmt}`,
+    /// `252cpu-14llc-{smt,nosmt}`, and related variants). Test authors
     /// that want broader coverage must
     /// raise `max_numa_nodes`, `max_llcs`, or `max_cpus` explicitly.
     ///
@@ -2913,6 +2913,16 @@ pub struct SchedulerJson {
     /// [`declare_scheduler!`](crate::declare_scheduler) or
     /// [`Scheduler::named`].
     pub name: String,
+    /// Manifest directory of the crate that declared this scheduler.
+    ///
+    /// `Discover` resolution is workspace-relative: cargo walks upward from
+    /// this directory to find the declaring workspace. The verifier parent
+    /// carries it through scheduler discovery so it can prebuild the exact
+    /// package once and key the immutable artifact manifest identically to
+    /// the child cell. The serde default keeps probes from older linked test
+    /// binaries readable during a rolling upgrade.
+    #[serde(default)]
+    pub manifest_dir: String,
     /// Binary specification: distinguishes Discover (build via cargo
     /// `[[bin]]` name), Path (use absolute path verbatim), Eevdf
     /// (kernel default scheduler, no binary), and KernelBuiltin
@@ -3090,7 +3100,85 @@ impl From<TopologyConstraintsJson> for TopologyConstraints {
     }
 }
 
+fn verifier_kernel_entry_matches_spec(label: &str, sanitized: &str, spec: &str) -> bool {
+    use crate::kernel_path::{KernelId, decompose_version_for_compare};
+
+    match KernelId::parse(spec) {
+        KernelId::Version(spec_ver) => {
+            label == spec_ver || sanitized == super::sanitize_kernel_label(&spec_ver)
+        }
+        KernelId::Range { start, end, .. } => {
+            let Some(entry_t) = decompose_version_for_compare(label) else {
+                return false;
+            };
+            let Some(start_t) = decompose_version_for_compare(&start) else {
+                return false;
+            };
+            let Some(end_t) = decompose_version_for_compare(&end) else {
+                return false;
+            };
+            entry_t >= start_t && entry_t <= end_t
+        }
+        KernelId::CacheKey(_)
+        | KernelId::Path(_)
+        | KernelId::Git { .. }
+        | KernelId::Package { .. }
+        | KernelId::Distro { .. } => sanitized == super::sanitize_kernel_label(spec),
+    }
+}
+
+pub(super) fn verifier_kernel_specs_accept<'a>(
+    declared: impl IntoIterator<Item = &'a str>,
+    label: &str,
+    sanitized: &str,
+) -> bool {
+    let mut declared_any = false;
+    for spec in declared {
+        declared_any = true;
+        if verifier_kernel_entry_matches_spec(label, sanitized, spec) {
+            return true;
+        }
+    }
+    !declared_any
+}
+
 impl SchedulerJson {
+    /// Whether one resolved kernel entry survives this scheduler's declared
+    /// kernel filter. Shared by test-binary cell emission and the
+    /// `cargo ktstr verifier` parent prebuild planner so both sides classify
+    /// the same raw/sanitized label pair identically.
+    pub fn accepts_verifier_kernel(&self, label: &str, sanitized: &str) -> bool {
+        verifier_kernel_specs_accept(self.kernels.iter().map(String::as_str), label, sanitized)
+    }
+
+    /// Whether one canned topology preset survives this scheduler's verifier
+    /// constraints and named verifier-only exclusions.
+    pub fn accepts_verifier_preset(&self, preset: &crate::gauntlet::TopoPreset) -> bool {
+        TopologyConstraints::from(self.constraints).accepts_verifier(&preset.topology)
+            && !self
+                .verifier_exclude_topologies
+                .iter()
+                .any(|excluded| excluded == preset.name)
+    }
+
+    /// Whether the resolved kernel × canned-preset matrix contains at least
+    /// one cell this scheduler can emit. Binary-kind, path-existence,
+    /// workspace-membership, and scheduler-name checks are intentionally
+    /// handled by the callers because they require registry or filesystem
+    /// context; the matrix policy itself stays pure and shared.
+    pub fn has_accepted_verifier_cell<'a>(
+        &self,
+        kernels: impl IntoIterator<Item = (&'a str, &'a str)>,
+        presets: &[crate::gauntlet::TopoPreset],
+    ) -> bool {
+        kernels
+            .into_iter()
+            .any(|(label, sanitized)| self.accepts_verifier_kernel(label, sanitized))
+            && presets
+                .iter()
+                .any(|preset| self.accepts_verifier_preset(preset))
+    }
+
     /// Project a `Scheduler` static into its JSON shape.
     pub fn from_scheduler(s: &Scheduler) -> Self {
         let binary_kind = match s.binary {
@@ -3101,6 +3189,7 @@ impl SchedulerJson {
         };
         Self {
             name: s.name.to_string(),
+            manifest_dir: s.manifest_dir.to_string(),
             binary_kind,
             topology: TopologyJson {
                 num_numa_nodes: s.topology.num_numa_nodes(),
@@ -5078,7 +5167,7 @@ mod tests {
     // -- TopologyConstraints::accepts_verifier --
     //
     // The two beyond-host battery shapes added alongside this gate.
-    // WIDE_192 stands in for uneven-11llc's gating dimensions (11 LLCs,
+    // WIDE_192 stands in for 192cpu-11llc-smt's gating dimensions (11 LLCs,
     // 192 CPUs, 1 node, SMT — the gate reads only num_llcs/total_cpus/
     // numa/threads, not the per-LLC unevenness). NUMA2_2LLC: 2 nodes,
     // 2 LLCs, 32 CPUs, SMT.
@@ -5161,7 +5250,7 @@ mod tests {
         assert!(!c.accepts(&WIDE_192(), 4096, 4096, 4096)); // cap: numa? no — llcs 11<=12, cpus 198>192
         assert!(!c.accepts(&NUMA2_2LLC(), 4096, 4096, 4096)); // cap: numa 2>1
         // And the classic default-active presets still pass unchanged.
-        assert!(c.accepts_no_perf_mode(&Topology::new(1, 8, 4, 2), 4096)); // medium-8llc
+        assert!(c.accepts_no_perf_mode(&Topology::new(1, 8, 4, 2), 4096)); // 64cpu-8llc-smt
         assert!(c.accepts(&Topology::new(1, 8, 4, 2), 4096, 4096, 4096));
     }
 
@@ -6827,6 +6916,7 @@ mod tests {
     fn from_scheduler_copies_name_topology_args_kernels_constraints() {
         let json = SchedulerJson::from_scheduler(&Scheduler::EEVDF);
         assert_eq!(json.name, "eevdf");
+        assert_eq!(json.manifest_dir, env!("CARGO_MANIFEST_DIR"));
         // EEVDF topology baseline.
         assert_eq!(json.topology.num_numa_nodes, 1);
         assert_eq!(json.topology.num_llcs, 1);
@@ -6915,6 +7005,23 @@ mod tests {
             back, json,
             "SchedulerJson must round-trip through serde unchanged"
         );
+    }
+
+    /// `manifest_dir` was added to the scheduler-list wire shape after the
+    /// original probe protocol. Older JSON remains readable so a CLI can
+    /// diagnose a mixed-version binary explicitly instead of failing at
+    /// deserialization before it can name the offending declaration.
+    #[test]
+    fn scheduler_json_missing_manifest_dir_defaults_empty() {
+        let json = SchedulerJson::from_scheduler(&Scheduler::EEVDF);
+        let mut value = serde_json::to_value(json).expect("serialize SchedulerJson");
+        value
+            .as_object_mut()
+            .expect("SchedulerJson is an object")
+            .remove("manifest_dir");
+        let back: SchedulerJson =
+            serde_json::from_value(value).expect("legacy SchedulerJson deserializes");
+        assert!(back.manifest_dir.is_empty());
     }
 
     /// [`SchedulerListEntry`] — the `--ktstr-list-schedulers` wire element (a

@@ -83,9 +83,9 @@ This is what those names look like in a real run:
 
 <pre>
 ...
-ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/smt-3llc
-ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/tiny-1llc
-ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/tiny-2llc
+ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/4cpu-2llc-nosmt
+ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/8cpu-2llc-smt
+ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/9cpu-3llc-nosmt
 </pre></div>
 
 Filter by prefix with `-E 'test(/^ktstr/)'` or `-E 'test(/^gauntlet/)'`.

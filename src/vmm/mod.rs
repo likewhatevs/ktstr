@@ -814,7 +814,7 @@ impl KtstrVm {
         // than converting a transient peer hold into a host-skip.
         let run_locks = self.acquire_run_locks(true)?;
 
-        let initramfs_handle = self.spawn_initramfs_resolve();
+        let initramfs_handle = self.spawn_initramfs_resolve()?;
         if dbg {
             eprintln!("  initramfs spawn: {:?}", start.elapsed());
         }
@@ -1440,7 +1440,7 @@ impl KtstrVm {
     pub fn run_interactive(&self) -> Result<Option<i32>> {
         let start = Instant::now();
 
-        let initramfs_handle = self.spawn_initramfs_resolve();
+        let initramfs_handle = self.spawn_initramfs_resolve()?;
         let (mut vm, kernel_result) = self.create_vm_and_load_kernel()?;
 
         #[cfg(target_arch = "x86_64")]
@@ -1720,11 +1720,11 @@ impl KtstrVm {
                 )
             })
             .collect();
-        // Interactive shell does not gate guest boot on AP readiness (it has
-        // no thread-join guard for a post-spawn early return, and human-driven
-        // sessions are not run oversubscribed the way CI batches are). Allocate
-        // boot latches only to satisfy the shared spawn signature; the APs fire
-        // them and nothing waits — same throwaway pattern as `ap_tid_slots`.
+        // The shared AP spawner gates each AP progressively before creating
+        // the next one, including on the interactive path. This keeps a large
+        // shell topology from recreating the same host-thread thundering herd
+        // as a test VM. There is no separate outer all-AP gate here: every
+        // latch has already fired when `spawn_ap_threads` returns.
         let ap_boot_latches: Vec<Arc<crate::sync::Latch>> = (0..n_aps)
             .map(|_| Arc::new(crate::sync::Latch::new()))
             .collect();

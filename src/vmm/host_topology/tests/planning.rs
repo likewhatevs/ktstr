@@ -401,6 +401,36 @@ fn plan_from_snapshots_target_ge_all_selects_every_llc() {
     assert_eq!(selected_over, vec![0, 1, 2], "target > len clamps");
 }
 
+/// Saturation must preserve the LLC identities carried by the snapshots.
+/// Sparse snapshots arise when the caller's allowed CPU set excludes whole
+/// LLCs; treating snapshot positions as LLC indices would turn `[1, 3]` into
+/// `[0, 1]` and reserve the wrong lockfiles.
+#[test]
+fn plan_from_snapshots_sparse_saturation_preserves_llc_indices() {
+    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 0)]);
+    let snapshots = [1usize, 3]
+        .into_iter()
+        .map(|llc_idx| LlcSnapshot {
+            llc_idx,
+            lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{llc_idx}.lock")),
+            holders: Vec::new(),
+            holder_count: 0,
+        })
+        .collect::<Vec<_>>();
+    let allowed = (0..4).collect::<std::collections::BTreeSet<_>>();
+
+    let selected = plan_from_snapshots(
+        &snapshots,
+        2,
+        &topo,
+        &allowed,
+        |_, _| 10,
+        PlacementPolicy::Consolidate,
+    );
+
+    assert_eq!(selected, vec![1, 3]);
+}
+
 /// `plan_from_snapshots` with `target == 0` returns empty —
 /// early return in the algorithm. Pins the degenerate case
 /// so a future "optimization" that assumes selected[0] exists
@@ -687,8 +717,8 @@ fn warn_if_cross_node_spill_predicate_gates_stderr() {
     // must thread the rendered LLC list + the node count through.
     let expected = format!(
         "ktstr: reserving LLCs {list} across {n} NUMA nodes \
-         (preferred single-node contiguous unavailable). Build \
-         will run; memory-access latency may be higher.",
+         (preferred single-node contiguous unavailable). Work \
+         will proceed; memory-access latency may be higher.",
         list = format_llc_list(&multi_plan.locked_llcs, &topo),
         n = multi_plan.mems.len(),
     );
@@ -1085,13 +1115,26 @@ fn parked_build_locks_release_through_shared_borrow() {
     // The exact release expression from `acquire_run_locks`' no-perf arm.
     drop(std::mem::take(&mut *slot_ref.lock().unwrap()));
 
+    // Another test thread may fork while this fd is live. CLOEXEC closes the
+    // inherited copy at exec, but cannot prevent inheritance by the raw-fork
+    // queue test, whose children retain it until `_exit`. The kernel's flock
+    // entry can therefore outlive our local close briefly in a parallel
+    // cargo-test process. Require disappearance within a tight diagnostic
+    // deadline rather than in the same instant.
     let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo after release");
-    let after = crate::flock::read_holders_with_mountinfo(&lock_path, &mountinfo)
-        .expect("read holders after release");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let after = loop {
+        let holders = crate::flock::read_holders_with_mountinfo(&lock_path, &mountinfo)
+            .expect("read holders after release");
+        if holders.is_empty() || std::time::Instant::now() >= deadline {
+            break holders;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
     assert!(
-        after.iter().all(|h| h.pid != self_pid),
+        after.is_empty(),
         "take-and-drop through the shared borrow must release our \
-         LOCK_SH; holders still list us: {after:?}",
+         LOCK_SH and every fork-inherited copy; holders remain: {after:?}",
     );
     assert!(
         slot_ref.lock().unwrap().is_empty(),

@@ -236,8 +236,7 @@ fn sweep_stale_checkouts(temp_root: &Path) {
 /// production, re-raise it as the process exit (128+signal) now that the
 /// checkout teardown is done. Otherwise propagate the run's Result.
 fn finish_or_reraise(guard: crate::interrupt::InterruptGuard, run_res: Result<()>) -> Result<()> {
-    let caught = guard.interrupted();
-    drop(guard);
+    let caught = crate::interrupt::restore_and_caught(guard);
     if let Some(sig) = caught {
         crate::interrupt::reraise(sig);
     }
@@ -1228,6 +1227,7 @@ mod tests {
 
     #[test]
     fn finish_or_reraise_passes_through_when_not_interrupted() {
+        let _serial = crate::interrupt::test_serial_guard();
         // The common (no-signal) path must return the run Result unchanged.
         // The reraise branch is unreachable here (it would terminate the
         // process), so only the pass-through is pinned. Each nextest test is

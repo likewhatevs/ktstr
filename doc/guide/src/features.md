@@ -111,7 +111,7 @@ guest memory. Topology is a real verification axis: values baked into
 `.rodata` (like CPU counts) change what the verifier explores, so a
 scheduler can attach on one topology and be rejected on another.
 
-<!-- captured: cargo ktstr verifier --kernel <local sched_ext dev tree> --test docs_real_scheds tiny-1llc tiny-2llc odd-3llc smt-2llc | ktstr 0.23.0 | kernel sched_ext-for-7.2 b4dc42d2 -->
+<!-- captured: cargo ktstr verifier --kernel <local sched_ext dev tree> --test docs_real_scheds 4cpu-1llc-nosmt 4cpu-2llc-nosmt 9cpu-3llc-nosmt 8cpu-2llc-smt | ktstr 0.23.0 | kernel sched_ext-for-7.2 b4dc42d2 -->
 <div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr verifier --kernel ../linux --test my_schedulers</span></div>
 
 <pre>verifier verified_insns (per scheduler; rows: kernel, cols: BPF program, cell: range across topologies):
@@ -123,43 +123,43 @@ scx_p2dq:
 verifier results (per scheduler; rows: topology, cols: kernel):
 
 scx_bpfland: 4 ✅  0 ❌
-┌───────────┬──────────────┐
-│ topology  │ kernel_local │
-╞═══════════╪══════════════╡
-│ odd-3llc  │ <span class="t-grn">✓</span>            │
-├───────────┼──────────────┤
-│ smt-2llc  │ <span class="t-grn">✓</span>            │
-├───────────┼──────────────┤
-│ tiny-1llc │ <span class="t-grn">✓</span>            │
-├───────────┼──────────────┤
-│ tiny-2llc │ <span class="t-grn">✓</span>            │
-└───────────┴──────────────┘
+┌─────────────────┬──────────────┐
+│ topology        │ kernel_local │
+╞═════════════════╪══════════════╡
+│ 4cpu-1llc-nosmt │ <span class="t-grn">✓</span>            │
+├─────────────────┼──────────────┤
+│ 4cpu-2llc-nosmt │ <span class="t-grn">✓</span>            │
+├─────────────────┼──────────────┤
+│ 8cpu-2llc-smt   │ <span class="t-grn">✓</span>            │
+├─────────────────┼──────────────┤
+│ 9cpu-3llc-nosmt │ <span class="t-grn">✓</span>            │
+└─────────────────┴──────────────┘
 
 scx_lavd: 0 ✅  <span class="t-red">4 ❌</span>
-┌───────────┬──────────────┐
-│ topology  │ kernel_local │
-╞═══════════╪══════════════╡
-│ odd-3llc  │ <span class="t-red">✗</span>            │
-├───────────┼──────────────┤
-│ smt-2llc  │ <span class="t-red">✗</span>            │
-├───────────┼──────────────┤
-│ tiny-1llc │ <span class="t-red">✗</span>            │
-├───────────┼──────────────┤
-│ tiny-2llc │ <span class="t-red">✗</span>            │
-└───────────┴──────────────┘
+┌─────────────────┬──────────────┐
+│ topology        │ kernel_local │
+╞═════════════════╪══════════════╡
+│ 4cpu-1llc-nosmt │ <span class="t-red">✗</span>            │
+├─────────────────┼──────────────┤
+│ 4cpu-2llc-nosmt │ <span class="t-red">✗</span>            │
+├─────────────────┼──────────────┤
+│ 8cpu-2llc-smt   │ <span class="t-red">✗</span>            │
+├─────────────────┼──────────────┤
+│ 9cpu-3llc-nosmt │ <span class="t-red">✗</span>            │
+└─────────────────┴──────────────┘
 
 scx_p2dq: 4 ✅  0 ❌
-┌───────────┬──────────────┐
-│ topology  │ kernel_local │
-╞═══════════╪══════════════╡
-│ odd-3llc  │ <span class="t-grn">✓</span>            │
-├───────────┼──────────────┤
-│ smt-2llc  │ <span class="t-grn">✓</span>            │
-├───────────┼──────────────┤
-│ tiny-1llc │ <span class="t-grn">✓</span>            │
-├───────────┼──────────────┤
-│ tiny-2llc │ <span class="t-grn">✓</span>            │
-└───────────┴──────────────┘</pre></div>
+┌─────────────────┬──────────────┐
+│ topology        │ kernel_local │
+╞═════════════════╪══════════════╡
+│ 4cpu-1llc-nosmt │ <span class="t-grn">✓</span>            │
+├─────────────────┼──────────────┤
+│ 4cpu-2llc-nosmt │ <span class="t-grn">✓</span>            │
+├─────────────────┼──────────────┤
+│ 8cpu-2llc-smt   │ <span class="t-grn">✓</span>            │
+├─────────────────┼──────────────┤
+│ 9cpu-3llc-nosmt │ <span class="t-grn">✓</span>            │
+└─────────────────┴──────────────┘</pre></div>
 
 That sweep is real: on this development kernel `scx_bpfland` and
 `scx_p2dq` verify, attach, and dispatch on all four topologies, while
@@ -172,7 +172,7 @@ in kernel or module BTFs`). See
 On rejection, the log is cycle-collapsed — repeated loop-unrolling
 iterations are deduplicated so the offending access is readable:
 
-<!-- captured: cargo ktstr verifier --kernel 7.0 --scheduler ktstr_broken --test verifier_pipeline tiny-1llc | ktstr 0.23.0 | kernel 7.0.14 -->
+<!-- captured: cargo ktstr verifier --kernel 7.0 --scheduler ktstr_broken --test verifier_pipeline 4cpu-1llc-nosmt | ktstr 0.23.0 | kernel 7.0.14 -->
 <div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cycle-collapsed verifier rejection</span></div>
 
 <pre><span class="t-red">Global function ktstr_dispatch() doesn't return scalar. Only those are supported.</span>

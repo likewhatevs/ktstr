@@ -1285,13 +1285,13 @@ mod tests {
             TEST_SCHED, {
                 name = "test_sched",
                 binary = "scx_test",
-                verifier_exclude_topologies = ["tiny-1llc", "tiny-1llc"],
+                verifier_exclude_topologies = ["4cpu-1llc-nosmt", "4cpu-1llc-nosmt"],
             }
         })
         .unwrap_err();
         assert!(
             err.to_string()
-                .contains("duplicate `verifier_exclude_topologies` entry `tiny-1llc`"),
+                .contains("duplicate `verifier_exclude_topologies` entry `4cpu-1llc-nosmt`"),
             "unexpected diagnostic: {err}",
         );
     }
@@ -1302,7 +1302,7 @@ mod tests {
             TEST_SCHED, {
                 name = "test_sched",
                 binary = "scx_test",
-                verifier_exclude_topologies = ["tiny/1llc"],
+                verifier_exclude_topologies = ["4cpu/1llc-nosmt"],
             }
         })
         .unwrap_err();

@@ -11,7 +11,7 @@ use crate::vmm::topology::Topology;
 
 /// A test candidate for budget selection.
 pub(crate) struct TestCandidate {
-    /// Full test name for `--list` output (e.g. `"gauntlet/basic/tiny-1llc: test"`).
+    /// Full test name for `--list` output (e.g. `"gauntlet/basic/4cpu-1llc-nosmt: test"`).
     pub name: String,
     /// Bitset encoding test properties for coverage measurement.
     pub features: u64,

@@ -25,5 +25,5 @@ mod shell;
 
 pub(crate) use completions::run_completions;
 pub(crate) use export::run_export;
-pub(crate) use probe::probe_collect;
+pub(crate) use probe::{ProbeError, probe_collect, probe_collect_from_bins};
 pub(crate) use shell::run_shell;

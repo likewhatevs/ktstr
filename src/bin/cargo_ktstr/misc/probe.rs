@@ -165,18 +165,31 @@ pub(crate) fn probe_collect<T>(
     probe_collect_with_bins(&bins, configure_cmd, on_success)
 }
 
+/// Walk an exact caller-supplied set of already-built test executables.
+///
+/// The verifier dispatcher obtains this set directly from the reserved
+/// `cargo nextest run --no-run` Cargo JSON stream. Reusing those paths is
+/// load-bearing: rebuilding via [`build_test_binaries`] would be unscoped
+/// from nextest's package/feature selection and could both miss declarations
+/// and trigger a second workspace build. Other probe consumers should keep
+/// using [`probe_collect`].
+pub(crate) fn probe_collect_from_bins<T>(
+    bins: &[PathBuf],
+    configure_cmd: impl Fn(&Path) -> Command,
+    on_success: impl Fn(&Path, &Output) -> Result<T, String>,
+) -> Result<Vec<T>, ProbeError> {
+    probe_collect_with_bins(bins, configure_cmd, on_success)
+}
+
 /// Unit-testable core of [`probe_first`]: bins pre-built by
 /// caller. Separated so the loop + bookkeeping + Setup/Miss
 /// dispatch can be exercised without spawning a real
 /// `cargo build --tests`.
 ///
-/// PRIVATE on purpose: external cargo-ktstr subcommands MUST use
-/// [`probe_first`] (which includes the `build_test_binaries`
-/// step) — exposing `_with_bins` invites callers to build their
-/// own bin list and bypass the build-once path, fragmenting the
-/// invariant that every probe runs against the same canonical
-/// set. Tests below reach this fn via Rust's same-module
-/// sibling-visibility rule, no `pub(crate)` needed.
+/// PRIVATE on purpose: callers with an authoritative prebuilt set use
+/// [`probe_collect_from_bins`]; ordinary subcommands use [`probe_first`] or
+/// [`probe_collect`] so they cannot accidentally bypass the canonical build.
+/// Tests below reach this fn via Rust's same-module sibling visibility.
 fn probe_first_with_bins<T>(
     bins: &[PathBuf],
     configure_cmd: impl Fn(&Path) -> Command,

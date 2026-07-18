@@ -1805,13 +1805,18 @@ fn plan_from_snapshots(
             .filter(|c| allowed.contains(c))
             .count()
     };
-    let total_allowed_in_llcs: usize = (0..snapshots.len()).map(llc_allowed_cpus).sum();
+    let total_allowed_in_llcs: usize = snapshots
+        .iter()
+        .map(|snapshot| llc_allowed_cpus(snapshot.llc_idx))
+        .sum();
     if target_cpus >= total_allowed_in_llcs {
         // Budget ≥ sum of per-LLC contributions: select every LLC
         // that has at least one allowed CPU, in ascending order.
         // Short-circuits the scoring walk when the cap degenerates
         // to "reserve everything we can schedule on."
-        let mut all: Vec<usize> = (0..snapshots.len())
+        let mut all: Vec<usize> = snapshots
+            .iter()
+            .map(|snapshot| snapshot.llc_idx)
             .filter(|&idx| llc_allowed_cpus(idx) > 0)
             .collect();
         all.sort_unstable();
@@ -2528,8 +2533,8 @@ fn cross_node_spill_warning(plan: &LlcPlan, topo: &HostTopology) -> Option<Strin
     }
     Some(format!(
         "ktstr: reserving LLCs {list} across {n} NUMA nodes \
-         (preferred single-node contiguous unavailable). Build \
-         will run; memory-access latency may be higher.",
+         (preferred single-node contiguous unavailable). Work \
+         will proceed; memory-access latency may be higher.",
         list = format_llc_list(&plan.locked_llcs, topo),
         n = plan.mems.len(),
     ))

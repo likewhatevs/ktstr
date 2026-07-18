@@ -268,7 +268,7 @@ line and the `--- sched_ext dump ---` section.
    [test name shapes](../running-tests.md#test-name-shapes)):
 
    ```sh
-   cargo ktstr test --kernel 7.0 -- -E 'test(=gauntlet/my_test/smt-2llc)'
+   cargo ktstr test --kernel 7.0 -- -E 'test(=gauntlet/my_test/8cpu-2llc-smt)'
    ```
 
    or re-run everything that failed last session with

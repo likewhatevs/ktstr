@@ -2428,13 +2428,13 @@ fn group_field_extracts_correct_dimension() {
 fn format_dimension_summary_computed_values() {
     // Two scenarios: "fast" with spread=4.0, gap=40, and "slow" with spread=20.0, gap=200.
     // Each has 1 row. format_dimension_summary sorts by avg_spread descending.
-    let mut r1 = make_row("slow", "tiny-1llc", false, 20.0);
+    let mut r1 = make_row("slow", "4cpu-1llc-nosmt", false, 20.0);
     r1.gap_ms = 200;
     r1.imbalance_ratio = 2.5; // > 1.0, should show imbal=2.5
     r1.max_dsq_depth = 8; // > 0, should show dsq=8
     r1.stuck_count = 2.0; // > 0, should show stuck=2
     r1.fallback_count = 15; // > 0, should show fallback=15
-    let r2 = make_row("fast", "tiny-1llc", true, 4.0);
+    let r2 = make_row("fast", "4cpu-1llc-nosmt", true, 4.0);
     let rows = vec![r1, r2];
     let out = format_dimension_summary(&rows, "scenario");
     // "slow" has higher spread, should appear first (sorted descending).

@@ -448,7 +448,7 @@ cargo ktstr shell --kernel ./arch/x86/boot/bzImage
 `--test NAME` derives topology, memory, and include files from a
 registered `#[ktstr_test]` (mutually exclusive with `--topology` /
 `--memory-mib`; `-i` is additive) — so "why does this only fail on
-odd-3llc" becomes an interactive session in that exact machine.
+9cpu-3llc-nosmt" becomes an interactive session in that exact machine.
 
 For scripted checks, `--exec` runs a command and exits with its
 status:

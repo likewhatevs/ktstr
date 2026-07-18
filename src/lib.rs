@@ -1268,6 +1268,16 @@ pub const KTSTR_VERIFIER_RAW_ENV: &str = "KTSTR_VERIFIER_RAW";
 /// writer (cell) and reader (dispatcher) ends.
 pub const KTSTR_VERIFIER_RESULT_DIR_ENV: &str = "KTSTR_VERIFIER_RESULT_DIR";
 
+/// Name of the environment variable carrying the immutable, versioned
+/// scheduler-artifact manifest written by the `cargo ktstr verifier` parent.
+///
+/// Every child `Discover` cell performs an exact
+/// `(scheduler, package, manifest_dir)` lookup. When unset, direct/manual cell
+/// invocations retain the legacy on-demand Cargo build. When set, any
+/// malformed manifest, missing identity, or invalid path is a hard error and
+/// never falls back to rebuilding.
+pub const KTSTR_VERIFIER_SCHEDULER_MANIFEST_ENV: &str = "KTSTR_VERIFIER_SCHEDULER_MANIFEST";
+
 /// Name of the environment variable carrying the operator's
 /// `cargo ktstr verifier --scheduler <NAME>` filter. Set by the
 /// dispatcher in `src/bin/cargo_ktstr/verifier.rs`; read by
