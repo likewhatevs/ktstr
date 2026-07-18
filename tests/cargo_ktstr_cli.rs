@@ -7,6 +7,50 @@ fn cargo_ktstr() -> Command {
     cmd
 }
 
+/// The production process-group runner re-execs cargo-ktstr as a tiny group
+/// anchor. Pin the real binary entry path—not the unit-test shell substitute:
+/// it must acknowledge readiness before ordinary CLI initialization, ignore a
+/// forwarded terminal signal, and exit cleanly when its control pipe closes.
+#[test]
+fn hidden_process_group_anchor_obeys_its_control_pipe() {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-ktstr"))
+        .env("__KTSTR_PROCESS_GROUP_ANCHOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cargo-ktstr anchor mode");
+
+    let mut ready = [0_u8; 1];
+    child
+        .stdout
+        .as_mut()
+        .expect("anchor stdout pipe")
+        .read_exact(&mut ready)
+        .expect("anchor readiness byte");
+    assert_eq!(ready, *b"R");
+
+    // SAFETY: `child.id()` names this live subprocess and a positive pid
+    // targets only that process, not the test runner's process group.
+    assert_eq!(
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) },
+        0,
+        "deliver SIGTERM to the anchor",
+    );
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert!(
+        child.try_wait().expect("query live anchor").is_none(),
+        "anchor must ignore the forwarded terminal signal",
+    );
+
+    drop(child.stdin.take());
+    let status = child.wait().expect("reap anchor after control EOF");
+    assert!(status.success(), "anchor exits cleanly after control EOF");
+}
+
 // -- help output --
 
 #[test]

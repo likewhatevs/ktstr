@@ -223,6 +223,13 @@ pub(crate) fn run_replay(
     // selections above do no metadata work.
     let args = crate::feature_discovery::augment_test_features(args.to_vec())
         .map_err(anyhow::Error::msg)?;
+    // Discovery above is preflight and retains ordinary signal termination.
+    // Cross into cleanup ownership only when --exec is about to create the
+    // nextest process tree, so the shared anchored runner can forward the
+    // exact signal and reap same-group descendants before the top level
+    // restores and re-raises it.
+    crate::interrupt::enter_cleanup_phase()
+        .context("ktstr replay: enter interrupt cleanup phase")?;
     let exit =
         invoke_nextest(&filter_expr, profile, nextest_profile, &args).with_context(|| {
             format!("ktstr replay: cargo nextest run -E {filter_expr:?} failed to spawn")
@@ -721,8 +728,8 @@ fn regex_escape(s: &str) -> String {
 /// Invoke `cargo nextest run -E '<filter>'` and forward its exit
 /// code. Inherits stdout/stderr so the operator sees nextest's
 /// live progress. Returns the nextest exit code; an `Err` here
-/// is only for spawn failure (nextest binary missing,
-/// `Command::status()` failed at the syscall level).
+/// is only for a shared-runner spawn/wait failure (for example,
+/// the nextest binary is missing).
 ///
 /// `nextest_profile` becomes nextest's own `--profile <NAME>` (the test
 /// profile), placed before the user's trailing `args` so a passthrough
@@ -752,7 +759,7 @@ fn invoke_nextest(
     if let Some(p) = profile {
         cmd.env(ktstr::KTSTR_SCHEDULER_PROFILE_ENV, p);
     }
-    let status = cmd.status().context("spawn `cargo nextest run`")?;
+    let status = crate::interrupt::run_status(cmd).context("spawn `cargo nextest run`")?;
     Ok(status.code().unwrap_or(1))
 }
 

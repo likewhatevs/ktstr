@@ -459,6 +459,15 @@ fn run_cargo_sub(
         cmd.env("BPF_EXTRA_CFLAGS_PRE_INCL", inject);
     }
 
+    // Everything above is preflight: a signal should terminate immediately
+    // without parking around metadata, kernel resolution, or cache analysis.
+    // From this point onward the command may acquire a compile reservation or
+    // spawn the final run, so establish cleanup ownership first and expose a
+    // signal caught during the transition before acquiring either resource.
+    crate::interrupt::enter_cleanup_phase()
+        .map_err(|error| format!("cargo ktstr: enter cleanup phase: {error}"))?;
+    let _shm_cleanup = ShmCleanupGuard;
+
     // Reserve + cgroup-confine the harness COMPILE phase only — NOT the
     // test-running phase (each VM cell takes its own LLC reservation; a
     // reservation still held here would deadlock/starve them). `cargo
@@ -522,17 +531,11 @@ fn run_cargo_sub(
     if let Ok(d) = run_start.duration_since(std::time::UNIX_EPOCH) {
         cmd.env(ktstr::KTSTR_RUN_EPOCH_ENV, d.as_nanos().to_string());
     }
-    // Survive Ctrl-C / SIGTERM for the duration of the child run so the
-    // parent reaches its cleanup below instead of dying at the default
-    // disposition. nextest, in the same foreground process group,
-    // receives its own SIGINT and tears down every per-test child
-    // independently; this guard only stops the PARENT from dying so the
-    // shm sweep + artifact footer still run. See `crate::interrupt`.
-    let interrupt_guard = crate::interrupt::InterruptGuard::install();
-    let status = cmd
-        .status()
+    // The shared runner creates a dedicated process group and forwards a
+    // caught SIGINT/SIGTERM to it. The outer wrapper keeps the parent alive
+    // through cleanup and re-raises afterward.
+    let status = crate::interrupt::run_status(cmd)
         .map_err(|e| format!("spawn cargo {}: {e}", sub_argv.join(" ")))?;
-    cleanup_shm();
     // Surface per-test debugging artefacts: name each test that
     // FAILED this run and the concrete path to each of its artifacts
     // (failure dump, auto-repro dump, stats sidecar, wprof trace), so
@@ -549,14 +552,6 @@ fn run_cargo_sub(
     let footer = ktstr::test_support::format_run_artifact_footer(&runs_root, run_start);
     if !footer.is_empty() {
         eprint!("{footer}");
-    }
-    // Cleanup + footer are done. If a Ctrl-C / SIGTERM arrived during the
-    // run, propagate it as the conventional 128+signal exit (130 / 143)
-    // now that teardown has completed. Drop the guard first so the signal
-    // is back at its prior disposition before we re-raise.
-    let caught = crate::interrupt::restore_and_caught(interrupt_guard);
-    if let Some(sig) = caught {
-        crate::interrupt::reraise(sig);
     }
     if !status.success() {
         // nextest is the authoritative pass/fail signal. The footer
@@ -728,8 +723,17 @@ fn prepare_reserved_prebuild(
 ) -> Result<ktstr::cli::BuildReservation, String> {
     let cpu_cap = ktstr::cli::CpuCap::resolve(None)
         .map_err(|e| format!("{cli_label}: resolve harness-build CPU cap: {e:#}"))?;
-    let reservation = ktstr::cli::acquire_build_reservation_waiting(cli_label, cpu_cap)
-        .map_err(|e| format!("{cli_label}: acquire harness-build reservation: {e:#}"))?;
+    let reservation = ktstr::cli::acquire_build_reservation_waiting_interruptible(
+        cli_label,
+        cpu_cap,
+        &crate::interrupt::INTERRUPTED,
+    )
+    .map_err(|e| format!("{cli_label}: acquire harness-build reservation: {e:#}"))?;
+    if crate::interrupt::caught().is_some() {
+        return Err(format!(
+            "{cli_label}: harness-build reservation interrupted before pre-build"
+        ));
+    }
     if let Some(jobs) = reservation.make_jobs() {
         warm_cmd.env("CARGO_BUILD_JOBS", jobs.to_string());
     }
@@ -746,10 +750,10 @@ pub(crate) fn run_reserved_build_output(
 ) -> Result<std::process::Output, String> {
     let reservation = prepare_reserved_prebuild(&mut command, cli_label)?;
     tracing::debug!("{cli_label}: reserved {description}");
-    let output = command
+    command
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .output()
+        .stderr(std::process::Stdio::inherit());
+    let output = crate::interrupt::run_stdout(command)
         .map_err(|error| format!("{cli_label}: spawn {description}: {error}"))?;
     drop(reservation);
     Ok(output)
@@ -778,8 +782,7 @@ pub(crate) fn run_reserved_prebuild(mut warm_cmd: Command, cli_label: &str) -> R
     // returns, ahead of the combined build+run the caller then spawns.
     let _reservation = prepare_reserved_prebuild(&mut warm_cmd, cli_label)?;
     tracing::debug!("{cli_label}: reserved harness pre-build (cargo … --no-run)");
-    let status = warm_cmd
-        .status()
+    let status = crate::interrupt::run_status(warm_cmd)
         .map_err(|e| format!("{cli_label}: spawn reserved pre-build: {e}"))?;
     if !status.success() {
         return Err(format!(
@@ -949,9 +952,9 @@ fn resolve_target_dir() -> std::path::PathBuf {
     if let Ok(d) = std::env::var("CARGO_TARGET_DIR") {
         return std::path::PathBuf::from(d);
     }
-    if let Ok(output) = Command::new("cargo")
-        .args(["metadata", "--format-version=1", "--no-deps"])
-        .output()
+    let mut metadata = Command::new("cargo");
+    metadata.args(["metadata", "--format-version=1", "--no-deps"]);
+    if let Ok(output) = crate::interrupt::run_output(metadata)
         && output.status.success()
         && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
         && let Some(dir) = v["target_directory"].as_str()
@@ -1014,6 +1017,14 @@ pub(crate) fn install_runs_root_env() {
     // SAFETY: see the function doc — startup, before any threads.
     unsafe {
         std::env::set_var(ktstr::KTSTR_RUNS_ROOT_ENV, &runs_root);
+    }
+}
+
+struct ShmCleanupGuard;
+
+impl Drop for ShmCleanupGuard {
+    fn drop(&mut self) {
+        cleanup_shm();
     }
 }
 

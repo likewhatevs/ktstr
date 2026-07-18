@@ -232,17 +232,6 @@ fn sweep_stale_checkouts(temp_root: &Path) {
     }
 }
 
-/// Drop the interrupt guard; if a signal was caught during run
-/// production, re-raise it as the process exit (128+signal) now that the
-/// checkout teardown is done. Otherwise propagate the run's Result.
-fn finish_or_reraise(guard: crate::interrupt::InterruptGuard, run_res: Result<()>) -> Result<()> {
-    let caught = crate::interrupt::restore_and_caught(guard);
-    if let Some(sig) = caught {
-        crate::interrupt::reraise(sig);
-    }
-    run_res
-}
-
 /// `cargo ktstr test --kernel <k> [-E <filter>] [<passthrough>...]` argv
 /// (after the `cargo` program name). The baseline child runs the SAME
 /// selection as HEAD; `KTSTR_PERF_ONLY` in the env (see
@@ -595,16 +584,19 @@ fn noise_dual_run(
     // lock drops after its checkout is removed (LIFO: guards drop first).
     let _baseline_lock = acquire_baseline_checkout_lock(&wt_dir, baseline_short)?;
     let _head_lock = acquire_baseline_checkout_lock(&head_wt_dir, head_short)?;
-    // Create both checkouts, self-healing any leftover from an interrupted prior
-    // run (Ctrl-C / SIGKILL skip CheckoutGuard::drop).
-    create_checkout_from_tree(repo, &wt_dir, baseline_tree, baseline_short)?;
+    // Install each guard before its checkout starts so an error or interrupt
+    // during materialization cannot leak a partial directory.
     let _baseline_guard = CheckoutGuard {
         wt_dir: wt_dir.clone(),
     };
-    create_checkout_from_tree(repo, &head_wt_dir, head_tree, head_short)?;
+    create_checkout_from_tree(repo, &wt_dir, baseline_tree, baseline_short)?;
+    if crate::interrupt::caught().is_some() {
+        return Ok(());
+    }
     let _head_guard = CheckoutGuard {
         wt_dir: head_wt_dir.clone(),
     };
+    create_checkout_from_tree(repo, &head_wt_dir, head_tree, head_short)?;
     // Ctrl-C during either checkout: bail before the run loop. The guards remove
     // the (possibly partial) checkouts.
     if crate::interrupt::caught().is_some() {
@@ -620,7 +612,8 @@ fn noise_dual_run(
         let head_leaf = noise_run_leaf(&runs_root_abs, "head", head_short, i);
         println!("perf-delta --noise-adjust: run {}/{runs}", i + 1);
 
-        let bs = Command::new("cargo")
+        let mut baseline_command = Command::new("cargo");
+        baseline_command
             .current_dir(&wt_dir)
             .args(perf_test_argv(
                 &kernel_arg,
@@ -629,8 +622,8 @@ fn noise_dual_run(
                 nextest_profile,
                 passthrough,
             ))
-            .envs(baseline_child_env(&base_leaf, baseline_short))
-            .status()
+            .envs(baseline_child_env(&base_leaf, baseline_short));
+        let bs = crate::interrupt::run_status(baseline_command)
             .with_context(|| format!("spawn baseline `cargo ktstr test` (noise run {i})"))?;
         if !bs.success() {
             eprintln!("perf-delta --noise-adjust: warning: baseline run {i} exited {bs}");
@@ -639,7 +632,8 @@ fn noise_dual_run(
             break;
         }
 
-        let hs = Command::new("cargo")
+        let mut head_command = Command::new("cargo");
+        head_command
             .current_dir(&head_wt_dir)
             .args(perf_test_argv(
                 &kernel_arg,
@@ -650,8 +644,8 @@ fn noise_dual_run(
             ))
             .env(ktstr::KTSTR_PERF_ONLY_ENV, "1")
             .env(ktstr::KTSTR_SIDECAR_DIR_ENV, &head_leaf)
-            .env(ktstr::KTSTR_PROJECT_COMMIT_ENV, head_short)
-            .status()
+            .env(ktstr::KTSTR_PROJECT_COMMIT_ENV, head_short);
+        let hs = crate::interrupt::run_status(head_command)
             .with_context(|| format!("spawn HEAD `cargo ktstr test` (noise run {i})"))?;
         if !hs.success() {
             eprintln!("perf-delta --noise-adjust: warning: HEAD run {i} exited {hs}");
@@ -871,26 +865,28 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
         // Reclaim checkouts orphaned by prior interrupted runs against
         // OTHER baselines (the per-baseline self-heal misses them).
         sweep_stale_checkouts(&std::env::temp_dir());
-        // Survive Ctrl-C during run production so CheckoutGuard::drop
-        // (checkout removal) runs; propagate the interrupt as 128+signal.
-        let interrupt_guard = crate::interrupt::InterruptGuard::install();
-        finish_or_reraise(
-            interrupt_guard,
-            noise_dual_run(
-                &repo,
-                &cwd,
-                baseline_tree,
-                head_snapshot_tree,
-                &baseline,
-                &head,
-                kernel,
-                effective_filter,
-                args.profile,
-                args.nextest_profile,
-                args.passthrough,
-                n,
-            ),
+        // Everything through stale-checkout reclamation is preflight. Enter
+        // cleanup ownership immediately before taking the live checkout locks;
+        // the top-level guard remains installed until both CheckoutGuards have
+        // dropped and then re-raises any caught signal.
+        crate::interrupt::enter_cleanup_phase().context("enter cleanup phase for perf-delta")?;
+        noise_dual_run(
+            &repo,
+            &cwd,
+            baseline_tree,
+            head_snapshot_tree,
+            &baseline,
+            &head,
+            kernel,
+            effective_filter,
+            args.profile,
+            args.nextest_profile,
+            args.passthrough,
+            n,
         )?;
+        if crate::interrupt::caught().is_some() {
+            return Ok(0);
+        }
         // If the perf run produced no sidecars at all — no
         // `#[ktstr_test(performance_mode)]` tests are defined, or `-E` / `--relevant`
         // narrowed the selection to none — there is nothing to compare. Exit cleanly
@@ -1223,24 +1219,6 @@ mod tests {
 
         drop(held);
         let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn finish_or_reraise_passes_through_when_not_interrupted() {
-        let _serial = crate::interrupt::test_serial_guard();
-        // The common (no-signal) path must return the run Result unchanged.
-        // The reraise branch is unreachable here (it would terminate the
-        // process), so only the pass-through is pinned. Each nextest test is
-        // its own process, so installing the guard is isolated.
-        let g = crate::interrupt::InterruptGuard::install();
-        assert!(g.interrupted().is_none(), "no signal delivered in-test");
-        assert!(finish_or_reraise(g, Ok(())).is_ok(), "Ok passes through");
-
-        let g2 = crate::interrupt::InterruptGuard::install();
-        assert!(
-            finish_or_reraise(g2, Err(anyhow::anyhow!("boom"))).is_err(),
-            "Err propagates unchanged"
-        );
     }
 
     #[test]

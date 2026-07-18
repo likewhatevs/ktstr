@@ -128,7 +128,7 @@ pub fn acquire_build_reservation(
     cli_label: &str,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
 ) -> Result<BuildReservation> {
-    acquire_build_reservation_impl(cli_label, cpu_cap, false)
+    acquire_build_reservation_impl(cli_label, cpu_cap, false, None)
 }
 
 /// Acquire a build reservation, joining the progress-aware host queue when
@@ -143,14 +143,29 @@ pub fn acquire_build_reservation_waiting(
     cli_label: &str,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
 ) -> Result<BuildReservation> {
-    acquire_build_reservation_impl(cli_label, cpu_cap, true)
+    acquire_build_reservation_impl(cli_label, cpu_cap, true, None)
+}
+
+/// Cancellation-aware harness-build reservation.
+///
+/// A signal-published `cancelled` flag interrupts a contended queue/head wait,
+/// releasing the FIFO ticket, claim, partial LLC holds, and any completed plan
+/// before returning [`std::io::ErrorKind::Interrupted`].
+pub fn acquire_build_reservation_waiting_interruptible(
+    cli_label: &str,
+    cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<BuildReservation> {
+    acquire_build_reservation_impl(cli_label, cpu_cap, true, Some(cancelled))
 }
 
 fn acquire_build_reservation_impl(
     cli_label: &str,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
     wait: bool,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<BuildReservation> {
+    check_reservation_cancelled(cancelled)?;
     let bypass = crate::bypass_llc_locks_active();
     // INVARIANT: `_sandbox` is declared first and drops first per
     // Rust's declaration-order field-drop rule; this ensures the
@@ -175,13 +190,23 @@ fn acquire_build_reservation_impl(
         // LLCs leaves whole LLCs free for exclusive perf-mode
         // reservations, and a build is throughput-elastic where a VM's
         // vCPU threads are not (VMs use Spread — see `PlacementPolicy`).
-        let acquired_plan = crate::vmm::host_topology::acquire_llc_plan(
-            &host_topo,
-            &test_topo,
-            cpu_cap,
-            crate::vmm::host_topology::PlacementPolicy::Consolidate,
-            wait,
-        )?;
+        let acquired_plan = match cancelled {
+            Some(flag) => crate::vmm::host_topology::acquire_llc_plan_interruptible(
+                &host_topo,
+                &test_topo,
+                cpu_cap,
+                crate::vmm::host_topology::PlacementPolicy::Consolidate,
+                flag,
+            )?,
+            None => crate::vmm::host_topology::acquire_llc_plan(
+                &host_topo,
+                &test_topo,
+                cpu_cap,
+                crate::vmm::host_topology::PlacementPolicy::Consolidate,
+                wait,
+            )?,
+        };
+        check_reservation_cancelled(cancelled)?;
         crate::vmm::host_topology::warn_if_cross_node_spill(&acquired_plan, &host_topo);
         Some(acquired_plan)
     } else {
@@ -216,6 +241,7 @@ fn acquire_build_reservation_impl(
         )?),
         None => None,
     };
+    check_reservation_cancelled(cancelled)?;
 
     // `make -jN` parallelism hint. `N` = `plan.cpus.len()` via
     // `make_jobs_for_plan` — the reserved CPU count, whether that
@@ -230,6 +256,18 @@ fn acquire_build_reservation_impl(
         _sandbox: sandbox,
         make_jobs,
     })
+}
+
+fn check_reservation_cancelled(cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<()> {
+    if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "ktstr build-reservation acquisition interrupted",
+        )
+        .into())
+    } else {
+        Ok(())
+    }
 }
 
 /// Acquire an exclusive flock on a per-source-canonical-path lockfile

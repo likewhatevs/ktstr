@@ -4,6 +4,7 @@
 //! vCPU pinning and host resource validation.
 
 use anyhow::{Context, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Advisory flock primitives live in `crate::flock` so both LLC +
 // per-CPU coordination here and per-cache-entry coordination in
@@ -2007,6 +2008,33 @@ pub fn acquire_llc_plan(
     policy: PlacementPolicy,
     wait: bool,
 ) -> Result<LlcPlan> {
+    acquire_llc_plan_impl(topo, test_topo, cpu_cap, policy, wait, None)
+}
+
+/// Cancellation-aware waiting LLC-plan acquisition.
+///
+/// This is the harness-build reservation path: normal contention retains one
+/// FIFO queue ticket, while a published cancellation interrupts either the
+/// queue flock or the head's inotify sleep and releases every partial hold.
+pub fn acquire_llc_plan_interruptible(
+    topo: &HostTopology,
+    test_topo: &crate::topology::TestTopology,
+    cpu_cap: Option<CpuCap>,
+    policy: PlacementPolicy,
+    cancelled: &AtomicBool,
+) -> Result<LlcPlan> {
+    acquire_llc_plan_impl(topo, test_topo, cpu_cap, policy, true, Some(cancelled))
+}
+
+fn acquire_llc_plan_impl(
+    topo: &HostTopology,
+    test_topo: &crate::topology::TestTopology,
+    cpu_cap: Option<CpuCap>,
+    policy: PlacementPolicy,
+    wait: bool,
+    cancelled: Option<&AtomicBool>,
+) -> Result<LlcPlan> {
+    check_acquire_cancelled(cancelled)?;
     if crate::cargo_test_mode::cargo_test_mode_active() {
         // Bare `cargo test` mode: no peer-coordination contract.
         // Synthesise a degenerate plan that names every LLC and
@@ -2050,13 +2078,15 @@ pub fn acquire_llc_plan(
                     .and_then(|c| topo.cpu_to_node.get(&c).copied())
             })
             .collect();
-        return Ok(LlcPlan {
+        let plan = LlcPlan {
             locked_llcs,
             cpus: allowed,
             mems,
             snapshot: Vec::new(),
             locks: Vec::new(),
-        });
+        };
+        check_acquire_cancelled(cancelled)?;
+        return Ok(plan);
     }
     acquire_llc_plan_with_acquire_fn(
         topo,
@@ -2064,8 +2094,21 @@ pub fn acquire_llc_plan(
         cpu_cap,
         policy,
         wait,
+        cancelled,
         try_acquire_llc_plan_locks,
     )
+}
+
+fn check_acquire_cancelled(cancelled: Option<&AtomicBool>) -> Result<()> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "ktstr LLC-plan acquisition interrupted",
+        )
+        .into())
+    } else {
+        Ok(())
+    }
 }
 
 /// Parameterized form of [`acquire_llc_plan`] that takes the
@@ -2111,11 +2154,13 @@ fn acquire_llc_plan_with_acquire_fn<F>(
     cpu_cap: Option<CpuCap>,
     policy: PlacementPolicy,
     wait: bool,
+    cancelled: Option<&AtomicBool>,
     mut acquire_fn: F,
 ) -> Result<LlcPlan>
 where
     F: FnMut(&[usize], &[LlcSnapshot]) -> Result<Option<Vec<std::os::fd::OwnedFd>>>,
 {
+    check_acquire_cancelled(cancelled)?;
     // Resolve the calling process's allowed cpuset. Plans must fit
     // inside this set — sched_setaffinity against a mask outside the
     // process's cgroup cpuset either fails outright or produces an
@@ -2167,12 +2212,14 @@ where
     let mountinfo = crate::flock::read_mountinfo().map_err(|e| ResourceContention {
         reason: format!("read /proc/self/mountinfo: {e}"),
     })?;
+    check_acquire_cancelled(cancelled)?;
 
     // ---- FAST PHASE: TOCTOU-bounded, non-blocking, all-or-nothing,
     // claim-subtracted (protocol rules 2-4). Bounded attempts, then
     // either bail (no-wait callers) or join the queue.
     let mut attempt: u32 = 0;
     loop {
+        check_acquire_cancelled(cancelled)?;
         let snapshots =
             discover_llc_snapshots(topo, &allowed, &mountinfo).map_err(|e| ResourceContention {
                 reason: format!("discover LLC snapshots: {e}"),
@@ -2237,14 +2284,10 @@ where
             })?
         };
         if let Some(locks) = acquired {
-            return Ok(materialize_llc_plan(
-                selected,
-                snapshots,
-                locks,
-                topo,
-                &allowed,
-                target_cpus,
-            ));
+            let plan =
+                materialize_llc_plan(selected, snapshots, locks, topo, &allowed, target_cpus);
+            check_acquire_cancelled(cancelled)?;
+            return Ok(plan);
         }
         if attempt >= ACQUIRE_MAX_TOCTOU_RETRIES {
             break;
@@ -2252,6 +2295,7 @@ where
         // Short backoff between fast-phase attempts so a racing peer
         // has time to drop its fds before the next DISCOVER.
         std::thread::sleep(TOCTOU_RETRY_DELAYS[attempt as usize]);
+        check_acquire_cancelled(cancelled)?;
         attempt = attempt.saturating_add(1);
     }
 
@@ -2291,8 +2335,12 @@ where
     // holds NO resource locks (every fast-phase attempt above was
     // all-or-nothing); as head, its `LOCK_SH` partials are retained
     // across re-plans exactly when the fresh plan still selects them.
-    let _queue = protocol::wait_for_queue_turn()?;
-    let outcome = protocol::acquire_as_head(|held| {
+    check_acquire_cancelled(cancelled)?;
+    let _queue = match cancelled {
+        Some(flag) => protocol::wait_for_queue_turn_interruptible(flag)?,
+        None => protocol::wait_for_queue_turn()?,
+    };
+    let step = |held: &mut protocol::HeldLocks| {
         // RE-PLAN against live holder state on every wake — plans are
         // never cached across waits. The freed capacity may satisfy a
         // different selection than the one that was busy last wake.
@@ -2331,16 +2379,18 @@ where
                 },
             })
         }
-    })?;
+    };
+    let outcome = match cancelled {
+        Some(flag) => protocol::acquire_as_head_interruptible(flag, step)?,
+        None => protocol::acquire_as_head(step)?,
+    };
     match outcome {
-        protocol::HeadOutcome::Acquired((selected, snapshots, locks)) => Ok(materialize_llc_plan(
-            selected,
-            snapshots,
-            locks,
-            topo,
-            &allowed,
-            target_cpus,
-        )),
+        protocol::HeadOutcome::Acquired((selected, snapshots, locks)) => {
+            let plan =
+                materialize_llc_plan(selected, snapshots, locks, topo, &allowed, target_cpus);
+            check_acquire_cancelled(cancelled)?;
+            Ok(plan)
+        }
         protocol::HeadOutcome::Aborted { reason } => {
             Err(anyhow::Error::new(ResourceContention { reason }))
         }

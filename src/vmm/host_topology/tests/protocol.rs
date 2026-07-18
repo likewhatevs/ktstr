@@ -7,6 +7,41 @@ use super::super::protocol;
 use super::super::*;
 use super::*;
 
+static INTERRUPTIBLE_FLOCK_BROKER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct InterruptibleFlockBrokerGuard {
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+impl InterruptibleFlockBrokerGuard {
+    fn start() -> Self {
+        let serial = INTERRUPTIBLE_FLOCK_BROKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::flock::start_interruptible_flock_broker().expect("start interruptible flock broker");
+        Self { _serial: serial }
+    }
+}
+
+impl Drop for InterruptibleFlockBrokerGuard {
+    fn drop(&mut self) {
+        crate::flock::stop_interruptible_flock_broker();
+    }
+}
+
+fn wait_for_broker_signal_after(previous: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while crate::flock::primitives::interruptible_flock_broker_signal_count() <= previous
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    assert!(
+        crate::flock::primitives::interruptible_flock_broker_signal_count() > previous,
+        "eventfd broker must deliver a targeted RT wake",
+    );
+}
+
 /// True when the machine's 1-minute loadavg exceeds 60% of its core
 /// count. The CI runners are colocated and routinely saturated, which
 /// dilates the wall time of a promptness assertion past any fixed bound
@@ -282,6 +317,313 @@ fn queue_turn_release_grants_waiter() {
         elapsed >= std::time::Duration::from_millis(80),
         "the waiter must actually block behind the initial turn; elapsed={elapsed:?}",
     );
+}
+
+/// Cancellation preserves the ordinary queue's one-ticket FIFO behavior while
+/// still closing the last-check/enter-flock race. The same registration stays
+/// live after becoming head so its inotify sleep is interruptible, and the
+/// published claim is removed before marker liveness is released.
+#[test]
+fn interrupt_wakes_queue_gap_and_head_poll_with_raii_claim_cleanup() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+
+    // Declared first so broker shutdown/join is the final test cleanup action.
+    let _broker = InterruptibleFlockBrokerGuard::start();
+    let _prefixes = LockPrefixesGuard::new();
+    let holder = protocol::wait_for_queue_turn().expect("initial queue acquire");
+
+    let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE.with(|p| p.borrow().clone());
+    let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE.with(|p| p.borrow().clone());
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let waiter_cancelled = Arc::clone(&cancelled);
+    let (gap_tx, gap_rx) = mpsc::sync_channel(1);
+    let (continue_tx, continue_rx) = mpsc::sync_channel(1);
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let waiter = std::thread::spawn(move || {
+        LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = llc_prefix);
+        CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = cpu_prefix);
+        let result =
+            protocol::wait_for_queue_turn_interruptible_with_handoff(&waiter_cancelled, || {
+                gap_tx.send(()).expect("announce final-check gap");
+                continue_rx.recv().expect("release final-check gap");
+            })
+            .map(|_| ());
+        result_tx
+            .send(result)
+            .expect("report interrupted queue wait");
+    });
+
+    if let Err(error) = gap_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        cancelled.store(true, Ordering::Release);
+        let waiter_id = crate::flock::interruptible_flock_waiter_id();
+        crate::flock::wake_interruptible_flock_waiter(waiter_id);
+        // The helper may already be parked inside the handoff closure. This
+        // channel has capacity one, so sending is also safe if it has not
+        // reached `recv` yet; ignore disconnect when it failed earlier.
+        let _ = continue_tx.send(());
+        drop(holder);
+        waiter.join().expect("queue waiter thread");
+        panic!("waiter did not reach the final-check/enter-flock gap: {error}");
+    }
+    let waiter_id = crate::flock::interruptible_flock_waiter_id();
+    if waiter_id == 0 {
+        cancelled.store(true, Ordering::Release);
+        continue_tx.send(()).expect("release waiter into flock");
+        drop(holder);
+        waiter.join().expect("queue waiter thread");
+        panic!("queue waiter must publish its registration generation");
+    }
+    cancelled.store(true, Ordering::Release);
+    crate::flock::wake_interruptible_flock_waiter(waiter_id);
+    continue_tx.send(()).expect("release waiter into flock");
+
+    let queue_result = match result_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        Ok(result) => result,
+        Err(error) => {
+            // Avoid stranding the helper if the assertion fails: releasing the
+            // authoritative holder lets it leave the flock even if the wake
+            // mechanism regressed.
+            drop(holder);
+            waiter.join().expect("queue waiter thread");
+            panic!("cancelled waiter remained blocked behind a live holder: {error}");
+        }
+    };
+    assert!(
+        queue_result
+            .expect_err("cancelled queue wait must not acquire")
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::Interrupted),
+        "queue cancellation must surface ErrorKind::Interrupted",
+    );
+    waiter.join().expect("queue waiter thread");
+    // The holder was deliberately still live when the waiter returned: the
+    // wake, not an authoritative flock release, ended its wait.
+    drop(holder);
+    assert_eq!(
+        crate::flock::interruptible_flock_waiter_id(),
+        0,
+        "queue registration must be torn down on error",
+    );
+
+    // Exercise the same registration across the queue-to-head transition.
+    let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE.with(|p| p.borrow().clone());
+    let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE.with(|p| p.borrow().clone());
+    let head_cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&head_cancelled);
+    let (head_result_tx, head_result_rx) = mpsc::sync_channel(1);
+    let head = std::thread::spawn(move || {
+        LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = llc_prefix);
+        CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = cpu_prefix);
+        let result = (|| {
+            let _turn = protocol::wait_for_queue_turn_interruptible(&worker_cancelled)?;
+            protocol::acquire_as_head_interruptible(&worker_cancelled, |_| {
+                let mut claim = protocol::ClaimSet::default();
+                claim.llcs.insert(91991);
+                Ok::<_, anyhow::Error>(protocol::HeadStep::<()>::Waiting { claim })
+            })
+        })();
+        head_result_tx
+            .send(result.map(|_| ()))
+            .expect("report interrupted head wait");
+    });
+
+    let claim_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let claim_path = protocol::head_claim_path();
+    while !std::path::Path::new(&claim_path).exists() && std::time::Instant::now() < claim_deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let claim_was_published = std::path::Path::new(&claim_path).exists();
+    let head_waiter_id = crate::flock::interruptible_flock_waiter_id();
+    head_cancelled.store(true, Ordering::Release);
+    crate::flock::wake_interruptible_flock_waiter(head_waiter_id);
+
+    let head_wake_start = std::time::Instant::now();
+    let head_result = head_result_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("cancelled head poll must wake without its fallback delay");
+    let head_wake_elapsed = head_wake_start.elapsed();
+    assert!(
+        claim_was_published,
+        "head must publish its claim before sleeping",
+    );
+    assert!(
+        head_waiter_id > 0,
+        "queue head must retain its registered generation",
+    );
+    assert!(
+        head_result
+            .expect_err("cancelled head must not complete")
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::Interrupted),
+        "head cancellation must surface ErrorKind::Interrupted",
+    );
+    if !host_appears_loaded() {
+        assert!(
+            head_wake_elapsed < std::time::Duration::from_millis(400),
+            "RT cancellation must interrupt the head poll before its 500 ms \
+             fallback; elapsed={head_wake_elapsed:?}",
+        );
+    }
+    head.join().expect("queue head thread");
+    assert!(
+        !std::path::Path::new(&claim_path).exists(),
+        "claim cleanup must run on the interrupt error path",
+    );
+    let _marker = crate::flock::try_flock(
+        protocol::head_marker_path(),
+        crate::flock::FlockMode::Exclusive,
+    )
+    .expect("open marker after cancellation")
+    .expect("head marker must release after claim cleanup");
+}
+
+/// Queue an old generation in the broker, then tear it down and register a new
+/// generation on the SAME Linux thread with the private RT signal originally
+/// blocked. Drop must drain through EINTR, restore the blocked mask, and stop
+/// the old retry before the new generation's poll.
+#[test]
+fn stale_generation_cannot_wake_same_tid_after_blocked_mask_restore() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, mpsc};
+
+    let _broker = InterruptibleFlockBrokerGuard::start();
+    let _prefixes = LockPrefixesGuard::new();
+    let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE.with(|p| p.borrow().clone());
+    let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE.with(|p| p.borrow().clone());
+    let stale_cancelled = Arc::new(AtomicBool::new(false));
+    let stale_worker_cancelled = Arc::clone(&stale_cancelled);
+    let (first_id_tx, first_id_rx) = mpsc::sync_channel(1);
+    let (advance_tx, advance_rx) = mpsc::sync_channel(1);
+    let (second_id_tx, second_id_rx) = mpsc::sync_channel(1);
+    let (stale_result_tx, stale_result_rx) = mpsc::sync_channel(1);
+    let stale_worker = std::thread::spawn(move || {
+        LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = llc_prefix);
+        CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = cpu_prefix);
+
+        // Exercise the harder mask-restoration case: each registration
+        // temporarily unblocks the private RT signal, while Drop must drain
+        // every old wake and restore it to blocked before the next generation
+        // on this same thread.
+        let wake_signal = libc::SIGRTMIN() + 4;
+        let mut wake_set: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut wake_set);
+            libc::sigaddset(&mut wake_set, wake_signal);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, &wake_set, std::ptr::null_mut(),),
+                0,
+                "block private RT wake before first registration",
+            );
+        }
+
+        let first = protocol::wait_for_queue_turn_interruptible(&stale_worker_cancelled)
+            .expect("first same-thread registration");
+        first_id_tx
+            .send(crate::flock::interruptible_flock_waiter_id())
+            .expect("report first generation");
+        advance_rx.recv().expect("advance to next generation");
+        drop(first);
+
+        let mut restored_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut restored_mask,),
+                0,
+                "read mask restored by first registration",
+            );
+            assert_eq!(
+                libc::sigismember(&restored_mask, wake_signal),
+                1,
+                "first registration must restore the originally blocked RT wake",
+            );
+        }
+
+        let second = protocol::wait_for_queue_turn_interruptible(&stale_worker_cancelled)
+            .expect("second same-thread registration");
+        second_id_tx
+            .send(crate::flock::interruptible_flock_waiter_id())
+            .expect("report second generation");
+        let result = protocol::LockDirWatch::new()
+            .and_then(|watch| watch.wait(std::time::Duration::from_millis(150)));
+        stale_result_tx
+            .send(result)
+            .expect("report stale-generation poll result");
+        drop(second);
+    });
+
+    let first_id = first_id_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("first registration generation");
+    let signal_count = crate::flock::primitives::interruptible_flock_broker_signal_count();
+    crate::flock::wake_interruptible_flock_waiter(first_id);
+    wait_for_broker_signal_after(signal_count);
+    advance_tx.send(()).expect("advance same-thread waiter");
+    let second_id = second_id_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("second registration generation");
+    assert_ne!(
+        first_id, second_id,
+        "successive registrations need distinct generations",
+    );
+    let stale_result = stale_result_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("new generation's bounded poll");
+    assert!(
+        stale_result.is_ok(),
+        "an old broker retry must not interrupt a later same-thread \
+         registration: {stale_result:?}",
+    );
+    stale_worker.join().expect("same-thread generation worker");
+}
+
+/// Stop while the broker is actively retrying a live generation. Shutdown
+/// hides the eventfd, drains handler writers, wakes through the owned fd, joins
+/// the reader, and can then be restarted after the registration drops.
+#[test]
+fn interruptible_broker_stops_during_retry_and_restarts() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, mpsc};
+
+    let _broker = InterruptibleFlockBrokerGuard::start();
+    let _prefixes = LockPrefixesGuard::new();
+    let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE.with(|p| p.borrow().clone());
+    let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE.with(|p| p.borrow().clone());
+    let shutdown_cancelled = Arc::new(AtomicBool::new(false));
+    let shutdown_worker_cancelled = Arc::clone(&shutdown_cancelled);
+    let (shutdown_id_tx, shutdown_id_rx) = mpsc::sync_channel(1);
+    let (shutdown_release_tx, shutdown_release_rx) = mpsc::sync_channel(1);
+    let shutdown_worker = std::thread::spawn(move || {
+        LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = llc_prefix);
+        CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = cpu_prefix);
+        let turn = protocol::wait_for_queue_turn_interruptible(&shutdown_worker_cancelled)
+            .expect("shutdown-drain registration");
+        shutdown_id_tx
+            .send(crate::flock::interruptible_flock_waiter_id())
+            .expect("report shutdown generation");
+        shutdown_release_rx
+            .recv()
+            .expect("release shutdown registration");
+        drop(turn);
+    });
+    let shutdown_id = shutdown_id_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("shutdown registration generation");
+    let signal_count = crate::flock::primitives::interruptible_flock_broker_signal_count();
+    crate::flock::wake_interruptible_flock_waiter(shutdown_id);
+    wait_for_broker_signal_after(signal_count);
+    crate::flock::stop_interruptible_flock_broker();
+    shutdown_release_tx
+        .send(())
+        .expect("release registration after broker join");
+    shutdown_worker
+        .join()
+        .expect("broker-shutdown registration worker");
+
+    crate::flock::start_interruptible_flock_broker()
+        .expect("broker must restart after a complete stop");
+    crate::flock::stop_interruptible_flock_broker();
 }
 
 /// The queue does not diagnose a live holder from elapsed wall time.

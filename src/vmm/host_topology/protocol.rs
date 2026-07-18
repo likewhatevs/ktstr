@@ -88,9 +88,10 @@ use anyhow::Result;
 use std::collections::BTreeSet;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::flock::{FlockMode, block_flock, try_flock};
+use crate::flock::{FlockMode, InterruptibleFlockWaiter, block_flock, try_flock};
 
 /// Fallback wake for the head's inotify sleep, bounding the staleness
 /// window if an event is missed (e.g. a release racing the
@@ -266,7 +267,44 @@ impl LockDirWatch {
 /// RAII queue-head license. The flock is the authoritative ticket and
 /// disappears automatically if the process crashes.
 pub(crate) struct QueueTurn {
+    // Keep the thread-directed wake registration alive while this turn owns
+    // the head license. A cancellation signal can therefore interrupt either
+    // the queue flock below or the head's inotify poll. It is deliberately the
+    // first field: struct fields drop in declaration order, so registration
+    // teardown completes before releasing the queue flock to the next head.
+    _interrupt_waiter: Option<InterruptibleFlockWaiter>,
     _fd: OwnedFd,
+}
+
+fn interrupted() -> anyhow::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "ktstr resource acquisition interrupted",
+    )
+    .into()
+}
+
+fn check_interrupted(cancelled: Option<&AtomicBool>) -> Result<()> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        Err(interrupted())
+    } else {
+        Ok(())
+    }
+}
+
+/// Prefer the caller's authoritative cancellation verdict over an incidental
+/// syscall error (most commonly the `EINTR` produced by the private wake).
+fn check_result<T>(result: Result<T>, cancelled: Option<&AtomicBool>) -> Result<T> {
+    match result {
+        Ok(value) => {
+            check_interrupted(cancelled)?;
+            Ok(value)
+        }
+        Err(error) => {
+            check_interrupted(cancelled)?;
+            Err(error)
+        }
+    }
 }
 
 /// Wait for our turn at the head of the acquisition queue.
@@ -284,14 +322,78 @@ pub(crate) struct QueueTurn {
 /// were all-or-nothing and released everything), so parking here can
 /// never feed a deadlock cycle.
 pub(crate) fn wait_for_queue_turn() -> Result<QueueTurn> {
+    wait_for_queue_turn_impl(None, || {})
+}
+
+/// Cancellation-aware variant of [`wait_for_queue_turn`].
+///
+/// The waiter retains one kernel FIFO flock request throughout healthy
+/// contention. The RT-wake broker remains idle until the caller publishes
+/// `cancelled = true` and asks [`crate::flock::wake_interruptible_flock_waiter`]
+/// to wake the exact registered generation.
+pub(crate) fn wait_for_queue_turn_interruptible(cancelled: &AtomicBool) -> Result<QueueTurn> {
+    wait_for_queue_turn_impl(Some(cancelled), || {})
+}
+
+fn wait_for_queue_turn_impl(
+    cancelled: Option<&AtomicBool>,
+    before_block: impl FnOnce(),
+) -> Result<QueueTurn> {
+    check_interrupted(cancelled)?;
+    let interrupt_waiter = check_result(
+        cancelled
+            .map(|_| InterruptibleFlockWaiter::register())
+            .transpose(),
+        cancelled,
+    )?;
+    check_interrupted(cancelled)?;
+
     let qpath = queue_lock_path();
     // Fast grab: empty queue is the common case.
-    if let Some(fd) = try_flock(&qpath, FlockMode::Exclusive)? {
-        return Ok(QueueTurn { _fd: fd });
+    let fast = match try_flock(&qpath, FlockMode::Exclusive) {
+        Ok(fast) => fast,
+        Err(error) => {
+            check_interrupted(cancelled)?;
+            return Err(error);
+        }
+    };
+    if let Some(fd) = fast {
+        let turn = QueueTurn {
+            _interrupt_waiter: interrupt_waiter,
+            _fd: fd,
+        };
+        check_interrupted(cancelled)?;
+        return Ok(turn);
     }
-    Ok(QueueTurn {
-        _fd: block_flock(&qpath, FlockMode::Exclusive)?,
-    })
+
+    // This check plus the cancellation broker's repeated RT wake closes both
+    // sides of the check/enter-flock race: a cancellation before the check
+    // returns here, while one after it interrupts the syscall on a broker tick.
+    check_interrupted(cancelled)?;
+    before_block();
+    let fd = match block_flock(&qpath, FlockMode::Exclusive) {
+        Ok(fd) => fd,
+        Err(error) => {
+            check_interrupted(cancelled)?;
+            return Err(error);
+        }
+    };
+    let turn = QueueTurn {
+        _interrupt_waiter: interrupt_waiter,
+        _fd: fd,
+    };
+    check_interrupted(cancelled)?;
+    Ok(turn)
+}
+
+/// Test seam for deterministically cancelling after the final userspace check
+/// but before entering the blocking flock.
+#[cfg(test)]
+pub(crate) fn wait_for_queue_turn_interruptible_with_handoff(
+    cancelled: &AtomicBool,
+    before_block: impl FnOnce(),
+) -> Result<QueueTurn> {
+    wait_for_queue_turn_impl(Some(cancelled), before_block)
 }
 
 /// The head's accumulated partial holds, keyed by lockfile path.
@@ -407,6 +509,16 @@ pub(crate) enum HeadOutcome<T> {
     Aborted { reason: String },
 }
 
+/// Claim manifest cleanup must precede marker-flock release on every exit,
+/// including a closure error or an interrupt out of the inotify poll.
+struct HeadClaimCleanup;
+
+impl Drop for HeadClaimCleanup {
+    fn drop(&mut self) {
+        clear_claim();
+    }
+}
+
 /// Run the head loop: RE-PLAN ON EVERY WAKE (the step closure is
 /// called afresh each iteration and must plan from live holder state
 /// — plans are never cached across waits), publish the claim, sleep
@@ -418,41 +530,82 @@ pub(crate) enum HeadOutcome<T> {
 /// liveness and releases it (plus any partial holds inside `held`)
 /// on every exit path.
 pub(crate) fn acquire_as_head<T>(
+    step: impl FnMut(&mut HeldLocks) -> Result<HeadStep<T>>,
+) -> Result<HeadOutcome<T>> {
+    acquire_as_head_impl(None, step)
+}
+
+/// Cancellation-aware variant of [`acquire_as_head`].
+///
+/// The [`QueueTurn`] returned by [`wait_for_queue_turn_interruptible`] keeps
+/// the private wake registration alive, so cancellation interrupts the
+/// inotify poll rather than waiting for its fallback tick.
+pub(crate) fn acquire_as_head_interruptible<T>(
+    cancelled: &AtomicBool,
+    step: impl FnMut(&mut HeldLocks) -> Result<HeadStep<T>>,
+) -> Result<HeadOutcome<T>> {
+    acquire_as_head_impl(Some(cancelled), step)
+}
+
+fn acquire_as_head_impl<T>(
+    cancelled: Option<&AtomicBool>,
     mut step: impl FnMut(&mut HeldLocks) -> Result<HeadStep<T>>,
 ) -> Result<HeadOutcome<T>> {
-    let watch = LockDirWatch::new()?;
+    check_interrupted(cancelled)?;
+    let watch = check_result(LockDirWatch::new(), cancelled)?;
     // The marker should be free: at most one head exists (queue EX)
     // and a crashed head's marker flock died with it. A held marker
     // here means a protocol bug — surface it rather than wedge.
-    let _marker = try_flock(head_marker_path(), FlockMode::Exclusive)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "acquisition protocol: head marker {} is held while the queue \
-             lock was free to take — two heads must never coexist",
-            head_marker_path()
-        )
-    })?;
+    let _marker = match try_flock(head_marker_path(), FlockMode::Exclusive) {
+        Ok(Some(marker)) => marker,
+        Ok(None) => {
+            return Err(anyhow::anyhow!(
+                "acquisition protocol: head marker {} is held while the queue \
+                 lock was free to take — two heads must never coexist",
+                head_marker_path()
+            ));
+        }
+        Err(error) => {
+            check_interrupted(cancelled)?;
+            return Err(error);
+        }
+    };
+    // Declared after `_marker` so Rust's reverse drop order removes the
+    // manifest while marker liveness is still held.
+    let _claim_cleanup = HeadClaimCleanup;
+    check_interrupted(cancelled)?;
     let mut held = HeldLocks::default();
     let mut last_claim: Option<ClaimSet> = None;
     let outcome = loop {
-        match step(&mut held)? {
+        check_interrupted(cancelled)?;
+        let next = match step(&mut held) {
+            Ok(next) => next,
+            Err(error) => {
+                check_interrupted(cancelled)?;
+                return Err(error);
+            }
+        };
+        check_interrupted(cancelled)?;
+        match next {
             HeadStep::Complete(t) => break HeadOutcome::Acquired(t),
             HeadStep::Abort { reason } => break HeadOutcome::Aborted { reason },
             HeadStep::Waiting { claim } => {
                 if last_claim.as_ref() != Some(&claim) {
-                    publish_claim(&claim)?;
+                    check_result(publish_claim(&claim), cancelled)?;
                     last_claim = Some(claim);
                 }
+                check_interrupted(cancelled)?;
                 // Drain our own attempt's open/close churn so we sleep
                 // on EXTERNAL events, then park until a lockfile
                 // closes somewhere (a release — or a peer bounce,
                 // which costs one spurious re-plan) or the fallback
                 // tick bounds the staleness window.
                 watch.drain();
-                let _ = watch.wait(HEAD_WAKE_FALLBACK)?;
+                check_interrupted(cancelled)?;
+                check_result(watch.wait(HEAD_WAKE_FALLBACK), cancelled)?;
             }
         }
     };
-    clear_claim();
     Ok(outcome)
 }
 

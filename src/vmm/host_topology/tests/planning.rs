@@ -1191,6 +1191,7 @@ fn acquire_llc_plan_retry_succeeds_on_attempt_one() {
         None,
         PlacementPolicy::Consolidate,
         false,
+        None,
         |_selected, _snapshots| {
             let n = counter.get();
             counter.set(n + 1);
@@ -1241,6 +1242,7 @@ fn acquire_llc_plan_retry_exhausted_bails_with_resource_contention() {
         None,
         PlacementPolicy::Consolidate,
         false,
+        None,
         |_selected, _snapshots| {
             counter.set(counter.get() + 1);
             Ok(None)
@@ -1293,6 +1295,7 @@ fn acquire_llc_plan_wait_phase_acquires_beyond_the_seam() {
         None,
         PlacementPolicy::Consolidate,
         true,
+        None,
         |_selected, _snapshots| {
             counter.set(counter.get() + 1);
             // Fast phase always bounces; the wait phase must succeed

@@ -1136,7 +1136,7 @@ struct SchedulerPrebuildContext<'a> {
     result_dir: &'a Path,
     metadata_options: &'a [String],
     build_options: &'a [String],
-    interrupt_guard: &'a crate::interrupt::InterruptGuard,
+    interrupted: &'a std::sync::atomic::AtomicBool,
 }
 
 fn prebuild_scheduler_manifest(
@@ -1145,7 +1145,10 @@ fn prebuild_scheduler_manifest(
     profile: &str,
     context: SchedulerPrebuildContext<'_>,
 ) -> Result<ktstr::verifier::VerifierSchedulerArtifactManifest, String> {
-    if context.interrupt_guard.interrupted().is_some() {
+    if context
+        .interrupted
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
         return Err("cargo ktstr verifier interrupted before scheduler prebuild".to_string());
     }
     let requests = selected_discover_requests(
@@ -1167,11 +1170,17 @@ fn prebuild_scheduler_manifest(
     let mut entries = Vec::with_capacity(requests.len());
     let mut snapshots: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
     for group in &groups {
-        if context.interrupt_guard.interrupted().is_some() {
+        if context
+            .interrupted
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             return Err("cargo ktstr verifier interrupted during scheduler prebuild".to_string());
         }
         let artifacts = build_scheduler_workspace(group, profile, context.build_options)?;
-        if context.interrupt_guard.interrupted().is_some() {
+        if context
+            .interrupted
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             return Err("cargo ktstr verifier interrupted during scheduler prebuild".to_string());
         }
         for request in &group.requests {
@@ -1415,12 +1424,13 @@ pub(crate) fn run_verifier(
     // handling: the verifier dispatcher injects none, so warm-up and run
     // inherit the identical process env.
     //
-    // Install one outer signal guard BEFORE creating any run-owned state or
-    // spawning any compile/probe child. Every `?` below exits this closure,
-    // dropping `result_dir` before the guard is removed and the caught signal
-    // is re-raised as 130/143. SIGKILL cannot run Rust cleanup; the existing
-    // dead-pid sweep remains the next-run recovery for that case.
-    let interrupt_guard = crate::interrupt::InterruptGuard::install();
+    // Everything above is preflight: package metadata and kernel resolution
+    // retain terminate-immediately signal behavior. Cross into cleanup
+    // ownership immediately before the first result directory/reservation.
+    // The one top-level guard remains installed while every `?` below drops
+    // `result_dir`, then re-raises the first caught signal as 130/143.
+    crate::interrupt::enter_cleanup_phase()
+        .map_err(|error| format!("cargo ktstr verifier: enter cleanup phase: {error}"))?;
     let guarded_result = (|| -> Result<Option<i32>, String> {
         // Per-cell result dir: each verifier cell writes its PASS/FAIL record
         // here (via KTSTR_VERIFIER_RESULT_DIR), and after nextest returns we
@@ -1429,7 +1439,7 @@ pub(crate) fn run_verifier(
         // declaration probes, scheduler prebuild/snapshots, manifest write,
         // and the final nextest run.
         let result_dir = VerifierResultDir::create(&std::env::temp_dir())?;
-        if interrupt_guard.interrupted().is_some() {
+        if crate::interrupt::INTERRUPTED.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(None);
         }
 
@@ -1443,11 +1453,11 @@ pub(crate) fn run_verifier(
             warm,
             "cargo ktstr verifier",
         )?;
-        if interrupt_guard.interrupted().is_some() {
+        if crate::interrupt::INTERRUPTED.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(None);
         }
         let declarations = probe_scheduler_declarations(&test_bins)?;
-        if interrupt_guard.interrupted().is_some() {
+        if crate::interrupt::INTERRUPTED.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(None);
         }
         cmd.env(ktstr::KTSTR_VERIFIER_RESULT_DIR_ENV, result_dir.path());
@@ -1471,15 +1481,15 @@ pub(crate) fn run_verifier(
                 result_dir: result_dir.path(),
                 metadata_options: &declaring_cargo_options,
                 build_options: &scheduler_cargo_options,
-                interrupt_guard: &interrupt_guard,
+                interrupted: &crate::interrupt::INTERRUPTED,
             },
         )?;
-        if interrupt_guard.interrupted().is_some() {
+        if crate::interrupt::INTERRUPTED.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(None);
         }
         let scheduler_manifest_path =
             write_scheduler_manifest(result_dir.path(), &scheduler_manifest)?;
-        if interrupt_guard.interrupted().is_some() {
+        if crate::interrupt::INTERRUPTED.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(None);
         }
         cmd.env(
@@ -1500,13 +1510,13 @@ pub(crate) fn run_verifier(
             },
         );
 
-        // The outer guard survives Ctrl-C / SIGTERM so the result-dir cleanup
-        // below runs; nextest tears down its own test children.
-        if interrupt_guard.interrupted().is_some() {
+        // The top-level guard and shared group runner survive Ctrl-C/SIGTERM
+        // so nextest descendants and the result directory both finish
+        // teardown before the signal becomes the parent outcome.
+        if crate::interrupt::INTERRUPTED.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(None);
         }
-        let status = cmd
-            .status()
+        let status = crate::interrupt::run_status(cmd)
             .map_err(|e| format!("spawn cargo nextest run: {e}"))?;
 
         // From the records each cell wrote into `result_dir`: print the
@@ -1548,14 +1558,13 @@ pub(crate) fn run_verifier(
     })();
 
     // `guarded_result` owns no result-dir guard here: every success/error path
-    // dropped it inside the closure. Restore the prior signal dispositions,
-    // then preserve the first caught SIGINT/SIGTERM as the process outcome.
-    let caught = crate::interrupt::restore_and_caught(interrupt_guard);
-    if let Some(sig) = caught {
-        crate::interrupt::reraise(sig);
-    }
+    // dropped it inside the closure. The top-level interrupt owner restores
+    // dispositions and re-raises only after this function returns.
     match guarded_result {
-        Ok(Some(code)) => std::process::exit(code),
+        Ok(Some(code)) => {
+            crate::interrupt::defer_exit_code(code);
+            Ok(())
+        }
         Ok(None) => Ok(()),
         Err(error) => Err(error),
     }

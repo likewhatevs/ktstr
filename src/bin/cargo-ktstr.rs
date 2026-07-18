@@ -91,6 +91,13 @@ use ktstr::cli::KernelCommand;
 use crate::cli::{Cargo, CargoSub, KtstrCommand};
 
 fn main() {
+    // Process-group anchors re-exec this binary with a private marker and
+    // control pipes. Handle that mode before blob extraction, Cargo metadata,
+    // tracing, argument parsing, or any other ordinary CLI initialization.
+    if interrupt::run_anchor_mode_if_requested() {
+        return;
+    }
+
     ktstr::host_heap::mark_jemalloc_global_allocator();
     // Restore SIGPIPE so piping `cargo ktstr ... | head` doesn't
     // panic inside `print!`. See `ktstr::cli::restore_sigpipe_default`
@@ -144,8 +151,24 @@ fn main() {
         Err(e) => e.exit(),
     };
 
+    // One handler installation spans the dispatched CLI lifetime. It starts
+    // in EARLY mode, where SIGINT/SIGTERM retain terminate-immediately
+    // semantics through command-specific metadata, network, and kernel
+    // preflight. Run-producing dispatchers cross into cleanup ownership
+    // immediately before their first reservation/result-dir/checkout, then
+    // this top-level owner restores and re-raises only after every
+    // dispatcher-local RAII cleanup has completed. Installing after parsing
+    // also leaves Clap's direct error exit under the ordinary dispositions.
+    let interrupt_guard = interrupt::InterruptGuard::install();
     let result = dispatch_command(ktstr.command);
 
+    let caught = interrupt::restore_and_caught(interrupt_guard);
+    if let Some(signal) = caught {
+        interrupt::reraise(signal);
+    }
+    if let Some(code) = interrupt::take_deferred_exit_code() {
+        std::process::exit(code);
+    }
     if let Err(e) = result {
         eprintln!("error: {e:#}");
         std::process::exit(1);
@@ -254,7 +277,10 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
             &args,
         ) {
             Ok(0) => Ok(()),
-            Ok(code) => std::process::exit(code),
+            Ok(code) => {
+                interrupt::defer_exit_code(code);
+                Ok(())
+            }
             Err(e) => Err(format!("{e:#}")),
         },
         KtstrCommand::PerfDelta {
@@ -307,7 +333,10 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
             };
             match perf_delta::run(&args) {
                 Ok(0) => Ok(()),
-                Ok(code) => std::process::exit(code),
+                Ok(code) => {
+                    interrupt::defer_exit_code(code);
+                    Ok(())
+                }
                 Err(e) => Err(format!("{e:#}")),
             }
         }
@@ -440,10 +469,14 @@ fn dispatch_admin_command(command: KtstrCommand) -> Result<(), String> {
         ) {
             // Shell mode exits with the guest payload's own exit code
             // (recovered from the ExecExit bulk frame); interactive mode
-            // (None) exits 0. Diverge here so it does not fall through to
-            // the uniform exit-0 path below; Err routes to the shared
-            // error handler.
-            Ok(opt) => std::process::exit(opt.unwrap_or(0)),
+            // (None) exits 0. Defer a non-zero code until the top-level
+            // signal owner has restored dispositions; Err routes to the
+            // shared error handler.
+            Ok(Some(code)) if code != 0 => {
+                interrupt::defer_exit_code(code);
+                Ok(())
+            }
+            Ok(_) => Ok(()),
             Err(e) => Err(e),
         },
         // Reached only for variants `dispatch_run_command` handles;

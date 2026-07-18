@@ -30,8 +30,13 @@
 //!    and permissions don't depend on creation order.
 
 use anyhow::Result;
-use std::os::fd::OwnedFd;
+use std::marker::PhantomData;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
+use std::rc::Rc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
+use std::thread::JoinHandle;
 
 use super::FlockMode;
 use super::fs_filter::reject_remote_fs;
@@ -151,22 +156,32 @@ fn flock_deadline_signal() -> libc::c_int {
     libc::SIGRTMIN() + 4
 }
 
-/// Install the no-op handler for [`flock_deadline_signal`] exactly
-/// once, process-wide. `sa_flags` deliberately OMITS `SA_RESTART`:
-/// the kernel must NOT transparently restart the interrupted `flock`,
-/// because the `EINTR` return is the deadline mechanism. The signal
-/// is delivered thread-directed (`SIGEV_THREAD_ID` targeting the
-/// blocked thread), so no other thread observes it.
+/// Cached signal number for async-signal-safe wake delivery.
+///
+/// On glibc `SIGRTMIN()` is a function call, not a compile-time constant.
+/// Resolve it while installing the handler in normal context so
+/// [`wake_interruptible_flock_waiter`] only performs atomic operations and
+/// async-signal-safe syscalls.
+static FLOCK_WAKE_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+/// Install the no-op handler for [`flock_deadline_signal`] exactly once,
+/// process-wide.
+///
+/// `sa_flags` deliberately omits `SA_RESTART`: both deadline ticks and an
+/// explicit interrupt wake must force a blocked `flock(2)` / `poll(2)` back
+/// into normal Rust context. Delivery is thread-directed, so unrelated threads
+/// never observe the wake signal.
 fn install_flock_deadline_handler() {
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(|| {
         extern "C" fn noop(_: libc::c_int) {}
         unsafe {
+            let signal = flock_deadline_signal();
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = noop as *const () as usize;
             sa.sa_flags = 0; // no SA_RESTART — EINTR is load-bearing.
             libc::sigemptyset(&mut sa.sa_mask);
-            let rc = libc::sigaction(flock_deadline_signal(), &sa, std::ptr::null_mut());
+            let rc = libc::sigaction(signal, &sa, std::ptr::null_mut());
             assert_eq!(
                 rc,
                 0,
@@ -174,8 +189,435 @@ fn install_flock_deadline_handler() {
                  deadline-bounded flock waits would park forever",
                 std::io::Error::last_os_error(),
             );
+            FLOCK_WAKE_SIGNAL.store(signal, Ordering::SeqCst);
         }
     });
+}
+
+const NO_INTERRUPTIBLE_WAITER: u32 = 0;
+const CLOSING_INTERRUPTIBLE_WAITER: u32 = u32::MAX;
+const NO_BROKER_EVENTFD: RawFd = -1;
+const CLOSING_BROKER_EVENTFD: RawFd = -2;
+const INTERRUPT_WAKE_RETRY: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// The current cancellation-aware queue/head waiter.
+///
+/// The public identity is a generation token, not the Linux TID. A retry
+/// queued for an old waiter can therefore never signal a later registration
+/// that happens to run on the same thread. TID is published before the live
+/// generation and cleared before that generation returns to zero.
+static INTERRUPTIBLE_WAITER_ID: AtomicU32 = AtomicU32::new(NO_INTERRUPTIBLE_WAITER);
+static INTERRUPTIBLE_WAITER_TID: AtomicI32 = AtomicI32::new(0);
+static NEXT_INTERRUPTIBLE_WAITER_ID: AtomicU32 = AtomicU32::new(1);
+
+/// Broker iterations that passed the generation check and may still load/use
+/// the registered TID. Waiter teardown changes the generation to CLOSING and
+/// drains this count before blocking and draining the private RT signal.
+static INTERRUPTIBLE_BROKER_READERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Signal-handler writers that may have loaded either the waiter generation or
+/// broker eventfd. Both waiter teardown and broker shutdown hide their
+/// respective object and drain this count before allowing reuse/close.
+static INTERRUPTIBLE_HANDLER_WRITERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Eventfd handoff from the async handler to the normal-context broker.
+static INTERRUPTIBLE_BROKER_EVENTFD: AtomicI32 = AtomicI32::new(NO_BROKER_EVENTFD);
+static INTERRUPTIBLE_BROKER_REQUEST: AtomicU32 = AtomicU32::new(NO_INTERRUPTIBLE_WAITER);
+static INTERRUPTIBLE_BROKER_STOPPING: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static INTERRUPTIBLE_BROKER_SIGNAL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+struct InterruptibleFlockBroker {
+    eventfd: OwnedFd,
+    thread: JoinHandle<()>,
+}
+
+static INTERRUPTIBLE_BROKER: Mutex<Option<InterruptibleFlockBroker>> = Mutex::new(None);
+
+fn broker_state() -> std::sync::MutexGuard<'static, Option<InterruptibleFlockBroker>> {
+    INTERRUPTIBLE_BROKER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Start the normal-context broker used to wake cancellation-aware flock
+/// waiters.
+///
+/// Lifecycle ownership belongs to cargo-ktstr: start immediately before
+/// entering its cleanup-owning phase and stop after all reservation state has
+/// dropped. The broker is restartable after a matching stop, which also keeps
+/// unit tests isolated.
+pub fn start_interruptible_flock_broker() -> Result<()> {
+    let mut state = broker_state();
+    if state.is_some() {
+        anyhow::bail!("interruptible flock broker is already running");
+    }
+    if INTERRUPTIBLE_WAITER_ID.load(Ordering::SeqCst) != NO_INTERRUPTIBLE_WAITER {
+        anyhow::bail!("cannot start interruptible flock broker with a live waiter");
+    }
+
+    // SAFETY: eventfd returns a new owned descriptor on success.
+    let raw_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if raw_fd < 0 {
+        anyhow::bail!(
+            "create interruptible flock broker eventfd: {}",
+            std::io::Error::last_os_error(),
+        );
+    }
+    let eventfd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+
+    // Prime the exact libc write entry used by the signal handler while in
+    // normal context, then drain the probe before making the fd visible.
+    let one = 1_u64;
+    let wrote = unsafe {
+        libc::write(
+            raw_fd,
+            (&one as *const u64).cast(),
+            std::mem::size_of::<u64>(),
+        )
+    };
+    if wrote != std::mem::size_of::<u64>() as isize {
+        anyhow::bail!(
+            "prime interruptible flock broker eventfd write: {}",
+            std::io::Error::last_os_error(),
+        );
+    }
+    let mut drained = 0_u64;
+    let read = unsafe {
+        libc::read(
+            raw_fd,
+            (&mut drained as *mut u64).cast(),
+            std::mem::size_of::<u64>(),
+        )
+    };
+    if read != std::mem::size_of::<u64>() as isize || drained != one {
+        anyhow::bail!(
+            "drain interruptible flock broker eventfd prime: {}",
+            std::io::Error::last_os_error(),
+        );
+    }
+
+    INTERRUPTIBLE_BROKER_REQUEST.store(NO_INTERRUPTIBLE_WAITER, Ordering::SeqCst);
+    INTERRUPTIBLE_BROKER_STOPPING.store(false, Ordering::SeqCst);
+    #[cfg(test)]
+    INTERRUPTIBLE_BROKER_SIGNAL_COUNT.store(0, Ordering::SeqCst);
+    let thread = std::thread::Builder::new()
+        .name("ktstr-flock-wake".into())
+        .spawn(move || interruptible_flock_broker_loop(raw_fd))
+        .map_err(|error| anyhow::anyhow!("spawn interruptible flock broker: {error}"))?;
+
+    // Publish only after the broker thread exists and owns its read loop.
+    INTERRUPTIBLE_BROKER_EVENTFD.store(raw_fd, Ordering::SeqCst);
+    *state = Some(InterruptibleFlockBroker { eventfd, thread });
+    Ok(())
+}
+
+/// Stop and join the interruptible-flock broker.
+///
+/// Hiding the eventfd and draining handler writers before the owned wake/close
+/// ensures an async handler can never write through a recycled fd number.
+pub fn stop_interruptible_flock_broker() {
+    let mut state = broker_state();
+    let Some(broker) = state.take() else {
+        return;
+    };
+
+    INTERRUPTIBLE_BROKER_STOPPING.store(true, Ordering::SeqCst);
+    let raw_fd = broker.eventfd.as_raw_fd();
+    let hidden = INTERRUPTIBLE_BROKER_EVENTFD.compare_exchange(
+        raw_fd,
+        CLOSING_BROKER_EVENTFD,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    );
+    assert_eq!(
+        hidden,
+        Ok(raw_fd),
+        "interruptible flock broker eventfd changed before stop",
+    );
+    while INTERRUPTIBLE_HANDLER_WRITERS.load(Ordering::SeqCst) != 0 {
+        std::hint::spin_loop();
+    }
+
+    // Wake the broker through the still-owned fd after handlers can no longer
+    // load it. Failure is harmless only if the broker already observed STOPPING
+    // after a prior handler wake.
+    let one = 1_u64;
+    unsafe {
+        libc::write(
+            raw_fd,
+            (&one as *const u64).cast(),
+            std::mem::size_of::<u64>(),
+        );
+    }
+    broker
+        .thread
+        .join()
+        .expect("interruptible flock broker thread panicked");
+    drop(broker.eventfd);
+
+    INTERRUPTIBLE_BROKER_REQUEST.store(NO_INTERRUPTIBLE_WAITER, Ordering::SeqCst);
+    INTERRUPTIBLE_BROKER_EVENTFD.store(NO_BROKER_EVENTFD, Ordering::SeqCst);
+    INTERRUPTIBLE_BROKER_STOPPING.store(false, Ordering::SeqCst);
+}
+
+fn interruptible_flock_broker_loop(eventfd: RawFd) {
+    loop {
+        let mut pollfd = libc::pollfd {
+            fd: eventfd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, -1) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            std::thread::yield_now();
+            continue;
+        }
+
+        drain_interruptible_broker_eventfd(eventfd);
+        if INTERRUPTIBLE_BROKER_STOPPING.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let waiter_id =
+            INTERRUPTIBLE_BROKER_REQUEST.swap(NO_INTERRUPTIBLE_WAITER, Ordering::SeqCst);
+        if waiter_id == NO_INTERRUPTIBLE_WAITER || waiter_id == CLOSING_INTERRUPTIBLE_WAITER {
+            continue;
+        }
+
+        // Re-fire only after cancellation was handed to the broker. Healthy
+        // queue contention therefore retains one FIFO flock request, while a
+        // signal that landed just before syscall entry cannot strand it.
+        loop {
+            if INTERRUPTIBLE_BROKER_STOPPING.load(Ordering::SeqCst)
+                || !broker_signal_waiter_if_live(waiter_id)
+            {
+                break;
+            }
+            std::thread::sleep(INTERRUPT_WAKE_RETRY);
+        }
+    }
+}
+
+fn drain_interruptible_broker_eventfd(eventfd: RawFd) {
+    loop {
+        let mut value = 0_u64;
+        let read = unsafe {
+            libc::read(
+                eventfd,
+                (&mut value as *mut u64).cast(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if read == std::mem::size_of::<u64>() as isize {
+            continue;
+        }
+        if read < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        break;
+    }
+}
+
+fn broker_signal_waiter_if_live(waiter_id: u32) -> bool {
+    INTERRUPTIBLE_BROKER_READERS.fetch_add(1, Ordering::SeqCst);
+    let live = INTERRUPTIBLE_WAITER_ID.load(Ordering::SeqCst) == waiter_id;
+    if live {
+        let tid = INTERRUPTIBLE_WAITER_TID.load(Ordering::SeqCst);
+        let signal = FLOCK_WAKE_SIGNAL.load(Ordering::SeqCst);
+        if tid > 0 && signal > 0 {
+            unsafe {
+                libc::syscall(libc::SYS_tgkill, libc::getpid(), tid, signal);
+            }
+            #[cfg(test)]
+            INTERRUPTIBLE_BROKER_SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    INTERRUPTIBLE_BROKER_READERS.fetch_sub(1, Ordering::SeqCst);
+    live
+}
+
+/// Current cancellation-aware flock waiter generation, or zero when none is
+/// registered.
+///
+/// This atomic-only query is safe to call from a signal handler.
+pub fn interruptible_flock_waiter_id() -> u32 {
+    let waiter_id = INTERRUPTIBLE_WAITER_ID.load(Ordering::SeqCst);
+    if waiter_id == CLOSING_INTERRUPTIBLE_WAITER {
+        NO_INTERRUPTIBLE_WAITER
+    } else {
+        waiter_id
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn interruptible_flock_broker_signal_count() -> usize {
+    INTERRUPTIBLE_BROKER_SIGNAL_COUNT.load(Ordering::SeqCst)
+}
+
+/// Hand cancellation of an exact waiter generation to the broker.
+///
+/// The signal-handler path performs only lock-free atomics and one nonblocking
+/// eventfd write. The caller must publish its cancellation flag first.
+pub fn wake_interruptible_flock_waiter(waiter_id: u32) {
+    if waiter_id == NO_INTERRUPTIBLE_WAITER || waiter_id == CLOSING_INTERRUPTIBLE_WAITER {
+        return;
+    }
+
+    INTERRUPTIBLE_HANDLER_WRITERS.fetch_add(1, Ordering::SeqCst);
+    if INTERRUPTIBLE_WAITER_ID.load(Ordering::SeqCst) == waiter_id {
+        let eventfd = INTERRUPTIBLE_BROKER_EVENTFD.load(Ordering::SeqCst);
+        if eventfd >= 0 {
+            INTERRUPTIBLE_BROKER_REQUEST.store(waiter_id, Ordering::SeqCst);
+            let one = 1_u64;
+            unsafe {
+                libc::write(
+                    eventfd,
+                    (&one as *const u64).cast(),
+                    std::mem::size_of::<u64>(),
+                );
+            }
+        }
+    }
+    INTERRUPTIBLE_HANDLER_WRITERS.fetch_sub(1, Ordering::SeqCst);
+}
+
+fn next_interruptible_waiter_id() -> u32 {
+    loop {
+        let waiter_id = NEXT_INTERRUPTIBLE_WAITER_ID.fetch_add(1, Ordering::SeqCst);
+        if waiter_id != NO_INTERRUPTIBLE_WAITER && waiter_id != CLOSING_INTERRUPTIBLE_WAITER {
+            return waiter_id;
+        }
+    }
+}
+
+/// RAII registration for one cancellation-aware queue/head waiter.
+///
+/// The broker targets this registration's Linux TID only while its generation
+/// remains live. This value is deliberately `!Send`: its saved signal-mask
+/// state must be restored on the registering thread.
+pub(crate) struct InterruptibleFlockWaiter {
+    waiter_id: u32,
+    wake_was_blocked: bool,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl InterruptibleFlockWaiter {
+    pub(crate) fn register() -> Result<Self> {
+        if INTERRUPTIBLE_BROKER_EVENTFD.load(Ordering::SeqCst) < 0 {
+            anyhow::bail!("interruptible flock broker is not running");
+        }
+        install_flock_deadline_handler();
+        let signal = FLOCK_WAKE_SIGNAL.load(Ordering::SeqCst);
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
+
+        if INTERRUPTIBLE_WAITER_ID
+            .compare_exchange(
+                NO_INTERRUPTIBLE_WAITER,
+                CLOSING_INTERRUPTIBLE_WAITER,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            anyhow::bail!("another interruptible flock waiter is already registered");
+        }
+
+        let mut wake_set: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let mut previous_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let mask_rc = unsafe {
+            libc::sigemptyset(&mut wake_set);
+            libc::sigaddset(&mut wake_set, signal);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &wake_set, &mut previous_mask)
+        };
+        if mask_rc != 0 {
+            INTERRUPTIBLE_WAITER_ID.store(NO_INTERRUPTIBLE_WAITER, Ordering::SeqCst);
+            return Err(anyhow::anyhow!(
+                "unblock interruptible flock wake signal: {}",
+                std::io::Error::from_raw_os_error(mask_rc),
+            ));
+        }
+        let wake_was_blocked = unsafe { libc::sigismember(&previous_mask, signal) == 1 };
+        let waiter_id = next_interruptible_waiter_id();
+
+        // TID becomes visible before the generation that authorizes readers to
+        // use it.
+        INTERRUPTIBLE_WAITER_TID.store(tid, Ordering::SeqCst);
+        INTERRUPTIBLE_WAITER_ID.store(waiter_id, Ordering::SeqCst);
+
+        Ok(Self {
+            waiter_id,
+            wake_was_blocked,
+            _not_send: PhantomData,
+        })
+    }
+}
+
+impl Drop for InterruptibleFlockWaiter {
+    fn drop(&mut self) {
+        let transitioned = INTERRUPTIBLE_WAITER_ID.compare_exchange(
+            self.waiter_id,
+            CLOSING_INTERRUPTIBLE_WAITER,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        assert_eq!(
+            transitioned,
+            Ok(self.waiter_id),
+            "interruptible flock waiter registration changed before drop",
+        );
+
+        while INTERRUPTIBLE_HANDLER_WRITERS.load(Ordering::SeqCst) != 0
+            || INTERRUPTIBLE_BROKER_READERS.load(Ordering::SeqCst) != 0
+        {
+            std::hint::spin_loop();
+        }
+
+        // No new broker reader can pass the generation check after CLOSING.
+        // Block and drain a signal already sent by an old reader before
+        // allowing either the TID or generation slot to be reused.
+        unsafe {
+            let signal = FLOCK_WAKE_SIGNAL.load(Ordering::SeqCst);
+            let mut wake_set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut wake_set);
+            libc::sigaddset(&mut wake_set, signal);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &wake_set, std::ptr::null_mut());
+            let zero = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            loop {
+                let drained = libc::sigtimedwait(&wake_set, std::ptr::null_mut(), &zero);
+                if drained == signal {
+                    continue;
+                }
+                assert!(
+                    drained < 0,
+                    "sigtimedwait returned unexpected signal {drained} while \
+                     draining private wake signal {signal}",
+                );
+                let error = std::io::Error::last_os_error();
+                match error.raw_os_error() {
+                    // No private RT signal remains pending on this thread.
+                    Some(libc::EAGAIN) => break,
+                    // An unrelated unblocked signal ran while draining. Retry
+                    // until EAGAIN so an old wake cannot escape into a later
+                    // same-thread registration.
+                    Some(libc::EINTR) => continue,
+                    _ => panic!("drain interruptible flock wake signal: {error}"),
+                }
+            }
+
+            INTERRUPTIBLE_WAITER_TID.store(0, Ordering::SeqCst);
+            INTERRUPTIBLE_WAITER_ID.store(NO_INTERRUPTIBLE_WAITER, Ordering::SeqCst);
+            if !self.wake_was_blocked {
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &wake_set, std::ptr::null_mut());
+            }
+        }
+    }
 }
 
 /// RAII POSIX per-thread interval timer that delivers
