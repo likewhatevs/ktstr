@@ -3,16 +3,25 @@
 //! Split from rust_init.rs; the shared consts/statics/imports live in the
 //! parent module (`super`), reached via the glob below.
 use super::*;
-use crate::scenario::ops::{ScxState, scx_state};
+use crate::scenario::ops::ScxState;
 
-/// Outcome of [`poll_startup`].
-#[derive(Debug)]
-pub(crate) enum StartupStatus {
-    /// Child exited before the poll window closed.
-    Died,
-    /// Child was still running when the poll window closed.
-    Alive,
-}
+const SYSFS_SCHED_EXT_STATE: &str = "/sys/kernel/sched_ext/state";
+
+/// Scheduler CPU service allowed between semantic attach-progress edges.
+///
+/// This is deliberately CPU time, not PID 1 wall time. Under a verifier
+/// storm a scheduler can be runnable but receive a small fraction of a host
+/// CPU for many wall seconds; charging that descheduled time made the old
+/// fixed 10-second window reject healthy cells. Thirty-five seconds matches
+/// the host Attach-stage service allowance while remaining far above a
+/// normal BPF open/load/attach.
+const SCHED_ATTACH_SERVICE_BUDGET: std::time::Duration = std::time::Duration::from_secs(35);
+
+/// Last-resort guard for a scheduler that consumes no service and makes no
+/// progress (for example, a permanently blocked userspace loader). The host's
+/// phase-aware watchdog remains authoritative; this guard is intentionally
+/// much wider than the old 10-second wall window.
+const SCHED_ATTACH_WALL_GUARD: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Outcome of [`poll_scx_attached`].
 #[derive(Debug, PartialEq, Eq)]
@@ -23,37 +32,516 @@ enum ScxAttachStatus {
     /// kernel set `SCX_ENABLED`), not merely registered. See
     /// `scx_attach_ready`.
     Attached,
-    /// Poll window closed. At least one read of `root/ops` succeeded
-    /// (the kernel supports sched_ext and the kset exists), but the
-    /// attach never completed before the timeout: either `root/ops`
-    /// stayed empty (scheduler never registered) or it registered but
-    /// `/sys/kernel/sched_ext/state` never reached `enabled` — stuck in
-    /// `enabling`, or the enable FAILED and the state moved on to
-    /// `disabling`/`disabled`. Typically a BPF verifier reject, an
-    /// ops-mismatch, a slow init, or an ops.init/enable failure.
-    ///
-    /// Carries the LAST-observed `/sys/kernel/sched_ext/state` reading
-    /// (`None` if every state read failed). This is the discriminator
-    /// the host uses to tell a still-in-flight enable (`Enabling` — a
-    /// slow/contended enable) from a rejected enable (`Disabling` /
-    /// `Disabled` — a real defect): the enable path leaves `Enabling`
-    /// for `Disabling`/`Disabled` ONLY on failure (see [`ScxState`]),
-    /// so `Enabling` at timeout means the enable was still progressing
-    /// when the deadline hit.
-    Timeout(Option<ScxState>),
-    /// Every read of `root/ops` returned `Err`. Either the kernel
-    /// lacks sched_ext support entirely or the sysfs tree has not
-    /// been created for the current kernel — distinct from
-    /// [`Timeout`](Self::Timeout), where reads succeed but the file
-    /// is empty.
-    SysfsAbsent,
+    /// The scheduler process exited at any point before attach completed.
+    /// The pidfd is watched in the same poll set as sched_ext state, so a
+    /// verifier rejection after the former one-second liveness gate is
+    /// reported immediately instead of waiting for an unrelated timeout.
+    Died,
+    /// Attach made a terminal backwards transition (registered/enabling to
+    /// disabling/disabled).
+    Rejected(AttachDiagnostic),
+    /// No semantic progress consumed the allowed scheduler CPU service.
+    ServiceBudgetExceeded(AttachDiagnostic),
+    /// Last-resort wall guard fired while service remained below its budget.
+    WallGuardExceeded(AttachDiagnostic),
+    /// The stable `/sys/kernel/sched_ext/state` node is absent. A missing
+    /// dynamic `root/ops` node is normal before registration and never maps
+    /// to this variant.
+    SysfsAbsent(AttachDiagnostic),
+    /// A required observer primitive failed. This is separate from scheduler
+    /// attach failure so diagnostics name the broken pidfd/sysfs/inotify/clock
+    /// source rather than inventing a sched_ext state.
+    ObserverError(String),
 }
 
-impl ScxAttachStatus {
-    /// True when the scheduler is registered AND fully enabled (see
-    /// `ScxAttachStatus::Attached`).
-    fn is_attached(&self) -> bool {
-        matches!(self, ScxAttachStatus::Attached)
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StateObservation {
+    Value(ScxState),
+    Missing,
+    Invalid(String),
+    Io(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpsObservation {
+    Missing,
+    Empty,
+    Named(String),
+    Io(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScxAttachSnapshot {
+    state: StateObservation,
+    ops: OpsObservation,
+}
+
+impl ScxAttachSnapshot {
+    fn state_label(&self) -> String {
+        match &self.state {
+            StateObservation::Value(ScxState::Enabling) => "enabling".into(),
+            StateObservation::Value(ScxState::Enabled) => "enabled".into(),
+            StateObservation::Value(ScxState::Disabling) => "disabling".into(),
+            StateObservation::Value(ScxState::Disabled) => "disabled".into(),
+            StateObservation::Missing => "missing".into(),
+            StateObservation::Invalid(raw) => format!("invalid({raw:?})"),
+            StateObservation::Io(error) => format!("io-error({error})"),
+        }
+    }
+
+    fn ops_label(&self) -> String {
+        match &self.ops {
+            OpsObservation::Missing => "missing".into(),
+            OpsObservation::Empty => "empty".into(),
+            OpsObservation::Named(name) => format!("named({name:?})"),
+            OpsObservation::Io(error) => format!("io-error({error})"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AttachProgress {
+    Loading,
+    Registered,
+    Enabling,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachDiagnostic {
+    snapshot: ScxAttachSnapshot,
+    wall: std::time::Duration,
+    service: std::time::Duration,
+}
+
+impl AttachDiagnostic {
+    fn reason(&self, cause: &str) -> String {
+        format!(
+            "cause={cause} state={} ops={} wall_ms={} service_ms={}",
+            self.snapshot.state_label(),
+            self.snapshot.ops_label(),
+            self.wall.as_millis(),
+            self.service.as_millis(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttachProbe {
+    Ready,
+    Pending(AttachProgress),
+    Rejected,
+    SysfsAbsent,
+    ObserverError(String),
+}
+
+/// Interpret one coherent sched_ext snapshot.
+///
+/// `root/ops == ENOENT` is the normal pre-registration state. The stable
+/// `state` node, not the lazy scheduler kobject, establishes whether sched_ext
+/// exists. A backwards state after registration/enabling is terminal; waiting
+/// longer cannot turn a rejected enable into the scheduler we spawned.
+fn classify_attach_snapshot(
+    snapshot: &ScxAttachSnapshot,
+    high_water: AttachProgress,
+) -> AttachProbe {
+    match &snapshot.state {
+        StateObservation::Missing => return AttachProbe::SysfsAbsent,
+        StateObservation::Invalid(raw) => {
+            return AttachProbe::ObserverError(format!(
+                "invalid {SYSFS_SCHED_EXT_STATE} value {raw:?}"
+            ));
+        }
+        StateObservation::Io(error) => {
+            return AttachProbe::ObserverError(format!("read {SYSFS_SCHED_EXT_STATE}: {error}"));
+        }
+        StateObservation::Value(_) => {}
+    }
+    if let OpsObservation::Io(error) = &snapshot.ops {
+        return AttachProbe::ObserverError(format!("read {SYSFS_SCHED_EXT_ROOT_OPS}: {error}"));
+    }
+
+    let state = match snapshot.state {
+        StateObservation::Value(state) => state,
+        _ => unreachable!("terminal state observations returned above"),
+    };
+    let registered = matches!(snapshot.ops, OpsObservation::Named(_));
+    if registered && state == ScxState::Enabled {
+        return AttachProbe::Ready;
+    }
+
+    match state {
+        ScxState::Disabling => AttachProbe::Rejected,
+        ScxState::Disabled if high_water >= AttachProgress::Enabling => AttachProbe::Rejected,
+        ScxState::Disabled if registered => AttachProbe::Pending(AttachProgress::Registered),
+        ScxState::Enabling | ScxState::Enabled => AttachProbe::Pending(AttachProgress::Enabling),
+        ScxState::Disabled => AttachProbe::Pending(AttachProgress::Loading),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AttachWaitPolicy {
+    cadence: std::time::Duration,
+    service_budget: std::time::Duration,
+    wall_guard: std::time::Duration,
+}
+
+trait AttachWaitIo {
+    fn child_exited(&mut self) -> Result<bool, String>;
+    fn snapshot(&mut self) -> Result<ScxAttachSnapshot, String>;
+    fn service_elapsed(&mut self) -> Result<std::time::Duration, String>;
+    fn wall_elapsed(&mut self) -> std::time::Duration;
+    fn wait(&mut self, timeout: std::time::Duration) -> Result<(), String>;
+}
+
+/// Policy loop split from Linux fd setup so deadline/process/state precedence is
+/// deterministic under unit tests.
+fn wait_scx_attach_with(io: &mut impl AttachWaitIo, policy: AttachWaitPolicy) -> ScxAttachStatus {
+    let mut high_water = AttachProgress::Loading;
+    let mut service_checkpoint = match io.service_elapsed() {
+        Ok(service) => service,
+        Err(error) => return ScxAttachStatus::ObserverError(error),
+    };
+    let mut last_service = service_checkpoint;
+
+    loop {
+        // Death wins over a stale `enabled` snapshot. Check both around the
+        // sysfs reads because the child can exit while PID 1 is reading.
+        match io.child_exited() {
+            Ok(true) => return ScxAttachStatus::Died,
+            Ok(false) => {}
+            Err(error) => return ScxAttachStatus::ObserverError(error),
+        }
+        let snapshot = match io.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => return ScxAttachStatus::ObserverError(error),
+        };
+        match io.child_exited() {
+            Ok(true) => return ScxAttachStatus::Died,
+            Ok(false) => {}
+            Err(error) => return ScxAttachStatus::ObserverError(error),
+        }
+
+        let wall = io.wall_elapsed();
+        let service = match io.service_elapsed() {
+            Ok(service) => service,
+            Err(error) => {
+                // A clock lookup can race process exit. Re-check pidfd before
+                // classifying it as an observer failure.
+                return match io.child_exited() {
+                    Ok(true) => ScxAttachStatus::Died,
+                    Ok(false) => ScxAttachStatus::ObserverError(error),
+                    Err(pidfd_error) => ScxAttachStatus::ObserverError(format!(
+                        "{error}; pidfd recheck also failed: {pidfd_error}"
+                    )),
+                };
+            }
+        };
+        if service < last_service {
+            return ScxAttachStatus::ObserverError(format!(
+                "scheduler CPU service clock regressed from {:?} to {:?}",
+                last_service, service
+            ));
+        }
+        last_service = service;
+        let diagnostic = AttachDiagnostic {
+            snapshot: snapshot.clone(),
+            wall,
+            service,
+        };
+
+        // The source-of-truth predicate is evaluated before either budget.
+        // Thus an attach that completed while PID 1 was descheduled across a
+        // boundary is success, not a false timeout.
+        match classify_attach_snapshot(&snapshot, high_water) {
+            AttachProbe::Ready => return ScxAttachStatus::Attached,
+            AttachProbe::Rejected => return ScxAttachStatus::Rejected(diagnostic),
+            AttachProbe::SysfsAbsent => {
+                return ScxAttachStatus::SysfsAbsent(diagnostic);
+            }
+            AttachProbe::ObserverError(error) => {
+                return ScxAttachStatus::ObserverError(error);
+            }
+            AttachProbe::Pending(progress) => {
+                if progress > high_water {
+                    high_water = progress;
+                    service_checkpoint = service;
+                }
+            }
+        }
+
+        if service.saturating_sub(service_checkpoint) >= policy.service_budget {
+            return ScxAttachStatus::ServiceBudgetExceeded(diagnostic);
+        }
+        if wall >= policy.wall_guard {
+            return ScxAttachStatus::WallGuardExceeded(diagnostic);
+        }
+
+        let remaining_wall = policy.wall_guard.saturating_sub(wall);
+        if let Err(error) = io.wait(policy.cadence.min(remaining_wall)) {
+            return ScxAttachStatus::ObserverError(error);
+        }
+    }
+}
+
+struct LinuxAttachWait {
+    pidfd: OwnedFd,
+    state_file: fs::File,
+    inotify: nix::sys::inotify::Inotify,
+    service_clock: libc::clockid_t,
+    service_start: std::time::Duration,
+    wall_start: std::time::Instant,
+}
+
+impl LinuxAttachWait {
+    fn new(pid: u32) -> Result<Self, ScxAttachStatus> {
+        let raw_pidfd =
+            unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0u32) as libc::c_int };
+        if raw_pidfd < 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::ESRCH) {
+                Err(ScxAttachStatus::Died)
+            } else {
+                Err(ScxAttachStatus::ObserverError(format!(
+                    "pidfd_open({pid}) failed: {error}"
+                )))
+            };
+        }
+        // SAFETY: pidfd_open returned a new descriptor owned by this value.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(raw_pidfd) };
+
+        let state_file = match fs::File::open(SYSFS_SCHED_EXT_STATE) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let snapshot = ScxAttachSnapshot {
+                    state: StateObservation::Missing,
+                    ops: OpsObservation::Missing,
+                };
+                return Err(ScxAttachStatus::SysfsAbsent(AttachDiagnostic {
+                    snapshot,
+                    wall: std::time::Duration::ZERO,
+                    service: std::time::Duration::ZERO,
+                }));
+            }
+            Err(error) => {
+                return Err(ScxAttachStatus::ObserverError(format!(
+                    "open {SYSFS_SCHED_EXT_STATE}: {error}"
+                )));
+            }
+        };
+
+        use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+        let inotify =
+            Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC).map_err(|error| {
+                ScxAttachStatus::ObserverError(format!("inotify_init1 for sched_ext: {error}"))
+            })?;
+        inotify
+            .add_watch(
+                "/sys/kernel/sched_ext/",
+                AddWatchFlags::IN_CREATE
+                    | AddWatchFlags::IN_MOVED_TO
+                    | AddWatchFlags::IN_DELETE
+                    | AddWatchFlags::IN_MOVED_FROM,
+            )
+            .map_err(|error| {
+                ScxAttachStatus::ObserverError(format!(
+                    "inotify_add_watch(/sys/kernel/sched_ext): {error}"
+                ))
+            })?;
+
+        let mut service_clock: libc::clockid_t = 0;
+        // SAFETY: `service_clock` is a valid output pointer and pid identifies
+        // the child just spawned by this process.
+        let rc = unsafe { libc::clock_getcpuclockid(pid as libc::pid_t, &mut service_clock) };
+        if rc != 0 {
+            return if rc == libc::ESRCH {
+                Err(ScxAttachStatus::Died)
+            } else {
+                Err(ScxAttachStatus::ObserverError(format!(
+                    "clock_getcpuclockid({pid}) failed: {}",
+                    std::io::Error::from_raw_os_error(rc)
+                )))
+            };
+        }
+        let service_start = match read_cpu_clock(service_clock) {
+            Ok(service) => service,
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+                return Err(ScxAttachStatus::Died);
+            }
+            Err(error) => {
+                return Err(ScxAttachStatus::ObserverError(format!(
+                    "read scheduler CPU service clock: {error}"
+                )));
+            }
+        };
+
+        Ok(Self {
+            pidfd,
+            state_file,
+            inotify,
+            service_clock,
+            service_start,
+            wall_start: std::time::Instant::now(),
+        })
+    }
+}
+
+fn read_cpu_clock(clock: libc::clockid_t) -> Result<std::time::Duration, std::io::Error> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `value` is a valid output pointer and `clock` came from
+    // clock_getcpuclockid.
+    if unsafe { libc::clock_gettime(clock, &mut value) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if value.tv_sec < 0 || value.tv_nsec < 0 {
+        return Err(std::io::Error::other(
+            "scheduler CPU clock returned a negative value",
+        ));
+    }
+    Ok(std::time::Duration::new(
+        value.tv_sec as u64,
+        value.tv_nsec as u32,
+    ))
+}
+
+fn read_state_observation(file: &mut fs::File) -> StateObservation {
+    use std::io::{Seek, SeekFrom};
+    if let Err(error) = file.seek(SeekFrom::Start(0)) {
+        return StateObservation::Io(error.to_string());
+    }
+    let mut value = String::with_capacity(16);
+    if let Err(error) = file.read_to_string(&mut value) {
+        return StateObservation::Io(error.to_string());
+    }
+    match value.trim() {
+        "enabling" => StateObservation::Value(ScxState::Enabling),
+        "enabled" => StateObservation::Value(ScxState::Enabled),
+        "disabling" => StateObservation::Value(ScxState::Disabling),
+        "disabled" => StateObservation::Value(ScxState::Disabled),
+        raw => StateObservation::Invalid(raw.to_string()),
+    }
+}
+
+fn read_ops_observation() -> OpsObservation {
+    let mut value = String::with_capacity(64);
+    match fs::File::open(SYSFS_SCHED_EXT_ROOT_OPS) {
+        Ok(mut file) => match file.read_to_string(&mut value) {
+            Ok(_) if value.trim().is_empty() => OpsObservation::Empty,
+            Ok(_) => OpsObservation::Named(value.trim().to_string()),
+            Err(error) => OpsObservation::Io(error.to_string()),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => OpsObservation::Missing,
+        Err(error) => OpsObservation::Io(error.to_string()),
+    }
+}
+
+impl AttachWaitIo for LinuxAttachWait {
+    fn child_exited(&mut self) -> Result<bool, String> {
+        let mut pfd = libc::pollfd {
+            fd: self.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live pidfd; zero timeout makes this a nonblocking truth
+        // probe.
+        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if rc < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(format!("nonblocking pidfd poll failed: {error}"));
+        }
+        if pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(format!(
+                "pidfd poll returned unexpected events {:#x}",
+                pfd.revents
+            ));
+        }
+        Ok(pfd.revents & (libc::POLLIN | libc::POLLHUP) != 0)
+    }
+
+    fn snapshot(&mut self) -> Result<ScxAttachSnapshot, String> {
+        Ok(ScxAttachSnapshot {
+            state: read_state_observation(&mut self.state_file),
+            ops: read_ops_observation(),
+        })
+    }
+
+    fn service_elapsed(&mut self) -> Result<std::time::Duration, String> {
+        let now = read_cpu_clock(self.service_clock)
+            .map_err(|error| format!("read scheduler CPU service clock: {error}"))?;
+        now.checked_sub(self.service_start)
+            .ok_or_else(|| "scheduler CPU service clock regressed below its baseline".into())
+    }
+
+    fn wall_elapsed(&mut self) -> std::time::Duration {
+        self.wall_start.elapsed()
+    }
+
+    fn wait(&mut self, timeout: std::time::Duration) -> Result<(), String> {
+        let timeout_ms = timeout
+            .as_millis()
+            .saturating_add(u128::from(
+                !timeout.subsec_nanos().is_multiple_of(1_000_000),
+            ))
+            .min(i32::MAX as u128) as libc::c_int;
+        let mut pfds = [
+            libc::pollfd {
+                fd: self.pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: self.state_file.as_raw_fd(),
+                events: libc::POLLPRI,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: self.inotify.as_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: all three descriptors are owned by self for the duration of
+        // poll; poll only writes the revents fields.
+        let rc = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as _, timeout_ms) };
+        if rc < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(());
+            }
+            return Err(format!("sched_ext attach poll failed: {error}"));
+        }
+        if pfds[0].revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(format!(
+                "pidfd returned unexpected poll events {:#x}",
+                pfds[0].revents
+            ));
+        }
+        // kernfs conventionally reports a notified attribute as
+        // POLLPRI|POLLERR, so POLLERR is a wake bit for this fd, not a broken
+        // source. POLLNVAL still means our stable state fd became invalid.
+        if pfds[1].revents & libc::POLLNVAL != 0 {
+            return Err(format!(
+                "sched_ext state returned invalid-fd poll events {:#x}",
+                pfds[1].revents
+            ));
+        }
+        if pfds[2].revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(format!(
+                "sched_ext inotify returned unexpected poll events {:#x}",
+                pfds[2].revents
+            ));
+        }
+        if pfds[2].revents & libc::POLLIN != 0 {
+            self.inotify
+                .read_events()
+                .map_err(|error| format!("drain sched_ext inotify events: {error}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -79,17 +567,13 @@ pub(crate) fn scx_attach_ready(root_ops_contents: &str, state: Option<ScxState>)
     !root_ops_contents.trim().is_empty() && state == Some(ScxState::Enabled)
 }
 
-/// Poll `/sys/kernel/sched_ext/root/ops` at `interval` cadence for up
-/// to `timeout`.
+/// Wait for scheduler attach using pidfd + sched_ext event sources.
 ///
-/// Returns [`ScxAttachStatus::Attached`] once `root/ops` is non-empty
-/// AND `/sys/kernel/sched_ext/state` reads `enabled` — registered AND
-/// fully enabled (see `scx_attach_ready`). When the window closes
-/// without that, distinguishes [`Timeout`](ScxAttachStatus::Timeout)
-/// (`root/ops` reads succeeded but attach never completed — never
-/// registered, or registered but never reached `enabled`) from
-/// [`SysfsAbsent`](ScxAttachStatus::SysfsAbsent) (every `root/ops` read
-/// errored — the kernel lacks sched_ext sysfs entirely).
+/// Returns [`ScxAttachStatus::Attached`] once `root/ops` is non-empty and
+/// `/sys/kernel/sched_ext/state` reads `enabled`. The same poll set watches the
+/// scheduler pidfd, the stable state attribute, and creation/removal under the
+/// sched_ext directory. A 50ms cadence covers state transitions which kernels
+/// do not `sysfs_notify`.
 ///
 /// The sysfs path is built in two steps by the kernel:
 /// - `kernel/sched/ext.c` creates the `sched_ext` kset under
@@ -108,229 +592,93 @@ pub(crate) fn scx_attach_ready(root_ops_contents: &str, state: Option<ScxState>)
 /// but the kobject add happens BEFORE `ops.init`, per-task init, and the
 /// `SCX_ENABLED` transition — so a non-empty `root/ops` does NOT prove
 /// the scheduler is live. This poll therefore ALSO requires
-/// `/sys/kernel/sched_ext/state` == `enabled` (via `scx_state`), so a
+/// `/sys/kernel/sched_ext/state` == `enabled`, so a
 /// returned `Attached` means the BPF enable completed and the workload
-/// can run against a fully-up scheduler. (Crash/exit detection AFTER
-/// enable is still the caller's job — monitor telemetry or the
-/// scheduler's own exit kind.)
+/// can run against a fully-up scheduler. Before that point, pidfd readiness
+/// wins over a stale sysfs snapshot and reports the scheduler's actual exit.
 ///
-/// Separate from [`poll_startup`] (which watches the child process
-/// state): a scheduler can be `Alive` from the process-waitpid
-/// perspective and still have zero progress on scx registration.
-fn poll_scx_attached(
-    interval: std::time::Duration,
-    timeout: std::time::Duration,
-) -> ScxAttachStatus {
-    use crate::vmm::freeze_coord::evented_wait::{KernfsWaitOutcome, kernfs_evented_wait};
-    use nix::sys::inotify::AddWatchFlags;
-
-    let start = std::time::Instant::now();
-    // Reusable read buffer for the attribute file. Keeping the
-    // allocation across the predicate's iterations is the
-    // steady-state fast path.
-    let mut buf = String::with_capacity(64);
-    let mut ever_read_ok = false;
-    // Last-observed sched_ext state, carried into
-    // ScxAttachStatus::Timeout so the host can tell a still-in-flight
-    // enable (Enabling) from a rejected one (Disabling/Disabled). Only
-    // updated on a successful read, and only read below in the Timeout
-    // branch (which requires ever_read_ok), so it always reflects a real
-    // reading there.
-    let mut last_state: Option<ScxState> = None;
-    // Track whether read ever succeeded so the Timeout vs SysfsAbsent
-    // distinction stays correct after the helper returns.
-    let check_done = || -> Option<()> {
-        buf.clear();
-        let read_outcome = std::fs::File::open(SYSFS_SCHED_EXT_ROOT_OPS).and_then(|mut f| {
-            use std::io::Read;
-            f.read_to_string(&mut buf)
-        });
-        if read_outcome.is_ok() {
-            ever_read_ok = true;
-            // Attached only when REGISTERED (non-empty root/ops) AND fully
-            // ENABLED (state == "enabled"): the kernel adds root/ops early in
-            // scx_root_enable_workfn, before ops.init / per-task init / the
-            // SCX_ENABLED transition, so root/ops alone races a still-ENABLING
-            // scheduler. scx_state() re-reads /sys/kernel/sched_ext/state each
-            // call (cheap; the cadence below drives the ENABLING->ENABLED
-            // re-check on kernels that do not sysfs_notify the transition).
-            let state = scx_state();
-            last_state = state;
-            if scx_attach_ready(&buf, state) {
-                return Some(());
-            }
-        }
-        None
+/// The progress budget is denominated in scheduler process CPU service, not
+/// guest wall time. Host descheduling under a 52-cell storm therefore cannot
+/// consume the attach allowance.
+fn poll_scx_attached(pid: u32) -> ScxAttachStatus {
+    let mut io = match LinuxAttachWait::new(pid) {
+        Ok(io) => io,
+        Err(status) => return status,
     };
-
-    // Evented wake sources are managed inside kernfs_evented_wait:
-    //   - POLLPRI on `/sys/kernel/sched_ext/root/ops` (future-proofed
-    //     for kernels that add `sysfs_notify` on the attribute)
-    //   - inotify on `/sys/kernel/sched_ext/` for IN_CREATE /
-    //     IN_MOVED_TO (fires when scx_alloc_and_add_sched calls
-    //     kobject_init_and_add(..., "root"))
-    //
-    // BELT-AND-BRACES CADENCE: the helper's `cadence` parameter caps
-    // each poll(2) at `interval`. In scx_alloc_and_add_sched
-    // `sch->ops = *ops` runs BEFORE `kobject_init_and_add(..., "root")`,
-    // so by IN_CREATE wake time `root/ops` reads non-empty. The cadence
-    // is ALSO load-bearing for the state==`enabled` half of the
-    // predicate: the `enabling`->`enabled` transition (later in
-    // scx_root_enable_workfn) is not `sysfs_notify`'d and fires no
-    // inotify event on this dir, so the periodic cadence re-check is what
-    // observes it. Plus defense-in-depth against (a) future kernel
-    // reordering, (b) inotify event loss under pressure, (c) out-of-band
-    // kobject creation without ops.name pre-population.
-    let outcome = kernfs_evented_wait(
-        "/sys/kernel/sched_ext/",
-        AddWatchFlags::IN_CREATE | AddWatchFlags::IN_MOVED_TO,
-        Some("/sys/kernel/sched_ext/root/ops"),
-        interval,
-        start + timeout,
-        check_done,
-    );
-
-    match outcome {
-        KernfsWaitOutcome::Done(()) => ScxAttachStatus::Attached,
-        KernfsWaitOutcome::NoEventedSource => {
-            // Both attr fd open and inotify_add_watch failed. We
-            // target kernel 6.16+ where kernfs + inotify are
-            // universally present, so /sys/kernel/sched_ext/ is
-            // fundamentally missing or broken. Surface as
-            // SysfsAbsent; the log makes the operator-actionable
-            // path-existence-but-fd-unopenable case visible.
-            tracing::warn!(
-                "poll_scx_attached: both attr-fd open (/sys/kernel/sched_ext/root/ops) \
-                 AND inotify_add_watch (/sys/kernel/sched_ext/) failed; surfacing \
-                 SysfsAbsent. Diagnose: zcat /proc/config.gz | grep -E \
-                 'CONFIG_SCHED_CLASS_EXT|CONFIG_INOTIFY_USER' — both must be =y"
-            );
-            ScxAttachStatus::SysfsAbsent
-        }
-        KernfsWaitOutcome::Timeout => {
-            let status = if ever_read_ok {
-                ScxAttachStatus::Timeout(last_state)
-            } else {
-                ScxAttachStatus::SysfsAbsent
-            };
-            // Per "log on timeout when no error surfaces": callers
-            // may swallow this into a non-error path (boot-time);
-            // log here for a visible breadcrumb in /tmp/ktstr*.log
-            // even when the typed return is later consumed silently.
-            tracing::warn!(
-                elapsed_s = start.elapsed().as_secs_f64(),
-                timeout_s = timeout.as_secs_f64(),
-                ever_read_ok,
-                status = ?status,
-                "poll_scx_attached: timeout — sched_ext attach not observed \
-                 within deadline"
-            );
-            status
-        }
-    }
+    wait_scx_attach_with(
+        &mut io,
+        AttachWaitPolicy {
+            cadence: std::time::Duration::from_millis(50),
+            service_budget: SCHED_ATTACH_SERVICE_BUDGET,
+            wall_guard: SCHED_ATTACH_WALL_GUARD,
+        },
+    )
 }
 
-/// Block on `pidfd` becoming readable for up to `timeout`. Returns
-/// as soon as the child exits (pidfd POLLIN edge fires
-/// microseconds after the kernel reaps), or when the deadline
-/// elapses with the child still alive.
-///
-/// `pidfd_open` has been available since kernel 5.3 (2019); ktstr
-/// targets 6.16+ where it is unconditionally present. The interval
-/// parameter is unused here because `poll(2)` blocks until the fd
-/// becomes readable or the absolute deadline elapses — there is
-/// nothing to "poll faster" inside the wait. The deadline is
-/// enforced via `Instant::now()` re-checks across loop iterations
-/// because `poll(2)` may return EINTR (e.g. SIGCHLD coalescing); the
-/// outer re-check rebuilds the remaining timeout against the
-/// absolute deadline.
-///
-/// Liveness is observed via [`proc_pid_alive`] / pidfd POLLIN, never
-/// `Child::try_wait`. PID 1 has SIGCHLD set to `SIG_IGN` for zombie
-/// prevention (see [`ktstr_guest_init`]), so the kernel auto-reaps
-/// the scheduler child the moment it exits. `try_wait` (which calls
-/// `waitpid(pid, ..., WNOHANG)`) then returns `ECHILD`, which the
-/// previous implementation mapped to `WaitError` and the caller
-/// treated as still-alive — leaving a crashed scheduler undetected.
-/// pidfd POLLIN and `/proc/{pid}` removal are signal-disposition
-/// independent (the pidfd is readable on exit regardless of who
-/// reaps; the procfs entry disappears on `release_task`), so they
-/// observe the real state.
+/// Test-only pin for the standalone pidfd liveness primitive which preceded
+/// the unified production attach wait. Keeping this small contract exercised
+/// guards SIGCHLD=SIG_IGN behavior without reintroducing the old sequential
+/// one-second gate into scheduler startup.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) enum StartupStatus {
+    Died,
+    Alive,
+}
+
+#[cfg(test)]
 pub(crate) fn poll_startup(
     child: &mut Child,
     interval: std::time::Duration,
     timeout: std::time::Duration,
 ) -> StartupStatus {
     let pid = child.id();
-    // SAFETY: `pidfd_open(2)` accepts any process the caller can
-    // signal. We just spawned `child`; its pid is owned by this
-    // process, so the syscall is safe to issue with no other
-    // synchronisation. Failure (rare — e.g. very tight pid reuse,
-    // sandbox restriction) falls back to a `proc_pid_alive` loop
-    // below.
+    // SAFETY: pidfd_open on the child we just spawned, with flags zero.
     let pidfd =
         unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_int, 0u32) as libc::c_int };
     if pidfd < 0 {
-        // pidfd_open unsupported on this kernel. Procfs polling is
-        // the SIG_IGN-safe fallback: the procfs entry vanishes when
-        // the kernel runs `release_task` on the child, regardless
-        // of how SIGCHLD is handled. The shared
-        // [`poll_proc_pid_absent`] helper carries the loop body so
-        // any future EINTR / signal-pause refinement applies
-        // uniformly here and in [`kill_scheduler_process`]'s
-        // SIGTERM/SIGKILL aftermath polls.
         return if poll_proc_pid_absent(pid, interval, timeout) {
             StartupStatus::Died
         } else {
             StartupStatus::Alive
         };
     }
-    let start = std::time::Instant::now();
+
+    let deadline = std::time::Instant::now() + timeout;
     let result = loop {
         let now = std::time::Instant::now();
-        if now >= start + timeout {
-            // Deadline elapsed. pidfd POLLIN never fired across
-            // the entire window, so the kernel hasn't signalled
-            // exit on the pidfd. Re-confirm via /proc to cover
-            // the rare race where the child died between the
-            // last poll and now (poll cadence is bounded by
-            // EINTR-driven loops; a ~microsecond-wide window
-            // exists where the child could have exited
-            // post-poll-pre-now).
+        if now >= deadline {
             break if proc_pid_alive(pid) {
                 StartupStatus::Alive
             } else {
                 StartupStatus::Died
             };
         }
-        let remaining_ms = (start + timeout - now).as_millis().min(i32::MAX as u128) as i32;
+        let remaining = deadline - now;
+        let timeout_ms = remaining
+            .as_millis()
+            .saturating_add(u128::from(
+                !remaining.subsec_nanos().is_multiple_of(1_000_000),
+            ))
+            .min(i32::MAX as u128) as libc::c_int;
         let mut pfd = libc::pollfd {
             fd: pidfd,
             events: libc::POLLIN,
             revents: 0,
         };
-        // SAFETY: `pfd` is a single-element pollfd; nfds is 1.
-        // Every poll outcome (ready, timeout, EINTR, error) loops
-        // back to the deadline check above, which rebuilds
-        // `remaining_ms` against the absolute start+timeout so
-        // EINTR cannot extend the wait past the requested
-        // duration.
-        let rc = unsafe { libc::poll(&mut pfd, 1, remaining_ms) };
-        if rc > 0 && pfd.revents & libc::POLLIN != 0 {
-            // pidfd POLLIN fires precisely at child exit (kernel
-            // `pidfd_poll` in `fs/pidfs.c` checks `exit_state`,
-            // woken via `do_notify_pidfd` from `exit_notify`).
-            // No `try_wait` follow-up needed — POLLIN itself is
-            // the proof.
+        // SAFETY: one live pidfd; poll only writes `revents`.
+        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if rc > 0 && pfd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             break StartupStatus::Died;
         }
-        // rc == 0 (timeout) or rc < 0 (EINTR/error) re-checks the
-        // deadline at the top of the loop. EINTR with remaining
-        // budget loops once more; deadline-exhausted falls into
-        // the elapsed branch above.
+        if rc < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            panic!(
+                "test pidfd liveness poll failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
     };
-    // SAFETY: pidfd is owned by this function and not used after
-    // close.
+    // SAFETY: this function exclusively owns the raw pidfd.
     unsafe {
         libc::close(pidfd);
     }
@@ -461,10 +809,9 @@ pub(crate) enum SpawnSchedulerError {
     /// log payload via `send_sched_log_text`.
     SpawnFailed(std::io::Error),
 
-    /// `poll_startup` observed the process exit within the
-    /// liveness window — typical for a scheduler that crashes in
-    /// BPF prog load (verifier reject) or argv validation before
-    /// the bind to `/sys/kernel/sched_ext/root/ops` lands.
+    /// The shared attach wait observed the process pidfd become readable
+    /// before attach completed — typical for a BPF verifier rejection,
+    /// argv validation failure, or userspace crash.
     /// `log_path` is the file the spawn helper wrote
     /// stdout+stderr into; callers use it for `dump_sched_output`.
     ///
@@ -474,20 +821,15 @@ pub(crate) enum SpawnSchedulerError {
     /// sched_exit_monitor caller path could install against a known
     /// id; the StartupDied branch never gets that far so the spawn
     /// helper owns the rollback). The dead child is auto-reaped by
-    /// the kernel because PID 1 runs SIGCHLD=`SIG_IGN` (see
-    /// [`poll_startup`]'s doc and [`ktstr_guest_init`]);
-    /// `poll_startup` only observes the exit via pidfd POLLIN, it
-    /// does not reap. No manual `wait`/`try_wait` required by the
-    /// caller.
+    /// the kernel because PID 1 runs SIGCHLD=`SIG_IGN`; the attach wait
+    /// observes pidfd POLLIN and does not reap. No manual
+    /// `wait`/`try_wait` is required by the caller.
     StartupDied { log_path: String },
 
-    /// Process is alive past the liveness window but
-    /// `poll_scx_attached` did NOT observe the bind marker.
-    /// `reason` is one of `"timeout"` (attach poll exhausted) or
-    /// `"sched_ext sysfs absent"` (kernel lacks sched_ext). The
-    /// caller (boot path → `force_reboot`, Op path → bail) uses
-    /// `log_path` to surface the scheduler's own diagnostic
-    /// output.
+    /// Process remained alive but did not attach. `reason` is a structured
+    /// diagnostic containing cause, terminal state/ops observations, and the
+    /// wall/service counters. The caller uses `log_path` to surface the
+    /// scheduler's own diagnostic output.
     ///
     /// **Post-mortem state guarantee.** [`try_spawn_scheduler`]
     /// returns this variant only AFTER SIGKILLing the orphan
@@ -496,10 +838,7 @@ pub(crate) enum SpawnSchedulerError {
     /// scheduler attempt) and waiting on it via `child.wait()` to
     /// reap the zombie, plus clearing [`SCHED_PID`] to 0. No manual
     /// cleanup required by the caller.
-    NotAttached {
-        reason: &'static str,
-        log_path: String,
-    },
+    NotAttached { reason: String, log_path: String },
 }
 
 impl std::fmt::Display for SpawnSchedulerError {
@@ -511,33 +850,24 @@ impl std::fmt::Display for SpawnSchedulerError {
             Self::StartupDied { log_path } => {
                 write!(
                     f,
-                    "scheduler exited before passing the 1-second liveness gate \
-                     (framework waits for the scheduler binary to remain alive at \
-                     least 1 s before checking for sched_ext bind via /sys/kernel/\
-                     sched_ext/root/ops). Common causes: BPF verifier rejection \
-                     (look for 'libbpf' / 'verifier' lines in the log), missing \
-                     CONFIG_SCHED_CLASS_EXT, scheduler binary segfault at init, \
-                     argv validation failure. Log content rendered below as part \
-                     of the failure dump (log captured at {log_path}); the process \
-                     was reaped and SCHED_PID cleared before this error surfaced."
+                    "scheduler exited before sched_ext attach completed. The pidfd \
+                     is watched continuously through BPF open/load/enable, so this \
+                     reports the exit at the point it happened. Common causes are \
+                     BPF verifier rejection (look for 'libbpf' / 'verifier' in the \
+                     log), a scheduler userspace crash, or argv validation failure. \
+                     Log captured at {log_path}; SCHED_PID was cleared before this \
+                     error surfaced."
                 )
             }
             Self::NotAttached { reason, log_path } => {
                 write!(
                     f,
-                    "scheduler alive but did not bind to sched_ext within the \
-                     attach window: {reason} (framework polls /sys/kernel/sched_ext/\
-                     root/ops for the BPF scheduler attach marker after the \
-                     scheduler binary's liveness gate; this variant surfaces when \
-                     the binary stayed alive but never wrote the bind marker). \
-                     Common causes for 'timeout': BPF program load stalled on a \
-                     slow CI runner past the 10s window, verifier ran long but \
-                     succeeded eventually (bump the window or warm the BPF cache). \
-                     Common causes for 'sched_ext sysfs absent': kernel built \
-                     without CONFIG_SCHED_CLASS_EXT (rebuild with that config). \
-                     Log content rendered below as part of the failure dump (log \
-                     captured at {log_path}); the framework SIGKILLed and reaped \
-                     the orphan + cleared SCHED_PID before this error surfaced."
+                    "scheduler stayed alive but did not complete sched_ext attach: \
+                     {reason}. Attach progress is charged in scheduler CPU service, \
+                     so host descheduling does not consume the allowance. Log \
+                     captured at {log_path}; the framework terminated the \
+                     unattached process and cleared SCHED_PID before surfacing this \
+                     error."
                 )
             }
         }
@@ -794,87 +1124,50 @@ pub(crate) fn try_spawn_scheduler(
     // exact.
     SCHED_PID.store(child.id() as i32, Ordering::Release);
 
-    match poll_startup(
-        &mut child,
-        std::time::Duration::from_millis(50),
-        std::time::Duration::from_secs(1),
-    ) {
-        StartupStatus::Died => {
-            // Process already exited — the dead child is auto-reaped by
-            // the kernel under SIGCHLD=SIG_IGN (poll_startup only observes
-            // the exit via pidfd POLLIN, it does not reap). SCHED_PID still
-            // points at the dead pid; clear so a
-            // subsequent Op dispatch's sched_pid() returns None instead of
-            // the stale dead/recycled id. The pid was published optimistically
-            // at spawn so the sched_exit_monitor caller path can install
-            // against a known id, but the StartupDied branch never gets that
-            // far so we own the rollback.
+    let status = poll_scx_attached(child.id());
+    match status {
+        ScxAttachStatus::Attached => Ok(Some((child, log_path.to_string()))),
+        ScxAttachStatus::Died => {
+            // The dead child is auto-reaped under SIGCHLD=SIG_IGN. SCHED_PID
+            // was published optimistically at spawn; clear it before any
+            // caller can install an exit monitor against the stale pid.
             SCHED_PID.store(0, Ordering::Release);
             Err(SpawnSchedulerError::StartupDied {
                 log_path: log_path.to_string(),
             })
         }
-        StartupStatus::Alive => {
-            // Verify the scheduler actually BOUND to sched_ext —
-            // a scheduler process can be alive but stuck in its
-            // BPF init (verifier reject, ops mismatch), which
-            // would leave the test running against the default
-            // kernel scheduler without the host ever noticing.
-            // `root/ops` is the post-attach marker.
-            //
-            // 10s budget aligns with SCHED_LIFECYCLE_KILL_GRACE on
-            // the kill side. A cold-cache BPF verifier + cgroup_init
-            // walking all tasks can plausibly run 5s+ on a slow CI
-            // runner; the prior 3s budget produced sporadic
-            // NotAttached(Timeout) returns under load even when the
-            // scheduler eventually bound seconds later. The 10s
-            // ceiling still surfaces real verifier-reject /
-            // ops-mismatch failures fast enough for an operator to
-            // act, while giving headroom for warm-boot timing.
-            let status = poll_scx_attached(
-                std::time::Duration::from_millis(50),
-                std::time::Duration::from_secs(10),
-            );
-            if !status.is_attached() {
-                // The terminal scx_state distinguishes a still-in-flight
-                // enable (Enabling — a slow/contended enable the host may
-                // classify as skippable) from a REJECTED enable (Disabling/
-                // Disabled — a verifier reject / ops.init failure, a real
-                // defect that must FAIL). The host keys its skip-vs-fail
-                // decision on this token; see the SchedulerNotAttached
-                // handling in src/test_support/eval.
-                let reason = match status {
-                    ScxAttachStatus::Timeout(Some(ScxState::Enabling)) => "timeout: state=enabling",
-                    ScxAttachStatus::Timeout(Some(ScxState::Disabling)) => {
-                        "timeout: state=disabling"
-                    }
-                    ScxAttachStatus::Timeout(Some(ScxState::Disabled)) => "timeout: state=disabled",
-                    ScxAttachStatus::Timeout(Some(ScxState::Enabled)) => "timeout: state=enabled",
-                    ScxAttachStatus::Timeout(None) => "timeout: state=unknown",
-                    ScxAttachStatus::SysfsAbsent => "sched_ext sysfs absent",
-                    ScxAttachStatus::Attached => unreachable!(),
-                };
-                // The process is ALIVE (poll_startup said so) but never
-                // bound to sched_ext. If we just return Err, the orphaned
-                // process keeps running and may bind LATE — polluting kernel
-                // state for the next Op dispatch (next AttachScheduler would
-                // see root/ops populated by an unknown owner; next Replace
-                // would race against the stale scheduler's eventual death).
-                // SIGKILL + waitpid here removes the orphan deterministically.
-                // SIGKILL not SIGTERM: the process never bound to scx so there's
-                // no in-kernel scheduler state to tear down via the libbpf path.
-                let pid = child.id() as libc::pid_t;
-                unsafe {
-                    let _ = libc::kill(pid, libc::SIGKILL);
+        status => {
+            let reason = match status {
+                ScxAttachStatus::Rejected(diagnostic) => diagnostic.reason("rejected-enable"),
+                ScxAttachStatus::ServiceBudgetExceeded(diagnostic) => {
+                    diagnostic.reason("service-budget")
                 }
-                let _ = child.wait();
-                SCHED_PID.store(0, Ordering::Release);
-                return Err(SpawnSchedulerError::NotAttached {
-                    reason,
-                    log_path: log_path.to_string(),
-                });
+                ScxAttachStatus::WallGuardExceeded(diagnostic) => diagnostic.reason("wall-guard"),
+                ScxAttachStatus::SysfsAbsent(diagnostic) => diagnostic.reason("sysfs-absent"),
+                ScxAttachStatus::ObserverError(error) => {
+                    format!("cause=observer-error detail={error:?}")
+                }
+                ScxAttachStatus::Attached | ScxAttachStatus::Died => unreachable!(),
+            };
+            tracing::warn!(
+                pid = child.id(),
+                reason,
+                "scheduler did not complete sched_ext attach"
+            );
+
+            // The process is still alive but not attached. Kill it
+            // deterministically so it cannot late-bind and pollute a later
+            // Attach/Replace operation.
+            let pid = child.id() as libc::pid_t;
+            unsafe {
+                let _ = libc::kill(pid, libc::SIGKILL);
             }
-            Ok(Some((child, log_path.to_string())))
+            let _ = child.wait();
+            SCHED_PID.store(0, Ordering::Release);
+            Err(SpawnSchedulerError::NotAttached {
+                reason,
+                log_path: log_path.to_string(),
+            })
         }
     }
 }
@@ -977,7 +1270,7 @@ pub(crate) fn spawn_scheduler_from_paths(
             dump_sched_output(&log_path);
             crate::vmm::guest_comms::send_lifecycle(
                 crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
-                reason,
+                &reason,
             );
             crate::vmm::guest_comms::send_exit(1);
             drain_probe_pipeline(probe_drain.as_ref(), crate::test_support::PROBE_DRAIN_GRACE);
@@ -989,6 +1282,251 @@ pub(crate) fn spawn_scheduler_from_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot(state: ScxState, ops: OpsObservation) -> ScxAttachSnapshot {
+        ScxAttachSnapshot {
+            state: StateObservation::Value(state),
+            ops,
+        }
+    }
+
+    fn loading_snapshot() -> ScxAttachSnapshot {
+        snapshot(ScxState::Disabled, OpsObservation::Missing)
+    }
+
+    fn enabling_snapshot() -> ScxAttachSnapshot {
+        snapshot(ScxState::Enabling, OpsObservation::Named("test_ops".into()))
+    }
+
+    fn attached_snapshot() -> ScxAttachSnapshot {
+        snapshot(ScxState::Enabled, OpsObservation::Named("test_ops".into()))
+    }
+
+    #[derive(Clone)]
+    struct FakeAttachFrame {
+        wall: std::time::Duration,
+        service: std::time::Duration,
+        exited: bool,
+        snapshot: ScxAttachSnapshot,
+    }
+
+    impl FakeAttachFrame {
+        fn new(wall_s: f64, service_s: f64, exited: bool, snapshot: ScxAttachSnapshot) -> Self {
+            Self {
+                wall: std::time::Duration::from_secs_f64(wall_s),
+                service: std::time::Duration::from_secs_f64(service_s),
+                exited,
+                snapshot,
+            }
+        }
+    }
+
+    struct FakeAttachIo {
+        frames: Vec<FakeAttachFrame>,
+        index: usize,
+        wait_error: Option<String>,
+    }
+
+    impl FakeAttachIo {
+        fn new(frames: Vec<FakeAttachFrame>) -> Self {
+            assert!(!frames.is_empty());
+            Self {
+                frames,
+                index: 0,
+                wait_error: None,
+            }
+        }
+
+        fn frame(&self) -> &FakeAttachFrame {
+            &self.frames[self.index]
+        }
+    }
+
+    impl AttachWaitIo for FakeAttachIo {
+        fn child_exited(&mut self) -> Result<bool, String> {
+            Ok(self.frame().exited)
+        }
+
+        fn snapshot(&mut self) -> Result<ScxAttachSnapshot, String> {
+            Ok(self.frame().snapshot.clone())
+        }
+
+        fn service_elapsed(&mut self) -> Result<std::time::Duration, String> {
+            Ok(self.frame().service)
+        }
+
+        fn wall_elapsed(&mut self) -> std::time::Duration {
+            self.frame().wall
+        }
+
+        fn wait(&mut self, _timeout: std::time::Duration) -> Result<(), String> {
+            if let Some(error) = self.wait_error.take() {
+                return Err(error);
+            }
+            assert!(
+                self.index + 1 < self.frames.len(),
+                "fake attach wait exhausted without a terminal frame"
+            );
+            self.index += 1;
+            Ok(())
+        }
+    }
+
+    fn test_policy() -> AttachWaitPolicy {
+        AttachWaitPolicy {
+            cadence: std::time::Duration::from_millis(50),
+            service_budget: std::time::Duration::from_secs(35),
+            wall_guard: std::time::Duration::from_secs(90),
+        }
+    }
+
+    /// Host starvation no longer consumes attach allowance: more than the old
+    /// ten wall seconds may pass while scheduler CPU service remains small.
+    #[test]
+    fn attach_wait_charges_service_not_wall() {
+        let mut io = FakeAttachIo::new(vec![
+            FakeAttachFrame::new(0.0, 0.0, false, loading_snapshot()),
+            FakeAttachFrame::new(12.0, 1.0, false, loading_snapshot()),
+            FakeAttachFrame::new(20.0, 2.0, false, enabling_snapshot()),
+            FakeAttachFrame::new(21.0, 2.5, false, attached_snapshot()),
+        ]);
+        assert_eq!(
+            wait_scx_attach_with(&mut io, test_policy()),
+            ScxAttachStatus::Attached
+        );
+    }
+
+    /// Readiness is sampled before the wall guard, so an attach that completed
+    /// while PID 1 was descheduled across the exact boundary wins.
+    #[test]
+    fn attach_at_wall_guard_is_success() {
+        let mut io = FakeAttachIo::new(vec![
+            FakeAttachFrame::new(0.0, 0.0, false, loading_snapshot()),
+            FakeAttachFrame::new(90.0, 1.0, false, attached_snapshot()),
+        ]);
+        assert_eq!(
+            wait_scx_attach_with(&mut io, test_policy()),
+            ScxAttachStatus::Attached
+        );
+    }
+
+    /// The pidfd remains in the wait through the whole attach, not only the
+    /// former one-second startup window.
+    #[test]
+    fn scheduler_death_after_old_startup_gate_is_immediate() {
+        let mut io = FakeAttachIo::new(vec![
+            FakeAttachFrame::new(0.0, 0.0, false, loading_snapshot()),
+            FakeAttachFrame::new(2.0, 0.2, true, loading_snapshot()),
+        ]);
+        assert_eq!(
+            wait_scx_attach_with(&mut io, test_policy()),
+            ScxAttachStatus::Died
+        );
+    }
+
+    /// A dead child wins over a stale `enabled` sysfs snapshot.
+    #[test]
+    fn simultaneous_death_and_ready_prefers_death() {
+        let mut io = FakeAttachIo::new(vec![FakeAttachFrame::new(
+            2.0,
+            0.2,
+            true,
+            attached_snapshot(),
+        )]);
+        assert_eq!(
+            wait_scx_attach_with(&mut io, test_policy()),
+            ScxAttachStatus::Died
+        );
+    }
+
+    /// The dynamic root kobject is intentionally absent before registration;
+    /// a readable stable state node proves sched_ext exists.
+    #[test]
+    fn missing_root_ops_is_loading_not_sysfs_absent() {
+        let mut io = FakeAttachIo::new(vec![
+            FakeAttachFrame::new(0.0, 0.0, false, loading_snapshot()),
+            FakeAttachFrame::new(40.0, 35.0, false, loading_snapshot()),
+        ]);
+        let status = wait_scx_attach_with(&mut io, test_policy());
+        assert!(
+            matches!(status, ScxAttachStatus::ServiceBudgetExceeded(_)),
+            "missing lazy root/ops was misclassified: {status:?}"
+        );
+    }
+
+    /// Only absence of the stable sched_ext state node means sched_ext sysfs is
+    /// absent.
+    #[test]
+    fn missing_state_is_sysfs_absent() {
+        let mut io = FakeAttachIo::new(vec![FakeAttachFrame::new(
+            0.0,
+            0.0,
+            false,
+            ScxAttachSnapshot {
+                state: StateObservation::Missing,
+                ops: OpsObservation::Missing,
+            },
+        )]);
+        assert!(matches!(
+            wait_scx_attach_with(&mut io, test_policy()),
+            ScxAttachStatus::SysfsAbsent(_)
+        ));
+    }
+
+    /// A semantic forward edge resets the per-progress service checkpoint.
+    #[test]
+    fn attach_progress_resets_service_budget() {
+        let mut io = FakeAttachIo::new(vec![
+            FakeAttachFrame::new(0.0, 0.0, false, loading_snapshot()),
+            FakeAttachFrame::new(34.0, 34.0, false, loading_snapshot()),
+            FakeAttachFrame::new(35.0, 34.5, false, enabling_snapshot()),
+            FakeAttachFrame::new(60.0, 60.0, false, enabling_snapshot()),
+            FakeAttachFrame::new(61.0, 60.5, false, attached_snapshot()),
+        ]);
+        assert_eq!(
+            wait_scx_attach_with(&mut io, test_policy()),
+            ScxAttachStatus::Attached
+        );
+    }
+
+    #[test]
+    fn service_clock_regression_is_observer_error() {
+        let mut io = FakeAttachIo::new(vec![
+            FakeAttachFrame::new(0.0, 1.0, false, loading_snapshot()),
+            FakeAttachFrame::new(1.0, 0.5, false, loading_snapshot()),
+        ]);
+        assert!(matches!(
+            wait_scx_attach_with(&mut io, test_policy()),
+            ScxAttachStatus::ObserverError(ref error) if error.contains("regressed")
+        ));
+    }
+
+    #[test]
+    fn event_source_error_is_not_a_timeout() {
+        let mut io = FakeAttachIo::new(vec![FakeAttachFrame::new(
+            0.0,
+            0.0,
+            false,
+            loading_snapshot(),
+        )]);
+        io.wait_error = Some("poll source failed".into());
+        assert_eq!(
+            wait_scx_attach_with(&mut io, test_policy()),
+            ScxAttachStatus::ObserverError("poll source failed".into())
+        );
+    }
+
+    #[test]
+    fn backwards_enable_transition_is_rejected_immediately() {
+        let mut io = FakeAttachIo::new(vec![
+            FakeAttachFrame::new(0.0, 0.0, false, enabling_snapshot()),
+            FakeAttachFrame::new(1.0, 1.0, false, loading_snapshot()),
+        ]);
+        assert!(matches!(
+            wait_scx_attach_with(&mut io, test_policy()),
+            ScxAttachStatus::Rejected(_)
+        ));
+    }
 
     /// `scx_attach_ready` (the attach predicate) is true ONLY when the
     /// scheduler is both registered (non-empty `root/ops`) AND fully enabled

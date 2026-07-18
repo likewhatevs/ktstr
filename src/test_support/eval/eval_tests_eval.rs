@@ -3833,11 +3833,13 @@ fn not_attached_drain(reason: &str) -> crate::vmm::host_comms::BulkDrainResult {
     }
 }
 
-/// A still-in-flight enable (state=enabling) under host oversubscription
-/// (64 vCPUs on 8 allowed CPUs = 8x) is a contention SKIP.
+/// A still-in-flight enable at the last-resort wall guard under host
+/// oversubscription (64 vCPUs on 8 allowed CPUs = 8x) is a contention SKIP.
 #[test]
 fn contention_skip_enabling_oversubscribed_skips() {
-    let drain = not_attached_drain("timeout: state=enabling");
+    let drain = not_attached_drain(
+        "cause=wall-guard state=enabling ops=missing wall_ms=90000 service_ms=1000",
+    );
     let reason = contention_not_attached_skip_reason(Some(&drain), 64, 8, None);
     assert!(
         reason
@@ -3852,7 +3854,9 @@ fn contention_skip_enabling_oversubscribed_skips() {
 /// is a real defect that must FAIL.
 #[test]
 fn contention_skip_enabling_fitting_host_fails() {
-    let drain = not_attached_drain("timeout: state=enabling");
+    let drain = not_attached_drain(
+        "cause=wall-guard state=enabling ops=missing wall_ms=90000 service_ms=1000",
+    );
     assert_eq!(
         contention_not_attached_skip_reason(Some(&drain), 8, 8, None),
         None,
@@ -3860,11 +3864,28 @@ fn contention_skip_enabling_fitting_host_fails() {
     );
 }
 
+/// CPU-service exhaustion is independent of host wall-time dilation. Even an
+/// `enabling` terminal snapshot under heavy oversubscription must fail.
+#[test]
+fn contention_skip_service_budget_enabling_never_skips() {
+    let drain = not_attached_drain(
+        "cause=service-budget state=enabling ops=named(\"lavd\") \
+         wall_ms=120000 service_ms=35000",
+    );
+    assert_eq!(
+        contention_not_attached_skip_reason(Some(&drain), 64, 8, None),
+        None,
+        "scheduler CPU-service exhaustion must FAIL, never become a host-contention skip",
+    );
+}
+
 /// A REJECTED enable (state=disabling) is a real defect and must FAIL
 /// even under heavy oversubscription.
 #[test]
 fn contention_skip_disabling_never_skips() {
-    let drain = not_attached_drain("timeout: state=disabling");
+    let drain = not_attached_drain(
+        "cause=rejected-enable state=disabling ops=named(\"lavd\") wall_ms=20 service_ms=10",
+    );
     assert_eq!(
         contention_not_attached_skip_reason(Some(&drain), 64, 8, None),
         None,
@@ -3876,7 +3897,9 @@ fn contention_skip_disabling_never_skips() {
 /// also never skips.
 #[test]
 fn contention_skip_disabled_never_skips() {
-    let drain = not_attached_drain("timeout: state=disabled");
+    let drain = not_attached_drain(
+        "cause=rejected-enable state=disabled ops=missing wall_ms=20 service_ms=10",
+    );
     assert_eq!(
         contention_not_attached_skip_reason(Some(&drain), 64, 8, None),
         None,
@@ -3887,7 +3910,8 @@ fn contention_skip_disabled_never_skips() {
 /// skips.
 #[test]
 fn contention_skip_sysfs_absent_never_skips() {
-    let drain = not_attached_drain("sched_ext sysfs absent");
+    let drain =
+        not_attached_drain("cause=sysfs-absent state=missing ops=missing wall_ms=0 service_ms=0");
     assert_eq!(
         contention_not_attached_skip_reason(Some(&drain), 64, 8, None),
         None,

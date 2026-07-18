@@ -20,6 +20,7 @@
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
+use nix::errno::Errno;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
 
@@ -34,6 +35,39 @@ pub(crate) enum KernfsWaitOutcome<T> {
     /// no evented source available, no point looping. Caller
     /// surfaces this as the appropriate kernel-defect error.
     NoEventedSource,
+}
+
+/// Resolve a deadline edge without letting the guard rail hide a
+/// simultaneously-satisfied source-of-truth predicate.
+///
+/// The caller can be descheduled between its preceding predicate
+/// check and its deadline check. Once it resumes at or after the
+/// deadline, it must sample the predicate one final time before
+/// reporting `Timeout`.
+fn outcome_at_deadline<T>(
+    now: Instant,
+    deadline: Instant,
+    check_done: &mut impl FnMut() -> Option<T>,
+) -> Option<KernfsWaitOutcome<T>> {
+    if now < deadline {
+        return None;
+    }
+
+    Some(match check_done() {
+        Some(value) => KernfsWaitOutcome::Done(value),
+        None => KernfsWaitOutcome::Timeout,
+    })
+}
+
+/// Convert a positive duration to poll's millisecond timeout without
+/// truncating a sub-millisecond remainder to an immediate return.
+fn poll_timeout_ceil(duration: Duration) -> PollTimeout {
+    let has_submillisecond_remainder = duration.subsec_nanos() % 1_000_000 != 0;
+    let millis = duration
+        .as_millis()
+        .saturating_add(u128::from(has_submillisecond_remainder))
+        .min(i32::MAX as u128);
+    PollTimeout::try_from(millis).expect("millisecond timeout was clamped to i32::MAX")
 }
 
 /// Wait for `check_done` to return `Some`, polling two evented
@@ -64,8 +98,9 @@ pub(crate) enum KernfsWaitOutcome<T> {
 /// deadlines/timeouts are ok", this is a deadline guard rail on
 /// the evented wait, not a degraded polling path.
 ///
-/// `check_done` runs ONCE at entry (fast-path), then after every
-/// poll wake. Returning `Some(value)` exits with `Done(value)`.
+/// `check_done` runs once at entry (fast-path), after every poll
+/// wake, and once more before an elapsed deadline is reported.
+/// Returning `Some(value)` exits with `Done(value)`.
 pub(crate) fn kernfs_evented_wait<T, P, A>(
     parent_dir: P,
     event_mask: AddWatchFlags,
@@ -128,12 +163,11 @@ where
     // the poll call).
     loop {
         let now = Instant::now();
-        if now >= deadline {
-            return KernfsWaitOutcome::Timeout;
+        if let Some(outcome) = outcome_at_deadline(now, deadline, &mut check_done) {
+            return outcome;
         }
         let remaining = deadline - now;
-        let wait_ms = remaining.min(cadence).as_millis().min(i32::MAX as u128) as i32;
-        let timeout = PollTimeout::try_from(wait_ms).unwrap_or(PollTimeout::ZERO);
+        let timeout = poll_timeout_ceil(remaining.min(cadence));
 
         // Build the pollfd set: max 2 entries. nix's PollFd::new
         // takes a BorrowedFd<'fd> that lives as long as the slice
@@ -147,10 +181,17 @@ where
             pfds.push(PollFd::new(inot.as_fd(), PollFlags::POLLIN));
         }
 
-        // Ignore poll return — caller's check_done is the source
-        // of truth. Errors (EINTR, etc.) are benign: the loop's
-        // next iteration re-checks the deadline and re-polls.
-        let _ = poll(&mut pfds, timeout);
+        // EINTR is a normal wake: the predicate remains the source
+        // of truth and the next iteration recomputes the remaining
+        // deadline. Other errors mean the subscribed event source
+        // cannot be trusted, so fail loudly rather than silently
+        // spinning until a misleading timeout.
+        match poll(&mut pfds, timeout) {
+            Ok(_) | Err(Errno::EINTR) => {}
+            Err(err) => {
+                panic!("evented_wait::kernfs_evented_wait: poll failed: {err}");
+            }
+        }
 
         // Drain inotify events so the fd doesn't stay readable
         // across iterations and spin the next poll. We don't
@@ -179,8 +220,8 @@ where
 /// unconditionally in Linux 5.3, so a non-ESRCH error
 /// (ENOMEM, ENFILE) is a catastrophic environment defect that
 /// polling cannot recover from. Same for nix's poll(2) failures
-/// beyond EINTR (already handled internally by the syscall
-/// retry).
+/// beyond EINTR; EINTR is treated as a normal wake and retries
+/// after the source-of-truth predicate is sampled.
 pub(crate) fn pidfd_wait_exit(
     pid: u32,
     deadline: Instant,
@@ -235,12 +276,88 @@ pub(crate) fn pidfd_wait_exit(
             return !still_alive();
         }
         let remaining = deadline - now;
-        let wait_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
-        let timeout = PollTimeout::try_from(wait_ms).unwrap_or(PollTimeout::ZERO);
+        let timeout = poll_timeout_ceil(remaining);
 
         let mut pfds = [PollFd::new(pidfd.as_fd(), PollFlags::POLLIN)];
-        // EINTR / other transient errors fall through to the next
-        // iteration; predicate re-check is the source of truth.
-        let _ = poll(&mut pfds, timeout);
+        match poll(&mut pfds, timeout) {
+            Ok(_) | Err(Errno::EINTR) => {}
+            Err(err) => {
+                panic!("evented_wait::pidfd_wait_exit: poll(pid={pid}) failed: {err}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deadline_edge_gives_done_precedence_over_timeout() {
+        let deadline = Instant::now();
+        let mut checks = 0;
+
+        let outcome = outcome_at_deadline(deadline, deadline, &mut || {
+            checks += 1;
+            Some(17)
+        });
+
+        assert!(matches!(outcome, Some(KernfsWaitOutcome::Done(17))));
+        assert_eq!(checks, 1);
+    }
+
+    #[test]
+    fn elapsed_deadline_rechecks_before_timeout() {
+        let deadline = Instant::now();
+        let now = deadline + Duration::from_secs(1);
+        let mut checks = 0;
+
+        let outcome = outcome_at_deadline(now, deadline, &mut || {
+            checks += 1;
+            None::<()>
+        });
+
+        assert!(matches!(outcome, Some(KernfsWaitOutcome::Timeout)));
+        assert_eq!(checks, 1);
+    }
+
+    #[test]
+    fn live_deadline_does_not_sample_predicate() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(1);
+        let mut checks = 0;
+
+        let outcome = outcome_at_deadline(now, deadline, &mut || {
+            checks += 1;
+            Some(())
+        });
+
+        assert!(outcome.is_none());
+        assert_eq!(checks, 0);
+    }
+
+    #[test]
+    fn poll_timeout_rounds_positive_submillisecond_waits_up() {
+        assert_eq!(
+            poll_timeout_ceil(Duration::from_nanos(1)).as_millis(),
+            Some(1)
+        );
+        assert_eq!(
+            poll_timeout_ceil(Duration::from_micros(999)).as_millis(),
+            Some(1)
+        );
+        assert_eq!(
+            poll_timeout_ceil(Duration::from_micros(1_001)).as_millis(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn poll_timeout_preserves_zero_and_exact_milliseconds() {
+        assert_eq!(poll_timeout_ceil(Duration::ZERO), PollTimeout::ZERO);
+        assert_eq!(
+            poll_timeout_ceil(Duration::from_millis(37)).as_millis(),
+            Some(37)
+        );
     }
 }

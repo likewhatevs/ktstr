@@ -512,21 +512,16 @@ fn overcommit_skip(
 /// Classify a no-guest-result run for the contention-`NotAttached` SKIP.
 ///
 /// Returns `Some(reason)` when the run should SKIP (a clean host-resource
-/// condition): the guest reported `SchedulerNotAttached` with the enable
-/// STILL IN FLIGHT (reason carries `state=enabling`) AND the host was
-/// oversubscribed (overcommit ratio > 1.0) — the scheduler was still
-/// enabling when the startup budget expired under host time-slicing, not
-/// a load/verify reject. Returns `None` (the run FAILs) for a REJECTED
-/// enable (`state=disabling`/`disabled`), a missing sched_ext sysfs, a
-/// `SchedulerDied`, a stall on a FITTING host (ratio == 1.0), or any run
-/// with no `SchedulerNotAttached` frame.
+/// condition): the guest reported `SchedulerNotAttached` because the
+/// last-resort WALL guard fired while state was still `enabling`, and the host
+/// was oversubscribed. The normal attach allowance is scheduler CPU service,
+/// so host descheduling cannot consume it. Service-budget exhaustion is real
+/// scheduler work without progress and always FAILs.
 ///
-/// The `state=enabling` token is produced by the guest's
-/// `poll_scx_attached` (`src/vmm/rust_init/scheduler.rs`): the sched_ext
-/// enable path leaves `Enabling` for `Disabling`/`Disabled` ONLY on
-/// failure, so `Enabling` at the deadline means a still-progressing (not
-/// rejected) enable. `SchedulerDied` and the non-`enabling` reasons are
-/// checked FIRST so a genuine defect can never be classified as a skip.
+/// The structured `cause=wall-guard state=enabling` tokens are produced by
+/// the guest's unified pidfd+sysfs attach wait. `SchedulerDied`, service
+/// exhaustion, observer failures, and non-enabling states are rejected before
+/// host overcommit is considered.
 /// Pure over its inputs so the skip boundary is unit-testable without a
 /// live scheduler.
 fn contention_not_attached_skip_reason(
@@ -542,10 +537,10 @@ fn contention_not_attached_skip_reason(
         // never a contention skip.
         return None;
     };
-    // Only a still-in-flight enable is skippable; a rejected enable
-    // (disabling/disabled), sysfs-absent, or unknown state is a real
-    // defect that must FAIL.
-    if !reason.contains("state=enabling") {
+    // Only the last-resort WALL guard plus an in-flight enable is skippable.
+    // A service-budget hit is dilation-invariant and therefore a real defect,
+    // even if its terminal state happens to be enabling.
+    if !reason.contains("cause=wall-guard") || !reason.contains("state=enabling") {
         return None;
     }
     // On a fitting host a startup-budget stall is a real defect, not
