@@ -16,13 +16,13 @@ use std::process::{Command, Stdio};
 use libbpf_cargo::SkeletonBuilder;
 
 #[cfg(feature = "wprof")]
-use build_ahash as gix_acquire_ahash;
+use ahash as gix_acquire_ahash;
 #[cfg(feature = "wprof")]
-use build_fs2 as gix_acquire_fs2;
+use fs2 as gix_acquire_fs2;
 #[cfg(feature = "wprof")]
-use build_gix as gix_acquire_gix;
+use gix as gix_acquire_gix;
 #[cfg(feature = "wprof")]
-use build_jobserver as gix_acquire_jobserver;
+use jobserver as gix_acquire_jobserver;
 #[cfg(feature = "wprof")]
 #[path = "build_support/gix_acquire.rs"]
 mod gix_acquire;
@@ -42,7 +42,7 @@ fn cargo_coordinated_make() -> Command {
     // SAFETY: Cargo owns the authenticated jobserver descriptors inherited by
     // this build script. `configure()` marks those descriptors inheritable by
     // GNU make instead of merely copying their numeric names.
-    if let Some(client) = unsafe { build_jobserver::Client::from_env() } {
+    if let Some(client) = unsafe { jobserver::Client::from_env() } {
         client.configure(&mut command);
     }
     // GNU make consumes MAKEFLAGS directly. Retain Cargo's compatibility

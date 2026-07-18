@@ -438,9 +438,9 @@ export = []
 # mold, elfutils-devel, zlib-devel on the host; takes several minutes cold).
 wprof = [
     "ktstr-macros/wprof",
-    "dep:build_ahash",
-    "dep:build_fs2",
-    "dep:build_gix",
+    "dep:ahash",
+    "dep:fs2",
+    "dep:gix",
 ]
 # Pretty thread-name labels in `ctprof_compare` output. Enables
 # `grex` regex synthesis to render multi-member buckets as a
@@ -518,12 +518,12 @@ mockito = "1"
 virtio-queue = { version = "0.17", features = ["test-utils"] }
 
 [build-dependencies]
-build_ahash = { package = "ahash", version = "0.8", optional = true }
-build_fs2 = { package = "fs2", version = "0.4", optional = true }
+ahash = { version = "0.8", optional = true }
+fs2 = { version = "0.4", optional = true }
 # Optional with `wprof`: default builds do not compile a second host-side gix
 # graph merely for a build-script path that is disabled.
-build_gix = { package = "gix", version = "0.83", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-curl-rustls", "worktree-mutation", "progress-tree", "parallel"], optional = true }
-build_jobserver = { package = "jobserver", version = "0.1" }
+gix = { version = "0.83", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-curl-rustls", "worktree-mutation", "progress-tree", "parallel"], optional = true }
+jobserver = { version = "0.1" }
 cc = "1"
 flate2 = "1"
 # BPF skeleton generator, invoked by build.rs. Optional + pulled in by

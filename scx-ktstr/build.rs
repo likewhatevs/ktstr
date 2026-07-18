@@ -10,10 +10,10 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-use build_ahash as gix_acquire_ahash;
-use build_fs2 as gix_acquire_fs2;
-use build_gix as gix_acquire_gix;
-use build_jobserver as gix_acquire_jobserver;
+use ahash as gix_acquire_ahash;
+use fs2 as gix_acquire_fs2;
+use gix as gix_acquire_gix;
+use jobserver as gix_acquire_jobserver;
 
 #[path = "../build_support/gix_acquire.rs"]
 mod gix_acquire;
