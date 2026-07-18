@@ -1269,6 +1269,7 @@ mod tests {
 
     #[test]
     fn create_checkout_from_tree_materializes_the_tree() {
+        let _serial = crate::interrupt::test_serial_guard();
         // Build a throwaway repo with one blob+tree, then check that
         // create_checkout_from_tree materializes it into a PLAIN dir with no
         // `.git`. Pins our wiring (index_from_tree -> checkout_options ->
@@ -1376,6 +1377,7 @@ mod tests {
     /// `-dirty` label matches the built content.
     #[test]
     fn dirty_head_snapshot_captures_worktree_bytes_not_head() {
+        let _serial = crate::interrupt::test_serial_guard();
         let base = std::env::temp_dir().join(format!("ktstr-pd-snap-dirty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let repo_dir = base.join("repo");
@@ -1457,6 +1459,7 @@ mod tests {
     /// in the snapshot; an ignored file is NOT.
     #[test]
     fn dirty_head_snapshot_includes_untracked_but_excludes_ignored() {
+        let _serial = crate::interrupt::test_serial_guard();
         let base = std::env::temp_dir().join(format!("ktstr-pd-snap-untr-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let repo_dir = base.join("repo");
@@ -1484,6 +1487,7 @@ mod tests {
     /// A file deleted from the worktree is removed from the snapshot tree.
     #[test]
     fn dirty_head_snapshot_drops_a_deleted_file() {
+        let _serial = crate::interrupt::test_serial_guard();
         let base = std::env::temp_dir().join(format!("ktstr-pd-snap-del-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let repo_dir = base.join("repo");
@@ -1508,6 +1512,7 @@ mod tests {
     /// perf script would silently change behavior).
     #[test]
     fn dirty_head_snapshot_preserves_the_worktree_exec_bit() {
+        let _serial = crate::interrupt::test_serial_guard();
         use std::os::unix::fs::PermissionsExt;
         let base = std::env::temp_dir().join(format!("ktstr-pd-snap-exec-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);

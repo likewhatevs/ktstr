@@ -56,7 +56,14 @@ pub(crate) fn record_for_test(sig: libc::c_int) {
 #[cfg(test)]
 pub(crate) fn test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Signal tests deliberately set the process-global checkout abort flag.
+    // A raw `cargo test` runs unrelated checkout fixtures in peer threads, so
+    // every participant in this test-only critical section starts from a
+    // clean state as well as excluding concurrent synthetic delivery.
+    CAUGHT_SIGNAL.store(0, Ordering::SeqCst);
+    INTERRUPTED.store(false, Ordering::SeqCst);
+    guard
 }
 
 /// RAII guard that routes SIGINT + SIGTERM to [`handler`] for its

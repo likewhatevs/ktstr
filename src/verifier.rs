@@ -1119,8 +1119,7 @@ pub fn collect_verifier_output(
     topology: crate::vmm::topology::Topology,
     forced_cpu_budget: Option<u32>,
 ) -> anyhow::Result<VerifierVmResult> {
-    let memory_min_mib =
-        crate::test_support::runtime::cpu_scaled_memory_mib(topology.total_cpus());
+    let memory_min_mib = crate::test_support::runtime::cpu_scaled_memory_mib(topology.total_cpus());
     collect_verifier_output_with_memory_min(
         sched_bin,
         ktstr_bin,
