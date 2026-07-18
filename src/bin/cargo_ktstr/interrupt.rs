@@ -159,6 +159,7 @@ extern "C" fn handler(sig: libc::c_int) {
 fn record_signal(sig: libc::c_int) {
     let _ = CAUGHT_SIGNAL.compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst);
     INTERRUPTED.store(true, Ordering::SeqCst);
+    ktstr::fetch::set_git_operation_interrupted(true);
 }
 
 fn terminate_from_handler(sig: libc::c_int) -> ! {
@@ -202,6 +203,7 @@ pub(crate) fn test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
     CAUGHT_SIGNAL.store(0, Ordering::SeqCst);
     DEFERRED_EXIT_CODE.store(0, Ordering::SeqCst);
     INTERRUPTED.store(false, Ordering::SeqCst);
+    ktstr::fetch::set_git_operation_interrupted(false);
     SIGNAL_PHASE.store(EARLY, Ordering::SeqCst);
     HANDLERS_IN_FLIGHT.store(0, Ordering::SeqCst);
     clear_pending_handoff_signals();
@@ -268,6 +270,7 @@ impl InterruptGuard {
         CAUGHT_SIGNAL.store(0, Ordering::SeqCst);
         DEFERRED_EXIT_CODE.store(0, Ordering::SeqCst);
         INTERRUPTED.store(false, Ordering::SeqCst);
+        ktstr::fetch::set_git_operation_interrupted(false);
         SIGNAL_PHASE.store(EARLY, Ordering::SeqCst);
 
         // SAFETY: `handler` has the signal-handler ABI and performs only
@@ -1029,6 +1032,10 @@ mod tests {
 
     fn install_cleanup_guard() -> InterruptGuard {
         let guard = InterruptGuard::install();
+        assert!(
+            !ktstr::fetch::git_operation_interrupted(),
+            "a new interrupt guard resets the gix cancellation epoch",
+        );
         enter_cleanup_phase().expect("test enters cleanup phase");
         guard
     }
@@ -1059,6 +1066,10 @@ mod tests {
         record_for_test(libc::SIGINT);
         assert_eq!(guard.interrupted(), Some(libc::SIGTERM));
         assert!(INTERRUPTED.load(Ordering::SeqCst));
+        assert!(
+            ktstr::fetch::git_operation_interrupted(),
+            "recording a process signal cancels in-process gix work",
+        );
         assert_eq!(restore_and_caught(guard), Some(libc::SIGTERM));
         assert_eq!(current(libc::SIGINT), libc::SIG_IGN);
         assert_eq!(current(libc::SIGTERM), libc::SIG_IGN);

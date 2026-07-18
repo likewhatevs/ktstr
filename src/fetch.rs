@@ -13,6 +13,7 @@ use std::io::Read;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -28,6 +29,29 @@ use sha2::{Digest, Sha256};
 /// within a CLI run. Cross-host fetches in the same run still
 /// re-handshake because reqwest's connection pool keys on host.
 static SHARED_CLIENT: OnceLock<Client> = OnceLock::new();
+
+/// Process interruption observed by in-process gix receive/checkout
+/// operations. cargo-ktstr's signal handler updates this through
+/// [`set_git_operation_interrupted`]; binaries retaining the default
+/// signal disposition terminate directly and do not need the bridge.
+static GIT_OPERATION_INTERRUPTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Bridge a process-level signal epoch into in-process gix work.
+///
+/// This performs one atomic store and is safe to call from
+/// cargo-ktstr's SIGINT/SIGTERM handler. `false` starts a new guard
+/// epoch; `true` stops active and subsequent fetch/checkout work.
+#[doc(hidden)]
+pub fn set_git_operation_interrupted(interrupted: bool) {
+    GIT_OPERATION_INTERRUPTED.store(interrupted, Ordering::SeqCst);
+}
+
+/// Read the process-level gix interruption bridge.
+#[doc(hidden)]
+pub fn git_operation_interrupted() -> bool {
+    GIT_OPERATION_INTERRUPTED.load(Ordering::SeqCst)
+}
 
 /// Connect-phase timeout for [`shared_client`]: bounds the time spent
 /// in the TCP + TLS handshake before reqwest gives up on a peer.
@@ -2433,17 +2457,17 @@ fn git_clone_inner(
     // Drive a determinate clone bar from gix's progress tree (see
     // [`crate::cli::progress::CloneProgress`]). `None` when no progress
     // group is threaded in; the gix calls then pass `Discard` exactly
-    // as before. One interrupt flag (never set) is shared by both
-    // phases, matching the prior per-call `AtomicBool::new(false)`.
-    let clone_progress = mp.map(|fp| fp.clone_progress(git_ref));
-    let interrupt = std::sync::atomic::AtomicBool::new(false);
+    // as before. Both phases poll the process-level signal bridge set
+    // by cargo-ktstr's interrupt handler.
+    let progress_label = format!("{cli_label}: {git_ref}");
+    let clone_progress = mp.map(|fp| fp.clone_progress(&progress_label));
     let commit_id = match fetch_exact_ref_and_checkout(
         url,
         git_ref,
         ref_kind,
         &clone_dir,
         clone_progress.as_ref(),
-        &interrupt,
+        &GIT_OPERATION_INTERRUPTED,
     ) {
         Ok(id) => id,
         Err(err) => {
@@ -2488,6 +2512,88 @@ fn git_clone_inner(
     })
 }
 
+/// Measured ceiling for one gix pack-index or checkout operation.
+///
+/// A live sched_ext `for-next` depth-one fetch on the 64-CPU
+/// development host took 55.0s / 705MB with all CPUs, 57.6s / 454MB
+/// with eight, and 58.0s / 591MB with sixteen. Eight therefore keeps
+/// essentially all transfer throughput while avoiding hundreds of MB
+/// of per-clone worker state. Smaller hosts use their available CPU
+/// count instead.
+const GIX_WORKERS_PER_OPERATION: usize = 8;
+
+/// Non-blocking pool of the *extra* workers shared by all gix fetches
+/// and checkouts in this process.
+///
+/// Every operation always has its calling thread and therefore always
+/// proceeds. It opportunistically leases currently-free extras, so
+/// concurrent clones cannot each create an eight-worker pool. With N
+/// simultaneous operations the process uses at most `budget + N - 1`
+/// workers: the shared extras plus one guaranteed caller per operation.
+/// No fetch is queued behind another.
+struct GixWorkerBudget {
+    extra_workers: AtomicUsize,
+}
+
+impl GixWorkerBudget {
+    const fn new(total_workers: usize) -> Self {
+        Self {
+            extra_workers: AtomicUsize::new(total_workers.saturating_sub(1)),
+        }
+    }
+
+    fn lease(&self) -> GixWorkerLease<'_> {
+        let mut available = self.extra_workers.load(Ordering::Acquire);
+        let leased = loop {
+            if available == 0 {
+                break 0;
+            }
+            match self.extra_workers.compare_exchange_weak(
+                available,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break available,
+                Err(actual) => available = actual,
+            }
+        };
+        GixWorkerLease {
+            budget: self,
+            extra_workers: leased,
+        }
+    }
+}
+
+struct GixWorkerLease<'a> {
+    budget: &'a GixWorkerBudget,
+    extra_workers: usize,
+}
+
+impl GixWorkerLease<'_> {
+    fn workers(&self) -> usize {
+        1 + self.extra_workers
+    }
+}
+
+impl Drop for GixWorkerLease<'_> {
+    fn drop(&mut self) {
+        self.budget
+            .extra_workers
+            .fetch_add(self.extra_workers, Ordering::Release);
+    }
+}
+
+fn gix_worker_budget() -> &'static GixWorkerBudget {
+    static BUDGET: OnceLock<GixWorkerBudget> = OnceLock::new();
+    BUDGET.get_or_init(|| {
+        let host_workers = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        GixWorkerBudget::new(host_workers.min(GIX_WORKERS_PER_OPERATION))
+    })
+}
+
 /// Fetch one fully-qualified branch or tag at depth one and materialize
 /// its peeled commit into `clone_dir`.
 fn fetch_exact_ref_and_checkout(
@@ -2512,7 +2618,7 @@ fn fetch_exact_ref_and_checkout(
     const FETCHED_REF: &str = "refs/ktstr/source";
     let refspec = format!("+{source_ref}:{FETCHED_REF}");
 
-    let repo = gix::ThreadSafeRepository::init_opts(
+    let mut repo = gix::ThreadSafeRepository::init_opts(
         clone_dir,
         gix::create::Kind::WithWorktree,
         gix::create::Options::default(),
@@ -2520,6 +2626,25 @@ fn fetch_exact_ref_and_checkout(
     )
     .with_context(|| "prepare clone")?
     .to_thread_local();
+    let _ = repo
+        .committer_or_set_generic_fallback()
+        .with_context(|| "configure fallback identity for clone reflog")?;
+
+    // gix reads pack.threads from its borrowed Repository inside
+    // `Prepare::receive`, but Remote/Prepare borrow that Repository and
+    // expose no per-receive thread-limit setter. Configure the count
+    // before constructing Remote and hold the lease through receive.
+    // The lease itself is only an atomic counter: no worker threads or
+    // memory are allocated during connect/ref discovery. Keeping it
+    // reserved is required to ensure peers cannot configure the same
+    // extras and later oversubscribe while both packs are active.
+    let pack_workers = gix_worker_budget().lease();
+    repo.config_snapshot_mut()
+        .set_value(
+            &gix::config::tree::Pack::THREADS,
+            pack_workers.workers().to_string().as_str(),
+        )
+        .with_context(|| "configure gix pack worker budget")?;
 
     let mut remote = repo
         .remote_at_without_url_rewrite(url)
@@ -2529,6 +2654,7 @@ fn fetch_exact_ref_and_checkout(
         .replace_refspecs([refspec.as_str()], gix::remote::Direction::Fetch)
         .with_context(|| format!("set exact fetch refspec for {source_ref}"))?;
 
+    ensure_git_operation_not_interrupted(interrupt, "before connecting")?;
     let connection = remote
         .connect(gix::remote::Direction::Fetch)
         .with_context(|| format!("connect to {url}"))?;
@@ -2547,6 +2673,7 @@ fn fetch_exact_ref_and_checkout(
         NonZeroU32::new(1).expect("1 is nonzero"),
     ));
 
+    ensure_git_operation_not_interrupted(interrupt, "before receiving the pack")?;
     match clone_progress {
         Some(progress) => prepare
             .receive(progress.item(), interrupt)
@@ -2555,13 +2682,27 @@ fn fetch_exact_ref_and_checkout(
             .receive(gix::progress::Discard, interrupt)
             .with_context(|| format!("fetch exact remote ref {source_ref}"))?,
     };
+    ensure_git_operation_not_interrupted(interrupt, "after receiving the pack")?;
+    drop(pack_workers);
 
-    let commit_id = repo
+    let mut fetched_ref = repo
         .find_reference(FETCHED_REF)
-        .with_context(|| format!("find fetched ref {source_ref}"))?
-        .peel_to_id()
+        .with_context(|| format!("find fetched ref {source_ref}"))?;
+    let unpeeled_id = fetched_ref.id().detach();
+    // Preserve exactly the requested ref in its native namespace. In
+    // particular, retaining the selected tag keeps setlocalversion and
+    // git-describe semantics without importing any unrelated tag.
+    repo.reference(
+        source_ref.as_str(),
+        unpeeled_id,
+        gix::refs::transaction::PreviousValue::Any,
+        "clone: preserve exact source ref",
+    )
+    .with_context(|| format!("preserve fetched ref {source_ref}"))?;
+    let commit_id = fetched_ref
+        .peel_to_commit()
         .with_context(|| format!("peel fetched ref {source_ref} to a commit"))?
-        .detach();
+        .id;
 
     // Both branch and tag clones are snapshots for ktstr, so a detached
     // HEAD is the uniform representation of the exact peeled commit.
@@ -2583,6 +2724,20 @@ fn fetch_exact_ref_and_checkout(
     }
     Ok(commit_id)
 }
+
+fn ensure_git_operation_not_interrupted(
+    interrupt: &std::sync::atomic::AtomicBool,
+    phase: &str,
+) -> Result<()> {
+    if interrupt.load(Ordering::Acquire) {
+        anyhow::bail!("git clone interrupted {phase}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+static TEST_INTERRUPT_AFTER_CHECKOUT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Materialize `commit_id` into the main worktree and persist its index.
 fn checkout_exact_commit(
@@ -2608,6 +2763,8 @@ fn checkout_exact_commit(
         .with_context(|| "build exact clone checkout options")?;
     opts.destination_is_initially_empty = true;
     opts.keep_going = false;
+    let checkout_workers = gix_worker_budget().lease();
+    opts.thread_limit = Some(checkout_workers.workers());
 
     progress.init(Some(index.entries().len()), gix::progress::count("files"));
     let objects = repo
@@ -2625,6 +2782,15 @@ fn checkout_exact_commit(
         opts,
     )
     .with_context(|| format!("check out fetched commit {commit_id}"))?;
+    #[cfg(test)]
+    if TEST_INTERRUPT_AFTER_CHECKOUT.swap(false, Ordering::AcqRel) {
+        interrupt.store(true, Ordering::Release);
+    }
+    // gix checkout returns Ok with a partial worktree when its
+    // interrupt flag becomes set. Never persist that partial index or
+    // report success; the caller removes the entire clone directory.
+    ensure_git_operation_not_interrupted(interrupt, "during checkout")?;
+    drop(checkout_workers);
 
     index
         .write(Default::default())

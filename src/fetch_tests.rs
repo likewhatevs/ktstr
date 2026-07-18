@@ -3702,6 +3702,473 @@ fn git_clone_tag_shallow_clones_stable_tag() {
     );
 }
 
+struct ExactCloneFixture {
+    remote: tempfile::TempDir,
+    ancestor_commit: gix::ObjectId,
+    gitlink_commit: gix::ObjectId,
+    branch_commit: gix::ObjectId,
+    tag_commit: gix::ObjectId,
+    annotated_tag_object: gix::ObjectId,
+    light_commit: gix::ObjectId,
+    unrelated_commit: gix::ObjectId,
+    slash_branch: String,
+    hex_branch: String,
+}
+
+impl ExactCloneFixture {
+    fn url(&self) -> String {
+        format!("file://{}", self.remote.path().display())
+    }
+}
+
+fn write_fixture_commit(
+    repo: &gix::Repository,
+    reference: &str,
+    marker: &str,
+    signature: gix::actor::SignatureRef<'_>,
+    parent: Option<gix::ObjectId>,
+    gitlink: Option<gix::ObjectId>,
+) -> (gix::ObjectId, gix::ObjectId) {
+    let blob = repo
+        .write_blob(marker.as_bytes())
+        .expect("fixture blob")
+        .detach();
+    let mut entries = vec![gix::objs::tree::Entry {
+        mode: gix::objs::tree::EntryKind::Blob.into(),
+        filename: "marker.txt".into(),
+        oid: blob,
+    }];
+    if let Some(gitlink) = gitlink {
+        entries.push(gix::objs::tree::Entry {
+            mode: gix::objs::tree::EntryKind::Commit.into(),
+            filename: "submodule".into(),
+            oid: gitlink,
+        });
+    }
+    entries.sort_by(|a, b| a.filename.cmp(&b.filename));
+    let tree = gix::objs::Tree { entries };
+    let tree = repo.write_object(&tree).expect("fixture tree").detach();
+    let commit = repo
+        .commit_as(signature, signature, reference, marker, tree, parent)
+        .expect("fixture commit")
+        .detach();
+    (commit, tree)
+}
+
+fn exact_clone_fixture() -> ExactCloneFixture {
+    let remote = tempfile::TempDir::new().expect("remote tempdir");
+    let mut repo = gix::ThreadSafeRepository::init_opts(
+        remote.path(),
+        gix::create::Kind::Bare,
+        gix::create::Options::default(),
+        anon_open_opts(),
+    )
+    .expect("init bare fixture")
+    .to_thread_local();
+    let _ = repo
+        .committer_or_set_generic_fallback()
+        .expect("fixture fallback identity");
+    let signature = gix::actor::SignatureRef::from_bytes(
+        b"ktstr test <ktstr@example.invalid> 1700000000 +0000",
+    )
+    .expect("fixture signature");
+
+    let (ancestor_commit, _) =
+        write_fixture_commit(&repo, "refs/heads/base", "base", signature, None, None);
+    let (gitlink_commit, _) = write_fixture_commit(
+        &repo,
+        "refs/heads/submodule-target",
+        "submodule",
+        signature,
+        None,
+        None,
+    );
+    let (branch_commit, _) = write_fixture_commit(
+        &repo,
+        "refs/heads/same",
+        "branch",
+        signature,
+        Some(ancestor_commit),
+        Some(gitlink_commit),
+    );
+    let (tag_commit, _) = write_fixture_commit(
+        &repo,
+        "refs/heads/tag-target",
+        "annotated-tag",
+        signature,
+        Some(ancestor_commit),
+        None,
+    );
+    let annotated_tag_object = repo
+        .tag(
+            "same",
+            tag_commit,
+            gix::objs::Kind::Commit,
+            Some(signature),
+            "annotated fixture tag",
+            gix::refs::transaction::PreviousValue::Any,
+        )
+        .expect("annotated tag")
+        .id()
+        .detach();
+
+    let (light_commit, light_tree) = write_fixture_commit(
+        &repo,
+        "refs/heads/light-target",
+        "light-tag",
+        signature,
+        Some(ancestor_commit),
+        None,
+    );
+    repo.tag_reference(
+        "light",
+        light_commit,
+        gix::refs::transaction::PreviousValue::Any,
+    )
+    .expect("lightweight tag");
+    repo.tag_reference(
+        "tree-target",
+        light_tree,
+        gix::refs::transaction::PreviousValue::Any,
+    )
+    .expect("tree tag");
+
+    let slash_branch = "topic/with/slash".to_string();
+    repo.reference(
+        format!("refs/heads/{slash_branch}"),
+        branch_commit,
+        gix::refs::transaction::PreviousValue::Any,
+        "fixture slash branch",
+    )
+    .expect("slash branch");
+    let hex_branch = "a".repeat(40);
+    repo.reference(
+        format!("refs/heads/{hex_branch}"),
+        branch_commit,
+        gix::refs::transaction::PreviousValue::Any,
+        "fixture 40-hex branch",
+    )
+    .expect("hex branch");
+
+    let (unrelated_commit, _) = write_fixture_commit(
+        &repo,
+        "refs/heads/unrelated",
+        "unrelated",
+        signature,
+        None,
+        None,
+    );
+    repo.tag_reference(
+        "unrelated",
+        unrelated_commit,
+        gix::refs::transaction::PreviousValue::Any,
+    )
+    .expect("unrelated tag");
+    repo.edit_reference(gix::refs::transaction::RefEdit {
+        change: gix::refs::transaction::Change::Update {
+            log: Default::default(),
+            expected: gix::refs::transaction::PreviousValue::Any,
+            new: gix::refs::Target::Symbolic(
+                "refs/heads/unrelated"
+                    .try_into()
+                    .expect("valid fixture HEAD target"),
+            ),
+        },
+        name: "HEAD".try_into().expect("valid HEAD"),
+        deref: false,
+    })
+    .expect("point fixture HEAD at the unrelated branch");
+
+    ExactCloneFixture {
+        remote,
+        ancestor_commit,
+        gitlink_commit,
+        branch_commit,
+        tag_commit,
+        annotated_tag_object,
+        light_commit,
+        unrelated_commit,
+        slash_branch,
+        hex_branch,
+    }
+}
+
+fn exact_clone_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn assert_exact_clone(
+    fixture: &ExactCloneFixture,
+    name: &str,
+    kind: crate::kernel_path::GitRefKind,
+    expected: gix::ObjectId,
+    expected_marker: &str,
+) {
+    let dest = tempfile::TempDir::new().expect("clone dest");
+    let acquired = git_clone_kinded(&fixture.url(), name, kind, dest.path(), "test", None)
+        .expect("exact clone");
+    let repo = gix::open(&acquired.source_dir).expect("open exact clone");
+    assert_eq!(repo.head_id().expect("clone HEAD").detach(), expected);
+    assert!(repo.head().expect("clone head state").is_detached());
+    assert!(
+        acquired.cache_key.contains(&expected.to_string()),
+        "cache identity must use the peeled commit",
+    );
+    let selected_ref = match kind {
+        crate::kernel_path::GitRefKind::Branch => format!("refs/heads/{name}"),
+        crate::kernel_path::GitRefKind::Tag => format!("refs/tags/{name}"),
+        _ => unreachable!("fixture clones only branches and tags"),
+    };
+    assert!(
+        repo.find_reference(&selected_ref).is_ok(),
+        "the one selected ref must be preserved locally",
+    );
+    if kind == crate::kernel_path::GitRefKind::Tag && name == "same" {
+        assert_eq!(
+            repo.find_reference(&selected_ref)
+                .expect("selected annotated tag")
+                .id()
+                .detach(),
+            fixture.annotated_tag_object,
+            "the selected annotated tag must retain its tag object, not be rewritten to its commit",
+        );
+    }
+    if name == "same" {
+        let unselected = match kind {
+            crate::kernel_path::GitRefKind::Branch => "refs/tags/same",
+            crate::kernel_path::GitRefKind::Tag => "refs/heads/same",
+            _ => unreachable!(),
+        };
+        assert!(
+            repo.try_find_reference(unselected)
+                .expect("look up unselected same-name ref")
+                .is_none(),
+            "the same-named ref in the other namespace must stay absent",
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(acquired.source_dir.join("marker.txt")).expect("read marker"),
+        expected_marker,
+    );
+    assert!(
+        repo.find_object(fixture.unrelated_commit).is_err(),
+        "the unrelated remote HEAD branch/tag object must not be fetched",
+    );
+    assert!(
+        repo.find_object(fixture.ancestor_commit).is_err(),
+        "depth one must leave the selected tip's parent unfetched",
+    );
+    assert!(
+        repo.find_object(fixture.gitlink_commit).is_err(),
+        "an exact clone must not recursively fetch a gitlink target",
+    );
+    assert!(
+        repo.try_find_remote("origin").is_none(),
+        "the exact snapshot intentionally has no broad origin remote",
+    );
+    for unrelated_ref in [
+        "refs/heads/unrelated",
+        "refs/tags/unrelated",
+        "refs/heads/base",
+        "refs/heads/submodule-target",
+        "refs/heads/tag-target",
+        "refs/heads/light-target",
+    ] {
+        assert!(
+            repo.try_find_reference(unrelated_ref)
+                .expect("look up unrelated local ref")
+                .is_none(),
+            "unrequested remote ref {unrelated_ref} must stay absent",
+        );
+    }
+    let shallow = std::fs::read_to_string(repo.git_dir().join("shallow")).expect("shallow file");
+    assert_eq!(
+        shallow.lines().collect::<Vec<_>>(),
+        vec![expected.to_string()]
+    );
+    let inspected = local_source(&acquired.source_dir).expect("inspect exact clone");
+    assert!(
+        !inspected.is_dirty,
+        "checkout and persisted index must match"
+    );
+}
+
+#[test]
+fn exact_clone_disambiguates_namespaces_and_preserves_only_selected_ref() {
+    let _guard = exact_clone_test_guard();
+    set_git_operation_interrupted(false);
+    let fixture = exact_clone_fixture();
+
+    assert_exact_clone(
+        &fixture,
+        "same",
+        crate::kernel_path::GitRefKind::Branch,
+        fixture.branch_commit,
+        "branch",
+    );
+    assert_exact_clone(
+        &fixture,
+        "same",
+        crate::kernel_path::GitRefKind::Tag,
+        fixture.tag_commit,
+        "annotated-tag",
+    );
+    assert_exact_clone(
+        &fixture,
+        "light",
+        crate::kernel_path::GitRefKind::Tag,
+        fixture.light_commit,
+        "light-tag",
+    );
+    assert_exact_clone(
+        &fixture,
+        &fixture.slash_branch,
+        crate::kernel_path::GitRefKind::Branch,
+        fixture.branch_commit,
+        "branch",
+    );
+    assert_exact_clone(
+        &fixture,
+        &fixture.hex_branch,
+        crate::kernel_path::GitRefKind::Branch,
+        fixture.branch_commit,
+        "branch",
+    );
+}
+
+#[test]
+fn exact_clone_rejects_non_commit_tag_and_rolls_back() {
+    let _guard = exact_clone_test_guard();
+    set_git_operation_interrupted(false);
+    let fixture = exact_clone_fixture();
+    let dest = tempfile::TempDir::new().expect("clone dest");
+    let err = match git_clone_kinded(
+        &fixture.url(),
+        "tree-target",
+        crate::kernel_path::GitRefKind::Tag,
+        dest.path(),
+        "test",
+        None,
+    ) {
+        Ok(_) => panic!("a tag targeting a tree is not a kernel commit"),
+        Err(err) => err,
+    };
+    assert!(format!("{err:#}").contains("to a commit"));
+    assert!(
+        !dest.path().join("linux").exists(),
+        "failed exact clone must roll its destination back",
+    );
+}
+
+#[test]
+fn exact_clone_observes_process_cancellation_and_rolls_back() {
+    let _guard = exact_clone_test_guard();
+    let fixture = exact_clone_fixture();
+    let dest = tempfile::TempDir::new().expect("clone dest");
+    set_git_operation_interrupted(true);
+    let result = git_clone_kinded(
+        &fixture.url(),
+        "same",
+        crate::kernel_path::GitRefKind::Branch,
+        dest.path(),
+        "test",
+        None,
+    );
+    set_git_operation_interrupted(false);
+    assert!(result.is_err(), "a pre-set process cancellation aborts gix");
+    assert!(
+        !dest.path().join("linux").exists(),
+        "cancelled exact clone must roll its destination back",
+    );
+}
+
+#[test]
+fn exact_clone_rejects_post_checkout_cancellation_before_writing_index() {
+    let _guard = exact_clone_test_guard();
+    let fixture = exact_clone_fixture();
+    let dest = tempfile::TempDir::new().expect("clone dest");
+    let clone_dir = dest.path().join("linux");
+    let interrupt = std::sync::atomic::AtomicBool::new(false);
+    TEST_INTERRUPT_AFTER_CHECKOUT.store(true, Ordering::Release);
+    let result = fetch_exact_ref_and_checkout(
+        &fixture.url(),
+        "same",
+        crate::kernel_path::GitRefKind::Branch,
+        &clone_dir,
+        None,
+        &interrupt,
+    );
+    TEST_INTERRUPT_AFTER_CHECKOUT.store(false, Ordering::Release);
+
+    let err = result.expect_err("post-checkout cancellation must reject the clone");
+    assert!(format!("{err:#}").contains("during checkout"));
+    assert!(
+        interrupt.load(Ordering::Acquire),
+        "the deterministic checkout seam must flip the local interrupt",
+    );
+    assert!(
+        clone_dir.join("marker.txt").is_file(),
+        "the seam fires only after checkout has materialized the tree",
+    );
+    assert!(
+        !clone_dir.join(".git/index").exists(),
+        "an interrupted checkout must never persist its partial index",
+    );
+}
+
+#[test]
+fn gix_worker_budget_never_reuses_leased_extra_workers() {
+    let budget = GixWorkerBudget::new(8);
+    let first = budget.lease();
+    let second = budget.lease();
+    assert_eq!(first.workers(), 8);
+    assert_eq!(second.workers(), 1, "peers always proceed on their caller");
+    drop(first);
+    let third = budget.lease();
+    assert_eq!(third.workers(), 8, "dropping a lease returns all extras");
+}
+
+#[test]
+fn gix_worker_budget_bounds_concurrent_extras_and_returns_every_lease() {
+    let budget = GixWorkerBudget::new(8);
+    let entered = std::sync::Barrier::new(9);
+    let release = std::sync::Barrier::new(9);
+    let leased_extras = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                let lease = budget.lease();
+                leased_extras
+                    .lock()
+                    .expect("record leased extras")
+                    .push(lease.workers() - 1);
+                entered.wait();
+                release.wait();
+                drop(lease);
+            });
+        }
+        entered.wait();
+        let total: usize = leased_extras
+            .lock()
+            .expect("sum leased extras")
+            .iter()
+            .sum();
+        assert!(
+            total <= 7,
+            "simultaneous operations may share at most seven extra workers, got {total}",
+        );
+        release.wait();
+    });
+    assert_eq!(
+        budget.extra_workers.load(Ordering::Acquire),
+        7,
+        "every RAII lease must return its extras",
+    );
+}
+
 /// `latest_patch_from_git_tags` resolves an EOL series to its highest
 /// patch via a real ls-remote of the gregkh GitHub mirror — the
 /// cdn-independent resolution the CI runners need (cdn serves

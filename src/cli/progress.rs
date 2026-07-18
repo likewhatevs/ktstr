@@ -3,9 +3,10 @@
 //! Two bar types, both rendered through a single
 //! [`indicatif::MultiProgress`] so concurrent fetches (the parallel
 //! `cargo ktstr test --kernel A --kernel B` resolve) never garble
-//! each other's terminal output, and both degrading to a no-op when
-//! stderr is not a TTY (CI, piped output) — the same contract as
-//! [`crate::cli::Spinner`].
+//! each other's terminal output. Byte-download and build bars degrade
+//! to a no-op when stderr is not a TTY; clone progress instead emits
+//! throttled, escape-free phase/percentage heartbeats so a long pack
+//! receive or index is never silent in CI.
 //!
 //! - [`FetchProgress`] — the group handle. One per resolve operation,
 //!   shared across the rayon workers by `&` (the inner
@@ -39,7 +40,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gix::progress::prodash::progress::{Key, Task};
 use gix::progress::tree::{Item, Root};
@@ -83,6 +84,13 @@ const CLONE_TEMPLATE: &str =
 /// bounded gix task exists (no total ⇒ nothing to estimate).
 const CLONE_TEMPLATE_SPINNER: &str = "{spinner:.green} {msg}";
 
+/// Maximum silence between non-TTY clone heartbeats. Phase changes and
+/// ten-percent progress boundaries are emitted sooner.
+const CLONE_HEARTBEAT: Duration = Duration::from_secs(10);
+
+/// Percent granularity for bounded non-TTY clone progress.
+const CLONE_PERCENT_STEP: usize = 10;
+
 /// Progress glyphs for the filled bar (filled, current, remaining).
 const PROGRESS_CHARS: &str = "##-";
 
@@ -97,11 +105,9 @@ const PROGRESS_CHARS: &str = "##-";
 /// `Arc<RwLock>`, so concurrent `download_bar`/`clone_progress` calls
 /// are safe.
 ///
-/// Off-TTY (`!stderr_color()`) the group draws to a hidden target:
-/// every child bar is a no-op, `inc`/`finish` emit nothing, and the
-/// gix poll thread is never spawned — piped/CI stderr stays
-/// escape-free, matching the [`crate::cli::Spinner`] degradation
-/// contract.
+/// Off-TTY (`!stderr_color()`) the group draws bars to a hidden target.
+/// Downloads/build steps remain no-op draws; clone progress still polls
+/// gix and emits throttled plain-text heartbeats to stderr.
 pub struct FetchProgress {
     /// Hidden draw target off-TTY; stderr otherwise. Always present
     /// (vs `Option`) so child-bar construction is unconditional and
@@ -127,7 +133,6 @@ impl FetchProgress {
     }
 
     /// Whether the group draws to a hidden target (non-TTY / forced).
-    /// When hidden, [`Self::clone_progress`] skips its poll thread.
     pub(crate) fn is_hidden(&self) -> bool {
         self.multi.is_hidden()
     }
@@ -189,9 +194,8 @@ impl FetchProgress {
     /// determinate (with ETA) whenever gix reports a bounded task and
     /// a spinner otherwise; see [`CloneProgress`].
     ///
-    /// Off-TTY (`is_hidden()`), no poll thread is spawned — the
-    /// returned [`CloneProgress`] still yields a valid (no-op) gix
-    /// progress sink via [`CloneProgress::item`].
+    /// Off-TTY (`is_hidden()`), the bar remains hidden but the poller
+    /// emits throttled plain-text updates instead.
     pub(crate) fn clone_progress(&self, label: &str) -> CloneProgress {
         let root = Root::new();
         let bar = self.multi.add(ProgressBar::new_spinner());
@@ -201,33 +205,27 @@ impl FetchProgress {
         );
         bar.set_message(format!("cloning {label}"));
 
-        // Hidden: no rendering, so skip both the steady-tick ticker
-        // thread and the poll thread. The tree (root) still exists so
-        // `item()` hands gix a valid NestedProgress sink that simply
-        // goes unread.
-        if self.is_hidden() {
-            return CloneProgress {
-                root,
-                bar,
-                stop: Arc::new(AtomicBool::new(false)),
-                poller: None,
-            };
+        let non_tty = self.is_hidden();
+        let started = Instant::now();
+        if !non_tty {
+            bar.enable_steady_tick(TICK);
         }
-
-        bar.enable_steady_tick(TICK);
         let stop = Arc::new(AtomicBool::new(false));
         let poller = std::thread::spawn({
             let root = Arc::clone(&root);
             let bar = bar.clone();
             let stop = Arc::clone(&stop);
             let label = label.to_string();
-            move || poll_clone_tree(root, bar, stop, label)
+            move || poll_clone_tree(root, bar, stop, label, non_tty)
         });
         CloneProgress {
             root,
             bar,
             stop,
             poller: Some(poller),
+            label: label.to_string(),
+            non_tty,
+            started,
         }
     }
 
@@ -276,12 +274,143 @@ impl Default for FetchProgress {
 /// name (spinner only) when no bounded task exists yet (negotiation, or
 /// an unadvertised pack size). The bar style is switched only on a
 /// determinate/indeterminate transition, not every tick.
-fn poll_clone_tree(root: Arc<Root>, bar: ProgressBar, stop: Arc<AtomicBool>, label: String) {
+fn poll_clone_tree(
+    root: Arc<Root>,
+    bar: ProgressBar,
+    stop: Arc<AtomicBool>,
+    label: String,
+    non_tty: bool,
+) {
     let mut snapshot: Vec<(Key, Task)> = Vec::new();
     let mut determinate = false;
+    let mut reporter = NonTtyCloneReporter::new(Instant::now());
     while !stop.load(Ordering::Relaxed) {
-        poll_tick(&root, &bar, &mut determinate, &label, &mut snapshot);
+        if non_tty {
+            root.sorted_snapshot(&mut snapshot);
+            if let Some(line) = reporter.update(&snapshot, Instant::now()) {
+                eprintln!("{label}: {line}");
+            }
+        } else {
+            poll_tick(&root, &bar, &mut determinate, &label, &mut snapshot);
+        }
         std::thread::sleep(TICK);
+    }
+}
+
+/// State machine for escape-free non-TTY clone reporting.
+///
+/// Emits immediately when gix changes phase, at each ten-percent
+/// boundary for bounded work, and at least every [`CLONE_HEARTBEAT`]
+/// while a phase continues. `now` is injected so cadence behavior is
+/// deterministic in unit tests.
+struct NonTtyCloneReporter {
+    started: Instant,
+    phase: Option<String>,
+    percent_bucket: Option<usize>,
+    last_emit: Instant,
+}
+
+impl NonTtyCloneReporter {
+    fn new(now: Instant) -> Self {
+        Self {
+            started: now,
+            phase: None,
+            percent_bucket: None,
+            last_emit: now,
+        }
+    }
+
+    fn update(&mut self, snapshot: &[(Key, Task)], now: Instant) -> Option<String> {
+        let Some(task) = most_relevant_clone_task(snapshot) else {
+            let phase_changed = self.phase.as_deref() != Some("waiting for remote");
+            let heartbeat = now.saturating_duration_since(self.last_emit) >= CLONE_HEARTBEAT;
+            if !(phase_changed || heartbeat) {
+                return None;
+            }
+            self.phase = Some("waiting for remote".to_string());
+            self.percent_bucket = None;
+            self.last_emit = now;
+            return Some(format!(
+                "waiting for remote (elapsed {})",
+                human_elapsed(now.saturating_duration_since(self.started))
+            ));
+        };
+        let phase_changed = self.phase.as_deref() != Some(task.name.as_str());
+        let percent_bucket = task.progress.as_ref().and_then(|value| {
+            value.done_at.filter(|total| *total > 0).map(|total| {
+                let pos = value.step.load(Ordering::Relaxed);
+                ((pos.saturating_mul(100) / total) / CLONE_PERCENT_STEP) * CLONE_PERCENT_STEP
+            })
+        });
+        let progress_bucket_changed = percent_bucket != self.percent_bucket;
+        let heartbeat = now.saturating_duration_since(self.last_emit) >= CLONE_HEARTBEAT;
+        if !(phase_changed || progress_bucket_changed || heartbeat) {
+            return None;
+        }
+
+        self.phase = Some(task.name.clone());
+        self.percent_bucket = percent_bucket;
+        self.last_emit = now;
+        Some(format!(
+            "{} (elapsed {})",
+            format_clone_task(task),
+            human_elapsed(now.saturating_duration_since(self.started))
+        ))
+    }
+}
+
+/// Prefer the deepest bounded task, as the TTY bar does, then the
+/// deepest task carrying a counter, then the deepest named phase.
+fn most_relevant_clone_task(snapshot: &[(Key, Task)]) -> Option<&Task> {
+    snapshot
+        .iter()
+        .rev()
+        .find(|(_, task)| {
+            task.progress
+                .as_ref()
+                .and_then(|value| value.done_at)
+                .is_some()
+        })
+        .or_else(|| {
+            snapshot
+                .iter()
+                .rev()
+                .find(|(_, task)| task.progress.is_some())
+        })
+        .or_else(|| snapshot.last())
+        .map(|(_, task)| task)
+}
+
+fn format_clone_task(task: &Task) -> String {
+    let Some(value) = task.progress.as_ref() else {
+        return task.name.clone();
+    };
+    let pos = value.step.load(Ordering::Relaxed);
+    let rendered = match value.unit.as_ref() {
+        Some(unit) => unit.display(pos, value.done_at, None).to_string(),
+        None => match value.done_at {
+            Some(total) if total > 0 => {
+                format!("{pos}/{total} ({}%)", pos.saturating_mul(100) / total)
+            }
+            _ => pos.to_string(),
+        },
+    };
+    format!("{}: {rendered}", task.name)
+}
+
+fn human_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!(
+            "{}h {:02}m {:02}s",
+            seconds / 3600,
+            (seconds % 3600) / 60,
+            seconds % 60
+        )
     }
 }
 
@@ -344,7 +473,7 @@ fn poll_tick(
             *determinate = false;
         }
         if let Some((_, task)) = any {
-            bar.set_message(format!("{label}: {}", task.name));
+            bar.set_message(format!("{label}: {}", format_clone_task(task)));
         }
     }
 }
@@ -396,8 +525,8 @@ impl Drop for GroupBar {
 
 /// Live git-clone progress bridge.
 ///
-/// Holds the prodash [`tree::Root`](Root), the indicatif bar, and (on
-/// a TTY) the background poll thread spawned by
+/// Holds the prodash [`tree::Root`](Root), the indicatif bar, and the
+/// background poll thread spawned by
 /// [`FetchProgress::clone_progress`]. [`Self::item`] yields a fresh gix
 /// progress sink ([`tree::Item`](Item)) for each gix call; both the
 /// fetch and checkout phases feed the one polled tree.
@@ -416,9 +545,15 @@ pub(crate) struct CloneProgress {
     bar: ProgressBar,
     /// Set by [`Self::shutdown`] to stop the poll loop.
     stop: Arc<AtomicBool>,
-    /// The poll thread handle. `None` off-TTY (no thread spawned) and
-    /// after [`Self::shutdown`] takes it to join.
+    /// The poll thread handle. Present for TTY rendering and non-TTY
+    /// heartbeats; `None` after [`Self::shutdown`] takes it to join.
     poller: Option<JoinHandle<()>>,
+    /// Human-readable clone label, also used by non-TTY completion.
+    label: String,
+    /// True when the bar is hidden and the poller emits plain text.
+    non_tty: bool,
+    /// Start time used in the non-TTY completion line.
+    started: Instant,
 }
 
 impl CloneProgress {
@@ -435,6 +570,13 @@ impl CloneProgress {
     /// the error/panic path.
     pub(crate) fn finish(mut self) {
         self.shutdown();
+        if self.non_tty {
+            eprintln!(
+                "{}: clone complete (elapsed {})",
+                self.label,
+                human_elapsed(self.started.elapsed())
+            );
+        }
     }
 
     /// Idempotent teardown: signal stop, join the poll thread (if any
@@ -543,17 +685,17 @@ mod tests {
         fp.clear();
     }
 
-    /// A hidden group skips the poll thread entirely (nothing to
-    /// render), yet still yields a valid gix progress sink via
-    /// `item()`, and `finish` is clean.
+    /// A hidden group still polls the gix tree so CI receives
+    /// plain-text heartbeats, while its indicatif bar remains hidden.
     #[test]
-    fn clone_progress_hidden_skips_poller() {
+    fn clone_progress_hidden_runs_plain_text_poller() {
         let fp = hidden_group();
         let cp = fp.clone_progress("for-next");
         assert!(
-            cp.poller.is_none(),
-            "hidden group must not spawn the poll thread",
+            cp.poller.is_some(),
+            "hidden group must poll gix for non-TTY heartbeats",
         );
+        assert!(cp.non_tty);
         let _item = cp.item();
         cp.finish();
     }
@@ -571,13 +713,16 @@ mod tests {
             let root = Arc::clone(&root);
             let bar = bar.clone();
             let stop = Arc::clone(&stop);
-            move || poll_clone_tree(root, bar, stop, "for-next".to_string())
+            move || poll_clone_tree(root, bar, stop, "for-next".to_string(), false)
         });
         let cp = CloneProgress {
             root,
             bar,
             stop,
             poller: Some(poller),
+            label: "for-next".to_string(),
+            non_tty: false,
+            started: Instant::now(),
         };
         // Must not hang: sets stop, the loop exits within one TICK, join
         // returns.
@@ -692,19 +837,179 @@ mod tests {
                         let root = Arc::clone(&root);
                         let bar = bar.clone();
                         let stop = Arc::clone(&stop);
-                        move || poll_clone_tree(root, bar, stop, "ref".to_string())
+                        move || poll_clone_tree(root, bar, stop, "ref".to_string(), false)
                     });
                     let cp = CloneProgress {
                         root,
                         bar,
                         stop,
                         poller: Some(poller),
+                        label: "ref".to_string(),
+                        non_tty: false,
+                        started: Instant::now(),
                     };
                     let _ = cp.item();
                     cp.finish();
                 });
             }
         });
+    }
+
+    #[test]
+    fn concurrent_hidden_clone_reporters_no_panic_or_deadlock() {
+        let fp = hidden_group();
+        let entered = std::sync::Barrier::new(9);
+        let release = std::sync::Barrier::new(9);
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                let fp = &fp;
+                let entered = &entered;
+                let release = &release;
+                scope.spawn(move || {
+                    let cp = fp.clone_progress(&format!("ci-ref-{i}"));
+                    let item = cp.item();
+                    item.init(Some(1), gix::progress::count("objects"));
+                    item.set(1);
+                    entered.wait();
+                    release.wait();
+                    cp.finish();
+                });
+            }
+            entered.wait();
+            release.wait();
+        });
+    }
+
+    #[test]
+    fn non_tty_clone_reporter_emits_percent_and_heartbeat_without_spam() {
+        let root = Root::new();
+        let task = root.add_child("indexing objects");
+        task.init(Some(100), gix::progress::count("objects"));
+        task.set(0);
+        let start = Instant::now();
+        let mut reporter = NonTtyCloneReporter::new(start);
+        let mut snapshot = Vec::new();
+
+        root.sorted_snapshot(&mut snapshot);
+        assert!(
+            reporter
+                .update(&snapshot, start)
+                .expect("new phase")
+                .contains("indexing objects"),
+        );
+        assert!(
+            reporter
+                .update(&snapshot, start + Duration::from_secs(1))
+                .is_none(),
+            "unchanged work before the heartbeat stays quiet",
+        );
+
+        task.set(9);
+        root.sorted_snapshot(&mut snapshot);
+        assert!(
+            reporter
+                .update(&snapshot, start + Duration::from_secs(2))
+                .is_none(),
+            "work inside one ten-percent bucket stays quiet",
+        );
+        task.set(10);
+        root.sorted_snapshot(&mut snapshot);
+        assert!(
+            reporter
+                .update(&snapshot, start + Duration::from_secs(3))
+                .expect("ten-percent boundary")
+                .contains("10"),
+        );
+        assert!(
+            reporter
+                .update(&snapshot, start + Duration::from_secs(3) + CLONE_HEARTBEAT,)
+                .expect("heartbeat")
+                .contains("indexing objects"),
+        );
+    }
+
+    #[test]
+    fn non_tty_clone_reporter_emits_unbounded_phase_changes() {
+        let root = Root::new();
+        let negotiate = root.add_child("negotiate");
+        let start = Instant::now();
+        let mut reporter = NonTtyCloneReporter::new(start);
+        let mut snapshot = Vec::new();
+        root.sorted_snapshot(&mut snapshot);
+        assert_eq!(
+            reporter.update(&snapshot, start).as_deref(),
+            Some("negotiate (elapsed 0s)"),
+        );
+
+        drop(negotiate);
+        let receive = root.add_child("read pack");
+        receive.init(None, gix::progress::bytes());
+        receive.set(1024);
+        root.sorted_snapshot(&mut snapshot);
+        let line = reporter
+            .update(&snapshot, start + Duration::from_millis(1))
+            .expect("phase change");
+        assert!(line.contains("read pack"));
+        assert!(line.contains("KiB") || line.contains("KB") || line.contains("1024"));
+    }
+
+    #[test]
+    fn non_tty_clone_reporter_emits_when_same_phase_changes_boundedness() {
+        let root = Root::new();
+        let task = root.add_child("receiving objects");
+        task.init(None, gix::progress::count("objects"));
+        let start = Instant::now();
+        let mut reporter = NonTtyCloneReporter::new(start);
+        let mut snapshot = Vec::new();
+        root.sorted_snapshot(&mut snapshot);
+        assert!(
+            reporter
+                .update(&snapshot, start)
+                .expect("initial unbounded phase")
+                .contains("receiving objects"),
+        );
+
+        task.init(Some(100), gix::progress::count("objects"));
+        task.set(1);
+        root.sorted_snapshot(&mut snapshot);
+        let line = reporter
+            .update(&snapshot, start + Duration::from_millis(1))
+            .expect("unbounded-to-bounded transition emits immediately");
+        assert!(line.contains("1/100") || line.contains("1 of 100"));
+
+        task.init(None, gix::progress::count("objects"));
+        task.set(2);
+        root.sorted_snapshot(&mut snapshot);
+        let line = reporter
+            .update(&snapshot, start + Duration::from_millis(2))
+            .expect("bounded-to-unbounded transition emits immediately");
+        assert!(line.contains('2'));
+        assert!(!line.contains("/100") && !line.contains("of 100"));
+    }
+
+    #[test]
+    fn non_tty_clone_reporter_heartbeats_empty_tree_with_elapsed_time() {
+        let start = Instant::now();
+        let mut reporter = NonTtyCloneReporter::new(start);
+        let snapshot = Vec::new();
+        assert_eq!(
+            reporter.update(&snapshot, start).as_deref(),
+            Some("waiting for remote (elapsed 0s)"),
+        );
+        assert!(
+            reporter
+                .update(&snapshot, start + Duration::from_secs(9))
+                .is_none(),
+            "empty tree must not spam before the heartbeat",
+        );
+        assert_eq!(
+            reporter
+                .update(&snapshot, start + Duration::from_secs(10))
+                .as_deref(),
+            Some("waiting for remote (elapsed 10s)"),
+        );
+        assert_eq!(human_elapsed(Duration::from_secs(65)), "1m 05s");
+        assert_eq!(human_elapsed(Duration::from_secs(3661)), "1h 01m 01s");
     }
 
     /// A `step_bar` is a label-only spinner: no byte counter (length is

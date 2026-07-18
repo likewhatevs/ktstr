@@ -451,26 +451,11 @@ fn fetch_via_clone(dest: &Path) -> Result<(), String> {
 
     let url = "https://github.com/sched-ext/scx.git";
     let interrupt = std::sync::atomic::AtomicBool::new(false);
-
-    let mut prep = gix::clone::PrepareFetch::new(
-        url,
-        &work,
-        gix::create::Kind::WithWorktree,
-        gix::create::Options::default(),
-        clone_open_options(),
-    )
-    .map_err(|e| format!("prepare_clone: {e}"))?
-    .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
-        1.try_into().expect("non-zero depth"),
-    ))
-    .with_ref_name(Some(SCX_TAG))
-    .map_err(|e| format!("with_ref_name: {e}"))?;
-    let (mut checkout, _) = prep
-        .fetch_then_checkout(gix::progress::Discard, &interrupt)
-        .map_err(|e| format!("fetch_then_checkout: {e}"))?;
-    let (_repo, _) = checkout
-        .main_worktree(gix::progress::Discard, &interrupt)
-        .map_err(|e| format!("main_worktree: {e}"))?;
+    let source_ref = format!("refs/tags/{SCX_TAG}");
+    if let Err(err) = clone_exact_ref(url, &source_ref, &work, &interrupt) {
+        let _ = std::fs::remove_dir_all(&work);
+        return Err(err);
+    }
 
     let stage = parent.join("scx-lib-stage");
     if stage.exists() {
@@ -494,5 +479,137 @@ fn fetch_via_clone(dest: &Path) -> Result<(), String> {
     std::fs::rename(&stage, dest).map_err(|e| format!("promote stage to scx-lib: {e}"))?;
     stamp_scx_tag(dest)?;
     let _ = std::fs::remove_dir_all(&work);
+    Ok(())
+}
+
+/// Fetch exactly one fully-qualified ref at depth one and check its
+/// peeled commit out. `clone::PrepareFetch` is intentionally avoided:
+/// it adds the remote `HEAD` and can expand tag handling, which makes a
+/// supposedly exact shallow fetch negotiate unrelated objects.
+fn clone_exact_ref(
+    url: &str,
+    source_ref: &str,
+    work: &Path,
+    interrupt: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
+    const FETCHED_REF: &str = "refs/ktstr/source";
+    const MAX_WORKERS: usize = 8;
+
+    let mut repo = gix::ThreadSafeRepository::init_opts(
+        work,
+        gix::create::Kind::WithWorktree,
+        gix::create::Options::default(),
+        clone_open_options(),
+    )
+    .map_err(|e| format!("prepare exact clone: {e}"))?
+    .to_thread_local();
+    let _ = repo
+        .committer_or_set_generic_fallback()
+        .map_err(|e| format!("configure exact clone fallback identity: {e}"))?;
+
+    let workers = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(MAX_WORKERS);
+    repo.config_snapshot_mut()
+        .set_value(
+            &gix::config::tree::Pack::THREADS,
+            workers.to_string().as_str(),
+        )
+        .map_err(|e| format!("configure exact clone pack workers: {e}"))?;
+
+    let refspec = format!("+{source_ref}:{FETCHED_REF}");
+    let mut remote = repo
+        .remote_at(url)
+        .map_err(|e| format!("prepare exact clone remote: {e}"))?
+        .with_fetch_tags(gix::remote::fetch::Tags::None);
+    remote
+        .replace_refspecs([refspec.as_str()], gix::remote::Direction::Fetch)
+        .map_err(|e| format!("configure exact clone refspec: {e}"))?;
+    ensure_clone_not_interrupted(interrupt, "before connecting")?;
+    let prepare = remote
+        .connect(gix::remote::Direction::Fetch)
+        .map_err(|e| format!("connect exact clone: {e}"))?
+        .prepare_fetch(
+            gix::progress::Discard,
+            gix::remote::ref_map::Options::default(),
+        )
+        .map_err(|e| format!("map exact clone ref {source_ref}: {e}"))?
+        .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
+            1.try_into().expect("non-zero depth"),
+        ));
+    ensure_clone_not_interrupted(interrupt, "before receiving the pack")?;
+    prepare
+        .receive(gix::progress::Discard, interrupt)
+        .map_err(|e| format!("fetch exact clone ref {source_ref}: {e}"))?;
+    ensure_clone_not_interrupted(interrupt, "after receiving the pack")?;
+
+    let mut fetched_ref = repo
+        .find_reference(FETCHED_REF)
+        .map_err(|e| format!("find exact clone ref {source_ref}: {e}"))?;
+    let unpeeled_id = fetched_ref.id().detach();
+    repo.reference(
+        source_ref,
+        unpeeled_id,
+        gix::refs::transaction::PreviousValue::Any,
+        "clone: preserve exact scx source ref",
+    )
+    .map_err(|e| format!("preserve exact clone ref {source_ref}: {e}"))?;
+    let commit_id = fetched_ref
+        .peel_to_commit()
+        .map_err(|e| format!("peel exact clone ref {source_ref} to a commit: {e}"))?
+        .id;
+    repo.reference(
+        "HEAD",
+        commit_id,
+        gix::refs::transaction::PreviousValue::Any,
+        "clone: checkout exact scx source",
+    )
+    .map_err(|e| format!("set exact clone HEAD: {e}"))?;
+
+    let tree_id = repo
+        .find_object(commit_id)
+        .map_err(|e| format!("find exact clone commit: {e}"))?
+        .peel_to_tree()
+        .map_err(|e| format!("peel exact clone commit to tree: {e}"))?
+        .id;
+    let mut index = repo
+        .index_from_tree(&tree_id)
+        .map_err(|e| format!("build exact clone index: {e}"))?;
+    let mut opts = repo
+        .checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)
+        .map_err(|e| format!("configure exact clone checkout: {e}"))?;
+    opts.destination_is_initially_empty = true;
+    opts.keep_going = false;
+    opts.thread_limit = Some(workers);
+    let objects = repo
+        .objects
+        .clone()
+        .into_arc()
+        .map_err(|e| format!("prepare exact clone object database: {e}"))?;
+    gix::worktree::state::checkout(
+        &mut index,
+        work,
+        objects,
+        &gix::progress::Discard,
+        &gix::progress::Discard,
+        interrupt,
+        opts,
+    )
+    .map_err(|e| format!("check out exact clone: {e}"))?;
+    ensure_clone_not_interrupted(interrupt, "during checkout")?;
+    index
+        .write(Default::default())
+        .map_err(|e| format!("write exact clone index: {e}"))?;
+    Ok(())
+}
+
+fn ensure_clone_not_interrupted(
+    interrupt: &std::sync::atomic::AtomicBool,
+    phase: &str,
+) -> Result<(), String> {
+    if interrupt.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(format!("exact clone interrupted {phase}"));
+    }
     Ok(())
 }
