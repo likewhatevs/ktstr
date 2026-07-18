@@ -1332,15 +1332,20 @@ fn clone_one_with_options(
 }
 
 #[cfg(test)]
+pub(crate) struct HttpTransportLimitsForTest<'a> {
+    pub connect_timeout_ms: u64,
+    pub low_speed_limit: u32,
+    pub low_speed_time_seconds: u64,
+    pub proxy: &'a str,
+}
+
+#[cfg(test)]
 pub(crate) fn clone_one_with_transport_limits_for_test(
     url: &str,
     revision: &str,
     destination: &Path,
     progress: &ProgressReporter,
-    connect_timeout_ms: u64,
-    low_speed_limit: u32,
-    low_speed_time_seconds: u64,
-    proxy: &str,
+    transport: HttpTransportLimitsForTest<'_>,
 ) -> Result<(), String> {
     clone_one_with_options(
         url,
@@ -1348,10 +1353,10 @@ pub(crate) fn clone_one_with_transport_limits_for_test(
         destination,
         progress,
         open_options_with_transport_limits(
-            connect_timeout_ms,
-            low_speed_limit,
-            low_speed_time_seconds,
-            Some(proxy),
+            transport.connect_timeout_ms,
+            transport.low_speed_limit,
+            transport.low_speed_time_seconds,
+            Some(transport.proxy),
             Some(""),
         ),
     )

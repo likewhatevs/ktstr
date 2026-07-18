@@ -927,10 +927,12 @@ fn stalled_smart_http_response_is_aborted_by_the_real_gix_transport() {
         "refs/heads/main",
         &temp.path().join("checkout"),
         &reporter,
-        1_000,
-        1024,
-        1,
-        &proxy,
+        gix_acquire::HttpTransportLimitsForTest {
+            connect_timeout_ms: 1_000,
+            low_speed_limit: 1024,
+            low_speed_time_seconds: 1,
+            proxy: &proxy,
+        },
     );
     let completed_at = Instant::now();
     drop(server_lifetime);
