@@ -121,6 +121,14 @@ pub(crate) fn open_options_with_transport_limits(
         overrides.push(format!("http.sslCAInfo={}", ca_bundle.display()));
     }
     if let Some(no_proxy) = no_proxy {
+        // Test fixtures use loopback listeners and must remain direct even
+        // when the parent runner exports ALL_PROXY/HTTP_PROXY. libcurl reads
+        // those variables itself after gix has applied its config policy, so
+        // a no-proxy list alone is not sufficient to make the fixture
+        // hermetic. An explicitly empty proxy maps to CURLOPT_PROXY="" and
+        // disables libcurl's ambient proxy discovery for this test-only
+        // options path.
+        overrides.push("gitoxide.http.proxy=".to_string());
         overrides.push(format!("gitoxide.http.noProxy={no_proxy}"));
     }
     options.config_overrides(overrides)

@@ -774,6 +774,9 @@ fn public_http_authentication_cannot_execute_configured_credentials_programs() {
         format!("credential.helper={}", helper.display()),
         format!("core.askPass={}", askpass.display()),
         "gitoxide.credentials.terminalPrompt=true".to_string(),
+        // Make the loopback transport direct even when libcurl discovers an
+        // ambient ALL_PROXY independently of gix's environment permissions.
+        "gitoxide.http.proxy=".to_string(),
         "gitoxide.http.noProxy=*".to_string(),
     ]
     .into_iter()

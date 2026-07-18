@@ -162,6 +162,11 @@ fn bare_verifier_recursively_discovers_feature_gated_workspace_test_binaries() {
         .env("KTSTR_CACHE_DIR", temp.path().join("cache"))
         .env("KTSTR_RUNS_ROOT", temp.path().join("runs"))
         .env(ktstr::KTSTR_KERNEL_ENV, &kernel)
+        // The parent nextest process exports its selected profile. This
+        // nested, hermetic workspace deliberately has no project nextest
+        // config, so inheriting (for example) CI's `ci` profile would make
+        // discovery fail before cargo-ktstr can inspect either registry.
+        .env_remove("NEXTEST_PROFILE")
         .output()
         .expect("run bare cargo ktstr verifier");
 
