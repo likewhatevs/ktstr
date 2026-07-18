@@ -165,7 +165,9 @@ fn classify_attach_snapshot(
         _ => unreachable!("terminal state observations returned above"),
     };
     let registered = matches!(snapshot.ops, OpsObservation::Named(_));
-    if registered && state == ScxState::Enabled {
+    if let OpsObservation::Named(name) = &snapshot.ops
+        && scx_attach_ready(name, Some(state))
+    {
         return AttachProbe::Ready;
     }
 
