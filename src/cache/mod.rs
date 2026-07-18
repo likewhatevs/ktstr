@@ -59,6 +59,7 @@ pub(crate) mod shared_test_helpers;
 // vmm/disk_template, test_support/*, remote_cache.rs, stats,
 // flock) rely on.
 
+pub(crate) use cache_dir::GitBuilderLockGuard;
 pub use cache_dir::{CacheDir, ExclusiveLockGuard, SharedLockGuard};
 pub use metadata::{
     CacheArtifacts, CacheEntry, KconfigStatus, KernelMetadata, KernelSource, ListedEntry,

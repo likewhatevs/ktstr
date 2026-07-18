@@ -2963,3 +2963,215 @@ fn clean_all_count_matches_listed_entry_count() {
          surviving: {surviving:?}",
     );
 }
+
+/// Subprocess body used by the cross-PID git-builder election tests.
+/// It is ignored during normal enumeration and invoked explicitly by
+/// the parent through the current libtest binary.
+#[test]
+#[ignore]
+fn git_builder_election_process_helper() {
+    use std::io::Write;
+
+    let root = std::path::PathBuf::from(std::env::var_os("KTSTR_TEST_BUILDER_ROOT").unwrap());
+    let cache_key = std::env::var("KTSTR_TEST_BUILDER_KEY").unwrap();
+    let ready = std::path::PathBuf::from(std::env::var_os("KTSTR_TEST_BUILDER_READY").unwrap());
+    let attempts =
+        std::path::PathBuf::from(std::env::var_os("KTSTR_TEST_BUILDER_ATTEMPTS").unwrap());
+    let published =
+        std::path::PathBuf::from(std::env::var_os("KTSTR_TEST_BUILDER_PUBLISHED").unwrap());
+    let mode = std::env::var("KTSTR_TEST_BUILDER_MODE").unwrap_or_else(|_| "publish".into());
+    std::fs::write(&ready, b"ready").unwrap();
+
+    let cache = CacheDir::with_root(root);
+    let acquire_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let _guard = loop {
+        if let Some(guard) = cache.try_acquire_git_builder_lock(&cache_key).unwrap() {
+            break guard;
+        }
+        assert!(
+            std::time::Instant::now() < acquire_deadline,
+            "timed out waiting for builder-election lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+
+    if mode == "fail-hold" {
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&attempts)
+            .unwrap();
+        writeln!(log, "failed-builder").unwrap();
+        let locked =
+            std::path::PathBuf::from(std::env::var_os("KTSTR_TEST_BUILDER_LOCKED").unwrap());
+        let release =
+            std::path::PathBuf::from(std::env::var_os("KTSTR_TEST_BUILDER_RELEASE").unwrap());
+        std::fs::write(&locked, b"locked").unwrap();
+        let release_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !release.exists() {
+            assert!(
+                std::time::Instant::now() < release_deadline,
+                "timed out waiting for failed-builder release barrier"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        return;
+    }
+
+    if !published.exists() {
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&attempts)
+            .unwrap();
+        writeln!(log, "builder").unwrap();
+        std::fs::write(&published, b"published").unwrap();
+    }
+}
+
+fn spawn_git_builder_helper(
+    exe: &std::path::Path,
+    root: &std::path::Path,
+    cache_key: &str,
+    ready: &std::path::Path,
+    attempts: &std::path::Path,
+    published: &std::path::Path,
+    mode: &str,
+    locked: Option<&std::path::Path>,
+    release: Option<&std::path::Path>,
+) -> std::process::Child {
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("--ignored")
+        .arg("--exact")
+        .arg("--color=never")
+        .arg("cache::cache_dir::tests::git_builder_election_process_helper")
+        .env("KTSTR_TEST_BUILDER_ROOT", root)
+        .env("KTSTR_TEST_BUILDER_KEY", cache_key)
+        .env("KTSTR_TEST_BUILDER_READY", ready)
+        .env("KTSTR_TEST_BUILDER_ATTEMPTS", attempts)
+        .env("KTSTR_TEST_BUILDER_PUBLISHED", published)
+        .env("KTSTR_TEST_BUILDER_MODE", mode)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(path) = locked {
+        command.env("KTSTR_TEST_BUILDER_LOCKED", path);
+    }
+    if let Some(path) = release {
+        command.env("KTSTR_TEST_BUILDER_RELEASE", path);
+    }
+    command.spawn().expect("spawn builder helper")
+}
+
+fn wait_for_test_paths(paths: &[std::path::PathBuf]) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while paths.iter().any(|path| !path.exists()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for subprocess barrier files: {paths:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn git_builder_election_has_exactly_one_cross_process_producer() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("cache");
+    let cache = CacheDir::with_root(root.clone());
+    let cache_key = "git-branch-test-content";
+    let parent_guard = cache
+        .try_acquire_git_builder_lock(cache_key)
+        .unwrap()
+        .expect("parent starts as builder");
+    let attempts = tmp.path().join("attempts");
+    let published = tmp.path().join("published");
+    let exe = std::env::current_exe().unwrap();
+    let ready: Vec<_> = (0..6)
+        .map(|idx| tmp.path().join(format!("ready-{idx}")))
+        .collect();
+    let mut children: Vec<_> = ready
+        .iter()
+        .map(|path| {
+            spawn_git_builder_helper(
+                &exe, &root, cache_key, path, &attempts, &published, "publish", None, None,
+            )
+        })
+        .collect();
+    wait_for_test_paths(&ready);
+    drop(parent_guard);
+    for child in &mut children {
+        assert!(child.wait().unwrap().success());
+    }
+    let attempts = std::fs::read_to_string(&attempts).unwrap();
+    assert_eq!(
+        attempts.lines().count(),
+        1,
+        "all same-key processes must reuse one producer"
+    );
+}
+
+#[test]
+fn git_builder_election_does_not_serialize_unrelated_content_keys() {
+    let tmp = TempDir::new().unwrap();
+    let cache = CacheDir::with_root(tmp.path().join("cache"));
+    let first = cache
+        .try_acquire_git_builder_lock("git-branch-content-a")
+        .unwrap()
+        .expect("first content key");
+    let second = cache
+        .try_acquire_git_builder_lock("git-branch-content-b")
+        .unwrap()
+        .expect("unrelated content key must remain independently acquirable");
+    drop((first, second));
+}
+
+#[test]
+fn git_builder_failure_allows_cross_process_takeover() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("cache");
+    let cache_key = "git-tag-failure-takeover";
+    let attempts = tmp.path().join("attempts");
+    let published = tmp.path().join("published");
+    let failed_ready = tmp.path().join("failed-ready");
+    let failed_locked = tmp.path().join("failed-locked");
+    let failed_release = tmp.path().join("failed-release");
+    let exe = std::env::current_exe().unwrap();
+    let mut failing = spawn_git_builder_helper(
+        &exe,
+        &root,
+        cache_key,
+        &failed_ready,
+        &attempts,
+        &published,
+        "fail-hold",
+        Some(&failed_locked),
+        Some(&failed_release),
+    );
+    wait_for_test_paths(&[failed_locked.clone()]);
+
+    let ready: Vec<_> = (0..4)
+        .map(|idx| tmp.path().join(format!("takeover-ready-{idx}")))
+        .collect();
+    let mut waiters: Vec<_> = ready
+        .iter()
+        .map(|path| {
+            spawn_git_builder_helper(
+                &exe, &root, cache_key, path, &attempts, &published, "publish", None, None,
+            )
+        })
+        .collect();
+    wait_for_test_paths(&ready);
+    std::fs::write(&failed_release, b"release").unwrap();
+    assert!(failing.wait().unwrap().success());
+    for child in &mut waiters {
+        assert!(child.wait().unwrap().success());
+    }
+    let attempts = std::fs::read_to_string(&attempts).unwrap();
+    assert_eq!(
+        attempts.lines().count(),
+        2,
+        "one failed producer and exactly one takeover producer must run"
+    );
+    assert!(published.exists(), "takeover must publish the result");
+}

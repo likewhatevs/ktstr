@@ -869,14 +869,11 @@ fn select_series_latest_in_range(
 /// Resolve a `git+URL#tag=/#branch=/#sha=` kernel spec to a cache-entry
 /// directory.
 ///
-/// Mirrors [`download_and_cache_version`] for the git source path. To
-/// avoid an unconditional fetch, it FIRST resolves `git_ref` to its
-/// commit via a KIND-directed ls-remote (a `Sha` resolves offline; a
-/// `Tag`/`Branch` matches its fully-qualified ref so a tag never aliases
-/// a same-named branch — see `crate::fetch::resolve_ref_commit`) and
-/// probes the cache for the key that resolution produces
-/// (`crate::fetch::git_cache_key`); on a hit it returns the cached
-/// entry WITHOUT any download.
+/// Mirrors [`download_and_cache_version`] for the git source path.
+/// Branch/tag acquisition connects and prepares exactly once, reads the
+/// advertised peeled id from that `Prepare`, then probes the cache and
+/// elects one cross-process producer before receiving any pack. A cache
+/// hit drops the prepared connection; the winner reuses it for receive.
 ///
 /// On a cache miss the fetch is routed by ref kind:
 /// - **Branch/tag**: a kind-directed, exact-ref, depth-one in-process
@@ -894,12 +891,10 @@ fn select_series_latest_in_range(
 /// path — the same shape `download_and_cache_version` returns and
 /// callers feed into the [`crate::KTSTR_KERNEL_ENV`] export.
 ///
-/// The cache key embeds `git_ref` verbatim (`/` and `..` sanitized —
-/// see `crate::fetch::git_cache_key`) alongside the resolved commit's
-/// full 40-hex hash, so two invocations with
-/// identical-sha-different-`git_ref` spellings remain distinct cache
-/// entries (collapsing those to one is separate future work — see
-/// [`crate::kernel_path::KernelId::Git`]).
+/// The cache key contains the ref kind, a fixed-seed ahash of the
+/// length-delimited raw ref, and the full resolved commit. This avoids
+/// filesystem-hostile names and sanitized-ref collisions while keeping
+/// tag, branch, and archive-SHA acquisition identities distinct.
 ///
 /// `cli_label` matches the contract the sibling helpers
 /// (`download_and_cache_version`, `resolve_kernel_dir`) use:
@@ -907,16 +902,86 @@ fn select_series_latest_in_range(
 /// [`kernel_build_pipeline`].
 ///
 /// `mp` is the progress group the download/clone bar is added to (the
-/// parallel resolve's shared group). Forwarded to the codeload download
-/// and the clone; `None` disables the bar.
+/// parallel resolve's shared group). Forwarded to codeload/gix; `None`
+/// uses the standalone non-TTY heartbeat reporter.
 ///
 /// Build flags shared with `cargo ktstr kernel build --kernel git+…`:
-/// `force` skips both cache probes so the ref is refetched and rebuilt;
+/// `force` ignores a preexisting entry when it wins election, so the ref
+/// is refetched and rebuilt without a separate discovery handshake. A
+/// contending force caller coalesces with the already-active exact-key
+/// producer and reuses its publication;
 /// `clean`, `cpu_cap`, and `extra_kconfig` thread into
 /// [`kernel_build_pipeline`] (an `extra_kconfig` fragment also appends
 /// its `-xkc{hash}` suffix to the cache key so an extras build lands a
 /// distinct slot). The auto-discovery test path passes `false` / `None`
 /// for all four; only `kernel build` populates them.
+enum GitResolveElection {
+    Builder {
+        cache_key: String,
+        guard: crate::cache::GitBuilderLockGuard,
+    },
+    Cached(std::path::PathBuf),
+    Contended {
+        cache_key: String,
+    },
+}
+
+fn git_cache_key_with_extra(
+    ref_kind: crate::kernel_path::GitRefKind,
+    git_ref: &str,
+    commit_hash: &str,
+    extra_kconfig: Option<&str>,
+) -> String {
+    let mut key = crate::fetch::git_cache_key(ref_kind, git_ref, commit_hash);
+    crate::cli::append_extra_kconfig_suffix(&mut key, extra_kconfig);
+    key
+}
+
+fn report_git_builder_wait(
+    cli_label: &str,
+    cache_key: &str,
+    elapsed: std::time::Duration,
+    mp: Option<&crate::cli::FetchProgress>,
+) {
+    let line = format!(
+        "{cli_label}: waiting for peer building {cache_key} (elapsed {})",
+        humantime::format_duration(elapsed)
+    );
+    match mp {
+        Some(fp) => fp.println(&line),
+        None => eprintln!("{line}"),
+    }
+}
+
+/// Wait until the content-key producer exits. The acquired guard is
+/// returned to the waiter, which first checks for the peer's published
+/// cache entry and retains the guard for failure takeover on a miss.
+fn wait_for_git_builder(
+    cache: &crate::cache::CacheDir,
+    cache_key: &str,
+    cli_label: &str,
+    mp: Option<&crate::cli::FetchProgress>,
+) -> Result<crate::cache::GitBuilderLockGuard> {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+    const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(10);
+    let started = std::time::Instant::now();
+    let mut next_heartbeat = std::time::Duration::ZERO;
+    loop {
+        if crate::fetch::git_operation_interrupted() {
+            bail!("source acquisition interrupted while waiting for peer builder");
+        }
+        if let Some(guard) = cache.try_acquire_git_builder_lock(cache_key)? {
+            return Ok(guard);
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= next_heartbeat {
+            report_git_builder_wait(cli_label, cache_key, elapsed, mp);
+            next_heartbeat = elapsed + HEARTBEAT;
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_git_kernel(
     url: &str,
@@ -929,87 +994,163 @@ pub fn resolve_git_kernel(
     cpu_cap: Option<crate::cli::CpuCap>,
     extra_kconfig: Option<&str>,
 ) -> Result<std::path::PathBuf> {
-    // Open the cache once: reused by the pre-fetch ls-remote probe, the
-    // post-fetch lookup, and the build pipeline below.
     let cache = crate::cache::CacheDir::new()?;
+    let tmp_dir = tempfile::TempDir::new()?;
+    let (acquired, _builder_guard) = match ref_kind {
+        crate::kernel_path::GitRefKind::Branch | crate::kernel_path::GitRefKind::Tag => {
+            // A waiter that observes a failed producer retains that
+            // content key's guard and reconnects. If the ref moved while
+            // waiting, the next gate drops the stale-key guard and
+            // independently elects on the newly advertised key.
+            let mut takeover: Option<(String, crate::cache::GitBuilderLockGuard)> = None;
+            loop {
+                let pending = takeover.take();
+                let outcome = crate::fetch::git_clone_kinded_gated(
+                    url,
+                    git_ref,
+                    ref_kind,
+                    tmp_dir.path(),
+                    cli_label,
+                    mp,
+                    |commit_id| {
+                        let commit_hash = format!("{commit_id}");
+                        let cache_key = git_cache_key_with_extra(
+                            ref_kind,
+                            git_ref,
+                            &commit_hash,
+                            extra_kconfig,
+                        );
 
-    // Resolve `git_ref` to its commit BEFORE the expensive fetch, using
-    // a KIND-directed ls-remote (a tag never aliases a same-named
-    // branch). With `git_ref` this keys the same entry the fetch would
-    // write, so a cache hit returns without any download. `Sha` resolves
-    // offline; a `Tag`/`Branch` ref-discovery failure is non-fatal
-    // because the exact shallow fetch below resolves the tip
-    // authoritatively.
-    let commit = crate::fetch::resolve_ref_commit(url, git_ref, ref_kind, cli_label, mp);
-    // `--force` skips the pre-fetch probe so the ref is always refetched
-    // and rebuilt. The `-xkc{hash}` suffix folds `--extra-kconfig` into
-    // the key so an extras build probes its own slot, not the baked-only
-    // one.
-    if !force && let Some(commit_hash) = &commit {
-        let mut cache_key = crate::fetch::git_cache_key(git_ref, commit_hash);
-        crate::cli::append_extra_kconfig_suffix(&mut cache_key, extra_kconfig);
-        if let Some(entry) = cache_lookup(&cache, &cache_key, cli_label) {
-            // Full hash keys the entry; show the familiar 7-hex prefix.
+                        if let Some((held_key, guard)) = pending {
+                            if held_key == cache_key {
+                                return Ok(crate::fetch::ExactRefGate::Fetch(
+                                    GitResolveElection::Builder { cache_key, guard },
+                                ));
+                            }
+                            drop(guard);
+                        }
+
+                        if !force && let Some(entry) = cache_lookup(&cache, &cache_key, cli_label) {
+                            return Ok(crate::fetch::ExactRefGate::Skip(
+                                GitResolveElection::Cached(entry.path),
+                            ));
+                        }
+                        match cache.try_acquire_git_builder_lock(&cache_key)? {
+                            Some(guard) => {
+                                // Close the race between the first probe
+                                // and election. Force intentionally
+                                // ignores an entry that predated its own
+                                // successful election.
+                                if !force
+                                    && let Some(entry) = cache_lookup(&cache, &cache_key, cli_label)
+                                {
+                                    Ok(crate::fetch::ExactRefGate::Skip(
+                                        GitResolveElection::Cached(entry.path),
+                                    ))
+                                } else {
+                                    Ok(crate::fetch::ExactRefGate::Fetch(
+                                        GitResolveElection::Builder { cache_key, guard },
+                                    ))
+                                }
+                            }
+                            None => Ok(crate::fetch::ExactRefGate::Skip(
+                                GitResolveElection::Contended { cache_key },
+                            )),
+                        }
+                    },
+                )?;
+
+                match outcome {
+                    crate::fetch::GitCloneOutcome::Fetched {
+                        mut acquired,
+                        token: GitResolveElection::Builder { cache_key, guard },
+                    } => {
+                        acquired.cache_key = cache_key;
+                        break (acquired, guard);
+                    }
+                    crate::fetch::GitCloneOutcome::Fetched { .. } => {
+                        unreachable!("only an elected builder may fetch")
+                    }
+                    crate::fetch::GitCloneOutcome::Skipped {
+                        token: GitResolveElection::Cached(path),
+                        commit_hash,
+                    } => {
+                        let short = &commit_hash[..7.min(commit_hash.len())];
+                        let msg =
+                            format!("{cli_label}: git+{url} -> {short} cached; skipping fetch");
+                        match mp {
+                            Some(fp) => fp.println(&msg),
+                            None => eprintln!("{msg}"),
+                        }
+                        return Ok(path);
+                    }
+                    crate::fetch::GitCloneOutcome::Skipped {
+                        token: GitResolveElection::Contended { cache_key },
+                        ..
+                    } => {
+                        let guard = wait_for_git_builder(&cache, &cache_key, cli_label, mp)?;
+                        if let Some(entry) = cache_lookup(&cache, &cache_key, cli_label) {
+                            return Ok(entry.path);
+                        }
+                        takeover = Some((cache_key, guard));
+                    }
+                    crate::fetch::GitCloneOutcome::Skipped { .. } => {
+                        unreachable!("builder token cannot skip")
+                    }
+                }
+            }
+        }
+        crate::kernel_path::GitRefKind::Sha => {
+            let commit_hash = git_ref.to_ascii_lowercase();
+            let cache_key =
+                git_cache_key_with_extra(ref_kind, git_ref, &commit_hash, extra_kconfig);
+            if !force && let Some(entry) = cache_lookup(&cache, &cache_key, cli_label) {
+                return Ok(entry.path);
+            }
+            let builder_guard = match cache.try_acquire_git_builder_lock(&cache_key)? {
+                Some(guard) => guard,
+                None => {
+                    let guard = wait_for_git_builder(&cache, &cache_key, cli_label, mp)?;
+                    if let Some(entry) = cache_lookup(&cache, &cache_key, cli_label) {
+                        return Ok(entry.path);
+                    }
+                    guard
+                }
+            };
+            if !force && let Some(entry) = cache_lookup(&cache, &cache_key, cli_label) {
+                return Ok(entry.path);
+            }
+            let archive_url =
+                crate::fetch::github_archive_url(url, &commit_hash).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "git+{url}#sha={git_ref}: commit snapshots are supported only for \
+                     github.com/OWNER/REPO remotes; use a #tag= or #branch= here"
+                    )
+                })?;
             let short = &commit_hash[..7.min(commit_hash.len())];
-            let msg = format!("{cli_label}: git+{url} -> {short} cached; skipping fetch");
+            let msg = format!(
+                "{cli_label}: fetching explicit immutable GitHub commit {short} as a source snapshot"
+            );
             match mp {
                 Some(fp) => fp.println(&msg),
                 None => eprintln!("{msg}"),
             }
-            return Ok(entry.path);
+            let mut acquired = crate::fetch::download_github_archive(
+                crate::fetch::shared_client(),
+                &archive_url,
+                git_ref,
+                &commit_hash,
+                tmp_dir.path(),
+                cli_label,
+                mp,
+            )?;
+            acquired.cache_key = cache_key;
+            (acquired, builder_guard)
         }
-    }
-
-    let tmp_dir = tempfile::TempDir::new()?;
-    // Archive acquisition is an explicit immutable-SHA policy decision
-    // at this call site, never an implicit property of a github.com URL.
-    // Branches and tags always take the exact shallow gix path below,
-    // retaining their native ref namespace and selected tag object.
-    let github_archive = match ref_kind {
-        crate::kernel_path::GitRefKind::Sha => commit
-            .as_deref()
-            .and_then(|c| crate::fetch::github_archive_url(url, c)),
-        crate::kernel_path::GitRefKind::Tag
-        | crate::kernel_path::GitRefKind::Branch
-        | crate::kernel_path::GitRefKind::Unknown => None,
-    };
-    let mut acquired = if let Some(archive_url) = github_archive {
-        let commit_hash = commit
-            .as_deref()
-            .expect("commit present — the archive URL was built from it");
-        let short = &commit_hash[..7.min(commit_hash.len())];
-        let msg = format!(
-            "{cli_label}: fetching explicit immutable GitHub commit {short} as a source snapshot"
-        );
-        match mp {
-            Some(fp) => fp.println(&msg),
-            None => eprintln!("{msg}"),
+        crate::kernel_path::GitRefKind::Unknown => {
+            bail!("git+{url}: ref kind could not be determined")
         }
-        crate::fetch::download_github_archive(
-            crate::fetch::shared_client(),
-            &archive_url,
-            git_ref,
-            commit_hash,
-            tmp_dir.path(),
-            cli_label,
-            mp,
-        )?
-    } else {
-        crate::fetch::git_clone_kinded(url, git_ref, ref_kind, tmp_dir.path(), cli_label, mp)?
     };
-    // Fold --extra-kconfig into the fetched key so the post-fetch probe
-    // and the pipeline's cache store target the extras-aware slot
-    // (mirrors kernel_build_one). A no-op when extra_kconfig is None.
-    crate::cli::append_extra_kconfig_suffix(&mut acquired.cache_key, extra_kconfig);
-
-    // Re-check the cache post-fetch (skipped under --force): the clone
-    // resolves the tip authoritatively, catching a hit the ls-remote
-    // probe missed (a ref-name resolution difference, or a probe that
-    // failed) so an unchanged tip still skips the rebuild. (The codeload
-    // path's key is already the probe key, so this is a no-op there.)
-    if !force && let Some(entry) = cache_lookup(&cache, &acquired.cache_key, cli_label) {
-        return Ok(entry.path);
-    }
 
     // `--force` fail-fast: if tests are holding the cache-entry lock,
     // bail with the PID list rather than silently waiting to stomp the

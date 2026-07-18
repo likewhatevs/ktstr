@@ -109,28 +109,22 @@ pub enum KernelId {
     /// (tag / branch / sha), chosen explicitly by the operator's
     /// `#tag=` / `#branch=` / `#sha=` fragment — no DWIM. Stored
     /// verbatim by `KernelId::parse` with no remote contact. At
-    /// cache-resolution time `resolve_git_kernel` resolves `git_ref`
-    /// to its full commit hash (a kind-directed ls-remote) and probes
-    /// the cache before fetching, so a re-run against an unchanged tip
-    /// skips the download.
+    /// cache-resolution time `resolve_git_kernel` obtains the peeled
+    /// commit from the exact gix fetch's single prepared ref-map, probes
+    /// the content-addressed cache, and receives the pack only for the
+    /// elected builder.
     ///
     /// Acquisition is routed by host (see `resolve_git_kernel` /
     /// `crate::fetch`):
-    /// - GitHub (`github.com/OWNER/REPO`): a codeload `tar.gz` snapshot
-    ///   of the RESOLVED COMMIT (the ls-remote-resolved commit for a
-    ///   tag/branch, the sha itself for a sha) — no clone; the
-    ///   exact-commit snapshot matches the cache key even if a branch
-    ///   tip moves mid-resolve. A tag/branch whose ls-remote resolution
-    ///   fails falls back to the clone path below (like a non-GitHub
-    ///   source).
-    /// - Non-GitHub: a kind-directed shallow clone — `Tag` fetches
-    ///   `refs/tags/{git_ref}` (annotated tags peel to the commit),
-    ///   `Branch` fetches `refs/heads/{git_ref}`. `Sha` is unsupported off
-    ///   GitHub (gix cannot fetch a bare commit and the remote lacks
-    ///   allow-sha-in-want) and errors.
+    /// - `Tag` and `Branch` use one uniform, kind-directed, depth-one
+    ///   in-process gix fetch on every host. Annotated tags peel to the
+    ///   commit while their selected tag object is retained.
+    /// - An explicit immutable GitHub `Sha` uses its codeload snapshot.
+    ///   `Sha` is unsupported off GitHub because the remote generally
+    ///   does not allow fetching an unadvertised bare commit.
     Git {
-        /// Remote URL (https or git@). GitHub sources are fetched from
-        /// codeload; non-GitHub sources are shallow-cloned from here.
+        /// Remote URL. Branches/tags are fetched verbatim through gix;
+        /// an explicit GitHub SHA uses codeload.
         url: String,
         /// The ref value after `kind=` (verbatim, no `refs/` prefix) for
         /// `Tag` / `Branch` / `Sha`; the whole unrecognized fragment for

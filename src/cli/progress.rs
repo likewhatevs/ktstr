@@ -190,8 +190,9 @@ impl FetchProgress {
         GroupBar { pb }
     }
 
-    /// Add a git-clone progress bar and spawn the gix-tree → indicatif
-    /// poll bridge. `label` names the clone (its git ref). The bar is
+    /// Add a git-clone progress bar and attempt to spawn the gix-tree →
+    /// indicatif poll bridge. A spawn failure is warned and nonfatal.
+    /// `label` names the clone (its git ref). The bar is
     /// determinate (with ETA) whenever gix reports a bounded task and
     /// a spinner otherwise; see [`CloneProgress`].
     ///
@@ -243,18 +244,26 @@ impl CloneProgress {
         started: Instant,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let poller = std::thread::spawn({
-            let root = Arc::clone(&root);
-            let bar = bar.clone();
-            let stop = Arc::clone(&stop);
-            let label = label.to_string();
-            move || poll_clone_tree(root, bar, stop, label, non_tty)
-        });
+        let poller = spawn_clone_poller(
+            Arc::clone(&root),
+            bar.clone(),
+            Arc::clone(&stop),
+            label.to_string(),
+            non_tty,
+        )
+        .map_err(|err| {
+            tracing::warn!(
+                %err,
+                operation = %label,
+                "could not start source-progress poller; acquisition will continue without it",
+            );
+        })
+        .ok();
         CloneProgress {
             root,
             bar,
             stop,
-            poller: Some(poller),
+            poller,
             label: label.to_string(),
             non_tty,
             started,
@@ -281,6 +290,34 @@ impl CloneProgress {
         bar.set_message(format!("{active_verb} {label}"));
         Self::start(root, bar, label, completion_noun, true, Instant::now())
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FAIL_NEXT_POLLER_SPAWN: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+fn spawn_clone_poller(
+    root: Arc<Root>,
+    bar: ProgressBar,
+    stop: Arc<AtomicBool>,
+    label: String,
+    non_tty: bool,
+) -> std::io::Result<JoinHandle<()>> {
+    #[cfg(test)]
+    {
+        let fail = TEST_FAIL_NEXT_POLLER_SPAWN.with(|flag| flag.replace(false));
+        if fail {
+            return Err(std::io::Error::other(
+                "injected progress-poller spawn failure",
+            ));
+        }
+    }
+    std::thread::Builder::new()
+        .name("ktstr-source-progress".to_string())
+        .spawn(move || poll_clone_tree(root, bar, stop, label, non_tty))
 }
 
 impl FetchProgress {
@@ -601,8 +638,9 @@ pub(crate) struct CloneProgress {
     bar: ProgressBar,
     /// Set by [`Self::shutdown`] to stop the poll loop.
     stop: Arc<AtomicBool>,
-    /// The poll thread handle. Present for TTY rendering and non-TTY
-    /// heartbeats; `None` after [`Self::shutdown`] takes it to join.
+    /// The poll thread handle. Present when spawning succeeded; `None`
+    /// after [`Self::shutdown`] takes it to join or when the operating
+    /// system rejected thread creation.
     poller: Option<JoinHandle<()>>,
     /// Human-readable clone label, also used by non-TTY completion.
     label: String,
@@ -782,6 +820,18 @@ mod tests {
             "the phase created before connect must be visible to the heartbeat poller",
         );
         drop(phase);
+        drop(cp);
+    }
+
+    #[test]
+    fn poller_spawn_failure_is_nonfatal_and_drop_safe() {
+        TEST_FAIL_NEXT_POLLER_SPAWN.with(|flag| flag.set(true));
+        let cp = CloneProgress::standalone_operation("injected", "fetching", "fetch");
+        assert!(
+            cp.poller.is_none(),
+            "spawn failure must degrade to a reporter without a poll thread"
+        );
+        let _phase = cp.item_named("operation still usable");
         drop(cp);
     }
 

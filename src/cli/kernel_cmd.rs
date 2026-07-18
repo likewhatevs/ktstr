@@ -261,9 +261,10 @@ pub const KERNEL_HELP_NO_RAW: &str = "Kernel identifier — one of: \
      tuple becomes a distinct nextest test case so nextest's parallelism, \
      retries, and `-E` filtering work natively. Ranges expand to every \
      `stable` and `longterm` release inside `[START, END]` inclusive \
-     (mainline / linux-next dropped). Git sources are fetched at the \
-     given ref (GitHub via a codeload snapshot, other hosts via a \
-     shallow clone) and built once. In contrast, `ktstr shell` accepts a single \
+     (mainline / linux-next dropped). Git branch and tag sources use \
+     the same exact-ref, depth-one in-process gix fetch on every host; \
+     only an explicit immutable GitHub SHA uses codeload. Same-content \
+     concurrent callers share one fetch and build. In contrast, `ktstr shell` accepts a single \
      kernel only — pass exactly one `--kernel`.";
 
 /// Help text for `--kernel` in contexts that accept raw image files:

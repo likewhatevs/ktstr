@@ -143,6 +143,46 @@ fn promote_staged_renames_well_formed_archive() {
 }
 
 #[test]
+fn promote_staged_never_replaces_preexisting_destination() {
+    let dest = tempfile::TempDir::new().unwrap();
+    let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
+    let staged = staging.path().join("linux-6.14.2");
+    std::fs::create_dir(&staged).unwrap();
+    std::fs::write(staged.join("new"), b"new").unwrap();
+    let existing = dest.path().join("linux-6.14.2");
+    std::fs::create_dir(&existing).unwrap();
+    std::fs::write(existing.join("old"), b"old").unwrap();
+
+    let err = promote_staged_kernel_tree(&staging, dest.path(), "6.14.2")
+        .expect_err("publication must use RENAME_NOREPLACE");
+    assert!(format!("{err:#}").contains("RENAME_NOREPLACE"));
+    assert_eq!(std::fs::read(existing.join("old")).unwrap(), b"old");
+    assert!(
+        staged.join("new").is_file(),
+        "failed no-replace promotion must leave staging available for rollback"
+    );
+}
+
+#[test]
+fn promoted_path_rollback_failure_is_attached_to_primary_error() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let published_dir = tmp.path().join("published");
+    std::fs::create_dir(&published_dir).unwrap();
+    let promoted = PromotedPath {
+        path: published_dir.clone(),
+        // Deliberately inject the wrong removal operation so rollback
+        // fails portably with "is a directory".
+        kind: PublishedPathKind::File,
+        committed: false,
+    };
+    let err = promoted.rollback(anyhow::anyhow!("primary acquisition failure"));
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains("primary acquisition failure"));
+    assert!(rendered.contains("also failed to roll back"));
+    assert!(published_dir.is_dir());
+}
+
+#[test]
 fn promote_staged_rejects_stray_top_level_entry() {
     let dest = tempfile::TempDir::new().unwrap();
     let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
@@ -1956,6 +1996,36 @@ fn download_stream_finalizes_sha256_over_streamed_bytes() {
     );
 }
 
+#[test]
+fn download_stream_cancellation_rejects_bytes_before_decoder_consumption() {
+    let _guard = exact_clone_test_guard();
+    set_git_operation_interrupted(true);
+    let mut stream = DownloadStream::with_progress(std::io::Cursor::new(b"payload"), None);
+    let mut buf = [0u8; 16];
+    let err = stream
+        .read(&mut buf)
+        .expect_err("a cancelled source read must fail before consuming bytes");
+    set_git_operation_interrupted(false);
+    assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+    assert_eq!(stream.bytes_total, 0);
+    assert_eq!(stream.inner.position(), 0);
+}
+
+#[test]
+fn source_retry_backoff_is_promptly_cancellable() {
+    let _guard = exact_clone_test_guard();
+    set_git_operation_interrupted(true);
+    let started = std::time::Instant::now();
+    let err = source_operation_backoff(std::time::Duration::from_secs(30))
+        .expect_err("cancelled backoff must not sleep its full interval");
+    set_git_operation_interrupted(false);
+    assert!(format!("{err:#}").contains("retry backoff"));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "cancellation should be observed at the first 100 ms quantum"
+    );
+}
+
 /// The same byte stream also produces the standard-base64 MD5 format
 /// published by Google Cloud Storage. This pins both the digest bytes
 /// and the encoding expected by the GKE artifact verifier.
@@ -3386,15 +3456,16 @@ fn fetch_read_makefile_version_parses_and_guards() {
     assert_eq!(super::read_makefile_version(dir.path()), None);
 }
 
-// -- git cache key + ls-remote ref pre-resolution --
+// -- git cache identity + standalone ref discovery --
 
 #[test]
 fn git_cache_key_embeds_ref_full_hash_arch_and_suffix() {
+    use crate::kernel_path::GitRefKind;
     let h = "abc1234abc1234abc1234abc1234abc1234abc12";
-    let key = git_cache_key("for-next", h);
+    let key = git_cache_key(GitRefKind::Branch, "for-next", h);
     assert!(
-        key.starts_with(&format!("for-next-git-{h}-")),
-        "key must lead with the raw ref, the -git- marker, and the full commit hash: {key}"
+        key.starts_with("git-branch-") && key.contains(h),
+        "key must carry kind, ref identity, and the full commit hash: {key}"
     );
     let (arch, _) = arch_info();
     assert!(
@@ -3410,59 +3481,53 @@ fn git_cache_key_embeds_ref_full_hash_arch_and_suffix() {
 /// class a 28-bit short prefix risked).
 #[test]
 fn git_cache_key_full_hash_distinguishes_7hex_prefix_collision() {
+    use crate::kernel_path::GitRefKind;
     let a = "abc1234000000000000000000000000000000000";
     let b = "abc1234ffffffffffffffffffffffffffffffffff";
     assert_eq!(&a[..7], &b[..7], "fixture precondition: same 7-hex prefix");
     assert_ne!(
-        git_cache_key("for-next", a),
-        git_cache_key("for-next", b),
+        git_cache_key(GitRefKind::Branch, "for-next", a),
+        git_cache_key(GitRefKind::Branch, "for-next", b),
         "full-hash key must distinguish two commits sharing a 7-hex prefix",
     );
 }
 
-/// A slashed branch ref (e.g. `for-next/core`) must be sanitized so
-/// the cache key contains no `/` or `..` — validate_cache_key
-/// (housekeeping) hard-rejects those, which would make a slashed ref
-/// uncacheable verbatim (breaking both the pre-clone probe and the
-/// store). The full commit hash keeps the key unique, so mapping
-/// `/` -> `_` cannot serve a wrong build.
+/// Raw ref bytes are content-addressed rather than sanitized. This
+/// keeps filesystem-hostile names cacheable without making `a/b`
+/// collide with the distinct ref `a_b`.
 #[test]
-fn git_cache_key_sanitizes_slashed_ref() {
+fn git_cache_key_hashes_raw_ref_without_sanitized_aliases() {
+    use crate::kernel_path::GitRefKind;
     let h = "abc1234abc1234abc1234abc1234abc1234abc12";
-    let key = git_cache_key("for-next/core", h);
+    let key = git_cache_key(GitRefKind::Branch, "for-next/core", h);
     assert!(!key.contains('/'), "cache key must not contain `/`: {key}");
     assert!(
         !key.contains(".."),
         "cache key must not contain `..`: {key}"
     );
-    assert!(
-        key.starts_with(&format!("for-next_core-git-{h}-")),
-        "slashed ref must sanitize `/` -> `_`: {key}"
+    assert_ne!(
+        key,
+        git_cache_key(GitRefKind::Branch, "for-next_core", h),
+        "distinct raw refs must remain distinct after filesystem-safe encoding"
     );
 }
 
-/// git_cache_key must sanitize every class validate_cache_key rejects,
-/// not just `/` — a leading `.` (hidden entry) and a NUL byte would
-/// otherwise force a cache miss (and a store hard-fail). The full
-/// commit hash keeps the key unique across the collapse.
 #[test]
-fn git_cache_key_sanitizes_dot_prefixed_and_nul_refs() {
+fn git_cache_key_distinguishes_kind_and_normalizes_sha_case() {
+    use crate::kernel_path::GitRefKind;
     let h = "abc1234abc1234abc1234abc1234abc1234abc12";
-    let dot = git_cache_key(".hidden", h);
-    assert!(
-        !dot.starts_with('.'),
-        "leading `.` must be sanitized: {dot}"
+    let branch = git_cache_key(GitRefKind::Branch, "same", h);
+    let tag = git_cache_key(GitRefKind::Tag, "same", h);
+    let sha = git_cache_key(GitRefKind::Sha, &h.to_ascii_uppercase(), h);
+    assert_ne!(branch, tag, "branch and tag identities must never alias");
+    assert_ne!(branch, sha, "archive SHA and git branch identities differ");
+    assert_eq!(
+        sha,
+        git_cache_key(GitRefKind::Sha, h, &h.to_ascii_uppercase()),
+        "SHA ref and commit renderings are canonical lowercase"
     );
-    assert!(
-        dot.starts_with(&format!("_.hidden-git-{h}-")),
-        "leading `.` is prefixed with `_`: {dot}"
-    );
-    let nul = git_cache_key("a\0b", h);
+    let nul = git_cache_key(GitRefKind::Branch, "a\0b", h);
     assert!(!nul.contains('\0'), "NUL must be sanitized: {nul:?}");
-    assert!(
-        nul.starts_with(&format!("a_b-git-{h}-")),
-        "NUL maps to `_`: {nul}"
-    );
 }
 
 /// [`github_archive_url`] builds the codeload archive URL for the
@@ -3548,6 +3613,8 @@ fn resolve_ref_commit_sha_resolves_offline_lowercased() {
     let sha = "ABC1234abc1234abc1234abc1234abc1234ABC12";
     assert_eq!(
         resolve_ref_commit("https://github.com/x/y", sha, GitRefKind::Sha, "test", None,)
+            .unwrap()
+            .map(|id| id.to_string())
             .as_deref(),
         Some("abc1234abc1234abc1234abc1234abc1234abc12"),
     );
@@ -3559,6 +3626,7 @@ fn resolve_ref_commit_sha_resolves_offline_lowercased() {
             "test",
             None,
         )
+        .unwrap()
         .is_none()
     );
 }
@@ -3582,7 +3650,9 @@ fn resolve_ref_commit_resolves_branch_over_v2() {
     use crate::kernel_path::GitRefKind;
     let url = "https://git.kernel.org/pub/scm/linux/kernel/git/tj/sched_ext.git";
     let hash = resolve_ref_commit(url, "for-next", GitRefKind::Branch, "test", None)
+        .expect("ref discovery transport must succeed")
         .expect("for-next branch must resolve over v2 ls-refs through its exact ref-prefix");
+    let hash = hash.to_string();
     assert_eq!(hash.len(), 40, "a full commit hash is 40 hex chars: {hash}");
     assert!(
         hash.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -3738,11 +3808,32 @@ fn write_fixture_commit(
         .write_blob(marker.as_bytes())
         .expect("fixture blob")
         .detach();
-    let mut entries = vec![gix::objs::tree::Entry {
-        mode: gix::objs::tree::EntryKind::Blob.into(),
-        filename: "marker.txt".into(),
-        oid: blob,
-    }];
+    let nested_blob = repo
+        .write_blob(format!("nested:{marker}").as_bytes())
+        .expect("nested fixture blob")
+        .detach();
+    let nested_tree = repo
+        .write_object(&gix::objs::Tree {
+            entries: vec![gix::objs::tree::Entry {
+                mode: gix::objs::tree::EntryKind::Blob.into(),
+                filename: "nested.txt".into(),
+                oid: nested_blob,
+            }],
+        })
+        .expect("nested fixture tree")
+        .detach();
+    let mut entries = vec![
+        gix::objs::tree::Entry {
+            mode: gix::objs::tree::EntryKind::Blob.into(),
+            filename: "marker.txt".into(),
+            oid: blob,
+        },
+        gix::objs::tree::Entry {
+            mode: gix::objs::tree::EntryKind::Tree.into(),
+            filename: "directory".into(),
+            oid: nested_tree,
+        },
+    ];
     if let Some(gitlink) = gitlink {
         entries.push(gix::objs::tree::Entry {
             mode: gix::objs::tree::EntryKind::Commit.into(),
@@ -3958,6 +4049,11 @@ fn assert_exact_clone(
         std::fs::read_to_string(acquired.source_dir.join("marker.txt")).expect("read marker"),
         expected_marker,
     );
+    assert_eq!(
+        std::fs::read_to_string(acquired.source_dir.join("directory/nested.txt"))
+            .expect("read recursively copied marker"),
+        format!("nested:{expected_marker}"),
+    );
     assert!(
         repo.find_object(fixture.unrelated_commit).is_err(),
         "the unrelated remote HEAD branch/tag object must not be fetched",
@@ -4045,6 +4141,63 @@ fn exact_clone_disambiguates_namespaces_and_preserves_only_selected_ref() {
 }
 
 #[test]
+fn local_exact_fetch_never_constructs_a_remote_prepare() {
+    let _guard = exact_clone_test_guard();
+    set_git_operation_interrupted(false);
+    let fixture = exact_clone_fixture();
+    let dest = tempfile::TempDir::new().expect("clone dest");
+    TEST_EXACT_PREPARE_COUNT.store(0, Ordering::Release);
+    let outcome = git_clone_kinded_gated(
+        &fixture.url(),
+        "same",
+        crate::kernel_path::GitRefKind::Branch,
+        dest.path(),
+        "test",
+        None,
+        |_| Ok(ExactRefGate::Fetch(())),
+    )
+    .expect("force-shaped exact fetch");
+    assert!(matches!(outcome, GitCloneOutcome::Fetched { .. }));
+    assert_eq!(
+        TEST_EXACT_PREPARE_COUNT.load(Ordering::Acquire),
+        0,
+        "a directly opened local repository must never enter gix's transport path"
+    );
+}
+
+#[test]
+fn local_exact_gate_can_skip_before_materializing_a_repository() {
+    let _guard = exact_clone_test_guard();
+    set_git_operation_interrupted(false);
+    let fixture = exact_clone_fixture();
+    let dest = tempfile::TempDir::new().expect("clone dest");
+    let outcome = git_clone_kinded_gated(
+        &fixture.url(),
+        "same",
+        crate::kernel_path::GitRefKind::Tag,
+        dest.path(),
+        "test",
+        None,
+        |commit_id| {
+            assert_eq!(commit_id, fixture.tag_commit);
+            Ok(ExactRefGate::Skip("cached"))
+        },
+    )
+    .expect("skip local exact materialization");
+    match outcome {
+        GitCloneOutcome::Skipped { commit_hash, token } => {
+            assert_eq!(commit_hash, fixture.tag_commit.to_string());
+            assert_eq!(token, "cached");
+        }
+        GitCloneOutcome::Fetched { .. } => panic!("the cache gate requested a skip"),
+    }
+    assert!(
+        !dest.path().join("linux").exists(),
+        "a skipped local exact ref must not initialize a destination repository"
+    );
+}
+
+#[test]
 fn exact_clone_rejects_non_commit_tag_and_rolls_back() {
     let _guard = exact_clone_test_guard();
     set_git_operation_interrupted(false);
@@ -4065,6 +4218,57 @@ fn exact_clone_rejects_non_commit_tag_and_rolls_back() {
     assert!(
         !dest.path().join("linux").exists(),
         "failed exact clone must roll its destination back",
+    );
+}
+
+#[test]
+fn exact_clone_never_replaces_preexisting_destination() {
+    let _guard = exact_clone_test_guard();
+    set_git_operation_interrupted(false);
+    let fixture = exact_clone_fixture();
+    let dest = tempfile::TempDir::new().expect("clone dest");
+    let existing = dest.path().join("linux");
+    std::fs::create_dir(&existing).unwrap();
+    std::fs::write(existing.join("owned-by-caller"), b"keep").unwrap();
+    let err = git_clone_kinded(
+        &fixture.url(),
+        "same",
+        crate::kernel_path::GitRefKind::Branch,
+        dest.path(),
+        "test",
+        None,
+    )
+    .expect_err("RENAME_NOREPLACE must reject an existing destination");
+    assert!(format!("{err:#}").contains("RENAME_NOREPLACE"));
+    assert_eq!(
+        std::fs::read(existing.join("owned-by-caller")).unwrap(),
+        b"keep",
+        "failed publication must not alter the preexisting tree"
+    );
+}
+
+#[test]
+fn exact_clone_rolls_back_transaction_owned_post_promote_cancellation() {
+    let _guard = exact_clone_test_guard();
+    set_git_operation_interrupted(false);
+    let fixture = exact_clone_fixture();
+    let dest = tempfile::TempDir::new().expect("clone dest");
+    TEST_INTERRUPT_AFTER_CLONE_PROMOTE.store(true, Ordering::Release);
+    let result = git_clone_kinded(
+        &fixture.url(),
+        "same",
+        crate::kernel_path::GitRefKind::Branch,
+        dest.path(),
+        "test",
+        None,
+    );
+    TEST_INTERRUPT_AFTER_CLONE_PROMOTE.store(false, Ordering::Release);
+    set_git_operation_interrupted(false);
+    let err = result.expect_err("post-promote cancellation must reject publication");
+    assert!(format!("{err:#}").contains("after promoting exact clone"));
+    assert!(
+        !dest.path().join("linux").exists(),
+        "the transaction-owned destination must be rolled back"
     );
 }
 
@@ -4091,24 +4295,47 @@ fn exact_clone_observes_process_cancellation_and_rolls_back() {
 }
 
 #[test]
+fn exact_local_clone_cancels_during_object_materialization() {
+    let _guard = exact_clone_test_guard();
+    let fixture = exact_clone_fixture();
+    let dest = tempfile::TempDir::new().expect("clone dest");
+    set_git_operation_interrupted(false);
+    TEST_INTERRUPT_DURING_LOCAL_COPY.store(true, Ordering::Release);
+    let result = git_clone_kinded(
+        &fixture.url(),
+        "same",
+        crate::kernel_path::GitRefKind::Branch,
+        dest.path(),
+        "test",
+        None,
+    );
+    TEST_INTERRUPT_DURING_LOCAL_COPY.store(false, Ordering::Release);
+    set_git_operation_interrupted(false);
+    let err = result.expect_err("local object materialization must observe cancellation");
+    assert!(
+        format!("{err:#}").contains("while copying local checkout tree"),
+        "unexpected cancellation boundary: {err:#}"
+    );
+    assert!(
+        !dest.path().join("linux").exists(),
+        "cancelled local materialization must roll its destination back",
+    );
+}
+
+#[test]
 fn exact_ref_discovery_preserves_branch_tag_namespaces() {
     let _guard = exact_clone_test_guard();
     let fixture = exact_clone_fixture();
-    let interrupt = std::sync::atomic::AtomicBool::new(false);
-    for (target, expected) in [
-        ("refs/heads/same", fixture.branch_commit),
-        ("refs/tags/same", fixture.tag_commit),
+    for (kind, expected) in [
+        (
+            crate::kernel_path::GitRefKind::Branch,
+            fixture.branch_commit,
+        ),
+        (crate::kernel_path::GitRefKind::Tag, fixture.tag_commit),
     ] {
-        let progress = crate::cli::progress::CloneProgress::standalone_operation(
-            &format!("test: {target}"),
-            "resolving git ref",
-            "ref discovery",
-        );
-        let refs = discover_remote_refs(&fixture.url(), Some(target), &progress, &interrupt)
-            .expect("discover exact fixture ref");
-        progress.finish();
         assert_eq!(
-            pick_ref_object(&refs, target),
+            resolve_ref_commit(&fixture.url(), "same", kind, "test", None)
+                .expect("discover exact fixture ref"),
             Some(expected),
             "exact discovery must preserve the requested ref namespace and peel tags to commits",
         );
@@ -4129,38 +4356,86 @@ fn exact_ref_discovery_observes_shared_process_cancellation() {
     );
     set_git_operation_interrupted(false);
     assert!(
-        result.is_none(),
+        result.is_err(),
         "the cache-probe ref discovery must observe the same process interrupt as pack receive",
     );
 }
 
 #[test]
-fn exact_ref_discovery_rechecks_interrupt_after_ref_map() {
+fn exact_local_ref_discovery_rechecks_interrupt_after_lookup() {
     let _guard = exact_clone_test_guard();
     let fixture = exact_clone_fixture();
-    let interrupt = std::sync::atomic::AtomicBool::new(false);
-    let progress = crate::cli::progress::CloneProgress::standalone_operation(
-        "test: same",
-        "resolving git ref",
-        "ref discovery",
-    );
+    set_git_operation_interrupted(false);
     TEST_INTERRUPT_AFTER_REF_DISCOVERY.store(true, Ordering::Release);
-    let err = discover_remote_refs(
+    let err = resolve_ref_commit(
         &fixture.url(),
-        Some("refs/heads/same"),
-        &progress,
-        &interrupt,
+        "same",
+        crate::kernel_path::GitRefKind::Branch,
+        "test",
+        None,
     )
-    .expect_err("an interrupt landing in ref_map must reject discovery");
+    .expect_err("an interrupt landing after local ref lookup must reject discovery");
     TEST_INTERRUPT_AFTER_REF_DISCOVERY.store(false, Ordering::Release);
+    set_git_operation_interrupted(false);
     assert!(
-        format!("{err:#}").contains("after reading remote refs"),
-        "the post-ref-map check must identify its publication boundary: {err:#}",
+        format!("{err:#}").contains("after reading local ref"),
+        "the post-lookup check must identify its publication boundary: {err:#}",
     );
-    assert!(
-        interrupt.load(Ordering::Acquire),
-        "the deterministic ref-map seam must flip the threaded interrupt",
-    );
+}
+
+#[test]
+fn helper_capable_runtime_transports_are_rejected_before_connect() {
+    let _guard = exact_clone_test_guard();
+    set_git_operation_interrupted(false);
+    for (index, url) in [
+        "ssh://example.invalid/repository.git",
+        "git://example.invalid/repository.git",
+        "hg://example.invalid/repository",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dest = tempfile::TempDir::new().expect("clone dest");
+        let err = git_clone_kinded(
+            url,
+            "main",
+            crate::kernel_path::GitRefKind::Branch,
+            dest.path(),
+            "test",
+            None,
+        )
+        .expect_err("helper-capable transport must be rejected");
+        assert!(
+            format!("{err:#}").contains("can start an external helper"),
+            "unexpected rejection for {url}: {err:#}"
+        );
+        assert!(
+            !dest.path().join("linux").exists(),
+            "rejected transport {index} must not publish a clone"
+        );
+    }
+}
+
+#[test]
+fn production_gix_acquisition_has_no_process_launcher() {
+    for (name, source) in [
+        ("runtime fetch", include_str!("fetch.rs")),
+        (
+            "build acquisition",
+            include_str!("../build_support/gix_acquire.rs"),
+        ),
+        (
+            "shared gix policy",
+            include_str!("../build_support/gix_policy.rs"),
+        ),
+    ] {
+        for forbidden in ["std::process::Command", "process::Command", "Command::new("] {
+            assert!(
+                !source.contains(forbidden),
+                "{name} contains executable-launching production code: {forbidden}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -4227,27 +4502,86 @@ fn exact_clone_rejects_cancellation_during_final_index_write_and_rolls_back() {
 }
 
 #[test]
-fn gix_worker_budget_never_reuses_leased_extra_workers() {
-    let budget = GixWorkerBudget::new(8);
-    let first = budget.lease();
-    let second = budget.lease();
+fn gix_checkout_worker_tokens_are_machine_shared_and_nonblocking() {
+    let tmp = tempfile::TempDir::new().expect("worker token dir");
+    let first = GixCheckoutWorkerLease::acquire_in(tmp.path(), 7);
+    let second = GixCheckoutWorkerLease::acquire_in(tmp.path(), 7);
     assert_eq!(first.workers(), 8);
     assert_eq!(second.workers(), 1, "peers always proceed on their caller");
     drop(first);
-    let third = budget.lease();
+    let third = GixCheckoutWorkerLease::acquire_in(tmp.path(), 7);
     assert_eq!(third.workers(), 8, "dropping a lease returns all extras");
 }
 
 #[test]
-fn gix_worker_budget_bounds_concurrent_extras_and_returns_every_lease() {
-    let budget = GixWorkerBudget::new(8);
+#[ignore]
+fn gix_checkout_low_budget_process_helper() {
+    let lock_dir = std::path::PathBuf::from(std::env::var_os("KTSTR_TEST_GIX_TOKEN_DIR").unwrap());
+    let locked = std::path::PathBuf::from(std::env::var_os("KTSTR_TEST_GIX_TOKEN_LOCKED").unwrap());
+    let release =
+        std::path::PathBuf::from(std::env::var_os("KTSTR_TEST_GIX_TOKEN_RELEASE").unwrap());
+    let lease = GixCheckoutWorkerLease::acquire_in(&lock_dir, 1);
+    assert_eq!(lease.workers(), 2, "helper must own the sole extra token");
+    std::fs::write(&locked, b"locked").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !release.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for checkout-token release barrier"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn gix_checkout_low_host_budget_is_cross_process_global() {
+    let tmp = tempfile::TempDir::new().expect("worker token dir");
+    let locked = tmp.path().join("locked");
+    let release = tmp.path().join("release");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--ignored")
+        .arg("--exact")
+        .arg("--color=never")
+        .arg("fetch::tests::gix_checkout_low_budget_process_helper")
+        .env("KTSTR_TEST_GIX_TOKEN_DIR", tmp.path())
+        .env("KTSTR_TEST_GIX_TOKEN_LOCKED", &locked)
+        .env("KTSTR_TEST_GIX_TOKEN_RELEASE", &release)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn checkout-token helper");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !locked.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for checkout-token helper"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let contended = GixCheckoutWorkerLease::acquire_in(tmp.path(), 1);
+    assert_eq!(
+        contended.workers(),
+        1,
+        "the sole two-CPU extra token must be shared across processes"
+    );
+    assert!(
+        !tmp.path().join("ktstr-gix-checkout-worker-1.lock").exists(),
+        "a one-extra host must not expose any higher token slot"
+    );
+    std::fs::write(&release, b"release").unwrap();
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn gix_checkout_worker_tokens_bound_concurrent_extras() {
+    let tmp = tempfile::TempDir::new().expect("worker token dir");
     let entered = std::sync::Barrier::new(9);
     let release = std::sync::Barrier::new(9);
     let leased_extras = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         for _ in 0..8 {
             scope.spawn(|| {
-                let lease = budget.lease();
+                let lease = GixCheckoutWorkerLease::acquire_in(tmp.path(), 7);
                 leased_extras
                     .lock()
                     .expect("record leased extras")
@@ -4269,10 +4603,11 @@ fn gix_worker_budget_bounds_concurrent_extras_and_returns_every_lease() {
         );
         release.wait();
     });
+    let final_lease = GixCheckoutWorkerLease::acquire_in(tmp.path(), 7);
     assert_eq!(
-        budget.extra_workers.load(Ordering::Acquire),
-        7,
-        "every RAII lease must return its extras",
+        final_lease.workers(),
+        8,
+        "every RAII lease returns its tokens"
     );
 }
 
@@ -4299,22 +4634,48 @@ fn latest_patch_from_git_tags_resolves_eol_series() {
     );
 }
 
-/// `anon_open_opts` must load ONLY repo-local git config. This is the
-/// fix that stops a user's `url.<base>.insteadOf` rewrite (e.g.
-/// `https://github.com/` -> `git@github.com:`) from rerouting anonymous
-/// public-mirror fetches through SSH — which prompted for the key
-/// passphrase once per operation, several at once under the concurrent
-/// intra-range kernel resolution. Pins every ambient config source OFF
-/// so a future edit that re-enables one (re-introducing the rewrite)
-/// fails here. Environment permissions are intentionally NOT asserted
-/// off: they stay at the Full-trust default so an `http(s)_proxy` env
-/// var still applies to real downloads.
+/// Runtime and build-script gix users include the same policy module. Pin the
+/// runtime side here as well so config loading, prompting, and curl liveness
+/// limits cannot drift.
 #[test]
 fn anon_open_opts_disables_ambient_config_sources() {
-    let cfg = super::anon_open_opts().permissions.config;
+    let temp = tempfile::tempdir().expect("policy test repository");
+    gix::init(temp.path()).expect("initialize policy test repository");
+    let repo =
+        gix::open_opts(temp.path(), super::anon_open_opts()).expect("open with runtime policy");
+    let cfg = repo.open_options().permissions.config;
     assert!(!cfg.user, "user (~/.gitconfig) config must not load");
     assert!(!cfg.system, "system (/etc/gitconfig) config must not load");
     assert!(!cfg.git, "XDG git config must not load");
     assert!(!cfg.env, "GIT_CONFIG_* env config must not load");
     assert!(!cfg.git_binary, "git-binary config must not load");
+    assert!(!cfg.includes, "config include files must not load");
+    let attributes = repo.open_options().permissions.attributes;
+    assert!(!attributes.system, "system attributes must not load");
+    assert!(!attributes.git, "user attributes must not load");
+    assert!(
+        !attributes.git_binary,
+        "git-binary attributes must not load"
+    );
+    assert_eq!(
+        repo.config_snapshot()
+            .boolean("gitoxide.credentials.terminalPrompt"),
+        Some(false)
+    );
+    let transport = repo
+        .transport_options(
+            "https://fixture.invalid/repository.git".as_bytes().into(),
+            None,
+        )
+        .expect("resolve runtime HTTP transport policy")
+        .expect("HTTPS transport options");
+    let transport = transport
+        .downcast_ref::<gix::protocol::transport::client::blocking_io::http::Options>()
+        .expect("gix HTTP options");
+    assert_eq!(
+        transport.connect_timeout,
+        Some(std::time::Duration::from_secs(20))
+    );
+    assert_eq!(transport.low_speed_limit_bytes_per_second, 1024);
+    assert_eq!(transport.low_speed_time_seconds, 30);
 }

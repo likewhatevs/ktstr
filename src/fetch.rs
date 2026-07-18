@@ -13,14 +13,19 @@ use std::io::Read;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+use std::{hash::BuildHasher, hash::Hasher};
 
+use ::gix;
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use md5::{Digest as _, Md5};
 use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
+
+#[path = "../build_support/gix_policy.rs"]
+mod gix_policy;
 
 /// Process-wide [`reqwest::blocking::Client`] lazily initialized on
 /// first access via [`shared_client`]. Keeping a single `Client`
@@ -30,27 +35,43 @@ use sha2::{Digest, Sha256};
 /// re-handshake because reqwest's connection pool keys on host.
 static SHARED_CLIENT: OnceLock<Client> = OnceLock::new();
 
-/// Process interruption observed by in-process gix receive/checkout
-/// operations. cargo-ktstr's signal handler updates this through
-/// [`set_git_operation_interrupted`]; binaries retaining the default
-/// signal disposition terminate directly and do not need the bridge.
-static GIT_OPERATION_INTERRUPTED: std::sync::atomic::AtomicBool =
+/// Process interruption observed by every in-process source-acquisition
+/// operation. cargo-ktstr's signal handler updates this through the
+/// compatibility entry point [`set_git_operation_interrupted`]; binaries
+/// retaining the default signal disposition terminate directly and do not
+/// need the bridge.
+static SOURCE_OPERATION_INTERRUPTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Bridge a process-level signal epoch into in-process gix work.
+/// Bridge a process-level signal epoch into in-process source acquisition.
 ///
 /// This performs one atomic store and is safe to call from
-/// cargo-ktstr's SIGINT/SIGTERM handler. `false` starts a new guard
-/// epoch; `true` stops active and subsequent fetch/checkout work.
+/// cargo-ktstr's SIGINT/SIGTERM handler. `false` starts a new guard epoch;
+/// `true` stops active and subsequent HTTP request/backoff/read/extract work
+/// as well as gix ref-map/receive/checkout work.
 #[doc(hidden)]
 pub fn set_git_operation_interrupted(interrupted: bool) {
-    GIT_OPERATION_INTERRUPTED.store(interrupted, Ordering::SeqCst);
+    SOURCE_OPERATION_INTERRUPTED.store(interrupted, Ordering::SeqCst);
 }
 
-/// Read the process-level gix interruption bridge.
+/// Read the process-level source-acquisition interruption bridge.
 #[doc(hidden)]
 pub fn git_operation_interrupted() -> bool {
-    GIT_OPERATION_INTERRUPTED.load(Ordering::SeqCst)
+    SOURCE_OPERATION_INTERRUPTED.load(Ordering::SeqCst)
+}
+
+fn ensure_source_operation_not_interrupted(phase: &str) -> Result<()> {
+    if SOURCE_OPERATION_INTERRUPTED.load(Ordering::Acquire) {
+        anyhow::bail!("source acquisition interrupted {phase}");
+    }
+    Ok(())
+}
+
+fn interrupted_io_error(phase: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        format!("source acquisition interrupted {phase}"),
+    )
 }
 
 /// Connect-phase timeout for [`shared_client`]: bounds the time spent
@@ -653,6 +674,9 @@ impl<R: Read> DownloadStream<R> {
 
 impl<R: Read> Read for DownloadStream<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if SOURCE_OPERATION_INTERRUPTED.load(Ordering::Acquire) {
+            return Err(interrupted_io_error("before reading response body"));
+        }
         // Watchdog gate: trip BEFORE delegating to the inner reader
         // so a stalled inner read does not get a fresh chance to
         // run after the no-progress window has already expired. The
@@ -682,6 +706,13 @@ impl<R: Read> Read for DownloadStream<R> {
                 Ok(0)
             }
             Ok(n) => {
+                // A signal can land while the inner blocking read owns this
+                // thread. Reject the bytes before feeding a decoder, checksum,
+                // or destination file so the caller's transaction rolls back
+                // instead of publishing after cancellation.
+                if SOURCE_OPERATION_INTERRUPTED.load(Ordering::Acquire) {
+                    return Err(interrupted_io_error("while reading response body"));
+                }
                 self.sha256.update(&buf[..n]);
                 self.md5.update(&buf[..n]);
                 self.bytes_total += n as u64;
@@ -796,12 +827,14 @@ fn get_with_transient_retry(
 ) -> Result<reqwest::blocking::Response> {
     assert!(retry.attempts > 0, "HttpRetry.attempts must be >= 1");
     for attempt in 1..=retry.attempts {
+        ensure_source_operation_not_interrupted("before HTTP request")?;
         let mut req = client.get(url);
         if let Some(t) = timeout {
             req = req.timeout(t);
         }
         match req.send() {
             Ok(response) => {
+                ensure_source_operation_not_interrupted("after HTTP response headers")?;
                 let status = response.status();
                 if !is_transient_http_status(status) || attempt == retry.attempts {
                     return Ok(response);
@@ -823,9 +856,25 @@ fn get_with_transient_retry(
         }
         // Reached only on a transient failure with attempts left:
         // both match arms return on the final attempt.
-        std::thread::sleep(retry.backoff_unit * (1u32 << attempt));
+        source_operation_backoff(retry.backoff_unit * (1u32 << attempt))?;
     }
     unreachable!("the attempt == retry.attempts arms above return on the final iteration")
+}
+
+/// Sleep between HTTP attempts without making cancellation wait for the whole
+/// exponential-backoff interval. The 100 ms quantum matches the flock wait
+/// poller and is far below the shortest production backoff (2 s).
+fn source_operation_backoff(duration: Duration) -> Result<()> {
+    const QUANTUM: Duration = Duration::from_millis(100);
+    let deadline = Instant::now() + duration;
+    loop {
+        ensure_source_operation_not_interrupted("during HTTP retry backoff")?;
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+        std::thread::sleep((deadline - now).min(QUANTUM));
+    }
 }
 
 /// GET `url` through the process-wide [`shared_client`] with the
@@ -846,10 +895,7 @@ pub(crate) fn fetch_metadata_bytes(url: &str, what: &str) -> Result<Vec<u8>> {
     if !response.status().is_success() {
         anyhow::bail!("{what} {url}: HTTP {}", response.status());
     }
-    Ok(response
-        .bytes()
-        .with_context(|| format!("read body of {url}"))?
-        .to_vec())
+    read_response_bytes(response, url)
 }
 
 /// GET `url` like [`fetch_metadata_bytes`] but decode the body as
@@ -861,9 +907,8 @@ pub(crate) fn fetch_metadata_text(url: &str, what: &str) -> Result<String> {
     if !response.status().is_success() {
         anyhow::bail!("{what} {url}: HTTP {}", response.status());
     }
-    response
-        .text()
-        .with_context(|| format!("read body of {url}"))
+    let bytes = read_response_bytes(response, url)?;
+    String::from_utf8(bytes).with_context(|| format!("decode body of {url} as UTF-8"))
 }
 
 /// Construct the cdn.kernel.org `sha256sums.asc` URL for a stable
@@ -901,9 +946,22 @@ fn fetch_sha256sums_from_url(client: &Client, url: &str) -> Result<String> {
     if !response.status().is_success() {
         anyhow::bail!("fetch {url}: HTTP {}", response.status());
     }
-    response
-        .text()
-        .with_context(|| format!("read body of {url}"))
+    let bytes = read_response_bytes(response, url)?;
+    String::from_utf8(bytes).with_context(|| format!("decode body of {url} as UTF-8"))
+}
+
+/// Read a short HTTP response through the same cancellation-aware
+/// streaming adapter as large archives. Metadata endpoints do not need
+/// a visible byte bar, but they must observe the shared signal epoch
+/// before and after every blocking body read.
+fn read_response_bytes(response: reqwest::blocking::Response, url: &str) -> Result<Vec<u8>> {
+    let mut stream = DownloadStream::with_progress(response, None);
+    let mut bytes = Vec::new();
+    stream
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read body of {url}"))?;
+    ensure_source_operation_not_interrupted("after reading HTTP response body")?;
+    Ok(bytes)
 }
 
 /// Extract the SHA-256 hex digest for `target_filename` from the
@@ -1196,7 +1254,7 @@ fn download_stable_tarball_from_url(
     };
     status(&format!("{cli_label}: extracting tarball (xz)"));
     // Stage extraction inside `dest_dir` (same filesystem) so the
-    // final `fs::rename` into place is atomic and a verification
+    // final `RENAME_NOREPLACE` into place is atomic and a verification
     // failure leaves `dest_dir` untouched. A bad mirror that serves
     // a wrong-version archive — or sneaks stray top-level entries
     // alongside `linux-{version}/` — gets caught after extraction
@@ -1208,9 +1266,11 @@ fn download_stable_tarball_from_url(
     let stream = DownloadStream::with_progress(response, download_bar.as_ref().map(|b| b.bar()));
     let decoder = xz2::read::XzDecoder::new(stream);
     let mut archive = tar::Archive::new(decoder);
+    ensure_source_operation_not_interrupted("before extracting stable kernel tarball")?;
     archive
         .unpack(staging.path())
         .with_context(|| "extract tarball")?;
+    ensure_source_operation_not_interrupted("after extracting stable kernel tarball")?;
 
     // Recover the watchdog wrapper from inside the decoder/archive
     // chain to read the streaming digest. `into_inner` on tar +
@@ -1242,8 +1302,14 @@ fn download_stable_tarball_from_url(
         );
     }
 
-    let source_dir = promote_staged_kernel_tree(&staging, dest_dir, version)?;
-    Ok(source_dir)
+    ensure_source_operation_not_interrupted("before promoting stable kernel source")?;
+    let promoted = promote_staged_kernel_tree_transaction(&staging, dest_dir, version)?;
+    if let Err(err) =
+        ensure_source_operation_not_interrupted("after promoting stable kernel source")
+    {
+        return Err(promoted.rollback(err));
+    }
+    Ok(promoted.commit())
 }
 
 /// Verify a kernel tarball's staged extraction contains exactly one
@@ -1258,6 +1324,14 @@ fn promote_staged_kernel_tree(
     dest_dir: &Path,
     version: &str,
 ) -> Result<PathBuf> {
+    Ok(promote_staged_kernel_tree_transaction(staging, dest_dir, version)?.commit())
+}
+
+fn promote_staged_kernel_tree_transaction(
+    staging: &tempfile::TempDir,
+    dest_dir: &Path,
+    version: &str,
+) -> Result<PromotedPath> {
     let expected_name = format!("linux-{version}");
     let mut found_inner = false;
     for entry in std::fs::read_dir(staging.path()).with_context(|| "read staging dir entries")? {
@@ -1277,9 +1351,7 @@ fn promote_staged_kernel_tree(
     }
     let inner = staging.path().join(&expected_name);
     let source_dir = dest_dir.join(&expected_name);
-    std::fs::rename(&inner, &source_dir)
-        .with_context(|| format!("rename {} -> {}", inner.display(), source_dir.display()))?;
-    Ok(source_dir)
+    promote_path_noreplace(&inner, &source_dir, PublishedPathKind::Directory)
 }
 
 /// Promote the single top-level directory a codeload archive extracts
@@ -1303,6 +1375,14 @@ fn promote_single_kernel_tree(
     dest_dir: &Path,
     canonical: &str,
 ) -> Result<PathBuf> {
+    Ok(promote_single_kernel_tree_transaction(staging, dest_dir, canonical)?.commit())
+}
+
+fn promote_single_kernel_tree_transaction(
+    staging: &tempfile::TempDir,
+    dest_dir: &Path,
+    canonical: &str,
+) -> Result<PromotedPath> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(staging.path()).with_context(|| "read staging dir entries")? {
         entries.push(entry.with_context(|| "iterate staging dir entry")?);
@@ -1317,7 +1397,7 @@ fn promote_single_kernel_tree(
     // Use the DIRECTORY-ENTRY file type (does NOT follow symlinks) so a
     // top-level symlink-to-directory is rejected rather than promoted:
     // `Path::is_dir()` would follow the link and accept an
-    // attacker-chosen target, and `fs::rename` moves the symlink itself
+    // attacker-chosen target, and renameat2 moves the symlink itself
     // (it never dereferences), leaving the build reading through it.
     let entry_type = entries[0]
         .file_type()
@@ -1329,9 +1409,104 @@ fn promote_single_kernel_tree(
         );
     }
     let source_dir = dest_dir.join(canonical);
-    std::fs::rename(&inner, &source_dir)
-        .with_context(|| format!("rename {} -> {}", inner.display(), source_dir.display()))?;
-    Ok(source_dir)
+    promote_path_noreplace(&inner, &source_dir, PublishedPathKind::Directory)
+}
+
+#[derive(Clone, Copy)]
+enum PublishedPathKind {
+    File,
+    Directory,
+}
+
+struct PromotedPath {
+    path: PathBuf,
+    kind: PublishedPathKind,
+    committed: bool,
+}
+
+impl PromotedPath {
+    fn commit(mut self) -> PathBuf {
+        self.committed = true;
+        self.path.clone()
+    }
+
+    fn rollback(mut self, primary: anyhow::Error) -> anyhow::Error {
+        match self.remove() {
+            Ok(()) => primary,
+            Err(rollback_err) => primary.context(format!(
+                "also failed to roll back transaction-owned publication {}: {rollback_err}",
+                self.path.display()
+            )),
+        }
+    }
+
+    fn remove(&mut self) -> std::io::Result<()> {
+        let result = match self.kind {
+            PublishedPathKind::File => std::fs::remove_file(&self.path),
+            PublishedPathKind::Directory => std::fs::remove_dir_all(&self.path),
+        };
+        if result.is_ok()
+            || result
+                .as_ref()
+                .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+        {
+            self.committed = true;
+            Ok(())
+        } else {
+            result
+        }
+    }
+}
+
+impl Drop for PromotedPath {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.remove();
+        }
+    }
+}
+
+/// Atomically publish a transaction-owned path without replacing an
+/// existing destination. A signal landing across the rename removes
+/// only the path this successful `RENAME_NOREPLACE` created; failure to
+/// roll it back is attached to the cancellation error instead of being
+/// silently discarded.
+fn promote_path_noreplace(
+    staged: &Path,
+    destination: &Path,
+    kind: PublishedPathKind,
+) -> Result<PromotedPath> {
+    ensure_source_operation_not_interrupted("before publishing acquired source")?;
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        staged,
+        rustix::fs::CWD,
+        destination,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|err| {
+        anyhow!(
+            "renameat2(RENAME_NOREPLACE) {} -> {}: {err}",
+            staged.display(),
+            destination.display()
+        )
+    })?;
+
+    if let Err(interrupted) =
+        ensure_source_operation_not_interrupted("after publishing acquired source")
+    {
+        let promoted = PromotedPath {
+            path: destination.to_path_buf(),
+            kind,
+            committed: false,
+        };
+        return Err(promoted.rollback(interrupted));
+    }
+    Ok(PromotedPath {
+        path: destination.to_path_buf(),
+        kind,
+        committed: false,
+    })
 }
 
 /// Download an RC kernel tarball (.tar.gz) from git.kernel.org.
@@ -1393,9 +1568,11 @@ fn download_rc_tarball(
     let stream = DownloadStream::with_progress(response, download_bar.as_ref().map(|b| b.bar()));
     let decoder = flate2::read::GzDecoder::new(stream);
     let mut archive = tar::Archive::new(decoder);
+    ensure_source_operation_not_interrupted("before extracting RC kernel tarball")?;
     archive
         .unpack(staging.path())
         .with_context(|| "extract tarball")?;
+    ensure_source_operation_not_interrupted("after extracting RC kernel tarball")?;
 
     // Surface the streamed digest as a warning. RC tarballs have
     // no upstream manifest, so verification is impossible — but
@@ -1417,15 +1594,19 @@ fn download_rc_tarball(
          {bytes_total} bytes is unverified",
     );
 
-    let source_dir = promote_staged_kernel_tree(&staging, dest_dir, version)?;
-    Ok(source_dir)
+    ensure_source_operation_not_interrupted("before promoting RC kernel source")?;
+    let promoted = promote_staged_kernel_tree_transaction(&staging, dest_dir, version)?;
+    if let Err(err) = ensure_source_operation_not_interrupted("after promoting RC kernel source") {
+        return Err(promoted.rollback(err));
+    }
+    Ok(promoted.commit())
 }
 
 /// Download a GitHub source snapshot for `git_ref` as a codeload
-/// `tar.gz` and extract it, returning an [`AcquiredSource`] keyed
-/// identically to the clone path ([`git_cache_key`] over the resolved
-/// `commit_hash`) so a codeload-acquired kernel and a clone-acquired
-/// one of the same commit share the cache entry.
+/// `tar.gz` and extract it, returning an [`AcquiredSource`] keyed as an
+/// explicit immutable-SHA snapshot ([`git_cache_key`] over the resolved
+/// `commit_hash`). Archive SHA, branch, and tag identities remain
+/// distinct even when they currently point at the same commit.
 ///
 /// GitHub serves a gzip snapshot for any tag/branch/commit via
 /// codeload; the caller supplies the `archive_url`
@@ -1509,9 +1690,11 @@ pub(crate) fn download_github_archive(
     let stream = DownloadStream::with_progress(response, download_bar.as_ref().map(|b| b.bar()));
     let decoder = flate2::read::GzDecoder::new(stream);
     let mut archive = tar::Archive::new(decoder);
+    ensure_source_operation_not_interrupted("before extracting GitHub snapshot")?;
     archive
         .unpack(staging.path())
         .with_context(|| "extract snapshot")?;
+    ensure_source_operation_not_interrupted("after extracting GitHub snapshot")?;
 
     // Drain the watchdog to read the streamed digest. codeload has no
     // published manifest, so the digest cannot be verified — log it so
@@ -1534,18 +1717,30 @@ pub(crate) fn download_github_archive(
     // Name the promoted tree by the resolved commit so distinct refs
     // never collide in `dest_dir` (the tree is temporary — `is_temp`).
     let canonical = format!("linux-git-{short_hash}");
-    let source_dir = promote_single_kernel_tree(&staging, dest_dir, &canonical)?;
+    ensure_source_operation_not_interrupted("before promoting GitHub snapshot")?;
+    let promoted = promote_single_kernel_tree_transaction(&staging, dest_dir, &canonical)?;
+    if let Err(err) = ensure_source_operation_not_interrupted("after promoting GitHub snapshot") {
+        return Err(promoted.rollback(err));
+    }
+    let source_dir = promoted.path.clone();
+    ensure_source_operation_not_interrupted("before reading GitHub snapshot metadata")?;
     let version = read_makefile_version(&source_dir);
+    if let Err(err) =
+        ensure_source_operation_not_interrupted("after reading GitHub snapshot metadata")
+    {
+        return Err(promoted.rollback(err));
+    }
 
     let acquired = AcquiredSource {
         source_dir,
-        cache_key: git_cache_key(git_ref, commit_hash),
+        cache_key: git_cache_key(crate::kernel_path::GitRefKind::Sha, git_ref, commit_hash),
         version,
         kernel_source: crate::cache::KernelSource::git(short_hash, git_ref),
         is_temp: true,
         is_dirty: false,
         is_git: true,
     };
+    let _source_dir = promoted.commit();
     snapshot_progress.finish();
     Ok(acquired)
 }
@@ -1599,15 +1794,17 @@ pub fn download_tarball(
                 // version simply does not exist — surface the friendly
                 // "not found" suggestion (with the latest in-series patch)
                 // instead of a cryptic fetch failure.
-                let Some(commit_hash) = resolve_ref_commit(
+                let Some(commit_id) = resolve_ref_commit(
                     STABLE_MIRROR_URL,
                     &tag,
                     crate::kernel_path::GitRefKind::Tag,
                     cli_label,
                     mp,
-                ) else {
+                )?
+                else {
                     anyhow::bail!("{}", version_not_found_msg(client, version));
                 };
+                let commit_hash = format!("{commit_id}");
                 let archive_url = github_archive_url(STABLE_MIRROR_URL, &commit_hash)
                     .expect("STABLE_MIRROR_URL is a github.com URL");
                 let msg = format!(
@@ -1732,25 +1929,45 @@ fn download_verified_file_with_checksum(
     print_download_size(&response, url, cli_label, mp);
     let total = response.content_length();
     let download_bar = mp.map(|fp| fp.download_bar(label, total));
-    let mut stream =
-        DownloadStream::with_progress(response, download_bar.as_ref().map(|b| b.bar()));
-    let mut file =
-        std::fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
-    std::io::copy(&mut stream, &mut file)
-        .with_context(|| format!("stream {url} to {}", dest.display()))?;
-    if let Some(bar) = &download_bar {
-        bar.finish();
-    }
-    match checksum {
-        DownloadChecksum::Sha256(expected) => {
-            let (actual, _bytes) = stream.finalize();
-            verify_sha256(&actual, expected, url)?;
+    let parent = dest
+        .parent()
+        .ok_or_else(|| anyhow!("download destination has no parent: {}", dest.display()))?;
+    let staging = tempfile::TempDir::new_in(parent)
+        .with_context(|| format!("create download staging directory in {}", parent.display()))?;
+    let staged_file = staging.path().join("artifact");
+    let staged_result = (|| -> Result<()> {
+        let mut stream =
+            DownloadStream::with_progress(response, download_bar.as_ref().map(|b| b.bar()));
+        let mut file = std::fs::File::create(&staged_file)
+            .with_context(|| format!("create {}", staged_file.display()))?;
+        std::io::copy(&mut stream, &mut file)
+            .with_context(|| format!("stream {url} to {}", staged_file.display()))?;
+        ensure_source_operation_not_interrupted("after writing downloaded artifact")?;
+        if let Some(bar) = &download_bar {
+            bar.finish();
         }
-        DownloadChecksum::Md5Base64(expected) => {
-            let (actual, _bytes) = stream.finalize_md5_base64();
-            verify_md5_base64(&actual, expected, url)?;
+        match checksum {
+            DownloadChecksum::Sha256(expected) => {
+                let (actual, _bytes) = stream.finalize();
+                verify_sha256(&actual, expected, url)?;
+            }
+            DownloadChecksum::Md5Base64(expected) => {
+                let (actual, _bytes) = stream.finalize_md5_base64();
+                verify_md5_base64(&actual, expected, url)?;
+            }
         }
+        drop(file);
+        Ok(())
+    })();
+    if let Err(err) = staged_result {
+        return Err(close_private_staging(staging, err));
     }
+    let promoted = match promote_path_noreplace(&staged_file, dest, PublishedPathKind::File) {
+        Ok(promoted) => promoted,
+        Err(err) => return Err(close_private_staging(staging, err)),
+    };
+    drop(staging);
+    promoted.commit();
     Ok(())
 }
 
@@ -1799,7 +2016,8 @@ pub(crate) fn fetch_releases(client: &Client, url: &str) -> Result<Vec<Release>>
     if !response.status().is_success() {
         anyhow::bail!("fetch {url}: HTTP {}", response.status());
     }
-    let body = response.text().with_context(|| "read response body")?;
+    let body = String::from_utf8(read_response_bytes(response, url)?)
+        .with_context(|| "decode response body as UTF-8")?;
     parse_releases_body(&body)
 }
 
@@ -2074,7 +2292,7 @@ pub(crate) fn cached_stable_tags() -> Option<&'static [String]> {
     if let Some(tags) = STABLE_TAGS_CACHE.get() {
         return Some(tags.as_slice());
     }
-    let refs = ls_remote_refs(STABLE_MIRROR_URL, "ktstr: stable release tags")?;
+    let refs = ls_remote_refs(STABLE_MIRROR_URL, "ktstr: stable release tags").ok()?;
     let tags: Vec<String> = refs
         .iter()
         .filter_map(|r| {
@@ -2095,16 +2313,18 @@ pub(crate) fn cached_stable_tags() -> Option<&'static [String]> {
     STABLE_TAGS_CACHE.get().map(|v| v.as_slice())
 }
 
-/// Cache key for a git-cloned kernel: the raw user ref verbatim, the
-/// resolved commit's FULL hash, the target arch, and the
-/// kconfig-fragment suffix. The SINGLE construction site, shared by all
-/// three sharers of a commit's cache entry: [`git_clone`] (post-clone,
-/// from `head_id`), `download_github_archive` (post-download, keyed on
-/// the resolved commit), and the pre-fetch ls-remote cache probe in
-/// `resolve_git_kernel` — a drift between any of them would make the
-/// probe miss the entry the fetch wrote and defeat the fetch-skip, and
-/// split the codeload and clone paths onto separate entries for one
-/// commit.
+/// Cache key for a git-acquired kernel: the explicit ref kind, a
+/// fixed-seed ahash of the length-delimited raw ref bytes, the resolved
+/// commit's full hash, the target arch, and the kconfig-fragment suffix.
+///
+/// The kind is part of the identity because `#tag=next`,
+/// `#branch=next`, and `#sha=...` are distinct acquisition contracts
+/// even when they currently resolve to the same commit. Hashing the raw
+/// bytes avoids both filesystem-hostile ref spellings and collisions
+/// introduced by sanitizing (`a/b` versus `a_b`) while keeping the
+/// cache key well below `NAME_MAX`. The zero-seeded ahash matches
+/// ktstr's other fast content-addressed caches; this is an identity
+/// accelerator, not a cryptographic integrity boundary.
 ///
 /// The FULL 40-hex commit hash keys the entry (not a 7-hex prefix): a
 /// branch/tag tip moves over time, so the `{git_ref}` segment alone
@@ -2114,37 +2334,30 @@ pub(crate) fn cached_stable_tags() -> Option<&'static [String]> {
 /// the wrong kernel build under the new ref. The full id removes that
 /// collision class; the probe and clone both render full lowercase hex
 /// before any truncation, so keying on it is drift-free.
-pub(crate) fn git_cache_key(git_ref: &str, commit_hash: &str) -> String {
+pub(crate) fn git_cache_key(
+    ref_kind: crate::kernel_path::GitRefKind,
+    git_ref: &str,
+    commit_hash: &str,
+) -> String {
+    use crate::kernel_path::GitRefKind;
+
     let (arch, _) = arch_info();
-    // Sanitize the ref segment so no ref can produce a key
-    // validate_cache_key (cache::housekeeping) rejects: it rejects `/`,
-    // `\`, `..`, a NUL byte, and a leading `.`. A slashed branch ref
-    // (e.g. `for-next/core`) or a dot-prefixed ref (`.foo`) would
-    // otherwise be uncacheable verbatim and break both the pre-fetch
-    // probe lookup and the store. The full commit_hash already makes
-    // the key unique, so collapsing several refs onto one sanitized
-    // prefix is safe — two refs at the same commit want the same build;
-    // two at different commits differ in the hash segment.
-    let safe_ref: String = git_ref
-        .chars()
-        .map(|c| {
-            if c == '/' || c == '\\' || c == '\0' {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-    let safe_ref = safe_ref.replace("..", "__");
-    // A leading `.` (hidden entry, `.` / `..`) is rejected by
-    // validate_cache_key; prefix `_` so a `.foo` ref stays cacheable.
-    let safe_ref = if safe_ref.starts_with('.') {
-        format!("_{safe_ref}")
-    } else {
-        safe_ref
+    let (kind_name, kind_byte) = match ref_kind {
+        GitRefKind::Tag => ("tag", 0u8),
+        GitRefKind::Branch => ("branch", 1u8),
+        GitRefKind::Sha => ("sha", 2u8),
+        GitRefKind::Unknown => ("unknown", 3u8),
     };
+    let canonical_ref = (ref_kind == GitRefKind::Sha).then(|| git_ref.to_ascii_lowercase());
+    let ref_bytes = canonical_ref.as_deref().unwrap_or(git_ref).as_bytes();
+    let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
+    hasher.write(&[kind_byte]);
+    hasher.write(&(ref_bytes.len() as u64).to_le_bytes());
+    hasher.write(ref_bytes);
+    let ref_hash = hasher.finish();
     format!(
-        "{safe_ref}-git-{commit_hash}-{arch}-kc{}",
+        "git-{kind_name}-{ref_hash:016x}-{}-{arch}-kc{}",
+        commit_hash.to_ascii_lowercase(),
         crate::cache_key_suffix()
     )
 }
@@ -2158,12 +2371,10 @@ pub(crate) fn git_cache_key(git_ref: &str, commit_hash: &str) -> String {
 /// (self-hosted / GitLab / …), where commit-SHA acquisition is not
 /// supported.
 ///
-/// The caller resolves the ref to `commit_hash` FIRST (a kind-directed
-/// ls-remote; a sha is already the commit), so the download fetches the
-/// EXACT commit the cache entry is keyed on — a branch tip that
-/// advances between the ls-remote probe and this GET cannot mislabel
-/// the entry the way a ref-name snapshot would. `commit_hash` is
-/// lowercased to align with `git_cache_key`'s hash segment.
+/// The caller supplies an immutable `commit_hash` (an explicit SHA, or
+/// the strict stable-tag fallback's resolved commit), so the download
+/// fetches the exact commit the cache/source record names.
+/// `commit_hash` is lowercased to align with `git_cache_key`.
 ///
 /// Accepts the https/http/ssh/git and scp-style GitHub remotes, each
 /// with an optional trailing `/` and `.git`; the host is matched
@@ -2248,34 +2459,44 @@ fn pick_ref_object(
 }
 
 /// Resolve `git_ref` to its full commit hash under `ref_kind`, via a
-/// kind-directed exact-ref discovery. This happens before acquisition
-/// so [`resolve_git_kernel`](crate::cli::resolve_git_kernel) can probe
-/// [`git_cache_key`] without fetching a pack. An explicit SHA also
-/// supplies the identity required by its archive snapshot, which has no
-/// checked-out `.git` from which to recover a commit.
+/// kind-directed exact-ref discovery. This standalone helper serves
+/// stable-tag fallback and metadata callers that genuinely need
+/// ls-remote semantics. Normal branch/tag acquisition instead reads the
+/// peeled id from its single receive `Prepare`, avoiding a second
+/// handshake. An explicit SHA resolves offline.
 ///
 /// A `Sha` ref IS the commit (lowercased to match `git_clone`'s
 /// rendering) and resolves offline — no handshake. `Tag`/`Branch`
 /// match ONLY the fully-qualified `refs/tags/{ref}` / `refs/heads/{ref}`
 /// so a tag never aliases a same-named branch (a bare-name DWIM lookup
-/// would resolve either). `None` on
-/// ls-remote failure, no match, or `Unknown` (rejected by
-/// [`crate::kernel_path::KernelId::validate`] upstream, so it is never
-/// resolved).
+/// would resolve either). `Ok(None)` means the exact ref was not
+/// advertised or the kind is `Unknown`. Transport, authentication,
+/// protocol, and cancellation failures propagate to the caller.
 pub(crate) fn resolve_ref_commit(
     url: &str,
     git_ref: &str,
     ref_kind: crate::kernel_path::GitRefKind,
     cli_label: &str,
     mp: Option<&crate::cli::FetchProgress>,
-) -> Option<String> {
+) -> Result<Option<gix::ObjectId>> {
     use crate::kernel_path::GitRefKind;
     let target = match ref_kind {
-        GitRefKind::Sha => return Some(git_ref.to_ascii_lowercase()),
+        GitRefKind::Sha => {
+            let canonical = git_ref.to_ascii_lowercase();
+            return gix::ObjectId::from_hex(canonical.as_bytes())
+                .with_context(|| format!("parse explicit git commit {git_ref}"))
+                .map(Some);
+        }
         GitRefKind::Tag => format!("refs/tags/{git_ref}"),
         GitRefKind::Branch => format!("refs/heads/{git_ref}"),
-        GitRefKind::Unknown => return None,
+        GitRefKind::Unknown => return Ok(None),
     };
+    match gix_policy::classify_source(url).map_err(anyhow::Error::msg)? {
+        gix_policy::InProcessSource::Local(path) => {
+            return resolve_local_ref_commit(&path, &target, &SOURCE_OPERATION_INTERRUPTED);
+        }
+        gix_policy::InProcessSource::Http | gix_policy::InProcessSource::Https => {}
+    }
     let progress_label = format!("{cli_label}: {git_ref}");
     let ref_progress = match mp {
         Some(fp) => fp.operation_progress(&progress_label, "resolving git ref", "ref discovery"),
@@ -2285,25 +2506,48 @@ pub(crate) fn resolve_ref_commit(
             "ref discovery",
         ),
     };
-    let refs = match discover_remote_refs(
+    let refs = discover_remote_refs(
         url,
         Some(&target),
         &ref_progress,
-        &GIT_OPERATION_INTERRUPTED,
-    ) {
-        Ok(refs) => refs,
-        Err(_) => return None,
-    };
-    let object = pick_ref_object(&refs, &target).map(|object| format!("{object}"));
+        &SOURCE_OPERATION_INTERRUPTED,
+    )?;
+    let object = pick_ref_object(&refs, &target);
     ref_progress.finish();
-    object
+    Ok(object)
+}
+
+fn resolve_local_ref_commit(
+    repository_path: &Path,
+    target: &str,
+    interrupt: &std::sync::atomic::AtomicBool,
+) -> Result<Option<gix::ObjectId>> {
+    ensure_git_operation_not_interrupted(interrupt, "before opening local repository")?;
+    let repo = gix::open_opts(repository_path, anon_open_opts())
+        .with_context(|| format!("open local source repository {}", repository_path.display()))?;
+    ensure_git_operation_not_interrupted(interrupt, "after opening local repository")?;
+    let Some(mut reference) = repo
+        .try_find_reference(target)
+        .with_context(|| format!("find local source ref {target}"))?
+    else {
+        return Ok(None);
+    };
+    let commit_id = reference
+        .peel_to_commit()
+        .with_context(|| format!("peel local source ref {target} to a commit"))?
+        .id;
+    #[cfg(test)]
+    if TEST_INTERRUPT_AFTER_REF_DISCOVERY.swap(false, Ordering::AcqRel) {
+        interrupt.store(true, Ordering::Release);
+    }
+    ensure_git_operation_not_interrupted(interrupt, "after reading local ref")?;
+    Ok(Some(commit_id))
 }
 
 /// ls-remote `url` and return EVERY advertised ref WITHOUT fetching a
-/// pack. Best-effort: `None` on any failure (network, auth). Shared by
-/// [`resolve_ref_commit`] (resolve one kind-directed ref → commit),
-/// [`cached_stable_tags`], and [`latest_patch_from_git_tags`] (highest
-/// `v{prefix}.{patch}` tag).
+/// pack. Callers decide explicitly whether failure is fatal:
+/// correctness-sensitive resolution propagates it, while optional
+/// historical-tag enrichment degrades with `.ok()`.
 ///
 /// The ad-hoc repo (`init_opts` on a tempdir, with repo-local git config
 /// only — see `anon_open_opts`) carries no working tree and fetches no
@@ -2315,15 +2559,15 @@ pub(crate) fn resolve_ref_commit(
 /// would return TAGS ONLY and `refs/heads/*` would never arrive.
 /// Disabling the filter returns all refs, so a branch, tag, or HEAD
 /// all resolve.
-fn ls_remote_refs(url: &str, progress_label: &str) -> Option<Vec<gix::protocol::handshake::Ref>> {
+fn ls_remote_refs(url: &str, progress_label: &str) -> Result<Vec<gix::protocol::handshake::Ref>> {
     let ref_progress = crate::cli::progress::CloneProgress::standalone_operation(
         progress_label,
         "resolving git refs",
         "ref discovery",
     );
-    let refs = discover_remote_refs(url, None, &ref_progress, &GIT_OPERATION_INTERRUPTED).ok()?;
+    let refs = discover_remote_refs(url, None, &ref_progress, &SOURCE_OPERATION_INTERRUPTED)?;
     ref_progress.finish();
-    Some(refs)
+    Ok(refs)
 }
 
 /// Discover either one exact fully-qualified ref or the remote's full
@@ -2343,6 +2587,13 @@ fn discover_remote_refs(
     interrupt: &std::sync::atomic::AtomicBool,
 ) -> Result<Vec<gix::protocol::handshake::Ref>> {
     ensure_git_operation_not_interrupted(interrupt, "before preparing ref discovery")?;
+    match gix_policy::classify_source(url).map_err(anyhow::Error::msg)? {
+        gix_policy::InProcessSource::Http | gix_policy::InProcessSource::Https => {}
+        gix_policy::InProcessSource::Local(path) => anyhow::bail!(
+            "local ref discovery must open {} directly instead of constructing a remote transport",
+            path.display()
+        ),
+    }
     let tmp = tempfile::TempDir::new().with_context(|| "create ref discovery staging dir")?;
     ensure_git_operation_not_interrupted(interrupt, "after preparing ref discovery")?;
     let repo = gix::ThreadSafeRepository::init_opts(
@@ -2397,38 +2648,10 @@ fn discover_remote_refs(
     Ok(refmap.remote_refs)
 }
 
-/// Open options for ktstr's git fetches: load ONLY repo-local git
-/// config, never the user (`~/.gitconfig`), XDG, system
-/// (`/etc/gitconfig`), or `GIT_CONFIG_*` env sources. This neutralizes a
-/// `url.<base>.insteadOf` rewrite (e.g. a developer rule mapping
-/// `https://github.com/` to `git@github.com:`) that would otherwise
-/// route an anonymous public fetch through SSH and prompt for the key
-/// passphrase once per operation — several at once under the concurrent
-/// intra-range kernel resolution. Environment permissions stay at the
-/// Full-trust default so an `http(s)_proxy` env var still applies.
-///
-/// SCOPE: these opts govern EVERY gix remote path — the internal version
-/// resolution (`ls_remote_refs` and its callers) AND every user-supplied
-/// `git+URL` clone via `git_clone_inner`, including a self-hosted
-/// `git+https://...` source. The tradeoff is deliberate: a PUBLIC source
-/// (the common case — kernel.org / gregkh / torvalds mirrors) fetches
-/// anonymously with no credential prompt, and a PRIVATE source must use a
-/// `git+ssh://user@host/repo` URL (SSH authenticates via `~/.ssh`,
-/// independent of gitconfig). gitconfig-driven auth (an `insteadOf`
-/// HTTPS->SSH rewrite plus credential/`git_binary` config) is
-/// intentionally NOT honored, so it can never silently reroute an
-/// anonymous fetch through SSH. The ad-hoc temp repos carry no local
-/// config, so the effective URL-rewrite set is empty: the passed URL is
-/// used verbatim.
+/// Shared hermetic options for runtime ref discovery, remote acquisition,
+/// and directly opened local repositories.
 fn anon_open_opts() -> gix::open::Options {
-    use gix::sec::trust::DefaultForLevel;
-    let mut opts = gix::open::Options::default_for_level(gix::sec::Trust::Full);
-    opts.permissions.config.system = false;
-    opts.permissions.config.git = false;
-    opts.permissions.config.user = false;
-    opts.permissions.config.env = false;
-    opts.permissions.config.git_binary = false;
-    opts
+    gix_policy::open_options()
 }
 
 /// Shallow-clone a git repository at a BRANCH ref.
@@ -2549,6 +2772,66 @@ fn git_clone_inner(
     cli_label: &str,
     mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<AcquiredSource> {
+    match git_clone_inner_gated(url, git_ref, ref_kind, dest_dir, cli_label, mp, |_| {
+        Ok(ExactRefGate::Fetch(()))
+    })? {
+        GitCloneOutcome::Fetched { acquired, .. } => Ok(acquired),
+        GitCloneOutcome::Skipped { .. } => unreachable!("unconditional clone cannot skip"),
+    }
+}
+
+pub(crate) enum GitCloneOutcome<T> {
+    Fetched { acquired: AcquiredSource, token: T },
+    Skipped { commit_hash: String, token: T },
+}
+
+/// Exact branch/tag acquisition with a cache/election callback executed
+/// after the single gix ref-map and before receive. Used by
+/// `resolve_git_kernel` to avoid a separate discovery handshake.
+pub(crate) fn git_clone_kinded_gated<T>(
+    url: &str,
+    git_ref: &str,
+    ref_kind: crate::kernel_path::GitRefKind,
+    dest_dir: &Path,
+    cli_label: &str,
+    mp: Option<&crate::cli::FetchProgress>,
+    gate: impl FnOnce(gix::ObjectId) -> Result<ExactRefGate<T>>,
+) -> Result<GitCloneOutcome<T>> {
+    use crate::kernel_path::GitRefKind;
+    match ref_kind {
+        GitRefKind::Branch | GitRefKind::Tag => {
+            git_clone_inner_gated(url, git_ref, ref_kind, dest_dir, cli_label, mp, gate)
+        }
+        GitRefKind::Sha => anyhow::bail!(
+            "git+{url}#sha={git_ref}: fetching this source by commit sha is \
+             not supported — use a github.com/OWNER/REPO URL or pin a \
+             #tag= / #branch= instead"
+        ),
+        GitRefKind::Unknown => anyhow::bail!(
+            "git+{url}: ref kind could not be determined; use #tag=NAME, \
+             #branch=NAME, or #sha=<40-hex>"
+        ),
+    }
+}
+
+fn close_private_staging(staging: tempfile::TempDir, primary: anyhow::Error) -> anyhow::Error {
+    match staging.close() {
+        Ok(()) => primary,
+        Err(cleanup_err) => primary.context(format!(
+            "also failed to remove private source-acquisition staging directory: {cleanup_err}"
+        )),
+    }
+}
+
+fn git_clone_inner_gated<T>(
+    url: &str,
+    git_ref: &str,
+    ref_kind: crate::kernel_path::GitRefKind,
+    dest_dir: &Path,
+    cli_label: &str,
+    mp: Option<&crate::cli::FetchProgress>,
+    gate: impl FnOnce(gix::ObjectId) -> Result<ExactRefGate<T>>,
+) -> Result<GitCloneOutcome<T>> {
     let cloning = format!("{cli_label}: cloning {url} (ref: {git_ref}, depth: 1)");
     match mp {
         Some(fp) => fp.println(&cloning),
@@ -2556,6 +2839,8 @@ fn git_clone_inner(
     }
 
     let clone_dir = dest_dir.join("linux");
+    let staging = tempfile::TempDir::new_in(dest_dir)
+        .with_context(|| format!("create private clone staging dir in {}", dest_dir.display()))?;
 
     // Drive a determinate clone bar from gix's progress tree (see
     // [`crate::cli::progress::CloneProgress`]). A shared group renders
@@ -2572,22 +2857,29 @@ fn git_clone_inner(
             "clone",
         ),
     };
-    let commit_id = match fetch_exact_ref_and_checkout(
+    let fetched = match fetch_exact_ref_and_checkout_gated(
         url,
         git_ref,
         ref_kind,
-        &clone_dir,
+        staging.path(),
         Some(&clone_progress),
-        &GIT_OPERATION_INTERRUPTED,
+        &SOURCE_OPERATION_INTERRUPTED,
+        gate,
     ) {
-        Ok(id) => id,
+        Ok(outcome) => outcome,
         Err(err) => {
-            // `PrepareCheckout` used to own this rollback. The exact-ref
-            // path is assembled from lower-level gix operations, so keep
-            // the same all-or-nothing destination contract explicitly.
-            let _ = std::fs::remove_dir_all(&clone_dir);
-            return Err(err);
+            return Err(close_private_staging(staging, err));
         }
+    };
+    let (commit_id, token) = match fetched {
+        ExactRefFetch::Skipped { commit_id, token } => {
+            let commit_hash = format!("{commit_id}");
+            staging.close().with_context(
+                || "remove private clone staging directory after cache/election skip",
+            )?;
+            return Ok(GitCloneOutcome::Skipped { commit_hash, token });
+        }
+        ExactRefFetch::Fetched { commit_id, token } => (commit_id, token),
     };
 
     let acquired = (|| -> Result<AcquiredSource> {
@@ -2597,22 +2889,16 @@ fn git_clone_inner(
         // record.
         let commit_hash = format!("{commit_id}");
         let short_hash = commit_hash.chars().take(7).collect::<String>();
-        let cache_key = git_cache_key(git_ref, &commit_hash);
+        let cache_key = git_cache_key(ref_kind, git_ref, &commit_hash);
 
         // Record the kernel version from the checked-out source
         // Makefile, as local_source does. The filesystem read is the
         // final non-interruptible boundary after index publication, so
         // observe the shared epoch on both sides before making this
         // source visible to the cache/build pipeline.
-        ensure_git_operation_not_interrupted(
-            &GIT_OPERATION_INTERRUPTED,
-            "before reading cloned source metadata",
-        )?;
-        let version = read_makefile_version(&clone_dir);
-        ensure_git_operation_not_interrupted(
-            &GIT_OPERATION_INTERRUPTED,
-            "after reading cloned source metadata",
-        )?;
+        ensure_source_operation_not_interrupted("before reading cloned source metadata")?;
+        let version = read_makefile_version(staging.path());
+        ensure_source_operation_not_interrupted("after reading cloned source metadata")?;
 
         Ok(AcquiredSource {
             source_dir: clone_dir.clone(),
@@ -2626,16 +2912,30 @@ fn git_clone_inner(
     })();
     match acquired {
         Ok(acquired) => {
-            // Every publication boundary is complete. Stop and join the
-            // reporter only on success; an error instead takes its Drop
-            // path and rolls the destination back below.
+            let promoted = match promote_path_noreplace(
+                staging.path(),
+                &clone_dir,
+                PublishedPathKind::Directory,
+            ) {
+                Ok(promoted) => promoted,
+                Err(err) => return Err(close_private_staging(staging, err)),
+            };
+            #[cfg(test)]
+            if TEST_INTERRUPT_AFTER_CLONE_PROMOTE.swap(false, Ordering::AcqRel) {
+                SOURCE_OPERATION_INTERRUPTED.store(true, Ordering::Release);
+            }
+            if let Err(err) = ensure_source_operation_not_interrupted("after promoting exact clone")
+            {
+                drop(staging);
+                return Err(promoted.rollback(err));
+            }
+            drop(staging);
+            let source_dir = promoted.commit();
+            debug_assert_eq!(source_dir, acquired.source_dir);
             clone_progress.finish();
-            Ok(acquired)
+            Ok(GitCloneOutcome::Fetched { acquired, token })
         }
-        Err(err) => {
-            let _ = std::fs::remove_dir_all(&clone_dir);
-            Err(err)
-        }
+        Err(err) => Err(close_private_staging(staging, err)),
     }
 }
 
@@ -2649,80 +2949,81 @@ fn git_clone_inner(
 /// count instead.
 const GIX_WORKERS_PER_OPERATION: usize = 8;
 
-/// Non-blocking pool of the *extra* workers shared by all gix fetches
-/// and checkouts in this process.
-///
-/// Every operation always has its calling thread and therefore always
-/// proceeds. It opportunistically leases currently-free extras, so
-/// concurrent clones cannot each create an eight-worker pool. With N
-/// simultaneous operations the process uses at most `budget + N - 1`
-/// workers: the shared extras plus one guaranteed caller per operation.
-/// No fetch is queued behind another.
-struct GixWorkerBudget {
-    extra_workers: AtomicUsize,
+/// Machine-wide, non-blocking lease for checkout's optional extra
+/// workers. Every checkout always has its calling thread. It then tries
+/// to flock up to seven numbered tokens in `KTSTR_LOCK_DIR` (or `/tmp`)
+/// and uses one worker per acquired token. Contending processes simply
+/// get fewer extras; no source acquisition is ever queued behind this
+/// performance optimization.
+struct GixCheckoutWorkerLease {
+    extra_workers: Vec<std::os::fd::OwnedFd>,
 }
 
-impl GixWorkerBudget {
-    const fn new(total_workers: usize) -> Self {
-        Self {
-            extra_workers: AtomicUsize::new(total_workers.saturating_sub(1)),
-        }
-    }
-
-    fn lease(&self) -> GixWorkerLease<'_> {
-        let mut available = self.extra_workers.load(Ordering::Acquire);
-        let leased = loop {
-            if available == 0 {
-                break 0;
-            }
-            match self.extra_workers.compare_exchange_weak(
-                available,
-                0,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break available,
-                Err(actual) => available = actual,
-            }
-        };
-        GixWorkerLease {
-            budget: self,
-            extra_workers: leased,
-        }
-    }
-}
-
-struct GixWorkerLease<'a> {
-    budget: &'a GixWorkerBudget,
-    extra_workers: usize,
-}
-
-impl GixWorkerLease<'_> {
-    fn workers(&self) -> usize {
-        1 + self.extra_workers
-    }
-}
-
-impl Drop for GixWorkerLease<'_> {
-    fn drop(&mut self) {
-        self.budget
-            .extra_workers
-            .fetch_add(self.extra_workers, Ordering::Release);
-    }
-}
-
-fn gix_worker_budget() -> &'static GixWorkerBudget {
-    static BUDGET: OnceLock<GixWorkerBudget> = OnceLock::new();
-    BUDGET.get_or_init(|| {
-        let host_workers = std::thread::available_parallelism()
+impl GixCheckoutWorkerLease {
+    fn acquire() -> Self {
+        let wanted = std::thread::available_parallelism()
             .map(usize::from)
-            .unwrap_or(1);
-        GixWorkerBudget::new(host_workers.min(GIX_WORKERS_PER_OPERATION))
-    })
+            .unwrap_or(1)
+            .min(GIX_WORKERS_PER_OPERATION)
+            .saturating_sub(1);
+        let lock_dir = crate::cache::resolve_lock_dir();
+        Self::acquire_in(&lock_dir, wanted)
+    }
+
+    fn acquire_in(lock_dir: &Path, wanted: usize) -> Self {
+        let wanted = wanted.min(GIX_WORKERS_PER_OPERATION.saturating_sub(1));
+        if let Err(err) = std::fs::create_dir_all(&lock_dir) {
+            tracing::warn!(
+                %err,
+                path = %lock_dir.display(),
+                "could not create gix worker-token directory; checkout will use its caller thread",
+            );
+            return Self {
+                extra_workers: Vec::new(),
+            };
+        }
+        let mut extra_workers = Vec::with_capacity(wanted);
+        // `wanted` is also the size of the machine-wide namespace.
+        // Scanning all seven ceiling slots on a two-CPU host would let
+        // seven processes each lease a different extra despite the
+        // host-wide budget being one.
+        for slot in 0..wanted {
+            if extra_workers.len() == wanted {
+                break;
+            }
+            let path = lock_dir.join(format!("ktstr-gix-checkout-worker-{slot}.lock"));
+            match crate::flock::try_flock(&path, crate::flock::FlockMode::Exclusive) {
+                Ok(Some(fd)) => extra_workers.push(fd),
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        path = %path.display(),
+                        "could not lease gix checkout worker token; continuing with fewer workers",
+                    );
+                }
+            }
+        }
+        Self { extra_workers }
+    }
+
+    fn workers(&self) -> usize {
+        1 + self.extra_workers.len()
+    }
 }
 
 /// Fetch one fully-qualified branch or tag at depth one and materialize
 /// its peeled commit into `clone_dir`.
+pub(crate) enum ExactRefGate<T> {
+    Fetch(T),
+    Skip(T),
+}
+
+enum ExactRefFetch<T> {
+    Fetched { commit_id: gix::ObjectId, token: T },
+    Skipped { commit_id: gix::ObjectId, token: T },
+}
+
 fn fetch_exact_ref_and_checkout(
     url: &str,
     git_ref: &str,
@@ -2731,6 +3032,32 @@ fn fetch_exact_ref_and_checkout(
     clone_progress: Option<&crate::cli::progress::CloneProgress>,
     interrupt: &std::sync::atomic::AtomicBool,
 ) -> Result<gix::ObjectId> {
+    match fetch_exact_ref_and_checkout_gated(
+        url,
+        git_ref,
+        ref_kind,
+        clone_dir,
+        clone_progress,
+        interrupt,
+        |_| Ok(ExactRefGate::Fetch(())),
+    )? {
+        ExactRefFetch::Fetched { commit_id, .. } => Ok(commit_id),
+        ExactRefFetch::Skipped { .. } => unreachable!("unconditional exact fetch cannot skip"),
+    }
+}
+
+/// Prepare one exact gix fetch, expose its advertised peeled commit to
+/// the caller before receiving a pack, and reuse that same `Prepare`
+/// when the caller wins the content-key builder election.
+fn fetch_exact_ref_and_checkout_gated<T>(
+    url: &str,
+    git_ref: &str,
+    ref_kind: crate::kernel_path::GitRefKind,
+    clone_dir: &Path,
+    clone_progress: Option<&crate::cli::progress::CloneProgress>,
+    interrupt: &std::sync::atomic::AtomicBool,
+    gate: impl FnOnce(gix::ObjectId) -> Result<ExactRefGate<T>>,
+) -> Result<ExactRefFetch<T>> {
     use crate::kernel_path::GitRefKind;
 
     let source_ref = match ref_kind {
@@ -2740,6 +3067,18 @@ fn fetch_exact_ref_and_checkout(
             anyhow::bail!("exact shallow fetch requires a branch or tag")
         }
     };
+    if let gix_policy::InProcessSource::Local(repository_path) =
+        gix_policy::classify_source(url).map_err(anyhow::Error::msg)?
+    {
+        return materialize_local_exact_ref_gated(
+            &repository_path,
+            &source_ref,
+            clone_dir,
+            clone_progress,
+            interrupt,
+            gate,
+        );
+    }
     // A fixed private destination means arbitrary valid branch/tag names
     // never have to be re-encoded as a local branch name.
     const FETCHED_REF: &str = "refs/ktstr/source";
@@ -2761,22 +3100,13 @@ fn fetch_exact_ref_and_checkout(
         .with_context(|| "configure fallback identity for clone reflog")?;
     ensure_git_operation_not_interrupted(interrupt, "after configuring clone identity")?;
 
-    // gix reads pack.threads from its borrowed Repository inside
-    // `Prepare::receive`, but Remote/Prepare borrow that Repository and
-    // expose no per-receive thread-limit setter. Configure the count
-    // before constructing Remote and hold the lease through receive.
-    // The lease itself is only an atomic counter: no worker threads or
-    // memory are allocated during connect/ref discovery. Keeping it
-    // reserved is required to ensure peers cannot configure the same
-    // extras and later oversubscribe while both packs are active.
-    let pack_workers = gix_worker_budget().lease();
+    // Pack indexing runs on the caller thread. Checkout separately
+    // leases machine-wide optional workers immediately before it starts;
+    // no worker token is held across connect or ref mapping.
     ensure_git_operation_not_interrupted(interrupt, "before configuring pack workers")?;
     repo.config_snapshot_mut()
-        .set_value(
-            &gix::config::tree::Pack::THREADS,
-            pack_workers.workers().to_string().as_str(),
-        )
-        .with_context(|| "configure gix pack worker budget")?;
+        .set_value(&gix::config::tree::Pack::THREADS, "1")
+        .with_context(|| "configure single-threaded gix pack indexing")?;
     ensure_git_operation_not_interrupted(interrupt, "after configuring pack workers")?;
 
     ensure_git_operation_not_interrupted(interrupt, "before preparing clone remote")?;
@@ -2813,11 +3143,34 @@ fn fetch_exact_ref_and_checkout(
             )
             .with_context(|| format!("map exact remote ref {source_ref}"))?,
     };
+    #[cfg(test)]
+    TEST_EXACT_PREPARE_COUNT.fetch_add(1, Ordering::AcqRel);
     ensure_git_operation_not_interrupted(interrupt, "after mapping exact remote ref")?;
     let prepare = prepare.with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
         NonZeroU32::new(1).expect("1 is nonzero"),
     ));
     ensure_git_operation_not_interrupted(interrupt, "after configuring shallow fetch")?;
+
+    // `Prepare` already owns the one connect + ref-map handshake. Read
+    // the exact mapping it will receive and elect/cache-probe before any
+    // pack bytes move; the winner continues with this same value.
+    let advertised_commit = prepare
+        .ref_map()
+        .mappings
+        .iter()
+        .find_map(|mapping| mapping.remote.peeled_id().map(ToOwned::to_owned))
+        .with_context(|| format!("remote did not advertise exact ref {source_ref}"))?;
+    ensure_git_operation_not_interrupted(interrupt, "before exact-ref cache election")?;
+    let token = match gate(advertised_commit)? {
+        ExactRefGate::Fetch(token) => token,
+        ExactRefGate::Skip(token) => {
+            return Ok(ExactRefFetch::Skipped {
+                commit_id: advertised_commit,
+                token,
+            });
+        }
+    };
+    ensure_git_operation_not_interrupted(interrupt, "after exact-ref cache election")?;
 
     ensure_git_operation_not_interrupted(interrupt, "before receiving the pack")?;
     match clone_progress {
@@ -2832,8 +3185,6 @@ fn fetch_exact_ref_and_checkout(
             .with_context(|| format!("fetch exact remote ref {source_ref}"))?,
     };
     ensure_git_operation_not_interrupted(interrupt, "after receiving the pack")?;
-    drop(pack_workers);
-
     ensure_git_operation_not_interrupted(interrupt, "before reading fetched ref")?;
     let mut fetched_ref = repo
         .find_reference(FETCHED_REF)
@@ -2858,6 +3209,12 @@ fn fetch_exact_ref_and_checkout(
         .with_context(|| format!("peel fetched ref {source_ref} to a commit"))?
         .id;
     ensure_git_operation_not_interrupted(interrupt, "after peeling exact source ref")?;
+    if commit_id != advertised_commit {
+        anyhow::bail!(
+            "exact ref {source_ref} changed during its single fetch handshake \
+             (advertised {advertised_commit}, received {commit_id})"
+        );
+    }
 
     // Both branch and tag clones are snapshots for ktstr, so a detached
     // HEAD is the uniform representation of the exact peeled commit.
@@ -2884,7 +3241,196 @@ fn fetch_exact_ref_and_checkout(
             checkout_exact_commit(&repo, commit_id, gix::progress::Discard, interrupt)?;
         }
     }
-    Ok(commit_id)
+    Ok(ExactRefFetch::Fetched { commit_id, token })
+}
+
+fn materialize_local_exact_ref_gated<T>(
+    repository_path: &Path,
+    source_ref: &str,
+    clone_dir: &Path,
+    clone_progress: Option<&crate::cli::progress::CloneProgress>,
+    interrupt: &std::sync::atomic::AtomicBool,
+    gate: impl FnOnce(gix::ObjectId) -> Result<ExactRefGate<T>>,
+) -> Result<ExactRefFetch<T>> {
+    const FETCHED_REF: &str = "refs/ktstr/source";
+
+    ensure_git_operation_not_interrupted(interrupt, "before opening local exact source")?;
+    let source = gix::open_opts(repository_path, anon_open_opts())
+        .with_context(|| format!("open local source repository {}", repository_path.display()))?;
+    ensure_git_operation_not_interrupted(interrupt, "after opening local exact source")?;
+    let mut reference = source
+        .find_reference(source_ref)
+        .with_context(|| format!("find local source ref {source_ref}"))?;
+    let unpeeled_id = reference.id().detach();
+    let commit_id = reference
+        .peel_to_commit()
+        .with_context(|| format!("peel local source ref {source_ref} to a commit"))?
+        .id;
+    ensure_git_operation_not_interrupted(interrupt, "before exact-ref cache election")?;
+    let token = match gate(commit_id)? {
+        ExactRefGate::Fetch(token) => token,
+        ExactRefGate::Skip(token) => {
+            return Ok(ExactRefFetch::Skipped { commit_id, token });
+        }
+    };
+    ensure_git_operation_not_interrupted(interrupt, "after exact-ref cache election")?;
+
+    let _copy_progress =
+        clone_progress.map(|progress| progress.item_named("copying local exact ref"));
+    ensure_git_operation_not_interrupted(interrupt, "before preparing local clone")?;
+    let repo = gix::ThreadSafeRepository::init_opts(
+        clone_dir,
+        gix::create::Kind::WithWorktree,
+        gix::create::Options::default(),
+        anon_open_opts(),
+    )
+    .with_context(|| "prepare local clone")?
+    .to_thread_local();
+    let _ = repo
+        .committer_or_set_generic_fallback()
+        .with_context(|| "configure fallback identity for local clone reflog")?;
+    ensure_git_operation_not_interrupted(interrupt, "before copying local exact objects")?;
+    copy_local_exact_ref_objects(&source, &repo, unpeeled_id, commit_id, interrupt)?;
+    ensure_git_operation_not_interrupted(interrupt, "after copying local exact objects")?;
+    drop(_copy_progress);
+
+    repo.reference(
+        FETCHED_REF,
+        unpeeled_id,
+        gix::refs::transaction::PreviousValue::Any,
+        "clone: stage exact local source ref",
+    )
+    .with_context(|| "stage exact local source ref")?;
+    repo.reference(
+        source_ref,
+        unpeeled_id,
+        gix::refs::transaction::PreviousValue::Any,
+        "clone: preserve exact local source ref",
+    )
+    .with_context(|| format!("preserve local source ref {source_ref}"))?;
+    repo.reference(
+        "HEAD",
+        commit_id,
+        gix::refs::transaction::PreviousValue::Any,
+        "clone: checkout exact local source",
+    )
+    .with_context(|| "set local clone HEAD")?;
+    std::fs::write(repo.git_dir().join("shallow"), format!("{commit_id}\n"))
+        .with_context(|| "write local clone shallow boundary")?;
+    ensure_git_operation_not_interrupted(interrupt, "after publishing local exact refs")?;
+
+    match clone_progress {
+        Some(progress) => checkout_exact_commit(
+            &repo,
+            commit_id,
+            progress.item_named("checking out local exact ref"),
+            interrupt,
+        )?,
+        None => checkout_exact_commit(&repo, commit_id, gix::progress::Discard, interrupt)?,
+    }
+    Ok(ExactRefFetch::Fetched { commit_id, token })
+}
+
+fn copy_local_exact_ref_objects(
+    source: &gix::Repository,
+    destination: &gix::Repository,
+    unpeeled_id: gix::ObjectId,
+    commit_id: gix::ObjectId,
+    interrupt: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    let mut copied = std::collections::HashSet::new();
+    let mut current = unpeeled_id;
+    loop {
+        ensure_git_operation_not_interrupted(interrupt, "while copying local exact ref")?;
+        if !copied.insert(current) {
+            anyhow::bail!("local exact ref contains a tag cycle at {current}");
+        }
+        let object = source
+            .find_object(current)
+            .with_context(|| format!("read local exact-ref object {current}"))?;
+        write_local_object(destination, &object)?;
+        match object.kind {
+            gix::objs::Kind::Tag => {
+                current = object
+                    .try_into_tag()
+                    .with_context(|| format!("decode local tag object {current}"))?
+                    .target_id()
+                    .with_context(|| format!("read target of local tag object {current}"))?
+                    .detach();
+            }
+            gix::objs::Kind::Commit => {
+                if current != commit_id {
+                    anyhow::bail!(
+                        "local exact ref peeled inconsistently: expected {commit_id}, found {current}"
+                    );
+                }
+                let tree_id = object
+                    .try_into_commit()
+                    .with_context(|| format!("decode local commit {commit_id}"))?
+                    .tree_id()
+                    .with_context(|| format!("read tree of local commit {commit_id}"))?
+                    .detach();
+                copy_local_tree_objects(source, destination, tree_id, &mut copied, interrupt)?;
+                return Ok(());
+            }
+            kind => anyhow::bail!("local exact ref resolves to {kind}, expected a tag or commit"),
+        }
+    }
+}
+
+fn copy_local_tree_objects(
+    source: &gix::Repository,
+    destination: &gix::Repository,
+    root_tree: gix::ObjectId,
+    copied: &mut std::collections::HashSet<gix::ObjectId>,
+    interrupt: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    let mut pending = vec![root_tree];
+    while let Some(object_id) = pending.pop() {
+        #[cfg(test)]
+        if TEST_INTERRUPT_DURING_LOCAL_COPY.swap(false, Ordering::AcqRel) {
+            interrupt.store(true, Ordering::Release);
+        }
+        ensure_git_operation_not_interrupted(interrupt, "while copying local checkout tree")?;
+        if !copied.insert(object_id) {
+            continue;
+        }
+        let object = source
+            .find_object(object_id)
+            .with_context(|| format!("read local checkout object {object_id}"))?;
+        write_local_object(destination, &object)?;
+        match object.kind {
+            gix::objs::Kind::Tree => {
+                let tree = object
+                    .try_into_tree()
+                    .with_context(|| format!("decode local tree {object_id}"))?;
+                for entry in tree.iter() {
+                    let entry =
+                        entry.with_context(|| format!("decode entry in local tree {object_id}"))?;
+                    if entry.kind() != gix::objs::tree::EntryKind::Commit {
+                        pending.push(entry.object_id());
+                    }
+                }
+            }
+            gix::objs::Kind::Blob => {}
+            kind => anyhow::bail!(
+                "local tree {root_tree} references unexpected {kind} object {object_id}"
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn write_local_object(destination: &gix::Repository, object: &gix::Object<'_>) -> Result<()> {
+    let written = gix::objs::Write::write_buf(destination, object.kind, &object.data)
+        .with_context(|| format!("write local source object {}", object.id))?;
+    if written != object.id {
+        anyhow::bail!(
+            "local source object {} changed identity while materializing (wrote {written})",
+            object.id
+        );
+    }
+    Ok(())
 }
 
 fn ensure_git_operation_not_interrupted(
@@ -2907,6 +3453,18 @@ static TEST_INTERRUPT_AFTER_INDEX_WRITE: std::sync::atomic::AtomicBool =
 
 #[cfg(test)]
 static TEST_INTERRUPT_AFTER_REF_DISCOVERY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+static TEST_INTERRUPT_DURING_LOCAL_COPY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+static TEST_EXACT_PREPARE_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+static TEST_INTERRUPT_AFTER_CLONE_PROMOTE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Materialize `commit_id` into the main worktree and persist its index.
@@ -2941,7 +3499,7 @@ fn checkout_exact_commit(
     ensure_git_operation_not_interrupted(interrupt, "after building checkout options")?;
     opts.destination_is_initially_empty = true;
     opts.keep_going = false;
-    let checkout_workers = gix_worker_budget().lease();
+    let checkout_workers = GixCheckoutWorkerLease::acquire();
     opts.thread_limit = Some(checkout_workers.workers());
 
     progress.init(Some(index.entries().len()), gix::progress::count("files"));
