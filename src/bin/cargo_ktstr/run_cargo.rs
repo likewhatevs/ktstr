@@ -25,7 +25,8 @@ use std::process::Command;
 use cargo_metadata::semver::Version;
 
 use crate::feature_discovery::{
-    MetadataMode, augment_test_features, augment_test_features_from_metadata, query_metadata,
+    MetadataMode, augment_test_features, augment_test_features_from_metadata_for_context,
+    effective_target_context, query_metadata_for_target, query_resolved_metadata,
     selected_workspace_packages,
 };
 use crate::kernel::{encode_kernel_list, resolve_kernel_set};
@@ -1117,15 +1118,18 @@ fn version_guard(cli: &Version, test: &Version) -> VersionGuard {
 /// reduces to the root package's `ktstr` lib edge: `deps` (rename-aware),
 /// Normal/Development kind (a pure build-dep is not linked by tests).
 ///
-/// LIMITATION: a platform-gated `ktstr` (a `[target.'cfg(...)'.dependencies]`
-/// edge) is matched by name regardless of `DepKindInfo.target`; host-triple
-/// `Platform` matching is intentionally omitted (it needs the full host cfg
-/// set). A cfg-gated ktstr test-driver dependency the host does not link is
-/// exotic; if hit, the failure direction is a false-abort — accepted over
-/// the matching complexity for that case.
+#[cfg(test)]
 fn linked_ktstr_versions<'metadata>(
     meta: &'metadata cargo_metadata::Metadata,
     root_id: &cargo_metadata::PackageId,
+) -> Vec<&'metadata Version> {
+    linked_ktstr_versions_for_context(meta, root_id, None)
+}
+
+fn linked_ktstr_versions_for_context<'metadata>(
+    meta: &'metadata cargo_metadata::Metadata,
+    root_id: &cargo_metadata::PackageId,
+    target: Option<&crate::feature_discovery::TargetContext>,
 ) -> Vec<&'metadata Version> {
     let Some(resolve) = meta.resolve.as_ref() else {
         return Vec::new();
@@ -1158,7 +1162,9 @@ fn linked_ktstr_versions<'metadata>(
                     kind.kind,
                     cargo_metadata::DependencyKind::Normal
                         | cargo_metadata::DependencyKind::Development
-                )
+                ) && kind.target.as_ref().is_none_or(|platform| {
+                    target.is_none_or(|target| target.matches_platform(platform))
+                })
             });
         if linked {
             versions.push(&dep_pkg.version);
@@ -1192,9 +1198,18 @@ fn resolved_ktstr_version(meta: &cargo_metadata::Metadata) -> Option<&Version> {
 }
 
 /// Every distinct ktstr version linked by Cargo's selected workspace members.
+#[cfg(test)]
 fn selected_resolved_ktstr_versions<'metadata>(
     meta: &'metadata cargo_metadata::Metadata,
     args: &[String],
+) -> Vec<&'metadata Version> {
+    selected_resolved_ktstr_versions_for_context(meta, args, None)
+}
+
+fn selected_resolved_ktstr_versions_for_context<'metadata>(
+    meta: &'metadata cargo_metadata::Metadata,
+    args: &[String],
+    target: Option<&crate::feature_discovery::TargetContext>,
 ) -> Vec<&'metadata Version> {
     let Some(packages) = selected_workspace_packages(meta, args) else {
         // Malformed/unsupported selection is left for Cargo to diagnose.
@@ -1202,7 +1217,7 @@ fn selected_resolved_ktstr_versions<'metadata>(
     };
     let mut versions = packages
         .into_iter()
-        .flat_map(|package| linked_ktstr_versions(meta, &package.id))
+        .flat_map(|package| linked_ktstr_versions_for_context(meta, &package.id, target))
         .collect::<Vec<_>>();
     versions.sort_by(|left, right| left.cmp_precedence(right));
     versions.dedup_by(|left, right| left.cmp_precedence(right).is_eq());
@@ -1220,10 +1235,11 @@ fn selected_resolved_ktstr_versions<'metadata>(
 fn check_ktstr_version_compat(
     meta: &cargo_metadata::Metadata,
     args: &[String],
+    target: &crate::feature_discovery::TargetContext,
 ) -> Result<(), String> {
     let cli = Version::parse(env!("CARGO_PKG_VERSION"))
         .expect("cargo-ktstr's own CARGO_PKG_VERSION is valid semver");
-    let tests = selected_resolved_ktstr_versions(meta, args);
+    let tests = selected_resolved_ktstr_versions_for_context(meta, args, Some(target));
     if tests.is_empty() {
         // No linked `ktstr` (or no resolve graph) — running outside a
         // ktstr-dependent project, or cannot assess; nothing to guard.
@@ -1247,14 +1263,25 @@ fn check_ktstr_version_compat(
     Ok(())
 }
 
-/// Reuse the initial requested-feature metadata result for targeted optional
-/// ktstr feature inference and, when nothing is added, the version guard.
+/// Reuse one manifest-only metadata result for targeted optional ktstr feature
+/// inference, then resolve the exact selected/augmented feature set for the
+/// version guard.
 ///
 /// Metadata inspection has historically been best-effort on these general test
 /// paths. Preserve that behavior: if it fails, warn and let the underlying
 /// Cargo command diagnose (or successfully handle) its own arguments.
 fn prepare_test_args(args: Vec<String>) -> Result<Vec<String>, String> {
-    let metadata = match query_metadata(&args, MetadataMode::Default) {
+    let target = match effective_target_context(&args) {
+        Ok(target) => target,
+        Err(error) => {
+            tracing::warn!(
+                error,
+                "ktstr target discovery/version guard failed; forwarding original Cargo args"
+            );
+            return Ok(args);
+        }
+    };
+    let manifests = match query_metadata_for_target(&args, MetadataMode::NoDeps, &target) {
         Ok(metadata) => metadata,
         Err(error) => {
             tracing::warn!(
@@ -1264,17 +1291,9 @@ fn prepare_test_args(args: Vec<String>) -> Result<Vec<String>, String> {
             return Ok(args);
         }
     };
-    let augmented = augment_test_features_from_metadata(args.clone(), &metadata);
-    if augmented == args {
-        check_ktstr_version_compat(&metadata, &args)?;
-        return Ok(args);
-    }
-
-    // The first resolve cannot contain an optional ktstr dependency that
-    // inference has only just activated. Resolve once more with the targeted
-    // package-qualified features so the newer-than-CLI guard inspects the
-    // graph Cargo is actually about to build.
-    let resolved = match query_metadata(&augmented, MetadataMode::Default) {
+    let augmented =
+        augment_test_features_from_metadata_for_context(args.clone(), &manifests, Some(&target));
+    let resolved = match query_resolved_metadata(&augmented, &augmented, &manifests, &target) {
         Ok(metadata) => metadata,
         Err(error) => {
             tracing::warn!(
@@ -1284,7 +1303,7 @@ fn prepare_test_args(args: Vec<String>) -> Result<Vec<String>, String> {
             return Ok(augmented);
         }
     };
-    check_ktstr_version_compat(&resolved, &augmented)?;
+    check_ktstr_version_compat(&resolved, &augmented, &target)?;
     Ok(augmented)
 }
 

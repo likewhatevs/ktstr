@@ -3711,6 +3711,7 @@ dependencies = [
  "base64",
  "blazesym",
  "btf-rs",
+ "cargo-platform",
  "cargo_metadata",
  "cc",
  "clap",

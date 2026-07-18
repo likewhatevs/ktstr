@@ -63,14 +63,16 @@ use cargo_metadata::semver::Version;
 use cargo_metadata::{Metadata, PackageId};
 
 use crate::feature_discovery::{
-    MetadataMode, PackageFeatureActivation, VersionScope, declaring_metadata_options,
-    has_package_selector, has_workspace_selector, infer_ktstr_feature_roots_for_target,
-    inject_feature_activations, package_spec_name, query_metadata, requested_target,
-    scheduler_build_options, selected_activations, selected_workspace_packages,
+    MetadataMode, PackageFeatureActivation, TargetContext, VersionScope,
+    declaring_metadata_options, effective_target_context, has_package_selector,
+    has_workspace_selector, infer_ktstr_feature_roots_for_context, inject_feature_activations,
+    package_spec_name, query_metadata_for_target, query_resolved_metadata, scheduler_build_options,
+    selected_activations_for_context, selected_workspace_packages,
 };
 #[cfg(test)]
 use crate::feature_discovery::{
     explicit_package_exclusions, explicit_package_selection, infer_ktstr_feature_roots,
+    infer_ktstr_feature_roots_for_target, selected_activations,
 };
 use crate::kernel::{
     encode_kernel_list, path_kernel_label, resolve_kernel_image, resolve_kernel_set,
@@ -219,47 +221,52 @@ struct VerifierPackagePlan {
 /// Development dependencies of a dependency do not; normal dependencies keep
 /// traversing at every depth. Empty `dep_kinds` is cargo metadata's
 /// backwards-compatible spelling for a normal dependency.
+#[cfg(test)]
 fn test_link_edge(
     dep: &cargo_metadata::NodeDep,
     workspace_root: bool,
     requested_target: Option<&str>,
+) -> bool {
+    let target = requested_target.map(|target| {
+        // Focused parser tests below exercise named target-table entries.
+        // Production always supplies rustc's complete effective context.
+        TargetContext::named_for_test(target)
+    });
+    test_link_edge_for_context(
+        dep,
+        workspace_root,
+        target.as_ref(),
+        requested_target.is_none(),
+    )
+}
+
+fn test_link_edge_for_context(
+    dep: &cargo_metadata::NodeDep,
+    workspace_root: bool,
+    target: Option<&TargetContext>,
+    unfiltered_without_context: bool,
 ) -> bool {
     dep.dep_kinds.is_empty()
         || dep.dep_kinds.iter().any(|kind| {
             let linked_kind = matches!(kind.kind, cargo_metadata::DependencyKind::Normal)
                 || (workspace_root
                     && matches!(kind.kind, cargo_metadata::DependencyKind::Development));
-            linked_kind && dep_kind_matches_requested_target(kind, requested_target)
+            linked_kind && dep_kind_matches_target_context(kind, target, unfiltered_without_context)
         })
 }
 
-fn dep_kind_matches_requested_target(
+fn dep_kind_matches_target_context(
     kind: &cargo_metadata::DepKindInfo,
-    requested_target: Option<&str>,
+    target: Option<&TargetContext>,
+    unfiltered_without_context: bool,
 ) -> bool {
     let Some(platform) = kind.target.as_ref() else {
         return true;
     };
-    let Some(requested_target) = requested_target else {
-        // Without a Cargo --target, the metadata graph is intentionally
-        // unfiltered. Preserve every possibly host-linked edge rather than
-        // guessing the runtime host cfg.
-        return true;
+    let Some(target) = target else {
+        return unfiltered_without_context;
     };
-    if requested_target.ends_with(".json")
-        || requested_target.contains('/')
-        || requested_target.contains('\\')
-    {
-        // Cargo metadata cannot use a custom target JSON path as
-        // --filter-platform. Keep the conservative unfiltered behavior.
-        return true;
-    }
-    let platform = platform.to_string();
-    // Cargo already evaluates cfg(...) entries when Default metadata receives
-    // --filter-platform. Named target-table entries can additionally be
-    // rejected exactly, which protects fixture/older-Cargo graphs that retain
-    // multiple dep_kinds on one package edge.
-    platform.starts_with("cfg(") || platform == requested_target
+    target.matches_platform(platform)
 }
 
 /// Collect every ktstr version in one workspace member's package-level test
@@ -270,11 +277,29 @@ fn dep_kind_matches_requested_target(
 /// old distributed scheduler registry. Package-level metadata cannot prove
 /// which individual test binary retains that dependency, so any such mixed
 /// package is excluded conservatively.
+#[cfg(test)]
 fn linked_ktstr_versions(
     member_id: &PackageId,
     packages: &HashMap<&PackageId, &cargo_metadata::Package>,
     nodes: &HashMap<&PackageId, &cargo_metadata::Node>,
     requested_target: Option<&str>,
+) -> Vec<Version> {
+    let target = requested_target.map(TargetContext::named_for_test);
+    linked_ktstr_versions_for_context(
+        member_id,
+        packages,
+        nodes,
+        target.as_ref(),
+        requested_target.is_none(),
+    )
+}
+
+fn linked_ktstr_versions_for_context(
+    member_id: &PackageId,
+    packages: &HashMap<&PackageId, &cargo_metadata::Package>,
+    nodes: &HashMap<&PackageId, &cargo_metadata::Node>,
+    target: Option<&TargetContext>,
+    unfiltered_without_context: bool,
 ) -> Vec<Version> {
     let mut versions = Vec::new();
     let mut seen = HashSet::new();
@@ -297,7 +322,8 @@ fn linked_ktstr_versions(
             continue;
         };
         for dep in &node.deps {
-            if !test_link_edge(dep, workspace_root, requested_target) {
+            if !test_link_edge_for_context(dep, workspace_root, target, unfiltered_without_context)
+            {
                 continue;
             }
             pending.push((&dep.pkg, false));
@@ -317,10 +343,21 @@ fn linked_ktstr_versions(
 /// - any newer version: record an error candidate; the caller first applies
 ///   explicit Cargo package selection so an unrelated newer package cannot
 ///   abort a deliberately scoped current-package run.
+#[cfg(test)]
 fn verifier_package_plan(
     meta: &Metadata,
     cli: &Version,
     requested_target: Option<&str>,
+) -> Result<VerifierPackagePlan, String> {
+    let target = requested_target.map(TargetContext::named_for_test);
+    verifier_package_plan_for_context(meta, cli, target.as_ref(), requested_target.is_none())
+}
+
+fn verifier_package_plan_for_context(
+    meta: &Metadata,
+    cli: &Version,
+    target: Option<&TargetContext>,
+    unfiltered_without_context: bool,
 ) -> Result<VerifierPackagePlan, String> {
     let resolve = meta
         .resolve
@@ -336,7 +373,13 @@ fn verifier_package_plan(
         let Some(member) = packages.get(member_id).copied() else {
             continue;
         };
-        let versions = linked_ktstr_versions(member_id, &packages, &nodes, requested_target);
+        let versions = linked_ktstr_versions_for_context(
+            member_id,
+            &packages,
+            &nodes,
+            target,
+            unfiltered_without_context,
+        );
         if versions.is_empty() {
             continue;
         }
@@ -353,10 +396,10 @@ fn verifier_package_plan(
         } else {
             compatible.push(CompatibleVerifierPackage {
                 name: member.name.to_string(),
-                verifier_features: infer_ktstr_feature_roots_for_target(
+                verifier_features: infer_ktstr_feature_roots_for_context(
                     member,
                     VersionScope::Matches(cli),
-                    requested_target,
+                    target,
                 ),
             });
         }
@@ -390,11 +433,13 @@ fn verifier_selection_args(args: &[String]) -> Vec<String> {
 fn query_verifier_package_plan(args: &[String]) -> Result<VerifierPackagePlan, String> {
     let cli = Version::parse(env!("CARGO_PKG_VERSION"))
         .expect("cargo-ktstr's own CARGO_PKG_VERSION is valid semver");
+    let target = effective_target_context(args)
+        .map_err(|error| format!("cargo ktstr verifier: determine Cargo target: {error}"))?;
     // First inspect workspace manifests without resolving optional
     // dependencies, then resolve only the ktstr-specific gates inferred from
     // those manifests. This gives recursive linked-version classification the
     // exact graph compilation will use without a broad all-features resolve.
-    let manifests = query_metadata(args, MetadataMode::NoDeps)
+    let manifests = query_metadata_for_target(args, MetadataMode::NoDeps, &target)
         .map_err(|error| format!("cargo ktstr verifier: {error}"))?;
     // Selection must precede optional feature activation. Otherwise an
     // unrelated workspace member can pull an old/new ktstr into Default
@@ -411,12 +456,16 @@ fn query_verifier_package_plan(args: &[String]) -> Result<VerifierPackagePlan, S
             newer: Vec::new(),
         });
     }
-    let activations = selected_activations(&manifests, &selection_args, VersionScope::Any);
+    let activations = selected_activations_for_context(
+        &manifests,
+        &selection_args,
+        VersionScope::Any,
+        Some(&target),
+    );
     let resolution_args = inject_feature_activations(args.to_vec(), &activations);
-    let metadata = query_metadata(&resolution_args, MetadataMode::Default)
+    let metadata = query_resolved_metadata(&resolution_args, &selection_args, &manifests, &target)
         .map_err(|error| format!("cargo ktstr verifier: {error}"))?;
-    let requested_target = requested_target(args);
-    let mut plan = verifier_package_plan(&metadata, &cli, requested_target.as_deref())?;
+    let mut plan = verifier_package_plan_for_context(&metadata, &cli, Some(&target), false)?;
 
     // A bare verifier deliberately widens beyond Cargo's default members.
     // Once the operator supplies package selection, however, classify only
@@ -1926,6 +1975,45 @@ mod tests {
         assert!(
             test_link_edge(&dependency, true, None),
             "an unfiltered host graph remains conservative",
+        );
+    }
+
+    #[test]
+    fn resolved_dep_kinds_evaluate_cfg_against_the_effective_target() {
+        let dependency: cargo_metadata::NodeDep = serde_json::from_str(
+            r#"{
+                "name":"ktstr",
+                "pkg":"ktstr 0.42.0 (path+file:///w/ktstr)",
+                "dep_kinds":[{
+                    "kind":null,
+                    "target":"cfg(target_os = \"linux\")"
+                }]
+            }"#,
+        )
+        .expect("cfg-target NodeDep fixture");
+        let linux = TargetContext::named(
+            "x86_64-unknown-linux-gnu",
+            vec![cargo_platform::Cfg::KeyPair(
+                "target_os".to_string(),
+                "linux".to_string(),
+            )],
+        );
+        let windows = TargetContext::named(
+            "x86_64-pc-windows-msvc",
+            vec![cargo_platform::Cfg::KeyPair(
+                "target_os".to_string(),
+                "windows".to_string(),
+            )],
+        );
+        assert!(test_link_edge_for_context(
+            &dependency,
+            true,
+            Some(&linux),
+            false,
+        ));
+        assert!(
+            !test_link_edge_for_context(&dependency, true, Some(&windows), false),
+            "an opposite-target ktstr edge cannot taint the selected test closure",
         );
     }
 

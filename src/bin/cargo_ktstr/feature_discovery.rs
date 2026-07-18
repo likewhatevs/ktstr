@@ -9,9 +9,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::process::Command;
+use std::str::FromStr;
 
 use cargo_metadata::semver::{Version, VersionReq};
 use cargo_metadata::{Metadata, MetadataCommand};
+use cargo_platform::{Cfg, Platform};
 use glob::Pattern;
 
 /// How much dependency resolution a metadata caller needs.
@@ -44,6 +47,46 @@ pub(crate) struct PackageFeatureActivation {
     pub(crate) features: Vec<String>,
 }
 
+/// Cargo's effective compilation target and the cfg set rustc reports for it.
+///
+/// Cargo's metadata graph is otherwise deliberately target-agnostic. Keeping
+/// this context explicit lets manifest feature inference and resolved-graph
+/// version classification apply the same target-table decision.
+#[derive(Clone, Debug)]
+pub(crate) struct TargetContext {
+    name: String,
+    cfg: Vec<Cfg>,
+    metadata_filter: Option<String>,
+}
+
+impl TargetContext {
+    pub(crate) fn named(name: impl Into<String>, cfg: Vec<Cfg>) -> Self {
+        let name = name.into();
+        Self {
+            metadata_filter: Some(name.clone()),
+            name,
+            cfg,
+        }
+    }
+
+    fn custom(name: impl Into<String>, cfg: Vec<Cfg>) -> Self {
+        Self {
+            name: name.into(),
+            cfg,
+            metadata_filter: None,
+        }
+    }
+
+    pub(crate) fn matches_platform(&self, platform: &Platform) -> bool {
+        platform.matches(&self.name, &self.cfg)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn named_for_test(name: impl Into<String>) -> Self {
+        Self::named(name, Vec::new())
+    }
+}
+
 /// The explicitly requested Cargo compilation target, if any.
 ///
 /// Stop at `--`, after which a `--target` token belongs to the test binary.
@@ -68,6 +111,93 @@ pub(crate) fn requested_target(args: &[String]) -> Option<String> {
         index += 1;
     }
     requested
+}
+
+fn rustc_program() -> std::ffi::OsString {
+    std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into())
+}
+
+fn rustc_stdout(arguments: &[&str]) -> Result<String, String> {
+    let output = Command::new(rustc_program())
+        .args(arguments)
+        .output()
+        .map_err(|error| format!("run rustc {}: {error}", arguments.join(" ")))?;
+    if !output.status.success() {
+        return Err(format!(
+            "rustc {} failed ({}): {}",
+            arguments.join(" "),
+            output
+                .status
+                .code()
+                .map_or("signal".to_string(), |code| code.to_string()),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|error| {
+        format!(
+            "rustc {} emitted non-UTF-8 output: {error}",
+            arguments.join(" ")
+        )
+    })
+}
+
+fn rustc_host_target() -> Result<String, String> {
+    let verbose = rustc_stdout(&["-vV"])?;
+    verbose
+        .lines()
+        .find_map(|line| line.strip_prefix("host: ").map(ToString::to_string))
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| "rustc -vV omitted its host target".to_string())
+}
+
+fn rustc_target_cfg(target: Option<&str>) -> Result<Vec<Cfg>, String> {
+    let output = match target {
+        Some(target) => rustc_stdout(&["--print", "cfg", "--target", target])?,
+        None => rustc_stdout(&["--print", "cfg"])?,
+    };
+    output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            Cfg::from_str(line).map_err(|error| format!("parse rustc target cfg {line:?}: {error}"))
+        })
+        .collect()
+}
+
+fn custom_target_name(target: &str) -> Result<String, String> {
+    Path::new(target)
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|name| !name.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| format!("custom target path has no UTF-8 file stem: {target:?}"))
+}
+
+/// Derive the target Cargo will compile tests for.
+///
+/// An omitted `--target` means rustc's host target, not an unfiltered union of
+/// every target table in the manifest. For a custom JSON target Cargo metadata
+/// cannot accept the path as `--filter-platform`, but rustc can still report
+/// its cfg set and the manual dependency-edge matcher remains exact.
+pub(crate) fn effective_target_context(args: &[String]) -> Result<TargetContext, String> {
+    match requested_target(args) {
+        Some(target) => {
+            let cfg = rustc_target_cfg(Some(&target))?;
+            if named_filter_platform(&target) {
+                Ok(TargetContext::named(target, cfg))
+            } else {
+                // Cargo identifies a custom target by the JSON file stem for
+                // exact `[target.<name>]` tables; the path is only rustc's
+                // input locator.
+                Ok(TargetContext::custom(custom_target_name(&target)?, cfg))
+            }
+        }
+        None => {
+            let host = rustc_host_target()?;
+            let cfg = rustc_target_cfg(None)?;
+            Ok(TargetContext::named(host, cfg))
+        }
+    }
 }
 
 /// The Cargo arguments relevant to a top-level metadata preflight.
@@ -313,6 +443,7 @@ pub(crate) fn metadata_resolution_options(args: &[String]) -> Vec<String> {
     out
 }
 
+#[cfg(test)]
 fn metadata_other_options(args: &[String], mode: MetadataMode) -> Vec<String> {
     let mut options = metadata_passthrough_options(args);
     if mode == MetadataMode::Default {
@@ -321,25 +452,178 @@ fn metadata_other_options(args: &[String], mode: MetadataMode) -> Vec<String> {
     options
 }
 
-/// Run the one metadata preflight used for feature inference.
-///
-/// `cargo_path("cargo")` is load-bearing for local development: unlike
-/// cargo_metadata's `$CARGO` default, it honors a PATH cargo wrapper used to
-/// patch crates.io ktstr to a checkout.
-pub(crate) fn query_metadata(args: &[String], mode: MetadataMode) -> Result<Metadata, String> {
-    let mut command = MetadataCommand::new();
-    command
-        .cargo_path("cargo")
-        .other_options(metadata_other_options(args, mode));
-    match mode {
-        MetadataMode::NoDeps => {
-            command.no_deps();
+fn parsed_feature_modes(args: &[String]) -> Option<(Vec<String>, bool, bool)> {
+    let args = cargo_args(args);
+    let mut features = Vec::new();
+    let mut all_features = false;
+    let mut no_default_features = false;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        let value = if matches!(argument.as_str(), "--features" | "-F") {
+            index += 1;
+            Some(args.get(index)?.as_str())
+        } else if let Some(value) = argument.strip_prefix("--features=") {
+            Some(value)
+        } else if let Some(value) = argument.strip_prefix("-F")
+            && !value.is_empty()
+        {
+            Some(value.strip_prefix('=').unwrap_or(value))
+        } else {
+            None
+        };
+        if let Some(value) = value {
+            if value.is_empty() {
+                return None;
+            }
+            features.extend(
+                value
+                    .split(|character: char| character == ',' || character.is_whitespace())
+                    .filter(|feature| !feature.is_empty())
+                    .map(ToString::to_string),
+            );
+        } else if argument == "--all-features" {
+            all_features = true;
+        } else if argument == "--no-default-features" {
+            no_default_features = true;
         }
-        MetadataMode::Default => {}
+        index += 1;
+    }
+    Some((features, all_features, no_default_features))
+}
+
+/// Re-express caller feature modes in Cargo metadata's workspace-global
+/// feature namespace without widening beyond Cargo's selected packages.
+///
+/// `cargo metadata` has no `-p`; an unqualified `--features ktstr-tests` or
+/// `--all-features` therefore activates every workspace member that defines
+/// the feature. The real nextest/build command still has its `-p` selection.
+/// Package-qualifying the metadata-only replay keeps its resolved graph equal
+/// to that command while leaving the forwarded argv untouched.
+fn scoped_metadata_resolution_options(
+    args: &[String],
+    selection_args: &[String],
+    manifests: &Metadata,
+) -> Vec<String> {
+    let Some((explicit, all_features, no_default_features)) = parsed_feature_modes(args) else {
+        return metadata_resolution_options(args);
+    };
+    let Some(selected) = selected_workspace_packages(manifests, selection_args) else {
+        return metadata_resolution_options(args);
+    };
+
+    let mut selectors = Vec::new();
+    if !no_default_features {
+        for package in &selected {
+            if package.features.contains_key("default") {
+                selectors.push(format!("{}/default", package.name));
+            }
+        }
+    }
+    if all_features {
+        for package in &selected {
+            selectors.extend(
+                package
+                    .features
+                    .keys()
+                    .map(|feature| format!("{}/{feature}", package.name)),
+            );
+        }
+    }
+    for feature in explicit {
+        if feature.contains('/') {
+            selectors.push(feature);
+            continue;
+        }
+        let mut matched = false;
+        for package in &selected {
+            if package.features.contains_key(&feature) {
+                selectors.push(format!("{}/{feature}", package.name));
+                matched = true;
+            }
+        }
+        if !matched {
+            if let Some(package) = selected.first() {
+                // Preserve Cargo's unknown-feature diagnostic without letting
+                // an unrelated workspace member of the same feature name make
+                // metadata succeed spuriously.
+                selectors.push(format!("{}/{feature}", package.name));
+            } else {
+                selectors.push(feature);
+            }
+        }
+    }
+    selectors.sort();
+    selectors.dedup();
+
+    let mut options = Vec::new();
+    if !selectors.is_empty() {
+        options.push("--features".to_string());
+        options.push(selectors.join(","));
+    }
+    // Cargo metadata cannot carry `-p`, so its ordinary default activation is
+    // workspace-wide. Disable that global behavior unconditionally, then the
+    // selected-package `/default` selectors above reconstruct Cargo's actual
+    // defaults unless the caller explicitly disabled them.
+    options.push("--no-default-features".to_string());
+    options
+}
+
+fn metadata_passthrough_for_target(args: &[String], target: &TargetContext) -> Vec<String> {
+    let mut options = metadata_passthrough_options(args);
+    let already_filtered = options
+        .iter()
+        .any(|option| option == "--filter-platform" || option.starts_with("--filter-platform="));
+    if !already_filtered && let Some(platform) = &target.metadata_filter {
+        options.push("--filter-platform".to_string());
+        options.push(platform.clone());
+    }
+    options
+}
+
+fn execute_metadata(
+    args: &[String],
+    mode: MetadataMode,
+    target: &TargetContext,
+    resolution_options: &[String],
+) -> Result<Metadata, String> {
+    let mut options = metadata_passthrough_for_target(args, target);
+    if mode == MetadataMode::Default {
+        options.extend_from_slice(resolution_options);
+    }
+    let mut command = MetadataCommand::new();
+    command.cargo_path("cargo").other_options(options);
+    if mode == MetadataMode::NoDeps {
+        command.no_deps();
     }
     command
         .exec()
         .map_err(|error| format!("cargo metadata failed: {error}"))
+}
+
+pub(crate) fn query_metadata_for_target(
+    args: &[String],
+    mode: MetadataMode,
+    target: &TargetContext,
+) -> Result<Metadata, String> {
+    match mode {
+        MetadataMode::NoDeps => execute_metadata(args, mode, target, &[]),
+        MetadataMode::Default => {
+            let manifests = execute_metadata(args, MetadataMode::NoDeps, target, &[])?;
+            query_resolved_metadata(args, args, &manifests, target)
+        }
+    }
+}
+
+/// Resolve one test selection using a manifest pass the caller already owns.
+pub(crate) fn query_resolved_metadata(
+    args: &[String],
+    selection_args: &[String],
+    manifests: &Metadata,
+    target: &TargetContext,
+) -> Result<Metadata, String> {
+    let resolution = scoped_metadata_resolution_options(args, selection_args, manifests);
+    execute_metadata(args, MetadataMode::Default, target, &resolution)
 }
 
 /// Classify a Cargo feature member that addresses one ktstr dependency alias.
@@ -362,18 +646,22 @@ fn compatible_ktstr_member(member: &str, aliases: &HashSet<&str>) -> Option<bool
 
 /// Whether a manifest dependency can participate in the requested target.
 ///
-/// With no explicit `--target`, keep the existing conservative rule: a
-/// manifest-only pass cannot evaluate target cfgs, so do not auto-activate
-/// them. With an explicit named target, exact target-table entries are safe to
-/// match. `cfg(...)` expressions remain deliberately explicit: evaluating
-/// them would require rustc's complete cfg set for the target, and Default
-/// metadata cannot recover an optional edge that this manifest pass never
-/// activated. The subsequent resolved metadata pass still receives
-/// `--filter-platform`, so already-active dependency versions are classified
-/// against Cargo's authoritative platform evaluation.
+/// Production callers supply rustc's effective target name and complete cfg
+/// set, so both exact target tables and `cfg(...)` expressions are evaluated
+/// with Cargo's own platform matcher. The optional legacy test wrapper keeps
+/// `None` as "unknown" and therefore declines target-specific activation.
+#[cfg(test)]
 fn dependency_matches_requested_target(
     dependency: &cargo_metadata::Dependency,
     target: Option<&str>,
+) -> bool {
+    let context = target.map(|target| TargetContext::named(target, Vec::new()));
+    dependency_matches_target_context(dependency, context.as_ref())
+}
+
+fn dependency_matches_target_context(
+    dependency: &cargo_metadata::Dependency,
+    target: Option<&TargetContext>,
 ) -> bool {
     let Some(platform) = dependency.target.as_ref() else {
         return true;
@@ -381,8 +669,7 @@ fn dependency_matches_requested_target(
     let Some(target) = target else {
         return false;
     };
-    let platform = platform.to_string();
-    !platform.starts_with("cfg(") && platform == target
+    target.matches_platform(platform)
 }
 
 /// Whether one target participates in `cargo test`/nextest harness discovery.
@@ -505,17 +792,27 @@ pub(crate) fn infer_ktstr_feature_roots(
 }
 
 /// Target-aware feature-root inference.
+#[cfg(test)]
 pub(crate) fn infer_ktstr_feature_roots_for_target(
     package: &cargo_metadata::Package,
     scope: VersionScope<'_>,
     requested_target: Option<&str>,
+) -> Vec<String> {
+    let target = requested_target.map(|target| TargetContext::named(target, Vec::new()));
+    infer_ktstr_feature_roots_for_context(package, scope, target.as_ref())
+}
+
+pub(crate) fn infer_ktstr_feature_roots_for_context(
+    package: &cargo_metadata::Package,
+    scope: VersionScope<'_>,
+    target: Option<&TargetContext>,
 ) -> Vec<String> {
     let eligible_dependencies = package
         .dependencies
         .iter()
         .filter(|dependency| {
             dependency.name == "ktstr"
-                && dependency_matches_requested_target(dependency, requested_target)
+                && dependency_matches_target_context(dependency, target)
                 && matches!(
                     dependency.kind,
                     cargo_metadata::DependencyKind::Normal
@@ -924,18 +1221,30 @@ pub(crate) fn selected_workspace_packages<'metadata>(
 }
 
 /// Infer activations only for the workspace packages Cargo will select.
+#[cfg(test)]
 pub(crate) fn selected_activations(
     metadata: &Metadata,
     args: &[String],
     scope: VersionScope<'_>,
 ) -> Vec<PackageFeatureActivation> {
     let requested_target = requested_target(args);
+    let target = requested_target
+        .as_deref()
+        .map(|target| TargetContext::named(target, Vec::new()));
+    selected_activations_for_context(metadata, args, scope, target.as_ref())
+}
+
+pub(crate) fn selected_activations_for_context(
+    metadata: &Metadata,
+    args: &[String],
+    scope: VersionScope<'_>,
+    target: Option<&TargetContext>,
+) -> Vec<PackageFeatureActivation> {
     let mut activations = selected_workspace_packages(metadata, args)
         .unwrap_or_default()
         .into_iter()
         .filter_map(|package| {
-            let features =
-                infer_ktstr_feature_roots_for_target(package, scope, requested_target.as_deref());
+            let features = infer_ktstr_feature_roots_for_context(package, scope, target);
             (!features.is_empty()).then(|| PackageFeatureActivation {
                 package: package.name.to_string(),
                 features,
@@ -990,16 +1299,31 @@ pub(crate) fn augment_test_features(args: Vec<String>) -> Result<Vec<String>, St
     if explicit_all_features(&args) {
         return Ok(args);
     }
-    let metadata = query_metadata(&args, MetadataMode::NoDeps)?;
-    Ok(augment_test_features_from_metadata(args, &metadata))
+    let target = effective_target_context(&args)?;
+    let metadata = query_metadata_for_target(&args, MetadataMode::NoDeps, &target)?;
+    Ok(augment_test_features_from_metadata_for_context(
+        args,
+        &metadata,
+        Some(&target),
+    ))
 }
 
 /// Inject ordinary test features from metadata a caller already queried.
+#[cfg(test)]
 pub(crate) fn augment_test_features_from_metadata(
     args: Vec<String>,
     metadata: &Metadata,
 ) -> Vec<String> {
     let activations = selected_activations(metadata, &args, VersionScope::Any);
+    inject_feature_activations(args, &activations)
+}
+
+pub(crate) fn augment_test_features_from_metadata_for_context(
+    args: Vec<String>,
+    metadata: &Metadata,
+    target: Option<&TargetContext>,
+) -> Vec<String> {
+    let activations = selected_activations_for_context(metadata, &args, VersionScope::Any, target);
     inject_feature_activations(args, &activations)
 }
 
@@ -1094,6 +1418,97 @@ mod tests {
             ),
         );
         serde_json::from_str(&json).expect("metadata fixture deserializes")
+    }
+
+    fn write_package(root: &Path, relative: &str, manifest: &str) {
+        let package = root.join(relative);
+        std::fs::create_dir_all(package.join("src")).expect("create fixture package source");
+        std::fs::write(package.join("Cargo.toml"), manifest).expect("write fixture manifest");
+        std::fs::write(package.join("src/lib.rs"), "pub fn marker() {}\n")
+            .expect("write fixture source");
+    }
+
+    fn real_feature_workspace() -> tempfile::TempDir {
+        let workspace = tempfile::tempdir().expect("feature workspace");
+        std::fs::write(
+            workspace.path().join("Cargo.toml"),
+            r#"[workspace]
+members = ["selected", "unrelated"]
+exclude = ["deps/ktstr-current", "deps/ktstr-old", "deps/selected-extra"]
+resolver = "2"
+"#,
+        )
+        .expect("write workspace manifest");
+        write_package(
+            workspace.path(),
+            "selected",
+            r#"[package]
+name = "selected"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+selected-extra = { path = "../deps/selected-extra", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ktstr = { path = "../deps/ktstr-current", optional = true }
+
+[features]
+default = ["selected-default"]
+selected-default = []
+ktstr-tests = ["dep:ktstr"]
+extra = ["dep:selected-extra"]
+"#,
+        );
+        write_package(
+            workspace.path(),
+            "unrelated",
+            r#"[package]
+name = "unrelated"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+ktstr = { path = "../deps/ktstr-old", optional = true }
+
+[features]
+default = ["ktstr-tests"]
+ktstr-tests = ["dep:ktstr"]
+unrelated-mode = []
+"#,
+        );
+        write_package(
+            workspace.path(),
+            "deps/ktstr-current",
+            "[package]\nname = \"ktstr\"\nversion = \"0.42.0\"\nedition = \"2024\"\n",
+        );
+        write_package(
+            workspace.path(),
+            "deps/ktstr-old",
+            "[package]\nname = \"ktstr\"\nversion = \"0.18.0\"\nedition = \"2024\"\n",
+        );
+        write_package(
+            workspace.path(),
+            "deps/selected-extra",
+            "[package]\nname = \"selected-extra\"\nversion = \"1.0.0\"\nedition = \"2024\"\n",
+        );
+        workspace
+    }
+
+    fn package_node<'a>(metadata: &'a Metadata, name: &str) -> &'a cargo_metadata::Node {
+        let package = metadata
+            .packages
+            .iter()
+            .find(|package| package.name.as_str() == name)
+            .unwrap_or_else(|| panic!("metadata contains package {name}"));
+        metadata
+            .resolve
+            .as_ref()
+            .expect("resolved metadata")
+            .nodes
+            .iter()
+            .find(|node| node.id == package.id)
+            .unwrap_or_else(|| panic!("resolve contains node {name}"))
     }
 
     #[test]
@@ -1318,6 +1733,160 @@ mod tests {
             .is_empty(),
             "even an explicit named target lacks rustc's full cfg set in the NoDeps pass; \
              users can still request that feature explicitly",
+        );
+    }
+
+    #[test]
+    fn real_workspace_host_cfg_inference_and_package_scoped_feature_resolution() {
+        assert!(
+            cfg!(target_os = "linux"),
+            "this regression exercises Linux cfg"
+        );
+        let workspace = real_feature_workspace();
+        let manifest = workspace.path().join("Cargo.toml");
+        let args = strings(&[
+            "--manifest-path",
+            manifest.to_str().expect("UTF-8 fixture path"),
+            "-p",
+            "selected",
+            "--features",
+            "ktstr-tests",
+        ]);
+        let target = effective_target_context(&args).expect("effective host target");
+        let manifests = query_metadata_for_target(&args, MetadataMode::NoDeps, &target)
+            .expect("manifest metadata");
+        assert_eq!(
+            selected_activations_for_context(&manifests, &args, VersionScope::Any, Some(&target),),
+            vec![PackageFeatureActivation {
+                package: "selected".to_string(),
+                features: vec!["ktstr-tests".to_string()],
+            }],
+            "the host-matching cfg(target_os = linux) ktstr edge is inferred",
+        );
+
+        let windows = TargetContext::named(
+            "x86_64-pc-windows-msvc",
+            vec![
+                Cfg::Name("windows".to_string()),
+                Cfg::KeyPair("target_os".to_string(), "windows".to_string()),
+            ],
+        );
+        assert!(
+            selected_activations_for_context(&manifests, &args, VersionScope::Any, Some(&windows),)
+                .is_empty(),
+            "the opposite target must not activate a Linux-only ktstr edge",
+        );
+
+        let resolved = query_resolved_metadata(&args, &args, &manifests, &target)
+            .expect("selection-scoped resolved metadata");
+        let selected = package_node(&resolved, "selected");
+        assert!(
+            selected
+                .features
+                .iter()
+                .any(|feature| feature == "ktstr-tests")
+        );
+        assert!(
+            ["default", "selected-default"]
+                .iter()
+                .all(|feature| selected.features.iter().any(|active| active == feature)),
+            "selected package defaults remain active: {:?}",
+            selected.features,
+        );
+        assert!(
+            selected.deps.iter().any(|dependency| {
+                resolved
+                    .packages
+                    .iter()
+                    .find(|package| package.id == dependency.pkg)
+                    .is_some_and(|package| {
+                        package.name.as_str() == "ktstr"
+                            && package.version == Version::parse("0.42.0").unwrap()
+                    })
+            }),
+            "the selected package links current ktstr",
+        );
+        let unrelated = package_node(&resolved, "unrelated");
+        assert!(
+            unrelated.features.is_empty()
+                && unrelated.deps.iter().all(|dependency| {
+                    resolved
+                        .packages
+                        .iter()
+                        .find(|package| package.id == dependency.pkg)
+                        .is_none_or(|package| package.name.as_str() != "ktstr")
+                }),
+            "unqualified --features is metadata-scoped to -p selected",
+        );
+
+        let no_default_args = strings(&[
+            "--manifest-path",
+            manifest.to_str().expect("UTF-8 fixture path"),
+            "-p",
+            "selected",
+            "--features",
+            "ktstr-tests",
+            "--no-default-features",
+        ]);
+        let no_default =
+            query_resolved_metadata(&no_default_args, &no_default_args, &manifests, &target)
+                .expect("no-default selection metadata");
+        let selected = package_node(&no_default, "selected");
+        assert!(
+            selected
+                .features
+                .iter()
+                .any(|feature| feature == "ktstr-tests")
+                && !selected.features.iter().any(|feature| feature == "default")
+                && !selected
+                    .features
+                    .iter()
+                    .any(|feature| feature == "selected-default"),
+            "caller --no-default-features remains authoritative: {:?}",
+            selected.features,
+        );
+    }
+
+    #[test]
+    fn real_workspace_package_scopes_caller_all_features_for_metadata_only() {
+        let workspace = real_feature_workspace();
+        let manifest = workspace.path().join("Cargo.toml");
+        let args = strings(&[
+            "--manifest-path",
+            manifest.to_str().expect("UTF-8 fixture path"),
+            "-p",
+            "selected",
+            "--all-features",
+        ]);
+        let target = effective_target_context(&args).expect("effective host target");
+        let manifests = query_metadata_for_target(&args, MetadataMode::NoDeps, &target)
+            .expect("manifest metadata");
+        let resolved = query_resolved_metadata(&args, &args, &manifests, &target)
+            .expect("selection-scoped all-features metadata");
+        let selected = package_node(&resolved, "selected");
+        assert!(
+            ["default", "extra", "ktstr-tests", "selected-default"]
+                .iter()
+                .all(|feature| selected.features.iter().any(|active| active == feature)),
+            "all selected-package features are active: {:?}",
+            selected.features,
+        );
+        let unrelated = package_node(&resolved, "unrelated");
+        assert!(
+            unrelated.features.is_empty()
+                && unrelated.deps.iter().all(|dependency| {
+                    resolved
+                        .packages
+                        .iter()
+                        .find(|package| package.id == dependency.pkg)
+                        .is_none_or(|package| package.name.as_str() != "ktstr")
+                }),
+            "caller --all-features must not become workspace-global in metadata",
+        );
+        assert_eq!(
+            inject_feature_activations(args.clone(), &activations()),
+            args,
+            "caller all-features remains untouched; no automatic all-features is introduced",
         );
     }
 
@@ -1551,6 +2120,19 @@ mod tests {
         assert_eq!(
             scheduler_build_options(&args, Path::new("/invoke")),
             strings(&["--target", "/invoke/targets/custom.json"]),
+        );
+        assert_eq!(
+            custom_target_name("targets/custom.json").expect("custom target name"),
+            "custom",
+            "Cargo matches exact target tables against the JSON file stem",
+        );
+        let context = TargetContext::custom(
+            custom_target_name("targets/custom.json").unwrap(),
+            vec![Cfg::KeyPair("target_os".to_string(), "linux".to_string())],
+        );
+        assert!(context.matches_platform(&Platform::from_str("custom").unwrap()));
+        assert!(
+            context.matches_platform(&Platform::from_str(r#"cfg(target_os = "linux")"#).unwrap())
         );
     }
 
