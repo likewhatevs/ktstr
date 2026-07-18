@@ -1433,9 +1433,20 @@ mod tests {
 
     #[test]
     fn replaced_ranges_require_and_accept_node_aligned_splits() {
-        let topo = Topology::new(2, 1, 2, 1);
+        // A uniform two-node topology needs at least one LLC per node.
+        // Keep the fixture at two total CPUs while making that ownership
+        // explicit: two LLCs, one single-threaded core each.
+        let topo = Topology::new(2, 2, 1, 1);
         let layout = NumaMemoryLayout::compute(&topo, 4, 0, None).unwrap();
         assert_eq!(layout.regions().len(), 2);
+        assert_eq!(
+            layout
+                .regions()
+                .iter()
+                .map(|region| (region.node_id, region.gpa_start, region.size))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 2 << 20), (1, 2 << 20, 2 << 20)],
+        );
         let boundary = layout.regions()[1].gpa_start;
         let dummy = std::ptr::dangling_mut::<u8>();
         let empty_policies = vec![Vec::new(), Vec::new()];
