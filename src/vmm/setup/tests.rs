@@ -1,4 +1,5 @@
 use super::*;
+use std::os::unix::fs::FileExt as _;
 
 fn test_prepared_mapping(magic: &[u8], guest_offset: u64, map_len: usize) -> PreparedMapping {
     use std::io::Write as _;
@@ -198,7 +199,7 @@ fn prepared_subrange_validation_covers_adjacent_regions_and_rejects_holes() {
 #[test]
 fn prepared_multi_region_direct_cow_preserves_offsets_and_private_writes() {
     use std::io::Write as _;
-    use std::os::unix::fs::{FileExt as _, PermissionsExt as _};
+    use std::os::unix::fs::PermissionsExt as _;
     use vm_memory::mmap::{GuestRegionMmap, MmapRegion};
 
     struct Reservation {
@@ -415,6 +416,543 @@ fn prepared_multi_region_direct_cow_preserves_offsets_and_private_writes() {
     drop(guest_mem);
     drop(reservation);
     drop(cow_guards);
+}
+
+const PREPARED_MULTIRANGE_CHILD_TEST: &str =
+    "vmm::setup::tests::prepared_multirange_cross_process_child";
+const PREPARED_MULTIRANGE_ROOT_ENV: &str = "KTSTR_PREPARED_MULTIRANGE_ROOT";
+const PREPARED_MULTIRANGE_INDEX_ENV: &str = "KTSTR_PREPARED_MULTIRANGE_INDEX";
+const PREPARED_MULTIRANGE_CHILDREN: usize = 2;
+
+struct PreparedMultirangeChildren(Vec<Option<std::process::Child>>);
+
+impl PreparedMultirangeChildren {
+    fn spawn(root: &std::path::Path) -> Self {
+        let mut children = Vec::with_capacity(PREPARED_MULTIRANGE_CHILDREN);
+        for index in 0..PREPARED_MULTIRANGE_CHILDREN {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(PREPARED_MULTIRANGE_CHILD_TEST)
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(PREPARED_MULTIRANGE_ROOT_ENV, root)
+                .env(PREPARED_MULTIRANGE_INDEX_ENV, index.to_string())
+                .env(crate::KTSTR_CACHE_DIR_ENV, root.join("cache"))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+                .unwrap();
+            children.push(Some(child));
+        }
+        Self(children)
+    }
+
+    fn assert_running(&mut self, stage: &str) {
+        for child in &mut self.0 {
+            if let Some(process) = child
+                && let Some(status) = process.try_wait().unwrap()
+            {
+                panic!("prepared multirange child exited during {stage} with {status}");
+            }
+        }
+    }
+
+    fn wait_all_success(&mut self, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while self.0.iter().any(Option::is_some) {
+            for child in &mut self.0 {
+                let Some(process) = child.as_mut() else {
+                    continue;
+                };
+                if let Some(status) = process.try_wait().unwrap() {
+                    assert!(
+                        status.success(),
+                        "prepared multirange child exited with {status}"
+                    );
+                    *child = None;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "prepared multirange children did not finish before timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
+impl Drop for PreparedMultirangeChildren {
+    fn drop(&mut self) {
+        for process in self.0.iter_mut().flatten() {
+            let _ = process.kill();
+            let _ = process.wait();
+        }
+    }
+}
+
+fn prepared_multirange_wait_for_markers(
+    directory: &std::path::Path,
+    expected: usize,
+    children: &mut PreparedMultirangeChildren,
+    stage: &str,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let count = std::fs::read_dir(directory).unwrap().count();
+        if count == expected {
+            return;
+        }
+        children.assert_running(stage);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {count}/{expected} prepared multirange children reached {stage}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+fn prepared_multirange_wait_for_path(path: &std::path::Path, stage: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "prepared multirange child timed out waiting for {stage}: {}",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+fn prepared_multirange_wait_on_lock(path: &std::path::Path) {
+    let lock = std::fs::File::open(path).unwrap();
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockShared).unwrap();
+}
+
+fn prepared_multirange_pattern(len: usize, seed: usize) -> Vec<u8> {
+    (0..len)
+        .map(|index| ((index.wrapping_mul(131).wrapping_add(seed) % 251).wrapping_add(1)) as u8)
+        .collect()
+}
+
+fn prepared_multirange_read_exact_at(file: &std::fs::File, mut offset: u64, mut buffer: &mut [u8]) {
+    while !buffer.is_empty() {
+        match file.read_at(buffer, offset) {
+            Ok(0) => panic!("prepared multirange backing was truncated at {offset:#x}"),
+            Ok(read) => {
+                offset += read as u64;
+                buffer = &mut buffer[read..];
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => panic!("read prepared multirange backing at {offset:#x}: {error}"),
+        }
+    }
+}
+
+fn prepared_multirange_hash_update(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+struct PreparedMultirangeObservation {
+    index: usize,
+    dev: u64,
+    ino: u64,
+    file_offset: u64,
+    guest_offset: u64,
+    map_len: usize,
+    sample_file_offset: u64,
+    sample_guest_offset: u64,
+    original: u8,
+    private: u8,
+    observer: std::fs::File,
+}
+
+fn prepared_multirange_observations(
+    ranges: &[PreparedMapping],
+    child_index: usize,
+    host_page: usize,
+) -> Vec<PreparedMultirangeObservation> {
+    ranges
+        .iter()
+        .enumerate()
+        .map(|(index, range)| {
+            assert!(
+                range.map_len > host_page,
+                "prepared range {index} is too short for a COW sample"
+            );
+            let stat = rustix::fs::fstat(&range.fd).unwrap();
+            let observer = std::fs::File::from(range.fd.try_clone().unwrap());
+            let sample_file_offset = range.file_offset + host_page as u64;
+            let sample_guest_offset = range.guest_offset + host_page as u64;
+            let mut original = [0u8; 1];
+            prepared_multirange_read_exact_at(&observer, sample_file_offset, &mut original);
+            PreparedMultirangeObservation {
+                index,
+                dev: stat.st_dev,
+                ino: stat.st_ino,
+                file_offset: range.file_offset,
+                guest_offset: range.guest_offset,
+                map_len: range.map_len,
+                sample_file_offset,
+                sample_guest_offset,
+                original: original[0],
+                private: original[0].wrapping_add(child_index as u8 + 1),
+                observer,
+            }
+        })
+        .collect()
+}
+
+fn prepared_multirange_assert_complete_mapping(
+    guest_mem: &GuestMemoryMmap,
+    observation: &PreparedMultirangeObservation,
+) -> u64 {
+    const CHUNK: usize = 64 << 10;
+    let mut expected = vec![0u8; CHUNK];
+    let mut actual = vec![0u8; CHUNK];
+    let mut consumed = 0usize;
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    while consumed < observation.map_len {
+        let len = (observation.map_len - consumed).min(CHUNK);
+        prepared_multirange_read_exact_at(
+            &observation.observer,
+            observation.file_offset + consumed as u64,
+            &mut expected[..len],
+        );
+        guest_mem
+            .read_slice(
+                &mut actual[..len],
+                GuestAddress(observation.guest_offset + consumed as u64),
+            )
+            .unwrap();
+        if expected[..len] != actual[..len] {
+            let mismatch = expected[..len]
+                .iter()
+                .zip(&actual[..len])
+                .position(|(expected, actual)| expected != actual)
+                .unwrap();
+            panic!(
+                "prepared range {} differs from its CAS object at logical offset {:#x}: \
+                 expected {:#04x}, got {:#04x}",
+                observation.index,
+                consumed + mismatch,
+                expected[mismatch],
+                actual[mismatch]
+            );
+        }
+        hash = prepared_multirange_hash_update(hash, &expected[..len]);
+        consumed += len;
+    }
+    hash
+}
+
+fn prepared_multirange_assert_guest_samples(
+    guest_mem: &GuestMemoryMmap,
+    observations: &[PreparedMultirangeObservation],
+    private: bool,
+) {
+    for observation in observations {
+        let mut actual = [0u8; 1];
+        guest_mem
+            .read_slice(&mut actual, GuestAddress(observation.sample_guest_offset))
+            .unwrap();
+        let expected = if private {
+            observation.private
+        } else {
+            observation.original
+        };
+        assert_eq!(
+            actual[0],
+            expected,
+            "prepared range {} has the wrong {} sample",
+            observation.index,
+            if private { "private" } else { "shared" }
+        );
+    }
+}
+
+fn prepared_multirange_assert_backing_samples(observations: &[PreparedMultirangeObservation]) {
+    for observation in observations {
+        let mut actual = [0u8; 1];
+        prepared_multirange_read_exact_at(
+            &observation.observer,
+            observation.sample_file_offset,
+            &mut actual,
+        );
+        assert_eq!(
+            actual[0], observation.original,
+            "MAP_PRIVATE write changed prepared CAS range {}",
+            observation.index
+        );
+    }
+}
+
+fn prepared_multirange_write_private_samples(
+    guest_mem: &GuestMemoryMmap,
+    observations: &[PreparedMultirangeObservation],
+) {
+    for observation in observations {
+        guest_mem
+            .write_slice(
+                &[observation.private],
+                GuestAddress(observation.sample_guest_offset),
+            )
+            .unwrap();
+    }
+}
+
+fn prepared_multirange_child_result(
+    plan: super::super::initramfs_cache::PreparedRangePlan,
+    observations: &[PreparedMultirangeObservation],
+    hashes: &[u64],
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut result = format!(
+        "plan {} {} {} {}\n",
+        plan.part_count,
+        plan.direct_ranges,
+        plan.stitch_pages,
+        observations.len()
+    );
+    for (observation, hash) in observations.iter().zip(hashes) {
+        writeln!(
+            result,
+            "range {} {} {} {} {} {} {hash:016x}",
+            observation.index,
+            observation.dev,
+            observation.ino,
+            observation.file_offset,
+            observation.guest_offset,
+            observation.map_len,
+        )
+        .unwrap();
+    }
+    result
+}
+
+#[test]
+fn prepared_multirange_cross_process_child() {
+    let Some(root) = std::env::var_os(PREPARED_MULTIRANGE_ROOT_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let child_index: usize = std::env::var(PREPARED_MULTIRANGE_INDEX_ENV)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(child_index < PREPARED_MULTIRANGE_CHILDREN);
+
+    std::fs::write(root.join("ready").join(child_index.to_string()), b"ready").unwrap();
+    prepared_multirange_wait_on_lock(&root.join("build-start"));
+
+    let payload = root.join("inputs/payload");
+    let include = root.join("inputs/base-content");
+    let module = root.join("inputs/test-module.ko");
+    let includes = [("fixture/base-content".to_string(), include)];
+    let inputs = prepare_base_inputs(&payload, &[], &includes, None).unwrap();
+    let prepared_base =
+        get_or_prepare_base(inputs, initramfs::InitrdCompression::Uncompressed).unwrap();
+    let modules = [module];
+    let params = initramfs::SuffixParams {
+        payload: Some(&payload),
+        kernel_modules: &modules,
+        ..Default::default()
+    };
+    let prepared = complete_prepared_initrd(prepared_base, &params).unwrap();
+    let plan = prepared.plan();
+    assert_eq!(plan.part_count, 4, "base, payload, modules, and tail");
+    assert!(
+        plan.direct_ranges >= 2,
+        "large base and module parts must each produce a direct range: {plan:?}"
+    );
+    assert!(
+        plan.stitch_pages >= 2,
+        "both immutable-part boundaries must produce stitches: {plan:?}"
+    );
+
+    let compressed_len = prepared.compressed_len();
+    let mapping_granule = prepared.mapping_granule();
+    let compression = prepared.compression();
+    let ranges = prepared.into_ranges();
+    assert_eq!(
+        ranges.len(),
+        plan.direct_ranges + plan.stitch_pages,
+        "every direct range and stitch page must reach the loader"
+    );
+    assert!(
+        ranges.len() >= 4,
+        "fixture must exercise multiple direct and stitched mappings"
+    );
+    let mapped_len: usize = ranges.iter().map(|range| range.map_len).sum();
+    let host_page = host_page_size() as usize;
+    assert_eq!(
+        validate_prepared_load(
+            compressed_len,
+            compression,
+            mapping_granule,
+            host_page,
+            0,
+            &ranges,
+        )
+        .unwrap(),
+        compressed_len as u32
+    );
+    let observations = prepared_multirange_observations(&ranges, child_index, host_page);
+
+    // Guards are declared before guest memory so the MAP_FIXED VMAs are
+    // unmapped before their shared CAS locks are released.
+    let mut cow_guards = Vec::with_capacity(ranges.len());
+    let guest_mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), mapped_len)]).unwrap();
+    let validated =
+        validate_prepared_subranges(&guest_mem, ranges, 0, host_page, host_page).unwrap();
+    assert_eq!(validated.len(), observations.len());
+    assert!(
+        validated.iter().all(|range| range.subranges.len() == 1),
+        "one contiguous base-page guest region must not split logical ranges"
+    );
+    map_validated_prepared_ranges(
+        &mut cow_guards,
+        validated,
+        |subrange, fd| unsafe {
+            initramfs::cow_overlay_file_borrowed(
+                subrange.host_addr,
+                subrange.len,
+                fd,
+                subrange.file_offset,
+            )
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        cow_guards.len(),
+        observations.len(),
+        "every prepared mapping must retain its own locked CAS fd"
+    );
+
+    let hashes: Vec<u64> = observations
+        .iter()
+        .map(|observation| prepared_multirange_assert_complete_mapping(&guest_mem, observation))
+        .collect();
+    prepared_multirange_assert_guest_samples(&guest_mem, &observations, false);
+    prepared_multirange_assert_backing_samples(&observations);
+
+    // This is the second barrier, after preparation and after every CAS range
+    // has been mapped and faulted. Both independent processes therefore keep
+    // the same clean file pages live while the ordered COW exchange runs.
+    std::fs::write(root.join("mapped").join(child_index.to_string()), b"mapped").unwrap();
+    prepared_multirange_wait_on_lock(&root.join("cow-start"));
+
+    let writer_done = root.join("writer-done");
+    let observer_written = root.join("observer-written");
+    let writer_confirmed = root.join("writer-confirmed");
+    if child_index == 0 {
+        prepared_multirange_write_private_samples(&guest_mem, &observations);
+        prepared_multirange_assert_guest_samples(&guest_mem, &observations, true);
+        prepared_multirange_assert_backing_samples(&observations);
+        std::fs::write(&writer_done, b"writer-done").unwrap();
+
+        prepared_multirange_wait_for_path(&observer_written, "observer COW writes");
+        prepared_multirange_assert_guest_samples(&guest_mem, &observations, true);
+        prepared_multirange_assert_backing_samples(&observations);
+        std::fs::write(&writer_confirmed, b"writer-confirmed").unwrap();
+    } else {
+        prepared_multirange_wait_for_path(&writer_done, "writer COW writes");
+        prepared_multirange_assert_guest_samples(&guest_mem, &observations, false);
+        prepared_multirange_assert_backing_samples(&observations);
+
+        prepared_multirange_write_private_samples(&guest_mem, &observations);
+        prepared_multirange_assert_guest_samples(&guest_mem, &observations, true);
+        prepared_multirange_assert_backing_samples(&observations);
+        std::fs::write(&observer_written, b"observer-written").unwrap();
+
+        prepared_multirange_wait_for_path(&writer_confirmed, "writer isolation check");
+        prepared_multirange_assert_guest_samples(&guest_mem, &observations, true);
+        prepared_multirange_assert_backing_samples(&observations);
+    }
+
+    let result = prepared_multirange_child_result(plan, &observations, &hashes);
+    std::fs::write(root.join("results").join(child_index.to_string()), result).unwrap();
+
+    // Retain the production lifetime order explicitly.
+    drop(guest_mem);
+    drop(cow_guards);
+}
+
+#[test]
+fn prepared_multirange_cross_process_reuses_every_cas_range_and_cow_isolates() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    for directory in ["inputs", "ready", "mapped", "results"] {
+        std::fs::create_dir(root.join(directory)).unwrap();
+    }
+
+    let fixture_len = 2 * PREPARED_MAPPING_GRANULE + (host_page_size() as usize);
+    std::fs::write(
+        root.join("inputs/payload"),
+        b"non-ELF payload used only to shape a prepared archive",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("inputs/base-content"),
+        prepared_multirange_pattern(fixture_len, 17),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("inputs/test-module.ko"),
+        prepared_multirange_pattern(fixture_len, 83),
+    )
+    .unwrap();
+
+    let build_start = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join("build-start"))
+        .unwrap();
+    let cow_start = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join("cow-start"))
+        .unwrap();
+    rustix::fs::flock(&build_start, rustix::fs::FlockOperation::LockExclusive).unwrap();
+    rustix::fs::flock(&cow_start, rustix::fs::FlockOperation::LockExclusive).unwrap();
+
+    let mut children = PreparedMultirangeChildren::spawn(root);
+    prepared_multirange_wait_for_markers(
+        &root.join("ready"),
+        PREPARED_MULTIRANGE_CHILDREN,
+        &mut children,
+        "build-start barrier",
+    );
+    rustix::fs::flock(&build_start, rustix::fs::FlockOperation::Unlock).unwrap();
+
+    prepared_multirange_wait_for_markers(
+        &root.join("mapped"),
+        PREPARED_MULTIRANGE_CHILDREN,
+        &mut children,
+        "live-mapping barrier",
+    );
+    rustix::fs::flock(&cow_start, rustix::fs::FlockOperation::Unlock).unwrap();
+    children.wait_all_success(std::time::Duration::from_secs(60));
+
+    let writer = std::fs::read_to_string(root.join("results/0")).unwrap();
+    let observer = std::fs::read_to_string(root.join("results/1")).unwrap();
+    assert_eq!(
+        writer, observer,
+        "independent processes must map every range from the same CAS \
+         inode, file offset, guest offset, length, and content"
+    );
+    assert!(
+        writer.lines().count() >= 5,
+        "fixture must report one plan plus at least four mapped CAS ranges:\n{writer}"
+    );
 }
 
 #[test]
