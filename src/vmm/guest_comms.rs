@@ -1482,6 +1482,24 @@ pub fn send_sched_stderr_chunk(buf: &[u8]) -> bool {
     write_msg(MsgType::SchedStderr.wire_value(), buf)
 }
 
+/// Send an authoritative terminal scheduler-STDOUT chunk to the host.
+///
+/// The caller supplies the completion-aware payload produced by
+/// [`crate::vmm::wire::encode_sched_stream_final_chunk`] after the scheduler
+/// child and its stdout forwarder have exited. Unlike the best-effort live
+/// stream, these frames are not suppressed by lifecycle priority.
+pub(crate) fn try_send_sched_stdout_final_chunk(buf: &[u8]) -> bool {
+    write_msg(MsgType::SchedStdoutFinal.wire_value(), buf)
+}
+
+/// Send an authoritative terminal scheduler-STDERR chunk to the host.
+///
+/// Same terminal replay semantics as
+/// [`try_send_sched_stdout_final_chunk`], applied to stderr.
+pub(crate) fn try_send_sched_stderr_final_chunk(buf: &[u8]) -> bool {
+    write_msg(MsgType::SchedStderrFinal.wire_value(), buf)
+}
+
 /// Send a lifecycle phase event to the host. Payload: 1-byte
 /// [`LifecyclePhase`] discriminant followed by a UTF-8 reason
 /// suffix (only `SchedulerNotAttached` populates `reason`; every
@@ -2460,6 +2478,14 @@ mod tests {
         let priority = reserve_bulk_lifecycle_priority();
         assert!(lifecycle_priority_drops(MsgType::SchedStdout.wire_value()));
         assert!(lifecycle_priority_drops(MsgType::SchedStderr.wire_value()));
+        assert!(
+            !lifecycle_priority_drops(MsgType::SchedStdoutFinal.wire_value()),
+            "completion-proven stdout recovery must bypass live-copy suppression"
+        );
+        assert!(
+            !lifecycle_priority_drops(MsgType::SchedStderrFinal.wire_value()),
+            "completion-proven stderr recovery must bypass live-copy suppression"
+        );
         assert!(
             !lifecycle_priority_drops(MsgType::Lifecycle.wire_value()),
             "required lifecycle traffic must bypass its own reservation"

@@ -174,6 +174,22 @@ pub enum MsgType {
     /// log region between the `-- BEGIN/END PROG LOAD LOG --` markers)
     /// typically lands here.
     SchedStderr,
+    /// Guest→host authoritative terminal scheduler-STDOUT chunk.
+    ///
+    /// Live [`Self::SchedStdout`] frames are best-effort and may be
+    /// deliberately suppressed while scheduler lifecycle control boundaries
+    /// own the bulk channel. Once the child and both pipe forwarders have
+    /// exited, the guest replays the complete stdout sidecar through this
+    /// message type only if a live frame was suppressed or failed. Each
+    /// payload carries a total-length/offset header, so the host accepts only
+    /// complete terminal streams and can fall back to the live stream when a
+    /// terminal replay is interrupted.
+    SchedStdoutFinal,
+    /// Guest→host authoritative terminal scheduler-STDERR chunk.
+    ///
+    /// Same completion-aware terminal semantics as
+    /// [`Self::SchedStdoutFinal`], applied to the scheduler child's stderr.
+    SchedStderrFinal,
     /// Guest→host lifecycle phase event. Payload: 1-byte
     /// [`LifecyclePhase`] discriminant followed by an optional
     /// UTF-8 reason buffer (used by `SchedulerNotAttached`'s
@@ -348,6 +364,8 @@ impl MsgType {
             MsgType::SchedLog => MSG_TYPE_SCHED_LOG,
             MsgType::SchedStdout => MSG_TYPE_SCHED_STDOUT,
             MsgType::SchedStderr => MSG_TYPE_SCHED_STDERR,
+            MsgType::SchedStdoutFinal => MSG_TYPE_SCHED_STDOUT_FINAL,
+            MsgType::SchedStderrFinal => MSG_TYPE_SCHED_STDERR_FINAL,
             MsgType::Lifecycle => MSG_TYPE_LIFECYCLE,
             MsgType::ExecExit => MSG_TYPE_EXEC_EXIT,
             MsgType::Dmesg => MSG_TYPE_DMESG,
@@ -389,6 +407,8 @@ impl MsgType {
             MSG_TYPE_SCHED_LOG => Some(MsgType::SchedLog),
             MSG_TYPE_SCHED_STDOUT => Some(MsgType::SchedStdout),
             MSG_TYPE_SCHED_STDERR => Some(MsgType::SchedStderr),
+            MSG_TYPE_SCHED_STDOUT_FINAL => Some(MsgType::SchedStdoutFinal),
+            MSG_TYPE_SCHED_STDERR_FINAL => Some(MsgType::SchedStderrFinal),
             MSG_TYPE_LIFECYCLE => Some(MsgType::Lifecycle),
             MSG_TYPE_EXEC_EXIT => Some(MsgType::ExecExit),
             MSG_TYPE_DMESG => Some(MsgType::Dmesg),
@@ -1010,6 +1030,61 @@ pub const MSG_TYPE_SCHED_STDOUT: u32 = 0x5353_544f; // "SSTO"
 /// including the BPF verifier log region — typically lands). See
 /// [`MsgType::SchedStderr`].
 pub const MSG_TYPE_SCHED_STDERR: u32 = 0x5353_5445; // "SSTE"
+
+/// Guest→host authoritative terminal scheduler-STDOUT chunk.
+///
+/// The payload begins with [`SCHED_STREAM_FINAL_CHUNK_HEADER_SIZE`] bytes:
+/// total stream length (`u64` LE), then this chunk's byte offset (`u64` LE),
+/// followed by the raw stdout bytes. A zero-length stream is represented by
+/// one header-only frame with both fields zero. The host selects the terminal
+/// stream only after receiving a contiguous `0..total_len` transaction.
+pub const MSG_TYPE_SCHED_STDOUT_FINAL: u32 = 0x5353_4f46; // "SSOF"
+
+/// Guest→host authoritative terminal scheduler-STDERR chunk.
+///
+/// Same completion-aware payload format as
+/// [`MSG_TYPE_SCHED_STDOUT_FINAL`], applied to stderr.
+pub const MSG_TYPE_SCHED_STDERR_FINAL: u32 = 0x5353_4546; // "SSEF"
+
+/// Header bytes prepended to every authoritative terminal scheduler-stream
+/// chunk: total stream length (`u64` LE) + chunk offset (`u64` LE).
+pub const SCHED_STREAM_FINAL_CHUNK_HEADER_SIZE: usize = 16;
+
+/// Encode one authoritative terminal scheduler-stream chunk.
+///
+/// `offset + bytes.len()` must stay within `total_len`. The transport's TLV
+/// CRC authenticates the complete returned payload; the embedded lengths let
+/// the host reject an interrupted multi-frame replay as a whole.
+pub(crate) fn encode_sched_stream_final_chunk(
+    total_len: u64,
+    offset: u64,
+    bytes: &[u8],
+) -> Vec<u8> {
+    let chunk_end = offset
+        .checked_add(bytes.len() as u64)
+        .expect("scheduler stream chunk offset overflowed u64");
+    assert!(
+        chunk_end <= total_len,
+        "scheduler stream chunk {offset}..{chunk_end} exceeds total length {total_len}"
+    );
+    let mut payload = Vec::with_capacity(SCHED_STREAM_FINAL_CHUNK_HEADER_SIZE + bytes.len());
+    payload.extend_from_slice(&total_len.to_le_bytes());
+    payload.extend_from_slice(&offset.to_le_bytes());
+    payload.extend_from_slice(bytes);
+    payload
+}
+
+/// Decode one authoritative terminal scheduler-stream chunk.
+///
+/// Returns `(total_len, offset, bytes)` only when the fixed-width header is
+/// present and the chunk range is contained by `total_len`.
+pub(crate) fn decode_sched_stream_final_chunk(payload: &[u8]) -> Option<(u64, u64, &[u8])> {
+    let (header, bytes) = payload.split_at_checked(SCHED_STREAM_FINAL_CHUNK_HEADER_SIZE)?;
+    let total_len = u64::from_le_bytes(header[..8].try_into().ok()?);
+    let offset = u64::from_le_bytes(header[8..].try_into().ok()?);
+    let chunk_end = offset.checked_add(bytes.len() as u64)?;
+    (chunk_end <= total_len).then_some((total_len, offset, bytes))
+}
 
 /// Guest→host lifecycle phase event.
 ///
@@ -2032,6 +2107,10 @@ mod tests {
             MSG_TYPE_STDOUT,
             MSG_TYPE_STDERR,
             MSG_TYPE_SCHED_LOG,
+            MSG_TYPE_SCHED_STDOUT,
+            MSG_TYPE_SCHED_STDERR,
+            MSG_TYPE_SCHED_STDOUT_FINAL,
+            MSG_TYPE_SCHED_STDERR_FINAL,
             MSG_TYPE_LIFECYCLE,
             MSG_TYPE_EXEC_EXIT,
             MSG_TYPE_DMESG,
@@ -2078,6 +2157,31 @@ mod tests {
         assert_eq!(std::mem::size_of::<ShmMessage>(), 16);
     }
 
+    #[test]
+    fn scheduler_stream_final_chunk_header_round_trips_and_bounds_ranges() {
+        let payload = encode_sched_stream_final_chunk(11, 5, b" world");
+        assert_eq!(payload.len(), SCHED_STREAM_FINAL_CHUNK_HEADER_SIZE + 6);
+        assert_eq!(
+            decode_sched_stream_final_chunk(&payload),
+            Some((11, 5, b" world".as_slice()))
+        );
+        assert_eq!(
+            decode_sched_stream_final_chunk(&encode_sched_stream_final_chunk(0, 0, b"")),
+            Some((0, 0, b"".as_slice())),
+            "an empty authoritative stream needs an explicit complete frame"
+        );
+        assert!(
+            decode_sched_stream_final_chunk(&payload[..15]).is_none(),
+            "a truncated fixed-width header must be rejected"
+        );
+        let mut out_of_range = payload;
+        out_of_range[..8].copy_from_slice(&10u64.to_le_bytes());
+        assert!(
+            decode_sched_stream_final_chunk(&out_of_range).is_none(),
+            "offset + chunk bytes beyond total_len must be rejected"
+        );
+    }
+
     /// Every [`MsgType`] variant round-trips through
     /// `wire_value` → `from_wire`.
     #[test]
@@ -2112,6 +2216,8 @@ mod tests {
             MsgType::SchedLog,
             MsgType::SchedStdout,
             MsgType::SchedStderr,
+            MsgType::SchedStdoutFinal,
+            MsgType::SchedStderrFinal,
             MsgType::Lifecycle,
             MsgType::ExecExit,
             MsgType::Dmesg,
@@ -2191,6 +2297,14 @@ mod tests {
         assert_eq!(MsgType::SchedLog.wire_value(), MSG_TYPE_SCHED_LOG);
         assert_eq!(MsgType::SchedStdout.wire_value(), MSG_TYPE_SCHED_STDOUT);
         assert_eq!(MsgType::SchedStderr.wire_value(), MSG_TYPE_SCHED_STDERR);
+        assert_eq!(
+            MsgType::SchedStdoutFinal.wire_value(),
+            MSG_TYPE_SCHED_STDOUT_FINAL
+        );
+        assert_eq!(
+            MsgType::SchedStderrFinal.wire_value(),
+            MSG_TYPE_SCHED_STDERR_FINAL
+        );
         assert_eq!(MsgType::Lifecycle.wire_value(), MSG_TYPE_LIFECYCLE);
         assert_eq!(MsgType::ExecExit.wire_value(), MSG_TYPE_EXEC_EXIT);
         assert_eq!(MsgType::Dmesg.wire_value(), MSG_TYPE_DMESG);
@@ -2251,6 +2365,8 @@ mod tests {
             MsgType::SchedLog,
             MsgType::SchedStdout,
             MsgType::SchedStderr,
+            MsgType::SchedStdoutFinal,
+            MsgType::SchedStderrFinal,
             MsgType::Lifecycle,
             MsgType::ExecExit,
             MsgType::Dmesg,

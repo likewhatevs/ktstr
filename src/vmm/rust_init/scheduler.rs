@@ -1627,6 +1627,97 @@ impl Drop for ForwarderDrainOnDrop {
     }
 }
 
+/// One scheduler-child output pipe captured by a live forwarder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SchedulerOutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl SchedulerOutputStream {
+    fn replay_suffix(self) -> &'static str {
+        match self {
+            Self::Stdout => ".ktstr-stdout-replay",
+            Self::Stderr => ".ktstr-stderr-replay",
+        }
+    }
+}
+
+/// Completed per-stream capture retained only when at least one live frame
+/// failed to reach the host.
+///
+/// Appending a suffix to the merged-log path keeps every scheduler invocation
+/// in the same lifecycle-managed directory without assuming that the path is
+/// valid UTF-8 beyond the `log_path` contract.
+pub(crate) fn scheduler_stream_replay_path(
+    log_path: &str,
+    stream: SchedulerOutputStream,
+) -> std::path::PathBuf {
+    let mut path = std::ffi::OsString::from(log_path);
+    path.push(stream.replay_suffix());
+    path.into()
+}
+
+fn scheduler_stream_pending_path(
+    log_path: &str,
+    stream: SchedulerOutputStream,
+) -> std::path::PathBuf {
+    let mut path = scheduler_stream_replay_path(log_path, stream).into_os_string();
+    path.push(".pending");
+    path.into()
+}
+
+fn remove_scheduler_stream_capture_files(log_path: &str) {
+    for stream in [SchedulerOutputStream::Stdout, SchedulerOutputStream::Stderr] {
+        let _ = fs::remove_file(scheduler_stream_replay_path(log_path, stream));
+        let _ = fs::remove_file(scheduler_stream_pending_path(log_path, stream));
+    }
+}
+
+/// A forwarder writes every byte to a pending sidecar while attempting its
+/// best-effort live publication. At EOF it atomically promotes the file only
+/// when live publication was incomplete. A crash, read error, or sidecar write
+/// error therefore cannot masquerade as an authoritative complete replay.
+struct SchedulerStreamCapture {
+    file: fs::File,
+    pending_path: std::path::PathBuf,
+    replay_path: std::path::PathBuf,
+}
+
+impl SchedulerStreamCapture {
+    fn create(log_path: &str, stream: SchedulerOutputStream) -> std::io::Result<Self> {
+        let pending_path = scheduler_stream_pending_path(log_path, stream);
+        let replay_path = scheduler_stream_replay_path(log_path, stream);
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&pending_path)?;
+        Ok(Self {
+            file,
+            pending_path,
+            replay_path,
+        })
+    }
+
+    fn finish(mut self, replay_needed: bool) {
+        let flushed = !replay_needed || self.file.flush().is_ok();
+        drop(self.file);
+        if replay_needed && flushed {
+            if let Err(error) = fs::rename(&self.pending_path, &self.replay_path) {
+                tracing::warn!(
+                    pending_path = %self.pending_path.display(),
+                    replay_path = %self.replay_path.display(),
+                    %error,
+                    "failed to publish complete scheduler-stream replay"
+                );
+                let _ = fs::remove_file(&self.pending_path);
+            }
+        } else {
+            let _ = fs::remove_file(&self.pending_path);
+        }
+    }
+}
+
 static SCHED_FWD_THREADS: OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, Vec<SchedulerForwarder>>>,
 > = OnceLock::new();
@@ -1635,12 +1726,11 @@ pub(crate) const SCHED_FORWARDER_DRAIN_BOUND: std::time::Duration =
     std::time::Duration::from_secs(5);
 
 /// Wait (bounded) for the stdio forwarders registered against
-/// `log_path` to finish draining the dead child's pipes, so the merged
-/// log file and the live `SchedStdout`/`SchedStderr` streams both carry
-/// the child's complete output. Callers run AFTER the child was
-/// reaped, so EOF is already pending on both pipes and the wait is
-/// normally an immediate latch observation; the bound only trips if a
-/// forwarder wedges
+/// `log_path` to finish draining the dead child's pipes, so the merged log
+/// file and any completion-needed per-stream replay carry the child's full
+/// output. Callers run AFTER the child was reaped, so EOF is already pending
+/// on both pipes and the wait is normally an immediate latch observation; the
+/// bound only trips if a forwarder wedges
 /// (e.g. blocked on virtio backpressure the host never drains). On that
 /// bound the handles remain registered and `false` makes the log transaction
 /// retryable; it never frames a knowingly incomplete file. No-op success when
@@ -1686,29 +1776,37 @@ pub(crate) fn wait_sched_forwarders_drained(log_path: &str, deadline: std::time:
 
 /// Forwarder thread for one scheduler-child pipe: read chunks from
 /// `read_end` until EOF (child closed the write end), and for each
-/// chunk (a) append it to the merged `/tmp/sched.log` clone `log` and
-/// (b) ship it live to the host via `sender`.
+/// chunk (a) append it to the merged `/tmp/sched.log` clone `log`,
+/// (b) append it to a private per-stream pending sidecar, and (c) ship it
+/// live to the host via `sender`.
 ///
 /// The `log` append preserves the pre-streaming merged-file view: both
 /// forwarders hold clones of the SAME open file description (from
 /// `File::try_clone`), so their appends share one offset and interleave
 /// in read order exactly as the child's two direct-to-file fds did.
-/// The `sender` ship is best-effort (a not-yet-open bulk port drops the
-/// chunk); neither a file write error nor a send failure stops the
-/// drain — the thread reads to EOF so the pipe never wedges the child
-/// on backpressure.
+/// The `sender` ship is best-effort (a not-yet-open bulk port or lifecycle
+/// reservation drops the chunk). If every live send succeeds, the sidecar is
+/// deleted at EOF and terminal publication adds no redundant stream traffic.
+/// If any live send fails, a complete sidecar is atomically retained for the
+/// terminal replay path. Neither a file write error nor a send failure stops
+/// the drain — the thread reads to EOF so the pipe never wedges the child on
+/// backpressure.
 ///
 /// The caller registers the returned handle only after both stdout and stderr
 /// readers have spawned. This all-or-fallback handoff prevents a child from
 /// inheriting a pipe whose only reader failed to start (and then dying from
 /// SIGPIPE on its first diagnostic write).
-fn spawn_sched_log_forwarder(
+fn spawn_sched_log_forwarder<S>(
     mut read_end: fs::File,
     mut log: Option<fs::File>,
+    mut capture: Option<SchedulerStreamCapture>,
     name: &'static str,
-    sender: fn(&[u8]) -> bool,
+    sender: S,
     force_spawn_failure: bool,
-) -> std::io::Result<SchedulerForwarder> {
+) -> std::io::Result<SchedulerForwarder>
+where
+    S: Fn(&[u8]) -> bool + Send + 'static,
+{
     if force_spawn_failure {
         return Err(std::io::Error::other(
             "injected scheduler forwarder spawn failure",
@@ -1721,18 +1819,36 @@ fn spawn_sched_log_forwarder(
         .spawn(move || {
             let _drain_on_drop = drain_on_drop;
             let mut buf = [0u8; STDIO_CHUNK_BYTES];
+            let mut reached_eof = false;
+            let mut capture_complete = capture.is_some();
+            let mut live_publication_complete = true;
             loop {
                 match read_end.read(&mut buf) {
-                    Ok(0) => break, // EOF — child closed its stdout/stderr.
+                    Ok(0) => {
+                        reached_eof = true;
+                        break;
+                    }
                     Ok(n) => {
                         if let Some(f) = log.as_mut() {
                             let _ = f.write_all(&buf[..n]);
                         }
-                        let _ = sender(&buf[..n]);
+                        if capture_complete
+                            && capture
+                                .as_mut()
+                                .is_some_and(|capture| capture.file.write_all(&buf[..n]).is_err())
+                        {
+                            capture_complete = false;
+                        }
+                        if !sender(&buf[..n]) {
+                            live_publication_complete = false;
+                        }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
+            }
+            if let Some(capture) = capture {
+                capture.finish(reached_eof && capture_complete && !live_publication_complete);
             }
         })?;
     Ok(SchedulerForwarder { handle, drained })
@@ -1785,8 +1901,35 @@ fn try_stream_sched_stdio_inner(
     log_path: &str,
     fail_forwarder: Option<usize>,
 ) -> Option<(Stdio, Stdio)> {
+    // A replay path is authoritative only after its matching forwarder
+    // atomically promotes a complete pending capture. Remove stale artifacts
+    // before any setup branch can fall back to direct file descriptors.
+    remove_scheduler_stream_capture_files(log_path);
     let (stdout_r, stdout_w) = super::modes::make_pipe()?;
     let (stderr_r, stderr_w) = super::modes::make_pipe()?;
+    let captures = match (
+        SchedulerStreamCapture::create(log_path, SchedulerOutputStream::Stdout),
+        SchedulerStreamCapture::create(log_path, SchedulerOutputStream::Stderr),
+    ) {
+        (Ok(stdout), Ok(stderr)) => (Some(stdout), Some(stderr)),
+        (stdout, stderr) => {
+            let error = stdout
+                .as_ref()
+                .err()
+                .or_else(|| stderr.as_ref().err())
+                .expect("one scheduler-stream capture creation failed");
+            tracing::warn!(
+                log_path,
+                %error,
+                "scheduler stream sidecar setup failed; retaining live and merged output"
+            );
+            drop(stdout);
+            drop(stderr);
+            remove_scheduler_stream_capture_files(log_path);
+            (None, None)
+        }
+    };
+    let (stdout_capture, stderr_capture) = captures;
     // Clone the merged log file per forwarder so both append through
     // the SAME open file description (shared offset → interleave in
     // read order). A clone failure just drops the file append for that
@@ -1796,6 +1939,7 @@ fn try_stream_sched_stdio_inner(
     let stdout_handle = match spawn_sched_log_forwarder(
         stdout_r,
         stdout_log,
+        stdout_capture,
         "ktstr-sched-stdout-fwd",
         crate::vmm::guest_comms::send_sched_stdout_chunk,
         fail_forwarder == Some(0),
@@ -1807,12 +1951,14 @@ fn try_stream_sched_stdio_inner(
                 error = %error,
                 "scheduler stdout forwarder failed to spawn; using file-only stdio"
             );
+            remove_scheduler_stream_capture_files(log_path);
             return None;
         }
     };
     let stderr_handle = match spawn_sched_log_forwarder(
         stderr_r,
         stderr_log,
+        stderr_capture,
         "ktstr-sched-stderr-fwd",
         crate::vmm::guest_comms::send_sched_stderr_chunk,
         fail_forwarder == Some(1),
@@ -1825,6 +1971,7 @@ fn try_stream_sched_stdio_inner(
             drop(stdout_w);
             drop(stderr_w);
             stdout_handle.join();
+            remove_scheduler_stream_capture_files(log_path);
             tracing::warn!(
                 log_path,
                 error = %error,
@@ -2104,6 +2251,74 @@ pub(crate) fn spawn_scheduler_from_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn forwarder_retains_replay_only_after_a_live_publication_drop() {
+        let dir = tempfile::tempdir().expect("create scheduler replay tempdir");
+        let payload = b"one pipe-read chunk\n";
+
+        for live_send_succeeds in [true, false] {
+            let log_path = dir
+                .path()
+                .join(if live_send_succeeds {
+                    "all-live.log"
+                } else {
+                    "one-drop.log"
+                })
+                .to_string_lossy()
+                .into_owned();
+            remove_scheduler_stream_capture_files(&log_path);
+            let capture = SchedulerStreamCapture::create(&log_path, SchedulerOutputStream::Stdout)
+                .expect("create pending stdout capture");
+            let replay_path =
+                scheduler_stream_replay_path(&log_path, SchedulerOutputStream::Stdout);
+            let pending_path =
+                scheduler_stream_pending_path(&log_path, SchedulerOutputStream::Stdout);
+            let (read_end, mut write_end) =
+                super::super::modes::make_pipe().expect("create forwarder pipe");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let sender_calls = calls.clone();
+            let forwarder = spawn_sched_log_forwarder(
+                read_end,
+                None,
+                Some(capture),
+                "ktstr-sched-replay-test",
+                move |_| {
+                    let call = sender_calls.fetch_add(1, Ordering::SeqCst);
+                    live_send_succeeds || call != 0
+                },
+                false,
+            )
+            .expect("spawn scheduler test forwarder");
+            write_end
+                .write_all(payload)
+                .expect("write one atomic scheduler chunk");
+            drop(write_end);
+            forwarder.join();
+
+            assert!(
+                calls.load(Ordering::SeqCst) >= 1,
+                "the scheduler pipe must exercise at least one live frame"
+            );
+            assert!(
+                !pending_path.exists(),
+                "a completed forwarder must atomically resolve its pending capture"
+            );
+            if live_send_succeeds {
+                assert!(
+                    !replay_path.exists(),
+                    "fully published live output must add no terminal replay"
+                );
+            } else {
+                assert_eq!(
+                    fs::read(&replay_path).expect("read retained stdout replay"),
+                    payload,
+                    "one dropped live frame must retain the complete stream"
+                );
+            }
+        }
+    }
 
     #[test]
     fn either_forwarder_spawn_failure_uses_file_fds_without_sigpipe() {
@@ -2149,6 +2364,13 @@ mod tests {
                     .is_none(),
                 "partial forwarder setup must not publish a drain registry entry"
             );
+            for stream in [SchedulerOutputStream::Stdout, SchedulerOutputStream::Stderr] {
+                assert!(
+                    !scheduler_stream_replay_path(&path_string, stream).exists()
+                        && !scheduler_stream_pending_path(&path_string, stream).exists(),
+                    "file-only fallback must not expose an authoritative stream capture"
+                );
+            }
         }
     }
 

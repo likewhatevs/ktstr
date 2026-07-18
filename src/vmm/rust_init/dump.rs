@@ -166,7 +166,15 @@ enum SchedLogDumpPhase {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SchedStreamDumpCursor {
+    payload_offset: u64,
+    complete: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct SchedLogDumpCursor {
+    stdout: SchedStreamDumpCursor,
+    stderr: SchedStreamDumpCursor,
     start_sent: bool,
     payload_offset: u64,
     end_sent: bool,
@@ -257,6 +265,55 @@ impl SchedLogDumpLease {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         debug_assert_eq!(state.phase, SchedLogDumpPhase::InProgress);
         state.cursor.start_sent = true;
+    }
+
+    fn stream_cursor(
+        &self,
+        stream: super::scheduler::SchedulerOutputStream,
+    ) -> SchedStreamDumpCursor {
+        let cursor = self.cursor();
+        match stream {
+            super::scheduler::SchedulerOutputStream::Stdout => cursor.stdout,
+            super::scheduler::SchedulerOutputStream::Stderr => cursor.stderr,
+        }
+    }
+
+    fn advance_stream_payload(
+        &self,
+        stream: super::scheduler::SchedulerOutputStream,
+        bytes: usize,
+    ) {
+        let mut state = self
+            .slot
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert_eq!(state.phase, SchedLogDumpPhase::InProgress);
+        let cursor = match stream {
+            super::scheduler::SchedulerOutputStream::Stdout => &mut state.cursor.stdout,
+            super::scheduler::SchedulerOutputStream::Stderr => &mut state.cursor.stderr,
+        };
+        cursor.payload_offset = cursor
+            .payload_offset
+            .checked_add(bytes as u64)
+            .expect("scheduler stream transmission offset overflowed u64");
+    }
+
+    fn mark_stream_complete(&self, stream: super::scheduler::SchedulerOutputStream) {
+        let mut state = self
+            .slot
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert_eq!(state.phase, SchedLogDumpPhase::InProgress);
+        match stream {
+            super::scheduler::SchedulerOutputStream::Stdout => {
+                state.cursor.stdout.complete = true;
+            }
+            super::scheduler::SchedulerOutputStream::Stderr => {
+                state.cursor.stderr.complete = true;
+            }
+        }
     }
 
     fn advance_payload(&self, bytes: usize) {
@@ -372,11 +429,150 @@ fn dump_sched_output_with(
     )
 }
 
+#[cfg(test)]
 fn dump_sched_output_with_wire(
     log_path: &str,
     forwarder_deadline: std::time::Instant,
     wait_for_forwarders: impl FnOnce(&str, std::time::Instant) -> bool,
+    send: impl FnMut(&[u8]) -> bool,
+    wire: Option<&mut SchedLogWireLease<'_>>,
+) -> bool {
+    dump_sched_output_with_wire_and_streams(
+        log_path,
+        forwarder_deadline,
+        wait_for_forwarders,
+        send,
+        |_| false,
+        |_| false,
+        wire,
+    )
+}
+
+/// Replay one complete scheduler stream only when its forwarder retained an
+/// authoritative sidecar after observing a failed live publication.
+///
+/// Missing sidecars are the common, successful hot path: every live frame
+/// reached the host, so no terminal replay is sent. A present sidecar is
+/// immutable after its atomic promotion at forwarder EOF. Accepted ranges are
+/// recorded synchronously, allowing terminal retries to resume without
+/// duplicating a chunk. The host selects this stream only after the embedded
+/// offsets prove the full `0..total_len` transaction arrived.
+fn dump_sched_stream_replay(
+    log_path: &str,
+    stream: super::scheduler::SchedulerOutputStream,
+    lease: &SchedLogDumpLease,
     mut send: impl FnMut(&[u8]) -> bool,
+) -> bool {
+    let mut cursor = lease.stream_cursor(stream);
+    if cursor.complete {
+        return true;
+    }
+    let replay_path = super::scheduler::scheduler_stream_replay_path(log_path, stream);
+    let mut file = match fs::File::open(&replay_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(error) => {
+            tracing::warn!(
+                log_path,
+                replay_path = %replay_path.display(),
+                %error,
+                "scheduler stream replay open failed; retaining cursor"
+            );
+            return false;
+        }
+    };
+    let total_len = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            tracing::warn!(
+                log_path,
+                replay_path = %replay_path.display(),
+                %error,
+                "scheduler stream replay metadata failed; retaining cursor"
+            );
+            return false;
+        }
+    };
+    if total_len < cursor.payload_offset {
+        tracing::warn!(
+            log_path,
+            replay_path = %replay_path.display(),
+            total_len,
+            payload_offset = cursor.payload_offset,
+            "scheduler stream replay shrank behind its accepted cursor"
+        );
+        return false;
+    }
+    if let Err(error) = file.seek(SeekFrom::Start(cursor.payload_offset)) {
+        tracing::warn!(
+            log_path,
+            replay_path = %replay_path.display(),
+            %error,
+            "scheduler stream replay seek failed; retaining cursor"
+        );
+        return false;
+    }
+
+    // An empty capture still needs one explicit frame to distinguish a
+    // complete empty stream from an interrupted transaction.
+    if total_len == 0 {
+        let payload = crate::vmm::wire::encode_sched_stream_final_chunk(0, 0, &[]);
+        if !send(&payload) {
+            return false;
+        }
+        lease.mark_stream_complete(stream);
+        return true;
+    }
+
+    let mut chunk = [0u8; SCHED_LOG_CHUNK_BYTES];
+    while cursor.payload_offset < total_len {
+        let remaining = (total_len - cursor.payload_offset) as usize;
+        let read_len = remaining.min(chunk.len());
+        let read = match file.read(&mut chunk[..read_len]) {
+            Ok(0) => {
+                tracing::warn!(
+                    log_path,
+                    replay_path = %replay_path.display(),
+                    total_len,
+                    payload_offset = cursor.payload_offset,
+                    "scheduler stream replay ended before its recorded length"
+                );
+                return false;
+            }
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                tracing::warn!(
+                    log_path,
+                    replay_path = %replay_path.display(),
+                    %error,
+                    "scheduler stream replay read failed; retaining cursor"
+                );
+                return false;
+            }
+        };
+        let payload = crate::vmm::wire::encode_sched_stream_final_chunk(
+            total_len,
+            cursor.payload_offset,
+            &chunk[..read],
+        );
+        if !send(&payload) {
+            return false;
+        }
+        lease.advance_stream_payload(stream, read);
+        cursor.payload_offset += read as u64;
+    }
+    lease.mark_stream_complete(stream);
+    true
+}
+
+fn dump_sched_output_with_wire_and_streams(
+    log_path: &str,
+    forwarder_deadline: std::time::Instant,
+    wait_for_forwarders: impl FnOnce(&str, std::time::Instant) -> bool,
+    mut send: impl FnMut(&[u8]) -> bool,
+    mut send_stdout_replay: impl FnMut(&[u8]) -> bool,
+    mut send_stderr_replay: impl FnMut(&[u8]) -> bool,
     mut wire: Option<&mut SchedLogWireLease<'_>>,
 ) -> bool {
     let Some(lease) = SchedLogDumpLease::acquire(log_path) else {
@@ -397,6 +593,23 @@ fn dump_sched_output_with_wire(
     // bytes. Wait (bounded) so the dumped file — and the live
     // SchedStdout/SchedStderr streams — carry the complete output.
     if !wait_for_forwarders(log_path, forwarder_deadline) {
+        return false;
+    }
+
+    if !dump_sched_stream_replay(
+        log_path,
+        super::scheduler::SchedulerOutputStream::Stdout,
+        &lease,
+        &mut send_stdout_replay,
+    ) {
+        return false;
+    }
+    if !dump_sched_stream_replay(
+        log_path,
+        super::scheduler::SchedulerOutputStream::Stderr,
+        &lease,
+        &mut send_stderr_replay,
+    ) {
         return false;
     }
 
@@ -496,16 +709,28 @@ pub(crate) fn dump_sched_output_before_terminal(log_path: &str) -> bool {
         &owner,
         log_path,
         |wire, forwarder_deadline| {
-            let complete = dump_sched_output_with_wire(
-                log_path,
-                forwarder_deadline,
-                super::scheduler::wait_sched_forwarders_drained,
-                crate::vmm::guest_comms::try_send_sched_log,
-                Some(wire),
-            );
+            let complete =
+                dump_sched_output_with_terminal_streams(log_path, forwarder_deadline, wire);
             SchedLogDumpAttempt { complete }
         },
         write_com2,
+    )
+}
+
+#[must_use]
+fn dump_sched_output_with_terminal_streams(
+    log_path: &str,
+    forwarder_deadline: std::time::Instant,
+    wire: &mut SchedLogWireLease<'_>,
+) -> bool {
+    dump_sched_output_with_wire_and_streams(
+        log_path,
+        forwarder_deadline,
+        super::scheduler::wait_sched_forwarders_drained,
+        crate::vmm::guest_comms::try_send_sched_log,
+        crate::vmm::guest_comms::try_send_sched_stdout_final_chunk,
+        crate::vmm::guest_comms::try_send_sched_stderr_final_chunk,
+        Some(wire),
     )
 }
 
@@ -2274,8 +2499,9 @@ mod tests {
         SchedExitPublicationGate, SchedExitTerminal, SchedLogDumpAttempt, SchedLogWireCoordinator,
         SchedLogWireLease, drain_probe_for_shutdown, dump_sched_output_before_terminal_with,
         dump_sched_output_with, dump_sched_output_with_wire,
-        send_synthetic_sched_output_before_terminal_with, spawn_sched_exit_monitor_thread,
-        staged_scheduler_log_paths, start_sched_exit_monitor_inner,
+        dump_sched_output_with_wire_and_streams, send_synthetic_sched_output_before_terminal_with,
+        spawn_sched_exit_monitor_thread, staged_scheduler_log_paths,
+        start_sched_exit_monitor_inner,
     };
     use crate::sync::Latch;
     use crate::vmm::wire::{AttachCancelCause, AttachControlPacket};
@@ -2682,6 +2908,126 @@ mod tests {
             },
         ));
         assert_eq!(frames[1].as_slice(), payload);
+    }
+
+    #[test]
+    fn terminal_stream_replay_is_absent_on_complete_live_and_resumable_after_drop() {
+        let dir = tempfile::tempdir().expect("create scheduler-stream replay tempdir");
+
+        let complete_live_path = dir.path().join("complete-live.log");
+        std::fs::write(&complete_live_path, b"merged").expect("write complete-live merged log");
+        let complete_live_path = complete_live_path.to_string_lossy().into_owned();
+        let mut merged_frames = Vec::new();
+        let mut stdout_replays = 0usize;
+        let mut stderr_replays = 0usize;
+        assert!(dump_sched_output_with_wire_and_streams(
+            &complete_live_path,
+            std::time::Instant::now() + Duration::from_secs(1),
+            |_, _| true,
+            |chunk| {
+                merged_frames.push(chunk.to_vec());
+                true
+            },
+            |_| {
+                stdout_replays += 1;
+                true
+            },
+            |_| {
+                stderr_replays += 1;
+                true
+            },
+            None,
+        ));
+        assert_eq!(
+            (stdout_replays, stderr_replays),
+            (0, 0),
+            "fully delivered live streams must generate no terminal replay frames"
+        );
+        assert_eq!(merged_frames.len(), 3);
+
+        let dropped_path = dir.path().join("dropped-live.log");
+        std::fs::write(&dropped_path, b"merged after dropped live frame")
+            .expect("write dropped-live merged log");
+        let dropped_path = dropped_path.to_string_lossy().into_owned();
+        let mut replay = vec![0x6du8; super::SCHED_LOG_CHUNK_BYTES];
+        replay.extend_from_slice(b"tail");
+        let stdout_replay_path = super::super::scheduler::scheduler_stream_replay_path(
+            &dropped_path,
+            super::super::scheduler::SchedulerOutputStream::Stdout,
+        );
+        std::fs::write(&stdout_replay_path, &replay).expect("write authoritative stdout replay");
+
+        let accepted = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let first_accepted = accepted.clone();
+        let mut first_frame = 0usize;
+        assert!(!dump_sched_output_with_wire_and_streams(
+            &dropped_path,
+            std::time::Instant::now() + Duration::from_secs(1),
+            |_, _| true,
+            |_| panic!("merged log must wait for an incomplete stream replay"),
+            |chunk| {
+                let frame = first_frame;
+                first_frame += 1;
+                if frame == 1 {
+                    return false;
+                }
+                first_accepted
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(chunk.to_vec());
+                true
+            },
+            |_| panic!("an absent stderr sidecar must not emit a replay"),
+            None,
+        ));
+
+        let retry_accepted = accepted.clone();
+        let mut retry_merged = Vec::new();
+        assert!(dump_sched_output_with_wire_and_streams(
+            &dropped_path,
+            std::time::Instant::now() + Duration::from_secs(1),
+            |_, _| true,
+            |chunk| {
+                retry_merged.push(chunk.to_vec());
+                true
+            },
+            |chunk| {
+                retry_accepted
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(chunk.to_vec());
+                true
+            },
+            |_| panic!("an absent stderr sidecar must not emit a replay"),
+            None,
+        ));
+
+        let accepted = accepted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            accepted.len(),
+            2,
+            "accepted replay ranges must not be duplicated across retries"
+        );
+        let mut reconstructed = Vec::new();
+        for (index, payload) in accepted.iter().enumerate() {
+            let (total_len, offset, bytes) =
+                crate::vmm::wire::decode_sched_stream_final_chunk(payload)
+                    .expect("decode accepted terminal stream frame");
+            assert_eq!(total_len, replay.len() as u64);
+            assert_eq!(offset, reconstructed.len() as u64, "frame {index} offset");
+            reconstructed.extend_from_slice(bytes);
+        }
+        assert_eq!(reconstructed, replay);
+        assert_eq!(
+            retry_merged,
+            vec![
+                crate::verifier::SCHED_OUTPUT_START.as_bytes().to_vec(),
+                b"merged after dropped live frame".to_vec(),
+                crate::verifier::SCHED_OUTPUT_END.as_bytes().to_vec(),
+            ]
+        );
     }
 
     #[test]

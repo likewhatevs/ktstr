@@ -573,12 +573,27 @@ mod tests {
     fn parse_recognises_all_new_msg_type_variants() {
         use super::super::wire::{
             MSG_TYPE_DMESG, MSG_TYPE_EXEC_EXIT, MSG_TYPE_LIFECYCLE, MSG_TYPE_PROBE_OUTPUT,
-            MSG_TYPE_SCHED_LOG, MSG_TYPE_STDERR, MSG_TYPE_STDOUT, MsgType,
+            MSG_TYPE_SCHED_LOG, MSG_TYPE_SCHED_STDERR, MSG_TYPE_SCHED_STDERR_FINAL,
+            MSG_TYPE_SCHED_STDOUT, MSG_TYPE_SCHED_STDOUT_FINAL, MSG_TYPE_STDERR, MSG_TYPE_STDOUT,
+            MsgType,
         };
+        let empty_final = super::super::wire::encode_sched_stream_final_chunk(0, 0, &[]);
         let cases: &[(u32, MsgType, &[u8])] = &[
             (MSG_TYPE_STDOUT, MsgType::Stdout, b"hello\n"),
             (MSG_TYPE_STDERR, MsgType::Stderr, b"error\n"),
             (MSG_TYPE_SCHED_LOG, MsgType::SchedLog, b"---SCHED---\n"),
+            (MSG_TYPE_SCHED_STDOUT, MsgType::SchedStdout, b"sched out\n"),
+            (MSG_TYPE_SCHED_STDERR, MsgType::SchedStderr, b"sched err\n"),
+            (
+                MSG_TYPE_SCHED_STDOUT_FINAL,
+                MsgType::SchedStdoutFinal,
+                &empty_final,
+            ),
+            (
+                MSG_TYPE_SCHED_STDERR_FINAL,
+                MsgType::SchedStderrFinal,
+                &empty_final,
+            ),
             // Lifecycle payload layout: 1-byte phase + reason
             // bytes. Use the InitStarted phase (=1) here.
             (MSG_TYPE_LIFECYCLE, MsgType::Lifecycle, &[1u8]),

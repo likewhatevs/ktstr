@@ -266,6 +266,78 @@ pub(crate) fn concat_sched_stderr_chunks(
     concat_chunks_of(drain, crate::vmm::wire::MSG_TYPE_SCHED_STDERR)
 }
 
+/// Reassemble every complete authoritative scheduler-stream transaction.
+///
+/// A transaction begins at offset zero and is accepted only when CRC-valid,
+/// well-formed chunks cover one contiguous `0..total_len` range. Interrupted
+/// replay is deliberately invisible to callers: they retain the best-effort
+/// live stream instead. Multiple complete transactions are concatenated in
+/// arrival order for scheduler-lifecycle runs that replace a scheduler inside
+/// one VM.
+fn concat_complete_sched_stream_replays(
+    drain: Option<&crate::vmm::host_comms::BulkDrainResult>,
+    msg_type: u32,
+) -> Option<String> {
+    let drain = drain?;
+    let mut completed = Vec::<u8>::new();
+    let mut transaction = None::<(u64, Vec<u8>)>;
+    let mut saw_complete = false;
+
+    for entry in &drain.entries {
+        if entry.msg_type != msg_type {
+            continue;
+        }
+        if !entry.crc_ok {
+            transaction = None;
+            continue;
+        }
+        let Some((total_len, offset, bytes)) =
+            crate::vmm::wire::decode_sched_stream_final_chunk(&entry.payload)
+        else {
+            transaction = None;
+            continue;
+        };
+        if offset == 0 {
+            transaction = Some((total_len, Vec::new()));
+        }
+        let Some((expected_total, bytes_so_far)) = transaction.as_mut() else {
+            continue;
+        };
+        if *expected_total != total_len
+            || offset != bytes_so_far.len() as u64
+            || (bytes.is_empty() && offset != total_len)
+        {
+            transaction = None;
+            continue;
+        }
+        bytes_so_far.extend_from_slice(bytes);
+        if bytes_so_far.len() as u64 == total_len {
+            completed.extend_from_slice(bytes_so_far);
+            saw_complete = true;
+            transaction = None;
+        }
+    }
+
+    saw_complete.then(|| String::from_utf8_lossy(&completed).into_owned())
+}
+
+/// Select the authoritative terminal replay when one arrived completely;
+/// otherwise preserve the live-stream behavior used by old guests and timeout
+/// paths that never reach terminal publication.
+fn scheduler_stream_with_terminal_fallback(
+    drain: Option<&crate::vmm::host_comms::BulkDrainResult>,
+    live_msg_type: u32,
+    replay_msg_type: u32,
+) -> String {
+    concat_complete_sched_stream_replays(drain, replay_msg_type).unwrap_or_else(|| {
+        match live_msg_type {
+            crate::vmm::wire::MSG_TYPE_SCHED_STDOUT => concat_sched_stdout_chunks(drain),
+            crate::vmm::wire::MSG_TYPE_SCHED_STDERR => concat_sched_stderr_chunks(drain),
+            _ => concat_chunks_of(drain, live_msg_type),
+        }
+    })
+}
+
 /// Concatenate every CRC-valid chunk of one `msg_type` in the drain,
 /// in arrival order. Shared inner for the per-stream concat helpers.
 fn concat_chunks_of(
@@ -938,19 +1010,19 @@ pub struct VerifierVmResult {
     /// empty — [`Self::scheduler_stdout`] / [`Self::scheduler_stderr`]
     /// are the live-streamed fallbacks that survive that case.
     pub scheduler_log: String,
-    /// The scheduler child's LIVE stdout, concatenated from the
-    /// `MSG_TYPE_SCHED_STDOUT` frames shipped per pipe-read as the run
-    /// progressed. Best-effort: whatever reached the host before the VM
-    /// exited or was watchdog-killed. Populated UNCONDITIONALLY (timeout
-    /// included) so a hung VM still surfaces its stdout. Raw child stream
-    /// — no `SCHED_OUTPUT_START/END` framing.
+    /// The scheduler child's stdout. Normally concatenated directly from the
+    /// live `MSG_TYPE_SCHED_STDOUT` frames shipped per pipe read. When the
+    /// guest detects that a live frame was suppressed or failed, a complete
+    /// terminal replay replaces that partial live stream only after its
+    /// offsets prove every byte arrived. Watchdog-killed and older guests keep
+    /// the best-effort live behavior. Raw child stream — no
+    /// `SCHED_OUTPUT_START/END` framing.
     pub scheduler_stdout: String,
-    /// The scheduler child's LIVE stderr, concatenated from the
-    /// `MSG_TYPE_SCHED_STDERR` frames. Same best-effort / unconditional
-    /// semantics as [`Self::scheduler_stdout`]. With the split streams,
-    /// libbpf / log-crate output (including the BPF verifier log region
-    /// between the `-- BEGIN/END PROG LOAD LOG --` markers) typically
-    /// lands here.
+    /// The scheduler child's stderr, using the same live-first,
+    /// completion-proven terminal fallback semantics as
+    /// [`Self::scheduler_stdout`]. Libbpf / log-crate output (including the
+    /// BPF verifier log region between the `-- BEGIN/END PROG LOAD LOG --`
+    /// markers) typically lands here.
     pub scheduler_stderr: String,
     /// Whether the scheduler positively confirmed attach. Derived from
     /// the guest's lifecycle frames ([`AttachOutcome`]). Attach is
@@ -1289,14 +1361,20 @@ pub(crate) fn collect_verifier_output_with_memory_min(
         parse_sched_output(&result.output).unwrap_or("").to_string()
     };
 
-    // Concatenate the LIVE scheduler stdout / stderr streams. These are
-    // populated UNCONDITIONALLY — including on `result.timed_out`, the
-    // core case the merged-file dump misses: a watchdog kill never
-    // reaches `dump_sched_output`, but any live chunk that arrived
-    // before the kill survives in `guest_messages`. Raw child streams
-    // (no `SCHED_OUTPUT_START/END` framing), so no `parse_sched_output`.
-    let scheduler_stdout = concat_sched_stdout_chunks(result.guest_messages.as_ref());
-    let scheduler_stderr = concat_sched_stderr_chunks(result.guest_messages.as_ref());
+    // Prefer a completion-proven terminal replay only when the guest observed
+    // a dropped live chunk for that stream. Otherwise retain the zero-replay
+    // live path. Watchdog kills and old guests never emit final frames, so
+    // their existing best-effort live semantics remain unchanged.
+    let scheduler_stdout = scheduler_stream_with_terminal_fallback(
+        result.guest_messages.as_ref(),
+        crate::vmm::wire::MSG_TYPE_SCHED_STDOUT,
+        crate::vmm::wire::MSG_TYPE_SCHED_STDOUT_FINAL,
+    );
+    let scheduler_stderr = scheduler_stream_with_terminal_fallback(
+        result.guest_messages.as_ref(),
+        crate::vmm::wire::MSG_TYPE_SCHED_STDERR,
+        crate::vmm::wire::MSG_TYPE_SCHED_STDERR_FINAL,
+    );
 
     // Build ProgStats from host-side ProgVerifierStats. Each program
     // that loaded successfully is visible in prog_idr with its
@@ -2054,6 +2132,107 @@ pub fn render_instruction_count_tables(records: &[VerifierCellRecord]) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_scheduler_stream_requires_completion_and_overrides_live_atomically() {
+        use crate::vmm::host_comms::BulkDrainResult;
+        use crate::vmm::wire::{
+            MSG_TYPE_SCHED_STDERR, MSG_TYPE_SCHED_STDERR_FINAL, ShmEntry,
+            encode_sched_stream_final_chunk,
+        };
+
+        let entry = |msg_type, payload: Vec<u8>| ShmEntry {
+            msg_type,
+            payload,
+            crc_ok: true,
+        };
+        let live = || {
+            entry(
+                MSG_TYPE_SCHED_STDERR,
+                b"live prefix missing one chunk\n".to_vec(),
+            )
+        };
+
+        let old_guest = BulkDrainResult {
+            entries: vec![live()],
+        };
+        assert_eq!(
+            scheduler_stream_with_terminal_fallback(
+                Some(&old_guest),
+                MSG_TYPE_SCHED_STDERR,
+                MSG_TYPE_SCHED_STDERR_FINAL,
+            ),
+            "live prefix missing one chunk\n",
+            "absence of new frames must preserve old-guest live semantics"
+        );
+
+        let complete = b"authoritative complete scheduler stderr\n";
+        let split = 14usize;
+        let recovered = BulkDrainResult {
+            entries: vec![
+                live(),
+                entry(
+                    MSG_TYPE_SCHED_STDERR_FINAL,
+                    encode_sched_stream_final_chunk(complete.len() as u64, 0, &complete[..split]),
+                ),
+                entry(
+                    MSG_TYPE_SCHED_STDERR_FINAL,
+                    encode_sched_stream_final_chunk(
+                        complete.len() as u64,
+                        split as u64,
+                        &complete[split..],
+                    ),
+                ),
+            ],
+        };
+        assert_eq!(
+            scheduler_stream_with_terminal_fallback(
+                Some(&recovered),
+                MSG_TYPE_SCHED_STDERR,
+                MSG_TYPE_SCHED_STDERR_FINAL,
+            ),
+            String::from_utf8_lossy(complete),
+            "one completion-proven replay must replace the partial live stream"
+        );
+
+        let interrupted = BulkDrainResult {
+            entries: vec![
+                live(),
+                entry(
+                    MSG_TYPE_SCHED_STDERR_FINAL,
+                    encode_sched_stream_final_chunk(complete.len() as u64, 0, &complete[..split]),
+                ),
+            ],
+        };
+        assert_eq!(
+            scheduler_stream_with_terminal_fallback(
+                Some(&interrupted),
+                MSG_TYPE_SCHED_STDERR,
+                MSG_TYPE_SCHED_STDERR_FINAL,
+            ),
+            "live prefix missing one chunk\n",
+            "an interrupted terminal transaction must never replace live output"
+        );
+
+        let explicit_empty = BulkDrainResult {
+            entries: vec![
+                live(),
+                entry(
+                    MSG_TYPE_SCHED_STDERR_FINAL,
+                    encode_sched_stream_final_chunk(0, 0, &[]),
+                ),
+            ],
+        };
+        assert_eq!(
+            scheduler_stream_with_terminal_fallback(
+                Some(&explicit_empty),
+                MSG_TYPE_SCHED_STDERR,
+                MSG_TYPE_SCHED_STDERR_FINAL,
+            ),
+            "",
+            "a complete empty transaction is distinct from no final transaction"
+        );
+    }
 
     #[test]
     fn absent_scheduler_artifact_manifest_authorizes_legacy_fallback() {
