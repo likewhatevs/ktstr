@@ -21,6 +21,9 @@ use jobserver as gix_acquire_jobserver;
 // planning, and reporter seams without treating the network-only functions as
 // dead-code errors under the workspace's `-D warnings`.
 #[allow(dead_code)]
+#[path = "../build_support/cargo_make.rs"]
+mod cargo_make;
+#[allow(dead_code)]
 #[path = "../build_support/gix_acquire.rs"]
 mod gix_acquire;
 
@@ -1104,4 +1107,19 @@ fn heartbeat_spawn_failure_keeps_acquisition_reporting_usable() {
     );
     reporter.set_phase("phase-only reporting remains live");
     drop(reporter);
+}
+
+#[test]
+fn configured_make_retains_jobserver_descriptors_through_spawn() {
+    let client = jobserver::Client::new(2).expect("create fixture jobserver");
+    let mut command =
+        cargo_make::CargoCoordinatedMake::with_client(Command::new("make"), Some(client));
+    command
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = command
+        .status()
+        .expect("configured child must not fail pre-exec with EBADF");
+    assert!(status.success(), "make --version must succeed");
 }

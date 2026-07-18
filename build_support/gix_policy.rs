@@ -11,6 +11,12 @@ use gix::bstr::ByteSlice;
 const HTTP_CONNECT_TIMEOUT_MS: u64 = 20_000;
 const HTTP_LOW_SPEED_LIMIT: u32 = 1024;
 const HTTP_LOW_SPEED_TIME_SECONDS: u64 = 30;
+const SYSTEM_CA_BUNDLES: &[&str] = &[
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+];
 
 /// A source whose implementation is known not to launch a helper process.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,10 +110,31 @@ pub(crate) fn open_options_with_transport_limits(
         format!("http.lowSpeedLimit={low_speed_limit}"),
         format!("http.lowSpeedTime={low_speed_time_seconds}"),
     ];
+    // curl's statically linked rustls backend has no compiled-in CA path. If
+    // neither CAINFO nor the native-CA option is set, recent libcurl reaches
+    // rustls_client_config_builder_build() without any verifier and every
+    // HTTPS request fails before the handshake. Point gix at the host's
+    // ordinary system bundle explicitly while keeping verification enabled.
+    if let Some(ca_bundle) = first_existing_regular_file(
+        SYSTEM_CA_BUNDLES
+            .iter()
+            .map(|candidate| std::path::Path::new(candidate)),
+    ) {
+        overrides.push(format!("http.sslCAInfo={}", ca_bundle.display()));
+    }
     if let Some(no_proxy) = no_proxy {
         overrides.push(format!("gitoxide.http.noProxy={no_proxy}"));
     }
     options.config_overrides(overrides)
+}
+
+fn first_existing_regular_file<'a>(
+    candidates: impl IntoIterator<Item = &'a std::path::Path>,
+) -> Option<PathBuf> {
+    candidates
+        .into_iter()
+        .find(|candidate| std::fs::metadata(candidate).is_ok_and(|metadata| metadata.is_file()))
+        .map(std::path::Path::to_path_buf)
 }
 
 /// Refuse authentication uniformly for public source acquisition.
@@ -124,7 +151,7 @@ pub(crate) fn reject_credentials(
 
 #[cfg(test)]
 mod tests {
-    use super::{InProcessSource, classify_source};
+    use super::{InProcessSource, classify_source, first_existing_regular_file};
 
     #[test]
     fn helper_capable_schemes_are_rejected_during_classification() {
@@ -160,5 +187,23 @@ mod tests {
             classify_source("/tmp/repository.git").unwrap(),
             InProcessSource::Local(_)
         ));
+    }
+
+    #[test]
+    fn ca_bundle_selection_uses_the_first_regular_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let directory = temp.path().join("directory");
+        let first = temp.path().join("first.pem");
+        let second = temp.path().join("second.pem");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        assert_eq!(
+            first_existing_regular_file(
+                [&missing, &directory, &first, &second].map(std::path::PathBuf::as_path)
+            ),
+            Some(first)
+        );
     }
 }

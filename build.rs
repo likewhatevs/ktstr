@@ -12,6 +12,9 @@ use std::env;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+#[path = "build_support/cargo_make.rs"]
+mod cargo_make;
+
 #[cfg(feature = "vendored")]
 use libbpf_cargo::SkeletonBuilder;
 
@@ -30,27 +33,9 @@ mod gix_acquire;
 include!("src/kernel_path.rs");
 include!("src/build_helpers.rs");
 
-/// Construct GNU make so it participates in Cargo's inherited jobserver.
-///
-/// Cargo exposes the jobserver authentication in `CARGO_MAKEFLAGS`, while
-/// GNU make consumes it from `MAKEFLAGS`. Propagating it lets every native
-/// build use otherwise-idle capacity without creating a second,
-/// oversubscribed worker pool.
 #[cfg(any(feature = "vendored", feature = "wprof"))]
-fn cargo_coordinated_make() -> Command {
-    let mut command = Command::new("make");
-    // SAFETY: Cargo owns the authenticated jobserver descriptors inherited by
-    // this build script. `configure()` marks those descriptors inheritable by
-    // GNU make instead of merely copying their numeric names.
-    if let Some(client) = unsafe { jobserver::Client::from_env() } {
-        client.configure(&mut command);
-    }
-    // GNU make consumes MAKEFLAGS directly. Retain Cargo's compatibility
-    // spelling after `configure()` has authenticated descriptor inheritance.
-    if let Some(makeflags) = std::env::var_os("CARGO_MAKEFLAGS") {
-        command.env("MAKEFLAGS", makeflags);
-    }
-    command
+fn cargo_coordinated_make() -> cargo_make::CargoCoordinatedMake {
+    cargo_make::CargoCoordinatedMake::new()
 }
 
 fn main() {
