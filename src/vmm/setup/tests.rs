@@ -1,6 +1,30 @@
 use super::*;
 
 #[test]
+fn prepared_split_alignment_accepts_257mib_custom_node_boundary_on_base_pages() {
+    let host_page = host_page_size() as usize;
+    let first_slice = 129usize << 20;
+    assert_eq!(
+        prepared_region_split_alignment(
+            MemoryBacking::BasePages,
+            host_page,
+            PREPARED_MAPPING_GRANULE,
+        ),
+        host_page
+    );
+    assert!(first_slice.is_multiple_of(host_page));
+    assert!(!first_slice.is_multiple_of(PREPARED_MAPPING_GRANULE));
+    assert_eq!(
+        prepared_region_split_alignment(
+            MemoryBacking::HugeTlb2M,
+            host_page,
+            PREPARED_MAPPING_GRANULE,
+        ),
+        PREPARED_MAPPING_GRANULE
+    );
+}
+
+#[test]
 fn prepared_host_address_accepts_page_aligned_non_hugepage_va() {
     let host_page = host_page_size() as usize;
     assert!(
@@ -37,8 +61,9 @@ fn aarch64_initrd_stays_below_pvtime_carve() {
     use crate::vmm::{aarch64::fdt::pvtime_base, kvm::DRAM_START};
     for &(mem, cpus) in &[(512u32, 2u32), (512, 8), (2048, 256), (4096, 512)] {
         let pvt = pvtime_base(mem, cpus);
-        // A near-max initrd that still fits below the carve.
-        let max = pvt - DRAM_START - (1 << 20);
+        // Leave two mapping granules of slack: both the ceiling and mapped
+        // extent round on 2 MiB boundaries.
+        let max = pvt - DRAM_START - (2 * PREPARED_MAPPING_GRANULE as u64);
         let load = aarch64_initrd_addr(mem, cpus, max).expect("near-max initrd must fit");
         assert!(
             load >= DRAM_START,
@@ -674,62 +699,42 @@ fn try_cow_overlay_rejects_unaligned_load_addr() {
     let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
 }
 
-/// `aarch64_initrd_addr` must return a host-page-aligned load address —
-/// the exact invariant the COW `MAP_FIXED` overlay relies on (the
-/// function header cites `EINVAL` on a mid-host-page target). The
-/// existing aarch64 tests bound the address (`>= DRAM_START`,
-/// `load + max <= pvtime_base`) and check the oversized `Err` path but
-/// never assert host-page alignment. Each fixture size is chosen so the
-/// pre-mask `pvtime_base - size` is NOT page-aligned, proving the mask
-/// rounds it down rather than passing trivially.
+/// `aarch64_initrd_addr` aligns both the ceiling and mapped extent to the
+/// uniform 2 MiB prepared-object granule. This keeps every range/file offset
+/// directly mappable and valid when the underlying guest VMA is hugetlb.
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn aarch64_initrd_addr_returns_host_page_aligned_address() {
-    use crate::vmm::{aarch64::fdt::pvtime_base, kvm::DRAM_START};
-    let page = host_page_size();
+fn aarch64_initrd_addr_returns_mapping_granule_aligned_address() {
+    use crate::vmm::aarch64::fdt::pvtime_base;
+    let granule = PREPARED_MAPPING_GRANULE as u64;
     for &(mem, cpus) in &[(512u32, 2u32), (512, 8), (2048, 256), (4096, 512)] {
         let pvt = pvtime_base(mem, cpus);
-        // Size chosen so `pvt - size = DRAM_START + 12345`, whose low
-        // bits (12345) are not page-aligned: the mask must round down.
-        let size = pvt - DRAM_START - 12345;
+        let size = 7_000_123;
         let load = aarch64_initrd_addr(mem, cpus, size)
             .expect("non-oversized initrd must produce a load address");
         assert_eq!(
-            load & (page - 1),
+            load & (granule - 1),
             0,
-            "initrd load addr {load:#x} not host-page-aligned \
-             (mem={mem} cpus={cpus} size={size:#x} page={page:#x})",
+            "initrd load addr {load:#x} not prepared-granule-aligned \
+             (mem={mem} cpus={cpus} size={size:#x} granule={granule:#x})",
         );
-        // The pre-mask top was deliberately unaligned, so the mask did
-        // real work: the aligned result must be strictly below it.
-        let pre_mask_top = pvt - size;
-        assert_ne!(
-            pre_mask_top & (page - 1),
-            0,
-            "fixture must present a non-page-aligned pre-mask top so the \
-             mask is exercised (mem={mem} cpus={cpus})",
-        );
-        assert!(
-            load < pre_mask_top,
-            "masked load {load:#x} must round DOWN from unaligned top \
-             {pre_mask_top:#x} (mem={mem} cpus={cpus})",
-        );
+        let mapped = (size + granule - 1) & !(granule - 1);
+        assert_eq!(load + mapped, pvt & !(granule - 1));
     }
 }
 
 /// Pin the EXACT `aarch64_initrd_addr` arithmetic against an
-/// independently-computed reference: `(pvtime_base(mem,cpus) - size) &
-/// !(host_page_size() - 1)`. The existing aarch64 tests only bound the
-/// result, so a drift that swapped the ceiling (`pvtime_base` vs
-/// `fdt_address`) or changed the alignment granule would still satisfy
-/// their inequalities but fail this exact-equality pin.
+/// independently-computed reference:
+/// `align_down(pvtime_base, 2MiB) - align_up(size, 2MiB)`.
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn aarch64_initrd_addr_exact_value_for_aligned_fit() {
     use crate::vmm::aarch64::fdt::pvtime_base;
-    let page = host_page_size();
+    let granule = PREPARED_MAPPING_GRANULE as u64;
     for &(mem, cpus, size) in &[(512u32, 2u32, 1u64 << 20), (2048, 256, 7_000_000)] {
-        let expected = (pvtime_base(mem, cpus) - size) & !(page - 1);
+        let aligned_ceiling = pvtime_base(mem, cpus) & !(granule - 1);
+        let mapped = (size + granule - 1) & !(granule - 1);
+        let expected = aligned_ceiling - mapped;
         assert_eq!(
             aarch64_initrd_addr(mem, cpus, size).unwrap(),
             expected,

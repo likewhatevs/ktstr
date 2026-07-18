@@ -22,10 +22,12 @@ lifecycle: boot, attach, scenario, collect, teardown. See
 
 ### Fast boot
 
-The initramfs base (test binary + busybox + shared libraries) is
-LZ4-compressed and cached in shared memory; concurrent VMs COW-map the
-cached base instead of rebuilding it, so boot is dominated by kernel
-init, not initramfs preparation. Measured on a 64-CPU host:
+Initramfs base, payload, and module parts are compressed once per
+content-addressed recipe and stored in a persistent regular-file cache.
+Concurrent VMs privately COW-map the cached ranges instead of rebuilding or
+copying them, so boot is dominated by kernel init rather than initramfs
+preparation. This applies to every supported initrd compression format.
+Measured on a 64-CPU host:
 
 <div class="kt-kpis">
 <div class="kt-kpi"><strong>55.583µs</strong><span>initramfs spawn</span></div>

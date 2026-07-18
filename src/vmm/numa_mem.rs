@@ -29,6 +29,13 @@ impl Drop for ReservationGuard {
 pub(crate) struct AllocatedMemory {
     pub guest_mem: GuestMemoryMmap,
     pub reservation: ReservationGuard,
+    pub backing: MemoryBacking,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemoryBacking {
+    BasePages,
+    HugeTlb2M,
 }
 
 /// Per-NUMA-node guest physical address range.
@@ -180,6 +187,40 @@ fn hugepage_even_split_mib(total_mib: u32, nodes: u32) -> Vec<u32> {
 }
 
 impl NumaMemoryLayout {
+    const HUGE_2MB: u64 = 2 * 1024 * 1024;
+
+    /// Explicit hugetlb VMAs can only be split/replaced at 2 MiB boundaries.
+    /// Every internal guest-memory region therefore has to start on that
+    /// boundary. An odd final tail is fine: it introduces no later boundary
+    /// and Linux rounds its hugetlb VMA span up behind the exact KVM slot.
+    fn hugetlb_compatible(&self) -> bool {
+        self.regions
+            .iter()
+            .all(|region| region.gpa_start.is_multiple_of(Self::HUGE_2MB))
+    }
+
+    fn hugepages_needed(&self) -> u64 {
+        self.regions
+            .iter()
+            .map(|region| region.size.div_ceil(Self::HUGE_2MB))
+            .sum()
+    }
+
+    fn choose_memory_backing(
+        &self,
+        use_hugepages: bool,
+        performance_mode: bool,
+        hugepages_free: u64,
+    ) -> MemoryBacking {
+        if self.hugetlb_compatible()
+            && (use_hugepages || (performance_mode && hugepages_free >= self.hugepages_needed()))
+        {
+            MemoryBacking::HugeTlb2M
+        } else {
+            MemoryBacking::BasePages
+        }
+    }
+
     /// Compute per-node GPA ranges from a topology and total memory.
     ///
     /// `dram_base`: GPA where guest RAM starts (0 on x86_64,
@@ -386,13 +427,12 @@ impl NumaMemoryLayout {
         // total would under-count and let a MAP_HUGETLB mmap fail on a
         // short pool (it routes to a clean contention SKIP, but the gate
         // should be accurate).
-        let hugepages_needed: u64 = self
-            .regions
-            .iter()
-            .map(|r| r.size.div_ceil(2 * 1024 * 1024))
-            .sum();
-        let use_hugepages = use_hugepages
-            || (performance_mode && super::host_topology::hugepages_free() >= hugepages_needed);
+        let backing = self.choose_memory_backing(
+            use_hugepages,
+            performance_mode,
+            super::host_topology::hugepages_free(),
+        );
+        let use_hugepages = backing == MemoryBacking::HugeTlb2M;
 
         // Hugepage host-VA layout. MAP_HUGETLB | MAP_FIXED rejects
         // (EINVAL, fs/hugetlbfs/inode.c hugetlb_get_unmapped_area) any
@@ -408,17 +448,12 @@ impl NumaMemoryLayout {
         // memory_size -- virt/kvm/kvm_main.c access_ok spans only
         // memory_size). For the snapped even-split path region.size is
         // already a 2 MiB multiple so the round is a no-op. A caller-
-        // declared (with_nodes) non-2 MiB node size also maps cleanly --
-        // its host-VA base is aligned here -- but a non-2 MiB size
-        // misaligns that node's end GPA AND, cumulatively, every later
-        // node's base GPA, so that node and all subsequent nodes drop to
-        // 4 KiB EPT (arch/x86/kvm/x86.c kvm_alloc_memslot_metadata
-        // GPA/HVA congruence). A sub-2 MiB node (a tiny total, or a tiny
-        // declared node) is likewise permitted at 4 KiB EPT rather than
-        // rejected -- an intentional divergence from qemu, which errors
-        // on a region smaller than one huge page (system/physmem.c
-        // file_ram_alloc) -- so a caller's declared topology stays
-        // bootable. Base 4 KiB pages need no rounding (align 1).
+        // caller-declared internal GPA boundary that is not 2 MiB aligned
+        // selects base-page backing above. That preserves the exact topology
+        // and lets the direct-initrd loader split on host pages; an explicit
+        // hugetlb VMA could only be replaced on a 2 MiB boundary. An odd final
+        // tail remains compatible because it creates no later boundary.
+        // Base pages need no host-VA span rounding (align 1).
         const HUGE_2MB: usize = 2 * 1024 * 1024;
         let va_align = if use_hugepages { HUGE_2MB } else { 1 };
         let round_up = |n: usize| (n + va_align - 1) & !(va_align - 1);
@@ -484,6 +519,7 @@ impl NumaMemoryLayout {
         Ok(AllocatedMemory {
             guest_mem,
             reservation: guard,
+            backing,
         })
     }
 
@@ -700,6 +736,55 @@ impl NumaMemoryLayout {
                 );
             }
         }
+    }
+
+    /// Reapply NUMA policy to a file-backed range that replaced part of a
+    /// guest-memory region with `MAP_FIXED`.
+    ///
+    /// Unlike [`Self::mbind_regions`], this deliberately does not populate
+    /// or write-fault any page. The immutable prepared-initrd mapping must
+    /// stay shared with the host page cache until the guest actually writes
+    /// a page; `MADV_POPULATE_WRITE` here would eagerly COW the entire image.
+    pub fn mbind_replaced_range(
+        &self,
+        guest_addr: u64,
+        host_addr: *mut u8,
+        len: usize,
+        host_nodes: &[Vec<usize>],
+    ) -> Result<()> {
+        anyhow::ensure!(len > 0, "replaced NUMA range is empty");
+        let region = self
+            .regions
+            .iter()
+            .find(|region| {
+                guest_addr >= region.gpa_start
+                    && guest_addr < region.gpa_start.saturating_add(region.size)
+            })
+            .with_context(|| format!("no NUMA region contains replaced GPA {guest_addr:#x}"))?;
+        let guest_end = guest_addr
+            .checked_add(len as u64)
+            .context("replaced NUMA range end overflows")?;
+        anyhow::ensure!(
+            guest_end <= region.gpa_start.saturating_add(region.size),
+            "replaced NUMA range {guest_addr:#x}..{guest_end:#x} crosses node {} boundary",
+            region.node_id
+        );
+        let nodes = host_nodes.get(region.node_id as usize).with_context(|| {
+            format!(
+                "missing host NUMA mapping for guest node {}",
+                region.node_id
+            )
+        })?;
+        if nodes.is_empty() || len == 0 {
+            return Ok(());
+        }
+        // SAFETY: load_prepared_initrd calls this immediately after a
+        // successful MAP_FIXED of exactly `(host_addr, len)`. The subrange
+        // was prevalidated to lie wholly within this NodeRegion.
+        unsafe {
+            super::host_topology::mbind_to_nodes(host_addr, len, nodes);
+        }
+        Ok(())
     }
 
     /// Test helper — find the node region containing a GPA.
@@ -1077,60 +1162,34 @@ mod tests {
     static ODD_NODES: [NumaNode; 2] = [NumaNode::new(2, 33), NumaNode::new(2, 33)];
 
     #[test]
-    fn allocate_hugepages_with_nodes_nonaligned_size() {
-        // Coverage: a with_nodes topology declares EXACT
-        // per-node sizes (a hard contract — they are NOT snapped). A
-        // non-2 MiB declared size (33 MiB) under use_hugepages takes the
-        // A-degradation path: the host-VA base is 2 MiB-aligned (va_span
-        // = round_up) so the MAP_HUGETLB | MAP_FIXED mmap does NOT EINVAL,
-        // while the KVM slot keeps the exact 33 MiB memory_size (the
-        // rounded tail is mapped-but-unregistered). This is the only
-        // shape where va_span != node_size on the hugepage path. Host-
-        // gated on free 2 MiB hugepages; the CI-runnable invariants are
-        // the helper + uniform_multi_numa_remainder tests above.
+    fn custom_odd_internal_boundary_selects_base_page_backing() {
         let topo = Topology::with_nodes(4, 2, &ODD_NODES);
         let layout = NumaMemoryLayout::compute(&topo, 66, 0, None).unwrap();
-        // Declared (non-2 MiB) sizes are preserved exactly — not snapped.
         assert_eq!(layout.regions()[0].size, 33 << 20);
         assert_eq!(layout.regions()[1].size, 33 << 20);
-        let needed: u64 = layout
-            .regions()
-            .iter()
-            .map(|r| r.size.div_ceil(2 * 1024 * 1024))
-            .sum();
-        if crate::vmm::host_topology::hugepages_free() < needed {
-            eprintln!(
-                "SKIP allocate_hugepages_with_nodes_nonaligned_size: < {needed} free 2 MiB hugepages"
-            );
-            return;
-        }
-        let kvm = kvm_ioctls::Kvm::new().unwrap();
-        let vm_fd = kvm.create_vm().unwrap();
-        // The non-2 MiB declared size must still map (host VA base
-        // aligned) — no EINVAL. .expect() pins the A-degradation path.
-        let alloc = layout.allocate_and_register(&vm_fd, true, false).expect(
-            "non-2 MiB with_nodes hugepage allocate must not EINVAL (host VA base aligned)",
+        assert_eq!(layout.regions()[1].gpa_start, 33 << 20);
+        assert_eq!(
+            layout.choose_memory_backing(true, true, u64::MAX),
+            MemoryBacking::BasePages
         );
-        use vm_memory::GuestMemoryRegion;
-        // memory_size stays the exact declared 66 MiB total (contract).
-        let total: u64 = alloc.guest_mem.iter().map(|r| r.len()).sum();
-        assert_eq!(total, 66 << 20);
-        // Every node's host VA base is 2 MiB-aligned (the EINVAL fix);
-        // the GPAs are NOT (node1's declared base is 33 MiB) — the
-        // intentional A-degradation for caller-exact sizes.
-        const TWO_MIB: usize = 2 << 20;
-        for r in layout.regions() {
-            let hva = alloc
-                .guest_mem
-                .get_host_address(GuestAddress(r.gpa_start))
-                .unwrap();
-            assert_eq!(
-                hva as usize % TWO_MIB,
-                0,
-                "node {} host VA not 2 MiB-aligned",
-                r.node_id
-            );
-        }
+    }
+
+    #[test]
+    fn odd_final_tail_remains_hugetlb_compatible() {
+        let topo = Topology::new(3, 3, 2, 1);
+        let layout = NumaMemoryLayout::compute(&topo, 101, 0, None).unwrap();
+        assert_eq!(
+            layout
+                .regions()
+                .iter()
+                .map(|region| region.size >> 20)
+                .collect::<Vec<_>>(),
+            vec![34, 34, 33]
+        );
+        assert_eq!(
+            layout.choose_memory_backing(true, false, 0),
+            MemoryBacking::HugeTlb2M
+        );
     }
 
     #[test]
@@ -1370,6 +1429,35 @@ mod tests {
         assert_eq!(layout.regions().len(), 1);
         assert_eq!(layout.regions()[0].gpa_start, dram_base);
         assert_eq!(layout.regions()[0].size, 16384 << 20);
+    }
+
+    #[test]
+    fn replaced_ranges_require_and_accept_node_aligned_splits() {
+        let topo = Topology::new(2, 1, 2, 1);
+        let layout = NumaMemoryLayout::compute(&topo, 4, 0, None).unwrap();
+        assert_eq!(layout.regions().len(), 2);
+        let boundary = layout.regions()[1].gpa_start;
+        let dummy = std::ptr::dangling_mut::<u8>();
+        let empty_policies = vec![Vec::new(), Vec::new()];
+
+        assert!(
+            layout
+                .mbind_replaced_range(boundary - (1 << 20), dummy, 2 << 20, &empty_policies,)
+                .is_err(),
+            "one mmap policy operation must not silently cross NodeRegions"
+        );
+        layout
+            .mbind_replaced_range(boundary - (1 << 20), dummy, 1 << 20, &empty_policies)
+            .unwrap();
+        layout
+            .mbind_replaced_range(boundary, dummy, 1 << 20, &empty_policies)
+            .unwrap();
+        assert!(
+            layout
+                .mbind_replaced_range(boundary, dummy, 1 << 20, &[Vec::new()])
+                .is_err(),
+            "a missing host-node mapping must be observable"
+        );
     }
 
     #[test]

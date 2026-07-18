@@ -16,7 +16,7 @@ use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 use super::ioapic::{IOAPIC_BASE, IOAPIC_SIZE, Ioapic, MsiRoute};
 use super::topology::{apic_id, generate_cpuid, max_apic_id};
-use crate::vmm::numa_mem::{NumaMemoryLayout, ReservationGuard};
+use crate::vmm::numa_mem::{MemoryBacking, NumaMemoryLayout, ReservationGuard};
 use crate::vmm::pi_mutex::PiMutex;
 use crate::vmm::topology::Topology;
 
@@ -332,6 +332,9 @@ pub struct KtstrKvm {
     /// Per-node GPA layout used by ACPI SRAT/HMAT generation. `None`
     /// in deferred mode before `allocate_and_register_memory()`.
     pub(crate) numa_layout: Option<NumaMemoryLayout>,
+    /// Actual backing selected by the allocator. `None` only before deferred
+    /// memory allocation.
+    pub(crate) memory_backing: Option<MemoryBacking>,
     /// Whether KVM supports the immediate_exit mechanism (KVM_CAP_IMMEDIATE_EXIT).
     pub has_immediate_exit: bool,
     /// Split IRQ chip mode: LAPIC in kernel, PIC/IOAPIC emulated in userspace.
@@ -352,13 +355,9 @@ pub struct KtstrKvm {
     /// Owns the VA reservation for per-node MAP_FIXED mmaps.
     /// Drop munmaps the entire reservation.
     _reservation: Option<ReservationGuard>,
-    /// RAII guards for COW-overlayed initramfs segments. Each guard
-    /// holds the lz4 SHM fd with `LOCK_SH`; dropping it releases the
-    /// flock and closes the fd. Must drop AFTER `_reservation` so the
-    /// COW VMAs are torn down (via the reservation's munmap) before
-    /// the flock is released — otherwise a concurrent writer could
-    /// take `LOCK_EX` and truncate the segment while the guest still
-    /// holds pages that fault through the backing file.
+    /// RAII guards for direct-COW initramfs mappings. Each guard holds its
+    /// immutable CAS object fd with `LOCK_SH`. Must drop AFTER `_reservation`
+    /// so GC cannot unlink the backing before the COW VMAs are torn down.
     pub(crate) cow_overlay_guards: Vec<crate::vmm::initramfs::CowOverlayGuard>,
     /// Whether this VM exposes the virtio-PCI transport (a PCI host bridge with
     /// ECAM/CAM config access). `false` keeps the guest on virtio-MMIO only —
@@ -444,6 +443,7 @@ impl KtstrKvm {
         unsafe { ManuallyDrop::drop(&mut self.guest_mem) };
         self.guest_mem = ManuallyDrop::new(alloc.guest_mem);
         self._reservation = Some(alloc.reservation);
+        self.memory_backing = Some(alloc.backing);
         self.numa_layout = Some(layout);
         Ok(())
     }
@@ -492,18 +492,23 @@ impl KtstrKvm {
 
         Self::tune_kvm_caps(&vm_fd, performance_mode)?;
 
-        let (guest_mem, numa_layout, reservation) = match memory_mib {
+        let (guest_mem, numa_layout, reservation, memory_backing) = match memory_mib {
             Some(mb) => {
                 let layout =
                     NumaMemoryLayout::compute(&topo, mb, 0, Some((MMIO_GAP_START, MMIO_GAP_END)))?;
                 let alloc =
                     layout.allocate_and_register(&vm_fd, use_hugepages, performance_mode)?;
-                (alloc.guest_mem, Some(layout), Some(alloc.reservation))
+                (
+                    alloc.guest_mem,
+                    Some(layout),
+                    Some(alloc.reservation),
+                    Some(alloc.backing),
+                )
             }
             None => {
                 let placeholder = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 4096)])
                     .context("allocate placeholder guest memory")?;
-                (placeholder, None, None)
+                (placeholder, None, None, None)
             }
         };
 
@@ -523,6 +528,7 @@ impl KtstrKvm {
             guest_mem: ManuallyDrop::new(guest_mem),
             topology: topo,
             numa_layout,
+            memory_backing,
             has_immediate_exit,
             split_irqchip,
             ioapic,

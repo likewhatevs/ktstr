@@ -86,15 +86,33 @@ const LD_CACHE_HEADER_SIZE: usize = 48;
 /// Per-entry size: flags(4) + key(4) + value(4) + osversion(4) + hwcap(8).
 const LD_CACHE_ENTRY_SIZE: usize = 24;
 
+#[derive(Debug, Default)]
+struct LdSoCache {
+    /// First currently usable path per soname. Retained as the map-like
+    /// compatibility surface for parser tests and diagnostics.
+    selected: HashMap<String, PathBuf>,
+    /// Every absolute cache candidate in file order, including missing and
+    /// dangling paths whose later appearance must invalidate a closure.
+    candidates: HashMap<String, Vec<PathBuf>>,
+}
+
+impl std::ops::Deref for LdSoCache {
+    type Target = HashMap<String, PathBuf>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.selected
+    }
+}
+
 /// Parse the binary `/etc/ld.so.cache` file into a soname->path map.
 ///
 /// Scans for the new-format magic because some systems prepend the
 /// old format (`ld.so-1.7.0`) before the new-format section.
-fn parse_ld_so_cache(path: &Path) -> HashMap<String, PathBuf> {
-    let mut map = HashMap::new();
+fn parse_ld_so_cache(path: &Path) -> LdSoCache {
+    let mut cache = LdSoCache::default();
     let data = match std::fs::read(path) {
         Ok(d) => d,
-        Err(_) => return map,
+        Err(_) => return cache,
     };
     // Scan for new-format magic. Usually at offset 0, but old-format
     // systems prepend the legacy section.
@@ -102,16 +120,16 @@ fn parse_ld_so_cache(path: &Path) -> HashMap<String, PathBuf> {
         .windows(LD_CACHE_MAGIC.len())
         .position(|w| w == LD_CACHE_MAGIC)
     else {
-        return map;
+        return cache;
     };
     let hdr = magic_pos;
     if data.len() < hdr + LD_CACHE_HEADER_SIZE {
-        return map;
+        return cache;
     }
     let nlibs = u32::from_le_bytes(data[hdr + 20..hdr + 24].try_into().unwrap()) as usize;
     let min_size = hdr + LD_CACHE_HEADER_SIZE + nlibs * LD_CACHE_ENTRY_SIZE;
     if data.len() < min_size {
-        return map;
+        return cache;
     }
     for i in 0..nlibs {
         let off = hdr + LD_CACHE_HEADER_SIZE + i * LD_CACHE_ENTRY_SIZE;
@@ -129,15 +147,23 @@ fn parse_ld_so_cache(path: &Path) -> HashMap<String, PathBuf> {
             Some(s) => s,
             None => continue,
         };
-        // Only accept absolute paths that exist as files.
+        // Keep every absolute path, including a currently missing or
+        // dangling candidate. Resolution records followed metadata for the
+        // candidate before deciding whether to use it, so a target that
+        // appears later invalidates the persistent closure.
         if path_str.starts_with('/') {
             let p = PathBuf::from(path_str);
+            cache
+                .candidates
+                .entry(soname.to_string())
+                .or_default()
+                .push(p.clone());
             if p.is_file() {
-                map.entry(soname.to_string()).or_insert(p);
+                cache.selected.entry(soname.to_string()).or_insert(p);
             }
         }
     }
-    map
+    cache
 }
 
 /// Read a null-terminated C string from `data` at `offset`.
@@ -337,7 +363,7 @@ fn resolve_shared_libs_inner(
     extra_interp_hints: &[PathBuf],
     loader_cwd: &Path,
     ld_library_path_dirs: &[PathBuf],
-    ld_so_cache: &HashMap<String, PathBuf>,
+    ld_so_cache: &LdSoCache,
 ) -> Result<SharedLibs> {
     // Cross-process memoisation and builder election live in
     // initramfs_cache. Keeping no path-only process cache here avoids stale
@@ -710,7 +736,7 @@ fn resolve_soname_with_loader(
     interp_hints: &[PathBuf],
     loader_cwd: &Path,
     ld_library_path_dirs: &[PathBuf],
-    ld_so_cache: &HashMap<String, PathBuf>,
+    ld_so_cache: &LdSoCache,
     observations: &mut Vec<ResolverPathObservation>,
 ) -> Result<Option<PathBuf>> {
     // 1. DT_RPATH (legacy). Non-empty only when DT_RUNPATH is absent
@@ -720,6 +746,7 @@ fn resolve_soname_with_loader(
         let dir = normalize_loader_search_dir(dir, loader_cwd);
         observe_search_path(&dir, observations)?;
         let candidate = dir.join(soname);
+        observe_search_path(&candidate, observations)?;
         if candidate.is_file() {
             return Ok(Some(candidate));
         }
@@ -730,6 +757,7 @@ fn resolve_soname_with_loader(
         let dir = normalize_loader_search_dir(dir, loader_cwd);
         observe_search_path(&dir, observations)?;
         let candidate = dir.join(soname);
+        observe_search_path(&candidate, observations)?;
         if candidate.is_file() {
             return Ok(Some(candidate));
         }
@@ -740,6 +768,7 @@ fn resolve_soname_with_loader(
         let dir = normalize_loader_search_dir(dir, loader_cwd);
         observe_search_path(&dir, observations)?;
         let candidate = dir.join(soname);
+        observe_search_path(&candidate, observations)?;
         if candidate.is_file() {
             return Ok(Some(candidate));
         }
@@ -753,6 +782,7 @@ fn resolve_soname_with_loader(
         let dir = normalize_loader_search_dir(dir, loader_cwd);
         observe_search_path(&dir, observations)?;
         let candidate = dir.join(soname);
+        observe_search_path(&candidate, observations)?;
         if candidate.is_file() {
             return Ok(Some(candidate));
         }
@@ -761,8 +791,13 @@ fn resolve_soname_with_loader(
     // 5. ld.so.cache — the binary cache is the real dynamic linker's
     //    primary lookup mechanism. Catches libraries in directories
     //    added via `ldconfig /path` that don't appear in ld.so.conf.
-    if let Some(cached_path) = ld_so_cache.get(soname) {
-        return Ok(Some(cached_path.clone()));
+    if let Some(candidates) = ld_so_cache.candidates.get(soname) {
+        for cached_path in candidates {
+            observe_search_path(cached_path, observations)?;
+            if cached_path.is_file() {
+                return Ok(Some(cached_path.clone()));
+            }
+        }
     }
 
     // 6. Default paths. (ld.so.conf step dropped: ldconfig already
@@ -772,6 +807,7 @@ fn resolve_soname_with_loader(
         let dir = Path::new(dir);
         observe_search_path(dir, observations)?;
         let candidate = dir.join(soname);
+        observe_search_path(&candidate, observations)?;
         if candidate.is_file() {
             return Ok(Some(candidate));
         }
@@ -2040,13 +2076,10 @@ pub(crate) fn shm_load_lz4(content_hash: u64) -> Option<Vec<u8>> {
 /// RAII guard for a live COW-overlay mapping.
 ///
 /// A COW overlay is `MAP_PRIVATE | MAP_FIXED` onto guest memory from
-/// a SHM segment fd. `MAP_PRIVATE` pages are lazily read from the
-/// backing file on first access; if the SHM segment is truncated or
-/// unlinked-with-retruncate between `mmap` and the guest's first
-/// read, the access SIGBUSes (see Linux `filemap_fault` against
-/// `i_size`). Holding the fd with `LOCK_SH` for the mapping's
-/// lifetime blocks any cooperating writer from taking `LOCK_EX` and
-/// `ftruncate`ing the segment until after the mapping is torn down.
+/// an immutable backing file. `MAP_PRIVATE` pages are lazily read from
+/// the page cache on first access. Holding the fd with `LOCK_SH` for
+/// the mapping's lifetime prevents the prepared-initrd GC from
+/// unlinking the backing object until after the mapping is torn down.
 ///
 /// Drop order: the guard releases `LOCK_UN` and `close` only. The
 /// MAP_FIXED region itself is owned by the caller's VA reservation
@@ -2065,10 +2098,9 @@ impl CowOverlayGuard {
 
 impl Drop for CowOverlayGuard {
     fn drop(&mut self) {
-        // fd was obtained via shm_open in the COW overlay path; release
-        // LOCK_SH explicitly so cooperating writers waiting on LOCK_EX
-        // observe ordering with the VM's reads. The OwnedFd's own drop
-        // closes the descriptor after this function returns.
+        // Release LOCK_SH explicitly so GC waiting on LOCK_EX observes
+        // ordering with the VM's reads. OwnedFd closes the descriptor
+        // after this function returns.
         let _ = rustix::fs::flock(&self.fd, rustix::fs::FlockOperation::Unlock);
     }
 }
@@ -2226,8 +2258,8 @@ pub fn load_initramfs_parts(
 /// unpacks with no `CONFIG_RD_*` at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitrdCompression {
-    /// LZ4 legacy frames (`CONFIG_RD_LZ4`-gated) — the default, and
-    /// the only variant backed by the SHM base cache + COW overlay.
+    /// LZ4 legacy frames (`CONFIG_RD_LZ4`-gated) — the default for
+    /// ktstr-built kernels.
     Lz4,
     /// One zstd frame per part (`CONFIG_RD_ZSTD`). Level 1: the
     /// window log stays far under the unpacker's 8 MiB
@@ -2239,9 +2271,8 @@ pub enum InitrdCompression {
     Uncompressed,
 }
 
-/// Compress one initrd part (base or suffix) in `comp`'s format. The
-/// non-LZ4 variants are the prebuilt-distro fallback path: compressed
-/// locally on every boot, with no SHM cache or COW overlay backing.
+/// Compress one immutable initrd part in `comp`'s format. Every variant is
+/// published through the prepared-initrd CAS and can back direct COW mappings.
 pub(crate) fn compress_initrd_part(comp: InitrdCompression, data: &[u8]) -> Result<Vec<u8>> {
     match comp {
         InitrdCompression::Lz4 => Ok(lz4_legacy_compress(data)),

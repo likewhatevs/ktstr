@@ -32,8 +32,8 @@
 //!   collection.
 //! - [`contention`] — KVM EINTR retry policy, `HostResourceSnapshot`,
 //!   `map_transient_to_contention`, and `create_vm_with_retry`.
-//! - [`initramfs_cache`] — cross-process initramfs blob cache with
-//!   POSIX SHM coordination.
+//! - [`initramfs_cache`] — persistent content-addressed initramfs parts,
+//!   cross-process transform election, and direct-COW range planning.
 //! - [`vcpu`] — vCPU thread infrastructure: `ImmediateExitHandle`,
 //!   signal handler, thread pinning, RT priority, and perf capture.
 //! - [`result`] — [`VmResult`], [`KvmStatsTotals`], `VmRunState`.
@@ -503,15 +503,15 @@ pub struct KtstrVm {
     /// order. Threaded verbatim into [`initramfs::SuffixParams::kernel_modules`]
     /// by [`Self::suffix_params`]; empty for ktstr-built kernels
     /// (virtio =y), populated for prebuilt distro kernels (virtio =m).
-    /// Rides the per-run suffix, not the cached base — so it does not
-    /// participate in the `BaseKey` cache key and an empty slice leaves
-    /// the suffix bytes identical to the pre-module output.
+    /// Stored as an independently content-addressed initramfs part, so cells
+    /// with the same module set reuse both archive construction and
+    /// compression.
     pub(crate) kernel_modules: Vec<PathBuf>,
     /// Initrd compression the guest kernel can unpack. LZ4 for
     /// ktstr-built kernels; prebuilt distro kernels without
     /// `CONFIG_RD_LZ4` get a format from their own `CONFIG_RD_*` set
-    /// (see [`initramfs::InitrdCompression`]). Non-LZ4 formats bypass
-    /// the SHM base cache + COW overlay and compress on every boot.
+    /// (see [`initramfs::InitrdCompression`]). Every supported format uses
+    /// the persistent prepared-initrd CAS and direct-COW loader.
     pub(crate) initrd_compression: initramfs::InitrdCompression,
     /// The optional single virtio-blk disk, rendered as `/dev/vda`. ktstr
     /// wires one blk device; multi-disk would be N PCI functions (re-addable

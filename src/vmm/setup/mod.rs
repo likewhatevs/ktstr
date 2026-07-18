@@ -29,6 +29,7 @@ use super::memory_budget::{
     MemoryBudget, TmpfsFraction, initramfs_min_memory_mib, read_kernel_init_size,
     read_kernel_version, read_kernel_version_from_metadata_sidecar,
 };
+use super::numa_mem::MemoryBacking;
 use super::pi_mutex::PiMutex;
 use super::{disk_config, disk_template, host_topology, initramfs, virtio_blk, virtio_net};
 // The virtio-PCI transport, its MSI-X state, and the INTx resample eventfd are
@@ -105,14 +106,10 @@ const INITRD_ADDR: u64 = 0x800_0000; // 128 MiB
 /// the FDT. Matches Firecracker/Cloud Hypervisor placement pattern —
 /// avoids conflicts with early kernel allocations near the kernel image.
 ///
-/// Aligned to the host page size (not a hardcoded 4 KB). On Apple
-/// Silicon hosts the kernel runs with 16 KB pages and the COW
-/// `MAP_FIXED` mmap rejects targets that aren't host-page-aligned
-/// with `EINVAL` — a 4 KB-aligned guest address that happens to fall
-/// mid-host-page would clobber unrelated mappings if the kernel
-/// accepted it, so the kernel correctly refuses. Round down here so
-/// the overlay path reaches `mmap` with a valid alignment regardless
-/// of host page size.
+/// Aligned to the prepared mapping granule (2 MiB), which satisfies both the
+/// guest-range geometry and Linux's hugetlb `MAP_FIXED` replacement rules.
+/// Destination host virtual addresses are validated separately against the
+/// runtime host page size.
 #[cfg(target_arch = "aarch64")]
 fn aarch64_initrd_addr(memory_mib: u32, total_cpus: u32, initrd_max_size: u64) -> Result<u64> {
     // Ceiling is the PVTIME carve base, NOT the FDT address. setup_pvtime
@@ -135,7 +132,7 @@ fn aarch64_initrd_addr(memory_mib: u32, total_cpus: u32, initrd_max_size: u64) -
         .map(|size| size & mask)
         .context("compressed initrd rounded mapping length overflows u64")?;
     let aligned_ceiling = ceiling & mask;
-    // Place initrd just below the PVTIME carve, host-page-aligned. Use
+    // Place initrd just below the PVTIME carve, mapping-granule-aligned. Use
     // checked_sub: a compressed initramfs larger than the advertised RAM
     // span [DRAM_START, pvtime_base) would otherwise wrap the u64 (debug:
     // panic; release with overflow-checks off: a near-u64::MAX value that
@@ -191,6 +188,17 @@ fn validate_prepared_host_address(host_addr: *mut u8) -> Result<()> {
          {host_page}-byte host page size"
     );
     Ok(())
+}
+
+fn prepared_region_split_alignment(
+    backing: MemoryBacking,
+    host_page_size: usize,
+    mapping_granule: usize,
+) -> usize {
+    match backing {
+        MemoryBacking::BasePages => host_page_size,
+        MemoryBacking::HugeTlb2M => mapping_granule,
+    }
 }
 
 /// Build the auto-mount cmdline tokens for one disk. Returns an
@@ -1184,17 +1192,11 @@ impl KtstrVm {
     /// Map a prepared initrd's immutable CAS ranges directly into guest RAM.
     /// Returns `total_compressed_size`.
     ///
-    /// On a successful COW overlay, the returned `CowOverlayGuard` is
-    /// pushed onto `vm.cow_overlay_guards` IMMEDIATELY — before any
-    /// subsequent fallible operation (suffix write, read-back verify)
-    /// runs. This is deliberate: if a later `?` unwinds this function
-    /// after the MAP_FIXED overlay is in place, a locally-held guard
-    /// would drop first, releasing `LOCK_SH` while the COW VMAs are
-    /// still live. A concurrent writer could then take `LOCK_EX` and
-    /// truncate the segment → SIGBUS on the mapped pages. Pushing the
-    /// guard onto `vm` transfers ownership to the VM, where Drop
-    /// order is structurally enforced (guard drops AFTER
-    /// `_reservation` munmaps the COW VMAs).
+    /// Every path after a successful `MAP_FIXED` transfers the backing fd to
+    /// `vm.cow_overlay_guards`, including later mmap/NUMA-policy errors. This
+    /// preserves the CAS object's shared lock for the complete lifetime of
+    /// any partial overlay. VM drop order is structural: `_reservation`
+    /// unmaps the COW VMAs before the guards release their locks.
     fn load_prepared_initrd(
         &self,
         vm: &mut kvm::KtstrKvm,
@@ -1203,6 +1205,11 @@ impl KtstrVm {
     ) -> Result<u32> {
         let total_compressed = prepared.compressed_len();
         let page_size = prepared.mapping_granule();
+        let host_page_size = host_page_size() as usize;
+        let backing = vm
+            .memory_backing
+            .context("prepared initrd load requires allocated guest-memory backing")?;
+        let split_alignment = prepared_region_split_alignment(backing, host_page_size, page_size);
         anyhow::ensure!(
             load_addr & (page_size as u64 - 1) == 0,
             "prepared initrd load address {load_addr:#x} is not aligned to the \
@@ -1228,8 +1235,9 @@ impl KtstrVm {
                 "prepared initrd mapping length is not aligned to the prepared granule"
             );
             anyhow::ensure!(
-                range.file_offset % page_size as u64 == 0,
-                "prepared initrd file offset is not aligned to the prepared granule"
+                range.file_offset % host_page_size as u64 == 0,
+                "prepared initrd file offset is not aligned to the \
+                 {host_page_size}-byte host page size"
             );
             mapped_len = mapped_len
                 .checked_add(range.map_len)
@@ -1255,9 +1263,10 @@ impl KtstrVm {
         }
 
         // GuestMemoryMmap is one region per NUMA memory slot; adjacent guest
-        // addresses may therefore have unrelated host VAs. Split only at
-        // region boundaries that preserve the 2 MiB prepared geometry.
-        // Every slice and every file offset is validated before MAP_FIXED.
+        // addresses may therefore have unrelated host VAs. Explicit hugetlb
+        // VMAs require 2 MiB replacement boundaries. Base-page/THP regions
+        // may split on the runtime host page, including caller-declared
+        // odd-MiB NUMA boundaries.
         let mut validated = Vec::with_capacity(ranges.len());
         for range in ranges {
             let guest_addr = load_addr
@@ -1272,9 +1281,9 @@ impl KtstrVm {
                 let slice = slice.context("prepared initrd crosses a guest-memory hole")?;
                 let len = slice.len();
                 anyhow::ensure!(
-                    len > 0 && len % page_size == 0,
+                    len > 0 && len % split_alignment == 0,
                     "prepared initrd crosses a guest-memory region boundary that is not \
-                     aligned to the {page_size}-byte mapping granule"
+                     aligned to the {split_alignment}-byte backing boundary"
                 );
                 let sub_guest = guest_addr
                     .checked_add(consumed as u64)
@@ -1294,7 +1303,7 @@ impl KtstrVm {
                     .checked_add(consumed as u64)
                     .context("prepared initrd subrange file offset overflow")?;
                 anyhow::ensure!(
-                    file_offset % page_size as u64 == 0,
+                    file_offset % host_page_size as u64 == 0,
                     "prepared initrd split produced a misaligned file offset"
                 );
                 subranges.push(ValidatedSubrange {
@@ -1337,6 +1346,39 @@ impl KtstrVm {
                             subrange.guest_addr, subrange.len, subrange.file_offset
                         )
                     });
+                }
+                if self.performance_mode && !self.mbind_node_map.is_empty() {
+                    let Some(layout) = vm.numa_layout.as_ref() else {
+                        // The prepared mapping is already live, so preserve
+                        // its shared-lock owner even if the allocation/setup
+                        // invariant was violated.
+                        vm.cow_overlay_guards
+                            .push(initramfs::CowOverlayGuard::new(fd));
+                        anyhow::bail!(
+                            "performance-mode direct-map initrd has NUMA bindings \
+                             but no NUMA memory layout"
+                        );
+                    };
+                    if let Err(error) = layout.mbind_replaced_range(
+                        subrange.guest_addr,
+                        subrange.host_addr,
+                        subrange.len,
+                        &self.mbind_node_map,
+                    ) {
+                        // MAP_FIXED already installed a live file mapping.
+                        // Transfer the shared-lock owner before unwinding so
+                        // GC can never unlink its backing object while that
+                        // partial overlay remains in guest memory.
+                        vm.cow_overlay_guards
+                            .push(initramfs::CowOverlayGuard::new(fd));
+                        return Err(error).with_context(|| {
+                            format!(
+                                "restore NUMA policy for direct-map prepared initrd \
+                                 subrange at guest {:#x} (len={})",
+                                subrange.guest_addr, subrange.len
+                            )
+                        });
+                    }
                 }
             }
             // One fd/LOCK_SH protects every VMA split from this source.
@@ -1438,7 +1480,7 @@ impl KtstrVm {
         // This path is only reached when memory_mib was set explicitly.
         let memory_mib = self.memory_mib.expect(
             "join_and_load_initramfs called in deferred mode; \
-             use join_compute_memory_and_load instead",
+             use join_compute_memory_and_allocate instead",
         );
         let kernel_init_size = read_kernel_init_size(&self.kernel)?;
         let (init_coverage_instrumented, instrumented_reserve_bytes) = prepared.coverage();
@@ -1469,22 +1511,24 @@ impl KtstrVm {
     }
 
     /// Deferred memory path: join initramfs, compute memory from actual
-    /// size, allocate guest memory, then load initramfs.
+    /// size, and allocate anonymous guest memory. The caller must apply
+    /// NUMA policy/prefault and load the kernel before mapping the returned
+    /// prepared initrd, otherwise `MADV_POPULATE_WRITE` would eagerly COW
+    /// every file-backed initrd page.
     ///
-    /// Returns `(initrd_addr, initrd_size, memory_mib)`.
+    /// Returns `(prepared_initrd, memory_mib)`.
     ///
     /// x86_64-only: aarch64 uses
-    /// `Self::join_compute_memory_and_load_aarch64`, which orders
+    /// `Self::join_compute_memory_and_allocate_aarch64`, which orders
     /// the load_addr computation after `allocate_and_register_memory`
     /// (the FDT-relative initrd address depends on `memory_mib`,
     /// which is itself computed from the post-compress total size).
     #[cfg(target_arch = "x86_64")]
-    fn join_compute_memory_and_load(
+    fn join_compute_memory_and_allocate(
         &self,
         vm: &mut kvm::KtstrKvm,
         handle: JoinHandle<Result<PreparedBase>>,
-        load_addr: u64,
-    ) -> Result<(Option<u64>, Option<u32>, u32)> {
+    ) -> Result<(PreparedInitrd, u32)> {
         let t0 = Instant::now();
         let prepared_base = handle
             .join()
@@ -1501,15 +1545,6 @@ impl KtstrVm {
             compressed_bytes = compressed_size,
             cache_hits = prepared.cache_hits(),
             "prepare_initrd",
-        );
-
-        let t0_compress = Instant::now();
-        tracing::debug!(
-            elapsed_us = t0_compress.elapsed().as_micros(),
-            uncompressed = uncompressed_size,
-            compressed = compressed_size,
-            ratio = format!("{:.1}x", uncompressed_size as f64 / compressed_size as f64),
-            "deferred_lz4_compress",
         );
 
         // Compute memory from actual sizes, honoring the
@@ -1540,10 +1575,7 @@ impl KtstrVm {
         vm.allocate_and_register_memory(memory_mib)
             .with_context(|| format!("allocate deferred memory ({memory_mib}MiB)"))?;
 
-        // Load the exact buffers used for sizing; neither part is
-        // recompressed after deferred memory has been allocated.
-        let size = self.load_prepared_initrd(vm, prepared, load_addr)?;
-        Ok((Some(load_addr), Some(size), memory_mib))
+        Ok((prepared, memory_mib))
     }
 
     pub(super) fn effective_memory_mib(&self, guest_mem: &GuestMemoryMmap) -> u32 {
@@ -1740,17 +1772,25 @@ impl KtstrVm {
             // Deferred memory path: join initramfs first to learn its size,
             // then allocate memory, load kernel, and load initramfs — all in
             // one shot with no estimation.
-            let (initrd_addr, initrd_size, _memory_mib) = match initramfs_handle {
-                Some(handle) => self.join_compute_memory_and_load(vm, handle, INITRD_ADDR)?,
+            let (prepared_initrd, _memory_mib) = match initramfs_handle {
+                Some(handle) => {
+                    let (prepared, memory_mib) =
+                        self.join_compute_memory_and_allocate(vm, handle)?;
+                    (Some(prepared), memory_mib)
+                }
                 None => {
                     // No initramfs — allocate minimum memory.
                     let memory_mib = 256u32;
                     vm.allocate_and_register_memory(memory_mib)
                         .context("allocate deferred memory (no initramfs)")?;
-                    (None, None, memory_mib)
+                    (None, memory_mib)
                 }
             };
 
+            // This must precede the prepared MAP_FIXED overlay:
+            // mbind_regions performs MADV_POPULATE_WRITE across anonymous
+            // guest RAM. Running it after the overlay eagerly COWs every
+            // initrd page and defeats machine-wide sharing.
             if self.performance_mode && !self.mbind_node_map.is_empty() {
                 let layout = vm.numa_layout.as_ref().expect(
                     "numa_layout is Some after the deferred allocate_and_register_memory \
@@ -1764,6 +1804,14 @@ impl KtstrVm {
             let t0 = Instant::now();
             let kr = boot::load_kernel(&vm.guest_mem, &self.kernel).context("load kernel")?;
             tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "load_kernel");
+
+            let (initrd_addr, initrd_size) = match prepared_initrd {
+                Some(prepared) => {
+                    let size = self.load_prepared_initrd(vm, prepared, INITRD_ADDR)?;
+                    (Some(INITRD_ADDR), Some(size))
+                }
+                None => (None, None),
+            };
 
             (kr, initrd_addr, initrd_size)
         };
@@ -1981,8 +2029,8 @@ impl KtstrVm {
     /// Allocate and register guest memory regions for aarch64, including
     /// NUMA-aware placement.
     ///
-    /// Uses the same LZ4 SHM compress cache and COW overlay path as the
-    /// x86_64 `Self::setup_memory` flow. The shared helpers
+    /// Uses the same persistent prepared-initrd CAS and direct COW mapping
+    /// path as the x86_64 `Self::setup_memory` flow. The shared helpers
     /// ([`Self::load_prepared_initrd`] and the prepared-initrd CAS range
     /// planner) are arch-neutral; this function differs
     /// from the x86_64 driver only in (a) computing the initrd load
@@ -2023,8 +2071,12 @@ impl KtstrVm {
         } else {
             // Deferred memory path: join initramfs first to learn its
             // size, allocate memory, then load kernel and initramfs.
-            let (initrd_addr, initrd_size) = match initramfs_handle {
-                Some(handle) => self.join_compute_memory_and_load_aarch64(vm, handle)?,
+            let (prepared_initrd, prepared_load_addr) = match initramfs_handle {
+                Some(handle) => {
+                    let (prepared, _memory_mib, load_addr) =
+                        self.join_compute_memory_and_allocate_aarch64(vm, handle)?;
+                    (Some(prepared), Some(load_addr))
+                }
                 None => {
                     // No initramfs — allocate minimum memory.
                     let memory_mib = 256u32;
@@ -2034,11 +2086,28 @@ impl KtstrVm {
                 }
             };
 
+            if self.performance_mode && !self.mbind_node_map.is_empty() {
+                let layout = vm
+                    .numa_layout
+                    .as_ref()
+                    .expect("numa_layout is Some after deferred aarch64 memory allocation");
+                layout.mbind_regions(&vm.guest_mem, &self.mbind_node_map);
+            }
+
             // Load kernel into the freshly allocated memory.
             let t0 = Instant::now();
             let kr =
                 boot::load_kernel(&vm.guest_mem, &self.kernel).context("load kernel (aarch64)")?;
             tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "load_kernel");
+
+            let (initrd_addr, initrd_size) = match (prepared_initrd, prepared_load_addr) {
+                (Some(prepared), Some(load_addr)) => {
+                    let size = self.load_prepared_initrd(vm, prepared, load_addr)?;
+                    (Some(load_addr), Some(size))
+                }
+                (None, None) => (None, None),
+                _ => anyhow::bail!("deferred aarch64 initrd state is inconsistent"),
+            };
 
             (kr, initrd_addr, initrd_size)
         };
@@ -2046,10 +2115,9 @@ impl KtstrVm {
         self.finish_aarch64_setup(vm, kernel_result, initrd_addr, initrd_size)
     }
 
-    /// Non-deferred aarch64 initramfs load: join handle, build suffix,
-    /// compress base+suffix via the LZ4 SHM cache to learn the
-    /// compressed size, validate that `memory_mib` is sufficient, compute
-    /// the FDT-relative load address, then COW-or-copy the compressed
+    /// Non-deferred aarch64 initramfs load: join preparation, finish the
+    /// independently cached parts, validate that `memory_mib` is sufficient,
+    /// compute the FDT-relative load address, then direct-map the compressed
     /// stream into guest memory via the shared
     /// [`Self::load_prepared_initrd`] path.
     fn join_and_load_initramfs_aarch64(
@@ -2113,15 +2181,16 @@ impl KtstrVm {
         Ok((Some(load_addr), Some(size)))
     }
 
-    /// Deferred aarch64 initramfs load: join handle, build suffix,
-    /// compress (priming the LZ4 SHM cache), compute memory budget,
-    /// allocate guest memory, then load initramfs via the shared
-    /// COW-overlay path. Returns `(Some(load_addr), Some(size))`.
-    fn join_compute_memory_and_load_aarch64(
+    /// Deferred aarch64 initramfs preparation: join, build immutable parts,
+    /// compute the memory budget, allocate anonymous guest memory, and return
+    /// the prepared image plus its final address. The caller applies NUMA
+    /// policy/prefault and loads the kernel before installing the file-backed
+    /// COW mappings.
+    fn join_compute_memory_and_allocate_aarch64(
         &self,
         vm: &mut kvm::KtstrKvm,
         handle: JoinHandle<Result<PreparedBase>>,
-    ) -> Result<(Option<u64>, Option<u32>)> {
+    ) -> Result<(PreparedInitrd, u32, u64)> {
         let t0 = Instant::now();
         let prepared_base = handle
             .join()
@@ -2142,14 +2211,6 @@ impl KtstrVm {
 
         // Prepare before computing memory so the budget formula and load
         // use the same exact compressed bytes.
-        let t0_compress = Instant::now();
-        tracing::debug!(
-            elapsed_us = t0_compress.elapsed().as_micros(),
-            uncompressed = uncompressed_size,
-            compressed = compressed_size,
-            ratio = format!("{:.1}x", uncompressed_size as f64 / compressed_size as f64),
-            "deferred_lz4_compress",
-        );
 
         let kernel_init_size = read_kernel_init_size(&self.kernel)?;
         let (init_coverage_instrumented, instrumented_reserve_bytes) = prepared.coverage();
@@ -2185,8 +2246,7 @@ impl KtstrVm {
             compressed_size as u64,
         )?;
 
-        let size = self.load_prepared_initrd(vm, prepared, load_addr)?;
-        Ok((Some(load_addr), Some(size)))
+        Ok((prepared, memory_mib, load_addr))
     }
 
     #[cfg(target_arch = "aarch64")]

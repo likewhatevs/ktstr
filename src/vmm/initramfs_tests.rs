@@ -2245,6 +2245,11 @@ fn parse_ld_so_cache_parses_valid_entries_and_skips_oob_and_nonabsolute() {
         Some(&PathBuf::from(lib_abs)),
         "or_insert first-wins: the second existing mapping is ignored",
     );
+    assert_eq!(
+        map.candidates.get("libfoo.so"),
+        Some(&vec![PathBuf::from(lib_abs), PathBuf::from(lib2_abs)]),
+        "resolution must retain every duplicate-soname candidate in file order",
+    );
     // C is skipped by the OOB guard — never inserted.
     assert!(
         !map.contains_key("liboob.so"),
@@ -2255,6 +2260,63 @@ fn parse_ld_so_cache_parses_valid_entries_and_skips_oob_and_nonabsolute() {
     assert!(
         !map.contains_key("librel.so"),
         "non-absolute path must be rejected by the starts_with('/') gate",
+    );
+}
+
+#[test]
+fn ld_so_cache_resolution_skips_missing_first_duplicate_and_observes_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("missing-first.so");
+    let usable = temp.path().join("usable-second.so");
+    std::fs::write(&usable, b"library").unwrap();
+    let soname = "libduplicate.so";
+    let cache = LdSoCache {
+        selected: HashMap::from([(soname.to_owned(), usable.clone())]),
+        candidates: HashMap::from([(soname.to_owned(), vec![missing.clone(), usable.clone()])]),
+    };
+    let mut observations = Vec::new();
+    let resolved = resolve_soname_with_loader(
+        soname,
+        &ElfSearchPaths::default(),
+        &[],
+        temp.path(),
+        &[],
+        &cache,
+        &mut observations,
+    )
+    .unwrap();
+    assert_eq!(resolved, Some(usable.clone()));
+    assert!(
+        observations
+            .iter()
+            .any(|observation| observation.path == missing && observation.identity.is_none()),
+        "a currently missing higher-priority cache candidate must remain a \
+         closure-key observation"
+    );
+    assert!(
+        observations
+            .iter()
+            .any(|observation| observation.path == usable && observation.identity.is_some())
+    );
+}
+
+#[test]
+fn dangling_loader_candidate_target_appearance_invalidates_observation() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("future-target.so");
+    let candidate = temp.path().join("libfuture.so");
+    symlink(&target, &candidate).unwrap();
+    let mut observations = Vec::new();
+    observe_search_path(&candidate, &mut observations).unwrap();
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].identity, None);
+
+    std::fs::write(&target, b"now present").unwrap();
+    assert!(
+        observe_search_path(&candidate, &mut observations).is_err(),
+        "creating a dangling candidate's target must invalidate the cached closure"
     );
 }
 

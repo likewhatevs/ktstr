@@ -98,14 +98,13 @@ The VMM builds a cpio initramfs containing:
 - Optional scheduler binary (as `/scheduler`)
 - Shared library dependencies (resolved via ELF `DT_NEEDED` parsing)
 
-The initramfs is split into a cached base plus a per-run suffix. The
-base cache key is derived from the payload's shared-library set and
-the content hashes of the packed scheduler/probe/worker binaries and
-include files — not the test binary's own bytes, which ride the
-per-run suffix. So recompiling your tests keeps the base cache warm,
-while recompiling the scheduler invalidates it. The cached base lives
-in a shared-memory segment that concurrent VMs map zero-copy, sharing
-physical pages across parallel tests.
+The initramfs is normalized into independently content-addressed base,
+payload, kernel-module, and control-tail parts. Cross-process election builds
+and compresses each immutable recipe once. A 2 MiB range planner maps pages
+owned by one part directly from the persistent cache and creates reusable
+stitch pages only at part boundaries. Concurrent VMs install those regular
+files with private COW mappings, sharing clean page-cache pages while keeping
+guest writes isolated.
 
 ## Guest–host transports {#transports}
 

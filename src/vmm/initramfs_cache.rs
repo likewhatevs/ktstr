@@ -1,29 +1,22 @@
-//! Two-tier initramfs cache: per-process HashMap + cross-process POSIX
-//! shm.
+//! Persistent, content-addressed initramfs preparation for VM storms.
 //!
-//! Each VM run produces an initramfs base blob keyed on the payload's
-//! shared-lib SET (not the payload's own content — its /init bytes ride
-//! the per-run suffix) plus the content hashes of the optional
-//! scheduler / probe / worker binaries packed into the base, include
-//! files, and shell-mode flags. Building the blob is expensive (10s of
-//! MB of cpio assembly + LZ4 compression), so the cache amortises the
-//! cost across:
+//! Inputs are pinned by open file description, content-digested once across
+//! processes, and normalized into an exact shared-library/archive recipe.
+//! Independently reusable base, payload, and module parts are compressed in
+//! every supported initrd format and published as immutable regular files.
+//! Only the small control tail varies per test cell.
 //!
-//! - **Same-process tests**: a `HashMap<BaseKey, Arc<Vec<u8>>>`
-//!   keeps the in-flight blob hot without a syscall.
-//! - **Cross-process tests / nextest workers**: an `O_CREAT|O_EXCL`
-//!   race over a `/dev/shm/ktstr-base-<arch>-<hash>` segment elects
-//!   a single builder; losers `LOCK_SH`-block on the segment until
-//!   the winner finishes, then `mmap` it zero-copy.
+//! A 2 MiB planner maps pages owned by one part directly and materializes
+//! content-addressed stitch pages only at part boundaries. The VMM installs
+//! those files over anonymous guest RAM with `MAP_PRIVATE | MAP_FIXED`, so
+//! parallel VMs share clean page-cache pages and pay for private memory only
+//! when the guest writes. Per-key `flock` election ensures one transform per
+//! recipe across nextest workers; a versioned namespace gate makes lock-file
+//! GC race-safe.
 //!
-//! The `BaseKey` hashes the payload's shared-lib set + interpreter (the
-//! bytes the base packs FROM the payload — not the payload itself) and
-//! the full content of the scheduler / probe / worker binaries written
-//! into the base. So a scheduler/probe/worker recompile invalidates the
-//! cache, while a payload recompile that keeps the same lib set is a HIT
-//! (the payload's content lives only in the per-run suffix). Stale
-//! segments from a previous compression format are GC'd once per process
-//! on the first `get_or_build_base` call via a `LOCK_EX | LOCK_NB` probe.
+//! The older process-local/POSIX-SHM base cache below is retained only for
+//! compatibility unit tests. Production verifier and ordinary VM paths use
+//! the regular-file CAS uniformly.
 
 use anyhow::{Context, Result};
 #[cfg(test)]
@@ -39,7 +32,8 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use std::hash::BuildHasher;
 
@@ -78,6 +72,18 @@ fn hash_file_cache() -> &'static Mutex<HashMap<HashFileKey, u64>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(test)]
+fn hash_file_test_cache_root() -> &'static Path {
+    static ROOT: OnceLock<tempfile::TempDir> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("ktstr-hash-cache-")
+            .tempdir()
+            .expect("create test-only machine digest cache")
+    })
+    .path()
+}
+
 /// Hash a file's content for cache keying via mmap + fixed-seed ahash.
 ///
 /// The stable open-file identity first checks the process-local map, then a
@@ -103,9 +109,9 @@ pub(crate) fn hash_file(path: &Path) -> Result<u64> {
         return Ok(cached);
     }
 
-    let root = prepared_cache_root()?;
-    ensure_prepared_cache_dirs(&root)?;
-    let digest = cached_file_digest(&root, &file, identity)
+    let root = hash_file_test_cache_root();
+    ensure_prepared_cache_dirs(root)?;
+    let digest = cached_file_digest(root, &file, identity)
         .with_context(|| format!("machine-wide hash memo: {}", path.display()))?;
     hash_file_cache().lock().unwrap().insert(cache_key, digest);
     Ok(digest)
@@ -377,12 +383,10 @@ impl AsRef<[u8]> for BaseRef {
     }
 }
 
-// Prepared initrd CAS and direct-COW mapping live here alongside the
-// pre-existing uncompressed-base cache. The two layers deliberately have
-// different lifetimes: base SHM is a build accelerator, while the regular
-// file CAS is the immutable backing mapped into every guest.
+// The production prepared-initrd CAS lives alongside a cfg(test)-only
+// compatibility cache for older base/suffix fixtures.
 
-const PREPARED_CAS_SCHEMA: u32 = 3;
+const PREPARED_CAS_SCHEMA: u32 = 4;
 const PREPARED_CAS_MAGIC: &[u8; 8] = b"KTSTRIR\0";
 const PREPARED_CAS_HEADER_LEN: usize = 128;
 const PREPARED_CAS_MAX_BYTES: u64 = 8 << 30;
@@ -394,16 +398,40 @@ const COVERAGE_PROBE_MAGIC: &[u8; 8] = b"KTSTRCV\0";
 const COVERAGE_PROBE_RECORD_LEN: usize = 48;
 const CLOSURE_RECORD_MAGIC: &[u8; 8] = b"KTSTRCL\0";
 const CLOSURE_RECORD_HEADER_LEN: usize = 40;
-const PREPARED_OBJECTS_DIR: &str = "prepared-initrd-objects";
-const PREPARED_LOCKS_DIR: &str = ".prepared-initrd-locks";
-const PREPARED_DIGESTS_DIR: &str = "prepared-initrd-digests";
-const PREPARED_PROBES_DIR: &str = "prepared-initrd-probes";
-const PREPARED_CLOSURES_DIR: &str = "prepared-initrd-closures";
-const PREPARED_GC_STAMP: &str = ".prepared-initrd-gc-stamp";
+// Version the complete namespace, not only the object recipes. Older ktstr
+// binaries do not participate in the namespace-gate protocol below; keeping
+// their objects, memos, and locks in separate directories prevents an old GC
+// from unlinking a live object coordinated by this version's lock inode.
+const PREPARED_OBJECTS_DIR: &str = "prepared-initrd-v4-objects";
+const PREPARED_LOCKS_DIR: &str = ".prepared-initrd-v4-locks";
+const PREPARED_DIGESTS_DIR: &str = "prepared-initrd-v4-digests";
+const PREPARED_PROBES_DIR: &str = "prepared-initrd-v4-probes";
+const PREPARED_CLOSURES_DIR: &str = "prepared-initrd-v4-closures";
+const PREPARED_GC_STAMP: &str = ".prepared-initrd-v4-gc-stamp";
+const PREPARED_NAMESPACE_GATE: &str = "namespace-v1.lock";
+const PREPARED_GC_LOCK: &str = "gc.lock";
 /// Uniform direct-map granule. It is host-page aligned on every supported
 /// host and also satisfies Linux hugetlb's MAP_FIXED unmap boundary rule for
 /// the VM's optional MAP_HUGETLB|MAP_HUGE_2MB guest backing.
 pub(crate) const PREPARED_MAPPING_GRANULE: usize = 2 << 20;
+
+fn prepared_file_alignment() -> Result<usize> {
+    static HOST_PAGE: OnceLock<usize> = OnceLock::new();
+    let host_page = *HOST_PAGE.get_or_init(|| {
+        // SAFETY: sysconf is thread-safe and _SC_PAGESIZE has no caller-side
+        // invariants. Linux always supplies a positive power-of-two value;
+        // retain the 4 KiB fallback so an unexpected libc failure cannot
+        // introduce a zero divisor into cache geometry.
+        let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if value > 0 { value as usize } else { 0x1000 }
+    });
+    anyhow::ensure!(
+        host_page.is_power_of_two() && PREPARED_MAPPING_GRANULE.is_multiple_of(host_page),
+        "host page size {host_page} is incompatible with the \
+         {PREPARED_MAPPING_GRANULE}-byte prepared mapping granule"
+    );
+    Ok(host_page)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -633,6 +661,35 @@ impl PinnedInput {
             .with_context(|| format!("probe ELF input {}", self.display_path.display()))?;
         Ok(read == magic.len() && magic == *b"\x7fELF")
     }
+
+    fn read_owned_stable(&self) -> Result<Vec<u8>> {
+        self.read_owned_stable_with_hook(|_| {})
+    }
+
+    fn read_owned_stable_with_hook(&self, mut after_chunk: impl FnMut(usize)) -> Result<Vec<u8>> {
+        self.verify_unchanged()?;
+        let len = usize::try_from(self.identity.size)
+            .with_context(|| format!("input is too large: {}", self.display_path.display()))?;
+        let mut bytes = vec![0u8; len];
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let read = self
+                .file
+                .read_at(&mut bytes[offset..], offset as u64)
+                .with_context(|| format!("pread input {}", self.display_path.display()))?;
+            anyhow::ensure!(
+                read > 0,
+                "input was truncated while reading: {}",
+                self.display_path.display()
+            );
+            offset = offset
+                .checked_add(read)
+                .context("pinned input read offset overflow")?;
+            after_chunk(offset);
+        }
+        self.verify_unchanged()?;
+        Ok(bytes)
+    }
 }
 
 fn prepared_cache_root() -> Result<PathBuf> {
@@ -653,7 +710,7 @@ fn ensure_prepared_cache_dirs(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn open_coord_file(path: &Path) -> Result<File> {
+fn open_lock_file(path: &Path) -> Result<File> {
     OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -661,6 +718,54 @@ fn open_coord_file(path: &Path) -> Result<File> {
         .write(true)
         .open(path)
         .with_context(|| format!("open prepared initrd lock {}", path.display()))
+}
+
+fn open_namespace_gate(root: &Path) -> Result<File> {
+    open_lock_file(&root.join(PREPARED_LOCKS_DIR).join(PREPARED_NAMESPACE_GATE))
+}
+
+/// A per-key coordination inode opened while holding the namespace gate.
+///
+/// The shared namespace lock remains held until this file successfully takes
+/// either its exclusive builder lock or shared waiter lock. GC takes the
+/// namespace lock exclusively before unlinking idle per-key files, closing
+/// the otherwise unavoidable open-before-flock race where a waiter could lock
+/// an already-unlinked inode while a new builder creates a replacement inode.
+struct CoordinationFile {
+    file: File,
+    namespace_gate: Option<File>,
+}
+
+impl CoordinationFile {
+    fn try_lock_exclusive(&mut self) -> rustix::io::Result<()> {
+        let result = rustix::fs::flock(
+            &self.file,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        );
+        if result.is_ok() {
+            self.namespace_gate.take();
+        }
+        result
+    }
+
+    fn lock_shared(&mut self) -> rustix::io::Result<()> {
+        let result = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::LockShared);
+        if result.is_ok() {
+            self.namespace_gate.take();
+        }
+        result
+    }
+}
+
+fn open_coord_file(root: &Path, path: &Path) -> Result<CoordinationFile> {
+    let namespace_gate = open_namespace_gate(root)?;
+    rustix::fs::flock(&namespace_gate, rustix::fs::FlockOperation::LockShared)
+        .context("lock prepared initrd coordination namespace")?;
+    let file = open_lock_file(path)?;
+    Ok(CoordinationFile {
+        file,
+        namespace_gate: Some(namespace_gate),
+    })
 }
 
 fn hash_pinned_file(file: &File, identity: StableFileIdentity) -> Result<u64> {
@@ -742,11 +847,16 @@ fn read_file_digest_record(
     )))
 }
 
+fn file_digest_identity_key_for_schema(identity: StableFileIdentity, schema: u32) -> u64 {
+    let mut hasher = fixed_hasher();
+    hash_len_prefixed(&mut hasher, b"ktstr-file-digest-identity");
+    hash_u32(&mut hasher, schema);
+    identity.hash_into(&mut hasher);
+    hasher.finish()
+}
+
 fn cached_file_digest(root: &Path, file: &File, identity: StableFileIdentity) -> Result<u64> {
-    let mut identity_hasher = fixed_hasher();
-    hash_len_prefixed(&mut identity_hasher, b"ktstr-file-digest-identity");
-    identity.hash_into(&mut identity_hasher);
-    let identity_key = identity_hasher.finish();
+    let identity_key = file_digest_identity_key_for_schema(identity, PREPARED_CAS_SCHEMA);
     let record_path = root
         .join(PREPARED_DIGESTS_DIR)
         .join(format!("{identity_key:016x}.digest"));
@@ -758,11 +868,8 @@ fn cached_file_digest(root: &Path, file: &File, identity: StableFileIdentity) ->
         .join(PREPARED_LOCKS_DIR)
         .join(format!("digest-{identity_key:016x}.lock"));
     loop {
-        let coordination = open_coord_file(&lock_path)?;
-        match rustix::fs::flock(
-            &coordination,
-            rustix::fs::FlockOperation::NonBlockingLockExclusive,
-        ) {
+        let mut coordination = open_coord_file(root, &lock_path)?;
+        match coordination.try_lock_exclusive() {
             Ok(()) => {
                 if let Some(digest) = read_file_digest_record(&record_path, identity)? {
                     return Ok(digest);
@@ -797,7 +904,8 @@ fn cached_file_digest(root: &Path, file: &File, identity: StableFileIdentity) ->
                 // readers, wake together when its EX lock drops, and read
                 // the tiny record concurrently. If the builder died before
                 // publication, loop and elect a successor.
-                rustix::fs::flock(&coordination, rustix::fs::FlockOperation::LockShared)
+                coordination
+                    .lock_shared()
                     .with_context(|| format!("wait for file digest {}", record_path.display()))?;
                 if let Some(digest) = read_file_digest_record(&record_path, identity)? {
                     return Ok(digest);
@@ -872,14 +980,15 @@ fn read_coverage_probe_record(path: &Path, key: u64) -> Result<Option<(bool, u64
 }
 
 fn inspect_coverage_from_pinned(payload: &PinnedInput) -> Result<(bool, u64)> {
-    payload.verify_unchanged()?;
     if payload.identity.size == 0 {
+        payload.verify_unchanged()?;
         return Ok((false, 0));
     }
-    let mmap = unsafe { memmap2::Mmap::map(&payload.file) }
-        .with_context(|| format!("mmap coverage payload {}", payload.display_path.display()))?;
-    let Ok(elf) = goblin::elf::Elf::parse(&mmap) else {
-        payload.verify_unchanged()?;
+    // Parse owned bytes. An mmap of the mutable original fd can SIGBUS if a
+    // concurrent writer truncates the inode before goblin faults a page;
+    // pread turns that race into a normal short-read/identity error.
+    let bytes = payload.read_owned_stable()?;
+    let Ok(elf) = goblin::elf::Elf::parse(&bytes) else {
         return Ok((false, 0));
     };
     let vaddrs = crate::test_support::find_symbol_vaddrs(
@@ -906,7 +1015,6 @@ fn inspect_coverage_from_pinned(payload: &PinnedInput) -> Result<(bool, u64)> {
         0
     };
     drop(elf);
-    drop(mmap);
     payload.verify_unchanged()?;
     Ok((instrumented, reserve))
 }
@@ -928,11 +1036,8 @@ fn cached_coverage_probe(root: &Path, payload: &PinnedInput) -> Result<(bool, u6
         .join(PREPARED_LOCKS_DIR)
         .join(format!("coverage-{key:016x}.lock"));
     loop {
-        let coordination = open_coord_file(&lock_path)?;
-        match rustix::fs::flock(
-            &coordination,
-            rustix::fs::FlockOperation::NonBlockingLockExclusive,
-        ) {
+        let mut coordination = open_coord_file(root, &lock_path)?;
+        match coordination.try_lock_exclusive() {
             Ok(()) => {
                 if let Some(result) = read_coverage_probe_record(&record_path, key)? {
                     return Ok(result);
@@ -966,10 +1071,9 @@ fn cached_coverage_probe(root: &Path, payload: &PinnedInput) -> Result<(bool, u6
                 return Ok(result);
             }
             Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
-                rustix::fs::flock(&coordination, rustix::fs::FlockOperation::LockShared)
-                    .with_context(|| {
-                        format!("wait for coverage probe {}", record_path.display())
-                    })?;
+                coordination.lock_shared().with_context(|| {
+                    format!("wait for coverage probe {}", record_path.display())
+                })?;
                 if let Some(result) = read_coverage_probe_record(&record_path, key)? {
                     return Ok(result);
                 }
@@ -1443,11 +1547,8 @@ fn get_or_resolve_pinned_closure(
         .join(PREPARED_LOCKS_DIR)
         .join(format!("closure-{key:016x}.lock"));
     loop {
-        let coordination = open_coord_file(&lock_path)?;
-        match rustix::fs::flock(
-            &coordination,
-            rustix::fs::FlockOperation::NonBlockingLockExclusive,
-        ) {
+        let mut coordination = open_coord_file(root, &lock_path)?;
+        match coordination.try_lock_exclusive() {
             Ok(()) => {
                 if let Some(closure) = read_pinned_closure_record(&record_path, key)? {
                     return Ok(closure);
@@ -1466,10 +1567,9 @@ fn get_or_resolve_pinned_closure(
                 return Ok(closure);
             }
             Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
-                rustix::fs::flock(&coordination, rustix::fs::FlockOperation::LockShared)
-                    .with_context(|| {
-                        format!("wait for loader closure {}", record_path.display())
-                    })?;
+                coordination.lock_shared().with_context(|| {
+                    format!("wait for loader closure {}", record_path.display())
+                })?;
                 if let Some(closure) = read_pinned_closure_record(&record_path, key)? {
                     return Ok(closure);
                 }
@@ -1600,10 +1700,6 @@ impl PreparedObjectHeader {
                 anyhow::ensure!(
                     self.parent_key == self.key,
                     "base object key linkage mismatch"
-                );
-                anyhow::ensure!(
-                    self.part_uncompressed_len > 0 || self.payload_len > 0,
-                    "base object has no source or compressed bytes"
                 );
             }
             PreparedObjectKind::Payload
@@ -1896,11 +1992,8 @@ where
     let lock_path = prepared_object_lock_path(root, expected.kind, expected.key);
     let mut build = Some(build);
     loop {
-        let coordination = open_coord_file(&lock_path)?;
-        match rustix::fs::flock(
-            &coordination,
-            rustix::fs::FlockOperation::NonBlockingLockExclusive,
-        ) {
+        let mut coordination = open_coord_file(root, &lock_path)?;
+        match coordination.try_lock_exclusive() {
             Ok(()) => {
                 if let Some(opened) =
                     try_open_prepared_object(&final_path, expected).with_context(|| {
@@ -1936,10 +2029,9 @@ where
                 return Ok(opened);
             }
             Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
-                rustix::fs::flock(&coordination, rustix::fs::FlockOperation::LockShared)
-                    .with_context(|| {
-                        format!("wait for prepared initrd object {}", final_path.display())
-                    })?;
+                coordination.lock_shared().with_context(|| {
+                    format!("wait for prepared initrd object {}", final_path.display())
+                })?;
                 if let Some(opened) =
                     try_open_prepared_object(&final_path, expected).with_context(|| {
                         format!(
@@ -1990,6 +2082,57 @@ struct GcCandidate {
     len: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum GcMemoKind {
+    Digest,
+    Coverage,
+    Closure,
+}
+
+impl GcMemoKind {
+    fn directory(self) -> &'static str {
+        match self {
+            Self::Digest => PREPARED_DIGESTS_DIR,
+            Self::Coverage => PREPARED_PROBES_DIR,
+            Self::Closure => PREPARED_CLOSURES_DIR,
+        }
+    }
+
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Digest => ".digest",
+            Self::Coverage => ".coverage",
+            Self::Closure => ".closure",
+        }
+    }
+
+    fn temp_prefix(self) -> &'static str {
+        match self {
+            Self::Digest => ".tmp-digest-",
+            Self::Coverage => ".tmp-coverage-",
+            Self::Closure => ".tmp-closure-",
+        }
+    }
+
+    fn lock_name(self, key: u64) -> String {
+        let prefix = match self {
+            Self::Digest => "digest",
+            Self::Coverage => "coverage",
+            Self::Closure => "closure",
+        };
+        format!("{prefix}-{key:016x}.lock")
+    }
+}
+
+#[derive(Debug)]
+struct GcMemoCandidate {
+    path: PathBuf,
+    kind: GcMemoKind,
+    key: u64,
+    modified_secs: u64,
+    len: u64,
+}
+
 fn parse_object_filename(name: &str) -> Option<(PreparedObjectKind, u64)> {
     let stem = name.strip_suffix(".bin")?;
     for kind in [
@@ -2032,8 +2175,8 @@ fn parse_temp_object_filename(name: &str) -> Option<(PreparedObjectKind, u64)> {
     None
 }
 
-fn parse_temp_digest_filename(name: &str) -> Option<u64> {
-    let key_and_random = name.strip_prefix(".tmp-digest-")?;
+fn parse_keyed_temp_filename(name: &str, prefix: &str) -> Option<u64> {
+    let key_and_random = name.strip_prefix(prefix)?;
     let (key, random) = key_and_random.split_once('-')?;
     if key.len() != 16 || random.is_empty() {
         return None;
@@ -2041,8 +2184,21 @@ fn parse_temp_digest_filename(name: &str) -> Option<u64> {
     u64::from_str_radix(key, 16).ok()
 }
 
-fn try_collect_temp(path: &Path, lock_path: &Path) -> Result<bool> {
-    let coordination = open_coord_file(lock_path)?;
+struct GcNamespaceGuard {
+    _file: File,
+}
+
+fn try_lock_gc_namespace(root: &Path) -> Result<Option<GcNamespaceGuard>> {
+    let file = open_namespace_gate(root)?;
+    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(Some(GcNamespaceGuard { _file: file })),
+        Err(error) if error == rustix::io::Errno::WOULDBLOCK => Ok(None),
+        Err(error) => Err(error).context("lock prepared initrd coordination namespace for GC"),
+    }
+}
+
+fn try_collect_temp(path: &Path, lock_path: &Path, _namespace: &GcNamespaceGuard) -> Result<bool> {
+    let coordination = open_lock_file(lock_path)?;
     if rustix::fs::flock(
         &coordination,
         rustix::fs::FlockOperation::NonBlockingLockExclusive,
@@ -2060,14 +2216,13 @@ fn try_collect_temp(path: &Path, lock_path: &Path) -> Result<bool> {
     }
 }
 
-fn try_collect_object(root: &Path, candidate: &GcCandidate) -> Result<bool> {
+fn try_collect_object(
+    root: &Path,
+    candidate: &GcCandidate,
+    _namespace: &GcNamespaceGuard,
+) -> Result<bool> {
     let lock_path = prepared_object_lock_path(root, candidate.kind, candidate.key);
-    let coord = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)?;
+    let coord = open_lock_file(&lock_path)?;
     if rustix::fs::flock(&coord, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_err() {
         return Ok(false);
     }
@@ -2089,7 +2244,125 @@ fn try_collect_object(root: &Path, candidate: &GcCandidate) -> Result<bool> {
     Ok(true)
 }
 
-fn run_prepared_cache_gc(root: &Path, now: u64) -> Result<()> {
+fn try_collect_memo(
+    root: &Path,
+    candidate: &GcMemoCandidate,
+    namespace: &GcNamespaceGuard,
+) -> Result<bool> {
+    let lock_path = root
+        .join(PREPARED_LOCKS_DIR)
+        .join(candidate.kind.lock_name(candidate.key));
+    try_collect_temp(&candidate.path, &lock_path, namespace)
+}
+
+fn metadata_modified_secs(metadata: &std::fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn collect_memo_gc_candidates(
+    root: &Path,
+    kind: GcMemoKind,
+    now: u64,
+    total: &mut u64,
+    candidates: &mut Vec<GcMemoCandidate>,
+    namespace: &GcNamespaceGuard,
+) -> Result<()> {
+    for entry in std::fs::read_dir(root.join(kind.directory()))? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified_secs = metadata_modified_secs(&metadata);
+        if let Some(key) = parse_keyed_temp_filename(&name, kind.temp_prefix()) {
+            let candidate = GcMemoCandidate {
+                path: entry.path(),
+                kind,
+                key,
+                modified_secs,
+                len: metadata.len(),
+            };
+            if now.saturating_sub(modified_secs) > PREPARED_CAS_GC_INTERVAL_SECS
+                && try_collect_memo(root, &candidate, namespace)?
+            {
+                continue;
+            }
+            *total = total.saturating_add(metadata.len());
+            continue;
+        }
+        let Some(key) = name
+            .strip_suffix(kind.suffix())
+            .filter(|key| key.len() == 16)
+            .and_then(|key| u64::from_str_radix(key, 16).ok())
+        else {
+            continue;
+        };
+        *total = total.saturating_add(metadata.len());
+        candidates.push(GcMemoCandidate {
+            path: entry.path(),
+            kind,
+            key,
+            modified_secs,
+            len: metadata.len(),
+        });
+    }
+    Ok(())
+}
+
+fn sweep_idle_coordination_locks(root: &Path, _namespace: &GcNamespaceGuard) -> Result<usize> {
+    let lock_dir = root.join(PREPARED_LOCKS_DIR);
+    let mut removed = 0usize;
+    for entry in std::fs::read_dir(&lock_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name == PREPARED_NAMESPACE_GATE
+            || name == PREPARED_GC_LOCK
+            || !name.ends_with(".lock")
+            || !entry.file_type()?.is_file()
+        {
+            continue;
+        }
+        let path = entry.path();
+        let file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("open idle coordination lock {}", path.display()));
+            }
+        };
+        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {}
+            Err(error) if error == rustix::io::Errno::WOULDBLOCK => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("probe coordination lock {}", path.display()));
+            }
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("remove idle coordination lock {}", path.display()));
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn run_prepared_cache_gc(root: &Path, now: u64, namespace: &GcNamespaceGuard) -> Result<()> {
     let mut candidates = Vec::new();
     let mut total = 0u64;
     for entry in std::fs::read_dir(root.join(PREPARED_OBJECTS_DIR))? {
@@ -2099,18 +2372,14 @@ fn run_prepared_cache_gc(root: &Path, now: u64) -> Result<()> {
         };
         let metadata = entry.metadata()?;
         if let Some((kind, key)) = parse_temp_object_filename(&name) {
-            let modified_secs = metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|duration| duration.as_secs())
-                .unwrap_or(0);
+            let modified_secs = metadata_modified_secs(&metadata);
             if now.saturating_sub(modified_secs) > PREPARED_CAS_GC_INTERVAL_SECS {
                 let lock_path = prepared_object_lock_path(root, kind, key);
-                let _ = try_collect_temp(&entry.path(), &lock_path);
-            } else {
-                total = total.saturating_add(metadata.len());
+                if try_collect_temp(&entry.path(), &lock_path, namespace)? {
+                    continue;
+                }
             }
+            total = total.saturating_add(metadata.len());
             continue;
         }
         let Some((kind, key)) = parse_object_filename(&name) else {
@@ -2119,12 +2388,7 @@ fn run_prepared_cache_gc(root: &Path, now: u64) -> Result<()> {
         if !metadata.is_file() {
             continue;
         }
-        let modified_secs = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_secs())
-            .unwrap_or(0);
+        let modified_secs = metadata_modified_secs(&metadata);
         total = total.saturating_add(metadata.len());
         candidates.push(GcCandidate {
             path: entry.path(),
@@ -2134,78 +2398,62 @@ fn run_prepared_cache_gc(root: &Path, now: u64) -> Result<()> {
             len: metadata.len(),
         });
     }
-    candidates.sort_by_key(|candidate| candidate.modified_secs);
-    for candidate in &candidates {
-        let too_old = now.saturating_sub(candidate.modified_secs) > PREPARED_CAS_MAX_AGE_SECS;
+    let mut memo_candidates = Vec::new();
+    for kind in [
+        GcMemoKind::Digest,
+        GcMemoKind::Coverage,
+        GcMemoKind::Closure,
+    ] {
+        collect_memo_gc_candidates(root, kind, now, &mut total, &mut memo_candidates, namespace)?;
+    }
+
+    #[derive(Clone, Copy)]
+    enum CandidateIndex {
+        Object(usize),
+        Memo(usize),
+    }
+    let mut order = Vec::with_capacity(candidates.len() + memo_candidates.len());
+    order.extend((0..candidates.len()).map(CandidateIndex::Object));
+    order.extend((0..memo_candidates.len()).map(CandidateIndex::Memo));
+    order.sort_by_key(|candidate| match candidate {
+        CandidateIndex::Object(index) => candidates[*index].modified_secs,
+        CandidateIndex::Memo(index) => memo_candidates[*index].modified_secs,
+    });
+    for candidate in order {
+        let (modified_secs, len) = match candidate {
+            CandidateIndex::Object(index) => {
+                (candidates[index].modified_secs, candidates[index].len)
+            }
+            CandidateIndex::Memo(index) => (
+                memo_candidates[index].modified_secs,
+                memo_candidates[index].len,
+            ),
+        };
+        let too_old = now.saturating_sub(modified_secs) > PREPARED_CAS_MAX_AGE_SECS;
         let over_size = total > PREPARED_CAS_MAX_BYTES;
         if !too_old && !over_size {
             continue;
         }
-        if try_collect_object(root, candidate)? {
-            total = total.saturating_sub(candidate.len);
-        }
-    }
-
-    for entry in std::fs::read_dir(root.join(PREPARED_DIGESTS_DIR))? {
-        let entry = entry?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let metadata = entry.metadata()?;
-        let modified_secs = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_secs())
-            .unwrap_or(0);
-        if let Some(key) = parse_temp_digest_filename(&name) {
-            if now.saturating_sub(modified_secs) > PREPARED_CAS_GC_INTERVAL_SECS {
-                let lock_path = root
-                    .join(PREPARED_LOCKS_DIR)
-                    .join(format!("digest-{key:016x}.lock"));
-                let _ = try_collect_temp(&entry.path(), &lock_path);
+        let removed = match candidate {
+            CandidateIndex::Object(index) => {
+                try_collect_object(root, &candidates[index], namespace)?
             }
-            continue;
-        }
-        let Some(key) = name
-            .strip_suffix(".digest")
-            .filter(|key| key.len() == 16)
-            .and_then(|key| u64::from_str_radix(key, 16).ok())
-        else {
-            continue;
+            CandidateIndex::Memo(index) => {
+                try_collect_memo(root, &memo_candidates[index], namespace)?
+            }
         };
-        if now.saturating_sub(modified_secs) <= PREPARED_CAS_MAX_AGE_SECS {
-            continue;
-        }
-        let lock_path = root
-            .join(PREPARED_LOCKS_DIR)
-            .join(format!("digest-{key:016x}.lock"));
-        let Ok(lock) = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(lock_path)
-        else {
-            continue;
-        };
-        if rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok() {
-            let _ = std::fs::remove_file(entry.path());
+        if removed {
+            total = total.saturating_sub(len);
         }
     }
+    sweep_idle_coordination_locks(root, namespace)?;
     Ok(())
 }
 
 fn maybe_gc_prepared_cache(root: &Path) {
     let now = unix_now_secs();
-    let gc_lock_path = root.join(PREPARED_LOCKS_DIR).join("gc.lock");
-    let Ok(gc_lock) = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&gc_lock_path)
-    else {
+    let gc_lock_path = root.join(PREPARED_LOCKS_DIR).join(PREPARED_GC_LOCK);
+    let Ok(gc_lock) = open_lock_file(&gc_lock_path) else {
         return;
     };
     if rustix::fs::flock(
@@ -2222,7 +2470,10 @@ fn maybe_gc_prepared_cache(root: &Path) {
     {
         return;
     }
-    if let Err(error) = run_prepared_cache_gc(root, now) {
+    let Ok(Some(namespace)) = try_lock_gc_namespace(root) else {
+        return;
+    };
+    if let Err(error) = run_prepared_cache_gc(root, now, &namespace) {
         tracing::warn!(%error, "prepared initrd CAS GC failed");
     }
     if let Err(error) = std::fs::write(&stamp_path, now.to_le_bytes()) {
@@ -2585,6 +2836,65 @@ fn merge_pinned_closure_entries(
     Ok(())
 }
 
+fn remove_explicit_dependency_collisions(
+    extras: &[PinnedArchiveInput],
+    includes: &[PinnedArchiveInput],
+    shared_libs: &mut Vec<PinnedClosureEntry>,
+) -> Result<()> {
+    let mut normalized = Vec::with_capacity(shared_libs.len());
+    for dependency in shared_libs.drain(..) {
+        if let Some(extra) = extras
+            .iter()
+            .find(|entry| entry.archive_name == dependency.guest_path)
+        {
+            anyhow::bail!(
+                "extra binary archive path '{}' collides with a resolved shared library: {} vs {}",
+                dependency.guest_path,
+                extra.input.display_path.display(),
+                dependency.input.display_path.display()
+            );
+        }
+        let Some(include) = includes
+            .iter()
+            .find(|entry| entry.archive_name == dependency.guest_path)
+        else {
+            normalized.push(dependency);
+            continue;
+        };
+        anyhow::ensure!(
+            include.input.identity.size == dependency.input.identity.size
+                && include.input.content_hash == dependency.input.content_hash
+                && include.mode == 0o100755,
+            "explicit archive path '{}' conflicts with a resolved shared library: {} vs {}",
+            dependency.guest_path,
+            include.input.display_path.display(),
+            dependency.input.display_path.display()
+        );
+        // A verbatim include with identical bytes and identical archive mode
+        // is semantically the same entry. Extras are never collapsed here:
+        // their debug-stripping transform can change bytes even when the
+        // source digest matches the dependency.
+    }
+    *shared_libs = normalized;
+    Ok(())
+}
+
+fn ensure_explicit_paths_disjoint(
+    extras: &[PinnedArchiveInput],
+    includes: &[PinnedArchiveInput],
+) -> Result<()> {
+    for extra in extras {
+        anyhow::ensure!(
+            !includes
+                .iter()
+                .any(|include| include.archive_name == extra.archive_name),
+            "archive path '{}' is used by both an extra binary and include file",
+            extra.archive_name
+        );
+    }
+    Ok(())
+}
+
 fn prepared_base_semantic_key(
     extras: &[PinnedArchiveInput],
     includes: &[PinnedArchiveInput],
@@ -2682,15 +2992,7 @@ pub(crate) fn prepare_base_inputs(
             .all(|pair| pair[0].archive_name != pair[1].archive_name),
         "duplicate include-file archive path"
     );
-    for extra in &extras {
-        anyhow::ensure!(
-            !includes
-                .iter()
-                .any(|include| include.archive_name == extra.archive_name),
-            "archive path '{}' is used by both an extra binary and include file",
-            extra.archive_name
-        );
-    }
+    ensure_explicit_paths_disjoint(&extras, &includes)?;
 
     let mut shared_libs = Vec::new();
     let payload_closure = get_or_resolve_pinned_closure(&root, &payload, payload_path, &loader)?;
@@ -2704,6 +3006,7 @@ pub(crate) fn prepare_base_inputs(
         merge_pinned_closure_entries(&mut shared_libs, closure)?;
     }
     shared_libs.sort_by(|left, right| left.guest_path.cmp(&right.guest_path));
+    remove_explicit_dependency_collisions(&extras, &includes, &mut shared_libs)?;
 
     loader.verify_unchanged()?;
     let key = prepared_base_semantic_key(&extras, &includes, &shared_libs, busybox_bytes);
@@ -2951,8 +3254,13 @@ fn plan_prepared_mappings(
     root: &Path,
     parts: &mut [PreparedPart],
     page_size: usize,
+    file_alignment: usize,
     compression: initramfs::InitrdCompression,
 ) -> Result<(Vec<PreparedMapping>, usize, usize, usize)> {
+    anyhow::ensure!(
+        file_alignment.is_power_of_two() && page_size.is_multiple_of(file_alignment),
+        "prepared file alignment {file_alignment} does not divide mapping granule {page_size}"
+    );
     let total_compressed_len = parts.iter().try_fold(0usize, |total, part| {
         anyhow::ensure!(
             part.stream_offset == total,
@@ -2975,7 +3283,15 @@ fn plan_prepared_mappings(
             let layout_offset = usize::try_from(part.object.header.leading_pad)?
                 .checked_add(segment.part_offset)
                 .context("prepared part layout offset overflow")?;
-            (segment.page_offset == 0 && layout_offset % page_size == 0)
+            let payload_len = usize::try_from(part.object.header.payload_len)
+                .context("prepared part payload length exceeds usize")?;
+            let padded_payload_len = round_up(payload_len, page_size)?;
+            let mapping_end = layout_offset
+                .checked_add(page_size)
+                .context("prepared direct mapping end overflow")?;
+            (segment.page_offset == 0
+                && layout_offset % file_alignment == 0
+                && mapping_end <= padded_payload_len)
                 .then_some((segment.part_index, layout_offset))
         } else {
             None
@@ -3102,6 +3418,7 @@ pub(crate) fn complete_prepared_initrd(
         page_size,
         compression,
     } = prepared_base;
+    let file_alignment = prepared_file_alignment()?;
     let pinned = PinnedSuffixInputs::pin(&root, params)?;
     let coverage = pinned
         .payload
@@ -3131,7 +3448,7 @@ pub(crate) fn complete_prepared_initrd(
     });
 
     if let Some(payload) = &pinned.payload {
-        let leading_pad = stream_offset % page_size;
+        let leading_pad = stream_offset % file_alignment;
         let key = payload_recipe_key(payload, coverage, page_size, compression);
         let payload_path = payload.proc_path();
         let canonical = get_or_build_part(
@@ -3180,7 +3497,7 @@ pub(crate) fn complete_prepared_initrd(
     }
 
     if !pinned.modules.is_empty() {
-        let leading_pad = stream_offset % page_size;
+        let leading_pad = stream_offset % file_alignment;
         let key = modules_recipe_key(&pinned.modules, page_size, compression);
         let module_sources = pinned.module_sources();
         let canonical = get_or_build_part(
@@ -3228,7 +3545,7 @@ pub(crate) fn complete_prepared_initrd(
             .context("uncompressed module length overflow")?;
     }
 
-    let leading_pad = stream_offset % page_size;
+    let leading_pad = stream_offset % file_alignment;
     let tail_key = tail_recipe_key(
         uncompressed_len,
         leading_pad,
@@ -3271,7 +3588,7 @@ pub(crate) fn complete_prepared_initrd(
     );
     let part_count = parts.len();
     let (ranges, direct_ranges, stitch_pages, stitch_cache_hits) =
-        plan_prepared_mappings(&root, &mut parts, page_size, compression)?;
+        plan_prepared_mappings(&root, &mut parts, page_size, file_alignment, compression)?;
     cache_hits += stitch_cache_hits;
     let plan = PreparedRangePlan {
         part_count,
@@ -4128,6 +4445,322 @@ mod tests {
         }
     }
 
+    fn test_prepared_part(
+        root: &Path,
+        kind: PreparedObjectKind,
+        key: u64,
+        page: usize,
+        leading_pad: usize,
+        compressed_len: usize,
+    ) -> PreparedObject {
+        let expectation = PreparedObjectExpectation {
+            kind,
+            compression: initramfs::InitrdCompression::Lz4,
+            key,
+            page_size: page as u64,
+            leading_pad: Some(leading_pad as u64),
+            parent_key: Some(key),
+        };
+        get_or_build_prepared_object(root, expectation, || {
+            let mut payload = vec![0; leading_pad];
+            payload.resize(leading_pad + compressed_len, key as u8);
+            Ok(BuiltPreparedObject {
+                header: PreparedObjectHeader {
+                    kind,
+                    compression: initramfs::InitrdCompression::Lz4,
+                    key,
+                    page_size: page as u64,
+                    payload_len: payload.len() as u64,
+                    payload_hash: ahash_bytes(&payload),
+                    part_uncompressed_len: compressed_len as u64,
+                    part_compressed_len: compressed_len as u64,
+                    leading_pad: leading_pad as u64,
+                    stream_offset_mod: leading_pad as u64,
+                    reserved_shape: 0,
+                    parent_key: key,
+                    reserved_len: 0,
+                },
+                payload,
+            })
+        })
+        .unwrap()
+    }
+
+    fn test_prepared_base(
+        root: &Path,
+        key: u64,
+        compression: initramfs::InitrdCompression,
+        uncompressed: &[u8],
+    ) -> PreparedBase {
+        let page = PREPARED_MAPPING_GRANULE;
+        let compressed = initramfs::compress_initrd_part(compression, uncompressed).unwrap();
+        let expectation = PreparedObjectExpectation {
+            kind: PreparedObjectKind::Base,
+            compression,
+            key,
+            page_size: page as u64,
+            leading_pad: Some(0),
+            parent_key: Some(key),
+        };
+        let object = get_or_build_prepared_object(root, expectation, || {
+            Ok(BuiltPreparedObject {
+                header: PreparedObjectHeader {
+                    kind: PreparedObjectKind::Base,
+                    compression,
+                    key,
+                    page_size: page as u64,
+                    payload_len: compressed.len() as u64,
+                    payload_hash: ahash_bytes(&compressed),
+                    part_uncompressed_len: uncompressed.len() as u64,
+                    part_compressed_len: compressed.len() as u64,
+                    leading_pad: 0,
+                    stream_offset_mod: 0,
+                    reserved_shape: 0,
+                    parent_key: key,
+                    reserved_len: 0,
+                },
+                payload: compressed,
+            })
+        })
+        .unwrap();
+        PreparedBase {
+            root: root.to_path_buf(),
+            object,
+            page_size: page,
+            compression,
+        }
+    }
+
+    fn read_prepared_stream(prepared: PreparedInitrd) -> Vec<u8> {
+        let compressed_len = prepared.compressed_len();
+        let mut stream = Vec::new();
+        for range in prepared.into_ranges() {
+            let file = File::from(range.fd);
+            let mut bytes = vec![0u8; range.map_len];
+            let mut offset = 0usize;
+            while offset < bytes.len() {
+                let read = file
+                    .read_at(&mut bytes[offset..], range.file_offset + offset as u64)
+                    .unwrap();
+                assert!(read > 0);
+                offset += read;
+            }
+            stream.extend_from_slice(&bytes);
+        }
+        stream.truncate(compressed_len);
+        stream
+    }
+
+    fn decompress_prepared_stream(
+        compression: initramfs::InitrdCompression,
+        stream: &[u8],
+    ) -> Vec<u8> {
+        use std::io::Read as _;
+
+        match compression {
+            initramfs::InitrdCompression::Lz4 => {
+                let mut output = Vec::new();
+                let mut offset = 0usize;
+                while offset < stream.len() {
+                    assert_eq!(stream[offset..offset + 4], initramfs::LZ4_LEGACY_MAGIC);
+                    offset += 4;
+                    while offset < stream.len()
+                        && stream[offset..offset + 4] != initramfs::LZ4_LEGACY_MAGIC
+                    {
+                        let chunk_len =
+                            u32::from_le_bytes(stream[offset..offset + 4].try_into().unwrap())
+                                as usize;
+                        offset += 4;
+                        let end = offset + chunk_len;
+                        output.extend(
+                            lz4_flex::block::decompress(&stream[offset..end], 8 << 20).unwrap(),
+                        );
+                        offset = end;
+                    }
+                }
+                output
+            }
+            initramfs::InitrdCompression::Zstd => {
+                zstd::stream::decode_all(std::io::Cursor::new(stream)).unwrap()
+            }
+            initramfs::InitrdCompression::Gzip => {
+                let mut output = Vec::new();
+                flate2::read::MultiGzDecoder::new(std::io::Cursor::new(stream))
+                    .read_to_end(&mut output)
+                    .unwrap();
+                output
+            }
+            initramfs::InitrdCompression::Uncompressed => stream.to_vec(),
+        }
+    }
+
+    #[test]
+    fn prepared_stream_reconstructs_every_compression_and_empty_base() {
+        let compressions = [
+            initramfs::InitrdCompression::Lz4,
+            initramfs::InitrdCompression::Zstd,
+            initramfs::InitrdCompression::Gzip,
+            initramfs::InitrdCompression::Uncompressed,
+        ];
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let incompressible: Vec<u8> = (0..(3 << 20))
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+
+        for (compression_index, compression) in compressions.into_iter().enumerate() {
+            for (case_index, base_bytes) in [incompressible.as_slice(), &[] as &[u8]]
+                .into_iter()
+                .enumerate()
+            {
+                let temp = tempfile::tempdir().unwrap();
+                ensure_prepared_cache_dirs(temp.path()).unwrap();
+                let key = 0x9000 + (compression_index * 2 + case_index) as u64;
+                let prepared_base = test_prepared_base(temp.path(), key, compression, base_bytes);
+                let params = initramfs::SuffixParams::default();
+                let mut expected = base_bytes.to_vec();
+                expected.extend(initramfs::build_dynamic_tail(base_bytes.len(), &params).unwrap());
+                let prepared = complete_prepared_initrd(prepared_base, &params).unwrap();
+                assert_eq!(prepared.uncompressed_len(), expected.len());
+                let stream = read_prepared_stream(prepared);
+                assert_eq!(
+                    decompress_prepared_stream(compression, &stream),
+                    expected,
+                    "{compression:?} prepared stream did not reconstruct"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_planner_uses_host_page_file_alignment_not_mapping_granule() {
+        let page = PREPARED_MAPPING_GRANULE;
+        let first_len = 0x1_2345;
+
+        for (index, file_alignment) in [0x1000, 0x4000, 0x1_0000, page].into_iter().enumerate() {
+            let temp = tempfile::tempdir().unwrap();
+            ensure_prepared_cache_dirs(temp.path()).unwrap();
+            let leading_pad = first_len % file_alignment;
+            let mut parts = vec![
+                PreparedPart {
+                    object: test_prepared_part(
+                        temp.path(),
+                        PreparedObjectKind::Payload,
+                        0x100 + index as u64,
+                        page,
+                        0,
+                        first_len,
+                    ),
+                    stream_offset: 0,
+                    uncompressed_len: first_len,
+                    compressed_len: first_len,
+                },
+                PreparedPart {
+                    object: test_prepared_part(
+                        temp.path(),
+                        PreparedObjectKind::PayloadView,
+                        0x200 + index as u64,
+                        page,
+                        leading_pad,
+                        page * 2,
+                    ),
+                    stream_offset: first_len,
+                    uncompressed_len: page * 2,
+                    compressed_len: page * 2,
+                },
+            ];
+
+            let (ranges, direct_ranges, stitch_pages, _) = plan_prepared_mappings(
+                temp.path(),
+                &mut parts,
+                page,
+                file_alignment,
+                initramfs::InitrdCompression::Lz4,
+            )
+            .unwrap();
+            assert_eq!(stitch_pages, 1);
+            assert_eq!(direct_ranges, 1);
+            assert_eq!(ranges.len(), 2);
+            assert_eq!(ranges[1].guest_offset, page as u64);
+            assert_eq!(ranges[1].file_offset % file_alignment as u64, 0);
+            assert!(
+                leading_pad < file_alignment,
+                "shifted views must be bounded by the host page, not 2 MiB"
+            );
+            if file_alignment < page {
+                assert_ne!(
+                    ranges[1].file_offset % page as u64,
+                    0,
+                    "ordinary-file direct ranges should not require 2 MiB file offsets"
+                );
+            }
+            for range in &ranges {
+                let file_len = rustix::fs::fstat(&range.fd).unwrap().st_size as u64;
+                assert!(
+                    range.file_offset + range.map_len as u64 <= file_len,
+                    "every planned mapping must be wholly inside its backing file"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_planner_stitches_shifted_final_page_before_eof() {
+        let temp = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(temp.path()).unwrap();
+        let page = PREPARED_MAPPING_GRANULE;
+        let file_alignment = 4096;
+        let first_len = page - 1024;
+        let leading_pad = first_len % file_alignment;
+        assert_eq!(leading_pad, 3072);
+        let mut parts = vec![
+            PreparedPart {
+                object: test_prepared_part(
+                    temp.path(),
+                    PreparedObjectKind::Payload,
+                    0xc001,
+                    page,
+                    0,
+                    first_len,
+                ),
+                stream_offset: 0,
+                uncompressed_len: first_len,
+                compressed_len: first_len,
+            },
+            PreparedPart {
+                object: test_prepared_part(
+                    temp.path(),
+                    PreparedObjectKind::PayloadView,
+                    0xc002,
+                    page,
+                    leading_pad,
+                    10 << 10,
+                ),
+                stream_offset: first_len,
+                uncompressed_len: 10 << 10,
+                compressed_len: 10 << 10,
+            },
+        ];
+        let (ranges, direct_ranges, stitch_pages, _) = plan_prepared_mappings(
+            temp.path(),
+            &mut parts,
+            page,
+            file_alignment,
+            initramfs::InitrdCompression::Lz4,
+        )
+        .unwrap();
+        assert_eq!(direct_ranges, 0);
+        assert_eq!(stitch_pages, 2);
+        for range in ranges {
+            let file_len = rustix::fs::fstat(&range.fd).unwrap().st_size as u64;
+            assert!(range.file_offset + range.map_len as u64 <= file_len);
+        }
+    }
+
     #[test]
     fn prepared_object_rejects_torn_and_header_corruption() {
         let temp = tempfile::tempdir().unwrap();
@@ -4140,17 +4773,330 @@ mod tests {
         let built = test_base_object(key, 4096, vec![7; 5000]);
         std::fs::remove_file(&path).unwrap();
         publish_prepared_object(temp.path(), &path, &built).unwrap();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        file.seek(SeekFrom::Start(24)).unwrap();
-        file.write_all(&8192u64.to_le_bytes()).unwrap();
-        drop(file);
+        let mut corrupted = std::fs::read(&path).unwrap();
+        corrupted[24..32].copy_from_slice(&8192u64.to_le_bytes());
+        // Published CAS objects are intentionally 0444. Replace this private
+        // test fixture through the directory rather than weakening the
+        // object's permissions or expecting a writable open to succeed.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, corrupted).unwrap();
         assert!(
             try_open_prepared_object(&path, test_base_expectation(key, 4096)).is_err(),
             "header checksum must reject metadata corruption in O(1)"
+        );
+    }
+
+    #[test]
+    fn closure_key_reuses_identical_root_and_loader_cache_replacements() {
+        let root = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(root.path()).unwrap();
+        let cwd = std::fs::canonicalize(root.path()).unwrap();
+        let binary_path = root.path().join("payload");
+        let cache_path = root.path().join("ld.so.cache");
+        std::fs::write(&binary_path, b"identical payload bytes").unwrap();
+        std::fs::write(&cache_path, b"identical loader cache bytes").unwrap();
+        let old_binary = pin_input(root.path(), &binary_path).unwrap();
+        let old_cache = pin_input(root.path(), &cache_path).unwrap();
+        let old_loader = PinnedLoaderInputs {
+            cwd: cwd.clone(),
+            ld_library_path_present: false,
+            ld_library_path_raw: Vec::new(),
+            ld_library_path_dirs: Vec::new(),
+            ld_so_cache: Some(old_cache),
+        };
+        let old_key = closure_recipe_key(&old_binary, &binary_path, &old_loader);
+
+        let replacement_binary = root.path().join("payload.new");
+        let replacement_cache = root.path().join("ld.so.cache.new");
+        std::fs::write(&replacement_binary, b"identical payload bytes").unwrap();
+        std::fs::write(&replacement_cache, b"identical loader cache bytes").unwrap();
+        std::fs::rename(&replacement_binary, &binary_path).unwrap();
+        std::fs::rename(&replacement_cache, &cache_path).unwrap();
+        let new_binary = pin_input(root.path(), &binary_path).unwrap();
+        let new_cache = pin_input(root.path(), &cache_path).unwrap();
+        assert_ne!(
+            (old_binary.identity.dev, old_binary.identity.ino),
+            (new_binary.identity.dev, new_binary.identity.ino),
+            "fixture must replace the root inode"
+        );
+        assert_ne!(
+            (
+                old_loader.ld_so_cache.as_ref().unwrap().identity.dev,
+                old_loader.ld_so_cache.as_ref().unwrap().identity.ino,
+            ),
+            (new_cache.identity.dev, new_cache.identity.ino),
+            "fixture must replace the loader-cache inode"
+        );
+        let new_loader = PinnedLoaderInputs {
+            cwd,
+            ld_library_path_present: false,
+            ld_library_path_raw: Vec::new(),
+            ld_library_path_dirs: Vec::new(),
+            ld_so_cache: Some(new_cache),
+        };
+        assert_eq!(
+            old_key,
+            closure_recipe_key(&new_binary, &binary_path, &new_loader),
+            "content-identical inode replacement must retain the closure key"
+        );
+    }
+
+    #[test]
+    fn closure_record_checksum_rejects_one_byte_corruption() {
+        let root = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(root.path()).unwrap();
+        let key = 0xabc0_1234;
+        let path = root
+            .path()
+            .join(PREPARED_CLOSURES_DIR)
+            .join(format!("{key:016x}.closure"));
+        let record = ClosureRecord {
+            entries: Vec::new(),
+            search_paths: vec![ClosureSearchRecord {
+                path: root.path().join("missing"),
+                identity: None,
+            }],
+        };
+        let mut bytes = encode_closure_record(&record, key).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(read_pinned_closure_record(&path, key).unwrap().is_some());
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x40;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(
+            read_pinned_closure_record(&path, key).is_err(),
+            "a decodable postcard payload must still fail its envelope checksum"
+        );
+    }
+
+    #[test]
+    fn digest_record_checksum_and_schema_namespace_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(root.path()).unwrap();
+        let path = root.path().join("input");
+        std::fs::write(&path, b"digest checksum fixture").unwrap();
+        let input = pin_input(root.path(), &path).unwrap();
+        let current_key = file_digest_identity_key_for_schema(input.identity, PREPARED_CAS_SCHEMA);
+        assert_ne!(
+            current_key,
+            file_digest_identity_key_for_schema(
+                input.identity,
+                PREPARED_CAS_SCHEMA.saturating_sub(1),
+            ),
+            "schema changes must cold-miss in the filename namespace"
+        );
+        let record_path = root
+            .path()
+            .join(PREPARED_DIGESTS_DIR)
+            .join(format!("{current_key:016x}.digest"));
+        let mut bytes = std::fs::read(&record_path).unwrap();
+        bytes[72] ^= 1;
+        std::fs::write(&record_path, bytes).unwrap();
+        assert!(
+            read_file_digest_record(&record_path, input.identity).is_err(),
+            "digest corruption must not silently key downstream objects"
+        );
+    }
+
+    #[test]
+    fn stable_owned_read_reports_midstream_truncate_without_sigbus() {
+        let root = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(root.path()).unwrap();
+        let path = root.path().join("large-payload");
+        std::fs::write(&path, vec![0x5a; 3 << 20]).unwrap();
+        let input = pin_input(root.path(), &path).unwrap();
+        let mut truncated = false;
+        let result = input.read_owned_stable_with_hook(|offset| {
+            if !truncated && offset >= 1 << 20 {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap();
+                truncated = true;
+            }
+        });
+        assert!(result.is_err(), "mid-read truncate must be a normal error");
+    }
+
+    fn pinned_closure_entry(root: &Path, guest_path: &str, host_path: &Path) -> PinnedClosureEntry {
+        PinnedClosureEntry {
+            guest_path: guest_path.to_owned(),
+            input: pin_input(root, host_path).unwrap(),
+        }
+    }
+
+    fn pinned_archive_entry(
+        root: &Path,
+        archive_name: &str,
+        host_path: &Path,
+        mode: u32,
+    ) -> PinnedArchiveInput {
+        PinnedArchiveInput {
+            archive_name: archive_name.to_owned(),
+            input: pin_input(root, host_path).unwrap(),
+            mode,
+        }
+    }
+
+    #[test]
+    fn explicit_archive_collisions_collapse_only_exact_verbatim_dependencies() {
+        let root = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(root.path()).unwrap();
+        let same = root.path().join("same");
+        let different = root.path().join("different");
+        std::fs::write(&same, b"dependency bytes").unwrap();
+        std::fs::write(&different, b"different bytes").unwrap();
+        let guest_path = "lib64/libcollision.so";
+
+        let executable_include = pinned_archive_entry(root.path(), guest_path, &same, 0o100755);
+        let mut dependencies = vec![pinned_closure_entry(root.path(), guest_path, &same)];
+        remove_explicit_dependency_collisions(&[], &[executable_include], &mut dependencies)
+            .unwrap();
+        assert!(
+            dependencies.is_empty(),
+            "an identical verbatim executable include is the same archive entry"
+        );
+
+        let non_executable_include = pinned_archive_entry(root.path(), guest_path, &same, 0o100644);
+        let mut dependencies = vec![pinned_closure_entry(root.path(), guest_path, &same)];
+        assert!(
+            remove_explicit_dependency_collisions(
+                &[],
+                &[non_executable_include],
+                &mut dependencies
+            )
+            .is_err(),
+            "identical bytes with a different archive mode must not collapse"
+        );
+
+        let different_include = pinned_archive_entry(root.path(), guest_path, &different, 0o100755);
+        let mut dependencies = vec![pinned_closure_entry(root.path(), guest_path, &same)];
+        assert!(
+            remove_explicit_dependency_collisions(&[], &[different_include], &mut dependencies)
+                .is_err(),
+            "the same guest path with different bytes must fail"
+        );
+
+        let stripped_extra = pinned_archive_entry(root.path(), guest_path, &same, 0o100755);
+        let mut dependencies = vec![pinned_closure_entry(root.path(), guest_path, &same)];
+        assert!(
+            remove_explicit_dependency_collisions(&[stripped_extra], &[], &mut dependencies)
+                .is_err(),
+            "extra binaries undergo stripping and therefore cannot be \
+             collapsed from their source digest"
+        );
+    }
+
+    #[test]
+    fn extra_and_include_archive_paths_must_be_disjoint() {
+        let root = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(root.path()).unwrap();
+        let file = root.path().join("file");
+        std::fs::write(&file, b"bytes").unwrap();
+        let extra = pinned_archive_entry(root.path(), "usr/bin/tool", &file, 0o100755);
+        let include = pinned_archive_entry(root.path(), "usr/bin/tool", &file, 0o100755);
+        assert!(ensure_explicit_paths_disjoint(&[extra], &[include]).is_err());
+    }
+
+    #[test]
+    fn closure_guest_collisions_collapse_by_content_and_reject_conflicts() {
+        let root = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(root.path()).unwrap();
+        let first = root.path().join("first");
+        let identical_inode = root.path().join("identical-copy");
+        let different = root.path().join("different");
+        std::fs::write(&first, b"same bytes").unwrap();
+        std::fs::write(&identical_inode, b"same bytes").unwrap();
+        std::fs::write(&different, b"different bytes").unwrap();
+
+        let mut merged = Vec::new();
+        merge_pinned_closure_entries(
+            &mut merged,
+            PinnedClosure {
+                entries: vec![pinned_closure_entry(
+                    root.path(),
+                    "lib64/libdemo.so",
+                    &first,
+                )],
+            },
+        )
+        .unwrap();
+        merge_pinned_closure_entries(
+            &mut merged,
+            PinnedClosure {
+                entries: vec![pinned_closure_entry(
+                    root.path(),
+                    "lib64/libdemo.so",
+                    &identical_inode,
+                )],
+            },
+        )
+        .unwrap();
+        assert_eq!(merged.len(), 1);
+        assert!(
+            merge_pinned_closure_entries(
+                &mut merged,
+                PinnedClosure {
+                    entries: vec![pinned_closure_entry(
+                        root.path(),
+                        "lib64/libdemo.so",
+                        &different,
+                    )],
+                },
+            )
+            .is_err(),
+            "same guest path with different content must fail deterministically"
+        );
+    }
+
+    #[test]
+    fn prepared_archive_symlink_shape_is_content_not_inode_based() {
+        let root = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(root.path()).unwrap();
+        let first = root.path().join("first");
+        let copy = root.path().join("copy");
+        std::fs::write(&first, b"library bytes").unwrap();
+        std::fs::write(&copy, b"library bytes").unwrap();
+        let first_input = pin_input(root.path(), &first).unwrap();
+        let copy_input = pin_input(root.path(), &copy).unwrap();
+        assert_ne!(first_input.identity.ino, copy_input.identity.ino);
+        let first_proc = first_input.proc_path();
+        let copy_proc = copy_input.proc_path();
+        let separate_inodes = vec![
+            (
+                "lib64/libsame.so".to_owned(),
+                first_proc.clone(),
+                first_input.identity.size,
+                first_input.content_hash,
+            ),
+            (
+                "usr/lib64/libsame.so".to_owned(),
+                copy_proc,
+                copy_input.identity.size,
+                copy_input.content_hash,
+            ),
+        ];
+        let one_inode = vec![
+            (
+                "lib64/libsame.so".to_owned(),
+                first_proc.clone(),
+                first_input.identity.size,
+                first_input.content_hash,
+            ),
+            (
+                "usr/lib64/libsame.so".to_owned(),
+                first_proc,
+                first_input.identity.size,
+                first_input.content_hash,
+            ),
+        ];
+        assert_eq!(
+            initramfs::build_initramfs_base_from_resolved(&[], &[], None, &separate_inodes,)
+                .unwrap(),
+            initramfs::build_initramfs_base_from_resolved(&[], &[], None, &one_inode).unwrap(),
+            "byte-identical inode copies must produce the same archive graph"
         );
     }
 
@@ -4190,6 +5136,678 @@ mod tests {
                 .iter()
                 .all(|object| object.header.payload_len == 8193)
         );
+    }
+
+    const PREPARED_CHILD_TEST: &str =
+        "vmm::initramfs_cache::tests::prepared_object_cross_process_child";
+    const PREPARED_CHILD_ROOT: &str = "KTSTR_PREPARED_CHILD_ROOT";
+    const PREPARED_CHILD_MODE: &str = "KTSTR_PREPARED_CHILD_MODE";
+    const PREPARED_CHILD_INDEX: &str = "KTSTR_PREPARED_CHILD_INDEX";
+    const PREPARED_CHILD_KEY: &str = "KTSTR_PREPARED_CHILD_KEY";
+    const PREPARED_CHILD_COUNTER: &str = "KTSTR_PREPARED_CHILD_COUNTER";
+    const PREPARED_CHILD_START: &str = "KTSTR_PREPARED_CHILD_START";
+    const PREPARED_CHILD_READY: &str = "KTSTR_PREPARED_CHILD_READY";
+    const PREPARED_CHILD_RESULTS: &str = "KTSTR_PREPARED_CHILD_RESULTS";
+    const PREPARED_CHILD_WINNER: &str = "KTSTR_PREPARED_CHILD_WINNER";
+
+    struct ChildProcesses(Vec<Option<std::process::Child>>);
+
+    impl ChildProcesses {
+        fn push(&mut self, child: std::process::Child) {
+            self.0.push(Some(child));
+        }
+
+        fn wait_all_success(&mut self, timeout: std::time::Duration) {
+            let deadline = std::time::Instant::now() + timeout;
+            while self.0.iter().any(Option::is_some) {
+                for child in &mut self.0 {
+                    let Some(process) = child.as_mut() else {
+                        continue;
+                    };
+                    if let Some(status) = process.try_wait().unwrap() {
+                        assert!(status.success(), "prepared child exited with {status}");
+                        *child = None;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "prepared child processes did not finish before timeout"
+                );
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    impl Drop for ChildProcesses {
+        fn drop(&mut self) {
+            for process in self.0.iter_mut().flatten() {
+                let _ = process.kill();
+                let _ = process.wait();
+            }
+        }
+    }
+
+    struct PreparedChildPaths<'a> {
+        root: &'a Path,
+        counter: &'a Path,
+        start: &'a Path,
+        ready: &'a Path,
+        results: &'a Path,
+        winner: &'a Path,
+    }
+
+    fn spawn_prepared_child(
+        paths: &PreparedChildPaths<'_>,
+        mode: &str,
+        index: usize,
+        key: u64,
+    ) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(PREPARED_CHILD_TEST)
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(PREPARED_CHILD_ROOT, paths.root)
+            .env(PREPARED_CHILD_MODE, mode)
+            .env(PREPARED_CHILD_INDEX, index.to_string())
+            .env(PREPARED_CHILD_KEY, format!("{key:016x}"))
+            .env(PREPARED_CHILD_COUNTER, paths.counter)
+            .env(PREPARED_CHILD_START, paths.start)
+            .env(PREPARED_CHILD_READY, paths.ready)
+            .env(PREPARED_CHILD_RESULTS, paths.results)
+            .env(PREPARED_CHILD_WINNER, paths.winner)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn wait_for_child_files(
+        directory: &Path,
+        expected: usize,
+        children: &mut ChildProcesses,
+        timeout: std::time::Duration,
+    ) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let count = std::fs::read_dir(directory).unwrap().count();
+            if count == expected {
+                return;
+            }
+            for child in &mut children.0 {
+                if let Some(process) = child
+                    && let Some(status) = process.try_wait().unwrap()
+                {
+                    panic!("prepared child exited before barrier with {status}");
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {count}/{expected} prepared children reached the barrier"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn prepared_object_cross_process_child() {
+        use std::io::Write as _;
+
+        let Some(root) = std::env::var_os(PREPARED_CHILD_ROOT).map(PathBuf::from) else {
+            return;
+        };
+        let mode = std::env::var(PREPARED_CHILD_MODE).unwrap();
+        let index: usize = std::env::var(PREPARED_CHILD_INDEX)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let key = u64::from_str_radix(&std::env::var(PREPARED_CHILD_KEY).unwrap(), 16).unwrap();
+        let counter = PathBuf::from(std::env::var_os(PREPARED_CHILD_COUNTER).unwrap());
+        let start = PathBuf::from(std::env::var_os(PREPARED_CHILD_START).unwrap());
+        let ready = PathBuf::from(std::env::var_os(PREPARED_CHILD_READY).unwrap());
+        let results = PathBuf::from(std::env::var_os(PREPARED_CHILD_RESULTS).unwrap());
+        let winner = PathBuf::from(std::env::var_os(PREPARED_CHILD_WINNER).unwrap());
+        ensure_prepared_cache_dirs(&root).unwrap();
+
+        if mode == "storm" {
+            let start = File::open(start).unwrap();
+            std::fs::write(ready.join(index.to_string()), b"ready").unwrap();
+            rustix::fs::flock(&start, rustix::fs::FlockOperation::LockShared).unwrap();
+        }
+
+        let page = PREPARED_MAPPING_GRANULE;
+        let object = get_or_build_prepared_object(&root, test_base_expectation(key, page), || {
+            let mut attempts = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&counter)
+                .unwrap();
+            writeln!(attempts, "{mode}:{index}").unwrap();
+            attempts.sync_all().unwrap();
+            if mode == "kill-builder" {
+                std::fs::write(&winner, b"exclusive-lock-held").unwrap();
+                loop {
+                    std::thread::park();
+                }
+            }
+            // Large enough to make duplicate transformations/publications
+            // visible without adding an artificial sleep.
+            Ok(test_base_object(key, page, vec![0x6d; 8 << 20]))
+        })
+        .unwrap();
+
+        let fd = object.fd.as_ref().unwrap();
+        let stat = rustix::fs::fstat(fd).unwrap();
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(address, libc::MAP_FAILED);
+        let address = address.cast::<u8>();
+        unsafe {
+            initramfs::cow_overlay_file_borrowed(address, page, fd, object.data_offset as u64)
+                .unwrap();
+        }
+        assert_eq!(unsafe { address.read_volatile() }, 0x6d);
+        let private_value = (index as u8).wrapping_add(1);
+        unsafe {
+            address.write_volatile(private_value);
+        }
+        assert_eq!(unsafe { address.read_volatile() }, private_value);
+        let mut persisted = [0u8; 1];
+        let read = unsafe {
+            libc::pread(
+                fd.as_raw_fd(),
+                persisted.as_mut_ptr().cast(),
+                1,
+                object.data_offset as libc::off_t,
+            )
+        };
+        assert_eq!(read, 1);
+        assert_eq!(persisted[0], 0x6d);
+        unsafe {
+            libc::munmap(address.cast(), page);
+        }
+        std::fs::write(
+            results.join(index.to_string()),
+            format!(
+                "{} {} {} {} {}",
+                stat.st_dev,
+                stat.st_ino,
+                persisted[0],
+                private_value,
+                u8::from(object.cache_hit)
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn prepared_object_52_process_storm_builds_once_and_cow_isolates() {
+        const CELLS: usize = 52;
+        let temp = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(temp.path()).unwrap();
+        let counter = temp.path().join("attempts");
+        let start_path = temp.path().join("start");
+        let ready = temp.path().join("ready");
+        let results = temp.path().join("results");
+        let winner = temp.path().join("winner");
+        std::fs::create_dir(&ready).unwrap();
+        std::fs::create_dir(&results).unwrap();
+        let start = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&start_path)
+            .unwrap();
+        rustix::fs::flock(&start, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        let paths = PreparedChildPaths {
+            root: temp.path(),
+            counter: &counter,
+            start: &start_path,
+            ready: &ready,
+            results: &results,
+            winner: &winner,
+        };
+        let key = 0xd001;
+        let mut children = ChildProcesses(Vec::with_capacity(CELLS));
+        for index in 0..CELLS {
+            children.push(spawn_prepared_child(&paths, "storm", index, key));
+        }
+        wait_for_child_files(
+            &ready,
+            CELLS,
+            &mut children,
+            std::time::Duration::from_secs(30),
+        );
+        rustix::fs::flock(&start, rustix::fs::FlockOperation::Unlock).unwrap();
+        children.wait_all_success(std::time::Duration::from_secs(60));
+
+        let attempts = std::fs::read_to_string(&counter).unwrap();
+        assert_eq!(
+            attempts.lines().count(),
+            1,
+            "the barriered process storm must run exactly one transform"
+        );
+        let mut inodes = std::collections::HashSet::new();
+        let mut cache_hits = 0usize;
+        for index in 0..CELLS {
+            let result = std::fs::read_to_string(results.join(index.to_string())).unwrap();
+            let fields: Vec<u64> = result
+                .split_whitespace()
+                .map(|field| field.parse().unwrap())
+                .collect();
+            assert_eq!(fields.len(), 5);
+            inodes.insert((fields[0], fields[1]));
+            assert_eq!(fields[2], 0x6d);
+            assert_eq!(fields[3] as u8, (index as u8).wrapping_add(1));
+            cache_hits += fields[4] as usize;
+        }
+        assert_eq!(inodes.len(), 1, "every process must map the same CAS inode");
+        assert_eq!(cache_hits, CELLS - 1);
+    }
+
+    #[test]
+    fn prepared_object_killed_builder_elects_successor() {
+        let temp = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(temp.path()).unwrap();
+        let counter = temp.path().join("attempts");
+        let start = temp.path().join("unused-start");
+        let ready = temp.path().join("ready");
+        let results = temp.path().join("results");
+        let winner = temp.path().join("winner");
+        std::fs::create_dir(&ready).unwrap();
+        std::fs::create_dir(&results).unwrap();
+        let paths = PreparedChildPaths {
+            root: temp.path(),
+            counter: &counter,
+            start: &start,
+            ready: &ready,
+            results: &results,
+            winner: &winner,
+        };
+        let key = 0xd002;
+        let mut children = ChildProcesses(Vec::new());
+        children.push(spawn_prepared_child(&paths, "kill-builder", 0, key));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !winner.exists() {
+            if let Some(status) = children.0[0].as_mut().unwrap().try_wait().unwrap() {
+                panic!("elected builder exited before kill point: {status}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "elected builder did not reach its publication hold point"
+            );
+            std::thread::yield_now();
+        }
+        let mut killed = children.0[0].take().unwrap();
+        killed.kill().unwrap();
+        assert!(!killed.wait().unwrap().success());
+
+        children.push(spawn_prepared_child(&paths, "successor", 1, key));
+        children.wait_all_success(std::time::Duration::from_secs(60));
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().lines().count(),
+            2,
+            "one killed attempt and one elected successor must run"
+        );
+        let object_path = prepared_object_path(temp.path(), PreparedObjectKind::Base, key);
+        assert!(object_path.exists());
+        assert!(
+            try_open_prepared_object(
+                &object_path,
+                test_base_expectation(key, PREPARED_MAPPING_GRANULE),
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn gc_namespace_gate_closes_open_flock_unlink_race_and_sweeps_idle_locks() {
+        let temp = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(temp.path()).unwrap();
+        let lock_path = temp
+            .path()
+            .join(PREPARED_LOCKS_DIR)
+            .join("payload-000000000000abcd.lock");
+
+        let mut holder = open_coord_file(temp.path(), &lock_path).unwrap();
+        holder.try_lock_exclusive().unwrap();
+
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let root = temp.path().to_path_buf();
+        let waiter_path = lock_path.clone();
+        let waiter = std::thread::spawn(move || {
+            let mut coordination = open_coord_file(&root, &waiter_path).unwrap();
+            assert_eq!(
+                coordination.try_lock_exclusive().unwrap_err(),
+                rustix::io::Errno::WOULDBLOCK
+            );
+            // The waiter still holds namespace LOCK_SH at this point and
+            // retains it while blocking for the per-key shared lock.
+            opened_tx.send(()).unwrap();
+            coordination.lock_shared().unwrap();
+            acquired_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        opened_rx.recv().unwrap();
+        assert!(
+            try_lock_gc_namespace(temp.path()).unwrap().is_none(),
+            "GC must not enter the unlink namespace while an opener is \
+             between open and successful per-key flock"
+        );
+
+        drop(holder);
+        acquired_rx.recv().unwrap();
+        let namespace = try_lock_gc_namespace(temp.path())
+            .unwrap()
+            .expect("waiter releases namespace gate after taking per-key LOCK_SH");
+        assert_eq!(
+            sweep_idle_coordination_locks(temp.path(), &namespace).unwrap(),
+            0,
+            "a live per-key shared holder must prevent lock inode collection"
+        );
+        assert!(lock_path.exists());
+
+        release_tx.send(()).unwrap();
+        waiter.join().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while lock_path.exists() {
+            sweep_idle_coordination_locks(temp.path(), &namespace).unwrap();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "idle coordination lock remained live after every owner dropped"
+            );
+            // A parallel self-spawn test may have forked while the fd was
+            // open. O_CLOEXEC closes that inherited reference at exec, but
+            // GC must correctly observe it as live during the brief fork→exec
+            // window and retry rather than unlinking under it.
+            std::thread::yield_now();
+        }
+        assert!(!lock_path.exists());
+        drop(namespace);
+
+        let mut replacement = open_coord_file(temp.path(), &lock_path).unwrap();
+        replacement.try_lock_exclusive().unwrap();
+        assert!(
+            lock_path.exists(),
+            "the first post-GC operation must safely recreate the coordination inode"
+        );
+    }
+
+    #[test]
+    fn gc_preserves_live_object_and_temp_locks_then_collects_them() {
+        let temp = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(temp.path()).unwrap();
+        let object_key = 0xa001;
+        let object = test_prepared_part(
+            temp.path(),
+            PreparedObjectKind::Payload,
+            object_key,
+            4096,
+            0,
+            1024,
+        );
+        let object_path =
+            prepared_object_path(temp.path(), PreparedObjectKind::Payload, object_key);
+
+        let temp_key = 0xa002;
+        let temp_path = temp
+            .path()
+            .join(PREPARED_OBJECTS_DIR)
+            .join(format!(".tmp-object-payload-{temp_key:016x}-interrupted"));
+        std::fs::write(&temp_path, b"partial").unwrap();
+        let temp_lock_path =
+            prepared_object_lock_path(temp.path(), PreparedObjectKind::Payload, temp_key);
+        let mut temp_holder = open_coord_file(temp.path(), &temp_lock_path).unwrap();
+        temp_holder.try_lock_exclusive().unwrap();
+
+        let namespace = try_lock_gc_namespace(temp.path())
+            .unwrap()
+            .expect("coordination holders release the namespace after flock");
+        let far_future =
+            unix_now_secs() + PREPARED_CAS_MAX_AGE_SECS + PREPARED_CAS_GC_INTERVAL_SECS + 1;
+        run_prepared_cache_gc(temp.path(), far_future, &namespace).unwrap();
+        assert!(
+            object_path.exists(),
+            "the object's LOCK_SH must prevent final-object collection"
+        );
+        assert!(
+            temp_path.exists(),
+            "the interrupted winner's per-key EX lock must protect its temp"
+        );
+
+        drop(object);
+        drop(temp_holder);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while object_path.exists() || temp_path.exists() {
+            run_prepared_cache_gc(temp.path(), far_future, &namespace).unwrap();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "GC did not collect objects after every live owner dropped"
+            );
+            std::thread::yield_now();
+        }
+        assert!(!object_path.exists());
+        assert!(!temp_path.exists());
+    }
+
+    #[test]
+    fn gc_accounts_for_memo_age_and_size() {
+        let temp = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(temp.path()).unwrap();
+        let coverage = temp
+            .path()
+            .join(PREPARED_PROBES_DIR)
+            .join("000000000000b001.coverage");
+        let closure = temp
+            .path()
+            .join(PREPARED_CLOSURES_DIR)
+            .join("000000000000b002.closure");
+        std::fs::write(&coverage, b"old coverage").unwrap();
+        std::fs::write(&closure, b"old closure").unwrap();
+        let namespace = try_lock_gc_namespace(temp.path()).unwrap().unwrap();
+        run_prepared_cache_gc(
+            temp.path(),
+            unix_now_secs() + PREPARED_CAS_MAX_AGE_SECS + 1,
+            &namespace,
+        )
+        .unwrap();
+        assert!(!coverage.exists());
+        assert!(!closure.exists());
+
+        let oversized = temp
+            .path()
+            .join(PREPARED_DIGESTS_DIR)
+            .join("000000000000b003.digest");
+        File::create(&oversized)
+            .unwrap()
+            .set_len(PREPARED_CAS_MAX_BYTES + 1)
+            .unwrap();
+        run_prepared_cache_gc(temp.path(), unix_now_secs(), &namespace).unwrap();
+        assert!(
+            !oversized.exists(),
+            "memo files must participate in the global 8 GiB cache cap"
+        );
+    }
+
+    fn smaps_value_kib(address: *mut u8, field: &str) -> Option<u64> {
+        let start = format!("{:x}-", address as usize);
+        let field = format!("{field}:");
+        let smaps = std::fs::read_to_string("/proc/self/smaps").ok()?;
+        let mut in_mapping = false;
+        for line in smaps.lines() {
+            if !in_mapping {
+                in_mapping = line.starts_with(&start);
+                continue;
+            }
+            if line.as_bytes().first().is_some_and(u8::is_ascii_hexdigit) && line.contains('-') {
+                return None;
+            }
+            if let Some(value) = line.strip_prefix(&field) {
+                return value.split_whitespace().next()?.parse().ok();
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn prepared_cow_overlay_after_anon_prefault_stays_clean_and_isolated() {
+        let host_page = crate::vmm::setup::host_page_size() as usize;
+        let len = host_page * 4;
+        let backing_bytes: Vec<u8> = (0..len).map(|index| (index % 251) as u8).collect();
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), &backing_bytes).unwrap();
+        temp.as_file().sync_all().unwrap();
+        let file: OwnedFd = OpenOptions::new()
+            .read(true)
+            .open(temp.path())
+            .unwrap()
+            .into();
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockShared).unwrap();
+
+        let reserve = || unsafe {
+            let address = libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert_ne!(address, libc::MAP_FAILED);
+            address.cast::<u8>()
+        };
+        let first = reserve();
+        let second = reserve();
+        // Model performance-mode's anonymous prefault before the prepared
+        // overlay. Touch every page even on kernels lacking
+        // MADV_POPULATE_WRITE.
+        for address in [first, second] {
+            for offset in (0..len).step_by(host_page) {
+                unsafe {
+                    address.add(offset).write_volatile(0xa5);
+                }
+            }
+            unsafe {
+                initramfs::cow_overlay_file_borrowed(address, len, &file, 0).unwrap();
+            }
+        }
+
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(first, len) },
+            backing_bytes,
+            "MAP_FIXED must replace the prefaulted anonymous pages"
+        );
+        assert_eq!(
+            smaps_value_kib(first, "Anonymous"),
+            Some(0),
+            "installing the prepared mapping after prefault must not leave \
+             anonymous COW pages behind"
+        );
+
+        unsafe {
+            first.add(host_page).write_volatile(0xee);
+        }
+        assert_eq!(
+            unsafe { second.add(host_page).read_volatile() },
+            backing_bytes[host_page]
+        );
+        let mut persisted = [0u8; 1];
+        File::open(temp.path())
+            .unwrap()
+            .read_at(&mut persisted, host_page as u64)
+            .unwrap();
+        assert_eq!(persisted[0], backing_bytes[host_page]);
+
+        unsafe {
+            libc::munmap(first.cast(), len);
+            libc::munmap(second.cast(), len);
+        }
+    }
+
+    #[test]
+    fn prepared_cow_overlay_replaces_real_hugetlb_vma_when_available() {
+        let len = PREPARED_MAPPING_GRANULE;
+        let host_page = crate::vmm::setup::host_page_size() as usize;
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB | libc::MAP_HUGE_2MB,
+                -1,
+                0,
+            )
+        };
+        if address == libc::MAP_FAILED {
+            let error = std::io::Error::last_os_error();
+            skip!(
+                "2 MiB MAP_HUGETLB reservation unavailable; \
+                 regular-file MAP_FIXED regression not applicable: {error}"
+            );
+        }
+        let address = address.cast::<u8>();
+        assert_eq!(
+            (address as usize) % PREPARED_MAPPING_GRANULE,
+            0,
+            "the kernel must return a hugepage-aligned VMA"
+        );
+
+        // Deliberately use a host-page-aligned but ordinarily non-2-MiB file
+        // offset. The destination and length retain hugetlb's 2 MiB geometry;
+        // the replacement regular-file mmap only requires host-page file
+        // alignment.
+        let mut backing_bytes = vec![0x5a; host_page];
+        backing_bytes.extend((0..len).map(|index| (index % 251) as u8));
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), &backing_bytes).unwrap();
+        temp.as_file().sync_all().unwrap();
+        let file: OwnedFd = OpenOptions::new()
+            .read(true)
+            .open(temp.path())
+            .unwrap()
+            .into();
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockShared).unwrap();
+
+        unsafe {
+            initramfs::cow_overlay_file_borrowed(address, len, &file, host_page as u64)
+                .expect("replace 2 MiB hugetlb VMA with host-page-aligned regular file");
+        }
+        assert_eq!(unsafe { address.read_volatile() }, backing_bytes[host_page]);
+        assert_eq!(
+            unsafe { address.add(len - 1).read_volatile() },
+            backing_bytes[host_page + len - 1]
+        );
+
+        unsafe {
+            address.add(host_page).write_volatile(0xee);
+        }
+        let mut persisted = [0u8; 1];
+        File::open(temp.path())
+            .unwrap()
+            .read_at(&mut persisted, (host_page * 2) as u64)
+            .unwrap();
+        assert_eq!(
+            persisted[0],
+            backing_bytes[host_page * 2],
+            "MAP_PRIVATE write must not mutate the prepared CAS file"
+        );
+
+        unsafe {
+            libc::munmap(address.cast(), len);
+        }
     }
 
     /// Regression: get_or_compress_base_shm pins the lz4 segment via
