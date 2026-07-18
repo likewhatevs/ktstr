@@ -719,6 +719,7 @@ fn public_http_authentication_cannot_execute_configured_credentials_programs() {
     let address = listener
         .local_addr()
         .expect("authentication fixture address");
+    let proxy = format!("http://{address}");
     listener
         .set_nonblocking(true)
         .expect("make authentication fixture cancellable");
@@ -766,7 +767,7 @@ fn public_http_authentication_cannot_execute_configured_credentials_programs() {
         &repository,
         gix::create::Kind::WithWorktree,
         gix::create::Options::default(),
-        gix_acquire::direct_http_fixture_open_options_for_test(),
+        gix_acquire::http_proxy_fixture_open_options_for_test(&proxy),
     )
     .expect("initialize authentication repository")
     .to_thread_local();
@@ -786,7 +787,7 @@ fn public_http_authentication_cannot_execute_configured_credentials_programs() {
         .commit()
         .expect("commit hostile credential overrides");
 
-    let url = format!("http://{address}/repository.git");
+    let url = "http://fixture.invalid/repository.git";
     assert_eq!(
         repo.open_options().permissions.env.http_transport,
         gix::sec::Permission::Deny,
@@ -801,13 +802,13 @@ fn public_http_authentication_cannot_execute_configured_credentials_programs() {
         .expect("gix HTTP loopback transport options");
     assert_eq!(
         transport.proxy.as_deref(),
-        Some(""),
-        "an explicit empty curl proxy must disable libcurl environment discovery",
+        Some(proxy.as_str()),
+        "curl must use the explicit loopback fixture proxy",
     );
     assert_eq!(
         transport.no_proxy.as_deref(),
-        Some("*"),
-        "the loopback transport must bypass every proxy target",
+        Some(""),
+        "the fixture proxy must override ambient NO_PROXY loopback exclusions",
     );
     let credential_url =
         gix::Url::from_bytes(url.as_bytes().into()).expect("parse authentication fixture URL");
@@ -832,7 +833,7 @@ fn public_http_authentication_cannot_execute_configured_credentials_programs() {
     );
 
     let mut remote = repo
-        .remote_at_without_url_rewrite(url.as_str())
+        .remote_at_without_url_rewrite(url)
         .expect("prepare authentication fixture remote")
         .with_fetch_tags(gix::remote::fetch::Tags::None);
     remote
@@ -849,16 +850,23 @@ fn public_http_authentication_cannot_execute_configured_credentials_programs() {
         gix::progress::Discard,
         gix::remote::ref_map::Options::default(),
     );
+    let transport_error = result
+        .err()
+        .expect("a public source requiring credentials must be rejected");
     drop(server_lifetime);
-    assert!(
-        result.is_err(),
-        "a public source requiring credentials must be rejected"
-    );
     let requests = server.join().expect("join authentication fixture");
     assert_eq!(
         requests.len(),
         1,
-        "credential rejection must not retry with authentication"
+        "credential rejection must not retry with authentication; \
+         transport error: {transport_error}"
+    );
+    assert!(
+        requests[0].starts_with(
+            b"GET http://fixture.invalid/repository.git/info/refs?service=git-upload-pack "
+        ),
+        "the explicit proxy received an unexpected request: {}",
+        String::from_utf8_lossy(&requests[0]),
     );
     assert!(
         !String::from_utf8_lossy(&requests[0])
@@ -880,6 +888,7 @@ fn public_http_authentication_cannot_execute_configured_credentials_programs() {
 fn stalled_smart_http_response_is_aborted_by_the_real_gix_transport() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled HTTP fixture");
     let address = listener.local_addr().expect("fixture address");
+    let proxy = format!("http://{address}");
     listener
         .set_nonblocking(true)
         .expect("make fixture cancellable");
@@ -914,13 +923,14 @@ fn stalled_smart_http_response_is_aborted_by_the_real_gix_transport() {
     let temp = tempfile::tempdir().expect("tempdir");
     let reporter = gix_acquire::ProgressReporter::new("stalled transport fixture");
     let result = gix_acquire::clone_one_with_transport_limits_for_test(
-        &format!("http://{address}/repository.git"),
+        "http://fixture.invalid/repository.git",
         "refs/heads/main",
         &temp.path().join("checkout"),
         &reporter,
         1_000,
         1024,
         1,
+        &proxy,
     );
     let completed_at = Instant::now();
     drop(server_lifetime);
@@ -929,12 +939,14 @@ fn stalled_smart_http_response_is_aborted_by_the_real_gix_transport() {
         result.is_err(),
         "stalled smart HTTP unexpectedly succeeded: {result:?}"
     );
-    let (request, headers_published) = server
-        .join()
-        .expect("join stalled HTTP fixture")
-        .expect("gix transport failed without sending a request");
+    let request = server.join().expect("join stalled HTTP fixture");
+    let Some((request, headers_published)) = request else {
+        panic!("gix transport failed without sending a proxy request: {result:?}");
+    };
     assert!(
-        request.starts_with(b"GET /repository.git/info/refs?service=git-upload-pack "),
+        request.starts_with(
+            b"GET http://fixture.invalid/repository.git/info/refs?service=git-upload-pack "
+        ),
         "unexpected smart-HTTP request: {}",
         String::from_utf8_lossy(&request)
     );

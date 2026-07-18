@@ -75,15 +75,17 @@ pub(crate) fn open_options() -> gix::open::Options {
         HTTP_LOW_SPEED_LIMIT,
         HTTP_LOW_SPEED_TIME_SECONDS,
         None,
+        None,
     )
 }
 
-/// Test-only overrides are passed by the build-acquisition integration fixture
-/// to exercise the real curl low-speed path without waiting 30 seconds.
+/// Test-only transport overrides are passed by the build-acquisition
+/// integration fixture to exercise the real curl path hermetically.
 pub(crate) fn open_options_with_transport_limits(
     connect_timeout_ms: u64,
     low_speed_limit: u32,
     low_speed_time_seconds: u64,
+    proxy: Option<&str>,
     no_proxy: Option<&str>,
 ) -> gix::open::Options {
     use gix::sec::trust::DefaultForLevel;
@@ -100,11 +102,11 @@ pub(crate) fn open_options_with_transport_limits(
     options.permissions.attributes.git_binary = false;
     options.permissions.env.git_prefix = gix::sec::Permission::Deny;
     options.permissions.env.ssh_prefix = gix::sec::Permission::Deny;
-    if no_proxy.is_some() {
-        // Loopback HTTP fixtures must not inherit HTTP_PROXY / ALL_PROXY.
+    if proxy.is_some() || no_proxy.is_some() {
+        // HTTP fixtures must not inherit HTTP_PROXY / ALL_PROXY / NO_PROXY.
         // gix loads those variables into its EnvOverride config layer, whose
         // precedence is higher than the API overrides below. Denying only the
-        // HTTP transport environment here makes the test-only direct path
+        // HTTP transport environment here makes the test-only route
         // deterministic while the production `open_options()` path retains
         // ordinary proxy support.
         options.permissions.env.http_transport = gix::sec::Permission::Deny;
@@ -129,15 +131,14 @@ pub(crate) fn open_options_with_transport_limits(
     {
         overrides.push(format!("http.sslCAInfo={}", ca_bundle.display()));
     }
+    if let Some(proxy) = proxy {
+        // Setting CURLOPT_PROXY explicitly prevents libcurl from consulting
+        // its own ambient proxy environment after gix resolves configuration.
+        overrides.push(format!("gitoxide.http.proxy={proxy}"));
+    }
     if let Some(no_proxy) = no_proxy {
-        // Test fixtures use loopback listeners and must remain direct even
-        // when the parent runner exports ALL_PROXY/HTTP_PROXY. libcurl reads
-        // those variables itself after gix has applied its config policy, so
-        // a no-proxy list alone is not sufficient to make the fixture
-        // hermetic. An explicitly empty proxy maps to CURLOPT_PROXY="" and
-        // disables libcurl's ambient proxy discovery for this test-only
-        // options path.
-        overrides.push("gitoxide.http.proxy=".to_string());
+        // CURLOPT_NOPROXY must also be explicit: an empty value makes curl use
+        // the fixture proxy even when a runner exports NO_PROXY for loopback.
         overrides.push(format!("gitoxide.http.noProxy={no_proxy}"));
     }
     options.config_overrides(overrides)

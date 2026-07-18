@@ -1340,6 +1340,7 @@ pub(crate) fn clone_one_with_transport_limits_for_test(
     connect_timeout_ms: u64,
     low_speed_limit: u32,
     low_speed_time_seconds: u64,
+    proxy: &str,
 ) -> Result<(), String> {
     clone_one_with_options(
         url,
@@ -1350,7 +1351,8 @@ pub(crate) fn clone_one_with_transport_limits_for_test(
             connect_timeout_ms,
             low_speed_limit,
             low_speed_time_seconds,
-            Some("*"),
+            Some(proxy),
+            Some(""),
         ),
     )
 }
@@ -1437,19 +1439,21 @@ fn open_options_with_transport_limits(
     connect_timeout_ms: u64,
     low_speed_limit: u32,
     low_speed_time_seconds: u64,
+    proxy: Option<&str>,
     no_proxy: Option<&str>,
 ) -> gix::open::Options {
     gix_policy::open_options_with_transport_limits(
         connect_timeout_ms,
         low_speed_limit,
         low_speed_time_seconds,
+        proxy,
         no_proxy,
     )
 }
 
 #[cfg(test)]
-pub(crate) fn direct_http_fixture_open_options_for_test() -> gix::open::Options {
-    open_options_with_transport_limits(20_000, 1024, 30, Some("*"))
+pub(crate) fn http_proxy_fixture_open_options_for_test(proxy: &str) -> gix::open::Options {
+    open_options_with_transport_limits(20_000, 1024, 30, Some(proxy), Some(""))
 }
 
 fn validate_relative_submodule_path(path: &Path) -> Result<(), String> {
