@@ -24,6 +24,30 @@ pub(crate) fn verifier_cleanup_state_confirmed(
     state == Some(crate::scenario::ops::ScxState::Enabled)
 }
 
+/// Lifecycle boundary emitted immediately after the dispatched workload
+/// returns and before Phase 6 can block on scheduler or artifact cleanup.
+///
+/// Ordinary scenarios publish their own `ScenarioEnd` (with real elapsed and
+/// iteration telemetry) from the scenario driver, so init only pauses their
+/// workload clock here. A verifier probe has no scenario driver: its
+/// `WorkloadDispatched` event advanced the host ledger to Body, and init must
+/// close that Body explicitly. Leaving it paused in Body makes both progress
+/// watchdog tiers structurally infinite and can turn any later teardown
+/// transport stall into an immortal cell under a verifier storm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostWorkloadBoundary {
+    ScenarioPause,
+    ScenarioEndThenPause,
+}
+
+pub(crate) const fn post_workload_boundary(verifier_workload: bool) -> PostWorkloadBoundary {
+    if verifier_workload {
+        PostWorkloadBoundary::ScenarioEndThenPause
+    } else {
+        PostWorkloadBoundary::ScenarioPause
+    }
+}
+
 /// AP-bring-up-gap check with a host-controlled fault-injection hook.
 ///
 /// The production verdict is [`all_possible_cpus_online`] — a pure
@@ -877,10 +901,11 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // disable the scheduler while the tracer is still loading and lose the
     // auto-repro artifact. The readiness wait is event-driven on wprof's
     // existing stderr + pidfd and adds no guest thread or polling wake.
+    let verifier_workload = crate::test_support::is_verifier_workload(&args);
+    let workload_started_at = std::time::Instant::now();
     crate::vmm::guest_comms::send_scenario_start();
 
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
-    let verifier_workload = crate::test_support::is_verifier_workload(&args);
     let mut code = if !dispatch_ready {
         eprintln!(
             "ktstr-init: workload not dispatched because required instrumentation readiness failed"
@@ -908,9 +933,23 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // SIG_DFL through that cleanup; restoring SIG_IGN here would auto-reap
     // the child and collapse "we killed it" and "it died on its own" into
     // the same ECHILD result.
-    if !verifier_workload {
+    if post_workload_boundary(verifier_workload) == PostWorkloadBoundary::ScenarioEndThenPause {
+        let elapsed_ms =
+            u64::try_from(workload_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // Verifier dispatch has no scenario driver to publish the terminal
+        // boundary. Close Body before any Phase-6 operation can wait on
+        // scheduler exit, stream drain, or virtio backpressure; the host's
+        // Teardown budgets then own every remaining wait.
+        crate::vmm::guest_comms::send_scenario_end(elapsed_ms, 0);
+    } else {
+        // Verifier cleanup needs the scheduler's real wait status to prove
+        // that the process survived until our intentional SIGKILL. Ordinary
+        // scenario cleanup can restore the auto-reap behavior now.
         unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
     }
+    // Stop periodic workload-time capture during cleanup on both paths. For a
+    // verifier this follows ScenarioEnd and cannot regress the forward-only
+    // Teardown lifecycle stage.
     crate::vmm::guest_comms::send_scenario_pause();
 
     #[cfg(feature = "wprof")]

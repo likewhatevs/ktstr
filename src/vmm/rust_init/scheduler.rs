@@ -1941,7 +1941,7 @@ fn try_stream_sched_stdio_inner(
         stdout_log,
         stdout_capture,
         "ktstr-sched-stdout-fwd",
-        crate::vmm::guest_comms::send_sched_stdout_chunk,
+        crate::vmm::guest_comms::try_send_sched_stdout_chunk,
         fail_forwarder == Some(0),
     ) {
         Ok(handle) => handle,
@@ -1960,7 +1960,7 @@ fn try_stream_sched_stdio_inner(
         stderr_log,
         stderr_capture,
         "ktstr-sched-stderr-fwd",
-        crate::vmm::guest_comms::send_sched_stderr_chunk,
+        crate::vmm::guest_comms::try_send_sched_stderr_chunk,
         fail_forwarder == Some(1),
     ) {
         Ok(handle) => handle,

@@ -1514,17 +1514,63 @@ mod stage_tests {
         assert_eq!(s.progress_epoch(), 4);
     }
 
-    /// Verifier cell path reaches Body via `WorkloadDispatched` (not
-    /// ScenarioStart), and ScenarioEnd drives Teardown.
+    /// Production verifier ordering enters Body at ScenarioStart, confirms
+    /// dispatch without a duplicate epoch, then closes Body at ScenarioEnd.
+    /// The common post-workload ScenarioPause cannot regress Teardown.
     #[test]
     fn verifier_cell_reaches_body_via_workload_dispatched() {
         let mut s = SinkState::new();
         s.dispatch(&frame(MsgType::SysRdy.wire_value(), Vec::new(), true));
         s.dispatch(&lifecycle(LifecyclePhase::PayloadStarting, true));
         assert_eq!(s.phase(), LifecycleStage::Dispatch as u8);
+        s.dispatch(&frame(
+            MsgType::ScenarioStart.wire_value(),
+            Vec::new(),
+            true,
+        ));
+        assert_eq!(s.phase(), LifecycleStage::Body as u8);
+        let body_epoch = s.phase_epoch();
         s.dispatch(&lifecycle(LifecyclePhase::WorkloadDispatched, true));
         assert_eq!(s.phase(), LifecycleStage::Body as u8);
-        s.dispatch(&frame(MsgType::ScenarioEnd.wire_value(), Vec::new(), true));
+        assert_eq!(
+            s.phase_epoch(),
+            body_epoch,
+            "dispatch confirmation in the same stage is not a second milestone"
+        );
+        s.dispatch(&frame(
+            MsgType::ScenarioEnd.wire_value(),
+            vec![0; crate::vmm::wire::SCENARIO_END_PAYLOAD_SIZE],
+            true,
+        ));
+        assert_eq!(s.phase(), LifecycleStage::Teardown as u8);
+        let teardown_epoch = s.phase_epoch();
+        s.dispatch(&frame(
+            MsgType::ScenarioPause.wire_value(),
+            Vec::new(),
+            true,
+        ));
+        assert_eq!(s.phase(), LifecycleStage::Teardown as u8);
+        assert_eq!(s.phase_epoch(), teardown_epoch);
+    }
+
+    /// A verifier probe which fails before WorkloadDispatched still owns the
+    /// ScenarioEnd boundary, so its cleanup cannot remain in Body either.
+    #[test]
+    fn failed_verifier_probe_still_closes_body_before_cleanup() {
+        let mut s = SinkState::new();
+        s.dispatch(&frame(MsgType::SysRdy.wire_value(), Vec::new(), true));
+        s.dispatch(&lifecycle(LifecyclePhase::PayloadStarting, true));
+        s.dispatch(&frame(
+            MsgType::ScenarioStart.wire_value(),
+            Vec::new(),
+            true,
+        ));
+        assert_eq!(s.phase(), LifecycleStage::Body as u8);
+        s.dispatch(&frame(
+            MsgType::ScenarioEnd.wire_value(),
+            vec![0; crate::vmm::wire::SCENARIO_END_PAYLOAD_SIZE],
+            true,
+        ));
         assert_eq!(s.phase(), LifecycleStage::Teardown as u8);
     }
 

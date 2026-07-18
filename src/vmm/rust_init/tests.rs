@@ -1141,6 +1141,22 @@ fn verifier_cleanup_requires_enabled_state() {
     }
 }
 
+/// Verifier probes do not run the scenario driver which normally publishes
+/// ScenarioEnd. Their init-owned completion boundary must therefore close
+/// Body before Phase 6, while ordinary tests retain the pause used to exclude
+/// cleanup from scenario timing.
+#[test]
+fn verifier_completion_closes_body_before_cleanup() {
+    assert_eq!(
+        post_workload_boundary(true),
+        PostWorkloadBoundary::ScenarioEndThenPause
+    );
+    assert_eq!(
+        post_workload_boundary(false),
+        PostWorkloadBoundary::ScenarioPause
+    );
+}
+
 #[test]
 fn verifier_cleanup_accepts_its_own_sigkill_status() {
     let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
