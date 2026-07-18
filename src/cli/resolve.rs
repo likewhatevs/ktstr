@@ -878,18 +878,16 @@ fn select_series_latest_in_range(
 /// (`crate::fetch::git_cache_key`); on a hit it returns the cached
 /// entry WITHOUT any download.
 ///
-/// On a cache miss the fetch is routed by source:
-/// - **GitHub** (`github.com/OWNER/REPO`, via
+/// On a cache miss the fetch is routed by ref kind:
+/// - **Branch/tag**: a kind-directed, exact-ref, depth-one in-process
+///   gix fetch into a temp directory (`crate::fetch::git_clone_kinded`
+///   → `git_clone_tag` for a tag, `git_clone` for a branch). GitHub uses
+///   this same path; its codeload endpoint must not silently replace a
+///   requested git ref with an archive acquisition.
+/// - **Explicit immutable GitHub SHA** (`github.com/OWNER/REPO`, via
 ///   `crate::fetch::github_archive_url`): a codeload `tar.gz` snapshot
-///   of the RESOLVED COMMIT (`crate::fetch::download_github_archive`) —
-///   no clone, and the exact-commit snapshot matches the cache key even
-///   if a branch tip advances between the ls-remote probe and the GET.
-/// - **Non-GitHub, or a ref whose ls-remote resolution failed**: a
-///   kind-directed shallow clone into a temp directory
-///   (`crate::fetch::git_clone_kinded` → `git_clone_tag` for a tag,
-///   `git_clone` for a branch; a `sha` is unsupported off GitHub). The
-///   clone resolves the tip authoritatively, catching a hit the
-///   ls-remote probe missed.
+///   of that commit (`crate::fetch::download_github_archive`). A `sha`
+///   remains unsupported on remotes without a commit-snapshot endpoint.
 ///
 /// On a final miss it delegates to [`kernel_build_pipeline`] for
 /// configure/build/validate/cache. Returns the cache entry directory
@@ -939,11 +937,10 @@ pub fn resolve_git_kernel(
     // a KIND-directed ls-remote (a tag never aliases a same-named
     // branch). With `git_ref` this keys the same entry the fetch would
     // write, so a cache hit returns without any download. `Sha` resolves
-    // offline; a `Tag`/`Branch` ls-remote failure is non-fatal for the
-    // clone path (the clone resolves the tip authoritatively) but is
-    // fatal for the codeload path (below), which has no `.git` to read
-    // the commit back from.
-    let commit = crate::fetch::resolve_ref_commit(url, git_ref, ref_kind);
+    // offline; a `Tag`/`Branch` ref-discovery failure is non-fatal
+    // because the exact shallow fetch below resolves the tip
+    // authoritatively.
+    let commit = crate::fetch::resolve_ref_commit(url, git_ref, ref_kind, cli_label, mp);
     // `--force` skips the pre-fetch probe so the ref is always refetched
     // and rebuilt. The `-xkc{hash}` suffix folds `--extra-kconfig` into
     // the key so an extras build probes its own slot, not the baked-only
@@ -964,21 +961,30 @@ pub fn resolve_git_kernel(
     }
 
     let tmp_dir = tempfile::TempDir::new()?;
-    // GitHub sources download the RESOLVED COMMIT's codeload `tar.gz`
-    // snapshot — no clone, and the exact-commit snapshot matches the
-    // cache key even if a branch tip advances mid-resolve.
-    // `github_archive_url` returns None for a non-GitHub URL. A ref that
-    // did not resolve to a commit (a `Tag`/`Branch` ls-remote failure —
-    // a `Sha` resolves offline, so it is never `None` here) has no
-    // codeload URL and falls through to the kind-directed clone, which
-    // resolves the tip authoritatively.
-    let github_archive = commit
-        .as_deref()
-        .and_then(|c| crate::fetch::github_archive_url(url, c));
+    // Archive acquisition is an explicit immutable-SHA policy decision
+    // at this call site, never an implicit property of a github.com URL.
+    // Branches and tags always take the exact shallow gix path below,
+    // retaining their native ref namespace and selected tag object.
+    let github_archive = match ref_kind {
+        crate::kernel_path::GitRefKind::Sha => commit
+            .as_deref()
+            .and_then(|c| crate::fetch::github_archive_url(url, c)),
+        crate::kernel_path::GitRefKind::Tag
+        | crate::kernel_path::GitRefKind::Branch
+        | crate::kernel_path::GitRefKind::Unknown => None,
+    };
     let mut acquired = if let Some(archive_url) = github_archive {
         let commit_hash = commit
             .as_deref()
             .expect("commit present — the archive URL was built from it");
+        let short = &commit_hash[..7.min(commit_hash.len())];
+        let msg = format!(
+            "{cli_label}: fetching explicit immutable GitHub commit {short} as a source snapshot"
+        );
+        match mp {
+            Some(fp) => fp.println(&msg),
+            None => eprintln!("{msg}"),
+        }
         crate::fetch::download_github_archive(
             crate::fetch::shared_client(),
             &archive_url,

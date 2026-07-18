@@ -3547,24 +3547,29 @@ fn resolve_ref_commit_sha_resolves_offline_lowercased() {
     use crate::kernel_path::GitRefKind;
     let sha = "ABC1234abc1234abc1234abc1234abc1234ABC12";
     assert_eq!(
-        resolve_ref_commit("https://github.com/x/y", sha, GitRefKind::Sha).as_deref(),
+        resolve_ref_commit("https://github.com/x/y", sha, GitRefKind::Sha, "test", None,)
+            .as_deref(),
         Some("abc1234abc1234abc1234abc1234abc1234abc12"),
     );
-    assert!(resolve_ref_commit("https://github.com/x/y", "foo", GitRefKind::Unknown).is_none());
+    assert!(
+        resolve_ref_commit(
+            "https://github.com/x/y",
+            "foo",
+            GitRefKind::Unknown,
+            "test",
+            None,
+        )
+        .is_none()
+    );
 }
 
-/// Regression: a BRANCH ref must resolve over protocol-v2 ls-refs. The
-/// bug was gix's default `Options` (`prefix_from_spec_as_filter_on_remote
-/// = true`): over a protocol-v2 `ls-refs` it derives ref-prefix filters
-/// from the anonymous remote's refspecs, and with empty fetch specs +
-/// `fetch_tags = Included` that ls-refs prefix is `refs/tags` ONLY — so
-/// `refs/heads/*` never reach `remote_refs` and a branch ref resolves to
-/// `None`, defeating `resolve_git_kernel`'s clone-skip (every run
-/// re-cloned). The fix sets the flag `false`. A `Some(_)` here is only
-/// reachable once `refs/heads/for-next` reaches `remote_refs`, so
-/// reverting the flag turns this red — the `pick_ref_object_*` unit tests
-/// feed synthetic ref vectors and never exercise the `ref_map` Options
-/// path.
+/// Regression: a BRANCH ref must resolve over protocol-v2 ls-refs.
+/// Normal resolution now installs one exact branch refspec, so gix
+/// derives `refs/heads/for-next` as the server-side ref-prefix instead
+/// of the old anonymous remote's tags-only prefix. A `Some(_)` here is
+/// only reachable once that fully-qualified branch reaches
+/// `remote_refs`; the local exact-discovery tests below additionally pin
+/// the branch/tag namespace and filtering without a live network.
 ///
 /// `#[ignore]`: hits the live sched_ext remote over the network (project
 /// convention for network-fetch tests). The filtering is protocol-v2
@@ -3576,8 +3581,8 @@ fn resolve_ref_commit_sha_resolves_offline_lowercased() {
 fn resolve_ref_commit_resolves_branch_over_v2() {
     use crate::kernel_path::GitRefKind;
     let url = "https://git.kernel.org/pub/scm/linux/kernel/git/tj/sched_ext.git";
-    let hash = resolve_ref_commit(url, "for-next", GitRefKind::Branch)
-        .expect("for-next branch must resolve over v2 ls-refs — the prefix filter must be off");
+    let hash = resolve_ref_commit(url, "for-next", GitRefKind::Branch, "test", None)
+        .expect("for-next branch must resolve over v2 ls-refs through its exact ref-prefix");
     assert_eq!(hash.len(), 40, "a full commit hash is 40 hex chars: {hash}");
     assert!(
         hash.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -4086,6 +4091,79 @@ fn exact_clone_observes_process_cancellation_and_rolls_back() {
 }
 
 #[test]
+fn exact_ref_discovery_preserves_branch_tag_namespaces() {
+    let _guard = exact_clone_test_guard();
+    let fixture = exact_clone_fixture();
+    let interrupt = std::sync::atomic::AtomicBool::new(false);
+    for (target, expected) in [
+        ("refs/heads/same", fixture.branch_commit),
+        ("refs/tags/same", fixture.tag_commit),
+    ] {
+        let progress = crate::cli::progress::CloneProgress::standalone_operation(
+            &format!("test: {target}"),
+            "resolving git ref",
+            "ref discovery",
+        );
+        let refs = discover_remote_refs(&fixture.url(), Some(target), &progress, &interrupt)
+            .expect("discover exact fixture ref");
+        progress.finish();
+        assert_eq!(
+            pick_ref_object(&refs, target),
+            Some(expected),
+            "exact discovery must preserve the requested ref namespace and peel tags to commits",
+        );
+    }
+}
+
+#[test]
+fn exact_ref_discovery_observes_shared_process_cancellation() {
+    let _guard = exact_clone_test_guard();
+    let fixture = exact_clone_fixture();
+    set_git_operation_interrupted(true);
+    let result = resolve_ref_commit(
+        &fixture.url(),
+        "same",
+        crate::kernel_path::GitRefKind::Branch,
+        "test",
+        None,
+    );
+    set_git_operation_interrupted(false);
+    assert!(
+        result.is_none(),
+        "the cache-probe ref discovery must observe the same process interrupt as pack receive",
+    );
+}
+
+#[test]
+fn exact_ref_discovery_rechecks_interrupt_after_ref_map() {
+    let _guard = exact_clone_test_guard();
+    let fixture = exact_clone_fixture();
+    let interrupt = std::sync::atomic::AtomicBool::new(false);
+    let progress = crate::cli::progress::CloneProgress::standalone_operation(
+        "test: same",
+        "resolving git ref",
+        "ref discovery",
+    );
+    TEST_INTERRUPT_AFTER_REF_DISCOVERY.store(true, Ordering::Release);
+    let err = discover_remote_refs(
+        &fixture.url(),
+        Some("refs/heads/same"),
+        &progress,
+        &interrupt,
+    )
+    .expect_err("an interrupt landing in ref_map must reject discovery");
+    TEST_INTERRUPT_AFTER_REF_DISCOVERY.store(false, Ordering::Release);
+    assert!(
+        format!("{err:#}").contains("after reading remote refs"),
+        "the post-ref-map check must identify its publication boundary: {err:#}",
+    );
+    assert!(
+        interrupt.load(Ordering::Acquire),
+        "the deterministic ref-map seam must flip the threaded interrupt",
+    );
+}
+
+#[test]
 fn exact_clone_rejects_post_checkout_cancellation_before_writing_index() {
     let _guard = exact_clone_test_guard();
     let fixture = exact_clone_fixture();
@@ -4116,6 +4194,35 @@ fn exact_clone_rejects_post_checkout_cancellation_before_writing_index() {
     assert!(
         !clone_dir.join(".git/index").exists(),
         "an interrupted checkout must never persist its partial index",
+    );
+}
+
+#[test]
+fn exact_clone_rejects_cancellation_during_final_index_write_and_rolls_back() {
+    let _guard = exact_clone_test_guard();
+    let fixture = exact_clone_fixture();
+    let dest = tempfile::TempDir::new().expect("clone dest");
+    set_git_operation_interrupted(false);
+    TEST_INTERRUPT_AFTER_INDEX_WRITE.store(true, Ordering::Release);
+    let result = git_clone_kinded(
+        &fixture.url(),
+        "same",
+        crate::kernel_path::GitRefKind::Branch,
+        dest.path(),
+        "test",
+        None,
+    );
+    TEST_INTERRUPT_AFTER_INDEX_WRITE.store(false, Ordering::Release);
+    set_git_operation_interrupted(false);
+
+    let err = result.expect_err("a signal landing in final index write must reject the clone");
+    assert!(
+        format!("{err:#}").contains("after writing exact clone index"),
+        "the final post-publication check must surface in the diagnostic: {err:#}",
+    );
+    assert!(
+        !dest.path().join("linux").exists(),
+        "the outer exact-clone transaction must remove a fully materialized but interrupted tree",
     );
 }
 

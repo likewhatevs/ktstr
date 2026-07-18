@@ -1446,6 +1446,20 @@ pub(crate) fn download_github_archive(
     cli_label: &str,
     mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<AcquiredSource> {
+    let progress_label = format!("{cli_label}: {git_ref}");
+    let snapshot_progress = match mp {
+        Some(fp) => fp.operation_progress(&progress_label, "fetching snapshot", "snapshot fetch"),
+        None => crate::cli::progress::CloneProgress::standalone_operation(
+            &progress_label,
+            "fetching snapshot",
+            "snapshot fetch",
+        ),
+    };
+    // Create the phase before issuing the request. The blocking HTTP
+    // header wait itself has no byte counter, so this live item is what
+    // lets CloneProgress emit its first phase immediately and a
+    // ten-second heartbeat for as long as the server stays silent.
+    let request_phase = snapshot_progress.item_named("requesting snapshot");
     tracing::info!(%archive_url, "downloading GitHub codeload snapshot (requires network)");
     let response = get_with_transient_retry(
         client,
@@ -1454,6 +1468,7 @@ pub(crate) fn download_github_archive(
         "download",
         &TRANSIENT_HTTP_RETRY,
     )?;
+    drop(request_phase);
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         anyhow::bail!(
             "codeload snapshot not found: {archive_url}\n  \
@@ -1485,6 +1500,12 @@ pub(crate) fn download_github_archive(
         tempfile::TempDir::new_in(dest_dir).with_context(|| "create extraction staging dir")?;
     let short_hash: String = commit_hash.chars().take(7).collect();
     let download_bar = mp.map(|fp| fp.download_bar(git_ref, total));
+    // tar::Archive streams decompression directly from the response, so
+    // download and extraction intentionally overlap instead of writing
+    // a second full archive to disk. Name that fused phase truthfully;
+    // the reporter continues to heartbeat even while gzip/tar is doing
+    // CPU or filesystem work between response reads.
+    let stream_phase = snapshot_progress.item_named("streaming and extracting snapshot");
     let stream = DownloadStream::with_progress(response, download_bar.as_ref().map(|b| b.bar()));
     let decoder = flate2::read::GzDecoder::new(stream);
     let mut archive = tar::Archive::new(decoder);
@@ -1498,6 +1519,7 @@ pub(crate) fn download_github_archive(
     // the tar then the gz layer, recovering the `DownloadStream`.
     let stream = archive.into_inner().into_inner();
     let (actual_hex, bytes_total) = stream.finalize();
+    drop(stream_phase);
     if let Some(bar) = &download_bar {
         bar.finish();
     }
@@ -1515,7 +1537,7 @@ pub(crate) fn download_github_archive(
     let source_dir = promote_single_kernel_tree(&staging, dest_dir, &canonical)?;
     let version = read_makefile_version(&source_dir);
 
-    Ok(AcquiredSource {
+    let acquired = AcquiredSource {
         source_dir,
         cache_key: git_cache_key(git_ref, commit_hash),
         version,
@@ -1523,7 +1545,9 @@ pub(crate) fn download_github_archive(
         is_temp: true,
         is_dirty: false,
         is_git: true,
-    })
+    };
+    snapshot_progress.finish();
+    Ok(acquired)
 }
 
 /// Download a kernel tarball (stable or RC) and extract it.
@@ -1579,6 +1603,8 @@ pub fn download_tarball(
                     STABLE_MIRROR_URL,
                     &tag,
                     crate::kernel_path::GitRefKind::Tag,
+                    cli_label,
+                    mp,
                 ) else {
                     anyhow::bail!("{}", version_not_found_msg(client, version));
                 };
@@ -1586,7 +1612,7 @@ pub fn download_tarball(
                     .expect("STABLE_MIRROR_URL is a github.com URL");
                 let msg = format!(
                     "{cli_label}: {version} not on cdn.kernel.org (pruned/EOL); \
-                     fetching gregkh mirror tag {tag}"
+                     using the GitHub source-snapshot fallback for gregkh mirror tag {tag}"
                 );
                 match mp {
                     Some(fp) => fp.println(&msg),
@@ -1978,7 +2004,7 @@ pub fn fetch_version_for_prefix(client: &Client, prefix: &str, cli_label: &str) 
 /// those same nodes still succeeds).
 fn latest_patch_from_git_tags(url: &str, prefix: &str, cli_label: &str) -> Result<Option<String>> {
     eprintln!("{cli_label}: resolving {prefix}.x release tags via {url}");
-    let refs = ls_remote_refs(url)
+    let refs = ls_remote_refs(url, &format!("{cli_label}: {prefix}.x tags"))
         .with_context(|| format!("ls-remote {url} for {prefix}.x release tags"))?;
     match max_tag_patch(refs.iter().map(ref_full_name), prefix) {
         Some(patch) => {
@@ -2048,7 +2074,7 @@ pub(crate) fn cached_stable_tags() -> Option<&'static [String]> {
     if let Some(tags) = STABLE_TAGS_CACHE.get() {
         return Some(tags.as_slice());
     }
-    let refs = ls_remote_refs(STABLE_MIRROR_URL)?;
+    let refs = ls_remote_refs(STABLE_MIRROR_URL, "ktstr: stable release tags")?;
     let tags: Vec<String> = refs
         .iter()
         .filter_map(|r| {
@@ -2126,10 +2152,11 @@ pub(crate) fn git_cache_key(git_ref: &str, commit_hash: &str) -> String {
 /// If `url` is a GitHub remote, build the codeload archive URL for the
 /// resolved `commit_hash`: `github.com/OWNER/REPO/archive/<commit>.tar.gz`
 /// (302 → codeload.github.com, its CDN) serves a gzip source snapshot
-/// for any commit — verified empirically. This lets a GitHub source's
-/// commit be fetched over HTTP (no clone, no server-side allow-sha
-/// requirement) rather than cloned. `None` for a non-GitHub URL
-/// (self-hosted / GitLab / …) — those take the gix clone path.
+/// for any commit — verified empirically. `resolve_git_kernel` invokes
+/// this only for an explicit immutable SHA; branches and tags use the
+/// exact shallow gix path even on GitHub. `None` for a non-GitHub URL
+/// (self-hosted / GitLab / …), where commit-SHA acquisition is not
+/// supported.
 ///
 /// The caller resolves the ref to `commit_hash` FIRST (a kind-directed
 /// ls-remote; a sha is already the commit), so the download fetches the
@@ -2221,10 +2248,11 @@ fn pick_ref_object(
 }
 
 /// Resolve `git_ref` to its full commit hash under `ref_kind`, via a
-/// kind-directed ls-remote. Unlike the clone path, the codeload
-/// download has no checked-out `.git` to read `head_id` from, so it
-/// resolves the commit here — [`git_cache_key`] needs it to key the
-/// entry a clone of the same ref would write (shared cache).
+/// kind-directed exact-ref discovery. This happens before acquisition
+/// so [`resolve_git_kernel`](crate::cli::resolve_git_kernel) can probe
+/// [`git_cache_key`] without fetching a pack. An explicit SHA also
+/// supplies the identity required by its archive snapshot, which has no
+/// checked-out `.git` from which to recover a commit.
 ///
 /// A `Sha` ref IS the commit (lowercased to match `git_clone`'s
 /// rendering) and resolves offline — no handshake. `Tag`/`Branch`
@@ -2238,6 +2266,8 @@ pub(crate) fn resolve_ref_commit(
     url: &str,
     git_ref: &str,
     ref_kind: crate::kernel_path::GitRefKind,
+    cli_label: &str,
+    mp: Option<&crate::cli::FetchProgress>,
 ) -> Option<String> {
     use crate::kernel_path::GitRefKind;
     let target = match ref_kind {
@@ -2246,7 +2276,27 @@ pub(crate) fn resolve_ref_commit(
         GitRefKind::Branch => format!("refs/heads/{git_ref}"),
         GitRefKind::Unknown => return None,
     };
-    pick_ref_object(&ls_remote_refs(url)?, &target).map(|object| format!("{object}"))
+    let progress_label = format!("{cli_label}: {git_ref}");
+    let ref_progress = match mp {
+        Some(fp) => fp.operation_progress(&progress_label, "resolving git ref", "ref discovery"),
+        None => crate::cli::progress::CloneProgress::standalone_operation(
+            &progress_label,
+            "resolving git ref",
+            "ref discovery",
+        ),
+    };
+    let refs = match discover_remote_refs(
+        url,
+        Some(&target),
+        &ref_progress,
+        &GIT_OPERATION_INTERRUPTED,
+    ) {
+        Ok(refs) => refs,
+        Err(_) => return None,
+    };
+    let object = pick_ref_object(&refs, &target).map(|object| format!("{object}"));
+    ref_progress.finish();
+    object
 }
 
 /// ls-remote `url` and return EVERY advertised ref WITHOUT fetching a
@@ -2265,28 +2315,86 @@ pub(crate) fn resolve_ref_commit(
 /// would return TAGS ONLY and `refs/heads/*` would never arrive.
 /// Disabling the filter returns all refs, so a branch, tag, or HEAD
 /// all resolve.
-fn ls_remote_refs(url: &str) -> Option<Vec<gix::protocol::handshake::Ref>> {
-    let tmp = tempfile::TempDir::new().ok()?;
+fn ls_remote_refs(url: &str, progress_label: &str) -> Option<Vec<gix::protocol::handshake::Ref>> {
+    let ref_progress = crate::cli::progress::CloneProgress::standalone_operation(
+        progress_label,
+        "resolving git refs",
+        "ref discovery",
+    );
+    let refs = discover_remote_refs(url, None, &ref_progress, &GIT_OPERATION_INTERRUPTED).ok()?;
+    ref_progress.finish();
+    Some(refs)
+}
+
+/// Discover either one exact fully-qualified ref or the remote's full
+/// advertisement without fetching a pack.
+///
+/// `exact_ref = Some` installs one exact fetch refspec and leaves
+/// protocol-v2 prefix filtering enabled, so a normal branch/tag cache
+/// probe asks the server only for that namespace-qualified ref. The
+/// `None` form deliberately disables filtering for stable-tag
+/// enumeration. Both forms create their progress phase before
+/// `connect`: the first blocking network wait is therefore visible and
+/// receives CloneProgress's ten-second heartbeat.
+fn discover_remote_refs(
+    url: &str,
+    exact_ref: Option<&str>,
+    progress: &crate::cli::progress::CloneProgress,
+    interrupt: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<gix::protocol::handshake::Ref>> {
+    ensure_git_operation_not_interrupted(interrupt, "before preparing ref discovery")?;
+    let tmp = tempfile::TempDir::new().with_context(|| "create ref discovery staging dir")?;
+    ensure_git_operation_not_interrupted(interrupt, "after preparing ref discovery")?;
     let repo = gix::ThreadSafeRepository::init_opts(
         tmp.path(),
         gix::create::Kind::WithWorktree,
         gix::create::Options::default(),
         anon_open_opts(),
     )
-    .ok()?
+    .with_context(|| "prepare ref discovery repository")?
     .to_thread_local();
-    let remote = repo.remote_at(url).ok()?;
-    let conn = remote.connect(gix::remote::Direction::Fetch).ok()?;
+    ensure_git_operation_not_interrupted(interrupt, "after initializing ref discovery")?;
+    let mut remote = repo
+        .remote_at_without_url_rewrite(url)
+        .with_context(|| format!("prepare ref discovery remote {url}"))?;
+    ensure_git_operation_not_interrupted(interrupt, "after preparing ref discovery remote")?;
+
+    if let Some(source_ref) = exact_ref {
+        // A private throwaway destination is enough to derive the exact
+        // protocol-v2 ref-prefix; no ref is written because this is only
+        // a ref-map operation.
+        const DISCOVERY_REF: &str = "refs/ktstr/discovery";
+        let refspec = format!("+{source_ref}:{DISCOVERY_REF}");
+        remote = remote.with_fetch_tags(gix::remote::fetch::Tags::None);
+        remote
+            .replace_refspecs([refspec.as_str()], gix::remote::Direction::Fetch)
+            .with_context(|| format!("set exact discovery refspec for {source_ref}"))?;
+        ensure_git_operation_not_interrupted(interrupt, "after setting discovery refspec")?;
+    }
+
+    // This phase exists before connect(), whose handshake has no
+    // progress or interrupt parameter. The shared process interrupt is
+    // checked on both sides of that non-interruptible boundary.
+    let discovery_progress = progress.item_named("discovering refs");
+    ensure_git_operation_not_interrupted(interrupt, "before connecting for ref discovery")?;
+    let conn = remote
+        .connect(gix::remote::Direction::Fetch)
+        .with_context(|| format!("connect to {url} for ref discovery"))?;
+    ensure_git_operation_not_interrupted(interrupt, "after connecting for ref discovery")?;
+    let options = gix::remote::ref_map::Options {
+        prefix_from_spec_as_filter_on_remote: exact_ref.is_some(),
+        ..Default::default()
+    };
+    ensure_git_operation_not_interrupted(interrupt, "before reading remote refs")?;
     let (refmap, _handshake) = conn
-        .ref_map(
-            gix::progress::Discard,
-            gix::remote::ref_map::Options {
-                prefix_from_spec_as_filter_on_remote: false,
-                ..Default::default()
-            },
-        )
-        .ok()?;
-    Some(refmap.remote_refs)
+        .ref_map(discovery_progress, options)
+        .with_context(|| format!("read remote refs from {url}"))?;
+    #[cfg(test)]
+    if TEST_INTERRUPT_AFTER_REF_DISCOVERY.swap(false, Ordering::AcqRel) {
+        interrupt.store(true, Ordering::Release);
+    }
+    ensure_git_operation_not_interrupted(interrupt, "after reading remote refs")?;
+    Ok(refmap.remote_refs)
 }
 
 /// Open options for ktstr's git fetches: load ONLY repo-local git
@@ -2328,15 +2436,17 @@ fn anon_open_opts() -> gix::open::Options {
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
 ///
-/// `mp` is the progress group a determinate clone bar is added to;
-/// `None` disables the bar and passes `gix::progress::Discard` to gix
-/// exactly as before (the single-shot `kernel build` paths and unit
-/// tests pass `None`). The bar shows real object/file counts + ETA
-/// during the receiving / resolving / checkout phases that gix reports
-/// a bounded total for; see the `crate::cli::progress` module.
+/// `mp` is the progress group a determinate clone bar is added to.
+/// Without a group, the clone still drives a hidden CloneProgress tree
+/// and emits escape-free ten-second heartbeats, so single-shot
+/// `kernel build` cannot disappear during a slow handshake or pack
+/// index. The bar shows real object/file counts + ETA during the
+/// receiving / resolving / checkout phases that gix reports a bounded
+/// total for; see the `crate::cli::progress` module.
 ///
-/// For a TAG ref use `git_clone_tag`: gix's shallow clone only
-/// resolves branches via `with_ref_name` — see `git_clone_inner`.
+/// For a TAG ref use [`git_clone_tag`]. Both entry points share the
+/// same lower-level exact-ref fetch; the wrapper selects the native
+/// `refs/heads/*` or `refs/tags/*` source namespace.
 pub fn git_clone(
     url: &str,
     git_ref: &str,
@@ -2356,16 +2466,13 @@ pub fn git_clone(
 
 /// Shallow-clone a git repository at a TAG ref (e.g. `v6.14.11`).
 ///
-/// gix's shallow clone routes the ref through `Category::LocalBranch`
-/// (`refs/heads/`) in its single-branch-shallow path
-/// (`gix::clone::fetch`), so a tag never matches on the remote and the
-/// fetch fails with "None of the refspec(s) matched". This appends a
-/// `+refs/tags/{tag}:refs/heads/{tag}` refspec so the tag is fetched
-/// into the local branch ref the checkout resolves. The `#tag=` git
-/// source (via [`git_clone_kinded`]) uses this for a non-GitHub remote;
-/// a GitHub remote takes the codeload path instead. (The pruned/EOL
-/// tarball recovery no longer clones — [`download_tarball`]'s
-/// `TarballNotFound` fallback fetches a gregkh codeload snapshot.)
+/// The exact fetch maps `refs/tags/{tag}` to ktstr's private fetched
+/// ref, peels annotated tags to their commit for checkout, and retains
+/// the original tag object under its native name for `git describe` /
+/// `setlocalversion`. The `#tag=` source (via
+/// [`git_clone_kinded`]) uses this path for every remote, including
+/// GitHub. The pruned/EOL tarball recovery is a separately reported
+/// archive fallback in [`download_tarball`].
 pub(crate) fn git_clone_tag(
     url: &str,
     tag: &str,
@@ -2384,17 +2491,13 @@ pub(crate) fn git_clone_tag(
 }
 
 /// Clone a git source at `git_ref`, dispatching on `ref_kind` to the
-/// correct clone path. A well-formed `github.com/OWNER/REPO` source
-/// normally takes the codeload path ([`download_github_archive`], via
-/// [`crate::cli::resolve_git_kernel`]) and reaches here only as a
-/// fallback when the pre-fetch ls-remote resolution failed (no commit →
-/// no codeload URL). A `github.com` URL whose path is not exactly
-/// `OWNER/REPO` (so `github_archive_url` returns `None`) can still reach
-/// the `Sha` arm below.
+/// correct clone path. Branches and tags use this exact shallow gix
+/// path uniformly, including well-formed GitHub remotes. Only an
+/// explicit immutable GitHub `Sha` is routed to
+/// [`download_github_archive`] by [`crate::cli::resolve_git_kernel`].
 ///
-/// - `Tag` → [`git_clone_tag`] (adds the `refs/tags/*` refspec gix's
-///   shallow path omits).
-/// - `Branch` → [`git_clone`] (the plain shallow single-branch clone).
+/// - `Tag` → [`git_clone_tag`] (exact `refs/tags/*` source).
+/// - `Branch` → [`git_clone`] (exact `refs/heads/*` source).
 /// - `Sha` → a hard error: gix cannot fetch a bare commit, and a
 ///   self-hosted server generally lacks allow-sha-in-want. The
 ///   actionable message points at GitHub (codeload serves any sha) or a
@@ -2455,18 +2558,26 @@ fn git_clone_inner(
     let clone_dir = dest_dir.join("linux");
 
     // Drive a determinate clone bar from gix's progress tree (see
-    // [`crate::cli::progress::CloneProgress`]). `None` when no progress
-    // group is threaded in; the gix calls then pass `Discard` exactly
-    // as before. Both phases poll the process-level signal bridge set
-    // by cargo-ktstr's interrupt handler.
+    // [`crate::cli::progress::CloneProgress`]). A shared group renders
+    // coordinated bars; a command without one still gets the same
+    // plain-text ten-second heartbeat through a standalone reporter.
+    // Every phase polls the process-level signal bridge set by
+    // cargo-ktstr's interrupt handler.
     let progress_label = format!("{cli_label}: {git_ref}");
-    let clone_progress = mp.map(|fp| fp.clone_progress(&progress_label));
+    let clone_progress = match mp {
+        Some(fp) => fp.clone_progress(&progress_label),
+        None => crate::cli::progress::CloneProgress::standalone_operation(
+            &progress_label,
+            "cloning",
+            "clone",
+        ),
+    };
     let commit_id = match fetch_exact_ref_and_checkout(
         url,
         git_ref,
         ref_kind,
         &clone_dir,
-        clone_progress.as_ref(),
+        Some(&clone_progress),
         &GIT_OPERATION_INTERRUPTED,
     ) {
         Ok(id) => id,
@@ -2479,37 +2590,53 @@ fn git_clone_inner(
         }
     };
 
-    // Clone + checkout done — stop the poll thread, join it, clear the
-    // bar. On any error path above, `clone_progress` is dropped
-    // instead, and its `Drop` performs the same shutdown (leak-proof).
-    if let Some(cp) = clone_progress {
-        cp.finish();
+    let acquired = (|| -> Result<AcquiredSource> {
+        // FULL commit hash keys the cache (see `git_cache_key` — a 7-hex
+        // prefix risks a moved-tip collision serving a stale build); the
+        // 7-hex `short_hash` is kept only for the human-facing source
+        // record.
+        let commit_hash = format!("{commit_id}");
+        let short_hash = commit_hash.chars().take(7).collect::<String>();
+        let cache_key = git_cache_key(git_ref, &commit_hash);
+
+        // Record the kernel version from the checked-out source
+        // Makefile, as local_source does. The filesystem read is the
+        // final non-interruptible boundary after index publication, so
+        // observe the shared epoch on both sides before making this
+        // source visible to the cache/build pipeline.
+        ensure_git_operation_not_interrupted(
+            &GIT_OPERATION_INTERRUPTED,
+            "before reading cloned source metadata",
+        )?;
+        let version = read_makefile_version(&clone_dir);
+        ensure_git_operation_not_interrupted(
+            &GIT_OPERATION_INTERRUPTED,
+            "after reading cloned source metadata",
+        )?;
+
+        Ok(AcquiredSource {
+            source_dir: clone_dir.clone(),
+            cache_key,
+            version,
+            kernel_source: crate::cache::KernelSource::git(short_hash, git_ref),
+            is_temp: true,
+            is_dirty: false,
+            is_git: true,
+        })
+    })();
+    match acquired {
+        Ok(acquired) => {
+            // Every publication boundary is complete. Stop and join the
+            // reporter only on success; an error instead takes its Drop
+            // path and rolls the destination back below.
+            clone_progress.finish();
+            Ok(acquired)
+        }
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&clone_dir);
+            Err(err)
+        }
     }
-
-    // FULL commit hash keys the cache (see `git_cache_key` — a 7-hex
-    // prefix risks a moved-tip collision serving a stale build); the
-    // 7-hex `short_hash` is kept only for the human-facing source record.
-    let commit_hash = format!("{commit_id}");
-    let short_hash = commit_hash.chars().take(7).collect::<String>();
-
-    let cache_key = git_cache_key(git_ref, &commit_hash);
-
-    // Record the kernel version from the checked-out source Makefile, as
-    // local_source does — the worktree is fully checked out here, so a
-    // git-clone-acquired honoring kernel also earns the 90% tmpfs reclaim
-    // via the metadata.json sidecar. None on an unreadable/unparsable
-    // Makefile, which keeps the conservative 50% default.
-    let version = read_makefile_version(&clone_dir);
-
-    Ok(AcquiredSource {
-        source_dir: clone_dir,
-        cache_key,
-        version,
-        kernel_source: crate::cache::KernelSource::git(short_hash, git_ref),
-        is_temp: true,
-        is_dirty: false,
-        is_git: true,
-    })
 }
 
 /// Measured ceiling for one gix pack-index or checkout operation.
@@ -2618,6 +2745,7 @@ fn fetch_exact_ref_and_checkout(
     const FETCHED_REF: &str = "refs/ktstr/source";
     let refspec = format!("+{source_ref}:{FETCHED_REF}");
 
+    ensure_git_operation_not_interrupted(interrupt, "before preparing clone")?;
     let mut repo = gix::ThreadSafeRepository::init_opts(
         clone_dir,
         gix::create::Kind::WithWorktree,
@@ -2626,9 +2754,12 @@ fn fetch_exact_ref_and_checkout(
     )
     .with_context(|| "prepare clone")?
     .to_thread_local();
+    ensure_git_operation_not_interrupted(interrupt, "after preparing clone")?;
+    ensure_git_operation_not_interrupted(interrupt, "before configuring clone identity")?;
     let _ = repo
         .committer_or_set_generic_fallback()
         .with_context(|| "configure fallback identity for clone reflog")?;
+    ensure_git_operation_not_interrupted(interrupt, "after configuring clone identity")?;
 
     // gix reads pack.threads from its borrowed Repository inside
     // `Prepare::receive`, but Remote/Prepare borrow that Repository and
@@ -2639,28 +2770,41 @@ fn fetch_exact_ref_and_checkout(
     // reserved is required to ensure peers cannot configure the same
     // extras and later oversubscribe while both packs are active.
     let pack_workers = gix_worker_budget().lease();
+    ensure_git_operation_not_interrupted(interrupt, "before configuring pack workers")?;
     repo.config_snapshot_mut()
         .set_value(
             &gix::config::tree::Pack::THREADS,
             pack_workers.workers().to_string().as_str(),
         )
         .with_context(|| "configure gix pack worker budget")?;
+    ensure_git_operation_not_interrupted(interrupt, "after configuring pack workers")?;
 
+    ensure_git_operation_not_interrupted(interrupt, "before preparing clone remote")?;
     let mut remote = repo
         .remote_at_without_url_rewrite(url)
         .with_context(|| "prepare clone remote")?
         .with_fetch_tags(gix::remote::fetch::Tags::None);
+    ensure_git_operation_not_interrupted(interrupt, "after preparing clone remote")?;
+    ensure_git_operation_not_interrupted(interrupt, "before setting exact fetch refspec")?;
     remote
         .replace_refspecs([refspec.as_str()], gix::remote::Direction::Fetch)
         .with_context(|| format!("set exact fetch refspec for {source_ref}"))?;
+    ensure_git_operation_not_interrupted(interrupt, "after setting exact fetch refspec")?;
 
+    // prepare_fetch owns this item later, but create it before connect:
+    // connect performs the first network handshake and accepts no
+    // progress/interrupt handle of its own.
+    let discovery_progress =
+        clone_progress.map(|progress| progress.item_named("discovering exact ref"));
     ensure_git_operation_not_interrupted(interrupt, "before connecting")?;
     let connection = remote
         .connect(gix::remote::Direction::Fetch)
         .with_context(|| format!("connect to {url}"))?;
-    let prepare = match clone_progress {
+    ensure_git_operation_not_interrupted(interrupt, "after connecting")?;
+    ensure_git_operation_not_interrupted(interrupt, "before mapping exact remote ref")?;
+    let prepare = match discovery_progress {
         Some(progress) => connection
-            .prepare_fetch(progress.item(), gix::remote::ref_map::Options::default())
+            .prepare_fetch(progress, gix::remote::ref_map::Options::default())
             .with_context(|| format!("map exact remote ref {source_ref}"))?,
         None => connection
             .prepare_fetch(
@@ -2668,15 +2812,20 @@ fn fetch_exact_ref_and_checkout(
                 gix::remote::ref_map::Options::default(),
             )
             .with_context(|| format!("map exact remote ref {source_ref}"))?,
-    }
-    .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
+    };
+    ensure_git_operation_not_interrupted(interrupt, "after mapping exact remote ref")?;
+    let prepare = prepare.with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
         NonZeroU32::new(1).expect("1 is nonzero"),
     ));
+    ensure_git_operation_not_interrupted(interrupt, "after configuring shallow fetch")?;
 
     ensure_git_operation_not_interrupted(interrupt, "before receiving the pack")?;
     match clone_progress {
         Some(progress) => prepare
-            .receive(progress.item(), interrupt)
+            .receive(
+                progress.item_named("receiving and indexing exact ref"),
+                interrupt,
+            )
             .with_context(|| format!("fetch exact remote ref {source_ref}"))?,
         None => prepare
             .receive(gix::progress::Discard, interrupt)
@@ -2685,13 +2834,16 @@ fn fetch_exact_ref_and_checkout(
     ensure_git_operation_not_interrupted(interrupt, "after receiving the pack")?;
     drop(pack_workers);
 
+    ensure_git_operation_not_interrupted(interrupt, "before reading fetched ref")?;
     let mut fetched_ref = repo
         .find_reference(FETCHED_REF)
         .with_context(|| format!("find fetched ref {source_ref}"))?;
+    ensure_git_operation_not_interrupted(interrupt, "after reading fetched ref")?;
     let unpeeled_id = fetched_ref.id().detach();
     // Preserve exactly the requested ref in its native namespace. In
     // particular, retaining the selected tag keeps setlocalversion and
     // git-describe semantics without importing any unrelated tag.
+    ensure_git_operation_not_interrupted(interrupt, "before preserving exact source ref")?;
     repo.reference(
         source_ref.as_str(),
         unpeeled_id,
@@ -2699,13 +2851,17 @@ fn fetch_exact_ref_and_checkout(
         "clone: preserve exact source ref",
     )
     .with_context(|| format!("preserve fetched ref {source_ref}"))?;
+    ensure_git_operation_not_interrupted(interrupt, "after preserving exact source ref")?;
+    ensure_git_operation_not_interrupted(interrupt, "before peeling exact source ref")?;
     let commit_id = fetched_ref
         .peel_to_commit()
         .with_context(|| format!("peel fetched ref {source_ref} to a commit"))?
         .id;
+    ensure_git_operation_not_interrupted(interrupt, "after peeling exact source ref")?;
 
     // Both branch and tag clones are snapshots for ktstr, so a detached
     // HEAD is the uniform representation of the exact peeled commit.
+    ensure_git_operation_not_interrupted(interrupt, "before publishing exact HEAD")?;
     repo.reference(
         "HEAD",
         commit_id,
@@ -2713,10 +2869,16 @@ fn fetch_exact_ref_and_checkout(
         "clone: checkout exact ktstr source",
     )
     .with_context(|| "set cloned repository HEAD")?;
+    ensure_git_operation_not_interrupted(interrupt, "after publishing exact HEAD")?;
 
     match clone_progress {
         Some(progress) => {
-            checkout_exact_commit(&repo, commit_id, progress.item(), interrupt)?;
+            checkout_exact_commit(
+                &repo,
+                commit_id,
+                progress.item_named("checking out exact ref"),
+                interrupt,
+            )?;
         }
         None => {
             checkout_exact_commit(&repo, commit_id, gix::progress::Discard, interrupt)?;
@@ -2730,13 +2892,21 @@ fn ensure_git_operation_not_interrupted(
     phase: &str,
 ) -> Result<()> {
     if interrupt.load(Ordering::Acquire) {
-        anyhow::bail!("git clone interrupted {phase}");
+        anyhow::bail!("git operation interrupted {phase}");
     }
     Ok(())
 }
 
 #[cfg(test)]
 static TEST_INTERRUPT_AFTER_CHECKOUT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+static TEST_INTERRUPT_AFTER_INDEX_WRITE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+static TEST_INTERRUPT_AFTER_REF_DISCOVERY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Materialize `commit_id` into the main worktree and persist its index.
@@ -2746,32 +2916,43 @@ fn checkout_exact_commit(
     mut progress: impl gix::Progress,
     interrupt: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
+    ensure_git_operation_not_interrupted(interrupt, "before locating exact clone worktree")?;
     let workdir = repo
         .workdir()
         .with_context(|| "exact clone repository has no worktree")?;
+    ensure_git_operation_not_interrupted(interrupt, "after locating exact clone worktree")?;
+    ensure_git_operation_not_interrupted(interrupt, "before resolving fetched commit tree")?;
     let tree_id = repo
         .find_object(commit_id)
         .with_context(|| format!("find fetched commit {commit_id}"))?
         .peel_to_tree()
         .with_context(|| format!("peel fetched commit {commit_id} to its tree"))?
         .id;
+    ensure_git_operation_not_interrupted(interrupt, "after resolving fetched commit tree")?;
+    ensure_git_operation_not_interrupted(interrupt, "before building exact clone index")?;
     let mut index = repo
         .index_from_tree(&tree_id)
         .with_context(|| format!("build index from fetched tree {tree_id}"))?;
+    ensure_git_operation_not_interrupted(interrupt, "after building exact clone index")?;
+    ensure_git_operation_not_interrupted(interrupt, "before building checkout options")?;
     let mut opts = repo
         .checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)
         .with_context(|| "build exact clone checkout options")?;
+    ensure_git_operation_not_interrupted(interrupt, "after building checkout options")?;
     opts.destination_is_initially_empty = true;
     opts.keep_going = false;
     let checkout_workers = gix_worker_budget().lease();
     opts.thread_limit = Some(checkout_workers.workers());
 
     progress.init(Some(index.entries().len()), gix::progress::count("files"));
+    ensure_git_operation_not_interrupted(interrupt, "before building checkout object handle")?;
     let objects = repo
         .objects
         .clone()
         .into_arc()
         .with_context(|| "build thread-safe object handle for exact clone checkout")?;
+    ensure_git_operation_not_interrupted(interrupt, "after building checkout object handle")?;
+    ensure_git_operation_not_interrupted(interrupt, "before checkout")?;
     gix::worktree::state::checkout(
         &mut index,
         workdir,
@@ -2792,9 +2973,19 @@ fn checkout_exact_commit(
     ensure_git_operation_not_interrupted(interrupt, "during checkout")?;
     drop(checkout_workers);
 
+    ensure_git_operation_not_interrupted(interrupt, "before writing exact clone index")?;
     index
         .write(Default::default())
         .with_context(|| "write exact clone index")?;
+    #[cfg(test)]
+    if TEST_INTERRUPT_AFTER_INDEX_WRITE.swap(false, Ordering::AcqRel) {
+        interrupt.store(true, Ordering::Release);
+    }
+    // Publication is not complete until the persisted index has been
+    // followed by one final observation of the shared signal epoch.
+    // Otherwise a signal landing inside index.write() could return an
+    // apparently successful clone whose caller proceeds to cache it.
+    ensure_git_operation_not_interrupted(interrupt, "after writing exact clone index")?;
     Ok(())
 }
 

@@ -26,8 +26,9 @@
 //!   transfer rate and ETA derived from `Content-Length`. Falls back
 //!   to a live byte counter (rate, no ETA) when the response carries
 //!   no `Content-Length`.
-//! - [`CloneProgress`] — a determinate object/file bar for git clones,
-//!   driven by polling gix's prodash progress tree via
+//! - [`CloneProgress`] — a determinate object/file bar and heartbeat
+//!   bridge for gix/source network operations, driven by polling gix's
+//!   prodash progress tree via
 //!   `tree::Root::sorted_snapshot`. Shows a real bar + ETA whenever gix
 //!   reports a bounded total — resolving deltas and checkout files
 //!   always do; the receiving/read-pack phase does only when the server
@@ -197,19 +198,50 @@ impl FetchProgress {
     /// Off-TTY (`is_hidden()`), the bar remains hidden but the poller
     /// emits throttled plain-text updates instead.
     pub(crate) fn clone_progress(&self, label: &str) -> CloneProgress {
+        self.operation_progress(label, "cloning", "clone")
+    }
+
+    /// Add a progress bridge for another network-backed git/source
+    /// operation. It intentionally uses the same prodash poller and
+    /// ten-second non-TTY heartbeat as a clone: ref discovery and
+    /// snapshot requests have the same potentially long, initially
+    /// unquantifiable network waits.
+    pub(crate) fn operation_progress(
+        &self,
+        label: &str,
+        active_verb: &str,
+        completion_noun: &str,
+    ) -> CloneProgress {
         let root = Root::new();
         let bar = self.multi.add(ProgressBar::new_spinner());
         bar.set_style(
             ProgressStyle::with_template(CLONE_TEMPLATE_SPINNER)
                 .expect("valid clone spinner template"),
         );
-        bar.set_message(format!("cloning {label}"));
+        bar.set_message(format!("{active_verb} {label}"));
 
         let non_tty = self.is_hidden();
-        let started = Instant::now();
         if !non_tty {
             bar.enable_steady_tick(TICK);
         }
+        CloneProgress::start(root, bar, label, completion_noun, non_tty, Instant::now())
+    }
+}
+
+impl CloneProgress {
+    /// Build the poll bridge around `root` and `bar`.
+    ///
+    /// Kept on `CloneProgress` so fetch paths without a surrounding
+    /// `FetchProgress` group can use the same heartbeat state machine
+    /// through [`CloneProgress::standalone_operation`].
+    fn start(
+        root: Arc<Root>,
+        bar: ProgressBar,
+        label: &str,
+        completion_noun: &str,
+        non_tty: bool,
+        started: Instant,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let poller = std::thread::spawn({
             let root = Arc::clone(&root);
@@ -226,9 +258,32 @@ impl FetchProgress {
             label: label.to_string(),
             non_tty,
             started,
+            completion_noun: completion_noun.to_string(),
         }
     }
 
+    /// A hidden, plain-text operation reporter for callers that do not
+    /// have a shared [`FetchProgress`] group. This keeps single-source
+    /// commands and internal mirror discovery from going silent during
+    /// a slow network wait; it does not create a renderer or serialize
+    /// the underlying operation.
+    pub(crate) fn standalone_operation(
+        label: &str,
+        active_verb: &str,
+        completion_noun: &str,
+    ) -> Self {
+        let root = Root::new();
+        let bar = ProgressBar::hidden();
+        bar.set_style(
+            ProgressStyle::with_template(CLONE_TEMPLATE_SPINNER)
+                .expect("valid clone spinner template"),
+        );
+        bar.set_message(format!("{active_verb} {label}"));
+        Self::start(root, bar, label, completion_noun, true, Instant::now())
+    }
+}
+
+impl FetchProgress {
     /// Print a status line that coordinates with the live bars.
     ///
     /// On a visible group this routes through
@@ -523,13 +578,14 @@ impl Drop for GroupBar {
     }
 }
 
-/// Live git-clone progress bridge.
+/// Live gix/source-operation progress bridge.
 ///
 /// Holds the prodash [`tree::Root`](Root), the indicatif bar, and the
 /// background poll thread spawned by
-/// [`FetchProgress::clone_progress`]. [`Self::item`] yields a fresh gix
-/// progress sink ([`tree::Item`](Item)) for each gix call; both the
-/// fetch and checkout phases feed the one polled tree.
+/// [`FetchProgress::clone_progress`] or
+/// [`FetchProgress::operation_progress`]. [`Self::item_named`] yields
+/// fresh gix progress sinks
+/// ([`tree::Item`](Item)); all phases feed the one polled tree.
 ///
 /// Shutdown is leak-proof: [`Self::finish`] (success path) and the
 /// [`Drop`] impl (a `git_clone` that bails via `?`) both signal the
@@ -554,15 +610,20 @@ pub(crate) struct CloneProgress {
     non_tty: bool,
     /// Start time used in the non-TTY completion line.
     started: Instant,
+    /// Noun used by the success-only completion line (`clone`, `ref
+    /// discovery`, `snapshot fetch`). Error paths only run `Drop` and
+    /// therefore never claim completion.
+    completion_noun: String,
 }
 
 impl CloneProgress {
-    /// A fresh gix progress sink for one gix call. `git_clone` calls
-    /// this once for the fetch phase and once for checkout; both
-    /// children feed the single polled tree, so the one bar reflects
-    /// whichever phase is active.
-    pub(crate) fn item(&self) -> Item {
-        self.root.add_child("clone")
+    /// A fresh progress sink with an explicit top-level phase name.
+    /// Ref discovery creates this before `connect`, so an empty gix
+    /// progress tree can never hide the first network wait; archive
+    /// fallback uses it to distinguish request and streaming/extract
+    /// phases.
+    pub(crate) fn item_named(&self, phase: &str) -> Item {
+        self.root.add_child(phase.to_string())
     }
 
     /// Stop the poll thread, join it, and clear the bar. Consuming
@@ -572,8 +633,9 @@ impl CloneProgress {
         self.shutdown();
         if self.non_tty {
             eprintln!(
-                "{}: clone complete (elapsed {})",
+                "{}: {} complete (elapsed {})",
                 self.label,
+                self.completion_noun,
                 human_elapsed(self.started.elapsed())
             );
         }
@@ -696,8 +758,31 @@ mod tests {
             "hidden group must poll gix for non-TTY heartbeats",
         );
         assert!(cp.non_tty);
-        let _item = cp.item();
+        let _item = cp.item_named("clone");
         cp.finish();
+    }
+
+    #[test]
+    fn operation_progress_carries_explicit_phase_and_completion_labels() {
+        let fp = hidden_group();
+        let cp = fp.operation_progress(
+            "cargo ktstr: for-next",
+            "resolving git ref",
+            "ref discovery",
+        );
+        assert!(cp.non_tty);
+        assert_eq!(cp.completion_noun, "ref discovery");
+        let phase = cp.item_named("discovering refs");
+        let mut snapshot = Vec::new();
+        cp.root.sorted_snapshot(&mut snapshot);
+        assert!(
+            snapshot
+                .iter()
+                .any(|(_, task)| task.name == "discovering refs"),
+            "the phase created before connect must be visible to the heartbeat poller",
+        );
+        drop(phase);
+        drop(cp);
     }
 
     /// The poll thread shuts down and joins cleanly. Constructs a
@@ -723,6 +808,7 @@ mod tests {
             label: "for-next".to_string(),
             non_tty: false,
             started: Instant::now(),
+            completion_noun: "clone".to_string(),
         };
         // Must not hang: sets stop, the loop exits within one TICK, join
         // returns.
@@ -847,8 +933,9 @@ mod tests {
                         label: "ref".to_string(),
                         non_tty: false,
                         started: Instant::now(),
+                        completion_noun: "clone".to_string(),
                     };
-                    let _ = cp.item();
+                    let _ = cp.item_named("clone");
                     cp.finish();
                 });
             }
@@ -867,7 +954,7 @@ mod tests {
                 let release = &release;
                 scope.spawn(move || {
                     let cp = fp.clone_progress(&format!("ci-ref-{i}"));
-                    let item = cp.item();
+                    let item = cp.item_named("clone");
                     item.init(Some(1), gix::progress::count("objects"));
                     item.set(1);
                     entered.wait();
