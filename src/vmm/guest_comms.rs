@@ -1251,8 +1251,9 @@ pub fn send_stderr_chunk(buf: &[u8]) -> bool {
     write_msg(MsgType::Stderr.wire_value(), buf)
 }
 
-/// Send a scheduler-log chunk to the host. Payload: opaque UTF-8
-/// bytes from the scheduler child process's captured log.
+/// Send a scheduler-log chunk to the host. Payload: opaque bytes from the
+/// scheduler child process's captured log; verifier output is not required to
+/// be valid UTF-8.
 ///
 /// Frames with [`MsgType::SchedLog`]. The host concatenates
 /// chunks in arrival order and the embedded `SCHED_OUTPUT_START` /
@@ -1264,7 +1265,13 @@ pub fn send_stderr_chunk(buf: &[u8]) -> bool {
 /// Required: caller chunks at sub-cap boundaries; same constraint
 /// as [`send_stdout_chunk`].
 pub fn send_sched_log(buf: &[u8]) {
-    write_msg(MsgType::SchedLog.wire_value(), buf);
+    let _ = try_send_sched_log(buf);
+}
+
+/// Fallible scheduler-log frame send used by the idempotent dump transaction.
+/// A `true` result means the complete TLV frame reached the kernel port write.
+pub(crate) fn try_send_sched_log(buf: &[u8]) -> bool {
+    write_msg(MsgType::SchedLog.wire_value(), buf)
 }
 
 /// Send a scheduler-STDOUT chunk to the host. Payload: opaque UTF-8
@@ -1309,10 +1316,51 @@ pub fn send_sched_stderr_chunk(buf: &[u8]) -> bool {
 /// host-side "unknown" sentinel and is rejected by
 /// [`LifecyclePhase::from_wire`].
 pub fn send_lifecycle(phase: LifecyclePhase, reason: &str) {
+    let _ = try_send_lifecycle(phase, reason);
+}
+
+fn lifecycle_payload(phase: LifecyclePhase, reason: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(1 + reason.len());
     buf.push(phase.wire_value());
     buf.extend_from_slice(reason.as_bytes());
-    write_msg(MsgType::Lifecycle.wire_value(), &buf);
+    buf
+}
+
+fn try_send_lifecycle(phase: LifecyclePhase, reason: &str) -> bool {
+    let payload = lifecycle_payload(phase, reason);
+    write_msg(MsgType::Lifecycle.wire_value(), &payload)
+}
+
+const REQUIRED_FRAME_ATTEMPTS: usize = 5;
+
+fn send_required_frame_with(mut send: impl FnMut() -> bool, mut wait: impl FnMut()) -> bool {
+    for attempt in 0..REQUIRED_FRAME_ATTEMPTS {
+        if send() {
+            return true;
+        }
+        if attempt + 1 < REQUIRED_FRAME_ATTEMPTS {
+            wait();
+        }
+    }
+    false
+}
+
+/// Reliably publish a lifecycle proof which must precede an armed asynchronous
+/// observer. Returns an error after bounded reopen retries instead of silently
+/// allowing a later `SchedExit` frame to overtake a missing proof.
+pub(crate) fn send_lifecycle_required(phase: LifecyclePhase, reason: &str) -> Result<(), String> {
+    let payload = lifecycle_payload(phase, reason);
+    if send_required_frame_with(
+        || write_msg(MsgType::Lifecycle.wire_value(), &payload),
+        || std::thread::sleep(std::time::Duration::from_millis(100)),
+    ) {
+        Ok(())
+    } else {
+        Err(format!(
+            "required lifecycle frame {phase:?} was not delivered after \
+             {REQUIRED_FRAME_ATTEMPTS} attempts"
+        ))
+    }
 }
 
 /// Publish one generation-tagged scheduler attach boundary.
@@ -2160,6 +2208,24 @@ mod tests {
         assert_no_bulk_write("send_lifecycle(SchedulerNotAttached)", || {
             send_lifecycle(LifecyclePhase::SchedulerNotAttached, "verifier rejected")
         });
+    }
+
+    #[test]
+    fn required_frame_failure_is_bounded_and_reported() {
+        let attempts = std::cell::Cell::new(0usize);
+        let waits = std::cell::Cell::new(0usize);
+        assert!(
+            !send_required_frame_with(
+                || {
+                    attempts.set(attempts.get() + 1);
+                    false
+                },
+                || waits.set(waits.get() + 1),
+            ),
+            "an undelivered required boundary must fail closed"
+        );
+        assert_eq!(attempts.get(), REQUIRED_FRAME_ATTEMPTS);
+        assert_eq!(waits.get(), REQUIRED_FRAME_ATTEMPTS - 1);
     }
 
     /// `send_exec_exit` from host context suppresses the write.

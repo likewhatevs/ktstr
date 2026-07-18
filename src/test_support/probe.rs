@@ -1738,13 +1738,13 @@ fn build_dispatch_ctx_parts(
     // controllers (a test that requires the absence of a controller
     // would fail) or under-enable them (the test's set_cpuset/set_memory
     // call would fail with bare ENOENT/EACCES at the knob-write site).
-    // Read the scheduler PID from the atomic side channel published by
-    // `vmm::rust_init::start_scheduler`. The previous consumer parsed
+    // Read the scheduler PID from the coherent process owner published by
+    // `vmm::rust_init`. The previous consumer parsed
     // `std::env::var("SCHED_PID")`, which is unsound under the live
     // probe thread spawned by `start_probe_phase_a` — glibc mutates
     // `__environ` without locks, so a concurrent reader vs. writer
-    // races. `sched_pid()` returns `None` on the `0` sentinel, matching
-    // the `.filter(|&pid| pid != 0)` clause it replaces.
+    // races. `sched_pid()` returns `None` when no userspace scheduler
+    // process is currently owned.
     let sched_pid = crate::vmm::rust_init::sched_pid();
     // Three-layer merge: default_checks → scheduler.assert → entry.assert.
     let merged_assert = crate::assert::Assert::default_checks()

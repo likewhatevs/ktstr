@@ -1240,55 +1240,23 @@ fn apply_read_kernel_cold(
 /// matches the cpio entries packed by the initramfs
 /// composer.
 ///
-/// SCHED_PID is the single source of truth for "which
-/// scheduler is currently running". Each arm reads it
-/// (Detach/Replace/Restart) or writes it (Attach via the
-/// spawn helper's internal store) to keep the existing
-/// monitor / sched-stats / probe consumers consistent.
 fn apply_attach_scheduler(scheduler: &'static crate::test_support::Scheduler) -> Result<()> {
-    {
-        dispatch_attach_scheduler(scheduler)?;
-        crate::vmm::rust_init::set_current_scheduler(Some(&scheduler.binary));
-    }
-    Ok(())
+    dispatch_attach_scheduler(scheduler)
 }
 
-/// `Op::DetachScheduler` body: kill the current scheduler, clear SCHED_PID.
+/// `Op::DetachScheduler` body: retire the current exact process owner.
 fn apply_detach_scheduler() -> Result<()> {
-    {
-        dispatch_detach_scheduler()?;
-        crate::vmm::rust_init::set_current_scheduler(None);
-    }
-    Ok(())
+    dispatch_detach_scheduler()
 }
 
 /// `Op::RestartScheduler` body: kill the current scheduler, respawn boot.
 fn apply_restart_scheduler() -> Result<()> {
-    {
-        dispatch_restart_scheduler()?;
-        // RestartScheduler re-spawns the BOOT scheduler;
-        // CURRENT_SCHEDULER stays as the prior identity
-        // (whatever the last Attach/Replace published, or
-        // None if the test only ever used the boot
-        // scheduler). A future iteration tracking the
-        // "currently-attached scheduler identity" on the
-        // boot path (matching the spawn_scheduler_from_paths
-        // side channel in rust_init) would let
-        // RestartScheduler restore the published identity
-        // explicitly; for v0 the slot keeps its last value
-        // and consumers reading the post-Op state see the
-        // same identity they would have seen pre-Op.
-    }
-    Ok(())
+    dispatch_restart_scheduler()
 }
 
 /// `Op::ReplaceScheduler` body: atomically swap to a staged scheduler.
 fn apply_replace_scheduler(scheduler: &'static crate::test_support::Scheduler) -> Result<()> {
-    {
-        dispatch_replace_scheduler(scheduler)?;
-        crate::vmm::rust_init::set_current_scheduler(Some(&scheduler.binary));
-    }
-    Ok(())
+    dispatch_replace_scheduler(scheduler)
 }
 
 /// `Op::PinBpfMap` body: hold a named BPF map fd for the scenario lifetime.
@@ -1631,20 +1599,10 @@ pub(super) fn staged_scheduler_log_path(name: &str) -> String {
     format!("/tmp/sched_{name}_{seq}.log", seq = next_sched_spawn_seq())
 }
 
-/// SIGTERM grace window for scheduler-lifecycle Op kill paths.
-/// 10s comfortably exceeds the real-world scx_disable_workfn
-/// detach latency (kernel/sched/ext.c:5923) — the kernel tears
-/// down the BPF prog graph on refcount drop from a workqueue and
-/// the scheduler's SIGTERM handler returns from main once that
-/// completes. The 2s initial cut produced
-/// `StillAliveAfterSigkill` in the e2e because scx_disable_workfn
-/// took longer than the SIGTERM budget AND the SIGKILL post-grace
-/// also exceeded (`POST_SIGKILL_GRACE` at 2s) — neither could
-/// service a process stuck mid-BPF-detach in D-state. 10s gives
-/// the SIGTERM-handled clean exit path enough room to complete
-/// without escalating to SIGKILL on the common scx_* scheduler
-/// shape; the SIGKILL escalation inside `kill_scheduler_process`
-/// still covers any pathological hang past this budget.
+/// SIGTERM/disabled-state barrier for scheduler-lifecycle Op transitions.
+/// 10s comfortably exceeds the real-world scx_disable_workfn detach latency
+/// (kernel/sched/ext.c:5923). After the barrier, the retained exact pidfd drives
+/// bounded final process cleanup; no numeric-pid reopen or signal is used.
 const SCHED_LIFECYCLE_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Deadline for `Op::ReplaceScheduler`'s worker-not-trying gate
@@ -1879,59 +1837,26 @@ fn wait_for_scx_disabled(timeout: std::time::Duration) -> Result<std::time::Dura
     }
 }
 
-/// Common kill helper for the Detach / Restart / Replace arms.
-/// Reads SCHED_PID, sends SIGTERM, waits for the scx kernel state
-/// to transition to `disabled` (the load-bearing barrier per
-/// `wait_for_scx_disabled`'s doc), and clears SCHED_PID on
-/// success so subsequent reads observe "no scheduler".
+/// Common exact-owner kill helper for Detach / Restart / Replace.
 ///
-/// Direct `libc::kill(SIGTERM)` rather than the
-/// `vmm::rust_init::kill_scheduler_process` helper because the
-/// latter's strict /proc-absence verification can fire
-/// `StillAliveAfterSigkill` when the scheduler's exit blocks on
-/// BPF detach. The scheduler PROCESS being gone is not the same
-/// signal as the BPF state being `SCX_DISABLED` — operatively the
-/// sysfs state is what gates the next spawn, not /proc removal.
-/// Both signals normally resolve together but a slow workqueue
-/// can decouple them under load. The scx state machine reaches
-/// `disabled` BEFORE the userspace process completes its libbpf
-/// cleanup syscalls (which are what holds /proc/{pid} alive).
-fn kill_current_scheduler(op_label: &str) -> Result<libc::pid_t> {
-    let pid = crate::vmm::rust_init::sched_pid().ok_or_else(|| {
+/// The scheduler PROCESS being gone is not the same signal as the BPF state
+/// being `SCX_DISABLED` — operatively the sysfs state gates the next spawn.
+/// Both normally resolve together but a slow workqueue can decouple them. The
+/// exact owner pidfd supplies identity-stable SIGTERM/SIGKILL while sysfs
+/// supplies the kernel-state barrier.
+fn kill_current_scheduler(
+    owner: &mut crate::vmm::rust_init::SchedulerProcessOwnerGuard<'_>,
+    op_label: &str,
+) -> Result<libc::pid_t> {
+    let current = owner.current_mut().ok_or_else(|| {
         anyhow::anyhow!(
-            "{op_label}: no scheduler attached (SCHED_PID is 0); \
+            "{op_label}: no scheduler attached (no scheduler process is currently owned); \
              attach a scheduler via boot-time `scheduler` field or \
              `Op::AttachScheduler` before invoking this Op"
         )
     })?;
-    // Stop the guest sched_exit_monitor BEFORE SIGTERM so the
-    // monitor thread exits without sending the SchedExit message
-    // that the host's dispatch.rs SchedExit arm would otherwise
-    // promote into the run-wide kill flag (failing the test as
-    // scheduler-died even though the kill is an INTENTIONAL
-    // lifecycle Op). The post-spawn Attach / Restart / Replace
-    // paths re-install a fresh monitor for the new SCHED_PID via
-    // `restart_sched_exit_monitor_with_log`; Detach leaves the
-    // slot empty because there is no replacement scheduler.
-    // SchedExitStop.stop_and_join joins the monitor thread before
-    // returning, so the kill below is safe from the prior
-    // monitor's pidfd race.
-    let _ = crate::vmm::rust_init::stop_sched_exit_monitor();
-    // Pin the post-stop invariant for Restart+Replace dispatch
-    // sites: after `stop_sched_exit_monitor` returns, the slot
-    // MUST be empty so the subsequent spawn's
-    // `restart_sched_exit_monitor_with_log` call lands a fresh
-    // monitor without first stop+joining a stale handle. The
-    // `Op::AttachScheduler` site does NOT flow through here (no
-    // prior scheduler to kill); its possibly-non-empty entry is
-    // handled silently by `restart_sched_exit_monitor_with_log`'s
-    // defensive `take()`. debug-only — release builds rely on
-    // that defensive take() as the safety net.
-    debug_assert!(
-        crate::vmm::rust_init::sched_exit_monitor_slot_is_empty(),
-        "kill_current_scheduler did not clear sched_exit_monitor slot — \
-         stop_sched_exit_monitor() must precede the kill (called from {op_label})",
-    );
+    let pid = current.pid();
+    let monitor_observed_exit = current.stop_monitor();
     // Trigger async scx_disable via sysrq-'S' so the kernel-side
     // disable cascade runs OUT OF BAND from the scheduler's exit
     // path. Without this, `bpf_scx_unreg`
@@ -1939,8 +1864,8 @@ fn kill_current_scheduler(op_label: &str) -> Result<libc::pid_t> {
     // D-state inside the bpf_link refcount-drop chain via
     // `kthread_flush_work(&sch->disable_work)` — SIGKILL kills
     // userspace but cannot remove /proc/{pid} until that block
-    // finishes, which is how the `kill_scheduler_process` helper
-    // sees `StillAliveAfterSigkill` under realistic load.
+    // finishes, which is why process-exit alone is the wrong transition
+    // barrier under realistic load.
     // The sysrq-'S' handler at ext.c:7508 runs scx_disable directly
     // via RCU-protected scx_root (registered at ext.c:7791
     // `register_sysrq_key('S', &sysrq_sched_ext_reset_op)`), so the
@@ -1961,33 +1886,81 @@ fn kill_current_scheduler(op_label: &str) -> Result<libc::pid_t> {
     // below rather than for the userspace process to exit so the
     // next scheduler's BPF skeleton load doesn't hit -EBUSY at
     // kernel/sched/ext.c:6643.
-    let r = unsafe { libc::kill(pid, libc::SIGTERM) };
-    if r != 0 {
-        let errno = std::io::Error::last_os_error();
-        anyhow::bail!("{op_label}: SIGTERM to pid {pid} failed: {errno}");
+    let signal_error = match current.send_signal(libc::SIGTERM) {
+        Ok(crate::vmm::rust_init::PidfdSignalOutcome::Delivered) => None,
+        Ok(crate::vmm::rust_init::PidfdSignalOutcome::AlreadyExited) => {
+            Some("scheduler was already dead before intentional SIGTERM".to_string())
+        }
+        Err(error) => Some(format!("SIGTERM to exact pidfd failed: {error}")),
+    };
+    let disable = wait_for_scx_disabled(SCHED_LIFECYCLE_KILL_GRACE);
+    if let Ok(elapsed) = disable.as_ref() {
+        tracing::debug!(
+            op = op_label,
+            pid = pid,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "scx state reached 'disabled' after SIGTERM",
+        );
     }
-    let elapsed = wait_for_scx_disabled(SCHED_LIFECYCLE_KILL_GRACE).map_err(|e| {
-        anyhow::anyhow!("{op_label}: wait_for_scx_disabled(pid={pid}) failed: {e:#}")
-    })?;
+    // The kernel state barrier and process exit are related but distinct.
+    // Reap the exact child before releasing this transition lock; if SIGTERM
+    // only detached BPF and left userspace alive, the pidfd SIGKILL closes it.
+    let cleanup_error = current.terminate_exact().err();
+    let retired = owner
+        .take()
+        .expect("current scheduler remained installed through exact cleanup");
+    debug_assert_eq!(retired.pid(), pid);
+    let retired_log_path = retired.log_path.clone();
+    // CurrentSchedulerProcess::Drop owns the last exact cleanup edge. This is
+    // normally a no-op because terminate_exact above already reaped the child;
+    // after a bounded-wait failure it only signals and probes nonblocking, so
+    // this path never spends a second teardown allowance.
+    drop(retired);
+    // Invalidate the host accessor as soon as the exact retiring owner is gone.
+    // By here the successful disabled-state barrier has NULLed `*scx_root` and
+    // unlinked the prior scx_sched; even on a barrier error, retiring this owner
+    // makes the accessor unusable. Best-effort delivery falls back to the
+    // coordinator's scx_root watchpoint. Log drain can wait on forwarders and
+    // move a large diagnostic payload, so it must not extend the stale-accessor
+    // invalidation window.
+    crate::vmm::guest_comms::send_sched_swap_notify();
+    // Preserve the exact retiring generation's log after owner cleanup;
+    // the coordinated terminal helper independently waits for both pipe
+    // readers to reach EOF and resumes any accepted prefix without duplicate
+    // framing. It also keeps another scheduler's SchedLog transaction from
+    // interleaving before this generation's END.
+    let retired_log_dump_complete =
+        crate::vmm::rust_init::dump_sched_output_before_terminal(&retired_log_path);
+
+    let mut failures = Vec::new();
+    if !retired_log_dump_complete {
+        failures.push(format!(
+            "retired scheduler log transaction did not complete: {retired_log_path}"
+        ));
+    }
+    if monitor_observed_exit {
+        failures.push("exit monitor observed scheduler death before transition".to_string());
+    }
+    if let Some(error) = signal_error {
+        failures.push(error);
+    }
+    if let Err(error) = disable {
+        failures.push(format!(
+            "wait_for_scx_disabled(pid={pid}) failed: {error:#}"
+        ));
+    }
+    if let Some(error) = cleanup_error {
+        failures.push(format!("exact scheduler process cleanup failed: {error}"));
+    }
+    if !failures.is_empty() {
+        anyhow::bail!("{op_label}: {}", failures.join("; "));
+    }
     tracing::debug!(
         op = op_label,
-        pid = pid,
-        elapsed_ms = elapsed.as_millis() as u64,
-        "scx state reached 'disabled' after SIGTERM",
+        pid,
+        monitor_observed_exit,
+        "retired exact scheduler owner"
     );
-    crate::vmm::rust_init::set_sched_pid(0);
-    // Notify the host that the scheduler has been swapped out. By here
-    // `wait_for_scx_disabled` has returned, so the kernel NULLed
-    // `*scx_root` (`RCU_INIT_POINTER(scx_root, NULL)` precedes
-    // `scx_set_enable_state(SCX_DISABLED)` in kernel/sched/ext.c) and
-    // the prior scx_sched object is unlinked (`*scx_root` NULLed) and
-    // its slab is subject to RCU-grace-period reuse — the host's
-    // owned periodic-capture accessor is now stale. The frame lets the
-    // freeze coordinator invalidate that accessor synchronously rather
-    // than waiting up to one SCAN_INTERVAL for its scx_root watchpoint
-    // poll to notice the rebind. Best-effort: a lost frame falls back
-    // to the poll-driven teardown (see `send_sched_swap_notify`).
-    crate::vmm::guest_comms::send_sched_swap_notify();
     Ok(pid)
 }
 
@@ -1997,8 +1970,8 @@ fn kill_current_scheduler(op_label: &str) -> Result<libc::pid_t> {
 /// spawn / startup-died / not-attached surfaces as a typed
 /// `anyhow::Error` that bubbles up through `apply_ops` to fail
 /// the test cleanly instead of rebooting the VM. The helper
-/// stores SCHED_PID on successful spawn via the internal
-/// `SCHED_PID.store` call site in `try_spawn_scheduler`.
+/// returns a provisional exact-process owner; publication happens only in
+/// `commit_spawned_scheduler_owner`.
 fn spawn_scheduler_for_op(
     op_label: &str,
     binary_path: &str,
@@ -2026,47 +1999,14 @@ fn spawn_scheduler_for_op(
     }
 }
 
-fn install_spawned_scheduler_monitor(
+fn commit_spawned_scheduler_owner(
     op_label: &str,
+    owner: &mut crate::vmm::rust_init::SchedulerProcessOwnerGuard<'_>,
     spawned: &mut crate::vmm::rust_init::SpawnedScheduler,
-    log_path: &str,
+    scheduler: Option<&'static crate::test_support::SchedulerSpec>,
 ) -> Result<()> {
-    let monitor_pidfd = match spawned.clone_pidfd() {
-        Ok(pidfd) => pidfd,
-        Err(error) => {
-            let cleanup = spawned.terminate_after_monitor_failure();
-            anyhow::bail!(
-                "{op_label}: scheduler attached but pidfd handoff failed: {error}; \
-                 pidfd cleanup result: {cleanup:?}"
-            );
-        }
-    };
-    if let Err(error) =
-        crate::vmm::rust_init::restart_sched_exit_monitor_with_log(monitor_pidfd, Some(log_path))
-    {
-        let cleanup = spawned.terminate_after_monitor_failure();
-        anyhow::bail!(
-            "{op_label}: scheduler attached but exit-monitor installation failed: \
-             {error}; pidfd cleanup result: {cleanup:?}"
-        );
-    }
-    if let Err(error) = spawned.confirm_alive_after_monitor_install() {
-        let _ = crate::vmm::rust_init::stop_sched_exit_monitor();
-        let cleanup = spawned.terminate_after_monitor_failure();
-        anyhow::bail!(
-            "{op_label}: scheduler exited during exit-monitor handoff: {error}; \
-             pidfd cleanup result: {cleanup:?}"
-        );
-    }
-    if let Err(error) = spawned.finish_attach_attempt() {
-        let _ = crate::vmm::rust_init::stop_sched_exit_monitor();
-        let cleanup = spawned.terminate_after_monitor_failure();
-        anyhow::bail!(
-            "{op_label}: scheduler attached and was monitored, but the host attach-attempt \
-             completion could not be published: {error}; pidfd cleanup result: {cleanup:?}"
-        );
-    }
-    Ok(())
+    crate::vmm::rust_init::commit_spawned_scheduler(owner, spawned, scheduler, || Ok(()))
+        .map_err(|error| anyhow::anyhow!("{op_label}: scheduler owner commit failed: {error}"))
 }
 
 /// Op::AttachScheduler dispatch. Spawns the named staged scheduler
@@ -2080,6 +2020,16 @@ fn install_spawned_scheduler_monitor(
 pub(super) fn dispatch_attach_scheduler(
     scheduler: &'static crate::test_support::Scheduler,
 ) -> Result<()> {
+    let mut owner = crate::vmm::rust_init::lock_scheduler_process_owner();
+    if let Some(current) = owner.current() {
+        anyhow::bail!(
+            "Op::AttachScheduler requires no current scheduler process; exact owner \
+             still contains pid {} generation {}. Detach it first or use \
+             Op::ReplaceScheduler",
+            current.pid(),
+            current.generation
+        );
+    }
     // Precondition: Op::AttachScheduler attaches a sched_ext scheduler,
     // and the kernel permits only one enabled at a time — `scx_enable`
     // returns -EBUSY unless `scx_enable_state() == SCX_DISABLED`
@@ -2133,12 +2083,13 @@ pub(super) fn dispatch_attach_scheduler(
         scheduler.name,
         crate::vmm::wire::AttachAttemptKind::Attach,
     )?;
-    // Install a fresh sched_exit_monitor against the just-spawned
-    // SCHED_PID so the post-Op scheduler retains death detection.
-    // No prior monitor existed for this slot (Attach is the
-    // "first scheduler" or post-Detach attach); the restart helper
-    // handles the empty-slot case as a fresh install.
-    install_spawned_scheduler_monitor("Op::AttachScheduler", &mut spawned, &log)?;
+    commit_spawned_scheduler_owner(
+        "Op::AttachScheduler",
+        &mut owner,
+        &mut spawned,
+        Some(&scheduler.binary),
+    )?;
+    drop(owner);
     // 30 s deadline: the coord's Published-arm pulse + worker's
     // no-deadline reinit budget (post-boot the 60 s gate is gone)
     // typically lands in <500 ms (one scan tick + tens of ms for
@@ -2163,9 +2114,10 @@ pub(super) fn dispatch_attach_scheduler(
 }
 
 /// Op::DetachScheduler dispatch. Kills the currently-running
-/// scheduler via the shared kill helper and clears SCHED_PID.
+/// scheduler via the shared exact-owner kill helper.
 pub(super) fn dispatch_detach_scheduler() -> Result<()> {
-    let pid = kill_current_scheduler("Op::DetachScheduler")?;
+    let mut owner = crate::vmm::rust_init::lock_scheduler_process_owner();
+    let pid = kill_current_scheduler(&mut owner, "Op::DetachScheduler")?;
     tracing::info!(
         op = "DetachScheduler",
         killed_pid = pid,
@@ -2182,7 +2134,8 @@ pub(super) fn dispatch_detach_scheduler() -> Result<()> {
 /// schedulers in place. The common test pattern (validate boot
 /// scheduler survives detach + reattach cleanly) is covered.
 pub(super) fn dispatch_restart_scheduler() -> Result<()> {
-    let prev_pid = kill_current_scheduler("Op::RestartScheduler")?;
+    let mut owner = crate::vmm::rust_init::lock_scheduler_process_owner();
+    let prev_pid = kill_current_scheduler(&mut owner, "Op::RestartScheduler")?;
     let log = staged_scheduler_log_path("boot");
     let mut spawned = spawn_scheduler_for_op(
         "Op::RestartScheduler",
@@ -2192,7 +2145,12 @@ pub(super) fn dispatch_restart_scheduler() -> Result<()> {
         "boot",
         crate::vmm::wire::AttachAttemptKind::Restart,
     )?;
-    install_spawned_scheduler_monitor("Op::RestartScheduler", &mut spawned, &log)?;
+    commit_spawned_scheduler_owner(
+        "Op::RestartScheduler",
+        &mut owner,
+        &mut spawned,
+        crate::vmm::rust_init::boot_scheduler(),
+    )?;
     tracing::info!(
         op = "RestartScheduler",
         prev_pid = prev_pid,
@@ -2209,7 +2167,8 @@ pub(super) fn dispatch_restart_scheduler() -> Result<()> {
 pub(super) fn dispatch_replace_scheduler(
     scheduler: &'static crate::test_support::Scheduler,
 ) -> Result<()> {
-    let prev_pid = kill_current_scheduler("Op::ReplaceScheduler")?;
+    let mut owner = crate::vmm::rust_init::lock_scheduler_process_owner();
+    let prev_pid = kill_current_scheduler(&mut owner, "Op::ReplaceScheduler")?;
     let binary = crate::test_support::staged::staged_scheduler_binary_path(scheduler.name);
     let args = crate::test_support::staged::staged_scheduler_args_path(scheduler.name);
     let log = staged_scheduler_log_path(scheduler.name);
@@ -2225,7 +2184,13 @@ pub(super) fn dispatch_replace_scheduler(
     // so death detection persists past the swap. The seq-suffixed
     // log path matches the spawn_scheduler_for_op log arg above so
     // failure-dump output goes to the new scheduler's own file.
-    install_spawned_scheduler_monitor("Op::ReplaceScheduler", &mut spawned, &log)?;
+    commit_spawned_scheduler_owner(
+        "Op::ReplaceScheduler",
+        &mut owner,
+        &mut spawned,
+        Some(&scheduler.binary),
+    )?;
+    drop(owner);
     // Quiesce the worker before capturing the baseline seqno.
     // Symmetric with Op::AttachScheduler's wait at L2074:
     // without this gate, a coord scan tick that fired during

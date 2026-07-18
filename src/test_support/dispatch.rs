@@ -299,8 +299,9 @@ impl SanitizedKernelLabel {
 /// semantic, operator-readable label per kernel:
 /// - Version / Range expansion: the version string verbatim
 ///   (`6.14.2`, `6.15-rc3`).
-/// - CacheKey: the version prefix (everything before the
-///   `-tarball-` / `-git-` source tag).
+/// - CacheKey: the version prefix for tarballs, a compact
+///   `git_{kind}_{refhash6}` label for content-addressed git entries,
+///   or the legacy ref prefix for older `-git-` keys.
 /// - Git: `git_{owner}_{repo}_{kind}_{ref}` extracted from the URL
 ///   (kind = tag/branch/sha).
 /// - Path: `path_{basename}_{hash6}` — basename + 6-char crc32 of

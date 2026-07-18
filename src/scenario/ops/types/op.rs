@@ -675,8 +675,8 @@ pub enum Op {
     /// accessor-init worker to quiesce (handles the case where the
     /// boot scheduler's first publish is still in flight), captures
     /// the pre-spawn publish seqno, spawns the staged scheduler
-    /// binary, re-installs the sched_exit_monitor against the new
-    /// SCHED_PID, then waits up to 30s for a fresh accessor publish.
+    /// binary, commits one coherent child/pidfd/spec/log/monitor owner,
+    /// then waits up to 30s for a fresh accessor publish.
     ///
     /// **Already-attached behavior.** No framework-level idempotency
     /// guard: if a scheduler is already running, the kernel rejects
@@ -711,14 +711,14 @@ pub enum Op {
     /// `kernel/sched/ext.c:6145`, reached on the struct_ops detach
     /// path via `bpf_scx_unreg` at `kernel/sched/ext.c:7666`), sends
     /// `SIGTERM` to the
-    /// scheduler pid, waits up to `SCHED_LIFECYCLE_KILL_GRACE` (10s)
-    /// for the kernel BPF state to reach `SCX_DISABLED`, then
-    /// clears the `SCHED_PID` atomic (defined in
-    /// `src/vmm/rust_init/mod.rs`) so subsequent
+    /// scheduler's exact pidfd, waits up to
+    /// `SCHED_LIFECYCLE_KILL_GRACE` (10s) for the kernel BPF state to
+    /// reach `SCX_DISABLED`, then exact-kills/reaps and removes the
+    /// coherent process owner so subsequent
     /// `crate::vmm::rust_init::sched_pid()` reads return `None`.
     ///
-    /// Bails when no scheduler is currently attached (SCHED_PID is
-    /// 0), when the SIGTERM syscall fails, or when the
+    /// Bails when no scheduler process is currently owned, when exact
+    /// SIGTERM delivery fails, or when the
     /// `SCX_DISABLED` wait times out. NOT idempotent: a second
     /// detach with no scheduler attached bails rather than no-oping.
     /// For defensive "ensure clean slate" scaffolds, gate on
@@ -765,8 +765,8 @@ pub enum Op {
     /// `src/scenario/ops/dispatch.rs:2153`): kills the current scheduler
     /// via the shared `kill_current_scheduler` helper, spawns the
     /// named staged scheduler binary from
-    /// `/staging/schedulers/<name>/`, re-installs the
-    /// sched_exit_monitor against the new SCHED_PID, waits up to
+    /// `/staging/schedulers/<name>/`, commits the replacement's coherent
+    /// process owner, waits up to
     /// `REPLACE_NOT_TRYING_DEADLINE_S` (5s) for the accessor-init
     /// worker to quiesce, captures the pre-publish seqno, then
     /// waits up to 10s for fresh accessors to publish against the

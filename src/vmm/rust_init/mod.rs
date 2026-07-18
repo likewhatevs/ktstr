@@ -16,7 +16,7 @@ pub(crate) use std::path::Path;
 pub(crate) use std::process::{Child, Command, Stdio};
 pub(crate) use std::sync::Arc;
 pub(crate) use std::sync::OnceLock;
-pub(crate) use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+pub(crate) use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub(crate) use crate::sync::Latch;
 
@@ -56,26 +56,6 @@ const TRACE_PIPE: &str = "/sys/kernel/tracing/trace_pipe";
 /// `sch->ops.name` is set.
 const SYSFS_SCHED_EXT_ROOT_OPS: &str = "/sys/kernel/sched_ext/root/ops";
 
-/// Side channel for the scheduler PID published by [`start_scheduler`]
-/// once `Command::spawn` returns. The guest test-dispatch path
-/// (e.g. [`crate::test_support`] consumers that need the scheduler's
-/// pid for cgroup attach / kill / probe) reads it via [`sched_pid`].
-///
-/// Replaces a previous `std::env::set_var("SCHED_PID", ...)` write.
-/// Mutating glibc's global `__environ` array while another thread is
-/// live (the Phase A probe thread spawned in `start_probe_phase_a`
-/// runs concurrently with `start_scheduler`) is documented UB on
-/// Linux — see
-/// [`crate::test_support::propagate_rust_env_from_cmdline`] for the
-/// mirroring rationale. An atomic side channel is the
-/// data-race-free alternative.
-///
-/// Sentinel: `0` means "no scheduler started". `pid_t` is a signed
-/// integer in glibc; the kernel never returns `0` from `fork(2)` to
-/// the parent, so `0` is a safe "unset" marker for the producer to
-/// initialise with and the consumer to filter on.
-static SCHED_PID: AtomicI32 = AtomicI32::new(0);
-
 /// Maximum bytes per `MsgType::Stdout` / `MsgType::Stderr` TLV
 /// chunk emitted by the pipe forwarder threads. 4 KiB matches a
 /// page-size pipe read; well under the host-side per-frame cap
@@ -83,9 +63,10 @@ static SCHED_PID: AtomicI32 = AtomicI32::new(0);
 /// comfortably in one frame even with the 16-byte header.
 const STDIO_CHUNK_BYTES: usize = 4 * 1024;
 
-/// Bound on [`reap_child_bounded_status`]: how long teardown waits for a
-/// SIGKILL'd scheduler to exit before giving up and letting the VM reboot
-/// reap it. A SIGKILL'd scheduler normally exits <<1s — post-crash bypass
+/// Bound on [`CurrentSchedulerProcess::reap_bounded_status`]: how long
+/// teardown waits for a SIGKILL'd scheduler to exit before giving up and
+/// letting the VM reboot reap it. A SIGKILL'd scheduler normally exits <<1s —
+/// post-crash bypass
 /// keeps it CFS-schedulable, and it is NOT held in the kernel scx disable:
 /// its `struct_ops` detach (`bpf_scx_unreg`) only `kthread_flush_work`s
 /// the `scx_root_disable` the crash irq_work already kicked, which is

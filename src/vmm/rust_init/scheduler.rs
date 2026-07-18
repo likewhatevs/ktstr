@@ -541,12 +541,6 @@ impl SchedulerAttachAttempt {
     fn close_terminal(self) -> Result<(), String> {
         self.complete_terminal(false)
     }
-
-    /// Complete the same protocol for a would-be success and preserve a
-    /// simultaneous typed cancellation as a failure after Settled is queued.
-    fn finish_terminal(self) -> Result<(), String> {
-        self.complete_terminal(true)
-    }
 }
 
 impl Drop for SchedulerAttachAttempt {
@@ -808,6 +802,7 @@ struct LinuxAttachWait {
     wall_start: std::time::Instant,
 }
 
+#[cfg(test)]
 fn open_scheduler_pidfd(pid: u32) -> Result<OwnedFd, ScxAttachStatus> {
     let raw_pidfd =
         unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0u32) as libc::c_int };
@@ -1285,6 +1280,7 @@ pub(crate) fn drain_probe_pipeline(
 /// within the window; on timeout the child is left for the VM reboot to
 /// reap — teardown must not block unboundedly on a wedged process (see
 /// [`SCHED_REAP_TIMEOUT`]).
+#[cfg(test)]
 pub(crate) fn reap_child_bounded_status(
     child: &mut std::process::Child,
     timeout: std::time::Duration,
@@ -1335,7 +1331,7 @@ pub(crate) enum SpawnSchedulerError {
     /// kernel boundary (ENOMEM, EACCES on the binary, EAGAIN from
     /// rlimit). Carries the underlying `io::Error` so the boot
     /// path can synthesize a `SCHED_OUTPUT_START / END`-framed
-    /// log payload via `send_sched_log_text`.
+    /// log payload via `send_synthetic_sched_output_before_terminal`.
     SpawnFailed(std::io::Error),
 
     /// The shared attach wait observed the process pidfd become readable
@@ -1344,15 +1340,8 @@ pub(crate) enum SpawnSchedulerError {
     /// `log_path` is the file the spawn helper wrote
     /// stdout+stderr into; callers use it for `dump_sched_output`.
     ///
-    /// **Post-mortem state guarantee.** [`try_spawn_scheduler`]
-    /// returns this variant only AFTER clearing [`SCHED_PID`] to 0
-    /// (the dead pid was published optimistically at spawn so the
-    /// sched_exit_monitor caller path could install against a known
-    /// id; the StartupDied branch never gets that far so the spawn
-    /// helper owns the rollback). The dead child is auto-reaped by
-    /// the kernel because PID 1 runs SIGCHLD=`SIG_IGN`; the attach wait
-    /// observes pidfd POLLIN and does not reap. No manual
-    /// `wait`/`try_wait` is required by the caller.
+    /// The provisional process is never published as the current scheduler;
+    /// its RAII owner observes the already-terminal exact pidfd.
     StartupDied { log_path: String },
 
     /// Process remained alive but did not attach. `reason` is a structured
@@ -1360,13 +1349,9 @@ pub(crate) enum SpawnSchedulerError {
     /// wall/service counters. The caller uses `log_path` to surface the
     /// scheduler's own diagnostic output.
     ///
-    /// **Post-mortem state guarantee.** [`try_spawn_scheduler`]
-    /// returns this variant only AFTER SIGKILLing the orphan
-    /// process (which is alive but not bound to scx, so it would
-    /// otherwise keep running and could late-bind on the next
-    /// scheduler attempt) and waiting on it via `child.wait()` to
-    /// reap the zombie, plus clearing [`SCHED_PID`] to 0. No manual
-    /// cleanup required by the caller.
+    /// The provisional process is SIGKILLed through its retained pidfd and
+    /// reaped within the finite scheduler cleanup allowance; a pathological
+    /// uninterruptible straggler is left to the imminent VM reboot.
     NotAttached { reason: String, log_path: String },
 }
 
@@ -1384,8 +1369,8 @@ impl std::fmt::Display for SpawnSchedulerError {
                      reports the exit at the point it happened. Common causes are \
                      BPF verifier rejection (look for 'libbpf' / 'verifier' in the \
                      log), a scheduler userspace crash, or argv validation failure. \
-                     Log captured at {log_path}; SCHED_PID was cleared before this \
-                     error surfaced."
+                     Log captured at {log_path}; no current-process owner was \
+                     published before this error surfaced."
                 )
             }
             Self::NotAttached { reason, log_path } => {
@@ -1395,8 +1380,8 @@ impl std::fmt::Display for SpawnSchedulerError {
                      {reason}. The host charges the attempt in max-vCPU service, so \
                      host descheduling does not consume the allowance. Log captured \
                      at {log_path}; the framework terminated the unattached process \
-                     through its pinned pidfd and cleared SCHED_PID before surfacing \
-                     this error."
+                     through its pinned pidfd before surfacing this error; no \
+                     current-process owner was published."
                 )
             }
         }
@@ -1408,13 +1393,28 @@ impl std::error::Error for SpawnSchedulerError {}
 /// Scheduler spawn whose process identity is pinned from the attach observer
 /// through exit-monitor installation.
 pub(crate) struct SpawnedScheduler {
-    pub(crate) child: Child,
+    child: Option<Child>,
     pub(crate) log_path: String,
     pidfd: Option<OwnedFd>,
     attach_attempt: Option<SchedulerAttachAttempt>,
+    cleanup_wait_exhausted: bool,
 }
 
 impl SpawnedScheduler {
+    pub(crate) fn child_id(&self) -> Result<u32, String> {
+        self.child
+            .as_ref()
+            .map(Child::id)
+            .ok_or_else(|| "scheduler child ownership was already transferred".to_string())
+    }
+
+    pub(crate) fn attach_generation(&self) -> Result<u64, String> {
+        self.attach_attempt
+            .as_ref()
+            .map(|attempt| attempt.generation)
+            .ok_or_else(|| "scheduler attach attempt already finished".to_string())
+    }
+
     /// Duplicate the already-open pidfd for monitor ownership. This is a
     /// `dup`, not a second `pidfd_open`; `self` retains the original until
     /// monitor installation and completion publication both succeed.
@@ -1427,11 +1427,7 @@ impl SpawnedScheduler {
     }
 
     pub(crate) fn terminate_after_monitor_failure(&mut self) -> Result<(), String> {
-        let result = match self.pidfd.as_ref() {
-            Some(pidfd) => terminate_scheduler_via_pidfd(&mut self.child, pidfd),
-            None => Err("scheduler pidfd is unavailable".to_string()),
-        };
-        SCHED_PID.store(0, Ordering::Release);
+        let result = self.terminate_provisional_process();
         let attach_close = self.close_failed_attach_attempt();
         match (result, attach_close) {
             (Ok(()), Ok(())) => Ok(()),
@@ -1441,6 +1437,26 @@ impl SpawnedScheduler {
                 "{cleanup}; scheduler-attach terminal close failed: {close}"
             )),
         }
+    }
+
+    pub(crate) fn terminate_provisional_process(&mut self) -> Result<(), String> {
+        if self.cleanup_wait_exhausted {
+            return Err(
+                "provisional scheduler already exhausted its bounded exact cleanup wait"
+                    .to_string(),
+            );
+        }
+        let result = match (self.child.as_mut(), self.pidfd.as_ref()) {
+            (Some(child), Some(pidfd)) => terminate_scheduler_via_pidfd(child, pidfd),
+            (None, _) => Ok(()),
+            (Some(_), None) => Err("scheduler pidfd is unavailable".to_string()),
+        };
+        self.cleanup_wait_exhausted = result.is_err();
+        if result.is_ok() {
+            self.child.take();
+            self.pidfd.take();
+        }
+        result
     }
 
     /// Revalidate the retained process identity after the monitor thread is
@@ -1475,20 +1491,10 @@ impl SpawnedScheduler {
         Ok(())
     }
 
-    /// Close the host attach-budget overlay only after the caller installed
-    /// the handed-off pidfd in the scheduler-exit monitor.
-    pub(crate) fn finish_attach_attempt(&mut self) -> Result<(), String> {
-        self.attach_attempt
-            .take()
-            .ok_or_else(|| "scheduler attach attempt already finished".to_string())?
-            .finish_terminal()
-    }
-
     /// Publish Finished and wait for its exact host ACK while retaining the
     /// non-charging Finishing overlay. A later owner-commit step calls
     /// [`Self::settle_attach_attempt`] only after publishing the final process
     /// ownership state.
-    #[allow(dead_code)] // consumed by the single-owner commit handoff
     pub(crate) fn await_attach_finished_ack(&mut self) -> Result<(), String> {
         self.attach_attempt
             .as_mut()
@@ -1497,7 +1503,6 @@ impl SpawnedScheduler {
     }
 
     /// Reliably publish Settled after the exact Finished ACK was consumed.
-    #[allow(dead_code)] // consumed by the single-owner commit handoff
     pub(crate) fn settle_attach_attempt(&mut self) -> Result<(), String> {
         self.attach_attempt
             .take()
@@ -1513,58 +1518,80 @@ impl SpawnedScheduler {
             None => Ok(()),
         }
     }
-}
 
-fn terminate_scheduler_via_pidfd(child: &mut Child, pidfd: &OwnedFd) -> Result<(), String> {
-    // SAFETY: pidfd is the descriptor opened for this exact child; siginfo is
-    // null and flags zero per pidfd_send_signal(2).
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            pidfd.as_raw_fd(),
-            libc::SIGKILL,
-            std::ptr::null::<libc::siginfo_t>(),
-            0u32,
-        )
-    };
-    if rc < 0 {
-        let error = std::io::Error::last_os_error();
-        // ESRCH means the pinned task has already exited. The same pidfd still
-        // becomes readable and remains authoritative below.
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(format!("pidfd_send_signal(SIGKILL): {error}"));
-        }
+    pub(crate) fn finished_ack_consumed(&self) -> bool {
+        self.attach_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.terminal_phase == AttachTerminalPhase::FinishedAcked)
     }
 
-    loop {
-        let mut pfd = libc::pollfd {
-            fd: pidfd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one live pidfd and an indefinite, event-driven wait.
-        let poll_rc = unsafe { libc::poll(&mut pfd, 1, -1) };
-        if poll_rc < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
+    /// Transfer the exact child and original pidfd into the single live owner.
+    /// The attach-attempt token deliberately remains in `self` until the new
+    /// owner is published and its pending monitor is committed.
+    pub(crate) fn take_current_process(
+        &mut self,
+        scheduler: Option<&'static crate::test_support::SchedulerSpec>,
+        monitor: SchedExitStop,
+    ) -> Result<CurrentSchedulerProcess, String> {
+        let generation = self.attach_generation()?;
+        if self.child.is_none() {
+            return Err("scheduler child ownership was already transferred".to_string());
+        }
+        if self.pidfd.is_none() {
+            return Err("scheduler pidfd ownership was already transferred".to_string());
+        }
+        let child = self.child.take().expect("child presence validated above");
+        let pidfd = self.pidfd.take().expect("pidfd presence validated above");
+        Ok(CurrentSchedulerProcess {
+            generation,
+            child,
+            pidfd,
+            log_path: self.log_path.clone(),
+            scheduler,
+            monitor: Some(monitor),
+            drop_reap_exhausted: false,
+        })
+    }
+}
+
+impl Drop for SpawnedScheduler {
+    fn drop(&mut self) {
+        // A prior cleanup timeout consumed the one finite wait allowance.
+        // Preserve exact targeting with a final nonblocking pidfd signal, but
+        // never turn RAII disposal into a second teardown-sized stall.
+        let cleanup = match (
+            self.cleanup_wait_exhausted,
+            self.child.as_mut(),
+            self.pidfd.as_ref(),
+        ) {
+            (true, Some(child), Some(pidfd)) => {
+                let _ = pidfd_send_signal(pidfd, libc::SIGKILL);
+                let _ = child.try_wait();
+                Ok(())
             }
-            return Err(format!("wait for SIGKILLed scheduler pidfd: {error}"));
+            (false, Some(child), Some(pidfd)) => terminate_scheduler_via_pidfd(child, pidfd),
+            // Construction publishes Child and pidfd as one race-free pair.
+            // Seeing only the Child would mean a future edit split that
+            // invariant; never fall back to signaling its numeric pid.
+            (_, Some(_), None) => Err(
+                "provisional scheduler invariant broken: child exists without original pidfd"
+                    .to_string(),
+            ),
+            (_, None, _) => Ok(()),
+        };
+        if let Err(error) = cleanup {
+            tracing::error!(
+                error = %error,
+                log_path = self.log_path,
+                "failed to clean provisional scheduler process from Drop"
+            );
         }
-        if pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
-            return Err(format!(
-                "SIGKILLed scheduler pidfd returned unexpected poll events {:#x}",
-                pfd.revents
-            ));
-        }
-        if pfd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-            // SIGCHLD is ignored during boot and default during scenario Ops.
-            // `wait` reaps in the latter case and harmlessly returns ECHILD in
-            // the former; pidfd readiness already proved identity-specific
-            // exit either way.
-            let _ = child.wait();
-            return Ok(());
-        }
+        self.child.take();
+        self.pidfd.take();
+        // SchedulerAttachAttempt::Drop performs the deliberately bounded,
+        // idempotent one-shot emergency boundary. Normal paths explicitly
+        // close the full Finished/Ack/Settled protocol before reaching Drop.
+        self.attach_attempt.take();
     }
 }
 
@@ -1588,34 +1615,56 @@ static SCHED_FWD_THREADS: OnceLock<
 /// the child's complete output. Callers run AFTER the child was
 /// reaped, so EOF is already pending on both pipes and the wait is
 /// normally a few polls; the bound only trips if a forwarder wedges
-/// (e.g. blocked on virtio backpressure the host never drains), in
-/// which case the dump proceeds with whatever reached the file — the
-/// pre-streaming behavior for a torn-down VM. No-op when no forwarder
-/// was registered for the path (file-only fallback wiring, or a
-/// second dump of the same path).
-pub(crate) fn wait_sched_forwarders_drained(log_path: &str) {
+/// (e.g. blocked on virtio backpressure the host never drains). On that
+/// bound the handles remain registered and `false` makes the log transaction
+/// retryable; it never frames a knowingly incomplete file. No-op success when
+/// no forwarder was registered for the path (file-only fallback wiring, or a
+/// completed prior drain).
+pub(crate) fn wait_sched_forwarders_drained(log_path: &str) -> bool {
     use std::time::{Duration, Instant};
     const DRAIN_BOUND: Duration = Duration::from_secs(5);
     let Some(map) = SCHED_FWD_THREADS.get() else {
-        return;
-    };
-    let Some(handles) = map.lock().unwrap().remove(log_path) else {
-        return;
+        return true;
     };
     let deadline = Instant::now() + DRAIN_BOUND;
-    for h in handles {
-        while !h.is_finished() {
-            if Instant::now() >= deadline {
-                tracing::warn!(
-                    log_path,
-                    "scheduler stdio forwarders still draining at dump time; \
-                     the dumped log may be missing the child's final output"
-                );
-                return;
+    loop {
+        let (finished, all_drained) = {
+            let mut registry = map
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(handles) = registry.get_mut(log_path) else {
+                return true;
+            };
+            let mut finished = Vec::new();
+            let mut index = 0;
+            while index < handles.len() {
+                if handles[index].is_finished() {
+                    finished.push(handles.swap_remove(index));
+                } else {
+                    index += 1;
+                }
             }
-            std::thread::sleep(Duration::from_millis(2));
+            let all_drained = handles.is_empty();
+            if all_drained {
+                registry.remove(log_path);
+            }
+            (finished, all_drained)
+        };
+        for handle in finished {
+            let _ = handle.join();
         }
-        let _ = h.join();
+        if all_drained {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                log_path,
+                "scheduler stdio forwarders still draining at dump time; \
+                 retaining their handles so a later dump can retry"
+            );
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -1633,19 +1682,24 @@ pub(crate) fn wait_sched_forwarders_drained(log_path: &str) {
 /// drain — the thread reads to EOF so the pipe never wedges the child
 /// on backpressure.
 ///
-/// The handle is registered in [`SCHED_FWD_THREADS`] under `log_path`
-/// so the dump paths can wait for the drain to finish
-/// ([`wait_sched_forwarders_drained`]); a thread-spawn failure
-/// registers nothing and the stream is silently absent, same as the
-/// stdio forwarders in [`super::modes::redirect_stdio_to_bulk_port`].
+/// The caller registers the returned handle only after both stdout and stderr
+/// readers have spawned. This all-or-fallback handoff prevents a child from
+/// inheriting a pipe whose only reader failed to start (and then dying from
+/// SIGPIPE on its first diagnostic write).
 fn spawn_sched_log_forwarder(
     mut read_end: fs::File,
     mut log: Option<fs::File>,
-    log_path: &str,
     name: &'static str,
     sender: fn(&[u8]) -> bool,
-) {
-    let spawned = std::thread::Builder::new()
+    force_spawn_failure: bool,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    if force_spawn_failure {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "injected scheduler forwarder spawn failure",
+        ));
+    }
+    std::thread::Builder::new()
         .name(name.into())
         .spawn(move || {
             let mut buf = [0u8; STDIO_CHUNK_BYTES];
@@ -1662,16 +1716,7 @@ fn spawn_sched_log_forwarder(
                     Err(_) => break,
                 }
             }
-        });
-    if let Ok(handle) = spawned {
-        SCHED_FWD_THREADS
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap()
-            .entry(log_path.to_string())
-            .or_default()
-            .push(handle);
-    }
+        })
 }
 
 /// Build the `(stdout, stderr)` [`Stdio`] pair for the scheduler child,
@@ -1684,7 +1729,15 @@ fn spawn_sched_log_forwarder(
 /// plumbing must never fail the spawn — a lost live stream degrades to
 /// the prior teardown-only dump, it does not abort the scheduler.
 fn sched_child_stdio(log_file: Option<&fs::File>, log_path: &str) -> (Stdio, Stdio) {
-    if let Some(streamed) = try_stream_sched_stdio(log_file, log_path) {
+    sched_child_stdio_inner(log_file, log_path, None)
+}
+
+fn sched_child_stdio_inner(
+    log_file: Option<&fs::File>,
+    log_path: &str,
+    fail_forwarder: Option<usize>,
+) -> (Stdio, Stdio) {
+    if let Some(streamed) = try_stream_sched_stdio_inner(log_file, log_path, fail_forwarder) {
         return streamed;
     }
     // Fallback: file-only (both fds share the merged log's open file
@@ -1709,6 +1762,14 @@ fn sched_child_stdio(log_file: Option<&fs::File>, log_path: &str) -> (Stdio, Std
 /// parent's copies are closed by the spawn machinery, so the child is
 /// the sole holder and the forwarders' `read`s see EOF on child exit.
 fn try_stream_sched_stdio(log_file: Option<&fs::File>, log_path: &str) -> Option<(Stdio, Stdio)> {
+    try_stream_sched_stdio_inner(log_file, log_path, None)
+}
+
+fn try_stream_sched_stdio_inner(
+    log_file: Option<&fs::File>,
+    log_path: &str,
+    fail_forwarder: Option<usize>,
+) -> Option<(Stdio, Stdio)> {
     let (stdout_r, stdout_w) = super::modes::make_pipe()?;
     let (stderr_r, stderr_w) = super::modes::make_pipe()?;
     // Clone the merged log file per forwarder so both append through
@@ -1717,29 +1778,62 @@ fn try_stream_sched_stdio(log_file: Option<&fs::File>, log_path: &str) -> Option
     // stream; the live bulk-port ship still runs.
     let stdout_log = log_file.and_then(|f| f.try_clone().ok());
     let stderr_log = log_file.and_then(|f| f.try_clone().ok());
-    spawn_sched_log_forwarder(
+    let stdout_handle = match spawn_sched_log_forwarder(
         stdout_r,
         stdout_log,
-        log_path,
         "ktstr-sched-stdout-fwd",
         crate::vmm::guest_comms::send_sched_stdout_chunk,
-    );
-    spawn_sched_log_forwarder(
+        fail_forwarder == Some(0),
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            tracing::warn!(
+                log_path,
+                error = %error,
+                "scheduler stdout forwarder failed to spawn; using file-only stdio"
+            );
+            return None;
+        }
+    };
+    let stderr_handle = match spawn_sched_log_forwarder(
         stderr_r,
         stderr_log,
-        log_path,
         "ktstr-sched-stderr-fwd",
         crate::vmm::guest_comms::send_sched_stderr_chunk,
-    );
+        fail_forwarder == Some(1),
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            // Closing both write ends produces EOF for the one live reader
+            // before joining it. Only then may the caller clone the regular
+            // file descriptors for its fallback child wiring.
+            drop(stdout_w);
+            drop(stderr_w);
+            let _ = stdout_handle.join();
+            tracing::warn!(
+                log_path,
+                error = %error,
+                "scheduler stderr forwarder failed to spawn; using file-only stdio"
+            );
+            return None;
+        }
+    };
+    SCHED_FWD_THREADS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(log_path.to_string())
+        .or_default()
+        .extend([stdout_handle, stderr_handle]);
     Some((Stdio::from(stdout_w), Stdio::from(stderr_w)))
 }
 
 /// Pure spawn helper — runs the spawn → poll-startup → poll-attached
 /// pipeline and returns a `Result` so callers can choose how to
 /// handle each failure mode. The boot path uniformly responds with
-/// `dump_sched_output` + `send_lifecycle` + `force_reboot`; the
-/// scheduler-lifecycle Op dispatch surfaces each `Err` variant as
-/// a typed test-failure rather than rebooting the VM.
+/// `dump_sched_output_before_terminal` + `send_lifecycle` +
+/// `force_reboot`; the scheduler-lifecycle Op dispatch surfaces each
+/// `Err` variant as a typed test-failure rather than rebooting the VM.
 ///
 /// `Ok(None)` means the binary file is missing — the caller decides
 /// whether that is a degenerate-but-acceptable state (boot path:
@@ -1796,14 +1890,14 @@ pub(crate) fn try_spawn_scheduler(
         )))
     })?;
 
-    let mut child = match Command::new(binary_path)
+    let mut command = Command::new(binary_path);
+    command
         .args(&args)
         .env("RUST_LOG", &sched_rust_log)
         .stdout(stdout)
-        .stderr(stderr)
-        .spawn()
-    {
-        Ok(child) => child,
+        .stderr(stderr);
+    let (child, pidfd) = match spawn_with_pidfd(&mut command) {
+        Ok(process) => process,
         Err(error) => {
             let kind = error.kind();
             let close = attempt.close_terminal();
@@ -1818,76 +1912,45 @@ pub(crate) fn try_spawn_scheduler(
         }
     };
 
-    // Publish the scheduler PID via the [`SCHED_PID`] atomic side
-    // channel — readers retrieve it through [`sched_pid`]. The
-    // previous implementation called `std::env::set_var("SCHED_PID",
-    // ...)` here, but the Phase A probe thread spawned earlier in
-    // `ktstr_guest_init` (`start_probe_phase_a`) is alive at this
-    // point, so mutating glibc's global `__environ` array races
-    // with the probe thread's potential `getenv`/`execve` traffic
-    // — documented UB on Linux. The atomic store is data-race-free
-    // and the published value reaches readers via the same
-    // `Acquire`/`Release` synchronisation the [`sched_pid`] reader
-    // uses.
-    //
-    // The `child.id()` value fits in `i32` because Linux pids are
-    // `pid_t` (signed 32-bit on every supported arch).
-    // `kernel.pid_max` is a 22-bit limit by default and the kernel
-    // never returns negative pids from `fork(2)`, so the cast is
-    // exact.
-    SCHED_PID.store(child.id() as i32, Ordering::Release);
-
-    let pidfd = match open_scheduler_pidfd(child.id()) {
-        Ok(pidfd) => pidfd,
-        Err(ScxAttachStatus::Died) => {
-            if let Err(error) = attempt.close_terminal() {
-                tracing::error!(
-                    error = %error,
-                    "failed to close scheduler-attach generation after pre-pidfd death"
-                );
-            }
-            SCHED_PID.store(0, Ordering::Release);
-            return Err(SpawnSchedulerError::StartupDied {
-                log_path: log_path.to_string(),
-            });
-        }
-        Err(status) => {
-            let mut reason = match status {
-                ScxAttachStatus::ObserverError(error) => {
-                    format!("cause=observer-error detail={error:?}")
-                }
-                _ => unreachable!("pidfd open returns only Died or ObserverError"),
-            };
-            if let Err(error) = attempt.close_terminal() {
-                reason.push_str(&format!(" attach_close_error={error:?}"));
-            }
-            SCHED_PID.store(0, Ordering::Release);
-            return Err(SpawnSchedulerError::NotAttached {
-                reason,
-                log_path: log_path.to_string(),
-            });
-        }
+    // From this edge onward every early return and unwind is owned by the
+    // same provisional RAII record. It cannot publish into the live owner
+    // until attach, FinishedAck, and monitor commit all succeed.
+    let mut provisional = SpawnedScheduler {
+        child: Some(child),
+        log_path: log_path.to_string(),
+        pidfd: Some(pidfd),
+        attach_attempt: Some(attempt),
+        cleanup_wait_exhausted: false,
     };
+    let child_id = provisional
+        .child_id()
+        .expect("new provisional spawn owns its child");
 
+    let attempt = provisional
+        .attach_attempt
+        .take()
+        .expect("provisional spawn owns attach attempt");
+    let pidfd = provisional
+        .pidfd
+        .take()
+        .expect("race-free spawn owns its original pidfd");
     let (status, pidfd, attempt) = poll_scx_attached(pidfd, attempt);
+    // Restore the observer's exact descriptor to the provisional owner before
+    // branching. Every terminal/error return then has the same RAII cleanup
+    // identity, including scheduler-death and bounded-cleanup failures.
+    provisional.pidfd = Some(pidfd);
     match status {
-        ScxAttachStatus::Attached => Ok(Some(SpawnedScheduler {
-            child,
-            log_path: log_path.to_string(),
-            pidfd: Some(pidfd),
-            attach_attempt: Some(attempt),
-        })),
+        ScxAttachStatus::Attached => {
+            provisional.attach_attempt = Some(attempt);
+            Ok(Some(provisional))
+        }
         ScxAttachStatus::Died => {
-            // The dead child is auto-reaped under SIGCHLD=SIG_IGN. SCHED_PID
-            // was published optimistically at spawn; clear it before any
-            // caller can install an exit monitor against the stale pid.
             if let Err(error) = attempt.close_terminal() {
                 tracing::error!(
                     error = %error,
                     "failed to close scheduler-attach generation after scheduler death"
                 );
             }
-            SCHED_PID.store(0, Ordering::Release);
             Err(SpawnSchedulerError::StartupDied {
                 log_path: log_path.to_string(),
             })
@@ -1903,7 +1966,7 @@ pub(crate) fn try_spawn_scheduler(
                 ScxAttachStatus::Attached | ScxAttachStatus::Died => unreachable!(),
             };
             tracing::warn!(
-                pid = child.id(),
+                pid = child_id,
                 reason,
                 "scheduler did not complete sched_ext attach"
             );
@@ -1911,9 +1974,9 @@ pub(crate) fn try_spawn_scheduler(
             // The process is still alive but not attached. Signal and wait on
             // the exact pidfd retained by the observer so PID reuse can never
             // redirect cleanup to another process.
-            if let Err(cleanup_error) = terminate_scheduler_via_pidfd(&mut child, &pidfd) {
+            if let Err(cleanup_error) = provisional.terminate_provisional_process() {
                 tracing::error!(
-                    pid = child.id(),
+                    pid = child_id,
                     error = %cleanup_error,
                     "failed to prove unattached scheduler cleanup through pidfd"
                 );
@@ -1922,7 +1985,6 @@ pub(crate) fn try_spawn_scheduler(
             if let Err(close_error) = attempt.close_terminal() {
                 reason.push_str(&format!(" attach_close_error={close_error:?}"));
             }
-            SCHED_PID.store(0, Ordering::Release);
             Err(SpawnSchedulerError::NotAttached {
                 reason,
                 log_path: log_path.to_string(),
@@ -1983,9 +2045,7 @@ pub(crate) fn spawn_scheduler_from_paths(
             // host's `parse_sched_output` returns the spawn-
             // failure diagnostic exactly as the prior COM2 path
             // did.
-            crate::vmm::guest_comms::send_sched_log(crate::verifier::SCHED_OUTPUT_START.as_bytes());
-            send_sched_log_text(&format!("failed to spawn: {e}"));
-            crate::vmm::guest_comms::send_sched_log(crate::verifier::SCHED_OUTPUT_END.as_bytes());
+            let _ = send_synthetic_sched_output_before_terminal(&format!("failed to spawn: {e}"));
             crate::vmm::guest_comms::send_lifecycle(
                 crate::vmm::wire::LifecyclePhase::SchedulerDied,
                 "",
@@ -2004,7 +2064,7 @@ pub(crate) fn spawn_scheduler_from_paths(
             // travel verbatim inside the chunk bytes so the
             // host's `parse_sched_output` walker keeps working
             // unchanged.
-            dump_sched_output(&log_path);
+            let _ = dump_sched_output_before_terminal(&log_path);
             crate::vmm::guest_comms::send_lifecycle(
                 crate::vmm::wire::LifecyclePhase::SchedulerDied,
                 "",
@@ -2014,7 +2074,7 @@ pub(crate) fn spawn_scheduler_from_paths(
             force_reboot();
         }
         Err(SpawnSchedulerError::NotAttached { reason, log_path }) => {
-            dump_sched_output(&log_path);
+            let _ = dump_sched_output_before_terminal(&log_path);
             crate::vmm::guest_comms::send_lifecycle(
                 crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
                 &reason,
@@ -2029,6 +2089,53 @@ pub(crate) fn spawn_scheduler_from_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn either_forwarder_spawn_failure_uses_file_fds_without_sigpipe() {
+        let dir = tempfile::tempdir().expect("create scheduler stdio tempdir");
+        for failed_reader in [0, 1] {
+            let path = dir.path().join(format!("sched-{failed_reader}.log"));
+            let log = fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("open scheduler log");
+            let path_string = path.to_string_lossy().into_owned();
+            let (stdout, stderr) =
+                sched_child_stdio_inner(Some(&log), &path_string, Some(failed_reader));
+
+            let status = Command::new("/bin/sh")
+                .args(["-c", "printf 'fallback survived\\n' >&2"])
+                .stdout(stdout)
+                .stderr(stderr)
+                .status()
+                .expect("spawn fallback-wired child");
+            assert!(
+                status.success(),
+                "reader {failed_reader} spawn failure left pipe-backed child stdio: {status}"
+            );
+            drop(log);
+            assert_eq!(
+                fs::read(&path).expect("read scheduler fallback log"),
+                b"fallback survived\n"
+            );
+            assert!(
+                SCHED_FWD_THREADS
+                    .get()
+                    .and_then(|threads| {
+                        threads
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .get(&path_string)
+                            .map(Vec::len)
+                    })
+                    .is_none(),
+                "partial forwarder setup must not publish a drain registry entry"
+            );
+        }
+    }
 
     #[test]
     fn attach_control_snapshot_matches_exact_generation_and_retains_cause() {

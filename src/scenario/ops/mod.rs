@@ -94,7 +94,9 @@ use anyhow::{Context, Result};
 
 use crate::assert::AssertResult;
 use crate::scenario::backdrop;
-use crate::scenario::{CgroupGroup, Ctx, process_alive};
+#[cfg(test)]
+use crate::scenario::process_alive;
+use crate::scenario::{CgroupGroup, Ctx};
 use crate::vmm::guest_comms;
 use crate::vmm::wire::StimulusPayload;
 use crate::workload::{MemPolicy, WorkloadHandle};
@@ -550,22 +552,36 @@ fn sched_died_detail_kind() -> crate::assert::DetailKind {
     }
 }
 
+#[cfg(not(test))]
+fn scheduler_process_died() -> Option<bool> {
+    match crate::vmm::rust_init::current_scheduler_liveness() {
+        Ok(Some(alive)) => Some(!alive),
+        Ok(None) => None,
+        // An unusable retained pidfd cannot prove scheduler liveness; fail
+        // closed exactly like the prior process probe.
+        Err(_) => Some(true),
+    }
+}
+
+#[cfg(test)]
+fn scheduler_process_died() -> Option<bool> {
+    crate::vmm::rust_init::sched_pid().map(|pid| !process_alive(pid))
+}
+
 /// Classify scheduler liveness for the guest-side `survives_storm` probe:
-/// `Some(kind)` when a scheduler is still expected to run (`sched_pid` set) but
-/// has died or gone down — the leader pid ESRCH'd OR the scx state reads
+/// `Some(kind)` when a scheduler is still expected to run but has died or gone
+/// down — its retained pidfd is terminal OR the scx state reads
 /// `disabling`/`disabled` ([`dispatch::scx_down`]) — and `None` otherwise.
 ///
 /// Mirrors the inter-step / post-loop liveness gate `run_scenario` runs for
-/// `execute_*` scenarios (`!process_alive(pid) || dispatch::scx_down()`, gated
-/// on `sched_pid()` being set), so a clean `Op::DetachScheduler` — which clears
-/// the pid before this would observe `disabled` — does not trip it. The kind
+/// `execute_*` scenarios, so a clean `Op::DetachScheduler` — which removes the
+/// owner before this would observe `disabled` — does not trip it. The kind
 /// comes from [`sched_died_detail_kind`]; in the primary test VM the BPF
 /// err-exit latch is unread, so the kind is
 /// [`crate::assert::DetailKind::SchedulerDiedUnknownReason`] (the scx state is
 /// kind-less — a crash and a clean unregister both read `disabling`/`disabled`).
 pub(crate) fn sched_liveness_failure_kind() -> Option<crate::assert::DetailKind> {
-    let pid = crate::vmm::rust_init::sched_pid()?;
-    if !process_alive(pid) || dispatch::scx_down() {
+    if scheduler_process_died().is_some_and(|died| died || dispatch::scx_down()) {
         Some(sched_died_detail_kind())
     } else {
         None
@@ -1062,8 +1078,7 @@ fn finish_scenario(
     // sched_pid() == None ⇒ no scheduler configured (kernel-default
     // path) OR Op::DetachScheduler cleared it; no liveness to
     // report on either case.
-    let sched_dead = crate::vmm::rust_init::sched_pid()
-        .is_some_and(|pid| !process_alive(pid) || dispatch::scx_down());
+    let sched_dead = scheduler_process_died().is_some_and(|died| died || dispatch::scx_down());
 
     // Scheduler died after the last hold: SIGKILL the backdrop
     // workers up front so the teardown reap below isn't
@@ -1186,16 +1201,13 @@ fn run_scenario(
         // Live `crate::vmm::rust_init::sched_pid()` read instead of
         // `ctx.sched_pid` snapshot so a mid-scenario
         // `Op::ReplaceScheduler` swap is reflected — the swap
-        // dispatcher publishes the new child's pid to `SCHED_PID`
-        // via the `SCHED_PID.store` in `try_spawn_scheduler`, and
-        // this check then observes the new pid's liveness (not the
-        // dead boot pid). `None` means
+        // dispatcher atomically publishes the replacement's coherent
+        // process owner, and this check then observes the new pid's
+        // liveness (not the dead boot pid). `None` means
         // either no scheduler was configured at boot or
         // `Op::DetachScheduler` cleared the pid; the liveness probe
         // cannot meaningfully report on a pid that doesn't exist.
-        if step_idx > 0
-            && let Some(pid) = crate::vmm::rust_init::sched_pid()
-            && (!process_alive(pid) || dispatch::scx_down())
+        if step_idx > 0 && scheduler_process_died().is_some_and(|died| died || dispatch::scx_down())
         {
             // Scheduler died between steps: the kernel has disabled
             // sched_ext and the backdrop workers have fallen back to
@@ -1430,7 +1442,9 @@ fn hold_or_sched_died(
 ) -> bool {
     use crate::probe::process::{SchedExitKind, sched_exit_kind};
     use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
-    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+    use std::os::fd::AsFd;
+    #[cfg(test)]
+    use std::os::fd::{FromRawFd, OwnedFd};
 
     // The BPF err-exit latch (read via `sched_exit_kind`) flips at the
     // error-class sched_ext exit — i.e. at the crash, before the crashed
@@ -1444,16 +1458,53 @@ fn hold_or_sched_died(
     const ERR_EXIT_POLL: Duration = Duration::from_millis(100);
     let crashed = || matches!(sched_exit_kind(), SchedExitKind::Crashed);
 
+    // Clone the pidfd retained by the coherent scheduler owner while its lock
+    // is held. Reopening `sched_pid` after the lock is released would recreate
+    // the numeric-PID reuse race that the owner record exists to eliminate.
+    let exact_scheduler = match crate::vmm::rust_init::clone_current_scheduler_pidfd() {
+        Ok(identity) => identity,
+        Err(error) => panic_evented_hold_defect(
+            "dup(current scheduler pidfd)",
+            sched_pid.unwrap_or(-1),
+            error,
+            "the owner retains a live pidfd; dup failure indicates fd exhaustion",
+        ),
+    };
+    #[cfg(test)]
+    let exact_scheduler = match (exact_scheduler, sched_pid) {
+        (Some(identity), _) => Some(identity),
+        (None, Some(pid)) => {
+            // Host unit tests inject a synthetic pid without installing the
+            // guest-only process owner. Keep that seam test-only.
+            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) as libc::c_int };
+            if raw < 0 {
+                None
+            } else {
+                Some((pid, unsafe { OwnedFd::from_raw_fd(raw) }))
+            }
+        }
+        (None, None) => None,
+    };
+    #[cfg(not(test))]
+    if sched_pid.is_some() && exact_scheduler.is_none() {
+        // The caller observed an owner immediately before this clone and a
+        // concurrent orderly transition removed it. Treat that exact owner as
+        // terminal rather than opening whichever task now owns the old number.
+        return true;
+    }
+
     if dur.is_zero() {
         if let Some(heartbeat) = workload_heartbeat {
             heartbeat.publish();
         }
         return crashed()
-            || (sched_pid.is_some() && dispatch::scx_down())
-            || sched_pid.is_some_and(|pid| !process_alive(pid));
+            || (exact_scheduler.is_some() && dispatch::scx_down())
+            || exact_scheduler.as_ref().is_some_and(|(_, pidfd)| {
+                !matches!(crate::vmm::rust_init::pidfd_is_alive(pidfd), Ok(true))
+            });
     }
     let deadline = std::time::Instant::now() + dur;
-    let Some(pid) = sched_pid else {
+    let Some((pid, pidfd)) = exact_scheduler else {
         // No scheduler pid (host-only run, or the pid was not recorded):
         // no pidfd to wait on, but the err-exit latch still fires on a
         // crash — poll it in short intervals instead of sleeping blind
@@ -1472,38 +1523,6 @@ fn hold_or_sched_died(
             thread::sleep(remaining.min(ERR_EXIT_POLL));
         }
     };
-
-    // `pidfd_open(pid, 0)`: returns an fd that becomes readable when
-    // the pid exits. Only meaningful on a thread-group leader, which
-    // every `sched_pid` already is (it is the scheduler binary's
-    // top-level pid as recorded in `Ctx::sched_pid`). No
-    // `PIDFD_NONBLOCK` flag — epoll is the gate.
-    let pidfd_raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0i32) };
-    if pidfd_raw < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ESRCH) {
-            // pidfd_open observed the pid as gone before we could
-            // even attach a waiter — sched is already dead.
-            return true;
-        }
-        // pidfd_open shipped unconditionally in Linux 5.3 and ktstr's
-        // kernel floor is well above that. A non-ESRCH failure (ENOMEM,
-        // ENFILE, EPERM) means the test environment is broken in a way
-        // polling cannot recover from. Panic loudly so the operator
-        // sees the env defect instead of silently losing sched-died
-        // detection for the rest of the hold.
-        panic_evented_hold_defect(
-            "pidfd_open",
-            pid,
-            format_args!("{err} (errno {:?})", err.raw_os_error()),
-            "pidfd_open is unconditional from Linux 5.3; failure on a \
-             5.3+ kernel = env defect — check ulimit -n / memory pressure / \
-             cgroup pids.max",
-        );
-    }
-    // SAFETY: the syscall succeeded and returned a fresh fd; it is
-    // not registered with any other owner.
-    let pidfd: OwnedFd = unsafe { OwnedFd::from_raw_fd(pidfd_raw as i32) };
 
     // epoll setup. EPOLL_CLOEXEC matches `wait_with_deadline` to
     // avoid leaking the epoll fd into any post-fork descendant.
@@ -1547,7 +1566,9 @@ fn hold_or_sched_died(
             // `epoll_wait` return and the deadline check (e.g. during
             // EINTR re-entry). `pid` is `Some` here, so the
             // scheduler-expected guard for `scx_down` is satisfied.
-            return crashed() || dispatch::scx_down() || !process_alive(pid);
+            return crashed()
+                || dispatch::scx_down()
+                || !matches!(crate::vmm::rust_init::pidfd_is_alive(&pidfd), Ok(true));
         }
 
         // Abort at the crash, not at the lingering process exit. Two

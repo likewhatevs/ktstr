@@ -251,11 +251,11 @@ pub(crate) fn resolve_one(
             let dir = canonicalize_cache_dir(cache_dir);
             // Extract a discriminating label from the cache key —
             // tarball keys yield the version prefix
-            // (`6.14.2-tarball-…` → `6.14.2`), git keys yield the
-            // ref (`for-next-git-…` → `for-next`), local keys yield
-            // `local_{hash6}` (or `local_unknown` for non-git
-            // trees). See [`cache_key_to_version_label`] for the
-            // full per-shape contract and fallback behavior.
+            // (`6.14.2-tarball-…` → `6.14.2`), content-addressed git
+            // keys yield a compact kind/ref-hash label, and local keys
+            // yield `local_{hash6}` (or `local_unknown` for non-git
+            // trees). See [`cache_key_to_version_label`] for the full
+            // per-shape contract and fallback behavior.
             let label = cache_key_to_version_label(key).to_string();
             Ok((label, dir))
         }
@@ -357,8 +357,9 @@ pub(crate) fn resolve_one(
 ///   don't collide).
 /// - Version / Range expansion → the version string verbatim
 ///   (e.g. `6.14.2`, `6.15-rc3`).
-/// - CacheKey → the version prefix (everything before the first
-///   `-tarball-` / `-git-` / `-local-` component).
+/// - CacheKey → the compact semantic label produced by
+///   `cache_key_to_version_label` for tarball, content-addressed git,
+///   and local key shapes.
 /// - Git → `git_{owner}_{repo}_{kind}_{ref}` extracted from the URL,
 ///   the ref kind (tag/branch/sha), and the git ref.
 ///
@@ -407,13 +408,13 @@ pub(crate) fn resolve_kernel_set(
 ///   - Range → fetch releases.json once, then per-version
 ///     cache lookup → maybe download + build for each
 ///     expanded version.
-///   - Git → resolve the commit (kind-directed ls-remote) → cache
-///     lookup → GitHub codeload snapshot or non-GitHub shallow
-///     clone → maybe build.
+///   - Git branch/tag → one exact-ref gix prepare → content-cache /
+///     builder election → receive only for the winner → maybe build.
+///     An explicit GitHub SHA uses codeload.
 ///
 /// Two phases of work happen behind the per-spec resolvers:
-/// (1) network I/O — kernel.org tarball download, a GitHub codeload
-///     snapshot, or a `git_clone` shallow fetch — which is
+/// (1) network I/O — kernel.org tarball download, an explicit-SHA
+///     GitHub codeload snapshot, or an exact-ref gix shallow fetch — which is
 ///     independent across specs and overlaps freely.
 /// (2) build — `make -j$(nproc)` invoked under an LLC flock
 ///     plus a cgroup v2 sandbox (`acquire_build_reservation`

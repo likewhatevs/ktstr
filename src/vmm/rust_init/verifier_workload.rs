@@ -103,7 +103,7 @@ fn dispatch_completion_is_valid(
 /// Run the SpinWait probe and, on confirmed dispatch by a scheduler that
 /// remains alive and enabled, emit [`LifecyclePhase::WorkloadDispatched`].
 /// Returns true only when that terminal success edge was emitted.
-pub(crate) fn run_and_confirm_dispatch(sched_child: Option<&mut std::process::Child>) -> bool {
+pub(crate) fn run_and_confirm_dispatch() -> bool {
     let workers = super::topology::count_online_cpus().unwrap_or(1).max(1) as usize;
     let cfg = WorkloadConfig::default()
         .work_type(WorkType::SpinWait)
@@ -177,7 +177,11 @@ pub(crate) fn run_and_confirm_dispatch(sched_child: Option<&mut std::process::Ch
     // through the kernel fallback. Re-check the child and kernel state at
     // the same edge as worker progress so those two moments cannot be
     // composed into a false PASS.
-    let scheduler_alive = sched_child.is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+    // Liveness comes from the original pidfd in the one current-process
+    // owner. This deliberately does not call Child::try_wait: Phase 6 must
+    // consume the terminal wait status exactly once to distinguish a natural
+    // scheduler exit from ktstr's intentional verifier-cleanup SIGKILL.
+    let scheduler_alive = matches!(super::current_scheduler_alive(), Ok(true));
     let state = scx_state();
     if dispatch_completion_is_valid(&reports, scheduler_alive, state) {
         crate::vmm::guest_comms::send_lifecycle(LifecyclePhase::WorkloadDispatched, "");
