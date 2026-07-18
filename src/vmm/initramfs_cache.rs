@@ -27,7 +27,7 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Arc;
@@ -394,6 +394,8 @@ const PREPARED_CAS_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 const PREPARED_CAS_GC_INTERVAL_SECS: u64 = 60 * 60;
 const FILE_DIGEST_MAGIC: &[u8; 8] = b"KTSTRDG\0";
 const FILE_DIGEST_RECORD_LEN: usize = 88;
+const PREPARED_VALIDATION_MAGIC: &[u8; 8] = b"KTSTRPV\0";
+const PREPARED_VALIDATION_RECORD_LEN: usize = 128;
 const COVERAGE_PROBE_MAGIC: &[u8; 8] = b"KTSTRCV\0";
 const COVERAGE_PROBE_RECORD_LEN: usize = 48;
 const CLOSURE_RECORD_MAGIC: &[u8; 8] = b"KTSTRCL\0";
@@ -800,7 +802,7 @@ fn hash_pinned_file(file: &File, identity: StableFileIdentity) -> Result<u64> {
     // this streaming read, so a fixed-size pread buffer is cheap and safe.
     let mut hasher = fixed_hasher();
     let mut offset = 0u64;
-    let mut buffer = vec![0u8; 1 << 20];
+    let mut buffer = vec![0u8; padded_payload_len.min(1 << 20)];
     while offset < identity.size {
         let remaining = usize::try_from((identity.size - offset).min(buffer.len() as u64))?;
         let read = file
@@ -1888,6 +1890,350 @@ fn prepared_object_lock_path(root: &Path, kind: PreparedObjectKind, key: u64) ->
         .join(format!("{}-{key:016x}.lock", kind.stem()))
 }
 
+fn prepared_validation_key(kind: PreparedObjectKind, object_key: u64) -> u64 {
+    let mut hasher = fixed_hasher();
+    hash_len_prefixed(&mut hasher, b"ktstr-prepared-payload-validation");
+    hash_u32(&mut hasher, PREPARED_CAS_SCHEMA);
+    hash_u8(&mut hasher, kind as u8);
+    hash_u64(&mut hasher, object_key);
+    hasher.finish()
+}
+
+fn prepared_validation_record_path(
+    root: &Path,
+    kind: PreparedObjectKind,
+    object_key: u64,
+) -> PathBuf {
+    let key = prepared_validation_key(kind, object_key);
+    root.join(PREPARED_DIGESTS_DIR)
+        .join(format!("{key:016x}.validation"))
+}
+
+fn prepared_validation_lock_path(
+    root: &Path,
+    kind: PreparedObjectKind,
+    object_key: u64,
+) -> PathBuf {
+    let key = prepared_validation_key(kind, object_key);
+    root.join(PREPARED_LOCKS_DIR)
+        .join(format!("validation-{key:016x}.lock"))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PreparedPayloadValidation {
+    payload_hash: u64,
+    padding_is_zero: bool,
+}
+
+fn read_prepared_validation_record(
+    record_path: &Path,
+    header: PreparedObjectHeader,
+    identity: StableFileIdentity,
+    data_offset: usize,
+) -> Result<Option<PreparedPayloadValidation>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(record_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "read prepared-object validation memo {}",
+                    record_path.display()
+                )
+            });
+        }
+    };
+    let metadata = file.metadata().with_context(|| {
+        format!(
+            "stat prepared-object validation memo {}",
+            record_path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "prepared-object validation memo is not a regular file: {}",
+        record_path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() == PREPARED_VALIDATION_RECORD_LEN as u64,
+        "prepared-object validation memo has invalid length {}: {}",
+        metadata.len(),
+        record_path.display()
+    );
+    let mut bytes = [0u8; PREPARED_VALIDATION_RECORD_LEN];
+    let mut done = 0usize;
+    while done < bytes.len() {
+        let read = loop {
+            match file.read_at(&mut bytes[done..], done as u64) {
+                Ok(read) => break read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "read prepared-object validation memo {}",
+                            record_path.display()
+                        )
+                    });
+                }
+            }
+        };
+        anyhow::ensure!(
+            read > 0,
+            "prepared-object validation memo was truncated while reading: {}",
+            record_path.display()
+        );
+        done += read;
+    }
+    anyhow::ensure!(
+        &bytes[..8] == PREPARED_VALIDATION_MAGIC,
+        "prepared-object validation memo magic mismatch"
+    );
+    anyhow::ensure!(
+        u32::from_le_bytes(bytes[8..12].try_into().unwrap()) == PREPARED_CAS_SCHEMA,
+        "prepared-object validation memo schema mismatch"
+    );
+    anyhow::ensure!(
+        bytes[13] & !1 == 0
+            && bytes[14..16] == [0; 2]
+            && bytes[112..].iter().all(|byte| *byte == 0),
+        "prepared-object validation memo reserved bytes changed"
+    );
+    let recorded_checksum = u64::from_le_bytes(bytes[104..112].try_into().unwrap());
+    let mut canonical = bytes;
+    canonical[104..112].fill(0);
+    anyhow::ensure!(
+        ahash_bytes(&canonical) == recorded_checksum,
+        "prepared-object validation memo checksum mismatch"
+    );
+    anyhow::ensure!(
+        PreparedObjectKind::from_tag(canonical[12])? == header.kind
+            && u64::from_le_bytes(canonical[16..24].try_into().unwrap()) == header.key,
+        "prepared-object validation memo recipe mismatch"
+    );
+
+    let recorded_identity = StableFileIdentity::decode(&canonical[24..80])?;
+    if recorded_identity != identity {
+        // The same semantic recipe may be rebuilt after GC. Its fixed memo
+        // path then names the previous immutable inode revision, which is a
+        // normal cache miss rather than a record collision.
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        u64::from_le_bytes(canonical[80..88].try_into().unwrap()) == u64::try_from(data_offset)?
+            && u64::from_le_bytes(canonical[88..96].try_into().unwrap()) == header.payload_len,
+        "prepared-object validation memo payload geometry mismatch"
+    );
+    Ok(Some(PreparedPayloadValidation {
+        payload_hash: u64::from_le_bytes(canonical[96..104].try_into().unwrap()),
+        padding_is_zero: canonical[13] & 1 != 0,
+    }))
+}
+
+fn publish_prepared_validation_record(
+    root: &Path,
+    header: PreparedObjectHeader,
+    identity: StableFileIdentity,
+    data_offset: usize,
+    validation: PreparedPayloadValidation,
+) -> Result<()> {
+    let validation_key = prepared_validation_key(header.kind, header.key);
+    let record_path = prepared_validation_record_path(root, header.kind, header.key);
+    let mut bytes = Vec::with_capacity(PREPARED_VALIDATION_RECORD_LEN);
+    bytes.extend_from_slice(PREPARED_VALIDATION_MAGIC);
+    bytes.extend_from_slice(&PREPARED_CAS_SCHEMA.to_le_bytes());
+    bytes.push(header.kind as u8);
+    bytes.push(u8::from(validation.padding_is_zero));
+    bytes.extend_from_slice(&[0; 2]);
+    bytes.extend_from_slice(&header.key.to_le_bytes());
+    identity.encode(&mut bytes);
+    bytes.extend_from_slice(&u64::try_from(data_offset)?.to_le_bytes());
+    bytes.extend_from_slice(&header.payload_len.to_le_bytes());
+    bytes.extend_from_slice(&validation.payload_hash.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&[0; 16]);
+    debug_assert_eq!(bytes.len(), PREPARED_VALIDATION_RECORD_LEN);
+    let checksum = ahash_bytes(&bytes);
+    bytes[104..112].copy_from_slice(&checksum.to_le_bytes());
+
+    let mut temp = tempfile::Builder::new()
+        .prefix(&format!(".tmp-validation-{validation_key:016x}-"))
+        .tempfile_in(root.join(PREPARED_DIGESTS_DIR))
+        .context("create prepared-object validation memo temp")?;
+    temp.write_all(&bytes)
+        .context("write prepared-object validation memo")?;
+    temp.as_file()
+        .sync_all()
+        .context("sync prepared-object validation memo")?;
+    temp.persist(&record_path)
+        .map_err(|error| error.error)
+        .with_context(|| {
+            format!(
+                "publish prepared-object validation memo {}",
+                record_path.display()
+            )
+        })?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn note_prepared_payload_hash_for_test() -> Result<()> {
+    use std::io::Write as _;
+
+    let Some(counter) = std::env::var_os("KTSTR_PREPARED_VALIDATION_COUNTER").map(PathBuf::from)
+    else {
+        return Ok(());
+    };
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&counter)
+        .with_context(|| format!("open prepared validation counter {}", counter.display()))?;
+    writeln!(file, "{}", std::process::id()).context("write prepared validation counter")?;
+    file.sync_all()
+        .context("sync prepared validation counter")?;
+    Ok(())
+}
+
+fn hash_prepared_payload(
+    file: &File,
+    identity: StableFileIdentity,
+    data_offset: usize,
+    payload_len: usize,
+    padded_payload_len: usize,
+) -> Result<PreparedPayloadValidation> {
+    let before = StableFileIdentity::from_file(file)?;
+    anyhow::ensure!(
+        before == identity,
+        "prepared object changed before payload validation"
+    );
+    #[cfg(test)]
+    note_prepared_payload_hash_for_test()?;
+
+    let mut hasher = fixed_hasher();
+    let mut done = 0usize;
+    let mut padding_is_zero = true;
+    let mut buffer = vec![0u8; 1 << 20];
+    while done < padded_payload_len {
+        let remaining = (padded_payload_len - done).min(buffer.len());
+        let file_offset = data_offset
+            .checked_add(done)
+            .context("prepared payload validation offset overflow")?;
+        let read = loop {
+            match file.read_at(&mut buffer[..remaining], u64::try_from(file_offset)?) {
+                Ok(read) => break read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(error).context("pread prepared object payload for validation");
+                }
+            }
+        };
+        anyhow::ensure!(
+            read > 0,
+            "prepared object was truncated while validating its payload"
+        );
+        let payload_bytes = payload_len.saturating_sub(done).min(read);
+        hasher.write(&buffer[..payload_bytes]);
+        padding_is_zero &= buffer[payload_bytes..read].iter().all(|byte| *byte == 0);
+        done = done
+            .checked_add(read)
+            .context("prepared payload validation length overflow")?;
+    }
+    let digest = hasher.finish();
+    let after = StableFileIdentity::from_file(file)?;
+    anyhow::ensure!(
+        after == identity,
+        "prepared object changed while validating its payload"
+    );
+    Ok(PreparedPayloadValidation {
+        payload_hash: digest,
+        padding_is_zero,
+    })
+}
+
+fn cached_prepared_payload_validation(
+    root: &Path,
+    file: &File,
+    header: PreparedObjectHeader,
+    identity: StableFileIdentity,
+    data_offset: usize,
+) -> Result<PreparedPayloadValidation> {
+    // Callers already hold the immutable object's LOCK_SH. The global order is
+    // namespace gate -> object-build coordination (when present) -> immutable
+    // object -> validation coordination. Publication takes build coordination
+    // -> validation coordination but releases validation before opening the
+    // immutable object. GC takes the namespace exclusively and only probes all
+    // subordinate locks nonblocking, so no path can invert this edge.
+    let record_path = prepared_validation_record_path(root, header.kind, header.key);
+    if let Some(digest) =
+        read_prepared_validation_record(&record_path, header, identity, data_offset)?
+    {
+        return Ok(digest);
+    }
+
+    let lock_path = prepared_validation_lock_path(root, header.kind, header.key);
+    let payload_len =
+        usize::try_from(header.payload_len).context("prepared payload length exceeds usize")?;
+    let padded_payload_len = round_up(payload_len, data_offset)?;
+    let mut wait_for_successor = false;
+    loop {
+        let mut coordination = open_coord_file(root, &lock_path)?;
+        let election = if wait_for_successor {
+            coordination.lock_exclusive()
+        } else {
+            coordination.try_lock_exclusive()
+        };
+        match election {
+            Ok(()) => {
+                coordination.release_namespace_gate();
+                if let Some(digest) =
+                    read_prepared_validation_record(&record_path, header, identity, data_offset)?
+                {
+                    return Ok(digest);
+                }
+                let digest = hash_prepared_payload(
+                    file,
+                    identity,
+                    data_offset,
+                    payload_len,
+                    padded_payload_len,
+                )?;
+                // Publish the observed digest even when it does not match the
+                // header. Every peer then rejects the same corrupt immutable
+                // inode in O(1) rather than serially streaming it again.
+                publish_prepared_validation_record(root, header, identity, data_offset, digest)?;
+                return Ok(digest);
+            }
+            Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
+                coordination.lock_shared().with_context(|| {
+                    format!(
+                        "wait for prepared-object validation {}",
+                        record_path.display()
+                    )
+                })?;
+                coordination.release_namespace_gate();
+                if let Some(digest) =
+                    read_prepared_validation_record(&record_path, header, identity, data_offset)?
+                {
+                    return Ok(digest);
+                }
+                wait_for_successor = true;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "elect prepared-object payload verifier {}",
+                        record_path.display()
+                    )
+                });
+            }
+        }
+    }
+}
+
 fn read_header_at(file: &File) -> Result<PreparedObjectHeader> {
     let mut bytes = [0u8; PREPARED_CAS_HEADER_LEN];
     let mut done = 0usize;
@@ -1901,7 +2247,11 @@ fn read_header_at(file: &File) -> Result<PreparedObjectHeader> {
             )
         };
         if read < 0 {
-            return Err(std::io::Error::last_os_error()).context("pread prepared object header");
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("pread prepared object header");
         }
         anyhow::ensure!(read != 0, "prepared object header is truncated");
         done += read as usize;
@@ -1910,10 +2260,24 @@ fn read_header_at(file: &File) -> Result<PreparedObjectHeader> {
 }
 
 fn validate_open_prepared_object(
+    root: &Path,
     path: &Path,
     file: File,
     expected: PreparedObjectExpectation,
 ) -> Result<PreparedObject> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("stat prepared initrd object {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "prepared initrd object is not a regular file: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.permissions().mode() & 0o222 == 0,
+        "prepared initrd object is writable rather than immutable: {}",
+        path.display()
+    );
     rustix::fs::flock(&file, rustix::fs::FlockOperation::LockShared)
         .with_context(|| format!("lock prepared initrd object {}", path.display()))?;
     let header = read_header_at(&file)?;
@@ -1931,10 +2295,23 @@ fn validate_open_prepared_object(
         .checked_add(padded_payload_len)
         .context("prepared object file length overflow")?;
     let actual_file_len =
-        usize::try_from(file.metadata()?.len()).context("prepared object file too large")?;
+        usize::try_from(metadata.len()).context("prepared object file too large")?;
     anyhow::ensure!(
         actual_file_len == expected_file_len,
         "prepared object file length {actual_file_len} != {expected_file_len}"
+    );
+    let identity = StableFileIdentity::from_metadata(&metadata);
+    let validation =
+        cached_prepared_payload_validation(root, &file, header, identity, data_offset)?;
+    anyhow::ensure!(
+        validation.payload_hash == header.payload_hash,
+        "prepared object payload checksum mismatch: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        validation.padding_is_zero,
+        "prepared object mapped padding is not zero: {}",
+        path.display()
     );
     Ok(PreparedObject {
         fd: Some(file.into()),
@@ -1965,20 +2342,29 @@ fn try_open_prepared_object_with_open_hook(
     let namespace_gate = open_namespace_gate(root)?;
     rustix::fs::flock(&namespace_gate, rustix::fs::FlockOperation::LockShared)
         .context("lock prepared initrd object namespace")?;
-    let result = try_open_prepared_object_under_namespace(path, expected, after_open);
+    let result = try_open_prepared_object_under_namespace(root, path, expected, after_open);
     drop(namespace_gate);
     result
 }
 
 /// Open and lock an object while the caller already holds the namespace gate
 /// shared. Coordination paths use this form to preserve the global lock order:
-/// namespace gate -> per-key coordination -> immutable object.
+/// namespace gate -> per-key build coordination -> immutable object ->
+/// validation coordination.
 fn try_open_prepared_object_under_namespace(
+    root: &Path,
     path: &Path,
     expected: PreparedObjectExpectation,
     after_open: impl FnOnce(),
 ) -> Result<Option<PreparedObject>> {
-    let file = match File::open(path) {
+    let file = match OpenOptions::new()
+        .read(true)
+        // O_NONBLOCK is ignored for regular files and prevents a malformed
+        // cache entry from hanging the opener on a FIFO before the fstat
+        // regular-file gate can reject it.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -1987,7 +2373,7 @@ fn try_open_prepared_object_under_namespace(
         }
     };
     after_open();
-    validate_open_prepared_object(path, file, expected).map(Some)
+    validate_open_prepared_object(root, path, file, expected).map(Some)
 }
 
 #[derive(Debug)]
@@ -2060,12 +2446,31 @@ fn publish_prepared_object(
         .context("sync prepared object temp")?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
         temp.as_file()
             .set_permissions(std::fs::Permissions::from_mode(0o444))
             .context("mark prepared object read-only")?;
     }
-    temp.persist(final_path)
+    // The data sync above does not necessarily persist the later chmod.
+    // Flush the permission transition before making the inode visible: a
+    // cache hit must never accept an owner-writable backing object after a
+    // crash/recovery boundary.
+    temp.as_file()
+        .sync_all()
+        .context("sync prepared object read-only permission")?;
+
+    // Readers use this separate lock only when the tiny validation memo is
+    // missing or names an older inode revision. Taking it before rename closes
+    // the publish→memo window: a reader that sees the final pathname waits for
+    // this lock and then consumes the publisher's already-known digest rather
+    // than streaming a hundreds-of-MiB object itself.
+    let validation_lock = prepared_validation_lock_path(root, built.header.kind, built.header.key);
+    let mut validation = open_coord_file(root, &validation_lock)?;
+    validation
+        .lock_exclusive()
+        .context("lock prepared-object validation publication")?;
+
+    let published = temp
+        .persist(final_path)
         .map_err(|error| error.error)
         .with_context(|| format!("publish prepared object {}", final_path.display()))?;
     if let Err(error) = crate::cache::fsync_parent(final_path) {
@@ -2073,6 +2478,28 @@ fn publish_prepared_object(
             path = %final_path.display(),
             %error,
             "prepared initrd CAS parent fsync failed; validation remains fail-closed"
+        );
+    }
+    let identity = StableFileIdentity::from_file(&published)
+        .context("stat published prepared object for validation memo")?;
+    publish_prepared_validation_record(
+        root,
+        built.header,
+        identity,
+        file_alignment,
+        PreparedPayloadValidation {
+            payload_hash: built.header.payload_hash,
+            padding_is_zero: true,
+        },
+    )?;
+    let validation_record =
+        prepared_validation_record_path(root, built.header.kind, built.header.key);
+    if let Err(error) = crate::cache::fsync_parent(&validation_record) {
+        tracing::warn!(
+            path = %validation_record.display(),
+            %error,
+            "prepared initrd validation-memo parent fsync failed; \
+             the next opener will verify the payload"
         );
     }
     Ok(())
@@ -2125,6 +2552,7 @@ where
         match election {
             Ok(()) => {
                 if let Some(opened) = try_open_prepared_object_under_namespace(
+                    root,
                     &final_path,
                     expected,
                     || {},
@@ -2153,7 +2581,7 @@ where
                 expected.validate(built.header)?;
                 publish_prepared_object(root, &final_path, &built)?;
                 let mut opened =
-                    try_open_prepared_object_under_namespace(&final_path, expected, || {})?
+                    try_open_prepared_object_under_namespace(root, &final_path, expected, || {})?
                         .context("published prepared object disappeared before open")?;
                 opened.cache_hit = false;
                 // `opened` takes LOCK_SH on the immutable object before the
@@ -2169,6 +2597,7 @@ where
                     format!("wait for prepared initrd object {}", final_path.display())
                 })?;
                 if let Some(opened) = try_open_prepared_object_under_namespace(
+                    root,
                     &final_path,
                     expected,
                     || {},
@@ -2227,6 +2656,7 @@ struct GcCandidate {
 #[derive(Clone, Copy, Debug)]
 enum GcMemoKind {
     Digest,
+    Validation,
     Coverage,
     Closure,
 }
@@ -2235,6 +2665,7 @@ impl GcMemoKind {
     fn directory(self) -> &'static str {
         match self {
             Self::Digest => PREPARED_DIGESTS_DIR,
+            Self::Validation => PREPARED_DIGESTS_DIR,
             Self::Coverage => PREPARED_PROBES_DIR,
             Self::Closure => PREPARED_CLOSURES_DIR,
         }
@@ -2243,6 +2674,7 @@ impl GcMemoKind {
     fn suffix(self) -> &'static str {
         match self {
             Self::Digest => ".digest",
+            Self::Validation => ".validation",
             Self::Coverage => ".coverage",
             Self::Closure => ".closure",
         }
@@ -2251,6 +2683,7 @@ impl GcMemoKind {
     fn temp_prefix(self) -> &'static str {
         match self {
             Self::Digest => ".tmp-digest-",
+            Self::Validation => ".tmp-validation-",
             Self::Coverage => ".tmp-coverage-",
             Self::Closure => ".tmp-closure-",
         }
@@ -2259,6 +2692,7 @@ impl GcMemoKind {
     fn lock_name(self, key: u64) -> String {
         let prefix = match self {
             Self::Digest => "digest",
+            Self::Validation => "validation",
             Self::Coverage => "coverage",
             Self::Closure => "closure",
         };
@@ -2543,6 +2977,7 @@ fn run_prepared_cache_gc(root: &Path, now: u64, namespace: &GcNamespaceGuard) ->
     let mut memo_candidates = Vec::new();
     for kind in [
         GcMemoKind::Digest,
+        GcMemoKind::Validation,
         GcMemoKind::Coverage,
         GcMemoKind::Closure,
     ] {
@@ -2872,6 +3307,7 @@ pub(crate) struct PreparedInitrd {
     cache_hits: usize,
     plan: PreparedRangePlan,
     mapping_granule: usize,
+    compression: initramfs::InitrdCompression,
     coverage_instrumented: bool,
     coverage_reserve_bytes: u64,
 }
@@ -2895,6 +3331,10 @@ impl PreparedInitrd {
 
     pub(crate) fn mapping_granule(&self) -> usize {
         self.mapping_granule
+    }
+
+    pub(crate) fn compression(&self) -> initramfs::InitrdCompression {
+        self.compression
     }
 
     pub(crate) fn coverage(&self) -> (bool, u64) {
@@ -3830,6 +4270,7 @@ pub(crate) fn complete_prepared_initrd(
         cache_hits,
         plan,
         mapping_granule,
+        compression,
         coverage_instrumented: coverage.0,
         coverage_reserve_bytes: coverage.1,
     })
@@ -5107,12 +5548,129 @@ mod tests {
     }
 
     #[test]
+    fn prepared_planner_stitches_three_and_four_parts_inside_one_page_exactly() {
+        let page = PREPARED_MAPPING_GRANULE;
+        let file_alignment = 4096;
+        let lengths = [3001usize, 5003, 7007, 9001];
+        for part_count in [3usize, 4] {
+            let temp = tempfile::tempdir().unwrap();
+            ensure_prepared_cache_dirs(temp.path()).unwrap();
+            let mut stream_offset = 0usize;
+            let mut expected = Vec::new();
+            let mut parts = Vec::new();
+            for (index, compressed_len) in lengths[..part_count].iter().copied().enumerate() {
+                let key = 0xd151 + index as u64;
+                let leading_pad = stream_offset % file_alignment;
+                parts.push(PreparedPart {
+                    object: test_prepared_part(
+                        temp.path(),
+                        PreparedObjectKind::Payload,
+                        key,
+                        page,
+                        file_alignment,
+                        leading_pad,
+                        compressed_len,
+                    ),
+                    stream_offset,
+                    uncompressed_len: compressed_len,
+                    compressed_len,
+                });
+                expected.resize(expected.len() + compressed_len, key as u8);
+                stream_offset += compressed_len;
+            }
+            assert!(stream_offset < page);
+
+            let (ranges, direct_ranges, stitch_pages, _) = plan_prepared_mappings(
+                temp.path(),
+                &mut parts,
+                page,
+                file_alignment,
+                initramfs::InitrdCompression::Lz4,
+            )
+            .unwrap();
+            assert_eq!(direct_ranges, 0);
+            assert_eq!(stitch_pages, 1);
+            assert_eq!(ranges.len(), 1);
+            let range = ranges.into_iter().next().unwrap();
+            let file = File::from(range.fd);
+            let mut actual = vec![0u8; range.map_len];
+            let mut done = 0usize;
+            while done < actual.len() {
+                let read = file
+                    .read_at(&mut actual[done..], range.file_offset + done as u64)
+                    .unwrap();
+                assert!(read > 0);
+                done += read;
+            }
+            assert_eq!(&actual[..expected.len()], expected);
+            assert!(
+                actual[expected.len()..].iter().all(|byte| *byte == 0),
+                "the remainder of the {part_count}-part stitched final page \
+                 must be zero padding"
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_planner_rejects_gap_overlap_and_reordered_parts() {
+        let temp = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(temp.path()).unwrap();
+        let page = PREPARED_MAPPING_GRANULE;
+        let file_alignment = 4096;
+        let part_len = 4096usize;
+
+        for (case_index, (name, offsets)) in [
+            ("gap", [0, part_len + 1]),
+            ("overlap", [0, part_len - 1]),
+            ("reordering", [part_len, 0]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut parts = offsets
+                .into_iter()
+                .enumerate()
+                .map(|(index, stream_offset)| {
+                    let key = 0xd200 + (case_index * 16 + index) as u64;
+                    PreparedPart {
+                        object: test_prepared_part(
+                            temp.path(),
+                            PreparedObjectKind::Payload,
+                            key,
+                            page,
+                            file_alignment,
+                            stream_offset % file_alignment,
+                            part_len,
+                        ),
+                        stream_offset,
+                        uncompressed_len: part_len,
+                        compressed_len: part_len,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let error = plan_prepared_mappings(
+                temp.path(),
+                &mut parts,
+                page,
+                file_alignment,
+                initramfs::InitrdCompression::Lz4,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("stream offsets are not contiguous"),
+                "{name} was not rejected by the planner's contiguous-stream gate: {error:#}"
+            );
+        }
+    }
+
+    #[test]
     fn prepared_object_rejects_torn_and_header_corruption() {
         let temp = tempfile::tempdir().unwrap();
         ensure_prepared_cache_dirs(temp.path()).unwrap();
         let key = 0x4142;
         let path = prepared_object_path(temp.path(), PreparedObjectKind::Base, key);
         std::fs::write(&path, b"torn").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
         assert!(
             try_open_prepared_object(temp.path(), &path, test_base_expectation(key, 4096, 4096),)
                 .is_err()
@@ -5128,10 +5686,225 @@ mod tests {
         // object's permissions or expecting a writable open to succeed.
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, corrupted).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
         assert!(
             try_open_prepared_object(temp.path(), &path, test_base_expectation(key, 4096, 4096),)
                 .is_err(),
             "header checksum must reject metadata corruption in O(1)"
+        );
+    }
+
+    #[test]
+    fn prepared_object_requires_regular_read_only_nofollow_backing() {
+        let temp = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(temp.path()).unwrap();
+        let key = 0x4143;
+        let expected = test_base_expectation(key, 4096, 4096);
+        let path = prepared_object_path(temp.path(), PreparedObjectKind::Base, key);
+        publish_prepared_object(
+            temp.path(),
+            &path,
+            &test_base_object(key, 4096, 4096, vec![0x31; 5000]),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o444,
+            "publication must expose an immutable backing inode"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = try_open_prepared_object(temp.path(), &path, expected).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("writable rather than immutable"),
+            "owner-writable prepared objects must fail closed: {error:#}"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let symlink = temp.path().join("prepared-symlink");
+        std::os::unix::fs::symlink(&path, &symlink).unwrap();
+        assert!(
+            try_open_prepared_object(temp.path(), &symlink, expected).is_err(),
+            "O_NOFOLLOW must reject a substituted prepared-object symlink"
+        );
+
+        let directory = temp.path().join("prepared-directory");
+        std::fs::create_dir(&directory).unwrap();
+        let error = try_open_prepared_object(temp.path(), &directory, expected).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not a regular file"),
+            "non-regular prepared objects must fail closed: {error:#}"
+        );
+
+        let fifo = temp.path().join("prepared-fifo");
+        let fifo_c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o444) },
+            0,
+            "create prepared-object FIFO fixture: {}",
+            std::io::Error::last_os_error()
+        );
+        let error = try_open_prepared_object(temp.path(), &fifo, expected).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not a regular file"),
+            "a FIFO substitution must be rejected without blocking: {error:#}"
+        );
+    }
+
+    #[test]
+    fn prepared_object_same_length_payload_corruption_is_memoized_and_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(temp.path()).unwrap();
+        let key = 0x4144;
+        let expected = test_base_expectation(key, 4096, 4096);
+        let path = prepared_object_path(temp.path(), PreparedObjectKind::Base, key);
+        publish_prepared_object(
+            temp.path(),
+            &path,
+            &test_base_object(key, 4096, 4096, vec![0x52; 8193]),
+        )
+        .unwrap();
+
+        // Keep the published inode open so its replacement cannot reuse the
+        // same inode number even on a filesystem with aggressive recycling.
+        let old_inode = File::open(&path).unwrap();
+        let mut corrupted = std::fs::read(&path).unwrap();
+        corrupted[4096 + 137] ^= 0x80;
+        let original_len = corrupted.len();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, corrupted).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len() as usize,
+            original_len
+        );
+
+        let first_error = try_open_prepared_object(temp.path(), &path, expected).unwrap_err();
+        assert!(
+            format!("{first_error:#}").contains("payload checksum mismatch"),
+            "same-length payload corruption must be detected by streaming validation: \
+             {first_error:#}"
+        );
+        let validation_path =
+            prepared_validation_record_path(temp.path(), PreparedObjectKind::Base, key);
+        let memo_after_first_rejection = std::fs::read(&validation_path).unwrap();
+        let memo_inode = File::open(&validation_path).unwrap();
+        let memo_identity = StableFileIdentity::from_file(&memo_inode).unwrap();
+
+        let second_error = try_open_prepared_object(temp.path(), &path, expected).unwrap_err();
+        assert!(
+            format!("{second_error:#}").contains("payload checksum mismatch"),
+            "the memoized corrupt inode must remain fail-closed: {second_error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&validation_path).unwrap(),
+            memo_after_first_rejection,
+            "a stable corrupt inode must be rejected from its O(1) memo without rehashing"
+        );
+        assert_eq!(
+            StableFileIdentity::from_metadata(&std::fs::metadata(&validation_path).unwrap()),
+            memo_identity,
+            "the second rejection must not atomically republish an identical memo"
+        );
+        drop(old_inode);
+    }
+
+    #[test]
+    fn prepared_object_rejects_nonzero_mapped_padding() {
+        let temp = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(temp.path()).unwrap();
+        let key = 0x4146;
+        let expected = test_base_expectation(key, 4096, 4096);
+        let path = prepared_object_path(temp.path(), PreparedObjectKind::Base, key);
+        let payload_len = 5000usize;
+        publish_prepared_object(
+            temp.path(),
+            &path,
+            &test_base_object(key, 4096, 4096, vec![0x72; payload_len]),
+        )
+        .unwrap();
+
+        let old_inode = File::open(&path).unwrap();
+        let mut corrupted = std::fs::read(&path).unwrap();
+        corrupted[4096 + payload_len + 37] = 0xa5;
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, corrupted).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let error = try_open_prepared_object(temp.path(), &path, expected).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("mapped padding is not zero"),
+            "all bytes exposed by a prepared mapping must be validated: {error:#}"
+        );
+        drop(old_inode);
+    }
+
+    #[test]
+    fn prepared_validation_record_corruption_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(temp.path()).unwrap();
+        let key = 0x4145;
+        let expected = test_base_expectation(key, 4096, 4096);
+        let path = prepared_object_path(temp.path(), PreparedObjectKind::Base, key);
+        publish_prepared_object(
+            temp.path(),
+            &path,
+            &test_base_object(key, 4096, 4096, vec![0x62; 8193]),
+        )
+        .unwrap();
+        let validation_path =
+            prepared_validation_record_path(temp.path(), PreparedObjectKind::Base, key);
+        let mut record = std::fs::read(&validation_path).unwrap();
+        record[96] ^= 1;
+        std::fs::write(&validation_path, record).unwrap();
+
+        let error = try_open_prepared_object(temp.path(), &path, expected).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("validation memo checksum mismatch"),
+            "a corrupt integrity memo must never authorize a cache hit: {error:#}"
+        );
+    }
+
+    #[test]
+    fn prepared_validation_record_rejects_nonregular_or_wrong_sized_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(temp.path()).unwrap();
+        let key = 0x4147;
+        let expected = test_base_expectation(key, 4096, 4096);
+        let path = prepared_object_path(temp.path(), PreparedObjectKind::Base, key);
+        publish_prepared_object(
+            temp.path(),
+            &path,
+            &test_base_object(key, 4096, 4096, vec![0x73; 8193]),
+        )
+        .unwrap();
+        let validation_path =
+            prepared_validation_record_path(temp.path(), PreparedObjectKind::Base, key);
+
+        std::fs::remove_file(&validation_path).unwrap();
+        let fifo_c = std::ffi::CString::new(validation_path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) },
+            0,
+            "create validation-memo FIFO fixture: {}",
+            std::io::Error::last_os_error()
+        );
+        let error = try_open_prepared_object(temp.path(), &path, expected).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("validation memo is not a regular file"),
+            "a memo FIFO must fail closed without blocking: {error:#}"
+        );
+
+        std::fs::remove_file(&validation_path).unwrap();
+        std::fs::write(
+            &validation_path,
+            vec![0u8; PREPARED_VALIDATION_RECORD_LEN + 1],
+        )
+        .unwrap();
+        let error = try_open_prepared_object(temp.path(), &path, expected).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("validation memo has invalid length"),
+            "a wrong-sized memo must be rejected before it is read: {error:#}"
         );
     }
 
@@ -5494,6 +6267,7 @@ mod tests {
     const PREPARED_CHILD_INDEX: &str = "KTSTR_PREPARED_CHILD_INDEX";
     const PREPARED_CHILD_KEY: &str = "KTSTR_PREPARED_CHILD_KEY";
     const PREPARED_CHILD_COUNTER: &str = "KTSTR_PREPARED_CHILD_COUNTER";
+    const PREPARED_CHILD_VALIDATION_COUNTER: &str = "KTSTR_PREPARED_VALIDATION_COUNTER";
     const PREPARED_CHILD_START: &str = "KTSTR_PREPARED_CHILD_START";
     const PREPARED_CHILD_READY: &str = "KTSTR_PREPARED_CHILD_READY";
     const PREPARED_CHILD_RESULTS: &str = "KTSTR_PREPARED_CHILD_RESULTS";
@@ -5539,6 +6313,7 @@ mod tests {
     struct PreparedChildPaths<'a> {
         root: &'a Path,
         counter: &'a Path,
+        validation_counter: &'a Path,
         start: &'a Path,
         ready: &'a Path,
         results: &'a Path,
@@ -5561,6 +6336,7 @@ mod tests {
             .env(PREPARED_CHILD_INDEX, index.to_string())
             .env(PREPARED_CHILD_KEY, format!("{key:016x}"))
             .env(PREPARED_CHILD_COUNTER, paths.counter)
+            .env(PREPARED_CHILD_VALIDATION_COUNTER, paths.validation_counter)
             .env(PREPARED_CHILD_START, paths.start)
             .env(PREPARED_CHILD_READY, paths.ready)
             .env(PREPARED_CHILD_RESULTS, paths.results)
@@ -5618,7 +6394,7 @@ mod tests {
         let winner = PathBuf::from(std::env::var_os(PREPARED_CHILD_WINNER).unwrap());
         ensure_prepared_cache_dirs(&root).unwrap();
 
-        if mode == "storm" {
+        if matches!(mode.as_str(), "storm" | "validation-storm") {
             let start = File::open(start).unwrap();
             std::fs::write(ready.join(index.to_string()), b"ready").unwrap();
             rustix::fs::flock(&start, rustix::fs::FlockOperation::LockShared).unwrap();
@@ -5713,6 +6489,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         ensure_prepared_cache_dirs(temp.path()).unwrap();
         let counter = temp.path().join("attempts");
+        let validation_counter = temp.path().join("validation-attempts");
         let start_path = temp.path().join("start");
         let ready = temp.path().join("ready");
         let results = temp.path().join("results");
@@ -5730,6 +6507,7 @@ mod tests {
         let paths = PreparedChildPaths {
             root: temp.path(),
             counter: &counter,
+            validation_counter: &validation_counter,
             start: &start_path,
             ready: &ready,
             results: &results,
@@ -5774,11 +6552,116 @@ mod tests {
     }
 
     #[test]
+    fn prepared_object_cross_process_cache_hit_hashes_new_inode_once() {
+        const CELLS: usize = 52;
+        let temp = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(temp.path()).unwrap();
+        let counter = temp.path().join("build-attempts");
+        let validation_counter = temp.path().join("validation-attempts");
+        let start_path = temp.path().join("start");
+        let ready = temp.path().join("ready");
+        let results = temp.path().join("results");
+        let winner = temp.path().join("winner");
+        std::fs::create_dir(&ready).unwrap();
+        std::fs::create_dir(&results).unwrap();
+        let key = 0xd00b;
+        let object_path = prepared_object_path(temp.path(), PreparedObjectKind::Base, key);
+        publish_prepared_object(
+            temp.path(),
+            &object_path,
+            &test_base_object(
+                key,
+                PREPARED_MAPPING_GRANULE,
+                prepared_file_alignment().unwrap(),
+                vec![0x6d; 8 << 20],
+            ),
+        )
+        .unwrap();
+        std::fs::remove_file(prepared_validation_record_path(
+            temp.path(),
+            PreparedObjectKind::Base,
+            key,
+        ))
+        .unwrap();
+
+        let start = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&start_path)
+            .unwrap();
+        rustix::fs::flock(&start, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        let paths = PreparedChildPaths {
+            root: temp.path(),
+            counter: &counter,
+            validation_counter: &validation_counter,
+            start: &start_path,
+            ready: &ready,
+            results: &results,
+            winner: &winner,
+        };
+        let mut children = ChildProcesses(Vec::with_capacity(CELLS));
+        for index in 0..CELLS {
+            children.push(spawn_prepared_child(&paths, "validation-storm", index, key));
+        }
+        wait_for_child_files(
+            &ready,
+            CELLS,
+            &mut children,
+            std::time::Duration::from_secs(30),
+        );
+        rustix::fs::flock(&start, rustix::fs::FlockOperation::Unlock).unwrap();
+        children.wait_all_success(std::time::Duration::from_secs(60));
+
+        assert!(
+            !counter.exists(),
+            "an already-published object must never rerun its transform"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&validation_counter)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "one process must stream-validate a new inode and every peer must use its memo"
+        );
+        let mut inodes = std::collections::HashSet::new();
+        for index in 0..CELLS {
+            let result = std::fs::read_to_string(results.join(index.to_string())).unwrap();
+            let fields: Vec<u64> = result
+                .split_whitespace()
+                .map(|field| field.parse().unwrap())
+                .collect();
+            assert_eq!(fields.len(), 5);
+            inodes.insert((fields[0], fields[1]));
+            assert_eq!(
+                fields[4], 1,
+                "every prepublished-object open is a cache hit"
+            );
+        }
+        assert_eq!(inodes.len(), 1);
+
+        let mut warm = ChildProcesses(Vec::with_capacity(1));
+        warm.push(spawn_prepared_child(&paths, "validation-hit", CELLS, key));
+        warm.wait_all_success(std::time::Duration::from_secs(30));
+        assert_eq!(
+            std::fs::read_to_string(&validation_counter)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "a stable-inode cache hit must validate in O(1) without streaming again"
+        );
+    }
+
+    #[test]
     fn prepared_object_killed_builder_elects_successor() {
         const WAITERS: usize = 52;
         let temp = tempfile::tempdir().unwrap();
         ensure_prepared_cache_dirs(temp.path()).unwrap();
         let counter = temp.path().join("attempts");
+        let validation_counter = temp.path().join("validation-attempts");
         let start = temp.path().join("unused-start");
         let ready = temp.path().join("ready");
         let results = temp.path().join("results");
@@ -5788,6 +6671,7 @@ mod tests {
         let paths = PreparedChildPaths {
             root: temp.path(),
             counter: &counter,
+            validation_counter: &validation_counter,
             start: &start,
             ready: &ready,
             results: &results,
@@ -5894,9 +6778,10 @@ mod tests {
             "a per-key holder must retain namespace LOCK_SH until object LOCK_SH \
              closes the gate -> per-key -> object lock chain"
         );
-        let opened = try_open_prepared_object_under_namespace(&object_path, expected, || {})
-            .unwrap()
-            .expect("published object must open under the retained namespace gate");
+        let opened =
+            try_open_prepared_object_under_namespace(temp.path(), &object_path, expected, || {})
+                .unwrap()
+                .expect("published object must open under the retained namespace gate");
 
         coordination.release_namespace_gate();
         let namespace = try_lock_gc_namespace(temp.path())
@@ -5933,6 +6818,42 @@ mod tests {
             )
             .unwrap(),
             "the object becomes collectible only after its shared lock drops"
+        );
+        drop(namespace);
+
+        let validation_lock =
+            prepared_validation_lock_path(temp.path(), PreparedObjectKind::Base, key);
+        let mut validation = open_coord_file(temp.path(), &validation_lock).unwrap();
+        validation.try_lock_exclusive().unwrap();
+        assert!(
+            try_lock_gc_namespace(temp.path()).unwrap().is_none(),
+            "validation election must retain namespace LOCK_SH while acquiring \
+             the per-recipe validation lock"
+        );
+        validation.release_namespace_gate();
+        let namespace = try_lock_gc_namespace(temp.path())
+            .unwrap()
+            .expect("GC must acquire the namespace after the validation holder releases it");
+        let validation_key = prepared_validation_key(PreparedObjectKind::Base, key);
+        assert!(
+            !try_collect_memo(
+                temp.path(),
+                &GcMemoCandidate {
+                    path: prepared_validation_record_path(
+                        temp.path(),
+                        PreparedObjectKind::Base,
+                        key,
+                    ),
+                    kind: GcMemoKind::Validation,
+                    key: validation_key,
+                    modified_secs: 0,
+                    len: 0,
+                },
+                &namespace,
+            )
+            .unwrap(),
+            "GC must probe the held validation lock nonblocking and leave its \
+             memo in place rather than invert the lock order"
         );
     }
 

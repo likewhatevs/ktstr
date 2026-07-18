@@ -10,6 +10,7 @@
 //! struct definition lives in [`super`].
 
 use anyhow::{Context, Result};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -22,7 +23,7 @@ use super::initramfs_cache::BaseKey;
 #[cfg(any(target_arch = "aarch64", test))]
 use super::initramfs_cache::PREPARED_MAPPING_GRANULE;
 use super::initramfs_cache::{
-    PreparedBase, PreparedInitrd, complete_prepared_initrd, get_or_prepare_base,
+    PreparedBase, PreparedInitrd, PreparedMapping, complete_prepared_initrd, get_or_prepare_base,
     prepare_base_inputs,
 };
 use super::memory_budget::{
@@ -190,6 +191,30 @@ fn validate_prepared_host_address(host_addr: *mut u8) -> Result<()> {
     Ok(())
 }
 
+fn validate_prepared_split_host_address(host_addr: *mut u8, split_alignment: usize) -> Result<()> {
+    validate_prepared_host_address(host_addr)?;
+    anyhow::ensure!(
+        (host_addr as usize).is_multiple_of(split_alignment),
+        "prepared initrd host address is not aligned to the \
+         {split_alignment}-byte backing boundary"
+    );
+    Ok(())
+}
+
+/// The prepared CAS source is an ordinary file, so Linux `mmap(2)` requires
+/// its offset to be aligned to the runtime base page. Replacing a hugetlb VMA
+/// additionally constrains the destination address and length to the hugetlb
+/// boundary, but does not turn the source fd into a hugetlb file or impose a
+/// 2 MiB file-offset requirement.
+fn validate_prepared_file_offset(file_offset: u64, host_page_size: usize) -> Result<()> {
+    anyhow::ensure!(
+        file_offset % host_page_size as u64 == 0,
+        "prepared initrd file offset is not aligned to the \
+         {host_page_size}-byte host page size"
+    );
+    Ok(())
+}
+
 fn prepared_region_split_alignment(
     backing: MemoryBacking,
     host_page_size: usize,
@@ -199,6 +224,255 @@ fn prepared_region_split_alignment(
         MemoryBacking::BasePages => host_page_size,
         MemoryBacking::HugeTlb2M => mapping_granule,
     }
+}
+
+fn expected_initrd_magic(
+    compression: initramfs::InitrdCompression,
+) -> (&'static [u8], &'static str) {
+    match compression {
+        initramfs::InitrdCompression::Lz4 => (&initramfs::LZ4_LEGACY_MAGIC, "LZ4 legacy"),
+        initramfs::InitrdCompression::Zstd => (b"\x28\xb5\x2f\xfd", "zstd"),
+        initramfs::InitrdCompression::Gzip => (b"\x1f\x8b", "gzip"),
+        initramfs::InitrdCompression::Uncompressed => (b"070701", "newc cpio"),
+    }
+}
+
+fn validate_prepared_stream_magic(
+    compression: initramfs::InitrdCompression,
+    ranges: &[PreparedMapping],
+) -> Result<()> {
+    let first = ranges
+        .first()
+        .context("prepared initrd has no mapping ranges")?;
+    let (expected, name) = expected_initrd_magic(compression);
+    let mut actual = vec![0u8; expected.len()];
+    let mut done = 0usize;
+    while done < actual.len() {
+        let offset = first
+            .file_offset
+            .checked_add(done as u64)
+            .context("prepared initrd magic file offset overflow")?;
+        let offset = libc::off_t::try_from(offset)
+            .context("prepared initrd magic file offset exceeds off_t")?;
+        let read = unsafe {
+            libc::pread(
+                first.fd.as_raw_fd(),
+                actual[done..].as_mut_ptr().cast(),
+                actual.len() - done,
+                offset,
+            )
+        };
+        if read < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("pread prepared initrd compression magic");
+        }
+        anyhow::ensure!(
+            read != 0,
+            "prepared initrd backing file is truncated before its compression magic"
+        );
+        done += read as usize;
+    }
+    anyhow::ensure!(
+        actual == expected,
+        "prepared initrd has invalid {name} magic: expected {expected:02x?}, got {actual:02x?}"
+    );
+    Ok(())
+}
+
+/// Validate every property that can be checked before the first unsafe
+/// `MAP_FIXED`. Keeping this pure over prepared-range metadata makes the exact
+/// production validator directly testable with malformed gap/overlap/reorder
+/// fixtures.
+fn validate_prepared_load(
+    total_compressed: usize,
+    compression: initramfs::InitrdCompression,
+    page_size: usize,
+    host_page_size: usize,
+    load_addr: u64,
+    ranges: &[PreparedMapping],
+) -> Result<u32> {
+    let boot_size =
+        u32::try_from(total_compressed).context("compressed initrd exceeds u32 boot-size field")?;
+    anyhow::ensure!(
+        page_size.is_power_of_two(),
+        "prepared initrd mapping granule is not a power of two"
+    );
+    anyhow::ensure!(
+        host_page_size.is_power_of_two() && page_size.is_multiple_of(host_page_size),
+        "prepared initrd host-page geometry is incompatible with its mapping granule"
+    );
+    anyhow::ensure!(
+        load_addr & (page_size as u64 - 1) == 0,
+        "prepared initrd load address {load_addr:#x} is not aligned to the \
+         {page_size}-byte prepared mapping granule"
+    );
+    anyhow::ensure!(!ranges.is_empty(), "prepared initrd has no mapping ranges");
+
+    let mut mapped_len = 0usize;
+    for range in ranges {
+        anyhow::ensure!(
+            range.guest_offset == mapped_len as u64,
+            "prepared initrd ranges contain a gap, overlap, or reordering"
+        );
+        anyhow::ensure!(
+            range.map_len > 0 && range.map_len % page_size == 0,
+            "prepared initrd mapping length is not aligned to the prepared granule"
+        );
+        validate_prepared_file_offset(range.file_offset, host_page_size)?;
+        libc::off_t::try_from(range.file_offset)
+            .context("prepared initrd file offset exceeds off_t")?;
+        let file_end = range
+            .file_offset
+            .checked_add(u64::try_from(range.map_len)?)
+            .context("prepared initrd backing-file extent overflow")?;
+        let stat =
+            rustix::fs::fstat(&range.fd).context("stat prepared initrd mapping backing file")?;
+        anyhow::ensure!(
+            stat.st_size >= 0 && file_end <= stat.st_size as u64,
+            "prepared initrd mapping exceeds its backing file: end={file_end:#x}, \
+             file_len={:#x}",
+            stat.st_size
+        );
+        mapped_len = mapped_len
+            .checked_add(range.map_len)
+            .context("prepared initrd mapped length overflow")?;
+    }
+    anyhow::ensure!(
+        total_compressed <= mapped_len && mapped_len.saturating_sub(total_compressed) < page_size,
+        "prepared initrd mapped padding is inconsistent with compressed length"
+    );
+    load_addr
+        .checked_add(mapped_len as u64)
+        .context("prepared initrd final guest address overflow")?;
+    validate_prepared_stream_magic(compression, ranges)?;
+    Ok(boot_size)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ValidatedPreparedSubrange {
+    guest_addr: u64,
+    host_addr: *mut u8,
+    file_offset: u64,
+    len: usize,
+}
+
+#[derive(Debug)]
+struct ValidatedPreparedRange {
+    range: PreparedMapping,
+    subranges: Vec<ValidatedPreparedSubrange>,
+}
+
+/// Resolve the complete guest-memory split before mutating any VMA. A mapping
+/// range may cross adjacent NUMA slots whose host virtual addresses are
+/// unrelated, but every resulting subrange must preserve the allocator's
+/// backing alignment and cover the source range exactly.
+fn validate_prepared_subranges(
+    guest_mem: &GuestMemoryMmap,
+    ranges: Vec<PreparedMapping>,
+    load_addr: u64,
+    split_alignment: usize,
+    host_page_size: usize,
+) -> Result<Vec<ValidatedPreparedRange>> {
+    anyhow::ensure!(
+        split_alignment.is_power_of_two()
+            && host_page_size.is_power_of_two()
+            && split_alignment.is_multiple_of(host_page_size),
+        "prepared initrd split alignment is incompatible with the host page size"
+    );
+    let mut validated = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let guest_addr = load_addr
+            .checked_add(range.guest_offset)
+            .context("prepared initrd guest address overflow")?;
+        let mut consumed = 0usize;
+        let mut subranges = Vec::new();
+        for slice in guest_mem.get_slices(GuestAddress(guest_addr), range.map_len) {
+            let slice = slice.context("prepared initrd crosses a guest-memory hole")?;
+            let len = slice.len();
+            anyhow::ensure!(
+                len > 0 && len % split_alignment == 0,
+                "prepared initrd crosses a guest-memory region boundary that is not \
+                 aligned to the {split_alignment}-byte backing boundary"
+            );
+            let sub_guest = guest_addr
+                .checked_add(consumed as u64)
+                .context("prepared initrd subrange guest address overflow")?;
+            let host_addr = guest_mem
+                .get_host_address(GuestAddress(sub_guest))
+                .context("resolve prepared initrd subrange host address")?;
+            validate_prepared_split_host_address(host_addr, split_alignment)?;
+            let file_offset = range
+                .file_offset
+                .checked_add(consumed as u64)
+                .context("prepared initrd subrange file offset overflow")?;
+            validate_prepared_file_offset(file_offset, host_page_size)
+                .context("prepared initrd split produced a misaligned file offset")?;
+            subranges.push(ValidatedPreparedSubrange {
+                guest_addr: sub_guest,
+                host_addr,
+                file_offset,
+                len,
+            });
+            consumed = consumed
+                .checked_add(len)
+                .context("prepared initrd split length overflow")?;
+        }
+        anyhow::ensure!(
+            consumed == range.map_len,
+            "prepared initrd guest-memory split did not cover the complete range"
+        );
+        validated.push(ValidatedPreparedRange { range, subranges });
+    }
+    Ok(validated)
+}
+
+/// Consume prevalidated ranges through the one strict production mapping
+/// shape. The callback seam lets unit tests observe ordering and injected
+/// failure without invoking `MAP_FIXED`; production supplies only
+/// `cow_overlay_file_borrowed`, so there is no byte-copy fallback branch.
+fn map_validated_prepared_ranges<Map, RestoreNuma>(
+    guards: &mut Vec<initramfs::CowOverlayGuard>,
+    validated: Vec<ValidatedPreparedRange>,
+    mut map: Map,
+    mut restore_numa: RestoreNuma,
+) -> Result<()>
+where
+    Map: FnMut(&ValidatedPreparedSubrange, &OwnedFd) -> Result<()>,
+    RestoreNuma: FnMut(&ValidatedPreparedSubrange) -> Result<()>,
+{
+    for validated_range in validated {
+        let fd = validated_range.range.fd;
+        for subrange in validated_range.subranges {
+            if let Err(error) = map(&subrange, &fd) {
+                // An earlier subrange from this fd may already be live. Move
+                // the sole shared-lock owner before unwinding.
+                guards.push(initramfs::CowOverlayGuard::new(fd));
+                return Err(error).with_context(|| {
+                    format!(
+                        "direct-map prepared initrd subrange at guest {:#x} \
+                         (len={}, file_offset={:#x})",
+                        subrange.guest_addr, subrange.len, subrange.file_offset
+                    )
+                });
+            }
+            if let Err(error) = restore_numa(&subrange) {
+                // MAP_FIXED already installed this file mapping.
+                guards.push(initramfs::CowOverlayGuard::new(fd));
+                return Err(error).with_context(|| {
+                    format!(
+                        "restore NUMA policy for direct-map prepared initrd \
+                         subrange at guest {:#x} (len={})",
+                        subrange.guest_addr, subrange.len
+                    )
+                });
+            }
+        }
+        guards.push(initramfs::CowOverlayGuard::new(fd));
+    }
+    Ok(())
 }
 
 /// Build the auto-mount cmdline tokens for one disk. Returns an
@@ -1196,186 +1470,69 @@ impl KtstrVm {
     ) -> Result<u32> {
         let total_compressed = prepared.compressed_len();
         let page_size = prepared.mapping_granule();
+        let compression = prepared.compression();
         let host_page_size = host_page_size() as usize;
         let backing = vm
             .memory_backing
             .context("prepared initrd load requires allocated guest-memory backing")?;
         let split_alignment = prepared_region_split_alignment(backing, host_page_size, page_size);
-        anyhow::ensure!(
-            load_addr & (page_size as u64 - 1) == 0,
-            "prepared initrd load address {load_addr:#x} is not aligned to the \
-             {page_size}-byte prepared mapping granule"
-        );
         let plan = prepared.plan();
         let cache_hits = prepared.cache_hits();
         let ranges = prepared.into_ranges();
-        anyhow::ensure!(!ranges.is_empty(), "prepared initrd has no mapping ranges");
-
-        // Validate the complete geometry before the first MAP_FIXED mutates
-        // guest RAM. The ranges must form one contiguous, granule-sized
-        // overlay starting at initrd byte zero; only the final range may
-        // extend beyond the boot-visible compressed length as zero padding.
-        let mut mapped_len = 0usize;
-        for range in &ranges {
-            anyhow::ensure!(
-                range.guest_offset == mapped_len as u64,
-                "prepared initrd ranges contain a gap, overlap, or reordering"
-            );
-            anyhow::ensure!(
-                range.map_len > 0 && range.map_len % page_size == 0,
-                "prepared initrd mapping length is not aligned to the prepared granule"
-            );
-            anyhow::ensure!(
-                range.file_offset % host_page_size as u64 == 0,
-                "prepared initrd file offset is not aligned to the \
-                 {host_page_size}-byte host page size"
-            );
-            mapped_len = mapped_len
-                .checked_add(range.map_len)
-                .context("prepared initrd mapped length overflow")?;
-        }
-        anyhow::ensure!(
-            total_compressed <= mapped_len
-                && mapped_len.saturating_sub(total_compressed) < page_size,
-            "prepared initrd mapped padding is inconsistent with compressed length"
-        );
-        load_addr
-            .checked_add(mapped_len as u64)
-            .context("prepared initrd final guest address overflow")?;
-        struct ValidatedSubrange {
-            guest_addr: u64,
-            host_addr: *mut u8,
-            file_offset: u64,
-            len: usize,
-        }
-        struct ValidatedRange {
-            range: super::initramfs_cache::PreparedMapping,
-            subranges: Vec<ValidatedSubrange>,
-        }
+        let boot_size = validate_prepared_load(
+            total_compressed,
+            compression,
+            page_size,
+            host_page_size,
+            load_addr,
+            &ranges,
+        )?;
 
         // GuestMemoryMmap is one region per NUMA memory slot; adjacent guest
         // addresses may therefore have unrelated host VAs. Explicit hugetlb
         // VMAs require 2 MiB replacement boundaries. Base-page/THP regions
         // may split on the runtime host page, including caller-declared
         // odd-MiB NUMA boundaries.
-        let mut validated = Vec::with_capacity(ranges.len());
-        for range in ranges {
-            let guest_addr = load_addr
-                .checked_add(range.guest_offset)
-                .context("prepared initrd guest address overflow")?;
-            let mut consumed = 0usize;
-            let mut subranges = Vec::new();
-            for slice in vm
-                .guest_mem
-                .get_slices(GuestAddress(guest_addr), range.map_len)
-            {
-                let slice = slice.context("prepared initrd crosses a guest-memory hole")?;
-                let len = slice.len();
-                anyhow::ensure!(
-                    len > 0 && len % split_alignment == 0,
-                    "prepared initrd crosses a guest-memory region boundary that is not \
-                     aligned to the {split_alignment}-byte backing boundary"
-                );
-                let sub_guest = guest_addr
-                    .checked_add(consumed as u64)
-                    .context("prepared initrd subrange guest address overflow")?;
-                let host_addr = vm
-                    .guest_mem
-                    .get_host_address(GuestAddress(sub_guest))
-                    .context("resolve prepared initrd subrange host address")?;
-                // MAP_FIXED requires destination alignment to the runtime
-                // host page size. The file/range geometry remains 2 MiB so
-                // the same objects can also replace hugetlb-backed guest
-                // VMAs; ordinary anonymous GuestMemory regions are not
-                // required to begin on a 2 MiB host virtual address.
-                validate_prepared_host_address(host_addr)?;
-                let file_offset = range
-                    .file_offset
-                    .checked_add(consumed as u64)
-                    .context("prepared initrd subrange file offset overflow")?;
-                anyhow::ensure!(
-                    file_offset % host_page_size as u64 == 0,
-                    "prepared initrd split produced a misaligned file offset"
-                );
-                subranges.push(ValidatedSubrange {
-                    guest_addr: sub_guest,
-                    host_addr,
-                    file_offset,
-                    len,
-                });
-                consumed = consumed
-                    .checked_add(len)
-                    .context("prepared initrd split length overflow")?;
-            }
-            anyhow::ensure!(
-                consumed == range.map_len,
-                "prepared initrd guest-memory split did not cover the complete range"
-            );
-            validated.push(ValidatedRange { range, subranges });
-        }
+        let validated = validate_prepared_subranges(
+            &vm.guest_mem,
+            ranges,
+            load_addr,
+            split_alignment,
+            host_page_size,
+        )?;
         let t0 = Instant::now();
-        for validated_range in validated {
-            let fd = validated_range.range.fd;
-            for subrange in validated_range.subranges {
-                let mapped = unsafe {
-                    initramfs::cow_overlay_file_borrowed(
-                        subrange.host_addr,
-                        subrange.len,
-                        &fd,
-                        subrange.file_offset,
-                    )
-                };
-                if let Err(error) = mapped {
-                    // Earlier subranges from this fd may already be live.
-                    // Transfer the single shared-lock owner before unwinding.
-                    vm.cow_overlay_guards
-                        .push(initramfs::CowOverlayGuard::new(fd));
-                    return Err(error).with_context(|| {
-                        format!(
-                            "direct-map prepared initrd subrange at guest {:#x} \
-                             (len={}, file_offset={:#x})",
-                            subrange.guest_addr, subrange.len, subrange.file_offset
-                        )
-                    });
-                }
-                if self.performance_mode && !self.mbind_node_map.is_empty() {
-                    let Some(layout) = vm.numa_layout.as_ref() else {
-                        // The prepared mapping is already live, so preserve
-                        // its shared-lock owner even if the allocation/setup
-                        // invariant was violated.
-                        vm.cow_overlay_guards
-                            .push(initramfs::CowOverlayGuard::new(fd));
-                        anyhow::bail!(
-                            "performance-mode direct-map initrd has NUMA bindings \
-                             but no NUMA memory layout"
-                        );
-                    };
-                    if let Err(error) = layout.mbind_replaced_range(
+        let restore_numa = self.performance_mode && !self.mbind_node_map.is_empty();
+        let numa_layout = if restore_numa {
+            Some(vm.numa_layout.as_ref().context(
+                "performance-mode direct-map initrd has NUMA bindings \
+                 but no NUMA memory layout",
+            )?)
+        } else {
+            None
+        };
+        map_validated_prepared_ranges(
+            &mut vm.cow_overlay_guards,
+            validated,
+            |subrange, fd| unsafe {
+                initramfs::cow_overlay_file_borrowed(
+                    subrange.host_addr,
+                    subrange.len,
+                    fd,
+                    subrange.file_offset,
+                )
+            },
+            |subrange| {
+                if let Some(layout) = numa_layout {
+                    layout.mbind_replaced_range(
                         subrange.guest_addr,
                         subrange.host_addr,
                         subrange.len,
                         &self.mbind_node_map,
-                    ) {
-                        // MAP_FIXED already installed a live file mapping.
-                        // Transfer the shared-lock owner before unwinding so
-                        // GC can never unlink its backing object while that
-                        // partial overlay remains in guest memory.
-                        vm.cow_overlay_guards
-                            .push(initramfs::CowOverlayGuard::new(fd));
-                        return Err(error).with_context(|| {
-                            format!(
-                                "restore NUMA policy for direct-map prepared initrd \
-                                 subrange at guest {:#x} (len={})",
-                                subrange.guest_addr, subrange.len
-                            )
-                        });
-                    }
+                    )?;
                 }
-            }
-            // One fd/LOCK_SH protects every VMA split from this source.
-            vm.cow_overlay_guards
-                .push(initramfs::CowOverlayGuard::new(fd));
-        }
+                Ok(())
+            },
+        )?;
         tracing::debug!(
             elapsed_us = t0.elapsed().as_micros(),
             range_count = vm.cow_overlay_guards.len(),
@@ -1403,11 +1560,11 @@ impl KtstrVm {
                 check_buf[6],
                 check_buf[7]
             ),
-            expected_magic = "02214c18",
+            ?compression,
             "initrd_verify",
         );
 
-        u32::try_from(total_compressed).context("compressed initrd exceeds u32 boot-size field")
+        Ok(boot_size)
     }
 
     /// Select the guest rootfs tmpfs fraction for the budget formula by
@@ -1609,7 +1766,6 @@ impl KtstrVm {
         // Validate LZ4 legacy magic before COW-mapping. pread the
         // first 4 bytes directly — no need to mmap the entire segment
         // just to peek at the header.
-        use std::os::fd::AsRawFd;
         let mut magic = [0u8; 4];
         // SAFETY: `fd` is owned by `shm_open_lz4` and remains valid
         // until `shm_close_fd` below; `magic` is a 4-byte stack buffer

@@ -1,5 +1,275 @@
 use super::*;
 
+fn test_prepared_mapping(magic: &[u8], guest_offset: u64, map_len: usize) -> PreparedMapping {
+    use std::io::Write as _;
+
+    let mut file = tempfile::tempfile().unwrap();
+    file.set_len(map_len as u64).unwrap();
+    file.write_all(magic).unwrap();
+    PreparedMapping {
+        fd: file.into(),
+        file_offset: 0,
+        guest_offset,
+        map_len,
+    }
+}
+
+#[test]
+fn prepared_load_rejects_gap_overlap_and_reordering_before_mapping() {
+    let page = PREPARED_MAPPING_GRANULE;
+    let host_page = host_page_size() as usize;
+    let compressed_len = page + 1;
+    let magic = initramfs::LZ4_LEGACY_MAGIC;
+    for (name, guest_offsets) in [
+        ("gap", [0, (2 * page) as u64]),
+        ("overlap", [0, 0]),
+        ("reordering", [page as u64, 0]),
+    ] {
+        let ranges =
+            guest_offsets.map(|guest_offset| test_prepared_mapping(&magic, guest_offset, page));
+        let error = validate_prepared_load(
+            compressed_len,
+            initramfs::InitrdCompression::Lz4,
+            page,
+            host_page,
+            0,
+            &ranges,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("gap, overlap, or reordering"),
+            "{name} reached mapping instead of failing geometry validation: {error:#}"
+        );
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn prepared_load_rejects_u32_overflow_before_reading_or_mapping() {
+    let error = validate_prepared_load(
+        u32::MAX as usize + 1,
+        initramfs::InitrdCompression::Lz4,
+        host_page_size() as usize,
+        host_page_size() as usize,
+        0,
+        &[],
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("exceeds u32 boot-size field"),
+        "boot protocol size conversion must be the first validation: {error:#}"
+    );
+}
+
+#[test]
+fn prepared_load_validates_magic_for_every_compression() {
+    let page = PREPARED_MAPPING_GRANULE;
+    let host_page = host_page_size() as usize;
+    for (compression, magic) in [
+        (
+            initramfs::InitrdCompression::Lz4,
+            initramfs::LZ4_LEGACY_MAGIC.as_slice(),
+        ),
+        (
+            initramfs::InitrdCompression::Zstd,
+            b"\x28\xb5\x2f\xfd".as_slice(),
+        ),
+        (initramfs::InitrdCompression::Gzip, b"\x1f\x8b".as_slice()),
+        (
+            initramfs::InitrdCompression::Uncompressed,
+            b"070701".as_slice(),
+        ),
+    ] {
+        let ranges = [test_prepared_mapping(magic, 0, page)];
+        assert_eq!(
+            validate_prepared_load(magic.len(), compression, page, host_page, 0, &ranges).unwrap(),
+            magic.len() as u32
+        );
+    }
+
+    let ranges = [test_prepared_mapping(b"nope", 0, page)];
+    let error = validate_prepared_load(
+        4,
+        initramfs::InitrdCompression::Lz4,
+        page,
+        host_page,
+        0,
+        &ranges,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("invalid LZ4 legacy magic"),
+        "compression metadata must select the validation magic: {error:#}"
+    );
+}
+
+#[test]
+fn prepared_load_rejects_invalid_backing_extents_before_mapping() {
+    let page = PREPARED_MAPPING_GRANULE;
+    let host_page = host_page_size() as usize;
+    let mut ranges = vec![
+        test_prepared_mapping(&initramfs::LZ4_LEGACY_MAGIC, 0, page),
+        test_prepared_mapping(&[], page as u64, page),
+    ];
+    rustix::fs::ftruncate(&ranges[1].fd, (page - 1) as u64).unwrap();
+    let error = validate_prepared_load(
+        page + 1,
+        initramfs::InitrdCompression::Lz4,
+        page,
+        host_page,
+        0,
+        &ranges,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("mapping exceeds its backing file"),
+        "a malformed later range must fail before an earlier range can be mapped: {error:#}"
+    );
+
+    ranges.truncate(1);
+    ranges[0].file_offset = libc::off_t::MAX as u64 + 1;
+    let error = validate_prepared_load(
+        1,
+        initramfs::InitrdCompression::Lz4,
+        page,
+        host_page,
+        0,
+        &ranges,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("file offset exceeds off_t"),
+        "every mmap offset must be representable before MAP_FIXED: {error:#}"
+    );
+}
+
+#[test]
+fn prepared_subrange_validation_covers_adjacent_regions_and_rejects_holes() {
+    let page = host_page_size() as usize;
+    let adjacent = GuestMemoryMmap::<()>::from_ranges(&[
+        (GuestAddress(0), page),
+        (GuestAddress(page as u64), page),
+    ])
+    .unwrap();
+    let validated = validate_prepared_subranges(
+        &adjacent,
+        vec![test_prepared_mapping(
+            &initramfs::LZ4_LEGACY_MAGIC,
+            0,
+            2 * page,
+        )],
+        0,
+        page,
+        page,
+    )
+    .unwrap();
+    assert_eq!(validated.len(), 1);
+    assert_eq!(validated[0].subranges.len(), 2);
+    assert_eq!(validated[0].subranges[0].guest_addr, 0);
+    assert_eq!(validated[0].subranges[0].file_offset, 0);
+    assert_eq!(validated[0].subranges[0].len, page);
+    assert_eq!(validated[0].subranges[1].guest_addr, page as u64);
+    assert_eq!(validated[0].subranges[1].file_offset, page as u64);
+    assert_eq!(validated[0].subranges[1].len, page);
+
+    let with_hole = GuestMemoryMmap::<()>::from_ranges(&[
+        (GuestAddress(0), page),
+        (GuestAddress((2 * page) as u64), page),
+    ])
+    .unwrap();
+    let error = validate_prepared_subranges(
+        &with_hole,
+        vec![test_prepared_mapping(
+            &initramfs::LZ4_LEGACY_MAGIC,
+            0,
+            3 * page,
+        )],
+        0,
+        page,
+        page,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("guest-memory hole"),
+        "the exact production split must reject uncovered guest ranges: {error:#}"
+    );
+}
+
+#[test]
+fn prepared_mapper_keeps_guards_on_partial_map_and_numa_failures() {
+    let page = host_page_size() as usize;
+    let subranges = vec![
+        ValidatedPreparedSubrange {
+            guest_addr: 0,
+            host_addr: page as *mut u8,
+            file_offset: 0,
+            len: page,
+        },
+        ValidatedPreparedSubrange {
+            guest_addr: page as u64,
+            host_addr: (2 * page) as *mut u8,
+            file_offset: page as u64,
+            len: page,
+        },
+    ];
+    let validated = vec![ValidatedPreparedRange {
+        range: test_prepared_mapping(&initramfs::LZ4_LEGACY_MAGIC, 0, 2 * page),
+        subranges: subranges.clone(),
+    }];
+    let mut guards = Vec::new();
+    let mut map_calls = 0usize;
+    let error = map_validated_prepared_ranges(
+        &mut guards,
+        validated,
+        |_, _| {
+            map_calls += 1;
+            anyhow::ensure!(map_calls < 2, "injected MAP_FIXED failure");
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+    .unwrap_err();
+    assert_eq!(map_calls, 2, "the mapper must stop at the first failure");
+    assert_eq!(
+        guards.len(),
+        1,
+        "a partially live range must retain its backing fd and shared lock"
+    );
+    assert!(
+        format!("{error:#}").contains("injected MAP_FIXED failure"),
+        "the strict mapper must return the mapping failure without a copy fallback: {error:#}"
+    );
+
+    let validated = vec![ValidatedPreparedRange {
+        range: test_prepared_mapping(&initramfs::LZ4_LEGACY_MAGIC, 0, 2 * page),
+        subranges,
+    }];
+    let mut guards = Vec::new();
+    let mut map_calls = 0usize;
+    let mut numa_calls = 0usize;
+    let error = map_validated_prepared_ranges(
+        &mut guards,
+        validated,
+        |_, _| {
+            map_calls += 1;
+            Ok(())
+        },
+        |_| {
+            numa_calls += 1;
+            anyhow::bail!("injected NUMA restore failure")
+        },
+    )
+    .unwrap_err();
+    assert_eq!(map_calls, 1);
+    assert_eq!(numa_calls, 1);
+    assert_eq!(
+        guards.len(),
+        1,
+        "a mapped range must stay guarded when policy restoration fails"
+    );
+    assert!(format!("{error:#}").contains("injected NUMA restore failure"));
+}
+
 #[test]
 fn prepared_split_alignment_accepts_257mib_custom_node_boundary_on_base_pages() {
     let host_page = host_page_size() as usize;
@@ -43,6 +313,36 @@ fn prepared_host_address_accepts_page_aligned_non_hugepage_va() {
     assert!(
         validate_prepared_host_address((address + 1) as *mut u8).is_err(),
         "a truly host-page-misaligned destination must still be rejected"
+    );
+}
+
+#[test]
+fn prepared_hugetlb_split_requires_huge_aligned_destination_not_file_offset() {
+    let host_page = host_page_size() as usize;
+    let huge = PREPARED_MAPPING_GRANULE;
+    assert!(huge.is_multiple_of(host_page));
+    assert!(
+        validate_prepared_split_host_address(huge as *mut u8, huge).is_ok(),
+        "a 2 MiB-aligned hugetlb replacement destination must be accepted"
+    );
+    if host_page < huge {
+        assert!(
+            validate_prepared_split_host_address(host_page as *mut u8, huge).is_err(),
+            "base-page alignment alone is insufficient for a hugetlb-backed destination"
+        );
+        assert!(
+            validate_prepared_file_offset(host_page as u64, host_page).is_ok(),
+            "the ordinary-file CAS source requires only base-page offset alignment"
+        );
+        assert_ne!(
+            host_page % huge,
+            0,
+            "fixture must prove that a non-2MiB file offset remains valid"
+        );
+    }
+    assert!(
+        validate_prepared_file_offset((host_page + 1) as u64, host_page).is_err(),
+        "an offset that is not aligned to the runtime base page must be rejected"
     );
 }
 
@@ -444,13 +744,13 @@ fn assemble_extras_and_key_threads_staged_into_basekey_in_both_modes() {
     );
 }
 
-/// Drive the REAL `try_cow_overlay` against a live LZ4 SHM segment and a
-/// two-region `GuestMemoryMmap`. The overlay must succeed (return
+/// Drive the legacy test-only SHM compatibility helper against a live LZ4
+/// segment and a two-region `GuestMemoryMmap`. The overlay must succeed (return
 /// `Some`), map the SHM bytes into region A, and leave the adjacent
-/// marker region B byte-for-byte untouched. Exercises the full prod
+/// marker region B byte-for-byte untouched. Exercises that compatibility
 /// path — `shm_open_lz4`, the LZ4-magic pread validation, the rounded-
 /// length bounds check, and the `MAP_FIXED` overlay via `cow_overlay` —
-/// not a re-implementation of the bounds check.
+/// not the production prepared-CAS loader.
 #[test]
 fn try_cow_overlay_maps_segment_and_preserves_adjacent_region() {
     use vm_memory::{Bytes, GuestAddress};
@@ -518,13 +818,13 @@ fn try_cow_overlay_maps_segment_and_preserves_adjacent_region() {
     let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
 }
 
-/// Drive the REAL `try_cow_overlay` with a request whose rounded length
-/// overruns region A into the inter-region gap. The prod bounds check
+/// Drive the legacy test-only SHM compatibility helper with a request whose
+/// rounded length overruns region A into the inter-region gap. Its bounds check
 /// (`get_slice` on the rounded length) must reject it: `try_cow_overlay`
 /// returns `None`, never invokes `MAP_FIXED`, and the adjacent marker
 /// region survives. Unlike the dependency-contract pin in
 /// `initramfs_tests.rs` (which calls `get_slice` directly), this routes
-/// through the production function, so dropping the guard or bounds-
+/// through the compatibility function, so dropping the guard or bounds-
 /// checking `len` instead of `rounded_len` would fail here.
 #[test]
 fn try_cow_overlay_rejects_oversized_request_and_preserves_region() {
@@ -575,8 +875,8 @@ fn try_cow_overlay_rejects_oversized_request_and_preserves_region() {
     let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
 }
 
-/// Drive the REAL `try_cow_overlay` against a stored SHM segment whose
-/// length matches `expected_len` but whose first 4 bytes are NOT the
+/// Drive the legacy test-only SHM compatibility helper against a stored segment
+/// whose length matches `expected_len` but whose first 4 bytes are NOT the
 /// LZ4 legacy magic. The magic-validation arm (`if magic !=
 /// initramfs::LZ4_LEGACY_MAGIC`) must reject it: `try_cow_overlay`
 /// closes the fd and returns `None`, never reaching the `MAP_FIXED`
@@ -638,8 +938,9 @@ fn try_cow_overlay_rejects_stale_non_lz4_magic_segment() {
     let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
 }
 
-/// Drive the REAL `try_cow_overlay` with a non-host-page-aligned
-/// `load_addr`. The alignment gate (`if load_addr & (host_page - 1) !=
+/// Drive the legacy test-only SHM compatibility helper with a
+/// non-host-page-aligned `load_addr`. The alignment gate
+/// (`if load_addr & (host_page - 1) !=
 /// 0`) must reject it: `try_cow_overlay` returns `None` and never
 /// invokes `MAP_FIXED` (mmap would return `EINVAL` on a mid-page
 /// target). The segment carries a VALID LZ4 magic so execution passes
