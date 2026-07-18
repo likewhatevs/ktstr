@@ -1616,19 +1616,22 @@ pub struct VerifierCellRecord {
     pub stats: Vec<ProgStats>,
 }
 
-/// Map a cell's full name to a filesystem-safe record filename: every
-/// non-alphanumeric byte becomes `_`. The input is the cell's full name
-/// (`verifier/<sched>/<kernel>/<preset>`, unique per cell), so the
-/// mapping is unique per cell — a nextest RETRY of the same cell overwrites its
-/// own prior record, so the FINAL attempt's outcome wins (a cell that
-/// failed then passed on retry records PASS).
+/// Map a cell's full name to a compact content-addressed record filename.
+///
+/// The fixed-seed ahash matches ktstr's other fast content-addressed
+/// identities. Hashing the raw, length-delimited name avoids aliases introduced
+/// by filesystem sanitization (`foo-bar` versus `foo_bar`) and keeps the
+/// filename below `NAME_MAX` even when a valid scheduler name is long. A
+/// nextest RETRY of the same cell resolves to the same path and overwrites its
+/// prior record, so the FINAL attempt's outcome wins.
 fn cell_record_filename(full_name: &str) -> String {
-    let mut s: String = full_name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    s.push_str(".json");
-    s
+    use std::hash::{BuildHasher, Hasher};
+
+    let bytes = full_name.as_bytes();
+    let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
+    hasher.write(&(bytes.len() as u64).to_le_bytes());
+    hasher.write(bytes);
+    format!("cell-{:016x}.json", hasher.finish())
 }
 
 /// Write a cell's PASS/FAIL/SKIP record into `dir`. Parses `full_name`
@@ -1735,10 +1738,11 @@ pub enum RunOutcome {
 /// the dispatcher diagnose the empty case itself instead of surfacing a
 /// cryptic nextest exit:
 /// - `--scheduler <NAME>` set + no records: the name is not a declared
-///   scheduler, or no topology preset fits this host for it.
+///   scheduler, or its declared topology constraints / verifier-only
+///   exclusions reject every selected preset.
 /// - no `--scheduler` + no records: no `declare_scheduler!` is linked into
-///   a test binary the sweep sees, or every declared scheduler's
-///   constraints rejected all topology presets on this host.
+///   a test binary the sweep sees, or every declared scheduler rejects all
+///   selected presets through those declaration-level gates.
 ///
 /// A genuine build/exec failure still fails nextest (exit non-zero, which
 /// `--no-tests=pass` does not mask). When that nonzero exit is a REAL
@@ -1771,14 +1775,14 @@ pub fn classify_run_outcome(
         return RunOutcome::Failed(match scheduler {
             Some(name) => format!(
                 "--scheduler {name:?}: matched no verifier cell — no declared BPF \
-                 scheduler by that name, or no topology preset fits this host for \
-                 it. Run `cargo ktstr verifier` with no --scheduler to see the \
-                 swept set."
+                 scheduler by that name, or its declared topology constraints or \
+                 verifier-only exclusions rejected every selected preset. Run \
+                 `cargo ktstr verifier` with no --scheduler to see the swept set."
             ),
             None => "no verifier cells ran — no scheduler is declared via \
                  declare_scheduler! in a linked test binary, or every declared \
-                 scheduler's constraints rejected all topology presets on this \
-                 host."
+                 scheduler's topology constraints or verifier-only exclusions \
+                 rejected every selected preset."
                 .to_string(),
         });
     }
@@ -2227,6 +2231,54 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Distinct valid scheduler names may differ only at punctuation which a
+    /// filesystem sanitizer would collapse. Their cells can finish
+    /// concurrently, so the raw-name content address must keep both records
+    /// independent while preserving same-cell retry overwrite semantics.
+    #[test]
+    fn concurrent_cell_records_do_not_alias_sanitized_scheduler_names() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().expect("result tempdir");
+        let hyphenated = "verifier/foo-bar/kernel_6_14/4cpu-1llc-nosmt";
+        let underscored = "verifier/foo_bar/kernel_6_14/4cpu-1llc-nosmt";
+
+        assert_ne!(
+            cell_record_filename(hyphenated),
+            cell_record_filename(underscored),
+            "the raw cell identity, not a lossy sanitized spelling, keys the record",
+        );
+
+        let barrier = Arc::new(Barrier::new(3));
+        std::thread::scope(|scope| {
+            for (name, verified_insns) in [(hyphenated, 111), (underscored, 222)] {
+                let barrier = Arc::clone(&barrier);
+                let dir = dir.path();
+                scope.spawn(move || {
+                    let stats = [ProgStats {
+                        name: "ktstr_dispatch".into(),
+                        verified_insns,
+                    }];
+                    barrier.wait();
+                    write_cell_record(dir, name, true, false, &stats);
+                });
+            }
+            barrier.wait();
+        });
+
+        let mut records = read_cell_records(dir.path());
+        records.sort_by(|a, b| a.scheduler.cmp(&b.scheduler));
+        assert_eq!(
+            records.len(),
+            2,
+            "concurrent punctuation-distinct cells must retain two JSON records: {records:?}",
+        );
+        assert_eq!(records[0].scheduler, "foo-bar");
+        assert_eq!(records[0].stats[0].verified_insns, 111);
+        assert_eq!(records[1].scheduler, "foo_bar");
+        assert_eq!(records[1].stats[0].verified_insns, 222);
+    }
+
     /// A verifier SKIP is distinct from both PASS and FAIL in the persisted
     /// record, including across JSON round-trip.
     #[test]
@@ -2642,6 +2694,11 @@ mod tests {
             e.contains("--scheduler \"nope\"") && e.contains("matched no verifier cell"),
             "scheduler-empty diagnostic: {e}"
         );
+        assert!(
+            e.contains("declared topology constraints or verifier-only exclusions")
+                && !e.contains("host"),
+            "scheduler-empty diagnostic must describe declaration gates, not host capacity: {e}"
+        );
 
         // Success + empty + no --scheduler -> "no cells ran" diagnosis
         // (must NOT silently succeed under --no-tests=pass).
@@ -2651,6 +2708,10 @@ mod tests {
         assert!(
             e.contains("no verifier cells ran") && e.contains("declare_scheduler!"),
             "no-cells diagnostic: {e}"
+        );
+        assert!(
+            e.contains("topology constraints or verifier-only exclusions") && !e.contains("host"),
+            "no-cells diagnostic must describe declaration gates, not host capacity: {e}"
         );
 
         // Nonzero exit WITH a failed cell + numeric code -> SilentExit: the
