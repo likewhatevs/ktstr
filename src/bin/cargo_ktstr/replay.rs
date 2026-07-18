@@ -218,9 +218,15 @@ pub(crate) fn run_replay(
     // post-exec re-scan that builds a fresh pool Vec.
     let queued: BTreeSet<String> = failed_names.iter().map(|s| s.to_string()).collect();
 
-    let exit = invoke_nextest(&filter_expr, profile, nextest_profile, args).with_context(|| {
-        format!("ktstr replay: cargo nextest run -E {filter_expr:?} failed to spawn")
-    })?;
+    // Only the --exec path builds test binaries. Discover the same narrow
+    // optional-ktstr feature roots as `cargo ktstr test`; dry-run and empty
+    // selections above do no metadata work.
+    let args = crate::feature_discovery::augment_test_features(args.to_vec())
+        .map_err(anyhow::Error::msg)?;
+    let exit =
+        invoke_nextest(&filter_expr, profile, nextest_profile, &args).with_context(|| {
+            format!("ktstr replay: cargo nextest run -E {filter_expr:?} failed to spawn")
+        })?;
 
     // Post-exec outcome diff. Re-scan the sidecar pool so the
     // newly-written sidecars from the replay run reach the

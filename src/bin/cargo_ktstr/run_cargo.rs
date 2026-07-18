@@ -24,6 +24,10 @@ use std::process::Command;
 
 use cargo_metadata::semver::Version;
 
+use crate::feature_discovery::{
+    MetadataMode, augment_test_features, augment_test_features_from_metadata, query_metadata,
+    selected_workspace_packages,
+};
 use crate::kernel::{encode_kernel_list, resolve_kernel_set};
 
 /// Cargo sub-argv that `run_test` passes to `run_cargo_sub`. Named
@@ -37,6 +41,66 @@ pub(crate) const COVERAGE_SUB_ARGV: &[&str] = &["llvm-cov", "nextest"];
 /// Single element — the user's trailing args supply the llvm-cov
 /// subcommand (`report`, `clean`, `show-env`, ...).
 pub(crate) const LLVM_COV_SUB_ARGV: &[&str] = &["llvm-cov"];
+
+/// Whether the raw `cargo ktstr llvm-cov` passthrough explicitly selects
+/// cargo-llvm-cov's nextest subcommand.
+///
+/// Bare `llvm-cov` and its `test` subcommand use Cargo's standard test
+/// harness, not ktstr's nextest listing/dispatch protocol. Report, clean,
+/// show-env, and run do not enumerate ktstr test binaries either. Keep this
+/// deliberately narrow: the documented test-producing form is
+/// `cargo ktstr llvm-cov nextest ...`.
+fn llvm_cov_uses_nextest(args: &[String]) -> bool {
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--" {
+            return false;
+        }
+        if !argument.starts_with('-') {
+            return argument == "nextest";
+        }
+
+        // cargo-llvm-cov accepts its global options before the subcommand.
+        // Skip the value of every current value-taking global option so a
+        // value literally named `nextest` is not mistaken for the subcommand.
+        let takes_separate_value = matches!(
+            argument.as_str(),
+            "--output-path"
+                | "--output-dir"
+                | "--failure-mode"
+                | "--ignore-filename-regex"
+                | "--fail-under-functions"
+                | "--fail-under-lines"
+                | "--fail-under-file-lines"
+                | "--fail-under-regions"
+                | "--fail-uncovered-lines"
+                | "--fail-uncovered-regions"
+                | "--fail-uncovered-functions"
+                | "--dep-coverage"
+                | "--bin"
+                | "--example"
+                | "--test"
+                | "--bench"
+                | "-p"
+                | "--package"
+                | "--exclude"
+                | "--exclude-from-test"
+                | "--exclude-from-report"
+                | "-j"
+                | "--jobs"
+                | "--profile"
+                | "-F"
+                | "--features"
+                | "--target"
+                | "--color"
+                | "--manifest-path"
+                | "-Z"
+        );
+        index += if takes_separate_value { 2 } else { 1 };
+    }
+    false
+}
 
 /// Decide whether to inject `LLVM_PROFILE_FILE` for a given cargo
 /// sub-invocation, returning the pattern to set or `None` to leave
@@ -553,11 +617,16 @@ fn wants_reserved_prebuild(sub_argv: &[&str]) -> bool {
 /// set, so the subsequent (filtered) combined run finds every artifact
 /// cached regardless of which subset it selects. `pub(crate)`: the
 /// verifier dispatcher's warm-up (`verifier.rs`) builds its argv the
-/// same way.
+/// same way. An inner `--` ends nextest option parsing: `--no-run` is inserted
+/// before it and the entire test-binary suffix remains opaque.
 pub(crate) fn prebuild_no_run_args(args: &[String]) -> Vec<String> {
     let mut v: Vec<String> = Vec::with_capacity(args.len() + 1);
     let mut skip_value = false;
-    for a in args {
+    let separator = args
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(args.len());
+    for a in &args[..separator] {
         if skip_value {
             skip_value = false;
             continue;
@@ -574,6 +643,7 @@ pub(crate) fn prebuild_no_run_args(args: &[String]) -> Vec<String> {
         }
     }
     v.push("--no-run".to_string());
+    v.extend_from_slice(&args[separator..]);
     v
 }
 
@@ -913,85 +983,169 @@ fn version_guard(cli: &Version, test: &Version) -> VersionGuard {
 /// set). A cfg-gated ktstr test-driver dependency the host does not link is
 /// exotic; if hit, the failure direction is a false-abort — accepted over
 /// the matching complexity for that case.
-fn resolved_ktstr_version(meta: &cargo_metadata::Metadata) -> Option<&Version> {
-    let resolve = meta.resolve.as_ref()?;
-    // The run executes the targets of the root package, or — in a virtual
-    // workspace (no root package) — of every workspace member.
-    let root_ids: Vec<&cargo_metadata::PackageId> = match &resolve.root {
-        Some(root) => vec![root],
-        None => meta.workspace_members.iter().collect(),
+fn linked_ktstr_versions<'metadata>(
+    meta: &'metadata cargo_metadata::Metadata,
+    root_id: &cargo_metadata::PackageId,
+) -> Vec<&'metadata Version> {
+    let Some(resolve) = meta.resolve.as_ref() else {
+        return Vec::new();
     };
-    for root_id in root_ids {
-        let Some(root_pkg) = meta.packages.iter().find(|p| &p.id == root_id) else {
+    let Some(root_pkg) = meta.packages.iter().find(|package| &package.id == root_id) else {
+        return Vec::new();
+    };
+    // The root package may BE ktstr (the in-repo workspace).
+    if root_pkg.name == "ktstr" {
+        return vec![&root_pkg.version];
+    }
+    // Else: the ktstr the root's bins/tests link is its `ktstr` dep edge.
+    let Some(node) = resolve.nodes.iter().find(|node| &node.id == root_id) else {
+        return Vec::new();
+    };
+    let mut versions = Vec::new();
+    for dep in &node.deps {
+        let Some(dep_pkg) = meta.packages.iter().find(|package| package.id == dep.pkg) else {
             continue;
         };
-        // The root package may BE ktstr (the in-repo workspace).
-        if root_pkg.name == "ktstr" {
-            return Some(&root_pkg.version);
+        if dep_pkg.name != "ktstr" {
+            continue;
         }
-        // Else: the ktstr the root's bins/tests link is its `ktstr` dep edge.
-        let Some(node) = resolve.nodes.iter().find(|n| &n.id == root_id) else {
-            continue;
-        };
-        for dep in &node.deps {
-            let Some(dep_pkg) = meta.packages.iter().find(|p| p.id == dep.pkg) else {
-                continue;
-            };
-            if dep_pkg.name != "ktstr" {
-                continue;
-            }
-            // A pure build-dependency edge is not linked by the test/bin
-            // targets; require a Normal/Development kind. Empty dep_kinds
-            // (older cargo metadata) → treat as a normal link.
-            let linked = dep.dep_kinds.is_empty()
-                || dep.dep_kinds.iter().any(|dk| {
-                    matches!(
-                        dk.kind,
-                        cargo_metadata::DependencyKind::Normal
-                            | cargo_metadata::DependencyKind::Development
-                    )
-                });
-            if linked {
-                return Some(&dep_pkg.version);
-            }
+        // A pure build-dependency edge is not linked by the test/bin
+        // targets; require a Normal/Development kind. Empty dep_kinds
+        // (older cargo metadata) → treat as a normal link.
+        let linked = dep.dep_kinds.is_empty()
+            || dep.dep_kinds.iter().any(|kind| {
+                matches!(
+                    kind.kind,
+                    cargo_metadata::DependencyKind::Normal
+                        | cargo_metadata::DependencyKind::Development
+                )
+            });
+        if linked {
+            versions.push(&dep_pkg.version);
         }
     }
-    None
+    versions
+}
+
+#[cfg(test)]
+fn linked_ktstr_version<'metadata>(
+    meta: &'metadata cargo_metadata::Metadata,
+    root_id: &cargo_metadata::PackageId,
+) -> Option<&'metadata Version> {
+    linked_ktstr_versions(meta, root_id).into_iter().next()
+}
+
+#[cfg(test)]
+fn resolved_ktstr_version(meta: &cargo_metadata::Metadata) -> Option<&Version> {
+    let resolve = meta.resolve.as_ref()?;
+    // Preserve the historical root lookup for the focused graph tests below.
+    // The command guard uses `selected_resolved_ktstr_versions`, which follows
+    // the actual Cargo package selection instead of returning the first member
+    // of a virtual workspace.
+    match &resolve.root {
+        Some(root) => linked_ktstr_version(meta, root),
+        None => meta
+            .workspace_members
+            .iter()
+            .find_map(|root| linked_ktstr_version(meta, root)),
+    }
+}
+
+/// Every distinct ktstr version linked by Cargo's selected workspace members.
+fn selected_resolved_ktstr_versions<'metadata>(
+    meta: &'metadata cargo_metadata::Metadata,
+    args: &[String],
+) -> Vec<&'metadata Version> {
+    let Some(packages) = selected_workspace_packages(meta, args) else {
+        // Malformed/unsupported selection is left for Cargo to diagnose.
+        return Vec::new();
+    };
+    let mut versions = packages
+        .into_iter()
+        .flat_map(|package| linked_ktstr_versions(meta, &package.id))
+        .collect::<Vec<_>>();
+    versions.sort_by(|left, right| left.cmp_precedence(right));
+    versions.dedup_by(|left, right| left.cmp_precedence(right).is_eq());
+    versions
 }
 
 /// Guard CLI↔test ktstr-version skew before running the suite.
 ///
-/// Reads the test project's RESOLVED `ktstr` dependency version (what the
-/// test binaries link) from `cargo metadata` and compares it with the
-/// CLI's own compiled-in version. Warns on any mismatch; errors —
-/// aborting the run — when the test's ktstr is newer than the CLI.
+/// Reads every selected test package's RESOLVED `ktstr` dependency version
+/// (what its test binaries link) from `cargo metadata` and compares it with
+/// the CLI's own compiled-in version. Warns on older versions; errors —
+/// aborting the run — when any selected ktstr is newer than the CLI.
 ///
-/// Best-effort: a project with no `ktstr` dependency, or a `cargo
-/// metadata` failure, skips the guard. The guard must never block a run
-/// it cannot assess — only one it can prove incompatible.
-fn check_ktstr_version_compat() -> Result<(), String> {
+/// A selection with no resolved `ktstr` dependency skips the guard.
+fn check_ktstr_version_compat(
+    meta: &cargo_metadata::Metadata,
+    args: &[String],
+) -> Result<(), String> {
     let cli = Version::parse(env!("CARGO_PKG_VERSION"))
         .expect("cargo-ktstr's own CARGO_PKG_VERSION is valid semver");
-    let meta = match cargo_metadata::MetadataCommand::new().exec() {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(error = %e, "ktstr version guard: cargo metadata failed; skipping");
-            return Ok(());
-        }
-    };
-    // The version the run's test/bin targets actually LINK (resolve-graph
-    // walk, not a `.max()` over the graph — see `resolved_ktstr_version`).
-    let Some(test) = resolved_ktstr_version(&meta) else {
+    let tests = selected_resolved_ktstr_versions(meta, args);
+    if tests.is_empty() {
         // No linked `ktstr` (or no resolve graph) — running outside a
         // ktstr-dependent project, or cannot assess; nothing to guard.
         return Ok(());
-    };
-    match version_guard(&cli, test) {
-        VersionGuard::Ok => {}
-        VersionGuard::Warn(msg) => eprintln!("cargo ktstr: warning: {msg}"),
-        VersionGuard::Error(msg) => return Err(msg),
+    }
+    let outcomes = tests
+        .into_iter()
+        .map(|test| version_guard(&cli, test))
+        .collect::<Vec<_>>();
+    if let Some(message) = outcomes.iter().find_map(|outcome| match outcome {
+        VersionGuard::Error(message) => Some(message),
+        VersionGuard::Ok | VersionGuard::Warn(_) => None,
+    }) {
+        return Err(message.clone());
+    }
+    for outcome in outcomes {
+        if let VersionGuard::Warn(message) = outcome {
+            eprintln!("cargo ktstr: warning: {message}");
+        }
     }
     Ok(())
+}
+
+/// Reuse the initial requested-feature metadata result for targeted optional
+/// ktstr feature inference and, when nothing is added, the version guard.
+///
+/// Metadata inspection has historically been best-effort on these general test
+/// paths. Preserve that behavior: if it fails, warn and let the underlying
+/// Cargo command diagnose (or successfully handle) its own arguments.
+fn prepare_test_args(args: Vec<String>) -> Result<Vec<String>, String> {
+    let metadata = match query_metadata(&args, MetadataMode::Default) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            tracing::warn!(
+                error,
+                "ktstr feature discovery/version guard failed; forwarding original Cargo args"
+            );
+            return Ok(args);
+        }
+    };
+    let augmented = augment_test_features_from_metadata(args.clone(), &metadata);
+    if augmented == args {
+        check_ktstr_version_compat(&metadata, &args)?;
+        return Ok(args);
+    }
+
+    // The first resolve cannot contain an optional ktstr dependency that
+    // inference has only just activated. Resolve once more with the targeted
+    // package-qualified features so the newer-than-CLI guard inspects the
+    // graph Cargo is actually about to build.
+    let resolved = match query_metadata(&augmented, MetadataMode::Default) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            tracing::warn!(
+                error,
+                "ktstr version guard could not resolve inferred features; forwarding Cargo args"
+            );
+            return Ok(augmented);
+        }
+    };
+    check_ktstr_version_compat(&resolved, &augmented)?;
+    Ok(augmented)
 }
 
 /// Split nextest FILTERSET tokens (`-E` / `--filterset` / the legacy
@@ -1007,13 +1161,24 @@ fn check_ktstr_version_compat() -> Result<(), String> {
 /// Multiple filtersets, by contrast, UNION among themselves (`exprs.iter().any`
 /// in `matches_expression`), so they MUST be folded into one `&`-composed
 /// expression to narrow rather than widen.
+/// An inner `--` and every following test-binary argument remain opaque.
 pub(crate) fn extract_nextest_filtersets(args: Vec<String>) -> (Vec<String>, Vec<String>) {
     let mut filters = Vec::new();
     let mut rest = Vec::new();
     let mut it = args.into_iter();
     while let Some(tok) = it.next() {
+        if tok == "--" {
+            rest.push(tok);
+            rest.extend(it);
+            break;
+        }
         if tok == "-E" || tok == "--filterset" || tok == "--filter-expr" {
             if let Some(val) = it.next() {
+                if val == "--" {
+                    rest.push(val);
+                    rest.extend(it);
+                    break;
+                }
                 filters.push(val);
             }
         } else if let Some(val) = tok
@@ -1045,7 +1210,8 @@ pub(crate) fn extract_nextest_filtersets(args: Vec<String>) -> (Vec<String>, Vec
 /// (`(relevant) & (userA | userB | ...)`), never widens it (nextest UNIONs
 /// multiple `-E`). User filterset tokens are removed and replaced by one
 /// composed `-E`; every other token (positional name filters, `--features`,
-/// …) is preserved and passes through untouched.
+/// …) is preserved and passes through untouched. The replacement filter is
+/// inserted before an inner `--`.
 fn compose_relevant_filter(args: Vec<String>, relevant: &str) -> Vec<String> {
     let (user_filtersets, mut rest) = extract_nextest_filtersets(args);
     let combined = if user_filtersets.is_empty() {
@@ -1058,8 +1224,11 @@ fn compose_relevant_filter(args: Vec<String>, relevant: &str) -> Vec<String> {
             .join(" | ");
         format!("({relevant}) & ({union})")
     };
-    rest.push("-E".to_string());
-    rest.push(combined);
+    let insertion = rest
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(rest.len());
+    rest.splice(insertion..insertion, ["-E".to_string(), combined]);
     rest
 }
 
@@ -1108,8 +1277,8 @@ pub(crate) fn run_test(
 ) -> Result<(), String> {
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     ktstr::cli::check_tools(&["cargo-nextest"]).map_err(|e| format!("{e:#}"))?;
-    check_ktstr_version_compat()?;
     let args = apply_relevant_narrowing(args, relevant, base, base_ref, default_branch)?;
+    let args = prepare_test_args(args)?;
     run_cargo_sub(
         TEST_SUB_ARGV,
         "tests",
@@ -1141,11 +1310,10 @@ pub(crate) fn run_coverage(
 ) -> Result<(), String> {
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     ktstr::cli::check_tools(&["cargo-nextest", "cargo-llvm-cov"]).map_err(|e| format!("{e:#}"))?;
-    // `coverage` runs the SAME test suite (cargo llvm-cov nextest), so it
-    // hits the same CLI-too-old incompatibility `test` does — guard it
-    // identically.
-    check_ktstr_version_compat()?;
     let args = apply_relevant_narrowing(args, relevant, base, base_ref, default_branch)?;
+    // `coverage` runs the same suite through `cargo llvm-cov nextest`, so use
+    // the same version guard and targeted feature inference as `test`.
+    let args = prepare_test_args(args)?;
     run_cargo_sub(
         COVERAGE_SUB_ARGV,
         "coverage",
@@ -1179,6 +1347,12 @@ pub(crate) fn run_llvm_cov(
     // invocation under a version-skewed project. A `cargo ktstr llvm-cov
     // nextest` that DOES run tests is the user's explicit raw-passthrough
     // choice; they own the version in that case.
+    let args = if llvm_cov_uses_nextest(&args) {
+        augment_test_features(args)
+            .map_err(|error| format!("cargo ktstr llvm-cov nextest: {error}"))?
+    } else {
+        args
+    };
     run_cargo_sub(
         LLVM_COV_SUB_ARGV,
         "llvm-cov",
@@ -1260,6 +1434,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn llvm_cov_feature_inference_is_nextest_only() {
+        for args in [
+            strs(&["nextest", "--workspace"]),
+            strs(&["--locked", "nextest"]),
+            strs(&["--workspace", "nextest"]),
+            strs(&["--manifest-path", "consumer/Cargo.toml", "nextest"]),
+            strs(&["--features=integration", "nextest"]),
+        ] {
+            assert!(
+                llvm_cov_uses_nextest(&args),
+                "explicit nextest subcommand should receive inference: {args:?}",
+            );
+        }
+        for args in [
+            strs(&[]),
+            strs(&["test"]),
+            strs(&["report", "--lcov"]),
+            strs(&["clean"]),
+            strs(&["show-env"]),
+            strs(&["run", "--bin", "scheduler"]),
+            strs(&["--features", "nextest"]),
+            strs(&["--manifest-path", "nextest"]),
+            strs(&["--", "nextest"]),
+        ] {
+            assert!(
+                !llvm_cov_uses_nextest(&args),
+                "raw/report mode must preserve its exact feature selection: {args:?}",
+            );
+        }
+    }
+
     fn strs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
     }
@@ -1296,6 +1502,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn extract_filtersets_preserves_inner_separator_suffix() {
+        let args = strs(&[
+            "-E",
+            "test(cargo_side)",
+            "--",
+            "-E",
+            "test_binary_value",
+            "--filterset=opaque",
+        ]);
+        let (filters, rest) = extract_nextest_filtersets(args);
+        assert_eq!(filters, strs(&["test(cargo_side)"]));
+        assert_eq!(
+            rest,
+            strs(&["--", "-E", "test_binary_value", "--filterset=opaque"]),
+        );
+    }
+
     /// With no user filterset, the relevant expression is injected verbatim as a
     /// single `-E`, and non-filter passthrough is preserved.
     #[test]
@@ -1327,6 +1551,26 @@ mod tests {
                 "x",
                 "-E",
                 "(test(r)) & ((test(u1)) | (test(u2)))",
+            ]),
+        );
+    }
+
+    #[test]
+    fn compose_relevant_inserts_filter_before_inner_separator() {
+        let out = compose_relevant_filter(
+            strs(&["--features", "x", "--", "-E", "test_binary_value"]),
+            "test(relevant)",
+        );
+        assert_eq!(
+            out,
+            strs(&[
+                "--features",
+                "x",
+                "-E",
+                "test(relevant)",
+                "--",
+                "-E",
+                "test_binary_value",
             ]),
         );
     }
@@ -1482,6 +1726,54 @@ mod tests {
         let meta: cargo_metadata::Metadata =
             serde_json::from_str(&json).expect("fixture deserializes");
         assert_eq!(resolved_ktstr_version(&meta), Some(&v("0.17.0")));
+    }
+
+    #[test]
+    fn selected_resolved_versions_follow_exact_glob_and_workspace_selection() {
+        let crates_io = r#""registry+https://github.com/rust-lang/crates.io-index""#;
+        let alpha = "alpha 0.1.0 (path+file:///w/alpha)";
+        let beta = "beta 0.1.0 (path+file:///w/beta)";
+        let old = "ktstr 0.18.0 (registry+https://github.com/rust-lang/crates.io-index)";
+        let new = "ktstr 0.43.0 (registry+https://github.com/rust-lang/crates.io-index)";
+        let json = format!(
+            r#"{{
+              "packages":[{alpha_pkg},{beta_pkg},{old_pkg},{new_pkg}],
+              "workspace_members":["{alpha}","{beta}"],
+              "workspace_default_members":["{alpha}"],
+              "resolve":{{
+                "root":null,
+                "nodes":[
+                  {{"id":"{alpha}","deps":[{{"name":"ktstr","pkg":"{old}","dep_kinds":[{{"kind":null,"target":null}}]}}],"dependencies":["{old}"],"features":[]}},
+                  {{"id":"{beta}","deps":[{{"name":"ktstr","pkg":"{new}","dep_kinds":[{{"kind":null,"target":null}}]}}],"dependencies":["{new}"],"features":[]}},
+                  {{"id":"{old}","deps":[],"dependencies":[],"features":[]}},
+                  {{"id":"{new}","deps":[],"dependencies":[],"features":[]}}
+                ]
+              }},
+              "workspace_root":"/w","target_directory":"/w/target","version":1
+            }}"#,
+            alpha_pkg = pkg_json("alpha", "0.1.0", alpha, "null"),
+            beta_pkg = pkg_json("beta", "0.1.0", beta, "null"),
+            old_pkg = pkg_json("ktstr", "0.18.0", old, crates_io),
+            new_pkg = pkg_json("ktstr", "0.43.0", new, crates_io),
+        );
+        let meta: cargo_metadata::Metadata =
+            serde_json::from_str(&json).expect("fixture deserializes");
+
+        assert_eq!(
+            selected_resolved_ktstr_versions(&meta, &[]),
+            vec![&v("0.18.0")],
+            "unscoped commands guard only Cargo's default members",
+        );
+        assert_eq!(
+            selected_resolved_ktstr_versions(&meta, &strs(&["-p", "b*"])),
+            vec![&v("0.43.0")],
+            "a globbed package selection must not guard an unrelated member",
+        );
+        assert_eq!(
+            selected_resolved_ktstr_versions(&meta, &strs(&["--workspace"])),
+            vec![&v("0.18.0"), &v("0.43.0")],
+            "workspace runs must guard every distinct linked ktstr version",
+        );
     }
 
     /// Serialize env mutation across this binary's tests. nextest runs
@@ -2052,6 +2344,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prebuild_no_run_args_preserves_inner_separator_suffix() {
+        let args = strs(&[
+            "--no-fail-fast",
+            "--features",
+            "integration",
+            "--",
+            "--fail-fast",
+            "--max-fail",
+            "3",
+        ]);
+        assert_eq!(
+            prebuild_no_run_args(&args),
+            strs(&[
+                "--features",
+                "integration",
+                "--no-run",
+                "--",
+                "--fail-fast",
+                "--max-fail",
+                "3",
+            ]),
+        );
+    }
+
     /// The warm-up command built for the `test` path carries the SAME
     /// build-affecting argv as the combined run (profile injection,
     /// nextest profile) PLUS a trailing `--no-run`, so the combined run
@@ -2059,7 +2376,7 @@ mod tests {
     /// `build_cargo_command` factory the warm-up shares with the run.
     #[test]
     fn warmup_command_mirrors_run_argv_plus_no_run() {
-        let user = strs(&["--features", "ktstr-tests"]);
+        let user = strs(&["--features", "consumer/ktstr-tests"]);
         let warm = build_cargo_command(
             TEST_SUB_ARGV,
             true, // release → `--cargo-profile release`
@@ -2083,7 +2400,7 @@ mod tests {
                 "--profile",
                 "ci",
                 "--features",
-                "ktstr-tests",
+                "consumer/ktstr-tests",
                 "--no-run",
             ]),
             "warm-up must equal the run argv (profiles/features) + trailing --no-run",

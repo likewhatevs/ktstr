@@ -170,8 +170,11 @@ pub(crate) fn build_test_binaries(
     {
         return Ok(vec![PathBuf::from(bin)]);
     }
+    let argv =
+        crate::feature_discovery::augment_test_features(build_test_binaries_argv(package, release))
+            .map_err(|error| format!("discover ktstr test features: {error}"))?;
     let mut cmd = Command::new("cargo");
-    cmd.args(build_test_binaries_argv(package, release));
+    cmd.args(argv);
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit());
 

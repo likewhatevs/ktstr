@@ -44,10 +44,20 @@ cargo ktstr verifier --raw
 See [cargo-ktstr verifier](cargo-ktstr.md#verifier) for the flag
 list.
 
-In a workspace with multiple ktstr versions, the one-shot command
-enumerates only packages linked to the current cargo-ktstr version.
-Older test packages are skipped with a short update-or-exclude message;
-current scheduler declarations continue in the same run.
+In a workspace with multiple ktstr versions, a bare/unscoped one-shot
+command considers every workspace package and enumerates those compatible
+with the current cargo-ktstr version; explicit package selectors remain
+scoped to the request. Older test packages are skipped with a short
+update-or-exclude message, while current scheduler declarations continue
+in the same run. Compatible
+direct optional ktstr dependencies are matched through ktstr-only feature
+aliases, and only those package-qualified roots are auto-injected.
+Conventional feature-gated declarations are therefore discovered by a
+bare `cargo ktstr verifier`; older workspace packages remain outside the
+selection. Cargo metadata cannot identify arbitrary source-level `cfg`
+expressions, so other arrangements such as a transitive optional helper or
+a composite gate remain opt-in through `--features`. Target-specific
+optional ktstr dependencies remain explicit for the same reason.
 
 ## A real sweep
 

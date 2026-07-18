@@ -11,6 +11,9 @@
 //!   `KtstrCommand` / `StatsCommand`
 //!   types that drive argument parsing and shell
 //!   completion generation.
+//! - `feature_discovery` — Cargo-metadata inspection that finds narrow
+//!   optional-ktstr feature gates and package-qualifies them for every
+//!   supported nextest or workspace test-registry build/probe command.
 //! - `kernel` — `--kernel <SPEC>` resolution shared by the `shell`,
 //!   `verifier`, and gauntlet-expansion code paths, plus
 //!   the `kernel build` subcommand dispatcher. Pure
@@ -50,6 +53,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 mod affected;
 #[path = "cargo_ktstr/cli.rs"]
 mod cli;
+#[path = "cargo_ktstr/feature_discovery.rs"]
+mod feature_discovery;
 #[path = "cargo_ktstr/interrupt.rs"]
 mod interrupt;
 #[path = "cargo_ktstr/kernel/mod.rs"]

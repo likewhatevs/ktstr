@@ -155,6 +155,27 @@ cargo ktstr test --kernel 7.0 -- --features integration    # cargo features
 cargo ktstr test --relevant                                # only tests my edits affect
 ```
 
+Before a supported command runs nextest or builds/probes downstream ktstr
+test registries, cargo-ktstr uses a Cargo metadata preflight to find direct
+optional ktstr dependencies and their ktstr-only feature chains. It
+automatically adds package-qualified selectors such as
+`--features scx_lavd/ktstr-tests`. Ordinary commands restrict those
+selectors to Cargo's selected/default workspace members. Existing
+`--features` are preserved; an explicit Cargo-side `--all-features`
+remains authoritative.
+
+This applies to `test`/`nextest`, `coverage`, `llvm-cov nextest`,
+`replay --exec`, `verifier`, and the shared test-binary build used by
+`export`, `shell --test`, and `cargo ktstr affected`. Commands that
+neither run nextest nor build/probe workspace test binaries do no feature
+inference.
+
+Cargo metadata cannot identify arbitrary source-level `cfg` expressions.
+Only ktstr-specific feature chains are inferred; composite gates and
+transitive optional-helper arrangements remain explicit. Target-specific
+optional ktstr dependencies also remain explicit because a metadata-only
+preflight does not have Cargo's complete target cfg evaluation.
+
 A real single-test run against a local kernel tree looks like this.
 The source tree was already built, so ktstr resolved it to a cache key
 and reused the image:
@@ -266,11 +287,15 @@ kernel-resolution plumbing:
 
 ```sh
 cargo ktstr llvm-cov report --lcov --output-path lcov.info
+cargo ktstr llvm-cov nextest --workspace
 ```
 
 Always pass a subcommand: a bare `cargo ktstr llvm-cov` falls
 through to `cargo test`, which skips gauntlet variants and verifier
-cells entirely (they exist only under the nextest harness).
+cells entirely (they exist only under the nextest harness). The explicit
+`nextest` form gets targeted optional-ktstr feature inference; every
+other raw form (`test`, `run`, `report`, `clean`, `show-env`, or bare)
+preserves the supplied feature selection.
 
 ## kernel
 
@@ -396,6 +421,13 @@ cargo ktstr verifier --kernel 7.0
 cargo ktstr verifier --scheduler scx-ktstr     # one scheduler
 cargo ktstr verifier --raw                     # no cycle collapse
 ```
+
+Unlike ordinary test commands, a bare/unscoped verifier recursively
+widens its Cargo package selection to every compatible workspace package.
+Explicit package selectors remain scoped to the requested packages. The
+verifier reuses the targeted feature inference described under
+[`test`](#test), while excluding packages linked to an older ktstr that
+this verifier dispatcher cannot enumerate.
 
 See [BPF Verifier Sweep](verifier.md) for the cell model, real
 output, and the kernels-filter contract.

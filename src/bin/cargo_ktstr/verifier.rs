@@ -29,9 +29,13 @@
 //! `cargo nextest run` (a nextest filterset, `--cargo-profile`, ...);
 //! native flags may appear in any order relative to them and no `--`
 //! separator is needed (see the bin's `argsplit` module). The
-//! `declare_scheduler!` verifier cells carry no
-//! `required-features`, so they build without a feature flag — no
-//! `--features` passthrough is needed to collect verifier statistics.
+//! `declare_scheduler!` verifier cells carry no `required-features`,
+//! but a consumer may place the declaration in a feature-gated test
+//! target. For a direct compatible optional ktstr dependency, the dispatcher
+//! follows ktstr-only feature aliases and auto-injects only their
+//! package-qualified roots. Conventional gated targets therefore link their
+//! declarations without a manual `--features` passthrough or an over-broad
+//! `--all-features`.
 //! The scheduler-under-test builds release by default, and each cell boots
 //! with performance mode disabled (its `verified_insns` count is
 //! perf-mode-independent, so cells take only a shared LLC reservation
@@ -55,8 +59,15 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use cargo_metadata::semver::Version;
-use cargo_metadata::{CargoOpt, Metadata, MetadataCommand, PackageId};
+use cargo_metadata::{Metadata, PackageId};
 
+use crate::feature_discovery::{
+    MetadataMode, PackageFeatureActivation, VersionScope, has_package_selector,
+    has_workspace_selector, infer_ktstr_feature_roots, inject_feature_activations,
+    package_spec_name, query_metadata, selected_workspace_packages,
+};
+#[cfg(test)]
+use crate::feature_discovery::{explicit_package_exclusions, explicit_package_selection};
 use crate::kernel::{
     encode_kernel_list, path_kernel_label, resolve_kernel_image, resolve_kernel_set,
 };
@@ -108,6 +119,9 @@ fn sweep_stale_result_dirs(temp_root: &std::path::Path) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CompatibleVerifierPackage {
     name: String,
+    /// Minimal package feature roots whose definitions exclusively activate
+    /// this package's optional dependency on the current ktstr.
+    verifier_features: Vec<String>,
 }
 
 /// One workspace package whose test-link closure contains an older ktstr.
@@ -239,6 +253,7 @@ fn verifier_package_plan(meta: &Metadata, cli: &Version) -> Result<VerifierPacka
         } else {
             compatible.push(CompatibleVerifierPackage {
                 name: member.name.to_string(),
+                verifier_features: infer_ktstr_feature_roots(member, VersionScope::Matches(cli)),
             });
         }
     }
@@ -253,45 +268,73 @@ fn verifier_package_plan(meta: &Metadata, cli: &Version) -> Result<VerifierPacka
     })
 }
 
-/// Cargo options which affect dependency resolution and are safe to replay on
-/// the verifier's metadata preflight. Feature selection is intentionally not
-/// copied: the preflight always uses all features so optional ktstr test edges
-/// (such as scx's `ktstr-tests`) are visible before nextest builds anything.
-fn metadata_passthrough_options(args: &[String]) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        if matches!(arg.as_str(), "--locked" | "--offline" | "--frozen") {
-            out.push(arg.clone());
-        } else if matches!(arg.as_str(), "--config" | "--manifest-path") {
-            out.push(arg.clone());
-            if let Some(value) = it.next() {
-                out.push(value.clone());
-            }
-        } else if arg.starts_with("--config=") || arg.starts_with("--manifest-path=") {
-            out.push(arg.clone());
-        }
-    }
-    out
-}
-
 /// Resolve the verifier package partition before either nextest warm-up or run.
-///
-/// `cargo_path("cargo")` is load-bearing for local development: unlike
-/// cargo_metadata's `$CARGO` default, it honors the PATH cargo wrapper used to
-/// patch crates.io ktstr to a checkout.
 fn query_verifier_package_plan(args: &[String]) -> Result<VerifierPackagePlan, String> {
     let cli = Version::parse(env!("CARGO_PKG_VERSION"))
         .expect("cargo-ktstr's own CARGO_PKG_VERSION is valid semver");
-    let mut command = MetadataCommand::new();
-    command
-        .cargo_path("cargo")
-        .features(CargoOpt::AllFeatures)
-        .other_options(metadata_passthrough_options(args));
-    let metadata = command
-        .exec()
-        .map_err(|e| format!("cargo ktstr verifier: cargo metadata failed: {e}"))?;
-    verifier_package_plan(&metadata, &cli)
+    // First inspect workspace manifests without resolving optional
+    // dependencies, then resolve only the ktstr-specific gates inferred from
+    // those manifests. This gives recursive linked-version classification the
+    // exact graph compilation will use without a broad all-features resolve.
+    let manifests = query_metadata(args, MetadataMode::NoDeps)
+        .map_err(|error| format!("cargo ktstr verifier: {error}"))?;
+    let member_ids = manifests.workspace_members.iter().collect::<HashSet<_>>();
+    let activations = manifests
+        .packages
+        .iter()
+        .filter(|package| member_ids.contains(&package.id))
+        .filter_map(|package| {
+            let features = infer_ktstr_feature_roots(package, VersionScope::Any);
+            (!features.is_empty()).then(|| PackageFeatureActivation {
+                package: package.name.to_string(),
+                features,
+            })
+        })
+        .collect::<Vec<_>>();
+    let resolution_args = inject_feature_activations(args.to_vec(), &activations);
+    let metadata = query_metadata(&resolution_args, MetadataMode::Default)
+        .map_err(|error| format!("cargo ktstr verifier: {error}"))?;
+    let mut plan = verifier_package_plan(&metadata, &cli)?;
+
+    // A bare verifier deliberately widens beyond Cargo's default members.
+    // Once the operator supplies package selection, however, classify only
+    // the exact/globbed workspace packages Cargo selected. A lone --exclude
+    // applies to that widened workspace selection, so synthesize --workspace
+    // for metadata selection without changing the forwarded Cargo argv.
+    if has_package_selector(args) {
+        let selection_args;
+        let args = if has_workspace_selector(args) || has_explicit_package_selector(args) {
+            args
+        } else {
+            selection_args = std::iter::once("--workspace".to_string())
+                .chain(args.iter().cloned())
+                .collect::<Vec<_>>();
+            &selection_args
+        };
+        if let Some(packages) = selected_workspace_packages(&metadata, args) {
+            let selected = packages
+                .into_iter()
+                .map(|package| package.name.to_string())
+                .collect::<HashSet<_>>();
+            plan.compatible
+                .retain(|package| selected.contains(&package.name));
+            plan.older
+                .retain(|package| selected.contains(&package.name));
+            plan.newer
+                .retain(|package| selected.contains(&package.name));
+        }
+    }
+    Ok(plan)
+}
+
+fn has_explicit_package_selector(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|argument| argument.as_str() != "--")
+        .any(|argument| {
+            matches!(argument.as_str(), "-p" | "--package")
+                || argument.starts_with("--package=")
+                || (argument.starts_with("-p") && argument.len() > 2)
+        })
 }
 
 fn format_older_package_skip(package: &OlderVerifierPackage) -> String {
@@ -307,83 +350,7 @@ fn format_older_package_skip(package: &OlderVerifierPackage) -> String {
     )
 }
 
-/// Recover a Cargo package name from the common `-p` package-id spellings.
-///
-/// Exact names and `name@version` cover normal verifier use. A full package ID
-/// (`registry+...#name@version` / `path+...#name@version`) is reduced to its
-/// fragment. Anything with Cargo package-spec syntax this small parser cannot
-/// prove is left unresolved, causing selection filtering to stay conservative.
-fn package_spec_name(spec: &str) -> Option<&str> {
-    let tail = spec.rsplit_once('#').map_or(spec, |(_, tail)| tail);
-    let name = tail.split(['@', ':']).next()?;
-    (!name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
-    .then_some(name)
-}
-
-/// Exact package names requested by `-p` / `--package`, or `None` for the
-/// unscoped / `--workspace` case (and for package-id syntax we cannot prove).
-fn explicit_package_selection(args: &[String]) -> Option<HashSet<String>> {
-    if args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "--workspace" | "--all"))
-    {
-        return None;
-    }
-    let mut selected = HashSet::new();
-    let mut saw_package = false;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        let spec = if matches!(arg.as_str(), "-p" | "--package") {
-            saw_package = true;
-            index += 1;
-            args.get(index).map(String::as_str)
-        } else if let Some(spec) = arg.strip_prefix("--package=") {
-            saw_package = true;
-            Some(spec)
-        } else if let Some(spec) = arg.strip_prefix("-p")
-            && !spec.is_empty()
-        {
-            saw_package = true;
-            Some(spec)
-        } else {
-            None
-        };
-        if let Some(spec) = spec {
-            let name = package_spec_name(spec)?;
-            selected.insert(name.to_string());
-        } else if saw_package && matches!(arg.as_str(), "-p" | "--package") {
-            // A missing selector value is invalid Cargo syntax. Do not infer a
-            // narrower compatibility scope from it.
-            return None;
-        }
-        index += 1;
-    }
-    saw_package.then_some(selected)
-}
-
-fn explicit_package_exclusions(args: &[String]) -> HashSet<String> {
-    let mut excluded = HashSet::new();
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        let spec = if arg == "--exclude" {
-            index += 1;
-            args.get(index).map(String::as_str)
-        } else {
-            arg.strip_prefix("--exclude=")
-        };
-        if let Some(name) = spec.and_then(package_spec_name) {
-            excluded.insert(name.to_string());
-        }
-        index += 1;
-    }
-    excluded
-}
-
+#[cfg(test)]
 fn restrict_plan_to_explicit_selection(
     mut plan: VerifierPackagePlan,
     args: &[String],
@@ -413,12 +380,18 @@ fn restrict_plan_to_explicit_selection(
 /// This matters for a mixed explicit selection: the invariant nextest package
 /// gate prevents an old binary from listing, but dropping its Cargo selector
 /// also prevents its obsolete dependency stack from being compiled at all.
+/// A `--` separator ends Cargo option parsing; every token from that boundary
+/// onward belongs to the test binary and must be preserved verbatim.
 fn drop_older_package_selectors(args: &[String], older: &[OlderVerifierPackage]) -> Vec<String> {
     let old_names: HashSet<&str> = older.iter().map(|package| package.name.as_str()).collect();
     let mut out = Vec::with_capacity(args.len());
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
+        if arg == "--" {
+            out.extend_from_slice(&args[index..]);
+            break;
+        }
         if matches!(arg.as_str(), "-p" | "--package") {
             if let Some(spec) = args.get(index + 1)
                 && package_spec_name(spec).is_some_and(|name| old_names.contains(name))
@@ -448,20 +421,68 @@ fn drop_older_package_selectors(args: &[String], older: &[OlderVerifierPackage])
     out
 }
 
-fn has_package_selector(args: &[String]) -> bool {
-    args.iter().any(|arg| {
-        matches!(
-            arg.as_str(),
-            "-p" | "--package" | "--workspace" | "--all" | "--exclude"
-        ) || arg.starts_with("--package=")
-            || arg.starts_with("--exclude=")
-            || (arg.starts_with("-p") && arg.len() > 2)
-    })
+/// Whether an explicit package selector needs Cargo-style pattern expansion.
+///
+/// Exact names and source-qualified `#name@version` IDs can be pruned one by
+/// one above. Globs and legacy full IDs cannot, so a mixed current+old
+/// selection is rewritten to the already-classified compatible packages.
+fn has_non_exact_package_selector(args: &[String]) -> bool {
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--" {
+            break;
+        }
+        let spec = if matches!(argument.as_str(), "-p" | "--package") {
+            index += 1;
+            args.get(index).map(String::as_str)
+        } else {
+            argument
+                .strip_prefix("--package=")
+                .or_else(|| argument.strip_prefix("-p").filter(|spec| !spec.is_empty()))
+        };
+        if spec.is_some_and(|spec| package_spec_name(spec).is_none()) {
+            return true;
+        }
+        index += 1;
+    }
+    false
 }
 
-fn has_workspace_selector(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| matches!(arg.as_str(), "--workspace" | "--all"))
+/// Replace every Cargo-side package selector with exact compatible packages.
+fn replace_package_selectors(
+    args: &[String],
+    compatible: &[CompatibleVerifierPackage],
+) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len() + compatible.len() * 2);
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--" {
+            for package in compatible {
+                out.push("-p".to_string());
+                out.push(package.name.clone());
+            }
+            out.extend_from_slice(&args[index..]);
+            return out;
+        }
+        if matches!(argument.as_str(), "-p" | "--package") {
+            index += usize::from(args.get(index + 1).is_some()) + 1;
+            continue;
+        }
+        if argument.starts_with("--package=") || (argument.starts_with("-p") && argument.len() > 2)
+        {
+            index += 1;
+            continue;
+        }
+        out.push(argument.clone());
+        index += 1;
+    }
+    for package in compatible {
+        out.push("-p".to_string());
+        out.push(package.name.clone());
+    }
+    out
 }
 
 /// Build the one invariant nextest filter used by both warm-up and run.
@@ -507,6 +528,19 @@ fn build_scoped_nextest_args(
         .expect("build_nextest_args always carries -E <filter>");
     args[filter_index] = filter;
 
+    // Discovery resolved only inferred ktstr gates. Replay the compatible
+    // package roots through the same targeted injector ordinary cargo-ktstr
+    // test commands use.
+    let activations = plan
+        .compatible
+        .iter()
+        .map(|package| PackageFeatureActivation {
+            package: package.name.clone(),
+            features: package.verifier_features.clone(),
+        })
+        .collect::<Vec<_>>();
+    let rest = inject_feature_activations(rest, &activations);
+
     // The unscoped one-shot path selects ONLY packages that can enumerate
     // current verifier declarations. This keeps old ktstr (and every unrelated
     // workspace package) out of the compile itself. Existing explicit package
@@ -522,6 +556,14 @@ fn build_scoped_nextest_args(
             args.push("-p".to_string());
             args.push(package.name.clone());
         }
+    } else if !has_explicit_package_selector(&rest) {
+        // A lone --exclude applies to verifier's intentionally widened
+        // workspace selection. Cargo requires --workspace alongside it.
+        args.push("--workspace".to_string());
+        for package in &plan.older {
+            args.push("--exclude".to_string());
+            args.push(package.name.clone());
+        }
     }
     args.extend(rest);
     args
@@ -531,10 +573,11 @@ fn build_scoped_nextest_args(
 ///
 /// The trailing `args` are forwarded verbatim to the inner
 /// `cargo nextest run` (a nextest filterset, `--cargo-profile`, ...).
-/// The `declare_scheduler!` verifier cells carry no `required-features`,
-/// so they build without a feature flag — no `--features` passthrough is
-/// needed for the cell-only filter to match and collect verifier
-/// statistics.
+/// The `declare_scheduler!` verifier cells carry no `required-features`, but
+/// declaration targets may themselves be feature-gated. From metadata, the
+/// dispatcher follows and package-qualifies ktstr-only feature chains for a
+/// direct compatible optional ktstr dependency, so conventional gates need no
+/// manual `--features` passthrough or broad `--all-features`.
 ///
 /// `profile` is the scheduler-under-test's cargo BUILD profile
 /// (`--profile <NAME>`): set as `KTSTR_SCHEDULER_PROFILE` so
@@ -552,8 +595,7 @@ pub(crate) fn run_verifier(
     include_eol: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
-    let package_plan =
-        restrict_plan_to_explicit_selection(query_verifier_package_plan(&args)?, &args);
+    let package_plan = query_verifier_package_plan(&args)?;
     if let Some(package) = package_plan.newer.first() {
         let versions = package
             .versions
@@ -576,7 +618,11 @@ pub(crate) fn run_verifier(
     if package_plan.compatible.is_empty() && !package_plan.older.is_empty() {
         return Ok(());
     }
-    let args = drop_older_package_selectors(&args, &package_plan.older);
+    let args = if !package_plan.older.is_empty() && has_non_exact_package_selector(&args) {
+        replace_package_selectors(&args, &package_plan.compatible)
+    } else {
+        drop_older_package_selectors(&args, &package_plan.older)
+    };
     let nextest_args = build_scoped_nextest_args(nextest_profile.as_deref(), &args, &package_plan);
 
     let mut cmd = Command::new("cargo");
@@ -778,10 +824,51 @@ mod tests {
         values.iter().map(|value| (*value).to_string()).collect()
     }
 
-    fn package_json(name: &str, version: &str, id: &str) -> String {
+    fn package_json_with(
+        name: &str,
+        version: &str,
+        id: &str,
+        dependencies: &str,
+        features: &str,
+    ) -> String {
         format!(
-            r#"{{"name":"{name}","version":"{version}","id":"{id}","source":null,"description":null,"dependencies":[],"license":null,"license_file":null,"targets":[],"features":{{}},"manifest_path":"/w/{name}/Cargo.toml","readme":null,"repository":null,"homepage":null,"documentation":null,"links":null,"publish":null,"default_run":null}}"#
+            r#"{{"name":"{name}","version":"{version}","id":"{id}","source":null,"description":null,"dependencies":{dependencies},"license":null,"license_file":null,"targets":[],"features":{features},"manifest_path":"/w/{name}/Cargo.toml","readme":null,"repository":null,"homepage":null,"documentation":null,"links":null,"publish":null,"default_run":null}}"#
         )
+    }
+
+    fn package_json(name: &str, version: &str, id: &str) -> String {
+        package_json_with(name, version, id, "[]", "{}")
+    }
+
+    fn optional_ktstr_package_json(
+        name: &str,
+        version: &str,
+        id: &str,
+        ktstr_req: &str,
+        alias: Option<&str>,
+        feature: &str,
+    ) -> String {
+        let dependency_alias = alias.unwrap_or("ktstr");
+        let features = format!(r#"{{"{feature}":["dep:{dependency_alias}"],"unrelated-mode":[]}}"#);
+        optional_ktstr_package_with_features_json(
+            name, version, id, ktstr_req, alias, "null", &features,
+        )
+    }
+
+    fn optional_ktstr_package_with_features_json(
+        name: &str,
+        version: &str,
+        id: &str,
+        ktstr_req: &str,
+        alias: Option<&str>,
+        kind: &str,
+        features: &str,
+    ) -> String {
+        let rename = alias.map_or_else(|| "null".to_string(), |alias| format!(r#""{alias}""#));
+        let dependencies = format!(
+            r#"[{{"name":"ktstr","source":null,"req":"{ktstr_req}","kind":{kind},"rename":{rename},"optional":true,"uses_default_features":true,"features":[],"target":null,"registry":null,"path":null}}]"#
+        );
+        package_json_with(name, version, id, &dependencies, &features)
     }
 
     fn scx_version_fixture() -> Metadata {
@@ -810,7 +897,14 @@ mod tests {
               }},
               "workspace_root":"/w","target_directory":"/w/target","version":1
             }}"#,
-            layered_pkg = package_json("scx_layered", "1.0.0", layered),
+            layered_pkg = optional_ktstr_package_json(
+                "scx_layered",
+                "1.0.0",
+                layered,
+                "=0.41.0",
+                None,
+                "ktstr-tests",
+            ),
             lavd_pkg = package_json("scx_lavd", "1.0.0", lavd),
             mitosis_pkg = package_json("scx_mitosis", "1.0.0", mitosis),
             unrelated_pkg = package_json("unrelated", "1.0.0", unrelated),
@@ -831,9 +925,11 @@ mod tests {
             vec![
                 CompatibleVerifierPackage {
                     name: "scx_lavd".to_string(),
+                    verifier_features: Vec::new(),
                 },
                 CompatibleVerifierPackage {
                     name: "scx_layered".to_string(),
+                    verifier_features: vec!["ktstr-tests".to_string()],
                 },
             ],
             "direct and transitive current ktstr links are both eligible",
@@ -846,6 +942,118 @@ mod tests {
             }],
             "the old dev edge is excluded; the unrelated build-only edge is ignored",
         );
+    }
+
+    #[test]
+    fn inferred_verifier_features_follow_renamed_optional_ktstr_dependency() {
+        let json = optional_ktstr_package_json(
+            "scheduler",
+            "1.0.0",
+            "scheduler 1.0.0 (path+file:///w/scheduler)",
+            "=0.41.0",
+            Some("test-harness"),
+            "verify-schedulers",
+        );
+        let package: cargo_metadata::Package =
+            serde_json::from_str(&json).expect("package fixture deserializes");
+        assert_eq!(
+            infer_ktstr_feature_roots(
+                &package,
+                VersionScope::Matches(&Version::parse("0.41.0").unwrap()),
+            ),
+            vec!["verify-schedulers"],
+            "derive the declaring package's feature name from dep:<renamed-alias>, \
+             without admitting its unrelated feature",
+        );
+    }
+
+    #[test]
+    fn inferred_verifier_features_follow_pure_aliases_not_composite_modes() {
+        let json = optional_ktstr_package_with_features_json(
+            "scheduler",
+            "1.0.0",
+            "scheduler 1.0.0 (path+file:///w/scheduler)",
+            "=0.41.0",
+            Some("test-harness"),
+            "null",
+            r#"{
+                "verify":["dep:test-harness"],
+                "ktstr-tests":["verify"],
+                "gpu":[],
+                "everything":["ktstr-tests","gpu"],
+                "weak-only":["test-harness?/test-support"]
+            }"#,
+        );
+        let package: cargo_metadata::Package =
+            serde_json::from_str(&json).expect("package fixture deserializes");
+        assert_eq!(
+            infer_ktstr_feature_roots(
+                &package,
+                VersionScope::Matches(&Version::parse("0.41.0").unwrap()),
+            ),
+            vec!["ktstr-tests"],
+            "select the outer alias that activates only ktstr; reject composite and weak-only modes",
+        );
+    }
+
+    #[test]
+    fn inferred_verifier_features_handle_forwarding_and_cyclic_aliases() {
+        let json = optional_ktstr_package_with_features_json(
+            "scheduler",
+            "1.0.0",
+            "scheduler 1.0.0 (path+file:///w/scheduler)",
+            "=0.41.0",
+            Some("test-harness"),
+            "null",
+            r#"{
+                "cycle-a":["cycle-b"],
+                "cycle-b":["cycle-a","test-harness/test-support"]
+            }"#,
+        );
+        let package: cargo_metadata::Package =
+            serde_json::from_str(&json).expect("package fixture deserializes");
+        assert_eq!(
+            infer_ktstr_feature_roots(
+                &package,
+                VersionScope::Matches(&Version::parse("0.41.0").unwrap()),
+            ),
+            vec!["cycle-a"],
+            "dependency-feature forwarding activates ktstr, and one cyclic root is sufficient",
+        );
+    }
+
+    #[test]
+    fn inferred_verifier_features_reject_bare_alias_and_build_dependency() {
+        let bare_alias = optional_ktstr_package_with_features_json(
+            "scheduler",
+            "1.0.0",
+            "scheduler 1.0.0 (path+file:///w/scheduler)",
+            "=0.41.0",
+            Some("test-harness"),
+            "null",
+            r#"{"test-harness":["marker"],"marker":[],"verify":["test-harness"]}"#,
+        );
+        let build_dependency = optional_ktstr_package_with_features_json(
+            "scheduler",
+            "1.0.0",
+            "scheduler 1.0.0 (path+file:///w/scheduler)",
+            "=0.41.0",
+            None,
+            r#""build""#,
+            r#"{"ktstr-tests":["dep:ktstr"]}"#,
+        );
+        for json in [bare_alias, build_dependency] {
+            let package: cargo_metadata::Package =
+                serde_json::from_str(&json).expect("package fixture deserializes");
+            assert!(
+                infer_ktstr_feature_roots(
+                    &package,
+                    VersionScope::Matches(&Version::parse("0.41.0").unwrap()),
+                )
+                .is_empty(),
+                "a local feature name and a build-only dependency are not test-link activations",
+            );
+        }
     }
 
     #[test]
@@ -867,9 +1075,15 @@ mod tests {
             compatible: vec![
                 CompatibleVerifierPackage {
                     name: "scx_cosmos".to_string(),
+                    verifier_features: vec!["ktstr-tests".to_string()],
+                },
+                CompatibleVerifierPackage {
+                    name: "scx_lavd".to_string(),
+                    verifier_features: vec!["ktstr-tests".to_string()],
                 },
                 CompatibleVerifierPackage {
                     name: "scx_layered".to_string(),
+                    verifier_features: vec!["ktstr-tests".to_string()],
                 },
             ],
             older: vec![OlderVerifierPackage {
@@ -881,12 +1095,13 @@ mod tests {
     }
 
     #[test]
-    fn unscoped_verifier_selects_only_current_packages() {
-        let args = build_scoped_nextest_args(
-            None,
-            &strings(&["--features", "ktstr-tests"]),
-            &scoped_plan(),
-        );
+    fn unscoped_verifier_selects_current_packages_with_targeted_features() {
+        // Bare `cargo ktstr verifier` is the scx regression shape: its
+        // declarations live in `#![cfg(feature = "ktstr-tests")]` test
+        // targets. A manifest pass discovers each ktstr-only gate, then both
+        // dependency resolution and nextest activate only the
+        // package-qualified feature that links each declaration target.
+        let args = build_scoped_nextest_args(None, &[], &scoped_plan());
         assert!(
             args.windows(2).any(|pair| pair == ["-p", "scx_cosmos"]),
             "{args:?}",
@@ -895,26 +1110,46 @@ mod tests {
             args.windows(2).any(|pair| pair == ["-p", "scx_layered"]),
             "{args:?}",
         );
+        assert!(
+            args.windows(2).any(|pair| pair == ["-p", "scx_lavd"]),
+            "{args:?}",
+        );
         assert!(!args.iter().any(|arg| arg == "scx_mitosis"), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "--all-features"));
+        assert!(args.windows(2).any(|pair| {
+            pair == [
+                "--features",
+                "scx_cosmos/ktstr-tests,scx_lavd/ktstr-tests,scx_layered/ktstr-tests",
+            ]
+        }));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("scx_mitosis/ktstr-tests")),
+            "old-package features must stay disabled: {args:?}",
+        );
         assert!(args.iter().any(|arg| {
             arg == "(test(/^verifier/) & !test(/^verifier::/)) & \
-                    (package(=scx_cosmos) | package(=scx_layered))"
+                    (package(=scx_cosmos) | package(=scx_lavd) | package(=scx_layered))"
         }));
     }
 
     #[test]
     fn explicit_package_selection_is_not_widened() {
-        let args = build_scoped_nextest_args(
-            None,
-            &strings(&["-p", "scx_layered", "--features", "ktstr-tests"]),
-            &scoped_plan(),
-        );
+        let forward = strings(&["-p", "scx_layered"]);
+        let plan = restrict_plan_to_explicit_selection(scoped_plan(), &forward);
+        let args = build_scoped_nextest_args(None, &forward, &plan);
         let selected = args
             .windows(2)
             .filter(|pair| pair[0] == "-p")
             .map(|pair| pair[1].as_str())
             .collect::<Vec<_>>();
         assert_eq!(selected, vec!["scx_layered"]);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--features", "scx_layered/ktstr-tests"]),
+            "only the explicitly selected package's verifier feature is enabled: {args:?}",
+        );
     }
 
     #[test]
@@ -944,6 +1179,69 @@ mod tests {
     }
 
     #[test]
+    fn mixed_glob_selection_rewrites_to_exact_compatible_packages() {
+        let plan = scoped_plan();
+        let args = strings(&[
+            "-p",
+            "scx_*",
+            "--all-features",
+            "--",
+            "--package",
+            "scx_mitosis",
+        ]);
+        assert!(has_non_exact_package_selector(&args));
+        let rewritten = replace_package_selectors(&args, &plan.compatible);
+        assert!(!rewritten.iter().any(|argument| argument == "scx_*"));
+        for package in ["scx_cosmos", "scx_lavd", "scx_layered"] {
+            assert!(
+                rewritten.windows(2).any(|pair| pair == ["-p", package]),
+                "{rewritten:?}",
+            );
+        }
+        assert!(
+            !rewritten[..rewritten.iter().position(|arg| arg == "--").unwrap()]
+                .iter()
+                .any(|argument| argument == "scx_mitosis")
+        );
+        assert_eq!(
+            &rewritten[rewritten.iter().position(|arg| arg == "--").unwrap()..],
+            strings(&["--", "--package", "scx_mitosis"]),
+            "test-binary arguments remain untouched",
+        );
+    }
+
+    #[test]
+    fn old_package_pruning_preserves_test_binary_args_after_separator() {
+        let args = strings(&[
+            "-p",
+            "scx_mitosis",
+            "-p",
+            "scx_layered",
+            "--",
+            "--package",
+            "scx_mitosis",
+            "-pscx_mitosis",
+            "--package=scx_mitosis",
+            "payload",
+        ]);
+        let selected = restrict_plan_to_explicit_selection(scoped_plan(), &args);
+        assert_eq!(
+            drop_older_package_selectors(&args, &selected.older),
+            strings(&[
+                "-p",
+                "scx_layered",
+                "--",
+                "--package",
+                "scx_mitosis",
+                "-pscx_mitosis",
+                "--package=scx_mitosis",
+                "payload",
+            ]),
+            "only Cargo-side selectors are pruned; test-binary argv is opaque",
+        );
+    }
+
+    #[test]
     fn package_spec_name_handles_exact_version_and_full_id() {
         assert_eq!(package_spec_name("scx_layered"), Some("scx_layered"));
         assert_eq!(package_spec_name("scx_layered@1.1.2"), Some("scx_layered"),);
@@ -966,6 +1264,7 @@ mod tests {
             selected.compatible,
             vec![CompatibleVerifierPackage {
                 name: "scx_layered".to_string(),
+                verifier_features: vec!["ktstr-tests".to_string()],
             }],
         );
         assert!(selected.older.is_empty());
@@ -990,20 +1289,59 @@ mod tests {
         );
         assert!(selected.older.is_empty());
         assert!(selected.newer.is_empty());
-        assert_eq!(selected.compatible.len(), 2);
+        assert_eq!(selected.compatible.len(), 3);
     }
 
     #[test]
     fn workspace_selection_excludes_old_package_from_compile() {
-        let args = build_scoped_nextest_args(
-            None,
-            &strings(&["--workspace", "--features", "ktstr-tests"]),
-            &scoped_plan(),
-        );
+        let args = build_scoped_nextest_args(None, &strings(&["--workspace"]), &scoped_plan());
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--exclude", "scx_mitosis"]),
             "{args:?}",
+        );
+        assert!(args.windows(2).any(|pair| {
+            pair == [
+                "--features",
+                "scx_cosmos/ktstr-tests,scx_lavd/ktstr-tests,scx_layered/ktstr-tests",
+            ]
+        }));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("scx_mitosis/ktstr-tests")),
+            "workspace mode must not activate the excluded old package: {args:?}",
+        );
+    }
+
+    #[test]
+    fn lone_exclude_gets_required_workspace_scope() {
+        let forward = strings(&["--exclude", "scx_cosmos"]);
+        let plan = restrict_plan_to_explicit_selection(scoped_plan(), &forward);
+        let args = build_scoped_nextest_args(None, &forward, &plan);
+        assert!(args.iter().any(|argument| argument == "--workspace"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--exclude", "scx_mitosis"]),
+            "older verifier packages remain outside the widened compile: {args:?}",
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--exclude", "scx_cosmos"]),
+            "the user's exclusion remains forwarded: {args:?}",
+        );
+    }
+
+    #[test]
+    fn explicit_all_features_is_preserved_without_inferred_feature_flag() {
+        let args = build_scoped_nextest_args(None, &strings(&["--all-features"]), &scoped_plan());
+        assert_eq!(
+            args.iter().filter(|arg| *arg == "--all-features").count(),
+            1,
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--features"),
+            "the user's broad feature choice already subsumes inferred roots: {args:?}",
         );
     }
 
@@ -1026,7 +1364,9 @@ mod tests {
             .find(|pair| pair[0] == "-E")
             .map(|pair| pair[1].as_str())
             .expect("one folded filter");
-        assert!(filter.contains("package(=scx_cosmos) | package(=scx_layered)"));
+        assert!(
+            filter.contains("package(=scx_cosmos) | package(=scx_lavd) | package(=scx_layered)")
+        );
         assert!(filter.contains("(test(large)) | (test(kernel_gke))"));
     }
 
@@ -1042,7 +1382,7 @@ mod tests {
     #[test]
     fn metadata_passthrough_keeps_only_resolution_options() {
         assert_eq!(
-            metadata_passthrough_options(&strings(&[
+            crate::feature_discovery::metadata_passthrough_options(&strings(&[
                 "--locked",
                 "--features",
                 "ktstr-tests",
@@ -1133,5 +1473,25 @@ mod tests {
                 .any(|w| w[0] == "--cargo-profile" && w[1] == "release"),
             "forwarded cargo profile present in warm-up: {warm_argv:?}",
         );
+    }
+
+    #[test]
+    fn verifier_warmup_preserves_targeted_features() {
+        let run_argv = build_scoped_nextest_args(None, &[], &scoped_plan());
+        let warm_argv = crate::run_cargo::prebuild_no_run_args(&run_argv);
+        let expected = [
+            "--features",
+            "scx_cosmos/ktstr-tests,scx_lavd/ktstr-tests,scx_layered/ktstr-tests",
+        ];
+        assert!(
+            run_argv.windows(2).any(|pair| pair == expected),
+            "the run must enable only inferred verifier features: {run_argv:?}",
+        );
+        assert!(
+            warm_argv.windows(2).any(|pair| pair == expected),
+            "the warm-up must compile the same declaration targets: {warm_argv:?}",
+        );
+        assert!(!run_argv.iter().any(|arg| arg == "--all-features"));
+        assert!(!warm_argv.iter().any(|arg| arg == "--all-features"));
     }
 }

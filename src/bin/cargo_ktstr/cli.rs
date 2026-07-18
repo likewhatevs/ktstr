@@ -43,6 +43,7 @@ pub(crate) struct Ktstr {
 #[derive(Subcommand)]
 pub(crate) enum KtstrCommand {
     /// Build the kernel (if needed) and run tests via cargo nextest.
+    /// Narrow optional-ktstr test features are enabled automatically.
     #[command(visible_alias = "nextest")]
     Test {
         /// Repeatable. See [`KERNEL_HELP_NO_RAW`] for accepted shapes
@@ -147,6 +148,7 @@ pub(crate) enum KtstrCommand {
     /// Build the kernel (if needed) and run tests with coverage via
     /// cargo llvm-cov nextest. For other llvm-cov subcommands
     /// (`report`, `clean`, `show-env`), use `cargo ktstr llvm-cov`.
+    /// Narrow optional-ktstr test features are enabled automatically.
     Coverage {
         /// Repeatable. Same shapes and multi-kernel semantics as
         /// `cargo ktstr test --kernel`: each (test × kernel) variant
@@ -227,7 +229,9 @@ pub(crate) enum KtstrCommand {
     ///
     /// Note: bare `cargo ktstr llvm-cov` (no subcommand) dispatches
     /// to `cargo llvm-cov` which runs `cargo test` — not useful for
-    /// ktstr tests. Always pass a subcommand.
+    /// ktstr tests. Always pass a subcommand. The explicit `nextest`
+    /// form receives the same targeted feature inference as `coverage`;
+    /// every non-nextest form preserves its feature arguments exactly.
     LlvmCov {
         /// Repeatable. Same shapes and multi-kernel semantics as
         /// `cargo ktstr test --kernel`. Profraw aggregation across
@@ -286,7 +290,8 @@ pub(crate) enum KtstrCommand {
     /// dedupes the resulting test names, and emits a `cargo nextest
     /// run`-compatible filter expression that targets exactly that
     /// subset. Default is dry-run (prints the filter expression to
-    /// stdout); pass `--exec` to invoke nextest directly.
+    /// stdout); pass `--exec` to invoke nextest directly with targeted
+    /// optional-ktstr test features enabled automatically.
     ///
     /// Distinct from the in-VM auto-repro (`auto_repro = true` on
     /// `KtstrTestEntry`) which fires within the same test process
@@ -568,9 +573,12 @@ pub(crate) enum KtstrCommand {
     /// cols = kernel) are printed.
     ///
     /// The `declare_scheduler!` verifier cells carry no `required-features`,
-    /// so they build without a feature flag — no `--features` passthrough
-    /// is needed for the sweep to find them. Trailing args are forwarded
-    /// verbatim to nextest (a filterset, `--cargo-profile`, ...). The
+    /// but declaration targets may themselves be feature-gated. Direct
+    /// compatible optional ktstr dependencies are matched through ktstr-only
+    /// feature aliases, and only those package-qualified roots are
+    /// auto-injected. Conventional gated declarations therefore need no manual
+    /// `--features` passthrough or broad `--all-features`. Remaining trailing
+    /// args are passed to nextest (a filterset, `--cargo-profile`, ...). The
     /// scheduler-under-test builds release by default.
     Verifier {
         /// Repeatable. See [`KERNEL_HELP_NO_RAW`] for accepted shapes
@@ -605,13 +613,14 @@ pub(crate) enum KtstrCommand {
         /// `--kernel`, a path, a cache key, or a git source.
         #[arg(long, help = INCLUDE_EOL_HELP)]
         include_eol: bool,
-        /// cargo/nextest flags forwarded verbatim to the inner
-        /// `cargo nextest run` — a nextest filterset, `--cargo-profile`,
-        /// etc. Native flags (`--kernel` / `--raw` / `--profile` /
-        /// `--nextest-profile`) may appear in ANY order relative to these
-        /// (the argv split routes by name), so no `--` separator is
-        /// required; to forward a token that shares a name with a native
-        /// flag (e.g. nextest's own `--profile`), place it after a `--`.
+        /// cargo/nextest flags passed to the inner `cargo nextest run` after
+        /// cargo-ktstr applies its verifier feature/package scope — a nextest
+        /// filterset, `--cargo-profile`, etc. Native flags (`--kernel` /
+        /// `--raw` / `--profile` / `--nextest-profile`) may appear in ANY
+        /// order relative to these (the argv split routes by name), so no `--`
+        /// separator is required; to forward a token that shares a name with
+        /// a native flag (e.g. nextest's own `--profile`), place it after a
+        /// `--`.
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -730,7 +739,7 @@ pub(crate) enum KtstrCommand {
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
         /// Restrict the workspace search to a specific package. When
-        /// omitted, every workspace member's tests is built and
+        /// omitted, Cargo's default package selection is built and
         /// scanned for a matching `#[ktstr_test]` registration.
         /// Pass-through to `cargo build --tests --package <NAME>`.
         #[arg(short = 'p', long)]
