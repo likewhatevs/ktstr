@@ -1447,6 +1447,11 @@ fn open_options_with_transport_limits(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn direct_http_fixture_open_options_for_test() -> gix::open::Options {
+    open_options_with_transport_limits(20_000, 1024, 30, Some("*"))
+}
+
 fn validate_relative_submodule_path(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() {
         return Err("submodule path is empty".to_string());

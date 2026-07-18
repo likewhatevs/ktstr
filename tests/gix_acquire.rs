@@ -766,7 +766,7 @@ fn public_http_authentication_cannot_execute_configured_credentials_programs() {
         &repository,
         gix::create::Kind::WithWorktree,
         gix::create::Options::default(),
-        gix_acquire::open_options(),
+        gix_acquire::direct_http_fixture_open_options_for_test(),
     )
     .expect("initialize authentication repository")
     .to_thread_local();
@@ -774,10 +774,6 @@ fn public_http_authentication_cannot_execute_configured_credentials_programs() {
         format!("credential.helper={}", helper.display()),
         format!("core.askPass={}", askpass.display()),
         "gitoxide.credentials.terminalPrompt=true".to_string(),
-        // Make the loopback transport direct even when libcurl discovers an
-        // ambient ALL_PROXY independently of gix's environment permissions.
-        "gitoxide.http.proxy=".to_string(),
-        "gitoxide.http.noProxy=*".to_string(),
     ]
     .into_iter()
     .map(Into::into)
@@ -791,6 +787,28 @@ fn public_http_authentication_cannot_execute_configured_credentials_programs() {
         .expect("commit hostile credential overrides");
 
     let url = format!("http://{address}/repository.git");
+    assert_eq!(
+        repo.open_options().permissions.env.http_transport,
+        gix::sec::Permission::Deny,
+        "loopback fixtures must reject gix's higher-precedence HTTP proxy environment",
+    );
+    let transport = repo
+        .transport_options(url.as_bytes(), None)
+        .expect("resolve direct loopback transport options")
+        .expect("HTTP loopback transport options");
+    let transport = transport
+        .downcast_ref::<gix::protocol::transport::client::blocking_io::http::Options>()
+        .expect("gix HTTP loopback transport options");
+    assert_eq!(
+        transport.proxy.as_deref(),
+        Some(""),
+        "an explicit empty curl proxy must disable libcurl environment discovery",
+    );
+    assert_eq!(
+        transport.no_proxy.as_deref(),
+        Some("*"),
+        "the loopback transport must bypass every proxy target",
+    );
     let credential_url =
         gix::Url::from_bytes(url.as_bytes().into()).expect("parse authentication fixture URL");
     let (cascade, _, prompt) = repo

@@ -100,6 +100,15 @@ pub(crate) fn open_options_with_transport_limits(
     options.permissions.attributes.git_binary = false;
     options.permissions.env.git_prefix = gix::sec::Permission::Deny;
     options.permissions.env.ssh_prefix = gix::sec::Permission::Deny;
+    if no_proxy.is_some() {
+        // Loopback HTTP fixtures must not inherit HTTP_PROXY / ALL_PROXY.
+        // gix loads those variables into its EnvOverride config layer, whose
+        // precedence is higher than the API overrides below. Denying only the
+        // HTTP transport environment here makes the test-only direct path
+        // deterministic while the production `open_options()` path retains
+        // ordinary proxy support.
+        options.permissions.env.http_transport = gix::sec::Permission::Deny;
+    }
 
     let mut overrides = vec![
         "core.logAllRefUpdates=false".to_string(),
