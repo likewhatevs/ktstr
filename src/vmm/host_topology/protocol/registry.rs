@@ -6184,8 +6184,8 @@ fn shared_live_inflight_head(header: &[u8], layout: HeaderLayout, next_slot: u64
 
 fn decode_mode(bytes: &[u8], offset: usize, slot: u64, label: &str) -> Result<ClaimMode> {
     match read_u32(bytes, offset) {
-        0 => ClaimMode::Shared,
-        1 => ClaimMode::Exclusive,
+        0 => Ok(ClaimMode::Shared),
+        1 => Ok(ClaimMode::Exclusive),
         mode => {
             anyhow::bail!("queue registry v{VERSION} slot {slot} has invalid {label} mode {mode}")
         }

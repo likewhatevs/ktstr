@@ -4632,6 +4632,7 @@ pub(crate) fn shm_write_and_release(fd: std::os::fd::OwnedFd, data: &[u8], seg_n
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::MetadataExt as _;
 
     /// `shm_try_create_excl` winner gets a locked fd; a second call
     /// with the same name returns `Exists`. The winner's

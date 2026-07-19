@@ -2844,7 +2844,7 @@ fn preferred_snapshot_synthesizes_nonadjacent_ready_llc_combination() {
             candidate.plan.llc_indices == vec![0, 2] && candidate.cpu_reservations == vec![0, 2]
         }),
         "availability must outrank cyclic seed rotation so a coordinator can \
-         synthesize the simultaneously ready {0,2} placement",
+         synthesize the simultaneously ready {{0,2}} placement",
     );
 }
 

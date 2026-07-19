@@ -381,20 +381,25 @@ fn resource_lock_shared_cpu_contention() {
 
 #[test]
 fn resource_lock_empty_llc_indices() {
-    // Empty llc_indices: LLC lock loop iterates zero times.
-    // Exclusive mode skips CPU locks. Result: Acquired with
-    // llc_offset 0 and empty locks vec.
+    let _prefixes = LockPrefixesGuard::new();
+    // Empty llc_indices skip the LLC lock loop but must retain the
+    // explicit CPU bridge for topology-unavailable admission.
     let plan = PinningPlan {
         assignments: vec![(0, 90800)],
         service_cpu: None,
         llc_indices: vec![],
         locks: Vec::new(),
     };
-    let outcome =
-        acquire_resource_locks(&[], LlcLockMode::Exclusive, &[], FlockMode::Exclusive).unwrap();
+    let outcome = acquire_resource_locks(
+        &[],
+        LlcLockMode::Exclusive,
+        &exact_plan_cpus(&plan),
+        FlockMode::Exclusive,
+    )
+    .unwrap();
     let (llc_offset, locks) = unwrap_acquired(outcome, None);
     assert_eq!(llc_offset, 0);
-    assert!(locks.is_empty());
+    assert_eq!(locks.len(), 1);
 }
 
 #[test]

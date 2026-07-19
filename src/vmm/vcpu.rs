@@ -723,10 +723,10 @@ pub(crate) struct VcpuThread {
     /// Eventfd bumped after the run-loop exit edge. Production
     /// `freeze_coord::kick_and_join_ap_threads` epoll-waits on it before
     /// re-checking `JoinHandle::is_finished()`; the test-only
-    /// [`Self::wait_for_exit`] exercises the same wake edge. The panic hook
-    /// also signals it, which wakes teardown promptly without claiming unwind
-    /// has finished. Counter mode (not semaphore): the value is unused; only
-    /// the transition from zero to non-zero matters.
+    /// `VcpuThread::wait_for_exit` helper exercises the same wake edge. The
+    /// panic hook also signals it, which wakes teardown promptly without
+    /// claiming unwind has finished. Counter mode (not semaphore): the value
+    /// is unused; only the transition from zero to non-zero matters.
     pub(crate) exit_evt: Arc<EventFd>,
     /// Logical participation flag for cross-thread AP kick loops.
     /// Initialised to `true` at spawn and flipped to `false` by the AP panic

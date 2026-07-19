@@ -36,8 +36,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-#[cfg(test)]
-use crate::flock::try_flock;
 use crate::flock::{FlockMode, TryFlockOutcome, try_flock_with_witness};
 
 mod registry;

@@ -192,7 +192,7 @@ impl LockPrefixesGuard {
         let cpu = CpuLockPrefixGuard::new();
         let llc = LlcLockPrefixGuard::new();
         let retry_wake_marker = test_retry.then(|| {
-            let marker = protocol::test_retry_wake_marker_path_for_tests();
+            let marker = super::protocol::test_retry_wake_marker_path_for_tests();
             std::fs::write(&marker, b"test-retry")
                 .expect("create test retry wake marker beside registry");
             marker
