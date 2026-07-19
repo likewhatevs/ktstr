@@ -144,18 +144,72 @@ pub(crate) fn head_claim_path() -> String {
         .to_string()
 }
 
-/// The head's published target set: which LLC locks and CPU locks it
-/// is currently accumulating toward. Fast-path planners subtract
-/// these from their view of free capacity.
+/// Sharing mode of the LLC locks in a published [`ClaimSet`].
+///
+/// A claim is an advisory reservation, so its compatibility rules must
+/// exactly match `flock`: a shared claim only fences an exclusive LLC
+/// requester, while an exclusive claim fences both shared and exclusive
+/// requesters. CPU claims are always exclusive.
+///
+/// `Exclusive` is the serde default for manifests written before claims
+/// carried a mode. Treating a legacy, ambiguous claim conservatively keeps
+/// mixed-version runs correct. Older readers ignore the added field and
+/// continue to over-fence all LLC claims until every participant is updated;
+/// that costs concurrency, never correctness.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ClaimLlcMode {
+    #[default]
+    Exclusive,
+    Shared,
+}
+
+impl From<FlockMode> for ClaimLlcMode {
+    fn from(mode: FlockMode) -> Self {
+        match mode {
+            FlockMode::Exclusive => Self::Exclusive,
+            FlockMode::Shared => Self::Shared,
+        }
+    }
+}
+
+/// The head's published target set: which LLC locks (and at what sharing
+/// mode) and CPU locks it is currently accumulating toward. Fast-path
+/// planners subtract only incompatible targets from their view of free
+/// capacity.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ClaimSet {
     pub llcs: BTreeSet<usize>,
     pub cpus: BTreeSet<usize>,
+    #[serde(default)]
+    pub llc_mode: ClaimLlcMode,
 }
 
 impl ClaimSet {
+    pub(crate) fn new(
+        llcs: impl IntoIterator<Item = usize>,
+        cpus: impl IntoIterator<Item = usize>,
+        llc_mode: FlockMode,
+    ) -> Self {
+        Self {
+            llcs: llcs.into_iter().collect(),
+            cpus: cpus.into_iter().collect(),
+            llc_mode: llc_mode.into(),
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.llcs.is_empty() && self.cpus.is_empty()
+    }
+
+    /// Whether `request_mode` on `llc_idx` is incompatible with this live
+    /// head claim. This is the same compatibility matrix as `flock`.
+    pub(crate) fn conflicts_with_llc(&self, llc_idx: usize, request_mode: FlockMode) -> bool {
+        self.llcs.contains(&llc_idx)
+            && matches!(
+                (self.llc_mode, request_mode),
+                (ClaimLlcMode::Exclusive, _) | (ClaimLlcMode::Shared, FlockMode::Exclusive)
+            )
     }
 }
 

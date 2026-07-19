@@ -139,6 +139,11 @@ fn live_claim_requires_marker_holder() {
     .expect("EX on fresh marker");
     let live = protocol::read_live_claim();
     assert!(live.llcs.contains(&3) && live.llcs.contains(&5) && live.cpus.contains(&12));
+    assert_eq!(
+        live.llc_mode,
+        protocol::ClaimLlcMode::Exclusive,
+        "legacy manifests without llc_mode must default to conservative EX",
+    );
 
     drop(marker);
     // A concurrent test thread can fork while the marker fd is live. CLOEXEC
@@ -159,6 +164,64 @@ fn live_claim_requires_marker_holder() {
         final_claim.is_empty(),
         "claim must die with the marker flock (crashed-head safety); \
          still live after fork-child grace period: {final_claim:?}",
+    );
+}
+
+/// Claim manifests preserve the LLC sharing mode for updated peers while
+/// remaining readable by an old peer (`llcs` and `cpus` stay unchanged).
+/// A missing mode is interpreted as EX so a mixed-version run can lose
+/// concurrency but cannot let a shared request slip past an ambiguous claim.
+#[test]
+fn claim_manifest_round_trips_mode_and_defaults_legacy_to_exclusive() {
+    let shared = protocol::ClaimSet::new([3usize, 5], [12usize], crate::flock::FlockMode::Shared);
+    let json = serde_json::to_string(&shared).expect("serialize shared claim");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("parse claim JSON");
+    assert_eq!(value["llcs"], serde_json::json!([3, 5]));
+    assert_eq!(value["cpus"], serde_json::json!([12]));
+    assert_eq!(value["llc_mode"], "shared");
+    assert_eq!(
+        serde_json::from_str::<protocol::ClaimSet>(&json).expect("round-trip shared claim"),
+        shared,
+    );
+
+    let legacy: protocol::ClaimSet =
+        serde_json::from_str(r#"{"llcs":[3,5],"cpus":[12]}"#).expect("parse legacy claim");
+    assert_eq!(legacy.llc_mode, protocol::ClaimLlcMode::Exclusive);
+    assert!(legacy.conflicts_with_llc(3, crate::flock::FlockMode::Shared));
+}
+
+#[test]
+fn claim_llc_compatibility_matches_flock_matrix() {
+    let shared = protocol::ClaimSet::new(
+        [7usize],
+        std::iter::empty(),
+        crate::flock::FlockMode::Shared,
+    );
+    assert!(
+        !shared.conflicts_with_llc(7, crate::flock::FlockMode::Shared),
+        "SH request is compatible with a SH claim",
+    );
+    assert!(
+        shared.conflicts_with_llc(7, crate::flock::FlockMode::Exclusive),
+        "EX request conflicts with a SH claim",
+    );
+
+    let exclusive = protocol::ClaimSet::new(
+        [7usize],
+        std::iter::empty(),
+        crate::flock::FlockMode::Exclusive,
+    );
+    assert!(
+        exclusive.conflicts_with_llc(7, crate::flock::FlockMode::Shared),
+        "SH request conflicts with an EX claim",
+    );
+    assert!(
+        exclusive.conflicts_with_llc(7, crate::flock::FlockMode::Exclusive),
+        "EX request conflicts with an EX claim",
+    );
+    assert!(
+        !exclusive.conflicts_with_llc(8, crate::flock::FlockMode::Exclusive),
+        "an unrelated LLC never conflicts",
     );
 }
 
@@ -223,6 +286,101 @@ fn fast_path_subtracts_live_claim_but_takes_disjoint_capacity() {
         acquire_resource_locks(&plan_cd, &plan_cd.llc_indices, LlcLockMode::Shared).unwrap();
     let (_, locks) = unwrap_acquired(outcome, Some("disjoint capacity stays available"));
     assert_eq!(locks.len(), 3, "two LLC SH + one CPU EX");
+}
+
+/// A shared queue head must reserve exactly its exclusive CPU targets, not
+/// the entire shared LLC. Model a head that already holds `SH LLC0 + EX
+/// CPU0` while waiting for CPU1: another shared cell on CPU2 can use the
+/// idle capacity immediately, but an EX LLC requester and a shared cell
+/// targeting CPU1 remain fenced by the published claim.
+#[test]
+fn shared_head_claim_allows_disjoint_cpu_but_fences_ex_llc_and_claimed_cpu() {
+    let _prefixes = LockPrefixesGuard::new();
+    let llc = 0usize;
+    let cpu0 = 0usize;
+    let cpu1 = 1usize;
+    let cpu2 = 2usize;
+
+    // CPU1 is occupied by a peer, which is why the simulated head has only
+    // accumulated LLC0 + CPU0 and must keep waiting.
+    let _cpu1_blocker =
+        crate::flock::try_flock(cpu_lock_path(cpu1), crate::flock::FlockMode::Exclusive)
+            .expect("open CPU1")
+            .expect("peer EX CPU1");
+    let _marker = crate::flock::try_flock(
+        protocol::head_marker_path(),
+        crate::flock::FlockMode::Exclusive,
+    )
+    .expect("open marker")
+    .expect("EX marker");
+    let _head_llc = crate::flock::try_flock(llc_lock_path(llc), crate::flock::FlockMode::Shared)
+        .expect("open LLC0")
+        .expect("head SH LLC0");
+    let _head_cpu0 =
+        crate::flock::try_flock(cpu_lock_path(cpu0), crate::flock::FlockMode::Exclusive)
+            .expect("open CPU0")
+            .expect("head EX CPU0");
+    let claim = protocol::ClaimSet::new([llc], [cpu0, cpu1], crate::flock::FlockMode::Shared);
+    std::fs::write(
+        protocol::head_claim_path(),
+        serde_json::to_string(&claim).expect("serialize claim"),
+    )
+    .expect("publish simulated head claim");
+
+    let disjoint_shared = PinningPlan {
+        assignments: vec![(0, cpu2)],
+        service_cpu: None,
+        llc_indices: vec![llc],
+        locks: Vec::new(),
+    };
+    let outcome = acquire_resource_locks(
+        &disjoint_shared,
+        &disjoint_shared.llc_indices,
+        LlcLockMode::Shared,
+    )
+    .expect("probe disjoint shared peer");
+    let (_, locks) = unwrap_acquired(
+        outcome,
+        Some("for SH LLC0 + unclaimed CPU2 behind a shared head"),
+    );
+    assert_eq!(locks.len(), 2, "one LLC SH + one CPU EX");
+    drop(locks);
+
+    let exclusive_llc = PinningPlan {
+        assignments: vec![(0, cpu2)],
+        service_cpu: None,
+        llc_indices: vec![llc],
+        locks: Vec::new(),
+    };
+    let reason = expect_unavailable(
+        acquire_resource_locks(
+            &exclusive_llc,
+            &exclusive_llc.llc_indices,
+            LlcLockMode::Exclusive,
+        )
+        .expect("probe EX LLC peer"),
+        Some("for EX LLC0 against a shared head claim"),
+    );
+    assert!(
+        reason.contains("LLC 0 claimed by the queue head"),
+        "EX must bounce on the shared LLC claim before touching flocks: {reason}",
+    );
+
+    let claimed_cpu = PinningPlan {
+        assignments: vec![(0, cpu1)],
+        service_cpu: None,
+        llc_indices: vec![llc],
+        locks: Vec::new(),
+    };
+    let reason = expect_unavailable(
+        acquire_resource_locks(&claimed_cpu, &claimed_cpu.llc_indices, LlcLockMode::Shared)
+            .expect("probe claimed-CPU peer"),
+        Some("for SH LLC0 + claimed CPU1"),
+    );
+    assert!(
+        reason.contains("CPU 1 claimed by the queue head"),
+        "SH peer on an exact claimed CPU must bounce on the CPU claim: {reason}",
+    );
 }
 
 /// A waiter keeps one kernel ticket while a chain of queue holders

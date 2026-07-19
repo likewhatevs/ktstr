@@ -1142,10 +1142,15 @@ fn claim_for(
     plan: &PinningPlan,
     llc_mode: LlcLockMode,
 ) -> protocol::ClaimSet {
-    protocol::ClaimSet {
-        llcs: llc_indices.iter().copied().collect(),
-        cpus: fixed_set_cpus(plan, llc_mode).into_iter().collect(),
-    }
+    let flock_mode = match llc_mode {
+        LlcLockMode::Exclusive => FlockMode::Exclusive,
+        LlcLockMode::Shared => FlockMode::Shared,
+    };
+    protocol::ClaimSet::new(
+        llc_indices.iter().copied(),
+        fixed_set_cpus(plan, llc_mode),
+        flock_mode,
+    )
 }
 
 /// Compose the LLC lockfile prefix from the resolved lock directory.
@@ -1229,7 +1234,10 @@ fn try_acquire_all(
     };
     let claim = protocol::read_live_claim();
     if !claim.is_empty() {
-        if let Some(&idx) = llc_indices.iter().find(|i| claim.llcs.contains(i)) {
+        if let Some(&idx) = llc_indices
+            .iter()
+            .find(|&&i| claim.conflicts_with_llc(i, flock_mode))
+        {
             return Err(format!("LLC {idx} claimed by the queue head"));
         }
         if let Some(&cpu) = fixed_set_cpus(plan, llc_mode)
@@ -2232,7 +2240,7 @@ where
         let claim = protocol::read_live_claim();
         let eligible: Vec<LlcSnapshot> = snapshots
             .iter()
-            .filter(|snap| !claim.llcs.contains(&snap.llc_idx))
+            .filter(|snap| !claim.conflicts_with_llc(snap.llc_idx, FlockMode::Shared))
             .cloned()
             .collect();
         let claim_filtered = eligible.len() != snapshots.len();
@@ -2373,10 +2381,11 @@ where
             Ok(protocol::HeadStep::Complete((selected, snapshots, locks)))
         } else {
             Ok(protocol::HeadStep::Waiting {
-                claim: protocol::ClaimSet {
-                    llcs: selected.iter().copied().collect(),
-                    cpus: std::collections::BTreeSet::new(),
-                },
+                claim: protocol::ClaimSet::new(
+                    selected.iter().copied(),
+                    std::iter::empty(),
+                    FlockMode::Shared,
+                ),
             })
         }
     };

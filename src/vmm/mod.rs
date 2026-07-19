@@ -1373,10 +1373,11 @@ impl KtstrVm {
                 candidate.assignments.iter().map(|&(_, cpu)| cpu).collect();
             claim_cpus.extend(candidate.service_cpu);
             Ok(protocol::HeadStep::Waiting {
-                claim: protocol::ClaimSet {
-                    llcs: candidate.llc_indices.iter().copied().collect(),
-                    cpus: claim_cpus,
-                },
+                claim: protocol::ClaimSet::new(
+                    candidate.llc_indices.iter().copied(),
+                    claim_cpus,
+                    crate::flock::FlockMode::Shared,
+                ),
             })
         })?;
         match outcome {
