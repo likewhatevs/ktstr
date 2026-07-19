@@ -353,15 +353,11 @@ impl Drop for EnvGuard {
 }
 
 // ---------------------------------------------------------------
-// NUMA primitives — host_llcs_by_numa_node / with_capacity /
-// sorted_by_distance
+// NUMA primitives — host_llcs_by_numa_node / sorted_by_distance
 // ---------------------------------------------------------------
 
-/// Backwards-compat helper: forwards to
-/// [`HostTopology::new_for_tests`]. Kept so existing tests that
-/// reference `synth_host_topo` don't need to be renamed in lock-
-/// step with the consolidation — the single authoritative
-/// constructor is `new_for_tests`, this and
+/// Shared test adapter over [`HostTopology::new_for_tests`]. The single
+/// authoritative constructor is `new_for_tests`; this and
 /// [`synthetic_topo`] / [`synthetic_topo_numa`] are thin adapters
 /// over it.
 fn synth_host_topo(groups: &[(Vec<usize>, usize)]) -> HostTopology {

@@ -93,7 +93,7 @@ impl std::error::Error for ResourceContention {}
 /// RAM top above the host MAXPHYADDR, vCPU count above KVM_CAP_MAX_VCPUS,
 /// or max APIC id at/above KVM_CAP_MAX_VCPU_ID): these fire for ANY VM of
 /// this shape, perf-mode or not, so the test cannot run here. Also
-/// returned by the `performance_mode` planner (`compute_pinning`) when the
+/// returned by the `performance_mode` topology planner when the
 /// host has too few physical CPUs / LLC groups — but that perf-mode caller
 /// RE-MAPS it to [`PerfModeUnavailable`] (a host-insufficiency: skip by
 /// default, fail under `KTSTR_NO_SKIP_MODE`). Also raised by
@@ -245,8 +245,7 @@ pub struct HostTopology {
     /// time from `llc_groups + cpu_to_node` so repeated NUMA-aware
     /// placement queries (perf-mode rotation, `--cpu-cap` consolidation
     /// PLAN) don't re-walk every LLC's CPU list on every call. Access
-    /// via [`HostTopology::host_llcs_by_numa_node`]. `BTreeMap` (not
-    /// `HashMap`) for deterministic iteration order — two ktstr
+    /// `BTreeMap` (not `HashMap`) gives deterministic iteration order — two ktstr
     /// invocations on the same host MUST produce identical LLC
     /// selections so their ACQUIRE phases converge on the same indices.
     pub(crate) host_node_llcs: std::collections::BTreeMap<usize, Vec<usize>>,
@@ -259,7 +258,7 @@ pub struct PinningPlan {
     /// vcpu_index -> host_cpu
     pub assignments: Vec<(u32, usize)>,
     /// Dedicated host CPU for monitor/watchdog threads. Set when
-    /// `reserve_service_cpu` is true in `compute_pinning`.
+    /// the planner selects performance-mode isolation.
     pub service_cpu: Option<usize>,
     /// Host LLC group indices used by this plan, sorted.
     pub llc_indices: Vec<usize>,
@@ -326,11 +325,23 @@ struct GuestLlcDemand {
     cpus: usize,
 }
 
+#[derive(Clone, Copy)]
+struct PlannerInputs<'a> {
+    demands: &'a [GuestLlcDemand],
+    kind: PinningKind,
+    allowed: &'a std::collections::BTreeSet<usize>,
+    allowed_rank: &'a std::collections::BTreeMap<usize, usize>,
+    preferred_cpus: &'a std::collections::BTreeSet<usize>,
+    preferred_shared_llcs: &'a std::collections::BTreeSet<usize>,
+    preferred_exclusive_llcs: &'a std::collections::BTreeSet<usize>,
+    performance_prefers_shared: bool,
+}
+
 impl PinningPlan {
     /// Duplicate the plan's DESCRIPTION (assignments, service CPU,
     /// LLC indices) with an EMPTY lock set. `PinningPlan` cannot be
     /// `Clone` — the fds are RAII lock holders — but candidate plans
-    /// (pure `compute_pinning` output, no locks yet) need copying
+    /// (pure topology-planner output, no locks yet) need copying
     /// between the fast path's scan list and the acquired result.
     pub(crate) fn clone_unlocked(&self) -> PinningPlan {
         PinningPlan {
@@ -530,6 +541,7 @@ impl HostTopology {
     }
 
     /// Total available host CPUs.
+    #[cfg(test)]
     pub fn total_cpus(&self) -> usize {
         self.online_cpus.len()
     }
@@ -538,51 +550,18 @@ impl HostTopology {
     // Shared NUMA-placement primitives
     // ------------------------------------------------------------------
     //
-    // Used by the existing perf-mode pinning path
-    // ([`numa_aware_llc_order`]) AND the `--cpu-cap` consolidation
-    // PLAN phase. Both callers implement DIFFERENT selection algorithms
-    // on top of these queries:
-    //
-    // - Perf-mode distributes virtual NUMA nodes across host NUMA
-    //   nodes with modulo rotation; uses primitive 2
-    //   (eligibility-by-capacity). No distance lookup.
-    // - Consolidation seeds from a scored LLC list then greedily
-    //   expands within the seed's node, spilling to nearest-by-distance
-    //   when needed; uses primitive 3 (plus llc_numa_node).
-    //
-    // Kept as small orthogonal queries rather than a single mega-selector
-    // — the two algorithms genuinely do different things, but they both
-    // need the same three topology lookups.
+    // Used by the bounded topology planner and `--cpu-cap` consolidation.
 
     /// Memoized map of NUMA node → LLC indices on that node. Returned
     /// by reference so callers can iterate without cloning; `BTreeMap`
     /// gives deterministic iteration so two invocations on identical
     /// topologies produce identical walks.
     ///
-    /// In-tree callers currently reach the same data via
-    /// [`Self::numa_nodes_sorted_by_distance`] and [`Self::numa_nodes_with_capacity`]
-    /// — both iterate `host_node_llcs` internally — so this accessor
-    /// has no direct consumer today. Kept as a stable handle for
-    /// future callers (e.g. a planned `ktstr topo --json` NUMA
-    /// section) and downstream tooling that wants the raw map.
-    #[allow(dead_code)]
+    /// Test fixtures use this to assert the same memoized map production
+    /// placement traverses.
+    #[cfg(test)]
     pub(crate) fn host_llcs_by_numa_node(&self) -> &std::collections::BTreeMap<usize, Vec<usize>> {
         &self.host_node_llcs
-    }
-
-    /// Return every NUMA node that has `>= min_llcs` LLCs, paired with
-    /// that node's LLC-index slice. Callers filter through this when
-    /// their algorithm requires per-node capacity guarantees (perf-mode
-    /// passes `ceil(llcs/numa_nodes)` so any guest node can land on any
-    /// host node; consolidation passes 1 so every node with at least
-    /// one free LLC is a valid spill candidate). Iteration order
-    /// follows the underlying `BTreeMap` — ascending by node id.
-    pub(crate) fn numa_nodes_with_capacity(&self, min_llcs: usize) -> Vec<(usize, &Vec<usize>)> {
-        self.host_node_llcs
-            .iter()
-            .filter(|(_, llcs)| llcs.len() >= min_llcs)
-            .map(|(&node, llcs)| (node, llcs))
-            .collect()
     }
 
     /// Return NUMA node ids sorted by distance from `anchor` ascending,
@@ -628,15 +607,8 @@ impl HostTopology {
     /// its CPUs' NUMA assignments. Returns 0 when the map is empty
     /// (single-node systems).
     ///
-    /// Production callers pre-compute the node-to-LLC mapping once at
-    /// [`HostTopology::from_sysfs`] via
-    /// [`compute_host_node_llcs`](Self::compute_host_node_llcs)
-    /// (memoized in [`host_node_llcs`](Self::host_node_llcs)); use
-    /// [`Self::host_llcs_by_numa_node`](Self::host_llcs_by_numa_node) to
-    /// iterate the pre-built map. This method stays exposed for
-    /// external callers (future `ktstr locks` NUMA column + any
-    /// downstream tooling that needs a single-LLC lookup) and
-    /// synthetic-topology tests that assert per-LLC node assignment.
+    /// Bulk placement traverses the memoized [`host_node_llcs`](Self::host_node_llcs)
+    /// map; this one-off query is used where a selected LLC's node is needed.
     pub fn llc_numa_node(&self, llc_idx: usize) -> usize {
         let group = &self.llc_groups[llc_idx];
         let mut counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
@@ -651,339 +623,11 @@ impl HostTopology {
             .unwrap_or(0)
     }
 
-    /// Compute a pinning plan that maps virtual LLCs to physical LLC groups.
-    ///
-    /// Each virtual LLC's vCPUs are assigned to cores within a single physical LLC.
-    /// `llc_offset` rotates the starting LLC group so concurrent VMs pin to
-    /// different physical cores. When `reserve_service_cpu` is true, one
-    /// additional host CPU is reserved for service threads (monitor, watchdog).
-    ///
-    /// When `topo.numa_nodes > 1`, virtual LLCs are grouped by guest NUMA
-    /// node and each group is placed on host LLCs within the same physical
-    /// NUMA node. Falls back to sequential placement when the host lacks
-    /// enough NUMA-aligned LLCs.
-    ///
-    /// Returns an error if the host cannot satisfy the topology.
-    pub fn compute_pinning(
-        &self,
-        topo: &super::topology::Topology,
-        reserve_service_cpu: bool,
-        llc_offset: usize,
-    ) -> Result<PinningPlan> {
-        self.compute_pinning_at(topo, reserve_service_cpu, llc_offset, 0)
-    }
-
-    /// [`Self::compute_pinning`] with an additional INTRA-LLC slot:
-    /// `intra_offset` selects which disjoint `vcpus_per_llc`-sized CPU
-    /// window inside each mapped LLC the plan assigns. `intra_offset
-    /// == 0` is exactly `compute_pinning`. This is the default run
-    /// path's candidate-DIVERSITY lever: without it, every 1-vCPU
-    /// cell's candidate for a given LLC offset is the same CPU prefix,
-    /// so a 64-CPU / 4-LLC host serializes 1-vCPU cells FOUR wide (one
-    /// per LLC) while 60 CPUs idle — a placement concentration the old
-    /// skip-on-contention regime silently masked. With intra slots, an
-    /// LLC with 16 CPUs offers 16 disjoint 1-vCPU candidates, and the
-    /// suite's effective default-cell parallelism scales with CPUs,
-    /// not LLC count. Returns `TopologyInsufficient` when the window
-    /// does not fit (the caller enumerating candidates treats that as
-    /// end-of-slots).
-    pub fn compute_pinning_at(
-        &self,
-        topo: &super::topology::Topology,
-        reserve_service_cpu: bool,
-        llc_offset: usize,
-        intra_offset: usize,
-    ) -> Result<PinningPlan> {
-        let cores = topo.cores_per_llc;
-        let threads = topo.threads_per_core;
-        let llcs = topo.llcs;
-        let vcpus_per_llc = cores * threads;
-        let total_vcpus = llcs * vcpus_per_llc;
-        let total_needed = total_vcpus as usize + if reserve_service_cpu { 1 } else { 0 };
-
-        if total_needed > self.total_cpus() {
-            return Err(anyhow::Error::new(TopologyInsufficient {
-                reason: format!(
-                    "performance_mode: need {} CPUs ({} vCPUs + {} service) \
-                     but only {} host CPUs available",
-                    total_needed,
-                    total_vcpus,
-                    if reserve_service_cpu { 1 } else { 0 },
-                    self.total_cpus(),
-                ),
-            }));
-        }
-
-        let num_llcs = self.llc_groups.len();
-        if llcs as usize > num_llcs {
-            return Err(anyhow::Error::new(TopologyInsufficient {
-                reason: format!(
-                    "performance_mode: need {} LLCs for {} virtual LLCs, \
-                     but host has {} LLC groups",
-                    llcs, llcs, num_llcs,
-                ),
-            }));
-        }
-
-        // Build the virtual-to-host LLC index mapping. When numa_nodes > 1,
-        // try to place each guest NUMA node's LLCs on host LLCs within
-        // the same physical NUMA node.
-        let llc_order = self.numa_aware_llc_order(topo.numa_nodes, llcs, llc_offset);
-
-        let mut assignments = Vec::with_capacity(total_vcpus as usize);
-        let mut used_cpus = std::collections::HashSet::new();
-
-        for llc in 0..llcs {
-            let llc_idx = llc_order[llc as usize];
-            let group = &self.llc_groups[llc_idx];
-            let available: Vec<usize> = group
-                .cpus
-                .iter()
-                .copied()
-                .filter(|c| !used_cpus.contains(c))
-                .collect();
-
-            // The intra window shifts the assigned slice by whole
-            // vcpus_per_llc-sized steps so distinct intra slots never
-            // overlap (disjoint per-CPU lock sets by construction).
-            let window_start = intra_offset * vcpus_per_llc as usize;
-            if available.len() < window_start + vcpus_per_llc as usize {
-                return Err(anyhow::Error::new(TopologyInsufficient {
-                    reason: format!(
-                        "LLC group {} has {} available CPUs, need {} at \
-                         intra slot {} for virtual LLC {}",
-                        llc_idx,
-                        available.len(),
-                        vcpus_per_llc,
-                        intra_offset,
-                        llc,
-                    ),
-                }));
-            }
-
-            for vcpu_in_llc in 0..vcpus_per_llc {
-                let vcpu_id = llc * vcpus_per_llc + vcpu_in_llc;
-                let host_cpu = available[window_start + vcpu_in_llc as usize];
-                used_cpus.insert(host_cpu);
-                assignments.push((vcpu_id, host_cpu));
-            }
-        }
-
-        let service_cpu = if reserve_service_cpu {
-            // Keep the service thread inside an LLC this placement already
-            // owns whenever that cache domain has a spare CPU. The previous
-            // global-first-free search made every nonzero LLC offset choose
-            // CPU 0 on common hosts, outside the plan's exclusive LLC claim;
-            // monitor and virtio work could then overlap an unrelated peer
-            // invisibly and every otherwise-disjoint slot convoyed on CPU 0.
-            let mut cpu = None;
-            for &llc_idx in &llc_order {
-                cpu = self.llc_groups[llc_idx]
-                    .cpus
-                    .iter()
-                    .copied()
-                    .find(|candidate| !used_cpus.contains(candidate));
-                if cpu.is_some() {
-                    break;
-                }
-            }
-            // A guest can fill every CPU in its mapped LLCs while a service
-            // CPU remains elsewhere on the host. Preserve that valid shape,
-            // but rotate the fallback cache-domain search with the candidate
-            // offset and add the chosen domain to `llc_indices` below. Thus
-            // the complete service footprint is still covered by the exact
-            // whole-LLC claim without reintroducing a global CPU-0 convoy.
-            if cpu.is_none() {
-                for step in 0..num_llcs {
-                    let llc_idx = (llc_offset + step) % num_llcs;
-                    cpu = self.llc_groups[llc_idx]
-                        .cpus
-                        .iter()
-                        .copied()
-                        .find(|candidate| !used_cpus.contains(candidate));
-                    if cpu.is_some() {
-                        break;
-                    }
-                }
-            }
-            // Defensive: the total-CPU check above already folds the +1
-            // service CPU into `total_needed`, so a passing host always
-            // has at least one online CPU beyond the assigned vCPUs and
-            // this never fires today. Typed as TopologyInsufficient (not
-            // plain anyhow) so that if a future refactor of that check ever
-            // lets it through, it is handled identically to its three
-            // sibling shortfall checks: the perf-mode caller
-            // (acquire_slot_with_locks) re-maps every compute_pinning
-            // TopologyInsufficient to PerfModeUnavailable (a host-insufficiency
-            // skip, fail under KTSTR_NO_SKIP_MODE), and
-            // the non-perf caller passes reserve_service_cpu=false so this
-            // site is unreachable there.
-            if cpu.is_none() {
-                return Err(anyhow::Error::new(TopologyInsufficient {
-                    reason: format!(
-                        "performance_mode: no free host CPU for service threads \
-                         after assigning {total_vcpus} vCPUs"
-                    ),
-                }));
-            }
-            cpu
-        } else {
-            None
-        };
-
-        // Deduplicate LLC indices (multiple virtual LLCs may map to the
-        // same host LLC at different offsets, but that's prevented by the
-        // used_cpus check above — each virtual LLC consumes distinct CPUs).
-        let mut llc_indices = llc_order;
-        if let Some(service_cpu) = service_cpu
-            && let Some((service_llc, _)) = self
-                .llc_groups
-                .iter()
-                .enumerate()
-                .find(|(_, group)| group.cpus.contains(&service_cpu))
-        {
-            llc_indices.push(service_llc);
-        }
-        llc_indices.sort_unstable();
-        llc_indices.dedup();
-
-        Ok(PinningPlan {
-            assignments,
-            service_cpu,
-            llc_indices,
-            locks: Vec::new(),
-        })
-    }
-
-    /// Per-CPU-GRAIN perf placement: tile each occupied host LLC into
-    /// disjoint `(vcpus_per_llc + 1)`-CPU BLOCKS and map the guest onto
-    /// block index `block`.
-    ///
-    /// Block `b` in a host LLC owns CPUs
-    /// `[b*(V+1) .. b*(V+1)+V)` (V = `vcpus_per_llc`) as a contiguous,
-    /// cache-coherent vCPU window — the SAME topology-mirroring
-    /// [`Self::compute_pinning_at`] gives (each guest LLC's vCPUs stay a
-    /// coherent group inside one real host LLC; guest LLCs never
-    /// interleave or straddle a cache boundary). The guest's single
-    /// service CPU is the block's SPARE `+V` slot in the first occupied
-    /// host LLC, so it too lies INSIDE block `b`. Because every CPU a
-    /// block consumes — vCPUs AND service — is contained in that block,
-    /// DISTINCT block indices produce fully DISJOINT host-CPU sets: two
-    /// perf cells at different blocks take non-overlapping per-CPU
-    /// `LOCK_EX` sets and COEXIST under a shared (`LOCK_SH`) LLC lock.
-    ///
-    /// This is the placement half of the per-CPU-grain reservation (see
-    /// [`perf_llc_lock_mode`]) that unblocks perf-cell parallelism on a
-    /// host whose LLC DWARFS the cell — the AWS Graviton's single
-    /// 96-CPU L3 being the motivating case, where whole-LLC `LOCK_EX`
-    /// (the default [`Self::compute_pinning`] path) serializes EVERY
-    /// perf cell onto the whole machine. It exists as a SEPARATE method
-    /// rather than a `compute_pinning_at` flag precisely so the
-    /// whole-LLC-Exclusive placement the validated dilation campaign
-    /// measured stays byte-for-byte unchanged.
-    ///
-    /// Contrast [`Self::compute_pinning_at`], whose service CPU is the
-    /// global-first-free CPU (fine when the whole LLC is locked `LOCK_EX`,
-    /// but it would COLLIDE across grain blocks and break disjointness).
-    ///
-    /// Returns `TopologyInsufficient` when block `block` does not fit in
-    /// every occupied host LLC — the caller enumerating blocks treats
-    /// that as end-of-blocks (mirroring the `intra_offset` overflow in
-    /// [`Self::compute_pinning_at`]).
-    pub(crate) fn compute_pinning_grain(
-        &self,
-        topo: &super::topology::Topology,
-        block: usize,
-    ) -> Result<PinningPlan> {
-        self.compute_pinning_grain_at(topo, 0, block)
-    }
-
-    /// Offset-aware form of [`Self::compute_pinning_grain`].
-    ///
-    /// `llc_offset` selects an equivalent NUMA-aware host-LLC window and
-    /// `block` selects a disjoint CPU grain inside every LLC in that window.
-    /// Both dimensions are needed for work-conserving admission on a host with
-    /// more than one huge cache domain.
-    pub(crate) fn compute_pinning_grain_at(
-        &self,
-        topo: &super::topology::Topology,
-        llc_offset: usize,
-        block: usize,
-    ) -> Result<PinningPlan> {
-        let cores = topo.cores_per_llc;
-        let threads = topo.threads_per_core;
-        let llcs = topo.llcs;
-        let vcpus_per_llc = cores * threads;
-        // A block reserves V vCPUs + 1 service slot so the WHOLE cell
-        // footprint (including service) tiles at this stride and blocks
-        // never overlap — the property that lets disjoint-block cells
-        // coexist.
-        let block_size = vcpus_per_llc as usize + 1;
-
-        let num_llcs = self.llc_groups.len();
-        if llcs as usize > num_llcs {
-            return Err(anyhow::Error::new(TopologyInsufficient {
-                reason: format!(
-                    "performance_mode (per-CPU grain): need {llcs} LLCs for \
-                     {llcs} virtual LLCs, but host has {num_llcs} LLC groups"
-                ),
-            }));
-        }
-
-        // Distinct host LLCs per guest LLC at this equivalent host window;
-        // block diversity then tiles each selected LLC independently.
-        let llc_order = self.numa_aware_llc_order(topo.numa_nodes, llcs, llc_offset);
-        let block_start = block * block_size;
-
-        let mut assignments = Vec::with_capacity((llcs * vcpus_per_llc) as usize);
-        for llc in 0..llcs {
-            let llc_idx = llc_order[llc as usize];
-            let group = &self.llc_groups[llc_idx];
-            // The entire block (V vCPUs + the service slot) must fit in
-            // this host LLC's CPU list.
-            if group.cpus.len() < block_start + block_size {
-                return Err(anyhow::Error::new(TopologyInsufficient {
-                    reason: format!(
-                        "LLC group {} has {} CPUs, need block {} of size {} \
-                         (end {}) for virtual LLC {}",
-                        llc_idx,
-                        group.cpus.len(),
-                        block,
-                        block_size,
-                        block_start + block_size,
-                        llc,
-                    ),
-                }));
-            }
-            for vcpu_in_llc in 0..vcpus_per_llc {
-                let vcpu_id = llc * vcpus_per_llc + vcpu_in_llc;
-                let host_cpu = group.cpus[block_start + vcpu_in_llc as usize];
-                assignments.push((vcpu_id, host_cpu));
-            }
-        }
-
-        // Service CPU: the block's spare `+V` slot in the FIRST occupied
-        // host LLC — inside block `b`, so disjoint from every other
-        // block's footprint. The fit check above already reserved it.
-        let first_group = &self.llc_groups[llc_order[0]];
-        let service_cpu = Some(first_group.cpus[block_start + vcpus_per_llc as usize]);
-
-        let mut llc_indices = llc_order;
-        llc_indices.sort_unstable();
-        llc_indices.dedup();
-
-        Ok(PinningPlan {
-            assignments,
-            service_cpu,
-            llc_indices,
-            locks: Vec::new(),
-        })
-    }
-
     /// Enumerate performance placements against the synthetic topology's CPU
     /// set. Production uses [`Self::performance_pinning_candidates_for_cpus`]
     /// with the process affinity set; this wrapper keeps topology-only tests
     /// independent of the machine running them.
+    #[cfg(test)]
     pub(crate) fn performance_pinning_candidates(
         &self,
         topo: &super::topology::Topology,
@@ -1111,22 +755,22 @@ impl HostTopology {
             .enumerate()
             .map(|(rank, cpu)| (cpu, rank))
             .collect::<std::collections::BTreeMap<_, _>>();
+        let inputs = PlannerInputs {
+            demands: &demands,
+            kind,
+            allowed: &allowed,
+            allowed_rank: &allowed_rank,
+            preferred_cpus,
+            preferred_shared_llcs,
+            preferred_exclusive_llcs,
+            performance_prefers_shared,
+        };
         let seeds = planner_seed_schedule(self, &demands, kind, &allowed);
         let mut seen = BTreeSet::new();
         let mut candidates = Vec::new();
         for (seed, local_seed) in seeds {
-            let Some((plan, mut exact_cpus)) = self.plan_topology_seed(
-                &demands,
-                kind,
-                &allowed,
-                &allowed_rank,
-                preferred_cpus,
-                preferred_shared_llcs,
-                preferred_exclusive_llcs,
-                performance_prefers_shared,
-                seed,
-                local_seed,
-            ) else {
+            let Some((plan, mut exact_cpus)) = self.plan_topology_seed(inputs, seed, local_seed)
+            else {
                 continue;
             };
             let llc_mode = match kind {
@@ -1194,19 +838,22 @@ impl HostTopology {
     /// Materialize one deterministic tie rotation of the bounded planner.
     fn plan_topology_seed(
         &self,
-        demands: &[GuestLlcDemand],
-        kind: PinningKind,
-        allowed: &std::collections::BTreeSet<usize>,
-        allowed_rank: &std::collections::BTreeMap<usize, usize>,
-        preferred_cpus: &std::collections::BTreeSet<usize>,
-        preferred_shared_llcs: &std::collections::BTreeSet<usize>,
-        preferred_exclusive_llcs: &std::collections::BTreeSet<usize>,
-        performance_prefers_shared: bool,
+        inputs: PlannerInputs<'_>,
         seed: usize,
         local_seed: usize,
     ) -> Option<(PinningPlan, Vec<usize>)> {
         use std::collections::{BTreeMap, BTreeSet};
 
+        let PlannerInputs {
+            demands,
+            kind,
+            allowed,
+            allowed_rank,
+            preferred_cpus,
+            preferred_shared_llcs,
+            preferred_exclusive_llcs,
+            performance_prefers_shared,
+        } = inputs;
         let mut guest_nodes = BTreeMap::<u32, Vec<usize>>::new();
         for (index, demand) in demands.iter().enumerate() {
             guest_nodes
@@ -1247,15 +894,9 @@ impl HostTopology {
                     (
                         !host_bins_preferred_fit(
                             self,
-                            demands,
+                            inputs,
                             request_indices,
                             &self.host_node_llcs[host_node],
-                            kind,
-                            allowed,
-                            preferred_cpus,
-                            preferred_shared_llcs,
-                            preferred_exclusive_llcs,
-                            performance_prefers_shared,
                         ),
                         rotated_tie(host_node_rank[host_node], seed, host_count),
                     )
@@ -1291,17 +932,11 @@ impl HostTopology {
                 let bins = &self.host_node_llcs[&host_node];
                 if !assign_distinct_bins(
                     self,
-                    demands,
+                    inputs,
                     guest_nodes
                         .get(&guest_node)
                         .expect("guest node came from this map"),
                     bins,
-                    kind,
-                    allowed,
-                    preferred_cpus,
-                    preferred_shared_llcs,
-                    preferred_exclusive_llcs,
-                    performance_prefers_shared,
                     seed,
                     &mut trial_used,
                     &mut trial_mapped,
@@ -1321,15 +956,9 @@ impl HostTopology {
             let all_bins = (0..self.llc_groups.len()).collect::<Vec<_>>();
             if !assign_distinct_bins(
                 self,
-                demands,
+                inputs,
                 &all_requests,
                 &all_bins,
-                kind,
-                allowed,
-                preferred_cpus,
-                preferred_shared_llcs,
-                preferred_exclusive_llcs,
-                performance_prefers_shared,
                 seed,
                 &mut used_llcs,
                 &mut mapped,
@@ -1493,112 +1122,6 @@ impl HostTopology {
             exact_cpus,
         ))
     }
-
-    /// Build the virtual LLC to host LLC index mapping.
-    ///
-    /// Falls back to sequential offset mapping when any of these hold:
-    /// `numa_nodes == 0` (avoids divide-by-zero), `numa_nodes == 1`
-    /// (no NUMA-awareness needed), `cpu_to_node` is empty (no NUMA
-    /// map available), `llcs < numa_nodes` (base-per-node would be 0
-    /// and leave guest nodes empty), or the host lacks enough
-    /// NUMA-aligned LLCs.
-    ///
-    /// Otherwise, distributes `llcs` across `numa_nodes` guest nodes:
-    /// the first `llcs % numa_nodes` guest nodes receive
-    /// `base + 1 = ceil(llcs / numa_nodes)` LLCs each; the rest
-    /// receive `base = floor(llcs / numa_nodes)` LLCs. This preserves
-    /// the remainder that floor-only division would silently drop
-    /// (e.g. `llcs=5, numa_nodes=2` yields counts 3+2 = 5).
-    /// Eligibility requires each host NUMA node to supply at least
-    /// `ceil(llcs / numa_nodes)` (the max any single guest node will
-    /// claim) — stricter than the prior floor-based check, so the
-    /// "+1" guest nodes always land on a node with capacity.
-    ///
-    /// Implementation composes [`Self::numa_nodes_with_capacity`],
-    /// which iterates the memoized `host_node_llcs` map. The
-    /// `--cpu-cap` consolidation PLAN phase instead composes
-    /// [`Self::numa_nodes_sorted_by_distance`] plus
-    /// [`Self::llc_numa_node`], so the two callers share the memoized
-    /// `host_node_llcs` map rather than the same accessor calls. The
-    /// two callers' SELECTION algorithms also differ: perf-mode does
-    /// modulo rotation of guest onto host nodes; consolidation does
-    /// score-driven greedy expansion.
-    pub(crate) fn numa_aware_llc_order(
-        &self,
-        numa_nodes: u32,
-        llcs: u32,
-        llc_offset: usize,
-    ) -> Vec<usize> {
-        let num_host_llcs = self.llc_groups.len();
-
-        // Sequential fallback used by the degenerate cases below.
-        let sequential_fallback = || -> Vec<usize> {
-            (0..llcs as usize)
-                .map(|i| (i + llc_offset) % num_host_llcs)
-                .collect()
-        };
-
-        // Defensive: zero NUMA nodes would divide-by-zero below. Also
-        // handles the single-node case (no NUMA-awareness needed) and
-        // the "cpu_to_node map unavailable" case.
-        if numa_nodes == 0 || numa_nodes == 1 || self.cpu_to_node.is_empty() {
-            return sequential_fallback();
-        }
-
-        // If the guest has fewer LLCs than NUMA nodes, a per-node base
-        // of 0 would leave some guest nodes empty. Fall back rather
-        // than silently dropping those nodes' LLCs.
-        if llcs < numa_nodes {
-            return sequential_fallback();
-        }
-
-        // Distribute LLCs across guest NUMA nodes. Integer division
-        // alone drops the remainder (e.g. llcs=5, numa_nodes=2 gave
-        // 2 per node = 4 LLCs assigned, 5th dropped). Fix: the first
-        // `remainder` nodes get `base + 1`, the rest get `base`.
-        let base_per_node = (llcs / numa_nodes) as usize;
-        let remainder = (llcs % numa_nodes) as usize;
-        // Ceiling-per-node — the largest count any single guest node
-        // will claim. Host NUMA nodes must supply at least this many
-        // to remain eligible.
-        let max_per_node = base_per_node + if remainder > 0 { 1 } else { 0 };
-
-        // Collect host NUMA nodes that can supply the ceiling (max)
-        // per-node count — so any guest node can land there regardless
-        // of whether it's one of the `remainder` "+1" nodes. Shared
-        // primitive: `numa_nodes_with_capacity` filters the memoized
-        // group-by-node map.
-        let eligible_nodes = self.numa_nodes_with_capacity(max_per_node);
-
-        // Need at least numa_nodes distinct host NUMA nodes with enough
-        // LLCs each.
-        if eligible_nodes.len() < numa_nodes as usize {
-            return sequential_fallback();
-        }
-
-        // Assign guest NUMA nodes to host NUMA nodes, rotating by
-        // llc_offset to spread concurrent VMs.
-        let mut order = Vec::with_capacity(llcs as usize);
-        let node_offset = llc_offset / max_per_node.max(1);
-        for guest_node in 0..numa_nodes as usize {
-            let host_idx = (guest_node + node_offset) % eligible_nodes.len();
-            let (_, host_llcs) = &eligible_nodes[host_idx];
-            let within_offset = llc_offset % host_llcs.len();
-            // First `remainder` guest nodes get `base + 1` LLCs; rest
-            // get `base`. Total assigned == llcs (remainder preserved).
-            let count = if guest_node < remainder {
-                base_per_node + 1
-            } else {
-                base_per_node
-            };
-            for i in 0..count {
-                let llc_idx = host_llcs[(i + within_offset) % host_llcs.len()];
-                order.push(llc_idx);
-            }
-        }
-
-        order
-    }
 }
 
 fn rotated_tie(value: usize, seed: usize, cardinality: usize) -> usize {
@@ -1730,7 +1253,7 @@ fn grain_mapping_possible(
     }
     // ...or occupy its own otherwise-unmapped grain-capable LLC.
     (0..host.llc_groups.len()).any(|llc| {
-        llc_allowed_cpus(host, llc, allowed).len() >= 1
+        !llc_allowed_cpus(host, llc, allowed).is_empty()
             && perf_grain_capable_for_footprint(host, llc, 1)
             && matches_with_service(None, Some(llc))
     })
@@ -1763,16 +1286,20 @@ fn preferred_llc_ready(
 /// checked authoritatively before acquisition.
 fn host_bins_preferred_fit(
     host: &HostTopology,
-    demands: &[GuestLlcDemand],
+    inputs: PlannerInputs<'_>,
     request_indices: &[usize],
     bins: &[usize],
-    kind: PinningKind,
-    allowed: &std::collections::BTreeSet<usize>,
-    preferred_cpus: &std::collections::BTreeSet<usize>,
-    preferred_shared_llcs: &std::collections::BTreeSet<usize>,
-    preferred_exclusive_llcs: &std::collections::BTreeSet<usize>,
-    performance_prefers_shared: bool,
 ) -> bool {
+    let PlannerInputs {
+        demands,
+        kind,
+        allowed,
+        preferred_cpus,
+        preferred_shared_llcs,
+        preferred_exclusive_llcs,
+        performance_prefers_shared,
+        ..
+    } = inputs;
     let mut edges = std::collections::BTreeMap::new();
     for &request in request_indices {
         let demand = demands[request].cpus;
@@ -1859,19 +1386,23 @@ fn match_distinct_nodes(
 
 fn assign_distinct_bins(
     host: &HostTopology,
-    demands: &[GuestLlcDemand],
+    inputs: PlannerInputs<'_>,
     request_indices: &[usize],
     eligible_bins: &[usize],
-    kind: PinningKind,
-    allowed: &std::collections::BTreeSet<usize>,
-    preferred_cpus: &std::collections::BTreeSet<usize>,
-    preferred_shared_llcs: &std::collections::BTreeSet<usize>,
-    preferred_exclusive_llcs: &std::collections::BTreeSet<usize>,
-    performance_prefers_shared: bool,
     seed: usize,
     used: &mut std::collections::BTreeSet<usize>,
     mapped: &mut [usize],
 ) -> bool {
+    let PlannerInputs {
+        demands,
+        kind,
+        allowed,
+        preferred_cpus,
+        preferred_shared_llcs,
+        preferred_exclusive_llcs,
+        performance_prefers_shared,
+        ..
+    } = inputs;
     let mut eligible = eligible_bins
         .iter()
         .copied()
@@ -2146,34 +1677,6 @@ pub enum LockOutcome {
     Unavailable(#[allow(dead_code)] String),
 }
 
-/// Acquire complete physical LLC domains (non-blocking).
-///
-/// The operation requires at least one valid host-global LLC index, takes
-/// every LLC lock exclusively, derives the union of all CPUs in those domains,
-/// and takes every derived CPU lock exclusively. Callers cannot understate the
-/// CPU footprint or weaken its mode. The CPU side is the admission bridge to a
-/// topology-unavailable overcommitter that can identify only CPU resources.
-///
-/// `KTSTR_CARGO_TEST_MODE` short-circuits the entire flock dance and
-/// returns `Acquired` with an empty fd list — bare `cargo test`
-/// invocations don't share the cross-process LLC reservation
-/// contract that nextest / `cargo ktstr test` peers rely on. Tests
-/// run on whatever CPUs the OS schedules them onto.
-pub fn acquire_whole_llc_locks(
-    host_topo: &HostTopology,
-    llc_indices: &[usize],
-) -> Result<LockOutcome> {
-    let cpus = whole_llc_cpus(host_topo, llc_indices)?;
-    acquire_resource_locks_waiting_impl(
-        llc_indices,
-        LlcLockMode::Exclusive,
-        &cpus,
-        FlockMode::Exclusive,
-        false,
-        None,
-    )
-}
-
 /// Admission bridge for a default overcommit run. The run cannot promise
 /// one-host-CPU-per-vCPU, but it still owns its complete allowed CPU footprint
 /// exclusively and shares every LLC that footprint is known to touch. Whole
@@ -2194,10 +1697,6 @@ pub(crate) fn acquire_overcommit_bridge(
         wait,
         cancelled,
     )
-}
-
-pub(crate) fn overcommit_bridge_claim(llc_indices: &[usize], cpus: &[usize]) -> protocol::ClaimSet {
-    resource_claim_with_modes(llc_indices, LlcLockMode::Shared, cpus, FlockMode::Exclusive)
 }
 
 fn acquire_resource_locks_waiting_impl(
@@ -2294,21 +1793,6 @@ fn acquire_resource_locks_waiting_impl(
         }
         protocol::CoordinatorOutcome::Aborted { reason } => LockOutcome::Unavailable(reason),
     })
-}
-
-fn whole_llc_cpus(host_topo: &HostTopology, llc_indices: &[usize]) -> Result<Vec<usize>> {
-    if llc_indices.is_empty() {
-        anyhow::bail!("a whole-LLC reservation requires at least one LLC index");
-    }
-    let mut domain = std::collections::BTreeSet::new();
-    for &llc in llc_indices {
-        let group = host_topo
-            .llc_groups
-            .get(llc)
-            .ok_or_else(|| anyhow::anyhow!("host LLC index {llc} is out of range"))?;
-        domain.extend(group.cpus.iter().copied());
-    }
-    Ok(domain.into_iter().collect())
 }
 
 fn llc_flock_mode(llc_mode: LlcLockMode) -> FlockMode {
@@ -2638,9 +2122,9 @@ fn default_cpu_budget(allowed_cpus: usize) -> usize {
 /// guest vCPU, plus headroom for the host-side service threads (monitor,
 /// watchdog, virtio, workload coordination) that live INSIDE the cell's
 /// cgroup and would otherwise CFS-contend with spinning vCPUs on an
-/// exactly-vcpus cpuset — the budgeted-path analog of perf mode's
-/// `reserve_service_cpu` +1 in `compute_pinning`. Sensing timeliness rides
-/// on this: on hosts without CAP_SYS_NICE the sensing threads run
+/// exactly-vcpus cpuset — the budgeted-path analog of the performance
+/// planner's dedicated service CPU. Sensing timeliness rides on this: on
+/// hosts without CAP_SYS_NICE the sensing threads run
 /// SCHED_OTHER, and a starved monitor thins the contention witness the
 /// latency verdicts consume.
 ///
@@ -2836,9 +2320,6 @@ impl PlacementPolicy {
 pub(crate) struct LlcSnapshot {
     /// Host LLC index — matches [`HostTopology::llc_groups`] ordering.
     pub(crate) llc_idx: usize,
-    /// Canonical `{lock_dir}/ktstr-llc-{N}.lock` path. Stored so the
-    /// ACQUIRE phase doesn't re-format the string per LLC.
-    pub(crate) lockfile_path: std::path::PathBuf,
     /// Processes currently holding this LLC's flock (any mode). Empty
     /// when no peer holds the lock. Derived from a single `/proc/locks`
     /// read shared across every LLC in the discover phase.
@@ -3060,7 +2541,7 @@ fn discover_llc_snapshots_impl(
     }
 
     let mut snapshots = Vec::with_capacity(paths.len());
-    for (row, (llc_idx, path)) in paths.into_iter().enumerate() {
+    for (row, (llc_idx, _)) in paths.into_iter().enumerate() {
         // Exclude the calling process from the PLAN-driving holder
         // count. No-perf `build()` now holds this LLC's `LOCK_SH` from
         // build through run, so at the run-time replan our own
@@ -3083,7 +2564,6 @@ fn discover_llc_snapshots_impl(
             .unwrap_or_default();
         snapshots.push(LlcSnapshot {
             llc_idx,
-            lockfile_path: path,
             holders,
             holder_count,
             exclusive_held: states[row].summary.exclusive_holder,
@@ -3459,15 +2939,27 @@ pub fn acquire_llc_plan_with_wait_handoff(
         return acquire_llc_plan(topo, test_topo, cpu_cap, policy, true);
     }
     acquire_llc_plan_with_acquire_fn_and_handoff(
-        topo,
-        test_topo,
-        cpu_cap,
-        policy,
-        true,
-        None,
+        LlcPlanAcquireRequest {
+            topo,
+            test_topo,
+            cpu_cap,
+            policy,
+            wait: true,
+            cancelled: None,
+        },
         Some(after_publish),
         try_acquire_llc_plan_locks_with_evidence,
     )
+}
+
+#[derive(Clone, Copy)]
+struct LlcPlanAcquireRequest<'a> {
+    topo: &'a HostTopology,
+    test_topo: &'a crate::topology::TestTopology,
+    cpu_cap: Option<CpuCap>,
+    policy: PlacementPolicy,
+    wait: bool,
+    cancelled: Option<&'a AtomicBool>,
 }
 
 fn acquire_llc_plan_impl(
@@ -3533,12 +3025,14 @@ fn acquire_llc_plan_impl(
         return Ok(plan);
     }
     acquire_llc_plan_with_acquire_fn_and_handoff(
-        topo,
-        test_topo,
-        cpu_cap,
-        policy,
-        wait,
-        cancelled,
+        LlcPlanAcquireRequest {
+            topo,
+            test_topo,
+            cpu_cap,
+            policy,
+            wait,
+            cancelled,
+        },
         None::<fn()>,
         try_acquire_llc_plan_locks_with_evidence,
     )
@@ -3603,24 +3097,21 @@ where
     F: FnMut(&[usize], &[usize], &[LlcSnapshot]) -> Result<Option<Vec<std::os::fd::OwnedFd>>>,
 {
     acquire_llc_plan_with_acquire_fn_and_handoff(
-        topo,
-        test_topo,
-        cpu_cap,
-        policy,
-        wait,
-        cancelled,
+        LlcPlanAcquireRequest {
+            topo,
+            test_topo,
+            cpu_cap,
+            policy,
+            wait,
+            cancelled,
+        },
         None::<fn()>,
         acquire_fn,
     )
 }
 
 fn acquire_llc_plan_with_acquire_fn_and_handoff<F, H, A>(
-    topo: &HostTopology,
-    test_topo: &crate::topology::TestTopology,
-    cpu_cap: Option<CpuCap>,
-    policy: PlacementPolicy,
-    wait: bool,
-    cancelled: Option<&AtomicBool>,
+    request: LlcPlanAcquireRequest<'_>,
     mut after_publish: Option<H>,
     mut acquire_fn: F,
 ) -> Result<LlcPlan>
@@ -3629,6 +3120,14 @@ where
     A: IntoLlcLockAttempt,
     H: FnOnce(),
 {
+    let LlcPlanAcquireRequest {
+        topo,
+        test_topo,
+        cpu_cap,
+        policy,
+        wait,
+        cancelled,
+    } = request;
     struct Handoff<F: FnOnce()>(Option<F>);
 
     impl<F: FnOnce()> Handoff<F> {

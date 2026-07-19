@@ -184,33 +184,6 @@ fn host_llcs_by_numa_node_dual_node() {
     assert_eq!(map.get(&1), Some(&vec![1, 3]));
 }
 
-/// Asymmetric: node 0 has 3 LLCs, node 1 has 1 LLC.
-/// `numa_nodes_with_capacity(2)` returns only node 0.
-#[test]
-fn numa_nodes_with_capacity_asymmetric() {
-    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 1)]);
-    let cap2: Vec<usize> = topo
-        .numa_nodes_with_capacity(2)
-        .into_iter()
-        .map(|(node, _)| node)
-        .collect();
-    assert_eq!(cap2, vec![0], "only node 0 has ≥ 2 LLCs");
-    let cap1: Vec<usize> = topo
-        .numa_nodes_with_capacity(1)
-        .into_iter()
-        .map(|(node, _)| node)
-        .collect();
-    assert_eq!(cap1, vec![0, 1], "both nodes have ≥ 1 LLC");
-}
-
-/// `numa_nodes_with_capacity` with min_llcs > every node's
-/// count returns empty — no candidates.
-#[test]
-fn numa_nodes_with_capacity_over_max_returns_empty() {
-    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 1)]);
-    assert!(topo.numa_nodes_with_capacity(99).is_empty());
-}
-
 /// `numa_nodes_sorted_by_distance` with identity closure:
 /// anchor == node → 10, else 20. Anchor sorts first; remaining
 /// nodes preserve BTreeMap ascending order (stable sort over
@@ -343,7 +316,6 @@ fn plan_from_snapshots_returns_ascending_indices() {
     let snapshots: Vec<LlcSnapshot> = (0..4)
         .map(|idx| LlcSnapshot {
             llc_idx: idx,
-            lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
             holders: Vec::new(),
             holder_count: if idx >= 2 { 5 } else { 0 },
             exclusive_held: false,
@@ -378,7 +350,6 @@ fn plan_from_snapshots_target_ge_all_selects_every_llc() {
     let snapshots: Vec<LlcSnapshot> = (0..3)
         .map(|idx| LlcSnapshot {
             llc_idx: idx,
-            lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
             holders: Vec::new(),
             holder_count: 0,
             exclusive_held: false,
@@ -416,7 +387,6 @@ fn plan_from_snapshots_sparse_saturation_preserves_llc_indices() {
         .into_iter()
         .map(|llc_idx| LlcSnapshot {
             llc_idx,
-            lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{llc_idx}.lock")),
             holders: Vec::new(),
             holder_count: 0,
             exclusive_held: false,
@@ -445,7 +415,6 @@ fn plan_from_snapshots_target_zero_returns_empty() {
     let topo = synth_host_topo(&[(vec![0], 0)]);
     let snapshots: Vec<LlcSnapshot> = vec![LlcSnapshot {
         llc_idx: 0,
-        lockfile_path: std::path::PathBuf::from("/tmp/ktstr-llc-0.lock"),
         holders: Vec::new(),
         holder_count: 0,
         exclusive_held: false,
@@ -468,7 +437,6 @@ fn overlapping_llc_groups_materialize_a_distinct_cpu_budget() {
     let snapshots = (0..2)
         .map(|llc_idx| LlcSnapshot {
             llc_idx,
-            lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{llc_idx}.lock")),
             holders: Vec::new(),
             holder_count: 0,
             exclusive_held: false,
@@ -560,14 +528,12 @@ fn plan_from_snapshots_prefers_higher_holder_count() {
     let snapshots: Vec<LlcSnapshot> = vec![
         LlcSnapshot {
             llc_idx: 0,
-            lockfile_path: std::path::PathBuf::from("/tmp/ktstr-llc-0.lock"),
             holders: Vec::new(),
             holder_count: 0,
             exclusive_held: false,
         },
         LlcSnapshot {
             llc_idx: 1,
-            lockfile_path: std::path::PathBuf::from("/tmp/ktstr-llc-1.lock"),
             holders: Vec::new(),
             holder_count: 5,
             exclusive_held: false,
@@ -606,28 +572,24 @@ fn plan_from_snapshots_always_ascending_across_target_range() {
     let snapshots: Vec<LlcSnapshot> = vec![
         LlcSnapshot {
             llc_idx: 0,
-            lockfile_path: std::path::PathBuf::from("/tmp/ktstr-llc-0.lock"),
             holders: Vec::new(),
             holder_count: 3,
             exclusive_held: false,
         },
         LlcSnapshot {
             llc_idx: 1,
-            lockfile_path: std::path::PathBuf::from("/tmp/ktstr-llc-1.lock"),
             holders: Vec::new(),
             holder_count: 0,
             exclusive_held: false,
         },
         LlcSnapshot {
             llc_idx: 2,
-            lockfile_path: std::path::PathBuf::from("/tmp/ktstr-llc-2.lock"),
             holders: Vec::new(),
             holder_count: 7,
             exclusive_held: false,
         },
         LlcSnapshot {
             llc_idx: 3,
-            lockfile_path: std::path::PathBuf::from("/tmp/ktstr-llc-3.lock"),
             holders: Vec::new(),
             holder_count: 1,
             exclusive_held: false,
@@ -1756,12 +1718,14 @@ fn waiting_handoff_publishes_ticket_before_releasing_old_locks() {
     let enrichment_before =
         crate::flock::proc_locks::batch_holder_info_resolution_count_for_tests();
     let plan = acquire_llc_plan_with_acquire_fn_and_handoff(
-        &topo,
-        &test_topo,
-        None,
-        PlacementPolicy::Spread { rotation: 0 },
-        true,
-        None,
+        LlcPlanAcquireRequest {
+            topo: &topo,
+            test_topo: &test_topo,
+            cpu_cap: None,
+            policy: PlacementPolicy::Spread { rotation: 0 },
+            wait: true,
+            cancelled: None,
+        },
         Some(|| {
             let records = admission_protocol::ticket_registry_snapshot_for_tests()
                 .expect("handoff hook must be able to read the published ticket");
@@ -1828,12 +1792,14 @@ fn waiting_handoff_releases_inherited_locks_on_acquire_error() {
     let handed_off_in_hook = &handed_off;
 
     let error = acquire_llc_plan_with_acquire_fn_and_handoff(
-        &topo,
-        &test_topo,
-        None,
-        PlacementPolicy::Spread { rotation: 0 },
-        true,
-        None,
+        LlcPlanAcquireRequest {
+            topo: &topo,
+            test_topo: &test_topo,
+            cpu_cap: None,
+            policy: PlacementPolicy::Spread { rotation: 0 },
+            wait: true,
+            cancelled: None,
+        },
         Some(move || {
             handed_off_in_hook.set(true);
             drop(inherited);
@@ -1878,7 +1844,6 @@ fn plan_from_snapshots_consolidation_overrides_fresh_ordering() {
     let snapshots: Vec<LlcSnapshot> = (0..4)
         .map(|idx| LlcSnapshot {
             llc_idx: idx,
-            lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
             holders: Vec::new(),
             holder_count: if idx == 3 { 5 } else { 0 },
             exclusive_held: false,
@@ -1921,7 +1886,6 @@ fn plan_from_snapshots_single_node_fit_no_spill() {
     let snapshots: Vec<LlcSnapshot> = (0..4)
         .map(|idx| LlcSnapshot {
             llc_idx: idx,
-            lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
             holders: Vec::new(),
             holder_count: 0,
             exclusive_held: false,
@@ -1961,7 +1925,6 @@ fn plan_from_snapshots_equal_scores_tiebreak_ascending() {
     let snapshots: Vec<LlcSnapshot> = (0..4)
         .map(|idx| LlcSnapshot {
             llc_idx: idx,
-            lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
             holders: Vec::new(),
             holder_count: 5,
             exclusive_held: false,
@@ -2134,7 +2097,6 @@ fn plan_from_snapshots_filters_llcs_outside_allowed_set() {
     let snapshots: Vec<LlcSnapshot> = (0..4)
         .map(|idx| LlcSnapshot {
             llc_idx: idx,
-            lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
             holders: Vec::new(),
             holder_count: 0,
             exclusive_held: false,
@@ -2211,7 +2173,6 @@ fn plan_from_snapshots_partial_llc_overlap_counted_correctly() {
     let snapshots: Vec<LlcSnapshot> = (0..2)
         .map(|idx| LlcSnapshot {
             llc_idx: idx,
-            lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
             holders: Vec::new(),
             holder_count: 0,
             exclusive_held: false,
@@ -2373,7 +2334,6 @@ fn spread_snapshots(holder_counts: &[usize]) -> Vec<LlcSnapshot> {
         .enumerate()
         .map(|(idx, &holder_count)| LlcSnapshot {
             llc_idx: idx,
-            lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
             holders: Vec::new(),
             holder_count,
             exclusive_held: false,
@@ -2774,10 +2734,10 @@ fn whole_domain_identity_and_cpu_bridge_are_cpuset_independent() {
     assert_eq!(left.cpu_reservations, vec![0, 1, 2]);
     assert_eq!(right.cpu_reservations, vec![0, 1, 2]);
     assert_eq!(
-        whole_llc_cpus(&host, &[0]).expect("derive whole-domain bridge"),
-        vec![0, 1, 2],
-        "whole-EX locking must include the sibling outside either caller's \
-         allowed mask",
+        left.claim().cpus,
+        [0, 1, 2].into_iter().collect(),
+        "the production whole-EX candidate claim must include the sibling \
+         outside either caller's allowed mask",
     );
 }
 
@@ -3133,12 +3093,18 @@ fn planner_reservation_matrix_is_explicit_and_canonical() {
             .all(|candidate| { candidate.cpu_reservations == vec![0, 1, 2, 3] }),
         "whole-LLC CPU bridge must cover sibling CPUs outside this process cpuset"
     );
-    let unknown_topology_bridge = overcommit_bridge_claim(&[], &[0, 1, 2, 3]);
+    let unknown_topology_bridge = resource_claim_with_modes(
+        &[],
+        LlcLockMode::Shared,
+        &[0, 1, 2, 3],
+        FlockMode::Exclusive,
+    );
     assert!(
         unknown_topology_bridge.conflicts_with(&restricted[0].claim()),
         "CPU EX alone must bridge a whole-perf reservation when LLCs are unknown",
     );
-    let known_topology_bridge = overcommit_bridge_claim(&[0], &[0, 1]);
+    let known_topology_bridge =
+        resource_claim_with_modes(&[0], LlcLockMode::Shared, &[0, 1], FlockMode::Exclusive);
     assert_eq!(
         known_topology_bridge.llc_mode,
         admission_protocol::ClaimMode::Shared,

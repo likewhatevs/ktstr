@@ -231,8 +231,25 @@ fn resource_lock_exclusive_includes_explicit_cpu_bridge() {
 fn whole_perf_derived_cpu_bridge_conflicts_with_overcommit() {
     let _prefixes = LockPrefixesGuard::new();
     let host = HostTopology::new_for_tests(&[(vec![90410, 90411], 0)]);
-    let whole = super::super::acquire_whole_llc_locks(&host, &[0]).unwrap();
-    let (_, locks) = unwrap_acquired(whole, Some("fresh public whole-domain acquire"));
+    let candidate = host
+        .performance_pinning_candidates_for_cpus(
+            &crate::vmm::topology::Topology::new(1, 1, 1, 1),
+            &[90410, 90411],
+        )
+        .expect("production planner must produce a whole-domain candidate")
+        .into_iter()
+        .next()
+        .expect("at least one whole-domain candidate");
+    assert_eq!(candidate.llc_mode, LlcLockMode::Exclusive);
+    assert_eq!(candidate.cpu_reservations, vec![90410, 90411]);
+    let whole = acquire_resource_locks(
+        &candidate.plan.llc_indices,
+        candidate.llc_mode,
+        &candidate.cpu_reservations,
+        candidate.cpu_mode,
+    )
+    .unwrap();
+    let (_, locks) = unwrap_acquired(whole, Some("fresh production whole-domain candidate"));
     assert_eq!(locks.len(), 3, "LLC EX plus both full-domain CPU EX locks");
     let bridge = acquire_overcommit_bridge(&[], &[90411], false, None).unwrap();
     assert!(
@@ -240,14 +257,6 @@ fn whole_perf_derived_cpu_bridge_conflicts_with_overcommit() {
         "topology-unavailable overcommit must still see whole-perf CPU EX",
     );
     drop(locks);
-}
-
-#[test]
-fn whole_llc_public_acquire_rejects_an_empty_domain() {
-    let host = HostTopology::new_for_tests(&[(vec![90415], 0)]);
-    let error = super::super::acquire_whole_llc_locks(&host, &[])
-        .expect_err("an empty whole-domain acquire must not become a no-op claim");
-    assert!(error.to_string().contains("at least one LLC"));
 }
 
 #[test]
@@ -826,26 +835,39 @@ fn perf_grain_two_disjoint_cells_coexist_on_huge_llc() {
     // A real perf cell: llcs=1, cores=2, threads=1 → 2 vCPUs + 1 service.
     let topo = crate::vmm::topology::Topology::new(1, 1, 2, 1);
 
-    // The switch fires: the cell is a tiny slice (3/96) of a huge LLC.
-    let block0 = host.compute_pinning_grain(&topo, 0).unwrap();
-    let block1 = host.compute_pinning_grain(&topo, 1).unwrap();
-    assert_eq!(perf_llc_lock_mode(&host, &block0), LlcLockMode::Shared);
-    assert_eq!(perf_llc_lock_mode(&host, &block1), LlcLockMode::Shared);
+    // The production planner emits disjoint 3-CPU grains for this cell.
+    let allowed = (0..96).collect::<Vec<_>>();
+    let candidates = host
+        .performance_pinning_candidates_for_cpus(&topo, &allowed)
+        .expect("production planner must emit grain candidates");
+    let block0 = &candidates[0];
+    let block1 = candidates
+        .iter()
+        .skip(1)
+        .find(|candidate| {
+            candidate
+                .cpu_reservations
+                .iter()
+                .all(|cpu| !block0.cpu_reservations.contains(cpu))
+        })
+        .expect("planner must expose a second disjoint grain");
+    assert_eq!(block0.llc_mode, LlcLockMode::Shared);
+    assert_eq!(block1.llc_mode, LlcLockMode::Shared);
 
     // AFTER: two disjoint grain cells both reserve simultaneously —
     // shared LLC lock + disjoint per-CPU exclusive locks.
     let a = acquire_resource_locks(
-        &block0.llc_indices,
-        LlcLockMode::Shared,
-        &exact_plan_cpus(&block0),
-        FlockMode::Exclusive,
+        &block0.plan.llc_indices,
+        block0.llc_mode,
+        &block0.cpu_reservations,
+        block0.cpu_mode,
     )
     .unwrap();
     let b = acquire_resource_locks(
-        &block1.llc_indices,
-        LlcLockMode::Shared,
-        &exact_plan_cpus(&block1),
-        FlockMode::Exclusive,
+        &block1.plan.llc_indices,
+        block1.llc_mode,
+        &block1.cpu_reservations,
+        block1.cpu_mode,
     )
     .unwrap();
     let (a_ok, b_ok) = (
@@ -865,9 +887,12 @@ fn perf_grain_two_disjoint_cells_coexist_on_huge_llc() {
     // path incurred for EVERY cell on this one-LLC host.)
     drop((a, b));
     let _fresh = LockPrefixesGuard::new();
-    let whole = host.compute_pinning(&topo, true, 0).unwrap();
-    let first = super::super::acquire_whole_llc_locks(&host, &whole.llc_indices).unwrap();
-    let second = super::super::acquire_whole_llc_locks(&host, &whole.llc_indices).unwrap();
+    let first =
+        acquire_resource_locks(&[0], LlcLockMode::Exclusive, &allowed, FlockMode::Exclusive)
+            .unwrap();
+    let second =
+        acquire_resource_locks(&[0], LlcLockMode::Exclusive, &allowed, FlockMode::Exclusive)
+            .unwrap();
     assert!(
         matches!(first, LockOutcome::Acquired { .. }),
         "first whole-LLC exclusive reservation acquires",

@@ -1500,10 +1500,10 @@ impl HeldLocks {
             match try_flock_with_witness(&lock.path, lock.mode)? {
                 TryFlockOutcome::Acquired(fd) => {
                     entry.insert(HeldLock {
-                            fd,
-                            mode: lock.mode,
-                            resource: lock.resource,
-                        });
+                        fd,
+                        mode: lock.mode,
+                        resource: lock.resource,
+                    });
                     self.newly_held.insert(lock.resource, lock.mode);
                     gained += 1;
                 }
@@ -1815,9 +1815,7 @@ impl HolderObserver {
     }
 
     fn proof_file(&mut self, key: ResourceKey) -> Result<&std::fs::File> {
-        if let std::collections::btree_map::Entry::Vacant(entry) =
-            self.proof_files.entry(key)
-        {
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.proof_files.entry(key) {
             let path = match key {
                 ResourceKey::Llc(index) => super::llc_lock_path(index),
                 ResourceKey::Cpu(index) => super::cpu_lock_path(index),

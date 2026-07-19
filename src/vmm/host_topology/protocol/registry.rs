@@ -58,8 +58,7 @@ const H_GRANT_SCANS: usize = 136;
 const H_ACTIVE_HEAD: usize = 144;
 const H_ACTIVE_TAIL: usize = 152;
 const H_LIVENESS_RECONCILE_BY_NS: usize = 160;
-const _: () =
-    assert!(H_AGGREGATE_DIRTY.is_multiple_of(std::mem::align_of::<AtomicU64>()));
+const _: () = assert!(H_AGGREGATE_DIRTY.is_multiple_of(std::mem::align_of::<AtomicU64>()));
 
 const R_STATE: usize = 0;
 const R_WAKE: usize = 4;

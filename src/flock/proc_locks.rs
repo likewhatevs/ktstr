@@ -774,9 +774,7 @@ malformed
         let pid_rows =
             read_holder_pids_batch_with_mountinfo(paths, &mountinfo).expect("read PID-only batch");
         assert!(
-            pid_rows
-                .iter()
-                .all(|row| row.contains(&our_pid)),
+            pid_rows.iter().all(|row| row.contains(&our_pid)),
             "our PID must appear for both held lockfiles: {pid_rows:?}",
         );
         assert_eq!(
