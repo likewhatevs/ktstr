@@ -6,7 +6,7 @@
 //!    per-CPU locks at `{lock_dir}/ktstr-cpu-{C}.lock` where
 //!    `lock_dir` is resolved by `crate::cache::resolve_lock_dir`
 //!    (`KTSTR_LOCK_DIR` env var, fallback `/tmp`). See
-//!    `crate::vmm::host_topology::acquire_resource_locks` and
+//!    `crate::vmm::host_topology::try_acquire_resources` and
 //!    friends.
 //!  - Per-cache-entry coordination locks at
 //!    `{cache_root}/.locks/{cache_key}.lock` (see

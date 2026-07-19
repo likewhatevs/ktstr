@@ -1223,14 +1223,11 @@ impl KtstrVmBuilder {
     /// `self.performance_mode` selects the perf-mode arm, else the
     /// deferred default.
     fn resolve_run_plans(&mut self, no_perf_mode: bool) -> Result<RunPlans> {
-        // `host_topo` is cached on KtstrVm so `KtstrVm::run`'s
-        // default-else branch (neither perf-mode nor no-perf-mode)
-        // can call `compute_pinning` per LLC offset and take `LOCK_SH`
-        // via `acquire_resource_locks` without re-reading sysfs.
-        // The no-perf-mode and perf-mode branches reuse their
-        // stored plans' `locked_llcs` / `llc_indices` directly
-        // through `acquire_resource_locks` and do not need the
-        // topology at run time.
+        // Cache one host-topology snapshot so every coordinated run path can
+        // re-plan without re-reading sysfs. No-perf repeats its budget plan
+        // after build-time reservations make peer load visible; performance
+        // and default invoke the same bounded exact-placement mapper used by
+        // their build-time validation/probe.
         let mut cached_host_topo: Option<host_topology::HostTopology> = None;
         // No-perf run-time replan budget: the exact effective `CpuCap`
         // the build-time plan targeted, carried onto `KtstrVm` so
@@ -1238,7 +1235,7 @@ impl KtstrVmBuilder {
         // recomputed from a possibly-shifted allowed set) after the
         // build-time holds have made peers' holder counts truthful.
         // `None` for perf-mode and the degraded-sysfs / bypass no-perf
-        // branches, which never replan.
+        // branches, which never consume this no-perf budget.
         let mut no_perf_effective_cap: Option<host_topology::CpuCap> = None;
 
         let (pinning_plan, mbind_node_map, no_perf_plan) = if no_perf_mode {
@@ -1437,18 +1434,16 @@ impl KtstrVmBuilder {
         } else if self.performance_mode {
             let (mut plan, host_topo) = self.validate_performance_mode()?;
             let node_map = build_per_node_map(&plan, &host_topo, &self.topology);
-            // Strip the flock fds — `run()` re-acquires via
-            // `acquire_resource_locks` using `plan.llc_indices`.
-            // The build-time setup paths read `assignments` /
-            // `service_cpu` / `llc_indices`, which all stay
-            // populated.
+            // Strip the build-time probe's flock fds. `run()` invokes the same
+            // candidate mapper and may select any equivalent exact placement;
+            // it returns that effective plan so affinity and NUMA binding are
+            // rebuilt from the resources actually acquired.
             drop(std::mem::take(&mut plan.locks));
             cached_host_topo = Some(host_topo);
             (Some(plan), node_map, None)
         } else {
-            // Default: defer pinning to run() which tries each LLC
-            // offset with LOCK_SH. Cache the host topology so run()
-            // can compute plans; no plan or locks at build time.
+            // Default: defer exact candidate selection and admission to run().
+            // Cache the host topology; no plan or locks exist at build time.
             cached_host_topo = host_topology::HostTopology::cached().ok();
             (None, Vec::new(), None)
         };
@@ -1468,12 +1463,11 @@ impl KtstrVmBuilder {
     /// host has too few CPUs / LLC groups for the requested perf topology
     /// (the explicit isolation guarantee cannot be honored — a permanent
     /// host-insufficiency the dispatch/macro treat as a SKIP by default,
-    /// promoted to a hard FAIL under `KTSTR_NO_SKIP_MODE`; from the pre-check
-    /// here and via the `compute_pinning` re-map in `acquire_slot_with_locks`),
-    /// or `ResourceContention` when the host is
-    /// big enough but all LLC slots are currently busy (transient →
-    /// retryable failure, nextest re-runs). Warnings are printed for degraded conditions
-    /// (hugepages, host load).
+    /// promoted to a hard FAIL under `KTSTR_NO_SKIP_MODE`; the shared bounded
+    /// candidate mapper in `acquire_slot_with_locks` is the sole capacity
+    /// authority). A host that fits but is currently busy returns an unlocked
+    /// setup plan and queues at run time. Warnings are printed for degraded
+    /// conditions (hugepages, host load).
     fn validate_performance_mode(
         &mut self,
     ) -> Result<(host_topology::PinningPlan, host_topology::HostTopology)> {
@@ -1483,37 +1477,11 @@ impl KtstrVmBuilder {
         let t = &self.topology;
         let total_vcpus = t.total_cpus();
 
-        // Validate LLC exclusivity: each virtual LLC should map to
-        // its own physical LLC group. Sum actual per-group CPU counts
-        // to handle asymmetric LLCs.
-        let llcs_needed = t.llcs as usize;
-        let reserved: usize = host_topo
-            .llc_groups
-            .iter()
-            .take(llcs_needed)
-            .map(|g| g.cpus.len())
-            .sum();
-        let total_reserved = reserved + 1; // +1 for service CPU
-        if total_reserved > host_topo.total_cpus() {
-            // The host has fewer CPUs than perf-mode must reserve: the
-            // explicitly-requested isolation guarantee cannot be honored on
-            // this host. PerfModeUnavailable — a host-insufficiency the
-            // dispatch/macro treat as a SKIP by default (FAIL under
-            // KTSTR_NO_SKIP_MODE); the operator provisions a bigger host,
-            // narrows the topology, or drops --perf-mode.
-            return Err(anyhow::Error::new(host_topology::PerfModeUnavailable {
-                reason: format!(
-                    "performance_mode: need {} CPUs ({} across {} LLCs + 1 service) \
-                     but only {} host CPUs available\n  \
-                     hint: pass --no-perf-mode or set KTSTR_NO_PERF_MODE=1 to run without CPU reservation",
-                    total_reserved,
-                    reserved,
-                    llcs_needed,
-                    host_topo.total_cpus(),
-                ),
-            }));
-        }
-
+        // `acquire_slot_with_locks` delegates all static fit decisions to the
+        // same allowed-CPU, heterogeneous-LLC candidate mapper used at run
+        // time. Do not pre-sum complete LLC widths here: the service CPU lives
+        // inside a claimed domain, and a per-CPU-grain cell on one 96-CPU LLC
+        // needs only its vCPUs plus one service CPU, not 96 + 1 CPUs.
         let plan = acquire_slot_with_locks(&host_topo, t)?;
 
         // WARN: hugepages (only when memory is known upfront).
@@ -1559,9 +1527,11 @@ pub(crate) fn build_per_node_map(
     let n = topo.numa_nodes as usize;
     let mut map: Vec<std::collections::BTreeSet<usize>> =
         vec![std::collections::BTreeSet::new(); n];
-    let cpus_per_llc = topo.cores_per_llc * topo.threads_per_core;
     for &(vcpu_id, host_cpu) in &plan.assignments {
-        let llc_id = vcpu_id / cpus_per_llc;
+        // Dense vCPU IDs use prefix-sum LLC boundaries when `llc_cores` is
+        // heterogeneous. Uniform division misattributes every vCPU after a
+        // short LLC to the preceding guest NUMA node.
+        let (llc_id, _, _) = topo.decompose(vcpu_id);
         let guest_node = topo.numa_node_of(llc_id) as usize;
         let host_node = host_topo.cpu_to_node.get(&host_cpu).copied().unwrap_or(0);
         if guest_node < n {
@@ -1580,16 +1550,14 @@ pub(crate) fn build_per_node_map(
 // nothing and its cpus == the full allowed cpuset (a no-op mask), so
 // the stamp records the unrestricted set the vCPUs floated across —
 // still the true CPU count the threads ran on.
-// perf-mode AND the deferred default both attempt a 1:1 pinning
-// plan at run time — perf-mode via `validate_performance_mode`, the
-// default via `run()`'s LOCK_SH offset search — hard-pinning each
-// vCPU thread to one distinct host CPU (`compute_pinning` emits
-// exactly `vcpus` 1:1 assignments). Both cache the host topology, so
+// perf-mode AND the deferred default both ask the shared bounded
+// candidate mapper for a 1:1 plan at run time, hard-pinning each vCPU
+// thread to one distinct host CPU. Both cache the host topology, so
 // `cached_host_topo.is_some()` predicts a 1:1 pin and the build-time
 // budget is the vCPU count. Two run-time outcomes diverge from that
-// estimate: perf-mode aborts with ResourceContention if its LOCK_EX
-// is unavailable (no sidecar written), and the default path
-// OVERCOMMITS when no offset can map the topology (host too small) —
+// estimate: a cancelled performance admission writes no sidecar, and
+// the default path OVERCOMMITS when no exact candidate maps (host too
+// small) —
 // `run()` then overrides `VmResult.cpu_budget` with the actual
 // masked host-CPU count (`RunLocks::default_cpu_mask` length), so a
 // too-small host stamps the real overcommit, not this `vcpus`
@@ -1685,20 +1653,18 @@ fn resolve_cpu_budget(
     }
 }
 
-/// Try each LLC slot, compute a pinning plan, and acquire resource
-/// locks (non-blocking). Single pass through all available slots.
-/// Returns `PerfModeUnavailable` when `compute_pinning` reports the host is
-/// too small for the perf topology (the isolation guarantee cannot be
+/// Enumerate exact performance placements and probe each complete resource
+/// claim non-blockingly. Returns `PerfModeUnavailable` when the shared mapper
+/// reports the host is too small for the perf topology (the isolation guarantee cannot be
 /// honored — a permanent host-insufficiency: a SKIP by default, a hard FAIL
 /// under `KTSTR_NO_SKIP_MODE`).
 ///
 /// When the host FITS but every slot is currently busy, this is NOT a
 /// failure: the build-time acquire is a free-offset PROBE — `build()`
-/// strips the returned fds immediately and `run()` re-acquires the
-/// plan's `llc_indices` through the acquisition queue (fast path,
-/// then head accumulation until the authoritative flock release). So on
-/// all-busy the probe returns the FIRST mappable candidate with an
-/// empty lock set and lets the run path queue for it. Bailing here —
+/// strips the returned fds immediately and `run()` repeats the same bounded
+/// candidate search through flexible admission. So on all-busy the probe
+/// returns the FIRST mappable candidate with an empty lock set for build-time
+/// setup; the run may acquire any equivalent candidate. Bailing here —
 /// the old behaviour — made perf cells fail instantly (~0.2 s,
 /// pre-boot) whenever the suite's default cells covered the LLCs with
 /// `LOCK_SH`, and nextest's second-scale retry backoff could never
@@ -1709,11 +1675,13 @@ fn acquire_slot_with_locks(
     topo: &topology::Topology,
 ) -> Result<host_topology::PinningPlan> {
     // One shared enumerator drives both this build-time probe and run-time
-    // admission. Each cache domain chooses its own exact reservation grain:
-    // validated small LLCs remain whole-LLC Exclusive, while a huge LLC can
-    // expose disjoint shared-LLC + per-CPU blocks on the same heterogeneous
-    // host.
-    let candidates = match host_topo.performance_pinning_candidates(topo) {
+    // admission. The plan chooses one conservative reservation grain: every
+    // occupied domain must qualify as huge/minority-used before the whole plan
+    // becomes LLC-SH + exact CPU-EX; one modest or heavily occupied domain
+    // keeps every claimed LLC whole-domain Exclusive.
+    let allowed_cpus = host_topology::host_allowed_cpus();
+    let candidates =
+        match host_topo.performance_pinning_candidates_for_cpus(topo, &allowed_cpus) {
         Ok(candidates) if !candidates.is_empty() => candidates,
         Ok(_) => {
             return Err(anyhow::Error::new(host_topology::PerfModeUnavailable {
@@ -1743,12 +1711,13 @@ fn acquire_slot_with_locks(
     for index in order {
         let candidate = candidates[index].plan.clone_unlocked();
         let llc_mode = candidates[index].llc_mode;
-        match host_topology::acquire_resource_locks(
-            &candidate,
+        match host_topology::try_acquire_resources(
             &candidate.llc_indices,
             llc_mode,
+            &candidates[index].cpu_reservations,
+            candidates[index].cpu_mode,
         )? {
-            host_topology::LockOutcome::Acquired { locks, .. } => {
+            host_topology::TryAcquireAll::Acquired(locks) => {
                 let mut plan = candidate;
                 plan.locks = locks;
                 eprintln!(
@@ -1760,7 +1729,7 @@ fn acquire_slot_with_locks(
                 );
                 return Ok(plan);
             }
-            host_topology::LockOutcome::Unavailable(_) => {
+            host_topology::TryAcquireAll::Contended { .. } => {
                 if first_mappable.is_none() {
                     first_mappable = Some(candidate);
                 }
@@ -1769,15 +1738,16 @@ fn acquire_slot_with_locks(
         }
     }
 
-    // Host fits, every slot busy: hand the first mappable candidate
-    // (no locks) to the run path, which queues for its llc_indices.
+    // Host fits, every placement busy: hand the first mappable candidate
+    // (no locks) to build-time setup. The run repeats this candidate search
+    // under flexible admission rather than freezing this LLC identity.
     let plan = first_mappable.expect(
         "all-busy implies at least one candidate mapped — the \
          no-candidate case returned PerfModeUnavailable above",
     );
     eprintln!(
         "performance_mode: all {} exact placements busy at build time; \
-         the run will choose among them via the lock-dir acquisition queue",
+         the run will choose among them through flexible admission",
         candidates.len(),
     );
     Ok(plan)
@@ -1786,6 +1756,45 @@ fn acquire_slot_with_locks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct HostPlannerOverrides {
+        allowed: Option<Vec<usize>>,
+        llc_prefix: Option<String>,
+        cpu_prefix: Option<String>,
+    }
+
+    impl HostPlannerOverrides {
+        fn new(allowed: Vec<usize>, lock_dir: &std::path::Path) -> Self {
+            let previous = Self {
+                allowed: host_topology::ALLOWED_CPUS_OVERRIDE
+                    .with(|slot| slot.borrow().clone()),
+                llc_prefix: host_topology::LLC_LOCK_PREFIX_OVERRIDE
+                    .with(|slot| slot.borrow().clone()),
+                cpu_prefix: host_topology::CPU_LOCK_PREFIX_OVERRIDE
+                    .with(|slot| slot.borrow().clone()),
+            };
+            host_topology::ALLOWED_CPUS_OVERRIDE
+                .with(|slot| *slot.borrow_mut() = Some(allowed));
+            host_topology::LLC_LOCK_PREFIX_OVERRIDE.with(|slot| {
+                *slot.borrow_mut() = Some(format!("{}/llc-", lock_dir.display()));
+            });
+            host_topology::CPU_LOCK_PREFIX_OVERRIDE.with(|slot| {
+                *slot.borrow_mut() = Some(format!("{}/cpu-", lock_dir.display()));
+            });
+            previous
+        }
+    }
+
+    impl Drop for HostPlannerOverrides {
+        fn drop(&mut self) {
+            host_topology::ALLOWED_CPUS_OVERRIDE
+                .with(|slot| *slot.borrow_mut() = self.allowed.take());
+            host_topology::LLC_LOCK_PREFIX_OVERRIDE
+                .with(|slot| *slot.borrow_mut() = self.llc_prefix.take());
+            host_topology::CPU_LOCK_PREFIX_OVERRIDE
+                .with(|slot| *slot.borrow_mut() = self.cpu_prefix.take());
+        }
+    }
 
     #[test]
     fn builder_default() {
@@ -1915,19 +1924,17 @@ mod tests {
     }
 
     /// acquire_slot_with_locks all-busy fallback: when the host FITS the
-    /// perf topology but every slot's `LOCK_EX` is currently held, the
+    /// perf topology but every exact placement is currently held, the
     /// build-time probe must return the first mappable candidate with an
-    /// EMPTY lock set — the run path queues for it — instead of the old
+    /// EMPTY lock set — the run path re-plans under flexible admission —
+    /// instead of the old
     /// `ResourceContention` bail, which made perf cells fail pre-boot in
     /// ~0.2 s whenever suite `LOCK_SH` coverage never left a free window
     /// (a retry-exhaustion storm nextest backoff cannot outlive).
     #[test]
     fn acquire_slot_with_locks_all_busy_returns_unlocked_candidate() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
-        let llc_prefix = format!("{}/llc-", tmp.path().display());
-        let cpu_prefix = format!("{}/cpu-", tmp.path().display());
-        host_topology::LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = Some(llc_prefix));
-        host_topology::CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = Some(cpu_prefix));
+        let _overrides = HostPlannerOverrides::new(vec![0, 1], tmp.path());
 
         // One-LLC host, 1/1/1/1 perf topology (+ service CPU) fits.
         let host = host_topology::HostTopology::new_for_tests(&[(vec![0, 1], 0)]);
@@ -1948,20 +1955,20 @@ mod tests {
         );
         assert_eq!(plan.llc_indices, vec![0], "first mappable candidate");
         drop(peer);
-        host_topology::LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = None);
-        host_topology::CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = None);
     }
 
     /// acquire_slot_with_locks perf-mode re-map: when the host is too small
-    /// for the requested perf topology, compute_pinning's TopologyInsufficient
+    /// for the requested perf topology, the shared mapper's TopologyInsufficient
     /// is re-mapped to a TYPED PerfModeUnavailable (a permanent
     /// host-insufficiency — the isolation guarantee cannot be honored on ANY
     /// slot of this host), distinct from the transient ResourceContention.
     /// Host = 1 LLC / 2 CPUs; request = 4 vCPUs. The shortfall is detected by
-    /// compute_pinning BEFORE any resource lock, so the synthetic host needs
+    /// the candidate mapper BEFORE any resource lock, so the synthetic host needs
     /// no flock fixture.
     #[test]
     fn acquire_slot_with_locks_host_too_small_is_perf_mode_unavailable() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let _overrides = HostPlannerOverrides::new(vec![0, 1], tmp.path());
         let host = host_topology::HostTopology::new_for_tests(&[(vec![0, 1], 0)]);
         let topo = topology::Topology::new(1, 1, 4, 1);
         let err = acquire_slot_with_locks(&host, &topo)
@@ -1971,6 +1978,46 @@ mod tests {
                 .is_some(),
             "host-too-small must re-map TopologyInsufficient -> PerfModeUnavailable \
              (a host-insufficiency, distinct from the transient ResourceContention): {err:#}",
+        );
+    }
+
+    #[test]
+    fn acquire_slot_with_locks_admits_small_perf_cell_on_monolithic_llc() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let allowed = (0..36).collect::<Vec<_>>();
+        let _overrides = HostPlannerOverrides::new(allowed.clone(), tmp.path());
+        let host = host_topology::HostTopology::new_for_tests(&[(allowed, 0)]);
+        let topo = topology::Topology::new(1, 1, 2, 1);
+
+        let plan = acquire_slot_with_locks(&host, &topo)
+            .expect("2 vCPUs plus service fit at CPU grain on a 36-CPU LLC");
+        assert_eq!(plan.assignments.len(), 2);
+        assert!(plan.service_cpu.is_some());
+        assert_eq!(
+            plan.locks.len(),
+            4,
+            "one LLC-SH plus two vCPU and one service CPU-EX locks",
+        );
+    }
+
+    #[test]
+    fn build_per_node_map_uses_nonuniform_llc_prefix_boundaries() {
+        static LLC_CORES: [u32; 2] = [1, 3];
+        let mut topo = topology::Topology::new(2, 2, 3, 1);
+        topo.llc_cores = Some(&LLC_CORES);
+        let host =
+            host_topology::HostTopology::new_for_tests(&[(vec![0], 0), (vec![1, 2, 3], 1)]);
+        let plan = host_topology::PinningPlan {
+            assignments: vec![(0, 0), (1, 1), (2, 2), (3, 3)],
+            service_cpu: None,
+            llc_indices: vec![0, 1],
+            locks: Vec::new(),
+        };
+
+        assert_eq!(
+            build_per_node_map(&plan, &host, &topo),
+            vec![vec![0], vec![1]],
+            "vCPU 1 begins heterogeneous LLC 1 and must bind guest node 1",
         );
     }
 

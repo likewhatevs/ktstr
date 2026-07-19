@@ -269,11 +269,61 @@ pub struct PinningPlan {
     pub(crate) locks: Vec<std::os::fd::OwnedFd>,
 }
 
-/// One exact performance-mode placement and the reservation grain required by
-/// the cache domain it occupies.
+/// Which run path is asking the shared topology planner for placements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PinningKind {
+    /// Default runs share touched LLCs and exclusively own the exact CPUs
+    /// assigned to guest vCPUs.
+    Default,
+    /// Performance runs additionally reserve a service CPU and choose whole
+    /// LLC or CPU-grain isolation from the occupied cache domains.
+    Performance,
+}
+
+/// Non-authoritative, mode-aware availability snapshot used to order one
+/// bounded planner pass. Complete registry claims and flocks remain the
+/// authority; these sets only steer the matcher toward resources the
+/// coordinator just observed ready.
+#[derive(Clone, Copy)]
+pub(crate) struct PinningPreferences<'a> {
+    pub(crate) cpus: &'a std::collections::BTreeSet<usize>,
+    pub(crate) shared_llcs: &'a std::collections::BTreeSet<usize>,
+    pub(crate) exclusive_llcs: &'a std::collections::BTreeSet<usize>,
+}
+
+/// One exact placement and its complete reservation footprint.
+///
+/// Keeping the CPU footprint beside the plan is important for whole-LLC
+/// performance reservations: those take both the LLC EX lock and CPU EX locks
+/// for every CPU in that domain (including siblings outside this process's
+/// cpuset). The CPU locks are the admission
+/// bridge to topology-unavailable overcommitters, which can name CPUs but not
+/// LLCs.
 pub(crate) struct PerformancePinningCandidate {
     pub(crate) plan: PinningPlan,
     pub(crate) llc_mode: LlcLockMode,
+    pub(crate) cpu_mode: FlockMode,
+    pub(crate) cpu_reservations: Vec<usize>,
+}
+
+impl PerformancePinningCandidate {
+    #[cfg(test)]
+    pub(crate) fn claim(&self) -> protocol::ClaimSet {
+        resource_claim_with_modes(
+            &self.plan.llc_indices,
+            self.llc_mode,
+            &self.cpu_reservations,
+            self.cpu_mode,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GuestLlcDemand {
+    guest_llc: u32,
+    guest_node: u32,
+    vcpu_start: u32,
+    cpus: usize,
 }
 
 impl PinningPlan {
@@ -297,11 +347,52 @@ impl PinningPlan {
 /// next call instead of poisoning the cache.
 static CACHED_HOST_TOPOLOGY: std::sync::OnceLock<HostTopology> = std::sync::OnceLock::new();
 
+fn validate_llc_partition(llc_groups: &[LlcGroup], online_cpus: &[usize]) -> Result<()> {
+    if online_cpus.is_empty() {
+        anyhow::bail!("host CPU discovery returned an empty online CPU set");
+    }
+    if llc_groups.is_empty() {
+        anyhow::bail!("host LLC discovery returned zero LLC groups");
+    }
+    let online = online_cpus
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    if online.len() != online_cpus.len() {
+        anyhow::bail!("online CPU discovery contains duplicate CPU IDs");
+    }
+
+    let mut partition = std::collections::BTreeSet::new();
+    for (llc, group) in llc_groups.iter().enumerate() {
+        if group.cpus.is_empty() {
+            anyhow::bail!("host LLC group {llc} is empty");
+        }
+        let mut within = std::collections::BTreeSet::new();
+        for &cpu in &group.cpus {
+            if !within.insert(cpu) {
+                anyhow::bail!("host LLC group {llc} repeats CPU {cpu}");
+            }
+            if !online.contains(&cpu) {
+                anyhow::bail!("host LLC group {llc} contains non-online CPU {cpu}");
+            }
+            if !partition.insert(cpu) {
+                anyhow::bail!("online CPU {cpu} appears in more than one host LLC group");
+            }
+        }
+    }
+    if partition != online {
+        let missing = online.difference(&partition).copied().collect::<Vec<_>>();
+        anyhow::bail!("host LLC groups omit online CPUs {missing:?}");
+    }
+    Ok(())
+}
+
 impl HostTopology {
-    /// Read host topology from sysfs via [`TestTopology::from_system()`](crate::topology::TestTopology::from_system).
+    /// Read the host-global physical topology from sysfs. Per-process affinity
+    /// is applied later by placement, never while assigning LLC lock identity.
     pub fn from_sysfs() -> Result<Self> {
-        let topo = crate::topology::TestTopology::from_system()
-            .context("read host topology from sysfs")?;
+        let topo = crate::topology::TestTopology::from_system_unfiltered()
+            .context("read host-global topology from sysfs")?;
         let online_cpus = topo.all_cpus().to_vec();
         let llc_groups: Vec<LlcGroup> = topo
             .llcs()
@@ -310,6 +401,8 @@ impl HostTopology {
                 cpus: llc.cpus().to_vec(),
             })
             .collect();
+        validate_llc_partition(&llc_groups, &online_cpus)
+            .context("host LLC discovery did not produce an exact CPU partition")?;
         let cpu_to_node: std::collections::HashMap<usize, usize> = topo
             .llcs()
             .iter()
@@ -356,6 +449,18 @@ impl HostTopology {
     /// `#[cfg(test)]` gate keeps the symbol out of release builds.
     #[cfg(test)]
     pub(crate) fn new_for_tests(groups: &[(Vec<usize>, usize)]) -> Self {
+        let topology = Self::new_for_tests_unchecked(groups);
+        validate_llc_partition(&topology.llc_groups, &topology.online_cpus)
+            .expect("synthetic host LLC groups must exactly partition online CPUs");
+        topology
+    }
+
+    /// Build an intentionally malformed synthetic topology for focused tests
+    /// of discovery validation and CPU-union behavior. Topology-planner tests
+    /// use [`Self::new_for_tests`], whose disjoint-partition invariant matches
+    /// sysfs discovery.
+    #[cfg(test)]
+    pub(crate) fn new_for_tests_unchecked(groups: &[(Vec<usize>, usize)]) -> Self {
         let llc_groups: Vec<LlcGroup> = groups
             .iter()
             .map(|(cpus, _)| LlcGroup { cpus: cpus.clone() })
@@ -875,123 +980,524 @@ impl HostTopology {
         })
     }
 
-    /// Enumerate every unique performance placement understood by the shared
-    /// topology mapper.
-    ///
-    /// Build-time probing and run-time admission both consume this exact list,
-    /// preventing their candidate sets from drifting. The LLC-offset period is
-    /// derived from the NUMA mapper's node rotation and every eligible node's
-    /// within-node rotation; deduplication uses the full placement identity
-    /// (vCPU assignments, service CPU, and claimed LLCs).
+    /// Enumerate performance placements against the synthetic topology's CPU
+    /// set. Production uses [`Self::performance_pinning_candidates_for_cpus`]
+    /// with the process affinity set; this wrapper keeps topology-only tests
+    /// independent of the machine running them.
     pub(crate) fn performance_pinning_candidates(
         &self,
         topo: &super::topology::Topology,
     ) -> Result<Vec<PerformancePinningCandidate>> {
-        let period = self.pinning_offset_period(topo)?;
-        let mut seen = std::collections::BTreeSet::new();
-        let mut candidates = Vec::new();
+        self.performance_pinning_candidates_for_cpus(topo, &self.online_cpus)
+    }
 
-        for llc_offset in 0..period {
-            let base = match self.compute_pinning(topo, true, llc_offset) {
-                Ok(candidate) => candidate,
-                Err(error) if error.downcast_ref::<TopologyInsufficient>().is_some() => continue,
-                Err(error) => return Err(error),
+    /// Enumerate performance placements using only CPUs allowed by the
+    /// caller's affinity/cgroup. Build-time probing and run-time admission
+    /// both call this exact entry point.
+    pub(crate) fn performance_pinning_candidates_for_cpus(
+        &self,
+        topo: &super::topology::Topology,
+        allowed_cpus: &[usize],
+    ) -> Result<Vec<PerformancePinningCandidate>> {
+        self.topology_pinning_candidates(topo, PinningKind::Performance, allowed_cpus, None)
+    }
+
+    /// Enumerate default 1:1 placements using the same mapper as performance
+    /// mode. The only policy differences are no service CPU and SH LLC locks.
+    pub(crate) fn default_pinning_candidates_for_cpus(
+        &self,
+        topo: &super::topology::Topology,
+        allowed_cpus: &[usize],
+    ) -> Result<Vec<PerformancePinningCandidate>> {
+        self.topology_pinning_candidates(topo, PinningKind::Default, allowed_cpus, None)
+    }
+
+    /// Bounded availability-aware topology planner.
+    ///
+    /// The old enumerator multiplied several unrelated rotation periods with
+    /// LCM and then nested an open-ended intra-LLC window loop. Coprime host
+    /// shapes could therefore perform enormous work before deduplication. This
+    /// planner evaluates at most one seed per actual allowed CPU (or host LLC
+    /// when larger), and canonical claim deduplication bounds its output by
+    /// that same physical-resource count.
+    ///
+    /// Each guest LLC contributes its real demand (`llc_cores[i] * threads`).
+    /// Largest demands claim distinct fitting host LLC bins first. When both
+    /// sides expose usable NUMA information, a bipartite match maps each
+    /// CPU-bearing guest node to a distinct host node and bins are selected
+    /// within that node. If no complete strict match exists, the planner
+    /// deliberately falls back once to a global distinct-LLC match: running
+    /// with correct CPU/LLC identity is preferable to rejecting a host solely
+    /// because its NUMA/cache geometry cannot mirror the guest.
+    ///
+    /// `preferences` is a non-authoritative, mode-aware availability snapshot.
+    /// Exact placement prefers its CPUs and LLC modes but may use the
+    /// remainder; final admission still validates the complete claim under the
+    /// registry fence. Supplying fragmented preferences therefore yields one
+    /// exact globally-distinct plan rather than requiring a contiguous free
+    /// window.
+    pub(crate) fn topology_pinning_candidates(
+        &self,
+        topo: &super::topology::Topology,
+        kind: PinningKind,
+        allowed_cpus: &[usize],
+        preferences: Option<PinningPreferences<'_>>,
+    ) -> Result<Vec<PerformancePinningCandidate>> {
+        use std::collections::BTreeSet;
+
+        let allowed = allowed_cpus.iter().copied().collect::<BTreeSet<_>>();
+        let total_needed =
+            topo.total_cpus() as usize + usize::from(kind == PinningKind::Performance);
+        if total_needed > allowed.len() {
+            return Err(anyhow::Error::new(TopologyInsufficient {
+                reason: format!(
+                    "{}: need {total_needed} distinct host CPUs but only {} are allowed",
+                    if kind == PinningKind::Performance {
+                        "performance_mode"
+                    } else {
+                        "default pinning"
+                    },
+                    allowed.len(),
+                ),
+            }));
+        }
+        if topo.llcs as usize > self.llc_groups.len() {
+            return Err(anyhow::Error::new(TopologyInsufficient {
+                reason: format!(
+                    "need {} distinct host LLC groups for {} guest LLCs, but host has {}",
+                    topo.llcs,
+                    topo.llcs,
+                    self.llc_groups.len(),
+                ),
+            }));
+        }
+
+        let mut vcpu_start = 0u32;
+        let demands = (0..topo.llcs)
+            .map(|guest_llc| {
+                let cpus = topo
+                    .cores_in_llc(guest_llc)
+                    .saturating_mul(topo.threads_per_core)
+                    as usize;
+                let demand = GuestLlcDemand {
+                    guest_llc,
+                    guest_node: topo.numa_node_of(guest_llc),
+                    vcpu_start,
+                    cpus,
+                };
+                vcpu_start = vcpu_start.saturating_add(cpus as u32);
+                demand
+            })
+            .collect::<Vec<_>>();
+        if demands.iter().any(|demand| demand.cpus == 0) {
+            return Err(anyhow::Error::new(TopologyInsufficient {
+                reason: "guest topology contains an empty LLC CPU demand".into(),
+            }));
+        }
+        let performance_prefers_shared = kind == PinningKind::Performance
+            && grain_mapping_possible(self, &demands, &allowed);
+
+        let all_llcs = (0..self.llc_groups.len()).collect::<BTreeSet<_>>();
+        let (preferred_cpus, preferred_shared_llcs, preferred_exclusive_llcs) =
+            match preferences {
+                Some(preferences) => (
+                    preferences.cpus,
+                    preferences.shared_llcs,
+                    preferences.exclusive_llcs,
+                ),
+                None => (&allowed, &all_llcs, &all_llcs),
             };
-            let llc_mode = perf_llc_lock_mode(self, &base);
-            match llc_mode {
-                LlcLockMode::Exclusive => {
-                    let identity = (1u8, base.llc_indices.clone(), Vec::new());
-                    if seen.insert(identity) {
-                        candidates.push(PerformancePinningCandidate {
-                            plan: base,
-                            llc_mode,
-                        });
-                    }
-                }
-                LlcLockMode::Shared => {
-                    for block in 0.. {
-                        let candidate =
-                            match self.compute_pinning_grain_at(topo, llc_offset, block) {
-                                Ok(candidate) => candidate,
-                                Err(error)
-                                    if error.downcast_ref::<TopologyInsufficient>().is_some() =>
-                                {
-                                    break;
-                                }
-                                Err(error) => return Err(error),
-                            };
-                        if perf_llc_lock_mode(self, &candidate) != llc_mode {
-                            continue;
-                        }
-                        let mut cpus = candidate
-                            .assignments
-                            .iter()
-                            .map(|&(_, cpu)| cpu)
-                            .chain(candidate.service_cpu)
-                            .collect::<Vec<_>>();
-                        cpus.sort_unstable();
-                        cpus.dedup();
-                        let identity = (0u8, candidate.llc_indices.clone(), cpus);
-                        if seen.insert(identity) {
-                            candidates.push(PerformancePinningCandidate {
-                                plan: candidate,
-                                llc_mode,
-                            });
-                        }
-                    }
-                }
+        let allowed_rank = allowed
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(rank, cpu)| (cpu, rank))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let seeds = planner_seed_schedule(self, &demands, kind, &allowed);
+        let mut seen = BTreeSet::new();
+        let mut candidates = Vec::new();
+        for (seed, local_seed) in seeds {
+            let Some((plan, mut exact_cpus)) = self.plan_topology_seed(
+                &demands,
+                kind,
+                &allowed,
+                &allowed_rank,
+                preferred_cpus,
+                preferred_shared_llcs,
+                preferred_exclusive_llcs,
+                performance_prefers_shared,
+                seed,
+                local_seed,
+            )
+            else {
+                continue;
+            };
+            let llc_mode = match kind {
+                PinningKind::Default => LlcLockMode::Shared,
+                PinningKind::Performance => perf_llc_lock_mode(self, &plan),
+            };
+            if kind == PinningKind::Performance && llc_mode == LlcLockMode::Exclusive {
+                exact_cpus = plan
+                    .llc_indices
+                    .iter()
+                    .flat_map(|&llc| self.llc_groups[llc].cpus.iter().copied())
+                    .collect();
+            }
+            exact_cpus.sort_unstable();
+            exact_cpus.dedup();
+            let llc_tag = u8::from(llc_mode == LlcLockMode::Exclusive);
+            let identity = (llc_tag, plan.llc_indices.clone(), exact_cpus.clone());
+            if seen.insert(identity) {
+                candidates.push(PerformancePinningCandidate {
+                    plan,
+                    llc_mode,
+                    cpu_mode: FlockMode::Exclusive,
+                    cpu_reservations: exact_cpus,
+                });
             }
         }
+        if candidates.is_empty() {
+            return Err(anyhow::Error::new(TopologyInsufficient {
+                reason: "no exact distinct-LLC/CPU host placement fits".into(),
+            }));
+        }
+
+        // Claim identity, not seed traversal, defines uniqueness.
+        candidates.sort_by_key(|candidate| {
+            let availability_miss = preferences.is_some_and(|preferences| {
+                let llcs_ready = match candidate.llc_mode {
+                    LlcLockMode::Shared => candidate
+                        .plan
+                        .llc_indices
+                        .iter()
+                        .all(|llc| preferences.shared_llcs.contains(llc)),
+                    LlcLockMode::Exclusive => candidate
+                        .plan
+                        .llc_indices
+                        .iter()
+                        .all(|llc| preferences.exclusive_llcs.contains(llc)),
+                };
+                let cpus_ready = candidate.llc_mode == LlcLockMode::Exclusive
+                    || candidate
+                        .cpu_reservations
+                        .iter()
+                        .all(|cpu| preferences.cpus.contains(cpu));
+                !(llcs_ready && cpus_ready)
+            });
+            (
+                availability_miss,
+                u8::from(candidate.llc_mode == LlcLockMode::Exclusive),
+                candidate.plan.llc_indices.clone(),
+                candidate.cpu_reservations.clone(),
+            )
+        });
         Ok(candidates)
     }
 
-    /// Exact period of [`Self::numa_aware_llc_order`] in `llc_offset`.
-    fn pinning_offset_period(&self, topo: &super::topology::Topology) -> Result<usize> {
-        let host_llcs = self.llc_groups.len();
-        if host_llcs == 0 {
-            return Ok(1);
-        }
-        let guest_llcs = topo.llcs;
-        let guest_nodes = topo.numa_nodes;
-        if guest_nodes <= 1
-            || self.cpu_to_node.is_empty()
-            || guest_llcs < guest_nodes
-        {
-            return Ok(host_llcs);
-        }
+    /// Materialize one deterministic tie rotation of the bounded planner.
+    fn plan_topology_seed(
+        &self,
+        demands: &[GuestLlcDemand],
+        kind: PinningKind,
+        allowed: &std::collections::BTreeSet<usize>,
+        allowed_rank: &std::collections::BTreeMap<usize, usize>,
+        preferred_cpus: &std::collections::BTreeSet<usize>,
+        preferred_shared_llcs: &std::collections::BTreeSet<usize>,
+        preferred_exclusive_llcs: &std::collections::BTreeSet<usize>,
+        performance_prefers_shared: bool,
+        seed: usize,
+        local_seed: usize,
+    ) -> Option<(PinningPlan, Vec<usize>)> {
+        use std::collections::{BTreeMap, BTreeSet};
 
-        let base_per_node = (guest_llcs / guest_nodes) as usize;
-        let remainder = (guest_llcs % guest_nodes) as usize;
-        let max_per_node = base_per_node + usize::from(remainder > 0);
-        let eligible = self.numa_nodes_with_capacity(max_per_node);
-        if eligible.len() < guest_nodes as usize {
-            return Ok(host_llcs);
+        let mut guest_nodes = BTreeMap::<u32, Vec<usize>>::new();
+        for (index, demand) in demands.iter().enumerate() {
+            guest_nodes.entry(demand.guest_node).or_default().push(index);
         }
+        let guest_node_rank = guest_nodes
+            .keys()
+            .copied()
+            .enumerate()
+            .map(|(rank, node)| (node, rank))
+            .collect::<BTreeMap<_, _>>();
+        let host_node_rank = self
+            .host_node_llcs
+            .keys()
+            .copied()
+            .enumerate()
+            .map(|(rank, node)| (node, rank))
+            .collect::<BTreeMap<_, _>>();
 
-        fn gcd(mut a: usize, mut b: usize) -> usize {
-            while b != 0 {
-                let next = a % b;
-                a = b;
-                b = next;
+        // First attempt a strict guest-node -> distinct host-node bipartite
+        // mapping. Feasibility is evaluated from the actual per-LLC CPU
+        // capacities after the process's allowed mask is applied.
+        let strict_nodes = if guest_nodes.len() > 1 && !self.cpu_to_node.is_empty() {
+            let mut edges = BTreeMap::<u32, Vec<usize>>::new();
+            let host_count = self.host_node_llcs.len().max(1);
+            for (&guest_node, request_indices) in &guest_nodes {
+                let mut hosts = self
+                    .host_node_llcs
+                    .iter()
+                    .filter_map(|(&host_node, llcs)| {
+                        host_bins_fit(self, demands, request_indices, llcs, allowed)
+                            .then_some(host_node)
+                    })
+                    .collect::<Vec<_>>();
+                hosts.sort_by_key(|host_node| {
+                    (
+                        !host_bins_preferred_fit(
+                            self,
+                            demands,
+                            request_indices,
+                            &self.host_node_llcs[host_node],
+                            kind,
+                            allowed,
+                            preferred_cpus,
+                            preferred_shared_llcs,
+                            preferred_exclusive_llcs,
+                            performance_prefers_shared,
+                        ),
+                        rotated_tie(host_node_rank[host_node], seed, host_count),
+                    )
+                });
+                edges.insert(guest_node, hosts);
             }
-            a
-        }
-        fn checked_lcm(a: usize, b: usize) -> Option<usize> {
-            a.checked_div(gcd(a, b))?.checked_mul(b)
+            match_distinct_nodes(&edges)
+        } else {
+            None
+        };
+
+        let mut mapped = vec![usize::MAX; demands.len()];
+        let mut used_llcs = BTreeSet::new();
+        let strict_fit = strict_nodes.as_ref().is_some_and(|node_map| {
+            let mut trial_mapped = mapped.clone();
+            let mut trial_used = BTreeSet::new();
+            let mut nodes = guest_nodes.keys().copied().collect::<Vec<_>>();
+            nodes.sort_by_key(|guest_node| {
+                let max_demand = guest_nodes
+                    .get(guest_node)
+                    .expect("guest node came from this map")
+                    .iter()
+                    .map(|&index| demands[index].cpus)
+                    .max()
+                    .unwrap_or(0);
+                (
+                    std::cmp::Reverse(max_demand),
+                    rotated_tie(guest_node_rank[guest_node], seed, guest_nodes.len()),
+                )
+            });
+            for guest_node in nodes {
+                let host_node = node_map[&guest_node];
+                let bins = &self.host_node_llcs[&host_node];
+                if !assign_distinct_bins(
+                    self,
+                    demands,
+                    guest_nodes
+                        .get(&guest_node)
+                        .expect("guest node came from this map"),
+                    bins,
+                    kind,
+                    allowed,
+                    preferred_cpus,
+                    preferred_shared_llcs,
+                    preferred_exclusive_llcs,
+                    performance_prefers_shared,
+                    seed,
+                    &mut trial_used,
+                    &mut trial_mapped,
+                ) {
+                    return false;
+                }
+            }
+            mapped = trial_mapped;
+            used_llcs = trial_used;
+            true
+        });
+
+        if !strict_fit {
+            // Documented global fallback: strict NUMA mirroring is optional,
+            // distinct cache bins and exact CPU identity are not.
+            let all_requests = (0..demands.len()).collect::<Vec<_>>();
+            let all_bins = (0..self.llc_groups.len()).collect::<Vec<_>>();
+            if !assign_distinct_bins(
+                self,
+                demands,
+                &all_requests,
+                &all_bins,
+                kind,
+                allowed,
+                preferred_cpus,
+                preferred_shared_llcs,
+                preferred_exclusive_llcs,
+                performance_prefers_shared,
+                seed,
+                &mut used_llcs,
+                &mut mapped,
+            ) {
+                return None;
+            }
         }
 
-        // node_offset = floor(offset / max_per_node) % eligible.len(),
-        // while each selected node rotates by offset % node_llcs.len().
-        let mut period = max_per_node
-            .checked_mul(eligible.len())
-            .ok_or_else(|| anyhow::anyhow!("performance placement offset period overflow"))?;
-        period = checked_lcm(period, host_llcs)
-            .ok_or_else(|| anyhow::anyhow!("performance placement offset period overflow"))?;
-        for (_, llcs) in eligible {
-            period = checked_lcm(period, llcs.len())
-                .ok_or_else(|| anyhow::anyhow!("performance placement offset period overflow"))?;
+        // Each mapped LLC is distinct and host discovery validates LLC CPU
+        // membership as a partition. Selecting the first demand-sized prefix
+        // from each independently ordered bin is therefore globally distinct;
+        // no recursive per-vCPU bipartite match is needed.
+        let mut assignments = Vec::new();
+        let mut occupied = BTreeSet::new();
+        // Static candidates are capacity grains, not every overlapping cyclic
+        // window. Advancing by the largest material footprint emits a
+        // pairwise-disjoint family per LLC (for example twelve 3-CPU
+        // vCPU+service grains on a 36-CPU domain). Availability-aware planning
+        // can still synthesize an arbitrary fragmented footprint on demand.
+        for (index, demand) in demands.iter().enumerate() {
+            let llc = mapped[index];
+            let mut cpus = self.llc_groups[llc]
+                .cpus
+                .iter()
+                .copied()
+                .filter(|cpu| allowed.contains(cpu))
+                .collect::<Vec<_>>();
+            cpus.sort_unstable();
+            cpus.dedup();
+            let local_rank = cpus
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(rank, cpu)| (cpu, rank))
+                .collect::<BTreeMap<_, _>>();
+            let cpu_count = cpus.len().max(1);
+            cpus.sort_by_key(|cpu| {
+                (
+                    !preferred_cpus.contains(cpu),
+                    rotated_tie(local_rank[cpu], local_seed, cpu_count),
+                )
+            });
+            if cpus.len() < demand.cpus {
+                return None;
+            }
+            for (local, cpu) in cpus.into_iter().take(demand.cpus).enumerate() {
+                if !occupied.insert(cpu) {
+                    // This is unreachable for a validated LLC partition and
+                    // keeps intentionally malformed test fixtures from
+                    // producing duplicate host CPU assignments.
+                    return None;
+                }
+                assignments.push((demand.vcpu_start + local as u32, cpu));
+            }
         }
-        Ok(period.max(1))
+        assignments.sort_unstable_by_key(|&(vcpu, _)| vcpu);
+
+        let service_cpu = if kind == PinningKind::Performance {
+            let mut mapped_choice_rank = BTreeMap::<usize, (usize, usize)>::new();
+            for (mapped_rank, &llc) in mapped.iter().enumerate() {
+                let mut cpus = self.llc_groups[llc]
+                    .cpus
+                    .iter()
+                    .copied()
+                    .filter(|cpu| allowed.contains(cpu))
+                    .collect::<Vec<_>>();
+                cpus.sort_unstable();
+                cpus.dedup();
+                let count = cpus.len().max(1);
+                for (rank, cpu) in cpus.into_iter().enumerate() {
+                    let rank = (mapped_rank, rotated_tie(rank, local_seed, count));
+                    mapped_choice_rank
+                        .entry(cpu)
+                        .and_modify(|current| *current = (*current).min(rank))
+                        .or_insert(rank);
+                }
+            }
+            // Include every allowed unoccupied host CPU. Locality is a
+            // preference, not an eligibility gate: one busy mapped-local
+            // leftover must not hide a free service CPU in another LLC.
+            let mut service_choices = self
+                .llc_groups
+                .iter()
+                .flat_map(|group| group.cpus.iter().copied())
+                .filter(|cpu| allowed.contains(cpu) && !occupied.contains(cpu))
+                .collect::<Vec<_>>();
+            service_choices.sort_unstable();
+            service_choices.dedup();
+            service_choices.sort_by_key(|cpu| {
+                let service_llcs = self
+                    .llc_groups
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, group)| group.cpus.contains(cpu))
+                    .map(|(llc, _)| llc)
+                    .collect::<Vec<_>>();
+                let candidate_prefers_shared = mapped.iter().enumerate().all(|(index, &llc)| {
+                    let footprint = demands[index].cpus
+                        + usize::from(service_llcs.contains(&llc));
+                    perf_grain_capable_for_footprint(self, llc, footprint)
+                }) && service_llcs
+                    .iter()
+                    .filter(|&&llc| !mapped.contains(&llc))
+                    .all(|&llc| perf_grain_capable_for_footprint(self, llc, 1));
+                let llc_ready = mapped
+                    .iter()
+                    .copied()
+                    .chain(service_llcs.iter().copied())
+                    .all(|llc| {
+                        if candidate_prefers_shared {
+                            preferred_shared_llcs.contains(&llc)
+                        } else {
+                            preferred_exclusive_llcs.contains(&llc)
+                        }
+                    });
+                let preferred = preferred_cpus.contains(cpu);
+                let mapped_local = mapped_choice_rank.contains_key(cpu);
+                (
+                    !llc_ready,
+                    !preferred,
+                    !candidate_prefers_shared,
+                    !mapped_local,
+                    mapped_choice_rank
+                        .get(cpu)
+                        .copied()
+                        .unwrap_or((
+                            usize::MAX,
+                            rotated_tie(allowed_rank[cpu], seed, allowed.len().max(1)),
+                        )),
+                )
+            });
+            let cpu = *service_choices.first()?;
+            occupied.insert(cpu);
+            Some(cpu)
+        } else {
+            None
+        };
+
+        let mut llc_indices = mapped;
+        if let Some(service_cpu) = service_cpu {
+            // Prefer an already-mapped cache domain. Discovery validates that
+            // each CPU belongs to exactly one LLC, while the fallback keeps
+            // this helper defensive for intentionally malformed test fixtures.
+            let service_llc = llc_indices
+                .iter()
+                .copied()
+                .find(|&llc| self.llc_groups[llc].cpus.contains(&service_cpu))
+                .or_else(|| {
+                    (0..self.llc_groups.len())
+                        .filter(|&llc| self.llc_groups[llc].cpus.contains(&service_cpu))
+                        .min_by_key(|&llc| {
+                            rotated_tie(llc, seed, self.llc_groups.len().max(1))
+                        })
+                })?;
+            llc_indices.push(service_llc);
+        }
+        llc_indices.sort_unstable();
+        llc_indices.dedup();
+        let exact_cpus = occupied.into_iter().collect();
+        Some((
+            PinningPlan {
+                assignments,
+                service_cpu,
+                llc_indices,
+                locks: Vec::new(),
+            },
+            exact_cpus,
+        ))
     }
 
     /// Build the virtual LLC to host LLC index mapping.
@@ -1101,6 +1607,422 @@ impl HostTopology {
     }
 }
 
+fn rotated_tie(value: usize, seed: usize, cardinality: usize) -> usize {
+    value
+        .wrapping_add(cardinality)
+        .wrapping_sub(seed % cardinality.max(1))
+        % cardinality.max(1)
+}
+
+fn planner_seed_schedule(
+    host: &HostTopology,
+    demands: &[GuestLlcDemand],
+    kind: PinningKind,
+    allowed: &std::collections::BTreeSet<usize>,
+) -> Vec<(usize, usize)> {
+    let stride = planner_local_stride(demands, kind);
+    let minimum_demand = demands
+        .iter()
+        .map(|demand| demand.cpus)
+        .min()
+        .unwrap_or(1);
+    let mut seeds = host
+        .llc_groups
+        .iter()
+        .enumerate()
+        .flat_map(|(llc, group)| {
+            let capacity = group
+                .cpus
+                .iter()
+                .filter(|cpu| allowed.contains(cpu))
+                .count();
+            let grains = if capacity >= minimum_demand {
+                (capacity / stride).max(1)
+            } else {
+                0
+            };
+            (0..grains).map(move |grain| (llc, grain.saturating_mul(stride)))
+        })
+        .collect::<Vec<_>>();
+    if seeds.is_empty() {
+        seeds.push((0, 0));
+    }
+    seeds
+}
+
+fn planner_local_stride(demands: &[GuestLlcDemand], kind: PinningKind) -> usize {
+    demands
+        .iter()
+        .map(|demand| demand.cpus)
+        .max()
+        .unwrap_or(1)
+        // The service thread may land in any mapped LLC. Reserve its width in
+        // every static grain so multi-LLC and heterogeneous topologies do not
+        // generate overlapping starts on the eventual service domain.
+        .saturating_add(usize::from(kind == PinningKind::Performance))
+        .max(1)
+}
+
+fn llc_allowed_cpus(
+    host: &HostTopology,
+    llc: usize,
+    allowed: &std::collections::BTreeSet<usize>,
+) -> std::collections::BTreeSet<usize> {
+    host.llc_groups[llc]
+        .cpus
+        .iter()
+        .copied()
+        .filter(|cpu| allowed.contains(cpu))
+        .collect()
+}
+
+fn host_bins_fit(
+    host: &HostTopology,
+    demands: &[GuestLlcDemand],
+    request_indices: &[usize],
+    bins: &[usize],
+    allowed: &std::collections::BTreeSet<usize>,
+) -> bool {
+    let mut request_sizes = request_indices
+        .iter()
+        .map(|&index| demands[index].cpus)
+        .collect::<Vec<_>>();
+    let mut capacities = bins
+        .iter()
+        .map(|&llc| llc_allowed_cpus(host, llc, allowed).len())
+        .collect::<Vec<_>>();
+    request_sizes.sort_unstable_by(|a, b| b.cmp(a));
+    capacities.sort_unstable_by(|a, b| b.cmp(a));
+    request_sizes.len() <= capacities.len()
+        && request_sizes
+            .iter()
+            .zip(capacities)
+            .all(|(demand, capacity)| *demand <= capacity)
+}
+
+fn perf_grain_capable_for_footprint(
+    host: &HostTopology,
+    llc: usize,
+    footprint: usize,
+) -> bool {
+    let llc_cpus = host.llc_groups[llc].cpus.len();
+    llc_cpus >= PERF_GRAIN_LLC_MIN_CPUS
+        && footprint.saturating_mul(PERF_GRAIN_MAX_OCCUPANCY_DEN)
+            < llc_cpus.saturating_mul(PERF_GRAIN_MAX_OCCUPANCY_NUM)
+}
+
+fn grain_mapping_possible(
+    host: &HostTopology,
+    demands: &[GuestLlcDemand],
+    allowed: &std::collections::BTreeSet<usize>,
+) -> bool {
+    let matches_with_service = |service_request: Option<usize>,
+                                separate_service_llc: Option<usize>| {
+        let mut edges = std::collections::BTreeMap::new();
+        for (request, demand) in demands.iter().enumerate() {
+            let footprint =
+                demand.cpus + usize::from(service_request == Some(request));
+            let choices = (0..host.llc_groups.len())
+                .filter(|&llc| {
+                    Some(llc) != separate_service_llc
+                        && llc_allowed_cpus(host, llc, allowed).len() >= footprint
+                        && perf_grain_capable_for_footprint(host, llc, footprint)
+                })
+                .collect::<Vec<_>>();
+            if choices.is_empty() {
+                return false;
+            }
+            edges.insert(request, choices);
+        }
+        let mut order = (0..demands.len()).collect::<Vec<_>>();
+        order.sort_by_key(|request| edges[request].len());
+        match_distinct_bins(&edges, &order).is_some()
+    };
+
+    // The one service CPU may share any guest-mapped LLC...
+    if (0..demands.len()).any(|request| matches_with_service(Some(request), None)) {
+        return true;
+    }
+    // ...or occupy its own otherwise-unmapped grain-capable LLC.
+    (0..host.llc_groups.len()).any(|llc| {
+        llc_allowed_cpus(host, llc, allowed).len() >= 1
+            && perf_grain_capable_for_footprint(host, llc, 1)
+            && matches_with_service(None, Some(llc))
+    })
+}
+
+fn preferred_llc_ready(
+    host: &HostTopology,
+    llc: usize,
+    demand: usize,
+    kind: PinningKind,
+    preferred_shared_llcs: &std::collections::BTreeSet<usize>,
+    preferred_exclusive_llcs: &std::collections::BTreeSet<usize>,
+    performance_prefers_shared: bool,
+) -> bool {
+    match kind {
+        PinningKind::Default => preferred_shared_llcs.contains(&llc),
+        PinningKind::Performance
+            if performance_prefers_shared
+                && perf_grain_capable_for_footprint(host, llc, demand) =>
+        {
+            preferred_shared_llcs.contains(&llc)
+        }
+        PinningKind::Performance => preferred_exclusive_llcs.contains(&llc),
+    }
+}
+
+/// Whether a host NUMA node can satisfy every request entirely from the
+/// mode-aware resources in the coordinator's latest availability snapshot.
+/// This is preference input only; the completed candidate's full claim is
+/// checked authoritatively before acquisition.
+fn host_bins_preferred_fit(
+    host: &HostTopology,
+    demands: &[GuestLlcDemand],
+    request_indices: &[usize],
+    bins: &[usize],
+    kind: PinningKind,
+    allowed: &std::collections::BTreeSet<usize>,
+    preferred_cpus: &std::collections::BTreeSet<usize>,
+    preferred_shared_llcs: &std::collections::BTreeSet<usize>,
+    preferred_exclusive_llcs: &std::collections::BTreeSet<usize>,
+    performance_prefers_shared: bool,
+) -> bool {
+    let mut edges = std::collections::BTreeMap::new();
+    for &request in request_indices {
+        let demand = demands[request].cpus;
+        let choices = bins
+            .iter()
+            .copied()
+            .filter(|&llc| {
+                let allowed_cpus = llc_allowed_cpus(host, llc, allowed);
+                allowed_cpus.len() >= demand
+                    && allowed_cpus
+                        .iter()
+                        .filter(|cpu| preferred_cpus.contains(cpu))
+                        .count()
+                        >= demand
+                    && preferred_llc_ready(
+                        host,
+                        llc,
+                        demand,
+                        kind,
+                        preferred_shared_llcs,
+                        preferred_exclusive_llcs,
+                        performance_prefers_shared,
+                    )
+            })
+            .collect::<Vec<_>>();
+        if choices.is_empty() {
+            return false;
+        }
+        edges.insert(request, choices);
+    }
+    let mut order = request_indices.to_vec();
+    order.sort_by_key(|request| edges[request].len());
+    match_distinct_bins(&edges, &order).is_some()
+}
+
+/// Maximum-cardinality bipartite matching for strict guest-NUMA placement.
+fn match_distinct_nodes(
+    edges: &std::collections::BTreeMap<u32, Vec<usize>>,
+) -> Option<std::collections::BTreeMap<u32, usize>> {
+    fn augment(
+        guest: u32,
+        edges: &std::collections::BTreeMap<u32, Vec<usize>>,
+        owner: &mut std::collections::BTreeMap<usize, u32>,
+        seen: &mut std::collections::BTreeSet<usize>,
+    ) -> bool {
+        for &host in edges.get(&guest).into_iter().flatten() {
+            if !seen.insert(host) {
+                continue;
+            }
+            let displaced = owner.get(&host).copied();
+            if displaced.is_none_or(|other| augment(other, edges, owner, seen)) {
+                owner.insert(host, guest);
+                return true;
+            }
+        }
+        false
+    }
+
+    let mut guests = edges.keys().copied().collect::<Vec<_>>();
+    guests.sort_by_key(|guest| {
+        edges
+            .get(guest)
+            .expect("guest came from this edge map")
+            .len()
+    });
+    let mut owner = std::collections::BTreeMap::new();
+    for guest in guests {
+        if !augment(
+            guest,
+            edges,
+            &mut owner,
+            &mut std::collections::BTreeSet::new(),
+        ) {
+            return None;
+        }
+    }
+    Some(owner.into_iter().map(|(host, guest)| (guest, host)).collect())
+}
+
+fn assign_distinct_bins(
+    host: &HostTopology,
+    demands: &[GuestLlcDemand],
+    request_indices: &[usize],
+    eligible_bins: &[usize],
+    kind: PinningKind,
+    allowed: &std::collections::BTreeSet<usize>,
+    preferred_cpus: &std::collections::BTreeSet<usize>,
+    preferred_shared_llcs: &std::collections::BTreeSet<usize>,
+    preferred_exclusive_llcs: &std::collections::BTreeSet<usize>,
+    performance_prefers_shared: bool,
+    seed: usize,
+    used: &mut std::collections::BTreeSet<usize>,
+    mapped: &mut [usize],
+) -> bool {
+    let mut eligible = eligible_bins
+        .iter()
+        .copied()
+        .filter(|llc| !used.contains(llc))
+        .collect::<Vec<_>>();
+    eligible.sort_unstable();
+    eligible.dedup();
+    let bin_rank = eligible
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(rank, llc)| (llc, rank))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let mut edges = std::collections::BTreeMap::new();
+    for &request in request_indices {
+        let demand = demands[request].cpus;
+        let mut choices = eligible
+            .iter()
+            .copied()
+            .filter_map(|llc| {
+                let cpus = llc_allowed_cpus(host, llc, allowed);
+                (cpus.len() >= demand).then(|| {
+                    let ready = cpus
+                        .iter()
+                        .filter(|cpu| preferred_cpus.contains(cpu))
+                        .count();
+                    let llc_ready = preferred_llc_ready(
+                        host,
+                        llc,
+                        demand,
+                        kind,
+                        preferred_shared_llcs,
+                        preferred_exclusive_llcs,
+                        performance_prefers_shared,
+                    );
+                    (llc, cpus.len(), ready, llc_ready)
+                })
+            })
+            .collect::<Vec<_>>();
+        // A complete ready footprint outranks cyclic rotation. This lets the
+        // coordinator synthesize an arbitrary simultaneously-free combination
+        // (for example LLCs 0+2 of four) without pre-enumerating every subset.
+        // When no availability snapshot was supplied, `preferred == allowed`,
+        // so every fitting bin ties on the capped readiness terms and bounded
+        // seed rotation still chooses alternate complete matchings. Subsequent
+        // seeds can therefore recover when exact CPU matching rejects one
+        // because synthetic LLC descriptions overlap.
+        choices.sort_by_key(|&(llc, capacity, ready, llc_ready)| {
+            let phase = bin_rank
+                .get(&seed)
+                .copied()
+                .unwrap_or(seed % eligible.len().max(1));
+            (
+                !llc_ready,
+                ready < demand,
+                std::cmp::Reverse(ready.min(demand)),
+                rotated_tie(bin_rank[&llc], phase, eligible.len().max(1)),
+                capacity,
+                std::cmp::Reverse(ready),
+            )
+        });
+        if choices.is_empty() {
+            return false;
+        }
+        edges.insert(
+            request,
+            choices
+                .into_iter()
+                .map(|(llc, _, _, _)| llc)
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    let mut requests = request_indices.to_vec();
+    requests.sort_by_key(|&request| {
+        (
+            edges[&request].len(),
+            std::cmp::Reverse(demands[request].cpus),
+            rotated_tie(
+                demands[request].guest_llc as usize,
+                seed,
+                demands.len().max(1),
+            ),
+        )
+    });
+    let Some(assignment) = match_distinct_bins(&edges, &requests) else {
+        return false;
+    };
+    for (&request, &llc) in &assignment {
+        used.insert(llc);
+        mapped[request] = llc;
+    }
+    true
+}
+
+/// Maximum-cardinality request-to-LLC matching. Unlike a greedy "first bin
+/// that fits" walk, augmenting paths can displace an earlier flexible request
+/// when a later request has only that bin available.
+fn match_distinct_bins(
+    edges: &std::collections::BTreeMap<usize, Vec<usize>>,
+    request_order: &[usize],
+) -> Option<std::collections::BTreeMap<usize, usize>> {
+    fn augment(
+        request: usize,
+        edges: &std::collections::BTreeMap<usize, Vec<usize>>,
+        owner: &mut std::collections::BTreeMap<usize, usize>,
+        seen: &mut std::collections::BTreeSet<usize>,
+    ) -> bool {
+        for &bin in edges.get(&request).into_iter().flatten() {
+            if !seen.insert(bin) {
+                continue;
+            }
+            let displaced = owner.get(&bin).copied();
+            if displaced.is_none_or(|other| augment(other, edges, owner, seen)) {
+                owner.insert(bin, request);
+                return true;
+            }
+        }
+        false
+    }
+
+    let mut owner = std::collections::BTreeMap::new();
+    for &request in request_order {
+        if !augment(
+            request,
+            edges,
+            &mut owner,
+            &mut std::collections::BTreeSet::new(),
+        ) {
+            return None;
+        }
+    }
+    Some(
+        owner
+            .into_iter()
+            .map(|(bin, request)| (request, bin))
+            .collect(),
+    )
+}
+
 /// Lock mode for LLC reservation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlcLockMode {
@@ -1168,10 +2090,9 @@ const PERF_GRAIN_MAX_OCCUPANCY_DEN: usize = 2;
 /// cells serialize globally (the 20-60× arm-CI makespan blowup). There
 /// we drop to per-CPU GRAIN: a SHARED (`LOCK_SH`) LLC lock so cells
 /// coexist on the giant L3, plus EXCLUSIVE per-CPU locks over exactly
-/// the pinned cores + service CPU — the SAME composition
-/// [`LlcLockMode::Shared`] already produces (`fixed_set_cpus` +
-/// `resource_claim`), so the returned claim names the ACTUAL CPUs held, not
-/// the whole LLC, and peers see the freed capacity.
+/// the pinned cores + service CPU. The returned explicit claim therefore
+/// names the actual CPUs held, not the whole LLC, and peers see the freed
+/// capacity.
 ///
 /// The switch requires BOTH gates, evaluated PER occupied host LLC and
 /// taken conservatively (any occupied LLC that is modest, or that the
@@ -1235,97 +2156,73 @@ pub enum LockOutcome {
     Unavailable(#[allow(dead_code)] String),
 }
 
-/// Acquire resource locks for a pinning plan (non-blocking).
+/// Acquire complete physical LLC domains (non-blocking).
 ///
-/// **LLC locks** (`{lock_dir}/ktstr-llc-{N}.lock`):
-/// - `Exclusive`: `flock(LOCK_EX | LOCK_NB)` — sole access to the LLC.
-/// - `Shared`: `flock(LOCK_SH | LOCK_NB)` — multiple holders coexist.
-///
-/// **CPU locks** (`{lock_dir}/ktstr-cpu-{C}.lock`):
-/// - Always `flock(LOCK_EX | LOCK_NB)` — exclusive per CPU.
-/// - Skipped for `Exclusive` LLC mode (the LLC lock already provides
-///   exclusivity over all CPUs in the group).
-///
-/// Single non-blocking, all-or-nothing attempt (the fast path of the
-/// acquisition protocol — see [`protocol`]). Returns
-/// `LockOutcome::Unavailable` immediately when any resource is busy,
-/// having released every lock it took (no fast-path partial ever persists;
-/// only the elected coordinator may retain partials).
-/// Locks are walked in the canonical global order (LLC index
-/// ascending, then CPU index ascending).
-///
-/// Claim-aware: an incompatible earlier exact ticket claim reports
-/// `Unavailable` without touching its reserved locks.
-///
-/// Used by the offset-scan probe in
-/// [`crate::vmm::KtstrVm::acquire_default_run_locks`] (which needs a
-/// fast "is this offset free?" answer per candidate), by perf mode's
-/// fast path, and by the locking tests.
+/// The operation requires at least one valid host-global LLC index, takes
+/// every LLC lock exclusively, derives the union of all CPUs in those domains,
+/// and takes every derived CPU lock exclusively. Callers cannot understate the
+/// CPU footprint or weaken its mode. The CPU side is the admission bridge to a
+/// topology-unavailable overcommitter that can identify only CPU resources.
 ///
 /// `KTSTR_CARGO_TEST_MODE` short-circuits the entire flock dance and
 /// returns `Acquired` with an empty fd list — bare `cargo test`
 /// invocations don't share the cross-process LLC reservation
 /// contract that nextest / `cargo ktstr test` peers rely on. Tests
 /// run on whatever CPUs the OS schedules them onto.
-pub fn acquire_resource_locks(
-    plan: &PinningPlan,
+pub fn acquire_whole_llc_locks(
+    host_topo: &HostTopology,
     llc_indices: &[usize],
-    llc_mode: LlcLockMode,
 ) -> Result<LockOutcome> {
-    acquire_resource_locks_waiting(plan, llc_indices, llc_mode, false)
+    let cpus = whole_llc_cpus(host_topo, llc_indices)?;
+    acquire_resource_locks_waiting_impl(
+        llc_indices,
+        LlcLockMode::Exclusive,
+        &cpus,
+        FlockMode::Exclusive,
+        false,
+        None,
+    )
 }
 
-/// Fixed-set reservation acquire with optional registry wait.
-///
-/// `wait == false` is the single non-blocking fast-path attempt — the
-/// interactive / one-shot `ktstr shell` path (which degrades a busy
-/// host to a lock-free overcommit rather than parking a human), the
-/// per-offset probe in the default run path, and build-time
-/// pre-checks.
-///
-/// `wait == true` is the TEST run path: on a busy reservation the caller
-/// publishes an exact ticket and, if elected coordinator, accumulates the
-/// fixed target set incrementally—holding partials, waking on filtered lock-dir
-/// events as holders release, and re-sweeping on every wake. This is the resource-budget
-/// model's contract — a budgeted / shared acquirer WAITS for an
-/// exclusive holder. It waits for the authoritative flock release;
-/// holder crashes are cleaned up by the kernel, while the holder's VM
-/// watchdog and nextest slow-timeout own lifecycle bounds. The lock
-/// scheduler never guesses that a live holder is wedged from elapsed
-/// wall time.
-///
-/// The fixed set is the degenerate re-plan case: the target cannot
-/// change, so "re-plan on every wake" reduces to re-sweeping the same
-/// canonical-order lock list against live state. While waiting, this caller
-/// holds no resource locks; as coordinator, its partials are fenced by its
-/// exact registry claim.
-///
-/// `KTSTR_CARGO_TEST_MODE` short-circuits to `Acquired` with an empty
-/// fd list, same as [`acquire_resource_locks`].
-pub fn acquire_resource_locks_waiting(
-    plan: &PinningPlan,
+/// Admission bridge for a default overcommit run. The run cannot promise
+/// one-host-CPU-per-vCPU, but it still owns its complete allowed CPU footprint
+/// exclusively and shares every LLC that footprint is known to touch. Whole
+/// performance reservations also lock every CPU in their claimed
+/// LLCs, so this CPU class remains sufficient when sysfs topology discovery
+/// failed and `llc_indices` is empty.
+pub(crate) fn acquire_overcommit_bridge(
     llc_indices: &[usize],
-    llc_mode: LlcLockMode,
+    cpus: &[usize],
     wait: bool,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<LockOutcome> {
-    acquire_resource_locks_waiting_impl(plan, llc_indices, llc_mode, wait, None)
+    acquire_resource_locks_waiting_impl(
+        llc_indices,
+        LlcLockMode::Shared,
+        cpus,
+        FlockMode::Exclusive,
+        wait,
+        cancelled,
+    )
 }
 
-#[cfg(test)]
-pub(crate) fn acquire_resource_locks_waiting_interruptible(
-    plan: &PinningPlan,
+pub(crate) fn overcommit_bridge_claim(
     llc_indices: &[usize],
-    llc_mode: LlcLockMode,
-    wait: bool,
-    cancelled: &AtomicBool,
-) -> Result<LockOutcome> {
-    acquire_resource_locks_waiting_impl(plan, llc_indices, llc_mode, wait, Some(cancelled))
+    cpus: &[usize],
+) -> protocol::ClaimSet {
+    resource_claim_with_modes(
+        llc_indices,
+        LlcLockMode::Shared,
+        cpus,
+        FlockMode::Exclusive,
+    )
 }
 
 fn acquire_resource_locks_waiting_impl(
-    plan: &PinningPlan,
     llc_indices: &[usize],
     llc_mode: LlcLockMode,
+    cpus: &[usize],
+    cpu_mode: FlockMode,
     wait: bool,
     cancelled: Option<&AtomicBool>,
 ) -> Result<LockOutcome> {
@@ -1337,7 +2234,8 @@ fn acquire_resource_locks_waiting_impl(
     }
     let llc_offset = llc_indices.first().copied().unwrap_or(0);
     // Fast path: claim-subtracted, non-blocking, all-or-nothing.
-    let (first_reason, first_evidence) = match try_acquire_all(plan, llc_indices, llc_mode)? {
+    let (first_reason, first_evidence) =
+        match try_acquire_resources(llc_indices, llc_mode, cpus, cpu_mode)? {
         TryAcquireAll::Acquired(locks) => {
             return Ok(LockOutcome::Acquired { llc_offset, locks });
         }
@@ -1346,22 +2244,20 @@ fn acquire_resource_locks_waiting_impl(
     if !wait {
         return Ok(LockOutcome::Unavailable(first_reason));
     }
-    let target = protocol::canonical_lock_order(
+    let target = protocol::canonical_lock_order_with_modes(
         llc_indices,
-        match llc_mode {
-            LlcLockMode::Exclusive => FlockMode::Exclusive,
-            LlcLockMode::Shared => FlockMode::Shared,
-        },
-        &fixed_set_cpus(plan, llc_mode),
+        llc_flock_mode(llc_mode),
+        cpus,
+        cpu_mode,
     );
-    let claim = resource_claim(llc_indices, plan, llc_mode);
+    let claim = resource_claim_with_modes(llc_indices, llc_mode, cpus, cpu_mode);
     // Contended: retain one exact ticket while retrying this fixed set only
     // when it is compatible with every earlier live waiter claim. This keeps
     // disjoint host capacity busy without weakening the reservation: the
     // actual flock set is still all-or-nothing and byte-for-byte identical.
     let register = |probe: &mut protocol::GrantedProbe| {
         probe.try_acquire(&claim, || {
-            match try_acquire_all_unfenced(plan, llc_indices, llc_mode)? {
+            match try_acquire_resources_unfenced(llc_indices, llc_mode, cpus, cpu_mode)? {
                 TryAcquireAll::Acquired(locks) => Ok(protocol::ProbeOutcome::Acquired(locks)),
                 TryAcquireAll::Contended {
                     evidence: Some(evidence),
@@ -1418,32 +2314,43 @@ fn acquire_resource_locks_waiting_impl(
     })
 }
 
-/// The CPU-lock set for a fixed reservation: assignment CPUs plus the
-/// service CPU, or empty for `Exclusive` LLC mode (the LLC lock
-/// already covers its CPUs).
-fn fixed_set_cpus(plan: &PinningPlan, llc_mode: LlcLockMode) -> Vec<usize> {
-    if llc_mode == LlcLockMode::Exclusive {
-        return Vec::new();
+fn whole_llc_cpus(
+    host_topo: &HostTopology,
+    llc_indices: &[usize],
+) -> Result<Vec<usize>> {
+    if llc_indices.is_empty() {
+        anyhow::bail!("a whole-LLC reservation requires at least one LLC index");
     }
-    let mut cpus: Vec<usize> = plan.assignments.iter().map(|&(_, c)| c).collect();
-    cpus.extend(plan.service_cpu);
-    cpus
+    let mut domain = std::collections::BTreeSet::new();
+    for &llc in llc_indices {
+        let group = host_topo
+            .llc_groups
+            .get(llc)
+            .ok_or_else(|| anyhow::anyhow!("host LLC index {llc} is out of range"))?;
+        domain.extend(group.cpus.iter().copied());
+    }
+    Ok(domain.into_iter().collect())
 }
 
-/// The published claim for a fixed reservation.
-pub(crate) fn resource_claim(
-    llc_indices: &[usize],
-    plan: &PinningPlan,
-    llc_mode: LlcLockMode,
-) -> protocol::ClaimSet {
-    let flock_mode = match llc_mode {
+fn llc_flock_mode(llc_mode: LlcLockMode) -> FlockMode {
+    match llc_mode {
         LlcLockMode::Exclusive => FlockMode::Exclusive,
         LlcLockMode::Shared => FlockMode::Shared,
-    };
-    protocol::ClaimSet::new(
+    }
+}
+
+/// The published claim for an explicit two-resource-class reservation.
+pub(crate) fn resource_claim_with_modes(
+    llc_indices: &[usize],
+    llc_mode: LlcLockMode,
+    cpus: &[usize],
+    cpu_mode: FlockMode,
+) -> protocol::ClaimSet {
+    protocol::ClaimSet::with_modes(
         llc_indices.iter().copied(),
-        fixed_set_cpus(plan, llc_mode),
-        flock_mode,
+        cpus.iter().copied(),
+        llc_flock_mode(llc_mode),
+        cpu_mode,
     )
 }
 
@@ -1532,19 +2439,20 @@ pub(crate) fn authoritative_registry_probe_count_for_tests() -> usize {
     AUTHORITATIVE_REGISTRY_PROBES.with(std::cell::Cell::get)
 }
 
-pub(crate) fn try_acquire_all(
-    plan: &PinningPlan,
+pub(crate) fn try_acquire_resources(
     llc_indices: &[usize],
     llc_mode: LlcLockMode,
+    cpus: &[usize],
+    cpu_mode: FlockMode,
 ) -> Result<TryAcquireAll> {
     #[cfg(test)]
     AUTHORITATIVE_REGISTRY_PROBES.with(|probes| probes.set(probes.get() + 1));
-    let request = resource_claim(llc_indices, plan, llc_mode);
+    let request = resource_claim_with_modes(llc_indices, llc_mode, cpus, cpu_mode);
     if request.is_empty() {
         return Ok(TryAcquireAll::Acquired(Vec::new()));
     }
     match protocol::with_registry_fence(&request, || {
-        try_acquire_all_unfenced(plan, llc_indices, llc_mode)
+        try_acquire_resources_unfenced(llc_indices, llc_mode, cpus, cpu_mode)
     })? {
         protocol::RegistryFence::Fenced => Ok(TryAcquireAll::Contended {
             reason: "reservation claimed by an earlier registered ticket".into(),
@@ -1563,17 +2471,18 @@ pub(crate) fn try_acquire_all(
     }
 }
 
-fn try_acquire_all_unfenced(
-    plan: &PinningPlan,
+fn try_acquire_resources_unfenced(
     llc_indices: &[usize],
     llc_mode: LlcLockMode,
+    cpus: &[usize],
+    cpu_mode: FlockMode,
 ) -> Result<TryAcquireAll> {
-    let flock_mode = match llc_mode {
-        LlcLockMode::Exclusive => FlockMode::Exclusive,
-        LlcLockMode::Shared => FlockMode::Shared,
-    };
-    let cpus = fixed_set_cpus(plan, llc_mode);
-    let target = protocol::canonical_lock_order(llc_indices, flock_mode, &cpus);
+    let target = protocol::canonical_lock_order_with_modes(
+        llc_indices,
+        llc_flock_mode(llc_mode),
+        cpus,
+        cpu_mode,
+    );
     let mut locks = Vec::with_capacity(target.len());
     for lock in &target {
         match try_flock_with_witness(&lock.path, lock.mode)? {
@@ -1596,13 +2505,14 @@ fn try_acquire_all_unfenced(
     Ok(TryAcquireAll::Acquired(locks))
 }
 
-pub(crate) fn acquire_resource_locks_granted_with_evidence(
-    plan: &PinningPlan,
+pub(crate) fn acquire_resources_granted_with_evidence(
     llc_indices: &[usize],
     llc_mode: LlcLockMode,
+    cpus: &[usize],
+    cpu_mode: FlockMode,
 ) -> Result<protocol::ProbeOutcome<Vec<std::os::fd::OwnedFd>>> {
     Ok(
-        match try_acquire_all_unfenced(plan, llc_indices, llc_mode)? {
+        match try_acquire_resources_unfenced(llc_indices, llc_mode, cpus, cpu_mode)? {
             TryAcquireAll::Acquired(locks) => protocol::ProbeOutcome::Acquired(locks),
             TryAcquireAll::Contended {
                 evidence: Some(evidence),
@@ -1668,8 +2578,8 @@ pub(crate) fn pid_window_offset(pid: u32, max_start: usize) -> usize {
 // because a CI runner whose parent cgroup pins ktstr to a 4-CPU
 // subset must plan within THAT subset or sched_setaffinity on the
 // resulting mask produces an empty effective set.
-// Perf-mode never reaches this path; it stays on
-// [`acquire_resource_locks`] for its `LOCK_EX` reservation contract.
+// Perf-mode never reaches this path; it uses topology-candidate admission
+// with LLC and CPU modes recorded explicitly in each exact claim.
 //
 // The pipeline has three phases: discover (snapshot holders per
 // LLC, filtered to the process's allowed cpuset), plan (NUMA-aware
@@ -2594,7 +3504,7 @@ fn acquire_llc_plan_impl(
         // Synthesise a degenerate plan that names every LLC and
         // every allowed CPU but holds no flocks. The vmm caller
         // strips `locks` after build (see `KtstrVmBuilder::build`)
-        // and re-acquires via `acquire_resource_locks` at run time
+        // and re-acquires through run-time host admission
         // — also short-circuited above. `cpus` is the calling
         // process's allowed cpuset so the `sched_setaffinity`
         // sites inside the vmm have a valid mask to apply

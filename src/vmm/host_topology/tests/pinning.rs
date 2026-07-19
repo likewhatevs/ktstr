@@ -343,13 +343,19 @@ fn sysfs_llc_groups_cover_all_cpus() {
         .iter()
         .flat_map(|g| g.cpus.iter().copied())
         .collect();
-    for cpu in &topo.online_cpus {
-        assert!(
-            llc_cpus.contains(cpu),
-            "CPU {} is online but not in any LLC group",
-            cpu,
-        );
-    }
+    assert_eq!(
+        llc_cpus.len(),
+        topo.online_cpus.len(),
+        "flattened LLC membership must name every online CPU exactly once",
+    );
+    assert_eq!(
+        llc_cpus.iter().copied().collect::<std::collections::BTreeSet<_>>(),
+        topo.online_cpus
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "LLC membership must be an exact partition of the online CPU set",
+    );
 }
 
 #[test]
@@ -1241,18 +1247,81 @@ fn performance_grain_candidates_cover_every_llc_window_and_block() {
             .iter()
             .all(|candidate| candidate.llc_mode == LlcLockMode::Shared),
     );
-    // block size = 2 vCPUs + 1 service, so each 36-CPU LLC seats 12.
-    assert_eq!(candidates.len(), 24);
     let per_llc = candidates.iter().fold(
-        std::collections::BTreeMap::<usize, usize>::new(),
-        |mut counts, candidate| {
+        std::collections::BTreeMap::<
+            usize,
+            std::collections::BTreeSet<Vec<usize>>,
+        >::new(),
+        |mut footprints, candidate| {
             assert_eq!(candidate.plan.llc_indices.len(), 1);
-            *counts.entry(candidate.plan.llc_indices[0]).or_default() += 1;
-            counts
+            footprints
+                .entry(candidate.plan.llc_indices[0])
+                .or_default()
+                .insert(candidate.cpu_reservations.clone());
+            footprints
         },
     );
-    assert_eq!(
-        per_llc,
-        std::collections::BTreeMap::from([(0, 12), (1, 12)])
-    );
+    assert_eq!(candidates.len(), 24);
+    for llc in 0..2 {
+        let base = llc * 36;
+        let expected = (0..12)
+            .map(|grain| {
+                let start = base + grain * 3;
+                vec![start, start + 1, start + 2]
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            per_llc[&llc], expected,
+            "each 36-CPU LLC must expose exactly twelve pairwise-disjoint \
+             vCPU+service grains",
+        );
+    }
+}
+
+#[test]
+fn multi_llc_performance_candidates_retain_twelve_disjoint_grains() {
+    let host = multi_llc_host(2, 36);
+    let candidates = host
+        .performance_pinning_candidates(&Topology::new(1, 2, 2, 1))
+        .expect("enumerate two-LLC performance grains");
+    assert!(candidates
+        .iter()
+        .all(|candidate| candidate.llc_mode == LlcLockMode::Shared));
+
+    let footprints = candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .cpu_reservations
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut selected = Vec::new();
+    for grain in 0..12 {
+        let low = grain * 3;
+        let high = 36 + grain * 3;
+        let service_low =
+            std::collections::BTreeSet::from([low, low + 1, low + 2, high, high + 1]);
+        let service_high =
+            std::collections::BTreeSet::from([low, low + 1, high, high + 1, high + 2]);
+        let footprint = if footprints.contains(&service_low) {
+            service_low
+        } else {
+            assert!(
+                footprints.contains(&service_high),
+                "missing grain {grain} with service CPU in either mapped LLC",
+            );
+            service_high
+        };
+        assert!(
+            selected
+                .iter()
+                .all(|prior: &std::collections::BTreeSet<usize>| prior.is_disjoint(&footprint)),
+            "static grain {grain} overlaps an earlier material footprint",
+        );
+        selected.push(footprint);
+    }
+    assert_eq!(selected.len(), 12);
 }

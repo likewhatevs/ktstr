@@ -1395,6 +1395,9 @@ pub(crate) struct HeldLocks {
     abandoned_resources: std::collections::BTreeMap<ResourceKey, FlockMode>,
     abandoned_fds: Vec<HeldLock>,
     contention: ContentionSet,
+    watch: Option<ClaimSet>,
+    predecessors: Option<registry::AggregateSnapshot>,
+    availability: Option<registry::AvailabilitySnapshot>,
 }
 
 struct HeldLock {
@@ -1414,6 +1417,65 @@ struct HeldRegistryUpdate {
 }
 
 impl HeldLocks {
+    fn install_schedule_snapshot(&mut self, snapshot: &registry::ScheduleSnapshot) {
+        self.watch = Some(snapshot.candidate_watch.clone());
+        self.predecessors = Some(snapshot.predecessors.clone());
+        self.availability = Some(snapshot.availability.clone());
+    }
+
+    /// Whether one complete alternative is ready according to the same
+    /// mode-aware registry snapshot used by granted waiter callbacks.
+    ///
+    /// Exact coordinator-held locks are removed from the live-holder query:
+    /// once published they correctly appear unavailable globally, but they are
+    /// already usable by this coordinator. Predecessor reservations remain an
+    /// independent hard fence.
+    pub(crate) fn candidate_ready(&self, candidate: &ClaimSet) -> Result<bool> {
+        let watch = self
+            .watch
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("coordinator availability snapshot is missing"))?;
+        let predecessors = self
+            .predecessors
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("coordinator predecessor snapshot is missing"))?;
+        let availability = self
+            .availability
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("coordinator availability snapshot is missing"))?;
+        registry::validate_claim_within_watch(candidate, watch)?;
+        if predecessors.conflicts(candidate)? {
+            return Ok(false);
+        }
+
+        let mut unheld = candidate.clone();
+        unheld.cpus.retain(|&cpu| {
+            !self.map.values().any(|held| {
+                held.resource == ResourceKey::Cpu(cpu)
+                    && held.mode
+                        == match candidate.cpu_mode {
+                            ClaimMode::Exclusive => FlockMode::Exclusive,
+                            ClaimMode::Shared => FlockMode::Shared,
+                        }
+            })
+        });
+        unheld.llcs.retain(|&llc| {
+            !self.map.values().any(|held| {
+                held.resource == ResourceKey::Llc(llc)
+                    && held.mode
+                        == match candidate.llc_mode {
+                            ClaimMode::Exclusive => FlockMode::Exclusive,
+                            ClaimMode::Shared => FlockMode::Shared,
+                        }
+            })
+        });
+        if unheld.is_empty() {
+            Ok(true)
+        } else {
+            availability.allows(&unheld)
+        }
+    }
+
     /// Stage every partial not present with the exact same mode in `target`.
     /// Staged fds remain locked until the registry publishes the corresponding
     /// UNKNOWN transition.
@@ -1952,6 +2014,7 @@ fn acquire_as_coordinator_impl<T>(
             watched_resources = snapshot.watch.clone();
             should_step |= snapshot.should_step;
         }
+        held.install_schedule_snapshot(&snapshot);
         let observation_pending = snapshot.observation.is_some();
         pending_events = LockDirEvents::default();
 

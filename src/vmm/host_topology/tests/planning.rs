@@ -1,6 +1,7 @@
 use super::super::*;
 use super::*;
 use super::super::protocol as admission_protocol;
+use crate::vmm::topology::Topology;
 
 /// `CpuCap::new(1)` succeeds — minimum legal cap.
 #[test]
@@ -463,7 +464,10 @@ fn plan_from_snapshots_target_zero_returns_empty() {
 
 #[test]
 fn overlapping_llc_groups_materialize_a_distinct_cpu_budget() {
-    let topo = synth_host_topo(&[(vec![0, 1], 0), (vec![1, 2], 0)]);
+    let topo = HostTopology::new_for_tests_unchecked(&[
+        (vec![0, 1], 0),
+        (vec![1, 2], 0),
+    ]);
     let snapshots = (0..2)
         .map(|llc_idx| LlcSnapshot {
             llc_idx,
@@ -2320,13 +2324,15 @@ fn acquire_resource_locks_cargo_test_mode_bypasses_flock() {
     use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
     let _lock = lock_env();
     let _env = EnvVarGuard::set(crate::KTSTR_CARGO_TEST_MODE_ENV, "1");
-    let plan = PinningPlan {
-        assignments: vec![(0, 95100)],
-        service_cpu: None,
-        llc_indices: vec![95100],
-        locks: Vec::new(),
-    };
-    let outcome = acquire_resource_locks(&plan, &[95100usize], LlcLockMode::Exclusive).unwrap();
+    let outcome = acquire_resource_locks_waiting_impl(
+        &[95100usize],
+        LlcLockMode::Exclusive,
+        &[95100],
+        FlockMode::Exclusive,
+        false,
+        None,
+    )
+    .unwrap();
     let (llc_offset, locks) = unwrap_acquired(outcome, Some("in cargo-test mode"));
     assert_eq!(llc_offset, 95100);
     assert!(
@@ -2348,19 +2354,21 @@ fn acquire_resource_locks_cargo_test_mode_empty_string_inert() {
     let _lock = lock_env();
     let _env = EnvVarGuard::set(crate::KTSTR_CARGO_TEST_MODE_ENV, "");
     let _llc_prefix = LlcLockPrefixGuard::new();
-    let plan = PinningPlan {
-        assignments: vec![(0, 95200)],
-        service_cpu: None,
-        llc_indices: vec![95200],
-        locks: Vec::new(),
-    };
-    let outcome = acquire_resource_locks(&plan, &[95200usize], LlcLockMode::Exclusive).unwrap();
+    let outcome = acquire_resource_locks_waiting_impl(
+        &[95200usize],
+        LlcLockMode::Exclusive,
+        &[95200],
+        FlockMode::Exclusive,
+        false,
+        None,
+    )
+    .unwrap();
     let (_, locks) = unwrap_acquired(outcome, Some("with empty-string bypass inert"));
     assert_eq!(
         locks.len(),
-        1,
+        2,
         "empty-string cargo-test-mode is inert — expected the \
-         standard `Exclusive` path to take exactly one LLC fd, \
+         explicit `Exclusive` path to take one LLC fd plus its CPU bridge, \
          got {}",
         locks.len(),
     );
@@ -2598,4 +2606,634 @@ fn spread_for_process_rotation_is_stable() {
         PlacementPolicy::spread_for_process(),
         PlacementPolicy::spread_for_process(),
     );
+}
+
+#[test]
+fn bounded_planner_stays_within_prime_host_resource_count() {
+    let groups = (0..7)
+        .map(|llc| {
+            let start = llc * 5;
+            (((start)..(start + 5)).collect::<Vec<_>>(), llc % 2)
+        })
+        .collect::<Vec<_>>();
+    let host = HostTopology::new_for_tests(&groups);
+    let allowed = host.online_cpus.clone();
+    let candidates = host
+        .default_pinning_candidates_for_cpus(&Topology::new(1, 3, 1, 1), &allowed)
+        .expect("prime/coprime host shape must be plannable");
+    assert!(!candidates.is_empty());
+    assert!(
+        candidates.len() <= allowed.len().max(host.llc_groups.len()),
+        "planner work/output must be bounded by physical resources",
+    );
+}
+
+#[test]
+fn planner_selects_fragmented_preferred_cpus_exactly() {
+    let host = synth_host_topo(&[(vec![0, 1, 2, 3], 0)]);
+    let allowed = vec![0, 1, 2, 3];
+    let preferred = std::collections::BTreeSet::from([0usize, 2]);
+    let llcs = std::collections::BTreeSet::from([0usize]);
+    let candidates = host
+        .topology_pinning_candidates(
+            &Topology::new(1, 1, 2, 1),
+            PinningKind::Default,
+            &allowed,
+            Some(PinningPreferences {
+                cpus: &preferred,
+                shared_llcs: &llcs,
+                exclusive_llcs: &llcs,
+            }),
+        )
+        .expect("fragmented exact CPU set must fit");
+    assert!(
+        candidates.iter().any(|candidate| {
+            candidate
+                .plan
+                .assignments
+                .iter()
+                .map(|&(_, cpu)| cpu)
+                .collect::<std::collections::BTreeSet<_>>()
+                == preferred
+        }),
+        "availability-aware matching must not require a contiguous window",
+    );
+}
+
+#[test]
+fn planner_rotates_sparse_cpu_ids_by_dense_rank() {
+    let host = synth_host_topo(&[(vec![0, 2, 4], 0)]);
+    let candidates = host
+        .default_pinning_candidates_for_cpus(&Topology::new(1, 1, 1, 1), &[0, 2, 4])
+        .expect("sparse CPU IDs must expose every exact one-CPU placement");
+    let footprints = candidates
+        .iter()
+        .map(|candidate| candidate.cpu_reservations.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        footprints,
+        std::collections::BTreeSet::from([vec![0], vec![2], vec![4]]),
+        "numeric CPU IDs modulo CPU count must not collapse candidate rotation",
+    );
+}
+
+#[test]
+fn planner_rotates_sparse_host_numa_ids_by_dense_rank() {
+    let host = synth_host_topo(&[(vec![0], 0), (vec![1], 3), (vec![2], 6)]);
+    let candidates = host
+        .default_pinning_candidates_for_cpus(&Topology::new(2, 2, 1, 1), &[0, 1, 2])
+        .expect("two guest nodes fit on every pair of three sparse host nodes");
+    let host_node_pairs = candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .plan
+                .assignments
+                .iter()
+                .map(|&(_, cpu)| host.cpu_to_node[&cpu])
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        host_node_pairs
+            .iter()
+            .any(|nodes| nodes.contains(&6)),
+        "raw sparse node IDs modulo node count must not leave node 6 unseen",
+    );
+    assert_eq!(
+        host_node_pairs,
+        std::collections::BTreeSet::from([
+            std::collections::BTreeSet::from([0, 3]),
+            std::collections::BTreeSet::from([0, 6]),
+            std::collections::BTreeSet::from([3, 6]),
+        ]),
+    );
+}
+
+#[test]
+fn llc_partition_validation_rejects_every_malformed_shape() {
+    let error = validate_llc_partition(&[], &[]).unwrap_err();
+    assert!(error.to_string().contains("empty online CPU set"));
+
+    let error = validate_llc_partition(&[], &[0]).unwrap_err();
+    assert!(error.to_string().contains("zero LLC groups"));
+
+    let error = validate_llc_partition(
+        &[LlcGroup { cpus: Vec::new() }],
+        &[0],
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("empty"));
+
+    let error = validate_llc_partition(
+        &[LlcGroup { cpus: vec![0, 0] }],
+        &[0],
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("repeats CPU 0"));
+
+    let error = validate_llc_partition(
+        &[
+            LlcGroup { cpus: vec![0, 1] },
+            LlcGroup { cpus: vec![1, 2] },
+        ],
+        &[0, 1, 2],
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("more than one"));
+
+    let error = validate_llc_partition(
+        &[LlcGroup { cpus: vec![0] }],
+        &[0, 1],
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("omit online CPUs [1]"));
+
+    let error = validate_llc_partition(
+        &[LlcGroup { cpus: vec![0, 2] }],
+        &[0, 1],
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("non-online CPU 2"));
+}
+
+#[test]
+fn planner_collapses_a_full_domain_to_one_material_seed() {
+    let cpus = (0..192).collect::<Vec<_>>();
+    let host = synth_host_topo(&[(cpus.clone(), 0)]);
+    let candidates = host
+        .default_pinning_candidates_for_cpus(&Topology::new(1, 1, 192, 1), &cpus)
+        .expect("a full-domain guest must fit exactly once");
+    assert_eq!(
+        candidates.len(),
+        1,
+        "a 192-vCPU full-domain fit must not materialize 192 identical \
+         192-by-192 CPU matchings",
+    );
+    assert_eq!(candidates[0].cpu_reservations, cpus);
+    assert_eq!(
+        candidates[0]
+            .plan
+            .assignments
+            .iter()
+            .map(|&(_, cpu)| cpu)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        192,
+        "direct per-bin selection must retain one globally distinct host CPU \
+         per guest vCPU",
+    );
+}
+
+#[test]
+fn whole_domain_identity_and_cpu_bridge_are_cpuset_independent() {
+    let host = synth_host_topo(&[
+        (vec![0, 1, 2], 0),
+        (vec![3, 4, 5], 0),
+    ]);
+    let topology = Topology::new(1, 1, 1, 1);
+    let left = host
+        .performance_pinning_candidates_for_cpus(&topology, &[0, 1])
+        .expect("left slice of LLC 0 must fit")
+        .into_iter()
+        .find(|candidate| candidate.plan.llc_indices == vec![0])
+        .expect("left cpuset must retain physical LLC 0 identity");
+    let right = host
+        .performance_pinning_candidates_for_cpus(&topology, &[1, 2])
+        .expect("right slice of LLC 0 must fit")
+        .into_iter()
+        .find(|candidate| candidate.plan.llc_indices == vec![0])
+        .expect("right cpuset must retain physical LLC 0 identity");
+
+    assert_eq!(left.llc_mode, LlcLockMode::Exclusive);
+    assert_eq!(right.llc_mode, LlcLockMode::Exclusive);
+    assert_eq!(left.plan.llc_indices, right.plan.llc_indices);
+    assert_eq!(left.cpu_reservations, vec![0, 1, 2]);
+    assert_eq!(right.cpu_reservations, vec![0, 1, 2]);
+    assert_eq!(
+        whole_llc_cpus(&host, &[0])
+            .expect("derive whole-domain bridge"),
+        vec![0, 1, 2],
+        "whole-EX locking must include the sibling outside either caller's \
+         allowed mask",
+    );
+}
+
+#[test]
+fn planner_seed_schedule_is_linear_on_heterogeneous_llcs() {
+    let mut groups = vec![((0..96).collect::<Vec<_>>(), 0)];
+    groups.extend((96..192).map(|cpu| (vec![cpu], 0)));
+    let host = synth_host_topo(&groups);
+    let allowed = (0..192).collect::<Vec<_>>();
+    let allowed_set = allowed.iter().copied().collect();
+    let demands = [GuestLlcDemand {
+        guest_llc: 0,
+        guest_node: 0,
+        vcpu_start: 0,
+        cpus: 1,
+    }];
+    let seeds = planner_seed_schedule(
+        &host,
+        &demands,
+        PinningKind::Default,
+        &allowed_set,
+    );
+    assert_eq!(
+        seeds.len(),
+        192,
+        "one 96-CPU LLC plus 96 singleton LLCs must produce a flattened \
+         192-grain schedule, not a 97-by-96 Cartesian product",
+    );
+    let candidates = host
+        .default_pinning_candidates_for_cpus(&Topology::new(1, 1, 1, 1), &allowed)
+        .expect("every physical one-CPU grain must be materialized");
+    assert_eq!(candidates.len(), 192);
+}
+
+#[test]
+fn bin_matching_displaces_flexible_requests_instead_of_getting_stuck_greedily() {
+    let edges = std::collections::BTreeMap::from([
+        (0usize, vec![0usize, 1]),
+        (1usize, vec![0]),
+        (2usize, vec![1, 2]),
+    ]);
+    let matched = match_distinct_bins(&edges, &[0, 1, 2])
+        .expect("augmenting paths must find the complete 0→1, 1→0, 2→2 match");
+    assert_eq!(
+        matched,
+        std::collections::BTreeMap::from([(0, 1), (1, 0), (2, 2)]),
+    );
+}
+
+#[test]
+fn preferred_snapshot_synthesizes_nonadjacent_ready_llc_combination() {
+    let host = synth_host_topo(&[
+        (vec![0], 0),
+        (vec![1], 0),
+        (vec![2], 0),
+        (vec![3], 0),
+    ]);
+    let preferred = std::collections::BTreeSet::from([0usize, 2]);
+    let all_llcs = std::collections::BTreeSet::from([0usize, 1, 2, 3]);
+    let candidates = host
+        .topology_pinning_candidates(
+            &Topology::new(1, 2, 1, 1),
+            PinningKind::Default,
+            &[0, 1, 2, 3],
+            Some(PinningPreferences {
+                cpus: &preferred,
+                shared_llcs: &all_llcs,
+                exclusive_llcs: &all_llcs,
+            }),
+        )
+        .expect("two nonadjacent ready LLCs must form an exact candidate");
+    assert!(
+        candidates.iter().any(|candidate| {
+            candidate.plan.llc_indices == vec![0, 2]
+                && candidate.cpu_reservations == vec![0, 2]
+        }),
+        "availability must outrank cyclic seed rotation so a coordinator can \
+         synthesize the simultaneously ready {0,2} placement",
+    );
+}
+
+#[test]
+fn preferred_llc_modes_synthesize_nonadjacent_whole_perf_combination() {
+    let host = synth_host_topo(&[
+        (vec![0, 1], 0),
+        (vec![2, 3], 0),
+        (vec![4, 5], 0),
+        (vec![6, 7], 0),
+    ]);
+    let cpus = (0..8).collect::<std::collections::BTreeSet<_>>();
+    let shared_llcs = std::collections::BTreeSet::from([0usize, 1, 2, 3]);
+    let exclusive_llcs = std::collections::BTreeSet::from([0usize, 2]);
+    let candidates = host
+        .topology_pinning_candidates(
+            &Topology::new(1, 2, 1, 1),
+            PinningKind::Performance,
+            &(0..8).collect::<Vec<_>>(),
+            Some(PinningPreferences {
+                cpus: &cpus,
+                shared_llcs: &shared_llcs,
+                exclusive_llcs: &exclusive_llcs,
+            }),
+        )
+        .expect("whole-LLC availability must synthesize the free 0+2 pair");
+    assert!(candidates.iter().any(|candidate| {
+        candidate.llc_mode == LlcLockMode::Exclusive
+            && candidate.plan.llc_indices == vec![0, 2]
+    }));
+}
+
+#[test]
+fn preferred_llc_modes_cover_service_only_whole_perf_domain() {
+    let host = synth_host_topo(&[
+        (vec![0], 0),
+        (vec![1], 0),
+        (vec![2], 0),
+        (vec![3], 0),
+    ]);
+    let cpus = std::collections::BTreeSet::from([0usize, 1, 2, 3]);
+    let shared_llcs = std::collections::BTreeSet::from([0usize, 1, 2, 3]);
+    let exclusive_llcs = std::collections::BTreeSet::from([0usize, 2]);
+    let candidates = host
+        .topology_pinning_candidates(
+            &Topology::new(1, 1, 1, 1),
+            PinningKind::Performance,
+            &[0, 1, 2, 3],
+            Some(PinningPreferences {
+                cpus: &cpus,
+                shared_llcs: &shared_llcs,
+                exclusive_llcs: &exclusive_llcs,
+            }),
+        )
+        .expect("vCPU and service may occupy the two nonadjacent free LLCs");
+    assert!(candidates.iter().any(|candidate| {
+        candidate.llc_mode == LlcLockMode::Exclusive
+            && candidate.plan.llc_indices == vec![0, 2]
+            && candidate.cpu_reservations == vec![0, 2]
+    }));
+}
+
+#[test]
+fn service_cpu_uses_a_ready_global_llc_before_a_busy_local_fallback() {
+    let host = synth_host_topo(&[
+        ((0..32).collect::<Vec<_>>(), 0),
+        ((32..64).collect::<Vec<_>>(), 0),
+    ]);
+    let preferred_cpus = std::collections::BTreeSet::from([0usize, 1, 32]);
+    let ready_llcs = std::collections::BTreeSet::from([0usize, 1]);
+    let candidates = host
+        .topology_pinning_candidates(
+            &Topology::new(1, 1, 2, 1),
+            PinningKind::Performance,
+            &[0, 1, 2, 32],
+            Some(PinningPreferences {
+                cpus: &preferred_cpus,
+                shared_llcs: &ready_llcs,
+                exclusive_llcs: &ready_llcs,
+            }),
+        )
+        .expect("a free service CPU in another LLC must remain eligible");
+    assert!(candidates.iter().any(|candidate| {
+        candidate.llc_mode == LlcLockMode::Shared
+            && candidate.plan.service_cpu == Some(32)
+            && candidate.plan.llc_indices == vec![0, 1]
+            && candidate.cpu_reservations == vec![0, 1, 32]
+    }));
+}
+
+#[test]
+fn heterogeneous_grain_service_placement_is_demand_order_independent() {
+    let host = synth_host_topo(&[
+        ((0..32).collect::<Vec<_>>(), 0),
+        ((32..64).collect::<Vec<_>>(), 0),
+    ]);
+    let allowed = (0..15).chain([32, 33]).collect::<Vec<_>>();
+    let preferred_cpus = allowed.iter().copied().collect();
+    let shared_llcs = std::collections::BTreeSet::from([0usize, 1]);
+    let exclusive_llcs = std::collections::BTreeSet::new();
+
+    let plan = |llc_cores: &'static [u32]| {
+        let mut topology = Topology::new(1, 2, 16, 1);
+        topology.llc_cores = Some(llc_cores);
+        host.topology_pinning_candidates(
+            &topology,
+            PinningKind::Performance,
+            &allowed,
+            Some(PinningPreferences {
+                cpus: &preferred_cpus,
+                shared_llcs: &shared_llcs,
+                exclusive_llcs: &exclusive_llcs,
+            }),
+        )
+        .expect("service must fit on the one-CPU guest LLC's spare grain")
+        .into_iter()
+        .find(|candidate| {
+            candidate.llc_mode == LlcLockMode::Shared
+                && candidate.cpu_reservations
+                    == (0..15).chain([32, 33]).collect::<Vec<_>>()
+        })
+        .expect("SH-ready 15/2 footprint must be preferred over whole EX")
+    };
+
+    let large_first = plan(&[15, 1]);
+    let small_first = plan(&[1, 15]);
+    assert_eq!(large_first.plan.service_cpu, Some(33));
+    assert_eq!(small_first.plan.service_cpu, Some(33));
+    assert_eq!(large_first.plan.llc_indices, vec![0, 1]);
+    assert_eq!(small_first.plan.llc_indices, vec![0, 1]);
+    assert_eq!(
+        large_first.cpu_reservations,
+        small_first.cpu_reservations,
+        "reversing guest LLC declaration order must not change the material \
+         SH-grain claim",
+    );
+
+    let mut static_topology = Topology::new(1, 2, 16, 1);
+    static_topology.llc_cores = Some(&[15, 1]);
+    let static_candidates = host
+        .topology_pinning_candidates(
+            &static_topology,
+            PinningKind::Performance,
+            &(0..64).collect::<Vec<_>>(),
+            None,
+        )
+        .expect("idle-host planning must preserve the available shared grain");
+    let static_first = static_candidates
+        .first()
+        .expect("idle-host planning must produce a candidate");
+    assert_eq!(
+        static_first.llc_mode,
+        LlcLockMode::Shared,
+        "when SH and EX are both ready, service locality must not turn a valid \
+         small-bin grain into a whole-domain reservation",
+    );
+    let small_guest_cpu = static_first
+        .plan
+        .assignments
+        .iter()
+        .find_map(|&(vcpu, cpu)| (vcpu == 15).then_some(cpu))
+        .expect("one-vCPU guest LLC assignment");
+    let service_cpu = static_first.plan.service_cpu.expect("service CPU");
+    assert!(
+        host.llc_groups
+            .iter()
+            .any(|group| group.cpus.contains(&small_guest_cpu)
+                && group.cpus.contains(&service_cpu)),
+        "the service CPU must preserve the shared grain by joining the \
+         one-vCPU guest LLC",
+    );
+}
+
+#[test]
+fn preferred_snapshot_guides_strict_numa_matching_to_nonadjacent_nodes() {
+    let host = synth_host_topo(&[(vec![0], 0), (vec![1], 1), (vec![2], 2), (vec![3], 3)]);
+    let preferred = std::collections::BTreeSet::from([0usize, 2]);
+    let preferred_llcs = std::collections::BTreeSet::from([0usize, 2]);
+    let all_llcs = std::collections::BTreeSet::from([0usize, 1, 2, 3]);
+    let candidates = host
+        .topology_pinning_candidates(
+            &Topology::new(2, 2, 1, 1),
+            PinningKind::Default,
+            &[0, 1, 2, 3],
+            Some(PinningPreferences {
+                cpus: &preferred,
+                shared_llcs: &preferred_llcs,
+                exclusive_llcs: &all_llcs,
+            }),
+        )
+        .expect("strict NUMA matching must use the simultaneously ready nodes");
+    assert!(candidates.iter().any(|candidate| {
+        candidate
+            .plan
+            .assignments
+            .iter()
+            .map(|&(_, cpu)| host.cpu_to_node[&cpu])
+            .collect::<std::collections::BTreeSet<_>>()
+            == std::collections::BTreeSet::from([0usize, 2])
+    }));
+}
+
+#[test]
+fn planner_matches_nonuniform_guest_llcs_largest_demand_first() {
+    let host = synth_host_topo(&[(vec![0], 0), (vec![1, 2, 3], 0)]);
+    let mut guest = Topology::new(1, 2, 3, 1);
+    guest.llc_cores = Some(&[3, 1]);
+    let candidate = host
+        .default_pinning_candidates_for_cpus(&guest, &[0, 1, 2, 3])
+        .expect("heterogeneous bins fit")
+        .into_iter()
+        .next()
+        .unwrap();
+    let large = candidate.plan.assignments[..3]
+        .iter()
+        .map(|&(_, cpu)| cpu)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(large, std::collections::BTreeSet::from([1, 2, 3]));
+    assert_eq!(candidate.plan.assignments[3].1, 0);
+}
+
+#[test]
+fn planner_uses_strict_numa_mapping_then_global_fallback() {
+    let strict_host = synth_host_topo(&[
+        (vec![0, 1], 0),
+        (vec![2, 3], 0),
+        (vec![4, 5], 1),
+        (vec![6, 7], 1),
+    ]);
+    let guest = Topology::new(2, 2, 1, 1);
+    let strict = strict_host
+        .default_pinning_candidates_for_cpus(&guest, &(0..8).collect::<Vec<_>>())
+        .unwrap();
+    assert!(strict.iter().all(|candidate| {
+        let first = strict_host.cpu_to_node[&candidate.plan.assignments[0].1];
+        let second = strict_host.cpu_to_node[&candidate.plan.assignments[1].1];
+        first != second
+    }));
+
+    let one_node_host =
+        synth_host_topo(&[(vec![0, 1], 0), (vec![2, 3], 0), (vec![4, 5], 0)]);
+    assert!(
+        one_node_host
+            .default_pinning_candidates_for_cpus(&guest, &(0..6).collect::<Vec<_>>())
+            .is_ok(),
+        "strict NUMA failure must fall back to a global distinct-LLC mapping",
+    );
+}
+
+#[test]
+fn planner_covers_service_only_domain() {
+    let service_host = synth_host_topo(&[(vec![0], 0), (vec![1], 0)]);
+    let performance = service_host
+        .performance_pinning_candidates_for_cpus(&Topology::new(1, 1, 1, 1), &[0, 1])
+        .unwrap();
+    assert!(performance.iter().all(|candidate| {
+        candidate.plan.llc_indices.len() == 2
+            && candidate.cpu_reservations == vec![0, 1]
+            && candidate.plan.service_cpu.is_some()
+    }));
+
+}
+
+#[test]
+fn planner_reservation_matrix_is_explicit_and_canonical() {
+    let small = synth_host_topo(&[(vec![0, 1, 2, 3], 0)]);
+    let default = small
+        .default_pinning_candidates_for_cpus(&Topology::new(1, 1, 2, 1), &[0, 1, 2, 3])
+        .unwrap();
+    assert_eq!(default[0].claim().llc_mode, admission_protocol::ClaimMode::Shared);
+    assert_eq!(
+        default[0].claim().cpu_mode,
+        admission_protocol::ClaimMode::Exclusive,
+    );
+    assert_eq!(default[0].cpu_reservations.len(), 2);
+
+    let whole = small
+        .performance_pinning_candidates_for_cpus(&Topology::new(1, 1, 2, 1), &[0, 1, 2, 3])
+        .unwrap();
+    assert!(whole.iter().all(|candidate| {
+        candidate.llc_mode == LlcLockMode::Exclusive
+            && candidate.cpu_reservations == vec![0, 1, 2, 3]
+            && candidate.claim().llc_mode == admission_protocol::ClaimMode::Exclusive
+            && candidate.claim().cpu_mode == admission_protocol::ClaimMode::Exclusive
+    }));
+
+    let restricted = small
+        .performance_pinning_candidates_for_cpus(&Topology::new(1, 1, 1, 1), &[0, 1])
+        .unwrap();
+    assert!(restricted.iter().all(|candidate| {
+        candidate.cpu_reservations == vec![0, 1, 2, 3]
+    }), "whole-LLC CPU bridge must cover sibling CPUs outside this process cpuset");
+    let unknown_topology_bridge = overcommit_bridge_claim(&[], &[0, 1, 2, 3]);
+    assert!(
+        unknown_topology_bridge.conflicts_with(&restricted[0].claim()),
+        "CPU EX alone must bridge a whole-perf reservation when LLCs are unknown",
+    );
+    let known_topology_bridge = overcommit_bridge_claim(&[0], &[0, 1]);
+    assert_eq!(
+        known_topology_bridge.llc_mode,
+        admission_protocol::ClaimMode::Shared,
+    );
+    assert_eq!(
+        known_topology_bridge.cpu_mode,
+        admission_protocol::ClaimMode::Exclusive,
+    );
+
+    let monolith = synth_host_topo(&[((0..36).collect(), 0)]);
+    let grain = monolith
+        .performance_pinning_candidates_for_cpus(
+            &Topology::new(1, 1, 2, 1),
+            &(0..36).collect::<Vec<_>>(),
+        )
+        .unwrap();
+    assert!(grain.iter().all(|candidate| {
+        candidate.llc_mode == LlcLockMode::Shared
+            && candidate.cpu_reservations.len() == 3
+            && candidate.claim().cpu_mode == admission_protocol::ClaimMode::Exclusive
+    }));
+}
+
+#[test]
+fn build_and_runtime_entry_points_return_identical_claim_sets() {
+    let host = synth_host_topo(&[
+        ((0..36).collect(), 0),
+        ((36..72).collect(), 1),
+    ]);
+    let guest = Topology::new(1, 1, 2, 1);
+    let allowed = (0..72).collect::<Vec<_>>();
+    let build = host
+        .performance_pinning_candidates_for_cpus(&guest, &allowed)
+        .unwrap()
+        .into_iter()
+        .map(|candidate| candidate.claim())
+        .collect::<Vec<_>>();
+    let runtime = host
+        .performance_pinning_candidates_for_cpus(&guest, &allowed)
+        .unwrap()
+        .into_iter()
+        .map(|candidate| candidate.claim())
+        .collect::<Vec<_>>();
+    assert_eq!(build, runtime);
 }

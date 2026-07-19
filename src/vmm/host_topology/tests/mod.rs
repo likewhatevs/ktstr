@@ -138,7 +138,7 @@ impl Drop for LlcLockPrefixGuard {
 
 /// RAII guard for a per-test CPU lockfile path prefix. Mirrors
 /// [`LlcLockPrefixGuard`] for the CPU-lock side of the
-/// `acquire_resource_locks` path. See that struct's doc for the
+/// explicit two-resource-class admission path. See that struct's doc for the
 /// per-test-tempdir + panic-safe-cleanup rationale.
 struct CpuLockPrefixGuard {
     _dir: tempfile::TempDir,
@@ -162,7 +162,7 @@ impl Drop for CpuLockPrefixGuard {
 /// RAII bundle that installs BOTH [`LlcLockPrefixGuard`]
 /// AND [`CpuLockPrefixGuard`] in one call. Used by any
 /// test that hits both LLC and CPU lockfile families —
-/// `acquire_resource_locks` (LLC + per-CPU), or any
+/// topology admission (LLC + per-CPU), or any
 /// future helper that composes the two. Each test gets
 /// its own per-tempdir prefix for both lockfile families,
 /// so cross-run / cross-process collisions on

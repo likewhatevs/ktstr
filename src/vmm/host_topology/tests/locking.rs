@@ -1,6 +1,47 @@
 use super::super::*;
 use super::*;
 
+fn exact_plan_cpus(plan: &PinningPlan) -> Vec<usize> {
+    plan.assignments
+        .iter()
+        .map(|&(_, cpu)| cpu)
+        .chain(plan.service_cpu)
+        .collect()
+}
+
+fn acquire_resource_locks(
+    llc_indices: &[usize],
+    llc_mode: LlcLockMode,
+    cpus: &[usize],
+    cpu_mode: FlockMode,
+) -> anyhow::Result<LockOutcome> {
+    acquire_resource_locks_waiting_impl(
+        llc_indices,
+        llc_mode,
+        cpus,
+        cpu_mode,
+        false,
+        None,
+    )
+}
+
+fn acquire_resource_locks_waiting(
+    llc_indices: &[usize],
+    llc_mode: LlcLockMode,
+    cpus: &[usize],
+    cpu_mode: FlockMode,
+    wait: bool,
+) -> anyhow::Result<LockOutcome> {
+    acquire_resource_locks_waiting_impl(
+        llc_indices,
+        llc_mode,
+        cpus,
+        cpu_mode,
+        wait,
+        None,
+    )
+}
+
 #[test]
 fn resource_lock_shared_acquires() {
     let _tempfile_keep_alive = tempfile::Builder::new()
@@ -120,11 +161,16 @@ fn resource_lock_exclusive_success() {
         locks: Vec::new(),
     };
     let llc_indices = &[90100usize];
-    let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Exclusive).unwrap();
+    let outcome = acquire_resource_locks(
+        llc_indices,
+        LlcLockMode::Exclusive,
+        &exact_plan_cpus(&plan),
+        FlockMode::Exclusive,
+    )
+    .unwrap();
     let (llc_offset, locks) = unwrap_acquired(outcome, None);
     assert_eq!(llc_offset, 90100);
-    // Exclusive mode: only LLC locks, no per-CPU locks.
-    assert_eq!(locks.len(), 1);
+    assert_eq!(locks.len(), 3);
 }
 
 #[test]
@@ -138,7 +184,13 @@ fn resource_lock_shared_includes_cpu_locks() {
     };
     let llc_indices = &[90200usize];
 
-    let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Shared).unwrap();
+    let outcome = acquire_resource_locks(
+        llc_indices,
+        LlcLockMode::Shared,
+        &exact_plan_cpus(&plan),
+        FlockMode::Exclusive,
+    )
+    .unwrap();
     let (_, locks) = unwrap_acquired(outcome, None);
     // Shared mode: 1 LLC lock + 2 CPU locks = 3 total.
     assert_eq!(locks.len(), 3);
@@ -155,16 +207,21 @@ fn resource_lock_shared_with_service_cpu() {
     };
     let llc_indices = &[90300usize];
 
-    let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Shared).unwrap();
+    let outcome = acquire_resource_locks(
+        llc_indices,
+        LlcLockMode::Shared,
+        &exact_plan_cpus(&plan),
+        FlockMode::Exclusive,
+    )
+    .unwrap();
     let (_, locks) = unwrap_acquired(outcome, None);
     // 1 LLC lock + 1 assignment CPU lock + 1 service CPU lock = 3.
     assert_eq!(locks.len(), 3);
 }
 
 #[test]
-fn resource_lock_exclusive_skips_cpu_locks() {
+fn resource_lock_exclusive_includes_explicit_cpu_bridge() {
     let _prefixes = LockPrefixesGuard::new();
-    // Exclusive LLC mode should NOT acquire per-CPU locks.
     let plan = PinningPlan {
         assignments: vec![(0, 90400), (1, 90401)],
         service_cpu: Some(90402),
@@ -173,10 +230,65 @@ fn resource_lock_exclusive_skips_cpu_locks() {
     };
     let llc_indices = &[90400usize];
 
-    let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Exclusive).unwrap();
+    let outcome = acquire_resource_locks(
+        llc_indices,
+        LlcLockMode::Exclusive,
+        &exact_plan_cpus(&plan),
+        FlockMode::Exclusive,
+    )
+    .unwrap();
     let (_, locks) = unwrap_acquired(outcome, None);
-    // Exclusive: only 1 LLC lock, no CPU locks.
-    assert_eq!(locks.len(), 1);
+    assert_eq!(locks.len(), 4);
+}
+
+#[test]
+fn whole_perf_derived_cpu_bridge_conflicts_with_overcommit() {
+    let _prefixes = LockPrefixesGuard::new();
+    let host = HostTopology::new_for_tests(&[(vec![90410, 90411], 0)]);
+    let whole = super::super::acquire_whole_llc_locks(
+        &host,
+        &[0],
+    )
+    .unwrap();
+    let (_, locks) = unwrap_acquired(whole, Some("fresh public whole-domain acquire"));
+    assert_eq!(locks.len(), 3, "LLC EX plus both full-domain CPU EX locks");
+    let bridge = acquire_overcommit_bridge(&[], &[90411], false, None).unwrap();
+    assert!(
+        matches!(bridge, LockOutcome::Unavailable(_)),
+        "topology-unavailable overcommit must still see whole-perf CPU EX",
+    );
+    drop(locks);
+}
+
+#[test]
+fn whole_llc_public_acquire_rejects_an_empty_domain() {
+    let host = HostTopology::new_for_tests(&[(vec![90415], 0)]);
+    let error = super::super::acquire_whole_llc_locks(&host, &[])
+        .expect_err("an empty whole-domain acquire must not become a no-op claim");
+    assert!(error.to_string().contains("at least one LLC"));
+}
+
+#[test]
+fn waiting_overcommit_bridge_acquires_after_whole_perf_releases() {
+    let _prefixes = LockPrefixesGuard::new();
+    let whole = try_acquire_resources(
+        &[90420],
+        LlcLockMode::Exclusive,
+        &[90420],
+        FlockMode::Exclusive,
+    )
+    .unwrap();
+    let locks = match whole {
+        TryAcquireAll::Acquired(locks) => locks,
+        TryAcquireAll::Contended { reason, .. } => panic!("fresh whole claim contended: {reason}"),
+    };
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(locks);
+    });
+    let bridge = acquire_overcommit_bridge(&[90420], &[90420], true, None).unwrap();
+    assert!(matches!(bridge, LockOutcome::Acquired { .. }));
+    releaser.join().unwrap();
 }
 
 #[test]
@@ -196,7 +308,13 @@ fn resource_lock_contention_returns_unavailable() {
         .unwrap()
         .unwrap();
 
-    let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Exclusive).unwrap();
+    let outcome = acquire_resource_locks(
+        llc_indices,
+        LlcLockMode::Exclusive,
+        &exact_plan_cpus(&plan),
+        FlockMode::Exclusive,
+    )
+    .unwrap();
     let reason = expect_unavailable(outcome, Some("while lock is held"));
     assert!(
         reason.contains("90500"),
@@ -222,7 +340,13 @@ fn resource_lock_all_or_nothing() {
 
     let holder = try_flock(&llc_601, FlockMode::Exclusive).unwrap().unwrap();
 
-    let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Exclusive).unwrap();
+    let outcome = acquire_resource_locks(
+        llc_indices,
+        LlcLockMode::Exclusive,
+        &exact_plan_cpus(&plan),
+        FlockMode::Exclusive,
+    )
+    .unwrap();
     assert!(
         matches!(outcome, LockOutcome::Unavailable(_)),
         "should fail when second LLC is busy",
@@ -253,7 +377,13 @@ fn resource_lock_shared_cpu_contention() {
 
     let holder = try_flock(&cpu_path, FlockMode::Exclusive).unwrap().unwrap();
 
-    let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Shared).unwrap();
+    let outcome = acquire_resource_locks(
+        llc_indices,
+        LlcLockMode::Shared,
+        &exact_plan_cpus(&plan),
+        FlockMode::Exclusive,
+    )
+    .unwrap();
     assert!(
         matches!(outcome, LockOutcome::Unavailable(_)),
         "should fail when CPU lock is held",
@@ -278,7 +408,13 @@ fn resource_lock_empty_llc_indices() {
         llc_indices: vec![],
         locks: Vec::new(),
     };
-    let outcome = acquire_resource_locks(&plan, &[], LlcLockMode::Exclusive).unwrap();
+    let outcome = acquire_resource_locks(
+        &[],
+        LlcLockMode::Exclusive,
+        &[],
+        FlockMode::Exclusive,
+    )
+    .unwrap();
     let (llc_offset, locks) = unwrap_acquired(outcome, None);
     assert_eq!(llc_offset, 0);
     assert!(locks.is_empty());
@@ -303,7 +439,13 @@ fn resource_lock_service_cpu_contention() {
     // Hold the service CPU lock.
     let holder = try_flock(&cpu_901, FlockMode::Exclusive).unwrap().unwrap();
 
-    let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Shared).unwrap();
+    let outcome = acquire_resource_locks(
+        llc_indices,
+        LlcLockMode::Shared,
+        &exact_plan_cpus(&plan),
+        FlockMode::Exclusive,
+    )
+    .unwrap();
     let reason = expect_unavailable(outcome, Some("when service CPU is held"));
     // The canonical-order acquire reports the busy LOCKFILE PATH
     // (service CPU and assignment CPUs share the ktstr-cpu-* family);
@@ -620,8 +762,14 @@ fn resource_lock_wait_acquires_after_peer_release() {
         drop(holder);
     });
     let start = std::time::Instant::now();
-    let outcome =
-        acquire_resource_locks_waiting(&plan, &[90700usize], LlcLockMode::Exclusive, true).unwrap();
+    let outcome = acquire_resource_locks_waiting(
+        &[90700usize],
+        LlcLockMode::Exclusive,
+        &exact_plan_cpus(&plan),
+        FlockMode::Exclusive,
+        true,
+    )
+    .unwrap();
     let elapsed = start.elapsed();
     let (_, locks) = unwrap_acquired(outcome, Some("after the peer's timed release"));
     assert_eq!(locks.len(), 1);
@@ -704,8 +852,20 @@ fn perf_grain_two_disjoint_cells_coexist_on_huge_llc() {
 
     // AFTER: two disjoint grain cells both reserve simultaneously —
     // shared LLC lock + disjoint per-CPU exclusive locks.
-    let a = acquire_resource_locks(&block0, &block0.llc_indices, LlcLockMode::Shared).unwrap();
-    let b = acquire_resource_locks(&block1, &block1.llc_indices, LlcLockMode::Shared).unwrap();
+    let a = acquire_resource_locks(
+        &block0.llc_indices,
+        LlcLockMode::Shared,
+        &exact_plan_cpus(&block0),
+        FlockMode::Exclusive,
+    )
+    .unwrap();
+    let b = acquire_resource_locks(
+        &block1.llc_indices,
+        LlcLockMode::Shared,
+        &exact_plan_cpus(&block1),
+        FlockMode::Exclusive,
+    )
+    .unwrap();
     let (a_ok, b_ok) = (
         matches!(a, LockOutcome::Acquired { .. }),
         matches!(b, LockOutcome::Acquired { .. }),
@@ -724,9 +884,16 @@ fn perf_grain_two_disjoint_cells_coexist_on_huge_llc() {
     drop((a, b));
     let _fresh = LockPrefixesGuard::new();
     let whole = host.compute_pinning(&topo, true, 0).unwrap();
-    let first = acquire_resource_locks(&whole, &whole.llc_indices, LlcLockMode::Exclusive).unwrap();
-    let second =
-        acquire_resource_locks(&whole, &whole.llc_indices, LlcLockMode::Exclusive).unwrap();
+    let first = super::super::acquire_whole_llc_locks(
+        &host,
+        &whole.llc_indices,
+    )
+    .unwrap();
+    let second = super::super::acquire_whole_llc_locks(
+        &host,
+        &whole.llc_indices,
+    )
+    .unwrap();
     assert!(
         matches!(first, LockOutcome::Acquired { .. }),
         "first whole-LLC exclusive reservation acquires",

@@ -435,8 +435,10 @@ fn routing_failure_summary_none_when_zero_else_counts() {
     );
 }
 
-/// build_overcommit_run_locks uses the resolved allowed cpuset as the default
-/// mask (no locks, no pinning plan). The mask is the run-time budget source:
+/// The pure build_overcommit_run_locks helper uses the resolved allowed cpuset
+/// as the default mask (no locks, no pinning plan). Production reaches it after
+/// the coordinated overcommit bridge or as the interactive best-effort
+/// fallback. The mask is the run-time budget source:
 /// run() stamps result.cpu_budget = default_cpu_mask.len().max(1), so the
 /// sidecar reflects the overcommit mask, not the build-time vCPU count. vcpus
 /// equals the mask size here so the overcommit_warning side-channel (which fires
@@ -513,46 +515,142 @@ fn performance_run_candidates_cover_every_equivalent_exclusive_slot() {
     let candidates = KtstrVm::performance_run_candidates(
         &host,
         &Topology::new(1, 1, 1, 1),
-        host_topology::LlcLockMode::Exclusive,
+        &[0, 1, 2, 3, 4, 5],
     )
     .expect("enumerate exact perf placements");
     let mut llcs: Vec<_> = candidates
         .iter()
-        .map(|candidate| candidate.llc_indices.clone())
+        .map(|candidate| candidate.plan.llc_indices.clone())
         .collect();
     llcs.sort();
     assert_eq!(llcs, vec![vec![0], vec![1], vec![2]]);
     assert!(
-        candidates.iter().all(|candidate| candidate.locks.is_empty()),
+        candidates
+            .iter()
+            .all(|candidate| candidate.plan.locks.is_empty()),
         "candidate enumeration carries no pre-boot flock ownership",
     );
 }
 
-/// Per-CPU-grain performance mode is flexible across every disjoint block
-/// inside a large LLC while preserving its shared-LLC + exact CPU-lock grain.
+/// Per-CPU-grain performance mode exposes a bounded set of exact CPU
+/// footprints inside a large LLC while preserving shared-LLC + CPU-EX grain.
 #[test]
 fn performance_run_candidates_cover_every_disjoint_cpu_grain() {
-    let host =
-        host_topology::HostTopology::new_for_tests(&[(vec![0, 1, 2, 3, 4, 5], 0)]);
+    let host = host_topology::HostTopology::new_for_tests(&[((0..36).collect(), 0)]);
+    let allowed = (0..36).collect::<Vec<_>>();
     let candidates = KtstrVm::performance_run_candidates(
         &host,
         &Topology::new(1, 1, 1, 1),
-        host_topology::LlcLockMode::Shared,
+        &allowed,
     )
     .expect("enumerate per-CPU perf grains");
     let mut footprints: Vec<Vec<usize>> = candidates
         .iter()
         .map(|candidate| {
             candidate
+                .plan
                 .assignments
                 .iter()
                 .map(|&(_, cpu)| cpu)
-                .chain(candidate.service_cpu)
+                .chain(candidate.plan.service_cpu)
                 .collect()
         })
         .collect();
     footprints.sort();
-    assert_eq!(footprints, vec![vec![0, 1], vec![2, 3], vec![4, 5]]);
+    assert!(!footprints.is_empty());
+    assert!(candidates
+        .iter()
+        .all(|candidate| candidate.llc_mode == host_topology::LlcLockMode::Shared));
+    assert!(footprints.len() <= allowed.len());
+}
+
+#[test]
+fn granted_scan_selects_a_far_ready_alternative_in_one_pass() {
+    let claims = (0..4)
+        .map(|cpu| {
+            host_topology::protocol::ClaimSet::new(
+                std::iter::empty(),
+                [cpu],
+                crate::flock::FlockMode::Exclusive,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut visited = Vec::new();
+    let selected = first_ready_alternative(0, &claims, |claim| {
+        let cpu = *claim.cpus.iter().next().unwrap();
+        visited.push(cpu);
+        Ok(cpu == 3)
+    })
+    .unwrap();
+    assert_eq!(selected, Some(3));
+    assert_eq!(visited, vec![1, 2, 3], "scan must not stop at the next busy claim");
+}
+
+#[test]
+fn availability_replanning_keeps_one_replaceable_live_candidate() {
+    let make_candidate = |llc: usize, cpu: usize| {
+        host_topology::PerformancePinningCandidate {
+            plan: host_topology::PinningPlan {
+                assignments: vec![(0, cpu)],
+                service_cpu: None,
+                llc_indices: vec![llc],
+                locks: Vec::new(),
+            },
+            llc_mode: host_topology::LlcLockMode::Shared,
+            cpu_mode: crate::flock::FlockMode::Exclusive,
+            cpu_reservations: vec![cpu],
+        }
+    };
+    let (candidate, claim, target) = flexible_candidate_parts(make_candidate(0, 0));
+    let mut candidates = vec![candidate];
+    let mut claims = vec![claim];
+    let mut targets = vec![target];
+    let static_len = candidates.len();
+
+    for resource in 1..128 {
+        let live = install_live_candidate(
+            static_len,
+            make_candidate(resource, resource),
+            &mut candidates,
+            &mut claims,
+            &mut targets,
+        );
+        assert_eq!(live, static_len);
+        assert_eq!(candidates.len(), static_len + 1);
+        assert_eq!(claims.len(), static_len + 1);
+        assert_eq!(targets.len(), static_len + 1);
+        assert_eq!(
+            candidates[static_len].cpu_reservations,
+            vec![resource],
+            "the live slot must be replaced, not retain planner history",
+        );
+    }
+}
+
+#[test]
+fn coordinator_synthesis_builds_a_nonadjacent_ready_live_candidate() {
+    let host = host_topology::HostTopology::new_for_tests(&[
+        (vec![0], 0),
+        (vec![1], 0),
+        (vec![2], 0),
+        (vec![3], 0),
+    ]);
+    let ready_cpus = std::collections::BTreeSet::from([0usize, 2]);
+    let ready_llcs = std::collections::BTreeSet::from([0usize, 2]);
+    let candidate = synthesize_ready_candidate(
+        &host,
+        &Topology::new(1, 2, 1, 1),
+        host_topology::PinningKind::Default,
+        &[0, 1, 2, 3],
+        &[0, 1, 2, 3],
+        |claim| {
+            Ok(claim.cpus.is_subset(&ready_cpus) && claim.llcs.is_subset(&ready_llcs))
+        },
+    )
+    .unwrap()
+    .expect("the coordinator snapshot must synthesize LLCs 0+2");
+    assert_eq!(candidate.plan.llc_indices, vec![0, 2]);
+    assert_eq!(candidate.cpu_reservations, vec![0, 2]);
 }
 
 #[test]

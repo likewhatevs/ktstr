@@ -1162,18 +1162,13 @@ fn small_shared_cell_proceeds_while_coordinator_hungers() {
     let coordinator_thread = std::thread::spawn(move || {
         LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = llc_prefix);
         CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = cpu_prefix);
-        let plan = PinningPlan {
-            assignments: vec![(0, 50)],
-            service_cpu: None,
-            llc_indices: vec![10],
-            locks: Vec::new(),
-        };
-        let result = acquire_resource_locks_waiting_interruptible(
-            &plan,
+        let result = acquire_resource_locks_waiting_impl(
             &[10usize],
             LlcLockMode::Exclusive,
+            &[50],
+            FlockMode::Exclusive,
             true,
-            &worker_cancelled,
+            Some(&worker_cancelled),
         );
         let _ = coordinator_tx.send(result);
     });
@@ -1216,8 +1211,15 @@ fn small_shared_cell_proceeds_while_coordinator_hungers() {
         locks: Vec::new(),
     };
     let start = std::time::Instant::now();
-    let outcome =
-        acquire_resource_locks(&plan_small, &plan_small.llc_indices, LlcLockMode::Shared).unwrap();
+    let outcome = acquire_resource_locks_waiting_impl(
+        &plan_small.llc_indices,
+        LlcLockMode::Shared,
+        &[51],
+        FlockMode::Exclusive,
+        false,
+        None,
+    )
+    .unwrap();
     let elapsed = start.elapsed();
     let (_, locks) = unwrap_acquired(
         outcome,

@@ -181,6 +181,9 @@ pub(super) enum State {
 #[derive(Debug)]
 pub(super) struct ScheduleSnapshot {
     pub watch: ClaimSet,
+    pub candidate_watch: ClaimSet,
+    pub predecessors: AggregateSnapshot,
+    pub availability: AvailabilitySnapshot,
     pub should_step: bool,
     pub observation: Option<ObservationRequest>,
     pub liveness_due_in: Duration,
@@ -276,6 +279,7 @@ pub(super) enum FenceResult<T> {
     Ran { value: T, watched: bool },
 }
 
+#[derive(Debug, Clone)]
 pub(super) struct AggregateSnapshot {
     bits: usize,
     cpu_any: Vec<u64>,
@@ -308,6 +312,7 @@ impl AggregateSnapshot {
     }
 }
 
+#[derive(Debug, Clone)]
 pub(super) struct AvailabilitySnapshot {
     bits: usize,
     cpu_known: Vec<u64>,
@@ -1069,8 +1074,13 @@ impl Ticket {
         } else {
             table.aggregate_watch()?
         };
+        let predecessors = table.cached_prefix(self.slot)?.1;
+        let availability = table.availability_snapshot();
         Ok(ScheduleSnapshot {
             watch,
+            candidate_watch: record.watch,
+            predecessors,
+            availability,
             should_step: false,
             observation: table.observation_request()?,
             liveness_due_in,
@@ -1112,12 +1122,13 @@ impl Ticket {
                 self.slot
             );
         }
-        let record = &chunk_map[range];
-        if read_u64(record, R_TICKET) != self.ticket
-            || read_u32(record, R_STATE) != STATE_COORDINATOR
+        let record_bytes = &chunk_map[range];
+        if read_u64(record_bytes, R_TICKET) != self.ticket
+            || read_u32(record_bytes, R_STATE) != STATE_COORDINATOR
         {
             return Ok(None);
         }
+        let record = decode_record(record_bytes, layout, self.slot)?;
 
         let watch_llcs = decode_header_bitset(&header, layout, B_WATCH_LLCS);
         let watch_cpus = decode_header_bitset(&header, layout, B_WATCH_CPUS);
@@ -1139,6 +1150,43 @@ impl Ticket {
                 ClaimMode::Exclusive
             },
         );
+        let record_words = |which| {
+            (0..layout.words)
+                .map(|word| {
+                    read_u64(
+                        record_bytes,
+                        record_bitset_offset(layout, which)
+                            + word * std::mem::size_of::<u64>(),
+                    )
+                })
+                .collect()
+        };
+        let predecessors = AggregateSnapshot {
+            bits: layout.bits,
+            cpu_any: record_words(RB_PREFIX_CPU_ANY),
+            cpu_exclusive: record_words(RB_PREFIX_CPU_EXCLUSIVE),
+            llc_any: record_words(RB_PREFIX_LLC_ANY),
+            llc_exclusive: record_words(RB_PREFIX_LLC_EXCLUSIVE),
+        };
+        let header_words = |which| {
+            (0..layout.words)
+                .map(|word| {
+                    read_u64(
+                        &header,
+                        layout.bitset_offset(which) + word * std::mem::size_of::<u64>(),
+                    )
+                })
+                .collect()
+        };
+        let availability = AvailabilitySnapshot {
+            bits: layout.bits,
+            cpu_known: header_words(B_CPU_KNOWN),
+            cpu_sh_available: header_words(B_CPU_SH_AVAILABLE),
+            cpu_ex_available: header_words(B_CPU_EX_AVAILABLE),
+            llc_known: header_words(B_LLC_KNOWN),
+            llc_sh_available: header_words(B_LLC_SH_AVAILABLE),
+            llc_ex_available: header_words(B_LLC_EX_AVAILABLE),
+        };
         let watched_cpus = closed_cpus.intersection(&watch.cpus).copied();
         let watched_llcs = closed_llcs.intersection(&watch.llcs).copied();
         let cpus_free = watched_cpus.into_iter().all(|cpu| {
@@ -1159,6 +1207,12 @@ impl Ticket {
         check_cancelled(cancelled)?;
         Ok(Some(ScheduleSnapshot {
             watch,
+            candidate_watch: record.watch,
+            predecessors,
+            availability,
+            // The registry already knew these resources were free. Their
+            // writable closes cannot improve the coordinator's last planning
+            // snapshot and are discarded without another planner pass.
             should_step: false,
             observation: None,
             liveness_due_in: liveness_due_in_from_header(
@@ -1202,8 +1256,13 @@ impl Ticket {
         } else {
             table.aggregate_watch()?
         };
+        let predecessors = table.cached_prefix(self.slot)?.1;
+        let availability = table.availability_snapshot();
         Ok(ScheduleSnapshot {
             watch,
+            candidate_watch: record.watch,
+            predecessors,
+            availability,
             should_step: watch_serial_after > watch_serial_before,
             observation: table.observation_request()?,
             liveness_due_in: table.liveness_due_in()?,
