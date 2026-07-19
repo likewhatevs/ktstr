@@ -809,8 +809,11 @@ fn invoke_nextest(
 ///
 /// Injection happens after the filter/profile/user argv are assembled so an
 /// inner `--` is handled uniformly, and so a user-supplied ktstr tool config
-/// can suppress the built-in one. Keeping this helper injectable gives the
-/// replay route a command-shape regression test without touching the cache.
+/// can suppress the built-in one. The shared command normalizer then removes
+/// valid user run-slot limits and installs ktstr's effectively-unbounded
+/// admission count, keeping replay on the same single-scheduler path as every
+/// other nextest frontend. Keeping this helper injectable gives the replay
+/// route a command-shape regression test without touching the cache.
 fn build_injected_nextest_run_args_with(
     filter_expr: &str,
     nextest_profile: Option<&str>,
@@ -832,7 +835,7 @@ fn build_injected_nextest_run_args_with(
     // `--cargo-profile`, …) verbatim so the replay re-run builds
     // identically to the original suite. No `--` separator is required.
     nextest_args.extend_from_slice(args);
-    inject(nextest_args)
+    inject(nextest_args).map(crate::run_cargo::normalize_nextest_command_admission)
 }
 
 #[cfg(test)]
@@ -895,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_exec_injects_tool_config_before_test_binary_args() {
+    fn replay_exec_injects_tool_config_and_normalizes_admission_before_test_binary_args() {
         let failed_names = BTreeSet::from(["failing"]);
         let filter_expr = build_nextest_filter(&failed_names);
         let got = build_injected_nextest_run_args_with(
@@ -924,9 +927,8 @@ mod tests {
                 filter_expr.as_str(),
                 "--profile",
                 "ci",
-                "-j",
-                "77",
                 "--tool-config-file=ktstr:/tmp/ktstr-nextest.toml",
+                "--test-threads=1000000",
                 "--",
                 "--nocapture",
             ]
