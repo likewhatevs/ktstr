@@ -2946,7 +2946,7 @@ mod tests {
         assert!(
             wait_until(Duration::from_secs(2), || {
                 // SAFETY: signal zero only probes process existence.
-                unsafe { libc::kill(pid, 0) } != 0
+                (unsafe { libc::kill(pid, 0) }) != 0
             }),
             "observer panic left its child alive",
         );
@@ -2982,7 +2982,7 @@ mod tests {
         assert!(
             wait_until(Duration::from_secs(2), || {
                 // SAFETY: signal zero only probes process existence.
-                unsafe { libc::kill(pid, 0) } != 0
+                (unsafe { libc::kill(pid, 0) }) != 0
             }),
             "direct observer panic detached its child",
         );
@@ -3017,7 +3017,7 @@ mod tests {
         assert!(
             wait_until(Duration::from_secs(2), || {
                 // SAFETY: signal zero only probes process existence.
-                unsafe { libc::kill(pid, 0) } != 0
+                (unsafe { libc::kill(pid, 0) }) != 0
             }),
             "direct stderr observer panic detached its child",
         );
@@ -3110,7 +3110,7 @@ mod tests {
         assert!(
             wait_until(Duration::from_secs(2), || {
                 // SAFETY: signal zero only probes process existence.
-                unsafe { libc::kill(pid, 0) } != 0
+                (unsafe { libc::kill(pid, 0) }) != 0
             }),
             "handoff panic left its pre-publication child alive",
         );
@@ -3231,7 +3231,7 @@ mod tests {
         assert!(
             wait_until(Duration::from_secs(2), || {
                 // SAFETY: signal zero only probes process existence.
-                unsafe { libc::kill(pid, 0) } != 0
+                (unsafe { libc::kill(pid, 0) }) != 0
             }),
             "service-budget teardown reaps the residual child",
         );
@@ -3379,7 +3379,7 @@ mod tests {
         assert!(
             wait_until(Duration::from_secs(3), || {
                 // SAFETY: signal zero only probes process existence.
-                unsafe { libc::kill(descendant, 0) } != 0
+                (unsafe { libc::kill(descendant, 0) }) != 0
             }),
             "observed runner left no same-group descendant",
         );

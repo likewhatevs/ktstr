@@ -329,7 +329,10 @@ fn capture_with_single_tgid_does_not_build_pool() {
         |_| panic!("single-TGID capture must not build a Rayon pool"),
     );
     assert_eq!(snap.threads.len(), 1);
-    assert_eq!(snap.threads[0].tgid, tgid);
+    assert_eq!(
+        snap.threads[0].tgid,
+        u32::try_from(tgid).expect("synthetic tgid is positive"),
+    );
 }
 
 /// Exercises the cache-lookup and insert code path in the

@@ -1,5 +1,6 @@
 use super::super::*;
 use super::*;
+use super::super::protocol as admission_protocol;
 
 /// `CpuCap::new(1)` succeeds — minimum legal cap.
 #[test]
@@ -1397,14 +1398,20 @@ fn registered_claim_fast_fails_without_acquire_or_diagnostic_enrichment() {
     let _allowed = AllowedCpusGuard::new(vec![93750]);
     let topo = synth_host_topo(&[(vec![93750], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(1, 1);
-    let claim = protocol::ClaimSet::new([0usize], std::iter::empty(), FlockMode::Exclusive);
-    let coordinator = match protocol::register_ticket_or_acquire(claim.clone(), claim, None, |_| {
-        Ok::<Option<()>, anyhow::Error>(None)
-    })
+    let claim =
+        admission_protocol::ClaimSet::new([0usize], std::iter::empty(), FlockMode::Exclusive);
+    let coordinator = match admission_protocol::register_ticket_or_acquire(
+        claim.clone(),
+        claim,
+        None,
+        |_| Ok::<Option<()>, anyhow::Error>(None),
+    )
     .expect("register exclusive LLC claim")
     {
-        protocol::TicketWork::Coordinator(coordinator) => coordinator,
-        protocol::TicketWork::Acquired(()) => panic!("fresh registry must elect a coordinator"),
+        admission_protocol::TicketWork::Coordinator(coordinator) => coordinator,
+        admission_protocol::TicketWork::Acquired(()) => {
+            panic!("fresh registry must elect a coordinator")
+        }
     };
     let attempts = std::cell::Cell::new(0usize);
     let enrichment_before =
@@ -1457,7 +1464,7 @@ fn waiting_handoff_publishes_ticket_before_releasing_old_locks() {
         true,
         None,
         Some(|| {
-            let records = protocol::ticket_registry_snapshot_for_tests()
+            let records = admission_protocol::ticket_registry_snapshot_for_tests()
                 .expect("handoff hook must be able to read the published ticket");
             assert_eq!(
                 records.len(),
@@ -1517,7 +1524,9 @@ fn waiting_handoff_releases_inherited_locks_on_acquire_error() {
             handed_off_in_hook.set(true);
             drop(inherited);
         }),
-        |_, _| anyhow::bail!("injected runtime replan failure"),
+        |_, _| -> anyhow::Result<Option<Vec<std::os::fd::OwnedFd>>> {
+            anyhow::bail!("injected runtime replan failure")
+        },
     )
     .expect_err("injected acquisition error must propagate");
     assert!(

@@ -219,7 +219,8 @@ fn coordinator_watch_classifies_close_events_by_watched_directory() {
 #[test]
 fn uncontended_fast_fence_does_not_create_registry_metadata() {
     let _prefixes = LockPrefixesGuard::new();
-    let protocol_dir = std::path::Path::new(&cpu_lock_path(1))
+    let cpu_path = cpu_lock_path(1);
+    let protocol_dir = std::path::Path::new(&cpu_path)
         .parent()
         .expect("resource lock parent");
     let registry_dir = protocol_dir.join("ktstr-acquire-registry-v4");
@@ -622,35 +623,51 @@ fn ordinary_state_reads_overlap_registry_shared_readers() {
     use std::sync::mpsc;
 
     let _prefixes = LockPrefixesGuard::new();
-    let claim = protocol::ClaimSet::new(
-        std::iter::empty(),
-        [1usize],
-        crate::flock::FlockMode::Exclusive,
-    );
-    let coordinator = match protocol::register_ticket_or_acquire(claim.clone(), claim, None, |_| {
-        Ok::<Option<()>, anyhow::Error>(None)
-    })
-    .expect("register coordinator")
-    {
-        protocol::TicketWork::Coordinator(coordinator) => coordinator,
-        protocol::TicketWork::Acquired(()) => panic!("fresh registry must elect a coordinator"),
-    };
     let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
     let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
-    let held_reader =
-        protocol::hold_registry_shared_for_tests().expect("hold first registry SH reader");
-    let (tx, rx) = mpsc::sync_channel(1);
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (go_tx, go_rx) = mpsc::sync_channel(1);
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
     let reader = std::thread::spawn(move || {
         LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
         CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
+        let claim = protocol::ClaimSet::new(
+            std::iter::empty(),
+            [1usize],
+            crate::flock::FlockMode::Exclusive,
+        );
+        let coordinator =
+            match protocol::register_ticket_or_acquire(claim.clone(), claim, None, |_| {
+                Ok::<Option<()>, anyhow::Error>(None)
+            })
+            .expect("register coordinator")
+            {
+                protocol::TicketWork::Coordinator(coordinator) => coordinator,
+                protocol::TicketWork::Acquired(()) => {
+                    panic!("fresh registry must elect a coordinator")
+                }
+            };
+        ready_tx
+            .send(())
+            .expect("report coordinator registration");
+        go_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("receive overlapping-read start");
         let before = protocol::shared_state_read_count_for_tests();
         let result = coordinator.read_state_shared_for_tests();
         let delta = protocol::shared_state_read_count_for_tests() - before;
-        tx.send((result, delta))
+        result_tx
+            .send((result, delta))
             .expect("report overlapping state read");
         drop(coordinator);
     });
-    let (result, delta) = rx
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("coordinator registration must complete");
+    let held_reader =
+        protocol::hold_registry_shared_for_tests().expect("hold first registry SH reader");
+    go_tx.send(()).expect("start overlapping state read");
+    let (result, delta) = result_rx
         .recv_timeout(std::time::Duration::from_secs(1))
         .expect("a second SH state read must not serialize behind the first");
     result.expect("read coordinator state through readonly mapping");
@@ -2174,8 +2191,10 @@ fn wait_for_ticket_pids(expected: &[u32]) {
         for &pid in expected {
             let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
                 .ok()
-                .and_then(|stat| stat.rsplit_once(')').map(|(_, tail)| tail.trim_start()))
-                .and_then(|tail| tail.as_bytes().first().copied());
+                .and_then(|stat| {
+                    stat.rsplit_once(')')
+                        .and_then(|(_, tail)| tail.trim_start().as_bytes().first().copied())
+                });
             if state.is_none_or(|state| matches!(state, b'Z' | b'X')) {
                 let diagnostics = ticket_helper_diagnostics(&[pid]);
                 panic!(

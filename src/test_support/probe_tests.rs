@@ -27,6 +27,7 @@ fn repro_vm_builder_adds_probe_drain_grace_to_deadline() {
         &entry,
         Path::new("/dummy/kernel"),
         None,
+        &[],
         Path::new("/dummy/ktstr"),
         None,
         &[],
