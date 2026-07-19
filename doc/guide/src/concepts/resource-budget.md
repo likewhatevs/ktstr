@@ -28,8 +28,8 @@ switches: `performance_mode` on the test or builder, and
 
 | Mode | Selected by | LLC lockfiles | Per-CPU lockfiles | Enforcement |
 |---|---|---|---|---|
-| Performance mode | `performance_mode = true` | exclusive (`LOCK_EX`), one per virtual LLC — **or** shared (`LOCK_SH`) on a huge LLC (see below) | none — **or** exclusive (`LOCK_EX`) per pinned CPU on a huge LLC | vCPU pinning, RT scheduling, hugepages, NUMA mbind |
-| Budgeted (no-perf-mode) | `--no-perf-mode` / `KTSTR_NO_PERF_MODE` | shared (`LOCK_SH`) on the planned LLC set | none — the cgroup cpuset is the enforcement layer | cgroup v2 cpuset sandbox + soft affinity mask |
+| Performance mode | `performance_mode = true` | exclusive (`LOCK_EX`), one per virtual LLC — **or** shared (`LOCK_SH`) on a huge LLC (see below) | exclusive (`LOCK_EX`) on every CPU covered by a whole-LLC claim — or on the pinned CPUs plus service CPU at per-CPU grain | vCPU pinning, RT scheduling, hugepages, NUMA mbind |
+| Budgeted (no-perf-mode) | `--no-perf-mode` / `KTSTR_NO_PERF_MODE` | shared (`LOCK_SH`) on the planned LLC set | shared (`LOCK_SH`) on the exact budgeted CPU pool; the cgroup cpuset enforces placement | cgroup v2 cpuset sandbox + soft affinity mask |
 | Default | neither | shared (`LOCK_SH`) on the 1:1 plan's LLCs | exclusive (`LOCK_EX`), one per assigned host CPU | none — reservation only |
 
 ### Performance mode on a huge LLC: per-CPU grain
@@ -82,16 +82,20 @@ shared holders coexist with each other, an exclusive holder blocks
 every shared acquirer and vice versa. So any number of budgeted and
 default runs share LLCs among themselves, a perf-mode run waits for
 all of them to release, and while a perf-mode run holds its LLCs
-nobody else touches those CPUs. Default runs additionally exclude
-each other per CPU, so two default VMs never time-slice the same
-host CPU. Kernel builds take the budgeted path, and so do
+nobody else touches those CPUs. CPU claims apply the same matrix:
+budgeted runs publish exact shared CPU footprints, while default and
+performance runs publish exclusive footprints. Thus budgeted peers may
+share deliberately, but they cannot be placed underneath an exclusive
+default/performance owner. Default runs exclude each other per CPU, so
+two default VMs never time-slice the same host CPU. Kernel builds take
+the budgeted path, and so do
 `cargo ktstr test` / `cargo ktstr verifier` harness compiles: each
 dispatcher runs a reserved `cargo … --no-run` warm-up under the same
 shared LLC locks and cpuset sandbox, releasing both before any cell
 starts — a harness build on one runner never invades a peer runner's
 exclusive reservation, and never contends with its own cells' locks.
 
-<div class="kt-figure"><svg width="700" height="272" viewBox="0 0 700 272" role="img" aria-label="Host LLC lock coordination: a performance-mode run holds whole LLCs under exclusive flock (LOCK_EX) while budgeted no-perf-mode runs share the remaining LLCs under shared flock (LOCK_SH). An exclusive holder blocks every shared acquirer and vice versa; shared holders coexist. Below, when the process cpuset is narrower than the guest vCPU count the CPU budget collapses to it and the host time-slices the vCPU threads.">
+<div class="kt-figure"><svg width="700" height="272" viewBox="0 0 700 272" role="img" aria-label="Host resource coordination: a performance-mode run holds whole LLCs and their CPUs under exclusive claims while budgeted no-perf-mode runs share the remaining LLCs and exact CPU pools under shared claims. An exclusive holder blocks every overlapping shared acquirer and vice versa; shared holders coexist. Below, when the process cpuset is narrower than the guest vCPU count the CPU budget collapses to it and the host time-slices the guest's vCPU threads within that admitted shared pool.">
   <defs><marker id="kt-arr8" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg)"/></marker></defs>
   <text x="24" y="20" font-size="12.5" font-weight="700" fill="var(--kt-accent)">host — one flock per LLC</text>
   <rect x="25" y="30" width="310" height="30" rx="8" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.5"/>
@@ -148,8 +152,11 @@ makes this work across disjoint invocations sharing one
   set non-blocking, all-or-nothing, in canonical lock order — cells
   satisfiable *right now* never register, and no fast-path partial ever
   persists (everything is released on any bounce).
-- **The v4 registry.** A bounced acquirer publishes one monotonic
-  fixed-size ticket containing its exact CPU/LLC claim. Ordinary
+- **The v5 registry.** A bounced acquirer publishes one monotonic
+  fixed-size ticket containing its exact CPU/LLC claim. Each record also
+  caches four predecessor-prefix bitsets (CPU-any, CPU-exclusive,
+  LLC-any, LLC-exclusive), published epoch-last, so a waiter can test a
+  complete alternative without walking every earlier ticket. Ordinary
   tickets sleep on targeted shared futex words; only one elected
   coordinator owns exact resource-release watches. Acquisition runs
   *before* VM setup, so a
@@ -163,13 +170,15 @@ makes this work across disjoint invocations sharing one
 - **The coordinator license.** The elected coordinator is the only
   agent allowed to retain a *partial* lock set while waiting for more.
   One incremental acquirer cannot form a deadlock cycle.
-- **Re-plan on every wake.** The coordinator sleeps on filtered
+- **Ready-alternative re-plan.** The coordinator sleeps on filtered
   inotify events for resource releases and explicit registry
-  notifications, then re-plans
-  against *live* holder state — plans are never cached across waits,
-  so a freed resource that satisfies a different plan than the one
-  that was busy is taken immediately. Partials the fresh plan still
-  needs are kept; only abandoned ones release.
+  notifications. A granted flexible ticket evaluates its bounded,
+  deterministic alternatives against its cached predecessor prefix and
+  the current aggregate availability snapshot. If another complete
+  candidate is ready, it publishes that exact claim once for the next
+  coordinator pass; it does not blindly rotate through busy plans or
+  wake itself for a claim it just abandoned. Partials the selected plan
+  still needs are kept; only abandoned ones release.
 - **Exact claim fencing.** A shared registry fence spans the aggregate
   claim check and the real all-or-nothing flock probe. No ticket can
   publish in that gap, and a fast path cannot snipe an earlier exact
@@ -278,24 +287,29 @@ Budgeted acquisition runs three phases:
 
 1. **Discover** — stat every LLC lockfile and read `/proc/locks` once
    to snapshot current holders. No locks taken.
-2. **Plan** — rank LLCs: prefer LLCs that already have holders
-   (consolidation packs shared runs together), seed on the
-   best-ranked LLC's NUMA node, and greedily fill that node before
-   spilling to nearest-by-distance neighbors. Accumulate LLCs until
-   their allowed CPUs cover the budget.
-3. **Acquire** — non-blocking shared locks on every selected LLC,
-   all-or-nothing. If any lock is busy, every held lock is dropped
+2. **Plan** — build a bounded, deterministic set of complete candidates
+   from the currently available CPUs and LLCs. Prefer strict
+   test-NUMA-to-host-NUMA mappings; when no strict mapping exists, fall
+   back explicitly to the closest valid cross-node placement. Candidate
+   rotation is process-stable and duplicate placements are removed, so
+   heterogeneous LLC widths and sparse CPU IDs do not turn into an
+   LCM-sized offset search.
+3. **Acquire** — non-blocking shared locks on every selected LLC and on
+   exactly the budgeted CPUs, all-or-nothing. If any lock is busy, every
+   held lock is dropped
    and the whole cycle retries a few times with short ascending
    backoff (absorbing plan/acquire races). Test-run acquisition then
-   joins the admission registry and completes as coordinator — re-running
-   DISCOVER → PLAN against live holder state on every lock-dir wake
+   joins the admission registry and completes as coordinator — choosing
+   one ready alternative from the bounded set against live holder state
+   on a relevant lock-dir wake
    (see the admission-registry section above); build-time and interactive
    acquisition stop at the short backoff and bail with a
    `ResourceContention` error naming the winning holders.
 
-The lock granularity is per-LLC, but the reserved CPU list holds
-exactly the budget — the last selected LLC typically contributes only
-a prefix of its CPUs. When the plan spans more than one NUMA node,
+The LLC claim covers every selected cache domain, while the shared CPU
+claim and cpuset hold exactly the budget — the last selected LLC
+typically contributes only a subset of its CPUs. When the plan spans
+more than one NUMA node,
 stderr warns:
 
 ```text

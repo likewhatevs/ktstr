@@ -7,9 +7,9 @@ tuning knob you reach for mid-test — it is the contract the run makes with
 the host and with every concurrent ktstr process sharing it.
 
 <div class="kt-doc-grid">
-<div class="kt-doc-card"><strong>Default</strong><p>Per-offset shared LLC lock plus an exclusive per-CPU lock, walked 1:1 against the host. Reserves without isolating; overcommits when the host is too small.</p></div>
-<div class="kt-doc-card"><strong>Performance</strong><p>Whole LLCs held exclusively, vCPUs pinned 1:1 under SCHED_FIFO with a reserved service CPU, NUMA-bound hugetlb memory. Measurement fidelity at the cost of host sharing.</p></div>
-<div class="kt-doc-card"><strong>No-perf</strong><p>A shared subset of LLCs sized to a CPU budget, vCPUs masked (not pinned) and spread across least-held LLCs. Coordination without the full isolation contract.</p></div>
+<div class="kt-doc-card"><strong>Default</strong><p>A bounded, availability-driven 1:1 placement with shared LLC and exclusive CPU claims. Reserves without isolating; overcommits when no 1:1 topology can exist.</p></div>
+<div class="kt-doc-card"><strong>Performance</strong><p>Whole LLCs and their CPUs held exclusively, vCPUs pinned 1:1 under SCHED_FIFO with a reserved service CPU, NUMA-bound hugetlb memory. Measurement fidelity at the cost of host sharing.</p></div>
+<div class="kt-doc-card"><strong>No-perf</strong><p>A shared subset of LLCs and exact shared CPU footprint sized to a budget, with vCPUs masked rather than pinned. Coordination without the full isolation contract.</p></div>
 </div>
 
 Two of these modes have dedicated deep-dive pages —
@@ -24,7 +24,7 @@ the shared reliability machinery behaves under each, and how to choose.
 |---|---|---|---|
 | **Selected by** | neither switch set | `performance_mode = true` | `--no-perf-mode` / `KTSTR_NO_PERF_MODE`, or a `cpu_budget` |
 | **LLC lock** | shared (`LOCK_SH`), on the 1:1 plan's LLCs | exclusive (`LOCK_EX`), one per virtual LLC | shared (`LOCK_SH`), on a budgeted LLC subset |
-| **Per-CPU lock** | exclusive (`LOCK_EX`), one per assigned host CPU | none — the exclusive LLC lock covers its CPUs | none — the cgroup cpuset is the enforcement layer |
+| **Per-CPU lock** | exclusive (`LOCK_EX`), one per assigned host CPU | exclusive (`LOCK_EX`) on every CPU covered by a whole-LLC claim; exact pinned/service CPUs at per-CPU grain | shared (`LOCK_SH`) on the exact budgeted pool; the cgroup cpuset enforces placement |
 | **vCPU placement** | pinned 1:1 (or masked, overcommitted, when the host is too small) | pinned 1:1 to reserved cores | masked to the reserved CPU pool, not pinned |
 | **vCPU scheduling** | `SCHED_OTHER` | `SCHED_FIFO` priority 1 | `SCHED_OTHER` |
 | **Memory** | anonymous, THP via `MADV_HUGEPAGE` | NUMA-bound 2 MB hugetlb (`MAP_HUGETLB`, strict `MPOL_BIND`) | anonymous, THP via `MADV_HUGEPAGE` |
@@ -33,7 +33,7 @@ the shared reliability machinery behaves under each, and how to choose.
 The same contrast as a host sketch — how each mode's vCPU threads land on
 host CPUs:
 
-<div class="kt-figure"><svg width="700" height="268" viewBox="0 0 700 268" role="img" aria-label="How each mode places vCPU threads on host CPUs. Performance: three vCPUs each pinned 1:1 to a core inside an exclusively-locked host LLC, with a separate reserved service CPU hosting the pinned FIFO-2 sensing threads; hugetlb memory with strict mbind; dilation near 1.0, higher means the isolation was violated. Default: three vCPUs pinned 1:1 to cores inside a shared-locked LLC whose individual CPUs are exclusively locked; THP via MADV_HUGEPAGE; FIFO-2 sensing unpinned; dilation quantifies residual host delay. No-perf: three vCPU threads fan into a shared LOCK_SH pool of LLC CPUs enforced by a cpuset — no per-CPU ownership; THP via MADV_HUGEPAGE; FIFO-2 sensing unpinned; dilation quantifies the sharing the budget accepted.">
+<div class="kt-figure"><svg width="700" height="268" viewBox="0 0 700 268" role="img" aria-label="How each mode places vCPU threads on host CPUs. Performance: three vCPUs each pinned 1:1 to a core inside an exclusively-locked host LLC whose CPUs are also exclusively claimed, with a separate reserved service CPU hosting the pinned FIFO-2 sensing threads; hugetlb memory with strict mbind; dilation near 1.0, higher means the isolation was violated. Default: three vCPUs pinned 1:1 to cores inside a shared-locked LLC whose individual CPUs are exclusively locked; THP via MADV_HUGEPAGE; FIFO-2 sensing unpinned; dilation quantifies residual host delay. No-perf: three vCPU threads fan into a shared LLC and shared CPU claim enforced by a cpuset; compatible no-perf peers may overlap, while exclusive default/performance owners cannot; THP via MADV_HUGEPAGE; FIFO-2 sensing unpinned; dilation quantifies the sharing the budget accepted.">
   <g>
     <text x="20" y="26" font-size="12" font-weight="700" fill="var(--kt-accent)">Performance</text>
     <text x="20" y="42" font-size="9" fill="var(--fg)" opacity=".75">pin 1:1 + service CPU</text>
@@ -105,8 +105,8 @@ host CPUs:
     <rect x="532" y="132" width="30" height="24" rx="4" fill="none" stroke="var(--fg)" stroke-width="1" opacity=".5"/>
     <rect x="572" y="132" width="30" height="24" rx="4" fill="none" stroke="var(--fg)" stroke-width="1" opacity=".5"/>
     <rect x="612" y="132" width="30" height="24" rx="4" fill="none" stroke="var(--fg)" stroke-width="1" opacity=".5"/>
-    <text x="570" y="176" text-anchor="middle" font-size="8.5" fill="var(--fg)" opacity=".8">LLC subset — LOCK_SH pool · cpuset</text>
-    <text x="480" y="206" font-size="8.5" fill="var(--fg)" opacity=".75">vCPUs SCHED_OTHER, no ownership</text>
+    <text x="570" y="176" text-anchor="middle" font-size="8.5" fill="var(--fg)" opacity=".8">LLC + CPU subset — LOCK_SH · cpuset</text>
+    <text x="480" y="206" font-size="8.5" fill="var(--fg)" opacity=".75">vCPUs SCHED_OTHER, shared claim</text>
     <text x="480" y="220" font-size="8.5" fill="var(--fg)" opacity=".75">THP via MADV_HUGEPAGE</text>
     <text x="480" y="234" font-size="8.5" fill="var(--fg)" opacity=".75">FIFO-2 sensing, unpinned</text>
     <text x="480" y="248" font-size="8.5" fill="var(--fg)" opacity=".75">D quantifies the accepted sharing</text>
@@ -115,16 +115,22 @@ host CPUs:
 
 ### Default
 
-The default path defers its plan to run time: it walks each LLC offset,
-computing a 1:1 candidate placement and taking `LOCK_SH` on the LLC plus
-`LOCK_EX` on each assigned host CPU until one offset's locks are all free
+The default path defers its plan to run time. It builds a bounded,
+deterministic set of complete 1:1 placements from the host's actual
+CPU/LLC/NUMA shape, ranks them against the current availability snapshot,
+and takes `LOCK_SH` on each selected LLC plus `LOCK_EX` on each assigned
+host CPU
 ([`acquire_default_run_locks`](https://github.com/likewhatevs/ktstr/blob/main/src/vmm/mod.rs)).
 The shared LLC lock coexists with other default and no-perf holders; the
 exclusive per-CPU locks are what keep two default VMs from ever
-time-slicing the same host CPU. If a 1:1 candidate *maps* but every offset
+time-slicing the same host CPU. Strict test-NUMA-to-host-NUMA mappings
+come first, followed by an explicit fallback when the host cannot match
+that shape exactly; sparse CPU IDs and unequal LLC widths do not create
+an LCM-sized offset search. If a 1:1 candidate *maps* but every candidate
 is busy, the run does not overcommit onto a peer's CPUs — it joins
-the lock-dir acquisition queue and, as head, re-probes every offset
-on each lock-dir wake until a candidate's authoritative flock release
+the admission registry and, after a relevant release, selects at most one
+complete ready alternative using its cached predecessor prefix and the
+current availability snapshot
 (see the resource-budget page's queue section).
 
 When no 1:1 plan can exist because the host is simply too small,
@@ -132,12 +138,16 @@ the default path falls back to
 [`build_overcommit_run_locks`](https://github.com/likewhatevs/ktstr/blob/main/src/vmm/mod.rs):
 every vCPU thread is masked to the allowed CPU set and the run proceeds
 *overcommitted*, warning when that genuinely oversubscribes the guest.
+The blocking test path still publishes and acquires an exclusive CPU
+bridge over that allowed set (plus the shared LLC footprint when known),
+so overcommit means the guest's own vCPUs share the reserved host CPUs —
+not that it may collide with another default/performance owner.
 The overcommit-vs-contention decision is the host-gate policy — make the
 run work, overcommit only when nothing else is possible — and the stamped
 `cpu_budget` in the sidecar drops below the vCPU count so an A/B against an
 overcommitted run is flagged, not silently confounded.
 
-<div class="kt-figure"><svg width="700" height="452" viewBox="0 0 700 452" role="img" aria-label="Default-mode run-lock decision walk. From run()'s acquire_default_run_locks: if the host topology was not cached (sysfs unreadable) the run goes straight to the overcommit fallback. Otherwise a per-offset candidate walk starts at a pid-windowed offset and wraps over max_slots: compute_pinning produces a 1:1 candidate for the offset; if it maps, the run takes a shared LLC flock plus an exclusive per-CPU flock — acquired means a 1:1 pinned run with the module-default halt-poll; a busy lock or an unmappable offset moves to the next offset. When all offsets are tried: if any offset produced a candidate the run queues and re-probes every offset on each lock-dir wake until release, then runs pinned; if none could map, the run overcommits — vCPUs masked to the allowed cpuset, budget rewritten with a warning, halt-poll zero.">
+<div class="kt-figure"><svg width="700" height="452" viewBox="0 0 700 452" role="img" aria-label="Default-mode run-lock decision. If host topology is unavailable, the run uses the admitted overcommit fallback. Otherwise a bounded, deterministic candidate scan creates complete 1:1 CPU, LLC, NUMA, and service-CPU placements from current availability. Acquiring shared LLC and exclusive CPU claims yields a pinned run. If valid candidates exist but are busy, the ticket waits and may publish one complete ready alternative after a relevant release. If no 1:1 candidate can exist, the guest uses an exclusive admitted bridge over its allowed CPUs and runs those vCPUs overcommitted.">
   <defs><marker id="rm-arrA" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg)"/></marker></defs>
   <rect x="20" y="16" width="200" height="44" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.4"/>
   <text x="36" y="34" font-size="11" font-weight="700" fill="var(--fg)">default mode</text>
@@ -150,26 +160,26 @@ overcommitted run is flagged, not silently confounded.
   <path d="M342 60 L 342 84" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#rm-arrA)"/>
   <text x="350" y="78" font-size="9" fill="var(--fg)" opacity=".65">yes</text>
   <rect x="40" y="88" width="430" height="184" rx="10" fill="none" stroke="var(--kt-rule)" stroke-width="1.2" stroke-dasharray="5 4"/>
-  <text x="56" y="108" font-size="9.5" font-weight="700" fill="var(--fg)" opacity=".8">per-offset candidate walk — pid-windowed start, wraps over max_slots</text>
+  <text x="56" y="108" font-size="9.5" font-weight="700" fill="var(--fg)" opacity=".8">bounded candidates — availability-ranked, deterministic, deduplicated</text>
   <rect x="60" y="124" width="190" height="48" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.3"/>
-  <text x="155" y="143" text-anchor="middle" font-size="10" font-weight="700" fill="var(--fg)">compute_pinning(offset)</text>
-  <text x="155" y="159" text-anchor="middle" font-size="9" fill="var(--fg)" opacity=".75">candidate maps 1:1?</text>
+  <text x="155" y="143" text-anchor="middle" font-size="10" font-weight="700" fill="var(--fg)">build complete candidate</text>
+  <text x="155" y="159" text-anchor="middle" font-size="9" fill="var(--fg)" opacity=".75">CPU + LLC + NUMA + service</text>
   <path d="M250 148 L 278 148" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#rm-arrA)"/>
   <text x="256" y="141" font-size="8.5" fill="var(--fg)" opacity=".65">yes</text>
   <rect x="280" y="124" width="172" height="48" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.3"/>
   <text x="366" y="143" text-anchor="middle" font-size="10" font-weight="700" fill="var(--fg)">take LLC LOCK_SH</text>
   <text x="366" y="159" text-anchor="middle" font-size="9" fill="var(--fg)" opacity=".75">+ per-CPU LOCK_EX</text>
   <path d="M366 172 C 336 202, 196 202, 162 176" stroke="var(--fg)" stroke-width="1.2" fill="none" opacity=".7" marker-end="url(#rm-arrA)"/>
-  <text x="264" y="212" text-anchor="middle" font-size="8.5" fill="var(--fg)" opacity=".65">lock busy or no 1:1 map → next offset</text>
+  <text x="264" y="212" text-anchor="middle" font-size="8.5" fill="var(--fg)" opacity=".65">busy or invalid → next bounded candidate</text>
   <path d="M430 172 C 420 240, 180 260, 122 366" stroke="var(--kt-accent)" stroke-width="1.4" fill="none" marker-end="url(#rm-arrA)"/>
   <text x="404" y="224" font-size="9" fill="var(--kt-accent)">acquired</text>
   <path d="M315 272 L 315 288" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#rm-arrA)"/>
-  <text x="323" y="286" font-size="9" fill="var(--fg)" opacity=".65">all offsets tried</text>
+  <text x="323" y="286" font-size="9" fill="var(--fg)" opacity=".65">candidate scan complete</text>
   <rect x="210" y="292" width="210" height="40" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.3"/>
-  <text x="315" y="309" text-anchor="middle" font-size="10" font-weight="700" fill="var(--fg)">any offset produced</text>
+  <text x="315" y="309" text-anchor="middle" font-size="10" font-weight="700" fill="var(--fg)">any valid plan produced</text>
   <text x="315" y="323" text-anchor="middle" font-size="10" font-weight="700" fill="var(--fg)">a 1:1 candidate?</text>
   <path d="M315 332 L 348 366" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#rm-arrA)"/>
-  <text x="232" y="356" font-size="9" fill="var(--fg)" opacity=".65">yes — every slot busy</text>
+  <text x="232" y="356" font-size="9" fill="var(--fg)" opacity=".65">yes — valid plans busy</text>
   <path d="M420 312 L 560 312 L 560 366" stroke="var(--fg)" stroke-width="1.3" fill="none" marker-end="url(#rm-arrA)"/>
   <text x="430" y="305" font-size="9" fill="var(--fg)" opacity=".65">no — cannot map</text>
   <rect x="20" y="370" width="200" height="64" rx="9" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.6"/>
@@ -178,12 +188,12 @@ overcommitted run is flagged, not silently confounded.
   <text x="36" y="418" font-size="8.5" fill="var(--fg)" opacity=".8">halt-poll: module default</text>
   <rect x="250" y="370" width="200" height="64" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.4"/>
   <text x="266" y="390" font-size="11" font-weight="700" fill="var(--fg)">queued acquisition</text>
-  <text x="266" y="405" font-size="8.5" fill="var(--fg)" opacity=".8">re-plan on every lock-dir wake</text>
-  <text x="266" y="418" font-size="8.5" fill="var(--fg)" opacity=".8">wait for authoritative release</text>
+  <text x="266" y="405" font-size="8.5" fill="var(--fg)" opacity=".8">one ready alternative per release</text>
+  <text x="266" y="418" font-size="8.5" fill="var(--fg)" opacity=".8">cached prefix + live availability</text>
   <path d="M250 402 L 224 402" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#rm-arrA)"/>
   <rect x="480" y="370" width="200" height="64" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.4" stroke-dasharray="5 4"/>
   <text x="496" y="390" font-size="11" font-weight="700" fill="var(--fg)">overcommit fallback</text>
-  <text x="496" y="404" font-size="8.5" fill="var(--fg)" opacity=".8">vCPUs masked to allowed cpuset</text>
+  <text x="496" y="404" font-size="8.5" fill="var(--fg)" opacity=".8">exclusive bridge on allowed CPUs</text>
   <text x="496" y="417" font-size="8.5" fill="var(--fg)" opacity=".8">budget rewritten + warning</text>
   <text x="496" y="430" font-size="8.5" fill="var(--fg)" opacity=".8">halt-poll: 0</text>
 </svg></div>
@@ -191,9 +201,13 @@ overcommitted run is flagged, not silently confounded.
 ### Performance
 
 `performance_mode = true` takes a whole host LLC per virtual LLC under
-`LOCK_EX`, pins each vCPU thread 1:1 to a core within it, and reserves one
-extra host CPU that no vCPU shares for the monitor and watchdog. On top of
-the pinning it runs vCPUs under `SCHED_FIFO`, binds guest memory to the
+`LOCK_EX`, publishes matching exclusive CPU claims for every CPU in those
+domains, pins each vCPU thread 1:1 to a core within them, and reserves one
+extra host CPU that no vCPU shares for the monitor and watchdog. The CPU
+claims are deliberately redundant with whole-LLC ownership: they make the
+cross-mode exclusion explicit to CPU-grain default and no-perf
+participants. On top of the pinning it runs vCPUs under `SCHED_FIFO`,
+binds guest memory to the
 pinned vCPUs' NUMA nodes (strict `MPOL_BIND`, no silent remote fallback),
 backs it with 2 MB hugetlb pages, and — on x86_64 — suppresses PAUSE/HLT
 exits and hints `KVM_HINTS_REALTIME` so the guest drives its own
@@ -209,11 +223,13 @@ modes, and host-sizing are in [Performance Mode](performance-mode.md).
 
 `--no-perf-mode` (or a `cpu_budget`) forces `performance_mode = false` and
 routes the run through the budgeted path: the planner reserves a subset of
-host LLCs sized to a CPU budget, takes `LOCK_SH` on them, and masks every
-vCPU thread onto the reserved pool via a cgroup v2 cpuset — no pinning, no
-RT scheduling, no hugetlb. Placement is *Spread*: concurrent no-perf VMs
-fan out across the least-held LLCs rather than stacking onto the same
-low-LLC prefix (builds keep *Consolidate*). The build-time `LOCK_SH` fds
+host LLCs sized to a CPU budget, takes `LOCK_SH` on them and on exactly the
+budgeted CPU pool, and masks every vCPU thread onto that pool via a cgroup
+v2 cpuset — no pinning, no RT scheduling, no hugetlb. Shared CPU claims
+let compatible no-perf peers overlap deliberately while still fencing
+exclusive default/performance owners. Placement is *Spread*: concurrent
+no-perf VMs fan out across available LLCs rather than stacking onto the
+same low-LLC prefix (builds keep *Consolidate*). The build-time `LOCK_SH` fds
 are held through setup so a concurrent peer's holder count reads true, then
 `run()` re-plans against those now-truthful counts and adopts the fresh
 plan's own fds (acquire-before-release, so retained LLCs never flicker
@@ -239,15 +255,15 @@ it only loads the scheduler's BPF and reads the kernel verifier's
 load-time `verified_insns` counts, a value fixed at BPF load and wholly
 independent of every perf-mode tuning (pinning, RT priority, hugepages,
 NUMA mbind, exit suppression). It needs none of that. Disabling perf mode
-also moves the run *off* the default run-lock path — whose per-offset
-`LOCK_SH` search hard-fails `all N LLC slots busy` when no offset is free
-— *onto* the no-perf plan, which reserves a shared `LOCK_SH` subset;
-`LOCK_SH` holders are mutually compatible, so a 30-cell parallel sweep no
-longer starves itself on the LLC lock. A `performance_mode` peer holding
-`LOCK_EX` can still defer a verifier cell (nextest retries it), which is
-correct: the verifier must not perturb an isolated peer's pinned CPUs.
+selects a bounded no-perf placement whose LLC and CPU claims are both
+shared. Compatible verifier cells can therefore enter together—even when
+their budgeted masks overlap—while the admission registry still routes
+them around disjoint capacity and fences an exclusive default/performance
+owner. A `performance_mode` peer holding `LOCK_EX` can defer an
+overlapping verifier cell, which is correct: the verifier must not perturb
+an isolated peer's pinned CPUs.
 
-<div class="kt-figure"><svg width="700" height="212" viewBox="0 0 700 212" role="img" aria-label="Mode-selection decision flow. Starting from a VM run: if performance_mode is true, the run is Performance mode (exclusive LLC locks, 1:1 FIFO pinning). Otherwise, if no-perf-mode or a cpu_budget or the verifier is set, the run is No-perf mode (shared LLC subset, masked vCPUs). Otherwise it is Default mode, which pins 1:1 when a plan fits and overcommits when the host is too small.">
+<div class="kt-figure"><svg width="700" height="212" viewBox="0 0 700 212" role="img" aria-label="Mode-selection decision flow. Starting from a VM run: if performance_mode is true, the run is Performance mode (exclusive LLC and CPU claims, 1:1 FIFO pinning). Otherwise, if no-perf-mode or a cpu_budget or the verifier is set, the run is No-perf mode (shared LLC and CPU subset, masked vCPUs). Otherwise it is Default mode, which pins 1:1 when a plan fits and uses an admitted exclusive overcommit bridge when the host is too small.">
   <defs><marker id="rm-arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg)"/></marker></defs>
   <rect x="20" y="86" width="96" height="40" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.4"/>
   <text x="68" y="103" text-anchor="middle" font-size="11" font-weight="700" fill="var(--fg)">VM run</text>
@@ -274,8 +290,8 @@ correct: the verifier must not perturb an isolated peer's pinned CPUs.
   <text x="421" y="66" font-size="9" fill="var(--kt-accent)" opacity=".9">yes</text>
   <rect x="338" y="12" width="150" height="34" rx="9" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.5"/>
   <text x="413" y="33" text-anchor="middle" font-size="11" font-weight="700" fill="var(--kt-accent)">No-perf</text>
-  <text x="20" y="176" font-size="9.5" fill="var(--fg)" opacity=".7">Exclusive LLC locks · 1:1 FIFO pinning · hugetlb · NUMA mbind</text>
-  <text x="20" y="192" font-size="9.5" fill="var(--fg)" opacity=".7">Shared LLC subset · masked vCPUs · Spread placement · cpuset budget</text>
+  <text x="20" y="176" font-size="9.5" fill="var(--fg)" opacity=".7">Exclusive LLC + CPU claims · 1:1 FIFO pinning · hugetlb · NUMA mbind</text>
+  <text x="20" y="192" font-size="9.5" fill="var(--fg)" opacity=".7">Shared LLC + CPU subset · masked vCPUs · Spread placement · cpuset budget</text>
   <text x="20" y="208" font-size="9.5" fill="var(--fg)" opacity=".7">Shared LLC + exclusive per-CPU · 1:1 reservation, overcommit fallback</text>
 </svg></div>
 
@@ -411,13 +427,16 @@ versa. The practical matrix, per resource:
 | Concurrent runs | LLC lock | Per-CPU lock | Result |
 |---|---|---|---|
 | Default + Default | both `LOCK_SH` — coexist | `LOCK_EX` each — mutually exclusive | share LLCs, never the same host CPU |
-| Default / No-perf + No-perf | all `LOCK_SH` — coexist | no per-CPU lock | share LLCs freely |
-| Any shared holder + Performance | `LOCK_SH` vs `LOCK_EX` — block | — | perf waits for all shared holders to release |
-| Performance + Performance | `LOCK_EX` each — mutually exclusive | — | serialized per LLC |
+| Default + No-perf | both `LOCK_SH` — coexist | default `LOCK_EX` vs no-perf `LOCK_SH` — overlap blocks | share an LLC only on disjoint CPU footprints |
+| No-perf + No-perf | both `LOCK_SH` — coexist | both `LOCK_SH` — coexist | deliberate shared CPU pool |
+| Any shared holder + Performance | `LOCK_SH` vs `LOCK_EX` — block | shared/exclusive CPU claims also block | perf waits for every overlapping shared holder |
+| Performance + Performance | `LOCK_EX` each — mutually exclusive | `LOCK_EX` bridge mirrors the LLC ownership | serialized per LLC |
 
-So any number of default and no-perf runs (and kernel builds, which take
-the shared path) coexist on shared LLCs; a perf-mode run waits for them
-all, and while it holds its LLCs nobody else touches those CPUs. The
+So default and no-perf runs (and kernel builds, which take the shared
+path) may coexist on shared LLCs when their CPU-mode matrix permits it;
+no-perf peers may intentionally share the same budgeted CPUs. A perf-mode
+run waits for every overlapping holder, and while it holds its LLCs
+nobody else touches those CPUs. The
 per-resource lock table and the planning phases are in
 [Resource Budget](resource-budget.md#the-three-coordination-modes).
 
