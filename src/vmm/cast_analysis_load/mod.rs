@@ -313,6 +313,52 @@ fn ahash_bytes(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// Load one content-addressed entry or become its sole cross-process builder.
+///
+/// A miss is checked before locking for the hot path, then checked again after
+/// acquiring the content-specific exclusive lease. The second check is the
+/// publication boundary: every waiter observes the winner's atomically renamed
+/// result and skips `build`. Distinct hashes use distinct lock files and remain
+/// fully concurrent.
+///
+/// Failure to acquire the lease returns `None`; there is deliberately no
+/// unsynchronized builder path that could recreate the thundering herd.
+fn load_or_build_content_entry<T, L, B>(hash: u64, mut load: L, build: B) -> Option<T>
+where
+    L: FnMut() -> Option<T>,
+    B: FnOnce() -> T,
+{
+    if let Some(value) = load() {
+        return Some(value);
+    }
+
+    let _builder_lock = match persist::acquire_builder_lock(hash) {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                hash = format_args!("{hash:016x}"),
+                "cast_analysis: cannot acquire content builder lease"
+            );
+            return None;
+        }
+    };
+
+    if let Some(value) = load() {
+        return Some(value);
+    }
+    Some(build())
+}
+
+fn collapse_cast_analysis(out: CastAnalysisOutput) -> Option<Arc<CastAnalysisOutput>> {
+    let total_casts: usize = out.cast_maps.iter().map(|map| map.len()).sum();
+    if total_casts == 0 && out.fwd_index.is_empty() {
+        None
+    } else {
+        Some(Arc::new(out))
+    }
+}
+
 /// Process-wide content-hash-cached entry point.
 ///
 /// Reads the scheduler binary once, hashes the bytes via ahash
@@ -338,12 +384,11 @@ fn ahash_bytes(bytes: &[u8]) -> u64 {
 ///
 /// # Concurrency
 ///
-/// Two simultaneous misses for the same hash do NOT both run the
-/// analyzer — they share an `Arc<OnceLock<...>>` and the second
-/// caller blocks inside `OnceLock::get_or_init` until the first
-/// finishes. Misses for different hashes proceed in parallel
-/// because the `Mutex<HashMap>` is held only across the
-/// hash-and-fetch step.
+/// Two simultaneous misses in one process share an
+/// `Arc<OnceLock<...>>`. Misses in different processes contend on the
+/// content-addressed builder lease; one analyzes and atomically publishes,
+/// then every waiter reloads that completed result. Misses for different
+/// hashes proceed in parallel.
 ///
 /// # Returns
 ///
@@ -387,63 +432,53 @@ pub(crate) fn cached_cast_analysis_for_scheduler(path: &Path) -> Option<Arc<Cast
             // instruction walker. BTFs are reparsed from the binary
             // bytes (Btf is not serializable).
             let btfs = parse_btfs_from_bytes(&bytes);
-            if let Some((cast_map, fwd_index, alloc_size_types)) =
-                persist::try_load(hash, btfs.len())
-            {
-                tracing::debug!("cast_analysis: disk cache hit");
-                let out = CastAnalysisOutput {
-                    cast_maps: vec![Arc::new(cast_map)],
-                    btfs,
-                    fwd_index,
-                    alloc_size_types,
-                };
-                let total: usize = out.cast_maps.iter().map(|m| m.len()).sum();
-                return if total == 0 && out.fwd_index.is_empty() {
-                    None
-                } else {
-                    Some(Arc::new(out))
-                };
-            }
-
-            let analyze_t0 = std::time::Instant::now();
-            let out = build_cast_analysis_from_bytes(&bytes);
-            tracing::debug!(
-                elapsed_ms = analyze_t0.elapsed().as_millis() as u64,
-                casts = out.cast_maps.iter().map(|m| m.len()).sum::<usize>(),
-                btfs = out.btfs.len(),
-                fwd_index = out.fwd_index.len(),
-                "cast_analysis: on-demand analysis finished"
-            );
-            let merged_for_cache: CastMap = out
-                .cast_maps
-                .iter()
-                .flat_map(|m| m.iter())
-                .map(|(&k, &v)| (k, v))
-                .collect();
-            // Do not cache a lossy multi-object merge. When >1 embedded
-            // object carries casts the flat (parent_id, offset) merge
-            // collides (per-object BTF id-spaces -- see the "Single-object
-            // only" note on build_cast_analysis_from_bytes), which already
-            // logged a loud error!. Caching the collided map would mask
-            // that error on every later cache hit (the build path, and its
-            // error!, is skipped on a hit), turning the loud guard into a
-            // one-shot. Skip the write so the guard re-fires every run
-            // until per-btf_kva selection lands.
-            if objects_with_casts(&out.cast_maps) <= 1 {
-                persist::try_save(
-                    hash,
-                    &merged_for_cache,
-                    &out.fwd_index,
-                    out.btfs.len(),
-                    &out.alloc_size_types,
-                );
-            }
-            let total_casts: usize = out.cast_maps.iter().map(|m| m.len()).sum();
-            if total_casts == 0 && out.fwd_index.is_empty() {
-                None
-            } else {
-                Some(Arc::new(out))
-            }
+            load_or_build_content_entry(
+                hash,
+                || {
+                    persist::try_load(hash, btfs.len()).map(
+                        |(cast_map, fwd_index, alloc_size_types)| {
+                            tracing::debug!("cast_analysis: disk cache hit");
+                            collapse_cast_analysis(CastAnalysisOutput {
+                                cast_maps: vec![Arc::new(cast_map)],
+                                btfs: btfs.clone(),
+                                fwd_index,
+                                alloc_size_types,
+                            })
+                        },
+                    )
+                },
+                || {
+                    let analyze_t0 = std::time::Instant::now();
+                    let out = build_cast_analysis_from_bytes(&bytes);
+                    tracing::debug!(
+                        elapsed_ms = analyze_t0.elapsed().as_millis() as u64,
+                        casts = out.cast_maps.iter().map(|m| m.len()).sum::<usize>(),
+                        btfs = out.btfs.len(),
+                        fwd_index = out.fwd_index.len(),
+                        "cast_analysis: on-demand analysis finished"
+                    );
+                    let merged_for_cache: CastMap = out
+                        .cast_maps
+                        .iter()
+                        .flat_map(|map| map.iter())
+                        .map(|(&key, &value)| (key, value))
+                        .collect();
+                    // Do not cache a lossy multi-object merge. When more than
+                    // one embedded object carries casts, their independent BTF
+                    // id spaces can collide in this legacy flat wire shape.
+                    if objects_with_casts(&out.cast_maps) <= 1 {
+                        persist::try_save(
+                            hash,
+                            &merged_for_cache,
+                            &out.fwd_index,
+                            out.btfs.len(),
+                            &out.alloc_size_types,
+                        );
+                    }
+                    collapse_cast_analysis(out)
+                },
+            )
+            .flatten()
         })
         .clone()
 }

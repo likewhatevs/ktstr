@@ -3033,6 +3033,11 @@ where
     // the new upper-layer inode — so the cache misses correctly
     // and re-resolves the rewritten binary.
     let tgids = iter_tgids_at(proc_root);
+    let eligible_tgids: Vec<i32> = tgids
+        .iter()
+        .copied()
+        .filter(|&tgid| tgid != self_pid)
+        .collect();
     let probe_cache: std::sync::Mutex<std::collections::HashMap<(u64, u64), CachedAttachResult>> =
         std::sync::Mutex::new(std::collections::HashMap::new());
     let summary_mutex = std::sync::Mutex::new(ProbeSummary::default());
@@ -3040,33 +3045,6 @@ where
     let probe_map: std::collections::HashMap<i32, Option<crate::host_thread_probe::JemallocProbe>> =
         if use_syscall_affinity {
             use rayon::prelude::*;
-            // Scale parallelism by available CPU headroom: read
-            // `<proc_root>/loadavg`, subtract from online CPU count,
-            // clamp to [1, num_cpus/2 + 1]. Avoids drowning a hot
-            // host. Routing the read through `proc_root` (rather
-            // than `/proc` directly) keeps the parameterised-root
-            // contract intact so synthetic-tree tests can stage
-            // their own loadavg shape.
-            let max_threads = {
-                let num_cpus = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4);
-                let load = std::fs::read_to_string(proc_root.join("loadavg"))
-                    .ok()
-                    .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                let headroom = (num_cpus as f64 - load).max(1.0) as usize;
-                headroom.clamp(1, num_cpus / 2 + 1)
-            };
-            // ThreadPoolBuilder::build can fail when the OS rejects
-            // `pthread_create` (RLIMIT_NPROC, kernel task table at
-            // PID_MAX). That is exactly when falling through to a
-            // `par_iter()` outside `pool.install` is unsafe: it lazily
-            // creates Rayon's host-sized global pool and escalates the
-            // exhaustion. The shared per-tgid closure below is installed
-            // on the bounded pool when construction succeeds and consumed
-            // by an ordinary ordered iterator when it fails.
-            let pool_result = build_pool(max_threads);
             let attach_one = |tgid: i32| {
                 // Catch panics from the per-tgid attach pipeline so
                 // a single rogue worker (fd exhaustion, OOM during
@@ -3242,28 +3220,58 @@ where
                 };
                 (tgid, probe)
             };
-            let work = || {
-                tgids
-                    .par_iter()
-                    .copied()
-                    .filter(|&tgid| tgid != self_pid)
-                    .map(&attach_one)
-                    .collect()
-            };
-            match pool_result {
-                Ok(pool) => pool.install(work),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        max_threads,
-                        "rayon ThreadPoolBuilder failed; falling back to sequential probe attach"
-                    );
-                    tgids
-                        .iter()
-                        .copied()
-                        .filter(|&tgid| tgid != self_pid)
-                        .map(&attach_one)
-                        .collect()
+
+            // Select the exact work set before considering a worker pool.
+            // Empty and single-TGID captures stay on the caller and never
+            // initialize Rayon. Larger captures retain the existing
+            // CPU-headroom cap, additionally bounded by actual eligible
+            // TGIDs so a sparse proc tree cannot create a host-sized idle
+            // pool.
+            if eligible_tgids.len() <= 1 {
+                eligible_tgids.iter().copied().map(&attach_one).collect()
+            } else {
+                // Scale parallelism by available CPU headroom: read
+                // `<proc_root>/loadavg`, subtract from online CPU count,
+                // clamp to [1, num_cpus/2 + 1]. Routing the read through
+                // `proc_root` keeps synthetic-tree tests deterministic.
+                let configured_max_threads = {
+                    let num_cpus = std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(4);
+                    let load = std::fs::read_to_string(proc_root.join("loadavg"))
+                        .ok()
+                        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    let headroom = (num_cpus as f64 - load).max(1.0) as usize;
+                    headroom.clamp(1, num_cpus / 2 + 1)
+                };
+                let max_threads = configured_max_threads.min(eligible_tgids.len());
+
+                if max_threads <= 1 {
+                    eligible_tgids.iter().copied().map(&attach_one).collect()
+                } else {
+                    // A failed private-pool build must remain sequential:
+                    // using `par_iter` outside `pool.install` would lazily
+                    // create Rayon's host-sized global pool precisely while
+                    // the process is resource constrained.
+                    match build_pool(max_threads) {
+                        Ok(pool) => pool.install(|| {
+                            eligible_tgids
+                                .par_iter()
+                                .copied()
+                                .map(&attach_one)
+                                .collect()
+                        }),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                max_threads,
+                                work_items = eligible_tgids.len(),
+                                "rayon ThreadPoolBuilder failed; falling back to sequential probe attach"
+                            );
+                            eligible_tgids.iter().copied().map(&attach_one).collect()
+                        }
+                    }
                 }
             }
         } else {

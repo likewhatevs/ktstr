@@ -579,8 +579,8 @@ pub use test_support::runtime::bypass_llc_locks_active;
 ///
 /// Called by cargo-ktstr before spawning nextest so test processes
 /// find a warm cache instead of each independently running the 30s
-/// analysis. Safe to call from a background thread — the function
-/// is idempotent (content-hash-keyed) and writes atomically.
+/// analysis. Same-content callers across processes elect one builder,
+/// wait for its atomic publication, and then reuse the completed entry.
 pub fn precompute_cast_analysis(path: &std::path::Path) {
     vmm::cast_analysis_load::cached_cast_analysis_for_scheduler(path);
 }

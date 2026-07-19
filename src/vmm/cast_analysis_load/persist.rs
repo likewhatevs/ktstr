@@ -1,6 +1,7 @@
 use crate::monitor::cast_analysis::{AddrSpace, CastHit, CastMap};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
 use super::FwdIndexEntry;
@@ -105,8 +106,7 @@ fn cache_dir() -> Option<PathBuf> {
     // Reclaim `*.bin.tmp.<pid>` staging files left by interrupted prior
     // runs, once per process on first cache access. try_save writes a
     // pid-suffixed temp then renames; a process that dies between the write
-    // and the rename (Ctrl-C / crash — notably on the detached precompute
-    // threads) orphans the temp, and nothing else reclaims it.
+    // and the rename orphans the temp, and nothing else reclaims it.
     static SWEEP_ONCE: std::sync::Once = std::sync::Once::new();
     SWEEP_ONCE.call_once(|| sweep_stale_tmp(&dir));
     Some(dir)
@@ -178,6 +178,31 @@ fn cache_path(hash: u64) -> Option<PathBuf> {
     })
 }
 
+/// Acquire the sole builder lease for one exact content-addressed entry.
+///
+/// The lock name includes the schema, analyzer fingerprint, dependency
+/// fingerprint, and scheduler-content hash because it is derived from the
+/// final cache path. Different entries can build concurrently; contenders for
+/// the same entry park in `flock(2)` and re-check the atomic cache publication
+/// after the winner releases this descriptor.
+pub(super) fn acquire_builder_lock(hash: u64) -> anyhow::Result<OwnedFd> {
+    use anyhow::Context;
+
+    let cache_path =
+        cache_path(hash).ok_or_else(|| anyhow::anyhow!("resolve cast-analysis cache path"))?;
+    let lock_path = cache_path.with_extension("lock");
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "create cast-analysis builder-lock directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    crate::flock::block_flock(&lock_path, crate::flock::FlockMode::Exclusive)
+        .with_context(|| format!("lock cast-analysis builder {}", lock_path.display()))
+}
+
 #[allow(clippy::type_complexity)]
 pub(super) fn try_load(
     hash: u64,
@@ -228,15 +253,6 @@ pub(super) fn try_save(
     btf_count: usize,
     alloc_size_types: &[(u64, String)],
 ) {
-    // Symmetric with get_full's read-side collapse (mod.rs:401/442):
-    // a result with no cast entries AND an empty fwd index loads back
-    // as None, so persisting it only wastes a disk write plus a
-    // recompute on every subsequent run. Skip the write. (alloc_size_types
-    // alone never resurrects a cached result -- the read-side collapse
-    // ignores it -- so it does not gate this guard.)
-    if cast_map.is_empty() && fwd_index.is_empty() {
-        return;
-    }
     let Some(path) = cache_path(hash) else { return };
 
     let persisted = PersistedCastAnalysis {
@@ -396,22 +412,22 @@ mod tests {
     }
 
     #[test]
-    fn try_save_skips_empty_result() {
+    fn try_save_persists_empty_result_as_negative_entry() {
         let _env_lock = lock_env();
         let _cache = isolated_cache_dir();
 
-        // An empty result (no cast entries, empty fwd index) loads back as
-        // None via get_full's collapse, so try_save must not persist it --
-        // otherwise every run pays a disk write plus a recompute on the
-        // next load. Verify the write is skipped: try_load finds no file.
+        // Empty analysis is still a completed content-addressed result.
+        // Persisting it lets cross-process waiters distinguish a negative hit
+        // from a miss instead of serially repeating the expensive analysis.
         let cast_map = BTreeMap::new();
         let fwd_index = HashMap::new();
         let hash = 0xABCD_1234_5678_9999u64;
         try_save(hash, &cast_map, &fwd_index, 2, &[]);
 
-        assert!(
-            try_load(hash, 2).is_none(),
-            "empty result must not be persisted"
-        );
+        let (loaded_map, loaded_fwd, loaded_alloc_types) =
+            try_load(hash, 2).expect("empty negative result must be persisted");
+        assert!(loaded_map.is_empty());
+        assert!(loaded_fwd.is_empty());
+        assert!(loaded_alloc_types.is_empty());
     }
 }

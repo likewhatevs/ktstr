@@ -905,10 +905,10 @@ fn capture_with_pool_build_failure_is_sequential_and_preserves_accounting_child(
     let sys_tmp = tempfile::TempDir::new().unwrap();
     std::fs::write(proc_tmp.path().join("loadavg"), "0.0 0.0 0.0 1/1 1\n").unwrap();
 
-    let survivor_tgid = 99_200;
-    let survivor_tid = 99_202;
-    let panic_tgid = 99_201;
-    let panic_tid = 99_203;
+    let survivor_tgid = std::process::id() as i32 + 1_000;
+    let survivor_tid = survivor_tgid + 2;
+    let panic_tgid = survivor_tgid + 1;
+    let panic_tid = panic_tgid + 2;
     stage_synthetic_proc(
         proc_tmp.path(),
         survivor_tgid,
@@ -948,9 +948,10 @@ fn capture_with_pool_build_failure_is_sequential_and_preserves_accounting_child(
     PANIC_INJECT_TGID.store(0, std::sync::atomic::Ordering::Release);
     std::panic::set_hook(saved_hook);
 
-    assert!(
-        requested_threads.get() >= 1,
-        "pool builder seam was not called"
+    assert_eq!(
+        requested_threads.get(),
+        2,
+        "private pool width must be bounded by the two eligible staged TGIDs"
     );
     assert_eq!(
         after, before,

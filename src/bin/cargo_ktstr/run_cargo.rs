@@ -496,8 +496,6 @@ fn run_cargo_sub(
 
     let target_dir_path = resolve_target_dir();
 
-    precompute_cast_cache(&target_dir_path);
-
     // BTF type anchor: if a prior build left .bpf.o files, extract
     // struct definitions from the BPF source tree and generate a
     // -include header with weak global anchors that force clang to
@@ -522,7 +520,7 @@ fn run_cargo_sub(
     }
 
     // Everything above is preflight: a signal should terminate immediately
-    // without parking around metadata, kernel resolution, or cache analysis.
+    // without parking around metadata, kernel resolution, or anchor discovery.
     // From this point onward the command may acquire a compile reservation or
     // spawn the final run, so establish cleanup ownership first and expose a
     // signal caught during the transition before acquiring either resource.
@@ -573,6 +571,12 @@ fn run_cargo_sub(
         }
         run_reserved_prebuild(warm, "cargo ktstr")?;
     }
+
+    // Scan after the reserved build so the analyzed content is the exact
+    // scheduler set the imminent tests will execute. This call joins all
+    // work; child test processes therefore hit complete atomic CAS entries
+    // instead of racing background warmers.
+    precompute_cast_cache(&target_dir_path);
 
     tracing::debug!("cargo ktstr: running {label}");
     // Capture the run-start instant BEFORE the nextest build+run so
@@ -912,11 +916,66 @@ fn precompute_cast_cache(target_dir: &std::path::Path) {
         "cargo ktstr: precomputing cast analysis for {} scheduler binaries",
         binaries.len()
     );
-    for binary in binaries {
-        let path = binary.clone();
-        std::thread::spawn(move || {
-            ktstr::precompute_cast_analysis(&path);
-        });
+    let configured_limit = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    precompute_cast_paths_with_pool_builder(
+        &binaries,
+        configured_limit,
+        |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|error| error.to_string())
+        },
+        ktstr::precompute_cast_analysis,
+    );
+}
+
+/// Analyze a prepared scheduler set under a work-sized private pool and wait
+/// for every item before returning.
+///
+/// The join is intentional: the test processes spawned after this function
+/// must see complete atomic cache entries, not race detached warmers. Zero and
+/// one item stay on the caller; larger sets use
+/// `min(configured_limit, binaries.len())` workers. A private-pool allocation
+/// failure remains sequential and never initializes Rayon's global pool.
+fn precompute_cast_paths_with_pool_builder<B, F>(
+    binaries: &[std::path::PathBuf],
+    configured_limit: usize,
+    build_pool: B,
+    precompute: F,
+) where
+    B: FnOnce(usize) -> Result<rayon::ThreadPool, String>,
+    F: Fn(&std::path::Path) + Sync,
+{
+    use rayon::prelude::*;
+
+    let width = configured_limit.max(1).min(binaries.len());
+    if width <= 1 {
+        for binary in binaries {
+            precompute(binary);
+        }
+        return;
+    }
+
+    match build_pool(width) {
+        Ok(pool) => pool.install(|| {
+            binaries
+                .par_iter()
+                .for_each(|binary| precompute(binary.as_path()));
+        }),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                width,
+                work_items = binaries.len(),
+                "rayon ThreadPoolBuilder failed; falling back to sequential cast precompute"
+            );
+            for binary in binaries {
+                precompute(binary);
+            }
+        }
     }
 }
 
@@ -925,8 +984,7 @@ fn precompute_cast_cache(target_dir: &std::path::Path) {
 /// byproducts that share the `scx_` prefix (e.g. `scx_foo.d` depfiles,
 /// `scx_foo.rlib`); only the bare executable matches, and the
 /// `is_file` gate excludes same-named directories. Split out from
-/// [`precompute_cast_cache`] so the scan/filter is unit-testable
-/// without spawning the per-binary analysis threads.
+/// [`precompute_cast_cache`] so the scan/filter is unit-testable.
 fn collect_scheduler_binaries(target_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut binaries = Vec::new();
     for profile in ["debug", "release"] {
@@ -947,6 +1005,8 @@ fn collect_scheduler_binaries(target_dir: &std::path::Path) -> Vec<std::path::Pa
             }
         }
     }
+    binaries.sort();
+    binaries.dedup();
     binaries
 }
 
@@ -2604,6 +2664,95 @@ mod tests {
             vec![debug.join("scx_ktstr")],
             "only the bare scx_* executable is collected",
         );
+    }
+
+    #[test]
+    fn cast_precompute_zero_and_one_stay_on_caller_without_pool() {
+        let empty: Vec<std::path::PathBuf> = Vec::new();
+        precompute_cast_paths_with_pool_builder(
+            &empty,
+            192,
+            |_| panic!("empty scheduler set must not build a pool"),
+            |_| panic!("empty scheduler set must not invoke precompute"),
+        );
+
+        let caller = std::thread::current().id();
+        let one = vec![std::path::PathBuf::from("/fake/scx_one")];
+        let visited = std::sync::Mutex::new(Vec::new());
+        precompute_cast_paths_with_pool_builder(
+            &one,
+            192,
+            |_| panic!("single scheduler must not build a pool"),
+            |path| {
+                assert_eq!(
+                    std::thread::current().id(),
+                    caller,
+                    "single cast precompute escaped onto a worker"
+                );
+                visited.lock().unwrap().push(path.to_path_buf());
+            },
+        );
+        assert_eq!(*visited.lock().unwrap(), one);
+    }
+
+    #[test]
+    fn cast_precompute_pool_is_work_sized_and_joined_before_return() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let binaries: Vec<_> = (0..3)
+            .map(|index| std::path::PathBuf::from(format!("/fake/scx_{index}")))
+            .collect();
+        let requested_threads = std::cell::Cell::new(0);
+        let completed = AtomicUsize::new(0);
+        precompute_cast_paths_with_pool_builder(
+            &binaries,
+            192,
+            |threads| {
+                requested_threads.set(threads);
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .map_err(|error| error.to_string())
+            },
+            |_| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                completed.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+        assert_eq!(requested_threads.get(), binaries.len());
+        assert_eq!(
+            completed.load(Ordering::Relaxed),
+            binaries.len(),
+            "all private-pool work must be joined before precompute returns"
+        );
+    }
+
+    #[test]
+    fn cast_precompute_pool_failure_is_caller_sequential() {
+        let binaries: Vec<_> = (0..3)
+            .map(|index| std::path::PathBuf::from(format!("/fake/scx_{index}")))
+            .collect();
+        let caller = std::thread::current().id();
+        let requested_threads = std::cell::Cell::new(0);
+        let visited = std::sync::Mutex::new(Vec::new());
+        precompute_cast_paths_with_pool_builder(
+            &binaries,
+            2,
+            |threads| {
+                requested_threads.set(threads);
+                Err("forced private-pool failure".to_string())
+            },
+            |path| {
+                assert_eq!(
+                    std::thread::current().id(),
+                    caller,
+                    "private-pool failure initialized parallel fallback work"
+                );
+                visited.lock().unwrap().push(path.to_path_buf());
+            },
+        );
+        assert_eq!(requested_threads.get(), 2);
+        assert_eq!(*visited.lock().unwrap(), binaries);
     }
 
     /// Byte-exact pin on the three `*_SUB_ARGV` constants that drive

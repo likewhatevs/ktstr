@@ -4,6 +4,110 @@ use goblin::elf::header as h;
 use goblin::elf::section_header as sh;
 use goblin::elf::sym as syms;
 
+const BUILDER_ELECTION_CHILD_ENV: &str = "KTSTR_CAST_BUILDER_ELECTION_CHILD";
+const BUILDER_ELECTION_GO_ENV: &str = "KTSTR_CAST_BUILDER_ELECTION_GO";
+const BUILDER_ELECTION_RESULT_ENV: &str = "KTSTR_CAST_BUILDER_ELECTION_RESULT";
+const BUILDER_ELECTION_CLAIMS_ENV: &str = "KTSTR_CAST_BUILDER_ELECTION_CLAIMS";
+
+/// Exact-content misses across independent processes elect one builder. Every
+/// other process blocks on the same lease, reloads the atomic publication, and
+/// returns without entering its build closure.
+#[test]
+fn content_builder_election_is_cross_process() {
+    const HASH: u64 = 0xC457_A11A_5E00_0001;
+    const EXACT_TEST: &str =
+        "vmm::cast_analysis_load::tests::index::content_builder_election_is_cross_process";
+
+    if std::env::var_os(BUILDER_ELECTION_CHILD_ENV).is_some() {
+        use std::io::Write as _;
+
+        let go = std::path::PathBuf::from(
+            std::env::var_os(BUILDER_ELECTION_GO_ENV).expect("child go path"),
+        );
+        let result_path = std::path::PathBuf::from(
+            std::env::var_os(BUILDER_ELECTION_RESULT_ENV).expect("child result path"),
+        );
+        let claims_path = std::path::PathBuf::from(
+            std::env::var_os(BUILDER_ELECTION_CLAIMS_ENV).expect("child claims path"),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !go.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for parent start barrier"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        let value = load_or_build_content_entry(
+            HASH,
+            || std::fs::read_to_string(&result_path).ok(),
+            || {
+                let mut claims = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&claims_path)
+                    .expect("open builder claims");
+                writeln!(claims, "{}", std::process::id()).expect("record builder claim");
+
+                // Keep the lease long enough for every peer to reach the
+                // contended path, then publish via rename exactly like the
+                // production cache writer.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let tmp = result_path.with_extension(format!("tmp.{}", std::process::id()));
+                std::fs::write(&tmp, "ready").expect("write staged result");
+                std::fs::rename(&tmp, &result_path).expect("publish staged result");
+                "ready".to_string()
+            },
+        )
+        .expect("acquire content builder lease");
+        assert_eq!(value, "ready");
+        return;
+    }
+
+    let tmp = tempfile::TempDir::new().expect("builder election tempdir");
+    let cache_root = tmp.path().join("cache");
+    let go = tmp.path().join("go");
+    let result_path = tmp.path().join("result");
+    let claims_path = tmp.path().join("claims");
+    let mut children = Vec::new();
+    for _ in 0..8 {
+        children.push(
+            std::process::Command::new(std::env::current_exe().expect("current test binary"))
+                .env(BUILDER_ELECTION_CHILD_ENV, "1")
+                .env(crate::KTSTR_CACHE_DIR_ENV, &cache_root)
+                .env(BUILDER_ELECTION_GO_ENV, &go)
+                .env(BUILDER_ELECTION_RESULT_ENV, &result_path)
+                .env(BUILDER_ELECTION_CLAIMS_ENV, &claims_path)
+                .arg("--exact")
+                .arg(EXACT_TEST)
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .spawn()
+                .expect("spawn builder-election child"),
+        );
+    }
+    std::fs::write(&go, b"go").expect("release builder-election children");
+
+    for child in children {
+        let output = child
+            .wait_with_output()
+            .expect("wait for builder-election child");
+        assert!(
+            output.status.success(),
+            "builder-election child failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let claims = std::fs::read_to_string(&claims_path).expect("read builder claims");
+    assert_eq!(
+        claims.lines().count(),
+        1,
+        "exactly one process may execute the build closure; claims:\n{claims}"
+    );
+}
+
 /// Multiple BTFs: the index records the first BTF seen for any
 /// duplicate name, so an entry's `(idx, type_id)` reflects the
 /// first-write-wins policy. The renderer only consults the
