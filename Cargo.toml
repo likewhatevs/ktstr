@@ -438,7 +438,6 @@ export = []
 # mold, elfutils-devel, zlib-devel on the host; takes several minutes cold).
 wprof = [
     "ktstr-macros/wprof",
-    "dep:ahash",
     "dep:fs2",
     "dep:gix",
 ]
@@ -518,7 +517,10 @@ mockito = "1"
 virtio-queue = { version = "0.17", features = ["test-utils"] }
 
 [build-dependencies]
-ahash = { version = "0.8", optional = true }
+# Fixed-seed, non-cryptographic content identity for both prebuilt blob
+# handoffs. Unconditional because busybox is prepared on the default build;
+# the wprof source-acquisition path reuses the same host-side crate.
+ahash = "0.8"
 fs2 = { version = "0.4", optional = true }
 # Optional with `wprof`: default builds do not compile a second host-side gix
 # graph merely for a build-script path that is disabled.

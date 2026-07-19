@@ -177,7 +177,7 @@ pub(crate) fn profraw_inject_for(
 /// Build-time env vars handing `cargo-ktstr`'s already-extracted
 /// busybox / wprof binaries to the child build, so the downstream
 /// `ktstr` `build.rs` copies them into `$OUT_DIR` instead of
-/// re-fetching + recompiling (see `copy_prebuilt_blob` in
+/// re-fetching + recompiling (see `install_prebuilt_blob` in
 /// `build_helpers.rs`). `cargo-ktstr` exported `KTSTR_BUSYBOX_PATH` /
 /// `KTSTR_WPROF_PATH` at startup (`bin/cargo_ktstr/blobs.rs`
 /// `install_env`) pointing at the extracted blobs; this re-exports each

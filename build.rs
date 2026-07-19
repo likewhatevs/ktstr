@@ -423,6 +423,7 @@ int main(void) {{
     // verify), and `KTSTR_BUSYBOX_TARBALL` covers the
     // tarball-fetch-failed case more cleanly.
     let busybox_bin = out_dir.join("busybox");
+    let busybox_stamp = out_dir.join(".busybox-content-key");
     println!("cargo:rerun-if-env-changed=KTSTR_SKIP_BUSYBOX_BUILD");
     println!("cargo:rerun-if-env-changed=KTSTR_BUSYBOX_TARBALL");
     println!("cargo:rerun-if-env-changed=KTSTR_BUSYBOX_BIN");
@@ -430,27 +431,51 @@ int main(void) {{
         .ok()
         .filter(|v| !v.is_empty())
         .is_some();
+    let prebuilt_busybox = if skip_busybox {
+        PrebuiltBlobStatus::NotRequested
+    } else {
+        install_prebuilt_blob(
+            std::env::var_os("KTSTR_BUSYBOX_BIN").as_deref(),
+            &busybox_bin,
+            &busybox_stamp,
+            "busybox",
+            "busybox-1_36_1",
+        )
+    };
+    if prebuilt_busybox == PrebuiltBlobStatus::Rejected {
+        // A requested-but-invalid handoff must fall through to a real
+        // acquisition, not silently retain an older embedded output.
+        let _ = std::fs::remove_file(&busybox_bin);
+        let _ = std::fs::remove_file(&busybox_stamp);
+    }
+    let reusable_busybox = matches!(
+        prebuilt_busybox,
+        PrebuiltBlobStatus::Reused | PrebuiltBlobStatus::Refreshed
+    ) || (prebuilt_busybox == PrebuiltBlobStatus::NotRequested
+        && match std::fs::metadata(&busybox_stamp) {
+            Ok(_) => reuse_prebuilt_blob_without_source(
+                &busybox_stamp,
+                &busybox_bin,
+                "busybox",
+                "busybox-1_36_1",
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A stamp-less non-empty output is an ordinary local
+                // busybox build from before/without the handoff path.
+                is_nonempty_regular_file(&busybox_bin)
+            }
+            Err(_) => false,
+        });
     if skip_busybox {
         println!(
             "cargo:warning=KTSTR_SKIP_BUSYBOX_BUILD set — writing 0-byte \
              $OUT_DIR/busybox placeholder; shell mode will be unavailable \
              in the resulting cargo-ktstr binary"
         );
-        if !busybox_bin.exists() {
-            std::fs::write(&busybox_bin, b"").unwrap_or_else(|e| {
-                panic!(
-                    "write 0-byte busybox placeholder {}: {e}",
-                    busybox_bin.display()
-                )
-            });
-        }
-    } else if !busybox_bin.exists()
-        && !copy_prebuilt_blob(
-            std::env::var("KTSTR_BUSYBOX_BIN").ok().as_deref(),
-            &busybox_bin,
-            "busybox",
-        )
-    {
+        // SKIP is authoritative even when Cargo reuses an OUT_DIR that
+        // already contains a real embedded or locally built binary.
+        install_skipped_blob(&busybox_bin, &busybox_stamp, "busybox");
+    } else if !reusable_busybox {
         println!("cargo:warning=compiling busybox (first build only)...");
 
         // Check required tools before attempting build.
@@ -570,6 +595,7 @@ int main(void) {{
         // Copy binary to OUT_DIR.
         std::fs::copy(busybox_src.join("busybox"), &busybox_bin)
             .expect("copy busybox binary to OUT_DIR");
+        let _ = std::fs::remove_file(&busybox_stamp);
     }
 
     // wprof build: gated behind the `wprof` cargo feature (default
@@ -622,20 +648,25 @@ fn prepare_wprof(out_dir: &std::path::Path, wprof_bin: &std::path::Path) {
         .ok()
         .is_some_and(|value| !value.is_empty());
     let stamp_path = out_dir.join(WPROF_STAMP);
-    let existing_stamp = std::fs::read_to_string(&stamp_path).unwrap_or_default();
 
     // A cargo-ktstr parent can hand this build the already embedded binary.
-    // Keep that zero-network path ahead of tool probing and source acquisition.
-    let copied = !skip
-        && !wprof_bin.exists()
-        && copy_prebuilt_blob(
-            std::env::var("KTSTR_WPROF_BIN").ok().as_deref(),
+    // Keep that zero-network path ahead of tool probing and source acquisition,
+    // and refresh it when the handed-over bytes change in a reused OUT_DIR.
+    let prebuilt_wprof = if skip {
+        PrebuiltBlobStatus::NotRequested
+    } else {
+        install_prebuilt_blob(
+            std::env::var_os("KTSTR_WPROF_BIN").as_deref(),
             wprof_bin,
+            &stamp_path,
             "wprof",
-        );
-    if copied {
-        std::fs::write(&stamp_path, format!("embedded:{WPROF_REV}"))
-            .expect("stamp embedded wprof binary");
+            WPROF_REV,
+        )
+    };
+    if matches!(
+        prebuilt_wprof,
+        PrebuiltBlobStatus::Reused | PrebuiltBlobStatus::Refreshed
+    ) {
         return;
     }
 
@@ -647,19 +678,19 @@ fn prepare_wprof(out_dir: &std::path::Path, wprof_bin: &std::path::Path) {
         );
         // The opt-out must remain authoritative when this OUT_DIR already
         // contains a real binary from an earlier non-skipped build.
-        std::fs::write(wprof_bin, b"").unwrap_or_else(|err| {
-            panic!(
-                "write 0-byte wprof placeholder {}: {err}",
-                wprof_bin.display()
-            )
-        });
-        std::fs::write(&stamp_path, format!("skipped:{WPROF_REV}"))
-            .expect("stamp skipped wprof placeholder");
+        install_skipped_blob(wprof_bin, &stamp_path, "wprof");
         return;
     }
 
-    if existing_stamp == format!("embedded:{WPROF_REV}")
-        && std::fs::metadata(wprof_bin).is_ok_and(|meta| meta.len() > 0)
+    if prebuilt_wprof == PrebuiltBlobStatus::Rejected {
+        // A requested-but-invalid handoff falls through to the normal
+        // content-addressed source build, never an older embedded output.
+        let _ = std::fs::remove_file(wprof_bin);
+        let _ = std::fs::remove_file(&stamp_path);
+    }
+    let existing_stamp = std::fs::read_to_string(&stamp_path).unwrap_or_default();
+    if prebuilt_wprof == PrebuiltBlobStatus::NotRequested
+        && reuse_prebuilt_blob_without_source(&stamp_path, wprof_bin, "wprof", WPROF_REV)
     {
         return;
     }
@@ -678,9 +709,7 @@ fn prepare_wprof(out_dir: &std::path::Path, wprof_bin: &std::path::Path) {
     ];
     let build_id = gix_acquire::content_id(&key_parts);
     let expected_stamp = format!("built:{build_id}");
-    if existing_stamp == expected_stamp
-        && std::fs::metadata(wprof_bin).is_ok_and(|meta| meta.len() > 0)
-    {
+    if existing_stamp == expected_stamp && is_nonempty_regular_file(wprof_bin) {
         return;
     }
     if wprof_bin.exists() {
