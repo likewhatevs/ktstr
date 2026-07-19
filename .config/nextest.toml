@@ -1,21 +1,21 @@
 # ── Profiles ──────────────────────────────────────────────────────────
 
-# SCHEDULING MODEL: nextest is a pure SPAWNER; the lock-dir queue is
-# the actual scheduler (see host_topology::protocol — the
+# SCHEDULING MODEL: nextest is a pure SPAWNER; the lock-dir admission
+# registry is the actual scheduler (see host_topology::protocol — the
 # "second-order scheduler"). Under the default and CI profiles, nextest
 # admits every lock-taking cell at once while the `host-tests` group
-# bounds ordinary host work. Cells park CHEAPLY in the cross-process
-# acquisition queue (before VM setup or guest-memory allocation) until
-# host capacity frees. Consequences for this config:
+# bounds ordinary host work. Cells park CHEAPLY on targeted cross-process
+# futexes (before VM setup or guest-memory allocation) until their exact
+# claims can run. Consequences for this config:
 #
-#  - Reported per-test DURATIONS INCLUDE LOCK-QUEUE TIME. That is
-#    accepted; no effort is spent excluding queue wait from timings
+#  - Reported per-test DURATIONS INCLUDE ADMISSION WAIT. That is
+#    accepted; no effort is spent excluding admission wait from timings
 #    or slow-test flagging.
-#  - slow-timeout rails for lock-taking cells must exceed the FULL
-#    suite drain, not one cell's runtime, because the deepest-queued
+#  - slow-timeout bounds for lock-taking cells must exceed the FULL
+#    suite drain, not one cell's runtime, because the deepest-waiting
 #    cell's wall approaches the whole makespan. The in-cell progress
 #    watchdog owns guest-lifecycle detection; nextest terminate-after
-#    owns the process-lifecycle final rail. The lock queue does not
+#    owns the final process-lifecycle bound. The admission registry does not
 #    guess that a healthy holder is wedged from wall time. See the
 #    vm-cell override block below for the sizing derivation.
 #  - ResourceContention from transient host syscalls is a RETRYABLE
@@ -66,11 +66,11 @@ max-threads = "num-cpus"
 # falls back to matching `profile.default.overrides`. The CI copies below
 # either carry CI-specific settings or pin intended CI precedence explicitly.
 
-# LOCK-TAKING VM CELLS: last-resort rail sized for FULL-SUITE DRAIN,
+# LOCK-TAKING VM CELLS: final process bound sized for FULL-SUITE DRAIN,
 # not per-cell runtime (overrides are first-match per setting, so this
 # must stay FIRST to win slow-timeout for these filters; later
 # blocks still contribute retries / test-groups). Derivation: nextest
-# admits every cell at once and the lock-dir queue serializes to host
+# admits every cell at once and the admission registry schedules to host
 # capacity, so the deepest-queued cell's nextest-visible wall ≈ the
 # whole VM-suite makespan (its reported duration INCLUDES queue time —
 # accepted). Measured local reference (64-CPU / 4-LLC dev box, full
@@ -79,7 +79,7 @@ max-threads = "num-cpus"
 # cells above 60 s. CI runners are ~200 CPUs / 24 LLCs but share the
 # lock dir across colocated runner units, so leave roughly three local
 # drains plus a long-cell tail. 180 s × 7 = 21 min: enough for the
-# measured queue-inclusive drain while still bounding a defect outside
+# measured admission-inclusive drain while still bounding a defect outside
 # the in-cell progress watchdog (or an unforeseen queue bug) near the
 # expected CI envelope instead of wasting an hour. A contention-killed
 # cell remains retryable and normally retries after the queue has drained.
@@ -236,14 +236,17 @@ retries = 2
 #
 # Generated ktstr/, gauntlet/, and verifier/ cells participate in the
 # scheduler. Generated host_only tests are emitted under the distinct host/
-# namespace, so they fall into host-tests generically without a brittle list
-# of macro/codegen probe names. The remaining arms cover direct KtstrVm
-# users, shell/verifier wrappers, ignored nested-VM/kernel-build shims, and
-# the two production-lock reservation tests. This CI complement declines
-# those identities; the inherited profile.default resource rule below then
-# explicitly assigns them to @global before the lower-priority tool fallback
-# can classify their ordinary Rust names as host work. Everything else enters
-# the CPU-sized host-tests group.
+# namespace, so ordinary host-only macro/codegen probes fall into host-tests
+# without a brittle per-test allowlist. verifier_pipeline is the deliberate
+# exception: its host/-named drivers call the verifier API directly, which
+# boots KtstrVm internally after suppressing only the outer generated harness
+# VM. The remaining arms cover direct KtstrVm users, shell/verifier wrappers,
+# ignored nested-VM/kernel-build shims, and the two production-lock
+# reservation tests. This CI complement declines those identities; the
+# inherited profile.default resource rule below then explicitly assigns them
+# to @global before the lower-priority tool fallback can classify their
+# ordinary Rust names as host work. Everything else enters the CPU-sized
+# host-tests group.
 [[profile.ci.overrides]]
 filter = '''
 not(
@@ -262,6 +265,7 @@ not(
   | binary(=vm_integration)
   | binary(=extra_kconfig_e2e)
   | binary(=wprof_e2e)
+  | binary(=verifier_pipeline)
   | (
     binary(=ktstr_cli)
     & test(=shell_exec_echo)
@@ -539,6 +543,7 @@ test(/^ktstr\//)
 | binary(=vm_integration)
 | binary(=extra_kconfig_e2e)
 | binary(=wprof_e2e)
+| binary(=verifier_pipeline)
 | (
   binary(=ktstr_cli)
   & test(=shell_exec_echo)
@@ -557,8 +562,10 @@ threads-required = 1
 
 # Assign the exact complement to ordinary host work. Keep this fallback after
 # the explicit resource assignment and every named default-profile
-# test-group override. The generated host/ namespace makes every host_only
-# entry fall into host-tests without a per-test allowlist.
+# test-group override. The generated host/ namespace makes ordinary
+# host_only entries fall into host-tests without a per-test allowlist;
+# verifier_pipeline remains the exact binary-level exception because its
+# host/-named bodies boot verifier VMs directly.
 [[profile.default.overrides]]
 filter = '''
 not(
@@ -577,6 +584,7 @@ not(
   | binary(=vm_integration)
   | binary(=extra_kconfig_e2e)
   | binary(=wprof_e2e)
+  | binary(=verifier_pipeline)
   | (
     binary(=ktstr_cli)
     & test(=shell_exec_echo)

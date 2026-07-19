@@ -472,6 +472,11 @@ mod tests {
             })
             .expect("profile.default explicitly assigns resource users to @global");
         let resource = normalized_filter(resource);
+        assert!(
+            resource.contains("binary(=verifier_pipeline)"),
+            "host/-named verifier API drivers boot KtstrVm internally and must \
+             remain in the resource-admission pool",
+        );
 
         for profile in ["ci", "default"] {
             let blocks = profile_override_blocks(CONFIG, profile);
