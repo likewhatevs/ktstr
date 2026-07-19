@@ -55,18 +55,6 @@ fn reservation_wait_progress_hook_is_synchronous_and_scoped() {
 // longer needs to dodge a high range.
 // ─────────────────────────────────────────────────────────────
 
-/// Collect the distinct host NUMA node IDs the given CPUs belong
-/// to. Tests that assert "these N CPUs all live on one NUMA node"
-/// (or span two) route through this helper so the CPU → node
-/// lookup and the single-CPU default stay in one place rather
-/// than duplicating the same closure across every assertion
-/// site.
-fn numa_nodes_for_cpus(topo: &HostTopology, cpus: &[usize]) -> std::collections::BTreeSet<usize> {
-    cpus.iter()
-        .map(|c| topo.cpu_to_node.get(c).copied().unwrap_or(0))
-        .collect()
-}
-
 // -- synthetic topology mapping tests --
 
 /// Backwards-compat helper: builds a synthetic HostTopology from

@@ -852,7 +852,7 @@ impl HostTopology {
             preferred_cpus,
             preferred_shared_llcs,
             preferred_exclusive_llcs,
-            performance_prefers_shared,
+            performance_prefers_shared: _,
         } = inputs;
         let mut guest_nodes = BTreeMap::<u32, Vec<usize>>::new();
         for (index, demand) in demands.iter().enumerate() {
