@@ -30,6 +30,32 @@ fn validate_task_happy_path_accepts() {
     assert!(validate(&kernel, 0, 12345, DEFAULT_START_TIME, &offs).is_ok());
 }
 
+/// Validation scalar reads follow each member's BTF width. All ordinary
+/// integer widths supported by GuestMem round-trip, while an unusual width is
+/// rejected explicitly instead of extending into adjacent guest state.
+#[test]
+fn validation_integer_reads_supported_widths_and_rejects_unknown_width() {
+    let mut buf = vec![0u8; 4096];
+    buf[0x10] = 0xAB;
+    buf[0x20..0x22].copy_from_slice(&0xCDEFu16.to_ne_bytes());
+    buf[0x30..0x34].copy_from_slice(&0x1234_5678u32.to_ne_bytes());
+    buf[0x40..0x48].copy_from_slice(&0x0123_4567_89AB_CDEFu64.to_ne_bytes());
+    let kernel = build_test_kernel(&mut buf, Default::default());
+    let read = |offset, width| {
+        read_validation_integer(kernel.mem(), 0, "fixture", IntegerField { offset, width })
+    };
+
+    assert_eq!(read(0x10, 1).unwrap(), 0xAB);
+    assert_eq!(read(0x20, 2).unwrap(), 0xCDEF);
+    assert_eq!(read(0x30, 4).unwrap(), 0x1234_5678);
+    assert_eq!(read(0x40, 8).unwrap(), 0x0123_4567_89AB_CDEF);
+
+    let err = read(0x50, 3).expect_err("unsupported integer width must reject");
+    assert!(err.contains("task_struct.fixture"), "{err}");
+    assert!(err.contains("width=3"), "{err}");
+    assert!(err.contains("supported widths: 1, 2, 4, 8"), "{err}");
+}
+
 /// L1 (pid mismatch): walker matched a task whose pid changed
 /// between walker scan and validation read. Defense against slab
 /// recycle.

@@ -1122,8 +1122,13 @@ fn int_byte_width(btf: &Btf, ty: btf_rs::Type) -> Option<usize> {
 /// Resolve a dot-path within `root` to `(byte_offset_from_root,
 /// leaf_int_width)`. Mirrors [`nested_member_byte_offset`]'s descent but also
 /// returns the leaf integer's BTF-declared byte size (so reads never hardcode
-/// a width). `None` on any resolve failure or a non-integer leaf.
-fn nested_member_offset_and_width(
+/// a width). Shared by BPF-map field reads and kernel-structure validation:
+/// both must follow kernel layout changes that alter a scalar's width without
+/// moving its containing structure.
+///
+/// Returns `None` on any resolve failure, a non-integer leaf, or a bitfield
+/// leaf whose neighbouring bits cannot safely be read as part of the value.
+pub(crate) fn nested_member_offset_and_width(
     btf: &Btf,
     root: &btf_rs::Struct,
     path: &str,
@@ -1139,13 +1144,16 @@ fn nested_member_offset_and_width(
         let (off, member) = member_byte_offset_with_member(btf, &current, part).ok()?;
         total = total.checked_add(off)?;
         if is_last {
-            // A bitfield leaf (sub-byte width, kind_flag==1) cannot be read as
-            // a whole little-endian integer without capturing neighbouring
-            // bits, so reject it rather than return a wrong value.
+            // A positive-width bitfield leaf cannot be read as a whole
+            // little-endian integer without capturing neighbouring bits, so
+            // reject it rather than return a wrong value. `kind_flag` belongs
+            // to the containing struct, not to each member: btf-rs therefore
+            // returns `Some(0)` for ordinary members of a struct that contains
+            // any bitfield. Zero means this member is not itself a bitfield.
             // (`member_byte_offset_with_member` already rejects a non-byte-
             // aligned offset; this additionally rejects a byte-aligned offset
             // with a sub-byte size.)
-            if member.bitfield_size().is_some() {
+            if matches!(member.bitfield_size(), Some(width) if width > 0) {
                 return None;
             }
             let leaf_ty = btf.resolve_chained_type(&member).ok()?;

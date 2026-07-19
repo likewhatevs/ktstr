@@ -737,6 +737,11 @@ impl GuestMem {
         u8::from_ne_bytes(self.read_scalar::<1>(pa, offset))
     }
 
+    /// Read a u16 at DRAM offset `pa + offset`.
+    pub fn read_u16(&self, pa: u64, offset: usize) -> u16 {
+        u16::from_ne_bytes(self.read_scalar::<2>(pa, offset))
+    }
+
     /// Read a u32 at DRAM offset `pa + offset`.
     pub fn read_u32(&self, pa: u64, offset: usize) -> u32 {
         u32::from_ne_bytes(self.read_scalar::<4>(pa, offset))

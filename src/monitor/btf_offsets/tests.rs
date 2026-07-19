@@ -1891,3 +1891,53 @@ fn resolve_map_field_offset_width_rejects_non_int_and_bitfield_leaves() {
     let bbtf = Btf::from_bytes(&cast_build_btf(&btypes, &bstrings)).expect("synthetic btf");
     assert_eq!(resolve_map_field_offset_width(&bbtf, 2, "bit"), None);
 }
+
+/// BTF's `kind_flag` is struct-wide: when any member is a bitfield, btf-rs
+/// returns `Some(0)` from `Member::bitfield_size()` for every ordinary member
+/// in that struct. A zero width means "not a bitfield", so the shared
+/// offset+width resolver must retain the regular member while still rejecting
+/// its positive-width bitfield sibling.
+#[test]
+fn resolve_offset_width_accepts_zero_width_member_in_kind_flag_struct() {
+    let (strings, off) = build_strtab(&["u32", "mixed_t", "plain", "bits"]);
+    let (u32n, mixed_t, plain, bits) = (off[0], off[1], off[2], off[3]);
+    let types = vec![
+        CastSynType::Int {
+            name_off: u32n,
+            size: 4,
+            encoding: 0,
+            offset: 0,
+            bits: 32,
+        }, // id 1
+        CastSynType::BitfieldStruct {
+            name_off: mixed_t,
+            size: 8,
+            members: vec![
+                CastSynBitMember {
+                    name_off: bits,
+                    type_id: 1,
+                    bit_offset: 0,
+                    bitfield_size: 4,
+                },
+                CastSynBitMember {
+                    name_off: plain,
+                    type_id: 1,
+                    bit_offset: 32,
+                    bitfield_size: 0,
+                },
+            ],
+        }, // id 2
+    ];
+    let btf = Btf::from_bytes(&cast_build_btf(&types, &strings)).expect("synthetic mixed BTF");
+
+    assert_eq!(
+        resolve_map_field_offset_width(&btf, 2, "plain"),
+        Some((4, 4)),
+        "Some(0) identifies an ordinary member in a kind_flag struct"
+    );
+    assert_eq!(
+        resolve_map_field_offset_width(&btf, 2, "bits"),
+        None,
+        "a positive-width bitfield must remain unsupported"
+    );
+}

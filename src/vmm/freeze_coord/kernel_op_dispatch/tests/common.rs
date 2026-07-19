@@ -53,12 +53,27 @@ pub(super) mod synth_task {
 /// BTF-resolved offsets.
 pub(super) fn synth_validation_offsets() -> TaskValidationOffsets {
     TaskValidationOffsets {
-        pid: synth_task::PID_OFF,
-        start_time: synth_task::START_TIME_OFF,
-        state: synth_task::STATE_OFF,
-        on_rq: synth_task::ON_RQ_OFF,
+        pid: IntegerField {
+            offset: synth_task::PID_OFF,
+            width: 4,
+        },
+        start_time: IntegerField {
+            offset: synth_task::START_TIME_OFF,
+            width: 8,
+        },
+        state: IntegerField {
+            offset: synth_task::STATE_OFF,
+            width: 4,
+        },
+        on_rq: IntegerField {
+            offset: synth_task::ON_RQ_OFF,
+            width: 4,
+        },
         sched_class: synth_task::SCHED_CLASS_OFF,
-        start_boottime: synth_task::START_BOOTTIME_OFF,
+        start_boottime: IntegerField {
+            offset: synth_task::START_BOOTTIME_OFF,
+            width: 8,
+        },
         scx_dsq: synth_task::SCX_DSQ_OFF,
         scx_runnable_node: synth_task::SCX_RUNNABLE_NODE_OFF,
         tasks: synth_task::TASKS_OFF,
