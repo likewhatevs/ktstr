@@ -1,6 +1,6 @@
 //! Cross-process host-resource admission under nextest.
 //!
-//! Every ktstr process sharing a lock directory participates in one v5
+//! Every ktstr process sharing a lock directory participates in one v6
 //! fixed-record mmap registry. A ticket publishes one exact, non-empty CPU/LLC
 //! reservation claim plus the resources its planner may watch. Claims preserve
 //! the resource-lock semantics exactly: CPU and LLC claims independently use
@@ -188,7 +188,7 @@ const TEST_RETRY_WAKE_MARKER: &str = ".ktstr-test-retry-wake";
 
 /// Directory the protocol files live in — derived from the LLC
 /// lockfile path so the test-only lock-prefix override isolates the
-/// v5 registry files into the same per-test tempdir as the LLC locks
+/// v6 registry files into the same per-test tempdir as the LLC locks
 /// they coordinate.
 fn protocol_dir() -> PathBuf {
     Path::new(&super::llc_lock_path(0))
@@ -765,10 +765,12 @@ fn check_result<T>(result: Result<T>, cancelled: Option<&AtomicBool>) -> Result<
 
 pub(crate) struct GrantedProbe {
     designated: ClaimSet,
+    watch: ClaimSet,
     next_claim: ClaimSet,
     acquisition_allowed: bool,
     contention: Option<ContentionEvidence>,
     predecessors: registry::AggregateSnapshot,
+    availability: registry::AvailabilitySnapshot,
 }
 
 impl GrantedProbe {
@@ -790,6 +792,33 @@ impl GrantedProbe {
     /// the full admission prefix.
     pub(crate) fn conflicts_with_predecessors(&self, candidate: &ClaimSet) -> Result<bool> {
         self.predecessors.conflicts(candidate)
+    }
+
+    /// Whether one complete alternative is eligible to become this ticket's
+    /// next exact designation. This is a scan-time hint only: the coordinator
+    /// revalidates the published exact claim before granting its real probe.
+    pub(crate) fn candidate_ready(&self, candidate: &ClaimSet) -> Result<bool> {
+        registry::validate_claim_within_watch(candidate, &self.watch)?;
+        // A failed SH probe proves an EX holder and blocks either candidate
+        // mode. A failed EX probe may have met only an SH holder, so retain an
+        // SH alternative; the coordinator still revalidates it before grant.
+        let just_contended = self.contention.as_ref().is_some_and(|evidence| {
+            match evidence.blocker {
+                ResourceKey::Cpu(cpu) => {
+                    candidate.cpus.contains(&cpu)
+                        && (evidence.mode == FlockMode::Shared
+                            || candidate.cpu_mode == ClaimMode::Exclusive)
+                }
+                ResourceKey::Llc(llc) => {
+                    candidate.llcs.contains(&llc)
+                        && (evidence.mode == FlockMode::Shared
+                            || candidate.llc_mode == ClaimMode::Exclusive)
+                }
+            }
+        });
+        Ok(!just_contended
+            && !self.predecessors.conflicts(candidate)?
+            && self.availability.allows(candidate)?)
     }
 
     pub(crate) fn try_acquire<T, O: IntoProbeOutcome<T>>(
@@ -924,6 +953,178 @@ pub(crate) fn exercise_cpu_shared_commit_improvement_for_tests() -> Result<(u64,
 #[cfg(test)]
 pub(crate) fn exercise_cpu_mode_repair_for_tests() -> Result<(bool, bool, bool, bool)> {
     registry::exercise_cpu_mode_repair_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_prefix_callback_scaling_for_tests(
+    waiters: usize,
+) -> Result<(usize, usize, usize)> {
+    registry::exercise_prefix_callback_scaling_for_tests(waiters)
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_one_shot_replacement_for_tests(
+) -> Result<(usize, bool, bool, bool, bool, usize)> {
+    registry::exercise_one_shot_replacement_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_prefix_epoch_validation_for_tests(
+) -> Result<(usize, bool, bool)> {
+    registry::exercise_prefix_epoch_validation_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_prefix_order_and_repair_for_tests(
+) -> Result<(bool, bool, bool, bool)> {
+    registry::exercise_prefix_order_and_repair_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_prefix_refresh_after_predecessor_release_for_tests(
+) -> Result<(bool, bool, bool, bool)> {
+    registry::exercise_prefix_refresh_after_predecessor_release_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool, bool)> {
+    registry::exercise_issue_serial_race_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_candidate_ready_matrix_for_tests() -> Result<()> {
+    let predecessor = ClaimSet::with_modes(
+        [1usize],
+        [1usize],
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let (predecessors, availability) = registry::probe_snapshots_for_tests(
+        &[predecessor],
+        &[
+            (1, Some(registry::CpuAvailability::Free)),
+            (2, Some(registry::CpuAvailability::SharedHeld)),
+            (3, Some(registry::CpuAvailability::ExclusiveHeld)),
+            (4, None),
+            (5, Some(registry::CpuAvailability::Free)),
+        ],
+        &[
+            (1, Some(registry::LlcAvailability::Free)),
+            (2, Some(registry::LlcAvailability::SharedHeld)),
+            (3, Some(registry::LlcAvailability::ExclusiveHeld)),
+            (4, None),
+            (5, Some(registry::LlcAvailability::Free)),
+        ],
+    )?;
+    let watch = ClaimSet::with_modes(
+        1usize..=5,
+        1usize..=5,
+        FlockMode::Exclusive,
+        FlockMode::Exclusive,
+    );
+    let designated = ClaimSet::with_modes(
+        std::iter::empty(),
+        [5usize],
+        FlockMode::Exclusive,
+        FlockMode::Shared,
+    );
+    let mut probe = GrantedProbe {
+        designated: designated.clone(),
+        watch,
+        next_claim: designated.clone(),
+        acquisition_allowed: false,
+        contention: None,
+        predecessors,
+        availability,
+    };
+    let cpu = |index, mode| {
+        ClaimSet::with_modes(
+            std::iter::empty(),
+            [index],
+            FlockMode::Exclusive,
+            mode,
+        )
+    };
+    let llc = |index, mode| {
+        ClaimSet::with_modes(
+            [index],
+            std::iter::empty(),
+            mode,
+            FlockMode::Exclusive,
+        )
+    };
+
+    anyhow::ensure!(
+        probe.candidate_ready(&cpu(1, FlockMode::Shared))?
+            && !probe.candidate_ready(&cpu(1, FlockMode::Exclusive))?
+            && probe.candidate_ready(&llc(1, FlockMode::Shared))?
+            && !probe.candidate_ready(&llc(1, FlockMode::Exclusive))?,
+        "SH predecessors must admit SH but reject EX candidates independently for CPU and LLC"
+    );
+    anyhow::ensure!(
+        probe.candidate_ready(&cpu(2, FlockMode::Shared))?
+            && !probe.candidate_ready(&cpu(2, FlockMode::Exclusive))?
+            && probe.candidate_ready(&llc(2, FlockMode::Shared))?
+            && !probe.candidate_ready(&llc(2, FlockMode::Exclusive))?,
+        "shared-held availability must admit SH and reject EX candidates"
+    );
+    anyhow::ensure!(
+        !probe.candidate_ready(&cpu(3, FlockMode::Shared))?
+            && !probe.candidate_ready(&cpu(3, FlockMode::Exclusive))?
+            && !probe.candidate_ready(&llc(3, FlockMode::Shared))?
+            && !probe.candidate_ready(&llc(3, FlockMode::Exclusive))?
+            && !probe.candidate_ready(&cpu(4, FlockMode::Shared))?
+            && !probe.candidate_ready(&llc(4, FlockMode::Shared))?,
+        "exclusive-held and unknown resources must reject every candidate mode"
+    );
+    anyhow::ensure!(
+        probe
+            .candidate_ready(&cpu(6, FlockMode::Exclusive))
+            .is_err(),
+        "a candidate outside the immutable watch must be rejected"
+    );
+
+    probe.contention = Some(ContentionEvidence {
+        blocker: ResourceKey::Cpu(5),
+        mode: FlockMode::Shared,
+        _witness: std::fs::File::open("/dev/null")?.into(),
+    });
+    anyhow::ensure!(
+        !probe.candidate_ready(&designated)?
+            && probe.candidate_ready(&llc(5, FlockMode::Exclusive))?,
+        "failed SH contention must suppress every mode on only that resource"
+    );
+    probe.contention = Some(ContentionEvidence {
+        blocker: ResourceKey::Cpu(5),
+        mode: FlockMode::Exclusive,
+        _witness: std::fs::File::open("/dev/null")?.into(),
+    });
+    anyhow::ensure!(
+        probe.candidate_ready(&designated)?
+            && !probe.candidate_ready(&cpu(5, FlockMode::Exclusive))?,
+        "failed EX contention must retain a compatible SH alternative while suppressing EX"
+    );
+    probe.contention = None;
+
+    let mut ran = false;
+    let acquired = probe.try_acquire(&designated, || {
+        ran = true;
+        Ok::<Option<()>, anyhow::Error>(Some(()))
+    })?;
+    anyhow::ensure!(
+        acquired.is_none() && !ran,
+        "REPLAN must never run even its designated acquisition"
+    );
+    probe.acquisition_allowed = true;
+    let acquired = probe.try_acquire(&cpu(2, FlockMode::Shared), || {
+        ran = true;
+        Ok::<Option<()>, anyhow::Error>(Some(()))
+    })?;
+    anyhow::ensure!(
+        acquired.is_none() && !ran,
+        "a GRANTED callback must not directly acquire an alternate candidate"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1143,13 +1344,15 @@ where
             registry::State::Granted | registry::State::Replan => {
                 let result = ticket.run_granted(
                     cancelled,
-                    |designated, acquisition_allowed, predecessors| {
+                    |designated, watch, acquisition_allowed, predecessors, availability| {
                         let mut probe = GrantedProbe {
                             designated: designated.clone(),
+                            watch: watch.clone(),
                             next_claim: designated.clone(),
                             acquisition_allowed,
                             contention: None,
                             predecessors,
+                            availability,
                         };
                         let acquired = try_acquire(&mut probe)?;
                         Ok(registry::GrantAttempt {

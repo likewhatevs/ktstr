@@ -20,8 +20,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-const MAGIC: u64 = 0x4b54_5354_5251_3035; // "KTSTRQ05"
-const VERSION: u32 = 5;
+const MAGIC: u64 = 0x4b54_5354_5251_3036; // "KTSTRQ06"
+const VERSION: u32 = 6;
 const HEADER_FIXED: usize = 256;
 const HEADER_ALIGN: usize = 4096;
 const RECORD_FIXED: usize = 128;
@@ -30,8 +30,8 @@ const RECORDS_PER_CHUNK: usize = 64;
 const NONE_SLOT: u64 = u64::MAX;
 const MAX_RESOURCE_BITS: usize = 1 << 20;
 const MAX_REGISTRY_SLOTS: u64 = 1 << 16;
-const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v5-init-";
-const LIVENESS_PREFIX: &str = "ktstr-acquire-v5-slot-";
+const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v6-init-";
+const LIVENESS_PREFIX: &str = "ktstr-acquire-v6-slot-";
 const LIVENESS_SEPARATOR: &str = "-ticket-";
 const LIVENESS_SUFFIX: &str = ".live";
 
@@ -71,14 +71,32 @@ const R_GRANT_EPOCH: usize = 40;
 const R_BLOCK_KIND: usize = 48;
 const R_BLOCK_MODE: usize = 52;
 const R_BLOCK_INDEX: usize = 56;
-const R_REPLAN_SERIAL: usize = 64;
+/// Resource-improvement serial covered by this record's published prefix and
+/// availability snapshot. For WAITING records it is the last serial consumed
+/// by a completed callback; for GRANTED/REPLAN records it is the callback
+/// issuance serial. This distinction lets a newer issuance invalidate an
+/// in-flight callback without manufacturing a self-wake.
+const R_ISSUE_SERIAL: usize = 64;
 const R_REPLAN_CLAIM_EPOCH: usize = 72;
 const R_PREV_ACTIVE: usize = 80;
 const R_NEXT_ACTIVE: usize = 88;
 const R_CLAIM_LLC_MODE: usize = 96;
 const R_CLAIM_CPU_MODE: usize = 100;
 const R_WATCH_CPU_MODE: usize = 104;
+/// Publication stamp for the four derived predecessor bitsets. Zero means a
+/// writer died before publishing a complete snapshot.
+const R_PREFIX_EPOCH: usize = 112;
 const R_BITS: usize = RECORD_FIXED;
+
+const RB_CLAIM_CPUS: usize = 0;
+const RB_CLAIM_LLCS: usize = 1;
+const RB_WATCH_CPUS: usize = 2;
+const RB_WATCH_LLCS: usize = 3;
+const RB_PREFIX_CPU_ANY: usize = 4;
+const RB_PREFIX_CPU_EXCLUSIVE: usize = 5;
+const RB_PREFIX_LLC_ANY: usize = 6;
+const RB_PREFIX_LLC_EXCLUSIVE: usize = 7;
+const RECORD_BITMAPS: usize = 8;
 
 const STATE_FREE: u32 = 0;
 const STATE_WAITING: u32 = 1;
@@ -140,7 +158,9 @@ thread_local! {
         const { std::cell::Cell::new(0) };
     static LIVENESS_PROBES: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
-    static CLAIMS_BEFORE_RECORD_READS: std::cell::Cell<usize> =
+    static GRANT_PREFIX_RECORD_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static ACTIVE_LIST_RECORD_READS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     #[cfg(test)]
     static CANCEL_GRANTED_AFTER_COMMIT: std::cell::Cell<bool> =
@@ -265,6 +285,16 @@ pub(super) struct AggregateSnapshot {
 }
 
 impl AggregateSnapshot {
+    fn empty(layout: HeaderLayout) -> Self {
+        Self {
+            bits: layout.bits,
+            cpu_any: vec![0; layout.words],
+            cpu_exclusive: vec![0; layout.words],
+            llc_any: vec![0; layout.words],
+            llc_exclusive: vec![0; layout.words],
+        }
+    }
+
     pub(super) fn conflicts(&self, candidate: &ClaimSet) -> Result<bool> {
         validate_claim(candidate)?;
         claim_conflicts_bits(
@@ -278,6 +308,49 @@ impl AggregateSnapshot {
     }
 }
 
+pub(super) struct AvailabilitySnapshot {
+    bits: usize,
+    cpu_known: Vec<u64>,
+    cpu_sh_available: Vec<u64>,
+    cpu_ex_available: Vec<u64>,
+    llc_known: Vec<u64>,
+    llc_sh_available: Vec<u64>,
+    llc_ex_available: Vec<u64>,
+}
+
+impl AvailabilitySnapshot {
+    pub(super) fn allows(&self, candidate: &ClaimSet) -> Result<bool> {
+        validate_claim(candidate)?;
+        let cpu_available = match candidate.cpu_mode {
+            ClaimMode::Shared => &self.cpu_sh_available,
+            ClaimMode::Exclusive => &self.cpu_ex_available,
+        };
+        for &cpu in &candidate.cpus {
+            if cpu >= self.bits {
+                anyhow::bail!("CPU index {cpu} exceeds queue registry capacity");
+            }
+            let mask = 1u64 << (cpu % 64);
+            if self.cpu_known[cpu / 64] & mask == 0 || cpu_available[cpu / 64] & mask == 0 {
+                return Ok(false);
+            }
+        }
+        let llc_available = match candidate.llc_mode {
+            ClaimMode::Shared => &self.llc_sh_available,
+            ClaimMode::Exclusive => &self.llc_ex_available,
+        };
+        for &llc in &candidate.llcs {
+            if llc >= self.bits {
+                anyhow::bail!("LLC index {llc} exceeds queue registry capacity");
+            }
+            let mask = 1u64 << (llc % 64);
+            if self.llc_known[llc / 64] & mask == 0 || llc_available[llc / 64] & mask == 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Record {
     slot: u64,
@@ -288,9 +361,10 @@ struct Record {
     claim: ClaimSet,
     watch: ClaimSet,
     blocked_on: Option<BlockedOn>,
-    replan_serial: u64,
+    issue_serial: u64,
     replan_claim_epoch: u64,
     grant_epoch: u64,
+    prefix_epoch: u64,
     prev_active: u64,
     next_active: u64,
 }
@@ -302,9 +376,6 @@ pub(super) struct Ticket {
     liveness: Option<OwnedFd>,
     wake: Option<FutexSlot>,
     _interrupt_waiter: Option<InterruptibleFlockWaiter>,
-    attempt_serial: u64,
-    attempt_claim_epoch: u64,
-    attempted_claims: Vec<ClaimSet>,
     finished: bool,
 }
 
@@ -442,6 +513,11 @@ impl Ticket {
         } else {
             STATE_WAITING
         };
+        // A newly appended ticket's predecessor prefix is exactly the global
+        // aggregate before its own exact claim is counted.
+        let claim_epoch = table.claim_epoch();
+        let issue_serial = table.max_watch_serial(&watch)?;
+        let predecessors = table.aggregate_claim_snapshot();
         let newly_watched = table.newly_watched(&watch)?;
         let blocked_at = exact_blocker
             .map(|marker| table.blocker_serial(marker.blocker, marker.mode))
@@ -453,6 +529,9 @@ impl Ticket {
             &claim,
             &watch,
             initial_state,
+            &predecessors,
+            claim_epoch,
+            issue_serial,
         )?;
         table.append_active(slot)?;
         crash_at_for_tests("register_record_before_counts");
@@ -468,10 +547,6 @@ impl Ticket {
                     blocked_at.expect("initial blocker serial must accompany evidence"),
                 )?;
             }
-        }
-        if initial_state == STATE_GRANTED {
-            let claim_epoch = table.claim_epoch();
-            table.set_record_grant_epoch(slot, claim_epoch)?;
         }
         table.set_next_ticket(
             ticket
@@ -493,9 +568,6 @@ impl Ticket {
             liveness: Some(liveness),
             wake: Some(wake),
             _interrupt_waiter: interrupt_waiter,
-            attempt_serial: 0,
-            attempt_claim_epoch: 0,
-            attempted_claims: Vec::new(),
             finished: false,
         })
     }
@@ -656,9 +728,23 @@ impl Ticket {
     pub(super) fn run_granted<T>(
         &mut self,
         cancelled: Option<&AtomicBool>,
-        attempt: impl FnOnce(&ClaimSet, bool, AggregateSnapshot) -> Result<GrantAttempt<T>>,
+        attempt: impl FnOnce(
+            &ClaimSet,
+            &ClaimSet,
+            bool,
+            AggregateSnapshot,
+            AvailabilitySnapshot,
+        ) -> Result<GrantAttempt<T>>,
     ) -> Result<GrantResult<T>> {
-        let (designated, watch, acquisition_allowed, predecessors) = {
+        let (
+            designated,
+            watch,
+            acquisition_allowed,
+            predecessors,
+            availability,
+            callback_epoch,
+            callback_serial,
+        ) = {
             let _lock = lock_registry_interruptible_existing(cancelled)?;
             let mut table = Table::open_existing()?;
             table.repair_consistency_if_needed()?;
@@ -670,39 +756,53 @@ impl Ticket {
                 return Ok(GrantResult::LostGrant);
             }
             let claim_epoch = table.claim_epoch();
-            if record.state == STATE_GRANTED && record.grant_epoch != claim_epoch {
-                if table.min_changed_ticket() < record.ticket {
-                    table.set_record_state(self.slot, STATE_WAITING)?;
-                    table.clear_record_blocked(self.slot)?;
-                    table.set_pending_flag(PENDING_RESCAN);
-                    table.bump_generation()?;
-                    table.elect_coordinator()?;
-                    drop(table);
-                    drop(_lock);
-                    notify_coordinator();
-                    return Ok(GrantResult::LostGrant);
-                }
-                // Only later tickets changed. Their reservations cannot
-                // invalidate this earlier grant, so refresh its stamp without
-                // a registry scan.
-                table.set_record_grant_epoch(self.slot, claim_epoch)?;
+            let state_epoch = if record.state == STATE_GRANTED {
+                record.grant_epoch
+            } else {
+                record.replan_claim_epoch
+            };
+            let (mut prefix_epoch, predecessors) = table.cached_prefix(record.slot)?;
+            let issue_serial = record.issue_serial;
+            let current_watch_serial = table.max_watch_serial(&record.watch)?;
+            let earlier_invalidated =
+                table.min_changed_ticket() < record.ticket && prefix_epoch != claim_epoch;
+            if prefix_epoch == 0
+                || prefix_epoch != state_epoch
+                || earlier_invalidated
+                || issue_serial != current_watch_serial
+            {
+                table.set_record_state(self.slot, STATE_WAITING)?;
+                table.clear_record_blocked(self.slot)?;
+                table.set_pending_flag(PENDING_RESCAN);
+                table.bump_generation()?;
+                table.elect_coordinator()?;
+                drop(table);
+                drop(_lock);
+                notify_coordinator();
+                return Ok(GrantResult::LostGrant);
             }
-            let watch_serial = table.max_watch_serial(&record.watch)?;
-            let prefix_changed = self.attempt_claim_epoch != record.replan_claim_epoch;
-            if self.attempt_serial != watch_serial || prefix_changed {
-                self.attempt_serial = watch_serial;
-                self.attempted_claims.clear();
+            // Changes belonging only to later tickets cannot alter this
+            // prefix. Keep a surviving grant and its cache on the current
+            // epoch so a completed scan may safely retire the old minimum.
+            if record.state == STATE_GRANTED && prefix_epoch != claim_epoch {
+                table.publish_prefix(
+                    record.slot,
+                    &predecessors,
+                    R_GRANT_EPOCH,
+                    claim_epoch,
+                    current_watch_serial,
+                )?;
+                prefix_epoch = claim_epoch;
             }
-            self.attempt_claim_epoch = record.replan_claim_epoch;
-            if !self.attempted_claims.contains(&record.claim) {
-                self.attempted_claims.push(record.claim.clone());
-            }
-            let predecessors = table.claims_before(record.ticket)?;
+            let availability = table.availability_snapshot();
             (
                 record.claim,
                 record.watch,
                 record.state == STATE_GRANTED,
                 predecessors,
+                availability,
+                prefix_epoch,
+                current_watch_serial,
             )
         };
 
@@ -711,7 +811,13 @@ impl Ticket {
         // flock. Disjoint grants can therefore probe concurrently, while the
         // aggregate fence still excludes conflicting fast paths.
         let mut result = normalize_cancellation(
-            attempt(&designated, acquisition_allowed, predecessors),
+            attempt(
+                &designated,
+                &watch,
+                acquisition_allowed,
+                predecessors,
+                availability,
+            ),
             cancelled,
         )?;
 
@@ -723,18 +829,36 @@ impl Ticket {
             .filter(|record| record.ticket == self.ticket)
             .ok_or_else(|| anyhow::anyhow!("live queue ticket {} disappeared", self.ticket))?;
         let claim_epoch = table.claim_epoch();
-        let stale = acquisition_allowed
-            && record.grant_epoch != claim_epoch
-            && table.min_changed_ticket() < record.ticket;
-        let replan_stale =
-            !acquisition_allowed && record.replan_claim_epoch != self.attempt_claim_epoch;
         let expected_state = if acquisition_allowed {
             STATE_GRANTED
         } else {
             STATE_REPLAN
         };
-        if record.state != expected_state || record.claim != designated || stale || replan_stale {
-            if record.state == STATE_GRANTED && stale {
+        let state_epoch = if acquisition_allowed {
+            record.grant_epoch
+        } else {
+            record.replan_claim_epoch
+        };
+        let prefix_epoch = table.record_prefix_epoch(record.slot)?;
+        let current_watch_serial = table.max_watch_serial(&watch)?;
+        let earlier_invalidated =
+            table.min_changed_ticket() < record.ticket && callback_epoch != claim_epoch;
+        let publication_changed = state_epoch != callback_epoch
+            || prefix_epoch != callback_epoch
+            || record.issue_serial != callback_serial;
+        let unissued_change =
+            earlier_invalidated || current_watch_serial != callback_serial;
+        let stale = publication_changed || unissued_change;
+        if record.state != expected_state || record.claim != designated || stale {
+            // A changed publication token means the coordinator already issued
+            // a fresh callback snapshot. Leave that runnable state intact. A
+            // resource or claim change without a newer publication must return
+            // through WAITING so the coordinator can publish one.
+            if record.state == expected_state
+                && record.claim == designated
+                && unissued_change
+                && !publication_changed
+            {
                 table.set_record_state(self.slot, STATE_WAITING)?;
                 table.clear_record_blocked(self.slot)?;
                 table.set_pending_flag(PENDING_RESCAN);
@@ -743,13 +867,10 @@ impl Ticket {
             }
             drop(table);
             drop(lock);
-            if stale || replan_stale {
+            if stale {
                 notify_coordinator();
             }
             return Ok(GrantResult::LostGrant);
-        }
-        if acquisition_allowed && record.grant_epoch != claim_epoch {
-            table.set_record_grant_epoch(self.slot, claim_epoch)?;
         }
         check_cancelled(cancelled)?;
 
@@ -785,15 +906,6 @@ impl Ticket {
         if let Some(evidence) = result.contention.as_ref() {
             validate_contention_within_watch(&[evidence.marker()], &watch)?;
         }
-        let current_watch_serial = table.max_watch_serial(&watch)?;
-        let prefix_changed = record.replan_claim_epoch != self.attempt_claim_epoch;
-        if current_watch_serial != self.attempt_serial || prefix_changed {
-            self.attempt_serial = current_watch_serial;
-            self.attempted_claims.clear();
-            self.attempted_claims.push(designated.clone());
-        }
-        self.attempt_claim_epoch = record.replan_claim_epoch;
-        let cycle_exhausted = self.attempted_claims.contains(&result.next_claim);
         let changed = result.next_claim != designated;
         let blocked = if let Some(evidence) = result.contention.as_ref() {
             let marker = evidence.marker();
@@ -802,29 +914,17 @@ impl Ticket {
             None
         };
         if changed {
-            let publish_state = if cycle_exhausted {
-                STATE_WAITING
-            } else {
-                STATE_REPLAN
-            };
             table.replace_claim(
                 self.slot,
                 record.ticket,
                 &designated,
                 &result.next_claim,
-                publish_state,
-                if cycle_exhausted {
-                    current_watch_serial
-                } else {
-                    0
-                },
+                STATE_WAITING,
+                current_watch_serial,
                 blocked,
                 false,
             )?;
-            table.wake_slot(self.slot)?;
-            if publish_state == STATE_WAITING {
-                table.elect_coordinator()?;
-            }
+            table.elect_coordinator()?;
         } else {
             table.begin_transaction()?;
             if let Some(evidence) = result.contention.as_ref() {
@@ -836,7 +936,7 @@ impl Ticket {
                 table.clear_record_blocked(self.slot)?;
             }
             table.set_record_state(self.slot, STATE_WAITING)?;
-            table.set_record_replan_serial(self.slot, current_watch_serial)?;
+            table.set_record_issue_serial(self.slot, current_watch_serial)?;
             table.set_pending_flag(PENDING_RESCAN);
             table.elect_coordinator_in_transaction()?;
             table.finish_transaction();
@@ -1427,6 +1527,89 @@ pub(super) fn round_trip_claim_modes_for_tests(
 }
 
 #[cfg(test)]
+pub(super) fn probe_snapshots_for_tests(
+    predecessors: &[ClaimSet],
+    cpu_availability: &[(usize, Option<CpuAvailability>)],
+    llc_availability: &[(usize, Option<LlcAvailability>)],
+) -> Result<(AggregateSnapshot, AvailabilitySnapshot)> {
+    let max_resource = predecessors
+        .iter()
+        .flat_map(|claim| claim.cpus.iter().chain(claim.llcs.iter()))
+        .copied()
+        .chain(cpu_availability.iter().map(|(index, _)| *index))
+        .chain(llc_availability.iter().map(|(index, _)| *index))
+        .max()
+        .unwrap_or(0);
+    let layout = HeaderLayout::new(max_resource.saturating_add(1).max(1))?;
+    let mut prefix = AggregateSnapshot::empty(layout);
+    for claim in predecessors {
+        add_claim_bits(
+            claim,
+            &mut prefix.cpu_any,
+            &mut prefix.cpu_exclusive,
+            &mut prefix.llc_any,
+            &mut prefix.llc_exclusive,
+            layout.bits,
+        )?;
+    }
+
+    let mut availability = AvailabilitySnapshot {
+        bits: layout.bits,
+        cpu_known: vec![0; layout.words],
+        cpu_sh_available: vec![0; layout.words],
+        cpu_ex_available: vec![0; layout.words],
+        llc_known: vec![0; layout.words],
+        llc_sh_available: vec![0; layout.words],
+        llc_ex_available: vec![0; layout.words],
+    };
+    for &(cpu, state) in cpu_availability {
+        set_snapshot_bit(&mut availability.cpu_known, cpu, state.is_some(), layout.bits)?;
+        set_snapshot_bit(
+            &mut availability.cpu_sh_available,
+            cpu,
+            state.is_some_and(|state| state != CpuAvailability::ExclusiveHeld),
+            layout.bits,
+        )?;
+        set_snapshot_bit(
+            &mut availability.cpu_ex_available,
+            cpu,
+            state == Some(CpuAvailability::Free),
+            layout.bits,
+        )?;
+    }
+    for &(llc, state) in llc_availability {
+        set_snapshot_bit(&mut availability.llc_known, llc, state.is_some(), layout.bits)?;
+        set_snapshot_bit(
+            &mut availability.llc_sh_available,
+            llc,
+            state.is_some_and(|state| state != LlcAvailability::ExclusiveHeld),
+            layout.bits,
+        )?;
+        set_snapshot_bit(
+            &mut availability.llc_ex_available,
+            llc,
+            state == Some(LlcAvailability::Free),
+            layout.bits,
+        )?;
+    }
+    Ok((prefix, availability))
+}
+
+#[cfg(test)]
+fn set_snapshot_bit(words: &mut [u64], index: usize, value: bool, bits: usize) -> Result<()> {
+    if index >= bits {
+        anyhow::bail!("snapshot resource index {index} exceeds {bits} bits");
+    }
+    let mask = 1u64 << (index % 64);
+    if value {
+        words[index / 64] |= mask;
+    } else {
+        words[index / 64] &= !mask;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub(super) fn shared_state_recovery_upgrade_count_for_tests() -> usize {
     SHARED_STATE_RECOVERY_UPGRADES.with(std::cell::Cell::get)
 }
@@ -1498,7 +1681,7 @@ pub(super) fn with_aggregate_fence<T>(
                 drop(shared);
                 // A creator may have died before publishing the initialized
                 // inode. Only an entirely zeroed image is unambiguously
-                // unpublished; malformed nonzero v5 state is never replaced.
+                // unpublished; malformed nonzero v6 state is never replaced.
                 let _lock = lock_registry_existing(FlockMode::Exclusive)?;
                 let mut table = Table::open(required_resource_bits(candidate))?;
                 table.repair_consistency_if_needed()?;
@@ -2237,7 +2420,8 @@ pub(super) fn exercise_exact_commit_scan_elision_for_tests(commits: usize) -> Re
         anyhow::bail!("exact-commit exercise needs at least one waiter");
     }
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
-    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let mut coordinator =
+        Ticket::register(coordinator_claim.clone(), coordinator_claim.clone(), None)?;
     let mut waiters = Vec::with_capacity(commits);
     for index in 0..commits {
         let claim = ClaimSet::new(std::iter::empty(), [index + 1], FlockMode::Exclusive);
@@ -2248,13 +2432,41 @@ pub(super) fn exercise_exact_commit_scan_elision_for_tests(commits: usize) -> Re
         let mut table = Table::open_existing()?;
         table.repair_consistency_if_needed()?;
         let claim_epoch = table.claim_epoch();
+        let prefix_bits = table.layout.bits;
         set_cpu_free_for_tests(&mut table, 0, false)?;
+        let mut prefix = AggregateSnapshot::empty(table.layout);
+        add_claim_bits(
+            &coordinator_claim,
+            &mut prefix.cpu_any,
+            &mut prefix.cpu_exclusive,
+            &mut prefix.llc_any,
+            &mut prefix.llc_exclusive,
+            prefix_bits,
+        )?;
         for (ticket, claim) in &waiters {
+            let record = table
+                .record(ticket.slot)?
+                .ok_or_else(|| anyhow::anyhow!("exact-commit waiter disappeared"))?;
+            let issue_serial = table.max_watch_serial(&record.watch)?;
+            table.publish_prefix(
+                ticket.slot,
+                &prefix,
+                R_GRANT_EPOCH,
+                claim_epoch,
+                issue_serial,
+            )?;
             table.set_record_state(ticket.slot, STATE_GRANTED)?;
-            table.set_record_grant_epoch(ticket.slot, claim_epoch)?;
             for &cpu in &claim.cpus {
                 set_cpu_free_for_tests(&mut table, cpu, true)?;
             }
+            add_claim_bits(
+                claim,
+                &mut prefix.cpu_any,
+                &mut prefix.cpu_exclusive,
+                &mut prefix.llc_any,
+                &mut prefix.llc_exclusive,
+                prefix_bits,
+            )?;
         }
         write_u64(&mut table.header, H_PENDING_FLAGS, 0);
         table.finish_claim_scan();
@@ -2275,15 +2487,15 @@ pub(super) fn exercise_exact_commit_scan_elision_for_tests(commits: usize) -> Re
         }
         let result = ticket.run_granted(
             None,
-            |designated, acquisition_allowed, _predecessors| {
-            if !acquisition_allowed || designated != claim {
-                anyhow::bail!("exact-commit waiter lost its prepared grant");
-            }
-            Ok(GrantAttempt {
-                acquired: Some(()),
-                next_claim: designated.clone(),
-                contention: None,
-            })
+            |designated, _watch, acquisition_allowed, _predecessors, _availability| {
+                if !acquisition_allowed || designated != claim {
+                    anyhow::bail!("exact-commit waiter lost its prepared grant");
+                }
+                Ok(GrantAttempt {
+                    acquired: Some(()),
+                    next_claim: designated.clone(),
+                    contention: None,
+                })
             },
         )?;
         if !matches!(result, GrantResult::Acquired(())) {
@@ -2612,6 +2824,533 @@ pub(super) fn exercise_cpu_mode_repair_for_tests() -> Result<(bool, bool, bool, 
 }
 
 #[cfg(test)]
+pub(super) fn exercise_prefix_callback_scaling_for_tests(
+    waiter_count: usize,
+) -> Result<(usize, usize, usize)> {
+    if waiter_count == 0 {
+        anyhow::bail!("prefix callback scaling exercise needs at least one waiter");
+    }
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(
+        coordinator_claim.clone(),
+        coordinator_claim.clone(),
+        None,
+    )?;
+    let mut waiters = Vec::with_capacity(waiter_count);
+    for index in 0..waiter_count {
+        let claim = coordinator_claim.clone();
+        let watch = ClaimSet::new(
+            std::iter::empty(),
+            [0usize, index.saturating_add(1)],
+            FlockMode::Exclusive,
+        );
+        let ticket = Ticket::register(claim.clone(), watch, None)?;
+        if ticket.state(None)? != State::Replan {
+            anyhow::bail!("flexible waiter {index} did not start in REPLAN");
+        }
+        waiters.push((ticket, claim));
+    }
+
+    let active_reads_before = ACTIVE_LIST_RECORD_READS.with(std::cell::Cell::get);
+    let prefix_reads_before = GRANT_PREFIX_RECORD_READS.with(std::cell::Cell::get);
+    let mut callbacks = 0usize;
+    for (ticket, claim) in &mut waiters {
+        let result = ticket.run_granted(
+            None,
+            |designated, _watch, acquisition_allowed, _predecessors, _availability| {
+                callbacks += 1;
+                if acquisition_allowed || designated != claim {
+                    anyhow::bail!("REPLAN callback received an acquire license or wrong claim");
+                }
+                Ok(GrantAttempt::<()> {
+                    acquired: None,
+                    next_claim: designated.clone(),
+                    contention: None,
+                })
+            },
+        )?;
+        if !matches!(result, GrantResult::Requeued) {
+            anyhow::bail!("REPLAN callback did not publish exactly one WAITING result");
+        }
+    }
+    let active_reads =
+        ACTIVE_LIST_RECORD_READS.with(std::cell::Cell::get) - active_reads_before;
+    let prefix_reads =
+        GRANT_PREFIX_RECORD_READS.with(std::cell::Cell::get) - prefix_reads_before;
+
+    for (ticket, _) in &mut waiters {
+        ticket.finish(None)?;
+    }
+    coordinator.finish(None)?;
+    Ok((callbacks, prefix_reads, active_reads))
+}
+
+#[cfg(test)]
+pub(super) fn exercise_one_shot_replacement_for_tests(
+) -> Result<(usize, bool, bool, bool, bool, usize)> {
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(
+        coordinator_claim.clone(),
+        coordinator_claim.clone(),
+        None,
+    )?;
+    let next_claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+    let watch =
+        ClaimSet::new(std::iter::empty(), [0usize, 1usize], FlockMode::Exclusive);
+    let mut waiter = Ticket::register(coordinator_claim.clone(), watch, None)?;
+    if waiter.state(None)? != State::Replan {
+        anyhow::bail!("one-shot replacement waiter did not start in REPLAN");
+    }
+
+    let active_reads_before = ACTIVE_LIST_RECORD_READS.with(std::cell::Cell::get);
+    let mut callbacks = 0usize;
+    let mut acquisition_allowed = true;
+    let result = waiter.run_granted(
+        None,
+        |designated, _watch, allowed, _predecessors, _availability| {
+            callbacks += 1;
+            acquisition_allowed = allowed;
+            if designated != &coordinator_claim {
+                anyhow::bail!("one-shot callback received the wrong designation");
+            }
+            Ok(GrantAttempt::<()> {
+                acquired: None,
+                next_claim: next_claim.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    let active_reads =
+        ACTIVE_LIST_RECORD_READS.with(std::cell::Cell::get) - active_reads_before;
+    let (waiting, replaced, rescan_pending) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let record = table
+            .record(waiter.slot)?
+            .ok_or_else(|| anyhow::anyhow!("one-shot replacement waiter disappeared"))?;
+        (
+            record.state == STATE_WAITING,
+            record.claim == next_claim,
+            table.pending_flags() & PENDING_RESCAN != 0,
+        )
+    };
+    waiter.finish(None)?;
+    coordinator.finish(None)?;
+    Ok((
+        callbacks,
+        matches!(result, GrantResult::Requeued) && !acquisition_allowed,
+        waiting,
+        replaced,
+        rescan_pending,
+        active_reads,
+    ))
+}
+
+#[cfg(test)]
+pub(super) fn exercise_prefix_epoch_validation_for_tests(
+) -> Result<(usize, bool, bool)> {
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(
+        coordinator_claim.clone(),
+        coordinator_claim.clone(),
+        None,
+    )?;
+    let watch =
+        ClaimSet::new(std::iter::empty(), [0usize, 1usize], FlockMode::Exclusive);
+    let mut waiter = Ticket::register(coordinator_claim, watch, None)?;
+    if waiter.state(None)? != State::Replan {
+        anyhow::bail!("epoch validation waiter did not start in REPLAN");
+    }
+
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let bytes = table
+            .record_bytes_mut(waiter.slot)?
+            .ok_or_else(|| anyhow::anyhow!("epoch validation waiter disappeared"))?;
+        write_u64(bytes, R_PREFIX_EPOCH, 0);
+    }
+    let mut callbacks = 0usize;
+    let torn = waiter.run_granted(
+        None,
+        |_designated, _watch, _allowed, _predecessors, _availability| {
+            callbacks += 1;
+            Ok(GrantAttempt::<()> {
+                acquired: None,
+                next_claim: ClaimSet::default(),
+                contention: None,
+            })
+        },
+    )?;
+    let torn_demoted =
+        matches!(torn, GrantResult::LostGrant) && waiter.state(None)? == State::Waiting;
+    let empty = BTreeSet::new();
+    coordinator.schedule(
+        None,
+        &empty,
+        &empty,
+        false,
+        None,
+        &[],
+        None,
+        &[],
+        false,
+        None,
+        false,
+        None,
+    )?;
+    let torn_rejected = torn_demoted && waiter.state(None)? == State::Replan;
+
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let (_, prefix) = table.cached_prefix(waiter.slot)?;
+        let epoch = table.claim_epoch();
+        let record = table
+            .record(waiter.slot)?
+            .ok_or_else(|| anyhow::anyhow!("epoch validation waiter disappeared"))?;
+        let issue_serial = table.max_watch_serial(&record.watch)?;
+        table.publish_prefix(
+            waiter.slot,
+            &prefix,
+            R_REPLAN_CLAIM_EPOCH,
+            epoch,
+            issue_serial,
+        )?;
+        table.set_record_state(waiter.slot, STATE_REPLAN)?;
+        table.finish_claim_scan();
+        table.mark_claim_changed(coordinator.ticket)?;
+    }
+    let stale = waiter.run_granted(
+        None,
+        |_designated, _watch, _allowed, _predecessors, _availability| {
+            callbacks += 1;
+            Ok(GrantAttempt::<()> {
+                acquired: None,
+                next_claim: ClaimSet::default(),
+                contention: None,
+            })
+        },
+    )?;
+    let stale_rejected =
+        matches!(stale, GrantResult::LostGrant) && waiter.state(None)? == State::Waiting;
+
+    waiter.finish(None)?;
+    coordinator.finish(None)?;
+    Ok((callbacks, torn_rejected, stale_rejected))
+}
+
+#[cfg(test)]
+pub(super) fn exercise_prefix_order_and_repair_for_tests(
+) -> Result<(bool, bool, bool, bool)> {
+    let predecessor_claim = ClaimSet::with_modes(
+        std::iter::empty(),
+        [1usize],
+        FlockMode::Exclusive,
+        FlockMode::Shared,
+    );
+    let mut predecessor = Ticket::register(
+        predecessor_claim.clone(),
+        predecessor_claim.clone(),
+        None,
+    )?;
+    let target_claim =
+        ClaimSet::new(std::iter::empty(), [2usize], FlockMode::Exclusive);
+    let target_watch = ClaimSet::new(
+        std::iter::empty(),
+        [1usize, 2usize, 3usize],
+        FlockMode::Exclusive,
+    );
+    let mut target = Ticket::register(target_claim.clone(), target_watch, None)?;
+    let successor_claim =
+        ClaimSet::new(std::iter::empty(), [3usize], FlockMode::Exclusive);
+    let mut successor =
+        Ticket::register(successor_claim.clone(), successor_claim.clone(), None)?;
+    let shared_on_predecessor = ClaimSet::with_modes(
+        std::iter::empty(),
+        [1usize],
+        FlockMode::Exclusive,
+        FlockMode::Shared,
+    );
+    let exclusive_on_predecessor =
+        ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+
+    let (initial_modes_correct, initial_excludes_successor, repaired_modes_correct, repaired_order) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let target_record = table
+            .record(target.slot)?
+            .ok_or_else(|| anyhow::anyhow!("target record disappeared"))?;
+        let (target_epoch, target_prefix) = table.cached_prefix(target.slot)?;
+        let initial_modes_correct = target_epoch == target_record.replan_claim_epoch
+            && !target_prefix.conflicts(&shared_on_predecessor)?
+            && target_prefix.conflicts(&exclusive_on_predecessor)?;
+        let initial_excludes_successor = !target_prefix.conflicts(&successor_claim)?;
+
+        // Model a writer dying with an invalid derived cache. Repair must
+        // regenerate every ticket's prefix in ticket order before clearing
+        // the dirty marker.
+        atomic_u64(&table.header, H_AGGREGATE_DIRTY).store(1, Ordering::SeqCst);
+        table.repair_consistency_if_needed()?;
+        let target_record = table
+            .record(target.slot)?
+            .ok_or_else(|| anyhow::anyhow!("target record disappeared after repair"))?;
+        let successor_record = table
+            .record(successor.slot)?
+            .ok_or_else(|| anyhow::anyhow!("successor record disappeared after repair"))?;
+        let (target_epoch, target_prefix) = table.cached_prefix(target.slot)?;
+        let (successor_epoch, successor_prefix) = table.cached_prefix(successor.slot)?;
+        let repaired_modes_correct = target_epoch == target_record.replan_claim_epoch
+            && !target_prefix.conflicts(&shared_on_predecessor)?
+            && target_prefix.conflicts(&exclusive_on_predecessor)?;
+        let repaired_order = successor_epoch == successor_record.replan_claim_epoch
+            && !target_prefix.conflicts(&successor_claim)?
+            && successor_prefix.conflicts(&target_claim)?
+            && successor_prefix.conflicts(&exclusive_on_predecessor)?;
+        (
+            initial_modes_correct,
+            initial_excludes_successor,
+            repaired_modes_correct,
+            repaired_order,
+        )
+    };
+
+    successor.finish(None)?;
+    target.finish(None)?;
+    predecessor.finish(None)?;
+    Ok((
+        initial_modes_correct,
+        initial_excludes_successor,
+        repaired_modes_correct,
+        repaired_order,
+    ))
+}
+
+#[cfg(test)]
+pub(super) fn exercise_prefix_refresh_after_predecessor_release_for_tests(
+) -> Result<(bool, bool, bool, bool)> {
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(
+        coordinator_claim.clone(),
+        coordinator_claim.clone(),
+        None,
+    )?;
+    let predecessor_claim =
+        ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+    let mut predecessor = Ticket::register(
+        predecessor_claim.clone(),
+        predecessor_claim.clone(),
+        None,
+    )?;
+    let designated = ClaimSet::new(std::iter::empty(), [2usize], FlockMode::Exclusive);
+    let watch =
+        ClaimSet::new(std::iter::empty(), [1usize, 2usize], FlockMode::Exclusive);
+    let mut waiter = Ticket::register(designated.clone(), watch, None)?;
+    if waiter.state(None)? != State::Replan {
+        anyhow::bail!("release-prefix waiter did not start in REPLAN");
+    }
+
+    // Give the fixed predecessor an exact grant, then commit it as a real
+    // holder. Acquired removal deliberately does not advance the claim epoch:
+    // the real flock carries the same reservation until its release.
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, 1, true)?;
+        let claim_epoch = table.claim_epoch();
+        let (_, prefix) = table.cached_prefix(predecessor.slot)?;
+        let record = table
+            .record(predecessor.slot)?
+            .ok_or_else(|| anyhow::anyhow!("release-prefix predecessor disappeared"))?;
+        let issue_serial = table.max_watch_serial(&record.watch)?;
+        table.publish_prefix(
+            predecessor.slot,
+            &prefix,
+            R_GRANT_EPOCH,
+            claim_epoch,
+            issue_serial,
+        )?;
+        table.set_record_state(predecessor.slot, STATE_GRANTED)?;
+    }
+    let acquired = predecessor.run_granted(
+        None,
+        |designated, _watch, allowed, _predecessors, _availability| {
+            if !allowed || designated != &predecessor_claim {
+                anyhow::bail!("release-prefix predecessor lost its exact grant");
+            }
+            Ok(GrantAttempt {
+                acquired: Some(()),
+                next_claim: designated.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    if !matches!(acquired, GrantResult::Acquired(())) {
+        anyhow::bail!("release-prefix predecessor did not commit acquisition");
+    }
+
+    let candidate = predecessor_claim;
+    let (stale_before, refreshed_prefix, refreshed_serial) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let (_, before) = table.cached_prefix(waiter.slot)?;
+        let stale_before = before.conflicts(&candidate)?;
+
+        // Model the acquired predecessor's real flock closing. The improvement
+        // scan must refresh an already-REPLAN suffix record even though the
+        // claim epoch did not change.
+        set_cpu_free_for_tests(&mut table, 1, true)?;
+        table.stamp_resource_improvement(S_CPU_EX, 1)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible()?;
+
+        let record = table
+            .record(waiter.slot)?
+            .ok_or_else(|| anyhow::anyhow!("release-prefix waiter disappeared"))?;
+        let (_, after) = table.cached_prefix(waiter.slot)?;
+        (
+            stale_before,
+            !after.conflicts(&candidate)?,
+            record.issue_serial == table.max_watch_serial(&record.watch)?,
+        )
+    };
+
+    let mut candidate_ready = false;
+    let result = waiter.run_granted(
+        None,
+        |_designated, _watch, allowed, predecessors, availability| {
+            if allowed {
+                anyhow::bail!("release-prefix REPLAN callback received an acquire license");
+            }
+            candidate_ready =
+                !predecessors.conflicts(&candidate)? && availability.allows(&candidate)?;
+            Ok(GrantAttempt::<()> {
+                acquired: None,
+                next_claim: candidate.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    let replacement_committed = matches!(result, GrantResult::Requeued)
+        && {
+            let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+            let mut table = Table::open_existing()?;
+            table
+                .record(waiter.slot)?
+                .is_some_and(|record| record.claim == candidate && record.state == STATE_WAITING)
+        };
+
+    waiter.finish(None)?;
+    coordinator.finish(None)?;
+    Ok((
+        stale_before && refreshed_prefix,
+        refreshed_serial,
+        candidate_ready,
+        replacement_committed,
+    ))
+}
+
+#[cfg(test)]
+pub(super) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool, bool)> {
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(
+        coordinator_claim.clone(),
+        coordinator_claim.clone(),
+        None,
+    )?;
+    let designated = ClaimSet::new(std::iter::empty(), [2usize], FlockMode::Exclusive);
+    let candidate = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+    let watch =
+        ClaimSet::new(std::iter::empty(), [1usize, 2usize], FlockMode::Exclusive);
+    let mut waiter = Ticket::register(designated.clone(), watch, None)?;
+    if waiter.state(None)? != State::Replan {
+        anyhow::bail!("issue-serial waiter did not start in REPLAN");
+    }
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, 1, false)?;
+        set_cpu_free_for_tests(&mut table, 2, false)?;
+    }
+
+    let mut stale_snapshot_rejected = false;
+    let first = waiter.run_granted(
+        None,
+        |_designated, _watch, allowed, predecessors, availability| {
+            if allowed {
+                anyhow::bail!("issue-serial REPLAN callback received an acquire license");
+            }
+            if predecessors.conflicts(&candidate)? || availability.allows(&candidate)? {
+                anyhow::bail!("issue-serial callback did not start from the expected busy snapshot");
+            }
+            {
+                let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+                let mut table = Table::open_existing()?;
+                set_cpu_free_for_tests(&mut table, 1, true)?;
+                table.stamp_resource_improvement(S_CPU_EX, 1)?;
+                table.set_pending_flag(PENDING_RESCAN);
+                table.grant_compatible()?;
+            }
+            stale_snapshot_rejected = true;
+            Ok(GrantAttempt::<()> {
+                acquired: None,
+                next_claim: designated.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    stale_snapshot_rejected &=
+        matches!(first, GrantResult::LostGrant) && waiter.state(None)? == State::Replan;
+
+    let mut fresh_snapshot_seen = false;
+    let second = waiter.run_granted(
+        None,
+        |_designated, _watch, allowed, predecessors, availability| {
+            if allowed {
+                anyhow::bail!("fresh issue-serial REPLAN received an acquire license");
+            }
+            fresh_snapshot_seen =
+                !predecessors.conflicts(&candidate)? && availability.allows(&candidate)?;
+            Ok(GrantAttempt::<()> {
+                acquired: None,
+                next_claim: candidate.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    let replacement_committed = matches!(second, GrantResult::Requeued)
+        && {
+            let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+            let mut table = Table::open_existing()?;
+            table
+                .record(waiter.slot)?
+                .is_some_and(|record| record.claim == candidate && record.state == STATE_WAITING)
+        };
+    let serial_consumed_only_by_fresh_snapshot = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let record = table
+            .record(waiter.slot)?
+            .ok_or_else(|| anyhow::anyhow!("issue-serial waiter disappeared"))?;
+        record.issue_serial == table.max_watch_serial(&record.watch)?
+    };
+
+    waiter.finish(None)?;
+    coordinator.finish(None)?;
+    Ok((
+        stale_snapshot_rejected,
+        fresh_snapshot_seen,
+        replacement_committed,
+        serial_consumed_only_by_fresh_snapshot,
+    ))
+}
+
+#[cfg(test)]
 fn diagnostic_counter_for_tests(offset: usize) -> Result<u64> {
     let _lock = lock_registry_existing(FlockMode::Shared)?;
     let file = File::open(header_path())?;
@@ -2678,7 +3417,7 @@ fn validate_claim(claim: &ClaimSet) -> Result<()> {
     Ok(())
 }
 
-fn validate_claim_within_watch(claim: &ClaimSet, watch: &ClaimSet) -> Result<()> {
+pub(super) fn validate_claim_within_watch(claim: &ClaimSet, watch: &ClaimSet) -> Result<()> {
     if !claim.cpus.is_subset(&watch.cpus)
         || !claim.llcs.is_subset(&watch.llcs)
         || (!claim.cpus.is_empty()
@@ -2766,7 +3505,7 @@ fn required_resource_bits(claim: &ClaimSet) -> usize {
         .max()
         .unwrap_or(0)
         .saturating_add(1);
-    // The v5 mapping is deliberately overprovisioned once. It never needs a
+    // The v6 mapping is deliberately overprovisioned once. It never needs a
     // migration/grow protocol when the first low-index ticket is followed by a
     // valid sparse CPU/LLC index on the same host.
     claim_bits.max(host_cpu_resource_bits()).max(4096)
@@ -2807,11 +3546,11 @@ fn notify_path() -> PathBuf {
 }
 
 fn registry_data_dir() -> PathBuf {
-    protocol_dir().join("ktstr-acquire-registry-v5")
+    protocol_dir().join("ktstr-acquire-registry-v6")
 }
 
 pub(super) fn event_dir() -> PathBuf {
-    protocol_dir().join("ktstr-acquire-events-v5")
+    protocol_dir().join("ktstr-acquire-events-v6")
 }
 
 pub(super) fn notify_basename() -> Result<std::ffi::OsString> {
@@ -3045,7 +3784,7 @@ impl HeaderLayout {
         let record_payload = RECORD_FIXED
             .checked_add(
                 bitset_bytes
-                    .checked_mul(4)
+                    .checked_mul(RECORD_BITMAPS)
                     .ok_or_else(|| anyhow::anyhow!("queue registry record size overflow"))?,
             )
             .ok_or_else(|| anyhow::anyhow!("queue registry record size overflow"))?;
@@ -3478,6 +4217,9 @@ impl Table {
         claim: &ClaimSet,
         watch: &ClaimSet,
         publish_state: u32,
+        predecessors: &AggregateSnapshot,
+        claim_epoch: u64,
+        issue_serial: u64,
     ) -> Result<()> {
         let layout = self.layout;
         let bytes = self
@@ -3516,11 +4258,21 @@ impl Table {
         write_u32(bytes, R_BLOCK_KIND, BLOCK_NONE);
         write_u32(bytes, R_BLOCK_MODE, 0);
         write_u64(bytes, R_BLOCK_INDEX, 0);
-        write_u64(bytes, R_REPLAN_SERIAL, 0);
+        write_u64(bytes, R_ISSUE_SERIAL, issue_serial);
         write_u64(bytes, R_REPLAN_CLAIM_EPOCH, 0);
         write_u64(bytes, R_PREV_ACTIVE, NONE_SLOT);
         write_u64(bytes, R_NEXT_ACTIVE, NONE_SLOT);
         encode_claim(bytes, layout, claim, watch)?;
+        let state_epoch_offset = if publish_state == STATE_GRANTED {
+            R_GRANT_EPOCH
+        } else {
+            R_REPLAN_CLAIM_EPOCH
+        };
+        write_u64(bytes, state_epoch_offset, claim_epoch);
+        encode_prefix(bytes, layout, predecessors)?;
+        // The record itself is still FREE, so this final derived-cache stamp
+        // precedes (and is covered by) the authoritative state publication.
+        write_u64(bytes, R_PREFIX_EPOCH, claim_epoch);
         crash_at_for_tests("register_record_before_state_publish");
         // Publish the active state last. A killed writer therefore leaves
         // either a complete active record or a FREE record which dirty
@@ -3627,6 +4379,8 @@ impl Table {
             if records.len() >= usize::try_from(next_slot).unwrap_or(usize::MAX) {
                 anyhow::bail!("queue registry v{VERSION} active list contains a cycle");
             }
+            #[cfg(test)]
+            ACTIVE_LIST_RECORD_READS.with(|reads| reads.set(reads.get() + 1));
             let record = self.record(slot)?.ok_or_else(|| {
                 anyhow::anyhow!("queue registry v{VERSION} active slot {slot} is free")
             })?;
@@ -3661,103 +4415,114 @@ impl Table {
         Ok(records)
     }
 
-    /// Aggregate every exact reservation preceding `ticket` in arrival order.
-    ///
-    /// A flexible waiter replans outside the registry lock. Giving that
-    /// callback the immutable prefix lets it avoid an earlier reservation
-    /// which has not acquired its real flock yet; `/proc/locks` alone cannot
-    /// reveal such a claim. The returned shape is the same compact bitset
-    /// snapshot used by the global fast-path fence.
-    fn claims_before(&mut self, ticket: u64) -> Result<AggregateSnapshot> {
-        let mut cpu_any = vec![0u64; self.layout.words];
-        let mut cpu_exclusive = vec![0u64; self.layout.words];
-        let mut llc_any = vec![0u64; self.layout.words];
-        let mut llc_exclusive = vec![0u64; self.layout.words];
-        let next_slot = self.next_slot()?;
-        let mut slot = read_u64(&self.header, H_ACTIVE_HEAD);
-        let mut previous = NONE_SLOT;
-        let mut previous_ticket = 0;
-        let mut visited = 0usize;
-        let mut found = false;
-        while slot != NONE_SLOT {
-            if visited >= usize::try_from(next_slot).unwrap_or(usize::MAX) {
-                anyhow::bail!("queue registry v{VERSION} active list contains a cycle");
-            }
-            #[cfg(test)]
-            CLAIMS_BEFORE_RECORD_READS.with(|reads| reads.set(reads.get() + 1));
-            let bytes = self.record_bytes(slot)?.ok_or_else(|| {
-                anyhow::anyhow!("queue registry v{VERSION} active slot {slot} is free")
-            })?;
-            let state = read_u32(bytes, R_STATE);
-            if !matches!(
-                state,
-                STATE_WAITING | STATE_GRANTED | STATE_REPLAN | STATE_COORDINATOR
-            ) {
-                anyhow::bail!(
-                    "queue registry v{VERSION} active slot {slot} has invalid state {state}"
-                );
-            }
-            let current_ticket = read_u64(bytes, R_TICKET);
-            let prev_active = read_u64(bytes, R_PREV_ACTIVE);
-            let next_active = read_u64(bytes, R_NEXT_ACTIVE);
-            if prev_active != previous {
-                anyhow::bail!(
-                    "queue registry v{VERSION} active slot {slot} has prev={prev_active}, expected {previous}"
-                );
-            }
-            if current_ticket <= previous_ticket {
-                anyhow::bail!(
-                    "queue registry v{VERSION} active tickets are not strictly increasing at {current_ticket}"
-                );
-            }
-            if current_ticket == ticket {
-                found = true;
-                break;
-            }
-            if current_ticket > ticket {
-                anyhow::bail!(
-                    "queue ticket {ticket} is missing before active ticket {current_ticket}"
-                );
-            }
-            let llc_mode = read_u32(bytes, R_CLAIM_LLC_MODE);
-            if llc_mode > 1 {
-                anyhow::bail!(
-                    "queue registry v{VERSION} slot {slot} has invalid LLC claim mode {llc_mode}"
-                );
-            }
-            let cpu_mode = read_u32(bytes, R_CLAIM_CPU_MODE);
-            if cpu_mode > 1 {
-                anyhow::bail!(
-                    "queue registry v{VERSION} slot {slot} has invalid CPU claim mode {cpu_mode}"
-                );
-            }
-            for word in 0..self.layout.words {
-                let cpus = read_u64(bytes, R_BITS + word * 8);
-                cpu_any[word] |= cpus;
-                if cpu_mode == 1 {
-                    cpu_exclusive[word] |= cpus;
-                }
-                let llcs = read_u64(bytes, R_BITS + self.layout.words * 8 + word * 8);
-                llc_any[word] |= llcs;
-                if llc_mode == 1 {
-                    llc_exclusive[word] |= llcs;
-                }
-            }
-            previous = slot;
-            previous_ticket = current_ticket;
-            slot = next_active;
-            visited += 1;
-        }
-        if !found {
-            anyhow::bail!("queue ticket {ticket} is absent from the active list");
-        }
-        Ok(AggregateSnapshot {
+    fn aggregate_claim_snapshot(&self) -> AggregateSnapshot {
+        AggregateSnapshot {
             bits: self.layout.bits,
-            cpu_any,
-            cpu_exclusive,
-            llc_any,
-            llc_exclusive,
-        })
+            cpu_any: self.header_words(B_CLAIM_CPUS),
+            cpu_exclusive: self.header_words(B_CLAIM_CPU_EXCLUSIVE),
+            llc_any: self.header_words(B_CLAIM_LLC_ANY),
+            llc_exclusive: self.header_words(B_CLAIM_LLC_EXCLUSIVE),
+        }
+    }
+
+    fn availability_snapshot(&self) -> AvailabilitySnapshot {
+        AvailabilitySnapshot {
+            bits: self.layout.bits,
+            cpu_known: self.header_words(B_CPU_KNOWN),
+            cpu_sh_available: self.header_words(B_CPU_SH_AVAILABLE),
+            cpu_ex_available: self.header_words(B_CPU_EX_AVAILABLE),
+            llc_known: self.header_words(B_LLC_KNOWN),
+            llc_sh_available: self.header_words(B_LLC_SH_AVAILABLE),
+            llc_ex_available: self.header_words(B_LLC_EX_AVAILABLE),
+        }
+    }
+
+    fn header_words(&self, which: usize) -> Vec<u64> {
+        (0..self.layout.words)
+            .map(|word| {
+                read_u64(
+                    &self.header,
+                    self.layout.bitset_offset(which) + word * std::mem::size_of::<u64>(),
+                )
+            })
+            .collect()
+    }
+
+    /// Copy the scan-time predecessor reservation cached in this ticket's
+    /// record. This is O(host words), independent of queue depth.
+    fn cached_prefix(&mut self, slot: u64) -> Result<(u64, AggregateSnapshot)> {
+        let layout = self.layout;
+        let bytes = self
+            .record_bytes(slot)?
+            .ok_or_else(|| anyhow::anyhow!("queue slot {slot} disappeared during prefix read"))?;
+        #[cfg(test)]
+        GRANT_PREFIX_RECORD_READS.with(|reads| reads.set(reads.get() + 1));
+        let read_words = |which| {
+            (0..layout.words)
+                .map(|word| {
+                    read_u64(
+                        bytes,
+                        record_bitset_offset(layout, which)
+                            + word * std::mem::size_of::<u64>(),
+                    )
+                })
+                .collect()
+        };
+        Ok((
+            read_u64(bytes, R_PREFIX_EPOCH),
+            AggregateSnapshot {
+                bits: layout.bits,
+                cpu_any: read_words(RB_PREFIX_CPU_ANY),
+                cpu_exclusive: read_words(RB_PREFIX_CPU_EXCLUSIVE),
+                llc_any: read_words(RB_PREFIX_LLC_ANY),
+                llc_exclusive: read_words(RB_PREFIX_LLC_EXCLUSIVE),
+            },
+        ))
+    }
+
+    fn record_prefix_epoch(&mut self, slot: u64) -> Result<u64> {
+        let bytes = self.record_bytes(slot)?.ok_or_else(|| {
+            anyhow::anyhow!("queue slot {slot} disappeared during prefix epoch read")
+        })?;
+        Ok(read_u64(bytes, R_PREFIX_EPOCH))
+    }
+
+    /// Publish one complete predecessor cache. The epoch is invalidated first
+    /// and is the last word published, so a killed writer cannot expose torn
+    /// bitsets as authoritative callback input.
+    fn publish_prefix(
+        &mut self,
+        slot: u64,
+        prefix: &AggregateSnapshot,
+        state_epoch_offset: usize,
+        epoch: u64,
+        issue_serial: u64,
+    ) -> Result<()> {
+        if epoch == 0 || prefix.bits != self.layout.bits {
+            anyhow::bail!("invalid queue prefix publication epoch or layout");
+        }
+        let layout = self.layout;
+        let bytes = self
+            .record_bytes_mut(slot)?
+            .ok_or_else(|| anyhow::anyhow!("queue slot {slot} disappeared during prefix publish"))?;
+        write_u64(bytes, R_PREFIX_EPOCH, 0);
+        crash_at_for_tests("prefix_invalidated_before_copy");
+        for (which, words) in [
+            (RB_PREFIX_CPU_ANY, prefix.cpu_any.as_slice()),
+            (RB_PREFIX_CPU_EXCLUSIVE, prefix.cpu_exclusive.as_slice()),
+            (RB_PREFIX_LLC_ANY, prefix.llc_any.as_slice()),
+            (RB_PREFIX_LLC_EXCLUSIVE, prefix.llc_exclusive.as_slice()),
+        ] {
+            let offset = record_bitset_offset(layout, which);
+            for (word, value) in words.iter().copied().enumerate() {
+                write_u64(bytes, offset + word * std::mem::size_of::<u64>(), value);
+            }
+        }
+        crash_at_for_tests("prefix_copied_before_epoch");
+        write_u64(bytes, state_epoch_offset, epoch);
+        write_u64(bytes, R_ISSUE_SERIAL, issue_serial);
+        write_u64(bytes, R_PREFIX_EPOCH, epoch);
+        Ok(())
     }
 
     fn replace_claim(
@@ -3767,7 +4532,7 @@ impl Table {
         old: &ClaimSet,
         new: &ClaimSet,
         publish_state: u32,
-        replan_serial: u64,
+        issue_serial: u64,
         blocked: Option<(ContentionMarker, u64)>,
         persist_blocker: bool,
     ) -> Result<()> {
@@ -3778,7 +4543,7 @@ impl Table {
             old,
             new,
             publish_state,
-            replan_serial,
+            issue_serial,
             blocked,
             persist_blocker,
         )?;
@@ -3793,7 +4558,7 @@ impl Table {
         old: &ClaimSet,
         new: &ClaimSet,
         publish_state: u32,
-        replan_serial: u64,
+        issue_serial: u64,
         blocked: Option<(ContentionMarker, u64)>,
         persist_blocker: bool,
     ) -> Result<()> {
@@ -3833,7 +4598,7 @@ impl Table {
             write_u32(bytes, R_BLOCK_KIND, BLOCK_NONE);
             write_u32(bytes, R_BLOCK_MODE, 0);
             write_u64(bytes, R_BLOCK_INDEX, 0);
-            write_u64(bytes, R_REPLAN_SERIAL, replan_serial);
+            write_u64(bytes, R_ISSUE_SERIAL, issue_serial);
             write_u64(bytes, R_REPLAN_CLAIM_EPOCH, replan_claim_epoch);
             if persist_blocker && let Some((evidence, serial)) = blocked {
                 let (kind, index) = match evidence.blocker {
@@ -3963,22 +4728,15 @@ impl Table {
         Ok(())
     }
 
-    fn set_record_replan_serial(&mut self, slot: u64, serial: u64) -> Result<()> {
+    fn set_record_issue_serial(&mut self, slot: u64, serial: u64) -> Result<()> {
         let bytes = self.record_bytes_mut(slot)?.ok_or_else(|| {
-            anyhow::anyhow!("queue slot {slot} disappeared during replan-serial update")
+            anyhow::anyhow!("queue slot {slot} disappeared during issue-serial update")
         })?;
-        write_u64(bytes, R_REPLAN_SERIAL, serial);
+        write_u64(bytes, R_ISSUE_SERIAL, serial);
         Ok(())
     }
 
-    fn set_record_replan_claim_epoch(&mut self, slot: u64, epoch: u64) -> Result<()> {
-        let bytes = self.record_bytes_mut(slot)?.ok_or_else(|| {
-            anyhow::anyhow!("queue slot {slot} disappeared during replan-epoch update")
-        })?;
-        write_u64(bytes, R_REPLAN_CLAIM_EPOCH, epoch);
-        Ok(())
-    }
-
+    #[cfg(test)]
     fn set_record_grant_epoch(&mut self, slot: u64, epoch: u64) -> Result<()> {
         let bytes = self.record_bytes_mut(slot)?.ok_or_else(|| {
             anyhow::anyhow!("queue slot {slot} disappeared during grant-epoch update")
@@ -4053,6 +4811,7 @@ impl Table {
             )?;
             let flexible = claim_is_flexible(&record.claim, &record.watch);
             let availability_compatible = self.claim_availability_compatible(&record.claim)?;
+            let watch_serial = self.max_watch_serial(&record.watch)?;
             let blocker_ready = match record.blocked_on {
                 None => true,
                 Some(blocked) => {
@@ -4064,15 +4823,45 @@ impl Table {
                         || self.blocker_serial(blocked.key, blocked.mode)? > blocked.serial
                 }
             };
-            let replan_invalidated = record.state == STATE_REPLAN
-                && self.min_changed_ticket() < record.ticket
+            let replan_invalidated = self.min_changed_ticket() < record.ticket
                 && record.replan_claim_epoch != claim_epoch;
-            if replan_invalidated {
+            let prefix_invalid = record.prefix_epoch == 0
+                || match record.state {
+                    STATE_GRANTED => record.prefix_epoch != record.grant_epoch,
+                    STATE_REPLAN => record.prefix_epoch != record.replan_claim_epoch,
+                    // WAITING may have returned from either kind of callback.
+                    // Its predecessor prefix remains valid because replacing
+                    // this ticket's own exact claim cannot alter its prefix.
+                    STATE_WAITING | STATE_COORDINATOR => {
+                        record.prefix_epoch != record.grant_epoch
+                            && record.prefix_epoch != record.replan_claim_epoch
+                    }
+                    _ => true,
+                };
+            if record.state == STATE_REPLAN
+                && (replan_invalidated
+                    || prefix_invalid
+                    || watch_serial != record.issue_serial)
+            {
                 // The callback runs outside the registry fence. Stamp its
                 // record before clearing the global suffix invalidation so its
-                // post-callback validation cannot commit an obsolete plan.
-                self.set_record_replan_claim_epoch(record.slot, claim_epoch)?;
-                self.wake_slot(record.slot)?;
+                // post-callback validation cannot commit an obsolete plan. A
+                // REPLAN record is already runnable, so refreshing its issue
+                // token must not manufacture another futex wake.
+                let prefix = aggregate_from_words(
+                    self.layout.bits,
+                    &cpu_any,
+                    &cpu_exclusive,
+                    &llc_any,
+                    &llc_exclusive,
+                );
+                self.publish_prefix(
+                    record.slot,
+                    &prefix,
+                    R_REPLAN_CLAIM_EPOCH,
+                    claim_epoch,
+                    watch_serial,
+                )?;
                 changed = true;
             } else if record.state == STATE_GRANTED && (conflict || !availability_compatible) {
                 // An earlier ticket may have changed its exact alternative
@@ -4088,9 +4877,22 @@ impl Table {
                 && availability_compatible
                 && blocker_ready
             {
+                let prefix = aggregate_from_words(
+                    self.layout.bits,
+                    &cpu_any,
+                    &cpu_exclusive,
+                    &llc_any,
+                    &llc_exclusive,
+                );
+                self.publish_prefix(
+                    record.slot,
+                    &prefix,
+                    R_GRANT_EPOCH,
+                    claim_epoch,
+                    watch_serial,
+                )?;
                 self.set_record_state(record.slot, STATE_GRANTED)?;
                 self.clear_record_blocked(record.slot)?;
-                self.set_record_grant_epoch(record.slot, claim_epoch)?;
                 crash_at_for_tests("grant_state_before_wake");
                 self.wake_slot(record.slot)?;
                 changed = true;
@@ -4098,21 +4900,52 @@ impl Table {
                 && record.ticket != self.coordinator_ticket()
                 && flexible
             {
-                let watch_serial = self.max_watch_serial(&record.watch)?;
                 let earlier_claim_changed = record.replan_claim_epoch != claim_epoch
                     && self.min_changed_ticket() < record.ticket;
-                if watch_serial > record.replan_serial || earlier_claim_changed {
+                if watch_serial != record.issue_serial
+                    || earlier_claim_changed
+                    || prefix_invalid
+                {
+                    let prefix = aggregate_from_words(
+                        self.layout.bits,
+                        &cpu_any,
+                        &cpu_exclusive,
+                        &llc_any,
+                        &llc_exclusive,
+                    );
+                    self.publish_prefix(
+                        record.slot,
+                        &prefix,
+                        R_REPLAN_CLAIM_EPOCH,
+                        claim_epoch,
+                        watch_serial,
+                    )?;
                     self.set_record_state(record.slot, STATE_REPLAN)?;
                     self.clear_record_blocked(record.slot)?;
-                    if earlier_claim_changed {
-                        self.set_record_replan_claim_epoch(record.slot, claim_epoch)?;
-                    }
                     self.wake_slot(record.slot)?;
                     changed = true;
                 }
-            } else if record.state == STATE_GRANTED && record.grant_epoch != claim_epoch {
-                // This grant precedes every changed ticket and remains valid.
-                self.set_record_grant_epoch(record.slot, claim_epoch)?;
+            } else if record.state == STATE_GRANTED
+                && (record.grant_epoch != claim_epoch
+                    || prefix_invalid
+                    || watch_serial != record.issue_serial)
+            {
+                // This grant remains valid, but its callback must observe the
+                // latest predecessor prefix and resource availability.
+                let prefix = aggregate_from_words(
+                    self.layout.bits,
+                    &cpu_any,
+                    &cpu_exclusive,
+                    &llc_any,
+                    &llc_exclusive,
+                );
+                self.publish_prefix(
+                    record.slot,
+                    &prefix,
+                    R_GRANT_EPOCH,
+                    claim_epoch,
+                    watch_serial,
+                )?;
             }
             add_claim_bits(
                 &record.claim,
@@ -5107,7 +5940,10 @@ impl Table {
             .unwrap_or((0, NONE_SLOT));
         self.set_coordinator(coordinator, coordinator_slot)?;
         let repair_claim_epoch = self.advance_claim_epoch()?;
+        let mut prefix = AggregateSnapshot::empty(self.layout);
+        let prefix_bits = prefix.bits;
         for record in &records {
+            let issue_serial = self.max_watch_serial(&record.watch)?;
             let state = if record.ticket == coordinator {
                 STATE_COORDINATOR
             } else if claim_is_flexible(&record.claim, &record.watch) {
@@ -5115,13 +5951,26 @@ impl Table {
             } else {
                 STATE_WAITING
             };
+            self.publish_prefix(
+                record.slot,
+                &prefix,
+                R_REPLAN_CLAIM_EPOCH,
+                repair_claim_epoch,
+                issue_serial,
+            )?;
             self.set_record_state(record.slot, state)?;
             self.clear_record_blocked(record.slot)?;
-            self.set_record_replan_serial(record.slot, 0)?;
-            self.set_record_replan_claim_epoch(record.slot, repair_claim_epoch)?;
             if state == STATE_REPLAN {
                 self.wake_slot(record.slot)?;
             }
+            add_claim_bits(
+                &record.claim,
+                &mut prefix.cpu_any,
+                &mut prefix.cpu_exclusive,
+                &mut prefix.llc_any,
+                &mut prefix.llc_exclusive,
+                prefix_bits,
+            )?;
         }
         // Any interrupted mutation invalidates outstanding grants. They were
         // demoted above; a fresh coordinator pass will stamp the new epoch.
@@ -5383,14 +6232,14 @@ fn decode_record(bytes: &[u8], layout: HeaderLayout, slot: u64) -> Result<Record
     let watch_cpu_mode = decode_mode(bytes, R_WATCH_CPU_MODE, slot, "CPU watch")?;
     let claim_cpu_mode = decode_mode(bytes, R_CLAIM_CPU_MODE, slot, "exact CPU claim")?;
     let claim = ClaimSet::with_claim_modes(
-        decode_bitset(bytes, R_BITS + layout.words * 8, layout)?,
-        decode_bitset(bytes, R_BITS, layout)?,
+        decode_bitset(bytes, record_bitset_offset(layout, RB_CLAIM_LLCS), layout)?,
+        decode_bitset(bytes, record_bitset_offset(layout, RB_CLAIM_CPUS), layout)?,
         claim_llc_mode,
         claim_cpu_mode,
     );
     let watch = ClaimSet::with_claim_modes(
-        decode_bitset(bytes, R_BITS + layout.words * 24, layout)?,
-        decode_bitset(bytes, R_BITS + layout.words * 16, layout)?,
+        decode_bitset(bytes, record_bitset_offset(layout, RB_WATCH_LLCS), layout)?,
+        decode_bitset(bytes, record_bitset_offset(layout, RB_WATCH_CPUS), layout)?,
         watch_llc_mode,
         watch_cpu_mode,
     );
@@ -5430,9 +6279,10 @@ fn decode_record(bytes: &[u8], layout: HeaderLayout, slot: u64) -> Result<Record
         claim,
         watch,
         blocked_on,
-        replan_serial: read_u64(bytes, R_REPLAN_SERIAL),
+        issue_serial: read_u64(bytes, R_ISSUE_SERIAL),
         replan_claim_epoch: read_u64(bytes, R_REPLAN_CLAIM_EPOCH),
         grant_epoch: read_u64(bytes, R_GRANT_EPOCH),
+        prefix_epoch: read_u64(bytes, R_PREFIX_EPOCH),
         prev_active: read_u64(bytes, R_PREV_ACTIVE),
         next_active: read_u64(bytes, R_NEXT_ACTIVE),
     })
@@ -5445,17 +6295,66 @@ fn encode_claim(
     watch: &ClaimSet,
 ) -> Result<()> {
     encode_exact_claim(bytes, layout, claim)?;
-    encode_bitset(bytes, R_BITS + layout.words * 16, layout, &watch.cpus)?;
-    encode_bitset(bytes, R_BITS + layout.words * 24, layout, &watch.llcs)
+    encode_bitset(
+        bytes,
+        record_bitset_offset(layout, RB_WATCH_CPUS),
+        layout,
+        &watch.cpus,
+    )?;
+    encode_bitset(
+        bytes,
+        record_bitset_offset(layout, RB_WATCH_LLCS),
+        layout,
+        &watch.llcs,
+    )
 }
 
 fn encode_exact_claim(bytes: &mut [u8], layout: HeaderLayout, claim: &ClaimSet) -> Result<()> {
-    encode_bitset(bytes, R_BITS, layout, &claim.cpus)?;
-    encode_bitset(bytes, R_BITS + layout.words * 8, layout, &claim.llcs)
+    encode_bitset(
+        bytes,
+        record_bitset_offset(layout, RB_CLAIM_CPUS),
+        layout,
+        &claim.cpus,
+    )?;
+    encode_bitset(
+        bytes,
+        record_bitset_offset(layout, RB_CLAIM_LLCS),
+        layout,
+        &claim.llcs,
+    )
+}
+
+fn encode_prefix(
+    bytes: &mut [u8],
+    layout: HeaderLayout,
+    prefix: &AggregateSnapshot,
+) -> Result<()> {
+    if prefix.bits != layout.bits {
+        anyhow::bail!("queue predecessor prefix layout does not match its record");
+    }
+    for (which, words) in [
+        (RB_PREFIX_CPU_ANY, prefix.cpu_any.as_slice()),
+        (RB_PREFIX_CPU_EXCLUSIVE, prefix.cpu_exclusive.as_slice()),
+        (RB_PREFIX_LLC_ANY, prefix.llc_any.as_slice()),
+        (RB_PREFIX_LLC_EXCLUSIVE, prefix.llc_exclusive.as_slice()),
+    ] {
+        let offset = record_bitset_offset(layout, which);
+        for (word, value) in words.iter().copied().enumerate() {
+            write_u64(bytes, offset + word * std::mem::size_of::<u64>(), value);
+        }
+    }
+    Ok(())
 }
 
 fn clear_record_claim_bits(bytes: &mut [u8], layout: HeaderLayout) {
-    bytes[R_BITS..R_BITS + layout.words * 16].fill(0);
+    let start = record_bitset_offset(layout, RB_CLAIM_CPUS);
+    let end = record_bitset_offset(layout, RB_WATCH_CPUS);
+    bytes[start..end].fill(0);
+}
+
+fn record_bitset_offset(layout: HeaderLayout, which: usize) -> usize {
+    debug_assert!(which < RECORD_BITMAPS);
+    R_BITS + which * layout.words * std::mem::size_of::<u64>()
 }
 
 fn encode_bitset(
@@ -5547,6 +6446,22 @@ fn claim_conflicts_bits(
         }
     }
     Ok(false)
+}
+
+fn aggregate_from_words(
+    bits: usize,
+    cpu_any: &[u64],
+    cpu_exclusive: &[u64],
+    llc_any: &[u64],
+    llc_exclusive: &[u64],
+) -> AggregateSnapshot {
+    AggregateSnapshot {
+        bits,
+        cpu_any: cpu_any.to_vec(),
+        cpu_exclusive: cpu_exclusive.to_vec(),
+        llc_any: llc_any.to_vec(),
+        llc_exclusive: llc_exclusive.to_vec(),
+    }
 }
 
 fn add_claim_bits(

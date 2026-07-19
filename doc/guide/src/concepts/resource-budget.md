@@ -152,11 +152,14 @@ makes this work across disjoint invocations sharing one
   set non-blocking, all-or-nothing, in canonical lock order — cells
   satisfiable *right now* never register, and no fast-path partial ever
   persists (everything is released on any bounce).
-- **The v5 registry.** A bounced acquirer publishes one monotonic
+- **The v6 registry.** A bounced acquirer publishes one monotonic
   fixed-size ticket containing its exact CPU/LLC claim. Each record also
   caches four predecessor-prefix bitsets (CPU-any, CPU-exclusive,
-  LLC-any, LLC-exclusive), published epoch-last, so a waiter can test a
-  complete alternative without walking every earlier ticket. Ordinary
+  LLC-any, LLC-exclusive), published epoch-last with the resource
+  observation serial that issued the callback. A waiter can therefore
+  test a complete alternative without walking every earlier ticket,
+  while an improvement that races the callback invalidates that
+  callback instead of being consumed unseen. Ordinary
   tickets sleep on targeted shared futex words; only one elected
   coordinator owns exact resource-release watches. Acquisition runs
   *before* VM setup, so a

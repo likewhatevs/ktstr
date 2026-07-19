@@ -223,8 +223,8 @@ fn uncontended_fast_fence_does_not_create_registry_metadata() {
     let protocol_dir = std::path::Path::new(&cpu_path)
         .parent()
         .expect("resource lock parent");
-    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v5");
-    let event_dir = protocol_dir.join("ktstr-acquire-events-v5");
+    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v6");
+    let event_dir = protocol_dir.join("ktstr-acquire-events-v6");
     assert!(!registry_dir.exists());
     assert!(!event_dir.exists());
 
@@ -1585,6 +1585,115 @@ fn dirty_repair_preserves_exact_and_watch_cpu_modes() {
         fixed_preserved && fixed_still_fixed,
         "canonical empty-class modes must keep an exact CPU SH claim fixed after repair",
     );
+}
+
+#[test]
+fn granted_callbacks_read_one_cached_prefix_without_walking_the_queue() {
+    let _prefixes = LockPrefixesGuard::new();
+    let waiters = 128usize;
+    let (callbacks, prefix_reads, active_list_reads) =
+        protocol::exercise_prefix_callback_scaling_for_tests(waiters)
+            .expect("exercise cached predecessor prefixes");
+    assert_eq!(callbacks, waiters, "each REPLAN ticket must run once");
+    assert_eq!(
+        prefix_reads, waiters,
+        "each callback must copy only its own cached prefix record",
+    );
+    assert_eq!(
+        active_list_reads, 0,
+        "callback admission must be independent of active queue depth",
+    );
+}
+
+#[test]
+fn replan_publishes_one_replacement_then_returns_to_coordinator_admission() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (callbacks, requeued_without_acquire, waiting, replaced, rescan_pending, active_reads) =
+        protocol::exercise_one_shot_replacement_for_tests()
+            .expect("exercise one-shot replacement");
+    assert_eq!(callbacks, 1, "one wake must invoke the planner once");
+    assert!(
+        requeued_without_acquire,
+        "REPLAN must publish a replacement without acquiring it",
+    );
+    assert!(
+        waiting && replaced && rescan_pending,
+        "the replacement must be WAITING behind a durable coordinator rescan",
+    );
+    assert_eq!(
+        active_reads, 0,
+        "replacement publication must not scan the active queue",
+    );
+}
+
+#[test]
+fn torn_and_stale_prefix_epochs_fail_closed_before_callback() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (callbacks, torn_rejected, stale_rejected) =
+        protocol::exercise_prefix_epoch_validation_for_tests()
+            .expect("exercise prefix epoch validation");
+    assert_eq!(
+        callbacks, 0,
+        "neither a torn nor stale predecessor snapshot may reach planner code",
+    );
+    assert!(
+        torn_rejected && stale_rejected,
+        "invalid snapshots must demote the ticket to WAITING for a fresh scan",
+    );
+}
+
+#[test]
+fn predecessor_prefixes_preserve_modes_order_and_dirty_repair() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (initial_modes, successor_excluded, repaired_modes, repaired_order) =
+        protocol::exercise_prefix_order_and_repair_for_tests()
+            .expect("exercise prefix order and dirty repair");
+    assert!(
+        initial_modes && successor_excluded,
+        "a newly appended prefix must include mode-correct predecessors and exclude successors",
+    );
+    assert!(
+        repaired_modes && repaired_order,
+        "dirty recovery must rebuild mode-correct prefixes in ticket order",
+    );
+}
+
+#[test]
+fn predecessor_release_refreshes_an_already_runnable_replan_prefix() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (prefix_refreshed, serial_refreshed, candidate_ready, replacement_committed) =
+        protocol::exercise_prefix_refresh_after_predecessor_release_for_tests()
+            .expect("exercise acquired-predecessor prefix refresh");
+    assert!(
+        prefix_refreshed && serial_refreshed,
+        "a holder-release improvement must refresh both the cached predecessor prefix and its issue serial",
+    );
+    assert!(
+        candidate_ready && replacement_committed,
+        "the release must become a usable one-shot replacement without waiting for another event",
+    );
+}
+
+#[test]
+fn callback_cannot_consume_an_improvement_it_did_not_observe() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (stale_rejected, fresh_seen, replacement_committed, serial_consumed_by_fresh) =
+        protocol::exercise_issue_serial_race_for_tests()
+            .expect("exercise callback issue-serial race");
+    assert!(
+        stale_rejected,
+        "a callback whose availability snapshot predates an improvement must lose its issuance",
+    );
+    assert!(
+        fresh_seen && replacement_committed && serial_consumed_by_fresh,
+        "the already-runnable ticket must immediately use a refreshed snapshot before consuming the improvement serial",
+    );
+}
+
+#[test]
+fn candidate_readiness_uses_prefix_availability_contention_and_exact_license() {
+    protocol::exercise_candidate_ready_matrix_for_tests()
+        .expect("exercise candidate readiness matrix");
 }
 
 #[test]
