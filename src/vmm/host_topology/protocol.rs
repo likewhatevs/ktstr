@@ -171,6 +171,11 @@ const OBSERVATION_RETRY_FALLBACK: Duration = Duration::from_secs(5);
 /// only a missed-event recovery tick; it avoids turning hundreds of queued
 /// cells into a synchronized `/proc/locks` polling herd.
 const WAITER_CRASH_RECOVERY_BASE: Duration = Duration::from_secs(3);
+/// Bound the watch-install handoff gap without making every short-lived
+/// coordinator scan the full registry. The first coordinator that remains
+/// active past this shared, non-postponable deadline performs one sweep;
+/// ordinary liveness closes after watch installation remain event-driven.
+const PREWATCH_LIVENESS_RECONCILE_DELAY: Duration = Duration::from_millis(500);
 
 /// Directory the protocol files live in — derived from the LLC
 /// lockfile path so the test-only lock-prefix override isolates the
@@ -675,8 +680,13 @@ pub(crate) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64,
 #[cfg(test)]
 pub(crate) fn exercise_coordinator_turnover_for_tests(
     coordinators: usize,
-) -> Result<(u64, usize, u64)> {
+) -> Result<(u64, usize, u64, bool)> {
     registry::exercise_coordinator_turnover_for_tests(coordinators)
+}
+
+#[cfg(test)]
+pub(crate) fn defer_liveness_maintenance_for_tests() -> Result<()> {
+    registry::defer_liveness_maintenance_for_tests()
 }
 
 #[cfg(test)]
@@ -762,6 +772,7 @@ pub(crate) fn exercise_registry_high_water_for_tests(waiters: usize) -> Result<u
             None,
             &[],
             false,
+            None,
             false,
             None,
         )?;
@@ -1451,6 +1462,7 @@ fn acquire_as_coordinator_impl<T>(
                 None,
                 &closed_tickets,
                 first || retry_due,
+                first.then_some(PREWATCH_LIVENESS_RECONCILE_DELAY),
                 pending_events.overflow,
                 cancelled,
             ),
@@ -1528,6 +1540,7 @@ fn acquire_as_coordinator_impl<T>(
                             Some(&update.abandoned),
                             &closed_tickets,
                             false,
+                            None,
                             false,
                             cancelled,
                         ),

@@ -1248,7 +1248,7 @@ fn failed_llc_ex_probe_releases_compatible_shared_waiter_without_fallback() {
 fn coordinator_turnover_does_one_global_liveness_sweep_and_skips_known_free_modes() {
     let _prefixes = LockPrefixesGuard::new();
     let coordinators = 96usize;
-    let (sweeps, probes, observation_requests) =
+    let (sweeps, probes, observation_requests, reconcile_deadline_coalesced) =
         protocol::exercise_coordinator_turnover_for_tests(coordinators)
             .expect("exercise rapid coordinator turnover");
     assert_eq!(
@@ -1258,6 +1258,11 @@ fn coordinator_turnover_does_one_global_liveness_sweep_and_skips_known_free_mode
     assert_eq!(
         probes, coordinators,
         "one global sweep probes the initial active set once instead of producing an O(N²) tail",
+    );
+    assert!(
+        reconcile_deadline_coalesced,
+        "post-watch liveness reconciliation must keep the first shared deadline across rapid \
+         coordinator handoffs instead of postponing it or sweeping once per handoff",
     );
     assert_eq!(
         observation_requests, 1,
@@ -2275,6 +2280,103 @@ fn release_before_successor_installs_watch_is_sampled_on_its_first_schedule() {
         "the successor must remain blocked on Y while post-watch observation grants C on X",
     );
     compatible.release_and_wait();
+    drop(blocker_y);
+    successor.wait_for_acquired();
+    successor.release_and_wait();
+}
+
+#[test]
+fn ticket_death_before_successor_installs_watch_is_reconciled_promptly() {
+    let _prefixes = LockPrefixesGuard::new();
+    let markers = tempfile::TempDir::new().expect("marker dir");
+    let blocker_x = crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Exclusive)
+        .expect("open first-coordinator blocker")
+        .expect("hold first-coordinator blocker");
+    let blocker_y = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
+        .expect("open successor-coordinator blocker")
+        .expect("hold successor-coordinator blocker");
+    let blocker_z = crate::flock::try_flock(cpu_lock_path(3), crate::flock::FlockMode::Exclusive)
+        .expect("open fenced-resource blocker")
+        .expect("hold fenced-resource blocker");
+
+    let first_gate = markers.path().join("commit-first-acquire");
+    let first_acquired = markers.path().join("first-real-lock-acquired");
+    let first = TicketChild::spawn_after_acquire_gate(
+        markers.path(),
+        "first-coordinator",
+        "1",
+        &first_gate,
+        &first_acquired,
+    );
+    wait_for_ticket_pids(&[first.pid]);
+    first.wait_for_probe();
+
+    let successor_gate = markers.path().join("install-successor-watch");
+    let successor_entered = markers.path().join("successor-elected-before-watch");
+    let successor = TicketChild::spawn_before_coordinator_gate(
+        markers.path(),
+        "successor-coordinator",
+        "2",
+        &successor_gate,
+        &successor_entered,
+    );
+    wait_for_ticket_pids(&[first.pid, successor.pid]);
+
+    // C first receives a disjoint grant, proves Z busy, and requeues its exact
+    // Z claim. D is later and conflicts with C, so C's live claim must fence D.
+    let dead_predecessor =
+        TicketChild::spawn(markers.path(), "dead-predecessor", "3", false);
+    wait_for_ticket_pids(&[first.pid, successor.pid, dead_predecessor.pid]);
+    dead_predecessor.wait_for_probe();
+    let fenced_successor =
+        TicketChild::spawn(markers.path(), "fenced-successor", "3", false);
+    wait_for_ticket_pids(&[
+        first.pid,
+        successor.pid,
+        dead_predecessor.pid,
+        fenced_successor.pid,
+    ]);
+    assert!(
+        !fenced_successor.probed.exists() && !fenced_successor.acquired.exists(),
+        "the earlier live Z claim must initially fence its conflicting successor",
+    );
+
+    drop(blocker_x);
+    first.wait_for_path(&first_acquired, "first coordinator real-lock marker");
+    std::fs::write(&first_gate, b"commit").expect("commit first coordinator acquisition");
+    first.wait_for_acquired();
+    successor.wait_for_path(&successor_entered, "pre-watch coordinator marker");
+
+    // B is now the elected coordinator but has not called LockDirWatch::new().
+    // Kill the non-coordinator C in that exact gap, then make Z physically
+    // available. Neither close can be present in B's future inotify queue.
+    let dead_pid = dead_predecessor.pid;
+    dead_predecessor.kill_and_wait();
+    drop(blocker_z);
+    first.release_and_wait();
+    protocol::defer_liveness_maintenance_for_tests()
+        .expect("keep the 30-second periodic sweep out of the regression");
+    std::fs::write(&successor_gate, b"install watch")
+        .expect("release successor pre-watch gate");
+
+    // B's first post-watch pass re-observes Z as free. C's stale claim still
+    // fences D until the shared short reconciliation deadline prunes C; the
+    // periodic 30-second maintenance sweep is deliberately deferred above,
+    // while every helper wait below has its own ten-second deadline.
+    fenced_successor.wait_for_acquired();
+    assert!(
+        !successor.acquired.exists(),
+        "the successor coordinator must remain blocked on Y while D acquires Z",
+    );
+    assert!(
+        protocol::ticket_registry_snapshot_for_tests()
+            .expect("ticket registry snapshot after reconciliation")
+            .iter()
+            .all(|(_, pid, _)| *pid != dead_pid),
+        "the pre-watch dead ticket must be removed by the short shared reconciliation",
+    );
+    fenced_successor.release_and_wait();
+
     drop(blocker_y);
     successor.wait_for_acquired();
     successor.release_and_wait();

@@ -57,6 +57,7 @@ const H_OBSERVATION_REQUEST: usize = 128;
 const H_GRANT_SCANS: usize = 136;
 const H_ACTIVE_HEAD: usize = 144;
 const H_ACTIVE_TAIL: usize = 152;
+const H_LIVENESS_RECONCILE_BY_NS: usize = 160;
 const _: () = assert!(H_AGGREGATE_DIRTY % std::mem::align_of::<AtomicU64>() == 0);
 
 const R_STATE: usize = 0;
@@ -804,6 +805,7 @@ impl Ticket {
         abandoned: Option<&ClaimSet>,
         closed_tickets: &[(u64, u64)],
         reobserve_watch: bool,
+        reconcile_liveness_after: Option<Duration>,
         force_liveness_maintenance: bool,
         cancelled: Option<&AtomicBool>,
     ) -> Result<ScheduleSnapshot> {
@@ -815,6 +817,7 @@ impl Ticket {
             && abandoned.is_none()
             && closed_tickets.is_empty()
             && !reobserve_watch
+            && reconcile_liveness_after.is_none()
             && !force_liveness_maintenance;
         if pure_release_batch
             && let Some(snapshot) =
@@ -827,6 +830,9 @@ impl Ticket {
         let mut table = Table::open_existing()?;
         table.repair_consistency_if_needed()?;
         table.prune_dead_identities(closed_tickets)?;
+        if let Some(delay) = reconcile_liveness_after {
+            table.request_liveness_reconciliation(delay)?;
+        }
         let liveness_due_in = table.perform_liveness_sweep_if_due(force_liveness_maintenance)?;
         let record = table
             .record(self.slot)?
@@ -985,8 +991,8 @@ impl Ticket {
             watch,
             should_step: false,
             observation: None,
-            liveness_due_in: liveness_due_in_from_last(
-                read_u64(&header, H_LAST_LIVENESS_SWEEP_NS),
+            liveness_due_in: liveness_due_in_from_header(
+                &header,
                 monotonic_now_ns()?,
             ),
         }))
@@ -1564,6 +1570,7 @@ pub(super) fn exercise_known_free_close_storm_for_tests(
         None,
         &[],
         false,
+        None,
         false,
         None,
     )?;
@@ -1593,6 +1600,7 @@ pub(super) fn exercise_known_free_close_storm_for_tests(
             None,
             &[],
             false,
+            None,
             false,
             None,
         )?;
@@ -1627,6 +1635,7 @@ pub(super) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usi
         None,
         &[],
         false,
+        None,
         false,
         None,
     )?;
@@ -1651,6 +1660,7 @@ pub(super) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usi
         None,
         &[],
         false,
+        None,
         false,
         None,
     )?;
@@ -1750,7 +1760,7 @@ pub(super) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64,
 #[cfg(test)]
 pub(super) fn exercise_coordinator_turnover_for_tests(
     coordinators: usize,
-) -> Result<(u64, usize, u64)> {
+) -> Result<(u64, usize, u64, bool)> {
     if coordinators == 0 {
         anyhow::bail!("coordinator-turnover exercise needs at least one ticket");
     }
@@ -1790,7 +1800,9 @@ pub(super) fn exercise_coordinator_turnover_for_tests(
     let observations_before = diagnostic_counter_for_tests(H_OBSERVATION_REQUEST)?;
     let probes_before = LIVENESS_PROBES.with(std::cell::Cell::get);
     let empty = BTreeSet::new();
-    for ticket in &mut tickets {
+    let mut shared_reconcile_by = None;
+    let mut reconcile_deadline_coalesced = true;
+    for (index, ticket) in tickets.iter_mut().enumerate() {
         let snapshot = ticket.schedule(
             None,
             &empty,
@@ -1801,9 +1813,25 @@ pub(super) fn exercise_coordinator_turnover_for_tests(
             None,
             &[],
             true,
+            Some(Duration::from_secs(60 * 60)),
             false,
             None,
         )?;
+        let reconcile_by =
+            diagnostic_counter_for_tests(H_LIVENESS_RECONCILE_BY_NS)?;
+        if index == 0 {
+            // The deliberately due periodic sweep consumes the first
+            // coordinator's request.
+            reconcile_deadline_coalesced &= reconcile_by == 0;
+        } else if let Some(shared) = shared_reconcile_by {
+            // Every later handoff requests "one hour from now". The shared
+            // deadline must remain the first request rather than sliding
+            // forward once per coordinator.
+            reconcile_deadline_coalesced &= reconcile_by == shared;
+        } else {
+            reconcile_deadline_coalesced &= reconcile_by != 0;
+            shared_reconcile_by = Some(reconcile_by);
+        }
         let request = snapshot
             .observation
             .ok_or_else(|| anyhow::anyhow!("known-busy CPU must remain observable"))?;
@@ -1819,7 +1847,12 @@ pub(super) fn exercise_coordinator_turnover_for_tests(
     let probes = LIVENESS_PROBES.with(std::cell::Cell::get) - probes_before;
     let observation_requests =
         diagnostic_counter_for_tests(H_OBSERVATION_REQUEST)? - observations_before;
-    Ok((sweeps, probes, observation_requests))
+    Ok((
+        sweeps,
+        probes,
+        observation_requests,
+        reconcile_deadline_coalesced,
+    ))
 }
 
 #[cfg(test)]
@@ -1895,6 +1928,7 @@ pub(super) fn exercise_exact_commit_scan_elision_for_tests(commits: usize) -> Re
             None,
             &[],
             false,
+            None,
             false,
             None,
         )?;
@@ -1941,6 +1975,7 @@ pub(super) fn exercise_mismatched_commit_rescan_for_tests() -> Result<(u64, bool
         None,
         &[],
         false,
+        None,
         false,
         None,
     )?;
@@ -1996,6 +2031,7 @@ pub(super) fn exercise_superset_commit_rescan_for_tests() -> Result<(u64, bool)>
         None,
         &[],
         false,
+        None,
         false,
         None,
     )?;
@@ -2053,6 +2089,7 @@ pub(super) fn exercise_shared_commit_improvement_for_tests() -> Result<(u64, boo
         None,
         &[],
         false,
+        None,
         false,
         None,
     )?;
@@ -2076,6 +2113,33 @@ fn diagnostic_counter_for_tests(offset: usize) -> Result<u64> {
     let map = unsafe { Mmap::map(&file) }?;
     HeaderLayout::validate(&map)?;
     Ok(read_u64(&map, offset))
+}
+
+#[cfg(test)]
+pub(super) fn defer_liveness_maintenance_for_tests() -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let _lock = loop {
+        if let Some(lock) =
+            try_lock_registry_existing_nonblocking(FlockMode::Exclusive)?
+        {
+            break lock;
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out taking admission registry lock to defer liveness maintenance"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let mut table = Table::open_existing()?;
+    table.repair_consistency_if_needed()?;
+    write_u64(
+        &mut table.header,
+        H_LAST_LIVENESS_SWEEP_NS,
+        monotonic_now_ns()?,
+    );
+    write_u64(&mut table.header, H_LIVENESS_RECONCILE_BY_NS, 0);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2754,22 +2818,48 @@ impl Table {
     }
 
     fn liveness_due_in(&self) -> Result<Duration> {
-        Ok(liveness_due_in_from_last(
-            read_u64(&self.header, H_LAST_LIVENESS_SWEEP_NS),
+        Ok(liveness_due_in_from_header(
+            &self.header,
             monotonic_now_ns()?,
         ))
+    }
+
+    /// Arrange one full liveness reconciliation after a newly elected
+    /// coordinator has installed its inotify watch.
+    ///
+    /// A ticket can die after election but before that watch exists, so its
+    /// CLOSE_WRITE is not observable. The deadline is shared by the whole
+    /// registry and may only move earlier: a rapid chain of coordinators
+    /// therefore coalesces into one O(N) sweep instead of performing one sweep
+    /// per handoff or postponing recovery indefinitely.
+    fn request_liveness_reconciliation(&mut self, delay: Duration) -> Result<()> {
+        let now = monotonic_now_ns()?;
+        let delay_ns = u64::try_from(delay.as_nanos()).unwrap_or(u64::MAX);
+        let requested = now.saturating_add(delay_ns).max(1);
+        let current = read_u64(&self.header, H_LIVENESS_RECONCILE_BY_NS);
+        if current == 0 || requested < current {
+            write_u64(
+                &mut self.header,
+                H_LIVENESS_RECONCILE_BY_NS,
+                requested,
+            );
+        }
+        Ok(())
     }
 
     fn perform_liveness_sweep_if_due(&mut self, force: bool) -> Result<Duration> {
         let now = monotonic_now_ns()?;
         let last = read_u64(&self.header, H_LAST_LIVENESS_SWEEP_NS);
-        if force || liveness_due_in_from_last(last, now).is_zero() {
+        let reconcile_by = read_u64(&self.header, H_LIVENESS_RECONCILE_BY_NS);
+        let reconcile_due = reconcile_by != 0 && reconcile_by <= now;
+        if force || liveness_due_in_from_last(last, now).is_zero() || reconcile_due {
             self.prune_dead()?;
             write_u64(
                 &mut self.header,
                 H_LAST_LIVENESS_SWEEP_NS,
                 monotonic_now_ns()?,
             );
+            write_u64(&mut self.header, H_LIVENESS_RECONCILE_BY_NS, 0);
             self.bump_liveness_sweep();
         }
         self.liveness_due_in()
@@ -4806,6 +4896,19 @@ fn liveness_due_in_from_last(last: u64, now: u64) -> Duration {
         return Duration::ZERO;
     }
     Duration::from_nanos(LIVENESS_SWEEP_INTERVAL_NS.saturating_sub(now - last))
+}
+
+fn liveness_due_in_from_header(header: &[u8], now: u64) -> Duration {
+    let periodic = liveness_due_in_from_last(
+        read_u64(header, H_LAST_LIVENESS_SWEEP_NS),
+        now,
+    );
+    let reconcile_by = read_u64(header, H_LIVENESS_RECONCILE_BY_NS);
+    if reconcile_by == 0 {
+        periodic
+    } else {
+        periodic.min(Duration::from_nanos(reconcile_by.saturating_sub(now)))
+    }
 }
 
 fn align_up_checked(value: usize, alignment: usize) -> Result<usize> {

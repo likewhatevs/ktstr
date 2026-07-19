@@ -256,13 +256,14 @@ retries = 2
 # value for each setting, so compile-fail, llc-lock, and the other
 # deliberately serialized groups retain their stronger rules.
 #
-# This is a RESOURCE-ADMISSION identity selector, deliberately separate
-# from the slow-timeout filters above. A test can need a long timeout
-# without taking topology locks (the fetch retry tests), and direct
-# KtstrVm / nested cargo-ktstr callers do take locks without having a
-# generated ktstr/... name. Conflating those policies both leaked
-# ordinary tests into the effectively-unbounded global pool and trapped
-# real VM waiters behind host-tests.
+# This is the canonical RESOURCE-ADMISSION identity selector. The
+# full-suite-drain timeout above deliberately copies this exact set because
+# admission wait is charged to each test; a unit test pins that equality.
+# Other long-timeout policies can still cover non-resource work (for example
+# fetch retry tests). Direct KtstrVm / nested cargo-ktstr callers take locks
+# without having a generated ktstr/... name, so a loose name-only selector
+# would both leak ordinary tests into the effectively-unbounded global pool
+# and trap real VM waiters behind host-tests.
 #
 # Generated ktstr/, gauntlet/, and verifier/ cells participate in the
 # scheduler. Generated host_only tests are emitted under the distinct host/
