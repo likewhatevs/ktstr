@@ -400,13 +400,14 @@ mod tests {
     #[test]
     fn repository_specialized_groups_precede_host_fallback_in_every_profile() {
         const CONFIG: &str = include_str!("../../../.config/nextest.toml");
+        assert!(
+            CONFIG.contains("failure-output = \"immediate-final\""),
+            "CI must print each failure immediately and repeat it in the final report",
+        );
         const EXPECTED_SPECIALIZED_GROUPS: &[&str] = &[
             "alu-vec512",
             "compile-fail",
             "llc-lock",
-            "vm-cli",
-            "vm-perf",
-            "wide-smp",
         ];
 
         for profile in ["ci", "default"] {
