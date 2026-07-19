@@ -254,19 +254,13 @@ impl VmlinuxSymbolCache {
 /// vCPU TID), differing only in that arming does NOT request a
 /// freeze — vCPUs immediately re-enter `KVM_RUN` after the arm.
 ///
-/// `bsp_alive` is the same Acquire-bool the freeze_and_dispatch
-/// closure consults: a `false` reading means the BSP `VcpuFd` is
-/// gone and writing through `bsp_ie_handle` would touch unmapped
-/// memory. The Arc is borrowed (not a snapshot) so each gated site
-/// performs its own fresh `load(Acquire)` immediately before the
-/// BSP-touching syscall — both `ie.set(1)` (which writes through
-/// the kvm_run mmap) and `pthread_kill` (which dereferences the
-/// BSP `pthread_t`) re-check liveness at the moment of the call.
-/// A snapshot taken at the start of the kick pass would be stale
-/// by tens of microseconds — long enough for the BSP run-loop's
-/// post-loop `bsp_alive.store(false, Release)` plus the BSP
-/// `VcpuFd` drop to land between snapshot and use, leaving the
-/// fast-path writes targeting freed mmap pages.
+/// `bsp_alive` suppresses unnecessary kicks once the BSP has left the
+/// rendezvous and remains the participation predicate for `pthread_kill`.
+/// It is deliberately not treated as an mmap lifetime proof: atomic loads
+/// cannot pin an allocation across a later pointer dereference. Every
+/// `ImmediateExitHandle::set` instead upgrades its Weak mapping reference to a
+/// transient Arc, structurally pinning the owner's second shared `kvm_run` VMA
+/// through the access even if the run-loop VcpuFd completes concurrently.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn arm_user_watchpoint(
     watchpoint: &Arc<WatchpointArm>,
@@ -447,15 +441,9 @@ pub(super) fn arm_user_watchpoint(
     // actual wake mechanism is immediate_exit + SIGRTMIN — the same
     // pair the freeze rendezvous uses for parking.
     //
-    // Per-AP `alive` gate mirrors the freeze rendezvous pass-1 kick:
-    // an AP that panicked under `panic = "unwind"` (test profile)
-    // has its hook flip `alive` to `false` BEFORE the stack drop
-    // unmaps `kvm_run`. Loading Acquire here pairs with the panic
-    // hook's Release store; a `true` reading observed at this site
-    // happens-before any subsequent unwind drop, so the
-    // `ie.set(1)` writes through a still-live mmap. The
-    // `iter().enumerate()` walk keeps `ap_alive[i]` index-aligned
-    // with `ap_ies[i]`.
+    // Per-AP `alive` is an early suppression hint after a panic edge, not the
+    // mapping lifetime mechanism. A stale true remains safe because set()
+    // upgrades its Weak mapping reference to a transient Arc.
     for (i, ie) in ap_ies.iter().enumerate() {
         if let Some(ie) = ie
             && ap_alive[i].load(Ordering::Acquire)
@@ -463,18 +451,9 @@ pub(super) fn arm_user_watchpoint(
             ie.set(1);
         }
     }
-    // Fresh Acquire-load of bsp_alive immediately before `ie.set(1)`.
-    // A snapshot taken earlier would race with a BSP that finishes
-    // its run loop, stores `false` (Release), and starts dropping
-    // its `VcpuFd` — `ie.set(1)` writes through `kvm_run.immediate_exit`
-    // which lives in the BSP VcpuFd's mmap, so a stale `true` here
-    // would dereference freed pages. The Acquire load synchronises
-    // with the BSP run-loop's Release store of `false`: a `true`
-    // observed here happens-before any subsequent `false` the BSP
-    // could publish, which means the BSP VcpuFd is still alive AT
-    // the moment of `ie.set()` and cannot be dropped until the next
-    // load reads false (the pthread_kill below issues its own fresh
-    // load for the same TOCTOU reason).
+    // `bsp_alive` avoids an unnecessary set after the BSP exit edge. It may
+    // be stale without compromising memory safety: the handle transiently
+    // upgrades and pins the owner's independent mapping through the access.
     if bsp_alive.load(Ordering::Acquire)
         && let Some(ie) = bsp_ie
     {
@@ -493,23 +472,12 @@ pub(super) fn arm_user_watchpoint(
             libc::pthread_kill(tid, vcpu_signal());
         }
     }
-    // Second fresh Acquire-load right before BSP pthread_kill. The
-    // window between the `ie.set` load and this one is microseconds
-    // (one Release fence + N AP signal deliveries), but a BSP exit
-    // can land in that window. A stale `true` reading here would
-    // signal a pthread_t whose thread has already returned — ESRCH
-    // is harmless on its own, but the surrounding contract relies
-    // on the bsp_alive bool being authoritative for all BSP-touching
-    // operations in this function. Loading fresh keeps the contract
-    // honest and matches the freeze_and_dispatch pattern at the
-    // mod.rs pass-2 site.
+    // Re-load the BSP participation predicate before the signal so a BSP
+    // which left during the AP pass is not kicked unnecessarily.
     if bsp_alive.load(Ordering::Acquire) {
-        // SAFETY: bsp_alive is Acquire-loaded immediately above;
-        // while true the BSP `VcpuFd` and its kvm_run mmap are
-        // live. The BSP TID was captured at coord spawn from the
-        // BSP thread's `pthread_self()` and remains valid until
-        // the BSP thread joins, which `run_vm` only allows AFTER
-        // this coordinator joins.
+        // SAFETY: the BSP TID belongs to run_vm's current thread, which cannot
+        // leave and destroy its pthread identity until this coordinator is
+        // joined. `bsp_alive` is a logical skip, not that lifetime proof.
         unsafe {
             libc::pthread_kill(bsp_tid, vcpu_signal());
         }
@@ -895,10 +863,9 @@ mod arm_user_watchpoint_tests {
     //! The function publishes a resolved KVA into one of the three
     //! user watchpoint slots and kicks every vCPU thread out of
     //! `KVM_RUN`. The kick path walks `ap_pthreads`, `ap_ies`,
-    //! `ap_alive`, and the BSP triple — and the BSP-touching paths
-    //! are ALL gated on `bsp_alive.load(Acquire)`. When `ap_pthreads`
-    //! is empty AND `bsp_alive` reads `false`, no `pthread_kill`
-    //! and no `ie.set` runs — exactly what these tests need to
+    //! `ap_alive`, and the BSP triple. When `ap_pthreads` is empty and
+    //! `bsp_alive` reads `false`, no `pthread_kill` or `ie.set` runs —
+    //! exactly what these tests need to
     //! exercise the symbol/alignment/slot-allocation logic in
     //! isolation, without spawning real vCPU threads or holding
     //! live `ImmediateExitHandle`s.

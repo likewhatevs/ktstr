@@ -35,10 +35,10 @@ use super::host_comms::BulkDrainResult;
 use super::pi_mutex::PiMutex;
 use super::result::{HostVcpuSchedstat, VmResult, VmRunState};
 use super::vcpu::{
-    ApFreezeHandles, BpfMapWriteParams, ImmediateExitHandle, VcpuThread, WatchpointArm,
-    duration_to_jiffies, load_probe_bss_offset, open_vcpu_perf_capture, pin_current_thread,
-    register_vcpu_signal_handler, self_arm_watchpoint, set_rt_priority, set_thread_cpumask,
-    vcpu_signal,
+    ApFreezeHandles, BpfMapWriteParams, ImmediateExitHandle, ImmediateExitVcpu, VcpuThread,
+    WatchpointArm, duration_to_jiffies, load_probe_bss_offset, open_vcpu_perf_capture,
+    pin_current_thread, register_vcpu_signal_handler, self_arm_watchpoint, set_rt_priority,
+    set_thread_cpumask, vcpu_signal,
 };
 use super::vmlinux::{cached_vmlinux_bytes, find_vmlinux};
 use super::{
@@ -165,8 +165,7 @@ pub(crate) const WPROF_SHIP_GRACE: Duration = Duration::from_secs(30);
 /// and EBADF (fd torn down — the coord is already exiting). Both mean
 /// "kill is already observed or about to be"; no recovery is meaningful.
 fn trigger_freeze_coord_kill(kill: &AtomicBool, kill_evt: &EventFd) {
-    kill.store(true, Ordering::Release);
-    let _ = kill_evt.write(1);
+    super::publish_vm_kill(kill, kill_evt);
 }
 
 /// True iff `msg` is the guest's wprof trace ship — a crc-valid,
@@ -1608,9 +1607,21 @@ fn has_bpf_scheduler_attached_inner<P: AsRef<std::path::Path>>(
 /// panic hook sets it before stack unwinding starts, so a panicking AP may
 /// have `exited == true` while still blocked in a destructor. Only
 /// `JoinHandle::is_finished()` proves `join()` is non-blocking.
-fn retire_ap_waiter(waiting: &mut [bool], index: usize, finished: bool) -> bool {
+///
+/// The per-index state transition and run-wide count update live in this one
+/// helper so a repeated level-triggered event cannot decrement `remaining`
+/// twice and the caller cannot accidentally duplicate the decrement.
+fn retire_ap_waiter(
+    waiting: &mut [bool],
+    remaining: &mut usize,
+    index: usize,
+    finished: bool,
+) -> bool {
     if finished && waiting[index] {
         waiting[index] = false;
+        *remaining = remaining
+            .checked_sub(1)
+            .expect("waiting AP retirement count cannot underflow");
         true
     } else {
         false
@@ -1702,17 +1713,12 @@ fn ap_teardown_service_budget_exhausted(anchor_ns: u64, now_ns: u64) -> bool {
     now_ns.saturating_sub(anchor_ns) > AP_TEARDOWN_SERVICE_BUDGET_NS
 }
 
-/// Wake one AP during teardown. Once the AP's exit/panic edge is observed,
-/// never touch its mmap-backed ImmediateExitHandle again: the panic hook sets
-/// `exited` before unwinding may drop the VcpuFd. SIGRTMIN and `unpark` do not
-/// dereference that mapping and remain safe while JoinHandle::is_finished is
-/// still false (for example, a destructor blocked during unwind).
+/// Wake one AP during teardown without touching `kvm_run`. Periodic SIGRTMIN
+/// delivery plus `unpark` closes the signal-before-KVM_RUN lost-wake window,
+/// while remaining valid even if panic-unwind concurrently completes and
+/// drops the vCPU's run-loop owner.
 fn wake_ap_for_teardown(vt: &VcpuThread) {
-    if vt.exited.load(Ordering::Acquire) {
-        vt.signal();
-    } else {
-        vt.kick();
-    }
+    vt.signal();
     vt.handle.thread().unpark();
 }
 
@@ -1753,7 +1759,7 @@ fn fail_closed_ap_teardown(cause: ApTeardownFailCause) -> ! {
     }
 }
 
-fn kick_and_join_ap_threads(ap_threads: Vec<VcpuThread>) {
+pub(super) fn kick_and_join_ap_threads(ap_threads: Vec<VcpuThread>) {
     let service_clocks: Vec<_> = ap_threads.iter().map(ap_teardown_service_clock).collect();
     for vt in &ap_threads {
         if !vt.handle.is_finished() {
@@ -1826,8 +1832,7 @@ fn kick_and_join_ap_threads(ap_threads: Vec<VcpuThread>) {
                 }
             }
             for (i, vt) in ap_threads.iter().enumerate() {
-                if retire_ap_waiter(&mut waiting, i, vt.handle.is_finished()) {
-                    remaining -= 1;
+                if retire_ap_waiter(&mut waiting, &mut remaining, i, vt.handle.is_finished()) {
                     if let Some(epoll) = &epoll {
                         let _ = epoll.ctl(
                             ControlOperation::Delete,
@@ -1863,20 +1868,21 @@ mod ap_join_accounting_tests {
     use crate::sync::Latch;
     use crate::vmm::result::HostVcpuSchedstat;
     use crate::vmm::topology::Topology;
-    use crate::vmm::vcpu::{ImmediateExitHandle, VcpuThread};
+    use crate::vmm::vcpu::{ImmediateExitHandle, ImmediateExitVcpu, VcpuThread};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
     use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
     const AP_TEARDOWN_PRODUCTION_CHILD: &str = "KTSTR_AP_TEARDOWN_PRODUCTION_CHILD";
     const HOST_DELAY_MODE: &str = "host-delay";
+    const MULTI_AP_MODE: &str = "multi-ap";
     const UNWINDING_MODE: &str = "unwinding";
     const IE_REWRITE_EXIT_CODE: i32 = 71;
     const CHILD_SETUP_EXIT_CODE: i32 = 72;
     const UNEXPECTED_RETURN_EXIT_CODE: i32 = 73;
 
-    fn real_vcpu() -> (kvm_ioctls::VcpuFd, ImmediateExitHandle) {
+    fn real_vcpu() -> (ImmediateExitVcpu, ImmediateExitHandle) {
         let topology = Topology {
             llcs: 1,
             cores_per_llc: 1,
@@ -1888,8 +1894,10 @@ mod ap_join_accounting_tests {
         };
         let mut vm = kvm::KtstrKvm::new(topology, 64, false)
             .expect("create real KVM vCPU for AP teardown regression");
-        let immediate_exit = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
-        (vm.vcpus.remove(0), immediate_exit)
+        let run_size = vm.vm_fd.run_size();
+        let (vcpu, immediate_exit) =
+            ImmediateExitVcpu::new(vm.vcpus.remove(0), true, run_size).unwrap();
+        (vcpu, immediate_exit.unwrap())
     }
 
     fn vcpu_thread(
@@ -1924,18 +1932,23 @@ mod ap_join_accounting_tests {
     #[test]
     fn level_triggered_exit_is_retired_once_per_ap_index() {
         let mut waiting = vec![true, true];
+        let mut remaining = waiting.len();
 
-        assert!(retire_ap_waiter(&mut waiting, 0, true));
+        assert!(retire_ap_waiter(&mut waiting, &mut remaining, 0, true));
         assert_eq!(waiting, [false, true]);
+        assert_eq!(remaining, 1);
 
         // An unread level-triggered eventfd can report AP 0 again. It must
         // not decrement the run-wide remaining count a second time.
-        assert!(!retire_ap_waiter(&mut waiting, 0, true));
+        assert!(!retire_ap_waiter(&mut waiting, &mut remaining, 0, true,));
         assert_eq!(waiting, [false, true]);
+        assert_eq!(remaining, 1);
 
-        assert!(!retire_ap_waiter(&mut waiting, 1, false));
-        assert!(retire_ap_waiter(&mut waiting, 1, true));
+        assert!(!retire_ap_waiter(&mut waiting, &mut remaining, 1, false,));
+        assert_eq!(remaining, 1);
+        assert!(retire_ap_waiter(&mut waiting, &mut remaining, 1, true));
         assert_eq!(waiting, [false, false]);
+        assert_eq!(remaining, 0);
     }
 
     #[test]
@@ -1975,6 +1988,59 @@ mod ap_join_accounting_tests {
         };
         register_vcpu_signal_handler();
         match mode.to_str().expect("ASCII AP teardown child mode") {
+            MULTI_AP_MODE => {
+                const AP_COUNT: usize = 3;
+                let completed = Arc::new(AtomicUsize::new(0));
+                let mut releases = Vec::with_capacity(AP_COUNT);
+                let mut threads = Vec::with_capacity(AP_COUNT);
+
+                for index in 0..AP_COUNT {
+                    let (vcpu, immediate_exit) = real_vcpu();
+                    let exited = Arc::new(AtomicBool::new(false));
+                    let exit_evt = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+                    let alive = Arc::new(AtomicBool::new(true));
+                    let ready = Arc::new(Latch::new());
+                    let release = Arc::new(Latch::new());
+
+                    let completed_ap = Arc::clone(&completed);
+                    let exited_ap = Arc::clone(&exited);
+                    let exit_evt_ap = Arc::clone(&exit_evt);
+                    let ready_ap = Arc::clone(&ready);
+                    let release_ap = Arc::clone(&release);
+                    let handle = std::thread::Builder::new()
+                        .name(format!("ap-teardown-multi-{index}"))
+                        .spawn(move || {
+                            register_vcpu_signal_handler();
+                            ready_ap.set();
+                            release_ap.wait();
+                            completed_ap.fetch_add(1, Ordering::AcqRel);
+                            exited_ap.store(true, Ordering::Release);
+                            exit_evt_ap.write(1).unwrap();
+                            vcpu.into_inner()
+                        })
+                        .unwrap();
+                    ready.wait();
+                    releases.push(release);
+                    threads.push(vcpu_thread(handle, exited, immediate_exit, exit_evt, alive));
+                }
+
+                // Retire one AP per wait-loop pass. This exercises repeated
+                // scans of already-finished, level-triggered indices before
+                // the last handle becomes joinable.
+                let releaser = std::thread::spawn(move || {
+                    for release in releases {
+                        std::thread::sleep(Duration::from_millis(25));
+                        release.set();
+                    }
+                });
+                kick_and_join_ap_threads(threads);
+                releaser.join().unwrap();
+                assert_eq!(
+                    completed.load(Ordering::Acquire),
+                    AP_COUNT,
+                    "production multi-AP teardown returned before every handle completed",
+                );
+            }
             HOST_DELAY_MODE => {
                 let (vcpu, immediate_exit) = real_vcpu();
                 let exited = Arc::new(AtomicBool::new(false));
@@ -1992,7 +2058,7 @@ mod ap_join_accounting_tests {
                         release_ap.wait();
                         exited_ap.store(true, Ordering::Release);
                         exit_evt_ap.write(1).unwrap();
-                        vcpu
+                        vcpu.into_inner()
                     })
                     .unwrap();
                 let vt = vcpu_thread(handle, exited, immediate_exit, exit_evt, alive);
@@ -2071,7 +2137,7 @@ mod ap_join_accounting_tests {
                 let vt = vcpu_thread(
                     handle,
                     Arc::clone(&exited),
-                    immediate_exit,
+                    immediate_exit.clone(),
                     exit_evt,
                     Arc::clone(&alive),
                 );
@@ -2094,7 +2160,7 @@ mod ap_join_accounting_tests {
                 alive.store(true, Ordering::Release);
                 std::thread::spawn(move || {
                     loop {
-                        if immediate_exit.read_byte() != 0 {
+                        if matches!(immediate_exit.read_byte(), Some(byte) if byte != 0) {
                             // SAFETY: subprocess-only sentinel. Distinct status
                             // proves a post-panic mmap write beat fail-closed.
                             unsafe { libc::_exit(IE_REWRITE_EXIT_CODE) };
@@ -2128,6 +2194,18 @@ mod ap_join_accounting_tests {
         assert!(
             started.elapsed() >= Duration::from_secs(2),
             "child must actually cross the former two-second wall deadline",
+        );
+    }
+
+    #[test]
+    fn production_teardown_retires_and_joins_every_ap_once() {
+        let output = run_production_child(MULTI_AP_MODE);
+        assert!(
+            output.status.success(),
+            "multi-AP production teardown failed to retire and join every handle: \
+             stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
     }
 
@@ -2377,8 +2455,7 @@ mod ap_boot_gate_tests {
 /// so touching that memory after `KtstrKvm::Drop` munmaps it is a host-side
 /// use-after-free (kernel fd teardown is refcounted, so the danger is purely the
 /// dangling host pointer). Accumulates handles as `run_vm` spawns them; mirrors
-/// the fixed two-handle `CrossThreadKickGuard` on the interactive path (a
-/// function-local struct in `run_interactive`, so it has no linkable path).
+/// the unified [`super::InteractiveRunGuard`] on the shell path.
 ///
 /// A partial spawn INSIDE `spawn_ap_threads` is covered by its own
 /// [`PartialApSpawnGuard`] (before this guard is armed), closing the
@@ -2388,9 +2465,10 @@ mod ap_boot_gate_tests {
 /// `process_tx` — it never dereferences the `virtio_con` guest-memory handle —
 /// so it needs no join here and its `ClientShared::drop` stays signal-only.)
 ///
-/// Declared AFTER `bsp` so it drops — and joins the watchdog + coordinator that
-/// hold `bsp`'s `ImmediateExitHandle` — BEFORE `bsp` drops; and, as a function
-/// local while `vm` is a parameter, BEFORE `vm` drops (parameters drop last).
+/// Declared after `bsp` so its cleanup completes before the VM parameter drops.
+/// Immediate-exit handles have an independent mapping lifetime, but these
+/// threads also hold guest-memory pointers, pthread identities, and other
+/// run-scoped resources that must not survive VM teardown.
 struct RunVmThreadGuard {
     ap_threads: Vec<VcpuThread>,
     monitor: Option<JoinHandle<monitor::reader::MonitorLoopResult>>,
@@ -2433,16 +2511,15 @@ impl Drop for RunVmThreadGuard {
         // takes its clean bsp-done exit rather than the sched-exit crash-final
         // pass (its outer loop DOES terminate on `kill` alone via that pass, but
         // bsp_done is the correct teardown signal the Ok path also uses), then
-        // set `kill` (+ its evt) and clear `freeze`. Join the WATCHDOG and
-        // COORDINATOR first: they hold the vCPUs' `ImmediateExitHandle`s, so
-        // joining a vCPU (which drops its `kvm_run` mmap) while a coordinator
-        // still kicks it would be a use-after-free — the kickers must be
-        // quiesced before their targets. Join the monitor next: its cached
-        // pthread CPU clock IDs remain valid only while every AP thread lives.
+        // set `kill` (+ its evt) and clear `freeze`. Join the watchdog and
+        // coordinator before their target threads so no logical kick or
+        // guest-memory work survives run teardown. In-flight immediate-exit
+        // accesses pin their mappings through transient Arcs; the ordering
+        // remains required for the broader lifecycle. Join the monitor next:
+        // its cached pthread CPU clock IDs remain valid only while APs live.
         self.bsp_done.store(true, Ordering::Release);
         let _ = self.bsp_done_evt.write(1);
-        self.kill.store(true, Ordering::Release);
-        let _ = self.kill_evt.write(1);
+        super::publish_vm_kill(&self.kill, &self.kill_evt);
         self.freeze.store(false, Ordering::Release);
         if let Some(h) = self.watchdog.take() {
             let _ = h.join();
@@ -2529,8 +2606,7 @@ impl Drop for PartialApSpawnGuard {
         if self.ap_threads.is_empty() {
             return; // disarmed on success (or a zero-AP / first-AP failure)
         }
-        self.kill.store(true, Ordering::Release);
-        let _ = self.kill_evt.write(1);
+        super::publish_vm_kill(&self.kill, &self.kill_evt);
         self.freeze.store(false, Ordering::Release);
         kick_and_join_ap_threads(std::mem::take(&mut self.ap_threads));
     }
@@ -3796,9 +3872,10 @@ impl KtstrVm {
             Arc::new(std::sync::Mutex::new(None));
 
         let has_immediate_exit = vm.has_immediate_exit;
+        let vcpu_run_size = vm.vm_fd.run_size();
         let vcpus_for_wd = self.topology.total_cpus();
         let mut vcpus = std::mem::take(&mut vm.vcpus);
-        let mut bsp = vcpus.remove(0);
+        let bsp = vcpus.remove(0);
 
         // Build per-vCPU pin targets from the stored pinning plan.
         // Index i holds the host CPU for vCPU i. BSP is index 0.
@@ -3892,6 +3969,7 @@ impl KtstrVm {
         let (ap_threads, ap_freeze_handles) = self.spawn_ap_threads(
             vcpus,
             has_immediate_exit,
+            vcpu_run_size,
             &com1,
             &com2,
             Some(&virtio_con),
@@ -3917,8 +3995,8 @@ impl KtstrVm {
         // guest_mem). The guard owns `ap_threads` (borrowed below via
         // `guard.ap_threads`) and accumulates the monitor / bpf-write /
         // coordinator / watchdog handles as they spawn; the Ok path `disarm`s it.
-        // Declared after `bsp` (above) so it joins the watchdog + coordinator
-        // (which hold bsp's ImmediateExitHandle) before `bsp` drops.
+        // Declared after `bsp` (above) so it joins every run-scoped helper
+        // before the enclosing VM resources drop.
         //
         // Snapshot the BSP thread's affinity BEFORE the mask narrowing below,
         // and declare the restore guard BEFORE `RunVmThreadGuard` so — Rust
@@ -4334,26 +4412,19 @@ impl KtstrVm {
         register_vcpu_signal_handler();
         let timeout = self.timeout;
 
-        // Watchdog thread.
-        let bsp_ie = if has_immediate_exit {
-            Some(ImmediateExitHandle::from_vcpu(&mut bsp))
-        } else {
-            None
-        };
+        // Watchdog thread. The BSP owner holds a second MAP_SHARED kvm_run
+        // VMA; each handle access transiently upgrades a Weak reference and
+        // pins that byte independently of the original VcpuFd mapping.
+        let (mut bsp, bsp_ie) = ImmediateExitVcpu::new(bsp, has_immediate_exit, vcpu_run_size)
+            .context("map BSP kvm_run for immediate-exit")?;
         let bsp_tid = unsafe { libc::pthread_self() };
         // `bsp_done` is created above (hoisted before the first spawn).
         let bsp_done_for_wd = bsp_done.clone();
-        // BSP-IE-handle liveness gate. The freeze coordinator's
-        // captured `ImmediateExitHandle` for the BSP addresses the
-        // BSP `VcpuFd`'s kvm_run mmap; that mapping disappears the
-        // moment `bsp` (a local in run_vm) falls out of scope. The
-        // primary defense against UAF is the `freeze_coord_handle`
-        // join inside run_vm BEFORE bsp drops, but this flag is a
-        // cheap secondary check the closure consults before any
-        // `bsp_ie_handle.set(1)` call so a future restructure that
-        // moves the join doesn't silently reintroduce the UAF. Set
-        // to `false` by run_vm right before bsp drops; gate every
-        // BSP-side immediate_exit write on `bsp_alive.load(Acquire)`.
+        // BSP logical-participation gate. The coordinator consults it to
+        // avoid kicks after BSP exit, and the panic hook publishes false
+        // before unwind. It is not the mapping-safety mechanism: each
+        // ImmediateExitHandle access carries its own owner-backed lifetime
+        // synchronization, so even a stale true cannot target unmapped memory.
         let bsp_alive = Arc::new(AtomicBool::new(true));
         let bsp_alive_for_coord = bsp_alive.clone();
         // `bsp_done_evt` is created above (hoisted before the first spawn).
@@ -4724,26 +4795,20 @@ impl KtstrVm {
                 }
             }
         };
-        // Extract a fresh ImmediateExitHandle for the freeze coord —
-        // the watchdog grabs another one below for its own kick path.
-        // Both views address the same kvm_run.immediate_exit byte
-        // (single-byte volatile writes), distinct from the BSP's own
-        // owned handle inside its run loop.
-        let freeze_coord_bsp_ie_handle = if has_immediate_exit {
-            Some(ImmediateExitHandle::from_vcpu(&mut bsp))
-        } else {
-            None
-        };
+        // Clone the BSP's Weak handle for the coordinator. Each access upgrades
+        // to a transient Arc, pinning the secondary VMA across a run-loop fd
+        // completion race; later upgrades fail after owner completion.
+        let freeze_coord_bsp_ie_handle = bsp_ie.clone();
         let freeze_coord_bsp_tid = unsafe { libc::pthread_self() };
         // Snapshot the AP-side freeze handles. `parked` flags and
         // register-snapshot slots come from `ap_freeze_handles` —
         // populated alongside the threads inside `spawn_ap_threads`,
-        // kept out of `VcpuThread` so that struct stays minimal
-        // (only `handle` + `exited` + `immediate_exit` are needed
-        // for teardown). The freeze coordinator owns these Vecs
-        // for the rest of run_vm. `pthread_t`s and immediate-exit
-        // handles still come from `ap_threads` because those are
-        // teardown-relevant too.
+        // kept out of `VcpuThread` so that struct carries only run-thread
+        // lifecycle and targeting state. The freeze coordinator owns these
+        // Vecs for the rest of run_vm. `pthread_t`s and immediate-exit handles
+        // still come from `ap_threads` because the coordinator needs them for
+        // rendezvous/watchpoint kicks; production teardown itself is
+        // signal-only and does not write `immediate_exit`.
         let ApFreezeHandles {
             parked: freeze_coord_ap_parked,
             regs: freeze_coord_ap_regs,
@@ -4753,31 +4818,19 @@ impl KtstrVm {
             .iter()
             .map(|vt| vt.handle.as_pthread_t() as libc::pthread_t)
             .collect();
-        // ImmediateExitHandle is Copy+Send+Sync, so the coordinator
-        // captures a Vec of them by move. The kvm_run mmap is shared
-        // between the spawned vCPU thread (which owns its handle
-        // inside VcpuThread) and the coordinator's copy — single-byte
-        // volatile writes through `set` from either side address the
-        // same MAP_SHARED page.
+        // ImmediateExitHandle is Clone+Send+Sync, so the coordinator captures
+        // Weak clones by move. Each access transiently upgrades to the AP
+        // owner's secondary-VMA Arc and pins it for the atomic byte operation.
         let freeze_coord_ap_ies: Vec<Option<ImmediateExitHandle>> = guard
             .ap_threads
             .iter()
-            .map(|vt| vt.immediate_exit)
+            .map(|vt| vt.immediate_exit.clone())
             .collect();
-        // Per-AP `alive` flags paired with the IE handles above. The
-        // coordinator's pass-1 kick (in `freeze_and_dispatch`) and
-        // `arm_user_watchpoint` gate each `ie.set` on a fresh
-        // Acquire load of the corresponding entry, mirroring the
-        // BSP-side `bsp_alive` TOCTOU-tightened gate. Without this,
-        // an AP panic-unwind under `panic = "unwind"` (test profile)
-        // can drop `vcpu` mid-cycle and the coordinator's
-        // `Vec<ImmediateExitHandle>` would issue a `write_volatile`
-        // through a freed `kvm_run` mapping. The Vec lives the
-        // entire coordinator lifetime; index alignment with
-        // `freeze_coord_ap_ies` and `freeze_coord_ap_pthreads` is
-        // load-bearing — every AP-loop site uses `iter().enumerate()`
-        // (or `zip`) so a future change that drops or reorders any
-        // one Vec is loud about the regression.
+        // Per-AP logical-participation flags paired with the IE handles above.
+        // Kick paths use a fresh Acquire load to skip APs that have crossed a
+        // panic edge. A stale true remains memory-safe because IE set itself
+        // holds the owner-backed mapping lease. Index alignment with the IE
+        // and pthread vectors remains load-bearing for targeting the right AP.
         let freeze_coord_ap_alive: Vec<Arc<AtomicBool>> =
             guard.ap_threads.iter().map(|vt| vt.alive.clone()).collect();
         // Total vCPU count (BSP + APs). Forwarded into dump_state so
@@ -7967,38 +8020,14 @@ impl KtstrVm {
                             // cannot be unconditional inside the
                             // closure).
                             'capture: {
-                            // Cycle-entry snapshot of BSP liveness
-                            // used for non-UAF-sensitive bookkeeping:
-                            // parked_evt pre-seed gating
-                            // (`bsp_parked` lookup), `expected_parks`
-                            // accounting (+1 for BSP), pass-2
-                            // `pthread_kill`, and the rendezvous-wait
-                            // diagnostics. None of those callsites
-                            // dereference the BSP's `kvm_run` mmap, so
-                            // a stale `true` is benign:
-                            // `pthread_kill` against an exited tid
-                            // returns ESRCH, an over-counted
-                            // `expected_parks` heals on the next
-                            // SIGRTMIN/park-ack overshoot path, and
-                            // pre-seed reads only the AtomicBool
-                            // `bsp_parked` flag.
-                            //
-                            // The TOCTOU-sensitive
-                            // `ImmediateExitHandle::set(1)` against
-                            // the BSP's `kvm_run` mmap is gated by
-                            // its own fresh Acquire load further
-                            // below — see the "Re-load `bsp_alive`
-                            // immediately before the BSP `ie.set()`"
-                            // comment for the full rationale (a stale
-                            // snapshot there would write through a
-                            // pointer into freed `kvm_run` pages
-                            // after the BSP drops its `VcpuFd`).
-                            //
-                            // The primary line of defense remains
-                            // `freeze_coord_handle.join()` in run_vm
-                            // BEFORE the BSP `VcpuFd` falls out of
-                            // scope; the in-closure loads are
-                            // defense-in-depth.
+                            // Cycle-entry BSP participation snapshot used for
+                            // parked pre-seeding, expected-park accounting,
+                            // signaling, and diagnostics. A stale true is
+                            // benign for those logical decisions. The IE
+                            // handle also rechecks participation at its set
+                            // site, but mapping safety comes from the handle's
+                            // owner-backed lifetime synchronization rather
+                            // than either atomic snapshot.
                             let bsp_alive_at_start =
                                 bsp_alive_for_coord.load(Ordering::Acquire);
                             // Drain `parked_evt` BEFORE flipping
@@ -8276,52 +8305,13 @@ impl KtstrVm {
                             if let Some(ref blk) = freeze_coord_virtio_blk {
                                 blk.lock().pause();
                             }
-                            // Pass 1: set every immediate_exit=1.
-                            // Each ImmediateExitHandle::set is a
-                            // single-byte write_volatile into the
-                            // corresponding kvm_run mmap (MAP_SHARED,
-                            // lifetime tied to the running VcpuFd
-                            // that owns it).
-                            //
-                            // Primary defense for the AP path: the
-                            // AP threads are joined in
-                            // `collect_results` AFTER the coord
-                            // joins, so in the normal lifecycle the
-                            // coord cannot outlive an AP's `VcpuFd`.
-                            // The exception is panic-unwind under
-                            // `panic = "unwind"` (test profile),
-                            // where the AP's panic hook fires
-                            // synchronously on the panicking thread
-                            // and the subsequent stack drop unmaps
-                            // the AP's `kvm_run` page mid-cycle —
-                            // before any join. Without a per-AP
-                            // gate the unguarded `ie.set(1)` above
-                            // would `write_volatile` through a
-                            // pointer into freed memory.
-                            //
-                            // Secondary defense: each AP carries an
-                            // `Arc<AtomicBool>` (`VcpuThread::alive`)
-                            // that the AP's panic hook flips to
-                            // `false` BEFORE unwinding starts.
-                            // The Acquire load below
-                            // synchronizes-with that Release store
-                            // (panic hook runs synchronously on the
-                            // panicking AP thread before unwind),
-                            // so a `true` reading observed here
-                            // happens-before any subsequent unwind
-                            // drop of `vcpu`. Mirrors the
-                            // BSP-side `bsp_alive` TOCTOU-tightened
-                            // gate: load fresh at the actual
-                            // `ie.set` site, not at cycle entry.
-                            // `iter().enumerate()` walks index
-                            // alongside the handle so the
-                            // `freeze_coord_ap_alive[i]` lookup
-                            // stays index-aligned.
-                            //
-                            // The BSP IE write is gated on
-                            // `bsp_alive` because run_vm drops the
-                            // BSP before collect_results runs; see
-                            // the gate's doc above.
+                            // Pass 1: set every participating vCPU's
+                            // immediate_exit byte. The alive loads are prompt
+                            // panic-edge suppression only; they can legally
+                            // race and return stale true. Each set remains
+                            // safe because it carries the corresponding
+                            // owner's mapping lifetime synchronization through
+                            // the atomic byte store.
                             for (i, ie) in freeze_coord_ap_ies.iter().enumerate() {
                                 if let Some(ie) = ie
                                     && freeze_coord_ap_alive[i]
@@ -8330,39 +8320,11 @@ impl KtstrVm {
                                     ie.set(1);
                                 }
                             }
-                            // Re-load `bsp_alive` immediately before the
-                            // BSP `ie.set()` instead of reusing the
-                            // cycle-entry snapshot (`bsp_alive_at_start`).
-                            // The snapshot is captured at the top of
-                            // 'capture and is many milliseconds stale by
-                            // the time pass-1 runs (worker pause()+ack,
-                            // parked_evt pre-seed, the freeze=true
-                            // Release store, and the virtio-blk
-                            // pause()-rendezvous all happen in between).
-                            // The BSP run-loop can transition
-                            // `bsp_alive=false` and drop its `VcpuFd` at
-                            // any point in that window. Without a
-                            // fresh load, `ImmediateExitHandle::set(1)`
-                            // would issue a `write_volatile` through a
-                            // pointer into a `kvm_run` mmap whose
-                            // backing pages were unmapped when the BSP
-                            // `VcpuFd` was dropped (the kernel's
-                            // `kvm_vcpu_release` path tears down the
-                            // `kvm_run` MAP_SHARED region; subsequent
-                            // userspace writes against the stale
-                            // pointer are use-after-free into freed
-                            // pages). The Acquire load pairs with the
-                            // BSP run-loop's Release store of `false`
-                            // on its way out: a `bsp_alive_now == true`
-                            // observed here happens-before any
-                            // `false` the BSP could subsequently
-                            // store, which means the BSP `VcpuFd` is
-                            // still alive AT the moment of `ie.set()`
-                            // and cannot be dropped until the next
-                            // load reads false. Pass-2's pthread_kill
-                            // and the rendezvous-wait below issue
-                            // their own fresh Acquire loads for the
-                            // same TOCTOU reason.
+                            // Re-load participation at the BSP set site to
+                            // avoid an unnecessary write when exit occurred
+                            // during the AP/worker pass. It is intentionally
+                            // not relied on as a mapping lifetime proof; the
+                            // handle revalidates under its own owner protocol.
                             let bsp_alive_for_ie =
                                 bsp_alive_for_coord.load(Ordering::Acquire);
                             if bsp_alive_for_ie
@@ -10597,28 +10559,12 @@ impl KtstrVm {
                                             .to_string(),
                                     ),
                                     Some(symbol_cache) => {
-                                        // Pass the bsp_alive Arc by
-                                        // reference so each BSP-touching
-                                        // site inside `arm_user_watchpoint`
-                                        // (the BSP `ie.set` and the BSP
-                                        // `pthread_kill`) issues its own
-                                        // fresh Acquire load immediately
-                                        // before the syscall. A bool
-                                        // snapshot taken here would be
-                                        // stale by the time the kick
-                                        // pass reaches the BSP — long
-                                        // enough for the BSP run-loop to
-                                        // publish `false` (Release) and
-                                        // drop its `VcpuFd`, leaving a
-                                        // `true`-snapshot writing through
-                                        // freed kvm_run mmap pages.
-                                        // `run_vm` flips bsp_alive to
-                                        // false only AFTER joining the
-                                        // coordinator (see `bsp_alive`
-                                        // in run_vm), so a `true`
-                                        // reading inside the helper is
-                                        // load-bearing for the BSP
-                                        // kvm_run mmap's liveness.
+                                        // Pass the Arc so the helper can
+                                        // suppress BSP work using a fresh
+                                        // participation check at each site.
+                                        // Immediate-exit mapping safety is
+                                        // independent of this hint and lives
+                                        // in the guarded handle itself.
                                         match arm_user_watchpoint(
                                             &freeze_coord_watchpoint,
                                             symbol_cache,
@@ -12944,8 +12890,9 @@ impl KtstrVm {
                 // `collect_results` after the coord thread closure
                 // returns (see `run_vm` join sequencing: coord first
                 // via `freeze_coord_handle.join()`, AP threads later
-                // via `wait_for_exit` + `handle.join` inside
-                // `collect_results`). Any vCPU that calls
+                // via the service-accounted, wall-bounded
+                // `kick_and_join_ap_threads` helper inside `collect_results`).
+                // Any vCPU that calls
                 // `latch_user_hit` between the drain loop above and
                 // its eventual join will set `hit = true` AND
                 // increment `hit_evt`, but the coordinator's epoll
@@ -13206,9 +13153,9 @@ impl KtstrVm {
                 }
             })
             .context("spawn freeze coordinator thread")?;
-        // The coordinator holds bsp + AP ImmediateExitHandles and a raw pointer
-        // into guest_mem; the guard joins it (before bsp/vm drop) on an
-        // early-return past here — e.g. the watchdog spawn `?` just below.
+        // The coordinator holds BSP/AP handles plus a raw pointer into
+        // guest_mem; the guard joins it before VM drop on any later early
+        // return, including watchdog spawn failure below.
         guard.freeze_coord = Some(freeze_coord_handle);
 
         let watchdog = std::thread::Builder::new()
@@ -13592,10 +13539,12 @@ impl KtstrVm {
                     {
                         // A progress tier fired, an AP set kill, or the
                         // hard timeout expired.
-                        // Re-check bsp_done: if the BSP already exited its
-                        // run loop, the VcpuFd (and kvm_run mmap backing
-                        // bsp_ie) may be dropped. Writing to ie after drop
-                        // is a use-after-free.
+                        // Re-check bsp_done so a completed BSP is not kicked
+                        // or relabeled as a timeout. This is a logical
+                        // participation check, not a mapping-lifetime guard:
+                        // each handle access first upgrades its Weak state and
+                        // pins the secondary kvm_run mapping through the
+                        // atomic byte access; a stale handle simply no-ops.
                         if bsp_done_for_wd.load(Ordering::Acquire) {
                             if crate::vmm::debug_logging_enabled() {
                                 eprintln!("ktstr-watchdog: BSP already done, returning");
@@ -13998,15 +13947,11 @@ impl KtstrVm {
                 }
             })
             .context("spawn watchdog thread")?;
-        // Last spawn: the watchdog holds bsp's ImmediateExitHandle. With it in
-        // the guard, the guard now owns every spawned thread. Under panic=unwind
-        // (test profile) a panic in the BSP loop below unwinds through the
-        // guard's Drop, which joins them all before bsp/vm drop; under
-        // panic=abort (release) the process aborts instead — no detached thread
-        // survives to touch freed memory, so that path is UAF-safe too. The
-        // normal return disarms the guard just before the watchdog/coordinator
-        // joins (deferred past the infallible post-loop teardown, so a panic
-        // there is still covered).
+        // Last spawn: with the watchdog in the guard, it now owns every
+        // spawned thread. Under panic=unwind a BSP panic runs guard Drop and
+        // joins them before VM resources disappear; panic=abort terminates the
+        // process. The normal return disarms immediately before the explicit
+        // watchdog/coordinator joins.
         guard.watchdog = Some(watchdog);
 
         // Boot-ordering gate: block the BSP until every AP host thread has
@@ -14050,20 +13995,11 @@ impl KtstrVm {
                 exited: bsp_done.clone(),
                 kill_evt: Some(kill_evt.clone()),
                 exited_evt: Some(bsp_done_evt.clone()),
-                // Hand the BSP's `bsp_alive` flag to the panic hook so a
-                // panic-unwind path flips it to `false` BEFORE the
-                // stack drop unmaps `bsp`'s `kvm_run` page. The
-                // normal-exit path's post-join `bsp_alive.store(false)`
-                // (see the `collect_results` finalization block) covers
-                // `panic = "abort"` and the no-panic path; the panic
-                // hook covers `panic = "unwind"` (test profile) where
-                // the post-join store is unreachable. Mirrors
-                // the AP-side `alive: Some(alive.clone())` plumbing in
-                // spawn_ap_threads — every cross-thread holder of a
-                // BSP `ImmediateExitHandle` (the freeze coordinator,
-                // the watchdog) gates `ie.set` on this flag's
-                // Acquire load, and a panic-released Release store
-                // happens-before the unwind drop of `bsp`.
+                // Give the panic hook the BSP participation flag so it can
+                // publish false before unwind and promptly suppress later
+                // coordinator/watchdog work. This is a logical edge only;
+                // every BSP ImmediateExitHandle upgrades to a transient Arc
+                // before access and remains safe across owner destruction.
                 alive: Some(bsp_alive.clone()),
             },
             || {
@@ -14124,8 +14060,7 @@ impl KtstrVm {
         // Previously kill was deferred to collect_results, leaving
         // the monitor sampling at 100ms cadence through the entire
         // run_vm cleanup window (watchdog join + coord join).
-        kill.store(true, Ordering::Release);
-        let _ = kill_evt.write(1);
+        super::publish_vm_kill(&kill, &kill_evt);
         // Sample cleanup start at the earliest moment after BSP exit so
         // every host-side teardown step lands inside the window, in
         // execution order: watchdog + coordinator joins, monitor join, AP
@@ -14210,9 +14145,9 @@ impl KtstrVm {
             watchdog,
         } = guard.disarm();
 
-        // Join the watchdog before dropping `bsp`. The watchdog holds an
-        // ImmediateExitHandle pointing into bsp's kvm_run mmap. If bsp is
-        // dropped first, the watchdog may write to unmapped memory.
+        // Join the watchdog so no timeout decision or logical BSP kick
+        // survives the VM run. Its ImmediateExitHandle mapping is
+        // independently pinned, so memory safety does not depend on this join.
         // (`Some` here — disarmed from the guard after a successful spawn.)
         if let Some(h) = watchdog {
             let _ = h.join();
@@ -14221,14 +14156,10 @@ impl KtstrVm {
             eprintln!("CLEANUP: watchdog joined");
         }
 
-        // Join the freeze coordinator BEFORE `bsp` falls out of scope at
-        // the end of this function. The coordinator's captured BSP
-        // `ImmediateExitHandle` addresses bsp's kvm_run mmap; reachable
-        // from multiple paths inside `freeze_and_dispatch` (TLV-driven
-        // CAPTURE, user watchpoint, late-trigger, even after `bsp_done`
-        // flips). Without this join, any of those paths can write
-        // through a freed kvm_run mapping after bsp drops — a
-        // use-after-free with hostile-input semantics.
+        // Join the freeze coordinator before returning so its capture,
+        // watchpoint, and late-trigger work cannot survive the VM run or touch
+        // guest-memory resources after teardown. Its immediate-exit mappings
+        // are independently pinned, including across BSP fd completion.
         //
         // `bsp_done.store(true)` + `bsp_done_evt.write(1)` above
         // (lines around `BSP: exited run loop`) wake the coordinator's
@@ -14236,10 +14167,9 @@ impl KtstrVm {
         // iteration, so this join does not deadlock; the watchdog's
         // own kill/bsp_done writes are also covered.
         //
-        // Flip `bsp_alive` to `false` AFTER the join completes — at
-        // that point the coordinator thread is gone and the gate is
-        // belt-and-braces for any future restructuring that could
-        // share the BSP IE handle outside this lifecycle.
+        // Flip the logical BSP participation flag after the coordinator is
+        // gone. The handle owner's active flag is published separately when
+        // the BSP wrapper completes.
         // (`Some` here — disarmed from the guard after a successful spawn.)
         if let Some(h) = freeze_coord_handle {
             let _ = h.join();
@@ -14344,10 +14274,8 @@ impl KtstrVm {
             ap_threads,
             monitor_handle,
             bpf_write_handle,
-            // Coordinator is already joined above (before `bsp` drops)
-            // to prevent UAF on the BSP `ImmediateExitHandle`.
-            // `collect_results`'s `if let Some(h) = ...` join is a
-            // no-op for the `None` arm.
+            // Coordinator is already joined above; collect_results' optional
+            // compatibility join is therefore a no-op.
             freeze_coordinator: None,
             com1,
             com2,
@@ -14440,6 +14368,7 @@ impl KtstrVm {
         &self,
         vcpus: Vec<kvm_ioctls::VcpuFd>,
         has_immediate_exit: bool,
+        vcpu_run_size: usize,
         com1: &Arc<PiMutex<console::Serial>>,
         com2: &Arc<PiMutex<console::Serial>>,
         virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
@@ -14486,12 +14415,14 @@ impl KtstrVm {
         // still owns every partial thread, preserving its kill/kick/join
         // teardown before the caller can drop guest memory.
         let ap_gate_start = Instant::now();
-        for (i, mut vcpu) in vcpus.into_iter().enumerate() {
-            let ie_handle = if has_immediate_exit {
-                Some(ImmediateExitHandle::from_vcpu(&mut vcpu))
-            } else {
-                None
-            };
+        for (i, vcpu) in vcpus.into_iter().enumerate() {
+            // The wrapper is moved into the AP closure and owns the secondary
+            // shared kvm_run VMA. Handles are Weak and pin it only for an
+            // in-flight access; into_inner/Drop publish inactive and release
+            // the owner Arc before returning or dropping the run-loop fd.
+            let (mut vcpu, ie_handle) =
+                ImmediateExitVcpu::new(vcpu, has_immediate_exit, vcpu_run_size)
+                    .with_context(|| format!("map AP vCPU {} kvm_run for immediate-exit", i + 1))?;
             let kill_clone = kill.clone();
             let kill_evt_clone = kill_evt.clone();
             let freeze_clone = freeze.clone();
@@ -14510,17 +14441,14 @@ impl KtstrVm {
             let parked_clone = parked.clone();
             let regs = Arc::new(std::sync::Mutex::new(None));
             let regs_clone = regs.clone();
-            // Per-AP `alive` flag mirroring the BSP `bsp_alive` gate.
-            // Initialised to `true`; the AP panic hook (via
-            // `VcpuPanicCtx::alive`) flips it to `false` BEFORE
-            // unwinding drops `vcpu` and its `kvm_run` mmap, so the
-            // freeze coordinator's pass-1 kick loop and the
-            // `arm_user_watchpoint` kick gate every `ie.set` on a
-            // fresh Acquire load and skip indices whose mmap is
-            // about to disappear. Under `panic = "abort"` (release)
-            // unwinding never runs and the flag stays `true` for
-            // the life of the run; the gate is then a no-op,
-            // matching the BSP belt-and-braces semantic.
+            // Per-AP logical-participation flag mirroring `bsp_alive`.
+            // The panic hook flips it to false before unwinding so kick loops
+            // promptly skip an AP that can no longer make progress. Mapping
+            // safety is structural and independent of this advisory gate:
+            // each ImmediateExitHandle access upgrades its Weak state to a
+            // transient Arc that pins the secondary kvm_run mapping until the
+            // byte access completes. Under panic=abort no unwind occurs and
+            // process termination makes the participation edge irrelevant.
             let alive = Arc::new(AtomicBool::new(true));
             let has_immediate_exit_clone = has_immediate_exit;
             let pin_cpu = pin_targets.get(i).copied().flatten();
@@ -14554,11 +14482,9 @@ impl KtstrVm {
                 exited: exited.clone(),
                 kill_evt: Some(kill_evt.clone()),
                 exited_evt: Some(Arc::clone(&exit_evt)),
-                // Hand the AP's `alive` flag to the panic hook so a
-                // panic-unwind path flips it to `false` BEFORE the
-                // stack drop unmaps `vcpu`'s `kvm_run` page. The
-                // freeze coordinator's pass-1 kick gates each
-                // `ie.set` on this flag's Acquire load.
+                // Publish the AP's logical panic edge before unwind so later
+                // coordinator passes can skip redundant kicks. Immediate-exit
+                // mapping lifetime does not depend on this flag.
                 alive: Some(alive.clone()),
             };
             let (tid_slot_clone, tid_latch_clone) = {
@@ -14625,6 +14551,29 @@ impl KtstrVm {
                     // installed vcpu panic hook turns into a `kill` store that
                     // the BSP gate also observes, so it never hangs.
                     boot_latch_clone.set();
+                    // Test-only production-path seam: hold this AP immediately
+                    // before its KVM loop until the interactive BSP is about to
+                    // enter KVM_RUN, then publish through the exact Fatal helper
+                    // used by `ExitAction::Fatal`. The subprocess parent has a
+                    // wall timeout, so a lost relay wake is a deterministic
+                    // failure instead of a wedged test worker.
+                    #[cfg(test)]
+                    if super::INJECT_INTERACTIVE_AP_FATAL.swap(false, Ordering::AcqRel) {
+                        while !super::INTERACTIVE_BSP_ENTERED.load(Ordering::Acquire)
+                            && !kill_clone.load(Ordering::Acquire)
+                        {
+                            std::thread::park_timeout(Duration::from_millis(1));
+                        }
+                        if !kill_clone.load(Ordering::Acquire) {
+                            // Give the BSP a chance to cross the final userspace
+                            // instructions into KVM_RUN. Correctness does not
+                            // depend on it: the relay's repeated post-kill
+                            // immediate-exit+signal sequence also closes a
+                            // signal-before-KVM_RUN race.
+                            std::thread::sleep(Duration::from_millis(100));
+                            exit_dispatch::publish_ap_fatal_exit(&kill_clone, &kill_evt_clone);
+                        }
+                    }
                     vcpu_panic::with_vcpu_panic_ctx(panic_ctx, || {
                         vcpu_run_loop_unified(
                             &mut vcpu,
@@ -14671,12 +14620,13 @@ impl KtstrVm {
                     // the waiter; only the edge from 0 to non-zero
                     // matters.
                     let _ = exit_evt_thread.write(1);
-                    vcpu
+                    vcpu.into_inner()
                 })
                 .with_context(|| format!("spawn vCPU {} thread", i + 1))?;
 
             spawn_guard.ap_threads.push(VcpuThread {
                 handle,
+                #[cfg(test)]
                 exited,
                 immediate_exit: ie_handle,
                 exit_evt,
@@ -16155,7 +16105,7 @@ impl KtstrVm {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_bsp_loop(
         &self,
-        bsp: &mut kvm_ioctls::VcpuFd,
+        bsp: &mut ImmediateExitVcpu,
         com1: &Arc<PiMutex<console::Serial>>,
         com2: &Arc<PiMutex<console::Serial>>,
         virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
@@ -16481,9 +16431,10 @@ impl KtstrVm {
                             // TIMEOUT. Mirrors the AP Fatal arm's
                             // kill-propagation in
                             // [`super::exit_dispatch::vcpu_run_loop_unified`].
-                            kill.store(true, Ordering::Release);
                             if let Some(kev) = kill_evt {
-                                let _ = kev.write(1);
+                                super::publish_vm_kill(kill, kev);
+                            } else {
+                                kill.store(true, Ordering::Release);
                             }
                             exit_reason = BspExitReason::Fatal;
                             break;
@@ -16494,18 +16445,19 @@ impl KtstrVm {
                     // latch fires only once the banner line is newline-
                     // terminated, so classify_exit just drained the '\n'
                     // that completed it.
-                    // Abort fast with the cause rather than spinning to the
-                    // watchdog / 24h interactive timeout. Propagate kill so
-                    // peers + the freeze coordinator tear down promptly,
-                    // like the Fatal arm.
+                    // Abort fast with the cause rather than leaving a shell
+                    // until external termination (or an exec payload until its
+                    // deadline). Propagate kill so peers + the freeze
+                    // coordinator tear down promptly, like the Fatal arm.
                     if let Some(line) = com1.lock().take_panic() {
                         eprintln!(
                             "BSP: guest kernel panic — aborting run: {line} \
                              (if OOM: raise memory_mib or shrink the initramfs)"
                         );
-                        kill.store(true, Ordering::Release);
                         if let Some(kev) = kill_evt {
-                            let _ = kev.write(1);
+                            super::publish_vm_kill(kill, kev);
+                        } else {
+                            kill.store(true, Ordering::Release);
                         }
                         exit_reason = BspExitReason::GuestPanic;
                         break;
@@ -16514,7 +16466,7 @@ impl KtstrVm {
                 Err(e) => {
                     if e.errno() == libc::EAGAIN || e.errno() == libc::EINTR {
                         if has_immediate_exit {
-                            bsp.set_kvm_immediate_exit(0);
+                            bsp.set_immediate_exit(0);
                         }
                         continue;
                     }
@@ -16592,8 +16544,7 @@ impl KtstrVm {
         // before returning VmRunState. kill_evt is level-triggered
         // (EFD_NONBLOCK eventfd); the AtomicBool kill flag is the
         // source of truth that breaks each thread's outer loop.
-        run.kill.store(true, Ordering::Release);
-        let _ = run.kill_evt.write(1);
+        super::publish_vm_kill(&run.kill, &run.kill_evt);
         // Clear freeze before kicking APs so any vCPU still in the
         // park loop observes `freeze=false` next iteration and exits
         // toward kill. Without this, an AP parked at the moment the
@@ -16602,9 +16553,8 @@ impl KtstrVm {
         // freeze clears.
         run.freeze.store(false, Ordering::Release);
 
-        // The freeze coordinator was joined inside `run_vm` BEFORE
-        // bsp dropped (preventing UAF on the BSP ImmediateExitHandle),
-        // so `run.freeze_coordinator` is always `None` here. The
+        // The freeze coordinator was joined inside `run_vm`, so
+        // `run.freeze_coordinator` is always `None` here. The
         // `Option`-typed field is preserved for backward compatibility
         // with paths that may construct VmRunState differently in
         // the future; the conditional join below is a no-op for the
@@ -16637,13 +16587,13 @@ impl KtstrVm {
         // `kind_host_ptr` would touch unmapped memory.
         // `request_kva` is the paired guest-side KVA whose
         // translation goes through the same mapping. By this point
-        // every vCPU thread has joined (the loop above blocked on
-        // each `wait_for_exit` + `handle.join`) and the freeze
-        // coordinator joined back in `run_vm` before `bsp` dropped,
-        // so no live thread reads either field. The defense-in-depth
-        // store here zeroes the slots so a stray future Arc clone
-        // (or a follow-up that adds a new reader after teardown)
-        // sees a sentinel `null_mut` / `0` that
+        // every AP thread has joined through the bounded helper above
+        // (`exit_evt` wake, `is_finished()` proof, then non-blocking join),
+        // and the freeze coordinator joined back in `run_vm` before `bsp`
+        // dropped, so no live thread reads either field. The
+        // defense-in-depth store here zeroes the slots so a stray future Arc
+        // clone (or a follow-up that adds a new reader after teardown) sees a
+        // sentinel `null_mut` / `0` that
         // [`super::exit_dispatch::latch_slot0_with_gate`] already
         // gates on, instead of dangling host memory. `Release`
         // ordering pairs with the `Acquire` reads inside the latch

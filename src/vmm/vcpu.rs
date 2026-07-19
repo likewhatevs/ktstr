@@ -15,16 +15,21 @@
 //! and RT priority ([`set_rt_priority`]) live here too — they're
 //! shared between the BSP / AP run loops.
 
+use std::ops::Deref;
+#[cfg(test)]
 use std::os::unix::io::AsRawFd;
 use std::os::unix::thread::JoinHandleExt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
-use vmm_sys_util::timerfd::TimerFd;
+#[cfg(test)]
+use vmm_sys_util::{
+    epoll::{ControlOperation, Epoll, EpollEvent, EventSet},
+    timerfd::TimerFd,
+};
 
 use super::exit_dispatch;
 use super::result::HostVcpuSchedstat;
@@ -43,77 +48,216 @@ use crate::sync::Latch;
 /// entering `KVM_RUN`. Setting it to 1 causes the next `KVM_RUN` to return
 /// immediately with `EINTR`.
 ///
-/// Clone+Copy so multiple threads (vCPU loop, watchdog, freeze coordinator)
-/// can each carry a handle pointing at the same MAP_SHARED `kvm_run` page.
-/// All writes go through `set` (single-byte `write_volatile`), so a value
-/// copy of `Self` is exactly equivalent to a borrowed reference for the
-/// access pattern KVM cares about.
+/// Each handle holds a Weak reference to an [`ImmediateExitState`] owned by the
+/// run-loop's [`ImmediateExitVcpu`]. A set/read upgrades it to a transient Arc,
+/// which pins the state's second MAP_SHARED `kvm_run` mapping for the complete
+/// byte access. Linux VMAs retain a file reference, so an in-flight access
+/// remains valid even if the run-loop completes and its `VcpuFd` is returned
+/// or dropped concurrently. Idle stale handles do not prolong the VM's
+/// lifetime. The extra VMA maps the same physical run pages and costs only
+/// VMA/page-table metadata.
 ///
-/// # Liveness contract
+/// This follows the KVM API's offset-zero vCPU mapping contract and Linux's
+/// `kvm_vcpu_mmap` implementation: each VMA maps the same `vcpu->run` pages,
+/// the VMA's file reference delays `kvm_vcpu_release`, and KVM samples
+/// `immediate_exit` with `READ_ONCE`.
 ///
-/// The handle has no lifetime tie to the `VcpuFd` that owns the mmap.
-/// Cross-thread holders MUST gate every `set` on a paired liveness flag
-/// flipped before the owning `VcpuFd` drops:
-///   - BSP: `bsp_alive` AtomicBool, flipped to `false` AFTER the freeze
-///     coordinator joins in `run_vm` (and BEFORE the local `bsp` falls
-///     out of scope). The flag's primary defense is the join ordering;
-///     the gate at every `set` site is belt-and-braces for future
-///     restructuring.
-///   - APs: per-AP `VcpuThread::alive` AtomicBool, initialised to `true`
-///     and flipped to `false` by the AP's panic hook
-///     (`VcpuPanicCtx::alive`) BEFORE stack unwinding drops `vcpu`.
-///     Under `panic = "abort"` (release) the unwind never runs and
-///     `vcpu` is reaped via `libc::abort`; under `panic = "unwind"`
-///     (test profile) the AP's panic hook fires synchronously on the
-///     panicking thread before unwinding starts, so the Release
-///     store on `alive` happens-before the Drop of `vcpu` and any
-///     coordinator iterating its captured handle Vec observes
-///     `alive == false` ahead of the freed mmap.
+/// [`ImmediateExitVcpu`] also publishes an active flag before dropping its
+/// strong Arc. That flag is deliberately not the memory-safety proof: a set
+/// may upgrade, observe `true`, lose a race with owner completion, and safely
+/// finish through its transient Arc mapping. Later upgrades fail and no-op.
 ///
-/// Without these gates, an AP-thread panic-unwind during the
-/// coordinator's lifetime can produce a UAF when the coordinator's
-/// `freeze_and_dispatch` pass-1 loop or `arm_user_watchpoint` writes
-/// through a freed `kvm_run` page.
-#[derive(Clone, Copy)]
+/// Handles cannot be constructed from a bare `&mut VcpuFd`. The only
+/// constructor is [`ImmediateExitVcpu::new`], which consumes the fd and
+/// requires the owning VM's kernel-reported vCPU mmap size.
+#[derive(Clone)]
 pub(crate) struct ImmediateExitHandle {
-    ptr: *mut u8,
+    state: Weak<ImmediateExitState>,
 }
 
-// SAFETY: The `kvm_run` page is mmap'd MAP_SHARED and designed for cross-thread
-// access. The `immediate_exit` field is a single byte with no torn-read risk.
-// The pointer remains valid for the lifetime of the VcpuFd that owns the mmap.
-unsafe impl Send for ImmediateExitHandle {}
-unsafe impl Sync for ImmediateExitHandle {}
+struct ImmediateExitState {
+    ptr: *mut u8,
+    active: AtomicBool,
+    // Owns the independent VMA addressed by `ptr`. Construct the pointer once
+    // while this mapping is uniquely owned, then never expose or dereference
+    // the wrapper again: every Rust byte access goes through AtomicU8 below.
+    _mapping: kvm_ioctls::KvmRunWrapper,
+}
+
+// SAFETY: `_mapping` owns the offset-zero vCPU VMA containing `ptr` for the
+// state's entire lifetime. Linux retains the vCPU file ref for that VMA, so
+// kvm_vcpu_release cannot retire `vcpu->run` before `_mapping` unmaps it.
+// Every Rust access through `ptr` uses AtomicU8, matching KVM's READ_ONCE
+// access. The mapping cannot move its virtual address and is not exposed after
+// the single construction-time `as_mut_ref` used to extract `ptr`.
+unsafe impl Send for ImmediateExitState {}
+unsafe impl Sync for ImmediateExitState {}
 
 impl ImmediateExitHandle {
-    /// Extract the `immediate_exit` pointer from a VcpuFd before the fd is
-    /// moved into a thread. Must be called while the caller has `&mut VcpuFd`.
-    pub(crate) fn from_vcpu(vcpu: &mut kvm_ioctls::VcpuFd) -> Self {
-        let kvm_run = vcpu.get_kvm_run();
-        let ptr: *mut u8 = &mut kvm_run.immediate_exit;
-        Self { ptr }
+    /// Set `immediate_exit` to the given value. Returns `false` without
+    /// touching the pointer if the run-loop owner has completed.
+    pub(crate) fn set(&self, val: u8) -> bool {
+        let Some(state) = self.state.upgrade() else {
+            return false;
+        };
+        if !state.active.load(Ordering::Acquire) {
+            return false;
+        }
+        // SAFETY: the transient `state` Arc pins `_mapping`, including across
+        // a race where the active load above returns true just before owner
+        // completion. AtomicU8 has size/alignment 1, matching the ABI field.
+        unsafe { AtomicU8::from_ptr(state.ptr).store(val, Ordering::Release) };
+        true
     }
 
-    /// Set `immediate_exit` to the given value.
-    pub(crate) fn set(&self, val: u8) {
-        // SAFETY: ptr points into a MAP_SHARED mmap that outlives this handle.
-        // Single-byte write is atomic on all architectures KVM supports.
-        unsafe {
-            std::ptr::write_volatile(self.ptr, val);
+    #[cfg(test)]
+    pub(crate) fn read_byte(&self) -> Option<u8> {
+        let state = self.state.upgrade()?;
+        if !state.active.load(Ordering::Acquire) {
+            return None;
+        }
+        // SAFETY: identical structural mapping-lifetime argument to `set`.
+        Some(unsafe { AtomicU8::from_ptr(state.ptr).load(Ordering::Acquire) })
+    }
+
+    #[cfg(test)]
+    fn set_after_test_barrier(&self, val: u8, acquired: &Latch, release: &Latch) -> Option<u8> {
+        let state = self.state.upgrade()?;
+        if !state.active.load(Ordering::Acquire) {
+            return None;
+        }
+        acquired.set();
+        release.wait();
+        // SAFETY: the barrier deliberately allows owner completion and the
+        // original VcpuFd mapping's destruction before this store. This
+        // transient Arc still structurally owns the independent mapping.
+        let byte = unsafe { AtomicU8::from_ptr(state.ptr) };
+        byte.store(val, Ordering::Release);
+        Some(byte.load(Ordering::Acquire))
+    }
+}
+
+/// Owns the run-loop `VcpuFd` and the logical-active reference for every
+/// [`ImmediateExitHandle`] clone.
+///
+/// Drop and [`Self::into_inner`] publish inactive before destroying or
+/// returning the fd. Memory safety does not depend on that ordering: the
+/// in-flight handle access owns a transient Arc to the shared mapping until
+/// that access completes.
+pub(crate) struct ImmediateExitVcpu {
+    vcpu: Option<kvm_ioctls::VcpuFd>,
+    state: Option<Arc<ImmediateExitState>>,
+}
+
+impl ImmediateExitVcpu {
+    /// Consume one vCPU fd and, when `enabled`, create an independently-owned
+    /// shared mapping for cross-thread access to its immediate-exit byte.
+    pub(crate) fn new(
+        vcpu: kvm_ioctls::VcpuFd,
+        enabled: bool,
+        run_size: usize,
+    ) -> vmm_sys_util::errno::Result<(Self, Option<ImmediateExitHandle>)> {
+        let state = if enabled {
+            let mut mapping = kvm_ioctls::KvmRunWrapper::mmap_from_fd(&vcpu, run_size)?;
+            let ptr: *mut u8 = &mut mapping.as_mut_ref().immediate_exit;
+            Some(Arc::new(ImmediateExitState {
+                ptr,
+                active: AtomicBool::new(true),
+                _mapping: mapping,
+            }))
+        } else {
+            None
+        };
+        let handle = state.as_ref().map(|state| ImmediateExitHandle {
+            state: Arc::downgrade(state),
+        });
+        Ok((
+            Self {
+                vcpu: Some(vcpu),
+                state,
+            },
+            handle,
+        ))
+    }
+
+    fn deactivate(&mut self) {
+        if let Some(state) = self.state.take() {
+            state.active.store(false, Ordering::Release);
         }
     }
 
-    /// Test-only read-back of the current `immediate_exit` byte
-    /// through the handle's pointer. Lets the kick gate's truth
-    /// table be observed cross-thread without a `VcpuFd::get_kvm_run`
-    /// call (used by tests that move the VcpuFd into a stub thread
-    /// to construct a real `JoinHandle<VcpuFd>` for `VcpuThread`).
-    #[cfg(test)]
-    pub(crate) fn read_byte(&self) -> u8 {
-        // SAFETY: same MAP_SHARED guarantees as `set`. Single-byte
-        // read is atomic on every supported KVM host.
-        unsafe { std::ptr::read_volatile(self.ptr) }
+    /// Enter KVM through the fd paired with this wrapper's immediate-exit
+    /// mapping. Keeping this operation on the wrapper prevents safe code from
+    /// replacing the inner fd while handles still name the original vCPU.
+    pub(crate) fn run(&mut self) -> vmm_sys_util::errno::Result<kvm_ioctls::VcpuExit<'_>> {
+        self.vcpu
+            .as_mut()
+            .expect("ImmediateExitVcpu owns its VcpuFd")
+            .run()
     }
+
+    /// Atomically update the run-loop mapping's immediate-exit byte.
+    pub(crate) fn set_immediate_exit(&mut self, val: u8) {
+        set_vcpu_immediate_exit(
+            self.vcpu
+                .as_mut()
+                .expect("ImmediateExitVcpu owns its VcpuFd"),
+            val,
+        );
+    }
+
+    #[cfg(test)]
+    fn read_immediate_exit(&mut self) -> u8 {
+        let ptr: *mut u8 = &mut self
+            .vcpu
+            .as_mut()
+            .expect("ImmediateExitVcpu owns its VcpuFd")
+            .get_kvm_run()
+            .immediate_exit;
+        // SAFETY: the wrapper owns the primary kvm_run mapping for the
+        // complete load and AtomicU8 matches the one-byte ABI field.
+        unsafe { AtomicU8::from_ptr(ptr).load(Ordering::Acquire) }
+    }
+
+    /// Mark every handle inactive, drop the owner's strong mapping reference,
+    /// then return the still-live raw fd. Any access that already upgraded its
+    /// Weak reference keeps the mapping pinned through completion; later
+    /// upgrades fail and no-op.
+    pub(crate) fn into_inner(mut self) -> kvm_ioctls::VcpuFd {
+        self.deactivate();
+        self.vcpu.take().expect("ImmediateExitVcpu owns its VcpuFd")
+    }
+}
+
+// Shared-reference ioctl methods remain available through Deref. There is
+// intentionally no DerefMut/AsMut implementation: safe code must not
+// `mem::replace` the fd while the secondary mapping and its Weak handles still
+// identify the original vCPU. Every mutable operation is forwarded explicitly
+// above so the fd/mapping pairing remains structural.
+impl Deref for ImmediateExitVcpu {
+    type Target = kvm_ioctls::VcpuFd;
+
+    fn deref(&self) -> &Self::Target {
+        self.vcpu
+            .as_ref()
+            .expect("ImmediateExitVcpu owns its VcpuFd")
+    }
+}
+
+impl Drop for ImmediateExitVcpu {
+    fn drop(&mut self) {
+        self.deactivate();
+    }
+}
+
+/// Atomically update `kvm_run.immediate_exit` from the owning vCPU thread.
+/// Cross-thread handles use the same `AtomicU8` representation, avoiding a
+/// mixed atomic/non-atomic Rust data race on the shared byte.
+fn set_vcpu_immediate_exit(vcpu: &mut kvm_ioctls::VcpuFd, val: u8) {
+    let ptr: *mut u8 = &mut vcpu.get_kvm_run().immediate_exit;
+    // SAFETY: AtomicU8 has size/alignment 1 and `ptr` names a live u8 field in
+    // the caller-owned kvm_run mapping.
+    unsafe { AtomicU8::from_ptr(ptr).store(val, Ordering::Release) };
 }
 
 // ---------------------------------------------------------------------------
@@ -215,16 +359,17 @@ pub(crate) fn load_probe_bss_offset(
 /// to return with EINTR. The fence ensures that a write to
 /// `kvm_run.immediate_exit` from another thread (via ImmediateExitHandle)
 /// is visible when KVM_RUN returns. This Acquire fence pairs with the
-/// proximal `Ordering::Release` fence in [`super::freeze_coord`]'s
-/// freeze coordinator — the `std::sync::atomic::fence(Ordering::Release)`
-/// that runs between pass 1 (writing `kvm_run.immediate_exit` for every
-/// vCPU via `ImmediateExitHandle::set(1)`) and pass 2 (issuing
-/// `pthread_kill(tid, SIGRTMIN)` for every vCPU). The Release fence
-/// publishes every immediate_exit byte before any signal is delivered;
-/// the Acquire fence here, executed when the signal handler runs in the
-/// receiving vCPU thread, observes those writes. Without the pair, a
-/// vCPU could process its signal, re-enter KVM_RUN, and miss the
-/// immediate_exit byte that was supposed to short-circuit guest entry.
+/// proximal `Ordering::Release` fence in each cross-thread kicker:
+///
+/// - [`super::freeze_coord`]'s freeze coordinator fences between pass 1
+///   (writing every `kvm_run.immediate_exit`) and pass 2 (delivering SIGRTMIN);
+/// - the interactive relay fences after its BSP immediate-exit write and before
+///   each SIGRTMIN retry.
+///
+/// Each Release fence publishes the immediate-exit byte before its signal is
+/// delivered; the Acquire fence here runs in the receiving vCPU thread.
+/// Without the pair, a vCPU could process its signal, re-enter KVM_RUN, and
+/// miss the byte that was supposed to short-circuit guest entry.
 extern "C" fn vcpu_signal_handler(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
     std::sync::atomic::fence(Ordering::Acquire);
 }
@@ -563,37 +708,32 @@ pub(crate) fn open_vcpu_perf_capture(
 // VcpuThread — Cloud Hypervisor pattern with Firecracker's immediate_exit
 // ---------------------------------------------------------------------------
 
-/// Per-vCPU thread handle with signal-based kick and ACK flag.
+/// Per-vCPU thread lifecycle and targeting state shared by the coordinator and
+/// bounded AP teardown.
 pub(crate) struct VcpuThread {
     pub(crate) handle: JoinHandle<kvm_ioctls::VcpuFd>,
-    /// Set by the thread after it exits the KVM_RUN loop.
+    /// Test-only mirror set after the thread exits the KVM_RUN loop.
+    /// Production teardown uses `JoinHandle::is_finished()` because the panic
+    /// hook may publish this edge before stack unwinding has completed.
+    #[cfg(test)]
     pub(crate) exited: Arc<AtomicBool>,
     /// Handle to set `kvm_run.immediate_exit` from outside the vCPU thread.
     /// `None` when KVM_CAP_IMMEDIATE_EXIT is not available.
     pub(crate) immediate_exit: Option<ImmediateExitHandle>,
-    /// Eventfd bumped after `exited.store(true)` so
-    /// [`Self::wait_for_exit`] can block in `epoll_wait` instead of
-    /// sleep-polling the atomic. The same eventfd is signaled from
-    /// the panic hook (see `vcpu_panic`'s `VcpuPanicCtx`) so the
-    /// parent observes both the normal-exit and panic-classified
-    /// shutdown paths through a single fd. Counter mode (not
-    /// semaphore) — the value is unused; only the edge from 0 to
-    /// non-zero matters.
+    /// Eventfd bumped after the run-loop exit edge. Production
+    /// `freeze_coord::kick_and_join_ap_threads` epoll-waits on it before
+    /// re-checking `JoinHandle::is_finished()`; the test-only
+    /// [`Self::wait_for_exit`] exercises the same wake edge. The panic hook
+    /// also signals it, which wakes teardown promptly without claiming unwind
+    /// has finished. Counter mode (not semaphore): the value is unused; only
+    /// the transition from zero to non-zero matters.
     pub(crate) exit_evt: Arc<EventFd>,
-    /// kvm_run-mmap-liveness flag for the per-AP
-    /// [`ImmediateExitHandle`] copy held by the freeze coordinator
-    /// (and any other cross-thread holder of a Copy clone).
-    /// Initialised to `true` at spawn; flipped to `false` by the
-    /// AP's panic hook (`VcpuPanicCtx::alive`) BEFORE stack
-    /// unwinding drops the thread's `VcpuFd` and unmaps the
-    /// `kvm_run` page that backs every `ImmediateExitHandle`
-    /// pointing into it. Mirrors the BSP-side `bsp_alive` gate in
-    /// `freeze_coord::run_vm` — the primary defense against
-    /// AP-side UAF is the join ordering (the coordinator joins
-    /// before any `JoinHandle<VcpuFd>` is joined / dropped), and
-    /// this flag closes the panic-unwind window where `vcpu`
-    /// drops while the coordinator is still iterating its
-    /// captured handle Vec.
+    /// Logical participation flag for cross-thread AP kick loops.
+    /// Initialised to `true` at spawn and flipped to `false` by the AP panic
+    /// hook before unwinding. Readers use it to avoid work after that edge,
+    /// but it is not an mmap-lifetime proof: a `true` load cannot pin memory
+    /// across a later pointer access. [`ImmediateExitHandle`] supplies its
+    /// own lifetime synchronization for every actual byte access.
     pub(crate) alive: Arc<AtomicBool>,
     /// Final cumulative schedstat sample taken by the AP on its own thread
     /// immediately before exit. `/proc/self/task/<tid>` disappears when the
@@ -1025,7 +1165,7 @@ pub(crate) const WATCHPOINT_MAX_NON_EINTR_FAILURES: u8 = 3;
 /// arrays (aarch64) and re-issues the ioctl.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn self_arm_watchpoint(
-    vcpu: &mut kvm_ioctls::VcpuFd,
+    vcpu: &kvm_ioctls::VcpuFd,
     watchpoint: &WatchpointArm,
     armed_slots: &mut [u64; 4],
     failures: &mut u8,
@@ -1214,7 +1354,7 @@ pub(crate) fn self_arm_watchpoint(
 /// pair.
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn self_arm_watchpoint(
-    vcpu: &mut kvm_ioctls::VcpuFd,
+    vcpu: &kvm_ioctls::VcpuFd,
     watchpoint: &WatchpointArm,
     armed_slots: &mut [u64; 4],
     failures: &mut u8,
@@ -1377,20 +1517,17 @@ impl VcpuThread {
     /// flag before sending the signal (Firecracker pattern). Otherwise falls
     /// back to signal-only (the signal handler causes EINTR).
     ///
-    /// `ie.set(1)` is gated on the per-AP `alive` Acquire load: under
-    /// `panic = "unwind"` the AP's panic hook flips `alive` to `false`
-    /// BEFORE stack unwinding drops `vcpu` (and unmaps the `kvm_run`
-    /// page that backs the IE handle), so a `false` reading here means
-    /// the next byte we'd write would land in freed memory. The
-    /// `pthread_kill` half is harmless against an exited tid (returns
-    /// ESRCH) and runs unconditionally — guarantees the wake even on
-    /// the rare alive-true-then-dropped TOCTOU window where the kick
-    /// path already raced past the gate.
+    /// The `alive` load is only an early no-op optimization after the panic
+    /// edge; it is not a lifetime proof. A stale `true` is safe because
+    /// `ImmediateExitHandle::set` upgrades its Weak mapping reference to a
+    /// transient Arc before checking active, so a stale participation read
+    /// remains safe even if the run-loop VcpuFd completes concurrently.
+    #[cfg(test)]
     pub(crate) fn kick(&self) {
         if let Some(ref ie) = self.immediate_exit
             && self.alive.load(Ordering::Acquire)
         {
-            ie.set(1);
+            let _ = ie.set(1);
             std::sync::atomic::fence(Ordering::Release);
         }
         self.signal();
@@ -1403,9 +1540,10 @@ impl VcpuThread {
         }
     }
 
-    /// Wait for the thread to exit, retrying the kick periodically.
-    /// Cloud Hypervisor pattern: re-kick every 10ms until the thread
-    /// observes `immediate_exit` and breaks out of `KVM_RUN`.
+    /// Wait for the thread to exit, retrying a signal-only wake every 10ms.
+    /// Teardown deliberately does not write `immediate_exit`: repeated
+    /// SIGRTMIN delivery closes a signal-before-KVM_RUN lost wake, and
+    /// `unpark` releases a userspace park without consulting mmap lifetime.
     ///
     /// Implementation: blocks in `epoll_wait` on `self.exit_evt`
     /// (bumped by the AP thread after `exited.store(true)` and by
@@ -1415,6 +1553,7 @@ impl VcpuThread {
     /// without an explicit timeout fd. A spurious wake (EINTR or a
     /// stale eventfd-counter drain) loops back without dropping the
     /// kick cadence.
+    #[cfg(test)]
     pub(crate) fn wait_for_exit(&self, timeout: Duration) {
         if self.exited.load(Ordering::Acquire) {
             return;
@@ -1477,7 +1616,8 @@ impl VcpuThread {
                             // Drain timerfd expiry counter (counter
                             // mode); the read value is uninteresting.
                             let _ = kick_timer.wait();
-                            self.kick();
+                            self.signal();
+                            self.handle.thread().unpark();
                         }
                     }
                 }
@@ -1649,7 +1789,7 @@ mod tests {
     }
 
     #[test]
-    fn immediate_exit_handle_set_clear() {
+    fn immediate_exit_secondary_mapping_aliases_run_loop_mapping() {
         let topo = Topology {
             llcs: 1,
             cores_per_llc: 1,
@@ -1660,29 +1800,37 @@ mod tests {
             llc_cores: None,
         };
         let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
-        let handle = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
+        let run_size = vm.vm_fd.run_size();
+        let (mut vcpu, handle) =
+            ImmediateExitVcpu::new(vm.vcpus.remove(0), true, run_size).unwrap();
+        let handle = handle.unwrap();
 
         // Initial state should be 0.
         assert_eq!(
-            vm.vcpus[0].get_kvm_run().immediate_exit,
+            vcpu.read_immediate_exit(),
             0,
             "immediate_exit should start at 0"
         );
 
         // Set via handle, verify via VcpuFd.
-        handle.set(1);
+        assert!(handle.set(1));
         assert_eq!(
-            vm.vcpus[0].get_kvm_run().immediate_exit,
+            vcpu.read_immediate_exit(),
             1,
-            "handle.set(1) should be visible via get_kvm_run()"
+            "handle.set(1) should be visible via the run-loop mapping"
         );
 
         // Clear via VcpuFd, verify.
-        vm.vcpus[0].set_kvm_immediate_exit(0);
+        vcpu.set_immediate_exit(0);
         assert_eq!(
-            vm.vcpus[0].get_kvm_run().immediate_exit,
+            vcpu.read_immediate_exit(),
             0,
-            "set_kvm_immediate_exit(0) should clear the flag"
+            "owner-side atomic clear should clear the flag"
+        );
+        assert_eq!(
+            handle.read_byte(),
+            Some(0),
+            "owner-side AtomicU8 clear must be visible through the secondary mapping",
         );
     }
 
@@ -1698,30 +1846,35 @@ mod tests {
             llc_cores: None,
         };
         let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
-        let h0 = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
-        let h1 = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[1]);
+        let run_size = vm.vm_fd.run_size();
+        let (mut vcpu1, h1) =
+            ImmediateExitVcpu::new(vm.vcpus.pop().unwrap(), true, run_size).unwrap();
+        let (mut vcpu0, h0) =
+            ImmediateExitVcpu::new(vm.vcpus.pop().unwrap(), true, run_size).unwrap();
+        let h0 = h0.unwrap();
+        let h1 = h1.unwrap();
 
         // Setting one vCPU's handle should not affect the other.
-        h0.set(1);
-        assert_eq!(vm.vcpus[0].get_kvm_run().immediate_exit, 1);
+        assert!(h0.set(1));
+        assert_eq!(vcpu0.read_immediate_exit(), 1);
         assert_eq!(
-            vm.vcpus[1].get_kvm_run().immediate_exit,
+            vcpu1.read_immediate_exit(),
             0,
             "setting vcpu0 handle should not affect vcpu1"
         );
 
-        h1.set(1);
-        assert_eq!(vm.vcpus[1].get_kvm_run().immediate_exit, 1);
+        assert!(h1.set(1));
+        assert_eq!(vcpu1.read_immediate_exit(), 1);
 
         // Clear both.
-        h0.set(0);
-        h1.set(0);
-        assert_eq!(vm.vcpus[0].get_kvm_run().immediate_exit, 0);
-        assert_eq!(vm.vcpus[1].get_kvm_run().immediate_exit, 0);
+        assert!(h0.set(0));
+        assert!(h1.set(0));
+        assert_eq!(vcpu0.read_immediate_exit(), 0);
+        assert_eq!(vcpu1.read_immediate_exit(), 0);
     }
 
     #[test]
-    fn vcpu_thread_kick_sets_immediate_exit() {
+    fn immediate_exit_mapping_survives_owner_drop_during_inflight_set() {
         let topo = Topology {
             llcs: 1,
             cores_per_llc: 1,
@@ -1732,33 +1885,102 @@ mod tests {
             llc_cores: None,
         };
         let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
-        let ie = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
+        let run_size = vm.vm_fd.run_size();
+        let (owner, handle) = ImmediateExitVcpu::new(vm.vcpus.remove(0), true, run_size).unwrap();
+        let handle = handle.unwrap();
+        let acquired = Arc::new(Latch::new());
+        let release = Arc::new(Latch::new());
+        let acquired_writer = Arc::clone(&acquired);
+        let release_writer = Arc::clone(&release);
+        let writer_handle = handle.clone();
+        let writer = std::thread::spawn(move || {
+            writer_handle.set_after_test_barrier(1, &acquired_writer, &release_writer)
+        });
+        if !acquired.wait_timeout(Duration::from_secs(2)) {
+            release.set();
+            let _ = writer.join();
+            panic!("in-flight immediate-exit writer never acquired its transient mapping Arc");
+        }
 
-        ie.set(1);
-        std::sync::atomic::fence(Ordering::Release);
+        // Reproduce the old false-read/deschedule interleaving exactly:
+        // writer has observed active=true but is paused before dereference;
+        // owner Drop then deactivates the state and destroys the original
+        // VcpuFd mapping before the writer resumes. Drop the entire VM owner
+        // too: the independent VMA's file reference—not an accidentally-live
+        // VmFd—must pin the kernel vCPU/run pages across the in-flight access.
+        let (drop_done_tx, drop_done_rx) = std::sync::mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(owner);
+            drop(vm);
+            drop_done_tx.send(()).unwrap();
+        });
+        drop_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("owner Drop must not wait on the paused handle");
+        dropper.join().unwrap();
+        assert_eq!(handle.read_byte(), None, "stale Weak handle must no-op");
+
+        release.set();
         assert_eq!(
-            vm.vcpus[0].get_kvm_run().immediate_exit,
-            1,
-            "kick pattern should set immediate_exit=1"
+            writer.join().unwrap(),
+            Some(1),
+            "the in-flight store and read complete through the transient Arc",
         );
 
-        vm.vcpus[0].set_kvm_immediate_exit(0);
-        assert_eq!(vm.vcpus[0].get_kvm_run().immediate_exit, 0);
+        assert!(
+            !handle.set(1),
+            "a new post-owner set must observe inactive and no-op",
+        );
+        assert_eq!(handle.read_byte(), None);
     }
 
-    /// `VcpuThread::kick` MUST skip the `ie.set(1)` when its `alive`
-    /// flag is `false`. Pins the AP-side UAF gate that mirrors the
-    /// BSP's `bsp_alive`: an AP that panic-unwound (under
-    /// `panic = "unwind"`) flips this flag to `false` BEFORE its
-    /// stack drop unmaps `kvm_run`, and the coordinator's
-    /// `Vec<ImmediateExitHandle>` would otherwise `write_volatile`
-    /// through a freed mapping. The test stages the pre-flip state
-    /// (immediate_exit=0, alive=false) and asserts the byte stays
-    /// 0 across `kick()` — both `iec.set(1)` and the trailing
-    /// `pthread_kill` happen, but the byte write is suppressed.
-    /// `pthread_kill` against an exited tid is harmless (ESRCH);
-    /// the test thread sleeps long enough for `kick()` to run and
-    /// then exits, matching the join contract.
+    #[test]
+    fn immediate_exit_stale_handle_noops_after_owner_return_and_vcpu_drop() {
+        let topo = Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+            llc_cores: None,
+        };
+        let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
+        let run_size = vm.vm_fd.run_size();
+        let (owner, handle) = ImmediateExitVcpu::new(vm.vcpus.remove(0), true, run_size).unwrap();
+        let handle = handle.unwrap();
+        assert!(handle.set(1));
+
+        let vcpu = owner.into_inner();
+        assert!(!handle.set(0), "owner return must deactivate future sets");
+        assert_eq!(handle.read_byte(), None);
+
+        drop(vcpu);
+        assert!(!handle.set(0));
+        assert_eq!(handle.read_byte(), None);
+    }
+
+    #[test]
+    fn immediate_exit_disabled_owner_avoids_secondary_mapping() {
+        let topo = Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+            llc_cores: None,
+        };
+        let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
+        let run_size = vm.vm_fd.run_size();
+        let (owner, handle) = ImmediateExitVcpu::new(vm.vcpus.remove(0), false, run_size).unwrap();
+        assert!(handle.is_none());
+        let mut vcpu = owner.into_inner();
+        assert_eq!(vcpu.get_kvm_run().immediate_exit, 0);
+    }
+
+    /// The panic-edge `alive=false` gate remains a useful early no-op, but
+    /// mapping safety is supplied by `ImmediateExitVcpu`, not this atomic.
     #[test]
     fn vcpu_thread_kick_skips_ie_when_alive_false() {
         use std::sync::Barrier;
@@ -1779,7 +2001,9 @@ mod tests {
             llc_cores: None,
         };
         let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
-        let ie = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
+        let run_size = vm.vm_fd.run_size();
+        let (probe_vcpu, ie) = ImmediateExitVcpu::new(vm.vcpus.remove(0), true, run_size).unwrap();
+        let ie = ie.unwrap();
         // Spawn a dummy thread we can hand into a `JoinHandle<VcpuFd>`.
         // The thread parks on a barrier — kick() fires the signal at
         // it; the signal-handler default for SIGRTMIN is no-op-with-
@@ -1787,12 +2011,11 @@ mod tests {
         // kick(), drop the barrier and let it exit.
         let barrier = Arc::new(Barrier::new(2));
         let barrier_thread = barrier.clone();
-        let probe_vcpu = vm.vcpus.remove(0);
         let handle = std::thread::Builder::new()
             .name("kick-test-stub".into())
             .spawn(move || {
                 barrier_thread.wait();
-                probe_vcpu
+                probe_vcpu.into_inner()
             })
             .unwrap();
         let exited = Arc::new(AtomicBool::new(false));
@@ -1812,16 +2035,14 @@ mod tests {
         // so we read the byte through the same shared `ie` we
         // captured before the move (handle dereferences the same
         // MAP_SHARED page).
-        // SAFETY: read_volatile on the shared mmap; same access
-        // pattern as `ImmediateExitHandle::set`.
         let read_byte = || vt.immediate_exit.as_ref().unwrap().read_byte();
-        assert_eq!(read_byte(), 0);
+        assert_eq!(read_byte(), Some(0));
         vt.kick();
         // alive=false ⇒ ie.set(1) is gated off ⇒ byte stays 0.
         assert_eq!(
             read_byte(),
-            0,
-            "kick() must skip ie.set when alive == false (UAF gate)",
+            Some(0),
+            "kick() should skip an unnecessary IE write after the panic edge",
         );
         // Release the stub and drain.
         barrier.wait();
@@ -1846,15 +2067,16 @@ mod tests {
             llc_cores: None,
         };
         let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
-        let ie = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
+        let run_size = vm.vm_fd.run_size();
+        let (probe_vcpu, ie) = ImmediateExitVcpu::new(vm.vcpus.remove(0), true, run_size).unwrap();
+        let ie = ie.unwrap();
         let barrier = Arc::new(Barrier::new(2));
         let barrier_thread = barrier.clone();
-        let probe_vcpu = vm.vcpus.remove(0);
         let handle = std::thread::Builder::new()
             .name("kick-test-stub-alive".into())
             .spawn(move || {
                 barrier_thread.wait();
-                probe_vcpu
+                probe_vcpu.into_inner()
             })
             .unwrap();
         let exited = Arc::new(AtomicBool::new(false));
@@ -1869,11 +2091,11 @@ mod tests {
             schedstat_at_exit: Arc::new(std::sync::Mutex::new(None)),
         };
         let read_byte = || vt.immediate_exit.as_ref().unwrap().read_byte();
-        assert_eq!(read_byte(), 0);
+        assert_eq!(read_byte(), Some(0));
         vt.kick();
         assert_eq!(
             read_byte(),
-            1,
+            Some(1),
             "kick() must write ie.set(1) when alive == true",
         );
         barrier.wait();

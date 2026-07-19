@@ -12,7 +12,9 @@
 use crate::sync::MutexExt;
 use crate::vmm::IoapicHandle;
 use crate::vmm::PiMutex;
-use crate::vmm::vcpu::{SCX_EXIT_ERROR_THRESHOLD, WatchpointArm, self_arm_watchpoint};
+use crate::vmm::vcpu::{
+    ImmediateExitVcpu, SCX_EXIT_ERROR_THRESHOLD, WatchpointArm, self_arm_watchpoint,
+};
 use crate::vmm::{console, kvm, pci, virtio_blk, virtio_console, virtio_net};
 use kvm_ioctls::VcpuExit;
 use serde::{Deserialize, Serialize};
@@ -115,7 +117,7 @@ pub struct VcpuRegSnapshot {
 /// the dump reflects "registers unavailable" rather than panicking
 /// the freeze path.
 #[cfg(target_arch = "x86_64")]
-pub(crate) fn capture_vcpu_regs(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<VcpuRegSnapshot> {
+pub(crate) fn capture_vcpu_regs(vcpu: &kvm_ioctls::VcpuFd) -> Option<VcpuRegSnapshot> {
     let regs = vcpu.get_regs().ok()?;
     let sregs = vcpu.get_sregs().ok()?;
     Some(VcpuRegSnapshot {
@@ -131,7 +133,7 @@ pub(crate) fn capture_vcpu_regs(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<VcpuReg
 }
 
 #[cfg(target_arch = "aarch64")]
-pub(crate) fn capture_vcpu_regs(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<VcpuRegSnapshot> {
+pub(crate) fn capture_vcpu_regs(vcpu: &kvm_ioctls::VcpuFd) -> Option<VcpuRegSnapshot> {
     // ARM core register IDs encode
     // `(offsetof(struct kvm_regs, field) / sizeof(u32))` in the low
     // bits, OR'd with KVM_REG_ARM64 + KVM_REG_SIZE_U64 +
@@ -242,12 +244,12 @@ pub(crate) fn capture_vcpu_regs(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<VcpuReg
 /// in the GuestKernel's `tcr_el1` field — the walker rejects T1SZ=0
 /// and the affected lookups skip cleanly.
 #[cfg(target_arch = "x86_64")]
-pub(crate) fn read_tcr_el1(_vcpu: &mut kvm_ioctls::VcpuFd) -> Option<u64> {
+pub(crate) fn read_tcr_el1(_vcpu: &kvm_ioctls::VcpuFd) -> Option<u64> {
     None
 }
 
 #[cfg(target_arch = "aarch64")]
-pub(crate) fn read_tcr_el1(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<u64> {
+pub(crate) fn read_tcr_el1(vcpu: &kvm_ioctls::VcpuFd) -> Option<u64> {
     // Same encoding constants as `capture_vcpu_regs`. TCR_EL1 packs
     // to (Op0=3, Op1=0, CRn=2, CRm=0, Op2=2) under the
     // KVM_REG_ARM64_SYSREG namespace.
@@ -280,12 +282,12 @@ pub(crate) fn read_tcr_el1(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<u64> {
 /// non-zero value so a stale `0` does not displace a previously
 /// latched non-zero CR3.
 #[cfg(target_arch = "x86_64")]
-pub(crate) fn read_cr3(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<u64> {
+pub(crate) fn read_cr3(vcpu: &kvm_ioctls::VcpuFd) -> Option<u64> {
     vcpu.get_sregs().ok().map(|s| s.cr3)
 }
 
 #[cfg(target_arch = "aarch64")]
-pub(crate) fn read_cr3(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<u64> {
+pub(crate) fn read_cr3(vcpu: &kvm_ioctls::VcpuFd) -> Option<u64> {
     // TTBR1_EL1 holds the kernel-half page-table base (matches the
     // `page_table_root` field in `VcpuRegSnapshot`). Same encoding
     // as `capture_vcpu_regs`: (Op0=3, Op1=0, CRn=2, CRm=0, Op2=1)
@@ -875,7 +877,7 @@ fn latch_slot0_with_gate(watchpoint: &WatchpointArm) {
 /// dance itself is Cloud Hypervisor-specific.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn vcpu_run_loop_unified(
-    vcpu: &mut kvm_ioctls::VcpuFd,
+    vcpu: &mut ImmediateExitVcpu,
     com1: &Arc<PiMutex<console::Serial>>,
     com2: &Arc<PiMutex<console::Serial>>,
     virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
@@ -1023,38 +1025,18 @@ pub(crate) fn vcpu_run_loop_unified(
                 ) {
                     Some(ExitAction::Continue) | None => {}
                     Some(ExitAction::Shutdown) => {
-                        kill.store(true, Ordering::Release);
-                        // Wake the freeze coordinator's epoll loop
-                        // so it sees the kill flag without waiting
-                        // up to one full epoll timeout. Failure
-                        // (EAGAIN under EFD_NONBLOCK from a
-                        // saturated counter) is benign — any prior
-                        // pending edge already wakes the coord, and
-                        // the AtomicBool above remains the source
-                        // of truth.
-                        let _ = kill_evt.write(1);
+                        super::publish_vm_kill(kill, kill_evt);
                         break;
                     }
                     Some(ExitAction::Fatal(_)) => {
-                        // AP fatal exit (FailEntry / InternalError):
-                        // surface in tracing AND propagate the kill
-                        // signal. Without `kill.store(true)` and the
-                        // kill_evt write, the AP thread silently
-                        // exits while peer vCPUs and the freeze
-                        // coordinator stay running — peers eventually
-                        // hit FREEZE_RENDEZVOUS_TIMEOUT instead of
-                        // shutting down promptly. Mirrors the
-                        // Shutdown arm's kill-propagation pattern.
-                        tracing::error!("AP fatal exit");
-                        kill.store(true, Ordering::Release);
-                        let _ = kill_evt.write(1);
+                        publish_ap_fatal_exit(kill, kill_evt);
                         break;
                     }
                 }
             }
             Err(e) => {
                 if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN {
-                    vcpu.set_kvm_immediate_exit(0);
+                    vcpu.set_immediate_exit(0);
                     if kill.load(Ordering::Acquire) {
                         break;
                     }
@@ -1063,6 +1045,9 @@ pub(crate) fn vcpu_run_loop_unified(
                 if kill.load(Ordering::Acquire) {
                     break;
                 }
+                tracing::error!(%e, "AP KVM_RUN failed");
+                publish_ap_fatal_exit(kill, kill_evt);
+                break;
             }
         }
 
@@ -1070,6 +1055,17 @@ pub(crate) fn vcpu_run_loop_unified(
             break;
         }
     }
+}
+
+/// Publish an AP's unrecoverable KVM exit to every peer and blocking
+/// coordinator. Kept as one primitive so the production Fatal arm and the
+/// real-KVM relay regression exercise the exact same edge.
+pub(super) fn publish_ap_fatal_exit(kill: &AtomicBool, kill_evt: &EventFd) {
+    // Without the shared kill publication, the AP thread silently exits while
+    // peer vCPUs and the freeze coordinator stay running; peers eventually hit
+    // FREEZE_RENDEZVOUS_TIMEOUT instead of shutting down promptly.
+    tracing::error!("AP fatal exit");
+    super::publish_vm_kill(kill, kill_evt);
 }
 
 /// Drain pending PIO/MMIO state and park the vCPU until freeze
@@ -1106,7 +1102,7 @@ pub(crate) fn vcpu_run_loop_unified(
 /// kill-check at the top of the loop.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_freeze(
-    vcpu: &mut kvm_ioctls::VcpuFd,
+    vcpu: &mut ImmediateExitVcpu,
     has_immediate_exit: bool,
     kill: &Arc<AtomicBool>,
     freeze: &Arc<AtomicBool>,
@@ -1121,7 +1117,7 @@ pub(crate) fn handle_freeze(
     // calling vcpu.run() with the cap absent would re-enter the
     // guest instead of returning EINTR.
     if has_immediate_exit {
-        vcpu.set_kvm_immediate_exit(1);
+        vcpu.set_immediate_exit(1);
         // Drain dance: KVM_RUN with immediate_exit=1 commits any
         // pending PIO/MMIO from the prior exit and returns EINTR
         // without entering the guest (per the KVM API contract). EINTR
@@ -1139,7 +1135,7 @@ pub(crate) fn handle_freeze(
                  pending PIO/MMIO may not have committed before park"
             );
         }
-        vcpu.set_kvm_immediate_exit(0);
+        vcpu.set_immediate_exit(0);
     }
 
     // Capture vCPU registers BEFORE the Release store on `parked`.

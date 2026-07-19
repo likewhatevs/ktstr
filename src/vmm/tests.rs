@@ -1,5 +1,385 @@
 use super::*;
 
+#[test]
+fn interactive_run_guard_drop_signals_wakes_and_joins_every_helper() {
+    use std::sync::atomic::AtomicUsize;
+
+    let kill = Arc::new(AtomicBool::new(false));
+    let kill_evt = Arc::new(
+        vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
+            .expect("interactive guard kill eventfd"),
+    );
+    let freeze = Arc::new(AtomicBool::new(true));
+    let bsp_done = Arc::new(AtomicBool::new(false));
+    let (stdin_read, stdin_write) = nix::unistd::pipe().expect("stdin wake pipe");
+    let dmesg_wakeup =
+        Arc::new(vmm_sys_util::eventfd::EventFd::new(0).expect("dmesg wake eventfd"));
+    let joined = Arc::new(AtomicUsize::new(0));
+
+    let exec_kill = Arc::clone(&kill);
+    let exec_joined = Arc::clone(&joined);
+    let deadline_publisher = std::thread::spawn(move || {
+        while !exec_kill.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        exec_joined.fetch_or(1 << 0, Ordering::AcqRel);
+    });
+
+    let stdin_joined = Arc::clone(&joined);
+    let stdin = std::thread::spawn(move || {
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            nix::unistd::read(&stdin_read, &mut byte).expect("stdin wake read"),
+            0,
+            "guard closes the writer so poll/read observes EOF",
+        );
+        stdin_joined.fetch_or(1 << 1, Ordering::AcqRel);
+    });
+
+    let stdout_kill = Arc::clone(&kill);
+    let stdout_joined = Arc::clone(&joined);
+    let stdout = std::thread::spawn(move || {
+        while !stdout_kill.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        stdout_joined.fetch_or(1 << 2, Ordering::AcqRel);
+        true
+    });
+
+    let dmesg_evt = Arc::clone(&dmesg_wakeup);
+    let dmesg_joined = Arc::clone(&joined);
+    let dmesg = std::thread::spawn(move || {
+        dmesg_evt.read().expect("dmesg shutdown wake");
+        dmesg_joined.fetch_or(1 << 3, Ordering::AcqRel);
+    });
+
+    let mut guard = InteractiveRunGuard::new(
+        Vec::new(),
+        stdin_write,
+        Arc::clone(&kill),
+        Arc::clone(&kill_evt),
+        Arc::clone(&bsp_done),
+        Arc::clone(&freeze),
+    );
+    guard.deadline_publisher = Some(deadline_publisher);
+    guard.stdin = Some(stdin);
+    guard.stdout = Some(stdout);
+    guard.dmesg = Some(dmesg);
+    guard.dmesg_wakeup = Some(dmesg_wakeup);
+
+    drop(guard);
+
+    assert!(kill.load(Ordering::Acquire));
+    assert!(bsp_done.load(Ordering::Acquire));
+    assert!(!freeze.load(Ordering::Acquire));
+    assert_eq!(
+        kill_evt
+            .read()
+            .expect("done and kill eventfd edges were signaled"),
+        2,
+    );
+    assert_eq!(
+        joined.load(Ordering::Acquire),
+        0b1111,
+        "Drop must join every owned helper before returning",
+    );
+}
+
+const INTERACTIVE_RELAY_CHILD_ENV: &str = "KTSTR_INTERACTIVE_RELAY_CHILD";
+const INTERACTIVE_RELAY_DEADLINE_MODE: &str = "deadline";
+const INTERACTIVE_RELAY_STDOUT_MODE: &str = "stdout-failure";
+const INTERACTIVE_RELAY_AP_FATAL_MODE: &str = "ap-fatal";
+const INTERACTIVE_RELAY_SETUP_FAILURE_MODE: &str = "setup-failure";
+const INTERACTIVE_RELAY_READY: &str = "KTSTR_INTERACTIVE_RELAY_READY";
+const INTERACTIVE_RELAY_CHILD_FAILURE: i32 = 75;
+
+fn interactive_runtime_threads() -> std::collections::BTreeMap<u32, String> {
+    std::fs::read_dir("/proc/self/task")
+        .expect("enumerate process tasks")
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let tid = entry.file_name().to_string_lossy().parse().ok()?;
+            let comm = std::fs::read_to_string(entry.path().join("comm")).ok()?;
+            Some((tid, comm.trim().to_owned()))
+        })
+        .collect()
+}
+
+/// Subprocess-only real-KVM driver for the interactive relay regressions below.
+///
+/// `_exit` is deliberate: the stdout-failure case closes the test process's
+/// stdout while the VM runs. Returning through libtest would make the harness's
+/// own trailing status write—not the VMM—fail on the closed pipe.
+#[test]
+fn interactive_kill_relay_subprocess_helper() {
+    let Ok(mode) = std::env::var(INTERACTIVE_RELAY_CHILD_ENV) else {
+        return;
+    };
+
+    INTERACTIVE_BSP_ENTERED.store(false, Ordering::Release);
+    INJECT_INTERACTIVE_AP_FATAL.store(mode == INTERACTIVE_RELAY_AP_FATAL_MODE, Ordering::Release);
+    FAIL_INTERACTIVE_AFTER_AP_SPAWN.store(
+        mode == INTERACTIVE_RELAY_SETUP_FAILURE_MODE,
+        Ordering::Release,
+    );
+    let baseline_threads =
+        (mode == INTERACTIVE_RELAY_SETUP_FAILURE_MODE).then(interactive_runtime_threads);
+
+    let kernel = crate::test_support::require_kernel();
+    let payload = crate::resolve_current_exe().expect("resolve test binary for shell init");
+    let busybox = blobs::load_busybox_bytes().expect("load busybox for shell initramfs");
+    let topology = if matches!(
+        mode.as_str(),
+        INTERACTIVE_RELAY_AP_FATAL_MODE | INTERACTIVE_RELAY_SETUP_FAILURE_MODE
+    ) {
+        Topology::new(1, 1, 2, 1)
+    } else {
+        Topology::new(1, 1, 1, 1)
+    };
+    let exec_cmd = match mode.as_str() {
+        INTERACTIVE_RELAY_DEADLINE_MODE | INTERACTIVE_RELAY_AP_FATAL_MODE => "sleep 60",
+        INTERACTIVE_RELAY_SETUP_FAILURE_MODE => "true",
+        INTERACTIVE_RELAY_STDOUT_MODE => {
+            "echo KTSTR_INTERACTIVE_RELAY_READY; while :; do echo KTSTR_INTERACTIVE_RELAY_SPAM; done"
+        }
+        other => {
+            eprintln!("unknown interactive relay child mode: {other}");
+            // SAFETY: this is an isolated subprocess test driver.
+            unsafe { libc::_exit(INTERACTIVE_RELAY_CHILD_FAILURE) };
+        }
+    };
+    let exec_timeout = if mode == INTERACTIVE_RELAY_DEADLINE_MODE {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_secs(60)
+    };
+    let topo_arg = if matches!(
+        mode.as_str(),
+        INTERACTIVE_RELAY_AP_FATAL_MODE | INTERACTIVE_RELAY_SETUP_FAILURE_MODE
+    ) {
+        "KTSTR_MODE=shell KTSTR_TOPO=1,1,2,1"
+    } else {
+        "KTSTR_MODE=shell KTSTR_TOPO=1,1,1,1"
+    };
+
+    let vm = match KtstrVm::builder()
+        .kernel(&kernel)
+        .init_binary(payload)
+        .busybox(Some(busybox))
+        .topology(topology)
+        .memory_deferred_min(128)
+        .cmdline(topo_arg)
+        .exec_cmd(exec_cmd)
+        .exec_timeout(exec_timeout)
+        .no_perf_mode(true)
+        .build()
+    {
+        Ok(vm) => vm,
+        Err(error) => {
+            eprintln!("interactive relay child VM build failed: {error:#}");
+            // SAFETY: this is an isolated subprocess test driver.
+            unsafe { libc::_exit(INTERACTIVE_RELAY_CHILD_FAILURE) };
+        }
+    };
+
+    let started = Instant::now();
+    let outcome = vm.run_interactive();
+    let no_setup_leaks = baseline_threads.as_ref().is_none_or(|baseline| {
+        interactive_runtime_threads()
+            .into_iter()
+            .all(|(tid, name)| {
+                baseline.contains_key(&tid)
+                    || !(name.starts_with("vcpu-")
+                        || name.starts_with("interactive-")
+                        || name.starts_with("ktstr-exec-"))
+            })
+    });
+    if !no_setup_leaks {
+        eprintln!("interactive setup failure returned with live vCPU/helper tasks");
+    }
+    let expected = match mode.as_str() {
+        INTERACTIVE_RELAY_DEADLINE_MODE => outcome
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("exec-timeout")),
+        INTERACTIVE_RELAY_STDOUT_MODE | INTERACTIVE_RELAY_AP_FATAL_MODE => outcome.is_err(),
+        INTERACTIVE_RELAY_SETUP_FAILURE_MODE => {
+            outcome.as_ref().is_err_and(|error| {
+                error
+                    .to_string()
+                    .contains("injected interactive setup failure after AP spawn")
+            }) && no_setup_leaks
+        }
+        _ => false,
+    };
+    if !expected {
+        eprintln!(
+            "interactive relay child returned an unexpected result after {:?}: {outcome:?}",
+            started.elapsed(),
+        );
+    }
+
+    INJECT_INTERACTIVE_AP_FATAL.store(false, Ordering::Release);
+    FAIL_INTERACTIVE_AFTER_AP_SPAWN.store(false, Ordering::Release);
+    INTERACTIVE_BSP_ENTERED.store(false, Ordering::Release);
+    // SAFETY: skip libtest teardown because stdout is intentionally invalid in
+    // one mode and encode the semantic result directly in the child status.
+    unsafe {
+        libc::_exit(if expected {
+            0
+        } else {
+            INTERACTIVE_RELAY_CHILD_FAILURE
+        })
+    };
+}
+
+fn spawn_interactive_relay_child(
+    mode: &str,
+    stdout: std::process::Stdio,
+) -> (std::process::Child, std::thread::JoinHandle<Vec<u8>>) {
+    use std::io::Read;
+
+    let exact = "vmm::tests::interactive_kill_relay_subprocess_helper";
+    let mut child = std::process::Command::new(
+        std::env::current_exe().expect("resolve current unit-test executable"),
+    )
+    .arg("--exact")
+    .arg(exact)
+    .arg("--nocapture")
+    .env(INTERACTIVE_RELAY_CHILD_ENV, mode)
+    .stdin(std::process::Stdio::null())
+    .stdout(stdout)
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .expect("spawn interactive relay subprocess");
+    let mut stderr = child.stderr.take().expect("capture relay child stderr");
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes);
+        bytes
+    });
+    (child, stderr_reader)
+}
+
+fn wait_interactive_relay_child(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> std::process::ExitStatus {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().expect("poll interactive relay child") {
+            return status;
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let reap_deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < reap_deadline {
+                if child
+                    .try_wait()
+                    .expect("poll killed interactive relay child")
+                    .is_some()
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!(
+                "interactive relay subprocess exceeded its {:?} hard timeout",
+                timeout,
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn assert_interactive_relay_child(mode: &str) {
+    let (mut child, stderr_reader) =
+        spawn_interactive_relay_child(mode, std::process::Stdio::null());
+    let status = wait_interactive_relay_child(&mut child, Duration::from_secs(20));
+    let stderr = stderr_reader.join().unwrap_or_default();
+    assert!(
+        status.success(),
+        "interactive relay {mode} child failed with {status}; stderr={}",
+        String::from_utf8_lossy(&stderr),
+    );
+}
+
+#[test]
+fn boot_kernel_interactive_deadline_relay_exits_blocked_bsp() {
+    if !crate::test_support::cargo_ktstr_orchestrated() {
+        skip!("real-KVM interactive deadline relay regression requires cargo-ktstr orchestration");
+    }
+    assert_interactive_relay_child(INTERACTIVE_RELAY_DEADLINE_MODE);
+}
+
+#[test]
+fn boot_kernel_interactive_ap_fatal_relay_exits_blocked_bsp() {
+    if !crate::test_support::cargo_ktstr_orchestrated() {
+        skip!("real-KVM interactive AP-fatal relay regression requires cargo-ktstr orchestration");
+    }
+    assert_interactive_relay_child(INTERACTIVE_RELAY_AP_FATAL_MODE);
+}
+
+#[test]
+fn boot_kernel_interactive_stdout_failure_relay_exits_blocked_bsp() {
+    use std::io::BufRead;
+
+    if !crate::test_support::cargo_ktstr_orchestrated() {
+        skip!(
+            "real-KVM interactive stdout-failure relay regression requires cargo-ktstr orchestration"
+        );
+    }
+
+    let (mut child, stderr_reader) =
+        spawn_interactive_relay_child(INTERACTIVE_RELAY_STDOUT_MODE, std::process::Stdio::piped());
+    let stdout = child.stdout.take().expect("capture relay child stdout");
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let stdout_reader = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = ready_tx.send(false);
+                    return;
+                }
+                Ok(_) if line.contains(INTERACTIVE_RELAY_READY) => {
+                    let _ = ready_tx.send(true);
+                    // Dropping the only read end makes the VMM's next guest
+                    // output write observe EPIPE/BrokenPipe.
+                    return;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    let _ = ready_tx.send(false);
+                    return;
+                }
+            }
+        }
+    });
+
+    let ready = ready_rx
+        .recv_timeout(Duration::from_secs(15))
+        .unwrap_or(false);
+    if !ready {
+        let _ = child.kill();
+        let _ = wait_interactive_relay_child(&mut child, Duration::from_secs(2));
+    }
+    assert!(
+        ready,
+        "guest never produced the stdout relay readiness marker"
+    );
+
+    let status = wait_interactive_relay_child(&mut child, Duration::from_secs(20));
+    let _ = stdout_reader.join();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    assert!(
+        status.success(),
+        "interactive stdout-failure relay child failed with {status}; stderr={}",
+        String::from_utf8_lossy(&stderr),
+    );
+}
+
 /// Whether a timing-sensitive boot-race VM test ran in an environment
 /// too loaded for its wall-anchored expectation to hold — so the test
 /// SKIPs (environmental non-verdict) instead of false-failing. Two
@@ -302,6 +682,22 @@ fn boot_kernel_produces_output() {
         result.stderr.contains("Linux") || result.stderr.contains("Booting"),
         "kernel console should contain boot messages"
     );
+}
+
+/// Inject a fallible helper-setup edge immediately after the interactive path
+/// has spawned its AP. Returning the injected error must run
+/// `InteractiveRunGuard::drop`, drain the live real-KVM AP through the shared
+/// bounded helper, and reach the caller instead of detaching or hanging.
+#[test]
+fn boot_kernel_interactive_post_ap_setup_failure_drains_threads() {
+    if !crate::test_support::cargo_ktstr_orchestrated() {
+        skip!(
+            "real-KVM interactive teardown regression requires cargo-ktstr orchestration; \
+             set {}=1 for an intentional local run",
+            crate::KTSTR_ORCHESTRATED_ENV,
+        );
+    }
+    assert_interactive_relay_child(INTERACTIVE_RELAY_SETUP_FAILURE_MODE);
 }
 
 /// Boot with SMP topology and verify kernel detects multiple CPUs.

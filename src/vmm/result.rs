@@ -1840,13 +1840,12 @@ pub(crate) struct VmRunState {
     pub(crate) monitor_handle: Option<JoinHandle<monitor::reader::MonitorLoopResult>>,
     pub(crate) bpf_write_handle: Option<JoinHandle<()>>,
     /// Freeze coordinator handle, always `None` in the
-    /// production path: [`super::KtstrVm::run_vm`] joins the
-    /// coordinator BEFORE the BSP `VcpuFd` falls out of scope so the
-    /// coordinator's captured BSP `ImmediateExitHandle` cannot
-    /// outlive the kvm_run mmap (UAF prevention). The optional shape
-    /// is preserved so the field stays trivially constructible in
-    /// any future test-only or alternative-orchestration path that
-    /// might not perform the early join.
+    /// production path: [`super::KtstrVm::run_vm`] joins the coordinator
+    /// before returning so no coordinator work survives the VM run. Captured
+    /// `ImmediateExitHandle`s are independently memory-safe because each
+    /// access upgrades a Weak reference to the owner's secondary shared
+    /// kvm_run mapping. The optional shape is preserved for test-only or
+    /// alternative orchestration paths.
     pub(crate) freeze_coordinator: Option<JoinHandle<()>>,
     pub(crate) com1: Arc<PiMutex<console::Serial>>,
     pub(crate) com2: Arc<PiMutex<console::Serial>>,

@@ -21,12 +21,12 @@
 //! chain, not from this module.
 //!
 //! Scope of work done inside the hook:
-//! - Atomic `store(true)` on `kill` and `exited` — non-blocking,
-//!   allocation-free, and correct under the panicking-thread
-//!   constraint (any lock acquisition here risks deadlocking against
-//!   the same thread if it held the lock at the point of panic; any
-//!   allocation risks triggering a nested panic).
-//! - Nothing else. Serial-buffer flush is *not* performed here: the
+//! - Atomic `store(true)` on `kill` and `exited`, plus nonblocking eventfd
+//!   publication for configured wake consumers. These operations are
+//!   allocation-free and take no userspace locks (any lock acquisition here
+//!   risks deadlocking against the same thread if it held the lock at the point
+//!   of panic; any allocation risks triggering a nested panic).
+//! - No device or serial work. Serial-buffer flush is *not* performed here: the
 //!   serial state lives behind a `PiMutex` and `PiMutex::lock`'s
 //!   non-try path would assert-fail if the panic struck mid-`lock`.
 //!   On a normal exit path the VM cleanup code drains serial; on
@@ -107,38 +107,22 @@ fn make_hook(prev: Box<PanicHook>) -> Box<PanicHook> {
     Box::new(move |info| {
         VCPU_PANIC_CTX.with(|slot| {
             if let Some(ctx) = slot.borrow().as_ref() {
-                // Flip `alive` first so any cross-thread reader
-                // observing the unwind has a chance to see
-                // `alive == false` BEFORE this thread's `vcpu`
-                // local drops during stack unwinding (under
-                // `panic = "unwind"` test profile). The hook runs
-                // synchronously on the panicking thread before
-                // unwinding starts; every store here is
-                // happens-before the Drop of `vcpu` that frees the
-                // `kvm_run` mmap backing this thread's
-                // `ImmediateExitHandle` ptr. A coordinator that
-                // captures Copy clones of the handle gates each
-                // `ie.set` on `alive.load(Acquire)` — Release here
-                // pairs with that Acquire so the gate observes the
-                // flip ahead of the freed mmap.
+                // Publish the logical participation edge before delegating
+                // to the previous hook or beginning unwind. Cross-thread
+                // kick loops can then avoid unnecessary work promptly.
+                // This atomic is deliberately not the memory-safety
+                // mechanism for ImmediateExitHandle: a load cannot pin an
+                // mmap across a subsequent pointer access. The handle's
+                // owner-backed lifetime synchronization supplies that.
                 if let Some(ref alive) = ctx.alive {
                     alive.store(false, Ordering::Release);
                 }
-                ctx.kill.store(true, Ordering::Release);
-                ctx.exited.store(true, Ordering::Release);
-                // Wake the freeze coordinator's epoll loop. EventFd
-                // writes are not async-signal-safe per spec, but a
-                // panic hook is not a signal handler — it runs on
-                // the panicking thread under normal Rust runtime
-                // context. WouldBlock (counter overflow) is
-                // swallowed: the coordinator has at least one wake
-                // pending in that case, so missing this one is
-                // harmless. Any other error is logged but non-fatal
-                // — under panic=abort the kill flag itself is
-                // observed via the watchdog's atomic-load fallback.
                 if let Some(ref evt) = ctx.kill_evt {
-                    let _ = evt.write(1);
+                    super::publish_vm_kill(&ctx.kill, evt);
+                } else {
+                    ctx.kill.store(true, Ordering::Release);
                 }
+                ctx.exited.store(true, Ordering::Release);
                 if let Some(ref evt) = ctx.exited_evt {
                     let _ = evt.write(1);
                 }
@@ -201,8 +185,9 @@ pub(crate) struct VcpuPanicCtx {
     /// writes `1` after the `kill.store(true)` so any thread
     /// blocked in `epoll_wait` (notably the freeze coordinator)
     /// wakes immediately rather than waiting for its next epoll
-    /// timeout. None on paths that have no epoll listener (the
-    /// interactive shell wires kill via signal-based kicks instead).
+    /// timeout. The interactive shell also supplies this eventfd: its
+    /// sole kill relay consumes the edge and performs the signal plus
+    /// immediate-exit sequence for a BSP blocked in `KVM_RUN`.
     /// EventFd::write is async-signal-unsafe by spec, but a panic
     /// hook is not a signal handler — it runs synchronously on the
     /// panicking thread before `libc::abort`, in normal Rust
@@ -221,15 +206,11 @@ pub(crate) struct VcpuPanicCtx {
     /// loop, not the freeze coordinator, and AP callers pass
     /// `Some`.
     pub(crate) exited_evt: Option<Arc<EventFd>>,
-    /// kvm_run-mmap-liveness flag. `true` means the thread's
-    /// `VcpuFd` (and its `MAP_SHARED` `kvm_run` mapping that
-    /// backs every cross-thread `ImmediateExitHandle` copy) is
-    /// still mapped. The hook flips it to `false` BEFORE the
-    /// stack unwind drops `vcpu` so a coordinator iterating a
-    /// captured `Vec<ImmediateExitHandle>` can gate each
-    /// `ie.set` on `alive.load(Acquire)` and skip the index
-    /// whose mmap is about to disappear. Mirrors the BSP-side
-    /// `bsp_alive` belt-and-braces gate.
+    /// Logical vCPU participation flag. The hook flips it to `false` before
+    /// stack unwind so cross-thread kick loops can skip this vCPU promptly.
+    /// It is not an mmap-lifetime guard: an atomic `true` observation cannot
+    /// keep the mapping alive until a later dereference. The
+    /// `ImmediateExitHandle` owner protocol provides that safety.
     ///
     /// `None` for callers that do not share an
     /// `ImmediateExitHandle` cross-thread (the interactive shell
@@ -543,18 +524,10 @@ mod tests {
         assert!(!exited_r, "exited must stay false when no ctx registered");
     }
 
-    /// The panic hook must flip `alive` to `false` BEFORE the
-    /// prev-hook chain runs — the coordinator's pass-1 kick loop
-    /// reads each AP's `alive` Acquire-bool to gate `ie.set` on a
-    /// kvm_run mmap that's about to disappear under
-    /// `panic = "unwind"` stack drop. Capture the value the prev
-    /// hook observes via the `alive` Arc, then assert it was
-    /// already false at the moment the prev hook ran. Together with
-    /// the existing `panic_inside_ctx_still_runs_prev_hook` test,
-    /// this pins the cross-thread visibility ordering: every
-    /// liveness flip happens inside the hook (synchronously,
-    /// before unwinding), not as a side effect of the unwind
-    /// itself.
+    /// The panic hook must flip `alive` to `false` before the previous-hook
+    /// chain runs. This pins the prompt logical-participation edge used to
+    /// suppress later kicks; mapping safety is tested independently by the
+    /// `ImmediateExitHandle` owner race regression.
     #[test]
     fn panic_inside_ctx_flips_alive_before_prev() {
         let _guard = HOOK_TEST_LOCK.lock_unpoisoned();

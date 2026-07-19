@@ -36,6 +36,9 @@ fn handle_freeze_drain_swallows_eintr_and_resets_state() {
     };
     let mut vm = KtstrKvm::new(topo, 64, false).unwrap();
     crate::vmm::x86_64::boot::setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();
+    let run_size = vm.vm_fd.run_size();
+    let (mut vcpu, _) =
+        crate::vmm::vcpu::ImmediateExitVcpu::new(vm.vcpus.remove(0), true, run_size).unwrap();
 
     let kill = std::sync::Arc::new(AtomicBool::new(false));
     let freeze = std::sync::Arc::new(AtomicBool::new(false));
@@ -44,16 +47,9 @@ fn handle_freeze_drain_swallows_eintr_and_resets_state() {
 
     // freeze=false → the park loop exits immediately; the function
     // returns after the drain + reg capture + parked toggle.
+    // has_immediate_exit=true exercises the EINTR drain path.
     handle_freeze(
-        &mut vm.vcpus[0],
-        true, // has_immediate_exit — exercise the EINTR drain path
-        &kill,
-        &freeze,
-        &parked,
-        &regs_slot,
-        None,
-        None,
-        None,
+        &mut vcpu, true, &kill, &freeze, &parked, &regs_slot, None, None, None,
     );
 
     // After handle_freeze returns:
@@ -94,22 +90,18 @@ fn handle_freeze_no_drain_when_immediate_exit_unsupported() {
     };
     let mut vm = KtstrKvm::new(topo, 64, false).unwrap();
     crate::vmm::x86_64::boot::setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();
+    let run_size = vm.vm_fd.run_size();
+    let (mut vcpu, _) =
+        crate::vmm::vcpu::ImmediateExitVcpu::new(vm.vcpus.remove(0), false, run_size).unwrap();
 
     let kill = std::sync::Arc::new(AtomicBool::new(false));
     let freeze = std::sync::Arc::new(AtomicBool::new(false));
     let parked = std::sync::Arc::new(AtomicBool::new(false));
     let regs_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
 
+    // has_immediate_exit=false skips the drain dance.
     handle_freeze(
-        &mut vm.vcpus[0],
-        false, // has_immediate_exit=false → drain dance skipped
-        &kill,
-        &freeze,
-        &parked,
-        &regs_slot,
-        None,
-        None,
-        None,
+        &mut vcpu, false, &kill, &freeze, &parked, &regs_slot, None, None, None,
     );
 
     assert!(!parked.load(Ordering::Acquire));
@@ -136,6 +128,9 @@ fn handle_freeze_writes_parked_evt_edge() {
     };
     let mut vm = KtstrKvm::new(topo, 64, false).unwrap();
     crate::vmm::x86_64::boot::setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();
+    let run_size = vm.vm_fd.run_size();
+    let (mut vcpu, _) =
+        crate::vmm::vcpu::ImmediateExitVcpu::new(vm.vcpus.remove(0), false, run_size).unwrap();
 
     let kill = std::sync::Arc::new(AtomicBool::new(false));
     let freeze = std::sync::Arc::new(AtomicBool::new(false));
@@ -145,7 +140,7 @@ fn handle_freeze_writes_parked_evt_edge() {
     let parked_evt = EventFd::new(vmm_sys_util::eventfd::EFD_NONBLOCK).unwrap();
 
     handle_freeze(
-        &mut vm.vcpus[0],
+        &mut vcpu,
         false,
         &kill,
         &freeze,

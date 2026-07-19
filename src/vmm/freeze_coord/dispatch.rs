@@ -506,20 +506,7 @@ pub(super) fn dispatch_bulk_message(
                     );
                 } else {
                     eprintln!("freeze_coord: SchedExit received; kill PROMOTED");
-                    sinks.kill.store(true, Ordering::Release);
-                    // EFD_NONBLOCK on a freshly-created eventfd never
-                    // legitimately fails; log unconditionally so a future
-                    // regression (e.g. the eventfd was closed by another
-                    // owner) surfaces in the host log instead of silently
-                    // swallowing the kill edge.
-                    if let Err(e) = sinks.kill_evt.write(1) {
-                        tracing::warn!(
-                            err = %e,
-                            "freeze_coord: kill_evt write on SCHED_EXIT \
-                             promotion failed; the kill AtomicBool above is \
-                             still authoritative"
-                        );
-                    }
+                    crate::vmm::publish_vm_kill(sinks.kill, sinks.kill_evt);
                 }
             }
             // SchedExit is verdict data — bucket only on CRC-valid

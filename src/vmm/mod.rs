@@ -165,7 +165,7 @@ pub(crate) use contention::{
 pub(crate) use pi_mutex::PiMutex;
 pub(crate) use terminal::TerminalRawGuard;
 pub(crate) use vcpu::{
-    BpfMapWriteParams, ImmediateExitHandle, WatchBpfMapParams, register_vcpu_signal_handler,
+    BpfMapWriteParams, ImmediateExitVcpu, WatchBpfMapParams, register_vcpu_signal_handler,
     set_thread_cpumask, vcpu_signal,
 };
 pub(crate) use vmlinux::{cached_vmlinux_artifacts, cached_vmlinux_bytes, find_vmlinux};
@@ -405,7 +405,7 @@ pub struct KtstrVm {
     /// enabled. The flock fds carried by the plan are stripped at
     /// build time — `KtstrVm::run` re-acquires the LLC flocks via
     /// [`host_topology::acquire_resource_locks_waiting`] at the TOP
-    /// of the run (before initramfs/KVM/kernel setup, so a queued
+    /// of the run (before initramfs/KVM/kernel setup, so a waiting
     /// cell holds no guest resources) and releases them on return, so
     /// concurrent peers see the LLCs free as soon as the run
     /// completes (and the window between `build()` and `run()`
@@ -556,8 +556,9 @@ pub struct KtstrVm {
     pub(crate) exec_cmd: Option<String>,
     /// Wall-clock bound for a shell `--exec` payload before the VM is
     /// force-killed. A panic-less guest hang otherwise blocks the BSP
-    /// run loop ~forever; the `run_interactive` watchdog kicks the vCPU
-    /// after this deadline. Consulted only in exec_mode runs.
+    /// run loop indefinitely; the `run_interactive` deadline publisher
+    /// wakes the sole BSP kill relay after this interval. Consulted only
+    /// in exec-mode runs.
     pub(crate) exec_timeout: Duration,
     /// Optional host path to `ktstr-jemalloc-probe`. When `Some`, the
     /// probe is packed into the guest initramfs as an extra binary at
@@ -707,6 +708,277 @@ struct RunLocks {
     no_perf_cpus: Option<Vec<usize>>,
 }
 
+/// Owns every thread and wake source created by [`KtstrVm::run_interactive`]
+/// after AP spawn. Drop performs the same shutdown as the normal path, so a
+/// later setup error cannot detach a vCPU or I/O helper that still references
+/// run-scoped VM state.
+struct InteractiveRunGuard {
+    ap_threads: Vec<vcpu::VcpuThread>,
+    kill_relay: Option<JoinHandle<()>>,
+    deadline_publisher: Option<JoinHandle<()>>,
+    stdin: Option<JoinHandle<()>>,
+    stdout: Option<JoinHandle<bool>>,
+    dmesg: Option<JoinHandle<()>>,
+    stdin_wakeup: Option<std::os::fd::OwnedFd>,
+    dmesg_wakeup: Option<Arc<vmm_sys_util::eventfd::EventFd>>,
+    kill: Arc<AtomicBool>,
+    kill_evt: Arc<vmm_sys_util::eventfd::EventFd>,
+    bsp_done: Arc<AtomicBool>,
+    freeze: Arc<AtomicBool>,
+    armed: bool,
+}
+
+/// Publish a VM-wide stop request and its level-triggered wake edge as one
+/// operation. `kill` is the source of truth; the eventfd exists solely to wake
+/// threads which would otherwise be blocked while waiting to observe it.
+///
+/// Keep every publisher on this helper. A bare `kill.store(true)` is not enough
+/// when the BSP is sleeping in `KVM_RUN`: without the event edge the interactive
+/// kill relay cannot set `immediate_exit` and deliver SIGRTMIN.
+pub(crate) fn publish_vm_kill(kill: &AtomicBool, kill_evt: &vmm_sys_util::eventfd::EventFd) {
+    kill.store(true, Ordering::Release);
+    // EAGAIN means the nonblocking counter is already saturated/readable, which
+    // is itself a pending wake. The AtomicBool above remains authoritative for
+    // every other failure.
+    let _ = kill_evt.write(1);
+}
+
+const INTERACTIVE_BSP_KILL_BACKSTOP: Duration = Duration::from_secs(30);
+const INTERACTIVE_BSP_KILL_EXIT_CODE: i32 = 74;
+const INTERACTIVE_BSP_KILL_DIAGNOSTIC: &[u8] =
+    b"ktstr fatal: interactive BSP ignored the kill relay for 30 seconds; terminating the test process\n";
+const INTERACTIVE_HELPER_JOIN_BACKSTOP: Duration = Duration::from_secs(30);
+const INTERACTIVE_HELPER_JOIN_EXIT_CODE: i32 = 76;
+const INTERACTIVE_HELPER_JOIN_DIAGNOSTIC: &[u8] =
+    b"ktstr fatal: interactive helper ignored shutdown for 30 seconds; terminating the test process\n";
+
+/// Terminate without running destructors when a BSP cannot be removed from
+/// `KVM_RUN`. Returning would drop guest memory under a live KVM ioctl, while
+/// joining the current BSP thread is impossible.
+#[cold]
+fn fail_closed_interactive_bsp() -> ! {
+    // SAFETY: write and _exit are async-signal-safe. The static slice requires
+    // no allocation or formatting, and _exit avoids touching locks which a
+    // wedged VMM helper may own.
+    unsafe {
+        let _ = libc::write(
+            libc::STDERR_FILENO,
+            INTERACTIVE_BSP_KILL_DIAGNOSTIC.as_ptr().cast(),
+            INTERACTIVE_BSP_KILL_DIAGNOSTIC.len(),
+        );
+        libc::_exit(INTERACTIVE_BSP_KILL_EXIT_CODE);
+    }
+}
+
+/// Join an interactive helper only after `is_finished` proves the operation
+/// cannot block. A wedged I/O helper still holds run-scoped device/VM state, so
+/// returning and dropping the VM would be unsound; fail closed after a wall
+/// backstop instead of turning teardown into an unbounded wait.
+fn join_interactive_helper<T>(handle: JoinHandle<T>) -> Option<T> {
+    let started = Instant::now();
+    while !handle.is_finished() {
+        if started.elapsed() >= INTERACTIVE_HELPER_JOIN_BACKSTOP {
+            // SAFETY: write and _exit are async-signal-safe. Avoid formatting
+            // and userspace locks because the wedged helper may own either.
+            unsafe {
+                let _ = libc::write(
+                    libc::STDERR_FILENO,
+                    INTERACTIVE_HELPER_JOIN_DIAGNOSTIC.as_ptr().cast(),
+                    INTERACTIVE_HELPER_JOIN_DIAGNOSTIC.len(),
+                );
+                libc::_exit(INTERACTIVE_HELPER_JOIN_EXIT_CODE);
+            }
+        }
+        handle.thread().unpark();
+        std::thread::park_timeout(Duration::from_millis(10));
+    }
+    handle.join().ok()
+}
+
+/// Start the sole interactive BSP kicker.
+///
+/// Before a kill, the relay sleeps on the level-triggered eventfd. Once any
+/// producer publishes `kill + event`, it repeatedly performs the complete KVM
+/// cancellation sequence (immediate-exit store, release fence, SIGRTMIN) until
+/// the BSP owner publishes `bsp_done`. Repetition closes the signal-before-
+/// `KVM_RUN` window even on a kernel without KVM_CAP_IMMEDIATE_EXIT; the Weak
+/// handle makes each mapping access independently safe across owner completion.
+fn spawn_interactive_kill_relay(
+    kill: Arc<AtomicBool>,
+    kill_evt: Arc<vmm_sys_util::eventfd::EventFd>,
+    bsp_done: Arc<AtomicBool>,
+    bsp_ie: Option<vcpu::ImmediateExitHandle>,
+    bsp_tid: libc::pthread_t,
+) -> std::io::Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("interactive-kill-relay".into())
+        .spawn(move || {
+            use std::os::fd::{AsRawFd, BorrowedFd};
+
+            // Every producer publishes through `publish_vm_kill`, and guard
+            // shutdown publishes even when the BSP returned normally. The
+            // eventfd is level-triggered and owned for this thread's full
+            // lifetime, so block without periodic polling until one of those
+            // edges arrives.
+            while !kill.load(Ordering::Acquire) && !bsp_done.load(Ordering::Acquire) {
+                use nix::poll::PollTimeout;
+
+                let borrowed =
+                    // SAFETY: kill_evt owns the fd for the relay's full life.
+                    unsafe { BorrowedFd::borrow_raw(kill_evt.as_raw_fd()) };
+                let mut fds = [nix::poll::PollFd::new(
+                    borrowed,
+                    nix::poll::PollFlags::POLLIN,
+                )];
+                match nix::poll::poll(&mut fds, PollTimeout::NONE) {
+                    Ok(_) => {
+                        if fds[0].revents().is_some_and(|events| {
+                            events.intersects(
+                                nix::poll::PollFlags::POLLIN
+                                    | nix::poll::PollFlags::POLLERR
+                                    | nix::poll::PollFlags::POLLHUP,
+                            )
+                        }) {
+                            let _ = kill_evt.read();
+                        }
+                    }
+                    Err(nix::errno::Errno::EINTR) => {}
+                    Err(_) => std::thread::sleep(Duration::from_millis(1)),
+                }
+            }
+            if bsp_done.load(Ordering::Acquire) {
+                return;
+            }
+
+            let kill_started = Instant::now();
+            while !bsp_done.load(Ordering::Acquire) {
+                if let Some(ref ie) = bsp_ie {
+                    let _ = ie.set(1);
+                    std::sync::atomic::fence(Ordering::Release);
+                }
+                // SAFETY: bsp_tid names the run_interactive caller. The guard
+                // joins this relay before that thread can return and destroy
+                // its pthread identity.
+                unsafe {
+                    libc::pthread_kill(bsp_tid, vcpu_signal());
+                }
+                if bsp_done.load(Ordering::Acquire) {
+                    return;
+                }
+                if kill_started.elapsed() >= INTERACTIVE_BSP_KILL_BACKSTOP {
+                    fail_closed_interactive_bsp();
+                }
+                std::thread::park_timeout(Duration::from_millis(10));
+            }
+        })
+}
+
+impl InteractiveRunGuard {
+    fn new(
+        ap_threads: Vec<vcpu::VcpuThread>,
+        stdin_wakeup: std::os::fd::OwnedFd,
+        kill: Arc<AtomicBool>,
+        kill_evt: Arc<vmm_sys_util::eventfd::EventFd>,
+        bsp_done: Arc<AtomicBool>,
+        freeze: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            ap_threads,
+            kill_relay: None,
+            deadline_publisher: None,
+            stdin: None,
+            stdout: None,
+            dmesg: None,
+            stdin_wakeup: Some(stdin_wakeup),
+            dmesg_wakeup: None,
+            kill,
+            kill_evt,
+            bsp_done,
+            freeze,
+            armed: true,
+        }
+    }
+
+    /// Publish that the BSP has returned and promptly stop the relay before
+    /// post-run result handling. This is separate from [`Self::shutdown`]
+    /// because a normal BSP return precedes helper and output collection.
+    fn mark_bsp_done(&mut self) {
+        self.bsp_done.store(true, Ordering::Release);
+        // The relay may still be blocked in an infinite poll before kill.
+        // Publish a level-triggered edge as part of the done transition;
+        // unpark below is the corresponding prompt path if it already entered
+        // the post-kill retry loop.
+        let _ = self.kill_evt.write(1);
+        if let Some(handle) = self.kill_relay.take() {
+            handle.thread().unpark();
+            let _ = join_interactive_helper(handle);
+        }
+    }
+
+    /// Signal every consumer, join the sole BSP kick relay and its deadline
+    /// publisher, drain APs through the shared service-accounted fail-closed
+    /// helper, then join output consumers after no guest vCPU can produce more
+    /// bytes.
+    fn shutdown(&mut self) -> bool {
+        if !self.armed {
+            return false;
+        }
+        // shutdown() runs only after the BSP loop returned, or while the caller
+        // is unwinding/setup-failing before it entered KVM. Publish done before
+        // waking the relay so it exits without targeting a non-running BSP.
+        self.mark_bsp_done();
+        publish_vm_kill(&self.kill, &self.kill_evt);
+        self.freeze.store(false, Ordering::Release);
+
+        // Closing the pipe writer wakes poll with HUP without risking SIGPIPE
+        // if the stdin reader raced to an early return.
+        drop(self.stdin_wakeup.take());
+        if let Some(evt) = self.dmesg_wakeup.as_ref() {
+            let _ = evt.write(1);
+        }
+
+        // Publishers cannot target the BSP themselves, but quiesce them before
+        // AP and device teardown so no later stop edge races a new run phase.
+        if let Some(handle) = self.deadline_publisher.take() {
+            let _ = join_interactive_helper(handle);
+        }
+        if let Some(handle) = self.stdin.take() {
+            let _ = join_interactive_helper(handle);
+        }
+
+        // This is the sole AP teardown implementation for interactive and
+        // test runs: signal+unpark retries, delivered-service accounting, and
+        // a wall backstop before fail-closed. It never enters an unbounded
+        // JoinHandle::join on a live AP.
+        freeze_coord::kick_and_join_ap_threads(std::mem::take(&mut self.ap_threads));
+
+        let stdout_wrote = self
+            .stdout
+            .take()
+            .and_then(join_interactive_helper)
+            .unwrap_or(false);
+        if let Some(handle) = self.dmesg.take() {
+            let _ = join_interactive_helper(handle);
+        }
+        self.dmesg_wakeup.take();
+        self.armed = false;
+        stdout_wrote
+    }
+}
+
+impl Drop for InteractiveRunGuard {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+#[cfg(test)]
+static FAIL_INTERACTIVE_AFTER_AP_SPAWN: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static INJECT_INTERACTIVE_AP_FATAL: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static INTERACTIVE_BSP_ENTERED: AtomicBool = AtomicBool::new(false);
+
 /// Process-wide gate for the VMM's verbose host-side diagnostics.
 ///
 /// Returns `true` when either [`crate::KTSTR_DEBUG_ENV`] or
@@ -803,12 +1075,11 @@ impl KtstrVm {
 
         // Acquire the run-scoped host reservation FIRST — before the
         // initramfs build, KVM VM creation, kernel load, and vCPU
-        // setup. Under the lock-dir queue ("second-order scheduler"
-        // — see host_topology::protocol), nextest admits every cell
-        // at once and cells park here until capacity frees; a queued
-        // cell must be CHEAP: what it holds is this process and a
-        // blocked flock ticket (plus one inotify fd only while it is
-        // queue head) — NOT a guest memory map with a resident kernel
+        // setup. Under the lock-dir admission registry (see
+        // host_topology::protocol), nextest admits every cell at once and
+        // cells park here until capacity frees; a waiting cell must be cheap:
+        // it holds one fixed ticket/futex, while only the coordinator owns an
+        // inotify fd — not a guest memory map with a resident kernel
         // image, not vCPU fds. Acquisition WAITS on contention
         // (wait = true) for the authoritative flock release rather
         // than converting a transient peer hold into a host-skip.
@@ -856,8 +1127,8 @@ impl KtstrVm {
         // (both post-setup; the watchdog computes its deadline slightly
         // later, inside the spawned thread) so the BSP loop and monitor
         // thread don't charge VM setup overhead against the guest's
-        // timeout budget. The lock-queue wait happened BEFORE setup
-        // (top of this fn), so neither queue time nor setup time is
+        // timeout budget. Admission waiting happened before setup
+        // (top of this fn), so neither admission time nor setup time is
         // charged against the guest.
         let run_start = Instant::now();
 
@@ -938,20 +1209,20 @@ impl KtstrVm {
     /// flock from the cached pinning / LLC plan and this fn re-takes
     /// them at the TOP of `run()` — before the initramfs build, KVM
     /// VM creation, and kernel load — so a cell parked in the
-    /// acquisition queue is CHEAP (a ticket flock, plus one inotify
-    /// fd only as head; no guest memory). The no-perf path additionally
+    /// admission registry is cheap (one fixed ticket/futex; only the
+    /// coordinator owns inotify; no guest memory). The no-perf path additionally
     /// HOLDS its build-time `LOCK_SH` fds (parked in
     /// [`Self::no_perf_build_locks`]) so peers' holder counts stay
     /// truthful, releasing them either the instant its replan adopts
-    /// fresh locks or BEFORE queueing on contention (a queued waiter
+    /// fresh locks or before registering on contention (a waiting ticket
     /// must hold nothing — see the no-perf arm). The returned
     /// `Vec<OwnedFd>` is dropped at the end of the run, releasing
     /// every run-scoped lock for concurrent peers.
     ///
     /// `wait` selects the contention policy: the test path
     /// ([`Self::run`]) passes `true`, so a contended reservation joins
-    /// the cross-invocation acquisition queue and completes under the
-    /// head license (the resource-budget model: budgeted/shared
+    /// cross-invocation admission registry and completes under the
+    /// coordinator license (the resource-budget model: budgeted/shared
     /// acquirers wait for exclusive holders; see
     /// [`host_topology::protocol`]) instead of surfacing contention;
     /// the interactive path passes `false` for the single-shot
@@ -972,8 +1243,8 @@ impl KtstrVm {
     ///   coordination is possible on this host.
     /// * `performance_mode` + `pinning_plan`: reuses the stored
     ///   plan's `llc_indices` to take `LOCK_EX` via
-    ///   `acquire_resource_locks_waiting` (fast path, then queue +
-    ///   head accumulation under `wait`).
+    ///   `acquire_resource_locks_waiting` (fast path, then registration +
+    ///   coordinator accumulation under `wait`).
     /// * default else: walks LLC offsets, computing a
     ///   `compute_pinning` candidate per offset and taking `LOCK_SH`
     ///   on the LLC plus `LOCK_EX` on each assigned CPU via
@@ -981,8 +1252,8 @@ impl KtstrVm {
     ///   is compatible with other non-perf `LOCK_SH` holders, blocked
     ///   by perf-mode `LOCK_EX`). If a 1:1 candidate exists but every
     ///   offset is busy (a perf-mode `LOCK_EX` peer on the LLC, or a
-    ///   non-perf peer on the per-CPU `LOCK_EX` set) it queues and,
-    ///   as head, probes every candidate on each lock-dir wake until
+    ///   non-perf peer on the per-CPU `LOCK_EX` set) it registers and, if
+    ///   elected coordinator, probes every candidate on each lock-dir wake until
     ///   the authoritative flock release. If NO offset can
     ///   map the topology (the host is too small), or no host topology
     ///   was cached at build time (sysfs unreadable), it OVERCOMMITS
@@ -1035,13 +1306,11 @@ impl KtstrVm {
                     // same SIZE. Two-stage under `wait`: a non-blocking
                     // fast-path replan first (build-time `LOCK_SH` fds
                     // still held — peers' holder counts stay truthful);
-                    // on contention, RELEASE the build-time fds BEFORE
-                    // queueing. A queued waiter must hold NO resource
-                    // locks: parking on the queue while holding `LOCK_SH`
-                    // on an LLC a perf-mode head wants `LOCK_EX` would be
-                    // a real deadlock cycle (head waits for our SH; we
-                    // wait for the head's queue). The truthfulness loss
-                    // is honest — a queued cell owns nothing yet.
+                    // on contention, release the build-time fds before
+                    // registering. A waiting ticket must hold no resource
+                    // locks: retaining `LOCK_SH` on an LLC while a perf-mode
+                    // coordinator wants `LOCK_EX` would create a real
+                    // hold-and-wait cycle. A waiting cell owns nothing yet.
                     // Residual `ResourceContention` (and every other
                     // `acquire_llc_plan` error) propagates verbatim for
                     // the classifier's retryable-failure routing.
@@ -1109,8 +1378,8 @@ impl KtstrVm {
                 // grain plan's per-LLC footprint still clears the ratio +
                 // floor). Without a cached host topology (degraded sysfs /
                 // cargo-test mode, where the acquire short-circuits anyway)
-                // fall back to whole-LLC Exclusive. Under `wait`, queue up
-                // and accumulate the set as head rather than skip; `wait ==
+                // fall back to whole-LLC Exclusive. Under `wait`, register
+                // and accumulate the set as coordinator rather than skip; `wait ==
                 // false` (interactive) keeps the single-shot behaviour.
                 let llc_mode = self
                     .host_topo
@@ -1158,13 +1427,13 @@ impl KtstrVm {
 
     /// Run-lock acquisition for the interactive / one-shot shell path
     /// ([`Self::run_interactive`]). Passes `wait = false` so
-    /// acquisition does NOT queue on a contended reservation — a human on a
+    /// acquisition does not register on a contended reservation — a human on a
     /// busy shared host should boot immediately, not park in the
-    /// acquisition queue. On the resulting transient
+    /// admission registry. On the resulting transient
     /// `ResourceContention` (every candidate LLC slot busy under a concurrent
     /// peer's `LOCK_EX`) it degrades to a lock-free best-effort boot instead
     /// of failing. The test path ([`Self::run`]) instead passes `wait = true`
-    /// and queues the holder out (see [`Self::acquire_run_locks`]).
+    /// and waits for the holder (see [`Self::acquire_run_locks`]).
     /// Non-contention errors still propagate.
     fn acquire_interactive_run_locks(&self) -> Result<RunLocks> {
         Self::degrade_contention_to_overcommit(self.acquire_run_locks(false))
@@ -1201,8 +1470,8 @@ impl KtstrVm {
     /// Default (non-perf, non-no-perf) run-lock acquisition: try each LLC offset
     /// for a 1:1 LOCK_SH pin. The offset scan is the acquisition
     /// protocol's non-blocking FAST PATH — all-or-nothing per
-    /// candidate, claim-subtracted (candidates targeting a live queue
-    /// head's claimed LLCs/CPUs are skipped), one bounce per offset,
+    /// candidate, claim-fenced (candidates conflicting with earlier exact
+    /// ticket claims are skipped), one bounce per offset,
     /// then the verdict:
     ///
     /// * A candidate acquired → 1:1 pinned run.
@@ -1213,14 +1482,14 @@ impl KtstrVm {
     ///   contention. `wait == false` (interactive) surfaces
     ///   `ResourceContention` immediately for the overcommit degrade.
     ///   `wait == true` (the TEST run path) joins the
-    ///   cross-invocation queue and, as head, RE-PLANS ON EVERY WAKE:
+    ///   cross-invocation registry and, if elected coordinator, RE-PLANS ON EVERY WAKE:
     ///   each lock-dir event re-probes EVERY candidate all-or-nothing
     ///   (so a fully-freed alternative is taken immediately — never
     ///   kept waiting on the original choice), and while none
     ///   completes it accumulates the primary candidate (maximum
     ///   overlap with already-held locks, ties to the pid-staggered
-    ///   scan order) under the head license, publishing it as the
-    ///   claim. It waits for the authoritative flock release; the
+    ///   scan order) under the coordinator license, publishing it as the
+    ///   exact claim. It waits for the authoritative flock release; the
     ///   holder's VM watchdog and nextest process rail own lifecycle
     ///   bounds, so host preemption cannot be misclassified as
     ///   contention.
@@ -1307,18 +1576,19 @@ impl KtstrVm {
                 ),
             }));
         }
-        // Contended: queue up (holding NOTHING — every bounce above
-        // released everything), then acquire as head.
-        Self::acquire_default_as_head(&candidates)
+        // Contended: register while holding nothing, then acquire as the
+        // elected coordinator.
+        Self::acquire_default_as_coordinator(&candidates)
     }
 
-    /// Queue-and-head phase of [`Self::acquire_default_run_locks`]:
+    /// Registry/coordinator phase of [`Self::acquire_default_run_locks`]:
     /// see that method's doc for the probe-all / accumulate-primary
     /// re-plan model. Split out so the wait machinery reads as one
     /// unit.
-    fn acquire_default_as_head(candidates: &[host_topology::PinningPlan]) -> Result<RunLocks> {
+    fn acquire_default_as_coordinator(
+        candidates: &[host_topology::PinningPlan],
+    ) -> Result<RunLocks> {
         use host_topology::protocol;
-        let _queue = protocol::wait_for_queue_turn()?;
         // Pre-compute each candidate's canonical lock order and claim.
         let targets: Vec<Vec<(String, crate::flock::FlockMode)>> = candidates
             .iter()
@@ -1332,15 +1602,73 @@ impl KtstrVm {
                 )
             })
             .collect();
-        let outcome = protocol::acquire_as_head(|held| {
+        let claims: Vec<protocol::ClaimSet> = candidates
+            .iter()
+            .map(|candidate| {
+                let mut cpus: std::collections::BTreeSet<usize> =
+                    candidate.assignments.iter().map(|&(_, cpu)| cpu).collect();
+                cpus.extend(candidate.service_cpu);
+                protocol::ClaimSet::new(
+                    candidate.llc_indices.iter().copied(),
+                    cpus,
+                    crate::flock::FlockMode::Shared,
+                )
+            })
+            .collect();
+        // The private watch covers every alternative, but the registry claim
+        // is always one exact designated candidate. This lets a later smaller
+        // waiter use capacity disjoint from that designation without sniping
+        // resources the earlier waiter has actually reserved.
+        let watch_claim = protocol::ClaimSet::new(
+            claims.iter().flat_map(|claim| claim.llcs.iter().copied()),
+            claims.iter().flat_map(|claim| claim.cpus.iter().copied()),
+            crate::flock::FlockMode::Shared,
+        );
+        let ticket =
+            protocol::register_ticket_or_acquire(claims[0].clone(), watch_claim, None, |probe| {
+                let index = claims
+                    .iter()
+                    .position(|claim| claim == probe.designated())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("queue designated an unknown default placement")
+                    })?;
+                let candidate = &candidates[index];
+                if let Some(locks) = probe.try_acquire(&claims[index], || {
+                    match host_topology::acquire_resource_locks_granted(
+                        candidate,
+                        &candidate.llc_indices,
+                        host_topology::LlcLockMode::Shared,
+                    )? {
+                        host_topology::LockOutcome::Acquired { locks, .. } => Ok(Some(locks)),
+                        host_topology::LockOutcome::Unavailable(_) => Ok(None),
+                    }
+                })? {
+                    return Ok(Some((index, locks)));
+                }
+                let next = (index + 1) % claims.len();
+                probe.reserve(&claims[next])?;
+                Ok(None)
+            })?;
+        let coordinator = match ticket {
+            protocol::TicketWork::Acquired((index, locks)) => {
+                return Ok(RunLocks {
+                    locks,
+                    default_cpu_mask: None,
+                    pinning_plan: Some(candidates[index].clone_unlocked()),
+                    no_perf_cpus: None,
+                });
+            }
+            protocol::TicketWork::Coordinator(coordinator) => coordinator,
+        };
+        let outcome = protocol::acquire_as_coordinator(coordinator, |held| {
             // RE-PLAN on every wake: probe EVERY candidate
             // all-or-nothing (reusing held locks) so a fully-freed
-            // alternative is taken the moment it appears — the head
+            // alternative is taken the moment it appears — the coordinator
             // never keeps waiting on its original choice while a
             // different sufficient set sits free.
             for (i, target) in targets.iter().enumerate() {
                 if let Some(locks) = held.probe_complete(target)? {
-                    return Ok(protocol::HeadStep::Complete((i, locks)));
+                    return Ok(protocol::CoordinatorStep::Complete((i, locks)));
                 }
             }
             // None complete: accumulate toward the PRIMARY candidate —
@@ -1366,13 +1694,13 @@ impl KtstrVm {
                 // sweep and the sweep finished the set — complete now
                 // rather than sleeping on a satisfied target.
                 let locks = held.take(target);
-                return Ok(protocol::HeadStep::Complete((primary, locks)));
+                return Ok(protocol::CoordinatorStep::Complete((primary, locks)));
             }
             let candidate = &candidates[primary];
             let mut claim_cpus: std::collections::BTreeSet<usize> =
                 candidate.assignments.iter().map(|&(_, cpu)| cpu).collect();
             claim_cpus.extend(candidate.service_cpu);
-            Ok(protocol::HeadStep::Waiting {
+            Ok(protocol::CoordinatorStep::Waiting {
                 claim: protocol::ClaimSet::new(
                     candidate.llc_indices.iter().copied(),
                     claim_cpus,
@@ -1381,13 +1709,13 @@ impl KtstrVm {
             })
         })?;
         match outcome {
-            protocol::HeadOutcome::Acquired((i, locks)) => Ok(RunLocks {
+            protocol::CoordinatorOutcome::Acquired((i, locks)) => Ok(RunLocks {
                 locks,
                 default_cpu_mask: None,
                 pinning_plan: Some(candidates[i].clone_unlocked()),
                 no_perf_cpus: None,
             }),
-            protocol::HeadOutcome::Aborted { reason } => {
+            protocol::CoordinatorOutcome::Aborted { reason } => {
                 Err(anyhow::Error::new(host_topology::ResourceContention {
                     reason,
                 }))
@@ -1662,11 +1990,11 @@ impl KtstrVm {
         let (wakeup_r, wakeup_w) = nix::unistd::pipe().context("create stdin wakeup pipe")?;
 
         let kill = Arc::new(AtomicBool::new(false));
-        // Companion eventfd for `kill`. The interactive shell has no
-        // epoll consumer for it (kicks land via `pthread_kill` +
-        // `immediate_exit`), but spawn_ap_threads requires a non-None
-        // eventfd in its signature; allocate a sentinel and let it
-        // drop with the function frame.
+        // Companion eventfd for `kill`. Every interactive stop producer
+        // publishes a level-triggered edge here; the sole relay consumes it
+        // and owns the BSP immediate-exit + SIGRTMIN cancellation sequence.
+        // AP park code shares the fd but cannot consume it on this path because
+        // `freeze` remains false for the entire run.
         let kill_evt = Arc::new(
             vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
                 .context("create shell kill eventfd")?,
@@ -1689,8 +2017,14 @@ impl KtstrVm {
         let bsp_regs: Arc<std::sync::Mutex<Option<exit_dispatch::VcpuRegSnapshot>>> =
             Arc::new(std::sync::Mutex::new(None));
         let has_immediate_exit = vm.has_immediate_exit;
+        let vcpu_run_size = vm.vm_fd.run_size();
         let mut vcpus = std::mem::take(&mut vm.vcpus);
-        let mut bsp = vcpus.remove(0);
+        let bsp = vcpus.remove(0);
+        // Create the BSP's independently-owned immediate-exit mapping before
+        // AP threads exist, so mmap failure cannot create a post-spawn
+        // teardown edge on the interactive path.
+        let (mut bsp, bsp_ie) = ImmediateExitVcpu::new(bsp, has_immediate_exit, vcpu_run_size)
+            .context("map interactive BSP kvm_run for immediate-exit")?;
 
         let ap_pins = vec![None; vcpus.len()];
         // Acquire run-scoped flock fds via the same path
@@ -1732,6 +2066,7 @@ impl KtstrVm {
         let (ap_threads, _ap_freeze) = self.spawn_ap_threads(
             vcpus,
             has_immediate_exit,
+            vcpu_run_size,
             &com1,
             &com2,
             Some(&virtio_con),
@@ -1755,35 +2090,57 @@ impl KtstrVm {
             None,
             None,
         )?;
+        // From this point onward every spawned thread has one owner. Any
+        // fallible helper setup below unwinds through the same bounded AP
+        // teardown and helper joins as normal shutdown.
+        let interactive_bsp_done = Arc::new(AtomicBool::new(false));
+        let mut run_guard = InteractiveRunGuard::new(
+            ap_threads,
+            wakeup_w,
+            kill.clone(),
+            kill_evt.clone(),
+            interactive_bsp_done.clone(),
+            freeze.clone(),
+        );
 
-        // BSP kick handles for the stdin escape sequence. The stdin thread
-        // needs to force the BSP out of KVM_RUN when Ctrl+A X is pressed.
-        let bsp_ie_for_stdin = if has_immediate_exit {
-            Some(ImmediateExitHandle::from_vcpu(&mut bsp))
-        } else {
-            None
-        };
+        // Install and unblock SIGRTMIN on the BSP before the relay can target
+        // it. This deliberately precedes every post-AP setup `?`: guard Drop
+        // may publish kill while unwinding one of those failures.
+        register_vcpu_signal_handler();
         let bsp_tid = unsafe { libc::pthread_self() };
+        run_guard.kill_relay = Some(
+            spawn_interactive_kill_relay(
+                kill.clone(),
+                kill_evt.clone(),
+                interactive_bsp_done,
+                bsp_ie,
+                bsp_tid,
+            )
+            .context("spawn interactive BSP kill relay")?,
+        );
+
+        #[cfg(test)]
+        if FAIL_INTERACTIVE_AFTER_AP_SPAWN.swap(false, Ordering::AcqRel) {
+            anyhow::bail!("injected interactive setup failure after AP spawn");
+        }
 
         // Bound a `--exec` payload's wall-clock. A panic-less guest
         // hang leaves the guest halted, so the BSP `bsp.run()` blocks in
         // KVM_RUN indefinitely — flipping `kill` alone never unblocks it
-        // (the loop only re-checks kill after a vCPU exit). The watchdog
-        // mirrors the stdin Ctrl+A X kick (kill + immediate_exit +
-        // SIGRTMIN) on a deadline. Gated on exec_mode — interactive
-        // sessions have no deadline (the human drives Ctrl+A X). Joined in
-        // the teardown below BEFORE `bsp` drops, so its `ImmediateExitHandle`
-        // (a Copy of `bsp_ie_for_stdin`, pointing into `bsp`'s kvm_run
-        // mmap) never writes through a freed mapping.
+        // (the loop only re-checks kill after a vCPU exit). The deadline
+        // publisher emits the same kill+event edge as every other producer;
+        // the sole relay above owns the immediate-exit and signal sequence.
+        // Gated on exec_mode — interactive sessions have no deadline (the
+        // human drives Ctrl+A X).
         let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let exec_watchdog = if exec_mode {
-            let bsp_ie_for_wd = bsp_ie_for_stdin;
+        let deadline_publisher = if exec_mode {
             let kill_for_wd = kill.clone();
+            let kill_evt_for_wd = kill_evt.clone();
             let timed_out_for_wd = timed_out.clone();
             let deadline = self.exec_timeout;
             Some(
                 std::thread::Builder::new()
-                    .name("ktstr-exec-wdog".into())
+                    .name("ktstr-exec-deadline".into())
                     .spawn(move || {
                         let start = std::time::Instant::now();
                         loop {
@@ -1793,69 +2150,23 @@ impl KtstrVm {
                             }
                             if start.elapsed() >= deadline {
                                 // Re-check: the payload may have completed
-                                // in the poll gap; only kick if still live.
+                                // in the poll gap; only publish if still live.
                                 if kill_for_wd.load(Ordering::Acquire) {
                                     return;
                                 }
                                 timed_out_for_wd.store(true, Ordering::Release);
-                                kill_for_wd.store(true, Ordering::Release);
-                                if let Some(ref ie) = bsp_ie_for_wd {
-                                    ie.set(1);
-                                    std::sync::atomic::fence(Ordering::Release);
-                                }
-                                // SAFETY: bsp_tid is the BSP thread (this
-                                // function's own thread); the watchdog is
-                                // joined before the function returns, so the
-                                // tid is live for the kick.
-                                unsafe {
-                                    libc::pthread_kill(bsp_tid, vcpu_signal());
-                                }
+                                publish_vm_kill(&kill_for_wd, &kill_evt_for_wd);
                                 return;
                             }
                             std::thread::sleep(std::time::Duration::from_millis(100));
                         }
                     })
-                    .context("spawn ktstr-exec-wdog (interactive exec watchdog) thread")?,
+                    .context("spawn interactive exec deadline publisher thread")?,
             )
         } else {
             None
         };
-
-        // UAF safety: the watchdog AND the stdin thread (spawned
-        // below) each hold a Copy of `bsp_ie_for_stdin` — a raw pointer
-        // into `bsp`'s kvm_run mmap (vcpu::ImmediateExitHandle) — plus
-        // `bsp_tid`, and each kicks the BSP (ie.set(1) + pthread_kill) on
-        // its trigger (watchdog deadline / Ctrl+A X). Both MUST be joined
-        // before `bsp` drops, on EVERY exit path: the normal teardown, the
-        // `?` early-returns below (stdin/stdout/dmesg spawn + eventfds),
-        // and a panic-unwind (the test profile unwinds). A bare teardown
-        // join covers only the normal path, so wrap both handles in an RAII
-        // guard whose Drop sets `kill` (each thread re-checks it within its
-        // <=100ms poll/sleep and returns WITHOUT kicking) then joins.
-        // Declared after `bsp` (above) so it drops — and joins — BEFORE
-        // bsp's kvm_run unmaps, on the normal path AND every early-return /
-        // unwind.
-        struct CrossThreadKickGuard {
-            watchdog: Option<std::thread::JoinHandle<()>>,
-            stdin: Option<std::thread::JoinHandle<()>>,
-            kill: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        }
-        impl Drop for CrossThreadKickGuard {
-            fn drop(&mut self) {
-                self.kill.store(true, std::sync::atomic::Ordering::Release);
-                if let Some(h) = self.watchdog.take() {
-                    let _ = h.join();
-                }
-                if let Some(h) = self.stdin.take() {
-                    let _ = h.join();
-                }
-            }
-        }
-        let mut kick_guard = CrossThreadKickGuard {
-            watchdog: exec_watchdog,
-            stdin: None,
-            kill: kill.clone(),
-        };
+        run_guard.deadline_publisher = deadline_publisher;
 
         // Stdin reader thread: host stdin -> virtio-console RX queue.
         // The guest reads stdin from /dev/hvc0 (virtio-console), never
@@ -1867,6 +2178,7 @@ impl KtstrVm {
         // host-side VM teardown without guest cooperation.
         let vc_for_stdin = virtio_con.clone();
         let kill_for_stdin = kill.clone();
+        let kill_evt_for_stdin = kill_evt.clone();
         let stdin_thread = std::thread::Builder::new()
             .name("interactive-stdin".into())
             .spawn(move || {
@@ -1929,14 +2241,7 @@ impl KtstrVm {
                                             // before the Ctrl+A were already
                                             // flushed when saw_ctrl_a was set.
                                             eprintln!("\r\nTerminated.");
-                                            kill_for_stdin.store(true, Ordering::Release);
-                                            if let Some(ref ie) = bsp_ie_for_stdin {
-                                                ie.set(1);
-                                                std::sync::atomic::fence(Ordering::Release);
-                                            }
-                                            unsafe {
-                                                libc::pthread_kill(bsp_tid, vcpu_signal());
-                                            }
+                                            publish_vm_kill(&kill_for_stdin, &kill_evt_for_stdin);
                                             return;
                                         }
                                         // Not 'x'/'X' after Ctrl+A: the 0x01
@@ -1975,18 +2280,16 @@ impl KtstrVm {
                 }
             })
             .context("spawn stdin reader thread")?;
-        // Hand the stdin handle to the kick guard so it is joined before
-        // `bsp` drops on every path (see CrossThreadKickGuard above). Any
-        // `?` after this point (stdout/dmesg spawn + eventfds) now joins
-        // both cross-thread holders via the guard's Drop.
-        kick_guard.stdin = Some(stdin_thread);
+        // Transfer ownership immediately; every subsequent `?` joins it.
+        run_guard.stdin = Some(stdin_thread);
 
         // Stdout writer thread: virtio-console TX -> host stdout.
         // Polls tx_evt for zero-latency wakeup when guest writes data.
-        // On write errors (including BrokenPipe), sets kill flag and exits
-        // to stop the VM rather than polling a dead pipe until timeout.
+        // On eventfd or output errors (including BrokenPipe), publishes kill
+        // and exits so the sole relay removes a blocked BSP from KVM_RUN.
         let vc_for_stdout = virtio_con.clone();
         let kill_for_stdout = kill.clone();
+        let kill_evt_for_stdout = kill_evt.clone();
         let stdout_thread: JoinHandle<bool> = std::thread::Builder::new()
             .name("interactive-stdout".into())
             .spawn(move || {
@@ -2015,7 +2318,11 @@ impl KtstrVm {
                     match nix::poll::poll(&mut fds, 50u16) {
                         Ok(0) => continue,
                         Err(nix::errno::Errno::EINTR) => continue,
-                        Err(_) => break,
+                        Err(error) => {
+                            tracing::warn!(%error, "interactive stdout event poll failed");
+                            publish_vm_kill(&kill_for_stdout, &kill_evt_for_stdout);
+                            break;
+                        }
                         Ok(_) => {
                             // Consume eventfd counter.
                             let _ = vc_for_stdout.lock().tx_evt().read();
@@ -2045,7 +2352,7 @@ impl KtstrVm {
                             if stdout.write_all(&data[..valid_len]).is_err()
                                 || stdout.flush().is_err()
                             {
-                                kill_for_stdout.store(true, Ordering::Release);
+                                publish_vm_kill(&kill_for_stdout, &kill_evt_for_stdout);
                                 break;
                             }
                             wrote_any = true;
@@ -2069,6 +2376,7 @@ impl KtstrVm {
                 wrote_any
             })
             .context("spawn stdout writer thread")?;
+        run_guard.stdout = Some(stdout_thread);
 
         // Optional dmesg thread: COM1 -> stderr in real-time.
         // Only spawned when --dmesg is active. Gives the user kernel
@@ -2167,11 +2475,14 @@ impl KtstrVm {
         } else {
             (None, None)
         };
+        run_guard.dmesg = dmesg_thread;
+        run_guard.dmesg_wakeup = dmesg_wakeup_evt;
 
-        // BSP run loop (same shutdown detection as run()).
-        // Interactive sessions are user-controlled; the builder's timeout
-        // (default 60s) must not kill the shell. Use 24 hours as a
-        // practical upper bound.
+        // BSP run loop (same shutdown detection as run()). Timeout enforcement
+        // lives in the external test watchdog/deadline publishers, not inside
+        // this shared loop; interactive sessions intentionally have no general
+        // deadline. Keep an inert long-duration argument for the shared
+        // signature.
         //
         // Apply the no-perf + --cpu-cap mask to the BSP thread so
         // interactive `ktstr shell --no-perf-mode --cpu-cap N` runs
@@ -2182,13 +2493,13 @@ impl KtstrVm {
         if let Some(mask) = self.no_perf_plan.as_ref().map(|p| p.cpus.as_slice()) {
             set_thread_cpumask(mask, "BSP (shell)");
         }
-        register_vcpu_signal_handler();
         let interactive_timeout = Duration::from_secs(24 * 60 * 60);
         // Exit code and timeout flag are unused here: interactive
-        // exit status is not derived from the run-loop sentinel
-        // (shell mode returns Ok(None)), and the 24h pseudo-timeout
-        // above means `timed_out` never flips. The exit reason is
-        // kept for the post-restore diagnostic line below.
+        // exit status is not derived from the run-loop sentinel (shell mode
+        // returns Ok(None)). The exit reason is kept for the post-restore
+        // diagnostic line below.
+        #[cfg(test)]
+        INTERACTIVE_BSP_ENTERED.store(true, Ordering::Release);
         let (_exit_code, _timed_out, bsp_exit_reason) = self.run_bsp_loop(
             &mut bsp,
             &com1,
@@ -2208,12 +2519,12 @@ impl KtstrVm {
             interactive_timeout,
             // Interactive shell never sets `freeze`, so the
             // handle_freeze branch is unreachable in this path.
-            // Pass None for the wake-fd handles — the legacy
-            // park_timeout cadence is the safe-by-construction
-            // fallback.
+            // No park/thaw handles are needed because `freeze` cannot be set.
+            // The kill event remains wired so a BSP fatal/panic publication
+            // wakes the interactive relay.
             None,
             None,
-            None,
+            Some(&kill_evt),
             // Interactive shell does not construct a GuestKernel
             // for monitor / BPF map writes, so no TCR_EL1 cache
             // is needed.
@@ -2221,9 +2532,9 @@ impl KtstrVm {
             // CR3 cache: unused in interactive shell (no monitor
             // thread, no phys_base resolution).
             &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            // Interactive shell has no watchdog (24-hour timeout
-            // is effectively disabled), so this flag never flips
-            // and the BSP returns `timed_out=false` cleanly.
+            // `run_bsp_loop`'s test-workload timeout is disabled here, so its
+            // flag never flips. Exec mode's independent deadline publisher
+            // records into `timed_out` above instead.
             &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // Interactive shell does not run the monitor/dump
             // pipeline that consumes the virt-KASLR offset, so the
@@ -2235,43 +2546,14 @@ impl KtstrVm {
                 .expect("eventfd for interactive-shell kern_virt_kaslr publish"),
             0,
         );
+        #[cfg(test)]
+        INTERACTIVE_BSP_ENTERED.store(false, Ordering::Release);
+        run_guard.mark_bsp_done();
 
-        // Shutdown.
-        kill.store(true, Ordering::Release);
-
-        // Wake the stdin reader so it exits poll() and can be joined.
-        let _ = nix::unistd::write(&wakeup_w, &[0u8]);
-        drop(wakeup_w);
-
-        // Wake the dmesg thread so it exits epoll_wait promptly and
-        // can be joined. The kill load above the loop short-circuits
-        // any pending iteration; this bump ensures the wait returns
-        // immediately rather than blocking on the next byte from the
-        // guest after teardown.
-        if let Some(ref evt) = dmesg_wakeup_evt {
-            let _ = evt.write(1);
-        }
-
-        for vt in &ap_threads {
-            if !vt.exited.load(Ordering::Acquire) {
-                vt.kick();
-            }
-        }
-        for vt in ap_threads {
-            vt.wait_for_exit(Duration::from_secs(5));
-            let _ = vt.handle.join();
-        }
-
-        let stdout_wrote = stdout_thread.join().unwrap_or(false);
-        // The stdin reader and the exec watchdog are joined by
-        // `kick_guard`'s Drop (which also covers the `?` early-returns +
-        // panic-unwind); `kill` set above makes each return without
-        // kicking. The guard drops before `bsp` (declared earlier), so
-        // the joins precede the kvm_run unmap on every path.
-        if let Some(dt) = dmesg_thread {
-            let _ = dt.join();
-        }
-        drop(dmesg_wakeup_evt);
+        // One shutdown implementation covers normal return and every setup
+        // error/unwind: all wake edges, the BSP kill relay, bounded AP
+        // teardown, then output-helper joins.
+        let stdout_wrote = run_guard.shutdown();
 
         // _raw_guard drops here, restoring terminal and signal handlers.
         drop(_raw_guard);
@@ -2381,7 +2663,7 @@ impl KtstrVm {
             // masking it as exit 0 — that silent default is the exact
             // regression this consumer closes.
             None => {
-                // A watchdog timeout is the most likely cause of a
+                // An exec-deadline expiry is the most likely cause of a
                 // missing EXEC_EXIT frame (the guest was force-killed
                 // mid-payload) — report it distinctly and actionably.
                 if timed_out.load(Ordering::Acquire) {
