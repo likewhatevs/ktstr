@@ -1,0 +1,28 @@
+# Defaults for nextest invocations orchestrated by cargo-ktstr.
+#
+# This is loaded through nextest's --tool-config-file mechanism, so a
+# repository config, an explicit --config-file, and CLI flags all remain
+# higher priority.
+
+[profile.default]
+# This is an admission budget, not a native-thread count. Resource-taking
+# ktstr cells park in ktstr's cheap cross-process topology queue before VM
+# allocation; all of them must reach that queue for it to remain
+# work-conserving.
+# future-queue reserves one u64 slot-id entry per permit, so this costs about
+# 8 MiB per nextest process without creating any eager threads or test tasks.
+# One million is intentionally far beyond a plausible generated-cell count
+# while avoiding an integer-max allocation.
+test-threads = 1_000_000
+
+[test-groups."@tool:ktstr:host-tests"]
+max-threads = "num-cpus"
+
+[[profile.default.overrides]]
+# Generated names encode their admission class:
+#   ktstr/, gauntlet/, verifier/  resource scheduler
+#   host/                         ordinary host work
+# Everything ktstr does not own is ordinary host work too.
+filter = 'not(test(/^ktstr\//) | test(/^gauntlet\//) | test(/^verifier\//))'
+test-group = "@tool:ktstr:host-tests"
+threads-required = 1

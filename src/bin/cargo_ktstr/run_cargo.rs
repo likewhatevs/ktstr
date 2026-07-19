@@ -128,6 +128,36 @@ fn prepare_llvm_cov_args_with(
     }
 }
 
+/// Whether this cargo sub-invocation ultimately runs tests through nextest.
+///
+/// `test` and `coverage` have fixed nextest command shapes. The raw
+/// `llvm-cov` passthrough is conditional: only its explicit `nextest`
+/// subcommand accepts nextest's tool-config flag. Keeping this decision next
+/// to [`llvm_cov_uses_nextest`] prevents report/clean/show-env passthroughs
+/// from being mutated.
+fn cargo_sub_uses_nextest(sub_argv: &[&str], args: &[String]) -> bool {
+    sub_argv == TEST_SUB_ARGV
+        || sub_argv == COVERAGE_SUB_ARGV
+        || (sub_argv == LLVM_COV_SUB_ARGV && llvm_cov_uses_nextest(args))
+}
+
+/// Add ktstr's low-priority nextest defaults to every nextest-backed route.
+///
+/// The injector is parameterized so command-shape tests can pin the routing
+/// contract without materializing the embedded config. Production passes the
+/// content-addressed [`crate::nextest_config::inject`] implementation.
+fn inject_nextest_tool_config_with(
+    sub_argv: &[&str],
+    args: Vec<String>,
+    inject: impl FnOnce(Vec<String>) -> Result<Vec<String>, String>,
+) -> Result<Vec<String>, String> {
+    if cargo_sub_uses_nextest(sub_argv, &args) {
+        inject(args)
+    } else {
+        Ok(args)
+    }
+}
+
 /// Decide whether to inject `LLVM_PROFILE_FILE` for a given cargo
 /// sub-invocation, returning the pattern to set or `None` to leave
 /// the env untouched.
@@ -363,6 +393,12 @@ fn run_cargo_sub(
     include_eol: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
+    // Materialize and inject once for the whole invocation family. The final
+    // run and the reserved no-run warm-up below are both derived from this
+    // exact argv, so they cannot drift onto different nextest admission
+    // policies. Raw llvm-cov modes that do not select nextest remain byte-for-
+    // byte passthroughs.
+    let args = inject_nextest_tool_config_with(sub_argv, args, crate::nextest_config::inject)?;
     let mut cmd = build_cargo_command(
         sub_argv,
         release,
@@ -1718,6 +1754,76 @@ mod tests {
                 "raw/report mode must preserve its exact feature selection: {args:?}",
             );
         }
+    }
+
+    #[test]
+    fn tool_config_injection_reaches_every_nextest_backed_cargo_route_only() {
+        let inject = |args| {
+            crate::nextest_config::inject_with_path(
+                args,
+                std::path::Path::new("/tmp/ktstr-nextest.toml"),
+            )
+        };
+
+        for (sub_argv, args) in [
+            (TEST_SUB_ARGV, strs(&["-j", "77"])),
+            (COVERAGE_SUB_ARGV, strs(&["--workspace"])),
+            (
+                LLVM_COV_SUB_ARGV,
+                strs(&["--manifest-path", "Cargo.toml", "nextest"]),
+            ),
+        ] {
+            let got = inject_nextest_tool_config_with(sub_argv, args, inject)
+                .expect("nextest tool-config injection succeeds");
+            assert_eq!(
+                got.iter()
+                    .filter(|argument| argument.starts_with("--tool-config-file=ktstr:"))
+                    .count(),
+                1,
+                "nextest-backed route {sub_argv:?} must receive exactly one ktstr tool config",
+            );
+        }
+
+        for raw_args in [
+            strs(&[]),
+            strs(&["test"]),
+            strs(&["report", "--lcov"]),
+            strs(&["clean"]),
+            strs(&["show-env"]),
+        ] {
+            let original = raw_args.clone();
+            let got = inject_nextest_tool_config_with(LLVM_COV_SUB_ARGV, raw_args, |_| {
+                panic!("non-nextest llvm-cov mode must not call the injector")
+            })
+            .expect("raw llvm-cov passthrough succeeds");
+            assert_eq!(got, original);
+        }
+    }
+
+    #[test]
+    fn reserved_warmup_reuses_the_final_runs_injected_tool_config() {
+        let run_args =
+            inject_nextest_tool_config_with(TEST_SUB_ARGV, strs(&["-j", "77"]), |args| {
+                crate::nextest_config::inject_with_path(
+                    args,
+                    std::path::Path::new("/tmp/ktstr-nextest.toml"),
+                )
+            })
+            .expect("tool-config injection succeeds");
+        let warm_args = prebuild_no_run_args(&run_args);
+
+        for args in [&run_args, &warm_args] {
+            assert_eq!(
+                args.iter()
+                    .filter(|argument| {
+                        argument.as_str() == "--tool-config-file=ktstr:/tmp/ktstr-nextest.toml"
+                    })
+                    .count(),
+                1,
+            );
+            assert!(args.windows(2).any(|pair| pair == ["-j", "77"]));
+        }
+        assert!(warm_args.iter().any(|argument| argument == "--no-run"));
     }
 
     #[test]

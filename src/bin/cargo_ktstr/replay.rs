@@ -762,17 +762,16 @@ fn invoke_nextest(
     args: &[String],
 ) -> Result<i32> {
     use std::process::Command;
+    let nextest_args = build_injected_nextest_run_args_with(
+        filter_expr,
+        nextest_profile,
+        args,
+        crate::nextest_config::inject,
+    )
+    .map_err(anyhow::Error::msg)
+    .context("prepare ktstr nextest tool config")?;
     let mut cmd = Command::new("cargo");
-    cmd.args(["nextest", "run", "-E", filter_expr]);
-    // `--nextest-profile <NAME>` selects the NEXTEST test profile;
-    // nextest's own flag is `--profile`.
-    if let Some(np) = nextest_profile {
-        cmd.args(["--profile", np]);
-    }
-    // Forward the operator's cargo/nextest flags (features,
-    // `--cargo-profile`, …) verbatim so the replay re-run builds
-    // identically to the original suite. No `--` separator is required.
-    cmd.args(args);
+    cmd.args(&nextest_args);
     // `--profile <NAME>` sets the scheduler-under-test's cargo BUILD
     // profile via `KTSTR_SCHEDULER_PROFILE`.
     if let Some(p) = profile {
@@ -780,6 +779,36 @@ fn invoke_nextest(
     }
     let status = crate::interrupt::run_status(cmd).context("spawn `cargo nextest run`")?;
     Ok(status.code().unwrap_or(1))
+}
+
+/// Build replay's complete nextest argv before the process is spawned.
+///
+/// Injection happens after the filter/profile/user argv are assembled so an
+/// inner `--` is handled uniformly, and so a user-supplied ktstr tool config
+/// can suppress the built-in one. Keeping this helper injectable gives the
+/// replay route a command-shape regression test without touching the cache.
+fn build_injected_nextest_run_args_with(
+    filter_expr: &str,
+    nextest_profile: Option<&str>,
+    args: &[String],
+    inject: impl FnOnce(Vec<String>) -> Result<Vec<String>, String>,
+) -> Result<Vec<String>, String> {
+    let mut nextest_args = vec![
+        "nextest".to_string(),
+        "run".to_string(),
+        "-E".to_string(),
+        filter_expr.to_string(),
+    ];
+    // `--nextest-profile <NAME>` selects the NEXTEST test profile;
+    // nextest's own flag is `--profile`.
+    if let Some(np) = nextest_profile {
+        nextest_args.extend(["--profile".to_string(), np.to_string()]);
+    }
+    // Forward the operator's cargo/nextest flags (features,
+    // `--cargo-profile`, …) verbatim so the replay re-run builds
+    // identically to the original suite. No `--` separator is required.
+    nextest_args.extend_from_slice(args);
+    inject(nextest_args)
 }
 
 #[cfg(test)]
@@ -838,6 +867,44 @@ mod tests {
                 .to_string()
                 .contains("package future-tests uses newer ktstr"),
             "{error:#}",
+        );
+    }
+
+    #[test]
+    fn replay_exec_injects_tool_config_before_test_binary_args() {
+        let got = build_injected_nextest_run_args_with(
+            "test(=ktstr/failing)",
+            Some("ci"),
+            &[
+                "-j".to_string(),
+                "77".to_string(),
+                "--".to_string(),
+                "--nocapture".to_string(),
+            ],
+            |args| {
+                crate::nextest_config::inject_with_path(
+                    args,
+                    std::path::Path::new("/tmp/ktstr-nextest.toml"),
+                )
+            },
+        )
+        .expect("replay tool-config injection succeeds");
+        assert_eq!(
+            got,
+            [
+                "nextest",
+                "run",
+                "-E",
+                "test(=ktstr/failing)",
+                "--profile",
+                "ci",
+                "-j",
+                "77",
+                "--tool-config-file=ktstr:/tmp/ktstr-nextest.toml",
+                "--",
+                "--nocapture",
+            ]
+            .map(ToString::to_string),
         );
     }
 

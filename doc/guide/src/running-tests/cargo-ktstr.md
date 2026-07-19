@@ -133,6 +133,15 @@ that simply could not start.
 - `--nextest-profile NAME` — the nextest test profile from
   `.config/nextest.toml` (retries, timeouts, output settings).
 
+For every nextest-backed route (`test`, `coverage`, `verifier`, replay
+`--exec`, and raw `llvm-cov nextest`), cargo-ktstr supplies a
+low-priority nextest tool config. It admits VM-resource waiters immediately
+so ktstr's cross-process topology queue—not a second CPU-sized nextest
+queue—decides which fitting VM starts next, while ordinary host tests remain
+bounded to the host CPU count. Repository nextest config and explicit CLI
+settings take priority; for example `-j 64` remains authoritative. Raw
+`llvm-cov` modes such as `report`, `clean`, and `show-env` are unchanged.
+
 **`--relevant` / `--base` / `--base-ref` / `--default-branch`** —
 narrow the run to only the tests whose scheduler your working-tree
 change touches, against a baseline commit (merge-base with `main` by

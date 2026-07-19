@@ -2,10 +2,11 @@
 
 # SCHEDULING MODEL: nextest is a pure SPAWNER; the lock-dir queue is
 # the actual scheduler (see host_topology::protocol — the
-# "second-order scheduler"). nextest admits every cell at once; cells
-# park CHEAPLY in the acquisition queue (a ticket flock + an inotify
-# fd, no guest memory — acquisition runs before VM setup) until host
-# capacity frees. Consequences for this config:
+# "second-order scheduler"). Under the default and CI profiles, nextest
+# admits every lock-taking cell at once while the `host-tests` group
+# bounds ordinary host work. Cells park CHEAPLY in the cross-process
+# acquisition queue (before VM setup or guest-memory allocation) until
+# host capacity frees. Consequences for this config:
 #
 #  - Reported per-test DURATIONS INCLUDE LOCK-QUEUE TIME. That is
 #    accepted; no effort is spent excluding queue wait from timings
@@ -21,41 +22,45 @@
 #    failure, never a skip; these retries re-run it alongside the true
 #    transient flakes, which typically resolve by retry 2-3. max-delay
 #    keeps the per-failure budget tight.
-#
-# test-threads = 16 caps parallelism well below `num-cpus` on
-# high-core dev boxes so VM-pinning,
-# cpuset/cgroup allocation, RLIMIT-touching tests, and shared-file-
-# lock holders don't step on each other's environment state. The
-# 16 ceiling is roughly one test per LLC group on typical desktop
-# and CI hosts. Individual binaries that genuinely benefit from
-# more parallelism (pure-Rust unit tests with no kernel side
-# effects) can override via `--test-threads N` at invocation time.
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 2 }
 retries = { backoff = "exponential", count = 5, delay = "1s", jitter = true, max-delay = "3s" }
-test-threads = 16
+test-threads = 1_000_000
 
 [profile.default.junit]
 path = "junit.xml"
 
-# ci: test-threads = 64 so VM cells are ADMITTED (spawned into the
-# lock-dir queue) quickly instead of trickling in behind non-lock-
-# taking unit tests at the default 16-wide schedule. Queued waiters
-# are cheap (see the scheduling-model note above), so a wide spawn
-# costs ~nothing; the lock dir — not nextest — decides how many cells
-# actually execute. 64 rather than "all cells at once" because the
-# non-lock-taking unit tests interleaved in the same schedule DO use
-# real CPU, and 64 concurrent short tests already saturate admission
-# within seconds.
+# The default and CI profiles use a deliberately large ADMISSION pool so
+# every lock-taking VM cell can reach ktstr's resource scheduler. A
+# CPU-sized nextest pool is not sufficient: queued cells still consume
+# nextest slots, so an unlucky set of blocked claims can fill that pool
+# while a not-yet-admitted cell would fit the host's free topology. That
+# creates a second, non-work-conserving scheduler above ktstr.
+#
+# `test-threads` is an async slot budget, not nextest's native Tokio
+# worker count. The runtime remains host-sized. Ordinary tests are
+# assigned to `host-tests` below; once that group reaches `num-cpus`,
+# nextest queues later ordinary tests inside the group without charging
+# global slots and keeps scanning until every cheap VM acquisition
+# waiter has started. Thus this does not launch all 11k host tests.
+#
+# One million makes global admission effectively unbounded without tying the
+# ceiling to today's suite size. nextest's future-queue reserves one u64
+# slot-id entry per permit (~8 MiB here), but does not create threads or tasks
+# eagerly; an integer-max value would therefore be wasteful. Explicit CLI
+# `-j`/`--test-threads` remains authoritative.
 [profile.ci]
 slow-timeout = { period = "90s", terminate-after = 3 }
 retries = { backoff = "exponential", count = 6, delay = "1s", jitter = true, max-delay = "3s" }
-test-threads = 64
+test-threads = 1_000_000
 failure-output = "final"
 fail-fast = false
 
 [profile.ci.junit]
 path = "junit.xml"
+
+[test-groups.host-tests]
+max-threads = "num-cpus"
 
 # CI overrides — mirrors profile.default.overrides. nextest does not
 # inherit overrides across profiles, so every override that should
@@ -170,6 +175,63 @@ threads-required = 1
 [[profile.ci.overrides]]
 filter = "binary(compile_fail) & test(=compile_fail)"
 test-group = "compile-fail"
+threads-required = 1
+
+# Keep ordinary host-side tests CPU-bounded even though the global CI
+# slot budget admits every resource-lock user. Put this fallback after
+# the named test-group overrides: nextest selects the first matching
+# value for each setting, so compile-fail, llc-lock, and the other
+# deliberately serialized groups retain their stronger rules.
+#
+# This is a RESOURCE-ADMISSION identity selector, deliberately separate
+# from the slow-timeout filters above. A test can need a long timeout
+# without taking topology locks (the fetch retry tests), and direct
+# KtstrVm / nested cargo-ktstr callers do take locks without having a
+# generated ktstr/... name. Conflating those policies both leaked
+# ordinary tests into the effectively-unbounded global pool and trapped
+# real VM waiters behind host-tests.
+#
+# Generated ktstr/, gauntlet/, and verifier/ cells participate in the
+# scheduler. Generated host_only tests are emitted under the distinct host/
+# namespace, so they fall into host-tests generically without a brittle list
+# of macro/codegen probe names. The remaining arms cover direct KtstrVm
+# users, shell/verifier wrappers, ignored nested-VM/kernel-build shims, and
+# the two production-lock reservation tests. They stay in @global so every
+# cheap waiter reaches ktstr's work-conserving cross-process queue;
+# everything else enters the CPU-sized host-tests group.
+[[profile.ci.overrides]]
+filter = '''
+not(
+  test(/^ktstr\//)
+  | test(/^gauntlet\//)
+  | test(/^verifier\//)
+  | (
+    binary(=ktstr)
+    & (
+      test(/^vmm::tests::(boot_kernel_.*|bench_boot_time.*|monitor_data_valid_latch_records_live_page_offset|sys_rdy_releases_monitor_before_5s_timeout|monitor_exits_cleanly_when_guest_panics_before_sys_rdy|first_sample_has_valid_rq_clock_thanks_to_sys_rdy|watchdog_timeout_override_lands_in_guest_memory|watchdog_override_prevents_stall_exit|sched_domain_data_populated|builder_performance_mode_valid_succeeds|builder_performance_mode_preserves_in_vm|builder_performance_mode_mbind_nodes_populated)$/)
+      | test(/^cli::kernel_build::build::tests::acquire_build_reservation_(bypass_empty_string_rejected|plan_and_make_jobs_consistent)$/)
+    )
+  )
+  | binary(=shell_mode_scheduler_lifecycle_e2e)
+  | binary(=disk_template_e2e)
+  | binary(=vm_integration)
+  | binary(=extra_kconfig_e2e)
+  | binary(=wprof_e2e)
+  | (
+    binary(=ktstr_cli)
+    & test(=shell_exec_echo)
+  )
+  | (
+    binary(=cargo_ktstr_shell_test_e2e)
+    & test(=shell_test_resolves_topology_from_named_test)
+  )
+  | (
+    binary(=cargo_ktstr_verifier_discovery)
+    & test(=bare_verifier_runs_recursively_discovered_scheduler_cell_end_to_end)
+  )
+)
+'''
+test-group = "host-tests"
 threads-required = 1
 
 # vmm::sched_stats tests share a binary whose first-attempt load is
@@ -299,19 +361,11 @@ filter = "test(gauntlet/)"
 slow-timeout = { period = "120s", terminate-after = 2 }
 
 # Compile-fail tests: trybuild compiles the dependency tree on first run.
-#
-# Also flaky under parallel nextest exec — trybuild internally invokes
-# `cargo build` on each fixture sharing the host's target/ directory
-# with concurrent tests. A neighbour test's build can leave stale dep
-# artifacts that one trybuild fixture compiles cleanly even when it
-# should fail ("Expected test case to fail to compile, but it
-# succeeded"). Inherits retries = 5 from profile.default which
-# typically resolves the contention on try 2-3 after the concurrent
-# build settles. The `compile-fail` test-group below holds the
-# driver to a single slot so cross-test cargo invocations cannot
-# interleave with trybuild's fixture builds; per-fixture trybuild
-# cache isolation would be the definitive in-tree fix (would require
-# patching the test wrapper).
+# The driver is ignored in the ordinary suite and selected alone by
+# `just compile-fail`, so unrelated tests do not share that dedicated CI
+# invocation. The group below serializes any future additional fixture
+# drivers selected by that recipe; a group limit does not reserve the global
+# nextest pool against tests outside the group.
 [[profile.default.overrides]]
 filter = "binary(compile_fail) & test(=compile_fail)"
 slow-timeout = { period = "180s", terminate-after = 2 }
@@ -441,24 +495,55 @@ test-group = "llc-lock"
 threads-required = 1
 
 # ── compile-fail ─────────────────────────────────────────────────────
-# The compile_fail test driver invokes trybuild, which spawns one
-# `cargo build` per fixture. Each cargo invocation grabs target/'s
-# build lock; trybuild itself walks its fixtures sequentially. The
-# stale-target race appears when compile_fail runs CONCURRENTLY with
-# other tests that also spawn cargo invocations (or otherwise mutate
-# target/) — a neighbour test's intermediate `.rmeta` /`.rlib` can
-# satisfy a fixture build that should have failed. max-threads = 1
-# + threads-required = 1 holds the compile_fail driver to a single
-# slot, so the test-group reserves the entire pool against cross-test
-# contention. Other tests outside this group keep their global
-# parallelism. Within compile_fail, trybuild's fixture loop is
-# already serial — the test-group does NOT change that.
+# Serialize multiple compile-fail drivers with one another. The dedicated
+# `just compile-fail` recipe selects this ignored test in isolation; this
+# group is not claimed to exclude unrelated tests from the global pool.
 [test-groups.compile-fail]
 max-threads = 1
 
 [[profile.default.overrides]]
 filter = "binary(compile_fail) & test(=compile_fail)"
 test-group = "compile-fail"
+threads-required = 1
+
+# Mirror profile.ci's exact resource-admission split. Keep this fallback after
+# every named default-profile test-group override so vm-cli, vm-perf,
+# alu-vec512, llc-lock, compile-fail, and wide-smp retain their stronger
+# serialization. The generated host/ namespace makes every host_only entry
+# fall into host-tests without a per-test allowlist.
+[[profile.default.overrides]]
+filter = '''
+not(
+  test(/^ktstr\//)
+  | test(/^gauntlet\//)
+  | test(/^verifier\//)
+  | (
+    binary(=ktstr)
+    & (
+      test(/^vmm::tests::(boot_kernel_.*|bench_boot_time.*|monitor_data_valid_latch_records_live_page_offset|sys_rdy_releases_monitor_before_5s_timeout|monitor_exits_cleanly_when_guest_panics_before_sys_rdy|first_sample_has_valid_rq_clock_thanks_to_sys_rdy|watchdog_timeout_override_lands_in_guest_memory|watchdog_override_prevents_stall_exit|sched_domain_data_populated|builder_performance_mode_valid_succeeds|builder_performance_mode_preserves_in_vm|builder_performance_mode_mbind_nodes_populated)$/)
+      | test(/^cli::kernel_build::build::tests::acquire_build_reservation_(bypass_empty_string_rejected|plan_and_make_jobs_consistent)$/)
+    )
+  )
+  | binary(=shell_mode_scheduler_lifecycle_e2e)
+  | binary(=disk_template_e2e)
+  | binary(=vm_integration)
+  | binary(=extra_kconfig_e2e)
+  | binary(=wprof_e2e)
+  | (
+    binary(=ktstr_cli)
+    & test(=shell_exec_echo)
+  )
+  | (
+    binary(=cargo_ktstr_shell_test_e2e)
+    & test(=shell_test_resolves_topology_from_named_test)
+  )
+  | (
+    binary(=cargo_ktstr_verifier_discovery)
+    & test(=bare_verifier_runs_recursively_discovered_scheduler_cell_end_to_end)
+  )
+)
+'''
+test-group = "host-tests"
 threads-required = 1
 
 # ── wide-smp ─────────────────────────────────────────────────────────

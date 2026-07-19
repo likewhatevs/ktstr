@@ -61,6 +61,8 @@ mod interrupt;
 mod kernel;
 #[path = "cargo_ktstr/misc/mod.rs"]
 mod misc;
+#[path = "cargo_ktstr/nextest_config.rs"]
+mod nextest_config;
 #[path = "cargo_ktstr/perf_delta.rs"]
 mod perf_delta;
 #[path = "cargo_ktstr/replay.rs"]

@@ -734,6 +734,20 @@ fn build_scoped_nextest_args(
     args
 }
 
+/// Build the verifier run argv and apply ktstr's low-priority nextest policy.
+///
+/// Kept as one operation so the production run cannot accidentally inject
+/// after cloning a separate warm-up argv. The caller derives both the JSON
+/// no-run discovery command and the final sweep from the returned vector.
+fn build_injected_scoped_nextest_args_with(
+    nextest_profile: Option<&str>,
+    forward: &[String],
+    plan: &VerifierPackagePlan,
+    inject: impl FnOnce(Vec<String>) -> Result<Vec<String>, String>,
+) -> Result<Vec<String>, String> {
+    inject(build_scoped_nextest_args(nextest_profile, forward, plan))
+}
+
 fn probe_scheduler_declarations(
     test_bins: &[PathBuf],
 ) -> Result<Vec<TestBinarySchedulerDeclarations>, String> {
@@ -1463,7 +1477,12 @@ pub(crate) fn run_verifier(
     } else {
         drop_older_package_selectors(&args, &package_plan.older)
     };
-    let nextest_args = build_scoped_nextest_args(nextest_profile.as_deref(), &args, &package_plan);
+    let nextest_args = build_injected_scoped_nextest_args_with(
+        nextest_profile.as_deref(),
+        &args,
+        &package_plan,
+        crate::nextest_config::inject,
+    )?;
     let scheduler_profile = scheduler_profile_for_run(profile.as_deref());
     let declaring_cargo_options = declaring_metadata_options(&args, &invocation_dir);
     let scheduler_cargo_options = scheduler_build_options(&args, &invocation_dir);
@@ -2835,7 +2854,7 @@ mod tests {
     #[test]
     fn verifier_warmup_argv_is_run_argv_plus_no_run() {
         let forwarded = vec!["--cargo-profile".to_string(), "release".to_string()];
-        let run_argv = build_scoped_nextest_args(
+        let run_argv = build_injected_scoped_nextest_args_with(
             Some("ci"),
             &forwarded,
             &VerifierPackagePlan {
@@ -2843,7 +2862,14 @@ mod tests {
                 older: Vec::new(),
                 newer: Vec::new(),
             },
-        );
+            |args| {
+                crate::nextest_config::inject_with_path(
+                    args,
+                    std::path::Path::new("/tmp/ktstr-nextest.toml"),
+                )
+            },
+        )
+        .expect("verifier nextest tool-config injection succeeds");
         let warm_argv = crate::run_cargo::prebuild_no_run_args(&run_argv);
         assert_eq!(
             warm_argv[..warm_argv.len() - 1],
@@ -2876,6 +2902,17 @@ mod tests {
                 .any(|w| w[0] == "--cargo-profile" && w[1] == "release"),
             "forwarded cargo profile present in warm-up: {warm_argv:?}",
         );
+        for argv in [&run_argv, &warm_argv] {
+            assert_eq!(
+                argv.iter()
+                    .filter(|argument| {
+                        argument.as_str() == "--tool-config-file=ktstr:/tmp/ktstr-nextest.toml"
+                    })
+                    .count(),
+                1,
+                "run and warm-up must share one identical tool config: {argv:?}",
+            );
+        }
     }
 
     #[test]

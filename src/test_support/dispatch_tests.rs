@@ -1241,7 +1241,7 @@ fn host_only_listing_lines(captured: &[u8]) -> Vec<String> {
 
 /// `list_tests_all` in multi-kernel mode emits exactly ONE line
 /// for a `host_only` entry, with NO `/kernel_…` suffix. Pins the
-/// `if entry.host_only { println!("ktstr/{}: test", entry.name); }`
+/// `if entry.host_only { println!("host/{}: test", entry.name); }`
 /// branch at the top of `list_tests_all` against a regression
 /// that fell through into the kernel-suffix loop. A regression
 /// would yield 2 matches (one per kernel) and at least one line
@@ -1278,12 +1278,12 @@ fn list_tests_all_host_only_skips_kernel_suffix_under_multi_kernel() {
         n = lines.len(),
     );
     let line = &lines[0];
-    // Expected exact form (mirrors the `println!("ktstr/{}: test", entry.name)`
+    // Expected exact form (mirrors the `println!("host/{}: test", entry.name)`
     // in the host_only branch of `list_tests_all`).
     assert_eq!(
         line,
-        &format!("ktstr/{HOST_ONLY_LISTING_NAME}: test"),
-        "host_only line must be `ktstr/<name>: test` with no kernel suffix",
+        &format!("host/{HOST_ONLY_LISTING_NAME}: test"),
+        "host_only line must be `host/<name>: test` with no kernel suffix",
     );
     // Belt-and-suspenders: neither sanitized kernel label appears
     // anywhere on the line, even as a substring.
@@ -1328,8 +1328,8 @@ fn list_tests_budget_host_only_skips_kernel_suffix_under_multi_kernel() {
     let line = &lines[0];
     assert_eq!(
         line,
-        &format!("ktstr/{HOST_ONLY_LISTING_NAME}: test"),
-        "host_only candidate name must be `ktstr/<name>: test` with no kernel suffix",
+        &format!("host/{HOST_ONLY_LISTING_NAME}: test"),
+        "host_only candidate name must be `host/<name>: test` with no kernel suffix",
     );
     assert!(
         !line.contains("kernel_6_14_2") && !line.contains("kernel_6_15_0"),
@@ -1350,9 +1350,9 @@ fn list_tests_budget_host_only_skips_kernel_suffix_under_multi_kernel() {
 // cargo-ktstr resolver that produces `KTSTR_KERNEL_LIST` is
 // not on the cargo-test path.
 
-/// Under `KTSTR_CARGO_TEST_MODE=1`, `list_tests_all` emits
-/// exactly one `ktstr/{name}: test` line per registered entry
-/// — no `gauntlet/...` lines. Pins the gauntlet-skip branch.
+/// Under `KTSTR_CARGO_TEST_MODE=1`, `list_tests_all` emits exactly one
+/// `ktstr/{name}: test` line per VM entry or `host/{name}: test` line per
+/// host-only entry — no `gauntlet/...` lines. Pins the gauntlet-skip branch.
 #[test]
 fn list_tests_all_cargo_test_mode_skips_gauntlet() {
     use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
@@ -1610,9 +1610,10 @@ fn result_to_exit_code_cpu_budget_unsatisfiable_fails_even_under_expect_err() {
 /// host-insufficiency: `classify_host_error` maps it to `HostClass::Skip`
 /// (default), which `err_to_exit_code` routes to EXIT_PASS — and because
 /// the host-class match precedes the `expect_err` inversion, BOTH polarities
-/// skip. Under nextest the plain `#[test]` wrapper is suppressed, so an
-/// entry dispatches as `ktstr/{name}` via `run_named_test` ->
-/// `err_to_exit_code`; this means a developer running `cargo nextest run`,
+/// skip. Under nextest the plain `#[test]` wrapper is suppressed, so a VM
+/// entry dispatches as `ktstr/{name}` (and a host-only entry as
+/// `host/{name}`) via `run_named_test` -> `err_to_exit_code`; this means a
+/// developer running `cargo nextest run`,
 /// or `cargo ktstr test` without `--kernel`, on a kernel-less host gets a
 /// clean skip rather than a hard fail on every entry. (A requested
 /// `--kernel` that fails to build bails in cargo-ktstr before nextest
@@ -3184,6 +3185,24 @@ fn run_host_only_test_passing_entry_exits_zero() {
     );
 }
 
+/// The generated `host/<name>` namespace must route through the same
+/// host-only wrapper. This pins the execution half of the listing-name
+/// change: accepting `host/` during discovery without stripping it here
+/// would make every generated host case fail as an unknown test.
+#[test]
+fn run_named_test_accepts_host_only_namespace() {
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+    let _env_lock = lock_env();
+    let _parent = EnvVarGuard::remove(crate::KTSTR_HOST_CGROUP_PARENT_ENV);
+    let _walk = EnvVarGuard::remove(crate::KTSTR_CGROUP_WALK_ROOT_ENV);
+
+    assert_eq!(
+        run_named_test(&format!("host/{HOST_ONLY_LISTING_NAME}")),
+        0,
+        "host/<name> must dispatch the registered host-only entry without a VM",
+    );
+}
+
 // ---------------------------------------------------------------
 // run_gauntlet_test — topo derivation reached before skip gate
 // ---------------------------------------------------------------
@@ -3258,9 +3277,9 @@ fn is_ignored_honors_registered_flag_and_demo_convention() {
 /// `ktstr_list_only` (whose body is
 /// `args.iter().any(|a| a == "--ignored")` then `list_tests(ignored_only)`)
 /// reads argv for
-/// `--ignored`, then delegates to `list_tests`, which prints the
-/// `ktstr/{name}: test` names to stdout and RETURNS (unlike
-/// `ktstr_main`, which `process::exit`s). Pins the
+/// `--ignored`, then delegates to `list_tests`, which prints generated
+/// `ktstr/{name}: test` and `host/{name}: test` names to stdout and RETURNS
+/// (unlike `ktstr_main`, which `process::exit`s). Pins the
 /// return-don't-exit listing entry point against a regression that
 /// routed it through the exiting handler. The bucket
 /// (`--ignored`-only vs all) is read from the test process's own
@@ -3275,7 +3294,7 @@ fn ktstr_list_only_prints_test_names_and_returns() {
     use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
     let _env_lock = lock_env();
     // Single-kernel listing + no budget filtering so the plain
-    // `ktstr/{name}: test` shape is emitted for the host_only fixture.
+    // `host/{name}: test` shape is emitted for the host_only fixture.
     let _kernel_list = EnvVarGuard::remove(crate::KTSTR_KERNEL_LIST_ENV);
     let _budget = EnvVarGuard::remove(crate::KTSTR_BUDGET_SECS_ENV);
     let _cargo = EnvVarGuard::remove(crate::KTSTR_CARGO_TEST_MODE_ENV);
@@ -3289,7 +3308,7 @@ fn ktstr_list_only_prints_test_names_and_returns() {
 
     let (_, captured) = capture_stdout(ktstr_list_only);
     let stdout = std::str::from_utf8(&captured).expect("utf-8");
-    let want = format!("ktstr/{HOST_ONLY_LISTING_NAME}: test");
+    let want = format!("host/{HOST_ONLY_LISTING_NAME}: test");
     if ignored_only {
         // Ignored-only bucket: the non-ignored host_only fixture
         // must NOT appear; the function still returned (no exit).
@@ -3300,7 +3319,7 @@ fn ktstr_list_only_prints_test_names_and_returns() {
         );
     } else {
         // All-tests bucket: the registered host_only fixture must
-        // appear with its bare `ktstr/<name>: test` form.
+        // appear with its bare `host/<name>: test` form.
         assert!(
             stdout.contains(&want),
             "ktstr_list_only must print the registered host_only fixture's \

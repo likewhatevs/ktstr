@@ -7,7 +7,9 @@
 //!   ktstr-linked binary. Routes the process to guest init, host-side
 //!   VM launch, guest-side test execution, or nextest protocol handling.
 //! - [`ktstr_main`]: the nextest protocol handler — `--list` returns
-//!   `ktstr/` and `gauntlet/` test names, `--exact` runs a single test.
+//!   `ktstr/`, `gauntlet/`, and `host/` test names, `--exact` runs a single
+//!   test. The prefix is also a resource-admission identity: `ktstr/` and
+//!   `gauntlet/` boot VMs, while `host/` entries are ordinary host work.
 //! - [`run_ktstr_test`]: programmatic entry point used by library
 //!   consumers and the macro-generated `#[test]` wrappers.
 //! - [`analyze_sidecars`]: collects sidecar JSON from a run directory
@@ -162,8 +164,9 @@ pub fn is_topology_unrepresentable(e: &anyhow::Error) -> bool {
 /// host-insufficiency): `err_to_exit_code` and the `#[ktstr_test]` macro
 /// body both SKIP it by default, promoted to a FAIL under
 /// `KTSTR_NO_SKIP_MODE`. Under nextest the plain `#[test]` wrapper is
-/// suppressed, so an entry dispatches as `ktstr/{name}` via `run_named_test`
-/// → `err_to_exit_code` — meaning a developer running `cargo nextest run`,
+/// suppressed, so a VM entry dispatches as `ktstr/{name}` (and a host-only
+/// entry as `host/{name}`) via `run_named_test` → `err_to_exit_code` —
+/// meaning a developer running `cargo nextest run`,
 /// or `cargo ktstr test` without `--kernel`, on a kernel-less host gets a
 /// clean skip rather than a hard fail on every entry. This cannot mask a CI
 /// kernel-build failure: a requested `--kernel` that fails to build bails in
@@ -495,7 +498,7 @@ pub fn ktstr_test_early_dispatch() {
     // those test names are silently dropped from the listing.
     //
     // For `--exact`, ktstr_main runs only when the test name starts
-    // with `ktstr/` or `gauntlet/` — names ktstr owns. Other names
+    // with `ktstr/`, `gauntlet/`, or `host/` — names ktstr owns. Other names
     // (libtest #[test] items, including the per-entry wrappers
     // emitted by `#[ktstr_test]` itself) fall through to libtest's
     // dispatch. Without this guard, run_named_test would fail
@@ -533,18 +536,21 @@ pub fn ktstr_test_early_dispatch() {
                 std::process::exit(code);
             } else if let Some(pos) = args.iter().position(|a| a == "--exact")
                 && let Some(name) = args.get(pos + 1)
-                && (name.starts_with("ktstr/") || name.starts_with("gauntlet/"))
+                && (name.starts_with("ktstr/")
+                    || name.starts_with("gauntlet/")
+                    || name.starts_with("host/"))
             {
                 let bare = name
                     .strip_prefix("ktstr/")
                     .or_else(|| name.strip_prefix("gauntlet/"))
+                    .or_else(|| name.strip_prefix("host/"))
                     .unwrap_or(name)
                     .split('/')
                     .next()
                     .unwrap_or(name);
 
                 // Reject malformed names like `gauntlet/` (trailing
-                // slash, no test name) and `ktstr/` up front, so the
+                // slash, no test name), `ktstr/`, and `host/` up front, so the
                 // operator sees a clear error instead of an opaque
                 // "unknown test" from the empty bare name.
                 if bare.is_empty() {
@@ -1606,7 +1612,8 @@ fn for_each_gauntlet_variant<F>(
 ///
 /// `KTSTR_CARGO_TEST_MODE=1` skips gauntlet variant emission and
 /// the multi-kernel suffix path: each test gets exactly one
-/// `ktstr/{name}: test` line. Bare `cargo test` doesn't have
+/// `ktstr/{name}: test` line for VM tests or `host/{name}: test` for
+/// host-only tests. Bare `cargo test` doesn't have
 /// access to the cargo-ktstr resolver that produces
 /// `KTSTR_KERNEL_LIST`, so the multi-kernel branch can't apply
 /// even if it were enabled — pin both behaviors explicitly so
@@ -1644,7 +1651,7 @@ fn list_tests_all(ignored_only: bool) {
 
         if !ignored_only || is_ignored(entry) {
             if entry.host_only {
-                println!("ktstr/{}: test", entry.name);
+                println!("host/{}: test", entry.name);
             } else {
                 for suffix in &kernel_suffixes {
                     if suffix.is_empty() {
@@ -2524,7 +2531,7 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
             // the same host-side function.
             if entry.host_only {
                 candidates.push(TestCandidate {
-                    name: format!("ktstr/{}: test", entry.name),
+                    name: format!("host/{}: test", entry.name),
                     features: extract_features(entry, &base_topo, false, entry.name),
                     estimated_secs: estimate_duration(entry, &base_topo),
                 });
@@ -2667,8 +2674,9 @@ fn export_kernel_for_variant(entry: &KernelEntry) {
 
 /// Parse a nextest-style test name and run it.
 ///
-/// Handles base tests (`ktstr/{name}`), gauntlet variants
-/// (`gauntlet/{name}/{preset}`), and bare names (backward compat).
+/// Handles VM base tests (`ktstr/{name}`), host-only tests (`host/{name}`),
+/// gauntlet variants (`gauntlet/{name}/{preset}`), and bare names (backward
+/// compatibility).
 /// When `KTSTR_KERNEL_LIST` carries 2+ kernels,
 /// VM-bound test names additionally end with
 /// `/{sanitized_kernel_label}` — that suffix is peeled here and
@@ -2676,7 +2684,7 @@ fn export_kernel_for_variant(entry: &KernelEntry) {
 /// [`crate::KTSTR_KERNEL_ENV`] before the dispatch continues. `host_only`
 /// tests are short-circuited BEFORE the suffix peel: they never
 /// boot a VM, so the kernel-suffix listing path emits one
-/// `ktstr/{name}: test` entry without a kernel suffix regardless
+/// `host/{name}: test` entry without a kernel suffix regardless
 /// of the kernel-list cardinality (see `list_tests_all` /
 /// `list_tests_budget`), and routing them through
 /// `strip_kernel_suffix` would surface as a "no recognised kernel
@@ -2687,7 +2695,7 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
     // host_only short-circuit: in multi-kernel mode, host_only tests
     // are listed without a `/{sanitized_kernel_label}` suffix (see
     // `list_tests_all` / `list_tests_budget`, which emit a single
-    // `ktstr/{name}: test` line for host_only entries regardless of
+    // `host/{name}: test` line for host_only entries regardless of
     // the kernel-list cardinality — a host_only test never boots a
     // VM, so the kernel never affects what runs). Calling
     // `strip_kernel_suffix` on such a name in multi-kernel mode
@@ -2699,7 +2707,10 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
     // VM-bound tests. Single-kernel mode is unaffected — the
     // pass-through arm in `strip_kernel_suffix` returns the input
     // verbatim either way.
-    let bare_for_lookup = test_name.strip_prefix("ktstr/").unwrap_or(test_name);
+    let bare_for_lookup = test_name
+        .strip_prefix("host/")
+        .or_else(|| test_name.strip_prefix("ktstr/"))
+        .unwrap_or(test_name);
 
     if let Some(entry) = find_test(bare_for_lookup)
         && entry.host_only
@@ -2722,7 +2733,10 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
         return run_gauntlet_test(rest);
     }
 
-    let bare_name = test_name.strip_prefix("ktstr/").unwrap_or(test_name);
+    let bare_name = test_name
+        .strip_prefix("host/")
+        .or_else(|| test_name.strip_prefix("ktstr/"))
+        .unwrap_or(test_name);
     let entry = match find_test(bare_name) {
         Some(e) => e,
         None => {
@@ -3144,11 +3158,12 @@ fn ktstr_list_only() {
 /// under nextest with `--exact <ktstr_or_gauntlet_name>`.
 /// Not intended for direct use.
 ///
-/// - `--list --format terse`: output `ktstr/{name}: test\n` for base
-///   tests and `gauntlet/{name}/{preset}: test\n` for gauntlet
-///   variants. (Discovery uses `ktstr_list_only` instead to allow
-///   libtest to print its own list afterward; this branch is
-///   preserved for direct callers of `ktstr_main`.)
+/// - `--list --format terse`: output `ktstr/{name}: test\n` for VM base
+///   tests, `host/{name}: test\n` for host-only tests, and
+///   `gauntlet/{name}/{preset}: test\n` for gauntlet variants. (Discovery
+///   uses `ktstr_list_only` instead to allow libtest to print its own list
+///   afterward; this branch is preserved for direct callers of
+///   `ktstr_main`.)
 /// - `--exact NAME --nocapture`: run the named test, exit 0/1.
 pub fn ktstr_main() -> ! {
     let args: Vec<String> = std::env::args().collect();

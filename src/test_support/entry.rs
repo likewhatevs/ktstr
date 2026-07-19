@@ -1713,7 +1713,9 @@ impl Scheduler {
 /// register via [`KTSTR_TESTS`].
 #[derive(Debug)]
 pub struct KtstrTestEntry {
-    /// Fully qualified test name as it appears in nextest output.
+    /// Bare registered test name. Discovery prefixes VM entries with
+    /// `ktstr/`, host-only entries with `host/`, and generated topology
+    /// variants with `gauntlet/`.
     pub name: &'static str,
     /// Entry point invoked once per replica, inside the guest VM when
     /// `host_only` is false and on the host when it is true.
@@ -1999,10 +2001,10 @@ pub struct KtstrTestEntry {
     /// `#[ktstr_test(ignore)]` / `#[ktstr_test(ignore = true)]`.
     ///
     /// This lives on the registered entry in addition to the generated
-    /// libtest wrapper's `#[ignore]`: cargo-ktstr discovers `ktstr/<name>`
-    /// cases from [`KTSTR_TESTS`], so the
-    /// custom listing path must carry the same bit or it would run an ignored
-    /// VM fixture by default.
+    /// libtest wrapper's `#[ignore]`: cargo-ktstr discovers generated
+    /// `ktstr/<name>` VM cases and `host/<name>` host-only cases from
+    /// [`KTSTR_TESTS`], so the custom listing path must carry the same bit or
+    /// it would run an ignored fixture by default.
     pub ignored: bool,
     /// Extra host-side file specs beyond what the entry's
     /// [`scheduler`](Self::scheduler) / [`payload`](Self::payload) /
