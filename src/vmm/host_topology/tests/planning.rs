@@ -1014,6 +1014,35 @@ fn discover_excludes_self_pid_from_holder_count() {
     let _ = child.wait();
 }
 
+#[test]
+fn count_only_discover_resolves_no_holder_cmdlines() {
+    let _llc_prefix = LlcLockPrefixGuard::new();
+    let topo = HostTopology::new_for_tests(&[(vec![0], 0)]);
+    let allowed: std::collections::BTreeSet<usize> = [0usize].into_iter().collect();
+    let path = llc_lock_path(0);
+    crate::flock::materialize(&path).expect("materialize count-only lockfile");
+    let _held = try_flock(&path, FlockMode::Shared)
+        .expect("open count-only lockfile")
+        .expect("hold count-only lockfile");
+    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo");
+    let before = crate::flock::proc_locks::batch_holder_info_resolution_count_for_tests();
+    let snapshots = discover_llc_snapshot_counts(&topo, &allowed, &mountinfo)
+        .expect("count-only LLC discovery");
+    let after = crate::flock::proc_locks::batch_holder_info_resolution_count_for_tests();
+    assert_eq!(
+        after, before,
+        "normal placement must not resolve HolderInfo/cmdline data",
+    );
+    assert_eq!(
+        snapshots[0].holder_count, 0,
+        "PID-only discovery must still exclude this process from placement counts",
+    );
+    assert!(
+        snapshots[0].holders.is_empty(),
+        "count-only snapshots intentionally carry no diagnostic enrichment",
+    );
+}
+
 /// The plan `acquire_llc_plan` returns carries its `LOCK_SH` flock
 /// fds LIVE: held through the plan's lifetime, visible to a peer's
 /// `/proc/locks` read, and released on drop. This is the precondition
@@ -1217,6 +1246,58 @@ fn acquire_llc_plan_retry_succeeds_on_attempt_one() {
     assert_eq!(plan.locked_llcs, vec![0]);
 }
 
+/// Once the outer LLC-plan path owns the real reservation fds, acquisition is
+/// committed. Cancellation racing immediately after the final flock succeeds
+/// must not replace that success with `Interrupted` and silently discard the
+/// reservation. The protocol-level granted/coordinator tests pin the registry
+/// commit boundary; this test pins the caller above those branches.
+#[test]
+fn acquire_llc_plan_commit_is_terminal_when_cancellation_arrives_after_lock_acquire() {
+    let _llc_prefix = LlcLockPrefixGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![93550]);
+    let topo = synth_host_topo(&[(vec![93550], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(1, 1);
+    let cancelled = AtomicBool::new(false);
+
+    let plan = acquire_llc_plan_with_acquire_fn(
+        &topo,
+        &test_topo,
+        None,
+        PlacementPolicy::Consolidate,
+        false,
+        Some(&cancelled),
+        |selected, snapshots| {
+            let acquired = try_acquire_llc_plan_locks(selected, snapshots)?;
+            assert!(
+                acquired.is_some(),
+                "fresh isolated lock pool must commit on its first probe",
+            );
+            cancelled.store(true, Ordering::Release);
+            Ok(acquired)
+        },
+    )
+    .expect("post-commit cancellation must not replace LLC-plan success");
+
+    assert!(
+        cancelled.load(Ordering::Acquire),
+        "seam must inject cancellation after the real flock succeeds",
+    );
+    assert_eq!(plan.locked_llcs, vec![0]);
+    assert_eq!(plan.locks.len(), 1);
+    assert!(
+        try_flock(llc_lock_path(0), FlockMode::Exclusive)
+            .expect("probe live LLC reservation")
+            .is_none(),
+        "returned plan must retain ownership despite post-commit cancellation",
+    );
+
+    drop(plan);
+    let released = try_flock(llc_lock_path(0), FlockMode::Exclusive)
+        .expect("probe dropped LLC reservation")
+        .expect("dropping the successful plan must release its reservation");
+    drop(released);
+}
+
 /// TOCTOU retry EXHAUSTED path via the acquire-fn seam: every
 /// attempt returns `Ok(None)`. After
 /// `ACQUIRE_MAX_TOCTOU_RETRIES + 1` attempts, the outer loop
@@ -1271,16 +1352,9 @@ fn acquire_llc_plan_retry_exhausted_bails_with_resource_contention() {
     );
 }
 
-/// Fast-phase seam contract under `wait = true`: the `acquire_fn`
-/// seam belongs to the FAST PHASE ONLY — exactly
-/// `ACQUIRE_MAX_TOCTOU_RETRIES + 1` calls — after which the wait
-/// phase acquires through the protocol head engine against REAL
-/// lockfiles, independent of the seam. The closure always bounces
-/// (simulating fast-path contention) while the real lockfile pool is
-/// free, so the head's first sweep completes immediately: the
-/// acquisition must SUCCEED even though the seam never returned
-/// locks. Before the queue design, a bouncing acquire_fn meant
-/// guaranteed failure; this pins the phase split.
+/// A waiting caller performs one real fast attempt, then uses the registry as
+/// its retry mechanism. The seam always bounces while the real lockfile pool is
+/// free, so the elected coordinator completes immediately.
 #[test]
 fn acquire_llc_plan_wait_phase_acquires_beyond_the_seam() {
     let _llc_prefix = LlcLockPrefixGuard::new();
@@ -1306,9 +1380,8 @@ fn acquire_llc_plan_wait_phase_acquires_beyond_the_seam() {
     .expect("wait phase must acquire via real lockfiles after the fast phase exhausts");
     assert_eq!(
         counter.get(),
-        ACQUIRE_MAX_TOCTOU_RETRIES + 1,
-        "acquire_fn is a fast-phase seam: exactly TOCTOU+1 calls, \
-         never invoked by the head engine",
+        1,
+        "waiting acquisition must make exactly one fast attempt before registry admission",
     );
     assert_eq!(plan.locked_llcs, vec![0]);
     assert_eq!(
@@ -1316,6 +1389,151 @@ fn acquire_llc_plan_wait_phase_acquires_beyond_the_seam() {
         1,
         "head-acquired LOCK_SH fd rides the plan"
     );
+}
+
+#[test]
+fn registered_claim_fast_fails_without_acquire_or_diagnostic_enrichment() {
+    let _llc_prefix = LlcLockPrefixGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![93750]);
+    let topo = synth_host_topo(&[(vec![93750], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(1, 1);
+    let claim = protocol::ClaimSet::new([0usize], std::iter::empty(), FlockMode::Exclusive);
+    let coordinator = match protocol::register_ticket_or_acquire(claim.clone(), claim, None, |_| {
+        Ok::<Option<()>, anyhow::Error>(None)
+    })
+    .expect("register exclusive LLC claim")
+    {
+        protocol::TicketWork::Coordinator(coordinator) => coordinator,
+        protocol::TicketWork::Acquired(()) => panic!("fresh registry must elect a coordinator"),
+    };
+    let attempts = std::cell::Cell::new(0usize);
+    let enrichment_before =
+        crate::flock::proc_locks::batch_holder_info_resolution_count_for_tests();
+    let error = acquire_llc_plan_with_acquire_fn(
+        &topo,
+        &test_topo,
+        None,
+        PlacementPolicy::Consolidate,
+        false,
+        None,
+        |_, _| {
+            attempts.set(attempts.get() + 1);
+            Ok(None)
+        },
+    )
+    .expect_err("a covering registered claim must fail fast");
+    assert!(error.downcast_ref::<ResourceContention>().is_some());
+    assert_eq!(
+        attempts.get(),
+        0,
+        "aggregate-proven claim contention must not touch the real acquire seam",
+    );
+    assert_eq!(
+        crate::flock::proc_locks::batch_holder_info_resolution_count_for_tests(),
+        enrichment_before,
+        "aggregate-proven contention must not run enriched final diagnostics",
+    );
+    drop(coordinator);
+}
+
+#[test]
+fn waiting_handoff_publishes_ticket_before_releasing_old_locks() {
+    let _llc_prefix = LlcLockPrefixGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![93775]);
+    let topo = synth_host_topo(&[(vec![93775], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(1, 1);
+    let blocker = try_flock(llc_lock_path(0), FlockMode::Exclusive)
+        .expect("open build-time blocker")
+        .expect("hold build-time blocker");
+    let handed_off = std::cell::Cell::new(false);
+    let attempts = std::cell::Cell::new(0usize);
+    let enrichment_before =
+        crate::flock::proc_locks::batch_holder_info_resolution_count_for_tests();
+    let plan = acquire_llc_plan_with_acquire_fn_and_handoff(
+        &topo,
+        &test_topo,
+        None,
+        PlacementPolicy::Spread { rotation: 0 },
+        true,
+        None,
+        Some(|| {
+            let records = protocol::ticket_registry_snapshot_for_tests()
+                .expect("handoff hook must be able to read the published ticket");
+            assert_eq!(
+                records.len(),
+                1,
+                "replacement ticket must be durable before inherited locks release",
+            );
+            handed_off.set(true);
+            drop(blocker);
+        }),
+        |selected, snapshots| {
+            assert!(
+                !handed_off.get(),
+                "old reservations must remain held through the fast probe",
+            );
+            attempts.set(attempts.get() + 1);
+            try_acquire_llc_plan_locks(selected, snapshots)
+        },
+    )
+    .expect("handoff release must let the registered coordinator acquire");
+    assert!(
+        handed_off.get(),
+        "contention must invoke the post-publication handoff"
+    );
+    assert_eq!(
+        attempts.get(),
+        1,
+        "handoff waiting path must make exactly one fast acquire call",
+    );
+    assert_eq!(
+        crate::flock::proc_locks::batch_holder_info_resolution_count_for_tests(),
+        enrichment_before,
+        "waiting handoff must use count-only discovery",
+    );
+    assert_eq!(plan.locked_llcs, vec![0]);
+}
+
+#[test]
+fn waiting_handoff_releases_inherited_locks_on_acquire_error() {
+    let _llc_prefix = LlcLockPrefixGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![93776]);
+    let topo = synth_host_topo(&[(vec![93776], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(1, 1);
+    let inherited = try_flock(llc_lock_path(0), FlockMode::Shared)
+        .expect("open inherited reservation")
+        .expect("hold inherited reservation");
+    let handed_off = std::cell::Cell::new(false);
+    let handed_off_in_hook = &handed_off;
+
+    let error = acquire_llc_plan_with_acquire_fn_and_handoff(
+        &topo,
+        &test_topo,
+        None,
+        PlacementPolicy::Spread { rotation: 0 },
+        true,
+        None,
+        Some(move || {
+            handed_off_in_hook.set(true);
+            drop(inherited);
+        }),
+        |_, _| anyhow::bail!("injected runtime replan failure"),
+    )
+    .expect_err("injected acquisition error must propagate");
+    assert!(
+        error
+            .to_string()
+            .contains("injected runtime replan failure"),
+        "unexpected handoff error: {error:#}"
+    );
+    assert!(
+        handed_off.get(),
+        "every error exit must drain inherited no-perf reservations"
+    );
+    let released = try_flock(llc_lock_path(0), FlockMode::Exclusive)
+        .expect("probe released inherited reservation")
+        .expect("inherited reservation must not survive an acquisition error");
+    drop(released);
 }
 
 /// `plan_from_snapshots` MUST-CONSOLIDATE invariant: on a

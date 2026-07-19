@@ -72,9 +72,9 @@ The switch is gated by two conditions, evaluated per occupied host LLC:
 
 Both must hold on *every* LLC the plan touches; one modest or
 cell-filling LLC keeps the whole plan exclusive. Per-CPU-grain perf cells
-flow through the same acquisition queue and claim protocol as every other
-reservation (see below) — a queued grain cell holds nothing, and its head
-partials are the plan's exact per-CPU locks.
+flow through the same admission registry and exact-claim protocol as every
+other reservation (see below) — a waiting grain cell holds nothing, and
+coordinator partials are the plan's exact per-CPU locks.
 
 Lockfiles live at `{KTSTR_LOCK_DIR or /tmp}/ktstr-llc-{N}.lock` and
 `{KTSTR_LOCK_DIR or /tmp}/ktstr-cpu-{C}.lock`. The modes compose:
@@ -135,7 +135,7 @@ exclusive reservation, and never contends with its own cells' locks.
   </g>
 </svg></div>
 
-## The queue: a second-order scheduler under nextest
+## Admission registry: a second-order scheduler under nextest
 
 nextest is a pure spawner: it launches every test process at once and
 retries failures. The lock dir is the actual scheduler — it decides
@@ -146,38 +146,41 @@ makes this work across disjoint invocations sharing one
 
 - **Fast path.** Every acquirer first tries its whole planned lock
   set non-blocking, all-or-nothing, in canonical lock order — cells
-  satisfiable *right now* never queue, and no fast-path partial ever
+  satisfiable *right now* never register, and no fast-path partial ever
   persists (everything is released on any bounce).
-- **The queue.** A bounced acquirer joins a single queue flock in the
-  lock dir (arrival order via the kernel's flock wait queue; tickets
-  are flocks, so a crashed waiter vanishes with its process). Waiters
-  are cheap: acquisition runs *before* VM setup, so a queued cell
-  holds a ticket and an inotify fd — no guest memory, no vCPUs. That
-  is what lets nextest admit hundreds of cells at once.
-- **The head license.** The queue holder — the head — is the only
-  agent anywhere allowed to hold a *partial* lock set while waiting
-  for more. One incremental acquirer cannot deadlock (a cycle needs
-  two holders-waiting) and cannot starve (it only accumulates), which
-  is the protocol's core safety argument.
-- **Re-plan on every wake.** The head sleeps on an inotify watch of
-  the lock dir; any lockfile release wakes it, and it re-plans
+- **The v4 registry.** A bounced acquirer publishes one monotonic
+  fixed-size ticket containing its exact CPU/LLC claim. Ordinary
+  tickets sleep on targeted shared futex words; only one elected
+  coordinator owns exact resource-release watches. Acquisition runs
+  *before* VM setup, so a
+  waiting cell holds no guest memory or vCPUs. Per-ticket liveness
+  flocks make abrupt process death recoverable.
+- **Work-conserving grants.** The coordinator scans tickets in arrival
+  order. A ticket may run as soon as its exact claim is compatible
+  with every earlier live claim, so disjoint work passes blocked work
+  without weakening CPU exclusivity or the LLC `LOCK_SH`/`LOCK_EX`
+  matrix.
+- **The coordinator license.** The elected coordinator is the only
+  agent allowed to retain a *partial* lock set while waiting for more.
+  One incremental acquirer cannot form a deadlock cycle.
+- **Re-plan on every wake.** The coordinator sleeps on filtered
+  inotify events for resource releases and explicit registry
+  notifications, then re-plans
   against *live* holder state — plans are never cached across waits,
   so a freed resource that satisfies a different plan than the one
   that was busy is taken immediately. Partials the fresh plan still
   needs are kept; only abandoned ones release.
-- **Claims.** The head publishes its current target set; fast-path
-  planners in every process subtract it from their view of free
-  capacity, so nobody snipes the slots the head is accumulating —
-  while any *other* free capacity stays fair game (work conservation:
-  a small `LOCK_SH` cell never waits behind a hungry `LOCK_EX` head
-  it doesn't overlap).
+- **Exact claim fencing.** A shared registry fence spans the aggregate
+  claim check and the real all-or-nothing flock probe. No ticket can
+  publish in that gap, and a fast path cannot snipe an earlier exact
+  reservation.
 - **Lifecycle-owned bounds.** The lock layer waits for the
   authoritative flock release. It cannot infer that a live holder is
   wedged from elapsed wall time: coverage instrumentation, host
   preemption, and a legitimately long cell make that inference false.
   A crash releases flocks in the kernel, the holder's VM watchdog
   bounds guest progress, and nextest's slow-timeout is the final
-  process-lifecycle rail. One slow healthy holder therefore cannot
+  process-lifecycle bound. One slow healthy holder therefore cannot
   fail every waiter behind it.
 
 When the default path cannot map its topology 1:1 onto the host at
@@ -284,9 +287,9 @@ Budgeted acquisition runs three phases:
    all-or-nothing. If any lock is busy, every held lock is dropped
    and the whole cycle retries a few times with short ascending
    backoff (absorbing plan/acquire races). Test-run acquisition then
-   joins the acquisition queue and completes as head — re-running
+   joins the admission registry and completes as coordinator — re-running
    DISCOVER → PLAN against live holder state on every lock-dir wake
-   (see the queue section above); build-time and interactive
+   (see the admission-registry section above); build-time and interactive
    acquisition stop at the short backoff and bail with a
    `ResourceContention` error naming the winning holders.
 

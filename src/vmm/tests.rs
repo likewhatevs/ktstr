@@ -500,6 +500,82 @@ fn acquire_default_run_locks_overcommits_when_host_too_small() {
     assert!(rl.no_perf_cpus.is_none());
 }
 
+#[test]
+fn default_candidate_scan_reuses_one_aggregate_snapshot_and_fences_survivors() {
+    struct ResetOverrides;
+    impl Drop for ResetOverrides {
+        fn drop(&mut self) {
+            host_topology::ALLOWED_CPUS_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+            host_topology::LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+            host_topology::CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    let temp = tempfile::TempDir::new().expect("default-scan tempdir");
+    host_topology::ALLOWED_CPUS_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(vec![0, 1, 2, 3]));
+    host_topology::LLC_LOCK_PREFIX_OVERRIDE.with(|slot| {
+        *slot.borrow_mut() = Some(format!("{}/llc-", temp.path().display()));
+    });
+    host_topology::CPU_LOCK_PREFIX_OVERRIDE.with(|slot| {
+        *slot.borrow_mut() = Some(format!("{}/cpu-", temp.path().display()));
+    });
+    let _reset = ResetOverrides;
+
+    let claim = host_topology::protocol::ClaimSet::new(
+        std::iter::empty(),
+        0usize..4,
+        crate::flock::FlockMode::Exclusive,
+    );
+    let coordinator = match host_topology::protocol::register_ticket_or_acquire(
+        claim.clone(),
+        claim,
+        None,
+        |_| Ok::<Option<()>, anyhow::Error>(None),
+    )
+    .expect("register union CPU claim")
+    {
+        host_topology::protocol::TicketWork::Coordinator(coordinator) => coordinator,
+        host_topology::protocol::TicketWork::Acquired(()) => {
+            panic!("fresh registry must elect a coordinator")
+        }
+    };
+    let host = host_topology::HostTopology::new_for_tests(&[(vec![0, 1, 2, 3], 0)]);
+    let topo = Topology::new(1, 1, 1, 1);
+    let snapshot_before = host_topology::protocol::aggregate_snapshot_read_count_for_tests();
+    let probe_before = host_topology::authoritative_registry_probe_count_for_tests();
+    let error = match KtstrVm::acquire_default_run_locks(Some(&host), &topo, false) {
+        Ok(_) => panic!("the union claim must fence every default CPU window"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .downcast_ref::<host_topology::ResourceContention>()
+            .is_some(),
+        "all locally fenced candidates must report contention: {error:#}",
+    );
+    assert_eq!(
+        host_topology::protocol::aggregate_snapshot_read_count_for_tests() - snapshot_before,
+        1,
+        "the full default candidate scan must copy aggregates once",
+    );
+    assert_eq!(
+        host_topology::authoritative_registry_probe_count_for_tests() - probe_before,
+        0,
+        "locally fenced windows must not reopen the authoritative registry fence",
+    );
+
+    drop(coordinator);
+    let probe_before = host_topology::authoritative_registry_probe_count_for_tests();
+    let acquired = KtstrVm::acquire_default_run_locks(Some(&host), &topo, false)
+        .expect("an unfenced default candidate must acquire");
+    assert_eq!(
+        host_topology::authoritative_registry_probe_count_for_tests() - probe_before,
+        1,
+        "the selected unfenced window must still use the authoritative fence",
+    );
+    drop(acquired);
+}
+
 /// degrade_contention_to_overcommit converts a transient ResourceContention
 /// into a lock-free best-effort RunLocks: the one-shot shell deliberately
 /// does not park on a peer's LOCK_EX (no wait deadline, no nextest retry),

@@ -1227,7 +1227,7 @@ impl KtstrVm {
     /// [`host_topology::protocol`]) instead of surfacing contention;
     /// the interactive path passes `false` for the single-shot
     /// fast-path-only behaviour. The holder's VM watchdog and
-    /// nextest process rail own lifecycle bounds; the lock layer
+    /// nextest process lifecycle owns the lifecycle bounds; the lock layer
     /// never turns a slow live holder into `ResourceContention`.
     ///
     /// Branch table (mirrors `build()`'s plan switch):
@@ -1301,44 +1301,32 @@ impl KtstrVm {
                     // one it fed `acquire_llc_plan` — a distinct probe of
                     // the same static topology, not a stashed handle.
                     let test_topo = crate::topology::TestTopology::from_system()?;
-                    // `no_perf_effective_cap` is the exact budget the
-                    // build-time plan targeted, so the replan reserves the
-                    // same SIZE. Two-stage under `wait`: a non-blocking
-                    // fast-path replan first (build-time `LOCK_SH` fds
-                    // still held — peers' holder counts stay truthful);
-                    // on contention, release the build-time fds before
-                    // registering. A waiting ticket must hold no resource
-                    // locks: retaining `LOCK_SH` on an LLC while a perf-mode
-                    // coordinator wants `LOCK_EX` would create a real
-                    // hold-and-wait cycle. A waiting cell owns nothing yet.
-                    // Residual `ResourceContention` (and every other
-                    // `acquire_llc_plan` error) propagates verbatim for
-                    // the classifier's retryable-failure routing.
-                    let fresh = match host_topology::acquire_llc_plan(
-                        host_topo,
-                        &test_topo,
-                        self.no_perf_effective_cap,
-                        host_topology::PlacementPolicy::spread_for_process(),
-                        false,
-                    ) {
-                        Ok(plan) => plan,
-                        Err(e)
-                            if wait
-                                && e.downcast_ref::<host_topology::ResourceContention>()
-                                    .is_some() =>
-                        {
-                            drop(std::mem::take(
-                                &mut *self.no_perf_build_locks.lock().unwrap(),
-                            ));
-                            host_topology::acquire_llc_plan(
-                                host_topo,
-                                &test_topo,
-                                self.no_perf_effective_cap,
-                                host_topology::PlacementPolicy::spread_for_process(),
-                                true,
-                            )?
-                        }
-                        Err(e) => return Err(e),
+                    // `no_perf_effective_cap` is the exact build-time budget.
+                    // A waiting run performs one fast replan while the build
+                    // SH fds still make holder counts truthful. On
+                    // contention, the handoff publishes the replacement exact
+                    // ticket before dropping those fds; fast success instead
+                    // keeps acquire-before-release continuity below.
+                    let fresh = if wait {
+                        host_topology::acquire_llc_plan_with_wait_handoff(
+                            host_topo,
+                            &test_topo,
+                            self.no_perf_effective_cap,
+                            host_topology::PlacementPolicy::spread_for_process(),
+                            || {
+                                drop(std::mem::take(
+                                    &mut *self.no_perf_build_locks.lock().unwrap(),
+                                ));
+                            },
+                        )?
+                    } else {
+                        host_topology::acquire_llc_plan(
+                            host_topo,
+                            &test_topo,
+                            self.no_perf_effective_cap,
+                            host_topology::PlacementPolicy::spread_for_process(),
+                            false,
+                        )?
                     };
                     // Move the RAII fds into `RunLocks` so they release at
                     // end-of-run, and carry the refreshed CPUs so the mask
@@ -1490,7 +1478,7 @@ impl KtstrVm {
     ///   overlap with already-held locks, ties to the pid-staggered
     ///   scan order) under the coordinator license, publishing it as the
     ///   exact claim. It waits for the authoritative flock release; the
-    ///   holder's VM watchdog and nextest process rail own lifecycle
+    ///   holder's VM watchdog and nextest process lifecycle own
     ///   bounds, so host preemption cannot be misclassified as
     ///   contention.
     ///
@@ -1503,6 +1491,25 @@ impl KtstrVm {
         host_topo: Option<&host_topology::HostTopology>,
         topology: &Topology,
         wait: bool,
+    ) -> Result<RunLocks> {
+        Self::acquire_default_run_locks_impl(host_topo, topology, wait, None)
+    }
+
+    #[cfg(test)]
+    fn acquire_default_run_locks_interruptible(
+        host_topo: Option<&host_topology::HostTopology>,
+        topology: &Topology,
+        wait: bool,
+        cancelled: &AtomicBool,
+    ) -> Result<RunLocks> {
+        Self::acquire_default_run_locks_impl(host_topo, topology, wait, Some(cancelled))
+    }
+
+    fn acquire_default_run_locks_impl(
+        host_topo: Option<&host_topology::HostTopology>,
+        topology: &Topology,
+        wait: bool,
+        cancelled: Option<&AtomicBool>,
     ) -> Result<RunLocks> {
         let Some(host_topo) = host_topo else {
             // No cached host topology (sysfs unreadable at build time): no
@@ -1549,15 +1556,39 @@ impl KtstrVm {
                 topology.total_cpus() as usize,
             ));
         }
-        // FAST PATH: one non-blocking, all-or-nothing bounce per
-        // candidate (claim subtraction happens inside).
-        for candidate in &candidates {
-            match host_topology::acquire_resource_locks(
+        // Copy the registry aggregates once for the whole candidate window.
+        // Local filtering avoids one SH flock/open/mmap per already-fenced CPU
+        // window; every candidate that survives still enters its authoritative
+        // shared fence around the real all-or-nothing flock probe.
+        let claims: Vec<_> = candidates
+            .iter()
+            .map(|candidate| {
+                host_topology::resource_claim(
+                    &candidate.llc_indices,
+                    candidate,
+                    host_topology::LlcLockMode::Shared,
+                )
+            })
+            .collect();
+        let required = host_topology::protocol::ClaimSet::new(
+            claims.iter().flat_map(|claim| claim.llcs.iter().copied()),
+            claims.iter().flat_map(|claim| claim.cpus.iter().copied()),
+            crate::flock::FlockMode::Shared,
+        );
+        let aggregate = host_topology::protocol::registered_claim_snapshot(&required)?;
+        let mut contention = host_topology::protocol::ContentionSet::default();
+        // FAST PATH: one non-blocking, all-or-nothing bounce per locally
+        // eligible candidate.
+        for (candidate, claim) in candidates.iter().zip(&claims) {
+            if aggregate.conflicts(claim)? {
+                continue;
+            }
+            match host_topology::try_acquire_all(
                 candidate,
                 &candidate.llc_indices,
                 host_topology::LlcLockMode::Shared,
             )? {
-                host_topology::LockOutcome::Acquired { locks, .. } => {
+                host_topology::TryAcquireAll::Acquired(locks) => {
                     return Ok(RunLocks {
                         locks,
                         default_cpu_mask: None,
@@ -1565,7 +1596,11 @@ impl KtstrVm {
                         no_perf_cpus: None,
                     });
                 }
-                host_topology::LockOutcome::Unavailable(_) => continue,
+                host_topology::TryAcquireAll::Contended {
+                    evidence: Some(evidence),
+                    ..
+                } => contention.insert(evidence),
+                host_topology::TryAcquireAll::Contended { evidence: None, .. } => {}
             }
         }
         if !wait {
@@ -1578,7 +1613,7 @@ impl KtstrVm {
         }
         // Contended: register while holding nothing, then acquire as the
         // elected coordinator.
-        Self::acquire_default_as_coordinator(&candidates)
+        Self::acquire_default_as_coordinator(&candidates, contention, cancelled)
     }
 
     /// Registry/coordinator phase of [`Self::acquire_default_run_locks`]:
@@ -1587,10 +1622,12 @@ impl KtstrVm {
     /// unit.
     fn acquire_default_as_coordinator(
         candidates: &[host_topology::PinningPlan],
+        contention: host_topology::protocol::ContentionSet,
+        cancelled: Option<&AtomicBool>,
     ) -> Result<RunLocks> {
         use host_topology::protocol;
         // Pre-compute each candidate's canonical lock order and claim.
-        let targets: Vec<Vec<(String, crate::flock::FlockMode)>> = candidates
+        let targets: Vec<Vec<protocol::ResourceLock>> = candidates
             .iter()
             .map(|c| {
                 let mut cpus: Vec<usize> = c.assignments.iter().map(|&(_, cpu)| cpu).collect();
@@ -1624,31 +1661,41 @@ impl KtstrVm {
             claims.iter().flat_map(|claim| claim.cpus.iter().copied()),
             crate::flock::FlockMode::Shared,
         );
-        let ticket =
-            protocol::register_ticket_or_acquire(claims[0].clone(), watch_claim, None, |probe| {
-                let index = claims
-                    .iter()
-                    .position(|claim| claim == probe.designated())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("queue designated an unknown default placement")
-                    })?;
-                let candidate = &candidates[index];
-                if let Some(locks) = probe.try_acquire(&claims[index], || {
-                    match host_topology::acquire_resource_locks_granted(
-                        candidate,
-                        &candidate.llc_indices,
-                        host_topology::LlcLockMode::Shared,
-                    )? {
-                        host_topology::LockOutcome::Acquired { locks, .. } => Ok(Some(locks)),
-                        host_topology::LockOutcome::Unavailable(_) => Ok(None),
-                    }
-                })? {
-                    return Ok(Some((index, locks)));
-                }
-                let next = (index + 1) % claims.len();
-                probe.reserve(&claims[next])?;
-                Ok(None)
-            })?;
+        let register = |probe: &mut protocol::GrantedProbe| {
+            let index = claims
+                .iter()
+                .position(|claim| claim == probe.designated())
+                .ok_or_else(|| anyhow::anyhow!("queue designated an unknown default placement"))?;
+            let candidate = &candidates[index];
+            if let Some(locks) = probe.try_acquire(&claims[index], || {
+                host_topology::acquire_resource_locks_granted_with_evidence(
+                    candidate,
+                    &candidate.llc_indices,
+                    host_topology::LlcLockMode::Shared,
+                )
+            })? {
+                return Ok(Some((index, locks)));
+            }
+            let next = (index + 1) % claims.len();
+            probe.reserve(&claims[next])?;
+            Ok(None)
+        };
+        let ticket = if contention.is_empty() {
+            protocol::register_ticket_or_acquire(
+                claims[0].clone(),
+                watch_claim,
+                cancelled,
+                register,
+            )?
+        } else {
+            protocol::register_ticket_after_contentions(
+                claims[0].clone(),
+                watch_claim,
+                contention,
+                cancelled,
+                register,
+            )?
+        };
         let coordinator = match ticket {
             protocol::TicketWork::Acquired((index, locks)) => {
                 return Ok(RunLocks {
@@ -1660,7 +1707,7 @@ impl KtstrVm {
             }
             protocol::TicketWork::Coordinator(coordinator) => coordinator,
         };
-        let outcome = protocol::acquire_as_coordinator(coordinator, |held| {
+        let mut step = |held: &mut protocol::HeldLocks| {
             // RE-PLAN on every wake: probe EVERY candidate
             // all-or-nothing (reusing held locks) so a fully-freed
             // alternative is taken the moment it appears — the coordinator
@@ -1668,7 +1715,10 @@ impl KtstrVm {
             // different sufficient set sits free.
             for (i, target) in targets.iter().enumerate() {
                 if let Some(locks) = held.probe_complete(target)? {
-                    return Ok(protocol::CoordinatorStep::Complete((i, locks)));
+                    return Ok(protocol::CoordinatorStep::Complete {
+                        claim: claims[i].clone(),
+                        value: (i, locks),
+                    });
                 }
             }
             // None complete: accumulate toward the PRIMARY candidate —
@@ -1680,21 +1730,24 @@ impl KtstrVm {
                 .max_by_key(|&i| {
                     let overlap = targets[i]
                         .iter()
-                        .filter(|(p, _)| held_paths.contains(p))
+                        .filter(|lock| held_paths.contains(&lock.path))
                         .count();
                     // Stable tie-break toward scan order.
                     (overlap, std::cmp::Reverse(i))
                 })
                 .expect("candidates is non-empty — checked by caller");
             let target = &targets[primary];
-            held.retain_paths(&target.iter().map(|(p, _)| p.clone()).collect());
+            held.retain_target(target);
             held.sweep(target)?;
             if held.covers(target) {
                 // A holder released between the probe pass and this
                 // sweep and the sweep finished the set — complete now
                 // rather than sleeping on a satisfied target.
                 let locks = held.take(target);
-                return Ok(protocol::CoordinatorStep::Complete((primary, locks)));
+                return Ok(protocol::CoordinatorStep::Complete {
+                    claim: claims[primary].clone(),
+                    value: (primary, locks),
+                });
             }
             let candidate = &candidates[primary];
             let mut claim_cpus: std::collections::BTreeSet<usize> =
@@ -1707,7 +1760,13 @@ impl KtstrVm {
                     crate::flock::FlockMode::Shared,
                 ),
             })
-        })?;
+        };
+        let outcome = match cancelled {
+            Some(cancelled) => {
+                protocol::acquire_as_coordinator_interruptible(coordinator, cancelled, &mut step)?
+            }
+            None => protocol::acquire_as_coordinator(coordinator, &mut step)?,
+        };
         match outcome {
             protocol::CoordinatorOutcome::Acquired((i, locks)) => Ok(RunLocks {
                 locks,

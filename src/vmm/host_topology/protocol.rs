@@ -1,88 +1,33 @@
-//! Cross-invocation acquisition protocol — the "second-order
-//! scheduler" under nextest.
+//! Cross-process host-resource admission under nextest.
 //!
-//! nextest is a pure spawner: it launches every test process at once
-//! and retries failures. The lock dir is the actual scheduler: it
-//! decides which cells EXECUTE against host capacity (the guest
-//! scheduler under test being the third layer down). Every ktstr
-//! invocation sharing a `KTSTR_LOCK_DIR` — disjoint processes,
-//! colocated runner units, concurrent nextest runs — coordinates
-//! through the files in that directory and nothing else, so each
-//! participant acts on a point-in-time view of global state. This
-//! module makes that partial knowledge harmless via four rules:
+//! Every ktstr process sharing a lock directory participates in one v4
+//! fixed-record mmap registry. A ticket publishes one exact, non-empty CPU/LLC
+//! reservation claim plus the resources its planner may watch. Claims preserve
+//! the resource-lock semantics exactly: CPU locks are exclusive, and LLC claims
+//! use the same SH/EX compatibility matrix as `flock`.
 //!
-//! 1. **Global head license.** A single queue flock
-//!    ([`queue_lock_path`]) serializes CONTENDED acquirers across all
-//!    invocations: whoever holds it (the "head") is the only agent
-//!    anywhere allowed to hold a PARTIAL resource-lock set while
-//!    waiting for more. Deadlock needs two holders-waiting; the queue
-//!    forbids a second, so the head's hold-and-wait is safe by
-//!    construction, and its acquisition completes because it only
-//!    ever accumulates toward a live-planned target. This is the
-//!    protocol's core safety invariant — everything else leans on it.
-//! 2. **Head claim visibility.** The head PUBLISHES its current
-//!    target set ([`publish_claim`]) so fast-path planners in other
-//!    processes SUBTRACT it from their view of free capacity
-//!    ([`read_live_claim`]) instead of sniping the very slots the
-//!    head is waiting on. The claim is advisory and crash-safe: its
-//!    liveness is an EX flock on a marker file
-//!    ([`head_marker_path`]) that vanishes with the process, so a
-//!    dead head's stale manifest is ignored. A fast-path caller
-//!    acting on a stale read at worst bounces once (rule 3 bounds
-//!    the damage).
-//! 3. **Fast-path grabs are all-or-nothing in canonical order.**
-//!    Non-contended acquirers try their whole planned set
-//!    non-blocking, in the global lock order (LLC locks by index,
-//!    then CPU locks by index), and release EVERYTHING on any bounce.
-//!    No fast-path partial ever persists, so the only partials in the
-//!    system are the head's (rule 1), and overlapping fast-path sets
-//!    cannot half-block each other.
-//! 4. **Bounce economics.** A bounce is one failed non-blocking
-//!    flock plus a release — cheap. Each consumer bounds its
-//!    fast-path attempts (the default path scans its offset
-//!    candidates once, perf mode tries its fixed set once, the
-//!    no-perf planner runs its short TOCTOU budget) and then joins
-//!    the queue: persistent contention belongs in the queue, both to
-//!    stop wasted work and because queued waiters are what the
-//!    head-license fairness protects.
+//! Admission is work-conserving without weakening those reservations. One
+//! elected coordinator scans tickets in monotonic order and grants a waiter
+//! when its exact claim is compatible with every earlier live claim. Thus an
+//! incompatible predecessor remains a hard fence, while fully disjoint work can
+//! pass it. Only the coordinator may retain partial resource locks while
+//! waiting, which preserves the no-deadlock invariant.
 //!
-//! The objective function is END-TO-END SUITE TIME plus TEST
-//! EXECUTION QUALITY (every cell runs, with valid resources, and
-//! produces a trustworthy verdict — no silent skips, no starvation
-//! casualties, no retry storms). Queue order is arrival order because
-//! it is the simplest thing the kernel's flock wait queue provides,
-//! not because ordering is a goal in itself.
+//! Nonqueued acquisition remains all-or-nothing. It holds the registry's shared
+//! fence from the aggregate-claim check through the real nonblocking flock
+//! probe, so a ticket cannot publish in the check-to-acquire gap. A failed probe
+//! releases every lock it acquired.
 //!
-//! **Waiting is event-driven, not polled.** A queued waiter sleeps in
-//! the kernel's flock wait queue on the queue file. The head sleeps on
-//! an inotify watch of the lock dir ([`LockDirWatch`]): releasing any
-//! lockfile closes its fd, which fires `IN_CLOSE_*` on that file, and
-//! the head wakes, RE-PLANS AGAINST LIVE HOLDER STATE (a hard
-//! requirement — plans are never cached across waits; the freed
-//! resource may satisfy a different plan than the one the head would
-//! have blocked on), and attempts acquisition again. Spurious wakes
-//! (peer fast-path bounces also open/close lockfiles) are tolerated:
-//! exactly one waiter re-plans per event, which is not a herd.
+//! Waiting scales with tickets rather than threads or directory watches. Each
+//! ordinary waiter sleeps on its own shared futex word; the sole coordinator
+//! owns one filtered inotify watch and re-plans against live holders after a
+//! relevant resource release or registry notification. Per-ticket liveness
+//! flocks make crash pruning authoritative, and dirty transactions rebuild
+//! derived aggregates from fixed records after an interrupted mutation.
 //!
-//! **Lifecycle bounds belong to lifecycle owners.** Neither a queued
-//! waiter nor the queue head can infer that a live resource holder is
-//! wedged from elapsed wall time: coverage instrumentation, host
-//! preemption, and a legitimately long cell all make that inference
-//! false. They therefore wait until the authoritative flock release.
-//! A holder crash releases its flock in the kernel; an in-cell VM
-//! watchdog bounds guest progress; and nextest's slow-timeout is the
-//! final process-lifecycle rail. This prevents one slow but healthy
-//! holder from making every waiter behind it fail and retry.
-//!
-//! Waiters are CHEAP by design: a queued cell is a process holding
-//! one blocked flock fd. Only the head adds an inotify fd and its
-//! partial lockfile fds — still no guest memory or vCPUs (acquisition
-//! runs before VM setup; see `KtstrVm::run`). nextest can therefore
-//! admit every cell at once and let this queue schedule them.
-//!
-//! The lock dir is already restricted to local filesystems (every
-//! lockfile open routes through `crate::flock`'s remote-fs rejection),
-//! which is also what inotify needs to be reliable.
+//! Elapsed time never revokes a live holder's reservation. Fallback wakes exist
+//! only to recover a missed event or detect a crashed process; guest and process
+//! lifecycle mechanisms remain responsible for genuinely wedged work.
 
 use anyhow::Result;
 use std::collections::BTreeSet;
@@ -91,17 +36,146 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::flock::{FlockMode, InterruptibleFlockWaiter, block_flock, try_flock};
+use crate::flock::{FlockMode, TryFlockOutcome, try_flock, try_flock_with_witness};
 
-/// Fallback wake for the head's inotify sleep, bounding the staleness
+mod registry;
+
+/// Stable identity of one host reservation lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ResourceKey {
+    Llc(usize),
+    Cpu(usize),
+}
+
+/// One canonical host-resource lock together with the exact registry identity
+/// it represents. Keeping the identity attached avoids reparsing test-specific
+/// lock paths and lets partial coordinator holds publish mode-correct state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResourceLock {
+    pub(crate) path: String,
+    pub(crate) mode: FlockMode,
+    pub(crate) resource: ResourceKey,
+}
+
+/// Exact evidence retained from a failed nonblocking resource probe.
+pub(crate) struct ContentionEvidence {
+    pub(crate) blocker: ResourceKey,
+    pub(crate) mode: FlockMode,
+    pub(crate) witness: OwnedFd,
+}
+
+impl std::fmt::Debug for ContentionEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ContentionEvidence")
+            .field("blocker", &self.blocker)
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContentionMarker {
+    pub(crate) blocker: ResourceKey,
+    pub(crate) mode: FlockMode,
+}
+
+impl Ord for ContentionMarker {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.blocker, u8::from(self.mode == FlockMode::Exclusive))
+            .cmp(&(other.blocker, u8::from(other.mode == FlockMode::Exclusive)))
+    }
+}
+
+impl PartialOrd for ContentionMarker {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl ContentionEvidence {
+    pub(crate) fn marker(&self) -> ContentionMarker {
+        ContentionMarker {
+            blocker: self.blocker,
+            mode: self.mode,
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ContentionSet {
+    markers: BTreeSet<ContentionMarker>,
+    witness: Option<ContentionEvidence>,
+}
+
+impl ContentionSet {
+    pub(crate) fn insert(&mut self, evidence: ContentionEvidence) {
+        self.markers.insert(evidence.marker());
+        // Keep every exact blocker marker but only one writable witness. One
+        // post-publication CLOSE_WRITE is sufficient for ordering, while the
+        // bounded fd count matters on hosts with hundreds of alternatives.
+        if self.witness.is_none() {
+            self.witness = Some(evidence);
+        }
+    }
+
+    pub(crate) fn marker_vec(&self) -> Vec<ContentionMarker> {
+        self.markers.iter().copied().collect()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.markers.is_empty()
+    }
+}
+
+impl From<ContentionEvidence> for ContentionSet {
+    fn from(evidence: ContentionEvidence) -> Self {
+        let mut set = Self::default();
+        set.insert(evidence);
+        set
+    }
+}
+
+pub(crate) enum ProbeOutcome<T> {
+    Acquired(T),
+    Contended(ContentionEvidence),
+    Unavailable,
+}
+
+pub(crate) trait IntoProbeOutcome<T> {
+    fn into_probe_outcome(self) -> ProbeOutcome<T>;
+}
+
+impl<T> IntoProbeOutcome<T> for ProbeOutcome<T> {
+    fn into_probe_outcome(self) -> ProbeOutcome<T> {
+        self
+    }
+}
+
+impl<T> IntoProbeOutcome<T> for Option<T> {
+    fn into_probe_outcome(self) -> ProbeOutcome<T> {
+        self.map_or(ProbeOutcome::Unavailable, ProbeOutcome::Acquired)
+    }
+}
+
+/// Fallback wake for the coordinator's inotify sleep, bounding the staleness
 /// window if an event is missed (e.g. a release racing the
 /// drain-before-sleep gap). The real wake is the inotify event.
-const HEAD_WAKE_FALLBACK: Duration = Duration::from_millis(500);
+const COORDINATOR_WAKE_FALLBACK: Duration = Duration::from_secs(30);
+/// A failed authoritative availability proof stays pending in the registry.
+/// Retry it at a deliberately slow cadence; exact lock-close watches wake the
+/// coordinator immediately when the holder actually changes.
+const OBSERVATION_RETRY_FALLBACK: Duration = Duration::from_secs(5);
+/// Claim-specific waiter watches should receive every relevant release or
+/// predecessor-state transition. This long, per-ticket-staggered fallback is
+/// only a missed-event recovery tick; it avoids turning hundreds of queued
+/// cells into a synchronized `/proc/locks` polling herd.
+const WAITER_CRASH_RECOVERY_BASE: Duration = Duration::from_secs(3);
 
 /// Directory the protocol files live in — derived from the LLC
 /// lockfile path so the test-only lock-prefix override isolates the
-/// queue, marker, and claim files into the same per-test tempdir as
-/// the resource lockfiles they coordinate.
+/// v4 registry files into the same per-test tempdir as the LLC locks
+/// they coordinate.
 fn protocol_dir() -> PathBuf {
     Path::new(&super::llc_lock_path(0))
         .parent()
@@ -109,55 +183,12 @@ fn protocol_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
-/// The acquisition-queue lockfile. Blocking `LOCK_EX` on it IS the
-/// ticket queue: the kernel's flock wait queue orders contended
-/// acquirers across every invocation sharing the lock dir, and a
-/// waiter's ticket vanishes with its process (crash-safe). Named
-/// outside the `ktstr-llc-*.lock` / `ktstr-cpu-*.lock` globs so the
-/// `ktstr locks` listing's index parse never sees it.
-pub(crate) fn queue_lock_path() -> String {
-    protocol_dir()
-        .join("ktstr-acquire-queue.lock")
-        .display()
-        .to_string()
-}
-
-/// The head-liveness marker. The head holds `LOCK_EX` on this file
-/// for exactly as long as it is the head; readers treat the claim
-/// manifest as live only while `/proc/locks` shows a holder here.
-/// Flock-based so a crashed head's claim dies with it.
-pub(crate) fn head_marker_path() -> String {
-    protocol_dir()
-        .join("ktstr-head-alive.lock")
-        .display()
-        .to_string()
-}
-
-/// The head's published claim manifest (JSON [`ClaimSet`]). Written
-/// atomically (temp + rename) on every re-plan; advisory only —
-/// correctness never depends on it, it exists so fast-path planners
-/// stop sniping the head's target slots.
-pub(crate) fn head_claim_path() -> String {
-    protocol_dir()
-        .join("ktstr-head-claim.json")
-        .display()
-        .to_string()
-}
-
-/// Sharing mode of the LLC locks in a published [`ClaimSet`].
+/// Sharing mode of the LLC locks in an exact [`ClaimSet`].
 ///
-/// A claim is an advisory reservation, so its compatibility rules must
-/// exactly match `flock`: a shared claim only fences an exclusive LLC
+/// Its compatibility rules exactly match `flock`: a shared claim only fences an exclusive LLC
 /// requester, while an exclusive claim fences both shared and exclusive
 /// requesters. CPU claims are always exclusive.
-///
-/// `Exclusive` is the serde default for manifests written before claims
-/// carried a mode. Treating a legacy, ambiguous claim conservatively keeps
-/// mixed-version runs correct. Older readers ignore the added field and
-/// continue to over-fence all LLC claims until every participant is updated;
-/// that costs concurrency, never correctness.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum ClaimLlcMode {
     #[default]
     Exclusive,
@@ -173,15 +204,11 @@ impl From<FlockMode> for ClaimLlcMode {
     }
 }
 
-/// The head's published target set: which LLC locks (and at what sharing
-/// mode) and CPU locks it is currently accumulating toward. Fast-path
-/// planners subtract only incompatible targets from their view of free
-/// capacity.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// One ticket's exact LLC and CPU reservation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ClaimSet {
     pub llcs: BTreeSet<usize>,
     pub cpus: BTreeSet<usize>,
-    #[serde(default)]
     pub llc_mode: ClaimLlcMode,
 }
 
@@ -203,7 +230,8 @@ impl ClaimSet {
     }
 
     /// Whether `request_mode` on `llc_idx` is incompatible with this live
-    /// head claim. This is the same compatibility matrix as `flock`.
+    /// ticket claim. This is the same compatibility matrix as `flock`.
+    #[cfg(test)]
     pub(crate) fn conflicts_with_llc(&self, llc_idx: usize, request_mode: FlockMode) -> bool {
         self.llcs.contains(&llc_idx)
             && matches!(
@@ -211,123 +239,307 @@ impl ClaimSet {
                 (ClaimLlcMode::Exclusive, _) | (ClaimLlcMode::Shared, FlockMode::Exclusive)
             )
     }
-}
 
-/// Read the LIVE head claim, or an empty set when there is no live
-/// head. Liveness gates content: the manifest counts only while a
-/// process holds the head marker flock (checked via `/proc/locks`,
-/// which takes no lock and cannot perturb the queue). A stale
-/// manifest from a crashed or finished head is therefore ignored, and
-/// any read/parse failure degrades to "no claim" — the worst a wrong
-/// answer costs a fast-path caller is one bounce.
-pub(crate) fn read_live_claim() -> ClaimSet {
-    // Cheap-out first: no manifest file (the completed head removed
-    // it) or an empty one means no claim, without paying the
-    // /proc/locks parse below. Fast paths call this once per
-    // candidate probe, and the no-head case is the steady state.
-    match std::fs::metadata(head_claim_path()) {
-        Ok(m) if m.len() > 0 => {}
-        _ => return ClaimSet::default(),
-    }
-    let holders = crate::flock::read_holders(Path::new(&head_marker_path())).unwrap_or_default();
-    if holders.is_empty() {
-        return ClaimSet::default();
-    }
-    match std::fs::read_to_string(head_claim_path()) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-        Err(_) => ClaimSet::default(),
+    /// Whether two complete reservation claims are incompatible.
+    ///
+    /// CPU locks are always exclusive. LLC compatibility is the flock
+    /// SH/EX matrix: two shared claims may overlap at the LLC layer as long as
+    /// their exact CPU claims remain disjoint.
+    #[cfg(test)]
+    pub(crate) fn conflicts_with(&self, other: &Self) -> bool {
+        if self.cpus.iter().any(|cpu| other.cpus.contains(cpu)) {
+            return true;
+        }
+        self.llcs.iter().any(|llc| {
+            other.llcs.contains(llc)
+                && matches!(
+                    (self.llc_mode, other.llc_mode),
+                    (ClaimLlcMode::Exclusive, _) | (_, ClaimLlcMode::Exclusive)
+                )
+        })
     }
 }
 
-/// Atomically publish `claim` as the head's manifest (temp file +
-/// rename, so readers never observe a torn write). Caller must hold
-/// the head marker flock — the manifest is meaningless without it.
-fn publish_claim(claim: &ClaimSet) -> Result<()> {
-    let path = head_claim_path();
-    let tmp = format!("{path}.tmp-{}", std::process::id());
-    let text = serde_json::to_string(claim)?;
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
+/// Whether a fast-path reservation conflicts with an exact live ticket claim.
+/// Three registry aggregates answer the common case in O(host bitset) rather
+/// than scanning O(waiters).
+pub(crate) fn registered_claim_conflicts(candidate: &ClaimSet) -> Result<bool> {
+    registry::aggregate_conflicts(candidate)
 }
 
-/// Remove the claim manifest (best-effort — liveness is the marker
-/// flock, so a leftover manifest is already inert once the marker
-/// releases; removing it just keeps the directory tidy).
-fn clear_claim() {
-    let _ = std::fs::remove_file(head_claim_path());
+pub(crate) struct RegisteredClaimSnapshot {
+    inner: registry::AggregateSnapshot,
 }
 
-/// inotify watch over the lock dir: any lockfile release closes its
-/// fd and fires `IN_CLOSE_WRITE` (lockfiles open `O_RDWR`, so the
-/// close is a writable-fd close — pinned by
-/// `flock_release_fires_in_close_write` in the locking tests). The
-/// head sleeps here between acquisition attempts; peer fast-path
-/// bounces fire the same events and cause spurious wakes, which are
-/// tolerated — one waiter re-planning per event is not a herd.
+impl RegisteredClaimSnapshot {
+    pub(crate) fn conflicts(&self, candidate: &ClaimSet) -> Result<bool> {
+        self.inner.conflicts(candidate)
+    }
+}
+
+/// Copy the aggregate reservation bitsets once for a whole planning pass.
+/// Candidate filtering after this call is process-local; the final selected
+/// claim still enters [`with_registry_fence`] for authoritative admission.
+pub(crate) fn registered_claim_snapshot(required: &ClaimSet) -> Result<RegisteredClaimSnapshot> {
+    Ok(RegisteredClaimSnapshot {
+        inner: registry::aggregate_snapshot(required)?,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn aggregate_snapshot_read_count_for_tests() -> usize {
+    registry::aggregate_snapshot_read_count_for_tests()
+}
+
+pub(crate) enum RegistryFence<T> {
+    Fenced,
+    Ran { value: T, watched: bool },
+}
+
+/// Run one all-or-nothing nonblocking resource probe while holding the
+/// registry's shared fence. Ticket publication and claim replacement require
+/// EX, so no earlier exact claim can appear between the aggregate check and
+/// the actual flock acquisition.
+pub(crate) fn with_registry_fence<T>(
+    candidate: &ClaimSet,
+    run: impl FnOnce() -> Result<T>,
+) -> Result<RegistryFence<T>> {
+    match registry::with_aggregate_fence(candidate, run) {
+        Ok(registry::FenceResult::Fenced) => Ok(RegistryFence::Fenced),
+        Ok(registry::FenceResult::Ran { value, watched }) => {
+            Ok(RegistryFence::Ran { value, watched })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// One coordinator-owned inotify watch over the lock directory.
+///
+/// Only resource-lock closes and the explicit registry notification are
+/// actionable. Registry header/chunk/liveness opens are coordinator-internal
+/// traffic; filtering their close events is essential because a generation
+/// read immediately before `poll` would otherwise wake the coordinator itself
+/// forever.
 pub(crate) struct LockDirWatch {
     ino: nix::sys::inotify::Inotify,
+    event_wd: nix::sys::inotify::WatchDescriptor,
+    resource_watches: std::collections::BTreeMap<nix::sys::inotify::WatchDescriptor, ResourceWatch>,
+    notify_name: std::ffi::OsString,
+}
+
+#[derive(Default)]
+struct ResourceWatch {
+    llc_prefix: Option<std::ffi::OsString>,
+    cpu_prefix: Option<std::ffi::OsString>,
+}
+
+#[derive(Default)]
+pub(crate) struct LockDirEvents {
+    llc_closes: BTreeSet<usize>,
+    cpu_closes: BTreeSet<usize>,
+    registry_notify: bool,
+    liveness_closes: BTreeSet<(u64, u64)>,
+    overflow: bool,
+}
+
+impl LockDirEvents {
+    fn merge(&mut self, other: Self) {
+        self.llc_closes.extend(other.llc_closes);
+        self.cpu_closes.extend(other.cpu_closes);
+        self.registry_notify |= other.registry_notify;
+        self.liveness_closes.extend(other.liveness_closes);
+        self.overflow |= other.overflow;
+    }
+
+    fn is_actionable(&self) -> bool {
+        !self.llc_closes.is_empty()
+            || !self.cpu_closes.is_empty()
+            || self.registry_notify
+            || !self.liveness_closes.is_empty()
+            || self.overflow
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_liveness(&self, identity: (u64, u64)) -> bool {
+        self.liveness_closes.contains(&identity)
+    }
 }
 
 impl LockDirWatch {
-    /// Watch the protocol directory. `IN_CLOSE_NOWRITE` is included
-    /// alongside `IN_CLOSE_WRITE` defensively: the mask that fires
-    /// depends on the open mode of the closing fd, and a future
-    /// read-only lockfile open must not silently stop waking heads.
+    /// Watch writable closes only. Resource holders, registry notifications,
+    /// and liveness owners all use O_RDWR/O_WRONLY descriptors. Liveness
+    /// verification deliberately uses O_RDONLY, so omitting CLOSE_NOWRITE
+    /// prevents those probes from entering the inotify queue at all.
     pub(crate) fn new() -> Result<Self> {
         use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
-        let dir = protocol_dir();
-        std::fs::create_dir_all(&dir)?;
+        let llc_path = super::llc_lock_path(0);
+        let cpu_path = super::cpu_lock_path(0);
+        let event_dir = registry::event_dir();
+        let llc_dir = Path::new(&llc_path)
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("LLC resource lock path has no parent: {llc_path}"))?
+            .to_path_buf();
+        let cpu_dir = Path::new(&cpu_path)
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("CPU resource lock path has no parent: {cpu_path}"))?
+            .to_path_buf();
+        if event_dir == llc_dir || event_dir == cpu_dir {
+            anyhow::bail!(
+                "admission event directory must be distinct from resource lock directories"
+            );
+        }
         let ino = Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC)?;
-        ino.add_watch(
-            &dir,
-            AddWatchFlags::IN_CLOSE_WRITE | AddWatchFlags::IN_CLOSE_NOWRITE,
-        )?;
-        Ok(LockDirWatch { ino })
+        std::fs::create_dir_all(&event_dir)?;
+        let event_wd = ino.add_watch(&event_dir, AddWatchFlags::IN_CLOSE_WRITE)?;
+
+        let mut resources = std::collections::BTreeMap::<PathBuf, ResourceWatch>::new();
+        resources.entry(llc_dir).or_default().llc_prefix =
+            Some(resource_basename_prefix(&llc_path)?);
+        resources.entry(cpu_dir).or_default().cpu_prefix =
+            Some(resource_basename_prefix(&cpu_path)?);
+        let mut resource_watches = std::collections::BTreeMap::new();
+        for (dir, resource) in resources {
+            std::fs::create_dir_all(&dir)?;
+            let wd = ino.add_watch(&dir, AddWatchFlags::IN_CLOSE_WRITE)?;
+            resource_watches.insert(wd, resource);
+        }
+        Ok(LockDirWatch {
+            ino,
+            event_wd,
+            resource_watches,
+            notify_name: registry::notify_basename()?,
+        })
     }
 
     /// Drain any queued events without blocking, discarding them.
-    /// The head calls this right before sleeping so its OWN
+    /// The coordinator calls this right before sleeping so its own
     /// open/close churn from the attempt it just made does not wake
     /// it straight back up (a self-wake busy loop). An external
     /// release slipping into the drain-to-sleep gap is caught by the
-    /// [`HEAD_WAKE_FALLBACK`] tick.
-    pub(crate) fn drain(&self) {
-        while let Ok(events) = self.ino.read_events() {
-            if events.is_empty() {
-                break;
+    /// [`COORDINATOR_WAKE_FALLBACK`] tick.
+    pub(crate) fn drain(&self, watched: &ClaimSet) -> Result<LockDirEvents> {
+        let mut batch = LockDirEvents::default();
+        loop {
+            match self.ino.read_events() {
+                Ok(events) if events.is_empty() => break,
+                Ok(events) => self.classify(events, watched, &mut batch),
+                Err(error) if error == nix::errno::Errno::EAGAIN => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(batch)
+    }
+
+    /// Sleep until a resource release/registry notification arrives or
+    /// `timeout` passes. Protocol-internal close events are consumed without
+    /// returning so coordinator bookkeeping cannot create a self-wake loop.
+    pub(crate) fn wait(
+        &self,
+        timeout: Duration,
+        watched: &ClaimSet,
+    ) -> Result<Option<LockDirEvents>> {
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+        use std::os::fd::AsFd;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let mut fds = [PollFd::new(self.ino.as_fd(), PollFlags::POLLIN)];
+            let ms =
+                u16::try_from(remaining.as_millis().clamp(1, u16::MAX as u128)).unwrap_or(u16::MAX);
+            if poll(&mut fds, PollTimeout::from(ms))? == 0 {
+                return Ok(None);
+            }
+            let events = match self.ino.read_events() {
+                Ok(events) => events,
+                Err(error) if error == nix::errno::Errno::EAGAIN => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let mut batch = LockDirEvents::default();
+            self.classify(events, watched, &mut batch);
+            if batch.is_actionable() {
+                return Ok(Some(batch));
             }
         }
     }
 
-    /// Sleep until a lock-dir event arrives or `timeout` passes.
-    /// Returns whether at least one event arrived (the caller
-    /// re-plans either way; the flag is informational).
-    pub(crate) fn wait(&self, timeout: Duration) -> Result<bool> {
-        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-        use std::os::fd::AsFd;
-        let mut fds = [PollFd::new(self.ino.as_fd(), PollFlags::POLLIN)];
-        let ms = u16::try_from(timeout.as_millis().clamp(1, u16::MAX as u128)).unwrap_or(u16::MAX);
-        let n = poll(&mut fds, PollTimeout::from(ms))?;
-        if n > 0 {
-            self.drain();
-            Ok(true)
-        } else {
-            Ok(false)
+    fn classify(
+        &self,
+        events: Vec<nix::sys::inotify::InotifyEvent>,
+        watched: &ClaimSet,
+        batch: &mut LockDirEvents,
+    ) {
+        use nix::sys::inotify::AddWatchFlags;
+
+        for event in events {
+            if event.mask.contains(AddWatchFlags::IN_Q_OVERFLOW) {
+                batch.overflow = true;
+            }
+            let Some(name) = event.name.as_deref() else {
+                continue;
+            };
+            if event.wd == self.event_wd {
+                if name == self.notify_name {
+                    batch.registry_notify = true;
+                } else if event.mask.contains(AddWatchFlags::IN_CLOSE_WRITE)
+                    && let Some(identity) = registry::parse_liveness_basename(name)
+                {
+                    // The owner holds an O_RDWR fd, so owner death/finish
+                    // yields CLOSE_WRITE. O(1) liveness probes deliberately
+                    // use O_RDONLY and yield CLOSE_NOWRITE.
+                    batch.liveness_closes.insert(identity);
+                }
+                continue;
+            }
+            let Some(resource) = self.resource_watches.get(&event.wd) else {
+                continue;
+            };
+            if let Some(index) = resource
+                .llc_prefix
+                .as_deref()
+                .and_then(|prefix| resource_index(name, prefix))
+                .filter(|index| watched.llcs.contains(index))
+            {
+                batch.llc_closes.insert(index);
+            }
+            if let Some(index) = resource
+                .cpu_prefix
+                .as_deref()
+                .and_then(|prefix| resource_index(name, prefix))
+                .filter(|index| watched.cpus.contains(index))
+            {
+                batch.cpu_closes.insert(index);
+            }
         }
     }
 }
 
-/// RAII queue-head license. The flock is the authoritative ticket and
-/// disappears automatically if the process crashes.
-pub(crate) struct QueueTurn {
-    // Keep the thread-directed wake registration alive while this turn owns
-    // the head license. A cancellation signal can therefore interrupt either
-    // the queue flock below or the head's inotify poll. It is deliberately the
-    // first field: struct fields drop in declaration order, so registration
-    // teardown completes before releasing the queue flock to the next head.
-    _interrupt_waiter: Option<InterruptibleFlockWaiter>,
-    _fd: OwnedFd,
+/// Publish mode-correct holder state while the corresponding real flocks are
+/// still live. This is an authoritative state transition, not an event hint.
+pub(crate) fn publish_acquired(claim: &ClaimSet) -> Result<()> {
+    registry::publish_acquired(claim)
+}
+
+fn resource_basename_prefix(path: &str) -> Result<std::ffi::OsString> {
+    let basename = Path::new(path)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| anyhow::anyhow!("resource lock path has no UTF-8 basename: {path}"))?;
+    let prefix = basename.strip_suffix("0.lock").ok_or_else(|| {
+        anyhow::anyhow!("resource lock basename does not end in an indexed lock name: {basename}")
+    })?;
+    Ok(prefix.into())
+}
+
+fn resource_index(name: &std::ffi::OsStr, prefix: &std::ffi::OsStr) -> Option<usize> {
+    let name = name.to_str()?;
+    let prefix = prefix.to_str()?;
+    name.strip_prefix(prefix)?
+        .strip_suffix(".lock")?
+        .parse()
+        .ok()
 }
 
 fn interrupted() -> anyhow::Error {
@@ -361,126 +573,470 @@ fn check_result<T>(result: Result<T>, cancelled: Option<&AtomicBool>) -> Result<
     }
 }
 
-/// Wait for our turn at the head of the acquisition queue.
-///
-/// Parks one persistent fd in the kernel's flock wait queue on
-/// [`queue_lock_path`] (`LOCK_EX`, blocking) — arrival-order FIFO
-/// across every invocation, tickets vanishing with their process.
-/// The wait has no private wall-clock verdict: the holder's watchdog
-/// and nextest process rail own lifecycle bounds, while flock owns
-/// crash cleanup. Keeping one blocking fd also preserves the waiter's
-/// kernel queue position instead of periodically moving it to the
-/// tail.
-///
-/// Queued waiters hold NO resource locks (their fast-path attempts
-/// were all-or-nothing and released everything), so parking here can
-/// never feed a deadlock cycle.
-pub(crate) fn wait_for_queue_turn() -> Result<QueueTurn> {
-    wait_for_queue_turn_impl(None, || {})
+pub(crate) struct GrantedProbe {
+    designated: ClaimSet,
+    next_claim: ClaimSet,
+    acquisition_allowed: bool,
+    contention: Option<ContentionEvidence>,
 }
 
-/// Cancellation-aware variant of [`wait_for_queue_turn`].
-///
-/// The waiter retains one kernel FIFO flock request throughout healthy
-/// contention. The RT-wake broker remains idle until the caller publishes
-/// `cancelled = true` and asks [`crate::flock::wake_interruptible_flock_waiter`]
-/// to wake the exact registered generation.
-pub(crate) fn wait_for_queue_turn_interruptible(cancelled: &AtomicBool) -> Result<QueueTurn> {
-    wait_for_queue_turn_impl(Some(cancelled), || {})
-}
-
-fn wait_for_queue_turn_impl(
-    cancelled: Option<&AtomicBool>,
-    before_block: impl FnOnce(),
-) -> Result<QueueTurn> {
-    check_interrupted(cancelled)?;
-    let interrupt_waiter = check_result(
-        cancelled
-            .map(|_| InterruptibleFlockWaiter::register())
-            .transpose(),
-        cancelled,
-    )?;
-    check_interrupted(cancelled)?;
-
-    let qpath = queue_lock_path();
-    // Fast grab: empty queue is the common case.
-    let fast = match try_flock(&qpath, FlockMode::Exclusive) {
-        Ok(fast) => fast,
-        Err(error) => {
-            check_interrupted(cancelled)?;
-            return Err(error);
-        }
-    };
-    if let Some(fd) = fast {
-        let turn = QueueTurn {
-            _interrupt_waiter: interrupt_waiter,
-            _fd: fd,
-        };
-        check_interrupted(cancelled)?;
-        return Ok(turn);
+impl GrantedProbe {
+    /// A grant covers exactly the ticket's designated reservation. Alternative
+    /// plans become the next designation and are considered by the coordinator
+    /// on the following scheduling pass.
+    pub(crate) fn allows(&self, candidate: &ClaimSet) -> bool {
+        *candidate == self.designated
     }
 
-    // This check plus the cancellation broker's repeated RT wake closes both
-    // sides of the check/enter-flock race: a cancellation before the check
-    // returns here, while one after it interrupts the syscall on a broker tick.
-    check_interrupted(cancelled)?;
-    before_block();
-    let fd = match block_flock(&qpath, FlockMode::Exclusive) {
-        Ok(fd) => fd,
-        Err(error) => {
-            check_interrupted(cancelled)?;
-            return Err(error);
+    pub(crate) fn designated(&self) -> &ClaimSet {
+        &self.designated
+    }
+
+    pub(crate) fn try_acquire<T, O: IntoProbeOutcome<T>>(
+        &mut self,
+        candidate: &ClaimSet,
+        acquire: impl FnOnce() -> Result<O>,
+    ) -> Result<Option<T>> {
+        if !self.acquisition_allowed || !self.allows(candidate) {
+            return Ok(None);
         }
-    };
-    let turn = QueueTurn {
-        _interrupt_waiter: interrupt_waiter,
-        _fd: fd,
-    };
-    check_interrupted(cancelled)?;
-    Ok(turn)
+        match acquire()?.into_probe_outcome() {
+            ProbeOutcome::Acquired(value) => Ok(Some(value)),
+            ProbeOutcome::Contended(evidence) => {
+                self.contention = Some(evidence);
+                Ok(None)
+            }
+            ProbeOutcome::Unavailable => Ok(None),
+        }
+    }
+
+    pub(crate) fn reserve(&mut self, candidate: &ClaimSet) -> Result<()> {
+        if candidate.is_empty() {
+            anyhow::bail!("a queued waiter cannot reserve an empty claim");
+        }
+        self.next_claim = candidate.clone();
+        Ok(())
+    }
 }
 
-/// Test seam for deterministically cancelling after the final userspace check
-/// but before entering the blocking flock.
+pub(crate) struct CoordinatorTicket {
+    ticket: registry::Ticket,
+}
+
 #[cfg(test)]
-pub(crate) fn wait_for_queue_turn_interruptible_with_handoff(
-    cancelled: &AtomicBool,
-    before_block: impl FnOnce(),
-) -> Result<QueueTurn> {
-    wait_for_queue_turn_impl(Some(cancelled), before_block)
+impl CoordinatorTicket {
+    pub(crate) fn read_state_shared_for_tests(&self) -> Result<()> {
+        self.ticket.read_state_shared_for_tests()
+    }
 }
 
-/// The head's accumulated partial holds, keyed by lockfile path.
-/// Only ever instantiated inside [`acquire_as_head`] — the global
-/// head license (queue `LOCK_EX`) is what makes holding these while
-/// waiting safe.
+pub(crate) enum TicketWork<T> {
+    Acquired(T),
+    Coordinator(CoordinatorTicket),
+}
+
+#[cfg(test)]
+pub(crate) fn ticket_registry_snapshot_for_tests() -> Result<Vec<(u64, u32, ClaimSet)>> {
+    registry::snapshot()
+}
+
+#[cfg(test)]
+pub(crate) fn active_free_head_is_rejected_for_tests() -> Result<()> {
+    registry::active_free_head_is_rejected_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn cancel_granted_after_commit_for_tests() {
+    registry::cancel_granted_after_commit_for_tests();
+}
+
+#[cfg(test)]
+pub(crate) fn cancel_coordinator_after_commit_for_tests() {
+    registry::cancel_coordinator_after_commit_for_tests();
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_known_free_close_storm_for_tests(
+    closes: usize,
+) -> Result<(usize, u64, usize, u64, u64)> {
+    registry::exercise_known_free_close_storm_for_tests(closes)
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usize)> {
+    registry::exercise_busy_to_free_close_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64, bool, bool)> {
+    registry::exercise_llc_ex_contention_shared_wake_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_coordinator_turnover_for_tests(
+    coordinators: usize,
+) -> Result<(u64, usize, u64)> {
+    registry::exercise_coordinator_turnover_for_tests(coordinators)
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_exact_commit_scan_elision_for_tests(commits: usize) -> Result<u64> {
+    registry::exercise_exact_commit_scan_elision_for_tests(commits)
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_mismatched_commit_rescan_for_tests() -> Result<(u64, bool)> {
+    registry::exercise_mismatched_commit_rescan_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_superset_commit_rescan_for_tests() -> Result<(u64, bool)> {
+    registry::exercise_superset_commit_rescan_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_shared_commit_improvement_for_tests() -> Result<(u64, bool)> {
+    registry::exercise_shared_commit_improvement_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn registry_initializer_temp_count_for_tests() -> Result<usize> {
+    registry::initializer_temp_count_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn hold_registry_exclusive_for_tests() -> Result<OwnedFd> {
+    registry::hold_registry_exclusive_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn hold_registry_shared_for_tests() -> Result<OwnedFd> {
+    registry::hold_registry_shared_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn shared_state_read_count_for_tests() -> usize {
+    registry::shared_state_read_count_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn resource_epoch_for_tests() -> Result<u64> {
+    registry::resource_epoch_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn coordinator_liveness_probe_for_tests() -> Result<((u64, u64), bool)> {
+    registry::coordinator_liveness_probe_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn missing_liveness_probe_does_not_create_for_tests() -> Result<bool> {
+    registry::missing_liveness_probe_does_not_create_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn registry_event_dir_for_tests() -> PathBuf {
+    registry::event_dir()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_registry_high_water_for_tests(waiters: usize) -> Result<usize> {
+    let claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+    let mut tickets = Vec::with_capacity(waiters);
+    for _ in 0..waiters {
+        tickets.push(registry::Ticket::register(
+            claim.clone(),
+            claim.clone(),
+            None,
+        )?);
+    }
+    let snapshot = registry::snapshot()?;
+    if let Some(coordinator) = tickets.first_mut() {
+        coordinator.schedule(
+            Some(&claim),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            false,
+            None,
+            &[],
+            None,
+            &[],
+            false,
+            false,
+            None,
+        )?;
+    }
+    // Unmap every non-coordinator futex before its slot reaches the freelist;
+    // release the coordinator last so the test does not manufacture 499
+    // leadership handoffs while checking chunk growth.
+    while tickets.len() > 1 {
+        tickets.pop();
+    }
+    drop(tickets);
+    Ok(snapshot.len())
+}
+
+/// Register one exact, non-empty priority claim in the fixed-record registry.
+/// Only the elected coordinator scans records and routes grants; ordinary
+/// waiters sleep on their own shared futex word and therefore add neither a
+/// helper thread nor an inotify instance to a storm.
+pub(crate) fn register_ticket_or_acquire<T>(
+    initial_claim: ClaimSet,
+    watch_claim: ClaimSet,
+    cancelled: Option<&AtomicBool>,
+    try_acquire: impl FnMut(&mut GrantedProbe) -> Result<Option<T>>,
+) -> Result<TicketWork<T>> {
+    register_ticket_or_acquire_impl(
+        initial_claim,
+        watch_claim,
+        None,
+        None::<fn()>,
+        cancelled,
+        try_acquire,
+    )
+}
+
+/// Register the ticket, then run `after_publish` before inspecting its state or
+/// invoking an acquisition callback. The hook is the acquire-before-release
+/// handoff point for reservations inherited from an earlier phase: the new
+/// exact record is already durable, so releasing the old flocks cannot create
+/// an unclaimed interval.
+pub(crate) fn register_ticket_or_acquire_after_publish<T>(
+    initial_claim: ClaimSet,
+    watch_claim: ClaimSet,
+    cancelled: Option<&AtomicBool>,
+    after_publish: impl FnOnce(),
+    try_acquire: impl FnMut(&mut GrantedProbe) -> Result<Option<T>>,
+) -> Result<TicketWork<T>> {
+    register_ticket_or_acquire_impl(
+        initial_claim,
+        watch_claim,
+        None,
+        Some(after_publish),
+        cancelled,
+        try_acquire,
+    )
+}
+
+pub(crate) fn register_ticket_after_contention<T>(
+    initial_claim: ClaimSet,
+    watch_claim: ClaimSet,
+    contention: ContentionEvidence,
+    cancelled: Option<&AtomicBool>,
+    try_acquire: impl FnMut(&mut GrantedProbe) -> Result<Option<T>>,
+) -> Result<TicketWork<T>> {
+    register_ticket_or_acquire_impl(
+        initial_claim,
+        watch_claim,
+        Some(contention.into()),
+        None::<fn()>,
+        cancelled,
+        try_acquire,
+    )
+}
+
+pub(crate) fn register_ticket_after_contentions<T>(
+    initial_claim: ClaimSet,
+    watch_claim: ClaimSet,
+    contention: ContentionSet,
+    cancelled: Option<&AtomicBool>,
+    try_acquire: impl FnMut(&mut GrantedProbe) -> Result<Option<T>>,
+) -> Result<TicketWork<T>> {
+    register_ticket_or_acquire_impl(
+        initial_claim,
+        watch_claim,
+        Some(contention),
+        None::<fn()>,
+        cancelled,
+        try_acquire,
+    )
+}
+
+pub(crate) fn register_ticket_after_contentions_and_publish<T>(
+    initial_claim: ClaimSet,
+    watch_claim: ClaimSet,
+    contention: ContentionSet,
+    cancelled: Option<&AtomicBool>,
+    after_publish: impl FnOnce(),
+    try_acquire: impl FnMut(&mut GrantedProbe) -> Result<Option<T>>,
+) -> Result<TicketWork<T>> {
+    register_ticket_or_acquire_impl(
+        initial_claim,
+        watch_claim,
+        Some(contention),
+        Some(after_publish),
+        cancelled,
+        try_acquire,
+    )
+}
+
+fn register_ticket_or_acquire_impl<T, H>(
+    initial_claim: ClaimSet,
+    watch_claim: ClaimSet,
+    initial_contention: Option<ContentionSet>,
+    after_publish: Option<H>,
+    cancelled: Option<&AtomicBool>,
+    mut try_acquire: impl FnMut(&mut GrantedProbe) -> Result<Option<T>>,
+) -> Result<TicketWork<T>>
+where
+    H: FnOnce(),
+{
+    check_interrupted(cancelled)?;
+    let mut ticket = check_result(
+        registry::Ticket::register_after_contention(
+            initial_claim,
+            watch_claim,
+            initial_contention,
+            cancelled,
+        ),
+        cancelled,
+    )?;
+    if let Some(after_publish) = after_publish {
+        after_publish();
+    }
+    let stagger = Duration::from_millis((std::process::id() as u64 * 37) % 1000);
+    loop {
+        check_interrupted(cancelled)?;
+        match check_result(
+            ticket.state_or_wait(WAITER_CRASH_RECOVERY_BASE + stagger, cancelled),
+            cancelled,
+        )? {
+            registry::State::Coordinator => {
+                return Ok(TicketWork::Coordinator(CoordinatorTicket { ticket }));
+            }
+            registry::State::Granted | registry::State::Replan => {
+                let result = ticket.run_granted(cancelled, |designated, acquisition_allowed| {
+                    let mut probe = GrantedProbe {
+                        designated: designated.clone(),
+                        next_claim: designated.clone(),
+                        acquisition_allowed,
+                        contention: None,
+                    };
+                    let acquired = try_acquire(&mut probe)?;
+                    Ok(registry::GrantAttempt {
+                        acquired,
+                        next_claim: probe.next_claim,
+                        contention: probe.contention,
+                    })
+                });
+                let result = match result {
+                    Ok(registry::GrantResult::Acquired(acquired)) => {
+                        // Removing the ticket while publishing the acquired
+                        // real flocks is the terminal commit point.
+                        // Cancellation that arrives after it must not turn
+                        // success into an unwind that drops those flocks behind
+                        // the sole observer.
+                        return Ok(TicketWork::Acquired(acquired));
+                    }
+                    result => result,
+                };
+                let result = check_result(result, cancelled)?;
+                match result {
+                    registry::GrantResult::Acquired(_) => {
+                        unreachable!("terminal acquisition returned above")
+                    }
+                    registry::GrantResult::Requeued | registry::GrantResult::LostGrant => continue,
+                }
+            }
+            registry::State::Waiting => {}
+        }
+    }
+}
+
+/// The coordinator's accumulated partial holds, keyed by lockfile path.
+/// Only the registry-elected coordinator may retain these while waiting.
 #[derive(Default)]
 pub(crate) struct HeldLocks {
-    map: std::collections::BTreeMap<String, OwnedFd>,
+    map: std::collections::BTreeMap<String, HeldLock>,
+    newly_held: std::collections::BTreeMap<ResourceKey, FlockMode>,
+    abandoned_resources: std::collections::BTreeMap<ResourceKey, FlockMode>,
+    abandoned_fds: Vec<HeldLock>,
+    contention: ContentionSet,
+}
+
+struct HeldLock {
+    fd: OwnedFd,
+    mode: FlockMode,
+    resource: ResourceKey,
+}
+
+struct HeldRegistryUpdate {
+    newly_held: ClaimSet,
+    abandoned: ClaimSet,
+    contention: ContentionSet,
+    // These descriptors intentionally outlive the registry transaction that
+    // marks their resources UNKNOWN. Dropping them sooner recreates the
+    // close-before-publication lost-wake race.
+    _abandoned_fds: Vec<HeldLock>,
 }
 
 impl HeldLocks {
-    /// Release every held lock whose path is not in `keep` — the
-    /// release-partials-then-replan rule: a fresh plan keeps the
-    /// partials it still needs (dropping them would be wasted
-    /// makespan) and releases only the ones it abandoned.
-    pub(crate) fn retain_paths(&mut self, keep: &BTreeSet<String>) {
-        self.map.retain(|p, _| keep.contains(p));
+    /// Stage every partial not present with the exact same mode in `target`.
+    /// Staged fds remain locked until the registry publishes the corresponding
+    /// UNKNOWN transition.
+    pub(crate) fn retain_target(&mut self, target: &[ResourceLock]) {
+        let keep: std::collections::BTreeMap<_, _> = target
+            .iter()
+            .map(|lock| (lock.path.as_str(), lock.mode))
+            .collect();
+        let abandoned: Vec<_> = self
+            .map
+            .iter()
+            .filter_map(|(path, held)| {
+                (keep.get(path.as_str()).copied() != Some(held.mode)).then(|| path.clone())
+            })
+            .collect();
+        for path in abandoned {
+            let held = self
+                .map
+                .remove(&path)
+                .expect("staged coordinator hold disappeared");
+            self.newly_held.remove(&held.resource);
+            self.abandoned_resources.insert(held.resource, held.mode);
+            self.abandoned_fds.push(held);
+        }
     }
 
     /// Non-blocking sweep: acquire, in the given (canonical) order,
     /// every lock in `target` not already held. Returns how many NEW
-    /// locks were gained. Never blocks — the head's waiting happens
+    /// locks were gained. Never blocks — the coordinator's waiting happens
     /// on the inotify watch, not inside flock.
-    pub(crate) fn sweep(&mut self, target: &[(String, FlockMode)]) -> Result<usize> {
+    pub(crate) fn sweep(&mut self, target: &[ResourceLock]) -> Result<usize> {
         let mut gained = 0;
-        for (path, mode) in target {
-            if self.map.contains_key(path) {
+        for lock in target {
+            if self
+                .map
+                .get(&lock.path)
+                .is_some_and(|held| held.mode == lock.mode)
+            {
                 continue;
             }
-            if let Some(fd) = try_flock(path, *mode)? {
-                self.map.insert(path.clone(), fd);
-                gained += 1;
+            // A differently-mode-held path cannot be upgraded while its old
+            // open-file description remains locked. The next retain_target
+            // publishes and releases it before a later sweep retries.
+            if self.map.contains_key(&lock.path) {
+                continue;
+            }
+            match try_flock_with_witness(&lock.path, lock.mode)? {
+                TryFlockOutcome::Acquired(fd) => {
+                    self.map.insert(
+                        lock.path.clone(),
+                        HeldLock {
+                            fd,
+                            mode: lock.mode,
+                            resource: lock.resource,
+                        },
+                    );
+                    self.newly_held.insert(lock.resource, lock.mode);
+                    gained += 1;
+                }
+                TryFlockOutcome::Contended(witness) => {
+                    self.record_contention(ContentionEvidence {
+                        blocker: lock.resource,
+                        mode: lock.mode,
+                        witness,
+                    });
+                }
             }
         }
         Ok(gained)
@@ -494,47 +1050,77 @@ impl HeldLocks {
     /// must not regress accumulated progress.
     pub(crate) fn probe_complete(
         &mut self,
-        candidate: &[(String, FlockMode)],
+        candidate: &[ResourceLock],
     ) -> Result<Option<Vec<OwnedFd>>> {
-        let mut fresh: Vec<(String, OwnedFd)> = Vec::new();
-        for (path, mode) in candidate {
-            if self.map.contains_key(path) {
+        let mut fresh: Vec<(String, HeldLock)> = Vec::new();
+        for lock in candidate {
+            if self
+                .map
+                .get(&lock.path)
+                .is_some_and(|held| held.mode == lock.mode)
+            {
                 continue;
             }
-            match try_flock(path, *mode)? {
-                Some(fd) => fresh.push((path.clone(), fd)),
-                None => {
-                    // Bounce: drop only what THIS probe took.
+            if self.map.contains_key(&lock.path) {
+                drop(fresh);
+                return Ok(None);
+            }
+            match try_flock_with_witness(&lock.path, lock.mode)? {
+                TryFlockOutcome::Acquired(fd) => fresh.push((
+                    lock.path.clone(),
+                    HeldLock {
+                        fd,
+                        mode: lock.mode,
+                        resource: lock.resource,
+                    },
+                )),
+                TryFlockOutcome::Contended(witness) => {
                     drop(fresh);
+                    self.record_contention(ContentionEvidence {
+                        blocker: lock.resource,
+                        mode: lock.mode,
+                        witness,
+                    });
                     return Ok(None);
                 }
             }
         }
-        for (path, fd) in fresh {
-            self.map.insert(path, fd);
+        for (path, held) in fresh {
+            self.newly_held.insert(held.resource, held.mode);
+            self.map.insert(path, held);
         }
         let mut out = Vec::with_capacity(candidate.len());
-        for (path, _) in candidate {
+        for lock in candidate {
             out.push(
                 self.map
-                    .remove(path)
-                    .expect("probe_complete: candidate path must be held"),
+                    .remove(&lock.path)
+                    .expect("probe_complete: candidate path must be held")
+                    .fd,
             );
         }
         Ok(Some(out))
     }
 
     /// Whether every lock in `target` is currently held.
-    pub(crate) fn covers(&self, target: &[(String, FlockMode)]) -> bool {
-        target.iter().all(|(p, _)| self.map.contains_key(p))
+    pub(crate) fn covers(&self, target: &[ResourceLock]) -> bool {
+        target.iter().all(|lock| {
+            self.map
+                .get(&lock.path)
+                .is_some_and(|held| held.mode == lock.mode)
+        })
     }
 
     /// Take the fds for `target` out of the map, in target order.
     /// Caller must have verified [`Self::covers`].
-    pub(crate) fn take(&mut self, target: &[(String, FlockMode)]) -> Vec<OwnedFd> {
+    pub(crate) fn take(&mut self, target: &[ResourceLock]) -> Vec<OwnedFd> {
         target
             .iter()
-            .map(|(p, _)| self.map.remove(p).expect("take: target path must be held"))
+            .map(|lock| {
+                self.map
+                    .remove(&lock.path)
+                    .expect("take: target path must be held")
+                    .fd
+            })
             .collect()
     }
 
@@ -542,13 +1128,58 @@ impl HeldLocks {
     pub(crate) fn held_paths(&self) -> BTreeSet<String> {
         self.map.keys().cloned().collect()
     }
+
+    fn record_contention(&mut self, evidence: ContentionEvidence) {
+        self.contention.insert(evidence);
+    }
+
+    fn take_registry_update(&mut self) -> Result<HeldRegistryUpdate> {
+        Ok(HeldRegistryUpdate {
+            newly_held: claim_from_resource_modes(std::mem::take(&mut self.newly_held))?,
+            abandoned: claim_from_resource_modes(std::mem::take(&mut self.abandoned_resources))?,
+            contention: std::mem::take(&mut self.contention),
+            _abandoned_fds: std::mem::take(&mut self.abandoned_fds),
+        })
+    }
 }
 
-/// One head-loop iteration's verdict, produced by the caller's step
+fn claim_from_resource_modes(
+    resources: std::collections::BTreeMap<ResourceKey, FlockMode>,
+) -> Result<ClaimSet> {
+    let mut cpus = BTreeSet::new();
+    let mut llcs = BTreeSet::new();
+    let mut llc_mode = None;
+    for (resource, mode) in resources {
+        match resource {
+            ResourceKey::Cpu(cpu) => {
+                if mode != FlockMode::Exclusive {
+                    anyhow::bail!("CPU reservation {cpu} was held in non-exclusive mode");
+                }
+                cpus.insert(cpu);
+            }
+            ResourceKey::Llc(llc) => {
+                if llc_mode.is_some_and(|existing| existing != mode) {
+                    anyhow::bail!("coordinator accumulated mixed LLC lock modes");
+                }
+                llc_mode = Some(mode);
+                llcs.insert(llc);
+            }
+        }
+    }
+    Ok(ClaimSet::new(
+        llcs,
+        cpus,
+        llc_mode.unwrap_or(FlockMode::Shared),
+    ))
+}
+
+/// One coordinator-loop iteration's verdict, produced by the caller's step
 /// closure (which owns the path-specific planning + probing logic).
-pub(crate) enum HeadStep<T> {
-    /// Acquisition complete — `T` carries the payload (plan + fds).
-    Complete(T),
+pub(crate) enum CoordinatorStep<T> {
+    /// Acquisition complete. `claim` names the exact resource fds carried by
+    /// `value`, which may differ from the coordinator's previously published
+    /// planning alternative.
+    Complete { claim: ClaimSet, value: T },
     /// Still waiting. `claim` is the freshly planned target to publish
     /// before sleeping for the next release event.
     Waiting { claim: ClaimSet },
@@ -557,106 +1188,391 @@ pub(crate) enum HeadStep<T> {
     Abort { reason: String },
 }
 
-/// Outcome of [`acquire_as_head`].
-pub(crate) enum HeadOutcome<T> {
+/// Outcome of [`acquire_as_coordinator`].
+pub(crate) enum CoordinatorOutcome<T> {
     Acquired(T),
     Aborted { reason: String },
 }
 
-/// Claim manifest cleanup must precede marker-flock release on every exit,
-/// including a closure error or an interrupt out of the inotify poll.
-struct HeadClaimCleanup;
+struct HolderObserver {
+    mountinfo: Option<String>,
+    needles: std::collections::BTreeMap<(bool, usize), String>,
+    proof_files: std::collections::BTreeMap<ResourceKey, std::fs::File>,
+    proof_locks: BTreeSet<ResourceKey>,
+}
 
-impl Drop for HeadClaimCleanup {
-    fn drop(&mut self) {
-        clear_claim();
+#[cfg(test)]
+thread_local! {
+    static FORCE_HOLDER_OBSERVER_UNAVAILABLE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_holder_observer_unavailable_for_tests() {
+    FORCE_HOLDER_OBSERVER_UNAVAILABLE.with(|forced| forced.set(true));
+}
+
+#[cfg(test)]
+pub(crate) fn restore_holder_observer_for_tests() {
+    FORCE_HOLDER_OBSERVER_UNAVAILABLE.with(|forced| forced.set(false));
+}
+
+impl HolderObserver {
+    fn new() -> Self {
+        #[cfg(test)]
+        let forced_unavailable = FORCE_HOLDER_OBSERVER_UNAVAILABLE.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let forced_unavailable = false;
+        Self {
+            mountinfo: if forced_unavailable {
+                None
+            } else {
+                crate::flock::read_mountinfo().ok()
+            },
+            needles: std::collections::BTreeMap::new(),
+            proof_files: std::collections::BTreeMap::new(),
+            proof_locks: BTreeSet::new(),
+        }
+    }
+
+    fn observe(
+        &mut self,
+        request: &registry::ObservationRequest,
+    ) -> registry::AvailabilityObservation {
+        self.release_proofs();
+        match self.observe_proc(request) {
+            Ok(observation) => observation,
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "cannot observe reservation modes through procfs; using retained read-only flock proofs"
+                );
+                match self.observe_with_proofs(request) {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        tracing::debug!(
+                            %error,
+                            "cannot prove pending reservation availability; keeping durable observation work pending"
+                        );
+                        registry::AvailabilityObservation::default()
+                    }
+                }
+            }
+        }
+    }
+
+    fn observe_proc(
+        &mut self,
+        request: &registry::ObservationRequest,
+    ) -> Result<registry::AvailabilityObservation> {
+        let mountinfo = self
+            .mountinfo
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("/proc/self/mountinfo was unavailable"))?;
+        for &llc in request.llcs.keys() {
+            if !self.needles.contains_key(&(false, llc)) {
+                let path = PathBuf::from(super::llc_lock_path(llc));
+                let needle =
+                    crate::flock::mountinfo::needle_from_path_with_mountinfo(&path, mountinfo)?;
+                self.needles.insert((false, llc), needle);
+            }
+        }
+        for &cpu in request.cpus.keys() {
+            if !self.needles.contains_key(&(true, cpu)) {
+                let path = PathBuf::from(super::cpu_lock_path(cpu));
+                let needle =
+                    crate::flock::mountinfo::needle_from_path_with_mountinfo(&path, mountinfo)?;
+                self.needles.insert((true, cpu), needle);
+            }
+        }
+        let resource_needles: BTreeSet<String> = request
+            .llcs
+            .keys()
+            .filter_map(|llc| self.needles.get(&(false, *llc)).cloned())
+            .chain(
+                request
+                    .cpus
+                    .keys()
+                    .filter_map(|cpu| self.needles.get(&(true, *cpu)).cloned()),
+            )
+            .collect();
+        let summaries = crate::flock::read_flock_mode_summaries(&resource_needles)?;
+        let mut observation = registry::AvailabilityObservation::default();
+        for &cpu in request.cpus.keys() {
+            let needle = &self.needles[&(true, cpu)];
+            observation.cpus.insert(cpu, !summaries[needle].any_holder);
+        }
+        for &llc in request.llcs.keys() {
+            let summary = summaries[&self.needles[&(false, llc)]];
+            let availability = if summary.exclusive_holder {
+                registry::LlcAvailability::ExclusiveHeld
+            } else if summary.any_holder {
+                registry::LlcAvailability::SharedHeld
+            } else {
+                registry::LlcAvailability::Free
+            };
+            observation.llcs.insert(
+                llc,
+                registry::LlcObservation {
+                    availability,
+                    sh_resolved: true,
+                    ex_resolved: true,
+                },
+            );
+        }
+        Ok(observation)
+    }
+
+    fn proof_file(&mut self, key: ResourceKey) -> Result<&std::fs::File> {
+        if !self.proof_files.contains_key(&key) {
+            let path = match key {
+                ResourceKey::Llc(index) => super::llc_lock_path(index),
+                ResourceKey::Cpu(index) => super::cpu_lock_path(index),
+            };
+            let file = std::fs::OpenOptions::new().read(true).open(&path)?;
+            self.proof_files.insert(key, file);
+        }
+        Ok(&self.proof_files[&key])
+    }
+
+    fn try_proof(&mut self, key: ResourceKey, mode: FlockMode) -> Result<bool> {
+        use rustix::fs::{FlockOperation, flock};
+        let operation = match mode {
+            FlockMode::Exclusive => FlockOperation::NonBlockingLockExclusive,
+            FlockMode::Shared => FlockOperation::NonBlockingLockShared,
+        };
+        match flock(self.proof_file(key)?, operation) {
+            Ok(()) => {
+                self.proof_locks.insert(key);
+                Ok(true)
+            }
+            Err(error) if error == rustix::io::Errno::WOULDBLOCK => Ok(false),
+            Err(error) => Err(std::io::Error::from_raw_os_error(error.raw_os_error()).into()),
+        }
+    }
+
+    fn observe_with_proofs(
+        &mut self,
+        request: &registry::ObservationRequest,
+    ) -> Result<registry::AvailabilityObservation> {
+        let mut observation = registry::AvailabilityObservation::default();
+        for &cpu in request.cpus.keys() {
+            if self.try_proof(ResourceKey::Cpu(cpu), FlockMode::Exclusive)? {
+                observation.cpus.insert(cpu, true);
+            }
+        }
+        for &llc in request.llcs.keys() {
+            let key = ResourceKey::Llc(llc);
+            if self.try_proof(key, FlockMode::Exclusive)? {
+                observation.llcs.insert(
+                    llc,
+                    registry::LlcObservation {
+                        availability: registry::LlcAvailability::Free,
+                        sh_resolved: true,
+                        ex_resolved: true,
+                    },
+                );
+            } else if self.try_proof(key, FlockMode::Shared)? {
+                observation.llcs.insert(
+                    llc,
+                    registry::LlcObservation {
+                        availability: registry::LlcAvailability::SharedHeld,
+                        sh_resolved: true,
+                        ex_resolved: false,
+                    },
+                );
+            }
+        }
+        Ok(observation)
+    }
+
+    fn release_proofs(&mut self) {
+        use rustix::fs::{FlockOperation, flock};
+        for key in std::mem::take(&mut self.proof_locks) {
+            if let Some(file) = self.proof_files.get(&key) {
+                let _ = flock(file, FlockOperation::Unlock);
+            }
+        }
     }
 }
 
-/// Run the head loop: RE-PLAN ON EVERY WAKE (the step closure is
-/// called afresh each iteration and must plan from live holder state
-/// — plans are never cached across waits), publish the claim, sleep
-/// on the lock-dir inotify watch, and continue until the authoritative
-/// lock release makes a plan complete.
-///
-/// The caller must hold the queue `LOCK_EX` (the head license). This
-/// function additionally takes the head marker flock for claim
-/// liveness and releases it (plus any partial holds inside `held`)
-/// on every exit path.
-pub(crate) fn acquire_as_head<T>(
-    step: impl FnMut(&mut HeldLocks) -> Result<HeadStep<T>>,
-) -> Result<HeadOutcome<T>> {
-    acquire_as_head_impl(None, step)
+/// Run the elected coordinator loop. The step closure re-plans from live holder
+/// state after each relevant wake; the ticket's exact claim is updated before
+/// compatible successors are granted.
+pub(crate) fn acquire_as_coordinator<T>(
+    coordinator: CoordinatorTicket,
+    step: impl FnMut(&mut HeldLocks) -> Result<CoordinatorStep<T>>,
+) -> Result<CoordinatorOutcome<T>> {
+    acquire_as_coordinator_impl(coordinator, None, step)
 }
 
-/// Cancellation-aware variant of [`acquire_as_head`].
+/// Cancellation-aware variant of [`acquire_as_coordinator`].
 ///
-/// The [`QueueTurn`] returned by [`wait_for_queue_turn_interruptible`] keeps
-/// the private wake registration alive, so cancellation interrupts the
-/// inotify poll rather than waiting for its fallback tick.
-pub(crate) fn acquire_as_head_interruptible<T>(
+/// The ticket keeps its private wake registration alive across the
+/// waiter-to-coordinator transition, so cancellation interrupts inotify rather
+/// than waiting for the fallback tick.
+pub(crate) fn acquire_as_coordinator_interruptible<T>(
+    coordinator: CoordinatorTicket,
     cancelled: &AtomicBool,
-    step: impl FnMut(&mut HeldLocks) -> Result<HeadStep<T>>,
-) -> Result<HeadOutcome<T>> {
-    acquire_as_head_impl(Some(cancelled), step)
+    step: impl FnMut(&mut HeldLocks) -> Result<CoordinatorStep<T>>,
+) -> Result<CoordinatorOutcome<T>> {
+    acquire_as_coordinator_impl(coordinator, Some(cancelled), step)
 }
 
-fn acquire_as_head_impl<T>(
+fn acquire_as_coordinator_impl<T>(
+    mut coordinator: CoordinatorTicket,
     cancelled: Option<&AtomicBool>,
-    mut step: impl FnMut(&mut HeldLocks) -> Result<HeadStep<T>>,
-) -> Result<HeadOutcome<T>> {
+    mut step: impl FnMut(&mut HeldLocks) -> Result<CoordinatorStep<T>>,
+) -> Result<CoordinatorOutcome<T>> {
     check_interrupted(cancelled)?;
     let watch = check_result(LockDirWatch::new(), cancelled)?;
-    // The marker should be free: at most one head exists (queue EX)
-    // and a crashed head's marker flock died with it. A held marker
-    // here means a protocol bug — surface it rather than wedge.
-    let _marker = match try_flock(head_marker_path(), FlockMode::Exclusive) {
-        Ok(Some(marker)) => marker,
-        Ok(None) => {
-            return Err(anyhow::anyhow!(
-                "acquisition protocol: head marker {} is held while the queue \
-                 lock was free to take — two heads must never coexist",
-                head_marker_path()
-            ));
-        }
-        Err(error) => {
-            check_interrupted(cancelled)?;
-            return Err(error);
-        }
-    };
-    // Declared after `_marker` so Rust's reverse drop order removes the
-    // manifest while marker liveness is still held.
-    let _claim_cleanup = HeadClaimCleanup;
     check_interrupted(cancelled)?;
     let mut held = HeldLocks::default();
-    let mut last_claim: Option<ClaimSet> = None;
+    let mut watched_resources = ClaimSet::default();
+    let mut observer = HolderObserver::new();
+    let mut first = true;
+    let mut retry_due = false;
+    let mut retry_deadline = std::time::Instant::now() + COORDINATOR_WAKE_FALLBACK;
+    let mut pending_events = LockDirEvents::default();
     let outcome = loop {
         check_interrupted(cancelled)?;
-        let next = match step(&mut held) {
-            Ok(next) => next,
-            Err(error) => {
-                check_interrupted(cancelled)?;
-                return Err(error);
-            }
-        };
-        check_interrupted(cancelled)?;
-        match next {
-            HeadStep::Complete(t) => break HeadOutcome::Acquired(t),
-            HeadStep::Abort { reason } => break HeadOutcome::Aborted { reason },
-            HeadStep::Waiting { claim } => {
-                if last_claim.as_ref() != Some(&claim) {
-                    check_result(publish_claim(&claim), cancelled)?;
-                    last_claim = Some(claim);
+        pending_events.merge(check_result(watch.drain(&watched_resources), cancelled)?);
+        let closed_tickets: Vec<_> = pending_events.liveness_closes.iter().copied().collect();
+        let mut snapshot = check_result(
+            coordinator.ticket.schedule(
+                None,
+                &pending_events.cpu_closes,
+                &pending_events.llc_closes,
+                pending_events.overflow,
+                None,
+                &[],
+                None,
+                &closed_tickets,
+                first || retry_due,
+                pending_events.overflow,
+                cancelled,
+            ),
+            cancelled,
+        )?;
+        retry_due = false;
+        let mut liveness_due_in = snapshot.liveness_due_in;
+        watched_resources = snapshot.watch.clone();
+        let mut should_step = first || snapshot.should_step;
+        if let Some(request) = snapshot.observation.take() {
+            let observation = observer.observe(&request);
+            snapshot = check_result(
+                coordinator.ticket.apply_observation(
+                    &request,
+                    &observation,
+                    || observer.release_proofs(),
+                    cancelled,
+                ),
+                cancelled,
+            )?;
+            liveness_due_in = snapshot.liveness_due_in;
+            watched_resources = snapshot.watch.clone();
+            should_step |= snapshot.should_step;
+        }
+        let observation_pending = snapshot.observation.is_some();
+        pending_events = LockDirEvents::default();
+
+        if should_step {
+            let next = match step(&mut held) {
+                Ok(next) => next,
+                Err(error) => {
+                    check_interrupted(cancelled)?;
+                    return Err(error);
                 }
-                check_interrupted(cancelled)?;
-                // Drain our own attempt's open/close churn so we sleep
-                // on EXTERNAL events, then park until a lockfile
-                // closes somewhere (a release — or a peer bounce,
-                // which costs one spurious re-plan) or the fallback
-                // tick bounds the staleness window.
-                watch.drain();
-                check_interrupted(cancelled)?;
-                check_result(watch.wait(HEAD_WAKE_FALLBACK), cancelled)?;
+            };
+            check_interrupted(cancelled)?;
+            match next {
+                CoordinatorStep::Complete { claim, value } => {
+                    check_interrupted(cancelled)?;
+                    held.retain_target(&[]);
+                    let update = held.take_registry_update()?;
+                    let markers = update.contention.marker_vec();
+                    // `finish_acquired` publishes the held flocks and removes
+                    // the coordinator record atomically. Once it returns
+                    // success, cancellation is for the caller's next lifecycle
+                    // phase—not grounds to roll back this committed acquire.
+                    coordinator.ticket.finish_acquired(
+                        &claim,
+                        &update.abandoned,
+                        &markers,
+                        cancelled,
+                    )?;
+                    drop(update);
+                    break CoordinatorOutcome::Acquired(value);
+                }
+                CoordinatorStep::Abort { reason } => {
+                    break CoordinatorOutcome::Aborted { reason };
+                }
+                CoordinatorStep::Waiting { claim } => {
+                    if claim.is_empty() {
+                        return Err(anyhow::anyhow!(
+                            "registry coordinator produced an empty priority claim"
+                        ));
+                    }
+                    let update = held.take_registry_update()?;
+                    let markers = update.contention.marker_vec();
+                    let snapshot = check_result(
+                        coordinator.ticket.schedule(
+                            Some(&claim),
+                            &BTreeSet::new(),
+                            &BTreeSet::new(),
+                            false,
+                            Some(&update.newly_held),
+                            &markers,
+                            Some(&update.abandoned),
+                            &closed_tickets,
+                            false,
+                            false,
+                            cancelled,
+                        ),
+                        cancelled,
+                    )?;
+                    drop(update);
+                    let observe_before_sleep = snapshot.observation.is_some();
+                    liveness_due_in = snapshot.liveness_due_in;
+                    watched_resources = snapshot.watch;
+                    if observe_before_sleep {
+                        first = false;
+                        pending_events = LockDirEvents::default();
+                        continue;
+                    }
+                }
+            }
+        }
+        first = false;
+        check_interrupted(cancelled)?;
+        let retry_interval = if observation_pending {
+            OBSERVATION_RETRY_FALLBACK
+        } else {
+            COORDINATOR_WAKE_FALLBACK
+        };
+        let now = std::time::Instant::now();
+        retry_deadline = retry_deadline.min(now + retry_interval);
+        let liveness_deadline = now + liveness_due_in;
+        let wake_deadline = retry_deadline.min(liveness_deadline);
+        match check_result(
+            watch.wait(
+                wake_deadline.saturating_duration_since(now),
+                &watched_resources,
+            ),
+            cancelled,
+        )? {
+            Some(events) => {
+                pending_events.merge(events);
+            }
+            None => {
+                // A global liveness deadline is persisted in the registry, so
+                // rapid coordinator handoff cannot postpone it. If that
+                // deadline alone woke us, the next schedule performs the due
+                // sweep without also manufacturing a whole-watch retry.
+                retry_due = liveness_deadline >= retry_deadline;
+                if retry_due {
+                    retry_deadline = std::time::Instant::now() + retry_interval;
+                }
             }
         }
     };
@@ -665,15 +1581,15 @@ fn acquire_as_head_impl<T>(
 
 /// Canonical global lock order for a resource set: LLC locks by
 /// ascending index, then CPU locks by ascending index. Every
-/// acquirer — fast path and head alike — walks locks in this order
-/// (protocol rule 3), which is what lets the head hold partials
+/// acquirer — fast path and coordinator alike — walks locks in this order,
+/// which is what lets the coordinator hold partials
 /// safely and keeps overlapping fast-path sets from half-blocking
 /// each other.
 pub(crate) fn canonical_lock_order(
     llc_indices: &[usize],
     llc_mode: FlockMode,
     cpus: &[usize],
-) -> Vec<(String, FlockMode)> {
+) -> Vec<ResourceLock> {
     let mut llcs: Vec<usize> = llc_indices.to_vec();
     llcs.sort_unstable();
     llcs.dedup();
@@ -682,10 +1598,18 @@ pub(crate) fn canonical_lock_order(
     cpu_sorted.dedup();
     let mut out = Vec::with_capacity(llcs.len() + cpu_sorted.len());
     for idx in llcs {
-        out.push((super::llc_lock_path(idx), llc_mode));
+        out.push(ResourceLock {
+            path: super::llc_lock_path(idx),
+            mode: llc_mode,
+            resource: ResourceKey::Llc(idx),
+        });
     }
     for cpu in cpu_sorted {
-        out.push((super::cpu_lock_path(cpu), FlockMode::Exclusive));
+        out.push(ResourceLock {
+            path: super::cpu_lock_path(cpu),
+            mode: FlockMode::Exclusive,
+            resource: ResourceKey::Cpu(cpu),
+        });
     }
     out
 }
