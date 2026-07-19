@@ -307,11 +307,11 @@ fn gc_cache_at(root: &std::path::Path, now: SystemTime, max_bytes: u64) -> Resul
 fn maybe_gc_cache(root: &std::path::Path) -> Result<()> {
     let stamp = root.join(CACHE_GC_STAMP);
     if stamp.metadata().ok().is_some_and(|metadata| {
-        !metadata
+        metadata
             .modified()
             .ok()
             .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-            .is_some_and(|age| age >= CACHE_GC_INTERVAL)
+            .is_none_or(|age| age < CACHE_GC_INTERVAL)
     }) {
         return Ok(());
     }

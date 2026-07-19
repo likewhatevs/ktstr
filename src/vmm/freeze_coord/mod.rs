@@ -15049,7 +15049,7 @@ impl KtstrVm {
         // returns None and the cache stays None.
         if let Some(ref cache) = tcr_el1_cache
             && cache.load(Ordering::Acquire) == 0
-            && let Some(val) = exit_dispatch::read_tcr_el1(&mut bsp)
+            && let Some(val) = exit_dispatch::read_tcr_el1(&bsp)
             && val != 0
         {
             cache.store(val, Ordering::Release);
@@ -15064,7 +15064,7 @@ impl KtstrVm {
         // `phys_base` resolution against a frozen VM) get the live
         // CR3 instead of the bootstrap zero.
         if cr3_cache.load(Ordering::Acquire) == 0
-            && let Some(val) = exit_dispatch::read_cr3(&mut bsp)
+            && let Some(val) = exit_dispatch::read_cr3(&bsp)
             && val != 0
         {
             cr3_cache.store(val, Ordering::Release);

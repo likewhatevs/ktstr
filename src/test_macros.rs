@@ -471,7 +471,7 @@ mod tests {
                         panic!("ktstr: FAIL: {e:#}");
                     }
                     match crate::test_support::classify_host_error(&e, false) {
-                        crate::test_support::HostClass::Skip { .. } => return,
+                        crate::test_support::HostClass::Skip { .. } => {}
                         crate::test_support::HostClass::Fail { reason } => {
                             panic!("ktstr: FAIL: {reason}")
                         }

@@ -113,6 +113,7 @@ pub(super) fn read_holders_from_contents(contents: &str, needle: &str) -> Vec<Ho
 /// [`read_holders_batch_with_mountinfo`]. Keeping PID resolution
 /// separate from parsing makes the once-per-distinct-PID guarantee
 /// directly testable without depending on live `/proc/{pid}` state.
+#[cfg(test)]
 fn read_holders_for_needles_from_contents_with(
     contents: &str,
     needles: &[String],
@@ -775,7 +776,7 @@ malformed
         assert!(
             pid_rows
                 .iter()
-                .all(|row| row.iter().any(|pid| *pid == our_pid)),
+                .all(|row| row.contains(&our_pid)),
             "our PID must appear for both held lockfiles: {pid_rows:?}",
         );
         assert_eq!(
