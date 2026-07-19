@@ -42,16 +42,12 @@ pub enum SchedulerArtifactSpec {
 }
 
 impl SchedulerArtifactSpec {
-    fn from_scheduler_spec(
-        spec: &crate::test_support::SchedulerSpec,
-    ) -> anyhow::Result<Self> {
+    fn from_scheduler_spec(spec: &crate::test_support::SchedulerSpec) -> anyhow::Result<Self> {
         match spec {
             crate::test_support::SchedulerSpec::Discover(package) => {
                 Ok(Self::Discover((*package).to_string()))
             }
-            crate::test_support::SchedulerSpec::Path(path) => {
-                Ok(Self::Path((*path).to_string()))
-            }
+            crate::test_support::SchedulerSpec::Path(path) => Ok(Self::Path((*path).to_string())),
             crate::test_support::SchedulerSpec::Eevdf
             | crate::test_support::SchedulerSpec::KernelBuiltin { .. } => {
                 anyhow::bail!("kernel-only scheduler has no artifact manifest identity")
@@ -85,11 +81,10 @@ struct CachedSchedulerArtifactManifest {
     manifest: Arc<SchedulerArtifactManifest>,
 }
 
-fn scheduler_manifest_cache(
-) -> &'static Mutex<BTreeMap<PathBuf, CachedSchedulerArtifactManifest>> {
-    static CACHE: OnceLock<
-        Mutex<BTreeMap<PathBuf, CachedSchedulerArtifactManifest>>,
-    > = OnceLock::new();
+fn scheduler_manifest_cache() -> &'static Mutex<BTreeMap<PathBuf, CachedSchedulerArtifactManifest>>
+{
+    static CACHE: OnceLock<Mutex<BTreeMap<PathBuf, CachedSchedulerArtifactManifest>>> =
+        OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
@@ -155,13 +150,12 @@ fn read_scheduler_artifact_manifest(
         "scheduler artifact manifest changed while reading: {}",
         manifest_path.display()
     );
-    let manifest: SchedulerArtifactManifest =
-        serde_json::from_slice(&bytes).map_err(|error| {
-            anyhow::anyhow!(
-                "parse scheduler artifact manifest {}: {error}",
-                manifest_path.display()
-            )
-        })?;
+    let manifest: SchedulerArtifactManifest = serde_json::from_slice(&bytes).map_err(|error| {
+        anyhow::anyhow!(
+            "parse scheduler artifact manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
     let manifest = Arc::new(manifest);
     if immutable {
         scheduler_manifest_cache()
@@ -188,7 +182,10 @@ fn validate_scheduler_artifact(path: &Path) -> anyhow::Result<()> {
         );
     }
     let canonical = std::fs::canonicalize(path).map_err(|error| {
-        anyhow::anyhow!("canonicalize scheduler artifact {}: {error}", path.display())
+        anyhow::anyhow!(
+            "canonicalize scheduler artifact {}: {error}",
+            path.display()
+        )
     })?;
     if canonical.as_path() != path {
         anyhow::bail!(
@@ -482,8 +479,11 @@ mod tests {
             }],
         };
         let path = dir.join("manifest.json");
-        std::fs::write(&path, serde_json::to_vec(&manifest).expect("serialize manifest"))
-            .expect("write manifest");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
         (path, manifest)
     }
 

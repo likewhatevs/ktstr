@@ -15,14 +15,7 @@ fn acquire_resource_locks(
     cpus: &[usize],
     cpu_mode: FlockMode,
 ) -> anyhow::Result<LockOutcome> {
-    acquire_resource_locks_waiting_impl(
-        llc_indices,
-        llc_mode,
-        cpus,
-        cpu_mode,
-        false,
-        None,
-    )
+    acquire_resource_locks_waiting_impl(llc_indices, llc_mode, cpus, cpu_mode, false, None)
 }
 
 fn acquire_resource_locks_waiting(
@@ -32,14 +25,7 @@ fn acquire_resource_locks_waiting(
     cpu_mode: FlockMode,
     wait: bool,
 ) -> anyhow::Result<LockOutcome> {
-    acquire_resource_locks_waiting_impl(
-        llc_indices,
-        llc_mode,
-        cpus,
-        cpu_mode,
-        wait,
-        None,
-    )
+    acquire_resource_locks_waiting_impl(llc_indices, llc_mode, cpus, cpu_mode, wait, None)
 }
 
 #[test]
@@ -245,11 +231,7 @@ fn resource_lock_exclusive_includes_explicit_cpu_bridge() {
 fn whole_perf_derived_cpu_bridge_conflicts_with_overcommit() {
     let _prefixes = LockPrefixesGuard::new();
     let host = HostTopology::new_for_tests(&[(vec![90410, 90411], 0)]);
-    let whole = super::super::acquire_whole_llc_locks(
-        &host,
-        &[0],
-    )
-    .unwrap();
+    let whole = super::super::acquire_whole_llc_locks(&host, &[0]).unwrap();
     let (_, locks) = unwrap_acquired(whole, Some("fresh public whole-domain acquire"));
     assert_eq!(locks.len(), 3, "LLC EX plus both full-domain CPU EX locks");
     let bridge = acquire_overcommit_bridge(&[], &[90411], false, None).unwrap();
@@ -408,13 +390,8 @@ fn resource_lock_empty_llc_indices() {
         llc_indices: vec![],
         locks: Vec::new(),
     };
-    let outcome = acquire_resource_locks(
-        &[],
-        LlcLockMode::Exclusive,
-        &[],
-        FlockMode::Exclusive,
-    )
-    .unwrap();
+    let outcome =
+        acquire_resource_locks(&[], LlcLockMode::Exclusive, &[], FlockMode::Exclusive).unwrap();
     let (llc_offset, locks) = unwrap_acquired(outcome, None);
     assert_eq!(llc_offset, 0);
     assert!(locks.is_empty());
@@ -884,16 +861,8 @@ fn perf_grain_two_disjoint_cells_coexist_on_huge_llc() {
     drop((a, b));
     let _fresh = LockPrefixesGuard::new();
     let whole = host.compute_pinning(&topo, true, 0).unwrap();
-    let first = super::super::acquire_whole_llc_locks(
-        &host,
-        &whole.llc_indices,
-    )
-    .unwrap();
-    let second = super::super::acquire_whole_llc_locks(
-        &host,
-        &whole.llc_indices,
-    )
-    .unwrap();
+    let first = super::super::acquire_whole_llc_locks(&host, &whole.llc_indices).unwrap();
+    let second = super::super::acquire_whole_llc_locks(&host, &whole.llc_indices).unwrap();
     assert!(
         matches!(first, LockOutcome::Acquired { .. }),
         "first whole-LLC exclusive reservation acquires",

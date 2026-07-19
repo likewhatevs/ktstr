@@ -2227,14 +2227,14 @@ fn result_to_exit_code_scheduler_build_refused_through_nested_context_routes_to_
 /// breakage as its expected scheduler failure.
 #[test]
 fn result_to_exit_code_framework_infrastructure_failure_bypasses_expect_err() {
-    let err = Err(anyhow::Error::new(
-        crate::vmm::host_topology::TopologyInsufficient {
+    let err = Err(
+        anyhow::Error::new(crate::vmm::host_topology::TopologyInsufficient {
             reason: "injected underlying capacity-looking errno".into(),
-        },
-    )
-    .context("injected MAP_PRIVATE prepared-initrd overlay failure")
-    .context(crate::test_support::eval::FrameworkInfrastructureFailure)
-    .context("run ktstr_test VM"));
+        })
+        .context("injected MAP_PRIVATE prepared-initrd overlay failure")
+        .context(crate::test_support::eval::FrameworkInfrastructureFailure)
+        .context("run ktstr_test VM"),
+    );
     assert_eq!(
         result_to_exit_code(err, true, false),
         EXIT_FAIL,

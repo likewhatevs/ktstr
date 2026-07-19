@@ -483,10 +483,7 @@ mod tests {
         let panic = result.expect_err(
             "macro/direct expect_err path must hard-fail framework infrastructure errors",
         );
-        let message = panic
-            .downcast_ref::<String>()
-            .cloned()
-            .unwrap_or_default();
+        let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
         assert!(
             message.contains("ktstr: FAIL:")
                 && message.contains("injected prepared-initrd CAS failure"),

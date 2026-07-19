@@ -32,8 +32,8 @@ use super::extract_export_output_arg;
 use super::{
     HostClass, KTSTR_TESTS, KtstrTestEntry, TopoOverride, classify_host_error, collect_sidecars,
     extract_export_check_test_arg, extract_export_test_arg, extract_shell_test_arg,
-    extract_test_fn_arg, extract_topo_arg, find_test, format_callback_profile,
-    format_kvm_stats, format_verifier_stats, maybe_dispatch_vm_test, parse_topo_string,
+    extract_test_fn_arg, extract_topo_arg, find_test, format_callback_profile, format_kvm_stats,
+    format_verifier_stats, maybe_dispatch_vm_test, parse_topo_string,
     propagate_rust_env_from_cmdline, record_skip_sidecar, resolve_test_kernel,
     run_ktstr_test_inner, sidecar_dir, try_flush_profraw,
 };
@@ -732,8 +732,7 @@ fn is_test_sentinel(name: &str) -> bool {
 #[cfg(not(feature = "export"))]
 fn maybe_dispatch_export() -> Option<i32> {
     let args: Vec<String> = std::env::args().collect();
-    let _ = extract_export_check_test_arg(&args)
-        .or_else(|| extract_export_test_arg(&args))?;
+    let _ = extract_export_check_test_arg(&args).or_else(|| extract_export_test_arg(&args))?;
     eprintln!(
         "ktstr export: this test binary was built without the `export` cargo \
          feature, so `cargo ktstr export <name>` cannot reach the export pipeline \
@@ -2250,48 +2249,48 @@ fn run_verifier_cell_inner(
         path
     } else {
         match sched.binary {
-        // A cargo-ktstr parent prebuilds every selected Discover package once
-        // and exports the same immutable exact-identity manifest used by
-        // ordinary and coverage tests. A direct/manual cell invocation has no
-        // manifest and retains on-demand resolution. Once a manifest is
-        // present, lookup failure is fatal and MUST NOT silently rebuild.
-        SchedulerSpec::Discover(pkg) => {
-            match crate::build_and_find_binary(pkg, sched.manifest_dir) {
-                Ok(path) => path,
-                Err(e) => {
-                    eprintln!("ktstr verifier: build scheduler {pkg:?}: {e:#}");
-                    return 1;
+            // A cargo-ktstr parent prebuilds every selected Discover package once
+            // and exports the same immutable exact-identity manifest used by
+            // ordinary and coverage tests. A direct/manual cell invocation has no
+            // manifest and retains on-demand resolution. Once a manifest is
+            // present, lookup failure is fatal and MUST NOT silently rebuild.
+            SchedulerSpec::Discover(pkg) => {
+                match crate::build_and_find_binary(pkg, sched.manifest_dir) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        eprintln!("ktstr verifier: build scheduler {pkg:?}: {e:#}");
+                        return 1;
+                    }
                 }
             }
-        }
-        SchedulerSpec::Path(p) => {
-            let path = std::path::PathBuf::from(p);
-            if !path.exists() {
-                eprintln!("ktstr verifier: scheduler binary not found: {p}");
-                return 1;
+            SchedulerSpec::Path(p) => {
+                let path = std::path::PathBuf::from(p);
+                if !path.exists() {
+                    eprintln!("ktstr verifier: scheduler binary not found: {p}");
+                    return 1;
+                }
+                path
             }
-            path
+            // Eevdf + KernelBuiltin are filtered at list time in
+            // list_verifier_cells_all, so nextest dispatch never reaches
+            // these arms. The SKIP arms remain as defense-in-depth for
+            // direct `--exact verifier/<eevdf>/...` invocation outside
+            // nextest.
+            SchedulerSpec::Eevdf => {
+                *out_skipped = true;
+                println!(
+                    "ktstr verifier: SKIP cell {full_name} (Eevdf has no userspace binary to verify)",
+                );
+                return 0;
+            }
+            SchedulerSpec::KernelBuiltin { .. } => {
+                *out_skipped = true;
+                println!(
+                    "ktstr verifier: SKIP cell {full_name} (KernelBuiltin has no userspace binary to verify)",
+                );
+                return 0;
+            }
         }
-        // Eevdf + KernelBuiltin are filtered at list time in
-        // list_verifier_cells_all, so nextest dispatch never reaches
-        // these arms. The SKIP arms remain as defense-in-depth for
-        // direct `--exact verifier/<eevdf>/...` invocation outside
-        // nextest.
-        SchedulerSpec::Eevdf => {
-            *out_skipped = true;
-            println!(
-                "ktstr verifier: SKIP cell {full_name} (Eevdf has no userspace binary to verify)",
-            );
-            return 0;
-        }
-        SchedulerSpec::KernelBuiltin { .. } => {
-            *out_skipped = true;
-            println!(
-                "ktstr verifier: SKIP cell {full_name} (KernelBuiltin has no userspace binary to verify)",
-            );
-            return 0;
-        }
-    }
     };
 
     let ktstr_bin = match std::env::current_exe() {

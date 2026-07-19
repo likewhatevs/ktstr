@@ -129,9 +129,7 @@ fn cache_dir() -> Result<PathBuf> {
 }
 
 fn cache_file_name(hash: u64) -> String {
-    format!(
-        "v{SCHEMA_VERSION}_{ANALYZER_FINGERPRINT}_{CARGO_LOCK_FINGERPRINT}_{hash:016x}.bin"
-    )
+    format!("v{SCHEMA_VERSION}_{ANALYZER_FINGERPRINT}_{CARGO_LOCK_FINGERPRINT}_{hash:016x}.bin")
 }
 
 fn cache_lock_name(hash: u64) -> String {
@@ -139,8 +137,7 @@ fn cache_lock_name(hash: u64) -> String {
 }
 
 fn current_hash_from_cache_name(name: &str) -> Option<u64> {
-    let prefix =
-        format!("v{SCHEMA_VERSION}_{ANALYZER_FINGERPRINT}_{CARGO_LOCK_FINGERPRINT}_");
+    let prefix = format!("v{SCHEMA_VERSION}_{ANALYZER_FINGERPRINT}_{CARGO_LOCK_FINGERPRINT}_");
     let hash = name.strip_prefix(&prefix)?.strip_suffix(".bin")?;
     (hash.len() == 16).then(|| u64::from_str_radix(hash, 16).ok())?
 }
@@ -167,8 +164,9 @@ fn remove_if_present(path: &std::path::Path) -> Result<bool> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error)
-            .with_context(|| format!("remove cast-analysis cache {}", path.display())),
+        Err(error) => {
+            Err(error).with_context(|| format!("remove cast-analysis cache {}", path.display()))
+        }
     }
 }
 
@@ -269,8 +267,7 @@ fn gc_cache_at(root: &std::path::Path, now: SystemTime, max_bytes: u64) -> Resul
         }
     }
 
-    let current_lock_prefix =
-        format!("{ANALYZER_FINGERPRINT}_{CARGO_LOCK_FINGERPRINT}_");
+    let current_lock_prefix = format!("{ANALYZER_FINGERPRINT}_{CARGO_LOCK_FINGERPRINT}_");
     for entry in std::fs::read_dir(&lock_dir)
         .with_context(|| format!("scan cast-analysis locks {}", lock_dir.display()))?
     {
@@ -577,20 +574,18 @@ mod tests {
         .unwrap();
         let live_lock_path = lock_dir.join(cache_lock_name(live_hash));
         let live_lock = open_gc_lock(&live_lock_path).unwrap();
-        crate::cache::content::flock_retry(
-            &live_lock,
-            rustix::fs::FlockOperation::LockExclusive,
-        )
-        .unwrap();
+        crate::cache::content::flock_retry(&live_lock, rustix::fs::FlockOperation::LockExclusive)
+            .unwrap();
         std::fs::write(&obsolete, vec![0u8; 4096]).unwrap();
 
         let future = SystemTime::now() + CACHE_MAX_AGE + Duration::from_secs(1);
         gc_cache_at(root.path(), future, 0).unwrap();
-        assert!(
-            !root.path().join(cache_file_name(removable_hash)).exists()
-        );
+        assert!(!root.path().join(cache_file_name(removable_hash)).exists());
         assert!(!lock_dir.join(cache_lock_name(removable_hash)).exists());
-        assert!(!obsolete.exists(), "obsolete schema records must be bounded");
+        assert!(
+            !obsolete.exists(),
+            "obsolete schema records must be bounded"
+        );
         assert!(
             root.path().join(cache_file_name(live_hash)).exists(),
             "GC must skip a record whose builder lock is live"

@@ -851,8 +851,7 @@ impl Ticket {
         let publication_changed = state_epoch != callback_epoch
             || prefix_epoch != callback_epoch
             || record.issue_serial != callback_serial;
-        let unissued_change =
-            earlier_invalidated || current_watch_serial != callback_serial;
+        let unissued_change = earlier_invalidated || current_watch_serial != callback_serial;
         let stale = publication_changed || unissued_change;
         if record.state != expected_state || record.claim != designated || stale {
             // A changed publication token means the coordinator already issued
@@ -1132,10 +1131,8 @@ impl Ticket {
 
         let watch_llcs = decode_header_bitset(&header, layout, B_WATCH_LLCS);
         let watch_cpus = decode_header_bitset(&header, layout, B_WATCH_CPUS);
-        let watch_llc_exclusive =
-            decode_header_bitset(&header, layout, B_WATCH_LLC_EXCLUSIVE);
-        let watch_cpu_exclusive =
-            decode_header_bitset(&header, layout, B_WATCH_CPU_EXCLUSIVE);
+        let watch_llc_exclusive = decode_header_bitset(&header, layout, B_WATCH_LLC_EXCLUSIVE);
+        let watch_cpu_exclusive = decode_header_bitset(&header, layout, B_WATCH_CPU_EXCLUSIVE);
         let watch = ClaimSet::with_claim_modes(
             watch_llcs,
             watch_cpus,
@@ -1155,8 +1152,7 @@ impl Ticket {
                 .map(|word| {
                     read_u64(
                         record_bytes,
-                        record_bitset_offset(layout, which)
-                            + word * std::mem::size_of::<u64>(),
+                        record_bitset_offset(layout, which) + word * std::mem::size_of::<u64>(),
                     )
                 })
                 .collect()
@@ -1215,10 +1211,7 @@ impl Ticket {
             // snapshot and are discarded without another planner pass.
             should_step: false,
             observation: None,
-            liveness_due_in: liveness_due_in_from_header(
-                &header,
-                monotonic_now_ns()?,
-            ),
+            liveness_due_in: liveness_due_in_from_header(&header, monotonic_now_ns()?),
         }))
     }
 
@@ -1622,7 +1615,12 @@ pub(super) fn probe_snapshots_for_tests(
         llc_ex_available: vec![0; layout.words],
     };
     for &(cpu, state) in cpu_availability {
-        set_snapshot_bit(&mut availability.cpu_known, cpu, state.is_some(), layout.bits)?;
+        set_snapshot_bit(
+            &mut availability.cpu_known,
+            cpu,
+            state.is_some(),
+            layout.bits,
+        )?;
         set_snapshot_bit(
             &mut availability.cpu_sh_available,
             cpu,
@@ -1637,7 +1635,12 @@ pub(super) fn probe_snapshots_for_tests(
         )?;
     }
     for &(llc, state) in llc_availability {
-        set_snapshot_bit(&mut availability.llc_known, llc, state.is_some(), layout.bits)?;
+        set_snapshot_bit(
+            &mut availability.llc_known,
+            llc,
+            state.is_some(),
+            layout.bits,
+        )?;
         set_snapshot_bit(
             &mut availability.llc_sh_available,
             llc,
@@ -2026,13 +2029,9 @@ pub(super) fn exercise_known_free_close_storm_for_tests(
 }
 
 #[cfg(test)]
-pub(super) fn exercise_llc_sh_only_shared_to_free_close_for_tests(
-) -> Result<(bool, bool, u64, u64)> {
-    let claim = ClaimSet::new(
-        [1usize],
-        std::iter::empty(),
-        FlockMode::Shared,
-    );
+pub(super) fn exercise_llc_sh_only_shared_to_free_close_for_tests() -> Result<(bool, bool, u64, u64)>
+{
+    let claim = ClaimSet::new([1usize], std::iter::empty(), FlockMode::Shared);
     let mut ticket = Ticket::register(claim.clone(), claim, None)?;
     let empty = BTreeSet::new();
     let initial = ticket.schedule(
@@ -2058,9 +2057,7 @@ pub(super) fn exercise_llc_sh_only_shared_to_free_close_for_tests(
         .copied()
         .ok_or_else(|| anyhow::anyhow!("SH-only LLC request omitted its resource"))?;
     if requested_modes.0.is_none() || requested_modes.1.is_some() {
-        anyhow::bail!(
-            "SH-only LLC watch requested the wrong modes: {requested_modes:?}"
-        );
+        anyhow::bail!("SH-only LLC watch requested the wrong modes: {requested_modes:?}");
     }
     let mut shared = AvailabilityObservation::default();
     shared.llcs.insert(
@@ -2252,10 +2249,9 @@ pub(super) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64,
 }
 
 #[cfg(test)]
-pub(super) fn exercise_cpu_ex_contention_shared_wake_for_tests(
-) -> Result<(u64, bool, bool, bool, bool, bool, bool)> {
-    let coordinator_claim =
-        ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
+pub(super) fn exercise_cpu_ex_contention_shared_wake_for_tests()
+-> Result<(u64, bool, bool, bool, bool, bool, bool)> {
+    let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
     let coordinator_watch =
         ClaimSet::new(std::iter::empty(), [0usize, 1usize], FlockMode::Exclusive);
     let mut coordinator = Ticket::register(coordinator_claim, coordinator_watch, None)?;
@@ -2266,10 +2262,8 @@ pub(super) fn exercise_cpu_ex_contention_shared_wake_for_tests(
         FlockMode::Shared,
     );
     let mut shared = Ticket::register(shared_claim.clone(), shared_claim, None)?;
-    let exclusive_claim =
-        ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
-    let mut exclusive =
-        Ticket::register(exclusive_claim.clone(), exclusive_claim, None)?;
+    let exclusive_claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+    let mut exclusive = Ticket::register(exclusive_claim.clone(), exclusive_claim, None)?;
 
     let _lock = lock_registry_existing(FlockMode::Exclusive)?;
     let mut table = Table::open_existing()?;
@@ -2435,8 +2429,7 @@ pub(super) fn exercise_coordinator_turnover_for_tests(
             false,
             None,
         )?;
-        let reconcile_by =
-            diagnostic_counter_for_tests(H_LIVENESS_RECONCILE_BY_NS)?;
+        let reconcile_by = diagnostic_counter_for_tests(H_LIVENESS_RECONCILE_BY_NS)?;
         if index == 0 {
             // The deliberately due periodic sweep consumes the first
             // coordinator's request.
@@ -2748,8 +2741,7 @@ pub(super) fn exercise_cpu_shared_commit_improvement_for_tests() -> Result<(u64,
         FlockMode::Shared,
     );
     let mut first = Ticket::register(shared.clone(), shared.clone(), None)?;
-    let middle_claim =
-        ClaimSet::new(std::iter::empty(), [3usize], FlockMode::Exclusive);
+    let middle_claim = ClaimSet::new(std::iter::empty(), [3usize], FlockMode::Exclusive);
     let mut middle = Ticket::register(middle_claim.clone(), middle_claim, None)?;
     let later_claim = shared.clone();
     let mut later = Ticket::register(later_claim.clone(), later_claim, None)?;
@@ -2758,11 +2750,7 @@ pub(super) fn exercise_cpu_shared_commit_improvement_for_tests() -> Result<(u64,
         let mut table = Table::open_existing()?;
         table.set_record_state(middle.slot, STATE_WAITING)?;
         table.set_record_state(later.slot, STATE_WAITING)?;
-        set_cpu_availability_for_tests(
-            &mut table,
-            1,
-            CpuAvailability::ExclusiveHeld,
-        )?;
+        set_cpu_availability_for_tests(&mut table, 1, CpuAvailability::ExclusiveHeld)?;
         set_cpu_free_for_tests(&mut table, 3, false)?;
         write_u64(&mut table.header, H_PENDING_FLAGS, 0);
         table.finish_claim_scan();
@@ -2799,20 +2787,16 @@ pub(super) fn exercise_cpu_shared_commit_improvement_for_tests() -> Result<(u64,
 
 #[cfg(test)]
 pub(super) fn exercise_cpu_mode_repair_for_tests() -> Result<(bool, bool, bool, bool)> {
-    let coordinator_claim =
-        ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
-    let mut coordinator =
-        Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
     let flexible_claim = ClaimSet::with_modes(
         std::iter::empty(),
         [1usize],
         FlockMode::Shared,
         FlockMode::Shared,
     );
-    let flexible_watch =
-        ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
-    let mut flexible =
-        Ticket::register(flexible_claim.clone(), flexible_watch.clone(), None)?;
+    let flexible_watch = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+    let mut flexible = Ticket::register(flexible_claim.clone(), flexible_watch.clone(), None)?;
     let fixed_claim = ClaimSet::with_modes(
         std::iter::empty(),
         [2usize],
@@ -2865,8 +2849,7 @@ pub(super) fn exercise_cpu_mode_repair_for_tests() -> Result<(bool, bool, bool, 
     let fixed_preserved = fixed_record.claim == fixed_claim
         && fixed_record.watch == fixed_claim
         && fixed_record.state == STATE_WAITING;
-    let flexible_still_flexible =
-        claim_is_flexible(&flexible_record.claim, &flexible_record.watch);
+    let flexible_still_flexible = claim_is_flexible(&flexible_record.claim, &flexible_record.watch);
     let fixed_still_fixed = !claim_is_flexible(&fixed_record.claim, &fixed_record.watch);
     drop(table);
     drop(_lock);
@@ -2889,13 +2872,9 @@ pub(super) fn exercise_prefix_callback_scaling_for_tests(
     if waiter_count == 0 {
         anyhow::bail!("prefix callback scaling exercise needs at least one waiter");
     }
-    let coordinator_claim =
-        ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
-    let mut coordinator = Ticket::register(
-        coordinator_claim.clone(),
-        coordinator_claim.clone(),
-        None,
-    )?;
+    let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
+    let mut coordinator =
+        Ticket::register(coordinator_claim.clone(), coordinator_claim.clone(), None)?;
     let mut waiters = Vec::with_capacity(waiter_count);
     for index in 0..waiter_count {
         let claim = coordinator_claim.clone();
@@ -2933,10 +2912,8 @@ pub(super) fn exercise_prefix_callback_scaling_for_tests(
             anyhow::bail!("REPLAN callback did not publish exactly one WAITING result");
         }
     }
-    let active_reads =
-        ACTIVE_LIST_RECORD_READS.with(std::cell::Cell::get) - active_reads_before;
-    let prefix_reads =
-        GRANT_PREFIX_RECORD_READS.with(std::cell::Cell::get) - prefix_reads_before;
+    let active_reads = ACTIVE_LIST_RECORD_READS.with(std::cell::Cell::get) - active_reads_before;
+    let prefix_reads = GRANT_PREFIX_RECORD_READS.with(std::cell::Cell::get) - prefix_reads_before;
 
     for (ticket, _) in &mut waiters {
         ticket.finish(None)?;
@@ -2946,18 +2923,13 @@ pub(super) fn exercise_prefix_callback_scaling_for_tests(
 }
 
 #[cfg(test)]
-pub(super) fn exercise_one_shot_replacement_for_tests(
-) -> Result<(usize, bool, bool, bool, bool, usize)> {
-    let coordinator_claim =
-        ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
-    let mut coordinator = Ticket::register(
-        coordinator_claim.clone(),
-        coordinator_claim.clone(),
-        None,
-    )?;
+pub(super) fn exercise_one_shot_replacement_for_tests()
+-> Result<(usize, bool, bool, bool, bool, usize)> {
+    let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
+    let mut coordinator =
+        Ticket::register(coordinator_claim.clone(), coordinator_claim.clone(), None)?;
     let next_claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
-    let watch =
-        ClaimSet::new(std::iter::empty(), [0usize, 1usize], FlockMode::Exclusive);
+    let watch = ClaimSet::new(std::iter::empty(), [0usize, 1usize], FlockMode::Exclusive);
     let mut waiter = Ticket::register(coordinator_claim.clone(), watch, None)?;
     if waiter.state(None)? != State::Replan {
         anyhow::bail!("one-shot replacement waiter did not start in REPLAN");
@@ -2981,8 +2953,7 @@ pub(super) fn exercise_one_shot_replacement_for_tests(
             })
         },
     )?;
-    let active_reads =
-        ACTIVE_LIST_RECORD_READS.with(std::cell::Cell::get) - active_reads_before;
+    let active_reads = ACTIVE_LIST_RECORD_READS.with(std::cell::Cell::get) - active_reads_before;
     let (waiting, replaced, rescan_pending) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
@@ -3008,17 +2979,11 @@ pub(super) fn exercise_one_shot_replacement_for_tests(
 }
 
 #[cfg(test)]
-pub(super) fn exercise_prefix_epoch_validation_for_tests(
-) -> Result<(usize, bool, bool)> {
-    let coordinator_claim =
-        ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
-    let mut coordinator = Ticket::register(
-        coordinator_claim.clone(),
-        coordinator_claim.clone(),
-        None,
-    )?;
-    let watch =
-        ClaimSet::new(std::iter::empty(), [0usize, 1usize], FlockMode::Exclusive);
+pub(super) fn exercise_prefix_epoch_validation_for_tests() -> Result<(usize, bool, bool)> {
+    let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
+    let mut coordinator =
+        Ticket::register(coordinator_claim.clone(), coordinator_claim.clone(), None)?;
+    let watch = ClaimSet::new(std::iter::empty(), [0usize, 1usize], FlockMode::Exclusive);
     let mut waiter = Ticket::register(coordinator_claim, watch, None)?;
     if waiter.state(None)? != State::Replan {
         anyhow::bail!("epoch validation waiter did not start in REPLAN");
@@ -3103,31 +3068,24 @@ pub(super) fn exercise_prefix_epoch_validation_for_tests(
 }
 
 #[cfg(test)]
-pub(super) fn exercise_prefix_order_and_repair_for_tests(
-) -> Result<(bool, bool, bool, bool)> {
+pub(super) fn exercise_prefix_order_and_repair_for_tests() -> Result<(bool, bool, bool, bool)> {
     let predecessor_claim = ClaimSet::with_modes(
         std::iter::empty(),
         [1usize],
         FlockMode::Exclusive,
         FlockMode::Shared,
     );
-    let mut predecessor = Ticket::register(
-        predecessor_claim.clone(),
-        predecessor_claim.clone(),
-        None,
-    )?;
-    let target_claim =
-        ClaimSet::new(std::iter::empty(), [2usize], FlockMode::Exclusive);
+    let mut predecessor =
+        Ticket::register(predecessor_claim.clone(), predecessor_claim.clone(), None)?;
+    let target_claim = ClaimSet::new(std::iter::empty(), [2usize], FlockMode::Exclusive);
     let target_watch = ClaimSet::new(
         std::iter::empty(),
         [1usize, 2usize, 3usize],
         FlockMode::Exclusive,
     );
     let mut target = Ticket::register(target_claim.clone(), target_watch, None)?;
-    let successor_claim =
-        ClaimSet::new(std::iter::empty(), [3usize], FlockMode::Exclusive);
-    let mut successor =
-        Ticket::register(successor_claim.clone(), successor_claim.clone(), None)?;
+    let successor_claim = ClaimSet::new(std::iter::empty(), [3usize], FlockMode::Exclusive);
+    let mut successor = Ticket::register(successor_claim.clone(), successor_claim.clone(), None)?;
     let shared_on_predecessor = ClaimSet::with_modes(
         std::iter::empty(),
         [1usize],
@@ -3189,25 +3147,16 @@ pub(super) fn exercise_prefix_order_and_repair_for_tests(
 }
 
 #[cfg(test)]
-pub(super) fn exercise_prefix_refresh_after_predecessor_release_for_tests(
-) -> Result<(bool, bool, bool, bool)> {
-    let coordinator_claim =
-        ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
-    let mut coordinator = Ticket::register(
-        coordinator_claim.clone(),
-        coordinator_claim.clone(),
-        None,
-    )?;
-    let predecessor_claim =
-        ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
-    let mut predecessor = Ticket::register(
-        predecessor_claim.clone(),
-        predecessor_claim.clone(),
-        None,
-    )?;
+pub(super) fn exercise_prefix_refresh_after_predecessor_release_for_tests()
+-> Result<(bool, bool, bool, bool)> {
+    let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
+    let mut coordinator =
+        Ticket::register(coordinator_claim.clone(), coordinator_claim.clone(), None)?;
+    let predecessor_claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+    let mut predecessor =
+        Ticket::register(predecessor_claim.clone(), predecessor_claim.clone(), None)?;
     let designated = ClaimSet::new(std::iter::empty(), [2usize], FlockMode::Exclusive);
-    let watch =
-        ClaimSet::new(std::iter::empty(), [1usize, 2usize], FlockMode::Exclusive);
+    let watch = ClaimSet::new(std::iter::empty(), [1usize, 2usize], FlockMode::Exclusive);
     let mut waiter = Ticket::register(designated.clone(), watch, None)?;
     if waiter.state(None)? != State::Replan {
         anyhow::bail!("release-prefix waiter did not start in REPLAN");
@@ -3294,14 +3243,13 @@ pub(super) fn exercise_prefix_refresh_after_predecessor_release_for_tests(
             })
         },
     )?;
-    let replacement_committed = matches!(result, GrantResult::Requeued)
-        && {
-            let _lock = lock_registry_existing(FlockMode::Exclusive)?;
-            let mut table = Table::open_existing()?;
-            table
-                .record(waiter.slot)?
-                .is_some_and(|record| record.claim == candidate && record.state == STATE_WAITING)
-        };
+    let replacement_committed = matches!(result, GrantResult::Requeued) && {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table
+            .record(waiter.slot)?
+            .is_some_and(|record| record.claim == candidate && record.state == STATE_WAITING)
+    };
 
     waiter.finish(None)?;
     coordinator.finish(None)?;
@@ -3315,17 +3263,12 @@ pub(super) fn exercise_prefix_refresh_after_predecessor_release_for_tests(
 
 #[cfg(test)]
 pub(super) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool, bool)> {
-    let coordinator_claim =
-        ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
-    let mut coordinator = Ticket::register(
-        coordinator_claim.clone(),
-        coordinator_claim.clone(),
-        None,
-    )?;
+    let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
+    let mut coordinator =
+        Ticket::register(coordinator_claim.clone(), coordinator_claim.clone(), None)?;
     let designated = ClaimSet::new(std::iter::empty(), [2usize], FlockMode::Exclusive);
     let candidate = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
-    let watch =
-        ClaimSet::new(std::iter::empty(), [1usize, 2usize], FlockMode::Exclusive);
+    let watch = ClaimSet::new(std::iter::empty(), [1usize, 2usize], FlockMode::Exclusive);
     let mut waiter = Ticket::register(designated.clone(), watch, None)?;
     if waiter.state(None)? != State::Replan {
         anyhow::bail!("issue-serial waiter did not start in REPLAN");
@@ -3345,7 +3288,9 @@ pub(super) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool
                 anyhow::bail!("issue-serial REPLAN callback received an acquire license");
             }
             if predecessors.conflicts(&candidate)? || availability.allows(&candidate)? {
-                anyhow::bail!("issue-serial callback did not start from the expected busy snapshot");
+                anyhow::bail!(
+                    "issue-serial callback did not start from the expected busy snapshot"
+                );
             }
             {
                 let _lock = lock_registry_existing(FlockMode::Exclusive)?;
@@ -3382,14 +3327,13 @@ pub(super) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool
             })
         },
     )?;
-    let replacement_committed = matches!(second, GrantResult::Requeued)
-        && {
-            let _lock = lock_registry_existing(FlockMode::Exclusive)?;
-            let mut table = Table::open_existing()?;
-            table
-                .record(waiter.slot)?
-                .is_some_and(|record| record.claim == candidate && record.state == STATE_WAITING)
-        };
+    let replacement_committed = matches!(second, GrantResult::Requeued) && {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table
+            .record(waiter.slot)?
+            .is_some_and(|record| record.claim == candidate && record.state == STATE_WAITING)
+    };
     let serial_consumed_only_by_fresh_snapshot = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
@@ -3422,15 +3366,11 @@ fn diagnostic_counter_for_tests(offset: usize) -> Result<u64> {
 pub(super) fn defer_liveness_maintenance_for_tests() -> Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let _lock = loop {
-        if let Some(lock) =
-            try_lock_registry_existing_nonblocking(FlockMode::Exclusive)?
-        {
+        if let Some(lock) = try_lock_registry_existing_nonblocking(FlockMode::Exclusive)? {
             break lock;
         }
         if std::time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "timed out taking admission registry lock to defer liveness maintenance"
-            );
+            anyhow::bail!("timed out taking admission registry lock to defer liveness maintenance");
         }
         std::thread::sleep(Duration::from_millis(5));
     };
@@ -4140,11 +4080,7 @@ impl Table {
         let requested = now.saturating_add(delay_ns).max(1);
         let current = read_u64(&self.header, H_LIVENESS_RECONCILE_BY_NS);
         if current == 0 || requested < current {
-            write_u64(
-                &mut self.header,
-                H_LIVENESS_RECONCILE_BY_NS,
-                requested,
-            );
+            write_u64(&mut self.header, H_LIVENESS_RECONCILE_BY_NS, requested);
         }
         Ok(())
     }
@@ -4521,8 +4457,7 @@ impl Table {
                 .map(|word| {
                     read_u64(
                         bytes,
-                        record_bitset_offset(layout, which)
-                            + word * std::mem::size_of::<u64>(),
+                        record_bitset_offset(layout, which) + word * std::mem::size_of::<u64>(),
                     )
                 })
                 .collect()
@@ -4561,9 +4496,9 @@ impl Table {
             anyhow::bail!("invalid queue prefix publication epoch or layout");
         }
         let layout = self.layout;
-        let bytes = self
-            .record_bytes_mut(slot)?
-            .ok_or_else(|| anyhow::anyhow!("queue slot {slot} disappeared during prefix publish"))?;
+        let bytes = self.record_bytes_mut(slot)?.ok_or_else(|| {
+            anyhow::anyhow!("queue slot {slot} disappeared during prefix publish")
+        })?;
         write_u64(bytes, R_PREFIX_EPOCH, 0);
         crash_at_for_tests("prefix_invalidated_before_copy");
         for (which, words) in [
@@ -4898,9 +4833,7 @@ impl Table {
                     _ => true,
                 };
             if record.state == STATE_REPLAN
-                && (replan_invalidated
-                    || prefix_invalid
-                    || watch_serial != record.issue_serial)
+                && (replan_invalidated || prefix_invalid || watch_serial != record.issue_serial)
             {
                 // The callback runs outside the registry fence. Stamp its
                 // record before clearing the global suffix invalidation so its
@@ -4961,10 +4894,7 @@ impl Table {
             {
                 let earlier_claim_changed = record.replan_claim_epoch != claim_epoch
                     && self.min_changed_ticket() < record.ticket;
-                if watch_serial != record.issue_serial
-                    || earlier_claim_changed
-                    || prefix_invalid
-                {
+                if watch_serial != record.issue_serial || earlier_claim_changed || prefix_invalid {
                     let prefix = aggregate_from_words(
                         self.layout.bits,
                         &cpu_any,
@@ -5282,9 +5212,7 @@ impl Table {
 
     fn blocker_serial(&self, key: ResourceKey, mode: FlockMode) -> Result<u64> {
         match (key, mode) {
-            (ResourceKey::Cpu(index), FlockMode::Shared) => {
-                self.resource_serial(S_CPU_SH, index)
-            }
+            (ResourceKey::Cpu(index), FlockMode::Shared) => self.resource_serial(S_CPU_SH, index),
             (ResourceKey::Cpu(index), FlockMode::Exclusive) => {
                 self.resource_serial(S_CPU_EX, index)
             }
@@ -5312,11 +5240,7 @@ impl Table {
         Ok(serial)
     }
 
-    fn mark_unknown(
-        &mut self,
-        cpus: &BTreeSet<usize>,
-        llcs: &BTreeSet<usize>,
-    ) -> Result<bool> {
+    fn mark_unknown(&mut self, cpus: &BTreeSet<usize>, llcs: &BTreeSet<usize>) -> Result<bool> {
         let plan = self.watched_observation_plan(cpus, llcs)?;
         self.mark_observation_modes(&plan)
     }
@@ -5498,11 +5422,7 @@ impl Table {
                 compatibility_improved = true;
             }
             self.set_bitmap_bit(B_CPU_KNOWN, cpu, true)?;
-            self.set_bitmap_bit(
-                B_CPU_SH_AVAILABLE,
-                cpu,
-                claim.cpu_mode == ClaimMode::Shared,
-            )?;
+            self.set_bitmap_bit(B_CPU_SH_AVAILABLE, cpu, claim.cpu_mode == ClaimMode::Shared)?;
             self.set_bitmap_bit(B_CPU_EX_AVAILABLE, cpu, false)?;
             self.set_bitmap_bit(B_PENDING_CPU_SH, cpu, false)?;
             self.set_bitmap_bit(B_PENDING_CPU_EX, cpu, false)?;
@@ -5524,11 +5444,7 @@ impl Table {
                 compatibility_improved = true;
             }
             self.set_bitmap_bit(B_LLC_KNOWN, llc, true)?;
-            self.set_bitmap_bit(
-                B_LLC_SH_AVAILABLE,
-                llc,
-                claim.llc_mode == ClaimMode::Shared,
-            )?;
+            self.set_bitmap_bit(B_LLC_SH_AVAILABLE, llc, claim.llc_mode == ClaimMode::Shared)?;
             self.set_bitmap_bit(B_LLC_EX_AVAILABLE, llc, false)?;
             self.set_bitmap_bit(B_PENDING_LLC_SH, llc, false)?;
             self.set_bitmap_bit(B_PENDING_LLC_EX, llc, false)?;
@@ -5784,8 +5700,7 @@ impl Table {
                 plan.cpu_sh.insert(cpu);
             }
             if watch.cpu_mode == ClaimMode::Exclusive {
-                let offset =
-                    self.layout.count_offset(B_WATCH_CPU_EXCLUSIVE) + cpu * 4;
+                let offset = self.layout.count_offset(B_WATCH_CPU_EXCLUSIVE) + cpu * 4;
                 if read_u32(&self.header, offset) == 0 {
                     plan.cpu_ex.insert(cpu);
                 }
@@ -5797,8 +5712,7 @@ impl Table {
                 plan.llc_sh.insert(llc);
             }
             if watch.llc_mode == ClaimMode::Exclusive {
-                let offset =
-                    self.layout.count_offset(B_WATCH_LLC_EXCLUSIVE) + llc * 4;
+                let offset = self.layout.count_offset(B_WATCH_LLC_EXCLUSIVE) + llc * 4;
                 if read_u32(&self.header, offset) == 0 {
                     plan.llc_ex.insert(llc);
                 }
@@ -5820,12 +5734,7 @@ impl Table {
         } else {
             ClaimMode::Exclusive
         };
-        Ok(ClaimSet::with_claim_modes(
-            llcs,
-            cpus,
-            llc_mode,
-            cpu_mode,
-        ))
+        Ok(ClaimSet::with_claim_modes(llcs, cpus, llc_mode, cpu_mode))
     }
 
     fn watched_intersection(&self, claim: &ClaimSet) -> Result<ClaimSet> {
@@ -6278,9 +6187,7 @@ fn decode_mode(bytes: &[u8], offset: usize, slot: u64, label: &str) -> Result<Cl
         0 => ClaimMode::Shared,
         1 => ClaimMode::Exclusive,
         mode => {
-            anyhow::bail!(
-                "queue registry v{VERSION} slot {slot} has invalid {label} mode {mode}"
-            )
+            anyhow::bail!("queue registry v{VERSION} slot {slot} has invalid {label} mode {mode}")
         }
     }
 }
@@ -6383,11 +6290,7 @@ fn encode_exact_claim(bytes: &mut [u8], layout: HeaderLayout, claim: &ClaimSet) 
     )
 }
 
-fn encode_prefix(
-    bytes: &mut [u8],
-    layout: HeaderLayout,
-    prefix: &AggregateSnapshot,
-) -> Result<()> {
+fn encode_prefix(bytes: &mut [u8], layout: HeaderLayout, prefix: &AggregateSnapshot) -> Result<()> {
     if prefix.bits != layout.bits {
         anyhow::bail!("queue predecessor prefix layout does not match its record");
     }
@@ -6631,10 +6534,7 @@ fn liveness_due_in_from_last(last: u64, now: u64) -> Duration {
 }
 
 fn liveness_due_in_from_header(header: &[u8], now: u64) -> Duration {
-    let periodic = liveness_due_in_from_last(
-        read_u64(header, H_LAST_LIVENESS_SWEEP_NS),
-        now,
-    );
+    let periodic = liveness_due_in_from_last(read_u64(header, H_LAST_LIVENESS_SWEEP_NS), now);
     let reconcile_by = read_u64(header, H_LIVENESS_RECONCILE_BY_NS);
     if reconcile_by == 0 {
         periodic

@@ -890,7 +890,6 @@ impl<'a> EffectiveRunPlacement<'a> {
             no_perf_cpus,
         }
     }
-
 }
 
 /// Owns every thread and wake source created by [`KtstrVm::run_interactive`]
@@ -1295,8 +1294,7 @@ impl KtstrVm {
 
         #[cfg(target_arch = "x86_64")]
         let _kernel_result = {
-            let kr =
-                self.setup_memory(&mut vm, kernel_result, initramfs_handle, mbind_node_map)?;
+            let kr = self.setup_memory(&mut vm, kernel_result, initramfs_handle, mbind_node_map)?;
             if dbg {
                 eprintln!("  setup_memory (joins initramfs): {:?}", start.elapsed());
             }
@@ -1554,12 +1552,9 @@ impl KtstrVm {
             }
         } else if self.performance_mode {
             match (self.host_topo.as_ref(), self.pinning_plan.as_ref()) {
-                (Some(host_topo), Some(plan)) => Self::acquire_performance_run_locks(
-                    host_topo,
-                    &self.topology,
-                    plan,
-                    wait,
-                ),
+                (Some(host_topo), Some(plan)) => {
+                    Self::acquire_performance_run_locks(host_topo, &self.topology, plan, wait)
+                }
                 _ => Ok(RunLocks {
                     locks: Vec::new(),
                     default_cpu_mask: None,
@@ -1923,12 +1918,8 @@ impl KtstrVm {
                 protocol::canonical_lock_order_with_modes(
                     &candidate.plan.llc_indices,
                     match candidate.llc_mode {
-                        host_topology::LlcLockMode::Exclusive => {
-                            crate::flock::FlockMode::Exclusive
-                        }
-                        host_topology::LlcLockMode::Shared => {
-                            crate::flock::FlockMode::Shared
-                        }
+                        host_topology::LlcLockMode::Exclusive => crate::flock::FlockMode::Exclusive,
+                        host_topology::LlcLockMode::Shared => crate::flock::FlockMode::Shared,
                     },
                     &candidate.cpu_reservations,
                     candidate.cpu_mode,
@@ -2168,7 +2159,10 @@ impl KtstrVm {
         wait: bool,
         cancelled: Option<&AtomicBool>,
     ) -> Result<RunLocks> {
-        let allowed_set = allowed.iter().copied().collect::<std::collections::BTreeSet<_>>();
+        let allowed_set = allowed
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
         let llcs = host_topo
             .map(|topology| {
                 topology
@@ -2180,12 +2174,7 @@ impl KtstrVm {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        match host_topology::acquire_overcommit_bridge(
-            &llcs,
-            &allowed,
-            wait,
-            cancelled,
-        )? {
+        match host_topology::acquire_overcommit_bridge(&llcs, &allowed, wait, cancelled)? {
             host_topology::LockOutcome::Acquired { locks, .. } => Ok(
                 Self::build_overcommit_run_locks_with_locks(allowed, vcpus, locks),
             ),
@@ -2194,9 +2183,11 @@ impl KtstrVm {
                 // behind test admission.
                 Ok(Self::build_overcommit_run_locks(allowed, vcpus))
             }
-            host_topology::LockOutcome::Unavailable(reason) => Err(anyhow::Error::new(
-                host_topology::ResourceContention { reason },
-            )),
+            host_topology::LockOutcome::Unavailable(reason) => {
+                Err(anyhow::Error::new(host_topology::ResourceContention {
+                    reason,
+                }))
+            }
         }
     }
 
@@ -2270,8 +2261,7 @@ impl KtstrVm {
             EffectiveRunPlacement::new(effective_plan, effective_no_perf_cpus);
 
         let initramfs_handle = self.spawn_initramfs_resolve()?;
-        let (mut vm, kernel_result) =
-            self.create_vm_and_load_kernel(&self.mbind_node_map)?;
+        let (mut vm, kernel_result) = self.create_vm_and_load_kernel(&self.mbind_node_map)?;
 
         #[cfg(target_arch = "x86_64")]
         {

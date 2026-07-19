@@ -36,9 +36,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::flock::{FlockMode, TryFlockOutcome, try_flock_with_witness};
 #[cfg(test)]
 use crate::flock::try_flock;
+use crate::flock::{FlockMode, TryFlockOutcome, try_flock_with_witness};
 
 mod registry;
 
@@ -266,12 +266,7 @@ impl ClaimSet {
         cpus: impl IntoIterator<Item = usize>,
         llc_mode: FlockMode,
     ) -> Self {
-        Self::from_claim_modes(
-            llcs,
-            cpus,
-            llc_mode.into(),
-            ClaimMode::Exclusive,
-        )
+        Self::from_claim_modes(llcs, cpus, llc_mode.into(), ClaimMode::Exclusive)
     }
 
     pub(crate) fn with_modes(
@@ -291,19 +286,14 @@ impl ClaimSet {
     /// actually present in each resource class. The canonical mode attached
     /// to an empty class is ignored.
     pub(crate) fn union_envelope(&self, other: &Self) -> Self {
-        let strongest = |a_empty: bool, a_mode, b_empty: bool, b_mode| {
-            match (a_empty, b_empty) {
-                (true, true) => ClaimMode::Exclusive,
-                (true, false) => b_mode,
-                (false, true) => a_mode,
-                (false, false)
-                    if a_mode == ClaimMode::Exclusive
-                        || b_mode == ClaimMode::Exclusive =>
-                {
-                    ClaimMode::Exclusive
-                }
-                (false, false) => ClaimMode::Shared,
+        let strongest = |a_empty: bool, a_mode, b_empty: bool, b_mode| match (a_empty, b_empty) {
+            (true, true) => ClaimMode::Exclusive,
+            (true, false) => b_mode,
+            (false, true) => a_mode,
+            (false, false) if a_mode == ClaimMode::Exclusive || b_mode == ClaimMode::Exclusive => {
+                ClaimMode::Exclusive
             }
+            (false, false) => ClaimMode::Shared,
         };
         Self::from_claim_modes(
             self.llcs.union(&other.llcs).copied(),
@@ -802,20 +792,21 @@ impl GrantedProbe {
         // A failed SH probe proves an EX holder and blocks either candidate
         // mode. A failed EX probe may have met only an SH holder, so retain an
         // SH alternative; the coordinator still revalidates it before grant.
-        let just_contended = self.contention.as_ref().is_some_and(|evidence| {
-            match evidence.blocker {
-                ResourceKey::Cpu(cpu) => {
-                    candidate.cpus.contains(&cpu)
-                        && (evidence.mode == FlockMode::Shared
-                            || candidate.cpu_mode == ClaimMode::Exclusive)
-                }
-                ResourceKey::Llc(llc) => {
-                    candidate.llcs.contains(&llc)
-                        && (evidence.mode == FlockMode::Shared
-                            || candidate.llc_mode == ClaimMode::Exclusive)
-                }
-            }
-        });
+        let just_contended =
+            self.contention
+                .as_ref()
+                .is_some_and(|evidence| match evidence.blocker {
+                    ResourceKey::Cpu(cpu) => {
+                        candidate.cpus.contains(&cpu)
+                            && (evidence.mode == FlockMode::Shared
+                                || candidate.cpu_mode == ClaimMode::Exclusive)
+                    }
+                    ResourceKey::Llc(llc) => {
+                        candidate.llcs.contains(&llc)
+                            && (evidence.mode == FlockMode::Shared
+                                || candidate.llc_mode == ClaimMode::Exclusive)
+                    }
+                });
         Ok(!just_contended
             && !self.predecessors.conflicts(candidate)?
             && self.availability.allows(candidate)?)
@@ -892,8 +883,8 @@ pub(crate) fn exercise_known_free_close_storm_for_tests(
 }
 
 #[cfg(test)]
-pub(crate) fn exercise_llc_sh_only_shared_to_free_close_for_tests(
-) -> Result<(bool, bool, u64, u64)> {
+pub(crate) fn exercise_llc_sh_only_shared_to_free_close_for_tests() -> Result<(bool, bool, u64, u64)>
+{
     registry::exercise_llc_sh_only_shared_to_free_close_for_tests()
 }
 
@@ -908,8 +899,8 @@ pub(crate) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64,
 }
 
 #[cfg(test)]
-pub(crate) fn exercise_cpu_ex_contention_shared_wake_for_tests(
-) -> Result<(u64, bool, bool, bool, bool, bool, bool)> {
+pub(crate) fn exercise_cpu_ex_contention_shared_wake_for_tests()
+-> Result<(u64, bool, bool, bool, bool, bool, bool)> {
     registry::exercise_cpu_ex_contention_shared_wake_for_tests()
 }
 
@@ -963,26 +954,24 @@ pub(crate) fn exercise_prefix_callback_scaling_for_tests(
 }
 
 #[cfg(test)]
-pub(crate) fn exercise_one_shot_replacement_for_tests(
-) -> Result<(usize, bool, bool, bool, bool, usize)> {
+pub(crate) fn exercise_one_shot_replacement_for_tests()
+-> Result<(usize, bool, bool, bool, bool, usize)> {
     registry::exercise_one_shot_replacement_for_tests()
 }
 
 #[cfg(test)]
-pub(crate) fn exercise_prefix_epoch_validation_for_tests(
-) -> Result<(usize, bool, bool)> {
+pub(crate) fn exercise_prefix_epoch_validation_for_tests() -> Result<(usize, bool, bool)> {
     registry::exercise_prefix_epoch_validation_for_tests()
 }
 
 #[cfg(test)]
-pub(crate) fn exercise_prefix_order_and_repair_for_tests(
-) -> Result<(bool, bool, bool, bool)> {
+pub(crate) fn exercise_prefix_order_and_repair_for_tests() -> Result<(bool, bool, bool, bool)> {
     registry::exercise_prefix_order_and_repair_for_tests()
 }
 
 #[cfg(test)]
-pub(crate) fn exercise_prefix_refresh_after_predecessor_release_for_tests(
-) -> Result<(bool, bool, bool, bool)> {
+pub(crate) fn exercise_prefix_refresh_after_predecessor_release_for_tests()
+-> Result<(bool, bool, bool, bool)> {
     registry::exercise_prefix_refresh_after_predecessor_release_for_tests()
 }
 
@@ -993,12 +982,8 @@ pub(crate) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool
 
 #[cfg(test)]
 pub(crate) fn exercise_candidate_ready_matrix_for_tests() -> Result<()> {
-    let predecessor = ClaimSet::with_modes(
-        [1usize],
-        [1usize],
-        FlockMode::Shared,
-        FlockMode::Shared,
-    );
+    let predecessor =
+        ClaimSet::with_modes([1usize], [1usize], FlockMode::Shared, FlockMode::Shared);
     let (predecessors, availability) = registry::probe_snapshots_for_tests(
         &[predecessor],
         &[
@@ -1037,22 +1022,10 @@ pub(crate) fn exercise_candidate_ready_matrix_for_tests() -> Result<()> {
         predecessors,
         availability,
     };
-    let cpu = |index, mode| {
-        ClaimSet::with_modes(
-            std::iter::empty(),
-            [index],
-            FlockMode::Exclusive,
-            mode,
-        )
-    };
-    let llc = |index, mode| {
-        ClaimSet::with_modes(
-            [index],
-            std::iter::empty(),
-            mode,
-            FlockMode::Exclusive,
-        )
-    };
+    let cpu =
+        |index, mode| ClaimSet::with_modes(std::iter::empty(), [index], FlockMode::Exclusive, mode);
+    let llc =
+        |index, mode| ClaimSet::with_modes([index], std::iter::empty(), mode, FlockMode::Exclusive);
 
     anyhow::ensure!(
         probe.candidate_ready(&cpu(1, FlockMode::Shared))?

@@ -349,7 +349,10 @@ fn sysfs_llc_groups_cover_all_cpus() {
         "flattened LLC membership must name every online CPU exactly once",
     );
     assert_eq!(
-        llc_cpus.iter().copied().collect::<std::collections::BTreeSet<_>>(),
+        llc_cpus
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
         topo.online_cpus
             .iter()
             .copied()
@@ -1005,10 +1008,7 @@ fn exclusive_offset_slots_cover_disjoint_service_footprints() {
     let left_footprint = footprint(&left);
     let right_footprint = footprint(&right);
     assert_eq!(left_footprint, std::collections::BTreeSet::from([0, 1, 2]));
-    assert_eq!(
-        right_footprint,
-        std::collections::BTreeSet::from([4, 5, 6])
-    );
+    assert_eq!(right_footprint, std::collections::BTreeSet::from([4, 5, 6]));
     assert!(
         left_footprint.is_disjoint(&right_footprint),
         "every service and vCPU thread must stay in its exact exclusive slot",
@@ -1248,10 +1248,7 @@ fn performance_grain_candidates_cover_every_llc_window_and_block() {
             .all(|candidate| candidate.llc_mode == LlcLockMode::Shared),
     );
     let per_llc = candidates.iter().fold(
-        std::collections::BTreeMap::<
-            usize,
-            std::collections::BTreeSet<Vec<usize>>,
-        >::new(),
+        std::collections::BTreeMap::<usize, std::collections::BTreeSet<Vec<usize>>>::new(),
         |mut footprints, candidate| {
             assert_eq!(candidate.plan.llc_indices.len(), 1);
             footprints
@@ -1284,9 +1281,11 @@ fn multi_llc_performance_candidates_retain_twelve_disjoint_grains() {
     let candidates = host
         .performance_pinning_candidates(&Topology::new(1, 2, 2, 1))
         .expect("enumerate two-LLC performance grains");
-    assert!(candidates
-        .iter()
-        .all(|candidate| candidate.llc_mode == LlcLockMode::Shared));
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.llc_mode == LlcLockMode::Shared)
+    );
 
     let footprints = candidates
         .iter()
@@ -1302,8 +1301,7 @@ fn multi_llc_performance_candidates_retain_twelve_disjoint_grains() {
     for grain in 0..12 {
         let low = grain * 3;
         let high = 36 + grain * 3;
-        let service_low =
-            std::collections::BTreeSet::from([low, low + 1, low + 2, high, high + 1]);
+        let service_low = std::collections::BTreeSet::from([low, low + 1, low + 2, high, high + 1]);
         let service_high =
             std::collections::BTreeSet::from([low, low + 1, high, high + 1, high + 2]);
         let footprint = if footprints.contains(&service_low) {

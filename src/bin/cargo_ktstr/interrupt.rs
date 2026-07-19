@@ -559,8 +559,7 @@ pub(crate) fn reraise(sig: libc::c_int) -> ! {
 }
 
 extern "C" fn startup_launcher_handler(sig: libc::c_int) {
-    let _ =
-        STARTUP_CAUGHT_SIGNAL.compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst);
+    let _ = STARTUP_CAUGHT_SIGNAL.compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst);
     let pgid = STARTUP_SUPERVISOR_GROUP.load(Ordering::SeqCst);
     if pgid == SPAWNING {
         match sig {
@@ -771,26 +770,11 @@ impl StartupLauncherSignals {
         // SAFETY: both actions and the mask were returned by successful
         // installation calls in this process.
         unsafe {
-            if libc::sigaction(
-                libc::SIGINT,
-                &self.previous_sigint,
-                std::ptr::null_mut(),
-            ) != 0
-                || libc::sigaction(
-                    libc::SIGTERM,
-                    &self.previous_sigterm,
-                    std::ptr::null_mut(),
-                ) != 0
-                || libc::sigaction(
-                    libc::SIGCHLD,
-                    &self.previous_sigchld,
-                    std::ptr::null_mut(),
-                ) != 0
-                || libc::sigprocmask(
-                    libc::SIG_SETMASK,
-                    &self.previous_mask,
-                    std::ptr::null_mut(),
-                ) != 0
+            if libc::sigaction(libc::SIGINT, &self.previous_sigint, std::ptr::null_mut()) != 0
+                || libc::sigaction(libc::SIGTERM, &self.previous_sigterm, std::ptr::null_mut()) != 0
+                || libc::sigaction(libc::SIGCHLD, &self.previous_sigchld, std::ptr::null_mut()) != 0
+                || libc::sigprocmask(libc::SIG_SETMASK, &self.previous_mask, std::ptr::null_mut())
+                    != 0
             {
                 return Err(io::Error::last_os_error());
             }
@@ -821,12 +805,7 @@ fn startup_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: pipe2 returned two fresh descriptors with unique ownership.
-    Ok(unsafe {
-        (
-            OwnedFd::from_raw_fd(fds[0]),
-            OwnedFd::from_raw_fd(fds[1]),
-        )
-    })
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
 fn set_fd_cloexec(fd: libc::c_int, enabled: bool) -> io::Result<()> {
@@ -847,11 +826,7 @@ fn set_fd_cloexec(fd: libc::c_int, enabled: bool) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_startup_pipe(
-    fd: libc::c_int,
-    access: libc::c_int,
-    label: &str,
-) -> io::Result<()> {
+fn validate_startup_pipe(fd: libc::c_int, access: libc::c_int, label: &str) -> io::Result<()> {
     // SAFETY: fstat initializes stat for a live descriptor.
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut stat) } != 0 {
@@ -970,11 +945,7 @@ fn startup_env_parent() -> io::Result<libc::pid_t> {
         })
 }
 
-fn take_startup_fd(
-    name: &str,
-    access: libc::c_int,
-    label: &str,
-) -> io::Result<OwnedFd> {
+fn take_startup_fd(name: &str, access: libc::c_int, label: &str) -> io::Result<OwnedFd> {
     let raw = std::env::var(name)
         .map_err(|_| {
             io::Error::new(
@@ -1041,24 +1012,19 @@ fn startup_test_mode_is(expected: &str) -> bool {
 
 #[cfg(test)]
 fn startup_test_checkpoint_path(phase: &str, suffix: &str) -> io::Result<std::path::PathBuf> {
-    let mut path = std::path::PathBuf::from(
-        std::env::var_os(STARTUP_TEST_PIDFILE_ENV).ok_or_else(|| {
+    let mut path =
+        std::path::PathBuf::from(std::env::var_os(STARTUP_TEST_PIDFILE_ENV).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 "startup test checkpoint has no pidfile",
             )
-        })?,
-    );
+        })?);
     path.set_extension(format!("{phase}.{suffix}"));
     Ok(path)
 }
 
 #[cfg(test)]
-fn startup_test_checkpoint_if(
-    mode: &str,
-    phase: &str,
-    wait_for_release: bool,
-) -> io::Result<()> {
+fn startup_test_checkpoint_if(mode: &str, phase: &str, wait_for_release: bool) -> io::Result<()> {
     if !startup_test_mode_is(mode) {
         return Ok(());
     }
@@ -1122,10 +1088,7 @@ fn write_startup_frame(fd: libc::c_int, mut frame: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn drain_startup_read(
-    fd: libc::c_int,
-    buffer: &mut Vec<u8>,
-) -> io::Result<bool> {
+fn drain_startup_read(fd: libc::c_int, buffer: &mut Vec<u8>) -> io::Result<bool> {
     let mut chunk = [0_u8; 256];
     loop {
         // SAFETY: chunk is writable and fd is a validated read end.
@@ -1350,8 +1313,7 @@ fn startup_launcher_read_ready(
         }
         let now = Instant::now();
         if STARTUP_CAUGHT_SIGNAL.load(Ordering::SeqCst) != 0 {
-            let deadline = signal_deadline
-                .get_or_insert_with(|| now + STARTUP_SIGNAL_READY_GRACE);
+            let deadline = signal_deadline.get_or_insert_with(|| now + STARTUP_SIGNAL_READY_GRACE);
             if now >= *deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
@@ -1371,8 +1333,8 @@ fn startup_launcher_read_ready(
             events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
             revents: 0,
         }];
-        let poll_deadline = signal_deadline
-            .map_or(ready_deadline, |deadline| deadline.min(ready_deadline));
+        let poll_deadline =
+            signal_deadline.map_or(ready_deadline, |deadline| deadline.min(ready_deadline));
         let wait = poll_deadline
             .saturating_duration_since(now)
             .min(STARTUP_POLL_INTERVAL);
@@ -1380,10 +1342,7 @@ fn startup_launcher_read_ready(
     }
 }
 
-fn startup_launcher_read_status(
-    report: &OwnedFd,
-    buffer: &mut Vec<u8>,
-) -> io::Result<libc::c_int> {
+fn startup_launcher_read_status(report: &OwnedFd, buffer: &mut Vec<u8>) -> io::Result<libc::c_int> {
     loop {
         let eof = drain_startup_read(report.as_raw_fd(), buffer)?;
         let shared = buffer.len().min(STARTUP_REPORT_STATUS_MAGIC.len());
@@ -1473,11 +1432,11 @@ fn startup_launcher_main() -> ! {
     {
         Some(pgid) => pgid,
         None => startup_launcher_fail(
-                signals,
-                Some(owner_write),
-                Some(&mut supervisor),
-                io::Error::other("startup supervisor has an invalid pid"),
-            ),
+            signals,
+            Some(owner_write),
+            Some(&mut supervisor),
+            io::Error::other("startup supervisor has an invalid pid"),
+        ),
     };
     // SAFETY: the unreaped Child pins this exact pid.
     let actual_pgid = unsafe { libc::getpgid(pgid) };
@@ -1493,91 +1452,51 @@ fn startup_launcher_main() -> ! {
     }
     let hello = prefixed_token_frame(STARTUP_OWNER_HELLO_MAGIC, &token);
     if let Err(error) = write_startup_frame(owner_write.as_raw_fd(), &hello) {
-        startup_launcher_fail(
-            signals,
-            Some(owner_write),
-            Some(&mut supervisor),
-            error,
-        );
+        startup_launcher_fail(signals, Some(owner_write), Some(&mut supervisor), error);
     }
     if let Err(error) = set_nonblocking(report_read.as_raw_fd()) {
-        startup_launcher_fail(
-            signals,
-            Some(owner_write),
-            Some(&mut supervisor),
-            error,
-        );
+        startup_launcher_fail(signals, Some(owner_write), Some(&mut supervisor), error);
     }
 
     let mut report = Vec::new();
     if let Err(error) = startup_launcher_read_ready(&report_read, &token, &mut report) {
-        startup_launcher_fail(
-            signals,
-            Some(owner_write),
-            Some(&mut supervisor),
-            error,
-        );
+        startup_launcher_fail(signals, Some(owner_write), Some(&mut supervisor), error);
     }
     // Keep the handler in SPAWNING through authenticated worker readiness.
     // Every terminal delivery in the entire L->S->W handoff is counted and
     // replayed only after W has restored its own default dispositions and
     // unblocked the signals.
     if let Err(error) = signals.publish_and_replay(pgid) {
-        startup_launcher_fail(
-            signals,
-            Some(owner_write),
-            Some(&mut supervisor),
-            error,
-        );
+        startup_launcher_fail(signals, Some(owner_write), Some(&mut supervisor), error);
     }
 
     let raw = match startup_launcher_read_status(&report_read, &mut report) {
         Ok(raw) => raw,
-        Err(error) => startup_launcher_fail(
-            signals,
-            Some(owner_write),
-            Some(&mut supervisor),
-            error,
-        ),
+        Err(error) => {
+            startup_launcher_fail(signals, Some(owner_write), Some(&mut supervisor), error)
+        }
     };
     #[cfg(test)]
-    if let Err(error) =
-        startup_test_checkpoint_if("owner-death-pre-ack", "pre-ack", true)
-    {
-        startup_launcher_fail(
-            signals,
-            Some(owner_write),
-            Some(&mut supervisor),
-            error,
-        );
+    if let Err(error) = startup_test_checkpoint_if("owner-death-pre-ack", "pre-ack", true) {
+        startup_launcher_fail(signals, Some(owner_write), Some(&mut supervisor), error);
     }
 
     let mut ack = [0_u8; 12];
     ack[..8].copy_from_slice(STARTUP_OWNER_ACK_MAGIC);
     ack[8..].copy_from_slice(&raw.to_be_bytes());
     if let Err(error) = write_startup_frame(owner_write.as_raw_fd(), &ack) {
-        startup_launcher_fail(
-            signals,
-            Some(owner_write),
-            Some(&mut supervisor),
-            error,
-        );
+        startup_launcher_fail(signals, Some(owner_write), Some(&mut supervisor), error);
     }
     if let Err(error) = signals.hide(pgid) {
-        startup_launcher_fail(
-            signals,
-            Some(owner_write),
-            Some(&mut supervisor),
-            error,
-        );
+        startup_launcher_fail(signals, Some(owner_write), Some(&mut supervisor), error);
     }
-    let supervisor_status =
-        match startup_wait_child_bounded(&mut supervisor, STARTUP_REAP_BACKSTOP) {
-            Ok(status) => status,
-            Err(error) => {
-                startup_launcher_fail(signals, Some(owner_write), None, error);
-            }
-        };
+    let supervisor_status = match startup_wait_child_bounded(&mut supervisor, STARTUP_REAP_BACKSTOP)
+    {
+        Ok(status) => status,
+        Err(error) => {
+            startup_launcher_fail(signals, Some(owner_write), None, error);
+        }
+    };
     if supervisor_status.into_raw() != raw {
         startup_launcher_fail(
             signals,
@@ -1690,8 +1609,7 @@ fn startup_process_parent(pid: libc::pid_t) -> io::Result<Option<libc::pid_t>> {
 
 fn startup_kill_direct_child(pid: libc::pid_t) -> io::Result<()> {
     // SAFETY: pidfd_open returns a fresh exact process reference.
-    let raw =
-        unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0_u32) as libc::c_int };
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0_u32) as libc::c_int };
     if raw < 0 {
         let error = io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::ESRCH) {
@@ -1787,16 +1705,7 @@ impl AnchoredSubtreeOwner {
         let mut was_subreaper: libc::c_int = 0;
         // SAFETY: PR_GET_CHILD_SUBREAPER writes one integer to the valid
         // out-pointer and ignores the remaining zero arguments.
-        if unsafe {
-            libc::prctl(
-                libc::PR_GET_CHILD_SUBREAPER,
-                &mut was_subreaper,
-                0,
-                0,
-                0,
-            )
-        } != 0
-        {
+        if unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut was_subreaper, 0, 0, 0) } != 0 {
             return Err(io::Error::last_os_error());
         }
         let restore_subreaper = was_subreaper == 0;
@@ -1942,10 +1851,7 @@ impl Drop for StartupSubtreeOwner {
     }
 }
 
-fn startup_wait_owner_hello(
-    owner: &OwnedFd,
-    token: &[u8; STARTUP_TOKEN_BYTES],
-) -> io::Result<()> {
+fn startup_wait_owner_hello(owner: &OwnedFd, token: &[u8; STARTUP_TOKEN_BYTES]) -> io::Result<()> {
     set_nonblocking(owner.as_raw_fd())?;
     let wanted = prefixed_token_frame(STARTUP_OWNER_HELLO_MAGIC, token);
     let deadline = Instant::now() + STARTUP_READY_BACKSTOP;
@@ -2072,16 +1978,8 @@ fn startup_spawn_worker(
 fn startup_supervisor_inner() -> io::Result<libc::c_int> {
     let token = startup_env_token()?;
     let declared_parent = startup_env_parent()?;
-    let owner = take_startup_fd(
-        STARTUP_OWNER_FD_ENV,
-        libc::O_RDONLY,
-        "startup owner pipe",
-    )?;
-    let report = take_startup_fd(
-        STARTUP_REPORT_FD_ENV,
-        libc::O_WRONLY,
-        "startup report pipe",
-    )?;
+    let owner = take_startup_fd(STARTUP_OWNER_FD_ENV, libc::O_RDONLY, "startup owner pipe")?;
+    let report = take_startup_fd(STARTUP_REPORT_FD_ENV, libc::O_WRONLY, "startup report pipe")?;
     clear_startup_role_env();
     if unsafe { libc::getppid() } != declared_parent {
         return Err(io::Error::new(
@@ -2143,16 +2041,8 @@ fn startup_supervisor_inner() -> io::Result<libc::c_int> {
                     }
                     #[cfg(test)]
                     {
-                        startup_test_checkpoint_if(
-                            "malformed-report",
-                            "report-fault",
-                            true,
-                        )?;
-                        startup_test_checkpoint_if(
-                            "truncated-report",
-                            "report-fault",
-                            true,
-                        )?;
+                        startup_test_checkpoint_if("malformed-report", "report-fault", true)?;
+                        startup_test_checkpoint_if("truncated-report", "report-fault", true)?;
                         if startup_test_mode_is("malformed-report") {
                             write_startup_frame(report.as_raw_fd(), &[b'X'; 24])?;
                             return Err(io::Error::new(
@@ -2161,10 +2051,7 @@ fn startup_supervisor_inner() -> io::Result<libc::c_int> {
                             ));
                         }
                         if startup_test_mode_is("truncated-report") {
-                            write_startup_frame(
-                                report.as_raw_fd(),
-                                &report_ready[..4],
-                            )?;
+                            write_startup_frame(report.as_raw_fd(), &report_ready[..4])?;
                             return Err(io::Error::new(
                                 io::ErrorKind::UnexpectedEof,
                                 "injected truncated startup report",
@@ -2252,9 +2139,7 @@ fn startup_supervisor_inner() -> io::Result<libc::c_int> {
                 raw
             };
             if !ready_reported {
-                return Err(io::Error::other(
-                    "startup worker exited before readiness",
-                ));
+                return Err(io::Error::other("startup worker exited before readiness"));
             }
             let mut status_frame = [0_u8; 12];
             status_frame[..8].copy_from_slice(STARTUP_REPORT_STATUS_MAGIC);
@@ -2264,11 +2149,7 @@ fn startup_supervisor_inner() -> io::Result<libc::c_int> {
             startup_wait_owner_ack(&owner, &mut owner_buffer, raw)?;
             subtree.release();
             #[cfg(test)]
-            startup_test_checkpoint_if(
-                "owner-death-post-ack",
-                "post-ack",
-                true,
-            )?;
+            startup_test_checkpoint_if("owner-death-post-ack", "post-ack", true)?;
             return Ok(raw);
         }
 
@@ -2320,12 +2201,8 @@ fn startup_worker_bootstrap() -> io::Result<()> {
     let ready = prefixed_token_frame(STARTUP_WORKER_READY_MAGIC, &token);
     write_startup_frame(control.as_raw_fd(), &ready)?;
     let raw = control.into_raw_fd();
-    if STARTUP_WORKER_CLEAN_FD.compare_exchange(
-        -1,
-        raw,
-        Ordering::SeqCst,
-        Ordering::SeqCst,
-    ) != Ok(-1)
+    if STARTUP_WORKER_CLEAN_FD.compare_exchange(-1, raw, Ordering::SeqCst, Ordering::SeqCst)
+        != Ok(-1)
     {
         // SAFETY: raw remains uniquely owned after into_raw_fd.
         unsafe {
@@ -3096,10 +2973,7 @@ fn invalid_proc_stat(pid: libc::pid_t, field: &str) -> io::Error {
 }
 
 fn process_gone(error: &io::Error) -> bool {
-    matches!(
-        error.raw_os_error(),
-        Some(libc::ENOENT) | Some(libc::ESRCH)
-    )
+    matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ESRCH))
 }
 
 fn read_process_stat(pid: libc::pid_t) -> io::Result<Option<GroupMember>> {
@@ -3132,10 +3006,10 @@ fn parse_process_stat(pid: libc::pid_t, stat: &[u8]) -> io::Result<GroupMember> 
         .ok_or_else(|| invalid_proc_stat(pid, "state"))?;
     let pgrp = parse_proc_stat_number::<libc::pid_t>(fields[2])
         .ok_or_else(|| invalid_proc_stat(pid, "process group"))?;
-    let utime = parse_proc_stat_number::<u64>(fields[11])
-        .ok_or_else(|| invalid_proc_stat(pid, "utime"))?;
-    let stime = parse_proc_stat_number::<u64>(fields[12])
-        .ok_or_else(|| invalid_proc_stat(pid, "stime"))?;
+    let utime =
+        parse_proc_stat_number::<u64>(fields[11]).ok_or_else(|| invalid_proc_stat(pid, "utime"))?;
+    let stime =
+        parse_proc_stat_number::<u64>(fields[12]).ok_or_else(|| invalid_proc_stat(pid, "stime"))?;
     let starttime_ticks = parse_proc_stat_number::<u64>(fields[19])
         .ok_or_else(|| invalid_proc_stat(pid, "starttime"))?;
     Ok(GroupMember {
@@ -3153,10 +3027,7 @@ fn parse_proc_stat_number<T>(field: &[u8]) -> Option<T>
 where
     T: std::str::FromStr,
 {
-    std::str::from_utf8(field)
-        .ok()?
-        .parse::<T>()
-        .ok()
+    std::str::from_utf8(field).ok()?.parse::<T>().ok()
 }
 
 fn unreadable_proc_entry_is_unrelated(
@@ -4036,8 +3907,7 @@ mod tests {
     const STARTUP_TEST_OWNER_ENV: &str = "__KTSTR_TEST_STARTUP_OWNER";
 
     fn test_pidfd_open(pid: libc::pid_t) -> OwnedFd {
-        let raw =
-            unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0_u32) as libc::c_int };
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0_u32) as libc::c_int };
         assert!(
             raw >= 0,
             "pidfd_open({pid}) failed: {}",
@@ -4133,11 +4003,9 @@ mod tests {
             b"ktstr-context-argv0",
         );
         assert_eq!(
-            std::env::var_os(std::ffi::OsStr::from_bytes(
-                b"KTSTR_CONTEXT_\xff",
-            ))
-            .as_deref()
-            .map(|value| value.as_bytes()),
+            std::env::var_os(std::ffi::OsStr::from_bytes(b"KTSTR_CONTEXT_\xff",))
+                .as_deref()
+                .map(|value| value.as_bytes()),
             Some(b"value_\xfe".as_slice()),
         );
         assert_eq!(
@@ -4161,8 +4029,7 @@ mod tests {
 
     fn startup_test_worker() {
         let pidfile = std::path::PathBuf::from(
-            std::env::var_os(STARTUP_TEST_PIDFILE_ENV)
-                .expect("startup supervision pidfile env"),
+            std::env::var_os(STARTUP_TEST_PIDFILE_ENV).expect("startup supervision pidfile env"),
         );
         append_startup_test_pid(&pidfile, unsafe { libc::getpid() });
         let mode = std::env::var(STARTUP_TEST_MODE_ENV).expect("startup test mode");
@@ -4223,11 +4090,8 @@ mod tests {
                 write_startup_frame(control.as_raw_fd(), &[b'X'; 9])
                     .expect("write malformed startup worker frame");
             } else {
-                write_startup_frame(
-                    control.as_raw_fd(),
-                    &STARTUP_WORKER_CLEAN_MAGIC[..4],
-                )
-                .expect("write truncated startup worker frame");
+                write_startup_frame(control.as_raw_fd(), &STARTUP_WORKER_CLEAN_MAGIC[..4])
+                    .expect("write truncated startup worker frame");
             }
             drop(control);
             loop {
@@ -4268,9 +4132,7 @@ mod tests {
             .arg("printf '%s\n' \"$$\" >> \"$1\"; exec /bin/sleep 300")
             .arg("ktstr-startup-test")
             .arg(&pidfile_text);
-        let _new_session = new_session
-            .spawn()
-            .expect("spawn setsid env-i descendant");
+        let _new_session = new_session.spawn().expect("spawn setsid env-i descendant");
 
         let mut double_fork = Command::new("/bin/sh");
         double_fork
@@ -4297,19 +4159,13 @@ mod tests {
                 true
             }
             _ if std::env::var_os(STARTUP_TEST_OWNER_ENV).is_some() => {
-                if std::env::var(STARTUP_TEST_MODE_ENV).as_deref()
-                    == Ok("sigchld-ignore-clean")
-                {
+                if std::env::var(STARTUP_TEST_MODE_ENV).as_deref() == Ok("sigchld-ignore-clean") {
                     unsafe {
                         let mut ignore: libc::sigaction = std::mem::zeroed();
                         ignore.sa_sigaction = libc::SIG_IGN;
                         libc::sigemptyset(&mut ignore.sa_mask);
                         assert_eq!(
-                            libc::sigaction(
-                                libc::SIGCHLD,
-                                &ignore,
-                                std::ptr::null_mut(),
-                            ),
+                            libc::sigaction(libc::SIGCHLD, &ignore, std::ptr::null_mut(),),
                             0,
                             "install inherited SIGCHLD ignore",
                         );
@@ -4321,11 +4177,7 @@ mod tests {
         }
     }
 
-    fn spawn_startup_test_owner(
-        test_name: &str,
-        mode: &str,
-        pidfile: &std::path::Path,
-    ) -> Child {
+    fn spawn_startup_test_owner(test_name: &str, mode: &str, pidfile: &std::path::Path) -> Child {
         let mut command = Command::new(std::env::current_exe().expect("current test executable"));
         command
             .arg("--exact")
@@ -4350,10 +4202,7 @@ mod tests {
         path
     }
 
-    fn startup_test_checkpoint_pid(
-        pidfile: &std::path::Path,
-        phase: &str,
-    ) -> libc::pid_t {
+    fn startup_test_checkpoint_pid(pidfile: &std::path::Path, phase: &str) -> libc::pid_t {
         let marker = startup_test_phase_path(pidfile, phase, "ready");
         assert!(
             wait_until(STARTUP_TEST_OBSERVATION_BACKSTOP, || marker.exists()),
@@ -4377,7 +4226,10 @@ mod tests {
     fn wait_startup_test_owner(owner: &mut Child, label: &str) -> ExitStatus {
         assert!(
             wait_until(STARTUP_TEST_OBSERVATION_BACKSTOP, || {
-                owner.try_wait().expect("query nested startup owner").is_some()
+                owner
+                    .try_wait()
+                    .expect("query nested startup owner")
+                    .is_some()
             }),
             "{label} startup owner did not exit within its bounded deadline",
         );
@@ -4392,10 +4244,7 @@ mod tests {
         );
     }
 
-    fn startup_test_pids(
-        pidfile: &std::path::Path,
-        count: usize,
-    ) -> Vec<libc::pid_t> {
+    fn startup_test_pids(pidfile: &std::path::Path, count: usize) -> Vec<libc::pid_t> {
         assert!(
             wait_until(STARTUP_TEST_OBSERVATION_BACKSTOP, || {
                 std::fs::read_to_string(pidfile)
@@ -4411,10 +4260,7 @@ mod tests {
             .collect()
     }
 
-    fn assert_startup_pids_exit(
-        pids: &[libc::pid_t],
-        pidfds: &[OwnedFd],
-    ) {
+    fn assert_startup_pids_exit(pids: &[libc::pid_t], pidfds: &[OwnedFd]) {
         assert!(
             wait_until(STARTUP_TEST_OBSERVATION_BACKSTOP, || {
                 pidfds.iter().all(test_pidfd_exited)
@@ -4523,9 +4369,7 @@ mod tests {
     }
 
     impl CancelWhenPidPublished {
-        fn new(
-            pidfile: std::path::PathBuf,
-        ) -> (Self, Arc<Mutex<CancellationState>>) {
+        fn new(pidfile: std::path::PathBuf) -> (Self, Arc<Mutex<CancellationState>>) {
             let state = Arc::new(Mutex::new(CancellationState::default()));
             (
                 Self {
@@ -4708,7 +4552,10 @@ mod tests {
         test_pidfd_kill(&pidfds[0]);
         assert!(
             wait_until(STARTUP_TEST_OBSERVATION_BACKSTOP, || {
-                owner.try_wait().expect("query nested startup owner").is_some()
+                owner
+                    .try_wait()
+                    .expect("query nested startup owner")
+                    .is_some()
             }),
             "startup launcher did not relay the killed worker status",
         );
@@ -4803,7 +4650,10 @@ mod tests {
         std::fs::write(release, b"release").expect("release worker readiness barrier");
         assert!(
             wait_until(STARTUP_TEST_OBSERVATION_BACKSTOP, || {
-                owner.try_wait().expect("query signalled startup owner").is_some()
+                owner
+                    .try_wait()
+                    .expect("query signalled startup owner")
+                    .is_some()
             }),
             "startup launcher did not replay its queued pre-ready signal",
         );
@@ -4860,8 +4710,7 @@ mod tests {
             .name()
             .expect("libtest supplies the current test name")
             .to_owned();
-        let mut owner =
-            spawn_startup_test_owner(&test_name, "sigchld-ignore-clean", &pidfile);
+        let mut owner = spawn_startup_test_owner(&test_name, "sigchld-ignore-clean", &pidfile);
         let pids = startup_test_pids(&pidfile, 2);
         let detached_pidfd = test_pidfd_open(pids[1]);
         let status = wait_startup_test_owner(&mut owner, "SIGCHLD-normalized owner");
@@ -4894,10 +4743,7 @@ mod tests {
         let worker_pidfd = test_pidfd_open(pids[0]);
         let status = wait_startup_test_owner(&mut owner, "pgrp-mismatch owner");
 
-        assert_eq!(
-            status.code(),
-            Some(CHILD_OWNERSHIP_FAIL_CLOSED_EXIT_CODE),
-        );
+        assert_eq!(status.code(), Some(CHILD_OWNERSHIP_FAIL_CLOSED_EXIT_CODE),);
         assert!(
             wait_until(STARTUP_TEST_OBSERVATION_BACKSTOP, || {
                 test_pidfd_exited(&worker_pidfd)
@@ -4918,8 +4764,7 @@ mod tests {
             .name()
             .expect("libtest supplies the current test name")
             .to_owned();
-        let mut owner =
-            spawn_startup_test_owner(&test_name, "owner-death-pre-ack", &pidfile);
+        let mut owner = spawn_startup_test_owner(&test_name, "owner-death-pre-ack", &pidfile);
         let owner_pidfd = test_pidfd_open(owner.id() as libc::pid_t);
         let checkpoint_pid = startup_test_checkpoint_pid(&pidfile, "pre-ack");
         assert_eq!(checkpoint_pid, owner.id() as libc::pid_t);
@@ -4944,8 +4789,7 @@ mod tests {
             .name()
             .expect("libtest supplies the current test name")
             .to_owned();
-        let mut owner =
-            spawn_startup_test_owner(&test_name, "owner-death-post-ack", &pidfile);
+        let mut owner = spawn_startup_test_owner(&test_name, "owner-death-post-ack", &pidfile);
         let owner_pidfd = test_pidfd_open(owner.id() as libc::pid_t);
         let supervisor_pid = startup_test_checkpoint_pid(&pidfile, "post-ack");
         let supervisor_pidfd = test_pidfd_open(supervisor_pid);
@@ -5071,12 +4915,7 @@ mod tests {
         if !std::path::Path::new("/usr/bin/setsid").exists() {
             return;
         }
-        assert_startup_protocol_fault_drains(
-            "malformed-report",
-            "report-fault",
-            5,
-            None,
-        );
+        assert_startup_protocol_fault_drains("malformed-report", "report-fault", 5, None);
     }
 
     #[test]
@@ -5088,12 +4927,7 @@ mod tests {
         if !std::path::Path::new("/usr/bin/setsid").exists() {
             return;
         }
-        assert_startup_protocol_fault_drains(
-            "truncated-report",
-            "report-fault",
-            5,
-            None,
-        );
+        assert_startup_protocol_fault_drains("truncated-report", "report-fault", 5, None);
     }
 
     #[test]
@@ -5109,8 +4943,7 @@ mod tests {
             .expect("libtest supplies the current test name")
             .to_owned();
         let started = Instant::now();
-        let mut owner =
-            spawn_startup_test_owner(&test_name, "supervisor-exec-failure", &pidfile);
+        let mut owner = spawn_startup_test_owner(&test_name, "supervisor-exec-failure", &pidfile);
         let status = wait_startup_test_owner(&mut owner, "supervisor exec failure");
 
         assert_startup_fail_closed(&status);
@@ -5132,8 +4965,7 @@ mod tests {
             .name()
             .expect("libtest supplies the current test name")
             .to_owned();
-        let mut owner =
-            spawn_startup_test_owner(&test_name, "worker-exec-failure", &pidfile);
+        let mut owner = spawn_startup_test_owner(&test_name, "worker-exec-failure", &pidfile);
         let supervisor_pid = startup_test_checkpoint_pid(&pidfile, "worker-exec");
         let supervisor_pidfd = test_pidfd_open(supervisor_pid);
         let started = Instant::now();
@@ -5170,7 +5002,10 @@ mod tests {
             .collect();
 
         assert_eq!(command.get_program().as_bytes(), b"/proc/self/exe");
-        assert_eq!(args, vec![b"argument-\xfe".as_slice(), b"--exact".as_slice()]);
+        assert_eq!(
+            args,
+            vec![b"argument-\xfe".as_slice(), b"--exact".as_slice()]
+        );
     }
 
     fn byte_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
@@ -5224,7 +5059,10 @@ mod tests {
             .expect("write startup context stdin");
         assert!(
             wait_until(STARTUP_TEST_OBSERVATION_BACKSTOP, || {
-                owner.try_wait().expect("query startup context owner").is_some()
+                owner
+                    .try_wait()
+                    .expect("query startup context owner")
+                    .is_some()
             }),
             "startup context owner did not exit",
         );
@@ -6355,7 +6193,10 @@ mod tests {
             (unsafe { libc::kill(*pid, 0) }) != 0,
             "escaped descendant {pid} must be synchronously reaped",
         );
-        assert!(!state.finished, "a cancelled command has no ordinary finish");
+        assert!(
+            !state.finished,
+            "a cancelled command has no ordinary finish"
+        );
         assert_eq!(state.failures, [error.to_string()]);
         assert_eq!(active_group_for_test(), IDLE);
         assert!(

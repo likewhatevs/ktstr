@@ -512,12 +512,9 @@ fn performance_run_candidates_cover_every_equivalent_exclusive_slot() {
         (vec![2, 3], 0),
         (vec![4, 5], 0),
     ]);
-    let candidates = KtstrVm::performance_run_candidates(
-        &host,
-        &Topology::new(1, 1, 1, 1),
-        &[0, 1, 2, 3, 4, 5],
-    )
-    .expect("enumerate exact perf placements");
+    let candidates =
+        KtstrVm::performance_run_candidates(&host, &Topology::new(1, 1, 1, 1), &[0, 1, 2, 3, 4, 5])
+            .expect("enumerate exact perf placements");
     let mut llcs: Vec<_> = candidates
         .iter()
         .map(|candidate| candidate.plan.llc_indices.clone())
@@ -538,12 +535,9 @@ fn performance_run_candidates_cover_every_equivalent_exclusive_slot() {
 fn performance_run_candidates_cover_every_disjoint_cpu_grain() {
     let host = host_topology::HostTopology::new_for_tests(&[((0..36).collect(), 0)]);
     let allowed = (0..36).collect::<Vec<_>>();
-    let candidates = KtstrVm::performance_run_candidates(
-        &host,
-        &Topology::new(1, 1, 1, 1),
-        &allowed,
-    )
-    .expect("enumerate per-CPU perf grains");
+    let candidates =
+        KtstrVm::performance_run_candidates(&host, &Topology::new(1, 1, 1, 1), &allowed)
+            .expect("enumerate per-CPU perf grains");
     let mut footprints: Vec<Vec<usize>> = candidates
         .iter()
         .map(|candidate| {
@@ -558,9 +552,11 @@ fn performance_run_candidates_cover_every_disjoint_cpu_grain() {
         .collect();
     footprints.sort();
     assert!(!footprints.is_empty());
-    assert!(candidates
-        .iter()
-        .all(|candidate| candidate.llc_mode == host_topology::LlcLockMode::Shared));
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.llc_mode == host_topology::LlcLockMode::Shared)
+    );
     assert!(footprints.len() <= allowed.len());
 }
 
@@ -583,23 +579,25 @@ fn granted_scan_selects_a_far_ready_alternative_in_one_pass() {
     })
     .unwrap();
     assert_eq!(selected, Some(3));
-    assert_eq!(visited, vec![1, 2, 3], "scan must not stop at the next busy claim");
+    assert_eq!(
+        visited,
+        vec![1, 2, 3],
+        "scan must not stop at the next busy claim"
+    );
 }
 
 #[test]
 fn availability_replanning_keeps_one_replaceable_live_candidate() {
-    let make_candidate = |llc: usize, cpu: usize| {
-        host_topology::PerformancePinningCandidate {
-            plan: host_topology::PinningPlan {
-                assignments: vec![(0, cpu)],
-                service_cpu: None,
-                llc_indices: vec![llc],
-                locks: Vec::new(),
-            },
-            llc_mode: host_topology::LlcLockMode::Shared,
-            cpu_mode: crate::flock::FlockMode::Exclusive,
-            cpu_reservations: vec![cpu],
-        }
+    let make_candidate = |llc: usize, cpu: usize| host_topology::PerformancePinningCandidate {
+        plan: host_topology::PinningPlan {
+            assignments: vec![(0, cpu)],
+            service_cpu: None,
+            llc_indices: vec![llc],
+            locks: Vec::new(),
+        },
+        llc_mode: host_topology::LlcLockMode::Shared,
+        cpu_mode: crate::flock::FlockMode::Exclusive,
+        cpu_reservations: vec![cpu],
     };
     let (candidate, claim, target) = flexible_candidate_parts(make_candidate(0, 0));
     let mut candidates = vec![candidate];
@@ -643,9 +641,7 @@ fn coordinator_synthesis_builds_a_nonadjacent_ready_live_candidate() {
         host_topology::PinningKind::Default,
         &[0, 1, 2, 3],
         &[0, 1, 2, 3],
-        |claim| {
-            Ok(claim.cpus.is_subset(&ready_cpus) && claim.llcs.is_subset(&ready_llcs))
-        },
+        |claim| Ok(claim.cpus.is_subset(&ready_cpus) && claim.llcs.is_subset(&ready_llcs)),
     )
     .unwrap()
     .expect("the coordinator snapshot must synthesize LLCs 0+2");

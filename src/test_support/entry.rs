@@ -3033,8 +3033,7 @@ pub struct SchedulerManifestProbe {
 
 /// Private CLI discriminator for the combined scheduler-manifest probe.
 #[doc(hidden)]
-pub const SCHEDULER_MANIFEST_PROBE_ARG: &str =
-    "--ktstr-list-scheduler-manifest";
+pub const SCHEDULER_MANIFEST_PROBE_ARG: &str = "--ktstr-list-scheduler-manifest";
 
 /// A single `#[ktstr_test]` paired with one scheduler it exercises. A test
 /// contributes one entry for its primary scheduler and one for every staged
@@ -3084,11 +3083,9 @@ fn collect_scheduler_artifact_requirements<'a>(
                 package.to_string(),
                 BinaryKindJson::Discover(package.to_string()),
             ),
-            SchedulerSpec::Path(path) => (
-                1,
-                path.to_string(),
-                BinaryKindJson::Path(path.to_string()),
-            ),
+            SchedulerSpec::Path(path) => {
+                (1, path.to_string(), BinaryKindJson::Path(path.to_string()))
+            }
             SchedulerSpec::Eevdf | SchedulerSpec::KernelBuiltin { .. } => continue,
         };
         let manifest_dir = scheduler.manifest_dir.to_string();
@@ -3125,8 +3122,7 @@ fn collect_scheduler_list_entries_from<'a>(
     schedulers: impl IntoIterator<Item = &'a Scheduler>,
     tests: impl IntoIterator<Item = (&'a Scheduler, &'a [&'a Scheduler])>,
 ) -> Vec<SchedulerListEntry> {
-    let mut test_counts: std::collections::HashMap<&str, usize> =
-        std::collections::HashMap::new();
+    let mut test_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for (primary, staged) in tests {
         for scheduler in test_schedulers(primary, staged) {
             *test_counts.entry(scheduler.name).or_insert(0) += 1;
@@ -3150,8 +3146,7 @@ fn collect_scheduler_list_entries() -> Vec<SchedulerListEntry> {
     )
 }
 
-fn collect_registered_scheduler_artifact_requirements(
-) -> Vec<SchedulerArtifactRequirement> {
+fn collect_registered_scheduler_artifact_requirements() -> Vec<SchedulerArtifactRequirement> {
     let schedulers = KTSTR_TESTS.iter().flat_map(|entry| {
         std::iter::once(entry.scheduler).chain(entry.staged_schedulers.iter().copied())
     });
@@ -3159,27 +3154,25 @@ fn collect_registered_scheduler_artifact_requirements(
 }
 
 fn collect_scheduler_tests_from<'a>(
-    tests: impl IntoIterator<
-        Item = (&'a str, &'a Scheduler, &'a [&'a Scheduler]),
-    >,
+    tests: impl IntoIterator<Item = (&'a str, &'a Scheduler, &'a [&'a Scheduler])>,
 ) -> Vec<SchedulerTestJson> {
     tests
         .into_iter()
         .flat_map(|(test, primary, staged)| {
-            test_schedulers(primary, staged).map(move |scheduler| {
-                SchedulerTestJson {
-                    test: test.to_string(),
-                    scheduler: scheduler.name.to_string(),
-                }
+            test_schedulers(primary, staged).map(move |scheduler| SchedulerTestJson {
+                test: test.to_string(),
+                scheduler: scheduler.name.to_string(),
             })
         })
         .collect()
 }
 
 fn collect_scheduler_tests() -> Vec<SchedulerTestJson> {
-    collect_scheduler_tests_from(KTSTR_TESTS.iter().map(|test| {
-        (test.name, test.scheduler, test.staged_schedulers)
-    }))
+    collect_scheduler_tests_from(
+        KTSTR_TESTS
+            .iter()
+            .map(|test| (test.name, test.scheduler, test.staged_schedulers)),
+    )
 }
 
 fn collect_scheduler_manifest_probe() -> SchedulerManifestProbe {
@@ -7402,8 +7395,7 @@ mod tests {
                 scheduler: "rt".into(),
             }],
         };
-        let text =
-            serde_json::to_string(&manifest).expect("serialize SchedulerManifestProbe");
+        let text = serde_json::to_string(&manifest).expect("serialize SchedulerManifestProbe");
         assert!(
             text.contains("\"declarations\"")
                 && text.contains("\"artifact_requirements\"")
@@ -7429,27 +7421,17 @@ mod tests {
         assert_eq!(
             declarations
                 .iter()
-                .map(|entry| (
-                    entry.scheduler.name.as_str(),
-                    entry.test_count,
-                ))
+                .map(|entry| (entry.scheduler.name.as_str(), entry.test_count,))
                 .collect::<Vec<_>>(),
             [("primary", 1), ("staged_a", 1), ("staged_b", 1)],
             "a staged-only scheduler is still exercised by the test",
         );
 
-        let tests = collect_scheduler_tests_from([(
-            "scheduler_swap",
-            &primary,
-            staged.as_slice(),
-        )]);
+        let tests = collect_scheduler_tests_from([("scheduler_swap", &primary, staged.as_slice())]);
         assert_eq!(
             tests
                 .iter()
-                .map(|entry| (
-                    entry.test.as_str(),
-                    entry.scheduler.as_str(),
-                ))
+                .map(|entry| (entry.test.as_str(), entry.scheduler.as_str(),))
                 .collect::<Vec<_>>(),
             [
                 ("scheduler_swap", "primary"),
@@ -7471,8 +7453,7 @@ mod tests {
         let path = Scheduler::named("path")
             .binary(SchedulerSpec::Path("/opt/scx_path"))
             .manifest_dir("/other");
-        let requirements =
-            collect_scheduler_artifact_requirements([&first, &alias, &first, &path]);
+        let requirements = collect_scheduler_artifact_requirements([&first, &alias, &first, &path]);
         assert_eq!(requirements.len(), 2);
         assert_eq!(
             requirements[0],

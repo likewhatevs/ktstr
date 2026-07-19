@@ -1680,8 +1680,7 @@ fn acquire_slot_with_locks(
     // becomes LLC-SH + exact CPU-EX; one modest or heavily occupied domain
     // keeps every claimed LLC whole-domain Exclusive.
     let allowed_cpus = host_topology::host_allowed_cpus();
-    let candidates =
-        match host_topo.performance_pinning_candidates_for_cpus(topo, &allowed_cpus) {
+    let candidates = match host_topo.performance_pinning_candidates_for_cpus(topo, &allowed_cpus) {
         Ok(candidates) if !candidates.is_empty() => candidates,
         Ok(_) => {
             return Err(anyhow::Error::new(host_topology::PerfModeUnavailable {
@@ -1766,15 +1765,13 @@ mod tests {
     impl HostPlannerOverrides {
         fn new(allowed: Vec<usize>, lock_dir: &std::path::Path) -> Self {
             let previous = Self {
-                allowed: host_topology::ALLOWED_CPUS_OVERRIDE
-                    .with(|slot| slot.borrow().clone()),
+                allowed: host_topology::ALLOWED_CPUS_OVERRIDE.with(|slot| slot.borrow().clone()),
                 llc_prefix: host_topology::LLC_LOCK_PREFIX_OVERRIDE
                     .with(|slot| slot.borrow().clone()),
                 cpu_prefix: host_topology::CPU_LOCK_PREFIX_OVERRIDE
                     .with(|slot| slot.borrow().clone()),
             };
-            host_topology::ALLOWED_CPUS_OVERRIDE
-                .with(|slot| *slot.borrow_mut() = Some(allowed));
+            host_topology::ALLOWED_CPUS_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(allowed));
             host_topology::LLC_LOCK_PREFIX_OVERRIDE.with(|slot| {
                 *slot.borrow_mut() = Some(format!("{}/llc-", lock_dir.display()));
             });
@@ -2005,8 +2002,7 @@ mod tests {
         static LLC_CORES: [u32; 2] = [1, 3];
         let mut topo = topology::Topology::new(2, 2, 3, 1);
         topo.llc_cores = Some(&LLC_CORES);
-        let host =
-            host_topology::HostTopology::new_for_tests(&[(vec![0], 0), (vec![1, 2, 3], 1)]);
+        let host = host_topology::HostTopology::new_for_tests(&[(vec![0], 0), (vec![1, 2, 3], 1)]);
         let plan = host_topology::PinningPlan {
             assignments: vec![(0, 0), (1, 1), (2, 2), (3, 3)],
             service_cpu: None,

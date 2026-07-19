@@ -65,7 +65,10 @@ struct ProbeHeartbeat {
 
 impl ProbeHeartbeat {
     fn new_at(binary: &Path, started: Instant, interval: Duration) -> Self {
-        assert!(!interval.is_zero(), "probe heartbeat interval must be non-zero");
+        assert!(
+            !interval.is_zero(),
+            "probe heartbeat interval must be non-zero"
+        );
         Self {
             started,
             next: started + interval,
@@ -101,12 +104,7 @@ struct ProbeObserver {
 }
 
 impl ProbeObserver {
-    fn bounded(
-        description: &str,
-        binary: &Path,
-        timeout: Duration,
-        streams: ProbeStreams,
-    ) -> Self {
+    fn bounded(description: &str, binary: &Path, timeout: Duration, streams: ProbeStreams) -> Self {
         Self {
             deadline: Some((
                 Instant::now() + timeout,
@@ -124,26 +122,14 @@ impl ProbeObserver {
     }
 
     fn export(binary: &Path) -> Self {
-        Self::export_at(
-            binary,
-            Instant::now(),
-            EXPORT_HEARTBEAT_INTERVAL,
-        )
+        Self::export_at(binary, Instant::now(), EXPORT_HEARTBEAT_INTERVAL)
     }
 
-    fn export_at(
-        binary: &Path,
-        started: Instant,
-        heartbeat_interval: Duration,
-    ) -> Self {
+    fn export_at(binary: &Path, started: Instant, heartbeat_interval: Duration) -> Self {
         Self {
             deadline: None,
             streams: ProbeStreams::Tee,
-            heartbeat: Some(ProbeHeartbeat::new_at(
-                binary,
-                started,
-                heartbeat_interval,
-            )),
+            heartbeat: Some(ProbeHeartbeat::new_at(binary, started, heartbeat_interval)),
             forward_error: None,
         }
     }
@@ -152,9 +138,9 @@ impl ProbeObserver {
         if let Some(error) = &self.forward_error {
             return Some(std::io::Error::other(error.clone()));
         }
-        self.deadline.as_ref().and_then(|(deadline, diagnostic)| {
-            probe_cancellation_error(*deadline, now, diagnostic)
-        })
+        self.deadline
+            .as_ref()
+            .and_then(|(deadline, diagnostic)| probe_cancellation_error(*deadline, now, diagnostic))
     }
 
     fn next_tick_in_at(&self, now: Instant) -> Duration {
@@ -180,23 +166,16 @@ fn probe_cancellation_error(
     now: Instant,
     diagnostic: &str,
 ) -> Option<std::io::Error> {
-    (now >= deadline).then(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            diagnostic.to_string(),
-        )
-    })
+    (now >= deadline)
+        .then(|| std::io::Error::new(std::io::ErrorKind::TimedOut, diagnostic.to_string()))
 }
 
 impl crate::interrupt::StdoutObserver for ProbeObserver {
     fn observe_stdout(&mut self, bytes: &[u8]) {
         if self.streams.tees_stdout() && self.forward_error.is_none() {
             let mut stdout = std::io::stdout().lock();
-            if let Err(error) =
-                stdout.write_all(bytes).and_then(|()| stdout.flush())
-            {
-                self.forward_error =
-                    Some(format!("forward probe stdout: {error}"));
+            if let Err(error) = stdout.write_all(bytes).and_then(|()| stdout.flush()) {
+                self.forward_error = Some(format!("forward probe stdout: {error}"));
             }
         }
     }
@@ -204,11 +183,8 @@ impl crate::interrupt::StdoutObserver for ProbeObserver {
     fn observe_stderr(&mut self, bytes: &[u8]) {
         if self.streams.tees_stderr() && self.forward_error.is_none() {
             let mut stderr = std::io::stderr().lock();
-            if let Err(error) =
-                stderr.write_all(bytes).and_then(|()| stderr.flush())
-            {
-                self.forward_error =
-                    Some(format!("forward probe stderr: {error}"));
+            if let Err(error) = stderr.write_all(bytes).and_then(|()| stderr.flush()) {
+                self.forward_error = Some(format!("forward probe stderr: {error}"));
             }
         }
     }
@@ -226,8 +202,7 @@ impl crate::interrupt::StdoutObserver for ProbeObserver {
                 .write_all(message.as_bytes())
                 .and_then(|()| stderr.flush())
             {
-                self.forward_error =
-                    Some(format!("write probe heartbeat: {error}"));
+                self.forward_error = Some(format!("write probe heartbeat: {error}"));
             }
         }
     }
@@ -251,19 +226,11 @@ fn run_bounded_probe_output(
     command: Command,
     streams: ProbeStreams,
 ) -> std::io::Result<Output> {
-    let observer = ProbeObserver::bounded(
-        description,
-        binary,
-        PROBE_CHILD_TIMEOUT,
-        streams,
-    );
+    let observer = ProbeObserver::bounded(description, binary, PROBE_CHILD_TIMEOUT, streams);
     crate::interrupt::run_output_observed_anchored(command, observer)
 }
 
-fn run_unbounded_export_output(
-    binary: &Path,
-    command: Command,
-) -> std::io::Result<Output> {
+fn run_unbounded_export_output(binary: &Path, command: Command) -> std::io::Result<Output> {
     let observer = ProbeObserver::export(binary);
     crate::interrupt::run_output_observed_anchored(command, observer)
 }
@@ -334,12 +301,7 @@ pub(crate) fn probe_collect_from_bins_bounded<T>(
         configure_cmd,
         on_success,
         |binary, command| {
-            run_bounded_probe_output(
-                description,
-                binary,
-                command,
-                ProbeStreams::Capture,
-            )
+            run_bounded_probe_output(description, binary, command, ProbeStreams::Capture)
         },
         |success| progress.item_finished(success),
     );
@@ -396,9 +358,7 @@ pub(crate) fn probe_scheduler_manifests_from_bins(
         .prefix("ktstr-scheduler-manifest-probe-profraw-")
         .tempdir()
         .map_err(|error| {
-            format!(
-                "create temporary scheduler-manifest probe profile directory: {error}"
-            )
+            format!("create temporary scheduler-manifest probe profile directory: {error}")
         })?;
     let profile_pattern = profile_dir.path().join("probe-%p-%m.profraw");
     let mut manifests = probe_collect_from_bins_bounded(
@@ -619,12 +579,7 @@ fn probe_first_with_bins<T>(
         configure_execute_cmd,
         on_success,
         |binary, command| {
-            run_bounded_probe_output(
-                "export acceptance",
-                binary,
-                command,
-                ProbeStreams::Capture,
-            )
+            run_bounded_probe_output("export acceptance", binary, command, ProbeStreams::Capture)
         },
         run_unbounded_export_output,
     )
@@ -643,9 +598,7 @@ fn probe_first_with_bins_using<T>(
     }
     let mut rejection_stderr: Option<String> = None;
     let mut last_miss_stderr = String::new();
-    let accepted = |binary: &Path, _output: &Output| {
-        Ok::<PathBuf, String>(binary.to_path_buf())
-    };
+    let accepted = |binary: &Path, _output: &Output| Ok::<PathBuf, String>(binary.to_path_buf());
     for bin in bins {
         match process_bin_with_runner(
             bin,
@@ -703,19 +656,9 @@ fn probe_collect_with_bins<T>(
     configure_cmd: impl Fn(&Path) -> Command,
     on_success: impl Fn(&Path, &Output) -> Result<T, String>,
 ) -> Result<Vec<T>, ProbeError> {
-    probe_collect_with_bins_using(
-        bins,
-        configure_cmd,
-        on_success,
-        |binary, command| {
-            run_bounded_probe_output(
-                "test registration",
-                binary,
-                command,
-                ProbeStreams::Capture,
-            )
-        },
-    )
+    probe_collect_with_bins_using(bins, configure_cmd, on_success, |binary, command| {
+        run_bounded_probe_output("test registration", binary, command, ProbeStreams::Capture)
+    })
 }
 
 fn probe_collect_with_bins_using<T>(
@@ -798,9 +741,7 @@ mod tests {
         );
         assert!(
             observer
-                .cancellation_error_at(
-                    started + PROBE_CHILD_TIMEOUT + Duration::from_secs(1),
-                )
+                .cancellation_error_at(started + PROBE_CHILD_TIMEOUT + Duration::from_secs(1),)
                 .is_none(),
             "the selected long exporter has no acceptance-probe deadline",
         );
@@ -817,10 +758,7 @@ mod tests {
         assert_eq!(observer.streams, ProbeStreams::Tee);
         assert!(observer.streams.tees_stdout());
         assert!(observer.streams.tees_stderr());
-        assert_eq!(
-            observer.next_tick_in_at(started),
-            Duration::from_secs(10),
-        );
+        assert_eq!(observer.next_tick_in_at(started), Duration::from_secs(10),);
 
         let heartbeat = observer
             .heartbeat
@@ -923,9 +861,7 @@ mod tests {
         let bins = vec![PathBuf::from("/fake/signaled")];
         let outcomes = std::cell::RefCell::new(Vec::new());
         let signal_status = std::process::ExitStatus::from_raw(libc::SIGKILL);
-        let expected = format!(
-            "scheduler probe /fake/signaled terminated by {signal_status}"
-        );
+        let expected = format!("scheduler probe /fake/signaled terminated by {signal_status}");
         let error = collect_probe_outputs(
             &bins,
             |binary| Command::new(binary),
@@ -951,9 +887,7 @@ mod tests {
         let error = collect_probe_outputs(
             &bins,
             |binary| Command::new(binary),
-            |_binary, _output| {
-                Err::<(), _>("malformed scheduler manifest".to_string())
-            },
+            |_binary, _output| Err::<(), _>("malformed scheduler manifest".to_string()),
             |_binary, _command| Ok(probe_output(0, b"not-json", b"")),
             |success| outcomes.borrow_mut().push(success),
         )
@@ -972,13 +906,11 @@ mod tests {
         let configure_cmd = |_bin: &Path| Command::new("true");
         let on_success =
             |bin: &Path, _out: &Output| -> Result<PathBuf, String> { Ok(bin.to_path_buf()) };
-        let result = probe_collect_with_bins_using(
-            &bins,
-            configure_cmd,
-            on_success,
-            |_bin, _command| Ok(probe_output(0, b"", b"")),
-        )
-        .expect("two successes should collect");
+        let result =
+            probe_collect_with_bins_using(&bins, configure_cmd, on_success, |_bin, _command| {
+                Ok(probe_output(0, b"", b""))
+            })
+            .expect("two successes should collect");
         assert_eq!(result, vec![fake_bin(0), fake_bin(1)]);
     }
 
@@ -1081,12 +1013,9 @@ mod tests {
         let bins: Vec<PathBuf> = vec![];
         let configure_cmd = |_bin: &Path| Command::new("true");
         let on_success = |_bin: &Path, _out: &Output| -> Result<(), String> { Ok(()) };
-        match probe_collect_with_bins_using(
-            &bins,
-            configure_cmd,
-            on_success,
-            |_bin, _command| unreachable!("an empty probe cannot execute"),
-        ) {
+        match probe_collect_with_bins_using(&bins, configure_cmd, on_success, |_bin, _command| {
+            unreachable!("an empty probe cannot execute")
+        }) {
             Err(ProbeError::Setup(msg)) => assert!(msg.contains("no executable artifacts")),
             _ => panic!("expected Setup error"),
         }
@@ -1140,12 +1069,9 @@ mod tests {
         let bins = vec![fake_bin(0), fake_bin(1), fake_bin(2)];
         let configure_cmd = |_bin: &Path| Command::new("false");
         let on_success = |_bin: &Path, _out: &Output| -> Result<(), String> { Ok(()) };
-        match probe_collect_with_bins_using(
-            &bins,
-            configure_cmd,
-            on_success,
-            |_bin, _command| Ok(probe_output(1, b"", b"miss")),
-        ) {
+        match probe_collect_with_bins_using(&bins, configure_cmd, on_success, |_bin, _command| {
+            Ok(probe_output(1, b"", b"miss"))
+        }) {
             Err(ProbeError::Miss(miss)) => {
                 assert_eq!(miss.bins_tried, 3);
                 assert!(

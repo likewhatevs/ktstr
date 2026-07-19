@@ -673,10 +673,7 @@ fn validate_source_after_cache_operation(
     Ok(())
 }
 
-fn hash_pinned_file_exact_identity(
-    file: &File,
-    identity: StableFileIdentity,
-) -> Result<u64> {
+fn hash_pinned_file_exact_identity(file: &File, identity: StableFileIdentity) -> Result<u64> {
     anyhow::ensure!(
         StableFileIdentity::from_file(file)? == identity,
         "pinned input changed before exact content validation"
@@ -896,15 +893,12 @@ fn publish_content_object(
         after_copy.same_open_content_version(source_identity),
         "content source changed during CAS publication"
     );
-    if before_copy != source_identity
-        || after_copy != source_identity
-        || before_copy != after_copy
+    if before_copy != source_identity || after_copy != source_identity || before_copy != after_copy
     {
         let temporary_identity = StableFileIdentity::from_file(temporary.as_file())
             .context("stat content object temp for source-race validation")?;
-        let actual_hash =
-            hash_pinned_file_exact_identity(temporary.as_file(), temporary_identity)
-                .context("hash content object temp after source revision transition")?;
+        let actual_hash = hash_pinned_file_exact_identity(temporary.as_file(), temporary_identity)
+            .context("hash content object temp after source revision transition")?;
         anyhow::ensure!(
             actual_hash == expected_hash,
             "content object captured bytes from a transient source revision"
@@ -1182,13 +1176,8 @@ mod tests {
         let (source, identity) = open_pinned_file(&source_path).unwrap();
         let content_hash = hash_pinned_file(&source, identity).unwrap();
         drop(
-            open_or_publish_content_object_at_root(
-                root.path(),
-                content_hash,
-                &source,
-                identity,
-            )
-            .unwrap(),
+            open_or_publish_content_object_at_root(root.path(), content_hash, &source, identity)
+                .unwrap(),
         );
 
         rewrite_same_size_and_restore_mtime(&source_path, b"new scheduler bytes", identity);
@@ -1212,17 +1201,12 @@ mod tests {
         let (source, identity) = open_pinned_file(&source_path).unwrap();
         let content_hash = hash_pinned_file(&source, identity).unwrap();
 
-        rewrite_same_size_and_restore_mtime(
-            &source_path,
-            b"new scheduler bytes",
-            identity,
-        );
+        rewrite_same_size_and_restore_mtime(&source_path, b"new scheduler bytes", identity);
         let error =
             open_or_publish_content_object_at_root(root.path(), content_hash, &source, identity)
                 .unwrap_err();
         assert!(
-            format!("{error:#}")
-                .contains("transient source revision"),
+            format!("{error:#}").contains("transient source revision"),
             "unexpected stale publication rejection: {error:#}",
         );
         assert!(
@@ -1322,13 +1306,9 @@ mod tests {
             std::fs::write(&path, bytes).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             let (file, identity) = open_pinned_file(&path).unwrap();
-            drop(open_or_publish_content_object_at_root(
-                root.path(),
-                hash,
-                &file,
-                identity,
-            )
-            .unwrap());
+            drop(
+                open_or_publish_content_object_at_root(root.path(), hash, &file, identity).unwrap(),
+            );
             leases.push(
                 lease_content_object_at_root(root.path(), hash, identity.size)
                     .unwrap()

@@ -182,9 +182,7 @@ fn cargo_sub_uses_nextest(sub_argv: &[&str], args: &[String]) -> bool {
     let selects_nextest = sub_argv == TEST_SUB_ARGV
         || sub_argv == COVERAGE_SUB_ARGV
         || (sub_argv == LLVM_COV_SUB_ARGV && llvm_cov_uses_nextest(args));
-    selects_nextest
-        && !(sub_argv != TEST_SUB_ARGV
-            && llvm_cov_has_lifecycle_flag(args, "--no-run"))
+    selects_nextest && !(sub_argv != TEST_SUB_ARGV && llvm_cov_has_lifecycle_flag(args, "--no-run"))
 }
 
 /// Whether the final cargo-llvm-cov invocation deliberately retains existing
@@ -258,12 +256,10 @@ fn nextest_archive_reuse(
             if argument == "--archive-format"
                 && args[index + 1..].iter().any(|value| value == "nextest")
             {
-                return Err(
-                    "cargo ktstr: split --archive-format is not valid before \
+                return Err("cargo ktstr: split --archive-format is not valid before \
                      cargo-llvm-cov's nextest subcommand; use \
                      --archive-format=tar-zst or place it after nextest"
-                        .to_string(),
-                );
+                    .to_string());
             }
             if !argument.starts_with('-') || argument == "--" {
                 break;
@@ -299,13 +295,10 @@ fn nextest_archive_reuse(
         let parsed = if argument == "--archive-file" || argument == "--archive-format" {
             let archive_file = argument == "--archive-file";
             let value = args.get(index + 1).filter(|value| {
-                value.as_str() != "--"
-                    && (archive_file || !value.starts_with('-'))
+                value.as_str() != "--" && (archive_file || !value.starts_with('-'))
             });
             let Some(value) = value else {
-                return Err(format!(
-                    "cargo ktstr: {argument} requires a nonempty value"
-                ));
+                return Err(format!("cargo ktstr: {argument} requires a nonempty value"));
             };
             let parsed = NextestArchiveOption {
                 option_index: index,
@@ -316,9 +309,7 @@ fn nextest_archive_reuse(
             Some((argument.as_str(), parsed))
         } else if let Some(value) = argument.strip_prefix("--archive-file=") {
             if value.is_empty() {
-                return Err(
-                    "cargo ktstr: --archive-file requires a nonempty value".to_string()
-                );
+                return Err("cargo ktstr: --archive-file requires a nonempty value".to_string());
             }
             let parsed = NextestArchiveOption {
                 option_index: index,
@@ -329,9 +320,7 @@ fn nextest_archive_reuse(
             Some(("--archive-file", parsed))
         } else if let Some(value) = argument.strip_prefix("--archive-format=") {
             if value.is_empty() {
-                return Err(
-                    "cargo ktstr: --archive-format requires a nonempty value".to_string()
-                );
+                return Err("cargo ktstr: --archive-format requires a nonempty value".to_string());
             }
             let parsed = NextestArchiveOption {
                 option_index: index,
@@ -350,9 +339,7 @@ fn nextest_archive_reuse(
                 &mut format
             };
             if slot.replace(parsed).is_some() {
-                return Err(format!(
-                    "cargo ktstr: duplicate {option} is ambiguous"
-                ));
+                return Err(format!("cargo ktstr: duplicate {option} is ambiguous"));
             }
             continue;
         }
@@ -364,9 +351,7 @@ fn nextest_archive_reuse(
     }
     let Some(file) = file else {
         if format.is_some() {
-            return Err(
-                "cargo ktstr: --archive-format requires --archive-file".to_string()
-            );
+            return Err("cargo ktstr: --archive-format requires --archive-file".to_string());
         }
         return Ok(None);
     };
@@ -374,8 +359,7 @@ fn nextest_archive_reuse(
         || file.value.ends_with(".tar.zst"),
         |format| {
             matches!(format.value.as_str(), "tar-zst" | "tar-zstd")
-                || (format.value == "auto"
-                    && file.value.ends_with(".tar.zst"))
+                || (format.value == "auto" && file.value.ends_with(".tar.zst"))
         },
     );
     if !supported {
@@ -420,8 +404,7 @@ fn rewrite_nextest_archive_reuse(
     archive_path: &std::path::Path,
 ) -> Result<Vec<String>, String> {
     let reuse = nextest_archive_reuse(sub_argv, &args)?.ok_or_else(|| {
-        "cargo ktstr: cannot rewrite a nextest invocation without --archive-file"
-            .to_string()
+        "cargo ktstr: cannot rewrite a nextest invocation without --archive-file".to_string()
     })?;
     let path = archive_path.to_string_lossy().into_owned();
     if reuse.file.separate_value {
@@ -436,8 +419,8 @@ fn rewrite_nextest_archive_reuse(
             args[format.option_index] = "--archive-format=tar-zst".to_string();
         }
     } else {
-        let region_start = nextest_region_start(sub_argv, &args)
-            .expect("validated archive reuse selects nextest");
+        let region_start =
+            nextest_region_start(sub_argv, &args).expect("validated archive reuse selects nextest");
         let insertion = args[region_start..]
             .iter()
             .position(|argument| argument == "--")
@@ -451,8 +434,7 @@ fn cargo_sub_needs_reserved_prebuild(sub_argv: &[&str], args: &[String]) -> bool
     if !cargo_sub_uses_nextest(sub_argv, args) {
         return false;
     }
-    !llvm_cov_has_lifecycle_flag(args, "--no-run")
-        && !llvm_cov_reuses_archive(sub_argv, args)
+    !llvm_cov_has_lifecycle_flag(args, "--no-run") && !llvm_cov_reuses_archive(sub_argv, args)
 }
 
 const ORCHESTRATED_NEXTEST_TEST_THREADS: usize = 1_000_000;
@@ -522,24 +504,19 @@ fn normalize_raw_llvm_cov_build_jobs(args: Vec<String>) -> Vec<String> {
             }
             continue;
         }
-        if let Some(value) = argument
-            .strip_prefix("--jobs=")
-            .or_else(|| {
-                argument
-                    .strip_prefix("-j")
-                    .filter(|value| !value.is_empty())
-                    .map(|value| value.strip_prefix('=').unwrap_or(value))
-            })
-        {
+        if let Some(value) = argument.strip_prefix("--jobs=").or_else(|| {
+            argument
+                .strip_prefix("-j")
+                .filter(|value| !value.is_empty())
+                .map(|value| value.strip_prefix('=').unwrap_or(value))
+        }) {
             build_jobs = Some(value.to_string());
             index += 1;
             continue;
         }
         out.push(argument.clone());
         index += 1;
-        if LLVM_COV_GLOBAL_VALUE_OPTIONS.contains(&argument.as_str())
-            && index < nextest_index
-        {
+        if LLVM_COV_GLOBAL_VALUE_OPTIONS.contains(&argument.as_str()) && index < nextest_index {
             out.push(args[index].clone());
             index += 1;
         }
@@ -1074,9 +1051,9 @@ fn nextest_archive_drops_flag(argument: &str) -> bool {
 fn nextest_archive_drops_joined_option(argument: &str) -> bool {
     NEXTEST_ARCHIVE_DROP_VALUE_OPTIONS.iter().any(|option| {
         let short = option.starts_with('-') && !option.starts_with("--");
-        argument.strip_prefix(option).is_some_and(|suffix| {
-            suffix.starts_with('=') || (short && !suffix.is_empty())
-        })
+        argument
+            .strip_prefix(option)
+            .is_some_and(|suffix| suffix.starts_with('=') || (short && !suffix.is_empty()))
     })
 }
 
@@ -1108,9 +1085,9 @@ fn llvm_cov_or_nextest_joined_value_option(argument: &str) -> bool {
         .chain(LLVM_COV_NEXTEST_VALUE_OPTIONS.iter())
         .any(|option| {
             let short = option.starts_with('-') && !option.starts_with("--");
-            argument.strip_prefix(option).is_some_and(|suffix| {
-                suffix.starts_with('=') || (short && !suffix.is_empty())
-            })
+            argument
+                .strip_prefix(option)
+                .is_some_and(|suffix| suffix.starts_with('=') || (short && !suffix.is_empty()))
         })
 }
 
@@ -1171,24 +1148,19 @@ fn llvm_cov_nextest_archive_args(
                 }
                 continue;
             }
-            if let Some(value) = argument
-                .strip_prefix("--jobs=")
-                .or_else(|| {
-                    argument
-                        .strip_prefix("-j")
-                        .filter(|value| !value.is_empty())
-                        .map(|value| value.strip_prefix('=').unwrap_or(value))
-                })
-            {
+            if let Some(value) = argument.strip_prefix("--jobs=").or_else(|| {
+                argument
+                    .strip_prefix("-j")
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.strip_prefix('=').unwrap_or(value))
+            }) {
                 raw_build_jobs = Some(value.to_string());
                 index += 1;
                 continue;
             }
             globals.push(argument.clone());
             index += 1;
-            if LLVM_COV_GLOBAL_VALUE_OPTIONS.contains(&argument.as_str())
-                && index < nextest_index
-            {
+            if LLVM_COV_GLOBAL_VALUE_OPTIONS.contains(&argument.as_str()) && index < nextest_index {
                 globals.push(args[index].clone());
                 index += 1;
             }
@@ -1277,8 +1249,7 @@ fn build_llvm_cov_archive_warm_command(
     args: &[String],
     archive_path: &std::path::Path,
 ) -> Result<Command, String> {
-    let (globals, archive_args) =
-        llvm_cov_nextest_archive_args(sub_argv, args, archive_path)?;
+    let (globals, archive_args) = llvm_cov_nextest_archive_args(sub_argv, args, archive_path)?;
     let mut command = Command::new("cargo");
     command.arg("llvm-cov");
     command.args(globals);
@@ -1302,8 +1273,7 @@ fn build_llvm_cov_archive_warm_command(
     Ok(command)
 }
 
-const NEXTEST_ARCHIVE_BINARIES_METADATA: &str =
-    "target/nextest/binaries-metadata.json";
+const NEXTEST_ARCHIVE_BINARIES_METADATA: &str = "target/nextest/binaries-metadata.json";
 const NEXTEST_ARCHIVE_METADATA_MAX_BYTES: u64 = 64 << 20;
 
 #[derive(serde::Deserialize)]
@@ -1553,11 +1523,7 @@ fn extract_nextest_archive_test_binaries(
     let owner = tempfile::Builder::new()
         .prefix("ktstr-nextest-archive-probe-")
         .tempdir()
-        .map_err(|error| {
-            format!(
-                "cargo ktstr: create nextest archive probe directory: {error}"
-            )
-        })?;
+        .map_err(|error| format!("cargo ktstr: create nextest archive probe directory: {error}"))?;
     let file = std::fs::File::open(archive_path).map_err(|error| {
         format!(
             "cargo ktstr: reopen nextest archive {}: {error}",
@@ -1595,15 +1561,11 @@ fn extract_nextest_archive_test_binaries(
             })?
             .into_owned();
         let is_test_binary = wanted.contains(&path);
-        let under_target = path
+        let under_target = path.components().next().is_some_and(|component| {
+            component == std::path::Component::Normal(std::ffi::OsStr::new("target"))
+        }) && path
             .components()
-            .next()
-            .is_some_and(|component| {
-                component == std::path::Component::Normal(std::ffi::OsStr::new("target"))
-            })
-            && path.components().all(|component| {
-                matches!(component, std::path::Component::Normal(_))
-            });
+            .all(|component| matches!(component, std::path::Component::Normal(_)));
         if !under_target {
             continue;
         }
@@ -1735,8 +1697,8 @@ fn run_cargo_sub(
     // and publish the validated source before constructing either command,
     // rewrite the user's exact archive option to the leased CAS pathname, and
     // retain the owner through the final child.
-    let report_only_llvm_cov = sub_argv != TEST_SUB_ARGV
-        && llvm_cov_has_lifecycle_flag(&args, "--no-run");
+    let report_only_llvm_cov =
+        sub_argv != TEST_SUB_ARGV && llvm_cov_has_lifecycle_flag(&args, "--no-run");
     let archive_source_path = if report_only_llvm_cov {
         None
     } else {
@@ -1864,8 +1826,7 @@ fn run_cargo_sub(
         }
     }
 
-    let target_dir_path =
-        resolve_cargo_target_dir_for_args(&args, &invocation_dir)?;
+    let target_dir_path = resolve_cargo_target_dir_for_args(&args, &invocation_dir)?;
 
     // BTF type anchor: if a prior build left .bpf.o files, extract
     // struct definitions from the BPF source tree and generate a
@@ -1922,14 +1883,14 @@ fn run_cargo_sub(
     } else {
         None
     };
-    let archive_dir = if needs_prebuild && sub_argv != TEST_SUB_ARGV {
-        Some(
-            tempfile::tempdir()
-                .map_err(|error| format!("cargo ktstr: create coverage warm archive dir: {error}"))?,
-        )
-    } else {
-        None
-    };
+    let archive_dir =
+        if needs_prebuild && sub_argv != TEST_SUB_ARGV {
+            Some(tempfile::tempdir().map_err(|error| {
+                format!("cargo ktstr: create coverage warm archive dir: {error}")
+            })?)
+        } else {
+            None
+        };
     let archive_probe = archive_reuse_path
         .as_deref()
         .map(|archive_path| {
@@ -2013,10 +1974,7 @@ fn run_cargo_sub(
     // artifacts. Export the same strict manifest to ordinary tests, coverage,
     // and raw llvm-cov nextest; the owner remains alive through run_status.
     if let Some(prepared) = &prepared_scheduler_artifacts {
-        cmd.env(
-            ktstr::KTSTR_SCHEDULER_MANIFEST_ENV,
-            &prepared.manifest_path,
-        );
+        cmd.env(ktstr::KTSTR_SCHEDULER_MANIFEST_ENV, &prepared.manifest_path);
     }
     // This joins all work before nextest starts, so child processes hit
     // complete atomic CAS entries instead of racing background warmers.
@@ -2198,7 +2156,9 @@ fn observe_cargo_json_stream(bytes: &[u8], discovery: &mut CargoJsonDiscovery) {
             continue;
         };
         if message.get("reason").and_then(|value| value.as_str()) == Some("build-finished")
-            && message.get("success").is_some_and(serde_json::Value::is_boolean)
+            && message
+                .get("success")
+                .is_some_and(serde_json::Value::is_boolean)
         {
             discovery.saw_build_finished = true;
             continue;
@@ -2220,9 +2180,7 @@ fn observe_cargo_json_stream(bytes: &[u8], discovery: &mut CargoJsonDiscovery) {
             .and_then(|test| test.as_bool())
             == Some(true);
         if target_is_test || profile_is_test {
-            discovery
-                .test_executables
-                .push(PathBuf::from(executable));
+            discovery.test_executables.push(PathBuf::from(executable));
         }
     }
 }
@@ -2296,13 +2254,12 @@ fn prepare_reserved_prebuild(
         crate::reserved_build_progress::ReservationWaitProgress::start(cli_label),
     ));
     let wait_tick = std::rc::Rc::clone(&wait_progress);
-    let reservation =
-        ktstr::cli::acquire_build_reservation_waiting_interruptible_with_progress(
-            cli_label,
-            cpu_cap,
-            &crate::interrupt::INTERRUPTED,
-            move || wait_tick.borrow_mut().tick(),
-        );
+    let reservation = ktstr::cli::acquire_build_reservation_waiting_interruptible_with_progress(
+        cli_label,
+        cpu_cap,
+        &crate::interrupt::INTERRUPTED,
+        move || wait_tick.borrow_mut().tick(),
+    );
     match &reservation {
         Ok(_) => wait_progress.borrow_mut().acquired(),
         Err(error) => wait_progress.borrow_mut().failed(error),
@@ -2409,14 +2366,15 @@ fn acquire_cargo_build_output_lease_at_root(
                 canonical_target_dir.display()
             ));
         }
-        match ktstr::flock::try_flock(&lock_path, ktstr::flock::FlockMode::Exclusive)
-            .map_err(|error| {
+        match ktstr::flock::try_flock(&lock_path, ktstr::flock::FlockMode::Exclusive).map_err(
+            |error| {
                 format!(
                     "{cli_label}: lock Cargo output directory {} via {}: {error:#}",
                     canonical_target_dir.display(),
                     lock_path.display(),
                 )
-            })? {
+            },
+        )? {
             Some(lock) => {
                 return Ok(CargoBuildOutputLease {
                     _lock: lock,
@@ -2709,10 +2667,7 @@ impl ItemProgress {
         let snapshot = self.state.record(success);
         if let Some(bar) = &self.tty {
             bar.set_position(snapshot.completed.min(self.total) as u64);
-            bar.set_message(format!(
-                "{} — {} failed",
-                self.label, snapshot.failed,
-            ));
+            bar.set_message(format!("{} — {} failed", self.label, snapshot.failed,));
         }
     }
 
@@ -2756,7 +2711,10 @@ impl ItemProgress {
 impl Drop for ItemProgress {
     fn drop(&mut self) {
         if !self.terminal {
-            self.finish("stopped", Some("progress owner dropped before terminal outcome"));
+            self.finish(
+                "stopped",
+                Some("progress owner dropped before terminal outcome"),
+            );
         }
     }
 }
@@ -2961,10 +2919,7 @@ fn generate_btf_anchor(target_dir: &std::path::Path, release: bool) -> Option<st
     crate::btf_catalog::generate_btf_anchor(bpf_object_dir, &clang, &cflags, &anchor_path)
 }
 
-fn explicit_cargo_target_dir(
-    args: &[String],
-    invocation_dir: &std::path::Path,
-) -> Option<PathBuf> {
+fn explicit_cargo_target_dir(args: &[String], invocation_dir: &std::path::Path) -> Option<PathBuf> {
     let mut target_dir = None;
     let mut index = 0;
     while index < args.len() {
@@ -3010,9 +2965,7 @@ pub(crate) fn resolve_cargo_target_dir_for_args(
     command
         .cargo_path("cargo")
         .current_dir(invocation_dir)
-        .other_options(crate::feature_discovery::metadata_passthrough_options(
-            args,
-        ))
+        .other_options(crate::feature_discovery::metadata_passthrough_options(args))
         .no_deps();
     command
         .exec()
@@ -3580,8 +3533,7 @@ pub(crate) fn run_coverage(
     } else {
         prepare_nextest_args(args)?
     };
-    let args =
-        apply_relevant_narrowing(args, relevant, base, base_ref, default_branch, release)?;
+    let args = apply_relevant_narrowing(args, relevant, base, base_ref, default_branch, release)?;
     run_cargo_sub(
         COVERAGE_SUB_ARGV,
         "coverage",
@@ -3756,9 +3708,8 @@ mod tests {
         let artifact_for_thread = artifact.clone();
         let interrupted_for_thread = Arc::clone(&interrupted);
         let contender = std::thread::spawn(move || {
-            let probe =
-                ktstr::flock::try_flock(&lock_path, ktstr::flock::FlockMode::Exclusive)
-                    .expect("probe first writer's output lock");
+            let probe = ktstr::flock::try_flock(&lock_path, ktstr::flock::FlockMode::Exclusive)
+                .expect("probe first writer's output lock");
             contended_tx
                 .send(probe.is_none())
                 .expect("report lock contention");
@@ -3797,9 +3748,8 @@ mod tests {
             .expect("second writer replaces output before deadline");
         contender.join().expect("join output-lock contender");
 
-        let snapshot =
-            ktstr::scheduler_artifact::snapshot_pinned_scheduler_artifact(pinned)
-                .expect("snapshot exact pinned revision after pathname replacement");
+        let snapshot = ktstr::scheduler_artifact::snapshot_pinned_scheduler_artifact(pinned)
+            .expect("snapshot exact pinned revision after pathname replacement");
         assert_eq!(
             std::fs::read(snapshot.path()).expect("read exact scheduler snapshot"),
             b"first scheduler revision",
@@ -3978,11 +3928,9 @@ mod tests {
             ),
         ] {
             assert!(!cargo_sub_uses_nextest(sub_argv, &args));
-            let uninjected = inject_nextest_tool_config_with(
-                sub_argv,
-                args.clone(),
-                |_| panic!("report-only --no-run must not inject nextest config"),
-            )
+            let uninjected = inject_nextest_tool_config_with(sub_argv, args.clone(), |_| {
+                panic!("report-only --no-run must not inject nextest config")
+            })
             .unwrap();
             assert_eq!(uninjected, args);
         }
@@ -5330,12 +5278,7 @@ mod tests {
                 .get_args()
                 .map(|argument| argument.to_string_lossy().into_owned())
                 .collect::<Vec<_>>(),
-            strs(&[
-                "llvm-cov",
-                "nextest",
-                "--archive-file",
-                "reuse.tar.zst",
-            ]),
+            strs(&["llvm-cov", "nextest", "--archive-file", "reuse.tar.zst",]),
             "archive reuse did not run ktstr's clean/warm lifecycle",
         );
 
@@ -5664,17 +5607,8 @@ mod tests {
             );
         }
         for args in [
-            strs(&[
-                "--archive-file",
-                "-",
-                "nextest",
-                "--archive-format=tar-zst",
-            ]),
-            strs(&[
-                "--archive-file=-",
-                "nextest",
-                "--archive-format=tar-zst",
-            ]),
+            strs(&["--archive-file", "-", "nextest", "--archive-format=tar-zst"]),
+            strs(&["--archive-file=-", "nextest", "--archive-format=tar-zst"]),
         ] {
             assert_eq!(
                 nextest_archive_reuse(LLVM_COV_SUB_ARGV, &args)
@@ -5687,12 +5621,9 @@ mod tests {
             );
         }
         assert!(
-            nextest_archive_reuse(
-                LLVM_COV_SUB_ARGV,
-                &strs(&["--archive-file=-", "nextest"]),
-            )
-            .unwrap_err()
-            .contains("format auto"),
+            nextest_archive_reuse(LLVM_COV_SUB_ARGV, &strs(&["--archive-file=-", "nextest"]),)
+                .unwrap_err()
+                .contains("format auto"),
             "the literal dash has no auto-detectable archive extension",
         );
         assert!(
@@ -5711,12 +5642,7 @@ mod tests {
         assert!(
             nextest_archive_reuse(
                 COVERAGE_SUB_ARGV,
-                &strs(&[
-                    "--archive-file",
-                    "reuse.tar.zst",
-                    "--archive-format",
-                    "zip",
-                ]),
+                &strs(&["--archive-file", "reuse.tar.zst", "--archive-format", "zip",]),
             )
             .unwrap_err()
             .contains("does not resolve to tar-zst"),
@@ -6128,11 +6054,7 @@ cargo-llvm-cov diagnostic
                     "target/debug/deps/libdep.so",
                     true,
                 ),
-                (
-                    "target/debug/deps/libdep-link.so",
-                    "libdep.so",
-                    false,
-                ),
+                ("target/debug/deps/libdep-link.so", "libdep.so", false),
             ],
         );
 
@@ -6160,16 +6082,15 @@ cargo-llvm-cov diagnostic
             .collect::<Vec<_>>(),
             "probe loader order must match nextest: linked, deps/base, Rust libdirs",
         );
-        assert!(extracted
-            ._owner
-            .path()
-            .join("target/unrelated/libignored.so")
-            .exists());
-        let deps = extracted._owner.path().join("target/debug/deps");
-        assert_eq!(
-            std::fs::read(deps.join("libdep-link.so")).unwrap(),
-            b"dep",
+        assert!(
+            extracted
+                ._owner
+                .path()
+                .join("target/unrelated/libignored.so")
+                .exists()
         );
+        let deps = extracted._owner.path().join("target/debug/deps");
+        assert_eq!(std::fs::read(deps.join("libdep-link.so")).unwrap(), b"dep",);
         use std::os::unix::fs::MetadataExt as _;
         assert_eq!(
             std::fs::metadata(deps.join("libdep.so")).unwrap().ino(),
@@ -6181,12 +6102,7 @@ cargo-llvm-cov diagnostic
     #[test]
     fn nextest_archive_loader_links_must_remain_under_target_tree() {
         let entry = std::path::Path::new("target/debug/deps/libfoo.so");
-        validate_archive_loader_link(
-            entry,
-            std::path::Path::new("libfoo.so.1"),
-            false,
-        )
-        .unwrap();
+        validate_archive_loader_link(entry, std::path::Path::new("libfoo.so.1"), false).unwrap();
         validate_archive_loader_link(
             entry,
             std::path::Path::new("target/debug/deps/libfoo.so.1"),
@@ -6203,23 +6119,21 @@ cargo-llvm-cov diagnostic
             .contains("escapes target tree"),
         );
         assert!(
-            validate_archive_loader_link(
-                entry,
-                std::path::Path::new("/etc/passwd"),
-                false,
-            )
-            .is_err(),
+            validate_archive_loader_link(entry, std::path::Path::new("/etc/passwd"), false,)
+                .is_err(),
         );
     }
 
     #[test]
     fn nextest_archive_probe_rejects_binary_outside_target_directory() {
-        let metadata: NextestArchiveBinaryMetadata = serde_json::from_slice(br#"{
+        let metadata: NextestArchiveBinaryMetadata = serde_json::from_slice(
+            br#"{
             "rust-build-meta": {"target-directory": "/original/target"},
             "rust-binaries": {
                 "pkg::escape": {"binary-path": "/original/other/escape"}
             }
-        }"#)
+        }"#,
+        )
         .expect("parse archive metadata fixture");
         let error = nextest_archive_binary_entry_paths(&metadata)
             .expect_err("archive binary outside target directory must fail");

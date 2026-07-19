@@ -156,9 +156,7 @@ impl PinnedContentFile {
 }
 
 /// Open and pin one regular-file revision without publishing it yet.
-pub fn pin_content_file(
-    path: impl AsRef<std::path::Path>,
-) -> anyhow::Result<PinnedContentFile> {
+pub fn pin_content_file(path: impl AsRef<std::path::Path>) -> anyhow::Result<PinnedContentFile> {
     let path = path.as_ref();
     let (source, identity) = content::open_pinned_file(path)?;
     Ok(PinnedContentFile {
@@ -174,8 +172,7 @@ pub fn snapshot_pinned_content_file(
 ) -> anyhow::Result<ContentFileSnapshot> {
     let (source, identity, _) = pinned.into_parts();
     let content_hash = content::cached_file_digest(&source, identity)?;
-    let lease =
-        content::open_or_publish_content_object_lease(content_hash, &source, identity)?;
+    let lease = content::open_or_publish_content_object_lease(content_hash, &source, identity)?;
     Ok(ContentFileSnapshot {
         _source: source,
         lease,

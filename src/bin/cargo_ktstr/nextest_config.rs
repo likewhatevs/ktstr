@@ -404,11 +404,7 @@ mod tests {
             CONFIG.contains("failure-output = \"immediate-final\""),
             "CI must print each failure immediately and repeat it in the final report",
         );
-        const EXPECTED_SPECIALIZED_GROUPS: &[&str] = &[
-            "alu-vec512",
-            "compile-fail",
-            "llc-lock",
-        ];
+        const EXPECTED_SPECIALIZED_GROUPS: &[&str] = &["alu-vec512", "compile-fail", "llc-lock"];
 
         for profile in ["ci", "default"] {
             let blocks = profile_override_blocks(CONFIG, profile);

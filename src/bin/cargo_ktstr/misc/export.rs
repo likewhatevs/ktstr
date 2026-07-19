@@ -85,9 +85,8 @@ pub(crate) fn run_export(
         cmd
     };
 
-    let on_success = |_bin: &std::path::Path,
-                      _out: &std::process::Output|
-     -> Result<(), String> { Ok(()) };
+    let on_success =
+        |_bin: &std::path::Path, _out: &std::process::Output| -> Result<(), String> { Ok(()) };
 
     match probe_first(
         package.as_deref(),

@@ -89,11 +89,11 @@ mod probe;
 pub(crate) use probe::PROBE_OUTPUT_END;
 mod probe_metrics;
 mod profraw;
+pub(crate) use eval::FrameworkInfrastructureFailure;
 pub use eval::{
     capture_starvation_witness, periodic_starvation_gate, post_vm_skip, stall_ejection_skip,
     starved_below_minimum_skip,
 };
-pub(crate) use eval::FrameworkInfrastructureFailure;
 pub use profraw::current_binary_is_coverage_instrumented;
 pub mod runtime;
 mod shell_descriptor;
@@ -159,12 +159,11 @@ pub use dispatch::{
 };
 pub use entry::{
     BinaryKindJson, BpfMapAgg, BpfMapWrite, CgroupPath, KTSTR_SCHEDULERS, KTSTR_TESTS,
-    KtstrTestEntry, MemSideCache, NumaDistance, NumaNode, PerfDeltaAssertion, Scheduler,
-    SchedulerArtifactRequirement, SchedulerJson, SchedulerListEntry, SchedulerSpec,
-    SchedulerManifestProbe, SchedulerTestJson, Sysctl, SysctlJson, Topology,
-    TopologyConstraints, TopologyConstraintsJson, TopologyJson, WatchBpfMap,
-    SCHEDULER_MANIFEST_PROBE_ARG, default_post_vm_periodic_fired, find_scheduler,
-    find_test,
+    KtstrTestEntry, MemSideCache, NumaDistance, NumaNode, PerfDeltaAssertion,
+    SCHEDULER_MANIFEST_PROBE_ARG, Scheduler, SchedulerArtifactRequirement, SchedulerJson,
+    SchedulerListEntry, SchedulerManifestProbe, SchedulerSpec, SchedulerTestJson, Sysctl,
+    SysctlJson, Topology, TopologyConstraints, TopologyConstraintsJson, TopologyJson, WatchBpfMap,
+    default_post_vm_periodic_fired, find_scheduler, find_test,
 };
 pub use eval::{KernelUnavailable, ResolveSource, resolve_scheduler, resolve_test_kernel};
 pub(crate) use eval::{record_skip_sidecar, run_ktstr_test_inner};

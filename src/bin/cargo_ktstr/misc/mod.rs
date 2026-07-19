@@ -24,11 +24,8 @@ mod probe;
 mod shell;
 
 pub(crate) use completions::run_completions;
-pub(crate) use export::{
-    build_contextual_test_binaries, build_test_binaries, run_export,
-};
+pub(crate) use export::{build_contextual_test_binaries, build_test_binaries, run_export};
 pub(crate) use probe::{
-    ProbeError, ProbedSchedulerManifest, probe_collect,
-    probe_scheduler_manifests_from_bins,
+    ProbeError, ProbedSchedulerManifest, probe_collect, probe_scheduler_manifests_from_bins,
 };
 pub(crate) use shell::run_shell;

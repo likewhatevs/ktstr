@@ -2246,12 +2246,7 @@ impl KtstrVm {
                     let memory_mib = self.memory_mib.context(
                         "internal: non-deferred aarch64 path requires memory_mib to be set",
                     )?;
-                    self.join_and_load_initramfs_aarch64(
-                        vm,
-                        handle,
-                        memory_mib,
-                        mbind_node_map,
-                    )?
+                    self.join_and_load_initramfs_aarch64(vm, handle, memory_mib, mbind_node_map)?
                 }
                 None => (None, None),
             };

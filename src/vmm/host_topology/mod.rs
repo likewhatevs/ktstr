@@ -13,9 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 // `O_CLOEXEC` source of truth) plus one `HolderInfo` /proc/locks
 // parser. Re-importing the names keeps existing in-module call sites
 // (production + `super::*` tests) compiling unchanged.
-use crate::flock::{FlockMode, TryFlockOutcome, try_flock_with_witness};
 #[cfg(test)]
 use crate::flock::try_flock;
+use crate::flock::{FlockMode, TryFlockOutcome, try_flock_with_witness};
 
 // Cross-invocation acquisition protocol: exact fixed-record claims,
 // work-conserving grants, the coordinator watch, and lifecycle-bound blocking.
@@ -1077,8 +1077,7 @@ impl HostTopology {
             .map(|guest_llc| {
                 let cpus = topo
                     .cores_in_llc(guest_llc)
-                    .saturating_mul(topo.threads_per_core)
-                    as usize;
+                    .saturating_mul(topo.threads_per_core) as usize;
                 let demand = GuestLlcDemand {
                     guest_llc,
                     guest_node: topo.numa_node_of(guest_llc),
@@ -1094,19 +1093,18 @@ impl HostTopology {
                 reason: "guest topology contains an empty LLC CPU demand".into(),
             }));
         }
-        let performance_prefers_shared = kind == PinningKind::Performance
-            && grain_mapping_possible(self, &demands, &allowed);
+        let performance_prefers_shared =
+            kind == PinningKind::Performance && grain_mapping_possible(self, &demands, &allowed);
 
         let all_llcs = (0..self.llc_groups.len()).collect::<BTreeSet<_>>();
-        let (preferred_cpus, preferred_shared_llcs, preferred_exclusive_llcs) =
-            match preferences {
-                Some(preferences) => (
-                    preferences.cpus,
-                    preferences.shared_llcs,
-                    preferences.exclusive_llcs,
-                ),
-                None => (&allowed, &all_llcs, &all_llcs),
-            };
+        let (preferred_cpus, preferred_shared_llcs, preferred_exclusive_llcs) = match preferences {
+            Some(preferences) => (
+                preferences.cpus,
+                preferences.shared_llcs,
+                preferences.exclusive_llcs,
+            ),
+            None => (&allowed, &all_llcs, &all_llcs),
+        };
         let allowed_rank = allowed
             .iter()
             .copied()
@@ -1128,8 +1126,7 @@ impl HostTopology {
                 performance_prefers_shared,
                 seed,
                 local_seed,
-            )
-            else {
+            ) else {
                 continue;
             };
             let llc_mode = match kind {
@@ -1212,7 +1209,10 @@ impl HostTopology {
 
         let mut guest_nodes = BTreeMap::<u32, Vec<usize>>::new();
         for (index, demand) in demands.iter().enumerate() {
-            guest_nodes.entry(demand.guest_node).or_default().push(index);
+            guest_nodes
+                .entry(demand.guest_node)
+                .or_default()
+                .push(index);
         }
         let guest_node_rank = guest_nodes
             .keys()
@@ -1427,8 +1427,7 @@ impl HostTopology {
                     .map(|(llc, _)| llc)
                     .collect::<Vec<_>>();
                 let candidate_prefers_shared = mapped.iter().enumerate().all(|(index, &llc)| {
-                    let footprint = demands[index].cpus
-                        + usize::from(service_llcs.contains(&llc));
+                    let footprint = demands[index].cpus + usize::from(service_llcs.contains(&llc));
                     perf_grain_capable_for_footprint(self, llc, footprint)
                 }) && service_llcs
                     .iter()
@@ -1452,13 +1451,10 @@ impl HostTopology {
                     !preferred,
                     !candidate_prefers_shared,
                     !mapped_local,
-                    mapped_choice_rank
-                        .get(cpu)
-                        .copied()
-                        .unwrap_or((
-                            usize::MAX,
-                            rotated_tie(allowed_rank[cpu], seed, allowed.len().max(1)),
-                        )),
+                    mapped_choice_rank.get(cpu).copied().unwrap_or((
+                        usize::MAX,
+                        rotated_tie(allowed_rank[cpu], seed, allowed.len().max(1)),
+                    )),
                 )
             });
             let cpu = *service_choices.first()?;
@@ -1480,9 +1476,7 @@ impl HostTopology {
                 .or_else(|| {
                     (0..self.llc_groups.len())
                         .filter(|&llc| self.llc_groups[llc].cpus.contains(&service_cpu))
-                        .min_by_key(|&llc| {
-                            rotated_tie(llc, seed, self.llc_groups.len().max(1))
-                        })
+                        .min_by_key(|&llc| rotated_tie(llc, seed, self.llc_groups.len().max(1)))
                 })?;
             llc_indices.push(service_llc);
         }
@@ -1621,11 +1615,7 @@ fn planner_seed_schedule(
     allowed: &std::collections::BTreeSet<usize>,
 ) -> Vec<(usize, usize)> {
     let stride = planner_local_stride(demands, kind);
-    let minimum_demand = demands
-        .iter()
-        .map(|demand| demand.cpus)
-        .min()
-        .unwrap_or(1);
+    let minimum_demand = demands.iter().map(|demand| demand.cpus).min().unwrap_or(1);
     let mut seeds = host
         .llc_groups
         .iter()
@@ -1700,11 +1690,7 @@ fn host_bins_fit(
             .all(|(demand, capacity)| *demand <= capacity)
 }
 
-fn perf_grain_capable_for_footprint(
-    host: &HostTopology,
-    llc: usize,
-    footprint: usize,
-) -> bool {
+fn perf_grain_capable_for_footprint(host: &HostTopology, llc: usize, footprint: usize) -> bool {
     let llc_cpus = host.llc_groups[llc].cpus.len();
     llc_cpus >= PERF_GRAIN_LLC_MIN_CPUS
         && footprint.saturating_mul(PERF_GRAIN_MAX_OCCUPANCY_DEN)
@@ -1716,28 +1702,27 @@ fn grain_mapping_possible(
     demands: &[GuestLlcDemand],
     allowed: &std::collections::BTreeSet<usize>,
 ) -> bool {
-    let matches_with_service = |service_request: Option<usize>,
-                                separate_service_llc: Option<usize>| {
-        let mut edges = std::collections::BTreeMap::new();
-        for (request, demand) in demands.iter().enumerate() {
-            let footprint =
-                demand.cpus + usize::from(service_request == Some(request));
-            let choices = (0..host.llc_groups.len())
-                .filter(|&llc| {
-                    Some(llc) != separate_service_llc
-                        && llc_allowed_cpus(host, llc, allowed).len() >= footprint
-                        && perf_grain_capable_for_footprint(host, llc, footprint)
-                })
-                .collect::<Vec<_>>();
-            if choices.is_empty() {
-                return false;
+    let matches_with_service =
+        |service_request: Option<usize>, separate_service_llc: Option<usize>| {
+            let mut edges = std::collections::BTreeMap::new();
+            for (request, demand) in demands.iter().enumerate() {
+                let footprint = demand.cpus + usize::from(service_request == Some(request));
+                let choices = (0..host.llc_groups.len())
+                    .filter(|&llc| {
+                        Some(llc) != separate_service_llc
+                            && llc_allowed_cpus(host, llc, allowed).len() >= footprint
+                            && perf_grain_capable_for_footprint(host, llc, footprint)
+                    })
+                    .collect::<Vec<_>>();
+                if choices.is_empty() {
+                    return false;
+                }
+                edges.insert(request, choices);
             }
-            edges.insert(request, choices);
-        }
-        let mut order = (0..demands.len()).collect::<Vec<_>>();
-        order.sort_by_key(|request| edges[request].len());
-        match_distinct_bins(&edges, &order).is_some()
-    };
+            let mut order = (0..demands.len()).collect::<Vec<_>>();
+            order.sort_by_key(|request| edges[request].len());
+            match_distinct_bins(&edges, &order).is_some()
+        };
 
     // The one service CPU may share any guest-mapped LLC...
     if (0..demands.len()).any(|request| matches_with_service(Some(request), None)) {
@@ -1864,7 +1849,12 @@ fn match_distinct_nodes(
             return None;
         }
     }
-    Some(owner.into_iter().map(|(host, guest)| (guest, host)).collect())
+    Some(
+        owner
+            .into_iter()
+            .map(|(host, guest)| (guest, host))
+            .collect(),
+    )
 }
 
 fn assign_distinct_bins(
@@ -2206,16 +2196,8 @@ pub(crate) fn acquire_overcommit_bridge(
     )
 }
 
-pub(crate) fn overcommit_bridge_claim(
-    llc_indices: &[usize],
-    cpus: &[usize],
-) -> protocol::ClaimSet {
-    resource_claim_with_modes(
-        llc_indices,
-        LlcLockMode::Shared,
-        cpus,
-        FlockMode::Exclusive,
-    )
+pub(crate) fn overcommit_bridge_claim(llc_indices: &[usize], cpus: &[usize]) -> protocol::ClaimSet {
+    resource_claim_with_modes(llc_indices, LlcLockMode::Shared, cpus, FlockMode::Exclusive)
 }
 
 fn acquire_resource_locks_waiting_impl(
@@ -2236,11 +2218,11 @@ fn acquire_resource_locks_waiting_impl(
     // Fast path: claim-subtracted, non-blocking, all-or-nothing.
     let (first_reason, first_evidence) =
         match try_acquire_resources(llc_indices, llc_mode, cpus, cpu_mode)? {
-        TryAcquireAll::Acquired(locks) => {
-            return Ok(LockOutcome::Acquired { llc_offset, locks });
-        }
-        TryAcquireAll::Contended { reason, evidence } => (reason, evidence),
-    };
+            TryAcquireAll::Acquired(locks) => {
+                return Ok(LockOutcome::Acquired { llc_offset, locks });
+            }
+            TryAcquireAll::Contended { reason, evidence } => (reason, evidence),
+        };
     if !wait {
         return Ok(LockOutcome::Unavailable(first_reason));
     }
@@ -2314,10 +2296,7 @@ fn acquire_resource_locks_waiting_impl(
     })
 }
 
-fn whole_llc_cpus(
-    host_topo: &HostTopology,
-    llc_indices: &[usize],
-) -> Result<Vec<usize>> {
+fn whole_llc_cpus(host_topo: &HostTopology, llc_indices: &[usize]) -> Result<Vec<usize>> {
     if llc_indices.is_empty() {
         anyhow::bail!("a whole-LLC reservation requires at least one LLC index");
     }
@@ -3050,19 +3029,21 @@ fn discover_llc_snapshots_impl(
     // diagnostics. Normal storm placement avoids one /proc/<pid>/cmdline read
     // per holder.
     let enriched = if enrich_holders {
-        Some(match crate::flock::proc_locks::read_holders_batch_with_mountinfo(
-            paths.iter().map(|(_, path)| path.as_path()),
-            mountinfo,
-        ) {
-            Ok(holders) => holders,
-            Err(error) => {
-                tracing::debug!(
-                    %error,
-                    "cannot attribute LLC flock holders; planning with empty holder snapshots"
-                );
-                (0..paths.len()).map(|_| Vec::new()).collect()
-            }
-        })
+        Some(
+            match crate::flock::proc_locks::read_holders_batch_with_mountinfo(
+                paths.iter().map(|(_, path)| path.as_path()),
+                mountinfo,
+            ) {
+                Ok(holders) => holders,
+                Err(error) => {
+                    tracing::debug!(
+                        %error,
+                        "cannot attribute LLC flock holders; planning with empty holder snapshots"
+                    );
+                    (0..paths.len()).map(|_| Vec::new()).collect()
+                }
+            },
+        )
     } else {
         None
     };
@@ -3324,11 +3305,8 @@ fn avoid_preceding_claims_when_possible(
 ) -> Result<Vec<LlcSnapshot>> {
     let mut unreserved = Vec::with_capacity(snapshots.len());
     for snapshot in snapshots {
-        let candidate = protocol::ClaimSet::new(
-            [snapshot.llc_idx],
-            std::iter::empty(),
-            FlockMode::Shared,
-        );
+        let candidate =
+            protocol::ClaimSet::new([snapshot.llc_idx], std::iter::empty(), FlockMode::Shared);
         if !conflicts(&candidate)? {
             unreserved.push(snapshot.clone());
         }
@@ -3375,9 +3353,11 @@ fn try_acquire_llc_plan_locks_with_evidence(
     cpus: &[usize],
     snapshots: &[LlcSnapshot],
 ) -> Result<LlcLockAttempt> {
-    debug_assert!(selected.iter().all(|idx| snapshots
-        .iter()
-        .any(|snapshot| snapshot.llc_idx == *idx)));
+    debug_assert!(
+        selected
+            .iter()
+            .all(|idx| snapshots.iter().any(|snapshot| snapshot.llc_idx == *idx))
+    );
     let target = protocol::canonical_lock_order_with_modes(
         selected,
         FlockMode::Shared,
@@ -3620,11 +3600,7 @@ fn acquire_llc_plan_with_acquire_fn<F>(
     acquire_fn: F,
 ) -> Result<LlcPlan>
 where
-    F: FnMut(
-        &[usize],
-        &[usize],
-        &[LlcSnapshot],
-    ) -> Result<Option<Vec<std::os::fd::OwnedFd>>>,
+    F: FnMut(&[usize], &[usize], &[LlcSnapshot]) -> Result<Option<Vec<std::os::fd::OwnedFd>>>,
 {
     acquire_llc_plan_with_acquire_fn_and_handoff(
         topo,
@@ -4031,11 +4007,12 @@ where
         FlockMode::Shared,
     );
     let register = |probe: &mut protocol::GrantedProbe| {
-        let mut snapshots = discover_llc_snapshot_counts(topo, &allowed, &mountinfo).map_err(|e| {
-            ResourceContention {
-                reason: format!("discover LLC snapshots while queued: {e}"),
-            }
-        })?;
+        let mut snapshots =
+            discover_llc_snapshot_counts(topo, &allowed, &mountinfo).map_err(|e| {
+                ResourceContention {
+                    reason: format!("discover LLC snapshots while queued: {e}"),
+                }
+            })?;
         let static_capacity = snapshots
             .iter()
             .flat_map(|snapshot| topo.llc_groups[snapshot.llc_idx].cpus.iter().copied())
@@ -4060,11 +4037,7 @@ where
         if designated_is_live
             && let Some(acquired) = probe.try_acquire(&designated, || {
                 Ok(
-                    match try_acquire_llc_plan_locks_with_evidence(
-                        &selected,
-                        &cpus,
-                        &snapshots,
-                    )? {
+                    match try_acquire_llc_plan_locks_with_evidence(&selected, &cpus, &snapshots)? {
                         LlcLockAttempt::Acquired(locks) => protocol::ProbeOutcome::Acquired((
                             selected.clone(),
                             snapshots.clone(),
@@ -4079,9 +4052,9 @@ where
                     },
                 )
             })?
-            {
-                return Ok(Some(acquired));
-            }
+        {
+            return Ok(Some(acquired));
+        }
 
         // `/proc/locks` shows only real flock holders. An earlier queue
         // ticket may reserve an LLC without holding that flock yet, so a
@@ -4261,9 +4234,7 @@ where
     };
     match outcome {
         protocol::CoordinatorOutcome::Acquired((selected, snapshots, locks, cpus, mems)) => {
-            Ok(materialize_llc_plan(
-                selected, snapshots, locks, cpus, mems,
-            ))
+            Ok(materialize_llc_plan(selected, snapshots, locks, cpus, mems))
         }
         protocol::CoordinatorOutcome::Aborted { reason } => {
             Err(anyhow::Error::new(ResourceContention { reason }))
@@ -4346,14 +4317,8 @@ pub fn plan_llc_selection_only(
             |from, to| test_topo.numa_distance(from, to),
             policy,
         );
-        materialized = materialize_plan_cpus(
-            &selected,
-            topo,
-            &allowed,
-            &cpu_states,
-            target_cpus,
-            policy,
-        );
+        materialized =
+            materialize_plan_cpus(&selected, topo, &allowed, &cpu_states, target_cpus, policy);
     }
     let Some((cpus, mems)) = materialized else {
         return Err(ResourceContention {
@@ -4466,10 +4431,7 @@ fn cpu_eligible_allowed(
 ) -> Result<std::collections::BTreeSet<usize>> {
     let mut eligible = std::collections::BTreeSet::new();
     for &cpu in allowed {
-        if states
-            .get(&cpu)
-            .is_some_and(|state| state.exclusive_held)
-        {
+        if states.get(&cpu).is_some_and(|state| state.exclusive_held) {
             continue;
         }
         if !conflicts(cpu)? {
@@ -4535,10 +4497,7 @@ fn materialize_plan_cpus(
     Some((cpus, mems))
 }
 
-fn plan_mems(
-    cpus: &[usize],
-    topo: &HostTopology,
-) -> std::collections::BTreeSet<usize> {
+fn plan_mems(cpus: &[usize], topo: &HostTopology) -> std::collections::BTreeSet<usize> {
     cpus.iter()
         .map(|cpu| topo.cpu_to_node.get(cpu).copied().unwrap_or(0))
         .collect()

@@ -842,16 +842,15 @@ pub(crate) fn attempt_auto_repro(
         eprintln!("ktstr_test: auto-repro: stall exit — skipping probe attachment");
     }
 
-    let (builder, repro_dump_path) =
-        build_repro_vm_builder(
-            entry,
-            kernel,
-            scheduler,
-            resolved_staged,
-            ktstr_bin,
-            topo,
-            &guest_args,
-        )?;
+    let (builder, repro_dump_path) = build_repro_vm_builder(
+        entry,
+        kernel,
+        scheduler,
+        resolved_staged,
+        ktstr_bin,
+        topo,
+        &guest_args,
+    )?;
 
     // VM build phase: KVM create, vCPU pinning, virtio device setup,
     // freeze-coord arming, ELF/BTF parses for monitor accessors. Any

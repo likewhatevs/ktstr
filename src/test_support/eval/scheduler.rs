@@ -291,9 +291,7 @@ pub fn resolve_scheduler(
             Err(error) => {
                 return Err(error
                     .context(FrameworkInfrastructureFailure)
-                    .context(
-                        "ktstr_test: parent scheduler artifact handoff is invalid",
-                    ));
+                    .context("ktstr_test: parent scheduler artifact handoff is invalid"));
             }
         }
     }

@@ -568,10 +568,7 @@ fn extend_watchdog_reset_for_grace(
 /// the watchdog samples either value. `fetch_max` gives the two writers one
 /// linearization order. The return value identifies whether this writer
 /// actually changed the deadline, which gates its diagnostic provenance tag.
-fn update_watchdog_reset_max(
-    reset_ns: &std::sync::atomic::AtomicU64,
-    candidate_ns: u64,
-) -> bool {
+fn update_watchdog_reset_max(reset_ns: &std::sync::atomic::AtomicU64, candidate_ns: u64) -> bool {
     candidate_ns > reset_ns.fetch_max(candidate_ns, Ordering::AcqRel)
 }
 
@@ -708,10 +705,9 @@ fn ordinary_watchdog_boundary_should_fire(
 #[cfg(test)]
 mod watchdog_reset_tag_tests {
     use super::{
-        DeadmanEvidence, KillReasonTag, WatchdogResetTag, decode_guest_phase,
-        decode_watchdog_kill_reason, ordinary_watchdog_boundary_should_fire,
+        DeadmanEvidence, KillReasonTag, WatchdogResetTag, WatchdogWakeSetupStage,
+        decode_guest_phase, decode_watchdog_kill_reason, ordinary_watchdog_boundary_should_fire,
         prepare_watchdog_wake, update_watchdog_reset_max, watchdog_hard_deadline,
-        WatchdogWakeSetupStage,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -912,12 +908,7 @@ mod watchdog_reset_tag_tests {
         let attach_done_for_thread = Arc::clone(&attach_done);
         let attach = std::thread::spawn(move || {
             reset_for_attach
-                .compare_exchange(
-                    0,
-                    attach_deadline,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange(0, attach_deadline, Ordering::AcqRel, Ordering::Acquire)
                 .expect("attach CAS wins from zero");
             attach_done_for_thread.wait();
         });
@@ -943,12 +934,7 @@ mod watchdog_reset_tag_tests {
 
         assert!(update_watchdog_reset_max(&reset_ns, grace_deadline));
         assert_eq!(
-            reset_ns.compare_exchange(
-                0,
-                attach_deadline,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ),
+            reset_ns.compare_exchange(0, attach_deadline, Ordering::AcqRel, Ordering::Acquire,),
             Err(grace_deadline),
         );
         assert_eq!(reset_ns.load(Ordering::Acquire), grace_deadline);
@@ -2666,10 +2652,7 @@ impl AccessorInitThreadGuard {
         // wait. A failed clock lookup simply leaves the wall backstop as the
         // sole fail-safe.
         let service_clock = if unsafe {
-            libc::pthread_getcpuclockid(
-                handle.as_pthread_t() as libc::pthread_t,
-                &mut clock_id,
-            )
+            libc::pthread_getcpuclockid(handle.as_pthread_t() as libc::pthread_t, &mut clock_id)
         } == 0
         {
             read_cpu_clock_ns(clock_id).map(|anchor_ns| ApTeardownServiceClock {
@@ -2688,14 +2671,10 @@ impl AccessorInitThreadGuard {
                         > ACCESSOR_INIT_TEARDOWN_SERVICE_BUDGET_NS
                 })
             }) {
-                fail_closed_accessor_init_teardown(
-                    AccessorInitTeardownFailCause::ServiceBudget,
-                );
+                fail_closed_accessor_init_teardown(AccessorInitTeardownFailCause::ServiceBudget);
             }
             if Instant::now() >= wall_deadline {
-                fail_closed_accessor_init_teardown(
-                    AccessorInitTeardownFailCause::WallBackstop,
-                );
+                fail_closed_accessor_init_teardown(AccessorInitTeardownFailCause::WallBackstop);
             }
 
             // Re-publish both halves in case another eventfd consumer drained
@@ -2764,8 +2743,7 @@ impl DeferredDrainProgress {
 
     fn expired(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.started) >= DEFERRED_DRAIN_GRACE
-            || now.saturating_duration_since(self.last_progress)
-                >= DEFERRED_DRAIN_IDLE_GRACE
+            || now.saturating_duration_since(self.last_progress) >= DEFERRED_DRAIN_IDLE_GRACE
     }
 }
 
@@ -2804,10 +2782,7 @@ fn vm_worker_service_clock<T>(handle: &JoinHandle<T>) -> Option<ApTeardownServic
     // SAFETY: `handle` remains owned and unjoined for the whole wait, so its
     // pthread identity remains valid until `is_finished()` becomes true.
     if unsafe {
-        libc::pthread_getcpuclockid(
-            handle.as_pthread_t() as libc::pthread_t,
-            &mut clock_id,
-        )
+        libc::pthread_getcpuclockid(handle.as_pthread_t() as libc::pthread_t, &mut clock_id)
     } != 0
     {
         return None;
@@ -2842,11 +2817,7 @@ fn wait_vm_worker_shutdown<T>(
         handle.thread().unpark();
         let service_exhausted = service_clock.is_some_and(|clock| {
             read_cpu_clock_ns(clock.clock_id).is_some_and(|now_ns| {
-                vm_worker_service_budget_exhausted(
-                    clock.anchor_ns,
-                    now_ns,
-                    service_budget_ns,
-                )
+                vm_worker_service_budget_exhausted(clock.anchor_ns, now_ns, service_budget_ns)
             })
         });
         if service_exhausted && !handle.is_finished() {
@@ -2881,10 +2852,7 @@ fn join_vm_worker_bounded<T>(
 }
 
 #[cold]
-fn fail_closed_vm_worker_teardown(
-    family: VmWorkerFamily,
-    cause: VmWorkerTeardownFailCause,
-) -> ! {
+fn fail_closed_vm_worker_teardown(family: VmWorkerFamily, cause: VmWorkerTeardownFailCause) -> ! {
     const WD_SERVICE: &[u8] =
         b"ktstr fatal: watchdog teardown delivered-service budget exhausted; terminating to preserve guest-memory ownership\n";
     const WD_WALL: &[u8] =
@@ -3000,11 +2968,7 @@ mod vm_worker_shutdown_tests {
         let anchor = 10_000;
         assert!(!vm_worker_service_budget_exhausted(anchor, anchor, 50));
         assert!(!vm_worker_service_budget_exhausted(anchor, anchor + 50, 50));
-        assert!(vm_worker_service_budget_exhausted(
-            anchor,
-            anchor + 51,
-            50
-        ));
+        assert!(vm_worker_service_budget_exhausted(anchor, anchor + 51, 50));
         assert!(
             !vm_worker_service_budget_exhausted(anchor, anchor.saturating_sub(1), 50),
             "a clock anomaly saturates instead of manufacturing service"
@@ -3071,13 +3035,11 @@ mod vm_worker_shutdown_tests {
 
         assert_eq!(result, Err(VmWorkerTeardownFailCause::WallBackstop));
         assert_eq!(
-            dropped_at_bound,
-            0,
+            dropped_at_bound, 0,
             "{family:?} guest-memory lease must remain owned at the fail-closed boundary"
         );
         assert_eq!(
-            dropped_after_join,
-            1,
+            dropped_after_join, 1,
             "{family:?} guest-memory lease drops only after worker completion"
         );
     }
@@ -3140,9 +3102,7 @@ fn fail_closed_accessor_init_teardown(cause: AccessorInitTeardownFailCause) -> !
             AccessorInitTeardownFailCause::ServiceBudget => {
                 ACCESSOR_INIT_TEARDOWN_SERVICE_DIAGNOSTIC
             }
-            AccessorInitTeardownFailCause::WallBackstop => {
-                ACCESSOR_INIT_TEARDOWN_WALL_DIAGNOSTIC
-            }
+            AccessorInitTeardownFailCause::WallBackstop => ACCESSOR_INIT_TEARDOWN_WALL_DIAGNOSTIC,
         };
         let _ = libc::write(
             libc::STDERR_FILENO,
@@ -3331,12 +3291,7 @@ impl Drop for RunVmThreadGuard {
             bsp_done: None,
         };
         if let Some(h) = self.watchdog.take() {
-            let _ = join_vm_worker_bounded(
-                h,
-                VmWorkerFamily::Watchdog,
-                &bsp_wake,
-                wall_deadline,
-            );
+            let _ = join_vm_worker_bounded(h, VmWorkerFamily::Watchdog, &bsp_wake, wall_deadline);
         }
         if let Some(h) = self.freeze_coord.take() {
             let _ = join_vm_worker_bounded(
@@ -3347,17 +3302,12 @@ impl Drop for RunVmThreadGuard {
             );
         }
         if let Some(h) = self.monitor.take() {
-            let _ =
-                join_vm_worker_bounded(h, VmWorkerFamily::Monitor, &kill_wake, wall_deadline);
+            let _ = join_vm_worker_bounded(h, VmWorkerFamily::Monitor, &kill_wake, wall_deadline);
         }
         kick_and_join_ap_threads(std::mem::take(&mut self.ap_threads));
         if let Some(h) = self.bpf_write.take() {
-            let _ = join_vm_worker_bounded(
-                h,
-                VmWorkerFamily::BpfMapWriter,
-                &kill_wake,
-                wall_deadline,
-            );
+            let _ =
+                join_vm_worker_bounded(h, VmWorkerFamily::BpfMapWriter, &kill_wake, wall_deadline);
         }
     }
 }
@@ -14946,8 +14896,7 @@ impl KtstrVm {
         // construction step. Its Drop uses this same absolute deadline on an
         // unwind, and the guard itself moves into VmRunState so ownership
         // remains structural across the run_vm -> collect_results handoff.
-        guard.worker_wall_deadline =
-            Some(cleanup_start + VM_WORKER_TEARDOWN_WALL_BACKSTOP);
+        guard.worker_wall_deadline = Some(cleanup_start + VM_WORKER_TEARDOWN_WALL_BACKSTOP);
         // Cleanup-window dilation instrument: snapshot THIS thread's
         // schedstat at the window open. run_vm and collect_results run on
         // the same caller thread (the BSP thread), which performs every
@@ -15158,8 +15107,7 @@ impl KtstrVm {
         // VmRunState also joins guest-memory readers before unmapping memory.
         let watchdog_kill_reason_raw = watchdog_kill_reason.load(Ordering::Acquire);
         let bpf_map_write_delivery_raw = bpf_map_write_delivery.load(Ordering::Acquire);
-        let periodic_prereqs_ready_ns_raw =
-            periodic_prereqs_ready_at.load(Ordering::Acquire);
+        let periodic_prereqs_ready_ns_raw = periodic_prereqs_ready_at.load(Ordering::Acquire);
         let periodic_window_end_ns_raw = periodic_window_end_at.load(Ordering::Acquire);
         let prog_accessor = prog_accessor_slot.lock_unpoisoned().take();
         let kern_phys_base = kern_phys_base_for_result.load(Ordering::Acquire);
@@ -17429,11 +17377,7 @@ impl KtstrVm {
     }
 
     /// Shutdown threads and collect output.
-    pub(super) fn collect_results(
-        &self,
-        start: Instant,
-        mut run: VmRunState,
-    ) -> Result<VmResult> {
+    pub(super) fn collect_results(&self, start: Instant, mut run: VmRunState) -> Result<VmResult> {
         // Whole-cleanup timer for the perf-repro tracing pipeline.
         // `cleanup_duration` below already records the post-BSP-exit
         // window via `run.cleanup_start.elapsed()`; this captures the

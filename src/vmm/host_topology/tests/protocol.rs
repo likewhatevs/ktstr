@@ -497,8 +497,7 @@ fn complete_claim_compatibility_matches_resource_lock_matrix() {
         "CPU SH/SH overlap is compatible",
     );
     assert!(
-        cpu_shared_a.conflicts_with(&cpu_exclusive)
-            && cpu_exclusive.conflicts_with(&cpu_shared_a),
+        cpu_shared_a.conflicts_with(&cpu_exclusive) && cpu_exclusive.conflicts_with(&cpu_shared_a),
         "CPU SH/EX overlap conflicts symmetrically",
     );
 }
@@ -614,17 +613,15 @@ fn registry_cpu_aggregate_uses_the_shared_exclusive_compatibility_matrix() {
         crate::flock::FlockMode::Shared,
         crate::flock::FlockMode::Shared,
     );
-    let coordinator = match protocol::register_ticket_or_acquire(
-        shared.clone(),
-        shared.clone(),
-        None,
-        |_| Ok::<Option<()>, anyhow::Error>(None),
-    )
-    .expect("register CPU SH aggregate owner")
-    {
-        protocol::TicketWork::Coordinator(coordinator) => coordinator,
-        protocol::TicketWork::Acquired(()) => panic!("fresh registry must elect a coordinator"),
-    };
+    let coordinator =
+        match protocol::register_ticket_or_acquire(shared.clone(), shared.clone(), None, |_| {
+            Ok::<Option<()>, anyhow::Error>(None)
+        })
+        .expect("register CPU SH aggregate owner")
+        {
+            protocol::TicketWork::Coordinator(coordinator) => coordinator,
+            protocol::TicketWork::Acquired(()) => panic!("fresh registry must elect a coordinator"),
+        };
     assert!(
         !protocol::registered_claim_conflicts(&shared).expect("query CPU SH aggregate"),
         "an active CPU SH claim must permit another CPU SH fast probe",
@@ -811,9 +808,7 @@ fn ordinary_state_reads_overlap_registry_shared_readers() {
                     panic!("fresh registry must elect a coordinator")
                 }
             };
-        ready_tx
-            .send(())
-            .expect("report coordinator registration");
+        ready_tx.send(()).expect("report coordinator registration");
         go_rx
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("receive overlapping-read start");
@@ -1560,9 +1555,8 @@ fn shared_commit_rescans_when_real_hold_improves_shared_compatibility() {
 #[test]
 fn cpu_shared_commit_rescans_when_real_hold_improves_shared_compatibility() {
     let _prefixes = LockPrefixesGuard::new();
-    let (scans, later_granted) =
-        protocol::exercise_cpu_shared_commit_improvement_for_tests()
-            .expect("exercise CPU shared compatibility improvement");
+    let (scans, later_granted) = protocol::exercise_cpu_shared_commit_improvement_for_tests()
+        .expect("exercise CPU shared compatibility improvement");
     assert_eq!(
         scans, 1,
         "publishing a real CPU SH hold over unknown or EX-held state needs one compatibility scan",
@@ -1577,8 +1571,7 @@ fn cpu_shared_commit_rescans_when_real_hold_improves_shared_compatibility() {
 fn dirty_repair_preserves_exact_and_watch_cpu_modes() {
     let _prefixes = LockPrefixesGuard::new();
     let (flexible_preserved, flexible_still_flexible, fixed_preserved, fixed_still_fixed) =
-        protocol::exercise_cpu_mode_repair_for_tests()
-            .expect("exercise dirty CPU-mode repair");
+        protocol::exercise_cpu_mode_repair_for_tests().expect("exercise dirty CPU-mode repair");
     assert!(
         flexible_preserved && flexible_still_flexible,
         "repair must retain a CPU SH exact claim under its CPU EX watch and mark it REPLAN",
@@ -1611,8 +1604,7 @@ fn granted_callbacks_read_one_cached_prefix_without_walking_the_queue() {
 fn replan_publishes_one_replacement_then_returns_to_coordinator_admission() {
     let _prefixes = LockPrefixesGuard::new();
     let (callbacks, requeued_without_acquire, waiting, replaced, rescan_pending, active_reads) =
-        protocol::exercise_one_shot_replacement_for_tests()
-            .expect("exercise one-shot replacement");
+        protocol::exercise_one_shot_replacement_for_tests().expect("exercise one-shot replacement");
     assert_eq!(callbacks, 1, "one wake must invoke the planner once");
     assert!(
         requeued_without_acquire,
@@ -2696,12 +2688,10 @@ fn ticket_death_before_successor_installs_watch_is_reconciled_promptly() {
 
     // C first receives a disjoint grant, proves Z busy, and requeues its exact
     // Z claim. D is later and conflicts with C, so C's live claim must fence D.
-    let dead_predecessor =
-        TicketChild::spawn(markers.path(), "dead-predecessor", "3", false);
+    let dead_predecessor = TicketChild::spawn(markers.path(), "dead-predecessor", "3", false);
     wait_for_ticket_pids(&[first.pid, successor.pid, dead_predecessor.pid]);
     dead_predecessor.wait_for_probe();
-    let fenced_successor =
-        TicketChild::spawn(markers.path(), "fenced-successor", "3", false);
+    let fenced_successor = TicketChild::spawn(markers.path(), "fenced-successor", "3", false);
     wait_for_ticket_pids(&[
         first.pid,
         successor.pid,
@@ -2728,8 +2718,7 @@ fn ticket_death_before_successor_installs_watch_is_reconciled_promptly() {
     first.release_and_wait();
     protocol::defer_liveness_maintenance_for_tests()
         .expect("keep the 30-second periodic sweep out of the regression");
-    std::fs::write(&successor_gate, b"install watch")
-        .expect("release successor pre-watch gate");
+    std::fs::write(&successor_gate, b"install watch").expect("release successor pre-watch gate");
 
     // B's first post-watch pass re-observes Z as free. C's stale claim still
     // fences D until the shared short reconciliation deadline prunes C; the
