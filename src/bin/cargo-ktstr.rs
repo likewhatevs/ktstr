@@ -90,6 +90,51 @@ use ktstr::cli::KernelCommand;
 
 use crate::cli::{Cargo, CargoSub, KtstrCommand};
 
+/// Decide whether startup must install a freshly detected project commit.
+///
+/// A non-empty inherited value is authoritative (notably perf-delta's
+/// baseline and HEAD labels) and suppresses detection. Missing or empty values
+/// trigger exactly one probe. Split from [`install_project_commit_env`] so the
+/// precedence and one-probe contract are testable without mutating the
+/// process-wide environment from a parallel unit test.
+fn project_commit_to_install_with(
+    existing: Option<std::ffi::OsString>,
+    detect: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if existing.as_ref().is_some_and(|value| !value.is_empty()) {
+        None
+    } else {
+        detect()
+    }
+}
+
+/// Resolve the invoking project's commit once and export it to every
+/// descendant of cargo-ktstr.
+///
+/// This is intentionally top-level rather than attached to individual
+/// subcommands: verifier, replay, shell, test, coverage, and raw
+/// `llvm-cov nextest` all spawn processes that may eventually write a
+/// sidecar. A single inherited value gives every path the same project
+/// snapshot and prevents process-per-test commit/status rediscovery.
+///
+/// SAFETY: `main` calls this before tracing initialization, signal-handler
+/// installation, or any other persistent thread spawn. `repo_is_dirty`
+/// bounds gix's tracked-file work to one worker and exhausts its status
+/// iterator, joining gix's temporary producer before detection returns.
+fn install_project_commit_env() {
+    let install = project_commit_to_install_with(
+        std::env::var_os(ktstr::KTSTR_PROJECT_COMMIT_ENV),
+        ktstr::test_support::detect_project_commit,
+    );
+    if let Some(commit) = install {
+        // SAFETY: see the function doc — startup is single-threaded, and the
+        // detector joins its temporary gix producer before returning.
+        unsafe {
+            std::env::set_var(ktstr::KTSTR_PROJECT_COMMIT_ENV, commit);
+        }
+    }
+}
+
 fn main() {
     // Process-group anchors re-exec this binary with a private marker and
     // control pipes. Handle that mode before blob extraction, Cargo metadata,
@@ -117,6 +162,10 @@ fn main() {
         eprintln!("error: extract embedded blobs: {e}");
         std::process::exit(1);
     }
+    // Resolve project identity once for every descendant-producing command.
+    // This must stay before tracing/thread initialization; see the installer's
+    // environment-safety contract.
+    install_project_commit_env();
     // Pin KTSTR_RUNS_ROOT to the absolute cargo target dir's ktstr
     // subdir so this orchestrator's footer / stats / replay reads and
     // the child test processes' sidecar writes resolve the SAME dir
@@ -172,6 +221,51 @@ fn main() {
     if let Err(e) = result {
         eprintln!("error: {e:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn project_commit_install_preserves_nonempty_override_without_probing() {
+        let calls = std::cell::Cell::new(0);
+        let install =
+            project_commit_to_install_with(Some(std::ffi::OsString::from("baseline1")), || {
+                calls.set(calls.get() + 1);
+                Some("wrong".to_string())
+            });
+        assert_eq!(install, None);
+        assert_eq!(
+            calls.get(),
+            0,
+            "an inherited perf-delta label must remain authoritative",
+        );
+    }
+
+    #[test]
+    fn project_commit_install_probes_once_for_missing_or_empty_value() {
+        for existing in [None, Some(std::ffi::OsString::new())] {
+            let calls = std::cell::Cell::new(0);
+            let install = project_commit_to_install_with(existing, || {
+                calls.set(calls.get() + 1);
+                Some("deadbee-dirty".to_string())
+            });
+            assert_eq!(install.as_deref(), Some("deadbee-dirty"));
+            assert_eq!(calls.get(), 1, "startup must resolve exactly once");
+        }
+    }
+
+    #[test]
+    fn project_commit_install_leaves_env_unset_when_detection_fails() {
+        let calls = std::cell::Cell::new(0);
+        let install = project_commit_to_install_with(None, || {
+            calls.set(calls.get() + 1);
+            None
+        });
+        assert_eq!(install, None);
+        assert_eq!(calls.get(), 1);
     }
 }
 

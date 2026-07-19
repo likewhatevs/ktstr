@@ -2285,7 +2285,8 @@ pub(crate) fn detect_kernel_version() -> Option<String> {
 /// accurate semantic anyway: "what code produced this sidecar"
 /// depends on the cwd at test launch (which crate is exercising
 /// ktstr), not the build host.
-pub(crate) fn detect_project_commit() -> Option<String> {
+#[doc(hidden)]
+pub fn detect_project_commit() -> Option<String> {
     // Explicit override: an orchestrator (perf-delta) that checked the
     // project tree out WITHOUT a `.git` — a plain gix checkout of a baseline
     // commit into a temp dir — passes the commit label via
@@ -2479,16 +2480,43 @@ pub fn repo_is_dirty(repo: &gix::Repository) -> Option<bool> {
                         check_dirty: false,
                     })
                     .index_worktree_options_mut(|opts| {
-                        opts.dirwalk_options = None;
+                        configure_dirty_status_options(opts);
                     })
                     .into_index_worktree_iter(Vec::new())
                     .ok()
-                    .map(|mut iter| iter.next().is_some())
+                    .map(status_iter_has_any)
             })
             .unwrap_or(false)
     };
 
     Some(index_dirty || worktree_dirty)
+}
+
+/// Configure the tracked-file half of the metadata-only dirty probe.
+///
+/// Sidecar writers need a boolean, not a high-throughput status listing. With
+/// gix's default `thread_limit = None`, every nextest child independently
+/// expands this small probe to the host's full logical CPU count. On a
+/// 192-thread host, 64 simultaneous sidecar writes therefore create more than
+/// 12,000 status threads just to inspect the same worktree. Keep the probe
+/// serial inside each process and let the already-parallel test runner provide
+/// the useful outer concurrency.
+fn configure_dirty_status_options(options: &mut gix::status::index_worktree::Options) {
+    options.dirwalk_options = None;
+    options.thread_limit = Some(1);
+}
+
+/// Consume a status producer to completion while remembering whether it
+/// yielded anything.
+///
+/// gix runs the high-level status iterator on a producer thread even when its
+/// tracked-file worker limit is one. Exhausting the iterator joins that
+/// producer before this function returns. That lifecycle guarantee is
+/// load-bearing for cargo-ktstr startup: it resolves the project commit and
+/// then installs it in the process environment while startup is still
+/// single-threaded.
+fn status_iter_has_any(iter: impl Iterator) -> bool {
+    iter.fold(false, |_, _| true)
 }
 
 /// Detect the kernel SOURCE TREE's git HEAD at sidecar-write time.

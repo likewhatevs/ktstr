@@ -1480,6 +1480,44 @@ fn repo_is_dirty_dirty_worktree_returns_some_true() {
     );
 }
 
+/// The metadata-only dirty probe must never inherit gix's default
+/// host-sized worker count. Nextest supplies the useful process-level
+/// parallelism; multiplying it by every logical CPU is the 64 x 192 thread
+/// explosion this option exists to prevent.
+#[test]
+fn repo_is_dirty_status_options_are_single_threaded() {
+    let mut options = gix::status::index_worktree::Options::default();
+    super::super::configure_dirty_status_options(&mut options);
+    assert_eq!(
+        options.thread_limit,
+        Some(1),
+        "the per-process status walk must use one worker",
+    );
+    assert!(
+        options.dirwalk_options.is_none(),
+        "untracked-file directory walking is outside the dirty probe contract",
+    );
+}
+
+/// Even a one-worker gix status iterator has an outer producer thread.
+/// Consuming the stream fully (instead of returning on its first item) makes
+/// gix join that producer before startup performs any environment mutation.
+#[test]
+fn repo_is_dirty_status_consumer_exhausts_the_producer() {
+    let yielded = std::cell::Cell::new(0);
+    let iter = (0..4).map(|item| {
+        yielded.set(yielded.get() + 1);
+        item
+    });
+    assert!(super::super::status_iter_has_any(iter));
+    assert_eq!(
+        yielded.get(),
+        4,
+        "status consumption must reach EOF rather than short-circuit",
+    );
+    assert!(!super::super::status_iter_has_any(std::iter::empty::<()>()));
+}
+
 /// Non-git directory: `detect_commit_at` calls
 /// `gix::discover` which walks up from the input path
 /// looking for a `.git` boundary. When the host's `/tmp`
