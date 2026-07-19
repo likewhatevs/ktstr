@@ -224,51 +224,6 @@ fn main() {
     }
 }
 
-#[cfg(test)]
-mod startup_tests {
-    use super::*;
-
-    #[test]
-    fn project_commit_install_preserves_nonempty_override_without_probing() {
-        let calls = std::cell::Cell::new(0);
-        let install =
-            project_commit_to_install_with(Some(std::ffi::OsString::from("baseline1")), || {
-                calls.set(calls.get() + 1);
-                Some("wrong".to_string())
-            });
-        assert_eq!(install, None);
-        assert_eq!(
-            calls.get(),
-            0,
-            "an inherited perf-delta label must remain authoritative",
-        );
-    }
-
-    #[test]
-    fn project_commit_install_probes_once_for_missing_or_empty_value() {
-        for existing in [None, Some(std::ffi::OsString::new())] {
-            let calls = std::cell::Cell::new(0);
-            let install = project_commit_to_install_with(existing, || {
-                calls.set(calls.get() + 1);
-                Some("deadbee-dirty".to_string())
-            });
-            assert_eq!(install.as_deref(), Some("deadbee-dirty"));
-            assert_eq!(calls.get(), 1, "startup must resolve exactly once");
-        }
-    }
-
-    #[test]
-    fn project_commit_install_leaves_env_unset_when_detection_fails() {
-        let calls = std::cell::Cell::new(0);
-        let install = project_commit_to_install_with(None, || {
-            calls.set(calls.get() + 1);
-            None
-        });
-        assert_eq!(install, None);
-        assert_eq!(calls.get(), 1);
-    }
-}
-
 /// Fan out a parsed [`KtstrCommand`] to its subcommand handler.
 ///
 /// Split into [`dispatch_run_command`] (test/coverage/llvm-cov/stats/
@@ -585,5 +540,50 @@ fn dispatch_admin_command(command: KtstrCommand) -> Result<(), String> {
         | KtstrCommand::PerfDelta { .. } => unreachable!(
             "run-group variants are handled by dispatch_run_command and never forwarded here"
         ),
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn project_commit_install_preserves_nonempty_override_without_probing() {
+        let calls = std::cell::Cell::new(0);
+        let install =
+            project_commit_to_install_with(Some(std::ffi::OsString::from("baseline1")), || {
+                calls.set(calls.get() + 1);
+                Some("wrong".to_string())
+            });
+        assert_eq!(install, None);
+        assert_eq!(
+            calls.get(),
+            0,
+            "an inherited perf-delta label must remain authoritative",
+        );
+    }
+
+    #[test]
+    fn project_commit_install_probes_once_for_missing_or_empty_value() {
+        for existing in [None, Some(std::ffi::OsString::new())] {
+            let calls = std::cell::Cell::new(0);
+            let install = project_commit_to_install_with(existing, || {
+                calls.set(calls.get() + 1);
+                Some("deadbee-dirty".to_string())
+            });
+            assert_eq!(install.as_deref(), Some("deadbee-dirty"));
+            assert_eq!(calls.get(), 1, "startup must resolve exactly once");
+        }
+    }
+
+    #[test]
+    fn project_commit_install_leaves_env_unset_when_detection_fails() {
+        let calls = std::cell::Cell::new(0);
+        let install = project_commit_to_install_with(None, || {
+            calls.set(calls.get() + 1);
+            None
+        });
+        assert_eq!(install, None);
+        assert_eq!(calls.get(), 1);
     }
 }

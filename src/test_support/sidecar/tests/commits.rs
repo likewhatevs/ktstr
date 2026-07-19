@@ -1505,9 +1505,8 @@ fn repo_is_dirty_status_options_are_single_threaded() {
 #[test]
 fn repo_is_dirty_status_consumer_exhausts_the_producer() {
     let yielded = std::cell::Cell::new(0);
-    let iter = (0..4).map(|item| {
+    let iter = (0..4).inspect(|_| {
         yielded.set(yielded.get() + 1);
-        item
     });
     assert!(super::super::status_iter_has_any(iter));
     assert_eq!(
