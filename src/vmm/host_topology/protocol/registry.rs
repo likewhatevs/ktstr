@@ -10,6 +10,8 @@ use super::{
     ClaimMode, ClaimSet, ContentionEvidence, ContentionMarker, ContentionSet, ResourceKey,
     interrupted, protocol_dir,
 };
+#[cfg(test)]
+use super::CpuExContentionSharedWake;
 use crate::flock::{FlockMode, InterruptibleFlockWaiter, block_flock, try_flock};
 use anyhow::{Context, Result};
 use memmap2::{Mmap, MmapMut};
@@ -2318,7 +2320,7 @@ pub(super) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64,
 
 #[cfg(test)]
 pub(super) fn exercise_cpu_ex_contention_shared_wake_for_tests()
--> Result<(u64, bool, bool, bool, bool, bool, bool, bool)> {
+-> Result<CpuExContentionSharedWake> {
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
     let coordinator_watch =
         ClaimSet::new(std::iter::empty(), [0usize, 1usize], FlockMode::Exclusive);
@@ -2434,7 +2436,7 @@ pub(super) fn exercise_cpu_ex_contention_shared_wake_for_tests()
     shared.finish(None)?;
     exclusive.finish(None)?;
     coordinator.finish(None)?;
-    Ok((
+    Ok(CpuExContentionSharedWake {
         scans,
         shared_granted,
         exclusive_waiting,
@@ -2442,8 +2444,8 @@ pub(super) fn exercise_cpu_ex_contention_shared_wake_for_tests()
         ex_serial_unchanged,
         shared_woke,
         exclusive_not_woken,
-        !snapshot.should_step,
-    ))
+        coordinator_did_not_replan: !snapshot.should_step,
+    })
 }
 
 #[cfg(test)]

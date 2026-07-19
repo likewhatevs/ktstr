@@ -80,6 +80,18 @@ pub(crate) struct ContentionMarker {
     pub(crate) mode: FlockMode,
 }
 
+#[cfg(test)]
+pub(crate) struct CpuExContentionSharedWake {
+    pub(crate) scans: u64,
+    pub(crate) shared_granted: bool,
+    pub(crate) exclusive_waiting: bool,
+    pub(crate) sh_serial_advanced: bool,
+    pub(crate) ex_serial_unchanged: bool,
+    pub(crate) shared_woke: bool,
+    pub(crate) exclusive_not_woken: bool,
+    pub(crate) coordinator_did_not_replan: bool,
+}
+
 impl Ord for ContentionMarker {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         (self.blocker, u8::from(self.mode == FlockMode::Exclusive))
@@ -947,7 +959,7 @@ pub(crate) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64,
 
 #[cfg(test)]
 pub(crate) fn exercise_cpu_ex_contention_shared_wake_for_tests()
--> Result<(u64, bool, bool, bool, bool, bool, bool, bool)> {
+-> Result<CpuExContentionSharedWake> {
     registry::exercise_cpu_ex_contention_shared_wake_for_tests()
 }
 

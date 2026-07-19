@@ -1515,7 +1515,7 @@ fn failed_llc_ex_probe_releases_compatible_shared_waiter_without_fallback() {
 #[test]
 fn failed_cpu_ex_probe_wakes_only_the_compatible_shared_waiter() {
     let _prefixes = LockPrefixesGuard::new();
-    let (
+    let protocol::CpuExContentionSharedWake {
         scans,
         shared_granted,
         exclusive_waiting,
@@ -1524,7 +1524,7 @@ fn failed_cpu_ex_probe_wakes_only_the_compatible_shared_waiter() {
         shared_woke,
         exclusive_not_woken,
         coordinator_did_not_replan,
-    ) = protocol::exercise_cpu_ex_contention_shared_wake_for_tests()
+    } = protocol::exercise_cpu_ex_contention_shared_wake_for_tests()
         .expect("exercise CPU mode-compatible wake");
     assert_eq!(
         scans, 1,
