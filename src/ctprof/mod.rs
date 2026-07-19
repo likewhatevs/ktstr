@@ -2983,6 +2983,38 @@ fn capture_with_pool_builder<B>(
 where
     B: FnOnce(usize) -> Result<rayon::ThreadPool, String>,
 {
+    capture_with_pool_builder_and_capacity(
+        proc_root,
+        cgroup_root,
+        sys_root,
+        use_syscall_affinity,
+        build_pool,
+        || {
+            std::thread::available_parallelism()
+                .map(|count| count.get())
+                .unwrap_or(4)
+        },
+    )
+}
+
+/// [`capture_with_pool_builder`] with an injected logical-CPU capacity.
+///
+/// The extra seam keeps pool-width and failed-builder tests independent of the
+/// host cpuset: a one-CPU CI worker correctly takes the sequential production
+/// path, while the regression test can still force the multi-item builder path
+/// without changing process affinity.
+fn capture_with_pool_builder_and_capacity<B, C>(
+    proc_root: &Path,
+    cgroup_root: &Path,
+    sys_root: &Path,
+    use_syscall_affinity: bool,
+    build_pool: B,
+    available_parallelism: C,
+) -> CtprofSnapshot
+where
+    B: FnOnce(usize) -> Result<rayon::ThreadPool, String>,
+    C: FnOnce() -> usize,
+{
     let captured_at_unix_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -3235,9 +3267,7 @@ where
                 // clamp to [1, num_cpus/2 + 1]. Routing the read through
                 // `proc_root` keeps synthetic-tree tests deterministic.
                 let configured_max_threads = {
-                    let num_cpus = std::thread::available_parallelism()
-                        .map(|n| n.get())
-                        .unwrap_or(4);
+                    let num_cpus = available_parallelism().max(1);
                     let load = std::fs::read_to_string(proc_root.join("loadavg"))
                         .ok()
                         .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())

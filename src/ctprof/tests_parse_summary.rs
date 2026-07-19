@@ -934,7 +934,7 @@ fn capture_with_pool_build_failure_is_sequential_and_preserves_accounting_child(
     std::panic::set_hook(Box::new(|_info| {}));
     PANIC_INJECT_TGID.store(panic_tgid, std::sync::atomic::Ordering::Release);
     let before = task_count();
-    let snap = capture_with_pool_builder(
+    let snap = capture_with_pool_builder_and_capacity(
         proc_tmp.path(),
         cgroup_tmp.path(),
         sys_tmp.path(),
@@ -943,6 +943,7 @@ fn capture_with_pool_build_failure_is_sequential_and_preserves_accounting_child(
             requested_threads.set(threads);
             Err("forced pool build failure".to_string())
         },
+        || 4,
     );
     let after = task_count();
     PANIC_INJECT_TGID.store(0, std::sync::atomic::Ordering::Release);

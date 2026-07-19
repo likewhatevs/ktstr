@@ -148,9 +148,10 @@ pub fn acquire_build_reservation_waiting(
 
 /// Cancellation-aware harness-build reservation.
 ///
-/// A signal-published `cancelled` flag interrupts a contended queue/head wait,
-/// releasing the FIFO ticket, claim, partial LLC holds, and any completed plan
-/// before returning [`std::io::ErrorKind::Interrupted`].
+/// A signal-published `cancelled` flag interrupts either the ticket's futex
+/// wait or the coordinator's inotify wait, releasing the exact registry claim,
+/// partial LLC holds, and any completed plan before returning
+/// [`std::io::ErrorKind::Interrupted`].
 pub fn acquire_build_reservation_waiting_interruptible(
     cli_label: &str,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,

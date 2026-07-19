@@ -621,7 +621,19 @@ where
     }
 
     match build_pool(width) {
-        Ok(pool) => pool.install(|| work.into_par_iter().map(&resolve).collect()),
+        Ok(pool) => {
+            // Collect every result before applying `Result`'s ordered
+            // short-circuit. Rayon's `FromParallelIterator<Result<...>>`
+            // cancels outstanding work after the first error it observes,
+            // which makes the surfaced error completion-order dependent and
+            // can leave later Range children entirely unattempted. The
+            // indexed parallel iterator preserves input slots; the sequential
+            // collect below therefore reports the first input-ordered error
+            // after every prepared kernel has finished.
+            let results: Vec<Result<(String, PathBuf), String>> =
+                pool.install(|| work.into_par_iter().map(&resolve).collect());
+            results.into_iter().collect()
+        }
         Err(error) => {
             tracing::warn!(
                 %error,
@@ -1283,6 +1295,47 @@ mod tests {
             out.into_iter().map(|(label, _)| label).collect::<Vec<_>>(),
             versions
         );
+    }
+
+    /// Parallel failures retain the historical Range contract: every prepared
+    /// child is attempted, and the first error in input order wins even when a
+    /// later error completes first.
+    #[test]
+    fn prepared_kernel_work_parallel_errors_attempt_all_and_report_in_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let work: Vec<_> = (0..32)
+            .map(|index| fake_kernel_work(format!("6.{index}")))
+            .collect();
+        let attempted = AtomicUsize::new(0);
+        let error = resolve_prepared_kernel_work_with_pool_builder(
+            work,
+            4,
+            |threads| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .map_err(|error| error.to_string())
+            },
+            |work| {
+                attempted.fetch_add(1, Ordering::Relaxed);
+                let ktstr::kernel_path::KernelId::Version(version) = work.id else {
+                    unreachable!("fixture contains only Version work")
+                };
+                match version.as_str() {
+                    "6.3" => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        Err("first-input-error".to_string())
+                    }
+                    "6.20" => Err("later-fast-error".to_string()),
+                    _ => Ok((version, PathBuf::from("/fake"))),
+                }
+            },
+        )
+        .expect_err("two prepared kernels fail");
+
+        assert_eq!(attempted.load(Ordering::Relaxed), 32);
+        assert_eq!(error, "first-input-error");
     }
 
     /// Exercise the real outer filtering / validation / error path with
