@@ -2655,6 +2655,108 @@ fn transient_status_classification_pins_retryable_set() {
             "HTTP {code} must NOT retry — it routes to the caller's status gate",
         );
     }
+
+    assert!(
+        !super::is_dns_edge_failure_status(StatusCode::TOO_MANY_REQUESTS),
+        "HTTP 429 retries must remain on the current route rather than \
+         evading the server's rate limit through another DNS address",
+    );
+    for code in [502u16, 503, 504] {
+        assert!(
+            super::is_dns_edge_failure_status(StatusCode::from_u16(code).unwrap()),
+            "HTTP {code} identifies a failed gateway/CDN edge and should \
+             advance to another resolved address",
+        );
+    }
+}
+
+/// A transport error from a routed attempt must retain the already-advanced
+/// candidate tail for the same origin, while an error attributed to a
+/// different redirect origin must replace it with a fresh resolution.
+#[test]
+fn transport_error_routes_preserve_same_origin_tail_and_reset_redirect_origin() {
+    use std::collections::VecDeque;
+    use std::net::SocketAddr;
+
+    let second: SocketAddr = "192.0.2.11:443".parse().unwrap();
+    let redirected: SocketAddr = "198.51.100.20:8443".parse().unwrap();
+    let mut routes = Some(super::HttpRetryRoutes {
+        host: "origin.invalid".to_owned(),
+        port: 443,
+        // The current primary has already been removed by
+        // next_routed_http_client; only the untried tail remains.
+        remaining: VecDeque::from([second]),
+    });
+
+    let same_origin = reqwest::Url::parse("https://origin.invalid/file").unwrap();
+    let has_tail =
+        super::prepare_routes_after_transport_error(&mut routes, &same_origin, &|_, _| {
+            panic!("same-origin transport failure must not re-resolve")
+        })
+        .unwrap();
+    assert!(has_tail);
+    assert_eq!(
+        routes
+            .as_ref()
+            .unwrap()
+            .remaining
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![second],
+        "same-origin failure must preserve only the untried tail",
+    );
+
+    let redirect_origin = reqwest::Url::parse("https://redirect.invalid:8443/file").unwrap();
+    let has_redirect_routes = super::prepare_routes_after_transport_error(
+        &mut routes,
+        &redirect_origin,
+        &|host, port| {
+            assert_eq!(host, "redirect.invalid");
+            assert_eq!(port, 8443);
+            Ok(vec![redirected, redirected])
+        },
+    )
+    .unwrap();
+    assert!(has_redirect_routes);
+    let reset = routes.as_ref().unwrap();
+    assert_eq!(reset.host, "redirect.invalid");
+    assert_eq!(reset.port, 8443);
+    assert_eq!(
+        reset.remaining.iter().copied().collect::<Vec<_>>(),
+        vec![redirected],
+        "redirect-origin reset must deduplicate its fresh resolution",
+    );
+}
+
+const RETRY_TEST_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const RETRY_TEST_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn accept_retry_test_connection(
+    listener: &std::net::TcpListener,
+) -> std::io::Result<std::net::TcpStream> {
+    listener.set_nonblocking(true)?;
+    let deadline = std::time::Instant::now() + RETRY_TEST_ACCEPT_TIMEOUT;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(RETRY_TEST_IO_TIMEOUT))?;
+                stream.set_write_timeout(Some(RETRY_TEST_IO_TIMEOUT))?;
+                return Ok(stream);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out waiting for retry-test HTTP connection",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 /// Serve one canned raw-HTTP response per accepted connection, in
@@ -2673,8 +2775,8 @@ fn serve_sequenced_responses(
     let handle = std::thread::spawn(move || {
         let mut served = 0usize;
         for response in responses {
-            let (mut sock, _) = match listener.accept() {
-                Ok(pair) => pair,
+            let mut sock = match accept_retry_test_connection(&listener) {
+                Ok(stream) => stream,
                 // Client gave up (e.g. the helper returned before
                 // consuming every canned response) — report how many
                 // were actually served.
@@ -2695,6 +2797,26 @@ fn serve_sequenced_responses(
 const RESPONSE_503: &str =
     "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 const RESPONSE_200: &str = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
+
+/// Serve exactly one canned response from an already-bound listener.
+///
+/// The DNS-edge failover regression binds two loopback addresses to the same
+/// port, so it cannot use [`serve_sequenced_responses`], which owns a single
+/// listener and chooses its own port.
+fn serve_one_response(
+    listener: std::net::TcpListener,
+    response: &'static str,
+) -> std::thread::JoinHandle<()> {
+    use std::io::{Read, Write};
+    std::thread::spawn(move || {
+        let mut sock =
+            accept_retry_test_connection(&listener).expect("accept one request before timeout");
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf);
+        sock.write_all(response.as_bytes())
+            .expect("write canned response");
+    })
+}
 
 /// A 503 on the first attempt followed by a 200 must succeed — the
 /// exact CI failure this helper exists for (cdn.kernel.org's Varnish
@@ -2718,6 +2840,143 @@ fn get_with_transient_retry_retries_503_then_succeeds() {
         2,
         "exactly two attempts: the 503 and the successful retry",
     );
+}
+
+/// A gateway failure on one address advances to another address published for
+/// the same hostname, while keeping the hostname in the URL.
+///
+/// `balanced.invalid` cannot resolve through the host DNS. The initial client
+/// explicitly maps it to the bad edge; the injected resolver then returns bad
+/// followed by good. With a two-attempt budget, the helper must use
+/// `Response::remote_addr()` to discard the first address and give a fresh
+/// client the healthy remaining candidate immediately — retrying the bad
+/// address first cannot accidentally recover on a third attempt.
+#[test]
+fn get_with_transient_retry_advances_past_failed_dns_edge() {
+    let bad_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind bad loopback edge");
+    let bad_addr = bad_listener.local_addr().expect("read bad edge address");
+    let good_addr = std::net::SocketAddr::from(([127, 0, 0, 2], bad_addr.port()));
+    let good_listener =
+        std::net::TcpListener::bind(good_addr).expect("bind good loopback edge on same port");
+
+    let bad_server = serve_one_response(bad_listener, RESPONSE_503);
+    let good_server = serve_one_response(good_listener, RESPONSE_200);
+    let host = "balanced.invalid";
+    let url = format!("http://{host}:{}/file", bad_addr.port());
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .no_proxy()
+        .resolve(host, bad_addr)
+        .build()
+        .expect("build initial bad-edge client");
+    let two_attempts = super::HttpRetry {
+        attempts: 2,
+        backoff_unit: std::time::Duration::ZERO,
+    };
+
+    let response = super::get_with_transient_retry_and_routes(
+        &client,
+        &url,
+        None,
+        "fetch",
+        &two_attempts,
+        super::HttpRouteFailover {
+            enabled: true,
+            resolve: |resolved_host: &str, port: u16| {
+                assert_eq!(resolved_host, host);
+                assert_eq!(port, bad_addr.port());
+                Ok(vec![bad_addr, bad_addr, good_addr])
+            },
+            build_client: |resolved_host: &str, candidates: &[std::net::SocketAddr]| {
+                assert_eq!(
+                    candidates,
+                    &[good_addr],
+                    "the 503 response peer must be removed before building the retry client",
+                );
+                reqwest::blocking::Client::builder()
+                    .timeout(RETRY_TEST_ACCEPT_TIMEOUT)
+                    .no_proxy()
+                    .resolve_to_addrs(resolved_host, candidates)
+                    .build()
+            },
+        },
+    )
+    .expect("503 edge must fail over to the 200 edge");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().expect("read good-edge body"), "ok");
+    bad_server.join().expect("bad edge server");
+    good_server.join().expect("good edge server");
+}
+
+/// An initial transport failure on the shared-client-shaped path initializes
+/// fresh route state and preserves reqwest's multi-address fallback inside the
+/// very next attempt.
+///
+/// Nothing listens on `bad_addr`, so attempt one fails before receiving HTTP
+/// headers. The injected resolver returns that refused address followed by a
+/// live address. The retry builder must receive the complete ordered,
+/// deduplicated tail; reqwest then rejects the first connection and reaches
+/// the live edge without spending a third harness-level attempt.
+#[test]
+fn get_with_transient_retry_routes_initial_transport_error_across_candidate_tail() {
+    let bad_reservation =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("reserve refused-edge port");
+    let bad_addr = bad_reservation
+        .local_addr()
+        .expect("read refused-edge address");
+    let good_addr = std::net::SocketAddr::from(([127, 0, 0, 2], bad_addr.port()));
+    let good_listener =
+        std::net::TcpListener::bind(good_addr).expect("bind healthy edge on matching port");
+    drop(bad_reservation);
+
+    let good_server = serve_one_response(good_listener, RESPONSE_200);
+    let host = "transport-balanced.invalid";
+    let url = format!("http://{host}:{}/file", bad_addr.port());
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(RETRY_TEST_IO_TIMEOUT)
+        .timeout(RETRY_TEST_ACCEPT_TIMEOUT)
+        .no_proxy()
+        .resolve(host, bad_addr)
+        .build()
+        .expect("build initial refused-edge client");
+    let two_attempts = super::HttpRetry {
+        attempts: 2,
+        backoff_unit: std::time::Duration::ZERO,
+    };
+
+    let response = super::get_with_transient_retry_and_routes(
+        &client,
+        &url,
+        None,
+        "fetch",
+        &two_attempts,
+        super::HttpRouteFailover {
+            enabled: true,
+            resolve: |resolved_host: &str, port: u16| {
+                assert_eq!(resolved_host, host);
+                assert_eq!(port, bad_addr.port());
+                Ok(vec![bad_addr, bad_addr, good_addr])
+            },
+            build_client: |resolved_host: &str, candidates: &[std::net::SocketAddr]| {
+                assert_eq!(
+                    candidates,
+                    &[bad_addr, good_addr],
+                    "an initial transport error must retain the full deduplicated \
+                     candidate tail for reqwest's connector fallback",
+                );
+                reqwest::blocking::Client::builder()
+                    .connect_timeout(RETRY_TEST_IO_TIMEOUT)
+                    .timeout(RETRY_TEST_ACCEPT_TIMEOUT)
+                    .no_proxy()
+                    .resolve_to_addrs(resolved_host, candidates)
+                    .build()
+            },
+        },
+    )
+    .expect("transport failure must retry through the healthy alternate");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().expect("read healthy-edge body"), "ok");
+    good_server.join().expect("healthy edge server");
 }
 
 /// A transient status that persists through every attempt is

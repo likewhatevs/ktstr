@@ -9,7 +9,9 @@
 //! that dispatches to `git_clone_tag` / [`git_clone`]), and
 //! [`local_source`] (an on-disk tree).
 
+use std::collections::{HashSet, VecDeque};
 use std::io::Read;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -21,7 +23,8 @@ use ::gix;
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use md5::{Digest as _, Md5};
-use reqwest::blocking::Client;
+use reqwest::Url;
+use reqwest::blocking::{Client, ClientBuilder};
 use sha2::{Digest, Sha256};
 
 #[path = "../build_support/gix_policy.rs"]
@@ -130,11 +133,21 @@ const SHARED_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// is itself an infallible wrapper around `builder().build().expect`).
 pub fn shared_client() -> &'static Client {
     SHARED_CLIENT.get_or_init(|| {
-        Client::builder()
-            .connect_timeout(SHARED_CLIENT_CONNECT_TIMEOUT)
+        default_http_client_builder()
             .build()
             .expect("build shared reqwest client")
     })
+}
+
+/// Construct the common reqwest client builder used by the process-wide
+/// client and by retry-only DNS-edge clients.
+///
+/// Keeping the builder policy in one place makes a routed retry retain the
+/// shared client's connect timeout, TLS defaults, and automatic system-proxy
+/// handling. A routed client adds only a per-origin DNS override; it does not
+/// rewrite the URL, Host header, TLS SNI, or proxy configuration.
+fn default_http_client_builder() -> ClientBuilder {
+    Client::builder().connect_timeout(SHARED_CLIENT_CONNECT_TIMEOUT)
 }
 
 /// Process-wide cache of the parsed `releases.json` payload.
@@ -795,6 +808,188 @@ fn is_transient_http_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 502 | 503 | 504)
 }
 
+/// Whether a retryable status identifies a failed HTTP gateway/CDN edge.
+///
+/// 429 remains retryable but deliberately does not select another address:
+/// changing peers to evade a server's rate limit is incorrect. The gateway
+/// trio instead says that a connectable peer could not serve the request, so
+/// another address published for the same hostname is the useful next route.
+fn is_dns_edge_failure_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 502..=504)
+}
+
+/// Remaining DNS addresses for one origin during a single retry loop.
+struct HttpRetryRoutes {
+    host: String,
+    port: u16,
+    remaining: VecDeque<SocketAddr>,
+}
+
+impl HttpRetryRoutes {
+    fn matches(&self, host: &str, port: u16) -> bool {
+        self.host == host && self.port == port
+    }
+
+    fn matches_url(&self, url: &Url) -> bool {
+        url.host_str()
+            .zip(url.port_or_known_default())
+            .is_some_and(|(host, port)| self.matches(host, port))
+    }
+
+    fn mark_failed(&mut self, addr: SocketAddr) {
+        self.remaining
+            .retain(|candidate| candidate.ip() != addr.ip());
+    }
+}
+
+/// Resolve every address currently published for an HTTP origin.
+fn resolve_http_origin(host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+    (host, port).to_socket_addrs().map(Iterator::collect)
+}
+
+/// Build a fresh client with an ordered set of origin-address candidates while
+/// retaining the hostname in the request URL.
+///
+/// Passing the whole remaining tail lets reqwest retain its connector-level
+/// multi-address/Happy-Eyeballs fallback within one attempt. The URL hostname
+/// still supplies the Host header and TLS SNI. If a system proxy intercepts
+/// the request, reqwest connects to that proxy instead; these origin
+/// candidates then remain advisory and do not claim which upstream peer the
+/// proxy selects.
+fn build_routed_http_client(host: &str, addrs: &[SocketAddr]) -> reqwest::Result<Client> {
+    default_http_client_builder()
+        .resolve_to_addrs(host, addrs)
+        .build()
+}
+
+/// Replace the retry-address queue with a fresh resolution of `request_url`.
+///
+/// Returning `false` means the URL has no routable HTTP origin (host or known
+/// port), so the caller should preserve the ordinary same-client retry.
+fn reset_http_retry_routes<R>(
+    routes: &mut Option<HttpRetryRoutes>,
+    request_url: &Url,
+    resolve: &R,
+) -> std::io::Result<bool>
+where
+    R: Fn(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
+{
+    let Some(host) = request_url.host_str() else {
+        *routes = None;
+        return Ok(false);
+    };
+    let Some(port) = request_url.port_or_known_default() else {
+        *routes = None;
+        return Ok(false);
+    };
+
+    let mut seen = HashSet::new();
+    let remaining: VecDeque<_> = resolve(host, port)?
+        .into_iter()
+        .filter(|addr| seen.insert(*addr))
+        .collect();
+    let has_candidates = !remaining.is_empty();
+    *routes = Some(HttpRetryRoutes {
+        host: host.to_owned(),
+        port,
+        remaining,
+    });
+    Ok(has_candidates)
+}
+
+/// Populate or update the alternate-address queue after a gateway response.
+fn record_failed_http_edge<R>(
+    routes: &mut Option<HttpRetryRoutes>,
+    response_url: &Url,
+    failed_remote: Option<SocketAddr>,
+    resolve: &R,
+) -> std::io::Result<bool>
+where
+    R: Fn(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
+{
+    let Some(host) = response_url.host_str() else {
+        return Ok(false);
+    };
+    let Some(port) = response_url.port_or_known_default() else {
+        return Ok(false);
+    };
+
+    if routes
+        .as_ref()
+        .is_none_or(|existing| !existing.matches(host, port))
+    {
+        reset_http_retry_routes(routes, response_url, resolve)?;
+    }
+    if let (Some(existing), Some(failed)) = (routes.as_mut(), failed_remote) {
+        existing.mark_failed(failed);
+    }
+
+    Ok(routes
+        .as_ref()
+        .is_some_and(|existing| !existing.remaining.is_empty()))
+}
+
+/// Prepare the next routed attempt after a transport error.
+///
+/// [`next_routed_http_client`] removes the current primary before issuing the
+/// request, leaving only untried candidates in `routes.remaining`. When the
+/// error URL still names that origin, preserve the advanced tail rather than
+/// re-resolving and retrying the same primary again. A missing route set
+/// (initial-client failure) or a different error origin (redirect failure)
+/// gets a fresh resolution for the URL that actually failed.
+fn prepare_routes_after_transport_error<R>(
+    routes: &mut Option<HttpRetryRoutes>,
+    failed_url: &Url,
+    resolve: &R,
+) -> std::io::Result<bool>
+where
+    R: Fn(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
+{
+    if routes
+        .as_ref()
+        .is_some_and(|existing| existing.matches_url(failed_url))
+    {
+        return Ok(routes
+            .as_ref()
+            .is_some_and(|existing| !existing.remaining.is_empty()));
+    }
+    reset_http_retry_routes(routes, failed_url, resolve)
+}
+
+/// Build a retry client for the next untried primary address plus every
+/// remaining fallback candidate.
+///
+/// Client-construction failure is non-fatal: skipping that primary address
+/// preserves the original retry contract rather than replacing an HTTP outage
+/// with a TLS/backend setup error.
+fn next_routed_http_client<B>(
+    routes: &mut Option<HttpRetryRoutes>,
+    build_client: &B,
+) -> Option<(Client, Vec<SocketAddr>)>
+where
+    B: Fn(&str, &[SocketAddr]) -> reqwest::Result<Client>,
+{
+    let routes = routes.as_mut()?;
+    while let Some(primary) = routes.remaining.pop_front() {
+        let candidates: Vec<_> = std::iter::once(primary)
+            .chain(routes.remaining.iter().copied())
+            .collect();
+        match build_client(&routes.host, &candidates) {
+            Ok(client) => return Some((client, candidates)),
+            Err(err) => {
+                tracing::warn!(
+                    host = %routes.host,
+                    ?candidates,
+                    %err,
+                    "failed to build an HTTP retry client for resolved candidates; \
+                     trying a shorter candidate tail",
+                );
+            }
+        }
+    }
+    None
+}
+
 /// GET `url`, retrying transient failures (transport errors and
 /// [`is_transient_http_status`] statuses) per `retry`.
 ///
@@ -825,13 +1020,60 @@ fn get_with_transient_retry(
     what: &str,
     retry: &HttpRetry,
 ) -> Result<reqwest::blocking::Response> {
+    get_with_transient_retry_and_routes(
+        client,
+        url,
+        timeout,
+        what,
+        retry,
+        HttpRouteFailover {
+            enabled: is_shared_client(client),
+            resolve: resolve_http_origin,
+            build_client: build_routed_http_client,
+        },
+    )
+}
+
+struct HttpRouteFailover<R, B> {
+    enabled: bool,
+    resolve: R,
+    build_client: B,
+}
+
+/// Implementation seam for [`get_with_transient_retry`].
+///
+/// Production enables address failover only for [`shared_client`], whose
+/// builder configuration is known and can be reproduced safely. A
+/// caller-provided client may carry custom roots, proxies, or redirect policy,
+/// so its retries remain on that exact client. Tests inject deterministic
+/// address resolution and a no-proxy routed-client builder here.
+fn get_with_transient_retry_and_routes<R, B>(
+    client: &Client,
+    url: &str,
+    timeout: Option<Duration>,
+    what: &str,
+    retry: &HttpRetry,
+    route_failover: HttpRouteFailover<R, B>,
+) -> Result<reqwest::blocking::Response>
+where
+    R: Fn(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
+    B: Fn(&str, &[SocketAddr]) -> reqwest::Result<Client>,
+{
     assert!(retry.attempts > 0, "HttpRetry.attempts must be >= 1");
+    let mut routes = None;
+    let mut routed_client: Option<(Client, Vec<SocketAddr>)> = None;
+
     for attempt in 1..=retry.attempts {
         ensure_source_operation_not_interrupted("before HTTP request")?;
-        let mut req = client.get(url);
+        let request_client = routed_client
+            .as_ref()
+            .map(|(client, _)| client)
+            .unwrap_or(client);
+        let mut req = request_client.get(url);
         if let Some(t) = timeout {
             req = req.timeout(t);
         }
+        let mut advance_route = false;
         match req.send() {
             Ok(response) => {
                 ensure_source_operation_not_interrupted("after HTTP response headers")?;
@@ -839,8 +1081,24 @@ fn get_with_transient_retry(
                 if !is_transient_http_status(status) || attempt == retry.attempts {
                     return Ok(response);
                 }
+                let remote_addr = response.remote_addr();
+                if route_failover.enabled && is_dns_edge_failure_status(status) {
+                    match record_failed_http_edge(
+                        &mut routes,
+                        response.url(),
+                        remote_addr,
+                        &route_failover.resolve,
+                    ) {
+                        Ok(has_routes) => advance_route = has_routes,
+                        Err(err) => tracing::warn!(
+                            url = %response.url(),
+                            %err,
+                            "failed to resolve alternate HTTP addresses; retrying normally",
+                        ),
+                    }
+                }
                 tracing::warn!(
-                    %url, %status, attempt, max_attempts = retry.attempts,
+                    %url, %status, ?remote_addr, attempt, max_attempts = retry.attempts,
                     "{what} hit a transient HTTP status; retrying",
                 );
             }
@@ -848,8 +1106,27 @@ fn get_with_transient_retry(
                 if attempt == retry.attempts {
                     return Err(anyhow::Error::new(e).context(format!("{what} {url}")));
                 }
+                if route_failover.enabled {
+                    let failed_url = e.url().cloned().or_else(|| Url::parse(url).ok());
+                    if let Some(failed_url) = failed_url {
+                        match prepare_routes_after_transport_error(
+                            &mut routes,
+                            &failed_url,
+                            &route_failover.resolve,
+                        ) {
+                            Ok(has_routes) => advance_route = has_routes,
+                            Err(resolve_err) => tracing::warn!(
+                                url = %failed_url,
+                                err = %resolve_err,
+                                "failed to refresh HTTP candidates after a transport error; \
+                                 retrying normally",
+                            ),
+                        }
+                    }
+                }
                 tracing::warn!(
-                    %url, err = %e, attempt, max_attempts = retry.attempts,
+                    %url, error_url = ?e.url(), err = %e,
+                    attempt, max_attempts = retry.attempts,
                     "{what} failed in transport; retrying",
                 );
             }
@@ -857,6 +1134,18 @@ fn get_with_transient_retry(
         // Reached only on a transient failure with attempts left:
         // both match arms return on the final attempt.
         source_operation_backoff(retry.backoff_unit * (1u32 << attempt))?;
+        if advance_route {
+            routed_client = next_routed_http_client(&mut routes, &route_failover.build_client);
+            if let Some((_, candidates)) = routed_client.as_ref() {
+                tracing::warn!(
+                    %url,
+                    ?candidates,
+                    next_attempt = attempt + 1,
+                    "retrying with alternate resolved origin candidates; \
+                     an active proxy may select a different upstream route",
+                );
+            }
+        }
     }
     unreachable!("the attempt == retry.attempts arms above return on the final iteration")
 }

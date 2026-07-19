@@ -1066,13 +1066,17 @@ fn ubuntu_dbgsym<'a>(ddebs: &'a [DebPkg], kver: &str) -> Option<&'a DebPkg> {
 
 /// Fetch and parse `{codename}-updates` `Packages.gz` for `deb_arch`.
 fn fetch_deb_packages(base: &str, codename: &str, deb_arch: &str) -> Result<Vec<DebPkg>> {
-    let url = format!("{base}dists/{codename}-updates/main/binary-{deb_arch}/Packages.gz");
+    let url = deb_packages_url(base, codename, deb_arch);
     let gz = crate::fetch::fetch_metadata_bytes(&url, "fetch")?;
     let mut text = String::new();
     flate2::read::GzDecoder::new(Cursor::new(&gz))
         .read_to_string(&mut text)
         .with_context(|| format!("gunzip {url}"))?;
     Ok(parse_deb_packages(&text))
+}
+
+fn deb_packages_url(base: &str, codename: &str, deb_arch: &str) -> String {
+    format!("{base}dists/{codename}-updates/main/binary-{deb_arch}/Packages.gz")
 }
 
 /// Extract the `{kver}` (e.g. `6.17.0-35`) from an HWE meta's

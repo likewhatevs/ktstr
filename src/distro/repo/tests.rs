@@ -5,6 +5,22 @@
 use super::*;
 use std::cmp::Ordering;
 
+#[test]
+fn ubuntu_package_indexes_use_each_repository_root() {
+    assert_eq!(
+        deb_packages_url(UBUNTU_ARCHIVE, "noble", "amd64"),
+        "https://archive.ubuntu.com/ubuntu/dists/noble-updates/main/binary-amd64/Packages.gz",
+    );
+    assert_eq!(
+        deb_packages_url(UBUNTU_PORTS, "noble", "arm64"),
+        "https://ports.ubuntu.com/ubuntu-ports/dists/noble-updates/main/binary-arm64/Packages.gz",
+    );
+    assert_eq!(
+        deb_packages_url(UBUNTU_DDEBS, "noble", "arm64"),
+        "http://ddebs.ubuntu.com/dists/noble-updates/main/binary-arm64/Packages.gz",
+    );
+}
+
 // ---- rpmvercmp / EVR ----------------------------------------------
 
 #[test]
