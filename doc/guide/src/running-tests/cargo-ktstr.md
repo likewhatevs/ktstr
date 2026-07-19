@@ -138,9 +138,12 @@ For every nextest-backed route (`test`, `coverage`, `verifier`, replay
 low-priority nextest tool config. It admits VM-resource waiters immediately
 so ktstr's cross-process topology queue—not a second CPU-sized nextest
 queue—decides which fitting VM starts next, while ordinary host tests remain
-bounded to the host CPU count. Repository nextest config and explicit CLI
-settings take priority; for example `-j 64` remains authoritative. Raw
-`llvm-cov` modes such as `report`, `clean`, and `show-env` are unchanged.
+bounded to the host CPU count. For orchestrated nextest runs, cargo-ktstr
+normalizes every valid `-j` / `--test-threads` spelling to its effectively
+unbounded admission budget; otherwise a caller-supplied CPU-sized value would
+reintroduce a second scheduler ahead of ktstr. Repository policy unrelated to
+the run-slot budget still applies. Raw `llvm-cov` modes such as `report`,
+`clean`, and `show-env` are unchanged.
 
 **`--relevant` / `--base` / `--base-ref` / `--default-branch`** —
 narrow the run to only the tests whose scheduler your working-tree
