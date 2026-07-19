@@ -714,6 +714,7 @@ fn hermetic_open_options_disable_terminal_credentials_prompting() {
 }
 
 #[test]
+#[ignore = "requires a runner that permits gix/libcurl loopback proxy connections"]
 fn public_http_authentication_cannot_execute_configured_credentials_programs() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind authentication fixture");
     let address = listener
@@ -885,6 +886,7 @@ fn public_http_authentication_cannot_execute_configured_credentials_programs() {
 }
 
 #[test]
+#[ignore = "requires a runner that permits gix/libcurl loopback proxy connections"]
 fn stalled_smart_http_response_is_aborted_by_the_real_gix_transport() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled HTTP fixture");
     let address = listener.local_addr().expect("fixture address");
