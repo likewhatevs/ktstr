@@ -1278,6 +1278,22 @@ pub const KTSTR_VERIFIER_RESULT_DIR_ENV: &str = "KTSTR_VERIFIER_RESULT_DIR";
 /// never falls back to rebuilding.
 pub const KTSTR_VERIFIER_SCHEDULER_MANIFEST_ENV: &str = "KTSTR_VERIFIER_SCHEDULER_MANIFEST";
 
+/// Name of the environment variable carrying the immutable, versioned
+/// verifier-cell ownership manifest written by the `cargo ktstr verifier`
+/// parent.
+///
+/// Recursive discovery can find the same exact `declare_scheduler!`
+/// declaration in multiple linked test binaries. The parent elects one
+/// canonical executable for each full scheduler identity and records that
+/// mapping here. Every child consults it both while listing cells and before
+/// exact-cell dispatch, so one declaration produces one nextest cell and one
+/// result writer across the whole warmed binary set. When unset, direct/manual
+/// test-binary invocations retain the legacy behavior. Once set, malformed or
+/// incomplete ownership data is a hard error and never falls back to every
+/// binary owning the cell.
+pub const KTSTR_VERIFIER_CELL_OWNERSHIP_MANIFEST_ENV: &str =
+    "KTSTR_VERIFIER_CELL_OWNERSHIP_MANIFEST";
+
 /// Name of the environment variable carrying the operator's
 /// `cargo ktstr verifier --scheduler <NAME>` filter. Set by the
 /// dispatcher in `src/bin/cargo_ktstr/verifier.rs`; read by

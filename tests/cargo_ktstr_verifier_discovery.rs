@@ -14,11 +14,13 @@
 //! scheduler prebuild or KVM cell can run. Observing both declaration payloads
 //! in that conflict is the end-to-end proof of recursive discovery.
 //!
-//! A second fixture carries one compatible declaration plus a private copy of
-//! ktstr's real `scx-ktstr` scheduler package. Its bare verifier invocation
-//! must continue through recursive discovery, the parent-owned scheduler
-//! prebuild and immutable artifact manifest, and one generated KVM cell. This
-//! closes the success-path gap left intentionally by the conflict fixture.
+//! A second fixture links one compatible declaration into two separate test
+//! binaries plus a private copy of ktstr's real `scx-ktstr` scheduler package.
+//! Its bare verifier invocation must continue through recursive discovery, the
+//! parent-owned scheduler prebuild and immutable artifact/ownership manifests,
+//! and exactly one generated KVM cell. This closes both the success-path gap
+//! left intentionally by the conflict fixture and the cross-binary duplicate
+//! cell/record-writer regression.
 
 use std::path::{Path, PathBuf};
 
@@ -173,14 +175,17 @@ test_harness = {{ package = "ktstr", path = {}, optional = true, default-feature
 name = "recursive_scheduler_declaration"
 path = "tests/scheduler.rs"
 required-features = ["verification-tests"]
+
+[[test]]
+name = "recursive_scheduler_declaration_duplicate"
+path = "tests/scheduler_duplicate.rs"
+required-features = ["verification-tests"]
 "#,
             toml_string(ktstr_root),
         ),
     )
     .expect("write success member manifest");
-    std::fs::write(
-        root.join("tests/scheduler.rs"),
-        r#"extern crate test_harness as ktstr;
+    let declaration = r#"extern crate test_harness as ktstr;
 
 use ktstr::declare_scheduler;
 use ktstr::test_support::TopologyConstraints;
@@ -202,9 +207,11 @@ declare_scheduler!(RECURSIVE_DISCOVERY_SUCCESS_SCHEDULER, {
 
 #[test]
 fn declaration_binary_was_built() {}
-"#,
-    )
-    .expect("write successful feature-gated scheduler declaration");
+"#;
+    std::fs::write(root.join("tests/scheduler.rs"), declaration)
+        .expect("write successful feature-gated scheduler declaration");
+    std::fs::write(root.join("tests/scheduler_duplicate.rs"), declaration)
+        .expect("write duplicate feature-gated scheduler declaration");
 }
 
 #[test]
@@ -383,6 +390,11 @@ panic = "abort"
         stderr.contains("prebuilding 1 scheduler package(s)")
             && stderr.contains("dispatching to nextest (verifier/ cells only)"),
         "the successful path must cross scheduler prebuild and generated-cell dispatch:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("1 test run: 1 passed"),
+        "two warmed binaries carrying the same full declaration must elect one lister, \
+         one VM launch, and therefore one result writer:\nstdout:\n{stdout}\nstderr:\n{stderr}",
     );
     assert!(
         stdout.contains("recursive-discovery-success: 1 ✅  0 ❌")

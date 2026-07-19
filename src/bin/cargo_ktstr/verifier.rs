@@ -27,6 +27,11 @@
 //! module's own `verifier::tests::*` unit tests, which also start with
 //! "verifier"). The trailing `args` are forwarded verbatim to that
 //! `cargo nextest run` (a nextest filterset, `--cargo-profile`, ...);
+//! when multiple warmed test binaries report the same full scheduler
+//! declaration, the parent records one canonical binary owner and both
+//! listing and exact dispatch enforce that ownership, so the declaration
+//! produces one VM cell and one result writer rather than one of each per
+//! binary.
 //! native flags may appear in any order relative to them and no `--`
 //! separator is needed (see the bin's `argsplit` module). The
 //! `declare_scheduler!` verifier cells carry no `required-features`,
@@ -93,6 +98,23 @@ struct WorkspaceSchedulerBuild {
     /// package name -> Cargo package ID
     packages: BTreeMap<String, PackageId>,
     requests: Vec<DiscoverSchedulerRequest>,
+}
+
+/// Scheduler declarations retained with the exact warmed test executable
+/// which reported them.
+///
+/// Keeping this provenance past the declaration probe is what lets the parent
+/// elect one child owner when multiple binaries link an identical scheduler.
+#[derive(Debug, Clone)]
+struct TestBinarySchedulerDeclarations {
+    executable: PathBuf,
+    declarations: Vec<ktstr::test_support::SchedulerListEntry>,
+}
+
+#[derive(Debug)]
+struct SelectedSchedulerPlan {
+    schedulers: Vec<ktstr::test_support::SchedulerJson>,
+    discover_requests: Vec<DiscoverSchedulerRequest>,
 }
 
 /// Own one verifier result directory from creation through final report
@@ -714,11 +736,11 @@ fn build_scoped_nextest_args(
 
 fn probe_scheduler_declarations(
     test_bins: &[PathBuf],
-) -> Result<Vec<ktstr::test_support::SchedulerListEntry>, String> {
+) -> Result<Vec<TestBinarySchedulerDeclarations>, String> {
     if test_bins.is_empty() {
         return Ok(Vec::new());
     }
-    let per_binary: Vec<Vec<ktstr::test_support::SchedulerListEntry>> =
+    let mut per_binary: Vec<TestBinarySchedulerDeclarations> =
         match crate::misc::probe_collect_from_bins(
             test_bins,
             |bin| {
@@ -727,11 +749,21 @@ fn probe_scheduler_declarations(
                 command
             },
             |bin, output| {
-                serde_json::from_slice(&output.stdout).map_err(|error| {
+                let declarations = serde_json::from_slice(&output.stdout).map_err(|error| {
                     format!(
                         "parse --ktstr-list-schedulers output from {}: {error}",
                         bin.display()
                     )
+                })?;
+                let executable = std::fs::canonicalize(bin).map_err(|error| {
+                    format!(
+                        "canonicalize warmed test executable {} after scheduler probe: {error}",
+                        bin.display()
+                    )
+                })?;
+                Ok(TestBinarySchedulerDeclarations {
+                    executable,
+                    declarations,
                 })
             },
         ) {
@@ -746,7 +778,10 @@ fn probe_scheduler_declarations(
                 ));
             }
         };
-    Ok(per_binary.into_iter().flatten().collect())
+    per_binary.sort_by(|left, right| left.executable.cmp(&right.executable));
+    let mut seen = HashSet::new();
+    per_binary.retain(|binary| seen.insert(binary.executable.clone()));
+    Ok(per_binary)
 }
 
 /// Apply the scheduler-name filter and child-emission eligibility before
@@ -841,19 +876,19 @@ fn declaring_workspace(
     Ok(Some((workspace_root, package.id.clone())))
 }
 
-/// Mirror every parent-visible child-listing gate before conflict detection or
-/// scheduler build planning. Workspace metadata resolutions are cached by raw
-/// declaring directory + package so exact declarations across test binaries
-/// run Cargo metadata once.
-fn selected_discover_requests(
+/// Mirror every parent-visible child-listing gate before conflict detection,
+/// owner election, or scheduler build planning. Workspace metadata
+/// resolutions are cached by raw declaring directory + package so exact
+/// declarations across test binaries run Cargo metadata once.
+fn selected_scheduler_plan(
     declarations: &[ktstr::test_support::SchedulerListEntry],
     scheduler_filter: Option<&str>,
     resolved_kernels: &[(String, String)],
     presets: &[ktstr::gauntlet::TopoPreset],
     metadata_options: &[String],
-) -> Result<Vec<DiscoverSchedulerRequest>, String> {
+) -> Result<SelectedSchedulerPlan, String> {
     let mut workspaces: BTreeMap<(String, String), Option<(PathBuf, PackageId)>> = BTreeMap::new();
-    let selected =
+    let schedulers =
         selected_emitting_scheduler_declarations(declarations, scheduler_filter, |scheduler| {
             use ktstr::test_support::BinaryKindJson;
 
@@ -904,9 +939,9 @@ fn selected_discover_requests(
             }
         })?;
 
-    let mut requests = Vec::new();
-    for scheduler in selected {
-        let ktstr::test_support::BinaryKindJson::Discover(package) = scheduler.binary_kind else {
+    let mut discover_requests = Vec::new();
+    for scheduler in &schedulers {
+        let ktstr::test_support::BinaryKindJson::Discover(package) = &scheduler.binary_kind else {
             continue;
         };
         let key = (scheduler.manifest_dir.clone(), package.clone());
@@ -915,22 +950,76 @@ fn selected_discover_requests(
             .cloned()
             .flatten()
             .expect("emitting Discover declaration has a member resolution");
-        requests.push(DiscoverSchedulerRequest {
-            scheduler: scheduler.name,
-            package,
-            manifest_dir: scheduler.manifest_dir,
+        discover_requests.push(DiscoverSchedulerRequest {
+            scheduler: scheduler.name.clone(),
+            package: package.clone(),
+            manifest_dir: scheduler.manifest_dir.clone(),
             workspace_root,
             package_id,
         });
     }
-    requests.sort_by(|left, right| {
+    discover_requests.sort_by(|left, right| {
         (&left.scheduler, &left.package, &left.manifest_dir).cmp(&(
             &right.scheduler,
             &right.package,
             &right.manifest_dir,
         ))
     });
-    Ok(requests)
+    Ok(SelectedSchedulerPlan {
+        schedulers,
+        discover_requests,
+    })
+}
+
+#[cfg(test)]
+fn selected_discover_requests(
+    declarations: &[ktstr::test_support::SchedulerListEntry],
+    scheduler_filter: Option<&str>,
+    resolved_kernels: &[(String, String)],
+    presets: &[ktstr::gauntlet::TopoPreset],
+    metadata_options: &[String],
+) -> Result<Vec<DiscoverSchedulerRequest>, String> {
+    Ok(selected_scheduler_plan(
+        declarations,
+        scheduler_filter,
+        resolved_kernels,
+        presets,
+        metadata_options,
+    )?
+    .discover_requests)
+}
+
+fn plan_verifier_cell_ownership(
+    binaries: &[TestBinarySchedulerDeclarations],
+    selected: &[ktstr::test_support::SchedulerJson],
+) -> Result<ktstr::verifier::VerifierCellOwnershipManifest, String> {
+    let mut entries = Vec::with_capacity(selected.len());
+    for scheduler in selected {
+        let owner = binaries
+            .iter()
+            .filter(|binary| {
+                binary
+                    .declarations
+                    .iter()
+                    .any(|entry| entry.scheduler.eq(scheduler))
+            })
+            .min_by(|left, right| left.executable.cmp(&right.executable))
+            .ok_or_else(|| {
+                format!(
+                    "selected scheduler {:?} has no warmed test-binary owner",
+                    scheduler.name,
+                )
+            })?;
+        entries.push(ktstr::verifier::VerifierCellOwnershipEntry {
+            scheduler: scheduler.clone(),
+            executable: owner.executable.clone(),
+        });
+    }
+    entries.sort_by(|left, right| left.scheduler.name.cmp(&right.scheduler.name));
+    Ok(ktstr::verifier::VerifierCellOwnershipManifest {
+        version: ktstr::verifier::VERIFIER_CELL_OWNERSHIP_MANIFEST_VERSION,
+        entries,
+    })
 }
 
 fn plan_workspace_scheduler_builds(
@@ -1163,17 +1252,13 @@ fn snapshot_scheduler_artifact_from_open_file(
 }
 
 struct SchedulerPrebuildContext<'a> {
-    resolved_kernels: &'a [(String, String)],
-    presets: &'a [ktstr::gauntlet::TopoPreset],
     result_dir: &'a Path,
-    metadata_options: &'a [String],
     build_options: &'a [String],
     interrupted: &'a std::sync::atomic::AtomicBool,
 }
 
 fn prebuild_scheduler_manifest(
-    declarations: &[ktstr::test_support::SchedulerListEntry],
-    scheduler_filter: Option<&str>,
+    requests: &[DiscoverSchedulerRequest],
     profile: &str,
     context: SchedulerPrebuildContext<'_>,
 ) -> Result<ktstr::verifier::VerifierSchedulerArtifactManifest, String> {
@@ -1183,14 +1268,7 @@ fn prebuild_scheduler_manifest(
     {
         return Err("cargo ktstr verifier interrupted before scheduler prebuild".to_string());
     }
-    let requests = selected_discover_requests(
-        declarations,
-        scheduler_filter,
-        context.resolved_kernels,
-        context.presets,
-        context.metadata_options,
-    )?;
-    let groups = plan_workspace_scheduler_builds(&requests)?;
+    let groups = plan_workspace_scheduler_builds(requests)?;
     let package_count: usize = groups.iter().map(|group| group.packages.len()).sum();
     if package_count > 0 {
         eprintln!(
@@ -1289,6 +1367,39 @@ fn write_scheduler_manifest(
     temporary.persist(&final_path).map_err(|error| {
         format!(
             "atomically install scheduler artifact manifest {}: {}",
+            final_path.display(),
+            error.error,
+        )
+    })?;
+    Ok(final_path)
+}
+
+fn write_cell_ownership_manifest(
+    result_dir: &Path,
+    manifest: &ktstr::verifier::VerifierCellOwnershipManifest,
+) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let final_path = result_dir.join("cell-ownership-v1.json");
+    let mut temporary = tempfile::NamedTempFile::new_in(result_dir).map_err(|error| {
+        format!(
+            "create temporary verifier cell ownership manifest in {}: {error}",
+            result_dir.display()
+        )
+    })?;
+    serde_json::to_writer_pretty(temporary.as_file_mut(), manifest)
+        .map_err(|error| format!("serialize verifier cell ownership manifest: {error}"))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| format!("sync verifier cell ownership manifest: {error}"))?;
+    temporary
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o444))
+        .map_err(|error| format!("make verifier cell ownership manifest read-only: {error}"))?;
+    temporary.persist(&final_path).map_err(|error| {
+        format!(
+            "atomically install verifier cell ownership manifest {}: {}",
             final_path.display(),
             error.error,
         )
@@ -1488,10 +1599,14 @@ pub(crate) fn run_verifier(
         if crate::interrupt::INTERRUPTED.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(None);
         }
-        let declarations = probe_scheduler_declarations(&test_bins)?;
+        let binary_declarations = probe_scheduler_declarations(&test_bins)?;
         if crate::interrupt::INTERRUPTED.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(None);
         }
+        let declarations = binary_declarations
+            .iter()
+            .flat_map(|binary| binary.declarations.iter().cloned())
+            .collect::<Vec<_>>();
         cmd.env(ktstr::KTSTR_VERIFIER_RESULT_DIR_ENV, result_dir.path());
         let resolved_kernel_labels = resolved
             .iter()
@@ -1503,15 +1618,20 @@ pub(crate) fn run_verifier(
             })
             .collect::<Vec<_>>();
         let presets = ktstr::gauntlet::gauntlet_presets();
-        let scheduler_manifest = prebuild_scheduler_manifest(
+        let selected_plan = selected_scheduler_plan(
             &declarations,
             scheduler.as_deref(),
+            &resolved_kernel_labels,
+            &presets,
+            &declaring_cargo_options,
+        )?;
+        let cell_ownership =
+            plan_verifier_cell_ownership(&binary_declarations, &selected_plan.schedulers)?;
+        let scheduler_manifest = prebuild_scheduler_manifest(
+            &selected_plan.discover_requests,
             &scheduler_profile,
             SchedulerPrebuildContext {
-                resolved_kernels: &resolved_kernel_labels,
-                presets: &presets,
                 result_dir: result_dir.path(),
-                metadata_options: &declaring_cargo_options,
                 build_options: &scheduler_cargo_options,
                 interrupted: &crate::interrupt::INTERRUPTED,
             },
@@ -1521,12 +1641,18 @@ pub(crate) fn run_verifier(
         }
         let scheduler_manifest_path =
             write_scheduler_manifest(result_dir.path(), &scheduler_manifest)?;
+        let cell_ownership_manifest_path =
+            write_cell_ownership_manifest(result_dir.path(), &cell_ownership)?;
         if crate::interrupt::INTERRUPTED.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(None);
         }
         cmd.env(
             ktstr::KTSTR_VERIFIER_SCHEDULER_MANIFEST_ENV,
             scheduler_manifest_path,
+        );
+        cmd.env(
+            ktstr::KTSTR_VERIFIER_CELL_OWNERSHIP_MANIFEST_ENV,
+            cell_ownership_manifest_path,
         );
 
         let kernel_count = resolved.len();
@@ -1690,6 +1816,76 @@ mod tests {
                 "{field} must be part of scheduler identity: {error}",
             );
         }
+    }
+
+    #[test]
+    fn identical_multi_binary_declarations_elect_one_read_only_cell_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("ownership tempdir");
+        let first = dir.path().join("a-test-bin");
+        let later = dir.path().join("z-test-bin");
+        std::fs::write(&first, b"first").expect("write first test bin");
+        std::fs::write(&later, b"later").expect("write later test bin");
+        let first = std::fs::canonicalize(first).expect("canonical first test bin");
+        let later = std::fs::canonicalize(later).expect("canonical later test bin");
+        let declaration = discover_declaration("shared", "scx_shared", "/workspace/member");
+        let mut path_declaration =
+            discover_declaration("shared-path", "unused", "/workspace/member");
+        path_declaration.scheduler.binary_kind =
+            ktstr::test_support::BinaryKindJson::Path("/scheduler/path".into());
+        let binaries = vec![
+            TestBinarySchedulerDeclarations {
+                executable: later,
+                declarations: vec![declaration.clone(), path_declaration.clone()],
+            },
+            TestBinarySchedulerDeclarations {
+                executable: first.clone(),
+                // A repeated local registration must not create another
+                // manifest owner either.
+                declarations: vec![
+                    declaration.clone(),
+                    declaration.clone(),
+                    path_declaration.clone(),
+                ],
+            },
+        ];
+
+        let manifest = plan_verifier_cell_ownership(
+            &binaries,
+            &[
+                declaration.scheduler.clone(),
+                path_declaration.scheduler.clone(),
+            ],
+        )
+        .expect("elect one owner for Discover and Path declarations");
+        assert_eq!(manifest.entries.len(), 2);
+        assert!(
+            manifest
+                .entries
+                .iter()
+                .all(|entry| entry.executable == first),
+            "owner election is canonical-path ordered for Discover and Path declarations, \
+             independent of probe order",
+        );
+
+        let result_dir = dir.path().join("results");
+        std::fs::create_dir(&result_dir).expect("create result dir");
+        let path = write_cell_ownership_manifest(&result_dir, &manifest)
+            .expect("write ownership manifest");
+        let roundtrip: ktstr::verifier::VerifierCellOwnershipManifest =
+            serde_json::from_slice(&std::fs::read(&path).expect("read ownership manifest"))
+                .expect("parse ownership manifest");
+        assert_eq!(roundtrip, manifest);
+        assert_eq!(
+            std::fs::metadata(path)
+                .expect("ownership manifest metadata")
+                .permissions()
+                .mode()
+                & 0o222,
+            0,
+            "published ownership is immutable before nextest starts",
+        );
     }
 
     fn verifier_matrix() -> (Vec<(String, String)>, Vec<ktstr::gauntlet::TopoPreset>) {

@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::sync::MutexExt;
-use crate::test_support::Scheduler;
+use crate::test_support::{Scheduler, SchedulerJson, SchedulerSpec};
 
 // ---------------------------------------------------------------
 // is_test_sentinel — convention-based sentinel-name predicate
@@ -2598,6 +2598,63 @@ fn verifier_topology_unsupported_classifier_is_typed_and_chain_aware() {
     )));
 }
 
+/// A non-owner exact dispatch stops before both the VM-launch callback and the
+/// deterministic result writer. This is the execution-side half of
+/// cross-binary ownership: even a stale/hand-crafted nextest dispatch cannot
+/// race the elected binary's record.
+#[test]
+fn verifier_non_owner_dispatch_cannot_launch_or_write_a_record() {
+    use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};
+
+    let _env_lock = lock_env();
+    let result_dir = tempfile::tempdir().expect("result dir");
+    let _results = EnvVarGuard::set(
+        crate::KTSTR_VERIFIER_RESULT_DIR_ENV,
+        result_dir.path().as_os_str(),
+    );
+    let launched = std::cell::Cell::new(false);
+    let (code, captured) = capture_stderr(|| {
+        run_verifier_cell_after_ownership(
+            "verifier/shared/kernel/topology",
+            Ok(None),
+            |_, _, _, _| {
+                launched.set(true);
+                0
+            },
+        )
+    });
+
+    assert_eq!(code, 1);
+    assert!(!launched.get(), "the non-owner must not enter VM execution");
+    assert_eq!(
+        std::fs::read_dir(result_dir.path())
+            .expect("read result dir")
+            .count(),
+        0,
+        "the non-owner must not create or replace the elected cell's record",
+    );
+    let stderr = String::from_utf8(captured).expect("stderr is utf-8");
+    assert!(stderr.contains("refusing non-owner exact-cell dispatch"));
+}
+
+#[test]
+fn exact_dispatch_selects_parent_identity_after_same_name_non_emitter() {
+    let non_emitting =
+        Scheduler::named("shared").binary(SchedulerSpec::Discover("fixture_not_in_workspace"));
+    let selected =
+        Scheduler::named("shared").binary(SchedulerSpec::Discover("real_workspace_member"));
+    let selected_json = SchedulerJson::from_scheduler(&selected);
+
+    let resolved =
+        select_verifier_scheduler_from([&non_emitting, &selected], "shared", Some(&selected_json))
+            .expect("resolve the parent-selected declaration");
+    assert_eq!(
+        SchedulerJson::from_scheduler(resolved),
+        selected_json,
+        "exact dispatch must not fall back to the first same-name registration",
+    );
+}
+
 /// A name lacking the `verifier/` prefix exits 1 with the
 /// missing-prefix diagnostic. Pins the strip_prefix None arm.
 #[test]
@@ -2901,6 +2958,17 @@ fn list_tests_budget_valid_routes_to_budget_lister() {
 // ---------------------------------------------------------------
 // list_verifier_cells_all — empty / scheduler-free kernel list
 // ---------------------------------------------------------------
+
+#[test]
+fn identical_local_scheduler_registrations_claim_one_cell_set() {
+    let mut emitted = std::collections::HashSet::new();
+    assert!(claim_verifier_scheduler_name(&mut emitted, "shared"));
+    assert!(
+        !claim_verifier_scheduler_name(&mut emitted, "shared"),
+        "a repeated registration in the elected binary must not list its matrix twice",
+    );
+    assert!(claim_verifier_scheduler_name(&mut emitted, "unique"));
+}
 
 #[test]
 fn verifier_named_topology_exclusion_does_not_change_gauntlet_constraints() {

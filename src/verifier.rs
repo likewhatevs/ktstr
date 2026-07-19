@@ -21,6 +21,195 @@ use std::path::{Path, PathBuf};
 /// Current schema version for [`VerifierSchedulerArtifactManifest`].
 pub const VERIFIER_SCHEDULER_ARTIFACT_MANIFEST_VERSION: u32 = 1;
 
+/// Current schema version for [`VerifierCellOwnershipManifest`].
+pub const VERIFIER_CELL_OWNERSHIP_MANIFEST_VERSION: u32 = 1;
+
+/// One parent-elected verifier-cell owner per selected scheduler identity.
+///
+/// Test binaries are the unit nextest lists and executes. When two warmed
+/// binaries link the same exact `declare_scheduler!`, both would otherwise
+/// advertise the same `verifier/<scheduler>/<kernel>/<topology>` name and
+/// race to write its deterministic result record. The parent writes this
+/// manifest after discovery; children use it at both listing and exact
+/// dispatch boundaries.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifierCellOwnershipManifest {
+    /// Wire schema version.
+    pub version: u32,
+    /// Full scheduler identity to canonical test-executable mapping.
+    pub entries: Vec<VerifierCellOwnershipEntry>,
+}
+
+/// One selected scheduler declaration and the sole test executable allowed to
+/// list, launch, and record its verifier cells.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifierCellOwnershipEntry {
+    /// The complete declaration identity, not merely its cell-name component.
+    pub scheduler: crate::test_support::SchedulerJson,
+    /// Canonical absolute path of the elected warmed test executable.
+    pub executable: PathBuf,
+}
+
+/// Validated ownership view for the current test executable.
+///
+/// Construction validates the entire manifest before any scheduler lookup, so
+/// an ambiguous or partially corrupt manifest cannot selectively fall back to
+/// duplicate cell emission.
+pub(crate) struct VerifierCellOwnership {
+    current_executable: PathBuf,
+    entries: HashMap<String, VerifierCellOwnershipEntry>,
+}
+
+impl VerifierCellOwnership {
+    fn entry_for_scheduler(
+        &self,
+        scheduler_name: &str,
+    ) -> anyhow::Result<&VerifierCellOwnershipEntry> {
+        self.entries.get(scheduler_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "verifier cell ownership manifest has no entry for selected scheduler {:?}",
+                scheduler_name,
+            )
+        })
+    }
+
+    /// Whether this process is the sole owner of `scheduler`.
+    ///
+    /// A present manifest must contain every scheduler which reaches the
+    /// child's normal emission gates, and its full declaration must match the
+    /// parent-observed identity. Missing or stale entries are therefore hard
+    /// errors rather than implicit ownership.
+    pub(crate) fn owns_scheduler(
+        &self,
+        scheduler: &crate::test_support::SchedulerJson,
+    ) -> anyhow::Result<bool> {
+        let entry = self.entry_for_scheduler(&scheduler.name)?;
+        if !entry.scheduler.eq(scheduler) {
+            anyhow::bail!(
+                "verifier cell ownership declaration mismatch for scheduler {:?}: \
+                 parent recorded {:?}, child linked {:?}",
+                scheduler.name,
+                entry.scheduler,
+                scheduler,
+            );
+        }
+        Ok(entry.executable.eq(&self.current_executable))
+    }
+
+    /// Return the parent-selected full declaration when this process owns it.
+    ///
+    /// Exact dispatch uses this identity to select the matching local
+    /// registration, rather than looking up only the scheduler name and
+    /// accidentally executing an earlier same-name declaration which the
+    /// parent correctly filtered as non-emitting.
+    pub(crate) fn owned_scheduler(
+        &self,
+        scheduler_name: &str,
+    ) -> anyhow::Result<Option<&crate::test_support::SchedulerJson>> {
+        let entry = self.entry_for_scheduler(scheduler_name)?;
+        Ok(entry
+            .executable
+            .eq(&self.current_executable)
+            .then_some(&entry.scheduler))
+    }
+}
+
+fn cell_ownership_from_manifest_path(
+    manifest_path: Option<&OsStr>,
+    current_executable: &Path,
+) -> anyhow::Result<Option<VerifierCellOwnership>> {
+    let Some(manifest_path) = manifest_path else {
+        return Ok(None);
+    };
+    if manifest_path.is_empty() {
+        anyhow::bail!(
+            "{} is set but empty",
+            crate::KTSTR_VERIFIER_CELL_OWNERSHIP_MANIFEST_ENV
+        );
+    }
+    let manifest_path = PathBuf::from(manifest_path);
+    let bytes = std::fs::read(&manifest_path).map_err(|error| {
+        anyhow::anyhow!(
+            "read verifier cell ownership manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: VerifierCellOwnershipManifest =
+        serde_json::from_slice(&bytes).map_err(|error| {
+            anyhow::anyhow!(
+                "parse verifier cell ownership manifest {}: {error}",
+                manifest_path.display()
+            )
+        })?;
+    if manifest.version != VERIFIER_CELL_OWNERSHIP_MANIFEST_VERSION {
+        anyhow::bail!(
+            "unsupported verifier cell ownership manifest version {} in {} (expected {})",
+            manifest.version,
+            manifest_path.display(),
+            VERIFIER_CELL_OWNERSHIP_MANIFEST_VERSION,
+        );
+    }
+
+    let current_executable = std::fs::canonicalize(current_executable).map_err(|error| {
+        anyhow::anyhow!(
+            "canonicalize current verifier test executable {}: {error}",
+            current_executable.display()
+        )
+    })?;
+    let mut entries = HashMap::with_capacity(manifest.entries.len());
+    for entry in manifest.entries {
+        if !entry.executable.is_absolute() {
+            anyhow::bail!(
+                "verifier cell owner for scheduler {:?} is not absolute: {}",
+                entry.scheduler.name,
+                entry.executable.display(),
+            );
+        }
+        let canonical_owner = std::fs::canonicalize(&entry.executable).map_err(|error| {
+            anyhow::anyhow!(
+                "canonicalize verifier cell owner {} for scheduler {:?}: {error}",
+                entry.executable.display(),
+                entry.scheduler.name,
+            )
+        })?;
+        if canonical_owner.as_path() != entry.executable.as_path() {
+            anyhow::bail!(
+                "verifier cell owner for scheduler {:?} is not canonical: {} resolves to {}",
+                entry.scheduler.name,
+                entry.executable.display(),
+                canonical_owner.display(),
+            );
+        }
+        let name = entry.scheduler.name.clone();
+        if entries.insert(name.clone(), entry).is_some() {
+            anyhow::bail!(
+                "duplicate verifier cell ownership manifest entry for scheduler {name:?}"
+            );
+        }
+    }
+    Ok(Some(VerifierCellOwnership {
+        current_executable,
+        entries,
+    }))
+}
+
+/// Read and validate the parent-owned cell mapping for this test process.
+///
+/// `Ok(None)` means no dispatcher manifest was exported and preserves direct
+/// test-binary behavior. Any present-manifest failure is returned to the
+/// listing/dispatch boundary and must not fall back to shared ownership.
+pub(crate) fn verifier_cell_ownership_from_env() -> anyhow::Result<Option<VerifierCellOwnership>> {
+    let Some(manifest_path) = std::env::var_os(crate::KTSTR_VERIFIER_CELL_OWNERSHIP_MANIFEST_ENV)
+    else {
+        return Ok(None);
+    };
+    let current_executable = std::env::current_exe()
+        .map_err(|error| anyhow::anyhow!("locate current verifier test executable: {error}"))?;
+    cell_ownership_from_manifest_path(Some(manifest_path.as_os_str()), &current_executable)
+}
+
 /// Parent-owned scheduler artifacts for one `cargo ktstr verifier` run.
 ///
 /// The dispatcher writes this before nextest starts and every verifier cell
@@ -1770,9 +1959,13 @@ fn cell_record_filename(full_name: &str) -> String {
 /// Write a cell's PASS/FAIL/SKIP record into `dir`. Parses `full_name`
 /// (`verifier/<sched>/<kernel>/<preset>`); a name that does not fit that
 /// shape is skipped (the cell already errored on the malformed name).
-/// Best-effort: a write failure is logged and swallowed — the summary
-/// table is a convenience over the per-cell nextest output, so a lost
-/// record must never turn an otherwise-passing cell into a failure.
+/// The record is serialized to a same-directory temporary and atomically
+/// renamed over the deterministic final path. Readers therefore see either
+/// the preceding retry's complete record or the current retry's complete
+/// record, never a truncated JSON prefix. Best-effort: a write failure is
+/// logged and swallowed — the summary table is a convenience over the
+/// per-cell nextest output, so a lost record must never turn an
+/// otherwise-passing cell into a failure.
 ///
 /// `pub(crate)`: the only writer is the cell handler in
 /// `test_support::dispatch` (same crate); the reader side
@@ -1805,16 +1998,20 @@ pub(crate) fn write_cell_record(
         stats: stats.to_vec(),
     };
     let path = dir.join(cell_record_filename(full_name));
-    match serde_json::to_vec(&record) {
-        Ok(bytes) => {
-            if let Err(e) = std::fs::write(&path, bytes) {
-                eprintln!(
-                    "ktstr verifier: warning: could not write result record {}: {e}",
-                    path.display(),
-                );
-            }
-        }
-        Err(e) => eprintln!("ktstr verifier: warning: serialize result record: {e}"),
+    let result = (|| -> anyhow::Result<()> {
+        use std::io::Write;
+
+        let mut temporary = tempfile::NamedTempFile::new_in(dir)?;
+        serde_json::to_writer(temporary.as_file_mut(), &record)?;
+        temporary.as_file_mut().flush()?;
+        temporary.persist(&path).map_err(|error| error.error)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!(
+            "ktstr verifier: warning: could not atomically write result record {}: {error:#}",
+            path.display(),
+        );
     }
 }
 
@@ -2188,6 +2385,178 @@ pub fn render_instruction_count_tables(records: &[VerifierCellRecord]) -> Option
 mod tests {
     use super::*;
 
+    fn ownership_scheduler(name: &str) -> crate::test_support::SchedulerJson {
+        let mut scheduler = crate::test_support::SchedulerJson::from_scheduler(
+            &crate::test_support::Scheduler::EEVDF,
+        );
+        scheduler.name = name.to_string();
+        scheduler
+    }
+
+    fn write_ownership_manifest(dir: &Path, manifest: &VerifierCellOwnershipManifest) -> PathBuf {
+        let path = dir.join("cell-ownership.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(manifest).expect("serialize ownership manifest"),
+        )
+        .expect("write ownership manifest");
+        path
+    }
+
+    #[test]
+    fn cell_ownership_allows_exactly_the_canonical_elected_executable() {
+        let dir = tempfile::tempdir().expect("ownership tempdir");
+        let owner = dir.path().join("owner");
+        let non_owner = dir.path().join("non-owner");
+        std::fs::write(&owner, b"owner").expect("write owner");
+        std::fs::write(&non_owner, b"non-owner").expect("write non-owner");
+        let owner = std::fs::canonicalize(owner).expect("canonical owner");
+        let non_owner = std::fs::canonicalize(non_owner).expect("canonical non-owner");
+        let owner_alias = dir.path().join("owner-alias");
+        std::os::unix::fs::symlink(&owner, &owner_alias).expect("symlink owner alias");
+        let scheduler = ownership_scheduler("shared");
+        let manifest_path = write_ownership_manifest(
+            dir.path(),
+            &VerifierCellOwnershipManifest {
+                version: VERIFIER_CELL_OWNERSHIP_MANIFEST_VERSION,
+                entries: vec![VerifierCellOwnershipEntry {
+                    scheduler: scheduler.clone(),
+                    executable: owner.clone(),
+                }],
+            },
+        );
+
+        let elected = cell_ownership_from_manifest_path(Some(manifest_path.as_os_str()), &owner)
+            .expect("load owner view")
+            .expect("present manifest");
+        let rejected =
+            cell_ownership_from_manifest_path(Some(manifest_path.as_os_str()), &non_owner)
+                .expect("load non-owner view")
+                .expect("present manifest");
+        let elected_through_alias =
+            cell_ownership_from_manifest_path(Some(manifest_path.as_os_str()), &owner_alias)
+                .expect("load owner alias view")
+                .expect("present manifest");
+        assert!(elected.owns_scheduler(&scheduler).expect("owner lookup"));
+        assert!(
+            elected_through_alias
+                .owns_scheduler(&scheduler)
+                .expect("owner alias lookup"),
+            "current_exe aliases must compare by their canonical executable path",
+        );
+        assert!(
+            !rejected
+                .owns_scheduler(&scheduler)
+                .expect("non-owner lookup")
+        );
+        let mut stale_child = scheduler.clone();
+        stale_child.kargs.push("identity=stale-child".into());
+        assert!(
+            elected.owns_scheduler(&stale_child).is_err(),
+            "matching only the scheduler name cannot establish ownership",
+        );
+    }
+
+    #[test]
+    fn present_cell_ownership_manifest_fails_closed() {
+        let dir = tempfile::tempdir().expect("ownership tempdir");
+        let owner = dir.path().join("owner");
+        std::fs::write(&owner, b"owner").expect("write owner");
+        let owner = std::fs::canonicalize(owner).expect("canonical owner");
+        let scheduler = ownership_scheduler("shared");
+        assert!(
+            cell_ownership_from_manifest_path(None, &owner)
+                .expect("absent manifest")
+                .is_none(),
+            "only an absent environment value retains direct invocation",
+        );
+        assert!(
+            cell_ownership_from_manifest_path(Some(OsStr::new("")), &owner).is_err(),
+            "an explicitly empty manifest path is still present and must fail",
+        );
+
+        let wrong_version_path = write_ownership_manifest(
+            dir.path(),
+            &VerifierCellOwnershipManifest {
+                version: VERIFIER_CELL_OWNERSHIP_MANIFEST_VERSION + 1,
+                entries: Vec::new(),
+            },
+        );
+        assert!(
+            cell_ownership_from_manifest_path(Some(wrong_version_path.as_os_str()), &owner)
+                .is_err(),
+            "unknown ownership schemas cannot fall back to shared ownership",
+        );
+
+        let empty_path = write_ownership_manifest(
+            dir.path(),
+            &VerifierCellOwnershipManifest {
+                version: VERIFIER_CELL_OWNERSHIP_MANIFEST_VERSION,
+                entries: Vec::new(),
+            },
+        );
+        let empty = cell_ownership_from_manifest_path(Some(empty_path.as_os_str()), &owner)
+            .expect("load empty manifest")
+            .expect("present manifest");
+        assert!(
+            empty.owns_scheduler(&scheduler).is_err(),
+            "a selected scheduler missing from a present manifest cannot become shared",
+        );
+
+        let duplicate_path = write_ownership_manifest(
+            dir.path(),
+            &VerifierCellOwnershipManifest {
+                version: VERIFIER_CELL_OWNERSHIP_MANIFEST_VERSION,
+                entries: vec![
+                    VerifierCellOwnershipEntry {
+                        scheduler: scheduler.clone(),
+                        executable: owner.clone(),
+                    },
+                    VerifierCellOwnershipEntry {
+                        scheduler: scheduler.clone(),
+                        executable: owner.clone(),
+                    },
+                ],
+            },
+        );
+        assert!(
+            cell_ownership_from_manifest_path(Some(duplicate_path.as_os_str()), &owner).is_err(),
+            "ambiguous scheduler owners cannot be accepted",
+        );
+
+        let noncanonical_owner = dir.path().join("owner-symlink");
+        std::os::unix::fs::symlink(&owner, &noncanonical_owner).expect("symlink owner");
+        let noncanonical_path = write_ownership_manifest(
+            dir.path(),
+            &VerifierCellOwnershipManifest {
+                version: VERIFIER_CELL_OWNERSHIP_MANIFEST_VERSION,
+                entries: vec![VerifierCellOwnershipEntry {
+                    scheduler: scheduler.clone(),
+                    executable: noncanonical_owner,
+                }],
+            },
+        );
+        assert!(
+            cell_ownership_from_manifest_path(Some(noncanonical_path.as_os_str()), &owner).is_err(),
+            "owner paths must be canonical rather than merely equivalent",
+        );
+
+        let malformed_path = dir.path().join("malformed-ownership.json");
+        std::fs::write(&malformed_path, b"{").expect("write malformed manifest");
+        assert!(
+            cell_ownership_from_manifest_path(Some(malformed_path.as_os_str()), &owner).is_err(),
+            "malformed JSON cannot fall back to shared ownership",
+        );
+        assert!(
+            cell_ownership_from_manifest_path(
+                Some(dir.path().join("missing.json").as_os_str()),
+                &owner,
+            )
+            .is_err(),
+            "a missing present-manifest path cannot fall back to shared ownership",
+        );
+    }
+
     #[test]
     fn declared_scheduler_launch_plan_preserves_boot_environment_and_order() {
         use crate::test_support::{Scheduler, Sysctl};
@@ -2490,15 +2859,14 @@ mod tests {
     /// FINAL outcome wins (fail-then-pass -> PASS).
     #[test]
     fn cell_record_write_read_roundtrip_and_retry_overwrites() {
-        let dir = std::env::temp_dir().join(format!("ktstr-verif-rec-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mk temp dir");
+        let dir = tempfile::tempdir().expect("result tempdir");
         // Malformed: no verifier/ prefix, and a 2-segment name (no
         // <preset> after the kernel) — both skipped.
-        write_cell_record(&dir, "not_a_cell", true, false, &[]);
-        write_cell_record(&dir, "verifier/only/two", true, false, &[]);
+        write_cell_record(dir.path(), "not_a_cell", true, false, &[]);
+        write_cell_record(dir.path(), "verifier/only/two", true, false, &[]);
         // Well-formed cell: fail, then a retry passes -> overwrites.
         let name = "verifier/scx_a/kernel_6_14/4cpu-1llc-nosmt";
-        write_cell_record(&dir, name, false, false, &[]);
+        write_cell_record(dir.path(), name, false, false, &[]);
         // The retry passes and carries per-program verified_insns, so the
         // final record has both the PASS outcome and the stats.
         let stats = [
@@ -2511,12 +2879,19 @@ mod tests {
                 verified_insns: 123,
             },
         ];
-        write_cell_record(&dir, name, true, false, &stats);
-        let recs = read_cell_records(&dir);
+        write_cell_record(dir.path(), name, true, false, &stats);
+        let recs = read_cell_records(dir.path());
         assert_eq!(
             recs.len(),
             1,
             "malformed names skipped; the retry overwrote its own record (one file): {recs:?}",
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .expect("read result directory")
+                .count(),
+            1,
+            "atomic retry replacement must leave no temporary record behind",
         );
         assert_eq!(recs[0].scheduler, "scx_a");
         assert_eq!(recs[0].kernel, "kernel_6_14");
@@ -2528,7 +2903,6 @@ mod tests {
         // Per-program verified_insns survive the JSON roundtrip and reflect
         // the final (retry) write, not the earlier stat-less fail.
         assert_eq!(recs[0].stats, stats, "stats roundtrip via serde");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Distinct valid scheduler names may differ only at punctuation which a

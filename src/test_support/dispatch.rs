@@ -1859,6 +1859,13 @@ fn query_workspace_member_packages(manifest_dir: &str) -> std::collections::Hash
         .collect()
 }
 
+fn claim_verifier_scheduler_name<'a>(
+    emitted: &mut std::collections::HashSet<&'a str>,
+    name: &'a str,
+) -> bool {
+    emitted.insert(name)
+}
+
 /// Emit `verifier/<sched>/<kernel>/<preset>: test` lines — one per
 /// (declared scheduler × kernel-list entry × accepted topology preset)
 /// cell. Mirrors the gauntlet emission pattern in [`list_tests_all`] but
@@ -1911,11 +1918,19 @@ fn query_workspace_member_packages(manifest_dir: &str) -> std::collections::Hash
 /// (direct binary invocation outside the dispatcher), no cells emit.
 fn list_verifier_cells_all() {
     use super::SchedulerSpec;
+    let cell_ownership = match crate::verifier::verifier_cell_ownership_from_env() {
+        Ok(ownership) => ownership,
+        Err(error) => {
+            eprintln!("ktstr verifier: cannot establish cell ownership while listing: {error:#}");
+            std::process::exit(1);
+        }
+    };
     let kernel_list = read_kernel_list();
     if kernel_list.is_empty() {
         return;
     }
     let presets = crate::gauntlet::gauntlet_presets();
+    let mut emitted_scheduler_names = std::collections::HashSet::new();
     // No host_capacity() read here: verifier preset selection has no
     // host-size bound (see accepts_verifier) — a battery shape lists on
     // any host regardless of CPU count.
@@ -1979,6 +1994,26 @@ fn list_verifier_cells_all() {
                 .map(|entry| (entry.label.as_str(), entry.sanitized.as_str())),
             &presets,
         ) {
+            continue;
+        }
+        if let Some(ownership) = &cell_ownership {
+            match ownership.owns_scheduler(&scheduler_json) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    eprintln!(
+                        "ktstr verifier: cannot establish cell ownership for scheduler {:?}: \
+                         {error:#}",
+                        sched.name,
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        // The parent collapses exact declarations across binaries. Mirror
+        // that identity rule inside the elected binary too: repeated links of
+        // the same scheduler static/name still advertise one nextest cell set.
+        if !claim_verifier_scheduler_name(&mut emitted_scheduler_names, sched.name) {
             continue;
         }
         for kernel_entry in &kernel_list {
@@ -2078,6 +2113,7 @@ fn is_verifier_topology_unsupported(e: &anyhow::Error) -> bool {
 /// that case they emit a `SKIP` banner + exit 0.
 fn run_verifier_cell_inner(
     full_name: &str,
+    sched: &super::Scheduler,
     out_stats: &mut Vec<crate::verifier::ProgStats>,
     out_skipped: &mut bool,
 ) -> i32 {
@@ -2114,13 +2150,13 @@ fn run_verifier_cell_inner(
         return 1;
     }
 
-    let Some(sched) = super::KTSTR_SCHEDULERS
-        .iter()
-        .find(|s| s.name == sched_name)
-    else {
-        eprintln!("ktstr verifier: no declared scheduler {sched_name:?} (cell {full_name:?})",);
+    if sched.name != sched_name {
+        eprintln!(
+            "ktstr verifier: selected scheduler {:?} does not match cell {full_name:?}",
+            sched.name,
+        );
         return 1;
-    };
+    }
 
     // Resolve the cell's topology preset by its <preset> name segment.
     let preset_list = crate::gauntlet::gauntlet_presets();
@@ -2318,6 +2354,70 @@ fn run_verifier_cell_inner(
     }
 }
 
+/// Check parent-elected ownership before an exact verifier cell can launch or
+/// write its deterministic record.
+///
+/// The environment-absent path preserves direct/manual invocation. Once a
+/// manifest is present, malformed names and missing local declarations cannot
+/// establish ownership and fail closed. A non-owner returns `Ok(None)` so the
+/// wrapper can reject it without entering either the VM path or record writer.
+fn select_verifier_scheduler_from<'a>(
+    schedulers: impl IntoIterator<Item = &'a super::Scheduler>,
+    scheduler_name: &str,
+    expected: Option<&super::SchedulerJson>,
+) -> anyhow::Result<&'a super::Scheduler> {
+    let mut candidates = schedulers
+        .into_iter()
+        .filter(|scheduler| scheduler.name == scheduler_name);
+    let Some(expected) = expected else {
+        return candidates.next().ok_or_else(|| {
+            anyhow::anyhow!("no declared scheduler {scheduler_name:?} exists in this test binary")
+        });
+    };
+    candidates
+        .find(|scheduler| super::SchedulerJson::from_scheduler(scheduler).eq(expected))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "this test binary has no declaration matching the parent-selected full \
+                 identity for scheduler {scheduler_name:?}: {expected:?}"
+            )
+        })
+}
+
+fn select_local_verifier_scheduler(
+    scheduler_name: &str,
+    expected: Option<&super::SchedulerJson>,
+) -> anyhow::Result<&'static super::Scheduler> {
+    select_verifier_scheduler_from(
+        super::KTSTR_SCHEDULERS.iter().copied(),
+        scheduler_name,
+        expected,
+    )
+}
+
+fn current_binary_verifier_scheduler(
+    full_name: &str,
+) -> anyhow::Result<Option<&'static super::Scheduler>> {
+    let rest = full_name
+        .strip_prefix("verifier/")
+        .ok_or_else(|| anyhow::anyhow!("missing 'verifier/' prefix in cell name {full_name:?}"))?;
+    let parts = rest.splitn(3, '/').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        anyhow::bail!(
+            "malformed cell name {full_name:?}; expected \
+             verifier/<sched>/<kernel>/<preset>"
+        );
+    }
+    let scheduler_name = parts[0];
+    let Some(ownership) = crate::verifier::verifier_cell_ownership_from_env()? else {
+        return select_local_verifier_scheduler(scheduler_name, None).map(Some);
+    };
+    let Some(expected) = ownership.owned_scheduler(scheduler_name)? else {
+        return Ok(None);
+    };
+    select_local_verifier_scheduler(scheduler_name, Some(expected)).map(Some)
+}
+
 /// Run a verifier cell and, when the `cargo ktstr verifier` dispatcher
 /// set [`crate::KTSTR_VERIFIER_RESULT_DIR_ENV`], record its
 /// PASS/FAIL/SKIP outcome there so the dispatcher can render the
@@ -2327,10 +2427,33 @@ fn run_verifier_cell_inner(
 /// the cell's exit code. A nextest RETRY re-runs this wrapper and
 /// overwrites the cell's own record (deterministic filename), so the
 /// final attempt's outcome is the one that lands in the table.
-fn run_verifier_cell(full_name: &str) -> i32 {
+fn run_verifier_cell_after_ownership(
+    full_name: &str,
+    scheduler: anyhow::Result<Option<&super::Scheduler>>,
+    execute: impl FnOnce(
+        &str,
+        &super::Scheduler,
+        &mut Vec<crate::verifier::ProgStats>,
+        &mut bool,
+    ) -> i32,
+) -> i32 {
+    let scheduler = match scheduler {
+        Ok(Some(scheduler)) => scheduler,
+        Ok(None) => {
+            eprintln!("ktstr verifier: refusing non-owner exact-cell dispatch for {full_name:?}");
+            return 1;
+        }
+        Err(error) => {
+            eprintln!(
+                "ktstr verifier: cannot establish exact-cell ownership for {full_name:?}: \
+                 {error:#}"
+            );
+            return 1;
+        }
+    };
     let mut stats = Vec::new();
     let mut skipped = false;
-    let code = run_verifier_cell_inner(full_name, &mut stats, &mut skipped);
+    let code = execute(full_name, scheduler, &mut stats, &mut skipped);
     if let Some(dir) = std::env::var_os(crate::KTSTR_VERIFIER_RESULT_DIR_ENV) {
         crate::verifier::write_cell_record(
             std::path::Path::new(&dir),
@@ -2341,6 +2464,14 @@ fn run_verifier_cell(full_name: &str) -> i32 {
         );
     }
     code
+}
+
+fn run_verifier_cell(full_name: &str) -> i32 {
+    run_verifier_cell_after_ownership(
+        full_name,
+        current_binary_verifier_scheduler(full_name),
+        run_verifier_cell_inner,
+    )
 }
 
 /// List tests with budget-based coverage maximization.
