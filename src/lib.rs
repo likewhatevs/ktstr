@@ -461,6 +461,8 @@ pub(crate) mod elf_strip;
 pub mod export;
 pub mod fetch;
 pub mod fun;
+#[doc(hidden)]
+pub mod git_status;
 pub mod host_context;
 pub mod host_heap;
 pub(crate) mod host_thread_probe;

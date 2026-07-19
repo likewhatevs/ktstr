@@ -1508,13 +1508,13 @@ fn repo_is_dirty_status_consumer_exhausts_the_producer() {
     let iter = (0..4).inspect(|_| {
         yielded.set(yielded.get() + 1);
     });
-    assert!(super::super::status_iter_has_any(iter));
+    assert!(crate::git_status::consume_has_any(iter));
     assert_eq!(
         yielded.get(),
         4,
         "status consumption must reach EOF rather than short-circuit",
     );
-    assert!(!super::super::status_iter_has_any(std::iter::empty::<()>()));
+    assert!(!crate::git_status::consume_has_any(std::iter::empty::<()>()));
 }
 
 /// Non-git directory: `detect_commit_at` calls

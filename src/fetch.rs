@@ -4094,9 +4094,10 @@ pub fn inspect_local_source_state(canonical: &Path) -> Result<LocalSourceState> 
                     })
                     .index_worktree_options_mut(|opts| {
                         opts.dirwalk_options = None;
+                        crate::git_status::configure_index_worktree_parallelism(opts);
                     })
                     .into_index_worktree_iter(Vec::new())
-                    .map(|mut iter| iter.next().is_some())
+                    .map(crate::git_status::consume_has_any)
                     .unwrap_or(false)
             } else {
                 false

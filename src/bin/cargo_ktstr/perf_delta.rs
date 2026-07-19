@@ -426,7 +426,8 @@ fn build_head_snapshot_tree(
         .context("configure working-tree status for the snapshot")?
         .untracked_files(gix::status::UntrackedFiles::Files)
         .index_worktree_rewrites(None)
-        .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled);
+        .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled)
+        .index_worktree_options_mut(ktstr::git_status::configure_index_worktree_parallelism);
 
     let mut changed = 0usize;
     for item in status
