@@ -956,6 +956,51 @@ where
     reset_http_retry_routes(routes, failed_url, resolve)
 }
 
+/// Route-relevant facts from one failed HTTP attempt.
+///
+/// Keeping this independent of reqwest's concrete response/error objects gives
+/// the retry loop one transition point for both failure classes and lets tests
+/// drive the route state deterministically without scheduling local sockets.
+enum HttpRetryRouteFailure<'a> {
+    Response {
+        status: reqwest::StatusCode,
+        response_url: &'a Url,
+        remote_addr: Option<SocketAddr>,
+    },
+    Transport {
+        failed_url: &'a Url,
+    },
+}
+
+/// Update retry-route state from one failed attempt.
+///
+/// Non-gateway responses (notably 429) deliberately leave routing unchanged.
+/// Gateway responses discard the observed peer after resolving the response
+/// origin, while transport errors initialize or preserve the candidate tail
+/// according to [`prepare_routes_after_transport_error`].
+fn prepare_http_retry_route<R>(
+    routes: &mut Option<HttpRetryRoutes>,
+    failure: HttpRetryRouteFailure<'_>,
+    resolve: &R,
+) -> std::io::Result<bool>
+where
+    R: Fn(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
+{
+    match failure {
+        HttpRetryRouteFailure::Response {
+            status,
+            response_url,
+            remote_addr,
+        } if is_dns_edge_failure_status(status) => {
+            record_failed_http_edge(routes, response_url, remote_addr, resolve)
+        }
+        HttpRetryRouteFailure::Response { .. } => Ok(false),
+        HttpRetryRouteFailure::Transport { failed_url } => {
+            prepare_routes_after_transport_error(routes, failed_url, resolve)
+        }
+    }
+}
+
 /// Build a retry client for the next untried primary address plus every
 /// remaining fallback candidate.
 ///
@@ -1082,11 +1127,14 @@ where
                     return Ok(response);
                 }
                 let remote_addr = response.remote_addr();
-                if route_failover.enabled && is_dns_edge_failure_status(status) {
-                    match record_failed_http_edge(
+                if route_failover.enabled {
+                    match prepare_http_retry_route(
                         &mut routes,
-                        response.url(),
-                        remote_addr,
+                        HttpRetryRouteFailure::Response {
+                            status,
+                            response_url: response.url(),
+                            remote_addr,
+                        },
                         &route_failover.resolve,
                     ) {
                         Ok(has_routes) => advance_route = has_routes,
@@ -1109,9 +1157,11 @@ where
                 if route_failover.enabled {
                     let failed_url = e.url().cloned().or_else(|| Url::parse(url).ok());
                     if let Some(failed_url) = failed_url {
-                        match prepare_routes_after_transport_error(
+                        match prepare_http_retry_route(
                             &mut routes,
-                            &failed_url,
+                            HttpRetryRouteFailure::Transport {
+                                failed_url: &failed_url,
+                            },
                             &route_failover.resolve,
                         ) {
                             Ok(has_routes) => advance_route = has_routes,
