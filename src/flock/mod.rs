@@ -113,7 +113,10 @@ pub use primitives::{
 pub(crate) use acquire::acquire_flock_with_timeout;
 pub(crate) use holder::NO_HOLDERS_RECORDED;
 pub(crate) use mountinfo::read_mountinfo;
-pub(crate) use primitives::{InterruptibleFlockWaiter, materialize};
+pub(crate) use primitives::{
+    InterruptibleFlockWaiter, TryFlockOutcome, materialize, probe_flock_existing_read_only,
+    try_flock_with_witness,
+};
 pub(crate) use proc_locks::{read_holders, read_holders_with_mountinfo};
 
 /// Subdirectory name (under whatever root each caller picks) that

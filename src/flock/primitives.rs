@@ -1,6 +1,6 @@
 //! Kernel-syscall wrappers for `flock(2)` acquire/release.
 //!
-//! Three entry points, each gated through
+//! Five entry points, each gated through
 //! [`super::fs_filter::reject_remote_fs`] so a misconfigured lockfile
 //! path on NFS / CIFS / SMB2 / CephFS / AFS / FUSE surfaces actionably
 //! at open time rather than silently returning an unserialized fd:
@@ -13,14 +13,24 @@
 //!  - [`try_flock`] — non-blocking acquire. Returns `Ok(None)` on
 //!    `EWOULDBLOCK` so the caller can decide whether to retry, poll,
 //!    or surface contention.
+//!  - [`try_flock_with_witness`] — the same non-blocking acquire while
+//!    retaining the still-open writable fd on contention. Admission
+//!    callers may use that witness to order its `IN_CLOSE_WRITE` after
+//!    publishing their blocked state, avoiding an unnecessary UNKNOWN
+//!    observation and re-probe.
+//!  - [`probe_flock_existing_read_only`] — non-creating, read-only
+//!    observation of an existing lockfile. Its fd closes with
+//!    `IN_CLOSE_NOWRITE`, so a resource-release watcher can ignore
+//!    observation traffic.
 //!  - [`block_flock`] — blocking acquire. Parks the calling thread
 //!    in the kernel until the lock is available. Used after
 //!    [`try_flock`] returns `None` for callers that want to wait
 //!    indefinitely; callers with a deadline use
 //!    [`super::acquire::acquire_flock_with_timeout`] instead.
 //!
-//! All three open with `O_CREAT | O_RDWR | O_CLOEXEC | 0o666` so the
-//! resulting fd matches the rest of the crate's lockfile contract:
+//! The creating/writable entry points open with
+//! `O_CREAT | O_RDWR | O_CLOEXEC | 0o666` so the resulting fd matches
+//! the rest of the crate's lockfile contract:
 //!
 //!  - `O_CLOEXEC` keeps the lock from leaking across `exec(2)` into
 //!    spawned subprocesses (cargo subcommands, build pipeline,
@@ -29,7 +39,7 @@
 //!  - 0o666 mode matches a peer first-acquire so the file's owner
 //!    and permissions don't depend on creation order.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
@@ -44,10 +54,10 @@ use super::fs_filter::reject_remote_fs;
 /// Open a lockfile with the crate-wide flock contract: refuses
 /// remote filesystems via [`reject_remote_fs`], then opens with
 /// `O_CREAT | O_RDWR | O_CLOEXEC | 0o666`. The three module entry
-/// points ([`materialize`], [`try_flock`], [`block_flock`]) share
-/// this open shape; centralizing it here means a future flag change
-/// (or an addition to the remote-fs deny-list) lands in one place
-/// instead of drifting across three call sites.
+/// points ([`materialize`], [`try_flock_with_witness`] / [`try_flock`],
+/// and [`block_flock`]) share this open shape; centralizing it here
+/// means a future flag change (or an addition to the remote-fs
+/// deny-list) lands in one place instead of drifting across call sites.
 ///
 /// `O_CLOEXEC` is mandatory: a leaked fd across `exec(2)` (cargo
 /// subcommand, build-pipeline subprocess, initramfs compressor)
@@ -69,6 +79,39 @@ fn open_lockfile(path: &Path) -> Result<OwnedFd> {
     .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))
 }
 
+/// Result of a nonblocking flock attempt that preserves the opened fd in
+/// either case.
+///
+/// A contended fd owns no flock: the kernel rejected the requested operation
+/// with `EWOULDBLOCK`. Keeping that writable fd open is nevertheless useful to
+/// admission protocols. They may publish the corresponding blocked state
+/// first, then drop the witness so its `IN_CLOSE_WRITE` avoids an intervening
+/// UNKNOWN state and re-probe. Correctness does not depend on retaining it when
+/// the admission model durably records pending UNKNOWN resources.
+#[derive(Debug)]
+pub(crate) enum TryFlockOutcome {
+    /// The fd owns the requested flock until its last open-file-description
+    /// reference closes.
+    Acquired(OwnedFd),
+    /// The fd remains open but owns no flock.
+    Contended(OwnedFd),
+}
+
+/// Issue the common nonblocking flock operation against an already-open fd.
+fn try_flock_fd(path: &Path, fd: OwnedFd, mode: FlockMode) -> Result<TryFlockOutcome> {
+    use rustix::fs::{FlockOperation, flock};
+
+    let op = match mode {
+        FlockMode::Exclusive => FlockOperation::NonBlockingLockExclusive,
+        FlockMode::Shared => FlockOperation::NonBlockingLockShared,
+    };
+    match flock(&fd, op) {
+        Ok(()) => Ok(TryFlockOutcome::Acquired(fd)),
+        Err(e) if e == rustix::io::Errno::WOULDBLOCK => Ok(TryFlockOutcome::Contended(fd)),
+        Err(e) => anyhow::bail!("flock {}: {e}", path.display()),
+    }
+}
+
 /// Ensure the lockfile exists on disk without acquiring a lock.
 /// Used by the DISCOVER phase of `acquire_llc_plan` (see
 /// `discover_llc_snapshots` in `crate::vmm::host_topology`): the
@@ -85,6 +128,53 @@ pub(crate) fn materialize<P: AsRef<Path>>(path: P) -> Result<()> {
     let fd = open_lockfile(path.as_ref())?;
     drop(fd);
     Ok(())
+}
+
+/// Open a lockfile read-write and attempt a nonblocking flock without dropping
+/// the fd on contention.
+///
+/// This is the evidence-preserving form of [`try_flock`]. Both variants create
+/// a missing lockfile with the crate-wide `O_CREAT | O_RDWR | O_CLOEXEC`
+/// contract. The only difference is that this function returns
+/// [`TryFlockOutcome::Contended`] with the writable fd still open, allowing a
+/// caller to order its eventual close after a cross-process state publication
+/// when doing so avoids a conservative UNKNOWN re-probe.
+pub(crate) fn try_flock_with_witness<P: AsRef<Path>>(
+    path: P,
+    mode: FlockMode,
+) -> Result<TryFlockOutcome> {
+    let path = path.as_ref();
+    let fd = open_lockfile(path)?;
+    try_flock_fd(path, fd, mode)
+}
+
+/// Observe an existing lockfile with a read-only, nonblocking flock attempt.
+///
+/// Returns `Ok(None)` if the path does not exist and never creates it. An
+/// existing path returns the same acquired/contended outcome as
+/// [`try_flock_with_witness`], but the fd was opened `O_RDONLY | O_CLOEXEC`.
+/// Dropping either outcome therefore emits `IN_CLOSE_NOWRITE`, not
+/// `IN_CLOSE_WRITE`; coordinator watches interested in real holder releases can
+/// omit observation traffic at the kernel filter.
+///
+/// An `Acquired` result is an observational proof flock. A caller may retain it
+/// through publication of the proven state so that state remains true at the
+/// publication boundary, then drop it; it should not use this read-only probe
+/// as a long-lived resource reservation.
+pub(crate) fn probe_flock_existing_read_only<P: AsRef<Path>>(
+    path: P,
+    mode: FlockMode,
+) -> Result<Option<TryFlockOutcome>> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let path = path.as_ref();
+    reject_remote_fs(path)?;
+    let fd = match open(path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(e) if e == rustix::io::Errno::NOENT => return Ok(None),
+        Err(e) => return Err(anyhow::anyhow!("open existing {}: {e}", path.display())),
+    };
+    try_flock_fd(path, fd, mode).map(Some)
 }
 
 /// Open a lock file and attempt `flock` with `LOCK_NB`.
@@ -114,18 +204,15 @@ pub(crate) fn materialize<P: AsRef<Path>>(path: P) -> Result<()> {
 /// lockfile paths are built as `PathBuf` via `Path::join` — both
 /// pass straight through.
 pub fn try_flock<P: AsRef<Path>>(path: P, mode: FlockMode) -> Result<Option<OwnedFd>> {
-    use rustix::fs::{FlockOperation, flock};
-
-    let path = path.as_ref();
-    let fd = open_lockfile(path)?;
-    let op = match mode {
-        FlockMode::Exclusive => FlockOperation::NonBlockingLockExclusive,
-        FlockMode::Shared => FlockOperation::NonBlockingLockShared,
-    };
-    match flock(&fd, op) {
-        Ok(()) => Ok(Some(fd)),
-        Err(e) if e == rustix::io::Errno::WOULDBLOCK => Ok(None),
-        Err(e) => anyhow::bail!("flock {}: {e}", path.display()),
+    match try_flock_with_witness(path, mode)? {
+        TryFlockOutcome::Acquired(fd) => Ok(Some(fd)),
+        TryFlockOutcome::Contended(witness) => {
+            // Preserve the historical Option API: callers that do not
+            // participate in publication ordering intentionally discard the
+            // contended writable witness immediately.
+            drop(witness);
+            Ok(None)
+        }
     }
 }
 
@@ -142,7 +229,9 @@ pub fn block_flock<P: AsRef<Path>>(path: P, mode: FlockMode) -> Result<OwnedFd> 
         FlockMode::Exclusive => FlockOperation::LockExclusive,
         FlockMode::Shared => FlockOperation::LockShared,
     };
-    flock(&fd, op).map_err(|e| anyhow::anyhow!("flock (blocking) {}: {e}", path.display()))?;
+    flock(&fd, op)
+        .map_err(|errno| std::io::Error::from_raw_os_error(errno.raw_os_error()))
+        .with_context(|| format!("flock (blocking) {}", path.display()))?;
     Ok(fd)
 }
 
@@ -200,7 +289,7 @@ const NO_BROKER_EVENTFD: RawFd = -1;
 const CLOSING_BROKER_EVENTFD: RawFd = -2;
 const INTERRUPT_WAKE_RETRY: std::time::Duration = std::time::Duration::from_millis(2);
 
-/// The current cancellation-aware queue/head waiter.
+/// The current cancellation-aware registry ticket or coordinator.
 ///
 /// The public identity is a generation token, not the Linux TID. A retry
 /// queued for an old waiter can therefore never signal a later registration
@@ -494,7 +583,7 @@ fn next_interruptible_waiter_id() -> u32 {
     }
 }
 
-/// RAII registration for one cancellation-aware queue/head waiter.
+/// RAII registration for one cancellation-aware registry ticket/coordinator.
 ///
 /// The broker targets this registration's Linux TID only while its generation
 /// remains live. This value is deliberately `!Send`: its saved signal-mask
@@ -710,7 +799,7 @@ pub enum FlockWait {
 /// Returns:
 ///  - [`FlockWait::Granted`] when the lock is granted,
 ///  - [`FlockWait::Tick`] when `tick` elapses first (caller
-///    re-evaluates live state — e.g. a queue head re-scanning for a
+///    re-evaluates live state — e.g. a coordinator re-scanning for a
 ///    fully-free alternative target — then typically calls again),
 ///  - [`FlockWait::DeadlineExpired`] when `deadline` passes,
 ///  - `Err` on open / unexpected-errno failures.
@@ -779,6 +868,20 @@ pub fn block_flock_deadline<P: AsRef<Path>>(
 mod tests {
     use super::*;
 
+    fn fd_flags(fd: &OwnedFd) -> libc::c_int {
+        use std::os::fd::AsRawFd;
+
+        // SAFETY: `fd` is live for the duration of the accessor and F_GETFD
+        // neither mutates nor assumes ownership of it.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert!(
+            flags >= 0,
+            "fcntl F_GETFD must succeed on a live fd; got errno={}",
+            std::io::Error::last_os_error(),
+        );
+        flags
+    }
+
     /// [`try_flock`] sets `O_CLOEXEC` on the returned fd. Earlier
     /// revisions missed this flag, which leaked flock-held fds
     /// through `execve` into child processes — the child inherited
@@ -819,6 +922,198 @@ mod tests {
         );
 
         drop(fd);
+    }
+
+    /// The evidence-preserving acquire keeps a real O_RDWR fd alive after
+    /// EWOULDBLOCK, with CLOEXEC set, but that witness owns no flock. Releasing
+    /// the real holder while the witness stays open must therefore let a third
+    /// fd acquire immediately. Dropping the witness cannot release the third
+    /// fd's independent flock.
+    #[test]
+    fn contended_witness_is_writable_cloexec_and_owns_no_flock() {
+        use std::os::fd::AsRawFd;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("witness.lock");
+        let peer = try_flock(&path, FlockMode::Exclusive)
+            .expect("open peer")
+            .expect("peer EX on fresh file");
+        let witness = match try_flock_with_witness(&path, FlockMode::Exclusive)
+            .expect("contended probe")
+        {
+            TryFlockOutcome::Contended(fd) => fd,
+            TryFlockOutcome::Acquired(_) => panic!("peer EX must force a contended witness"),
+        };
+
+        assert_eq!(
+            fd_flags(&witness) & libc::FD_CLOEXEC,
+            libc::FD_CLOEXEC,
+            "a retained witness must not leak through exec",
+        );
+        // SAFETY: witness is a live O_RDWR fd. Writing one byte demonstrates
+        // the access mode directly without changing fd ownership.
+        let byte = b"x";
+        let written = unsafe {
+            libc::write(
+                witness.as_raw_fd(),
+                byte.as_ptr().cast::<libc::c_void>(),
+                byte.len(),
+            )
+        };
+        assert_eq!(
+            written,
+            byte.len() as libc::ssize_t,
+            "the contended witness must remain open and writable: {}",
+            std::io::Error::last_os_error(),
+        );
+
+        drop(peer);
+        let successor = try_flock(&path, FlockMode::Exclusive)
+            .expect("successor probe")
+            .expect("an open contended witness owns no flock");
+
+        drop(witness);
+        assert!(
+            try_flock(&path, FlockMode::Exclusive)
+                .expect("probe against successor")
+                .is_none(),
+            "dropping a non-owning witness must not release the successor's flock",
+        );
+        drop(successor);
+    }
+
+    /// A read-only observation never creates a missing lockfile. On an
+    /// existing contended inode it returns a CLOEXEC O_RDONLY witness, which is
+    /// the flag-level guarantee that its close is IN_CLOSE_NOWRITE and cannot
+    /// masquerade as a resource-holder release.
+    #[test]
+    fn read_only_existing_probe_does_not_create_and_uses_read_only_cloexec_fd() {
+        use std::os::fd::AsRawFd;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("observe.lock");
+        assert!(
+            probe_flock_existing_read_only(&path, FlockMode::Exclusive)
+                .expect("missing observation")
+                .is_none(),
+            "a missing existing-only probe must report no inode",
+        );
+        assert!(
+            !path.exists(),
+            "a read-only existing-file probe must never create the lockfile",
+        );
+
+        let peer = try_flock(&path, FlockMode::Exclusive)
+            .expect("open peer")
+            .expect("peer EX on fresh file");
+        let witness = match probe_flock_existing_read_only(&path, FlockMode::Exclusive)
+            .expect("existing observation")
+            .expect("peer materialized the inode")
+        {
+            TryFlockOutcome::Contended(fd) => fd,
+            TryFlockOutcome::Acquired(_) => panic!("peer EX must force read-only contention"),
+        };
+        assert_eq!(
+            fd_flags(&witness) & libc::FD_CLOEXEC,
+            libc::FD_CLOEXEC,
+            "read-only observation fd must not leak through exec",
+        );
+        // SAFETY: F_GETFL is a read-only query on a live fd.
+        let status = unsafe { libc::fcntl(witness.as_raw_fd(), libc::F_GETFL) };
+        assert!(status >= 0, "F_GETFL failed: {}", std::io::Error::last_os_error());
+        assert_eq!(
+            status & libc::O_ACCMODE,
+            libc::O_RDONLY,
+            "observation fd must be O_RDONLY so close is IN_CLOSE_NOWRITE",
+        );
+
+        drop(peer);
+        let successor = try_flock(&path, FlockMode::Exclusive)
+            .expect("successor probe")
+            .expect("read-only contended witness owns no flock");
+        drop(witness);
+        drop(successor);
+    }
+
+    /// Linux permits an exclusive flock on an O_RDONLY descriptor. The
+    /// admission observer relies on that property to prove a free existing
+    /// resource without opening it writable (and therefore without emitting
+    /// IN_CLOSE_WRITE when the proof fd is dropped).
+    #[test]
+    fn read_only_existing_probe_acquires_exclusive_on_free_local_inode() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("read-only-exclusive.lock");
+        materialize(&path).expect("materialize existing local inode");
+
+        let proof = probe_flock_existing_read_only(&path, FlockMode::Exclusive)
+            .expect("read-only exclusive probe")
+            .expect("materialized inode must exist");
+        match proof {
+            TryFlockOutcome::Acquired(fd) => drop(fd),
+            TryFlockOutcome::Contended(_) => {
+                panic!("a free local inode must grant EX through an O_RDONLY fd")
+            }
+        }
+    }
+
+    /// Pin the flock compatibility matrix used when admission falls back to
+    /// read-only observation of LLC availability:
+    ///
+    /// - a live SH holder admits another SH proof but rejects EX;
+    /// - a live EX holder rejects both SH and EX.
+    ///
+    /// Each probe uses its own open-file description, so the result exercises
+    /// kernel compatibility rather than recursive locking on one fd.
+    #[test]
+    fn read_only_existing_probe_matches_shared_exclusive_llc_matrix() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("read-only-matrix.lock");
+
+        let shared_peer = try_flock(&path, FlockMode::Shared)
+            .expect("open shared peer")
+            .expect("first SH must acquire");
+        let shared_proof = probe_flock_existing_read_only(&path, FlockMode::Shared)
+            .expect("read-only SH probe")
+            .expect("shared peer materialized the inode");
+        let shared_proof = match shared_proof {
+            TryFlockOutcome::Acquired(fd) => fd,
+            TryFlockOutcome::Contended(_) => {
+                panic!("SH must remain compatible with a peer SH holder")
+            }
+        };
+        match probe_flock_existing_read_only(&path, FlockMode::Exclusive)
+            .expect("read-only EX probe against SH")
+            .expect("inode exists")
+        {
+            TryFlockOutcome::Contended(fd) => drop(fd),
+            TryFlockOutcome::Acquired(_) => {
+                panic!("EX must conflict with live SH holders")
+            }
+        }
+        drop(shared_proof);
+        drop(shared_peer);
+
+        let exclusive_peer = try_flock(&path, FlockMode::Exclusive)
+            .expect("open exclusive peer")
+            .expect("EX must acquire after every SH proof drops");
+        for mode in [FlockMode::Shared, FlockMode::Exclusive] {
+            match probe_flock_existing_read_only(&path, mode)
+                .expect("read-only probe against EX")
+                .expect("inode exists")
+            {
+                TryFlockOutcome::Contended(fd) => drop(fd),
+                TryFlockOutcome::Acquired(_) => {
+                    panic!("{mode:?} must conflict with a live EX holder")
+                }
+            }
+        }
+        drop(exclusive_peer);
     }
 
     /// `block_flock_step` tri-state contract: while a peer holds
