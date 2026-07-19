@@ -318,12 +318,6 @@ fn parsed_prebuilt_blob_stamp<'a>(
     Some((source_revision, content_key, len, identity))
 }
 
-#[cfg(any(feature = "wprof", test))]
-fn is_prebuilt_blob_stamp(stamp: &str, blob_name: &str, source_revision: &str) -> bool {
-    parsed_prebuilt_blob_stamp(stamp, blob_name)
-        .is_some_and(|(revision, _, _, _)| revision == source_revision)
-}
-
 fn reuse_prebuilt_blob_without_source(
     stamp_path: &std::path::Path,
     dest: &std::path::Path,
@@ -682,12 +676,10 @@ mod tests {
             b"BUSYBOX-BINARY-BYTES",
             "dest must hold the source bytes verbatim",
         );
+        let installed_stamp = std::fs::read_to_string(stamp).expect("read content stamp");
         assert!(
-            is_prebuilt_blob_stamp(
-                &std::fs::read_to_string(stamp).expect("read content stamp"),
-                "busybox",
-                "test-revision",
-            ),
+            parsed_prebuilt_blob_stamp(&installed_stamp, "busybox")
+                .is_some_and(|(revision, _, _, _)| revision == "test-revision"),
             "installed bytes must carry the content-addressed handoff stamp",
         );
     }
@@ -781,12 +773,10 @@ mod tests {
                 PrebuiltBlobStatus::Reused,
                 "{blob_name}: a pin update with identical bytes only needs a re-stamp",
             );
+            let rekeyed_stamp = std::fs::read_to_string(&stamp).expect("read re-keyed stamp");
             assert!(
-                is_prebuilt_blob_stamp(
-                    &std::fs::read_to_string(&stamp).expect("read re-keyed stamp"),
-                    blob_name,
-                    "next-test-revision",
-                ),
+                parsed_prebuilt_blob_stamp(&rekeyed_stamp, blob_name)
+                    .is_some_and(|(revision, _, _, _)| revision == "next-test-revision"),
                 "{blob_name}: the sidecar must carry the current logical source revision",
             );
             #[cfg(unix)]
