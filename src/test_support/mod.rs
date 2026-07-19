@@ -160,9 +160,10 @@ pub use entry::{
     BinaryKindJson, BpfMapAgg, BpfMapWrite, CgroupPath, KTSTR_SCHEDULERS, KTSTR_TESTS,
     KtstrTestEntry, MemSideCache, NumaDistance, NumaNode, PerfDeltaAssertion, Scheduler,
     SchedulerArtifactRequirement, SchedulerJson, SchedulerListEntry, SchedulerSpec,
-    SchedulerTestJson, Sysctl, SysctlJson, Topology, TopologyConstraints,
-    TopologyConstraintsJson, TopologyJson, WatchBpfMap, default_post_vm_periodic_fired,
-    find_scheduler, find_test,
+    SchedulerManifestProbe, SchedulerTestJson, Sysctl, SysctlJson, Topology,
+    TopologyConstraints, TopologyConstraintsJson, TopologyJson, WatchBpfMap,
+    SCHEDULER_MANIFEST_PROBE_ARG, default_post_vm_periodic_fired, find_scheduler,
+    find_test,
 };
 pub use eval::{KernelUnavailable, ResolveSource, resolve_scheduler, resolve_test_kernel};
 pub(crate) use eval::{record_skip_sidecar, run_ktstr_test_inner};

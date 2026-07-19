@@ -114,6 +114,12 @@ struct TestBinarySchedulerDeclarations {
 }
 
 #[derive(Debug)]
+struct TestBinarySchedulerManifest {
+    executable: PathBuf,
+    manifest: ktstr::test_support::SchedulerManifestProbe,
+}
+
+#[derive(Debug)]
 struct SelectedSchedulerPlan {
     schedulers: Vec<ktstr::test_support::SchedulerJson>,
     discover_requests: Vec<DiscoverSchedulerRequest>,
@@ -772,27 +778,180 @@ fn probe_dylib_path(
     Ok(Some((variable, value)))
 }
 
-fn probe_scheduler_declarations(
+const SCHEDULER_PROBE_CHILD_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+struct SchedulerProbeObserver {
+    deadline: std::time::Instant,
+    timeout_error: String,
+}
+
+impl SchedulerProbeObserver {
+    fn new(
+        description: &str,
+        binary: &Path,
+        timeout: std::time::Duration,
+    ) -> Self {
+        Self {
+            deadline: std::time::Instant::now() + timeout,
+            timeout_error: format!(
+                "{description} probe in {} exceeded {:.1}s; its complete descendant \
+                 subtree was terminated",
+                binary.display(),
+                timeout.as_secs_f64(),
+            ),
+        }
+    }
+
+    fn cancellation_error_at(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<std::io::Error> {
+        scheduler_probe_cancellation_error(self.deadline, now, &self.timeout_error)
+    }
+}
+
+fn scheduler_probe_cancellation_error(
+    deadline: std::time::Instant,
+    now: std::time::Instant,
+    diagnostic: &str,
+) -> Option<std::io::Error> {
+    (now >= deadline).then(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            diagnostic.to_string(),
+        )
+    })
+}
+
+impl crate::interrupt::StdoutObserver for SchedulerProbeObserver {
+    fn observe_stdout(&mut self, _bytes: &[u8]) {}
+
+    fn tick(&mut self) {}
+
+    fn next_tick_in(&self) -> std::time::Duration {
+        self.deadline
+            .saturating_duration_since(std::time::Instant::now())
+    }
+
+    fn cancellation_error(&mut self) -> Option<std::io::Error> {
+        self.cancellation_error_at(std::time::Instant::now())
+    }
+
+    fn finished(&mut self, _status: &std::process::ExitStatus) {}
+
+    fn failed(&mut self, _error: &std::io::Error) {}
+}
+
+fn collect_scheduler_probe_outputs<T>(
+    bins: &[PathBuf],
+    configure_cmd: impl Fn(&Path) -> Command,
+    on_success: impl Fn(&Path, &std::process::Output) -> Result<T, String>,
+    mut run: impl FnMut(&Path, Command) -> std::io::Result<std::process::Output>,
+    mut item_finished: impl FnMut(bool),
+) -> Result<Vec<T>, String> {
+    if bins.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut collected = Vec::new();
+    for binary in bins {
+        let output = match run(binary, configure_cmd(binary)) {
+            Ok(output) => output,
+            Err(error) => {
+                item_finished(false);
+                return Err(format!(
+                    "exec scheduler probe {}: {error}",
+                    binary.display(),
+                ));
+            }
+        };
+        if output.status.success() {
+            match on_success(binary, &output) {
+                Ok(value) => {
+                    collected.push(value);
+                    item_finished(true);
+                }
+                Err(error) => {
+                    item_finished(false);
+                    return Err(error);
+                }
+            }
+        } else if output.status.code().is_none() {
+            item_finished(false);
+            return Err(format!(
+                "scheduler probe {} terminated by {}",
+                binary.display(),
+                output.status,
+            ));
+        } else {
+            // A test binary which does not link the probe ctor is an ordinary
+            // miss, not a failed work item.
+            item_finished(true);
+        }
+    }
+    Ok(collected)
+}
+
+fn probe_collect_from_bins_bounded<T>(
+    bins: &[PathBuf],
+    description: &str,
+    configure_cmd: impl Fn(&Path) -> Command,
+    on_success: impl Fn(&Path, &std::process::Output) -> Result<T, String>,
+) -> Result<Vec<T>, String> {
+    if bins.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut progress = crate::run_cargo::ItemProgress::start(
+        &format!("cargo ktstr: probing {description}"),
+        bins.len(),
+    );
+    let result = collect_scheduler_probe_outputs(
+        bins,
+        configure_cmd,
+        on_success,
+        |binary, command| {
+            let observer = SchedulerProbeObserver::new(
+                description,
+                binary,
+                SCHEDULER_PROBE_CHILD_TIMEOUT,
+            );
+            crate::interrupt::run_output_observed_anchored(command, observer)
+        },
+        |success| progress.item_finished(success),
+    );
+    match &result {
+        Err(error) => progress.finish_error(error),
+        Ok(_) => progress.finish_success(),
+    }
+    result
+}
+
+fn probe_scheduler_manifests(
     test_bins: &[PathBuf],
     loader_paths: &[PathBuf],
-    probe_provenance: &HashMap<PathBuf, PathBuf>,
-) -> Result<Vec<TestBinarySchedulerDeclarations>, String> {
+    probe_provenance: Option<&HashMap<PathBuf, PathBuf>>,
+) -> Result<Vec<TestBinarySchedulerManifest>, String> {
     if test_bins.is_empty() {
         return Ok(Vec::new());
     }
     let dylib_path = probe_dylib_path(loader_paths)?;
     let profile_dir = tempfile::Builder::new()
-        .prefix("ktstr-scheduler-probe-profraw-")
+        .prefix("ktstr-scheduler-manifest-probe-profraw-")
         .tempdir()
-        .map_err(|error| format!("create temporary scheduler-probe profile directory: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "create temporary scheduler-manifest probe profile directory: {error}"
+            )
+        })?;
     let profile_pattern = profile_dir.path().join("probe-%p-%m.profraw");
-    let mut per_binary: Vec<TestBinarySchedulerDeclarations> =
-        match crate::misc::probe_collect_from_bins(
+    let mut per_binary: Vec<TestBinarySchedulerManifest> =
+        probe_collect_from_bins_bounded(
             test_bins,
+            "warmed test binaries for scheduler manifests",
             |bin| {
                 let mut command = Command::new(bin);
                 command
-                    .arg("--ktstr-list-schedulers")
+                    .arg(ktstr::test_support::SCHEDULER_MANIFEST_PROBE_ARG)
                     .env("LLVM_PROFILE_FILE", &profile_pattern);
                 if let Some((variable, value)) = &dylib_path {
                     command.env(variable, value);
@@ -800,44 +959,58 @@ fn probe_scheduler_declarations(
                 command
             },
             |bin, output| {
-                let declarations = serde_json::from_slice(&output.stdout).map_err(|error| {
+                let manifest = serde_json::from_slice(&output.stdout).map_err(|error| {
                     format!(
-                        "parse --ktstr-list-schedulers output from {}: {error}",
+                        "parse --ktstr-list-scheduler-manifest output from {}: {error}",
                         bin.display()
                     )
                 })?;
-                let executable = if let Some(source) = probe_provenance.get(bin) {
-                    source.clone()
-                } else {
-                    std::fs::canonicalize(bin).map_err(|error| {
+                let executable = if let Some(provenance) = probe_provenance {
+                    provenance.get(bin).cloned().ok_or_else(|| {
                         format!(
-                            "canonicalize warmed test executable {} after scheduler probe: \
-                             {error}",
-                            bin.display()
+                            "scheduler-manifest probe path {} has no warmed Cargo \
+                             executable provenance",
+                            bin.display(),
                         )
                     })?
+                } else {
+                    // Artifact preparation only consumes the manifest payload.
+                    // Preserve descriptor-backed paths verbatim rather than
+                    // resolving `/proc/self/fd/N` after Cargo may have
+                    // replaced the ordinary target pathname.
+                    bin.to_path_buf()
                 };
-                Ok(TestBinarySchedulerDeclarations {
+                Ok(TestBinarySchedulerManifest {
                     executable,
-                    declarations,
+                    manifest,
                 })
             },
-        ) {
-            Ok(entries) => entries,
-            // None of the warmed executables linked the scheduler-list ctor.
-            // Preserve verifier's established zero-cell diagnosis instead of
-            // turning "no declare_scheduler!" into a probe setup failure.
-            Err(crate::misc::ProbeError::Miss(_)) => Vec::new(),
-            Err(error @ crate::misc::ProbeError::Setup(_)) => {
-                return Err(format!(
-                    "probe warmed test binaries for declared schedulers: {error:?}"
-                ));
-            }
-        };
+        )
+        .map_err(|error| {
+            format!("probe warmed test binaries for scheduler manifests: {error}")
+        })?;
     per_binary.sort_by(|left, right| left.executable.cmp(&right.executable));
     let mut seen = HashSet::new();
     per_binary.retain(|binary| seen.insert(binary.executable.clone()));
     Ok(per_binary)
+}
+
+fn probe_scheduler_declarations(
+    test_bins: &[PathBuf],
+    loader_paths: &[PathBuf],
+    probe_provenance: &HashMap<PathBuf, PathBuf>,
+) -> Result<Vec<TestBinarySchedulerDeclarations>, String> {
+    probe_scheduler_manifests(test_bins, loader_paths, Some(probe_provenance)).map(
+        |manifests| {
+            manifests
+                .into_iter()
+                .map(|binary| TestBinarySchedulerDeclarations {
+                    executable: binary.executable,
+                    declarations: binary.manifest.declarations,
+                })
+                .collect()
+        },
+    )
 }
 
 fn probe_scheduler_artifact_requirements(
@@ -847,46 +1020,7 @@ fn probe_scheduler_artifact_requirements(
     if test_bins.is_empty() {
         return Ok(Vec::new());
     }
-    let dylib_path = probe_dylib_path(loader_paths)?;
-    let profile_dir = tempfile::Builder::new()
-        .prefix("ktstr-scheduler-requirements-profraw-")
-        .tempdir()
-        .map_err(|error| {
-            format!("create temporary scheduler-requirements profile directory: {error}")
-        })?;
-    let profile_pattern = profile_dir.path().join("probe-%p-%m.profraw");
-    let per_binary: Vec<Vec<ktstr::test_support::SchedulerArtifactRequirement>> =
-        match crate::misc::probe_collect_from_bins(
-            test_bins,
-            |bin| {
-                let mut command = Command::new(bin);
-                command
-                    .arg("--ktstr-list-scheduler-artifact-requirements")
-                    .env("LLVM_PROFILE_FILE", &profile_pattern);
-                if let Some((variable, value)) = &dylib_path {
-                    command.env(variable, value);
-                }
-                command
-            },
-            |bin, output| {
-                serde_json::from_slice(&output.stdout).map_err(|error| {
-                    format!(
-                        "parse --ktstr-list-scheduler-artifact-requirements output \
-                         from {}: {error}",
-                        bin.display()
-                    )
-                })
-            },
-        ) {
-            Ok(entries) => entries,
-            Err(crate::misc::ProbeError::Miss(_)) => Vec::new(),
-            Err(error @ crate::misc::ProbeError::Setup(_)) => {
-                return Err(format!(
-                    "probe warmed test binaries for scheduler artifact requirements: \
-                     {error:?}"
-                ));
-            }
-        };
+    let per_binary = probe_scheduler_manifests(test_bins, loader_paths, None)?;
 
     struct RequirementAccumulator {
         binary_kind: ktstr::test_support::BinaryKindJson,
@@ -895,7 +1029,10 @@ fn probe_scheduler_artifact_requirements(
         use_count: usize,
     }
     let mut merged: BTreeMap<(u8, String, String), RequirementAccumulator> = BTreeMap::new();
-    for requirement in per_binary.into_iter().flatten() {
+    for requirement in per_binary
+        .into_iter()
+        .flat_map(|binary| binary.manifest.artifact_requirements)
+    {
         let (kind_order, value) = match &requirement.binary_kind {
             ktstr::test_support::BinaryKindJson::Discover(value) => (0, value.clone()),
             ktstr::test_support::BinaryKindJson::Path(value) => (1, value.clone()),
@@ -2198,6 +2335,142 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn probe_output(code: i32, stdout: &[u8], stderr: &[u8]) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        }
+    }
+
+    #[test]
+    fn scheduler_probe_deadline_boundary_and_diagnostic_are_deterministic() {
+        let deadline = std::time::Instant::now();
+        assert!(
+            scheduler_probe_cancellation_error(
+                deadline,
+                deadline - std::time::Duration::from_nanos(1),
+                "probe deadline",
+            )
+            .is_none(),
+        );
+        let error =
+            scheduler_probe_cancellation_error(deadline, deadline, "probe deadline")
+                .expect("the exact deadline cancels");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "probe deadline");
+    }
+
+    #[test]
+    fn scheduler_probe_core_visits_each_binary_once_in_order() {
+        let bins = vec![
+            PathBuf::from("/fake/a"),
+            PathBuf::from("/fake/b"),
+            PathBuf::from("/fake/c"),
+        ];
+        let visited = std::cell::RefCell::new(Vec::new());
+        let outcomes = std::cell::RefCell::new(Vec::new());
+        let values = collect_scheduler_probe_outputs(
+            &bins,
+            |binary| Command::new(binary),
+            |binary, output| {
+                assert_eq!(output.stdout, b"hit");
+                Ok(binary.to_path_buf())
+            },
+            |binary, _command| {
+                visited.borrow_mut().push(binary.to_path_buf());
+                let code = if binary.ends_with("a") { 1 } else { 0 };
+                Ok(probe_output(code, b"hit", b"miss"))
+            },
+            |success| outcomes.borrow_mut().push(success),
+        )
+        .expect("deterministic probe succeeds");
+        assert_eq!(*visited.borrow(), bins);
+        assert_eq!(*outcomes.borrow(), [true, true, true]);
+        assert_eq!(values, bins[1..]);
+    }
+
+    #[test]
+    fn scheduler_probe_core_stops_on_runner_error_with_binary_context() {
+        let bins = vec![
+            PathBuf::from("/fake/a"),
+            PathBuf::from("/fake/b"),
+            PathBuf::from("/fake/c"),
+        ];
+        let visited = std::cell::RefCell::new(Vec::new());
+        let outcomes = std::cell::RefCell::new(Vec::new());
+        let error = collect_scheduler_probe_outputs(
+            &bins,
+            |binary| Command::new(binary),
+            |_binary, _output| Ok(()),
+            |binary, _command| {
+                visited.borrow_mut().push(binary.to_path_buf());
+                if binary.ends_with("b") {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "complete subtree terminated",
+                    ))
+                } else {
+                    Ok(probe_output(1, b"", b"miss"))
+                }
+            },
+            |success| outcomes.borrow_mut().push(success),
+        )
+        .expect_err("runner failure is terminal");
+        assert_eq!(*visited.borrow(), bins[..2]);
+        assert_eq!(*outcomes.borrow(), [true, false]);
+        assert_eq!(
+            error,
+            "exec scheduler probe /fake/b: complete subtree terminated",
+        );
+    }
+
+    #[test]
+    fn scheduler_probe_core_rejects_signal_exit_with_binary_context() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let bins = vec![PathBuf::from("/fake/signaled")];
+        let outcomes = std::cell::RefCell::new(Vec::new());
+        let signal_status = std::process::ExitStatus::from_raw(libc::SIGKILL);
+        let expected = format!(
+            "scheduler probe /fake/signaled terminated by {signal_status}"
+        );
+        let error = collect_scheduler_probe_outputs(
+            &bins,
+            |binary| Command::new(binary),
+            |_binary, _output| Ok(()),
+            |_binary, _command| {
+                Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(libc::SIGKILL),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            },
+            |success| outcomes.borrow_mut().push(success),
+        )
+        .expect_err("signal termination is not an ordinary unlinked-ctor miss");
+        assert_eq!(error, expected);
+        assert_eq!(*outcomes.borrow(), [false]);
+    }
+
+    #[test]
+    fn scheduler_probe_core_counts_decode_failure_as_failed_item() {
+        let bins = vec![PathBuf::from("/fake/malformed")];
+        let outcomes = std::cell::RefCell::new(Vec::new());
+        let error = collect_scheduler_probe_outputs(
+            &bins,
+            |binary| Command::new(binary),
+            |_binary, _output| Err::<(), _>("malformed scheduler manifest".to_string()),
+            |_binary, _command| Ok(probe_output(0, b"not-json", b"")),
+            |success| outcomes.borrow_mut().push(success),
+        )
+        .expect_err("decode failure is terminal");
+        assert_eq!(error, "malformed scheduler manifest");
+        assert_eq!(*outcomes.borrow(), [false]);
     }
 
     fn discover_declaration(

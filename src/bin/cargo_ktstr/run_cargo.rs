@@ -2543,20 +2543,282 @@ pub(crate) fn run_reserved_prebuild_collect_test_bins(
     )
 }
 
+const ITEM_PROGRESS_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ItemProgressSnapshot {
+    completed: usize,
+    failed: usize,
+}
+
+struct ItemProgressState {
+    completed: std::sync::atomic::AtomicUsize,
+    failed: std::sync::atomic::AtomicUsize,
+    finished: std::sync::Mutex<bool>,
+    finish_wake: std::sync::Condvar,
+}
+
+impl ItemProgressState {
+    fn new() -> Self {
+        Self {
+            completed: std::sync::atomic::AtomicUsize::new(0),
+            failed: std::sync::atomic::AtomicUsize::new(0),
+            finished: std::sync::Mutex::new(false),
+            finish_wake: std::sync::Condvar::new(),
+        }
+    }
+
+    fn record(&self, success: bool) -> ItemProgressSnapshot {
+        use std::sync::atomic::Ordering;
+
+        if !success {
+            self.failed.fetch_add(1, Ordering::Relaxed);
+        }
+        self.completed.fetch_add(1, Ordering::Release);
+        self.snapshot()
+    }
+
+    fn snapshot(&self) -> ItemProgressSnapshot {
+        use std::sync::atomic::Ordering;
+
+        ItemProgressSnapshot {
+            completed: self.completed.load(Ordering::Acquire),
+            failed: self.failed.load(Ordering::Relaxed),
+        }
+    }
+
+    fn wait_until_finished(&self, deadline: std::time::Instant) -> bool {
+        let finished = self
+            .finished
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let wait = deadline.saturating_duration_since(std::time::Instant::now());
+        let (finished, _) = self
+            .finish_wake
+            .wait_timeout_while(finished, wait, |finished| !*finished)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *finished
+    }
+
+    fn mark_finished(&self) {
+        let mut finished = self
+            .finished
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *finished = true;
+        self.finish_wake.notify_all();
+    }
+}
+
+/// Shared progress for bounded item sets whose workers may all be silent.
+///
+/// TTY callers receive a live item bar. Non-TTY callers receive an immediate
+/// start line, ten-second heartbeats from one sleeping reporter thread, and an
+/// exact terminal line. Item completion itself is only two atomic increments
+/// and never serializes the Rayon workers or sequential probe loop.
+pub(crate) struct ItemProgress {
+    label: String,
+    total: usize,
+    started: std::time::Instant,
+    state: std::sync::Arc<ItemProgressState>,
+    tty: Option<indicatif::ProgressBar>,
+    reporter: Option<std::thread::JoinHandle<()>>,
+    terminal: bool,
+}
+
+impl ItemProgress {
+    pub(crate) fn start(label: &str, total: usize) -> Self {
+        use std::io::IsTerminal as _;
+        use std::sync::Arc;
+
+        let label = escape_progress_text(label);
+        let started = std::time::Instant::now();
+        let state = Arc::new(ItemProgressState::new());
+        if std::io::stderr().is_terminal() {
+            let bar = indicatif::ProgressBar::new(total as u64);
+            bar.set_draw_target(indicatif::ProgressDrawTarget::stderr());
+            bar.set_style(
+                indicatif::ProgressStyle::with_template(
+                    "{spinner:.cyan} {msg} [{bar:32.cyan/blue}] {pos}/{len} \
+                     [{elapsed_precise}]",
+                )
+                .expect("item progress template is valid"),
+            );
+            if !bar.is_hidden() {
+                bar.set_message(label.clone());
+                bar.tick();
+                bar.enable_steady_tick(std::time::Duration::from_millis(80));
+                return Self {
+                    label,
+                    total,
+                    started,
+                    state,
+                    tty: Some(bar),
+                    reporter: None,
+                    terminal: false,
+                };
+            }
+        }
+
+        eprintln!("{label}: starting; total={total}");
+        let reporter_state = Arc::clone(&state);
+        let reporter_label = label.clone();
+        let reporter = std::thread::Builder::new()
+            .name("ktstr-item-progress".to_string())
+            .spawn(move || {
+                let mut next_heartbeat = started + ITEM_PROGRESS_HEARTBEAT;
+                loop {
+                    if reporter_state.wait_until_finished(next_heartbeat) {
+                        break;
+                    }
+                    let now = std::time::Instant::now();
+                    let snapshot = reporter_state.snapshot();
+                    eprintln!(
+                        "{}",
+                        item_progress_line(
+                            &reporter_label,
+                            total,
+                            snapshot,
+                            now.saturating_duration_since(started),
+                            "working",
+                            None,
+                        ),
+                    );
+                    next_heartbeat = now + ITEM_PROGRESS_HEARTBEAT;
+                }
+            })
+            .map_err(|error| {
+                eprintln!(
+                    "{label}: could not start progress heartbeat thread: {}",
+                    escape_progress_text(&error.to_string()),
+                );
+            })
+            .ok();
+        Self {
+            label,
+            total,
+            started,
+            state,
+            tty: None,
+            reporter,
+            terminal: false,
+        }
+    }
+
+    pub(crate) fn item_finished(&self, success: bool) {
+        let snapshot = self.state.record(success);
+        if let Some(bar) = &self.tty {
+            bar.set_position(snapshot.completed.min(self.total) as u64);
+            bar.set_message(format!(
+                "{} — {} failed",
+                self.label, snapshot.failed,
+            ));
+        }
+    }
+
+    pub(crate) fn finish_success(&mut self) {
+        self.finish("completed", None);
+    }
+
+    pub(crate) fn finish_error(&mut self, error: &str) {
+        self.finish("failed", Some(error));
+    }
+
+    fn finish(&mut self, phase: &str, detail: Option<&str>) {
+        if self.terminal {
+            return;
+        }
+        self.state.mark_finished();
+        if let Some(reporter) = self.reporter.take() {
+            let _ = reporter.join();
+        }
+        let message = item_progress_line(
+            &self.label,
+            self.total,
+            self.state.snapshot(),
+            self.started.elapsed(),
+            phase,
+            detail,
+        );
+        if let Some(bar) = self.tty.take() {
+            if phase == "completed" {
+                bar.finish_with_message(message);
+            } else {
+                bar.abandon_with_message(message);
+            }
+        } else {
+            eprintln!("{message}");
+        }
+        self.terminal = true;
+    }
+}
+
+impl Drop for ItemProgress {
+    fn drop(&mut self) {
+        if !self.terminal {
+            self.finish("stopped", Some("progress owner dropped before terminal outcome"));
+        }
+    }
+}
+
+fn item_progress_line(
+    label: &str,
+    total: usize,
+    snapshot: ItemProgressSnapshot,
+    elapsed: std::time::Duration,
+    phase: &str,
+    detail: Option<&str>,
+) -> String {
+    let mut line = format!(
+        "{label}: {phase}; completed={}/{}; failed={}; elapsed={}",
+        snapshot.completed,
+        total,
+        snapshot.failed,
+        format_progress_elapsed(elapsed),
+    );
+    if let Some(detail) = detail {
+        line.push_str("; error=");
+        line.push_str(&escape_progress_text(detail));
+    }
+    line
+}
+
+fn format_progress_elapsed(elapsed: std::time::Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds >= 60 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    }
+}
+
+fn escape_progress_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 /// Precompute cast analysis for exact declaration-derived scheduler
 /// artifacts so the first test needing one does not pay the analysis cost.
 pub(crate) fn precompute_cast_cache(binaries: &[std::path::PathBuf]) -> Result<(), String> {
     if binaries.is_empty() {
         return Ok(());
     }
-    eprintln!(
-        "cargo ktstr: precomputing cast analysis for {} scheduler binaries",
-        binaries.len()
+    let mut progress = ItemProgress::start(
+        "cargo ktstr: precomputing cast analysis for scheduler binaries",
+        binaries.len(),
     );
     let configured_limit = std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(1);
-    precompute_cast_paths_with_pool_builder(
+    let result = precompute_cast_paths_with_pool_builder(
         binaries,
         configured_limit,
         |threads| {
@@ -2566,11 +2828,18 @@ pub(crate) fn precompute_cast_cache(binaries: &[std::path::PathBuf]) -> Result<(
                 .map_err(|error| error.to_string())
         },
         |path| {
-            ktstr::precompute_cast_analysis(path).map_err(|error| {
+            let result = ktstr::precompute_cast_analysis(path).map_err(|error| {
                 format!("precompute cast analysis for {}: {error:#}", path.display())
-            })
+            });
+            progress.item_finished(result.is_ok());
+            result
         },
-    )
+    );
+    match &result {
+        Ok(()) => progress.finish_success(),
+        Err(error) => progress.finish_error(error),
+    }
+    result
 }
 
 /// Analyze a prepared scheduler set under a work-sized private pool and wait
@@ -4657,6 +4926,57 @@ mod tests {
             Some(expected),
             "a relative CARGO_TARGET_DIR must be anchored to the orchestrator cwd \
              and exported absolute, not skipped",
+        );
+    }
+
+    #[test]
+    fn item_progress_accounting_and_rendering_are_deterministic() {
+        let state = ItemProgressState::new();
+        assert!(
+            !state.wait_until_finished(std::time::Instant::now()),
+            "an unfinished reporter times out instead of inventing completion",
+        );
+        state.mark_finished();
+        assert!(
+            state.wait_until_finished(
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+            ),
+            "completion published before a wait remains observable without sleeping",
+        );
+        assert_eq!(
+            state.snapshot(),
+            ItemProgressSnapshot {
+                completed: 0,
+                failed: 0,
+            },
+        );
+        assert_eq!(
+            state.record(true),
+            ItemProgressSnapshot {
+                completed: 1,
+                failed: 0,
+            },
+        );
+        let snapshot = state.record(false);
+        assert_eq!(
+            snapshot,
+            ItemProgressSnapshot {
+                completed: 2,
+                failed: 1,
+            },
+        );
+        assert_eq!(
+            item_progress_line(
+                "cargo ktstr probe",
+                3,
+                snapshot,
+                std::time::Duration::from_secs(70),
+                "failed",
+                Some("bad\nchild"),
+            ),
+            "cargo ktstr probe: failed; completed=2/3; failed=1; elapsed=1m 10s; \
+             error=bad child",
+            "the renderer uses injected elapsed time and escapes terminal detail",
         );
     }
 

@@ -1750,6 +1750,137 @@ fn startup_kill_and_reap_descendants(
     }
 }
 
+/// A process-local subreaper boundary for one exact anchored command.
+///
+/// The ordinary group owner handles every descendant which preserves its
+/// process group. This owner closes the remaining Linux escape hatch:
+/// descendants which call `setsid()` or otherwise leave that group are
+/// reparented here when their parent dies, then killed and reaped before the
+/// observed command returns. The child slot must be empty on entry so draining
+/// all direct children cannot consume an unrelated wait status.
+struct AnchoredSubtreeOwner {
+    restore_subreaper: bool,
+    armed: bool,
+}
+
+fn set_child_subreaper(enabled: bool) -> io::Result<()> {
+    // SAFETY: PR_SET_CHILD_SUBREAPER consumes one integer flag and ignores the
+    // remaining zero arguments.
+    if unsafe {
+        libc::prctl(
+            libc::PR_SET_CHILD_SUBREAPER,
+            if enabled { 1 } else { 0 },
+            0,
+            0,
+            0,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+impl AnchoredSubtreeOwner {
+    fn enter() -> io::Result<Self> {
+        let mut was_subreaper: libc::c_int = 0;
+        // SAFETY: PR_GET_CHILD_SUBREAPER writes one integer to the valid
+        // out-pointer and ignores the remaining zero arguments.
+        if unsafe {
+            libc::prctl(
+                libc::PR_GET_CHILD_SUBREAPER,
+                &mut was_subreaper,
+                0,
+                0,
+                0,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let restore_subreaper = was_subreaper == 0;
+        if restore_subreaper {
+            // SAFETY: process-wide subreaper state is changed before this
+            // owner creates any child and restored only after every child is
+            // reaped.
+            set_child_subreaper(true)?;
+        }
+
+        match startup_direct_children() {
+            Ok(children) if children.is_empty() => Ok(Self {
+                restore_subreaper,
+                armed: true,
+            }),
+            Ok(children) => {
+                if restore_subreaper {
+                    // SAFETY: no owned child has been created, so restoring
+                    // the state cannot move an owned descendant boundary.
+                    set_child_subreaper(false)?;
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "cannot establish exclusive anchored subtree ownership while \
+                         direct children are already active: {children:?}",
+                    ),
+                ))
+            }
+            Err(error) => {
+                if restore_subreaper {
+                    // SAFETY: as above, setup failed before an owned spawn.
+                    set_child_subreaper(false)?;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn drain(&mut self) -> io::Result<()> {
+        let deadline = Instant::now() + STARTUP_REAP_BACKSTOP;
+        let mut ignored_status = None;
+        loop {
+            if startup_reap_nonblocking(-1, &mut ignored_status)? {
+                return Ok(());
+            }
+            for pid in startup_direct_children()? {
+                startup_kill_direct_child(pid)?;
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "anchored command descendant cleanup exceeded its reap backstop",
+                ));
+            }
+            std::thread::sleep(STARTUP_POLL_INTERVAL);
+        }
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        if self.restore_subreaper {
+            // SAFETY: `drain` proved that no owned child remains to be
+            // reparented past this process.
+            set_child_subreaper(false)?;
+        }
+        self.armed = false;
+        Ok(())
+    }
+
+    fn finish(mut self) {
+        if self.drain().is_err() || self.restore().is_err() {
+            fail_closed_child_ownership();
+        }
+    }
+}
+
+impl Drop for AnchoredSubtreeOwner {
+    fn drop(&mut self) {
+        if self.armed && (self.drain().is_err() || self.restore().is_err()) {
+            fail_closed_child_ownership();
+        }
+    }
+}
+
 fn startup_drain_descendants_fail_closed(
     worker_pid: libc::pid_t,
     mut worker_status: Option<libc::c_int>,
@@ -2386,6 +2517,16 @@ pub(crate) trait StdoutObserver {
     /// Maximum time the runner may sleep before calling [`Self::tick`] again.
     fn next_tick_in(&self) -> Duration;
 
+    /// Request cancellation while the child and every process in its owned
+    /// group are still under the runner's exact teardown authority.
+    ///
+    /// The default keeps ordinary observers non-cancelling. A bounded
+    /// observer should return a descriptive error and make
+    /// [`Self::next_tick_in`] expire no later than its deadline.
+    fn cancellation_error(&mut self) -> Option<io::Error> {
+        None
+    }
+
     /// Report the command's ordinary process exit, including non-zero exits.
     fn finished(&mut self, status: &ExitStatus);
 
@@ -2403,7 +2544,7 @@ pub(crate) fn run_stdout_observed<O>(command: Command, mut observer: O) -> io::R
 where
     O: StdoutObserver,
 {
-    run_observed(command, &mut observer, false)
+    run_observed(command, &mut observer, false, false)
 }
 
 /// Run a command with incrementally observed, exactly preserved stdout and
@@ -2416,13 +2557,32 @@ pub(crate) fn run_output_observed<O>(command: Command, mut observer: O) -> io::R
 where
     O: StdoutObserver,
 {
-    run_observed(command, &mut observer, true)
+    run_observed(command, &mut observer, true, false)
+}
+
+/// Run an observed command beneath an anchored process-group owner even when
+/// the top-level cargo-ktstr cleanup guard is not active.
+///
+/// This is the bounded-probe path: an observer cancellation is handled like
+/// any other owner-loop failure, synchronously terminating and reaping the
+/// complete anchored group before the error is returned. Keeping this
+/// guarantee independent of startup mode makes direct invocation and unit
+/// tests exercise the same subtree cleanup as the normal supervised worker.
+pub(crate) fn run_output_observed_anchored<O>(
+    command: Command,
+    mut observer: O,
+) -> io::Result<Output>
+where
+    O: StdoutObserver,
+{
+    run_observed(command, &mut observer, true, true)
 }
 
 fn run_observed<O>(
     mut command: Command,
     observer: &mut O,
     capture_stderr: bool,
+    force_anchored_group: bool,
 ) -> io::Result<Output>
 where
     O: StdoutObserver,
@@ -2431,11 +2591,25 @@ where
     if capture_stderr {
         command.stderr(Stdio::piped());
     }
-    let result = if runner_enabled() {
+    let subtree = if force_anchored_group {
+        match AnchoredSubtreeOwner::enter() {
+            Ok(subtree) => Some(subtree),
+            Err(error) => {
+                observer.failed(&error);
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    let result = if force_anchored_group || runner_enabled() {
         run_observed_group(command, observer, capture_stderr)
     } else {
         run_observed_direct(command, observer, capture_stderr)
     };
+    if let Some(subtree) = subtree {
+        subtree.finish();
+    }
     match &result {
         Ok(output) => observer.finished(&output.status),
         Err(error) => observer.failed(error),
@@ -3671,6 +3845,10 @@ fn drain_group_capture<O: StdoutObserver>(
             next_group_scan = now + GROUP_SCAN_INTERVAL;
         }
 
+        if let Some(error) = observer.cancellation_error() {
+            return Err(error);
+        }
+
         let maximum_wait = if streams.has_open_pipe() {
             Duration::from_millis(100)
         } else {
@@ -3705,6 +3883,9 @@ fn drain_direct_capture<O: StdoutObserver>(
         if let Some(status) = child.try_wait()? {
             streams.finish_owned_prefix(observer)?;
             return Ok(streams.into_output(status));
+        }
+        if let Some(error) = observer.cancellation_error() {
+            return Err(error);
         }
         let maximum_wait = if streams.has_open_pipe() {
             Duration::from_millis(100)
@@ -4324,6 +4505,70 @@ mod tests {
             self.state
                 .lock()
                 .expect("observer state")
+                .failures
+                .push(error.to_string());
+        }
+    }
+
+    #[derive(Default)]
+    struct CancellationState {
+        descendant: Option<(libc::pid_t, OwnedFd)>,
+        failures: Vec<String>,
+        finished: bool,
+    }
+
+    struct CancelWhenPidPublished {
+        pidfile: std::path::PathBuf,
+        state: Arc<Mutex<CancellationState>>,
+    }
+
+    impl CancelWhenPidPublished {
+        fn new(
+            pidfile: std::path::PathBuf,
+        ) -> (Self, Arc<Mutex<CancellationState>>) {
+            let state = Arc::new(Mutex::new(CancellationState::default()));
+            (
+                Self {
+                    pidfile,
+                    state: Arc::clone(&state),
+                },
+                state,
+            )
+        }
+    }
+
+    impl StdoutObserver for CancelWhenPidPublished {
+        fn observe_stdout(&mut self, _bytes: &[u8]) {}
+
+        fn tick(&mut self) {}
+
+        fn next_tick_in(&self) -> Duration {
+            Duration::from_millis(5)
+        }
+
+        fn cancellation_error(&mut self) -> Option<io::Error> {
+            let pid = std::fs::read_to_string(&self.pidfile)
+                .ok()?
+                .parse::<libc::pid_t>()
+                .ok()?;
+            let mut state = self.state.lock().expect("cancellation state");
+            if state.descendant.is_none() {
+                state.descendant = Some((pid, test_pidfd_open(pid)));
+            }
+            Some(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "deterministic observed-command deadline",
+            ))
+        }
+
+        fn finished(&mut self, _status: &ExitStatus) {
+            self.state.lock().expect("cancellation state").finished = true;
+        }
+
+        fn failed(&mut self, error: &io::Error) {
+            self.state
+                .lock()
+                .expect("cancellation state")
                 .failures
                 .push(error.to_string());
         }
@@ -6067,6 +6312,92 @@ mod tests {
         assert_eq!(active_group_for_test(), IDLE);
         drop(state);
         drop(guard);
+    }
+
+    #[test]
+    fn anchored_observer_cancellation_reaps_a_setsid_descendant_without_startup_guard() {
+        let _serial = test_serial_guard();
+        if !std::path::Path::new("/usr/bin/setsid").exists() {
+            return;
+        }
+        assert!(
+            !runner_enabled(),
+            "the forced anchored path must not rely on the startup cleanup guard",
+        );
+        let root = tempfile::tempdir().expect("cancellation tempdir");
+        let pidfile = root.path().join("setsid-descendant.pid");
+        let (observer, state) = CancelWhenPidPublished::new(pidfile.clone());
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(
+                "/usr/bin/setsid /bin/sh -c \
+                 'printf %s \"$$\" > \"$KTSTR_CANCEL_DESCENDANT\"; exec sleep 300' & \
+                 wait",
+            )
+            .env("KTSTR_CANCEL_DESCENDANT", &pidfile);
+
+        let error = run_output_observed_anchored(command, observer)
+            .expect_err("observer deadline cancels the anchored subtree");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "deterministic observed-command deadline");
+
+        let state = state.lock().expect("cancellation state");
+        let (pid, pidfd) = state
+            .descendant
+            .as_ref()
+            .expect("observer pinned the escaped descendant before cancellation");
+        assert!(
+            test_pidfd_exited(pidfd),
+            "escaped descendant {pid} must exit before cancellation returns",
+        );
+        assert!(
+            (unsafe { libc::kill(*pid, 0) }) != 0,
+            "escaped descendant {pid} must be synchronously reaped",
+        );
+        assert!(!state.finished, "a cancelled command has no ordinary finish");
+        assert_eq!(state.failures, [error.to_string()]);
+        assert_eq!(active_group_for_test(), IDLE);
+        assert!(
+            startup_direct_children()
+                .expect("enumerate children after cancellation")
+                .is_empty(),
+            "anchored cancellation leaves no direct child behind",
+        );
+    }
+
+    #[test]
+    fn anchored_observer_reports_subtree_setup_failure_exactly_once() {
+        let _serial = test_serial_guard();
+        assert!(
+            !runner_enabled(),
+            "the forced anchored path must not rely on the startup cleanup guard",
+        );
+        let mut blocker_command = Command::new("/bin/sh");
+        blocker_command.arg("-c").arg("exec sleep 300");
+        let mut blocker =
+            ArmedChild::new(blocker_command.spawn().expect("spawn direct-child blocker"));
+        let (observer, state) = RecordingObserver::new(Duration::from_secs(1));
+        let command = Command::new("/definitely/not/a/started-command");
+
+        let error = run_output_observed_anchored(command, observer)
+            .expect_err("a pre-existing direct child prevents exact subtree ownership");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        let state = state.lock().expect("observer state");
+        assert!(state.finished.is_empty());
+        assert_eq!(state.failures, [error.to_string()]);
+        drop(state);
+        assert_eq!(active_group_for_test(), IDLE);
+
+        blocker
+            .child_mut()
+            .kill()
+            .expect("kill direct-child blocker");
+        blocker
+            .child_mut()
+            .wait()
+            .expect("reap direct-child blocker");
+        blocker.disarm_reaped();
     }
 
     #[test]

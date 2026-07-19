@@ -3011,6 +3011,25 @@ pub struct SchedulerArtifactRequirement {
     pub use_count: usize,
 }
 
+/// Complete scheduler metadata emitted by one warmed test-binary probe.
+///
+/// `cargo ktstr` consumes this object through
+/// `--ktstr-list-scheduler-manifest`, avoiding separate process startups for
+/// declaration discovery and executable requirement discovery while keeping
+/// the legacy individual probe payloads available to existing callers.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SchedulerManifestProbe {
+    /// Every scheduler declaration linked into this test binary.
+    pub declarations: Vec<SchedulerListEntry>,
+    /// Every userspace scheduler executable referenced by its test registry.
+    pub artifact_requirements: Vec<SchedulerArtifactRequirement>,
+}
+
+/// Private CLI discriminator for the combined scheduler-manifest probe.
+#[doc(hidden)]
+pub const SCHEDULER_MANIFEST_PROBE_ARG: &str =
+    "--ktstr-list-scheduler-manifest";
+
 /// A single `#[ktstr_test]` paired with its declared scheduler's name. Emitted
 /// (as a JSON array) by the `--ktstr-list-scheduler-tests` probe so `--relevant`
 /// can map each test to its scheduler and select the tests whose scheduler a
@@ -3087,6 +3106,36 @@ fn collect_scheduler_artifact_requirements<'a>(
             use_count: requirement.use_count,
         })
         .collect()
+}
+
+fn collect_scheduler_list_entries() -> Vec<SchedulerListEntry> {
+    let mut test_counts: std::collections::HashMap<&'static str, usize> =
+        std::collections::HashMap::new();
+    for test in KTSTR_TESTS.iter() {
+        *test_counts.entry(test.scheduler.name).or_insert(0) += 1;
+    }
+    KTSTR_SCHEDULERS
+        .iter()
+        .map(|scheduler| SchedulerListEntry {
+            scheduler: SchedulerJson::from_scheduler(scheduler),
+            test_count: test_counts.get(scheduler.name).copied().unwrap_or(0),
+        })
+        .collect()
+}
+
+fn collect_registered_scheduler_artifact_requirements(
+) -> Vec<SchedulerArtifactRequirement> {
+    let schedulers = KTSTR_TESTS.iter().flat_map(|entry| {
+        std::iter::once(entry.scheduler).chain(entry.staged_schedulers.iter().copied())
+    });
+    collect_scheduler_artifact_requirements(schedulers)
+}
+
+fn collect_scheduler_manifest_probe() -> SchedulerManifestProbe {
+    SchedulerManifestProbe {
+        declarations: collect_scheduler_list_entries(),
+        artifact_requirements: collect_registered_scheduler_artifact_requirements(),
+    }
 }
 
 /// JSON-friendly mirror of `Topology` for the verifier wire format.
@@ -3347,21 +3396,25 @@ fn __ktstr_list_schedulers() {
     if !std::env::args().any(|a| a == "--ktstr-list-schedulers") {
         return;
     }
-    // Count declared tests per scheduler name (a scheduler with no test still
-    // appears, with test_count 0).
-    let mut test_counts: std::collections::HashMap<&'static str, usize> =
-        std::collections::HashMap::new();
-    for t in KTSTR_TESTS.iter() {
-        *test_counts.entry(t.scheduler.name).or_insert(0) += 1;
-    }
-    let entries: Vec<SchedulerListEntry> = KTSTR_SCHEDULERS
-        .iter()
-        .map(|s| SchedulerListEntry {
-            scheduler: SchedulerJson::from_scheduler(s),
-            test_count: test_counts.get(s.name).copied().unwrap_or(0),
-        })
-        .collect();
+    let entries = collect_scheduler_list_entries();
     let json = ::serde_json::to_string(&entries).expect("serialize schedulers");
+    println!("{json}");
+    std::process::exit(0);
+}
+}
+
+::ctor::declarative::ctor! {
+/// Ctor that emits the complete scheduler declaration and artifact-requirement
+/// manifest for one warmed test binary in a single process startup.
+#[ctor(unsafe)]
+fn __ktstr_list_scheduler_manifest() {
+    if !std::env::args().any(|argument| {
+        argument == SCHEDULER_MANIFEST_PROBE_ARG
+    }) {
+        return;
+    }
+    let manifest = collect_scheduler_manifest_probe();
+    let json = ::serde_json::to_string(&manifest).expect("serialize scheduler manifest probe");
     println!("{json}");
     std::process::exit(0);
 }
@@ -3383,10 +3436,7 @@ fn __ktstr_list_scheduler_artifact_requirements() {
     }) {
         return;
     }
-    let schedulers = KTSTR_TESTS.iter().flat_map(|entry| {
-        std::iter::once(entry.scheduler).chain(entry.staged_schedulers.iter().copied())
-    });
-    let requirements = collect_scheduler_artifact_requirements(schedulers);
+    let requirements = collect_registered_scheduler_artifact_requirements();
     let json =
         ::serde_json::to_string(&requirements).expect("serialize scheduler artifact requirements");
     println!("{json}");
@@ -7283,6 +7333,35 @@ mod tests {
         let back: SchedulerListEntry =
             serde_json::from_str(&text).expect("deserialize SchedulerListEntry");
         assert_eq!(back, entry, "SchedulerListEntry must round-trip unchanged");
+    }
+
+    #[test]
+    fn scheduler_manifest_probe_roundtrips_both_payloads_together() {
+        let scheduler = Scheduler::named("rt")
+            .binary_discover("scx_rt")
+            .manifest_dir("/workspace");
+        let manifest = SchedulerManifestProbe {
+            declarations: vec![SchedulerListEntry {
+                scheduler: SchedulerJson::from_scheduler(&scheduler),
+                test_count: 2,
+            }],
+            artifact_requirements: vec![SchedulerArtifactRequirement {
+                binary_kind: BinaryKindJson::Discover("scx_rt".into()),
+                manifest_dir: "/workspace".into(),
+                schedulers: vec!["rt".into()],
+                use_count: 2,
+            }],
+        };
+        let text =
+            serde_json::to_string(&manifest).expect("serialize SchedulerManifestProbe");
+        assert!(
+            text.contains("\"declarations\"")
+                && text.contains("\"artifact_requirements\""),
+            "the combined protocol carries both payloads: {text}",
+        );
+        let back: SchedulerManifestProbe =
+            serde_json::from_str(&text).expect("deserialize SchedulerManifestProbe");
+        assert_eq!(back, manifest);
     }
 
     #[test]
