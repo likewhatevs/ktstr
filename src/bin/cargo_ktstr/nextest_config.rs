@@ -191,6 +191,37 @@ mod tests {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
 
+    fn profile_override_blocks<'a>(config: &'a str, profile: &str) -> Vec<(usize, &'a str)> {
+        let header = format!("[[profile.{profile}.overrides]]");
+        config
+            .match_indices(&header)
+            .map(|(start, _)| {
+                let body_start = start + header.len();
+                let end = config[body_start..]
+                    .find("\n[")
+                    .map_or(config.len(), |relative| body_start + relative);
+                (start, &config[start..end])
+            })
+            .collect()
+    }
+
+    fn multiline_filter(block: &str) -> &str {
+        block
+            .split_once("filter = '''\n")
+            .and_then(|(_, tail)| tail.split_once("\n'''"))
+            .map(|(filter, _)| filter)
+            .expect("override has a multiline filter")
+    }
+
+    fn normalized_filter(filter: &str) -> String {
+        filter
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn injects_after_user_tool_configs_and_before_test_binary_separator() {
         let args = strings(&[
@@ -360,5 +391,110 @@ mod tests {
         assert!(TOOL_CONFIG.contains("test(/^gauntlet\\//)"));
         assert!(TOOL_CONFIG.contains("test(/^verifier\\//)"));
         assert!(!TOOL_CONFIG.contains("test(/^host\\//)"));
+    }
+
+    #[test]
+    fn repository_specialized_groups_precede_host_fallback_in_every_profile() {
+        const CONFIG: &str = include_str!("../../../.config/nextest.toml");
+        const EXPECTED_SPECIALIZED_GROUPS: &[&str] = &[
+            "alu-vec512",
+            "compile-fail",
+            "llc-lock",
+            "vm-cli",
+            "vm-perf",
+            "wide-smp",
+        ];
+
+        for profile in ["ci", "default"] {
+            let blocks = profile_override_blocks(CONFIG, profile);
+
+            let fallback = blocks
+                .iter()
+                .find_map(|(start, block)| {
+                    block
+                        .contains("test-group = \"host-tests\"")
+                        .then_some(*start)
+                })
+                .unwrap_or_else(|| panic!("{profile} ordinary-host fallback must be present"));
+
+            let mut specialized = Vec::new();
+            let mut explicit_global = 0;
+            for (start, block) in blocks {
+                let Some(group) = block.lines().find_map(|line| {
+                    line.strip_prefix("test-group = \"")
+                        .and_then(|value| value.strip_suffix('"'))
+                }) else {
+                    continue;
+                };
+                if group == "host-tests" {
+                    continue;
+                }
+                assert!(
+                    start < fallback,
+                    "nextest resolves test-group by first match: {profile} \
+                     specialized group {group:?} must precede its ordinary-host fallback",
+                );
+                if group == "@global" {
+                    explicit_global += 1;
+                    continue;
+                }
+                specialized.push(group);
+            }
+
+            specialized.sort_unstable();
+            specialized.dedup();
+            assert_eq!(
+                specialized.as_slice(),
+                EXPECTED_SPECIALIZED_GROUPS,
+                "{profile} must retain every specialized test-group override \
+                 before the ordinary-host fallback",
+            );
+            assert_eq!(
+                explicit_global,
+                if profile == "default" { 1 } else { 0 },
+                "profile.default must explicitly pin repository-known resource \
+                 users to @global before the lower-priority tool fallback; \
+                 custom profiles inherit that assignment",
+            );
+        }
+    }
+
+    #[test]
+    fn repository_resource_and_host_admission_filters_are_exact_complements() {
+        const CONFIG: &str = include_str!("../../../.config/nextest.toml");
+        let default_blocks = profile_override_blocks(CONFIG, "default");
+        let resource = default_blocks
+            .iter()
+            .find_map(|(_, block)| {
+                block
+                    .contains("test-group = \"@global\"")
+                    .then(|| multiline_filter(block))
+            })
+            .expect("profile.default explicitly assigns resource users to @global");
+        let resource = normalized_filter(resource);
+
+        for profile in ["ci", "default"] {
+            let blocks = profile_override_blocks(CONFIG, profile);
+            let host = blocks
+                .iter()
+                .find_map(|(_, block)| {
+                    block
+                        .contains("test-group = \"host-tests\"")
+                        .then(|| multiline_filter(block))
+                })
+                .unwrap_or_else(|| panic!("{profile} ordinary-host fallback must be present"));
+            let host_inner = host
+                .strip_prefix("not(\n")
+                .and_then(|filter| filter.strip_suffix("\n)"))
+                .unwrap_or_else(|| {
+                    panic!("{profile} ordinary-host filter must be not(resource-filter)")
+                });
+            assert_eq!(
+                normalized_filter(host_inner),
+                resource,
+                "{profile} must assign the exact complement of repository-known \
+                 resource users to host-tests",
+            );
+        }
     }
 }

@@ -62,9 +62,9 @@ path = "junit.xml"
 [test-groups.host-tests]
 max-threads = "num-cpus"
 
-# CI overrides — mirrors profile.default.overrides. nextest does not
-# inherit overrides across profiles, so every override that should
-# apply under --profile ci must be duplicated here.
+# CI overrides take priority when `--profile ci` is selected; nextest then
+# falls back to matching `profile.default.overrides`. The CI copies below
+# either carry CI-specific settings or pin intended CI precedence explicitly.
 
 # LOCK-TAKING VM CELLS: last-resort rail sized for FULL-SUITE DRAIN,
 # not per-cell runtime (overrides are first-match per setting, so this
@@ -177,6 +177,49 @@ filter = "binary(compile_fail) & test(=compile_fail)"
 test-group = "compile-fail"
 threads-required = 1
 
+# Wide-SMP boot tests: every ~256-vCPU topology (16-LLC × 16-core, or
+# 14×9×2) overcommits its vCPU threads onto the host cpuset (~1.3x on a
+# 192-CPU runner). Boot wall-clock stretches under that overcommit, but
+# the wall deadline no longer scales with it: `vm_timeout_from_entry` is
+# the Tier-3 dead-man formula (base max(watchdog_timeout_s, duration, 1)
+# + vm_boot_headroom(256)=58.4s × DEADMAN_HEADROOM_MULT=3 ≈ 235s for
+# these tests), and a slow-but-progressing boot is protected by the
+# progress watchdog instead of a ratio-scaled deadline. The binding case
+# is pos_expect_auto_repro_satisfied_wide_smp: it boots TWO 256-vCPU VMs
+# sequentially (primary + auto-repro), each with its OWN ~235s deadman,
+# so a healthy two-VM run can reach ~470s. That two-VM wprof-inversion
+# chain auto-skips above EXPECT_AUTO_REPRO_SKIP_RATIO (2.0x) — far below
+# the OVERCOMMIT_SKIP_RATIO (6x) boot-or-skip gate — because its repro-VM
+# trace transport is fragile under host time-slicing; so it RUNS only on
+# a host with MORE than 128 CPUs (256 vCPUs at < 2.0x; exactly 128 CPUs =
+# 2.0x SKIPS, the cap being inclusive) and SKIPS cleanly on a 96-CPU
+# runner (2.7x) instead of hard-failing, while single-VM wide-SMP boot
+# tests keep the 6x skip gate. slow-timeout 960s/terminate-after 1 covers that two-VM
+# worst running case so the per-VM framework watchdog fires FIRST (a
+# clean failure dump) rather than nextest blunt-killing a still-booting
+# second VM; single-VM wide tests fail at their ≤470s watchdog long
+# before 960s, so the larger budget is harmless for them, and on a
+# 192-CPU runner (~1.3x) every test finishes in a few hundred seconds,
+# far under 960s. The `wide-smp` test-group (max-threads = 1) serializes
+# these heavy boots so they never oversubscribe EACH OTHER — two 256-vCPU
+# VMs on one host is 2.6x aggregate before any other test, the
+# concurrent-boot cascade that put 100+ VM tests into SLOW at one
+# instant. The filter is test()-scoped for snapshot_real_capture_e2e /
+# expect_auto_repro_e2e so only their wide-SMP tests join the group;
+# their lighter siblings keep normal budgets. retries = 2 absorbs
+# residual host-load jitter; the per-VM watchdog bounds each attempt, so
+# this is not a retry storm.
+#
+# Keep this before the ordinary-host fallback below. Test-group resolution is
+# first-match, so placing it afterward silently collapses these tests into the
+# CPU-wide host-tests group.
+[[profile.ci.overrides]]
+filter = "binary(wide_smp_boot_e2e) | binary(wide_smp_device_irq_e2e) | binary(wide_smp_net_irq_e2e) | test(multi_llc_guest_presents_fat_l3_wide_smp) | test(snapshot_real_capture_wide_smp) | test(pos_expect_auto_repro_satisfied_wide_smp)"
+slow-timeout = { period = "960s", terminate-after = 1 }
+test-group = "wide-smp"
+threads-required = 1
+retries = 2
+
 # Keep ordinary host-side tests CPU-bounded even though the global CI
 # slot budget admits every resource-lock user. Put this fallback after
 # the named test-group overrides: nextest selects the first matching
@@ -196,9 +239,11 @@ threads-required = 1
 # namespace, so they fall into host-tests generically without a brittle list
 # of macro/codegen probe names. The remaining arms cover direct KtstrVm
 # users, shell/verifier wrappers, ignored nested-VM/kernel-build shims, and
-# the two production-lock reservation tests. They stay in @global so every
-# cheap waiter reaches ktstr's work-conserving cross-process queue;
-# everything else enters the CPU-sized host-tests group.
+# the two production-lock reservation tests. This CI complement declines
+# those identities; the inherited profile.default resource rule below then
+# explicitly assigns them to @global before the lower-priority tool fallback
+# can classify their ordinary Rust names as host work. Everything else enters
+# the CPU-sized host-tests group.
 [[profile.ci.overrides]]
 filter = '''
 not(
@@ -281,45 +326,6 @@ filter = "test(vmm::sched_stats::)"
 slow-timeout = { period = "180s", terminate-after = 1 }
 retries = 3
 
-# Wide-SMP boot tests: every ~256-vCPU topology (16-LLC × 16-core, or
-# 14×9×2) overcommits its vCPU threads onto the host cpuset (~1.3x on a
-# 192-CPU runner). Boot wall-clock stretches under that overcommit, but
-# the wall deadline no longer scales with it: `vm_timeout_from_entry` is
-# the Tier-3 dead-man formula (base max(watchdog_timeout_s, duration, 1)
-# + vm_boot_headroom(256)=58.4s × DEADMAN_HEADROOM_MULT=3 ≈ 235s for
-# these tests), and a slow-but-progressing boot is protected by the
-# progress watchdog instead of a ratio-scaled deadline. The binding case
-# is pos_expect_auto_repro_satisfied_wide_smp: it boots TWO 256-vCPU VMs
-# sequentially (primary + auto-repro), each with its OWN ~235s deadman,
-# so a healthy two-VM run can reach ~470s. That two-VM wprof-inversion
-# chain auto-skips above EXPECT_AUTO_REPRO_SKIP_RATIO (2.0x) — far below
-# the OVERCOMMIT_SKIP_RATIO (6x) boot-or-skip gate — because its repro-VM
-# trace transport is fragile under host time-slicing; so it RUNS only on
-# a host with MORE than 128 CPUs (256 vCPUs at < 2.0x; exactly 128 CPUs =
-# 2.0x SKIPS, the cap being inclusive) and SKIPS cleanly on a 96-CPU
-# runner (2.7x) instead of hard-failing, while single-VM wide-SMP boot
-# tests keep the 6x skip gate. slow-timeout 960s/terminate-after 1 covers that two-VM
-# worst running case so the per-VM framework watchdog fires FIRST (a
-# clean failure dump) rather than nextest blunt-killing a still-booting
-# second VM; single-VM wide tests fail at their ≤470s watchdog long
-# before 960s, so the larger budget is harmless for them, and on a
-# 192-CPU runner (~1.3x) every test finishes in a few hundred seconds,
-# far under 960s. The `wide-smp` test-group (max-threads = 1) serializes
-# these heavy boots so they never oversubscribe EACH OTHER — two 256-vCPU
-# VMs on one host is 2.6x aggregate before any other test, the
-# concurrent-boot cascade that put 100+ VM tests into SLOW at one
-# instant. The filter is test()-scoped for snapshot_real_capture_e2e /
-# expect_auto_repro_e2e so only their wide-SMP tests join the group;
-# their lighter siblings keep normal budgets. retries = 2 absorbs
-# residual host-load jitter; the per-VM watchdog bounds each attempt, so
-# this is not a retry storm.
-[[profile.ci.overrides]]
-filter = "binary(wide_smp_boot_e2e) | binary(wide_smp_device_irq_e2e) | binary(wide_smp_net_irq_e2e) | test(multi_llc_guest_presents_fat_l3_wide_smp) | test(snapshot_real_capture_wide_smp) | test(pos_expect_auto_repro_satisfied_wide_smp)"
-slow-timeout = { period = "960s", terminate-after = 1 }
-test-group = "wide-smp"
-threads-required = 1
-retries = 2
-
 [profile.quick]
 # Usage: cargo nextest run --profile quick
 slow-timeout = { period = "10s", terminate-after = 2 }
@@ -399,8 +405,8 @@ filter = "test(eevdf_)"
 slow-timeout = { period = "75s", terminate-after = 2 }
 retries = 0
 
-# Progress-watchdog wedge fixtures (mirror of the profile.ci override —
-# nextest does not inherit overrides across profiles). Two fixtures inject
+# Progress-watchdog wedge fixtures (explicit default-profile copy of the
+# higher-priority profile.ci rule). Two fixtures inject
 # a forever-wedge the watchdog must kill on Tier-1/Tier-2, so a watchdog
 # timeout is the EXPECTED outcome — retries=0. 150s x 2 sits above the
 # ~150s Tier-3 deadman of these 1-vCPU watchdog_timeout_s=90 cells so the
@@ -413,8 +419,8 @@ filter = "binary(progress_watchdog_e2e)"
 slow-timeout = { period = "150s", terminate-after = 2 }
 retries = 0
 
-# Wide-SMP boot tests: mirror of the profile.ci override (nextest does
-# not inherit overrides across profiles). 960s/terminate-after 1 covers
+# Wide-SMP boot tests: explicit default-profile copy of the higher-priority
+# profile.ci rule. 960s/terminate-after 1 covers
 # the two-VM auto-repro test's worst running case so the per-VM framework
 # watchdog (vm_timeout_from_entry, flat dead-man boot headroom) fires
 # before nextest's kill even under a local dev box's higher overcommit
@@ -506,11 +512,53 @@ filter = "binary(compile_fail) & test(=compile_fail)"
 test-group = "compile-fail"
 threads-required = 1
 
-# Mirror profile.ci's exact resource-admission split. Keep this fallback after
-# every named default-profile test-group override so vm-cli, vm-perf,
-# alu-vec512, llc-lock, compile-fail, and wide-smp retain their stronger
-# serialization. The generated host/ namespace makes every host_only entry
-# fall into host-tests without a per-test allowlist.
+# Explicitly keep every repository-known resource user in nextest's global
+# admission pool. Merely excluding these identities from the repository's
+# host fallback is insufficient: nextest would continue down its
+# source-precedence chain, where cargo-ktstr's lower-priority generic tool
+# fallback sees their ordinary Rust names and assigns them to its CPU-sized
+# host group. Selected custom profiles fall back to profile.default overrides,
+# so this single rule also protects `--profile ci` after its complementary
+# host fallback declines the same identities. Keep it after specialized
+# groups so vm-cli, vm-perf, alu-vec512, llc-lock, compile-fail, and wide-smp
+# retain their stronger first-match assignments.
+[[profile.default.overrides]]
+filter = '''
+test(/^ktstr\//)
+| test(/^gauntlet\//)
+| test(/^verifier\//)
+| (
+  binary(=ktstr)
+  & (
+    test(/^vmm::tests::(boot_kernel_.*|bench_boot_time.*|monitor_data_valid_latch_records_live_page_offset|sys_rdy_releases_monitor_before_5s_timeout|monitor_exits_cleanly_when_guest_panics_before_sys_rdy|first_sample_has_valid_rq_clock_thanks_to_sys_rdy|watchdog_timeout_override_lands_in_guest_memory|watchdog_override_prevents_stall_exit|sched_domain_data_populated|builder_performance_mode_valid_succeeds|builder_performance_mode_preserves_in_vm|builder_performance_mode_mbind_nodes_populated)$/)
+    | test(/^cli::kernel_build::build::tests::acquire_build_reservation_(bypass_empty_string_rejected|plan_and_make_jobs_consistent)$/)
+  )
+)
+| binary(=shell_mode_scheduler_lifecycle_e2e)
+| binary(=disk_template_e2e)
+| binary(=vm_integration)
+| binary(=extra_kconfig_e2e)
+| binary(=wprof_e2e)
+| (
+  binary(=ktstr_cli)
+  & test(=shell_exec_echo)
+)
+| (
+  binary(=cargo_ktstr_shell_test_e2e)
+  & test(=shell_test_resolves_topology_from_named_test)
+)
+| (
+  binary(=cargo_ktstr_verifier_discovery)
+  & test(=bare_verifier_runs_recursively_discovered_scheduler_cell_end_to_end)
+)
+'''
+test-group = "@global"
+threads-required = 1
+
+# Assign the exact complement to ordinary host work. Keep this fallback after
+# the explicit resource assignment and every named default-profile
+# test-group override. The generated host/ namespace makes every host_only
+# entry fall into host-tests without a per-test allowlist.
 [[profile.default.overrides]]
 filter = '''
 not(

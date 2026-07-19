@@ -4,7 +4,8 @@
 //! Reads a sidecar root (defaults to `target/ktstr/`), selects every
 //! sidecar whose run failed and was not a skip, dedupes the
 //! resulting test names, and emits a `cargo nextest run`-compatible
-//! filter expression that targets exactly that subset. With
+//! filter expression that targets every listed variant of exactly that
+//! subset. With
 //! `--exec`, also invokes nextest and waits for it; default is
 //! dry-run so an operator can paste the filter expression into CI
 //! or refine it by hand before committing to a re-run.
@@ -52,26 +53,40 @@
 //!
 //! Multiple sidecars per test_name (one per topology variant, one
 //! per scheduler) fold into a single nextest filter entry via
-//! [`std::collections::BTreeSet`]. The output filter uses
-//! nextest's `test(/regex/)` form anchored at end-of-identifier:
-//! `test(/^(.*::)?NAME$/) | test(/^(.*::)?NAME2$/)`.
+//! [`std::collections::BTreeSet`]. A sidecar stores the registered bare
+//! `KtstrTestEntry::name`, while nextest can list that entry under four
+//! concrete shapes:
+//!
+//! - the ordinary libtest path ending in `::NAME`;
+//! - `host/NAME`;
+//! - `ktstr/NAME` with an optional kernel suffix; or
+//! - `gauntlet/NAME/PRESET` with an optional kernel suffix.
+//!
+//! The output filter therefore uses one fully anchored `test(/regex/)`
+//! union per bare name. It deliberately includes every shape instead of
+//! guessing whether an archived sidecar came from a host-only, base-VM, or
+//! gauntlet invocation; names absent from the current binary simply match
+//! nothing.
 //!
 //! Why the regex form rather than the simpler `test(=NAME)` or
 //! `test(NAME)`:
-//! - `test(=NAME)` matches the FULL nextest identifier
-//!   (`<binary_id>::<path>::<test_name>`). SidecarResult.test_name
-//!   stores only the bare function name (per sidecar/mod.rs:107),
-//!   so the equality match never fires against production tests.
+//! - `test(=NAME)` matches one exact nextest test name.
+//!   `SidecarResult.test_name` stores only the registered bare entry name
+//!   (per sidecar/mod.rs:107), so equality cannot cover its module path or
+//!   generated `host/`, `ktstr/`, and `gauntlet/` variants.
 //! - `test(NAME)` is a substring match — would shadow if one
 //!   test name is a substring of another (e.g.
 //!   `phase_pipeline_two_step_e2e` vs
 //!   `phase_pipeline_no_periodic_samples_yields_empty_phases`
 //!   share the `phase_pipeline_` prefix).
-//! - `test(/^(.*::)?NAME$/)` matches the bare name as the
-//!   terminal component of any nextest path, with the `$` anchor
-//!   preventing substring shadowing. The optional `(.*::)?`
-//!   prefix tolerates both `binary::name` and
-//!   `binary::module::name` shapes nextest emits.
+//! - The generated union matches the bare name only as a complete path
+//!   component and anchors the whole nextest test name with `^...$`, so
+//!   substring-related tests cannot shadow one another.
+//!
+//! Verifier cells are not included in this reconstruction. Their names are
+//! `verifier/SCHEDULER/KERNEL/PRESET` and do not contain the registered test
+//! entry name stored in a sidecar, so selecting one from `test_name` alone
+//! would be guesswork.
 //!
 //! Empty selection (no failures in the pool) prints a
 //! pipeline-safe no-op expression (`test(/^__ktstr_no_failures_to_replay__$/)`)
@@ -707,18 +722,26 @@ pub(crate) fn select_failed_names<'a>(
         .collect()
 }
 
-/// Format a `BTreeSet<&str>` of test names as a nextest filter
-/// expression using the regex `test(/^(.*::)?NAME$/)` form.
-/// See the module-level "Filter expression shape" section for
-/// the rationale behind the regex form (over `test(=NAME)` or
-/// bare `test(NAME)`). Empty set is rejected by the caller
-/// before reaching this fn — callers emit
-/// `EMPTY_POOL_FILTER` instead so the downstream nextest
+/// Format a `BTreeSet<&str>` of registered bare test names as a nextest
+/// filter expression covering every concrete name shape the dispatcher can
+/// list for each entry.
+///
+/// See the module-level "Filter expression shape" section for the rationale
+/// behind the exact regex union (over `test(=NAME)` or bare
+/// `test(NAME)`). Empty set is rejected by the caller before reaching this
+/// fn — callers emit `EMPTY_POOL_FILTER` instead so the downstream nextest
 /// invocation has a parseable input.
 pub(crate) fn build_nextest_filter(names: &BTreeSet<&str>) -> String {
     let parts: Vec<String> = names
         .iter()
-        .map(|n| format!("test(/^(.*::)?{}$/)", regex_escape(n)))
+        .map(|name| {
+            let name = regex_escape(name);
+            format!(
+                "test(/^(?:(?:.*::)?{name}|host\\/{name}|\
+                 ktstr\\/{name}(?:\\/[^\\/]+)?|\
+                 gauntlet\\/{name}\\/[^\\/]+(?:\\/[^\\/]+)?)$/)"
+            )
+        })
         .collect();
     parts.join(" | ")
 }
@@ -734,7 +757,8 @@ fn regex_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
-            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\' => {
+            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\'
+            | '/' => {
                 out.push('\\');
                 out.push(ch);
             }
@@ -872,8 +896,10 @@ mod tests {
 
     #[test]
     fn replay_exec_injects_tool_config_before_test_binary_args() {
+        let failed_names = BTreeSet::from(["failing"]);
+        let filter_expr = build_nextest_filter(&failed_names);
         let got = build_injected_nextest_run_args_with(
-            "test(=ktstr/failing)",
+            &filter_expr,
             Some("ci"),
             &[
                 "-j".to_string(),
@@ -895,7 +921,7 @@ mod tests {
                 "nextest",
                 "run",
                 "-E",
-                "test(=ktstr/failing)",
+                filter_expr.as_str(),
                 "--profile",
                 "ci",
                 "-j",
@@ -995,9 +1021,68 @@ mod tests {
         names.insert("scheduler_smoke_test");
         let expr = build_nextest_filter(&names);
         assert_eq!(
-            expr, "test(/^(.*::)?scheduler_smoke_test$/)",
-            "single-name filter wraps in regex with optional path prefix + end anchor"
+            expr,
+            "test(/^(?:(?:.*::)?scheduler_smoke_test|host\\/scheduler_smoke_test|\
+             ktstr\\/scheduler_smoke_test(?:\\/[^\\/]+)?|\
+             gauntlet\\/scheduler_smoke_test\\/[^\\/]+(?:\\/[^\\/]+)?)$/)",
+            "single-name filter covers every concrete dispatcher name shape"
         );
+    }
+
+    /// Compile a one-name nextest regex arm with Rust's regex engine.
+    ///
+    /// nextest's `/.../` filter literal requires `/` to be escaped even
+    /// though `/` has no special meaning to the regex engine itself.
+    fn compile_single_name_filter(expr: &str) -> regex::Regex {
+        let body = expr
+            .strip_prefix("test(/")
+            .and_then(|body| body.strip_suffix("/)"))
+            .expect("one-name filter has nextest's test(/.../) envelope")
+            .replace("\\/", "/");
+        regex::Regex::new(&body).expect("generated nextest filter contains a valid regex")
+    }
+
+    /// A sidecar records only the registered bare entry name. Replay must
+    /// therefore select every exact name shape that `dispatch` can list for
+    /// that entry, without also admitting malformed or unrelated variants.
+    #[test]
+    fn build_nextest_filter_matches_every_dispatch_name_shape_exactly() {
+        let names = BTreeSet::from(["scheduler_smoke_test"]);
+        let expr = build_nextest_filter(&names);
+        let regex = compile_single_name_filter(&expr);
+
+        for listed_name in [
+            "scheduler_smoke_test",
+            "module::scheduler_smoke_test",
+            "binary::module::scheduler_smoke_test",
+            "host/scheduler_smoke_test",
+            "ktstr/scheduler_smoke_test",
+            "ktstr/scheduler_smoke_test/kernel_6_14",
+            "gauntlet/scheduler_smoke_test/8cpu-2llc-smt",
+            "gauntlet/scheduler_smoke_test/8cpu-2llc-smt/kernel_6_14",
+        ] {
+            assert!(
+                regex.is_match(listed_name),
+                "replay filter must select dispatcher name {listed_name:?}: {expr}"
+            );
+        }
+
+        for unrelated_name in [
+            "scheduler_smoke_test_extra",
+            "prefix_scheduler_smoke_test",
+            "host/scheduler_smoke_test/kernel_6_14",
+            "ktstr/scheduler_smoke_test/preset/kernel_6_14",
+            "gauntlet/scheduler_smoke_test",
+            "gauntlet/scheduler_smoke_test/preset/kernel/extra",
+            // A verifier cell contains no registered entry name. The sidecar
+            // identity cannot reconstruct it, so replay must not guess.
+            "verifier/scx_rustland/kernel_6_14/8cpu-2llc-smt",
+        ] {
+            assert!(
+                !regex.is_match(unrelated_name),
+                "replay filter must reject non-dispatch shape {unrelated_name:?}: {expr}"
+            );
+        }
     }
 
     /// Multiple names produce a `|`-joined expression in
@@ -1013,7 +1098,9 @@ mod tests {
         let expr = build_nextest_filter(&names);
         assert_eq!(
             expr,
-            "test(/^(.*::)?a_test$/) | test(/^(.*::)?m_test$/) | test(/^(.*::)?z_test$/)"
+            "test(/^(?:(?:.*::)?a_test|host\\/a_test|ktstr\\/a_test(?:\\/[^\\/]+)?|gauntlet\\/a_test\\/[^\\/]+(?:\\/[^\\/]+)?)$/) | \
+             test(/^(?:(?:.*::)?m_test|host\\/m_test|ktstr\\/m_test(?:\\/[^\\/]+)?|gauntlet\\/m_test\\/[^\\/]+(?:\\/[^\\/]+)?)$/) | \
+             test(/^(?:(?:.*::)?z_test|host\\/z_test|ktstr\\/z_test(?:\\/[^\\/]+)?|gauntlet\\/z_test\\/[^\\/]+(?:\\/[^\\/]+)?)$/)"
         );
     }
 
@@ -1029,12 +1116,12 @@ mod tests {
         names.insert("phase_pipeline_no_periodic_samples_yields_empty_phases");
         let expr = build_nextest_filter(&names);
         assert!(
-            expr.contains("phase_pipeline_two_step_e2e$"),
-            "two_step_e2e present with end anchor"
+            expr.contains("host\\/phase_pipeline_two_step_e2e"),
+            "two_step_e2e exact host variant is present"
         );
         assert!(
-            expr.contains("phase_pipeline_no_periodic_samples_yields_empty_phases$"),
-            "no_periodic_samples present with end anchor"
+            expr.contains("host\\/phase_pipeline_no_periodic_samples_yields_empty_phases"),
+            "no_periodic_samples exact host variant is present"
         );
         assert_eq!(
             expr.matches(" | ").count(),
@@ -1059,6 +1146,7 @@ mod tests {
         assert_eq!(regex_escape("(group)"), "\\(group\\)");
         assert_eq!(regex_escape("a|b"), "a\\|b");
         assert_eq!(regex_escape("end$"), "end\\$");
+        assert_eq!(regex_escape("path/name"), "path\\/name");
     }
 
     // -- select_failed_names (scan-path selector) --

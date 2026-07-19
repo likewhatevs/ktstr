@@ -288,10 +288,11 @@ pub(crate) enum KtstrCommand {
     ///
     /// Scans the sidecar root for failed runs (`!passed && !skipped`),
     /// dedupes the resulting test names, and emits a `cargo nextest
-    /// run`-compatible filter expression that targets exactly that
-    /// subset. Default is dry-run (prints the filter expression to
-    /// stdout); pass `--exec` to invoke nextest directly with targeted
-    /// optional-ktstr test features enabled automatically.
+    /// run`-compatible filter expression that targets every currently
+    /// listed ordinary, host, base-VM, and gauntlet variant of exactly
+    /// that bare-name subset. Default is dry-run (prints the filter
+    /// expression to stdout); pass `--exec` to invoke nextest directly
+    /// with targeted optional-ktstr test features enabled automatically.
     ///
     /// Distinct from the in-VM auto-repro (`auto_repro = true` on
     /// `KtstrTestEntry`) which fires within the same test process

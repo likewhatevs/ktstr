@@ -1147,24 +1147,13 @@ mod tests {
         ];
         let outcome = AffectedOutcome::Subset(vec!["scx_a".to_string()]);
         let expr = select_relevant_tests(&outcome, &pkg_of, &tests).expect("Subset selects tests");
-        // Match on the `NAME$` boundary `build_nextest_filter` emits, so a
-        // dropped name is not falsely "found" as a prefix of a kept one
-        // (e.g. `t_b` is a prefix of `t_builtin`).
-        assert!(
-            expr.contains("t_a$"),
-            "affected Discover pkg test kept: {expr}"
-        );
-        assert!(
-            expr.contains("t_builtin$"),
-            "package-less test kept: {expr}"
-        );
-        assert!(
-            expr.contains("t_unknown$"),
-            "unenumerable-scheduler test kept: {expr}"
-        );
-        assert!(
-            !expr.contains("t_b$"),
-            "unaffected Discover pkg test dropped: {expr}"
+        let expected = BTreeSet::from(["t_a", "t_builtin", "t_unknown"]);
+        assert_eq!(
+            expr,
+            crate::replay::build_nextest_filter(&expected),
+            "relevant selection keeps the affected, package-less, and \
+             unenumerable tests while dropping the unaffected test even when \
+             its name is a prefix of a kept one",
         );
     }
 

@@ -252,6 +252,9 @@ cargo ktstr replay --dir PATH   # source sidecars from an archived tree
 
 Dry-run is the default: the filter prints to stdout so you can
 inspect it (or paste it into CI) before committing to the re-run.
+Because sidecars record the registered bare test name, replay selects
+every currently listed ordinary, `host/`, `ktstr/`, and `gauntlet/` variant
+of that name; absent variants simply match nothing.
 `--profile` / `--nextest-profile` apply with `--exec`. Distinct from
 [auto-repro](auto-repro.md), which fires inside the failing test
 process; `replay` is post-hoc, across a whole session.
