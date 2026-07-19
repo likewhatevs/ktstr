@@ -524,8 +524,8 @@ impl AttachAttemptKind {
 pub enum AttachAttemptTransition {
     /// Start charging one attach generation.
     Started,
-    /// Stop charging the matching generation and enter the host's
-    /// non-charging `Finishing` rendezvous state.
+    /// Stop charging the attach body and enter the host's separately
+    /// service-accounted `Finishing` rendezvous state.
     Finished,
     /// The guest consumed the exact [`AttachControlPacket::FinishedAck`] and
     /// the host may now close the overlay and resume coarse accounting.

@@ -389,6 +389,9 @@ pub(crate) enum KillReasonTag {
     /// attempt still owned the lifecycle watchdog. This is an infrastructure
     /// sensor failure, not an unacknowledged guest cancellation.
     AttachMonitorUnavailable = 6,
+    /// The guest published scheduler-attach Finished but did not complete
+    /// the FinishedAck/Settled rendezvous within its delivered-service grace.
+    AttachFinishUnsettled = 7,
 }
 
 impl KillReasonTag {
@@ -402,6 +405,7 @@ impl KillReasonTag {
             4 => Self::ApKill,
             5 => Self::AttachCancelUnacked,
             6 => Self::AttachMonitorUnavailable,
+            7 => Self::AttachFinishUnsettled,
             _ => Self::Unset,
         }
     }
@@ -416,6 +420,7 @@ impl KillReasonTag {
             Self::ApKill => "ap-kill",
             Self::AttachCancelUnacked => "attach-cancel-unacknowledged",
             Self::AttachMonitorUnavailable => "attach-monitor-unavailable",
+            Self::AttachFinishUnsettled => "attach-finish-unsettled",
         }
     }
 }
@@ -436,6 +441,7 @@ fn decode_watchdog_kill_reason(raw: u8) -> Option<crate::vmm::WatchdogKillReason
         KillReasonTag::ApKill => Some(Pub::ApKill),
         KillReasonTag::AttachCancelUnacked => Some(Pub::AttachCancelUnacknowledged),
         KillReasonTag::AttachMonitorUnavailable => Some(Pub::AttachMonitorUnavailable),
+        KillReasonTag::AttachFinishUnsettled => Some(Pub::AttachFinishUnsettled),
     }
 }
 
@@ -666,6 +672,10 @@ mod watchdog_reset_tag_tests {
                 KillReasonTag::AttachMonitorUnavailable,
                 Pub::AttachMonitorUnavailable,
             ),
+            (
+                KillReasonTag::AttachFinishUnsettled,
+                Pub::AttachFinishUnsettled,
+            ),
         ] {
             assert_eq!(decode_watchdog_kill_reason(tag as u8), Some(expected));
         }
@@ -721,6 +731,10 @@ mod watchdog_reset_tag_tests {
             (
                 KillReasonTag::AttachMonitorUnavailable,
                 "attach-monitor-unavailable",
+            ),
+            (
+                KillReasonTag::AttachFinishUnsettled,
+                "attach-finish-unsettled",
             ),
         ] {
             assert_eq!(tag.render(), token);
@@ -1583,12 +1597,19 @@ fn has_bpf_scheduler_attached_inner<P: AsRef<std::path::Path>>(
 /// draining the guest-memory readers before the backing mmap unmaps. The
 /// caller MUST set `kill`, signal `kill_evt`, and clear `freeze` first so a
 /// parked AP observes the shutdown and exits promptly. Kicks + unparks each
-/// non-exited AP, epoll-waits on their `exit_evt`s with a 2 s deadline
-/// (re-kicking each cycle), then joins every handle. Shared by
+/// unfinished AP, epoll-waits on their `exit_evt`s with a two-second
+/// delivered-service budget and the established 30-second rendezvous wall
+/// backstop (re-kicking each cycle), then joins only after every handle
+/// reports `is_finished()`. Shared by
 /// [`KtstrVm::collect_results`] and [`RunVmThreadGuard`]'s `Drop` so both
 /// drain the vCPU threads through the identical, deadlock-safe sequence.
-fn retire_ap_waiter(waiting: &mut [bool], index: usize, exited: bool) -> bool {
-    if exited && waiting[index] {
+///
+/// `VcpuThread::exited` is deliberately not the join predicate: the vCPU
+/// panic hook sets it before stack unwinding starts, so a panicking AP may
+/// have `exited == true` while still blocked in a destructor. Only
+/// `JoinHandle::is_finished()` proves `join()` is non-blocking.
+fn retire_ap_waiter(waiting: &mut [bool], index: usize, finished: bool) -> bool {
+    if finished && waiting[index] {
         waiting[index] = false;
         true
     } else {
@@ -1600,18 +1621,150 @@ fn ap_join_wait_quantum(left: Duration) -> Duration {
     left.min(Duration::from_millis(10))
 }
 
-fn kick_and_join_ap_threads(ap_threads: Vec<VcpuThread>) {
-    for vt in &ap_threads {
-        if !vt.exited.load(Ordering::Acquire) {
-            vt.kick();
+/// Delivered pthread CPU service an AP may consume after the teardown kick.
+/// A healthy AP needs only the next KVM_RUN/park-loop edge to observe kill;
+/// two full CPU seconds is deliberately orders of magnitude larger while,
+/// unlike a wall deadline, host descheduling consumes none of it.
+const AP_TEARDOWN_SERVICE_BUDGET_NS: u64 = 2_000_000_000;
+
+/// Fail-safe for an AP blocked without consuming CPU service (for example in
+/// an uninterruptible host syscall or a wedged unwinding destructor). Reuse
+/// the established 30-second freeze-rendezvous ceiling: that bound already
+/// covers the same vCPU host threads under deep CI oversubscription.
+const AP_TEARDOWN_WALL_BACKSTOP: Duration = FREEZE_RENDEZVOUS_TIMEOUT;
+
+const AP_TEARDOWN_FAIL_CLOSED_EXIT_CODE: i32 = 70;
+const AP_TEARDOWN_SERVICE_FAIL_DIAGNOSTIC: &[u8] =
+    b"ktstr fatal: AP teardown delivered-service budget exhausted; terminating the test process to preserve guest-memory lifetime\n";
+const AP_TEARDOWN_WALL_FAIL_DIAGNOSTIC: &[u8] =
+    b"ktstr fatal: AP teardown wall backstop exhausted; terminating the test process to preserve guest-memory lifetime\n";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApTeardownFailCause {
+    ServiceBudget,
+    WallBackstop,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ApTeardownServiceClock {
+    clock_id: libc::clockid_t,
+    anchor_ns: u64,
+}
+
+fn read_cpu_clock_ns(clock_id: libc::clockid_t) -> Option<u64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid writable out-parameter and `clock_id` came from
+    // pthread_getcpuclockid. The call has no ownership side effects.
+    if unsafe { libc::clock_gettime(clock_id, &mut ts) } != 0 || ts.tv_sec < 0 || ts.tv_nsec < 0 {
+        return None;
+    }
+    (ts.tv_sec as u64)
+        .checked_mul(1_000_000_000)?
+        .checked_add(ts.tv_nsec as u64)
+}
+
+fn ap_teardown_service_clock(vt: &VcpuThread) -> Option<ApTeardownServiceClock> {
+    let mut clock_id: libc::clockid_t = 0;
+    // SAFETY: the JoinHandle owns a still-unjoined pthread, so its pthread_t
+    // remains valid for pthread_getcpuclockid throughout teardown.
+    let ret = unsafe {
+        libc::pthread_getcpuclockid(vt.handle.as_pthread_t() as libc::pthread_t, &mut clock_id)
+    };
+    if ret != 0 {
+        return None;
+    }
+    Some(ApTeardownServiceClock {
+        clock_id,
+        anchor_ns: read_cpu_clock_ns(clock_id)?,
+    })
+}
+
+fn ap_teardown_service_exhausted(
+    ap_threads: &[VcpuThread],
+    clocks: &[Option<ApTeardownServiceClock>],
+) -> bool {
+    ap_threads.iter().zip(clocks).any(|(vt, clock)| {
+        if vt.handle.is_finished() {
+            return false;
         }
-        vt.handle.thread().unpark();
+        let Some(clock) = clock else {
+            return false;
+        };
+        read_cpu_clock_ns(clock.clock_id)
+            .is_some_and(|now_ns| ap_teardown_service_budget_exhausted(clock.anchor_ns, now_ns))
+    })
+}
+
+fn ap_teardown_service_budget_exhausted(anchor_ns: u64, now_ns: u64) -> bool {
+    now_ns.saturating_sub(anchor_ns) > AP_TEARDOWN_SERVICE_BUDGET_NS
+}
+
+/// Wake one AP during teardown. Once the AP's exit/panic edge is observed,
+/// never touch its mmap-backed ImmediateExitHandle again: the panic hook sets
+/// `exited` before unwinding may drop the VcpuFd. SIGRTMIN and `unpark` do not
+/// dereference that mapping and remain safe while JoinHandle::is_finished is
+/// still false (for example, a destructor blocked during unwind).
+fn wake_ap_for_teardown(vt: &VcpuThread) {
+    if vt.exited.load(Ordering::Acquire) {
+        vt.signal();
+    } else {
+        vt.kick();
+    }
+    vt.handle.thread().unpark();
+}
+
+/// A Rust thread cannot be forcibly destroyed while preserving Rust and KVM
+/// invariants. Returning would let the VM's guest-memory mmap drop under a
+/// live AP; joining would restore the original unbounded hang. Terminating
+/// the process is therefore the fail-closed same-process boundary.
+///
+/// Use only async-signal-safe libc operations here. A wedged AP could own the
+/// allocator, tracing subscriber, or stderr's Rust lock, so allocating or
+/// formatting the diagnostic could itself recreate the teardown hang.
+#[cold]
+fn fail_closed_ap_teardown(cause: ApTeardownFailCause) -> ! {
+    // SAFETY: these libc calls are async-signal-safe. Best-effort O_NONBLOCK
+    // prevents a full captured-stderr pipe from turning the diagnostic itself
+    // into another teardown wait. `write` receives a valid static byte slice,
+    // and libc `_exit` terminates the whole process on Linux without running
+    // destructors which could touch the live AP's guest-memory references.
+    unsafe {
+        let stderr_flags = libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL);
+        if stderr_flags >= 0 {
+            let _ = libc::fcntl(
+                libc::STDERR_FILENO,
+                libc::F_SETFL,
+                stderr_flags | libc::O_NONBLOCK,
+            );
+        }
+        let diagnostic = match cause {
+            ApTeardownFailCause::ServiceBudget => AP_TEARDOWN_SERVICE_FAIL_DIAGNOSTIC,
+            ApTeardownFailCause::WallBackstop => AP_TEARDOWN_WALL_FAIL_DIAGNOSTIC,
+        };
+        let _ = libc::write(
+            libc::STDERR_FILENO,
+            diagnostic.as_ptr().cast(),
+            diagnostic.len(),
+        );
+        libc::_exit(AP_TEARDOWN_FAIL_CLOSED_EXIT_CODE);
+    }
+}
+
+fn kick_and_join_ap_threads(ap_threads: Vec<VcpuThread>) {
+    let service_clocks: Vec<_> = ap_threads.iter().map(ap_teardown_service_clock).collect();
+    for vt in &ap_threads {
+        if !vt.handle.is_finished() {
+            wake_ap_for_teardown(vt);
+        }
     }
     let mut waiting = vec![false; ap_threads.len()];
     let mut remaining = 0usize;
     let mut epoll = Epoll::new().ok();
     for (i, vt) in ap_threads.iter().enumerate() {
-        if vt.exited.load(Ordering::Acquire) {
+        if vt.handle.is_finished() {
             continue;
         }
         waiting[i] = true;
@@ -1624,23 +1777,30 @@ fn kick_and_join_ap_threads(ap_threads: Vec<VcpuThread>) {
             );
         }
     }
+    let wall_deadline = Instant::now() + AP_TEARDOWN_WALL_BACKSTOP;
+    let mut fail_cause = None;
     if remaining > 0 {
         let mut events = vec![EpollEvent::default(); remaining];
-        let deadline = Instant::now() + Duration::from_secs(2);
         while remaining > 0 {
-            let left = deadline.saturating_duration_since(Instant::now());
+            if ap_teardown_service_exhausted(&ap_threads, &service_clocks) {
+                fail_cause = Some(ApTeardownFailCause::ServiceBudget);
+                break;
+            }
+            let left = wall_deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
+                fail_cause = Some(ApTeardownFailCause::WallBackstop);
                 break;
             }
             // A timeout is intentional: no exit event means the AP did
             // not respond to the prior kick, so wake and re-kick instead
-            // of sleeping for the full two-second drain deadline.
+            // of sleeping for the full teardown bound.
             let quantum = ap_join_wait_quantum(left);
             let ms = quantum.as_millis().max(1).min(i32::MAX as u128) as i32;
             let mut epoll_failed = false;
+            let mut ready_events = 0usize;
             if let Some(epoll) = &epoll {
                 match epoll.wait(ms, &mut events) {
-                    Ok(_) => {}
+                    Ok(n) => ready_events = n,
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(error) => {
                         tracing::warn!(%error, "AP teardown epoll wait failed; using timed re-kick");
@@ -1654,8 +1814,19 @@ fn kick_and_join_ap_threads(ap_threads: Vec<VcpuThread>) {
                 epoll = None;
                 std::thread::sleep(quantum);
             }
+            // The panic hook signals exit_evt before unwinding, so the event
+            // is only a wake hint, not proof the JoinHandle finished. Drain
+            // each reported level-triggered counter before the scan; leaving
+            // a pre-unwind event readable would turn the remainder of the
+            // teardown window into a hot epoll loop.
+            for event in &events[..ready_events] {
+                let index = event.data() as usize;
+                if index < ap_threads.len() {
+                    let _ = ap_threads[index].exit_evt.read();
+                }
+            }
             for (i, vt) in ap_threads.iter().enumerate() {
-                if retire_ap_waiter(&mut waiting, i, vt.exited.load(Ordering::Acquire)) {
+                if retire_ap_waiter(&mut waiting, i, vt.handle.is_finished()) {
                     remaining -= 1;
                     if let Some(epoll) = &epoll {
                         let _ = epoll.ctl(
@@ -1664,13 +1835,17 @@ fn kick_and_join_ap_threads(ap_threads: Vec<VcpuThread>) {
                             EpollEvent::default(),
                         );
                     }
-                    let _ = vt.exit_evt.read();
                 } else if waiting[i] {
-                    vt.kick();
-                    vt.handle.thread().unpark();
+                    wake_ap_for_teardown(vt);
                 }
             }
         }
+    }
+
+    // Do not allocate or format after either bound. A wedged AP could own the
+    // process allocator; the final decision is a direct handle scan.
+    if ap_threads.iter().any(|vt| !vt.handle.is_finished()) {
+        fail_closed_ap_teardown(fail_cause.unwrap_or(ApTeardownFailCause::WallBackstop));
     }
     for vt in ap_threads {
         let _ = vt.handle.join();
@@ -1679,8 +1854,72 @@ fn kick_and_join_ap_threads(ap_threads: Vec<VcpuThread>) {
 
 #[cfg(test)]
 mod ap_join_accounting_tests {
-    use super::{ap_join_wait_quantum, retire_ap_waiter};
-    use std::time::Duration;
+    use super::{
+        AP_TEARDOWN_FAIL_CLOSED_EXIT_CODE, AP_TEARDOWN_SERVICE_BUDGET_NS,
+        AP_TEARDOWN_SERVICE_FAIL_DIAGNOSTIC, AP_TEARDOWN_WALL_BACKSTOP, FREEZE_RENDEZVOUS_TIMEOUT,
+        ap_join_wait_quantum, ap_teardown_service_budget_exhausted, kick_and_join_ap_threads, kvm,
+        register_vcpu_signal_handler, retire_ap_waiter, vcpu_panic,
+    };
+    use crate::sync::Latch;
+    use crate::vmm::result::HostVcpuSchedstat;
+    use crate::vmm::topology::Topology;
+    use crate::vmm::vcpu::{ImmediateExitHandle, VcpuThread};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
+
+    const AP_TEARDOWN_PRODUCTION_CHILD: &str = "KTSTR_AP_TEARDOWN_PRODUCTION_CHILD";
+    const HOST_DELAY_MODE: &str = "host-delay";
+    const UNWINDING_MODE: &str = "unwinding";
+    const IE_REWRITE_EXIT_CODE: i32 = 71;
+    const CHILD_SETUP_EXIT_CODE: i32 = 72;
+    const UNEXPECTED_RETURN_EXIT_CODE: i32 = 73;
+
+    fn real_vcpu() -> (kvm_ioctls::VcpuFd, ImmediateExitHandle) {
+        let topology = Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+            llc_cores: None,
+        };
+        let mut vm = kvm::KtstrKvm::new(topology, 64, false)
+            .expect("create real KVM vCPU for AP teardown regression");
+        let immediate_exit = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
+        (vm.vcpus.remove(0), immediate_exit)
+    }
+
+    fn vcpu_thread(
+        handle: std::thread::JoinHandle<kvm_ioctls::VcpuFd>,
+        exited: Arc<AtomicBool>,
+        immediate_exit: ImmediateExitHandle,
+        exit_evt: Arc<EventFd>,
+        alive: Arc<AtomicBool>,
+    ) -> VcpuThread {
+        VcpuThread {
+            handle,
+            exited,
+            immediate_exit: Some(immediate_exit),
+            exit_evt,
+            alive,
+            schedstat_at_exit: Arc::new(std::sync::Mutex::new(None::<HostVcpuSchedstat>)),
+        }
+    }
+
+    fn run_production_child(mode: &str) -> std::process::Output {
+        let helper =
+            "vmm::freeze_coord::ap_join_accounting_tests::production_teardown_subprocess_helper";
+        std::process::Command::new(
+            std::env::current_exe().expect("resolve current unit-test executable"),
+        )
+        .args(["--exact", helper, "--nocapture", "--test-threads=1"])
+        .env(AP_TEARDOWN_PRODUCTION_CHILD, mode)
+        .output()
+        .expect("run AP teardown production-path subprocess")
+    }
 
     #[test]
     fn level_triggered_exit_is_retired_once_per_ap_index() {
@@ -1708,6 +1947,213 @@ mod ap_join_accounting_tests {
         assert_eq!(
             ap_join_wait_quantum(Duration::from_millis(3)),
             Duration::from_millis(3),
+        );
+    }
+
+    #[test]
+    fn service_budget_is_strict_saturating_and_uses_existing_wall_ceiling() {
+        let anchor = 123;
+        assert!(!ap_teardown_service_budget_exhausted(
+            anchor,
+            anchor + AP_TEARDOWN_SERVICE_BUDGET_NS,
+        ));
+        assert!(ap_teardown_service_budget_exhausted(
+            anchor,
+            anchor + AP_TEARDOWN_SERVICE_BUDGET_NS + 1,
+        ));
+        assert!(
+            !ap_teardown_service_budget_exhausted(u64::MAX, 0),
+            "a regressed clock must saturate instead of fabricating service",
+        );
+        assert_eq!(AP_TEARDOWN_WALL_BACKSTOP, FREEZE_RENDEZVOUS_TIMEOUT);
+    }
+
+    #[test]
+    fn production_teardown_subprocess_helper() {
+        let Some(mode) = std::env::var_os(AP_TEARDOWN_PRODUCTION_CHILD) else {
+            return;
+        };
+        register_vcpu_signal_handler();
+        match mode.to_str().expect("ASCII AP teardown child mode") {
+            HOST_DELAY_MODE => {
+                let (vcpu, immediate_exit) = real_vcpu();
+                let exited = Arc::new(AtomicBool::new(false));
+                let exit_evt = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+                let alive = Arc::new(AtomicBool::new(true));
+                let release = Arc::new(Latch::new());
+
+                let exited_ap = Arc::clone(&exited);
+                let exit_evt_ap = Arc::clone(&exit_evt);
+                let release_ap = Arc::clone(&release);
+                let handle = std::thread::Builder::new()
+                    .name("ap-teardown-host-delay".into())
+                    .spawn(move || {
+                        register_vcpu_signal_handler();
+                        release_ap.wait();
+                        exited_ap.store(true, Ordering::Release);
+                        exit_evt_ap.write(1).unwrap();
+                        vcpu
+                    })
+                    .unwrap();
+                let vt = vcpu_thread(handle, exited, immediate_exit, exit_evt, alive);
+
+                // Hold the AP without delivering it CPU service past the old
+                // fixed two-second wall cutoff. The production service clock
+                // must permit the eventual exit instead of killing the test.
+                let releaser = std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(2_500));
+                    release.set();
+                });
+                let started = Instant::now();
+                kick_and_join_ap_threads(vec![vt]);
+                releaser.join().unwrap();
+                assert!(
+                    started.elapsed() >= Duration::from_millis(2_300),
+                    "production teardown did not exercise the former wall cutoff",
+                );
+                assert!(
+                    started.elapsed() < AP_TEARDOWN_WALL_BACKSTOP,
+                    "zero-service host delay must remain below the wall backstop",
+                );
+            }
+            UNWINDING_MODE => {
+                struct CpuBurnOnDrop {
+                    entered: Arc<Latch>,
+                }
+
+                impl Drop for CpuBurnOnDrop {
+                    fn drop(&mut self) {
+                        self.entered.set();
+                        loop {
+                            std::hint::spin_loop();
+                        }
+                    }
+                }
+
+                vcpu_panic::install_once();
+                let (vcpu, immediate_exit) = real_vcpu();
+                let exited = Arc::new(AtomicBool::new(false));
+                let exit_evt = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+                let alive = Arc::new(AtomicBool::new(true));
+                let kill = Arc::new(AtomicBool::new(false));
+                let kill_evt = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+                let drop_entered = Arc::new(Latch::new());
+
+                let exited_ap = Arc::clone(&exited);
+                let exit_evt_ap = Arc::clone(&exit_evt);
+                let alive_ap = Arc::clone(&alive);
+                let kill_ap = Arc::clone(&kill);
+                let kill_evt_ap = Arc::clone(&kill_evt);
+                let drop_entered_ap = Arc::clone(&drop_entered);
+                let handle = std::thread::Builder::new()
+                    .name("ap-teardown-unwinding".into())
+                    .spawn(move || -> kvm_ioctls::VcpuFd {
+                        register_vcpu_signal_handler();
+                        let panic_ctx = vcpu_panic::VcpuPanicCtx {
+                            kill: kill_ap,
+                            exited: exited_ap,
+                            kill_evt: Some(kill_evt_ap),
+                            exited_evt: Some(exit_evt_ap),
+                            alive: Some(alive_ap),
+                        };
+                        vcpu_panic::with_vcpu_panic_ctx(panic_ctx, move || {
+                            // Declared before `_burn` so reverse-order unwind
+                            // enters the blocking destructor while the VcpuFd
+                            // (and its kvm_run mmap) is still alive.
+                            let _vcpu = vcpu;
+                            let _burn = CpuBurnOnDrop {
+                                entered: drop_entered_ap,
+                            };
+                            panic!("induced AP panic with blocked unwinding");
+                        })
+                    })
+                    .unwrap();
+                let vt = vcpu_thread(
+                    handle,
+                    Arc::clone(&exited),
+                    immediate_exit,
+                    exit_evt,
+                    Arc::clone(&alive),
+                );
+
+                if !drop_entered.wait_timeout(Duration::from_secs(5)) {
+                    // SAFETY: subprocess-only setup failure; no Rust teardown
+                    // is useful with the AP state unknown.
+                    unsafe { libc::_exit(CHILD_SETUP_EXIT_CODE) };
+                }
+                assert!(exited.load(Ordering::Acquire));
+                assert!(!alive.load(Ordering::Acquire));
+
+                // Every production retry after the panic edge must remain
+                // signal-only. Poison the secondary liveness gate back to
+                // true so an accidental call to the old `kick()` path cannot
+                // pass merely because that method also checks `alive`.
+                // `_burn` keeps the real VcpuFd/kvm_run mapping valid, making
+                // this a safe, observable write sentinel while `exited=true`
+                // remains the authoritative production edge.
+                alive.store(true, Ordering::Release);
+                std::thread::spawn(move || {
+                    loop {
+                        if immediate_exit.read_byte() != 0 {
+                            // SAFETY: subprocess-only sentinel. Distinct status
+                            // proves a post-panic mmap write beat fail-closed.
+                            unsafe { libc::_exit(IE_REWRITE_EXIT_CODE) };
+                        }
+                        // The byte remains set after an illegal kick, so
+                        // millisecond polling detects it without competing
+                        // materially with the AP's delivered-service clock.
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                });
+
+                kick_and_join_ap_threads(vec![vt]);
+                // SAFETY: the blocked unwind cannot validly be joined.
+                unsafe { libc::_exit(UNEXPECTED_RETURN_EXIT_CODE) };
+            }
+            other => panic!("unknown AP teardown child mode: {other}"),
+        }
+    }
+
+    #[test]
+    fn production_teardown_tolerates_delay_past_old_wall_limit() {
+        let started = Instant::now();
+        let output = run_production_child(HOST_DELAY_MODE);
+        assert!(
+            output.status.success(),
+            "service-accounted production teardown rejected zero-service host delay: \
+             stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "child must actually cross the former two-second wall deadline",
+        );
+    }
+
+    #[test]
+    fn production_teardown_fail_closes_unwinding_ap_without_ie_rewrite() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = run_production_child(UNWINDING_MODE);
+        assert_eq!(
+            output.status.code(),
+            Some(AP_TEARDOWN_FAIL_CLOSED_EXIT_CODE),
+            "production teardown must consume its delivered-service budget and \
+             fail closed before join; status {} specifically means an illegal \
+             post-panic ImmediateExitHandle write; signal={:?}, stdout={}, stderr={}",
+            IE_REWRITE_EXIT_CODE,
+            output.status.signal(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            output
+                .stderr
+                .windows(AP_TEARDOWN_SERVICE_FAIL_DIAGNOSTIC.len())
+                .any(|window| window == AP_TEARDOWN_SERVICE_FAIL_DIAGNOSTIC),
+            "production service deadline must emit its allocation-free diagnostic: {}",
+            String::from_utf8_lossy(&output.stderr),
         );
     }
 }
@@ -12990,6 +13436,7 @@ impl KtstrVm {
                         }
                         AttachWatchdogDecision::None
                         | AttachWatchdogDecision::FailClosed { .. }
+                        | AttachWatchdogDecision::FinishUnsettled { .. }
                         | AttachWatchdogDecision::SensorTerminal { .. } => {}
                     }
                     let attach_failure = match attach_step.decision {
@@ -13018,9 +13465,38 @@ impl KtstrVm {
                         }
                         AttachWatchdogDecision::None
                         | AttachWatchdogDecision::RequestCancel { .. }
+                        | AttachWatchdogDecision::FinishUnsettled { .. }
                         | AttachWatchdogDecision::SensorTerminal { .. } => None,
                     };
-                    let attach_fail_closed = attach_failure.is_some();
+                    let attach_finish_failure = match attach_step.decision {
+                        AttachWatchdogDecision::FinishUnsettled {
+                            generation,
+                            kind,
+                            service_after_finished_ns,
+                            grace_budget_ns,
+                        } => {
+                            eprintln!(
+                                "ktstr-watchdog: scheduler attach finish rendezvous did not \
+                                 settle; failing closed: generation={generation}, \
+                                 kind={kind:?}, max_vcpu_service_since_finished={:?}, \
+                                 grace_budget={:?}",
+                                Duration::from_nanos(service_after_finished_ns),
+                                Duration::from_nanos(grace_budget_ns),
+                            );
+                            Some((
+                                generation,
+                                kind,
+                                service_after_finished_ns,
+                                grace_budget_ns,
+                            ))
+                        }
+                        AttachWatchdogDecision::None
+                        | AttachWatchdogDecision::RequestCancel { .. }
+                        | AttachWatchdogDecision::FailClosed { .. }
+                        | AttachWatchdogDecision::SensorTerminal { .. } => None,
+                    };
+                    let attach_fail_closed =
+                        attach_failure.is_some() || attach_finish_failure.is_some();
                     let attach_monitor_failure = match attach_step.decision {
                         AttachWatchdogDecision::SensorTerminal {
                             generation,
@@ -13037,7 +13513,8 @@ impl KtstrVm {
                         }
                         AttachWatchdogDecision::None
                         | AttachWatchdogDecision::RequestCancel { .. }
-                        | AttachWatchdogDecision::FailClosed { .. } => None,
+                        | AttachWatchdogDecision::FailClosed { .. }
+                        | AttachWatchdogDecision::FinishUnsettled { .. } => None,
                     };
                     let attach_monitor_unavailable = attach_monitor_failure.is_some();
                     // CPU-trickle verdict for this tick — the Tier-3
@@ -13140,6 +13617,9 @@ impl KtstrVm {
                         let reason_tag = match progress_decision {
                             _ if attach_monitor_unavailable => {
                                 KillReasonTag::AttachMonitorUnavailable
+                            }
+                            _ if attach_finish_failure.is_some() => {
+                                KillReasonTag::AttachFinishUnsettled
                             }
                             _ if attach_fail_closed => KillReasonTag::AttachCancelUnacked,
                             watchdog_step::KillDecision::Tier1CpuBudget => KillReasonTag::Tier1Cpu,
@@ -13251,6 +13731,8 @@ impl KtstrVm {
                         };
                         let fire_event = if attach_monitor_unavailable {
                             "attach monitor unavailable"
+                        } else if attach_finish_failure.is_some() {
+                            "attach finish rendezvous grace exhausted"
                         } else if attach_fail_closed {
                             "attach cancellation grace exhausted"
                         } else if tier_fire {
@@ -13294,6 +13776,20 @@ impl KtstrVm {
                                  cancel_cause:{cause:?}, \
                                  max_vcpu_service_since_cancel={:?} vs grace_budget={:?}",
                                 Duration::from_nanos(service_after_cancel_ns),
+                                Duration::from_nanos(grace_budget_ns),
+                            );
+                        }
+                        if let Some((
+                            generation,
+                            kind,
+                            service_after_finished_ns,
+                            grace_budget_ns,
+                        )) = attach_finish_failure
+                        {
+                            eprintln!(
+                                "  attach_overlay=generation:{generation} kind:{kind:?} \
+                                 max_vcpu_service_since_finished={:?} vs grace_budget={:?}",
+                                Duration::from_nanos(service_after_finished_ns),
                                 Duration::from_nanos(grace_budget_ns),
                             );
                         }

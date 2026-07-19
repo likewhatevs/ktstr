@@ -25,6 +25,17 @@ type AttachControlConsole =
 /// Every host path follows the fixed tracker→virtio-console lock order. This
 /// makes state promotion and packet order atomic relative to watchdog
 /// cancellation.
+///
+/// This nested lock cannot inherit guest backpressure: `queue_input` appends
+/// the fixed 17-byte control packet to a host-owned deque and makes at most
+/// one bounded `drain_pending_rx(0)` pass. That pass has an explicit
+/// `RX_CHAINS_PER_CALL_MAX` cap (including zero-progress descriptor chains),
+/// and every other `VirtioConsole` critical section is likewise a bounded
+/// device operation: no condition wait, blocking read/write, thread join, or
+/// guest-response wait is performed while its `PiMutex` is held. The mutex
+/// uses priority inheritance, so retaining tracker→console ordering gives
+/// deterministic packet order without letting a blocked guest reader pin the
+/// watchdog behind guest I/O.
 fn acknowledge_boundary_locked(console: &AttachControlConsole, event: AttachAttemptEvent) {
     match event.transition {
         AttachAttemptTransition::Started => {
@@ -47,6 +58,13 @@ const ATTACH_SERVICE_BUDGET_NS: u64 = 35_000_000_000;
 /// as an otherwise idle cell.
 const ATTACH_CANCEL_SERVICE_GRACE_NS: u64 = 5_000_000_000;
 
+/// Delivered max-vCPU service allowed for the FinishedAck/Settled
+/// rendezvous. `Finished` starts a fresh accounting epoch, so wall time while
+/// the VM is host-starved is free, but a guest which continues to receive
+/// service without consuming the ACK and publishing `Settled` cannot suppress
+/// the ordinary lifecycle watchdog forever.
+const ATTACH_FINISH_SERVICE_GRACE_NS: u64 = 5_000_000_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AttachWatchdogDecision {
     None,
@@ -63,6 +81,15 @@ pub(super) enum AttachWatchdogDecision {
         kind: AttachAttemptKind,
         cause: AttachCancelCause,
         service_after_cancel_ns: u64,
+        grace_budget_ns: u64,
+    },
+    /// `Finished` was accepted and acknowledged, but the guest consumed more
+    /// than the bounded delivered-service grace without publishing the FIFO
+    /// `Settled` boundary which proves it consumed that ACK.
+    FinishUnsettled {
+        generation: u64,
+        kind: AttachAttemptKind,
+        service_after_finished_ns: u64,
         grace_budget_ns: u64,
     },
     /// The host monitor reached a known terminal state while the attach
@@ -126,6 +153,7 @@ struct ActiveAttempt {
 struct FinishingAttempt {
     generation: u64,
     kind: AttachAttemptKind,
+    accounting_epoch: u32,
 }
 
 #[derive(Debug, Default)]
@@ -157,27 +185,19 @@ impl std::fmt::Debug for AttachAttemptTracker {
 }
 
 impl AttachAttemptTracker {
-    /// Apply one CRC- and shape-validated guest boundary.
-    ///
-    /// Accepted starts and matching settles each re-anchor the monitor's
-    /// max-vCPU tracker without changing the coarse lifecycle stage. Finished
-    /// moves the overlay into a non-charging rendezvous until the matching
-    /// Settled proves the guest consumed its ACK. Duplicate, stale,
-    /// conflicting, and unmatched events never move the anchor, so a buggy
-    /// guest cannot evade the service budget by replaying `Started`.
-    pub(super) fn observe_event(
+    fn observe_event_with_ack(
         &self,
         event: AttachAttemptEvent,
         ledger: &ProgressLedger,
         wall_ns: u64,
-        control_console: &AttachControlConsole,
+        mut acknowledge: impl FnMut(AttachAttemptEvent),
     ) -> AttachEventDisposition {
         let mut state = self.state.lock();
         match event.transition {
             AttachAttemptTransition::Started => {
                 if let Some(active) = state.active {
                     if active.generation == event.generation && active.kind == event.kind {
-                        acknowledge_boundary_locked(control_console, event);
+                        acknowledge(event);
                         return AttachEventDisposition::Duplicate;
                     }
                     return AttachEventDisposition::Conflict;
@@ -200,13 +220,13 @@ impl AttachAttemptTracker {
                     accounting_epoch,
                     cancel: None,
                 });
-                acknowledge_boundary_locked(control_console, event);
+                acknowledge(event);
                 AttachEventDisposition::Started
             }
             AttachAttemptTransition::Finished => {
                 if let Some(finishing) = state.finishing {
                     if finishing.generation == event.generation && finishing.kind == event.kind {
-                        acknowledge_boundary_locked(control_console, event);
+                        acknowledge(event);
                         return AttachEventDisposition::Duplicate;
                     }
                     return if event.generation < finishing.generation {
@@ -217,7 +237,7 @@ impl AttachAttemptTracker {
                 }
                 let Some(active) = state.active else {
                     if state.last_settled == Some((event.generation, event.kind)) {
-                        acknowledge_boundary_locked(control_console, event);
+                        acknowledge(event);
                         return AttachEventDisposition::Duplicate;
                     }
                     return if event.generation <= state.last_generation {
@@ -234,19 +254,20 @@ impl AttachAttemptTracker {
                     };
                 }
 
-                // Finished reanchors into a fresh zero-service epoch, stops
-                // charging immediately, but deliberately keeps a
-                // non-charging overlay installed until the guest consumes the
-                // matching ACK and sends Settled. Coarse accounting stays
-                // suppressed throughout that rendezvous, so a host-starved
-                // ACK waiter cannot be killed by a stale Attach-stage sample.
-                ledger.reanchor_phase_cpu(wall_ns);
+                // Queue FinishedAck first while the tracker still serializes
+                // every boundary and watchdog cancellation. Only after that
+                // enqueue completes do we establish the finishing epoch:
+                // console-mutex contention belongs to the active attempt, not
+                // to the guest's delivered-service allowance for consuming an
+                // ACK which did not yet exist.
+                acknowledge(event);
+                let accounting_epoch = ledger.reanchor_phase_cpu(wall_ns);
                 state.active = None;
                 state.finishing = Some(FinishingAttempt {
                     generation: event.generation,
                     kind: event.kind,
+                    accounting_epoch,
                 });
-                acknowledge_boundary_locked(control_console, event);
                 AttachEventDisposition::Finished
             }
             AttachAttemptTransition::Settled => {
@@ -277,6 +298,26 @@ impl AttachAttemptTracker {
                 }
             }
         }
+    }
+
+    /// Apply one CRC- and shape-validated guest boundary.
+    ///
+    /// Accepted starts and matching settles each re-anchor the monitor's
+    /// max-vCPU tracker without changing the coarse lifecycle stage. Finished
+    /// moves the overlay into a fresh, service-accounted rendezvous until the
+    /// matching Settled proves the guest consumed its ACK. Duplicate, stale,
+    /// conflicting, and unmatched events never move the anchor, so a buggy
+    /// guest cannot evade the service budget by replaying `Started`.
+    pub(super) fn observe_event(
+        &self,
+        event: AttachAttemptEvent,
+        ledger: &ProgressLedger,
+        wall_ns: u64,
+        control_console: &AttachControlConsole,
+    ) -> AttachEventDisposition {
+        self.observe_event_with_ack(event, ledger, wall_ns, |event| {
+            acknowledge_boundary_locked(control_console, event);
+        })
     }
 
     /// Take one state/ledger-coherent host watchdog tick and atomically latch
@@ -325,15 +366,56 @@ impl AttachAttemptTracker {
                 };
             }
         }
+        if let Some(mut finishing) = state.finishing {
+            // A lifecycle transition racing Finished can publish a different
+            // monitor epoch. As for an active attach/cancellation grace, do
+            // not charge a sample from the wrong anchor and do not return
+            // None forever: rebase once to the observed generation, then
+            // charge subsequent delivered service directly.
+            if snapshot.phase_epoch != finishing.accounting_epoch {
+                finishing.accounting_epoch = ledger.reanchor_phase_cpu(now_wall_ns);
+                state.finishing = Some(finishing);
+                return AttachWatchdogTick {
+                    snapshot: ledger.snapshot(),
+                    monitor_live,
+                    attach: AttachWatchdogStep {
+                        active: true,
+                        decision: AttachWatchdogDecision::None,
+                    },
+                };
+            }
+
+            let service_grace = watchdog_step::widen_budget_for_currency(
+                ATTACH_FINISH_SERVICE_GRACE_NS,
+                snapshot.cpu_currency,
+            );
+            let service_grace_exhausted = snapshot.cpu_currency != CPU_CURRENCY_NONE
+                && snapshot.max_vcpu_cpu_in_phase_ns > service_grace;
+            return AttachWatchdogTick {
+                snapshot,
+                monitor_live,
+                attach: AttachWatchdogStep {
+                    active: true,
+                    decision: if service_grace_exhausted {
+                        AttachWatchdogDecision::FinishUnsettled {
+                            generation: finishing.generation,
+                            kind: finishing.kind,
+                            service_after_finished_ns: snapshot.max_vcpu_cpu_in_phase_ns,
+                            grace_budget_ns: service_grace,
+                        }
+                    } else {
+                        AttachWatchdogDecision::None
+                    },
+                },
+            };
+        }
+
         let Some(mut active) = state.active else {
             return AttachWatchdogTick {
                 snapshot,
                 monitor_live,
                 attach: AttachWatchdogStep {
-                    // Finishing no longer charges or cancels, but it continues
-                    // to own the coarse watchdog until the guest's Settled
-                    // boundary proves FinishedAck was consumed.
-                    active: state.finishing.is_some(),
+                    active: false,
                     decision: AttachWatchdogDecision::None,
                 },
             };
@@ -555,7 +637,7 @@ mod tests {
         assert_eq!(
             ledger.phase_epoch.load(Ordering::Acquire),
             2,
-            "Finished must reanchor the non-charging ACK rendezvous",
+            "Finished must reanchor the service-accounted ACK rendezvous",
         );
 
         // A retried terminal boundary is accepted idempotently so the host
@@ -608,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn started_and_finished_same_drain_leave_non_charging_overlay_until_settled() {
+    fn started_and_finished_same_drain_leave_fresh_overlay_until_settled() {
         let tracker = AttachAttemptTracker::default();
         let ledger = ProgressLedger::default();
         let console = test_control_console();
@@ -620,6 +702,10 @@ mod tests {
             9,
         );
 
+        // The console deliberately has no guest memory, ready queue, or
+        // reader. Accepted boundaries must still return after appending to
+        // the host-owned pending deque; queue_input must never wait for guest
+        // RX capacity while tracker→console serialization is held.
         assert_eq!(
             tracker.observe_event(started, &ledger, 100, &console),
             AttachEventDisposition::Started
@@ -634,6 +720,88 @@ mod tests {
 
         let mut expected = crate::vmm::wire::encode_attach_started_ack(9).to_vec();
         expected.extend_from_slice(&crate::vmm::wire::encode_attach_finished_ack(9));
+        assert_eq!(console.lock().pending_rx_bytes_for_test(), expected);
+    }
+
+    #[test]
+    fn finished_grace_starts_only_after_delayed_console_enqueue() {
+        let tracker = Arc::new(AttachAttemptTracker::default());
+        let ledger = Arc::new(ProgressLedger::default());
+        let console = test_control_console();
+        let mut liveness = watchdog_step::MonitorLiveness::new();
+        assert_eq!(
+            tracker.observe_event(
+                event(
+                    AttachAttemptTransition::Started,
+                    AttachAttemptKind::Replace,
+                    12,
+                ),
+                &ledger,
+                0,
+                &console,
+            ),
+            AttachEventDisposition::Started,
+        );
+        assert_eq!(ledger.phase_epoch.load(Ordering::Acquire), 1);
+
+        // Hold the actual console mutex, then use the testable serialized
+        // enqueue seam to signal precisely after the finisher acquired the
+        // tracker and immediately before it tries the production ACK path.
+        // This makes the console delay deterministic without sleeps.
+        let console_guard = console.lock();
+        let (enqueue_entered_tx, enqueue_entered_rx) = std::sync::mpsc::channel();
+        let tracker_for_finish = Arc::clone(&tracker);
+        let ledger_for_finish = Arc::clone(&ledger);
+        let console_for_finish = Arc::clone(&console);
+        let finisher = std::thread::spawn(move || {
+            tracker_for_finish.observe_event_with_ack(
+                event(
+                    AttachAttemptTransition::Finished,
+                    AttachAttemptKind::Replace,
+                    12,
+                ),
+                &ledger_for_finish,
+                1,
+                |event| {
+                    enqueue_entered_tx.send(()).expect("signal enqueue entry");
+                    acknowledge_boundary_locked(&console_for_finish, event);
+                },
+            )
+        });
+        enqueue_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("finisher reached delayed console enqueue");
+
+        // Service published while FinishedAck is still blocked belongs to the
+        // active attempt. The finishing epoch must not exist yet.
+        publish(
+            &ledger,
+            ATTACH_FINISH_SERVICE_GRACE_NS + 1,
+            CPU_CURRENCY_PMU,
+            true,
+            true,
+        );
+        assert_eq!(
+            ledger.phase_epoch.load(Ordering::Acquire),
+            1,
+            "console delay must precede the finishing reanchor",
+        );
+
+        drop(console_guard);
+        assert_eq!(
+            finisher.join().expect("finisher thread"),
+            AttachEventDisposition::Finished,
+        );
+        assert_eq!(ledger.phase_epoch.load(Ordering::Acquire), 2);
+        let just_acked = tick(&tracker, &ledger, 2, &mut liveness);
+        assert_eq!(
+            just_acked.snapshot.max_vcpu_cpu_in_phase_ns, 0,
+            "pre-ACK service must be discarded by the post-enqueue reanchor",
+        );
+        assert_eq!(just_acked.attach.decision, AttachWatchdogDecision::None,);
+
+        let mut expected = crate::vmm::wire::encode_attach_started_ack(12).to_vec();
+        expected.extend_from_slice(&crate::vmm::wire::encode_attach_finished_ack(12));
         assert_eq!(console.lock().pending_rx_bytes_for_test(), expected);
     }
 
@@ -743,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn finishing_suppresses_coarse_watchdog_without_charging_or_cancelling() {
+    fn finishing_suppresses_coarse_watchdog_but_charges_its_fresh_service_epoch() {
         let tracker = AttachAttemptTracker::default();
         let ledger = ProgressLedger::default();
         let mut liveness = watchdog_step::MonitorLiveness::new();
@@ -785,12 +953,44 @@ mod tests {
         assert_eq!(after.attach.decision, AttachWatchdogDecision::None);
 
         // Arbitrary host wall time, no runnable demand, dead channels, and no
-        // delivered service cannot turn an ACK rendezvous into cancellation.
+        // delivered service cannot exhaust an ACK rendezvous.
         publish(&ledger, 0, CPU_CURRENCY_NONE, false, false);
-        ledger.reanchor_phase_cpu(u64::MAX - 1);
         let starved = tick(&tracker, &ledger, u64::MAX, &mut liveness);
         assert!(starved.attach.active);
         assert_eq!(starved.attach.decision, AttachWatchdogDecision::None);
+
+        publish(
+            &ledger,
+            ATTACH_FINISH_SERVICE_GRACE_NS,
+            CPU_CURRENCY_PMU,
+            true,
+            true,
+        );
+        assert_eq!(
+            tick(&tracker, &ledger, u64::MAX, &mut liveness)
+                .attach
+                .decision,
+            AttachWatchdogDecision::None,
+            "the exact delivered-service budget remains permitted",
+        );
+        publish(
+            &ledger,
+            ATTACH_FINISH_SERVICE_GRACE_NS + 1,
+            CPU_CURRENCY_PMU,
+            true,
+            true,
+        );
+        assert_eq!(
+            tick(&tracker, &ledger, u64::MAX, &mut liveness)
+                .attach
+                .decision,
+            AttachWatchdogDecision::FinishUnsettled {
+                generation: 2,
+                kind: AttachAttemptKind::Attach,
+                service_after_finished_ns: ATTACH_FINISH_SERVICE_GRACE_NS + 1,
+                grace_budget_ns: ATTACH_FINISH_SERVICE_GRACE_NS,
+            },
+        );
 
         assert_eq!(
             observe(
@@ -808,6 +1008,61 @@ mod tests {
         let settled = tick(&tracker, &ledger, u64::MAX, &mut liveness);
         assert!(!settled.attach.active);
         assert_eq!(settled.snapshot.max_vcpu_cpu_in_phase_ns, 0);
+    }
+
+    #[test]
+    fn finishing_epoch_mismatch_rebases_once_then_fails_on_fresh_service() {
+        let tracker = AttachAttemptTracker::default();
+        let ledger = ProgressLedger::default();
+        let mut liveness = watchdog_step::MonitorLiveness::new();
+        for transition in [
+            AttachAttemptTransition::Started,
+            AttachAttemptTransition::Finished,
+        ] {
+            assert!(matches!(
+                observe(
+                    &tracker,
+                    event(transition, AttachAttemptKind::Replace, 22),
+                    &ledger,
+                    0,
+                ),
+                AttachEventDisposition::Started | AttachEventDisposition::Finished,
+            ));
+        }
+
+        // Model an unrelated lifecycle epoch advance which raced the
+        // rendezvous, followed by a large publication for that foreign
+        // anchor. The first tick must discard it and establish a fresh epoch.
+        ledger.reanchor_phase_cpu(1);
+        publish(
+            &ledger,
+            ATTACH_FINISH_SERVICE_GRACE_NS + 1,
+            CPU_CURRENCY_PMU,
+            true,
+            true,
+        );
+        let rebased = tick(&tracker, &ledger, 2, &mut liveness);
+        assert_eq!(rebased.attach.decision, AttachWatchdogDecision::None);
+        assert_eq!(
+            rebased.snapshot.max_vcpu_cpu_in_phase_ns, 0,
+            "a foreign epoch's service must not be charged to finishing",
+        );
+
+        publish(
+            &ledger,
+            ATTACH_FINISH_SERVICE_GRACE_NS + 1,
+            CPU_CURRENCY_PMU,
+            true,
+            true,
+        );
+        assert!(matches!(
+            tick(&tracker, &ledger, 3, &mut liveness).attach.decision,
+            AttachWatchdogDecision::FinishUnsettled {
+                generation: 22,
+                kind: AttachAttemptKind::Replace,
+                ..
+            },
+        ));
     }
 
     #[test]
@@ -979,6 +1234,43 @@ mod tests {
         assert!(matches!(
             tick(&tracker, &ledger, 2, &mut liveness).attach.decision,
             AttachWatchdogDecision::RequestCancel { .. }
+        ));
+
+        let tracker = AttachAttemptTracker::default();
+        let ledger = ProgressLedger::default();
+        let mut liveness = watchdog_step::MonitorLiveness::new();
+        for transition in [
+            AttachAttemptTransition::Started,
+            AttachAttemptTransition::Finished,
+        ] {
+            observe(
+                &tracker,
+                event(transition, AttachAttemptKind::Attach, 3),
+                &ledger,
+                0,
+            );
+        }
+        let widened_finish = ATTACH_FINISH_SERVICE_GRACE_NS + ATTACH_FINISH_SERVICE_GRACE_NS / 2;
+        publish(&ledger, widened_finish, CPU_CURRENCY_PTHREAD, true, true);
+        assert_eq!(
+            tick(&tracker, &ledger, 1, &mut liveness).attach.decision,
+            AttachWatchdogDecision::None,
+        );
+        publish(
+            &ledger,
+            widened_finish + 1,
+            CPU_CURRENCY_PTHREAD,
+            true,
+            true,
+        );
+        assert!(matches!(
+            tick(&tracker, &ledger, 2, &mut liveness)
+                .attach
+                .decision,
+            AttachWatchdogDecision::FinishUnsettled {
+                grace_budget_ns,
+                ..
+            } if grace_budget_ns == widened_finish
         ));
     }
 

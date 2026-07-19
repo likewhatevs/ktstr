@@ -1805,7 +1805,7 @@ mod stage_tests {
         assert_eq!(
             s.phase_epoch(),
             phase_epoch + 2,
-            "Finished must reanchor the non-charging overlay until Settled",
+            "Finished must reanchor the service-accounted overlay until Settled",
         );
         assert_eq!(s.progress_epoch(), progress_epoch + 2);
         expected_control.extend_from_slice(&crate::vmm::wire::encode_attach_finished_ack(41));

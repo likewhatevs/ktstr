@@ -1495,9 +1495,9 @@ impl SpawnedScheduler {
     }
 
     /// Publish Finished and wait for its exact host ACK while retaining the
-    /// non-charging Finishing overlay. A later owner-commit step calls
-    /// [`Self::settle_attach_attempt`] only after publishing the final process
-    /// ownership state.
+    /// separately service-accounted Finishing overlay. A later owner-commit
+    /// step calls [`Self::settle_attach_attempt`] only after publishing the
+    /// final process ownership state.
     pub(crate) fn await_attach_finished_ack(&mut self) -> Result<(), String> {
         self.attach_attempt
             .as_mut()

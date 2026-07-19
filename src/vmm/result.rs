@@ -60,6 +60,10 @@ pub enum WatchdogKillReason {
     /// The host monitor became terminal or was unavailable while a
     /// scheduler attach attempt still owned the lifecycle watchdog.
     AttachMonitorUnavailable,
+    /// The guest published scheduler-attach `Finished` but consumed the
+    /// delivered-service grace without completing the FinishedAck/Settled
+    /// rendezvous.
+    AttachFinishUnsettled,
 }
 
 /// Final guest lifecycle stage as tracked by the progress ledger —
