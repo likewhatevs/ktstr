@@ -350,6 +350,57 @@ fn backdrop_worker_phase_slices_partition_and_fold() {
 }
 
 #[test]
+fn backdrop_timer_worker_finalizes_phase_published_before_start() {
+    let config = WorkloadConfig {
+        num_workers: 1,
+        affinity: AffinityIntent::Inherit,
+        work_type: WorkType::TimerLatency { interval_us: 1_000 },
+        sched_policy: SchedPolicy::Normal,
+        signal_first_iteration: true,
+        ..Default::default()
+    };
+    let mut h = WorkloadHandle::spawn(&config).unwrap();
+
+    // Reproduce a saturated guest whose worker does not run until after
+    // StepStart. It initializes directly in epoch 1 and therefore observes no
+    // transition before shutdown. The final drain must still publish the
+    // measured epoch instead of retaining only whole-run timer samples.
+    h.set_phase_epoch(1);
+    h.start();
+    assert!(
+        h.wait_first_iteration_all(Instant::now() + Duration::from_secs(10), 1),
+        "the timer worker must reach its first counted iteration"
+    );
+    let reports = h.stop_and_collect();
+    assert_eq!(reports.len(), 1);
+
+    let report = &reports[0];
+    assert!(
+        report.timer_sample_total > 0,
+        "fixture must produce whole-run timer samples"
+    );
+    assert_eq!(
+        report.phase_slices.len(),
+        1,
+        "an already-active measured epoch must be finalized without a prior transition"
+    );
+    let slice = &report.phase_slices[0];
+    assert_eq!(slice.phase_epoch, 1);
+    assert_eq!(
+        slice.iterations, report.iterations,
+        "one measured epoch must retain every whole-run iteration"
+    );
+    assert_eq!(
+        slice.timer_sample_total, report.timer_sample_total,
+        "one measured epoch must retain every whole-run timer sample"
+    );
+    assert!(
+        slice.timer_sample_total > 0,
+        "the measured phase must retain TimerLatency samples"
+    );
+}
+
+#[test]
 fn spawn_auto_start_on_collect() {
     let config = WorkloadConfig {
         num_workers: 1,
