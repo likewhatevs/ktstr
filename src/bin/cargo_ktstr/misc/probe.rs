@@ -1,30 +1,448 @@
-//! Shared probe-loop scaffolding for cargo-ktstr subcommands that
-//! locate a `#[ktstr_test]` registration by exec'ing every
-//! workspace test binary with a discriminator flag.
+//! Shared probe-loop scaffolding for cargo-ktstr subcommands which execute
+//! selected test binaries with private discriminator flags.
 //!
 //! Both [`super::export::run_export`] and
-//! `super::shell::resolve_shell_from_test_entry` walk the same
-//! [`super::export::build_test_binaries`] output; they differ only
-//! in (a) stdio shape, (b) per-success disposition (forward stderr
-//! vs parse JSON + push), and (c) stop-on-first vs walk-all
-//! semantics. Two dedicated helpers ([`probe_first`] and
-//! [`probe_collect`]) encode the stop-vs-walk choice in the type
-//! system — caller's match drops the otherwise-unreachable arm
-//! entirely. The caller provides closures for (a) + (b); the
-//! shared exit-code categorisation (0 = win, 2 = "registered but
-//! rejected", other = "not registered here") and miss-stderr
-//! bookkeeping live in [`process_bin`].
+//! `super::shell::resolve_shell_from_test_entry` consume the same
+//! [`super::export::build_test_binaries`] output. [`probe_collect`] walks every
+//! shell descriptor candidate. [`probe_first`] walks bounded export-acceptance
+//! candidates until the first success, then executes only that owner through a
+//! distinct long-running command. Their shared exit-code categorisation
+//! (0 = accepted, 2 = "registered but rejected", other = "not registered
+//! here") and miss-stderr bookkeeping live in [`process_bin_with_runner`].
 //!
-//! All items are `pub(crate)` — the dispatch protocol
-//! (`--ktstr-export-test` / `--ktstr-shell-test` exit-code
-//! contract) is a private agreement between cargo-ktstr (router)
-//! and `crate::test_support::dispatch` (dispatcher), not a
-//! ktstr-library general capability.
+//! Quick shell, scheduler-manifest, and export-acceptance discriminators have a
+//! 60-second child deadline. Export first selects an accepted owner through
+//! that bounded path, then invokes only that binary's real exporter through an
+//! unbounded anchored runner which tees both output streams and emits elapsed
+//! heartbeats while scheduler build and executable packaging proceed.
+//!
+//! The export/shell exit-code contract and combined scheduler-manifest wire
+//! payload are private agreements between cargo-ktstr and test-support ctors,
+//! not ktstr-library general capabilities.
 
+use std::collections::{HashMap, HashSet};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 use super::export::build_test_binaries;
+
+const PROBE_CHILD_TIMEOUT: Duration = Duration::from_secs(60);
+const EXPORT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// One decoded combined scheduler manifest retained with the executable which
+/// emitted it. `executable` is rewritten through `provenance` when the caller
+/// probes descriptor-backed warmed binaries.
+#[derive(Debug)]
+pub(crate) struct ProbedSchedulerManifest {
+    pub executable: PathBuf,
+    pub manifest: ktstr::test_support::SchedulerManifestProbe,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeStreams {
+    Capture,
+    Tee,
+}
+
+impl ProbeStreams {
+    fn tees_stdout(self) -> bool {
+        matches!(self, Self::Tee)
+    }
+
+    fn tees_stderr(self) -> bool {
+        matches!(self, Self::Tee)
+    }
+}
+
+struct ProbeHeartbeat {
+    started: Instant,
+    next: Instant,
+    interval: Duration,
+    binary: PathBuf,
+}
+
+impl ProbeHeartbeat {
+    fn new_at(binary: &Path, started: Instant, interval: Duration) -> Self {
+        assert!(!interval.is_zero(), "probe heartbeat interval must be non-zero");
+        Self {
+            started,
+            next: started + interval,
+            interval,
+            binary: binary.to_path_buf(),
+        }
+    }
+
+    fn next_tick_in_at(&self, now: Instant) -> Duration {
+        self.next.saturating_duration_since(now)
+    }
+
+    fn message_at(&mut self, now: Instant) -> Option<String> {
+        if now < self.next {
+            return None;
+        }
+        while self.next <= now {
+            self.next += self.interval;
+        }
+        Some(format!(
+            "cargo ktstr: export via {} still running ({:.1}s elapsed)\n",
+            self.binary.display(),
+            now.saturating_duration_since(self.started).as_secs_f64(),
+        ))
+    }
+}
+
+struct ProbeObserver {
+    deadline: Option<(Instant, String)>,
+    streams: ProbeStreams,
+    heartbeat: Option<ProbeHeartbeat>,
+    forward_error: Option<String>,
+}
+
+impl ProbeObserver {
+    fn bounded(
+        description: &str,
+        binary: &Path,
+        timeout: Duration,
+        streams: ProbeStreams,
+    ) -> Self {
+        Self {
+            deadline: Some((
+                Instant::now() + timeout,
+                format!(
+                    "{description} probe in {} exceeded {:.1}s; its complete descendant \
+                     subtree was terminated",
+                    binary.display(),
+                    timeout.as_secs_f64(),
+                ),
+            )),
+            streams,
+            heartbeat: None,
+            forward_error: None,
+        }
+    }
+
+    fn export(binary: &Path) -> Self {
+        Self::export_at(
+            binary,
+            Instant::now(),
+            EXPORT_HEARTBEAT_INTERVAL,
+        )
+    }
+
+    fn export_at(
+        binary: &Path,
+        started: Instant,
+        heartbeat_interval: Duration,
+    ) -> Self {
+        Self {
+            deadline: None,
+            streams: ProbeStreams::Tee,
+            heartbeat: Some(ProbeHeartbeat::new_at(
+                binary,
+                started,
+                heartbeat_interval,
+            )),
+            forward_error: None,
+        }
+    }
+
+    fn cancellation_error_at(&self, now: Instant) -> Option<std::io::Error> {
+        if let Some(error) = &self.forward_error {
+            return Some(std::io::Error::other(error.clone()));
+        }
+        self.deadline.as_ref().and_then(|(deadline, diagnostic)| {
+            probe_cancellation_error(*deadline, now, diagnostic)
+        })
+    }
+
+    fn next_tick_in_at(&self, now: Instant) -> Duration {
+        let deadline = self
+            .deadline
+            .as_ref()
+            .map(|(deadline, _)| deadline.saturating_duration_since(now));
+        let heartbeat = self
+            .heartbeat
+            .as_ref()
+            .map(|heartbeat| heartbeat.next_tick_in_at(now));
+        match (deadline, heartbeat) {
+            (Some(deadline), Some(heartbeat)) => deadline.min(heartbeat),
+            (Some(deadline), None) => deadline,
+            (None, Some(heartbeat)) => heartbeat,
+            (None, None) => Duration::from_secs(1),
+        }
+    }
+}
+
+fn probe_cancellation_error(
+    deadline: Instant,
+    now: Instant,
+    diagnostic: &str,
+) -> Option<std::io::Error> {
+    (now >= deadline).then(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            diagnostic.to_string(),
+        )
+    })
+}
+
+impl crate::interrupt::StdoutObserver for ProbeObserver {
+    fn observe_stdout(&mut self, bytes: &[u8]) {
+        if self.streams.tees_stdout() && self.forward_error.is_none() {
+            let mut stdout = std::io::stdout().lock();
+            if let Err(error) =
+                stdout.write_all(bytes).and_then(|()| stdout.flush())
+            {
+                self.forward_error =
+                    Some(format!("forward probe stdout: {error}"));
+            }
+        }
+    }
+
+    fn observe_stderr(&mut self, bytes: &[u8]) {
+        if self.streams.tees_stderr() && self.forward_error.is_none() {
+            let mut stderr = std::io::stderr().lock();
+            if let Err(error) =
+                stderr.write_all(bytes).and_then(|()| stderr.flush())
+            {
+                self.forward_error =
+                    Some(format!("forward probe stderr: {error}"));
+            }
+        }
+    }
+
+    fn tick(&mut self) {
+        let message = self
+            .heartbeat
+            .as_mut()
+            .and_then(|heartbeat| heartbeat.message_at(Instant::now()));
+        if let Some(message) = message
+            && self.forward_error.is_none()
+        {
+            let mut stderr = std::io::stderr().lock();
+            if let Err(error) = stderr
+                .write_all(message.as_bytes())
+                .and_then(|()| stderr.flush())
+            {
+                self.forward_error =
+                    Some(format!("write probe heartbeat: {error}"));
+            }
+        }
+    }
+
+    fn next_tick_in(&self) -> Duration {
+        self.next_tick_in_at(Instant::now())
+    }
+
+    fn cancellation_error(&mut self) -> Option<std::io::Error> {
+        self.cancellation_error_at(Instant::now())
+    }
+
+    fn finished(&mut self, _status: &std::process::ExitStatus) {}
+
+    fn failed(&mut self, _error: &std::io::Error) {}
+}
+
+fn run_bounded_probe_output(
+    description: &str,
+    binary: &Path,
+    command: Command,
+    streams: ProbeStreams,
+) -> std::io::Result<Output> {
+    let observer = ProbeObserver::bounded(
+        description,
+        binary,
+        PROBE_CHILD_TIMEOUT,
+        streams,
+    );
+    crate::interrupt::run_output_observed_anchored(command, observer)
+}
+
+fn run_unbounded_export_output(
+    binary: &Path,
+    command: Command,
+) -> std::io::Result<Output> {
+    let observer = ProbeObserver::export(binary);
+    crate::interrupt::run_output_observed_anchored(command, observer)
+}
+
+/// Execute every supplied binary once through the supplied runner. Numeric
+/// non-zero exits mean that binary does not link the requested probe ctor and
+/// remain ordinary misses. Signals, runner errors, and successful-output
+/// decode errors are terminal and count as failed progress items.
+fn collect_probe_outputs<T>(
+    bins: &[PathBuf],
+    configure_cmd: impl Fn(&Path) -> Command,
+    on_success: impl Fn(&Path, &Output) -> Result<T, String>,
+    mut run: impl FnMut(&Path, Command) -> std::io::Result<Output>,
+    mut item_finished: impl FnMut(bool),
+) -> Result<Vec<T>, String> {
+    let mut collected = Vec::new();
+    for binary in bins {
+        let output = match run(binary, configure_cmd(binary)) {
+            Ok(output) => output,
+            Err(error) => {
+                item_finished(false);
+                return Err(format!(
+                    "exec scheduler probe {}: {error}",
+                    binary.display(),
+                ));
+            }
+        };
+        if output.status.success() {
+            match on_success(binary, &output) {
+                Ok(value) => {
+                    collected.push(value);
+                    item_finished(true);
+                }
+                Err(error) => {
+                    item_finished(false);
+                    return Err(error);
+                }
+            }
+        } else if output.status.code().is_none() {
+            item_finished(false);
+            return Err(format!(
+                "scheduler probe {} terminated by {}",
+                binary.display(),
+                output.status,
+            ));
+        } else {
+            item_finished(true);
+        }
+    }
+    Ok(collected)
+}
+
+pub(crate) fn probe_collect_from_bins_bounded<T>(
+    bins: &[PathBuf],
+    description: &str,
+    configure_cmd: impl Fn(&Path) -> Command,
+    on_success: impl Fn(&Path, &Output) -> Result<T, String>,
+) -> Result<Vec<T>, String> {
+    if bins.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut progress = crate::run_cargo::ItemProgress::start(
+        &format!("cargo ktstr: probing {description}"),
+        bins.len(),
+    );
+    let result = collect_probe_outputs(
+        bins,
+        configure_cmd,
+        on_success,
+        |binary, command| {
+            run_bounded_probe_output(
+                description,
+                binary,
+                command,
+                ProbeStreams::Capture,
+            )
+        },
+        |success| progress.item_finished(success),
+    );
+    match &result {
+        Err(error) => progress.finish_error(error),
+        Ok(_) => progress.finish_success(),
+    }
+    result
+}
+
+fn probe_dylib_path(
+    loader_paths: &[PathBuf],
+) -> Result<Option<(&'static str, std::ffi::OsString)>, String> {
+    if loader_paths.is_empty() {
+        return Ok(None);
+    }
+    #[cfg(target_os = "macos")]
+    let variable = "DYLD_FALLBACK_LIBRARY_PATH";
+    #[cfg(windows)]
+    let variable = "PATH";
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    let variable = "LD_LIBRARY_PATH";
+
+    let inherited = std::env::var_os(variable)
+        .into_iter()
+        .flat_map(|value| std::env::split_paths(&value).collect::<Vec<_>>());
+    let value = std::env::join_paths(loader_paths.iter().cloned().chain(inherited))
+        .map_err(|error| format!("construct scheduler-probe {variable}: {error}"))?;
+    Ok(Some((variable, value)))
+}
+
+/// Probe the combined scheduler payload from every distinct selected binary.
+///
+/// Coverage-instrumented registries receive a disposable `%p/%m` profile
+/// destination, and dynamically linked nextest archives receive their exact
+/// loader path. Descriptor-backed verifier binaries can provide a map back to
+/// Cargo's canonical emitted executable so cell ownership retains stable
+/// provenance after the descriptors are dropped.
+pub(crate) fn probe_scheduler_manifests_from_bins(
+    bins: &[PathBuf],
+    loader_paths: &[PathBuf],
+    provenance: Option<&HashMap<PathBuf, PathBuf>>,
+    description: &str,
+) -> Result<Vec<ProbedSchedulerManifest>, String> {
+    if bins.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut bins = bins.to_vec();
+    bins.sort();
+    bins.dedup();
+
+    let dylib_path = probe_dylib_path(loader_paths)?;
+    let profile_dir = tempfile::Builder::new()
+        .prefix("ktstr-scheduler-manifest-probe-profraw-")
+        .tempdir()
+        .map_err(|error| {
+            format!(
+                "create temporary scheduler-manifest probe profile directory: {error}"
+            )
+        })?;
+    let profile_pattern = profile_dir.path().join("probe-%p-%m.profraw");
+    let mut manifests = probe_collect_from_bins_bounded(
+        &bins,
+        description,
+        |bin| {
+            let mut command = Command::new(bin);
+            command
+                .arg(ktstr::test_support::SCHEDULER_MANIFEST_PROBE_ARG)
+                .env("LLVM_PROFILE_FILE", &profile_pattern);
+            if let Some((variable, value)) = &dylib_path {
+                command.env(variable, value);
+            }
+            command
+        },
+        |bin, output| {
+            let manifest = serde_json::from_slice(&output.stdout).map_err(|error| {
+                format!(
+                    "parse --ktstr-list-scheduler-manifest output from {}: {error}",
+                    bin.display(),
+                )
+            })?;
+            let executable = if let Some(provenance) = provenance {
+                provenance.get(bin).cloned().ok_or_else(|| {
+                    format!(
+                        "scheduler-manifest probe path {} has no warmed Cargo \
+                         executable provenance",
+                        bin.display(),
+                    )
+                })?
+            } else {
+                bin.to_path_buf()
+            };
+            Ok(ProbedSchedulerManifest {
+                executable,
+                manifest,
+            })
+        },
+    )?;
+    manifests.sort_by(|left, right| left.executable.cmp(&right.executable));
+    let mut seen = HashSet::new();
+    manifests.retain(|binary| seen.insert(binary.executable.clone()));
+    Ok(manifests)
+}
 
 /// Aggregate of all-binaries-tried-and-missed. The caller renders
 /// a subject-specific message via [`ProbeMiss::render`].
@@ -59,8 +477,8 @@ impl ProbeMiss {
 
 /// Helper-level error: either setup failed
 /// ([`ProbeError::Setup`] — `build_test_binaries` errored or
-/// returned empty, exec hit an I/O error, or on_success bubbled
-/// up a String) or every binary missed
+/// returned empty, either phase hit an I/O/status error, or on_success bubbled
+/// up a String) or every bounded discriminator missed
 /// ([`ProbeError::Miss`]).
 #[derive(Debug)]
 pub(crate) enum ProbeError {
@@ -71,7 +489,7 @@ pub(crate) enum ProbeError {
 /// Per-binary categorised outcome — only the success arm carries
 /// payload. exit-1 / exit-2 / other-nonzero outcomes are bucketed
 /// into the caller's `&mut rejection_stderr` / `&mut
-/// last_miss_stderr` accumulators by [`process_bin`] before
+/// last_miss_stderr` accumulators by [`process_bin_with_runner`] before
 /// returning [`BinOutcome::Continue`].
 enum BinOutcome<T> {
     Success(T),
@@ -85,20 +503,26 @@ enum BinOutcome<T> {
 /// other non-zero → overwrite `last_miss_stderr` (last-write-
 /// wins for miss diagnostics), return [`BinOutcome::Continue`].
 /// I/O error spawning the child → [`ProbeError::Setup`].
-fn process_bin<T>(
+fn process_bin_with_runner<T>(
     bin: &Path,
     configure_cmd: &impl Fn(&Path) -> Command,
     on_success: &impl Fn(&Path, &Output) -> Result<T, String>,
     rejection_stderr: &mut Option<String>,
     last_miss_stderr: &mut String,
+    run: &mut impl FnMut(&Path, Command) -> std::io::Result<Output>,
 ) -> Result<BinOutcome<T>, ProbeError> {
-    let mut cmd = configure_cmd(bin);
-    let out = cmd
-        .output()
+    let out = run(bin, configure_cmd(bin))
         .map_err(|e| ProbeError::Setup(format!("exec {}: {e}", bin.display())))?;
     if out.status.success() {
         let value = on_success(bin, &out).map_err(ProbeError::Setup)?;
         return Ok(BinOutcome::Success(value));
+    }
+    if out.status.code().is_none() {
+        return Err(ProbeError::Setup(format!(
+            "probe {} terminated by {}",
+            bin.display(),
+            out.status,
+        )));
     }
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     // Exit 2 = "registered but rejected here" (host_only,
@@ -127,26 +551,33 @@ const EMPTY_BINS_SETUP_ERROR: &str = "cargo build --tests produced no executable
      ensure the workspace has at least one [[test]] target or \
      a [lib]/[bin] with #[cfg(test)] tests";
 
-/// Walk every workspace test binary, stop at the FIRST that
-/// returns Ok via `on_success`, and return its value. Used by
-/// `run_export` (first-match-wins semantics).
+/// Select and execute the first export-capable workspace test binary.
 ///
 /// `package` + `release` flow straight to
-/// [`build_test_binaries`]; the `configure_cmd` closure receives
-/// each candidate's path and returns a fully-configured `Command`
-/// (with the discriminator flag + stdio shape set by the caller).
+/// [`build_test_binaries`]. `configure_check_cmd` creates the cheap private
+/// ownership/eligibility discriminator run under the 60-second bounded
+/// anchored observer. Once one candidate accepts, `configure_execute_cmd`
+/// creates the real exporter and only that selected binary runs again, through
+/// the unbounded anchored observer with live stdout/stderr and heartbeats.
 ///
 /// Errors: [`ProbeError::Setup`] for build failure / empty
-/// executables / exec I/O failure / on_success error.
-/// [`ProbeError::Miss`] when every binary returned non-zero.
+/// executables / either runner's I/O failure / selected-export failure /
+/// `on_success` error. [`ProbeError::Miss`] when every bounded acceptance
+/// probe returned non-zero.
 pub(crate) fn probe_first<T>(
     package: Option<&str>,
     release: bool,
-    configure_cmd: impl Fn(&Path) -> Command,
+    configure_check_cmd: impl Fn(&Path) -> Command,
+    configure_execute_cmd: impl Fn(&Path) -> Command,
     on_success: impl Fn(&Path, &Output) -> Result<T, String>,
 ) -> Result<T, ProbeError> {
     let bins = build_test_binaries(package, release).map_err(ProbeError::Setup)?;
-    probe_first_with_bins(&bins, configure_cmd, on_success)
+    probe_first_with_bins(
+        &bins,
+        configure_check_cmd,
+        configure_execute_cmd,
+        on_success,
+    )
 }
 
 /// Walk every workspace test binary, call `on_success` on each
@@ -154,7 +585,8 @@ pub(crate) fn probe_first<T>(
 /// `resolve_shell_from_test_entry` (walk-all + ambiguity-bail
 /// semantics — caller checks `Vec::len()` after the walk).
 ///
-/// See [`probe_first`] for arg + error semantics.
+/// Each child is bounded by [`PROBE_CHILD_TIMEOUT`]. See [`probe_first`] for
+/// argument and error semantics.
 pub(crate) fn probe_collect<T>(
     package: Option<&str>,
     release: bool,
@@ -165,50 +597,72 @@ pub(crate) fn probe_collect<T>(
     probe_collect_with_bins(&bins, configure_cmd, on_success)
 }
 
-/// Walk an exact caller-supplied set of already-built test executables.
-///
-/// The verifier dispatcher obtains this set directly from the reserved
-/// `cargo nextest run --no-run` Cargo JSON stream. Reusing those paths is
-/// load-bearing: rebuilding via [`build_test_binaries`] would be unscoped
-/// from nextest's package/feature selection and could both miss declarations
-/// and trigger a second workspace build. Other probe consumers should keep
-/// using [`probe_collect`].
-pub(crate) fn probe_collect_from_bins<T>(
-    bins: &[PathBuf],
-    configure_cmd: impl Fn(&Path) -> Command,
-    on_success: impl Fn(&Path, &Output) -> Result<T, String>,
-) -> Result<Vec<T>, ProbeError> {
-    probe_collect_with_bins(bins, configure_cmd, on_success)
-}
-
 /// Unit-testable core of [`probe_first`]: bins pre-built by
 /// caller. Separated so the loop + bookkeeping + Setup/Miss
 /// dispatch can be exercised without spawning a real
 /// `cargo build --tests`.
 ///
-/// PRIVATE on purpose: callers with an authoritative prebuilt set use
-/// [`probe_collect_from_bins`]; ordinary subcommands use [`probe_first`] or
-/// [`probe_collect`] so they cannot accidentally bypass the canonical build.
-/// Tests below reach this fn via Rust's same-module sibling visibility.
+/// PRIVATE on purpose: scheduler-manifest callers with an authoritative
+/// prebuilt set use [`probe_scheduler_manifests_from_bins`]; ordinary
+/// subcommands use [`probe_first`] or [`probe_collect`] so they cannot
+/// accidentally bypass the canonical build. Tests below reach this fn via
+/// Rust's same-module sibling visibility.
 fn probe_first_with_bins<T>(
     bins: &[PathBuf],
-    configure_cmd: impl Fn(&Path) -> Command,
+    configure_check_cmd: impl Fn(&Path) -> Command,
+    configure_execute_cmd: impl Fn(&Path) -> Command,
     on_success: impl Fn(&Path, &Output) -> Result<T, String>,
+) -> Result<T, ProbeError> {
+    probe_first_with_bins_using(
+        bins,
+        configure_check_cmd,
+        configure_execute_cmd,
+        on_success,
+        |binary, command| {
+            run_bounded_probe_output(
+                "export acceptance",
+                binary,
+                command,
+                ProbeStreams::Capture,
+            )
+        },
+        run_unbounded_export_output,
+    )
+}
+
+fn probe_first_with_bins_using<T>(
+    bins: &[PathBuf],
+    configure_check_cmd: impl Fn(&Path) -> Command,
+    configure_execute_cmd: impl Fn(&Path) -> Command,
+    on_success: impl Fn(&Path, &Output) -> Result<T, String>,
+    mut run_check: impl FnMut(&Path, Command) -> std::io::Result<Output>,
+    mut run_execute: impl FnMut(&Path, Command) -> std::io::Result<Output>,
 ) -> Result<T, ProbeError> {
     if bins.is_empty() {
         return Err(ProbeError::Setup(EMPTY_BINS_SETUP_ERROR.to_string()));
     }
     let mut rejection_stderr: Option<String> = None;
     let mut last_miss_stderr = String::new();
+    let accepted = |binary: &Path, _output: &Output| {
+        Ok::<PathBuf, String>(binary.to_path_buf())
+    };
     for bin in bins {
-        match process_bin(
+        match process_bin_with_runner(
             bin,
-            &configure_cmd,
-            &on_success,
+            &configure_check_cmd,
+            &accepted,
             &mut rejection_stderr,
             &mut last_miss_stderr,
+            &mut run_check,
         )? {
-            BinOutcome::Success(value) => return Ok(value),
+            BinOutcome::Success(selected) => {
+                return execute_selected_with_runner(
+                    &selected,
+                    &configure_execute_cmd,
+                    &on_success,
+                    &mut run_execute,
+                );
+            }
             BinOutcome::Continue => continue,
         }
     }
@@ -219,6 +673,28 @@ fn probe_first_with_bins<T>(
     }))
 }
 
+fn execute_selected_with_runner<T>(
+    binary: &Path,
+    configure_cmd: &impl Fn(&Path) -> Command,
+    on_success: &impl Fn(&Path, &Output) -> Result<T, String>,
+    run: &mut impl FnMut(&Path, Command) -> std::io::Result<Output>,
+) -> Result<T, ProbeError> {
+    let output = run(binary, configure_cmd(binary)).map_err(|error| {
+        ProbeError::Setup(format!(
+            "exec selected exporter {}: {error}",
+            binary.display(),
+        ))
+    })?;
+    if !output.status.success() {
+        return Err(ProbeError::Setup(format!(
+            "selected exporter {} failed with {}",
+            binary.display(),
+            output.status,
+        )));
+    }
+    on_success(binary, &output).map_err(ProbeError::Setup)
+}
+
 /// Unit-testable core of [`probe_collect`]: bins pre-built by
 /// caller. See [`probe_first_with_bins`] for the
 /// PRIVATE-on-purpose rationale.
@@ -227,6 +703,27 @@ fn probe_collect_with_bins<T>(
     configure_cmd: impl Fn(&Path) -> Command,
     on_success: impl Fn(&Path, &Output) -> Result<T, String>,
 ) -> Result<Vec<T>, ProbeError> {
+    probe_collect_with_bins_using(
+        bins,
+        configure_cmd,
+        on_success,
+        |binary, command| {
+            run_bounded_probe_output(
+                "test registration",
+                binary,
+                command,
+                ProbeStreams::Capture,
+            )
+        },
+    )
+}
+
+fn probe_collect_with_bins_using<T>(
+    bins: &[PathBuf],
+    configure_cmd: impl Fn(&Path) -> Command,
+    on_success: impl Fn(&Path, &Output) -> Result<T, String>,
+    mut run: impl FnMut(&Path, Command) -> std::io::Result<Output>,
+) -> Result<Vec<T>, ProbeError> {
     if bins.is_empty() {
         return Err(ProbeError::Setup(EMPTY_BINS_SETUP_ERROR.to_string()));
     }
@@ -234,12 +731,13 @@ fn probe_collect_with_bins<T>(
     let mut rejection_stderr: Option<String> = None;
     let mut last_miss_stderr = String::new();
     for bin in bins {
-        match process_bin(
+        match process_bin_with_runner(
             bin,
             &configure_cmd,
             &on_success,
             &mut rejection_stderr,
             &mut last_miss_stderr,
+            &mut run,
         )? {
             BinOutcome::Success(value) => collected.push(value),
             BinOutcome::Continue => continue,
@@ -263,6 +761,207 @@ mod tests {
         PathBuf::from(format!("/fake/bin{idx}"))
     }
 
+    fn probe_output(code: i32, stdout: &[u8], stderr: &[u8]) -> Output {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        }
+    }
+
+    #[test]
+    fn probe_deadline_boundary_and_diagnostic_are_deterministic() {
+        let deadline = Instant::now();
+        assert!(
+            probe_cancellation_error(
+                deadline,
+                deadline - Duration::from_nanos(1),
+                "probe deadline",
+            )
+            .is_none(),
+        );
+        let error = probe_cancellation_error(deadline, deadline, "probe deadline")
+            .expect("the exact deadline cancels");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "probe deadline");
+    }
+
+    #[test]
+    fn accepted_export_survives_beyond_probe_deadline() {
+        let started = Instant::now();
+        let observer = ProbeObserver::export_at(
+            Path::new("/fake/exporter"),
+            started,
+            Duration::from_secs(10),
+        );
+        assert!(
+            observer
+                .cancellation_error_at(
+                    started + PROBE_CHILD_TIMEOUT + Duration::from_secs(1),
+                )
+                .is_none(),
+            "the selected long exporter has no acceptance-probe deadline",
+        );
+    }
+
+    #[test]
+    fn export_observer_tees_both_streams_and_advances_heartbeat() {
+        let started = Instant::now();
+        let mut observer = ProbeObserver::export_at(
+            Path::new("/fake/exporter"),
+            started,
+            Duration::from_secs(10),
+        );
+        assert_eq!(observer.streams, ProbeStreams::Tee);
+        assert!(observer.streams.tees_stdout());
+        assert!(observer.streams.tees_stderr());
+        assert_eq!(
+            observer.next_tick_in_at(started),
+            Duration::from_secs(10),
+        );
+
+        let heartbeat = observer
+            .heartbeat
+            .as_mut()
+            .expect("export observer carries heartbeat state");
+        assert!(
+            heartbeat
+                .message_at(started + Duration::from_secs(9))
+                .is_none(),
+        );
+        assert_eq!(
+            heartbeat.message_at(started + Duration::from_secs(10)),
+            Some(
+                "cargo ktstr: export via /fake/exporter still running \
+                 (10.0s elapsed)\n"
+                    .to_string(),
+            ),
+        );
+        assert!(
+            heartbeat
+                .message_at(started + Duration::from_secs(10))
+                .is_none(),
+            "one deadline produces one heartbeat",
+        );
+        assert_eq!(
+            heartbeat.message_at(started + Duration::from_secs(25)),
+            Some(
+                "cargo ktstr: export via /fake/exporter still running \
+                 (25.0s elapsed)\n"
+                    .to_string(),
+            ),
+            "a delayed tick reports real elapsed time and advances past missed slots",
+        );
+        assert_eq!(
+            heartbeat.next_tick_in_at(started + Duration::from_secs(25)),
+            Duration::from_secs(5),
+        );
+    }
+
+    #[test]
+    fn bounded_probe_core_visits_each_binary_once_in_order() {
+        let bins = vec![fake_bin(0), fake_bin(1), fake_bin(2)];
+        let visited = std::cell::RefCell::new(Vec::new());
+        let outcomes = std::cell::RefCell::new(Vec::new());
+        let values = collect_probe_outputs(
+            &bins,
+            |binary| Command::new(binary),
+            |binary, output| {
+                assert_eq!(output.stdout, b"hit");
+                Ok(binary.to_path_buf())
+            },
+            |binary, _command| {
+                visited.borrow_mut().push(binary.to_path_buf());
+                let code = if binary.ends_with("bin0") { 1 } else { 0 };
+                Ok(probe_output(code, b"hit", b"miss"))
+            },
+            |success| outcomes.borrow_mut().push(success),
+        )
+        .expect("deterministic probe succeeds");
+        assert_eq!(*visited.borrow(), bins);
+        assert_eq!(*outcomes.borrow(), [true, true, true]);
+        assert_eq!(values, bins[1..]);
+    }
+
+    #[test]
+    fn bounded_probe_core_stops_on_runner_error_with_binary_context() {
+        let bins = vec![fake_bin(0), fake_bin(1), fake_bin(2)];
+        let visited = std::cell::RefCell::new(Vec::new());
+        let outcomes = std::cell::RefCell::new(Vec::new());
+        let error = collect_probe_outputs(
+            &bins,
+            |binary| Command::new(binary),
+            |_binary, _output| Ok(()),
+            |binary, _command| {
+                visited.borrow_mut().push(binary.to_path_buf());
+                if binary.ends_with("bin1") {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "complete subtree terminated",
+                    ))
+                } else {
+                    Ok(probe_output(1, b"", b"miss"))
+                }
+            },
+            |success| outcomes.borrow_mut().push(success),
+        )
+        .expect_err("runner failure is terminal");
+        assert_eq!(*visited.borrow(), bins[..2]);
+        assert_eq!(*outcomes.borrow(), [true, false]);
+        assert_eq!(
+            error,
+            "exec scheduler probe /fake/bin1: complete subtree terminated",
+        );
+    }
+
+    #[test]
+    fn bounded_probe_core_rejects_signal_exit_with_binary_context() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let bins = vec![PathBuf::from("/fake/signaled")];
+        let outcomes = std::cell::RefCell::new(Vec::new());
+        let signal_status = std::process::ExitStatus::from_raw(libc::SIGKILL);
+        let expected = format!(
+            "scheduler probe /fake/signaled terminated by {signal_status}"
+        );
+        let error = collect_probe_outputs(
+            &bins,
+            |binary| Command::new(binary),
+            |_binary, _output| Ok(()),
+            |_binary, _command| {
+                Ok(Output {
+                    status: std::process::ExitStatus::from_raw(libc::SIGKILL),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            },
+            |success| outcomes.borrow_mut().push(success),
+        )
+        .expect_err("signal termination is not an ordinary unlinked-ctor miss");
+        assert_eq!(error, expected);
+        assert_eq!(*outcomes.borrow(), [false]);
+    }
+
+    #[test]
+    fn bounded_probe_core_counts_decode_failure_as_failed_item() {
+        let bins = vec![PathBuf::from("/fake/malformed")];
+        let outcomes = std::cell::RefCell::new(Vec::new());
+        let error = collect_probe_outputs(
+            &bins,
+            |binary| Command::new(binary),
+            |_binary, _output| {
+                Err::<(), _>("malformed scheduler manifest".to_string())
+            },
+            |_binary, _command| Ok(probe_output(0, b"not-json", b"")),
+            |success| outcomes.borrow_mut().push(success),
+        )
+        .expect_err("decode failure is terminal");
+        assert_eq!(error, "malformed scheduler manifest");
+        assert_eq!(*outcomes.borrow(), [false]);
+    }
+
     /// Walking all bins, every Ok(T) is appended in iteration
     /// order. Pins the Vec append contract (caller relies on it
     /// for the shell-mode ambiguity-bail path which checks
@@ -273,27 +972,82 @@ mod tests {
         let configure_cmd = |_bin: &Path| Command::new("true");
         let on_success =
             |bin: &Path, _out: &Output| -> Result<PathBuf, String> { Ok(bin.to_path_buf()) };
-        let result = probe_collect_with_bins(&bins, configure_cmd, on_success)
-            .expect("two successes should collect");
+        let result = probe_collect_with_bins_using(
+            &bins,
+            configure_cmd,
+            on_success,
+            |_bin, _command| Ok(probe_output(0, b"", b"")),
+        )
+        .expect("two successes should collect");
         assert_eq!(result, vec![fake_bin(0), fake_bin(1)]);
     }
 
-    /// First success short-circuits the remaining bins. Pins
-    /// the export-style "first-match-wins + skip the rest"
-    /// contract — without this, an operator with multiple
-    /// matching test binaries would observe surprising spawn
-    /// counts.
     #[test]
-    fn probe_first_with_bins_short_circuits_after_first_success() {
+    fn export_selects_first_acceptance_and_executes_only_it_once() {
         let bins = vec![fake_bin(0), fake_bin(1), fake_bin(2)];
-        let spawn_count = std::cell::Cell::new(0usize);
-        let configure_cmd = |_bin: &Path| {
-            spawn_count.set(spawn_count.get() + 1);
-            Command::new("true")
-        };
-        let on_success = |_bin: &Path, _out: &Output| -> Result<(), String> { Ok(()) };
-        probe_first_with_bins(&bins, configure_cmd, on_success).expect("first success");
-        assert_eq!(spawn_count.get(), 1, "must not spawn after first success");
+        let checked = std::cell::RefCell::new(Vec::new());
+        let executed = std::cell::RefCell::new(Vec::new());
+        let selected = probe_first_with_bins_using(
+            &bins,
+            |binary| Command::new(binary),
+            |binary| Command::new(binary),
+            |binary, _output| Ok(binary.to_path_buf()),
+            |binary, _command| {
+                checked.borrow_mut().push(binary.to_path_buf());
+                let (status, stderr) = if binary.ends_with("bin0") {
+                    (2, &b"registered but ineligible"[..])
+                } else {
+                    (0, &b""[..])
+                };
+                Ok(probe_output(status, b"", stderr))
+            },
+            |binary, _command| {
+                executed.borrow_mut().push(binary.to_path_buf());
+                Ok(probe_output(0, b"exported", b"wrote runfile"))
+            },
+        )
+        .expect("the second candidate accepts and exports");
+        assert_eq!(selected, fake_bin(1));
+        assert_eq!(*checked.borrow(), bins[..2]);
+        assert_eq!(*executed.borrow(), [fake_bin(1)]);
+    }
+
+    #[test]
+    fn hung_acceptance_miss_is_terminal_and_never_executes() {
+        let bins = vec![fake_bin(0), fake_bin(1), fake_bin(2)];
+        let checked = std::cell::RefCell::new(Vec::new());
+        let execute_count = std::cell::Cell::new(0usize);
+        let result = probe_first_with_bins_using(
+            &bins,
+            |binary| Command::new(binary),
+            |binary| Command::new(binary),
+            |_binary, _output| Ok(()),
+            |binary, _command| {
+                checked.borrow_mut().push(binary.to_path_buf());
+                if binary.ends_with("bin0") {
+                    Ok(probe_output(1, b"", b"not registered"))
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "export acceptance probe exceeded 60.0s; complete subtree terminated",
+                    ))
+                }
+            },
+            |_binary, _command| {
+                execute_count.set(execute_count.get() + 1);
+                Ok(probe_output(0, b"", b""))
+            },
+        );
+        match result {
+            Err(ProbeError::Setup(message)) => assert_eq!(
+                message,
+                "exec /fake/bin1: export acceptance probe exceeded 60.0s; \
+                 complete subtree terminated",
+            ),
+            _ => panic!("a timed-out bounded acceptance probe must be terminal"),
+        }
+        assert_eq!(*checked.borrow(), bins[..2]);
+        assert_eq!(execute_count.get(), 0);
     }
 
     /// Empty bin list surfaces [`ProbeError::Setup`] with the
@@ -302,9 +1056,15 @@ mod tests {
     #[test]
     fn probe_first_with_bins_empty_returns_setup_error() {
         let bins: Vec<PathBuf> = vec![];
-        let configure_cmd = |_bin: &Path| Command::new("true");
         let on_success = |_bin: &Path, _out: &Output| -> Result<(), String> { Ok(()) };
-        match probe_first_with_bins(&bins, configure_cmd, on_success) {
+        match probe_first_with_bins_using(
+            &bins,
+            |_bin| Command::new("true"),
+            |_bin| Command::new("true"),
+            on_success,
+            |_bin, _command| unreachable!("an empty probe cannot execute"),
+            |_bin, _command| unreachable!("an empty exporter cannot execute"),
+        ) {
             Err(ProbeError::Setup(msg)) => assert!(
                 msg.contains("no executable artifacts"),
                 "expected empty-bins diagnostic, got {msg:?}",
@@ -321,7 +1081,12 @@ mod tests {
         let bins: Vec<PathBuf> = vec![];
         let configure_cmd = |_bin: &Path| Command::new("true");
         let on_success = |_bin: &Path, _out: &Output| -> Result<(), String> { Ok(()) };
-        match probe_collect_with_bins(&bins, configure_cmd, on_success) {
+        match probe_collect_with_bins_using(
+            &bins,
+            configure_cmd,
+            on_success,
+            |_bin, _command| unreachable!("an empty probe cannot execute"),
+        ) {
             Err(ProbeError::Setup(msg)) => assert!(msg.contains("no executable artifacts")),
             _ => panic!("expected Setup error"),
         }
@@ -336,22 +1101,20 @@ mod tests {
     #[test]
     fn probe_collect_with_bins_exit_2_first_wins_exit_1_overwrites() {
         let bins = vec![fake_bin(0), fake_bin(1), fake_bin(2), fake_bin(3)];
-        let configure_cmd = |bin: &Path| {
-            let suffix = bin.file_name().unwrap().to_str().unwrap().to_string();
-            let (code, stderr) = match suffix.as_str() {
+        let configure_cmd = |bin: &Path| Command::new(bin);
+        let run = |bin: &Path, _command: Command| {
+            let suffix = bin.file_name().unwrap().to_str().unwrap();
+            let (code, stderr) = match suffix {
                 "bin0" => (2, "REJECTED_A"),
                 "bin1" => (2, "REJECTED_B"),
                 "bin2" => (1, "MISS_C"),
                 "bin3" => (1, "MISS_D"),
                 _ => unreachable!(),
             };
-            let mut cmd = Command::new("sh");
-            cmd.args(["-c", &format!("printf '%s' '{stderr}' >&2; exit {code}")]);
-            cmd.stderr(std::process::Stdio::piped());
-            cmd
+            Ok(probe_output(code, b"", stderr.as_bytes()))
         };
         let on_success = |_bin: &Path, _out: &Output| -> Result<(), String> { Ok(()) };
-        match probe_collect_with_bins(&bins, configure_cmd, on_success) {
+        match probe_collect_with_bins_using(&bins, configure_cmd, on_success, run) {
             Err(ProbeError::Miss(miss)) => {
                 assert_eq!(miss.bins_tried, 4);
                 assert_eq!(
@@ -377,7 +1140,12 @@ mod tests {
         let bins = vec![fake_bin(0), fake_bin(1), fake_bin(2)];
         let configure_cmd = |_bin: &Path| Command::new("false");
         let on_success = |_bin: &Path, _out: &Output| -> Result<(), String> { Ok(()) };
-        match probe_collect_with_bins(&bins, configure_cmd, on_success) {
+        match probe_collect_with_bins_using(
+            &bins,
+            configure_cmd,
+            on_success,
+            |_bin, _command| Ok(probe_output(1, b"", b"miss")),
+        ) {
             Err(ProbeError::Miss(miss)) => {
                 assert_eq!(miss.bins_tried, 3);
                 assert!(

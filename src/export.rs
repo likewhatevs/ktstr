@@ -100,7 +100,47 @@ use crate::test_support::{
 pub fn export_test(test_name: &str, output: Option<PathBuf>) -> Result<()> {
     let entry = find_test(test_name)
         .ok_or_else(|| anyhow::anyhow!("no registered test named '{test_name}'"))?;
+    validate_export_entry(entry)?;
 
+    let test_binary =
+        std::env::current_exe().context("locate the current test binary via /proc/self/exe")?;
+
+    let scheduler_path = resolve_scheduler_for_export(entry)?;
+    let mut include_files = resolve_include_files(entry)?;
+    let config_additions = compute_config_export_additions(entry)
+        .context("resolve scheduler config file for export")?;
+    for addition in &config_additions {
+        include_files.push(addition.host_path.clone());
+    }
+
+    let output_path = output.unwrap_or_else(|| PathBuf::from(format!("{test_name}.run")));
+
+    let archive = build_archive(&test_binary, scheduler_path.as_deref(), &include_files)
+        .context("build embedded gzip tarball")?;
+
+    let preamble = generate_preamble(entry, scheduler_path.is_some(), &config_additions);
+
+    write_runfile(&output_path, &preamble, &archive)
+        .with_context(|| format!("write runfile to {}", output_path.display()))?;
+
+    eprintln!(
+        "wrote {} ({} bytes archive, {} include files)",
+        output_path.display(),
+        archive.len(),
+        include_files.len()
+    );
+    Ok(())
+}
+
+/// Validate the cheap, static eligibility contract shared by the router's
+/// check-only phase and the selected binary's real export phase.
+///
+/// Keep every entry-only rejection here. The router can therefore select an
+/// owner without resolving/building its scheduler or reading/compressing the
+/// large test executable, while the real exporter repeats the exact same
+/// eligibility predicate before performing any expensive work.
+pub(crate) fn validate_export_entry(entry: &KtstrTestEntry) -> Result<()> {
+    let test_name = entry.name;
     if entry.host_only {
         bail!(
             "test '{test_name}' is host_only — it orchestrates cargo / nested VMs \
@@ -134,34 +174,6 @@ pub fn export_test(test_name: &str, output: Option<PathBuf>) -> Result<()> {
              commands; KernelBuiltin export is out of scope for v1."
         );
     }
-
-    let test_binary =
-        std::env::current_exe().context("locate the current test binary via /proc/self/exe")?;
-
-    let scheduler_path = resolve_scheduler_for_export(entry)?;
-    let mut include_files = resolve_include_files(entry)?;
-    let config_additions = compute_config_export_additions(entry)
-        .context("resolve scheduler config file for export")?;
-    for addition in &config_additions {
-        include_files.push(addition.host_path.clone());
-    }
-
-    let output_path = output.unwrap_or_else(|| PathBuf::from(format!("{test_name}.run")));
-
-    let archive = build_archive(&test_binary, scheduler_path.as_deref(), &include_files)
-        .context("build embedded gzip tarball")?;
-
-    let preamble = generate_preamble(entry, scheduler_path.is_some(), &config_additions);
-
-    write_runfile(&output_path, &preamble, &archive)
-        .with_context(|| format!("write runfile to {}", output_path.display()))?;
-
-    eprintln!(
-        "wrote {} ({} bytes archive, {} include files)",
-        output_path.display(),
-        archive.len(),
-        include_files.len()
-    );
     Ok(())
 }
 

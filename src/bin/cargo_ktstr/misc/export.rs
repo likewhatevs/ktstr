@@ -4,13 +4,12 @@
 //! The exporter cannot run inside cargo-ktstr because the test
 //! registry it needs (the `#[ktstr_test]` distributed-slice) lives
 //! in user-crate test binaries, not here. [`run_export`] therefore
-//! builds every workspace test binary via
-//! [`build_test_binaries`] and exec's each in turn with
-//! `--ktstr-export-test=NAME`, surfacing the first binary that
-//! exits 0 as the winner. All-fail surfaces the most informative
-//! per-binary stderr (exit-2 "rejected" preferred over exit-1
-//! "not registered"), so the operator sees the actual rejection
-//! reason rather than N×"missing" lines.
+//! builds every workspace test binary via [`build_test_binaries`], probes each
+//! through the cheap `--ktstr-export-check-test=NAME` discriminator, then
+//! exec's only the first accepted owner with `--ktstr-export-test=NAME`.
+//! All-fail surfaces the most informative bounded-probe stderr (exit-2
+//! "rejected" preferred over exit-1 "not registered"), while the selected
+//! long exporter streams both output channels and elapsed heartbeats.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -22,10 +21,11 @@ use super::probe::{ProbeError, probe_first};
 /// itself into the .run file because it has no `#[ktstr_test]`
 /// entries from the user's crate — only the test binary that
 /// links against the user's code carries the registry. The router
-/// builds every workspace test binary, then exec's each in turn
-/// with `--ktstr-export-test=NAME`. The first binary that exits 0
-/// wins; all-fail surfaces the per-binary stderrs so the operator
-/// can see why the lookup missed (typically: typoed test name).
+/// builds every workspace test binary, then checks each through a bounded,
+/// side-effect-free ownership/eligibility dispatch. The first accepted owner
+/// is executed exactly once through the real export dispatch; all-fail
+/// surfaces the per-binary check stderrs so the operator can see why the lookup
+/// missed (typically: typoed test name).
 ///
 /// `package` (when `Some`) restricts the build via
 /// `cargo build --tests --package <NAME>` — necessary in
@@ -44,12 +44,12 @@ pub(crate) fn run_export(
     package: Option<String>,
     release: bool,
 ) -> Result<(), String> {
+    let check_flag = format!("--ktstr-export-check-test={test}");
     let test_flag = format!("--ktstr-export-test={test}");
-    // Resolve relative paths against cwd BEFORE the probe loop so
-    // the test binary writes to the operator's pwd, not its own
-    // (the binary lives under target/debug/deps/...). Done once
-    // outside the loop so a transient cwd change between binaries
-    // can't desync the per-binary output target.
+    // Resolve relative paths against cwd before selection so the chosen test
+    // binary writes to the operator's pwd, not its own (the binary lives under
+    // target/debug/deps/...). The cheap check phase never receives this flag
+    // and therefore cannot create or overwrite the destination.
     let output_flag = match output.as_deref() {
         Some(o) => {
             let abs = if o.is_absolute() {
@@ -64,34 +64,38 @@ pub(crate) fn run_export(
         None => None,
     };
 
-    let configure_cmd = |bin: &std::path::Path| {
+    let configure_check_cmd = |bin: &std::path::Path| {
+        let mut cmd = Command::new(bin);
+        cmd.arg(&check_flag)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        cmd
+    };
+
+    let configure_execute_cmd = |bin: &std::path::Path| {
         let mut cmd = Command::new(bin);
         cmd.arg(&test_flag);
         if let Some(o) = &output_flag {
             cmd.arg(o);
         }
         cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::inherit())
-            // Capture stderr so per-candidate "no registered test
-            // named X" diagnostics don't spam the operator's
-            // terminal for every binary we try. Winner's stderr
-            // is forwarded in on_success below; on full miss the
-            // probe helper surfaces the exit-2 rejection stderr
-            // (or last exit-1 stderr) via ProbeMiss.
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         cmd
     };
 
-    let on_success = |_bin: &std::path::Path, out: &std::process::Output| -> Result<(), String> {
-        // Forward the winner's stderr so the "wrote ..." line (and
-        // any operator-visible diagnostics) reach the user's
-        // terminal.
-        std::io::Write::write_all(&mut std::io::stderr(), &out.stderr)
-            .map_err(|e| format!("forward winner stderr: {e}"))?;
-        Ok(())
-    };
+    let on_success = |_bin: &std::path::Path,
+                      _out: &std::process::Output|
+     -> Result<(), String> { Ok(()) };
 
-    match probe_first(package.as_deref(), release, configure_cmd, on_success) {
+    match probe_first(
+        package.as_deref(),
+        release,
+        configure_check_cmd,
+        configure_execute_cmd,
+        on_success,
+    ) {
         Ok(()) => Ok(()),
         Err(ProbeError::Setup(msg)) => Err(msg),
         Err(ProbeError::Miss(miss)) => Err(miss.render(&test, "cannot be exported")),

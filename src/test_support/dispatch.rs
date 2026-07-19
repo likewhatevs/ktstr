@@ -31,10 +31,11 @@ use crate::assert::AssertResult;
 use super::extract_export_output_arg;
 use super::{
     HostClass, KTSTR_TESTS, KtstrTestEntry, TopoOverride, classify_host_error, collect_sidecars,
-    extract_export_test_arg, extract_shell_test_arg, extract_test_fn_arg, extract_topo_arg,
-    find_test, format_callback_profile, format_kvm_stats, format_verifier_stats,
-    maybe_dispatch_vm_test, parse_topo_string, propagate_rust_env_from_cmdline,
-    record_skip_sidecar, resolve_test_kernel, run_ktstr_test_inner, sidecar_dir, try_flush_profraw,
+    extract_export_check_test_arg, extract_export_test_arg, extract_shell_test_arg,
+    extract_test_fn_arg, extract_topo_arg, find_test, format_callback_profile,
+    format_kvm_stats, format_verifier_stats, maybe_dispatch_vm_test, parse_topo_string,
+    propagate_rust_env_from_cmdline, record_skip_sidecar, resolve_test_kernel,
+    run_ktstr_test_inner, sidecar_dir, try_flush_profraw,
 };
 
 /// Check if an error is a host topology mismatch (e.g. test requests
@@ -685,18 +686,18 @@ fn is_test_sentinel(name: &str) -> bool {
     name.starts_with("__unit_test_") && name.ends_with("__")
 }
 
-/// Export-self dispatch: if `--ktstr-export-test=NAME` is present in
-/// argv, look up `NAME` in the binary's own `KTSTR_TESTS` registry,
-/// build a self-extracting `.run` file embedding `current_exe()`
-/// (this binary), and exit. Returns `Some(exit_code)` when dispatched,
-/// `None` when the flag is absent.
+/// Export-self dispatch. `--ktstr-export-check-test=NAME` performs only the
+/// cheap registry ownership and static eligibility check;
+/// `--ktstr-export-test=NAME` builds the self-extracting `.run` file embedding
+/// `current_exe()` (this binary). Returns `Some(exit_code)` when either private
+/// discriminator is present and `None` otherwise.
 ///
 /// `cargo ktstr export <NAME>` (the cargo-ktstr binary) is a router
-/// that compiles the workspace's tests, locates the test binary that
-/// owns `NAME`, and exec's it with this arg. The test binary embeds
-/// ITSELF — without that indirection, cargo-ktstr would package its
-/// own binary, which has no `#[ktstr_test]` registrations from the
-/// user's crate and can't reproduce the test on bare metal.
+/// that compiles the workspace's tests, locates an eligible owner with the
+/// check-only arg, then exec's that selected binary once with the real export
+/// arg. The test binary embeds ITSELF — without that indirection, cargo-ktstr
+/// would package its own binary, which has no `#[ktstr_test]` registrations
+/// from the user's crate and can't reproduce the test on bare metal.
 ///
 /// `--ktstr-export-output=PATH` overrides the default output path
 /// (`<NAME>.run` in the cwd). Both flags are leniently parsed by the
@@ -706,7 +707,7 @@ fn is_test_sentinel(name: &str) -> bool {
 ///
 /// # Exit-code contract
 ///
-/// The router (`cargo-ktstr.rs::run_export`) discriminates between
+/// During the check-only phase the router discriminates between
 /// "this binary doesn't know the test" (exit 1) and "this binary
 /// has the test but rejects it" (exit 2). When ANY candidate exits
 /// 2, the router surfaces THAT candidate's stderr (the rejection
@@ -715,10 +716,10 @@ fn is_test_sentinel(name: &str) -> bool {
 /// Without the differentiation, an operator who exports a
 /// host_only test would see the misleading "not found" diagnostic
 /// even though the test exists.
-/// Stub for the `export`-feature-disabled build. The router
-/// (`cargo-ktstr.rs::run_export`) execs every candidate test binary
-/// with `--ktstr-export-test=NAME`; without this stub a binary
-/// compiled without `export` would fall through to the nextest
+///
+/// Stub for the `export`-feature-disabled build. The router probes candidate
+/// test binaries with `--ktstr-export-check-test=NAME`; without this stub a
+/// binary compiled without `export` would fall through to the nextest
 /// harness, which would surface an opaque "unrecognised argument"
 /// error against an arg the operator never typed. The stub turns
 /// that into an actionable diagnostic by detecting the arg and
@@ -731,7 +732,8 @@ fn is_test_sentinel(name: &str) -> bool {
 #[cfg(not(feature = "export"))]
 fn maybe_dispatch_export() -> Option<i32> {
     let args: Vec<String> = std::env::args().collect();
-    let _ = extract_export_test_arg(&args)?;
+    let _ = extract_export_check_test_arg(&args)
+        .or_else(|| extract_export_test_arg(&args))?;
     eprintln!(
         "ktstr export: this test binary was built without the `export` cargo \
          feature, so `cargo ktstr export <name>` cannot reach the export pipeline \
@@ -744,13 +746,18 @@ fn maybe_dispatch_export() -> Option<i32> {
 #[cfg(feature = "export")]
 fn maybe_dispatch_export() -> Option<i32> {
     let args: Vec<String> = std::env::args().collect();
-    let name = extract_export_test_arg(&args)?;
+    let check_name = extract_export_check_test_arg(&args);
+    let execute_name = extract_export_test_arg(&args);
+    let (name, check_only) = if let Some(name) = check_name {
+        (name, true)
+    } else {
+        (execute_name?, false)
+    };
     let output = extract_export_output_arg(&args).map(std::path::PathBuf::from);
 
-    // Empty name: surface as a hard error rather than silently
-    // succeeding. The router's "first binary that exits 0 wins"
-    // protocol relies on the absent-test path returning a non-zero
-    // exit so the next candidate is tried.
+    // Empty name: surface as a hard error rather than silently succeeding. The
+    // bounded selection protocol relies on the absent-test path returning a
+    // non-zero exit so the next candidate is tried.
     if name.is_empty() {
         eprintln!("ktstr export: --ktstr-export-test= requires a non-empty test name");
         return Some(1);
@@ -761,9 +768,19 @@ fn maybe_dispatch_export() -> Option<i32> {
     // "registered but rejected" (exit 2, router surfaces this
     // stderr). `export_test` itself returns anyhow::Error for both
     // cases, which would conflate them at the exit-code level.
-    if find_test(name).is_none() {
+    let Some(entry) = find_test(name) else {
         eprintln!("ktstr export: no registered test named '{name}'");
         return Some(1);
+    };
+
+    if check_only {
+        return match crate::export::validate_export_entry(entry) {
+            Ok(()) => Some(0),
+            Err(error) => {
+                eprintln!("ktstr export: {error:#}");
+                Some(2)
+            }
+        };
     }
 
     match crate::export::export_test(name, output) {
