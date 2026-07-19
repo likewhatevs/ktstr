@@ -417,7 +417,11 @@ pub(crate) fn with_registry_fence<T>(
 /// Production always constructs `RealInotify` and propagates initialization
 /// failure. TestRetry exists only in cfg(test), and only when a unique
 /// LockPrefixesGuard marker has been installed explicitly.
-pub(crate) enum LockDirWatch {
+pub(crate) struct LockDirWatch {
+    backend: LockDirWatchBackend,
+}
+
+enum LockDirWatchBackend {
     RealInotify(RealInotifyWake),
     #[cfg(test)]
     TestRetry,
@@ -533,7 +537,7 @@ impl RealInotifyWake {
             match self.ino.read_events() {
                 Ok(events) if events.is_empty() => break,
                 Ok(events) => self.classify(events, watched, &mut batch),
-                Err(error) if error == nix::errno::Errno::EAGAIN => break,
+                Err(nix::errno::Errno::EAGAIN) => break,
                 Err(error) => return Err(error.into()),
             }
         }
@@ -564,7 +568,7 @@ impl RealInotifyWake {
             }
             let events = match self.ino.read_events() {
                 Ok(events) => events,
-                Err(error) if error == nix::errno::Errno::EAGAIN => continue,
+                Err(nix::errno::Errno::EAGAIN) => continue,
                 Err(error) => return Err(error.into()),
             };
             let mut batch = LockDirEvents::default();
@@ -630,13 +634,17 @@ impl LockDirWatch {
     pub(crate) fn new() -> Result<Self> {
         #[cfg(test)]
         if test_retry_wake_marker_path().is_file() {
-            return Ok(Self::TestRetry);
+            return Ok(Self {
+                backend: LockDirWatchBackend::TestRetry,
+            });
         }
         Self::new_real_wake()
     }
 
     fn new_real_wake() -> Result<Self> {
-        RealInotifyWake::new().map(Self::RealInotify)
+        RealInotifyWake::new().map(|wake| Self {
+            backend: LockDirWatchBackend::RealInotify(wake),
+        })
     }
 
     /// Dedicated real-inotify constructor for its contract tests. It bypasses
@@ -647,10 +655,10 @@ impl LockDirWatch {
     }
 
     pub(crate) fn drain(&self, watched: &ClaimSet) -> Result<LockDirEvents> {
-        match self {
-            Self::RealInotify(wake) => wake.drain(watched),
+        match &self.backend {
+            LockDirWatchBackend::RealInotify(wake) => wake.drain(watched),
             #[cfg(test)]
-            Self::TestRetry => Ok(LockDirEvents::default()),
+            LockDirWatchBackend::TestRetry => Ok(LockDirEvents::default()),
         }
     }
 
@@ -659,10 +667,10 @@ impl LockDirWatch {
         timeout: Duration,
         watched: &ClaimSet,
     ) -> Result<Option<LockDirEvents>> {
-        match self {
-            Self::RealInotify(wake) => wake.wait(timeout, watched),
+        match &self.backend {
+            LockDirWatchBackend::RealInotify(wake) => wake.wait(timeout, watched),
             #[cfg(test)]
-            Self::TestRetry => {
+            LockDirWatchBackend::TestRetry => {
                 std::thread::sleep(timeout);
                 Ok(None)
             }
@@ -670,8 +678,8 @@ impl LockDirWatch {
     }
 
     fn semantic_retry_interval(&self, observation_pending: bool) -> Duration {
-        match self {
-            Self::RealInotify(_) => {
+        match &self.backend {
+            LockDirWatchBackend::RealInotify(_) => {
                 if observation_pending {
                     OBSERVATION_RETRY_FALLBACK
                 } else {
@@ -679,7 +687,7 @@ impl LockDirWatch {
                 }
             }
             #[cfg(test)]
-            Self::TestRetry => TEST_RETRY_WAKE_INTERVAL,
+            LockDirWatchBackend::TestRetry => TEST_RETRY_WAKE_INTERVAL,
         }
     }
 }
@@ -1111,11 +1119,6 @@ pub(crate) fn registry_initializer_temp_count_for_tests() -> Result<usize> {
 }
 
 #[cfg(test)]
-pub(crate) fn hold_registry_exclusive_for_tests() -> Result<OwnedFd> {
-    registry::hold_registry_exclusive_for_tests()
-}
-
-#[cfg(test)]
 pub(crate) fn hold_registry_shared_for_tests() -> Result<OwnedFd> {
     registry::hold_registry_shared_for_tests()
 }
@@ -1458,9 +1461,8 @@ impl HeldLocks {
         let abandoned: Vec<_> = self
             .map
             .iter()
-            .filter_map(|(path, held)| {
-                (keep.get(path.as_str()).copied() != Some(held.mode)).then(|| path.clone())
-            })
+            .filter(|(path, held)| keep.get(path.as_str()).copied() != Some(held.mode))
+            .map(|(path, _)| path.clone())
             .collect();
         for path in abandoned {
             let held = self
@@ -1490,23 +1492,23 @@ impl HeldLocks {
             // A differently-mode-held path cannot be upgraded while its old
             // open-file description remains locked. The next retain_target
             // publishes and releases it before a later sweep retries.
-            if self.map.contains_key(&lock.path) {
+            let std::collections::btree_map::Entry::Vacant(entry) =
+                self.map.entry(lock.path.clone())
+            else {
                 continue;
-            }
+            };
             match try_flock_with_witness(&lock.path, lock.mode)? {
                 TryFlockOutcome::Acquired(fd) => {
-                    self.map.insert(
-                        lock.path.clone(),
-                        HeldLock {
+                    entry.insert(HeldLock {
                             fd,
                             mode: lock.mode,
                             resource: lock.resource,
-                        },
-                    );
+                        });
                     self.newly_held.insert(lock.resource, lock.mode);
                     gained += 1;
                 }
                 TryFlockOutcome::Contended(witness) => {
+                    drop(entry);
                     self.record_contention(ContentionEvidence {
                         blocker: lock.resource,
                         mode: lock.mode,
@@ -1530,16 +1532,13 @@ impl HeldLocks {
     ) -> Result<Option<Vec<OwnedFd>>> {
         let mut fresh: Vec<(String, HeldLock)> = Vec::new();
         for lock in candidate {
-            if self
-                .map
-                .get(&lock.path)
-                .is_some_and(|held| held.mode == lock.mode)
-            {
-                continue;
-            }
-            if self.map.contains_key(&lock.path) {
-                drop(fresh);
-                return Ok(None);
+            match self.map.get(&lock.path) {
+                Some(held) if held.mode == lock.mode => continue,
+                Some(_) => {
+                    drop(fresh);
+                    return Ok(None);
+                }
+                None => {}
             }
             match try_flock_with_witness(&lock.path, lock.mode)? {
                 TryFlockOutcome::Acquired(fd) => fresh.push((
@@ -1691,11 +1690,6 @@ pub(crate) fn force_holder_observer_unavailable_for_tests() {
     FORCE_HOLDER_OBSERVER_UNAVAILABLE.with(|forced| forced.set(true));
 }
 
-#[cfg(test)]
-pub(crate) fn restore_holder_observer_for_tests() {
-    FORCE_HOLDER_OBSERVER_UNAVAILABLE.with(|forced| forced.set(false));
-}
-
 impl HolderObserver {
     fn new() -> Self {
         #[cfg(test)]
@@ -1749,19 +1743,23 @@ impl HolderObserver {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("/proc/self/mountinfo was unavailable"))?;
         for &llc in request.llcs.keys() {
-            if !self.needles.contains_key(&(false, llc)) {
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                self.needles.entry((false, llc))
+            {
                 let path = PathBuf::from(super::llc_lock_path(llc));
                 let needle =
                     crate::flock::mountinfo::needle_from_path_with_mountinfo(&path, mountinfo)?;
-                self.needles.insert((false, llc), needle);
+                entry.insert(needle);
             }
         }
         for &cpu in request.cpus.keys() {
-            if !self.needles.contains_key(&(true, cpu)) {
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                self.needles.entry((true, cpu))
+            {
                 let path = PathBuf::from(super::cpu_lock_path(cpu));
                 let needle =
                     crate::flock::mountinfo::needle_from_path_with_mountinfo(&path, mountinfo)?;
-                self.needles.insert((true, cpu), needle);
+                entry.insert(needle);
             }
         }
         let resource_needles: BTreeSet<String> = request
@@ -1817,13 +1815,15 @@ impl HolderObserver {
     }
 
     fn proof_file(&mut self, key: ResourceKey) -> Result<&std::fs::File> {
-        if !self.proof_files.contains_key(&key) {
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            self.proof_files.entry(key)
+        {
             let path = match key {
                 ResourceKey::Llc(index) => super::llc_lock_path(index),
                 ResourceKey::Cpu(index) => super::cpu_lock_path(index),
             };
             let file = std::fs::OpenOptions::new().read(true).open(&path)?;
-            self.proof_files.insert(key, file);
+            entry.insert(file);
         }
         Ok(&self.proof_files[&key])
     }
@@ -2104,6 +2104,7 @@ fn acquire_as_coordinator_impl<T>(
 /// which is what lets the coordinator hold partials
 /// safely and keeps overlapping fast-path sets from half-blocking
 /// each other.
+#[cfg(test)]
 pub(crate) fn canonical_lock_order(
     llc_indices: &[usize],
     llc_mode: FlockMode,

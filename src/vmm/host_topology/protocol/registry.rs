@@ -58,7 +58,8 @@ const H_GRANT_SCANS: usize = 136;
 const H_ACTIVE_HEAD: usize = 144;
 const H_ACTIVE_TAIL: usize = 152;
 const H_LIVENESS_RECONCILE_BY_NS: usize = 160;
-const _: () = assert!(H_AGGREGATE_DIRTY % std::mem::align_of::<AtomicU64>() == 0);
+const _: () =
+    assert!(H_AGGREGATE_DIRTY.is_multiple_of(std::mem::align_of::<AtomicU64>()));
 
 const R_STATE: usize = 0;
 const R_WAKE: usize = 4;
@@ -544,14 +545,14 @@ impl Ticket {
         table.adjust_watch_counts(&watch, true)?;
         table.mark_observation_modes(&newly_watched)?;
         table.mark_blockers_unknown(&contention_markers)?;
-        if initial_state == STATE_WAITING {
-            if let Some(marker) = exact_blocker {
-                table.set_record_blocked(
-                    slot,
-                    marker,
-                    blocked_at.expect("initial blocker serial must accompany evidence"),
-                )?;
-            }
+        if initial_state == STATE_WAITING
+            && let Some(marker) = exact_blocker
+        {
+            table.set_record_blocked(
+                slot,
+                marker,
+                blocked_at.expect("initial blocker serial must accompany evidence"),
+            )?;
         }
         table.set_next_ticket(
             ticket
@@ -879,12 +880,11 @@ impl Ticket {
         check_cancelled(cancelled)?;
 
         if let Some(acquired) = result.acquired.take() {
-            if !acquisition_allowed {
-                anyhow::bail!(
-                    "replan-only queue wake returned an acquired payload for ticket {}",
-                    self.ticket
-                );
-            }
+            anyhow::ensure!(
+                acquisition_allowed,
+                "replan-only queue wake returned an acquired payload for ticket {}",
+                self.ticket
+            );
             crash_at_for_tests("granted_acquired_before_clear");
             // Unmap the per-slot futex before making the slot recyclable.
             self.wake.take();
@@ -952,6 +952,10 @@ impl Ticket {
         Ok(GrantResult::Requeued)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one coordinator transaction combines independent event, claim, liveness, and cancellation inputs"
+    )]
     pub(super) fn schedule(
         &mut self,
         coordinator_claim: Option<&ClaimSet>,
@@ -1006,17 +1010,17 @@ impl Ticket {
             validate_claim(claim)?;
             validate_claim_within_watch(claim, &record.watch)?;
         }
-        if let Some(claim) = newly_held {
-            if !claim.is_empty() {
-                validate_claim(claim)?;
-                validate_claim_within_watch(claim, &record.watch)?;
-            }
+        if let Some(claim) = newly_held
+            && !claim.is_empty()
+        {
+            validate_claim(claim)?;
+            validate_claim_within_watch(claim, &record.watch)?;
         }
-        if let Some(claim) = abandoned {
-            if !claim.is_empty() {
-                validate_claim(claim)?;
-                validate_claim_within_watch(claim, &record.watch)?;
-            }
+        if let Some(claim) = abandoned
+            && !claim.is_empty()
+        {
+            validate_claim(claim)?;
+            validate_claim_within_watch(claim, &record.watch)?;
         }
         validate_contention_within_watch(contention, &record.watch)?;
         let mut event_cpus;
@@ -1671,11 +1675,6 @@ fn set_snapshot_bit(words: &mut [u64], index: usize, value: bool, bits: usize) -
     Ok(())
 }
 
-#[cfg(test)]
-pub(super) fn shared_state_recovery_upgrade_count_for_tests() -> usize {
-    SHARED_STATE_RECOVERY_UPGRADES.with(std::cell::Cell::get)
-}
-
 pub(super) fn with_aggregate_fence<T>(
     candidate: &ClaimSet,
     run: impl FnOnce() -> Result<T>,
@@ -1771,11 +1770,12 @@ pub(super) fn with_aggregate_fence<T>(
             let coordinator = read_u64(&map, H_COORDINATOR);
             let coordinator_slot = read_u64(&map, H_COORDINATOR_SLOT);
             let next_slot = read_u64(&map, H_NEXT_SLOT);
-            if coordinator == 0 {
-                if shared_live_inflight_head(&map, layout, next_slot)? {
-                    return Ok(FenceResult::Fenced);
-                }
-            } else {
+            let live_inflight_head =
+                coordinator == 0 && shared_live_inflight_head(&map, layout, next_slot)?;
+            if live_inflight_head {
+                return Ok(FenceResult::Fenced);
+            }
+            if coordinator != 0 {
                 if coordinator_slot >= next_slot {
                     anyhow::bail!(
                         "queue registry v{VERSION} coordinator slot {coordinator_slot} is outside \
@@ -1826,11 +1826,6 @@ pub(super) fn snapshot() -> Result<Vec<(u64, u32, ClaimSet)>> {
         .into_iter()
         .map(|record| (record.ticket, record.pid, record.claim))
         .collect())
-}
-
-#[cfg(test)]
-pub(super) fn hold_registry_exclusive_for_tests() -> Result<OwnedFd> {
-    lock_registry_existing(FlockMode::Exclusive)
 }
 
 #[cfg(test)]
@@ -4204,6 +4199,10 @@ impl Table {
         Ok(slot)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "record publication writes one fixed-layout queue record and its publication epochs as a unit"
+    )]
     fn initialize_record(
         &mut self,
         slot: u64,
@@ -4519,6 +4518,10 @@ impl Table {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "claim replacement carries the complete transactional record transition"
+    )]
     fn replace_claim(
         &mut self,
         slot: u64,
@@ -4545,6 +4548,10 @@ impl Table {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "claim replacement carries the complete transactional record transition"
+    )]
     fn replace_claim_in_transaction(
         &mut self,
         slot: u64,
@@ -4645,17 +4652,15 @@ impl Table {
     }
 
     fn remove_record_in_transaction(&mut self, record: &Record, acquired: bool) -> Result<()> {
-        if !acquired {
-            if self.coordinator_ticket() == record.ticket {
-                // The coordinator may have acquired partials for a freshly
-                // planned alternative but crashed before publishing that exact
-                // claim. Its immutable watch is the only sound crash envelope.
-                self.mark_possible_release(&record.watch.cpus, &record.watch.llcs)?;
-            } else if record.state == STATE_GRANTED {
-                // A granted callback probes without EX and may die while
-                // holding its exact fds, before committing acquired removal.
-                self.mark_possible_release(&record.claim.cpus, &record.claim.llcs)?;
-            }
+        if !acquired && self.coordinator_ticket() == record.ticket {
+            // The coordinator may have acquired partials for a freshly
+            // planned alternative but crashed before publishing that exact
+            // claim. Its immutable watch is the only sound crash envelope.
+            self.mark_possible_release(&record.watch.cpus, &record.watch.llcs)?;
+        } else if !acquired && record.state == STATE_GRANTED {
+            // A granted callback probes without EX and may die while
+            // holding its exact fds, before committing acquired removal.
+            self.mark_possible_release(&record.claim.cpus, &record.claim.llcs)?;
         }
         self.adjust_claim_counts(&record.claim, false)?;
         self.adjust_watch_counts(&record.watch, false)?;
@@ -5951,12 +5956,12 @@ impl Table {
     }
 
     fn ensure_chunk(&mut self, chunk: u64) -> Result<()> {
-        if self.chunks.contains_key(&chunk) {
-            return Ok(());
+        let record_size = self.layout.record_size;
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.chunks.entry(chunk) {
+            let file = open_chunk_file(chunk, record_size)?;
+            let map = unsafe { MmapMut::map_mut(&file) }?;
+            entry.insert(map);
         }
-        let file = open_chunk_file(chunk, self.layout.record_size)?;
-        let map = unsafe { MmapMut::map_mut(&file) }?;
-        self.chunks.insert(chunk, map);
         Ok(())
     }
 

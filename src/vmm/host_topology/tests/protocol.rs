@@ -2168,18 +2168,6 @@ impl TicketChild {
         )
     }
 
-    fn spawn_observerless(marker_dir: &std::path::Path, label: &str, candidates: &str) -> Self {
-        Self::spawn_with_options(
-            marker_dir,
-            label,
-            candidates,
-            TicketSpawnOptions {
-                force_observer_none: true,
-                ..TicketSpawnOptions::default()
-            },
-        )
-    }
-
     fn spawn_crashing(
         marker_dir: &std::path::Path,
         label: &str,
