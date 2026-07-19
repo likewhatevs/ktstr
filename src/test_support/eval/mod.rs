@@ -35,8 +35,9 @@ use super::{KtstrTestEntry, SchedulerSpec, Topology};
 mod kernel;
 mod post_vm;
 pub(crate) use post_vm::{
-    ExpectAutoReproSatisfied, HostSkipRequest, PostVmAssertionFailure, SchedulerBuildRefused,
-    ScxBpfErrorMatcherMismatch, SurvivesStormViolated, record_skip_sidecar, run_post_vm_callbacks,
+    ExpectAutoReproSatisfied, FrameworkInfrastructureFailure, HostSkipRequest,
+    PostVmAssertionFailure, SchedulerBuildRefused, ScxBpfErrorMatcherMismatch,
+    SurvivesStormViolated, record_skip_sidecar, run_post_vm_callbacks,
 };
 pub use post_vm::{
     capture_starvation_witness, periodic_starvation_gate, post_vm_skip, stall_ejection_skip,
@@ -1543,6 +1544,7 @@ fn run_ktstr_test_inner_impl(
             entry,
             &kernel,
             scheduler.as_deref(),
+            &resolved_staged,
             &ktstr_bin,
             output,
             &result.stderr,

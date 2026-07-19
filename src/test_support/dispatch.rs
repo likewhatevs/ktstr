@@ -1144,6 +1144,13 @@ fn ok_to_exit_code(r: AssertResult, expect_err: bool, allow_inconclusive: bool) 
 /// order + per-class skip/fail policy live in `classify_host_error`, not
 /// here, so this site and the macro cannot drift apart.
 fn err_to_exit_code(e: anyhow::Error, expect_err: bool, no_skip: bool) -> i32 {
+    if crate::test_support::is_framework_infrastructure_failure(&e) {
+        // Framework faults are never resource insufficiency and never an
+        // expected guest failure. Check the marker before host classification
+        // so a nested errno or contextual message cannot turn it into a skip.
+        eprintln!("{e:#}");
+        return EXIT_FAIL;
+    }
     // Host-insufficiency classification (kernel-unavailable, perf-mode,
     // cpu-budget, topology-unrepresentable, resource-contention,
     // topology-insufficient) is shared with the `#[ktstr_test]` macro body via
@@ -1374,6 +1381,9 @@ pub(crate) fn final_outcome(
             Verdict::Pass
         }
         Err(e) => {
+            if crate::test_support::is_framework_infrastructure_failure(e) {
+                return Verdict::Fail;
+            }
             match classify_host_error(e, no_skip) {
                 HostClass::Skip { .. } => return Verdict::Skip,
                 HostClass::Fail { .. } => return Verdict::Fail,
@@ -2201,32 +2211,38 @@ fn run_verifier_cell_inner(
         return 1;
     };
 
-    let sched_bin: std::path::PathBuf = match sched.binary {
+    let prebuilt = if sched.binary.has_bpf_scheduler() {
+        match crate::scheduler_artifact::scheduler_artifact_from_env(
+            Some(sched.name),
+            &sched.binary,
+            sched.manifest_dir,
+        ) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!(
+                    "ktstr verifier: resolve parent-owned scheduler artifact for \
+                     {sched_name:?}: {e:#}"
+                );
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+    let sched_bin: std::path::PathBuf = if let Some(path) = prebuilt {
+        path
+    } else {
+        match sched.binary {
         // A cargo-ktstr parent prebuilds every selected Discover package once
-        // and exports an immutable exact-identity manifest. A direct/manual
-        // cell invocation has no manifest and retains the legacy on-demand
-        // build. Once a manifest is present, lookup failure is fatal and MUST
-        // NOT silently rebuild: doing so would recreate one shared-target
-        // Cargo lock waiter per verifier topology cell.
+        // and exports the same immutable exact-identity manifest used by
+        // ordinary and coverage tests. A direct/manual cell invocation has no
+        // manifest and retains on-demand resolution. Once a manifest is
+        // present, lookup failure is fatal and MUST NOT silently rebuild.
         SchedulerSpec::Discover(pkg) => {
-            match crate::verifier::verifier_scheduler_artifact_from_env(
-                sched.name,
-                pkg,
-                sched.manifest_dir,
-            ) {
-                Ok(Some(path)) => path,
-                Ok(None) => match crate::build_and_find_binary(pkg, sched.manifest_dir) {
-                    Ok(path) => path,
-                    Err(e) => {
-                        eprintln!("ktstr verifier: build scheduler {pkg:?}: {e:#}");
-                        return 1;
-                    }
-                },
+            match crate::build_and_find_binary(pkg, sched.manifest_dir) {
+                Ok(path) => path,
                 Err(e) => {
-                    eprintln!(
-                        "ktstr verifier: resolve prebuilt scheduler {sched_name:?} \
-                         (package {pkg:?}): {e:#}"
-                    );
+                    eprintln!("ktstr verifier: build scheduler {pkg:?}: {e:#}");
                     return 1;
                 }
             }
@@ -2258,6 +2274,7 @@ fn run_verifier_cell_inner(
             );
             return 0;
         }
+    }
     };
 
     let ktstr_bin = match std::env::current_exe() {

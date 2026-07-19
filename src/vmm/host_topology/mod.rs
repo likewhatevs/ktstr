@@ -4,6 +4,7 @@
 //! vCPU pinning and host resource validation.
 
 use anyhow::{Context, Result};
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // Advisory flock primitives live in `crate::flock` so both LLC +
@@ -18,6 +19,54 @@ use crate::flock::{FlockMode, TryFlockOutcome, try_flock, try_flock_with_witness
 // work-conserving grants, the coordinator watch, and lifecycle-bound blocking.
 // See protocol.rs's module doc for the full model.
 pub(crate) mod protocol;
+
+const RESERVATION_WAIT_PROGRESS_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+thread_local! {
+    /// Optional same-thread progress callbacks around a blocking admission
+    /// acquire. A stack keeps nested library callers well-defined without a
+    /// process-global reporter or helper thread.
+    static RESERVATION_WAIT_PROGRESS: RefCell<Vec<Box<dyn FnMut()>>> =
+        RefCell::new(Vec::new());
+}
+
+struct ReservationWaitProgressScope;
+
+impl Drop for ReservationWaitProgressScope {
+    fn drop(&mut self) {
+        RESERVATION_WAIT_PROGRESS.with(|callbacks| {
+            callbacks
+                .borrow_mut()
+                .pop()
+                .expect("reservation wait progress scope remains installed");
+        });
+    }
+}
+
+pub(crate) fn with_reservation_wait_progress<T>(
+    progress: impl FnMut() + 'static,
+    operation: impl FnOnce() -> T,
+) -> T {
+    RESERVATION_WAIT_PROGRESS.with(|callbacks| {
+        callbacks.borrow_mut().push(Box::new(progress));
+    });
+    let _scope = ReservationWaitProgressScope;
+    operation()
+}
+
+fn tick_reservation_wait_progress() {
+    RESERVATION_WAIT_PROGRESS.with(|callbacks| {
+        if let Some(progress) = callbacks.borrow_mut().last_mut() {
+            progress();
+        }
+    });
+}
+
+fn reservation_wait_progress_poll() -> Option<std::time::Duration> {
+    RESERVATION_WAIT_PROGRESS.with(|callbacks| {
+        (!callbacks.borrow().is_empty()).then_some(RESERVATION_WAIT_PROGRESS_POLL)
+    })
+}
 
 /// Resource contention error — LLC slots or CPUs unavailable.
 /// Downcast via `anyhow::Error::downcast_ref::<ResourceContention>()`

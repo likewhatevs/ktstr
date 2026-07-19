@@ -19,6 +19,7 @@
 //! is INDEPENDENT of `--release` (`--cargo-profile release`, the harness
 //! build profile).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -76,7 +77,42 @@ const LLVM_COV_GLOBAL_VALUE_OPTIONS: &[&str] = &[
     "--target",
     "--color",
     "--manifest-path",
+    "--cargo-profile",
+    "--archive-file",
+    "--nextest-archive-file",
     "-Z",
+];
+
+/// Additional value-taking spellings accepted after cargo-llvm-cov's
+/// `nextest` subcommand.
+///
+/// The lifecycle scanner must not mistake an option value literally named
+/// `--no-clean`, `--no-report`, or `--no-run` for a cargo-llvm-cov retention
+/// flag. This table covers the nextest/Cargo controls that are not already in
+/// [`LLVM_COV_GLOBAL_VALUE_OPTIONS`].
+const LLVM_COV_NEXTEST_VALUE_OPTIONS: &[&str] = &[
+    "--cargo-profile",
+    "--exclude",
+    "--exclude-from-test",
+    "--exclude-from-report",
+    "--build-jobs",
+    "--test-threads",
+    "--retries",
+    "--max-fail",
+    "--cargo-message-format",
+    "--config",
+    "--target-dir",
+    "--archive-file",
+    "--archive-format",
+    "--zstd-level",
+    "--nextest-archive-file",
+    "--config-file",
+    "--user-config-file",
+    "--tool-config-file",
+    "-P",
+    "-E",
+    "--filterset",
+    "--filter-expr",
 ];
 
 /// Whether the raw `cargo ktstr llvm-cov` passthrough explicitly selects
@@ -87,15 +123,15 @@ const LLVM_COV_GLOBAL_VALUE_OPTIONS: &[&str] = &[
 /// show-env, and run do not enumerate ktstr test binaries either. Keep this
 /// deliberately narrow: the documented test-producing form is
 /// `cargo ktstr llvm-cov nextest ...`.
-fn llvm_cov_uses_nextest(args: &[String]) -> bool {
+fn llvm_cov_nextest_index(args: &[String]) -> Option<usize> {
     let mut index = 0;
     while index < args.len() {
         let argument = &args[index];
         if argument == "--" {
-            return false;
+            return None;
         }
         if !argument.starts_with('-') {
-            return argument == "nextest";
+            return (argument == "nextest").then_some(index);
         }
 
         // cargo-llvm-cov accepts its global options before the subcommand.
@@ -104,7 +140,11 @@ fn llvm_cov_uses_nextest(args: &[String]) -> bool {
         let takes_separate_value = LLVM_COV_GLOBAL_VALUE_OPTIONS.contains(&argument.as_str());
         index += if takes_separate_value { 2 } else { 1 };
     }
-    false
+    None
+}
+
+fn llvm_cov_uses_nextest(args: &[String]) -> bool {
+    llvm_cov_nextest_index(args).is_some()
 }
 
 /// Apply the ordinary nextest metadata preflight to the raw llvm-cov
@@ -121,7 +161,10 @@ fn prepare_llvm_cov_args_with(
     args: Vec<String>,
     prepare: impl FnOnce(Vec<String>) -> Result<Vec<String>, String>,
 ) -> Result<Vec<String>, String> {
-    if llvm_cov_uses_nextest(&args) {
+    if llvm_cov_uses_nextest(&args)
+        && !llvm_cov_reuses_archive(LLVM_COV_SUB_ARGV, &args)
+        && !llvm_cov_has_lifecycle_flag(&args, "--no-run")
+    {
         prepare(args)
     } else {
         Ok(args)
@@ -136,9 +179,436 @@ fn prepare_llvm_cov_args_with(
 /// to [`llvm_cov_uses_nextest`] prevents report/clean/show-env passthroughs
 /// from being mutated.
 fn cargo_sub_uses_nextest(sub_argv: &[&str], args: &[String]) -> bool {
-    sub_argv == TEST_SUB_ARGV
+    let selects_nextest = sub_argv == TEST_SUB_ARGV
         || sub_argv == COVERAGE_SUB_ARGV
-        || (sub_argv == LLVM_COV_SUB_ARGV && llvm_cov_uses_nextest(args))
+        || (sub_argv == LLVM_COV_SUB_ARGV && llvm_cov_uses_nextest(args));
+    selects_nextest
+        && !(sub_argv != TEST_SUB_ARGV
+            && llvm_cov_has_lifecycle_flag(args, "--no-run"))
+}
+
+/// Whether the final cargo-llvm-cov invocation deliberately retains existing
+/// coverage artifacts.
+///
+/// cargo-llvm-cov makes `--no-report` and `--no-run` imply `--no-clean`.
+/// Those modes are user-owned merge/build-only workflows: ktstr must not
+/// pre-clean them or add a second lifecycle policy. Value-taking options are
+/// skipped so a value which happens to equal one of these flags stays opaque.
+fn llvm_cov_has_lifecycle_flag(args: &[String], wanted: &str) -> bool {
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--" {
+            break;
+        }
+        if argument == wanted {
+            return true;
+        }
+        let takes_value = llvm_cov_or_nextest_option_takes_value(argument);
+        index += if takes_value { 2 } else { 1 };
+    }
+    false
+}
+
+fn llvm_cov_retains_artifacts(args: &[String]) -> bool {
+    ["--no-clean", "--no-report", "--no-run"]
+        .iter()
+        .any(|flag| llvm_cov_has_lifecycle_flag(args, flag))
+}
+
+/// Whether ktstr must own cargo-llvm-cov's clean/warm/run lifecycle.
+fn llvm_cov_managed_lifecycle(sub_argv: &[&str], args: &[String]) -> bool {
+    (sub_argv == COVERAGE_SUB_ARGV
+        || (sub_argv == LLVM_COV_SUB_ARGV && llvm_cov_uses_nextest(args)))
+        && !llvm_cov_retains_artifacts(args)
+        && !llvm_cov_reuses_archive(sub_argv, args)
+}
+
+fn nextest_region_start(sub_argv: &[&str], args: &[String]) -> Option<usize> {
+    if sub_argv == TEST_SUB_ARGV || sub_argv == COVERAGE_SUB_ARGV {
+        Some(0)
+    } else if sub_argv == LLVM_COV_SUB_ARGV {
+        llvm_cov_nextest_index(args).map(|index| index + 1)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NextestArchiveOption {
+    option_index: usize,
+    separate_value: bool,
+    value: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NextestArchiveReuse {
+    file: NextestArchiveOption,
+    format: Option<NextestArchiveOption>,
+}
+
+fn nextest_archive_reuse(
+    sub_argv: &[&str],
+    args: &[String],
+) -> Result<Option<NextestArchiveReuse>, String> {
+    if sub_argv == LLVM_COV_SUB_ARGV {
+        let mut index = 0;
+        while index < args.len() {
+            let argument = &args[index];
+            if argument == "--archive-format"
+                && args[index + 1..].iter().any(|value| value == "nextest")
+            {
+                return Err(
+                    "cargo ktstr: split --archive-format is not valid before \
+                     cargo-llvm-cov's nextest subcommand; use \
+                     --archive-format=tar-zst or place it after nextest"
+                        .to_string(),
+                );
+            }
+            if !argument.starts_with('-') || argument == "--" {
+                break;
+            }
+            index += if LLVM_COV_GLOBAL_VALUE_OPTIONS.contains(&argument.as_str()) {
+                2
+            } else {
+                1
+            };
+        }
+    }
+    let raw_nextest_index = (sub_argv == LLVM_COV_SUB_ARGV)
+        .then(|| llvm_cov_nextest_index(args))
+        .flatten();
+    let Some(mut index) = (if sub_argv == LLVM_COV_SUB_ARGV {
+        raw_nextest_index.map(|_| 0)
+    } else {
+        nextest_region_start(sub_argv, args)
+    }) else {
+        return Ok(None);
+    };
+    let mut file = None;
+    let mut format = None;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--" {
+            break;
+        }
+        if Some(index) == raw_nextest_index {
+            index += 1;
+            continue;
+        }
+        let parsed = if argument == "--archive-file" || argument == "--archive-format" {
+            let archive_file = argument == "--archive-file";
+            let value = args.get(index + 1).filter(|value| {
+                value.as_str() != "--"
+                    && (archive_file || !value.starts_with('-'))
+            });
+            let Some(value) = value else {
+                return Err(format!(
+                    "cargo ktstr: {argument} requires a nonempty value"
+                ));
+            };
+            let parsed = NextestArchiveOption {
+                option_index: index,
+                separate_value: true,
+                value: value.clone(),
+            };
+            index += 2;
+            Some((argument.as_str(), parsed))
+        } else if let Some(value) = argument.strip_prefix("--archive-file=") {
+            if value.is_empty() {
+                return Err(
+                    "cargo ktstr: --archive-file requires a nonempty value".to_string()
+                );
+            }
+            let parsed = NextestArchiveOption {
+                option_index: index,
+                separate_value: false,
+                value: value.to_string(),
+            };
+            index += 1;
+            Some(("--archive-file", parsed))
+        } else if let Some(value) = argument.strip_prefix("--archive-format=") {
+            if value.is_empty() {
+                return Err(
+                    "cargo ktstr: --archive-format requires a nonempty value".to_string()
+                );
+            }
+            let parsed = NextestArchiveOption {
+                option_index: index,
+                separate_value: false,
+                value: value.to_string(),
+            };
+            index += 1;
+            Some(("--archive-format", parsed))
+        } else {
+            None
+        };
+        if let Some((option, parsed)) = parsed {
+            let slot = if option == "--archive-file" {
+                &mut file
+            } else {
+                &mut format
+            };
+            if slot.replace(parsed).is_some() {
+                return Err(format!(
+                    "cargo ktstr: duplicate {option} is ambiguous"
+                ));
+            }
+            continue;
+        }
+        index += if llvm_cov_or_nextest_option_takes_value(argument) {
+            2
+        } else {
+            1
+        };
+    }
+    let Some(file) = file else {
+        if format.is_some() {
+            return Err(
+                "cargo ktstr: --archive-format requires --archive-file".to_string()
+            );
+        }
+        return Ok(None);
+    };
+    let supported = format.as_ref().map_or_else(
+        || file.value.ends_with(".tar.zst"),
+        |format| {
+            matches!(format.value.as_str(), "tar-zst" | "tar-zstd")
+                || (format.value == "auto"
+                    && file.value.ends_with(".tar.zst"))
+        },
+    );
+    if !supported {
+        return Err(format!(
+            "cargo ktstr: archive format {} does not resolve to tar-zst \
+             for --archive-file {:?}",
+            format
+                .as_ref()
+                .map_or("auto", |format| format.value.as_str()),
+            file.value,
+        ));
+    }
+    Ok(Some(NextestArchiveReuse { file, format }))
+}
+
+fn llvm_cov_reuses_archive(sub_argv: &[&str], args: &[String]) -> bool {
+    nextest_archive_reuse(sub_argv, args)
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+fn llvm_cov_archive_path(
+    sub_argv: &[&str],
+    args: &[String],
+    invocation_dir: &std::path::Path,
+) -> Result<Option<PathBuf>, String> {
+    let Some(reuse) = nextest_archive_reuse(sub_argv, args)? else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(reuse.file.value);
+    Ok(Some(if path.is_absolute() {
+        path
+    } else {
+        invocation_dir.join(path)
+    }))
+}
+
+fn rewrite_nextest_archive_reuse(
+    sub_argv: &[&str],
+    mut args: Vec<String>,
+    archive_path: &std::path::Path,
+) -> Result<Vec<String>, String> {
+    let reuse = nextest_archive_reuse(sub_argv, &args)?.ok_or_else(|| {
+        "cargo ktstr: cannot rewrite a nextest invocation without --archive-file"
+            .to_string()
+    })?;
+    let path = archive_path.to_string_lossy().into_owned();
+    if reuse.file.separate_value {
+        args[reuse.file.option_index + 1] = path;
+    } else {
+        args[reuse.file.option_index] = format!("--archive-file={path}");
+    }
+    if let Some(format) = reuse.format {
+        if format.separate_value {
+            args[format.option_index + 1] = "tar-zst".to_string();
+        } else {
+            args[format.option_index] = "--archive-format=tar-zst".to_string();
+        }
+    } else {
+        let region_start = nextest_region_start(sub_argv, &args)
+            .expect("validated archive reuse selects nextest");
+        let insertion = args[region_start..]
+            .iter()
+            .position(|argument| argument == "--")
+            .map_or(args.len(), |offset| region_start + offset);
+        args.insert(insertion, "--archive-format=tar-zst".to_string());
+    }
+    Ok(args)
+}
+
+fn cargo_sub_needs_reserved_prebuild(sub_argv: &[&str], args: &[String]) -> bool {
+    if !cargo_sub_uses_nextest(sub_argv, args) {
+        return false;
+    }
+    !llvm_cov_has_lifecycle_flag(args, "--no-run")
+        && !llvm_cov_reuses_archive(sub_argv, args)
+}
+
+const ORCHESTRATED_NEXTEST_TEST_THREADS: usize = 1_000_000;
+
+fn valid_nextest_test_threads(value: &str) -> bool {
+    value == "num-cpus" || value.parse::<isize>().is_ok_and(|threads| threads != 0)
+}
+
+fn normalize_nextest_region(args: Vec<String>, region_start: usize) -> Vec<String> {
+    let separator = args[region_start..]
+        .iter()
+        .position(|argument| argument == "--")
+        .map_or(args.len(), |offset| region_start + offset);
+    let mut out = Vec::with_capacity(args.len() + 1);
+    out.extend(args[..region_start].iter().cloned());
+    let mut index = region_start;
+    while index < separator {
+        let argument = &args[index];
+        if matches!(argument.as_str(), "-j" | "--test-threads") {
+            if args
+                .get(index + 1)
+                .filter(|_| index + 1 < separator)
+                .is_some_and(|value| valid_nextest_test_threads(value))
+            {
+                index += 2;
+                continue;
+            }
+        }
+        let valid_joined = argument
+            .strip_prefix("-j")
+            .filter(|value| !value.is_empty())
+            .map(|value| value.strip_prefix('=').unwrap_or(value))
+            .is_some_and(valid_nextest_test_threads)
+            || argument
+                .strip_prefix("--test-threads=")
+                .is_some_and(valid_nextest_test_threads);
+        if valid_joined {
+            index += 1;
+            continue;
+        }
+        out.push(argument.clone());
+        index += 1;
+    }
+    out.push(format!(
+        "--test-threads={ORCHESTRATED_NEXTEST_TEST_THREADS}"
+    ));
+    out.extend(args[separator..].iter().cloned());
+    out
+}
+
+fn normalize_raw_llvm_cov_build_jobs(args: Vec<String>) -> Vec<String> {
+    let Some(nextest_index) = llvm_cov_nextest_index(&args) else {
+        return args;
+    };
+    let mut out = Vec::with_capacity(args.len() + 2);
+    let mut build_jobs = None;
+    let mut index = 0;
+    while index < nextest_index {
+        let argument = &args[index];
+        if matches!(argument.as_str(), "-j" | "--jobs") {
+            if let Some(value) = args.get(index + 1) {
+                build_jobs = Some(value.clone());
+                index += 2;
+            } else {
+                out.push(argument.clone());
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(value) = argument
+            .strip_prefix("--jobs=")
+            .or_else(|| {
+                argument
+                    .strip_prefix("-j")
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.strip_prefix('=').unwrap_or(value))
+            })
+        {
+            build_jobs = Some(value.to_string());
+            index += 1;
+            continue;
+        }
+        out.push(argument.clone());
+        index += 1;
+        if LLVM_COV_GLOBAL_VALUE_OPTIONS.contains(&argument.as_str())
+            && index < nextest_index
+        {
+            out.push(args[index].clone());
+            index += 1;
+        }
+    }
+    out.push("nextest".to_string());
+    index = nextest_index + 1;
+    let separator = args[index..]
+        .iter()
+        .position(|argument| argument == "--")
+        .map_or(args.len(), |offset| index + offset);
+    while index < separator {
+        let argument = &args[index];
+        if argument == "--build-jobs" {
+            if let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) {
+                build_jobs = Some(value.clone());
+                index += 2;
+            } else {
+                out.push(argument.clone());
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--build-jobs=") {
+            build_jobs = Some(value.to_string());
+            index += 1;
+            continue;
+        }
+        out.push(argument.clone());
+        index += 1;
+        if llvm_cov_or_nextest_option_takes_value(argument) && index < separator {
+            out.push(args[index].clone());
+            index += 1;
+        }
+    }
+    if let Some(build_jobs) = build_jobs {
+        out.extend(["--build-jobs".to_string(), build_jobs]);
+    }
+    out.extend_from_slice(&args[separator..]);
+    out
+}
+
+/// Enforce one admission scheduler for every cargo-ktstr nextest run.
+///
+/// User/repository nextest run-slot limits would otherwise strand ktstr cells
+/// before they reach the machine-wide topology queue. Replace every
+/// syntactically valid CLI spelling with the orchestrator's effectively
+/// unbounded admission count. Malformed spellings remain intact so nextest,
+/// rather than this wrapper, reports the user's argument error.
+/// Raw llvm-cov build-job flags before its `nextest` subcommand remain Cargo
+/// controls, and an inner `--` keeps the test-binary suffix opaque.
+pub(crate) fn normalize_nextest_admission(sub_argv: &[&str], args: Vec<String>) -> Vec<String> {
+    let args = if sub_argv == LLVM_COV_SUB_ARGV {
+        normalize_raw_llvm_cov_build_jobs(args)
+    } else {
+        args
+    };
+    let region_start = nextest_region_start(sub_argv, &args);
+    region_start.map_or(args.clone(), |start| normalize_nextest_region(args, start))
+}
+
+/// Variant for a complete `cargo nextest run ...` argv, used by verifier.
+pub(crate) fn normalize_nextest_command_admission(args: Vec<String>) -> Vec<String> {
+    if args.get(0).map(String::as_str) == Some("nextest")
+        && args.get(1).map(String::as_str) == Some("run")
+    {
+        normalize_nextest_region(args, 2)
+    } else {
+        args
+    }
 }
 
 /// Add ktstr's low-priority nextest defaults to every nextest-backed route.
@@ -285,12 +755,18 @@ pub(crate) fn prebuilt_blob_bin_envs(
 /// can't be inspected directly.
 ///
 /// `--cargo-profile release` is prepended BEFORE the user's trailing
-/// `args` so the profile selection applies to the whole invocation.
+/// nextest args so the profile selection applies to the whole invocation.
 /// nextest reads `--cargo-profile` directly; `cargo llvm-cov nextest`
-/// forwards it to its inner nextest invocation. For `cargo llvm-cov
-/// <sub>` (the raw-passthrough binding) the caller passes `release ==
-/// false` and `profile` / `nextest_profile` `None`, so nothing is
-/// injected — the raw path relies on user-supplied flags.
+/// forwards it to its inner nextest invocation. Nextest-backed llvm-cov
+/// routes additionally receive one global `--no-clean` immediately before
+/// the FINAL `nextest`: the reserved `nextest-archive` warm command has
+/// already run cargo-llvm-cov's exact clean_partial and built the identical
+/// instrumented artifacts. Explicit user retention modes (`--no-clean`,
+/// `--no-report`, and report-only `--no-run`) remain authoritative and receive
+/// no wrapper lifecycle flag. For `cargo llvm-cov <non-nextest-sub>` (the raw
+/// passthrough binding) the caller passes `release == false` and `profile` /
+/// `nextest_profile` `None`, so nothing is injected and the argv remains
+/// byte-for-byte user-controlled.
 ///
 /// The `std::env`-reading envs (prebuilt-blob paths, `LLVM_PROFILE_FILE`
 /// profraw injection) and the kernel-resolution envs are layered on by
@@ -306,7 +782,31 @@ fn build_cargo_command(
     args: &[String],
 ) -> Command {
     let mut cmd = Command::new("cargo");
-    cmd.args(sub_argv);
+    let managed_llvm_cov = llvm_cov_managed_lifecycle(sub_argv, args);
+    let command_args = if sub_argv == COVERAGE_SUB_ARGV {
+        cmd.arg("llvm-cov");
+        if managed_llvm_cov {
+            cmd.arg("--no-clean");
+        }
+        cmd.arg("nextest");
+        args
+    } else if sub_argv == LLVM_COV_SUB_ARGV {
+        if let Some(nextest_index) = llvm_cov_nextest_index(args) {
+            cmd.arg("llvm-cov");
+            cmd.args(&args[..nextest_index]);
+            if managed_llvm_cov {
+                cmd.arg("--no-clean");
+            }
+            cmd.arg("nextest");
+            &args[nextest_index + 1..]
+        } else {
+            cmd.args(sub_argv);
+            args
+        }
+    } else {
+        cmd.args(sub_argv);
+        args
+    };
     if release {
         cmd.args(["--cargo-profile", "release"]);
     }
@@ -316,7 +816,7 @@ fn build_cargo_command(
     if let Some(np) = nextest_profile {
         cmd.args(["--profile", np]);
     }
-    cmd.args(args);
+    cmd.args(command_args);
     if no_perf_mode {
         cmd.env(ktstr::KTSTR_NO_PERF_MODE_ENV, "1");
     }
@@ -332,6 +832,58 @@ fn build_cargo_command(
         cmd.env(ktstr::KTSTR_SCHEDULER_PROFILE_ENV, p);
     }
     cmd
+}
+
+/// Execute cargo-llvm-cov's deprecated report-only `--no-run` mode without
+/// entering ktstr's test orchestration lifecycle.
+///
+/// cargo-llvm-cov rewrites `--no-run` to its `report` subcommand before it
+/// considers the originally selected test runner. It therefore does not read a
+/// nextest archive, enumerate tests, build schedulers, or boot a VM. Running
+/// this command directly preserves that contract: no KVM/tool preflight,
+/// Cargo metadata query, archive snapshot, kernel resolution, BTF anchor,
+/// shared-memory cleanup guard, or result-artifact scan can precede the
+/// upstream report operation. The signal phase still crosses immediately
+/// before spawn so the child is group-owned and reaped under interruption.
+#[allow(clippy::too_many_arguments)]
+fn run_llvm_cov_report_only(
+    sub_argv: &[&str],
+    release: bool,
+    profile: Option<&str>,
+    nextest_profile: Option<&str>,
+    no_perf_mode: bool,
+    no_skip_mode: bool,
+    args: &[String],
+) -> Result<(), String> {
+    let command = build_cargo_command(
+        sub_argv,
+        release,
+        profile,
+        nextest_profile,
+        no_perf_mode,
+        no_skip_mode,
+        args,
+    );
+    tracing::debug!(
+        program = ?command.get_program(),
+        argv = ?command.get_args().collect::<Vec<_>>(),
+        "running report-only cargo-llvm-cov passthrough",
+    );
+    crate::interrupt::enter_cleanup_phase()
+        .map_err(|error| format!("cargo ktstr: enter cleanup phase: {error}"))?;
+    let status = crate::interrupt::run_status(command)
+        .map_err(|error| format!("spawn cargo {}: {error}", sub_argv.join(" ")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "cargo {} exited with {}",
+            sub_argv.join(" "),
+            status
+                .code()
+                .map_or("signal".to_string(), |code| code.to_string()),
+        ))
+    }
 }
 
 /// Consume the resolved `--kernel` set, bailing if a non-empty `kernel`
@@ -376,6 +928,789 @@ fn kernel_set_or_bail(
     Ok(resolved)
 }
 
+const NEXTEST_ARCHIVE_DROP_VALUE_OPTIONS: &[&str] = &[
+    "-j",
+    "--test-threads",
+    "--retries",
+    "--flaky-result",
+    "--max-fail",
+    "-R",
+    "--rerun",
+    "--run-id",
+    "--debugger",
+    "--tracer",
+    "--stress-count",
+    "--stress-duration",
+    "--status-level",
+    "--final-status-level",
+    "--success-output",
+    "--failure-output",
+    "--show-progress",
+    "--max-progress-running",
+    "--message-format",
+    "--message-format-version",
+    "--run-ignored",
+    "--partition",
+    "--platform-filter",
+    "--no-tests",
+    "-E",
+    "--filterset",
+    "--filter-expr",
+    "--cargo-message-format",
+    "--archive-file",
+    "--archive-format",
+    "--zstd-level",
+    "--extract-to",
+    "--cargo-metadata",
+    "--workspace-remap",
+    "--binaries-metadata",
+    "--target-dir-remap",
+    "--build-dir-remap",
+];
+
+const NEXTEST_ARCHIVE_DROP_FLAGS: &[&str] = &[
+    "--fail-fast",
+    "--ff",
+    "--no-fail-fast",
+    "--nff",
+    "--no-capture",
+    "--capture",
+    "--hide-progress-bar",
+    "--no-output-indent",
+    "--no-input-handler",
+    "--ignore-default-filter",
+    "--extract-overwrite",
+    "--persist-extract-tempdir",
+    "--ignore-run-fail",
+];
+
+const LLVM_COV_ARCHIVE_DROP_REPORT_VALUE_OPTIONS: &[&str] = &[
+    "--output-path",
+    "--output-dir",
+    "--failure-mode",
+    "--ignore-filename-regex",
+    "--fail-under-functions",
+    "--fail-under-lines",
+    "--fail-under-file-lines",
+    "--fail-under-regions",
+    "--fail-uncovered-lines",
+    "--fail-uncovered-regions",
+    "--fail-uncovered-functions",
+    "--nextest-archive-file",
+];
+
+const LLVM_COV_ARCHIVE_DROP_REPORT_FLAGS: &[&str] = &[
+    "--json",
+    "--lcov",
+    "--cobertura",
+    "--codecov",
+    "--text",
+    "--html",
+    "--open",
+    "--summary-only",
+    "--no-default-ignore-filename-regex",
+    "--disable-default-ignore-filename-regex",
+    "--show-instantiations",
+    "--hide-instantiations",
+    "--show-missing-lines",
+    "--include-build-script",
+    "--skip-functions",
+];
+
+const LLVM_COV_ARCHIVE_PRESERVE_FLAGS: &[&str] = &[
+    "--all",
+    "--workspace",
+    "--lib",
+    "--bins",
+    "--examples",
+    "--tests",
+    "--benches",
+    "--all-targets",
+    "--all-features",
+    "--no-default-features",
+    "--release",
+    "--frozen",
+    "--locked",
+    "--offline",
+    "--ignore-rust-version",
+    "--keep-going",
+    "--verbose",
+    "-v",
+    "--quiet",
+    "-q",
+    "--cargo-quiet",
+    "--cargo-verbose",
+    "--future-incompat-report",
+    "--override-version-check",
+    "--no-pager",
+    "--unit-graph",
+    "--timings",
+    "--no-clean",
+    "--branch",
+    "--mcdc",
+    "--doctests",
+    "--coverage-target-only",
+    "--coverage-host-only",
+    "--include-ffi",
+    "--no-rustc-wrapper",
+    "--no-cfg-coverage",
+    "--no-cfg-coverage-nightly",
+    "--remap-path-prefix",
+];
+
+fn option_matches_bool_flag(argument: &str, option: &str) -> bool {
+    argument == option
+        || argument
+            .strip_prefix(option)
+            .is_some_and(|suffix| suffix.starts_with('='))
+}
+
+fn nextest_archive_drops_flag(argument: &str) -> bool {
+    NEXTEST_ARCHIVE_DROP_FLAGS
+        .iter()
+        .any(|option| option_matches_bool_flag(argument, option))
+}
+
+fn nextest_archive_drops_joined_option(argument: &str) -> bool {
+    NEXTEST_ARCHIVE_DROP_VALUE_OPTIONS.iter().any(|option| {
+        let short = option.starts_with('-') && !option.starts_with("--");
+        argument.strip_prefix(option).is_some_and(|suffix| {
+            suffix.starts_with('=') || (short && !suffix.is_empty())
+        })
+    })
+}
+
+fn llvm_cov_archive_drops_joined_report_option(argument: &str) -> bool {
+    LLVM_COV_ARCHIVE_DROP_REPORT_VALUE_OPTIONS
+        .iter()
+        .any(|option| {
+            argument
+                .strip_prefix(option)
+                .is_some_and(|suffix| suffix.starts_with('='))
+        })
+}
+
+fn llvm_cov_or_nextest_option_takes_value(argument: &str) -> bool {
+    LLVM_COV_GLOBAL_VALUE_OPTIONS.contains(&argument)
+        || LLVM_COV_NEXTEST_VALUE_OPTIONS.contains(&argument)
+        || NEXTEST_ARCHIVE_DROP_VALUE_OPTIONS.contains(&argument)
+}
+
+fn llvm_cov_or_nextest_joined_value_option(argument: &str) -> bool {
+    if argument
+        .strip_prefix("--timings=")
+        .is_some_and(|value| !value.is_empty())
+    {
+        return true;
+    }
+    LLVM_COV_GLOBAL_VALUE_OPTIONS
+        .iter()
+        .chain(LLVM_COV_NEXTEST_VALUE_OPTIONS.iter())
+        .any(|option| {
+            let short = option.starts_with('-') && !option.starts_with("--");
+            argument.strip_prefix(option).is_some_and(|suffix| {
+                suffix.starts_with('=') || (short && !suffix.is_empty())
+            })
+        })
+}
+
+/// Project one llvm-cov nextest run argv onto nextest-archive's build surface.
+///
+/// Archive filtering happens only after nextest builds the complete
+/// Cargo-selected binary list. Removing run filters/positional test filters and
+/// adding `none()` therefore preserves the exact build while keeping the
+/// archive itself metadata-sized. cargo-llvm-cov owns the clean_partial call
+/// for this supported subcommand, so no private cleanup behavior is duplicated
+/// here.
+fn llvm_cov_nextest_archive_args(
+    sub_argv: &[&str],
+    args: &[String],
+    archive_path: &std::path::Path,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let raw_nextest_index = (sub_argv == LLVM_COV_SUB_ARGV)
+        .then(|| llvm_cov_nextest_index(args))
+        .flatten();
+    let separator = args
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(args.len());
+    let mut globals = Vec::new();
+    let mut projected = Vec::with_capacity(separator + 8);
+    let mut translated_no_report = false;
+    let mut raw_build_jobs = None;
+    let mut index = 0;
+    if let Some(nextest_index) = raw_nextest_index {
+        while index < nextest_index {
+            let argument = &args[index];
+            if argument == "--no-report" {
+                translated_no_report = true;
+                index += 1;
+                continue;
+            }
+            if nextest_archive_drops_flag(argument) {
+                index += 1;
+                continue;
+            }
+            if LLVM_COV_ARCHIVE_DROP_REPORT_VALUE_OPTIONS.contains(&argument.as_str()) {
+                index += 2;
+                continue;
+            }
+            if LLVM_COV_ARCHIVE_DROP_REPORT_FLAGS.contains(&argument.as_str())
+                || llvm_cov_archive_drops_joined_report_option(argument)
+            {
+                index += 1;
+                continue;
+            }
+            if matches!(argument.as_str(), "-j" | "--jobs") {
+                if let Some(value) = args.get(index + 1) {
+                    raw_build_jobs = Some(value.clone());
+                    index += 2;
+                } else {
+                    globals.push(argument.clone());
+                    index += 1;
+                }
+                continue;
+            }
+            if let Some(value) = argument
+                .strip_prefix("--jobs=")
+                .or_else(|| {
+                    argument
+                        .strip_prefix("-j")
+                        .filter(|value| !value.is_empty())
+                        .map(|value| value.strip_prefix('=').unwrap_or(value))
+                })
+            {
+                raw_build_jobs = Some(value.to_string());
+                index += 1;
+                continue;
+            }
+            globals.push(argument.clone());
+            index += 1;
+            if LLVM_COV_GLOBAL_VALUE_OPTIONS.contains(&argument.as_str())
+                && index < nextest_index
+            {
+                globals.push(args[index].clone());
+                index += 1;
+            }
+        }
+        index += 1; // replace the raw `nextest` subcommand
+    }
+    while index < separator {
+        let argument = &args[index];
+        if argument == "--no-report" {
+            // `nextest-archive` always performs a build and cargo-llvm-cov
+            // warns that --no-report has no effect there. With
+            // CARGO_LLVM_COV_DENY_WARNINGS that warning is fatal. Preserve
+            // the user's retain/merge intent with the underlying lifecycle
+            // flag that --no-report implies.
+            translated_no_report = true;
+            index += 1;
+            continue;
+        }
+        if NEXTEST_ARCHIVE_DROP_VALUE_OPTIONS.contains(&argument.as_str())
+            || LLVM_COV_ARCHIVE_DROP_REPORT_VALUE_OPTIONS.contains(&argument.as_str())
+        {
+            index += 2;
+            continue;
+        }
+        if nextest_archive_drops_flag(argument)
+            || nextest_archive_drops_joined_option(argument)
+            || LLVM_COV_ARCHIVE_DROP_REPORT_FLAGS.contains(&argument.as_str())
+            || llvm_cov_archive_drops_joined_report_option(argument)
+        {
+            index += 1;
+            continue;
+        }
+        if !argument.starts_with('-') {
+            // A nextest run positional name filter cannot change the Cargo
+            // build and is not accepted by `nextest archive`.
+            index += 1;
+            continue;
+        }
+        if !LLVM_COV_ARCHIVE_PRESERVE_FLAGS.contains(&argument.as_str())
+            && !llvm_cov_or_nextest_option_takes_value(argument)
+            && !llvm_cov_or_nextest_joined_value_option(argument)
+        {
+            return Err(format!(
+                "cargo ktstr: cannot safely project unknown post-nextest option \
+                 {argument:?} onto cargo-llvm-cov nextest-archive"
+            ));
+        }
+        projected.push(argument.clone());
+        index += 1;
+        if llvm_cov_or_nextest_option_takes_value(argument)
+            && index < separator
+            && Some(index) != raw_nextest_index
+        {
+            projected.push(args[index].clone());
+            index += 1;
+        }
+    }
+    if translated_no_report
+        && !globals.iter().any(|argument| argument == "--no-clean")
+        && !projected.iter().any(|argument| argument == "--no-clean")
+    {
+        globals.push("--no-clean".to_string());
+    }
+    if let Some(build_jobs) = raw_build_jobs {
+        projected.extend(["--build-jobs".to_string(), build_jobs]);
+    }
+    projected.extend([
+        "--archive-file".to_string(),
+        archive_path.to_string_lossy().into_owned(),
+        "--zstd-level=-7".to_string(),
+        "-E".to_string(),
+        "none()".to_string(),
+        "--cargo-message-format=json-render-diagnostics".to_string(),
+    ]);
+    Ok((globals, projected))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_llvm_cov_archive_warm_command(
+    sub_argv: &[&str],
+    release: bool,
+    profile: Option<&str>,
+    nextest_profile: Option<&str>,
+    no_perf_mode: bool,
+    no_skip_mode: bool,
+    args: &[String],
+    archive_path: &std::path::Path,
+) -> Result<Command, String> {
+    let (globals, archive_args) =
+        llvm_cov_nextest_archive_args(sub_argv, args, archive_path)?;
+    let mut command = Command::new("cargo");
+    command.arg("llvm-cov");
+    command.args(globals);
+    command.arg("nextest-archive");
+    if release {
+        command.args(["--cargo-profile", "release"]);
+    }
+    if let Some(nextest_profile) = nextest_profile {
+        command.args(["--profile", nextest_profile]);
+    }
+    command.args(archive_args);
+    if no_perf_mode {
+        command.env(ktstr::KTSTR_NO_PERF_MODE_ENV, "1");
+    }
+    if no_skip_mode {
+        command.env(ktstr::KTSTR_NO_SKIP_MODE_ENV, "1");
+    }
+    if let Some(profile) = profile {
+        command.env(ktstr::KTSTR_SCHEDULER_PROFILE_ENV, profile);
+    }
+    Ok(command)
+}
+
+const NEXTEST_ARCHIVE_BINARIES_METADATA: &str =
+    "target/nextest/binaries-metadata.json";
+const NEXTEST_ARCHIVE_METADATA_MAX_BYTES: u64 = 64 << 20;
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct NextestArchiveBinaryMetadata {
+    rust_build_meta: NextestArchiveBuildMetadata,
+    rust_binaries: std::collections::BTreeMap<String, NextestArchiveBinary>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct NextestArchiveBuildMetadata {
+    target_directory: PathBuf,
+    #[serde(default)]
+    build_directory: Option<PathBuf>,
+    #[serde(default)]
+    base_output_directories: std::collections::BTreeSet<PathBuf>,
+    #[serde(default)]
+    linked_paths: std::collections::BTreeSet<PathBuf>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct NextestArchiveBinary {
+    binary_path: PathBuf,
+}
+
+struct ExtractedNextestArchive {
+    _owner: tempfile::TempDir,
+    test_binaries: Vec<PathBuf>,
+    loader_paths: Vec<PathBuf>,
+}
+
+fn validated_archive_target_path(relative: &std::path::Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+
+    if relative.as_os_str().is_empty()
+        || !relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(format!(
+            "nextest archive has unsafe target-relative path: {}",
+            relative.display()
+        ));
+    }
+    Ok(PathBuf::from("target").join(relative))
+}
+
+fn nextest_archive_binary_entry_paths(
+    metadata: &NextestArchiveBinaryMetadata,
+) -> Result<std::collections::BTreeSet<PathBuf>, String> {
+    if !metadata.rust_build_meta.target_directory.is_absolute() {
+        return Err(format!(
+            "nextest archive target-directory is not absolute: {}",
+            metadata.rust_build_meta.target_directory.display()
+        ));
+    }
+    let build_directory = metadata
+        .rust_build_meta
+        .build_directory
+        .as_ref()
+        .unwrap_or(&metadata.rust_build_meta.target_directory);
+    if !build_directory.is_absolute() {
+        return Err(format!(
+            "nextest archive build-directory is not absolute: {}",
+            build_directory.display()
+        ));
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    for binary in metadata.rust_binaries.values() {
+        let relative = binary
+            .binary_path
+            .strip_prefix(build_directory)
+            .map_err(|_| {
+                format!(
+                    "nextest archive test binary {} is outside build-directory {}",
+                    binary.binary_path.display(),
+                    build_directory.display(),
+                )
+            })?;
+        paths.insert(validated_archive_target_path(relative)?);
+    }
+    Ok(paths)
+}
+
+fn nextest_archive_loader_entry_dirs(
+    metadata: &NextestArchiveBinaryMetadata,
+) -> Result<Vec<PathBuf>, String> {
+    let mut paths = Vec::new();
+    let mut push_unique = |path| {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    };
+    for relative in &metadata.rust_build_meta.linked_paths {
+        push_unique(validated_archive_target_path(relative)?);
+    }
+    for relative in &metadata.rust_build_meta.base_output_directories {
+        let base = validated_archive_target_path(relative)?;
+        push_unique(base.join("deps"));
+        push_unique(base);
+    }
+    push_unique(PathBuf::from("target/nextest/libdirs/host"));
+    push_unique(PathBuf::from("target/nextest/libdirs/target/0"));
+    Ok(paths)
+}
+
+fn read_nextest_archive_binary_metadata(
+    archive_path: &std::path::Path,
+) -> Result<NextestArchiveBinaryMetadata, String> {
+    use std::io::Read as _;
+
+    let file = std::fs::File::open(archive_path).map_err(|error| {
+        format!(
+            "cargo ktstr: open nextest archive {}: {error}",
+            archive_path.display()
+        )
+    })?;
+    let decoder = zstd::Decoder::new(std::io::BufReader::new(file)).map_err(|error| {
+        format!(
+            "cargo ktstr: decode nextest archive {} as tar.zst: {error}",
+            archive_path.display()
+        )
+    })?;
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries().map_err(|error| {
+        format!(
+            "cargo ktstr: read nextest archive {}: {error}",
+            archive_path.display()
+        )
+    })? {
+        let mut entry = entry.map_err(|error| {
+            format!(
+                "cargo ktstr: read nextest archive entry from {}: {error}",
+                archive_path.display()
+            )
+        })?;
+        let path = entry.path().map_err(|error| {
+            format!(
+                "cargo ktstr: read nextest archive entry path from {}: {error}",
+                archive_path.display()
+            )
+        })?;
+        if path.as_ref() != std::path::Path::new(NEXTEST_ARCHIVE_BINARIES_METADATA) {
+            continue;
+        }
+        if !entry.header().entry_type().is_file() {
+            return Err(format!(
+                "cargo ktstr: nextest archive metadata is not a regular file: \
+                 {NEXTEST_ARCHIVE_BINARIES_METADATA}"
+            ));
+        }
+        let declared_len = entry.size();
+        if declared_len > NEXTEST_ARCHIVE_METADATA_MAX_BYTES {
+            return Err(format!(
+                "cargo ktstr: nextest archive binaries metadata is too large \
+                 ({declared_len} bytes)"
+            ));
+        }
+        let mut bytes = Vec::with_capacity(usize::try_from(declared_len).unwrap_or(0));
+        entry
+            .take(NEXTEST_ARCHIVE_METADATA_MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| {
+                format!(
+                    "cargo ktstr: read nextest archive binaries metadata from {}: {error}",
+                    archive_path.display()
+                )
+            })?;
+        if bytes.len() as u64 > NEXTEST_ARCHIVE_METADATA_MAX_BYTES {
+            return Err(
+                "cargo ktstr: nextest archive binaries metadata exceeded size limit".to_string(),
+            );
+        }
+        return serde_json::from_slice(&bytes).map_err(|error| {
+            format!(
+                "cargo ktstr: parse {NEXTEST_ARCHIVE_BINARIES_METADATA} \
+                 from {}: {error}",
+                archive_path.display()
+            )
+        });
+    }
+    Err(format!(
+        "cargo ktstr: nextest archive {} has no {NEXTEST_ARCHIVE_BINARIES_METADATA}",
+        archive_path.display()
+    ))
+}
+
+fn validate_archive_loader_link(
+    entry_path: &std::path::Path,
+    target: &std::path::Path,
+    hard_link: bool,
+) -> Result<(), String> {
+    use std::path::Component;
+
+    let mut resolved = if hard_link {
+        Vec::new()
+    } else {
+        entry_path
+            .parent()
+            .into_iter()
+            .flat_map(std::path::Path::components)
+            .filter_map(|component| match component {
+                Component::Normal(value) => Some(value.to_os_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    for component in target.components() {
+        match component {
+            Component::Normal(value) => resolved.push(value.to_os_string()),
+            Component::CurDir => {}
+            Component::ParentDir if resolved.len() > 1 => {
+                resolved.pop();
+            }
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "cargo ktstr: nextest archive loader link {} escapes target tree via {}",
+                    entry_path.display(),
+                    target.display(),
+                ));
+            }
+        }
+    }
+    if resolved
+        .first()
+        .is_none_or(|component| component != std::ffi::OsStr::new("target"))
+    {
+        return Err(format!(
+            "cargo ktstr: nextest archive loader link {} targets outside target tree: {}",
+            entry_path.display(),
+            target.display(),
+        ));
+    }
+    Ok(())
+}
+
+fn extract_nextest_archive_test_binaries(
+    archive_path: &std::path::Path,
+) -> Result<ExtractedNextestArchive, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata = read_nextest_archive_binary_metadata(archive_path)?;
+    let wanted = nextest_archive_binary_entry_paths(&metadata)?;
+    let loader_entry_dirs = nextest_archive_loader_entry_dirs(&metadata)?;
+    let owner = tempfile::Builder::new()
+        .prefix("ktstr-nextest-archive-probe-")
+        .tempdir()
+        .map_err(|error| {
+            format!(
+                "cargo ktstr: create nextest archive probe directory: {error}"
+            )
+        })?;
+    let file = std::fs::File::open(archive_path).map_err(|error| {
+        format!(
+            "cargo ktstr: reopen nextest archive {}: {error}",
+            archive_path.display()
+        )
+    })?;
+    let decoder = zstd::Decoder::new(std::io::BufReader::new(file)).map_err(|error| {
+        format!(
+            "cargo ktstr: decode nextest archive {} as tar.zst: {error}",
+            archive_path.display()
+        )
+    })?;
+    let mut archive = tar::Archive::new(decoder);
+    let mut extracted = std::collections::BTreeSet::new();
+    let mut extracted_binaries = std::collections::BTreeSet::new();
+    for entry in archive.entries().map_err(|error| {
+        format!(
+            "cargo ktstr: read nextest archive {}: {error}",
+            archive_path.display()
+        )
+    })? {
+        let mut entry = entry.map_err(|error| {
+            format!(
+                "cargo ktstr: read nextest archive entry from {}: {error}",
+                archive_path.display()
+            )
+        })?;
+        let path = entry
+            .path()
+            .map_err(|error| {
+                format!(
+                    "cargo ktstr: read nextest archive entry path from {}: {error}",
+                    archive_path.display()
+                )
+            })?
+            .into_owned();
+        let is_test_binary = wanted.contains(&path);
+        let under_target = path
+            .components()
+            .next()
+            .is_some_and(|component| {
+                component == std::path::Component::Normal(std::ffi::OsStr::new("target"))
+            })
+            && path.components().all(|component| {
+                matches!(component, std::path::Component::Normal(_))
+            });
+        if !under_target {
+            continue;
+        }
+        let entry_type = entry.header().entry_type();
+        if is_test_binary && !entry_type.is_file() {
+            return Err(format!(
+                "cargo ktstr: nextest archive test binary is not a regular file: {}",
+                path.display()
+            ));
+        }
+        if !entry_type.is_file() && !entry_type.is_dir() {
+            let hard_link = entry_type.is_hard_link();
+            if !entry_type.is_symlink() && !hard_link {
+                return Err(format!(
+                    "cargo ktstr: nextest archive loader entry has unsupported type: {}",
+                    path.display()
+                ));
+            }
+            let target = entry
+                .link_name()
+                .map_err(|error| {
+                    format!(
+                        "cargo ktstr: read nextest archive loader link {}: {error}",
+                        path.display()
+                    )
+                })?
+                .ok_or_else(|| {
+                    format!(
+                        "cargo ktstr: nextest archive loader link has no target: {}",
+                        path.display()
+                    )
+                })?;
+            validate_archive_loader_link(&path, target.as_ref(), hard_link)?;
+        }
+        if !extracted.insert(path.clone()) {
+            let duplicate = if path == std::path::Path::new(NEXTEST_ARCHIVE_BINARIES_METADATA) {
+                "binaries metadata"
+            } else {
+                "target"
+            };
+            return Err(format!(
+                "cargo ktstr: nextest archive contains duplicate {duplicate} entry: {}",
+                path.display()
+            ));
+        }
+        if is_test_binary {
+            extracted_binaries.insert(path.clone());
+        }
+        let unpacked = entry.unpack_in(owner.path()).map_err(|error| {
+            format!(
+                "cargo ktstr: extract nextest archive probe entry {}: {error}",
+                path.display()
+            )
+        })?;
+        if !unpacked {
+            return Err(format!(
+                "cargo ktstr: nextest archive probe entry escaped extraction root: {}",
+                path.display()
+            ));
+        }
+    }
+    if extracted_binaries != wanted {
+        let missing = wanted
+            .difference(&extracted_binaries)
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "cargo ktstr: nextest archive {} is missing test binaries declared \
+             by its metadata: {missing}",
+            archive_path.display()
+        ));
+    }
+    let mut test_binaries = Vec::with_capacity(wanted.len());
+    for path in wanted {
+        let extracted = owner.path().join(path);
+        let metadata = std::fs::metadata(&extracted).map_err(|error| {
+            format!(
+                "cargo ktstr: stat extracted nextest test binary {}: {error}",
+                extracted.display()
+            )
+        })?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            return Err(format!(
+                "cargo ktstr: extracted nextest test binary is not executable: {}",
+                extracted.display()
+            ));
+        }
+        test_binaries.push(std::fs::canonicalize(&extracted).map_err(|error| {
+            format!(
+                "cargo ktstr: canonicalize extracted nextest test binary {}: {error}",
+                extracted.display()
+            )
+        })?);
+    }
+    let loader_paths = loader_entry_dirs
+        .into_iter()
+        .map(|path| owner.path().join(path))
+        .filter(|path| path.is_dir())
+        .collect();
+    Ok(ExtractedNextestArchive {
+        _owner: owner,
+        test_binaries,
+        loader_paths,
+    })
+}
+
 // Private internal dispatch helper with a cohesive run-config arg list
 // (sub-command identity + the four CLI flags + passthrough args);
 // bundling into a struct would not improve clarity for a fn called from
@@ -393,12 +1728,47 @@ fn run_cargo_sub(
     include_eol: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
+    let invocation_dir = std::env::current_dir()
+        .map_err(|error| format!("cargo ktstr: read invocation directory: {error}"))?;
+    // Archive reuse must be one immutable revision across metadata parsing,
+    // scheduler-declaration probing, and nextest's eventual extraction. Pin
+    // and publish the validated source before constructing either command,
+    // rewrite the user's exact archive option to the leased CAS pathname, and
+    // retain the owner through the final child.
+    let report_only_llvm_cov = sub_argv != TEST_SUB_ARGV
+        && llvm_cov_has_lifecycle_flag(&args, "--no-run");
+    let archive_source_path = if report_only_llvm_cov {
+        None
+    } else {
+        llvm_cov_archive_path(sub_argv, &args, &invocation_dir)?
+    };
+    let archive_snapshot = archive_source_path
+        .as_deref()
+        .map(|path| {
+            ktstr::cache::snapshot_content_file(path).map_err(|error| {
+                format!(
+                    "cargo ktstr: snapshot nextest archive {}: {error:#}",
+                    path.display()
+                )
+            })
+        })
+        .transpose()?;
+    let args = if let Some(snapshot) = &archive_snapshot {
+        rewrite_nextest_archive_reuse(sub_argv, args, snapshot.path())?
+    } else {
+        args
+    };
     // Materialize and inject once for the whole invocation family. The final
     // run and the reserved no-run warm-up below are both derived from this
     // exact argv, so they cannot drift onto different nextest admission
     // policies. Raw llvm-cov modes that do not select nextest remain byte-for-
     // byte passthroughs.
     let args = inject_nextest_tool_config_with(sub_argv, args, crate::nextest_config::inject)?;
+    let args = if cargo_sub_uses_nextest(sub_argv, &args) {
+        normalize_nextest_admission(sub_argv, args)
+    } else {
+        args
+    };
     let mut cmd = build_cargo_command(
         sub_argv,
         release,
@@ -494,7 +1864,8 @@ fn run_cargo_sub(
         }
     }
 
-    let target_dir_path = resolve_target_dir();
+    let target_dir_path =
+        resolve_cargo_target_dir_for_args(&args, &invocation_dir)?;
 
     // BTF type anchor: if a prior build left .bpf.o files, extract
     // struct definitions from the BPF source tree and generate a
@@ -530,28 +1901,68 @@ fn run_cargo_sub(
 
     // Reserve + cgroup-confine the harness COMPILE phase only — NOT the
     // test-running phase (each VM cell takes its own LLC reservation; a
-    // reservation still held here would deadlock/starve them). `cargo
-    // nextest run` builds then runs in ONE process and the build is not
-    // separable, so we run an explicit `cargo nextest run --no-run` warm-up
-    // UNDER the reservation: it compiles every test binary while holding
-    // machine-global LLC LOCK_SH + a cpuset cgroup, releases both, and the
-    // combined run below then finds the build cached — never compiling
-    // UNRESERVED where a colocated runner's harness build could invade a
-    // perf-mode reservation. acquire_build_reservation uses Consolidate
-    // placement (packs onto already-held LLCs, leaving whole LLCs free for
-    // exclusive perf-mode reservations — right for a throughput-elastic
-    // compile). Only the bare-`nextest` `test` path warms up; see
-    // `wants_reserved_prebuild`.
-    if wants_reserved_prebuild(sub_argv) {
-        let mut warm = build_cargo_command(
-            sub_argv,
-            release,
-            profile.as_deref(),
-            nextest_profile.as_deref(),
-            no_perf_mode,
-            no_skip_mode,
-            &prebuild_no_run_args(&args),
-        );
+    // reservation still held here would deadlock/starve them). Plain nextest
+    // uses its supported `--no-run` compile path. cargo-llvm-cov's `--no-run`
+    // is report-only, so coverage instead uses its supported
+    // `nextest-archive` path: cargo-llvm-cov performs its exact clean_partial,
+    // nextest builds every selected binary, then an empty-set archive filter
+    // keeps the temporary archive metadata-sized. The final coverage command
+    // receives `--no-clean` only for this default lifecycle and reuses the
+    // identical instrumented build. User-owned retain/merge modes keep their
+    // own no-clean semantics.
+    //
+    // acquire_build_reservation uses Consolidate placement (packs onto
+    // already-held LLCs, leaving whole LLCs free for exclusive perf-mode
+    // reservations — right for a throughput-elastic compile).
+    let needs_prebuild = cargo_sub_needs_reserved_prebuild(sub_argv, &args);
+    let archive_reuse_path = if cargo_sub_uses_nextest(sub_argv, &args)
+        && !llvm_cov_has_lifecycle_flag(&args, "--no-run")
+    {
+        llvm_cov_archive_path(sub_argv, &args, &invocation_dir)?
+    } else {
+        None
+    };
+    let archive_dir = if needs_prebuild && sub_argv != TEST_SUB_ARGV {
+        Some(
+            tempfile::tempdir()
+                .map_err(|error| format!("cargo ktstr: create coverage warm archive dir: {error}"))?,
+        )
+    } else {
+        None
+    };
+    let archive_probe = archive_reuse_path
+        .as_deref()
+        .map(|archive_path| {
+            eprintln!(
+                "cargo ktstr: extracting test binaries for scheduler discovery from {}",
+                archive_path.display()
+            );
+            extract_nextest_archive_test_binaries(archive_path)
+        })
+        .transpose()?;
+    let (test_bins, pinned_test_bins) = if needs_prebuild {
+        let mut warm = if let Some(archive_dir) = &archive_dir {
+            build_llvm_cov_archive_warm_command(
+                sub_argv,
+                release,
+                profile.as_deref(),
+                nextest_profile.as_deref(),
+                no_perf_mode,
+                no_skip_mode,
+                &args,
+                &archive_dir.path().join("warm-build.tar.zst"),
+            )?
+        } else {
+            build_cargo_command(
+                sub_argv,
+                release,
+                profile.as_deref(),
+                nextest_profile.as_deref(),
+                no_perf_mode,
+                no_skip_mode,
+                &prebuild_no_run_json_args(&args),
+            )
+        };
         for (var, val) in &blob_envs {
             warm.env(var, val);
         }
@@ -569,14 +1980,51 @@ fn run_cargo_sub(
         if let Some((_, first_dir)) = resolved.first() {
             warm.env(ktstr::KTSTR_KERNEL_ENV, first_dir);
         }
-        run_reserved_prebuild(warm, "cargo ktstr")?;
-    }
+        let pinned =
+            run_reserved_prebuild_collect_test_bins(warm, "cargo ktstr", &target_dir_path)?;
+        (pinned.probe_paths(), Some(pinned))
+    } else {
+        (
+            archive_probe
+                .as_ref()
+                .map_or_else(Vec::new, |archive| archive.test_binaries.clone()),
+            None,
+        )
+    };
+    let prepared_scheduler_artifacts = if needs_prebuild || archive_probe.is_some() {
+        Some(crate::verifier::prepare_scheduler_artifacts(
+            &test_bins,
+            archive_probe
+                .as_ref()
+                .map_or(&[][..], |archive| archive.loader_paths.as_slice()),
+            profile.as_deref(),
+            &args,
+            &invocation_dir,
+        )?)
+    } else {
+        None
+    };
+    // Descriptor-backed paths are needed only while probing declarations.
+    // Release test-binary fds before the potentially long nextest run; the
+    // prepared scheduler manifest owns all durable artifacts it needs.
+    drop(pinned_test_bins);
 
-    // Scan after the reserved build so the analyzed content is the exact
-    // scheduler set the imminent tests will execute. This call joins all
-    // work; child test processes therefore hit complete atomic CAS entries
-    // instead of racing background warmers.
-    precompute_cast_cache(&target_dir_path);
+    // Analyze only requirement-derived, parent-snapshotted scheduler
+    // artifacts. Export the same strict manifest to ordinary tests, coverage,
+    // and raw llvm-cov nextest; the owner remains alive through run_status.
+    if let Some(prepared) = &prepared_scheduler_artifacts {
+        cmd.env(
+            ktstr::KTSTR_SCHEDULER_MANIFEST_ENV,
+            &prepared.manifest_path,
+        );
+    }
+    // This joins all work before nextest starts, so child processes hit
+    // complete atomic CAS entries instead of racing background warmers.
+    precompute_cast_cache(
+        prepared_scheduler_artifacts
+            .as_ref()
+            .map_or(&[][..], |prepared| prepared.binaries.as_slice()),
+    )?;
 
     tracing::debug!("cargo ktstr: running {label}");
     // Capture the run-start instant BEFORE the nextest build+run so
@@ -602,6 +2050,7 @@ fn run_cargo_sub(
     // through cleanup and re-raises afterward.
     let status = crate::interrupt::run_status(cmd)
         .map_err(|e| format!("spawn cargo {}: {e}", sub_argv.join(" ")))?;
+    drop(archive_snapshot);
     // Surface per-test debugging artefacts: name each test that
     // FAILED this run and the concrete path to each of its artifacts
     // (failure dump, auto-repro dump, stats sidecar, wprof trace), so
@@ -647,19 +2096,6 @@ fn run_cargo_sub(
                 .map_or("signal".to_string(), |c| c.to_string()),
         ))
     }
-}
-
-/// Does `sub_argv` select a build-then-run-in-one-process path whose
-/// COMPILE phase we warm up under an LLC reservation + cgroup sandbox?
-///
-/// Only the bare `nextest run` (`test`) path. The `coverage`
-/// (`llvm-cov nextest`) and raw `llvm-cov` paths run an
-/// llvm-cov-INSTRUMENTED build that a plain `cargo nextest run --no-run`
-/// warm-up would not match (different RUSTFLAGS) — warming them up would
-/// cache-miss and double-build, so they are intentionally left
-/// unreserved rather than risk that regression.
-fn wants_reserved_prebuild(sub_argv: &[&str]) -> bool {
-    sub_argv == TEST_SUB_ARGV
 }
 
 /// Append `--no-run` to a `cargo nextest run` passthrough argv so the
@@ -745,18 +2181,28 @@ pub(crate) fn prebuild_no_run_json_args(args: &[String]) -> Vec<String> {
     out
 }
 
-/// Parse the Cargo JSON stream emitted by a nextest no-run warm-up and return
-/// the exact test executables it built.
+#[derive(Default)]
+struct CargoJsonDiscovery {
+    test_executables: Vec<PathBuf>,
+    saw_build_finished: bool,
+}
+
+/// Parse Cargo JSON emitted by one reserved warm-up stream.
 ///
 /// Integration tests identify themselves with target kind `test`; unit-test
 /// harnesses built from lib/bin targets carry `profile.test = true`. Both can
 /// link distributed scheduler declarations and therefore must be probed.
-fn test_executables_from_cargo_json(stdout: &[u8]) -> Vec<PathBuf> {
-    let mut bins = Vec::new();
-    for line in stdout.split(|byte| *byte == b'\n') {
+fn observe_cargo_json_stream(bytes: &[u8], discovery: &mut CargoJsonDiscovery) {
+    for line in bytes.split(|byte| *byte == b'\n') {
         let Ok(message) = serde_json::from_slice::<serde_json::Value>(line) else {
             continue;
         };
+        if message.get("reason").and_then(|value| value.as_str()) == Some("build-finished")
+            && message.get("success").is_some_and(serde_json::Value::is_boolean)
+        {
+            discovery.saw_build_finished = true;
+            continue;
+        }
         if message.get("reason").and_then(|value| value.as_str()) != Some("compiler-artifact") {
             continue;
         }
@@ -774,12 +2220,69 @@ fn test_executables_from_cargo_json(stdout: &[u8]) -> Vec<PathBuf> {
             .and_then(|test| test.as_bool())
             == Some(true);
         if target_is_test || profile_is_test {
-            bins.push(PathBuf::from(executable));
+            discovery
+                .test_executables
+                .push(PathBuf::from(executable));
         }
     }
-    bins.sort();
-    bins.dedup();
-    bins
+}
+
+fn cargo_json_discovery(stdout: &[u8], stderr: &[u8]) -> CargoJsonDiscovery {
+    let mut discovery = CargoJsonDiscovery::default();
+    observe_cargo_json_stream(stdout, &mut discovery);
+    observe_cargo_json_stream(stderr, &mut discovery);
+    discovery.test_executables.sort();
+    discovery.test_executables.dedup();
+    discovery
+}
+
+fn validated_test_executables_from_cargo_output(
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<Vec<PathBuf>, ()> {
+    let discovery = cargo_json_discovery(stdout, stderr);
+    discovery
+        .saw_build_finished
+        .then_some(discovery.test_executables)
+        .ok_or(())
+}
+
+fn test_executables_from_cargo_json(stdout: &[u8]) -> Vec<PathBuf> {
+    cargo_json_discovery(stdout, &[]).test_executables
+}
+
+/// Exact warmed test executable revisions pinned while the wrapper still owns
+/// their Cargo target directory.
+pub(crate) struct PinnedTestExecutables {
+    artifacts: Vec<ktstr::cache::PinnedContentFile>,
+}
+
+impl PinnedTestExecutables {
+    /// Executable pathnames that resolve through the retained descriptors.
+    ///
+    /// `execve("/proc/self/fd/N", ...)` resolves the descriptor before its
+    /// CLOEXEC close, so declaration probes consume the exact warmed inode
+    /// even after Cargo atomically replaces the ordinary target pathname.
+    pub(crate) fn probe_paths(&self) -> Vec<PathBuf> {
+        self.artifacts
+            .iter()
+            .map(ktstr::cache::PinnedContentFile::proc_fd_path)
+            .collect()
+    }
+
+    /// Map each descriptor-backed probe path to Cargo's canonical emitted
+    /// pathname. Verifier ownership remains keyed to the path nextest will
+    /// execute, while declaration bytes come from the pinned inode.
+    pub(crate) fn probe_provenance(&self) -> HashMap<PathBuf, PathBuf> {
+        self.probe_paths()
+            .into_iter()
+            .zip(
+                self.artifacts
+                    .iter()
+                    .map(|artifact| artifact.source_path().to_path_buf()),
+            )
+            .collect()
+    }
 }
 
 /// Acquire and apply the shared compile reservation to one warm command.
@@ -789,12 +2292,23 @@ fn prepare_reserved_prebuild(
 ) -> Result<ktstr::cli::BuildReservation, String> {
     let cpu_cap = ktstr::cli::CpuCap::resolve(None)
         .map_err(|e| format!("{cli_label}: resolve harness-build CPU cap: {e:#}"))?;
-    let reservation = ktstr::cli::acquire_build_reservation_waiting_interruptible(
-        cli_label,
-        cpu_cap,
-        &crate::interrupt::INTERRUPTED,
-    )
-    .map_err(|e| format!("{cli_label}: acquire harness-build reservation: {e:#}"))?;
+    let wait_progress = std::rc::Rc::new(std::cell::RefCell::new(
+        crate::reserved_build_progress::ReservationWaitProgress::start(cli_label),
+    ));
+    let wait_tick = std::rc::Rc::clone(&wait_progress);
+    let reservation =
+        ktstr::cli::acquire_build_reservation_waiting_interruptible_with_progress(
+            cli_label,
+            cpu_cap,
+            &crate::interrupt::INTERRUPTED,
+            move || wait_tick.borrow_mut().tick(),
+        );
+    match &reservation {
+        Ok(_) => wait_progress.borrow_mut().acquired(),
+        Err(error) => wait_progress.borrow_mut().failed(error),
+    }
+    let reservation = reservation
+        .map_err(|e| format!("{cli_label}: acquire harness-build reservation: {e:#}"))?;
     if crate::interrupt::caught().is_some() {
         return Err(format!(
             "{cli_label}: harness-build reservation interrupted before pre-build"
@@ -806,111 +2320,234 @@ fn prepare_reserved_prebuild(
     Ok(reservation)
 }
 
-/// Run one compile command under the shared LLC/cgroup build reservation and
-/// capture its Cargo JSON stdout while leaving diagnostics attached to the
-/// operator's stderr.
-pub(crate) fn run_reserved_build_output(
-    mut command: Command,
+/// Exclusive wrapper ownership of one canonical Cargo target directory.
+///
+/// Cargo already admits one writer to a target directory at a time, but its
+/// internal lock ends before a parent can parse machine output and pin the
+/// emitted executable pathnames. New ktstr writers extend that same
+/// single-writer lifetime through descriptor pinning with this per-target-dir
+/// lock. There is no legacy lock lookup or fallback namespace.
+pub(crate) struct CargoBuildOutputLease {
+    _lock: std::os::fd::OwnedFd,
+    canonical_target_dir: PathBuf,
+}
+
+impl CargoBuildOutputLease {
+    pub(crate) fn target_dir(&self) -> &std::path::Path {
+        &self.canonical_target_dir
+    }
+}
+
+fn cargo_build_output_lock_path(
+    root: &std::path::Path,
+    canonical_target_dir: &std::path::Path,
+) -> PathBuf {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
+    hasher.write(canonical_target_dir.as_os_str().as_bytes());
+    root.join(format!("{:016x}.lock", hasher.finish()))
+}
+
+fn canonical_cargo_target_dir(target_dir: &std::path::Path) -> Result<PathBuf, String> {
+    let target_dir = if target_dir.is_absolute() {
+        target_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("cargo ktstr: read invocation directory: {error}"))?
+            .join(target_dir)
+    };
+    std::fs::create_dir_all(&target_dir).map_err(|error| {
+        format!(
+            "cargo ktstr: create Cargo target directory {} before output locking: {error}",
+            target_dir.display()
+        )
+    })?;
+    std::fs::canonicalize(&target_dir).map_err(|error| {
+        format!(
+            "cargo ktstr: canonicalize Cargo target directory {}: {error}",
+            target_dir.display()
+        )
+    })
+}
+
+pub(crate) fn acquire_cargo_build_output_lease(
+    target_dir: &std::path::Path,
+    cli_label: &str,
+) -> Result<CargoBuildOutputLease, String> {
+    let root = ktstr::cache::cargo_build_output_lock_root()
+        .map_err(|error| format!("{cli_label}: resolve Cargo output lock root: {error:#}"))?;
+    acquire_cargo_build_output_lease_at_root(
+        target_dir,
+        &root,
+        cli_label,
+        &crate::interrupt::INTERRUPTED,
+    )
+}
+
+fn acquire_cargo_build_output_lease_at_root(
+    target_dir: &std::path::Path,
+    root: &std::path::Path,
+    cli_label: &str,
+    interrupted: &std::sync::atomic::AtomicBool,
+) -> Result<CargoBuildOutputLease, String> {
+    let canonical_target_dir = canonical_cargo_target_dir(target_dir)?;
+    std::fs::create_dir_all(&root).map_err(|error| {
+        format!(
+            "{cli_label}: create Cargo output lock root {}: {error}",
+            root.display()
+        )
+    })?;
+    let lock_path = cargo_build_output_lock_path(&root, &canonical_target_dir);
+    let started = std::time::Instant::now();
+    let mut next_heartbeat = started + std::time::Duration::from_secs(10);
+    loop {
+        if interrupted.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(format!(
+                "{cli_label}: interrupted while waiting to own Cargo output directory {}",
+                canonical_target_dir.display()
+            ));
+        }
+        match ktstr::flock::try_flock(&lock_path, ktstr::flock::FlockMode::Exclusive)
+            .map_err(|error| {
+                format!(
+                    "{cli_label}: lock Cargo output directory {} via {}: {error:#}",
+                    canonical_target_dir.display(),
+                    lock_path.display(),
+                )
+            })? {
+            Some(lock) => {
+                return Ok(CargoBuildOutputLease {
+                    _lock: lock,
+                    canonical_target_dir,
+                });
+            }
+            None => {
+                let now = std::time::Instant::now();
+                if now >= next_heartbeat {
+                    eprintln!(
+                        "{cli_label}: waiting to pin Cargo artifacts from {}; elapsed={:.1}s",
+                        canonical_target_dir.display(),
+                        now.saturating_duration_since(started).as_secs_f64(),
+                    );
+                    next_heartbeat = now + std::time::Duration::from_secs(10);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+/// Spawn and observe a build whose command already carries its reservation's
+/// CPU placement and job count.
+fn run_prepared_reserved_build_output(
+    command: Command,
     cli_label: &str,
     description: &str,
 ) -> Result<std::process::Output, String> {
-    let reservation = prepare_reserved_prebuild(&mut command, cli_label)?;
     tracing::debug!("{cli_label}: reserved {description}");
-    command
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit());
-    let output = crate::interrupt::run_stdout(command)
-        .map_err(|error| format!("{cli_label}: spawn {description}: {error}"))?;
+    let progress =
+        crate::reserved_build_progress::ReservedBuildProgress::start(cli_label, description);
+    crate::interrupt::run_output_observed(command, progress)
+        .map_err(|error| format!("{cli_label}: spawn {description}: {error}"))
+}
+
+/// Run a reserved Cargo build while extending target-dir writer ownership
+/// through an exact output postprocess.
+///
+/// The closure runs after Cargo exits but before the per-target-dir lease is
+/// released. It should parse successful Cargo JSON and open every emitted
+/// artifact it needs; hashing and CAS publication can happen after this
+/// returns because those file descriptors pin their inodes.
+pub(crate) fn run_reserved_build_output_under_lease<T>(
+    mut command: Command,
+    cli_label: &str,
+    description: &str,
+    target_dir: &std::path::Path,
+    postprocess: impl FnOnce(&std::process::Output) -> Result<T, String>,
+) -> Result<T, String> {
+    // Reservation comes first: a queued compile must not own and idle-block
+    // its target directory before Cargo is ready to become that directory's
+    // writer. Every leased build follows this one ordering.
+    let reservation = prepare_reserved_prebuild(&mut command, cli_label)?;
+    let lease = acquire_cargo_build_output_lease(target_dir, cli_label)?;
+    tracing::debug!(
+        target_dir = %lease.target_dir().display(),
+        "{cli_label}: acquired Cargo build-output ownership",
+    );
+    let output = run_prepared_reserved_build_output(command, cli_label, description)?;
+    let processed = postprocess(&output);
+    drop(lease);
     drop(reservation);
-    Ok(output)
+    processed
 }
 
-/// Run `warm_cmd` (a `cargo … --no-run` compile-only invocation) under a
-/// machine-global LLC flock reservation + cgroup-v2 cpuset sandbox, then
-/// release BOTH before returning so the caller's test-running phase
-/// starts unreserved.
+/// Reserved warm-up variant used by scheduler-declaration discovery.
 ///
-/// Mirrors the kernel build's reservation via the shared
-/// [`ktstr::cli::acquire_build_reservation_waiting`]: same Consolidate
-/// placement, `KTSTR_BYPASS_LLC_LOCKS` / `KTSTR_CARGO_TEST_MODE` /
-/// degraded-sysfs short-circuits, and cgroup-degrade gating as kernel builds,
-/// plus progress-aware waiting when perf-mode tests temporarily own the
-/// required capacity
-/// (hard error iff an explicit cap was set — here only via
-/// `KTSTR_CPU_CAP`, since `cargo ktstr test` exposes no `--cpu-cap` flag;
-/// warn-and-proceed otherwise). Errors abort the run BEFORE any test
-/// starts, matching the kernel build's fail-hard-on-cap semantics.
-/// `pub(crate)`: shared with the verifier dispatcher's warm-up
-/// (`verifier.rs`), whose sweep is the primary colocated-CI workload.
-pub(crate) fn run_reserved_prebuild(mut warm_cmd: Command, cli_label: &str) -> Result<(), String> {
-    // RAII: `_reservation`'s cgroup sandbox drops before its LLC flocks per
-    // `BuildReservation` field order; both are released when this fn
-    // returns, ahead of the combined build+run the caller then spawns.
-    let _reservation = prepare_reserved_prebuild(&mut warm_cmd, cli_label)?;
-    tracing::debug!("{cli_label}: reserved harness pre-build (cargo … --no-run)");
-    let status = crate::interrupt::run_status(warm_cmd)
-        .map_err(|e| format!("{cli_label}: spawn reserved pre-build: {e}"))?;
-    if !status.success() {
-        return Err(format!(
-            "{cli_label}: reserved pre-build failed ({}) — see cargo output above",
-            status
-                .code()
-                .map_or("signal".to_string(), |c| c.to_string()),
-        ));
-    }
-    Ok(())
-    // `_reservation` drops here → cgroup rmdir, then LLC flocks release.
-}
-
-/// Reserved warm-up variant used by verifier discovery.
-///
-/// Captures stdout (Cargo JSON) while inheriting stderr so normal Cargo and
-/// rustc diagnostics remain visible, then returns the exact executable paths
-/// selected by nextest's scoped build. The compile reservation is released
-/// before the caller probes those binaries or starts verifier cells.
+/// Captures Cargo JSON from both streams while teeing stderr live, then returns
+/// the exact executable paths selected by nextest's scoped build. The
+/// dual-stream parse is required because cargo-llvm-cov redirects inner Cargo
+/// stdout to stderr. The compile reservation is released before the caller
+/// probes those binaries or starts verifier cells.
 pub(crate) fn run_reserved_prebuild_collect_test_bins(
     warm_cmd: Command,
     cli_label: &str,
-) -> Result<Vec<PathBuf>, String> {
-    let output = run_reserved_build_output(
+    target_dir: &std::path::Path,
+) -> Result<PinnedTestExecutables, String> {
+    run_reserved_build_output_under_lease(
         warm_cmd,
         cli_label,
         "harness pre-build with Cargo artifact discovery",
-    )?;
-    if !output.status.success() {
-        return Err(format!(
-            "{cli_label}: reserved pre-build failed ({}) — see cargo output above",
-            output
-                .status
-                .code()
-                .map_or("signal".to_string(), |code| code.to_string()),
-        ));
-    }
-    let bins = test_executables_from_cargo_json(&output.stdout);
-    if bins.is_empty() {
-        return Err(format!(
-            "{cli_label}: reserved nextest pre-build emitted no test executable \
-             artifacts in its Cargo JSON stream; cannot discover linked \
-             declare_scheduler! registrations"
-        ));
-    }
-    Ok(bins)
+        target_dir,
+        |output| {
+            if !output.status.success() {
+                return Err(format!(
+                    "{cli_label}: reserved pre-build failed ({}) — see cargo output above",
+                    output
+                        .status
+                        .code()
+                        .map_or("signal".to_string(), |code| code.to_string()),
+                ));
+            }
+            let paths =
+                validated_test_executables_from_cargo_output(&output.stdout, &output.stderr)
+                    .map_err(|()| {
+                        format!(
+                            "{cli_label}: successful reserved pre-build emitted no Cargo \
+                             build-finished message on stdout or stderr; cannot trust scheduler \
+                             declaration discovery"
+                        )
+                    })?;
+            let artifacts = paths
+                .into_iter()
+                .map(|path| {
+                    let canonical = std::fs::canonicalize(&path).map_err(|error| {
+                        format!(
+                            "{cli_label}: canonicalize warmed Cargo test executable {} \
+                             while target output is exclusively owned: {error}",
+                            path.display(),
+                        )
+                    })?;
+                    ktstr::cache::pin_content_file(&canonical).map_err(|error| {
+                        format!(
+                            "{cli_label}: pin warmed Cargo test executable {} \
+                             while target output is exclusively owned: {error:#}",
+                            canonical.display(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(PinnedTestExecutables { artifacts })
+        },
+    )
 }
 
-/// Precompute cast analysis for the built scheduler binaries so the
-/// first test needing it doesn't pay the analysis cost inline.
-///
-/// `target_dir` is the resolved (absolute) cargo target dir, passed in
-/// rather than re-read from `CARGO_TARGET_DIR`/"target": in a Cargo
-/// workspace invoked from a member-dir CWD a relative "target" points
-/// at a package dir that holds no built binaries (they live under the
-/// shared workspace target), so the scan would silently find nothing.
-/// The caller resolves it once via [`resolve_target_dir`] and shares it
-/// with [`generate_btf_anchor`] — no extra `cargo metadata` spawn here.
-fn precompute_cast_cache(target_dir: &std::path::Path) {
-    let binaries = collect_scheduler_binaries(target_dir);
+/// Precompute cast analysis for exact declaration-derived scheduler
+/// artifacts so the first test needing one does not pay the analysis cost.
+pub(crate) fn precompute_cast_cache(binaries: &[std::path::PathBuf]) -> Result<(), String> {
     if binaries.is_empty() {
-        return;
+        return Ok(());
     }
     eprintln!(
         "cargo ktstr: precomputing cast analysis for {} scheduler binaries",
@@ -920,7 +2557,7 @@ fn precompute_cast_cache(target_dir: &std::path::Path) {
         .map(|count| count.get())
         .unwrap_or(1);
     precompute_cast_paths_with_pool_builder(
-        &binaries,
+        binaries,
         configured_limit,
         |threads| {
             rayon::ThreadPoolBuilder::new()
@@ -928,8 +2565,12 @@ fn precompute_cast_cache(target_dir: &std::path::Path) {
                 .build()
                 .map_err(|error| error.to_string())
         },
-        ktstr::precompute_cast_analysis,
-    );
+        |path| {
+            ktstr::precompute_cast_analysis(path).map_err(|error| {
+                format!("precompute cast analysis for {}: {error:#}", path.display())
+            })
+        },
+    )
 }
 
 /// Analyze a prepared scheduler set under a work-sized private pool and wait
@@ -945,25 +2586,32 @@ fn precompute_cast_paths_with_pool_builder<B, F>(
     configured_limit: usize,
     build_pool: B,
     precompute: F,
-) where
+) -> Result<(), String>
+where
     B: FnOnce(usize) -> Result<rayon::ThreadPool, String>,
-    F: Fn(&std::path::Path) + Sync,
+    F: Fn(&std::path::Path) -> Result<(), String> + Sync,
 {
     use rayon::prelude::*;
 
     let width = configured_limit.max(1).min(binaries.len());
     if width <= 1 {
+        let mut first_error = None;
         for binary in binaries {
-            precompute(binary);
+            if let Err(error) = precompute(binary)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         }
-        return;
+        return first_error.map_or(Ok(()), Err);
     }
 
-    match build_pool(width) {
+    let results = match build_pool(width) {
         Ok(pool) => pool.install(|| {
             binaries
                 .par_iter()
-                .for_each(|binary| precompute(binary.as_path()));
+                .map(|binary| precompute(binary.as_path()))
+                .collect::<Vec<_>>()
         }),
         Err(error) => {
             tracing::warn!(
@@ -972,42 +2620,16 @@ fn precompute_cast_paths_with_pool_builder<B, F>(
                 work_items = binaries.len(),
                 "rayon ThreadPoolBuilder failed; falling back to sequential cast precompute"
             );
-            for binary in binaries {
-                precompute(binary);
-            }
+            binaries
+                .iter()
+                .map(|binary| precompute(binary))
+                .collect::<Vec<_>>()
         }
+    };
+    for result in results {
+        result?;
     }
-}
-
-/// Collect built scheduler binaries (`scx_*`, no extension) under
-/// `{target_dir}/{debug,release}`. The no-dot filter rejects build
-/// byproducts that share the `scx_` prefix (e.g. `scx_foo.d` depfiles,
-/// `scx_foo.rlib`); only the bare executable matches, and the
-/// `is_file` gate excludes same-named directories. Split out from
-/// [`precompute_cast_cache`] so the scan/filter is unit-testable.
-fn collect_scheduler_binaries(target_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut binaries = Vec::new();
-    for profile in ["debug", "release"] {
-        let dir = target_dir.join(profile);
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name_str) = name.to_str() else {
-                continue;
-            };
-            if name_str.starts_with("scx_") && !name_str.contains('.') {
-                let path = entry.path();
-                if path.is_file() {
-                    binaries.push(path);
-                }
-            }
-        }
-    }
-    binaries.sort();
-    binaries.dedup();
-    binaries
+    Ok(())
 }
 
 fn generate_btf_anchor(target_dir: &std::path::Path, release: bool) -> Option<std::path::PathBuf> {
@@ -1068,6 +2690,70 @@ fn generate_btf_anchor(target_dir: &std::path::Path, release: bool) -> Option<st
 
     let clang = std::env::var("BPF_CLANG").unwrap_or_else(|_| "clang".to_string());
     crate::btf_catalog::generate_btf_anchor(bpf_object_dir, &clang, &cflags, &anchor_path)
+}
+
+fn explicit_cargo_target_dir(
+    args: &[String],
+    invocation_dir: &std::path::Path,
+) -> Option<PathBuf> {
+    let mut target_dir = None;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--" {
+            break;
+        }
+        if argument == "--target-dir" {
+            if let Some(value) = args.get(index + 1) {
+                target_dir = Some(PathBuf::from(value));
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--target-dir=") {
+            target_dir = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        index += if llvm_cov_or_nextest_option_takes_value(argument) {
+            2
+        } else {
+            1
+        };
+    }
+    target_dir.map(|path| {
+        if path.is_absolute() {
+            path
+        } else {
+            invocation_dir.join(path)
+        }
+    })
+}
+
+pub(crate) fn resolve_cargo_target_dir_for_args(
+    args: &[String],
+    invocation_dir: &std::path::Path,
+) -> Result<PathBuf, String> {
+    if let Some(target_dir) = explicit_cargo_target_dir(args, invocation_dir) {
+        return Ok(target_dir);
+    }
+    let mut command = cargo_metadata::MetadataCommand::new();
+    command
+        .cargo_path("cargo")
+        .current_dir(invocation_dir)
+        .other_options(crate::feature_discovery::metadata_passthrough_options(
+            args,
+        ))
+        .no_deps();
+    command
+        .exec()
+        .map(|metadata| metadata.target_directory.into_std_path_buf())
+        .map_err(|error| {
+            format!(
+                "cargo ktstr: resolve effective Cargo target directory from {}: {error}",
+                invocation_dir.display(),
+            )
+        })
 }
 
 fn resolve_target_dir() -> std::path::PathBuf {
@@ -1563,12 +3249,17 @@ pub(crate) fn run_test(
     default_branch: String,
     args: Vec<String>,
 ) -> Result<(), String> {
+    nextest_archive_reuse(TEST_SUB_ARGV, &args)?;
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     ktstr::cli::check_tools(&["cargo-nextest"]).map_err(|e| format!("{e:#}"))?;
     // Smart feature inference must precede registry discovery: `--relevant`
     // probes the exact feature/package/target/profile selection the eventual
     // nextest run will build, rather than a second workspace-wide default.
-    let args = prepare_nextest_args(args)?;
+    let args = if llvm_cov_reuses_archive(TEST_SUB_ARGV, &args) {
+        args
+    } else {
+        prepare_nextest_args(args)?
+    };
     let args = apply_relevant_narrowing(args, relevant, base, base_ref, default_branch, release)?;
     run_cargo_sub(
         TEST_SUB_ARGV,
@@ -1599,12 +3290,29 @@ pub(crate) fn run_coverage(
     default_branch: String,
     args: Vec<String>,
 ) -> Result<(), String> {
+    if llvm_cov_has_lifecycle_flag(&args, "--no-run") {
+        return run_llvm_cov_report_only(
+            COVERAGE_SUB_ARGV,
+            release,
+            profile.as_deref(),
+            nextest_profile.as_deref(),
+            no_perf_mode,
+            no_skip_mode,
+            &args,
+        );
+    }
+    nextest_archive_reuse(COVERAGE_SUB_ARGV, &args)?;
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     ktstr::cli::check_tools(&["cargo-nextest", "cargo-llvm-cov"]).map_err(|e| format!("{e:#}"))?;
     // `coverage` runs the same suite through `cargo llvm-cov nextest`, so use
     // the same version guard and targeted feature inference as `test`.
-    let args = prepare_nextest_args(args)?;
-    let args = apply_relevant_narrowing(args, relevant, base, base_ref, default_branch, release)?;
+    let args = if llvm_cov_reuses_archive(COVERAGE_SUB_ARGV, &args) {
+        args
+    } else {
+        prepare_nextest_args(args)?
+    };
+    let args =
+        apply_relevant_narrowing(args, relevant, base, base_ref, default_branch, release)?;
     run_cargo_sub(
         COVERAGE_SUB_ARGV,
         "coverage",
@@ -1626,6 +3334,18 @@ pub(crate) fn run_llvm_cov(
     include_eol: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
+    if llvm_cov_has_lifecycle_flag(&args, "--no-run") {
+        return run_llvm_cov_report_only(
+            LLVM_COV_SUB_ARGV,
+            false,
+            None,
+            None,
+            no_perf_mode,
+            no_skip_mode,
+            &args,
+        );
+    }
+    nextest_archive_reuse(LLVM_COV_SUB_ARGV, &args)?;
     // `llvm-cov` is raw passthrough — the user supplies every
     // argument after the subcommand name, including any profile
     // selection. `release: false` / `profile: None` / `nextest_profile:
@@ -1656,7 +3376,7 @@ pub(crate) fn run_llvm_cov(
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
     fn v(s: &str) -> Version {
         Version::parse(s).expect("test version literal is valid semver")
@@ -1730,6 +3450,122 @@ mod tests {
     #[test]
     fn version_guard_equal_is_ok() {
         assert_eq!(version_guard(&v("0.19.0"), &v("0.19.0")), VersionGuard::Ok);
+    }
+
+    #[test]
+    fn cargo_output_lease_covers_exact_artifact_pin_boundary() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::sync::atomic::AtomicBool;
+
+        let directory = tempfile::tempdir().expect("temporary output-lock fixture");
+        let target_dir = directory.path().join("target");
+        let lock_root = directory.path().join("output-locks");
+        std::fs::create_dir_all(&target_dir).expect("create fixture target dir");
+        let artifact = target_dir.join("scheduler");
+        std::fs::write(&artifact, b"first scheduler revision").expect("write first revision");
+        std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o755))
+            .expect("make first revision executable");
+
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let first = acquire_cargo_build_output_lease_at_root(
+            &target_dir,
+            &lock_root,
+            "first writer",
+            &interrupted,
+        )
+        .expect("first writer owns target output");
+        let pinned = ktstr::cache::pin_content_file(&artifact)
+            .expect("pin Cargo artifact before ending output ownership");
+
+        let canonical_target =
+            std::fs::canonicalize(&target_dir).expect("canonical fixture target dir");
+        let lock_path = cargo_build_output_lock_path(&lock_root, &canonical_target);
+        let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+        let (replaced_tx, replaced_rx) = std::sync::mpsc::channel();
+        let target_for_thread = target_dir.clone();
+        let lock_root_for_thread = lock_root.clone();
+        let artifact_for_thread = artifact.clone();
+        let interrupted_for_thread = Arc::clone(&interrupted);
+        let contender = std::thread::spawn(move || {
+            let probe =
+                ktstr::flock::try_flock(&lock_path, ktstr::flock::FlockMode::Exclusive)
+                    .expect("probe first writer's output lock");
+            contended_tx
+                .send(probe.is_none())
+                .expect("report lock contention");
+            drop(probe);
+
+            let _second = acquire_cargo_build_output_lease_at_root(
+                &target_for_thread,
+                &lock_root_for_thread,
+                "second writer",
+                &interrupted_for_thread,
+            )
+            .expect("second writer acquires after first releases");
+            let replacement = target_for_thread.join("scheduler.next");
+            std::fs::write(&replacement, b"second scheduler revision")
+                .expect("write replacement revision");
+            std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755))
+                .expect("make replacement executable");
+            std::fs::rename(replacement, artifact_for_thread)
+                .expect("atomically replace Cargo output");
+            replaced_tx.send(()).expect("report replacement");
+        });
+
+        assert!(
+            contended_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("receive contention observation before deadline"),
+            "a second writer must not cross the artifact pin boundary",
+        );
+        assert!(
+            replaced_rx.try_recv().is_err(),
+            "the target pathname must remain stable while the first lease is held",
+        );
+        drop(first);
+        replaced_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("second writer replaces output before deadline");
+        contender.join().expect("join output-lock contender");
+
+        let snapshot =
+            ktstr::scheduler_artifact::snapshot_pinned_scheduler_artifact(pinned)
+                .expect("snapshot exact pinned revision after pathname replacement");
+        assert_eq!(
+            std::fs::read(snapshot.path()).expect("read exact scheduler snapshot"),
+            b"first scheduler revision",
+        );
+        assert_eq!(
+            std::fs::read(&artifact).expect("read current Cargo output"),
+            b"second scheduler revision",
+        );
+    }
+
+    #[test]
+    fn descriptor_backed_probe_executes_the_pinned_elf_revision() {
+        let directory = tempfile::tempdir().expect("temporary pinned-exec fixture");
+        let artifact = directory.path().join("test-executable");
+        std::fs::copy("/bin/true", &artifact).expect("copy successful executable revision");
+        let pinned = ktstr::cache::pin_content_file(&artifact).expect("pin executable revision");
+
+        let replacement = directory.path().join("replacement");
+        std::fs::copy("/bin/false", &replacement).expect("copy failing replacement revision");
+        std::fs::rename(replacement, &artifact).expect("atomically replace executable pathname");
+
+        let status = Command::new(pinned.proc_fd_path())
+            .status()
+            .expect("execute pinned ELF through /proc/self/fd");
+        assert!(
+            status.success(),
+            "descriptor-backed probe must execute the pinned /bin/true inode",
+        );
+        assert!(
+            !Command::new(&artifact)
+                .status()
+                .expect("execute replacement /bin/false")
+                .success(),
+            "the ordinary pathname must now select the replacement revision",
+        );
     }
 
     #[test]
@@ -1861,15 +3697,46 @@ mod tests {
     }
 
     #[test]
+    fn llvm_cov_no_run_bypasses_metadata_tool_config_and_admission() {
+        for (sub_argv, args) in [
+            (
+                COVERAGE_SUB_ARGV,
+                strs(&["--no-run", "--test-threads", "7"]),
+            ),
+            (
+                LLVM_COV_SUB_ARGV,
+                strs(&["nextest", "--no-run", "--test-threads", "7"]),
+            ),
+        ] {
+            assert!(!cargo_sub_uses_nextest(sub_argv, &args));
+            let uninjected = inject_nextest_tool_config_with(
+                sub_argv,
+                args.clone(),
+                |_| panic!("report-only --no-run must not inject nextest config"),
+            )
+            .unwrap();
+            assert_eq!(uninjected, args);
+        }
+        let raw = strs(&["nextest", "--no-run", "--features", "explicit"]);
+        let prepared = prepare_llvm_cov_args_with(raw.clone(), |_| {
+            panic!("report-only --no-run must not query Cargo metadata")
+        })
+        .unwrap();
+        assert_eq!(prepared, raw);
+    }
+
+    #[test]
     fn reserved_warmup_reuses_the_final_runs_injected_tool_config() {
-        let run_args =
+        let run_args = normalize_nextest_admission(
+            TEST_SUB_ARGV,
             inject_nextest_tool_config_with(TEST_SUB_ARGV, strs(&["-j", "77"]), |args| {
                 crate::nextest_config::inject_with_path(
                     args,
                     std::path::Path::new("/tmp/ktstr-nextest.toml"),
                 )
             })
-            .expect("tool-config injection succeeds");
+            .expect("tool-config injection succeeds"),
+        );
         let warm_args = prebuild_no_run_args(&run_args);
 
         for args in [&run_args, &warm_args] {
@@ -1881,9 +3748,160 @@ mod tests {
                     .count(),
                 1,
             );
-            assert!(args.windows(2).any(|pair| pair == ["-j", "77"]));
+            assert_eq!(
+                args.iter()
+                    .filter(|argument| {
+                        argument.as_str()
+                            == format!("--test-threads={ORCHESTRATED_NEXTEST_TEST_THREADS}")
+                    })
+                    .count(),
+                1,
+            );
+            assert!(!args.iter().any(|argument| argument == "-j"));
         }
         assert!(warm_args.iter().any(|argument| argument == "--no-run"));
+    }
+
+    #[test]
+    fn admission_normalization_replaces_every_nextest_slot_spelling() {
+        let expected_threads = format!("--test-threads={ORCHESTRATED_NEXTEST_TEST_THREADS}");
+        for sub_argv in [TEST_SUB_ARGV, COVERAGE_SUB_ARGV] {
+            assert_eq!(
+                normalize_nextest_admission(
+                    sub_argv,
+                    strs(&[
+                        "-j",
+                        "192",
+                        "-j64",
+                        "-j=32",
+                        "--test-threads",
+                        "16",
+                        "--test-threads=8",
+                        "--locked",
+                        "--",
+                        "-j",
+                        "2",
+                    ]),
+                ),
+                vec![
+                    "--locked".to_string(),
+                    expected_threads.clone(),
+                    "--".to_string(),
+                    "-j".to_string(),
+                    "2".to_string(),
+                ],
+                "{sub_argv:?} must have one admission scheduler and preserve the opaque suffix",
+            );
+        }
+    }
+
+    #[test]
+    fn admission_normalization_preserves_invalid_values_for_nextest_to_reject() {
+        let expected_threads = format!("--test-threads={ORCHESTRATED_NEXTEST_TEST_THREADS}");
+        let overflow = "999999999999999999999999999999999999999999";
+        assert_eq!(
+            normalize_nextest_admission(
+                TEST_SUB_ARGV,
+                vec![
+                    "-j".into(),
+                    "--locked".into(),
+                    "--test-threads".into(),
+                    "junk".into(),
+                    "-j0".into(),
+                    "-j=0".into(),
+                    "--test-threads=0".into(),
+                    format!("-j{overflow}"),
+                    format!("--test-threads={overflow}"),
+                ],
+            ),
+            vec![
+                "-j".to_string(),
+                "--locked".to_string(),
+                "--test-threads".to_string(),
+                "junk".to_string(),
+                "-j0".to_string(),
+                "-j=0".to_string(),
+                "--test-threads=0".to_string(),
+                format!("-j{overflow}"),
+                format!("--test-threads={overflow}"),
+                expected_threads,
+            ],
+            "the wrapper must not turn malformed user input into a successful invocation",
+        );
+        assert_eq!(
+            normalize_nextest_admission(TEST_SUB_ARGV, strs(&["--test-threads"])),
+            vec![
+                "--test-threads".to_string(),
+                format!("--test-threads={ORCHESTRATED_NEXTEST_TEST_THREADS}"),
+            ],
+            "a missing separate value remains visible to nextest",
+        );
+    }
+
+    #[test]
+    fn admission_normalization_accepts_nextest_negative_and_num_cpus_values() {
+        assert_eq!(
+            normalize_nextest_admission(
+                TEST_SUB_ARGV,
+                strs(&[
+                    "-j",
+                    "-2",
+                    "-j-3",
+                    "-j=-4",
+                    "--test-threads",
+                    "num-cpus",
+                    "--test-threads=-5",
+                ]),
+            ),
+            vec![format!(
+                "--test-threads={ORCHESTRATED_NEXTEST_TEST_THREADS}"
+            )],
+        );
+    }
+
+    #[test]
+    fn raw_llvm_cov_translates_global_build_jobs_and_normalizes_nextest_region() {
+        let got = normalize_nextest_admission(
+            LLVM_COV_SUB_ARGV,
+            strs(&[
+                "-j",
+                "12",
+                "--jobs=10",
+                "--manifest-path",
+                "Cargo.toml",
+                "nextest",
+                "-j192",
+                "--test-threads",
+                "7",
+                "--features",
+                "integration",
+                "--",
+                "-j",
+                "3",
+            ]),
+        );
+        assert_eq!(
+            got,
+            vec![
+                "--manifest-path".to_string(),
+                "Cargo.toml".to_string(),
+                "nextest".to_string(),
+                "--features".to_string(),
+                "integration".to_string(),
+                "--build-jobs".to_string(),
+                "10".to_string(),
+                format!("--test-threads={ORCHESTRATED_NEXTEST_TEST_THREADS}"),
+                "--".to_string(),
+                "-j".to_string(),
+                "3".to_string(),
+            ],
+        );
+        let report = strs(&["-j", "12", "report", "--test-threads=7"]);
+        assert_eq!(
+            normalize_nextest_admission(LLVM_COV_SUB_ARGV, report.clone()),
+            report,
+            "non-nextest raw llvm-cov must remain byte-for-byte passthrough"
+        );
     }
 
     #[test]
@@ -1976,6 +3994,7 @@ mod tests {
             raw_argv,
             [
                 "llvm-cov",
+                "--no-clean",
                 "nextest",
                 "--workspace",
                 "--target",
@@ -2641,31 +4660,6 @@ mod tests {
         );
     }
 
-    /// `collect_scheduler_binaries` returns only bare `scx_*`
-    /// executables under `{target}/{debug,release}`: build byproducts
-    /// sharing the prefix (`scx_foo.d`), non-`scx_` files, and
-    /// same-named directories are excluded; a missing profile dir is a
-    /// no-op (not an error).
-    #[test]
-    fn collect_scheduler_binaries_filters_to_bare_scx_executables() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        // No debug/release dirs yet -> nothing collected.
-        assert!(collect_scheduler_binaries(tmp.path()).is_empty());
-
-        let debug = tmp.path().join("debug");
-        std::fs::create_dir(&debug).unwrap();
-        std::fs::write(debug.join("scx_ktstr"), b"x").unwrap(); // collected
-        std::fs::write(debug.join("scx_ktstr.d"), b"x").unwrap(); // .d byproduct -> excluded
-        std::fs::write(debug.join("ktstr"), b"x").unwrap(); // no scx_ prefix -> excluded
-        std::fs::create_dir(debug.join("scx_subdir")).unwrap(); // dir -> excluded by is_file
-
-        assert_eq!(
-            collect_scheduler_binaries(tmp.path()),
-            vec![debug.join("scx_ktstr")],
-            "only the bare scx_* executable is collected",
-        );
-    }
-
     #[test]
     fn cast_precompute_zero_and_one_stay_on_caller_without_pool() {
         let empty: Vec<std::path::PathBuf> = Vec::new();
@@ -2674,7 +4668,8 @@ mod tests {
             192,
             |_| panic!("empty scheduler set must not build a pool"),
             |_| panic!("empty scheduler set must not invoke precompute"),
-        );
+        )
+        .unwrap();
 
         let caller = std::thread::current().id();
         let one = vec![std::path::PathBuf::from("/fake/scx_one")];
@@ -2690,8 +4685,10 @@ mod tests {
                     "single cast precompute escaped onto a worker"
                 );
                 visited.lock().unwrap().push(path.to_path_buf());
+                Ok(())
             },
-        );
+        )
+        .unwrap();
         assert_eq!(*visited.lock().unwrap(), one);
     }
 
@@ -2717,8 +4714,10 @@ mod tests {
             |_| {
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 completed.fetch_add(1, Ordering::Relaxed);
+                Ok(())
             },
-        );
+        )
+        .unwrap();
         assert_eq!(requested_threads.get(), binaries.len());
         assert_eq!(
             completed.load(Ordering::Relaxed),
@@ -2749,10 +4748,43 @@ mod tests {
                     "private-pool failure initialized parallel fallback work"
                 );
                 visited.lock().unwrap().push(path.to_path_buf());
+                Ok(())
             },
-        );
+        )
+        .unwrap();
         assert_eq!(requested_threads.get(), 2);
         assert_eq!(*visited.lock().unwrap(), binaries);
+    }
+
+    #[test]
+    fn cast_precompute_attempts_all_work_and_reports_first_input_error() {
+        let binaries: Vec<_> = (0..4)
+            .map(|index| std::path::PathBuf::from(format!("/fake/scx_{index}")))
+            .collect();
+        let visited = std::sync::Mutex::new(Vec::new());
+        let error = precompute_cast_paths_with_pool_builder(
+            &binaries,
+            4,
+            |threads| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .map_err(|error| error.to_string())
+            },
+            |path| {
+                visited.lock().unwrap().push(path.to_path_buf());
+                match path.file_name().and_then(std::ffi::OsStr::to_str) {
+                    Some("scx_1") => Err("first input error".to_string()),
+                    Some("scx_3") => Err("later input error".to_string()),
+                    _ => Ok(()),
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "first input error");
+        let mut visited = visited.into_inner().unwrap();
+        visited.sort();
+        assert_eq!(visited, binaries, "every cast precompute must be attempted");
     }
 
     /// Byte-exact pin on the three `*_SUB_ARGV` constants that drive
@@ -2939,6 +4971,129 @@ mod tests {
         assert_eq!(argv, ["llvm-cov", "report"].map(std::ffi::OsStr::new));
     }
 
+    #[test]
+    fn llvm_cov_final_no_clean_is_owned_only_by_a_build_warm() {
+        let default = build_cargo_command(
+            COVERAGE_SUB_ARGV,
+            false,
+            None,
+            None,
+            false,
+            false,
+            &strs(&["--features", "integration"]),
+        );
+        assert_eq!(
+            default
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            strs(&[
+                "llvm-cov",
+                "--no-clean",
+                "nextest",
+                "--features",
+                "integration",
+            ]),
+        );
+
+        let archive_reuse = build_cargo_command(
+            COVERAGE_SUB_ARGV,
+            false,
+            None,
+            None,
+            false,
+            false,
+            &strs(&["--archive-file", "reuse.tar.zst"]),
+        );
+        assert_eq!(
+            archive_reuse
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            strs(&[
+                "llvm-cov",
+                "nextest",
+                "--archive-file",
+                "reuse.tar.zst",
+            ]),
+            "archive reuse did not run ktstr's clean/warm lifecycle",
+        );
+
+        for retained in ["--no-clean", "--no-report", "--no-run"] {
+            let command = build_cargo_command(
+                COVERAGE_SUB_ARGV,
+                false,
+                None,
+                None,
+                false,
+                false,
+                &[retained.to_string()],
+            );
+            let argv = command
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                argv.iter().filter(|argument| *argument == retained).count(),
+                1,
+                "explicit lifecycle flag must be preserved without duplication",
+            );
+            assert_eq!(argv, strs(&["llvm-cov", "nextest", retained]));
+        }
+    }
+
+    #[test]
+    fn raw_llvm_cov_final_injects_no_clean_before_nextest_only() {
+        let command = build_cargo_command(
+            LLVM_COV_SUB_ARGV,
+            false,
+            None,
+            None,
+            false,
+            false,
+            &strs(&[
+                "--manifest-path",
+                "Cargo.toml",
+                "nextest",
+                "--features",
+                "integration",
+            ]),
+        );
+        assert_eq!(
+            command
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            strs(&[
+                "llvm-cov",
+                "--manifest-path",
+                "Cargo.toml",
+                "--no-clean",
+                "nextest",
+                "--features",
+                "integration",
+            ]),
+        );
+
+        let report = build_cargo_command(
+            LLVM_COV_SUB_ARGV,
+            false,
+            None,
+            None,
+            false,
+            false,
+            &strs(&["report", "--lcov"]),
+        );
+        assert_eq!(
+            report
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            strs(&["llvm-cov", "report", "--lcov"]),
+            "non-nextest llvm-cov remains an exact passthrough",
+        );
+    }
+
     /// Each of `--no-perf-mode` / `--no-skip-mode` independently gates
     /// one env var to the literal "1", absent when its flag is false.
     /// Two invocations — (perf=true,skip=false) and (perf=false,skip=true)
@@ -3111,23 +5266,259 @@ mod tests {
     // Reserved harness-compile warm-up wiring.
     // ---------------------------------------------------------------
 
-    /// Only the bare `nextest run` (`test`) path warms up under a
-    /// reservation. The `coverage` / raw `llvm-cov` paths run an
-    /// instrumented build a plain `--no-run` would not match, so they
-    /// must NOT warm up (a mismatch would cache-miss and double-build).
+    /// Every nextest-backed route warms its own exact command; non-test
+    /// llvm-cov passthroughs remain untouched.
     #[test]
-    fn wants_reserved_prebuild_gates_test_path_only() {
+    fn reserved_prebuild_gates_every_nextest_route() {
         assert!(
-            wants_reserved_prebuild(TEST_SUB_ARGV),
+            cargo_sub_uses_nextest(TEST_SUB_ARGV, &[]),
             "the `test` path must warm up under the reservation",
         );
         assert!(
-            !wants_reserved_prebuild(COVERAGE_SUB_ARGV),
-            "coverage's llvm-cov-instrumented build must NOT plain-warm-up",
+            cargo_sub_uses_nextest(COVERAGE_SUB_ARGV, &[]),
+            "coverage must warm its llvm-cov-instrumented command",
         );
         assert!(
-            !wants_reserved_prebuild(LLVM_COV_SUB_ARGV),
-            "raw llvm-cov passthrough must NOT warm up",
+            cargo_sub_uses_nextest(LLVM_COV_SUB_ARGV, &strs(&["nextest"])),
+            "raw llvm-cov nextest must use the same warm-up path",
+        );
+        assert!(
+            !cargo_sub_uses_nextest(LLVM_COV_SUB_ARGV, &strs(&["report"])),
+            "raw llvm-cov report must remain a pure passthrough",
+        );
+        assert!(!cargo_sub_needs_reserved_prebuild(
+            COVERAGE_SUB_ARGV,
+            &strs(&["--no-run"]),
+        ));
+        assert!(!cargo_sub_needs_reserved_prebuild(
+            COVERAGE_SUB_ARGV,
+            &strs(&["--archive-file", "reuse.tar.zst"]),
+        ));
+        assert!(cargo_sub_needs_reserved_prebuild(
+            COVERAGE_SUB_ARGV,
+            &strs(&["--no-report"]),
+        ));
+    }
+
+    #[test]
+    fn archive_reuse_detection_is_nextest_region_and_value_aware() {
+        assert!(llvm_cov_reuses_archive(
+            LLVM_COV_SUB_ARGV,
+            &strs(&[
+                "--output-path",
+                "report.info",
+                "nextest",
+                "--archive-file",
+                "reuse.tar.zst",
+            ]),
+        ));
+        assert!(!llvm_cov_reuses_archive(
+            LLVM_COV_SUB_ARGV,
+            &strs(&[
+                "--output-path",
+                "--archive-file",
+                "nextest",
+                "--features",
+                "integration",
+            ]),
+        ));
+        assert!(!llvm_cov_reuses_archive(
+            COVERAGE_SUB_ARGV,
+            &strs(&["--tool-config-file", "--archive-file"]),
+        ));
+        assert!(!llvm_cov_reuses_archive(
+            COVERAGE_SUB_ARGV,
+            &strs(&["--nextest-archive-file", "report.tar.zst"]),
+        ));
+        assert!(!llvm_cov_reuses_archive(
+            COVERAGE_SUB_ARGV,
+            &strs(&["--", "--archive-file", "opaque"]),
+        ));
+        for args in [
+            strs(&["--archive-file", "reuse.tar.zst", "nextest"]),
+            strs(&["--archive-file=reuse.tar.zst", "nextest"]),
+        ] {
+            assert!(
+                llvm_cov_reuses_archive(LLVM_COV_SUB_ARGV, &args),
+                "raw llvm-cov accepts archive reuse before its nextest subcommand",
+            );
+        }
+        for args in [
+            strs(&[
+                "--archive-file",
+                "-",
+                "nextest",
+                "--archive-format=tar-zst",
+            ]),
+            strs(&[
+                "--archive-file=-",
+                "nextest",
+                "--archive-format=tar-zst",
+            ]),
+        ] {
+            assert_eq!(
+                nextest_archive_reuse(LLVM_COV_SUB_ARGV, &args)
+                    .unwrap()
+                    .unwrap()
+                    .file
+                    .value,
+                "-",
+                "a dash is nextest's literal filename in either spelling",
+            );
+        }
+        assert!(
+            nextest_archive_reuse(
+                LLVM_COV_SUB_ARGV,
+                &strs(&["--archive-file=-", "nextest"]),
+            )
+            .unwrap_err()
+            .contains("format auto"),
+            "the literal dash has no auto-detectable archive extension",
+        );
+        assert!(
+            nextest_archive_reuse(
+                LLVM_COV_SUB_ARGV,
+                &strs(&[
+                    "--archive-file",
+                    "first.tar.zst",
+                    "nextest",
+                    "--archive-file=second.tar.zst",
+                ]),
+            )
+            .unwrap_err()
+            .contains("duplicate --archive-file"),
+        );
+        assert!(
+            nextest_archive_reuse(
+                COVERAGE_SUB_ARGV,
+                &strs(&[
+                    "--archive-file",
+                    "reuse.tar.zst",
+                    "--archive-format",
+                    "zip",
+                ]),
+            )
+            .unwrap_err()
+            .contains("does not resolve to tar-zst"),
+        );
+    }
+
+    #[test]
+    fn archive_reuse_rewrite_preserves_occurrence_and_forces_tar_zst() {
+        let rewritten = rewrite_nextest_archive_reuse(
+            LLVM_COV_SUB_ARGV,
+            strs(&["--archive-file", "reuse.tar.zst", "nextest", "--locked"]),
+            std::path::Path::new("/cache/deadbeef.object"),
+        )
+        .unwrap();
+        assert_eq!(
+            rewritten,
+            strs(&[
+                "--archive-file",
+                "/cache/deadbeef.object",
+                "nextest",
+                "--locked",
+                "--archive-format=tar-zst",
+            ]),
+        );
+    }
+
+    #[test]
+    fn archive_warm_projection_rejects_unknown_post_nextest_options() {
+        let error = llvm_cov_nextest_archive_args(
+            LLVM_COV_SUB_ARGV,
+            &strs(&["nextest", "--future-option"]),
+            std::path::Path::new("/tmp/warm.tar.zst"),
+        )
+        .unwrap_err();
+        assert!(error.contains("unknown post-nextest option"));
+    }
+
+    #[test]
+    fn llvm_cov_archive_warm_projection_is_build_exact_and_run_clean() {
+        let command = build_llvm_cov_archive_warm_command(
+            LLVM_COV_SUB_ARGV,
+            true,
+            Some("scheduler-dev"),
+            Some("ci"),
+            true,
+            true,
+            &strs(&[
+                "--manifest-path",
+                "Cargo.toml",
+                "-j",
+                "12",
+                "--lcov",
+                "--output-path",
+                "report.info",
+                "nextest",
+                "--features",
+                "integration",
+                "-j",
+                "7",
+                "--show-progress",
+                "bar",
+                "--flaky-result",
+                "fail",
+                "--no-fail-fast",
+                "-R",
+                "previous",
+                "-E",
+                "test(x)",
+                "positional",
+                "--no-report",
+                "--exclude-from-report",
+                "vendor",
+                "--branch",
+                "--",
+                "--exact",
+                "opaque",
+            ]),
+            std::path::Path::new("/tmp/warm-build.tar.zst"),
+        )
+        .expect("known llvm-cov/nextest options project onto archive warm-up");
+        assert_eq!(
+            command
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            strs(&[
+                "llvm-cov",
+                "--manifest-path",
+                "Cargo.toml",
+                "--no-clean",
+                "nextest-archive",
+                "--cargo-profile",
+                "release",
+                "--profile",
+                "ci",
+                "--features",
+                "integration",
+                "--exclude-from-report",
+                "vendor",
+                "--branch",
+                "--build-jobs",
+                "12",
+                "--archive-file",
+                "/tmp/warm-build.tar.zst",
+                "--zstd-level=-7",
+                "-E",
+                "none()",
+                "--cargo-message-format=json-render-diagnostics",
+            ]),
+        );
+        let env = cmd_env_map(&command);
+        assert_eq!(
+            env.get(std::ffi::OsStr::new(ktstr::KTSTR_NO_PERF_MODE_ENV)),
+            Some(&Some(std::ffi::OsString::from("1"))),
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new(ktstr::KTSTR_NO_SKIP_MODE_ENV)),
+            Some(&Some(std::ffi::OsString::from("1"))),
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new(ktstr::KTSTR_SCHEDULER_PROFILE_ENV)),
+            Some(&Some(std::ffi::OsString::from("scheduler-dev"))),
         );
     }
 
@@ -3254,6 +5645,265 @@ nextest non-json output is ignored
                 PathBuf::from("/tmp/z-unit"),
             ],
         );
+    }
+
+    #[test]
+    fn cargo_json_discovery_accepts_stderr_redirect_and_requires_build_finished() {
+        let stderr = br#"
+cargo-llvm-cov diagnostic
+{"reason":"compiler-artifact","executable":"/tmp/from-stderr","target":{"kind":["test"]},"profile":{"test":false}}
+{"reason":"build-finished","success":true}
+"#;
+        assert_eq!(
+            validated_test_executables_from_cargo_output(b"", stderr).unwrap(),
+            vec![PathBuf::from("/tmp/from-stderr")],
+        );
+        assert!(
+            validated_test_executables_from_cargo_output(
+                br#"{"reason":"compiler-artifact","executable":"/tmp/untrusted","target":{"kind":["test"]},"profile":{"test":false}}"#,
+                b"plain diagnostics only",
+            )
+            .is_err(),
+            "successful discovery without Cargo's build-finished record is untrusted",
+        );
+        assert_eq!(
+            validated_test_executables_from_cargo_output(
+                br#"{"reason":"build-finished","success":true}"#,
+                b"",
+            )
+            .unwrap(),
+            Vec::<PathBuf>::new(),
+            "a confirmed build with zero test executables is valid",
+        );
+    }
+
+    fn append_nextest_archive_file<W: std::io::Write>(
+        archive: &mut tar::Builder<W>,
+        path: &str,
+        bytes: &[u8],
+        mode: u32,
+    ) {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(mode);
+        header.set_mtime(0);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, path, bytes)
+            .expect("append nextest archive fixture");
+    }
+
+    fn write_nextest_archive_fixture(
+        path: &std::path::Path,
+        metadata: &[u8],
+        binaries: &[(&str, &[u8])],
+        links: &[(&str, &str, bool)],
+    ) {
+        let file = std::fs::File::create(path).expect("create nextest archive fixture");
+        let encoder = zstd::Encoder::new(file, 0).expect("create zstd encoder");
+        let mut archive = tar::Builder::new(encoder);
+        append_nextest_archive_file(
+            &mut archive,
+            NEXTEST_ARCHIVE_BINARIES_METADATA,
+            metadata,
+            0o644,
+        );
+        for (binary_path, bytes) in binaries {
+            append_nextest_archive_file(&mut archive, binary_path, bytes, 0o755);
+        }
+        for (path, target, hard_link) in links {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o755);
+            header.set_mtime(0);
+            header.set_entry_type(if *hard_link {
+                tar::EntryType::Link
+            } else {
+                tar::EntryType::Symlink
+            });
+            header
+                .set_link_name(target)
+                .expect("set archive fixture link target");
+            header.set_cksum();
+            archive
+                .append_data(&mut header, path, std::io::empty())
+                .expect("append nextest archive link fixture");
+        }
+        let encoder = archive.into_inner().expect("finish tar archive");
+        encoder.finish().expect("finish zstd archive");
+    }
+
+    #[test]
+    fn nextest_archive_probe_selects_exact_test_binaries_from_full_target_closure() {
+        let temp = tempfile::tempdir().expect("archive fixture tempdir");
+        let archive_path = temp.path().join("reuse.tar.zst");
+        let metadata = br#"{
+            "rust-build-meta": {"target-directory": "/original/target"},
+            "rust-binaries": {
+                "pkg::one": {"binary-path": "/original/target/debug/deps/one"},
+                "pkg::two": {"binary-path": "/original/target/debug/deps/two"}
+            }
+        }"#;
+        write_nextest_archive_fixture(
+            &archive_path,
+            metadata,
+            &[
+                ("target/debug/deps/one", b"first"),
+                ("target/debug/deps/two", b"second"),
+                ("target/debug/deps/unlisted", b"must not extract"),
+            ],
+            &[],
+        );
+
+        let extracted =
+            extract_nextest_archive_test_binaries(&archive_path).expect("extract test binaries");
+        assert_eq!(extracted.test_binaries.len(), 2);
+        assert_eq!(
+            extracted
+                .test_binaries
+                .iter()
+                .map(std::fs::read)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![b"first".to_vec(), b"second".to_vec()],
+        );
+        assert!(
+            extracted
+                ._owner
+                .path()
+                .join("target/debug/deps/unlisted")
+                .exists(),
+            "the archived target closure is retained so loader links cannot dangle",
+        );
+    }
+
+    #[test]
+    fn nextest_archive_probe_extracts_and_orders_loader_directories() {
+        let temp = tempfile::tempdir().expect("archive fixture tempdir");
+        let archive_path = temp.path().join("reuse.tar.zst");
+        let metadata = br#"{
+            "rust-build-meta": {
+                "target-directory": "/original/target",
+                "base-output-directories": ["debug"],
+                "linked-paths": ["vendor/lib"]
+            },
+            "rust-binaries": {
+                "pkg::one": {"binary-path": "/original/target/debug/deps/one"}
+            }
+        }"#;
+        write_nextest_archive_fixture(
+            &archive_path,
+            metadata,
+            &[
+                ("target/debug/deps/one", b"test"),
+                ("target/vendor/lib/liblinked.so", b"linked"),
+                ("target/debug/deps/libdep.so", b"dep"),
+                ("target/debug/libbase.so", b"base"),
+                ("target/nextest/libdirs/host/libstd.so", b"std"),
+                ("target/unrelated/libignored.so", b"ignored"),
+            ],
+            &[
+                (
+                    "target/debug/deps/libhard.so",
+                    "target/debug/deps/libdep.so",
+                    true,
+                ),
+                (
+                    "target/debug/deps/libdep-link.so",
+                    "libdep.so",
+                    false,
+                ),
+            ],
+        );
+
+        let extracted =
+            extract_nextest_archive_test_binaries(&archive_path).expect("extract probe closure");
+        let relative = extracted
+            .loader_paths
+            .iter()
+            .map(|path| {
+                path.strip_prefix(extracted._owner.path())
+                    .unwrap()
+                    .to_path_buf()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            relative,
+            [
+                "target/vendor/lib",
+                "target/debug/deps",
+                "target/debug",
+                "target/nextest/libdirs/host",
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>(),
+            "probe loader order must match nextest: linked, deps/base, Rust libdirs",
+        );
+        assert!(extracted
+            ._owner
+            .path()
+            .join("target/unrelated/libignored.so")
+            .exists());
+        let deps = extracted._owner.path().join("target/debug/deps");
+        assert_eq!(
+            std::fs::read(deps.join("libdep-link.so")).unwrap(),
+            b"dep",
+        );
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!(
+            std::fs::metadata(deps.join("libdep.so")).unwrap().ino(),
+            std::fs::metadata(deps.join("libhard.so")).unwrap().ino(),
+            "archive-root hard links must resolve inside the extraction owner",
+        );
+    }
+
+    #[test]
+    fn nextest_archive_loader_links_must_remain_under_target_tree() {
+        let entry = std::path::Path::new("target/debug/deps/libfoo.so");
+        validate_archive_loader_link(
+            entry,
+            std::path::Path::new("libfoo.so.1"),
+            false,
+        )
+        .unwrap();
+        validate_archive_loader_link(
+            entry,
+            std::path::Path::new("target/debug/deps/libfoo.so.1"),
+            true,
+        )
+        .unwrap();
+        assert!(
+            validate_archive_loader_link(
+                entry,
+                std::path::Path::new("../../../../etc/passwd"),
+                false,
+            )
+            .unwrap_err()
+            .contains("escapes target tree"),
+        );
+        assert!(
+            validate_archive_loader_link(
+                entry,
+                std::path::Path::new("/etc/passwd"),
+                false,
+            )
+            .is_err(),
+        );
+    }
+
+    #[test]
+    fn nextest_archive_probe_rejects_binary_outside_target_directory() {
+        let metadata: NextestArchiveBinaryMetadata = serde_json::from_slice(br#"{
+            "rust-build-meta": {"target-directory": "/original/target"},
+            "rust-binaries": {
+                "pkg::escape": {"binary-path": "/original/other/escape"}
+            }
+        }"#)
+        .expect("parse archive metadata fixture");
+        let error = nextest_archive_binary_entry_paths(&metadata)
+            .expect_err("archive binary outside target directory must fail");
+        assert!(error.contains("outside build-directory"));
     }
 
     /// The warm-up command built for the `test` path carries the SAME

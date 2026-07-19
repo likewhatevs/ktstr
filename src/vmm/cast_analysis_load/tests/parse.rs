@@ -7,10 +7,10 @@ use goblin::elf::sym as syms;
 
 // ----- Tests for cached_cast_analysis_for_scheduler error paths --
 
-/// 1. Path that does not exist on the filesystem: the
-///    `std::fs::read` arm fires, returns `None`.
+/// 1. Path that does not exist on the filesystem: pinning is an infrastructure
+///    failure and must remain distinguishable from a valid empty analysis.
 #[test]
-fn cached_cast_analysis_nonexistent_path_returns_none() {
+fn cached_cast_analysis_nonexistent_path_returns_error() {
     let p = std::path::Path::new("/tmp/ktstr-cast-analysis-nonexistent-fixture-path-do-not-create");
     // Sanity: ensure the path really does not exist so the
     // assertion below proves what it claims.
@@ -18,7 +18,10 @@ fn cached_cast_analysis_nonexistent_path_returns_none() {
         !p.exists(),
         "fixture path must not exist; remove it before running this test"
     );
-    assert!(cached_cast_analysis_for_scheduler(p).is_none());
+    assert!(
+        cached_cast_analysis_for_scheduler(p).is_err(),
+        "a missing scheduler must be a hard infrastructure error"
+    );
 }
 
 /// 2. Empty file: `goblin::elf::Elf::parse` rejects a 0-byte
@@ -28,7 +31,11 @@ fn cached_cast_analysis_empty_file_returns_none() {
     let dir = tempfile::tempdir().expect("tempdir");
     let p = dir.path().join("empty.bin");
     std::fs::write(&p, b"").expect("write empty file");
-    assert!(cached_cast_analysis_for_scheduler(&p).is_none());
+    assert!(
+        cached_cast_analysis_for_scheduler(&p)
+            .expect("valid empty analysis")
+            .is_none()
+    );
 }
 
 /// 3. Valid ELF without a `.bpf.objs` section: the section-lookup
@@ -44,7 +51,11 @@ fn cached_cast_analysis_no_bpf_objs_section_returns_none() {
     let dir = tempfile::tempdir().expect("tempdir");
     let p = dir.path().join("no_bpf_objs.elf");
     std::fs::write(&p, &blob).expect("write");
-    assert!(cached_cast_analysis_for_scheduler(&p).is_none());
+    assert!(
+        cached_cast_analysis_for_scheduler(&p)
+            .expect("valid no-findings analysis")
+            .is_none()
+    );
 }
 
 // ----- Tests for btf_str_at --------------------------------------
@@ -738,7 +749,11 @@ fn cached_cast_analysis_corrupt_inner_returns_none() {
     let dir = tempfile::tempdir().expect("tempdir");
     let p = dir.path().join("bad_inner.bin");
     std::fs::write(&p, &outer).expect("write");
-    assert!(cached_cast_analysis_for_scheduler(&p).is_none());
+    assert!(
+        cached_cast_analysis_for_scheduler(&p)
+            .expect("valid corrupt-inner analysis")
+            .is_none()
+    );
 }
 
 /// Outer ELF whose `.bpf.objs` carries an inner BPF ELF
@@ -763,7 +778,11 @@ fn cached_cast_analysis_inner_without_btf_returns_none() {
     let dir = tempfile::tempdir().expect("tempdir");
     let p = dir.path().join("no_inner_btf.bin");
     std::fs::write(&p, &outer).expect("write");
-    assert!(cached_cast_analysis_for_scheduler(&p).is_none());
+    assert!(
+        cached_cast_analysis_for_scheduler(&p)
+            .expect("valid no-BTF analysis")
+            .is_none()
+    );
 }
 
 /// Full end-to-end through the public driver: outer host ELF
@@ -840,7 +859,9 @@ fn cached_cast_analysis_recovers_arena_cast_end_to_end() {
     let p = dir.path().join("full.bin");
     std::fs::write(&p, &outer).expect("write");
 
-    let out = cached_cast_analysis_for_scheduler(&p).expect("non-empty fixture must produce Some");
+    let out = cached_cast_analysis_for_scheduler(&p)
+        .expect("cast-analysis infrastructure")
+        .expect("non-empty fixture must produce Some");
     let hit = out.cast_maps[0].get(&(2u32, 8u32)).copied();
     assert_eq!(
         hit,
@@ -866,8 +887,12 @@ fn cached_cast_analysis_returns_same_arc_for_same_content() {
     std::fs::write(&p1, &blob).expect("write 1");
     std::fs::write(&p2, &blob).expect("write 2");
 
-    let first = cached_cast_analysis_for_scheduler(&p1).expect("Some on non-empty analysis");
-    let second = cached_cast_analysis_for_scheduler(&p2).expect("cache hit on identical content");
+    let first = cached_cast_analysis_for_scheduler(&p1)
+        .expect("first cast-analysis infrastructure")
+        .expect("Some on non-empty analysis");
+    let second = cached_cast_analysis_for_scheduler(&p2)
+        .expect("second cast-analysis infrastructure")
+        .expect("cache hit on identical content");
 
     assert!(
         Arc::ptr_eq(&first, &second),
@@ -900,26 +925,38 @@ fn cached_cast_analysis_collapses_empty_to_none() {
     std::fs::write(&p, &empty_blob).expect("write");
 
     // First call analyzes; result is empty → None.
-    assert!(cached_cast_analysis_for_scheduler(&p).is_none());
+    assert!(
+        cached_cast_analysis_for_scheduler(&p)
+            .expect("first valid empty analysis")
+            .is_none()
+    );
     // Second call hits the same content-hash cache entry and
     // also resolves to None without re-running the analyzer.
-    assert!(cached_cast_analysis_for_scheduler(&p).is_none());
+    assert!(
+        cached_cast_analysis_for_scheduler(&p)
+            .expect("cached valid empty analysis")
+            .is_none()
+    );
 }
 
-/// Read-failure path: a non-existent path produces `None`
-/// without polluting the cache. A later call after the file
-/// appears must succeed and run the analyzer on demand.
+/// Read-failure path: a non-existent path returns an infrastructure error
+/// without polluting either cache. A later call after the file appears must
+/// succeed and run the analyzer on demand.
 #[test]
 fn cached_cast_analysis_read_failure_does_not_pollute_cache() {
     let dir = tempfile::tempdir().expect("tempdir");
     let p = dir.path().join("appears_later.bin");
 
     assert!(!p.exists());
-    assert!(cached_cast_analysis_for_scheduler(&p).is_none());
+    assert!(
+        cached_cast_analysis_for_scheduler(&p).is_err(),
+        "the first missing-file lookup must fail"
+    );
 
     let blob = build_recovers_arena_cast_outer_elf();
     std::fs::write(&p, &blob).expect("write");
     let out = cached_cast_analysis_for_scheduler(&p)
+        .expect("post-creation infrastructure should succeed")
         .expect("post-creation read should succeed and produce a non-empty CastAnalysisOutput");
     assert_eq!(
         out.cast_maps[0].get(&(2u32, 8u32)).copied(),
@@ -929,6 +966,38 @@ fn cached_cast_analysis_read_failure_does_not_pollute_cache() {
             addr_space: AddrSpace::Arena,
         }),
         "post-creation analysis should recover the seeded cast"
+    );
+}
+
+/// The per-VM lazy slot follows the same retry contract as the process cache:
+/// an infrastructure error is returned and does not poison the `OnceLock`.
+#[test]
+fn lazy_cast_map_infrastructure_error_is_hard_and_retryable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let p = dir.path().join("lazy-appears-later.bin");
+    let lazy = LazyCastMap::new(Some(p.clone()));
+
+    assert!(
+        lazy.get_full().is_err(),
+        "missing scheduler must propagate through the lazy wrapper"
+    );
+    assert!(
+        lazy.inner.get().is_none(),
+        "an infrastructure error must not populate the success cache"
+    );
+
+    std::fs::write(&p, build_recovers_arena_cast_outer_elf()).expect("publish scheduler");
+    let output = lazy
+        .get_full()
+        .expect("retry after publication")
+        .expect("fixture has a cast analysis");
+    assert!(
+        output.cast_maps[0].contains_key(&(2, 8)),
+        "retry must analyze the newly published scheduler"
+    );
+    assert!(
+        lazy.inner.get().is_some(),
+        "successful retry must populate the lazy cache"
     );
 }
 
@@ -950,8 +1019,14 @@ fn lazy_cast_map_get_full_is_idempotent_and_lazy() {
         "LazyCastMap::new must not run analysis"
     );
 
-    let first = lazy.get_full().expect("non-empty result");
-    let second = lazy.get_full().expect("non-empty result");
+    let first = lazy
+        .get_full()
+        .expect("first lazy infrastructure")
+        .expect("non-empty result");
+    let second = lazy
+        .get_full()
+        .expect("second lazy infrastructure")
+        .expect("non-empty result");
     assert!(
         Arc::ptr_eq(&first, &second),
         "OnceLock-backed `.get_full()` must return the same Arc on every call"
@@ -960,9 +1035,8 @@ fn lazy_cast_map_get_full_is_idempotent_and_lazy() {
 
 /// `LazyCastMap::get_full` on a binary with no recoverable
 /// casts returns `None` (the cache layer collapses empty
-/// results). The renderer treats `None` identically to an
-/// empty map, so this keeps the pre-integration default
-/// behaviour intact.
+/// results). This is a semantic negative result, not an infrastructure
+/// fallback.
 #[test]
 fn lazy_cast_map_get_full_returns_none_for_no_findings() {
     let empty_blob = build_elf64(
@@ -976,7 +1050,9 @@ fn lazy_cast_map_get_full_returns_none_for_no_findings() {
 
     let lazy = LazyCastMap::new(Some(p));
     assert!(
-        lazy.get_full().is_none(),
+        lazy.get_full()
+            .expect("valid no-findings lazy analysis")
+            .is_none(),
         "no-`.bpf.objs` binary must collapse to None on `.get_full()`"
     );
 }

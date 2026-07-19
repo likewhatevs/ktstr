@@ -22,7 +22,7 @@ mod make;
 pub use build::{
     BuildReservation, KernelBuildResult, acquire_build_reservation,
     acquire_build_reservation_waiting, acquire_build_reservation_waiting_interruptible,
-    kernel_build_pipeline,
+    acquire_build_reservation_waiting_interruptible_with_progress, kernel_build_pipeline,
 };
 pub(crate) use kconfig::critical_config_options;
 pub use kconfig::{append_extra_kconfig_suffix, read_extra_kconfig, validate_kernel_config};

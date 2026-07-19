@@ -1,10 +1,12 @@
 //! Low-priority nextest defaults shipped with `cargo-ktstr`.
 //!
 //! Nextest's `--tool-config-file TOOL:ABS_PATH` interface is specifically
-//! intended for wrappers that need defaults without overriding repository or
-//! CLI policy. The embedded config gives ktstr's resource-taking generated
-//! cells a wide admission budget while bounding ordinary host tests to the
-//! host CPU count.
+//! intended for wrapper-owned policy. The embedded config gives ktstr's
+//! resource-taking generated cells a wide admission budget while bounding
+//! ordinary host tests to the host CPU count. Dispatch also writes the same
+//! admission count as an explicit nextest option so repository and user
+//! run-slot settings cannot create a second queue ahead of ktstr's
+//! machine-wide topology scheduler.
 
 use std::hash::{BuildHasher, Hasher};
 use std::io::Write as _;
@@ -17,10 +19,12 @@ const TOOL_CONFIG: &str = include_str!("nextest-tool.toml");
 
 /// Add ktstr's low-priority tool config to a nextest argument vector.
 ///
-/// A user-supplied ktstr tool config is authoritative and suppresses the
-/// built-in one. Other tool configs are preserved ahead of the injected
-/// argument because nextest gives earlier tool config arguments higher
-/// priority. Insertion happens before the test-binary `--` separator.
+/// A user-supplied ktstr tool config is authoritative for tool-config policy
+/// and suppresses the built-in one. The orchestrator still forces the common
+/// admission count as an explicit nextest option. Other tool configs are
+/// preserved ahead of the injected argument because nextest gives earlier
+/// tool config arguments higher priority. Insertion happens before the
+/// test-binary `--` separator.
 pub(crate) fn inject(args: Vec<String>) -> Result<Vec<String>, String> {
     if has_ktstr_tool_config(&args) {
         return Ok(args);

@@ -641,6 +641,49 @@ fn resolve_scheduler_discover_via_env() {
     );
 }
 
+#[test]
+fn repeated_manifest_resolution_never_falls_through_to_cargo() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = lock_env();
+    let _override = EnvVarGuard::remove(crate::KTSTR_SCHEDULER_ENV);
+    let dir = TempDir::new().expect("tempdir");
+    let executable = dir.path().join("scheduler");
+    std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").expect("write executable");
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod executable");
+    let executable = std::fs::canonicalize(executable).expect("canonicalize executable");
+    let manifest_path = dir.path().join("scheduler-artifacts.json");
+    let manifest = crate::scheduler_artifact::SchedulerArtifactManifest {
+        version: crate::scheduler_artifact::SCHEDULER_ARTIFACT_MANIFEST_VERSION,
+        profile: crate::scheduler_profile_name(),
+        entries: vec![crate::scheduler_artifact::SchedulerArtifactEntry {
+            binary: crate::scheduler_artifact::SchedulerArtifactSpec::Discover(
+                "__package_must_never_reach_cargo__".into(),
+            ),
+            manifest_dir: "/workspace".into(),
+            schedulers: vec!["test-scheduler".into()],
+            path: executable.clone(),
+        }],
+    };
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("serialize manifest"),
+    )
+    .expect("write manifest");
+    let _manifest = EnvVarGuard::set(crate::KTSTR_SCHEDULER_MANIFEST_ENV, &manifest_path);
+
+    for _ in 0..64 {
+        let (path, source) = resolve_scheduler(
+            &SchedulerSpec::Discover("__package_must_never_reach_cargo__"),
+            "/workspace",
+        )
+        .expect("every child resolves the parent artifact");
+        assert_eq!(path.as_deref(), Some(executable.as_path()));
+        assert_eq!(source, ResolveSource::Manifest);
+    }
+}
+
 /// `ResolveSource::as_str` is the load-bearing enum -> persisted-tag
 /// bridge: it produces the snake_case string stamped into
 /// `SidecarResult::resolve_source` (eval/mod.rs stamps it post-run) and
@@ -653,6 +696,7 @@ fn resolve_scheduler_discover_via_env() {
 /// already forces a new variant to add an arm, and this fixes the string.
 #[test]
 fn resolve_source_as_str_tags() {
+    assert_eq!(ResolveSource::Manifest.as_str(), "manifest");
     assert_eq!(ResolveSource::Path.as_str(), "path");
     assert_eq!(ResolveSource::EnvVar.as_str(), "env_var");
     assert_eq!(ResolveSource::PathLookup.as_str(), "path_lookup");

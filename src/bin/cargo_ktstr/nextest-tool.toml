@@ -1,8 +1,9 @@
 # Defaults for nextest invocations orchestrated by cargo-ktstr.
 #
-# This is loaded through nextest's --tool-config-file mechanism, so a
-# repository config, an explicit --config-file, and CLI flags all remain
-# higher priority.
+# This is loaded through nextest's --tool-config-file mechanism. cargo-ktstr
+# also forces this admission count on the command line after removing user
+# run-slot flags, so every orchestrated route has one scheduler: ktstr's
+# machine-wide topology queue.
 
 [profile.default]
 # This is an admission budget, not a native-thread count. Resource-taking

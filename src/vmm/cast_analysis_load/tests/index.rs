@@ -3,108 +3,320 @@ use super::*;
 use goblin::elf::header as h;
 use goblin::elf::section_header as sh;
 use goblin::elf::sym as syms;
+use std::os::unix::fs::MetadataExt as _;
 
-const BUILDER_ELECTION_CHILD_ENV: &str = "KTSTR_CAST_BUILDER_ELECTION_CHILD";
-const BUILDER_ELECTION_GO_ENV: &str = "KTSTR_CAST_BUILDER_ELECTION_GO";
-const BUILDER_ELECTION_RESULT_ENV: &str = "KTSTR_CAST_BUILDER_ELECTION_RESULT";
-const BUILDER_ELECTION_CLAIMS_ENV: &str = "KTSTR_CAST_BUILDER_ELECTION_CLAIMS";
+const CAS_CHILD_ENV: &str = "KTSTR_CAST_CAS_CHILD";
+const CAS_GO_ENV: &str = "KTSTR_CAST_CAS_GO";
+const CAS_SCHEDULER_ENV: &str = "KTSTR_CAST_CAS_SCHEDULER";
+const CAS_EXPECTED_ENV: &str = "KTSTR_CAST_CAS_EXPECTED";
+const CAS_IDENTITIES_ENV: &str = "KTSTR_CAST_CAS_IDENTITIES";
+const CAS_BUILDER_CLAIMS_ENV: &str = "KTSTR_CAST_ANALYSIS_BUILDER_CLAIMS";
+const CAS_EXACT_TEST: &str =
+    "vmm::cast_analysis_load::tests::index::production_cast_cas_is_cross_process";
 
-/// Exact-content misses across independent processes elect one builder. Every
-/// other process blocks on the same lease, reloads the atomic publication, and
-/// returns without entering its build closure.
-#[test]
-fn content_builder_election_is_cross_process() {
-    const HASH: u64 = 0xC457_A11A_5E00_0001;
-    const EXACT_TEST: &str =
-        "vmm::cast_analysis_load::tests::index::content_builder_election_is_cross_process";
+struct CastCasChildren(Vec<(Option<std::process::Child>, std::path::PathBuf)>);
 
-    if std::env::var_os(BUILDER_ELECTION_CHILD_ENV).is_some() {
-        use std::io::Write as _;
-
-        let go = std::path::PathBuf::from(
-            std::env::var_os(BUILDER_ELECTION_GO_ENV).expect("child go path"),
-        );
-        let result_path = std::path::PathBuf::from(
-            std::env::var_os(BUILDER_ELECTION_RESULT_ENV).expect("child result path"),
-        );
-        let claims_path = std::path::PathBuf::from(
-            std::env::var_os(BUILDER_ELECTION_CLAIMS_ENV).expect("child claims path"),
-        );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !go.exists() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for parent start barrier"
-            );
+impl CastCasChildren {
+    fn wait_all_success(&mut self, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while self.0.iter().any(|(child, _)| child.is_some()) {
+            for (child, log_path) in &mut self.0 {
+                let Some(process) = child.as_mut() else {
+                    continue;
+                };
+                if let Some(status) = process.try_wait().expect("poll cast-CAS child") {
+                    let diagnostics = std::fs::read_to_string(log_path).unwrap_or_default();
+                    assert!(
+                        status.success(),
+                        "cast-CAS child exited with {status}:\n{diagnostics}"
+                    );
+                    *child = None;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                let diagnostics = self
+                    .0
+                    .iter()
+                    .filter_map(|(child, log_path)| {
+                        let child = child.as_ref()?;
+                        let log = std::fs::read_to_string(log_path).unwrap_or_default();
+                        Some(format!(
+                            "\n--- live child pid={} log={} ---\n{}",
+                            child.id(),
+                            log_path.display(),
+                            log
+                        ))
+                    })
+                    .collect::<String>();
+                panic!("cast-CAS children exceeded {timeout:?}:{diagnostics}");
+            }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
+    }
+}
 
-        let value = load_or_build_content_entry(
-            HASH,
-            || std::fs::read_to_string(&result_path).ok(),
-            || {
-                let mut claims = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&claims_path)
-                    .expect("open builder claims");
-                writeln!(claims, "{}", std::process::id()).expect("record builder claim");
+impl Drop for CastCasChildren {
+    fn drop(&mut self) {
+        for (process, _) in &mut self.0 {
+            if let Some(process) = process {
+                let _ = process.kill();
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while self.0.iter().any(|(process, _)| process.is_some())
+            && std::time::Instant::now() < deadline
+        {
+            for (process, _) in &mut self.0 {
+                let Some(child) = process.as_mut() else {
+                    continue;
+                };
+                if child.try_wait().ok().flatten().is_some() {
+                    *process = None;
+                }
+            }
+            std::thread::yield_now();
+        }
+    }
+}
 
-                // Keep the lease long enough for every peer to reach the
-                // contended path, then publish via rename exactly like the
-                // production cache writer.
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                let tmp = result_path.with_extension(format!("tmp.{}", std::process::id()));
-                std::fs::write(&tmp, "ready").expect("write staged result");
-                std::fs::rename(&tmp, &result_path).expect("publish staged result");
-                "ready".to_string()
-            },
-        )
-        .expect("acquire content builder lease");
-        assert_eq!(value, "ready");
-        return;
+fn append_one_line(path: &Path, line: &str) {
+    use std::io::Write as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("open cast-CAS result");
+    file.write_all(line.as_bytes())
+        .expect("append cast-CAS result");
+    file.sync_data().expect("sync cast-CAS result");
+}
+
+fn run_cast_cas_child() {
+    let go = std::path::PathBuf::from(std::env::var_os(CAS_GO_ENV).expect("child go path"));
+    let scheduler =
+        std::path::PathBuf::from(std::env::var_os(CAS_SCHEDULER_ENV).expect("scheduler path"));
+    let identities = std::path::PathBuf::from(
+        std::env::var_os(CAS_IDENTITIES_ENV).expect("child identities path"),
+    );
+    let expects_analysis = std::env::var(CAS_EXPECTED_ENV).as_deref() == Ok("positive");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !go.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for cast-CAS start barrier"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 
-    let tmp = tempfile::TempDir::new().expect("builder election tempdir");
-    let cache_root = tmp.path().join("cache");
-    let go = tmp.path().join("go");
-    let result_path = tmp.path().join("result");
-    let claims_path = tmp.path().join("claims");
-    let mut children = Vec::new();
-    for _ in 0..8 {
-        children.push(
+    crate::precompute_cast_analysis(&scheduler).expect("precompute cast analysis");
+    let analysis =
+        cached_cast_analysis_for_scheduler(&scheduler).expect("load cached cast analysis");
+    assert_eq!(
+        analysis.is_some(),
+        expects_analysis,
+        "cached analysis polarity differs from fixture"
+    );
+
+    let pinned = pin_scheduler(&scheduler).expect("pin scheduler after precompute");
+    let object =
+        crate::cache::content::open_content_object(pinned.content_hash, pinned.identity.size)
+            .expect("open cast content object")
+            .expect("precompute must publish the cast content object");
+    let metadata = object.metadata().expect("stat cast content object");
+    append_one_line(
+        &identities,
+        &format!("{}:{}\n", metadata.dev(), metadata.ino()),
+    );
+}
+
+fn run_cast_cas_case(
+    temp: &Path,
+    cache_root: &Path,
+    label: &str,
+    scheduler_bytes: &[u8],
+    expects_analysis: bool,
+) {
+    let scheduler = temp.join(format!("{label}.scheduler"));
+    let go = temp.join(format!("{label}.go"));
+    let claims = temp.join(format!("{label}.claims"));
+    let identities = temp.join(format!("{label}.identities"));
+    std::fs::write(&scheduler, scheduler_bytes).expect("write scheduler fixture");
+
+    let mut children = CastCasChildren(Vec::new());
+    for index in 0..8 {
+        let log_path = temp.join(format!("{label}.{index}.log"));
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&log_path)
+            .expect("create cast-CAS child log");
+        let child =
             std::process::Command::new(std::env::current_exe().expect("current test binary"))
-                .env(BUILDER_ELECTION_CHILD_ENV, "1")
-                .env(crate::KTSTR_CACHE_DIR_ENV, &cache_root)
-                .env(BUILDER_ELECTION_GO_ENV, &go)
-                .env(BUILDER_ELECTION_RESULT_ENV, &result_path)
-                .env(BUILDER_ELECTION_CLAIMS_ENV, &claims_path)
                 .arg("--exact")
-                .arg(EXACT_TEST)
+                .arg(CAS_EXACT_TEST)
                 .arg("--nocapture")
                 .arg("--test-threads=1")
+                .env(CAS_CHILD_ENV, "1")
+                .env(crate::KTSTR_CACHE_DIR_ENV, cache_root)
+                .env(CAS_GO_ENV, &go)
+                .env(CAS_SCHEDULER_ENV, &scheduler)
+                .env(
+                    CAS_EXPECTED_ENV,
+                    if expects_analysis {
+                        "positive"
+                    } else {
+                        "negative"
+                    },
+                )
+                .env(CAS_IDENTITIES_ENV, &identities)
+                .env(CAS_BUILDER_CLAIMS_ENV, &claims)
+                .stdout(std::process::Stdio::from(
+                    log.try_clone().expect("clone cast-CAS child log"),
+                ))
+                .stderr(std::process::Stdio::from(log))
                 .spawn()
-                .expect("spawn builder-election child"),
-        );
+                .expect("spawn cast-CAS child");
+        children.0.push((Some(child), log_path));
     }
-    std::fs::write(&go, b"go").expect("release builder-election children");
+    std::fs::write(&go, b"go").expect("release cast-CAS children");
+    children.wait_all_success(std::time::Duration::from_secs(20));
 
-    for child in children {
-        let output = child
-            .wait_with_output()
-            .expect("wait for builder-election child");
-        assert!(
-            output.status.success(),
-            "builder-election child failed:\n{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let claims = std::fs::read_to_string(&claims_path).expect("read builder claims");
+    let claims = std::fs::read_to_string(&claims).expect("read cast builder claims");
     assert_eq!(
         claims.lines().count(),
         1,
-        "exactly one process may execute the build closure; claims:\n{claims}"
+        "exactly one process must analyze {label}; claims:\n{claims}"
+    );
+    let identities = std::fs::read_to_string(&identities).expect("read cast object identities");
+    let unique_identities = identities
+        .lines()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        identities.lines().count(),
+        8,
+        "every {label} child must report its CAS inode:\n{identities}"
+    );
+    assert_eq!(
+        unique_identities.len(),
+        1,
+        "every {label} process must open the same immutable CAS inode:\n{identities}"
+    );
+}
+
+/// Real precompute and lazy-load calls across independent processes elect one
+/// analysis builder and converge on one immutable scheduler CAS inode. The
+/// positive fixture exercises MAP_PRIVATE parsing; the negative fixture proves
+/// empty analyses publish once and hit without reparsing.
+#[test]
+fn production_cast_cas_is_cross_process() {
+    if std::env::var_os(CAS_CHILD_ENV).is_some() {
+        run_cast_cas_child();
+        return;
+    }
+
+    let temp = tempfile::TempDir::new().expect("cast-CAS tempdir");
+    let cache_root = temp.path().join("cache");
+    run_cast_cas_case(
+        temp.path(),
+        &cache_root,
+        "positive",
+        &build_recovers_arena_cast_outer_elf(),
+        true,
+    );
+    let negative = build_elf64(
+        vec![
+            SecSpec::new(".text", sh::SHT_PROGBITS)
+                .flags(sh::SHF_EXECINSTR.into())
+                .data(vec![0; 16]),
+        ],
+        h::EM_X86_64,
+        h::ET_EXEC,
+    );
+    run_cast_cas_case(temp.path(), &cache_root, "negative", &negative, false);
+}
+
+#[test]
+fn loaded_analysis_survives_source_replacement_via_pinned_cas() {
+    let _env_lock = crate::test_support::test_helpers::lock_env();
+    let _cache = crate::test_support::test_helpers::isolated_cache_dir();
+    let temp = tempfile::TempDir::new().expect("cast source replacement tempdir");
+    let scheduler = temp.path().join("scheduler");
+    std::fs::write(&scheduler, build_recovers_arena_cast_outer_elf()).expect("write scheduler");
+
+    let first = pin_scheduler(&scheduler).expect("pin first scheduler");
+    ensure_persisted_analysis(&first).expect("populate cast analysis");
+    let second = pin_scheduler(&scheduler).expect("pin second scheduler");
+    let coordinated = ensure_persisted_analysis(&second).expect("load cast analysis");
+    assert!(
+        matches!(&coordinated, CoordinatedAnalysis::Loaded { .. }),
+        "the second lookup must use the persisted analysis"
+    );
+
+    let replacement = temp.path().join("replacement");
+    std::fs::write(&replacement, b"not the scheduler").expect("write replacement");
+    std::fs::rename(&replacement, &scheduler).expect("replace scheduler path");
+    assert!(
+        materialize_analysis(coordinated)
+            .expect("materialize pinned CAS analysis")
+            .is_some(),
+        "the loaded record must parse its already-open CAS inode"
+    );
+}
+
+#[test]
+fn persisted_analysis_hit_rejects_restored_mtime_source_rewrite() {
+    use std::io::Write as _;
+    use std::os::fd::AsRawFd as _;
+
+    let _env_lock = crate::test_support::test_helpers::lock_env();
+    let _cache = crate::test_support::test_helpers::isolated_cache_dir();
+    let temp = tempfile::TempDir::new().expect("cast stale-hit tempdir");
+    let scheduler = temp.path().join("scheduler");
+    let original = build_recovers_arena_cast_outer_elf();
+    std::fs::write(&scheduler, &original).expect("write scheduler");
+
+    let first = pin_scheduler(&scheduler).expect("pin first scheduler");
+    ensure_persisted_analysis(&first).expect("populate cast analysis");
+    let stale = pin_scheduler(&scheduler).expect("pin scheduler before rewrite");
+
+    let mut replacement = original;
+    let last = replacement.last_mut().expect("ELF fixture is nonempty");
+    *last ^= 0x5a;
+    let mut writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&scheduler)
+        .expect("open scheduler for in-place rewrite");
+    writer
+        .write_all(&replacement)
+        .expect("rewrite scheduler in place");
+    writer.sync_all().expect("sync scheduler rewrite");
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: stale.identity.mtime_secs,
+            tv_nsec: stale.identity.mtime_nsecs,
+        },
+    ];
+    // SAFETY: writer is live and times points at exactly two valid timespecs.
+    assert_eq!(
+        unsafe { libc::futimens(writer.as_raw_fd(), times.as_ptr()) },
+        0,
+        "restore scheduler mtime: {}",
+        std::io::Error::last_os_error(),
+    );
+
+    let error = match ensure_persisted_analysis(&stale) {
+        Ok(_) => panic!("analysis hit must validate the pinned scheduler content"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error:#}").contains("does not match the pinned source"),
+        "unexpected stale analysis rejection: {error:#}",
     );
 }
 
@@ -604,17 +816,18 @@ fn build_cast_analysis_indexes_cross_object_struct_body() {
 
 // ----- LazyCastMap full-output accessor -------------------------
 
-/// `LazyCastMap::new(None).get_full()` returns `None` without
+/// `LazyCastMap::new(None).get_full()` returns `Ok(None)` without
 /// touching the filesystem or the process-wide cache. Matches
-/// the no-scheduler dump-path contract (every `u64` renders as
-/// a plain counter) for the production [`Self::get_full`]
+/// the no-scheduler dump-path contract for the production [`Self::get_full`]
 /// accessor that returns the full [`CastAnalysisOutput`]
 /// including the cross-BTF Fwd index.
 #[test]
 fn lazy_cast_map_get_full_returns_none_when_no_scheduler() {
     let lazy = LazyCastMap::new(None);
     assert!(
-        lazy.get_full().is_none(),
+        lazy.get_full()
+            .expect("no scheduler is a valid semantic negative")
+            .is_none(),
         "no-scheduler builder must short-circuit `.get_full()` to None",
     );
 }
@@ -665,6 +878,7 @@ fn cached_cast_analysis_concurrent_callers_share_one_oncelock_init() {
                     // the cache lookup.
                     barrier.wait();
                     cached_cast_analysis_for_scheduler(&path)
+                        .expect("cast-analysis infrastructure")
                         .expect("non-empty fixture must produce Some")
                 })
             })

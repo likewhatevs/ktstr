@@ -2992,6 +2992,25 @@ pub struct SchedulerListEntry {
     pub test_count: usize,
 }
 
+/// One exact scheduler executable requirement reported by a warmed test
+/// binary.
+///
+/// The artifact identity is `(binary_kind, manifest_dir)`. Repeated primary
+/// and staged uses collapse into one entry, while `use_count` records how many
+/// registry edges require it and `schedulers` retains every declared name
+/// sharing the executable.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SchedulerArtifactRequirement {
+    /// `Discover(package)` or `Path(path)`. Kernel-only schedulers are omitted.
+    pub binary_kind: BinaryKindJson,
+    /// Exact declaring `CARGO_MANIFEST_DIR`.
+    pub manifest_dir: String,
+    /// Sorted, unique scheduler names using the executable.
+    pub schedulers: Vec<String>,
+    /// Number of primary plus staged references across [`KTSTR_TESTS`].
+    pub use_count: usize,
+}
+
 /// A single `#[ktstr_test]` paired with its declared scheduler's name. Emitted
 /// (as a JSON array) by the `--ktstr-list-scheduler-tests` probe so `--relevant`
 /// can map each test to its scheduler and select the tests whose scheduler a
@@ -3019,6 +3038,55 @@ pub enum BinaryKindJson {
     Eevdf,
     /// Built into the kernel (e.g. `scx_simple` enabled via sysfs). No userspace binary.
     KernelBuiltin,
+}
+
+fn collect_scheduler_artifact_requirements<'a>(
+    schedulers: impl IntoIterator<Item = &'a Scheduler>,
+) -> Vec<SchedulerArtifactRequirement> {
+    struct Accumulator {
+        binary_kind: BinaryKindJson,
+        manifest_dir: String,
+        schedulers: std::collections::BTreeSet<String>,
+        use_count: usize,
+    }
+
+    let mut requirements: std::collections::BTreeMap<(u8, String, String), Accumulator> =
+        std::collections::BTreeMap::new();
+    for scheduler in schedulers {
+        let (kind_order, value, binary_kind) = match scheduler.binary {
+            SchedulerSpec::Discover(package) => (
+                0,
+                package.to_string(),
+                BinaryKindJson::Discover(package.to_string()),
+            ),
+            SchedulerSpec::Path(path) => (
+                1,
+                path.to_string(),
+                BinaryKindJson::Path(path.to_string()),
+            ),
+            SchedulerSpec::Eevdf | SchedulerSpec::KernelBuiltin { .. } => continue,
+        };
+        let manifest_dir = scheduler.manifest_dir.to_string();
+        let accumulator = requirements
+            .entry((kind_order, value, manifest_dir.clone()))
+            .or_insert_with(|| Accumulator {
+                binary_kind,
+                manifest_dir,
+                schedulers: std::collections::BTreeSet::new(),
+                use_count: 0,
+            });
+        accumulator.schedulers.insert(scheduler.name.to_string());
+        accumulator.use_count += 1;
+    }
+    requirements
+        .into_values()
+        .map(|requirement| SchedulerArtifactRequirement {
+            binary_kind: requirement.binary_kind,
+            manifest_dir: requirement.manifest_dir,
+            schedulers: requirement.schedulers.into_iter().collect(),
+            use_count: requirement.use_count,
+        })
+        .collect()
 }
 
 /// JSON-friendly mirror of `Topology` for the verifier wire format.
@@ -3294,6 +3362,33 @@ fn __ktstr_list_schedulers() {
         })
         .collect();
     let json = ::serde_json::to_string(&entries).expect("serialize schedulers");
+    println!("{json}");
+    std::process::exit(0);
+}
+}
+
+::ctor::declarative::ctor! {
+/// Ctor that reports every scheduler executable referenced by this binary's
+/// [`KTSTR_TESTS`] registry.
+///
+/// Both each test's primary scheduler and every `staged_schedulers` entry are
+/// included. `Path` and `Discover` requirements are deduplicated by exact
+/// binary specification plus declaring manifest directory; kernel-only
+/// schedulers are omitted. The `cargo ktstr` parent uses this probe to make
+/// one strict artifact manifest complete before any nextest child starts.
+#[ctor(unsafe)]
+fn __ktstr_list_scheduler_artifact_requirements() {
+    if !std::env::args().any(|argument| {
+        argument == "--ktstr-list-scheduler-artifact-requirements"
+    }) {
+        return;
+    }
+    let schedulers = KTSTR_TESTS.iter().flat_map(|entry| {
+        std::iter::once(entry.scheduler).chain(entry.staged_schedulers.iter().copied())
+    });
+    let requirements = collect_scheduler_artifact_requirements(schedulers);
+    let json =
+        ::serde_json::to_string(&requirements).expect("serialize scheduler artifact requirements");
     println!("{json}");
     std::process::exit(0);
 }
@@ -7188,6 +7283,40 @@ mod tests {
         let back: SchedulerListEntry =
             serde_json::from_str(&text).expect("deserialize SchedulerListEntry");
         assert_eq!(back, entry, "SchedulerListEntry must round-trip unchanged");
+    }
+
+    #[test]
+    fn scheduler_artifact_requirements_dedupe_primary_and_staged_uses() {
+        let first = Scheduler::named("first")
+            .binary_discover("scx_shared")
+            .manifest_dir("/workspace");
+        let alias = Scheduler::named("alias")
+            .binary_discover("scx_shared")
+            .manifest_dir("/workspace");
+        let path = Scheduler::named("path")
+            .binary(SchedulerSpec::Path("/opt/scx_path"))
+            .manifest_dir("/other");
+        let requirements =
+            collect_scheduler_artifact_requirements([&first, &alias, &first, &path]);
+        assert_eq!(requirements.len(), 2);
+        assert_eq!(
+            requirements[0],
+            SchedulerArtifactRequirement {
+                binary_kind: BinaryKindJson::Discover("scx_shared".into()),
+                manifest_dir: "/workspace".into(),
+                schedulers: vec!["alias".into(), "first".into()],
+                use_count: 3,
+            },
+        );
+        assert_eq!(
+            requirements[1],
+            SchedulerArtifactRequirement {
+                binary_kind: BinaryKindJson::Path("/opt/scx_path".into()),
+                manifest_dir: "/other".into(),
+                schedulers: vec!["path".into()],
+                use_count: 1,
+            },
+        );
     }
 
     /// [`SchedulerTestJson`] — the `--ktstr-list-scheduler-tests` wire element

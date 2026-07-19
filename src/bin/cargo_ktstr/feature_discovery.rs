@@ -323,8 +323,11 @@ fn rebase_inline_config_path(value: &str, invocation_dir: &Path) -> Option<Strin
     } else {
         return None;
     };
-    let non_executable_path =
-        key.ends_with(".path") || matches!(key, "build.target-dir" | "build.dep-info-basedir");
+    let non_executable_path = key.ends_with(".path")
+        || matches!(
+            key,
+            "build.target-dir" | "build.build-dir" | "build.dep-info-basedir"
+        );
     let executable_path = matches!(
         key,
         "build.rustc"
@@ -2306,6 +2309,24 @@ unrelated-mode = []
                 "--ignore-rust-version",
             ]),
             "scheduler builds replay only resolution/platform controls, never consumer features",
+        );
+    }
+
+    #[test]
+    fn cargo_build_dir_config_is_rebased_with_scheduler_current_dir() {
+        assert_eq!(
+            rebase_config_value(
+                "build.build-dir='artifacts/build'",
+                Some(Path::new("/invoke")),
+            ),
+            r#"build.build-dir="/invoke/artifacts/build""#,
+        );
+        assert_eq!(
+            rebase_config_value(
+                r#"build.build-dir="/absolute/build""#,
+                Some(Path::new("/invoke")),
+            ),
+            r#"build.build-dir="/absolute/build""#,
         );
     }
 

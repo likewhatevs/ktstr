@@ -13,14 +13,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::console;
 use super::host_comms::BulkDrainResult;
 use super::kvm;
 use super::pi_mutex::PiMutex;
-use super::vcpu::{VcpuThread, WatchpointArm};
+use super::vcpu::WatchpointArm;
 use super::virtio_blk::{VirtioBlkCounters, VirtioBlkCountersSnapshot};
 use super::virtio_net::{VirtioNetCounters, VirtioNetCountersSnapshot};
 use super::wire;
@@ -1833,20 +1832,20 @@ pub(crate) struct VmRunState {
     /// Run-relative ns of the periodic capture-window end (0 = the
     /// window never resolved) → [`VmResult::periodic_window_end`].
     pub(crate) periodic_window_end_ns_raw: u64,
+    /// Framework/infrastructure failure raised after the VM had already
+    /// started. `collect_results` performs the complete teardown first, then
+    /// returns this as a marker-typed error which cannot be inverted by
+    /// `expect_err` or classified as a resource skip.
+    pub(crate) framework_error: Option<String>,
     /// Event-anchored per-phase dilation + Body contention intervals,
     /// finalized from live proc entries plus one-shot AP exit snapshots.
     pub(crate) contention_witness: Option<ContentionWitness>,
-    pub(crate) ap_threads: Vec<VcpuThread>,
-    pub(crate) monitor_handle: Option<JoinHandle<monitor::reader::MonitorLoopResult>>,
-    pub(crate) bpf_write_handle: Option<JoinHandle<()>>,
-    /// Freeze coordinator handle, always `None` in the
-    /// production path: [`super::KtstrVm::run_vm`] joins the coordinator
-    /// before returning so no coordinator work survives the VM run. Captured
-    /// `ImmediateExitHandle`s are independently memory-safe because each
-    /// access upgrades a Weak reference to the owner's secondary shared
-    /// kvm_run mapping. The optional shape is preserved for test-only or
-    /// alternative orchestration paths.
-    pub(crate) freeze_coordinator: Option<JoinHandle<()>>,
+    /// Armed owner for every AP, monitor, and BPF-map-writer thread which can
+    /// retain a raw view of guest memory. It moves directly from `run_vm` into
+    /// this handoff state without a naked-JoinHandle interval. Its Drop runs
+    /// before `vm` (field declaration order), so an unwind or an abandoned
+    /// `VmRunState` still bounded-joins all readers before guest memory unmaps.
+    pub(crate) run_threads: super::freeze_coord::RunVmThreadGuard,
     pub(crate) com1: Arc<PiMutex<console::Serial>>,
     pub(crate) com2: Arc<PiMutex<console::Serial>>,
     pub(crate) kill: Arc<AtomicBool>,

@@ -52,6 +52,19 @@ use super::virtio_console;
 #[cfg(target_arch = "x86_64")]
 use super::x86_64::{acpi, boot, kvm, mptable};
 
+fn framework_infrastructure<T>(result: Result<T>) -> Result<T> {
+    result.context(crate::test_support::FrameworkInfrastructureFailure)
+}
+
+fn join_prepared_base(handle: JoinHandle<Result<PreparedBase>>) -> Result<PreparedBase> {
+    framework_infrastructure(
+        handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))
+            .and_then(|result| result),
+    )
+}
+
 /// Host-side handles for the x86_64 virtio-net PCI device. The device
 /// core lives inside the [`pci::PciBus`] function; these are the pieces
 /// the run loop keeps alive and exposes.
@@ -1446,15 +1459,18 @@ impl KtstrVm {
                 for (index, staged) in staged_schedulers.iter().enumerate() {
                     extras.push((staged_extras_names[index].as_str(), staged.binary.as_path()));
                 }
-                let inputs = prepare_base_inputs(
-                    &payload,
-                    &extras,
-                    &merged_includes,
-                    busybox_bytes.as_deref(),
-                )?;
-                get_or_prepare_base(inputs, compression)
+                framework_infrastructure(
+                    prepare_base_inputs(
+                        &payload,
+                        &extras,
+                        &merged_includes,
+                        busybox_bytes.as_deref(),
+                    )
+                    .and_then(|inputs| get_or_prepare_base(inputs, compression)),
+                )
             })
-            .context("spawn initramfs-resolve thread")?;
+            .context("spawn initramfs-resolve thread")
+            .context(crate::test_support::FrameworkInfrastructureFailure)?;
         Ok(Some(handle))
     }
 
@@ -1467,6 +1483,15 @@ impl KtstrVm {
     /// any partial overlay. VM drop order is structural: `_reservation`
     /// unmaps the COW VMAs before the guards release their locks.
     fn load_prepared_initrd(
+        &self,
+        vm: &mut kvm::KtstrKvm,
+        prepared: PreparedInitrd,
+        load_addr: u64,
+    ) -> Result<u32> {
+        framework_infrastructure(self.load_prepared_initrd_inner(vm, prepared, load_addr))
+    }
+
+    fn load_prepared_initrd_inner(
         &self,
         vm: &mut kvm::KtstrKvm,
         prepared: PreparedInitrd,
@@ -1611,13 +1636,14 @@ impl KtstrVm {
         load_addr: u64,
     ) -> Result<(Option<u64>, Option<u32>)> {
         let t0 = Instant::now();
-        let prepared_base = handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
+        let prepared_base = join_prepared_base(handle)?;
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "initramfs_join");
 
         let t0 = Instant::now();
-        let prepared = complete_prepared_initrd(prepared_base, &self.suffix_params())?;
+        let prepared = framework_infrastructure(complete_prepared_initrd(
+            prepared_base,
+            &self.suffix_params(),
+        ))?;
         let uncompressed_size = prepared.uncompressed_len();
         let compressed_size = prepared.compressed_len();
         tracing::debug!(
@@ -1682,13 +1708,14 @@ impl KtstrVm {
         handle: JoinHandle<Result<PreparedBase>>,
     ) -> Result<(PreparedInitrd, u32)> {
         let t0 = Instant::now();
-        let prepared_base = handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
+        let prepared_base = join_prepared_base(handle)?;
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "initramfs_join");
 
         let t0 = Instant::now();
-        let prepared = complete_prepared_initrd(prepared_base, &self.suffix_params())?;
+        let prepared = framework_infrastructure(complete_prepared_initrd(
+            prepared_base,
+            &self.suffix_params(),
+        ))?;
         let uncompressed_size = prepared.uncompressed_len();
         let compressed_size = prepared.compressed_len();
         tracing::debug!(
@@ -2278,13 +2305,14 @@ impl KtstrVm {
         memory_mib: u32,
     ) -> Result<(Option<u64>, Option<u32>)> {
         let t0 = Instant::now();
-        let prepared_base = handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
+        let prepared_base = join_prepared_base(handle)?;
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "initramfs_join");
 
         let t0 = Instant::now();
-        let prepared = complete_prepared_initrd(prepared_base, &self.suffix_params())?;
+        let prepared = framework_infrastructure(complete_prepared_initrd(
+            prepared_base,
+            &self.suffix_params(),
+        ))?;
         let uncompressed_size = prepared.uncompressed_len();
         let compressed_size = prepared.compressed_len();
         tracing::debug!(
@@ -2343,13 +2371,14 @@ impl KtstrVm {
         handle: JoinHandle<Result<PreparedBase>>,
     ) -> Result<(PreparedInitrd, u32, u64)> {
         let t0 = Instant::now();
-        let prepared_base = handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
+        let prepared_base = join_prepared_base(handle)?;
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "initramfs_join");
 
         let t0 = Instant::now();
-        let prepared = complete_prepared_initrd(prepared_base, &self.suffix_params())?;
+        let prepared = framework_infrastructure(complete_prepared_initrd(
+            prepared_base,
+            &self.suffix_params(),
+        ))?;
         let uncompressed_size = prepared.uncompressed_len();
         let compressed_size = prepared.compressed_len();
         tracing::debug!(

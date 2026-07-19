@@ -93,6 +93,7 @@ pub use eval::{
     capture_starvation_witness, periodic_starvation_gate, post_vm_skip, stall_ejection_skip,
     starved_below_minimum_skip,
 };
+pub(crate) use eval::FrameworkInfrastructureFailure;
 pub use profraw::current_binary_is_coverage_instrumented;
 pub mod runtime;
 mod shell_descriptor;
@@ -158,14 +159,29 @@ pub use dispatch::{
 pub use entry::{
     BinaryKindJson, BpfMapAgg, BpfMapWrite, CgroupPath, KTSTR_SCHEDULERS, KTSTR_TESTS,
     KtstrTestEntry, MemSideCache, NumaDistance, NumaNode, PerfDeltaAssertion, Scheduler,
-    SchedulerJson, SchedulerListEntry, SchedulerSpec, SchedulerTestJson, Sysctl, SysctlJson,
-    Topology, TopologyConstraints, TopologyConstraintsJson, TopologyJson, WatchBpfMap,
-    default_post_vm_periodic_fired, find_scheduler, find_test,
+    SchedulerArtifactRequirement, SchedulerJson, SchedulerListEntry, SchedulerSpec,
+    SchedulerTestJson, Sysctl, SysctlJson, Topology, TopologyConstraints,
+    TopologyConstraintsJson, TopologyJson, WatchBpfMap, default_post_vm_periodic_fired,
+    find_scheduler, find_test,
 };
 pub use eval::{KernelUnavailable, ResolveSource, resolve_scheduler, resolve_test_kernel};
 pub(crate) use eval::{record_skip_sidecar, run_ktstr_test_inner};
 pub(crate) use host_class::host_skip_class;
 pub use host_class::{HostClass, classify_host_error};
+
+/// True when an error is a ktstr framework/CAS/COW infrastructure failure
+/// which must never be reinterpreted as host insufficiency or inverted by an
+/// `expect_err` test.
+///
+/// This hidden public predicate is consumed by proc-macro-generated libtest
+/// wrappers in downstream crates, where the private marker type itself cannot
+/// be named.
+#[doc(hidden)]
+pub fn is_framework_infrastructure_failure(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<eval::FrameworkInfrastructureFailure>()
+        .is_some()
+}
 pub use metrics::{
     MAX_WALK_DEPTH, WALK_TRUNCATION_SENTINEL_NAME, extract_metrics, is_truncation_sentinel_name,
     walk_json_leaves,

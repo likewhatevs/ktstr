@@ -160,6 +160,23 @@ pub fn acquire_build_reservation_waiting_interruptible(
     acquire_build_reservation_impl(cli_label, cpu_cap, true, Some(cancelled))
 }
 
+/// Cancellation-aware harness-build reservation with synchronous wait ticks.
+///
+/// `progress` runs on the acquiring thread while an ordinary v4 ticket is
+/// parked or its elected coordinator is blocked in inotify. The protocol only
+/// slices those blocking syscalls; reservation ordering, retry deadlines, and
+/// liveness deadlines are unchanged.
+pub fn acquire_build_reservation_waiting_interruptible_with_progress(
+    cli_label: &str,
+    cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
+    cancelled: &std::sync::atomic::AtomicBool,
+    progress: impl FnMut() + 'static,
+) -> Result<BuildReservation> {
+    crate::vmm::host_topology::with_reservation_wait_progress(progress, || {
+        acquire_build_reservation_impl(cli_label, cpu_cap, true, Some(cancelled))
+    })
+}
+
 fn acquire_build_reservation_impl(
     cli_label: &str,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,

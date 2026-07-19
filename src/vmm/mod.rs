@@ -680,14 +680,13 @@ pub struct KtstrVm {
     /// recover Fwd-pointee bodies via
     /// [`crate::monitor::btf_render::MemReader::cross_btf_resolve_fwd`].
     ///
-    /// `.get_full()` returns `None` for every degraded case (no
-    /// scheduler binary, file read failed, analyzer surfaced an
-    /// empty cast map AND empty cross-BTF index — no `.bpf.objs`,
-    /// BTF parse failure, no recovered casts and no complete
-    /// struct/union definitions). All `None` paths render every
-    /// `u64` as a plain unsigned counter and skip Fwd pointee
-    /// chases with the legacy "forward declaration" skip path,
-    /// matching the pre-integration default.
+    /// `.get_full()` returns `Ok(None)` only when there is no scheduler
+    /// binary or analysis completed with an empty cast map AND empty cross-BTF
+    /// index (no `.bpf.objs`, BTF parse failure, no recovered casts, and no
+    /// complete struct/union definitions). Cache, coordination, publication,
+    /// mapping, and scheduler-file failures return `Err`; the freeze
+    /// coordinator records a degraded capture and fails the VM run rather than
+    /// silently selecting a different renderer.
     pub(crate) cast_map: std::sync::Arc<crate::vmm::cast_analysis_load::LazyCastMap>,
 }
 

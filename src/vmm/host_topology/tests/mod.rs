@@ -1,5 +1,31 @@
 use super::*;
 
+#[test]
+fn reservation_wait_progress_hook_is_synchronous_and_scoped() {
+    let ticks = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let callback_ticks = std::rc::Rc::clone(&ticks);
+    assert!(reservation_wait_progress_poll().is_none());
+
+    let value = with_reservation_wait_progress(
+        move || callback_ticks.set(callback_ticks.get() + 1),
+        || {
+            assert_eq!(
+                reservation_wait_progress_poll(),
+                Some(RESERVATION_WAIT_PROGRESS_POLL),
+            );
+            tick_reservation_wait_progress();
+            17
+        },
+    );
+
+    assert_eq!(value, 17);
+    assert_eq!(ticks.get(), 1);
+    assert!(
+        reservation_wait_progress_poll().is_none(),
+        "the callback cannot leak into a later acquisition",
+    );
+}
+
 // ─── SYNTHETIC-TOPOLOGY OFFSET CONVENTION ────────────────────
 //
 // Flock-path tests in this module install a per-test lockfile

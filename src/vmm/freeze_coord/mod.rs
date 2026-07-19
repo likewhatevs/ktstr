@@ -551,13 +551,28 @@ fn extend_watchdog_reset_for_grace(
 ) {
     let target = run_start.elapsed().saturating_add(grace);
     let encoded = u64::try_from(target.as_nanos()).unwrap_or(u64::MAX).max(1);
-    if encoded > reset_ns.load(Ordering::Acquire) {
-        reset_ns.store(encoded, Ordering::Release);
+    if update_watchdog_reset_max(reset_ns, encoded) {
         // Stamp provenance whenever we win the max-style store, so the
         // watchdog dump attributes this deadline to the grace and not
         // to a stale earlier writer. Relaxed is fine — diagnostic only.
         reset_tag.store(WatchdogResetTag::WprofGrace as u8, Ordering::Relaxed);
     }
+}
+
+/// Atomically extend a watchdog reset deadline without ever shrinking it.
+///
+/// The monitor's scheduler-attach fallback races this writer with a
+/// `compare_exchange(0, attach_deadline)`. A load/compare followed by a plain
+/// store is not a max operation: it can read zero, lose the CAS race, and then
+/// overwrite the longer attach deadline with a shorter grace deadline before
+/// the watchdog samples either value. `fetch_max` gives the two writers one
+/// linearization order. The return value identifies whether this writer
+/// actually changed the deadline, which gates its diagnostic provenance tag.
+fn update_watchdog_reset_max(
+    reset_ns: &std::sync::atomic::AtomicU64,
+    candidate_ns: u64,
+) -> bool {
+    candidate_ns > reset_ns.fetch_max(candidate_ns, Ordering::AcqRel)
 }
 
 /// Arm the wprof-ship grace: extend the watchdog reset deadline to cover
@@ -582,6 +597,83 @@ fn arm_wprof_grace(
 /// to every deadline derived from this one.
 fn watchdog_hard_deadline(run_start: Instant, timeout: Duration) -> Instant {
     run_start + timeout
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchdogWakeSetupStage {
+    TimerFdCreate,
+    TimerFdArm,
+    EpollCreate,
+    EpollAddTick,
+    EpollAddKill,
+    EpollAddBspDone,
+}
+
+struct WatchdogWake {
+    tick_tfd: TimerFd,
+    epoll: Epoll,
+}
+
+fn inject_watchdog_wake_setup_failure(
+    fault: Option<WatchdogWakeSetupStage>,
+    stage: WatchdogWakeSetupStage,
+) -> Result<()> {
+    if fault == Some(stage) {
+        anyhow::bail!("injected watchdog wake setup failure at {stage:?}");
+    }
+    Ok(())
+}
+
+/// Construct and register every watchdog wake source synchronously.
+///
+/// This runs on the VM owner before the watchdog thread is spawned and before
+/// the BSP enters `KVM_RUN`. Any resource/setup failure therefore propagates
+/// through `run_vm` and its teardown guard instead of starting a VM whose only
+/// outer deadline silently disappeared inside the watchdog thread.
+fn prepare_watchdog_wake(
+    kill_evt: &EventFd,
+    bsp_done_evt: &EventFd,
+    fault: Option<WatchdogWakeSetupStage>,
+) -> Result<WatchdogWake> {
+    inject_watchdog_wake_setup_failure(fault, WatchdogWakeSetupStage::TimerFdCreate)?;
+    let mut tick_tfd = TimerFd::new().context("create watchdog timerfd")?;
+    let tick = Duration::from_millis(100);
+    inject_watchdog_wake_setup_failure(fault, WatchdogWakeSetupStage::TimerFdArm)?;
+    tick_tfd
+        .reset(tick, Some(tick))
+        .context("arm watchdog timerfd")?;
+
+    inject_watchdog_wake_setup_failure(fault, WatchdogWakeSetupStage::EpollCreate)?;
+    let epoll = Epoll::new().context("create watchdog epoll")?;
+    let tick_fd = tick_tfd.as_raw_fd();
+    for (stage, fd, name) in [
+        (
+            WatchdogWakeSetupStage::EpollAddTick,
+            tick_fd,
+            "watchdog timerfd",
+        ),
+        (
+            WatchdogWakeSetupStage::EpollAddKill,
+            kill_evt.as_raw_fd(),
+            "watchdog kill eventfd",
+        ),
+        (
+            WatchdogWakeSetupStage::EpollAddBspDone,
+            bsp_done_evt.as_raw_fd(),
+            "watchdog BSP-done eventfd",
+        ),
+    ] {
+        inject_watchdog_wake_setup_failure(fault, stage)?;
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                fd,
+                EpollEvent::new(EventSet::IN, fd as u64),
+            )
+            .with_context(|| format!("register {name} with watchdog epoll"))?;
+    }
+
+    Ok(WatchdogWake { tick_tfd, epoll })
 }
 
 /// Apply the attach-overlay gate at the watchdog caller, before ordinary
@@ -618,10 +710,13 @@ mod watchdog_reset_tag_tests {
     use super::{
         DeadmanEvidence, KillReasonTag, WatchdogResetTag, decode_guest_phase,
         decode_watchdog_kill_reason, ordinary_watchdog_boundary_should_fire,
-        watchdog_hard_deadline,
+        prepare_watchdog_wake, update_watchdog_reset_max, watchdog_hard_deadline,
+        WatchdogWakeSetupStage,
     };
-    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
+    use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
     #[test]
     fn attach_overlay_gates_tier3_and_soft_prefire_at_the_caller() {
@@ -801,6 +896,92 @@ mod watchdog_reset_tag_tests {
             WatchdogResetTag::from_u8(reset_tag.load(Ordering::Relaxed)),
             WatchdogResetTag::ScxRootLatch,
         );
+    }
+
+    /// The monitor's attach fallback and the grace extender have exactly two
+    /// legal linearization orders. If attach wins first, the shorter grace
+    /// cannot overwrite it and cannot claim the provenance tag.
+    #[test]
+    fn attach_cas_wins_before_shorter_grace_max() {
+        let reset_ns = Arc::new(AtomicU64::new(0));
+        let attach_deadline = 50_000;
+        let grace_deadline = 10_000;
+        let attach_done = Arc::new(std::sync::Barrier::new(2));
+
+        let reset_for_attach = Arc::clone(&reset_ns);
+        let attach_done_for_thread = Arc::clone(&attach_done);
+        let attach = std::thread::spawn(move || {
+            reset_for_attach
+                .compare_exchange(
+                    0,
+                    attach_deadline,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .expect("attach CAS wins from zero");
+            attach_done_for_thread.wait();
+        });
+        attach_done.wait();
+
+        assert!(
+            !update_watchdog_reset_max(reset_ns.as_ref(), grace_deadline),
+            "a shorter grace did not win the max update"
+        );
+        assert_eq!(reset_ns.load(Ordering::Acquire), attach_deadline);
+        attach.join().expect("attach writer");
+    }
+
+    /// In the opposite legal order the grace wins from zero and the monitor's
+    /// attach-only CAS must fail. Together with the preceding test this pins
+    /// the atomic arbitration which excludes the old load/CAS/store
+    /// non-linearizable shrink interleaving.
+    #[test]
+    fn grace_max_wins_before_attach_cas() {
+        let reset_ns = AtomicU64::new(0);
+        let grace_deadline = 10_000;
+        let attach_deadline = 50_000;
+
+        assert!(update_watchdog_reset_max(&reset_ns, grace_deadline));
+        assert_eq!(
+            reset_ns.compare_exchange(
+                0,
+                attach_deadline,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ),
+            Err(grace_deadline),
+        );
+        assert_eq!(reset_ns.load(Ordering::Acquire), grace_deadline);
+    }
+
+    /// Every fallible watchdog wake setup stage returns an error before the
+    /// caller can cross its BSP-start boundary. A future syscall addition must
+    /// join this table or it will lack deterministic failure coverage.
+    #[test]
+    fn watchdog_wake_setup_faults_propagate_before_bsp_start() {
+        let kill_evt = EventFd::new(EFD_NONBLOCK).expect("kill eventfd");
+        let bsp_done_evt = EventFd::new(EFD_NONBLOCK).expect("BSP-done eventfd");
+
+        for stage in [
+            WatchdogWakeSetupStage::TimerFdCreate,
+            WatchdogWakeSetupStage::TimerFdArm,
+            WatchdogWakeSetupStage::EpollCreate,
+            WatchdogWakeSetupStage::EpollAddTick,
+            WatchdogWakeSetupStage::EpollAddKill,
+            WatchdogWakeSetupStage::EpollAddBspDone,
+        ] {
+            let bsp_started = AtomicBool::new(false);
+            let result = (|| -> anyhow::Result<()> {
+                let _wake = prepare_watchdog_wake(&kill_evt, &bsp_done_evt, Some(stage))?;
+                bsp_started.store(true, Ordering::Release);
+                Ok(())
+            })();
+            assert!(result.is_err(), "{stage:?} injection must propagate");
+            assert!(
+                !bsp_started.load(Ordering::Acquire),
+                "{stage:?} failure must precede BSP entry"
+            );
+        }
     }
 
     /// A late-scheduled watchdog must not receive a fresh timeout budget when
@@ -2236,17 +2417,6 @@ mod ap_join_accounting_tests {
     }
 }
 
-/// Handles reclaimed from [`RunVmThreadGuard::disarm`] on the Ok path so the
-/// normal teardown owns them again (join the watchdog + coordinator before
-/// `bsp` drops; move the vCPU / monitor / bpf-write handles onto `VmRunState`).
-struct RunVmHandles {
-    ap_threads: Vec<VcpuThread>,
-    monitor: Option<JoinHandle<monitor::reader::MonitorLoopResult>>,
-    bpf_write: Option<JoinHandle<()>>,
-    freeze_coord: Option<JoinHandle<()>>,
-    watchdog: Option<JoinHandle<()>>,
-}
-
 /// An AP-ready boot gate timed out (or was cut short by `kill`) with one or
 /// more AP host threads not yet in `KVM_RUN`. The progressive gate runs inside
 /// [`KtstrVm::spawn_ap_threads`], with an outer all-AP gate in
@@ -2445,12 +2615,648 @@ mod ap_boot_gate_tests {
     }
 }
 
+/// Delivered pthread CPU service an accessor-init worker may consume after
+/// coordinator shutdown is published. The worker checks `kill` around every
+/// retry and performs no intentionally long operation after that edge; two
+/// seconds is generous while remaining independent of host descheduling.
+const ACCESSOR_INIT_TEARDOWN_SERVICE_BUDGET_NS: u64 = 2_000_000_000;
+const ACCESSOR_INIT_TEARDOWN_WALL_BACKSTOP: Duration = FREEZE_RENDEZVOUS_TIMEOUT;
+const ACCESSOR_INIT_TEARDOWN_FAIL_CLOSED_EXIT_CODE: i32 = 77;
+const ACCESSOR_INIT_TEARDOWN_SERVICE_DIAGNOSTIC: &[u8] =
+    b"ktstr fatal: accessor-init teardown delivered-service budget exhausted; terminating the test process to preserve guest-memory lifetime\n";
+const ACCESSOR_INIT_TEARDOWN_WALL_DIAGNOSTIC: &[u8] =
+    b"ktstr fatal: accessor-init teardown wall backstop exhausted; terminating the test process to preserve guest-memory lifetime\n";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessorInitTeardownFailCause {
+    ServiceBudget,
+    WallBackstop,
+}
+
+/// Own the coordinator's nested accessor-init worker across every exit path.
+///
+/// The worker's `Arc<GuestMem>` is only shared ownership of the wrapper; its
+/// host pointer still targets the `KtstrKvm` guest-memory mmap. Dropping a
+/// `JoinHandle` would detach the worker and let the outer VM owner unmap that
+/// memory underneath it. This guard publishes the VM-wide stop edge and proves
+/// `is_finished()` before joining on normal return, setup error, or panic.
+struct AccessorInitThreadGuard {
+    handle: Option<JoinHandle<()>>,
+    kill: Arc<AtomicBool>,
+    kill_evt: Arc<EventFd>,
+}
+
+impl AccessorInitThreadGuard {
+    fn new(handle: JoinHandle<()>, kill: Arc<AtomicBool>, kill_evt: Arc<EventFd>) -> Self {
+        Self {
+            handle: Some(handle),
+            kill,
+            kill_evt,
+        }
+    }
+
+    fn shutdown(&mut self) {
+        trigger_freeze_coord_kill(&self.kill, &self.kill_evt);
+        let Some(handle) = self.handle.as_ref() else {
+            return;
+        };
+
+        let mut clock_id: libc::clockid_t = 0;
+        // SAFETY: the guard owns this still-unjoined pthread for the whole
+        // wait. A failed clock lookup simply leaves the wall backstop as the
+        // sole fail-safe.
+        let service_clock = if unsafe {
+            libc::pthread_getcpuclockid(
+                handle.as_pthread_t() as libc::pthread_t,
+                &mut clock_id,
+            )
+        } == 0
+        {
+            read_cpu_clock_ns(clock_id).map(|anchor_ns| ApTeardownServiceClock {
+                clock_id,
+                anchor_ns,
+            })
+        } else {
+            None
+        };
+        let wall_deadline = Instant::now() + ACCESSOR_INIT_TEARDOWN_WALL_BACKSTOP;
+
+        while !handle.is_finished() {
+            if service_clock.is_some_and(|clock| {
+                read_cpu_clock_ns(clock.clock_id).is_some_and(|now_ns| {
+                    now_ns.saturating_sub(clock.anchor_ns)
+                        > ACCESSOR_INIT_TEARDOWN_SERVICE_BUDGET_NS
+                })
+            }) {
+                fail_closed_accessor_init_teardown(
+                    AccessorInitTeardownFailCause::ServiceBudget,
+                );
+            }
+            if Instant::now() >= wall_deadline {
+                fail_closed_accessor_init_teardown(
+                    AccessorInitTeardownFailCause::WallBackstop,
+                );
+            }
+
+            // Re-publish both halves in case another eventfd consumer drained
+            // the prior counter, and wake a worker currently parked outside
+            // poll. Its 100/200 ms bounded polls remain the independent
+            // lost-edge backstop.
+            trigger_freeze_coord_kill(&self.kill, &self.kill_evt);
+            handle.thread().unpark();
+            std::thread::park_timeout(Duration::from_millis(10));
+        }
+
+        let handle = self
+            .handle
+            .take()
+            .expect("accessor-init handle remains owned until finished");
+        let _ = handle.join();
+    }
+}
+
+impl Drop for AccessorInitThreadGuard {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Uniform shutdown policy for every non-vCPU worker which can retain a raw
+/// view of guest memory. A Rust worker cannot be forcibly cancelled safely:
+/// after cooperative shutdown is published, ownership stays in this process
+/// until `JoinHandle::is_finished()` proves that `join()` cannot block. If the
+/// worker consumes too much delivered CPU service, or the run-wide wall
+/// backstop expires while it is blocked, the only memory-safe outcome is to
+/// terminate the process without running destructors.
+const VM_WORKER_TEARDOWN_SERVICE_BUDGET_NS: u64 = 2_000_000_000;
+// One event-loop quantum beyond the longest intentional 30-second coordinator
+// grace lets that grace publish its terminal edge instead of racing the owner
+// to the exact same deadline. This remains one run-wide deadline shared by all
+// four joins, never four serial per-worker allowances.
+const VM_WORKER_TEARDOWN_WALL_BACKSTOP: Duration = Duration::from_secs(31);
+const VM_WORKER_TEARDOWN_FAIL_CLOSED_EXIT_CODE: i32 = 78;
+const VM_WORKER_TEARDOWN_POLL: Duration = Duration::from_millis(10);
+const DEFERRED_DRAIN_GRACE: Duration = Duration::from_secs(30);
+const DEFERRED_DRAIN_IDLE_GRACE: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy)]
+struct DeferredDrainProgress {
+    started: Instant,
+    last_progress: Instant,
+    epoch: u64,
+}
+
+impl DeferredDrainProgress {
+    fn new(now: Instant, epoch: u64) -> Self {
+        Self {
+            started: now,
+            last_progress: now,
+            epoch,
+        }
+    }
+
+    fn observe(&mut self, now: Instant, epoch: u64) {
+        if epoch != self.epoch {
+            self.epoch = epoch;
+            self.last_progress = now;
+        }
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.started) >= DEFERRED_DRAIN_GRACE
+            || now.saturating_duration_since(self.last_progress)
+                >= DEFERRED_DRAIN_IDLE_GRACE
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmWorkerFamily {
+    Watchdog,
+    FreezeCoordinator,
+    Monitor,
+    BpfMapWriter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmWorkerTeardownFailCause {
+    ServiceBudget,
+    WallBackstop,
+}
+
+struct VmWorkerWake<'a> {
+    kill: &'a AtomicBool,
+    kill_evt: &'a EventFd,
+    bsp_done: Option<(&'a AtomicBool, &'a EventFd)>,
+}
+
+impl VmWorkerWake<'_> {
+    fn publish(&self) {
+        if let Some((bsp_done, bsp_done_evt)) = self.bsp_done {
+            bsp_done.store(true, Ordering::Release);
+            let _ = bsp_done_evt.write(1);
+        }
+        super::publish_vm_kill(self.kill, self.kill_evt);
+    }
+}
+
+fn vm_worker_service_clock<T>(handle: &JoinHandle<T>) -> Option<ApTeardownServiceClock> {
+    let mut clock_id: libc::clockid_t = 0;
+    // SAFETY: `handle` remains owned and unjoined for the whole wait, so its
+    // pthread identity remains valid until `is_finished()` becomes true.
+    if unsafe {
+        libc::pthread_getcpuclockid(
+            handle.as_pthread_t() as libc::pthread_t,
+            &mut clock_id,
+        )
+    } != 0
+    {
+        return None;
+    }
+    Some(ApTeardownServiceClock {
+        clock_id,
+        anchor_ns: read_cpu_clock_ns(clock_id)?,
+    })
+}
+
+fn vm_worker_service_budget_exhausted(anchor_ns: u64, now_ns: u64, budget_ns: u64) -> bool {
+    now_ns.saturating_sub(anchor_ns) > budget_ns
+}
+
+/// Testable wait core. Returning `Err` does not consume or detach the handle;
+/// production immediately fail-closes, while tests can release an injected
+/// wedge and prove the worker retained its guest-memory lease through the
+/// bound.
+fn wait_vm_worker_shutdown<T>(
+    handle: &JoinHandle<T>,
+    wake: &VmWorkerWake<'_>,
+    wall_deadline: Instant,
+    service_budget_ns: u64,
+    poll: Duration,
+) -> std::result::Result<(), VmWorkerTeardownFailCause> {
+    let service_clock = vm_worker_service_clock(handle);
+    loop {
+        if handle.is_finished() {
+            return Ok(());
+        }
+        wake.publish();
+        handle.thread().unpark();
+        let service_exhausted = service_clock.is_some_and(|clock| {
+            read_cpu_clock_ns(clock.clock_id).is_some_and(|now_ns| {
+                vm_worker_service_budget_exhausted(
+                    clock.anchor_ns,
+                    now_ns,
+                    service_budget_ns,
+                )
+            })
+        });
+        if service_exhausted && !handle.is_finished() {
+            return Err(VmWorkerTeardownFailCause::ServiceBudget);
+        }
+        let now = Instant::now();
+        if now >= wall_deadline && !handle.is_finished() {
+            return Err(VmWorkerTeardownFailCause::WallBackstop);
+        }
+        std::thread::park_timeout(poll.min(wall_deadline.saturating_duration_since(now)));
+    }
+}
+
+fn join_vm_worker_bounded<T>(
+    handle: JoinHandle<T>,
+    family: VmWorkerFamily,
+    wake: &VmWorkerWake<'_>,
+    wall_deadline: Instant,
+) -> std::thread::Result<T> {
+    if let Err(cause) = wait_vm_worker_shutdown(
+        &handle,
+        wake,
+        wall_deadline,
+        VM_WORKER_TEARDOWN_SERVICE_BUDGET_NS,
+        VM_WORKER_TEARDOWN_POLL,
+    ) {
+        fail_closed_vm_worker_teardown(family, cause);
+    }
+    // `is_finished()` is monotonic. The join is therefore only a result
+    // transfer; it cannot become a new wait after the bounded proof above.
+    handle.join()
+}
+
+#[cold]
+fn fail_closed_vm_worker_teardown(
+    family: VmWorkerFamily,
+    cause: VmWorkerTeardownFailCause,
+) -> ! {
+    const WD_SERVICE: &[u8] =
+        b"ktstr fatal: watchdog teardown delivered-service budget exhausted; terminating to preserve guest-memory ownership\n";
+    const WD_WALL: &[u8] =
+        b"ktstr fatal: watchdog teardown wall backstop exhausted; terminating to preserve guest-memory ownership\n";
+    const COORD_SERVICE: &[u8] =
+        b"ktstr fatal: freeze-coordinator teardown delivered-service budget exhausted; terminating to preserve guest-memory ownership\n";
+    const COORD_WALL: &[u8] =
+        b"ktstr fatal: freeze-coordinator teardown wall backstop exhausted; terminating to preserve guest-memory ownership\n";
+    const MONITOR_SERVICE: &[u8] =
+        b"ktstr fatal: monitor teardown delivered-service budget exhausted; terminating to preserve guest-memory ownership\n";
+    const MONITOR_WALL: &[u8] =
+        b"ktstr fatal: monitor teardown wall backstop exhausted; terminating to preserve guest-memory ownership\n";
+    const BPF_SERVICE: &[u8] =
+        b"ktstr fatal: BPF-map-writer teardown delivered-service budget exhausted; terminating to preserve guest-memory ownership\n";
+    const BPF_WALL: &[u8] =
+        b"ktstr fatal: BPF-map-writer teardown wall backstop exhausted; terminating to preserve guest-memory ownership\n";
+    let diagnostic = match (family, cause) {
+        (VmWorkerFamily::Watchdog, VmWorkerTeardownFailCause::ServiceBudget) => WD_SERVICE,
+        (VmWorkerFamily::Watchdog, VmWorkerTeardownFailCause::WallBackstop) => WD_WALL,
+        (VmWorkerFamily::FreezeCoordinator, VmWorkerTeardownFailCause::ServiceBudget) => {
+            COORD_SERVICE
+        }
+        (VmWorkerFamily::FreezeCoordinator, VmWorkerTeardownFailCause::WallBackstop) => COORD_WALL,
+        (VmWorkerFamily::Monitor, VmWorkerTeardownFailCause::ServiceBudget) => MONITOR_SERVICE,
+        (VmWorkerFamily::Monitor, VmWorkerTeardownFailCause::WallBackstop) => MONITOR_WALL,
+        (VmWorkerFamily::BpfMapWriter, VmWorkerTeardownFailCause::ServiceBudget) => BPF_SERVICE,
+        (VmWorkerFamily::BpfMapWriter, VmWorkerTeardownFailCause::WallBackstop) => BPF_WALL,
+    };
+    // SAFETY: allocation-free fail-closed boundary. A wedged worker may own
+    // arbitrary Rust locks, so diagnostics use only static bytes and libc.
+    unsafe {
+        let stderr_flags = libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL);
+        if stderr_flags >= 0 {
+            let _ = libc::fcntl(
+                libc::STDERR_FILENO,
+                libc::F_SETFL,
+                stderr_flags | libc::O_NONBLOCK,
+            );
+        }
+        let _ = libc::write(
+            libc::STDERR_FILENO,
+            diagnostic.as_ptr().cast(),
+            diagnostic.len(),
+        );
+        libc::_exit(VM_WORKER_TEARDOWN_FAIL_CLOSED_EXIT_CODE);
+    }
+}
+
+#[cfg(test)]
+mod vm_worker_shutdown_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    const FAMILIES: [VmWorkerFamily; 4] = [
+        VmWorkerFamily::Watchdog,
+        VmWorkerFamily::FreezeCoordinator,
+        VmWorkerFamily::Monitor,
+        VmWorkerFamily::BpfMapWriter,
+    ];
+
+    fn evt() -> Arc<EventFd> {
+        Arc::new(EventFd::new(EFD_NONBLOCK).expect("eventfd"))
+    }
+
+    #[test]
+    fn every_worker_family_cooperatively_exits_before_join() {
+        for family in FAMILIES {
+            let kill = Arc::new(AtomicBool::new(false));
+            let kill_evt = evt();
+            let bsp_done = Arc::new(AtomicBool::new(false));
+            let bsp_done_evt = evt();
+            let exited = Arc::new(AtomicBool::new(false));
+            let entered = Arc::new(crate::sync::Latch::new());
+            let kill_for_worker = Arc::clone(&kill);
+            let bsp_done_for_worker = Arc::clone(&bsp_done);
+            let exited_for_worker = Arc::clone(&exited);
+            let entered_for_worker = Arc::clone(&entered);
+            let handle = std::thread::spawn(move || {
+                entered_for_worker.set();
+                while !kill_for_worker.load(Ordering::Acquire)
+                    && !bsp_done_for_worker.load(Ordering::Acquire)
+                {
+                    std::thread::park();
+                }
+                exited_for_worker.store(true, Ordering::Release);
+            });
+            entered.wait();
+            let bsp_wake = matches!(
+                family,
+                VmWorkerFamily::Watchdog | VmWorkerFamily::FreezeCoordinator
+            )
+            .then_some((bsp_done.as_ref(), bsp_done_evt.as_ref()));
+            let wake = VmWorkerWake {
+                kill: kill.as_ref(),
+                kill_evt: kill_evt.as_ref(),
+                bsp_done: bsp_wake,
+            };
+            let result = wait_vm_worker_shutdown(
+                &handle,
+                &wake,
+                Instant::now() + VM_WORKER_TEARDOWN_WALL_BACKSTOP,
+                VM_WORKER_TEARDOWN_SERVICE_BUDGET_NS,
+                Duration::from_millis(1),
+            );
+            handle.join().expect("finished worker join cannot block");
+            assert_eq!(result, Ok(()), "{family:?} must accept its stop edge");
+            assert!(exited.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn worker_service_budget_counts_only_delivered_cpu() {
+        let anchor = 10_000;
+        assert!(!vm_worker_service_budget_exhausted(anchor, anchor, 50));
+        assert!(!vm_worker_service_budget_exhausted(anchor, anchor + 50, 50));
+        assert!(vm_worker_service_budget_exhausted(
+            anchor,
+            anchor + 51,
+            50
+        ));
+        assert!(
+            !vm_worker_service_budget_exhausted(anchor, anchor.saturating_sub(1), 50),
+            "a clock anomaly saturates instead of manufacturing service"
+        );
+    }
+
+    struct GuestMemoryLease {
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl Drop for GuestMemoryLease {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    fn injected_stuck_guest_memory_operation(family: VmWorkerFamily) {
+        let kill = Arc::new(AtomicBool::new(false));
+        let kill_evt = evt();
+        let bsp_done = Arc::new(AtomicBool::new(false));
+        let bsp_done_evt = evt();
+        let entered = Arc::new(crate::sync::Latch::new());
+        let release = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let entered_for_worker = Arc::clone(&entered);
+        let release_for_worker = Arc::clone(&release);
+        let lease = GuestMemoryLease {
+            dropped: Arc::clone(&dropped),
+        };
+        let handle = std::thread::spawn(move || {
+            // Models a worker blocked inside one accessor/maps operation: it
+            // owns the guest-memory lease and deliberately cannot inspect the
+            // cooperative kill edge until the injected operation returns.
+            let _lease = lease;
+            entered_for_worker.set();
+            while !release_for_worker.load(Ordering::Acquire) {
+                std::thread::park_timeout(Duration::from_millis(1));
+            }
+        });
+        entered.wait();
+        let bsp_wake = matches!(
+            family,
+            VmWorkerFamily::Watchdog | VmWorkerFamily::FreezeCoordinator
+        )
+        .then_some((bsp_done.as_ref(), bsp_done_evt.as_ref()));
+        let wake = VmWorkerWake {
+            kill: kill.as_ref(),
+            kill_evt: kill_evt.as_ref(),
+            bsp_done: bsp_wake,
+        };
+        let started = Instant::now();
+        let result = wait_vm_worker_shutdown(
+            &handle,
+            &wake,
+            started + Duration::from_millis(20),
+            u64::MAX,
+            Duration::from_millis(1),
+        );
+        let dropped_at_bound = dropped.load(Ordering::Acquire);
+        release.store(true, Ordering::Release);
+        handle.thread().unpark();
+        handle.join().expect("released injected operation joins");
+        let dropped_after_join = dropped.load(Ordering::Acquire);
+
+        assert_eq!(result, Err(VmWorkerTeardownFailCause::WallBackstop));
+        assert_eq!(
+            dropped_at_bound,
+            0,
+            "{family:?} guest-memory lease must remain owned at the fail-closed boundary"
+        );
+        assert_eq!(
+            dropped_after_join,
+            1,
+            "{family:?} guest-memory lease drops only after worker completion"
+        );
+    }
+
+    #[test]
+    fn injected_wedge_is_bounded_without_releasing_guest_memory_for_every_family() {
+        for family in FAMILIES {
+            injected_stuck_guest_memory_operation(family);
+        }
+    }
+
+    #[test]
+    fn bpf_writer_stuck_inside_accessor_maps_operation_is_bounded_and_owned() {
+        injected_stuck_guest_memory_operation(VmWorkerFamily::BpfMapWriter);
+    }
+
+    #[test]
+    fn deferred_drain_grace_requires_progress_and_keeps_an_absolute_cap() {
+        let start = Instant::now();
+        let mut progress = DeferredDrainProgress::new(start, 7);
+        let before_idle = start + DEFERRED_DRAIN_IDLE_GRACE - Duration::from_nanos(1);
+        progress.observe(before_idle, 7);
+        assert!(!progress.expired(before_idle));
+
+        progress.observe(before_idle, 8);
+        assert!(
+            !progress.expired(start + DEFERRED_DRAIN_IDLE_GRACE),
+            "an accessor attempt resets only the idle-progress window"
+        );
+        assert!(
+            progress.expired(before_idle + DEFERRED_DRAIN_IDLE_GRACE),
+            "a wedged accessor operation stops advancing and closes the grace"
+        );
+
+        let mut continuously_advancing = DeferredDrainProgress::new(start, 0);
+        continuously_advancing.observe(start + DEFERRED_DRAIN_GRACE, 1);
+        assert!(
+            continuously_advancing.expired(start + DEFERRED_DRAIN_GRACE),
+            "progress cannot extend the run-wide absolute ceiling"
+        );
+    }
+}
+
+#[cold]
+fn fail_closed_accessor_init_teardown(cause: AccessorInitTeardownFailCause) -> ! {
+    // SAFETY: same fail-closed contract as AP teardown. A wedged worker may
+    // own allocator or logging locks, so use only static bytes and
+    // async-signal-safe libc calls, make stderr nonblocking best-effort, and
+    // terminate without running destructors.
+    unsafe {
+        let stderr_flags = libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL);
+        if stderr_flags >= 0 {
+            let _ = libc::fcntl(
+                libc::STDERR_FILENO,
+                libc::F_SETFL,
+                stderr_flags | libc::O_NONBLOCK,
+            );
+        }
+        let diagnostic = match cause {
+            AccessorInitTeardownFailCause::ServiceBudget => {
+                ACCESSOR_INIT_TEARDOWN_SERVICE_DIAGNOSTIC
+            }
+            AccessorInitTeardownFailCause::WallBackstop => {
+                ACCESSOR_INIT_TEARDOWN_WALL_DIAGNOSTIC
+            }
+        };
+        let _ = libc::write(
+            libc::STDERR_FILENO,
+            diagnostic.as_ptr().cast(),
+            diagnostic.len(),
+        );
+        libc::_exit(ACCESSOR_INIT_TEARDOWN_FAIL_CLOSED_EXIT_CODE);
+    }
+}
+
+#[cfg(test)]
+mod accessor_init_thread_guard_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicI32};
+
+    fn evt() -> Arc<EventFd> {
+        Arc::new(EventFd::new(EFD_NONBLOCK).expect("eventfd"))
+    }
+
+    fn guarded_worker(
+        kill: Arc<AtomicBool>,
+        kill_evt: Arc<EventFd>,
+        tid_slot: Arc<AtomicI32>,
+        finished: Arc<AtomicBool>,
+    ) -> AccessorInitThreadGuard {
+        let kill_for_worker = Arc::clone(&kill);
+        let handle = std::thread::spawn(move || {
+            // SAFETY: gettid has no arguments or ownership effects.
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+            tid_slot.store(tid, Ordering::Release);
+            while !kill_for_worker.load(Ordering::Acquire) {
+                std::thread::park_timeout(Duration::from_millis(10));
+            }
+            finished.store(true, Ordering::Release);
+        });
+        AccessorInitThreadGuard::new(handle, kill, kill_evt)
+    }
+
+    fn wait_for_tid(tid_slot: &AtomicI32) -> i32 {
+        loop {
+            let tid = tid_slot.load(Ordering::Acquire);
+            if tid > 0 {
+                return tid;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    fn assert_worker_identity_gone(tid: i32, finished: &AtomicBool) {
+        assert!(
+            finished.load(Ordering::Acquire),
+            "guard joined after the worker's terminal publication"
+        );
+        assert!(
+            !std::path::Path::new(&format!("/proc/self/task/{tid}")).exists(),
+            "worker TID {tid} must be gone before guarded scope returns"
+        );
+    }
+
+    #[test]
+    fn injected_post_spawn_error_joins_worker_before_return() {
+        let kill = Arc::new(AtomicBool::new(false));
+        let kill_evt = evt();
+        let tid_slot = Arc::new(AtomicI32::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+
+        let result = (|| -> anyhow::Result<()> {
+            let _guard = guarded_worker(
+                Arc::clone(&kill),
+                Arc::clone(&kill_evt),
+                Arc::clone(&tid_slot),
+                Arc::clone(&finished),
+            );
+            let _ = wait_for_tid(&tid_slot);
+            anyhow::bail!("injected coordinator setup error after accessor worker spawn");
+        })();
+
+        assert!(result.is_err());
+        let tid = wait_for_tid(&tid_slot);
+        assert_worker_identity_gone(tid, &finished);
+    }
+
+    #[test]
+    fn injected_post_spawn_panic_joins_worker_during_unwind() {
+        let kill = Arc::new(AtomicBool::new(false));
+        let kill_evt = evt();
+        let tid_slot = Arc::new(AtomicI32::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let kill = Arc::clone(&kill);
+            let kill_evt = Arc::clone(&kill_evt);
+            let tid_slot = Arc::clone(&tid_slot);
+            let finished = Arc::clone(&finished);
+            move || {
+                let _guard = guarded_worker(kill, kill_evt, Arc::clone(&tid_slot), finished);
+                let _ = wait_for_tid(&tid_slot);
+                panic!("injected coordinator panic after accessor worker spawn");
+            }
+        }));
+
+        assert!(unwind.is_err());
+        let tid = wait_for_tid(&tid_slot);
+        assert_worker_identity_gone(tid, &finished);
+    }
+}
+
 /// RAII guard that joins the vCPU / monitor / bpf-write / freeze-coordinator /
 /// watchdog threads [`KtstrVm::run_vm`] spawns BEFORE the `vm` local (and its
 /// `guest_mem` mmap) drops, on EVERY exit path. The normal Ok teardown
-/// [`disarm`](Self::disarm)s it and joins the handles itself; any `?`
-/// early-return or panic-unwind between the first spawn and that teardown
-/// triggers `Drop` instead. Without it, an early exit DETACHES those threads —
+/// consumes the watchdog/coordinator handles, then moves this still-armed owner
+/// into [`VmRunState`] with the AP/monitor/BPF handles. Any `?`, panic-unwind,
+/// or abandoned handoff therefore triggers `Drop`. Without it, an early exit
+/// DETACHES those threads —
 /// they hold BARE raw pointers into `vm.guest_mem` (no `Arc`) and run `KVM_RUN`,
 /// so touching that memory after `KtstrKvm::Drop` munmaps it is a host-side
 /// use-after-free (kernel fd teardown is refcounted, so the danger is purely the
@@ -2469,7 +3275,7 @@ mod ap_boot_gate_tests {
 /// Immediate-exit handles have an independent mapping lifetime, but these
 /// threads also hold guest-memory pointers, pthread identities, and other
 /// run-scoped resources that must not survive VM teardown.
-struct RunVmThreadGuard {
+pub(crate) struct RunVmThreadGuard {
     ap_threads: Vec<VcpuThread>,
     monitor: Option<JoinHandle<monitor::reader::MonitorLoopResult>>,
     bpf_write: Option<JoinHandle<()>>,
@@ -2480,20 +3286,10 @@ struct RunVmThreadGuard {
     freeze: Arc<AtomicBool>,
     bsp_done: Arc<AtomicBool>,
     bsp_done_evt: Arc<EventFd>,
-}
-
-impl RunVmThreadGuard {
-    /// Reclaim every handle on the Ok path, leaving the guard empty so its
-    /// `Drop` joins nothing. The caller then runs the normal teardown.
-    fn disarm(&mut self) -> RunVmHandles {
-        RunVmHandles {
-            ap_threads: std::mem::take(&mut self.ap_threads),
-            monitor: self.monitor.take(),
-            bpf_write: self.bpf_write.take(),
-            freeze_coord: self.freeze_coord.take(),
-            watchdog: self.watchdog.take(),
-        }
-    }
+    /// One absolute deadline for every non-vCPU worker in this VM run. It is
+    /// armed at the cleanup-window boundary on the normal path. An early-error
+    /// guard which never reached that boundary derives one deadline at Drop.
+    worker_wall_deadline: Option<Instant>,
 }
 
 impl Drop for RunVmThreadGuard {
@@ -2504,7 +3300,7 @@ impl Drop for RunVmThreadGuard {
             && self.freeze_coord.is_none()
             && self.watchdog.is_none()
         {
-            return; // disarmed on the Ok path — nothing to join
+            return; // every handle was explicitly joined on the Ok path
         }
         // Early-return / panic-unwind cleanup. Replicate the Ok teardown's EXACT
         // stop sequence: set `bsp_done` (+ its evt) so the freeze-coordinator
@@ -2521,18 +3317,47 @@ impl Drop for RunVmThreadGuard {
         let _ = self.bsp_done_evt.write(1);
         super::publish_vm_kill(&self.kill, &self.kill_evt);
         self.freeze.store(false, Ordering::Release);
+        let wall_deadline = self
+            .worker_wall_deadline
+            .unwrap_or_else(|| Instant::now() + VM_WORKER_TEARDOWN_WALL_BACKSTOP);
+        let bsp_wake = VmWorkerWake {
+            kill: self.kill.as_ref(),
+            kill_evt: self.kill_evt.as_ref(),
+            bsp_done: Some((self.bsp_done.as_ref(), self.bsp_done_evt.as_ref())),
+        };
+        let kill_wake = VmWorkerWake {
+            kill: self.kill.as_ref(),
+            kill_evt: self.kill_evt.as_ref(),
+            bsp_done: None,
+        };
         if let Some(h) = self.watchdog.take() {
-            let _ = h.join();
+            let _ = join_vm_worker_bounded(
+                h,
+                VmWorkerFamily::Watchdog,
+                &bsp_wake,
+                wall_deadline,
+            );
         }
         if let Some(h) = self.freeze_coord.take() {
-            let _ = h.join();
+            let _ = join_vm_worker_bounded(
+                h,
+                VmWorkerFamily::FreezeCoordinator,
+                &bsp_wake,
+                wall_deadline,
+            );
         }
         if let Some(h) = self.monitor.take() {
-            let _ = h.join();
+            let _ =
+                join_vm_worker_bounded(h, VmWorkerFamily::Monitor, &kill_wake, wall_deadline);
         }
         kick_and_join_ap_threads(std::mem::take(&mut self.ap_threads));
         if let Some(h) = self.bpf_write.take() {
-            let _ = h.join();
+            let _ = join_vm_worker_bounded(
+                h,
+                VmWorkerFamily::BpfMapWriter,
+                &kill_wake,
+                wall_deadline,
+            );
         }
     }
 }
@@ -3576,6 +4401,13 @@ impl KtstrVm {
             Arc::new(std::sync::atomic::AtomicU8::new(
                 crate::scenario::snapshot::bridge::accessor_worker_state::TRYING,
             ));
+        // Teardown-visible evidence that the accessor worker is making
+        // forward attempts. The post-BSP deferred-drain grace may remain open
+        // only while this epoch advances; a worker wedged inside one
+        // guest-memory accessor operation cannot turn the coordinator join
+        // into a fixed 30-second silent tail.
+        let accessor_worker_progress_epoch: Arc<std::sync::atomic::AtomicU64> =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
         // Dispatcher wake EventFd — pulsed by the worker on every
         // seqno bump AND on FAILED_PERMANENTLY exit so the bridge's
         // wait paths react at kernel-scheduling-tick latency instead
@@ -4016,6 +4848,7 @@ impl KtstrVm {
             freeze: freeze.clone(),
             bsp_done: bsp_done.clone(),
             bsp_done_evt: bsp_done_evt.clone(),
+            worker_wall_deadline: None,
         };
 
         // Pin / mask BSP (runs on current thread, pid=0 means calling thread).
@@ -4290,7 +5123,7 @@ impl KtstrVm {
         )?;
         // Hand the monitor handle to the guard so an early-return past here
         // joins it before guest_mem drops (the monitor holds a bare raw pointer
-        // into guest_mem). Reclaimed by `guard.disarm()` on the Ok path.
+        // into guest_mem). The armed guard moves into VmRunState on the Ok path.
         guard.monitor = monitor_handle;
         let watchdog_reset_for_coord = watchdog_reset_ns.clone();
         let watchdog_reset_tag_for_coord = watchdog_reset_tag.clone();
@@ -4855,6 +5688,14 @@ impl KtstrVm {
         // `.get_full()`.
         let freeze_coord_cast_map: Arc<crate::vmm::cast_analysis_load::LazyCastMap> =
             self.cast_map.clone();
+        // Cast-analysis infrastructure failures are run failures, not renderer
+        // feature negotiation. The coordinator records the diagnostic here,
+        // emits a degraded capture, and requests teardown; run_vm converts the
+        // recorded failure into a marker-typed infrastructure error after the
+        // coordinator has thawed the vCPUs and joined.
+        let cast_analysis_error: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let freeze_coord_cast_analysis_error = cast_analysis_error.clone();
         let freeze_coord_on_demand_in_flight = on_demand_in_flight.clone();
         // Snapshot bridge clone for the coord run-loop. The bridge
         // stores `FailureDumpReport` entries under per-tag keys (TLV
@@ -5321,6 +6162,8 @@ impl KtstrVm {
                         let reinit_for_worker = accessor_reinit_evt.clone();
                         let publish_seqno_for_worker = accessor_publish_seqno.clone();
                         let worker_state_for_worker = accessor_worker_state.clone();
+                        let progress_epoch_for_worker =
+                            accessor_worker_progress_epoch.clone();
                         let dispatcher_wake_for_worker =
                             accessor_dispatcher_wake_evt.clone();
                         std::thread::Builder::new()
@@ -5473,6 +6316,15 @@ impl KtstrVm {
                                             unsafe { libc::poll(pfds.as_mut_ptr(), 2, 200) };
                                             continue;
                                         };
+                                        // A new attempt is demonstrable
+                                        // teardown progress. Publish before
+                                        // entering the accessor operation and
+                                        // again after it returns; if that one
+                                        // operation wedges, the epoch stops
+                                        // advancing and the coordinator's
+                                        // post-BSP idle grace closes.
+                                        progress_epoch_for_worker
+                                            .fetch_add(1, Ordering::Release);
                                         let map_res = crate::monitor::bpf_map::GuestMemMapAccessorOwned
                                             ::from_precomputed(
                                                 mem_for_worker.clone(),
@@ -5483,6 +6335,8 @@ impl KtstrVm {
                                                 cr3_val,
                                                 pb_hint,
                                             );
+                                        progress_epoch_for_worker
+                                            .fetch_add(1, Ordering::Release);
                                         if kill_for_worker.load(Ordering::Acquire) {
                                             return;
                                         }
@@ -5623,6 +6477,17 @@ impl KtstrVm {
                     }
                     _ => None,
                 };
+                // Wrap the nested worker immediately after spawn. From this
+                // point every coordinator return and panic-unwind publishes
+                // kill and bounded-joins it before the closure can relinquish
+                // its guest-memory access.
+                let mut accessor_init_guard = accessor_init_handle.map(|handle| {
+                    AccessorInitThreadGuard::new(
+                        handle,
+                        Arc::clone(&freeze_coord_kill),
+                        Arc::clone(&freeze_coord_kill_evt),
+                    )
+                });
                 // Per-CPU offset array used by `runtime_stats` to
                 // locate each CPU's `bpf_prog_stats` slot. Resolved
                 // once after `owned_prog_accessor` lands by reading
@@ -6326,20 +7191,21 @@ impl KtstrVm {
                 let mut scan_tick: bool;
                 let mut first_iter = true;
                 let mut bsp_done_final_pass = false;
-                // Wall-clock cap on the post-BSP_DONE stay-alive
+                // Progress-gated cap on the post-BSP_DONE stay-alive
                 // window. Bounds the wait for the
                 // `owned_accessor`-gated drain of
                 // [`capture_requests_deferred`] /
                 // [`kernel_op_requests_deferred`]: if the accessor
                 // hasn't adopted by the cap, surface the empty
                 // reply path rather than blocking the test forever.
-                // 30 s leaves headroom over the accessor-init
-                // worker's own 60 s first-init deadline only in the
-                // genuinely-stuck scenario (worker bailed
-                // FAILED_PERMANENTLY); under healthy boots the
-                // adoption fires within seconds and the stay-alive
-                // exits immediately on the `owned_accessor.is_some()`
-                // path. The cap exists exclusively to keep a
+                // A hard 30 s ceiling remains, but a one-second interval
+                // with no accessor-attempt epoch advance closes the grace
+                // earlier. Each attempt publishes before and after the
+                // accessor operation, so an operation wedged internally
+                // cannot consume the whole silent window. Under healthy
+                // boots repeated attempts keep the grace live and adoption
+                // exits immediately on the `owned_accessor.is_some()` path.
+                // The caps exist exclusively to keep a
                 // catastrophic prerequisite failure from converting
                 // a test fault into an unbounded test run. The
                 // `scenario::ops::await_accessor_ready` pre-stall gate
@@ -6347,8 +7213,7 @@ impl KtstrVm {
                 // fires only after adoption), so post-gate it backs only
                 // the never-adopt cases: pre-adoption `Op::CaptureSnapshot`
                 // requests and scenarios that don't await the gate.
-                let mut bsp_done_final_pass_start: Option<Instant> = None;
-                const DEFERRED_DRAIN_GRACE: Duration = Duration::from_secs(30);
+                let mut deferred_drain_progress: Option<DeferredDrainProgress> = None;
                 // Bounded grace for a wprof run's LATE trace ship. On an
                 // error-class exit (Captured or Degraded) the coordinator
                 // captures the dump, thaws, and — for a non-wprof run —
@@ -6426,14 +7291,20 @@ impl KtstrVm {
                             // accessor publishes would otherwise see
                             // no reply at all (workload ends, deferred
                             // queue never drains). The wall-clock
-                            // cap at `DEFERRED_DRAIN_GRACE` keeps a
-                            // genuinely-stuck prerequisite from
-                            // hanging the test indefinitely.
+                            // progress-idle and absolute caps keep a
+                            // genuinely-stuck prerequisite from hanging the
+                            // test or charging a fixed 30-second tail after
+                            // one accessor operation wedges.
                             let any_deferred = !capture_requests_deferred.is_empty()
                                 || !kernel_op_requests_deferred.is_empty();
-                            let grace_expired = bsp_done_final_pass_start
-                                .map(|t| t.elapsed() >= DEFERRED_DRAIN_GRACE)
-                                .unwrap_or(false);
+                            let now = Instant::now();
+                            let progress_epoch =
+                                accessor_worker_progress_epoch.load(Ordering::Acquire);
+                            if let Some(progress) = deferred_drain_progress.as_mut() {
+                                progress.observe(now, progress_epoch);
+                            }
+                            let grace_expired = deferred_drain_progress
+                                .is_some_and(|progress| progress.expired(now));
                             if wprof_ship_deadline.is_none()
                                 && (!any_deferred
                                     || owned_accessor.is_some()
@@ -6458,7 +7329,10 @@ impl KtstrVm {
                                 );
                             }
                         } else {
-                            bsp_done_final_pass_start = Some(Instant::now());
+                            deferred_drain_progress = Some(DeferredDrainProgress::new(
+                                Instant::now(),
+                                accessor_worker_progress_epoch.load(Ordering::Acquire),
+                            ));
                         }
                         bsp_done_final_pass = true;
                     } else if freeze_coord_kill.load(Ordering::Acquire) {
@@ -9435,7 +10309,40 @@ impl KtstrVm {
                                 // `.bpf.objs` shape where one object
                                 // declares `struct foo;` (forward) and
                                 // another defines the body.
-                                let cast_analysis = freeze_coord_cast_map.get_full();
+                                let cast_analysis = match freeze_coord_cast_map.get_full() {
+                                    Ok(output) => output,
+                                    Err(error) => {
+                                        let reason = format!(
+                                            "cast-analysis infrastructure failure: {error:#}"
+                                        );
+                                        tracing::error!(
+                                            %error,
+                                            "freeze-coord: cast analysis failed; aborting VM run"
+                                        );
+                                        *freeze_coord_cast_analysis_error
+                                            .lock()
+                                            .unwrap_or_else(|poison| poison.into_inner()) =
+                                            Some(reason.clone());
+                                        trigger_freeze_coord_kill(
+                                            &freeze_coord_kill,
+                                            &freeze_coord_kill_evt,
+                                        );
+                                        break 'capture FreezeOutcome::Degraded(Box::new(
+                                            crate::monitor::dump::DegradedFailureDumpReport {
+                                                schema:
+                                                    crate::monitor::dump::SCHEMA_DEGRADED.to_string(),
+                                                reason,
+                                                vcpu_regs,
+                                                watchpoint_hit: false,
+                                                bss_latch_state:
+                                                    "not-applicable".to_string(),
+                                                exit_kind: None,
+                                                elapsed_ms:
+                                                    capture_start.elapsed().as_millis() as u64,
+                                            },
+                                        ));
+                                    }
+                                };
                                 // Single-object only: cast_lookup consults this one
                                 // map by (parent_type_id, offset). Multi-object
                                 // schedulers would need per-btf_kva selection here;
@@ -13122,9 +14029,9 @@ impl KtstrVm {
                 // freed memory through stale `Arc<GuestMem>` on its
                 // next `try_init_*` retry.
                 trigger_freeze_coord_kill(&freeze_coord_kill, &freeze_coord_kill_evt);
-                if let Some(handle) = accessor_init_handle {
+                if let Some(mut worker_guard) = accessor_init_guard.take() {
                     let jt = std::time::Instant::now();
-                    let _ = handle.join();
+                    worker_guard.shutdown();
                     if crate::vmm::debug_logging_enabled() {
                         eprintln!("CLEANUP: accessor-init worker joined {:?}", jt.elapsed());
                     }
@@ -13158,9 +14065,25 @@ impl KtstrVm {
         // return, including watchdog spawn failure below.
         guard.freeze_coord = Some(freeze_coord_handle);
 
+        // Build every fallible watchdog wake primitive on the VM owner before
+        // the watchdog is spawned and, critically, before the BSP can enter
+        // KVM_RUN below. A setup error propagates through `run_vm` so the
+        // armed teardown guard drains the coordinator/monitor/AP set; it can
+        // no longer leave a running VM with no outer deadline because the
+        // watchdog closure logged an error and returned.
+        let watchdog_wake = prepare_watchdog_wake(
+            kill_evt_for_watchdog.as_ref(),
+            bsp_done_evt_for_wd.as_ref(),
+            None,
+        )
+        .context("initialize watchdog wake sources")?;
         let watchdog = std::thread::Builder::new()
             .name("ktstr-watchdog".into())
             .spawn(move || {
+                let WatchdogWake {
+                    mut tick_tfd,
+                    epoll,
+                } = watchdog_wake;
                 if let Some(cpu) = wd_service_cpu {
                     pin_current_thread(cpu, "ktstr-watchdog");
                 }
@@ -13231,65 +14154,11 @@ impl KtstrVm {
                     eprintln!("ktstr-watchdog: started, timeout={timeout:?}");
                 }
 
-                // Wake plumbing. `tick_tfd` is a periodic 100 ms
-                // timerfd that drives the deadline-progress checks
-                // (matches the legacy `thread::sleep(100ms)` cadence
-                // exactly). `kill_evt_for_watchdog` and
-                // `bsp_done_evt_for_wd` are fast-wake fds bumped by
-                // the kill / bsp_done setters so the deadline-arm
-                // path runs within microseconds of the flip rather
-                // than at the next 100 ms tick. Construction failure
-                // for any of these means the watchdog cannot
-                // observe wake signals; surface as `tracing::error`
-                // and return so the symptom is visible — the
-                // deadline-armed BSP still gets kicked by the
-                // freeze coordinator's own paths if those fire.
-                let mut tick_tfd = match TimerFd::new() {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::error!(err = %e, "ktstr-watchdog: timerfd_create failed");
-                        return;
-                    }
-                };
-                let tick = Duration::from_millis(100);
-                if let Err(e) = tick_tfd.reset(tick, Some(tick)) {
-                    tracing::error!(err = %e, "ktstr-watchdog: timerfd_settime failed");
-                    return;
-                }
-                let epoll = match Epoll::new() {
-                    Ok(e) => e,
-                    Err(e) => {
-                        tracing::error!(err = %e, "ktstr-watchdog: epoll_create1 failed");
-                        return;
-                    }
-                };
+                // Wake plumbing was constructed synchronously by
+                // `prepare_watchdog_wake` before BSP entry. The timerfd drives
+                // the 100 ms deadline/progress cadence; kill and BSP-done
+                // eventfds provide prompt teardown wakes.
                 let tick_fd = tick_tfd.as_raw_fd();
-                let kill_fd = kill_evt_for_watchdog.as_raw_fd();
-                let bsp_done_fd = bsp_done_evt_for_wd.as_raw_fd();
-                if let Err(e) = epoll.ctl(
-                    ControlOperation::Add,
-                    tick_fd,
-                    EpollEvent::new(EventSet::IN, tick_fd as u64),
-                ) {
-                    tracing::error!(err = %e, "ktstr-watchdog: epoll_ctl add timerfd failed");
-                    return;
-                }
-                if let Err(e) = epoll.ctl(
-                    ControlOperation::Add,
-                    kill_fd,
-                    EpollEvent::new(EventSet::IN, kill_fd as u64),
-                ) {
-                    tracing::error!(err = %e, "ktstr-watchdog: epoll_ctl add kill_evt failed");
-                    return;
-                }
-                if let Err(e) = epoll.ctl(
-                    ControlOperation::Add,
-                    bsp_done_fd,
-                    EpollEvent::new(EventSet::IN, bsp_done_fd as u64),
-                ) {
-                    tracing::error!(err = %e, "ktstr-watchdog: epoll_ctl add bsp_done_evt failed");
-                    return;
-                }
                 let mut epoll_buf = [EpollEvent::default(); 3];
 
                 loop {
@@ -14070,6 +14939,12 @@ impl KtstrVm {
         // `Instant::now()` at the end and the difference becomes
         // `VmResult::cleanup_duration`.
         let cleanup_start = Instant::now();
+        // Keep the thread guard armed across every post-run read and result
+        // construction step. Its Drop uses this same absolute deadline on an
+        // unwind, and the guard itself moves into VmRunState so ownership
+        // remains structural across the run_vm -> collect_results handoff.
+        guard.worker_wall_deadline =
+            Some(cleanup_start + VM_WORKER_TEARDOWN_WALL_BACKSTOP);
         // Cleanup-window dilation instrument: snapshot THIS thread's
         // schedstat at the window open. run_vm and collect_results run on
         // the same caller thread (the BSP thread), which performs every
@@ -14127,30 +15002,32 @@ impl KtstrVm {
             }
         }
 
-        // Disarm the guard and reclaim every handle for the joins below; from
-        // here its Drop is a no-op. Deferred to this point (not right after the
-        // BSP loop) so the guard covers the infallible post-loop teardown above.
-        // The watchdog/coord joins below consume these handles, so the disarm
-        // cannot move past them; the post-join `read_tcr_el1` / `read_cr3`
-        // catch-up reads (which must follow the coordinator join to avoid a
-        // cache race) then run after this disarm — but they are infallible
-        // `.ok()` reads with no panic site, a pre-existing sliver unchanged by
-        // this fix. The `watchdog` / `freeze_coord_handle` bindings are `Option`
-        // (always `Some` here — reached only after both spawned successfully).
-        let RunVmHandles {
-            ap_threads,
-            monitor: monitor_handle,
-            bpf_write: bpf_write_handle,
-            freeze_coord: freeze_coord_handle,
-            watchdog,
-        } = guard.disarm();
+        // Consume only the two control workers which must finish before the
+        // post-run guest-memory reads below. AP, monitor, and BPF-writer
+        // handles remain inside the armed guard throughout those reads; a
+        // panic therefore cannot detach a guest-memory reader.
+        let worker_wall_deadline = guard
+            .worker_wall_deadline
+            .expect("cleanup boundary arms one worker wall deadline");
+        let bsp_worker_wake = VmWorkerWake {
+            kill: kill.as_ref(),
+            kill_evt: kill_evt.as_ref(),
+            bsp_done: Some((bsp_done.as_ref(), bsp_done_evt.as_ref())),
+        };
 
         // Join the watchdog so no timeout decision or logical BSP kick
         // survives the VM run. Its ImmediateExitHandle mapping is
         // independently pinned, so memory safety does not depend on this join.
-        // (`Some` here — disarmed from the guard after a successful spawn.)
-        if let Some(h) = watchdog {
-            let _ = h.join();
+        // (`Some` here after a successful spawn.) Take the handle only as the
+        // bounded join call consumes it, leaving no naked ownership interval
+        // across another post-run operation.
+        if let Some(h) = guard.watchdog.take() {
+            let _ = join_vm_worker_bounded(
+                h,
+                VmWorkerFamily::Watchdog,
+                &bsp_worker_wake,
+                worker_wall_deadline,
+            );
         }
         if crate::vmm::debug_logging_enabled() {
             eprintln!("CLEANUP: watchdog joined");
@@ -14170,9 +15047,22 @@ impl KtstrVm {
         // Flip the logical BSP participation flag after the coordinator is
         // gone. The handle owner's active flag is published separately when
         // the BSP wrapper completes.
-        // (`Some` here — disarmed from the guard after a successful spawn.)
-        if let Some(h) = freeze_coord_handle {
-            let _ = h.join();
+        // (`Some` here after a successful spawn.) As with the watchdog, take
+        // only in the consuming bounded-join expression.
+        if let Some(h) = guard.freeze_coord.take() {
+            let _ = join_vm_worker_bounded(
+                h,
+                VmWorkerFamily::FreezeCoordinator,
+                &bsp_worker_wake,
+                worker_wall_deadline,
+            );
+        }
+        let framework_error = cast_analysis_error
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        if let Some(error) = framework_error.as_deref() {
+            eprintln!("ktstr: {error}");
         }
         if crate::vmm::debug_logging_enabled() {
             eprintln!("CLEANUP: freeze_coord joined");
@@ -14229,8 +15119,8 @@ impl KtstrVm {
         }
 
         // Host-side vCPU scheduling-dilation sample. Read HERE — after the
-        // watchdog/freeze-coord joins above but BEFORE `ap_threads` move
-        // into `VmRunState` (they are joined only later, in
+        // watchdog/freeze-coord joins above but BEFORE the armed thread guard
+        // moves into `VmRunState` (its APs are joined only later, in
         // `collect_results`). A live vCPU is read from proc; an AP that
         // already returned contributes the one-shot self-snapshot it stored
         // immediately before exit. TIDs come from the same
@@ -14258,25 +15148,38 @@ impl KtstrVm {
         // The dispatch consumers that advance these are joined/dead by
         // now, so this is the run's final state.
         let final_ledger = progress_ledger_for_result.snapshot();
+        // Finish every operation which can lock, allocate, or otherwise panic
+        // before moving either `vm` or the armed thread guard into the handoff
+        // state. The initializer below is then a pure sequence of copies and
+        // moves; `run_threads` is declared before `vm`, so dropping a completed
+        // VmRunState also joins guest-memory readers before unmapping memory.
+        let watchdog_kill_reason_raw = watchdog_kill_reason.load(Ordering::Acquire);
+        let bpf_map_write_delivery_raw = bpf_map_write_delivery.load(Ordering::Acquire);
+        let periodic_prereqs_ready_ns_raw =
+            periodic_prereqs_ready_at.load(Ordering::Acquire);
+        let periodic_window_end_ns_raw = periodic_window_end_at.load(Ordering::Acquire);
+        let prog_accessor = prog_accessor_slot.lock_unpoisoned().take();
+        let kern_phys_base = kern_phys_base_for_result.load(Ordering::Acquire);
+        let kern_kaslr_offset = kern_virt_kaslr_for_result
+            .load(Ordering::Acquire)
+            .saturating_sub(1);
+        let periodic_fired = periodic_fired_slot.load(Ordering::Relaxed);
+        let periodic_target = self.num_snapshots;
 
         Ok(VmRunState {
             exit_code,
             timed_out,
             // Final kill-reason byte: the watchdog thread joined above, so
             // this load observes its last store (the join synchronizes).
-            watchdog_kill_reason_raw: watchdog_kill_reason.load(Ordering::Acquire),
+            watchdog_kill_reason_raw,
             final_guest_phase_raw: final_ledger.phase,
             final_progress_epoch: final_ledger.progress_epoch,
-            bpf_map_write_delivery_raw: bpf_map_write_delivery.load(Ordering::Acquire),
-            periodic_prereqs_ready_ns_raw: periodic_prereqs_ready_at.load(Ordering::Acquire),
-            periodic_window_end_ns_raw: periodic_window_end_at.load(Ordering::Acquire),
+            bpf_map_write_delivery_raw,
+            periodic_prereqs_ready_ns_raw,
+            periodic_window_end_ns_raw,
+            framework_error,
             contention_witness,
-            ap_threads,
-            monitor_handle,
-            bpf_write_handle,
-            // Coordinator is already joined above; collect_results' optional
-            // compatibility join is therefore a no-op.
-            freeze_coordinator: None,
+            run_threads: guard,
             com1,
             com2,
             kill,
@@ -14295,8 +15198,8 @@ impl KtstrVm {
             tcr_el1: tcr_el1_cache,
             cr3: cr3_cache,
             vmlinux_data: vmlinux_data_for_result,
-            prog_accessor: prog_accessor_slot.lock_unpoisoned().take(),
-            kern_phys_base: kern_phys_base_for_result.load(Ordering::Acquire),
+            prog_accessor,
+            kern_phys_base,
             // Snapshot the kern_virt_kaslr Arc at run-end. The Arc
             // stores `actual_offset + 1` (bias) so 0 = "never
             // published" and `saturating_sub(1)` recovers the actual
@@ -14304,9 +15207,7 @@ impl KtstrVm {
             // "published as 0", indistinguishable from the consumer's
             // perspective — e2e tests distinguish via the test
             // entry's `kaslr` attribute).
-            kern_kaslr_offset: kern_virt_kaslr_for_result
-                .load(Ordering::Acquire)
-                .saturating_sub(1),
+            kern_kaslr_offset,
             // Virtio-console handle threaded into `collect_results`
             // for the post-exit `drain_bulk()` call. Carries any
             // port-1 TLV bytes the guest wrote that the freeze
@@ -14332,12 +15233,12 @@ impl KtstrVm {
             // the AtomicU32's value is the final advance count;
             // `collect_results` forwards onto
             // `VmResult::periodic_fired`.
-            periodic_fired: periodic_fired_slot.load(Ordering::Relaxed),
+            periodic_fired,
             // Configured periodic-target plumbed onto KtstrVm via
             // `KtstrVmBuilder::num_snapshots`. Forwarded to
             // `VmResult::periodic_target` so test code can compute
             // coverage as `fired / target`.
-            periodic_target: self.num_snapshots,
+            periodic_target,
             // Watchpoint Arc forwarded so `collect_results` can
             // invalidate `kind_host_ptr` and `request_kva` after
             // every vCPU thread joins but before `vm` drops.
@@ -16524,7 +17425,11 @@ impl KtstrVm {
     }
 
     /// Shutdown threads and collect output.
-    pub(super) fn collect_results(&self, start: Instant, run: VmRunState) -> Result<VmResult> {
+    pub(super) fn collect_results(
+        &self,
+        start: Instant,
+        mut run: VmRunState,
+    ) -> Result<VmResult> {
         // Whole-cleanup timer for the perf-repro tracing pipeline.
         // `cleanup_duration` below already records the post-BSP-exit
         // window via `run.cleanup_start.elapsed()`; this captures the
@@ -16534,6 +17439,7 @@ impl KtstrVm {
         let collect_results_start = Instant::now();
         let mut exit_code = run.exit_code;
         let timed_out = run.timed_out;
+        let framework_error = run.framework_error.clone();
         // Belt-and-braces: kill + kill_evt are already set by run_vm
         // immediately after BSP exits. Re-assert here in case a
         // future code path reaches collect_results without the
@@ -16553,19 +17459,33 @@ impl KtstrVm {
         // freeze clears.
         run.freeze.store(false, Ordering::Release);
 
-        // The freeze coordinator was joined inside `run_vm`, so
-        // `run.freeze_coordinator` is always `None` here. The
-        // `Option`-typed field is preserved for backward compatibility
-        // with paths that may construct VmRunState differently in
-        // the future; the conditional join below is a no-op for the
-        // `None` arm.
-        if let Some(h) = run.freeze_coordinator {
-            let _ = h.join();
-        }
+        // `run_threads` stayed armed throughout run_vm's post-run processing
+        // and moved directly into VmRunState. Continue using the exact same
+        // cleanup-boundary deadline; taking each handle empties the guard only
+        // after the corresponding worker is proved finished and joined.
+        let worker_wall_deadline = run
+            .run_threads
+            .worker_wall_deadline
+            .expect("run_vm arms the worker teardown deadline");
+        let worker_kill = Arc::clone(&run.kill);
+        let worker_kill_evt = Arc::clone(&run.kill_evt);
+        let worker_wake = VmWorkerWake {
+            kill: worker_kill.as_ref(),
+            kill_evt: worker_kill_evt.as_ref(),
+            bsp_done: None,
+        };
         // The monitor owns CPU clock IDs derived from the AP pthread handles.
         // Join it while every AP is still alive; `kill_evt` above wakes its
         // epoll loop promptly, so this does not wait for the sample cadence.
-        let monitor_loop_result = run.monitor_handle.and_then(|h| h.join().ok());
+        let monitor_loop_result = run.run_threads.monitor.take().and_then(|h| {
+            join_vm_worker_bounded(
+                h,
+                VmWorkerFamily::Monitor,
+                &worker_wake,
+                worker_wall_deadline,
+            )
+            .ok()
+        });
         if crate::vmm::debug_logging_enabled() {
             eprintln!("CLEANUP: monitor joined");
         }
@@ -16575,7 +17495,7 @@ impl KtstrVm {
         // `kill` / `kill_evt` / `freeze` were set above, as the helper requires.
         // This must remain after the monitor join above: pthread CPU clock IDs
         // are not a safe lifetime token for a terminated thread.
-        kick_and_join_ap_threads(run.ap_threads);
+        kick_and_join_ap_threads(std::mem::take(&mut run.run_threads.ap_threads));
         if crate::vmm::debug_logging_enabled() {
             eprintln!("CLEANUP: all AP threads joined");
         }
@@ -16658,8 +17578,13 @@ impl KtstrVm {
         };
         let cleanup_t = std::time::Instant::now();
 
-        if let Some(h) = run.bpf_write_handle {
-            let _ = h.join();
+        if let Some(h) = run.run_threads.bpf_write.take() {
+            let _ = join_vm_worker_bounded(
+                h,
+                VmWorkerFamily::BpfMapWriter,
+                &worker_wake,
+                worker_wall_deadline,
+            );
         }
         if crate::vmm::debug_logging_enabled() {
             eprintln!("CLEANUP: bpf_write joined {:?}", cleanup_t.elapsed());
@@ -16927,6 +17852,11 @@ impl KtstrVm {
         // later test-side drain that would empty the bridge.
         let periodic_real = run.snapshot_bridge.periodic_real_count();
 
+        if let Some(error) = framework_error {
+            return Err(anyhow::Error::msg(error)
+                .context(crate::test_support::FrameworkInfrastructureFailure));
+        }
+
         Ok(VmResult {
             success: !timed_out && exit_code == 0,
             vcpus: self.vcpus,
@@ -16974,7 +17904,7 @@ impl KtstrVm {
             // devices are the vCPU threads — the BSP completed its
             // run loop earlier (joined back in `run_vm` before `bsp`
             // dropped) and every AP joined upstream in the
-            // `run.ap_threads` join loop above. The virtio-blk
+            // `run.run_threads.ap_threads` join loop above. The virtio-blk
             // worker can therefore receive no new kicks (and the
             // intervening monitor-join + bulk-drain phases give it
             // ample time to drain any in-flight one before settling
@@ -18416,6 +19346,7 @@ mod run_vm_thread_guard_tests {
             freeze: Arc::new(AtomicBool::new(true)),
             bsp_done: Arc::new(AtomicBool::new(false)),
             bsp_done_evt: evt(),
+            worker_wall_deadline: None,
         };
         drop(guard);
         assert!(
@@ -18430,47 +19361,79 @@ mod run_vm_thread_guard_tests {
         );
     }
 
-    /// After `disarm`, the guard is empty: `Drop` must be a no-op (NOT signal
-    /// kill, NOT join), and the handles are handed back to the caller. Proves
-    /// the Ok path reclaims the threads for the normal teardown instead of the
-    /// guard joining them.
+    /// Regression for the normal-path hole which used to disarm the guard
+    /// before TCR/CR3 reads, schedstat collection, contention finalization, and
+    /// VmRunState construction. An unwind in that interval dropped naked
+    /// JoinHandles and detached guest-memory readers.
+    ///
+    /// The fixture deliberately declares the armed guard before the simulated
+    /// guest-memory mapping, matching VmRunState's field order. Rust drops
+    /// fields in declaration order: the worker's terminal publication is
+    /// therefore joined before the mapping's Drop records its observation.
     #[test]
-    fn disarm_hands_back_handles_and_drop_is_inert() {
+    fn post_run_processing_unwind_joins_readers_before_guest_memory_drop() {
+        struct GuestMemoryMapping {
+            readers_joined: Arc<AtomicUsize>,
+            joined_seen_at_drop: Arc<AtomicUsize>,
+        }
+
+        impl Drop for GuestMemoryMapping {
+            fn drop(&mut self) {
+                self.joined_seen_at_drop.store(
+                    self.readers_joined.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+            }
+        }
+
+        struct PostRunHandoff {
+            _run_threads: RunVmThreadGuard,
+            _guest_memory: GuestMemoryMapping,
+        }
+
         let kill = Arc::new(AtomicBool::new(false));
         let joined = Arc::new(AtomicUsize::new(0));
-        // Worker exits on its OWN flag, not the guard's kill, so we can prove the
-        // disarmed guard neither signals kill nor joins it.
-        let go = Arc::new(AtomicBool::new(false));
-        let go_worker = go.clone();
-        let joined_worker = joined.clone();
-        let h = std::thread::spawn(move || {
-            while !go_worker.load(Ordering::Acquire) {
-                std::thread::yield_now();
+        let joined_seen_at_drop = Arc::new(AtomicUsize::new(usize::MAX));
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let kill = Arc::clone(&kill);
+            let joined = Arc::clone(&joined);
+            let joined_seen_at_drop = Arc::clone(&joined_seen_at_drop);
+            move || {
+                let handoff = PostRunHandoff {
+                    _run_threads: RunVmThreadGuard {
+                        ap_threads: Vec::new(),
+                        monitor: None,
+                        bpf_write: Some(kill_watching_worker(
+                            Arc::clone(&kill),
+                            Arc::clone(&joined),
+                        )),
+                        freeze_coord: None,
+                        watchdog: None,
+                        kill,
+                        kill_evt: evt(),
+                        freeze: Arc::new(AtomicBool::new(false)),
+                        bsp_done: Arc::new(AtomicBool::new(false)),
+                        bsp_done_evt: evt(),
+                        worker_wall_deadline: Some(
+                            Instant::now() + VM_WORKER_TEARDOWN_WALL_BACKSTOP,
+                        ),
+                    },
+                    _guest_memory: GuestMemoryMapping {
+                        readers_joined: joined,
+                        joined_seen_at_drop,
+                    },
+                };
+                std::hint::black_box(&handoff);
+                panic!("injected panic during post-run result processing");
             }
-            joined_worker.fetch_add(1, Ordering::Release);
-        });
-        let mut guard = RunVmThreadGuard {
-            ap_threads: Vec::new(),
-            monitor: None,
-            bpf_write: Some(h),
-            freeze_coord: None,
-            watchdog: None,
-            kill: kill.clone(),
-            kill_evt: evt(),
-            freeze: Arc::new(AtomicBool::new(false)),
-            bsp_done: Arc::new(AtomicBool::new(false)),
-            bsp_done_evt: evt(),
-        };
-        let handles = guard.disarm();
-        drop(guard); // disarmed -> inert
-        assert!(
-            !kill.load(Ordering::Acquire),
-            "a disarmed guard's Drop does not signal kill"
+        }));
+
+        assert!(unwind.is_err());
+        assert_eq!(
+            joined_seen_at_drop.load(Ordering::Acquire),
+            1,
+            "the armed handoff guard joins its guest-memory reader before the \
+             mapping is allowed to drop"
         );
-        assert!(handles.bpf_write.is_some(), "disarm returns the handle");
-        // Release + join the reclaimed handle ourselves (the Ok-path role).
-        go.store(true, Ordering::Release);
-        let _ = handles.bpf_write.unwrap().join();
-        assert_eq!(joined.load(Ordering::Acquire), 1);
     }
 }

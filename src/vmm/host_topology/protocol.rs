@@ -896,6 +896,7 @@ where
     }
     let stagger = Duration::from_millis((std::process::id() as u64 * 37) % 1000);
     loop {
+        super::tick_reservation_wait_progress();
         check_interrupted(cancelled)?;
         match check_result(
             ticket.state_or_wait(WAITER_CRASH_RECOVERY_BASE + stagger, cancelled),
@@ -1435,6 +1436,7 @@ fn acquire_as_coordinator_impl<T>(
     let mut retry_deadline = std::time::Instant::now() + COORDINATOR_WAKE_FALLBACK;
     let mut pending_events = LockDirEvents::default();
     let outcome = loop {
+        super::tick_reservation_wait_progress();
         check_interrupted(cancelled)?;
         pending_events.merge(check_result(watch.drain(&watched_resources), cancelled)?);
         let closed_tickets: Vec<_> = pending_events.liveness_closes.iter().copied().collect();
@@ -1554,24 +1556,33 @@ fn acquire_as_coordinator_impl<T>(
         retry_deadline = retry_deadline.min(now + retry_interval);
         let liveness_deadline = now + liveness_due_in;
         let wake_deadline = retry_deadline.min(liveness_deadline);
-        match check_result(
-            watch.wait(
-                wake_deadline.saturating_duration_since(now),
-                &watched_resources,
-            ),
-            cancelled,
-        )? {
-            Some(events) => {
-                pending_events.merge(events);
-            }
-            None => {
-                // A global liveness deadline is persisted in the registry, so
-                // rapid coordinator handoff cannot postpone it. If that
-                // deadline alone woke us, the next schedule performs the due
-                // sweep without also manufacturing a whole-watch retry.
-                retry_due = liveness_deadline >= retry_deadline;
-                if retry_due {
-                    retry_deadline = std::time::Instant::now() + retry_interval;
+        loop {
+            let wait_now = std::time::Instant::now();
+            let semantic_wait = wake_deadline.saturating_duration_since(wait_now);
+            let syscall_wait = super::reservation_wait_progress_poll()
+                .map_or(semantic_wait, |poll| semantic_wait.min(poll));
+            match check_result(watch.wait(syscall_wait, &watched_resources), cancelled)? {
+                Some(events) => {
+                    pending_events.merge(events);
+                    break;
+                }
+                None => {
+                    super::tick_reservation_wait_progress();
+                    if std::time::Instant::now() < wake_deadline {
+                        // This was only a synchronous progress slice. Remain
+                        // inside the same semantic watch wait: do not take the
+                        // registry lock or run another schedule pass.
+                        continue;
+                    }
+                    // A global liveness deadline is persisted in the registry,
+                    // so rapid coordinator handoff cannot postpone it. If that
+                    // deadline alone woke us, the next schedule performs the
+                    // due sweep without also manufacturing a whole-watch retry.
+                    retry_due = liveness_deadline >= retry_deadline;
+                    if retry_due {
+                        retry_deadline = std::time::Instant::now() + retry_interval;
+                    }
+                    break;
                 }
             }
         }

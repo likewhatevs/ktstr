@@ -89,12 +89,14 @@ struct DiscoverSchedulerRequest {
     package: String,
     manifest_dir: String,
     workspace_root: PathBuf,
+    target_dir: PathBuf,
     package_id: PackageId,
 }
 
 #[derive(Debug)]
 struct WorkspaceSchedulerBuild {
     root: PathBuf,
+    target_dir: PathBuf,
     /// package name -> Cargo package ID
     packages: BTreeMap<String, PackageId>,
     requests: Vec<DiscoverSchedulerRequest>,
@@ -746,20 +748,55 @@ fn build_injected_scoped_nextest_args_with(
     inject: impl FnOnce(Vec<String>) -> Result<Vec<String>, String>,
 ) -> Result<Vec<String>, String> {
     inject(build_scoped_nextest_args(nextest_profile, forward, plan))
+        .map(crate::run_cargo::normalize_nextest_command_admission)
+}
+
+fn probe_dylib_path(
+    loader_paths: &[PathBuf],
+) -> Result<Option<(&'static str, std::ffi::OsString)>, String> {
+    if loader_paths.is_empty() {
+        return Ok(None);
+    }
+    #[cfg(target_os = "macos")]
+    let variable = "DYLD_FALLBACK_LIBRARY_PATH";
+    #[cfg(windows)]
+    let variable = "PATH";
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    let variable = "LD_LIBRARY_PATH";
+
+    let inherited = std::env::var_os(variable)
+        .into_iter()
+        .flat_map(|value| std::env::split_paths(&value).collect::<Vec<_>>());
+    let value = std::env::join_paths(loader_paths.iter().cloned().chain(inherited))
+        .map_err(|error| format!("construct scheduler-probe {variable}: {error}"))?;
+    Ok(Some((variable, value)))
 }
 
 fn probe_scheduler_declarations(
     test_bins: &[PathBuf],
+    loader_paths: &[PathBuf],
+    probe_provenance: &HashMap<PathBuf, PathBuf>,
 ) -> Result<Vec<TestBinarySchedulerDeclarations>, String> {
     if test_bins.is_empty() {
         return Ok(Vec::new());
     }
+    let dylib_path = probe_dylib_path(loader_paths)?;
+    let profile_dir = tempfile::Builder::new()
+        .prefix("ktstr-scheduler-probe-profraw-")
+        .tempdir()
+        .map_err(|error| format!("create temporary scheduler-probe profile directory: {error}"))?;
+    let profile_pattern = profile_dir.path().join("probe-%p-%m.profraw");
     let mut per_binary: Vec<TestBinarySchedulerDeclarations> =
         match crate::misc::probe_collect_from_bins(
             test_bins,
             |bin| {
                 let mut command = Command::new(bin);
-                command.arg("--ktstr-list-schedulers");
+                command
+                    .arg("--ktstr-list-schedulers")
+                    .env("LLVM_PROFILE_FILE", &profile_pattern);
+                if let Some((variable, value)) = &dylib_path {
+                    command.env(variable, value);
+                }
                 command
             },
             |bin, output| {
@@ -769,12 +806,17 @@ fn probe_scheduler_declarations(
                         bin.display()
                     )
                 })?;
-                let executable = std::fs::canonicalize(bin).map_err(|error| {
-                    format!(
-                        "canonicalize warmed test executable {} after scheduler probe: {error}",
-                        bin.display()
-                    )
-                })?;
+                let executable = if let Some(source) = probe_provenance.get(bin) {
+                    source.clone()
+                } else {
+                    std::fs::canonicalize(bin).map_err(|error| {
+                        format!(
+                            "canonicalize warmed test executable {} after scheduler probe: \
+                             {error}",
+                            bin.display()
+                        )
+                    })?
+                };
                 Ok(TestBinarySchedulerDeclarations {
                     executable,
                     declarations,
@@ -796,6 +838,103 @@ fn probe_scheduler_declarations(
     let mut seen = HashSet::new();
     per_binary.retain(|binary| seen.insert(binary.executable.clone()));
     Ok(per_binary)
+}
+
+fn probe_scheduler_artifact_requirements(
+    test_bins: &[PathBuf],
+    loader_paths: &[PathBuf],
+) -> Result<Vec<ktstr::test_support::SchedulerArtifactRequirement>, String> {
+    if test_bins.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dylib_path = probe_dylib_path(loader_paths)?;
+    let profile_dir = tempfile::Builder::new()
+        .prefix("ktstr-scheduler-requirements-profraw-")
+        .tempdir()
+        .map_err(|error| {
+            format!("create temporary scheduler-requirements profile directory: {error}")
+        })?;
+    let profile_pattern = profile_dir.path().join("probe-%p-%m.profraw");
+    let per_binary: Vec<Vec<ktstr::test_support::SchedulerArtifactRequirement>> =
+        match crate::misc::probe_collect_from_bins(
+            test_bins,
+            |bin| {
+                let mut command = Command::new(bin);
+                command
+                    .arg("--ktstr-list-scheduler-artifact-requirements")
+                    .env("LLVM_PROFILE_FILE", &profile_pattern);
+                if let Some((variable, value)) = &dylib_path {
+                    command.env(variable, value);
+                }
+                command
+            },
+            |bin, output| {
+                serde_json::from_slice(&output.stdout).map_err(|error| {
+                    format!(
+                        "parse --ktstr-list-scheduler-artifact-requirements output \
+                         from {}: {error}",
+                        bin.display()
+                    )
+                })
+            },
+        ) {
+            Ok(entries) => entries,
+            Err(crate::misc::ProbeError::Miss(_)) => Vec::new(),
+            Err(error @ crate::misc::ProbeError::Setup(_)) => {
+                return Err(format!(
+                    "probe warmed test binaries for scheduler artifact requirements: \
+                     {error:?}"
+                ));
+            }
+        };
+
+    struct RequirementAccumulator {
+        binary_kind: ktstr::test_support::BinaryKindJson,
+        manifest_dir: String,
+        schedulers: BTreeMap<String, ()>,
+        use_count: usize,
+    }
+    let mut merged: BTreeMap<(u8, String, String), RequirementAccumulator> = BTreeMap::new();
+    for requirement in per_binary.into_iter().flatten() {
+        let (kind_order, value) = match &requirement.binary_kind {
+            ktstr::test_support::BinaryKindJson::Discover(value) => (0, value.clone()),
+            ktstr::test_support::BinaryKindJson::Path(value) => (1, value.clone()),
+            ktstr::test_support::BinaryKindJson::Eevdf
+            | ktstr::test_support::BinaryKindJson::KernelBuiltin => {
+                return Err(
+                    "scheduler artifact requirements probe emitted a kernel-only scheduler"
+                        .to_string(),
+                );
+            }
+        };
+        let key = (kind_order, value, requirement.manifest_dir.clone());
+        let accumulator = merged
+            .entry(key)
+            .or_insert_with(|| RequirementAccumulator {
+                binary_kind: requirement.binary_kind.clone(),
+                manifest_dir: requirement.manifest_dir.clone(),
+                schedulers: BTreeMap::new(),
+                use_count: 0,
+            });
+        accumulator.use_count = accumulator
+            .use_count
+            .checked_add(requirement.use_count)
+            .ok_or_else(|| "scheduler artifact requirement use_count overflow".to_string())?;
+        for scheduler in requirement.schedulers {
+            accumulator.schedulers.insert(scheduler, ());
+        }
+    }
+    Ok(merged
+        .into_values()
+        .map(
+            |requirement| ktstr::test_support::SchedulerArtifactRequirement {
+                binary_kind: requirement.binary_kind,
+                manifest_dir: requirement.manifest_dir,
+                schedulers: requirement.schedulers.into_keys().collect(),
+                use_count: requirement.use_count,
+            },
+        )
+        .collect())
 }
 
 /// Apply the scheduler-name filter and child-emission eligibility before
@@ -834,7 +973,7 @@ fn selected_emitting_scheduler_declarations(
     Ok(identities.into_values().collect())
 }
 
-fn scheduler_profile_for_run(cli_profile: Option<&str>) -> String {
+pub(crate) fn scheduler_profile_for_run(cli_profile: Option<&str>) -> String {
     match cli_profile {
         Some(profile) if !profile.is_empty() => profile.to_string(),
         Some(_) => "release".to_string(),
@@ -847,7 +986,7 @@ fn declaring_workspace(
     package: &str,
     manifest_dir: &str,
     metadata_options: &[String],
-) -> Result<Option<(PathBuf, PackageId)>, String> {
+) -> Result<Option<(PathBuf, PathBuf, PackageId)>, String> {
     let manifest_dir = Path::new(manifest_dir);
     if !manifest_dir.is_dir() {
         return Err(format!(
@@ -887,7 +1026,8 @@ fn declaring_workspace(
                 scheduler, metadata.workspace_root,
             )
         })?;
-    Ok(Some((workspace_root, package.id.clone())))
+    let target_dir = metadata.target_directory.into_std_path_buf();
+    Ok(Some((workspace_root, target_dir, package.id.clone())))
 }
 
 /// Mirror every parent-visible child-listing gate before conflict detection,
@@ -901,7 +1041,11 @@ fn selected_scheduler_plan(
     presets: &[ktstr::gauntlet::TopoPreset],
     metadata_options: &[String],
 ) -> Result<SelectedSchedulerPlan, String> {
-    let mut workspaces: BTreeMap<(String, String), Option<(PathBuf, PackageId)>> = BTreeMap::new();
+    let mut workspaces: BTreeMap<
+        (String, String),
+        Option<(PathBuf, PathBuf, PackageId)>,
+    > = BTreeMap::new();
+    let scheduler_override = std::env::var_os(ktstr::KTSTR_SCHEDULER_ENV);
     let schedulers =
         selected_emitting_scheduler_declarations(declarations, scheduler_filter, |scheduler| {
             use ktstr::test_support::BinaryKindJson;
@@ -925,6 +1069,7 @@ fn selected_scheduler_plan(
             }
             match &scheduler.binary_kind {
                 BinaryKindJson::Path(path) => Ok(Path::new(path).exists()),
+                BinaryKindJson::Discover(_) if scheduler_override.is_some() => Ok(true),
                 BinaryKindJson::Discover(package) => {
                     if scheduler.manifest_dir.is_empty() {
                         return Err(format!(
@@ -958,8 +1103,11 @@ fn selected_scheduler_plan(
         let ktstr::test_support::BinaryKindJson::Discover(package) = &scheduler.binary_kind else {
             continue;
         };
+        if scheduler_override.is_some() {
+            continue;
+        }
         let key = (scheduler.manifest_dir.clone(), package.clone());
-        let (workspace_root, package_id) = workspaces
+        let (workspace_root, target_dir, package_id) = workspaces
             .get(&key)
             .cloned()
             .flatten()
@@ -969,6 +1117,7 @@ fn selected_scheduler_plan(
             package: package.clone(),
             manifest_dir: scheduler.manifest_dir.clone(),
             workspace_root,
+            target_dir,
             package_id,
         });
     }
@@ -1039,14 +1188,16 @@ fn plan_verifier_cell_ownership(
 fn plan_workspace_scheduler_builds(
     requests: &[DiscoverSchedulerRequest],
 ) -> Result<Vec<WorkspaceSchedulerBuild>, String> {
-    let mut groups: BTreeMap<PathBuf, WorkspaceSchedulerBuild> = BTreeMap::new();
+    let mut groups: BTreeMap<(PathBuf, PathBuf), WorkspaceSchedulerBuild> = BTreeMap::new();
     for request in requests {
         let root = request.workspace_root.clone();
+        let target_dir = request.target_dir.clone();
         let package_id = request.package_id.clone();
         let group = groups
-            .entry(root.clone())
+            .entry((root.clone(), target_dir.clone()))
             .or_insert_with(|| WorkspaceSchedulerBuild {
                 root,
+                target_dir,
                 packages: BTreeMap::new(),
                 requests: Vec::new(),
             });
@@ -1145,137 +1296,366 @@ fn scheduler_workspace_build_args(
     args
 }
 
+fn explicit_scheduler_target_dir(
+    group: &WorkspaceSchedulerBuild,
+    build_options: &[String],
+) -> Option<PathBuf> {
+    let mut explicit = None;
+    let mut index = 0;
+    while index < build_options.len() {
+        let argument = &build_options[index];
+        if argument == "--target-dir" {
+            if let Some(value) = build_options.get(index + 1) {
+                explicit = Some(PathBuf::from(value));
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--target-dir=") {
+            explicit = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        index += if matches!(argument.as_str(), "--config" | "--target" | "-Z") {
+            2
+        } else {
+            1
+        };
+    }
+    explicit.map(|path| {
+        if path.is_absolute() {
+            path
+        } else {
+            group.root.join(path)
+        }
+    })
+}
+
+fn effective_scheduler_target_dir(
+    group: &WorkspaceSchedulerBuild,
+    build_options: &[String],
+) -> PathBuf {
+    explicit_scheduler_target_dir(group, build_options)
+        .unwrap_or_else(|| group.target_dir.clone())
+}
+
+fn scheduler_workspace_execution(
+    group: &WorkspaceSchedulerBuild,
+    profile: &str,
+    build_options: &[String],
+) -> (Vec<String>, PathBuf) {
+    let explicit_target_dir = explicit_scheduler_target_dir(group, build_options);
+    let target_dir = effective_scheduler_target_dir(group, build_options);
+    let mut build_args = scheduler_workspace_build_args(group, profile, build_options);
+    if explicit_target_dir.is_none() {
+        // Metadata resolves an inherited relative CARGO_TARGET_DIR against the
+        // declaring member directory. The batched build runs from the
+        // workspace root, where inheriting that same relative value would
+        // silently select a different directory than the lock. Pin Cargo to
+        // metadata's already-resolved absolute path so writer and lease are
+        // necessarily identical.
+        build_args.extend([
+            "--target-dir".to_string(),
+            target_dir.display().to_string(),
+        ]);
+    }
+    (build_args, target_dir)
+}
+
+struct WorkspaceSchedulerArtifacts {
+    paths: BTreeMap<String, PathBuf>,
+    snapshots: Vec<ktstr::scheduler_artifact::SchedulerArtifactSnapshot>,
+}
+
 fn build_scheduler_workspace(
     group: &WorkspaceSchedulerBuild,
     profile: &str,
     build_options: &[String],
-) -> Result<BTreeMap<String, PathBuf>, String> {
+    cli_label: &str,
+) -> Result<WorkspaceSchedulerArtifacts, String> {
+    let (build_args, target_dir) = scheduler_workspace_execution(group, profile, build_options);
     let mut command = Command::new("cargo");
-    command
-        .current_dir(&group.root)
-        .args(scheduler_workspace_build_args(
-            group,
-            profile,
-            build_options,
-        ));
-    let output = crate::run_cargo::run_reserved_build_output(
+    command.current_dir(&group.root).args(build_args);
+    let pinned = crate::run_cargo::run_reserved_build_output_under_lease(
         command,
-        "cargo ktstr verifier",
+        cli_label,
         "scheduler workspace pre-build",
+        &target_dir,
+        |output| {
+            if !output.status.success() {
+                return Err(format!(
+                    "scheduler prebuild in workspace {} failed ({}) — see Cargo output above",
+                    group.root.display(),
+                    output
+                        .status
+                        .code()
+                        .map_or("signal".to_string(), |code| code.to_string()),
+                ));
+            }
+            map_scheduler_artifacts(&output.stdout, group)?
+                .into_iter()
+                .map(|(package, path)| {
+                    let pinned = ktstr::cache::pin_content_file(&path).map_err(|error| {
+                        format!(
+                            "pin Cargo-emitted scheduler package {package:?} artifact {} \
+                             while target output is exclusively owned: {error:#}",
+                            path.display(),
+                        )
+                    })?;
+                    Ok((package, pinned))
+                })
+                .collect::<Result<BTreeMap<_, _>, String>>()
+        },
     )?;
-    if !output.status.success() {
-        return Err(format!(
-            "scheduler prebuild in workspace {} failed ({}) — see Cargo output above",
-            group.root.display(),
-            output
-                .status
-                .code()
-                .map_or("signal".to_string(), |code| code.to_string()),
-        ));
+
+    // The output lease has ended, but every source inode is pinned. Hash and
+    // publish outside that target-dir critical section so an unrelated Cargo
+    // build can proceed while the content CAS does its one-time work.
+    let mut paths = BTreeMap::new();
+    let mut snapshots = Vec::with_capacity(pinned.len());
+    for (package, pinned) in pinned {
+        let snapshot =
+            ktstr::scheduler_artifact::snapshot_pinned_scheduler_artifact(pinned)?;
+        paths.insert(package, snapshot.path().to_path_buf());
+        snapshots.push(snapshot);
     }
-    map_scheduler_artifacts(&output.stdout, group)
+    Ok(WorkspaceSchedulerArtifacts { paths, snapshots })
 }
 
-/// Copy one Cargo-emitted scheduler executable into the parent-owned result
-/// directory through an already-open source descriptor.
+/// Parent-owned scheduler handoff kept alive through one nextest run.
+pub(crate) struct PreparedSchedulerArtifacts {
+    _owner: tempfile::TempDir,
+    _snapshots: Vec<ktstr::scheduler_artifact::SchedulerArtifactSnapshot>,
+    pub(crate) manifest_path: PathBuf,
+    pub(crate) binaries: Vec<PathBuf>,
+}
+
+/// Probe every primary and staged scheduler requirement from the exact warmed
+/// test executables, build each distinct Discover package once, and snapshot
+/// every Discover and Path source into the shared immutable content CAS.
 ///
-/// Opening first pins the source inode against a concurrent Cargo atomic
-/// replacement. The destination is populated under a private temporary name,
-/// made read-only executable, synced, and renamed into place atomically; cells
-/// never observe a partial file and the manifest never points back into a
-/// mutable Cargo target directory.
-fn snapshot_scheduler_artifact(
-    source_path: &Path,
-    result_dir: &Path,
-    ordinal: usize,
-) -> Result<PathBuf, String> {
-    let source = std::fs::File::open(source_path).map_err(|error| {
-        format!(
-            "open scheduler artifact {} for immutable snapshot: {error}",
-            source_path.display()
-        )
-    })?;
-    snapshot_scheduler_artifact_from_open_file(source, source_path, result_dir, ordinal)
-}
+/// The returned owner and CAS leases must remain alive through nextest. Its
+/// manifest is complete and authoritative for all child resolution; there is
+/// no target-directory scan, declaration-only shortcut, or child Cargo
+/// fallback.
+pub(crate) fn prepare_scheduler_artifacts(
+    test_bins: &[PathBuf],
+    loader_paths: &[PathBuf],
+    cli_profile: Option<&str>,
+    cargo_args: &[String],
+    invocation_dir: &Path,
+) -> Result<PreparedSchedulerArtifacts, String> {
+    use ktstr::scheduler_artifact::{
+        SCHEDULER_ARTIFACT_MANIFEST_VERSION, SchedulerArtifactEntry,
+        SchedulerArtifactManifest, SchedulerArtifactSpec,
+    };
 
-fn snapshot_scheduler_artifact_from_open_file(
-    mut source: std::fs::File,
-    source_path: &Path,
-    result_dir: &Path,
-    ordinal: usize,
-) -> Result<PathBuf, String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let source_metadata = source.metadata().map_err(|error| {
-        format!(
-            "stat opened scheduler artifact {}: {error}",
-            source_path.display()
-        )
-    })?;
-    if !source_metadata.is_file() {
-        return Err(format!(
-            "scheduler artifact is not a file: {}",
-            source_path.display()
-        ));
+    let requirements =
+        probe_scheduler_artifact_requirements(test_bins, loader_paths)?;
+    let profile = scheduler_profile_for_run(cli_profile);
+    let metadata_options = declaring_metadata_options(cargo_args, invocation_dir);
+    let build_options = scheduler_build_options(cargo_args, invocation_dir);
+    let scheduler_override = std::env::var_os(ktstr::KTSTR_SCHEDULER_ENV).map(PathBuf::from);
+    let mut workspaces: BTreeMap<
+        (String, String),
+        Option<(PathBuf, PathBuf, PackageId)>,
+    > = BTreeMap::new();
+    let owner = tempfile::Builder::new()
+        .prefix("ktstr-scheduler-artifacts-")
+        .tempdir()
+        .map_err(|error| format!("create scheduler artifact handoff directory: {error}"))?;
+    let mut requests = Vec::new();
+    let mut pending: BTreeMap<
+        (SchedulerArtifactSpec, String),
+        (Vec<String>, PathBuf),
+    > = BTreeMap::new();
+    let mut discover_scheduler_names: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for requirement in requirements {
+        if requirement.manifest_dir.is_empty() || requirement.schedulers.is_empty() {
+            return Err(format!(
+                "scheduler artifact requirement has empty manifest_dir or scheduler names: \
+                 {requirement:?}"
+            ));
+        }
+        match requirement.binary_kind {
+            ktstr::test_support::BinaryKindJson::Eevdf
+            | ktstr::test_support::BinaryKindJson::KernelBuiltin => {
+                return Err(
+                    "scheduler artifact requirements contained a kernel-only scheduler"
+                        .to_string(),
+                );
+            }
+            ktstr::test_support::BinaryKindJson::Path(path) => {
+                let source = std::fs::canonicalize(&path).map_err(|error| {
+                    format!(
+                        "canonicalize required scheduler path {}: {error}",
+                        Path::new(&path).display()
+                    )
+                })?;
+                pending.insert(
+                    (
+                        SchedulerArtifactSpec::Path(path),
+                        requirement.manifest_dir,
+                    ),
+                    (requirement.schedulers, source),
+                );
+            }
+            ktstr::test_support::BinaryKindJson::Discover(package)
+                if scheduler_override.is_some() =>
+            {
+                let source = scheduler_override
+                    .as_ref()
+                    .expect("Discover override checked above");
+                let source = std::fs::canonicalize(source).map_err(|error| {
+                    format!(
+                        "canonicalize KTSTR_SCHEDULER override {}: {error}",
+                        source.display()
+                    )
+                })?;
+                pending.insert(
+                    (
+                        SchedulerArtifactSpec::Discover(package),
+                        requirement.manifest_dir,
+                    ),
+                    (requirement.schedulers, source),
+                );
+            }
+            ktstr::test_support::BinaryKindJson::Discover(package) => {
+                let scheduler = requirement.schedulers[0].clone();
+                let key = (requirement.manifest_dir.clone(), package.clone());
+                if !workspaces.contains_key(&key) {
+                    let resolution = declaring_workspace(
+                        &scheduler,
+                        &package,
+                        &requirement.manifest_dir,
+                        &metadata_options,
+                    )?;
+                    workspaces.insert(key.clone(), resolution);
+                }
+                let Some((workspace_root, target_dir, package_id)) =
+                    workspaces.get(&key).cloned().flatten()
+                else {
+                    return Err(format!(
+                        "required scheduler package {package:?} for {scheduler:?} is not a \
+                         member of the workspace declared by {}",
+                        requirement.manifest_dir,
+                    ));
+                };
+                requests.push(DiscoverSchedulerRequest {
+                    scheduler,
+                    package: package.clone(),
+                    manifest_dir: requirement.manifest_dir.clone(),
+                    workspace_root,
+                    target_dir,
+                    package_id,
+                });
+                discover_scheduler_names.insert(
+                    (requirement.manifest_dir, package),
+                    requirement.schedulers,
+                );
+            }
+        }
     }
-    if source_metadata.permissions().mode() & 0o111 == 0 {
-        return Err(format!(
-            "scheduler artifact is not executable: {}",
-            source_path.display()
-        ));
+
+    let groups = plan_workspace_scheduler_builds(&requests)?;
+    let package_count: usize = groups.iter().map(|group| group.packages.len()).sum();
+    if package_count > 0 {
+        eprintln!(
+            "cargo ktstr: prebuilding {package_count} declared scheduler package(s) \
+             in {} workspace batch(es) with profile {profile:?}",
+            groups.len(),
+        );
+    }
+    let mut snapshot_paths: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+    let mut snapshots = Vec::new();
+    for group in &groups {
+        let artifacts = build_scheduler_workspace(group, &profile, &build_options, "cargo ktstr")?;
+        for path in artifacts.paths.values() {
+            snapshot_paths.insert(path.clone(), path.clone());
+        }
+        snapshots.extend(artifacts.snapshots);
+        for request in &group.requests {
+            let emitted = artifacts
+                .paths
+                .get(&request.package)
+                .expect("artifact completeness checked above");
+            let schedulers = discover_scheduler_names
+                .get(&(request.manifest_dir.clone(), request.package.clone()))
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "lost scheduler names for required package {:?}, manifest_dir {:?}",
+                        request.package, request.manifest_dir,
+                    )
+                })?;
+            pending.insert(
+                (
+                    SchedulerArtifactSpec::Discover(request.package.clone()),
+                    request.manifest_dir.clone(),
+                ),
+                (schedulers, emitted.clone()),
+            );
+        }
     }
 
-    let final_path = result_dir.join(format!("scheduler-executable-{ordinal}"));
-    let mut temporary = tempfile::NamedTempFile::new_in(result_dir).map_err(|error| {
-        format!(
-            "create temporary scheduler snapshot in {}: {error}",
-            result_dir.display()
-        )
-    })?;
-    std::io::copy(&mut source, temporary.as_file_mut()).map_err(|error| {
-        format!(
-            "copy scheduler artifact {} into immutable snapshot: {error}",
-            source_path.display()
-        )
-    })?;
-    temporary
-        .as_file_mut()
-        .flush()
-        .map_err(|error| format!("flush scheduler snapshot: {error}"))?;
-    temporary
-        .as_file()
-        .set_permissions(std::fs::Permissions::from_mode(0o555))
-        .map_err(|error| format!("make scheduler snapshot read-only executable: {error}"))?;
-    temporary
-        .as_file()
-        .sync_all()
-        .map_err(|error| format!("sync scheduler snapshot: {error}"))?;
-    temporary.persist(&final_path).map_err(|error| {
-        format!(
-            "atomically install scheduler snapshot {}: {}",
-            final_path.display(),
-            error.error,
-        )
-    })?;
-    std::fs::canonicalize(&final_path).map_err(|error| {
-        format!(
-            "canonicalize scheduler snapshot {}: {error}",
-            final_path.display()
-        )
+    let mut entries = Vec::with_capacity(pending.len());
+    for ((binary, manifest_dir), (schedulers, source)) in pending {
+        let snapshot_path = if let Some(snapshot_path) = snapshot_paths.get(&source) {
+            snapshot_path.clone()
+        } else {
+            let snapshot =
+                ktstr::scheduler_artifact::snapshot_scheduler_artifact(&source)?;
+            let snapshot_path = snapshot.path().to_path_buf();
+            snapshot_paths.insert(source, snapshot_path.clone());
+            snapshots.push(snapshot);
+            snapshot_path
+        };
+        entries.push(SchedulerArtifactEntry {
+            binary,
+            manifest_dir,
+            schedulers,
+            path: snapshot_path,
+        });
+    }
+    let mut binaries = snapshot_paths.into_values().collect::<Vec<_>>();
+    binaries.sort();
+    binaries.dedup();
+    let manifest = SchedulerArtifactManifest {
+        version: SCHEDULER_ARTIFACT_MANIFEST_VERSION,
+        profile,
+        entries,
+    };
+    let manifest_path =
+        ktstr::scheduler_artifact::write_scheduler_artifact_manifest(owner.path(), &manifest)?;
+    Ok(PreparedSchedulerArtifacts {
+        _owner: owner,
+        _snapshots: snapshots,
+        manifest_path,
+        binaries,
     })
 }
 
 struct SchedulerPrebuildContext<'a> {
-    result_dir: &'a Path,
     build_options: &'a [String],
     interrupted: &'a std::sync::atomic::AtomicBool,
 }
 
+struct PreparedSchedulerManifest {
+    manifest: ktstr::scheduler_artifact::SchedulerArtifactManifest,
+    _snapshots: Vec<ktstr::scheduler_artifact::SchedulerArtifactSnapshot>,
+}
+
 fn prebuild_scheduler_manifest(
     requests: &[DiscoverSchedulerRequest],
+    selected_schedulers: &[ktstr::test_support::SchedulerJson],
     profile: &str,
     context: SchedulerPrebuildContext<'_>,
-) -> Result<ktstr::verifier::VerifierSchedulerArtifactManifest, String> {
+) -> Result<PreparedSchedulerManifest, String> {
+    use ktstr::scheduler_artifact::{
+        SCHEDULER_ARTIFACT_MANIFEST_VERSION, SchedulerArtifactEntry,
+        SchedulerArtifactManifest, SchedulerArtifactSpec,
+    };
+
     if context
         .interrupted
         .load(std::sync::atomic::Ordering::Acquire)
@@ -1291,8 +1671,12 @@ fn prebuild_scheduler_manifest(
             groups.len(),
         );
     }
-    let mut entries = Vec::with_capacity(requests.len());
-    let mut snapshots: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+    let mut sources: BTreeMap<
+        (SchedulerArtifactSpec, String),
+        (BTreeMap<String, ()>, PathBuf),
+    > = BTreeMap::new();
+    let mut snapshot_paths: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+    let mut snapshots = Vec::new();
     for group in &groups {
         if context
             .interrupted
@@ -1300,7 +1684,16 @@ fn prebuild_scheduler_manifest(
         {
             return Err("cargo ktstr verifier interrupted during scheduler prebuild".to_string());
         }
-        let artifacts = build_scheduler_workspace(group, profile, context.build_options)?;
+        let artifacts = build_scheduler_workspace(
+            group,
+            profile,
+            context.build_options,
+            "cargo ktstr verifier",
+        )?;
+        for path in artifacts.paths.values() {
+            snapshot_paths.insert(path.clone(), path.clone());
+        }
+        snapshots.extend(artifacts.snapshots);
         if context
             .interrupted
             .load(std::sync::atomic::Ordering::Acquire)
@@ -1309,83 +1702,113 @@ fn prebuild_scheduler_manifest(
         }
         for request in &group.requests {
             let emitted = artifacts
+                .paths
                 .get(&request.package)
                 .expect("artifact completeness checked above");
-            let path = std::fs::canonicalize(emitted).map_err(|error| {
-                format!(
-                    "canonicalize scheduler {:?} artifact {}: {error}",
-                    request.scheduler,
-                    emitted.display(),
-                )
-            })?;
-            let snapshot = if let Some(snapshot) = snapshots.get(&path) {
-                snapshot.clone()
-            } else {
-                let snapshot =
-                    snapshot_scheduler_artifact(&path, context.result_dir, snapshots.len())?;
-                snapshots.insert(path, snapshot.clone());
-                snapshot
-            };
-            entries.push(ktstr::verifier::VerifierSchedulerArtifactEntry {
-                scheduler: request.scheduler.clone(),
-                package: request.package.clone(),
-                manifest_dir: request.manifest_dir.clone(),
-                path: snapshot,
-            });
+            let path = emitted.clone();
+            let key = (
+                SchedulerArtifactSpec::Discover(request.package.clone()),
+                request.manifest_dir.clone(),
+            );
+            let source = sources
+                .entry(key)
+                .or_insert_with(|| (BTreeMap::new(), path.clone()));
+            if source.1 != path {
+                return Err(format!(
+                    "scheduler artifact identity for package {:?}, manifest_dir {:?} \
+                     resolved to both {} and {}",
+                    request.package,
+                    request.manifest_dir,
+                    source.1.display(),
+                    path.display(),
+                ));
+            }
+            source.0.insert(request.scheduler.clone(), ());
         }
     }
-    entries.sort_by(|left, right| {
-        (
-            &left.scheduler,
-            &left.package,
-            &left.manifest_dir,
-            &left.path,
-        )
-            .cmp(&(
-                &right.scheduler,
-                &right.package,
-                &right.manifest_dir,
-                &right.path,
-            ))
-    });
-    Ok(ktstr::verifier::VerifierSchedulerArtifactManifest {
-        version: ktstr::verifier::VERIFIER_SCHEDULER_ARTIFACT_MANIFEST_VERSION,
-        profile: profile.to_string(),
-        entries,
+
+    let scheduler_override = std::env::var_os(ktstr::KTSTR_SCHEDULER_ENV)
+        .map(PathBuf::from)
+        .map(|path| {
+            std::fs::canonicalize(&path).map_err(|error| {
+                format!(
+                    "canonicalize KTSTR_SCHEDULER override {}: {error}",
+                    path.display()
+                )
+            })
+        })
+        .transpose()?;
+    for scheduler in selected_schedulers {
+        let (binary, source_path) = match &scheduler.binary_kind {
+            ktstr::test_support::BinaryKindJson::Path(path) => (
+                SchedulerArtifactSpec::Path(path.clone()),
+                std::fs::canonicalize(path).map_err(|error| {
+                    format!(
+                        "canonicalize verifier scheduler {:?} path {}: {error}",
+                        scheduler.name,
+                        Path::new(path).display(),
+                    )
+                })?,
+            ),
+            ktstr::test_support::BinaryKindJson::Discover(package)
+                if scheduler_override.is_some() =>
+            {
+                (
+                    SchedulerArtifactSpec::Discover(package.clone()),
+                    scheduler_override
+                        .as_ref()
+                        .expect("Discover override checked above")
+                        .clone(),
+                )
+            }
+            ktstr::test_support::BinaryKindJson::Discover(_) => continue,
+            ktstr::test_support::BinaryKindJson::Eevdf
+            | ktstr::test_support::BinaryKindJson::KernelBuiltin => continue,
+        };
+        let key = (binary, scheduler.manifest_dir.clone());
+        let source = sources
+            .entry(key)
+            .or_insert_with(|| (BTreeMap::new(), source_path.clone()));
+        if source.1 != source_path {
+            return Err(format!(
+                "scheduler artifact identity for {:?}, manifest_dir {:?} resolved to \
+                 both {} and {}",
+                scheduler.binary_kind,
+                scheduler.manifest_dir,
+                source.1.display(),
+                source_path.display(),
+            ));
+        }
+        source.0.insert(scheduler.name.clone(), ());
+    }
+
+    let mut entries = Vec::with_capacity(sources.len());
+    for ((binary, manifest_dir), (scheduler_names, source_path)) in sources {
+        let snapshot_path = if let Some(snapshot_path) = snapshot_paths.get(&source_path) {
+            snapshot_path.clone()
+        } else {
+            let snapshot =
+                ktstr::scheduler_artifact::snapshot_scheduler_artifact(&source_path)?;
+            let snapshot_path = snapshot.path().to_path_buf();
+            snapshot_paths.insert(source_path, snapshot_path.clone());
+            snapshots.push(snapshot);
+            snapshot_path
+        };
+        entries.push(SchedulerArtifactEntry {
+            binary,
+            manifest_dir,
+            schedulers: scheduler_names.into_keys().collect(),
+            path: snapshot_path,
+        });
+    }
+    Ok(PreparedSchedulerManifest {
+        manifest: SchedulerArtifactManifest {
+            version: SCHEDULER_ARTIFACT_MANIFEST_VERSION,
+            profile: profile.to_string(),
+            entries,
+        },
+        _snapshots: snapshots,
     })
-}
-
-fn write_scheduler_manifest(
-    result_dir: &Path,
-    manifest: &ktstr::verifier::VerifierSchedulerArtifactManifest,
-) -> Result<PathBuf, String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let final_path = result_dir.join("scheduler-artifacts-v1.json");
-    let mut temporary = tempfile::NamedTempFile::new_in(result_dir).map_err(|error| {
-        format!(
-            "create temporary scheduler artifact manifest in {}: {error}",
-            result_dir.display()
-        )
-    })?;
-    serde_json::to_writer_pretty(temporary.as_file_mut(), manifest)
-        .map_err(|error| format!("serialize scheduler artifact manifest: {error}"))?;
-    temporary
-        .as_file()
-        .sync_all()
-        .map_err(|error| format!("sync scheduler artifact manifest: {error}"))?;
-    temporary
-        .as_file()
-        .set_permissions(std::fs::Permissions::from_mode(0o444))
-        .map_err(|error| format!("make scheduler artifact manifest read-only: {error}"))?;
-    temporary.persist(&final_path).map_err(|error| {
-        format!(
-            "atomically install scheduler artifact manifest {}: {}",
-            final_path.display(),
-            error.error,
-        )
-    })?;
-    Ok(final_path)
 }
 
 fn write_cell_ownership_manifest(
@@ -1483,6 +1906,8 @@ pub(crate) fn run_verifier(
         &package_plan,
         crate::nextest_config::inject,
     )?;
+    let harness_target_dir =
+        crate::run_cargo::resolve_cargo_target_dir_for_args(&nextest_args, &invocation_dir)?;
     let scheduler_profile = scheduler_profile_for_run(profile.as_deref());
     let declaring_cargo_options = declaring_metadata_options(&args, &invocation_dir);
     let scheduler_cargo_options = scheduler_build_options(&args, &invocation_dir);
@@ -1611,14 +2036,21 @@ pub(crate) fn run_verifier(
             warm.env(var, val);
         }
         warm.env(ktstr::KTSTR_KERNEL_ENV, &resolved[0].1);
-        let test_bins = crate::run_cargo::run_reserved_prebuild_collect_test_bins(
+        let pinned_test_bins = crate::run_cargo::run_reserved_prebuild_collect_test_bins(
             warm,
             "cargo ktstr verifier",
+            &harness_target_dir,
         )?;
         if crate::interrupt::INTERRUPTED.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(None);
         }
-        let binary_declarations = probe_scheduler_declarations(&test_bins)?;
+        let test_bins = pinned_test_bins.probe_paths();
+        let probe_provenance = pinned_test_bins.probe_provenance();
+        let binary_declarations =
+            probe_scheduler_declarations(&test_bins, &[], &probe_provenance)?;
+        // Ownership now records Cargo's canonical emitted paths; no later
+        // phase reads through the warmed executable descriptors.
+        drop(pinned_test_bins);
         if crate::interrupt::INTERRUPTED.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(None);
         }
@@ -1648,25 +2080,37 @@ pub(crate) fn run_verifier(
             plan_verifier_cell_ownership(&binary_declarations, &selected_plan.schedulers)?;
         let scheduler_manifest = prebuild_scheduler_manifest(
             &selected_plan.discover_requests,
+            &selected_plan.schedulers,
             &scheduler_profile,
             SchedulerPrebuildContext {
-                result_dir: result_dir.path(),
                 build_options: &scheduler_cargo_options,
                 interrupted: &crate::interrupt::INTERRUPTED,
             },
         )?;
+        let mut scheduler_binaries = scheduler_manifest
+            .manifest
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        scheduler_binaries.sort();
+        scheduler_binaries.dedup();
+        crate::run_cargo::precompute_cast_cache(&scheduler_binaries)?;
         if crate::interrupt::INTERRUPTED.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(None);
         }
         let scheduler_manifest_path =
-            write_scheduler_manifest(result_dir.path(), &scheduler_manifest)?;
+            ktstr::scheduler_artifact::write_scheduler_artifact_manifest(
+                result_dir.path(),
+                &scheduler_manifest.manifest,
+            )?;
         let cell_ownership_manifest_path =
             write_cell_ownership_manifest(result_dir.path(), &cell_ownership)?;
         if crate::interrupt::INTERRUPTED.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(None);
         }
         cmd.env(
-            ktstr::KTSTR_VERIFIER_SCHEDULER_MANIFEST_ENV,
+            ktstr::KTSTR_SCHEDULER_MANIFEST_ENV,
             scheduler_manifest_path,
         );
         cmd.env(
@@ -1977,14 +2421,14 @@ mod tests {
 
     #[test]
     fn scheduler_snapshot_uses_pinned_source_and_is_read_only_executable() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("cargo-target-scheduler");
         std::fs::write(&source, b"old scheduler bytes").expect("write source");
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755))
             .expect("chmod source");
-        let pinned = std::fs::File::open(&source).expect("pin source fd");
+        let pinned = ktstr::cache::pin_content_file(&source).expect("pin source fd");
 
         let replacement = dir.path().join("replacement");
         std::fs::write(&replacement, b"new scheduler bytes").expect("write replacement");
@@ -1992,30 +2436,29 @@ mod tests {
             .expect("chmod replacement");
         std::fs::rename(&replacement, &source).expect("replace Cargo target path atomically");
 
-        let result_dir = dir.path().join("results");
-        std::fs::create_dir(&result_dir).expect("create result dir");
-        let snapshot = snapshot_scheduler_artifact_from_open_file(pinned, &source, &result_dir, 0)
-            .expect("snapshot pinned scheduler");
+        let snapshot =
+            ktstr::scheduler_artifact::snapshot_pinned_scheduler_artifact(pinned)
+                .expect("snapshot pinned scheduler");
 
         assert_eq!(
-            std::fs::read(&snapshot).expect("read snapshot"),
+            std::fs::read(snapshot.path()).expect("read snapshot"),
             b"old scheduler bytes",
             "the copy follows the pinned source inode, not a replaced target path",
         );
-        let mode = std::fs::metadata(&snapshot)
+        let mode = std::fs::metadata(snapshot.path())
             .expect("snapshot metadata")
             .permissions()
             .mode();
         assert_eq!(mode & 0o222, 0, "snapshot must be read-only");
         assert_eq!(mode & 0o111, 0o111, "snapshot must remain executable");
-        assert_eq!(
-            snapshot.parent(),
-            Some(
-                std::fs::canonicalize(&result_dir)
-                    .expect("canonical result dir")
-                    .as_path()
-            ),
-            "manifestable path lives in the parent result directory",
+        assert_ne!(
+            std::fs::metadata(snapshot.path())
+                .expect("snapshot metadata")
+                .ino(),
+            std::fs::metadata(&source)
+                .expect("replacement metadata")
+                .ino(),
+            "the manifest path must retain the pinned source revision",
         );
     }
 
@@ -2080,6 +2523,7 @@ mod tests {
             .expect("PackageId fixture");
         let group = WorkspaceSchedulerBuild {
             root: PathBuf::from("/w"),
+            target_dir: PathBuf::from("/w/target"),
             packages: BTreeMap::from([("scx_a".to_string(), package_id)]),
             requests: Vec::new(),
         };
@@ -2103,6 +2547,7 @@ mod tests {
         let b: PackageId = serde_json::from_str(r#""scx_b 1.0.0 (path+file:///w/scx_b)""#).unwrap();
         let group = WorkspaceSchedulerBuild {
             root: PathBuf::from("/w"),
+            target_dir: PathBuf::from("/w/target"),
             packages: BTreeMap::from([("scx_b".to_string(), b), ("scx_a".to_string(), a)]),
             requests: Vec::new(),
         };
@@ -2146,6 +2591,45 @@ mod tests {
                 "/invoke/target/ci",
             ]),
             "consumer feature modes never leak into the parent-owned scheduler workspace",
+        );
+    }
+
+    #[test]
+    fn scheduler_workspace_pins_metadata_target_for_relative_cargo_target_dir() {
+        let package: PackageId =
+            serde_json::from_str(r#""scx_a 1.0.0 (path+file:///w/member/scx_a)""#).unwrap();
+        let group = WorkspaceSchedulerBuild {
+            root: PathBuf::from("/w"),
+            // This is the absolute target directory Cargo metadata reports
+            // when invoked from `/w/member` with CARGO_TARGET_DIR=relative.
+            // Inheriting the same env from the batched `/w` build would
+            // otherwise write `/w/relative`, outside the output lease.
+            target_dir: PathBuf::from("/w/member/relative"),
+            packages: BTreeMap::from([("scx_a".to_string(), package)]),
+            requests: Vec::new(),
+        };
+
+        let (args, locked_target) =
+            scheduler_workspace_execution(&group, "release", &[]);
+        assert_eq!(locked_target, PathBuf::from("/w/member/relative"));
+        assert_eq!(
+            &args[args.len() - 2..],
+            strings(&["--target-dir", "/w/member/relative"]).as_slice(),
+            "the Cargo writer must be forced onto the exact metadata/lock path",
+        );
+
+        let (args, locked_target) = scheduler_workspace_execution(
+            &group,
+            "release",
+            &strings(&["--target-dir=/invoke/explicit"]),
+        );
+        assert_eq!(locked_target, PathBuf::from("/invoke/explicit"));
+        assert_eq!(
+            args.iter()
+                .filter(|argument| argument.starts_with("--target-dir"))
+                .count(),
+            1,
+            "an explicit rebased target-dir remains authoritative",
         );
     }
 
@@ -2853,7 +3337,13 @@ mod tests {
     /// `warmup_command_mirrors_run_argv_plus_no_run`.
     #[test]
     fn verifier_warmup_argv_is_run_argv_plus_no_run() {
-        let forwarded = vec!["--cargo-profile".to_string(), "release".to_string()];
+        let forwarded = strings(&[
+            "--cargo-profile",
+            "release",
+            "-j",
+            "192",
+            "--test-threads=8",
+        ]);
         let run_argv = build_injected_scoped_nextest_args_with(
             Some("ci"),
             &forwarded,
@@ -2875,6 +3365,20 @@ mod tests {
             warm_argv[..warm_argv.len() - 1],
             run_argv[..],
             "warm-up must share the run's argv prefix verbatim",
+        );
+        assert!(
+            !run_argv
+                .iter()
+                .any(|argument| argument == "-j" || argument == "--test-threads=8"),
+            "verifier must remove forwarded nextest run-slot controls"
+        );
+        assert_eq!(
+            run_argv
+                .iter()
+                .filter(|argument| argument.as_str() == "--test-threads=1000000")
+                .count(),
+            1,
+            "verifier must use the same single admission scheduler as other routes"
         );
         assert_eq!(
             warm_argv.last().map(String::as_str),

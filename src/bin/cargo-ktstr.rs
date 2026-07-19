@@ -67,6 +67,8 @@ mod nextest_config;
 mod perf_delta;
 #[path = "cargo_ktstr/replay.rs"]
 mod replay;
+#[path = "cargo_ktstr/reserved_build_progress.rs"]
+mod reserved_build_progress;
 #[path = "cargo_ktstr/run_cargo.rs"]
 mod run_cargo;
 #[path = "cargo_ktstr/stats.rs"]

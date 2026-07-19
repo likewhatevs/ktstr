@@ -8,8 +8,11 @@
 //!
 //! # Pipeline
 //!
-//! 1. Read the scheduler binary from disk.
-//! 2. Parse it as a host ELF via [`goblin::elf::Elf::parse`]; locate the
+//! 1. Pin the scheduler inode, resolve its machine-wide streamed content
+//!    digest, and open or publish one immutable content-CAS inode.
+//! 2. On an elected analysis miss, map that inode read-only with
+//!    `MAP_PRIVATE`, parse it as a host ELF via [`goblin::elf::Elf::parse`],
+//!    and locate the
 //!    `.bpf.objs` PROGBITS section. scx schedulers (the only producers
 //!    we target) embed their compiled BPF object(s) inline at that
 //!    section via the libbpf-rs / scx skel codegen. Each `STT_OBJECT`
@@ -27,29 +30,33 @@
 //!    base of the section the record belongs to. The record's `type_id`
 //!    is the BTF id of `BTF_KIND_FUNC` whose `func.type` is the
 //!    [`btf_rs::Type::FuncProto`] the analyzer reseeds R1..R5 from.
-//! 6. Run [`analyze_casts`]; merge the result into a single
-//!    [`CastMap`] aggregating every embedded BPF object's findings.
+//! 6. Run [`analyze_casts`] and retain one [`CastMap`] per embedded BPF
+//!    object in the persisted analysis record.
 //!
 //! # Error policy
 //!
-//! Any failure returns an empty [`CastMap`]. The log level depends on
-//! the failure kind: scheduler-binary read errors, outer ELF parse
+//! Analyzer parse failures return an empty analysis. Cache I/O, coordination,
+//! publication, and mapping failures are infrastructure failures: they
+//! propagate through the lazy wrapper and fail the VM run instead of silently
+//! selecting a different renderer. The log level depends on
+//! the parse failure kind: outer ELF parse
 //! failures, missing `.bpf.objs`, inner ELF parse failures, and
 //! malformed `.BTF` log at `warn!` (these indicate a likely bug in
 //! the scheduler build); a missing `.BTF` section and an inner ELF
 //! with no executable BPF program sections log at `debug!` (these
 //! shapes are valid for non-scx binaries that ship a `.bpf.objs` for
-//! unrelated reasons). The dump path is best-effort — a missing
-//! cast map silently disables typed-pointer promotion in the renderer
-//! (every `u64` field renders as a plain counter, the pre-integration
-//! default).
+//! unrelated reasons). A valid analysis with no cast or cross-BTF findings is
+//! still represented by `None`; that semantic negative result is distinct from
+//! an infrastructure error.
 //!
 //! No libbpf calls, no kernel BPF interaction, no CAP_BPF needed — this
-//! runs purely on the on-disk binary bytes.
+//! runs purely on the immutable content mapping.
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+use anyhow::{Context, Result};
 
 use crate::monitor::cast_analysis::{
     BPF_PSEUDO_CALL, BPF_PSEUDO_KFUNC_CALL, BpfInsn, CastMap, DatasecPointer, FuncEntry,
@@ -150,9 +157,10 @@ pub(crate) struct FwdIndexEntry {
 /// from object B without dropping into the "forward declaration; body
 /// not in this BTF" skip.
 ///
-/// Built once per scheduler binary per process via
-/// [`cached_cast_analysis_for_scheduler`] and shared across VMs by
-/// content hash. The `btfs` vec is `Arc<Btf>` so the rendered
+/// The semantic analysis is elected and persisted once per content hash
+/// across processes. Positive consumers parse BTF from the shared COW mapping
+/// once per process and share this output across their VMs. The `btfs` vec is
+/// `Arc<Btf>` so the rendered
 /// borrows live for the full dump pass without copying the parsed
 /// BTF.
 pub(crate) struct CastAnalysisOutput {
@@ -230,19 +238,17 @@ pub(crate) struct CastAnalysisOutput {
 ///
 /// # Concurrency
 ///
-/// `OnceLock::get_or_init` serialises concurrent first-callers in
-/// the same VM: the second caller blocks while the first runs the
-/// analysis, then both observe the cached
-/// `Option<Arc<CastAnalysisOutput>>`. The inner
+/// Successful initialization is cached in the per-VM `OnceLock`. An
+/// infrastructure error leaves the slot empty so a later caller may retry; the
+/// process-wide retryable entry serialises concurrent first-callers. The inner
 /// [`cached_cast_analysis_for_scheduler`] additionally dedupes work
-/// across VMs by content hash and uses an inner `OnceLock` per
-/// cache entry to avoid the thundering-herd shape where two VMs
-/// find the cache empty under the same lock and both run the
-/// analyzer after releasing it.
+/// across VMs by content hash through a retryable mutex/condition-variable
+/// entry. Cross-process misses use the same per-content builder election;
+/// waiters read the atomic publication rather than repeating analysis.
 pub(crate) struct LazyCastMap {
     /// Scheduler binary path captured at VM build time. `None`
     /// when the builder had no scheduler binary; `.get_full()`
-    /// returns `None` immediately in that case.
+    /// returns `Ok(None)` immediately in that case.
     scheduler_binary: Option<std::path::PathBuf>,
     /// One-shot per-VM cache of the analysis result. Populated by
     /// the first `.get_full()` caller via
@@ -271,83 +277,227 @@ impl LazyCastMap {
     /// the captured path, which itself consults the process-wide
     /// content-hash cache — so two VMs that share a scheduler
     /// binary path produce one analyzer run per process.
-    /// Subsequent `.get_full()` calls on the same VM hit the inner
-    /// `OnceLock` and return immediately.
+    /// Subsequent successful `.get_full()` calls on the same VM hit the inner
+    /// `OnceLock` and return immediately. Errors are not cached.
     ///
-    /// Returns `None` when no scheduler binary was set, the file
-    /// read failed, or the analyzer produced neither cast findings
-    /// nor cross-BTF index entries.
-    pub(crate) fn get_full(&self) -> Option<Arc<CastAnalysisOutput>> {
-        self.inner
-            .get_or_init(|| {
-                self.scheduler_binary
-                    .as_deref()
-                    .and_then(cached_cast_analysis_for_scheduler)
-            })
-            .clone()
+    /// Returns `Ok(None)` only when no scheduler binary was set or the analyzer
+    /// produced neither cast findings nor cross-BTF index entries. File,
+    /// cache, coordination, publication, and mapping failures return `Err`.
+    pub(crate) fn get_full(&self) -> Result<Option<Arc<CastAnalysisOutput>>> {
+        if let Some(output) = self.inner.get() {
+            return Ok(output.clone());
+        }
+        let output = match self.scheduler_binary.as_deref() {
+            Some(path) => cached_cast_analysis_for_scheduler(path)?,
+            None => None,
+        };
+        let _ = self.inner.set(output.clone());
+        Ok(self.inner.get().cloned().unwrap_or(output))
     }
 }
 
-/// Process-wide cache entry: scheduler binary content hash →
-/// `Arc<OnceLock<Option<Arc<CastAnalysisOutput>>>>`. The outer
-/// `OnceLock` is the deduplication primitive — two VMs that hash
-/// to the same content but find the entry uninitialized both call
-/// `entry.get_or_init(...)`, which runs the analyzer exactly once.
-/// The entry's eventual value is the collapsed
-/// `Option<Arc<CastAnalysisOutput>>` (`None` on empty cast map AND
-/// empty cross-BTF index, `Some` on any non-empty). Without the
-/// inner `OnceLock` shape, two cache misses on the same hash would
-/// each release the `Mutex<HashMap>` lock, then race to run the
-/// analyzer in parallel — the thundering-herd anti-pattern.
-type CastCacheEntry = Arc<OnceLock<Option<Arc<CastAnalysisOutput>>>>;
+enum CastCacheState {
+    Empty,
+    Building,
+    Ready(Option<Arc<CastAnalysisOutput>>),
+}
 
-fn cast_cache() -> &'static Mutex<HashMap<u64, CastCacheEntry>> {
-    static CACHE: OnceLock<Mutex<HashMap<u64, CastCacheEntry>>> = OnceLock::new();
+/// Retryable in-process initialization for one content hash.
+///
+/// Unlike `OnceLock<Option<_>>`, a transient digest/election/publication error
+/// returns the state to `Empty` and wakes waiters so a later dump can retry.
+/// Successful positive and negative analyses remain process-wide.
+struct CastCacheEntry {
+    state: Mutex<CastCacheState>,
+    ready: Condvar,
+}
+
+impl CastCacheEntry {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(CastCacheState::Empty),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn get_or_try_init(
+        &self,
+        initialize: impl FnOnce() -> Result<Option<Arc<CastAnalysisOutput>>>,
+    ) -> Result<Option<Arc<CastAnalysisOutput>>> {
+        let mut initialize = Some(initialize);
+        loop {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            match &*state {
+                CastCacheState::Ready(value) => return Ok(value.clone()),
+                CastCacheState::Building => {
+                    state = self
+                        .ready
+                        .wait(state)
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    drop(state);
+                }
+                CastCacheState::Empty => {
+                    *state = CastCacheState::Building;
+                    drop(state);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        initialize
+                            .take()
+                            .expect("cast cache initializer consumed only by elected builder"),
+                    ));
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    match result {
+                        Ok(Ok(value)) => {
+                            *state = CastCacheState::Ready(value.clone());
+                            self.ready.notify_all();
+                            return Ok(value);
+                        }
+                        Ok(Err(error)) => {
+                            *state = CastCacheState::Empty;
+                            self.ready.notify_all();
+                            return Err(error);
+                        }
+                        Err(payload) => {
+                            *state = CastCacheState::Empty;
+                            self.ready.notify_all();
+                            drop(state);
+                            std::panic::resume_unwind(payload);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn cast_cache() -> &'static Mutex<HashMap<u64, Arc<CastCacheEntry>>> {
+    static CACHE: OnceLock<Mutex<HashMap<u64, Arc<CastCacheEntry>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn ahash_bytes(bytes: &[u8]) -> u64 {
-    use std::hash::{BuildHasher, Hasher};
-    let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
-    hasher.write(bytes);
-    hasher.finish()
+struct PinnedScheduler {
+    file: std::fs::File,
+    identity: crate::cache::content::StableFileIdentity,
+    content_hash: u64,
+    display_path: std::path::PathBuf,
 }
 
-/// Load one content-addressed entry or become its sole cross-process builder.
-///
-/// A miss is checked before locking for the hot path, then checked again after
-/// acquiring the content-specific exclusive lease. The second check is the
-/// publication boundary: every waiter observes the winner's atomically renamed
-/// result and skips `build`. Distinct hashes use distinct lock files and remain
-/// fully concurrent.
-///
-/// Failure to acquire the lease returns `None`; there is deliberately no
-/// unsynchronized builder path that could recreate the thundering herd.
-fn load_or_build_content_entry<T, L, B>(hash: u64, mut load: L, build: B) -> Option<T>
-where
-    L: FnMut() -> Option<T>,
-    B: FnOnce() -> T,
-{
-    if let Some(value) = load() {
-        return Some(value);
-    }
+#[cfg(test)]
+fn record_analysis_builder_claim_for_test(content_hash: u64) -> Result<()> {
+    use std::io::Write as _;
 
-    let _builder_lock = match persist::acquire_builder_lock(hash) {
-        Ok(lock) => lock,
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                hash = format_args!("{hash:016x}"),
-                "cast_analysis: cannot acquire content builder lease"
-            );
-            return None;
-        }
+    let Some(path) = std::env::var_os("KTSTR_CAST_ANALYSIS_BUILDER_CLAIMS") else {
+        return Ok(());
     };
+    let line = format!("{content_hash:016x} {}\n", std::process::id());
+    let mut claims = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| {
+            format!(
+                "open cast-analysis builder-claim record {}",
+                Path::new(&path).display()
+            )
+        })?;
+    claims
+        .write_all(line.as_bytes())
+        .context("record cast-analysis builder claim")?;
+    claims
+        .sync_data()
+        .context("sync cast-analysis builder claim")?;
+    Ok(())
+}
 
-    if let Some(value) = load() {
-        return Some(value);
-    }
-    Some(build())
+fn pin_scheduler(path: &Path) -> Result<PinnedScheduler> {
+    let (file, identity) = crate::cache::content::open_pinned_file(path)?;
+    let started = std::time::Instant::now();
+    let content_hash = crate::cache::content::cached_file_digest(&file, identity)
+        .with_context(|| format!("digest scheduler binary {}", path.display()))?;
+    tracing::debug!(
+        elapsed_us = started.elapsed().as_micros() as u64,
+        len = identity.size,
+        hash = format_args!("{content_hash:016x}"),
+        "cast_analysis: scheduler binary content digest resolved"
+    );
+    Ok(PinnedScheduler {
+        file,
+        identity,
+        content_hash,
+        display_path: path.to_path_buf(),
+    })
+}
+
+enum CoordinatedAnalysis {
+    Loaded {
+        cached: persist::CachedCastAnalysis,
+        object: std::fs::File,
+    },
+    Built(CastAnalysisOutput),
+}
+
+/// Ensure the content-addressed analysis record exists.
+///
+/// Hits read only the small persisted record and open the immutable scheduler
+/// CAS inode; they do not mmap, parse BTF, or retain the scheduler bytes.
+/// Exactly one elected miss builder snapshots the pinned source into that CAS,
+/// maps it read-only/private, analyzes it, and atomically publishes the record.
+fn ensure_persisted_analysis(pinned: &PinnedScheduler) -> Result<CoordinatedAnalysis> {
+    let paths = persist::coordination_paths(pinned.content_hash)?;
+    crate::cache::content::load_or_build(
+        &paths.namespace_gate,
+        &paths.lock,
+        &format!("cast analysis {:016x}", pinned.content_hash),
+        || {
+            let Some(cached) = persist::try_load(pinned.content_hash)? else {
+                return Ok(None);
+            };
+            let object = crate::cache::content::open_or_publish_content_object(
+                pinned.content_hash,
+                &pinned.file,
+                pinned.identity,
+            )?;
+            Ok(Some(CoordinatedAnalysis::Loaded { cached, object }))
+        },
+        || {
+            #[cfg(test)]
+            record_analysis_builder_claim_for_test(pinned.content_hash)?;
+            let object = crate::cache::content::open_or_publish_content_object(
+                pinned.content_hash,
+                &pinned.file,
+                pinned.identity,
+            )
+            .with_context(|| {
+                format!(
+                    "publish scheduler content object {}",
+                    pinned.display_path.display()
+                )
+            })?;
+            let mapped = crate::cache::content::CowMappedFile::map(object)?;
+            let analyze_t0 = std::time::Instant::now();
+            let out = build_cast_analysis_from_bytes(mapped.as_ref());
+            tracing::debug!(
+                elapsed_ms = analyze_t0.elapsed().as_millis() as u64,
+                casts = out.cast_maps.iter().map(|map| map.len()).sum::<usize>(),
+                btfs = out.btfs.len(),
+                fwd_index = out.fwd_index.len(),
+                "cast_analysis: elected analysis finished"
+            );
+            persist::try_save(
+                pinned.content_hash,
+                &out.cast_maps,
+                &out.fwd_index,
+                out.btfs.len(),
+                &out.alloc_size_types,
+            )?;
+            Ok(CoordinatedAnalysis::Built(out))
+        },
+    )
 }
 
 fn collapse_cast_analysis(out: CastAnalysisOutput) -> Option<Arc<CastAnalysisOutput>> {
@@ -361,11 +511,10 @@ fn collapse_cast_analysis(out: CastAnalysisOutput) -> Option<Arc<CastAnalysisOut
 
 /// Process-wide content-hash-cached entry point.
 ///
-/// Reads the scheduler binary once, hashes the bytes via ahash
-/// (AES-NI accelerated, deterministic per-binary with fixed seeds),
-/// and either returns the previously-analysed
-/// `Option<Arc<CastAnalysisOutput>>` for that hash or runs the
-/// analyzer once to populate the cache entry. The cache value is
+/// Pins the scheduler inode and resolves its fixed-seed ahash through the
+/// machine-wide digest memo. It then either returns the process-local
+/// `Option<Arc<CastAnalysisOutput>>` for that content or loads/builds the
+/// persisted cross-process entry. The process cache value is
 /// `Option<Arc>` (collapsed empty → `None`) so the dump path's
 /// borrow expresses "no analysis available" cleanly without an
 /// emptiness check at every freeze.
@@ -379,120 +528,83 @@ fn collapse_cast_analysis(out: CastAnalysisOutput) -> Option<Arc<CastAnalysisOut
 /// stale entry and rendering the wrong cast map for a
 /// just-replaced binary. Content-hash over the actual bytes is
 /// the only key that is correct for every overwrite shape. The
-/// hash cost is dominated by the file read which has to happen
-/// anyway.
+/// first process to see one inode revision streams it; peers read the small
+/// checked digest memo.
 ///
 /// # Concurrency
 ///
-/// Two simultaneous misses in one process share an
-/// `Arc<OnceLock<...>>`. Misses in different processes contend on the
-/// content-addressed builder lease; one analyzes and atomically publishes,
-/// then every waiter reloads that completed result. Misses for different
-/// hashes proceed in parallel.
+/// Two simultaneous misses in one process share a retryable cache entry.
+/// Misses in different processes contend on the content-addressed builder
+/// lease; one maps/analyzes and atomically publishes, then every waiter reloads
+/// that completed result. Misses for different hashes proceed in parallel.
 ///
 /// # Returns
 ///
-/// `None` when the file read fails (transient I/O) OR the
-/// analyzer's result is empty AND the cross-BTF index is empty.
+/// `Ok(None)` when the analyzer's result is empty AND the cross-BTF index is
+/// empty. Infrastructure failures are returned to the caller.
 /// Otherwise the analyzed `Arc<CastAnalysisOutput>` shared with
 /// every prior caller for the same binary content.
-pub(crate) fn cached_cast_analysis_for_scheduler(path: &Path) -> Option<Arc<CastAnalysisOutput>> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                path = %path.display(),
-                "cast_analysis: read scheduler binary failed; \
-                 dump renderer will fall back to plain u64 counters"
+fn materialize_analysis(
+    coordinated: CoordinatedAnalysis,
+) -> Result<Option<Arc<CastAnalysisOutput>>> {
+    match coordinated {
+        CoordinatedAnalysis::Built(output) => Ok(collapse_cast_analysis(output)),
+        CoordinatedAnalysis::Loaded { cached, object } => {
+            let total_casts: usize = cached.cast_maps.iter().map(CastMap::len).sum();
+            if total_casts == 0 && cached.fwd_index.is_empty() {
+                return Ok(None);
+            }
+            let mapped = crate::cache::content::CowMappedFile::map(object)?;
+            let btfs = parse_btfs_from_bytes(mapped.as_ref());
+            anyhow::ensure!(
+                btfs.len() == cached.btf_count,
+                "cast-analysis cache expected {} BTFs but immutable content parsed {}",
+                cached.btf_count,
+                btfs.len()
             );
-            return None;
+            Ok(collapse_cast_analysis(CastAnalysisOutput {
+                cast_maps: cached.cast_maps.into_iter().map(Arc::new).collect(),
+                btfs,
+                fwd_index: cached.fwd_index,
+                alloc_size_types: cached.alloc_size_types,
+            }))
         }
-    };
-    let hash_t0 = std::time::Instant::now();
-    let hash = ahash_bytes(&bytes);
-    tracing::debug!(
-        elapsed_us = hash_t0.elapsed().as_micros() as u64,
-        len = bytes.len(),
-        hash = format_args!("{hash:016x}"),
-        "cast_analysis: scheduler binary content hash finished"
-    );
+    }
+}
 
-    let entry: CastCacheEntry = {
+pub(crate) fn cached_cast_analysis_for_scheduler(
+    path: &Path,
+) -> Result<Option<Arc<CastAnalysisOutput>>> {
+    let pinned = pin_scheduler(path)?;
+    let entry: Arc<CastCacheEntry> = {
         let mut cache = cast_cache().lock().unwrap();
         cache
-            .entry(hash)
-            .or_insert_with(|| Arc::new(OnceLock::new()))
+            .entry(pinned.content_hash)
+            .or_insert_with(|| Arc::new(CastCacheEntry::new()))
             .clone()
     };
-    entry
-        .get_or_init(|| {
-            // Disk cache probe: if a prior process already analyzed
-            // this binary, load the result without re-running the
-            // instruction walker. BTFs are reparsed from the binary
-            // bytes (Btf is not serializable).
-            let btfs = parse_btfs_from_bytes(&bytes);
-            load_or_build_content_entry(
-                hash,
-                || {
-                    persist::try_load(hash, btfs.len()).map(
-                        |(cast_map, fwd_index, alloc_size_types)| {
-                            tracing::debug!("cast_analysis: disk cache hit");
-                            collapse_cast_analysis(CastAnalysisOutput {
-                                cast_maps: vec![Arc::new(cast_map)],
-                                btfs: btfs.clone(),
-                                fwd_index,
-                                alloc_size_types,
-                            })
-                        },
-                    )
-                },
-                || {
-                    let analyze_t0 = std::time::Instant::now();
-                    let out = build_cast_analysis_from_bytes(&bytes);
-                    tracing::debug!(
-                        elapsed_ms = analyze_t0.elapsed().as_millis() as u64,
-                        casts = out.cast_maps.iter().map(|m| m.len()).sum::<usize>(),
-                        btfs = out.btfs.len(),
-                        fwd_index = out.fwd_index.len(),
-                        "cast_analysis: on-demand analysis finished"
-                    );
-                    let merged_for_cache: CastMap = out
-                        .cast_maps
-                        .iter()
-                        .flat_map(|map| map.iter())
-                        .map(|(&key, &value)| (key, value))
-                        .collect();
-                    // Do not cache a lossy multi-object merge. When more than
-                    // one embedded object carries casts, their independent BTF
-                    // id spaces can collide in this legacy flat wire shape.
-                    if objects_with_casts(&out.cast_maps) <= 1 {
-                        persist::try_save(
-                            hash,
-                            &merged_for_cache,
-                            &out.fwd_index,
-                            out.btfs.len(),
-                            &out.alloc_size_types,
-                        );
-                    }
-                    collapse_cast_analysis(out)
-                },
-            )
-            .flatten()
-        })
-        .clone()
+    entry.get_or_try_init(|| {
+        let coordinated = ensure_persisted_analysis(&pinned)?;
+        materialize_analysis(coordinated)
+    })
+}
+
+/// Precompute and persist cast analysis without materializing BTFs on a hit.
+pub(crate) fn precompute_cast_analysis(path: &Path) -> Result<()> {
+    let pinned = pin_scheduler(path)?;
+    ensure_persisted_analysis(&pinned)?;
+    Ok(())
 }
 
 /// Count embedded BPF objects that produced at least one cast.
 ///
-/// The dump renderer threads a single cast map (`cast_maps.first()`
-/// in the freeze coordinator) and the disk cache merges all objects
-/// into one (the `merged_for_cache` collapse in
-/// `cached_cast_analysis_for_scheduler`); both are correct only when at most one
-/// object carries casts. Per-object program BTFs each restart their
+/// The dump renderer still threads a single cast map (`cast_maps.first()` in
+/// the freeze coordinator), so rendering is correct only when at most one
+/// object carries casts. Persistence retains every map losslessly for future
+/// renderer support and diagnostics. Per-object program BTFs each restart their
 /// user-type ids at `vmlinux_last + 1`, so the same
-/// `(parent_id, offset)` from two objects collides -- the merge
-/// overwrites, `first()` drops. A count > 1 is therefore
+/// `(parent_id, offset)` from two objects cannot share one flat renderer map;
+/// `first()` drops later objects. A count > 1 is therefore
 /// unrenderable today; `build_cast_analysis_from_bytes` logs a loud
 /// `error!` so the gap is never silent.
 fn objects_with_casts(cast_maps: &[Arc<CastMap>]) -> usize {
@@ -529,20 +641,19 @@ fn objects_with_casts(cast_maps: &[Arc<CastMap>]) -> usize {
 /// threading is exact. Multi-object schedulers do not exist and are
 /// NOT handled: [`crate::monitor::btf_render::MemReader::cast_lookup`]
 /// consults one flat map keyed on `(parent_type_id, offset)`, the
-/// freeze coordinator threads only `cast_maps.first()`, and the disk
-/// cache would persist a single merged map. Per-object program BTFs
+/// freeze coordinator threads only `cast_maps.first()`. The disk cache
+/// preserves every per-object map, but the renderer cannot select one by
+/// `btf_kva`. Per-object program BTFs
 /// each restart user-type ids at `vmlinux_last + 1`, so the same
-/// `(parent_id, offset)` from two objects collides -- the merge
-/// overwrites, `first()` drops. Arena resolution is unaffected:
+/// `(parent_id, offset)` from two objects collides in any flat selection and
+/// `first()` drops later objects. Arena resolution is unaffected:
 /// `resolve_arena_type` is already `requesting_btf_kva`-scoped; only
 /// the cast lookup is flat.
 ///
 /// `objects_with_casts` detects the multi-object case and
-/// `build_cast_analysis_from_bytes` logs a loud `error!`; `get_full`
-/// then skips the disk write so the `error!` re-fires every run
-/// instead of being masked by a cached lossy map. Correct support
-/// needs per-`btf_kva` cast-map selection, unimplemented because no
-/// multi-object scheduler exists. The conservative "false negatives
+/// `build_cast_analysis_from_bytes` logs a loud `error!`. The complete
+/// per-object result is still persisted; correct rendering support needs
+/// per-`btf_kva` cast-map selection. The conservative "false negatives
 /// are fine, false positives are not" stance from
 /// [`crate::monitor::cast_analysis`] still applies.
 pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput {
@@ -553,7 +664,7 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
             tracing::warn!(
                 error = %e,
                 "cast_analysis: parse outer ELF failed; \
-                 dump renderer will fall back to plain u64 counters"
+                 analysis result will be empty"
             );
             return CastAnalysisOutput {
                 cast_maps: vec![Arc::new(CastMap::new())],
@@ -614,11 +725,11 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
     // Fail loudly on the unsupported multi-object case rather than
     // silently dropping or mis-rendering casts. See `objects_with_casts`
     // and the "Single-object only" note above: the renderer threads
-    // `cast_maps.first()` and the disk cache merges every object into a
-    // single flat `(parent_id, offset)` map, but per-object program BTFs
-    // restart their id-space at `vmlinux_last + 1`, so casts from objects
-    // 2+ collide on the merge and are dropped by `first()`. No multi-object
-    // scx scheduler ships today; this guards the future.
+    // `cast_maps.first()`. The cache preserves every per-object map, but
+    // per-object program BTFs restart their id-space at
+    // `vmlinux_last + 1`, so casts from objects 2+ cannot be selected by
+    // the current flat renderer. No multi-object scx scheduler ships today;
+    // this guards the future.
     let cast_bearing_objects = objects_with_casts(&cast_maps);
     if cast_bearing_objects > 1 {
         tracing::error!(
@@ -626,9 +737,9 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
             cast_bearing_objects,
             "cast analysis found casts in more than one embedded BPF object; \
              multi-object cast rendering is unsupported -- casts from objects \
-             2+ are dropped (renderer) or overwritten (disk cache) because \
-             per-object BTF id-spaces collide. correct support needs \
-             per-btf_kva cast-map selection."
+             2+ are not selected by the flat renderer because per-object BTF \
+             id-spaces collide. the cache retained every map; correct rendering \
+             needs per-btf_kva cast-map selection."
         );
     }
 

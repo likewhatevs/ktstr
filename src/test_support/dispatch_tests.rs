@@ -1426,7 +1426,7 @@ fn result_to_exit_code_inconclusive_maps_to_distinct_code() {
 fn final_outcome_projects_to_result_to_exit_code() {
     use crate::assert::{AssertDetail, AssertResult, DetailKind};
     type ResultBuilder = fn() -> Result<AssertResult>;
-    let cases: [(ResultBuilder, &str); 9] = [
+    let cases: [(ResultBuilder, &str); 10] = [
         (|| Ok(AssertResult::pass()), "ok_pass"),
         (|| Ok(AssertResult::skip("skip reason")), "ok_skip"),
         (
@@ -1460,6 +1460,13 @@ fn final_outcome_projects_to_result_to_exit_code() {
         (
             || Err(anyhow::anyhow!("f").context(crate::test_support::eval::SchedulerBuildRefused)),
             "err_scheduler_build_refused",
+        ),
+        (
+            || {
+                Err(anyhow::anyhow!("f")
+                    .context(crate::test_support::eval::FrameworkInfrastructureFailure))
+            },
+            "err_framework_infrastructure",
         ),
         (
             || Err(anyhow::anyhow!("f").context(crate::test_support::eval::SurvivesStormViolated)),
@@ -2212,6 +2219,28 @@ fn result_to_exit_code_scheduler_build_refused_through_nested_context_routes_to_
         result_to_exit_code(err, true, false),
         EXIT_FAIL,
         "nested SchedulerBuildRefused must still be downcast and force EXIT_FAIL"
+    );
+}
+
+/// A framework/CAS failure is outside the guest verdict domain: even an
+/// `expect_err` reproducer must fail instead of accepting infrastructure
+/// breakage as its expected scheduler failure.
+#[test]
+fn result_to_exit_code_framework_infrastructure_failure_bypasses_expect_err() {
+    use anyhow::Context as _;
+
+    let err = Err(anyhow::Error::new(
+        crate::vmm::host_topology::TopologyInsufficient {
+            reason: "injected underlying capacity-looking errno".into(),
+        },
+    )
+    .context("injected MAP_PRIVATE prepared-initrd overlay failure")
+    .context(crate::test_support::eval::FrameworkInfrastructureFailure)
+    .context("run ktstr_test VM"));
+    assert_eq!(
+        result_to_exit_code(err, true, false),
+        EXIT_FAIL,
+        "framework marker must hard-fail before host skip classification or expect_err inversion"
     );
 }
 

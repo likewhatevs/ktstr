@@ -47,8 +47,9 @@ path = "junit.xml"
 # One million makes global admission effectively unbounded without tying the
 # ceiling to today's suite size. nextest's future-queue reserves one u64
 # slot-id entry per permit (~8 MiB here), but does not create threads or tasks
-# eagerly; an integer-max value would therefore be wasteful. Explicit CLI
-# `-j`/`--test-threads` remains authoritative.
+# eagerly; an integer-max value would therefore be wasteful. cargo-ktstr also
+# replaces every syntactically valid CLI `-j`/`--test-threads` spelling with
+# this value so no user or repository setting creates a second admission queue.
 [profile.ci]
 slow-timeout = { period = "90s", terminate-after = 3 }
 retries = { backoff = "exponential", count = 6, delay = "1s", jitter = true, max-delay = "3s" }

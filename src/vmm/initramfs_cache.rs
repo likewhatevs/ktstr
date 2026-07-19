@@ -40,6 +40,10 @@ use std::hash::BuildHasher;
 use ahash::AHasher;
 
 use super::initramfs;
+use crate::cache::content::{
+    CoordinationFile, StableFileIdentity, cached_file_digest as shared_cached_file_digest,
+    open_cache_record, read_fixed_cache_record,
+};
 
 /// Semantic cache key for a prepared base initramfs. It covers the exact
 /// normalized archive recipe: packed binary and include contents, modes,
@@ -72,18 +76,6 @@ fn hash_file_cache() -> &'static Mutex<HashMap<HashFileKey, u64>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[cfg(test)]
-fn hash_file_test_cache_root() -> &'static Path {
-    static ROOT: OnceLock<tempfile::TempDir> = OnceLock::new();
-    ROOT.get_or_init(|| {
-        tempfile::Builder::new()
-            .prefix("ktstr-hash-cache-")
-            .tempdir()
-            .expect("create test-only machine digest cache")
-    })
-    .path()
-}
-
 /// Hash a file's content for cache keying via mmap + fixed-seed ahash.
 ///
 /// The stable open-file identity first checks the process-local map, then a
@@ -109,9 +101,7 @@ pub(crate) fn hash_file(path: &Path) -> Result<u64> {
         return Ok(cached);
     }
 
-    let root = hash_file_test_cache_root();
-    ensure_prepared_cache_dirs(root)?;
-    let digest = cached_file_digest(root, &file, identity)
+    let digest = shared_cached_file_digest(&file, identity)
         .with_context(|| format!("machine-wide hash memo: {}", path.display()))?;
     hash_file_cache().lock().unwrap().insert(cache_key, digest);
     Ok(digest)
@@ -392,8 +382,6 @@ const PREPARED_CAS_HEADER_LEN: usize = 128;
 const PREPARED_CAS_MAX_BYTES: u64 = 8 << 30;
 const PREPARED_CAS_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 const PREPARED_CAS_GC_INTERVAL_SECS: u64 = 60 * 60;
-const FILE_DIGEST_MAGIC: &[u8; 8] = b"KTSTRDG\0";
-const FILE_DIGEST_RECORD_LEN: usize = 88;
 const PREPARED_VALIDATION_MAGIC: &[u8; 8] = b"KTSTRPV\0";
 const PREPARED_VALIDATION_RECORD_LEN: usize = 128;
 const COVERAGE_PROBE_MAGIC: &[u8; 8] = b"KTSTRCV\0";
@@ -554,10 +542,6 @@ fn hash_u64(hasher: &mut AHasher, value: u64) {
     hasher.write(&value.to_le_bytes());
 }
 
-fn hash_i64(hasher: &mut AHasher, value: i64) {
-    hasher.write(&value.to_le_bytes());
-}
-
 fn hash_len_prefixed(hasher: &mut AHasher, bytes: &[u8]) {
     hash_u64(hasher, bytes.len() as u64);
     hasher.write(bytes);
@@ -588,93 +572,15 @@ fn round_up(value: usize, align: usize) -> Result<usize> {
         .context("aligned length overflow")
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct StableFileIdentity {
-    dev: u64,
-    ino: u64,
-    size: u64,
-    mtime_secs: i64,
-    mtime_nsecs: i64,
-    ctime_secs: i64,
-    ctime_nsecs: i64,
-}
-
-impl StableFileIdentity {
-    fn from_metadata(meta: &std::fs::Metadata) -> Self {
-        Self {
-            dev: meta.dev(),
-            ino: meta.ino(),
-            size: meta.size(),
-            mtime_secs: meta.mtime(),
-            mtime_nsecs: meta.mtime_nsec(),
-            ctime_secs: meta.ctime(),
-            ctime_nsecs: meta.ctime_nsec(),
-        }
-    }
-
-    fn from_file(file: &File) -> Result<Self> {
-        let meta = file.metadata().context("stat pinned input")?;
-        anyhow::ensure!(
-            meta.is_file(),
-            "prepared initrd input is not a regular file"
-        );
-        Ok(Self::from_metadata(&meta))
-    }
-
-    fn from_resolver(identity: initramfs::ResolverFileIdentity) -> Self {
-        Self {
-            dev: identity.dev,
-            ino: identity.ino,
-            size: identity.size,
-            mtime_secs: identity.mtime_secs,
-            mtime_nsecs: identity.mtime_nsecs,
-            ctime_secs: identity.ctime_secs,
-            ctime_nsecs: identity.ctime_nsecs,
-        }
-    }
-
-    /// Compare the byte version behind an already-open fd. Replacing or
-    /// unlinking its pathname updates ctime but cannot alter the pinned
-    /// contents; size and mtime still reject ordinary in-place mutation.
-    fn same_open_content_version(self, other: Self) -> bool {
-        self.dev == other.dev
-            && self.ino == other.ino
-            && self.size == other.size
-            && self.mtime_secs == other.mtime_secs
-            && self.mtime_nsecs == other.mtime_nsecs
-    }
-
-    fn hash_into(self, hasher: &mut AHasher) {
-        hash_u64(hasher, self.dev);
-        hash_u64(hasher, self.ino);
-        hash_u64(hasher, self.size);
-        hash_i64(hasher, self.mtime_secs);
-        hash_i64(hasher, self.mtime_nsecs);
-        hash_i64(hasher, self.ctime_secs);
-        hash_i64(hasher, self.ctime_nsecs);
-    }
-
-    fn encode(self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.dev.to_le_bytes());
-        out.extend_from_slice(&self.ino.to_le_bytes());
-        out.extend_from_slice(&self.size.to_le_bytes());
-        out.extend_from_slice(&self.mtime_secs.to_le_bytes());
-        out.extend_from_slice(&self.mtime_nsecs.to_le_bytes());
-        out.extend_from_slice(&self.ctime_secs.to_le_bytes());
-        out.extend_from_slice(&self.ctime_nsecs.to_le_bytes());
-    }
-
-    fn decode(bytes: &[u8]) -> Result<Self> {
-        anyhow::ensure!(bytes.len() == 56, "invalid file identity record length");
-        Ok(Self {
-            dev: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
-            ino: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-            size: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
-            mtime_secs: i64::from_le_bytes(bytes[24..32].try_into().unwrap()),
-            mtime_nsecs: i64::from_le_bytes(bytes[32..40].try_into().unwrap()),
-            ctime_secs: i64::from_le_bytes(bytes[40..48].try_into().unwrap()),
-            ctime_nsecs: i64::from_le_bytes(bytes[48..56].try_into().unwrap()),
-        })
+fn stable_identity_from_resolver(identity: initramfs::ResolverFileIdentity) -> StableFileIdentity {
+    StableFileIdentity {
+        dev: identity.dev,
+        ino: identity.ino,
+        size: identity.size,
+        mtime_secs: identity.mtime_secs,
+        mtime_nsecs: identity.mtime_nsecs,
+        ctime_secs: identity.ctime_secs,
+        ctime_nsecs: identity.ctime_nsecs,
     }
 }
 
@@ -787,268 +693,13 @@ fn open_namespace_gate(root: &Path) -> Result<File> {
     open_lock_file(&root.join(PREPARED_LOCKS_DIR).join(PREPARED_NAMESPACE_GATE))
 }
 
-/// A per-key coordination inode opened while holding the namespace gate.
-///
-/// The shared namespace lock remains held until the caller explicitly releases
-/// it or this value drops. Memo paths release it once the per-key lock protects
-/// their record; prepared-object paths retain it through object LOCK_SH. GC
-/// takes the namespace lock exclusively before unlinking idle per-key files,
-/// closing both the open-before-flock race and the per-key-to-object lock-order
-/// inversion.
-struct CoordinationFile {
-    file: File,
-    namespace_gate: Option<File>,
-}
-
-pub(super) fn flock_retry(
-    file: impl std::os::fd::AsFd,
-    operation: rustix::fs::FlockOperation,
-) -> rustix::io::Result<()> {
-    loop {
-        match rustix::fs::flock(&file, operation) {
-            Err(error) if error == rustix::io::Errno::INTR => continue,
-            result => return result,
-        }
-    }
-}
-
-impl CoordinationFile {
-    fn try_lock_exclusive(&mut self) -> rustix::io::Result<()> {
-        flock_retry(
-            &self.file,
-            rustix::fs::FlockOperation::NonBlockingLockExclusive,
-        )
-    }
-
-    fn lock_shared(&mut self) -> rustix::io::Result<()> {
-        flock_retry(&self.file, rustix::fs::FlockOperation::LockShared)
-    }
-
-    /// Join the successor queue after a builder disappeared without
-    /// publishing. Unlike repeatedly probing `LOCK_EX` and falling back to
-    /// `LOCK_SH`, a blocking exclusive request gives the kernel a real writer
-    /// to wake and cannot be starved by a herd continuously overlapping shared
-    /// locks.
-    fn lock_exclusive(&mut self) -> rustix::io::Result<()> {
-        flock_retry(&self.file, rustix::fs::FlockOperation::LockExclusive)
-    }
-
-    /// Release the namespace gate after the protected inode chain has become
-    /// self-sufficient. Memo records need only the per-key lock; prepared
-    /// objects retain the gate until their immutable inode has taken LOCK_SH.
-    fn release_namespace_gate(&mut self) {
-        self.namespace_gate.take();
-    }
-}
+pub(super) use crate::cache::content::flock_retry;
 
 fn open_coord_file(root: &Path, path: &Path) -> Result<CoordinationFile> {
-    let namespace_gate = open_namespace_gate(root)?;
-    flock_retry(&namespace_gate, rustix::fs::FlockOperation::LockShared)
-        .context("lock prepared initrd coordination namespace")?;
-    let file = open_lock_file(path)?;
-    Ok(CoordinationFile {
-        file,
-        namespace_gate: Some(namespace_gate),
-    })
-}
-
-fn hash_pinned_file(file: &File, identity: StableFileIdentity) -> Result<u64> {
-    let before = StableFileIdentity::from_file(file)?;
-    anyhow::ensure!(
-        before.same_open_content_version(identity),
-        "pinned input changed before hashing"
-    );
-    // Never mmap a mutable input here: a concurrent in-place truncate can
-    // SIGBUS an mmap reader before the post-stat check gets a chance to turn
-    // the mutation into a normal error. Exactly one elected process performs
-    // this streaming read, so a fixed-size pread buffer is cheap and safe.
-    let mut hasher = fixed_hasher();
-    let mut offset = 0u64;
-    let buffer_len = usize::try_from(identity.size.min(CONTENT_HASH_CHUNK_LEN as u64))?;
-    let mut buffer = vec![0u8; buffer_len];
-    while offset < identity.size {
-        let remaining = usize::try_from((identity.size - offset).min(buffer.len() as u64))?;
-        pread_exact(
-            file,
-            offset,
-            &mut buffer[..remaining],
-            "pinned input for digest",
-        )?;
-        hasher.write(&buffer[..remaining]);
-        offset = offset
-            .checked_add(u64::try_from(remaining)?)
-            .context("pinned input digest offset overflow")?;
-    }
-    let digest = hasher.finish();
-    let after = StableFileIdentity::from_file(file)?;
-    anyhow::ensure!(
-        after.same_open_content_version(identity),
-        "pinned input changed while hashing its content"
-    );
-    Ok(digest)
-}
-
-fn open_cache_record(path: &Path, subject: &str) -> Result<Option<(File, StableFileIdentity)>> {
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("open {subject} {}", path.display()));
-        }
-    };
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("stat {subject} {}", path.display()))?;
-    anyhow::ensure!(
-        metadata.is_file(),
-        "{subject} is not a regular file: {}",
-        path.display()
-    );
-    Ok(Some((file, StableFileIdentity::from_metadata(&metadata))))
-}
-
-fn read_fixed_cache_record<const N: usize>(path: &Path, subject: &str) -> Result<Option<[u8; N]>> {
-    let Some((file, identity)) = open_cache_record(path, subject)? else {
-        return Ok(None);
-    };
-    anyhow::ensure!(
-        identity.size == N as u64,
-        "{subject} has invalid length {}: {}",
-        identity.size,
-        path.display()
-    );
-    let mut bytes = [0u8; N];
-    pread_exact(&file, 0, &mut bytes, subject)?;
-    anyhow::ensure!(
-        StableFileIdentity::from_file(&file)? == identity,
-        "{subject} changed while reading: {}",
-        path.display()
-    );
-    Ok(Some(bytes))
-}
-
-fn read_file_digest_record(
-    record_path: &Path,
-    identity: StableFileIdentity,
-) -> Result<Option<u64>> {
-    let Some(bytes) =
-        read_fixed_cache_record::<FILE_DIGEST_RECORD_LEN>(record_path, "file digest memo")?
-    else {
-        return Ok(None);
-    };
-    anyhow::ensure!(
-        &bytes[..8] == FILE_DIGEST_MAGIC,
-        "file digest memo magic mismatch"
-    );
-    anyhow::ensure!(
-        u32::from_le_bytes(bytes[8..12].try_into().unwrap()) == PREPARED_CAS_SCHEMA,
-        "file digest memo schema mismatch"
-    );
-    anyhow::ensure!(
-        bytes[12..16] == [0; 4],
-        "file digest memo reserved bytes changed"
-    );
-    let recorded_identity = StableFileIdentity::decode(&bytes[16..72])?;
-    anyhow::ensure!(
-        recorded_identity == identity,
-        "file digest memo identity collision"
-    );
-    let recorded_checksum = u64::from_le_bytes(bytes[80..88].try_into().unwrap());
-    let mut canonical = bytes;
-    canonical[80..88].fill(0);
-    anyhow::ensure!(
-        ahash_bytes(&canonical) == recorded_checksum,
-        "file digest memo checksum mismatch"
-    );
-    Ok(Some(u64::from_le_bytes(
-        canonical[72..80].try_into().unwrap(),
-    )))
-}
-
-fn file_digest_identity_key_for_schema(identity: StableFileIdentity, schema: u32) -> u64 {
-    let mut hasher = fixed_hasher();
-    hash_len_prefixed(&mut hasher, b"ktstr-file-digest-identity");
-    hash_u32(&mut hasher, schema);
-    identity.hash_into(&mut hasher);
-    hasher.finish()
-}
-
-fn cached_file_digest(root: &Path, file: &File, identity: StableFileIdentity) -> Result<u64> {
-    let identity_key = file_digest_identity_key_for_schema(identity, PREPARED_CAS_SCHEMA);
-    let record_path = root
-        .join(PREPARED_DIGESTS_DIR)
-        .join(format!("{identity_key:016x}.digest"));
-    if let Some(digest) = read_file_digest_record(&record_path, identity)? {
-        return Ok(digest);
-    }
-
-    let lock_path = root
-        .join(PREPARED_LOCKS_DIR)
-        .join(format!("digest-{identity_key:016x}.lock"));
-    let mut wait_for_successor = false;
-    loop {
-        let mut coordination = open_coord_file(root, &lock_path)?;
-        let election = if wait_for_successor {
-            coordination.lock_exclusive()
-        } else {
-            coordination.try_lock_exclusive()
-        };
-        match election {
-            Ok(()) => {
-                coordination.release_namespace_gate();
-                if let Some(digest) = read_file_digest_record(&record_path, identity)? {
-                    return Ok(digest);
-                }
-                let digest = hash_pinned_file(file, identity)?;
-                let mut bytes = Vec::with_capacity(FILE_DIGEST_RECORD_LEN);
-                bytes.extend_from_slice(FILE_DIGEST_MAGIC);
-                bytes.extend_from_slice(&PREPARED_CAS_SCHEMA.to_le_bytes());
-                bytes.extend_from_slice(&[0; 4]);
-                identity.encode(&mut bytes);
-                bytes.extend_from_slice(&digest.to_le_bytes());
-                bytes.extend_from_slice(&0u64.to_le_bytes());
-                let checksum = ahash_bytes(&bytes);
-                bytes[80..88].copy_from_slice(&checksum.to_le_bytes());
-                debug_assert_eq!(bytes.len(), FILE_DIGEST_RECORD_LEN);
-
-                let mut temp = tempfile::Builder::new()
-                    .prefix(&format!(".tmp-digest-{identity_key:016x}-"))
-                    .tempfile_in(root.join(PREPARED_DIGESTS_DIR))
-                    .context("create file digest memo temp")?;
-                temp.write_all(&bytes).context("write file digest memo")?;
-                temp.as_file().sync_all().context("sync file digest memo")?;
-                temp.persist(&record_path)
-                    .map_err(|error| error.error)
-                    .with_context(|| {
-                        format!("publish file digest memo {}", record_path.display())
-                    })?;
-                return Ok(digest);
-            }
-            Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
-                // One builder streams this inode. Peers wait as shared
-                // readers, wake together when its EX lock drops, and read
-                // the tiny record concurrently. If the builder died before
-                // publication, loop and elect a successor.
-                coordination
-                    .lock_shared()
-                    .with_context(|| format!("wait for file digest {}", record_path.display()))?;
-                coordination.release_namespace_gate();
-                if let Some(digest) = read_file_digest_record(&record_path, identity)? {
-                    return Ok(digest);
-                }
-                wait_for_successor = true;
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("elect file digest builder {}", record_path.display())
-                });
-            }
-        }
-    }
+    crate::cache::content::open_coord_file(
+        &root.join(PREPARED_LOCKS_DIR).join(PREPARED_NAMESPACE_GATE),
+        path,
+    )
 }
 
 /// Open an explicit or recorded host input without blocking on a substituted
@@ -1062,12 +713,12 @@ fn open_pinned_input_path(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
-fn pin_input(root: &Path, path: &Path) -> Result<PinnedInput> {
+fn pin_input(_root: &Path, path: &Path) -> Result<PinnedInput> {
     let file = open_pinned_input_path(path)
         .with_context(|| format!("open prepared input {}", path.display()))?;
     let identity = StableFileIdentity::from_file(&file)
         .with_context(|| format!("stat prepared input {}", path.display()))?;
-    let content_hash = cached_file_digest(root, &file, identity)
+    let content_hash = shared_cached_file_digest(&file, identity)
         .with_context(|| format!("digest prepared input {}", path.display()))?;
     Ok(PinnedInput {
         file,
@@ -1704,7 +1355,7 @@ fn merge_resolver_observations(
     source: Vec<(PathBuf, initramfs::ResolverFileIdentity)>,
 ) -> Result<()> {
     for (path, identity) in source {
-        let identity = StableFileIdentity::from_resolver(identity);
+        let identity = stable_identity_from_resolver(identity);
         if let Some((_, previous)) = destination.iter().find(|(seen, _)| *seen == path) {
             anyhow::ensure!(
                 *previous == identity,
@@ -1723,7 +1374,7 @@ fn merge_search_observations(
     source: Vec<initramfs::ResolverPathObservation>,
 ) -> Result<()> {
     for observation in source {
-        let identity = observation.identity.map(StableFileIdentity::from_resolver);
+        let identity = observation.identity.map(stable_identity_from_resolver);
         if let Some(previous) = destination
             .iter()
             .find(|seen| seen.path == observation.path)
@@ -6578,30 +6229,24 @@ mod tests {
     }
 
     #[test]
-    fn digest_record_checksum_and_schema_namespace_fail_closed() {
+    fn shared_digest_record_checksum_fails_closed() {
         let root = tempfile::tempdir().unwrap();
-        ensure_prepared_cache_dirs(root.path()).unwrap();
         let path = root.path().join("input");
         std::fs::write(&path, b"digest checksum fixture").unwrap();
-        let input = pin_input(root.path(), &path).unwrap();
-        let current_key = file_digest_identity_key_for_schema(input.identity, PREPARED_CAS_SCHEMA);
-        assert_ne!(
-            current_key,
-            file_digest_identity_key_for_schema(
-                input.identity,
-                PREPARED_CAS_SCHEMA.saturating_sub(1),
-            ),
-            "schema changes must cold-miss in the filename namespace"
-        );
+        let file = File::open(&path).unwrap();
+        let identity = StableFileIdentity::from_file(&file).unwrap();
+        crate::cache::content::cached_file_digest_at_root(root.path(), &file, identity).unwrap();
+        let current_key = crate::cache::content::file_digest_identity_key(identity);
         let record_path = root
             .path()
-            .join(PREPARED_DIGESTS_DIR)
+            .join("digests-v1")
             .join(format!("{current_key:016x}.digest"));
         let mut bytes = std::fs::read(&record_path).unwrap();
         bytes[72] ^= 1;
         std::fs::write(&record_path, bytes).unwrap();
         assert!(
-            read_file_digest_record(&record_path, input.identity).is_err(),
+            crate::cache::content::cached_file_digest_at_root(root.path(), &file, identity)
+                .is_err(),
             "digest corruption must not silently key downstream objects"
         );
     }

@@ -577,18 +577,23 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
     // non-host failure; expect_ok panics with it), so it is interpolated.
     let host_arms = |not_host_class: proc_macro2::TokenStream| {
         quote! {
-            Err(e) => match ::ktstr::test_support::classify_host_error(
-                &e,
-                ::std::env::var_os("KTSTR_NO_SKIP_MODE").is_some(),
-            ) {
-                ::ktstr::test_support::HostClass::Skip { reason } => {
-                    eprintln!("ktstr: SKIP: {reason}");
-                    return;
+            Err(e) => {
+                if ::ktstr::test_support::is_framework_infrastructure_failure(&e) {
+                    panic!("ktstr: FAIL: {e:#}");
                 }
-                ::ktstr::test_support::HostClass::Fail { reason } => {
-                    panic!("ktstr: FAIL: {reason}");
+                match ::ktstr::test_support::classify_host_error(
+                    &e,
+                    ::std::env::var_os("KTSTR_NO_SKIP_MODE").is_some(),
+                ) {
+                    ::ktstr::test_support::HostClass::Skip { reason } => {
+                        eprintln!("ktstr: SKIP: {reason}");
+                        return;
+                    }
+                    ::ktstr::test_support::HostClass::Fail { reason } => {
+                        panic!("ktstr: FAIL: {reason}");
+                    }
+                    ::ktstr::test_support::HostClass::NotHostClass => #not_host_class,
                 }
-                ::ktstr::test_support::HostClass::NotHostClass => #not_host_class,
             },
         }
     };

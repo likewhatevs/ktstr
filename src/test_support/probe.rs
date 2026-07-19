@@ -555,6 +555,7 @@ fn build_repro_vm_builder(
     entry: &KtstrTestEntry,
     kernel: &Path,
     scheduler: Option<&Path>,
+    resolved_staged: &[(String, std::path::PathBuf, Vec<String>)],
     ktstr_bin: &Path,
     topo: Option<&TopoOverride>,
     guest_args: &[String],
@@ -564,44 +565,16 @@ fn build_repro_vm_builder(
     let (vm_topology, memory_mib) = super::runtime::resolve_vm_topology(entry, topo);
 
     let no_perf_mode = super::runtime::no_perf_mode_for_entry(entry);
-    // Resolve staged schedulers for the auto-repro VM so any
-    // scheduler-lifecycle ops in the replayed scenario can find
-    // their staged binaries at the same /staging/schedulers/<name>/
-    // paths the primary VM used. See crate::test_support::eval for the
-    // resolve-loop rationale + KernelBuiltin/Eevdf skip semantics.
-    //
-    // Resolution errors here log + skip rather than propagate: the
-    // auto-repro function returns Option<String> (best-effort), so
-    // a staging-resolve failure for one staged scheduler should not
-    // tear down the whole auto-repro path. The operator still gets
-    // the warn in tracing; the primary VM's failure already landed
-    // its own dump.
-    let mut resolved_staged: Vec<(String, std::path::PathBuf, Vec<String>)> = Vec::new();
-    for staged in entry.staged_schedulers {
-        match super::eval::resolve_scheduler(&staged.binary, staged.manifest_dir) {
-            Ok((Some(host_path), _src)) => {
-                resolved_staged.push((
-                    staged.name.to_string(),
-                    host_path,
-                    staged.sched_args.iter().map(|s| s.to_string()).collect(),
-                ));
-            }
-            Ok((None, _)) => {} // KernelBuiltin / Eevdf — no binary
-            Err(e) => {
-                tracing::warn!(
-                    staged_name = %staged.name,
-                    error = %e,
-                    "auto-repro: failed to resolve staged scheduler binary; skipping (Op::AttachScheduler / Op::ReplaceScheduler against this staged entry will fail at dispatch time in the repro VM)"
-                );
-            }
-        }
-    }
+    // Reuse the exact primary-run resolution. In orchestrated runs these are
+    // immutable parent snapshots from the authoritative manifest; resolving
+    // again could demote a handoff error into the auto-repro path's historical
+    // best-effort skip and could observe a replaced Path source.
     let mut builder = super::runtime::build_vm_builder_base(
         entry,
         kernel,
         ktstr_bin,
         scheduler,
-        &resolved_staged,
+        resolved_staged,
         vm_topology,
         memory_mib,
         &cmdline_extra,
@@ -757,6 +730,7 @@ pub(crate) fn attempt_auto_repro(
     entry: &KtstrTestEntry,
     kernel: &Path,
     scheduler: Option<&Path>,
+    resolved_staged: &[(String, std::path::PathBuf, Vec<String>)],
     ktstr_bin: &Path,
     first_vm_output: &str,
     console_output: &str,
@@ -869,7 +843,15 @@ pub(crate) fn attempt_auto_repro(
     }
 
     let (builder, repro_dump_path) =
-        build_repro_vm_builder(entry, kernel, scheduler, ktstr_bin, topo, &guest_args)?;
+        build_repro_vm_builder(
+            entry,
+            kernel,
+            scheduler,
+            resolved_staged,
+            ktstr_bin,
+            topo,
+            &guest_args,
+        )?;
 
     // VM build phase: KVM create, vCPU pinning, virtio device setup,
     // freeze-coord arming, ELF/BTF parses for monitor accessors. Any

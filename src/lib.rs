@@ -549,6 +549,7 @@ pub mod remote_cache {
 }
 pub mod gauntlet;
 pub(crate) mod reflink;
+pub mod scheduler_artifact;
 pub(crate) mod sync;
 #[cfg(any(feature = "export", feature = "remote-cache"))]
 pub(crate) mod tar_util;
@@ -581,8 +582,8 @@ pub use test_support::runtime::bypass_llc_locks_active;
 /// find a warm cache instead of each independently running the 30s
 /// analysis. Same-content callers across processes elect one builder,
 /// wait for its atomic publication, and then reuse the completed entry.
-pub fn precompute_cast_analysis(path: &std::path::Path) {
-    vmm::cast_analysis_load::cached_cast_analysis_for_scheduler(path);
+pub fn precompute_cast_analysis(path: &std::path::Path) -> anyhow::Result<()> {
+    vmm::cast_analysis_load::precompute_cast_analysis(path)
 }
 pub mod worker_ready_wait;
 pub mod workload;
@@ -1272,14 +1273,16 @@ pub const KTSTR_VERIFIER_RAW_ENV: &str = "KTSTR_VERIFIER_RAW";
 pub const KTSTR_VERIFIER_RESULT_DIR_ENV: &str = "KTSTR_VERIFIER_RESULT_DIR";
 
 /// Name of the environment variable carrying the immutable, versioned
-/// scheduler-artifact manifest written by the `cargo ktstr verifier` parent.
+/// scheduler-artifact manifest written by every nextest-backed `cargo ktstr`
+/// parent.
 ///
-/// Every child `Discover` cell performs an exact
-/// `(scheduler, package, manifest_dir)` lookup. When unset, direct/manual cell
-/// invocations retain the legacy on-demand Cargo build. When set, any
-/// malformed manifest, missing identity, or invalid path is a hard error and
-/// never falls back to rebuilding.
-pub const KTSTR_VERIFIER_SCHEDULER_MANIFEST_ENV: &str = "KTSTR_VERIFIER_SCHEDULER_MANIFEST";
+/// Every child `Discover` or `Path` resolution performs an exact tagged
+/// `(binary specification, manifest_dir, profile)` lookup. Verifier cells
+/// additionally validate the declared scheduler name. When unset,
+/// direct/manual test-binary invocations retain on-demand resolution. When
+/// set, any malformed manifest, missing identity, or invalid path is a hard
+/// error and never falls back to Cargo or a mutable source path.
+pub const KTSTR_SCHEDULER_MANIFEST_ENV: &str = "KTSTR_SCHEDULER_MANIFEST";
 
 /// Name of the environment variable carrying the immutable, versioned
 /// verifier-cell ownership manifest written by the `cargo ktstr verifier`

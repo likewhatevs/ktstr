@@ -576,8 +576,22 @@ impl Ticket {
         if state != State::Waiting {
             return Ok(state);
         }
-        let timed_out = wake.wait(expected, timeout)?;
-        check_cancelled(cancelled)?;
+        let wait_started = std::time::Instant::now();
+        let timed_out = loop {
+            let elapsed = wait_started.elapsed();
+            if elapsed >= timeout {
+                break true;
+            }
+            let remaining = timeout.saturating_sub(elapsed);
+            let wait_for = super::super::reservation_wait_progress_poll()
+                .map_or(remaining, |poll| remaining.min(poll));
+            let timed_out = wake.wait(expected, wait_for)?;
+            check_cancelled(cancelled)?;
+            if !timed_out {
+                break false;
+            }
+            super::super::tick_reservation_wait_progress();
+        };
         if timed_out {
             // Ordinary wakes stay entirely on SH/read-only mappings. The
             // bounded crash-recovery tick alone pays for an EX coordinator
