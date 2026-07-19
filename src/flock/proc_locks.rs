@@ -9,8 +9,8 @@
 //!
 //!  - [`read_holders`] — one-shot, reads both `/proc/self/mountinfo`
 //!    and `/proc/locks` itself. Use when looking up one lockfile.
-//!  - [`read_holders_with_mountinfo`] — accepts pre-read mountinfo.
-//!    Use for one lockfile when the caller already has mountinfo.
+//!  - `read_holders_with_mountinfo` — a test seam that accepts pre-read
+//!    mountinfo for one lockfile.
 //!  - [`read_flock_mode_summaries`],
 //!    [`read_holder_pids_batch_with_mountinfo`], and
 //!    [`read_holders_batch_with_mountinfo`] — accept N lockfile paths
@@ -327,12 +327,13 @@ pub(crate) fn read_holders(path: &Path) -> Result<Vec<HolderInfo>> {
 /// format, the same /proc/locks scan, the same HolderInfo shape —
 /// just with the mountinfo text supplied by the caller rather than
 /// read inside this function.
+#[cfg(test)]
 pub(crate) fn read_holders_with_mountinfo(path: &Path, mountinfo: &str) -> Result<Vec<HolderInfo>> {
     let needle = needle_from_path_with_mountinfo(path, mountinfo)?;
     read_holders_for_needle(&needle)
 }
 
-/// Batch variant of [`read_holders_with_mountinfo`].
+/// Batch variant of the test-only `read_holders_with_mountinfo` seam.
 ///
 /// Derives one `/proc/locks` needle per input path, reads
 /// `/proc/locks` exactly once, scans that text exactly once for all

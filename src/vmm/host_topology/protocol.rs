@@ -36,7 +36,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::flock::{FlockMode, TryFlockOutcome, try_flock, try_flock_with_witness};
+use crate::flock::{FlockMode, TryFlockOutcome, try_flock_with_witness};
+#[cfg(test)]
+use crate::flock::try_flock;
 
 mod registry;
 
@@ -61,7 +63,7 @@ pub(crate) struct ResourceLock {
 pub(crate) struct ContentionEvidence {
     pub(crate) blocker: ResourceKey,
     pub(crate) mode: FlockMode,
-    pub(crate) witness: OwnedFd,
+    pub(crate) _witness: OwnedFd,
 }
 
 impl std::fmt::Debug for ContentionEvidence {
@@ -268,6 +270,7 @@ impl ClaimSet {
 /// Whether a fast-path reservation conflicts with an exact live ticket claim.
 /// Three registry aggregates answer the common case in O(host bitset) rather
 /// than scanning O(waiters).
+#[cfg(test)]
 pub(crate) fn registered_claim_conflicts(candidate: &ClaimSet) -> Result<bool> {
     registry::aggregate_conflicts(candidate)
 }
@@ -1046,7 +1049,7 @@ impl HeldLocks {
                     self.record_contention(ContentionEvidence {
                         blocker: lock.resource,
                         mode: lock.mode,
-                        witness,
+                        _witness: witness,
                     });
                 }
             }
@@ -1091,7 +1094,7 @@ impl HeldLocks {
                     self.record_contention(ContentionEvidence {
                         blocker: lock.resource,
                         mode: lock.mode,
-                        witness,
+                        _witness: witness,
                     });
                     return Ok(None);
                 }

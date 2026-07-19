@@ -455,8 +455,6 @@ mod tests {
     #[test]
     #[cfg(panic = "unwind")]
     fn ktstr_test_macro_expect_err_cannot_invert_framework_failure() {
-        use anyhow::Context as _;
-
         let result = std::panic::catch_unwind(|| {
             let result: Result<(), anyhow::Error> = Err(anyhow::Error::new(
                 crate::vmm::host_topology::TopologyInsufficient {

@@ -147,7 +147,6 @@ pub(super) enum State {
 
 #[derive(Debug)]
 pub(super) struct ScheduleSnapshot {
-    pub generation: u64,
     pub watch: ClaimSet,
     pub should_step: bool,
     pub observation: Option<ObservationRequest>,
@@ -322,6 +321,7 @@ impl FutexSlot {
 }
 
 impl Ticket {
+    #[cfg(test)]
     pub(super) fn register(
         claim: ClaimSet,
         watch: ClaimSet,
@@ -916,7 +916,6 @@ impl Ticket {
             table.aggregate_watch()?
         };
         Ok(ScheduleSnapshot {
-            generation: table.generation(),
             watch,
             should_step: false,
             observation: table.observation_request()?,
@@ -987,7 +986,6 @@ impl Ticket {
         }
         check_cancelled(cancelled)?;
         Ok(Some(ScheduleSnapshot {
-            generation: read_u64(&header, H_GENERATION),
             watch,
             should_step: false,
             observation: None,
@@ -1033,16 +1031,11 @@ impl Ticket {
             table.aggregate_watch()?
         };
         Ok(ScheduleSnapshot {
-            generation: table.generation(),
             watch,
             should_step: watch_serial_after > watch_serial_before,
             observation: table.observation_request()?,
             liveness_due_in: table.liveness_due_in()?,
         })
-    }
-
-    pub(super) fn generation(&self, cancelled: Option<&AtomicBool>) -> Result<u64> {
-        read_generation(cancelled)
     }
 
     #[cfg(test)]
@@ -1052,6 +1045,7 @@ impl Ticket {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn finish(&mut self, cancelled: Option<&AtomicBool>) -> Result<()> {
         if self.finished {
             return Ok(());
@@ -1126,6 +1120,7 @@ impl Ticket {
         Ok(())
     }
 
+    #[cfg(test)]
     fn remove_record_interruptible(&mut self, cancelled: Option<&AtomicBool>) -> Result<()> {
         let _lock = lock_registry_interruptible_existing(cancelled)?;
         self.remove_record_locked()
@@ -1180,6 +1175,7 @@ impl Drop for Ticket {
     }
 }
 
+#[cfg(test)]
 pub(super) fn aggregate_conflicts(candidate: &ClaimSet) -> Result<bool> {
     Ok(matches!(
         with_aggregate_fence(candidate, || Ok(()))?,
@@ -2485,17 +2481,6 @@ pub(super) fn publish_acquired(claim: &ClaimSet) -> Result<()> {
     Ok(())
 }
 
-fn read_generation(cancelled: Option<&AtomicBool>) -> Result<u64> {
-    check_cancelled(cancelled)?;
-    let _lock = normalize_cancellation(lock_registry_existing(FlockMode::Shared), cancelled)?;
-    let path = header_path();
-    let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
-    let map = unsafe { Mmap::map(&file) }
-        .with_context(|| format!("map admission registry header {}", path.display()))?;
-    HeaderLayout::validate(&map)?;
-    Ok(read_u64(&map, H_GENERATION))
-}
-
 #[derive(Clone, Copy)]
 struct HeaderLayout {
     words: usize,
@@ -3404,7 +3389,7 @@ impl Table {
     }
 
     fn grant_compatible(&mut self) -> Result<ClaimSet> {
-        let mut records = self.records()?;
+        let records = self.records()?;
         let mut cpus = vec![0u64; self.layout.words];
         let mut llc_any = vec![0u64; self.layout.words];
         let mut llc_exclusive = vec![0u64; self.layout.words];

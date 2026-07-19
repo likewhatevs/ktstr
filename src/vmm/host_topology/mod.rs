@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 // `O_CLOEXEC` source of truth) plus one `HolderInfo` /proc/locks
 // parser. Re-importing the names keeps existing in-module call sites
 // (production + `super::*` tests) compiling unchanged.
-use crate::flock::{FlockMode, TryFlockOutcome, try_flock, try_flock_with_witness};
+use crate::flock::{FlockMode, TryFlockOutcome, try_flock_with_witness};
+#[cfg(test)]
+use crate::flock::try_flock;
 
 // Cross-invocation acquisition protocol: exact fixed-record claims,
 // work-conserving grants, the coordinator watch, and lifecycle-bound blocking.
@@ -35,10 +37,12 @@ struct ReservationWaitProgressScope;
 impl Drop for ReservationWaitProgressScope {
     fn drop(&mut self) {
         RESERVATION_WAIT_PROGRESS.with(|callbacks| {
-            callbacks
-                .borrow_mut()
-                .pop()
-                .expect("reservation wait progress scope remains installed");
+            drop(
+                callbacks
+                    .borrow_mut()
+                    .pop()
+                    .expect("reservation wait progress scope remains installed"),
+            );
         });
     }
 }
@@ -1404,32 +1408,13 @@ fn try_acquire_all_unfenced(
                     evidence: Some(protocol::ContentionEvidence {
                         blocker: lock.resource,
                         mode: lock.mode,
-                        witness,
+                        _witness: witness,
                     }),
                 });
             }
         }
     }
     Ok(TryAcquireAll::Acquired(locks))
-}
-
-/// Queue-grant probe. The registry publishes the exact granted claim while
-/// this unfenced host probe runs, then revalidates the same ticket, claim, and
-/// grant epoch under EX before committing the result. Conflicting fast paths
-/// remain fenced by the published claim while disjoint granted probes run
-/// concurrently.
-pub(crate) fn acquire_resource_locks_granted(
-    plan: &PinningPlan,
-    llc_indices: &[usize],
-    llc_mode: LlcLockMode,
-) -> Result<LockOutcome> {
-    let llc_offset = llc_indices.first().copied().unwrap_or(0);
-    Ok(
-        match try_acquire_all_unfenced(plan, llc_indices, llc_mode)? {
-            TryAcquireAll::Acquired(locks) => LockOutcome::Acquired { llc_offset, locks },
-            TryAcquireAll::Contended { reason, .. } => LockOutcome::Unavailable(reason),
-        },
-    )
 }
 
 pub(crate) fn acquire_resource_locks_granted_with_evidence(
@@ -1881,7 +1866,7 @@ const TOCTOU_RETRY_DELAYS: [std::time::Duration; ACQUIRE_MAX_TOCTOU_RETRIES as u
 /// acquires — DISCOVER never contends.
 ///
 /// `mountinfo` is the `/proc/self/mountinfo` text read once per
-/// `acquire_llc_plan` invocation at [`acquire_llc_plan_with_acquire_fn`]
+/// `acquire_llc_plan` invocation at [`acquire_llc_plan_impl`]
 /// and threaded through here so a host with N LLCs pays for exactly
 /// one mountinfo read per DISCOVER pass (DISCOVER runs once per retry
 /// attempt — up to ACQUIRE_MAX_TOCTOU_RETRIES+1 — plus once on the
@@ -2048,7 +2033,7 @@ fn discover_llc_snapshots_impl(
 /// allowed-CPU overlap) until the accumulated contribution meets
 /// the budget. The LAST selected LLC may contribute more allowed
 /// CPUs than the remaining budget needs; the materialization layer
-/// at [`acquire_llc_plan_with_acquire_fn`] takes only the needed
+/// at [`materialize_llc_plan`] takes only the needed
 /// prefix of that LLC's allowed CPUs into `plan.cpus`. The flock
 /// is always held at LLC granularity — coordination with concurrent
 /// ktstr peers happens per-LLC, regardless of how many of the LLC's
@@ -2220,6 +2205,7 @@ fn plan_from_snapshots(
 /// `drop(locks)`) and returns `Ok(None)` so the caller re-runs
 /// discover + plan with a fresh snapshot. Non-retryable errors
 /// (unexpected errno, path open failures) propagate unchanged.
+#[cfg(test)]
 fn try_acquire_llc_plan_locks(
     selected: &[usize],
     snapshots: &[LlcSnapshot],
@@ -2235,6 +2221,7 @@ fn try_acquire_llc_plan_locks(
 enum LlcLockAttempt {
     Acquired(Vec<std::os::fd::OwnedFd>),
     Contended(protocol::ContentionEvidence),
+    #[cfg(test)]
     Unavailable,
 }
 
@@ -2248,6 +2235,7 @@ impl IntoLlcLockAttempt for LlcLockAttempt {
     }
 }
 
+#[cfg(test)]
 impl IntoLlcLockAttempt for Option<Vec<std::os::fd::OwnedFd>> {
     fn into_llc_lock_attempt(self) -> LlcLockAttempt {
         self.map_or(LlcLockAttempt::Unavailable, LlcLockAttempt::Acquired)
@@ -2273,7 +2261,7 @@ fn try_acquire_llc_plan_locks_with_evidence(
                 return Ok(LlcLockAttempt::Contended(protocol::ContentionEvidence {
                     blocker: protocol::ResourceKey::Llc(idx),
                     mode: FlockMode::Shared,
-                    witness,
+                    _witness: witness,
                 }));
             }
         }
@@ -2487,6 +2475,7 @@ fn check_acquire_cancelled(cancelled: Option<&AtomicBool>) -> Result<()> {
 /// (partials retained across re-plans exactly when the new plan still
 /// selects them) until the plan completes. Ordinary tickets wait on targeted
 /// futexes; the coordinator waits on filtered inotify events.
+#[cfg(test)]
 fn acquire_llc_plan_with_acquire_fn<F>(
     topo: &HostTopology,
     test_topo: &crate::topology::TestTopology,
@@ -2494,7 +2483,7 @@ fn acquire_llc_plan_with_acquire_fn<F>(
     policy: PlacementPolicy,
     wait: bool,
     cancelled: Option<&AtomicBool>,
-    mut acquire_fn: F,
+    acquire_fn: F,
 ) -> Result<LlcPlan>
 where
     F: FnMut(&[usize], &[LlcSnapshot]) -> Result<Option<Vec<std::os::fd::OwnedFd>>>,
@@ -2714,6 +2703,7 @@ where
                         contention.insert(evidence);
                         None
                     }
+                    #[cfg(test)]
                     LlcLockAttempt::Unavailable => None,
                 },
             }
@@ -2838,6 +2828,7 @@ where
                         LlcLockAttempt::Contended(evidence) => {
                             protocol::ProbeOutcome::Contended(evidence)
                         }
+                        #[cfg(test)]
                         LlcLockAttempt::Unavailable => protocol::ProbeOutcome::Unavailable,
                     },
                 )

@@ -1436,7 +1436,7 @@ fn read_nextest_archive_binary_metadata(
             archive_path.display()
         )
     })? {
-        let mut entry = entry.map_err(|error| {
+        let entry = entry.map_err(|error| {
             format!(
                 "cargo ktstr: read nextest archive entry from {}: {error}",
                 archive_path.display()

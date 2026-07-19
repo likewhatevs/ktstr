@@ -18,7 +18,7 @@
 //!    callers may use that witness to order its `IN_CLOSE_WRITE` after
 //!    publishing their blocked state, avoiding an unnecessary UNKNOWN
 //!    observation and re-probe.
-//!  - [`probe_flock_existing_read_only`] — non-creating, read-only
+//!  - `probe_flock_existing_read_only` — non-creating, read-only
 //!    observation of an existing lockfile. Its fd closes with
 //!    `IN_CLOSE_NOWRITE`, so a resource-release watcher can ignore
 //!    observation traffic.
@@ -161,6 +161,7 @@ pub(crate) fn try_flock_with_witness<P: AsRef<Path>>(
 /// through publication of the proven state so that state remains true at the
 /// publication boundary, then drop it; it should not use this read-only probe
 /// as a long-lived resource reservation.
+#[cfg(test)]
 pub(crate) fn probe_flock_existing_read_only<P: AsRef<Path>>(
     path: P,
     mode: FlockMode,

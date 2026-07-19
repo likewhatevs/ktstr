@@ -1598,7 +1598,7 @@ fn try_ticket_candidate(
                     protocol::ContentionEvidence {
                         blocker: protocol::ResourceKey::Cpu(cpu),
                         mode: crate::flock::FlockMode::Exclusive,
-                        witness,
+                        _witness: witness,
                     },
                 ));
             }
@@ -2547,7 +2547,7 @@ fn fast_probe_prunes_a_killed_sole_ticket_before_fencing() {
     let blocker = crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .unwrap();
-    let mut coordinator = TicketChild::spawn(markers.path(), "coordinator", "1", false);
+    let coordinator = TicketChild::spawn(markers.path(), "coordinator", "1", false);
     wait_for_ticket_pids(&[coordinator.pid]);
     coordinator.kill_and_wait();
     drop(blocker);
@@ -2578,7 +2578,7 @@ fn fast_probe_prunes_a_killed_sole_ticket_before_fencing() {
 fn interrupted_initializer_is_rebuilt_from_the_zero_length_header() {
     let _prefixes = LockPrefixesGuard::new();
     let markers = tempfile::TempDir::new().expect("marker dir");
-    let mut creator = TicketChild::spawn_crashing(
+    let creator = TicketChild::spawn_crashing(
         markers.path(),
         "initializer",
         "1",
@@ -2601,7 +2601,7 @@ fn interrupted_initializer_is_rebuilt_from_the_zero_length_header() {
 fn register_crash_after_record_before_counts_is_repaired() {
     let _prefixes = LockPrefixesGuard::new();
     let markers = tempfile::TempDir::new().expect("marker dir");
-    let mut registering = TicketChild::spawn_crashing(
+    let registering = TicketChild::spawn_crashing(
         markers.path(),
         "registering",
         "1",
@@ -2618,7 +2618,7 @@ fn register_crash_after_record_before_counts_is_repaired() {
 fn register_crash_before_state_publish_leaves_no_partial_active_ticket() {
     let _prefixes = LockPrefixesGuard::new();
     let markers = tempfile::TempDir::new().expect("marker dir");
-    let mut registering = TicketChild::spawn_crashing(
+    let registering = TicketChild::spawn_crashing(
         markers.path(),
         "registering-state",
         "1",
@@ -2641,7 +2641,7 @@ fn register_crash_before_state_publish_leaves_no_partial_active_ticket() {
 fn remove_crash_after_counts_before_free_is_repaired() {
     let _prefixes = LockPrefixesGuard::new();
     let markers = tempfile::TempDir::new().expect("marker dir");
-    let mut removing =
+    let removing =
         TicketChild::spawn_crashing(markers.path(), "removing", "1", "remove_counts_before_free");
     removing.wait_for_injected_crash();
 
@@ -2660,9 +2660,9 @@ fn replace_crash_after_counts_before_record_is_repaired() {
     let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .unwrap();
-    let mut coordinator = TicketChild::spawn(markers.path(), "coordinator", "1", false);
+    let coordinator = TicketChild::spawn(markers.path(), "coordinator", "1", false);
     wait_for_ticket_pids(&[coordinator.pid]);
-    let mut replacing = TicketChild::spawn_crashing(
+    let replacing = TicketChild::spawn_crashing(
         markers.path(),
         "replacing",
         "2;3",
@@ -2688,9 +2688,9 @@ fn replace_crash_before_state_publish_cannot_reserve_a_partial_claim() {
     let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .unwrap();
-    let mut coordinator = TicketChild::spawn(markers.path(), "coordinator", "1", false);
+    let coordinator = TicketChild::spawn(markers.path(), "coordinator", "1", false);
     wait_for_ticket_pids(&[coordinator.pid]);
-    let mut replacing = TicketChild::spawn_crashing(
+    let replacing = TicketChild::spawn_crashing(
         markers.path(),
         "replacing-state",
         "2;3",
@@ -2713,7 +2713,7 @@ fn grant_crash_after_state_before_wake_still_makes_progress() {
     let blocker = crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .unwrap();
-    let mut coordinator = TicketChild::spawn_crashing(
+    let coordinator = TicketChild::spawn_crashing(
         markers.path(),
         "coordinator",
         "1",
@@ -2734,9 +2734,9 @@ fn granted_acquirer_crash_before_record_clear_is_pruned() {
     let blocker = crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .unwrap();
-    let mut coordinator = TicketChild::spawn(markers.path(), "coordinator", "1", false);
+    let coordinator = TicketChild::spawn(markers.path(), "coordinator", "1", false);
     wait_for_ticket_pids(&[coordinator.pid]);
-    let mut acquired = TicketChild::spawn_crashing(
+    let acquired = TicketChild::spawn_crashing(
         markers.path(),
         "acquired",
         "2",
@@ -2758,9 +2758,9 @@ fn election_crash_after_header_publish_is_repaired_by_the_next_waiter() {
     let blocker = crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .unwrap();
-    let mut coordinator = TicketChild::spawn(markers.path(), "coordinator", "1", false);
+    let coordinator = TicketChild::spawn(markers.path(), "coordinator", "1", false);
     wait_for_ticket_pids(&[coordinator.pid]);
-    let mut crashing = TicketChild::spawn_crashing(
+    let crashing = TicketChild::spawn_crashing(
         markers.path(),
         "crashing-election",
         "1",
@@ -2795,7 +2795,7 @@ fn conflicting_ticket_cannot_bypass_an_earlier_live_claim() {
     let earlier = TicketChild::spawn(markers.path(), "earlier", "2", true);
     wait_for_ticket_pids(&[coordinator.pid, earlier.pid]);
     earlier.wait_for_probe();
-    let mut conflicting = TicketChild::spawn(markers.path(), "conflicting", "2", false);
+    let conflicting = TicketChild::spawn(markers.path(), "conflicting", "2", false);
     wait_for_ticket_pids(&[coordinator.pid, earlier.pid, conflicting.pid]);
     std::thread::sleep(std::time::Duration::from_millis(100));
     assert!(
@@ -2804,7 +2804,6 @@ fn conflicting_ticket_cannot_bypass_an_earlier_live_claim() {
     );
 
     conflicting.kill_and_wait();
-    let mut earlier = earlier;
     earlier.kill_and_wait();
     drop(blocker);
     coordinator.wait_for_acquired();
@@ -2825,7 +2824,7 @@ fn every_predecessor_claim_is_respected_while_disjoint_work_passes() {
     let third = TicketChild::spawn(markers.path(), "third", "3", true);
     wait_for_ticket_pids(&[coordinator.pid, second.pid, third.pid]);
 
-    let mut conflicts_third = TicketChild::spawn(markers.path(), "conflict-third", "3", false);
+    let conflicts_third = TicketChild::spawn(markers.path(), "conflict-third", "3", false);
     wait_for_ticket_pids(&[coordinator.pid, second.pid, third.pid, conflicts_third.pid]);
 
     let disjoint = TicketChild::spawn(markers.path(), "fully-disjoint", "4", false);
@@ -2838,9 +2837,7 @@ fn every_predecessor_claim_is_respected_while_disjoint_work_passes() {
     );
 
     conflicts_third.kill_and_wait();
-    let mut third = third;
     third.kill_and_wait();
-    let mut second = second;
     second.kill_and_wait();
     drop(blocker);
     coordinator.wait_for_acquired();
@@ -2856,7 +2853,7 @@ fn crashed_ticket_is_pruned_before_a_later_compatible_probe() {
         .unwrap();
     let coordinator = TicketChild::spawn(markers.path(), "coordinator", "1", false);
     wait_for_ticket_pids(&[coordinator.pid]);
-    let mut crashed = TicketChild::spawn(markers.path(), "crashed", "2", true);
+    let crashed = TicketChild::spawn(markers.path(), "crashed", "2", true);
     wait_for_ticket_pids(&[coordinator.pid, crashed.pid]);
     crashed.wait_for_probe();
     let crashed_pid = crashed.pid;

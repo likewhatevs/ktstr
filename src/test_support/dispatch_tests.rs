@@ -2227,8 +2227,6 @@ fn result_to_exit_code_scheduler_build_refused_through_nested_context_routes_to_
 /// breakage as its expected scheduler failure.
 #[test]
 fn result_to_exit_code_framework_infrastructure_failure_bypasses_expect_err() {
-    use anyhow::Context as _;
-
     let err = Err(anyhow::Error::new(
         crate::vmm::host_topology::TopologyInsufficient {
             reason: "injected underlying capacity-looking errno".into(),

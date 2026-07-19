@@ -823,6 +823,7 @@ fn open_content_object_at(path: &Path, expected_len: u64) -> Result<Option<File>
 }
 
 /// Open one immutable machine-wide content object and validate its byte length.
+#[cfg(test)]
 pub(crate) fn open_content_object(content_hash: u64, expected_len: u64) -> Result<Option<File>> {
     let root = content_cache_root()?;
     ensure_content_dirs(&root)?;

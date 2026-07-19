@@ -1850,11 +1850,9 @@ pub(crate) fn write_cell_record(
     };
     let path = dir.join(cell_record_filename(full_name));
     let result = (|| -> anyhow::Result<()> {
-        use std::io::Write;
-
         let mut temporary = tempfile::NamedTempFile::new_in(dir)?;
         serde_json::to_writer(temporary.as_file_mut(), &record)?;
-        temporary.as_file_mut().flush()?;
+        std::io::Write::flush(temporary.as_file_mut())?;
         temporary.persist(&path).map_err(|error| error.error)?;
         Ok(())
     })();

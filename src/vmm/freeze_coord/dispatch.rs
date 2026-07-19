@@ -37,7 +37,7 @@
 //! [`crate::vmm::wire::MsgType::is_coordinator_internal`].
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use vmm_sys_util::eventfd::EventFd;
 
 use super::snapshot::decode_snapshot_request;
