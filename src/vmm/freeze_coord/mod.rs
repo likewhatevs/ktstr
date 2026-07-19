@@ -4276,6 +4276,8 @@ impl KtstrVm {
         // fallback (the interactive path and every non-no-perf run).
         effective_no_perf_cpus: Option<&[usize]>,
     ) -> Result<VmRunState> {
+        let effective_placement =
+            super::EffectiveRunPlacement::new(effective_pinning_plan, effective_no_perf_cpus);
         let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
         let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
         // Userspace IOAPIC handle for the split-irqchip path: the device + the
@@ -4548,7 +4550,7 @@ impl KtstrVm {
         let (virtio_blk, blk_device, _blk_resample_evt): (Option<_>, Option<_>, Option<_>) =
             match pci_bus_handle.as_ref() {
                 Some(bus) => {
-                    match self.init_virtio_blk_pci(&vm, bus, msix_sink, effective_no_perf_cpus)? {
+                    match self.init_virtio_blk_pci(&vm, bus, msix_sink, effective_placement)? {
                         Some(h) => (None, Some(h.device), h.resample_evt),
                         None => (None, None, None),
                     }
@@ -4557,7 +4559,7 @@ impl KtstrVm {
             };
         #[cfg(not(target_arch = "x86_64"))]
         let (virtio_blk, blk_device): (Option<_>, Option<_>) = {
-            let dev = self.init_virtio_blk(&vm, effective_no_perf_cpus)?;
+            let dev = self.init_virtio_blk(&vm, effective_placement)?;
             (dev.clone(), dev)
         };
         // Plumb the shared parked_evt into the device (both transports) so its
@@ -5105,6 +5107,7 @@ impl KtstrVm {
             &kill,
             &kill_evt,
             run_start,
+            effective_placement,
             vcpu_pthreads,
             contention_recorder.clone(),
             perf_capture.clone(),
@@ -5269,7 +5272,7 @@ impl KtstrVm {
         // instead of polling on a 100 ms thread::sleep cadence.
         let kill_evt_for_watchdog = kill_evt.clone();
         let bsp_done_evt_for_wd = bsp_done_evt.clone();
-        let wd_service_cpu = effective_pinning_plan.and_then(|p| p.service_cpu);
+        let wd_service_cpu = effective_placement.service_cpu;
         // Clone the virtio-console Arc into the watchdog so the
         // soft-deadline path can push `SIGNAL_VC_SHUTDOWN` to
         // `/dev/hvc0` for graceful shutdown. The guest's
@@ -15564,6 +15567,7 @@ impl KtstrVm {
         kill: &Arc<AtomicBool>,
         kill_evt: &Arc<EventFd>,
         run_start: Instant,
+        effective_placement: super::EffectiveRunPlacement<'_>,
         vcpu_pthreads: Vec<libc::pthread_t>,
         contention_recorder: Arc<ContentionWitnessRecorder>,
         perf_capture: Arc<Option<monitor::perf_counters::PerfCountersCapture>>,
@@ -15743,7 +15747,7 @@ impl KtstrVm {
             j.saturating_mul(GUEST_SCX_WATCHDOG_COVERAGE_SCALE)
         });
         let preemption_threshold_ns = monitor::vcpu_preemption_threshold_ns(Some(&self.kernel));
-        let service_cpu = self.pinning_plan.as_ref().and_then(|p| p.service_cpu);
+        let service_cpu = effective_placement.service_cpu;
         // Workload duration captured for the scheduler-attach
         // watchdog reset. `Some(d)` enables the reset; the
         // monitor closure constructs a

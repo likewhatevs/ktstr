@@ -839,13 +839,10 @@ impl KtstrVm {
     pub(super) fn init_virtio_blk(
         &self,
         vm: &kvm::KtstrKvm,
-        // No-perf worker-placement override from `run_vm`'s run-time
-        // replan. `Some` on the no-perf test path — the fresh LLC plan's
-        // CPUs, which name the LLCs the run-scoped flocks hold; the worker
-        // shares that budget. `None` on the interactive path (no replan
-        // runs) and every non-no-perf run, where the placement falls back
-        // to the build-time `self.no_perf_plan.cpus` exactly as before.
-        no_perf_cpus: Option<&[usize]>,
+        // The selected run-time placement. Performance admission can choose a
+        // different equivalent exact plan than the build-time probe, while
+        // no-perf admission can choose a fresh LLC mask.
+        effective_placement: super::EffectiveRunPlacement<'_>,
     ) -> Result<Option<Arc<PiMutex<virtio_blk::VirtioBlk>>>> {
         let Some(disk) = self.disk.as_ref() else {
             return Ok(None);
@@ -920,10 +917,8 @@ impl KtstrVm {
         // build-time `no_perf_plan.cpus` so the worker binds to the same
         // LLCs the run-scoped flocks hold.
         let placement = virtio_blk::WorkerPlacement {
-            service_cpu: self.pinning_plan.as_ref().and_then(|p| p.service_cpu),
-            no_perf_cpus: no_perf_cpus
-                .map(<[usize]>::to_vec)
-                .or_else(|| self.no_perf_plan.as_ref().map(|p| p.cpus.clone())),
+            service_cpu: effective_placement.service_cpu,
+            no_perf_cpus: effective_placement.no_perf_cpus.map(<[usize]>::to_vec),
         };
         blk.set_worker_placement(placement);
         blk.set_mem((*vm.guest_mem).clone());
@@ -1185,10 +1180,8 @@ impl KtstrVm {
         vm: &kvm::KtstrKvm,
         pci_bus: &Arc<PiMutex<pci::PciBus>>,
         msix_sink: Option<Arc<dyn virtio_msix::MsixRouteSink>>,
-        // No-perf worker-placement override — same semantics as the MMIO
-        // twin `init_virtio_blk`: the run-time-replan CPUs when `Some`,
-        // else the build-time `self.no_perf_plan.cpus` fallback.
-        no_perf_cpus: Option<&[usize]>,
+        // Same selected run-time placement as the MMIO twin.
+        effective_placement: super::EffectiveRunPlacement<'_>,
     ) -> Result<Option<BlkDeviceHandles>> {
         let Some(disk) = self.disk.as_ref() else {
             return Ok(None);
@@ -1208,12 +1201,10 @@ impl KtstrVm {
         // Worker placement + guest memory — same as `init_virtio_blk`. Both land
         // before the deferred initial worker spawn (DRIVER_OK), so the first
         // worker observes the placement and guest memory. The run-time-replan
-        // `no_perf_cpus` override wins over the build-time `no_perf_plan.cpus`.
+        // selected run-time placement wins over every build-time probe.
         let placement = virtio_blk::WorkerPlacement {
-            service_cpu: self.pinning_plan.as_ref().and_then(|p| p.service_cpu),
-            no_perf_cpus: no_perf_cpus
-                .map(<[usize]>::to_vec)
-                .or_else(|| self.no_perf_plan.as_ref().map(|p| p.cpus.clone())),
+            service_cpu: effective_placement.service_cpu,
+            no_perf_cpus: effective_placement.no_perf_cpus.map(<[usize]>::to_vec),
         };
         blk.set_worker_placement(placement);
         blk.set_mem((*vm.guest_mem).clone());
@@ -1317,6 +1308,7 @@ impl KtstrVm {
     /// in `setup_memory` after the actual initramfs size is known.
     pub(super) fn create_vm_and_load_kernel(
         &self,
+        mbind_node_map: &[Vec<usize>],
     ) -> Result<(kvm::KtstrKvm, Option<boot::KernelLoadResult>)> {
         let t0 = Instant::now();
 
@@ -1348,14 +1340,14 @@ impl KtstrVm {
         // When memory is already allocated (non-deferred path), do mbind
         // and load kernel now. Deferred path does this in setup_memory.
         let kernel_result = if self.memory_mib.is_some() {
-            if self.performance_mode && !self.mbind_node_map.is_empty() {
+            if self.performance_mode && !mbind_node_map.is_empty() {
                 let layout = vm.numa_layout.as_ref().expect(
                     "numa_layout is Some on the non-deferred allocation path: \
                      allocate_and_register_memory ran during `vm_new` because \
                      memory_mib was provided up front, and that call sets \
                      numa_layout to Some(...) in src/vmm/{x86_64,aarch64}/kvm.rs",
                 );
-                layout.mbind_regions(&vm.guest_mem, &self.mbind_node_map);
+                layout.mbind_regions(&vm.guest_mem, mbind_node_map);
             }
 
             let t0 = Instant::now();
@@ -1487,8 +1479,14 @@ impl KtstrVm {
         vm: &mut kvm::KtstrKvm,
         prepared: PreparedInitrd,
         load_addr: u64,
+        mbind_node_map: &[Vec<usize>],
     ) -> Result<u32> {
-        framework_infrastructure(self.load_prepared_initrd_inner(vm, prepared, load_addr))
+        framework_infrastructure(self.load_prepared_initrd_inner(
+            vm,
+            prepared,
+            load_addr,
+            mbind_node_map,
+        ))
     }
 
     fn load_prepared_initrd_inner(
@@ -1496,6 +1494,7 @@ impl KtstrVm {
         vm: &mut kvm::KtstrKvm,
         prepared: PreparedInitrd,
         load_addr: u64,
+        mbind_node_map: &[Vec<usize>],
     ) -> Result<u32> {
         let total_compressed = prepared.compressed_len();
         let page_size = prepared.mapping_granule();
@@ -1530,7 +1529,7 @@ impl KtstrVm {
             host_page_size,
         )?;
         let t0 = Instant::now();
-        let restore_numa = self.performance_mode && !self.mbind_node_map.is_empty();
+        let restore_numa = self.performance_mode && !mbind_node_map.is_empty();
         let numa_layout = if restore_numa {
             Some(vm.numa_layout.as_ref().context(
                 "performance-mode direct-map initrd has NUMA bindings \
@@ -1556,7 +1555,7 @@ impl KtstrVm {
                         subrange.guest_addr,
                         subrange.host_addr,
                         subrange.len,
-                        &self.mbind_node_map,
+                        mbind_node_map,
                     )?;
                 }
                 Ok(())
@@ -1634,6 +1633,7 @@ impl KtstrVm {
         vm: &mut kvm::KtstrKvm,
         handle: JoinHandle<Result<PreparedBase>>,
         load_addr: u64,
+        mbind_node_map: &[Vec<usize>],
     ) -> Result<(Option<u64>, Option<u32>)> {
         let t0 = Instant::now();
         let prepared_base = join_prepared_base(handle)?;
@@ -1684,7 +1684,7 @@ impl KtstrVm {
             );
         }
 
-        let size = self.load_prepared_initrd(vm, prepared, load_addr)?;
+        let size = self.load_prepared_initrd(vm, prepared, load_addr, mbind_node_map)?;
         Ok((Some(load_addr), Some(size)))
     }
 
@@ -1931,6 +1931,7 @@ impl KtstrVm {
         vm: &mut kvm::KtstrKvm,
         kernel_result: Option<boot::KernelLoadResult>,
         initramfs_handle: Option<JoinHandle<Result<PreparedBase>>>,
+        mbind_node_map: &[Vec<usize>],
     ) -> Result<boot::KernelLoadResult> {
         // Deferred memory path: join initramfs first to learn its size,
         // then allocate memory, load kernel, and load initramfs — all in
@@ -1942,7 +1943,9 @@ impl KtstrVm {
             // operation, so a mid-function `?` cannot drop the guard
             // before the COW VMAs are torn down.
             let (initrd_addr, initrd_size) = match initramfs_handle {
-                Some(handle) => self.join_and_load_initramfs(vm, handle, INITRD_ADDR)?,
+                Some(handle) => {
+                    self.join_and_load_initramfs(vm, handle, INITRD_ADDR, mbind_node_map)?
+                }
                 None => (None, None),
             };
             (kr, initrd_addr, initrd_size)
@@ -1969,13 +1972,13 @@ impl KtstrVm {
             // mbind_regions performs MADV_POPULATE_WRITE across anonymous
             // guest RAM. Running it after the overlay eagerly COWs every
             // initrd page and defeats machine-wide sharing.
-            if self.performance_mode && !self.mbind_node_map.is_empty() {
+            if self.performance_mode && !mbind_node_map.is_empty() {
                 let layout = vm.numa_layout.as_ref().expect(
                     "numa_layout is Some after the deferred allocate_and_register_memory \
                      call above: that call sets numa_layout to Some(...) in \
                      src/vmm/{x86_64,aarch64}/kvm.rs before this branch can reach here",
                 );
-                layout.mbind_regions(&vm.guest_mem, &self.mbind_node_map);
+                layout.mbind_regions(&vm.guest_mem, mbind_node_map);
             }
 
             // Load kernel into the freshly allocated memory.
@@ -1985,7 +1988,8 @@ impl KtstrVm {
 
             let (initrd_addr, initrd_size) = match prepared_initrd {
                 Some(prepared) => {
-                    let size = self.load_prepared_initrd(vm, prepared, INITRD_ADDR)?;
+                    let size =
+                        self.load_prepared_initrd(vm, prepared, INITRD_ADDR, mbind_node_map)?;
                     (Some(INITRD_ADDR), Some(size))
                 }
                 None => (None, None),
@@ -2221,6 +2225,7 @@ impl KtstrVm {
         vm: &mut kvm::KtstrKvm,
         kernel_result: Option<boot::KernelLoadResult>,
         initramfs_handle: Option<JoinHandle<Result<PreparedBase>>>,
+        mbind_node_map: &[Vec<usize>],
     ) -> Result<boot::KernelLoadResult> {
         // Deferred memory path for aarch64.
         let (kernel_result, initrd_addr, initrd_size) = if let Some(kr) = kernel_result {
@@ -2241,7 +2246,12 @@ impl KtstrVm {
                     let memory_mib = self.memory_mib.context(
                         "internal: non-deferred aarch64 path requires memory_mib to be set",
                     )?;
-                    self.join_and_load_initramfs_aarch64(vm, handle, memory_mib)?
+                    self.join_and_load_initramfs_aarch64(
+                        vm,
+                        handle,
+                        memory_mib,
+                        mbind_node_map,
+                    )?
                 }
                 None => (None, None),
             };
@@ -2264,12 +2274,12 @@ impl KtstrVm {
                 }
             };
 
-            if self.performance_mode && !self.mbind_node_map.is_empty() {
+            if self.performance_mode && !mbind_node_map.is_empty() {
                 let layout = vm
                     .numa_layout
                     .as_ref()
                     .expect("numa_layout is Some after deferred aarch64 memory allocation");
-                layout.mbind_regions(&vm.guest_mem, &self.mbind_node_map);
+                layout.mbind_regions(&vm.guest_mem, mbind_node_map);
             }
 
             // Load kernel into the freshly allocated memory.
@@ -2280,7 +2290,8 @@ impl KtstrVm {
 
             let (initrd_addr, initrd_size) = match (prepared_initrd, prepared_load_addr) {
                 (Some(prepared), Some(load_addr)) => {
-                    let size = self.load_prepared_initrd(vm, prepared, load_addr)?;
+                    let size =
+                        self.load_prepared_initrd(vm, prepared, load_addr, mbind_node_map)?;
                     (Some(load_addr), Some(size))
                 }
                 (None, None) => (None, None),
@@ -2303,6 +2314,7 @@ impl KtstrVm {
         vm: &mut kvm::KtstrKvm,
         handle: JoinHandle<Result<PreparedBase>>,
         memory_mib: u32,
+        mbind_node_map: &[Vec<usize>],
     ) -> Result<(Option<u64>, Option<u32>)> {
         let t0 = Instant::now();
         let prepared_base = join_prepared_base(handle)?;
@@ -2356,7 +2368,7 @@ impl KtstrVm {
             self.topology.total_cpus(),
             compressed_size as u64,
         )?;
-        let size = self.load_prepared_initrd(vm, prepared, load_addr)?;
+        let size = self.load_prepared_initrd(vm, prepared, load_addr, mbind_node_map)?;
         Ok((Some(load_addr), Some(size)))
     }
 

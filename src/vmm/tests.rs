@@ -500,6 +500,75 @@ fn acquire_default_run_locks_overcommits_when_host_too_small() {
     assert!(rl.no_perf_cpus.is_none());
 }
 
+/// Performance admission must publish every exact whole-LLC placement, not
+/// freeze an all-busy storm onto the builder's first slot. The order is
+/// process-rotated, so compare the set.
+#[test]
+fn performance_run_candidates_cover_every_equivalent_exclusive_slot() {
+    let host = host_topology::HostTopology::new_for_tests(&[
+        (vec![0, 1], 0),
+        (vec![2, 3], 0),
+        (vec![4, 5], 0),
+    ]);
+    let candidates = KtstrVm::performance_run_candidates(
+        &host,
+        &Topology::new(1, 1, 1, 1),
+        host_topology::LlcLockMode::Exclusive,
+    )
+    .expect("enumerate exact perf placements");
+    let mut llcs: Vec<_> = candidates
+        .iter()
+        .map(|candidate| candidate.llc_indices.clone())
+        .collect();
+    llcs.sort();
+    assert_eq!(llcs, vec![vec![0], vec![1], vec![2]]);
+    assert!(
+        candidates.iter().all(|candidate| candidate.locks.is_empty()),
+        "candidate enumeration carries no pre-boot flock ownership",
+    );
+}
+
+/// Per-CPU-grain performance mode is flexible across every disjoint block
+/// inside a large LLC while preserving its shared-LLC + exact CPU-lock grain.
+#[test]
+fn performance_run_candidates_cover_every_disjoint_cpu_grain() {
+    let host =
+        host_topology::HostTopology::new_for_tests(&[(vec![0, 1, 2, 3, 4, 5], 0)]);
+    let candidates = KtstrVm::performance_run_candidates(
+        &host,
+        &Topology::new(1, 1, 1, 1),
+        host_topology::LlcLockMode::Shared,
+    )
+    .expect("enumerate per-CPU perf grains");
+    let mut footprints: Vec<Vec<usize>> = candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .assignments
+                .iter()
+                .map(|&(_, cpu)| cpu)
+                .chain(candidate.service_cpu)
+                .collect()
+        })
+        .collect();
+    footprints.sort();
+    assert_eq!(footprints, vec![vec![0, 1], vec![2, 3], vec![4, 5]]);
+}
+
+#[test]
+fn effective_run_placement_uses_runtime_plan_for_every_service_consumer() {
+    let selected = host_topology::PinningPlan {
+        assignments: vec![(0, 8), (1, 9)],
+        service_cpu: Some(10),
+        llc_indices: vec![2],
+        locks: Vec::new(),
+    };
+    let no_perf = [12, 13];
+    let placement = EffectiveRunPlacement::new(Some(&selected), Some(&no_perf));
+    assert_eq!(placement.service_cpu, Some(10));
+    assert_eq!(placement.no_perf_cpus, Some(no_perf.as_slice()));
+}
+
 #[test]
 fn default_candidate_scan_reuses_one_aggregate_snapshot_and_fences_survivors() {
     struct ResetOverrides;

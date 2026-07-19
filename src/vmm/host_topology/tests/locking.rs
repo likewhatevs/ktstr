@@ -511,7 +511,11 @@ fn acquire_llc_plan_none_cap_reserves_thirty_percent_cpus() {
         "plan.cpus is truncated to exactly the budget: {:?}",
         plan.cpus,
     );
-    assert_eq!(plan.locks.len(), 2, "one fd per selected LLC");
+    assert_eq!(
+        plan.locks.len(),
+        plan.locked_llcs.len() + plan.cpus.len(),
+        "one shared fd per selected LLC and budget CPU",
+    );
 }
 
 /// `acquire_llc_plan` bails with `ResourceContention` when ANY
@@ -582,8 +586,8 @@ fn acquire_llc_plan_coexists_with_shared_peer() {
         .expect("second SH caller must coexist with the first");
     assert_eq!(
         plan.locks.len(),
-        topo.llc_groups.len(),
-        "second SH caller must acquire one fd per LLC group",
+        topo.llc_groups.len() + plan.cpus.len(),
+        "second SH caller must acquire one fd per LLC and budget CPU",
     );
 }
 
@@ -654,7 +658,11 @@ fn acquire_llc_plan_waits_out_real_exclusive_peer() {
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
     let plan = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate, true)
         .expect("wait-enabled acquisition must complete after the peer releases");
-    assert_eq!(plan.locks.len(), 1, "one fd for the single released LLC");
+    assert_eq!(
+        plan.locks.len(),
+        2,
+        "one fd each for the released LLC and budget CPU",
+    );
     releaser.join().expect("releaser thread must not panic");
 }
 

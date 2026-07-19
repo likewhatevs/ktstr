@@ -102,9 +102,10 @@ fn synthetic_topo_numa(groups: Vec<(usize, Vec<usize>)>) -> HostTopology {
     HostTopology::new_for_tests(&tagged)
 }
 
-/// RAII guard for a per-test LLC lockfile path prefix. Installs
-/// a `{tempdir}/llc-` prefix into [`LLC_LOCK_PREFIX_OVERRIDE`]
-/// on construction and unsets it on Drop. Two parallel tests
+/// RAII guard for a per-test LLC-plan lockfile pool. Installs
+/// `{tempdir}/llc-` and `{tempdir}/cpu-` prefixes on construction
+/// and unsets both on Drop because an [`LlcPlan`] reserves shared CPU
+/// locks as well as shared LLC locks. Two parallel tests
 /// using this guard each get their own tempdir, so their
 /// `acquire_llc_plan` lockfiles can't collide. Eliminates the
 /// 90K+ empty `LlcGroup` padding that earlier tests used to
@@ -120,8 +121,10 @@ struct LlcLockPrefixGuard {
 impl LlcLockPrefixGuard {
     fn new() -> Self {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let prefix = format!("{}/llc-", dir.path().display());
-        LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = Some(prefix));
+        let llc_prefix = format!("{}/llc-", dir.path().display());
+        let cpu_prefix = format!("{}/cpu-", dir.path().display());
+        LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = Some(llc_prefix));
+        CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = Some(cpu_prefix));
         LlcLockPrefixGuard { _dir: dir }
     }
 }
@@ -129,6 +132,7 @@ impl LlcLockPrefixGuard {
 impl Drop for LlcLockPrefixGuard {
     fn drop(&mut self) {
         LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = None);
+        CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = None);
     }
 }
 
@@ -170,13 +174,41 @@ impl Drop for CpuLockPrefixGuard {
 struct LockPrefixesGuard {
     _cpu: CpuLockPrefixGuard,
     _llc: LlcLockPrefixGuard,
+    retry_wake_marker: Option<std::path::PathBuf>,
 }
 
 impl LockPrefixesGuard {
     fn new() -> Self {
-        LockPrefixesGuard {
-            _cpu: CpuLockPrefixGuard::new(),
-            _llc: LlcLockPrefixGuard::new(),
+        Self::new_with_retry_wake(true)
+    }
+
+    /// Keep the production real-inotify transport for end-to-end wake
+    /// contract tests while retaining isolated lock paths.
+    fn new_real_wake() -> Self {
+        Self::new_with_retry_wake(false)
+    }
+
+    fn new_with_retry_wake(test_retry: bool) -> Self {
+        let cpu = CpuLockPrefixGuard::new();
+        let llc = LlcLockPrefixGuard::new();
+        let retry_wake_marker = test_retry.then(|| {
+            let marker = protocol::test_retry_wake_marker_path_for_tests();
+            std::fs::write(&marker, b"test-retry")
+                .expect("create test retry wake marker beside registry");
+            marker
+        });
+        Self {
+            _cpu: cpu,
+            _llc: llc,
+            retry_wake_marker,
+        }
+    }
+}
+
+impl Drop for LockPrefixesGuard {
+    fn drop(&mut self) {
+        if let Some(marker) = self.retry_wake_marker.take() {
+            let _ = std::fs::remove_file(marker);
         }
     }
 }

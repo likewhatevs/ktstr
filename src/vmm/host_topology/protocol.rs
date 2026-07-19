@@ -1,10 +1,10 @@
 //! Cross-process host-resource admission under nextest.
 //!
-//! Every ktstr process sharing a lock directory participates in one v4
+//! Every ktstr process sharing a lock directory participates in one v5
 //! fixed-record mmap registry. A ticket publishes one exact, non-empty CPU/LLC
 //! reservation claim plus the resources its planner may watch. Claims preserve
-//! the resource-lock semantics exactly: CPU locks are exclusive, and LLC claims
-//! use the same SH/EX compatibility matrix as `flock`.
+//! the resource-lock semantics exactly: CPU and LLC claims independently use
+//! the same SH/EX compatibility matrix as `flock`.
 //!
 //! Admission is work-conserving without weakening those reservations. One
 //! elected coordinator scans tickets in monotonic order and grants a waiter
@@ -178,10 +178,17 @@ const WAITER_CRASH_RECOVERY_BASE: Duration = Duration::from_secs(3);
 /// active past this shared, non-postponable deadline performs one sweep;
 /// ordinary liveness closes after watch installation remain event-driven.
 const PREWATCH_LIVENESS_RECONCILE_DELAY: Duration = Duration::from_millis(500);
+/// Explicit cfg(test)-only retry transport cadence. This is a semantic
+/// coordinator retry deadline, not a short slice of the 30-second real-inotify
+/// deadline: each expiry runs schedule + replan again.
+#[cfg(test)]
+const TEST_RETRY_WAKE_INTERVAL: Duration = Duration::from_millis(8);
+#[cfg(test)]
+const TEST_RETRY_WAKE_MARKER: &str = ".ktstr-test-retry-wake";
 
 /// Directory the protocol files live in — derived from the LLC
 /// lockfile path so the test-only lock-prefix override isolates the
-/// v4 registry files into the same per-test tempdir as the LLC locks
+/// v5 registry files into the same per-test tempdir as the LLC locks
 /// they coordinate.
 fn protocol_dir() -> PathBuf {
     Path::new(&super::llc_lock_path(0))
@@ -190,19 +197,19 @@ fn protocol_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
-/// Sharing mode of the LLC locks in an exact [`ClaimSet`].
+/// Sharing mode of one resource class in an exact [`ClaimSet`].
 ///
-/// Its compatibility rules exactly match `flock`: a shared claim only fences an exclusive LLC
-/// requester, while an exclusive claim fences both shared and exclusive
-/// requesters. CPU claims are always exclusive.
+/// Its compatibility rules exactly match `flock`: a shared claim only fences
+/// an exclusive requester, while an exclusive claim fences both shared and
+/// exclusive requesters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum ClaimLlcMode {
+pub(crate) enum ClaimMode {
     #[default]
     Exclusive,
     Shared,
 }
 
-impl From<FlockMode> for ClaimLlcMode {
+impl From<FlockMode> for ClaimMode {
     fn from(mode: FlockMode) -> Self {
         match mode {
             FlockMode::Exclusive => Self::Exclusive,
@@ -216,24 +223,104 @@ impl From<FlockMode> for ClaimLlcMode {
 pub(crate) struct ClaimSet {
     pub llcs: BTreeSet<usize>,
     pub cpus: BTreeSet<usize>,
-    pub llc_mode: ClaimLlcMode,
+    pub llc_mode: ClaimMode,
+    pub cpu_mode: ClaimMode,
 }
 
 impl ClaimSet {
+    fn from_claim_modes(
+        llcs: impl IntoIterator<Item = usize>,
+        cpus: impl IntoIterator<Item = usize>,
+        llc_mode: ClaimMode,
+        cpu_mode: ClaimMode,
+    ) -> Self {
+        let llcs = llcs.into_iter().collect::<BTreeSet<_>>();
+        let cpus = cpus.into_iter().collect::<BTreeSet<_>>();
+        Self {
+            llc_mode: if llcs.is_empty() {
+                ClaimMode::Exclusive
+            } else {
+                llc_mode
+            },
+            cpu_mode: if cpus.is_empty() {
+                ClaimMode::Exclusive
+            } else {
+                cpu_mode
+            },
+            llcs,
+            cpus,
+        }
+    }
+
+    pub(super) fn with_claim_modes(
+        llcs: impl IntoIterator<Item = usize>,
+        cpus: impl IntoIterator<Item = usize>,
+        llc_mode: ClaimMode,
+        cpu_mode: ClaimMode,
+    ) -> Self {
+        Self::from_claim_modes(llcs, cpus, llc_mode, cpu_mode)
+    }
+
     pub(crate) fn new(
         llcs: impl IntoIterator<Item = usize>,
         cpus: impl IntoIterator<Item = usize>,
         llc_mode: FlockMode,
     ) -> Self {
-        Self {
-            llcs: llcs.into_iter().collect(),
-            cpus: cpus.into_iter().collect(),
-            llc_mode: llc_mode.into(),
-        }
+        Self::from_claim_modes(
+            llcs,
+            cpus,
+            llc_mode.into(),
+            ClaimMode::Exclusive,
+        )
+    }
+
+    pub(crate) fn with_modes(
+        llcs: impl IntoIterator<Item = usize>,
+        cpus: impl IntoIterator<Item = usize>,
+        llc_mode: FlockMode,
+        cpu_mode: FlockMode,
+    ) -> Self {
+        Self::from_claim_modes(llcs, cpus, llc_mode.into(), cpu_mode.into())
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.llcs.is_empty() && self.cpus.is_empty()
+    }
+
+    /// Union two alternative footprints while preserving the strongest mode
+    /// actually present in each resource class. The canonical mode attached
+    /// to an empty class is ignored.
+    pub(crate) fn union_envelope(&self, other: &Self) -> Self {
+        let strongest = |a_empty: bool, a_mode, b_empty: bool, b_mode| {
+            match (a_empty, b_empty) {
+                (true, true) => ClaimMode::Exclusive,
+                (true, false) => b_mode,
+                (false, true) => a_mode,
+                (false, false)
+                    if a_mode == ClaimMode::Exclusive
+                        || b_mode == ClaimMode::Exclusive =>
+                {
+                    ClaimMode::Exclusive
+                }
+                (false, false) => ClaimMode::Shared,
+            }
+        };
+        Self::from_claim_modes(
+            self.llcs.union(&other.llcs).copied(),
+            self.cpus.union(&other.cpus).copied(),
+            strongest(
+                self.llcs.is_empty(),
+                self.llc_mode,
+                other.llcs.is_empty(),
+                other.llc_mode,
+            ),
+            strongest(
+                self.cpus.is_empty(),
+                self.cpu_mode,
+                other.cpus.is_empty(),
+                other.cpu_mode,
+            ),
+        )
     }
 
     /// Whether `request_mode` on `llc_idx` is incompatible with this live
@@ -243,25 +330,28 @@ impl ClaimSet {
         self.llcs.contains(&llc_idx)
             && matches!(
                 (self.llc_mode, request_mode),
-                (ClaimLlcMode::Exclusive, _) | (ClaimLlcMode::Shared, FlockMode::Exclusive)
+                (ClaimMode::Exclusive, _) | (ClaimMode::Shared, FlockMode::Exclusive)
             )
     }
 
     /// Whether two complete reservation claims are incompatible.
     ///
-    /// CPU locks are always exclusive. LLC compatibility is the flock
-    /// SH/EX matrix: two shared claims may overlap at the LLC layer as long as
-    /// their exact CPU claims remain disjoint.
+    /// CPU and LLC compatibility independently follow the flock SH/EX matrix.
     #[cfg(test)]
     pub(crate) fn conflicts_with(&self, other: &Self) -> bool {
-        if self.cpus.iter().any(|cpu| other.cpus.contains(cpu)) {
+        if self.cpus.iter().any(|cpu| other.cpus.contains(cpu))
+            && matches!(
+                (self.cpu_mode, other.cpu_mode),
+                (ClaimMode::Exclusive, _) | (_, ClaimMode::Exclusive)
+            )
+        {
             return true;
         }
         self.llcs.iter().any(|llc| {
             other.llcs.contains(llc)
                 && matches!(
                     (self.llc_mode, other.llc_mode),
-                    (ClaimLlcMode::Exclusive, _) | (_, ClaimLlcMode::Exclusive)
+                    (ClaimMode::Exclusive, _) | (_, ClaimMode::Exclusive)
                 )
         })
     }
@@ -299,6 +389,19 @@ pub(crate) fn aggregate_snapshot_read_count_for_tests() -> usize {
     registry::aggregate_snapshot_read_count_for_tests()
 }
 
+#[cfg(test)]
+pub(crate) fn union_claims_for_tests(a: &ClaimSet, b: &ClaimSet) -> ClaimSet {
+    registry::union_claims_for_tests(a, b)
+}
+
+#[cfg(test)]
+pub(crate) fn round_trip_claim_modes_for_tests(
+    claim: &ClaimSet,
+    watch: &ClaimSet,
+) -> Result<(ClaimSet, ClaimSet)> {
+    registry::round_trip_claim_modes_for_tests(claim, watch)
+}
+
 pub(crate) enum RegistryFence<T> {
     Fenced,
     Ran { value: T, watched: bool },
@@ -321,14 +424,25 @@ pub(crate) fn with_registry_fence<T>(
     }
 }
 
-/// One coordinator-owned inotify watch over the lock directory.
+/// One coordinator-owned wake transport.
+///
+/// Production always constructs `RealInotify` and propagates initialization
+/// failure. TestRetry exists only in cfg(test), and only when a unique
+/// LockPrefixesGuard marker has been installed explicitly.
+pub(crate) enum LockDirWatch {
+    RealInotify(RealInotifyWake),
+    #[cfg(test)]
+    TestRetry,
+}
+
+/// Real coordinator-owned inotify watch over the lock directory.
 ///
 /// Only resource-lock closes and the explicit registry notification are
 /// actionable. Registry header/chunk/liveness opens are coordinator-internal
 /// traffic; filtering their close events is essential because a generation
 /// read immediately before `poll` would otherwise wake the coordinator itself
 /// forever.
-pub(crate) struct LockDirWatch {
+struct RealInotifyWake {
     ino: nix::sys::inotify::Inotify,
     event_wd: nix::sys::inotify::WatchDescriptor,
     resource_watches: std::collections::BTreeMap<nix::sys::inotify::WatchDescriptor, ResourceWatch>,
@@ -373,12 +487,12 @@ impl LockDirEvents {
     }
 }
 
-impl LockDirWatch {
+impl RealInotifyWake {
     /// Watch writable closes only. Resource holders, registry notifications,
     /// and liveness owners all use O_RDWR/O_WRONLY descriptors. Liveness
     /// verification deliberately uses O_RDONLY, so omitting CLOSE_NOWRITE
     /// prevents those probes from entering the inotify queue at all.
-    pub(crate) fn new() -> Result<Self> {
+    fn new() -> Result<Self> {
         use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
         let llc_path = super::llc_lock_path(0);
         let cpu_path = super::cpu_lock_path(0);
@@ -411,7 +525,7 @@ impl LockDirWatch {
             let wd = ino.add_watch(&dir, AddWatchFlags::IN_CLOSE_WRITE)?;
             resource_watches.insert(wd, resource);
         }
-        Ok(LockDirWatch {
+        Ok(RealInotifyWake {
             ino,
             event_wd,
             resource_watches,
@@ -524,6 +638,74 @@ impl LockDirWatch {
     }
 }
 
+impl LockDirWatch {
+    pub(crate) fn new() -> Result<Self> {
+        #[cfg(test)]
+        if test_retry_wake_marker_path().is_file() {
+            return Ok(Self::TestRetry);
+        }
+        Self::new_real_wake()
+    }
+
+    fn new_real_wake() -> Result<Self> {
+        RealInotifyWake::new().map(Self::RealInotify)
+    }
+
+    /// Dedicated real-inotify constructor for its contract tests. It bypasses
+    /// the cfg(test) retry marker and remains fail-fast.
+    #[cfg(test)]
+    pub(crate) fn new_real_for_tests() -> Result<Self> {
+        Self::new_real_wake()
+    }
+
+    pub(crate) fn drain(&self, watched: &ClaimSet) -> Result<LockDirEvents> {
+        match self {
+            Self::RealInotify(wake) => wake.drain(watched),
+            #[cfg(test)]
+            Self::TestRetry => Ok(LockDirEvents::default()),
+        }
+    }
+
+    pub(crate) fn wait(
+        &self,
+        timeout: Duration,
+        watched: &ClaimSet,
+    ) -> Result<Option<LockDirEvents>> {
+        match self {
+            Self::RealInotify(wake) => wake.wait(timeout, watched),
+            #[cfg(test)]
+            Self::TestRetry => {
+                std::thread::sleep(timeout);
+                Ok(None)
+            }
+        }
+    }
+
+    fn semantic_retry_interval(&self, observation_pending: bool) -> Duration {
+        match self {
+            Self::RealInotify(_) => {
+                if observation_pending {
+                    OBSERVATION_RETRY_FALLBACK
+                } else {
+                    COORDINATOR_WAKE_FALLBACK
+                }
+            }
+            #[cfg(test)]
+            Self::TestRetry => TEST_RETRY_WAKE_INTERVAL,
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_retry_wake_marker_path() -> PathBuf {
+    protocol_dir().join(TEST_RETRY_WAKE_MARKER)
+}
+
+#[cfg(test)]
+pub(crate) fn test_retry_wake_marker_path_for_tests() -> PathBuf {
+    test_retry_wake_marker_path()
+}
+
 /// Publish mode-correct holder state while the corresponding real flocks are
 /// still live. This is an authoritative state transition, not an event hint.
 pub(crate) fn publish_acquired(claim: &ClaimSet) -> Result<()> {
@@ -586,6 +768,7 @@ pub(crate) struct GrantedProbe {
     next_claim: ClaimSet,
     acquisition_allowed: bool,
     contention: Option<ContentionEvidence>,
+    predecessors: registry::AggregateSnapshot,
 }
 
 impl GrantedProbe {
@@ -598,6 +781,15 @@ impl GrantedProbe {
 
     pub(crate) fn designated(&self) -> &ClaimSet {
         &self.designated
+    }
+
+    /// Whether `candidate` conflicts with any exact claim preceding this
+    /// ticket. Flexible planners must consult this in addition to live flock
+    /// holders: an earlier waiter reserves its designated resources before it
+    /// acquires the corresponding kernel flocks, so `/proc/locks` cannot see
+    /// the full admission prefix.
+    pub(crate) fn conflicts_with_predecessors(&self, candidate: &ClaimSet) -> Result<bool> {
+        self.predecessors.conflicts(candidate)
     }
 
     pub(crate) fn try_acquire<T, O: IntoProbeOutcome<T>>(
@@ -671,6 +863,12 @@ pub(crate) fn exercise_known_free_close_storm_for_tests(
 }
 
 #[cfg(test)]
+pub(crate) fn exercise_llc_sh_only_shared_to_free_close_for_tests(
+) -> Result<(bool, bool, u64, u64)> {
+    registry::exercise_llc_sh_only_shared_to_free_close_for_tests()
+}
+
+#[cfg(test)]
 pub(crate) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usize)> {
     registry::exercise_busy_to_free_close_for_tests()
 }
@@ -678,6 +876,12 @@ pub(crate) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usi
 #[cfg(test)]
 pub(crate) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64, bool, bool)> {
     registry::exercise_llc_ex_contention_shared_wake_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_cpu_ex_contention_shared_wake_for_tests(
+) -> Result<(u64, bool, bool, bool, bool, bool, bool)> {
+    registry::exercise_cpu_ex_contention_shared_wake_for_tests()
 }
 
 #[cfg(test)]
@@ -710,6 +914,23 @@ pub(crate) fn exercise_superset_commit_rescan_for_tests() -> Result<(u64, bool)>
 #[cfg(test)]
 pub(crate) fn exercise_shared_commit_improvement_for_tests() -> Result<(u64, bool)> {
     registry::exercise_shared_commit_improvement_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_cpu_shared_commit_improvement_for_tests() -> Result<(u64, bool)> {
+    registry::exercise_cpu_shared_commit_improvement_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_cpu_mode_repair_for_tests() -> Result<(bool, bool, bool, bool)> {
+    registry::exercise_cpu_mode_repair_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn claim_from_resource_modes_for_tests(
+    resources: impl IntoIterator<Item = (ResourceKey, FlockMode)>,
+) -> Result<ClaimSet> {
+    claim_from_resource_modes(resources.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -920,20 +1141,24 @@ where
                 return Ok(TicketWork::Coordinator(CoordinatorTicket { ticket }));
             }
             registry::State::Granted | registry::State::Replan => {
-                let result = ticket.run_granted(cancelled, |designated, acquisition_allowed| {
-                    let mut probe = GrantedProbe {
-                        designated: designated.clone(),
-                        next_claim: designated.clone(),
-                        acquisition_allowed,
-                        contention: None,
-                    };
-                    let acquired = try_acquire(&mut probe)?;
-                    Ok(registry::GrantAttempt {
-                        acquired,
-                        next_claim: probe.next_claim,
-                        contention: probe.contention,
-                    })
-                });
+                let result = ticket.run_granted(
+                    cancelled,
+                    |designated, acquisition_allowed, predecessors| {
+                        let mut probe = GrantedProbe {
+                            designated: designated.clone(),
+                            next_claim: designated.clone(),
+                            acquisition_allowed,
+                            contention: None,
+                            predecessors,
+                        };
+                        let acquired = try_acquire(&mut probe)?;
+                        Ok(registry::GrantAttempt {
+                            acquired,
+                            next_claim: probe.next_claim,
+                            contention: probe.contention,
+                        })
+                    },
+                );
                 let result = match result {
                     Ok(registry::GrantResult::Acquired(acquired)) => {
                         // Removing the ticket while publishing the acquired
@@ -1163,13 +1388,15 @@ fn claim_from_resource_modes(
 ) -> Result<ClaimSet> {
     let mut cpus = BTreeSet::new();
     let mut llcs = BTreeSet::new();
+    let mut cpu_mode = None;
     let mut llc_mode = None;
     for (resource, mode) in resources {
         match resource {
             ResourceKey::Cpu(cpu) => {
-                if mode != FlockMode::Exclusive {
-                    anyhow::bail!("CPU reservation {cpu} was held in non-exclusive mode");
+                if cpu_mode.is_some_and(|existing| existing != mode) {
+                    anyhow::bail!("coordinator accumulated mixed CPU lock modes");
                 }
+                cpu_mode = Some(mode);
                 cpus.insert(cpu);
             }
             ResourceKey::Llc(llc) => {
@@ -1181,10 +1408,11 @@ fn claim_from_resource_modes(
             }
         }
     }
-    Ok(ClaimSet::new(
+    Ok(ClaimSet::with_modes(
         llcs,
         cpus,
         llc_mode.unwrap_or(FlockMode::Shared),
+        cpu_mode.unwrap_or(FlockMode::Shared),
     ))
 }
 
@@ -1314,8 +1542,22 @@ impl HolderObserver {
         let summaries = crate::flock::read_flock_mode_summaries(&resource_needles)?;
         let mut observation = registry::AvailabilityObservation::default();
         for &cpu in request.cpus.keys() {
-            let needle = &self.needles[&(true, cpu)];
-            observation.cpus.insert(cpu, !summaries[needle].any_holder);
+            let summary = summaries[&self.needles[&(true, cpu)]];
+            let availability = if summary.exclusive_holder {
+                registry::CpuAvailability::ExclusiveHeld
+            } else if summary.any_holder {
+                registry::CpuAvailability::SharedHeld
+            } else {
+                registry::CpuAvailability::Free
+            };
+            observation.cpus.insert(
+                cpu,
+                registry::CpuObservation {
+                    availability,
+                    sh_resolved: true,
+                    ex_resolved: true,
+                },
+            );
         }
         for &llc in request.llcs.keys() {
             let summary = summaries[&self.needles[&(false, llc)]];
@@ -1372,8 +1614,25 @@ impl HolderObserver {
     ) -> Result<registry::AvailabilityObservation> {
         let mut observation = registry::AvailabilityObservation::default();
         for &cpu in request.cpus.keys() {
-            if self.try_proof(ResourceKey::Cpu(cpu), FlockMode::Exclusive)? {
-                observation.cpus.insert(cpu, true);
+            let key = ResourceKey::Cpu(cpu);
+            if self.try_proof(key, FlockMode::Exclusive)? {
+                observation.cpus.insert(
+                    cpu,
+                    registry::CpuObservation {
+                        availability: registry::CpuAvailability::Free,
+                        sh_resolved: true,
+                        ex_resolved: true,
+                    },
+                );
+            } else if self.try_proof(key, FlockMode::Shared)? {
+                observation.cpus.insert(
+                    cpu,
+                    registry::CpuObservation {
+                        availability: registry::CpuAvailability::SharedHeld,
+                        sh_resolved: true,
+                        ex_resolved: false,
+                    },
+                );
             }
         }
         for &llc in request.llcs.keys() {
@@ -1563,11 +1822,7 @@ fn acquire_as_coordinator_impl<T>(
         }
         first = false;
         check_interrupted(cancelled)?;
-        let retry_interval = if observation_pending {
-            OBSERVATION_RETRY_FALLBACK
-        } else {
-            COORDINATOR_WAKE_FALLBACK
-        };
+        let retry_interval = watch.semantic_retry_interval(observation_pending);
         let now = std::time::Instant::now();
         retry_deadline = retry_deadline.min(now + retry_interval);
         let liveness_deadline = now + liveness_due_in;
@@ -1617,6 +1872,15 @@ pub(crate) fn canonical_lock_order(
     llc_mode: FlockMode,
     cpus: &[usize],
 ) -> Vec<ResourceLock> {
+    canonical_lock_order_with_modes(llc_indices, llc_mode, cpus, FlockMode::Exclusive)
+}
+
+pub(crate) fn canonical_lock_order_with_modes(
+    llc_indices: &[usize],
+    llc_mode: FlockMode,
+    cpus: &[usize],
+    cpu_mode: FlockMode,
+) -> Vec<ResourceLock> {
     let mut llcs: Vec<usize> = llc_indices.to_vec();
     llcs.sort_unstable();
     llcs.dedup();
@@ -1634,7 +1898,7 @@ pub(crate) fn canonical_lock_order(
     for cpu in cpu_sorted {
         out.push(ResourceLock {
             path: super::cpu_lock_path(cpu),
-            mode: FlockMode::Exclusive,
+            mode: cpu_mode,
             resource: ResourceKey::Cpu(cpu),
         });
     }

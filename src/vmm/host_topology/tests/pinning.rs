@@ -963,7 +963,7 @@ fn compute_pinning_offset_numa_node_rotation() {
 fn compute_pinning_offset_with_service_cpu() {
     // 2 host LLCs, offset 1, reserve_service_cpu=true.
     // LLC order: [1, 0]. vCPUs consume 4,5,0,1.
-    // Service CPU: first online_cpus entry not in {0,1,4,5} → 2.
+    // Service CPU stays in the first selected LLC: CPU 6.
     let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]]);
     let plan = topo
         .compute_pinning(&Topology::new(1, 2, 2, 1), true, 1)
@@ -974,10 +974,39 @@ fn compute_pinning_offset_with_service_cpu() {
     assert_eq!(plan.assignments[2], (2, 0));
     assert_eq!(plan.assignments[3], (3, 1));
     let service = plan.service_cpu.expect("service_cpu should be set");
-    assert_eq!(service, 2);
+    assert_eq!(service, 6);
     let vcpu_cpus: std::collections::HashSet<usize> =
         plan.assignments.iter().map(|a| a.1).collect();
     assert!(!vcpu_cpus.contains(&service));
+}
+
+#[test]
+fn exclusive_offset_slots_cover_disjoint_service_footprints() {
+    let host = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]]);
+    let topo = Topology::new(1, 1, 2, 1);
+    let left = host.compute_pinning(&topo, true, 0).unwrap();
+    let right = host.compute_pinning(&topo, true, 1).unwrap();
+
+    assert_eq!(left.llc_indices, vec![0]);
+    assert_eq!(right.llc_indices, vec![1]);
+    let footprint = |plan: &PinningPlan| {
+        plan.assignments
+            .iter()
+            .map(|&(_, cpu)| cpu)
+            .chain(plan.service_cpu)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let left_footprint = footprint(&left);
+    let right_footprint = footprint(&right);
+    assert_eq!(left_footprint, std::collections::BTreeSet::from([0, 1, 2]));
+    assert_eq!(
+        right_footprint,
+        std::collections::BTreeSet::from([4, 5, 6])
+    );
+    assert!(
+        left_footprint.is_disjoint(&right_footprint),
+        "every service and vCPU thread must stay in its exact exclusive slot",
+    );
 }
 
 #[test]
@@ -1156,5 +1185,74 @@ fn compute_pinning_grain_reports_end_of_blocks() {
     assert!(
         past.downcast_ref::<TopologyInsufficient>().is_some(),
         "past-last-block must be TopologyInsufficient, got: {past:#}",
+    );
+}
+
+#[test]
+fn performance_candidates_include_numa_rotations_skipped_by_slot_stride() {
+    // With one guest LLC per NUMA node, offsets 0 and 1 select the two
+    // disjoint host windows. The old `slot * guest_llcs` scan used offsets
+    // 0 and 2; NUMA node rotation made offset 2 alias offset 0 and hid the
+    // second half of the machine.
+    let host = synthetic_topo_numa(vec![
+        (0, vec![0, 1, 2, 3]),
+        (0, vec![4, 5, 6, 7]),
+        (1, vec![8, 9, 10, 11]),
+        (1, vec![12, 13, 14, 15]),
+    ]);
+    let candidates = host
+        .performance_pinning_candidates(&Topology::new(2, 2, 1, 1))
+        .expect("enumerate NUMA-aware exclusive placements");
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.llc_mode == LlcLockMode::Exclusive),
+    );
+    let mut llcs = candidates
+        .iter()
+        .map(|candidate| candidate.plan.llc_indices.clone())
+        .collect::<Vec<_>>();
+    llcs.sort();
+    assert_eq!(llcs, vec![vec![0, 2], vec![1, 3]]);
+
+    let footprints = candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .plan
+                .assignments
+                .iter()
+                .map(|&(_, cpu)| cpu)
+                .chain(candidate.plan.service_cpu)
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert!(footprints[0].is_disjoint(&footprints[1]));
+}
+
+#[test]
+fn performance_grain_candidates_cover_every_llc_window_and_block() {
+    let host = multi_llc_host(2, 36);
+    let candidates = host
+        .performance_pinning_candidates(&Topology::new(1, 1, 2, 1))
+        .expect("enumerate offset-aware grain placements");
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.llc_mode == LlcLockMode::Shared),
+    );
+    // block size = 2 vCPUs + 1 service, so each 36-CPU LLC seats 12.
+    assert_eq!(candidates.len(), 24);
+    let per_llc = candidates.iter().fold(
+        std::collections::BTreeMap::<usize, usize>::new(),
+        |mut counts, candidate| {
+            assert_eq!(candidate.plan.llc_indices.len(), 1);
+            *counts.entry(candidate.plan.llc_indices[0]).or_default() += 1;
+            counts
+        },
+    );
+    assert_eq!(
+        per_llc,
+        std::collections::BTreeMap::from([(0, 12), (1, 12)])
     );
 }

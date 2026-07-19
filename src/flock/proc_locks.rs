@@ -12,11 +12,13 @@
 //!  - `read_holders_with_mountinfo` — a test seam that accepts pre-read
 //!    mountinfo for one lockfile.
 //!  - [`read_flock_mode_summaries`],
+//!    [`read_flock_states_batch_with_mountinfo`],
 //!    [`read_holder_pids_batch_with_mountinfo`], and
 //!    [`read_holders_batch_with_mountinfo`] — accept N lockfile paths
 //!    or already-derived needles and scan `/proc/locks` once. Admission
-//!    uses the mode-summary form; placement callers use the PID-only
-//!    form; diagnostics use the enriched form, which resolves each
+//!    placement uses the combined mode/PID form; other callers can use
+//!    the narrower summary or PID-only forms; diagnostics use the enriched
+//!    form, which resolves each
 //!    distinct PID's [`HolderInfo`] once for the whole batch.
 //!
 //! The pure parser seams [`parse_flock_pids_for_needle`] and
@@ -37,13 +39,24 @@ use super::mountinfo::{needle_from_path, needle_from_path_with_mountinfo};
 ///
 /// `any_holder` is true for either a held READ (`LOCK_SH`) or WRITE
 /// (`LOCK_EX`) flock. `exclusive_holder` is true only for a held WRITE flock.
-/// Thus an LLC shared requester is compatible exactly when
-/// `exclusive_holder` is false, while an LLC exclusive requester (and every
-/// CPU requester) is compatible exactly when `any_holder` is false.
+/// Thus a shared CPU or LLC requester is compatible exactly when
+/// `exclusive_holder` is false, while an exclusive requester is compatible
+/// exactly when `any_holder` is false.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct FlockModeSummary {
     pub(crate) any_holder: bool,
     pub(crate) exclusive_holder: bool,
+}
+
+/// Compatibility state plus holder identities for one flock inode.
+///
+/// Admission planning uses this combined shape so one `/proc/locks` scan can
+/// both reject exclusive holders and discount this process's inherited shared
+/// hold from occupancy scoring.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FlockResourceState {
+    pub(crate) summary: FlockModeSummary,
+    pub(crate) holder_pids: Vec<u32>,
 }
 
 /// Parse `/proc/locks` and return [`HolderInfo`] entries for every
@@ -255,6 +268,44 @@ pub(crate) fn read_flock_mode_summaries(
     let contents = std::fs::read_to_string("/proc/locks")
         .with_context(|| "read /proc/locks for batched flock-mode observation")?;
     Ok(parse_flock_mode_summaries(&contents, needles))
+}
+
+/// Derive needles for every path and read compatibility modes plus holder PIDs
+/// in one `/proc/locks` pass.
+pub(crate) fn read_flock_states_batch_with_mountinfo<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+    mountinfo: &str,
+) -> Result<Vec<FlockResourceState>> {
+    let needles = paths
+        .into_iter()
+        .map(|path| needle_from_path_with_mountinfo(path, mountinfo))
+        .collect::<Result<Vec<_>>>()?;
+    let mut positions: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (index, needle) in needles.iter().enumerate() {
+        positions.entry(needle).or_default().push(index);
+    }
+    let contents = std::fs::read_to_string("/proc/locks")
+        .with_context(|| "read /proc/locks for batched flock-state observation")?;
+    let mut states = vec![FlockResourceState::default(); needles.len()];
+    for line in contents.lines() {
+        let Some((pid, mode, dev_inode)) = parse_held_flock_with_mode(line) else {
+            continue;
+        };
+        let Some(indices) = positions.get(dev_inode) else {
+            continue;
+        };
+        for &index in indices {
+            let state = &mut states[index];
+            state.summary.any_holder = true;
+            state.summary.exclusive_holder |= mode != HeldFlockMode::Shared;
+            state.holder_pids.push(pid);
+        }
+    }
+    for state in &mut states {
+        state.holder_pids.sort_unstable();
+        state.holder_pids.dedup();
+    }
+    Ok(states)
 }
 
 /// Return `(pid, dev:inode)` for a held FLOCK line.

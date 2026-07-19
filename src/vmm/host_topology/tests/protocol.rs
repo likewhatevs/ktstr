@@ -143,7 +143,7 @@ fn coordinator_watch_filters_registry_self_closes_without_spinning() {
         };
     drop(coordinator);
 
-    let watch = protocol::LockDirWatch::new().expect("coordinator watch");
+    let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
     watch
         .drain(&protocol::ClaimSet::default())
         .expect("drain coordinator watch");
@@ -176,7 +176,7 @@ fn coordinator_watch_classifies_close_events_by_watched_directory() {
         [1usize],
         crate::flock::FlockMode::Exclusive,
     );
-    let watch = protocol::LockDirWatch::new().expect("coordinator watch");
+    let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
     watch.drain(&watched).expect("drain coordinator watch");
 
     let resource_dir = std::path::Path::new(&cpu_lock_path(1))
@@ -223,8 +223,8 @@ fn uncontended_fast_fence_does_not_create_registry_metadata() {
     let protocol_dir = std::path::Path::new(&cpu_path)
         .parent()
         .expect("resource lock parent");
-    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v4");
-    let event_dir = protocol_dir.join("ktstr-acquire-events-v4");
+    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v5");
+    let event_dir = protocol_dir.join("ktstr-acquire-events-v5");
     assert!(!registry_dir.exists());
     assert!(!event_dir.exists());
 
@@ -273,7 +273,7 @@ fn failed_complete_probe_releases_its_fresh_prefix_immediately() {
 }
 
 #[test]
-fn cpu_only_exact_claim_inherits_its_llc_watch_mode() {
+fn cpu_only_exact_claim_keeps_independent_canonical_modes() {
     let _prefixes = LockPrefixesGuard::new();
     let initial = protocol::ClaimSet::new(
         std::iter::empty(),
@@ -298,9 +298,13 @@ fn cpu_only_exact_claim_inherits_its_llc_watch_mode() {
     assert_eq!(snapshot.len(), 1);
     assert_eq!(
         snapshot[0].2.llc_mode,
-        protocol::ClaimLlcMode::Exclusive,
-        "the record's single immutable mode must come from its LLC watch even \
-         while the exact alternative contains CPUs only",
+        protocol::ClaimMode::Exclusive,
+        "an absent LLC class must retain its canonical EX mode",
+    );
+    assert_eq!(
+        snapshot[0].2.cpu_mode,
+        protocol::ClaimMode::Exclusive,
+        "the CPU exact mode must be encoded independently of the LLC class",
     );
     drop(coordinator);
 }
@@ -308,7 +312,7 @@ fn cpu_only_exact_claim_inherits_its_llc_watch_mode() {
 #[test]
 fn coordinator_watch_wakes_for_registry_notification() {
     let _prefixes = LockPrefixesGuard::new();
-    let watch = protocol::LockDirWatch::new().expect("coordinator watch");
+    let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
     watch
         .drain(&protocol::ClaimSet::default())
         .expect("drain coordinator watch");
@@ -354,7 +358,7 @@ fn coordinator_watch_observes_owner_liveness_close_but_not_readonly_probes() {
         protocol::TicketWork::Coordinator(coordinator) => coordinator,
         protocol::TicketWork::Acquired(()) => panic!("fresh registry must elect a coordinator"),
     };
-    let watch = protocol::LockDirWatch::new().expect("coordinator watch");
+    let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
     watch
         .drain(&protocol::ClaimSet::default())
         .expect("drain registration events");
@@ -398,7 +402,7 @@ fn coordinator_watch_wakes_for_resource_release() {
     let held = crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Exclusive)
         .expect("open resource lock")
         .expect("take fresh resource lock");
-    let watch = protocol::LockDirWatch::new().expect("coordinator watch");
+    let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
     let watched = protocol::ClaimSet::new(
         std::iter::empty(),
         [1usize],
@@ -475,6 +479,166 @@ fn complete_claim_compatibility_matches_resource_lock_matrix() {
         shared_a.conflicts_with(&exclusive_same_llc),
         "SH/EX overlap on one LLC conflicts",
     );
+
+    let cpu_shared_a = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [10usize],
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Shared,
+    );
+    let cpu_shared_b = cpu_shared_a.clone();
+    let cpu_exclusive = protocol::ClaimSet::new(
+        std::iter::empty(),
+        [10usize],
+        crate::flock::FlockMode::Exclusive,
+    );
+    assert!(
+        !cpu_shared_a.conflicts_with(&cpu_shared_b),
+        "CPU SH/SH overlap is compatible",
+    );
+    assert!(
+        cpu_shared_a.conflicts_with(&cpu_exclusive)
+            && cpu_exclusive.conflicts_with(&cpu_shared_a),
+        "CPU SH/EX overlap conflicts symmetrically",
+    );
+}
+
+#[test]
+fn empty_resource_modes_are_canonical_across_construction_union_and_record_round_trip() {
+    let llc_new = protocol::ClaimSet::new(
+        [7usize],
+        std::iter::empty(),
+        crate::flock::FlockMode::Shared,
+    );
+    let llc_with_modes = protocol::ClaimSet::with_modes(
+        [7usize],
+        std::iter::empty(),
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Shared,
+    );
+    let llc_reconstructed = protocol::claim_from_resource_modes_for_tests([(
+        protocol::ResourceKey::Llc(7),
+        crate::flock::FlockMode::Shared,
+    )])
+    .expect("reconstruct LLC-only held claim");
+    assert_eq!(llc_new, llc_with_modes);
+    assert_eq!(llc_new, llc_reconstructed);
+
+    let cpu_shared = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [9usize],
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Shared,
+    );
+    let cpu_reconstructed = protocol::claim_from_resource_modes_for_tests([(
+        protocol::ResourceKey::Cpu(9),
+        crate::flock::FlockMode::Shared,
+    )])
+    .expect("reconstruct CPU-only held claim");
+    assert_eq!(cpu_shared, cpu_reconstructed);
+
+    let empty = protocol::ClaimSet::default();
+    assert_eq!(
+        protocol::union_claims_for_tests(&llc_new, &empty),
+        llc_new,
+        "an absent CPU/LLC class must not upgrade a present SH mode",
+    );
+    assert_eq!(
+        protocol::union_claims_for_tests(&empty, &cpu_shared),
+        cpu_shared,
+        "union must ignore the canonical EX mode of an absent operand class",
+    );
+    assert_eq!(
+        protocol::union_claims_for_tests(&empty, &empty),
+        empty,
+        "the both-empty union remains canonical",
+    );
+    assert_eq!(
+        [llc_new.clone()]
+            .into_iter()
+            .reduce(|envelope, claim| envelope.union_envelope(&claim))
+            .expect("one candidate"),
+        llc_new,
+        "a one-candidate LLC-SH envelope is exactly its SH claim",
+    );
+
+    let (round_trip_claim, round_trip_watch) =
+        protocol::round_trip_claim_modes_for_tests(&llc_new, &cpu_shared)
+            .expect("round-trip independently-modeled claim and watch");
+    assert_eq!(round_trip_claim, llc_new);
+    assert_eq!(round_trip_watch, cpu_shared);
+}
+
+#[test]
+fn reconstructed_cpu_holds_accept_uniform_shared_mode_and_reject_mixed_modes() {
+    let shared = protocol::claim_from_resource_modes_for_tests([
+        (
+            protocol::ResourceKey::Cpu(1),
+            crate::flock::FlockMode::Shared,
+        ),
+        (
+            protocol::ResourceKey::Cpu(2),
+            crate::flock::FlockMode::Shared,
+        ),
+    ])
+    .expect("uniform CPU SH holds form one claim");
+    assert_eq!(
+        shared,
+        protocol::ClaimSet::with_modes(
+            std::iter::empty(),
+            [1usize, 2usize],
+            crate::flock::FlockMode::Shared,
+            crate::flock::FlockMode::Shared,
+        ),
+    );
+    let error = protocol::claim_from_resource_modes_for_tests([
+        (
+            protocol::ResourceKey::Cpu(1),
+            crate::flock::FlockMode::Shared,
+        ),
+        (
+            protocol::ResourceKey::Cpu(2),
+            crate::flock::FlockMode::Exclusive,
+        ),
+    ])
+    .expect_err("mixed CPU lock modes cannot be represented by one exact claim");
+    assert!(error.to_string().contains("mixed CPU lock modes"));
+}
+
+#[test]
+fn registry_cpu_aggregate_uses_the_shared_exclusive_compatibility_matrix() {
+    let _prefixes = LockPrefixesGuard::new();
+    let shared = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [31usize],
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Shared,
+    );
+    let coordinator = match protocol::register_ticket_or_acquire(
+        shared.clone(),
+        shared.clone(),
+        None,
+        |_| Ok::<Option<()>, anyhow::Error>(None),
+    )
+    .expect("register CPU SH aggregate owner")
+    {
+        protocol::TicketWork::Coordinator(coordinator) => coordinator,
+        protocol::TicketWork::Acquired(()) => panic!("fresh registry must elect a coordinator"),
+    };
+    assert!(
+        !protocol::registered_claim_conflicts(&shared).expect("query CPU SH aggregate"),
+        "an active CPU SH claim must permit another CPU SH fast probe",
+    );
+    let exclusive = protocol::ClaimSet::new(
+        std::iter::empty(),
+        [31usize],
+        crate::flock::FlockMode::Exclusive,
+    );
+    assert!(
+        protocol::registered_claim_conflicts(&exclusive).expect("query CPU EX aggregate"),
+        "an active CPU SH claim must fence an overlapping CPU EX fast probe",
+    );
+    drop(coordinator);
 }
 
 #[test]
@@ -809,7 +973,7 @@ fn stale_broker_generation_cannot_interrupt_the_next_registration() {
         second_id_tx
             .send(crate::flock::interruptible_flock_waiter_id())
             .expect("report second generation");
-        let result = protocol::LockDirWatch::new().and_then(|watch| {
+        let result = protocol::LockDirWatch::new_real_for_tests().and_then(|watch| {
             watch.wait(
                 std::time::Duration::from_millis(150),
                 &protocol::ClaimSet::default(),
@@ -888,7 +1052,7 @@ fn coordinator_replans_to_freed_alternative_candidate() {
     use std::sync::{Arc, atomic::AtomicBool};
 
     let _broker = InterruptibleFlockBrokerGuard::start();
-    let _prefixes = LockPrefixesGuard::new();
+    let _prefixes = LockPrefixesGuard::new_real_wake();
     let _allowed = AllowedCpusGuard::new(vec![0, 1]);
     let host = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
     let topo = crate::vmm::Topology::new(1, 1, 1, 1);
@@ -1242,6 +1406,23 @@ fn busy_to_free_close_produces_exactly_one_improvement() {
 }
 
 #[test]
+fn shared_holder_close_does_not_replan_an_llc_sh_only_watch() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (observation_requested, planner_step, scans, generations) =
+        protocol::exercise_llc_sh_only_shared_to_free_close_for_tests()
+            .expect("exercise SH-only shared-to-free close");
+    assert!(
+        !observation_requested && !planner_step,
+        "SharedHeld→Free improves only EX compatibility and is irrelevant to an SH-only watch",
+    );
+    assert_eq!(
+        (scans, generations),
+        (0, 0),
+        "an irrelevant close must not scan grants or publish a replan wake",
+    );
+}
+
+#[test]
 fn failed_llc_ex_probe_releases_compatible_shared_waiter_without_fallback() {
     let _prefixes = LockPrefixesGuard::new();
     let (scans, shared_granted, exclusive_waiting) =
@@ -1258,6 +1439,35 @@ fn failed_llc_ex_probe_releases_compatible_shared_waiter_without_fallback() {
     assert!(
         exclusive_waiting,
         "the same shared-held observation must keep the incompatible EX ticket blocked",
+    );
+}
+
+#[test]
+fn failed_cpu_ex_probe_wakes_only_the_compatible_shared_waiter() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (
+        scans,
+        shared_granted,
+        exclusive_waiting,
+        sh_serial_advanced,
+        ex_serial_unchanged,
+        shared_woke,
+        exclusive_not_woken,
+    ) = protocol::exercise_cpu_ex_contention_shared_wake_for_tests()
+        .expect("exercise CPU mode-compatible wake");
+    assert_eq!(
+        scans, 1,
+        "the CPU shared-held observation must trigger exactly one grant scan",
+    );
+    assert!(shared_granted, "CPU SH waiter must be granted");
+    assert!(exclusive_waiting, "CPU EX waiter must remain blocked");
+    assert!(
+        sh_serial_advanced && ex_serial_unchanged,
+        "SharedHeld must advance only the CPU SH compatibility serial",
+    );
+    assert!(
+        shared_woke && exclusive_not_woken,
+        "the targeted wake belongs only to the newly compatible CPU SH ticket",
     );
 }
 
@@ -1342,6 +1552,38 @@ fn shared_commit_rescans_when_real_hold_improves_shared_compatibility() {
     assert!(
         later_granted,
         "a later SH waiter must be granted when the committed real SH hold proves compatibility",
+    );
+}
+
+#[test]
+fn cpu_shared_commit_rescans_when_real_hold_improves_shared_compatibility() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (scans, later_granted) =
+        protocol::exercise_cpu_shared_commit_improvement_for_tests()
+            .expect("exercise CPU shared compatibility improvement");
+    assert_eq!(
+        scans, 1,
+        "publishing a real CPU SH hold over unknown or EX-held state needs one compatibility scan",
+    );
+    assert!(
+        later_granted,
+        "a later CPU SH waiter must be granted when the committed real SH hold proves compatibility",
+    );
+}
+
+#[test]
+fn dirty_repair_preserves_exact_and_watch_cpu_modes() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (flexible_preserved, flexible_still_flexible, fixed_preserved, fixed_still_fixed) =
+        protocol::exercise_cpu_mode_repair_for_tests()
+            .expect("exercise dirty CPU-mode repair");
+    assert!(
+        flexible_preserved && flexible_still_flexible,
+        "repair must retain a CPU SH exact claim under its CPU EX watch and mark it REPLAN",
+    );
+    assert!(
+        fixed_preserved && fixed_still_fixed,
+        "canonical empty-class modes must keep an exact CPU SH claim fixed after repair",
     );
 }
 
