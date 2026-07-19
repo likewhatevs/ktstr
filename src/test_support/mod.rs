@@ -72,6 +72,8 @@ mod eval;
 mod host_class;
 mod metrics;
 mod output;
+#[doc(hidden)]
+pub use output::strip_ansi_csi;
 // Reachable crate-wide (vmm::VmResult::guest_assert_result parses the guest
 // AssertResult from its own drained guest_messages via this helper, mirroring
 // the eval-layer use). The fn itself is pub(crate); this just lifts it out of

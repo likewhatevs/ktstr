@@ -80,6 +80,58 @@ fn copy_tree(source: &Path, destination: &Path) {
     }
 }
 
+/// Match nextest's one-cell success summary after removing presentation-only
+/// ANSI CSI sequences. Parsing the count tokens (rather than merely searching
+/// for a substring) keeps this an exact-once assertion: multi-cell summaries,
+/// failed cells, and duplicate summary lines all reject.
+fn exactly_one_verifier_cell_passed(stderr: &str) -> bool {
+    let stderr = ktstr::test_support::strip_ansi_csi(stderr);
+    stderr
+        .lines()
+        .filter(|line| {
+            let Some((before, after)) = line.split_once(" test run: ") else {
+                return false;
+            };
+            if before.split_whitespace().next_back() != Some("1") {
+                return false;
+            }
+            let mut result = after.split_whitespace();
+            result.next() == Some("1")
+                && result
+                    .next()
+                    .is_some_and(|status| status.trim_end_matches(',') == "passed")
+        })
+        .count()
+        == 1
+}
+
+#[test]
+fn exact_one_cell_summary_accepts_ansi_without_weakening_counts() {
+    let colored = concat!(
+        "\u{1b}[1mSummary\u{1b}[0m [ 28.848s] ",
+        "\u{1b}[32m1 test run\u{1b}[0m: ",
+        "\u{1b}[32m1 passed\u{1b}[0m, 306 skipped\n",
+    );
+    assert!(
+        exactly_one_verifier_cell_passed(colored),
+        "ANSI styling must not hide an exact one-cell success",
+    );
+
+    for not_exactly_one in [
+        "Summary [ 1.000s] 2 test run: 2 passed",
+        "Summary [ 1.000s] 11 test run: 1 passed",
+        "Summary [ 1.000s] 1 test run: 0 passed",
+        "Summary [ 1.000s] 1 test run: 1 failed",
+        "Summary [ 1.000s] 1 test run: 1 passed\n\
+         Summary [ 1.000s] 1 test run: 1 passed",
+    ] {
+        assert!(
+            !exactly_one_verifier_cell_passed(not_exactly_one),
+            "non-exact summary must reject: {not_exactly_one:?}",
+        );
+    }
+}
+
 fn write_member(
     workspace: &Path,
     package: &str,
@@ -392,7 +444,7 @@ panic = "abort"
         "the successful path must cross scheduler prebuild and generated-cell dispatch:\n{stderr}",
     );
     assert!(
-        stderr.contains("1 test run: 1 passed"),
+        exactly_one_verifier_cell_passed(&stderr),
         "two warmed binaries carrying the same full declaration must elect one lister, \
          one VM launch, and therefore one result writer:\nstdout:\n{stdout}\nstderr:\n{stderr}",
     );
