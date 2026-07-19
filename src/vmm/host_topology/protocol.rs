@@ -176,6 +176,13 @@ const WAITER_CRASH_RECOVERY_BASE: Duration = Duration::from_secs(3);
 /// active past this shared, non-postponable deadline performs one sweep;
 /// ordinary liveness closes after watch installation remain event-driven.
 const PREWATCH_LIVENESS_RECONCILE_DELAY: Duration = Duration::from_millis(500);
+/// Bound one coordinator turn's inotify consumption. The kernel API returns
+/// at most 4 KiB per read, so four reads and 1,024 decoded events are matching
+/// hard caps; the wall-time cap also protects unusually expensive name
+/// classification. Remaining events are processed after one registry turn.
+const INOTIFY_TURN_MAX_READS: usize = 4;
+const INOTIFY_TURN_MAX_EVENTS: usize = 1_024;
+const INOTIFY_TURN_MAX_TIME: Duration = Duration::from_millis(1);
 /// Explicit cfg(test)-only retry transport cadence. This is a semantic
 /// coordinator retry deadline, not a short slice of the 30-second real-inotify
 /// deadline: each expiry runs schedule + replan again.
@@ -454,6 +461,7 @@ pub(crate) struct LockDirEvents {
     registry_notify: bool,
     liveness_closes: BTreeSet<(u64, u64)>,
     overflow: bool,
+    backlog: bool,
 }
 
 impl LockDirEvents {
@@ -463,6 +471,7 @@ impl LockDirEvents {
         self.registry_notify |= other.registry_notify;
         self.liveness_closes.extend(other.liveness_closes);
         self.overflow |= other.overflow;
+        self.backlog |= other.backlog;
     }
 
     fn is_actionable(&self) -> bool {
@@ -471,11 +480,27 @@ impl LockDirEvents {
             || self.registry_notify
             || !self.liveness_closes.is_empty()
             || self.overflow
+            || self.backlog
     }
 
     #[cfg(test)]
     pub(crate) fn contains_liveness(&self, identity: (u64, u64)) -> bool {
         self.liveness_closes.contains(&identity)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_registry_notify(&self) -> bool {
+        self.registry_notify
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_backlog(&self) -> bool {
+        self.backlog
+    }
+
+    #[cfg(test)]
+    pub(crate) fn overflowed(&self) -> bool {
+        self.overflow
     }
 }
 
@@ -525,18 +550,39 @@ impl RealInotifyWake {
         })
     }
 
-    /// Drain any queued events without blocking, discarding them.
+    /// Drain one bounded turn of queued events without blocking.
     /// The coordinator calls this right before sleeping so its own
     /// open/close churn from the attempt it just made does not wake
     /// it straight back up (a self-wake busy loop). An external
     /// release slipping into the drain-to-sleep gap is caught by the
     /// [`COORDINATOR_WAKE_FALLBACK`] tick.
     pub(crate) fn drain(&self, watched: &ClaimSet) -> Result<LockDirEvents> {
+        self.read_bounded(watched)
+    }
+
+    fn read_bounded(&self, watched: &ClaimSet) -> Result<LockDirEvents> {
         let mut batch = LockDirEvents::default();
+        let started = std::time::Instant::now();
+        let mut reads = 0usize;
+        let mut decoded = 0usize;
         loop {
+            if reads >= INOTIFY_TURN_MAX_READS
+                || decoded >= INOTIFY_TURN_MAX_EVENTS
+                || started.elapsed() >= INOTIFY_TURN_MAX_TIME
+            {
+                // Budget exhaustion is not kernel queue overflow. It merely
+                // asks the coordinator to run one scheduling turn before
+                // consuming the next bounded chunk.
+                batch.backlog = true;
+                break;
+            }
             match self.ino.read_events() {
                 Ok(events) if events.is_empty() => break,
-                Ok(events) => self.classify(events, watched, &mut batch),
+                Ok(events) => {
+                    reads += 1;
+                    decoded = decoded.saturating_add(events.len());
+                    self.classify(events, watched, &mut batch);
+                }
                 Err(nix::errno::Errno::EAGAIN) => break,
                 Err(error) => return Err(error.into()),
             }
@@ -566,13 +612,7 @@ impl RealInotifyWake {
             if poll(&mut fds, PollTimeout::from(ms))? == 0 {
                 return Ok(None);
             }
-            let events = match self.ino.read_events() {
-                Ok(events) => events,
-                Err(nix::errno::Errno::EAGAIN) => continue,
-                Err(error) => return Err(error.into()),
-            };
-            let mut batch = LockDirEvents::default();
-            self.classify(events, watched, &mut batch);
+            let batch = self.read_bounded(watched)?;
             if batch.is_actionable() {
                 return Ok(Some(batch));
             }
@@ -900,13 +940,14 @@ pub(crate) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usi
 }
 
 #[cfg(test)]
-pub(crate) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64, bool, bool)> {
+pub(crate) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64, bool, bool, bool)>
+{
     registry::exercise_llc_ex_contention_shared_wake_for_tests()
 }
 
 #[cfg(test)]
 pub(crate) fn exercise_cpu_ex_contention_shared_wake_for_tests()
--> Result<(u64, bool, bool, bool, bool, bool, bool)> {
+-> Result<(u64, bool, bool, bool, bool, bool, bool, bool)> {
     registry::exercise_cpu_ex_contention_shared_wake_for_tests()
 }
 
@@ -984,6 +1025,11 @@ pub(crate) fn exercise_prefix_refresh_after_predecessor_release_for_tests()
 #[cfg(test)]
 pub(crate) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool, bool)> {
     registry::exercise_issue_serial_race_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_stale_contention_commit_for_tests() -> Result<(bool, bool, bool, bool)> {
+    registry::exercise_stale_contention_commit_for_tests()
 }
 
 #[cfg(test)]
@@ -1131,6 +1177,11 @@ pub(crate) fn shared_state_read_count_for_tests() -> usize {
 #[cfg(test)]
 pub(crate) fn resource_epoch_for_tests() -> Result<u64> {
     registry::resource_epoch_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn ticket_blocked_at_current_serial_for_tests(pid: u32) -> Result<bool> {
+    registry::ticket_blocked_at_current_serial_for_tests(pid)
 }
 
 #[cfg(test)]
@@ -1946,6 +1997,7 @@ fn acquire_as_coordinator_impl<T>(
         super::tick_reservation_wait_progress();
         check_interrupted(cancelled)?;
         pending_events.merge(check_result(watch.drain(&watched_resources), cancelled)?);
+        let drain_backlog = pending_events.backlog;
         let closed_tickets: Vec<_> = pending_events.liveness_closes.iter().copied().collect();
         let mut snapshot = check_result(
             coordinator.ticket.schedule(
@@ -1965,7 +2017,7 @@ fn acquire_as_coordinator_impl<T>(
             cancelled,
         )?;
         retry_due = false;
-        let mut liveness_due_in = snapshot.liveness_due_in;
+        let mut liveness_deadline = std::time::Instant::now() + snapshot.liveness_due_in;
         watched_resources = snapshot.watch.clone();
         let mut should_step = first || snapshot.should_step;
         if let Some(request) = snapshot.observation.take() {
@@ -1979,7 +2031,7 @@ fn acquire_as_coordinator_impl<T>(
                 ),
                 cancelled,
             )?;
-            liveness_due_in = snapshot.liveness_due_in;
+            liveness_deadline = std::time::Instant::now() + snapshot.liveness_due_in;
             watched_resources = snapshot.watch.clone();
             should_step |= snapshot.should_step;
         }
@@ -2045,7 +2097,7 @@ fn acquire_as_coordinator_impl<T>(
                     )?;
                     drop(update);
                     let observe_before_sleep = snapshot.observation.is_some();
-                    liveness_due_in = snapshot.liveness_due_in;
+                    liveness_deadline = std::time::Instant::now() + snapshot.liveness_due_in;
                     watched_resources = snapshot.watch;
                     if observe_before_sleep {
                         first = false;
@@ -2057,10 +2109,15 @@ fn acquire_as_coordinator_impl<T>(
         }
         first = false;
         check_interrupted(cancelled)?;
+        if drain_backlog {
+            // Fairly interleave event consumption with registry/grant work.
+            // This path never sleeps while the kernel queue may still contain
+            // a bounded-drain remainder.
+            continue;
+        }
         let retry_interval = watch.semantic_retry_interval(observation_pending);
         let now = std::time::Instant::now();
         retry_deadline = retry_deadline.min(now + retry_interval);
-        let liveness_deadline = now + liveness_due_in;
         let wake_deadline = retry_deadline.min(liveness_deadline);
         loop {
             let wait_now = std::time::Instant::now();

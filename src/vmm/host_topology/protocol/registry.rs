@@ -848,12 +848,46 @@ impl Ticket {
         let current_watch_serial = table.max_watch_serial(&watch)?;
         let earlier_invalidated =
             table.min_changed_ticket() < record.ticket && callback_epoch != claim_epoch;
-        let publication_changed = state_epoch != callback_epoch
-            || prefix_epoch != callback_epoch
-            || record.issue_serial != callback_serial;
+        let epoch_publication_changed =
+            state_epoch != callback_epoch || prefix_epoch != callback_epoch;
+        let issue_serial_changed = record.issue_serial != callback_serial;
         let unissued_change = earlier_invalidated || current_watch_serial != callback_serial;
-        let stale = publication_changed || unissued_change;
-        if record.state != expected_state || record.claim != designated || stale {
+        let stale = epoch_publication_changed || issue_serial_changed || unissued_change;
+        let current_designated_contention =
+            result
+                .contention
+                .as_ref()
+                .is_some_and(|evidence| match evidence.blocker {
+                    ResourceKey::Cpu(index) => {
+                        designated.cpus.contains(&index)
+                            && ClaimMode::from(evidence.mode) == designated.cpu_mode
+                    }
+                    ResourceKey::Llc(index) => {
+                        designated.llcs.contains(&index)
+                            && ClaimMode::from(evidence.mode) == designated.llc_mode
+                    }
+                });
+        // A failed nonblocking flock is authoritative current negative
+        // evidence even if a predecessor epoch or availability serial changed
+        // while the callback was running. If the same exact grant is still
+        // live, commit that contention at the *current* blocker serial and
+        // discard any positive alternative selected from the stale snapshot.
+        // Keeping the writable witness through publication orders a later
+        // re-observation; dropping this result instead immediately regrants a
+        // known-stale callback and can create an unbounded probe storm.
+        let accept_stale_contention = stale
+            && acquisition_allowed
+            && record.state == STATE_GRANTED
+            && record.claim == designated
+            && result.acquired.is_none()
+            && current_designated_contention;
+        if accept_stale_contention {
+            result.next_claim = designated.clone();
+        }
+        if record.state != expected_state
+            || record.claim != designated
+            || (stale && !accept_stale_contention)
+        {
             // A changed publication token means the coordinator already issued
             // a fresh callback snapshot. Leave that runnable state intact. A
             // resource or claim change without a newer publication must return
@@ -861,7 +895,8 @@ impl Ticket {
             if record.state == expected_state
                 && record.claim == designated
                 && unissued_change
-                && !publication_changed
+                && !epoch_publication_changed
+                && !issue_serial_changed
             {
                 table.set_record_state(self.slot, STATE_WAITING)?;
                 table.clear_record_blocked(self.slot)?;
@@ -1238,11 +1273,11 @@ impl Ticket {
         {
             anyhow::bail!("ticket {} lost the queue coordinator license", self.ticket);
         }
-        let watch_serial_before = table.max_watch_serial(&record.watch)?;
+        let planner_serial_before = table.max_planner_watch_serial(&record.watch, &record.claim)?;
         table.begin_transaction()?;
         table.apply_observation(request, observation)?;
         table.finish_transaction();
-        let watch_serial_after = table.max_watch_serial(&record.watch)?;
+        let planner_serial_after = table.max_planner_watch_serial(&record.watch, &record.claim)?;
         // Keep the registry EX fence while dropping proof flocks, then grant
         // from the state they proved. A split release/reacquire lets a fast SH
         // fenced acquirer steal the resource between proof and waiter wake.
@@ -1259,7 +1294,7 @@ impl Ticket {
             candidate_watch: record.watch,
             predecessors,
             availability,
-            should_step: watch_serial_after > watch_serial_before,
+            should_step: planner_serial_after > planner_serial_before,
             observation: table.observation_request()?,
             liveness_due_in: table.liveness_due_in()?,
         })
@@ -1815,7 +1850,12 @@ pub(super) fn with_aggregate_fence<T>(
 
 #[cfg(test)]
 pub(super) fn snapshot() -> Result<Vec<(u64, u32, ClaimSet)>> {
-    let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+    let Some(_lock) = try_lock_registry_existing(FlockMode::Exclusive)? else {
+        // The uncontended fast path deliberately creates no registry
+        // metadata. Test pollers therefore observe a missing lock as the
+        // authoritative empty-registry state until the first ticket publishes.
+        return Ok(Vec::new());
+    };
     let mut table = Table::open_existing()?;
     table.repair_consistency_if_needed()?;
     table.prune_dead()?;
@@ -1846,6 +1886,28 @@ pub(super) fn resource_epoch_for_tests() -> Result<u64> {
         .with_context(|| format!("map admission registry header {}", path.display()))?;
     HeaderLayout::validate(&map)?;
     Ok(read_u64(&map, H_GLOBAL_SERIAL).max(1))
+}
+
+#[cfg(test)]
+pub(super) fn ticket_blocked_at_current_serial_for_tests(pid: u32) -> Result<bool> {
+    let Some(_lock) = try_lock_registry_existing(FlockMode::Exclusive)? else {
+        return Ok(false);
+    };
+    let mut table = Table::open_existing()?;
+    table.repair_consistency_if_needed()?;
+    let Some(record) = table
+        .records()?
+        .into_iter()
+        .find(|record| record.pid == pid)
+    else {
+        return Ok(false);
+    };
+    let Some(blocked) = record.blocked_on else {
+        return Ok(false);
+    };
+    Ok(record.state == STATE_WAITING
+        && blocked.serial == table.blocker_serial(blocked.key, blocked.mode)?
+        && record.issue_serial == table.max_watch_serial(&record.watch)?)
 }
 
 #[cfg(test)]
@@ -2163,7 +2225,8 @@ pub(super) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usi
 }
 
 #[cfg(test)]
-pub(super) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64, bool, bool)> {
+pub(super) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64, bool, bool, bool)>
+{
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
     let coordinator_watch = ClaimSet::new([1usize], [0usize], FlockMode::Exclusive);
     let mut coordinator = Ticket::register(coordinator_claim, coordinator_watch, None)?;
@@ -2210,6 +2273,9 @@ pub(super) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64,
         .observation_request()?
         .ok_or_else(|| anyhow::anyhow!("failed EX probe must request an LLC observation"))?;
     let scans_before = read_u64(&table.header, H_GRANT_SCANS);
+    drop(table);
+    drop(_lock);
+
     let mut observation = AvailabilityObservation::default();
     observation.llcs.insert(
         1,
@@ -2219,13 +2285,16 @@ pub(super) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64,
             ex_resolved: true,
         },
     );
-    table.begin_transaction()?;
-    let improved = table.apply_observation(&request, &observation)?;
-    table.finish_transaction();
-    if !improved || table.pending_flags() & PENDING_RESCAN == 0 {
-        anyhow::bail!("shared-held observation after EX contention must publish an SH improvement");
+    let snapshot = coordinator.apply_observation(&request, &observation, || {}, None)?;
+    if snapshot.should_step {
+        anyhow::bail!(
+            "an SH-only LLC improvement must not rerun the incompatible EX coordinator planner"
+        );
     }
-    table.grant_compatible()?;
+
+    let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+    let mut table = Table::open_existing()?;
+    table.repair_consistency_if_needed()?;
     let scans = read_u64(&table.header, H_GRANT_SCANS) - scans_before;
     let shared_granted = table
         .record(shared.slot)?
@@ -2239,12 +2308,17 @@ pub(super) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64,
     shared.finish(None)?;
     exclusive.finish(None)?;
     coordinator.finish(None)?;
-    Ok((scans, shared_granted, exclusive_waiting))
+    Ok((
+        scans,
+        shared_granted,
+        exclusive_waiting,
+        !snapshot.should_step,
+    ))
 }
 
 #[cfg(test)]
 pub(super) fn exercise_cpu_ex_contention_shared_wake_for_tests()
--> Result<(u64, bool, bool, bool, bool, bool, bool)> {
+-> Result<(u64, bool, bool, bool, bool, bool, bool, bool)> {
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
     let coordinator_watch =
         ClaimSet::new(std::iter::empty(), [0usize, 1usize], FlockMode::Exclusive);
@@ -2316,15 +2390,19 @@ pub(super) fn exercise_cpu_ex_contention_shared_wake_for_tests()
             ex_resolved: true,
         },
     );
-    table.begin_transaction()?;
-    let improved = table.apply_observation(&request, &observation)?;
-    table.finish_transaction();
-    if !improved || table.pending_flags() & PENDING_RESCAN == 0 {
+    drop(table);
+    drop(_lock);
+
+    let snapshot = coordinator.apply_observation(&request, &observation, || {}, None)?;
+    if snapshot.should_step {
         anyhow::bail!(
-            "shared-held CPU observation after EX contention must publish an SH improvement"
+            "an SH-only CPU improvement must not rerun the incompatible EX coordinator planner"
         );
     }
-    table.grant_compatible()?;
+
+    let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+    let mut table = Table::open_existing()?;
+    table.repair_consistency_if_needed()?;
     let scans = read_u64(&table.header, H_GRANT_SCANS) - scans_before;
     let shared_granted = table
         .record(shared.slot)?
@@ -2364,6 +2442,7 @@ pub(super) fn exercise_cpu_ex_contention_shared_wake_for_tests()
         ex_serial_unchanged,
         shared_woke,
         exclusive_not_woken,
+        !snapshot.should_step,
     ))
 }
 
@@ -3348,6 +3427,84 @@ pub(super) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool
 }
 
 #[cfg(test)]
+pub(super) fn exercise_stale_contention_commit_for_tests() -> Result<(bool, bool, bool, bool)> {
+    let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
+    let mut coordinator =
+        Ticket::register(coordinator_claim.clone(), coordinator_claim.clone(), None)?;
+    let designated = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+    let alternative = ClaimSet::new(std::iter::empty(), [2usize], FlockMode::Exclusive);
+    let watch = ClaimSet::new(std::iter::empty(), [1usize, 2usize], FlockMode::Exclusive);
+    let mut waiter = Ticket::register(designated.clone(), watch, None)?;
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.repair_consistency_if_needed()?;
+        set_cpu_free_for_tests(&mut table, 1, true)?;
+        set_cpu_free_for_tests(&mut table, 2, true)?;
+        table.set_record_state(waiter.slot, STATE_WAITING)?;
+        table.clear_record_blocked(waiter.slot)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible()?;
+    }
+    if waiter.state(None)? != State::Granted {
+        anyhow::bail!("stale-contention exercise failed to grant the disjoint waiter");
+    }
+
+    let result = waiter.run_granted(
+        None,
+        |_designated, _watch, allowed, _predecessors, _availability| {
+            if !allowed {
+                anyhow::bail!("stale-contention exercise lost its acquisition license");
+            }
+            let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+            let mut table = Table::open_existing()?;
+            table.stamp_resource_improvement(S_CPU_EX, 1)?;
+            table.set_pending_flag(PENDING_RESCAN);
+            table.grant_compatible()?;
+            Ok(GrantAttempt::<()> {
+                acquired: None,
+                next_claim: alternative.clone(),
+                contention: Some(ContentionEvidence {
+                    blocker: ResourceKey::Cpu(1),
+                    mode: FlockMode::Exclusive,
+                    _witness: File::open("/dev/null")?.into(),
+                }),
+            })
+        },
+    )?;
+
+    let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+    let mut table = Table::open_existing()?;
+    table.repair_consistency_if_needed()?;
+    let record = table
+        .record(waiter.slot)?
+        .ok_or_else(|| anyhow::anyhow!("stale-contention waiter disappeared"))?;
+    let exact_preserved = record.claim == designated;
+    let blocked_current = record.blocked_on.is_some_and(|blocked| {
+        blocked.key == ResourceKey::Cpu(1)
+            && blocked.mode == FlockMode::Exclusive
+            && table
+                .blocker_serial(blocked.key, blocked.mode)
+                .is_ok_and(|serial| serial == blocked.serial)
+    });
+    table.grant_compatible()?;
+    let stayed_waiting = table
+        .record(waiter.slot)?
+        .is_some_and(|record| record.state == STATE_WAITING);
+    drop(table);
+    drop(_lock);
+
+    waiter.finish(None)?;
+    coordinator.finish(None)?;
+    Ok((
+        matches!(result, GrantResult::Requeued),
+        exact_preserved,
+        blocked_current,
+        stayed_waiting,
+    ))
+}
+
+#[cfg(test)]
 fn diagnostic_counter_for_tests(offset: usize) -> Result<u64> {
     let _lock = lock_registry_existing(FlockMode::Shared)?;
     let file = File::open(header_path())?;
@@ -3681,11 +3838,19 @@ fn lock_registry_interruptible_existing(cancelled: Option<&AtomicBool>) -> Resul
 }
 
 fn notify_coordinator() {
-    let _ = OpenOptions::new()
+    let path = notify_path();
+    if let Err(error) = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
-        .open(notify_path());
+        .open(&path)
+    {
+        tracing::warn!(
+            path = %path.display(),
+            %error,
+            "failed to notify the host-admission coordinator; the bounded recovery wake remains active",
+        );
+    }
 }
 
 pub(super) fn publish_acquired(claim: &ClaimSet) -> Result<()> {
@@ -5240,6 +5405,34 @@ impl Table {
             if watch.llc_mode == ClaimMode::Exclusive {
                 serial = serial.max(self.resource_serial(S_LLC_EX, llc)?);
             }
+        }
+        Ok(serial)
+    }
+
+    /// Highest compatibility serial that can make the coordinator's current
+    /// exact designation runnable.
+    ///
+    /// An EX contention deliberately observes both SH and EX compatibility:
+    /// resolving it as SharedHeld must wake compatible SH tickets. That SH
+    /// improvement does not, however, make an EX coordinator runnable. Keep
+    /// the broad publication serial above for callback invalidation, while
+    /// planner wakes follow the modes of the exact claim currently published
+    /// by the coordinator.
+    fn max_planner_watch_serial(&self, watch: &ClaimSet, claim: &ClaimSet) -> Result<u64> {
+        let mut serial = 0;
+        let cpu_serial = match claim.cpu_mode {
+            ClaimMode::Shared => S_CPU_SH,
+            ClaimMode::Exclusive => S_CPU_EX,
+        };
+        for &cpu in &watch.cpus {
+            serial = serial.max(self.resource_serial(cpu_serial, cpu)?);
+        }
+        let llc_serial = match claim.llc_mode {
+            ClaimMode::Shared => S_LLC_SH,
+            ClaimMode::Exclusive => S_LLC_EX,
+        };
+        for &llc in &watch.llcs {
+            serial = serial.max(self.resource_serial(llc_serial, llc)?);
         }
         Ok(serial)
     }

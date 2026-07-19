@@ -1658,13 +1658,19 @@ fn plan_only_falls_back_to_a_full_static_shape_when_every_llc_is_exclusive_held(
 #[test]
 fn registered_claim_fast_fails_without_acquire_or_diagnostic_enrichment() {
     let _llc_prefix = LlcLockPrefixGuard::new();
-    let _allowed = AllowedCpusGuard::new(vec![93750]);
-    let topo = synth_host_topo(&[(vec![93750], 0)]);
+    let _allowed = AllowedCpusGuard::new(vec![0]);
+    let topo = synth_host_topo(&[(vec![0], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(1, 1);
     let claim =
         admission_protocol::ClaimSet::new([0usize], std::iter::empty(), FlockMode::Exclusive);
+    let watch = admission_protocol::ClaimSet::with_modes(
+        [0usize],
+        [0usize],
+        FlockMode::Exclusive,
+        FlockMode::Shared,
+    );
     let coordinator =
-        match admission_protocol::register_ticket_or_acquire(claim.clone(), claim, None, |_| {
+        match admission_protocol::register_ticket_or_acquire(claim, watch, None, |_| {
             Ok::<Option<()>, anyhow::Error>(None)
         })
         .expect("register exclusive LLC claim")
@@ -1768,8 +1774,8 @@ fn waiting_handoff_publishes_ticket_before_releasing_old_locks() {
     );
     assert_eq!(
         attempts.get(),
-        1,
-        "handoff waiting path must make exactly one fast acquire call",
+        0,
+        "known-busy discovery must publish directly instead of retrying the fast acquire seam",
     );
     assert_eq!(
         crate::flock::proc_locks::batch_holder_info_resolution_count_for_tests(),

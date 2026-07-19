@@ -228,6 +228,17 @@ fn uncontended_fast_fence_does_not_create_registry_metadata() {
     assert!(!registry_dir.exists());
     assert!(!event_dir.exists());
 
+    assert!(
+        protocol::ticket_registry_snapshot_for_tests()
+            .expect("snapshot absent registry")
+            .is_empty(),
+        "never-created registry metadata is the authoritative empty state",
+    );
+    assert!(
+        !registry_dir.exists() && !event_dir.exists(),
+        "observing the empty registry must preserve the metadata-free fast path",
+    );
+
     let claim = ticket_claim(&[1]);
     let outcome = protocol::with_registry_fence(&claim, || Ok::<_, anyhow::Error>("uncontended"))
         .expect("run absent-registry fence");
@@ -416,6 +427,62 @@ fn coordinator_watch_wakes_for_resource_release() {
             .expect("wait for resource release")
             .is_some(),
         "resource-lock close must wake the coordinator watch",
+    );
+}
+
+#[test]
+fn coordinator_watch_yields_between_bounded_close_storm_chunks() {
+    let _prefixes = LockPrefixesGuard::new_real_wake();
+    let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
+    let cpu_path = cpu_lock_path(0);
+    let resource_dir = std::path::Path::new(&cpu_path)
+        .parent()
+        .expect("CPU resource parent");
+    for index in 0..2_048usize {
+        drop(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(resource_dir.join(format!("unwatched-storm-{index}")))
+                .expect("create unwatched close"),
+        );
+    }
+    drop(
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(protocol::registry_event_dir_for_tests().join("notify"))
+            .expect("create trailing registry notification"),
+    );
+
+    let watched = protocol::ClaimSet::default();
+    let first = watch.drain(&watched).expect("drain first bounded turn");
+    assert!(
+        first.has_backlog(),
+        "a close storm larger than one coordinator budget must yield with backlog",
+    );
+    assert!(
+        !first.overflowed(),
+        "a user-space fairness budget must not masquerade as kernel queue overflow",
+    );
+
+    let mut saw_notify = first.contains_registry_notify();
+    for _ in 0..32 {
+        if saw_notify {
+            break;
+        }
+        let events = watch.drain(&watched).expect("drain next bounded turn");
+        assert!(
+            !events.overflowed(),
+            "the bounded test storm must remain below the kernel overflow limit",
+        );
+        saw_notify |= events.contains_registry_notify();
+    }
+    assert!(
+        saw_notify,
+        "bounded turns must eventually reach a trailing actionable notification",
     );
 }
 
@@ -839,7 +906,7 @@ fn ordinary_state_reads_overlap_registry_shared_readers() {
 }
 
 #[test]
-fn targeted_broker_wake_interrupts_one_registry_futex_waiter() {
+fn targeted_broker_wake_cancels_one_registry_waiter() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
 
@@ -891,13 +958,11 @@ fn targeted_broker_wake_interrupts_one_registry_futex_waiter() {
         );
         std::thread::yield_now();
     };
-    let signal_count = crate::flock::primitives::interruptible_flock_broker_signal_count();
     cancelled.store(true, Ordering::Release);
     crate::flock::wake_interruptible_flock_waiter(waiter_id);
-    wait_for_broker_signal_after(signal_count);
     let result = result_rx
         .recv_timeout(std::time::Duration::from_secs(2))
-        .expect("targeted wake must interrupt the registry futex");
+        .expect("targeted wake must cancel the registry wait");
     assert!(
         result
             .expect_err("cancelled registry wait must not acquire")
@@ -1258,7 +1323,11 @@ fn small_shared_cell_proceeds_while_coordinator_hungers() {
         .join()
         .expect("completed coordinator thread");
     match coordinator_outcome {
-        LockOutcome::Acquired { locks, .. } => assert_eq!(locks.len(), 1),
+        LockOutcome::Acquired { locks, .. } => assert_eq!(
+            locks.len(),
+            2,
+            "independent LLC and CPU admission must retain both exclusive fds",
+        ),
         LockOutcome::Unavailable(r) => {
             panic!("coordinator must complete after the release: {r}")
         }
@@ -1422,7 +1491,7 @@ fn shared_holder_close_does_not_replan_an_llc_sh_only_watch() {
 #[test]
 fn failed_llc_ex_probe_releases_compatible_shared_waiter_without_fallback() {
     let _prefixes = LockPrefixesGuard::new();
-    let (scans, shared_granted, exclusive_waiting) =
+    let (scans, shared_granted, exclusive_waiting, coordinator_did_not_replan) =
         protocol::exercise_llc_ex_contention_shared_wake_for_tests()
             .expect("exercise LLC mode-compatible wake");
     assert_eq!(
@@ -1437,6 +1506,10 @@ fn failed_llc_ex_probe_releases_compatible_shared_waiter_without_fallback() {
         exclusive_waiting,
         "the same shared-held observation must keep the incompatible EX ticket blocked",
     );
+    assert!(
+        coordinator_did_not_replan,
+        "an SH compatibility improvement must not spin the incompatible EX coordinator",
+    );
 }
 
 #[test]
@@ -1450,6 +1523,7 @@ fn failed_cpu_ex_probe_wakes_only_the_compatible_shared_waiter() {
         ex_serial_unchanged,
         shared_woke,
         exclusive_not_woken,
+        coordinator_did_not_replan,
     ) = protocol::exercise_cpu_ex_contention_shared_wake_for_tests()
         .expect("exercise CPU mode-compatible wake");
     assert_eq!(
@@ -1466,6 +1540,33 @@ fn failed_cpu_ex_probe_wakes_only_the_compatible_shared_waiter() {
         shared_woke && exclusive_not_woken,
         "the targeted wake belongs only to the newly compatible CPU SH ticket",
     );
+    assert!(
+        coordinator_did_not_replan,
+        "an SH compatibility improvement must not spin the incompatible EX coordinator",
+    );
+}
+
+#[test]
+fn exclusive_coordinator_waits_for_shared_holder_without_reprobe_spin() {
+    let _prefixes = LockPrefixesGuard::new_real_wake();
+    let markers = tempfile::TempDir::new().expect("marker dir");
+    let shared_holder = crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Shared)
+        .expect("open shared CPU holder")
+        .expect("hold CPU in shared mode");
+    let coordinator = TicketChild::spawn(markers.path(), "exclusive-coordinator", "1", false);
+    coordinator.wait_for_probe();
+
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    assert_eq!(
+        coordinator.probe_count(),
+        1,
+        "resolving EX contention as SharedHeld must not synchronously reprobe EX",
+    );
+
+    drop(shared_holder);
+    coordinator.wait_for_probe_count(2);
+    coordinator.wait_for_acquired();
+    coordinator.release_and_wait();
 }
 
 #[test]
@@ -1633,6 +1734,30 @@ fn torn_and_stale_prefix_epochs_fail_closed_before_callback() {
     assert!(
         torn_rejected && stale_rejected,
         "invalid snapshots must demote the ticket to WAITING for a fresh scan",
+    );
+}
+
+#[test]
+fn stale_negative_probe_commits_current_blocker_and_discards_stale_alternative() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (requeued, exact_preserved, blocked_current, stayed_waiting) =
+        protocol::exercise_stale_contention_commit_for_tests()
+            .expect("exercise stale negative probe commit");
+    assert!(
+        requeued,
+        "stale negative evidence must requeue the live grant"
+    );
+    assert!(
+        exact_preserved,
+        "an alternative selected from the stale snapshot must be discarded",
+    );
+    assert!(
+        blocked_current,
+        "the real contention must be recorded at the current resource serial",
+    );
+    assert!(
+        stayed_waiting,
+        "the same serial must not immediately regrant the failed exact probe",
     );
 }
 
@@ -2442,7 +2567,14 @@ impl TicketChild {
     }
 
     fn terminate_bounded(&self) {
-        if let Some(child) = self.child.borrow_mut().as_mut() {
+        {
+            let mut child = self.child.borrow_mut();
+            let Some(child) = child.as_mut() else {
+                // A successful wait already reaped the helper and cleared the
+                // slot. In particular, Drop after release_and_wait must not
+                // pay the two-second kill fallback a second time.
+                return;
+            };
             let _ = child.kill();
         }
         let _ = self.wait_for_status(std::time::Duration::from_secs(2));
@@ -2639,7 +2771,7 @@ fn release_before_successor_installs_watch_is_sampled_on_its_first_schedule() {
 
 #[test]
 fn ticket_death_before_successor_installs_watch_is_reconciled_promptly() {
-    let _prefixes = LockPrefixesGuard::new();
+    let _prefixes = LockPrefixesGuard::new_real_wake();
     let markers = tempfile::TempDir::new().expect("marker dir");
     let blocker_x = crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Exclusive)
         .expect("open first-coordinator blocker")
@@ -2674,11 +2806,11 @@ fn ticket_death_before_successor_installs_watch_is_reconciled_promptly() {
     );
     wait_for_ticket_pids(&[first.pid, successor.pid]);
 
-    // C first receives a disjoint grant, proves Z busy, and requeues its exact
-    // Z claim. D is later and conflicts with C, so C's live claim must fence D.
+    // C publishes an exact Z claim. The coordinator's availability snapshot
+    // already proves Z busy, so no speculative granted callback is needed.
+    // D is later and conflicts with C, so C's live claim must fence D.
     let dead_predecessor = TicketChild::spawn(markers.path(), "dead-predecessor", "3", false);
     wait_for_ticket_pids(&[first.pid, successor.pid, dead_predecessor.pid]);
-    dead_predecessor.wait_for_probe();
     let fenced_successor = TicketChild::spawn(markers.path(), "fenced-successor", "3", false);
     wait_for_ticket_pids(&[
         first.pid,
@@ -2826,12 +2958,9 @@ fn invalidated_inflight_grant_drops_its_acquired_payload_before_commit() {
 
 #[test]
 fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
-    let _prefixes = LockPrefixesGuard::new();
+    let _prefixes = LockPrefixesGuard::new_real_wake();
     let markers = tempfile::TempDir::new().expect("marker dir");
     let blocker_one = crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Exclusive)
-        .unwrap()
-        .unwrap();
-    let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .unwrap();
     let coordinator = TicketChild::spawn(markers.path(), "coordinator", "1", false);
@@ -2840,6 +2969,11 @@ fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
     let waiter = TicketChild::spawn_before_probe_gate(markers.path(), "waiter", "2", &gate);
     waiter.wait_for_probe();
 
+    let claim = ticket_claim(&[2]);
+    let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
+        .unwrap()
+        .expect("block the in-flight waiter probe");
+    protocol::publish_acquired(&claim).expect("publish first external hold");
     let before = protocol::resource_epoch_for_tests().expect("resource epoch before release");
     drop(blocker_two);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -2853,8 +2987,20 @@ fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
     let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .expect("re-block waiter after epoch transition");
+    protocol::publish_acquired(&claim).expect("publish replacement external hold");
     std::fs::write(&gate, b"release").expect("release stale-epoch probe");
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !protocol::ticket_blocked_at_current_serial_for_tests(waiter.pid)
+        .expect("inspect waiter blocked serial")
+    {
+        waiter.assert_running("current blocked-serial publication");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "failed in-flight probe did not publish its blocker at the current serial; {}",
+            waiter.diagnostics(),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     assert_eq!(
         waiter.probe_count(),
         1,
@@ -3059,7 +3205,7 @@ fn grant_crash_after_state_before_wake_still_makes_progress() {
 
 #[test]
 fn granted_acquirer_crash_before_record_clear_is_pruned() {
-    let _prefixes = LockPrefixesGuard::new();
+    let _prefixes = LockPrefixesGuard::new_real_wake();
     let markers = tempfile::TempDir::new().expect("marker dir");
     let blocker = crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Exclusive)
         .unwrap()
@@ -3176,7 +3322,7 @@ fn every_predecessor_claim_is_respected_while_disjoint_work_passes() {
 
 #[test]
 fn crashed_ticket_is_pruned_before_a_later_compatible_probe() {
-    let _prefixes = LockPrefixesGuard::new();
+    let _prefixes = LockPrefixesGuard::new_real_wake();
     let markers = tempfile::TempDir::new().expect("marker dir");
     let blocker = crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Exclusive)
         .unwrap()

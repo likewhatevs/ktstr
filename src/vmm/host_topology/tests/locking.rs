@@ -763,7 +763,11 @@ fn resource_lock_wait_acquires_after_peer_release() {
     .unwrap();
     let elapsed = start.elapsed();
     let (_, locks) = unwrap_acquired(outcome, Some("after the peer's timed release"));
-    assert_eq!(locks.len(), 1);
+    assert_eq!(
+        locks.len(),
+        2,
+        "independent LLC and CPU admission must retain both exclusive fds",
+    );
     assert!(
         elapsed >= std::time::Duration::from_millis(250),
         "acquire must have parked through the peer's ~300 ms hold; elapsed={elapsed:?}",
