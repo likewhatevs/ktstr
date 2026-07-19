@@ -465,6 +465,7 @@ pub mod host_context;
 pub mod host_heap;
 pub(crate) mod host_thread_probe;
 pub mod kernel_path;
+pub(crate) mod lookup_cache;
 // build_helpers.rs is `include!`d into build.rs at build-script
 // compile time. Mounting it as a `#[cfg(test)]` mod here lets its
 // unit tests run under `cargo nextest` / `cargo ktstr test`

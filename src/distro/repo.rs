@@ -81,7 +81,7 @@ pub use crate::kernel_path::DistroKind;
 
 /// A single resolved package: name, version, download URL, and the
 /// sha256 the repo metadata declares for it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PackageRef {
     pub name: String,
     pub version: String,
@@ -92,7 +92,7 @@ pub struct PackageRef {
 
 /// The resolved kernel for a distro spec: the packages that carry the
 /// kernel image + modules, plus the vmlinux-bearing debuginfo packages.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ResolvedDistroKernel {
     /// Short distro tag, e.g. `"fedora44"`, `"ubuntu24.04-hwe"`, `"al2023"`.
     pub distro: String,
@@ -131,6 +131,25 @@ pub(crate) fn resolve_for_arch(
     release: Option<&str>,
     arch: &str,
 ) -> Result<ResolvedDistroKernel> {
+    let key = distro_resolution_cache_key(kind, release, arch);
+    crate::lookup_cache::last_known_good(
+        &key,
+        || resolve_for_arch_uncached(kind, release, arch),
+        |resolved| validate_cached_resolution(kind, release, arch, resolved),
+    )
+}
+
+/// Resolve a distro directly from its repository metadata.
+///
+/// The last-known-good boundary deliberately wraps this whole dispatcher:
+/// only a fully selected package set whose complete metadata chain succeeded
+/// can be persisted, and any failure in that chain can fall back to the last
+/// validated complete result.
+fn resolve_for_arch_uncached(
+    kind: DistroKind,
+    release: Option<&str>,
+    arch: &str,
+) -> Result<ResolvedDistroKernel> {
     match kind {
         DistroKind::Fedora => resolve_fedora(release, arch),
         DistroKind::Ubuntu => resolve_ubuntu(release, arch),
@@ -140,6 +159,180 @@ pub(crate) fn resolve_for_arch(
             bail!("GKE kernels use Google COS image metadata, not a distro package repository")
         }
     }
+}
+
+/// On-disk schema for complete distro-resolution records.
+///
+/// Bump this when either the serialized payload or its validation semantics
+/// change incompatibly. Kind, requested release (or the explicit `latest`
+/// marker), and host architecture are separate components so one resolver
+/// input can never supply another's stale result.
+const DISTRO_RESOLUTION_CACHE_SCHEMA: &str = "distro-resolution-v1";
+
+fn distro_kind_cache_name(kind: DistroKind) -> &'static str {
+    match kind {
+        DistroKind::Fedora => "fedora",
+        DistroKind::Ubuntu => "ubuntu",
+        DistroKind::AmazonLinux => "amazonlinux",
+        DistroKind::SteamOs => "steamos",
+        DistroKind::Gke => "gke",
+    }
+}
+
+fn distro_resolution_cache_key(kind: DistroKind, release: Option<&str>, arch: &str) -> String {
+    let release = if kind == DistroKind::AmazonLinux {
+        // Every accepted Amazon Linux spelling selects the same rolling
+        // AL2023 repository; the resolver intentionally ignores `release`.
+        // Canonicalize that equivalence here so `amazonlinux`, `al2023`, and
+        // `amazonlinux-2023` share one last-known-good result.
+        "rolling-al2023".to_string()
+    } else {
+        release
+            .map(|release| format!("release={release}"))
+            .unwrap_or_else(|| "latest".to_string())
+    };
+    format!(
+        "{DISTRO_RESOLUTION_CACHE_SCHEMA}/{}/{release}/{arch}",
+        distro_kind_cache_name(kind)
+    )
+}
+
+/// Validate a deserialized last-known-good record against the exact resolver
+/// request that selected its cache slot.
+///
+/// Treat the cache as untrusted input: besides request identity, validate all
+/// fields that acquisition later relies on before accepting stale metadata.
+fn validate_cached_resolution(
+    kind: DistroKind,
+    release: Option<&str>,
+    host_arch: &str,
+    resolved: &ResolvedDistroKernel,
+) -> Result<()> {
+    validate_cached_distro_tag(kind, release, &resolved.distro)?;
+
+    let expected_arch = match kind {
+        DistroKind::Fedora | DistroKind::AmazonLinux => match host_arch {
+            "x86_64" | "aarch64" => host_arch,
+            other => bail!("unsupported cached distro host architecture {other}"),
+        },
+        DistroKind::Ubuntu => ubuntu_arch(host_arch)?,
+        DistroKind::SteamOs => {
+            if host_arch != "x86_64" {
+                bail!("SteamOS cached resolution requires x86_64, got {host_arch}");
+            }
+            "x86_64"
+        }
+        DistroKind::Gke => {
+            bail!("GKE does not use distro package-repository resolution")
+        }
+    };
+    if resolved.arch != expected_arch {
+        bail!(
+            "cached {} architecture is {:?}, expected {expected_arch:?}",
+            distro_kind_cache_name(kind),
+            resolved.arch
+        );
+    }
+    if resolved.kernel_release.trim().is_empty() {
+        bail!("cached distro kernel release is empty");
+    }
+    if resolved.packages.is_empty() {
+        bail!("cached distro resolution has no kernel packages");
+    }
+
+    match kind {
+        DistroKind::SteamOs if !resolved.debuginfo.is_empty() => {
+            bail!("cached SteamOS resolution unexpectedly contains debuginfo")
+        }
+        DistroKind::Fedora | DistroKind::Ubuntu | DistroKind::AmazonLinux
+            if resolved.debuginfo.is_empty() =>
+        {
+            bail!(
+                "cached {} resolution has no mandatory debuginfo",
+                distro_kind_cache_name(kind)
+            )
+        }
+        _ => {}
+    }
+
+    for package in resolved.packages.iter().chain(&resolved.debuginfo) {
+        validate_cached_package(package)?;
+    }
+    Ok(())
+}
+
+fn validate_cached_distro_tag(kind: DistroKind, release: Option<&str>, distro: &str) -> Result<()> {
+    let valid = match (kind, release) {
+        (DistroKind::Fedora, Some(release)) => {
+            !release.is_empty()
+                && release.bytes().all(|byte| byte.is_ascii_digit())
+                && distro == format!("fedora{release}")
+        }
+        (DistroKind::Fedora, None) => distro.strip_prefix("fedora").is_some_and(|release| {
+            !release.is_empty() && release.bytes().all(|b| b.is_ascii_digit())
+        }),
+        (DistroKind::Ubuntu, Some(release)) => {
+            valid_dotted_release(release) && distro == format!("ubuntu{release}-hwe")
+        }
+        (DistroKind::Ubuntu, None) => distro
+            .strip_prefix("ubuntu")
+            .and_then(|tag| tag.strip_suffix("-hwe"))
+            .is_some_and(valid_dotted_release),
+        (DistroKind::AmazonLinux, _) => distro == "al2023",
+        (DistroKind::SteamOs, Some(release)) => {
+            valid_dotted_release(release) && distro == format!("steamos{release}")
+        }
+        (DistroKind::SteamOs, None) => distro
+            .strip_prefix("steamos")
+            .is_some_and(valid_dotted_release),
+        (DistroKind::Gke, _) => false,
+    };
+    if !valid {
+        bail!(
+            "cached {} distro tag {:?} does not match requested release {:?}",
+            distro_kind_cache_name(kind),
+            distro,
+            release
+        );
+    }
+    Ok(())
+}
+
+fn valid_dotted_release(release: &str) -> bool {
+    !release.is_empty()
+        && release.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && release.split('.').all(|part| !part.is_empty())
+}
+
+fn validate_cached_package(package: &PackageRef) -> Result<()> {
+    if package.name.trim().is_empty() {
+        bail!("cached distro package has an empty name");
+    }
+    if package.version.trim().is_empty() {
+        bail!(
+            "cached distro package {} has an empty version",
+            package.name
+        );
+    }
+    let url = Url::parse(&package.url)
+        .with_context(|| format!("cached distro package {} has an invalid URL", package.name))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        bail!(
+            "cached distro package {} URL must be absolute http(s): {}",
+            package.name,
+            package.url
+        );
+    }
+    if package.sha256.len() != 64 || !package.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!(
+            "cached distro package {} has an invalid sha256",
+            package.name
+        );
+    }
+    if package.size == Some(0) {
+        bail!("cached distro package {} has a zero size", package.name);
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------
