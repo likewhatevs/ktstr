@@ -146,6 +146,7 @@ fn main() {
     if interrupt::run_anchor_mode_if_requested() {
         return;
     }
+    interrupt::run_startup_supervision();
 
     ktstr::host_heap::mark_jemalloc_global_allocator();
     // Restore SIGPIPE so piping `cargo ktstr ... | head` doesn't
@@ -164,6 +165,7 @@ fn main() {
     // error.
     if let Err(e) = blobs::install_env() {
         eprintln!("error: extract embedded blobs: {e}");
+        interrupt::commit_startup_worker_exit(1);
         std::process::exit(1);
     }
     // Resolve project identity once for every descendant-producing command.
@@ -201,7 +203,12 @@ fn main() {
         command: CargoSub::Ktstr(ktstr),
     } = match Cargo::try_parse_from(&rewritten) {
         Ok(c) => c,
-        Err(e) => e.exit(),
+        Err(e) => {
+            let code = u8::try_from(e.exit_code()).unwrap_or(1);
+            let _ = e.print();
+            interrupt::commit_startup_worker_exit(code);
+            std::process::exit(i32::from(code));
+        }
     };
 
     // One handler installation spans the dispatched CLI lifetime. It starts
@@ -217,15 +224,22 @@ fn main() {
 
     let caught = interrupt::restore_and_caught(interrupt_guard);
     if let Some(signal) = caught {
+        // A signal exit is intentionally not a clean-release commit. The
+        // startup subreaper drains anything that survived worker cleanup
+        // before relaying the exact signal status.
         interrupt::reraise(signal);
     }
     if let Some(code) = interrupt::take_deferred_exit_code() {
-        std::process::exit(code);
+        let code = code as u8;
+        interrupt::commit_startup_worker_exit(code);
+        std::process::exit(i32::from(code));
     }
     if let Err(e) = result {
         eprintln!("error: {e:#}");
+        interrupt::commit_startup_worker_exit(1);
         std::process::exit(1);
     }
+    interrupt::commit_startup_worker_exit(0);
 }
 
 /// Fan out a parsed [`KtstrCommand`] to its subcommand handler.
