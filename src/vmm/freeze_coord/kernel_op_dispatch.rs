@@ -793,6 +793,12 @@ fn dispatch_per_cpu_field_read(
 /// after `pid_max` ≈ 2^22 entries).
 const START_TIME_PROC_TICK_NS: u64 = 10_000_000;
 
+#[derive(Clone, Copy)]
+struct IntegerField {
+    offset: usize,
+    width: usize,
+}
+
 /// BTF-derived byte offsets needed by the 8-layer task validation in
 /// [`validate_task_for_field_op`] plus the per-thread walker in
 /// [`find_task_by_pid`]. Resolved once per `TaskField` dispatch via
@@ -847,12 +853,6 @@ const START_TIME_PROC_TICK_NS: u64 = 10_000_000;
 /// - `thread_node`: `task_struct.thread_node` (`struct list_head`) at
 ///   sched.h:1101. Per-task linkage into `signal->thread_head`.
 ///   Used by the per-thread walker for `container_of` math.
-#[derive(Clone, Copy)]
-struct IntegerField {
-    offset: usize,
-    width: usize,
-}
-
 struct TaskValidationOffsets {
     pid: IntegerField,
     start_time: IntegerField,
