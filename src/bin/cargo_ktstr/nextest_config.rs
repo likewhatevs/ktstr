@@ -506,4 +506,37 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn repository_resource_users_share_the_full_drain_timeout_filter() {
+        const CONFIG: &str = include_str!("../../../.config/nextest.toml");
+        const FULL_DRAIN_TIMEOUT: &str =
+            "slow-timeout = { period = \"180s\", terminate-after = 7 }";
+
+        let default_blocks = profile_override_blocks(CONFIG, "default");
+        let resource = default_blocks
+            .iter()
+            .find_map(|(_, block)| {
+                block
+                    .contains("test-group = \"@global\"")
+                    .then(|| normalized_filter(multiline_filter(block)))
+            })
+            .expect("profile.default explicitly assigns resource users to @global");
+
+        for profile in ["ci", "default"] {
+            let blocks = profile_override_blocks(CONFIG, profile);
+            let full_drain = blocks
+                .iter()
+                .find_map(|(_, block)| {
+                    block
+                        .contains(FULL_DRAIN_TIMEOUT)
+                        .then(|| normalized_filter(multiline_filter(block)))
+                })
+                .unwrap_or_else(|| panic!("{profile} full-drain timeout override must be present"));
+            assert_eq!(
+                full_drain, resource,
+                "{profile} full-drain timeout must cover the exact resource-admission set",
+            );
+        }
+    }
 }

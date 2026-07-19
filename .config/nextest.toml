@@ -85,7 +85,36 @@ max-threads = "num-cpus"
 # expected CI envelope instead of wasting an hour. A contention-killed
 # cell remains retryable and normally retries after the queue has drained.
 [[profile.ci.overrides]]
-filter = "test(/^ktstr\\//) | test(/^verifier\\//) | test(demo_) | test(gauntlet/) | test(boot_kernel) | test(bench_boot) | test(sched_perf_) | test(shell_exec_) | test(eevdf_) | test(disk_template_e2e) | test(cached_releases_with_non_singleton_bypasses_cache)"
+filter = '''
+test(/^ktstr\//)
+| test(/^gauntlet\//)
+| test(/^verifier\//)
+| (
+  binary(=ktstr)
+  & (
+    test(/^vmm::tests::(boot_kernel_.*|bench_boot_time.*|monitor_data_valid_latch_records_live_page_offset|sys_rdy_releases_monitor_before_5s_timeout|monitor_exits_cleanly_when_guest_panics_before_sys_rdy|first_sample_has_valid_rq_clock_thanks_to_sys_rdy|watchdog_timeout_override_lands_in_guest_memory|watchdog_override_prevents_stall_exit|sched_domain_data_populated|builder_performance_mode_valid_succeeds|builder_performance_mode_preserves_in_vm|builder_performance_mode_mbind_nodes_populated)$/)
+    | test(/^cli::kernel_build::build::tests::acquire_build_reservation_(bypass_empty_string_rejected|plan_and_make_jobs_consistent)$/)
+  )
+)
+| binary(=shell_mode_scheduler_lifecycle_e2e)
+| binary(=disk_template_e2e)
+| binary(=vm_integration)
+| binary(=extra_kconfig_e2e)
+| binary(=wprof_e2e)
+| binary(=verifier_pipeline)
+| (
+  binary(=ktstr_cli)
+  & test(=shell_exec_echo)
+)
+| (
+  binary(=cargo_ktstr_shell_test_e2e)
+  & test(=shell_test_resolves_topology_from_named_test)
+)
+| (
+  binary(=cargo_ktstr_verifier_discovery)
+  & test(=bare_verifier_runs_recursively_discovered_scheduler_cell_end_to_end)
+)
+'''
 slow-timeout = { period = "180s", terminate-after = 7 }
 
 [[profile.ci.overrides]]
@@ -318,7 +347,36 @@ threads-required = 1
 # slow-timeout for these filters; later blocks still contribute their
 # other settings.
 [[profile.default.overrides]]
-filter = "test(/^ktstr\\//) | test(/^verifier\\//) | test(demo_) | test(gauntlet/) | test(boot_kernel) | test(bench_boot) | test(sched_perf_) | test(shell_exec_) | test(eevdf_) | test(disk_template_e2e) | test(cached_releases_with_non_singleton_bypasses_cache)"
+filter = '''
+test(/^ktstr\//)
+| test(/^gauntlet\//)
+| test(/^verifier\//)
+| (
+  binary(=ktstr)
+  & (
+    test(/^vmm::tests::(boot_kernel_.*|bench_boot_time.*|monitor_data_valid_latch_records_live_page_offset|sys_rdy_releases_monitor_before_5s_timeout|monitor_exits_cleanly_when_guest_panics_before_sys_rdy|first_sample_has_valid_rq_clock_thanks_to_sys_rdy|watchdog_timeout_override_lands_in_guest_memory|watchdog_override_prevents_stall_exit|sched_domain_data_populated|builder_performance_mode_valid_succeeds|builder_performance_mode_preserves_in_vm|builder_performance_mode_mbind_nodes_populated)$/)
+    | test(/^cli::kernel_build::build::tests::acquire_build_reservation_(bypass_empty_string_rejected|plan_and_make_jobs_consistent)$/)
+  )
+)
+| binary(=shell_mode_scheduler_lifecycle_e2e)
+| binary(=disk_template_e2e)
+| binary(=vm_integration)
+| binary(=extra_kconfig_e2e)
+| binary(=wprof_e2e)
+| binary(=verifier_pipeline)
+| (
+  binary(=ktstr_cli)
+  & test(=shell_exec_echo)
+)
+| (
+  binary(=cargo_ktstr_shell_test_e2e)
+  & test(=shell_test_resolves_topology_from_named_test)
+)
+| (
+  binary(=cargo_ktstr_verifier_discovery)
+  & test(=bare_verifier_runs_recursively_discovered_scheduler_cell_end_to_end)
+)
+'''
 slow-timeout = { period = "180s", terminate-after = 7 }
 
 [[profile.default.overrides]]
