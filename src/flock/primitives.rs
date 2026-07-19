@@ -939,12 +939,11 @@ mod tests {
         let peer = try_flock(&path, FlockMode::Exclusive)
             .expect("open peer")
             .expect("peer EX on fresh file");
-        let witness = match try_flock_with_witness(&path, FlockMode::Exclusive)
-            .expect("contended probe")
-        {
-            TryFlockOutcome::Contended(fd) => fd,
-            TryFlockOutcome::Acquired(_) => panic!("peer EX must force a contended witness"),
-        };
+        let witness =
+            match try_flock_with_witness(&path, FlockMode::Exclusive).expect("contended probe") {
+                TryFlockOutcome::Contended(fd) => fd,
+                TryFlockOutcome::Acquired(_) => panic!("peer EX must force a contended witness"),
+            };
 
         assert_eq!(
             fd_flags(&witness) & libc::FD_CLOEXEC,
@@ -1022,7 +1021,11 @@ mod tests {
         );
         // SAFETY: F_GETFL is a read-only query on a live fd.
         let status = unsafe { libc::fcntl(witness.as_raw_fd(), libc::F_GETFL) };
-        assert!(status >= 0, "F_GETFL failed: {}", std::io::Error::last_os_error());
+        assert!(
+            status >= 0,
+            "F_GETFL failed: {}",
+            std::io::Error::last_os_error()
+        );
         assert_eq!(
             status & libc::O_ACCMODE,
             libc::O_RDONLY,

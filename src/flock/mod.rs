@@ -117,7 +117,9 @@ pub(crate) use primitives::{
     InterruptibleFlockWaiter, TryFlockOutcome, materialize, probe_flock_existing_read_only,
     try_flock_with_witness,
 };
-pub(crate) use proc_locks::{read_holders, read_holders_with_mountinfo};
+pub(crate) use proc_locks::{
+    FlockModeSummary, read_flock_mode_summaries, read_holders, read_holders_with_mountinfo,
+};
 
 /// Subdirectory name (under whatever root each caller picks) that
 /// holds advisory `flock(2)` sentinels. Both [`crate::cache`] and
