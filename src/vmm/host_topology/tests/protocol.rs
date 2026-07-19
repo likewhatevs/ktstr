@@ -2870,13 +2870,6 @@ fn disjoint_granted_callbacks_probe_concurrently_without_registry_ex_convoy() {
     let blocker_one = crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .unwrap();
-    let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
-        .unwrap()
-        .unwrap();
-    let blocker_three =
-        crate::flock::try_flock(cpu_lock_path(3), crate::flock::FlockMode::Exclusive)
-            .unwrap()
-            .unwrap();
     let coordinator = TicketChild::spawn(markers.path(), "coordinator", "1", false);
     wait_for_ticket_pids(&[coordinator.pid]);
 
@@ -2891,15 +2884,18 @@ fn disjoint_granted_callbacks_probe_concurrently_without_registry_ex_convoy() {
         if entered == 2 {
             break;
         }
+        second.assert_running("concurrent probe barrier");
+        third.assert_running("concurrent probe barrier");
         assert!(
             std::time::Instant::now() < deadline,
-            "disjoint granted callbacks did not overlap; only {entered}/2 entered the barrier"
+            "disjoint granted callbacks did not overlap; only {entered}/2 entered the barrier; \
+             second: {}; third: {}",
+            second.diagnostics(),
+            third.diagnostics(),
         );
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 
-    drop(blocker_two);
-    drop(blocker_three);
     second.wait_for_acquired();
     third.wait_for_acquired();
     second.release_and_wait();
