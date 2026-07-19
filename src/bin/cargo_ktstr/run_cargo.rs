@@ -453,15 +453,14 @@ fn normalize_nextest_region(args: Vec<String>, region_start: usize) -> Vec<Strin
     let mut index = region_start;
     while index < separator {
         let argument = &args[index];
-        if matches!(argument.as_str(), "-j" | "--test-threads") {
-            if args
+        if matches!(argument.as_str(), "-j" | "--test-threads")
+            && args
                 .get(index + 1)
                 .filter(|_| index + 1 < separator)
                 .is_some_and(|value| valid_nextest_test_threads(value))
-            {
-                index += 2;
-                continue;
-            }
+        {
+            index += 2;
+            continue;
         }
         let valid_joined = argument
             .strip_prefix("-j")
@@ -579,7 +578,7 @@ pub(crate) fn normalize_nextest_admission(sub_argv: &[&str], args: Vec<String>) 
 
 /// Variant for a complete `cargo nextest run ...` argv, used by verifier.
 pub(crate) fn normalize_nextest_command_admission(args: Vec<String>) -> Vec<String> {
-    if args.get(0).map(String::as_str) == Some("nextest")
+    if args.first().map(String::as_str) == Some("nextest")
         && args.get(1).map(String::as_str) == Some("run")
     {
         normalize_nextest_region(args, 2)
@@ -2205,6 +2204,7 @@ fn validated_test_executables_from_cargo_output(
         .ok_or(())
 }
 
+#[cfg(test)]
 fn test_executables_from_cargo_json(stdout: &[u8]) -> Vec<PathBuf> {
     cargo_json_discovery(stdout, &[]).test_executables
 }
@@ -2350,13 +2350,13 @@ fn acquire_cargo_build_output_lease_at_root(
     interrupted: &std::sync::atomic::AtomicBool,
 ) -> Result<CargoBuildOutputLease, String> {
     let canonical_target_dir = canonical_cargo_target_dir(target_dir)?;
-    std::fs::create_dir_all(&root).map_err(|error| {
+    std::fs::create_dir_all(root).map_err(|error| {
         format!(
             "{cli_label}: create Cargo output lock root {}: {error}",
             root.display()
         )
     })?;
-    let lock_path = cargo_build_output_lock_path(&root, &canonical_target_dir);
+    let lock_path = cargo_build_output_lock_path(root, &canonical_target_dir);
     let started = std::time::Instant::now();
     let mut next_heartbeat = started + std::time::Duration::from_secs(10);
     loop {

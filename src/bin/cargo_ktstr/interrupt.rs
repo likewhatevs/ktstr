@@ -610,7 +610,7 @@ impl StartupLauncherSignals {
             }
 
             let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = startup_launcher_handler as usize;
+            action.sa_sigaction = startup_launcher_handler as *const () as usize;
             if libc::sigemptyset(&mut action.sa_mask) != 0
                 || libc::sigaddset(&mut action.sa_mask, libc::SIGINT) != 0
                 || libc::sigaddset(&mut action.sa_mask, libc::SIGTERM) != 0
@@ -1156,7 +1156,7 @@ fn initialize_startup_supervisor_signal_state() -> io::Result<()> {
     // forwards a terminal signal to the whole new process group.
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = startup_supervisor_handler as usize;
+        action.sa_sigaction = startup_supervisor_handler as *const () as usize;
         if libc::sigemptyset(&mut action.sa_mask) != 0
             || libc::sigaddset(&mut action.sa_mask, libc::SIGINT) != 0
             || libc::sigaddset(&mut action.sa_mask, libc::SIGTERM) != 0
@@ -2362,15 +2362,6 @@ pub(crate) fn run_output(mut command: Command) -> io::Result<Output> {
     run_capture(command, true)
 }
 
-/// Run a single-use command, capturing stdout while leaving
-/// stderr at the command's configured/default destination.
-pub(crate) fn run_stdout(mut command: Command) -> io::Result<Output> {
-    if !runner_enabled() {
-        return command.output();
-    }
-    run_capture(command, false)
-}
-
 /// Observe captured child pipes while retaining their exact byte streams.
 ///
 /// The observer runs synchronously on the child-owning thread. Its periodic
@@ -2414,9 +2405,10 @@ pub(crate) trait StdoutObserver {
 /// Run a command with inherited/configured stderr and incrementally observed,
 /// exactly preserved stdout.
 ///
-/// Unlike [`run_stdout`], this never waits for process exit before consuming
-/// stdout. A silent child therefore continues to drive observer heartbeats,
-/// while a chatty Cargo JSON producer cannot fill its pipe and deadlock.
+/// This never waits for process exit before consuming stdout. A silent child
+/// therefore continues to drive observer heartbeats, while a chatty Cargo JSON
+/// producer cannot fill its pipe and deadlock.
+#[cfg(test)]
 pub(crate) fn run_stdout_observed<O>(command: Command, mut observer: O) -> io::Result<Output>
 where
     O: StdoutObserver,
@@ -3635,7 +3627,7 @@ fn drain_exact_available<R: Read>(
 }
 
 fn timeout_ms(duration: Duration) -> libc::c_int {
-    let partial_millisecond = if duration.subsec_nanos() % 1_000_000 != 0 {
+    let partial_millisecond = if !duration.subsec_nanos().is_multiple_of(1_000_000) {
         1
     } else {
         0
@@ -3675,7 +3667,7 @@ fn drain_group_capture<O: StdoutObserver>(
             }
         }
 
-        if leader_status.is_some() && now >= next_group_scan {
+        if let Some(leader_status) = leader_status.as_ref().filter(|_| now >= next_group_scan) {
             let members = snapshot_group_members(group)?;
             match &mut budget {
                 Some(budget) => budget.observe(&members),
@@ -3687,7 +3679,7 @@ fn drain_group_capture<O: StdoutObserver>(
                 if empty_snapshots == 2 {
                     streams.finish_owned_prefix(observer)?;
                     return Ok(GroupCapture {
-                        status: leader_status.expect("leader status present"),
+                        status: *leader_status,
                         streams,
                     });
                 }
@@ -3839,10 +3831,7 @@ fn run_observed_direct<O: StdoutObserver>(
     } else {
         None
     };
-    let streams = match CaptureStreams::new(stdout, stderr) {
-        Ok(streams) => streams,
-        Err(error) => return Err(error),
-    };
+    let streams = CaptureStreams::new(stdout, stderr)?;
     let output = drain_direct_capture(owner.child_mut(), streams, observer)?;
     owner.disarm_reaped();
     Ok(output)
@@ -4108,7 +4097,10 @@ mod tests {
                  exec /bin/sleep 300",
             )
             .env("KTSTR_STARTUP_PIDFILE", &pidfile_text);
-        let _same_group = same_group.spawn().expect("spawn same-group descendant");
+        let same_group_child = same_group.spawn().expect("spawn same-group descendant");
+        // The subtree supervisor, not this deliberately blocked worker, owns
+        // termination and reaping for every descendant in this fixture.
+        drop(same_group_child);
 
         let mut separate_group = Command::new("/bin/sh");
         separate_group
@@ -4119,9 +4111,10 @@ mod tests {
             )
             .env("KTSTR_STARTUP_PIDFILE", &pidfile_text)
             .process_group(0);
-        let _separate_group = separate_group
+        let separate_group_child = separate_group
             .spawn()
             .expect("spawn explicit-setpgid descendant");
+        drop(separate_group_child);
 
         let mut new_session = Command::new("/usr/bin/setsid");
         new_session
@@ -4132,7 +4125,8 @@ mod tests {
             .arg("printf '%s\n' \"$$\" >> \"$1\"; exec /bin/sleep 300")
             .arg("ktstr-startup-test")
             .arg(&pidfile_text);
-        let _new_session = new_session.spawn().expect("spawn setsid env-i descendant");
+        let new_session_child = new_session.spawn().expect("spawn setsid env-i descendant");
+        drop(new_session_child);
 
         let mut double_fork = Command::new("/bin/sh");
         double_fork
@@ -4144,7 +4138,8 @@ mod tests {
                  exec /bin/sleep 300",
             )
             .env("KTSTR_STARTUP_PIDFILE", &pidfile_text);
-        let _double_fork = double_fork.spawn().expect("spawn double-fork chain");
+        let double_fork_child = double_fork.spawn().expect("spawn double-fork chain");
+        drop(double_fork_child);
 
         loop {
             std::thread::sleep(Duration::from_secs(60));
@@ -4483,7 +4478,7 @@ mod tests {
         handle.join().expect("watchdog joins");
     }
 
-    fn wait_until(timeout: Duration, predicate: impl Fn() -> bool) -> bool {
+    fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if predicate() {

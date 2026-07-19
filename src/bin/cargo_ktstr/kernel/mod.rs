@@ -512,7 +512,7 @@ fn resolve_prepared_kernel_work(
 /// vector, so one Range retains the same parallelism as N explicit versions.
 /// Rayon consumes an indexed `Vec`, preserving input order in the successful
 /// output regardless of completion order.
-
+///
 /// `resolve_one` plus per-resolve progress feedback.
 ///
 /// A user passing `--kernel 6.10..6.20` (10+ versions) sees

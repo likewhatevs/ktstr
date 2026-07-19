@@ -60,7 +60,7 @@
 //! run a cell against an unrelated kernel).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -82,6 +82,9 @@ use crate::feature_discovery::{
 use crate::kernel::{
     encode_kernel_list, path_kernel_label, resolve_kernel_image, resolve_kernel_set,
 };
+
+type SchedulerWorkspace = (PathBuf, PathBuf, PackageId);
+type SchedulerWorkspaceCache = BTreeMap<(String, String), Option<SchedulerWorkspace>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DiscoverSchedulerRequest {
@@ -946,8 +949,7 @@ fn selected_scheduler_plan(
     presets: &[ktstr::gauntlet::TopoPreset],
     metadata_options: &[String],
 ) -> Result<SelectedSchedulerPlan, String> {
-    let mut workspaces: BTreeMap<(String, String), Option<(PathBuf, PathBuf, PackageId)>> =
-        BTreeMap::new();
+    let mut workspaces = SchedulerWorkspaceCache::new();
     let scheduler_override = std::env::var_os(ktstr::KTSTR_SCHEDULER_ENV);
     let schedulers =
         selected_emitting_scheduler_declarations(declarations, scheduler_filter, |scheduler| {
@@ -1353,8 +1355,7 @@ pub(crate) fn prepare_scheduler_artifacts(
     let metadata_options = declaring_metadata_options(cargo_args, invocation_dir);
     let build_options = scheduler_build_options(cargo_args, invocation_dir);
     let scheduler_override = std::env::var_os(ktstr::KTSTR_SCHEDULER_ENV).map(PathBuf::from);
-    let mut workspaces: BTreeMap<(String, String), Option<(PathBuf, PathBuf, PackageId)>> =
-        BTreeMap::new();
+    let mut workspaces = SchedulerWorkspaceCache::new();
     let owner = tempfile::Builder::new()
         .prefix("ktstr-scheduler-artifacts-")
         .tempdir()

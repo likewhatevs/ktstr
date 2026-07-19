@@ -489,10 +489,10 @@ impl StdoutObserver for ReservedBuildProgress {
 
 impl Drop for ReservedBuildProgress {
     fn drop(&mut self) {
-        if !self.finished {
-            if let ProgressTarget::Tty(bar) = &self.target {
-                bar.finish_and_clear();
-            }
+        if !self.finished
+            && let ProgressTarget::Tty(bar) = &self.target
+        {
+            bar.finish_and_clear();
         }
     }
 }
