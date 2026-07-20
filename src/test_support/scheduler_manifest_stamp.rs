@@ -1565,34 +1565,18 @@ fn order_tests_by_legacy_registry(
 /// missing sentinel, unsupported version, invalid relocation, or out-of-range
 /// pointer is a corruption error. There is intentionally no process-exec
 /// fallback.
-#[doc(hidden)]
-pub fn read_scheduler_manifest_stamp(
-    path: &Path,
+pub(super) fn read_scheduler_manifest_stamp_reader(
+    reader: &ElfStampReader<'_>,
 ) -> Result<Option<SchedulerManifestProbe>, String> {
-    let file = std::fs::File::open(path).map_err(|error| {
-        format!(
-            "open warmed test binary {} for scheduler-manifest stamp: {error}",
-            path.display()
-        )
-    })?;
-    // SAFETY: the mapping is read-only, `file` stays alive through creation,
-    // and no mutable alias is created. The returned map owns the kernel VMA.
-    let data = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|error| {
-        format!(
-            "map warmed test binary {} for scheduler-manifest stamp: {error}",
-            path.display()
-        )
-    })?;
-    let reader = ElfStampReader::new(path, &data)?;
     let declarations = parse_record_section(
-        &reader,
+        reader,
         DECLARATION_SECTION,
         size_of::<SchedulerManifestDeclarationStampV1>(),
         STAMP_KIND_DECLARATION,
         |base, index| reader.declaration(base, index),
     )?;
     let tests = parse_record_section(
-        &reader,
+        reader,
         TEST_SECTION,
         size_of::<SchedulerManifestTestStampV1>(),
         STAMP_KIND_TEST,
@@ -1607,7 +1591,7 @@ pub fn read_scheduler_manifest_stamp(
                     "ktstr-linked test binary {} is missing required version-{STAMP_VERSION} \
                      scheduler-manifest stamp sections; rebuild every selected test target \
                      with this cargo-ktstr/ktstr version",
-                    path.display()
+                    reader.source.display()
                 ))
             } else {
                 Ok(None)
@@ -1616,32 +1600,54 @@ pub fn read_scheduler_manifest_stamp(
         (Some(_), None) => Err(format!(
             "scheduler-manifest ELF {} contains {DECLARATION_SECTION} but is missing \
              required peer section {TEST_SECTION}",
-            path.display()
+            reader.source.display()
         )),
         (None, Some(_)) => Err(format!(
             "scheduler-manifest ELF {} contains {TEST_SECTION} but is missing \
              required peer section {DECLARATION_SECTION}",
-            path.display()
+            reader.source.display()
         )),
         (Some(declarations), Some(mut tests)) => {
             validate_registry_count(
-                &reader,
+                reader,
                 "linkme_KTSTR_SCHEDULERS",
                 size_of::<&Scheduler>(),
                 declarations.len(),
                 "scheduler declaration(s)",
             )?;
             validate_registry_count(
-                &reader,
+                reader,
                 "linkme_KTSTR_TESTS",
                 size_of::<KtstrTestEntry>(),
                 tests.len(),
                 "test entry/entries",
             )?;
-            order_tests_by_legacy_registry(&reader, &mut tests)?;
+            order_tests_by_legacy_registry(reader, &mut tests)?;
             reconstruct_manifest(declarations, tests).map(Some)
         }
     }
+}
+
+#[doc(hidden)]
+pub fn read_scheduler_manifest_stamp(
+    path: &Path,
+) -> Result<Option<SchedulerManifestProbe>, String> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        format!(
+            "open warmed test binary {} for scheduler-manifest stamp: {error}",
+            path.display()
+        )
+    })?;
+    // SAFETY: the mapping is read-only, `file` stays alive through creation,
+    // and no mutable alias is created. The returned map owns its kernel VMA.
+    let data = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|error| {
+        format!(
+            "map warmed test binary {} for scheduler-manifest stamp: {error}",
+            path.display()
+        )
+    })?;
+    let reader = ElfStampReader::new(path, &data)?;
+    read_scheduler_manifest_stamp_reader(&reader)
 }
 
 #[cfg(test)]

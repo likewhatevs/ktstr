@@ -4,12 +4,10 @@
 //! before it starts a heavyweight test executable.  These records project the
 //! admission-relevant portion of every [`KtstrTestEntry`] and canned topology
 //! preset into a strict, versioned ELF wire format.  They intentionally live
-//! beside, rather than inside, the scheduler-manifest v1 records: changing the
+//! beside, rather than inside, the scheduler-manifest records: changing the
 //! admission contract must never silently change that established layout.
 
-#[cfg(test)]
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::mem::{offset_of, size_of};
 use std::path::Path;
 
@@ -18,14 +16,18 @@ use linkme::distributed_slice;
 use super::scheduler_manifest_stamp::ElfStampReader;
 use super::{KtstrTestEntry, Topology};
 
-const ADMISSION_MAGIC: [u8; 8] = *b"KTSTRAD1";
-const ADMISSION_VERSION: u16 = 1;
+const ADMISSION_MAGIC: [u8; 8] = *b"KTSTRAD2";
+const ADMISSION_VERSION: u16 = 2;
 const ADMISSION_KIND_SENTINEL: u16 = 0;
 const ADMISSION_KIND_TEST: u16 = 1;
 const ADMISSION_KIND_PRESET: u16 = 2;
+const ADMISSION_KIND_TEST_KEY: u16 = 3;
+const ADMISSION_KIND_PRESET_KEY: u16 = 4;
 
-const TEST_SECTION: &str = "linkme_KTSTR_ADMISSION_TESTS_V1";
-const PRESET_SECTION: &str = "linkme_KTSTR_ADMISSION_PRESETS_V1";
+const TEST_SECTION: &str = "linkme_KTSTR_ADMISSION_TESTS_V2";
+const PRESET_SECTION: &str = "linkme_KTSTR_ADMISSION_PRESETS_V2";
+const TEST_KEY_SECTION: &str = "linkme_KTSTR_ADMISSION_TEST_KEYS_V2";
+const PRESET_KEY_SECTION: &str = "linkme_KTSTR_ADMISSION_PRESET_KEYS_V2";
 const LEGACY_TEST_SECTION: &str = "linkme_KTSTR_TESTS";
 
 // KVM's topology surface is capped below 256 vCPUs.  Fixed-width arrays make
@@ -35,14 +37,14 @@ const MAX_TOPOLOGY_COMPONENTS: usize = 255;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct AdmissionHeaderV1 {
+struct AdmissionHeaderV2 {
     magic: [u8; 8],
     version: u16,
     kind: u16,
     record_size: u32,
 }
 
-impl AdmissionHeaderV1 {
+impl AdmissionHeaderV2 {
     const fn new(kind: u16, record_size: usize) -> Self {
         Self {
             magic: ADMISSION_MAGIC,
@@ -55,15 +57,15 @@ impl AdmissionHeaderV1 {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct AdmissionStrV1 {
+struct AdmissionStrV2 {
     ptr: *const u8,
     len: u64,
 }
 
 // Every emitted pointer refers to an immutable static string.
-unsafe impl Sync for AdmissionStrV1 {}
+unsafe impl Sync for AdmissionStrV2 {}
 
-impl AdmissionStrV1 {
+impl AdmissionStrV2 {
     const fn new(value: &'static str) -> Self {
         Self {
             ptr: value.as_ptr(),
@@ -81,13 +83,13 @@ impl AdmissionStrV1 {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct AdmissionOptionalU32V1 {
+struct AdmissionOptionalU32V2 {
     value: u32,
     present: u8,
     reserved: [u8; 3],
 }
 
-impl AdmissionOptionalU32V1 {
+impl AdmissionOptionalU32V2 {
     const fn new(value: Option<u32>) -> Self {
         match value {
             Some(value) => Self {
@@ -106,7 +108,7 @@ impl AdmissionOptionalU32V1 {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct AdmissionTopologyStampV1 {
+struct AdmissionTopologyStampV2 {
     numa_nodes: u32,
     llcs: u32,
     cores_per_llc: u32,
@@ -120,7 +122,7 @@ struct AdmissionTopologyStampV1 {
     llc_cores: [u32; MAX_TOPOLOGY_COMPONENTS],
 }
 
-impl AdmissionTopologyStampV1 {
+impl AdmissionTopologyStampV2 {
     const fn new(topology: Topology) -> Self {
         let mut node_llcs = [0; MAX_TOPOLOGY_COMPONENTS];
         let (explicit_nodes, node_llcs_len) = match topology.nodes {
@@ -188,18 +190,18 @@ impl AdmissionTopologyStampV1 {
     }
 }
 
-/// Version-1 admission record emitted for every `KtstrTestEntry`.
+/// Version-2 admission record emitted for every `KtstrTestEntry`.
 ///
 /// Public only because proc-macro expansions in downstream crates construct
 /// it.  It is not a source-level extension point.
 #[doc(hidden)]
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct AdmissionTestStampV1 {
-    header: AdmissionHeaderV1,
-    name: AdmissionStrV1,
-    topology: AdmissionTopologyStampV1,
-    cpu_budget: AdmissionOptionalU32V1,
+pub struct AdmissionTestStampV2 {
+    header: AdmissionHeaderV2,
+    name: AdmissionStrV2,
+    topology: AdmissionTopologyStampV2,
+    cpu_budget: AdmissionOptionalU32V2,
     host_only: u8,
     performance_mode: u8,
     no_perf_mode: u8,
@@ -208,17 +210,17 @@ pub struct AdmissionTestStampV1 {
     legacy_entry: *const KtstrTestEntry,
 }
 
-unsafe impl Sync for AdmissionTestStampV1 {}
+unsafe impl Sync for AdmissionTestStampV2 {}
 
-impl AdmissionTestStampV1 {
-    /// Project one const-evaluated test entry into the v1 admission wire shape.
+impl AdmissionTestStampV2 {
+    /// Project one const-evaluated test entry into the v2 admission wire shape.
     #[doc(hidden)]
     pub const fn new(entry: &'static KtstrTestEntry) -> Self {
         Self {
-            header: AdmissionHeaderV1::new(ADMISSION_KIND_TEST, size_of::<AdmissionTestStampV1>()),
-            name: AdmissionStrV1::new(entry.name),
-            topology: AdmissionTopologyStampV1::new(entry.topology),
-            cpu_budget: AdmissionOptionalU32V1::new(entry.cpu_budget),
+            header: AdmissionHeaderV2::new(ADMISSION_KIND_TEST, size_of::<AdmissionTestStampV2>()),
+            name: AdmissionStrV2::new(entry.name),
+            topology: AdmissionTopologyStampV2::new(entry.topology),
+            cpu_budget: AdmissionOptionalU32V2::new(entry.cpu_budget),
             host_only: entry.host_only as u8,
             performance_mode: entry.performance_mode as u8,
             no_perf_mode: entry.no_perf_mode as u8,
@@ -230,13 +232,13 @@ impl AdmissionTestStampV1 {
 
     const fn sentinel() -> Self {
         Self {
-            header: AdmissionHeaderV1::new(
+            header: AdmissionHeaderV2::new(
                 ADMISSION_KIND_SENTINEL,
-                size_of::<AdmissionTestStampV1>(),
+                size_of::<AdmissionTestStampV2>(),
             ),
-            name: AdmissionStrV1::empty(),
-            topology: AdmissionTopologyStampV1::sentinel(),
-            cpu_budget: AdmissionOptionalU32V1::new(None),
+            name: AdmissionStrV2::empty(),
+            topology: AdmissionTopologyStampV2::sentinel(),
+            cpu_budget: AdmissionOptionalU32V2::new(None),
             host_only: 0,
             performance_mode: 0,
             no_perf_mode: 0,
@@ -249,27 +251,27 @@ impl AdmissionTestStampV1 {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct AdmissionPresetStampV1 {
-    header: AdmissionHeaderV1,
-    name: AdmissionStrV1,
-    topology: AdmissionTopologyStampV1,
-    forced_cpu_budget: AdmissionOptionalU32V1,
+struct AdmissionPresetStampV2 {
+    header: AdmissionHeaderV2,
+    name: AdmissionStrV2,
+    topology: AdmissionTopologyStampV2,
+    forced_cpu_budget: AdmissionOptionalU32V2,
     sentinel_expected_count: u32,
     reserved: [u8; 4],
 }
 
-unsafe impl Sync for AdmissionPresetStampV1 {}
+unsafe impl Sync for AdmissionPresetStampV2 {}
 
-impl AdmissionPresetStampV1 {
+impl AdmissionPresetStampV2 {
     const fn new(name: &'static str, topology: Topology, forced_cpu_budget: Option<u32>) -> Self {
         Self {
-            header: AdmissionHeaderV1::new(
+            header: AdmissionHeaderV2::new(
                 ADMISSION_KIND_PRESET,
-                size_of::<AdmissionPresetStampV1>(),
+                size_of::<AdmissionPresetStampV2>(),
             ),
-            name: AdmissionStrV1::new(name),
-            topology: AdmissionTopologyStampV1::new(topology),
-            forced_cpu_budget: AdmissionOptionalU32V1::new(forced_cpu_budget),
+            name: AdmissionStrV2::new(name),
+            topology: AdmissionTopologyStampV2::new(topology),
+            forced_cpu_budget: AdmissionOptionalU32V2::new(forced_cpu_budget),
             sentinel_expected_count: 0,
             reserved: [0; 4],
         }
@@ -277,38 +279,150 @@ impl AdmissionPresetStampV1 {
 
     const fn sentinel(expected_count: u32) -> Self {
         Self {
-            header: AdmissionHeaderV1::new(
+            header: AdmissionHeaderV2::new(
                 ADMISSION_KIND_SENTINEL,
-                size_of::<AdmissionPresetStampV1>(),
+                size_of::<AdmissionPresetStampV2>(),
             ),
-            name: AdmissionStrV1::empty(),
-            topology: AdmissionTopologyStampV1::sentinel(),
-            forced_cpu_budget: AdmissionOptionalU32V1::new(None),
+            name: AdmissionStrV2::empty(),
+            topology: AdmissionTopologyStampV2::sentinel(),
+            forced_cpu_budget: AdmissionOptionalU32V2::new(None),
             sentinel_expected_count: expected_count,
             reserved: [0; 4],
         }
     }
 }
 
-/// Link-retained v1 test-admission records.
+/// Stable, deliberately non-cryptographic hash used by the compact admission
+/// lookup sections. A full string comparison is authoritative, so collisions
+/// merely add one candidate parse and can never alias two test cells.
+const fn admission_name_hash(value: &str) -> u64 {
+    let bytes = value.as_bytes();
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        hash ^= bytes[index] as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+        index += 1;
+    }
+    hash
+}
+
+/// Compact lookup key for one test admission record.
+///
+/// Public only because proc-macro expansions in downstream crates emit it.
+#[doc(hidden)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AdmissionTestKeyV2 {
+    header: AdmissionHeaderV2,
+    name_hash: u64,
+    name_len: u64,
+    record: *const AdmissionTestStampV2,
+}
+
+unsafe impl Sync for AdmissionTestKeyV2 {}
+
+impl AdmissionTestKeyV2 {
+    #[doc(hidden)]
+    pub const fn new(
+        entry: &'static KtstrTestEntry,
+        record: &'static AdmissionTestStampV2,
+    ) -> Self {
+        Self {
+            header: AdmissionHeaderV2::new(
+                ADMISSION_KIND_TEST_KEY,
+                size_of::<AdmissionTestKeyV2>(),
+            ),
+            name_hash: admission_name_hash(entry.name),
+            name_len: entry.name.len() as u64,
+            record,
+        }
+    }
+
+    const fn sentinel() -> Self {
+        Self {
+            header: AdmissionHeaderV2::new(
+                ADMISSION_KIND_SENTINEL,
+                size_of::<AdmissionTestKeyV2>(),
+            ),
+            name_hash: 0,
+            name_len: 0,
+            record: std::ptr::null(),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AdmissionPresetKeyV2 {
+    header: AdmissionHeaderV2,
+    name_hash: u64,
+    name_len: u64,
+    record: *const AdmissionPresetStampV2,
+}
+
+unsafe impl Sync for AdmissionPresetKeyV2 {}
+
+impl AdmissionPresetKeyV2 {
+    const fn new(name: &'static str, record: &'static AdmissionPresetStampV2) -> Self {
+        Self {
+            header: AdmissionHeaderV2::new(
+                ADMISSION_KIND_PRESET_KEY,
+                size_of::<AdmissionPresetKeyV2>(),
+            ),
+            name_hash: admission_name_hash(name),
+            name_len: name.len() as u64,
+            record,
+        }
+    }
+
+    const fn sentinel() -> Self {
+        Self {
+            header: AdmissionHeaderV2::new(
+                ADMISSION_KIND_SENTINEL,
+                size_of::<AdmissionPresetKeyV2>(),
+            ),
+            name_hash: 0,
+            name_len: 0,
+            record: std::ptr::null(),
+        }
+    }
+}
+
+/// Link-retained v2 test-admission records.
 #[doc(hidden)]
 #[distributed_slice]
-pub static KTSTR_ADMISSION_TESTS_V1: [AdmissionTestStampV1];
+pub static KTSTR_ADMISSION_TESTS_V2: [AdmissionTestStampV2];
 
 #[distributed_slice]
-static KTSTR_ADMISSION_PRESETS_V1: [AdmissionPresetStampV1];
+static KTSTR_ADMISSION_PRESETS_V2: [AdmissionPresetStampV2];
 
-#[distributed_slice(KTSTR_ADMISSION_TESTS_V1)]
-static KTSTR_ADMISSION_TESTS_V1_SENTINEL: AdmissionTestStampV1 = AdmissionTestStampV1::sentinel();
+/// Compact link-retained lookup keys for v2 test-admission records.
+#[doc(hidden)]
+#[distributed_slice]
+pub static KTSTR_ADMISSION_TEST_KEYS_V2: [AdmissionTestKeyV2];
+
+#[distributed_slice]
+static KTSTR_ADMISSION_PRESET_KEYS_V2: [AdmissionPresetKeyV2];
+
+#[distributed_slice(KTSTR_ADMISSION_TESTS_V2)]
+static KTSTR_ADMISSION_TESTS_V2_SENTINEL: AdmissionTestStampV2 = AdmissionTestStampV2::sentinel();
+
+#[distributed_slice(KTSTR_ADMISSION_TEST_KEYS_V2)]
+static KTSTR_ADMISSION_TEST_KEYS_V2_SENTINEL: AdmissionTestKeyV2 = AdmissionTestKeyV2::sentinel();
 
 #[cfg(target_arch = "aarch64")]
 const CANNED_PRESET_COUNT: u32 = 14;
 #[cfg(not(target_arch = "aarch64"))]
 const CANNED_PRESET_COUNT: u32 = 26;
 
-#[distributed_slice(KTSTR_ADMISSION_PRESETS_V1)]
-static KTSTR_ADMISSION_PRESETS_V1_SENTINEL: AdmissionPresetStampV1 =
-    AdmissionPresetStampV1::sentinel(CANNED_PRESET_COUNT);
+#[distributed_slice(KTSTR_ADMISSION_PRESETS_V2)]
+static KTSTR_ADMISSION_PRESETS_V2_SENTINEL: AdmissionPresetStampV2 =
+    AdmissionPresetStampV2::sentinel(CANNED_PRESET_COUNT);
+
+#[distributed_slice(KTSTR_ADMISSION_PRESET_KEYS_V2)]
+static KTSTR_ADMISSION_PRESET_KEYS_V2_SENTINEL: AdmissionPresetKeyV2 =
+    AdmissionPresetKeyV2::sentinel();
 
 macro_rules! admission_preset {
     (
@@ -318,8 +432,8 @@ macro_rules! admission_preset {
         $llc_cores:expr, $forced_cpu_budget:expr
     ) => {
         $(#[$meta])*
-        #[distributed_slice(KTSTR_ADMISSION_PRESETS_V1)]
-        static $static_name: AdmissionPresetStampV1 = AdmissionPresetStampV1::new(
+        #[distributed_slice(KTSTR_ADMISSION_PRESETS_V2)]
+        static $static_name: AdmissionPresetStampV2 = AdmissionPresetStampV2::new(
             $name,
             Topology {
                 numa_nodes: $numa_nodes,
@@ -332,6 +446,16 @@ macro_rules! admission_preset {
             },
             $forced_cpu_budget,
         );
+
+        $(#[$meta])*
+        #[allow(non_snake_case)]
+        mod $static_name {
+            use super::*;
+
+            #[distributed_slice(KTSTR_ADMISSION_PRESET_KEYS_V2)]
+            static KEY: AdmissionPresetKeyV2 =
+                AdmissionPresetKeyV2::new($name, &super::$static_name);
+        }
     };
 }
 
@@ -685,6 +809,7 @@ pub struct AdmissionCellDescriptor {
 
 #[derive(Debug, Clone)]
 struct ParsedAdmissionTest {
+    record_base: u64,
     name: String,
     topology: AdmissionTopologyDescriptor,
     cpu_budget: Option<u32>,
@@ -697,6 +822,7 @@ struct ParsedAdmissionTest {
 
 #[derive(Debug, Clone)]
 struct ParsedAdmissionPreset {
+    record_base: u64,
     name: String,
     topology: AdmissionTopologyDescriptor,
     forced_cpu_budget: Option<u32>,
@@ -705,6 +831,22 @@ struct ParsedAdmissionPreset {
 struct AdmissionIndex {
     tests: Vec<ParsedAdmissionTest>,
     presets: Vec<ParsedAdmissionPreset>,
+}
+
+#[derive(Clone, Copy)]
+struct AdmissionKeySlot {
+    base: u64,
+    index: usize,
+    kind: u16,
+}
+
+struct AdmissionKeyTable {
+    section: &'static str,
+    expected_kind: u16,
+    name_hash_offset: usize,
+    name_len_offset: usize,
+    record_offset: usize,
+    slots: Vec<AdmissionKeySlot>,
 }
 
 fn header(
@@ -716,7 +858,7 @@ fn header(
 ) -> Result<u16, String> {
     let what = format!("{section} record {index}");
     let magic = reader.bytes_at_va(
-        base + offset_of!(AdmissionHeaderV1, magic) as u64,
+        base + offset_of!(AdmissionHeaderV2, magic) as u64,
         ADMISSION_MAGIC.len(),
         &what,
     )?;
@@ -727,7 +869,7 @@ fn header(
             magic,
         ));
     }
-    let version = reader.u16(base, offset_of!(AdmissionHeaderV1, version), &what)?;
+    let version = reader.u16(base, offset_of!(AdmissionHeaderV2, version), &what)?;
     if version != ADMISSION_VERSION {
         return Err(format!(
             "unsupported admission stamp version {version} in {} ({what}); expected version \
@@ -735,7 +877,7 @@ fn header(
             reader.source.display(),
         ));
     }
-    let encoded_size = reader.u32(base, offset_of!(AdmissionHeaderV1, record_size), &what)?;
+    let encoded_size = reader.u32(base, offset_of!(AdmissionHeaderV2, record_size), &what)?;
     if encoded_size as usize != record_size {
         return Err(format!(
             "corrupt admission stamp in {}: {what} declares record size {encoded_size}, \
@@ -743,11 +885,11 @@ fn header(
             reader.source.display(),
         ));
     }
-    reader.u16(base, offset_of!(AdmissionHeaderV1, kind), &what)
+    reader.u16(base, offset_of!(AdmissionHeaderV2, kind), &what)
 }
 
 fn string(reader: &ElfStampReader<'_>, base: u64, what: &str) -> Result<String, String> {
-    let len = reader.raw_u64(base + offset_of!(AdmissionStrV1, len) as u64, what)?;
+    let len = reader.raw_u64(base + offset_of!(AdmissionStrV2, len) as u64, what)?;
     let len = usize::try_from(len).map_err(|_| {
         format!(
             "{what} in admission ELF {} has an unrepresentable string length",
@@ -757,7 +899,7 @@ fn string(reader: &ElfStampReader<'_>, base: u64, what: &str) -> Result<String, 
     if len == 0 {
         return Ok(String::new());
     }
-    let pointer = reader.pointer(base, offset_of!(AdmissionStrV1, ptr), what)?;
+    let pointer = reader.pointer(base, offset_of!(AdmissionStrV2, ptr), what)?;
     if pointer == 0 {
         return Err(format!(
             "{what} in admission ELF {} has a null pointer for a non-empty string",
@@ -776,10 +918,10 @@ fn string(reader: &ElfStampReader<'_>, base: u64, what: &str) -> Result<String, 
 }
 
 fn optional_u32(reader: &ElfStampReader<'_>, base: u64, what: &str) -> Result<Option<u32>, String> {
-    match reader.u8(base, offset_of!(AdmissionOptionalU32V1, present), what)? {
+    match reader.u8(base, offset_of!(AdmissionOptionalU32V2, present), what)? {
         0 => Ok(None),
         1 => reader
-            .u32(base, offset_of!(AdmissionOptionalU32V1, value), what)
+            .u32(base, offset_of!(AdmissionOptionalU32V2, value), what)
             .map(Some),
         other => Err(format!(
             "{what} in admission ELF {} has invalid option tag {other}",
@@ -809,38 +951,38 @@ fn topology(
     base: u64,
     what: &str,
 ) -> Result<AdmissionTopologyDescriptor, String> {
-    let numa_nodes = reader.u32(base, offset_of!(AdmissionTopologyStampV1, numa_nodes), what)?;
-    let llcs = reader.u32(base, offset_of!(AdmissionTopologyStampV1, llcs), what)?;
+    let numa_nodes = reader.u32(base, offset_of!(AdmissionTopologyStampV2, numa_nodes), what)?;
+    let llcs = reader.u32(base, offset_of!(AdmissionTopologyStampV2, llcs), what)?;
     let cores_per_llc = reader.u32(
         base,
-        offset_of!(AdmissionTopologyStampV1, cores_per_llc),
+        offset_of!(AdmissionTopologyStampV2, cores_per_llc),
         what,
     )?;
     let threads_per_core = reader.u32(
         base,
-        offset_of!(AdmissionTopologyStampV1, threads_per_core),
+        offset_of!(AdmissionTopologyStampV2, threads_per_core),
         what,
     )?;
     let explicit_nodes = boolean(
         reader,
         base,
-        offset_of!(AdmissionTopologyStampV1, explicit_nodes),
+        offset_of!(AdmissionTopologyStampV2, explicit_nodes),
         &format!("{what}.explicit_nodes"),
     )?;
     let llc_cores_present = boolean(
         reader,
         base,
-        offset_of!(AdmissionTopologyStampV1, llc_cores_present),
+        offset_of!(AdmissionTopologyStampV2, llc_cores_present),
         &format!("{what}.llc_cores_present"),
     )?;
     let node_llcs_len = reader.u16(
         base,
-        offset_of!(AdmissionTopologyStampV1, node_llcs_len),
+        offset_of!(AdmissionTopologyStampV2, node_llcs_len),
         &format!("{what}.node_llcs_len"),
     )? as usize;
     let llc_cores_len = reader.u16(
         base,
-        offset_of!(AdmissionTopologyStampV1, llc_cores_len),
+        offset_of!(AdmissionTopologyStampV2, llc_cores_len),
         &format!("{what}.llc_cores_len"),
     )? as usize;
     if node_llcs_len > MAX_TOPOLOGY_COMPONENTS || llc_cores_len > MAX_TOPOLOGY_COMPONENTS {
@@ -875,7 +1017,7 @@ fn topology(
     let node_llcs = explicit_nodes
         .then(|| {
             read_array(
-                offset_of!(AdmissionTopologyStampV1, node_llcs),
+                offset_of!(AdmissionTopologyStampV2, node_llcs),
                 node_llcs_len,
                 "node_llcs",
             )
@@ -884,7 +1026,7 @@ fn topology(
     let llc_cores = llc_cores_present
         .then(|| {
             read_array(
-                offset_of!(AdmissionTopologyStampV1, llc_cores),
+                offset_of!(AdmissionTopologyStampV2, llc_cores),
                 llc_cores_len,
                 "llc_cores",
             )
@@ -972,13 +1114,13 @@ fn test_record(
     let performance_mode = boolean(
         reader,
         base,
-        offset_of!(AdmissionTestStampV1, performance_mode),
+        offset_of!(AdmissionTestStampV2, performance_mode),
         &format!("{what}.performance_mode"),
     )?;
     let no_perf_mode = boolean(
         reader,
         base,
-        offset_of!(AdmissionTestStampV1, no_perf_mode),
+        offset_of!(AdmissionTestStampV2, no_perf_mode),
         &format!("{what}.no_perf_mode"),
     )?;
     if performance_mode && no_perf_mode {
@@ -988,25 +1130,26 @@ fn test_record(
         ));
     }
     Ok(ParsedAdmissionTest {
+        record_base: base,
         name: string(
             reader,
-            base + offset_of!(AdmissionTestStampV1, name) as u64,
+            base + offset_of!(AdmissionTestStampV2, name) as u64,
             &format!("{what}.name"),
         )?,
         topology: topology(
             reader,
-            base + offset_of!(AdmissionTestStampV1, topology) as u64,
+            base + offset_of!(AdmissionTestStampV2, topology) as u64,
             &format!("{what}.topology"),
         )?,
         cpu_budget: optional_u32(
             reader,
-            base + offset_of!(AdmissionTestStampV1, cpu_budget) as u64,
+            base + offset_of!(AdmissionTestStampV2, cpu_budget) as u64,
             &format!("{what}.cpu_budget"),
         )?,
         host_only: boolean(
             reader,
             base,
-            offset_of!(AdmissionTestStampV1, host_only),
+            offset_of!(AdmissionTestStampV2, host_only),
             &format!("{what}.host_only"),
         )?,
         performance_mode,
@@ -1014,12 +1157,12 @@ fn test_record(
         expect_auto_repro: boolean(
             reader,
             base,
-            offset_of!(AdmissionTestStampV1, expect_auto_repro),
+            offset_of!(AdmissionTestStampV2, expect_auto_repro),
             &format!("{what}.expect_auto_repro"),
         )?,
         legacy_entry: reader.pointer(
             base,
-            offset_of!(AdmissionTestStampV1, legacy_entry),
+            offset_of!(AdmissionTestStampV2, legacy_entry),
             &format!("{what}.legacy_entry"),
         )?,
     })
@@ -1032,19 +1175,20 @@ fn preset_record(
 ) -> Result<ParsedAdmissionPreset, String> {
     let what = format!("admission preset record {index}");
     Ok(ParsedAdmissionPreset {
+        record_base: base,
         name: string(
             reader,
-            base + offset_of!(AdmissionPresetStampV1, name) as u64,
+            base + offset_of!(AdmissionPresetStampV2, name) as u64,
             &format!("{what}.name"),
         )?,
         topology: topology(
             reader,
-            base + offset_of!(AdmissionPresetStampV1, topology) as u64,
+            base + offset_of!(AdmissionPresetStampV2, topology) as u64,
             &format!("{what}.topology"),
         )?,
         forced_cpu_budget: optional_u32(
             reader,
-            base + offset_of!(AdmissionPresetStampV1, forced_cpu_budget) as u64,
+            base + offset_of!(AdmissionPresetStampV2, forced_cpu_budget) as u64,
             &format!("{what}.forced_cpu_budget"),
         )?,
     })
@@ -1097,6 +1241,216 @@ fn section_records<T>(
         )
     })?;
     Ok(Some((records, sentinel)))
+}
+
+fn key_table(
+    reader: &ElfStampReader<'_>,
+    section: &'static str,
+    expected_kind: u16,
+    record_size: usize,
+    name_hash_offset: usize,
+    name_len_offset: usize,
+    record_offset: usize,
+) -> Result<Option<AdmissionKeyTable>, String> {
+    let Some((section_va, bytes)) = reader.section(section)? else {
+        return Ok(None);
+    };
+    if bytes.is_empty() || !bytes.len().is_multiple_of(record_size) {
+        return Err(format!(
+            "corrupt admission key section {section} in {}: byte length {} is not a non-zero \
+             multiple of record size {record_size}",
+            reader.source.display(),
+            bytes.len(),
+        ));
+    }
+    let mut sentinel_count = 0usize;
+    let mut slots = Vec::with_capacity(bytes.len() / record_size);
+    for index in 0..bytes.len() / record_size {
+        let base = section_va + (index * record_size) as u64;
+        let kind = header(reader, base, record_size, section, index)?;
+        match kind {
+            ADMISSION_KIND_SENTINEL => sentinel_count += 1,
+            kind if kind == expected_kind => {}
+            kind => {
+                return Err(format!(
+                    "corrupt admission key section {section} in {}: record {index} has kind \
+                     {kind}, expected sentinel or {expected_kind}",
+                    reader.source.display(),
+                ));
+            }
+        }
+        slots.push(AdmissionKeySlot { base, index, kind });
+    }
+    if sentinel_count != 1 {
+        return Err(format!(
+            "corrupt admission key section {section} in {}: expected exactly one version \
+             sentinel, found {sentinel_count}",
+            reader.source.display(),
+        ));
+    }
+    Ok(Some(AdmissionKeyTable {
+        section,
+        expected_kind,
+        name_hash_offset,
+        name_len_offset,
+        record_offset,
+        slots,
+    }))
+}
+
+fn test_key_table(reader: &ElfStampReader<'_>) -> Result<Option<AdmissionKeyTable>, String> {
+    key_table(
+        reader,
+        TEST_KEY_SECTION,
+        ADMISSION_KIND_TEST_KEY,
+        size_of::<AdmissionTestKeyV2>(),
+        offset_of!(AdmissionTestKeyV2, name_hash),
+        offset_of!(AdmissionTestKeyV2, name_len),
+        offset_of!(AdmissionTestKeyV2, record),
+    )
+}
+
+fn preset_key_table(reader: &ElfStampReader<'_>) -> Result<Option<AdmissionKeyTable>, String> {
+    key_table(
+        reader,
+        PRESET_KEY_SECTION,
+        ADMISSION_KIND_PRESET_KEY,
+        size_of::<AdmissionPresetKeyV2>(),
+        offset_of!(AdmissionPresetKeyV2, name_hash),
+        offset_of!(AdmissionPresetKeyV2, name_len),
+        offset_of!(AdmissionPresetKeyV2, record),
+    )
+}
+
+fn key_name_hash(
+    reader: &ElfStampReader<'_>,
+    table: &AdmissionKeyTable,
+    slot: AdmissionKeySlot,
+) -> Result<u64, String> {
+    reader.raw_u64(
+        slot.base + table.name_hash_offset as u64,
+        &format!("{} record {} name hash", table.section, slot.index),
+    )
+}
+
+fn key_name_len(
+    reader: &ElfStampReader<'_>,
+    table: &AdmissionKeyTable,
+    slot: AdmissionKeySlot,
+) -> Result<u64, String> {
+    reader.raw_u64(
+        slot.base + table.name_len_offset as u64,
+        &format!("{} record {} name length", table.section, slot.index),
+    )
+}
+
+fn key_record_target(
+    reader: &ElfStampReader<'_>,
+    table: &AdmissionKeyTable,
+    slot: AdmissionKeySlot,
+) -> Result<u64, String> {
+    reader.pointer(
+        slot.base,
+        table.record_offset,
+        &format!("{} record {} target", table.section, slot.index),
+    )
+}
+
+fn matching_key_targets(
+    reader: &ElfStampReader<'_>,
+    table: &AdmissionKeyTable,
+    name: &str,
+) -> Result<Vec<u64>, String> {
+    let hash = admission_name_hash(name);
+    let len = name.len() as u64;
+    table
+        .slots
+        .iter()
+        .copied()
+        .filter(|slot| slot.kind == table.expected_kind)
+        .filter_map(|slot| {
+            let matches = (|| {
+                Ok::<_, String>(
+                    key_name_hash(reader, table, slot)? == hash
+                        && key_name_len(reader, table, slot)? == len,
+                )
+            })();
+            match matches {
+                Ok(true) => Some(key_record_target(reader, table, slot)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect()
+}
+
+fn validate_key_registry(
+    reader: &ElfStampReader<'_>,
+    table: &AdmissionKeyTable,
+    records: &BTreeMap<u64, &str>,
+) -> Result<(), String> {
+    let mut bindings = Vec::new();
+    for slot in table
+        .slots
+        .iter()
+        .copied()
+        .filter(|slot| slot.kind == table.expected_kind)
+    {
+        bindings.push((
+            slot.index,
+            key_record_target(reader, table, slot)?,
+            key_name_hash(reader, table, slot)?,
+            key_name_len(reader, table, slot)?,
+        ));
+    }
+    validate_key_bindings(reader.source, table.section, records, &bindings)
+}
+
+fn validate_key_bindings(
+    source: &Path,
+    section: &str,
+    records: &BTreeMap<u64, &str>,
+    bindings: &[(usize, u64, u64, u64)],
+) -> Result<(), String> {
+    if bindings.len() != records.len() {
+        return Err(format!(
+            "admission ELF {} has {} {} records but {key_count} compact lookup keys",
+            source.display(),
+            records.len(),
+            section,
+            key_count = bindings.len(),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for &(index, target, encoded_hash, encoded_len) in bindings {
+        let name = records.get(&target).ok_or_else(|| {
+            format!(
+                "{} record {} in admission ELF {} points to 0x{target:x}, which is not a \
+                 version-{ADMISSION_VERSION} admission record",
+                section,
+                index,
+                source.display(),
+            )
+        })?;
+        if !seen.insert(target) {
+            return Err(format!(
+                "admission ELF {} contains duplicate {} keys for record {:?}",
+                source.display(),
+                section,
+                name,
+            ));
+        }
+        if encoded_hash != admission_name_hash(name) || encoded_len != name.len() as u64 {
+            return Err(format!(
+                "{} record {} in admission ELF {} does not match its target name {:?}",
+                section,
+                index,
+                source.display(),
+                name,
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_test_registry(
@@ -1155,6 +1509,113 @@ fn validate_test_registry(
     Ok(())
 }
 
+fn read_index_from_reader(reader: &ElfStampReader<'_>) -> Result<Option<AdmissionIndex>, String> {
+    let tests = section_records(
+        reader,
+        TEST_SECTION,
+        size_of::<AdmissionTestStampV2>(),
+        ADMISSION_KIND_TEST,
+        test_record,
+    )?;
+    let presets = section_records(
+        reader,
+        PRESET_SECTION,
+        size_of::<AdmissionPresetStampV2>(),
+        ADMISSION_KIND_PRESET,
+        preset_record,
+    )?;
+    let test_keys = test_key_table(reader)?;
+    let preset_keys = preset_key_table(reader)?;
+    if tests.is_none() && presets.is_none() && test_keys.is_none() && preset_keys.is_none() {
+        if reader.section(LEGACY_TEST_SECTION)?.is_some() {
+            return Err(format!(
+                "ktstr-linked test binary {} is missing required version-{} admission stamp \
+                 and lookup sections; rebuild every selected test target",
+                reader.source.display(),
+                ADMISSION_VERSION,
+            ));
+        }
+        return Ok(None);
+    }
+    let (tests, _) = tests.ok_or_else(|| {
+        format!(
+            "admission ELF {} is missing required {TEST_SECTION}",
+            reader.source.display(),
+        )
+    })?;
+    let (presets, preset_sentinel) = presets.ok_or_else(|| {
+        format!(
+            "admission ELF {} is missing required {PRESET_SECTION}",
+            reader.source.display(),
+        )
+    })?;
+    let test_keys = test_keys.ok_or_else(|| {
+        format!(
+            "admission ELF {} is missing required {TEST_KEY_SECTION}",
+            reader.source.display(),
+        )
+    })?;
+    let preset_keys = preset_keys.ok_or_else(|| {
+        format!(
+            "admission ELF {} is missing required {PRESET_KEY_SECTION}",
+            reader.source.display(),
+        )
+    })?;
+
+    validate_test_registry(reader, &tests)?;
+    let tests = AdmissionIndex { tests, presets };
+
+    let expected = reader.u32(
+        preset_sentinel,
+        offset_of!(AdmissionPresetStampV2, sentinel_expected_count),
+        "admission preset sentinel expected count",
+    )? as usize;
+    if tests.presets.len() != expected {
+        return Err(format!(
+            "admission ELF {} contains {} preset records but its version sentinel requires \
+             {expected}",
+            reader.source.display(),
+            tests.presets.len(),
+        ));
+    }
+
+    let mut entry_names = BTreeSet::new();
+    for test in &tests.tests {
+        if test.name.is_empty() || !entry_names.insert(test.name.clone()) {
+            return Err(format!(
+                "admission ELF {} contains an empty or duplicate test-entry name {:?}",
+                reader.source.display(),
+                test.name,
+            ));
+        }
+    }
+    let mut preset_names = BTreeSet::new();
+    for preset in &tests.presets {
+        if preset.name.is_empty() || !preset_names.insert(preset.name.clone()) {
+            return Err(format!(
+                "admission ELF {} contains an empty or duplicate preset name {:?}",
+                reader.source.display(),
+                preset.name,
+            ));
+        }
+    }
+
+    let test_records = tests
+        .tests
+        .iter()
+        .map(|record| (record.record_base, record.name.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let preset_records = tests
+        .presets
+        .iter()
+        .map(|record| (record.record_base, record.name.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    validate_key_registry(reader, &test_keys, &test_records)?;
+    validate_key_registry(reader, &preset_keys, &preset_records)?;
+    Ok(Some(tests))
+}
+
+#[cfg(test)]
 fn read_index(path: &Path) -> Result<Option<AdmissionIndex>, String> {
     let file = std::fs::File::open(path).map_err(|error| {
         format!(
@@ -1171,85 +1632,11 @@ fn read_index(path: &Path) -> Result<Option<AdmissionIndex>, String> {
         )
     })?;
     let reader = ElfStampReader::new(path, &data)?;
-    let tests = section_records(
-        &reader,
-        TEST_SECTION,
-        size_of::<AdmissionTestStampV1>(),
-        ADMISSION_KIND_TEST,
-        test_record,
-    )?;
-    let presets = section_records(
-        &reader,
-        PRESET_SECTION,
-        size_of::<AdmissionPresetStampV1>(),
-        ADMISSION_KIND_PRESET,
-        preset_record,
-    )?;
-    let (tests, preset_sentinel) = match (tests, presets) {
-        (None, None) => {
-            if reader.section(LEGACY_TEST_SECTION)?.is_some() {
-                return Err(format!(
-                    "ktstr-linked test binary {} is missing required version-{} admission \
-                     stamp sections; rebuild every selected test target",
-                    path.display(),
-                    ADMISSION_VERSION,
-                ));
-            }
-            return Ok(None);
-        }
-        (Some(_), None) => {
-            return Err(format!(
-                "admission ELF {} contains {TEST_SECTION} but is missing {PRESET_SECTION}",
-                path.display(),
-            ));
-        }
-        (None, Some(_)) => {
-            return Err(format!(
-                "admission ELF {} contains {PRESET_SECTION} but is missing {TEST_SECTION}",
-                path.display(),
-            ));
-        }
-        (Some((tests, _)), Some((presets, sentinel))) => {
-            validate_test_registry(&reader, &tests)?;
-            (AdmissionIndex { tests, presets }, sentinel)
-        }
-    };
+    read_index_from_reader(&reader)
+}
 
-    let expected = reader.u32(
-        preset_sentinel,
-        offset_of!(AdmissionPresetStampV1, sentinel_expected_count),
-        "admission preset sentinel expected count",
-    )? as usize;
-    if tests.presets.len() != expected {
-        return Err(format!(
-            "admission ELF {} contains {} preset records but its version sentinel requires \
-             {expected}",
-            path.display(),
-            tests.presets.len(),
-        ));
-    }
-
-    let mut entry_names = BTreeSet::new();
-    for test in &tests.tests {
-        if test.name.is_empty() || !entry_names.insert(test.name.clone()) {
-            return Err(format!(
-                "admission ELF {} contains an empty or duplicate test-entry name {:?}",
-                path.display(),
-                test.name,
-            ));
-        }
-    }
-    let mut preset_names = BTreeSet::new();
-    for preset in &tests.presets {
-        if preset.name.is_empty() || !preset_names.insert(preset.name.clone()) {
-            return Err(format!(
-                "admission ELF {} contains an empty or duplicate preset name {:?}",
-                path.display(),
-                preset.name,
-            ));
-        }
-    }
-    Ok(Some(tests))
+pub(super) fn validate_admission_stamp_reader(reader: &ElfStampReader<'_>) -> Result<(), String> {
+    read_index_from_reader(reader).map(|_| ())
 }
 
 fn mode(test: &ParsedAdmissionTest) -> AdmissionMode {
@@ -1288,6 +1675,7 @@ fn descriptor_from_test(
     }
 }
 
+#[cfg(test)]
 fn optional_kernel_matches<'a>(
     rest: &str,
     tests: &'a [ParsedAdmissionTest],
@@ -1324,6 +1712,323 @@ fn unique_match<T>(
     }
 }
 
+struct DirectAdmissionTables {
+    tests: AdmissionKeyTable,
+    presets: AdmissionKeyTable,
+}
+
+fn validate_record_section_shape(
+    reader: &ElfStampReader<'_>,
+    section: &str,
+    record_size: usize,
+) -> Result<(), String> {
+    let (_, bytes) = reader.section(section)?.ok_or_else(|| {
+        format!(
+            "admission ELF {} is missing required {section}",
+            reader.source.display(),
+        )
+    })?;
+    if bytes.is_empty() || !bytes.len().is_multiple_of(record_size) {
+        return Err(format!(
+            "corrupt admission section {section} in {}: byte length {} is not a non-zero \
+             multiple of record size {record_size}",
+            reader.source.display(),
+            bytes.len(),
+        ));
+    }
+    Ok(())
+}
+
+fn direct_tables(reader: &ElfStampReader<'_>) -> Result<Option<DirectAdmissionTables>, String> {
+    let tests = test_key_table(reader)?;
+    let presets = preset_key_table(reader)?;
+    match (tests, presets) {
+        (None, None) => {
+            if reader.section(LEGACY_TEST_SECTION)?.is_some()
+                || reader.section(TEST_SECTION)?.is_some()
+                || reader.section(PRESET_SECTION)?.is_some()
+            {
+                return Err(format!(
+                    "ktstr-linked test binary {} is missing required version-{} compact \
+                     admission lookup sections; rebuild every selected test target",
+                    reader.source.display(),
+                    ADMISSION_VERSION,
+                ));
+            }
+            Ok(None)
+        }
+        (Some(_), None) => Err(format!(
+            "admission ELF {} contains {TEST_KEY_SECTION} but is missing {PRESET_KEY_SECTION}",
+            reader.source.display(),
+        )),
+        (None, Some(_)) => Err(format!(
+            "admission ELF {} contains {PRESET_KEY_SECTION} but is missing {TEST_KEY_SECTION}",
+            reader.source.display(),
+        )),
+        (Some(tests), Some(presets)) => {
+            validate_record_section_shape(reader, TEST_SECTION, size_of::<AdmissionTestStampV2>())?;
+            validate_record_section_shape(
+                reader,
+                PRESET_SECTION,
+                size_of::<AdmissionPresetStampV2>(),
+            )?;
+            Ok(Some(DirectAdmissionTables { tests, presets }))
+        }
+    }
+}
+
+fn target_record_index(
+    reader: &ElfStampReader<'_>,
+    section: &str,
+    record_size: usize,
+    expected_kind: u16,
+    target: u64,
+) -> Result<usize, String> {
+    let (section_va, bytes) = reader.section(section)?.ok_or_else(|| {
+        format!(
+            "admission ELF {} is missing required {section}",
+            reader.source.display(),
+        )
+    })?;
+    let relative = target.checked_sub(section_va).ok_or_else(|| {
+        format!(
+            "compact admission key in {} points before {section}",
+            reader.source.display(),
+        )
+    })?;
+    if relative % record_size as u64 != 0
+        || relative / record_size as u64 >= (bytes.len() / record_size) as u64
+    {
+        return Err(format!(
+            "compact admission key in {} points outside or between {section} records",
+            reader.source.display(),
+        ));
+    }
+    let index = usize::try_from(relative / record_size as u64).map_err(|_| {
+        format!(
+            "compact admission key record index in {} is unrepresentable",
+            reader.source.display(),
+        )
+    })?;
+    let kind = header(reader, target, record_size, section, index)?;
+    if kind != expected_kind {
+        return Err(format!(
+            "compact admission key in {} points to {section} record {index} with kind {kind}, \
+             expected {expected_kind}",
+            reader.source.display(),
+        ));
+    }
+    Ok(index)
+}
+
+fn lookup_tests(
+    reader: &ElfStampReader<'_>,
+    table: &AdmissionKeyTable,
+    name: &str,
+) -> Result<Vec<ParsedAdmissionTest>, String> {
+    let candidates = matching_key_targets(reader, table, name)?
+        .into_iter()
+        .map(|target| {
+            let index = target_record_index(
+                reader,
+                TEST_SECTION,
+                size_of::<AdmissionTestStampV2>(),
+                ADMISSION_KIND_TEST,
+                target,
+            )?;
+            test_record(reader, target, index)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(retain_exact_test_names(candidates, name))
+}
+
+fn retain_exact_test_names(
+    candidates: Vec<ParsedAdmissionTest>,
+    requested: &str,
+) -> Vec<ParsedAdmissionTest> {
+    candidates
+        .into_iter()
+        .filter(|record| record.name == requested)
+        .collect()
+}
+
+fn lookup_presets(
+    reader: &ElfStampReader<'_>,
+    table: &AdmissionKeyTable,
+    name: &str,
+) -> Result<Vec<ParsedAdmissionPreset>, String> {
+    let candidates = matching_key_targets(reader, table, name)?
+        .into_iter()
+        .map(|target| {
+            let index = target_record_index(
+                reader,
+                PRESET_SECTION,
+                size_of::<AdmissionPresetStampV2>(),
+                ADMISSION_KIND_PRESET,
+                target,
+            )?;
+            preset_record(reader, target, index)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(candidates
+        .into_iter()
+        .filter(|record| record.name == name)
+        .collect())
+}
+
+fn direct_test_match(
+    reader: &ElfStampReader<'_>,
+    table: &AdmissionKeyTable,
+    path: &Path,
+    exact_name: &str,
+    family: &str,
+    name: &str,
+    host_only: bool,
+) -> Result<ParsedAdmissionTest, String> {
+    unique_match(
+        path,
+        exact_name,
+        family,
+        lookup_tests(reader, table, name)?
+            .into_iter()
+            .filter(|test| test.host_only == host_only)
+            .collect(),
+    )
+}
+
+fn read_admission_cell_stamp_from_reader(
+    reader: &ElfStampReader<'_>,
+    path: &Path,
+    exact_name: &str,
+) -> Result<Option<AdmissionCellDescriptor>, String> {
+    let tables = direct_tables(reader)?.ok_or_else(|| {
+        format!(
+            "generated ktstr test name {exact_name:?} came from {}, which has no admission \
+             stamp sections",
+            path.display(),
+        )
+    })?;
+
+    if let Some(rest) = exact_name.strip_prefix("host/") {
+        if rest.is_empty() {
+            return Err(format!("malformed host test name {exact_name:?}"));
+        }
+        let test = direct_test_match(reader, &tables.tests, path, exact_name, "host", rest, true)?;
+        return Ok(Some(descriptor_from_test(
+            exact_name,
+            AdmissionCellKind::Host,
+            &test,
+            test.topology.clone(),
+            test.cpu_budget,
+            None,
+            None,
+        )));
+    }
+
+    if let Some(rest) = exact_name.strip_prefix("ktstr/") {
+        let mut matches = lookup_tests(reader, &tables.tests, rest)?
+            .into_iter()
+            .filter(|test| !test.host_only)
+            .map(|test| (test, None))
+            .collect::<Vec<_>>();
+        if let Some((entry_name, kernel)) = rest.rsplit_once('/')
+            && !entry_name.is_empty()
+            && !kernel.is_empty()
+        {
+            matches.extend(
+                lookup_tests(reader, &tables.tests, entry_name)?
+                    .into_iter()
+                    .filter(|test| !test.host_only)
+                    .map(|test| (test, Some(kernel.to_string()))),
+            );
+        }
+        let (test, kernel) = unique_match(path, exact_name, "ktstr", matches)?;
+        return Ok(Some(descriptor_from_test(
+            exact_name,
+            AdmissionCellKind::Ktstr,
+            &test,
+            test.topology.clone(),
+            test.cpu_budget,
+            None,
+            kernel,
+        )));
+    }
+
+    if let Some(rest) = exact_name.strip_prefix("gauntlet/") {
+        let mut forms = Vec::with_capacity(2);
+        if let Some((entry, preset)) = rest.rsplit_once('/')
+            && !entry.is_empty()
+            && !preset.is_empty()
+        {
+            forms.push((entry, preset, None));
+        }
+        if let Some((without_kernel, kernel)) = rest.rsplit_once('/')
+            && !kernel.is_empty()
+            && let Some((entry, preset)) = without_kernel.rsplit_once('/')
+            && !entry.is_empty()
+            && !preset.is_empty()
+        {
+            forms.push((entry, preset, Some(kernel.to_string())));
+        }
+        let mut matches = Vec::new();
+        for (entry_name, preset_name, kernel) in forms {
+            let tests = lookup_tests(reader, &tables.tests, entry_name)?;
+            let presets = lookup_presets(reader, &tables.presets, preset_name)?;
+            for test in tests.into_iter().filter(|test| !test.host_only) {
+                for preset in &presets {
+                    matches.push((test.clone(), preset.clone(), kernel.clone()));
+                }
+            }
+        }
+        let (test, preset, kernel) = unique_match(path, exact_name, "gauntlet", matches)?;
+        if preset.topology.llc_cores.is_some() {
+            return Err(format!(
+                "generated gauntlet test name {exact_name:?} selects verifier-only \
+                 non-uniform preset {:?}",
+                preset.name,
+            ));
+        }
+        return Ok(Some(descriptor_from_test(
+            exact_name,
+            AdmissionCellKind::Gauntlet,
+            &test,
+            preset.topology,
+            test.cpu_budget,
+            Some(preset.name),
+            kernel,
+        )));
+    }
+
+    let rest = exact_name
+        .strip_prefix("verifier/")
+        .expect("reserved family checked before opening the ELF");
+    let parts = rest.split('/').collect::<Vec<_>>();
+    if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
+        return Err(format!("malformed verifier test name {exact_name:?}"));
+    }
+    let preset = unique_match(
+        path,
+        exact_name,
+        "verifier",
+        lookup_presets(reader, &tables.presets, parts[2])?,
+    )?;
+    Ok(Some(AdmissionCellDescriptor {
+        exact_name: exact_name.to_string(),
+        kind: AdmissionCellKind::Verifier,
+        entry_name: None,
+        preset_name: Some(preset.name),
+        scheduler_name: Some(parts[0].to_string()),
+        kernel: Some(parts[1].to_string()),
+        topology: preset.topology,
+        cpu_budget: preset.forced_cpu_budget,
+        mode: AdmissionMode::NoPerf,
+        host_only: false,
+        performance_mode: false,
+        no_perf_mode: true,
+        expect_auto_repro: false,
+    }))
+}
+
 /// Resolve one exact generated libtest name directly from a final ELF.
 ///
 /// Unrelated ordinary Rust tests return `Ok(None)`.  Names in the reserved
@@ -1339,131 +2044,22 @@ pub fn read_admission_cell_stamp(
     if !matches!(family, Some("host" | "ktstr" | "gauntlet" | "verifier")) {
         return Ok(None);
     }
-    let index = read_index(path)?.ok_or_else(|| {
+    let file = std::fs::File::open(path).map_err(|error| {
         format!(
-            "generated ktstr test name {exact_name:?} came from {}, which has no admission \
-             stamp sections",
+            "open test binary {} for direct admission lookup: {error}",
             path.display(),
         )
     })?;
-
-    if let Some(rest) = exact_name.strip_prefix("host/") {
-        if rest.is_empty() {
-            return Err(format!("malformed host test name {exact_name:?}"));
-        }
-        let test = unique_match(
-            path,
-            exact_name,
-            "host",
-            index
-                .tests
-                .iter()
-                .filter(|test| test.name == rest && test.host_only)
-                .collect(),
-        )?;
-        return Ok(Some(descriptor_from_test(
-            exact_name,
-            AdmissionCellKind::Host,
-            test,
-            test.topology.clone(),
-            test.cpu_budget,
-            None,
-            None,
-        )));
-    }
-
-    if let Some(rest) = exact_name.strip_prefix("ktstr/") {
-        let (test, kernel) = unique_match(
-            path,
-            exact_name,
-            "ktstr",
-            optional_kernel_matches(rest, &index.tests)
-                .into_iter()
-                .filter(|(test, _)| !test.host_only)
-                .collect(),
-        )?;
-        return Ok(Some(descriptor_from_test(
-            exact_name,
-            AdmissionCellKind::Ktstr,
-            test,
-            test.topology.clone(),
-            test.cpu_budget,
-            None,
-            kernel,
-        )));
-    }
-
-    if let Some(rest) = exact_name.strip_prefix("gauntlet/") {
-        let mut matches = Vec::new();
-        for test in index.tests.iter().filter(|test| !test.host_only) {
-            for preset in &index.presets {
-                let base = format!("{}/{}", test.name, preset.name);
-                let kernel = if rest == base {
-                    Some(None)
-                } else {
-                    rest.strip_prefix(&format!("{base}/")).and_then(|suffix| {
-                        (!suffix.is_empty() && !suffix.contains('/'))
-                            .then(|| Some(suffix.to_string()))
-                    })
-                };
-                if let Some(kernel) = kernel {
-                    matches.push((test, preset, kernel));
-                }
-            }
-        }
-        let (test, preset, kernel) = unique_match(path, exact_name, "gauntlet", matches)?;
-        if preset.topology.llc_cores.is_some() {
-            return Err(format!(
-                "generated gauntlet test name {exact_name:?} selects verifier-only \
-                 non-uniform preset {:?}",
-                preset.name,
-            ));
-        }
-        return Ok(Some(descriptor_from_test(
-            exact_name,
-            AdmissionCellKind::Gauntlet,
-            test,
-            preset.topology.clone(),
-            // Ordinary gauntlet deliberately ignores verifier-only forced
-            // budgets and preserves the entry's admission policy.
-            test.cpu_budget,
-            Some(preset.name.clone()),
-            kernel,
-        )));
-    }
-
-    let rest = exact_name
-        .strip_prefix("verifier/")
-        .expect("reserved family checked above");
-    let parts = rest.split('/').collect::<Vec<_>>();
-    if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
-        return Err(format!("malformed verifier test name {exact_name:?}"));
-    }
-    let preset = unique_match(
-        path,
-        exact_name,
-        "verifier",
-        index
-            .presets
-            .iter()
-            .filter(|preset| preset.name == parts[2])
-            .collect(),
-    )?;
-    Ok(Some(AdmissionCellDescriptor {
-        exact_name: exact_name.to_string(),
-        kind: AdmissionCellKind::Verifier,
-        entry_name: None,
-        preset_name: Some(preset.name.clone()),
-        scheduler_name: Some(parts[0].to_string()),
-        kernel: Some(parts[1].to_string()),
-        topology: preset.topology.clone(),
-        cpu_budget: preset.forced_cpu_budget,
-        mode: AdmissionMode::NoPerf,
-        host_only: false,
-        performance_mode: false,
-        no_perf_mode: true,
-        expect_auto_repro: false,
-    }))
+    // SAFETY: the mapping is read-only, the file stays alive through reader
+    // construction, and the map owns its kernel VMA.
+    let data = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|error| {
+        format!(
+            "map test binary {} for direct admission lookup: {error}",
+            path.display(),
+        )
+    })?;
+    let reader = ElfStampReader::new(path, &data)?;
+    read_admission_cell_stamp_from_reader(&reader, path, exact_name)
 }
 
 #[cfg(test)]
@@ -1528,20 +2124,25 @@ mod tests {
     };
 
     #[test]
-    fn v1_wire_layout_is_pinned() {
-        assert_eq!(size_of::<AdmissionHeaderV1>(), 16);
-        assert_eq!(size_of::<AdmissionStrV1>(), 16);
-        assert_eq!(size_of::<AdmissionOptionalU32V1>(), 8);
-        assert_eq!(size_of::<AdmissionTopologyStampV1>(), 2064);
-        assert_eq!(size_of::<AdmissionTestStampV1>(), 2120);
-        assert_eq!(size_of::<AdmissionPresetStampV1>(), 2112);
-        assert_eq!(offset_of!(AdmissionTestStampV1, header), 0);
-        assert_eq!(offset_of!(AdmissionTestStampV1, name), 16);
-        assert_eq!(offset_of!(AdmissionTestStampV1, topology), 32);
-        assert_eq!(offset_of!(AdmissionTestStampV1, cpu_budget), 2096);
-        assert_eq!(offset_of!(AdmissionTestStampV1, legacy_entry), 2112);
-        assert_eq!(offset_of!(AdmissionPresetStampV1, topology), 32);
-        assert_eq!(offset_of!(AdmissionPresetStampV1, forced_cpu_budget), 2096);
+    fn v2_wire_layout_is_pinned() {
+        assert_eq!(size_of::<AdmissionHeaderV2>(), 16);
+        assert_eq!(size_of::<AdmissionStrV2>(), 16);
+        assert_eq!(size_of::<AdmissionOptionalU32V2>(), 8);
+        assert_eq!(size_of::<AdmissionTopologyStampV2>(), 2064);
+        assert_eq!(size_of::<AdmissionTestStampV2>(), 2120);
+        assert_eq!(size_of::<AdmissionPresetStampV2>(), 2112);
+        assert_eq!(size_of::<AdmissionTestKeyV2>(), 40);
+        assert_eq!(size_of::<AdmissionPresetKeyV2>(), 40);
+        assert_eq!(offset_of!(AdmissionTestStampV2, header), 0);
+        assert_eq!(offset_of!(AdmissionTestStampV2, name), 16);
+        assert_eq!(offset_of!(AdmissionTestStampV2, topology), 32);
+        assert_eq!(offset_of!(AdmissionTestStampV2, cpu_budget), 2096);
+        assert_eq!(offset_of!(AdmissionTestStampV2, legacy_entry), 2112);
+        assert_eq!(offset_of!(AdmissionPresetStampV2, topology), 32);
+        assert_eq!(offset_of!(AdmissionPresetStampV2, forced_cpu_budget), 2096);
+        assert_eq!(offset_of!(AdmissionTestKeyV2, name_hash), 16);
+        assert_eq!(offset_of!(AdmissionTestKeyV2, name_len), 24);
+        assert_eq!(offset_of!(AdmissionTestKeyV2, record), 32);
     }
 
     #[test]
@@ -1598,6 +2199,37 @@ mod tests {
                 .expect("unrelated name")
                 .is_none()
         );
+        let missing = read_admission_cell_stamp(&executable, "ktstr/__missing_direct_key__")
+            .expect_err("reserved-family key miss must be strict");
+        assert!(missing.contains("has no admission stamp"), "{missing}");
+    }
+
+    #[test]
+    fn compact_lookup_hash_collision_still_requires_full_name_match() {
+        let executable = std::env::current_exe().expect("locate unit-test executable");
+        let index = read_index(&executable)
+            .expect("read admission index")
+            .expect("linked admission index");
+        let prototype = index.tests.first().expect("at least one admission test");
+        let mut collision = prototype.clone();
+        collision.name = "different-name-with-the-same-synthetic-key".to_string();
+        let selected =
+            retain_exact_test_names(vec![collision, prototype.clone()], prototype.name.as_str());
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].record_base, prototype.record_base);
+    }
+
+    #[test]
+    fn compact_lookup_global_validation_rejects_duplicate_record_targets() {
+        let source = Path::new("synthetic-admission-elf");
+        let records = BTreeMap::from([(0x1000, "first"), (0x2000, "second")]);
+        let bindings = [
+            (0, 0x1000, admission_name_hash("first"), 5),
+            (1, 0x1000, admission_name_hash("first"), 5),
+        ];
+        let error = validate_key_bindings(source, TEST_KEY_SECTION, &records, &bindings)
+            .expect_err("duplicate compact key target must be rejected");
+        assert!(error.contains("duplicate"), "{error}");
     }
 
     #[test]

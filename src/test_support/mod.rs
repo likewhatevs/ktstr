@@ -57,8 +57,9 @@ mod admission_stamp;
 mod args;
 #[doc(hidden)]
 pub use admission_stamp::{
-    AdmissionCellDescriptor, AdmissionCellKind, AdmissionMode, AdmissionTestStampV1,
-    AdmissionTopologyDescriptor, KTSTR_ADMISSION_TESTS_V1, read_admission_cell_stamp,
+    AdmissionCellDescriptor, AdmissionCellKind, AdmissionMode, AdmissionTestKeyV2,
+    AdmissionTestStampV2, AdmissionTopologyDescriptor, KTSTR_ADMISSION_TEST_KEYS_V2,
+    KTSTR_ADMISSION_TESTS_V2, read_admission_cell_stamp,
 };
 // Re-exported for the workload-side CgroupChurn worker, which resolves the
 // same workload cgroup root the host-side setup uses but lives outside the
@@ -110,6 +111,34 @@ pub use scheduler_manifest_stamp::{
     SchedulerManifestStampStrV1, SchedulerManifestStampSysctlV1, SchedulerManifestTestStampV1,
     SchedulerManifestUseStampV1, read_scheduler_manifest_stamp,
 };
+
+/// Read scheduler discovery metadata and globally validate admission metadata
+/// through one ELF mapping. Cargo invokes this once per warmed binary; target
+/// runner children can then use the compact direct admission keys without
+/// rescanning unrelated full records.
+#[doc(hidden)]
+pub fn read_scheduler_manifest_and_validate_admission_stamp(
+    path: &std::path::Path,
+) -> std::result::Result<Option<SchedulerManifestProbe>, String> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        format!(
+            "open warmed test binary {} for ktstr metadata: {error}",
+            path.display(),
+        )
+    })?;
+    // SAFETY: the map is read-only, the file stays alive through construction,
+    // and the returned mapping owns its VMA.
+    let data = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|error| {
+        format!(
+            "map warmed test binary {} for ktstr metadata: {error}",
+            path.display(),
+        )
+    })?;
+    let reader = scheduler_manifest_stamp::ElfStampReader::new(path, &data)?;
+    let manifest = scheduler_manifest_stamp::read_scheduler_manifest_stamp_reader(&reader)?;
+    admission_stamp::validate_admission_stamp_reader(&reader)?;
+    Ok(manifest)
+}
 mod shell_descriptor;
 pub use shell_descriptor::{SchedulerKind, ShellTestDescriptor};
 #[cfg(feature = "wprof")]

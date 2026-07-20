@@ -314,7 +314,9 @@ pub(crate) fn probe_scheduler_manifests_from_bins(
     let result: Result<Vec<ProbedSchedulerManifest>, String> = (|| {
         let mut manifests = Vec::new();
         for bin in bins {
-            let Some(manifest) = ktstr::test_support::read_scheduler_manifest_stamp(&bin)? else {
+            let Some(manifest) =
+                ktstr::test_support::read_scheduler_manifest_and_validate_admission_stamp(&bin)?
+            else {
                 progress.item_finished(true);
                 continue;
             };
