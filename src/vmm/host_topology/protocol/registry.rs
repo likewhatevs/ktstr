@@ -22,8 +22,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ07");
-const VERSION: u32 = 7;
+const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ08");
+const VERSION: u32 = 8;
 const HEADER_FIXED: usize = 256;
 const HEADER_ALIGN: usize = 4096;
 const RECORD_FIXED: usize = 128;
@@ -32,8 +32,8 @@ const RECORDS_PER_CHUNK: usize = 64;
 const NONE_SLOT: u64 = u64::MAX;
 const MAX_RESOURCE_BITS: usize = 1 << 20;
 const MAX_REGISTRY_SLOTS: u64 = 1 << 16;
-const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v7-init-";
-const LIVENESS_PREFIX: &str = "ktstr-acquire-v7-slot-";
+const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v8-init-";
+const LIVENESS_PREFIX: &str = "ktstr-acquire-v8-slot-";
 const LIVENESS_SEPARATOR: &str = "-ticket-";
 const LIVENESS_SUFFIX: &str = ".live";
 
@@ -105,6 +105,7 @@ const STATE_WAITING: u32 = 1;
 const STATE_GRANTED: u32 = 2;
 const STATE_COORDINATOR: u32 = 3;
 const STATE_REPLAN: u32 = 4;
+const STATE_HELD: u32 = 5;
 
 const BLOCK_NONE: u32 = 0;
 const BLOCK_CPU: u32 = 1;
@@ -121,22 +122,26 @@ const B_WATCH_CPUS: usize = 4;
 const B_WATCH_CPU_EXCLUSIVE: usize = 5;
 const B_WATCH_LLCS: usize = 6;
 const B_WATCH_LLC_EXCLUSIVE: usize = 7;
-const B_CPU_KNOWN: usize = 8;
-const B_CPU_SH_AVAILABLE: usize = 9;
-const B_CPU_EX_AVAILABLE: usize = 10;
-const B_LLC_KNOWN: usize = 11;
-const B_LLC_SH_AVAILABLE: usize = 12;
-const B_LLC_EX_AVAILABLE: usize = 13;
-const B_PENDING_CPU_SH: usize = 14;
-const B_PENDING_CPU_EX: usize = 15;
-const B_PENDING_LLC_SH: usize = 16;
-const B_PENDING_LLC_EX: usize = 17;
-const B_CANDIDATE_CPU_SH: usize = 18;
-const B_CANDIDATE_CPU_EX: usize = 19;
-const B_CANDIDATE_LLC_SH: usize = 20;
-const B_CANDIDATE_LLC_EX: usize = 21;
-const HEADER_BITMAPS: usize = 22;
-const AGGREGATE_BITMAPS: usize = 8;
+const B_HELD_CPU_SHARED: usize = 8;
+const B_HELD_CPU_EXCLUSIVE: usize = 9;
+const B_HELD_LLC_SHARED: usize = 10;
+const B_HELD_LLC_EXCLUSIVE: usize = 11;
+const B_CPU_KNOWN: usize = 12;
+const B_CPU_SH_AVAILABLE: usize = 13;
+const B_CPU_EX_AVAILABLE: usize = 14;
+const B_LLC_KNOWN: usize = 15;
+const B_LLC_SH_AVAILABLE: usize = 16;
+const B_LLC_EX_AVAILABLE: usize = 17;
+const B_PENDING_CPU_SH: usize = 18;
+const B_PENDING_CPU_EX: usize = 19;
+const B_PENDING_LLC_SH: usize = 20;
+const B_PENDING_LLC_EX: usize = 21;
+const B_CANDIDATE_CPU_SH: usize = 22;
+const B_CANDIDATE_CPU_EX: usize = 23;
+const B_CANDIDATE_LLC_SH: usize = 24;
+const B_CANDIDATE_LLC_EX: usize = 25;
+const HEADER_BITMAPS: usize = 26;
+const AGGREGATE_BITMAPS: usize = 12;
 
 const S_CPU_SH: usize = 0;
 const S_CPU_EX: usize = 1;
@@ -172,6 +177,9 @@ thread_local! {
     #[cfg(test)]
     static CANCEL_COORDINATOR_AFTER_COMMIT: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    #[cfg(test)]
+    static HELD_DROP_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,9 +207,8 @@ pub(super) struct CoordinatorCommitToken {
     claim_epoch: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FinishAcquireResult {
-    Committed,
+    Committed(HeldClaim),
     Stale,
 }
 
@@ -212,9 +219,8 @@ pub(super) struct GrantAttempt<T> {
     pub contention: Option<ContentionEvidence>,
 }
 
-#[derive(Debug)]
 pub(super) enum GrantResult<T> {
-    Acquired(T),
+    Acquired(T, HeldClaim),
     Requeued,
     LostGrant,
 }
@@ -295,6 +301,11 @@ pub(super) enum FenceResult<T> {
     Ran { value: T, watched: bool },
 }
 
+pub(super) enum ExclusivePublishResult<T> {
+    Fenced,
+    Ran(Option<(T, HeldClaim)>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AggregateSnapshot {
     bits: usize,
@@ -302,6 +313,10 @@ pub(super) struct AggregateSnapshot {
     cpu_exclusive: Vec<u64>,
     llc_any: Vec<u64>,
     llc_exclusive: Vec<u64>,
+    cpu_shared_holders: Vec<u32>,
+    cpu_exclusive_holders: Vec<u32>,
+    llc_shared_holders: Vec<u32>,
+    llc_exclusive_holders: Vec<u32>,
 }
 
 impl AggregateSnapshot {
@@ -312,6 +327,10 @@ impl AggregateSnapshot {
             cpu_exclusive: vec![0; layout.words],
             llc_any: vec![0; layout.words],
             llc_exclusive: vec![0; layout.words],
+            cpu_shared_holders: vec![0; layout.bits],
+            cpu_exclusive_holders: vec![0; layout.bits],
+            llc_shared_holders: vec![0; layout.bits],
+            llc_exclusive_holders: vec![0; layout.bits],
         }
     }
 
@@ -325,6 +344,35 @@ impl AggregateSnapshot {
             &self.llc_exclusive,
             self.bits,
         )
+    }
+
+    pub(super) fn cpu_holder_count(&self, cpu: usize) -> Result<usize> {
+        self.ensure_index(cpu, "CPU")?;
+        Ok((self.cpu_shared_holders[cpu] as usize)
+            .saturating_add(self.cpu_exclusive_holders[cpu] as usize))
+    }
+
+    pub(super) fn cpu_exclusive_held(&self, cpu: usize) -> Result<bool> {
+        self.ensure_index(cpu, "CPU")?;
+        Ok(self.cpu_exclusive_holders[cpu] != 0)
+    }
+
+    pub(super) fn llc_holder_count(&self, llc: usize) -> Result<usize> {
+        self.ensure_index(llc, "LLC")?;
+        Ok((self.llc_shared_holders[llc] as usize)
+            .saturating_add(self.llc_exclusive_holders[llc] as usize))
+    }
+
+    pub(super) fn llc_exclusive_held(&self, llc: usize) -> Result<bool> {
+        self.ensure_index(llc, "LLC")?;
+        Ok(self.llc_exclusive_holders[llc] != 0)
+    }
+
+    fn ensure_index(&self, index: usize, kind: &str) -> Result<()> {
+        if index >= self.bits {
+            anyhow::bail!("{kind} index {index} exceeds queue registry capacity");
+        }
+        Ok(())
     }
 }
 
@@ -398,6 +446,96 @@ pub(super) struct Ticket {
     wake: Option<FutexSlot>,
     _interrupt_waiter: Option<InterruptibleFlockWaiter>,
     finished: bool,
+}
+
+/// One registry-owned publication of a live physical reservation.
+///
+/// The caller keeps this behind the physical flock set in an outer RAII
+/// owner. Its liveness fd lets another process prune the record after a crash;
+/// normal teardown removes the exact record synchronously.
+pub(super) struct HeldClaim {
+    slot: u64,
+    ticket: u64,
+    liveness_path: PathBuf,
+    liveness: Option<OwnedFd>,
+}
+
+impl HeldClaim {
+    fn from_ticket(ticket: &mut Ticket) -> Result<Self> {
+        let liveness = ticket
+            .liveness
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("queue ticket liveness fd disappeared at commit"))?;
+        ticket.wake.take();
+        ticket._interrupt_waiter.take();
+        ticket.finished = true;
+        Ok(Self {
+            slot: ticket.slot,
+            ticket: ticket.ticket,
+            liveness_path: ticket.liveness_path.clone(),
+            liveness: Some(liveness),
+        })
+    }
+
+    fn remove_record(&mut self) -> Result<()> {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.repair_consistency_if_needed()?;
+        if let Some(record) = table
+            .record(self.slot)?
+            .filter(|record| record.ticket == self.ticket)
+        {
+            table.remove_record(&record, false)?;
+            table.bump_generation()?;
+        }
+        drop(table);
+        drop(_lock);
+        notify_coordinator();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn abandon_for_tests(mut self) {
+        // Model abrupt process death: close the authoritative liveness flock
+        // without running normal record cleanup or unlinking its inode.
+        self.liveness.take();
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for HeldClaim {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(hook) = HELD_DROP_HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+        if let Err(error) = self.remove_record() {
+            tracing::warn!(
+                ticket = self.ticket,
+                %error,
+                "failed to remove held reservation; liveness cleanup will prune it"
+            );
+        }
+        self.liveness.take();
+        let _ = std::fs::remove_file(&self.liveness_path);
+        notify_coordinator();
+    }
+}
+
+#[cfg(test)]
+pub(super) fn set_held_drop_hook_for_tests(hook: impl FnOnce() + 'static) {
+    HELD_DROP_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "a HELD drop hook is already installed on this test thread"
+        );
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+pub(super) fn abandon_held_for_tests(held: HeldClaim) {
+    held.abandon_for_tests();
 }
 
 struct FutexSlot {
@@ -938,23 +1076,17 @@ impl Ticket {
                 self.ticket
             );
             crash_at_for_tests("granted_acquired_before_clear");
-            // Unmap the per-slot futex before making the slot recyclable.
-            self.wake.take();
-            // The real resource flocks in `acquired` are already held. Remove
-            // the published exact claim under the same EX fence, so a
-            // conflicting fast path observes either the claim or those flocks,
-            // never a check-to-acquire gap between them.
-            table.remove_record(&record, true)?;
-            table.bump_generation()?;
-            self._interrupt_waiter.take();
-            self.finished = true;
-            self.liveness.take();
+            // The physical resource flocks in `acquired` are already held.
+            // Convert this exact queue claim into a live HELD publication
+            // before exposing success, preserving one uninterrupted registry
+            // fence across the state transition.
+            table.promote_record_to_held(&record, &designated, &[])?;
+            let held = HeldClaim::from_ticket(self)?;
             drop(table);
             drop(lock);
-            let _ = std::fs::remove_file(&self.liveness_path);
             notify_coordinator();
             cancel_granted_commit_for_tests(cancelled);
-            return Ok(GrantResult::Acquired(acquired));
+            return Ok(GrantResult::Acquired(acquired, held));
         }
 
         validate_claim(&result.next_claim)?;
@@ -1197,6 +1329,10 @@ impl Ticket {
             cpu_exclusive: record_words(RB_PREFIX_CPU_EXCLUSIVE),
             llc_any: record_words(RB_PREFIX_LLC_ANY),
             llc_exclusive: record_words(RB_PREFIX_LLC_EXCLUSIVE),
+            cpu_shared_holders: vec![0; layout.bits],
+            cpu_exclusive_holders: vec![0; layout.bits],
+            llc_shared_holders: vec![0; layout.bits],
+            llc_exclusive_holders: vec![0; layout.bits],
         };
         let header_words = |which| {
             (0..layout.words)
@@ -1357,7 +1493,7 @@ impl Ticket {
         cancelled: Option<&AtomicBool>,
     ) -> Result<FinishAcquireResult> {
         if self.finished {
-            return Ok(FinishAcquireResult::Committed);
+            anyhow::bail!("coordinator ticket was already committed");
         }
         validate_claim(exact)?;
         let _lock = lock_registry_interruptible_existing(cancelled)?;
@@ -1396,36 +1532,17 @@ impl Ticket {
             }
             return Ok(FinishAcquireResult::Stale);
         }
-        // A slot cannot be recycled while this process still maps its futex.
-        // Keep that mapping live until every stale-success check above has
-        // passed, because a stale physical fd set is retried by this ticket.
-        self.wake.take();
-        let claim_unchanged = &record.claim == exact;
-        table.begin_transaction()?;
-        table.publish_claim_busy(exact)?;
-        table.mark_blockers_unknown(contention)?;
-        table.remove_record_in_transaction(&record, true)?;
-        if !claim_unchanged {
-            // Any alternative change invalidates later grants: omitted
-            // resources may become runnable, while added resources have
-            // become authoritatively busy under the committed real flocks.
-            table.mark_claim_changed(record.ticket)?;
-        }
-        table.elect_coordinator_in_transaction()?;
-        if !claim_unchanged {
-            table.set_pending_flag(PENDING_RESCAN);
-        }
-        table.bump_generation()?;
-        table.finish_transaction();
-        self._interrupt_waiter.take();
-        self.finished = true;
-        self.liveness.take();
+        // Keep the per-slot futex mapping live until every stale-success check
+        // above has passed. The real fds are already held; convert the
+        // coordinator record into a crash-recoverable HELD publication before
+        // returning them.
+        table.promote_record_to_held(&record, exact, contention)?;
+        let held = HeldClaim::from_ticket(self)?;
         drop(table);
         drop(_lock);
-        let _ = std::fs::remove_file(&self.liveness_path);
         notify_coordinator();
         cancel_coordinator_commit_for_tests(cancelled);
-        Ok(FinishAcquireResult::Committed)
+        Ok(FinishAcquireResult::Committed(held))
     }
 
     #[cfg(test)]
@@ -1491,42 +1608,29 @@ pub(super) fn aggregate_conflicts(candidate: &ClaimSet) -> Result<bool> {
     ))
 }
 
+#[cfg(test)]
+pub(super) fn shared_probe_is_blocked_for_tests() -> Result<bool> {
+    Ok(try_lock_registry_existing_nonblocking(FlockMode::Shared)?.is_none())
+}
+
 pub(super) fn aggregate_snapshot(required: &ClaimSet) -> Result<AggregateSnapshot> {
     validate_claim(required)?;
     let required_layout = HeaderLayout::new(required_resource_bits(required))
         .context("aggregate snapshot exceeds admission registry capacity")?;
     loop {
         let Some(shared) = try_lock_registry_existing(FlockMode::Shared)? else {
-            return Ok(AggregateSnapshot {
-                bits: required_layout.bits,
-                cpu_any: vec![0; required_layout.words],
-                cpu_exclusive: vec![0; required_layout.words],
-                llc_any: vec![0; required_layout.words],
-                llc_exclusive: vec![0; required_layout.words],
-            });
+            return Ok(AggregateSnapshot::empty(required_layout));
         };
         let path = header_path();
         let file = match File::open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(AggregateSnapshot {
-                    bits: required_layout.bits,
-                    cpu_any: vec![0; required_layout.words],
-                    cpu_exclusive: vec![0; required_layout.words],
-                    llc_any: vec![0; required_layout.words],
-                    llc_exclusive: vec![0; required_layout.words],
-                });
+                return Ok(AggregateSnapshot::empty(required_layout));
             }
             Err(error) => return Err(error).with_context(|| format!("open {}", path.display())),
         };
         if file.metadata()?.len() == 0 {
-            return Ok(AggregateSnapshot {
-                bits: required_layout.bits,
-                cpu_any: vec![0; required_layout.words],
-                cpu_exclusive: vec![0; required_layout.words],
-                llc_any: vec![0; required_layout.words],
-                llc_exclusive: vec![0; required_layout.words],
-            });
+            return Ok(AggregateSnapshot::empty(required_layout));
         }
         let map = unsafe { Mmap::map(&file) }
             .with_context(|| format!("map queue aggregate {}", path.display()))?;
@@ -1540,13 +1644,7 @@ pub(super) fn aggregate_snapshot(required: &ClaimSet) -> Result<AggregateSnapsho
                 // registry, not authority for an observer to choose the
                 // process-wide resource width. Keep SH through this read and
                 // leave replacement to the first ticket registrant under EX.
-                return Ok(AggregateSnapshot {
-                    bits: required_layout.bits,
-                    cpu_any: vec![0; required_layout.words],
-                    cpu_exclusive: vec![0; required_layout.words],
-                    llc_any: vec![0; required_layout.words],
-                    llc_exclusive: vec![0; required_layout.words],
-                });
+                return Ok(AggregateSnapshot::empty(required_layout));
             }
             Err(error) => return Err(error),
         };
@@ -1571,12 +1669,21 @@ pub(super) fn aggregate_snapshot(required: &ClaimSet) -> Result<AggregateSnapsho
                 .map(|word| read_u64(&map, layout.bitset_offset(which) + word * 8))
                 .collect()
         };
+        let read_counts = |which| {
+            (0..layout.bits)
+                .map(|index| read_u32(&map, layout.count_offset(which) + index * 4))
+                .collect()
+        };
         let snapshot = AggregateSnapshot {
             bits: layout.bits,
             cpu_any: read_words(B_CLAIM_CPUS),
             cpu_exclusive: read_words(B_CLAIM_CPU_EXCLUSIVE),
             llc_any: read_words(B_CLAIM_LLC_ANY),
             llc_exclusive: read_words(B_CLAIM_LLC_EXCLUSIVE),
+            cpu_shared_holders: read_counts(B_HELD_CPU_SHARED),
+            cpu_exclusive_holders: read_counts(B_HELD_CPU_EXCLUSIVE),
+            llc_shared_holders: read_counts(B_HELD_LLC_SHARED),
+            llc_exclusive_holders: read_counts(B_HELD_LLC_EXCLUSIVE),
         };
         // The common disjoint snapshot is a pure SH/read-only operation. Only
         // a claim that is actually fenced needs any liveness work.
@@ -1899,6 +2006,45 @@ pub(super) fn with_aggregate_fence<T>(
         };
         return Ok(FenceResult::Ran { value, watched });
     }
+}
+
+/// Run one nonblocking physical EX→SH conversion while holding the registry's
+/// exclusive fence, then publish the weaker lifetime claim before releasing
+/// that fence.
+///
+/// Ordinary fast probes retain the scalable shared fence. Only conversions
+/// whose old physical lock is momentarily released by `flock(LOCK_SH)` use
+/// this short EX section, preventing another current-version fast probe from
+/// entering the conversion window.
+pub(super) fn with_exclusive_conversion_fence<T>(
+    probe: &ClaimSet,
+    published: &ClaimSet,
+    cancelled: Option<&AtomicBool>,
+    run: impl FnOnce() -> Result<Option<T>>,
+) -> Result<ExclusivePublishResult<T>> {
+    validate_claim(probe)?;
+    validate_claim(published)?;
+    anyhow::ensure!(
+        probe.cpus == published.cpus && probe.llcs == published.llcs,
+        "conversion probe and lifetime publication must name identical resources"
+    );
+    validate_claim_within_watch(published, probe)?;
+    materialize_claim_paths(probe)?;
+    let _lock = lock_registry_interruptible(cancelled)?;
+    let mut table = Table::open(required_resource_bits(probe))?;
+    table.repair_consistency_if_needed()?;
+    table.recover_coordinator_if_dead()?;
+    if table.claim_conflicts_aggregate(probe)? {
+        return Ok(ExclusivePublishResult::Fenced);
+    }
+    let Some(value) = run()? else {
+        return Ok(ExclusivePublishResult::Ran(None));
+    };
+    let held = publish_acquired_in_table(&mut table, published)?;
+    drop(table);
+    drop(_lock);
+    notify_coordinator();
+    Ok(ExclusivePublishResult::Ran(Some((value, held))))
 }
 
 #[cfg(test)]
@@ -2706,7 +2852,7 @@ pub(super) fn exercise_exact_commit_scan_elision_for_tests(commits: usize) -> Re
                 })
             },
         )?;
-        if !matches!(result, GrantResult::Acquired(())) {
+        if !matches!(result, GrantResult::Acquired((), _)) {
             anyhow::bail!("exact-commit waiter did not commit its prepared acquisition");
         }
         coordinator.schedule(
@@ -3345,7 +3491,7 @@ pub(super) fn exercise_prefix_refresh_after_predecessor_release_for_tests()
             })
         },
     )?;
-    if !matches!(acquired, GrantResult::Acquired(())) {
+    if !matches!(acquired, GrantResult::Acquired((), _)) {
         anyhow::bail!("release-prefix predecessor did not commit acquisition");
     }
 
@@ -3775,7 +3921,7 @@ fn required_resource_bits(claim: &ClaimSet) -> usize {
         .max()
         .unwrap_or(0)
         .saturating_add(1);
-    // The v7 mapping is deliberately overprovisioned once. It never needs a
+    // The v8 mapping is deliberately overprovisioned once. It never needs a
     // migration/grow protocol when the first low-index ticket is followed by a
     // valid sparse CPU/LLC index on the same host.
     claim_bits.max(host_cpu_resource_bits()).max(4096)
@@ -3816,11 +3962,11 @@ fn notify_path() -> PathBuf {
 }
 
 fn registry_data_dir() -> PathBuf {
-    protocol_dir().join("ktstr-acquire-registry-v7")
+    protocol_dir().join("ktstr-acquire-registry-v8")
 }
 
 pub(super) fn event_dir() -> PathBuf {
-    protocol_dir().join("ktstr-acquire-events-v7")
+    protocol_dir().join("ktstr-acquire-events-v8")
 }
 
 pub(super) fn notify_basename() -> Result<std::ffi::OsString> {
@@ -3973,48 +4119,60 @@ fn notify_coordinator() {
     }
 }
 
-pub(super) fn publish_acquired(claim: &ClaimSet) -> Result<()> {
+pub(super) fn publish_acquired(claim: &ClaimSet) -> Result<HeldClaim> {
     validate_claim(claim)?;
-    let Some(shared) = try_lock_registry_existing(FlockMode::Shared)? else {
-        return Ok(());
-    };
-    let path = header_path();
-    let file = match File::open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).with_context(|| format!("open {}", path.display())),
-    };
-    if file.metadata()?.len() == 0 {
-        return Ok(());
-    }
-    let map = unsafe { Mmap::map(&file) }
-        .with_context(|| format!("map queue aggregate {}", path.display()))?;
-    let layout = HeaderLayout::validate(&map)?;
-    let dirty = atomic_u64(&map, H_AGGREGATE_DIRTY).load(Ordering::SeqCst) != 0;
-    let watched = claim_intersects_watch_map(&map, layout, claim)?;
-    if !dirty && !watched {
-        return Ok(());
-    }
-    drop(map);
-    drop(file);
-    drop(shared);
-
-    let Some(_lock) = try_lock_registry_existing(FlockMode::Exclusive)? else {
-        return Ok(());
-    };
-    let mut table = Table::open_existing()?;
+    materialize_claim_paths(claim)?;
+    let _lock = lock_registry_interruptible(None)?;
+    let required_bits = required_resource_bits(claim);
+    let mut table = Table::open(required_bits)?;
     table.repair_consistency_if_needed()?;
-    let watched = table.watched_intersection(claim)?;
-    if watched.is_empty() {
-        return Ok(());
-    }
-    table.begin_transaction()?;
-    table.publish_claim_busy(&watched)?;
-    table.finish_transaction();
+    table.recover_coordinator_if_dead()?;
+    let held = publish_acquired_in_table(&mut table, claim)?;
     drop(table);
     drop(_lock);
     notify_coordinator();
-    Ok(())
+    Ok(held)
+}
+
+fn publish_acquired_in_table(table: &mut Table, claim: &ClaimSet) -> Result<HeldClaim> {
+    table.begin_transaction()?;
+
+    let ticket = table.next_ticket()?;
+    let slot = table.allocate_slot()?;
+    let liveness_path = liveness_path(slot, ticket);
+    let liveness = try_flock(&liveness_path, FlockMode::Exclusive)?
+        .ok_or_else(|| anyhow::anyhow!("fresh held-claim liveness file is already locked"))?;
+    let claim_epoch = table.claim_epoch();
+    let predecessors = table.aggregate_claim_snapshot();
+    table.initialize_record(
+        slot,
+        ticket,
+        std::process::id(),
+        claim,
+        &ClaimSet::default(),
+        STATE_HELD,
+        &predecessors,
+        claim_epoch,
+        0,
+    )?;
+    table.append_active(slot)?;
+    table.adjust_claim_counts(claim, true)?;
+    table.adjust_held_counts(claim, true)?;
+    table.publish_claim_busy(claim)?;
+    table.set_next_ticket(
+        ticket
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("queue ticket id overflow"))?,
+    );
+    table.mark_claim_changed(ticket)?;
+    table.bump_generation()?;
+    table.finish_transaction();
+    Ok(HeldClaim {
+        slot,
+        ticket,
+        liveness_path,
+        liveness: Some(liveness),
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -4638,7 +4796,7 @@ impl Table {
         }
         if !matches!(
             state,
-            STATE_WAITING | STATE_GRANTED | STATE_REPLAN | STATE_COORDINATOR
+            STATE_WAITING | STATE_GRANTED | STATE_REPLAN | STATE_COORDINATOR | STATE_HELD
         ) {
             anyhow::bail!("queue registry v{VERSION} slot {slot} has invalid state {state}");
         }
@@ -4718,6 +4876,10 @@ impl Table {
             cpu_exclusive: self.header_words(B_CLAIM_CPU_EXCLUSIVE),
             llc_any: self.header_words(B_CLAIM_LLC_ANY),
             llc_exclusive: self.header_words(B_CLAIM_LLC_EXCLUSIVE),
+            cpu_shared_holders: self.header_counts(B_HELD_CPU_SHARED),
+            cpu_exclusive_holders: self.header_counts(B_HELD_CPU_EXCLUSIVE),
+            llc_shared_holders: self.header_counts(B_HELD_LLC_SHARED),
+            llc_exclusive_holders: self.header_counts(B_HELD_LLC_EXCLUSIVE),
         }
     }
 
@@ -4739,6 +4901,17 @@ impl Table {
                 read_u64(
                     &self.header,
                     self.layout.bitset_offset(which) + word * std::mem::size_of::<u64>(),
+                )
+            })
+            .collect()
+    }
+
+    fn header_counts(&self, which: usize) -> Vec<u32> {
+        (0..self.layout.bits)
+            .map(|index| {
+                read_u32(
+                    &self.header,
+                    self.layout.count_offset(which) + index * std::mem::size_of::<u32>(),
                 )
             })
             .collect()
@@ -4771,6 +4944,10 @@ impl Table {
                 cpu_exclusive: read_words(RB_PREFIX_CPU_EXCLUSIVE),
                 llc_any: read_words(RB_PREFIX_LLC_ANY),
                 llc_exclusive: read_words(RB_PREFIX_LLC_EXCLUSIVE),
+                cpu_shared_holders: vec![0; layout.bits],
+                cpu_exclusive_holders: vec![0; layout.bits],
+                llc_shared_holders: vec![0; layout.bits],
+                llc_exclusive_holders: vec![0; layout.bits],
             },
         ))
     }
@@ -4935,6 +5112,63 @@ impl Table {
         Ok(())
     }
 
+    fn promote_record_to_held(
+        &mut self,
+        record: &Record,
+        exact: &ClaimSet,
+        contention: &[ContentionMarker],
+    ) -> Result<()> {
+        validate_claim(exact)?;
+        self.begin_transaction()?;
+        self.mark_blockers_unknown(contention)?;
+        let claim_changed = record.claim != *exact;
+        if claim_changed {
+            self.adjust_claim_counts(&record.claim, false)?;
+            self.adjust_claim_counts(exact, true)?;
+        }
+        self.adjust_watch_counts(&record.watch, false)?;
+        self.adjust_held_counts(exact, true)?;
+        self.publish_claim_busy(exact)?;
+        crash_at_for_tests("held_counts_before_record");
+        let layout = self.layout;
+        {
+            let bytes = self
+                .record_bytes_mut(record.slot)?
+                .ok_or_else(|| anyhow::anyhow!("queue slot {} disappeared", record.slot))?;
+            if claim_changed {
+                clear_record_claim_bits(bytes, layout);
+                write_u32(
+                    bytes,
+                    R_CLAIM_LLC_MODE,
+                    u32::from(exact.llc_mode == ClaimMode::Exclusive),
+                );
+                write_u32(
+                    bytes,
+                    R_CLAIM_CPU_MODE,
+                    u32::from(exact.cpu_mode == ClaimMode::Exclusive),
+                );
+                encode_exact_claim(bytes, layout, exact)?;
+            }
+            clear_record_watch_bits(bytes, layout);
+            write_u64(bytes, R_BLOCKED_SERIAL, 0);
+            write_u32(bytes, R_BLOCK_KIND, BLOCK_NONE);
+            write_u32(bytes, R_BLOCK_MODE, 0);
+            write_u64(bytes, R_BLOCK_INDEX, 0);
+            write_u32(bytes, R_STATE, STATE_HELD);
+        }
+        if claim_changed {
+            self.mark_claim_changed(record.ticket)?;
+            self.set_pending_flag(PENDING_RESCAN);
+        }
+        if self.coordinator_ticket() == record.ticket {
+            self.set_coordinator(0, NONE_SLOT)?;
+            self.elect_coordinator_in_transaction()?;
+        }
+        self.bump_generation()?;
+        self.finish_transaction();
+        Ok(())
+    }
+
     fn remove_record(&mut self, record: &Record, acquired: bool) -> Result<()> {
         let removed_coordinator = self.coordinator_ticket() == record.ticket;
         self.begin_transaction()?;
@@ -4957,13 +5191,20 @@ impl Table {
     }
 
     fn remove_record_in_transaction(&mut self, record: &Record, acquired: bool) -> Result<()> {
-        if !acquired && record.state == STATE_GRANTED {
+        if !acquired && matches!(record.state, STATE_GRANTED | STATE_HELD) {
             // A granted callback probes without EX and may die while
-            // holding its exact fds, before committing acquired removal.
+            // holding its exact fds, before committing acquired publication.
+            // A HELD owner is pruned only after its physical fds have closed
+            // (normal RAII teardown or process death), so both states may
+            // represent a genuine compatibility improvement.
             self.mark_possible_release(&record.claim.cpus, &record.claim.llcs)?;
         }
         self.adjust_claim_counts(&record.claim, false)?;
-        self.adjust_watch_counts(&record.watch, false)?;
+        if record.state == STATE_HELD {
+            self.adjust_held_counts(&record.claim, false)?;
+        } else {
+            self.adjust_watch_counts(&record.watch, false)?;
+        }
         crash_at_for_tests("remove_counts_before_free");
         if self.coordinator_ticket() == record.ticket {
             self.set_coordinator(0, NONE_SLOT)?;
@@ -5129,6 +5370,7 @@ impl Table {
                 || match record.state {
                     STATE_GRANTED => record.prefix_epoch != record.grant_epoch,
                     STATE_REPLAN => record.prefix_epoch != record.replan_claim_epoch,
+                    STATE_HELD => false,
                     // WAITING may have returned from either kind of callback.
                     // Its predecessor prefix remains valid because replacing
                     // this ticket's own exact claim cannot alter its prefix.
@@ -6021,6 +6263,24 @@ impl Table {
         Ok(())
     }
 
+    fn adjust_held_counts(&mut self, claim: &ClaimSet, add: bool) -> Result<()> {
+        let cpu_which = match claim.cpu_mode {
+            ClaimMode::Shared => B_HELD_CPU_SHARED,
+            ClaimMode::Exclusive => B_HELD_CPU_EXCLUSIVE,
+        };
+        for &cpu in &claim.cpus {
+            self.adjust_aggregate_bit(cpu_which, cpu, add)?;
+        }
+        let llc_which = match claim.llc_mode {
+            ClaimMode::Shared => B_HELD_LLC_SHARED,
+            ClaimMode::Exclusive => B_HELD_LLC_EXCLUSIVE,
+        };
+        for &llc in &claim.llcs {
+            self.adjust_aggregate_bit(llc_which, llc, add)?;
+        }
+        Ok(())
+    }
+
     fn adjust_watch_counts(&mut self, watch: &ClaimSet, add: bool) -> Result<()> {
         for &cpu in &watch.cpus {
             self.adjust_aggregate_bit(B_WATCH_CPUS, cpu, add)?;
@@ -6111,6 +6371,7 @@ impl Table {
         Ok(ClaimSet::with_claim_modes(llcs, cpus, llc_mode, cpu_mode))
     }
 
+    #[allow(dead_code)]
     fn watched_intersection(&self, claim: &ClaimSet) -> Result<ClaimSet> {
         let mut cpus = BTreeSet::new();
         let mut llcs = BTreeSet::new();
@@ -6238,7 +6499,11 @@ impl Table {
         write_u64(&mut self.header, H_PENDING_FLAGS, PENDING_RESCAN);
         for record in &records {
             self.adjust_claim_counts(&record.claim, true)?;
-            self.adjust_watch_counts(&record.watch, true)?;
+            if record.state == STATE_HELD {
+                self.adjust_held_counts(&record.claim, true)?;
+            } else {
+                self.adjust_watch_counts(&record.watch, true)?;
+            }
         }
         records.sort_by_key(|record| record.ticket);
         write_u64(
@@ -6275,8 +6540,13 @@ impl Table {
         let previous = self.coordinator_ticket();
         let coordinator = records
             .iter()
-            .find(|record| record.ticket == previous)
-            .or_else(|| records.iter().min_by_key(|record| record.ticket));
+            .find(|record| record.ticket == previous && record.state != STATE_HELD)
+            .or_else(|| {
+                records
+                    .iter()
+                    .filter(|record| record.state != STATE_HELD)
+                    .min_by_key(|record| record.ticket)
+            });
         let (coordinator, coordinator_slot) = coordinator
             .map(|record| (record.ticket, record.slot))
             .unwrap_or((0, NONE_SLOT));
@@ -6285,6 +6555,19 @@ impl Table {
         let mut prefix = AggregateSnapshot::empty(self.layout);
         let prefix_bits = prefix.bits;
         for record in &records {
+            if record.state == STATE_HELD {
+                self.set_record_state(record.slot, STATE_HELD)?;
+                self.clear_record_blocked(record.slot)?;
+                add_claim_bits(
+                    &record.claim,
+                    &mut prefix.cpu_any,
+                    &mut prefix.cpu_exclusive,
+                    &mut prefix.llc_any,
+                    &mut prefix.llc_exclusive,
+                    prefix_bits,
+                )?;
+                continue;
+            }
             let issue_serial = self.max_watch_serial(&record.watch)?;
             let state = if record.ticket == coordinator {
                 STATE_COORDINATOR
@@ -6549,7 +6832,7 @@ fn shared_live_inflight_head(header: &[u8], layout: HeaderLayout, next_slot: u64
     }
     let bytes = &map[range];
     let state = read_u32(bytes, R_STATE);
-    if !matches!(state, STATE_GRANTED | STATE_REPLAN) {
+    if !matches!(state, STATE_GRANTED | STATE_REPLAN | STATE_HELD) {
         return Ok(false);
     }
     let ticket = read_u64(bytes, R_TICKET);
@@ -6688,6 +6971,12 @@ fn clear_record_claim_bits(bytes: &mut [u8], layout: HeaderLayout) {
     bytes[start..end].fill(0);
 }
 
+fn clear_record_watch_bits(bytes: &mut [u8], layout: HeaderLayout) {
+    let start = record_bitset_offset(layout, RB_WATCH_CPUS);
+    let end = record_bitset_offset(layout, RB_PREFIX_CPU_ANY);
+    bytes[start..end].fill(0);
+}
+
 fn record_bitset_offset(layout: HeaderLayout, which: usize) -> usize {
     debug_assert!(which < RECORD_BITMAPS);
     R_BITS + which * layout.words * std::mem::size_of::<u64>()
@@ -6797,6 +7086,10 @@ fn aggregate_from_words(
         cpu_exclusive: cpu_exclusive.to_vec(),
         llc_any: llc_any.to_vec(),
         llc_exclusive: llc_exclusive.to_vec(),
+        cpu_shared_holders: vec![0; bits],
+        cpu_exclusive_holders: vec![0; bits],
+        llc_shared_holders: vec![0; bits],
+        llc_exclusive_holders: vec![0; bits],
     }
 }
 

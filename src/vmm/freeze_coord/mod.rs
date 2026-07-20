@@ -4234,18 +4234,14 @@ impl KtstrVm {
         &self,
         run_start: Instant,
         mut vm: kvm::KtstrKvm,
-        default_cpu_mask: Option<&[usize]>,
         effective_pinning_plan: Option<&super::host_topology::PinningPlan>,
-        // Refreshed no-perf CPU list from `acquire_run_locks`' run-time
-        // replan. `Some` only on the no-perf path; used in preference to
-        // any build-time shape for every affinity mask below (vCPU-thread
-        // mask, BSP mask, virtio-blk worker placement) so those masks match
-        // the LLCs the run-scoped flocks hold. `None` leaves only the separate
-        // default-overcommit mask available.
-        effective_no_perf_cpus: Option<&[usize]>,
+        // Authoritative shared CPU list from run-time admission. Both explicit
+        // no-perf mode and default fallback use it for every affinity consumer
+        // so masks match the LLC-SH/CPU-SH locks held by this invocation.
+        shared_cpu_mask: Option<&[usize]>,
     ) -> Result<VmRunState> {
         let effective_placement =
-            super::EffectiveRunPlacement::new(effective_pinning_plan, effective_no_perf_cpus);
+            super::EffectiveRunPlacement::new(effective_pinning_plan, shared_cpu_mask);
         let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
         let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
         // Userspace IOAPIC handle for the split-irqchip path: the device + the
@@ -4694,14 +4690,9 @@ impl KtstrVm {
             vec![None; vcpus.len()]
         };
 
-        // No-perf + --cpu-cap: flat CPU list from the LLC plan gets
-        // sched_setaffinity'd on every vCPU thread as a mask (not a
-        // hard pin). Mutually exclusive with perf-mode's pin_targets.
-        // Only the run-time replan may supply a no-perf mask: it names the
-        // exact LLC/CPU resources protected by this invocation's fds. A
-        // build-time shape is never resurrected as placement. The default
-        // overcommit mask is the separate unreserved fallback.
-        let no_perf_mask: Option<&[usize]> = effective_no_perf_cpus.or(default_cpu_mask);
+        // Flat shared CPU pool gets sched_setaffinity'd on every vCPU thread
+        // as a mask (not a hard pin). It is mutually exclusive with exact
+        // pin_targets and always names this invocation's admitted resources.
 
         // Per-AP TID slots — each AP thread stamps gettid() into its
         // `AtomicI32` and fires the paired `Latch` at startup so the
@@ -4772,7 +4763,7 @@ impl KtstrVm {
             &freeze,
             &watchpoint,
             &ap_pins,
-            no_perf_mask,
+            shared_cpu_mask,
             &ap_tid_slots,
             &ap_boot_latches,
             Some(&parked_evt),
@@ -4813,7 +4804,7 @@ impl KtstrVm {
         // Pin / mask BSP (runs on current thread, pid=0 means calling thread).
         if let Some(Some(host_cpu)) = pin_targets.first() {
             pin_current_thread(*host_cpu, "BSP (vCPU 0)");
-        } else if let Some(mask) = no_perf_mask {
+        } else if let Some(mask) = shared_cpu_mask {
             set_thread_cpumask(mask, "BSP (vCPU 0)");
         }
         if self.performance_mode {
@@ -15210,10 +15201,9 @@ impl KtstrVm {
 
     /// Spawn AP vCPU threads. Each thread optionally pins itself to a
     /// host CPU from `pin_targets` (indexed by AP order, 0-based), OR
-    /// applies a CPU mask from `no_perf_mask` when the no-perf +
-    /// `--cpu-cap` path is active. The two are mutually exclusive —
-    /// perf-mode produces `pin_targets` via the PinningPlan;
-    /// `--cpu-cap` no-perf produces `no_perf_mask` via the LlcPlan.
+    /// applies the admitted `shared_cpu_mask`. The two are mutually exclusive:
+    /// exact default/performance placement produces `pin_targets`; explicit
+    /// no-perf and default fallback produce a shared pool via the LLC planner.
     ///
     /// Returns `(threads, freeze_handles)`. The freeze handles
     /// (per-AP `parked` flags + register-snapshot slots) are the
@@ -15240,7 +15230,7 @@ impl KtstrVm {
         freeze: &Arc<AtomicBool>,
         watchpoint: &Arc<WatchpointArm>,
         pin_targets: &[Option<usize>],
-        no_perf_mask: Option<&[usize]>,
+        shared_cpu_mask: Option<&[usize]>,
         ap_tid_slots: &[(Arc<AtomicI32>, Arc<crate::sync::Latch>)],
         ap_boot_latches: &[Arc<crate::sync::Latch>],
         parked_evt: Option<&Arc<EventFd>>,
@@ -15311,7 +15301,7 @@ impl KtstrVm {
             let alive = Arc::new(AtomicBool::new(true));
             let has_immediate_exit_clone = has_immediate_exit;
             let pin_cpu = pin_targets.get(i).copied().flatten();
-            let mask_for_thread: Option<Vec<usize>> = no_perf_mask.map(|m| m.to_vec());
+            let mask_for_thread: Option<Vec<usize>> = shared_cpu_mask.map(<[usize]>::to_vec);
             // Per-AP shared watchpoint state. Cloned once per AP;
             // the AP polls `wp_clone.request_kva` before each
             // KVM_RUN (via the per-iteration hook in
@@ -19354,10 +19344,11 @@ mod run_vm_thread_guard_tests {
             freeze_coord: None,
             watchdog: None,
             run_locks: Some(super::super::RunLocks {
-                locks: vec![held],
-                default_cpu_mask: None,
+                locks: super::super::host_topology::protocol::Acquired::untracked(vec![held]),
                 pinning_plan: None,
-                no_perf_cpus: None,
+                shared_cpu_mask: None,
+                default_shared_cpu_claim: false,
+                default_shared_fallback: false,
             }),
             kill: Arc::clone(&kill),
             kill_evt: evt(),

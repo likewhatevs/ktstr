@@ -144,7 +144,7 @@ fn resource_lock_exclusive_success() {
         assignments: vec![(0, 90100), (1, 90101)],
         service_cpu: None,
         llc_indices: vec![90100],
-        locks: Vec::new(),
+        locks: super::super::protocol::Acquired::untracked(Vec::new()),
     };
     let llc_indices = &[90100usize];
     let outcome = acquire_resource_locks(
@@ -166,7 +166,7 @@ fn resource_lock_shared_includes_cpu_locks() {
         assignments: vec![(0, 90200), (1, 90201)],
         service_cpu: None,
         llc_indices: vec![90200],
-        locks: Vec::new(),
+        locks: super::super::protocol::Acquired::untracked(Vec::new()),
     };
     let llc_indices = &[90200usize];
 
@@ -189,7 +189,7 @@ fn resource_lock_shared_with_service_cpu() {
         assignments: vec![(0, 90300)],
         service_cpu: Some(90301),
         llc_indices: vec![90300],
-        locks: Vec::new(),
+        locks: super::super::protocol::Acquired::untracked(Vec::new()),
     };
     let llc_indices = &[90300usize];
 
@@ -212,7 +212,7 @@ fn resource_lock_exclusive_includes_explicit_cpu_bridge() {
         assignments: vec![(0, 90400), (1, 90401)],
         service_cpu: Some(90402),
         llc_indices: vec![90400],
-        locks: Vec::new(),
+        locks: super::super::protocol::Acquired::untracked(Vec::new()),
     };
     let llc_indices = &[90400usize];
 
@@ -228,7 +228,7 @@ fn resource_lock_exclusive_includes_explicit_cpu_bridge() {
 }
 
 #[test]
-fn whole_perf_derived_cpu_bridge_conflicts_with_overcommit() {
+fn whole_perf_derived_cpu_bridge_conflicts_with_shared_fallback() {
     let _prefixes = LockPrefixesGuard::new();
     let host = HostTopology::new_for_tests(&[(vec![90410, 90411], 0)]);
     let candidate = host
@@ -251,16 +251,16 @@ fn whole_perf_derived_cpu_bridge_conflicts_with_overcommit() {
     .unwrap();
     let (_, locks) = unwrap_acquired(whole, Some("fresh production whole-domain candidate"));
     assert_eq!(locks.len(), 3, "LLC EX plus both full-domain CPU EX locks");
-    let bridge = acquire_overcommit_bridge(&[], &[90411], false, None).unwrap();
+    let bridge = acquire_shared_fallback_bridge(&[90411], false, None).unwrap();
     assert!(
         matches!(bridge, LockOutcome::Unavailable(_)),
-        "topology-unavailable overcommit must still see whole-perf CPU EX",
+        "topology-unavailable shared fallback must still see whole-perf CPU EX",
     );
     drop(locks);
 }
 
 #[test]
-fn waiting_overcommit_bridge_acquires_after_whole_perf_releases() {
+fn waiting_shared_fallback_bridge_acquires_after_whole_perf_releases() {
     let _prefixes = LockPrefixesGuard::new();
     let whole = try_acquire_resources(
         &[90420],
@@ -277,7 +277,7 @@ fn waiting_overcommit_bridge_acquires_after_whole_perf_releases() {
         std::thread::sleep(std::time::Duration::from_millis(50));
         drop(locks);
     });
-    let bridge = acquire_overcommit_bridge(&[90420], &[90420], true, None).unwrap();
+    let bridge = acquire_shared_fallback_bridge(&[90420], true, None).unwrap();
     assert!(matches!(bridge, LockOutcome::Acquired { .. }));
     releaser.join().unwrap();
 }
@@ -290,7 +290,7 @@ fn resource_lock_contention_returns_unavailable() {
         assignments: vec![(0, 90500)],
         service_cpu: None,
         llc_indices: vec![90500],
-        locks: Vec::new(),
+        locks: super::super::protocol::Acquired::untracked(Vec::new()),
     };
     let llc_indices = &[90500usize];
     let lock_path = llc_lock_path(90500);
@@ -323,7 +323,7 @@ fn resource_lock_all_or_nothing() {
         assignments: vec![(0, 90600), (1, 90601)],
         service_cpu: None,
         llc_indices: vec![90600, 90601],
-        locks: Vec::new(),
+        locks: super::super::protocol::Acquired::untracked(Vec::new()),
     };
     let llc_indices = &[90600usize, 90601];
     let llc_600 = llc_lock_path(90600);
@@ -360,7 +360,7 @@ fn resource_lock_shared_cpu_contention() {
         assignments: vec![(0, 90700)],
         service_cpu: None,
         llc_indices: vec![90700],
-        locks: Vec::new(),
+        locks: super::super::protocol::Acquired::untracked(Vec::new()),
     };
     let llc_indices = &[90700usize];
     let llc_path = llc_lock_path(90700);
@@ -397,7 +397,7 @@ fn resource_lock_empty_llc_indices() {
         assignments: vec![(0, 90800)],
         service_cpu: None,
         llc_indices: vec![],
-        locks: Vec::new(),
+        locks: super::super::protocol::Acquired::untracked(Vec::new()),
     };
     let outcome = acquire_resource_locks(
         &[],
@@ -420,7 +420,7 @@ fn resource_lock_service_cpu_contention() {
         assignments: vec![(0, 90900)],
         service_cpu: Some(90901),
         llc_indices: vec![90850],
-        locks: Vec::new(),
+        locks: super::super::protocol::Acquired::untracked(Vec::new()),
     };
     let llc_indices = &[90850usize];
     let llc_path = llc_lock_path(90850);
@@ -739,7 +739,7 @@ fn resource_lock_wait_acquires_after_peer_release() {
         assignments: vec![(0, 90700)],
         service_cpu: None,
         llc_indices: vec![90700],
-        locks: Vec::new(),
+        locks: super::super::protocol::Acquired::untracked(Vec::new()),
     };
     let lock_path = llc_lock_path(90700);
     let holder = try_flock(&lock_path, FlockMode::Exclusive)

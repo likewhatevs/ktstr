@@ -2422,23 +2422,25 @@ fn numa_balancing_token_uses_kernel_accepted_spellings() {
 /// default). Mirrors the W2f policy documented on the fn.
 #[test]
 fn halt_poll_policy_truth_table() {
-    // (no_perf_mode, performance_mode, overcommit) -> expected
+    // (no_perf_mode, performance_mode, default_shared_cpu_claim) -> expected
     let cases = [
         // no_perf_mode always disables polling (shared host CPUs).
         ((true, false, false), Some(0u64)),
         ((true, false, true), Some(0)),
         // performance_mode leaves the module default (guest haltpoll drives it).
         ((false, true, false), None),
-        // default mode, 1:1 pin -> leave the module default.
+        // Interactive performance builders use default shared admission.
+        ((false, true, true), Some(0)),
+        // No admitted default SH claim (unreserved test-only path).
         ((false, false, false), None),
-        // default mode, overcommit fallback -> disable polling.
+        // Default exact pins and fallback pools both retain CPU-SH.
         ((false, false, true), Some(0)),
     ];
-    for ((no_perf, perf, over), expected) in cases {
+    for ((no_perf, perf, shared), expected) in cases {
         assert_eq!(
-            halt_poll_policy(no_perf, perf, over),
+            halt_poll_policy(no_perf, perf, shared),
             expected,
-            "halt_poll_policy(no_perf={no_perf}, perf={perf}, overcommit={over})",
+            "halt_poll_policy(no_perf={no_perf}, perf={perf}, shared={shared})",
         );
     }
 }

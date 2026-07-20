@@ -1,6 +1,6 @@
 //! Cross-process host-resource admission under nextest.
 //!
-//! Every ktstr process sharing a lock directory participates in one v7
+//! Every ktstr process sharing a lock directory participates in one v8
 //! fixed-record mmap registry. A ticket publishes one exact, non-empty CPU/LLC
 //! reservation claim plus the resources its planner may watch. Claims preserve
 //! the resource-lock semantics exactly: CPU and LLC claims independently use
@@ -206,7 +206,7 @@ const TEST_RETRY_WAKE_MARKER: &str = ".ktstr-test-retry-wake";
 
 /// Directory the protocol files live in — derived from the LLC
 /// lockfile path so the test-only lock-prefix override isolates the
-/// v7 registry files into the same per-test tempdir as the LLC locks
+/// v8 registry files into the same per-test tempdir as the LLC locks
 /// they coordinate.
 fn protocol_dir() -> PathBuf {
     Path::new(&super::llc_lock_path(0))
@@ -381,6 +381,22 @@ impl RegisteredClaimSnapshot {
     pub(crate) fn conflicts(&self, candidate: &ClaimSet) -> Result<bool> {
         self.inner.conflicts(candidate)
     }
+
+    pub(crate) fn cpu_holder_count(&self, cpu: usize) -> Result<usize> {
+        self.inner.cpu_holder_count(cpu)
+    }
+
+    pub(crate) fn cpu_exclusive_held(&self, cpu: usize) -> Result<bool> {
+        self.inner.cpu_exclusive_held(cpu)
+    }
+
+    pub(crate) fn llc_holder_count(&self, llc: usize) -> Result<usize> {
+        self.inner.llc_holder_count(llc)
+    }
+
+    pub(crate) fn llc_exclusive_held(&self, llc: usize) -> Result<bool> {
+        self.inner.llc_exclusive_held(llc)
+    }
 }
 
 /// Copy the aggregate reservation bitsets once for a whole planning pass.
@@ -398,6 +414,11 @@ pub(crate) fn aggregate_snapshot_read_count_for_tests() -> usize {
 }
 
 #[cfg(test)]
+pub(crate) fn registry_shared_probe_is_blocked_for_tests() -> Result<bool> {
+    registry::shared_probe_is_blocked_for_tests()
+}
+
+#[cfg(test)]
 pub(crate) fn union_claims_for_tests(a: &ClaimSet, b: &ClaimSet) -> ClaimSet {
     registry::union_claims_for_tests(a, b)
 }
@@ -412,7 +433,17 @@ pub(crate) fn round_trip_claim_modes_for_tests(
 
 pub(crate) enum RegistryFence<T> {
     Fenced,
-    Ran { value: T, watched: bool },
+    Ran {
+        value: T,
+        #[allow(dead_code)]
+        watched: bool,
+    },
+}
+
+pub(crate) enum ConversionFence<T> {
+    Fenced,
+    Unavailable,
+    Acquired(Acquired<T>),
 }
 
 /// Run one all-or-nothing nonblocking resource probe while holding the
@@ -429,6 +460,28 @@ pub(crate) fn with_registry_fence<T>(
             Ok(RegistryFence::Ran { value, watched })
         }
         Err(error) => Err(error),
+    }
+}
+
+/// Serialize a physical lock-mode conversion against every normal fast probe.
+///
+/// `probe` is the strong instantaneous claim used to test isolation;
+/// `published` is the weaker lifetime claim retained after `run` converts the
+/// real flock set. The registry EX fence spans aggregate validation, the
+/// nonblocking callback, and HELD publication, so no current-version SH-fenced
+/// probe can enter a non-atomic `flock` conversion window.
+pub(crate) fn with_exclusive_conversion_fence<T>(
+    probe: &ClaimSet,
+    published: &ClaimSet,
+    cancelled: Option<&AtomicBool>,
+    run: impl FnOnce() -> Result<Option<T>>,
+) -> Result<ConversionFence<T>> {
+    match registry::with_exclusive_conversion_fence(probe, published, cancelled, run)? {
+        registry::ExclusivePublishResult::Fenced => Ok(ConversionFence::Fenced),
+        registry::ExclusivePublishResult::Ran(None) => Ok(ConversionFence::Unavailable),
+        registry::ExclusivePublishResult::Ran(Some((value, held))) => {
+            Ok(ConversionFence::Acquired(Acquired::tracked(value, held)))
+        }
     }
 }
 
@@ -757,8 +810,8 @@ pub(crate) fn test_retry_wake_marker_path_for_tests() -> PathBuf {
 
 /// Publish mode-correct holder state while the corresponding real flocks are
 /// still live. This is an authoritative state transition, not an event hint.
-pub(crate) fn publish_acquired(claim: &ClaimSet) -> Result<()> {
-    registry::publish_acquired(claim)
+pub(crate) fn publish_acquired<T>(claim: &ClaimSet, value: T) -> Result<Acquired<T>> {
+    registry::publish_acquired(claim).map(|held| Acquired::tracked(value, held))
 }
 
 fn resource_basename_prefix(path: &str) -> Result<std::ffi::OsString> {
@@ -909,8 +962,105 @@ impl CoordinatorTicket {
     }
 }
 
+/// A physical reservation and its registry publication.
+///
+/// Drop releases the physical value first (normally a complete flock set),
+/// then removes the HELD registry record and notifies waiters. This preserves
+/// conservative ordering in both directions: acquisition publishes only after
+/// the real flocks exist, while teardown never advertises free capacity before
+/// those flocks close.
+pub(crate) struct Acquired<T> {
+    value: Option<T>,
+    held: Option<registry::HeldClaim>,
+}
+
+impl<T> Acquired<T> {
+    fn tracked(value: T, held: registry::HeldClaim) -> Self {
+        Self {
+            value: Some(value),
+            held: Some(held),
+        }
+    }
+
+    pub(crate) fn untracked(value: T) -> Self {
+        Self {
+            value: Some(value),
+            held: None,
+        }
+    }
+
+    pub(crate) fn split_map<R, U>(mut self, map: impl FnOnce(T) -> (R, U)) -> (R, Acquired<U>) {
+        let value = self
+            .value
+            .take()
+            .expect("acquired reservation payload was already consumed");
+        let held = self.held.take();
+        let (result, value) = map(value);
+        (
+            result,
+            Acquired {
+                value: Some(value),
+                held,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn abandon_publication_for_tests(mut self) {
+        // Match process teardown ordering: physical flocks disappear first,
+        // then the liveness fd closes while the HELD record remains for a
+        // different participant to prune.
+        drop(self.value.take());
+        if let Some(held) = self.held.take() {
+            registry::abandon_held_for_tests(held);
+        }
+    }
+}
+
+impl<T> std::ops::Deref for Acquired<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.value
+            .as_ref()
+            .expect("acquired reservation payload was already consumed")
+    }
+}
+
+impl<T> std::ops::DerefMut for Acquired<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.value
+            .as_mut()
+            .expect("acquired reservation payload was already consumed")
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for Acquired<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Acquired")
+            .field("value", &self.value)
+            .field("registry_held", &self.held.is_some())
+            .finish()
+    }
+}
+
+impl<T> Drop for Acquired<T> {
+    fn drop(&mut self) {
+        // Do not rely on field declaration order: the physical reservation
+        // must disappear before its registry record can advertise a release.
+        drop(self.value.take());
+        drop(self.held.take());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_held_drop_hook_for_tests(hook: impl FnOnce() + 'static) {
+    registry::set_held_drop_hook_for_tests(hook);
+}
+
 pub(crate) enum TicketWork<T> {
-    Acquired(T),
+    Acquired(Acquired<T>),
     Coordinator(CoordinatorTicket),
 }
 
@@ -1353,19 +1503,19 @@ fn register_ticket_or_acquire_impl<T>(
                     },
                 );
                 let result = match result {
-                    Ok(registry::GrantResult::Acquired(acquired)) => {
+                    Ok(registry::GrantResult::Acquired(acquired, held)) => {
                         // Removing the ticket while publishing the acquired
                         // real flocks is the terminal commit point.
                         // Cancellation that arrives after it must not turn
                         // success into an unwind that drops those flocks behind
                         // the sole observer.
-                        return Ok(TicketWork::Acquired(acquired));
+                        return Ok(TicketWork::Acquired(Acquired::tracked(acquired, held)));
                     }
                     result => result,
                 };
                 let result = check_result(result, cancelled)?;
                 match result {
-                    registry::GrantResult::Acquired(_) => {
+                    registry::GrantResult::Acquired(_, _) => {
                         unreachable!("terminal acquisition returned above")
                     }
                     registry::GrantResult::Requeued | registry::GrantResult::LostGrant => continue,
@@ -1552,13 +1702,11 @@ pub(crate) enum CoordinatorStep<T> {
 
 /// Outcome of [`acquire_as_coordinator`].
 pub(crate) enum CoordinatorOutcome<T> {
-    Acquired(T),
+    Acquired(Acquired<T>),
     Aborted { reason: String },
 }
 
 struct HolderObserver {
-    mountinfo: Option<String>,
-    needles: std::collections::BTreeMap<(bool, usize), String>,
     proof_files: std::collections::BTreeMap<ResourceKey, std::fs::File>,
     proof_locks: BTreeSet<ResourceKey>,
 }
@@ -1574,19 +1722,19 @@ pub(crate) fn force_holder_observer_unavailable_for_tests() {
     FORCE_HOLDER_OBSERVER_UNAVAILABLE.with(|forced| forced.set(true));
 }
 
+#[cfg(test)]
+fn forced_unavailable_for_tests() -> bool {
+    FORCE_HOLDER_OBSERVER_UNAVAILABLE.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn forced_unavailable_for_tests() -> bool {
+    false
+}
+
 impl HolderObserver {
     fn new() -> Self {
-        #[cfg(test)]
-        let forced_unavailable = FORCE_HOLDER_OBSERVER_UNAVAILABLE.with(std::cell::Cell::get);
-        #[cfg(not(test))]
-        let forced_unavailable = false;
         Self {
-            mountinfo: if forced_unavailable {
-                None
-            } else {
-                crate::flock::read_mountinfo().ok()
-            },
-            needles: std::collections::BTreeMap::new(),
             proof_files: std::collections::BTreeMap::new(),
             proof_locks: BTreeSet::new(),
         }
@@ -1597,105 +1745,19 @@ impl HolderObserver {
         request: &registry::ObservationRequest,
     ) -> registry::AvailabilityObservation {
         self.release_proofs();
-        match self.observe_proc(request) {
+        if forced_unavailable_for_tests() {
+            return registry::AvailabilityObservation::default();
+        }
+        match self.observe_with_proofs(request) {
             Ok(observation) => observation,
             Err(error) => {
                 tracing::debug!(
                     %error,
-                    "cannot observe reservation modes through procfs; using retained read-only flock proofs"
+                    "cannot prove pending reservation availability; keeping durable observation work pending"
                 );
-                match self.observe_with_proofs(request) {
-                    Ok(observation) => observation,
-                    Err(error) => {
-                        tracing::debug!(
-                            %error,
-                            "cannot prove pending reservation availability; keeping durable observation work pending"
-                        );
-                        registry::AvailabilityObservation::default()
-                    }
-                }
+                registry::AvailabilityObservation::default()
             }
         }
-    }
-
-    fn observe_proc(
-        &mut self,
-        request: &registry::ObservationRequest,
-    ) -> Result<registry::AvailabilityObservation> {
-        let mountinfo = self
-            .mountinfo
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("/proc/self/mountinfo was unavailable"))?;
-        for &llc in request.llcs.keys() {
-            if let std::collections::btree_map::Entry::Vacant(entry) =
-                self.needles.entry((false, llc))
-            {
-                let path = PathBuf::from(super::llc_lock_path(llc));
-                let needle =
-                    crate::flock::mountinfo::needle_from_path_with_mountinfo(&path, mountinfo)?;
-                entry.insert(needle);
-            }
-        }
-        for &cpu in request.cpus.keys() {
-            if let std::collections::btree_map::Entry::Vacant(entry) =
-                self.needles.entry((true, cpu))
-            {
-                let path = PathBuf::from(super::cpu_lock_path(cpu));
-                let needle =
-                    crate::flock::mountinfo::needle_from_path_with_mountinfo(&path, mountinfo)?;
-                entry.insert(needle);
-            }
-        }
-        let resource_needles: BTreeSet<String> = request
-            .llcs
-            .keys()
-            .filter_map(|llc| self.needles.get(&(false, *llc)).cloned())
-            .chain(
-                request
-                    .cpus
-                    .keys()
-                    .filter_map(|cpu| self.needles.get(&(true, *cpu)).cloned()),
-            )
-            .collect();
-        let summaries = crate::flock::read_flock_mode_summaries(&resource_needles)?;
-        let mut observation = registry::AvailabilityObservation::default();
-        for &cpu in request.cpus.keys() {
-            let summary = summaries[&self.needles[&(true, cpu)]];
-            let availability = if summary.exclusive_holder {
-                registry::CpuAvailability::ExclusiveHeld
-            } else if summary.any_holder {
-                registry::CpuAvailability::SharedHeld
-            } else {
-                registry::CpuAvailability::Free
-            };
-            observation.cpus.insert(
-                cpu,
-                registry::CpuObservation {
-                    availability,
-                    sh_resolved: true,
-                    ex_resolved: true,
-                },
-            );
-        }
-        for &llc in request.llcs.keys() {
-            let summary = summaries[&self.needles[&(false, llc)]];
-            let availability = if summary.exclusive_holder {
-                registry::LlcAvailability::ExclusiveHeld
-            } else if summary.any_holder {
-                registry::LlcAvailability::SharedHeld
-            } else {
-                registry::LlcAvailability::Free
-            };
-            observation.llcs.insert(
-                llc,
-                registry::LlcObservation {
-                    availability,
-                    sh_resolved: true,
-                    ex_resolved: true,
-                },
-            );
-        }
-        Ok(observation)
     }
 
     fn proof_file(&mut self, key: ResourceKey) -> Result<&std::fs::File> {
@@ -1748,7 +1810,16 @@ impl HolderObserver {
                     registry::CpuObservation {
                         availability: registry::CpuAvailability::SharedHeld,
                         sh_resolved: true,
-                        ex_resolved: false,
+                        ex_resolved: true,
+                    },
+                );
+            } else {
+                observation.cpus.insert(
+                    cpu,
+                    registry::CpuObservation {
+                        availability: registry::CpuAvailability::ExclusiveHeld,
+                        sh_resolved: true,
+                        ex_resolved: true,
                     },
                 );
             }
@@ -1770,7 +1841,16 @@ impl HolderObserver {
                     registry::LlcObservation {
                         availability: registry::LlcAvailability::SharedHeld,
                         sh_resolved: true,
-                        ex_resolved: false,
+                        ex_resolved: true,
+                    },
+                );
+            } else {
+                observation.llcs.insert(
+                    llc,
+                    registry::LlcObservation {
+                        availability: registry::LlcAvailability::ExclusiveHeld,
+                        sh_resolved: true,
+                        ex_resolved: true,
                     },
                 );
             }
@@ -1897,9 +1977,12 @@ fn acquire_as_coordinator_impl<T>(
                         &markers,
                         cancelled,
                     )? {
-                        registry::FinishAcquireResult::Committed => {
+                        registry::FinishAcquireResult::Committed(publication) => {
                             drop(contention);
-                            break CoordinatorOutcome::Acquired(value);
+                            break CoordinatorOutcome::Acquired(Acquired::tracked(
+                                value,
+                                publication,
+                            ));
                         }
                         registry::FinishAcquireResult::Stale => {
                             // An earlier callback changed its reservation after

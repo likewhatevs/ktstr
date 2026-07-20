@@ -630,7 +630,7 @@ fn make_jobs_for_plan_matches_cpu_count() {
         cpus: vec![0, 1, 2, 3],
         mems: std::collections::BTreeSet::new(),
         snapshot: Vec::new(),
-        locks: Vec::new(),
+        locks: admission_protocol::Acquired::untracked(Vec::new()),
     };
     assert_eq!(make_jobs_for_plan(&plan), 4);
 }
@@ -646,7 +646,7 @@ fn make_jobs_for_plan_empty_cpus_floors_to_one() {
         cpus: Vec::new(),
         mems: std::collections::BTreeSet::new(),
         snapshot: Vec::new(),
-        locks: Vec::new(),
+        locks: admission_protocol::Acquired::untracked(Vec::new()),
     };
     assert_eq!(
         make_jobs_for_plan(&plan),
@@ -760,7 +760,7 @@ fn warn_if_cross_node_spill_predicate_gates_stderr() {
         cpus: vec![0, 1],
         mems: [0usize, 1].into_iter().collect(),
         snapshot: Vec::new(),
-        locks: Vec::new(),
+        locks: admission_protocol::Acquired::untracked(Vec::new()),
     };
     let msg = cross_node_spill_warning(&multi_plan, &topo)
         .expect("multi-node plan must produce a warning");
@@ -791,7 +791,7 @@ fn warn_if_cross_node_spill_predicate_gates_stderr() {
         cpus: vec![0],
         mems: [0usize].into_iter().collect(),
         snapshot: Vec::new(),
-        locks: Vec::new(),
+        locks: admission_protocol::Acquired::untracked(Vec::new()),
     };
     assert!(
         cross_node_spill_warning(&single_plan, &topo).is_none(),
@@ -817,111 +817,43 @@ fn cpu_cap_effective_count_on_zero_llc_host() {
     );
 }
 
-/// Multi-process concurrent `acquire_llc_plan`: a child process
-/// holds `LOCK_SH` on one LLC's lockfile via `flock(1)` (SHELL
-/// utility), then the parent calls `acquire_llc_plan` with a
-/// cap forcing the planner to consolidate onto an LLC that has
-/// holders. The consolidation invariant (`holder_count DESC`
-/// ordering in `plan_from_snapshots`) requires the parent's
-/// plan to include the child's LLC.
-///
-/// Uses `flock(1)` + `sleep` rather than Rust fork() so the
-/// holder is a different process (different pid, different OFD)
-/// than the test thread — proving the /proc/locks cross-process
-/// enumeration path is exercised.
-///
-/// `flock(1)` is expected on every Linux host that runs ktstr
-/// tests (it's in util-linux, part of the minimum viable CI
-/// image). If it's absent the test short-circuits rather than
-/// failing — the invariant is real but the test infrastructure
-/// depends on a userspace utility.
+/// A current-version HELD publication supplies consolidation occupancy without
+/// any procfs scan. The planner must prefer that compatible SH-held LLC over a
+/// fresh peer when the cap selects only one.
 #[test]
 fn acquire_llc_plan_consolidates_on_peer_held_llc() {
     let _llc_prefix = LlcLockPrefixGuard::new();
-    // 2 LLCs on the same node so NUMA-locality doesn't bias
-    // against consolidation.
+    let _allowed = AllowedCpusGuard::new(vec![0, 1]);
     let topo = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
-
-    // Child process holds SH on LLC 1's lockfile via flock(1).
-    // Keep it alive until explicitly killed so host load cannot
-    // close the observation window before the parent's acquire.
     let target_lock = llc_lock_path(1);
-    // Ensure the lockfile exists so flock(1) opens the right
-    // inode (not a fresh one that /proc/locks would attribute
-    // to the flock(1) pid on a different inode than the parent
-    // sees).
-    crate::flock::materialize(&target_lock).expect("materialize lockfile");
-
-    use std::os::unix::process::CommandExt as _;
-    let child = std::process::Command::new("flock")
-        .args(["-s", "-n", &target_lock, "sleep", "300"])
-        .process_group(0)
-        .spawn();
-    let mut child = match child {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // flock(1) missing — skip rather than fail.
-            eprintln!(
-                "acquire_llc_plan_consolidates_on_peer_held_llc: \
-                 flock(1) not available, skipping ({e})"
-            );
-            return;
-        }
-        Err(e) => panic!("spawn flock(1): {e}"),
-    };
-
-    // Wait for the peer's LOCK_SH to become observable. A fixed sleep
-    // races process scheduling on a saturated runner: the child can
-    // remain runnable but unscheduled past any guessed delay.
-    let allowed: std::collections::BTreeSet<usize> = [0usize, 1].into_iter().collect();
-    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let peer_seen = loop {
-        let snapshots =
-            discover_llc_snapshots(&topo, &allowed, &mountinfo).expect("discover must succeed");
-        if snapshots
-            .iter()
-            .find(|s| s.llc_idx == 1)
-            .is_some_and(|s| s.holder_count == 1)
-        {
-            break true;
-        }
-        if std::time::Instant::now() >= deadline {
-            break false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
+    let physical = crate::flock::try_flock(&target_lock, FlockMode::Shared)
+        .expect("open peer LLC lock")
+        .expect("acquire peer LLC SH");
+    let claim = admission_protocol::ClaimSet::with_modes(
+        [1usize],
+        std::iter::empty(),
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let peer =
+        admission_protocol::publish_acquired(&claim, physical).expect("publish peer LLC HELD");
 
     let test_topo = crate::topology::TestTopology::synthetic(2, 1);
     let cap = CpuCap::new(1).expect("cap=1 valid");
-    let plan = peer_seen.then(|| {
-        acquire_llc_plan(
-            &topo,
-            &test_topo,
-            Some(cap),
-            PlacementPolicy::Consolidate,
-            false,
-        )
-    });
-
-    // Sweep both flock and its sleep child before any assertion can
-    // panic, then reap flock so the test leaves no process or zombie.
-    if let Some(pgid) = libc::pid_t::try_from(child.id())
-        .ok()
-        .filter(|&p| p > 0)
-        .map(nix::unistd::Pid::from_raw)
-    {
-        let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
-    }
-    let _ = child.wait();
-
-    assert!(
-        peer_seen,
-        "peer LOCK_SH on LLC 1 did not become visible within 30s"
+    let proc_reads_before = crate::flock::proc_locks::proc_locks_read_count_for_tests();
+    let plan = acquire_llc_plan(
+        &topo,
+        &test_topo,
+        Some(cap),
+        PlacementPolicy::Consolidate,
+        false,
+    )
+    .expect("current-version SH occupancy remains compatible");
+    assert_eq!(
+        crate::flock::proc_locks::proc_locks_read_count_for_tests(),
+        proc_reads_before,
+        "successful current-version placement must not scan /proc/locks",
     );
-    let plan = plan
-        .expect("peer was visible, so acquire was attempted")
-        .expect("SH is reentrant — parent SH must coexist with child SH");
 
     // Consolidation picked LLC 1 (the one with a holder) over
     // LLC 0 (fresh). The `holder_count DESC` ordering in
@@ -929,12 +861,13 @@ fn acquire_llc_plan_consolidates_on_peer_held_llc() {
     assert_eq!(
         plan.locked_llcs,
         vec![1],
-        "cap=1 with child holding SH on LLC 1 must pick LLC 1 \
+        "cap=1 with a published SH holder on LLC 1 must pick LLC 1 \
          (consolidation over fresh LLC 0); got {:?}",
         plan.locked_llcs,
     );
 
     drop(plan);
+    drop(peer);
 }
 
 #[test]
@@ -1669,7 +1602,7 @@ fn registered_claim_fast_fails_without_acquire_or_diagnostic_enrichment() {
         .expect("register exclusive LLC claim")
         {
             admission_protocol::TicketWork::Coordinator(coordinator) => coordinator,
-            admission_protocol::TicketWork::Acquired(()) => {
+            admission_protocol::TicketWork::Acquired(_) => {
                 panic!("fresh registry must elect a coordinator")
             }
         };
@@ -1943,6 +1876,7 @@ fn elastic_build_wait_replans_to_largest_partial_release() {
     });
 
     let started = std::time::Instant::now();
+    let proc_reads_before = crate::flock::proc_locks::proc_locks_read_count_for_tests();
     let plan =
         acquire_elastic_build_llc_plan(&topo, &test_topo, Some(CpuCap::new(3).unwrap()), None)
             .expect("the two-CPU release must satisfy an elastic build");
@@ -1954,6 +1888,11 @@ fn elastic_build_wait_replans_to_largest_partial_release() {
     assert_eq!(plan.locked_llcs, vec![2, 3]);
     assert_eq!(plan.cpus, vec![2, 3]);
     assert_eq!(make_jobs_for_plan(&plan), 2);
+    assert_eq!(
+        crate::flock::proc_locks::proc_locks_read_count_for_tests(),
+        proc_reads_before,
+        "queued admission and coordinator wakes must not scan /proc/locks",
+    );
 
     drop(plan);
     let _ = finish_tx.send(());

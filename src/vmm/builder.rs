@@ -1486,23 +1486,14 @@ pub(crate) fn build_per_node_map(
 // nothing and its cpus == the full allowed cpuset (a no-op mask), so
 // the stamp records the unrestricted set the vCPUs floated across —
 // still the true CPU count the threads ran on.
-// perf-mode AND the deferred default both ask the shared bounded
-// candidate mapper for a 1:1 plan at run time, hard-pinning each vCPU
-// thread to one distinct host CPU. Both cache the host topology, so
-// `cached_host_topo.is_some()` predicts a 1:1 pin and the build-time
-// budget is the vCPU count. Two run-time outcomes diverge from that
-// estimate: a cancelled performance admission writes no sidecar, and
-// the default path OVERCOMMITS when no exact candidate maps (host too
-// small) —
-// `run()` then overrides `VmResult.cpu_budget` with the actual
-// masked host-CPU count (`RunLocks::default_cpu_mask` length), so a
-// too-small host stamps the real overcommit, not this `vcpus`
-// estimate. Only when no affinity is applied (no-perf bypass, sysfs
-// unreadable, or the deferred default with no cached host topology)
-// do the vCPU threads fall to the allowed-cpuset size below. The
-// earlier `no_perf_plan` arm wins first, so the `cached_host_topo`
-// arm is only reached with no no-perf plan (perf-mode / deferred
-// default), never the no-perf masked path.
+// perf-mode asks the bounded mapper for a hard 1:1 run-time plan.
+// Default first tries the same 1:1 shape opportunistically, then falls
+// through to a `vcpus + 1` shared pool. A cached topology therefore
+// remains a build-time capacity estimate only: `run()` overrides default
+// fallback results with the actual `RunLocks::shared_cpu_mask` length.
+// A cancelled performance admission writes no sidecar. Only when no
+// affinity is possible (explicit no-perf bypass / unreadable sysfs) do
+// threads fall to the allowed-cpuset size below.
 fn resolve_effective_cpu_budget(
     no_perf_plan: &Option<host_topology::LlcPlan>,
     has_cached_host_topo: bool,
@@ -1893,7 +1884,7 @@ mod tests {
             assignments: vec![(0, 0), (1, 1), (2, 2), (3, 3)],
             service_cpu: None,
             llc_indices: vec![0, 1],
-            locks: Vec::new(),
+            locks: host_topology::protocol::Acquired::untracked(Vec::new()),
         };
 
         assert_eq!(

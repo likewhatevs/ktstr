@@ -30,7 +30,7 @@ switches: `performance_mode` on the test or builder, and
 |---|---|---|---|---|
 | Performance mode | `performance_mode = true` | exclusive (`LOCK_EX`), one per virtual LLC — **or** shared (`LOCK_SH`) on a huge LLC (see below) | exclusive (`LOCK_EX`) on every CPU covered by a whole-LLC claim — or on the pinned CPUs plus service CPU at per-CPU grain | vCPU pinning, RT scheduling, hugepages, NUMA mbind |
 | Budgeted (no-perf-mode) | `--no-perf-mode` / `KTSTR_NO_PERF_MODE` | shared (`LOCK_SH`) on the planned LLC set | shared (`LOCK_SH`) on the exact budgeted CPU pool; the cgroup cpuset enforces placement | cgroup v2 cpuset sandbox + soft affinity mask |
-| Default | neither | shared (`LOCK_SH`) on the 1:1 plan's LLCs | exclusive (`LOCK_EX`), one per assigned host CPU | none — reservation only |
+| Default | neither | shared (`LOCK_SH`) on an exact candidate or fallback pool | instantaneous exact `LOCK_EX` probe, converted to lifetime `LOCK_SH`; fallback is `LOCK_SH` on a `vcpus + 1` pool | exact 1:1 pin when initially unshared; otherwise soft affinity mask |
 
 ### Performance mode on a huge LLC: per-CPU grain
 
@@ -77,18 +77,15 @@ other reservation (see below) — a waiting grain cell holds nothing, and
 coordinator partials are the plan's exact per-CPU locks.
 
 Lockfiles live at `{KTSTR_LOCK_DIR or /tmp}/ktstr-llc-{N}.lock` and
-`{KTSTR_LOCK_DIR or /tmp}/ktstr-cpu-{C}.lock`. The modes compose:
-shared holders coexist with each other, an exclusive holder blocks
-every shared acquirer and vice versa. So any number of budgeted and
-default runs share LLCs among themselves, a perf-mode run waits for
-all of them to release, and while a perf-mode run holds its LLCs
-nobody else touches those CPUs. CPU claims apply the same matrix:
-budgeted runs publish exact shared CPU footprints, while default and
-performance runs publish exclusive footprints. Thus budgeted peers may
-share deliberately, but they cannot be placed underneath an exclusive
-default/performance owner. Default runs exclude each other per CPU, so
-two default VMs never time-slice the same host CPU. Kernel builds take
-the budgeted path, and so do
+`{KTSTR_LOCK_DIR or /tmp}/ktstr-cpu-{C}.lock`. Shared holders coexist;
+an exclusive holder blocks overlapping shared acquirers and vice versa.
+Performance mode is the only hard non-interference contract. Default
+uses CPU EX only as an instantaneous 1:1 availability probe. On success
+it converts that same footprint to CPU SH before publishing the run; on
+failure it uses the shared budget machinery. Exact-pinned defaults,
+default fallbacks, no-perf runs, and builds may therefore overlap
+CPU-SH pools, but none can enter CPUs held by performance EX. Kernel
+builds take the budgeted path, and so do
 `cargo ktstr test` / `cargo ktstr verifier` harness compiles: each
 dispatcher runs a reserved `cargo … --no-run` warm-up under the same
 shared LLC locks and cpuset sandbox, releasing both before any cell
@@ -149,10 +146,10 @@ makes this work across disjoint invocations sharing one
 `KTSTR_LOCK_DIR` (colocated runner units, concurrent nextest runs):
 
 - **Fast path.** Every acquirer first tries its whole planned lock
-  set non-blocking, all-or-nothing, in canonical lock order — cells
-  satisfiable *right now* never register, and no fast-path partial ever
-  persists (everything is released on any bounce).
-- **The v7 registry.** A bounced acquirer publishes one monotonic
+  set non-blocking, all-or-nothing, in canonical lock order. No partial
+  survives a bounce. A successful reservation publishes one HELD record
+  for its actual lock modes until the physical flocks are dropped.
+- **The v8 registry.** A bounced waiting acquirer publishes one monotonic
   fixed-size ticket containing its exact CPU/LLC claim. Each record also
   caches four predecessor-prefix bitsets (CPU-any, CPU-exclusive,
   LLC-any, LLC-exclusive), published epoch-last with the resource
@@ -168,8 +165,8 @@ makes this work across disjoint invocations sharing one
 - **Work-conserving grants.** The coordinator scans tickets in arrival
   order. A ticket may run as soon as its exact claim is compatible
   with every earlier live claim, so disjoint work passes blocked work
-  without weakening CPU exclusivity or the LLC `LOCK_SH`/`LOCK_EX`
-  matrix.
+  without weakening the requested CPU or LLC `LOCK_SH`/`LOCK_EX`
+  modes.
 - **The coordinator license.** The elected coordinator is the only
   agent allowed to retain a *partial* lock set while waiting for more.
   One incremental acquirer cannot form a deadlock cycle.
@@ -185,7 +182,10 @@ makes this work across disjoint invocations sharing one
 - **Exact claim fencing.** A shared registry fence spans the aggregate
   claim check and the real all-or-nothing flock probe. No ticket can
   publish in that gap, and a fast path cannot snipe an earlier exact
-  reservation.
+  reservation. Default's non-atomic CPU EX-to-SH flock conversion uses
+  a short registry EX fence spanning the probe, conversion, and weaker
+  HELD publication; normal probes require registry SH and therefore
+  cannot enter that transition window.
 - **Lifecycle-owned bounds.** The lock layer waits for the
   authoritative flock release. It cannot infer that a live holder is
   wedged from elapsed wall time: coverage instrumentation, host
@@ -195,10 +195,9 @@ makes this work across disjoint invocations sharing one
   process-lifecycle bound. One slow healthy holder therefore cannot
   fail every waiter behind it.
 
-When the default path cannot map its topology 1:1 onto the host at
-all (no plan can exist — host too small), the run proceeds
-*overcommitted* — every vCPU thread masked to the allowed CPUs — and
-warns when that means oversubscription (see below).
+When default cannot immediately acquire a 1:1 placement, it requests a
+shared `vcpus + 1` pool (clamped to the allowed set). It warns only when
+that admitted pool is actually narrower than the guest vCPU count.
 
 ## Too-small hosts: who asked determines the verdict
 
@@ -211,7 +210,7 @@ operator typo must not look like a host limitation:
 | `performance_mode = true`, host can't honor isolation | `PerfModeUnavailable` | skip (fail under `KTSTR_NO_SKIP_MODE`) |
 | Per-test `cpu_budget` above the allowed CPUs | `TopologyInsufficient` | skip (fail under `KTSTR_NO_SKIP_MODE`) |
 | Operator `--cpu-cap` / `KTSTR_CPU_CAP` above the allowed CPUs | `CpuBudgetUnsatisfiable` | hard fail |
-| Default mode, no 1:1 placement possible | — | runs overcommitted, warns |
+| Default mode, no immediate 1:1 placement | — | uses shared pool; warns only if pool is narrower than vCPUs |
 
 A test attribute is a capability requirement a bigger host would
 satisfy, so it skips. An operator-typed number that does not exist on

@@ -1039,7 +1039,7 @@ impl KtstrVm {
         // can only bind to the same LLCs the run-scoped flocks hold.
         let placement = virtio_blk::WorkerPlacement {
             service_cpu: effective_placement.service_cpu,
-            no_perf_cpus: effective_placement.no_perf_cpus.map(<[usize]>::to_vec),
+            shared_cpus: effective_placement.shared_cpus.map(<[usize]>::to_vec),
         };
         blk.set_worker_placement(placement);
         blk.set_mem((*vm.guest_mem).clone());
@@ -1325,7 +1325,7 @@ impl KtstrVm {
         // selected run-time placement wins over every build-time probe.
         let placement = virtio_blk::WorkerPlacement {
             service_cpu: effective_placement.service_cpu,
-            no_perf_cpus: effective_placement.no_perf_cpus.map(<[usize]>::to_vec),
+            shared_cpus: effective_placement.shared_cpus.map(<[usize]>::to_vec),
         };
         blk.set_worker_placement(placement);
         blk.set_mem((*vm.guest_mem).clone());
@@ -2621,37 +2621,37 @@ impl KtstrVm {
 ///
 /// Keyed on signals resolved by the time `KtstrVm::run` calls this — the
 /// build-time mode flags plus the run-time `acquire_run_locks` outcome
-/// (`overcommit` is true when the default path fell back to an overcommitted
-/// CPU mask rather than a 1:1 pin, i.e. `RunLocks::default_cpu_mask` is set):
+/// (`default_shared_cpu_claim` is true for default-style admission, including
+/// an exact pin whose lifetime reservation was converted to CPU-SH):
 ///
 /// * `no_perf_mode` → `Some(0)`: the guest deliberately shares host CPUs with
 ///   peers, so halt polling burns CPU that belongs to others.
-/// * `performance_mode` → `None`: perf mode disables HLT exits and enables the
+/// * `default_shared_cpu_claim` → `Some(0)`: an interactive shell configured
+///   from a performance builder still uses default-style shared admission, so
+///   the acquired claim outranks the build-time mode flag.
+/// * `performance_mode` → `None`: an actually isolated perf run disables HLT exits and enables the
 ///   guest's own haltpoll cpuidle (see `tune_kvm_caps`), which drives
 ///   `MSR_KVM_POLL_CONTROL` — host halt polling is redundant, leave the module
 ///   default.
-/// * default mode, overcommit fallback → `Some(0)`: vCPUs exceed the acquired
-///   host CPUs, so polling wastes contended CPU time.
-/// * default mode, 1:1 pin → `None`: each vCPU owns a host CPU; leave the
-///   module default (200_000 == KVM_HALT_POLL_NS_DEFAULT on stock x86), which
-///   is exactly what the prior build-time policy set explicitly.
+/// * default mode, exact pin or shared fallback → `Some(0)`: both retain
+///   CPU-SH, so compatible peers may overlap later and polling would burn
+///   their shared time.
 ///
 /// `no_perf_mode` is checked first: `build()` forces `performance_mode=false`
-/// under it, and overcommit only arises on the default path, so the arms are
-/// mutually exclusive — the order only fixes a defensive precedence.
+/// under it, and default-style shared admission is a separate mode outcome.
 pub(super) fn halt_poll_policy(
     no_perf_mode: bool,
     performance_mode: bool,
-    overcommit: bool,
+    default_shared_cpu_claim: bool,
 ) -> Option<u64> {
     if no_perf_mode {
         return Some(0);
     }
+    if default_shared_cpu_claim {
+        return Some(0);
+    }
     if performance_mode {
         return None;
-    }
-    if overcommit {
-        return Some(0);
     }
     None
 }

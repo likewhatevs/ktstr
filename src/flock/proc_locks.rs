@@ -35,6 +35,23 @@ use super::HolderInfo;
 use super::holder::holder_info_for_pid;
 use super::mountinfo::{needle_from_path, needle_from_path_with_mountinfo};
 
+fn read_proc_locks(context: &'static str) -> Result<String> {
+    #[cfg(test)]
+    PROC_LOCKS_READS.with(|count| count.set(count.get().saturating_add(1)));
+    std::fs::read_to_string("/proc/locks").with_context(|| context)
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROC_LOCKS_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn proc_locks_read_count_for_tests() -> usize {
+    PROC_LOCKS_READS.with(std::cell::Cell::get)
+}
+
 /// Compatibility-relevant holder state for one flock inode.
 ///
 /// `any_holder` is true for either a held READ (`LOCK_SH`) or WRITE
@@ -84,10 +101,7 @@ pub(crate) struct FlockResourceState {
 /// overflow. A cmdline read failure is non-fatal — the entry
 /// carries `"<cmdline unavailable>"` so the pid still surfaces.
 pub(super) fn read_holders_for_needle(needle: &str) -> Result<Vec<HolderInfo>> {
-    use std::fs;
-
-    let contents = fs::read_to_string("/proc/locks")
-        .with_context(|| "read /proc/locks for lockfile holder lookup")?;
+    let contents = read_proc_locks("read /proc/locks for lockfile holder lookup")?;
     Ok(read_holders_from_contents(&contents, needle))
 }
 
@@ -238,6 +252,7 @@ pub(crate) fn parse_flock_pids_for_needles(contents: &str, needles: &[String]) -
 /// `{major:02x}:{minor:02x}:{inode}` strings emitted by `/proc/locks`.
 /// Every requested needle is present in the output, including needles with no
 /// held flock. Waiting (`->`) entries and non-FLOCK lock classes are ignored.
+#[allow(dead_code)]
 pub(crate) fn parse_flock_mode_summaries(
     contents: &str,
     needles: &BTreeSet<String>,
@@ -263,11 +278,11 @@ pub(crate) fn parse_flock_mode_summaries(
 
 /// Read `/proc/locks` once and return compatibility summaries for every
 /// requested inode needle.
+#[allow(dead_code)]
 pub(crate) fn read_flock_mode_summaries(
     needles: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, FlockModeSummary>> {
-    let contents = std::fs::read_to_string("/proc/locks")
-        .with_context(|| "read /proc/locks for batched flock-mode observation")?;
+    let contents = read_proc_locks("read /proc/locks for batched flock-mode observation")?;
     Ok(parse_flock_mode_summaries(&contents, needles))
 }
 
@@ -285,8 +300,7 @@ pub(crate) fn read_flock_states_batch_with_mountinfo<'a>(
     for (index, needle) in needles.iter().enumerate() {
         positions.entry(needle).or_default().push(index);
     }
-    let contents = std::fs::read_to_string("/proc/locks")
-        .with_context(|| "read /proc/locks for batched flock-state observation")?;
+    let contents = read_proc_locks("read /proc/locks for batched flock-state observation")?;
     let mut states = vec![FlockResourceState::default(); needles.len()];
     for line in contents.lines() {
         let Some((pid, mode, dev_inode)) = parse_held_flock_with_mode(line) else {
@@ -417,8 +431,7 @@ pub(crate) fn read_holder_pids_batch_with_mountinfo<'a>(
         .into_iter()
         .map(|path| needle_from_path_with_mountinfo(path, mountinfo))
         .collect::<Result<Vec<_>>>()?;
-    let contents = std::fs::read_to_string("/proc/locks")
-        .with_context(|| "read /proc/locks for batched lockfile holder lookup")?;
+    let contents = read_proc_locks("read /proc/locks for batched lockfile holder lookup")?;
     Ok(parse_flock_pids_for_needles(&contents, &needles))
 }
 

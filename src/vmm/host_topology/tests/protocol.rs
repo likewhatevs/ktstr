@@ -139,7 +139,7 @@ fn coordinator_watch_filters_registry_self_closes_without_spinning() {
         .expect("initialize registry")
         {
             protocol::TicketWork::Coordinator(coordinator) => coordinator,
-            protocol::TicketWork::Acquired(()) => panic!("fresh registry must elect a coordinator"),
+            protocol::TicketWork::Acquired(_) => panic!("fresh registry must elect a coordinator"),
         };
     drop(coordinator);
 
@@ -223,8 +223,8 @@ fn uncontended_fast_fence_does_not_create_registry_metadata() {
     let protocol_dir = std::path::Path::new(&cpu_path)
         .parent()
         .expect("resource lock parent");
-    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v7");
-    let event_dir = protocol_dir.join("ktstr-acquire-events-v7");
+    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v8");
+    let event_dir = protocol_dir.join("ktstr-acquire-events-v8");
     assert!(!registry_dir.exists());
     assert!(!event_dir.exists());
 
@@ -252,6 +252,215 @@ fn uncontended_fast_fence_does_not_create_registry_metadata() {
     assert!(
         !registry_dir.exists() && !event_dir.exists(),
         "an uncontended fast probe must not create registry directories or lockfiles",
+    );
+}
+
+#[test]
+fn held_counts_track_shared_publications_but_not_queued_claims() {
+    let _prefixes = LockPrefixesGuard::new();
+    let claim = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [1usize],
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+
+    let queued =
+        match protocol::register_ticket_or_acquire(claim.clone(), claim.clone(), None, |_| {
+            Ok::<Option<()>, anyhow::Error>(None)
+        })
+        .expect("register queued claim")
+        {
+            protocol::TicketWork::Coordinator(coordinator) => coordinator,
+            protocol::TicketWork::Acquired(_) => panic!("probe deliberately returned unavailable"),
+        };
+    let incompatible = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [1usize],
+        FlockMode::Shared,
+        FlockMode::Exclusive,
+    );
+    let queued_snapshot =
+        protocol::registered_claim_snapshot(&incompatible).expect("read queued aggregate");
+    assert!(
+        queued_snapshot
+            .conflicts(&incompatible)
+            .expect("queued conflict"),
+        "an exact queued claim must still fence an incompatible fast probe",
+    );
+    assert_eq!(
+        queued_snapshot.cpu_holder_count(1).expect("queued count"),
+        0,
+        "a queue reservation is not a physical holder",
+    );
+    drop(queued);
+
+    let first = crate::flock::try_flock(cpu_lock_path(1), FlockMode::Shared)
+        .expect("first SH probe")
+        .expect("first SH");
+    let first = protocol::publish_acquired(&claim, first).expect("publish first SH");
+    let second = crate::flock::try_flock(cpu_lock_path(1), FlockMode::Shared)
+        .expect("second SH probe")
+        .expect("second SH");
+    let second = protocol::publish_acquired(&claim, second).expect("publish second SH");
+    let both = protocol::registered_claim_snapshot(&claim).expect("read two SH holders");
+    assert_eq!(both.cpu_holder_count(1).expect("two-holder count"), 2);
+    assert!(
+        !both.cpu_exclusive_held(1).expect("two-holder mode"),
+        "two shared publications must not become an exclusive holder",
+    );
+
+    drop(first);
+    assert_eq!(
+        protocol::registered_claim_snapshot(&claim)
+            .expect("read one SH holder")
+            .cpu_holder_count(1)
+            .expect("one-holder count"),
+        1,
+    );
+    drop(second);
+    assert_eq!(
+        protocol::registered_claim_snapshot(&claim)
+            .expect("read released holders")
+            .cpu_holder_count(1)
+            .expect("released count"),
+        0,
+    );
+}
+
+#[test]
+fn acquired_drop_releases_physical_flock_before_held_record() {
+    let _prefixes = LockPrefixesGuard::new();
+    let path = cpu_lock_path(2);
+    let claim = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [2usize],
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let physical = crate::flock::try_flock(&path, FlockMode::Shared)
+        .expect("physical SH probe")
+        .expect("fresh physical SH");
+    let acquired = protocol::publish_acquired(&claim, physical).expect("publish HELD claim");
+
+    let observed = std::rc::Rc::new(std::cell::Cell::new(None));
+    let hook_observed = std::rc::Rc::clone(&observed);
+    let hook_claim = claim.clone();
+    protocol::set_held_drop_hook_for_tests(move || {
+        let physical_is_free = crate::flock::try_flock(&path, FlockMode::Exclusive)
+            .expect("probe physical release inside HELD drop")
+            .is_some();
+        let published_count = protocol::registered_claim_snapshot(&hook_claim)
+            .expect("read HELD record before removal")
+            .cpu_holder_count(2)
+            .expect("HELD count before removal");
+        hook_observed.set(Some((physical_is_free, published_count)));
+    });
+    drop(acquired);
+
+    assert_eq!(
+        observed.get(),
+        Some((true, 1)),
+        "physical release must precede HELD removal, leaving only a conservative false-busy window",
+    );
+    assert_eq!(
+        protocol::registered_claim_snapshot(&claim)
+            .expect("read final holder count")
+            .cpu_holder_count(2)
+            .expect("final holder count"),
+        0,
+    );
+}
+
+#[test]
+fn dead_held_publication_is_pruned_by_the_next_conflicting_snapshot() {
+    let _prefixes = LockPrefixesGuard::new();
+    let claim = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [3usize],
+        FlockMode::Shared,
+        FlockMode::Exclusive,
+    );
+    let physical = crate::flock::try_flock(cpu_lock_path(3), FlockMode::Exclusive)
+        .expect("physical EX probe")
+        .expect("fresh physical EX");
+    let acquired = protocol::publish_acquired(&claim, physical).expect("publish HELD EX");
+    assert_eq!(
+        protocol::registered_claim_snapshot(&claim)
+            .expect("read live HELD record")
+            .cpu_holder_count(3)
+            .expect("live HELD count"),
+        1,
+    );
+
+    acquired.abandon_publication_for_tests();
+    let recovered =
+        protocol::registered_claim_snapshot(&claim).expect("recover dead HELD publication");
+    assert_eq!(recovered.cpu_holder_count(3).expect("recovered count"), 0);
+    assert!(
+        !recovered.conflicts(&claim).expect("recovered conflict"),
+        "a dead liveness owner must not leave a permanent reservation",
+    );
+}
+
+#[test]
+fn concurrent_held_publication_counts_are_exact() {
+    const HOLDERS: usize = 32;
+
+    let _prefixes = LockPrefixesGuard::new();
+    let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE
+        .with(|slot| slot.borrow().clone())
+        .expect("LLC test prefix");
+    let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE
+        .with(|slot| slot.borrow().clone())
+        .expect("CPU test prefix");
+    let claim = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [4usize],
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let published = std::sync::Arc::new(std::sync::Barrier::new(HOLDERS + 1));
+    let release = std::sync::Arc::new(std::sync::Barrier::new(HOLDERS + 1));
+    let mut threads = Vec::with_capacity(HOLDERS);
+    for _ in 0..HOLDERS {
+        let llc_prefix = llc_prefix.clone();
+        let cpu_prefix = cpu_prefix.clone();
+        let claim = claim.clone();
+        let published = std::sync::Arc::clone(&published);
+        let release = std::sync::Arc::clone(&release);
+        threads.push(std::thread::spawn(move || {
+            LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(llc_prefix));
+            CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(cpu_prefix));
+            let physical = crate::flock::try_flock(cpu_lock_path(4), FlockMode::Shared)
+                .expect("concurrent SH probe")
+                .expect("concurrent SH");
+            let acquired =
+                protocol::publish_acquired(&claim, physical).expect("publish concurrent HELD");
+            published.wait();
+            release.wait();
+            drop(acquired);
+        }));
+    }
+
+    published.wait();
+    assert_eq!(
+        protocol::registered_claim_snapshot(&claim)
+            .expect("read concurrent holders")
+            .cpu_holder_count(4)
+            .expect("concurrent holder count"),
+        HOLDERS,
+    );
+    release.wait();
+    for thread in threads {
+        thread.join().expect("concurrent publisher");
+    }
+    assert_eq!(
+        protocol::registered_claim_snapshot(&claim)
+            .expect("read released concurrent holders")
+            .cpu_holder_count(4)
+            .expect("released concurrent holder count"),
+        0,
     );
 }
 
@@ -383,7 +592,7 @@ fn cpu_only_exact_claim_keeps_independent_canonical_modes() {
     .expect("register CPU-only exact claim")
     {
         protocol::TicketWork::Coordinator(coordinator) => coordinator,
-        protocol::TicketWork::Acquired(()) => panic!("fresh registry must elect a coordinator"),
+        protocol::TicketWork::Acquired(_) => panic!("fresh registry must elect a coordinator"),
     };
     let snapshot =
         protocol::ticket_registry_snapshot_for_tests().expect("read normalized exact claim");
@@ -419,7 +628,7 @@ fn coordinator_watch_wakes_for_registry_notification() {
     .expect("register ticket")
     {
         protocol::TicketWork::Coordinator(coordinator) => coordinator,
-        protocol::TicketWork::Acquired(()) => panic!("fresh registry must elect a coordinator"),
+        protocol::TicketWork::Acquired(_) => panic!("fresh registry must elect a coordinator"),
     };
     assert!(
         watch
@@ -448,7 +657,7 @@ fn coordinator_watch_observes_owner_liveness_close_but_not_readonly_probes() {
     .expect("register coordinator")
     {
         protocol::TicketWork::Coordinator(coordinator) => coordinator,
-        protocol::TicketWork::Acquired(()) => panic!("fresh registry must elect a coordinator"),
+        protocol::TicketWork::Acquired(_) => panic!("fresh registry must elect a coordinator"),
     };
     let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
     watch
@@ -719,7 +928,7 @@ fn registry_cpu_aggregate_uses_the_shared_exclusive_compatibility_matrix() {
         .expect("register CPU SH aggregate owner")
         {
             protocol::TicketWork::Coordinator(coordinator) => coordinator,
-            protocol::TicketWork::Acquired(()) => panic!("fresh registry must elect a coordinator"),
+            protocol::TicketWork::Acquired(_) => panic!("fresh registry must elect a coordinator"),
         };
     assert!(
         !protocol::registered_claim_conflicts(&shared).expect("query CPU SH aggregate"),
@@ -830,7 +1039,7 @@ fn active_record_cannot_be_reused_through_a_malformed_free_head() {
     .expect("register active ticket")
     {
         protocol::TicketWork::Coordinator(coordinator) => coordinator,
-        protocol::TicketWork::Acquired(()) => panic!("fresh registry must elect a coordinator"),
+        protocol::TicketWork::Acquired(_) => panic!("fresh registry must elect a coordinator"),
     };
     protocol::active_free_head_is_rejected_for_tests()
         .expect("active free-list head must fail closed without overwriting its record");
@@ -858,7 +1067,7 @@ fn one_aggregate_snapshot_filters_many_candidates_with_one_registry_read() {
     .expect("register aggregate owner")
     {
         protocol::TicketWork::Coordinator(coordinator) => coordinator,
-        protocol::TicketWork::Acquired(()) => panic!("fresh registry must elect a coordinator"),
+        protocol::TicketWork::Acquired(_) => panic!("fresh registry must elect a coordinator"),
     };
     let required = protocol::ClaimSet::new(
         std::iter::empty(),
@@ -914,7 +1123,7 @@ fn ordinary_state_reads_overlap_registry_shared_readers() {
             .expect("register coordinator")
             {
                 protocol::TicketWork::Coordinator(coordinator) => coordinator,
-                protocol::TicketWork::Acquired(()) => {
+                protocol::TicketWork::Acquired(_) => {
                     panic!("fresh registry must elect a coordinator")
                 }
             };
@@ -967,7 +1176,7 @@ fn targeted_broker_wake_cancels_one_registry_waiter() {
         .expect("register coordinator")
         {
             protocol::TicketWork::Coordinator(coordinator) => coordinator,
-            protocol::TicketWork::Acquired(()) => panic!("fresh registry must elect a coordinator"),
+            protocol::TicketWork::Acquired(_) => panic!("fresh registry must elect a coordinator"),
         };
 
     let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE.with(|p| p.borrow().clone());
@@ -1140,100 +1349,308 @@ fn interruptible_broker_stops_during_retry_and_restarts() {
     crate::flock::stop_interruptible_flock_broker();
 }
 
-/// RE-PLAN-ON-WAKE, the falsifiable form (a REQUIREMENT of the
-/// regime, not an implementation detail): the coordinator enters the wait
-/// wanting resource set X (all candidates busy); a DIFFERENT
-/// sufficient set Y frees; the coordinator must acquire Y promptly — never
-/// keep waiting on X. Driven through the PRODUCTION default-path
-/// acquisition (`KtstrVm::acquire_default_run_locks`) on a synthetic
-/// two-LLC host: candidate X (LLC 0 / CPU 0) stays wedged for the
-/// whole test; candidate Y (LLC 1 / CPU 1) frees after ~400 ms; the
-/// returned plan must be Y's.
+/// Exact default placement is opportunistic. Shared CPU holders defeat every
+/// CPU-EX candidate, but the run must immediately take the same CPU-SH pool;
+/// multiple default fallbacks may overlap it. Once peers leave, free admission
+/// returns to exact 1:1 pinning.
 #[test]
-fn coordinator_replans_to_freed_alternative_candidate() {
+fn default_exact_is_best_effort_and_shared_fallbacks_overlap() {
+    let _prefixes = LockPrefixesGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![0, 1]);
+    let host = HostTopology::new_for_tests(&[(vec![0, 1], 0)]);
+    let topo = crate::vmm::Topology::new(1, 1, 1, 1);
+
+    let peer0 = crate::flock::try_flock(cpu_lock_path(0), crate::flock::FlockMode::Shared)
+        .unwrap()
+        .expect("SH cpu0");
+    let peer1 = crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Shared)
+        .unwrap()
+        .expect("SH cpu1");
+    let start = std::time::Instant::now();
+    let first = crate::vmm::KtstrVm::acquire_default_run_locks(Some(&host), &topo, false)
+        .expect("SH peers permit immediate shared fallback");
+    let mut first_mask = first
+        .shared_cpu_mask
+        .clone()
+        .expect("fallback retains its admitted CPU set");
+    first_mask.sort_unstable();
+    assert_eq!(first_mask, vec![0, 1]);
+    assert!(first.pinning_plan.is_none());
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "default must not queue to preserve exact pinning",
+    );
+
+    let second = crate::vmm::KtstrVm::acquire_default_run_locks(Some(&host), &topo, false)
+        .expect("a second default fallback may overlap the first");
+    let mut second_mask = second
+        .shared_cpu_mask
+        .clone()
+        .expect("second fallback retains its admitted CPU set");
+    second_mask.sort_unstable();
+    assert_eq!(second_mask, first_mask);
+    assert!(second.pinning_plan.is_none());
+
+    drop(second);
+    drop(first);
+    drop(peer1);
+    drop(peer0);
+    let exact = crate::vmm::KtstrVm::acquire_default_run_locks(Some(&host), &topo, false)
+        .expect("free default placement");
+    assert!(exact.shared_cpu_mask.is_none());
+    assert!(
+        exact.pinning_plan.is_some(),
+        "free admission prefers exact 1:1"
+    );
+
+    let exact_peer = crate::vmm::KtstrVm::acquire_default_run_locks(Some(&host), &topo, false)
+        .expect("disjoint exact capacity remains preferable");
+    assert!(
+        exact_peer.pinning_plan.is_some(),
+        "a second default should use the remaining unshared exact CPU",
+    );
+
+    let overlapping = crate::vmm::KtstrVm::acquire_default_run_locks(Some(&host), &topo, false)
+        .expect("exact defaults retain SH and permit a shared default peer");
+    assert!(
+        overlapping.pinning_plan.is_none(),
+        "once exact capacity is occupied, default must fall back without waiting",
+    );
+    let mut overlapping_mask = overlapping
+        .shared_cpu_mask
+        .clone()
+        .expect("overlapping fallback retains its admitted CPU set");
+    overlapping_mask.sort_unstable();
+    assert_eq!(overlapping_mask, vec![0, 1]);
+    drop(overlapping);
+
+    let exact_cpu = exact
+        .pinning_plan
+        .as_ref()
+        .and_then(|plan| plan.assignments.first())
+        .map(|(_, cpu)| *cpu)
+        .expect("exact plan has one vCPU assignment");
+    let build = try_acquire_resources(&[0], LlcLockMode::Shared, &[exact_cpu], FlockMode::Shared)
+        .expect("build-style SH probe against exact default");
+    assert!(
+        matches!(&build, TryAcquireAll::Acquired(_)),
+        "an exact-pinned default must not block overlapping build/no-perf SH",
+    );
+    drop(build);
+    assert!(matches!(
+        try_acquire_resources(
+            &[0],
+            LlcLockMode::Shared,
+            &[exact_cpu],
+            FlockMode::Exclusive,
+        )
+        .expect("perf-grain probe against exact default"),
+        TryAcquireAll::Contended { .. },
+    ));
+}
+
+/// Linux flock conversion is not atomic, so the default EX probe converts and
+/// publishes its lifetime SH claim under registry EX. A concurrent performance
+/// probe cannot enter that window: it blocks on the normal registry SH fence,
+/// then observes the published SH holder and remains excluded.
+#[test]
+fn default_conversion_fence_never_coexists_with_performance_ex() {
+    use std::sync::mpsc;
+
+    let _prefixes = LockPrefixesGuard::new();
+    let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
+    let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
+    let probe =
+        protocol::ClaimSet::with_modes([0usize], [0usize], FlockMode::Shared, FlockMode::Exclusive);
+    let published =
+        protocol::ClaimSet::with_modes([0usize], [0usize], FlockMode::Shared, FlockMode::Shared);
+    let (paused_tx, paused_rx) = mpsc::sync_channel(0);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+    let (default_ready_tx, default_ready_rx) = mpsc::sync_channel(0);
+    let (release_default_tx, release_default_rx) = mpsc::sync_channel(0);
+    let default_llc_prefix = llc_prefix.clone();
+    let default_cpu_prefix = cpu_prefix.clone();
+    let default = std::thread::spawn(move || {
+        LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = default_llc_prefix);
+        CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = default_cpu_prefix);
+        let target = protocol::canonical_lock_order_with_modes(
+            &[0],
+            FlockMode::Shared,
+            &[0],
+            FlockMode::Exclusive,
+        );
+        let acquired = protocol::with_exclusive_conversion_fence(&probe, &published, None, || {
+            let locks = target
+                .iter()
+                .map(|resource| {
+                    crate::flock::try_flock(&resource.path, resource.mode)
+                        .expect("physical conversion probe")
+                        .expect("fresh physical conversion footprint")
+                })
+                .collect::<Vec<_>>();
+            paused_tx.send(()).expect("publish paused conversion");
+            resume_rx.recv().expect("resume conversion");
+            for (resource, fd) in target.iter().zip(&locks) {
+                if matches!(resource.resource, protocol::ResourceKey::Cpu(_)) {
+                    assert!(
+                        crate::flock::try_convert_flock(fd, FlockMode::Shared)
+                            .expect("convert CPU EX to SH"),
+                        "registry EX must preserve an uncontended conversion",
+                    );
+                }
+            }
+            Ok(Some(locks))
+        })
+        .expect("conversion fence");
+        let protocol::ConversionFence::Acquired(acquired) = acquired else {
+            panic!("fresh conversion must acquire");
+        };
+        default_ready_tx
+            .send(())
+            .expect("publish retained default SH");
+        release_default_rx.recv().expect("release retained default");
+        drop(acquired);
+    });
+
+    paused_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("default conversion must reach the deterministic pause");
+    assert!(
+        protocol::registry_shared_probe_is_blocked_for_tests()
+            .expect("probe conversion registry fence"),
+        "the conversion callback must retain registry EX",
+    );
+
+    let (perf_started_tx, perf_started_rx) = mpsc::sync_channel(0);
+    let (perf_result_tx, perf_result_rx) = mpsc::sync_channel(0);
+    let perf = std::thread::spawn(move || {
+        LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
+        CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
+        perf_started_tx.send(()).expect("publish perf start");
+        let contended = matches!(
+            try_acquire_resources(&[0], LlcLockMode::Shared, &[0], FlockMode::Exclusive,)
+                .expect("performance probe"),
+            TryAcquireAll::Contended { .. },
+        );
+        perf_result_tx.send(contended).expect("publish perf result");
+    });
+    perf_started_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("performance probe must start");
+    assert!(
+        perf_result_rx.try_recv().is_err(),
+        "performance must not cross the paused conversion fence",
+    );
+
+    resume_tx.send(()).expect("resume default conversion");
+    default_ready_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("default must publish retained SH");
+    assert!(
+        perf_result_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("performance probe must finish after conversion"),
+        "performance EX must observe and reject the retained default SH claim",
+    );
+    release_default_tx
+        .send(())
+        .expect("release retained default SH");
+    perf.join().expect("performance probe thread");
+    default.join().expect("default conversion thread");
+}
+
+#[test]
+fn default_shared_fallback_uses_disjoint_capacity_but_never_perf_ex() {
+    let _prefixes = LockPrefixesGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3, 4, 5]);
+    let host = HostTopology::new_for_tests(&[(vec![0, 1], 0), (vec![2, 3], 0), (vec![4, 5], 0)]);
+    let topo = crate::vmm::Topology::new(1, 1, 1, 1);
+    let perf = try_acquire_resources(&[0], LlcLockMode::Exclusive, &[0, 1], FlockMode::Exclusive)
+        .expect("acquire perf EX");
+    let perf = match perf {
+        TryAcquireAll::Acquired(locks) => locks,
+        TryAcquireAll::Contended { reason, .. } => panic!("fresh perf EX contended: {reason}"),
+    };
+    let shared_peers = [2usize, 3, 4, 5]
+        .into_iter()
+        .map(|cpu| {
+            crate::flock::try_flock(cpu_lock_path(cpu), crate::flock::FlockMode::Shared)
+                .unwrap()
+                .expect("SH exact-pin blocker")
+        })
+        .collect::<Vec<_>>();
+
+    let admitted = crate::vmm::KtstrVm::acquire_default_run_locks(Some(&host), &topo, false)
+        .expect("disjoint shared capacity must remain usable");
+    let mask = admitted
+        .shared_cpu_mask
+        .as_deref()
+        .expect("SH peers force default fallback");
+    assert!(mask.iter().all(|cpu| ![0, 1].contains(cpu)));
+    assert_eq!(mask.len(), 2);
+    drop(admitted);
+    drop(shared_peers);
+    drop(perf);
+}
+
+#[test]
+fn default_hard_perf_contention_is_no_wait_and_cancellable() {
     use std::sync::mpsc;
     use std::sync::{Arc, atomic::AtomicBool};
 
     let _broker = InterruptibleFlockBrokerGuard::start();
     let _prefixes = LockPrefixesGuard::new_real_wake();
     let _allowed = AllowedCpusGuard::new(vec![0, 1]);
-    let host = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
+    let host = HostTopology::new_for_tests(&[(vec![0, 1], 0)]);
     let topo = crate::vmm::Topology::new(1, 1, 1, 1);
+    let perf = try_acquire_resources(&[0], LlcLockMode::Exclusive, &[0, 1], FlockMode::Exclusive)
+        .expect("acquire perf EX");
+    let perf = match perf {
+        TryAcquireAll::Acquired(locks) => locks,
+        TryAcquireAll::Contended { reason, .. } => panic!("fresh perf EX contended: {reason}"),
+    };
 
-    // Wedge BOTH candidates' CPU locks (the per-CPU LOCK_EX is what
-    // serializes 1:1 default pins); free Y's after 400 ms.
-    let hold_x = crate::flock::try_flock(cpu_lock_path(0), crate::flock::FlockMode::Exclusive)
-        .unwrap()
-        .expect("EX cpu0");
-    let hold_y = crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Exclusive)
-        .unwrap()
-        .expect("EX cpu1");
-    // Copy the per-thread lock-prefix overrides into the releaser so
-    // its paths (none needed — it only drops fds) stay coherent.
-    let releaser = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        drop(hold_y);
-    });
+    let error = match crate::vmm::KtstrVm::acquire_default_run_locks(Some(&host), &topo, false) {
+        Ok(_) => panic!("interactive/no-wait default must surface hard perf contention"),
+        Err(error) => error,
+    };
+    assert!(error.downcast_ref::<ResourceContention>().is_some());
 
     let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
     let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = Arc::clone(&cancelled);
     let (result_tx, result_rx) = mpsc::sync_channel(1);
-    let start = std::time::Instant::now();
     let worker = std::thread::spawn(move || {
         LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
         CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
+        ALLOWED_CPUS_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(vec![0, 1]));
         let result = crate::vmm::KtstrVm::acquire_default_run_locks_interruptible(
             Some(&host),
             &topo,
             true,
             &worker_cancelled,
         );
+        ALLOWED_CPUS_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
         let _ = result_tx.send(result);
     });
-    let result = match result_rx.recv_timeout(std::time::Duration::from_secs(10)) {
-        Ok(result) => result,
-        Err(error) => {
-            cancel_registry_worker(&cancelled);
-            drop(hold_x);
-            let _ = result_rx
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .expect("cancelled default-path worker must unwind");
-            worker
-                .join()
-                .expect("cancelled default-path coordinator worker");
-            releaser.join().expect("bounded releaser thread");
-            panic!("default-path coordinator did not complete within 10 s: {error}");
-        }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    cancel_registry_worker(&cancelled);
+    let result = result_rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("cancelled default waiter must unwind");
+    worker.join().expect("cancelled default waiter");
+    let error = match result {
+        Ok(_) => panic!("cancelled admission must not acquire through perf EX"),
+        Err(error) => error,
     };
-    let elapsed = start.elapsed();
-    worker
-        .join()
-        .expect("completed default-path coordinator worker");
-    releaser.join().expect("releaser thread");
-    drop(hold_x);
-    let rl = result.expect("acquisition must complete via the freed alternative");
-
-    let plan = rl
-        .pinning_plan
-        .as_ref()
-        .expect("1:1 pin, not overcommit — both candidates map");
-    assert_eq!(
-        plan.assignments,
-        vec![(0, 1)],
-        "the coordinator must have re-planned onto the FREED candidate \
-         (LLC 1 / CPU 1), not kept waiting on the wedged one",
-    );
     assert!(
-        elapsed >= std::time::Duration::from_millis(350),
-        "must actually have waited for the release; elapsed={elapsed:?}",
+        error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::Interrupted),
+        "unexpected cancellation error: {error:#}",
     );
-    assert!(
-        elapsed < std::time::Duration::from_secs(10),
-        "the freed alternative must be taken PROMPTLY (inotify wake + \
-         re-plan), not at some distant fallback; elapsed={elapsed:?}",
-    );
+    drop(perf);
 }
 
 /// WORK CONSERVATION: while a big `LOCK_EX` request is the coordinator
@@ -1311,7 +1728,7 @@ fn small_shared_cell_proceeds_while_coordinator_hungers() {
         assignments: vec![(0, 51)],
         service_cpu: None,
         llc_indices: vec![11],
-        locks: Vec::new(),
+        locks: protocol::Acquired::untracked(Vec::new()),
     };
     let start = std::time::Instant::now();
     let outcome = acquire_resource_locks_waiting_impl(
@@ -1405,7 +1822,7 @@ fn coordinator_reprobes_when_a_release_races_the_initial_watch_transition() {
                 |_| Ok::<Option<()>, anyhow::Error>(None),
             )? {
                 protocol::TicketWork::Coordinator(coordinator) => coordinator,
-                protocol::TicketWork::Acquired(()) => {
+                protocol::TicketWork::Acquired(_) => {
                     anyhow::bail!("fresh registry must elect a coordinator")
                 }
             };
@@ -2237,7 +2654,9 @@ fn ticket_registry_process_helper() {
         .expect("helper queue");
 
     let (index, locks) = match queue {
-        protocol::TicketWork::Acquired(acquired) => acquired,
+        protocol::TicketWork::Acquired(acquired) => {
+            acquired.split_map(|(index, locks)| (index, locks))
+        }
         protocol::TicketWork::Coordinator(coordinator) => {
             if let Some(entered) = &coordinator_entered {
                 std::fs::write(entered, b"entered").expect("publish pre-watch coordinator entry");
@@ -3244,7 +3663,8 @@ fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
     let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .expect("block the in-flight waiter probe");
-    protocol::publish_acquired(&claim).expect("publish first external hold");
+    let blocker_two =
+        protocol::publish_acquired(&claim, blocker_two).expect("publish first external hold");
     let before = protocol::resource_epoch_for_tests().expect("resource epoch before release");
     drop(blocker_two);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -3258,7 +3678,8 @@ fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
     let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .expect("re-block waiter after epoch transition");
-    protocol::publish_acquired(&claim).expect("publish replacement external hold");
+    let blocker_two =
+        protocol::publish_acquired(&claim, blocker_two).expect("publish replacement external hold");
     std::fs::write(&gate, b"release").expect("release stale-epoch probe");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while !protocol::ticket_blocked_at_current_serial_for_tests(waiter.pid)
@@ -3343,7 +3764,7 @@ fn observer_winning_first_registry_lock_leaves_layout_choice_to_the_registrant()
         .expect("let the authoritative sparse-LLC registrant choose the host layout")
         {
             protocol::TicketWork::Coordinator(coordinator) => coordinator,
-            protocol::TicketWork::Acquired(()) => {
+            protocol::TicketWork::Acquired(_) => {
                 panic!("first sparse-LLC registrant must become coordinator")
             }
         };
@@ -3375,7 +3796,7 @@ fn register_sparse_first_ticket_after_observation() {
         .expect("let the authoritative sparse-LLC registrant choose the host layout")
         {
             protocol::TicketWork::Coordinator(coordinator) => coordinator,
-            protocol::TicketWork::Acquired(()) => {
+            protocol::TicketWork::Acquired(_) => {
                 panic!("first sparse-LLC registrant must become coordinator")
             }
         };

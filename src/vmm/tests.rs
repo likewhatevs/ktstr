@@ -435,71 +435,89 @@ fn routing_failure_summary_none_when_zero_else_counts() {
     );
 }
 
-/// The pure build_overcommit_run_locks helper uses the resolved allowed cpuset
-/// as the default mask (no locks, no pinning plan). Production reaches it after
-/// the coordinated overcommit bridge or as the interactive best-effort
-/// fallback. The mask is the run-time budget source:
-/// run() stamps result.cpu_budget = default_cpu_mask.len().max(1), so the
-/// sidecar reflects the overcommit mask, not the build-time vCPU count. vcpus
-/// equals the mask size here so the overcommit_warning side-channel (which fires
-/// only when the mask is narrower than vcpus) stays out of this mask-focused
-/// test.
+struct DefaultAdmissionTestGuard {
+    _dir: tempfile::TempDir,
+}
+
+impl DefaultAdmissionTestGuard {
+    fn new(cpus: Vec<usize>) -> Self {
+        let dir = tempfile::TempDir::new().expect("default admission tempdir");
+        host_topology::ALLOWED_CPUS_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(cpus));
+        host_topology::LLC_LOCK_PREFIX_OVERRIDE.with(|slot| {
+            *slot.borrow_mut() = Some(format!("{}/llc-", dir.path().display()));
+        });
+        host_topology::CPU_LOCK_PREFIX_OVERRIDE.with(|slot| {
+            *slot.borrow_mut() = Some(format!("{}/cpu-", dir.path().display()));
+        });
+        Self { _dir: dir }
+    }
+}
+
+impl Drop for DefaultAdmissionTestGuard {
+    fn drop(&mut self) {
+        host_topology::ALLOWED_CPUS_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        host_topology::LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        host_topology::CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// The default fallback constructor preserves the exact shared mask admitted
+/// alongside its run-scoped locks.
 #[test]
-fn build_overcommit_run_locks_uses_allowed_as_mask() {
-    let rl = KtstrVm::build_overcommit_run_locks(vec![0, 1, 2, 3], 4);
-    assert_eq!(rl.default_cpu_mask, Some(vec![0, 1, 2, 3]));
+fn build_default_shared_run_locks_uses_admitted_mask() {
+    let rl = KtstrVm::build_default_shared_run_locks(
+        vec![0, 1, 2, 3],
+        4,
+        host_topology::protocol::Acquired::untracked(Vec::new()),
+    );
+    assert_eq!(rl.shared_cpu_mask, Some(vec![0, 1, 2, 3]));
     assert!(rl.locks.is_empty());
     assert!(rl.pinning_plan.is_none());
-    // The overcommit path is not the no-perf replan path — it must not
-    // populate `no_perf_cpus` (only `acquire_run_locks`' no-perf arm
-    // does, from its fresh LLC plan).
-    assert!(rl.no_perf_cpus.is_none());
+    assert!(rl.default_shared_fallback);
 }
 
-/// acquire_default_run_locks overcommits (default_cpu_mask = the allowed cpuset)
-/// when there is no cached host topology — nothing to plan a 1:1 pin against.
+/// Without cached LLC topology, default still takes a target-sized CPU-SH
+/// reservation rather than degrading to an unreserved run.
 #[test]
-fn acquire_default_run_locks_overcommits_with_no_host_topo() {
-    // Reset BEFORE the asserts so an assert-fail cannot leak the thread-local
-    // into a sibling; the call itself has no panic path. (host_topology's RAII
-    // AllowedCpusGuard is module-private; the override is thread-local +
-    // per-test isolated, so a leak could not cross tests regardless.)
-    host_topology::ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = Some(vec![0, 1]));
+fn acquire_default_run_locks_uses_shared_bridge_with_no_host_topo() {
+    let _guard = DefaultAdmissionTestGuard::new(vec![0, 1]);
     let rl = KtstrVm::acquire_default_run_locks(None, &Topology::new(1, 1, 1, 1), false);
-    host_topology::ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = None);
     let rl = rl.expect("no-host overcommit is Ok, not an error");
+    let mut shared_cpu_mask = rl
+        .shared_cpu_mask
+        .clone()
+        .expect("default bridge retains its admitted CPU set");
+    shared_cpu_mask.sort_unstable();
     assert_eq!(
-        rl.default_cpu_mask,
-        Some(vec![0, 1]),
-        "overcommit uses the allowed cpuset as the mask",
+        shared_cpu_mask,
+        vec![0, 1],
+        "vcpus + 1 uses the complete two-CPU allowed set",
     );
     assert!(rl.pinning_plan.is_none());
-    assert!(rl.no_perf_cpus.is_none());
+    assert!(rl.default_shared_fallback);
 }
 
-/// acquire_default_run_locks overcommits when the host is too small for a 1:1
-/// pin (compute_pinning fails for every offset, produced_candidate stays false)
-/// — the make-it-work-overcommit-if-topologically-impossible host-gate policy.
-/// Host has 1 LLC; the topology requests 2, so no offset can map it.
+/// A host too small for exact 1:1 topology still admits the clamped shared
+/// pool. Host has 1 LLC; the topology requests 2, so no exact plan can map.
 #[test]
-fn acquire_default_run_locks_overcommits_when_host_too_small() {
+fn acquire_default_run_locks_uses_shared_pool_when_host_too_small() {
     let host = host_topology::HostTopology::new_for_tests(&[(vec![0, 1], 0)]);
     let topo = Topology::new(1, 2, 1, 1);
-    // Reset BEFORE the asserts so an assert-fail cannot leak the thread-local
-    // into a sibling; the call itself has no panic path. (host_topology's RAII
-    // AllowedCpusGuard is module-private; the override is thread-local +
-    // per-test isolated, so a leak could not cross tests regardless.)
-    host_topology::ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = Some(vec![0, 1]));
+    let _guard = DefaultAdmissionTestGuard::new(vec![0, 1]);
     let rl = KtstrVm::acquire_default_run_locks(Some(&host), &topo, false);
-    host_topology::ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = None);
     let rl = rl.expect("a too-small host overcommits, it does not error or skip");
+    let mut shared_cpu_mask = rl
+        .shared_cpu_mask
+        .clone()
+        .expect("default fallback retains its admitted CPU set");
+    shared_cpu_mask.sort_unstable();
     assert_eq!(
-        rl.default_cpu_mask,
-        Some(vec![0, 1]),
-        "host too small for a 1:1 pin overcommits to the allowed cpuset",
+        shared_cpu_mask,
+        vec![0, 1],
+        "host too small for a 1:1 pin uses the exact shared pool",
     );
     assert!(rl.pinning_plan.is_none());
-    assert!(rl.no_perf_cpus.is_none());
+    assert!(rl.default_shared_fallback);
 }
 
 /// Performance admission must publish every exact whole-LLC placement, not
@@ -593,7 +611,7 @@ fn availability_replanning_keeps_one_replaceable_live_candidate() {
             assignments: vec![(0, cpu)],
             service_cpu: None,
             llc_indices: vec![llc],
-            locks: Vec::new(),
+            locks: host_topology::protocol::Acquired::untracked(Vec::new()),
         },
         llc_mode: host_topology::LlcLockMode::Shared,
         cpu_mode: crate::flock::FlockMode::Exclusive,
@@ -632,7 +650,7 @@ fn stale_granted_replan_retains_the_registry_designation() {
             assignments: vec![(0, cpu)],
             service_cpu: None,
             llc_indices: vec![llc],
-            locks: Vec::new(),
+            locks: host_topology::protocol::Acquired::untracked(Vec::new()),
         },
         llc_mode: host_topology::LlcLockMode::Shared,
         cpu_mode: crate::flock::FlockMode::Exclusive,
@@ -717,25 +735,24 @@ fn stale_granted_replan_retains_the_registry_designation() {
 #[test]
 fn coordinator_synthesis_builds_a_nonadjacent_ready_live_candidate() {
     let host = host_topology::HostTopology::new_for_tests(&[
-        (vec![0], 0),
-        (vec![1], 0),
-        (vec![2], 0),
-        (vec![3], 0),
+        (vec![0, 1], 0),
+        (vec![2, 3], 0),
+        (vec![4, 5], 0),
+        (vec![6, 7], 0),
     ]);
-    let ready_cpus = std::collections::BTreeSet::from([0usize, 2]);
+    let ready_cpus = std::collections::BTreeSet::from([0usize, 1, 4, 5]);
     let ready_llcs = std::collections::BTreeSet::from([0usize, 2]);
     let candidate = synthesize_ready_candidate(
         &host,
         &Topology::new(1, 2, 1, 1),
-        host_topology::PinningKind::Default,
-        &[0, 1, 2, 3],
+        &[0, 1, 2, 3, 4, 5, 6, 7],
         &[0, 1, 2, 3],
         |claim| Ok(claim.cpus.is_subset(&ready_cpus) && claim.llcs.is_subset(&ready_llcs)),
     )
     .unwrap()
     .expect("the coordinator snapshot must synthesize LLCs 0+2");
     assert_eq!(candidate.plan.llc_indices, vec![0, 2]);
-    assert_eq!(candidate.cpu_reservations, vec![0, 2]);
+    assert_eq!(candidate.cpu_reservations, vec![0, 1, 4, 5]);
 }
 
 #[test]
@@ -744,12 +761,12 @@ fn effective_run_placement_uses_runtime_plan_for_every_service_consumer() {
         assignments: vec![(0, 8), (1, 9)],
         service_cpu: Some(10),
         llc_indices: vec![2],
-        locks: Vec::new(),
+        locks: host_topology::protocol::Acquired::untracked(Vec::new()),
     };
-    let no_perf = [12, 13];
-    let placement = EffectiveRunPlacement::new(Some(&selected), Some(&no_perf));
+    let shared = [12, 13];
+    let placement = EffectiveRunPlacement::new(Some(&selected), Some(&shared));
     assert_eq!(placement.service_cpu, Some(10));
-    assert_eq!(placement.no_perf_cpus, Some(no_perf.as_slice()));
+    assert_eq!(placement.shared_cpus, Some(shared.as_slice()));
 }
 
 #[test]
@@ -758,7 +775,7 @@ fn exact_plan_expands_to_dense_default_interactive_pins() {
         assignments: vec![(0, 20), (1, 21), (2, 22), (3, 23)],
         service_cpu: None,
         llc_indices: vec![4, 5],
-        locks: Vec::new(),
+        locks: host_topology::protocol::Acquired::untracked(Vec::new()),
     };
     assert_eq!(
         pin_targets_from_plan(Some(&selected), 4),
@@ -814,33 +831,13 @@ fn interactive_unreserved_placement_never_resurrects_build_shape() {
     assert!(plan.is_none());
     assert!(placement.service_cpu.is_none());
     assert!(
-        placement.no_perf_cpus.is_none(),
-        "contention fallback is defined entirely by the current acquisition; \
-         no stale build-time no-perf mask may reappear",
+        placement.shared_cpus.is_none(),
+        "unreserved placement must not resurrect any stale build-time mask",
     );
 }
 
 #[test]
-fn interactive_performance_mode_skips_physical_acquisition() {
-    let acquire_called = std::cell::Cell::new(false);
-    let run_locks =
-        KtstrVm::interactive_run_locks_for_mode(true, || -> anyhow::Result<RunLocks> {
-            acquire_called.set(true);
-            anyhow::bail!("performance shell must not evaluate physical admission")
-        })
-        .expect("interactive performance mode is explicitly reservation-free");
-    assert!(
-        !acquire_called.get(),
-        "performance shell must not probe or queue for an exact reservation",
-    );
-    assert!(run_locks.locks.is_empty());
-    assert!(run_locks.default_cpu_mask.is_none());
-    assert!(run_locks.pinning_plan.is_none());
-    assert!(run_locks.no_perf_cpus.is_none());
-}
-
-#[test]
-fn default_candidate_scan_reuses_one_aggregate_snapshot_and_fences_survivors() {
+fn predecessor_ex_claim_fences_exact_and_shared_default_admission() {
     struct ResetOverrides;
     impl Drop for ResetOverrides {
         fn drop(&mut self) {
@@ -874,99 +871,31 @@ fn default_candidate_scan_reuses_one_aggregate_snapshot_and_fences_survivors() {
     .expect("register union CPU claim")
     {
         host_topology::protocol::TicketWork::Coordinator(coordinator) => coordinator,
-        host_topology::protocol::TicketWork::Acquired(()) => {
+        host_topology::protocol::TicketWork::Acquired(_) => {
             panic!("fresh registry must elect a coordinator")
         }
     };
     let host = host_topology::HostTopology::new_for_tests(&[(vec![0, 1, 2, 3], 0)]);
     let topo = Topology::new(1, 1, 1, 1);
-    let snapshot_before = host_topology::protocol::aggregate_snapshot_read_count_for_tests();
-    let probe_before = host_topology::authoritative_registry_probe_count_for_tests();
     let error = match KtstrVm::acquire_default_run_locks(Some(&host), &topo, false) {
-        Ok(_) => panic!("the union claim must fence every default CPU window"),
+        Ok(_) => panic!("the union EX claim must fence exact and shared default placement"),
         Err(error) => error,
     };
     assert!(
         error
             .downcast_ref::<host_topology::ResourceContention>()
             .is_some(),
-        "all locally fenced candidates must report contention: {error:#}",
-    );
-    assert_eq!(
-        host_topology::protocol::aggregate_snapshot_read_count_for_tests() - snapshot_before,
-        1,
-        "the full default candidate scan must copy aggregates once",
-    );
-    assert_eq!(
-        host_topology::authoritative_registry_probe_count_for_tests() - probe_before,
-        0,
-        "locally fenced windows must not reopen the authoritative registry fence",
+        "predecessor EX pressure must report contention: {error:#}",
     );
 
     drop(coordinator);
-    let probe_before = host_topology::authoritative_registry_probe_count_for_tests();
     let acquired = KtstrVm::acquire_default_run_locks(Some(&host), &topo, false)
         .expect("an unfenced default candidate must acquire");
-    assert_eq!(
-        host_topology::authoritative_registry_probe_count_for_tests() - probe_before,
-        1,
-        "the selected unfenced window must still use the authoritative fence",
+    assert!(
+        acquired.pinning_plan.is_some(),
+        "free host prefers exact 1:1"
     );
     drop(acquired);
-}
-
-/// degrade_contention_to_overcommit converts a transient ResourceContention
-/// into a lock-free best-effort RunLocks: the one-shot shell deliberately
-/// does not park on a peer's LOCK_EX (no wait deadline, no nextest retry),
-/// so it boots overcommitted rather than aborting. No locks, no mask, no
-/// pinning plan.
-#[test]
-fn degrade_contention_to_overcommit_maps_contention_to_lockfree() {
-    let contended = Err(anyhow::Error::new(host_topology::ResourceContention {
-        reason: "all 3 LLC slots busy (LOCK_SH)".into(),
-    }));
-    let rl = KtstrVm::degrade_contention_to_overcommit(contended)
-        .expect("contention degrades to Ok, not an error");
-    assert!(
-        rl.locks.is_empty(),
-        "best-effort boot holds no resource locks"
-    );
-    assert!(rl.default_cpu_mask.is_none());
-    assert!(rl.pinning_plan.is_none());
-    assert!(
-        rl.no_perf_cpus.is_none(),
-        "interactive contention must not resurrect the build-time no-perf mask",
-    );
-}
-
-/// degrade_contention_to_overcommit passes a successful acquire through
-/// unchanged — the degrade only fires on ResourceContention.
-#[test]
-fn degrade_contention_to_overcommit_passes_success_through() {
-    let ok = Ok(RunLocks {
-        locks: Vec::new(),
-        default_cpu_mask: Some(vec![0, 1]),
-        pinning_plan: None,
-        no_perf_cpus: None,
-    });
-    let rl = KtstrVm::degrade_contention_to_overcommit(ok).expect("Ok passes through");
-    assert_eq!(rl.default_cpu_mask, Some(vec![0, 1]));
-}
-
-/// degrade_contention_to_overcommit propagates a non-contention error rather
-/// than masking a genuine failure as an overcommit boot.
-#[test]
-fn degrade_contention_to_overcommit_propagates_other_errors() {
-    let boom = Err::<RunLocks, _>(anyhow::anyhow!("disk gone"));
-    let err = match KtstrVm::degrade_contention_to_overcommit(boom) {
-        Ok(_) => panic!("non-contention error must propagate, not degrade"),
-        Err(e) => e,
-    };
-    assert!(err.to_string().contains("disk gone"));
-    assert!(
-        err.downcast_ref::<host_topology::ResourceContention>()
-            .is_none()
-    );
 }
 
 #[test]

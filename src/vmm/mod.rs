@@ -649,26 +649,32 @@ pub struct KtstrVm {
 
 struct RunLocks {
     #[allow(dead_code)]
-    locks: Vec<std::os::fd::OwnedFd>,
-    default_cpu_mask: Option<Vec<usize>>,
+    locks: host_topology::protocol::Acquired<Vec<std::os::fd::OwnedFd>>,
     pinning_plan: Option<host_topology::PinningPlan>,
-    /// Refreshed no-perf CPU list from the run-time replan. `Some` only
-    /// on the `no_perf_mode` arm that re-plans against live holder
-    /// counts; the run threads it to `run_vm`'s affinity-mask consumers — the
-    /// vCPU-thread mask, the BSP mask, and the virtio-blk worker placement — so
-    /// the mask every consumer applies matches the LLCs the run-scoped fds in
-    /// `locks` actually protect. `None` never resurrects the build-time shape:
-    /// only the separate default-overcommit mask remains a valid fallback.
-    no_perf_cpus: Option<Vec<usize>>,
+    /// Run-time shared CPU pool admitted for either explicit no-perf mode or
+    /// default's best-effort fallback. Every mask consumer uses this exact
+    /// list, so placement cannot drift from the LLC-SH/CPU-SH locks above.
+    /// Exact default/performance placements instead carry `pinning_plan`.
+    shared_cpu_mask: Option<Vec<usize>>,
+    /// Default-style admission retains CPU-SH even when it also produced an
+    /// exact pinning plan. Compatible peers may overlap those CPUs later, so
+    /// halt polling must not burn their shared capacity.
+    default_shared_cpu_claim: bool,
+    /// Distinguishes default's shared fallback from explicit no-perf mode.
+    /// The mask itself is intentionally common; this bit only drives default's
+    /// overcommit diagnostic/result accounting.
+    default_shared_fallback: bool,
 }
 
 impl RunLocks {
+    #[allow(dead_code)]
     fn unreserved() -> Self {
         Self {
-            locks: Vec::new(),
-            default_cpu_mask: None,
+            locks: host_topology::protocol::Acquired::untracked(Vec::new()),
             pinning_plan: None,
-            no_perf_cpus: None,
+            shared_cpu_mask: None,
+            default_shared_cpu_claim: false,
+            default_shared_fallback: false,
         }
     }
 }
@@ -835,7 +841,6 @@ fn stage_granted_candidate(
 fn synthesize_ready_candidate(
     host_topo: &host_topology::HostTopology,
     topology: &Topology,
-    kind: host_topology::PinningKind,
     allowed: &[usize],
     watch_llcs: &[usize],
     mut ready: impl FnMut(&host_topology::protocol::ClaimSet) -> Result<bool>,
@@ -868,11 +873,7 @@ fn synthesize_ready_candidate(
         let exclusive = host_topology::resource_claim_with_modes(
             &[llc],
             host_topology::LlcLockMode::Exclusive,
-            if kind == host_topology::PinningKind::Performance {
-                &host_topo.llc_groups[llc].cpus
-            } else {
-                &[]
-            },
+            &host_topo.llc_groups[llc].cpus,
             crate::flock::FlockMode::Exclusive,
         );
         if ready(&exclusive)? {
@@ -882,7 +883,7 @@ fn synthesize_ready_candidate(
 
     let planned = host_topo.topology_pinning_candidates(
         topology,
-        kind,
+        host_topology::PinningKind::Performance,
         allowed,
         Some(host_topology::PinningPreferences {
             cpus: &preferred_cpus,
@@ -913,17 +914,17 @@ fn synthesize_ready_candidate(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EffectiveRunPlacement<'a> {
     pub(crate) service_cpu: Option<usize>,
-    pub(crate) no_perf_cpus: Option<&'a [usize]>,
+    pub(crate) shared_cpus: Option<&'a [usize]>,
 }
 
 impl<'a> EffectiveRunPlacement<'a> {
     fn new(
         pinning_plan: Option<&host_topology::PinningPlan>,
-        no_perf_cpus: Option<&'a [usize]>,
+        shared_cpus: Option<&'a [usize]>,
     ) -> Self {
         Self {
             service_cpu: pinning_plan.and_then(|plan| plan.service_cpu),
-            no_perf_cpus,
+            shared_cpus,
         }
     }
 }
@@ -1391,16 +1392,16 @@ impl KtstrVm {
         // charged against the guest.
         let run_start = Instant::now();
 
-        // Per-VM halt-poll (W2f): keyed on the run-lock outcome now that it is
-        // resolved. `default_cpu_mask` is set only on the default-path
-        // overcommit fallback (see `build_overcommit_run_locks`), so it is the
-        // overcommit signal. `KVM_CAP_HALT_POLL` is settable at any time
+        // Per-VM halt-poll (W2f): every default admission retains CPU-SH and
+        // may overlap a compatible peer later, even when it began on an exact
+        // unshared pin. Polling must not burn capacity that shared admission
+        // deliberately made available to others.
         // (api.rst 7.20), so applying it here — after vCPU create, before the
         // run loop — is valid. `None` leaves the host module default.
         if let Some(ns) = setup::halt_poll_policy(
             self.no_perf_mode,
             self.performance_mode,
-            run_locks.default_cpu_mask.is_some(),
+            run_locks.default_shared_cpu_claim,
         ) {
             vm.set_halt_poll(ns);
         }
@@ -1409,31 +1410,16 @@ impl KtstrVm {
         // physical acquisition. The build-time performance shape is a capacity
         // witness and must never be resurrected as run placement.
         let effective_plan = run_locks.pinning_plan.as_ref();
-        // No-perf run-time replan output: every affinity mask inside `run_vm`
-        // binds to the LLCs these run-scoped fds actually hold. `None` on a
-        // degraded no-perf arm means no affinity, never the stale build-time
-        // shape; the separate default-overcommit arm may still supply its
-        // authoritative `default_cpu_mask`.
-        let effective_no_perf_cpus = run_locks.no_perf_cpus.as_deref();
-        let mut run = self.run_vm(
-            run_start,
-            vm,
-            run_locks.default_cpu_mask.as_deref(),
-            effective_plan,
-            effective_no_perf_cpus,
-        )?;
-        // The default-overcommit path masks every vCPU thread to a CPU set
-        // SMALLER than vcpus (host too small for a 1:1 pin). build()'s
-        // effective_cpu_budget assumed this path either 1:1-pins or aborts, so
-        // it stamped the full vcpu count; capture the true masked host-CPU
-        // count here (clamped >= 1, mirroring the builder.rs sentinel) so the
-        // sidecar records the real overcommit and render_overcommit_warning's
-        // b<v test fires. None on every non-overcommit path, so the build-time
-        // effective_cpu_budget stands.
+        // Shared run-time replan output: both explicit no-perf mode and
+        // default's fallback bind every affinity consumer to the exact CPU
+        // pool protected by this invocation's LLC-SH/CPU-SH locks.
+        let shared_cpu_mask = run_locks.shared_cpu_mask.as_deref();
+        let mut run = self.run_vm(run_start, vm, effective_plan, shared_cpu_mask)?;
+        // Default fallback may run fewer host CPUs than guest vCPUs. Record the
+        // admitted pool rather than the build-time 1:1 capacity witness.
         let overcommit_budget = run_locks
-            .default_cpu_mask
-            .as_ref()
-            .map(|m| (m.len() as u32).max(1));
+            .default_shared_fallback
+            .then(|| (run_locks.shared_cpu_mask.as_ref().map_or(0, Vec::len) as u32).max(1));
         // Couple the physical reservation to the existing run-thread
         // supervisor before entering teardown. Its normal path releases the
         // fds immediately after every AP/device/helper has quiesced; its Drop
@@ -1490,7 +1476,7 @@ impl KtstrVm {
     /// * `no_perf_mode` + cached `no_perf_plan`: re-runs the full
     ///   `acquire_llc_plan` (DISCOVER+PLAN+ACQUIRE) against the
     ///   `no_perf_effective_cap` budget. The fresh plan's fds ride the run;
-    ///   its refreshed `cpus` thread through `RunLocks::no_perf_cpus` to every
+    ///   its refreshed `cpus` thread through `RunLocks::shared_cpu_mask` to every
     ///   mask consumer so mask + lock identity holds by construction.
     /// * `no_perf_mode` + missing plan (bypass / degraded sysfs):
     ///   returns an empty Vec — `build()` already warned, no
@@ -1499,20 +1485,21 @@ impl KtstrVm {
     ///   mapper's exact candidates, probes every complete claim, and on
     ///   contention enters flexible admission. The acquired candidate—not the
     ///   build-time shape witness—becomes the effective affinity and NUMA plan.
-    /// * default else: uses that same mapper without a service CPU, taking
-    ///   LLC-SH plus exact CPU-EX reservations. A busy exact-candidate set
-    ///   enters flexible admission and can re-plan from the coordinator's
-    ///   availability snapshot. If no exact candidate can map the topology
-    ///   (host too small), or no host topology was cached at build time, it
-    ///   OVERCOMMITS through the LLC-SH + allowed-CPU-EX admission bridge
-    ///   instead of skipping. This is the path
+    /// * default else: opportunistically probes every 1:1 placement with an
+    ///   instantaneous LLC-SH/CPU-EX check, then retains LLC-SH/CPU-SH for
+    ///   the lifetime of the pinned run. If none is immediately available, it falls through
+    ///   to the same exact-size LLC-SH/CPU-SH planner as no-perf mode, using a
+    ///   `vcpus + 1` spread pool. Shared peers coexist; only performance-mode
+    ///   EX holders or predecessor EX claims can make this path wait. This is
+    ///   also the path used when no 1:1 placement maps the topology.
+    ///   This is the path
     ///   test fixtures take when neither `--perf-mode` nor `--no-perf-mode`
     ///   is in effect.
     fn acquire_run_locks(&self, wait: bool) -> Result<RunLocks> {
         if self.no_perf_mode {
             // Re-plan at run time rather than freezing the build-time shape.
             // The fresh plan owns the only physical resource fds and its
-            // `cpus` are threaded through `RunLocks::no_perf_cpus` to every
+            // `cpus` are threaded through `RunLocks::shared_cpu_mask` to every
             // downstream mask consumer, preserving mask/lock identity by
             // construction. When the build plan is absent (degraded sysfs /
             // bypass), no coordination is possible and build() already
@@ -1549,16 +1536,18 @@ impl KtstrVm {
                     let host_topology::LlcPlan { cpus, locks, .. } = fresh;
                     Ok(RunLocks {
                         locks,
-                        default_cpu_mask: None,
                         pinning_plan: None,
-                        no_perf_cpus: Some(cpus),
+                        shared_cpu_mask: Some(cpus),
+                        default_shared_cpu_claim: false,
+                        default_shared_fallback: false,
                     })
                 }
                 _ => Ok(RunLocks {
-                    locks: Vec::new(),
-                    default_cpu_mask: None,
+                    locks: host_topology::protocol::Acquired::untracked(Vec::new()),
                     pinning_plan: None,
-                    no_perf_cpus: None,
+                    shared_cpu_mask: None,
+                    default_shared_cpu_claim: false,
+                    default_shared_fallback: false,
                 }),
             }
         } else if self.performance_mode {
@@ -1572,54 +1561,39 @@ impl KtstrVm {
                 ),
             }
         } else {
-            // Default: probe every bounded exact candidate (LLC-SH +
-            // CPU-EX), then join flexible admission when all are busy. If no
-            // exact candidate maps, use the coordinated overcommit bridge.
+            // Default: probe every bounded exact candidate with a momentary
+            // LLC-SH/CPU-EX check, retain LLC-SH/CPU-SH on success, or
+            // immediately use shared admission.
             Self::acquire_default_run_locks(self.host_topo.as_ref(), &self.topology, wait)
         }
     }
 
     /// Run-lock acquisition for the interactive / one-shot shell path
     /// ([`Self::run_interactive`]). Passes `wait = false` so
-    /// acquisition does not register on a contended reservation — a human on a
-    /// busy shared host should boot immediately, not park in the
-    /// admission registry. On the resulting transient
-    /// `ResourceContention` (every candidate LLC slot busy under a concurrent
-    /// peer's `LOCK_EX`) it degrades to a lock-free best-effort boot instead
-    /// of failing. The test path ([`Self::run`]) instead passes `wait = true`
-    /// and waits for the holder (see [`Self::acquire_run_locks`]).
-    /// Non-contention errors still propagate.
+    /// acquisition does not register on a contended reservation. Default and
+    /// no-perf shells therefore take an immediately available shared pool or
+    /// surface contention. A performance-configured shell still ignores exact
+    /// performance pinning, but uses the same default shared fallback so it
+    /// cannot run through another performance VM's exclusive reservation.
     fn acquire_interactive_run_locks(&self) -> Result<RunLocks> {
-        Self::interactive_run_locks_for_mode(self.performance_mode, || {
-            self.acquire_run_locks(false)
-        })
-    }
-
-    /// Apply the interactive admission policy without eagerly evaluating the
-    /// physical acquisition closure.
-    ///
-    /// Interactive performance-mode pinning is intentionally unsupported (see
-    /// `run_interactive`'s public contract). Reserving an exact perf candidate
-    /// while launching unpinned vCPUs would sequester resources the shell does
-    /// not actually use, so this mode does not call `acquire` at all.
-    fn interactive_run_locks_for_mode(
-        performance_mode: bool,
-        acquire: impl FnOnce() -> Result<RunLocks>,
-    ) -> Result<RunLocks> {
-        if performance_mode {
-            Ok(RunLocks::unreserved())
+        if self.performance_mode {
+            Self::acquire_default_shared_run_locks(
+                self.host_topo.as_ref(),
+                host_topology::host_allowed_cpus(),
+                self.topology.total_cpus() as usize,
+                false,
+                None,
+            )
         } else {
-            Self::degrade_contention_to_overcommit(acquire())
+            self.acquire_run_locks(false)
         }
     }
 
     /// Resolve only placement backed by this interactive invocation's
     /// successful acquisition.
     ///
-    /// In particular, a contention-to-overcommit result carries no plan or
-    /// mask and must stay that way: resurrecting `self.no_perf_plan` or
-    /// `self.pinning_plan` here would bind workers to a stale build-time shape
-    /// whose resources this run does not own.
+    /// The shared mask always comes from this run's successful admission;
+    /// build-time no-perf/performance shapes are never resurrected.
     fn interactive_run_placement<'a>(
         run_locks: &'a RunLocks,
     ) -> (
@@ -1629,31 +1603,8 @@ impl KtstrVm {
         let pinning_plan = run_locks.pinning_plan.as_ref();
         (
             pinning_plan,
-            EffectiveRunPlacement::new(pinning_plan, run_locks.no_perf_cpus.as_deref()),
+            EffectiveRunPlacement::new(pinning_plan, run_locks.shared_cpu_mask.as_deref()),
         )
-    }
-
-    /// Map an [`Self::acquire_run_locks`] result for the one-shot shell path: a
-    /// transient `ResourceContention` becomes a lock-free best-effort
-    /// `RunLocks`; every other outcome (including non-contention errors) passes
-    /// through unchanged. Associated fn over the input `Result` so the degrade
-    /// policy is unit-testable — host acquisition short-circuits to
-    /// Acquired in cargo-test mode, so the contention branch is otherwise
-    /// unreachable from a test.
-    fn degrade_contention_to_overcommit(acquired: Result<RunLocks>) -> Result<RunLocks> {
-        match acquired {
-            Err(e)
-                if e.downcast_ref::<host_topology::ResourceContention>()
-                    .is_some() =>
-            {
-                eprintln!(
-                    "ktstr: host CPUs busy ({e}); booting the shell without a \
-                     host-resource reservation"
-                );
-                Ok(RunLocks::unreserved())
-            }
-            other => other,
-        }
     }
 
     /// Performance-mode run admission over every equivalent exact placement.
@@ -1708,9 +1659,10 @@ impl KtstrVm {
                 host_topology::TryAcquireAll::Acquired(locks) => {
                     return Ok(RunLocks {
                         locks,
-                        default_cpu_mask: None,
                         pinning_plan: Some(candidate.plan.clone_unlocked()),
-                        no_perf_cpus: None,
+                        shared_cpu_mask: None,
+                        default_shared_cpu_claim: false,
+                        default_shared_fallback: false,
                     });
                 }
                 host_topology::TryAcquireAll::Contended {
@@ -1728,14 +1680,8 @@ impl KtstrVm {
                 ),
             }));
         }
-        Self::acquire_flexible_as_coordinator(
-            host_topo,
-            topology,
-            host_topology::PinningKind::Performance,
-            &allowed,
-            candidates,
-            contention,
-            None,
+        Self::acquire_performance_as_coordinator(
+            host_topo, topology, &allowed, candidates, contention, None,
         )
     }
 
@@ -1765,36 +1711,22 @@ impl KtstrVm {
             .collect())
     }
 
-    /// Default (non-perf, non-no-perf) run-lock acquisition: try each LLC offset
-    /// for a 1:1 LOCK_SH pin. The offset scan is the acquisition
-    /// protocol's non-blocking FAST PATH — all-or-nothing per
-    /// candidate, claim-fenced (candidates conflicting with earlier exact
-    /// ticket claims are skipped), one bounce per offset,
-    /// then the verdict:
+    /// Default (non-perf, non-no-perf) run-lock acquisition. Every exact
+    /// 1:1 candidate gets one nonblocking, claim-fenced LLC-SH/CPU-EX probe.
+    /// A successful probe is converted to LLC-SH/CPU-SH before publication,
+    /// so exact placement is an optimization, never an exclusion contract:
     ///
     /// * A candidate acquired → 1:1 pinned run.
-    /// * NO offset maps the topology, or there is no cached host
-    ///   topology → the host is too small for a 1:1 pin → OVERCOMMIT
-    ///   (the host-gate policy: make it work; NOT contention).
-    /// * Candidates map but every offset bounced → genuine
-    ///   contention. `wait == false` (interactive) surfaces
-    ///   `ResourceContention` immediately for the overcommit degrade.
-    ///   `wait == true` (the TEST run path) joins the
-    ///   cross-invocation registry and, if elected coordinator, RE-PLANS ON EVERY WAKE:
-    ///   each lock-dir event re-probes EVERY candidate all-or-nothing
-    ///   (so a fully-freed alternative is taken immediately — never
-    ///   kept waiting on the original choice). While none completes it
-    ///   publishes one exact designation but retains no physical subset.
-    ///   It waits for the authoritative flock release; the
-    ///   holder's VM watchdog and nextest process lifecycle own
-    ///   bounds, so host preemption cannot be misclassified as
-    ///   contention.
+    /// * No exact candidate maps, or every candidate is busy → immediately
+    ///   request a `vcpus + 1` (clamped) Spread pool through the shared
+    ///   LLC-SH/CPU-SH planner. Default peers may overlap that pool.
+    /// * `wait == true` may wait only when performance EX ownership or an
+    ///   earlier incompatible EX claim leaves insufficient shared capacity.
+    /// * `wait == false` surfaces that hard contention to an interactive
+    ///   caller; there is no lock-free degradation.
     ///
-    /// Associated fn (no `&self`) over host_topo/topology so
-    /// the overcommit-vs-contention decision is unit-testable with a
-    /// synthetic HostTopology (host acquisition short-circuits
-    /// to Acquired in cargo-test mode, so a fitting host yields a pin
-    /// and a too-small host yields overcommit).
+    /// Associated fn (no `&self`) over host topology and guest topology so the
+    /// exact-vs-shared decision is testable against synthetic hosts.
     fn acquire_default_run_locks(
         host_topo: Option<&host_topology::HostTopology>,
         topology: &Topology,
@@ -1821,10 +1753,10 @@ impl KtstrVm {
     ) -> Result<RunLocks> {
         let allowed = host_topology::host_allowed_cpus();
         let Some(host_topo) = host_topo else {
-            // No cached host topology (sysfs unreadable at build time): no
-            // topology to name LLCs, but CPU locks still bridge whole-perf
-            // reservations during a waiting test run.
-            return Self::acquire_overcommit_run_locks(
+            // No cached topology can name LLCs, so use the CPU-SH fallback
+            // bridge. Whole-performance ownership names every CPU in its LLC,
+            // preserving the hard EX fence even on this degraded path.
+            return Self::acquire_default_shared_run_locks(
                 None,
                 allowed,
                 topology.total_cpus() as usize,
@@ -1839,7 +1771,7 @@ impl KtstrVm {
                     .downcast_ref::<host_topology::TopologyInsufficient>()
                     .is_some() =>
             {
-                return Self::acquire_overcommit_run_locks(
+                return Self::acquire_default_shared_run_locks(
                     Some(host_topo),
                     allowed,
                     topology.total_cpus() as usize,
@@ -1863,7 +1795,7 @@ impl KtstrVm {
             .collect();
         drop(flat);
         if candidates.is_empty() {
-            return Self::acquire_overcommit_run_locks(
+            return Self::acquire_default_shared_run_locks(
                 Some(host_topo),
                 allowed,
                 topology.total_cpus() as usize,
@@ -1892,61 +1824,42 @@ impl KtstrVm {
             .reduce(|envelope, claim| envelope.union_envelope(&claim))
             .expect("default candidates are non-empty");
         let aggregate = host_topology::protocol::registered_claim_snapshot(&required)?;
-        let mut contention = host_topology::protocol::ContentionSet::default();
         // FAST PATH: one non-blocking, all-or-nothing bounce per locally
         // eligible candidate.
         for (candidate, claim) in candidates.iter().zip(&claims) {
             if aggregate.conflicts(claim)? {
                 continue;
             }
-            match host_topology::try_acquire_resources(
+            match host_topology::try_acquire_default_exact_resources(
                 &candidate.plan.llc_indices,
-                candidate.llc_mode,
                 &candidate.cpu_reservations,
-                candidate.cpu_mode,
+                cancelled,
             )? {
                 host_topology::TryAcquireAll::Acquired(locks) => {
                     return Ok(RunLocks {
                         locks,
-                        default_cpu_mask: None,
                         pinning_plan: Some(candidate.plan.clone_unlocked()),
-                        no_perf_cpus: None,
+                        shared_cpu_mask: None,
+                        default_shared_cpu_claim: true,
+                        default_shared_fallback: false,
                     });
                 }
-                host_topology::TryAcquireAll::Contended {
-                    evidence: Some(evidence),
-                    ..
-                } => contention.insert(evidence),
-                host_topology::TryAcquireAll::Contended { evidence: None, .. } => {}
+                host_topology::TryAcquireAll::Contended { .. } => {}
             }
         }
-        if !wait {
-            return Err(anyhow::Error::new(host_topology::ResourceContention {
-                reason: format!(
-                    "all {} exact default placements busy (LOCK_SH)\n  \
-                     hint: a performance_mode test may hold LOCK_EX",
-                    candidates.len(),
-                ),
-            }));
-        }
-        Self::acquire_flexible_as_coordinator(
-            host_topo,
-            topology,
-            host_topology::PinningKind::Default,
-            &allowed,
-            candidates,
-            contention,
+        Self::acquire_default_shared_run_locks(
+            Some(host_topo),
+            allowed,
+            topology.total_cpus() as usize,
+            wait,
             cancelled,
         )
     }
 
-    /// Registry/coordinator phase shared by default and performance-mode
-    /// flexible placement. The reservation grain remains exact; only the
-    /// equivalent candidate selected before VM setup may change.
-    fn acquire_flexible_as_coordinator(
+    /// Registry/coordinator phase for exact performance-mode placement.
+    fn acquire_performance_as_coordinator(
         host_topo: &host_topology::HostTopology,
         topology: &Topology,
-        kind: host_topology::PinningKind,
         allowed: &[usize],
         mut candidates: Vec<FlexibleRunCandidate>,
         contention: host_topology::protocol::ContentionSet,
@@ -2009,13 +1922,11 @@ impl KtstrVm {
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         let mut watch_cpus = allowed.to_vec();
-        if kind == host_topology::PinningKind::Performance {
-            watch_cpus.extend(
-                watch_llcs
-                    .iter()
-                    .flat_map(|&llc| host_topo.llc_groups[llc].cpus.iter().copied()),
-            );
-        }
+        watch_cpus.extend(
+            watch_llcs
+                .iter()
+                .flat_map(|&llc| host_topo.llc_groups[llc].cpus.iter().copied()),
+        );
         let watch_claim = host_topology::resource_claim_with_modes(
             &watch_llcs,
             host_topology::LlcLockMode::Exclusive,
@@ -2046,14 +1957,11 @@ impl KtstrVm {
             // Feed the same mode-aware snapshot through the bounded topology
             // planner. Keep exactly one replaceable live slot: prior snapshots
             // are planning history, not useful queue alternatives.
-            if let Some(candidate) = synthesize_ready_candidate(
-                host_topo,
-                topology,
-                kind,
-                allowed,
-                &watch_llcs,
-                |claim| probe.candidate_ready(claim),
-            )? {
+            if let Some(candidate) =
+                synthesize_ready_candidate(host_topo, topology, allowed, &watch_llcs, |claim| {
+                    probe.candidate_ready(claim)
+                })?
+            {
                 let ready = stage_granted_candidate(
                     static_len,
                     candidate,
@@ -2096,12 +2004,14 @@ impl KtstrVm {
             )?
         };
         let coordinator = match ticket {
-            protocol::TicketWork::Acquired((index, locks)) => {
+            protocol::TicketWork::Acquired(acquired) => {
+                let (index, locks) = acquired.split_map(|(index, locks)| (index, locks));
                 return Ok(RunLocks {
                     locks,
-                    default_cpu_mask: None,
                     pinning_plan: Some(candidates[index].plan.clone_unlocked()),
-                    no_perf_cpus: None,
+                    shared_cpu_mask: None,
+                    default_shared_cpu_claim: false,
+                    default_shared_fallback: false,
                 });
             }
             protocol::TicketWork::Coordinator(coordinator) => {
@@ -2116,23 +2026,19 @@ impl KtstrVm {
             }
         };
         let mut step = |held: &mut protocol::HeldLocks| {
-            let live = synthesize_ready_candidate(
-                host_topo,
-                topology,
-                kind,
-                allowed,
-                &watch_llcs,
-                |claim| held.candidate_ready(claim),
-            )?
-            .map(|candidate| {
-                install_live_candidate(
-                    static_len,
-                    candidate,
-                    &mut candidates,
-                    &mut claims,
-                    &mut targets,
-                )
-            });
+            let live =
+                synthesize_ready_candidate(host_topo, topology, allowed, &watch_llcs, |claim| {
+                    held.candidate_ready(claim)
+                })?
+                .map(|candidate| {
+                    install_live_candidate(
+                        static_len,
+                        candidate,
+                        &mut candidates,
+                        &mut claims,
+                        &mut targets,
+                    )
+                });
 
             // RE-PLAN on every wake and probe every candidate
             // all-or-nothing, so a fully-freed alternative is taken the
@@ -2169,12 +2075,16 @@ impl KtstrVm {
             None => protocol::acquire_as_coordinator(coordinator, &mut step)?,
         };
         match outcome {
-            protocol::CoordinatorOutcome::Acquired((i, locks)) => Ok(RunLocks {
-                locks,
-                default_cpu_mask: None,
-                pinning_plan: Some(candidates[i].plan.clone_unlocked()),
-                no_perf_cpus: None,
-            }),
+            protocol::CoordinatorOutcome::Acquired(acquired) => {
+                let (i, locks) = acquired.split_map(|(i, locks)| (i, locks));
+                Ok(RunLocks {
+                    locks,
+                    pinning_plan: Some(candidates[i].plan.clone_unlocked()),
+                    shared_cpu_mask: None,
+                    default_shared_cpu_claim: false,
+                    default_shared_fallback: false,
+                })
+            }
             protocol::CoordinatorOutcome::Aborted { reason } => {
                 Err(anyhow::Error::new(host_topology::ResourceContention {
                     reason,
@@ -2183,36 +2093,48 @@ impl KtstrVm {
         }
     }
 
-    fn acquire_overcommit_run_locks(
+    /// Admit default's shared fallback through the same exact-size
+    /// LLC-SH/CPU-SH planner as no-perf mode. The requested pool is
+    /// `vcpus + 1`, clamped to the process cpuset. The planner may select any
+    /// compatible spread placement and returns the authoritative mask.
+    ///
+    /// Without cached LLC topology, retain the hard performance fence through
+    /// a CPU-SH bridge over the target-sized mask: whole-LLC performance
+    /// reservations also own every constituent CPU EX.
+    fn acquire_default_shared_run_locks(
         host_topo: Option<&host_topology::HostTopology>,
         allowed: Vec<usize>,
         vcpus: usize,
         wait: bool,
         cancelled: Option<&AtomicBool>,
     ) -> Result<RunLocks> {
-        let allowed_set = allowed
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        let llcs = host_topo
-            .map(|topology| {
-                topology
-                    .llc_groups
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, group)| group.cpus.iter().any(|cpu| allowed_set.contains(cpu)))
-                    .map(|(index, _)| index)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        match host_topology::acquire_overcommit_bridge(&llcs, &allowed, wait, cancelled)? {
-            host_topology::LockOutcome::Acquired { locks, .. } => Ok(
-                Self::build_overcommit_run_locks_with_locks(allowed, vcpus, locks),
-            ),
-            host_topology::LockOutcome::Unavailable(_reason) if !wait => {
-                // Interactive shells remain best-effort: never park a human
-                // behind test admission.
-                Ok(Self::build_overcommit_run_locks(allowed, vcpus))
+        let target = host_topology::no_perf_cpu_budget(allowed.len(), vcpus);
+        if let Some(host_topo) = host_topo {
+            let test_topo = crate::topology::TestTopology::from_system()
+                .context("discover NUMA distances for default shared admission")?;
+            let plan = host_topology::acquire_llc_plan_interruptible(
+                host_topo,
+                &test_topo,
+                Some(host_topology::CpuCap::new(target)?),
+                host_topology::PlacementPolicy::spread_for_process(),
+                wait,
+                cancelled,
+            )?;
+            let host_topology::LlcPlan { cpus, locks, .. } = plan;
+            return Ok(Self::build_default_shared_run_locks(cpus, vcpus, locks));
+        }
+
+        anyhow::ensure!(
+            !allowed.is_empty(),
+            "default shared admission could not determine an allowed CPU"
+        );
+        let start = host_topology::pid_window_offset(std::process::id(), allowed.len());
+        let cpus = (0..target)
+            .map(|index| allowed[(start + index) % allowed.len()])
+            .collect::<Vec<_>>();
+        match host_topology::acquire_shared_fallback_bridge(&cpus, wait, cancelled)? {
+            host_topology::LockOutcome::Acquired { locks, .. } => {
+                Ok(Self::build_default_shared_run_locks(cpus, vcpus, locks))
             }
             host_topology::LockOutcome::Unavailable(reason) => {
                 Err(anyhow::Error::new(host_topology::ResourceContention {
@@ -2222,42 +2144,20 @@ impl KtstrVm {
         }
     }
 
-    /// Build the overcommit `RunLocks` from a resolved allowed-CPU set: the
-    /// allowed cpuset as the default mask, and an
-    /// `overcommit_warning` when the mask is narrower than the vCPU count.
-    ///
-    /// This is the default (non-perf, non-no-perf) path's fallback when no 1:1
-    /// pinning plan can map the topology onto the host (the host is too small,
-    /// or no host topology was cached at build time). Rather than skipping, the
-    /// VM runs OVERCOMMITTED — every vCPU thread masked to the host's allowed
-    /// CPUs (oversubscribed + time-sliced). The mask is the run-time budget
-    /// source: the orchestrator (`run`) reads the returned `default_cpu_mask`
-    /// and overrides `VmResult.cpu_budget` with the masked host-CPU count so the
-    /// sidecar records the overcommit (not the build-time vCPU count). This is
-    /// the only place the default path fires the overcommit warning — `build()`
-    /// computes the `no_perf_plan` warning only under `no_perf_mode`. When the
-    /// allowed set is empty (a host that cannot enumerate its own affinity),
-    /// `set_thread_cpumask` no-ops and the warning is the sole signal.
-    ///
-    /// Pure (the allowed set is passed in) so the mask + warning policy is
-    /// unit-testable without reading the host cpuset.
-    fn build_overcommit_run_locks(allowed: Vec<usize>, vcpus: usize) -> RunLocks {
-        Self::build_overcommit_run_locks_with_locks(allowed, vcpus, Vec::new())
-    }
-
-    fn build_overcommit_run_locks_with_locks(
-        allowed: Vec<usize>,
+    fn build_default_shared_run_locks(
+        cpus: Vec<usize>,
         vcpus: usize,
-        locks: Vec<std::os::fd::OwnedFd>,
+        locks: host_topology::protocol::Acquired<Vec<std::os::fd::OwnedFd>>,
     ) -> RunLocks {
-        if let Some(w) = host_topology::overcommit_warning(allowed.len(), vcpus, false) {
+        if let Some(w) = host_topology::overcommit_warning(cpus.len(), vcpus, false) {
             eprintln!("{w}");
         }
         RunLocks {
             locks,
-            default_cpu_mask: Some(allowed),
             pinning_plan: None,
-            no_perf_cpus: None,
+            shared_cpu_mask: Some(cpus),
+            default_shared_cpu_claim: true,
+            default_shared_fallback: true,
         }
     }
 
@@ -2320,6 +2220,14 @@ impl KtstrVm {
                 interactive_mbind_node_map,
             )?;
             self.setup_vcpus_aarch64(&vm, kr.entry)?;
+        }
+
+        if let Some(ns) = setup::halt_poll_policy(
+            self.no_perf_mode,
+            self.performance_mode,
+            run_locks.default_shared_cpu_claim,
+        ) {
+            vm.set_halt_poll(ns);
         }
 
         let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
@@ -2560,16 +2468,15 @@ impl KtstrVm {
         let (mut bsp, bsp_ie) = ImmediateExitVcpu::new(bsp, has_immediate_exit, vcpu_run_size)
             .context("map interactive BSP kvm_run for immediate-exit")?;
 
-        // Default-mode interactive admission returns an exact plan; consume
-        // the same dense pin map as `run_vm` so the reservation and placement
-        // cannot diverge. Performance-mode interactive runs are explicitly
-        // unreserved/unpinned, while no-perf uses the admitted mask below.
+        // Default-mode interactive admission may return an exact plan; consume
+        // the same dense pin map as `run_vm`. Every non-exact interactive path,
+        // including a performance-configured shell whose exact pinning is
+        // intentionally ignored, carries an admitted shared mask below.
         let pin_targets =
             pin_targets_from_plan(effective_plan, self.topology.total_cpus() as usize);
         let ap_pins = pin_targets.get(1..).unwrap_or_default().to_vec();
-        // No-perf + --cpu-cap applies the admitted CPU list as a
-        // sched_setaffinity mask on every vCPU thread.
-        let no_perf_mask = effective_placement.no_perf_cpus;
+        // Apply the admitted shared pool to every vCPU thread.
+        let shared_cpu_mask = effective_placement.shared_cpus;
         // Interactive shell does not run a freeze coordinator, so
         // discard the freeze-handle Vecs. Interactive mode also skips
         // the perf-counter capture path; allocate empty TID slots so
@@ -2608,7 +2515,7 @@ impl KtstrVm {
             &freeze,
             &watchpoint,
             &ap_pins,
-            no_perf_mask,
+            shared_cpu_mask,
             &ap_tid_slots,
             &ap_boot_latches,
             // Interactive shell does not run a freeze coordinator,
@@ -3013,12 +2920,11 @@ impl KtstrVm {
         // deadline. Keep an inert long-duration argument for the shared
         // signature.
         //
-        // Apply the exact default pin or the no-perf admitted mask to the BSP
-        // just as `run_vm` does. Performance-mode interactive runs carry
-        // neither because their documented pinning is disabled.
+        // Apply the exact default pin or admitted shared mask to the BSP just
+        // as `run_vm` does.
         if let Some(Some(host_cpu)) = pin_targets.first() {
             pin_current_thread(*host_cpu, "BSP (shell)");
-        } else if let Some(mask) = effective_placement.no_perf_cpus {
+        } else if let Some(mask) = effective_placement.shared_cpus {
             set_thread_cpumask(mask, "BSP (shell)");
         }
         let interactive_timeout = Duration::from_secs(24 * 60 * 60);

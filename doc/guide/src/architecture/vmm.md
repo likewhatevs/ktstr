@@ -172,9 +172,11 @@ Two details worth internalizing:
 When performance mode is enabled, the VMM applies host-side isolation
 (vCPU pinning, hugepages, NUMA mbind, RT scheduling), guest-visible
 hints (`KVM_HINTS_REALTIME` CPUID), and KVM exit suppression.
-Default-mode VMs pinned 1:1 leave the KVM halt-poll interval at the
-module default (200µs); no-perf mode and overcommitted default runs
-set it to 0. See
+No-perf mode and every default-mode VM use a zero KVM halt-poll interval:
+default exact pins retain CPU-SH after their instantaneous EX probe, so a
+compatible peer may overlap them later just like a default fallback. Polling
+must not burn that peer's shared CPU. Performance mode leaves the module
+policy alone because its guest haltpoll path owns the isolated CPUs. See
 [Performance Mode](../concepts/performance-mode.md).
 
 ## Dual-role dispatch

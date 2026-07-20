@@ -217,6 +217,28 @@ pub fn try_flock<P: AsRef<Path>>(path: P, mode: FlockMode) -> Result<Option<Owne
     }
 }
 
+/// Nonblockingly convert an already-held flock to `mode`.
+///
+/// Linux implements a flock conversion as an unlock followed by a new lock,
+/// so the conversion is not atomic. A caller whose old and new modes carry
+/// admission semantics must provide an independent fence across this call.
+/// `false` means another holder won the conversion window; the fd then owns no
+/// lock and the caller must discard the whole reservation attempt.
+pub(crate) fn try_convert_flock(fd: &OwnedFd, mode: FlockMode) -> Result<bool> {
+    use rustix::fs::{FlockOperation, flock};
+
+    let operation = match mode {
+        FlockMode::Exclusive => FlockOperation::NonBlockingLockExclusive,
+        FlockMode::Shared => FlockOperation::NonBlockingLockShared,
+    };
+    match flock(fd, operation) {
+        Ok(()) => Ok(true),
+        Err(error) if error == rustix::io::Errno::WOULDBLOCK => Ok(false),
+        Err(error) => Err(std::io::Error::from_raw_os_error(error.raw_os_error()))
+            .context("convert held flock mode"),
+    }
+}
+
 /// Blocking variant of [`try_flock`]. Opens the lockfile (creating
 /// it if absent), then issues a blocking `flock(2)` that parks the
 /// caller in the kernel until the lock is available. Use after
@@ -923,6 +945,39 @@ mod tests {
         );
 
         drop(fd);
+    }
+
+    #[test]
+    fn flock_mode_conversion_retains_the_same_reservation_fd() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("convert.lock");
+        let exclusive = try_flock(&path, FlockMode::Exclusive)
+            .expect("acquire initial EX")
+            .expect("fresh EX lock");
+        assert!(
+            try_flock(&path, FlockMode::Shared)
+                .expect("probe SH against EX")
+                .is_none(),
+            "EX must initially fence a shared peer",
+        );
+
+        assert!(
+            try_convert_flock(&exclusive, FlockMode::Shared).expect("convert EX to SH"),
+            "uncontended conversion must retain the reservation",
+        );
+        let shared_peer = try_flock(&path, FlockMode::Shared)
+            .expect("probe SH after conversion")
+            .expect("converted lock must coexist with SH");
+        assert!(
+            try_flock(&path, FlockMode::Exclusive)
+                .expect("probe EX against converted SH")
+                .is_none(),
+            "converted lock must continue to fence EX",
+        );
+        drop(shared_peer);
+        drop(exclusive);
     }
 
     /// The evidence-preserving acquire keeps a real O_RDWR fd alive after
