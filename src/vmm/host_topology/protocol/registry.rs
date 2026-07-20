@@ -1511,13 +1511,14 @@ impl Ticket {
         cancelled: Option<&AtomicBool>,
     ) -> Result<ScheduleSnapshot> {
         let mut release_proofs = Some(release_proofs);
-        let mut release_if_parked = || {
-            if let Some(release) = release_proofs.take() {
-                release();
-            }
+        let (_lock, mut table) = {
+            let mut release_if_parked = || {
+                if let Some(release) = release_proofs.take() {
+                    release();
+                }
+            };
+            self.open_coordinator_table(cancelled, &mut release_if_parked)?
         };
-        let (_lock, mut table) = self.open_coordinator_table(cancelled, &mut release_if_parked)?;
-        drop(release_if_parked);
         let record = table
             .record(self.slot)?
             .filter(|record| record.ticket == self.ticket)
