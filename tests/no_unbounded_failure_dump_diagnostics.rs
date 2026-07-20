@@ -3,10 +3,27 @@
 
 use std::path::Path;
 
-const ASSERTION_FILES: &[&str] = &["failure_dump_e2e.rs", "silent_drop_e2e.rs"];
+const ASSERTION_FILES: &[&str] = &[
+    "cast_analysis_e2e.rs",
+    "failure_dump_e2e.rs",
+    "silent_drop_e2e.rs",
+];
 const FORBIDDEN: &[&str] = &[
     "{value}",
+    "{dump}",
+    "{payload}",
+    "{task_storage}",
+    "{entry}",
+    "{parent}",
+    "{bss_value}",
+    "{deref_struct}",
+    "{holder_outer}",
+    "{arena_target}",
+    "{array_map}",
+    "{val}",
     "Full JSON",
+    "Full dump",
+    "full payload",
     "payload: {value}",
     "{arena_map}",
     "{arena_field}",

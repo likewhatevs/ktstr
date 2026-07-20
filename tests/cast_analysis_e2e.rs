@@ -69,15 +69,14 @@
 //! end-to-end, against the actual JSON the freeze coordinator
 //! writes, not against synthetic BTF or stub readers (the unit
 //! tests in `src/monitor/btf_render/tests/` already cover those
-//! shapes). Each assertion fails loudly with the full payload if a
-//! gate misses, so a regression in any layer of the pipeline (cast
-//! analyzer, BPF builder, freeze rendezvous, render_cast_pointer,
-//! read_kva) surfaces with the same error path.
+//! shapes). Each assertion reports the failing structural gate and
+//! points at the persisted dump rather than copying captured arena
+//! pages and nested payloads into nextest output.
 
 mod common;
 
 use anyhow::Result;
-use common::failure_dump::read_failure_dump;
+use common::failure_dump::{failure_dump_artifact, read_failure_dump};
 use ktstr::assert::AssertResult;
 use ktstr::prelude::VmResult;
 use ktstr::scenario::ops::{HoldSpec, Step, await_accessor_ready, execute_steps};
@@ -91,7 +90,10 @@ const KTSTR_SCHED: Scheduler =
 /// entry point — the rendered ktstr_arena_ctx that triggers the
 /// cast intercept lives under `entries[].payload`. Returns the JSON
 /// value for the map; bails with a diagnostic if it cannot be found.
-fn find_task_storage_map(dump: &serde_json::Value) -> Result<&serde_json::Value> {
+fn find_task_storage_map<'a>(
+    dump: &'a serde_json::Value,
+    dump_artifact: &str,
+) -> Result<&'a serde_json::Value> {
     // BPF_MAP_TYPE_TASK_STORAGE = 29 in `enum bpf_map_type`
     // (include/uapi/linux/bpf.h; 23 is BPF_MAP_TYPE_STACK). The
     // failure-dump JSON exposes the map_type integer verbatim from
@@ -116,7 +118,7 @@ fn find_task_storage_map(dump: &serde_json::Value) -> Result<&serde_json::Value>
                  scx-ktstr declares `scx_task_map` via lib/sdt_task.bpf.c so the \
                  map MUST appear; absence means the walker filtered it, \
                  sdt_alloc was disabled, or the scheduler aborted before \
-                 task_storage allocation. Full dump: {dump}",
+                 task_storage allocation; {dump_artifact}",
                 maps.len()
             )
         })
@@ -128,6 +130,7 @@ fn find_task_storage_map(dump: &serde_json::Value) -> Result<&serde_json::Value>
 fn struct_member<'a>(
     parent: &'a serde_json::Value,
     member_name: &str,
+    dump_artifact: &str,
 ) -> Result<&'a serde_json::Value> {
     let kind = parent
         .get("kind")
@@ -136,13 +139,13 @@ fn struct_member<'a>(
     if kind != "struct" {
         anyhow::bail!(
             "expected a `struct`-kind RenderedValue but got kind={kind:?}; \
-             parent: {parent}"
+             {dump_artifact}"
         );
     }
     let members = parent
         .get("members")
         .and_then(|m| m.as_array())
-        .ok_or_else(|| anyhow::anyhow!("struct has no `members` array: {parent}"))?;
+        .ok_or_else(|| anyhow::anyhow!("struct has no `members` array; {dump_artifact}"))?;
     let member = members
         .iter()
         .find(|m| m.get("name").and_then(|n| n.as_str()) == Some(member_name))
@@ -153,12 +156,15 @@ fn struct_member<'a>(
                 .collect();
             anyhow::anyhow!(
                 "struct member `{member_name}` not found; got names: {names:?}; \
-                 parent: {parent}"
+                 {dump_artifact}"
             )
         })?;
-    member
-        .get("value")
-        .ok_or_else(|| anyhow::anyhow!("member `{member_name}` has no `value` field: {member}"))
+    member.get("value").ok_or_else(|| {
+        anyhow::anyhow!(
+            "member `{member_name}` has no `value` field; \
+             {dump_artifact}"
+        )
+    })
 }
 
 /// Asserts that scx-ktstr's per-task arena context (`struct
@@ -199,8 +205,9 @@ fn scenario_cast_analysis_chases_kernel_kptr(ctx: &ktstr::scenario::Ctx) -> Resu
 /// FAIL (`PostVmAssertionFailure`) that `expect_err` does not invert.
 fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
     let dump = read_failure_dump(result)?;
+    let dump_artifact = failure_dump_artifact(result);
 
-    let task_storage = find_task_storage_map(&dump)?;
+    let task_storage = find_task_storage_map(&dump, &dump_artifact)?;
     let entries = task_storage
         .get("entries")
         .and_then(|e| e.as_array())
@@ -209,14 +216,14 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
                 "scx_task_map has no `entries` array — TASK_STORAGE walker did \
                  not populate the map. With workers_per_cgroup>0 driving load, \
                  at least one task must have a per-task ktstr_arena_ctx. \
-                 task_storage: {task_storage}"
+                 {dump_artifact}"
             )
         })?;
     if entries.is_empty() {
         anyhow::bail!(
             "scx_task_map.entries is empty — `bpf_task_storage_get` was never \
              called (no task ran ktstr_init_task before freeze) or the local-\
-             storage walker found no live owners. task_storage: {task_storage}"
+             storage walker found no live owners; {dump_artifact}"
         );
     }
 
@@ -239,8 +246,8 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
              allocator metadata may be unresolved (no target_type_id \
              discovery), the per-task `sdt_data __arena *` field offset \
              was not found, or every captured arena pointer fell outside \
-             the kern_vm window. entry count: {}, dump: {dump}",
-            entries.len()
+             the kern_vm window. entry count: {}; {dump_artifact}",
+            entries.len(),
         );
     }
 
@@ -271,8 +278,7 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
                 .collect();
             anyhow::anyhow!(
                 "no payload rendered as Struct(type_name=\"ktstr_arena_ctx\"); \
-                 saw kinds/type_names: {kinds:?}; first payload: {}",
-                payloads[0]
+                 saw kinds/type_names: {kinds:?}; {dump_artifact}"
             )
         })?;
 
@@ -281,7 +287,7 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
     // ktstr_arena_ctx — the BPF code only loads magic for printing,
     // never as a pointer base, and never stores a typed pointer
     // into it.
-    let magic = struct_member(payload, "magic")?;
+    let magic = struct_member(payload, "magic", &dump_artifact)?;
     let magic_kind = magic
         .get("kind")
         .and_then(|k| k.as_str())
@@ -292,7 +298,7 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
              (BPF code only stores the immediate sentinel into it, never a \
              typed pointer; the analyzer must not flag this field), but got \
              kind={magic_kind:?}. cast intercept fired falsely on offset 0. \
-             magic: {magic}; full payload: {payload}"
+             {dump_artifact}"
         );
     }
     // The magic value comes from BPF code that writes
@@ -305,18 +311,18 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
     let magic_value = magic
         .get("value")
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow::anyhow!("`magic` value not a u64: {magic}"))?;
+        .ok_or_else(|| anyhow::anyhow!("`magic` value not a u64; {dump_artifact}"))?;
     if magic_value != KTSTR_ARENA_MAGIC {
         anyhow::bail!(
             "`magic` value mismatch: got 0x{magic_value:016x}, expected \
-             0x{KTSTR_ARENA_MAGIC:016x}; magic: {magic}"
+             0x{KTSTR_ARENA_MAGIC:016x}; {dump_artifact}"
         );
     }
 
     // Negative assertion #2: `counter` is a u32 — the cast intercept's
     // `int.size() != 8` gate must reject it. The render kind is
     // `uint` with bits=32.
-    let counter = struct_member(payload, "counter")?;
+    let counter = struct_member(payload, "counter", &dump_artifact)?;
     let counter_kind = counter
         .get("kind")
         .and_then(|k| k.as_str())
@@ -325,19 +331,20 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
         anyhow::bail!(
             "NEGATIVE ASSERTION FAILED: `counter` (u32) must render as Uint; \
              the cast intercept's size==8 gate must reject sub-u64 fields. \
-             Got kind={counter_kind:?}. counter: {counter}; payload: {payload}"
+             Got kind={counter_kind:?}; {dump_artifact}"
         );
     }
     let counter_bits = counter.get("bits").and_then(|b| b.as_u64()).unwrap_or(0);
     if counter_bits != 32 {
         anyhow::bail!(
-            "`counter` bits mismatch: got {counter_bits}, expected 32. counter: {counter}"
+            "`counter` bits mismatch: got {counter_bits}, expected 32; \
+             {dump_artifact}"
         );
     }
     let counter_value = counter
         .get("value")
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow::anyhow!("`counter` value not numeric: {counter}"))?;
+        .ok_or_else(|| anyhow::anyhow!("`counter` value not numeric; {dump_artifact}"))?;
     // `KTSTR_TASK_COUNTER = 42` is what `ktstr_init_task` stamps.
     const KTSTR_TASK_COUNTER: u64 = 42;
     if counter_value != KTSTR_TASK_COUNTER {
@@ -345,7 +352,7 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
             "`counter` value mismatch: got {counter_value}, expected \
              {KTSTR_TASK_COUNTER}; the BPF code's `taskc->counter = \
              KTSTR_TASK_COUNTER` write did not land or the captured page is \
-             stale. counter: {counter}"
+             stale; {dump_artifact}"
         );
     }
 
@@ -353,7 +360,7 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
     // the user-facing bar — the cast analysis pipeline turned a u64
     // field into a typed pointer that the renderer chased to its
     // target struct.
-    let task_kptr = struct_member(payload, "task_kptr")?;
+    let task_kptr = struct_member(payload, "task_kptr", &dump_artifact)?;
     let task_kptr_kind = task_kptr
         .get("kind")
         .and_then(|k| k.as_str())
@@ -372,7 +379,7 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
              (c) `MemReader::cast_lookup` did not return Some for the \
              (parent, offset) the renderer asked. \
              (d) `render_cast_pointer` bailed before emitting Ptr. \
-             task_kptr: {task_kptr}; full payload: {payload}"
+             {dump_artifact}"
         );
     }
 
@@ -385,14 +392,14 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
     let task_kptr_value = task_kptr
         .get("value")
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow::anyhow!("`task_kptr` Ptr has no `value` field: {task_kptr}"))?;
+        .ok_or_else(|| anyhow::anyhow!("`task_kptr` Ptr has no `value` field; {dump_artifact}"))?;
     if task_kptr_value == 0 {
         anyhow::bail!(
             "`task_kptr` value is 0x0 — `ktstr_stash_task_kptr` never wrote \
              a live task_struct pointer for this entry, or the captured \
              arena page predates the write. The render correctly identified \
              the field as a Ptr (cast analysis pipeline OK), but the source \
-             data is zero. task_kptr: {task_kptr}"
+             data is zero; {dump_artifact}"
         );
     }
 
@@ -420,7 +427,7 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
             "`task_kptr` Ptr has no `deref` AND no `deref_skipped_reason` — \
              the chase was either not attempted (depth cap, cycle, null \
              value), or the JSON shape changed. task_kptr value: \
-             0x{task_kptr_value:x}; task_kptr: {task_kptr}"
+             0x{task_kptr_value:x}; {dump_artifact}"
         )
     })?;
 
@@ -437,17 +444,17 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
         Some("truncated") => (
             deref
                 .get("partial")
-                .ok_or_else(|| anyhow::anyhow!("Truncated has no `partial`: {deref}"))?,
+                .ok_or_else(|| anyhow::anyhow!("Truncated has no `partial`; {dump_artifact}"))?,
             true,
         ),
         Some(other) => {
             anyhow::bail!(
                 "`task_kptr` deref must be Struct or Truncated{{partial: Struct}}, \
-                 got kind={other:?}; deref: {deref}"
+                 got kind={other:?}; {dump_artifact}"
             );
         }
         None => {
-            anyhow::bail!("`task_kptr` deref has no `kind` field: {deref}");
+            anyhow::bail!("`task_kptr` deref has no `kind` field; {dump_artifact}");
         }
     };
     let deref_kind = deref_struct
@@ -457,7 +464,7 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
     if deref_kind != "struct" {
         anyhow::bail!(
             "task_kptr deref's inner kind must be struct (post-truncation), \
-             got {deref_kind:?}; deref_struct: {deref_struct}"
+             got {deref_kind:?}; {dump_artifact}"
         );
     }
     let deref_type_name = deref_struct
@@ -466,14 +473,14 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "deref struct has no type_name (anonymous struct?); \
-                 deref_struct: {deref_struct}"
+                 {dump_artifact}"
             )
         })?;
     if deref_type_name != "task_struct" {
         anyhow::bail!(
             "deref type_name mismatch: got {deref_type_name:?}, expected \
              \"task_struct\"; the cast analyzer flagged the wrong target. \
-             deref_struct: {deref_struct}"
+             {dump_artifact}"
         );
     }
 
@@ -487,7 +494,7 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
     let members = deref_struct
         .get("members")
         .and_then(|m| m.as_array())
-        .ok_or_else(|| anyhow::anyhow!("deref task_struct has no `members`: {deref_struct}"))?;
+        .ok_or_else(|| anyhow::anyhow!("deref task_struct has no `members`; {dump_artifact}"))?;
     let names: std::collections::HashSet<&str> = members
         .iter()
         .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
@@ -500,7 +507,7 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
                  cast chase produced a struct render but the BTF Datasec \
                  walk did not surface real task_struct fields, or the \
                  read returned bytes shorter than the field offset. \
-                 Got members: {names:?}; deref_struct: {deref_struct}"
+                 Got members: {names:?}; {dump_artifact}"
             );
         }
     }
@@ -508,29 +515,32 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
     // Pid must be a non-negative integer that proves we read a real
     // task. The captured task is the running task at freeze, so pid
     // is whatever was scheduled — but it MUST be parseable.
-    let pid = struct_member(deref_struct, "pid")?;
+    let pid = struct_member(deref_struct, "pid", &dump_artifact)?;
     let pid_kind = pid
         .get("kind")
         .and_then(|k| k.as_str())
         .unwrap_or("<no-kind>");
     if pid_kind != "int" && pid_kind != "uint" {
-        anyhow::bail!("task_struct.pid must render as int/uint, got kind={pid_kind:?}: {pid}");
+        anyhow::bail!(
+            "task_struct.pid must render as int/uint, got kind={pid_kind:?}; \
+             {dump_artifact}"
+        );
     }
     let pid_value = pid
         .get("value")
-        .ok_or_else(|| anyhow::anyhow!("pid has no `value`: {pid}"))?;
+        .ok_or_else(|| anyhow::anyhow!("pid has no `value`; {dump_artifact}"))?;
     let pid_int = pid_value
         .as_i64()
         .or_else(|| pid_value.as_u64().map(|u| u as i64));
     if pid_int.is_none() {
-        anyhow::bail!("pid value not numeric: {pid}");
+        anyhow::bail!("pid value not numeric; {dump_artifact}");
     }
 
     // comm should be either a Bytes hex (the renderer's char[]
     // path) or a Struct-like rendering. Just confirm it exists with
     // a value field — the structure shape varies by BTF rendering
     // mode and that's fine for this assertion.
-    let comm = struct_member(deref_struct, "comm")?;
+    let comm = struct_member(deref_struct, "comm", &dump_artifact)?;
     let comm_kind = comm
         .get("kind")
         .and_then(|k| k.as_str())
@@ -538,7 +548,7 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
     if comm_kind == "unsupported" {
         anyhow::bail!(
             "task_struct.comm rendered as Unsupported — the BTF Datasec walk \
-             could not handle the field type. comm: {comm}"
+             could not handle the field type; {dump_artifact}"
         );
     }
 
@@ -623,7 +633,10 @@ fn find_sdt_allocation_by_addr(
 /// builds with object name `bpf` (per `scx-ktstr/build.rs::enable_skel`), so
 /// the map's `name` ends with `.bss` and is NOT one of the framework probe
 /// maps (filtered with the `probe_bp.` / `fentry_p.` prefix exclusions).
-fn find_scheduler_bss_map(dump: &serde_json::Value) -> Result<&serde_json::Value> {
+fn find_scheduler_bss_map<'a>(
+    dump: &'a serde_json::Value,
+    dump_artifact: &str,
+) -> Result<&'a serde_json::Value> {
     let maps = dump
         .get("maps")
         .and_then(|m| m.as_array())
@@ -643,7 +656,7 @@ fn find_scheduler_bss_map(dump: &serde_json::Value) -> Result<&serde_json::Value
             anyhow::anyhow!(
                 "dump has no scheduler `.bss` map (looked across {} maps); the \
                  scx-ktstr BPF program must surface a `.bss` global section. \
-                 Full dump: {dump}",
+                 {dump_artifact}",
                 maps.len()
             )
         })
@@ -706,14 +719,15 @@ fn scenario_cast_analysis_chases_bss_to_arena(ctx: &ktstr::scenario::Ctx) -> Res
 /// (`PostVmAssertionFailure`) that `expect_err` does not invert.
 fn check_cast_analysis_chases_bss_to_arena(result: &VmResult) -> Result<()> {
     let dump = read_failure_dump(result)?;
+    let dump_artifact = failure_dump_artifact(result);
 
-    let bss_map = find_scheduler_bss_map(&dump)?;
+    let bss_map = find_scheduler_bss_map(&dump, &dump_artifact)?;
     // The .bss map's `value` is the BTF-rendered Datasec (libbpf
     // exposes the entire .bss as a single Datasec type). Its members
     // enumerate every global declared in main.bpf.c.
     let bss_value = bss_map
         .get("value")
-        .ok_or_else(|| anyhow::anyhow!(".bss map has no `value` field; bss_map: {bss_map}"))?;
+        .ok_or_else(|| anyhow::anyhow!(".bss map has no `value` field; {dump_artifact}"))?;
     let bss_kind = bss_value
         .get("kind")
         .and_then(|k| k.as_str())
@@ -722,21 +736,23 @@ fn check_cast_analysis_chases_bss_to_arena(result: &VmResult) -> Result<()> {
         anyhow::bail!(
             ".bss value must render as a Struct (the renderer maps Datasec to Struct \
              with type_name set to the section name), got kind={bss_kind:?}; \
-             bss_value: {bss_value}"
+             {dump_artifact}"
         );
     }
 
     // Locate the `ktstr_bss_arena_holder` member inside the .bss
     // Datasec. The Datasec member's `name` is the global variable
     // name; the inner `value` carries the BTF-rendered struct.
-    let holder_outer = struct_member(bss_value, "ktstr_bss_arena_holder").map_err(|e| {
-        anyhow::anyhow!(
-            "{e}\n\nNo `ktstr_bss_arena_holder` Var in .bss -- either the BSS test \
-             fixture in scx-ktstr/src/bpf/main.bpf.c was renamed, the BTF Datasec \
-             walker filtered it, or the global was elided by the BPF compiler \
-             because no in-program writer kept it live. bss_value: {bss_value}"
-        )
-    })?;
+    let holder_outer =
+        struct_member(bss_value, "ktstr_bss_arena_holder", &dump_artifact).map_err(|e| {
+            anyhow::anyhow!(
+                "{e}\n\nNo `ktstr_bss_arena_holder` Var in .bss -- either the \
+                 BSS test fixture in scx-ktstr/src/bpf/main.bpf.c was renamed, \
+                 the BTF Datasec walker filtered it, or the global was elided \
+                 by the BPF compiler because no in-program writer kept it live; \
+                 {dump_artifact}"
+            )
+        })?;
     let holder_kind = holder_outer
         .get("kind")
         .and_then(|k| k.as_str())
@@ -745,7 +761,7 @@ fn check_cast_analysis_chases_bss_to_arena(result: &VmResult) -> Result<()> {
         anyhow::bail!(
             "`ktstr_bss_arena_holder` must render as a Struct (it's declared as \
              `struct ktstr_bss_arena_holder` in BPF source), got kind={holder_kind:?}: \
-             {holder_outer}"
+             {dump_artifact}"
         );
     }
     // Sanity-check the type_name lines up so a BTF rename surfaces
@@ -757,14 +773,14 @@ fn check_cast_analysis_chases_bss_to_arena(result: &VmResult) -> Result<()> {
     {
         anyhow::bail!(
             "ktstr_bss_arena_holder rendered with unexpected type_name={name:?}; \
-             holder: {holder_outer}"
+             {dump_artifact}"
         );
     }
 
     // PRIMARY POSITIVE ASSERTION: `arena_target` MUST render as Ptr.
     // The cast analysis pipeline turned the u64 field into a typed
     // pointer that the renderer chased to its arena target.
-    let arena_target = struct_member(holder_outer, "arena_target")?;
+    let arena_target = struct_member(holder_outer, "arena_target", &dump_artifact)?;
     let arena_kind = arena_target
         .get("kind")
         .and_then(|k| k.as_str())
@@ -785,7 +801,7 @@ fn check_cast_analysis_chases_bss_to_arena(result: &VmResult) -> Result<()> {
              (c) `MemReader::cast_lookup` did not return Some for \
              (ktstr_bss_arena_holder, 0). \
              (d) `render_cast_pointer` bailed before emitting Ptr. \
-             arena_target: {arena_target}; full holder: {holder_outer}"
+             {dump_artifact}"
         );
     }
 
@@ -798,14 +814,14 @@ fn check_cast_analysis_chases_bss_to_arena(result: &VmResult) -> Result<()> {
     let arena_value = arena_target
         .get("value")
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow::anyhow!("`arena_target` Ptr has no `value`: {arena_target}"))?;
+        .ok_or_else(|| anyhow::anyhow!("`arena_target` Ptr has no `value`; {dump_artifact}"))?;
     if arena_value == 0 {
         anyhow::bail!(
             "`arena_target` value is 0x0 -- `ktstr_init_task`'s write to \
              `ktstr_bss_arena_holder.arena_target` never landed, or the captured \
              .bss page predates every init_task invocation. The render correctly \
              flagged the field (cast pipeline OK), but the source data is zero. \
-             arena_target: {arena_target}"
+             {dump_artifact}"
         );
     }
 
@@ -836,7 +852,7 @@ fn check_cast_analysis_chases_bss_to_arena(result: &VmResult) -> Result<()> {
                          `deref_skipped_reason` -- the chase was either not \
                          attempted (depth cap, cycle, null value), or the JSON \
                          shape changed. arena_target value: 0x{arena_value:x}; \
-                         arena_target: {arena_target}"
+                         {dump_artifact}"
                     )
                 })?;
                 // ktstr_arena_ctx is 24 bytes so no Truncated wrap is
@@ -846,16 +862,19 @@ fn check_cast_analysis_chases_bss_to_arena(result: &VmResult) -> Result<()> {
                     Some("struct") => (deref, false, "inline deref"),
                     Some("truncated") => (
                         deref.get("partial").ok_or_else(|| {
-                            anyhow::anyhow!("Truncated has no `partial`: {deref}")
+                            anyhow::anyhow!("Truncated has no `partial`; {dump_artifact}")
                         })?,
                         true,
                         "inline deref (truncated)",
                     ),
                     Some(other) => anyhow::bail!(
                         "`arena_target` deref must be Struct or \
-                         Truncated{{partial: Struct}}, got kind={other:?}; deref: {deref}"
+                         Truncated{{partial: Struct}}, got kind={other:?}; \
+                         {dump_artifact}"
                     ),
-                    None => anyhow::bail!("`arena_target` deref has no `kind` field: {deref}"),
+                    None => {
+                        anyhow::bail!("`arena_target` deref has no `kind` field; {dump_artifact}")
+                    }
                 }
             }
             // Must match the dedup reason string emitted at
@@ -897,7 +916,7 @@ fn check_cast_analysis_chases_bss_to_arena(result: &VmResult) -> Result<()> {
     if deref_kind_inner != "struct" {
         anyhow::bail!(
             "arena_target deref's inner kind must be struct (post-truncation), \
-             got {deref_kind_inner:?}; deref_struct: {deref_struct}"
+             got {deref_kind_inner:?}; {dump_artifact}"
         );
     }
     let deref_type_name = deref_struct
@@ -906,7 +925,7 @@ fn check_cast_analysis_chases_bss_to_arena(result: &VmResult) -> Result<()> {
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "deref struct has no type_name (anonymous struct?); \
-                 deref_struct: {deref_struct}"
+                 {dump_artifact}"
             )
         })?;
     if deref_type_name != "ktstr_arena_ctx" {
@@ -915,7 +934,7 @@ fn check_cast_analysis_chases_bss_to_arena(result: &VmResult) -> Result<()> {
              \"ktstr_arena_ctx\"; the cast analyzer flagged the wrong target. \
              This is the correctness bar -- a wrong target struct means the \
              access-pattern intersection picked a same-shape decoy out of the \
-             program BTF. deref_struct: {deref_struct}"
+             program BTF; {dump_artifact}"
         );
     }
 
@@ -929,7 +948,7 @@ fn check_cast_analysis_chases_bss_to_arena(result: &VmResult) -> Result<()> {
     // update site (this constant block).
     const KTSTR_ARENA_MAGIC: u64 = 0xDEADBEEFCAFEBABE;
     const KTSTR_TASK_COUNTER: u64 = 42;
-    let magic = struct_member(deref_struct, "magic")?;
+    let magic = struct_member(deref_struct, "magic", &dump_artifact)?;
     let magic_kind = magic
         .get("kind")
         .and_then(|k| k.as_str())
@@ -938,13 +957,13 @@ fn check_cast_analysis_chases_bss_to_arena(result: &VmResult) -> Result<()> {
         anyhow::bail!(
             "chased `ktstr_arena_ctx.magic` must render as Uint (the analyzer \
              must NOT recurse into magic -- it's only loaded as a sentinel, \
-             never as a pointer base), got kind={magic_kind:?}: {magic}"
+             never as a pointer base), got kind={magic_kind:?}; {dump_artifact}"
         );
     }
     let magic_value = magic
         .get("value")
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow::anyhow!("magic value not a u64: {magic}"))?;
+        .ok_or_else(|| anyhow::anyhow!("magic value not a u64; {dump_artifact}"))?;
     if magic_value != KTSTR_ARENA_MAGIC {
         anyhow::bail!(
             "chased `ktstr_arena_ctx.magic` mismatch: got 0x{magic_value:016x}, \
@@ -953,21 +972,21 @@ fn check_cast_analysis_chases_bss_to_arena(result: &VmResult) -> Result<()> {
              Either the captured arena page is stale, the user_addr in \
              `arena_target` does not point at a current allocation, or a \
              same-shape decoy struct in the program BTF won the access-pattern \
-             intersection. magic: {magic}"
+             intersection; {dump_artifact}"
         );
     }
 
-    let counter = struct_member(deref_struct, "counter")?;
+    let counter = struct_member(deref_struct, "counter", &dump_artifact)?;
     let counter_value = counter
         .get("value")
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow::anyhow!("counter value not numeric: {counter}"))?;
+        .ok_or_else(|| anyhow::anyhow!("counter value not numeric; {dump_artifact}"))?;
     if counter_value != KTSTR_TASK_COUNTER {
         anyhow::bail!(
             "chased `ktstr_arena_ctx.counter` mismatch: got {counter_value}, \
              expected {KTSTR_TASK_COUNTER}. The cast chase landed on the right \
              struct shape but the captured bytes do not carry the alloc-time \
-             value, indicating a stale arena page. counter: {counter}"
+             value, indicating a stale arena page; {dump_artifact}"
         );
     }
 
@@ -975,7 +994,7 @@ fn check_cast_analysis_chases_bss_to_arena(result: &VmResult) -> Result<()> {
     // same .bss struct) must NOT render as a Ptr. The BPF code only
     // increments it via `__sync_fetch_and_add`; the analyzer must not
     // flag offset 8 of ktstr_bss_arena_holder as a typed pointer.
-    let plain_counter = struct_member(holder_outer, "bss_plain_counter")?;
+    let plain_counter = struct_member(holder_outer, "bss_plain_counter", &dump_artifact)?;
     let plain_kind = plain_counter
         .get("kind")
         .and_then(|k| k.as_str())
@@ -986,18 +1005,18 @@ fn check_cast_analysis_chases_bss_to_arena(result: &VmResult) -> Result<()> {
              never used as a pointer base) must render as a plain Uint. The \
              cast intercept fired falsely on offset 8 of \
              ktstr_bss_arena_holder. Got kind={plain_kind:?}. \
-             plain_counter: {plain_counter}"
+             {dump_artifact}"
         );
     }
     let plain_value = plain_counter
         .get("value")
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow::anyhow!("plain counter value not numeric: {plain_counter}"))?;
+        .ok_or_else(|| anyhow::anyhow!("plain counter value not numeric; {dump_artifact}"))?;
     if plain_value == 0 {
         anyhow::bail!(
             "`bss_plain_counter` is 0 -- `ktstr_init_task` never executed the \
              increment, which means the test fixture in main.bpf.c did not \
-             run before the freeze. plain_counter: {plain_counter}"
+             run before the freeze; {dump_artifact}"
         );
     }
 
@@ -1087,20 +1106,19 @@ fn scenario_cast_analysis_sdt_alloc_bridge_resolves_fwd(
 /// that `expect_err` does not invert.
 fn check_cast_analysis_sdt_alloc_bridge_resolves_fwd(result: &VmResult) -> Result<()> {
     let dump = read_failure_dump(result)?;
+    let dump_artifact = failure_dump_artifact(result);
 
-    let task_storage = find_task_storage_map(&dump)?;
+    let task_storage = find_task_storage_map(&dump, &dump_artifact)?;
     let entries = task_storage
         .get("entries")
         .and_then(|e| e.as_array())
-        .ok_or_else(|| {
-            anyhow::anyhow!("scx_task_map has no `entries` array; task_storage: {task_storage}")
-        })?;
+        .ok_or_else(|| anyhow::anyhow!("scx_task_map has no `entries` array; {dump_artifact}"))?;
     if entries.is_empty() {
         anyhow::bail!(
             "scx_task_map.entries is empty -- ktstr_init_task never registered \
              a per-task arena context for any task, so neither the surface-struct \
              chase nor the payload chase has anything to operate on. \
-             task_storage: {task_storage}"
+             {dump_artifact}"
         );
     }
 
@@ -1144,9 +1162,9 @@ fn check_cast_analysis_sdt_alloc_bridge_resolves_fwd(result: &VmResult) -> Resul
             continue;
         };
         data_members_seen += 1;
-        let data_value = data
-            .get("value")
-            .ok_or_else(|| anyhow::anyhow!("`data` member has no `value`: {data}"))?;
+        let data_value = data.get("value").ok_or_else(|| {
+            anyhow::anyhow!("`data` member has no `value`; entry={idx}; {dump_artifact}")
+        })?;
         let data_kind = data_value
             .get("kind")
             .and_then(|k| k.as_str())
@@ -1158,13 +1176,15 @@ fn check_cast_analysis_sdt_alloc_bridge_resolves_fwd(result: &VmResult) -> Resul
             anyhow::bail!(
                 "entry[{idx}].value.data must render as Ptr (BTF Type::Ptr arm \
                  for `struct sdt_data __arena *`); got kind={data_kind:?}. \
-                 data: {data}; entry: {entry}"
+                 {dump_artifact}"
             );
         }
         let data_value_u64 = data_value
             .get("value")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("`data` Ptr has no `value`: {data_value}"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("`data` Ptr has no `value`; entry={idx}; {dump_artifact}")
+            })?;
         if data_value_u64 == 0 {
             // Null `data` cannot exercise the bridge -- skip without
             // flagging. ktstr_init_task writes a non-null pointer on
@@ -1191,7 +1211,7 @@ fn check_cast_analysis_sdt_alloc_bridge_resolves_fwd(result: &VmResult) -> Resul
                  [`MemReader::resolve_arena_type`] returned None. Without \
                  the bridge the per-task struct content is unrenderable on \
                  the surface-struct path. Skip reason: {reason:?}; \
-                 data: {data_value}"
+                 {dump_artifact}"
             );
         }
 
@@ -1207,7 +1227,7 @@ fn check_cast_analysis_sdt_alloc_bridge_resolves_fwd(result: &VmResult) -> Resul
                     "entry[{idx}].value.data carried unexpected \
                      cast_annotation={ann:?}; the BTF Type::Ptr arm only \
                      emits 'sdt_alloc' (no cast→ prefix) when the bridge \
-                     fires on a Fwd target. data: {data_value}"
+                     fires on a Fwd target; {dump_artifact}"
                 );
             }
         }
@@ -1286,11 +1306,10 @@ fn check_cast_analysis_sdt_alloc_bridge_resolves_fwd(result: &VmResult) -> Resul
         payloads_inspected += 1;
 
         // magic must read the alloc-time sentinel.
-        let magic = struct_member(payload, "magic")?;
-        let magic_value = magic
-            .get("value")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("magic value not a u64: {magic}"))?;
+        let magic = struct_member(payload, "magic", &dump_artifact)?;
+        let magic_value = magic.get("value").and_then(|v| v.as_u64()).ok_or_else(|| {
+            anyhow::anyhow!("magic value not a u64; entry={idx}; {dump_artifact}")
+        })?;
         if magic_value != KTSTR_ARENA_MAGIC {
             anyhow::bail!(
                 "entry[{idx}].payload.magic mismatch: got 0x{magic_value:016x}, \
@@ -1299,19 +1318,19 @@ fn check_cast_analysis_sdt_alloc_bridge_resolves_fwd(result: &VmResult) -> Resul
                  alloc-time sentinel -- either the upstream allocator \
                  metadata pointed at a stale slot, or the .data chase / \
                  payload chase landed on different allocator state. \
-                 magic: {magic}"
+                 {dump_artifact}"
             );
         }
 
-        let counter = struct_member(payload, "counter")?;
+        let counter = struct_member(payload, "counter", &dump_artifact)?;
         let counter_value = counter
             .get("value")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("counter not numeric: {counter}"))?;
+            .ok_or_else(|| anyhow::anyhow!("counter not numeric; entry={idx}; {dump_artifact}"))?;
         if counter_value != KTSTR_TASK_COUNTER {
             anyhow::bail!(
                 "entry[{idx}].payload.counter mismatch: got {counter_value}, \
-                 expected {KTSTR_TASK_COUNTER}. counter: {counter}"
+                 expected {KTSTR_TASK_COUNTER}; {dump_artifact}"
             );
         }
     }
@@ -1383,18 +1402,17 @@ fn scenario_cast_analysis_cross_subprog_arena_chase(
 /// `expect_err` does not invert.
 fn check_cast_analysis_cross_subprog_arena_chase(result: &VmResult) -> Result<()> {
     let dump = read_failure_dump(result)?;
+    let dump_artifact = failure_dump_artifact(result);
 
-    let task_storage = find_task_storage_map(&dump)?;
+    let task_storage = find_task_storage_map(&dump, &dump_artifact)?;
     let entries = task_storage
         .get("entries")
         .and_then(|e| e.as_array())
-        .ok_or_else(|| {
-            anyhow::anyhow!("scx_task_map has no `entries` array; task_storage: {task_storage}")
-        })?;
+        .ok_or_else(|| anyhow::anyhow!("scx_task_map has no `entries` array; {dump_artifact}"))?;
     if entries.is_empty() {
         anyhow::bail!(
             "scx_task_map.entries is empty -- no per-task arena context was \
-             allocated before freeze. task_storage: {task_storage}"
+             allocated before freeze; {dump_artifact}"
         );
     }
 
@@ -1418,7 +1436,7 @@ fn check_cast_analysis_cross_subprog_arena_chase(result: &VmResult) -> Result<()
 
     let mut any_arena_chase = false;
     for payload in &payloads {
-        let stashed = match struct_member(payload, "stashed_arena_ptr") {
+        let stashed = match struct_member(payload, "stashed_arena_ptr", &dump_artifact) {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -1435,7 +1453,7 @@ fn check_cast_analysis_cross_subprog_arena_chase(result: &VmResult) -> Result<()
                     "stashed_arena_ptr rendered as Ptr but cast_annotation \
                      does not contain 'arena': got {ann:?}. The cast \
                      analyzer tagged the field but with the wrong domain. \
-                     stashed: {stashed}"
+                     {dump_artifact}"
                 );
             }
             break;
@@ -1449,8 +1467,7 @@ fn check_cast_analysis_cross_subprog_arena_chase(result: &VmResult) -> Result<()
                      The cross-subprog arena typing did NOT propagate through \
                      the fixpoint -- the publish helper's STX into the hash \
                      map value's cached_ptr was not carried to the chase \
-                     helper's LDX site across passes. stashed: {stashed}; \
-                     payload: {payload}"
+                     helper's LDX site across passes; {dump_artifact}"
                 );
             }
         }

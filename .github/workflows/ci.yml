@@ -123,6 +123,7 @@ jobs:
         features: ['', 'wprof']
     env:
       KTSTR_BUILD_DIAGNOSTICS_DIR: ${{ github.workspace }}/target/ktstr-build-diagnostics
+      KTSTR_SIDECAR_DIR: ${{ github.workspace }}/target/ktstr-ci-artifacts/${{ github.run_id }}-${{ github.run_attempt }}-test-x64-${{ matrix.kernel-version }}-${{ matrix.features || 'base' }}
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v7.0.0
@@ -148,6 +149,14 @@ jobs:
           path: ${{ env.KTSTR_BUILD_DIAGNOSTICS_DIR }}
           if-no-files-found: ignore
           retention-days: 14
+      - name: Upload ktstr failure dumps
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.0
+        with:
+          name: failure-dumps-x64-${{ matrix.kernel-version }}-${{ matrix.features || 'base' }}-attempt-${{ github.run_attempt }}
+          path: ${{ env.KTSTR_SIDECAR_DIR }}/*.failure-dump.json
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v7.0.0
@@ -166,6 +175,7 @@ jobs:
     env:
       CARGO_BUILD_JOBS: "32"
       KTSTR_BUILD_DIAGNOSTICS_DIR: ${{ github.workspace }}/target/ktstr-build-diagnostics
+      KTSTR_SIDECAR_DIR: ${{ github.workspace }}/target/ktstr-ci-artifacts/${{ github.run_id }}-${{ github.run_attempt }}-test-arm64-${{ matrix.kernel-version }}-${{ matrix.features || 'base' }}
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v7.0.0
@@ -189,6 +199,14 @@ jobs:
         with:
           name: cargo-diagnostics-arm64-${{ matrix.kernel-version }}-${{ matrix.features || 'base' }}
           path: ${{ env.KTSTR_BUILD_DIAGNOSTICS_DIR }}
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload ktstr failure dumps
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.0
+        with:
+          name: failure-dumps-arm64-${{ matrix.kernel-version }}-${{ matrix.features || 'base' }}-attempt-${{ github.run_attempt }}
+          path: ${{ env.KTSTR_SIDECAR_DIR }}/*.failure-dump.json
           if-no-files-found: ignore
           retention-days: 14
       - name: Upload test results to Codecov
@@ -284,6 +302,7 @@ jobs:
     runs-on: [ktstr-x64]
     env:
       KTSTR_BUILD_DIAGNOSTICS_DIR: ${{ github.workspace }}/target/ktstr-build-diagnostics
+      KTSTR_SIDECAR_DIR: ${{ github.workspace }}/target/ktstr-ci-artifacts/${{ github.run_id }}-${{ github.run_attempt }}-coverage-x64
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v7.0.0
@@ -307,6 +326,14 @@ jobs:
           path: ${{ env.KTSTR_BUILD_DIAGNOSTICS_DIR }}
           if-no-files-found: ignore
           retention-days: 14
+      - name: Upload ktstr failure dumps
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.0
+        with:
+          name: failure-dumps-coverage-x64-attempt-${{ github.run_attempt }}
+          path: ${{ env.KTSTR_SIDECAR_DIR }}/*.failure-dump.json
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7.0.0
         with:
@@ -319,6 +346,7 @@ jobs:
     env:
       CARGO_BUILD_JOBS: "32"
       KTSTR_BUILD_DIAGNOSTICS_DIR: ${{ github.workspace }}/target/ktstr-build-diagnostics
+      KTSTR_SIDECAR_DIR: ${{ github.workspace }}/target/ktstr-ci-artifacts/${{ github.run_id }}-${{ github.run_attempt }}-coverage-arm64
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v7.0.0
@@ -340,6 +368,14 @@ jobs:
         with:
           name: cargo-diagnostics-coverage-arm64
           path: ${{ env.KTSTR_BUILD_DIAGNOSTICS_DIR }}
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload ktstr failure dumps
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.0
+        with:
+          name: failure-dumps-coverage-arm64-attempt-${{ github.run_attempt }}
+          path: ${{ env.KTSTR_SIDECAR_DIR }}/*.failure-dump.json
           if-no-files-found: ignore
           retention-days: 14
       - name: Upload coverage to Codecov

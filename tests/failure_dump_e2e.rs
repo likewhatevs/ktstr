@@ -656,12 +656,12 @@ fn check_array_entries_dump(result: &VmResult) -> Result<()> {
     anyhow::ensure!(
         array_map.get("value").is_none_or(|v| v.is_null()),
         "multi-entry ARRAY must populate `array_entries`, not the single-entry \
-         `value`: {array_map}"
+         `value`; {dump_artifact}"
     );
     // 16 < MAX_ARRAY_KEYS (4096) and every entry is mapped → no error.
     anyhow::ensure!(
         array_map.get("error").is_none_or(|e| e.is_null()),
-        "ARRAY render must be error-free for 16 mapped entries: {array_map}"
+        "ARRAY render must be error-free for 16 mapped entries; {dump_artifact}"
     );
 
     let entries = array_map
@@ -670,14 +670,15 @@ fn check_array_entries_dump(result: &VmResult) -> Result<()> {
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "ARRAY fixture has no `array_entries` — the prior 'only key 0' \
-                 behaviour would leave this empty with `value` set: {array_map}"
+                 behaviour would leave this empty with `value` set; \
+                 {dump_artifact}"
             )
         })?;
     anyhow::ensure!(
         entries.len() == KTSTR_ARRAY_ENTRIES as usize,
-        "expected {KTSTR_ARRAY_ENTRIES} array_entries (every key rendered), got {}: \
-         {array_map}",
-        entries.len()
+        "expected {KTSTR_ARRAY_ENTRIES} array_entries (every key rendered), got {}; \
+         {dump_artifact}",
+        entries.len(),
     );
 
     // Each entry i: key == i, value is a struct whose `magic` member is
@@ -685,27 +686,32 @@ fn check_array_entries_dump(result: &VmResult) -> Result<()> {
     // per-key stride read the correct entry (not key 0 repeated, not a
     // wrong-stride overlap).
     for (i, entry) in entries.iter().enumerate() {
-        let key = entry
-            .get("key")
-            .and_then(|k| k.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("array_entries[{i}] missing u32 `key`: {entry}"))?;
+        let key = entry.get("key").and_then(|k| k.as_u64()).ok_or_else(|| {
+            anyhow::anyhow!("array_entries[{i}] missing u32 `key`; {dump_artifact}")
+        })?;
         anyhow::ensure!(
             key == i as u64,
             "array_entries[{i}].key == {key}, expected {i} (entries must be key-ordered)"
         );
 
         let val = entry.get("value").ok_or_else(|| {
-            anyhow::anyhow!("array_entries[{i}] has no value (unreadable key?): {entry}")
+            anyhow::anyhow!(
+                "array_entries[{i}] has no value (unreadable key?); \
+                 {dump_artifact}"
+            )
         })?;
         anyhow::ensure!(
             val.get("kind").and_then(|k| k.as_str()) == Some("struct"),
-            "array_entries[{i}].value must render as a struct: {val}"
+            "array_entries[{i}].value must render as a struct; {dump_artifact}"
         );
         let members = val
             .get("members")
             .and_then(|m| m.as_array())
             .ok_or_else(|| {
-                anyhow::anyhow!("array_entries[{i}].value struct has no members: {val}")
+                anyhow::anyhow!(
+                    "array_entries[{i}].value struct has no members; \
+                     {dump_artifact}"
+                )
             })?;
         let member_u64 = |nm: &str| -> Option<u64> {
             members
@@ -720,11 +726,12 @@ fn check_array_entries_dump(result: &VmResult) -> Result<()> {
         anyhow::ensure!(
             magic == Some(KTSTR_ARRAY_MAGIC),
             "array_entries[{i}].magic must be KTSTR_ARRAY_MAGIC (0x{KTSTR_ARRAY_MAGIC:x}); \
-             got {magic:?}: {val}"
+             got {magic:?}; {dump_artifact}"
         );
         anyhow::ensure!(
             key_echo == Some(i as u64),
-            "array_entries[{i}].key_echo must echo the key {i}; got {key_echo:?}: {val}"
+            "array_entries[{i}].key_echo must echo the key {i}; got {key_echo:?}; \
+             {dump_artifact}"
         );
     }
 
