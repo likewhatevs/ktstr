@@ -2200,6 +2200,11 @@ impl KtstrVm {
         // and every placement consumer below uses the matching run-time CPU
         // mask rather than independently consulting the build-time plan.
         let run_locks = self.acquire_interactive_run_locks()?;
+        // Capture after admission so this guard is declared after `run_locks`.
+        // Rust drops locals in reverse declaration order: every return path
+        // therefore restores the caller's original affinity before releasing
+        // the physical reservation that licensed the temporary BSP pin/mask.
+        let _bsp_affinity_guard = freeze_coord::BspAffinityGuard::capture();
         let (effective_plan, effective_placement) = Self::interactive_run_placement(&run_locks);
         debug_assert!(
             !self.performance_mode || effective_plan.is_none(),

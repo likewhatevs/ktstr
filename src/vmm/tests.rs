@@ -685,6 +685,40 @@ fn exact_plan_expands_to_dense_default_interactive_pins() {
 }
 
 #[test]
+fn interactive_affinity_guard_restores_the_calling_thread() {
+    let pid = nix::unistd::Pid::from_raw(0);
+    let original =
+        nix::sched::sched_getaffinity(pid).expect("read the test thread's original affinity");
+    let allowed = (0..libc::CPU_SETSIZE as usize)
+        .filter(|cpu| original.is_set(*cpu).unwrap_or(false))
+        .collect::<Vec<_>>();
+    if allowed.len() < 2 {
+        // A single-CPU test environment cannot distinguish restoration from
+        // leaving the temporary pin in place.
+        return;
+    }
+
+    let guard = freeze_coord::BspAffinityGuard::capture();
+    let mut narrowed = nix::sched::CpuSet::new();
+    narrowed
+        .set(allowed[0])
+        .expect("construct a one-CPU interactive BSP mask");
+    nix::sched::sched_setaffinity(pid, &narrowed).expect("apply the temporary interactive pin");
+    assert_eq!(
+        nix::sched::sched_getaffinity(pid).expect("read the temporary affinity"),
+        narrowed,
+        "the test must observe the same narrowing performed by the interactive BSP path",
+    );
+
+    drop(guard);
+    assert_eq!(
+        nix::sched::sched_getaffinity(pid).expect("read the restored affinity"),
+        original,
+        "interactive teardown must restore the caller before its reservation is released",
+    );
+}
+
+#[test]
 fn interactive_unreserved_placement_never_resurrects_build_shape() {
     let run_locks = RunLocks::unreserved();
     let (plan, placement) = KtstrVm::interactive_run_placement(&run_locks);

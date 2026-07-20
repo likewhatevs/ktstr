@@ -3332,20 +3332,20 @@ impl Drop for RunVmThreadGuard {
 }
 
 /// Restores the calling (BSP) thread's CPU affinity on every exit path from
-/// [`KtstrVm::run_vm`]. `run_vm` narrows this thread to the BSP host mask (via
-/// [`pin_current_thread`] / [`set_thread_cpumask`]) and never widens it back,
-/// which leaked the narrowed mask two ways when the same process ran a second
-/// VM (a boot retry, or a subsequent cell in the same process):
+/// [`KtstrVm::run_vm`] and [`KtstrVm::run_interactive`]. Both paths may narrow
+/// this thread to the BSP host mask (via [`pin_current_thread`] /
+/// [`set_thread_cpumask`]); leaving that mask behind leaks placement two ways
+/// when the same process runs later work:
 ///   (a) AP host threads `clone(2)` from this thread and inherit its affinity
 ///       at spawn, so a leaked narrow mask would confine the next VM's APs to
 ///       the previous VM's BSP CPU(s); and
 ///   (b) [`crate::vmm::host_topology::host_allowed_cpus`] seeds the CPU budget from THIS
 ///       thread's `sched_getaffinity`, so a leaked mask would make replanning
 ///       compute against the previous VM's cpuset instead of the host's.
-/// Captured BEFORE the narrowing and restored on `Drop`, keeping `run_vm`
-/// affinity-neutral for its caller. Only `run_vm` needs this; the interactive
-/// shell path is one-shot-then-exit.
-struct BspAffinityGuard {
+/// Captured before narrowing and restored on `Drop`, keeping both VM entry
+/// points affinity-neutral for their caller. Interactive mode declares the
+/// guard after its run locks so restoration also precedes reservation release.
+pub(super) struct BspAffinityGuard {
     /// The pre-narrowing affinity, or `None` if `sched_getaffinity` failed —
     /// then `Drop` is a no-op (nothing trustworthy to restore).
     saved: Option<nix::sched::CpuSet>,
@@ -3355,7 +3355,7 @@ impl BspAffinityGuard {
     /// Snapshot the calling thread's affinity. Call this BEFORE applying the
     /// BSP mask. Mirrors the module's `sched_setaffinity(Pid::from_raw(0), ..)`
     /// idiom (pid 0 = calling thread) in the reverse direction.
-    fn capture() -> Self {
+    pub(super) fn capture() -> Self {
         Self {
             saved: nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).ok(),
         }
