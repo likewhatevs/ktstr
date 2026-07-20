@@ -5,6 +5,12 @@ fn ktstr() -> Command {
     Command::cargo_bin("ktstr").unwrap()
 }
 
+fn is_host_resource_contention(stderr: &str) -> bool {
+    stderr.contains("LLC slots busy")
+        || stderr.contains("acquire_llc_plan: could not reserve")
+        || stderr.contains("CPU") && stderr.contains("busy")
+}
+
 // -- help output --
 
 #[test]
@@ -221,7 +227,7 @@ fn shell_exec_echo() {
         .output()
         .expect("failed to run ktstr shell");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("LLC slots busy") || stderr.contains("CPU") && stderr.contains("busy") {
+    if is_host_resource_contention(&stderr) {
         eprintln!("skipping shell_exec_echo: host resource contention");
         return;
     }
@@ -235,6 +241,13 @@ fn shell_exec_echo() {
         stdout.contains("hello-from-guest"),
         "stdout missing greeting: {stdout}"
     );
+}
+
+#[test]
+fn shell_exec_recognizes_current_resource_contention_diagnostic() {
+    let stderr = "Error: acquire_llc_plan: could not reserve 2 CPU(s) after 4 attempts; \
+                  holders: LLC 0: pid=123";
+    assert!(is_host_resource_contention(stderr));
 }
 
 #[test]
