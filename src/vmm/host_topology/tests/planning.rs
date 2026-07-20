@@ -460,7 +460,7 @@ fn overlapping_llc_groups_materialize_a_distinct_cpu_budget() {
         &allowed,
         &states,
         3,
-        PlacementPolicy::Consolidate,
+        CpuSelectionPolicy::WithinEachLlc(PlacementPolicy::Consolidate),
     )
     .expect("the union of overlapping LLC groups carries three CPUs");
     assert_eq!(cpus, vec![0, 1, 2]);
@@ -486,7 +486,7 @@ fn sparse_cpu_rotation_uses_eligible_ordinals_not_cpu_ids() {
         &eligible,
         &std::collections::BTreeMap::new(),
         3,
-        PlacementPolicy::Spread { rotation: 1 },
+        CpuSelectionPolicy::WithinEachLlc(PlacementPolicy::Spread { rotation: 1 }),
     )
     .expect("one sparse LLC carries the full budget");
     assert_eq!(
@@ -1801,27 +1801,209 @@ fn elastic_sizing_uses_every_available_cpu_up_to_its_maximum() {
     assert_eq!(exact.queued_target(8), 8);
 }
 
-/// A storm of compatible Cargo builds must not all choose the same lowest
-/// CPU/LLC prefix. The build entry point uses the process-rotated Spread
-/// policy, so an otherwise-idle one-CPU reservation starts at this process's
-/// rotation rather than Consolidate's fixed LLC 0.
+/// A heavily SH-held LLC can satisfy the complete build maximum, but must not
+/// hide a disjoint idle LLC. Free-first eligibility is applied before LLC
+/// consolidation, so the build uses the idle domain rather than reproducing
+/// the busy-prefix/idle-host collapse.
 #[test]
-fn elastic_build_uses_process_rotated_spread_placement() {
+fn elastic_build_chooses_idle_cpus_before_a_sufficient_shared_llc() {
     let _prefixes = LockPrefixesGuard::new();
     let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3]);
-    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 0)]);
+    let topo = synth_host_topo(&[(vec![0, 1], 0), (vec![2, 3], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
-    let expected = match PlacementPolicy::spread_for_process() {
-        PlacementPolicy::Spread { rotation } => rotation % 4,
-        PlacementPolicy::Consolidate => unreachable!("build placement must be Spread"),
-    };
+    let peer_claim = admission_protocol::ClaimSet::with_modes(
+        [0usize],
+        [0usize, 1],
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let peer_physical = [llc_lock_path(0), cpu_lock_path(0), cpu_lock_path(1)]
+        .into_iter()
+        .map(|path| {
+            try_flock(path, FlockMode::Shared)
+                .expect("open peer SH resource")
+                .expect("acquire peer SH resource")
+        })
+        .collect::<Vec<_>>();
+    let peer = admission_protocol::publish_acquired(&peer_claim, peer_physical)
+        .expect("publish concurrent SH holder");
+
+    let plan =
+        acquire_elastic_build_llc_plan(&topo, &test_topo, Some(CpuCap::new(2).unwrap()), None)
+            .expect("two unshared CPUs must admit a two-CPU elastic build");
+
+    assert_eq!(
+        plan.locked_llcs,
+        vec![1],
+        "the shared LLC must be absent while the idle LLC carries the maximum",
+    );
+    assert_eq!(
+        plan.cpus
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [2usize, 3].into_iter().collect(),
+        "admitted CPUs must come entirely from the disjoint idle LLC",
+    );
+    drop(plan);
+    drop(peer);
+}
+
+#[test]
+fn elastic_build_width_prefers_unshared_capacity_then_falls_back_to_shared() {
+    let topo = synth_host_topo(&[(vec![0, 1], 0), (vec![2, 3], 0)]);
+    let snapshots = vec![
+        LlcSnapshot {
+            llc_idx: 0,
+            holders: Vec::new(),
+            holder_count: 1,
+            exclusive_held: false,
+        },
+        LlcSnapshot {
+            llc_idx: 1,
+            holders: Vec::new(),
+            holder_count: 1,
+            exclusive_held: false,
+        },
+    ];
+    let compatible = (0usize..4).collect::<std::collections::BTreeSet<_>>();
+    let mut states = (0usize..4)
+        .map(|cpu| (cpu, CpuPlacementState::default()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    states.get_mut(&0).unwrap().other_holders = 2;
+    states.get_mut(&1).unwrap().other_holders = 1;
+
+    let unshared = live_cpu_capacity(
+        LlcPlanSizing::Elastic,
+        4,
+        &snapshots,
+        &topo,
+        &compatible,
+        &states,
+    )
+    .expect("two unshared CPUs provide live capacity");
+    assert_eq!(
+        unshared.target, 2,
+        "two unshared CPUs contract a four-CPU elastic maximum to two",
+    );
+    assert_eq!(
+        unshared.eligible,
+        [2usize, 3].into_iter().collect(),
+        "LLC planning and CPU selection must both see only unshared CPUs",
+    );
+
+    for state in states.values_mut() {
+        state.other_holders = 1;
+    }
+    let fallback = live_cpu_capacity(
+        LlcPlanSizing::Elastic,
+        4,
+        &snapshots,
+        &topo,
+        &compatible,
+        &states,
+    )
+    .expect("compatible shared CPUs provide fallback capacity");
+    assert_eq!(
+        fallback.target, 4,
+        "a fully occupied cooperative host retains the SH-compatible fallback",
+    );
+    assert_eq!(
+        fallback.eligible, compatible,
+        "zero unshared capacity restores the complete SH-compatible set",
+    );
+}
+
+/// A performance-shaped EX claim remains a hard fence even though elastic
+/// builds use SH locks and can overlap default/no-perf/build peers.
+#[test]
+fn elastic_build_excludes_a_hard_exclusive_llc() {
+    let _prefixes = LockPrefixesGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3]);
+    let topo = synth_host_topo(&[(vec![0, 1], 0), (vec![2, 3], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(4, 1);
+    let peer_claim = admission_protocol::ClaimSet::with_modes(
+        [0usize],
+        [0usize],
+        FlockMode::Exclusive,
+        FlockMode::Exclusive,
+    );
+    let peer_physical = [llc_lock_path(0), cpu_lock_path(0)]
+        .into_iter()
+        .map(|path| {
+            try_flock(path, FlockMode::Exclusive)
+                .expect("open peer EX resource")
+                .expect("acquire peer EX resource")
+        })
+        .collect::<Vec<_>>();
+    let peer = admission_protocol::publish_acquired(&peer_claim, peer_physical)
+        .expect("publish hard-exclusive holder");
 
     let plan =
         acquire_elastic_build_llc_plan(&topo, &test_topo, Some(CpuCap::new(1).unwrap()), None)
-            .expect("idle host must admit a one-CPU elastic build");
+            .expect("disjoint compatible LLC must admit the elastic build");
+    assert_eq!(
+        plan.locked_llcs,
+        vec![1],
+        "the build must not enter the hard-exclusive LLC",
+    );
+    assert!(
+        plan.cpus.iter().all(|cpu| [2usize, 3].contains(cpu)),
+        "the build CPU must come from the disjoint LLC: {:?}",
+        plan.cpus,
+    );
+    drop(plan);
+    drop(peer);
+}
 
-    assert_eq!(plan.locked_llcs, vec![expected]);
-    assert_eq!(plan.cpus, vec![expected]);
+/// Once every compatible CPU already has a SH holder, an elastic build must
+/// still start by sharing rather than manufacturing an EX-like serialization
+/// point. The LLC footprint remains consolidated to one domain.
+#[test]
+fn elastic_build_uses_shared_capacity_when_no_cpu_is_unshared() {
+    let _prefixes = LockPrefixesGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3]);
+    let topo = synth_host_topo(&[(vec![0, 1], 0), (vec![2, 3], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(4, 1);
+    let peer_claim = admission_protocol::ClaimSet::with_modes(
+        [0usize, 1],
+        [0usize, 1, 2, 3],
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let peer_physical = [
+        llc_lock_path(0),
+        llc_lock_path(1),
+        cpu_lock_path(0),
+        cpu_lock_path(1),
+        cpu_lock_path(2),
+        cpu_lock_path(3),
+    ]
+    .into_iter()
+    .map(|path| {
+        try_flock(path, FlockMode::Shared)
+            .expect("open peer SH resource")
+            .expect("acquire peer SH resource")
+    })
+    .collect::<Vec<_>>();
+    let peer = admission_protocol::publish_acquired(&peer_claim, peer_physical)
+        .expect("publish whole-host cooperative holder");
+
+    let plan =
+        acquire_elastic_build_llc_plan(&topo, &test_topo, Some(CpuCap::new(2).unwrap()), None)
+            .expect("SH fallback must admit a fully occupied cooperative host");
+    assert_eq!(
+        plan.locked_llcs,
+        vec![0],
+        "equal held LLCs consolidate deterministically onto the first domain",
+    );
+    assert_eq!(
+        plan.cpus.iter().copied().collect::<std::collections::BTreeSet<_>>(),
+        [0usize, 1].into_iter().collect(),
+        "fallback CPUs must remain inside the consolidated footprint",
+    );
+    drop(plan);
+    drop(peer);
 }
 
 /// An elastic build must start immediately on every currently compatible CPU

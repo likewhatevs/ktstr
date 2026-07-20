@@ -2357,9 +2357,9 @@ impl CpuCap {
 ///
 /// `Consolidate` packs onto the LLCs already holding peers
 /// (holder_count DESC, llc_idx ASC) so the rest of the host stays
-/// whole for exclusive perf-mode reservations. Right for kernel-build
-/// sandboxes: a build is throughput-elastic and indifferent to
-/// sharing its cache domain with another build.
+/// whole for exclusive perf-mode reservations. Elastic build admission
+/// uses this policy for its LLC footprint while independently using
+/// [`Spread`](Self::Spread) for the exact CPUs inside that footprint.
 ///
 /// `Spread` picks the LEAST-held LLCs (holder_count ASC), breaking
 /// ties by the eligible-list position rotated by `rotation`. Right
@@ -2382,9 +2382,9 @@ impl CpuCap {
 /// actually locked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlacementPolicy {
-    /// Pack onto already-held LLCs. Direct fixed-size kernel builds use this
-    /// policy; elastic harness and scheduler prebuilds use [`Self::Spread`] so
-    /// concurrent Cargo processes do not converge on one busy CPU prefix.
+    /// Pack onto already-held resources. Direct fixed-size kernel builds use
+    /// this policy for both LLCs and CPUs. Elastic harness and scheduler
+    /// prebuilds use it only for LLCs, then select least-held CPUs separately.
     Consolidate,
     /// Fan out across least-held LLCs, tie-broken by `rotation`
     /// (no-perf VM placement). `rotation` is reduced modulo the
@@ -2398,6 +2398,27 @@ impl PlacementPolicy {
     /// modulo-by-eligible-count stays uniform for any LLC count.
     pub fn spread_for_process() -> Self {
         PlacementPolicy::Spread {
+            rotation: pid_window_offset(std::process::id(), 1 << 16),
+        }
+    }
+}
+
+/// CPU ranking inside an LLC footprint selected by [`PlacementPolicy`].
+///
+/// Exact reservations retain the historical per-LLC walk: the same policy
+/// selects LLCs and orders CPUs within each LLC. Elastic builds instead rank
+/// every CPU in their already-consolidated footprint together, so a free CPU
+/// in a later LLC wins over a shared CPU in an earlier LLC without spreading
+/// the LLC locks themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CpuSelectionPolicy {
+    WithinEachLlc(PlacementPolicy),
+    LeastHeldAcrossFootprint { rotation: usize },
+}
+
+impl CpuSelectionPolicy {
+    fn least_held_for_process() -> Self {
+        Self::LeastHeldAcrossFootprint {
             rotation: pid_window_offset(std::process::id(), 1 << 16),
         }
     }
@@ -3040,13 +3061,15 @@ fn try_acquire_llc_plan_locks_with_evidence(
 /// fallback — so plans are always schedulable under cgroup-restricted
 /// runners (CI hosts, systemd slices, sudo under a limited cpuset).
 ///
-/// `policy` picks the placement preference among eligible LLCs. Shared VM and
-/// elastic harness/scheduler reservations use process-rotated
+/// `policy` picks the placement preference among eligible LLCs and CPUs for
+/// exact reservations. Shared VM reservations use process-rotated
 /// [`PlacementPolicy::Spread`] (see the enum docs for the clustering failure
 /// Spread exists to prevent); direct fixed-size kernel builds use
-/// [`PlacementPolicy::Consolidate`] for cache-domain packing. Both policies use
-/// the host distance matrix from [`crate::topology::TestTopology`] so spill
-/// order matches actual NUMA cost. Hosts whose
+/// [`PlacementPolicy::Consolidate`] for cache-domain packing. Elastic build
+/// admission has a dedicated entry point which consolidates only its LLC
+/// footprint and spreads CPU selection within it. Both policies use the host
+/// distance matrix from [`crate::topology::TestTopology`] so spill order
+/// matches actual NUMA cost. Hosts whose
 /// `/sys/devices/system/node/*/distance` failed to parse degrade to a
 /// numerically-adjacent ordering via the distance closure (`10` for
 /// same-node, `20` for cross-node).
@@ -3062,6 +3085,7 @@ pub fn acquire_llc_plan(
         test_topo,
         cpu_cap,
         policy,
+        CpuSelectionPolicy::WithinEachLlc(policy),
         wait,
         LlcPlanSizing::Exact,
         None,
@@ -3084,6 +3108,7 @@ pub(crate) fn acquire_llc_plan_interruptible(
         test_topo,
         cpu_cap,
         policy,
+        CpuSelectionPolicy::WithinEachLlc(policy),
         wait,
         LlcPlanSizing::Exact,
         cancelled,
@@ -3092,13 +3117,18 @@ pub(crate) fn acquire_llc_plan_interruptible(
 
 /// Work-conserving waiting acquisition for throughput-elastic builds.
 ///
-/// The resolved CPU budget is a maximum. Each admission turn takes the
-/// largest currently SH-compatible placement from one CPU through that
-/// maximum. Performance reservations remain a hard EX fence; default,
-/// no-perf, and build holders are SH-compatible and may overlap. Compatible
-/// work is placed with the same process-rotated Spread policy as shared VM
-/// work, preventing independent Cargo processes from stacking their whole
-/// parallelism allowance onto one most-held CPU prefix. When no CPU is
+/// The resolved CPU budget is a maximum. Each admission turn first sizes
+/// itself from CPUs with no current holder, preventing every concurrent Cargo
+/// process from advertising the full maximum while unused CPU capacity still
+/// exists. Once every compatible CPU has a holder, SH-compatible capacity is
+/// the fallback so default, no-perf, and build work may continue to overlap.
+///
+/// LLC and CPU placement are deliberately independent. The build consolidates
+/// its LLC footprint among domains carrying the effective free-first CPU set,
+/// leaving as many whole LLCs as possible available for hard-exclusive
+/// performance work, while choosing the least-held CPUs inside that footprint
+/// with a process-rotated tiebreak.
+/// Performance reservations remain a hard EX fence. When no compatible CPU is
 /// currently available, the caller queues behind a one-CPU exact designation
 /// and replans against the full immutable watch on every wake.
 pub(crate) fn acquire_elastic_build_llc_plan(
@@ -3111,7 +3141,8 @@ pub(crate) fn acquire_elastic_build_llc_plan(
         topo,
         test_topo,
         cpu_cap,
-        PlacementPolicy::spread_for_process(),
+        PlacementPolicy::Consolidate,
+        CpuSelectionPolicy::least_held_for_process(),
         true,
         LlcPlanSizing::Elastic,
         cancelled,
@@ -3151,7 +3182,8 @@ struct LlcPlanAcquireRequest<'a> {
     topo: &'a HostTopology,
     test_topo: &'a crate::topology::TestTopology,
     cpu_cap: Option<CpuCap>,
-    policy: PlacementPolicy,
+    llc_policy: PlacementPolicy,
+    cpu_policy: CpuSelectionPolicy,
     wait: bool,
     sizing: LlcPlanSizing,
     cancelled: Option<&'a AtomicBool>,
@@ -3161,7 +3193,8 @@ fn acquire_llc_plan_impl(
     topo: &HostTopology,
     test_topo: &crate::topology::TestTopology,
     cpu_cap: Option<CpuCap>,
-    policy: PlacementPolicy,
+    llc_policy: PlacementPolicy,
+    cpu_policy: CpuSelectionPolicy,
     wait: bool,
     sizing: LlcPlanSizing,
     cancelled: Option<&AtomicBool>,
@@ -3182,7 +3215,8 @@ fn acquire_llc_plan_impl(
             topo,
             test_topo,
             cpu_cap,
-            policy,
+            llc_policy,
+            cpu_policy,
             wait,
             sizing,
             cancelled,
@@ -3294,7 +3328,8 @@ where
             topo,
             test_topo,
             cpu_cap,
-            policy,
+            llc_policy: policy,
+            cpu_policy: CpuSelectionPolicy::WithinEachLlc(policy),
             wait,
             sizing: LlcPlanSizing::Exact,
             cancelled,
@@ -3320,7 +3355,8 @@ fn acquire_elastic_build_llc_plan_with_coordinator_step_hook(
             topo,
             test_topo,
             cpu_cap,
-            policy: PlacementPolicy::spread_for_process(),
+            llc_policy: PlacementPolicy::Consolidate,
+            cpu_policy: CpuSelectionPolicy::least_held_for_process(),
             wait: true,
             sizing: LlcPlanSizing::Elastic,
             cancelled,
@@ -3344,7 +3380,8 @@ where
         topo,
         test_topo,
         cpu_cap,
-        policy,
+        llc_policy,
+        cpu_policy,
         wait,
         sizing,
         cancelled,
@@ -3476,22 +3513,23 @@ where
             }
             .into());
         }
-        let eligible_capacity = eligible
-            .iter()
-            .flat_map(|snapshot| topo.llc_groups[snapshot.llc_idx].cpus.iter().copied())
-            .filter(|cpu| eligible_allowed.contains(cpu))
-            .collect::<std::collections::BTreeSet<_>>()
-            .len();
-        let planned_target = sizing.target_for_capacity(target_cpus, eligible_capacity);
-        let claim_capacity_insufficient = planned_target.is_none();
-        let selected = if let Some(planned_target) = planned_target {
+        let live_capacity = live_cpu_capacity(
+            sizing,
+            target_cpus,
+            &eligible,
+            topo,
+            &eligible_allowed,
+            &cpu_states,
+        );
+        let claim_capacity_insufficient = live_capacity.is_none();
+        let selected = if let Some(live_capacity) = &live_capacity {
             plan_from_snapshots(
                 &eligible,
-                planned_target,
+                live_capacity.target,
                 topo,
-                &eligible_allowed,
+                &live_capacity.eligible,
                 |from, to| test_topo.numa_distance(from, to),
-                policy,
+                llc_policy,
             )
         } else {
             Vec::new()
@@ -3519,17 +3557,26 @@ where
             materialize_plan_cpus(
                 &selected,
                 topo,
-                &eligible_allowed,
+                &live_capacity
+                    .as_ref()
+                    .expect("a non-empty plan must have live capacity")
+                    .eligible,
                 &cpu_states,
-                planned_target.expect("a non-empty plan must have a target"),
-                policy,
+                live_capacity
+                    .as_ref()
+                    .expect("a non-empty plan must have live capacity")
+                    .target,
+                cpu_policy,
             )
         };
         if !selected.is_empty() && selected_materialized.is_none() {
             return Err(ResourceContention {
                 reason: format!(
                     "selected LLCs did not contain the required {} distinct eligible CPUs",
-                    planned_target.expect("a non-empty plan must have a target"),
+                    live_capacity
+                        .as_ref()
+                        .expect("a non-empty plan must have live capacity")
+                        .target,
                 ),
             }
             .into());
@@ -3660,13 +3707,22 @@ where
     let queued_allowed = queue_seed_universe
         .expect("waiting acquisition must preserve its full static CPU universe");
     let queued_target_cpus = sizing.queued_target(target_cpus);
-    let queued_selected = plan_from_snapshots(
-        &queued_snapshots,
+    let queued_capacity = live_cpu_capacity(
+        sizing,
         queued_target_cpus,
+        &queued_snapshots,
         topo,
         &queued_allowed,
+        &queued_cpu_states,
+    )
+    .expect("a statically valid queued designation must have CPU capacity");
+    let queued_selected = plan_from_snapshots(
+        &queued_snapshots,
+        queued_capacity.target,
+        topo,
+        &queued_capacity.eligible,
         |from, to| test_topo.numa_distance(from, to),
-        policy,
+        llc_policy,
     );
     if queued_selected.is_empty() {
         return Err(ResourceContention {
@@ -3680,10 +3736,10 @@ where
     let Some((queued_cpus, _)) = materialize_plan_cpus(
         &queued_selected,
         topo,
-        &queued_allowed,
+        &queued_capacity.eligible,
         &queued_cpu_states,
-        queued_target_cpus,
-        policy,
+        queued_capacity.target,
+        cpu_policy,
     ) else {
         return Err(ResourceContention {
             reason: format!(
@@ -3795,14 +3851,14 @@ where
                 predecessor_free
             }
         };
-        let eligible_capacity = snapshots
-            .iter()
-            .flat_map(|snapshot| topo.llc_groups[snapshot.llc_idx].cpus.iter().copied())
-            .filter(|cpu| eligible_allowed.contains(cpu))
-            .collect::<std::collections::BTreeSet<_>>()
-            .len();
-        let Some(next_target_cpus) = sizing.target_for_capacity(target_cpus, eligible_capacity)
-        else {
+        let Some(live_capacity) = live_cpu_capacity(
+            sizing,
+            target_cpus,
+            &snapshots,
+            topo,
+            &eligible_allowed,
+            &cpu_states,
+        ) else {
             // The full immutable watch covers every resource that can make
             // this elastic ticket runnable; no speculative physical probe is
             // needed while the live/registry snapshot exposes zero capacity.
@@ -3810,11 +3866,11 @@ where
         };
         let next_selected = plan_from_snapshots(
             &snapshots,
-            next_target_cpus,
+            live_capacity.target,
             topo,
-            &eligible_allowed,
+            &live_capacity.eligible,
             |from, to| test_topo.numa_distance(from, to),
-            policy,
+            llc_policy,
         );
         if next_selected.is_empty() {
             // Every statically valid alternative is temporarily excluded by
@@ -3826,10 +3882,10 @@ where
         let Some((next_cpus, _)) = materialize_plan_cpus(
             &next_selected,
             topo,
-            &eligible_allowed,
+            &live_capacity.eligible,
             &cpu_states,
-            next_target_cpus,
-            policy,
+            live_capacity.target,
+            cpu_policy,
         ) else {
             // The ready subset lost capacity between planning dimensions.
             // This is transient contention, not a malformed static topology.
@@ -3949,28 +4005,29 @@ where
             }
             ready_snapshots = predecessor_free;
         }
-        let eligible_capacity = ready_snapshots
-            .iter()
-            .flat_map(|snapshot| topo.llc_groups[snapshot.llc_idx].cpus.iter().copied())
-            .filter(|cpu| eligible_allowed.contains(cpu))
-            .collect::<std::collections::BTreeSet<_>>()
-            .len();
-        if let Some(next_target_cpus) = sizing.target_for_capacity(target_cpus, eligible_capacity) {
+        if let Some(live_capacity) = live_cpu_capacity(
+            sizing,
+            target_cpus,
+            &ready_snapshots,
+            topo,
+            &eligible_allowed,
+            &cpu_states,
+        ) {
             let selected = plan_from_snapshots(
                 &ready_snapshots,
-                next_target_cpus,
+                live_capacity.target,
                 topo,
-                &eligible_allowed,
+                &live_capacity.eligible,
                 |from, to| test_topo.numa_distance(from, to),
-                policy,
+                llc_policy,
             );
             if let Some((cpus, _)) = materialize_plan_cpus(
                 &selected,
                 topo,
-                &eligible_allowed,
+                &live_capacity.eligible,
                 &cpu_states,
-                next_target_cpus,
-                policy,
+                live_capacity.target,
+                cpu_policy,
             ) {
                 coordinator_claim = protocol::ClaimSet::with_modes(
                     selected,
@@ -4093,8 +4150,14 @@ pub fn plan_llc_selection_only(
         |from, to| test_topo.numa_distance(from, to),
         policy,
     );
-    let materialized =
-        materialize_plan_cpus(&selected, topo, &allowed, &cpu_states, target_cpus, policy);
+    let materialized = materialize_plan_cpus(
+        &selected,
+        topo,
+        &allowed,
+        &cpu_states,
+        target_cpus,
+        CpuSelectionPolicy::WithinEachLlc(policy),
+    );
     let Some((cpus, mems)) = materialized else {
         return Err(ResourceContention {
             reason: format!(
@@ -4132,6 +4195,72 @@ struct CpuPlacementState {
     other_holders: usize,
 }
 
+/// Resolve one admission turn's CPU width from the current placement image.
+///
+/// Exact VM reservations retain their fixed-capacity contract. Elastic build
+/// reservations first consume the currently unshared capacity visible through
+/// the selected LLC candidates. That keeps a compile storm's aggregate
+/// parallelism tied to real idle capacity instead of giving every process the
+/// full maximum immediately. If no compatible CPU is unshared, the existing
+/// SH-compatible capacity is deliberately retained as a fallback: default,
+/// no-perf, and build reservations are cooperative, and must still make
+/// progress while the host is fully occupied by other cooperative ktstr work.
+///
+/// The effective set accompanies the width. While any unshared CPU exists,
+/// both LLC selection and CPU materialization see only those CPUs, so a
+/// heavily shared LLC cannot hide a disjoint idle LLC merely because
+/// Consolidate ranks its LLC holder count first. Once the unshared set is
+/// empty, the effective set becomes every SH-compatible CPU.
+struct LiveCpuCapacity {
+    target: usize,
+    eligible: std::collections::BTreeSet<usize>,
+}
+
+fn live_cpu_capacity(
+    sizing: LlcPlanSizing,
+    maximum: usize,
+    snapshots: &[LlcSnapshot],
+    topo: &HostTopology,
+    compatible: &std::collections::BTreeSet<usize>,
+    states: &std::collections::BTreeMap<usize, CpuPlacementState>,
+) -> Option<LiveCpuCapacity> {
+    let snapshot_cpus = snapshots
+        .iter()
+        .flat_map(|snapshot| topo.llc_groups[snapshot.llc_idx].cpus.iter().copied())
+        .collect::<std::collections::BTreeSet<_>>();
+    let compatible = compatible
+        .intersection(&snapshot_cpus)
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let compatible_capacity = compatible.len();
+    if sizing == LlcPlanSizing::Elastic {
+        let unshared = compatible
+            .iter()
+            .copied()
+            .filter(|cpu| {
+                states
+                    .get(cpu)
+                    .is_none_or(|state| state.other_holders == 0)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let unshared_capacity = unshared.len();
+        if unshared_capacity > 0 {
+            return sizing
+                .target_for_capacity(maximum, unshared_capacity)
+                .map(|target| LiveCpuCapacity {
+                    target,
+                    eligible: unshared,
+                });
+        }
+    }
+    sizing
+        .target_for_capacity(maximum, compatible_capacity)
+        .map(|target| LiveCpuCapacity {
+            target,
+            eligible: compatible,
+        })
+}
+
 fn cpu_eligible_allowed(
     allowed: &std::collections::BTreeSet<usize>,
     states: &std::collections::BTreeMap<usize, CpuPlacementState>,
@@ -4155,20 +4284,12 @@ fn materialize_plan_cpus(
     eligible: &std::collections::BTreeSet<usize>,
     states: &std::collections::BTreeMap<usize, CpuPlacementState>,
     target_cpus: usize,
-    policy: PlacementPolicy,
+    policy: CpuSelectionPolicy,
 ) -> Option<(Vec<usize>, std::collections::BTreeSet<usize>)> {
-    let mut cpus: Vec<usize> = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    'outer: for &idx in selected {
-        let group = &topo.llc_groups[idx];
-        let mut candidates = group
-            .cpus
-            .iter()
-            .copied()
-            .filter(|cpu| eligible.contains(cpu))
-            .collect::<Vec<_>>();
+    let rank = |candidates: &mut Vec<usize>, placement: PlacementPolicy| {
         candidates.sort_unstable();
-        let rotation = match policy {
+        candidates.dedup();
+        let rotation = match placement {
             PlacementPolicy::Consolidate => 0,
             PlacementPolicy::Spread { rotation } => rotation,
         };
@@ -4182,20 +4303,52 @@ fn materialize_plan_cpus(
         candidates.sort_by(|a, b| {
             let a_holders = states.get(a).map_or(0, |state| state.other_holders);
             let b_holders = states.get(b).map_or(0, |state| state.other_holders);
-            let occupancy = match policy {
+            let occupancy = match placement {
                 PlacementPolicy::Consolidate => b_holders.cmp(&a_holders),
                 PlacementPolicy::Spread { .. } => a_holders.cmp(&b_holders),
             };
             occupancy.then_with(|| rotated_pos[a].cmp(&rotated_pos[b]).then(a.cmp(b)))
         });
-        for cpu in candidates {
-            if !seen.insert(cpu) {
-                continue;
+    };
+
+    let mut cpus: Vec<usize> = Vec::new();
+    match policy {
+        CpuSelectionPolicy::WithinEachLlc(placement) => {
+            let mut seen = std::collections::BTreeSet::new();
+            'outer: for &idx in selected {
+                let group = &topo.llc_groups[idx];
+                let mut candidates = group
+                    .cpus
+                    .iter()
+                    .copied()
+                    .filter(|cpu| eligible.contains(cpu))
+                    .collect::<Vec<_>>();
+                rank(&mut candidates, placement);
+                for cpu in candidates {
+                    if !seen.insert(cpu) {
+                        continue;
+                    }
+                    if cpus.len() >= target_cpus {
+                        break 'outer;
+                    }
+                    cpus.push(cpu);
+                }
             }
-            if cpus.len() >= target_cpus {
-                break 'outer;
+        }
+        CpuSelectionPolicy::LeastHeldAcrossFootprint { rotation } => {
+            let mut candidates = selected
+                .iter()
+                .flat_map(|idx| topo.llc_groups[*idx].cpus.iter().copied())
+                .filter(|cpu| eligible.contains(cpu))
+                .collect::<Vec<_>>();
+            rank(
+                &mut candidates,
+                PlacementPolicy::Spread { rotation },
+            );
+            if candidates.len() < target_cpus {
+                return None;
             }
-            cpus.push(cpu);
+            cpus.extend(candidates.into_iter().take(target_cpus));
         }
     }
     if cpus.len() != target_cpus {

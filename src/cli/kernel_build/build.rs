@@ -209,11 +209,13 @@ fn acquire_build_reservation_impl(
         None
     } else if let Ok(host_topo) = crate::vmm::host_topology::HostTopology::from_sysfs() {
         let test_topo = crate::topology::TestTopology::from_system()?;
-        // Concurrent harness/scheduler prebuilds use the same
-        // process-rotated Spread placement as shared VM work. Consolidating
-        // those independent Cargo processes onto the most-held LLCs is
-        // pathological during a runner storm: every build selects the same
-        // busy CPU prefix while the rest of the host sits available.
+        // Concurrent harness/scheduler prebuilds decouple cache footprint from
+        // CPU choice. They consolidate among LLCs carrying the effective
+        // free-first CPU set so whole cache domains remain available for
+        // hard-exclusive performance runs, then select least-held CPUs inside
+        // that footprint instead of converging on one busy CPU prefix. Their
+        // elastic width consumes currently unshared capacity first and retains
+        // cooperative SH overlap as the fully-occupied fallback.
         //
         // A direct kernel build keeps its fixed Consolidate contract. It is
         // non-elastic, may hold a source-tree lock, and deliberately packs
