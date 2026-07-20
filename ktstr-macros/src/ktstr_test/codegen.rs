@@ -24,6 +24,10 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         "__KTSTR_SCHED_MANIFEST_TEST_{}",
         orig_name.to_string().to_uppercase()
     );
+    let admission_entry_name = format_ident!(
+        "__KTSTR_ADMISSION_TEST_{}",
+        orig_name.to_string().to_uppercase()
+    );
     let name_str = orig_name.to_string();
 
     // Destructure attrs into per-field bare locals. The codegen
@@ -771,6 +775,14 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
                     #(#manifest_staged_schedulers),*
                 ],
             );
+
+        #[::ktstr::distributed_slice(
+            ::ktstr::test_support::KTSTR_ADMISSION_TESTS_V1
+        )]
+        #[linkme(crate = ::ktstr::linkme)]
+        static #admission_entry_name:
+            ::ktstr::test_support::AdmissionTestStampV1 =
+            ::ktstr::test_support::AdmissionTestStampV1::new(&#entry_name);
 
         #pairing_assert
 

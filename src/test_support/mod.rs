@@ -53,7 +53,13 @@ use crate::scenario::Ctx;
 #[cfg(test)]
 use anyhow::Result;
 
+mod admission_stamp;
 mod args;
+#[doc(hidden)]
+pub use admission_stamp::{
+    AdmissionCellDescriptor, AdmissionCellKind, AdmissionMode, AdmissionTestStampV1,
+    AdmissionTopologyDescriptor, KTSTR_ADMISSION_TESTS_V1, read_admission_cell_stamp,
+};
 // Re-exported for the workload-side CgroupChurn worker, which resolves the
 // same workload cgroup root the host-side setup uses but lives outside the
 // private `args` module's subtree.

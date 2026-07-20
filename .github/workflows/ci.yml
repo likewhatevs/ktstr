@@ -135,7 +135,6 @@ jobs:
       - uses: taiki-e/install-action@v2.83.3
         with:
           tool: cargo-nextest
-      - run: just kernel-build ${{ matrix.kernel-version }}
       - run: just test ${{ matrix.kernel-version }} ${{ matrix.features }}
       - if: ${{ !cancelled() }}
         run: just sccache-stats
@@ -190,7 +189,6 @@ jobs:
       - uses: taiki-e/install-action@v2.83.3
         with:
           tool: cargo-nextest
-      - run: just kernel-build ${{ matrix.kernel-version }}
       - run: just test ${{ matrix.kernel-version }} ${{ matrix.features }}
       - if: ${{ !cancelled() }}
         run: just sccache-stats
@@ -320,7 +318,6 @@ jobs:
       - uses: taiki-e/install-action@v2.83.3
         with:
           tool: cargo-llvm-cov,cargo-nextest
-      - run: just kernel-build 7.1
       - run: just coverage 7.1 wprof
       - if: ${{ !cancelled() }}
         run: just sccache-stats
@@ -367,7 +364,6 @@ jobs:
       - uses: taiki-e/install-action@v2.83.3
         with:
           tool: cargo-llvm-cov,cargo-nextest
-      - run: just kernel-build 7.1
       - run: just coverage 7.1 wprof
       - if: ${{ !cancelled() }}
         run: just sccache-stats

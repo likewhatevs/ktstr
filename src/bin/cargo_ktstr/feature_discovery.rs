@@ -56,6 +56,7 @@ pub(crate) struct PackageFeatureActivation {
 #[derive(Clone, Debug)]
 pub(crate) struct TargetContext {
     name: String,
+    cargo_target: String,
     cfg: Vec<Cfg>,
     metadata_filter: Option<String>,
 }
@@ -65,14 +66,20 @@ impl TargetContext {
         let name = name.into();
         Self {
             metadata_filter: Some(name.clone()),
+            cargo_target: name.clone(),
             name,
             cfg,
         }
     }
 
-    fn custom(name: impl Into<String>, cfg: Vec<Cfg>) -> Self {
+    fn custom(
+        name: impl Into<String>,
+        cargo_target: impl Into<String>,
+        cfg: Vec<Cfg>,
+    ) -> Self {
         Self {
             name: name.into(),
+            cargo_target: cargo_target.into(),
             cfg,
             metadata_filter: None,
         }
@@ -80,6 +87,21 @@ impl TargetContext {
 
     pub(crate) fn matches_platform(&self, platform: &Platform) -> bool {
         platform.matches(&self.name, &self.cfg)
+    }
+
+    /// Cargo's canonical target-table/env-key name for this context.
+    ///
+    /// Named targets retain their full triple. Custom JSON targets use their
+    /// file stem, matching Cargo's `CARGO_TARGET_<NAME>_*` normalization.
+    pub(crate) fn target_name(&self) -> &str {
+        &self.name
+    }
+
+    /// Exact Cargo `--target` spelling used to resolve hierarchical runner
+    /// configuration. For custom targets this retains the JSON path so
+    /// cargo-config2 can evaluate the same cfg tables Cargo does.
+    pub(crate) fn cargo_target(&self) -> &str {
+        &self.cargo_target
     }
 
     #[cfg(test)]
@@ -190,7 +212,11 @@ pub(crate) fn effective_target_context(args: &[String]) -> Result<TargetContext,
                 // Cargo identifies a custom target by the JSON file stem for
                 // exact `[target.<name>]` tables; the path is only rustc's
                 // input locator.
-                Ok(TargetContext::custom(custom_target_name(&target)?, cfg))
+                Ok(TargetContext::custom(
+                    custom_target_name(&target)?,
+                    target,
+                    cfg,
+                ))
             }
         }
         None => {
@@ -2354,8 +2380,11 @@ unrelated-mode = []
         );
         let context = TargetContext::custom(
             custom_target_name("targets/custom.json").unwrap(),
+            "targets/custom.json",
             vec![Cfg::KeyPair("target_os".to_string(), "linux".to_string())],
         );
+        assert_eq!(context.target_name(), "custom");
+        assert_eq!(context.cargo_target(), "targets/custom.json");
         assert!(context.matches_platform(&Platform::from_str("custom").unwrap()));
         assert!(
             context.matches_platform(&Platform::from_str(r#"cfg(target_os = "linux")"#).unwrap())

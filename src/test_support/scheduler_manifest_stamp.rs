@@ -444,8 +444,8 @@ enum PointerRelocation {
     Duplicate,
 }
 
-struct ElfStampReader<'a> {
-    source: &'a Path,
+pub(super) struct ElfStampReader<'a> {
+    pub(super) source: &'a Path,
     data: &'a [u8],
     elf: Elf<'a>,
     relative_relocation_type: u32,
@@ -455,7 +455,7 @@ struct ElfStampReader<'a> {
 }
 
 impl<'a> ElfStampReader<'a> {
-    fn new(source: &'a Path, data: &'a [u8]) -> Result<Self, String> {
+    pub(super) fn new(source: &'a Path, data: &'a [u8]) -> Result<Self, String> {
         // `Elf::parse` eagerly decodes the static and dynamic symbol tables,
         // every section relocation, symbol versions, and other metadata that
         // the stamp reader never consults. Rust test executables routinely
@@ -771,7 +771,7 @@ impl<'a> ElfStampReader<'a> {
         }))
     }
 
-    fn section(&self, name: &str) -> Result<Option<(u64, &'a [u8])>, String> {
+    pub(super) fn section(&self, name: &str) -> Result<Option<(u64, &'a [u8])>, String> {
         let mut found = None;
         for section in &self.elf.section_headers {
             if self.elf.shdr_strtab.get_at(section.sh_name) != Some(name) {
@@ -867,19 +867,19 @@ impl<'a> ElfStampReader<'a> {
         ))
     }
 
-    fn bytes_at_va(&self, va: u64, len: usize, what: &str) -> Result<&'a [u8], String> {
+    pub(super) fn bytes_at_va(&self, va: u64, len: usize, what: &str) -> Result<&'a [u8], String> {
         let offset = self.va_file_offset(va, len, what)?;
         Ok(&self.data[offset..offset + len])
     }
 
-    fn u8(&self, base: u64, offset: usize, what: &str) -> Result<u8, String> {
+    pub(super) fn u8(&self, base: u64, offset: usize, what: &str) -> Result<u8, String> {
         let va = base
             .checked_add(offset as u64)
             .ok_or_else(|| format!("{what} address overflow in {}", self.source.display()))?;
         Ok(self.bytes_at_va(va, 1, what)?[0])
     }
 
-    fn u16(&self, base: u64, offset: usize, what: &str) -> Result<u16, String> {
+    pub(super) fn u16(&self, base: u64, offset: usize, what: &str) -> Result<u16, String> {
         let va = base
             .checked_add(offset as u64)
             .ok_or_else(|| format!("{what} address overflow in {}", self.source.display()))?;
@@ -890,7 +890,7 @@ impl<'a> ElfStampReader<'a> {
         Ok(u16::from_le_bytes(bytes))
     }
 
-    fn u32(&self, base: u64, offset: usize, what: &str) -> Result<u32, String> {
+    pub(super) fn u32(&self, base: u64, offset: usize, what: &str) -> Result<u32, String> {
         let va = base
             .checked_add(offset as u64)
             .ok_or_else(|| format!("{what} address overflow in {}", self.source.display()))?;
@@ -901,7 +901,7 @@ impl<'a> ElfStampReader<'a> {
         Ok(u32::from_le_bytes(bytes))
     }
 
-    fn raw_u64(&self, va: u64, what: &str) -> Result<u64, String> {
+    pub(super) fn raw_u64(&self, va: u64, what: &str) -> Result<u64, String> {
         let bytes: [u8; 8] = self
             .bytes_at_va(va, 8, what)?
             .try_into()
@@ -909,7 +909,7 @@ impl<'a> ElfStampReader<'a> {
         Ok(u64::from_le_bytes(bytes))
     }
 
-    fn pointer(&self, base: u64, offset: usize, what: &str) -> Result<u64, String> {
+    pub(super) fn pointer(&self, base: u64, offset: usize, what: &str) -> Result<u64, String> {
         let field_va = base.checked_add(offset as u64).ok_or_else(|| {
             format!(
                 "{what} pointer address overflow in {}",
@@ -997,7 +997,7 @@ impl<'a> ElfStampReader<'a> {
         self.u16(base, offset_of!(StampHeaderV1, kind), &what)
     }
 
-    fn string(&self, base: u64, what: &str) -> Result<String, String> {
+    pub(super) fn string(&self, base: u64, what: &str) -> Result<String, String> {
         let len = self.raw_u64(
             base + offset_of!(SchedulerManifestStampStrV1, len) as u64,
             what,

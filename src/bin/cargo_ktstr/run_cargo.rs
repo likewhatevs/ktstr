@@ -178,7 +178,7 @@ fn prepare_llvm_cov_args_with(
 /// subcommand accepts nextest's tool-config flag. Keeping this decision next
 /// to [`llvm_cov_uses_nextest`] prevents report/clean/show-env passthroughs
 /// from being mutated.
-fn cargo_sub_uses_nextest(sub_argv: &[&str], args: &[String]) -> bool {
+pub(crate) fn cargo_sub_uses_nextest(sub_argv: &[&str], args: &[String]) -> bool {
     let selects_nextest = sub_argv == TEST_SUB_ARGV
         || sub_argv == COVERAGE_SUB_ARGV
         || (sub_argv == LLVM_COV_SUB_ARGV && llvm_cov_uses_nextest(args));

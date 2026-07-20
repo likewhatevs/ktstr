@@ -49,6 +49,8 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[path = "cargo_ktstr/admission_runner.rs"]
+mod admission_runner;
 #[path = "cargo_ktstr/affected/mod.rs"]
 mod affected;
 #[path = "cargo_ktstr/cli.rs"]
@@ -143,6 +145,11 @@ fn install_project_commit_env() {
 }
 
 fn main() {
+    // Cargo/nextest re-enters this executable as a hidden target runner. That
+    // mode must remain a tiny admission+exec path: no startup supervisor,
+    // embedded-blob extraction, metadata probe, tracing, or clap dispatch.
+    admission_runner::dispatch_if_requested();
+
     // Process-group anchors re-exec this binary with a private marker and
     // control pipes. Handle that mode before blob extraction, Cargo metadata,
     // tracing, argument parsing, or any other ordinary CLI initialization.
@@ -213,6 +220,16 @@ fn main() {
             std::process::exit(i32::from(code));
         }
     };
+
+    // Install the nextest target runner only for commands that can execute
+    // test cells. All environment mutation remains in single-threaded startup:
+    // tracing's synchronous formatter owns no worker and every earlier helper
+    // has joined its temporary child/work before returning.
+    if let Err(e) = admission_runner::install_for_command(&ktstr.command) {
+        eprintln!("error: configure nextest pre-admission runner: {e}");
+        interrupt::commit_startup_worker_exit(1);
+        std::process::exit(1);
+    }
 
     // One handler installation spans the dispatched CLI lifetime. It starts
     // in EARLY mode, where SIGINT/SIGTERM retain terminate-immediately

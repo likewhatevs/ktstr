@@ -68,6 +68,75 @@ fn hidden_process_group_anchor_obeys_its_control_pipe() {
     );
 }
 
+/// The private Cargo target-runner entry point must execute before normal
+/// cargo-ktstr startup, compose an existing configured runner for list/plain
+/// binaries, and restore the user's runner environment before the final exec.
+#[test]
+fn hidden_admission_runner_composes_listing_runner_and_restores_environment() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    const TARGET_RUNNER: &str = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER";
+    const TARGET_ENV_KEY_ENV: &str = "KTSTR_ADMISSION_TARGET_ENV_KEY";
+    const CHAINED_RUNNER_ENV: &str = "KTSTR_ADMISSION_CHAINED_RUNNER";
+    const ORIGINAL_RUNNER_ENV: &str = "KTSTR_ADMISSION_ORIGINAL_RUNNER";
+
+    let temporary = tempfile::tempdir().expect("create admission-runner fixture directory");
+    let runner = temporary.path().join("runner.sh");
+    let test_binary = temporary.path().join("listed-test.sh");
+    std::fs::write(
+        &runner,
+        b"#!/bin/sh\n[ \"$1\" = --fixed-runner-arg ] || exit 31\nshift\nexec \"$@\"\n",
+    )
+    .expect("write chained runner fixture");
+    std::fs::write(
+        &test_binary,
+        format!(
+            "#!/bin/sh\n\
+             [ \"${{{TARGET_RUNNER}}}\" = 'original runner --flag' ] || exit 32\n\
+             [ -z \"${{{TARGET_ENV_KEY_ENV}+set}}\" ] || exit 33\n\
+             [ -z \"${{{CHAINED_RUNNER_ENV}+set}}\" ] || exit 34\n\
+             [ -z \"${{{ORIGINAL_RUNNER_ENV}+set}}\" ] || exit 35\n\
+             printf 'admission-runner-ok\\n'\n",
+        ),
+    )
+    .expect("write listed test fixture");
+    for path in [&runner, &test_binary] {
+        let mut permissions = std::fs::metadata(path)
+            .expect("read fixture mode")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("make fixture executable");
+    }
+
+    let encoded_runner = serde_json::json!({
+        "program": runner.as_os_str().as_bytes(),
+        "args": [b"--fixed-runner-arg"],
+    })
+    .to_string();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-ktstr"))
+        .args([
+            std::ffi::OsStr::new("__ktstr_admission_runner"),
+            test_binary.as_os_str(),
+            std::ffi::OsStr::new("--list"),
+        ])
+        .env(TARGET_ENV_KEY_ENV, TARGET_RUNNER)
+        .env(CHAINED_RUNNER_ENV, encoded_runner)
+        .env(ORIGINAL_RUNNER_ENV, "original runner --flag")
+        .env(TARGET_RUNNER, "temporary ktstr wrapper")
+        .output()
+        .expect("run hidden admission runner");
+    assert!(
+        output.status.success(),
+        "hidden admission runner failed with {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(output.stdout, b"admission-runner-ok\n");
+    assert!(output.stderr.is_empty());
+}
+
 // -- help output --
 
 #[test]

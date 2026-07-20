@@ -15,6 +15,10 @@ pub(crate) fn expand(item: ItemStatic) -> syn::Result<TokenStream> {
         "__KTSTR_SCHED_MANIFEST_MANUAL_{}",
         entry.to_string().to_uppercase()
     );
+    let admission_stamp = format_ident!(
+        "__KTSTR_ADMISSION_MANUAL_{}",
+        entry.to_string().to_uppercase()
+    );
     Ok(quote! {
         #[::ktstr::distributed_slice(::ktstr::test_support::KTSTR_TESTS)]
         #[linkme(crate = ::ktstr::linkme)]
@@ -33,5 +37,12 @@ pub(crate) fn expand(item: ItemStatic) -> syn::Result<TokenStream> {
                     ),
                 ],
             );
+
+        #[::ktstr::distributed_slice(
+            ::ktstr::test_support::KTSTR_ADMISSION_TESTS_V1
+        )]
+        #[linkme(crate = ::ktstr::linkme)]
+        static #admission_stamp: ::ktstr::test_support::AdmissionTestStampV1 =
+            ::ktstr::test_support::AdmissionTestStampV1::new(&#entry);
     })
 }
