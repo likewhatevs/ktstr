@@ -77,30 +77,26 @@ fn interrupted_io_error(phase: &str) -> std::io::Error {
     )
 }
 
-/// Connect-phase timeout for [`shared_client`]: bounds the time spent
-/// in the TCP + TLS handshake before reqwest gives up on a peer.
-/// Bounds the dead-route case — a CDN edge that accepts the SYN but
-/// stalls the handshake, or a route that blackholes outright —
-/// without putting any ceiling on the response body's streaming
-/// duration once the connection is up.
-///
-/// No total request `.timeout()` is set: the same client serves both
-/// short requests (releases.json, sha256sums.asc) and large
-/// tarball streams ([`download_stable_tarball`],
-/// [`download_rc_tarball`]), where a 130–180 MiB compressed payload
-/// over a slow uplink can take minutes of wall-clock to deliver.
-/// Capping that with a per-request timeout would abort legitimate
-/// downloads; bounding only the connect phase preserves the
-/// dead-route guarantee while letting
-/// the body stream as long as the upstream is making forward
-/// progress.
+/// Connect-phase timeout for [`shared_client`]: bounds the TCP + TLS
+/// handshake before reqwest gives up on a dead peer or blackholed route.
 const SHARED_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default blocking-operation timeout for [`shared_client`].
+///
+/// Reqwest's blocking client applies this budget to connection, request-write,
+/// and response-read waits. Keeping it explicit here means a response that
+/// delivered headers but then stopped producing body bytes cannot wedge a
+/// caller that forgot a per-request override. Small metadata/index/probe
+/// requests also pass this value explicitly; large archive and package
+/// downloads override it with [`DOWNLOAD_REQUEST_READ_TIMEOUT`].
+const SMALL_RESPONSE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Return the process-wide shared [`reqwest::blocking::Client`]. First
 /// call constructs it via `Client::builder()` with
-/// `SHARED_CLIENT_CONNECT_TIMEOUT` applied; every subsequent call
-/// returns a reference to the same instance. This helper is for
-/// top-level CLI entries that want the default client.
+/// [`SHARED_CLIENT_CONNECT_TIMEOUT`] and
+/// [`SMALL_RESPONSE_REQUEST_TIMEOUT`] applied; every subsequent call returns
+/// a reference to the same instance. This helper is for top-level CLI entries
+/// that want the default client.
 ///
 /// Tests that need to verify a network round-trip (rather than a
 /// cache hit) must NOT pass `shared_client()` to a cache-routed
@@ -147,7 +143,9 @@ pub fn shared_client() -> &'static Client {
 /// handling. A routed client adds only a per-origin DNS override; it does not
 /// rewrite the URL, Host header, TLS SNI, or proxy configuration.
 fn default_http_client_builder() -> ClientBuilder {
-    Client::builder().connect_timeout(SHARED_CLIENT_CONNECT_TIMEOUT)
+    Client::builder()
+        .connect_timeout(SHARED_CLIENT_CONNECT_TIMEOUT)
+        .timeout(SMALL_RESPONSE_REQUEST_TIMEOUT)
 }
 
 /// Process-wide cache of the parsed `releases.json` payload.
@@ -755,24 +753,6 @@ impl<R: Read> Read for DownloadStream<R> {
 /// chunk; the watchdog provides the tighter 60s no-progress bound.
 const DOWNLOAD_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Total request timeout for [`fetch_sha256sums_from_url`]: bounds
-/// the wall-clock window for the single small-body GET that
-/// retrieves the cleartext-signed checksum manifest. The body is
-/// the `sha256sums.asc` cleartext block — typically a few KiB of
-/// `<hash>  <filename>` lines plus a PGP signature trailer — so a
-/// tight 30 s ceiling fits the realistic case (sub-second on a
-/// healthy CDN edge) while still bounding the failure mode this
-/// guards against: a stalled CDN that accepts the connection but
-/// never delivers bytes. Without a per-request timeout the
-/// shared client only carries [`SHARED_CLIENT_CONNECT_TIMEOUT`]
-/// (handshake-only), so a stalled body read would hang the build
-/// indefinitely. The caller treats any error from this function
-/// as "no expected hash available" and downgrades verification
-/// to a warning, so a 30 s timeout that fires on a hung CDN
-/// surfaces as an unverified-but-progressing download rather
-/// than a wedged build.
-const SHA256SUMS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// Retry policy for [`get_with_transient_retry`]: attempt count and
 /// the unit the exponential backoff scales from (sleep =
 /// `backoff_unit << attempt`, i.e. 2s/4s/8s for a 1s unit — the same
@@ -1065,12 +1045,37 @@ fn get_with_transient_retry(
     what: &str,
     retry: &HttpRetry,
 ) -> Result<reqwest::blocking::Response> {
+    get_with_transient_retry_and_headers(
+        client,
+        url,
+        timeout,
+        what,
+        retry,
+        &reqwest::header::HeaderMap::new(),
+    )
+}
+
+/// [`get_with_transient_retry`] with headers reapplied to every attempt.
+///
+/// This is used by the ranged URL-existence probe. Keeping request
+/// construction inside the retry loop is important: a retry must carry the
+/// same `Range` contract as the first attempt instead of silently becoming a
+/// full-body GET.
+fn get_with_transient_retry_and_headers(
+    client: &Client,
+    url: &str,
+    timeout: Option<Duration>,
+    what: &str,
+    retry: &HttpRetry,
+    headers: &reqwest::header::HeaderMap,
+) -> Result<reqwest::blocking::Response> {
     get_with_transient_retry_and_routes(
         client,
         url,
         timeout,
         what,
         retry,
+        headers,
         HttpRouteFailover {
             enabled: is_shared_client(client),
             resolve: resolve_http_origin,
@@ -1098,6 +1103,7 @@ fn get_with_transient_retry_and_routes<R, B>(
     timeout: Option<Duration>,
     what: &str,
     retry: &HttpRetry,
+    headers: &reqwest::header::HeaderMap,
     route_failover: HttpRouteFailover<R, B>,
 ) -> Result<reqwest::blocking::Response>
 where
@@ -1114,7 +1120,7 @@ where
             .as_ref()
             .map(|(client, _)| client)
             .unwrap_or(client);
-        let mut req = request_client.get(url);
+        let mut req = request_client.get(url).headers(headers.clone());
         if let Some(t) = timeout {
             req = req.timeout(t);
         }
@@ -1225,12 +1231,29 @@ fn source_operation_backoff(duration: Duration) -> Result<()> {
 /// through this so every metadata fetch rides the same retry/backoff
 /// seam as the kernel-source downloads. `what` is the error-context
 /// verb ("fetch"). A non-success status is a hard error carrying the
-/// status; the caller adds its own context. No total-request timeout
-/// (mirrors [`fetch_releases`]) — the connect timeout still bounds a
-/// dead route, and metadata bodies are single-digit MiB.
+/// status; the caller adds its own context. The explicit
+/// [`SMALL_RESPONSE_REQUEST_TIMEOUT`] bounds both the wait for response
+/// headers and every blocking body read, including the headers-then-stall
+/// failure mode.
 pub(crate) fn fetch_metadata_bytes(url: &str, what: &str) -> Result<Vec<u8>> {
-    let response =
-        get_with_transient_retry(shared_client(), url, None, what, &TRANSIENT_HTTP_RETRY)?;
+    fetch_metadata_bytes_with(
+        shared_client(),
+        url,
+        what,
+        &TRANSIENT_HTTP_RETRY,
+        SMALL_RESPONSE_REQUEST_TIMEOUT,
+    )
+}
+
+/// Injectable core of [`fetch_metadata_bytes`] for timeout/retry tests.
+fn fetch_metadata_bytes_with(
+    client: &Client,
+    url: &str,
+    what: &str,
+    retry: &HttpRetry,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    let response = get_with_transient_retry(client, url, Some(timeout), what, retry)?;
     if !response.status().is_success() {
         anyhow::bail!("{what} {url}: HTTP {}", response.status());
     }
@@ -1241,13 +1264,47 @@ pub(crate) fn fetch_metadata_bytes(url: &str, what: &str) -> Result<Vec<u8>> {
 /// UTF-8 text — for the plain-text metadata endpoints (`mirror.list`,
 /// `meta-release-lts`).
 pub(crate) fn fetch_metadata_text(url: &str, what: &str) -> Result<String> {
-    let response =
-        get_with_transient_retry(shared_client(), url, None, what, &TRANSIENT_HTTP_RETRY)?;
-    if !response.status().is_success() {
-        anyhow::bail!("{what} {url}: HTTP {}", response.status());
-    }
-    let bytes = read_response_bytes(response, url)?;
+    let bytes = fetch_metadata_bytes(url, what)?;
     String::from_utf8(bytes).with_context(|| format!("decode body of {url} as UTF-8"))
+}
+
+/// Ranged GET used by live distro-resolution tests to prove a resolved
+/// package URL still exists upstream without downloading the package.
+///
+/// The range header is rebuilt on every transient retry, and the small-response
+/// timeout bounds both header and body waits. Returning the final status keeps
+/// 404 and other permanent failures visible to the caller's assertion.
+#[cfg(test)]
+pub(crate) fn probe_url_status(url: &str) -> Result<reqwest::StatusCode> {
+    probe_url_status_with(
+        shared_client(),
+        url,
+        &TRANSIENT_HTTP_RETRY,
+        SMALL_RESPONSE_REQUEST_TIMEOUT,
+    )
+}
+
+#[cfg(test)]
+fn probe_url_status_with(
+    client: &Client,
+    url: &str,
+    retry: &HttpRetry,
+    timeout: Duration,
+) -> Result<reqwest::StatusCode> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::RANGE,
+        reqwest::header::HeaderValue::from_static("bytes=0-0"),
+    );
+    let response = get_with_transient_retry_and_headers(
+        client,
+        url,
+        Some(timeout),
+        "probe",
+        retry,
+        &headers,
+    )?;
+    Ok(response.status())
 }
 
 /// Construct the cdn.kernel.org `sha256sums.asc` URL for a stable
@@ -1278,7 +1335,7 @@ fn fetch_sha256sums_from_url(client: &Client, url: &str) -> Result<String> {
     let response = get_with_transient_retry(
         client,
         url,
-        Some(SHA256SUMS_REQUEST_TIMEOUT),
+        Some(SMALL_RESPONSE_REQUEST_TIMEOUT),
         "fetch",
         &TRANSIENT_HTTP_RETRY,
     )?;
@@ -2353,7 +2410,13 @@ pub(crate) const RELEASES_URL: &str = "https://www.kernel.org/releases.json";
 /// returns canned `releases.json` content.
 pub(crate) fn fetch_releases(client: &Client, url: &str) -> Result<Vec<Release>> {
     tracing::info!(%url, "fetching kernel.org releases index (requires network)");
-    let response = get_with_transient_retry(client, url, None, "fetch", &TRANSIENT_HTTP_RETRY)?;
+    let response = get_with_transient_retry(
+        client,
+        url,
+        Some(SMALL_RESPONSE_REQUEST_TIMEOUT),
+        "fetch",
+        &TRANSIENT_HTTP_RETRY,
+    )?;
     if !response.status().is_success() {
         anyhow::bail!("fetch {url}: HTTP {}", response.status());
     }

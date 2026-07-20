@@ -936,16 +936,14 @@ fn assert_resolved_shape(r: &ResolvedDistroKernel) {
 /// robust against a mirror that rejects HEAD; a server that ignores the
 /// `Range` header still only ships headers here — the blocking body is
 /// lazily read and we never read it, so no full package is pulled.
-/// `ddebs.ubuntu.com` is plain http, which the shared client handles. A
-/// non-success status (notably 404) is a hard failure so an upstream
+/// `ddebs.ubuntu.com` is plain http, which the shared client handles. The
+/// fetch helper bounds response stalls and retries transient transport/
+/// gateway failures while preserving this ranged request on every attempt.
+/// A non-success status (notably 404) is a hard failure so an upstream
 /// URL/layout change trips CI in advance of any real download.
 fn assert_url_exists(url: &str) {
-    let resp = crate::fetch::shared_client()
-        .get(url)
-        .header(reqwest::header::RANGE, "bytes=0-0")
-        .send()
+    let status = crate::fetch::probe_url_status(url)
         .unwrap_or_else(|e| panic!("existence probe for {url} failed: {e}"));
-    let status = resp.status();
     assert!(
         status.is_success(),
         "package URL does not exist upstream ({status}): {url}",

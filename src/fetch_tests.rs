@@ -2732,6 +2732,15 @@ fn transport_error_routes_preserve_same_origin_tail_and_reset_redirect_origin() 
 const RETRY_TEST_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const RETRY_TEST_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+fn configure_retry_test_connection(
+    stream: std::net::TcpStream,
+) -> std::io::Result<std::net::TcpStream> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(RETRY_TEST_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(RETRY_TEST_IO_TIMEOUT))?;
+    Ok(stream)
+}
+
 fn accept_retry_test_connection(
     listener: &std::net::TcpListener,
 ) -> std::io::Result<std::net::TcpStream> {
@@ -2739,12 +2748,7 @@ fn accept_retry_test_connection(
     let deadline = std::time::Instant::now() + RETRY_TEST_ACCEPT_TIMEOUT;
     loop {
         match listener.accept() {
-            Ok((stream, _)) => {
-                stream.set_nonblocking(false)?;
-                stream.set_read_timeout(Some(RETRY_TEST_IO_TIMEOUT))?;
-                stream.set_write_timeout(Some(RETRY_TEST_IO_TIMEOUT))?;
-                return Ok(stream);
-            }
+            Ok((stream, _)) => return configure_retry_test_connection(stream),
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 if std::time::Instant::now() >= deadline {
                     return Err(std::io::Error::new(
@@ -2757,6 +2761,65 @@ fn accept_retry_test_connection(
             Err(err) => return Err(err),
         }
     }
+}
+
+/// Accept a connection while a main-driven test client is still running.
+///
+/// Unlike the background-server helpers used by older network tests, these
+/// tests perform accept/read/write on the test thread. That prevents a
+/// saturated nextest/KVM run from starving the mock server after the client
+/// has already consumed its timeout budget. Returning `None` when the client
+/// finishes also turns a missing retry into an immediate assertion failure
+/// instead of a blocked second `accept`.
+fn accept_retry_test_connection_while_running<T>(
+    listener: &std::net::TcpListener,
+    client: &std::thread::JoinHandle<T>,
+) -> std::io::Result<Option<std::net::TcpStream>> {
+    listener.set_nonblocking(true)?;
+    let deadline = std::time::Instant::now() + RETRY_TEST_ACCEPT_TIMEOUT;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return configure_retry_test_connection(stream).map(Some),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if client.is_finished() {
+                    return Ok(None);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out waiting for main-driven HTTP test connection",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn read_retry_test_request_head(stream: &mut std::net::TcpStream) -> std::io::Result<String> {
+    use std::io::Read;
+
+    const MAX_REQUEST_HEAD: usize = 64 * 1024;
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "client closed before completing the HTTP request head",
+            ));
+        }
+        head.extend_from_slice(&chunk[..read]);
+        if head.len() > MAX_REQUEST_HEAD {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP request head exceeded test limit",
+            ));
+        }
+    }
+    Ok(String::from_utf8_lossy(&head).into_owned())
 }
 
 /// Serve one canned raw-HTTP response per accepted connection, in
@@ -2797,6 +2860,153 @@ fn serve_sequenced_responses(
 const RESPONSE_503: &str =
     "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 const RESPONSE_200: &str = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
+
+/// A server that completes the response head and then holds the body open must
+/// be interrupted by the request-layer timeout. The server work runs on this
+/// test thread, so observing a complete request and writing the response head
+/// cannot be starved behind the client. A ten-second socket keeper is only a
+/// fail-safe: the asserted sub-five-second timeout must fire first.
+#[test]
+fn metadata_request_timeout_bounds_headers_then_stalled_body() {
+    use std::io::Write;
+
+    const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+    const SOCKET_FAILSAFE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind localhost listener");
+    let addr = listener.local_addr().expect("read listener address");
+    let url = format!("http://{addr}/metadata");
+    let client_url = url.clone();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .no_proxy()
+        .build()
+        .expect("build timeout-test client");
+    let worker = std::thread::spawn(move || {
+        let one_attempt = super::HttpRetry {
+            attempts: 1,
+            backoff_unit: std::time::Duration::ZERO,
+        };
+        let started = std::time::Instant::now();
+        let result = super::fetch_metadata_bytes_with(
+            &client,
+            &client_url,
+            "fetch",
+            &one_attempt,
+            BODY_TIMEOUT,
+        );
+        (result, started.elapsed())
+    });
+
+    let mut socket = accept_retry_test_connection_while_running(&listener, &worker)
+        .expect("accept metadata request")
+        .expect("client must remain active until response headers arrive");
+    let request = read_retry_test_request_head(&mut socket).expect("read metadata request");
+    assert!(
+        request.starts_with("GET /metadata HTTP/1.1\r\n"),
+        "unexpected metadata request head: {request:?}",
+    );
+    socket
+        .write_all(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\nconnection: keep-alive\r\n\r\n",
+        )
+        .expect("write response headers");
+    socket.flush().expect("flush response headers");
+
+    // Keep the response body open and empty while the worker performs its
+    // blocking read. If the request timeout regresses, dropping the socket
+    // after the fail-safe prevents this test from wedging the whole suite.
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let keeper = std::thread::spawn(move || {
+        let _ = release_rx.recv_timeout(SOCKET_FAILSAFE);
+        drop(socket);
+    });
+    let (result, elapsed) = worker.join().expect("metadata client thread");
+    let _ = release_tx.send(());
+    keeper.join().expect("socket keeper thread");
+
+    let err = result.expect_err("a headers-then-stalled body must time out");
+    assert!(
+        format!("{err:#}").contains("read body of"),
+        "headers must have completed before the body timeout: {err:#}",
+    );
+    assert!(
+        err.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+                || cause
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(reqwest::Error::is_timeout)
+        }),
+        "stalled body must surface a timeout error: {err:#}",
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "{BODY_TIMEOUT:?} body timeout took {elapsed:?}; the socket fail-safe \
+         must not be what unblocked the read",
+    );
+}
+
+/// The live package-URL probe must retry a transient gateway response and
+/// preserve its one-byte `Range` header on the successful attempt.
+#[test]
+fn url_probe_retries_503_and_reapplies_range_header() {
+    use std::io::Write;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind localhost listener");
+    let addr = listener.local_addr().expect("read listener address");
+    let url = format!("http://{addr}/package");
+    let client_url = url.clone();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .no_proxy()
+        .build()
+        .expect("build probe-test client");
+    let worker = std::thread::spawn(move || {
+        let two_attempts = super::HttpRetry {
+            attempts: 2,
+            backoff_unit: std::time::Duration::ZERO,
+        };
+        super::probe_url_status_with(
+            &client,
+            &client_url,
+            &two_attempts,
+            std::time::Duration::from_secs(10),
+        )
+    });
+
+    let mut requests = Vec::new();
+    for response in [
+        RESPONSE_503,
+        "HTTP/1.1 206 Partial Content\r\ncontent-length: 1\r\n\
+         content-range: bytes 0-0/1\r\nconnection: close\r\n\r\nx",
+    ] {
+        let mut socket = accept_retry_test_connection_while_running(&listener, &worker)
+            .expect("accept probe request")
+            .expect("probe client stopped before issuing every expected attempt");
+        requests.push(read_retry_test_request_head(&mut socket).expect("read probe request"));
+        socket
+            .write_all(response.as_bytes())
+            .expect("write probe response");
+        socket.flush().expect("flush probe response");
+    }
+
+    let status = worker
+        .join()
+        .expect("probe client thread")
+        .expect("503-then-206 probe must succeed");
+    assert_eq!(status, reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(requests.len(), 2);
+    for (attempt, request) in requests.iter().enumerate() {
+        let lowercase = request.to_ascii_lowercase();
+        assert!(
+            lowercase.contains("\r\nrange: bytes=0-0\r\n"),
+            "probe attempt {} lost the one-byte Range header: {request:?}",
+            attempt + 1,
+        );
+    }
+}
 
 /// A 503 on the first attempt followed by a 200 must succeed — the
 /// exact CI failure this helper exists for (cdn.kernel.org's Varnish
