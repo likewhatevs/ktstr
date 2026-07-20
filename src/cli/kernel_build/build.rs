@@ -162,7 +162,7 @@ pub fn acquire_build_reservation_waiting_interruptible(
 
 /// Cancellation-aware harness-build reservation with synchronous wait ticks.
 ///
-/// `progress` runs on the acquiring thread while an ordinary v4 ticket is
+/// `progress` runs on the acquiring thread while an ordinary admission ticket is
 /// parked or its elected coordinator is blocked in inotify. The protocol only
 /// slices those blocking syscalls; reservation ordering, retry deadlines, and
 /// liveness deadlines are unchanged.
