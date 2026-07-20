@@ -50,29 +50,73 @@ fn cancel_registry_worker(cancelled: &std::sync::atomic::AtomicBool) {
     }
 }
 
-/// True when the machine's 1-minute loadavg exceeds 60% of its core
-/// count. The CI runners are colocated and routinely saturated, which
-/// dilates the wall time of a promptness assertion past any fixed bound
-/// even when the code under test did nothing slow — the delay is in the
-/// scheduler, not the acquisition path. Read `/proc/loadavg` field 1
-/// against the `/proc/stat` per-cpu line count (machine-wide, ignoring
-/// any cpuset the test process runs under).
-fn host_appears_loaded() -> bool {
-    let machine_cpus = std::fs::read_to_string("/proc/stat")
-        .ok()
-        .map(|s| {
-            s.lines()
-                .filter(|l| {
-                    l.starts_with("cpu") && l.as_bytes().get(3).is_some_and(u8::is_ascii_digit)
-                })
-                .count()
-        })
-        .filter(|&n| n > 0)
-        .unwrap_or(1);
-    std::fs::read_to_string("/proc/loadavg")
-        .ok()
-        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
-        .is_some_and(|load1| load1 > machine_cpus as f64 * 0.6)
+/// Wait for one deterministic test handshake without charging time in which
+/// the host scheduler did not run this test.
+///
+/// These protocol tests intentionally run in the ordinary host-test pool while
+/// several CI jobs share one machine. A fixed wall deadline therefore tests
+/// host scheduling latency rather than the protocol transition. The waiter
+/// spins cooperatively and consumes a budget from its own
+/// `CLOCK_THREAD_CPUTIME_ID`: a starved test keeps waiting, while a real missing
+/// transition fails after the observer itself received ample CPU service.
+fn wait_with_delivered_service<T>(
+    context: &str,
+    mut observe: impl FnMut() -> anyhow::Result<Option<T>>,
+) -> anyhow::Result<T> {
+    const SERVICE_BUDGET_NS: u64 = 1_000_000_000;
+
+    fn thread_cpu_time_ns() -> anyhow::Result<u64> {
+        let mut timestamp = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `timestamp` is a valid out-pointer and `clock_gettime` writes
+        // exactly one `timespec`.
+        if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut timestamp) } != 0 {
+            anyhow::bail!(
+                "read protocol-test thread CPU clock: {}",
+                std::io::Error::last_os_error(),
+            );
+        }
+        anyhow::ensure!(
+            timestamp.tv_sec >= 0 && timestamp.tv_nsec >= 0,
+            "protocol-test thread CPU clock returned a negative timestamp",
+        );
+        Ok((timestamp.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(timestamp.tv_nsec as u64))
+    }
+
+    let started = thread_cpu_time_ns()?;
+    let mut polls = 0usize;
+    loop {
+        if let Some(value) = observe()? {
+            return Ok(value);
+        }
+        std::thread::yield_now();
+        polls = polls.wrapping_add(1);
+        if polls.is_multiple_of(64) {
+            let consumed = thread_cpu_time_ns()?.saturating_sub(started);
+            anyhow::ensure!(
+                consumed <= SERVICE_BUDGET_NS,
+                "{context} did not complete after the waiting test thread received \
+                 {consumed}ns of CPU service",
+            );
+        }
+    }
+}
+
+fn recv_with_delivered_service<T>(
+    receiver: &std::sync::mpsc::Receiver<T>,
+    context: &str,
+) -> anyhow::Result<T> {
+    wait_with_delivered_service(context, || match receiver.try_recv() {
+        Ok(value) => Ok(Some(value)),
+        Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            anyhow::bail!("{context} channel disconnected before publishing")
+        }
+    })
 }
 
 /// EMPIRICAL verification of the inotify wake contract the coordinator
@@ -1128,9 +1172,7 @@ fn ordinary_state_reads_overlap_registry_shared_readers() {
                 }
             };
         ready_tx.send(()).expect("report coordinator registration");
-        go_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("receive overlapping-read start");
+        go_rx.recv().expect("receive overlapping-read start");
         let before = protocol::shared_state_read_count_for_tests();
         let result = coordinator.read_state_shared_for_tests();
         let delta = protocol::shared_state_read_count_for_tests() - before;
@@ -1139,15 +1181,14 @@ fn ordinary_state_reads_overlap_registry_shared_readers() {
             .expect("report overlapping state read");
         drop(coordinator);
     });
-    ready_rx
-        .recv_timeout(std::time::Duration::from_secs(1))
+    recv_with_delivered_service(&ready_rx, "coordinator registration")
         .expect("coordinator registration must complete");
     let held_reader =
         protocol::hold_registry_shared_for_tests().expect("hold first registry SH reader");
     go_tx.send(()).expect("start overlapping state read");
-    let (result, delta) = result_rx
-        .recv_timeout(std::time::Duration::from_secs(1))
-        .expect("a second SH state read must not serialize behind the first");
+    let (result, delta) =
+        recv_with_delivered_service(&result_rx, "overlapping SH registry state read")
+            .expect("a second SH state read must not serialize behind the first");
     result.expect("read coordinator state through readonly mapping");
     assert_eq!(
         delta, 1,
@@ -1366,9 +1407,22 @@ fn default_exact_is_best_effort_and_shared_fallbacks_overlap() {
     let peer1 = crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Shared)
         .unwrap()
         .expect("SH cpu1");
-    let start = std::time::Instant::now();
-    let first = crate::vmm::KtstrVm::acquire_default_run_locks(Some(&host), &topo, false)
+    let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
+    let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
+    let first_host = host.clone();
+    let (first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
+    let first_worker = std::thread::spawn(move || {
+        LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
+        CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
+        ALLOWED_CPUS_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(vec![0, 1]));
+        let result =
+            crate::vmm::KtstrVm::acquire_default_run_locks(Some(&first_host), &topo, false);
+        let _ = first_tx.send(result);
+    });
+    let first = recv_with_delivered_service(&first_rx, "non-waiting default shared fallback")
+        .expect("default fallback worker must publish")
         .expect("SH peers permit immediate shared fallback");
+    first_worker.join().expect("default fallback worker");
     let mut first_mask = first
         .shared_cpu_mask
         .clone()
@@ -1376,10 +1430,6 @@ fn default_exact_is_best_effort_and_shared_fallbacks_overlap() {
     first_mask.sort_unstable();
     assert_eq!(first_mask, vec![0, 1]);
     assert!(first.pinning_plan.is_none());
-    assert!(
-        start.elapsed() < std::time::Duration::from_secs(2),
-        "default must not queue to preserve exact pinning",
-    );
 
     let second = crate::vmm::KtstrVm::acquire_default_run_locks(Some(&host), &topo, false)
         .expect("a second default fallback may overlap the first");
@@ -1512,8 +1562,7 @@ fn default_conversion_fence_never_coexists_with_performance_ex() {
         drop(acquired);
     });
 
-    paused_rx
-        .recv_timeout(std::time::Duration::from_secs(2))
+    recv_with_delivered_service(&paused_rx, "default conversion pause")
         .expect("default conversion must reach the deterministic pause");
     assert!(
         protocol::registry_shared_probe_is_blocked_for_tests()
@@ -1534,8 +1583,7 @@ fn default_conversion_fence_never_coexists_with_performance_ex() {
         );
         perf_result_tx.send(contended).expect("publish perf result");
     });
-    perf_started_rx
-        .recv_timeout(std::time::Duration::from_secs(2))
+    recv_with_delivered_service(&perf_started_rx, "performance conversion-fence probe start")
         .expect("performance probe must start");
     assert!(
         perf_result_rx.try_recv().is_err(),
@@ -1543,12 +1591,10 @@ fn default_conversion_fence_never_coexists_with_performance_ex() {
     );
 
     resume_tx.send(()).expect("resume default conversion");
-    default_ready_rx
-        .recv_timeout(std::time::Duration::from_secs(2))
+    recv_with_delivered_service(&default_ready_rx, "default retained-SH publication")
         .expect("default must publish retained SH");
     assert!(
-        perf_result_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
+        recv_with_delivered_service(&perf_result_rx, "performance conversion-fence result")
             .expect("performance probe must finish after conversion"),
         "performance EX must observe and reject the retained default SH claim",
     );
@@ -1692,93 +1738,82 @@ fn small_shared_cell_proceeds_while_coordinator_hungers() {
         );
         let _ = coordinator_tx.send(result);
     });
-    // Wait boundedly for the coordinator to publish its exact claim. Surface
-    // an early worker return immediately instead of sleeping and later
-    // misdiagnosing a missing registry record.
-    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        if !protocol::ticket_registry_snapshot_for_tests()
-            .expect("poll coordinator ticket")
-            .is_empty()
-        {
-            break;
+    // Wait for the coordinator's exact claim, charging only CPU service
+    // delivered to this observer. This is a registry-state handshake because
+    // the high-level acquisition API deliberately has no test callback in its
+    // registration path.
+    let ready = wait_with_delivered_service("coordinator exact-claim publication", || {
+        if !protocol::ticket_registry_snapshot_for_tests()?.is_empty() {
+            Ok(Some(()))
+        } else if coordinator_thread.is_finished() {
+            anyhow::bail!("coordinator returned before publishing its blocked claim")
+        } else {
+            Ok(None)
         }
-        if let Ok(result) = coordinator_rx.try_recv() {
-            coordinator_thread
-                .join()
-                .expect("early coordinator worker return");
-            panic!("coordinator returned before blocking: {result:?}");
-        }
-        if std::time::Instant::now() >= ready_deadline {
-            cancel_registry_worker(&cancelled);
-            drop(peer_sh);
-            let _ = coordinator_rx
-                .recv_timeout(std::time::Duration::from_secs(2))
+    });
+    if let Err(error) = ready {
+        cancel_registry_worker(&cancelled);
+        drop(peer_sh);
+        let result =
+            recv_with_delivered_service(&coordinator_rx, "cancelled fixed-set coordinator unwind")
                 .expect("cancelled fixed-set coordinator must unwind");
-            coordinator_thread
-                .join()
-                .expect("cancelled fixed-set coordinator thread");
-            panic!("coordinator did not publish its claim within 2 s");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        coordinator_thread
+            .join()
+            .expect("cancelled fixed-set coordinator thread");
+        panic!("coordinator did not publish its claim: {error:#}; worker={result:?}");
     }
 
-    // Small SH cell on a DIFFERENT LLC/CPU: must complete promptly.
-    let plan_small = PinningPlan {
-        assignments: vec![(0, 51)],
-        service_cpu: None,
-        llc_indices: vec![11],
-        locks: protocol::Acquired::untracked(Vec::new()),
-    };
-    let start = std::time::Instant::now();
-    let outcome = acquire_resource_locks_waiting_impl(
-        &plan_small.llc_indices,
-        LlcLockMode::Shared,
-        &[51],
-        FlockMode::Exclusive,
-        false,
-        None,
-    )
-    .unwrap();
-    let elapsed = start.elapsed();
+    // Small SH cell on a DIFFERENT LLC/CPU: must take disjoint capacity
+    // without entering the coordinator's queue.
+    let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
+    let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
+    let (small_tx, small_rx) = std::sync::mpsc::sync_channel(1);
+    let small_thread = std::thread::spawn(move || {
+        LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
+        CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
+        let result = acquire_resource_locks_waiting_impl(
+            &[11],
+            LlcLockMode::Shared,
+            &[51],
+            FlockMode::Exclusive,
+            false,
+            None,
+        );
+        let _ = small_tx.send(result);
+    });
+    let outcome =
+        recv_with_delivered_service(&small_rx, "disjoint non-waiting shared-cell admission")
+            .expect("small-cell worker must publish")
+            .expect("small-cell acquisition");
+    small_thread.join().expect("small-cell worker");
     let (_, locks) = unwrap_acquired(
         outcome,
         Some("disjoint SH cell while the coordinator hungers"),
     );
     assert_eq!(locks.len(), 2);
-    // The `Acquired` outcome above already proves work conservation
-    // happened at all: strict arrival-order admission would have forced this
-    // disjoint-capacity cell to wait behind the coordinator and return
-    // `Unavailable`, which `unwrap_acquired` would have panicked on. The
-    // wall-time bound below additionally proves the fast path incurred no
-    // queue delay — but that latency is only measurable on a
-    // quiet host. On a saturated CI runner the elapsed time is dominated
-    // by thread-scheduling latency, so enforce the bound only when the
-    // host is not loaded (the semantic proof holds unconditionally).
-    if !host_appears_loaded() {
-        assert!(
-            elapsed < std::time::Duration::from_millis(200),
-            "work conservation: the small cell must not wait behind the \
-             hungering coordinator; elapsed={elapsed:?}",
-        );
-    }
+    // `wait=false` plus the delivered-service-bounded worker proves this
+    // disjoint request did not enter a queue behind the coordinator. Strict
+    // arrival-order admission would either return `Unavailable` (caught above)
+    // or consume the service budget while waiting.
 
     // Release the peer; the coordinator must now complete.
     drop(peer_sh);
-    let coordinator_outcome = match coordinator_rx.recv_timeout(std::time::Duration::from_secs(10))
-    {
-        Ok(result) => result.expect("coordinator acquire"),
-        Err(error) => {
-            cancel_registry_worker(&cancelled);
-            let _ = coordinator_rx
-                .recv_timeout(std::time::Duration::from_secs(2))
+    let coordinator_outcome =
+        match recv_with_delivered_service(&coordinator_rx, "coordinator post-release completion") {
+            Ok(result) => result.expect("coordinator acquire"),
+            Err(error) => {
+                cancel_registry_worker(&cancelled);
+                let _ = recv_with_delivered_service(
+                    &coordinator_rx,
+                    "cancelled fixed-set coordinator unwind",
+                )
                 .expect("cancelled fixed-set coordinator must unwind");
-            coordinator_thread
-                .join()
-                .expect("cancelled fixed-set coordinator thread");
-            panic!("coordinator did not complete within 10 s of release: {error}");
-        }
-    };
+                coordinator_thread
+                    .join()
+                    .expect("cancelled fixed-set coordinator thread");
+                panic!("coordinator did not complete after release: {error:#}");
+            }
+        };
     coordinator_thread
         .join()
         .expect("completed coordinator thread");
@@ -1862,30 +1897,37 @@ fn coordinator_reprobes_when_a_release_races_the_initial_watch_transition() {
         })();
         let _ = result_tx.send(result);
     });
-    let first_step = first_step_rx.recv_timeout(std::time::Duration::from_secs(2));
-    if let Err(error) = first_step {
+    if let Err(error) =
+        recv_with_delivered_service(&first_step_rx, "initial coordinator planning step")
+    {
         cancel_registry_worker(&cancelled);
         drop(blocker);
-        let _ = result_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("cancelled transition-race worker must unwind");
+        let result =
+            recv_with_delivered_service(&result_rx, "cancelled transition-race worker unwind")
+                .expect("cancelled transition-race worker must unwind");
         worker
             .join()
             .expect("cancelled transition-race coordinator worker");
-        panic!("coordinator did not reach its initial planning step: {error}");
+        panic!(
+            "coordinator did not reach its initial planning step: {error:#}; \
+             worker={result:?}"
+        );
     }
     drop(blocker);
-    let steps = match result_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+    let steps = match recv_with_delivered_service(
+        &result_rx,
+        "transition-race coordinator post-release completion",
+    ) {
         Ok(result) => result.expect("coordinator transition-race acquire"),
         Err(error) => {
             cancel_registry_worker(&cancelled);
-            let _ = result_rx
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .expect("cancelled transition-race worker must unwind");
+            let _ =
+                recv_with_delivered_service(&result_rx, "cancelled transition-race worker unwind")
+                    .expect("cancelled transition-race worker must unwind");
             worker
                 .join()
                 .expect("cancelled transition-race coordinator worker");
-            panic!("transition-race coordinator did not complete within 10 s: {error}");
+            panic!("transition-race coordinator did not complete after release: {error:#}");
         }
     };
     worker
@@ -2392,9 +2434,24 @@ fn granted_commit_is_terminal_even_if_cancellation_arrives_afterward() {
         })();
         let _ = coordinator_tx.send(result);
     });
-    ready_rx
-        .recv_timeout(std::time::Duration::from_secs(2))
-        .expect("coordinator must publish before granted waiter starts");
+    if let Err(error) =
+        recv_with_delivered_service(&ready_rx, "granted-path coordinator publication")
+    {
+        coordinator_cancelled.store(true, Ordering::Release);
+        drop(blocker);
+        let result = recv_with_delivered_service(
+            &coordinator_rx,
+            "cancelled granted-path coordinator unwind",
+        )
+        .expect("cancelled granted-path coordinator must unwind");
+        coordinator_worker
+            .join()
+            .expect("cancelled granted-path coordinator worker");
+        panic!(
+            "coordinator did not publish before granted waiter starts: {error:#}; \
+             worker={result:?}"
+        );
+    }
 
     let waiter_cancelled = Arc::new(AtomicBool::new(false));
     let worker_waiter_cancelled = Arc::clone(&waiter_cancelled);
@@ -2420,22 +2477,24 @@ fn granted_commit_is_terminal_even_if_cancellation_arrives_afterward() {
         });
         let _ = waiter_tx.send(result);
     });
-    let locks = match waiter_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+    let locks = match recv_with_delivered_service(&waiter_rx, "disjoint granted waiter completion")
+    {
         Ok(result) => result.expect("granted waiter must return committed success"),
         Err(error) => {
             cancel_registry_worker(&waiter_cancelled);
             drop(blocker);
-            let _ = waiter_rx
-                .recv_timeout(std::time::Duration::from_secs(2))
+            let _ = recv_with_delivered_service(&waiter_rx, "cancelled granted waiter unwind")
                 .expect("cancelled granted waiter must unwind");
             waiter_worker.join().expect("cancelled granted waiter");
-            let _ = coordinator_rx
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .expect("released coordinator must complete");
+            let _ = recv_with_delivered_service(
+                &coordinator_rx,
+                "released granted-path coordinator completion",
+            )
+            .expect("released coordinator must complete");
             coordinator_worker
                 .join()
                 .expect("released coordinator worker");
-            panic!("granted waiter did not complete within 10 s: {error}");
+            panic!("granted waiter did not complete: {error:#}");
         }
     };
     waiter_worker.join().expect("completed granted waiter");
@@ -2457,7 +2516,10 @@ fn granted_commit_is_terminal_even_if_cancellation_arrives_afterward() {
     );
 
     drop(blocker);
-    match coordinator_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+    match recv_with_delivered_service(
+        &coordinator_rx,
+        "granted-path coordinator post-release completion",
+    ) {
         Ok(result) => result.expect("coordinator completes after blocker release"),
         Err(error) => {
             coordinator_cancelled.store(true, Ordering::Release);
@@ -2467,13 +2529,15 @@ fn granted_commit_is_terminal_even_if_cancellation_arrives_afterward() {
                     .open(cpu_lock_path(1))
                     .expect("wake cancelled coordinator"),
             );
-            let _ = coordinator_rx
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .expect("cancelled coordinator must unwind");
+            let _ = recv_with_delivered_service(
+                &coordinator_rx,
+                "cancelled granted-path coordinator unwind",
+            )
+            .expect("cancelled coordinator must unwind");
             coordinator_worker
                 .join()
                 .expect("cancelled coordinator worker");
-            panic!("coordinator did not complete after blocker release: {error}");
+            panic!("coordinator did not complete after blocker release: {error:#}");
         }
     }
     coordinator_worker
@@ -3667,14 +3731,10 @@ fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
         protocol::publish_acquired(&claim, blocker_two).expect("publish first external hold");
     let before = protocol::resource_epoch_for_tests().expect("resource epoch before release");
     drop(blocker_two);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while protocol::resource_epoch_for_tests().expect("poll resource epoch") == before {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "coordinator did not advance the resource epoch for a real holder release"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    wait_with_delivered_service("resource epoch advance after real holder release", || {
+        Ok((protocol::resource_epoch_for_tests()? != before).then_some(()))
+    })
+    .expect("coordinator must advance the resource epoch for a real holder release");
     let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .expect("re-block waiter after epoch transition");
@@ -3683,17 +3743,16 @@ fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
     // its callback returned, bypassing the stale-negative-evidence path this
     // test is meant to pin.
     std::fs::write(&gate, b"release").expect("release stale-epoch probe");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while !protocol::ticket_blocked_at_current_serial_for_tests(waiter.pid)
-        .expect("inspect waiter blocked serial")
-    {
+    let blocked = wait_with_delivered_service("current blocked-serial publication", || {
         waiter.assert_running("current blocked-serial publication");
-        assert!(
-            std::time::Instant::now() < deadline,
-            "failed in-flight probe did not publish its blocker at the current serial; {}",
+        Ok(protocol::ticket_blocked_at_current_serial_for_tests(waiter.pid)?.then_some(()))
+    });
+    if let Err(error) = blocked {
+        panic!(
+            "failed in-flight probe did not publish its blocker at the current serial: \
+             {error:#}; {}",
             waiter.diagnostics(),
         );
-        std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert_eq!(
         waiter.probe_count(),
