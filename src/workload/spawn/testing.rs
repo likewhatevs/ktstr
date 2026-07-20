@@ -439,12 +439,46 @@ pub(super) fn read_grandchild_gpid_from_pidfile(
     assert!(gpid > 0, "grandchild pid must be positive: {gpid}");
     gpid
 }
-/// Poll for `gpid` death with a bounded deadline. Returns `Ok(())`
-/// when the pid is gone (ESRCH on the existence probe) and
-/// `Err(())` on timeout. The waitpid + WNOHANG inside the loop
-/// reaps a zombie if the caller inherited the grandchild under
-/// `PR_SET_CHILD_SUBREAPER` (systemd-run scopes, some CI
-/// runners). Shared by
+/// Read the process state from `/proc/<pid>/stat`.
+///
+/// The command field is parenthesized and may itself contain spaces or
+/// parentheses, so the state is parsed after the final `") "` delimiter
+/// rather than by splitting the complete line.
+fn process_state(pid: libc::pid_t) -> std::io::Result<Option<u8>> {
+    let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let delimiter = stat
+        .windows(2)
+        .rposition(|window| window == b") ")
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("/proc/{pid}/stat has no command terminator"),
+            )
+        })?;
+    let state = stat.get(delimiter + 2).copied().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("/proc/{pid}/stat has no process state"),
+        )
+    })?;
+    Ok(Some(state))
+}
+
+/// Poll for `gpid` termination with a bounded deadline. Returns `Ok(())`
+/// when the pid is gone, was reaped by this process, or is already a zombie
+/// awaiting its actual parent's `wait(2)`. A zombie is conclusively dead: it
+/// cannot execute, retain memory mappings, or keep workload pipes open.
+///
+/// The `waitpid + WNOHANG` probe still reaps the process when this test binary
+/// inherited it under `PR_SET_CHILD_SUBREAPER`. Some CI runner supervisors are
+/// themselves subreapers, however, so the test binary cannot reap that
+/// supervisor-owned zombie. Treating `kill(pid, 0)` alone as liveness made
+/// successful SIGKILL teardown wait five seconds and fail in that environment.
+/// Shared by
 /// [`stop_and_collect_reaps_custom_grandchild_via_process_group`]
 /// and the new multi-worker / panic-path / Drop-path tests.
 pub(super) fn wait_for_grandchild_reap(gpid: libc::pid_t, timeout: Duration) -> Result<(), ()> {
@@ -468,6 +502,11 @@ pub(super) fn wait_for_grandchild_reap(gpid: libc::pid_t, timeout: Duration) -> 
                     | Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => return Ok(()),
                     _ => {}
                 }
+                match process_state(gpid) {
+                    Ok(None) | Ok(Some(b'Z' | b'X' | b'x')) => return Ok(()),
+                    Ok(Some(_)) => {}
+                    Err(error) => panic!("read grandchild {gpid} process state: {error}"),
+                }
                 if Instant::now() >= deadline {
                     return Err(());
                 }
@@ -486,7 +525,7 @@ pub(super) fn assert_grandchild_reaped_within(gpid: libc::pid_t, timeout: Durati
             nix::sys::signal::Signal::SIGKILL,
         );
         panic!(
-            "grandchild {gpid} still alive {:?} after {context} — \
+            "grandchild {gpid} still live {:?} after {context} — \
              setpgid/killpg path broken",
             timeout,
         );
