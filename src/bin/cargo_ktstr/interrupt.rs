@@ -2050,6 +2050,15 @@ fn startup_spawn_worker(
     Ok((worker_read, subtree))
 }
 
+fn startup_worker_clean_exit_budget(worker_pid: libc::pid_t) -> io::Result<StartupServiceBudget> {
+    // Once the worker has committed a clean status, only that worker can
+    // complete the awaited exit. Charging the owner or this polling
+    // supervisor makes unrelated command/observer service consume the
+    // worker-exit budget while the worker itself may still be starved.
+    // StartupServiceBudget retains its independent wall backstop.
+    StartupServiceBudget::exact(&[worker_pid], STARTUP_COMMIT_SERVICE_BACKSTOP)
+}
+
 fn startup_supervisor_inner() -> io::Result<libc::c_int> {
     let token = startup_env_token()?;
     let declared_parent = startup_env_parent()?;
@@ -2160,10 +2169,7 @@ fn startup_supervisor_inner() -> io::Result<libc::c_int> {
                 ));
             }
             clean_code = Some(worker_buffer[8]);
-            clean_budget = Some(StartupServiceBudget::exact(
-                &[declared_parent, own_pid, worker_pid],
-                STARTUP_COMMIT_SERVICE_BACKSTOP,
-            )?);
+            clean_budget = Some(startup_worker_clean_exit_budget(worker_pid)?);
             worker_buffer.drain(..9);
         }
         if clean_code.is_some() && !worker_buffer.is_empty() {
@@ -5061,6 +5067,33 @@ mod tests {
         let owner_status = owner.wait().expect("read signalled owner status");
         assert_eq!(owner_status.signal(), Some(libc::SIGTERM));
         assert_startup_pids_exit(&pids, &pidfds);
+    }
+
+    #[test]
+    fn startup_clean_exit_budget_charges_only_worker_and_keeps_wall_backstop() {
+        let worker_pid = unsafe { libc::getpid() };
+        let budget = startup_worker_clean_exit_budget(worker_pid)
+            .expect("capture clean-exit worker service");
+        let StartupServiceScope::Exact(scope) = &budget.scope else {
+            panic!("clean worker exit must use an exact service scope");
+        };
+        assert_eq!(
+            scope.identities.len(),
+            1,
+            "clean worker exit must charge exactly one process",
+        );
+        assert_eq!(
+            scope.identities[0].pid, worker_pid,
+            "clean worker exit must charge only the worker",
+        );
+        assert_eq!(
+            budget.budget.service_budget_ns,
+            STARTUP_COMMIT_SERVICE_BACKSTOP.as_nanos(),
+        );
+        assert_eq!(
+            budget.budget.wall_backstop, STARTUP_STARVATION_BACKSTOP,
+            "worker-only CPU accounting must retain the starvation wall backstop",
+        );
     }
 
     #[test]
