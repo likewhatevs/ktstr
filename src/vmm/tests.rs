@@ -187,12 +187,7 @@ fn interactive_kill_relay_subprocess_helper() {
     let no_setup_leaks = baseline_threads.as_ref().is_none_or(|baseline| {
         interactive_runtime_threads()
             .into_iter()
-            .all(|(tid, name)| {
-                baseline.contains_key(&tid)
-                    || !(name.starts_with("vcpu-")
-                        || name.starts_with("interactive-")
-                        || name.starts_with("ktstr-exec-"))
-            })
+            .all(|(tid, name)| baseline.contains_key(&tid) || !interactive_runtime_thread(&name))
     });
     if !no_setup_leaks {
         eprintln!("interactive setup failure returned with live vCPU/helper tasks");
@@ -245,6 +240,15 @@ fn spawn_interactive_relay_child(
     .arg("--exact")
     .arg(exact)
     .arg("--nocapture")
+    // Libtest's parallel runner starts a 60-second timeout reporter even
+    // when only one exact test is selected. The stdout-failure regression
+    // deliberately closes this process's stdout after the guest readiness
+    // marker; under admission delay that reporter can then win the EPIPE
+    // race and exit 101 before the VMM observes the broken output sink.
+    // One harness thread selects libtest's synchronous path, which has no
+    // concurrent timeout writer. This does not serialize any VMM worker:
+    // the helper still creates the same vCPU and interactive relay threads.
+    .arg("--test-threads=1")
     .env(INTERACTIVE_RELAY_CHILD_ENV, mode)
     .stdin(std::process::Stdio::null())
     .stdout(stdout)
@@ -264,6 +268,11 @@ fn spawn_interactive_relay_child(
 struct InteractiveChildServiceSample {
     tasks: std::collections::BTreeMap<u32, (u64, u64)>,
     runnable_tasks: usize,
+    runtime_started: bool,
+}
+
+fn interactive_runtime_thread(comm: &str) -> bool {
+    comm.starts_with("vcpu-") || comm.starts_with("interactive-") || comm.starts_with("ktstr-exec-")
 }
 
 fn interactive_child_service_sample(pid: u32) -> InteractiveChildServiceSample {
@@ -276,6 +285,9 @@ fn interactive_child_service_sample(pid: u32) -> InteractiveChildServiceSample {
             continue;
         };
         let task_path = task.path();
+        if let Ok(comm) = std::fs::read_to_string(task_path.join("comm")) {
+            sample.runtime_started |= interactive_runtime_thread(comm.trim());
+        }
         if let Ok(schedstat) = std::fs::read_to_string(task_path.join("schedstat")) {
             let mut fields = schedstat.split_whitespace();
             if let (Some(cpu), Some(delay)) = (
@@ -299,6 +311,7 @@ fn interactive_child_service_sample(pid: u32) -> InteractiveChildServiceSample {
 
 struct InteractiveChildWatchdog {
     previous: InteractiveChildServiceSample,
+    runtime_started: bool,
     charged_cpu_ns: u64,
     blocked_watch: InteractiveBlockedServiceWatch,
     cpu_budget: Duration,
@@ -335,8 +348,8 @@ struct InteractiveBlockedServiceWatch {
 }
 
 impl InteractiveBlockedServiceWatch {
-    fn observe(&mut self, made_progress: bool, observer_service_ns: u64) -> u64 {
-        if made_progress {
+    fn observe(&mut self, armed: bool, made_progress: bool, observer_service_ns: u64) -> u64 {
+        if !armed || made_progress {
             self.observer_anchor_ns = None;
             return 0;
         }
@@ -347,8 +360,11 @@ impl InteractiveBlockedServiceWatch {
 
 impl InteractiveChildWatchdog {
     fn new(child: &std::process::Child, cpu_budget: Duration) -> Self {
+        let previous = interactive_child_service_sample(child.id());
+        let runtime_started = previous.runtime_started;
         Self {
-            previous: interactive_child_service_sample(child.id()),
+            previous,
+            runtime_started,
             charged_cpu_ns: 0,
             blocked_watch: InteractiveBlockedServiceWatch::default(),
             cpu_budget,
@@ -367,6 +383,7 @@ impl InteractiveChildWatchdog {
         }
 
         let current = interactive_child_service_sample(child.id());
+        self.runtime_started |= current.runtime_started;
         let task_set_changed = !current.tasks.keys().eq(self.previous.tasks.keys());
         let mut counters_changed = false;
         for (tid, &(cpu_ns, delay_ns)) in &current.tasks {
@@ -395,12 +412,15 @@ impl InteractiveChildWatchdog {
         // unchanged is eligible for the stall verdict. Charge that verdict to
         // CPU service delivered to this observer, not host wall time: a
         // descheduled observer cannot prove that a blocked child remained
-        // unchanged during the interval it did not inspect.
+        // unchanged during the interval it did not inspect. Admission happens
+        // before the VMM creates any runtime threads and may legitimately
+        // block for longer than this detector's budget, so do not arm the
+        // VMM-stall detector until one of those threads has been observed.
         const BLOCKED_OBSERVER_SERVICE_BUDGET: Duration = Duration::from_millis(250);
         let observer_service_ns = interactive_observer_cpu_time_ns()?;
-        let blocked_observer_service_ns = self
-            .blocked_watch
-            .observe(made_progress, observer_service_ns);
+        let blocked_observer_service_ns =
+            self.blocked_watch
+                .observe(self.runtime_started, made_progress, observer_service_ns);
         if blocked_observer_service_ns >= BLOCKED_OBSERVER_SERVICE_BUDGET.as_nanos() as u64 {
             return Err(format!(
                 "interactive relay subprocess made no task-service progress \
@@ -416,24 +436,41 @@ impl InteractiveChildWatchdog {
 #[test]
 fn interactive_blocked_watch_ignores_unobserved_wall_time() {
     let mut watch = InteractiveBlockedServiceWatch::default();
-    assert_eq!(watch.observe(false, 10), 0);
-    assert_eq!(watch.observe(false, 10), 0);
+    assert_eq!(watch.observe(true, false, 10), 0);
+    assert_eq!(watch.observe(true, false, 10), 0);
+}
+
+#[test]
+fn interactive_runtime_thread_recognizes_linux_truncated_names() {
+    assert!(interactive_runtime_thread("vcpu-1"));
+    assert!(interactive_runtime_thread("interactive-kil"));
+    assert!(interactive_runtime_thread("ktstr-exec-dead"));
+    assert!(!interactive_runtime_thread("vmm::tests::boot"));
+}
+
+#[test]
+fn interactive_blocked_watch_does_not_arm_before_vmm_runtime() {
+    let mut watch = InteractiveBlockedServiceWatch::default();
+    assert_eq!(watch.observe(false, false, 10), 0);
+    assert_eq!(watch.observe(false, false, 10_000), 0);
+    assert_eq!(watch.observe(true, false, 20_000), 0);
+    assert_eq!(watch.observe(true, false, 20_100), 100);
 }
 
 #[test]
 fn interactive_blocked_watch_charges_only_delivered_observer_service() {
     let mut watch = InteractiveBlockedServiceWatch::default();
-    assert_eq!(watch.observe(false, 10), 0);
-    assert_eq!(watch.observe(false, 110), 100);
+    assert_eq!(watch.observe(true, false, 10), 0);
+    assert_eq!(watch.observe(true, false, 110), 100);
 }
 
 #[test]
 fn interactive_blocked_watch_reanchors_on_child_progress() {
     let mut watch = InteractiveBlockedServiceWatch::default();
-    assert_eq!(watch.observe(false, 10), 0);
-    assert_eq!(watch.observe(false, 110), 100);
-    assert_eq!(watch.observe(true, 120), 0);
-    assert_eq!(watch.observe(false, 10_000), 0);
+    assert_eq!(watch.observe(true, false, 10), 0);
+    assert_eq!(watch.observe(true, false, 110), 100);
+    assert_eq!(watch.observe(true, true, 120), 0);
+    assert_eq!(watch.observe(true, false, 10_000), 0);
 }
 
 fn terminate_interactive_relay_child(child: &mut std::process::Child) {
