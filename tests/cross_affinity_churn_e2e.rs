@@ -34,7 +34,6 @@ const KTSTR_SCHED: Scheduler =
     llcs = 1,
     cores = 4,
     threads = 1,
-    memory_mib = 2048,
     sustained_samples = 25,
     // Churn-heavy multi-profile fixture: the guest scx watchdog's 5s
     // default evicts it under contended-runner starvation (the same

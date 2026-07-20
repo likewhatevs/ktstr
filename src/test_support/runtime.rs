@@ -1748,22 +1748,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_vm_topology_none_floors_memory_at_256() {
-        // Tiny topology: 1*1*1=1 cpu -> 64 MiB raw, entry.memory_mib=0,
-        // floor = max(64, 256, 0) = 256.
-        //
-        // Override memory_mib explicitly to 0 — KtstrTestEntry::DEFAULT
-        // sets memory_mib=2048, which would bypass the floor entirely
-        // and leave this test vacuously passing regardless of the
-        // max(…, 256, …) branch. Setting memory_mib=0 makes the 256
-        // floor the exact lower bound the assertion verifies.
+    fn resolve_vm_topology_default_memory_can_stay_below_two_gib() {
+        // The default topology has two vCPUs, so cpu scaling yields
+        // 128 MiB and the framework-wide 256-MiB floor wins. This
+        // specifically guards against restoring a stale multi-GiB
+        // entry default that would defeat deferred payload sizing.
         let entry = KtstrTestEntry {
             name: "tiny",
-            memory_mib: 0,
             ..KtstrTestEntry::DEFAULT
         };
         let (_topo, mem) = resolve_vm_topology(&entry, None);
         assert_eq!(mem, 256, "memory floor = 256 MiB, got {mem}");
+        assert!(mem < 2048, "default memory must not pin every VM at 2 GiB");
     }
 
     #[test]
@@ -1771,11 +1767,14 @@ mod tests {
         // Entry with explicit memory_mib above the cpu*64 and 256 floors.
         let entry = KtstrTestEntry {
             name: "mem",
-            memory_mib: 8192,
+            memory_mib: 1536,
             ..KtstrTestEntry::DEFAULT
         };
         let (_topo, mem) = resolve_vm_topology(&entry, None);
-        assert_eq!(mem, 8192);
+        assert_eq!(
+            mem, 1536,
+            "a real explicit override must win even when it is not the old 2-GiB default"
+        );
     }
 
     #[cfg(feature = "wprof")]
@@ -1840,7 +1839,6 @@ mod tests {
     fn derive_test_memory_mib_baseline_without_wprof() {
         let entry = KtstrTestEntry {
             name: "baseline",
-            memory_mib: 0,
             ..KtstrTestEntry::DEFAULT
         };
         let mem = derive_test_memory_mib(2, &entry);
@@ -1873,7 +1871,6 @@ mod tests {
         // direct verifier API reuse cpu_scaled_memory_mib directly.
         let entry = KtstrTestEntry {
             name: "shared",
-            memory_mib: 0,
             ..KtstrTestEntry::DEFAULT
         };
         for cpus in [1u32, 4, 8, 32] {
@@ -1881,7 +1878,7 @@ mod tests {
                 derive_test_memory_mib(cpus, &entry),
                 cpu_scaled_memory_mib(cpus),
                 "derive_test_memory_mib must equal the shared core for \
-                 {cpus} cpus when entry.memory_mib=0"
+                 {cpus} cpus when the entry uses the framework minimum"
             );
         }
     }

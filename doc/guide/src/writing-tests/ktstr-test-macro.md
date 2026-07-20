@@ -59,7 +59,7 @@ the later value win.
 | `llcs` | inherited | Total LLCs (not per node) |
 | `cores` | inherited | Cores per LLC |
 | `threads` | inherited | Threads per core |
-| `memory_mib` | 2048 | VM memory floor in MiB (see below) |
+| `memory_mib` | 256 | VM memory floor in MiB (see below) |
 
 Each dimension independently inherits from `Scheduler.topology` when
 a `scheduler` is specified and that dimension is not set. Without a
@@ -70,11 +70,12 @@ guest actually gets.
 
 ### Memory
 
-`memory_mib` is one of three floors: the framework allocates
-`max(total_cpus * 64, 256, memory_mib)` MiB at VM launch. Above 32
-vCPUs the CPU-based floor dominates the default 2048, so a 126-vCPU
-test gets 8064 MiB regardless. Raise `memory_mib` only when the test
-needs more headroom than the per-CPU budget provides.
+`memory_mib` is one of three declaration-derived floors:
+`max(total_cpus * 64, 256, memory_mib)` MiB. Deferred sizing can
+raise the final allocation further to fit the prepared initramfs.
+Above 4 vCPUs the CPU-based floor dominates the default 256, so a
+126-vCPU test gets 8064 MiB regardless. Raise `memory_mib` only when
+the test needs more headroom than the per-CPU budget provides.
 
 ## Timing
 

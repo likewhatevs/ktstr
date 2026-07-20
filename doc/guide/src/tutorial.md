@@ -259,7 +259,7 @@ scenario. The defaults are tuned for fast iteration:
 |---|---|---|
 | `duration_s` | `12` | Per-scenario wall-clock seconds. Workers run for this long, then stop and report. |
 | `watchdog_timeout_s` | `5` | sched_ext watchdog fire threshold. |
-| `memory_mib` | `2048` | VM memory in MiB. |
+| `memory_mib` | `256` | Minimum VM memory in MiB; actual memory is raised for topology and initramfs size. |
 
 `watchdog_timeout_s` is sched_ext's per-task stall threshold — if a
 runnable task is not picked for that many seconds, the scheduler

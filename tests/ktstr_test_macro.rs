@@ -267,7 +267,7 @@ fn entry_default_fields() {
     assert_eq!(entry.topology.llcs, 1);
     assert_eq!(entry.topology.cores_per_llc, 2);
     assert_eq!(entry.topology.threads_per_core, 1);
-    assert_eq!(entry.memory_mib, 2048);
+    assert_eq!(entry.memory_mib, 256);
     assert_eq!(entry.constraints.min_numa_nodes, 1);
     assert_eq!(entry.constraints.min_llcs, 1);
     assert!(!entry.constraints.requires_smt);
@@ -915,7 +915,6 @@ fn declare_scheduler_empty_binary() {
     llcs = 2,
     cores = 2,
     threads = 1,
-    memory_mib = 2048,
     min_numa_nodes = 2,
     max_numa_nodes = 4,
     min_llcs = 2,

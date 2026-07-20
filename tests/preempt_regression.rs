@@ -243,7 +243,7 @@ fn zeroed_report(tid: libc::pid_t, start: Instant) -> WorkerReport {
 /// 0 — the framework returns a Custom worker's report verbatim and only
 /// populates schedstat deltas on the built-in worker path, so run delay
 /// carries no signal here.)
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
+#[ktstr_test(llcs = 1, cores = 4, threads = 1)]
 fn preempt_regression_fault_under_load(ctx: &Ctx) -> Result<AssertResult> {
     let futex_addr = init_shared_futex();
     // Pass the shared-futex address + fault-region geometry through the

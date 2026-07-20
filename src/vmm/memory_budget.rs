@@ -691,7 +691,12 @@ mod tests {
             instrumented_reserve_bytes: 0,
             tmpfs_fraction: TmpfsFraction::Half,
         };
-        assert_eq!(initramfs_min_memory_mib(&budget), 744);
+        let memory_mib = initramfs_min_memory_mib(&budget);
+        assert_eq!(memory_mib, 744);
+        assert!(
+            memory_mib < 2048,
+            "deferred sizing must be allowed to choose a right-sized sub-2-GiB VM"
+        );
     }
 
     /// Coverage-instrumented shape: a GiB-scale instrumented `/init`

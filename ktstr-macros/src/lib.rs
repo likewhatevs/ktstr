@@ -71,11 +71,12 @@ pub fn ktstr_test_entry(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   - `threads = N` (default: inherited from scheduler, or 1)
 ///   - `numa_nodes = N` (default: inherited from scheduler, or 1)
 ///   - `memory_mib = N` — per-test minimum memory in MiB (default:
-///     2048). The framework picks `max(total_cpus * 64, 256,
-///     memory_mib)` MiB at VM-launch time, so for tests with more
-///     than 32 vCPUs the cpu-based floor dominates the macro
-///     default. Below ~4 vCPUs the absolute 256-MiB floor wins if
-///     `memory_mib` is also below it. Setting `memory_mib` above
+///     256). The declaration-derived floor is
+///     `max(total_cpus * 64, 256, memory_mib)` MiB; deferred sizing
+///     can raise the final allocation further to fit the prepared
+///     initramfs. For tests with more than 4 vCPUs the cpu-based
+///     floor dominates the macro default. At or below 4 vCPUs the
+///     absolute 256-MiB floor wins. Setting `memory_mib` above
 ///     the cpu-based floor is only meaningful when the test needs
 ///     more headroom than the per-cpu budget. The unit is binary
 ///     mebibytes; the conversion at VM-launch is `value << 20`

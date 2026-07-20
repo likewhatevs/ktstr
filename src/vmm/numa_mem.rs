@@ -40,6 +40,24 @@ pub(crate) enum MemoryBacking {
     HugeTlb2M,
 }
 
+/// Flags for each anonymous node mapping installed into the VA reservation.
+///
+/// Base-page guest RAM is demand-paged and intentionally does not reserve
+/// swap/commit for its full advertised size. This matters under a VM storm:
+/// most of a guest's address space remains untouched, so charging every
+/// declared MiB up front would reject useful oversubscription despite ample
+/// resident memory. Explicit hugetlb mappings are backed by the reserved
+/// hugepage pool and therefore do not use `MAP_NORESERVE`.
+fn anonymous_node_map_flags(use_hugepages: bool) -> libc::c_int {
+    let mut flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED;
+    if use_hugepages {
+        flags |= libc::MAP_HUGETLB | libc::MAP_HUGE_2MB;
+    } else {
+        flags |= libc::MAP_NORESERVE;
+    }
+    flags
+}
+
 const HUGEPAGE_ALLOCATION_LOCK: &str = "ktstr-hugepage-allocation-v1.lock";
 
 fn hugepage_allocation_lock_path() -> PathBuf {
@@ -606,10 +624,7 @@ impl NumaMemoryLayout {
                 .context("NUMA mapped host-VA offset overflow")?;
             let node_addr = unsafe { (base as *mut u8).add(offset) as *mut libc::c_void };
 
-            let mut flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED;
-            if use_hugepages {
-                flags |= libc::MAP_HUGETLB | libc::MAP_HUGE_2MB;
-            }
+            let flags = anonymous_node_map_flags(use_hugepages);
 
             let node_ptr = unsafe {
                 libc::mmap(
@@ -949,6 +964,29 @@ impl NumaMemoryLayout {
 mod tests {
     use super::*;
     use crate::vmm::topology::{NumaNode, Topology};
+
+    #[test]
+    fn anonymous_node_mapping_retains_noreserve_for_base_pages() {
+        let base = anonymous_node_map_flags(false);
+        assert_ne!(
+            base & libc::MAP_NORESERVE,
+            0,
+            "base-page guest RAM must not reserve commit for untouched pages"
+        );
+        assert_eq!(base & libc::MAP_HUGETLB, 0);
+        assert_ne!(base & libc::MAP_FIXED, 0);
+        assert_ne!(base & libc::MAP_ANONYMOUS, 0);
+        assert_ne!(base & libc::MAP_PRIVATE, 0);
+
+        let huge = anonymous_node_map_flags(true);
+        assert_eq!(
+            huge & libc::MAP_NORESERVE,
+            0,
+            "explicit hugetlb RAM is accounted by the hugepage pool"
+        );
+        assert_ne!(huge & libc::MAP_HUGETLB, 0);
+        assert_ne!(huge & libc::MAP_HUGE_2MB, 0);
+    }
 
     #[test]
     fn uniform_single_region() {

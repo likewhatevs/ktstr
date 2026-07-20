@@ -312,7 +312,7 @@ fn duplicate_attr_error(ident: &str, span: &dyn ToTokens) -> syn::Error {
 pub(crate) const DEFAULT_LLCS: u32 = 1;
 pub(crate) const DEFAULT_CORES: u32 = 2;
 pub(crate) const DEFAULT_THREADS: u32 = 1;
-pub(crate) const DEFAULT_MEMORY_MIB: u32 = 2048;
+pub(crate) const DEFAULT_MEMORY_MIB: u32 = 256;
 
 /// Canonical list of bool attributes the `#[ktstr_test]` parser
 /// accepts. Used by the NameValue arm's group guard, the bare-form

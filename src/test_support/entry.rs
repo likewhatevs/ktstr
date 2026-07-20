@@ -1726,8 +1726,10 @@ pub struct KtstrTestEntry {
     /// Host-topology constraints (CPU and LLC bounds) that gate
     /// whether this entry is eligible on the current machine.
     pub constraints: TopologyConstraints,
-    /// Guest memory in MiB (binary mebibytes; conversion at
-    /// VM-launch is `value << 20` bytes, not `value * 1_000_000`).
+    /// Guest-memory floor in MiB. Deferred sizing can raise the final
+    /// allocation to fit the prepared initramfs. Values are binary
+    /// mebibytes; conversion at VM launch is `value << 20` bytes, not
+    /// `value * 1_000_000`.
     pub memory_mib: u32,
     /// Host-CPU budget for the no-perf vCPU mask — the number of host
     /// CPUs the VM's vCPU threads share. `None` auto-sizes from the vCPU
@@ -2388,7 +2390,7 @@ impl KtstrTestEntry {
             llc_cores: None,
         },
         constraints: TopologyConstraints::DEFAULT,
-        memory_mib: 2048,
+        memory_mib: 256,
         cpu_budget: None,
         scheduler: &crate::test_support::Scheduler::EEVDF,
         staged_schedulers: &[],
@@ -3648,7 +3650,7 @@ mod tests {
         assert!(d.topology.nodes.is_none());
         assert!(d.topology.distances.is_none());
         assert_eq!(d.constraints, TopologyConstraints::DEFAULT);
-        assert_eq!(d.memory_mib, 2048);
+        assert_eq!(d.memory_mib, 256);
         // scheduler defaults to `&Scheduler::EEVDF`, whose
         // compile-time-fixed `.name = "eevdf"`. Read directly via
         // field access — no kind dispatch.
