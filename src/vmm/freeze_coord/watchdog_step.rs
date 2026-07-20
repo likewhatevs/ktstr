@@ -457,6 +457,305 @@ pub(crate) fn deadman_should_fire(
         || (cpu_trickle_stalled && wall_since_milestone_ns > TIER3_PROGRESS_GRACE_NS)
 }
 
+/// Delivered watchdog CPU service allowed while every sampled host-vCPU
+/// task remains unchanged and non-runnable (or its run state is unknown).
+///
+/// This is deliberately watchdog-thread CPU time, not wall time. A host
+/// scheduler can therefore deschedule both a healthy guest and its
+/// watchdog for arbitrarily long without spending the budget. Once the
+/// watchdog itself receives two full CPU seconds while repeatedly
+/// observing no runnable vCPU, no vCPU service, and no sample change, the
+/// observation machinery has had orders of magnitude more service than
+/// one `/proc` snapshot needs and the blocked verdict is finite. The
+/// budget is only entered after the guest-derived wall boundary; it does
+/// not lengthen healthy runs.
+pub(crate) const DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS: u64 = 2_000_000_000;
+
+/// Host scheduler state of one vCPU task at a Tier-3 observation.
+///
+/// `Unknown` is intentionally a blocked-class observation rather than a
+/// sensor failure: `/proc` can race task publication and exit. A change
+/// into or out of `Unknown` re-anchors the blocked-service interval, and a
+/// stable unknown sample remains finitely bounded by watchdog CPU service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostVcpuRunState {
+    Runnable,
+    NonRunnable,
+    Unknown,
+}
+
+/// One vCPU slot's exact host-side identity and service observation.
+///
+/// `task_id=None` represents an unpublished vCPU slot. `cpu_ns=None`
+/// represents a task whose host CPU clock could not be sampled. Either
+/// availability transition changes the sample and re-anchors; stable
+/// absence is treated like stable blocked evidence and remains finite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostVcpuTaskSample {
+    pub(crate) task_id: Option<u32>,
+    pub(crate) cpu_ns: Option<u64>,
+    pub(crate) run_state: HostVcpuRunState,
+}
+
+/// The watchdog's own `CLOCK_THREAD_CPUTIME_ID` observation.
+///
+/// Unlike an unavailable vCPU clock, an unavailable watchdog clock cannot
+/// degrade to blocked evidence: it is the currency that makes the wait
+/// finite without charging host starvation, so its loss has a distinct,
+/// deterministic verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeadmanObserverClock {
+    Reading(u64),
+    Unavailable,
+}
+
+/// One pure Tier-3 host-service observation.
+///
+/// The caller evaluates this only after the guest-derived wall boundary.
+/// Wall age, monitor heartbeat age, and guest trickle classification are
+/// intentionally absent: none is evidence that a host-starved vCPU task
+/// has wedged. `monitor_terminal` and the existing busiest-vCPU CPU
+/// backstop remain authoritative and are evaluated before any deferral.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeadmanHostServiceInput<'a> {
+    pub(crate) monitor_terminal: bool,
+    pub(crate) vcpu_cpu_budget_exhausted: bool,
+    pub(crate) observer_cpu: DeadmanObserverClock,
+    pub(crate) vcpu_tasks: &'a [HostVcpuTaskSample],
+}
+
+/// Why the host-service deadman deferred this observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeadmanHostDefer {
+    /// First complete observation establishes both baselines.
+    Seeded,
+    /// At least one host vCPU task is runnable. Host starvation is not a
+    /// guest-wedge verdict, regardless of elapsed wall time.
+    Runnable,
+    /// The sampled task set, CPU-clock availability, or normalized run
+    /// state changed.
+    SampleChanged,
+    /// A per-task host CPU clock regressed. This commonly means a task was
+    /// replaced between observations; re-anchor instead of comparing
+    /// across generations.
+    VcpuServiceRegressed,
+    /// Summed host-vCPU on-CPU service advanced.
+    VcpuServiceAdvanced,
+    /// The blocked sample stayed identical; this much watchdog CPU
+    /// service has been charged against the finite budget.
+    Blocked {
+        observer_service_ns: u64,
+        budget_ns: u64,
+    },
+}
+
+/// Required-sensor failure detected by the host-service deadman.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeadmanHostSensorFailure {
+    ObserverClockUnavailable,
+    ObserverClockRegressed { previous_ns: u64, current_ns: u64 },
+}
+
+/// A finite Tier-3 verdict produced from host-service evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeadmanHostFire {
+    /// The monitor task has terminated; no future evidence can arrive.
+    MonitorTerminal,
+    /// The existing dilation-immune busiest-vCPU CPU backstop was spent.
+    VcpuCpuBudget,
+    /// The watchdog received the full blocked-observation service budget
+    /// while every vCPU sample remained unchanged and non-runnable/unknown.
+    BlockedObserverService {
+        observer_service_ns: u64,
+        budget_ns: u64,
+    },
+    /// The observer clock needed to make the blocked wait finite failed.
+    SensorFailure(DeadmanHostSensorFailure),
+}
+
+/// Result of one [`DeadmanHostService`] observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeadmanHostDecision {
+    Defer(DeadmanHostDefer),
+    Fire(DeadmanHostFire),
+}
+
+#[derive(Debug, Clone)]
+struct DeadmanHostBaseline {
+    tasks: Vec<HostVcpuTaskSample>,
+    summed_cpu_ns: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeadmanHostSampleRelation {
+    Unchanged,
+    Changed,
+    ServiceRegressed,
+    ServiceAdvanced,
+}
+
+/// Pure Tier-3 host-service state machine.
+///
+/// Once the wall boundary is reached, feed this tracker exact vCPU-slot
+/// samples and the watchdog's own thread-CPU reading. Runnable host tasks
+/// and host-vCPU service always defer and re-anchor. So do task-generation,
+/// state, clock-availability, and service-regression changes. Only an
+/// identical non-runnable/unknown sample charges the observer's delivered
+/// CPU service; host wall starvation spends nothing.
+///
+/// The tracker owns exact per-slot baselines rather than a hash, avoiding
+/// both identity aliasing and the false "no progress" result that a summed
+/// clock alone could produce when one task advances while another is
+/// replaced or regresses.
+#[derive(Debug, Clone)]
+pub(crate) struct DeadmanHostService {
+    baseline: Option<DeadmanHostBaseline>,
+    blocked_observer_anchor_ns: Option<u64>,
+    last_observer_cpu_ns: Option<u64>,
+}
+
+impl DeadmanHostService {
+    pub(crate) fn new() -> Self {
+        Self {
+            baseline: None,
+            blocked_observer_anchor_ns: None,
+            last_observer_cpu_ns: None,
+        }
+    }
+
+    /// Fold one host-service observation into a deterministic decision.
+    pub(crate) fn observe(&mut self, input: DeadmanHostServiceInput<'_>) -> DeadmanHostDecision {
+        // These are pre-existing authoritative kill facts. Their precedence
+        // also means a failed observer clock cannot hide a completed monitor
+        // or an exhausted guest-CPU backstop.
+        if input.monitor_terminal {
+            return DeadmanHostDecision::Fire(DeadmanHostFire::MonitorTerminal);
+        }
+        if input.vcpu_cpu_budget_exhausted {
+            return DeadmanHostDecision::Fire(DeadmanHostFire::VcpuCpuBudget);
+        }
+
+        let observer_cpu_ns = match input.observer_cpu {
+            DeadmanObserverClock::Reading(reading) => reading,
+            DeadmanObserverClock::Unavailable => {
+                return DeadmanHostDecision::Fire(DeadmanHostFire::SensorFailure(
+                    DeadmanHostSensorFailure::ObserverClockUnavailable,
+                ));
+            }
+        };
+
+        if let Some(previous_ns) = self.last_observer_cpu_ns
+            && observer_cpu_ns < previous_ns
+        {
+            return DeadmanHostDecision::Fire(DeadmanHostFire::SensorFailure(
+                DeadmanHostSensorFailure::ObserverClockRegressed {
+                    previous_ns,
+                    current_ns: observer_cpu_ns,
+                },
+            ));
+        }
+        self.last_observer_cpu_ns = Some(observer_cpu_ns);
+
+        if input
+            .vcpu_tasks
+            .iter()
+            .any(|sample| sample.run_state == HostVcpuRunState::Runnable)
+        {
+            self.reanchor(input.vcpu_tasks, observer_cpu_ns);
+            return DeadmanHostDecision::Defer(DeadmanHostDefer::Runnable);
+        }
+
+        let Some(baseline) = &self.baseline else {
+            self.reanchor(input.vcpu_tasks, observer_cpu_ns);
+            return DeadmanHostDecision::Defer(DeadmanHostDefer::Seeded);
+        };
+
+        match Self::relation(baseline, input.vcpu_tasks) {
+            DeadmanHostSampleRelation::Changed => {
+                self.reanchor(input.vcpu_tasks, observer_cpu_ns);
+                DeadmanHostDecision::Defer(DeadmanHostDefer::SampleChanged)
+            }
+            DeadmanHostSampleRelation::ServiceRegressed => {
+                self.reanchor(input.vcpu_tasks, observer_cpu_ns);
+                DeadmanHostDecision::Defer(DeadmanHostDefer::VcpuServiceRegressed)
+            }
+            DeadmanHostSampleRelation::ServiceAdvanced => {
+                self.reanchor(input.vcpu_tasks, observer_cpu_ns);
+                DeadmanHostDecision::Defer(DeadmanHostDefer::VcpuServiceAdvanced)
+            }
+            DeadmanHostSampleRelation::Unchanged => {
+                let anchor_ns = self
+                    .blocked_observer_anchor_ns
+                    .expect("a deadman host baseline always has an observer anchor");
+                let observer_service_ns = observer_cpu_ns - anchor_ns;
+                if observer_service_ns >= DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS {
+                    DeadmanHostDecision::Fire(DeadmanHostFire::BlockedObserverService {
+                        observer_service_ns,
+                        budget_ns: DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS,
+                    })
+                } else {
+                    DeadmanHostDecision::Defer(DeadmanHostDefer::Blocked {
+                        observer_service_ns,
+                        budget_ns: DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS,
+                    })
+                }
+            }
+        }
+    }
+
+    fn reanchor(&mut self, tasks: &[HostVcpuTaskSample], observer_cpu_ns: u64) {
+        self.baseline = Some(DeadmanHostBaseline {
+            tasks: tasks.to_vec(),
+            summed_cpu_ns: Self::summed_cpu_ns(tasks),
+        });
+        self.blocked_observer_anchor_ns = Some(observer_cpu_ns);
+    }
+
+    fn summed_cpu_ns(tasks: &[HostVcpuTaskSample]) -> u128 {
+        tasks
+            .iter()
+            .filter_map(|sample| sample.cpu_ns)
+            .map(u128::from)
+            .sum()
+    }
+
+    fn relation(
+        baseline: &DeadmanHostBaseline,
+        tasks: &[HostVcpuTaskSample],
+    ) -> DeadmanHostSampleRelation {
+        if baseline.tasks.len() != tasks.len()
+            || baseline.tasks.iter().zip(tasks).any(|(before, now)| {
+                before.task_id != now.task_id
+                    || before.cpu_ns.is_some() != now.cpu_ns.is_some()
+                    || before.run_state != now.run_state
+            })
+        {
+            return DeadmanHostSampleRelation::Changed;
+        }
+
+        if baseline
+            .tasks
+            .iter()
+            .zip(tasks)
+            .any(|(before, now)| matches!((before.cpu_ns, now.cpu_ns), (Some(a), Some(b)) if b < a))
+        {
+            return DeadmanHostSampleRelation::ServiceRegressed;
+        }
+
+        let summed_cpu_ns = Self::summed_cpu_ns(tasks);
+        if summed_cpu_ns > baseline.summed_cpu_ns {
+            DeadmanHostSampleRelation::ServiceAdvanced
+        } else if summed_cpu_ns < baseline.summed_cpu_ns {
+            // The per-task check above normally owns this path. Retain the
+            // aggregate guard so future sample representations cannot turn a
+            // regression into charged blocked service.
+            DeadmanHostSampleRelation::ServiceRegressed
+        } else {
+            DeadmanHostSampleRelation::Unchanged
+        }
+    }
+}
+
 /// Pure state machine that turns each tick's PER-vCPU cumulative CPU-time
 /// readings into a boolean "the guest is receiving essentially no CPU"
 /// (trickle-stalled) — the Tier-3 deadman's deferral discriminator
@@ -1129,6 +1428,281 @@ mod tests {
             100 * S,
             CPU_CURRENCY_PMU,
         ));
+    }
+
+    // ---- Tier-3 host-service deadman ----
+
+    fn host_task(
+        task_id: Option<u32>,
+        cpu_ns: Option<u64>,
+        run_state: HostVcpuRunState,
+    ) -> HostVcpuTaskSample {
+        HostVcpuTaskSample {
+            task_id,
+            cpu_ns,
+            run_state,
+        }
+    }
+
+    fn host_input(
+        observer_cpu_ns: u64,
+        vcpu_tasks: &[HostVcpuTaskSample],
+    ) -> DeadmanHostServiceInput<'_> {
+        DeadmanHostServiceInput {
+            monitor_terminal: false,
+            vcpu_cpu_budget_exhausted: false,
+            observer_cpu: DeadmanObserverClock::Reading(observer_cpu_ns),
+            vcpu_tasks,
+        }
+    }
+
+    #[test]
+    fn host_deadman_authoritative_facts_precede_deferral_and_sensor_failure() {
+        let runnable = [host_task(Some(11), Some(0), HostVcpuRunState::Runnable)];
+        let unavailable = DeadmanHostServiceInput {
+            monitor_terminal: true,
+            vcpu_cpu_budget_exhausted: true,
+            observer_cpu: DeadmanObserverClock::Unavailable,
+            vcpu_tasks: &runnable,
+        };
+        let mut deadman = DeadmanHostService::new();
+        assert_eq!(
+            deadman.observe(unavailable),
+            DeadmanHostDecision::Fire(DeadmanHostFire::MonitorTerminal),
+            "terminal monitor is the first authoritative fact"
+        );
+
+        let cpu_exhausted = DeadmanHostServiceInput {
+            monitor_terminal: false,
+            vcpu_cpu_budget_exhausted: true,
+            ..unavailable
+        };
+        assert_eq!(
+            deadman.observe(cpu_exhausted),
+            DeadmanHostDecision::Fire(DeadmanHostFire::VcpuCpuBudget),
+            "the existing CPU backstop is authoritative over host-service deferral"
+        );
+    }
+
+    #[test]
+    fn host_deadman_runnable_vcpu_defers_through_arbitrary_wall_starvation() {
+        // Wall time is deliberately not an input. Even enormous gaps between
+        // observations cannot become kill evidence while a vCPU host task is
+        // runnable; each observation re-anchors the blocked-service budget.
+        let mut deadman = DeadmanHostService::new();
+        let runnable = [host_task(Some(21), Some(7), HostVcpuRunState::Runnable)];
+        for observer_cpu_ns in [
+            0,
+            DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS,
+            10 * DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS,
+            u64::MAX - 1,
+        ] {
+            assert_eq!(
+                deadman.observe(host_input(observer_cpu_ns, &runnable)),
+                DeadmanHostDecision::Defer(DeadmanHostDefer::Runnable)
+            );
+        }
+    }
+
+    #[test]
+    fn host_deadman_vcpu_service_progress_restarts_blocked_budget() {
+        let mut deadman = DeadmanHostService::new();
+        let blocked0 = [host_task(
+            Some(31),
+            Some(100),
+            HostVcpuRunState::NonRunnable,
+        )];
+        assert_eq!(
+            deadman.observe(host_input(10, &blocked0)),
+            DeadmanHostDecision::Defer(DeadmanHostDefer::Seeded)
+        );
+        assert_eq!(
+            deadman.observe(host_input(
+                10 + DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS - 1,
+                &blocked0
+            )),
+            DeadmanHostDecision::Defer(DeadmanHostDefer::Blocked {
+                observer_service_ns: DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS - 1,
+                budget_ns: DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS,
+            })
+        );
+
+        let blocked_progress = [host_task(
+            Some(31),
+            Some(101),
+            HostVcpuRunState::NonRunnable,
+        )];
+        let progress_at = 10 + DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS;
+        assert_eq!(
+            deadman.observe(host_input(progress_at, &blocked_progress)),
+            DeadmanHostDecision::Defer(DeadmanHostDefer::VcpuServiceAdvanced)
+        );
+        assert_eq!(
+            deadman.observe(host_input(
+                progress_at + DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS - 1,
+                &blocked_progress
+            )),
+            DeadmanHostDecision::Defer(DeadmanHostDefer::Blocked {
+                observer_service_ns: DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS - 1,
+                budget_ns: DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS,
+            }),
+            "service is charged from the vCPU-progress re-anchor"
+        );
+    }
+
+    #[test]
+    fn host_deadman_stable_blocked_sample_is_finite_at_exact_budget() {
+        let mut deadman = DeadmanHostService::new();
+        let blocked = [
+            host_task(Some(41), Some(1_000), HostVcpuRunState::NonRunnable),
+            host_task(Some(42), None, HostVcpuRunState::Unknown),
+        ];
+        let anchor = 500;
+        assert_eq!(
+            deadman.observe(host_input(anchor, &blocked)),
+            DeadmanHostDecision::Defer(DeadmanHostDefer::Seeded)
+        );
+        assert_eq!(
+            deadman.observe(host_input(
+                anchor + DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS,
+                &blocked
+            )),
+            DeadmanHostDecision::Fire(DeadmanHostFire::BlockedObserverService {
+                observer_service_ns: DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS,
+                budget_ns: DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS,
+            }),
+            "the exact delivered-service boundary is finite"
+        );
+    }
+
+    #[test]
+    fn host_deadman_sample_changes_each_reanchor_blocked_service() {
+        let mut deadman = DeadmanHostService::new();
+        let original = [host_task(Some(51), Some(10), HostVcpuRunState::NonRunnable)];
+        assert_eq!(
+            deadman.observe(host_input(0, &original)),
+            DeadmanHostDecision::Defer(DeadmanHostDefer::Seeded)
+        );
+
+        let replaced = [host_task(Some(52), Some(10), HostVcpuRunState::NonRunnable)];
+        assert_eq!(
+            deadman.observe(host_input(
+                DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS - 1,
+                &replaced
+            )),
+            DeadmanHostDecision::Defer(DeadmanHostDefer::SampleChanged),
+            "task-generation replacement re-anchors"
+        );
+
+        let clock_missing = [host_task(Some(52), None, HostVcpuRunState::NonRunnable)];
+        let second_anchor = 2 * DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS - 2;
+        assert_eq!(
+            deadman.observe(host_input(second_anchor, &clock_missing)),
+            DeadmanHostDecision::Defer(DeadmanHostDefer::SampleChanged),
+            "vCPU clock availability change re-anchors"
+        );
+
+        let state_unknown = [host_task(Some(52), None, HostVcpuRunState::Unknown)];
+        let third_anchor = 3 * DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS - 3;
+        assert_eq!(
+            deadman.observe(host_input(third_anchor, &state_unknown)),
+            DeadmanHostDecision::Defer(DeadmanHostDefer::SampleChanged),
+            "normalized blocked-state change re-anchors"
+        );
+        assert_eq!(
+            deadman.observe(host_input(
+                third_anchor + DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS - 1,
+                &state_unknown
+            )),
+            DeadmanHostDecision::Defer(DeadmanHostDefer::Blocked {
+                observer_service_ns: DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS - 1,
+                budget_ns: DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS,
+            }),
+            "none of the earlier observer service leaks across re-anchors"
+        );
+    }
+
+    #[test]
+    fn host_deadman_per_task_service_regression_reanchors_even_if_sum_advances() {
+        let mut deadman = DeadmanHostService::new();
+        let before = [
+            host_task(Some(61), Some(100), HostVcpuRunState::NonRunnable),
+            host_task(Some(62), Some(100), HostVcpuRunState::NonRunnable),
+        ];
+        assert!(matches!(
+            deadman.observe(host_input(0, &before)),
+            DeadmanHostDecision::Defer(DeadmanHostDefer::Seeded)
+        ));
+
+        // The aggregate advanced (200 -> 250), but task 61 regressed. This
+        // is a generation/race boundary, not comparable service progress.
+        let raced = [
+            host_task(Some(61), Some(50), HostVcpuRunState::NonRunnable),
+            host_task(Some(62), Some(200), HostVcpuRunState::NonRunnable),
+        ];
+        assert_eq!(
+            deadman.observe(host_input(
+                DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS - 1,
+                &raced
+            )),
+            DeadmanHostDecision::Defer(DeadmanHostDefer::VcpuServiceRegressed)
+        );
+    }
+
+    #[test]
+    fn host_deadman_summed_multi_vcpu_service_advance_reanchors() {
+        let mut deadman = DeadmanHostService::new();
+        let before = [
+            host_task(Some(71), Some(10), HostVcpuRunState::NonRunnable),
+            host_task(Some(72), Some(20), HostVcpuRunState::NonRunnable),
+        ];
+        assert!(matches!(
+            deadman.observe(host_input(0, &before)),
+            DeadmanHostDecision::Defer(DeadmanHostDefer::Seeded)
+        ));
+        let after = [
+            host_task(Some(71), Some(10), HostVcpuRunState::NonRunnable),
+            host_task(Some(72), Some(21), HostVcpuRunState::NonRunnable),
+        ];
+        assert_eq!(
+            deadman.observe(host_input(
+                DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS - 1,
+                &after
+            )),
+            DeadmanHostDecision::Defer(DeadmanHostDefer::VcpuServiceAdvanced)
+        );
+    }
+
+    #[test]
+    fn host_deadman_observer_clock_failures_are_deterministic() {
+        let blocked = [host_task(Some(81), Some(0), HostVcpuRunState::NonRunnable)];
+        let mut unavailable = DeadmanHostService::new();
+        assert_eq!(
+            unavailable.observe(DeadmanHostServiceInput {
+                monitor_terminal: false,
+                vcpu_cpu_budget_exhausted: false,
+                observer_cpu: DeadmanObserverClock::Unavailable,
+                vcpu_tasks: &blocked,
+            }),
+            DeadmanHostDecision::Fire(DeadmanHostFire::SensorFailure(
+                DeadmanHostSensorFailure::ObserverClockUnavailable
+            ))
+        );
+
+        let mut regressed = DeadmanHostService::new();
+        assert!(matches!(
+            regressed.observe(host_input(100, &blocked)),
+            DeadmanHostDecision::Defer(DeadmanHostDefer::Seeded)
+        ));
+        assert_eq!(
+            regressed.observe(host_input(99, &blocked)),
+            DeadmanHostDecision::Fire(DeadmanHostFire::SensorFailure(
+                DeadmanHostSensorFailure::ObserverClockRegressed {
+                    previous_ns: 100,
+                    current_ns: 99,
+                }
+            ))
+        );
     }
 
     // ---- CpuTrickleTracker ----
