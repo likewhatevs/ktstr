@@ -18,11 +18,11 @@
 //! erased environment, and double-forking therefore cannot detach work from an
 //! abruptly lost cargo-ktstr owner.
 //!
-//! Cleanup-phase commands within the worker retain the process-group anchor
-//! used for signal forwarding and bounded output-tail accounting. The startup
-//! subreaper is the ownership backstop outside that group: it keeps all
-//! arbitrary `Command` spawning on Rust's normal path while covering escaped
-//! descendants uniformly.
+//! Cleanup-phase commands within the worker claim an exclusive subreaper epoch
+//! before spawning. Their process-group anchor remains the signal-forwarding
+//! and pgid-reuse boundary, while ancestry traversal owns descendants which
+//! call `setsid`, change groups, or double-fork. The startup supervisor remains
+//! the backstop for abrupt loss of the complete cargo-ktstr worker.
 //!
 //! The active handoff is `IDLE -> SPAWNING -> anchor-pgid -> REAPING -> IDLE`.
 //! Signals handled during SPAWNING are counted by kind and replayed after
@@ -31,10 +31,9 @@
 //! only then is the anchor released/reaped. A handler therefore cannot resume
 //! a stale `kill(-pgid)` after reuse.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{
     Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio,
@@ -93,14 +92,14 @@ const STARTUP_COMMIT_BACKSTOP: Duration = STARTUP_TEST_OBSERVATION_BACKSTOP;
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const STARTUP_SIGNAL_READY_GRACE: Duration = Duration::from_secs(1);
 
-/// Post-leader CPU service a residual child group may consume before it is
+/// Post-leader CPU service a residual owned subtree may consume before it is
 /// conclusively a leak. Host descheduling consumes no budget.
 #[cfg(not(test))]
 const GROUP_TAIL_SERVICE_BUDGET_NS: u128 = 2_000_000_000;
 #[cfg(test)]
 const GROUP_TAIL_SERVICE_BUDGET_NS: u128 = 500_000_000;
 
-/// Absolute starvation backstop for a residual child group.
+/// Absolute starvation backstop for a residual owned subtree.
 #[cfg(not(test))]
 const GROUP_TAIL_WALL_BACKSTOP: Duration = Duration::from_secs(30);
 #[cfg(test)]
@@ -1562,13 +1561,9 @@ fn startup_reap_nonblocking(
     }
 }
 
-fn startup_direct_children() -> io::Result<Vec<libc::pid_t>> {
-    // Production S is single-threaded, while the nested regression invokes S
-    // from a libtest worker thread. Enumerating every task is correct in both
-    // cases and also covers a future supervisor implementation that creates a
-    // helper thread: Linux records children against the task that forked them.
+fn task_children(task_dir: impl AsRef<std::path::Path>) -> io::Result<Vec<libc::pid_t>> {
     let mut children = HashSet::new();
-    for task in std::fs::read_dir("/proc/self/task")? {
+    for task in std::fs::read_dir(task_dir)? {
         let task = task?;
         let path = task.path().join("children");
         let contents = match std::fs::read_to_string(path) {
@@ -1589,6 +1584,23 @@ fn startup_direct_children() -> io::Result<Vec<libc::pid_t>> {
     let mut children: Vec<_> = children.into_iter().collect();
     children.sort_unstable();
     Ok(children)
+}
+
+fn startup_direct_children() -> io::Result<Vec<libc::pid_t>> {
+    // Production S is single-threaded, while the nested regression invokes S
+    // from a libtest worker thread. Enumerating every task is correct in both
+    // cases and also covers a future supervisor implementation that creates a
+    // helper thread: Linux records children against the task that forked them.
+    task_children("/proc/self/task")
+}
+
+fn process_direct_children(pid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
+    let task_dir = format!("/proc/{pid}/task");
+    match task_children(task_dir) {
+        Ok(children) => Ok(children),
+        Err(error) if process_gone(&error) => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
 }
 
 fn startup_process_parent(pid: libc::pid_t) -> io::Result<Option<libc::pid_t>> {
@@ -1675,12 +1687,11 @@ fn startup_kill_and_reap_descendants(
 
 /// A process-local subreaper boundary for one exact anchored command.
 ///
-/// The ordinary group owner handles every descendant which preserves its
-/// process group. This owner closes the remaining Linux escape hatch:
-/// descendants which call `setsid()` or otherwise leave that group are
-/// reparented here when their parent dies, then killed and reaped before the
-/// observed command returns. The child slot must be empty on entry so draining
-/// all direct children cannot consume an unrelated wait status.
+/// Claiming the active-child slot precedes the process-wide subreaper change.
+/// The owner remains armed through command, descendant, and anchor teardown;
+/// `IDLE` is published only after the old subreaper state is restored. A second
+/// runner can therefore neither enter the same process-wide subreaper epoch nor
+/// have its children consumed by the preceding owner.
 struct AnchoredSubtreeOwner {
     restore_subreaper: bool,
     armed: bool,
@@ -1707,90 +1718,143 @@ fn set_child_subreaper(enabled: bool) -> io::Result<()> {
 
 impl AnchoredSubtreeOwner {
     fn enter() -> io::Result<Self> {
-        let mut was_subreaper: libc::c_int = 0;
-        // SAFETY: PR_GET_CHILD_SUBREAPER writes one integer to the valid
-        // out-pointer and ignores the remaining zero arguments.
-        if unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut was_subreaper, 0, 0, 0) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let restore_subreaper = was_subreaper == 0;
-        if restore_subreaper {
-            // SAFETY: process-wide subreaper state is changed before this
-            // owner creates any child and restored only after every child is
-            // reaped.
-            set_child_subreaper(true)?;
+        ACTIVE_CHILD_GROUP
+            .compare_exchange(IDLE, SPAWNING, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "another cargo-ktstr child process is already active",
+                )
+            })?;
+        let mut owner = Self {
+            restore_subreaper: false,
+            armed: true,
+        };
+
+        if caught().is_some() {
+            owner.abandon_spawning();
+            return Err(interrupted_error());
         }
 
         match startup_direct_children() {
-            Ok(children) if children.is_empty() => Ok(Self {
-                restore_subreaper,
-                armed: true,
-            }),
+            Ok(children) if children.is_empty() => {}
             Ok(children) => {
-                if restore_subreaper {
-                    // SAFETY: no owned child has been created, so restoring
-                    // the state cannot move an owned descendant boundary.
-                    set_child_subreaper(false)?;
-                }
-                Err(io::Error::new(
+                let error = io::Error::new(
                     io::ErrorKind::WouldBlock,
                     format!(
                         "cannot establish exclusive anchored subtree ownership while \
                          direct children are already active: {children:?}",
                     ),
-                ))
+                );
+                owner.abandon_spawning();
+                return Err(error);
             }
             Err(error) => {
-                if restore_subreaper {
-                    // SAFETY: as above, setup failed before an owned spawn.
-                    set_child_subreaper(false)?;
-                }
+                owner.abandon_spawning();
+                return Err(error);
+            }
+        }
+
+        let mut was_subreaper: libc::c_int = 0;
+        // SAFETY: PR_GET_CHILD_SUBREAPER writes one integer to the valid
+        // out-pointer and ignores the remaining zero arguments.
+        if unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut was_subreaper, 0, 0, 0) } != 0 {
+            let error = io::Error::last_os_error();
+            owner.abandon_spawning();
+            return Err(error);
+        }
+        owner.restore_subreaper = was_subreaper == 0;
+        if owner.restore_subreaper {
+            // SAFETY: process-wide subreaper state is changed before this
+            // owner creates any child and restored only after every child is
+            // reaped.
+            if let Err(error) = set_child_subreaper(true) {
+                owner.restore_subreaper = false;
+                owner.abandon_spawning();
+                return Err(error);
+            }
+        }
+
+        match startup_direct_children() {
+            // Recheck after the process-wide transition. The active-child
+            // claim excludes another owned spawn; this catches a caller which
+            // bypassed the runner without consuming that unrelated child.
+            Ok(children) if children.is_empty() => Ok(owner),
+            Ok(children) => {
+                let error = io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "cannot establish exclusive anchored subtree ownership while \
+                         direct children are already active: {children:?}",
+                    ),
+                );
+                owner.abandon_spawning();
+                Err(error)
+            }
+            Err(error) => {
+                owner.abandon_spawning();
                 Err(error)
             }
         }
     }
 
-    fn drain(&mut self) -> io::Result<()> {
-        let deadline = Instant::now() + STARTUP_REAP_BACKSTOP;
-        let mut ignored_status = None;
-        loop {
-            if startup_reap_nonblocking(-1, &mut ignored_status)? {
-                return Ok(());
-            }
-            for pid in startup_direct_children()? {
-                startup_kill_direct_child(pid)?;
-            }
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "anchored command descendant cleanup exceeded its reap backstop",
-                ));
-            }
-            std::thread::sleep(STARTUP_POLL_INTERVAL);
+    fn abandon_spawning(&mut self) {
+        if !self.armed {
+            return;
         }
-    }
-
-    fn restore(&mut self) -> io::Result<()> {
-        if self.restore_subreaper {
-            // SAFETY: `drain` proved that no owned child remains to be
-            // reparented past this process.
-            set_child_subreaper(false)?;
-        }
-        self.armed = false;
-        Ok(())
-    }
-
-    fn finish(mut self) {
-        if self.drain().is_err() || self.restore().is_err() {
+        let transitioned = ACTIVE_CHILD_GROUP.compare_exchange(
+            SPAWNING,
+            REAPING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        if transitioned != Ok(SPAWNING) {
             fail_closed_child_ownership();
         }
+        drain_handlers_in_flight_bounded(None);
+        clear_pending_handoff_signals();
+        self.restore_and_publish_idle(false);
+    }
+
+    fn finish_reaping(&mut self) {
+        self.restore_and_publish_idle(true);
+    }
+
+    fn restore_and_publish_idle(&mut self, require_empty: bool) {
+        if !self.armed {
+            return;
+        }
+        if ACTIVE_CHILD_GROUP.load(Ordering::SeqCst) != REAPING {
+            fail_closed_child_ownership();
+        }
+        if require_empty {
+            match startup_direct_children() {
+                Ok(children) if children.is_empty() => {}
+                _ => fail_closed_child_ownership(),
+            }
+        }
+        if self.restore_subreaper {
+            // SAFETY: the owned-tree stable-empty fence and the exact anchor
+            // reap proved that no child remains to be reparented past this
+            // process.
+            if set_child_subreaper(false).is_err() {
+                fail_closed_child_ownership();
+            }
+        }
+        self.armed = false;
+        ACTIVE_CHILD_GROUP.store(IDLE, Ordering::SeqCst);
     }
 }
 
 impl Drop for AnchoredSubtreeOwner {
     fn drop(&mut self) {
-        if self.armed && (self.drain().is_err() || self.restore().is_err()) {
-            fail_closed_child_ownership();
+        if !self.armed {
+            return;
+        }
+        match ACTIVE_CHILD_GROUP.load(Ordering::SeqCst) {
+            SPAWNING => self.abandon_spawning(),
+            REAPING => self.finish_reaping(),
+            _ => fail_closed_child_ownership(),
         }
     }
 }
@@ -2376,9 +2440,9 @@ pub(crate) fn run_output(mut command: Command) -> io::Result<Output> {
 ///
 /// The observer runs synchronously on the child-owning thread. Its periodic
 /// tick remains live while the command is silent, after the command leader
-/// closes its pipes, and while same-process-group descendants finish. No
+/// closes its pipes, and while any owned descendant finishes. No
 /// drain thread outlives this call, and every error path kills/reaps the
-/// published child group before returning.
+/// published child subtree before returning.
 pub(crate) trait StdoutObserver {
     /// Inspect newly read bytes. The runner appends them to its returned
     /// [`Output::stdout`] before making this call.
@@ -2395,8 +2459,8 @@ pub(crate) trait StdoutObserver {
     /// Maximum time the runner may sleep before calling [`Self::tick`] again.
     fn next_tick_in(&self) -> Duration;
 
-    /// Request cancellation while the child and every process in its owned
-    /// group are still under the runner's exact teardown authority.
+    /// Request cancellation while the child and its complete descendant tree
+    /// are still under the runner's exact teardown authority.
     ///
     /// The default keeps ordinary observers non-cancelling. A bounded
     /// observer should return a descriptive error and make
@@ -2408,7 +2472,7 @@ pub(crate) trait StdoutObserver {
     /// Report the command's ordinary process exit, including non-zero exits.
     fn finished(&mut self, status: &ExitStatus);
 
-    /// Report a spawn, pipe, poll, wait, or process-group ownership failure.
+    /// Report a spawn, pipe, poll, wait, or child-subtree ownership failure.
     fn failed(&mut self, error: &io::Error);
 }
 
@@ -2444,7 +2508,7 @@ where
 ///
 /// This is the bounded-probe path: an observer cancellation is handled like
 /// any other owner-loop failure, synchronously terminating and reaping the
-/// complete anchored group before the error is returned. Keeping this
+/// complete anchored subtree before the error is returned. Keeping this
 /// guarantee independent of startup mode makes direct invocation and unit
 /// tests exercise the same subtree cleanup as the normal supervised worker.
 pub(crate) fn run_output_observed_anchored<O>(
@@ -2470,25 +2534,11 @@ where
     if capture_stderr {
         command.stderr(Stdio::piped());
     }
-    let subtree = if force_anchored_group {
-        match AnchoredSubtreeOwner::enter() {
-            Ok(subtree) => Some(subtree),
-            Err(error) => {
-                observer.failed(&error);
-                return Err(error);
-            }
-        }
-    } else {
-        None
-    };
     let result = if force_anchored_group || runner_enabled() {
         run_observed_group(command, observer, capture_stderr)
     } else {
         run_observed_direct(command, observer, capture_stderr)
     };
-    if let Some(subtree) = subtree {
-        subtree.finish();
-    }
     match &result {
         Ok(output) => observer.finished(&output.status),
         Err(error) => observer.failed(error),
@@ -2516,9 +2566,11 @@ struct GroupAnchor {
 struct GroupChild {
     child: Child,
     anchor: GroupAnchor,
+    subtree: AnchoredSubtreeOwner,
     armed: bool,
     published: bool,
-    known_members: HashSet<libc::pid_t>,
+    leader_pid: libc::pid_t,
+    leader_reaped: bool,
 }
 
 /// Restore the spawning thread's original mask on every return path.
@@ -2788,18 +2840,7 @@ fn terminate_direct_child_bounded(child: &mut Child) -> io::Result<()> {
     }
 }
 
-fn abandon_spawning() {
-    let transitioned =
-        ACTIVE_CHILD_GROUP.compare_exchange(SPAWNING, REAPING, Ordering::SeqCst, Ordering::SeqCst);
-    if transitioned != Ok(SPAWNING) {
-        fail_closed_child_ownership();
-    }
-    drain_handlers_in_flight_bounded(None);
-    clear_pending_handoff_signals();
-    ACTIVE_CHILD_GROUP.store(IDLE, Ordering::SeqCst);
-}
-
-fn abandon_spawning_anchor(anchor: &mut GroupAnchor) {
+fn abandon_spawning_anchor(anchor: &mut GroupAnchor, subtree: &mut AnchoredSubtreeOwner) {
     let transitioned =
         ACTIVE_CHILD_GROUP.compare_exchange(SPAWNING, REAPING, Ordering::SeqCst, Ordering::SeqCst);
     if transitioned != Ok(SPAWNING) {
@@ -2811,7 +2852,7 @@ fn abandon_spawning_anchor(anchor: &mut GroupAnchor) {
     if release_anchor(anchor).is_err() {
         fail_closed_child_ownership();
     }
-    ACTIVE_CHILD_GROUP.store(IDLE, Ordering::SeqCst);
+    subtree.finish_reaping();
 }
 
 /// Claim the global handoff slot, create the group anchor, spawn the real
@@ -2823,28 +2864,21 @@ where
     if caught().is_some() {
         return Err(interrupted_error());
     }
-    ACTIVE_CHILD_GROUP
-        .compare_exchange(IDLE, SPAWNING, Ordering::SeqCst, Ordering::SeqCst)
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "another cargo-ktstr child process is already active",
-            )
-        })?;
+    let mut subtree = AnchoredSubtreeOwner::enter()?;
     if caught().is_some() {
-        abandon_spawning();
+        subtree.abandon_spawning();
         return Err(interrupted_error());
     }
 
     let mut anchor = match spawn_anchor() {
         Ok(anchor) => anchor,
         Err(error) => {
-            abandon_spawning();
+            subtree.abandon_spawning();
             return Err(error);
         }
     };
     if caught().is_some() {
-        abandon_spawning_anchor(&mut anchor);
+        abandon_spawning_anchor(&mut anchor, &mut subtree);
         return Err(interrupted_error());
     }
 
@@ -2852,18 +2886,35 @@ where
     let child = match spawn_with_unblocked_signals(&mut command) {
         Ok(child) => child,
         Err(error) => {
-            abandon_spawning_anchor(&mut anchor);
+            abandon_spawning_anchor(&mut anchor, &mut subtree);
             return Err(error);
         }
     };
 
-    let child_pid = libc::pid_t::try_from(child.id()).ok();
+    let leader_pid = match libc::pid_t::try_from(child.id())
+        .ok()
+        .filter(|pid| *pid > 0)
+    {
+        Some(pid) => pid,
+        None => {
+            let mut invalid_child = child;
+            if terminate_direct_child_bounded(&mut invalid_child).is_err() {
+                fail_closed_child_ownership();
+            }
+            abandon_spawning_anchor(&mut anchor, &mut subtree);
+            return Err(io::Error::other(
+                "spawned child id is not a positive process id",
+            ));
+        }
+    };
     let mut group = GroupChild {
         child,
         anchor,
+        subtree,
         armed: true,
         published: false,
-        known_members: child_pid.into_iter().collect(),
+        leader_pid,
+        leader_reaped: false,
     };
 
     // Deterministic test seam: the armed owner already covers unwinding, the
@@ -2962,9 +3013,17 @@ struct ProcessIdentity {
 #[derive(Clone, Copy, Debug)]
 struct GroupMember {
     identity: ProcessIdentity,
-    pgrp: libc::pid_t,
+    ppid: libc::pid_t,
     cpu_ticks: u64,
     state: u8,
+}
+
+struct OwnedProcess {
+    member: GroupMember,
+    pidfd: OwnedFd,
+    direct: bool,
+    leader: bool,
+    depth: usize,
 }
 
 fn invalid_proc_stat(pid: libc::pid_t, field: &str) -> io::Error {
@@ -3006,8 +3065,8 @@ fn parse_process_stat(pid: libc::pid_t, stat: &[u8]) -> io::Result<GroupMember> 
         .first()
         .copied()
         .ok_or_else(|| invalid_proc_stat(pid, "state"))?;
-    let pgrp = parse_proc_stat_number::<libc::pid_t>(fields[2])
-        .ok_or_else(|| invalid_proc_stat(pid, "process group"))?;
+    let ppid = parse_proc_stat_number::<libc::pid_t>(fields[1])
+        .ok_or_else(|| invalid_proc_stat(pid, "parent pid"))?;
     let utime =
         parse_proc_stat_number::<u64>(fields[11]).ok_or_else(|| invalid_proc_stat(pid, "utime"))?;
     let stime =
@@ -3019,7 +3078,7 @@ fn parse_process_stat(pid: libc::pid_t, stat: &[u8]) -> io::Result<GroupMember> 
             pid,
             starttime_ticks,
         },
-        pgrp,
+        ppid,
         cpu_ticks: utime.saturating_add(stime),
         state,
     })
@@ -3032,83 +3091,103 @@ where
     std::str::from_utf8(field).ok()?.parse::<T>().ok()
 }
 
-fn unreadable_proc_entry_is_unrelated(
-    entry: &std::fs::DirEntry,
+fn open_verified_descendant(
     pid: libc::pid_t,
-    known_members: &HashSet<libc::pid_t>,
-) -> io::Result<bool> {
-    if known_members.contains(&pid) {
-        return Ok(false);
-    }
-    let metadata = match entry.metadata() {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
-        Err(error) => return Err(error),
+    expected_ppid: libc::pid_t,
+) -> io::Result<Option<(GroupMember, OwnedFd)>> {
+    let Some(before) = read_process_stat(pid)? else {
+        return Ok(None);
     };
-    // SAFETY: geteuid has no arguments and cannot fail.
-    let own_euid = unsafe { libc::geteuid() };
-    Ok(proc_owner_is_unrelated(
-        pid,
-        known_members,
-        metadata.uid(),
-        own_euid,
-    ))
-}
+    if before.ppid != expected_ppid {
+        return Ok(None);
+    }
 
-fn proc_owner_is_unrelated(
-    pid: libc::pid_t,
-    known_members: &HashSet<libc::pid_t>,
-    owner_uid: libc::uid_t,
-    own_euid: libc::uid_t,
-) -> bool {
-    !known_members.contains(&pid) && owner_uid != own_euid
-}
-
-fn process_group_members(
-    pgid: libc::pid_t,
-    known_members: &HashSet<libc::pid_t>,
-) -> io::Result<Vec<GroupMember>> {
-    let mut members = Vec::new();
-    for entry in std::fs::read_dir("/proc")? {
-        let entry = entry?;
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<libc::pid_t>().ok())
-        else {
-            continue;
-        };
-        if pid == pgid {
-            continue;
+    // SAFETY: pidfd_open takes one positive numeric pid and flags=0.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0_u32) as libc::c_int };
+    if raw < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None);
         }
-        let member = match read_process_stat(pid) {
-            Ok(Some(member)) => member,
-            Ok(None) => continue,
-            Err(error)
-                if error.kind() == io::ErrorKind::PermissionDenied
-                    && unreadable_proc_entry_is_unrelated(&entry, pid, known_members)? =>
-            {
-                // hidepid may expose a numeric directory while denying stat
-                // for another uid. Such a process cannot join this caller's
-                // group without first becoming observable. A known group pid
-                // or same-euid pid remains a hard error above.
-                continue;
+        return Err(error);
+    }
+    // SAFETY: pidfd_open returned a fresh descriptor owned by this function.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let Some(after) = read_process_stat(pid)? else {
+        return Ok(None);
+    };
+    if after.identity != before.identity || after.ppid != expected_ppid {
+        return Ok(None);
+    }
+    Ok(Some((after, pidfd)))
+}
+
+fn verified_process_children(member: GroupMember) -> io::Result<Vec<libc::pid_t>> {
+    if matches!(member.state, b'Z' | b'X') {
+        return Ok(Vec::new());
+    }
+    let children = process_direct_children(member.identity.pid)?;
+    let Some(after) = read_process_stat(member.identity.pid)? else {
+        return Ok(Vec::new());
+    };
+    if after.identity != member.identity {
+        return Ok(Vec::new());
+    }
+    Ok(children)
+}
+
+/// Snapshot only descendants of this exact runner.
+///
+/// The worker is a subreaper for the complete command epoch, so an orphaned
+/// `setsid` or double-fork descendant becomes a direct child here. Living
+/// roots are then walked through each task's `children` file. Two root reads
+/// close a reparent that races the recursive walk; the caller additionally
+/// requires a time-separated empty fence before declaring the tree gone. Cost
+/// is proportional to this owned subtree, never the host-wide process table.
+fn snapshot_owned_subtree(group: &GroupChild) -> io::Result<Vec<OwnedProcess>> {
+    // SAFETY: getpid has no arguments and cannot fail.
+    let own_pid = unsafe { libc::getpid() };
+    let mut indices = HashMap::<ProcessIdentity, usize>::new();
+    let mut members = Vec::new();
+
+    for _ in 0..2 {
+        let mut queued = HashSet::<(libc::pid_t, libc::pid_t)>::new();
+        let mut queue = VecDeque::<(libc::pid_t, libc::pid_t, usize)>::new();
+        for pid in startup_direct_children()? {
+            if pid != group.anchor.pgid && queued.insert((pid, own_pid)) {
+                queue.push_back((pid, own_pid, 0));
             }
-            Err(error) => return Err(error),
-        };
-        if member.pgrp == pgid && member.state != b'Z' && member.state != b'X' {
-            members.push(member);
+        }
+
+        while let Some((pid, expected_ppid, depth)) = queue.pop_front() {
+            let Some((member, pidfd)) = open_verified_descendant(pid, expected_ppid)? else {
+                continue;
+            };
+
+            for child in verified_process_children(member)? {
+                if queued.insert((child, member.identity.pid)) {
+                    queue.push_back((child, member.identity.pid, depth.saturating_add(1)));
+                }
+            }
+            let process = OwnedProcess {
+                member,
+                pidfd,
+                direct: expected_ppid == own_pid,
+                leader: !group.leader_reaped && member.identity.pid == group.leader_pid,
+                depth,
+            };
+            if let Some(index) = indices.get(&member.identity).copied() {
+                // The second walk is newer and can observe a former nested
+                // descendant after it has been adopted as a direct child.
+                members[index] = process;
+            } else {
+                indices.insert(member.identity, members.len());
+                members.push(process);
+            }
         }
     }
-    members.sort_by_key(|member| member.identity.pid);
-    Ok(members)
-}
 
-fn snapshot_group_members(group: &mut GroupChild) -> io::Result<Vec<GroupMember>> {
-    let members = process_group_members(group.anchor.pgid, &group.known_members)?;
-    group
-        .known_members
-        .extend(members.iter().map(|member| member.identity.pid));
+    members.sort_by_key(|process| (process.depth, process.member.identity.pid));
     Ok(members)
 }
 
@@ -3125,7 +3204,7 @@ impl GroupTailBudget {
         let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
         if ticks_per_second <= 0 {
             return Err(io::Error::other(
-                "sysconf(_SC_CLK_TCK) failed for child-group service accounting",
+                "sysconf(_SC_CLK_TCK) failed for child-subtree service accounting",
             ));
         }
         Ok(Self {
@@ -3169,9 +3248,10 @@ fn observer_sleep<O: StdoutObserver>(observer: &O, maximum: Duration) -> Duratio
         .max(Duration::from_millis(1))
 }
 
-/// Move the anchor pgid into REAPING, drain old handler readers, then close
-/// the control pipe and reap the anchor before exposing IDLE.
-fn finish_anchor(anchor: &mut GroupAnchor) -> io::Result<()> {
+/// Hide the anchor pgid from new signal handlers and drain every handler which
+/// may still own the published value. The anchor remains alive and unreaped
+/// until the complete owned subtree has reached its stable-empty fence.
+fn begin_group_reaping(anchor: &GroupAnchor) {
     let transitioned = ACTIVE_CHILD_GROUP.compare_exchange(
         anchor.pgid,
         REAPING,
@@ -3182,40 +3262,14 @@ fn finish_anchor(anchor: &mut GroupAnchor) -> io::Result<()> {
         fail_closed_child_ownership();
     }
     drain_handlers_in_flight_bounded(Some(anchor.pgid));
-    if release_anchor(anchor).is_err() {
-        fail_closed_child_ownership();
-    }
-    ACTIVE_CHILD_GROUP.store(IDLE, Ordering::SeqCst);
-    Ok(())
 }
 
-fn open_verified_member_pidfd(
-    member: GroupMember,
-    pgid: libc::pid_t,
-) -> io::Result<Option<OwnedFd>> {
-    // SAFETY: pidfd_open takes an integer pid and flags=0, returning a new fd.
-    let raw =
-        unsafe { libc::syscall(libc::SYS_pidfd_open, member.identity.pid, 0_u32) as libc::c_int };
-    if raw < 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(None);
-        }
-        return Err(error);
+fn try_wait_group_leader(group: &mut GroupChild) -> io::Result<Option<ExitStatus>> {
+    let status = group.child.try_wait()?;
+    if status.is_some() {
+        group.leader_reaped = true;
     }
-    // SAFETY: pidfd_open returned a fresh descriptor owned by this function.
-    let pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
-    let Some(current) = read_process_stat(member.identity.pid)? else {
-        return Ok(None);
-    };
-    if current.identity != member.identity
-        || current.pgrp != pgid
-        || current.state == b'Z'
-        || current.state == b'X'
-    {
-        return Ok(None);
-    }
-    Ok(Some(pidfd))
+    Ok(status)
 }
 
 fn signal_member_pidfd(pidfd: &OwnedFd, signal: libc::c_int) -> io::Result<()> {
@@ -3242,29 +3296,88 @@ fn signal_member_pidfd(pidfd: &OwnedFd, signal: libc::c_int) -> io::Result<()> {
     }
 }
 
-fn force_reap_group_members(group: &mut GroupChild) -> io::Result<()> {
-    let pgid = group.anchor.pgid;
-    let deadline = Instant::now() + FORCED_GROUP_REAP_BACKSTOP;
-    let mut empty_snapshots = 0;
-    loop {
-        let members = snapshot_group_members(group)?;
-        if members.is_empty() {
-            empty_snapshots += 1;
-            if empty_snapshots == 2 {
-                return Ok(());
+fn signal_owned_processes(processes: &[OwnedProcess], signal: libc::c_int) -> io::Result<()> {
+    let mut ordered: Vec<_> = processes
+        .iter()
+        .filter(|process| !matches!(process.member.state, b'Z' | b'X'))
+        .collect();
+    ordered.sort_by_key(|process| std::cmp::Reverse(process.depth));
+    for process in ordered {
+        signal_member_pidfd(&process.pidfd, signal)?;
+    }
+    Ok(())
+}
+
+fn reap_direct_terminated(processes: &[OwnedProcess]) -> io::Result<()> {
+    for process in processes.iter().filter(|process| {
+        process.direct && !process.leader && matches!(process.member.state, b'Z' | b'X')
+    }) {
+        // P_PIDFD selects the exact adopted direct child represented by this
+        // descriptor. WNOHANG keeps a stale terminal procfs sample from
+        // blocking; a non-zero si_pid proves the exact child was consumed.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: the pidfd belongs to a process verified as this owner's
+        // direct child, `info` is writable, and the option set is valid.
+        loop {
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PIDFD,
+                    process.pidfd.as_raw_fd() as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG,
+                )
+            };
+            if result == 0 {
+                break;
             }
-        } else {
-            empty_snapshots = 0;
-            for member in members {
-                if let Some(pidfd) = open_verified_member_pidfd(member, pgid)? {
-                    signal_member_pidfd(&pidfd, libc::SIGKILL)?;
-                }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
             }
         }
-        if Instant::now() >= deadline {
+        // SAFETY: waitid initialized the SIGCHLD view of siginfo_t.
+        let reaped_pid = unsafe { info.si_pid() };
+        if reaped_pid != 0 && reaped_pid != process.member.identity.pid {
+            return Err(io::Error::other(format!(
+                "pidfd wait reaped {reaped_pid}, expected {}",
+                process.member.identity.pid,
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn force_reap_owned_subtree(group: &mut GroupChild) -> io::Result<()> {
+    let deadline = Instant::now() + FORCED_GROUP_REAP_BACKSTOP;
+    let mut empty_since = None::<Instant>;
+    loop {
+        if !group.leader_reaped {
+            let _ = try_wait_group_leader(group)?;
+        }
+        let processes = snapshot_owned_subtree(group)?;
+        let now = Instant::now();
+        if processes.is_empty() && group.leader_reaped {
+            if empty_since.is_some_and(|started| {
+                now.saturating_duration_since(started) >= GROUP_SCAN_INTERVAL
+            }) {
+                return Ok(());
+            }
+            empty_since.get_or_insert(now);
+        } else {
+            empty_since = None;
+            signal_owned_processes(&processes, libc::SIGKILL)?;
+            if !group.leader_reaped {
+                let _ = try_wait_group_leader(group)?;
+            }
+            reap_direct_terminated(&processes)?;
+        }
+        if now >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!("child process group {pgid} survived SIGKILL"),
+                format!(
+                    "owned child subtree for process group {} survived SIGKILL",
+                    group.anchor.pgid,
+                ),
             ));
         }
         std::thread::sleep(GROUP_SCAN_INTERVAL);
@@ -3349,28 +3462,25 @@ fn terminate_group(group: &mut GroupChild) {
         clear_pending_handoff_signals();
     }
 
-    // The anchor ignores TERM and therefore continues to pin the pgid while
-    // exact pidfds kill every non-anchor member. Never SIGKILL the group as a
-    // whole: that would turn the ownership anchor into a zombie before the
-    // rescan fence completed.
+    // The anchor ignores TERM and therefore continues to pin the pgid. Send
+    // the ordinary group edge first, then reach setsid/session escapes through
+    // exact ancestry-verified pidfds. Never SIGKILL the group as a whole: that
+    // would turn the ownership anchor into a zombie before the rescan fence.
     signal_group(group.anchor.pgid, libc::SIGTERM);
-    if force_reap_group_members(group).is_err() {
+    let cooperative_failed = snapshot_owned_subtree(group)
+        .and_then(|processes| signal_owned_processes(&processes, libc::SIGTERM))
+        .is_err();
+    // Always attempt the exact SIGKILL/reap sweep. A failed cooperative
+    // snapshot must not make the forced anchored path detach its subtree
+    // before fail-closed termination.
+    let force_failed = force_reap_owned_subtree(group).is_err();
+    if cooperative_failed || force_failed {
         fail_closed_child_ownership();
-    }
-    let leader_deadline = Instant::now() + FORCED_GROUP_REAP_BACKSTOP;
-    loop {
-        match group.child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < leader_deadline => {
-                std::thread::sleep(GROUP_SCAN_INTERVAL);
-            }
-            _ => fail_closed_child_ownership(),
-        }
     }
     if release_anchor(&mut group.anchor).is_err() {
         fail_closed_child_ownership();
     }
-    ACTIVE_CHILD_GROUP.store(IDLE, Ordering::SeqCst);
+    group.subtree.finish_reaping();
     group.armed = false;
 }
 
@@ -3378,7 +3488,11 @@ fn finish_group(group: &mut GroupChild) -> io::Result<()> {
     if !group.armed || !group.published {
         fail_closed_child_ownership();
     }
-    finish_anchor(&mut group.anchor)?;
+    begin_group_reaping(&group.anchor);
+    if release_anchor(&mut group.anchor).is_err() {
+        fail_closed_child_ownership();
+    }
+    group.subtree.finish_reaping();
     group.armed = false;
     Ok(())
 }
@@ -3517,10 +3631,9 @@ impl CaptureStreams {
         Ok(())
     }
 
-    /// Drain bytes already queued at the exact point the anchored group
-    /// becomes quiescent, then close any still-open pipe. A remaining writer
-    /// has escaped the owned process group; later output is not ours to wait
-    /// for and cannot hold this invocation hostage.
+    /// Drain bytes already queued at the exact point the complete owned
+    /// subtree reaches its stable-empty fence, then close its pipes. No owned
+    /// writer can still append after that fence.
     fn finish_owned_prefix<O: StdoutObserver>(&mut self, observer: &mut O) -> io::Result<()> {
         if let Some(stdout) = &mut self.stdout {
             let available = pending_pipe_bytes(stdout.as_raw_fd())?;
@@ -3665,43 +3778,48 @@ fn drain_group_capture<O: StdoutObserver>(
     let mut leader_status = None;
     let mut budget = None::<GroupTailBudget>;
     let mut next_group_scan = Instant::now();
-    let mut empty_snapshots = 0;
+    let mut empty_since = None::<Instant>;
 
     loop {
         observer.tick();
         let now = Instant::now();
         if leader_status.is_none() {
-            leader_status = group.child.try_wait()?;
+            leader_status = try_wait_group_leader(group)?;
             if leader_status.is_some() {
                 next_group_scan = now;
             }
         }
 
         if let Some(leader_status) = leader_status.as_ref().filter(|_| now >= next_group_scan) {
-            let members = snapshot_group_members(group)?;
+            let processes = snapshot_owned_subtree(group)?;
+            let members: Vec<_> = processes.iter().map(|process| process.member).collect();
             match &mut budget {
                 Some(budget) => budget.observe(&members),
                 None => budget = Some(GroupTailBudget::start(now, &members)?),
             }
 
             if members.is_empty() {
-                empty_snapshots += 1;
-                if empty_snapshots == 2 {
+                if empty_since.is_some_and(|started| {
+                    now.saturating_duration_since(started) >= GROUP_SCAN_INTERVAL
+                }) {
                     streams.finish_owned_prefix(observer)?;
                     return Ok(GroupCapture {
                         status: *leader_status,
                         streams,
                     });
                 }
+                empty_since.get_or_insert(now);
             } else {
-                empty_snapshots = 0;
+                empty_since = None;
             }
+            reap_direct_terminated(&processes)?;
 
             let budget = budget.as_ref().expect("tail budget initialized");
             if budget.service_exhausted() || budget.wall_exhausted(now) {
-                // Give cooperative teardown one TERM edge before the caller's
-                // exact pidfd-verified SIGKILL sweep.
+                // Give cooperative teardown one group edge and one exact
+                // owned-tree edge before the caller's iterative SIGKILL sweep.
                 signal_group(group.anchor.pgid, libc::SIGTERM);
+                signal_owned_processes(&processes, libc::SIGTERM)?;
                 let cause = if budget.service_exhausted() {
                     "CPU-service budget"
                 } else {
@@ -3710,7 +3828,7 @@ fn drain_group_capture<O: StdoutObserver>(
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!(
-                        "child process group {} exceeded its post-leader {cause}",
+                        "owned child subtree for process group {} exceeded its post-leader {cause}",
                         group.anchor.pgid,
                     ),
                 ));
@@ -4529,6 +4647,51 @@ mod tests {
         );
         enter_cleanup_phase().expect("test enters cleanup phase");
         guard
+    }
+
+    fn child_subreaper_state() -> bool {
+        let mut enabled: libc::c_int = 0;
+        let result = unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut enabled, 0, 0, 0) };
+        assert_eq!(
+            result,
+            0,
+            "query child-subreaper state: {}",
+            io::Error::last_os_error(),
+        );
+        enabled != 0
+    }
+
+    #[test]
+    fn subtree_owner_claim_precedes_process_wide_subreaper_epoch() {
+        let _serial = test_serial_guard();
+        let original_subreaper = child_subreaper_state();
+        let mut first = AnchoredSubtreeOwner::enter().expect("first owner claims the child slot");
+        assert_eq!(active_group_for_test(), SPAWNING);
+
+        let contender = match std::thread::spawn(AnchoredSubtreeOwner::enter)
+            .join()
+            .expect("contending owner thread joins")
+        {
+            Ok(mut unexpected_owner) => {
+                unexpected_owner.abandon_spawning();
+                panic!("a second owner entered the same subreaper epoch");
+            }
+            Err(error) => error,
+        };
+        assert_eq!(contender.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            active_group_for_test(),
+            SPAWNING,
+            "the rejected owner cannot mutate the first owner's slot",
+        );
+
+        first.abandon_spawning();
+        assert_eq!(active_group_for_test(), IDLE);
+        assert_eq!(
+            child_subreaper_state(),
+            original_subreaper,
+            "the sole owner restores the exact process-wide subreaper state",
+        );
     }
 
     #[test]
@@ -5526,43 +5689,225 @@ mod tests {
     }
 
     #[test]
-    fn runner_does_not_wait_for_a_helper_that_escapes_the_group() {
+    fn runner_waits_for_a_setsid_descendant_after_leader_exit() {
         let _serial = test_serial_guard();
         if !std::path::Path::new("/usr/bin/setsid").exists() {
             return;
         }
         let root = tempfile::tempdir().expect("tempdir");
-        let escaped_ready = root.path().join("escaped-ready");
-        let escaped_done = root.path().join("escaped-done");
+        let descendant_pid = root.path().join("setsid.pid");
+        let descendant_ready = root.path().join("setsid.ready");
+        let descendant_release = root.path().join("setsid.release");
+        let descendant_done = root.path().join("setsid.done");
         let guard = install_cleanup_guard();
 
-        let mut command = Command::new("/bin/sh");
-        command
-            .arg("-c")
-            .arg(
-                "/usr/bin/setsid /bin/sh -c \
-                   'printf ready > \"$KTSTR_ESCAPED_READY\"; \
-                    sleep 1; printf done > \"$KTSTR_ESCAPED_DONE\"' \
-                   </dev/null >/dev/null 2>&1 & \
-                 while [ ! -e \"$KTSTR_ESCAPED_READY\" ]; do :; done; \
-                 exit 0",
-            )
-            .env("KTSTR_ESCAPED_READY", &escaped_ready)
-            .env("KTSTR_ESCAPED_DONE", &escaped_done);
-        let started = Instant::now();
-        let status = run_status(command).expect("leader and escaped helper spawn");
-        let elapsed = started.elapsed();
+        let pid_env = descendant_pid.clone();
+        let ready_env = descendant_ready.clone();
+        let release_env = descendant_release.clone();
+        let done_env = descendant_done.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg(
+                    "/usr/bin/setsid /bin/sh -c \
+                       'printf %s \"$$\" > \"$KTSTR_SETSID_PID\"; \
+                        printf ready > \"$KTSTR_SETSID_READY\"; \
+                        while [ ! -e \"$KTSTR_SETSID_RELEASE\" ]; do sleep 0.01; done; \
+                        printf done > \"$KTSTR_SETSID_DONE\"' \
+                       </dev/null >/dev/null 2>&1 & \
+                     while [ ! -e \"$KTSTR_SETSID_READY\" ]; do :; done; \
+                     exit 0",
+                )
+                .env("KTSTR_SETSID_PID", pid_env)
+                .env("KTSTR_SETSID_READY", ready_env)
+                .env("KTSTR_SETSID_RELEASE", release_env)
+                .env("KTSTR_SETSID_DONE", done_env);
+            let _ = result_tx.send(run_status(command));
+        });
 
-        assert!(status.success(), "leader exits successfully");
         assert!(
-            elapsed < Duration::from_millis(500),
-            "escaped helper must not delay runner completion: {elapsed:?}",
+            wait_until(Duration::from_secs(3), || descendant_ready.exists()),
+            "setsid descendant reaches its release barrier",
+        );
+        let pid: libc::pid_t = std::fs::read_to_string(&descendant_pid)
+            .expect("read setsid descendant pid")
+            .parse()
+            .expect("parse setsid descendant pid");
+        let pidfd = test_pidfd_open(pid);
+        assert!(
+            matches!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "runner cannot publish IDLE while a setsid descendant remains",
+        );
+        let contender = match AnchoredSubtreeOwner::enter() {
+            Ok(mut unexpected_owner) => {
+                unexpected_owner.abandon_spawning();
+                panic!("a live setsid descendant did not keep the owner epoch exclusive");
+            }
+            Err(error) => error,
+        };
+        assert_eq!(contender.kind(), io::ErrorKind::WouldBlock);
+
+        std::fs::write(&descendant_release, b"go").expect("release setsid descendant");
+        let status = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("runner returns after setsid descendant exit")
+            .expect("setsid subtree wait succeeds");
+        runner.join().expect("runner joins");
+
+        assert!(status.success(), "leader status is preserved");
+        assert!(
+            descendant_done.exists(),
+            "setsid descendant completed before the runner returned",
         );
         assert!(
-            wait_until(Duration::from_secs(3), || escaped_done.exists()),
-            "escaped helper finishes independently",
+            test_pidfd_exited(&pidfd),
+            "setsid descendant exits before ownership is released",
+        );
+        // SAFETY: signal zero only probes whether this just-reaped pid remains.
+        assert!(
+            (unsafe { libc::kill(pid, 0) }) != 0,
+            "setsid descendant is synchronously reaped",
+        );
+        assert!(
+            startup_direct_children()
+                .expect("enumerate children after setsid wait")
+                .is_empty(),
+            "setsid wait leaves no adopted direct child",
         );
         assert_eq!(active_group_for_test(), IDLE);
+        drop(guard);
+    }
+
+    #[test]
+    fn runner_owns_nested_descendant_after_setsid_intermediate_exits() {
+        let _serial = test_serial_guard();
+        if !std::path::Path::new("/usr/bin/setsid").exists() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("tempdir");
+        let intermediate_script = root.path().join("intermediate.sh");
+        let nested_script = root.path().join("nested.sh");
+        let intermediate_pid = root.path().join("intermediate.pid");
+        let intermediate_ready = root.path().join("intermediate.ready");
+        let intermediate_release = root.path().join("intermediate.release");
+        let nested_pid = root.path().join("nested.pid");
+        let nested_ready = root.path().join("nested.ready");
+        let nested_release = root.path().join("nested.release");
+        let nested_done = root.path().join("nested.done");
+        std::fs::write(
+            &intermediate_script,
+            b"printf %s \"$$\" > \"$KTSTR_INTERMEDIATE_PID\"\n\
+              /bin/sh \"$KTSTR_NESTED_SCRIPT\" &\n\
+              while [ ! -e \"$KTSTR_NESTED_READY\" ]; do sleep 0.01; done\n\
+              printf ready > \"$KTSTR_INTERMEDIATE_READY\"\n\
+              while [ ! -e \"$KTSTR_INTERMEDIATE_RELEASE\" ]; do sleep 0.01; done\n\
+              exit 0\n",
+        )
+        .expect("write setsid intermediate script");
+        std::fs::write(
+            &nested_script,
+            b"printf %s \"$$\" > \"$KTSTR_NESTED_PID\"\n\
+              printf ready > \"$KTSTR_NESTED_READY\"\n\
+              while [ ! -e \"$KTSTR_NESTED_RELEASE\" ]; do sleep 0.01; done\n\
+              printf done > \"$KTSTR_NESTED_DONE\"\n",
+        )
+        .expect("write nested descendant script");
+        let guard = install_cleanup_guard();
+
+        let intermediate_script_env = intermediate_script.clone();
+        let nested_script_env = nested_script.clone();
+        let intermediate_pid_env = intermediate_pid.clone();
+        let intermediate_ready_env = intermediate_ready.clone();
+        let intermediate_release_env = intermediate_release.clone();
+        let nested_pid_env = nested_pid.clone();
+        let nested_ready_env = nested_ready.clone();
+        let nested_release_env = nested_release.clone();
+        let nested_done_env = nested_done.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg(
+                    "/usr/bin/setsid /bin/sh \"$KTSTR_INTERMEDIATE_SCRIPT\" \
+                       </dev/null >/dev/null 2>&1 & \
+                     while [ ! -e \"$KTSTR_INTERMEDIATE_READY\" ]; do :; done; \
+                     exit 0",
+                )
+                .env("KTSTR_INTERMEDIATE_SCRIPT", intermediate_script_env)
+                .env("KTSTR_NESTED_SCRIPT", nested_script_env)
+                .env("KTSTR_INTERMEDIATE_PID", intermediate_pid_env)
+                .env("KTSTR_INTERMEDIATE_READY", intermediate_ready_env)
+                .env("KTSTR_INTERMEDIATE_RELEASE", intermediate_release_env)
+                .env("KTSTR_NESTED_PID", nested_pid_env)
+                .env("KTSTR_NESTED_READY", nested_ready_env)
+                .env("KTSTR_NESTED_RELEASE", nested_release_env)
+                .env("KTSTR_NESTED_DONE", nested_done_env);
+            let _ = result_tx.send(run_status(command));
+        });
+
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                intermediate_ready.exists() && nested_ready.exists()
+            }),
+            "setsid intermediate and nested descendant reach their barriers",
+        );
+        let intermediate: libc::pid_t = std::fs::read_to_string(&intermediate_pid)
+            .expect("read intermediate pid")
+            .parse()
+            .expect("parse intermediate pid");
+        let nested: libc::pid_t = std::fs::read_to_string(&nested_pid)
+            .expect("read nested pid")
+            .parse()
+            .expect("parse nested pid");
+        let intermediate_pidfd = test_pidfd_open(intermediate);
+        let nested_pidfd = test_pidfd_open(nested);
+
+        std::fs::write(&intermediate_release, b"go").expect("release setsid intermediate");
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                // SAFETY: signal zero only probes whether the pinned
+                // intermediate pid remains waitable in this process.
+                test_pidfd_exited(&intermediate_pidfd)
+                    && (unsafe { libc::kill(intermediate, 0) }) != 0
+            }),
+            "the owner reaps the exited setsid intermediate",
+        );
+        assert!(
+            matches!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "the adopted nested descendant keeps ownership active",
+        );
+
+        std::fs::write(&nested_release, b"go").expect("release nested descendant");
+        let status = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("runner returns after nested descendant exit")
+            .expect("nested subtree wait succeeds");
+        runner.join().expect("runner joins");
+
+        assert!(status.success(), "leader status is preserved");
+        assert!(
+            nested_done.exists(),
+            "nested descendant completes before the runner returns",
+        );
+        assert!(
+            test_pidfd_exited(&nested_pidfd),
+            "nested descendant exits before ownership is released",
+        );
+        // SAFETY: signal zero only probes whether this just-reaped pid remains.
+        assert!(
+            (unsafe { libc::kill(nested, 0) }) != 0,
+            "nested descendant is synchronously reaped",
+        );
+        assert_eq!(active_group_for_test(), IDLE);
+        assert!(
+            startup_direct_children()
+                .expect("enumerate children after nested wait")
+                .is_empty(),
+            "nested ownership leaves no adopted direct child",
+        );
         drop(guard);
     }
 
@@ -5938,23 +6283,6 @@ mod tests {
     }
 
     #[test]
-    fn proc_permission_filter_skips_only_unknown_foreign_owners() {
-        let known = HashSet::from([41]);
-        assert!(
-            proc_owner_is_unrelated(42, &known, 2000, 1000),
-            "an unknown foreign process cannot poison a same-euid group scan",
-        );
-        assert!(
-            !proc_owner_is_unrelated(42, &known, 1000, 1000),
-            "same-euid permission denial remains a hard scan error",
-        );
-        assert!(
-            !proc_owner_is_unrelated(41, &known, 2000, 1000),
-            "a known member cannot disappear by changing its effective uid",
-        );
-    }
-
-    #[test]
     fn proc_exit_races_accept_only_enoent_and_esrch_as_gone() {
         assert!(process_gone(&io::Error::from_raw_os_error(libc::ENOENT)));
         assert!(process_gone(&io::Error::from_raw_os_error(libc::ESRCH)));
@@ -5965,6 +6293,22 @@ mod tests {
         assert!(
             !process_gone(&io::Error::from_raw_os_error(libc::EIO)),
             "procfs I/O failures must remain visible",
+        );
+    }
+
+    #[test]
+    fn task_children_deduplicates_and_sorts_the_supplied_task_tree() {
+        let root = tempfile::tempdir().expect("task-tree tempdir");
+        let first = root.path().join("101");
+        let second = root.path().join("202");
+        std::fs::create_dir(&first).expect("create first task");
+        std::fs::create_dir(&second).expect("create second task");
+        std::fs::write(first.join("children"), b"41 7 41\n").expect("write first children file");
+        std::fs::write(second.join("children"), b"19 7\n").expect("write second children file");
+
+        assert_eq!(
+            task_children(root.path()).expect("enumerate supplied task tree"),
+            [7, 19, 41],
         );
     }
 
@@ -5994,7 +6338,7 @@ mod tests {
                 starttime_ticks: 99,
             },
         );
-        assert_eq!(member.pgrp, 77);
+        assert_eq!(member.ppid, 1);
         assert_eq!(member.cpu_ticks, 12);
         assert_eq!(member.state, b'R');
     }
@@ -6078,13 +6422,14 @@ mod tests {
     }
 
     #[test]
-    fn escaped_pipe_holder_cannot_extend_capture_lifetime() {
+    fn capture_waits_for_setsid_pipe_holder_before_returning() {
         let _serial = test_serial_guard();
         if !std::path::Path::new("/usr/bin/setsid").exists() {
             return;
         }
         let root = tempfile::tempdir().expect("tempdir");
         let helper_pid = root.path().join("helper.pid");
+        let helper_ready = root.path().join("helper.ready");
         let helper_done = root.path().join("helper.done");
         let helper_release = root.path().join("helper.release");
         let guard = install_cleanup_guard();
@@ -6093,54 +6438,84 @@ mod tests {
         let release_watchdog = std::thread::spawn(move || {
             if release_waiter.recv_timeout(Duration::from_secs(5)).is_err() {
                 std::fs::write(watchdog_release, b"release")
-                    .expect("watchdog releases escaped helper");
+                    .expect("watchdog releases setsid pipe holder");
             }
         });
-        let mut command = Command::new("/bin/sh");
-        command
-            .arg("-c")
-            .arg(
-                "printf owned-stdout; printf owned-stderr >&2; \
-                 /usr/bin/setsid /bin/sh -c \
-                   'while [ ! -e \"$KTSTR_ESCAPED_RELEASE\" ]; do sleep 0.02; done; \
-                    printf done > \"$KTSTR_ESCAPED_DONE\"' & \
-                 printf '%s' \"$!\" > \"$KTSTR_ESCAPED_PID\"; exit 0",
-            )
-            .env("KTSTR_ESCAPED_PID", &helper_pid)
-            .env("KTSTR_ESCAPED_DONE", &helper_done)
-            .env("KTSTR_ESCAPED_RELEASE", &helper_release);
-        let started = Instant::now();
-        let output = run_output(command).expect("escaped pipe holder is detached");
-        let elapsed = started.elapsed();
+        let pid_env = helper_pid.clone();
+        let ready_env = helper_ready.clone();
+        let done_env = helper_done.clone();
+        let release_env = helper_release.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg(
+                    "printf owned-stdout; printf owned-stderr >&2; \
+                     /usr/bin/setsid /bin/sh -c \
+                       'printf %s \"$$\" > \"$KTSTR_SETSID_PID\"; \
+                        printf ready > \"$KTSTR_SETSID_READY\"; \
+                        while [ ! -e \"$KTSTR_SETSID_RELEASE\" ]; do sleep 0.02; done; \
+                        printf done > \"$KTSTR_SETSID_DONE\"' & \
+                     while [ ! -e \"$KTSTR_SETSID_READY\" ]; do :; done; \
+                     exit 0",
+                )
+                .env("KTSTR_SETSID_PID", pid_env)
+                .env("KTSTR_SETSID_READY", ready_env)
+                .env("KTSTR_SETSID_DONE", done_env)
+                .env("KTSTR_SETSID_RELEASE", release_env);
+            let _ = result_tx.send(run_output(command));
+        });
+
+        assert!(
+            wait_until(Duration::from_secs(3), || helper_ready.exists()),
+            "setsid pipe holder reaches its release barrier",
+        );
+        let pid: libc::pid_t = std::fs::read_to_string(&helper_pid)
+            .expect("read setsid pipe-holder pid")
+            .parse()
+            .expect("parse setsid pipe-holder pid");
+        let pidfd = test_pidfd_open(pid);
+        assert!(
+            matches!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "capture cannot return while an owned setsid writer holds its pipes",
+        );
+
+        std::fs::write(&helper_release, b"release").expect("release setsid pipe holder");
+        let output = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("capture returns after setsid writer exit")
+            .expect("setsid pipe-holder capture succeeds");
+        runner.join().expect("capture runner joins");
+        let _ = cancel_release.send(());
+        release_watchdog.join().expect("release watchdog joins");
 
         assert!(output.status.success());
         assert_eq!(output.stdout, b"owned-stdout");
         assert_eq!(output.stderr, b"owned-stderr");
         assert!(
-            elapsed < Duration::from_secs(3),
-            "setsid pipe holder delayed capture by {elapsed:?}",
+            helper_done.exists(),
+            "setsid pipe holder completes before capture returns",
         );
-        let pid: libc::pid_t = std::fs::read_to_string(&helper_pid)
-            .expect("read escaped helper pid")
-            .parse()
-            .expect("parse escaped helper pid");
-        // SAFETY: signal zero only probes process existence. The helper is
-        // intentionally independent once it leaves the anchored group.
-        assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
-        std::fs::write(&helper_release, b"release").expect("release escaped helper");
-        let _ = cancel_release.send(());
-        release_watchdog.join().expect("release watchdog joins");
         assert!(
-            wait_until(Duration::from_secs(3), || helper_done.exists()),
-            "escaped helper finishes independently after capture returns",
+            test_pidfd_exited(&pidfd),
+            "setsid pipe holder is reaped before capture returns",
+        );
+        // SAFETY: signal zero only probes whether this just-reaped pid remains.
+        assert!(
+            (unsafe { libc::kill(pid, 0) }) != 0,
+            "setsid pipe holder is synchronously reaped",
         );
         assert_eq!(active_group_for_test(), IDLE);
         drop(guard);
     }
 
     #[test]
-    fn cpu_burning_post_leader_group_is_killed_by_service_budget() {
+    fn cpu_burning_post_leader_setsid_subtree_is_killed_by_service_budget() {
         let _serial = test_serial_guard();
+        if !std::path::Path::new("/usr/bin/setsid").exists() {
+            return;
+        }
         let root = tempfile::tempdir().expect("tempdir");
         let child_pid = root.path().join("child.pid");
         let guard = install_cleanup_guard();
@@ -6148,12 +6523,15 @@ mod tests {
         command
             .arg("-c")
             .arg(
-                "/bin/sh -c 'while :; do :; done' & child=$!; \
-                 printf '%s' \"$child\" > \"$KTSTR_IMMORTAL_PID\"; exit 0",
+                "/usr/bin/setsid /bin/sh -c \
+                   'printf %s \"$$\" > \"$KTSTR_IMMORTAL_PID\"; \
+                    while :; do :; done' & \
+                 while [ ! -e \"$KTSTR_IMMORTAL_PID\" ]; do :; done; \
+                 exit 0",
             )
             .env("KTSTR_IMMORTAL_PID", &child_pid);
         let started = Instant::now();
-        let error = run_output(command).expect_err("immortal group tail must fail");
+        let error = run_output(command).expect_err("immortal setsid subtree must fail");
         let elapsed = started.elapsed();
 
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
@@ -6175,7 +6553,7 @@ mod tests {
                 // SAFETY: signal zero only probes process existence.
                 (unsafe { libc::kill(pid, 0) }) != 0
             }),
-            "service-budget teardown reaps the residual child",
+            "service-budget teardown reaps the residual setsid child",
         );
         assert_eq!(active_group_for_test(), IDLE);
         drop(guard);
@@ -6245,6 +6623,7 @@ mod tests {
         if !std::path::Path::new("/usr/bin/setsid").exists() {
             return;
         }
+        let original_subreaper = child_subreaper_state();
         assert!(
             !runner_enabled(),
             "the forced anchored path must not rely on the startup cleanup guard",
@@ -6271,14 +6650,14 @@ mod tests {
         let (pid, pidfd) = state
             .descendant
             .as_ref()
-            .expect("observer pinned the escaped descendant before cancellation");
+            .expect("observer pinned the setsid descendant before cancellation");
         assert!(
             test_pidfd_exited(pidfd),
-            "escaped descendant {pid} must exit before cancellation returns",
+            "setsid descendant {pid} must exit before cancellation returns",
         );
         assert!(
             (unsafe { libc::kill(*pid, 0) }) != 0,
-            "escaped descendant {pid} must be synchronously reaped",
+            "setsid descendant {pid} must be synchronously reaped",
         );
         assert!(
             !state.finished,
@@ -6292,11 +6671,17 @@ mod tests {
                 .is_empty(),
             "anchored cancellation leaves no direct child behind",
         );
+        assert_eq!(
+            child_subreaper_state(),
+            original_subreaper,
+            "cancellation restores the exact process-wide subreaper state",
+        );
     }
 
     #[test]
     fn anchored_observer_reports_subtree_setup_failure_exactly_once() {
         let _serial = test_serial_guard();
+        let original_subreaper = child_subreaper_state();
         assert!(
             !runner_enabled(),
             "the forced anchored path must not rely on the startup cleanup guard",
@@ -6305,6 +6690,8 @@ mod tests {
         blocker_command.arg("-c").arg("exec sleep 300");
         let mut blocker =
             ArmedChild::new(blocker_command.spawn().expect("spawn direct-child blocker"));
+        let blocker_pid = blocker.child().id() as libc::pid_t;
+        let blocker_pidfd = test_pidfd_open(blocker_pid);
         let (observer, state) = RecordingObserver::new(Duration::from_secs(1));
         let command = Command::new("/definitely/not/a/started-command");
 
@@ -6316,6 +6703,23 @@ mod tests {
         assert_eq!(state.failures, [error.to_string()]);
         drop(state);
         assert_eq!(active_group_for_test(), IDLE);
+        assert!(
+            !test_pidfd_exited(&blocker_pidfd),
+            "subtree setup refusal cannot signal or reap the pre-existing child",
+        );
+        assert!(
+            blocker
+                .child_mut()
+                .try_wait()
+                .expect("query direct-child blocker")
+                .is_none(),
+            "the pre-existing child remains live after setup refusal",
+        );
+        assert_eq!(
+            child_subreaper_state(),
+            original_subreaper,
+            "setup refusal restores the exact process-wide subreaper state",
+        );
 
         blocker
             .child_mut()
@@ -6331,6 +6735,7 @@ mod tests {
     #[test]
     fn observed_nonzero_and_spawn_failure_both_finish_ownership() {
         let _serial = test_serial_guard();
+        let original_subreaper = child_subreaper_state();
         let guard = install_cleanup_guard();
 
         let (nonzero_observer, nonzero_state) = RecordingObserver::new(Duration::from_millis(20));
@@ -6345,6 +6750,11 @@ mod tests {
             [Some(7)],
         );
         assert_eq!(active_group_for_test(), IDLE);
+        assert_eq!(
+            child_subreaper_state(),
+            original_subreaper,
+            "successful nonzero exit restores the original subreaper state",
+        );
 
         let (missing_observer, missing_state) = RecordingObserver::new(Duration::from_millis(20));
         let missing = Command::new("/definitely/not/a/ktstr-observed-command");
@@ -6354,6 +6764,11 @@ mod tests {
         assert!(state.finished.is_empty());
         assert_eq!(state.failures, [error.to_string()]);
         assert_eq!(active_group_for_test(), IDLE);
+        assert_eq!(
+            child_subreaper_state(),
+            original_subreaper,
+            "spawn failure restores the original subreaper state",
+        );
         drop(state);
         drop(guard);
     }
