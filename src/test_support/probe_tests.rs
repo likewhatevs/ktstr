@@ -1408,13 +1408,12 @@ fn classify_repro_vm_status_malformed_not_attached_falls_through() {
 // -- render_failure_dump_file -----------------------------------
 //
 // The auto-repro path reads its `{name}-{variant_hash}.repro.failure-dump.json`
-// sidecar back, sniffs the `schema` discriminant to choose
-// between [`FailureDumpReport`] and [`DualFailureDumpReport`],
-// and emits the Display rendering as a tail block. These tests
-// pin every branch of that helper: missing file, both schemas,
-// absent schema (back-compat), unknown schema, malformed JSON.
-// tempfile gives us scratch paths without polluting the working
-// directory or relying on sidecar_dir() machinery.
+// sidecar metadata and emits only its exact path and byte size.
+// The payload remains exclusively in the artifact. These tests pin
+// missing-file handling, schema-independent preservation, and the
+// hard output bound for a synthetic report much larger than the
+// inline diagnostic ceiling. tempfile gives us scratch paths without
+// polluting the working directory or relying on sidecar_dir() machinery.
 
 #[test]
 fn render_failure_dump_file_missing_returns_none() {
@@ -1439,19 +1438,21 @@ fn render_failure_dump_file_single_schema() {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     std::fs::write(tmp.path(), json).expect("write tempfile");
 
-    let rendered = render_failure_dump_file(tmp.path()).expect("single-schema must render Some");
+    let rendered =
+        render_failure_dump_file(tmp.path()).expect("single-schema must render Some");
     assert!(
         rendered.starts_with("--- repro VM failure dump ---"),
         "header missing: {rendered}"
     );
-    // FailureDumpReport's empty Display body is "(empty failure dump)";
-    // pin the substring that the FailureDumpReport's own Display
-    // emits for an empty-but-valid report so we know the body
-    // came from FailureDumpReport::fmt and not a different path.
     assert!(
-        rendered.contains("(empty failure dump)"),
-        "single-schema body must come from FailureDumpReport Display: {rendered}"
+        rendered.contains(&tmp.path().display().to_string()),
+        "summary must point at the exact artifact path: {rendered}"
     );
+    assert_eq!(
+        rendered.lines().count(),
+        MAX_INLINE_FAILURE_DUMP_SUMMARY_LINES
+    );
+    assert!(!rendered.contains("(empty failure dump)"));
 }
 
 #[test]
@@ -1469,56 +1470,111 @@ fn render_failure_dump_file_dual_schema() {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     std::fs::write(tmp.path(), json).expect("write tempfile");
 
-    let rendered = render_failure_dump_file(tmp.path()).expect("dual-schema must render Some");
+    let rendered =
+        render_failure_dump_file(tmp.path()).expect("dual-schema must render Some");
     assert!(
         rendered.starts_with("--- repro VM failure dump ---"),
         "header missing: {rendered}"
     );
     assert!(
-        rendered.contains("DualFailureDumpReport:"),
-        "dual-schema body must come from DualFailureDumpReport Display: {rendered}"
+        rendered.contains(&tmp.path().display().to_string()),
+        "dual-schema summary must point at the exact artifact path: {rendered}"
     );
+    assert!(!rendered.contains("DualFailureDumpReport:"));
 }
 
 #[test]
-fn render_failure_dump_file_absent_schema_returns_none() {
-    // JSON without the `schema` field: the dispatcher at
-    // `FailureDumpReportAny::from_json` requires an explicit
-    // schema discriminant. Per the dispatcher doc, the previous
-    // "absent ⇒ single" fallback was deliberately removed to
-    // avoid silently mis-routing a richer wrapper as a lossy
-    // single shape. So absent-schema JSON returns None — the
-    // helper does not invent a schema choice.
+fn render_failure_dump_file_absent_schema_still_preserves_artifact_pointer() {
+    // The console summary is deliberately schema-agnostic. A malformed
+    // or older artifact is more important to retain and point at than
+    // it is to render inline.
     let json = r#"{"maps":[],"vcpu_regs":[],"sdt_allocations":[]}"#;
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     std::fs::write(tmp.path(), json).expect("write tempfile");
 
-    assert!(
-        render_failure_dump_file(tmp.path()).is_none(),
-        "absent-schema JSON must return None to avoid silent mis-routing"
-    );
+    let rendered =
+        render_failure_dump_file(tmp.path()).expect("existing artifact must summarize");
+    assert!(rendered.contains(&tmp.path().display().to_string()));
 }
 
 #[test]
-fn render_failure_dump_file_unknown_schema_returns_none() {
-    // A schema value the helper doesn't know about (e.g. a
-    // future "triple" wrapper) returns None — the helper does
-    // not silently fall back to single, since that could
-    // mis-render a richer wrapper as the lossy single shape.
+fn render_failure_dump_file_unknown_schema_still_preserves_artifact_pointer() {
     let json = r#"{"schema":"triple","maps":[],"vcpu_regs":[],"sdt_allocations":[]}"#;
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     std::fs::write(tmp.path(), json).expect("write tempfile");
-    assert!(render_failure_dump_file(tmp.path()).is_none());
+    let rendered =
+        render_failure_dump_file(tmp.path()).expect("existing artifact must summarize");
+    assert!(rendered.contains(&tmp.path().display().to_string()));
 }
 
 #[test]
-fn render_failure_dump_file_invalid_json_returns_none() {
-    // Garbage bytes on disk: the initial
-    // `serde_json::from_str::<Value>` call returns Err, and the
-    // helper short-circuits to None without panicking.
+fn render_failure_dump_file_invalid_json_still_preserves_artifact_pointer() {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     std::fs::write(tmp.path(), "not json").expect("write tempfile");
-    assert!(render_failure_dump_file(tmp.path()).is_none());
+    let rendered =
+        render_failure_dump_file(tmp.path()).expect("existing artifact must summarize");
+    assert!(rendered.contains(&tmp.path().display().to_string()));
+}
+
+#[test]
+fn render_failure_dump_file_large_payload_is_strictly_bounded() {
+    use crate::monitor::arena::{ArenaPage, ArenaSnapshot};
+    use crate::monitor::dump::{FailureDumpMap, FailureDumpReport};
+
+    const SENTINEL: &str = "KTSTR_UNBOUNDED_FAILURE_DUMP_SENTINEL";
+    let huge = FailureDumpReport {
+        maps: vec![FailureDumpMap {
+            name: "synthetic_large_arena".to_string(),
+            arena: Some(ArenaSnapshot {
+                pages: vec![ArenaPage {
+                    user_addr: 0,
+                    bytes: vec![255u8; 256 * 1024],
+                }],
+                declared_pages: 1,
+                ..Default::default()
+            }),
+            error: Some(SENTINEL.repeat(4096)),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let json = serde_json::to_vec(&huge).expect("serialize synthetic large report");
+    assert!(
+        json.len() > MAX_INLINE_FAILURE_DUMP_SUMMARY_BYTES,
+        "fixture must be larger than the inline diagnostic ceiling"
+    );
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    std::fs::write(tmp.path(), &json).expect("write tempfile");
+
+    let rendered = render_failure_dump_file(tmp.path()).expect("large report must summarize");
+    assert_eq!(
+        std::fs::read(tmp.path()).expect("read preserved artifact"),
+        json,
+        "rendering the console summary must not modify the forensic artifact"
+    );
+    assert!(
+        rendered.len() <= MAX_INLINE_FAILURE_DUMP_SUMMARY_BYTES,
+        "summary exceeded hard byte ceiling: {} > {}",
+        rendered.len(),
+        MAX_INLINE_FAILURE_DUMP_SUMMARY_BYTES,
+    );
+    assert_eq!(
+        rendered.lines().count(),
+        MAX_INLINE_FAILURE_DUMP_SUMMARY_LINES,
+        "summary exceeded hard line ceiling: {rendered}"
+    );
+    assert!(
+        !rendered.contains(SENTINEL),
+        "forensic payload escaped into stderr: {rendered}"
+    );
+    assert!(
+        rendered.contains(&tmp.path().display().to_string()),
+        "summary omitted the exact artifact path: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("{} bytes", json.len())),
+        "summary omitted the artifact byte size: {rendered}"
+    );
 }
 
 // -- stitch_drop_cause / format_probe_diagnostics events line --

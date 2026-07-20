@@ -154,7 +154,10 @@ jobs:
         uses: actions/upload-artifact@v7.0.0
         with:
           name: failure-dumps-x64-${{ matrix.kernel-version }}-${{ matrix.features || 'base' }}-attempt-${{ github.run_attempt }}
-          path: ${{ env.KTSTR_SIDECAR_DIR }}/*.failure-dump.json
+          path: |
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.failure-dump.json
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.repro.probe-payload.partial.json
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.snapshot.*.json
           if-no-files-found: ignore
           retention-days: 14
       - name: Upload test results to Codecov
@@ -206,7 +209,10 @@ jobs:
         uses: actions/upload-artifact@v7.0.0
         with:
           name: failure-dumps-arm64-${{ matrix.kernel-version }}-${{ matrix.features || 'base' }}-attempt-${{ github.run_attempt }}
-          path: ${{ env.KTSTR_SIDECAR_DIR }}/*.failure-dump.json
+          path: |
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.failure-dump.json
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.repro.probe-payload.partial.json
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.snapshot.*.json
           if-no-files-found: ignore
           retention-days: 14
       - name: Upload test results to Codecov
@@ -331,7 +337,10 @@ jobs:
         uses: actions/upload-artifact@v7.0.0
         with:
           name: failure-dumps-coverage-x64-attempt-${{ github.run_attempt }}
-          path: ${{ env.KTSTR_SIDECAR_DIR }}/*.failure-dump.json
+          path: |
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.failure-dump.json
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.repro.probe-payload.partial.json
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.snapshot.*.json
           if-no-files-found: ignore
           retention-days: 14
       - name: Upload coverage to Codecov
@@ -375,7 +384,10 @@ jobs:
         uses: actions/upload-artifact@v7.0.0
         with:
           name: failure-dumps-coverage-arm64-attempt-${{ github.run_attempt }}
-          path: ${{ env.KTSTR_SIDECAR_DIR }}/*.failure-dump.json
+          path: |
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.failure-dump.json
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.repro.probe-payload.partial.json
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.snapshot.*.json
           if-no-files-found: ignore
           retention-days: 14
       - name: Upload coverage to Codecov

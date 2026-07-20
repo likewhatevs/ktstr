@@ -4,11 +4,16 @@
 use std::path::Path;
 
 const ASSERTION_FILES: &[&str] = &[
-    "cast_analysis_e2e.rs",
-    "failure_dump_e2e.rs",
-    "silent_drop_e2e.rs",
+    "tests/cast_analysis_e2e.rs",
+    "tests/failure_dump_e2e.rs",
+    "tests/silent_drop_e2e.rs",
+];
+const PRODUCTION_FAILURE_OUTPUT_FILES: &[&str] = &[
+    "src/test_support/probe.rs",
 ];
 const FORBIDDEN: &[&str] = &[
+    "{any}",
+    "{report}",
     "{value}",
     "{dump}",
     "{payload}",
@@ -32,23 +37,33 @@ const FORBIDDEN: &[&str] = &[
     "Full rq_scx_states",
     "Full task_enrichments",
 ];
+const PRODUCTION_FORBIDDEN: &[&str] = &[
+    "FailureDumpReportAny::from_json(&json)",
+    "write!(buf, \"{any}\")",
+    "write!(buf, \"{report}\")",
+];
 
 #[test]
 fn failure_dump_assertions_never_embed_unbounded_payloads() {
-    let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut violations = Vec::new();
-    for relative in ASSERTION_FILES {
-        let path = tests_dir.join(relative);
-        let source = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-        for (line_index, line) in source.lines().enumerate() {
-            for forbidden in FORBIDDEN {
-                if line.contains(forbidden) {
-                    violations.push(format!(
-                        "{relative}:{} contains {forbidden:?}: {}",
-                        line_index + 1,
-                        line.trim(),
-                    ));
+    for (files, forbidden_tokens) in [
+        (ASSERTION_FILES, FORBIDDEN),
+        (PRODUCTION_FAILURE_OUTPUT_FILES, PRODUCTION_FORBIDDEN),
+    ] {
+        for relative in files {
+            let path = manifest_dir.join(relative);
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            for (line_index, line) in source.lines().enumerate() {
+                for forbidden in forbidden_tokens {
+                    if line.contains(forbidden) {
+                        violations.push(format!(
+                            "{relative}:{} contains {forbidden:?}: {}",
+                            line_index + 1,
+                            line.trim(),
+                        ));
+                    }
                 }
             }
         }

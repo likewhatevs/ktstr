@@ -278,25 +278,51 @@ fn classify_dmesg_corruption(text: &str) -> Option<&'static str> {
     }
 }
 
-/// Read the repro VM's failure-dump JSON, parse it via
-/// [`crate::monitor::dump::FailureDumpReportAny`], and emit the
-/// Display rendering as a `--- repro VM failure dump ---` tail.
-/// Returns `None` when the file is missing (no freeze fired during
-/// repro), unreadable, or fails to parse — the JSON file itself
-/// stays on disk for any downstream consumer that needs the
-/// structured form. Schema-dispatch logic (single vs dual vs
-/// degraded discriminant; absent or unknown schema rejection) lives
-/// in `FailureDumpReportAny::from_json`; this helper is just the
-/// file-IO + tail-header wrapper.
+/// Render a bounded pointer to the repro VM's failure-dump artifact.
+///
+/// Failure dumps can contain thousands of rendered map entries and
+/// megabytes of arena page bytes. Formatting the parsed report here
+/// duplicates that forensic artifact into nextest's stderr, where one
+/// failure can overwhelm the useful diagnostics from every other test.
+/// The complete JSON is already durable at `path`; keep the inline
+/// surface to its exact path and byte size.
+///
+/// Returns `None` when the file is missing, unreadable, or not a regular
+/// file. The output is two lines and independent of the dump payload
+/// size. Linux limits a successfully-resolved pathname to well below
+/// [`MAX_INLINE_FAILURE_DUMP_SUMMARY_BYTES`]; the overflow branch is a
+/// defensive guard for a future non-Linux caller or an unusual virtual
+/// filesystem.
+const MAX_INLINE_FAILURE_DUMP_SUMMARY_BYTES: usize = 16 * 1024;
+const MAX_INLINE_FAILURE_DUMP_SUMMARY_LINES: usize = 2;
+
 fn render_failure_dump_file(path: &std::path::Path) -> Option<String> {
-    use crate::monitor::dump::FailureDumpReportAny;
-    use std::fmt::Write;
-    let json = std::fs::read_to_string(path).ok()?;
-    let any = FailureDumpReportAny::from_json(&json)?;
-    let mut buf = String::with_capacity(json.len());
-    buf.push_str("--- repro VM failure dump ---\n");
-    let _ = write!(buf, "{any}");
-    Some(buf)
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let summary = format!(
+        "--- repro VM failure dump ---\n\
+         full dump preserved at {} ({} bytes)",
+        path.display(),
+        metadata.len(),
+    );
+    if summary.len() > MAX_INLINE_FAILURE_DUMP_SUMMARY_BYTES
+        || summary.lines().count() > MAX_INLINE_FAILURE_DUMP_SUMMARY_LINES
+    {
+        tracing::warn!(
+            path = %path.display(),
+            bytes = metadata.len(),
+            "auto-repro failure-dump path exceeded the inline diagnostic limit"
+        );
+        return Some(format!(
+            "--- repro VM failure dump ---\n\
+             full dump preserved in KTSTR_SIDECAR_DIR \
+             (path omitted from stderr; {} bytes)",
+            metadata.len(),
+        ));
+    }
+    Some(summary)
 }
 
 /// Prepend "PRIMARY DID NOT REACH WORKLOAD" to a repro VM verdict
@@ -1057,18 +1083,13 @@ fn format_repro_output(
     // with the other tail builders that legitimately return `None`.
     let dmesg_tail = Some(render_dmesg_tail(&repro_result.stderr, REPRO_TAIL_LINES));
 
-    // Inline-render the freeze coordinator's failure-dump JSON when
-    // present. The freeze-coord writes a `FailureDumpReport` /
-    // `DualFailureDumpReport` to `repro_dump_path` if any error-class
-    // SCX exit (or the dual-snapshot half-way trigger) fired during
-    // the repro VM run. Surfacing the Display rendering inline means a
-    // CLI user sees the BPF map state, vCPU regs, and (for dual)
-    // early/late jiffies metadata in the same tail block as the
-    // sched_ext_dump and dmesg — no need to chase the separate
-    // `.repro.failure-dump.json` sibling for the at-a-glance view.
-    let failure_dump_tail = render_failure_dump_file(repro_dump_path);
+    // Point at the freeze coordinator's complete failure-dump JSON
+    // when present. Do not render the parsed report here: map entries
+    // and arena pages are intentionally forensic-sized and belong in
+    // the sidecar artifact, not nextest's stderr.
+    let failure_dump_summary = render_failure_dump_file(repro_dump_path);
 
-    let tails: Vec<String> = [sched_log_tail, dump_tail, failure_dump_tail, dmesg_tail]
+    let tails: Vec<String> = [sched_log_tail, dump_tail, failure_dump_summary, dmesg_tail]
         .into_iter()
         .flatten()
         .collect();
