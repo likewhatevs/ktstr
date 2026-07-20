@@ -13,16 +13,17 @@
 //! ## Two-phase sync mechanism
 //!
 //! Phase A runs on a probe worker thread. Caller and worker
-//! synchronize via two `Latch`es and one mpsc channel:
+//! synchronize via two `Latch`es, one status slot, and one mpsc channel:
 //!
 //! 1. Caller spawns the probe worker, which loads the skeleton and
-//!    attaches kprobes + trigger + kernel fexit, then signals the
-//!    `probes_ready` latch (see `ready.set()` below). The worker
-//!    then enters the ringbuf poll loop.
-//! 2. Caller waits on `probes_ready`. After it fires, the caller
-//!    starts the scheduler — the scheduler launches with Phase A
-//!    probes already attached, so the trigger and any kprobes that
-//!    fire during scheduler init are observed.
+//!    attaches kprobes + trigger + kernel fexit, publishes Phase A's
+//!    success/failure status, then signals the `probes_ready` latch
+//!    (see `publish_phase_a` below). On success the worker enters the
+//!    ringbuf poll loop.
+//! 2. Caller waits on `probes_ready` and reads the published status.
+//!    Only after success does it start the scheduler — the scheduler
+//!    launches with Phase A probes already attached, so the trigger
+//!    and any kprobes that fire during scheduler init are observed.
 //! 3. After the scheduler is up, the caller discovers BPF programs
 //!    by scheduler pid (see `discover_bpf_symbols` /
 //!    `expand_bpf_to_kernel_callers`) and sends a [`PhaseBInput`]
@@ -59,12 +60,13 @@ use crate::sync::{Latch, RwLockExt};
 ///   either still alive (latch never set) or exited via the clean
 ///   `SCX_EXIT_NONE` path.
 /// - `2` ([`SchedExitKind::Crashed`]) — probe armed, BSS latch
-///   observed at `!= 0`. Set by the BPF trace_sched_ext_exit handler
-///   under any non-clean kernel exit (`SCX_EXIT_ERROR`,
-///   `SCX_EXIT_ERROR_STALL`, watchdog kick, BPF-side error).
+///   observed at `!= 0`. Set by the selected typed BPF exit handler
+///   after any successfully claimed non-clean kernel exit
+///   (`SCX_EXIT_ERROR`, `SCX_EXIT_ERROR_STALL`, watchdog kick,
+///   BPF-side error).
 ///
 /// 0 → 1/2 transitions are monotonic for a single test run; once the
-/// kernel emits the exit trace, the latch never clears. Cross-thread
+/// accepted exit path returns, the latch never clears. Cross-thread
 /// observation uses Release / Acquire so the scenario-side load sees
 /// every prior probe-side store.
 pub(crate) static PROBE_SCHED_EXIT_STATE: AtomicU32 = AtomicU32::new(0);
@@ -89,8 +91,8 @@ pub enum SchedExitKind {
     /// cleanly via the `SCX_EXIT_NONE` path that does not latch the
     /// error flag.
     Clean,
-    /// Probe armed AND observed the BSS latch set. Kernel emitted a
-    /// non-clean `trace_sched_ext_exit` event (error, stall,
+    /// Probe armed AND observed the BSS latch set. The probe observed a
+    /// successful non-clean scheduler exit (error, stall,
     /// watchdog kick, BPF-side error) before this read.
     Crashed,
 }
@@ -105,6 +107,137 @@ pub fn sched_exit_kind() -> SchedExitKind {
         PROBE_EXIT_STATE_CRASHED => SchedExitKind::Crashed,
         _ => SchedExitKind::Unknown,
     }
+}
+
+/// Render the useful tail of libbpf's verifier/load log for an early Phase-A
+/// failure.
+///
+/// The complete bounded log remains in `ProbeDiagnostics`; guest init needs a
+/// concise reason before it reboots, otherwise a missing typed-BTF target is
+/// reduced to the opaque outer `ESRCH`. Preserve the final six non-empty
+/// records (where libbpf places the program and target diagnostics), collapse
+/// whitespace, and cap the result so this control error cannot flood stdout.
+fn bounded_libbpf_tail(log: &str) -> String {
+    const MAX_LINES: usize = 6;
+    const MAX_CHARS: usize = 1_000;
+
+    let mut lines: Vec<String> = log
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .rev()
+        .take(MAX_LINES)
+        .collect();
+    lines.reverse();
+    let condensed = lines.join(" | ");
+    if condensed.chars().count() > MAX_CHARS {
+        format!(
+            "…{}",
+            condensed
+                .chars()
+                .rev()
+                .take(MAX_CHARS - 1)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+        )
+    } else {
+        condensed
+    }
+}
+
+/// Kernel-generation-specific typed hook used to observe sched_ext exits.
+///
+/// All programs live in the same BPF object. Userspace selects exactly one
+/// before load so a missing target cannot reject the whole object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchedulerExitTrigger {
+    /// Per-scheduler typed tracepoint emitted after a successful claim.
+    SchedExtExitTracepoint,
+    /// Five-argument per-scheduler exit path used by the preceding generation.
+    ScxVexit,
+    /// Global-era error dump path used by 6.14.
+    ScxDumpState,
+}
+
+impl SchedulerExitTrigger {
+    fn diagnostic_type(self) -> &'static str {
+        match self {
+            Self::SchedExtExitTracepoint => "tp_btf",
+            Self::ScxVexit => "fexit",
+            Self::ScxDumpState => "fentry-global",
+        }
+    }
+
+    fn section(self) -> &'static str {
+        match self {
+            Self::SchedExtExitTracepoint => "tp_btf/sched_ext_exit",
+            Self::ScxVexit => "fexit/scx_vexit",
+            Self::ScxDumpState => "fentry/scx_dump_state",
+        }
+    }
+}
+
+/// Prefer the exact post-claim tracepoint whenever it exists. It has a stable
+/// two-argument ABI while `scx_vexit` gained an `exit_cpu` argument in the
+/// following kernel generation. The five-argument `scx_vexit` function shape
+/// is therefore selected only when the tracepoint is absent, and the
+/// two-argument global-era dump hook is the final fallback.
+fn select_scheduler_exit_trigger(
+    has_sched_ext_exit_tracepoint: bool,
+    has_scx_vexit_5: bool,
+    has_scx_dump_state_2: bool,
+) -> Option<SchedulerExitTrigger> {
+    if has_sched_ext_exit_tracepoint {
+        Some(SchedulerExitTrigger::SchedExtExitTracepoint)
+    } else if has_scx_vexit_5 {
+        Some(SchedulerExitTrigger::ScxVexit)
+    } else if has_scx_dump_state_2 {
+        Some(SchedulerExitTrigger::ScxDumpState)
+    } else {
+        None
+    }
+}
+
+fn btf_has_function_arity(btf: &btf_rs::Btf, name: &str, arity: usize) -> bool {
+    btf.resolve_types_by_name(name).is_ok_and(|types| {
+        types.iter().any(|ty| {
+            let btf_rs::Type::Func(func) = ty else {
+                return false;
+            };
+            matches!(
+                btf.resolve_chained_type(func),
+                Ok(btf_rs::Type::FuncProto(proto)) if proto.parameters.len() == arity
+            )
+        })
+    })
+}
+
+/// `tp_btf/<name>` attachment is keyed by the kernel-generated
+/// `btf_trace_<name>` typedef, not the ordinary tracefs event record.
+///
+/// A typed tracepoint typedef chains to a function pointer. Its prototype has
+/// one hidden tracepoint context parameter followed by the explicit event
+/// arguments; `sched_ext_exit(sch, kind)` therefore has arity three in BTF.
+/// Validate the whole chain so a same-named, non-attachable typedef cannot
+/// select a program that libbpf will reject at load time.
+fn btf_has_typed_tracepoint_arity(btf: &btf_rs::Btf, name: &str, arity: usize) -> bool {
+    let target = format!("btf_trace_{name}");
+    btf.resolve_types_by_name(&target).is_ok_and(|types| {
+        types.iter().any(|ty| {
+            let btf_rs::Type::Typedef(typedef) = ty else {
+                return false;
+            };
+            let Ok(btf_rs::Type::Ptr(ptr)) = btf.resolve_chained_type(typedef) else {
+                return false;
+            };
+            matches!(
+                btf.resolve_chained_type(&ptr),
+                Ok(btf_rs::Type::FuncProto(proto)) if proto.parameters.len() == arity
+            )
+        })
+    })
 }
 
 /// Override the cross-thread exit-state mirror. The probe poll thread
@@ -192,9 +325,10 @@ pub struct ProbeDiagnostics {
     pub events_after_stitch: u32,
     /// Whether the trigger fired.
     pub trigger_fired: bool,
-    /// Which trigger mechanism attached ("tp_btf").
+    /// Which trigger mechanism attached ("tp_btf", "fexit", or
+    /// "fentry-global").
     pub trigger_type: String,
-    /// Error from tp_btf/sched_ext_exit attach failure.
+    /// Error from the selected typed scheduler-exit hook.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_attach_error: Option<String>,
     /// Panic payload from the guest-side probe-collection thread
@@ -234,11 +368,11 @@ pub struct ProbeDiagnostics {
     /// event even though the scheduler did fire.
     pub bpf_ringbuf_drops: u64,
     /// Nanosecond timestamp captured by the BPF trigger handler on
-    /// the first error-class `sched_ext_exit` (from BSS
+    /// the first accepted error-class scheduler exit (from BSS
     /// ktstr_last_trigger_ts). 0 when no error-class exit fired.
     pub bpf_first_trigger_ns: u64,
     /// `kind` argument captured by the BPF trigger handler on the
-    /// first error-class `sched_ext_exit` (from BSS
+    /// first accepted error-class scheduler exit (from BSS
     /// `ktstr_exit_kind_snap`). 0 when no error-class exit fired,
     /// otherwise one of the [`SCX_EXIT_*`](super::scx_defs) values.
     /// Used by the host renderer to disambiguate "trigger fired with
@@ -879,7 +1013,7 @@ fn set_rodata_slot(
 /// Causal-task filter for the trigger event's `task_ptr` (sourced
 /// from `args[0]`).
 ///
-/// The BPF `ktstr_trigger_tp` handler sets `args[0]` to
+/// The BPF `ktstr_trigger_fexit` handler sets `args[0]` to
 /// `bpf_get_current_task()` only for `SCX_EXIT_ERROR_BPF` (where
 /// `current` IS the causal task); for `SCX_EXIT_ERROR` (kworker /
 /// sysrq context) it emits `args[0] == 0`. A zero `task_ptr` means
@@ -900,7 +1034,7 @@ fn causal_tptr(task_ptr: u64) -> Option<u64> {
 /// polls until the trigger fires.
 ///
 /// **Two-phase (`phase_b_rx = Some`):** Phase A attaches kprobes +
-/// kernel fexit + the `tp_btf/sched_ext_exit` trigger before the
+/// kernel fexit + the kernel-selected typed exit trigger before the
 /// scheduler starts, signals `ready`, then polls the ring buffer
 /// while waiting for Phase B input via the channel. When Phase B
 /// input arrives, attaches fentry/fexit to BPF struct_ops callbacks
@@ -909,9 +1043,11 @@ fn causal_tptr(task_ptr: u64) -> Option<u64> {
 /// fires before Phase B input arrives, fentry is skipped — the
 /// crash happened before BPF programs could be probed.
 ///
-/// The trigger fires on `sched_ext_exit` inside `scx_claim_exit()`
-/// — exactly once per scheduler lifetime. If the tracepoint is
-/// unavailable, auto-repro is skipped.
+/// Newest kernels trigger directly after a successful `scx_claim_exit()` via
+/// `tp_btf/sched_ext_exit`; the preceding generation triggers as its
+/// five-argument `scx_vexit()` returns; global-era kernels trigger on their
+/// filtered two-argument `scx_dump_state()` error entry. If no compatible
+/// typed shape is available, auto-repro fails closed before object load.
 ///
 /// Returns accumulated func_names from both phases as the third
 /// tuple element.
@@ -921,6 +1057,7 @@ pub fn run_probe_skeleton(
     stop: &AtomicBool,
     bpf_prog_fds: &std::collections::HashMap<u32, i32>,
     ready: &Latch,
+    phase_a_status: &std::sync::Mutex<Option<Result<(), String>>>,
     phase_b_rx: Option<std::sync::mpsc::Receiver<PhaseBInput>>,
 ) -> (
     Option<Vec<ProbeEvent>>,
@@ -932,6 +1069,17 @@ pub fn run_probe_skeleton(
     use libbpf_rs::{Link, MapCore, MapFlags, RingBufferBuilder};
 
     tracing::debug!(n = functions.len(), "run_probe_skeleton");
+
+    let publish_phase_a = |status: Result<(), String>| {
+        let mut slot = phase_a_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(status);
+        }
+        drop(slot);
+        ready.set();
+    };
 
     let mut diag = ProbeDiagnostics::default();
 
@@ -956,6 +1104,35 @@ pub fn run_probe_skeleton(
         b.clear();
     }
 
+    // Load vmlinux BTF once and use it for both trigger selection and
+    // kprobe metadata below. All trigger programs live in probe.o; every
+    // unselected program must have autoload disabled before libbpf resolves
+    // its attach target.
+    let cached_btf = crate::monitor::btf_offsets::cached_vmlinux_btf();
+    let exit_trigger = cached_btf
+        .as_deref()
+        .and_then(|btf| {
+            select_scheduler_exit_trigger(
+                btf_has_typed_tracepoint_arity(btf, "sched_ext_exit", 3),
+                btf_has_function_arity(btf, "scx_vexit", 5),
+                btf_has_function_arity(btf, "scx_dump_state", 2),
+            )
+        })
+        .ok_or_else(|| {
+            "kernel BTF exposes no compatible typed sched_ext exit target \
+             (`sched_ext_exit`, five-argument `scx_vexit`, or two-argument \
+             `scx_dump_state`)"
+                .to_string()
+        });
+    let exit_trigger = match exit_trigger {
+        Ok(trigger) => trigger,
+        Err(error) => {
+            diag.trigger_attach_error = Some(error.clone());
+            publish_phase_a(Err(error));
+            return (None, diag, Vec::new());
+        }
+    };
+
     // Open skeleton. Two MaybeUninit slots: the first backs the
     // initial load attempt; the second backs the fallback retry when
     // optional programs cause ESRCH. Both must outlive `skel`.
@@ -967,7 +1144,7 @@ pub fn run_probe_skeleton(
         Err(e) => {
             tracing::error!(%e, "probe skeleton open failed");
             diag.trigger_attach_error = Some(format!("skeleton open: {e}"));
-            ready.set();
+            publish_phase_a(Err(format!("probe skeleton open failed: {e}")));
             return (None, diag, Vec::new());
         }
     };
@@ -976,9 +1153,29 @@ pub fn run_probe_skeleton(
     if let Some(rodata) = open_skel.maps.rodata_data.as_mut() {
         rodata.ktstr_enabled = true;
     }
+    match exit_trigger {
+        SchedulerExitTrigger::SchedExtExitTracepoint => {
+            open_skel.progs.ktstr_trigger_fexit.set_autoload(false);
+            open_skel
+                .progs
+                .ktstr_trigger_dump_fentry
+                .set_autoload(false);
+        }
+        SchedulerExitTrigger::ScxVexit => {
+            open_skel.progs.ktstr_trigger_tp.set_autoload(false);
+            open_skel
+                .progs
+                .ktstr_trigger_dump_fentry
+                .set_autoload(false);
+        }
+        SchedulerExitTrigger::ScxDumpState => {
+            open_skel.progs.ktstr_trigger_tp.set_autoload(false);
+            open_skel.progs.ktstr_trigger_fexit.set_autoload(false);
+        }
+    }
 
-    // Load skeleton. Try with all programs first; if a missing tp_btf
-    // target causes ESRCH, re-open with optional programs disabled.
+    // Load skeleton. Try with all programs first; if a missing optional
+    // typed-BTF target causes ESRCH, re-open with optional programs disabled.
     // The fallback unconditionally fires on any load error, not
     // strictly ESRCH — libbpf doesn't surface a stable errno through
     // its Error type, so an exact ESRCH match is brittle. The retry
@@ -1004,16 +1201,41 @@ pub fn run_probe_skeleton(
                     diag.trigger_attach_error = Some(format!(
                         "skeleton open (retry): {e}; original load error: {first_err}"
                     ));
-                    ready.set();
+                    publish_phase_a(Err(format!(
+                        "probe skeleton re-open failed: {e}; original load error: {first_err}"
+                    )));
                     return (None, diag, Vec::new());
                 }
             };
             if let Some(rodata) = open_skel2.maps.rodata_data.as_mut() {
                 rodata.ktstr_enabled = true;
             }
+            match exit_trigger {
+                SchedulerExitTrigger::SchedExtExitTracepoint => {
+                    open_skel2.progs.ktstr_trigger_fexit.set_autoload(false);
+                    open_skel2
+                        .progs
+                        .ktstr_trigger_dump_fentry
+                        .set_autoload(false);
+                }
+                SchedulerExitTrigger::ScxVexit => {
+                    open_skel2.progs.ktstr_trigger_tp.set_autoload(false);
+                    open_skel2
+                        .progs
+                        .ktstr_trigger_dump_fentry
+                        .set_autoload(false);
+                }
+                SchedulerExitTrigger::ScxDumpState => {
+                    open_skel2.progs.ktstr_trigger_tp.set_autoload(false);
+                    open_skel2.progs.ktstr_trigger_fexit.set_autoload(false);
+                }
+            }
             open_skel2.progs.ktstr_pi_fentry.set_autoload(false);
             open_skel2.progs.ktstr_pi_fexit.set_autoload(false);
             open_skel2.progs.ktstr_lock_contend.set_autoload(false);
+            open_skel2.progs.ktstr_tl_switch.set_autoload(false);
+            open_skel2.progs.ktstr_tl_migrate.set_autoload(false);
+            open_skel2.progs.ktstr_tl_wakeup.set_autoload(false);
             open_skel2
                 .progs
                 .ktstr_preempt_disable_tp
@@ -1044,7 +1266,12 @@ pub fn run_probe_skeleton(
                         "skeleton load (retry): {e}; original error before retry: {first_err}; \
                          LIBBPF-LOG>>>\n{libbpf_log}\n<<<LIBBPF-LOG"
                     ));
-                    ready.set();
+                    let libbpf_tail = bounded_libbpf_tail(&libbpf_log);
+                    publish_phase_a(Err(format!(
+                        "probe skeleton load failed after minimal retry: {e}; \
+                         original load error: {first_err}; \
+                         libbpf tail: {libbpf_tail}"
+                    )));
                     return (None, diag, Vec::new());
                 }
             }
@@ -1069,8 +1296,6 @@ pub fn run_probe_skeleton(
     // process-wide so repeated auto-repro cycles in the same nextest
     // process share one `Arc<Btf>` instead of re-reading and
     // re-parsing the multi-MB blob each time.
-    let cached_btf = crate::monitor::btf_offsets::cached_vmlinux_btf();
-
     for (idx, func) in functions.iter().enumerate() {
         if func.is_bpf {
             bpf_funcs.push((idx as u32, func));
@@ -1127,7 +1352,7 @@ pub fn run_probe_skeleton(
         tracing::warn!("no kprobe IPs resolved and no BPF functions for fentry");
         diag.trigger_attach_error =
             Some("no functions resolved — kprobes and trigger skipped".to_string());
-        ready.set();
+        publish_phase_a(Err("no probe functions resolved during Phase A".to_string()));
         return (None, diag, Vec::new());
     }
     if func_ips.is_empty() && (phase_b_rx.is_some() || !bpf_funcs.is_empty()) {
@@ -1604,36 +1829,53 @@ pub fn run_probe_skeleton(
         );
     }
 
-    // Attach trigger: tp_btf/sched_ext_exit fires inside
-    // scx_claim_exit() in the context of the current task at exit time.
-    match skel.progs.ktstr_trigger_tp.attach_trace() {
+    // Attach the sole program selected before load. The newest tracepoint is
+    // emitted only for a successful claim, the modern return hook rejects
+    // losing concurrent claims, and the global-era entry hook rechecks
+    // scx_exit_info.kind to reject the SysRq-D caller.
+    let trigger_attach = match exit_trigger {
+        SchedulerExitTrigger::SchedExtExitTracepoint => skel.progs.ktstr_trigger_tp.attach_trace(),
+        SchedulerExitTrigger::ScxVexit => skel.progs.ktstr_trigger_fexit.attach_trace(),
+        SchedulerExitTrigger::ScxDumpState => skel.progs.ktstr_trigger_dump_fentry.attach_trace(),
+    };
+    match trigger_attach {
         Ok(link) => {
-            tracing::debug!("trigger attached via tp_btf/sched_ext_exit");
-            diag.trigger_type = "tp_btf".to_string();
-            links.push((link, "tp_btf/sched_ext_exit".to_string()));
+            tracing::debug!(
+                trigger = exit_trigger.section(),
+                "scheduler-exit trigger attached"
+            );
+            diag.trigger_type = exit_trigger.diagnostic_type().to_string();
+            links.push((link, exit_trigger.section().to_string()));
         }
         Err(e) => {
-            let msg = format!("auto-repro requires kernel with sched_ext_exit tracepoint: {e}");
+            let msg = format!(
+                "auto-repro could not attach selected scheduler-exit trigger {}: {e}",
+                exit_trigger.section()
+            );
             tracing::error!(%msg, "trigger attach failed");
-            diag.trigger_attach_error = Some(msg);
-            ready.set();
+            diag.trigger_attach_error = Some(msg.clone());
+            publish_phase_a(Err(format!(
+                "probe trigger attach failed during Phase A: {msg}"
+            )));
             return (None, diag, Vec::new());
         }
     }
 
     // Attach timeline programs (loaded by the skeleton but not
     // auto-attached — they need explicit attach_trace calls).
-    match skel.progs.ktstr_tl_switch.attach_trace() {
-        Ok(link) => links.push((link, "tp_btf/sched_switch".to_string())),
-        Err(e) => tracing::warn!(%e, "timeline sched_switch attach failed"),
-    }
-    match skel.progs.ktstr_tl_migrate.attach_trace() {
-        Ok(link) => links.push((link, "tp_btf/sched_migrate_task".to_string())),
-        Err(e) => tracing::warn!(%e, "timeline sched_migrate_task attach failed"),
-    }
-    match skel.progs.ktstr_tl_wakeup.attach_trace() {
-        Ok(link) => links.push((link, "tp_btf/sched_wakeup".to_string())),
-        Err(e) => tracing::warn!(%e, "timeline sched_wakeup attach failed"),
+    if optional_programs_loaded {
+        match skel.progs.ktstr_tl_switch.attach_trace() {
+            Ok(link) => links.push((link, "tp_btf/sched_switch".to_string())),
+            Err(e) => tracing::warn!(%e, "timeline sched_switch attach failed"),
+        }
+        match skel.progs.ktstr_tl_migrate.attach_trace() {
+            Ok(link) => links.push((link, "tp_btf/sched_migrate_task".to_string())),
+            Err(e) => tracing::warn!(%e, "timeline sched_migrate_task attach failed"),
+        }
+        match skel.progs.ktstr_tl_wakeup.attach_trace() {
+            Ok(link) => links.push((link, "tp_btf/sched_wakeup".to_string())),
+            Err(e) => tracing::warn!(%e, "timeline sched_wakeup attach failed"),
+        }
     }
 
     // Attach optional programs. When the first load succeeded (all
@@ -1715,7 +1957,9 @@ pub fn run_probe_skeleton(
         0
     }) {
         tracing::error!(%e, "failed to register ring buffer callback");
-        ready.set();
+        let error = format!("probe ring-buffer callback registration failed: {e}");
+        diag.trigger_attach_error = Some(error.clone());
+        publish_phase_a(Err(error));
         return (None, diag, Vec::new());
     }
 
@@ -1723,7 +1967,9 @@ pub fn run_probe_skeleton(
         Ok(rb) => rb,
         Err(e) => {
             tracing::error!(%e, "failed to build ring buffer");
-            ready.set();
+            let error = format!("probe ring-buffer build failed: {e}");
+            diag.trigger_attach_error = Some(error.clone());
+            publish_phase_a(Err(error));
             return (None, diag, Vec::new());
         }
     };
@@ -1743,7 +1989,7 @@ pub fn run_probe_skeleton(
     // Signal Phase A probes attached (kprobes + kernel fexit +
     // trigger). When phase_b_rx is None, this means all probes.
     // When Some, BPF fentry is deferred to Phase B.
-    ready.set();
+    publish_phase_a(Ok(()));
 
     // Phase B: receive BPF fentry targets and attach them while
     // polling the ring buffer. The channel is consumed once; after
@@ -2130,7 +2376,7 @@ pub fn run_probe_skeleton(
             // filter events to those referencing the same task_struct
             // pointer as the causal task.
             //
-            // The args[0] assignment in ktstr_trigger_tp (the BPF
+            // The args[0] assignment in ktstr_trigger_fexit (the BPF
             // trigger handler) sets args[0] to
             // bpf_get_current_task() ONLY for
             // SCX_EXIT_ERROR_BPF (1025), where a BPF scheduler

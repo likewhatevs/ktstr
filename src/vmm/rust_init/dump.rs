@@ -1101,6 +1101,12 @@ static BPF_MAP_WRITE_DONE_LATCH: OnceLock<Arc<Latch>> = OnceLock::new();
 /// [`BPF_MAP_WRITE_DONE_LATCH`].
 static ACCESSOR_READY_LATCH: OnceLock<Arc<Latch>> = OnceLock::new();
 
+/// Shared `probe_dump_ready` latch. The host fires this only after the
+/// exact failure-dump decoder has read the probe's complete per-CPU
+/// counter slab. An opt-in guest waits on it before scheduler launch,
+/// keeping scheduler-relative fault timers behind diagnostic readiness.
+static PROBE_DUMP_READY_LATCH: OnceLock<Arc<Latch>> = OnceLock::new();
+
 /// Lazily materialise and return the shared `bpf_map_write_done`
 /// latch. Both the producer (`hvc0_poll_loop`) and consumer (scenario
 /// `wait_for_map_write` gate) reach for this — the first caller
@@ -1119,6 +1125,15 @@ pub(crate) fn bpf_map_write_done_latch() -> Arc<Latch> {
 /// observes the same instance. Mirrors [`bpf_map_write_done_latch`].
 pub(crate) fn accessor_ready_latch() -> Arc<Latch> {
     ACCESSOR_READY_LATCH
+        .get_or_init(|| Arc::new(Latch::new()))
+        .clone()
+}
+
+/// Lazily materialise and return the shared `probe_dump_ready` latch.
+/// The producer is [`hvc0_poll_loop`] on `SIGNAL_PROBE_DUMP_READY`; the
+/// consumer is the opt-in pre-scheduler gate in guest init.
+pub(crate) fn probe_dump_ready_latch() -> Arc<Latch> {
+    PROBE_DUMP_READY_LATCH
         .get_or_init(|| Arc::new(Latch::new()))
         .clone()
 }
@@ -1433,6 +1448,9 @@ fn hvc0_poll_loop(
                 }
                 HvcControlEvent::Signal(crate::vmm::virtio_console::SIGNAL_ACCESSOR_READY) => {
                     accessor_ready_latch().set();
+                }
+                HvcControlEvent::Signal(crate::vmm::virtio_console::SIGNAL_PROBE_DUMP_READY) => {
+                    probe_dump_ready_latch().set();
                 }
                 HvcControlEvent::Signal(crate::vmm::virtio_console::SIGNAL_PERIODIC_READY) => {
                     periodic_prereqs_ready_latch().set();
@@ -1961,7 +1979,8 @@ pub(crate) fn sched_exit_poll_timeout(
 ///     port (`dump_sched_output_before_terminal`); true (probes active)
 ///     instead waits on the probe thread's `output_done` latch — keeping the
 ///     VM alive until the probe has emitted its payload — and skips the dump
-///     (the probe pipeline handles crash detection via tp_btf/sched_ext_exit).
+///     (the probe pipeline handles crash detection via its
+///     kernel-selected typed scheduler-exit trigger).
 ///   - the SCHED_EXIT signal (MSG_TYPE_SCHED_EXIT, which lets the host
 ///     terminate the VM early) is then sent UNLESS the `stop` flag is set
 ///     (a host-initiated kill, where the exit is expected). It is gated by
@@ -3837,6 +3856,7 @@ mod tests {
             crate::vmm::virtio_console::SIGNAL_VC_DUMP,
             crate::vmm::virtio_console::SIGNAL_BPF_WRITE_DONE,
             crate::vmm::virtio_console::SIGNAL_ACCESSOR_READY,
+            crate::vmm::virtio_console::SIGNAL_PROBE_DUMP_READY,
             crate::vmm::virtio_console::SIGNAL_PERIODIC_READY,
             crate::vmm::virtio_console::SIGNAL_WPROF_ARTIFACTS_RECEIVED,
             crate::vmm::virtio_console::SIGNAL_VC_SHUTDOWN,
@@ -3876,6 +3896,7 @@ mod tests {
             crate::vmm::virtio_console::SIGNAL_VC_DUMP,
             crate::vmm::virtio_console::SIGNAL_BPF_WRITE_DONE,
             crate::vmm::virtio_console::SIGNAL_ACCESSOR_READY,
+            crate::vmm::virtio_console::SIGNAL_PROBE_DUMP_READY,
             crate::vmm::virtio_console::SIGNAL_PERIODIC_READY,
             crate::vmm::virtio_console::SIGNAL_WPROF_ARTIFACTS_RECEIVED,
             crate::vmm::virtio_console::SIGNAL_VC_SHUTDOWN,

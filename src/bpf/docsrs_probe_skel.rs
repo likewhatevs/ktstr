@@ -103,6 +103,8 @@ mod imp {
     pub struct OpenProbeProgs<'obj> {
         pub ktstr_probe: libbpf_rs::OpenProgramMut<'obj>,
         pub ktstr_trigger_tp: libbpf_rs::OpenProgramMut<'obj>,
+        pub ktstr_trigger_fexit: libbpf_rs::OpenProgramMut<'obj>,
+        pub ktstr_trigger_dump_fentry: libbpf_rs::OpenProgramMut<'obj>,
         pub ktstr_tl_switch: libbpf_rs::OpenProgramMut<'obj>,
         pub ktstr_tl_migrate: libbpf_rs::OpenProgramMut<'obj>,
         pub ktstr_tl_wakeup: libbpf_rs::OpenProgramMut<'obj>,
@@ -145,6 +147,8 @@ mod imp {
     pub struct ProbeProgs<'obj> {
         pub ktstr_probe: libbpf_rs::ProgramMut<'obj>,
         pub ktstr_trigger_tp: libbpf_rs::ProgramMut<'obj>,
+        pub ktstr_trigger_fexit: libbpf_rs::ProgramMut<'obj>,
+        pub ktstr_trigger_dump_fentry: libbpf_rs::ProgramMut<'obj>,
         pub ktstr_tl_switch: libbpf_rs::ProgramMut<'obj>,
         pub ktstr_tl_migrate: libbpf_rs::ProgramMut<'obj>,
         pub ktstr_tl_wakeup: libbpf_rs::ProgramMut<'obj>,
@@ -158,6 +162,8 @@ mod imp {
     pub struct ProbeLinks {
         pub ktstr_probe: Option<libbpf_rs::Link>,
         pub ktstr_trigger_tp: Option<libbpf_rs::Link>,
+        pub ktstr_trigger_fexit: Option<libbpf_rs::Link>,
+        pub ktstr_trigger_dump_fentry: Option<libbpf_rs::Link>,
         pub ktstr_tl_switch: Option<libbpf_rs::Link>,
         pub ktstr_tl_migrate: Option<libbpf_rs::Link>,
         pub ktstr_tl_wakeup: Option<libbpf_rs::Link>,

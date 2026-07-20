@@ -936,9 +936,10 @@ pub struct ProbeBssCounters {
     /// `KTSTR_PCPU_PREEMPT_ENABLE_COUNT` summed across CPUs —
     /// `tp_btf/preempt_enable` outermost-transition fires.
     pub preempt_enable_count: u64,
-    /// `KTSTR_PCPU_TRIGGER_COUNT` summed across CPUs — every
-    /// `tp_btf/sched_ext_exit` fire (including non-error
-    /// kinds like DONE / UNREG, not just error-class exits).
+    /// `KTSTR_PCPU_TRIGGER_COUNT` summed across CPUs — every accepted
+    /// selected typed trigger fire. The modern `scx_vexit` program
+    /// also counts non-error kinds like DONE / UNREG; the global-era
+    /// `scx_dump_state` program counts only error-class entries.
     pub trigger_count: u64,
 }
 
@@ -1295,7 +1296,7 @@ pub struct FailureDumpReport {
     /// resolve.
     ///
     /// A populated `trigger_count > 0` is the structural signal
-    /// that the BPF tp_btf/sched_ext_exit handler fired during
+    /// that the selected BPF scheduler-exit handler fired during
     /// the run — distinct from the boolean `trigger_fired` flag
     /// in `super::probe::process::ProbeDiagnostics` (which
     /// also records host-side observations like a watchdog
@@ -2373,8 +2374,8 @@ pub struct CrossBtfFwdIndex<'a> {
 ///
 /// Used as a fallback by [`dump_state`] when
 /// [`super::scx_walker::read_scx_sched_state`] returned `None`
-/// because `*scx_root == 0` at freeze time. The probe's tp_btf
-/// handler captured the same scalars BEFORE the kernel teardown
+/// because `*scx_root == 0` at freeze time. The probe's selected typed
+/// scheduler-exit handler captured the same scalars BEFORE kernel teardown
 /// nulled `scx_root`, so this path produces a coherent view of
 /// what the scheduler looked like AT THE INSTANT IT ERRORED OUT —
 /// which is exactly the state an operator wants to debug.
@@ -2541,6 +2542,23 @@ fn decode_probe_counters_snapshot(
     })
 }
 
+/// Return whether the exact probe-counter failure-dump read path is
+/// fully usable.
+///
+/// This intentionally calls [`decode_probe_counters_snapshot`] rather
+/// than duplicating a shallower map/BTF probe. A true result therefore
+/// proves accessor adoption, `probe_bp.bss` discovery, split-BTF
+/// parsing, `ktstr_pcpu_counters` offset resolution, and the same full
+/// 480-KiB slab read the eventual dump performs. Counter values may
+/// still be zero before workload execution; this edge describes
+/// decodability, not activity.
+pub(crate) fn probe_counters_snapshot_ready(
+    accessor: &GuestMemMapAccessor<'_>,
+    base_btf: &Btf,
+) -> bool {
+    decode_probe_counters_snapshot(accessor, base_btf).is_some()
+}
+
 fn decode_probe_sched_state_snapshot(
     accessor: &GuestMemMapAccessor<'_>,
     base_btf: &Btf,
@@ -2606,7 +2624,7 @@ fn decode_probe_sched_state_snapshot(
     let kind = u32::from_le_bytes(kind_bytes.as_slice().try_into().ok()?);
 
     // The snapshot is sticky: `ktstr_exit_kind_snap` stays at 0
-    // until the BPF tp_btf handler latches an error-class exit. A
+    // until the selected BPF handler latches an error-class exit. A
     // 0 here means the latch never fired — the snapshot vars are
     // all at their initial 0/false defaults and the dump should
     // honour `*scx_root == 0` as "no scheduler state to surface"
@@ -2634,9 +2652,9 @@ fn decode_probe_sched_state_snapshot(
         watchdog_timeout: Some(watchdog_timeout),
         source: Some(super::scx_walker::SCX_SCHED_STATE_SOURCE_BSS.to_string()),
         // `sched_kva == 0` would mean the BPF probe handler ran
-        // BEFORE `*scx_root` was populated (impossibly early — the
-        // tp_btf hook is on `sched_ext_exit`, which only fires after
-        // a sched_ext scheduler attached and ran). Surface it as
+        // BEFORE a scheduler identity was available. The tracepoint and
+        // fexit shapes always carry `sch`; the global-era dump shape has no
+        // per-scheduler object and intentionally leaves this zero. Surface it as
         // None so the consumer can distinguish "snapshot data exists
         // but no slab address" from "snapshot has the address" via
         // a single Option rather than a magic-zero check.
@@ -2840,8 +2858,8 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                         // Live read failed — `*scx_root == 0` because
                         // the scheduler has already torn down by
                         // freeze time. Fall back to the BPF .bss
-                        // snapshot the probe's tp_btf handler latched
-                        // at err-exit time. The snapshot is the
+                        // snapshot the probe's selected typed handler latched
+                        // at error-exit time. The snapshot is the
                         // strict subset of scheduler state the host
                         // renderer needs; the sched_pa stays None
                         // because the slab page that backed the live

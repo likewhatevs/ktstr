@@ -2169,6 +2169,30 @@ pub struct KtstrTestEntry {
     /// callback (counter increment, file open) should pick exactly
     /// one slot.
     pub post_vm_unconditional: Option<super::PostVmCallback>,
+    /// Gate boot-time scheduler launch on full probe-counter dump
+    /// readiness.
+    ///
+    /// When true, the primary runtime adds
+    /// `KTSTR_AWAIT_PROBE_DUMP_READY=1` to the guest cmdline. Guest
+    /// args also request the minimal diagnostic probe needed to
+    /// materialize the counter map. Guest init then waits before
+    /// spawning the scheduler until the host
+    /// freeze coordinator has used the real failure-dump decoder to
+    /// discover `probe_bp.bss`, parse its split BTF, resolve the
+    /// `ktstr_pcpu_counters` offset, and read the complete per-CPU
+    /// counter slab. This is stronger than
+    /// [`crate::scenario::ops::await_accessor_ready`], which only
+    /// proves accessor adoption and runs after scheduler launch.
+    ///
+    /// Auto-repro does not inherit this primary-only gate: stall
+    /// auto-repro deliberately skips probe attachment and therefore
+    /// cannot satisfy it.
+    ///
+    /// The gate is intended for diagnostic tests whose scheduler
+    /// arguments trigger a failure relative to process startup (for
+    /// example `--stall-after=1`). `false` (the default) adds no host
+    /// decode work and no guest wait.
+    pub probe_dump_ready_gate: bool,
     /// Periodic snapshot count: when non-zero, the freeze
     /// coordinator divides the 10 %–90 % slice of the capturable
     /// window into `num_snapshots + 1` equal intervals and fires a
@@ -2396,6 +2420,7 @@ impl KtstrTestEntry {
         networks: &[],
         post_vm: None,
         post_vm_unconditional: None,
+        probe_dump_ready_gate: false,
         num_snapshots: 0,
         workload_root_cgroup: None,
         kaslr: true,
@@ -6555,6 +6580,10 @@ mod tests {
         assert_eq!(from_trait.config_content, from_const.config_content);
         assert!(from_trait.disk.is_none() && from_const.disk.is_none());
         assert!(from_trait.post_vm.is_none() && from_const.post_vm.is_none());
+        assert_eq!(
+            from_trait.probe_dump_ready_gate,
+            from_const.probe_dump_ready_gate
+        );
         assert_eq!(from_trait.num_snapshots, from_const.num_snapshots);
         // `assert` field lock-step: Assert does not derive PartialEq,
         // so compare via `format_human()` (renders every

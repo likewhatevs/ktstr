@@ -299,6 +299,18 @@ pub enum MsgType {
     /// scheduler before the instrumentation needed to observe that crash is
     /// live. Coordinator-internal: carries no test verdict.
     BpfMapWriteReady,
+    /// Guest→host boundary for a finite prerequisite/readiness wait.
+    ///
+    /// Payload is the fixed-size [`ReadinessWaitEvent`] encoding. A
+    /// generation-tagged `Started` event transfers ordinary watchdog
+    /// progress ownership to that finite wait immediately before the guest
+    /// blocks; the matching `Finished` event returns ownership after
+    /// readiness or failure. The watchdog policy is deliberately independent
+    /// of [`ReadinessWaitKind`].
+    ///
+    /// Coordinator-internal: carries accounting control only, never a test
+    /// verdict.
+    ReadinessWait,
     /// Guest→host scheduler-swap notification (payload: empty).
     ///
     /// Emitted by the guest's `kill_current_scheduler`
@@ -357,6 +369,7 @@ impl MsgType {
             MsgType::KernelOpReply => MSG_TYPE_KERNEL_OP_REPLY,
             MsgType::SysRdy => MSG_TYPE_SYS_RDY,
             MsgType::BpfMapWriteReady => MSG_TYPE_BPF_MAP_WRITE_READY,
+            MsgType::ReadinessWait => MSG_TYPE_READINESS_WAIT,
             MsgType::SchedSwapNotify => MSG_TYPE_SCHED_SWAP_NOTIFY,
             MsgType::AttachAttempt => MSG_TYPE_ATTACH_ATTEMPT,
             MsgType::Stdout => MSG_TYPE_STDOUT,
@@ -400,6 +413,7 @@ impl MsgType {
             MSG_TYPE_KERNEL_OP_REPLY => Some(MsgType::KernelOpReply),
             MSG_TYPE_SYS_RDY => Some(MsgType::SysRdy),
             MSG_TYPE_BPF_MAP_WRITE_READY => Some(MsgType::BpfMapWriteReady),
+            MSG_TYPE_READINESS_WAIT => Some(MsgType::ReadinessWait),
             MSG_TYPE_SCHED_SWAP_NOTIFY => Some(MsgType::SchedSwapNotify),
             MSG_TYPE_ATTACH_ATTEMPT => Some(MsgType::AttachAttempt),
             MSG_TYPE_STDOUT => Some(MsgType::Stdout),
@@ -454,6 +468,8 @@ impl MsgType {
     ///     verdict.
     ///   - [`MsgType::BpfMapWriteReady`] — releases the configured
     ///     host-side map writer after guest instrumentation is armed.
+    ///   - [`MsgType::ReadinessWait`] — opens or closes the generic finite
+    ///     guest-prerequisite watchdog overlay.
     ///   - [`MsgType::AttachAttempt`] — opens or closes the
     ///     generation-tagged host scheduler-attach watchdog overlay; carries
     ///     accounting control only, never a test verdict.
@@ -468,9 +484,116 @@ impl MsgType {
                 | MsgType::TeardownBarrierAck
                 | MsgType::SysRdy
                 | MsgType::BpfMapWriteReady
+                | MsgType::ReadinessWait
                 | MsgType::SchedSwapNotify
                 | MsgType::AttachAttempt
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Finite guest prerequisite/readiness-wait protocol
+// ---------------------------------------------------------------------------
+
+/// Version byte in the fixed-size [`ReadinessWaitEvent`] payload.
+pub const READINESS_WAIT_WIRE_VERSION: u8 = 1;
+
+/// Fixed payload size for [`ReadinessWaitEvent`]:
+/// `version:u8, transition:u8, kind:u8, reserved:u8, generation:u64_le`.
+pub const READINESS_WAIT_PAYLOAD_SIZE: usize = 12;
+
+/// Diagnostic identity of a finite guest prerequisite.
+///
+/// The host watchdog does not branch on this value: every kind uses the same
+/// explicit finite-wait ownership policy. The kind exists so the host can
+/// close the matching wait when it publishes readiness and so diagnostics
+/// identify the prerequisite that owned progress.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum ReadinessWaitKind {
+    ProbeDump,
+}
+
+impl ReadinessWaitKind {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::ProbeDump => 1,
+        }
+    }
+
+    pub const fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::ProbeDump),
+            _ => None,
+        }
+    }
+}
+
+/// Boundary represented by one [`ReadinessWaitEvent`].
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum ReadinessWaitTransition {
+    Started,
+    Finished,
+}
+
+impl ReadinessWaitTransition {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::Started => 1,
+            Self::Finished => 2,
+        }
+    }
+
+    pub const fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Started),
+            2 => Some(Self::Finished),
+            _ => None,
+        }
+    }
+}
+
+/// One generation-tagged finite guest prerequisite boundary.
+///
+/// A generation is non-zero and monotonically allocated by the guest.
+/// Matching the finish prevents a delayed duplicate from closing a newer wait.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct ReadinessWaitEvent {
+    pub transition: ReadinessWaitTransition,
+    pub kind: ReadinessWaitKind,
+    pub generation: u64,
+}
+
+impl ReadinessWaitEvent {
+    pub fn to_payload(self) -> [u8; READINESS_WAIT_PAYLOAD_SIZE] {
+        let mut payload = [0u8; READINESS_WAIT_PAYLOAD_SIZE];
+        payload[0] = READINESS_WAIT_WIRE_VERSION;
+        payload[1] = self.transition.wire_value();
+        payload[2] = self.kind.wire_value();
+        payload[4..12].copy_from_slice(&self.generation.to_le_bytes());
+        payload
+    }
+
+    /// Decode an exact canonical payload. Unknown versions/discriminants,
+    /// non-zero reserved data, zero generations, and size mismatches are
+    /// rejected.
+    pub fn from_payload(payload: &[u8]) -> Option<Self> {
+        if payload.len() != READINESS_WAIT_PAYLOAD_SIZE
+            || payload[0] != READINESS_WAIT_WIRE_VERSION
+            || payload[3] != 0
+        {
+            return None;
+        }
+        let transition = ReadinessWaitTransition::from_wire(payload[1])?;
+        let kind = ReadinessWaitKind::from_wire(payload[2])?;
+        let generation = u64::from_le_bytes(payload[4..12].try_into().ok()?);
+        if generation == 0 {
+            return None;
+        }
+        Some(Self {
+            transition,
+            kind,
+            generation,
+        })
     }
 }
 
@@ -971,6 +1094,13 @@ pub const MSG_TYPE_SYS_RDY: u32 = 0x5352_4459; // "SRDY"
 /// shape validation. The guest emits it after probes and optional wprof are
 /// ready, immediately before ScenarioStart.
 pub const MSG_TYPE_BPF_MAP_WRITE_READY: u32 = 0x424D_5259; // "BMRY"
+
+/// Guest→host finite prerequisite/readiness-wait boundary.
+///
+/// Tag spelled `"RDWT"` (ReaDiness WaiT). The payload is
+/// [`READINESS_WAIT_PAYLOAD_SIZE`] bytes and decodes through
+/// [`ReadinessWaitEvent::from_payload`].
+pub const MSG_TYPE_READINESS_WAIT: u32 = 0x5244_5754; // "RDWT"
 
 /// Guest→host scheduler-swap notification (payload: empty).
 ///
@@ -2102,6 +2232,7 @@ mod tests {
             MSG_TYPE_KERNEL_OP_REPLY,
             MSG_TYPE_SYS_RDY,
             MSG_TYPE_BPF_MAP_WRITE_READY,
+            MSG_TYPE_READINESS_WAIT,
             MSG_TYPE_SCHED_SWAP_NOTIFY,
             MSG_TYPE_ATTACH_ATTEMPT,
             MSG_TYPE_STDOUT,
@@ -2209,6 +2340,7 @@ mod tests {
             MsgType::KernelOpReply,
             MsgType::SysRdy,
             MsgType::BpfMapWriteReady,
+            MsgType::ReadinessWait,
             MsgType::SchedSwapNotify,
             MsgType::AttachAttempt,
             MsgType::Stdout,
@@ -2292,6 +2424,7 @@ mod tests {
             MsgType::BpfMapWriteReady.wire_value(),
             MSG_TYPE_BPF_MAP_WRITE_READY
         );
+        assert_eq!(MsgType::ReadinessWait.wire_value(), MSG_TYPE_READINESS_WAIT);
         assert_eq!(MsgType::Stdout.wire_value(), MSG_TYPE_STDOUT);
         assert_eq!(MsgType::Stderr.wire_value(), MSG_TYPE_STDERR);
         assert_eq!(MsgType::SchedLog.wire_value(), MSG_TYPE_SCHED_LOG);
@@ -2318,8 +2451,9 @@ mod tests {
 
     /// `is_coordinator_internal` flips on for SnapshotRequest,
     /// SnapshotReply, KernelOpRequest, KernelOpReply, TeardownBarrier,
-    /// TeardownBarrierAck, SysRdy, BpfMapWriteReady, SchedSwapNotify, and
-    /// AttachAttempt and stays off for every test-verdict-bearing
+    /// TeardownBarrierAck, SysRdy, BpfMapWriteReady, ReadinessWait,
+    /// SchedSwapNotify, and AttachAttempt and stays off for every
+    /// test-verdict-bearing
     /// variant. The
     /// Reply variants are host→guest only on port-1 RX; a guest TX
     /// frame stamped with one of those tags is illegitimate and
@@ -2342,6 +2476,7 @@ mod tests {
             MsgType::TeardownBarrierAck,
             MsgType::SysRdy,
             MsgType::BpfMapWriteReady,
+            MsgType::ReadinessWait,
             MsgType::SchedSwapNotify,
             MsgType::AttachAttempt,
         ];
@@ -2399,6 +2534,43 @@ mod tests {
         );
         assert_eq!(MsgType::SchedSwapNotify.wire_value(), 0x5343_5357);
         assert!(MsgType::SchedSwapNotify.is_coordinator_internal());
+    }
+
+    #[test]
+    fn readiness_wait_protocol_round_trips_and_rejects_noncanonical_payloads() {
+        for transition in [
+            ReadinessWaitTransition::Started,
+            ReadinessWaitTransition::Finished,
+        ] {
+            let event = ReadinessWaitEvent {
+                transition,
+                kind: ReadinessWaitKind::ProbeDump,
+                generation: u64::MAX,
+            };
+            assert_eq!(
+                ReadinessWaitEvent::from_payload(&event.to_payload()),
+                Some(event)
+            );
+        }
+
+        let canonical = ReadinessWaitEvent {
+            transition: ReadinessWaitTransition::Started,
+            kind: ReadinessWaitKind::ProbeDump,
+            generation: 1,
+        }
+        .to_payload();
+        for index in [0usize, 1, 2, 3] {
+            let mut malformed = canonical;
+            malformed[index] = 0xff;
+            assert_eq!(ReadinessWaitEvent::from_payload(&malformed), None);
+        }
+        let mut zero_generation = canonical;
+        zero_generation[4..12].fill(0);
+        assert_eq!(ReadinessWaitEvent::from_payload(&zero_generation), None);
+        assert_eq!(
+            ReadinessWaitEvent::from_payload(&canonical[..canonical.len() - 1]),
+            None
+        );
     }
 
     #[test]

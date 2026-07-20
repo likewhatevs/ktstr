@@ -327,8 +327,19 @@ pub(crate) fn scheduler_cmdline_tokens(scheduler: &super::entry::Scheduler) -> V
     parts
 }
 
-pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
+fn build_cmdline_extra_with_probe_dump_gate(
+    entry: &KtstrTestEntry,
+    include_probe_dump_gate: bool,
+) -> String {
     let mut parts = scheduler_cmdline_tokens(entry.scheduler);
+    // Framework-owned readiness authority. Scheduler kargs are otherwise
+    // passed through verbatim, but they may neither arm nor disarm this
+    // watchdog-accounting protocol: only the typed test-entry field decides
+    // whether the primary VM emits the exact `=1` token. This also prevents
+    // auto-repro from inheriting a raw scheduler-provided gate.
+    parts.retain(|part| {
+        part != "KTSTR_AWAIT_PROBE_DUMP_READY" && !part.starts_with("KTSTR_AWAIT_PROBE_DUMP_READY=")
+    });
     // Per-test KASLR opt-out (see `KtstrTestEntry.kaslr` doc). The base
     // cmdline `base_guest_cmdline` at `src/vmm/setup/mod.rs` does NOT
     // inject `nokaslr` by default — KASLR is on. A test that needs determinism sets `kaslr = false` in
@@ -350,6 +361,14 @@ pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
     // periodic runs pay the wait; non-periodic runs never see the flag.
     if entry.num_snapshots > 0 {
         parts.push("KTSTR_AWAIT_PERIODIC_READY=1".to_string());
+    }
+    // Diagnostic scheduler-start gate: only explicitly opted-in tests
+    // pay the host's full probe-counter decode and guest wait. The
+    // host publishes the matching edge only after the exact dump
+    // reader succeeds, so scheduler-relative fault timers start with
+    // the diagnostic substrate already readable.
+    if include_probe_dump_gate && entry.probe_dump_ready_gate {
+        parts.push("KTSTR_AWAIT_PROBE_DUMP_READY=1".to_string());
     }
     if let Ok(bt) = std::env::var("RUST_BACKTRACE") {
         parts.push(format!("RUST_BACKTRACE={bt}"));
@@ -391,6 +410,25 @@ pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
         parts.push(format!("KTSTR_SIDECAR_DIR={s}"));
     }
     parts.join(" ")
+}
+
+/// Build the primary VM's cmdline additions.
+///
+/// An explicitly opted-in primary carries the probe-dump readiness gate. Its
+/// guest args also carry the matching minimal probe request; see
+/// `append_primary_probe_dump_arg`.
+pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
+    build_cmdline_extra_with_probe_dump_gate(entry, true)
+}
+
+/// Build an auto-repro VM's cmdline additions without primary-only launch
+/// gates.
+///
+/// Stall auto-repro intentionally skips probe attachment, so inheriting a
+/// primary cell's probe-dump gate would make guest init wait for an edge the
+/// host can never publish.
+pub(crate) fn build_auto_repro_cmdline_extra(entry: &KtstrTestEntry) -> String {
+    build_cmdline_extra_with_probe_dump_gate(entry, false)
 }
 
 #[cfg(feature = "wprof")]
@@ -1546,6 +1584,98 @@ mod tests {
         assert_eq!(
             out,
             "sysctl.kernel.foo=1 quiet KTSTR_SIDECAR_DIR=/tmp/ktstr-test"
+        );
+    }
+
+    #[test]
+    fn build_cmdline_extra_emits_probe_dump_gate_only_when_opted_in() {
+        let _lock = lock_env();
+        let _env_bt = EnvVarGuard::remove("RUST_BACKTRACE");
+        let _env_log = EnvVarGuard::remove("RUST_LOG");
+        let _env_sd = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, "/tmp/ktstr-test");
+
+        let default = KtstrTestEntry {
+            name: "probe_dump_gate_default",
+            ..KtstrTestEntry::DEFAULT
+        };
+        assert!(
+            !build_cmdline_extra(&default).contains("KTSTR_AWAIT_PROBE_DUMP_READY"),
+            "the default path must not pay the probe-dump readiness gate"
+        );
+
+        let opted_in = KtstrTestEntry {
+            name: "probe_dump_gate_enabled",
+            probe_dump_ready_gate: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        assert_eq!(
+            build_cmdline_extra(&opted_in),
+            "KTSTR_AWAIT_PROBE_DUMP_READY=1 KTSTR_SIDECAR_DIR=/tmp/ktstr-test"
+        );
+    }
+
+    #[test]
+    fn build_auto_repro_cmdline_extra_omits_primary_probe_dump_gate() {
+        let _lock = lock_env();
+        let _env_bt = EnvVarGuard::remove("RUST_BACKTRACE");
+        let _env_log = EnvVarGuard::remove("RUST_LOG");
+        let _env_sd = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, "/tmp/ktstr-test");
+
+        let opted_in = KtstrTestEntry {
+            name: "probe_dump_gate_auto_repro",
+            probe_dump_ready_gate: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        assert_eq!(
+            build_auto_repro_cmdline_extra(&opted_in),
+            "KTSTR_SIDECAR_DIR=/tmp/ktstr-test",
+            "auto-repro must not inherit the primary-only probe-dump gate"
+        );
+    }
+
+    #[test]
+    fn scheduler_kargs_cannot_forge_or_disable_probe_dump_gate() {
+        let _lock = lock_env();
+        let _env_bt = EnvVarGuard::remove("RUST_BACKTRACE");
+        let _env_log = EnvVarGuard::remove("RUST_LOG");
+        let _env_sd = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, "/tmp/ktstr-test");
+
+        static SCHED: Scheduler = Scheduler::named("probe-gate-kargs").kargs(&[
+            "quiet",
+            "KTSTR_AWAIT_PROBE_DUMP_READY=0",
+            "KTSTR_AWAIT_PROBE_DUMP_READY=1",
+        ]);
+        let disabled = KtstrTestEntry {
+            name: "probe_gate_kargs_disabled",
+            scheduler: &SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        assert_eq!(
+            build_cmdline_extra(&disabled),
+            "quiet KTSTR_SIDECAR_DIR=/tmp/ktstr-test"
+        );
+
+        let enabled = KtstrTestEntry {
+            name: "probe_gate_kargs_enabled",
+            scheduler: &SCHED,
+            probe_dump_ready_gate: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let primary = build_cmdline_extra(&enabled);
+        assert_eq!(
+            primary,
+            "quiet KTSTR_AWAIT_PROBE_DUMP_READY=1 KTSTR_SIDECAR_DIR=/tmp/ktstr-test"
+        );
+        assert_eq!(
+            primary
+                .split_ascii_whitespace()
+                .filter(|token| *token == "KTSTR_AWAIT_PROBE_DUMP_READY=1")
+                .count(),
+            1
+        );
+        assert_eq!(
+            build_auto_repro_cmdline_extra(&enabled),
+            "quiet KTSTR_SIDECAR_DIR=/tmp/ktstr-test"
         );
     }
 

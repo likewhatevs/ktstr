@@ -125,6 +125,17 @@ pub const SIGNAL_BPF_WRITE_DONE: u8 = 0xBF;
 /// accessor-adoption point.
 pub const SIGNAL_ACCESSOR_READY: u8 = 0xAC;
 
+/// RX wake byte: the host freeze coordinator has proved that the
+/// failure-dump reader can decode the probe's complete per-CPU counter
+/// slab. This is deliberately stronger than [`SIGNAL_ACCESSOR_READY`]:
+/// the accessor has been adopted, the probe's split BTF is readable,
+/// the `.bss` `ktstr_pcpu_counters` offset resolves, and the full array
+/// read used by the real dump path succeeds. An opt-in guest waits on
+/// this edge before starting its scheduler so scheduler-relative fault
+/// timers cannot outrun dump readiness. Host side:
+/// `host_comms::request_probe_dump_ready`.
+pub const SIGNAL_PROBE_DUMP_READY: u8 = 0xAB;
+
 /// RX wake byte: the host freeze coordinator has stamped its periodic-
 /// capture PREREQS ready — KASLR published AND both accessors adopted,
 /// the exact triad the periodic boundary window anchors on

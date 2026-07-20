@@ -5,6 +5,62 @@
 
 use super::*;
 
+#[test]
+fn bounded_libbpf_tail_keeps_specific_final_diagnostics_and_caps_output() {
+    let log = format!(
+        "{}\n\
+         libbpf: prog 'ktstr_trigger_fexit': BPF program load failed\n\
+         libbpf: failed to find kernel BTF type ID of 'scx_vexit': -3\n",
+        "unhelpful verifier prelude\n".repeat(300)
+    );
+    let tail = bounded_libbpf_tail(&log);
+    assert!(
+        tail.contains("prog 'ktstr_trigger_fexit'"),
+        "program identity must survive: {tail}"
+    );
+    assert!(
+        tail.contains("kernel BTF type ID of 'scx_vexit'"),
+        "target failure must survive: {tail}"
+    );
+    assert!(
+        tail.chars().count() <= 1_000,
+        "early init error must stay bounded: {} chars",
+        tail.chars().count()
+    );
+}
+
+#[test]
+fn scheduler_exit_trigger_selection_prefers_tracepoint_and_covers_older_shapes() {
+    assert_eq!(
+        select_scheduler_exit_trigger(true, true, true),
+        Some(SchedulerExitTrigger::SchedExtExitTracepoint),
+        "the exact post-claim tracepoint must win when all generations coexist"
+    );
+    assert_eq!(
+        select_scheduler_exit_trigger(true, false, false),
+        Some(SchedulerExitTrigger::SchedExtExitTracepoint)
+    );
+    assert_eq!(
+        select_scheduler_exit_trigger(false, true, true),
+        Some(SchedulerExitTrigger::ScxVexit),
+        "without the tracepoint, the exact five-argument return hook wins"
+    );
+    assert_eq!(
+        select_scheduler_exit_trigger(false, true, false),
+        Some(SchedulerExitTrigger::ScxVexit)
+    );
+    assert_eq!(
+        select_scheduler_exit_trigger(false, false, true),
+        Some(SchedulerExitTrigger::ScxDumpState),
+        "6.14 must select its filtered global-era dump entry"
+    );
+    assert_eq!(
+        select_scheduler_exit_trigger(false, false, false),
+        None,
+        "missing every compatible typed target must fail closed before object load"
+    );
+}
+
 // -- parse_kallsyms --
 
 #[test]
@@ -347,8 +403,8 @@ fn build_field_keys_max_six_params() {
 
 // ---- args[0] kind-conditional filter ----------------------------
 //
-// The args[0] conditional in ktstr_trigger_tp (the BPF
-// tracepoint trigger handler) sets
+// The args[0] conditional in ktstr_trigger_fexit (the BPF
+// scheduler-exit trigger handler) sets
 // `event->args[0] = (kind == SCX_EXIT_ERROR_BPF)
 // ? bpf_get_current_task() : 0;` — current-task is emitted
 // ONLY for SCX_EXIT_ERROR_BPF (1025). For SCX_EXIT_ERROR
@@ -372,7 +428,7 @@ const SCX_EXIT_ERROR_BPF: u64 = 1025;
 /// ringbuf callback inside `run_probe_skeleton` constructs
 /// from a trigger event. `args[0]` is the causal task
 /// pointer the BPF side emitted (per the args[0] conditional
-/// in ktstr_trigger_tp); `args[1]` is the exit kind.
+/// in ktstr_trigger_fexit); `args[1]` is the exit kind.
 /// `task_ptr` is set from `args[0]` in the trigger event
 /// constructor in run_probe_skeleton.
 fn make_trigger_event(args0: u64, kind: u64) -> ProbeEvent {

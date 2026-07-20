@@ -178,6 +178,44 @@ fn maybe_inject_teardown_wedge_fault() {
     }
 }
 
+/// One absolute budget shared by probe Phase A and the host's exact
+/// probe-counter decoder readiness edge.
+///
+/// The guest publishes a finite-wait boundary before either prerequisite.
+/// Sharing the deadline prevents the two sequential waits from silently
+/// becoming 2×75 seconds.
+const PROBE_DUMP_READINESS_BUDGET: std::time::Duration = std::time::Duration::from_secs(75);
+
+fn fail_probe_dump_prerequisite(
+    reason: &str,
+    readiness_generation: Option<u64>,
+    probe_phase_a: Option<&crate::test_support::ProbePhaseAState>,
+) -> ! {
+    if let Some(generation) = readiness_generation
+        && !crate::vmm::guest_comms::finish_readiness_wait(
+            crate::vmm::wire::ReadinessWaitKind::ProbeDump,
+            generation,
+        )
+    {
+        tracing::error!(
+            generation,
+            "ktstr-init: failed to publish probe-dump readiness Finished boundary"
+        );
+    }
+    tracing::error!("ktstr-init: {reason}");
+    crate::vmm::guest_comms::send_lifecycle(
+        crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
+        reason,
+    );
+    crate::vmm::guest_comms::send_exit(1);
+    let drain = probe_phase_a.map(|pa| ProbeDrain {
+        stop: pa.pipeline.stop.clone(),
+        output_done: pa.pipeline.output_done.clone(),
+    });
+    drain_probe_pipeline(drain.as_ref(), crate::test_support::PROBE_DRAIN_GRACE);
+    force_reboot();
+}
+
 /// Full guest init lifecycle. Called from the ctor when PID 1 is
 /// detected. Mounts filesystems, then either runs the test lifecycle
 /// (scheduler + dispatch + reboot) or drops into an interactive
@@ -708,14 +746,48 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // calling it while the probe thread is live is UB on Linux.
     crate::test_support::propagate_rust_env_from_cmdline();
 
+    let probe_dump_ready_gate =
+        crate::vmm::rust_init::cmdline_val("KTSTR_AWAIT_PROBE_DUMP_READY").as_deref() == Some("1");
+    let probe_phase_a_deadline = std::time::Instant::now() + PROBE_DUMP_READINESS_BUDGET;
+    // Transfer ordinary-watchdog progress ownership before Phase A can block.
+    // The same generation remains active through the exact host decoder wait.
+    let probe_dump_readiness_generation = if probe_dump_ready_gate {
+        match crate::vmm::guest_comms::begin_readiness_wait(
+            crate::vmm::wire::ReadinessWaitKind::ProbeDump,
+        ) {
+            Some(generation) => Some(generation),
+            None => fail_probe_dump_prerequisite(
+                "probe dump readiness Started boundary was not delivered",
+                None,
+                None,
+            ),
+        }
+    } else {
+        None
+    };
+
     // Phase 2b: Probe Phase A (before scheduler starts).
-    // Attaches kprobes + trigger + kernel fexit so the one-shot
-    // sched_ext_exit tracepoint is captured even if the scheduler
+    // Attaches kprobes + the kernel-selected typed exit trigger so an
+    // accepted scheduler error is captured even if the scheduler
     // crashes immediately on startup.
     let _s_phase2b = tracing::debug_span!("phase2b_probe_phase_a").entered();
-    let probe_phase_a = crate::test_support::start_probe_phase_a(&args);
+    let probe_phase_a =
+        match crate::test_support::start_probe_phase_a(&args, probe_phase_a_deadline) {
+            Ok(state) => state,
+            Err(error) => {
+                fail_probe_dump_prerequisite(&error, probe_dump_readiness_generation, None)
+            }
+        };
     let probes_active = probe_phase_a.is_some();
     drop(_s_phase2b);
+
+    if probe_dump_ready_gate && probe_phase_a.is_none() {
+        fail_probe_dump_prerequisite(
+            "probe dump readiness requires a Phase-A probe stack",
+            probe_dump_readiness_generation,
+            None,
+        );
+    }
 
     // Bring up the host→guest control reader before scheduler spawn. The
     // attach-attempt watchdog returns its generation-tagged cancellation over
@@ -735,11 +807,58 @@ pub(crate) fn ktstr_guest_init() -> ! {
                 error = %error,
                 "ktstr-init: host control reader could not start"
             );
+            if probe_dump_ready_gate {
+                fail_probe_dump_prerequisite(
+                    "host control reader could not start for probe dump readiness",
+                    probe_dump_readiness_generation,
+                    probe_phase_a.as_ref(),
+                );
+            }
             crate::vmm::guest_comms::send_exit(1);
             force_reboot();
         }
     };
     drop(_s_phase2c);
+
+    // An explicitly opted-in diagnostic test may arm a
+    // scheduler-relative failure timer (for example
+    // `--stall-after=1`) and then require the resulting dump to carry
+    // the probe's per-CPU counters. Accessor adoption alone is too
+    // weak, and a wait inside the test body is too late: both happen
+    // after the scheduler process has started its timer. Hold Phase 3
+    // here until the host has run the exact dump decoder successfully
+    // over `probe_bp.bss` and its full `ktstr_pcpu_counters` slab.
+    //
+    // The host edge is independent of scheduler launch: Probe Phase A
+    // above has already loaded the probe object, and the freeze
+    // coordinator builds its accessor from guest kernel state. The
+    // hvc0 reader is also already live, and its latch is sticky, so an
+    // edge published before this point returns immediately.
+    if probe_dump_ready_gate {
+        tracing::debug!("waiting for full probe-dump readiness before scheduler launch");
+        let ready =
+            crate::vmm::rust_init::probe_dump_ready_latch().wait_until(probe_phase_a_deadline);
+        if !ready {
+            fail_probe_dump_prerequisite(
+                "probe dump readiness timed out before scheduler launch",
+                probe_dump_readiness_generation,
+                probe_phase_a.as_ref(),
+            );
+        }
+        let generation = probe_dump_readiness_generation
+            .expect("the exact probe dump gate opened a readiness generation");
+        if !crate::vmm::guest_comms::finish_readiness_wait(
+            crate::vmm::wire::ReadinessWaitKind::ProbeDump,
+            generation,
+        ) {
+            fail_probe_dump_prerequisite(
+                "probe dump readiness Finished boundary was not delivered",
+                Some(generation),
+                probe_phase_a.as_ref(),
+            );
+        }
+        tracing::debug!("full probe-dump decoder ready; starting scheduler");
+    }
 
     // Phase 3: Cgroup parent + Scheduler.
     // Create the cgroup parent directory before starting the scheduler
@@ -1133,8 +1252,8 @@ pub(crate) fn ktstr_guest_init() -> ! {
 
     // Phase 6b: probe finalisation. Now that the scheduler is
     // killed and `/sched_disable` has run, the kernel's
-    // `scx_disable_irq_workfn` path runs `scx_claim_exit` which
-    // fires `trace_sched_ext_exit`. The probe's tp_btf listener is
+    // sched_ext disable path has crossed the kernel-selected typed
+    // error hook. The probe's listener is
     // STILL attached at this point because
     // [`crate::test_support::probe::publish_result_and_collect`]
     // stashed the probe stop+handle into a deferred slot rather

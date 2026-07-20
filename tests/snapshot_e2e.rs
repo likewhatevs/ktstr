@@ -432,7 +432,7 @@ static __KTSTR_ENTRY_SNAPSHOT_OP_IN_VM: ktstr::test_support::KtstrTestEntry =
 /// Test 2: `Op::watch_snapshot` runs inside scx-ktstr's guest VM and
 /// drives the host-installed `SnapshotBridge`'s `register_watch`
 /// callback. Test invokes scx-ktstr with `--stall-after=1` so the
-/// scheduler's `tp_btf/sched_ext_exit` handler fires
+/// ktstr probe's selected typed exit handler fires
 /// `SCX_EXIT_ERROR_STALL`, the freeze coordinator dumps the live
 /// scheduler `.bss` to the variant-keyed
 /// `{sidecar_dir()}/{test_name}-{variant_hash:016x}.failure-dump.json`,

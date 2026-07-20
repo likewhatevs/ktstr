@@ -24,9 +24,9 @@ use crate::sync::MutexExt;
 use crate::vmm::wire::{
     AttachAttemptEvent, KERNEL_OP_REPLY_MAX, KernelOpReplyPayload, KernelOpRequestPayload,
     KernelOpRequestResult, LifecyclePhase, MSG_TYPE_KERNEL_OP_REPLY, MSG_TYPE_SNAPSHOT_REPLY,
-    MsgType, PORT1_NAME, SNAPSHOT_REASON_MAX, SNAPSHOT_STATUS_ERR, SNAPSHOT_STATUS_OK,
-    SNAPSHOT_TAG_MAX, ShmMessage, SnapshotReplyPayload, SnapshotRequestPayload,
-    SnapshotRequestResult,
+    MsgType, PORT1_NAME, ReadinessWaitEvent, ReadinessWaitKind, ReadinessWaitTransition,
+    SNAPSHOT_REASON_MAX, SNAPSHOT_STATUS_ERR, SNAPSHOT_STATUS_OK, SNAPSHOT_TAG_MAX, ShmMessage,
+    SnapshotReplyPayload, SnapshotRequestPayload, SnapshotRequestResult,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -47,6 +47,13 @@ static GUEST_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// terminal log transaction still ships the authoritative bytes afterwards.
 static BULK_LIFECYCLE_PRIORITY: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// Next non-zero generation for a finite guest prerequisite.
+///
+/// Generations share one allocator across readiness kinds so a future kind
+/// cannot accidentally reuse a still-delayed boundary from another kind.
+static NEXT_READINESS_WAIT_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 /// RAII reservation for a scheduler-attach control transaction.
 pub(crate) struct BulkLifecyclePriorityGuard;
@@ -1572,6 +1579,63 @@ pub(crate) fn send_lifecycle_required(phase: LifecyclePhase, reason: &str) -> Re
              {REQUIRED_FRAME_ATTEMPTS} attempts"
         ))
     }
+}
+
+fn allocate_readiness_wait_generation() -> u64 {
+    let mut current = NEXT_READINESS_WAIT_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+    loop {
+        let generation = current.max(1);
+        let next = generation.wrapping_add(1).max(1);
+        match NEXT_READINESS_WAIT_GENERATION.compare_exchange_weak(
+            current,
+            next,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => return generation,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn send_readiness_wait_required(event: ReadinessWaitEvent) -> bool {
+    let _priority = reserve_bulk_lifecycle_priority();
+    let payload = event.to_payload();
+    send_required_frame_with(
+        || try_write_msg(MsgType::ReadinessWait.wire_value(), &payload),
+        || std::thread::sleep(std::time::Duration::from_millis(100)),
+    )
+}
+
+/// Open one finite prerequisite immediately before the guest blocks.
+///
+/// Returning `None` means the host never received a complete canonical
+/// Started boundary; callers must fail closed rather than block without
+/// transferring ordinary-watchdog progress ownership.
+pub fn begin_readiness_wait(kind: ReadinessWaitKind) -> Option<u64> {
+    let generation = allocate_readiness_wait_generation();
+    send_readiness_wait_required(ReadinessWaitEvent {
+        transition: ReadinessWaitTransition::Started,
+        kind,
+        generation,
+    })
+    .then_some(generation)
+}
+
+/// Close the exact generation opened by [`begin_readiness_wait`].
+///
+/// The close is required on both readiness and failure paths. It may reach the
+/// host after the host-side readiness publisher already closed the overlay;
+/// generation matching makes that late Finished boundary harmless.
+pub fn finish_readiness_wait(kind: ReadinessWaitKind, generation: u64) -> bool {
+    if generation == 0 {
+        return false;
+    }
+    send_readiness_wait_required(ReadinessWaitEvent {
+        transition: ReadinessWaitTransition::Finished,
+        kind,
+        generation,
+    })
 }
 
 /// Publish one generation-tagged scheduler attach boundary.

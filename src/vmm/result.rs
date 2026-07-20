@@ -63,6 +63,9 @@ pub enum WatchdogKillReason {
     /// delivered-service grace without completing the FinishedAck/Settled
     /// rendezvous.
     AttachFinishUnsettled,
+    /// A finite guest prerequisite consumed its delivered-service budget,
+    /// or the host sensor needed to account that budget became terminal.
+    ReadinessWaitFailed,
 }
 
 /// Final guest lifecycle stage as tracked by the progress ledger —

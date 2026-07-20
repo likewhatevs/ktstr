@@ -39,7 +39,8 @@ pub enum DetailKind {
     Monitor,
     /// Scheduler process observed to have died (via `sched_pid`
     /// probe returning ESRCH or wait on the leader) AND the BPF
-    /// probe observed a non-clean `trace_sched_ext_exit` event
+    /// probe observed a non-clean scheduler exit through the
+    /// kernel-selected typed trigger
     /// before the liveness check fired. The crash classification
     /// covers SCX_EXIT_ERROR, SCX_EXIT_ERROR_STALL, watchdog kick,
     /// and BPF-side error paths — every kernel exit that latches

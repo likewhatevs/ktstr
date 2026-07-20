@@ -62,6 +62,7 @@ use super::DRAM_BASE;
 mod dispatch;
 pub(crate) mod latency_verdict;
 mod lazy_init;
+mod readiness_wait;
 mod snapshot;
 mod state;
 // `pub(crate)` so the monitor can drive `CpuTrickleTracker` /
@@ -236,7 +237,7 @@ fn is_probe_output_end_frame(msg: &crate::vmm::bulk::BulkMessage) -> bool {
 /// A healthy probe stays attached until scheduler teardown, so its
 /// `PROBE_OUTPUT_END` normally follows the late wprof trace. A probe that
 /// cannot load (for example, because the guest kernel lacks the optional
-/// `sched_ext_exit` BTF tracepoint) emits its diagnostic payload before the
+/// compatible typed scheduler-exit shape) emits its diagnostic payload before the
 /// scenario starts. Remember both events across drain batches so either order
 /// satisfies the rendezvous; requiring the terminator to arrive *after* the
 /// trace loses the already-shipped diagnostic and holds the VM until the grace
@@ -390,6 +391,9 @@ pub(crate) enum KillReasonTag {
     /// The guest published scheduler-attach Finished but did not complete
     /// the FinishedAck/Settled rendezvous within its delivered-service grace.
     AttachFinishUnsettled = 7,
+    /// A generation-tagged finite guest prerequisite exhausted its
+    /// service-accounted budget or lost a required accounting sensor.
+    ReadinessWaitFailed = 8,
 }
 
 impl KillReasonTag {
@@ -404,6 +408,7 @@ impl KillReasonTag {
             5 => Self::AttachCancelUnacked,
             6 => Self::AttachMonitorUnavailable,
             7 => Self::AttachFinishUnsettled,
+            8 => Self::ReadinessWaitFailed,
             _ => Self::Unset,
         }
     }
@@ -419,6 +424,7 @@ impl KillReasonTag {
             Self::AttachCancelUnacked => "attach-cancel-unacknowledged",
             Self::AttachMonitorUnavailable => "attach-monitor-unavailable",
             Self::AttachFinishUnsettled => "attach-finish-unsettled",
+            Self::ReadinessWaitFailed => "readiness-wait-failed",
         }
     }
 }
@@ -440,6 +446,7 @@ fn decode_watchdog_kill_reason(raw: u8) -> Option<crate::vmm::WatchdogKillReason
         KillReasonTag::AttachCancelUnacked => Some(Pub::AttachCancelUnacknowledged),
         KillReasonTag::AttachMonitorUnavailable => Some(Pub::AttachMonitorUnavailable),
         KillReasonTag::AttachFinishUnsettled => Some(Pub::AttachFinishUnsettled),
+        KillReasonTag::ReadinessWaitFailed => Some(Pub::ReadinessWaitFailed),
     }
 }
 
@@ -672,16 +679,22 @@ fn prepare_watchdog_wake(
     Ok(WatchdogWake { tick_tfd, epoll })
 }
 
-/// Apply the attach-overlay and guest-derived wall-boundary gates before the
-/// ordinary Tier-3 state machine observes host service. AP kill and
-/// attach-specific fail-closed bypass this helper.
+/// Apply explicit control-overlay and guest-derived wall-boundary gates before
+/// the ordinary Tier-3 state machine observes host service. AP kill and
+/// overlay-specific fail-closed decisions bypass this helper.
 fn ordinary_watchdog_boundary_decision(
-    attach_overlay_active: bool,
+    ordinary_overlay_active: bool,
     boundary_reached: bool,
     deadman: &mut watchdog_step::DeadmanHostService,
     input: watchdog_step::DeadmanHostServiceInput<'_>,
 ) -> Option<watchdog_step::DeadmanHostDecision> {
-    (!attach_overlay_active && boundary_reached).then(|| deadman.observe(input))
+    if ordinary_overlay_active {
+        // Do not let observer CPU delivered while an explicit finite wait
+        // owns progress leak into the next ordinary observation.
+        deadman.reset();
+        return None;
+    }
+    boundary_reached.then(|| deadman.observe(input))
 }
 
 /// A soft shutdown request is itself a guest-side state transition, so it may
@@ -690,12 +703,12 @@ fn ordinary_watchdog_boundary_decision(
 /// terminated monitor or an exhausted busiest-vCPU service budget. Stable
 /// blocked-host evidence begins accruing only at the hard boundary.
 fn ordinary_watchdog_soft_prefire_should_fire(
-    attach_overlay_active: bool,
+    ordinary_overlay_active: bool,
     soft_boundary_reached: bool,
     monitor_terminal: bool,
     vcpu_cpu_budget_exhausted: bool,
 ) -> bool {
-    !attach_overlay_active
+    !ordinary_overlay_active
         && soft_boundary_reached
         && (monitor_terminal || vcpu_cpu_budget_exhausted)
 }
@@ -789,6 +802,7 @@ mod watchdog_reset_tag_tests {
                 KillReasonTag::AttachFinishUnsettled,
                 Pub::AttachFinishUnsettled,
             ),
+            (KillReasonTag::ReadinessWaitFailed, Pub::ReadinessWaitFailed),
         ] {
             assert_eq!(decode_watchdog_kill_reason(tag as u8), Some(expected));
         }
@@ -849,6 +863,7 @@ mod watchdog_reset_tag_tests {
                 KillReasonTag::AttachFinishUnsettled,
                 "attach-finish-unsettled",
             ),
+            (KillReasonTag::ReadinessWaitFailed, "readiness-wait-failed"),
         ] {
             assert_eq!(tag.render(), token);
             assert_eq!(KillReasonTag::from_u8(tag as u8), tag);
@@ -2692,12 +2707,13 @@ fn ap_task_state(tid: i32) -> Option<char> {
     stat.rsplit(") ").next()?.chars().next()
 }
 
-/// Snapshot every vCPU slot for the post-boundary host-service deadman.
+/// Snapshot every vCPU slot for a host-service-accounted wait.
 ///
-/// This O(vCPU) `/proc` walk is deliberately absent from the normal 100 ms
-/// watchdog path: the caller invokes it only after the guest-derived hard
-/// boundary. Slot identity stays explicit so a publishing/exiting/replaced
-/// task re-anchors the pure tracker rather than looking like zero service.
+/// This O(vCPU) `/proc` walk is deliberately absent from ordinary pre-deadline
+/// watchdog ticks: callers invoke it only after the guest-derived hard
+/// boundary or while an explicit finite readiness overlay owns progress. Slot
+/// identity stays explicit so a publishing/exiting/replaced task re-anchors
+/// the pure tracker rather than looking like zero service.
 fn deadman_host_vcpu_samples(
     tid_slots: &[Arc<AtomicI32>],
 ) -> Vec<watchdog_step::HostVcpuTaskSample> {
@@ -4704,6 +4720,68 @@ mod schedstat_tests {
     }
 }
 
+/// Consume the one-shot probe-dump-ready publication edge.
+///
+/// `is_ready` is deliberately lazy: ordinary runs and subsequent scan
+/// ticks after publication must not repeat the full 480-KiB decoder
+/// read. A requested gate retries while the decoder returns false,
+/// then permanently closes after the first true observation.
+fn take_probe_dump_ready_edge(
+    requested: bool,
+    published: &mut bool,
+    is_ready: impl FnOnce() -> bool,
+) -> bool {
+    if !requested || *published || !is_ready() {
+        return false;
+    }
+    *published = true;
+    true
+}
+
+#[cfg(test)]
+mod probe_dump_ready_edge_tests {
+    use super::take_probe_dump_ready_edge;
+
+    #[test]
+    fn decoder_is_lazy_retriable_and_publication_is_one_shot() {
+        let mut published = false;
+        let mut decoder_calls = 0;
+
+        assert!(!take_probe_dump_ready_edge(false, &mut published, || {
+            decoder_calls += 1;
+            true
+        }));
+        assert_eq!(
+            decoder_calls, 0,
+            "ordinary runs must not pay the full probe-counter read"
+        );
+
+        assert!(!take_probe_dump_ready_edge(true, &mut published, || {
+            decoder_calls += 1;
+            false
+        }));
+        assert!(
+            !published,
+            "a partial/failed decode cannot release the guest"
+        );
+
+        assert!(take_probe_dump_ready_edge(true, &mut published, || {
+            decoder_calls += 1;
+            true
+        }));
+        assert!(published);
+
+        assert!(!take_probe_dump_ready_edge(true, &mut published, || {
+            decoder_calls += 1;
+            true
+        }));
+        assert_eq!(
+            decoder_calls, 2,
+            "the decoder is never called again after the edge publishes"
+        );
+    }
+}
+
 impl KtstrVm {
     /// Spawn threads and run the BSP. Returns all state needed for
     /// `collect_results`.
@@ -5626,6 +5704,21 @@ impl KtstrVm {
         // default) skips the loop entirely — no boundary
         // computation, no per-iteration check.
         let freeze_coord_num_snapshots = self.num_snapshots;
+        // Only the diagnostic entry carrying this exact token asks the
+        // coordinator to prove full probe-counter decodability before
+        // scheduler launch. Keep it separate from accessor-ready and
+        // periodic readiness: both are intentionally weaker contracts.
+        let freeze_coord_probe_dump_ready = self
+            .cmdline_extra
+            .split_ascii_whitespace()
+            .any(|token| token == "KTSTR_AWAIT_PROBE_DUMP_READY=1");
+        // Generic finite guest-prerequisite ownership shared by bulk-frame
+        // dispatch, host readiness publishers, and the watchdog. The guest
+        // opens a generation immediately before blocking; ordinary watchdog
+        // policy is suspended only while that exact finite wait is active.
+        let readiness_wait = Arc::new(readiness_wait::ReadinessWaitOverlay::default());
+        let freeze_coord_readiness_wait = readiness_wait.clone();
+        let readiness_wait_for_wd = readiness_wait.clone();
         // Live periodic-fire count published by the run-loop after
         // each successful capture / placeholder store. Threaded
         // out to `VmResult::periodic_fired` so test code can
@@ -7568,6 +7661,11 @@ impl KtstrVm {
                 // scenario_anchor + duration) is what keeps the window off
                 // post-workload idle. 0 = not yet ready.
                 let mut periodic_prereqs_ready_ns: u64 = 0;
+                // One-shot host→guest publication state for the
+                // explicitly requested full probe-counter decode edge.
+                // The lazy gate below avoids touching the 480-KiB slab
+                // on ordinary runs and after the first success.
+                let mut probe_dump_ready_published = false;
                 let mut next_periodic_idx: u32 = 0;
                 // Periodic-capture clock, driven off GUEST progress. The
                 // boundaries below are sliced over the workload in scenario-
@@ -7672,7 +7770,7 @@ impl KtstrVm {
                 // sched-exit-monitor fires `send_sched_exit` on
                 // scheduler-binary pidfd POLLIN, the host bulk-port
                 // dispatch flips `freeze_coord_kill` — but the BPF
-                // tp_btf/sched_ext_exit handler that latches
+                // selected typed scheduler-exit handler that latches
                 // `ktstr_err_exit_detected` in `.bss` fires from
                 // inside the kernel before the userspace pidfd
                 // POLLIN. Without a sched-exit final pass the coord
@@ -7946,6 +8044,9 @@ impl KtstrVm {
                                         sys_rdy_evt: &mut freeze_coord_sys_rdy_evt,
                                         bpf_map_write_ready_evt:
                                             freeze_coord_bpf_map_write_ready_evt.as_ref(),
+                                        readiness_wait: Some(
+                                            freeze_coord_readiness_wait.as_ref(),
+                                        ),
                                         snapshot_requests_pending:
                                             &mut snapshot_requests_pending,
                                         kernel_op_requests_pending:
@@ -8295,6 +8396,54 @@ impl KtstrVm {
                             );
                             kernel_op_requests_pending.append(
                                 &mut kernel_op_requests_deferred,
+                            );
+                        }
+                    }
+                    // The accessor-ready edge above proves only adoption.
+                    // This opt-in edge is stronger and calls the exact
+                    // decoder used by `dump_state`: it publishes only
+                    // after probe map discovery, split-BTF loading,
+                    // `ktstr_pcpu_counters` offset resolution, and the
+                    // complete slab read all succeed. Guest init waits
+                    // on this edge BEFORE scheduler spawn, so a
+                    // scheduler-relative stall timer cannot beat the
+                    // diagnostic substrate.
+                    if scan_tick
+                        && take_probe_dump_ready_edge(
+                            freeze_coord_probe_dump_ready,
+                            &mut probe_dump_ready_published,
+                            || {
+                                let (Some(owned), Some(btf)) =
+                                    (owned_accessor.as_ref(), dump_btf.as_ref())
+                                else {
+                                    return false;
+                                };
+                                let accessor = owned.as_accessor();
+                                crate::monitor::dump::probe_counters_snapshot_ready(
+                                    &accessor, btf,
+                                )
+                            },
+                        )
+                    {
+                        super::host_comms::request_probe_dump_ready(&freeze_coord_virtio_con);
+                        // Keep the overlay active while re-anchoring the
+                        // surrounding coarse phase so the watchdog cannot
+                        // observe an inactive wait paired with pre-wait CPU
+                        // accounting. The guest's matching Finished edge may
+                        // arrive later; after this host-side readiness close
+                        // it is deliberately stale and harmless.
+                        if let Some(generation) = freeze_coord_readiness_wait.finish_kind(
+                            crate::vmm::wire::ReadinessWaitKind::ProbeDump,
+                            || {
+                                let wall_ns =
+                                    u64::try_from(run_start.elapsed().as_nanos())
+                                        .unwrap_or(u64::MAX);
+                                progress_ledger_for_coord.reanchor_phase_cpu(wall_ns)
+                            },
+                        ) {
+                            tracing::debug!(
+                                generation,
+                                "freeze-coord: host readiness publication closed finite wait"
                             );
                         }
                     }
@@ -9139,7 +9288,7 @@ impl KtstrVm {
                     // semantics. The early (runnable_at) trigger and
                     // BPF-bss late trigger pass `false`: those paths
                     // are already gated on their own conditions
-                    // (half-way age threshold; tp_btf handler latch
+                    // (half-way age threshold; selected typed handler latch
                     // on error-class kinds), so an extra exit_kind
                     // read would be redundant overhead.
                     // kvm_clock save/restore around the freeze
@@ -10416,7 +10565,7 @@ impl KtstrVm {
                                     // kernel overwrote with NONE/DONE
                                     // during scx_ops_disable_workfn
                                     // teardown after firing
-                                    // tp_btf/sched_ext_exit). In that
+                                    // the selected typed trigger). In that
                                     // race window the gate would
                                     // silently drop a real failure
                                     // dump; the BPF latch is the
@@ -13779,8 +13928,8 @@ impl KtstrVm {
                                 freeze_state = FreezeState::Done;
                                 // Error-class exit dump complete: the dump
                                 // is serialized and emitted above, the probe
-                                // ringbuf has drained by the time
-                                // sched_ext_exit fired, and serial output is
+                                // ringbuf has drained by the time the selected
+                                // scheduler-exit trigger fired, and serial output is
                                 // flushed.
                                 //
                                 // For a NON-wprof run no useful work remains
@@ -14661,7 +14810,10 @@ impl KtstrVm {
                         &mut monitor_liveness,
                         &wd_virtio_con,
                     );
-                    let snapshot = attach_tick.snapshot;
+                    // The attach computation consumed this snapshot
+                    // internally. Ordinary policy takes a later
+                    // readiness-serialized snapshot below.
+                    let _ = attach_tick.snapshot;
                     let monitor_live = attach_tick.monitor_live;
                     let attach_step = attach_tick.attach;
                     match attach_step.decision {
@@ -14766,6 +14918,49 @@ impl KtstrVm {
                         | AttachWatchdogDecision::FinishUnsettled { .. } => None,
                     };
                     let attach_monitor_unavailable = attach_monitor_failure.is_some();
+                    let readiness_host_samples = readiness_wait_for_wd
+                        .active()
+                        .map(|_| deadman_host_vcpu_samples(&vcpu_tid_atomics_for_watchdog));
+                    let readiness_decision = readiness_wait_for_wd.watchdog_tick(
+                        progress_ledger_for_wd.as_ref(),
+                        now_wall_ns,
+                        read_cpu_clock_ns(libc::CLOCK_THREAD_CPUTIME_ID).map_or(
+                            watchdog_step::DeadmanObserverClock::Unavailable,
+                            watchdog_step::DeadmanObserverClock::Reading,
+                        ),
+                        readiness_host_samples.as_deref().unwrap_or(&[]),
+                    );
+                    let readiness_failure = match readiness_decision {
+                        readiness_wait::ReadinessWaitDecision::FailClosed {
+                            generation,
+                            kind,
+                            cause,
+                            service_ns,
+                            budget_ns,
+                        } => {
+                            eprintln!(
+                                "ktstr-watchdog: finite guest readiness wait failed closed: \
+                                 generation={generation}, kind={kind:?}, cause={cause:?}, \
+                                 service={:?}, budget={:?}",
+                                Duration::from_nanos(service_ns),
+                                Duration::from_nanos(budget_ns),
+                            );
+                            Some((generation, kind, cause, service_ns, budget_ns))
+                        }
+                        readiness_wait::ReadinessWaitDecision::None
+                        | readiness_wait::ReadinessWaitDecision::Reanchored { .. } => None,
+                    };
+                    let readiness_fail_closed = readiness_failure.is_some();
+                    // Refresh the ledger while serialized against readiness
+                    // transitions. `attach_tick.snapshot` may predate a
+                    // concurrent host-side readiness close; pairing that old
+                    // CPU value with an inactive overlay would leak
+                    // prerequisite service into ordinary Tier-1/2.
+                    let (active_readiness_wait, snapshot) = readiness_wait_for_wd
+                        .coherent_snapshot(progress_ledger_for_wd.as_ref());
+                    let ordinary_overlay_active = attach_step.active
+                        || active_readiness_wait.is_some()
+                        || readiness_fail_closed;
                     // Diagnostic CPU-trickle verdict for this tick. The
                     // MONITOR computes it because it owns the per-vCPU CPU
                     // data the busiest-vCPU windowed currency needs (see
@@ -14779,7 +14974,7 @@ impl KtstrVm {
                     // milestone); reused by the deadman deferral gate.
                     let wall_since_milestone_ns =
                         now_wall_ns.saturating_sub(snapshot.wall_ns_at_progress);
-                    let progress_decision = if attach_step.active {
+                    let progress_decision = if ordinary_overlay_active {
                         watchdog_step::KillDecision::None
                     } else {
                         watchdog_step::evaluate_progress(
@@ -14816,10 +15011,10 @@ impl KtstrVm {
                     // delivered vCPU service all defer/re-anchor. Only an
                     // unchanged fully blocked set can spend the watchdog's
                     // own delivered CPU-service budget.
-                    let deadman_host_samples = (!attach_step.active && hard_deadline_reached)
+                    let deadman_host_samples = (!ordinary_overlay_active && hard_deadline_reached)
                         .then(|| deadman_host_vcpu_samples(&vcpu_tid_atomics_for_watchdog));
                     let deadman_decision = ordinary_watchdog_boundary_decision(
-                        attach_step.active,
+                        ordinary_overlay_active,
                         hard_deadline_reached,
                         &mut deadman_host_service,
                         watchdog_step::DeadmanHostServiceInput {
@@ -14841,6 +15036,7 @@ impl KtstrVm {
                         || tier_fire
                         || attach_fail_closed
                         || attach_monitor_unavailable
+                        || readiness_fail_closed
                     {
                         // A progress tier fired, an AP set kill, or the
                         // hard timeout expired.
@@ -14869,6 +15065,7 @@ impl KtstrVm {
                         // is last (and, unlike the tiers/deadline, is not a
                         // timeout). Mirrors the old hard-over-AP order.
                         let reason_tag = match progress_decision {
+                            _ if readiness_fail_closed => KillReasonTag::ReadinessWaitFailed,
                             _ if attach_monitor_unavailable => {
                                 KillReasonTag::AttachMonitorUnavailable
                             }
@@ -14972,7 +15169,11 @@ impl KtstrVm {
                         // infrastructure fault, not a test failure — prefix
                         // the header with a greppable marker so triage can
                         // separate framework wedges from workload timeouts.
-                        let infra_fault = reason_tag == KillReasonTag::AttachMonitorUnavailable
+                        let infra_fault = matches!(
+                            reason_tag,
+                            KillReasonTag::AttachMonitorUnavailable
+                                | KillReasonTag::ReadinessWaitFailed
+                        )
                             || (matches!(
                                 reason_tag,
                                 KillReasonTag::Tier1Cpu | KillReasonTag::Tier2Idle
@@ -14983,7 +15184,9 @@ impl KtstrVm {
                         } else {
                             ""
                         };
-                        let fire_event = if attach_monitor_unavailable {
+                        let fire_event = if readiness_fail_closed {
+                            "finite readiness wait failed"
+                        } else if attach_monitor_unavailable {
                             "attach monitor unavailable"
                         } else if attach_finish_failure.is_some() {
                             "attach finish rendezvous grace exhausted"
@@ -15051,6 +15254,22 @@ impl KtstrVm {
                             eprintln!(
                                 "  attach_overlay=generation:{generation} kind:{kind:?} \
                                  phase:{attach_phase}, monitor_terminal=true"
+                            );
+                        }
+                        if let Some((generation, kind, cause, service_ns, budget_ns)) =
+                            readiness_failure
+                        {
+                            eprintln!(
+                                "  readiness_overlay=generation:{generation} kind:{kind:?} \
+                                 failure:{cause:?}, service={:?} vs budget={:?}",
+                                Duration::from_nanos(service_ns),
+                                Duration::from_nanos(budget_ns),
+                            );
+                        }
+                        if let Some(wait) = active_readiness_wait {
+                            eprintln!(
+                                "  readiness_overlay=generation:{} kind:{:?}",
+                                wait.generation, wait.kind,
                             );
                         }
                         eprintln!(
@@ -15139,7 +15358,11 @@ impl KtstrVm {
                         // AP-set-kill path does NOT — it is a panic-driven
                         // kill, and propagating it as `timed_out=true` would
                         // mislabel it as a deadline expiry.
-                        if hard_timeout_fired || tier_fire || attach_fail_closed {
+                        if hard_timeout_fired
+                            || tier_fire
+                            || attach_fail_closed
+                            || readiness_fail_closed
+                        {
                             timed_out_for_watchdog.store(true, Ordering::Release);
                         }
                         // Propagate kill so handle_freeze's poll loop
@@ -15186,14 +15409,14 @@ impl KtstrVm {
                     // trickle classification remain diagnostic only.
                     let effective_soft = soft_deadline
                         .and_then(|_| effective_deadline.checked_sub(Duration::from_secs(3)));
-                    if !attach_step.active && hard_deadline_reached {
+                    if !ordinary_overlay_active && hard_deadline_reached {
                         // Reached the wall deadline this tick but did not
                         // fire (deadman deferred; kill/tier not set) — the
                         // cell is alive but past its budget.
                         deadman_deferrals = deadman_deferrals.saturating_add(1);
                     } else if !soft_fired
                         && ordinary_watchdog_soft_prefire_should_fire(
-                            attach_step.active,
+                            ordinary_overlay_active,
                             effective_soft.is_some_and(|d| Instant::now() >= d),
                             snapshot.monitor_terminal,
                             deadman_cpu_budget_exhausted,
@@ -19586,7 +19809,7 @@ mod compute_watchpoint_only_trigger_tests {
     //! because the watchpoint catches every write to `*scx_root->
     //! exit_kind` (including the clean init/teardown NONE/DONE values
     //! that would synthesise a bogus dump without the gate). False on a
-    //! bss-confirmed `Triggered` (the tp_btf handler already proved
+    //! bss-confirmed `Triggered` (the selected typed handler already proved
     //! `kind >= SCX_EXIT_ERROR`, so the gate is redundant) and false
     //! whenever the watchpoint did not fire (there is no
     //! watchpoint-only event to gate).

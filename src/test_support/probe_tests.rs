@@ -13,6 +13,57 @@ use super::*;
 /// its stash/take exercises so the ordering is well defined.
 static DEFERRED_PROBE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[test]
+fn phase_a_status_is_consumed_and_missing_publication_fails_closed() {
+    let pipeline = ProbePipeline::new();
+    *pipeline.phase_a_status.lock().unwrap() = Some(Ok(()));
+    assert_eq!(take_phase_a_status(&pipeline), Ok(()));
+    assert!(
+        take_phase_a_status(&pipeline)
+            .unwrap_err()
+            .contains("without publishing status"),
+        "a terminal latch cannot be interpreted as implicit success"
+    );
+
+    *pipeline.phase_a_status.lock().unwrap() = Some(Err("typed hook rejected".to_string()));
+    assert_eq!(
+        take_phase_a_status(&pipeline),
+        Err("typed hook rejected".to_string()),
+        "the concrete worker failure must cross the Phase-A latch"
+    );
+}
+
+#[test]
+fn primary_probe_dump_arg_is_injected_only_for_opted_in_cells() {
+    let mut default_args = vec!["run".to_string()];
+    append_primary_probe_dump_arg(&KtstrTestEntry::DEFAULT, &mut default_args);
+    assert_eq!(default_args, ["run"]);
+
+    let opted_in = KtstrTestEntry {
+        name: "primary-probe-dump-ready",
+        probe_dump_ready_gate: true,
+        ..KtstrTestEntry::DEFAULT
+    };
+    let mut opted_in_args = vec!["run".to_string()];
+    append_primary_probe_dump_arg(&opted_in, &mut opted_in_args);
+    assert_eq!(
+        extract_probe_stack_arg(&opted_in_args).as_deref(),
+        Some(PRIMARY_PROBE_DUMP_STACK),
+        "the primary VM must load the base probe skeleton and one live \
+         sched_ext kprobe before waiting"
+    );
+
+    append_primary_probe_dump_arg(&opted_in, &mut opted_in_args);
+    assert_eq!(
+        opted_in_args
+            .iter()
+            .filter(|arg| arg.starts_with("--ktstr-probe-stack="))
+            .count(),
+        1,
+        "an explicit probe request must not be duplicated"
+    );
+}
+
 /// The auto-repro VM's host deadline must include PROBE_DRAIN_GRACE beyond the
 /// base workload timeout, so the watchdog cannot fire during the post-trigger
 /// probe-drain tail and truncate the captured-arg payload (the repro
@@ -1508,10 +1559,10 @@ fn diag_with_events(
 
 #[test]
 fn stitch_drop_cause_trigger_never_fired() {
-    // bpf_trigger_fires == 0 → the tp_btf handler never executed.
+    // bpf_trigger_fires == 0 → the selected typed handler never executed.
     // Either the scheduler clean-exited (kind < SCX_EXIT_ERROR
     // hits the early-return at probe.bpf.c:565) or the scheduler
-    // crashed before reaching the tracepoint at all. The cause
+    // crashed before reaching the selected trigger at all. The cause
     // string MUST mention "trigger never fired" so an operator
     // grepping the section can land on the lifecycle bug rather
     // than chasing a stitch failure.
@@ -2836,13 +2887,13 @@ fn condense_probe_reason_prefers_libbpf_log_tail() {
     // condense_probe_reason surfaces that tail line, not the leading errno.
     let err = "skeleton load (retry): Permission denied; original error \
                before retry: Permission denied; LIBBPF-LOG>>>\n\
-               libbpf: prog 'ktstr_trigger_tp': BPF program load failed\n\
-               libbpf: failed to find kernel BTF type ID of 'sched_ext_exit': -3\n\
+               libbpf: prog 'ktstr_trigger_fexit': BPF program load failed\n\
+               libbpf: failed to find kernel BTF type ID of 'scx_vexit': -3\n\
                <<<LIBBPF-LOG";
     let condensed = condense_probe_reason(err);
     assert_eq!(
         condensed,
-        "libbpf: failed to find kernel BTF type ID of 'sched_ext_exit': -3",
+        "libbpf: failed to find kernel BTF type ID of 'scx_vexit': -3",
     );
 }
 

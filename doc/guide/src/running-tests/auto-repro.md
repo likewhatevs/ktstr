@@ -32,7 +32,7 @@ locations (DWARF for kernel functions, BPF line info for callbacks).
     <text x="272" y="52" font-size="12.5" font-weight="700" opacity=".8">host</text>
     <text x="272" y="76" opacity=".8">extract crash chain</text>
     <text x="272" y="94" opacity=".8">plan kprobes + fentry</text>
-    <text x="272" y="112" opacity=".8">arm tp_btf trigger</text>
+    <text x="272" y="112" opacity=".8">select typed exit hook</text>
   </g>
   <path d="M434 86 L 500 86" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#kt-arr)"/>
   <text x="446" y="76" font-size="9.5" fill="var(--fg)" opacity=".7">replay</text>
@@ -50,14 +50,14 @@ locations (DWARF for kernel functions, BPF line info for callbacks).
 Where fexit captured post-mutation state, changed fields show an
 arrow between entry and exit values:
 
-<!-- captured: cargo ktstr test --kernel local-8cd2b47 (v7.1 + sched_ext_exit tracepoint) --features integration,wprof -E 'test(=ktstr/bpf_crash_auto_repro_e2e)' --no-capture | ktstr 0.23.0 (with the probe trigger + ship-gate fixes) | full run: captures/autorepro-live.txt -->
+<!-- captured: cargo ktstr test --kernel local-8cd2b47 (v7.1 + scheduler-exit probe trigger) --features integration,wprof -E 'test(=ktstr/bpf_crash_auto_repro_e2e)' --no-capture | ktstr 0.23.0 (with the probe trigger + ship-gate fixes) | full run: captures/autorepro-live.txt -->
 <div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr test — auto-repro trail after a scheduler crash</span></div>
 
 <pre>--- probe pipeline ---
   extracted:   9 functions from crash backtrace
   kprobes:     5 attached
   fentry:      11 attached
-  <span class="t-grn">trigger:     fired (tp_btf)</span>
+  <span class="t-grn">trigger:     fired (fexit)</span>
   events:      125 captured, 8 after stitch
 
 === AUTO-PROBE: scx_exit fired ===
@@ -133,8 +133,10 @@ about 17 seconds.
    scalar/enum/cpumask fields auto-discovered.
 4. **Probed rerun** — the second VM reruns the scenario with kprobes
    on kernel entry, fentry/fexit on BPF callbacks and kernel exits,
-   and a one-shot trigger on the `sched_ext_exit` tracepoint that
-   fires at the moment the exit is claimed.
+   and the kernel-selected typed scheduler-exit trigger:
+   `tp_btf/sched_ext_exit` on the newest kernels,
+   `fexit/scx_vexit` on the preceding generation, or filtered
+   `fentry/scx_dump_state` on global-era kernels.
 5. **Stitching** — events are filtered to the task that triggered the
    exit, sorted by timestamp, and rendered with decoded values.
 
@@ -147,13 +149,19 @@ reading the repro as evidence.
 
 ## Kernel requirement
 
-The probe *trigger* needs the `sched_ext_exit` tracepoint, which is
-currently only in the sched_ext `for-7.2` development branch — no
-released stable kernel has it. On a kernel without it, the rest of
-the pipeline still runs — the crash call chain is extracted and
-probes are prepared — but the trigger cannot attach and no events are
-captured. The `--- probe pipeline ---` block says exactly that; this
-is the shape to recognize:
+The probe trigger needs one compatible sched_ext target: the typed
+`sched_ext_exit` tracepoint on the newest kernels, the five-argument
+`scx_vexit` function on the preceding generation, or the two-argument
+`scx_dump_state` function on global-era kernels. ktstr reads vmlinux BTF
+before loading the probe object, picks the first compatible target in that
+order, and disables every unused program before load. The tracepoint takes
+precedence because it fires only after the exit claim succeeds and its
+two-argument ABI does not inherit `scx_vexit` signature changes.
+
+On a kernel without any compatible typed shape, the probed rerun fails
+closed before scheduler launch and reports the concrete Phase-A attachment
+error. The `--- probe pipeline ---` block records that failure; this is the
+shape to recognize:
 
 <!-- captured: cargo ktstr test --kernel 7.0 -- --features integration,wprof -E 'test(=ktstr/bpf_crash_auto_repro_e2e)' --no-capture (expect_auto_repro demo test) | ktstr 0.23.0 | kernel 7.0.14 -->
 ```text
@@ -171,9 +179,9 @@ is the shape to recognize:
 repro VM duration: 16.9s
 ```
 
-The diagnostic tails (repro VM sched_ext dump, dmesg) are still
-appended, so the repro run remains useful as a crash-reproduction
-check even without probe events.
+Any diagnostic tail captured before the Phase-A failure is still appended,
+but the scheduler and workload are not started under a partially armed probe
+configuration.
 
 ## Example test
 

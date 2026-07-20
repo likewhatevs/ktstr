@@ -35,8 +35,8 @@ use zerocopy::FromBytes;
 use super::bulk::{MAX_BULK_FRAME_PAYLOAD, find_next_valid_frame};
 use super::pi_mutex::PiMutex;
 use super::virtio_console::{
-    SIGNAL_ACCESSOR_READY, SIGNAL_BPF_WRITE_DONE, SIGNAL_PERIODIC_READY, SIGNAL_VC_DUMP,
-    SIGNAL_VC_SHUTDOWN, VirtioConsole,
+    SIGNAL_ACCESSOR_READY, SIGNAL_BPF_WRITE_DONE, SIGNAL_PERIODIC_READY, SIGNAL_PROBE_DUMP_READY,
+    SIGNAL_VC_DUMP, SIGNAL_VC_SHUTDOWN, VirtioConsole,
 };
 use super::wire::{FRAME_HEADER_SIZE, ShmEntry, ShmMessage};
 
@@ -287,6 +287,17 @@ pub fn request_bpf_map_write_done(virtio_con: &Arc<PiMutex<VirtioConsole>>) {
 /// Mirrors [`request_bpf_map_write_done`].
 pub fn request_accessor_ready(virtio_con: &Arc<PiMutex<VirtioConsole>>) {
     virtio_con.lock().queue_input(&[SIGNAL_ACCESSOR_READY]);
+}
+
+/// Notify an opt-in guest that the real failure-dump decoder can read
+/// the probe's complete per-CPU counter slab. Pushes
+/// [`SIGNAL_PROBE_DUMP_READY`] only after accessor adoption, split-BTF
+/// lookup, `.bss` variable-offset resolution, and the full array read
+/// have all succeeded. The guest gates scheduler launch on the matching
+/// sticky latch, so scheduler-relative failure injection cannot race
+/// the diagnostic substrate.
+pub fn request_probe_dump_ready(virtio_con: &Arc<PiMutex<VirtioConsole>>) {
+    virtio_con.lock().queue_input(&[SIGNAL_PROBE_DUMP_READY]);
 }
 
 /// Notify a periodic-capture guest that ALL periodic-capture prereqs

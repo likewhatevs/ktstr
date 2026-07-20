@@ -39,7 +39,7 @@
 
 mod common;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use common::failure_dump::{failure_dump_artifact, read_failure_dump};
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
@@ -1014,20 +1014,22 @@ static __KTSTR_ENTRY_FAILURE_DUMP_CAPTURES: ktstr::test_support::KtstrTestEntry 
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
-/// Asserts that the failure dump's `probe_counters` field captures
-/// non-zero `trigger_count` after an SCX_EXIT_ERROR_STALL fires.
+/// Asserts that the failure dump's `probe_counters` field captures a
+/// structurally valid trigger counter and a live non-zero kprobe counter after
+/// an SCX_EXIT_ERROR_STALL fires.
 ///
 /// User-facing test bar (per project memory): the BPF probe's
 /// per-CPU diagnostic counters must surface in the failure dump
-/// with values that prove each tracepoint actually fired during
+/// with values that prove each probe actually fired during
 /// the run. After the per-CPU conversion landed (replacing N
 /// shared-global counters with a `[MAX_CPUS][KTSTR_PCPU_NR]`
 /// 2D array in `.bss`), this test pins:
 ///   1. `probe_counters` is present and structured (not absent /
 ///      null in the JSON);
-///   2. `probe_counters.trigger_count > 0` — the
-///      `tp_btf/sched_ext_exit` handler fired at least once during
-///      the stall, which proves the per-CPU sum reaches the host;
+///   2. `probe_counters.trigger_count` is present and numeric. Zero is a
+///      valid precise-freeze result: the hardware watchpoint linearizes on
+///      the scheduler's `exit_kind` write before the selected typed trigger
+///      increments this slot;
 ///   3. `probe_counters.probe_count > 0` — kprobes attached and
 ///      fired (confirms the host-side sum walks the array, since
 ///      a stub-empty array would produce 0 even on a working run).
@@ -1040,10 +1042,10 @@ static __KTSTR_ENTRY_FAILURE_DUMP_CAPTURES: ktstr::test_support::KtstrTestEntry 
 fn scenario_failure_dump_renders_probe_counters(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
-    // Adopt the accessor before the --stall-after=1 freeze so the dump
-    // renders a full report (probe_counters present); the host-side
-    // `check_probe_dump` callback does the assertions.
-    await_accessor_ready();
+    // This entry's `probe_dump_ready_gate` has already held scheduler
+    // launch until the exact probe-counter dump decoder succeeded.
+    // The host-side `check_probe_dump` callback asserts that the later
+    // stall dump preserves that readiness and carries live counters.
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
@@ -1053,20 +1055,70 @@ fn scenario_failure_dump_renders_probe_counters(
 }
 
 /// Host-side post_vm assertion for `failure_dump_renders_probe_counters`.
-/// Reads the dump via `read_failure_dump` and verifies the probe's
-/// per-CPU `.bss` counters surfaced (non-zero `trigger_count` and
-/// `probe_count`). Runs unconditionally; its Err is a hard FAIL via the
+/// Reads the dump directly and verifies the probe's per-CPU `.bss` counters
+/// surfaced (numeric `trigger_count` and non-zero `probe_count`). This
+/// acceptance deliberately does not use `read_failure_dump`: the readiness
+/// handshake has already proved that this exact map is decodable, so a later
+/// placeholder or mapless dump is a regression, not an inconclusive
+/// `HostSkipRequest`. Runs unconditionally; its Err is a hard FAIL via the
 /// framework's `PostVmAssertionFailure` marker even though `expect_err`
 /// inverts the stall itself to PASS.
 fn check_probe_dump(result: &VmResult) -> Result<()> {
-    let value = read_failure_dump(result)?;
+    let dump_path = result.failure_dump_path()?;
+    let json = std::fs::read_to_string(&dump_path).with_context(|| {
+        format!(
+            "probe-counter failure dump missing at {} after its readiness \
+             handshake succeeded",
+            dump_path.display()
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&json)
+        .map_err(|error| anyhow::anyhow!("probe-counter dump is not valid JSON: {error}"))?;
     let dump_artifact = failure_dump_artifact(result);
+
+    validate_required_probe_dump(&value, &dump_artifact)?;
+
+    Ok(())
+}
+
+/// Validate the dump-level prerequisites promised by the probe readiness edge
+/// before checking the counter payload itself.
+///
+/// Keep this helper free of `post_vm_skip`: the dedicated acceptance cannot
+/// turn a placeholder or an empty-map dump into a passing nextest case.
+fn validate_required_probe_dump(
+    value: &serde_json::Value,
+    dump_artifact: &str,
+) -> Result<(u64, u64)> {
+    anyhow::ensure!(
+        !value
+            .get("is_placeholder")
+            .and_then(|placeholder| placeholder.as_bool())
+            .unwrap_or(false),
+        "probe-counter dump is a placeholder after its readiness handshake \
+         succeeded; {dump_artifact}"
+    );
+
+    let maps = value
+        .get("maps")
+        .and_then(|maps| maps.as_array())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "probe-counter dump is missing its top-level `maps` array; \
+                 {dump_artifact}"
+            )
+        })?;
+    anyhow::ensure!(
+        !maps.is_empty(),
+        "probe-counter dump has no rendered BPF maps after its readiness \
+         handshake succeeded; {dump_artifact}"
+    );
 
     // `probe_counters` is `skip_serializing_if = "Option::is_none"`,
     // so its absence in the JSON means the host-side decoder
-    // returned None. That's a regression — when the probe has
-    // attached and fired (which the stall scenario guarantees),
-    // the decoder must produce a populated struct.
+    // returned None. That's a regression — the pre-scheduler readiness gate
+    // has already proved the exact decoder can read this slab, so the precise
+    // stall freeze must preserve a populated struct.
     let probe_counters = value.get("probe_counters").ok_or_else(|| {
         anyhow::anyhow!(
             "dump JSON missing `probe_counters` field — \
@@ -1084,13 +1136,22 @@ fn check_probe_dump(result: &VmResult) -> Result<()> {
         );
     }
 
-    // `trigger_count` is the structural assertion — a stall
-    // scenario is guaranteed to fire `tp_btf/sched_ext_exit`
-    // (the SCX kernel emits SCX_EXIT_ERROR_STALL through the
-    // tracepoint), so a zero value here means either (a) the
-    // probe didn't attach the trigger handler, (b) the handler
-    // fired but the per-CPU slot bump didn't land, or (c) the
-    // host-side cross-CPU sum walked the wrong slot index.
+    validate_probe_counters(probe_counters, dump_artifact)
+}
+
+/// Validate the counter serde shape and the precise-freeze ordering invariant.
+///
+/// The scheduler error watchpoint traps immediately after the kernel writes
+/// `exit_kind`. That store precedes every selected trigger point, so a correct
+/// hardware-linearized dump may observe `trigger_count == 0`.
+/// Delaying capture to make it non-zero would lose the stronger invariant that
+/// the probe skeleton and its map are still alive. `probe_count > 0` is the
+/// independent live-array proof: the Phase-A `do_enqueue_task` kprobe has
+/// already fired before the scheduler stalls.
+fn validate_probe_counters(
+    probe_counters: &serde_json::Value,
+    dump_artifact: &str,
+) -> Result<(u64, u64)> {
     let trigger_count = probe_counters
         .get("trigger_count")
         .and_then(|v| v.as_u64())
@@ -1098,23 +1159,13 @@ fn check_probe_dump(result: &VmResult) -> Result<()> {
             anyhow::anyhow!(
                 "`probe_counters.trigger_count` missing or non-numeric — \
                  ProbeBssCounters serde shape changed. \
-                 probe_counters: {probe_counters}"
+                 probe_counters: {probe_counters}; {dump_artifact}"
             )
         })?;
-    if trigger_count == 0 {
-        anyhow::bail!(
-            "`probe_counters.trigger_count == 0` — `tp_btf/sched_ext_exit` \
-             never fired (or the per-CPU slot didn't increment). The stall \
-             scenario must produce at least one tracepoint fire. \
-             probe_counters: {probe_counters}"
-        );
-    }
 
-    // `probe_count` cross-validates the array walk: the kprobe
-    // handler is attached to multiple kernel functions (sched
-    // entry / dispatch path) and fires throughout the run, so a
-    // healthy stall scenario produces hundreds-to-millions of
-    // fires. A non-zero value here proves the host-side reader
+    // `probe_count` cross-validates the array walk: the primary readiness
+    // path attaches `do_enqueue_task`, which fires during scheduler startup
+    // and workload dispatch. A non-zero value here proves the host-side reader
     // walked the per-CPU slots (rather than reading a stub-zero
     // value from index 0 of an empty array).
     let probe_count = probe_counters
@@ -1124,7 +1175,7 @@ fn check_probe_dump(result: &VmResult) -> Result<()> {
             anyhow::anyhow!(
                 "`probe_counters.probe_count` missing or non-numeric — \
                  ProbeBssCounters serde shape changed. \
-                 probe_counters: {probe_counters}"
+                 probe_counters: {probe_counters}; {dump_artifact}"
             )
         })?;
     if probe_count == 0 {
@@ -1132,7 +1183,7 @@ fn check_probe_dump(result: &VmResult) -> Result<()> {
             "`probe_counters.probe_count == 0` — kprobe path never fired \
              across the run. Either probe attach failed, ktstr_enabled \
              never flipped to true, or the host-side sum walked the wrong \
-             slot index. probe_counters: {probe_counters}"
+             slot index. probe_counters: {probe_counters}; {dump_artifact}"
         );
     }
 
@@ -1142,7 +1193,32 @@ fn check_probe_dump(result: &VmResult) -> Result<()> {
          `.bss` `ktstr_pcpu_counters` array)"
     );
 
-    Ok(())
+    Ok((trigger_count, probe_count))
+}
+
+#[test]
+fn probe_counter_validation_accepts_zero_trigger_at_watchpoint_linearization() {
+    let counters = serde_json::json!({
+        "trigger_count": 0,
+        "probe_count": 1,
+    });
+    assert_eq!(
+        validate_probe_counters(&counters, "synthetic dump").unwrap(),
+        (0, 1)
+    );
+}
+
+#[test]
+fn probe_counter_acceptance_rejects_placeholder_as_hard_failure() {
+    let placeholder = serde_json::json!({
+        "is_placeholder": true,
+        "maps": [],
+    });
+    let error = validate_required_probe_dump(&placeholder, "synthetic dump").unwrap_err();
+    assert!(
+        error.to_string().contains("is a placeholder"),
+        "placeholder must be a hard validation error, got: {error:#}"
+    );
 }
 
 #[ktstr::ktstr_test_entry]
@@ -1151,11 +1227,17 @@ static __KTSTR_ENTRY_FAILURE_DUMP_PROBE_COUNTERS: ktstr::test_support::KtstrTest
         name: "failure_dump_renders_probe_counters",
         func: scenario_failure_dump_renders_probe_counters,
         scheduler: &KTSTR_SCHED,
-        // --stall-after=1 fires SCX_EXIT_ERROR_STALL on watchdog
-        // timeout. The probe's tp_btf/sched_ext_exit handler
-        // bumps `KTSTR_PCPU_TRIGGER_COUNT` on every fire, so a
-        // single stall produces a non-zero cross-CPU sum.
+        // --stall-after=1 fires SCX_EXIT_ERROR_STALL on watchdog timeout.
+        // The hardware watchpoint may freeze before the selected trigger bumps
+        // `KTSTR_PCPU_TRIGGER_COUNT`; the separate Phase-A kprobe count
+        // is the live per-CPU-array proof.
         extra_sched_args: &["--stall-after=1"],
+        // `--stall-after` is scheduler-relative, so a scenario-body
+        // `await_accessor_ready()` is too late: the one-second timer
+        // starts before the test function runs. Hold scheduler launch
+        // until the host can decode the exact probe-counter slab used
+        // by the failure dump.
+        probe_dump_ready_gate: true,
         // watchdog_timeout sets the GUEST scx watchdog (scx_sched.
         // watchdog_timeout), so a stalled task trips SCX_EXIT_ERROR_STALL
         // ~3s after it parks. duration drives the HOST watchdog deadline
@@ -1171,8 +1253,8 @@ static __KTSTR_ENTRY_FAILURE_DUMP_PROBE_COUNTERS: ktstr::test_support::KtstrTest
         // outcome of --stall-after=1) to PASS. The real counter
         // assertions live in `check_probe_dump`, a
         // post_vm_unconditional callback whose Err is a hard FAIL via
-        // PostVmAssertionFailure — so a missing/zero counter fails the
-        // test even though the stall itself is inverted.
+        // PostVmAssertionFailure — so a missing counter or zero probe_count
+        // fails the test even though the stall itself is inverted.
         expect_err: true,
         post_vm_unconditional: Some(check_probe_dump),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT

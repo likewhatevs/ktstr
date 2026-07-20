@@ -519,8 +519,37 @@ impl DeadmanHostService {
         }
     }
 
+    /// Forget every Tier-3 host-service anchor.
+    ///
+    /// An explicit control overlay owns progress while it is active. Merely
+    /// skipping observations is insufficient: the watchdog thread's CPU
+    /// clock keeps advancing during that interval, so retaining the old
+    /// blocked anchor would charge the overlay retroactively on the first
+    /// post-overlay observation. Resetting makes the next ordinary tick a
+    /// fresh seed, exactly as if the finite wait had not elapsed.
+    pub(crate) fn reset(&mut self) {
+        self.baseline = None;
+        self.blocked_observer_anchor_ns = None;
+        self.last_observer_cpu_ns = None;
+    }
+
     /// Fold one host-service observation into a deterministic decision.
     pub(crate) fn observe(&mut self, input: DeadmanHostServiceInput<'_>) -> DeadmanHostDecision {
+        self.observe_with_budget(input, DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS)
+    }
+
+    /// Fold an observation using a caller-owned blocked-observer service
+    /// budget.
+    ///
+    /// The ordinary Tier-3 deadman uses its short fixed budget through
+    /// [`Self::observe`]. Finite control overlays reuse the same
+    /// runnable/starvation and task-generation semantics with their own
+    /// explicit service budget.
+    pub(crate) fn observe_with_budget(
+        &mut self,
+        input: DeadmanHostServiceInput<'_>,
+        blocked_observer_budget_ns: u64,
+    ) -> DeadmanHostDecision {
         // These are pre-existing authoritative kill facts. Their precedence
         // also means a failed observer clock cannot hide a completed monitor
         // or an exhausted guest-CPU backstop.
@@ -584,15 +613,15 @@ impl DeadmanHostService {
                     .blocked_observer_anchor_ns
                     .expect("a deadman host baseline always has an observer anchor");
                 let observer_service_ns = observer_cpu_ns - anchor_ns;
-                if observer_service_ns >= DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS {
+                if observer_service_ns >= blocked_observer_budget_ns {
                     DeadmanHostDecision::Fire(DeadmanHostFire::BlockedObserverService {
                         observer_service_ns,
-                        budget_ns: DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS,
+                        budget_ns: blocked_observer_budget_ns,
                     })
                 } else {
                     DeadmanHostDecision::Defer(DeadmanHostDefer::Blocked {
                         observer_service_ns,
-                        budget_ns: DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS,
+                        budget_ns: blocked_observer_budget_ns,
                     })
                 }
             }

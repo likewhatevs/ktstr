@@ -94,16 +94,18 @@ scheduler crashes, ktstr automatically:
 1. Captures the crash stack trace from the scenario output.
 2. Boots a second VM with kprobes (kernel functions) and fentry
    probes (BPF callbacks) on each function in the crash chain, plus
-   a `tp_btf/sched_ext_exit` tracepoint trigger.
+   the kernel-selected typed scheduler-exit trigger
+   (`tp_btf/sched_ext_exit` on the newest kernels,
+   `fexit/scx_vexit` on the preceding generation, or filtered
+   `fentry/scx_dump_state` on global-era kernels).
 3. Reruns the scenario to capture function arguments at each crash
    point.
 
 The `--- auto-repro ---` section starts with the probe pipeline's
 own accounting, so you can always see how much of the chain
-attached. On a kernel with the `sched_ext_exit` tracepoint, the same
-crash replayed under probes:
+attached. The same crash replayed under probes:
 
-<!-- captured: cargo ktstr test --kernel local-8cd2b47 (v7.1 + sched_ext_exit tracepoint) --features integration,wprof -E 'test(=ktstr/bpf_crash_auto_repro_e2e)' --no-capture | ktstr 0.23.0 (with the probe trigger + ship-gate fixes) | full run: captures/autorepro-live.txt -->
+<!-- captured: cargo ktstr test --kernel local-8cd2b47 (v7.1 + scheduler-exit probe trigger) --features integration,wprof -E 'test(=ktstr/bpf_crash_auto_repro_e2e)' --no-capture | ktstr 0.23.0 (with the probe trigger + ship-gate fixes) | full run: captures/autorepro-live.txt -->
 <div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">--- auto-repro --- (repro VM, probes on the crash chain)</span></div>
 
 <pre>--- probe pipeline ---
@@ -111,7 +113,7 @@ crash replayed under probes:
   traceable:   4 passed, 4 dropped: bpf_prog_9a11f2edaac0b52f_ktstr_dispatch, ...
   kprobes:     5 attached
   fentry:      11 attached
-  <span class="t-grn">trigger:     fired (tp_btf)</span>
+  <span class="t-grn">trigger:     fired (fexit)</span>
   events:      125 captured, 8 after stitch
 
 === AUTO-PROBE: scx_exit fired ===

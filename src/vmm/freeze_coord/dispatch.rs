@@ -94,6 +94,11 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// resolving the target and before mutation. `None` on runs without a
     /// configured write, so ordinary tests allocate no fd and take no arm.
     pub bpf_map_write_ready_evt: Option<&'a Arc<EventFd>>,
+    /// Generic finite guest prerequisite/readiness-wait overlay. A
+    /// CRC-valid, canonical `ReadinessWait` frame opens or closes one
+    /// generation. The watchdog consults the same object and suppresses its
+    /// ordinary tiers only while an explicit wait is active.
+    pub readiness_wait: Option<&'a super::readiness_wait::ReadinessWaitOverlay>,
     /// Scheduler-swap notification latch. Set `true` on a CRC-valid
     /// `MSG_TYPE_SCHED_SWAP_NOTIFY` frame; the freeze coordinator's
     /// run-loop reads-and-clears it each iteration and synchronously
@@ -579,6 +584,37 @@ pub(super) fn dispatch_bulk_message(
                     "freeze_coord: BPF-map-write readiness eventfd write failed; \
                      injection remains safely gated"
                 );
+            }
+            None
+        }
+        Some(crate::vmm::wire::MsgType::ReadinessWait) => {
+            // A readiness-wait boundary owns watchdog progress, so accept it
+            // only with both transport integrity and the exact canonical
+            // typed payload. Malformed/torn frames remain internal but cannot
+            // mask ordinary watchdog policy.
+            if msg.crc_ok
+                && let Some(event) =
+                    crate::vmm::wire::ReadinessWaitEvent::from_payload(&msg.payload)
+                && let Some(overlay) = sinks.readiness_wait
+            {
+                let update = overlay.apply(event, || {
+                    let Some(ledger) = sinks.progress_ledger else {
+                        return 0;
+                    };
+                    let wall_ns =
+                        u64::try_from(sinks.run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    ledger.reanchor_phase_cpu(wall_ns)
+                });
+                if matches!(
+                    update,
+                    super::readiness_wait::ReadinessWaitUpdate::Replaced { .. }
+                ) {
+                    tracing::warn!(
+                        ?event,
+                        ?update,
+                        "freeze_coord: non-canonical readiness-wait transition"
+                    );
+                }
             }
             None
         }
@@ -1373,6 +1409,7 @@ mod stage_tests {
                 run_is_wprof: false,
                 sys_rdy_evt: &mut self.sys_rdy_evt,
                 bpf_map_write_ready_evt: None,
+                readiness_wait: None,
                 snapshot_requests_pending: &mut self.snapshot_requests_pending,
                 kernel_op_requests_pending: &mut self.kernel_op_requests_pending,
                 kern_phys_base: &self.kern_phys_base,

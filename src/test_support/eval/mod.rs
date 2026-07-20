@@ -818,6 +818,7 @@ fn run_ktstr_test_inner_impl(
         "--ktstr-test-fn".to_string(),
         entry.name.to_string(),
     ];
+    super::probe::append_primary_probe_dump_arg(entry, &mut guest_args);
 
     let cmdline_extra = super::runtime::build_cmdline_extra(entry);
 
@@ -1612,6 +1613,7 @@ fn run_ktstr_test_inner_impl(
                 | Some(crate::vmm::wire::MsgType::TeardownBarrierAck)
                 | Some(crate::vmm::wire::MsgType::SysRdy)
                 | Some(crate::vmm::wire::MsgType::BpfMapWriteReady)
+                | Some(crate::vmm::wire::MsgType::ReadinessWait)
                 | Some(crate::vmm::wire::MsgType::SchedSwapNotify)
                 | Some(crate::vmm::wire::MsgType::AttachAttempt) => {}
                 None => {

@@ -307,7 +307,7 @@ probes attached along the crash path — decoded function arguments and
 struct state at each call site, `→` arrows marking entry-to-exit
 changes:
 
-<!-- captured: cargo ktstr test (ktstr/bpf_crash_auto_repro_e2e) — prior-run sample preserved from running-tests/auto-repro.md | ktstr 0.23.0 | kernel with the sched_ext_exit tracepoint -->
+<!-- captured: cargo ktstr test (ktstr/bpf_crash_auto_repro_e2e) — prior-run sample preserved from running-tests/auto-repro.md | ktstr 0.23.0 | kernel with the scheduler-exit probe trigger -->
 <div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">auto-repro probe excerpt</span></div>
 
 <pre>
@@ -321,7 +321,10 @@ do_enqueue_task                                               kernel/sched/ext.c
 ...
     <span class="t-grn">scx_flags   QUEUED|DEQD_FOR_SLEEP    →  QUEUED</span></pre></div>
 
-On by default; requires a kernel with the `sched_ext_exit` tracepoint.
+On by default. ktstr selects the kernel's native typed scheduler-exit hook:
+`tp_btf/sched_ext_exit` on the newest kernels,
+`fexit/scx_vexit` on the preceding generation, or filtered
+`fentry/scx_dump_state` on global-era kernels.
 See [Auto-Repro](running-tests/auto-repro.md).
 
 ### Interactive shell
@@ -361,7 +364,7 @@ See [ctprof](reference/ctprof.md).
 | CI-tested series | 6.14 and 7.1, on x86_64 and aarch64, every push |
 | Watchdog-timeout override | 7.1+ via BTF (`scx_sched.watchdog_timeout`); older kernels via the static `scx_watchdog_timeout` symbol |
 | sched_ext event counters | 6.16+ (two BTF layouts); sampling is disabled when neither is present |
-| Auto-repro probe trigger | kernels with the `sched_ext_exit` tracepoint |
+| Auto-repro probe trigger | `sched_ext_exit` typed tracepoint (newest), five-argument `scx_vexit` (preceding generation), or two-argument `scx_dump_state` (global era) |
 
 Outside the CI-tested series, the monitor degrades feature by feature
 rather than failing: tests still run, and unavailable capabilities are

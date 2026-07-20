@@ -1133,7 +1133,7 @@ fn load_btf_fresh_resolution_per_call() {
 // core to miss the transition under TSO-violating reorder. This
 // test pins the BPF bytecode against that regression by parsing
 // the compiled `probe.o` and asserting at least one atomic op is
-// present in the `tp_btf/sched_ext_exit` program section.
+// present in each kernel-generation trigger program section.
 //
 // BPF instruction encoding (uapi/linux/bpf.h):
 //   - opcode byte: bits[2:0] = class (BPF_STX = 0x03),
@@ -1154,9 +1154,8 @@ fn probe_bpf_object_emits_atomic_for_err_exit_latch() {
     // broken and the test should surface that loudly.
     //
     // Limitation: this test counts ANY BPF_CMPXCHG instruction
-    // in the `tp_btf/sched_ext_exit` section, not specifically
-    // the cmpxchg targeting `ktstr_err_exit_detected`. Today
-    // the section contains exactly one
+    // in each selected trigger section, not specifically the cmpxchg
+    // targeting `ktstr_err_exit_detected`. Today each section contains one
     // `__sync_val_compare_and_swap` call (against the latch),
     // so any cmpxchg present must be the latch's; if a future
     // change adds a second atomic in the same handler, the
@@ -1183,63 +1182,66 @@ fn probe_bpf_object_emits_atomic_for_err_exit_latch() {
             probe_obj_path.display()
         )
     });
-    // Locate the program section. libbpf names sections after
-    // the SEC() macro argument; tp_btf programs land in
-    // `tp_btf/sched_ext_exit`. Match exact name; a future
-    // restructure that splits the program into a different
-    // section would surface as a clear test failure with the
-    // expected name.
-    const TARGET_SECTION: &str = "tp_btf/sched_ext_exit";
-    let mut found_section = false;
-    let mut atomic_count: usize = 0;
-    for sh in &elf.section_headers {
-        let Some(name) = elf.shdr_strtab.get_at(sh.sh_name) else {
-            continue;
-        };
-        if name != TARGET_SECTION {
-            continue;
-        }
-        found_section = true;
-        // BPF programs are SHT_PROGBITS sections of `n` 8-byte
-        // instructions. Read the section bytes via offset/size.
-        let off = sh.sh_offset as usize;
-        let sz = sh.sh_size as usize;
-        assert!(
-            sz.is_multiple_of(8),
-            "BPF section size {sz} must be a multiple of 8 (instruction width)"
-        );
-        let prog = &bytes[off..off + sz];
-        // BPF_STX | BPF_ATOMIC | BPF_W = 0xc3
-        // BPF_STX | BPF_ATOMIC | BPF_DW = 0xc3 | 0x18 = 0xdb
-        // The latch is u32, so we expect 0xc3 specifically — but
-        // accept either width to keep the test robust against
-        // a future widening to u64.
-        const STX_ATOMIC_W: u8 = 0xc3;
-        const STX_ATOMIC_DW: u8 = 0xdb;
-        // BPF_CMPXCHG = 0xf0 | BPF_FETCH(0x01) = 0xf1
-        const BPF_CMPXCHG_IMM: i32 = 0xf1;
-        for chunk in prog.chunks_exact(8) {
-            let opcode = chunk[0];
-            if opcode == STX_ATOMIC_W || opcode == STX_ATOMIC_DW {
-                let imm = i32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
-                if imm == BPF_CMPXCHG_IMM {
-                    atomic_count += 1;
+    // Locate all program sections. libbpf names sections after the SEC()
+    // macro argument. A future restructure that drops any generation's
+    // typed hook surfaces as a clear test failure with the expected name.
+    const TARGET_SECTIONS: &[&str] = &[
+        "tp_btf/sched_ext_exit",
+        "fexit/scx_vexit",
+        "fentry/scx_dump_state",
+    ];
+    for target_section in TARGET_SECTIONS {
+        let mut found_section = false;
+        let mut atomic_count: usize = 0;
+        for sh in &elf.section_headers {
+            let Some(name) = elf.shdr_strtab.get_at(sh.sh_name) else {
+                continue;
+            };
+            if name != *target_section {
+                continue;
+            }
+            found_section = true;
+            // BPF programs are SHT_PROGBITS sections of `n` 8-byte
+            // instructions. Read the section bytes via offset/size.
+            let off = sh.sh_offset as usize;
+            let sz = sh.sh_size as usize;
+            assert!(
+                sz.is_multiple_of(8),
+                "BPF section size {sz} must be a multiple of 8 (instruction width)"
+            );
+            let prog = &bytes[off..off + sz];
+            // BPF_STX | BPF_ATOMIC | BPF_W = 0xc3
+            // BPF_STX | BPF_ATOMIC | BPF_DW = 0xc3 | 0x18 = 0xdb
+            // The latch is u32, so we expect 0xc3 specifically — but
+            // accept either width to keep the test robust against
+            // a future widening to u64.
+            const STX_ATOMIC_W: u8 = 0xc3;
+            const STX_ATOMIC_DW: u8 = 0xdb;
+            // BPF_CMPXCHG = 0xf0 | BPF_FETCH(0x01) = 0xf1
+            const BPF_CMPXCHG_IMM: i32 = 0xf1;
+            for chunk in prog.chunks_exact(8) {
+                let opcode = chunk[0];
+                if opcode == STX_ATOMIC_W || opcode == STX_ATOMIC_DW {
+                    let imm = i32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+                    if imm == BPF_CMPXCHG_IMM {
+                        atomic_count += 1;
+                    }
                 }
             }
         }
+        assert!(
+            found_section,
+            "probe.o is missing the expected `{target_section}` section — \
+             SEC() macro changed?"
+        );
+        assert!(
+            atomic_count >= 1,
+            "probe.o `{target_section}` section has no BPF_STX|BPF_ATOMIC|cmpxchg \
+             instruction — `__sync_val_compare_and_swap` was silently \
+             lowered to a non-atomic store. Cross-core ordering on aarch64 \
+             would be broken by this regression."
+        );
     }
-    assert!(
-        found_section,
-        "probe.o is missing the expected `{TARGET_SECTION}` section — \
-         SEC() macro changed?"
-    );
-    assert!(
-        atomic_count >= 1,
-        "probe.o `{TARGET_SECTION}` section has no BPF_STX|BPF_ATOMIC|cmpxchg \
-         instruction — `__sync_val_compare_and_swap` was silently \
-         lowered to a non-atomic store. Cross-core ordering on aarch64 \
-         would be broken by this regression."
-    );
 }
 
 /// `ScxWalkerOffsets::missing_groups` enumerates exactly the
