@@ -1846,9 +1846,9 @@ struct PreparedObject {
 }
 
 impl PreparedObject {
-    fn read_exact_at(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+    fn read_exact_into(&self, offset: usize, out: &mut [u8]) -> Result<()> {
         let end = offset
-            .checked_add(len)
+            .checked_add(out.len())
             .context("prepared object read overflow")?;
         let payload_len =
             usize::try_from(self.header.payload_len).context("payload length exceeds usize")?;
@@ -1857,9 +1857,8 @@ impl PreparedObject {
             .data_offset
             .checked_add(offset)
             .context("prepared object file offset overflow")?;
-        let mut out = vec![0u8; len];
         let mut done = 0usize;
-        while done < len {
+        while done < out.len() {
             let absolute = file_offset
                 .checked_add(done)
                 .context("prepared object pread offset overflow")?;
@@ -1871,7 +1870,7 @@ impl PreparedObject {
                         .context("prepared object fd already consumed")?
                         .as_raw_fd(),
                     out[done..].as_mut_ptr().cast(),
-                    len - done,
+                    out.len() - done,
                     absolute,
                 )
             };
@@ -1885,6 +1884,12 @@ impl PreparedObject {
             anyhow::ensure!(read != 0, "prepared object truncated during pread");
             done += read as usize;
         }
+        Ok(())
+    }
+
+    fn read_exact_at(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        let mut out = vec![0u8; len];
+        self.read_exact_into(offset, &mut out)?;
         Ok(out)
     }
 }
@@ -3747,6 +3752,19 @@ struct PreparedGeometry {
     compression: initramfs::InitrdCompression,
 }
 
+fn layout_compressed_part(compressed: Vec<u8>, leading_pad: usize) -> Result<Vec<u8>> {
+    if leading_pad == 0 {
+        return Ok(compressed);
+    }
+    let layout_len = leading_pad
+        .checked_add(compressed.len())
+        .context("prepared part layout length overflow")?;
+    let mut layout = Vec::with_capacity(layout_len);
+    layout.resize(leading_pad, 0);
+    layout.extend_from_slice(&compressed);
+    Ok(layout)
+}
+
 fn get_or_build_part<F>(
     root: &Path,
     kind: PreparedObjectKind,
@@ -3780,10 +3798,11 @@ where
     };
     get_or_build_prepared_object(root, expectation, || {
         let uncompressed = build()?;
+        let uncompressed_len = uncompressed.len();
         let compressed = initramfs::compress_initrd_part(compression, &uncompressed)?;
-        let mut layout = Vec::with_capacity(leading_pad + compressed.len());
-        layout.resize(leading_pad, 0);
-        layout.extend_from_slice(&compressed);
+        drop(uncompressed);
+        let compressed_len = compressed.len();
+        let layout = layout_compressed_part(compressed, leading_pad)?;
         let header = PreparedObjectHeader {
             kind,
             compression,
@@ -3791,8 +3810,8 @@ where
             mapping_granule: mapping_granule as u64,
             payload_len: layout.len() as u64,
             payload_hash: content_hash_bytes(&layout),
-            part_uncompressed_len: uncompressed.len() as u64,
-            part_compressed_len: compressed.len() as u64,
+            part_uncompressed_len: uncompressed_len as u64,
+            part_compressed_len: compressed_len as u64,
             leading_pad: leading_pad as u64,
             stream_offset_mod: leading_pad as u64,
             file_alignment: file_alignment as u64,
@@ -3849,10 +3868,11 @@ fn get_or_build_part_view(
     };
     get_or_build_prepared_object(root, expectation, || {
         let compressed_len = usize::try_from(canonical.header.part_compressed_len)?;
-        let compressed = canonical.read_exact_at(0, compressed_len)?;
-        let mut layout = Vec::with_capacity(leading_pad + compressed.len());
-        layout.resize(leading_pad, 0);
-        layout.extend_from_slice(&compressed);
+        let layout_len = leading_pad
+            .checked_add(compressed_len)
+            .context("shifted prepared-part view length overflow")?;
+        let mut layout = vec![0u8; layout_len];
+        canonical.read_exact_into(0, &mut layout[leading_pad..])?;
         let header = PreparedObjectHeader {
             kind: view_kind,
             compression,
@@ -3901,7 +3921,9 @@ pub(crate) fn get_or_prepare_base(
     };
     let object = get_or_build_prepared_object(&root, expectation, || {
         let uncompressed = inputs.build()?;
+        let uncompressed_len = uncompressed.len();
         let compressed = initramfs::compress_initrd_part(compression, &uncompressed)?;
+        drop(uncompressed);
         let header = PreparedObjectHeader {
             kind: PreparedObjectKind::Base,
             compression,
@@ -3909,7 +3931,7 @@ pub(crate) fn get_or_prepare_base(
             mapping_granule: mapping_granule as u64,
             payload_len: compressed.len() as u64,
             payload_hash: content_hash_bytes(&compressed),
-            part_uncompressed_len: uncompressed.len() as u64,
+            part_uncompressed_len: uncompressed_len as u64,
             part_compressed_len: compressed.len() as u64,
             leading_pad: 0,
             stream_offset_mod: 0,
@@ -5405,6 +5427,92 @@ mod tests {
             })
         })
         .unwrap()
+    }
+
+    #[test]
+    fn zero_pad_compressed_layout_reuses_the_original_allocation() {
+        let compressed: Vec<u8> = (0..8192).map(|index| (index % 251) as u8).collect();
+        let allocation = compressed.as_ptr();
+        let expected = compressed.clone();
+
+        let layout = layout_compressed_part(compressed, 0).unwrap();
+
+        assert_eq!(layout, expected);
+        assert_eq!(
+            layout.as_ptr(),
+            allocation,
+            "the canonical zero-pad path must move the compressed Vec instead of copying it"
+        );
+        assert_eq!(
+            layout_compressed_part(vec![1, 2, 3], 4).unwrap(),
+            vec![0, 0, 0, 0, 1, 2, 3],
+            "the padded path must retain its exact wire layout"
+        );
+    }
+
+    #[test]
+    fn shifted_part_view_preserves_padding_body_and_cache_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(temp.path()).unwrap();
+        let mapping_granule = PREPARED_MAPPING_GRANULE;
+        let file_alignment = 4096;
+        let leading_pad = 3072;
+        let compressed_len = 8193;
+        let canonical_key = 0xa5;
+        let canonical = test_prepared_part(
+            temp.path(),
+            PreparedObjectKind::Payload,
+            canonical_key,
+            mapping_granule,
+            file_alignment,
+            0,
+            compressed_len,
+        );
+        let geometry = PreparedGeometry {
+            mapping_granule,
+            file_alignment,
+            compression: initramfs::InitrdCompression::Lz4,
+        };
+
+        let first = get_or_build_part_view(
+            temp.path(),
+            &canonical,
+            PreparedObjectKind::PayloadView,
+            leading_pad,
+            geometry,
+        )
+        .unwrap();
+        assert!(!first.cache_hit);
+        let layout = first
+            .read_exact_at(0, leading_pad + compressed_len)
+            .unwrap();
+        assert!(layout[..leading_pad].iter().all(|byte| *byte == 0));
+        assert!(
+            layout[leading_pad..]
+                .iter()
+                .all(|byte| *byte == canonical_key as u8)
+        );
+        assert_eq!(first.header.payload_hash, content_hash_bytes(&layout));
+        drop(first);
+
+        let second = get_or_build_part_view(
+            temp.path(),
+            &canonical,
+            PreparedObjectKind::PayloadView,
+            leading_pad,
+            geometry,
+        )
+        .unwrap();
+        assert!(
+            second.cache_hit,
+            "the direct-read view must retain the existing recipe and cache identity"
+        );
+        assert_eq!(
+            second
+                .read_exact_at(0, leading_pad + compressed_len)
+                .unwrap(),
+            layout
+        );
     }
 
     fn test_prepared_base(
