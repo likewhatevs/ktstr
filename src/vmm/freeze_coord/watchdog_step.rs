@@ -20,33 +20,18 @@
 //!     [`phase_wall_backstop_ns`] with live evidence channels and no
 //!     runnable demand — a *silent* wedge. No CPU term: the runnable
 //!     conjunct alone carries the starvation protection (see the rule).
-//!   - Tier-3 (the guest-derived hard deadline) lives in the watchdog
-//!     thread ([`super`]); [`deadman_should_fire`] here is its deferral
-//!     gate. It fires at the wall deadline when the monitor is dead, the
-//!     cell is inert (CPU trickle-stalled AND no milestone within the
-//!     grace), or the current phase has consumed more busiest-vCPU CPU
-//!     than the VM's entire effective deadline budget. The last condition
-//!     is a dilation-immune bound for an active Body livelock: host
-//!     starvation stretches the wall needed to spend the budget, while a
-//!     guest that keeps burning CPU can no longer defer forever.
+//!   - Tier-3 begins at the guest-derived hard wall boundary, but wall age
+//!     is not a verdict. [`DeadmanHostService`] keeps explicit per-vCPU host
+//!     task/service samples: runnable tasks, sample changes, and delivered
+//!     vCPU service defer and re-anchor; only an unchanged blocked set can
+//!     spend a finite watchdog-thread CPU-service budget. Explicit monitor
+//!     termination and the busiest-vCPU CPU backstop remain authoritative.
 //!
-//! The CPU-trickle discriminator ([`CpuTrickleTracker`]) serves the Tier-3
-//! deadman's deferral gate ONLY: a starved-but-alive cell (even at ~40x
-//! host dilation) still lands tens of ms/s of guest CPU on its busiest
-//! vCPU → not stalled → the deadman defers a slow cell rather than
-//! false-killing it. It is denominated in the BUSIEST single vCPU's
-//! windowed accrual (`max_i(C_i(now) - C_i(window_start))` over the
-//! per-vCPU cumulatives), not the summed CPU nor a per-tick max: those grow
-//! with vCPU count faster (a wide idle guest's rotating background burn
-//! sums ~64x above a per-vCPU floor), while the per-vCPU windowed max
-//! collapses the rotation. Computed monitor-side and published as
-//! `cpu_trickle_stalled`. It is deliberately NOT a Tier-2 conjunct: the
-//! guest housekeeping CPU's timekeeping/RCU tick burns 20-45 ms/10 s at 64
-//! vCPUs (scaling with width), so no width-stable floor can separate
-//! wide-idle from starved-alive there — the runnable conjunct carries that
-//! protection instead (see the Tier-2 rule). The same width residual in the
-//! deadman only DEFERS (never kills); its runnable-piled remainder is
-//! bounded by the guest scx watchdog (see [`deadman_should_fire`]).
+//! [`CpuTrickleTracker`] remains diagnostic telemetry. Its calibrated
+//! busiest-vCPU window is useful in failure reports, but it is deliberately
+//! absent from every kill predicate: wide idle guests and deeply starved
+//! live guests overlap too much for a fixed trickle floor to be proof of a
+//! wedge.
 
 use crate::monitor::{
     CPU_CURRENCY_NONE, CPU_CURRENCY_PTHREAD, LedgerSnapshot, LifecycleStage, StageClass,
@@ -83,28 +68,26 @@ pub(crate) enum KillDecision {
 
 /// Trailing window over which [`CpuTrickleTracker`] measures the guest's
 /// busiest-vCPU CPU accrual. 10 s is long enough to average out the 100 ms
-/// tick jitter and the bursty ISR pattern on parked vCPUs, yet short enough
-/// that the deadman's stall verdict refreshes several times inside its
-/// 60 s milestone grace.
+/// tick jitter and the bursty ISR pattern on parked vCPUs while keeping the
+/// diagnostic responsive.
 const TRICKLE_STALL_WINDOW_NS: u64 = 10_000_000_000;
 
 /// Minimum busiest-vCPU guest CPU (ns) that must accrue over one
 /// [`TRICKLE_STALL_WINDOW_NS`] for the guest to count as "receiving CPU"
-/// (NOT trickle-stalled) under the PMU currency. 1 ms / 10 s discriminates
-/// the two populations the deadman's deferral gate must tell apart: an
+/// (NOT trickle-stalled) under the PMU currency. 1 ms / 10 s distinguishes
+/// two useful diagnostic populations: an
 /// idle-or-wedged guest still takes timer interrupts on its parked vCPUs
 /// but the PMU SW task-clock (`exclude_host`) counts only guest-mode
 /// execution, so its busiest vCPU accrues just the in-guest ISR bodies —
 /// tens of µs over the window at 1 vCPU, below the floor → stalled — while
 /// even a cell starved at ~40x host dilation lands tens of ms/s on its
 /// busiest vCPU (hundreds of ms over the window — far above the floor →
-/// not stalled → the deadman defers).
+/// not stalled).
 ///
 /// CALIBRATED ON 1-vCPU CELLS. At width the guest housekeeping CPU's
 /// timekeeping/RCU duty grows with vCPU count and can lift an idle guest's
 /// busiest vCPU over this floor (see [`CpuTrickleTracker`]); the misread
-/// only DEFERS the deadman — Tier-2 owns the idle-wedge kill and carries
-/// no trickle term — so the 1-vCPU calibration stays safe to keep.
+/// is why this signal is diagnostic only.
 const TRICKLE_FLOOR_NS: u64 = 1_000_000;
 
 /// [`TRICKLE_FLOOR_NS`]'s sibling for the PTHREAD currency, mirroring the
@@ -118,18 +101,12 @@ const TRICKLE_FLOOR_NS: u64 = 1_000_000;
 /// Tier-2 made the idle wedge invisible to both consumers); a
 /// starved-but-alive cell at even ~100x dilation accrues 100+ ms per
 /// window on its busiest vCPU. 25 ms sits in that measured gap with ~2.5x
-/// margin in both directions. The deadman additionally requires a 60 s-stale
-/// milestone ([`TIER3_PROGRESS_GRACE_NS`]), so the joint false-kill
-/// condition is sub-0.25%-CPU-delivery for 60+ s at the wall deadline — a
-/// defensible operator bound.
+/// margin in both directions for diagnostics.
 ///
 /// CALIBRATED ON 1-vCPU CELLS (where the summed and busiest-vCPU
 /// currencies coincide). At width the housekeeping-CPU duty lifts an idle
 /// guest's busiest vCPU to 20-45 ms per window at 64 vCPUs — over this
-/// floor — so the deadman can misread a wide idle guest as alive and
-/// DEFER. That is safe: Tier-2 owns the idle-wedge kill without any
-/// trickle term, and the deferral's runnable-piled remainder is bounded by
-/// the guest scx watchdog (see [`deadman_should_fire`]).
+/// floor, which is why no watchdog verdict consumes this classification.
 const TRICKLE_FLOOR_PTHREAD_NS: u64 = 25_000_000;
 
 /// Consecutive sub-floor [`TRICKLE_STALL_WINDOW_NS`] windows required
@@ -172,9 +149,7 @@ pub(crate) const fn widen_budget_for_currency(budget: u64, cpu_currency: u8) -> 
 /// [`TRICKLE_FLOOR_PTHREAD_NS`] applies (see its doc for the measured
 /// populations). `CPU_CURRENCY_NONE` gets the pthread floor too: with no
 /// per-vCPU source this tick the readings carry no trusted magnitude, and
-/// the wider floor is the conservative-against-immortality choice — an
-/// inert cell must stay deadman-killable — while the deadman's 60 s
-/// milestone grace still guards a live cell.
+/// the wider floor produces the more useful diagnostic classification.
 pub(crate) const fn trickle_floor_for_currency(cpu_currency: u8) -> u64 {
     match cpu_currency {
         crate::monitor::CPU_CURRENCY_PMU => TRICKLE_FLOOR_NS,
@@ -229,8 +204,9 @@ pub(crate) fn watchdog_step(
     // last milestone, and milestones are published through the same ledger
     // — with a dead monitor the anchor can never advance, so the wall
     // delta grows unboundedly even for a healthy guest and Tier-2 would
-    // false-fire. Suppress both while the monitor is not live; the Tier-3
-    // deadman ([`deadman_should_fire`]) takes over that case.
+    // false-fire. Suppress both while the monitor is not live; after the
+    // hard boundary Tier-3 uses explicit monitor-terminal and host-service
+    // evidence instead of heartbeat staleness.
     if !monitor_live {
         return KillDecision::None;
     }
@@ -269,17 +245,15 @@ pub(crate) fn watchdog_step(
     //     memory is readable regardless of host scheduling), so it is
     //     exempt here; a cell with NOTHING runnable is not starved of
     //     anything, and idle-in-INFRA past the backstop IS the wedge
-    //     definition. If a runnable-exempted cell is also stalled, the
-    //     Tier-3 deadman / guest scx watchdog bound it rather than Tier-2.
+    //     definition. Host-side Tier-3 task/service evidence and the guest
+    //     scx watchdog bound runnable-exempted cells rather than Tier-2.
     //
     // Deliberately NO CPU-trickle conjunct. Trickle here was width-broken
     // belt-and-braces duplicating the runnable protection: the guest
     // housekeeping CPU's timekeeping/RCU tick burns 20-45 ms per 10 s
     // window at 64 vCPUs (measured; scales with width), so no width-stable
-    // floor exists — a wide idle wedge read "not stalled" and became
-    // immortal to Tier-2 AND the trickle-gated deadman. The trickle
-    // discriminator remains the DEADMAN's deferral gate only
-    // ([`deadman_should_fire`]), where its residual merely defers.
+    // floor exists — a wide idle wedge read "not stalled". Trickle remains
+    // diagnostic telemetry only and cannot influence this verdict.
     if class == PhaseClass::Infra
         && channels_live
         && !runnable_demand
@@ -337,10 +311,8 @@ pub(crate) const fn deadman_cpu_budget_exhausted(
 /// in-phase delta and maps the lifecycle stage onto a [`PhaseClass`],
 /// then defers to `watchdog_step`. Kept pure (the wall clock arrives as
 /// `now_wall_ns`) so the ledger-read → tier-decision path is unit-testable
-/// without a live watchdog thread. The ledger's `cpu_trickle_stalled` is
-/// NOT consumed here — it gates only the Tier-3 deadman
-/// ([`deadman_should_fire`]), which the watchdog thread evaluates
-/// separately.
+/// without a live watchdog thread. The ledger's
+/// `cpu_trickle_stalled` remains diagnostic-only and is not consumed here.
 ///
 /// `now_wall_ns` is `run_start`-relative — the SAME `run_start` the
 /// monitor/dispatch anchor `wall_ns_at_progress` to — so `wall_in_phase`
@@ -379,82 +351,6 @@ pub(crate) fn evaluate_progress(
         snap.cpu_currency,
         vcpus,
     )
-}
-
-/// Grace window for the Tier-3 deadman (the guest-derived hard deadline):
-/// once the wall deadline has elapsed, an otherwise-unbounded active-cell
-/// deferral ends when its CPU backstop is exhausted; an inert-cell deferral
-/// ends after this milestone grace.
-///
-/// TERMINATION STORY (exactly this shape):
-///   - A starved-but-alive cell keeps accruing guest CPU (tens of ms/s
-///     even at ~40x dilation), so it is NOT trickle-stalled and is
-///     DEFERRED past the wall deadline by design. It remains bounded by the
-///     dilation-immune busiest-vCPU budget: a slow cell spends that budget
-///     slowly, while an active livelock eventually exhausts it.
-///   - An idle userspace wedge on a LIVE kernel (the classic PID-1-blocked
-///     shape) shows no runnable demand, so Tier-2 kills it at the wall
-///     backstop long before this deadline; the deadman is its backstop-of-
-///     last-resort should Tier-2's channel gate stay blind. (Milestone-only
-///     progress is what makes this work: kernel scheduling noise would
-///     otherwise reset a wall-since-progress clock every tick and defer
-///     forever.)
-///   - A runnable-piled-up stalled-scx cell has `runnable_demand=true`, so
-///     Tier-2 exempts it — its CPU also trickle-stalls (tasks never run),
-///     so this deadman bounds it at the wall deadline. At wide vCPU counts
-///     the trickle can misread such a cell as alive (the housekeeping-CPU
-///     width residual — see [`CpuTrickleTracker`]) and this deadman then
-///     DEFERS; that residual is still bounded, by the guest scx watchdog
-///     (`scx_tick` fires `SCX_EXIT_ERROR_STALL` on a stalled scheduler),
-///     not by wall deferral here.
-///   - An INFRA spinning wedge never reaches here: Tier-1 bounds it on the
-///     phase CPU budget long before the deadline. Body deliberately has no
-///     Tier-1 budget, so the whole-VM CPU backstop closes that gap here.
-///
-/// 60 s is generous against the 100 ms watchdog tick and any legitimate
-/// quiet span (so a live cell is never misjudged), yet small against the
-/// multi-minute deadlines it defers.
-pub(crate) const TIER3_PROGRESS_GRACE_NS: u64 = 60_000_000_000;
-
-/// Decide whether the Tier-3 deadman should FIRE now that the hard wall
-/// deadline has already elapsed. Pure — the watchdog supplies the live
-/// values (see the caller in `freeze_coord`).
-///
-///   - `monitor_live`: the monitor is producing fresh ledger writes. When
-///     false the progress machinery is dead, so nothing can defer — fire.
-///   - `wall_since_milestone_ns`: wall time since the last MILESTONE
-///     (`progress_epoch` anchor). Milestone-only, so a live kernel's
-///     scheduling noise does NOT reset it.
-///   - `cpu_trickle_stalled`: the guest is receiving essentially no CPU
-///     ([`CpuTrickleTracker`]). CPU still trickling above the floor = the
-///     guest is alive and merely slow → defer. This deadman is the trickle
-///     discriminator's ONLY consumer (Tier-2 dropped it as width-broken
-///     belt-and-braces): here a width residual can only DEFER a kill, and
-///     the runnable-piled cell it would defer is bounded by the guest scx
-///     watchdog instead.
-///   - `max_vcpu_cpu_in_phase_ns`, `effective_deadline_budget_ns`, and
-///     `cpu_currency`: the active-cell CPU backstop evidence, budget, and
-///     provenance. [`deadman_cpu_budget_exhausted`] owns the comparison and
-///     pthread widening.
-///
-/// Fires iff the monitor is dead, the active-cell CPU backstop is exhausted,
-/// OR the cell is inert: CPU trickle-stalled AND no milestone within the full
-/// [`TIER3_PROGRESS_GRACE_NS`].
-pub(crate) fn deadman_should_fire(
-    monitor_live: bool,
-    wall_since_milestone_ns: u64,
-    cpu_trickle_stalled: bool,
-    max_vcpu_cpu_in_phase_ns: u64,
-    effective_deadline_budget_ns: u64,
-    cpu_currency: u8,
-) -> bool {
-    !monitor_live
-        || deadman_cpu_budget_exhausted(
-            max_vcpu_cpu_in_phase_ns,
-            effective_deadline_budget_ns,
-            cpu_currency,
-        )
-        || (cpu_trickle_stalled && wall_since_milestone_ns > TIER3_PROGRESS_GRACE_NS)
 }
 
 /// Delivered watchdog CPU service allowed while every sampled host-vCPU
@@ -758,10 +654,9 @@ impl DeadmanHostService {
 
 /// Pure state machine that turns each tick's PER-vCPU cumulative CPU-time
 /// readings into a boolean "the guest is receiving essentially no CPU"
-/// (trickle-stalled) — the Tier-3 deadman's deferral discriminator
-/// ([`deadman_should_fire`]), its ONLY consumer. No clocks, no atomics — so
-/// its window arithmetic is unit-testable in isolation. Driven by the
-/// MONITOR (which owns the per-vCPU CPU data), not the watchdog: the
+/// (trickle-stalled) for diagnostics. No clocks, no atomics — so its window
+/// arithmetic is unit-testable in isolation. Driven by the MONITOR (which
+/// owns the per-vCPU CPU data), not the watchdog: the
 /// monitor feeds it each tick's active-currency per-vCPU cumulatives (the
 /// same readings the Tier-1
 /// [`crate::monitor::reader::MaxVcpuInPhaseTracker`] sees) and a `run_start`-
@@ -782,9 +677,8 @@ impl DeadmanHostService {
 /// housekeeping CPU's timekeeping/RCU duty grows with width (measured
 /// 20-45 ms per 10 s window at 64 vCPUs under pthread currency, vs 1-10 ms
 /// at 1 vCPU), which can exceed the 1-vCPU-calibrated floors and misread a
-/// wide idle guest as alive. That misread is why this discriminator gates
-/// ONLY the deadman's deferral (where it can merely DEFER a kill, bounded
-/// elsewhere) and is NOT a Tier-2 conjunct.
+/// wide idle guest as alive. That overlap is why this discriminator is
+/// diagnostic-only and absent from both Tier-2 and Tier-3 predicates.
 ///
 /// Measures accrual over a trailing [`TRICKLE_STALL_WINDOW_NS`]: it holds a
 /// `(now_ns, anchor[])` window anchor and, each time at least a full window
@@ -1118,8 +1012,8 @@ mod tests {
         // THE WIDE-IDLE REGRESSION ROW (restores approved row D-infra): a
         // 64-vCPU idle wedge whose housekeeping CPU burns 20-45 ms per 10 s
         // window (the measured width residual that kept the old trickle
-        // conjunct reading "alive" and made the wedge immortal to Tier-2
-        // AND the trickle-gated deadman). With the trickle conjunct gone,
+        // conjunct reading "alive" and made the wedge immortal to Tier-2).
+        // With the trickle conjunct gone,
         // that burn shows up only in `max_vcpu_cpu_in_phase` — far under
         // the Tier-1 budget — and Tier-2 fires on the wall backstop alone:
         // nothing runnable + INFRA past backstop IS the wedge.
@@ -1299,64 +1193,7 @@ mod tests {
         assert_eq!(d, KillDecision::None);
     }
 
-    // ---- Tier-3 deadman deferral: deadman_should_fire ----
-
-    #[test]
-    fn deadman_dead_monitor_always_fires() {
-        // Monitor dead → fire regardless of wall / trickle (the machinery
-        // that could defer is gone).
-        assert!(deadman_should_fire(
-            false,
-            0,
-            false,
-            0,
-            100 * S,
-            CPU_CURRENCY_PMU
-        ));
-        assert!(deadman_should_fire(
-            false,
-            100 * S,
-            true,
-            0,
-            100 * S,
-            CPU_CURRENCY_PMU,
-        ));
-    }
-
-    #[test]
-    fn deadman_starved_but_alive_defers_while_cpu_budget_remains() {
-        // Monitor live, NOT trickle-stalled (CPU still accruing) — a
-        // starved-but-alive cell defers past the wall deadline while it has
-        // not spent the dilation-immune CPU backstop.
-        assert!(!deadman_should_fire(
-            true,
-            TIER3_PROGRESS_GRACE_NS + S,
-            false,
-            99 * S,
-            100 * S,
-            CPU_CURRENCY_PMU,
-        ));
-        assert!(!deadman_should_fire(
-            true,
-            1_000 * S,
-            false,
-            99 * S,
-            100 * S,
-            CPU_CURRENCY_PMU,
-        ));
-    }
-
-    #[test]
-    fn deadman_active_cell_fires_when_cpu_budget_is_exhausted() {
-        assert!(deadman_should_fire(
-            true,
-            0,
-            false,
-            100 * S + 1,
-            100 * S,
-            CPU_CURRENCY_PMU,
-        ));
-    }
+    // ---- Tier-3 host-service deadman ----
 
     #[test]
     fn deadman_cpu_backstop_is_width_independent_and_currency_widened() {
@@ -1388,49 +1225,6 @@ mod tests {
             CPU_CURRENCY_NONE
         ));
     }
-
-    #[test]
-    fn deadman_inert_cell_fires_past_grace() {
-        // Monitor live, trickle-stalled, and no milestone for longer than
-        // the grace → the cell is inert → fire (the idle-userspace-wedge /
-        // stalled-scx bound). Strict `>` on the grace boundary.
-        assert!(deadman_should_fire(
-            true,
-            TIER3_PROGRESS_GRACE_NS + 1,
-            true,
-            0,
-            100 * S,
-            CPU_CURRENCY_PMU,
-        ));
-        assert!(
-            !deadman_should_fire(
-                true,
-                TIER3_PROGRESS_GRACE_NS,
-                true,
-                0,
-                100 * S,
-                CPU_CURRENCY_PMU,
-            ),
-            "exactly at the grace is not yet past it"
-        );
-    }
-
-    #[test]
-    fn deadman_trickle_stalled_within_grace_defers() {
-        // Trickle-stalled but a milestone landed within the grace → defer
-        // (a recent milestone means the cell is still advancing its
-        // lifecycle).
-        assert!(!deadman_should_fire(
-            true,
-            TIER3_PROGRESS_GRACE_NS - S,
-            true,
-            0,
-            100 * S,
-            CPU_CURRENCY_PMU,
-        ));
-    }
-
-    // ---- Tier-3 host-service deadman ----
 
     fn host_task(
         task_id: Option<u32>,

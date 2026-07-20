@@ -65,9 +65,9 @@ mod lazy_init;
 mod snapshot;
 mod state;
 // `pub(crate)` so the monitor can drive `CpuTrickleTracker` /
-// `trickle_floor_for_currency`: the width-sound trickle-stall verdict is
-// computed monitor-side (it owns the per-vCPU CPU data the busiest-vCPU
-// windowed currency needs) and published to the ledger for the watchdog.
+// `trickle_floor_for_currency`: diagnostic trickle telemetry is computed
+// monitor-side because it owns the per-vCPU CPU data, while the watchdog
+// consumes the host-service deadman types below.
 pub(crate) mod watchdog_step;
 mod watchpoint;
 
@@ -369,13 +369,12 @@ pub(crate) enum KillReasonTag {
     /// Tier-2: no progress past the phase wall backstop with no runnable
     /// demand — a silent idle wedge (`KillDecision::Tier2IdleWedge`).
     Tier2Idle = 2,
-    /// Tier-3: the guest-derived hard deadline expired AND the deadman was
-    /// not deferred — the monitor was dead (`!monitor_live`), the cell was
-    /// inert (CPU trickle-stalled AND no milestone within
-    /// [`watchdog_step::TIER3_PROGRESS_GRACE_NS`]), or the current phase
-    /// exhausted the whole effective-deadline busiest-vCPU budget. NOT an
-    /// unconditional wall clock: a starved-but-alive cell accrues that CPU
-    /// budget slowly, while an active Body livelock is now finite.
+    /// Tier-3: the guest-derived hard boundary was crossed and authoritative
+    /// host-service evidence fired — the monitor explicitly terminated, the
+    /// current phase exhausted the whole effective-deadline busiest-vCPU
+    /// budget, the vCPU tasks stayed unchanged/non-runnable while the
+    /// watchdog received its finite observation service, or that required
+    /// observer clock failed. Wall age and heartbeat staleness never fire it.
     Tier3Deadman = 3,
     /// An AP set the kill flag (a panic-driven kill), not a watchdog
     /// timeout. Distinct so the dump does not mislabel it as an expiry.
@@ -673,41 +672,41 @@ fn prepare_watchdog_wake(
     Ok(WatchdogWake { tick_tfd, epoll })
 }
 
-/// Apply the attach-overlay gate at the watchdog caller, before ordinary
-/// Tier-3 or its soft-shutdown prefire can consume stale/dead monitor
-/// evidence. AP kill and attach-specific fail-closed bypass this helper.
-struct DeadmanEvidence {
-    monitor_live: bool,
-    wall_since_milestone_ns: u64,
-    cpu_trickle_stalled: bool,
-    max_vcpu_cpu_in_phase_ns: u64,
-    effective_deadline_budget_ns: u64,
-    cpu_currency: u8,
-}
-
-fn ordinary_watchdog_boundary_should_fire(
+/// Apply the attach-overlay and guest-derived wall-boundary gates before the
+/// ordinary Tier-3 state machine observes host service. AP kill and
+/// attach-specific fail-closed bypass this helper.
+fn ordinary_watchdog_boundary_decision(
     attach_overlay_active: bool,
     boundary_reached: bool,
-    evidence: DeadmanEvidence,
+    deadman: &mut watchdog_step::DeadmanHostService,
+    input: watchdog_step::DeadmanHostServiceInput<'_>,
+) -> Option<watchdog_step::DeadmanHostDecision> {
+    (!attach_overlay_active && boundary_reached).then(|| deadman.observe(input))
+}
+
+/// A soft shutdown request is itself a guest-side state transition, so it may
+/// not be injected merely because wall time elapsed. Before the hard boundary,
+/// only already-authoritative evidence can justify it: an explicitly
+/// terminated monitor or an exhausted busiest-vCPU service budget. Stable
+/// blocked-host evidence begins accruing only at the hard boundary.
+fn ordinary_watchdog_soft_prefire_should_fire(
+    attach_overlay_active: bool,
+    soft_boundary_reached: bool,
+    monitor_terminal: bool,
+    vcpu_cpu_budget_exhausted: bool,
 ) -> bool {
     !attach_overlay_active
-        && boundary_reached
-        && watchdog_step::deadman_should_fire(
-            evidence.monitor_live,
-            evidence.wall_since_milestone_ns,
-            evidence.cpu_trickle_stalled,
-            evidence.max_vcpu_cpu_in_phase_ns,
-            evidence.effective_deadline_budget_ns,
-            evidence.cpu_currency,
-        )
+        && soft_boundary_reached
+        && (monitor_terminal || vcpu_cpu_budget_exhausted)
 }
 
 #[cfg(test)]
 mod watchdog_reset_tag_tests {
     use super::{
-        DeadmanEvidence, KillReasonTag, WatchdogResetTag, WatchdogWakeSetupStage,
-        decode_guest_phase, decode_watchdog_kill_reason, ordinary_watchdog_boundary_should_fire,
-        prepare_watchdog_wake, update_watchdog_reset_max, watchdog_hard_deadline,
+        KillReasonTag, WatchdogResetTag, WatchdogWakeSetupStage, decode_guest_phase,
+        decode_watchdog_kill_reason, ordinary_watchdog_boundary_decision,
+        ordinary_watchdog_soft_prefire_should_fire, prepare_watchdog_wake,
+        update_watchdog_reset_max, watchdog_hard_deadline,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -715,24 +714,48 @@ mod watchdog_reset_tag_tests {
     use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
     #[test]
-    fn attach_overlay_gates_tier3_and_soft_prefire_at_the_caller() {
-        let otherwise_terminal = |overlay_active, boundary_reached| {
-            ordinary_watchdog_boundary_should_fire(
+    fn attach_overlay_and_boundary_gate_tier3_observation_at_the_caller() {
+        let terminal = |overlay_active, boundary_reached| {
+            let mut deadman = super::watchdog_step::DeadmanHostService::new();
+            ordinary_watchdog_boundary_decision(
                 overlay_active,
                 boundary_reached,
-                DeadmanEvidence {
-                    monitor_live: false, // would ordinarily fire immediately
-                    wall_since_milestone_ns: u64::MAX,
-                    cpu_trickle_stalled: true,
-                    max_vcpu_cpu_in_phase_ns: u64::MAX,
-                    effective_deadline_budget_ns: 1,
-                    cpu_currency: crate::monitor::CPU_CURRENCY_PMU,
+                &mut deadman,
+                super::watchdog_step::DeadmanHostServiceInput {
+                    monitor_terminal: true,
+                    vcpu_cpu_budget_exhausted: false,
+                    observer_cpu: super::watchdog_step::DeadmanObserverClock::Unavailable,
+                    vcpu_tasks: &[],
                 },
             )
         };
-        assert!(otherwise_terminal(false, true));
-        assert!(!otherwise_terminal(true, true));
-        assert!(!otherwise_terminal(false, false));
+        assert!(matches!(
+            terminal(false, true),
+            Some(super::watchdog_step::DeadmanHostDecision::Fire(
+                super::watchdog_step::DeadmanHostFire::MonitorTerminal
+            ))
+        ));
+        assert!(terminal(true, true).is_none());
+        assert!(terminal(false, false).is_none());
+    }
+
+    #[test]
+    fn soft_prefire_requires_authoritative_evidence() {
+        assert!(!ordinary_watchdog_soft_prefire_should_fire(
+            false, true, false, false
+        ));
+        assert!(ordinary_watchdog_soft_prefire_should_fire(
+            false, true, true, false
+        ));
+        assert!(ordinary_watchdog_soft_prefire_should_fire(
+            false, true, false, true
+        ));
+        assert!(!ordinary_watchdog_soft_prefire_should_fire(
+            true, true, true, true
+        ));
+        assert!(!ordinary_watchdog_soft_prefire_should_fire(
+            false, false, true, true
+        ));
     }
 
     /// The VmResult plumbing decodes each fired tier's raw byte into the
@@ -2667,6 +2690,45 @@ fn wait_for_ap_boot_latch_observed(
 fn ap_task_state(tid: i32) -> Option<char> {
     let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok()?;
     stat.rsplit(") ").next()?.chars().next()
+}
+
+/// Snapshot every vCPU slot for the post-boundary host-service deadman.
+///
+/// This O(vCPU) `/proc` walk is deliberately absent from the normal 100 ms
+/// watchdog path: the caller invokes it only after the guest-derived hard
+/// boundary. Slot identity stays explicit so a publishing/exiting/replaced
+/// task re-anchors the pure tracker rather than looking like zero service.
+fn deadman_host_vcpu_samples(
+    tid_slots: &[Arc<AtomicI32>],
+) -> Vec<watchdog_step::HostVcpuTaskSample> {
+    tid_slots
+        .iter()
+        .map(|slot| {
+            let tid = slot.load(Ordering::Acquire);
+            if tid <= 0 {
+                return watchdog_step::HostVcpuTaskSample {
+                    task_id: None,
+                    cpu_ns: None,
+                    run_state: watchdog_step::HostVcpuRunState::Unknown,
+                };
+            }
+
+            let cpu_ns = std::fs::read_to_string(format!("/proc/self/task/{tid}/schedstat"))
+                .ok()
+                .and_then(|line| parse_schedstat_line(line.trim()))
+                .map(|(on_cpu_ns, _)| on_cpu_ns);
+            let run_state = match ap_task_state(tid) {
+                Some('R') => watchdog_step::HostVcpuRunState::Runnable,
+                Some(_) => watchdog_step::HostVcpuRunState::NonRunnable,
+                None => watchdog_step::HostVcpuRunState::Unknown,
+            };
+            watchdog_step::HostVcpuTaskSample {
+                task_id: Some(tid as u32),
+                cpu_ns,
+                run_state,
+            }
+        })
+        .collect()
 }
 
 fn ap_gate_evidence(vcpu_id: usize, tid_slot: &AtomicI32, failure: &ApBootWaitFailure) -> String {
@@ -5428,6 +5490,7 @@ impl KtstrVm {
             .iter()
             .map(|(slot, _)| slot.clone())
             .collect();
+        let vcpu_tid_atomics_for_watchdog = vcpu_tid_atomics.clone();
         // Per-phase host-contention recorder. It owns the live TID handles for
         // rare lifecycle-boundary schedstat sweeps and a persistent O(1) CPU
         // PSI reader sampled from the monitor's existing timer wake.
@@ -14515,6 +14578,11 @@ impl KtstrVm {
                 // kill dump so a deferred-then-killed cell shows its
                 // history.
                 let mut deadman_deferrals: u64 = 0;
+                // Tier-3 begins sampling host vCPU tasks only after the
+                // guest-derived hard wall boundary. Runnable tasks and
+                // delivered vCPU service re-anchor this tracker; only an
+                // unchanged blocked set spends watchdog-thread CPU service.
+                let mut deadman_host_service = watchdog_step::DeadmanHostService::new();
                 if crate::vmm::debug_logging_enabled() {
                     eprintln!("ktstr-watchdog: started, timeout={timeout:?}");
                 }
@@ -14698,15 +14766,11 @@ impl KtstrVm {
                         | AttachWatchdogDecision::FinishUnsettled { .. } => None,
                     };
                     let attach_monitor_unavailable = attach_monitor_failure.is_some();
-                    // CPU-trickle verdict for this tick — the Tier-3
-                    // deadman's deferral discriminator (its ONLY consumer;
-                    // Tier-2 carries no CPU term). The MONITOR computes it
-                    // (it owns the per-vCPU CPU data the busiest-vCPU
-                    // windowed currency needs — see
-                    // `watchdog_step::CpuTrickleTracker`); the watchdog just
-                    // reads the published verdict. `true` = the guest's
-                    // busiest single vCPU accrued below the currency floor
-                    // over the trailing window.
+                    // Diagnostic CPU-trickle verdict for this tick. The
+                    // MONITOR computes it because it owns the per-vCPU CPU
+                    // data the busiest-vCPU windowed currency needs (see
+                    // `watchdog_step::CpuTrickleTracker`). It is rendered in
+                    // failure evidence but participates in no kill predicate.
                     let cpu_trickle_stalled = snapshot.cpu_trickle_stalled;
                     // Wall time since the last MILESTONE (progress_epoch
                     // anchor) — milestone-only, so a live kernel's
@@ -14744,26 +14808,33 @@ impl KtstrVm {
                         );
                     let kill_set = kill_for_watchdog.load(Ordering::Acquire);
                     let hard_deadline_reached = Instant::now() >= effective_deadline;
-                    // Tier-3 deadman deferral: reaching the wall deadline
-                    // only KILLS when the monitor is dead, the cell is
-                    // inert (CPU trickle-stalled AND no milestone within
-                    // the grace), or the current phase has burned more
-                    // busiest-vCPU CPU than the VM's entire effective
-                    // deadline budget. That last bound closes Body's
-                    // intentional Tier-1 exemption without reintroducing
-                    // wall-clock false kills under host contention. See
-                    // [`watchdog_step::deadman_should_fire`].
-                    let deadman_fire = ordinary_watchdog_boundary_should_fire(
+                    // The wall boundary begins observation; it is never
+                    // itself a wedge verdict. Explicit monitor termination
+                    // and the existing busiest-vCPU CPU backstop remain
+                    // authoritative. Otherwise sample exact host vCPU tasks:
+                    // runnable tasks, task-generation/state changes, and
+                    // delivered vCPU service all defer/re-anchor. Only an
+                    // unchanged fully blocked set can spend the watchdog's
+                    // own delivered CPU-service budget.
+                    let deadman_host_samples = (!attach_step.active && hard_deadline_reached)
+                        .then(|| deadman_host_vcpu_samples(&vcpu_tid_atomics_for_watchdog));
+                    let deadman_decision = ordinary_watchdog_boundary_decision(
                         attach_step.active,
                         hard_deadline_reached,
-                        DeadmanEvidence {
-                            monitor_live,
-                            wall_since_milestone_ns,
-                            cpu_trickle_stalled,
-                            max_vcpu_cpu_in_phase_ns: snapshot.max_vcpu_cpu_in_phase_ns,
-                            effective_deadline_budget_ns,
-                            cpu_currency: snapshot.cpu_currency,
+                        &mut deadman_host_service,
+                        watchdog_step::DeadmanHostServiceInput {
+                            monitor_terminal: snapshot.monitor_terminal,
+                            vcpu_cpu_budget_exhausted: deadman_cpu_budget_exhausted,
+                            observer_cpu: read_cpu_clock_ns(libc::CLOCK_THREAD_CPUTIME_ID).map_or(
+                                watchdog_step::DeadmanObserverClock::Unavailable,
+                                watchdog_step::DeadmanObserverClock::Reading,
+                            ),
+                            vcpu_tasks: deadman_host_samples.as_deref().unwrap_or(&[]),
                         },
+                    );
+                    let deadman_fire = matches!(
+                        deadman_decision,
+                        Some(watchdog_step::DeadmanHostDecision::Fire(_))
                     );
                     if kill_set
                         || deadman_fire
@@ -14996,12 +15067,13 @@ impl KtstrVm {
                             render_budget(deadman_cpu_budget),
                             deadman_cpu_budget_exhausted,
                         );
-                        // Deadman trickle evidence: the BUSIEST single
+                        eprintln!("  tier3_host_service={deadman_decision:?}");
+                        // Diagnostic trickle evidence: the BUSIEST single
                         // vCPU's CPU accrued over the last closed 10 s
                         // window (monitor-computed via per-vCPU window
                         // anchors) vs the currency floor — what latched (or
-                        // deferred) `cpu_trickle_stalled` above. Deadman-
-                        // only; Tier-2 carries no CPU term.
+                        // `cpu_trickle_stalled` classification above. Neither
+                        // Tier-2 nor Tier-3 consumes it.
                         eprintln!(
                             "  busiest_vcpu_window={:?} vs trickle_floor={:?}",
                             Duration::from_nanos(snapshot.busiest_vcpu_window_ns),
@@ -15106,16 +15178,12 @@ impl KtstrVm {
                     // inherits that decision rather than
                     // synthesising a soft phase out of nothing.
                     //
-                    // Tier-3 deferral consistency: the soft request PRECEDES
-                    // the hard fire (3 s before), so it is gated by the SAME
-                    // deferral predicate — only nudge the guest toward a
-                    // flush+reboot when the deadman WOULD fire (monitor dead
-                    // or cell inert). A starved-but-alive cell is deferred,
-                    // so it must never be told to shut down: that would kill
-                    // the very cell the deferral protects. Once the wall
-                    // deadline is reached but deferred, count it (no
-                    // per-tick log — would spam for the whole deferral span)
-                    // and skip soft entirely.
+                    // A soft request precedes the hard boundary, so stable
+                    // blocked-host evidence has not begun accruing yet.
+                    // Inject shutdown only for already-authoritative facts:
+                    // explicit monitor termination or an exhausted vCPU
+                    // service backstop. Wall age, stale heartbeats, and
+                    // trickle classification remain diagnostic only.
                     let effective_soft = soft_deadline
                         .and_then(|_| effective_deadline.checked_sub(Duration::from_secs(3)));
                     if !attach_step.active && hard_deadline_reached {
@@ -15124,17 +15192,11 @@ impl KtstrVm {
                         // cell is alive but past its budget.
                         deadman_deferrals = deadman_deferrals.saturating_add(1);
                     } else if !soft_fired
-                        && ordinary_watchdog_boundary_should_fire(
+                        && ordinary_watchdog_soft_prefire_should_fire(
                             attach_step.active,
                             effective_soft.is_some_and(|d| Instant::now() >= d),
-                            DeadmanEvidence {
-                                monitor_live,
-                                wall_since_milestone_ns,
-                                cpu_trickle_stalled,
-                                max_vcpu_cpu_in_phase_ns: snapshot.max_vcpu_cpu_in_phase_ns,
-                                effective_deadline_budget_ns,
-                                cpu_currency: snapshot.cpu_currency,
-                            },
+                            snapshot.monitor_terminal,
+                            deadman_cpu_budget_exhausted,
                         )
                     {
                         soft_fired = true;
