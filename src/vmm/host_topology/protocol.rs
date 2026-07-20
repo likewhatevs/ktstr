@@ -1,6 +1,6 @@
 //! Cross-process host-resource admission under nextest.
 //!
-//! Every ktstr process sharing a lock directory participates in one v8
+//! Every ktstr process sharing a lock directory participates in one v9
 //! fixed-record mmap registry. A ticket publishes one exact, non-empty CPU/LLC
 //! reservation claim plus the resources its planner may watch. Claims preserve
 //! the resource-lock semantics exactly: CPU and LLC claims independently use
@@ -206,7 +206,7 @@ const TEST_RETRY_WAKE_MARKER: &str = ".ktstr-test-retry-wake";
 
 /// Directory the protocol files live in — derived from the LLC
 /// lockfile path so the test-only lock-prefix override isolates the
-/// v8 registry files into the same per-test tempdir as the LLC locks
+/// v9 registry files into the same per-test tempdir as the LLC locks
 /// they coordinate.
 fn protocol_dir() -> PathBuf {
     Path::new(&super::llc_lock_path(0))
@@ -1075,6 +1075,16 @@ pub(crate) fn ticket_registry_diagnostics_for_tests() -> Result<String> {
 }
 
 #[cfg(test)]
+pub(crate) fn expire_coordinator_lease_for_tests() -> Result<()> {
+    registry::expire_coordinator_lease_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn churn_registry_generation_for_tests(rounds: usize) -> Result<()> {
+    registry::churn_registry_generation_for_tests(rounds)
+}
+
+#[cfg(test)]
 pub(crate) fn active_free_head_is_rejected_for_tests() -> Result<()> {
     registry::active_free_head_is_rejected_for_tests()
 }
@@ -1538,6 +1548,11 @@ fn register_ticket_or_acquire_impl<T>(
                 }
             }
             registry::State::Waiting => {}
+            registry::State::CoordinatorStandby => {
+                anyhow::bail!(
+                    "new queue ticket entered coordinator standby before owning the coordinator loop"
+                );
+            }
         }
     }
 }

@@ -22,8 +22,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ08");
-const VERSION: u32 = 8;
+const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ09");
+const VERSION: u32 = 9;
 const HEADER_FIXED: usize = 256;
 const HEADER_ALIGN: usize = 4096;
 const RECORD_FIXED: usize = 128;
@@ -32,8 +32,8 @@ const RECORDS_PER_CHUNK: usize = 64;
 const NONE_SLOT: u64 = u64::MAX;
 const MAX_RESOURCE_BITS: usize = 1 << 20;
 const MAX_REGISTRY_SLOTS: u64 = 1 << 16;
-const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v8-init-";
-const LIVENESS_PREFIX: &str = "ktstr-acquire-v8-slot-";
+const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v9-init-";
+const LIVENESS_PREFIX: &str = "ktstr-acquire-v9-slot-";
 const LIVENESS_SEPARATOR: &str = "-ticket-";
 const LIVENESS_SUFFIX: &str = ".live";
 
@@ -60,6 +60,9 @@ const H_GRANT_SCANS: usize = 136;
 const H_ACTIVE_HEAD: usize = 144;
 const H_ACTIVE_TAIL: usize = 152;
 const H_LIVENESS_RECONCILE_BY_NS: usize = 160;
+const H_COORDINATOR_EPOCH: usize = 168;
+const H_COORDINATOR_HEARTBEAT_NS: usize = 176;
+const H_LAST_PROGRESS_NS: usize = 184;
 const _: () = assert!(H_AGGREGATE_DIRTY.is_multiple_of(std::mem::align_of::<AtomicU64>()));
 
 const R_STATE: usize = 0;
@@ -106,6 +109,10 @@ const STATE_GRANTED: u32 = 2;
 const STATE_COORDINATOR: u32 = 3;
 const STATE_REPLAN: u32 = 4;
 const STATE_HELD: u32 = 5;
+/// A live coordinator whose bounded progress lease was transferred to a
+/// successor. Its logical reservation is parked until it is elected again;
+/// physical flock modes remain the final compatibility fence.
+const STATE_COORDINATOR_STANDBY: u32 = 6;
 
 const BLOCK_NONE: u32 = 0;
 const BLOCK_CPU: u32 = 1;
@@ -154,6 +161,11 @@ const Q_LLC_SH: usize = 2;
 const Q_LLC_EX: usize = 3;
 const REQUEST_ARRAYS: usize = 4;
 const LIVENESS_SWEEP_INTERVAL_NS: u64 = 30_000_000_000;
+const COORDINATOR_HEARTBEAT_REFRESH_NS: u64 = 30_000_000_000;
+/// Four normal coordinator fallback periods. This is deliberately long enough
+/// to survive severe host oversubscription while still bounding a live process
+/// that stopped advancing the shared queue.
+const COORDINATOR_LEASE_NS: u64 = 120_000_000_000;
 
 #[cfg(test)]
 thread_local! {
@@ -191,6 +203,7 @@ pub(super) enum State {
     Granted,
     Replan,
     Coordinator,
+    CoordinatorStandby,
 }
 
 #[derive(Debug)]
@@ -208,6 +221,7 @@ pub(super) struct ScheduleSnapshot {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct CoordinatorCommitToken {
     claim_epoch: u64,
+    coordinator_epoch: u64,
 }
 
 pub(super) enum FinishAcquireResult {
@@ -769,6 +783,7 @@ impl Ticket {
             STATE_GRANTED => Ok(State::Granted),
             STATE_REPLAN => Ok(State::Replan),
             STATE_COORDINATOR => Ok(State::Coordinator),
+            STATE_COORDINATOR_STANDBY => Ok(State::CoordinatorStandby),
             state => anyhow::bail!("queue ticket {} has invalid state {state}", self.ticket),
         }
     }
@@ -833,9 +848,11 @@ impl Ticket {
             STATE_GRANTED => State::Granted,
             STATE_REPLAN => State::Replan,
             STATE_COORDINATOR => State::Coordinator,
+            STATE_COORDINATOR_STANDBY => State::CoordinatorStandby,
             state => anyhow::bail!("queue ticket {} has invalid state {state}", self.ticket),
         };
-        if check_coordinator_liveness && state == State::Waiting {
+        if check_coordinator_liveness && matches!(state, State::Waiting | State::CoordinatorStandby)
+        {
             let coordinator = read_u64(&header, H_COORDINATOR);
             let coordinator_slot = read_u64(&header, H_COORDINATOR_SLOT);
             let progress_is_live = if coordinator == 0 {
@@ -844,6 +861,7 @@ impl Ticket {
                 coordinator_slot != NONE_SLOT
                     && coordinator_slot < next_slot
                     && ticket_is_live(coordinator_slot, coordinator)?
+                    && coordinator_activity_is_fresh(&header, monotonic_now_ns()?)
             };
             if !progress_is_live {
                 // Drop the SH lock before the caller takes the rare EX
@@ -875,7 +893,7 @@ impl Ticket {
             Some(state) => state,
             None => self.state(cancelled)?,
         };
-        if state != State::Waiting {
+        if !matches!(state, State::Waiting | State::CoordinatorStandby) {
             return Ok(state);
         }
         let wait_started = std::time::Instant::now();
@@ -904,7 +922,7 @@ impl Ticket {
                 None => self.state(cancelled),
             }
         } else {
-            Ok(State::Waiting)
+            Ok(state)
         }
     }
 
@@ -1217,9 +1235,8 @@ impl Ticket {
             return Ok(snapshot);
         }
 
-        let _lock = lock_registry_interruptible_existing(cancelled)?;
-        let mut table = Table::open_existing()?;
-        table.repair_consistency_if_needed()?;
+        let mut on_park = || {};
+        let (_lock, mut table) = self.open_coordinator_table(cancelled, &mut on_park)?;
         table.prune_dead_identities(closed_tickets)?;
         if let Some(delay) = reconcile_liveness_after {
             table.request_liveness_reconciliation(delay)?;
@@ -1287,6 +1304,8 @@ impl Ticket {
         };
         let predecessors = table.cached_prefix(self.slot)?.1;
         let availability = table.availability_snapshot();
+        let observation = table.observation_request()?;
+        table.touch_coordinator_heartbeat()?;
         Ok(ScheduleSnapshot {
             watch,
             candidate_watch: record.watch,
@@ -1294,11 +1313,52 @@ impl Ticket {
             availability,
             commit_token: CoordinatorCommitToken {
                 claim_epoch: table.claim_epoch(),
+                coordinator_epoch: table.coordinator_epoch(),
             },
             should_step: coordinator_prefix_changed,
-            observation: table.observation_request()?,
+            observation,
             liveness_due_in,
         })
+    }
+
+    fn open_coordinator_table(
+        &self,
+        cancelled: Option<&AtomicBool>,
+        on_park: &mut impl FnMut(),
+    ) -> Result<(OwnedFd, Table)> {
+        loop {
+            let lock = lock_registry_interruptible_existing(cancelled)?;
+            let mut table = Table::open_existing()?;
+            table.repair_consistency_if_needed()?;
+            let record = table
+                .record(self.slot)?
+                .filter(|record| record.ticket == self.ticket)
+                .ok_or_else(|| anyhow::anyhow!("coordinator ticket {} disappeared", self.ticket))?;
+            if record.state == STATE_COORDINATOR
+                && table.coordinator_ticket() == self.ticket
+                && table.coordinator_slot()? == self.slot
+            {
+                return Ok((lock, table));
+            }
+            if record.state != STATE_COORDINATOR_STANDBY {
+                anyhow::bail!("ticket {} lost the queue coordinator license", self.ticket);
+            }
+            on_park();
+            drop(table);
+            drop(lock);
+            loop {
+                match self.state_or_wait(Duration::from_secs(4), cancelled)? {
+                    State::Coordinator => break,
+                    State::CoordinatorStandby | State::Waiting => {}
+                    State::Granted | State::Replan => {
+                        anyhow::bail!(
+                            "parked coordinator ticket {} was published as an ordinary callback",
+                            self.ticket
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn try_known_free_release_snapshot(
@@ -1312,10 +1372,15 @@ impl Ticket {
         let file = File::open(header_path())?;
         let header = unsafe { Mmap::map(&file) }?;
         let layout = HeaderLayout::validate(&header)?;
+        let now = monotonic_now_ns()?;
+        let heartbeat = read_u64(&header, H_COORDINATOR_HEARTBEAT_NS);
         if atomic_u64(&header, H_AGGREGATE_DIRTY).load(Ordering::SeqCst) != 0
             || read_u64(&header, H_PENDING_FLAGS) != 0
             || read_u64(&header, H_COORDINATOR) != self.ticket
             || read_u64(&header, H_COORDINATOR_SLOT) != self.slot
+            || heartbeat == 0
+            || heartbeat > now
+            || now - heartbeat >= COORDINATOR_HEARTBEAT_REFRESH_NS
         {
             return Ok(None);
         }
@@ -1427,13 +1492,14 @@ impl Ticket {
             availability,
             commit_token: CoordinatorCommitToken {
                 claim_epoch: read_u64(&header, H_CLAIM_EPOCH).max(1),
+                coordinator_epoch: read_u64(&header, H_COORDINATOR_EPOCH).max(1),
             },
             // The registry already knew these resources were free. Their
             // writable closes cannot improve the coordinator's last planning
             // snapshot and are discarded without another planner pass.
             should_step: false,
             observation: None,
-            liveness_due_in: liveness_due_in_from_header(&header, monotonic_now_ns()?),
+            liveness_due_in: liveness_due_in_from_header(&header, now),
         }))
     }
 
@@ -1444,9 +1510,14 @@ impl Ticket {
         release_proofs: impl FnOnce(),
         cancelled: Option<&AtomicBool>,
     ) -> Result<ScheduleSnapshot> {
-        let _lock = lock_registry_interruptible_existing(cancelled)?;
-        let mut table = Table::open_existing()?;
-        table.repair_consistency_if_needed()?;
+        let mut release_proofs = Some(release_proofs);
+        let mut release_if_parked = || {
+            if let Some(release) = release_proofs.take() {
+                release();
+            }
+        };
+        let (_lock, mut table) = self.open_coordinator_table(cancelled, &mut release_if_parked)?;
+        drop(release_if_parked);
         let record = table
             .record(self.slot)?
             .filter(|record| record.ticket == self.ticket)
@@ -1465,7 +1536,9 @@ impl Ticket {
         // Keep the registry EX fence while dropping proof flocks, then grant
         // from the state they proved. A split release/reacquire lets a fast SH
         // fenced acquirer steal the resource between proof and waiter wake.
-        release_proofs();
+        if let Some(release) = release_proofs.take() {
+            release();
+        }
         let (watch, coordinator_prefix_changed) = if table.pending_flags() & PENDING_RESCAN != 0 {
             table.grant_compatible()?
         } else {
@@ -1473,6 +1546,9 @@ impl Ticket {
         };
         let predecessors = table.cached_prefix(self.slot)?.1;
         let availability = table.availability_snapshot();
+        let observation = table.observation_request()?;
+        let liveness_due_in = table.liveness_due_in()?;
+        table.touch_coordinator_heartbeat()?;
         Ok(ScheduleSnapshot {
             watch,
             candidate_watch: record.watch,
@@ -1480,10 +1556,11 @@ impl Ticket {
             availability,
             commit_token: CoordinatorCommitToken {
                 claim_epoch: table.claim_epoch(),
+                coordinator_epoch: table.coordinator_epoch(),
             },
             should_step: planner_serial_after > planner_serial_before || coordinator_prefix_changed,
-            observation: table.observation_request()?,
-            liveness_due_in: table.liveness_due_in()?,
+            observation,
+            liveness_due_in,
         })
     }
 
@@ -1512,6 +1589,7 @@ impl Ticket {
         }
         Ok(CoordinatorCommitToken {
             claim_epoch: table.claim_epoch(),
+            coordinator_epoch: table.coordinator_epoch(),
         })
     }
 
@@ -1552,6 +1630,9 @@ impl Ticket {
             .record(self.slot)?
             .filter(|record| record.ticket == self.ticket)
             .ok_or_else(|| anyhow::anyhow!("coordinator ticket {} disappeared", self.ticket))?;
+        if record.state == STATE_COORDINATOR_STANDBY {
+            return Ok(FinishAcquireResult::Stale);
+        }
         if record.state != STATE_COORDINATOR
             || table.coordinator_ticket() != self.ticket
             || table.coordinator_slot()? != self.slot
@@ -1560,8 +1641,9 @@ impl Ticket {
         }
         validate_claim_within_watch(exact, &record.watch)?;
         validate_contention_within_watch(contention, &record.watch)?;
-        let stale = table.claim_epoch() != commit_token.claim_epoch
-            && table.min_changed_ticket() < record.ticket;
+        let stale = table.coordinator_epoch() != commit_token.coordinator_epoch
+            || (table.claim_epoch() != commit_token.claim_epoch
+                && table.min_changed_ticket() < record.ticket);
         if stale {
             // The physical probe raced an earlier callback that changed or
             // removed its reservation. Preserve this coordinator ticket,
@@ -2147,6 +2229,7 @@ pub(super) fn diagnostics_for_tests() -> Result<String> {
             STATE_WAITING => "waiting",
             STATE_GRANTED => "granted",
             STATE_COORDINATOR => "coordinator",
+            STATE_COORDINATOR_STANDBY => "coordinator-standby",
             STATE_REPLAN => "replan",
             STATE_HELD => "held",
             STATE_FREE => "free",
@@ -2170,10 +2253,14 @@ pub(super) fn diagnostics_for_tests() -> Result<String> {
         ));
     }
     Ok(format!(
-        "coordinator={} coordinator_slot={} generation={} claim_epoch={} \
-         min_changed_ticket={} pending_flags={:#x} global_serial={} grant_scans={}; [{}]",
+        "coordinator={} coordinator_slot={} coordinator_epoch={} coordinator_heartbeat_ns={} \
+         last_progress_ns={} generation={} claim_epoch={} min_changed_ticket={} \
+         pending_flags={:#x} global_serial={} grant_scans={}; [{}]",
         table.coordinator_ticket(),
         table.coordinator_slot()?,
+        table.coordinator_epoch(),
+        read_u64(&table.header, H_COORDINATOR_HEARTBEAT_NS),
+        read_u64(&table.header, H_LAST_PROGRESS_NS),
         table.generation(),
         table.claim_epoch(),
         table.min_changed_ticket(),
@@ -2182,6 +2269,34 @@ pub(super) fn diagnostics_for_tests() -> Result<String> {
         read_u64(&table.header, H_GRANT_SCANS),
         rows.join("; "),
     ))
+}
+
+#[cfg(test)]
+pub(super) fn expire_coordinator_lease_for_tests() -> Result<()> {
+    let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+    let mut table = Table::open_existing()?;
+    table.repair_consistency_if_needed()?;
+    anyhow::ensure!(
+        table.coordinator_ticket() != 0,
+        "cannot expire an absent test coordinator"
+    );
+    write_u64(&mut table.header, H_COORDINATOR_HEARTBEAT_NS, 0);
+    write_u64(&mut table.header, H_LAST_PROGRESS_NS, 0);
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn churn_registry_generation_for_tests(rounds: usize) -> Result<()> {
+    let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+    let mut table = Table::open_existing()?;
+    table.repair_consistency_if_needed()?;
+    for _ in 0..rounds {
+        // Registration and cancellation both advance the structural
+        // generation. This deliberately exercises that generic churn without
+        // manufacturing coordinator or runnable-queue progress.
+        table.bump_generation()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4126,7 +4241,7 @@ fn required_resource_bits(claim: &ClaimSet) -> usize {
         .max()
         .unwrap_or(0)
         .saturating_add(1);
-    // The v8 mapping is deliberately overprovisioned once. It never needs a
+    // The v9 mapping is deliberately overprovisioned once. It never needs a
     // migration/grow protocol when the first low-index ticket is followed by a
     // valid sparse CPU/LLC index on the same host.
     claim_bits.max(host_cpu_resource_bits()).max(4096)
@@ -4167,11 +4282,11 @@ fn notify_path() -> PathBuf {
 }
 
 fn registry_data_dir() -> PathBuf {
-    protocol_dir().join("ktstr-acquire-registry-v8")
+    protocol_dir().join("ktstr-acquire-registry-v9")
 }
 
 pub(super) fn event_dir() -> PathBuf {
-    protocol_dir().join("ktstr-acquire-events-v8")
+    protocol_dir().join("ktstr-acquire-events-v9")
 }
 
 pub(super) fn notify_basename() -> Result<std::ffi::OsString> {
@@ -4617,6 +4732,11 @@ impl Table {
         Ok(())
     }
 
+    fn note_queue_progress(&mut self) -> Result<()> {
+        write_u64(&mut self.header, H_LAST_PROGRESS_NS, monotonic_now_ns()?);
+        Ok(())
+    }
+
     fn global_serial(&self) -> u64 {
         read_u64(&self.header, H_GLOBAL_SERIAL).max(1)
     }
@@ -4781,6 +4901,19 @@ impl Table {
         Ok(slot)
     }
 
+    fn coordinator_epoch(&self) -> u64 {
+        read_u64(&self.header, H_COORDINATOR_EPOCH).max(1)
+    }
+
+    fn touch_coordinator_heartbeat(&mut self) -> Result<()> {
+        write_u64(
+            &mut self.header,
+            H_COORDINATOR_HEARTBEAT_NS,
+            monotonic_now_ns()?,
+        );
+        Ok(())
+    }
+
     fn set_coordinator(&mut self, ticket: u64, slot: u64) -> Result<()> {
         if (ticket == 0) != (slot == NONE_SLOT) {
             anyhow::bail!(
@@ -4789,6 +4922,17 @@ impl Table {
         }
         write_u64(&mut self.header, H_COORDINATOR, ticket);
         write_u64(&mut self.header, H_COORDINATOR_SLOT, slot);
+        if ticket == 0 {
+            write_u64(&mut self.header, H_COORDINATOR_HEARTBEAT_NS, 0);
+        } else {
+            let epoch = self
+                .coordinator_epoch()
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("queue coordinator epoch exhausted"))?;
+            write_u64(&mut self.header, H_COORDINATOR_EPOCH, epoch);
+            self.touch_coordinator_heartbeat()?;
+            self.note_queue_progress()?;
+        }
         Ok(())
     }
 
@@ -5005,7 +5149,12 @@ impl Table {
         }
         if !matches!(
             state,
-            STATE_WAITING | STATE_GRANTED | STATE_REPLAN | STATE_COORDINATOR | STATE_HELD
+            STATE_WAITING
+                | STATE_GRANTED
+                | STATE_REPLAN
+                | STATE_COORDINATOR
+                | STATE_HELD
+                | STATE_COORDINATOR_STANDBY
         ) {
             anyhow::bail!("queue registry v{VERSION} slot {slot} has invalid state {state}");
         }
@@ -5583,7 +5732,7 @@ impl Table {
                     // WAITING may have returned from either kind of callback.
                     // Its predecessor prefix remains valid because replacing
                     // this ticket's own exact claim cannot alter its prefix.
-                    STATE_WAITING | STATE_COORDINATOR => {
+                    STATE_WAITING | STATE_COORDINATOR | STATE_COORDINATOR_STANDBY => {
                         record.prefix_epoch != record.grant_epoch
                             && record.prefix_epoch != record.replan_claim_epoch
                     }
@@ -5718,17 +5867,20 @@ impl Table {
                     watch_serial,
                 )?;
             }
-            add_claim_bits(
-                &record.claim,
-                &mut cpu_any,
-                &mut cpu_exclusive,
-                &mut llc_any,
-                &mut llc_exclusive,
-                self.layout.bits,
-            )?;
+            if record.state != STATE_COORDINATOR_STANDBY {
+                add_claim_bits(
+                    &record.claim,
+                    &mut cpu_any,
+                    &mut cpu_exclusive,
+                    &mut llc_any,
+                    &mut llc_exclusive,
+                    self.layout.bits,
+                )?;
+            }
         }
         if changed {
             self.bump_generation()?;
+            self.note_queue_progress()?;
         }
         self.finish_claim_scan();
         self.clear_pending_flag(PENDING_RESCAN);
@@ -5828,26 +5980,73 @@ impl Table {
             // contains no work that an election scan could discover.
             return Ok(());
         }
-        if coordinator != 0 {
-            let _record = self
-                .record(slot)?
-                .filter(|record| record.ticket == coordinator && record.state == STATE_COORDINATOR)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "queue registry v{VERSION} coordinator header ticket={coordinator}, \
-                         slot={slot} does not name its coordinator record"
-                    )
-                })?;
-            if ticket_is_live(slot, coordinator)? {
-                return Ok(());
-            }
+        let record = self
+            .record(slot)?
+            .filter(|record| record.ticket == coordinator && record.state == STATE_COORDINATOR)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "queue registry v{VERSION} coordinator header ticket={coordinator}, \
+                     slot={slot} does not name its coordinator record"
+                )
+            })?;
+        if !ticket_is_live(slot, coordinator)? {
             // Coordinator death commonly accompanies a cancelled job with a
             // dead prefix. This is a rare recovery scan: batch every dead
             // record and elect one live survivor once, rather than peeling and
             // re-electing dead coordinators one O(N) scan at a time.
             self.prune_dead()?;
+            return self.elect_coordinator();
         }
-        self.elect_coordinator()
+
+        let now = monotonic_now_ns()?;
+        if coordinator_activity_is_fresh(&self.header, now) {
+            return Ok(());
+        }
+        let Some(successor) = self
+            .records()?
+            .into_iter()
+            .filter(|candidate| candidate.state == STATE_WAITING)
+            .min_by_key(|candidate| candidate.ticket)
+        else {
+            return Ok(());
+        };
+
+        // A live process can stop advancing between any two userspace
+        // instructions (or remain indefinitely descheduled under a storm).
+        // Transfer the bounded coordinator lease to the oldest waiter. The old
+        // ticket stays live but parked and is eligible for a later election;
+        // its logical prefix reservation is suspended while parked so the new
+        // coordinator can actually drain compatible work.
+        self.begin_transaction()?;
+        let current = self
+            .record(slot)?
+            .filter(|current| current.ticket == record.ticket && current.state == STATE_COORDINATOR)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "queue coordinator {} changed during stalled-lease recovery",
+                    record.ticket
+                )
+            })?;
+        let successor = self
+            .record(successor.slot)?
+            .filter(|candidate| {
+                candidate.ticket == successor.ticket && candidate.state == STATE_WAITING
+            })
+            .ok_or_else(|| anyhow::anyhow!("queue takeover successor changed during recovery"))?;
+        if coordinator_activity_is_fresh(&self.header, monotonic_now_ns()?) {
+            self.finish_transaction();
+            return Ok(());
+        }
+        self.set_record_state(current.slot, STATE_COORDINATOR_STANDBY)?;
+        self.set_coordinator(successor.ticket, successor.slot)?;
+        self.set_record_state(successor.slot, STATE_COORDINATOR)?;
+        self.clear_record_blocked(successor.slot)?;
+        self.mark_claim_changed(current.ticket)?;
+        self.bump_generation()?;
+        self.wake_slot(current.slot)?;
+        self.wake_slot(successor.slot)?;
+        self.finish_transaction();
+        Ok(())
     }
 
     fn elect_coordinator(&mut self) -> Result<()> {
@@ -5879,7 +6078,7 @@ impl Table {
             let record = self.record(slot)?.ok_or_else(|| {
                 anyhow::anyhow!("queue active slot {slot} disappeared during coordinator election")
             })?;
-            if record.state == STATE_WAITING {
+            if matches!(record.state, STATE_WAITING | STATE_COORDINATOR_STANDBY) {
                 self.set_coordinator(record.ticket, record.slot)?;
                 crash_at_for_tests("elect_header_before_state");
                 self.set_record_state(record.slot, STATE_COORDINATOR)?;
@@ -6780,6 +6979,8 @@ impl Table {
             let issue_serial = self.max_watch_serial(&record.watch)?;
             let state = if record.ticket == coordinator {
                 STATE_COORDINATOR
+            } else if record.state == STATE_COORDINATOR_STANDBY {
+                STATE_COORDINATOR_STANDBY
             } else if claim_is_flexible(&record.claim, &record.watch) {
                 STATE_REPLAN
             } else {
@@ -6797,14 +6998,16 @@ impl Table {
             if state == STATE_REPLAN {
                 self.wake_slot(record.slot)?;
             }
-            add_claim_bits(
-                &record.claim,
-                &mut prefix.cpu_any,
-                &mut prefix.cpu_exclusive,
-                &mut prefix.llc_any,
-                &mut prefix.llc_exclusive,
-                prefix_bits,
-            )?;
+            if state != STATE_COORDINATOR_STANDBY {
+                add_claim_bits(
+                    &record.claim,
+                    &mut prefix.cpu_any,
+                    &mut prefix.cpu_exclusive,
+                    &mut prefix.llc_any,
+                    &mut prefix.llc_exclusive,
+                    prefix_bits,
+                )?;
+            }
         }
         // Any interrupted mutation invalidates outstanding grants. They were
         // demoted above; a fresh coordinator pass will stamp the new epoch.
@@ -6884,11 +7087,13 @@ fn initialize_header_file(path: &PathBuf, layout: HeaderLayout) -> Result<File> 
         write_u64(&mut header, H_FREE_HEAD, NONE_SLOT);
         write_u64(&mut header, H_GLOBAL_SERIAL, 1);
         write_u64(&mut header, H_CLAIM_EPOCH, 1);
+        write_u64(&mut header, H_COORDINATOR_EPOCH, 1);
         write_u64(&mut header, H_MIN_CHANGED_TICKET, u64::MAX);
         write_u64(&mut header, H_COORDINATOR_SLOT, NONE_SLOT);
         write_u64(&mut header, H_OBSERVATION_REQUEST, 1);
         write_u64(&mut header, H_ACTIVE_HEAD, NONE_SLOT);
         write_u64(&mut header, H_ACTIVE_TAIL, NONE_SLOT);
+        write_u64(&mut header, H_LAST_PROGRESS_NS, monotonic_now_ns()?);
         // Magic is published last in an inode nobody else can name. The
         // registry path changes only after the complete mapping is flushed.
         write_u64(&mut header, H_MAGIC, MAGIC);
@@ -7400,6 +7605,12 @@ fn monotonic_now_ns() -> Result<u64> {
         .checked_mul(1_000_000_000)
         .and_then(|value| value.checked_add(nanoseconds))
         .ok_or_else(|| anyhow::anyhow!("CLOCK_MONOTONIC nanosecond value overflow"))
+}
+
+fn coordinator_activity_is_fresh(header: &[u8], now: u64) -> bool {
+    let last =
+        read_u64(header, H_COORDINATOR_HEARTBEAT_NS).max(read_u64(header, H_LAST_PROGRESS_NS));
+    last != 0 && last <= now && now - last < COORDINATOR_LEASE_NS
 }
 
 fn liveness_due_in_from_last(last: u64, now: u64) -> Duration {

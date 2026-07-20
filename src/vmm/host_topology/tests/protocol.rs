@@ -57,6 +57,37 @@ fn wait_for_broker_signal_after(previous: usize) {
     .expect("eventfd broker must deliver a targeted RT wake");
 }
 
+enum BrokerWakeOrCompletion<T> {
+    BrokerSignalled,
+    WaiterCompleted(T),
+}
+
+fn wait_for_broker_signal_or_waiter_completion<T>(
+    previous: usize,
+    receiver: &std::sync::mpsc::Receiver<T>,
+    waiter: &TestTaskService,
+) -> anyhow::Result<BrokerWakeOrCompletion<T>> {
+    let broker = interruptible_flock_broker_service();
+    let sources = [broker, waiter.clone()];
+    wait_with_task_service(
+        "eventfd broker targeted RT wake or waiter cancellation",
+        &sources,
+        || match receiver.try_recv() {
+            Ok(result) => Ok(Some(BrokerWakeOrCompletion::WaiterCompleted(result))),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+                if crate::flock::primitives::interruptible_flock_broker_signal_count()
+                    > previous =>
+            {
+                Ok(Some(BrokerWakeOrCompletion::BrokerSignalled))
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                anyhow::bail!("registry waiter channel disconnected before cancellation completed")
+            }
+        },
+    )
+}
+
 fn cancel_registry_worker(cancelled: &std::sync::atomic::AtomicBool) {
     let waiter = crate::flock::interruptible_flock_waiter_id();
     // Capture the generation before publishing cancellation so a waiter that
@@ -569,8 +600,8 @@ fn uncontended_fast_fence_does_not_create_registry_metadata() {
     let protocol_dir = std::path::Path::new(&cpu_path)
         .parent()
         .expect("resource lock parent");
-    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v8");
-    let event_dir = protocol_dir.join("ktstr-acquire-events-v8");
+    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v9");
+    let event_dir = protocol_dir.join("ktstr-acquire-events-v9");
     assert!(!registry_dir.exists());
     assert!(!event_dir.exists());
 
@@ -1553,10 +1584,19 @@ fn targeted_broker_wake_cancels_one_registry_waiter() {
     cancelled.store(true, Ordering::Release);
     let signal_count = crate::flock::primitives::interruptible_flock_broker_signal_count();
     crate::flock::wake_interruptible_flock_waiter(waiter_id);
-    wait_for_broker_signal_after(signal_count);
-    let result =
-        recv_from_service_thread(&result_rx, "targeted registry-wait cancellation", &waiter)
-            .expect("targeted wake must cancel the registry wait");
+    let result = match wait_for_broker_signal_or_waiter_completion(
+        signal_count,
+        &result_rx,
+        &waiter.service,
+    )
+    .expect("targeted wake or the cancellation it races must make progress")
+    {
+        BrokerWakeOrCompletion::BrokerSignalled => {
+            recv_from_service_thread(&result_rx, "targeted registry-wait cancellation", &waiter)
+                .expect("targeted wake must cancel the registry wait")
+        }
+        BrokerWakeOrCompletion::WaiterCompleted(result) => result,
+    };
     assert!(
         result
             .expect_err("cancelled registry wait must not acquire")
@@ -3868,6 +3908,47 @@ fn disjoint_ticket_bypasses_a_blocked_coordinator() {
 }
 
 #[test]
+fn live_parked_coordinator_lease_transfers_and_successors_drain() {
+    let _prefixes = LockPrefixesGuard::new();
+    let markers = tempfile::TempDir::new().expect("marker dir");
+    let coordinator_gate = markers.path().join("resume-original-coordinator");
+    let coordinator_entered = markers.path().join("original-coordinator-parked");
+    let coordinator = TicketChild::spawn_before_coordinator_gate(
+        markers.path(),
+        "parked-coordinator",
+        "1",
+        &coordinator_gate,
+        &coordinator_entered,
+    );
+    coordinator.wait_for_path(&coordinator_entered, "parked coordinator marker");
+
+    // The first successor deliberately targets the parked ticket's exact CPU:
+    // lease transfer must suspend the stale logical prefix while the physical
+    // flock continues to enforce the requested mode.
+    let first = TicketChild::spawn(markers.path(), "first-successor", "1", false);
+    wait_for_ticket_pids(&[coordinator.pid, first.pid]);
+    let second = TicketChild::spawn(markers.path(), "second-successor", "2", false);
+    wait_for_ticket_pids(&[coordinator.pid, first.pid, second.pid]);
+    protocol::expire_coordinator_lease_for_tests().expect("expire coordinator lease");
+    protocol::churn_registry_generation_for_tests(256)
+        .expect("simulate registration/cancellation generation churn");
+
+    first.wait_for_acquired();
+    second.wait_for_acquired();
+    coordinator.assert_running("successor drain under transferred coordinator lease");
+    assert!(
+        !coordinator.acquired.exists(),
+        "the parked original coordinator must remain alive and unacquired while successors drain"
+    );
+    first.release_and_wait();
+    second.release_and_wait();
+
+    std::fs::write(&coordinator_gate, b"resume").expect("resume original coordinator");
+    coordinator.wait_for_acquired();
+    coordinator.release_and_wait();
+}
+
+#[test]
 fn coordinator_election_skips_a_live_granted_head_for_disjoint_waiting_work() {
     let _prefixes = LockPrefixesGuard::new();
     let markers = tempfile::TempDir::new().expect("marker dir");
@@ -4362,7 +4443,7 @@ fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
     let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .expect("re-block waiter after epoch transition");
-    // Leave the replacement as an external, unregistered flock. A current-v8
+    // Leave the replacement as an external, unregistered flock. A current-v9
     // HELD publication would authoritatively revoke the in-flight grant before
     // its callback returned, bypassing the stale-negative-evidence path this
     // test is meant to pin.
@@ -4610,7 +4691,7 @@ fn remove_crash_after_counts_before_free_is_repaired() {
     let markers = tempfile::TempDir::new().expect("marker dir");
     let removing =
         TicketChild::spawn_crashing(markers.path(), "removing", "1", "remove_counts_before_free");
-    // The v8 HELD lifecycle removes its registry record only after the
+    // The v9 HELD lifecycle removes its registry record only after the
     // physical reservation is released. Let the helper pass its normal
     // release barrier so the injected crash observes that production ordering.
     std::fs::write(&removing.release, b"release").expect("release crash-test reservation");
