@@ -34,7 +34,11 @@
 //!    `--stall-after`, scheduler ends via `Drop`) drives the exit_kind
 //!    gate's `kind < SCX_EXIT_ERROR` branch to suppress dump emit. The
 //!    callback asserts no primary dump file AND no snapshot-tagged
-//!    sibling files exist on the host. Pins the gate's designed
+//!    sibling files exist on the host, but only after the primary VM
+//!    reports a clean successful run. A boot failure or watchdog
+//!    timeout legitimately emits a failure dump; in that case the
+//!    callback leaves the artifact intact and lets the underlying VM
+//!    failure remain the diagnostic. Pins the gate's designed
 //!    clean-exit suppression; a regression that over-fires the gate
 //!    (emitting dumps on clean exits) surfaces here.
 //!
@@ -159,16 +163,22 @@ fn scenario_clean_exit_gate_suppresses_dump(ctx: &ktstr::scenario::Ctx) -> Resul
     execute_steps(ctx, steps)
 }
 
-/// Host-side post_vm assertion for `silent_drop_clean_exit_gate_suppression`.
-/// A clean (non-error-class) exit must suppress the dump; the guest
-/// cannot observe the host-side dump path, so the absence check runs
-/// here. Runs unconditionally; its Err is a hard FAIL via
-/// PostVmAssertionFailure.
-fn check_clean_exit_gate_suppresses_dump(result: &VmResult) -> Result<()> {
-    let test_name = result
-        .entry_name
-        .ok_or_else(|| anyhow::anyhow!("VmResult.entry_name is None"))?;
-    let dump_path = result.failure_dump_path()?;
+/// Assert the clean-exit artifact contract after its premise holds.
+///
+/// `artifacts` is deliberately lazy: a failed primary run must not even
+/// inspect the failure artifacts it legitimately produced. Besides
+/// preventing a derivative assertion from obscuring the VM failure,
+/// this guarantees the callback never removes or otherwise consumes
+/// the evidence needed to diagnose it.
+fn assert_clean_exit_dump_suppression(
+    primary_run_succeeded: bool,
+    artifacts: impl FnOnce() -> Result<(std::path::PathBuf, Vec<std::path::PathBuf>)>,
+) -> Result<()> {
+    if !primary_run_succeeded {
+        return Ok(());
+    }
+
+    let (dump_path, siblings) = artifacts()?;
 
     anyhow::ensure!(
         !dump_path.exists(),
@@ -177,7 +187,6 @@ fn check_clean_exit_gate_suppresses_dump(result: &VmResult) -> Result<()> {
         dump_path.display(),
     );
 
-    let siblings = snapshot_sibling_files(test_name);
     anyhow::ensure!(
         siblings.is_empty(),
         "exit_kind gate suppression must not leave snapshot-tagged sibling files; \
@@ -188,6 +197,26 @@ fn check_clean_exit_gate_suppresses_dump(result: &VmResult) -> Result<()> {
 
     eprintln!("clean exit produced no dump artifacts (primary path absent, no tagged siblings)");
     Ok(())
+}
+
+/// Host-side post_vm assertion for `silent_drop_clean_exit_gate_suppression`.
+/// A clean (non-error-class) exit must suppress the dump; the guest
+/// cannot observe the host-side dump path, so the absence check runs
+/// here. The callback is wired unconditionally so the host artifact is
+/// observable, but it asserts only when `VmResult::success` proves the
+/// primary run reached the clean-success premise. On a boot failure,
+/// crash, or watchdog timeout, the real failure dump is retained and
+/// the underlying VM error remains authoritative.
+fn check_clean_exit_gate_suppresses_dump(result: &VmResult) -> Result<()> {
+    assert_clean_exit_dump_suppression(result.success, || {
+        let test_name = result
+            .entry_name
+            .ok_or_else(|| anyhow::anyhow!("VmResult.entry_name is None"))?;
+        Ok((
+            result.failure_dump_path()?,
+            snapshot_sibling_files(test_name),
+        ))
+    })
 }
 
 fn scenario_watchdog_stall_dump_populates_vcpu_regs_and_maps(
@@ -285,8 +314,10 @@ static __KTSTR_ENTRY_SILENT_DROP_CLEAN_EXIT_GATE_SUPPRESSION: ktstr::test_suppor
         watchdog_timeout: std::time::Duration::from_secs(10),
         duration: std::time::Duration::from_secs(3),
         // Clean exit (expect_err: false) → the suppression assertion gates
-        // in check_clean_exit_gate_suppresses_dump (post_vm_unconditional);
-        // its Err is a hard FAIL.
+        // in check_clean_exit_gate_suppresses_dump (post_vm_unconditional).
+        // A failed primary run bypasses the absence assertion and keeps its
+        // legitimate failure artifact; a clean successful run with an
+        // artifact still returns a hard FAIL.
         expect_err: false,
         post_vm_unconditional: Some(check_clean_exit_gate_suppresses_dump),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
@@ -308,3 +339,81 @@ static __KTSTR_ENTRY_SILENT_DROP_WATCHDOG_STALL_CAPTURED_CONTENT:
     post_vm_unconditional: Some(check_captured_content),
     ..ktstr::test_support::KtstrTestEntry::DEFAULT
 };
+
+#[cfg(test)]
+mod clean_exit_gate_tests {
+    use super::assert_clean_exit_dump_suppression;
+
+    #[test]
+    fn failed_primary_run_preserves_dump_without_resolving_artifacts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dump_path = tmp.path().join("legitimate-failure-dump.json");
+        std::fs::write(&dump_path, b"{\"schema\":\"ktstr.failure_dump.v1\"}")
+            .expect("write failure dump");
+        let artifacts_resolved = std::cell::Cell::new(false);
+
+        assert_clean_exit_dump_suppression(false, || {
+            artifacts_resolved.set(true);
+            Ok((dump_path.clone(), Vec::new()))
+        })
+        .expect("failed primary run must retain its underlying diagnostic");
+
+        assert!(
+            !artifacts_resolved.get(),
+            "failed primary run must not inspect clean-exit artifacts"
+        );
+        assert!(
+            dump_path.exists(),
+            "legitimate failure dump must remain available for diagnosis"
+        );
+    }
+
+    #[test]
+    fn successful_primary_run_rejects_primary_dump() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dump_path = tmp.path().join("unexpected.failure-dump.json");
+        std::fs::write(&dump_path, b"{}").expect("write unexpected dump");
+
+        let err = assert_clean_exit_dump_suppression(true, || Ok((dump_path.clone(), Vec::new())))
+            .expect_err("clean success with a primary dump must fail");
+
+        assert!(
+            err.to_string().contains("unexpected primary dump file"),
+            "unexpected diagnostic: {err:#}"
+        );
+        assert!(
+            dump_path.exists(),
+            "assertion must not delete the unexpected artifact"
+        );
+    }
+
+    #[test]
+    fn successful_primary_run_rejects_snapshot_sibling() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dump_path = tmp.path().join("absent.failure-dump.json");
+        let sibling = tmp.path().join("unexpected.snapshot.watchpoint.json");
+        std::fs::write(&sibling, b"{}").expect("write unexpected sibling");
+
+        let err =
+            assert_clean_exit_dump_suppression(true, || Ok((dump_path, vec![sibling.clone()])))
+                .expect_err("clean success with a snapshot sibling must fail");
+
+        assert!(
+            err.to_string().contains("snapshot-tagged sibling files"),
+            "unexpected diagnostic: {err:#}"
+        );
+        assert!(
+            sibling.exists(),
+            "assertion must not delete the unexpected artifact"
+        );
+    }
+
+    #[test]
+    fn successful_primary_run_accepts_absent_artifacts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dump_path = tmp.path().join("absent.failure-dump.json");
+
+        assert_clean_exit_dump_suppression(true, || Ok((dump_path, Vec::new())))
+            .expect("clean success without dump artifacts must pass");
+    }
+}
