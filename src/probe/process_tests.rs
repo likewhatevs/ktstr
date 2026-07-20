@@ -9,17 +9,17 @@ use super::*;
 fn bounded_libbpf_tail_keeps_specific_final_diagnostics_and_caps_output() {
     let log = format!(
         "{}\n\
-         libbpf: prog 'ktstr_trigger_fexit': BPF program load failed\n\
-         libbpf: failed to find kernel BTF type ID of 'scx_vexit': -3\n",
+         libbpf: prog 'ktstr_trigger_vexit_return': BPF program load failed\n\
+         libbpf: failed to load raw scx_vexit return probe: -22\n",
         "unhelpful verifier prelude\n".repeat(300)
     );
     let tail = bounded_libbpf_tail(&log);
     assert!(
-        tail.contains("prog 'ktstr_trigger_fexit'"),
+        tail.contains("prog 'ktstr_trigger_vexit_return'"),
         "program identity must survive: {tail}"
     );
     assert!(
-        tail.contains("kernel BTF type ID of 'scx_vexit'"),
+        tail.contains("raw scx_vexit return probe"),
         "target failure must survive: {tail}"
     );
     assert!(
@@ -42,12 +42,12 @@ fn scheduler_exit_trigger_selection_prefers_tracepoint_and_covers_older_shapes()
     );
     assert_eq!(
         select_scheduler_exit_trigger(false, true, true),
-        Some(SchedulerExitTrigger::ScxVexit),
-        "without the tracepoint, the exact five-argument return hook wins"
+        Some(SchedulerExitTrigger::ScxVexitKprobePair),
+        "without the tracepoint, the raw post-claim entry/return pair wins"
     );
     assert_eq!(
         select_scheduler_exit_trigger(false, true, false),
-        Some(SchedulerExitTrigger::ScxVexit)
+        Some(SchedulerExitTrigger::ScxVexitKprobePair)
     );
     assert_eq!(
         select_scheduler_exit_trigger(false, false, true),
@@ -58,6 +58,69 @@ fn scheduler_exit_trigger_selection_prefers_tracepoint_and_covers_older_shapes()
         select_scheduler_exit_trigger(false, false, false),
         None,
         "missing every compatible typed target must fail closed before object load"
+    );
+}
+
+#[test]
+fn scheduler_exit_autoload_selects_one_complete_generation() {
+    assert_eq!(
+        scheduler_exit_program_selection(SchedulerExitTrigger::SchedExtExitTracepoint),
+        SchedulerExitProgramSelection {
+            tracepoint: true,
+            vexit_enter: false,
+            vexit_return: false,
+            dump_fentry: false,
+        }
+    );
+    assert_eq!(
+        scheduler_exit_program_selection(SchedulerExitTrigger::ScxVexitKprobePair),
+        SchedulerExitProgramSelection {
+            tracepoint: false,
+            vexit_enter: true,
+            vexit_return: true,
+            dump_fentry: false,
+        },
+        "the raw scx_vexit path must load both correlation halves"
+    );
+    assert_eq!(
+        scheduler_exit_program_selection(SchedulerExitTrigger::ScxDumpState),
+        SchedulerExitProgramSelection {
+            tracepoint: false,
+            vexit_enter: false,
+            vexit_return: false,
+            dump_fentry: true,
+        }
+    );
+}
+
+#[test]
+fn raw_scx_vexit_source_pairs_entry_state_with_accepted_return() {
+    let source = include_str!("../bpf/probe.bpf.c");
+    for required in [
+        "int ktstr_trigger_vexit_enter(struct pt_regs *ctx)",
+        "bpf_map_update_elem(&ktstr_vexit_args, &pid_tgid, &args, BPF_ANY)",
+        "int ktstr_trigger_vexit_return(struct pt_regs *ctx)",
+        "bpf_map_lookup_elem(&ktstr_vexit_args, &pid_tgid)",
+        "bpf_map_delete_elem(&ktstr_vexit_args, &pid_tgid)",
+        "if (!PT_REGS_RC_CORE(ctx))",
+        "args.kind == SCX_EXIT_ERROR_BPF",
+        "args.kind == SCX_EXIT_ERROR_BPF, false",
+    ] {
+        assert!(
+            source.contains(required),
+            "raw scx_vexit entry/return contract lost `{required}`"
+        );
+    }
+
+    let delete = source
+        .find("bpf_map_delete_elem(&ktstr_vexit_args, &pid_tgid)")
+        .expect("return probe deletes entry state");
+    let accepted = source
+        .find("if (!PT_REGS_RC_CORE(ctx))")
+        .expect("return probe gates on successful scx_claim_exit");
+    assert!(
+        delete < accepted,
+        "losing returns must still delete their entry-state slot"
     );
 }
 
@@ -403,8 +466,8 @@ fn build_field_keys_max_six_params() {
 
 // ---- args[0] kind-conditional filter ----------------------------
 //
-// The args[0] conditional in ktstr_trigger_fexit (the BPF
-// scheduler-exit trigger handler) sets
+// The args[0] conditional in the common BPF scheduler-exit
+// trigger handler sets
 // `event->args[0] = (kind == SCX_EXIT_ERROR_BPF)
 // ? bpf_get_current_task() : 0;` — current-task is emitted
 // ONLY for SCX_EXIT_ERROR_BPF (1025). For SCX_EXIT_ERROR
@@ -428,7 +491,7 @@ const SCX_EXIT_ERROR_BPF: u64 = 1025;
 /// ringbuf callback inside `run_probe_skeleton` constructs
 /// from a trigger event. `args[0]` is the causal task
 /// pointer the BPF side emitted (per the args[0] conditional
-/// in ktstr_trigger_fexit); `args[1]` is the exit kind.
+/// in the common trigger handler); `args[1]` is the exit kind.
 /// `task_ptr` is set from `args[0]` in the trigger event
 /// constructor in run_probe_skeleton.
 fn make_trigger_event(args0: u64, kind: u64) -> ProbeEvent {
@@ -632,16 +695,16 @@ fn build_task_param_idx_keeps_index_at_five() {
 fn build_task_param_idx_uses_bpf_op_callers_first() {
     // `BPF_OP_CALLERS` overrides BTF for the well-known
     // sched_ext op kernel callers — verifies the BTF fallback
-    // doesn't shadow the canonical mapping. `do_enqueue_task`
+    // doesn't shadow the canonical mapping. `enqueue_task_scx`
     // is registered with task_arg_idx=1 in the table; the
     // builder must return 1 even when the BTF (synthesized
     // here at task_pos=3) would say otherwise.
     let func_ips = vec![(
         0u32,
         0xffff_ffff_8100_0000u64,
-        "do_enqueue_task".to_string(),
+        "enqueue_task_scx".to_string(),
     )];
-    let btf = vec![make_btf_with_task_at("do_enqueue_task", 3)];
+    let btf = vec![make_btf_with_task_at("enqueue_task_scx", 3)];
     let map = build_task_param_idx(&func_ips, &btf, &[]);
     assert_eq!(
         map.get(&0).copied(),

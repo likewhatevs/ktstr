@@ -8,8 +8,8 @@
 /*
  * Per-scheduler sched_ext generations expose this type through vmlinux BTF;
  * global-era kernels do not.  Keep one file-scope incomplete declaration so
- * the optional typed hooks below still compile against an older vmlinux.h.
- * Userspace disables both hooks before load when their exact BTF targets are
+ * the optional hooks below still compile against an older vmlinux.h.
+ * Userspace disables unselected hooks before load when their targets are
  * absent.
  */
 struct scx_sched;
@@ -129,13 +129,13 @@ struct {
 
 /* Global enable flag. Set by userspace after all probes attached.
  *
- * Gates generic kprobe execution only — the selected typed
+ * Gates generic kprobe execution only — the selected
  * scheduler-exit trigger fires regardless of this flag.
  */
 volatile const bool ktstr_enabled = false;
 
 /*
- * Sticky error-exit latch. Set to non-zero by the selected typed
+ * Sticky error-exit latch. Set to non-zero by the selected
  * handler when an error-class exit (kind >= SCX_EXIT_ERROR) succeeds.
  * Lives in writable .bss so an external observer with read access
  * to guest memory can detect the transition. Sticky: re-firing the
@@ -160,7 +160,7 @@ volatile const bool ktstr_enabled = false;
  *  - Initial value: `0` at probe load. libbpf zeroes .bss when the
  *    BPF program is loaded; the freeze coordinator sees `0` until
  *    the latch fires.
- *  - Set: the selected typed handler below CAS's `0 -> 1` on the first
+ *  - Set: the selected handler below CAS's `0 -> 1` on the first
  *    error-class exit. Sticky: subsequent fires no-op.
  *  - Read: the freeze coordinator polls this value via host-side
  *    guest-memory access (`vmm::mod.rs` lazy `BpfMapAccessor`
@@ -242,19 +242,18 @@ u64 ktstr_last_trigger_ts = 0;
  * On kernels without the type, the kfunc is `__weak` and never
  * called — the fields stay at their zero defaults.
  *
- * The Datasec walker on the host side renders this struct
- * by name in the failure-dump's `.bss` map output, so an operator
- * sees the system-wide counter values exactly when the scheduler
- * errored. Cross-CPU aggregation happens kernel-side
- * (`scx_read_events`); this BPF program just stores the
- * aggregated snapshot.
+ * The Datasec walker on the host side renders this struct by name in the
+ * failure-dump's `.bss` map output. Typed tracing programs snapshot the
+ * system-wide counter values exactly when the scheduler errors; the raw
+ * scx_vexit kprobe generation leaves these fields zero because that kernel
+ * does not permit this sched_ext kfunc from BPF_PROG_TYPE_KPROBE. Every
+ * other exit snapshot field remains available there. Cross-CPU aggregation
+ * happens kernel-side (`scx_read_events`); this BPF program just stores the
+ * aggregated snapshot when its program type permits the call.
  *
- * Sticky: written exactly once when the error latch flips
- * 0 -> 1, so a host-side observer that polls
- * `ktstr_err_exit_detected` and sees `1` is guaranteed to see a
- * matching populated `ktstr_exit_event_stats`. Subsequent fires
- * (which might come from racing `scx_sched` instances) skip the
- * write to keep the snapshot causally tied to the first error. */
+ * On typed tracing generations, the snapshot is published before the error
+ * latch flips 0 -> 1, so an observer that sees the latch also sees a
+ * populated `ktstr_exit_event_stats`. */
 struct scx_event_stats___fwd {
 	s64 SCX_EV_SELECT_CPU_FALLBACK;
 	s64 SCX_EV_DISPATCH_LOCAL_DSQ_OFFLINE;
@@ -317,18 +316,16 @@ struct scx_event_stats___fwd ktstr_exit_event_stats = {};
  * `aborting`, `bypass_depth`, `exit_kind`, `watchdog_timeout`. The
  * snapshot below is captured BEFORE the scheduler reaches the
  * teardown path: the newest typed tracepoint runs directly after
- * `scx_claim_exit()` succeeds, the modern fexit runs as `scx_vexit()`
- * returns after a successful claim, and the global-era fentry runs from
- * the error worker before it schedules disable.
+ * `scx_claim_exit()` succeeds, the raw scx_vexit return probe runs after
+ * a successful claim, and the global-era fentry runs from the error worker
+ * before it schedules disable.
  * So the values written here represent the scheduler at the instant
  * it errored out, even if `*scx_root` has been nulled by the time the
  * host reads guest memory.
  *
- * All five fields are sticky: written exactly once when the latch
- * flips 0 -> 1. Subsequent error-class fires (racing scx_sched
- * instances) skip the writes to keep the snapshot causally tied to
- * the first error — same rule as `ktstr_exit_event_stats` /
- * `ktstr_last_trigger_ts`.
+ * All five fields are published before the latch flips 0 -> 1, matching
+ * `ktstr_last_trigger_ts` and (on tracing-program generations)
+ * `ktstr_exit_event_stats`.
  */
 
 /* `scx_sched.aborting` at the moment the first error-class exit
@@ -342,7 +339,7 @@ bool ktstr_exit_aborting = false;
  * scheduler) when the error fired. */
 s32 ktstr_exit_bypass_depth = 0;
 
-/* The `kind` argument the fexit handler received. Stored even when
+/* The `kind` argument the selected handler received. Stored even when
  * the scheduler pointer is NULL (no BPF_CORE_READ chain needed) so
  * the fallback path always has the SCX_EXIT_* class even when every
  * scheduler-scalar read fails. */
@@ -535,14 +532,41 @@ int ktstr_probe(struct pt_regs *ctx)
 }
 
 /*
+ * Entry arguments for the raw scx_vexit kprobe/kretprobe pair used by the
+ * kernel generation immediately before sched_ext_exit was introduced.
+ *
+ * scx_vexit's final va_list parameter is represented differently by BTF
+ * across architectures and compiler generations, which makes a typed fexit
+ * program needlessly fragile. A raw entry probe captures only the two stable
+ * leading arguments needed by ktstr. The return probe consumes them only when
+ * scx_vexit returns true, i.e. after scx_claim_exit() won.
+ *
+ * scx_vexit runs with preemption disabled and does not recurse. pid_tgid is
+ * therefore an exact entry/return correlation key, and 1024 entries exceed
+ * the number of calls that can be in flight on any supported ktstr guest.
+ */
+struct ktstr_vexit_args {
+	u64 sch;
+	u32 kind;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);
+	__type(value, struct ktstr_vexit_args);
+	__uint(max_entries, 1024);
+} ktstr_vexit_args SEC(".maps");
+
+/*
  * Shared error-exit capture body. Kernel generations select one of the
- * thin typed wrappers below before object load; both enter here with an
+ * thin wrappers below before object load; all enter here with an
  * already validated error-class kind.
  */
 static __always_inline int ktstr_trigger_error(void *ctx,
 					      struct scx_sched *sch,
 					      unsigned int kind,
-					      bool causal_current)
+					      bool causal_current,
+					      bool capture_event_stats)
 {
 	/*
 	 * Skip non-error exits (kind < SCX_EXIT_ERROR). The error-exit
@@ -594,8 +618,9 @@ static __always_inline int ktstr_trigger_error(void *ctx,
 	 * CAS publishes the error. Same happens-before ordering as the
 	 * timestamp store above: a host-side observer that polls
 	 * `ktstr_err_exit_detected` and sees `1` is then guaranteed to
-	 * see populated `ktstr_exit_event_stats` because the CAS below
-	 * provides release semantics over the prior plain stores.
+	 * see populated `ktstr_exit_event_stats` when this program type permits
+	 * the snapshot because the CAS below provides release semantics over
+	 * the prior plain stores.
 	 *
 	 * Concurrent racing fires (multiple `scx_sched` instances
 	 * exiting in parallel) may overwrite the snapshot with their
@@ -605,7 +630,15 @@ static __always_inline int ktstr_trigger_error(void *ctx,
 	 * want — every racing fire's snapshot is a valid system-wide
 	 * view at its own ktime.
 	 */
-	if (bpf_ksym_exists(scx_bpf_events))
+	/*
+	 * scx_bpf_events is permitted from BPF_PROG_TYPE_TRACING but not from
+	 * BPF_PROG_TYPE_KPROBE on the pre-tracepoint kernel generation. Keep
+	 * this a compile-time wrapper argument: __always_inline plus a literal
+	 * false at the raw scx_vexit call site removes the kfunc reference from
+	 * that program before verifier load, while the typed trace/fentry
+	 * generations retain the snapshot.
+	 */
+	if (capture_event_stats && bpf_ksym_exists(scx_bpf_events))
 		scx_bpf_events(&ktstr_exit_event_stats,
 			       sizeof(ktstr_exit_event_stats));
 
@@ -731,35 +764,57 @@ int BPF_PROG(ktstr_trigger_tp, struct scx_sched *sch, unsigned int kind)
 		return 0;
 
 	return ktstr_trigger_error(ctx, sch, kind,
-				   kind == SCX_EXIT_ERROR_BPF);
+				   kind == SCX_EXIT_ERROR_BPF, true);
 }
 
 /*
- * Modern sched_ext trigger. The former tp_btf/sched_ext_exit target
- * is absent from this kernel generation, so scx_vexit() is its typed
- * exit path.
- * Its bool return says whether scx_claim_exit() won the per-scheduler
- * atomic transition, so rejecting `accepted == false` preserves one
- * trigger per successfully claimed exit without racing at entry.
+ * Pre-tracepoint sched_ext trigger, entry half. A raw kprobe avoids typed-BTF
+ * validation of scx_vexit's architecture-dependent by-value va_list while
+ * retaining the stable leading `(sch, kind)` arguments.
  */
-SEC("fexit/scx_vexit")
-int BPF_PROG(ktstr_trigger_fexit, struct scx_sched *sch,
-	     unsigned int kind, s64 exit_code, const char *fmt,
-	     void *args, bool accepted)
+SEC("kprobe/scx_vexit")
+int ktstr_trigger_vexit_enter(struct pt_regs *ctx)
 {
-	(void)exit_code;
-	(void)fmt;
-	(void)args;
+	u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct ktstr_vexit_args args = {
+		.sch = PT_REGS_PARM1_CORE(ctx),
+		.kind = (u32)PT_REGS_PARM2_CORE(ctx),
+	};
 
-	if (!accepted)
+	bpf_map_update_elem(&ktstr_vexit_args, &pid_tgid, &args, BPF_ANY);
+	return 0;
+}
+
+/*
+ * Pre-tracepoint sched_ext trigger, return half. scx_vexit's bool return says
+ * whether scx_claim_exit() won the per-scheduler atomic transition. Consume
+ * and delete the entry unconditionally, but publish a trigger only for the
+ * winning return. `current` is unchanged across the pair because scx_vexit
+ * holds preemption disabled, preserving the causal-current contract for
+ * SCX_EXIT_ERROR_BPF.
+ */
+SEC("kretprobe/scx_vexit")
+int ktstr_trigger_vexit_return(struct pt_regs *ctx)
+{
+	u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct ktstr_vexit_args *saved =
+		bpf_map_lookup_elem(&ktstr_vexit_args, &pid_tgid);
+	if (saved == NULL)
+		return 0;
+
+	struct ktstr_vexit_args args = *saved;
+	bpf_map_delete_elem(&ktstr_vexit_args, &pid_tgid);
+
+	if (!PT_REGS_RC_CORE(ctx))
 		return 0;
 
 	ktstr_pcpu_inc(KTSTR_PCPU_TRIGGER_COUNT);
-	if (kind < SCX_EXIT_ERROR)
+	if (args.kind < SCX_EXIT_ERROR)
 		return 0;
 
-	return ktstr_trigger_error(ctx, sch, kind,
-				   kind == SCX_EXIT_ERROR_BPF);
+	return ktstr_trigger_error(ctx, (struct scx_sched *)args.sch,
+				   args.kind,
+				   args.kind == SCX_EXIT_ERROR_BPF, false);
 }
 
 /*
@@ -784,7 +839,7 @@ int BPF_PROG(ktstr_trigger_dump_fentry, struct scx_exit_info *ei,
 		return 0;
 
 	ktstr_pcpu_inc(KTSTR_PCPU_TRIGGER_COUNT);
-	return ktstr_trigger_error(ctx, NULL, kind, false);
+	return ktstr_trigger_error(ctx, NULL, kind, false, true);
 }
 
 /*

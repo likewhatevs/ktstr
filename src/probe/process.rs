@@ -60,7 +60,7 @@ use crate::sync::{Latch, RwLockExt};
 ///   either still alive (latch never set) or exited via the clean
 ///   `SCX_EXIT_NONE` path.
 /// - `2` ([`SchedExitKind::Crashed`]) — probe armed, BSS latch
-///   observed at `!= 0`. Set by the selected typed BPF exit handler
+///   observed at `!= 0`. Set by the selected BPF exit handler
 ///   after any successfully claimed non-clean kernel exit
 ///   (`SCX_EXIT_ERROR`, `SCX_EXIT_ERROR_STALL`, watchdog kick,
 ///   BPF-side error).
@@ -147,7 +147,7 @@ fn bounded_libbpf_tail(log: &str) -> String {
     }
 }
 
-/// Kernel-generation-specific typed hook used to observe sched_ext exits.
+/// Kernel-generation-specific hook used to observe sched_ext exits.
 ///
 /// All programs live in the same BPF object. Userspace selects exactly one
 /// before load so a missing target cannot reject the whole object.
@@ -155,8 +155,8 @@ fn bounded_libbpf_tail(log: &str) -> String {
 enum SchedulerExitTrigger {
     /// Per-scheduler typed tracepoint emitted after a successful claim.
     SchedExtExitTracepoint,
-    /// Five-argument per-scheduler exit path used by the preceding generation.
-    ScxVexit,
+    /// Raw entry/return pair around the preceding generation's exit path.
+    ScxVexitKprobePair,
     /// Global-era error dump path used by 6.14.
     ScxDumpState,
 }
@@ -165,7 +165,7 @@ impl SchedulerExitTrigger {
     fn diagnostic_type(self) -> &'static str {
         match self {
             Self::SchedExtExitTracepoint => "tp_btf",
-            Self::ScxVexit => "fexit",
+            Self::ScxVexitKprobePair => "kprobe+kretprobe",
             Self::ScxDumpState => "fentry-global",
         }
     }
@@ -173,31 +173,60 @@ impl SchedulerExitTrigger {
     fn section(self) -> &'static str {
         match self {
             Self::SchedExtExitTracepoint => "tp_btf/sched_ext_exit",
-            Self::ScxVexit => "fexit/scx_vexit",
+            Self::ScxVexitKprobePair => "kprobe+kretprobe/scx_vexit",
             Self::ScxDumpState => "fentry/scx_dump_state",
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SchedulerExitProgramSelection {
+    tracepoint: bool,
+    vexit_enter: bool,
+    vexit_return: bool,
+    dump_fentry: bool,
+}
+
+/// Return the complete pre-load autoload selection for a scheduler-exit
+/// trigger. Keeping the raw scx_vexit entry and return halves in one
+/// projection prevents a future selector change from loading only half of the
+/// correlation pair.
+fn scheduler_exit_program_selection(
+    trigger: SchedulerExitTrigger,
+) -> SchedulerExitProgramSelection {
+    SchedulerExitProgramSelection {
+        tracepoint: trigger == SchedulerExitTrigger::SchedExtExitTracepoint,
+        vexit_enter: trigger == SchedulerExitTrigger::ScxVexitKprobePair,
+        vexit_return: trigger == SchedulerExitTrigger::ScxVexitKprobePair,
+        dump_fentry: trigger == SchedulerExitTrigger::ScxDumpState,
+    }
+}
+
 /// Prefer the exact post-claim tracepoint whenever it exists. It has a stable
-/// two-argument ABI while `scx_vexit` gained an `exit_cpu` argument in the
-/// following kernel generation. The five-argument `scx_vexit` function shape
-/// is therefore selected only when the tracepoint is absent, and the
-/// two-argument global-era dump hook is the final fallback.
+/// two-argument ABI while `scx_vexit`'s trailing by-value `va_list` has an
+/// architecture- and compiler-dependent BTF representation. The raw
+/// `scx_vexit` kprobe/kretprobe pair is therefore selected by function
+/// presence when the tracepoint is absent, and the two-argument global-era
+/// dump hook is the final fallback.
 fn select_scheduler_exit_trigger(
     has_sched_ext_exit_tracepoint: bool,
-    has_scx_vexit_5: bool,
+    has_scx_vexit: bool,
     has_scx_dump_state_2: bool,
 ) -> Option<SchedulerExitTrigger> {
     if has_sched_ext_exit_tracepoint {
         Some(SchedulerExitTrigger::SchedExtExitTracepoint)
-    } else if has_scx_vexit_5 {
-        Some(SchedulerExitTrigger::ScxVexit)
+    } else if has_scx_vexit {
+        Some(SchedulerExitTrigger::ScxVexitKprobePair)
     } else if has_scx_dump_state_2 {
         Some(SchedulerExitTrigger::ScxDumpState)
     } else {
         None
     }
+}
+
+fn btf_has_function(btf: &btf_rs::Btf, name: &str) -> bool {
+    btf.resolve_types_by_name(name)
+        .is_ok_and(|types| types.iter().any(|ty| matches!(ty, btf_rs::Type::Func(_))))
 }
 
 fn btf_has_function_arity(btf: &btf_rs::Btf, name: &str, arity: usize) -> bool {
@@ -328,7 +357,7 @@ pub struct ProbeDiagnostics {
     /// Which trigger mechanism attached ("tp_btf", "fexit", or
     /// "fentry-global").
     pub trigger_type: String,
-    /// Error from the selected typed scheduler-exit hook.
+    /// Error from the selected scheduler-exit hook.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_attach_error: Option<String>,
     /// Panic payload from the guest-side probe-collection thread
@@ -1013,7 +1042,7 @@ fn set_rodata_slot(
 /// Causal-task filter for the trigger event's `task_ptr` (sourced
 /// from `args[0]`).
 ///
-/// The BPF `ktstr_trigger_fexit` handler sets `args[0]` to
+/// The selected BPF scheduler-exit handler sets `args[0]` to
 /// `bpf_get_current_task()` only for `SCX_EXIT_ERROR_BPF` (where
 /// `current` IS the causal task); for `SCX_EXIT_ERROR` (kworker /
 /// sysrq context) it emits `args[0] == 0`. A zero `task_ptr` means
@@ -1034,7 +1063,7 @@ fn causal_tptr(task_ptr: u64) -> Option<u64> {
 /// polls until the trigger fires.
 ///
 /// **Two-phase (`phase_b_rx = Some`):** Phase A attaches kprobes +
-/// kernel fexit + the kernel-selected typed exit trigger before the
+/// kernel fexit + the kernel-selected exit trigger before the
 /// scheduler starts, signals `ready`, then polls the ring buffer
 /// while waiting for Phase B input via the channel. When Phase B
 /// input arrives, attaches fentry/fexit to BPF struct_ops callbacks
@@ -1044,10 +1073,10 @@ fn causal_tptr(task_ptr: u64) -> Option<u64> {
 /// crash happened before BPF programs could be probed.
 ///
 /// Newest kernels trigger directly after a successful `scx_claim_exit()` via
-/// `tp_btf/sched_ext_exit`; the preceding generation triggers as its
-/// five-argument `scx_vexit()` returns; global-era kernels trigger on their
+/// `tp_btf/sched_ext_exit`; the preceding generation triggers from a raw
+/// entry/return pair around `scx_vexit()`; global-era kernels trigger on their
 /// filtered two-argument `scx_dump_state()` error entry. If no compatible
-/// typed shape is available, auto-repro fails closed before object load.
+/// target is available, auto-repro fails closed before object load.
 ///
 /// Returns accumulated func_names from both phases as the third
 /// tuple element.
@@ -1114,13 +1143,13 @@ pub fn run_probe_skeleton(
         .and_then(|btf| {
             select_scheduler_exit_trigger(
                 btf_has_typed_tracepoint_arity(btf, "sched_ext_exit", 3),
-                btf_has_function_arity(btf, "scx_vexit", 5),
+                btf_has_function(btf, "scx_vexit"),
                 btf_has_function_arity(btf, "scx_dump_state", 2),
             )
         })
         .ok_or_else(|| {
-            "kernel BTF exposes no compatible typed sched_ext exit target \
-             (`sched_ext_exit`, five-argument `scx_vexit`, or two-argument \
+            "kernel BTF exposes no compatible sched_ext exit target \
+             (`sched_ext_exit`, `scx_vexit`, or two-argument \
              `scx_dump_state`)"
                 .to_string()
         });
@@ -1153,26 +1182,23 @@ pub fn run_probe_skeleton(
     if let Some(rodata) = open_skel.maps.rodata_data.as_mut() {
         rodata.ktstr_enabled = true;
     }
-    match exit_trigger {
-        SchedulerExitTrigger::SchedExtExitTracepoint => {
-            open_skel.progs.ktstr_trigger_fexit.set_autoload(false);
-            open_skel
-                .progs
-                .ktstr_trigger_dump_fentry
-                .set_autoload(false);
-        }
-        SchedulerExitTrigger::ScxVexit => {
-            open_skel.progs.ktstr_trigger_tp.set_autoload(false);
-            open_skel
-                .progs
-                .ktstr_trigger_dump_fentry
-                .set_autoload(false);
-        }
-        SchedulerExitTrigger::ScxDumpState => {
-            open_skel.progs.ktstr_trigger_tp.set_autoload(false);
-            open_skel.progs.ktstr_trigger_fexit.set_autoload(false);
-        }
-    }
+    let trigger_programs = scheduler_exit_program_selection(exit_trigger);
+    open_skel
+        .progs
+        .ktstr_trigger_tp
+        .set_autoload(trigger_programs.tracepoint);
+    open_skel
+        .progs
+        .ktstr_trigger_vexit_enter
+        .set_autoload(trigger_programs.vexit_enter);
+    open_skel
+        .progs
+        .ktstr_trigger_vexit_return
+        .set_autoload(trigger_programs.vexit_return);
+    open_skel
+        .progs
+        .ktstr_trigger_dump_fentry
+        .set_autoload(trigger_programs.dump_fentry);
 
     // Load skeleton. Try with all programs first; if a missing optional
     // typed-BTF target causes ESRCH, re-open with optional programs disabled.
@@ -1210,26 +1236,23 @@ pub fn run_probe_skeleton(
             if let Some(rodata) = open_skel2.maps.rodata_data.as_mut() {
                 rodata.ktstr_enabled = true;
             }
-            match exit_trigger {
-                SchedulerExitTrigger::SchedExtExitTracepoint => {
-                    open_skel2.progs.ktstr_trigger_fexit.set_autoload(false);
-                    open_skel2
-                        .progs
-                        .ktstr_trigger_dump_fentry
-                        .set_autoload(false);
-                }
-                SchedulerExitTrigger::ScxVexit => {
-                    open_skel2.progs.ktstr_trigger_tp.set_autoload(false);
-                    open_skel2
-                        .progs
-                        .ktstr_trigger_dump_fentry
-                        .set_autoload(false);
-                }
-                SchedulerExitTrigger::ScxDumpState => {
-                    open_skel2.progs.ktstr_trigger_tp.set_autoload(false);
-                    open_skel2.progs.ktstr_trigger_fexit.set_autoload(false);
-                }
-            }
+            let trigger_programs = scheduler_exit_program_selection(exit_trigger);
+            open_skel2
+                .progs
+                .ktstr_trigger_tp
+                .set_autoload(trigger_programs.tracepoint);
+            open_skel2
+                .progs
+                .ktstr_trigger_vexit_enter
+                .set_autoload(trigger_programs.vexit_enter);
+            open_skel2
+                .progs
+                .ktstr_trigger_vexit_return
+                .set_autoload(trigger_programs.vexit_return);
+            open_skel2
+                .progs
+                .ktstr_trigger_dump_fentry
+                .set_autoload(trigger_programs.dump_fentry);
             open_skel2.progs.ktstr_pi_fentry.set_autoload(false);
             open_skel2.progs.ktstr_pi_fexit.set_autoload(false);
             open_skel2.progs.ktstr_lock_contend.set_autoload(false);
@@ -1759,20 +1782,16 @@ pub fn run_probe_skeleton(
             continue;
         }
 
-        // Disable fexit for unused slots. Fentry for these slots was
-        // left at its default by the `targets` loop above (which
-        // disables fentry only for slots that have a target); no
-        // attach_target was set for them either, so libbpf loads
-        // them with a NULL target. Disabling fexit here keeps the
-        // behaviour as it was before the slot helpers were
-        // introduced.
+        // Disable both programs for unused slots. A generic `SEC("fentry")`
+        // program without an attach target is not a valid load target on all
+        // kernels; leaving the unused entry half enabled can reject the whole
+        // short final batch with EINVAL even though every used fexit target is
+        // valid.
         let used_slots: std::collections::HashSet<usize> =
             targets.iter().filter(|t| t.ok).map(|t| t.slot).collect();
         for slot in 0..FENTRY_BATCH {
-            if !used_slots.contains(&slot)
-                && let Some(p) = fexit_prog_mut_by_slot(&mut fentry_open, slot)
-            {
-                p.set_autoload(false);
+            if !used_slots.contains(&slot) {
+                disable_slot_programs(&mut fentry_open, slot);
             }
         }
 
@@ -1829,23 +1848,48 @@ pub fn run_probe_skeleton(
         );
     }
 
-    // Attach the sole program selected before load. The newest tracepoint is
-    // emitted only for a successful claim, the modern return hook rejects
-    // losing concurrent claims, and the global-era entry hook rechecks
+    // Attach the selected trigger program(s). The newest tracepoint is emitted
+    // only for a successful claim, the preceding generation's raw return probe
+    // rejects losing concurrent claims, and the global-era entry hook rechecks
     // scx_exit_info.kind to reject the SysRq-D caller.
-    let trigger_attach = match exit_trigger {
-        SchedulerExitTrigger::SchedExtExitTracepoint => skel.progs.ktstr_trigger_tp.attach_trace(),
-        SchedulerExitTrigger::ScxVexit => skel.progs.ktstr_trigger_fexit.attach_trace(),
-        SchedulerExitTrigger::ScxDumpState => skel.progs.ktstr_trigger_dump_fentry.attach_trace(),
+    let trigger_attach: Result<Vec<(Link, String)>, String> = match exit_trigger {
+        SchedulerExitTrigger::SchedExtExitTracepoint => skel
+            .progs
+            .ktstr_trigger_tp
+            .attach_trace()
+            .map(|link| vec![(link, "tp_btf/sched_ext_exit".to_string())])
+            .map_err(|e| e.to_string()),
+        SchedulerExitTrigger::ScxVexitKprobePair => (|| {
+            let enter = skel
+                .progs
+                .ktstr_trigger_vexit_enter
+                .attach_kprobe(false, "scx_vexit")
+                .map_err(|e| format!("entry kprobe: {e}"))?;
+            let ret = skel
+                .progs
+                .ktstr_trigger_vexit_return
+                .attach_kprobe(true, "scx_vexit")
+                .map_err(|e| format!("return kprobe: {e}"))?;
+            Ok(vec![
+                (enter, "kprobe/scx_vexit".to_string()),
+                (ret, "kretprobe/scx_vexit".to_string()),
+            ])
+        })(),
+        SchedulerExitTrigger::ScxDumpState => skel
+            .progs
+            .ktstr_trigger_dump_fentry
+            .attach_trace()
+            .map(|link| vec![(link, "fentry/scx_dump_state".to_string())])
+            .map_err(|e| e.to_string()),
     };
     match trigger_attach {
-        Ok(link) => {
+        Ok(trigger_links) => {
             tracing::debug!(
                 trigger = exit_trigger.section(),
                 "scheduler-exit trigger attached"
             );
             diag.trigger_type = exit_trigger.diagnostic_type().to_string();
-            links.push((link, exit_trigger.section().to_string()));
+            links.extend(trigger_links);
         }
         Err(e) => {
             let msg = format!(
@@ -2376,8 +2420,7 @@ pub fn run_probe_skeleton(
             // filter events to those referencing the same task_struct
             // pointer as the causal task.
             //
-            // The args[0] assignment in ktstr_trigger_fexit (the BPF
-            // trigger handler) sets args[0] to
+            // The selected BPF trigger handler sets args[0] to
             // bpf_get_current_task() ONLY for
             // SCX_EXIT_ERROR_BPF (1025), where a BPF scheduler
             // callback faulted in the running task's context — so
@@ -2622,6 +2665,21 @@ fn attach_phase_b_fentry(
     }
 
     let attach_input: Vec<String> = kprobe_targets.iter().map(|t| t.raw_name.clone()).collect();
+    // Kernel fexit must mirror the set that resolved and received func_meta,
+    // not the raw Phase-B plan. Feeding an absent generation-specific alias to
+    // set_attach_target can poison the whole batch even though the matching
+    // kprobe was already rejected above.
+    struct KernelFexitTarget {
+        idx: u32,
+        name: String,
+    }
+    let kernel_fexit_targets: Vec<KernelFexitTarget> = kprobe_targets
+        .iter()
+        .map(|target| KernelFexitTarget {
+            idx: target.idx,
+            name: target.raw_name.clone(),
+        })
+        .collect();
     let attach_results = parallel_attach_kprobes(&skel.progs.ktstr_probe, &attach_input);
     // Pair the attach result with its target metadata. `attach_results`
     // is in the same order as `attach_input` is in the same order as
@@ -2645,21 +2703,6 @@ fn attach_phase_b_fentry(
     }
 
     // --- Phase B kernel function fexit batches (fd=0 = vmlinux BTF) ---
-    struct KernelFexitTarget {
-        idx: u32,
-        name: String,
-    }
-    let kernel_fexit_targets: Vec<KernelFexitTarget> = pb
-        .functions
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| !f.is_bpf)
-        .map(|(i, f)| KernelFexitTarget {
-            idx: offset + i as u32,
-            name: f.display_name.clone(),
-        })
-        .collect();
-
     for chunk in kernel_fexit_targets.chunks(FENTRY_BATCH) {
         let mut targets: Vec<FentryTarget<'_>> = Vec::new();
         for (slot, kt) in chunk.iter().enumerate() {
@@ -2715,15 +2758,13 @@ fn attach_phase_b_fentry(
             continue;
         }
 
-        // Disable fexit for unused slots (see the matching single-phase
-        // kernel-fexit batch for the fentry-left-at-default rationale).
+        // Disable both halves for unused slots; loading an untargeted generic
+        // fentry program can reject a short batch with EINVAL.
         let used_slots: std::collections::HashSet<usize> =
             targets.iter().filter(|t| t.ok).map(|t| t.slot).collect();
         for slot in 0..FENTRY_BATCH {
-            if !used_slots.contains(&slot)
-                && let Some(p) = fexit_prog_mut_by_slot(&mut fentry_open, slot)
-            {
-                p.set_autoload(false);
+            if !used_slots.contains(&slot) {
+                disable_slot_programs(&mut fentry_open, slot);
             }
         }
 

@@ -89,7 +89,7 @@ changed between entry and exit:
 <span class="t-grn">      slice               19982063         →  20000000</span>
       weight              100
       scx_flags           RESET_RUNNABLE_AT|DEQD_FOR_SLEEP|ENABLED
-  do_enqueue_task                                               kernel/sched/ext.c:1885
+  enqueue_task_scx                                              kernel/sched/ext.c
     rq *rq
       cpu                 0
     task_struct *p
@@ -99,9 +99,9 @@ changed between entry and exit:
 <span class="t-dim">  ...</span>
 <span class="t-red">  bpf_prog_9a11f2edaac0b52f_ktstr_dispatch+0x57/0x1db</span></pre></div>
 
-Auto-repro is on by default and selects the kernel's native typed
-scheduler-exit hook (`sched_ext_exit` on the newest kernels, `scx_vexit`
-on the preceding generation, or `scx_dump_state` on global-era kernels) —
+Auto-repro is on by default and selects the kernel's native scheduler-exit
+hook (`sched_ext_exit` on the newest kernels, a raw `scx_vexit` entry/return
+pair on the preceding generation, or `scx_dump_state` on global-era kernels) —
 see [Auto-Repro](running-tests/auto-repro.md). For the
 anatomy of ordinary failures (stats, timeline, monitor verdict), see
 [Reading Failure Output](running-tests/failures.md).

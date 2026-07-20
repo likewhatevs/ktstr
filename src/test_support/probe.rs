@@ -8,7 +8,7 @@
 //!
 //! Probe attachment runs in two phases:
 //! - **Phase A** ([`start_probe_phase_a`]) attaches kprobes, fexits,
-//!   and the selected typed scheduler-exit trigger before the scheduler
+//!   and the selected scheduler-exit trigger before the scheduler
 //!   starts. Needed because kprobes must be in place before the
 //!   first call to each traced function.
 //! - **Phase B** ([`maybe_dispatch_vm_test_with_phase_a`]) discovers
@@ -45,11 +45,11 @@ const DISCOVER_SENTINEL: &str = "__discover__";
 
 /// Minimal primary diagnostic target used by the probe-counter readiness test.
 ///
-/// `do_enqueue_task` is the stable sched_ext enqueue bridge already used by
+/// `enqueue_task_scx` is the stable sched_ext enqueue bridge already used by
 /// auto-repro's BPF-to-kernel expansion. It fires after scheduler launch and
 /// increments `KTSTR_PCPU_PROBE_COUNT`, proving the decoded per-CPU slab is
 /// live rather than merely addressable.
-const PRIMARY_PROBE_DUMP_STACK: &str = "do_enqueue_task";
+const PRIMARY_PROBE_DUMP_STACK: &str = "enqueue_task_scx";
 
 /// Add the minimal probe request needed by a primary VM whose scheduler
 /// launch is gated on full probe-counter dump readiness.
@@ -1432,7 +1432,7 @@ fn find_balanced_object_end(s: &str) -> Option<usize> {
 /// speculative.
 ///
 /// Branch order matches the failure-mode taxonomy:
-///   1. `bpf_trigger_fires == 0` — the selected typed exit
+///   1. `bpf_trigger_fires == 0` — the selected exit
 ///      handler never accepted an error-class exit. Either the
 ///      scheduler clean-exited (kind < SCX_EXIT_ERROR, handler
 ///      early-returns in probe.bpf.c) or the scheduler crashed
@@ -2623,7 +2623,7 @@ fn emit_probe_payload(
 /// after the guest's Phase 6 scheduler teardown. Holds the `stop`
 /// signal and probe handle that [`collect_and_print_probe_data`]
 /// consumes; deferring the consumption past `child.kill()` is what
-/// keeps the selected typed exit listener attached while the kernel's
+/// keeps the selected exit listener attached while the kernel's
 /// accepted error path crosses the trigger.
 ///
 /// Stored in [`DEFERRED_PROBE_COLLECT`]; [`take_deferred_probe`]
@@ -2725,7 +2725,7 @@ fn wait_for_sched_disabled_at(path: &str, timeout: std::time::Duration) -> bool 
 /// `child.wait()` / `/sched_disable`. By the time the kernel
 /// finishes `scx_disable_irq_workfn` (signalled by
 /// `/sys/kernel/sched_ext/state` transitioning to `disabled`),
-/// the probe's selected typed exit listener has had its one
+/// the probe's selected exit listener has had its one
 /// guaranteed fire — the trigger event lands in the ring buffer
 /// with a real `target_tptr`, the probe poll loop's BSS latch
 /// check observes `ktstr_err_exit_detected != 0`, and the
@@ -2745,7 +2745,7 @@ pub(crate) fn finalize_probe_after_unwind() {
     };
     // Skip the kernel-unwind wait when no probe handle is attached.
     // The wait exists exclusively to give the probe's
-    // typed exit listener time to observe the trigger;
+    // exit listener time to observe the trigger;
     // when there is no listener, the wait is wasted teardown
     // latency on every test (auto-repro is the only path that
     // installs a probe handle, and even then only when the primary
@@ -2762,7 +2762,7 @@ pub(crate) fn finalize_probe_after_unwind() {
         //
         // No grace sleep after `wait_for_sched_disabled` returns
         // true: the kernel's `scx_claim_exit` (called from
-        // selected typed exit hook fires BEFORE the kernel publishes
+        // selected exit hook fires BEFORE the kernel publishes
         // SCX_DISABLED at the
         // tail of `scx_root_disable`, so a `state == disabled`
         // observation establishes a happens-after relationship
@@ -2836,7 +2836,7 @@ fn enforce_survives_storm_liveness(result: &mut AssertResult, survives_storm: bo
 /// teardown lives) or collect-and-emit immediately (ctor path on
 /// the host, where there is no Phase 6).
 ///
-/// The deferred path is what keeps the selected typed exit listener
+/// The deferred path is what keeps the selected exit listener
 /// attached while the accepted error path unwinds — without it, the probe
 /// is detached before `child.kill()` runs and the stall-class
 /// trigger fires into a void (146 captured kprobe events, 0

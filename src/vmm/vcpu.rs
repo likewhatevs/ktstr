@@ -812,7 +812,7 @@ pub(crate) struct ApFreezeHandles {
 /// polling overhead and no dependency on the probe BPF program being
 /// loaded. It also fires on ANY exit_kind transition — including
 /// SCX_EXIT_ERROR_BPF / SCX_EXIT_ERROR_STALL paths the .bss probe might miss
-/// when its selected typed hook ran before kernel teardown.
+/// when its selected hook ran before kernel teardown.
 /// The .bss path remains because the watchpoint can be unavailable
 /// (no `scx_root` symbol on pre-6.16, BTF stripped of `scx_sched`,
 /// or `KVM_SET_GUEST_DEBUG` rejected by the host).

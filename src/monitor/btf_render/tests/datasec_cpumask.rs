@@ -113,7 +113,7 @@ fn render_datasec_emits_struct_with_named_variables() {
         // (ktstr_trigger_count / ktstr_probe_count / etc.).
         "ktstr_pcpu_counters",
         // Sticky timestamp + scheduler-state snapshots written
-        // by the selected typed scheduler-exit handler at the first
+        // by the selected scheduler-exit handler at the first
         // error-class exit.
         "ktstr_last_trigger_ts",
         // SCX_EV_* counter snapshot taken by `scx_bpf_events`

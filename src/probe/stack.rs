@@ -65,8 +65,8 @@ pub fn should_skip_probe(name: &str) -> bool {
 ///
 /// Order matters: `.find()` returns the first matching fragment.
 pub(super) const BPF_OP_CALLERS: &[(&str, &str, u32)] = &[
-    ("select_cpu", "do_enqueue_task", 1),
-    ("enqueue", "do_enqueue_task", 1),
+    ("select_cpu", "enqueue_task_scx", 1),
+    ("enqueue", "enqueue_task_scx", 1),
     ("dispatch", "balance_one", 1),
     ("running", "set_next_task_scx", 1),
     ("stopping", "put_prev_task_scx", 1),
@@ -81,7 +81,7 @@ pub(super) const BPF_OP_CALLERS: &[(&str, &str, u32)] = &[
 /// BPF functions are kept (for fentry attachment) and their kernel
 /// callers are added (for bridge kprobes that capture the kernel-side
 /// view). Uses [`BPF_OP_CALLERS`] to map sched_ext op name fragments
-/// to kernel entry points (e.g. `enqueue` -> `do_enqueue_task`).
+/// to kernel entry points (e.g. `enqueue` -> `enqueue_task_scx`).
 /// Deduplicates by raw_name.
 pub fn expand_bpf_to_kernel_callers(functions: Vec<StackFunction>) -> Vec<StackFunction> {
     let mut result = Vec::new();
@@ -690,13 +690,13 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].raw_name, "bpf_prog_9_mitosis_enqueue");
         assert!(result[0].is_bpf);
-        assert_eq!(result[1].raw_name, "do_enqueue_task");
+        assert_eq!(result[1].raw_name, "enqueue_task_scx");
         assert!(!result[1].is_bpf);
     }
 
     #[test]
     fn expand_bpf_deduplicates_callers() {
-        // Both enqueue and select_cpu map to do_enqueue_task.
+        // Both enqueue and select_cpu map to enqueue_task_scx.
         let funcs = vec![
             StackFunction {
                 raw_name: "bpf_prog_9_mitosis_enqueue".into(),
@@ -716,7 +716,7 @@ mod tests {
         assert_eq!(result.len(), 3);
         // Order: bpf1, caller (from bpf1), bpf2 (caller deduped for bpf2).
         assert!(result[0].is_bpf);
-        assert_eq!(result[1].raw_name, "do_enqueue_task");
+        assert_eq!(result[1].raw_name, "enqueue_task_scx");
         assert!(!result[1].is_bpf);
         assert!(result[2].is_bpf);
     }

@@ -1980,7 +1980,7 @@ pub(crate) fn sched_exit_poll_timeout(
 ///     instead waits on the probe thread's `output_done` latch — keeping the
 ///     VM alive until the probe has emitted its payload — and skips the dump
 ///     (the probe pipeline handles crash detection via its
-///     kernel-selected typed scheduler-exit trigger).
+///     kernel-selected scheduler-exit trigger).
 ///   - the SCHED_EXIT signal (MSG_TYPE_SCHED_EXIT, which lets the host
 ///     terminate the VM early) is then sent UNLESS the `stop` flag is set
 ///     (a host-initiated kill, where the exit is expected). It is gated by

@@ -94,9 +94,9 @@ scheduler crashes, ktstr automatically:
 1. Captures the crash stack trace from the scenario output.
 2. Boots a second VM with kprobes (kernel functions) and fentry
    probes (BPF callbacks) on each function in the crash chain, plus
-   the kernel-selected typed scheduler-exit trigger
+   the kernel-selected scheduler-exit trigger
    (`tp_btf/sched_ext_exit` on the newest kernels,
-   `fexit/scx_vexit` on the preceding generation, or filtered
+   a raw `scx_vexit` entry/return pair on the preceding generation, or filtered
    `fentry/scx_dump_state` on global-era kernels).
 3. Reruns the scenario to capture function arguments at each crash
    point.
@@ -124,7 +124,7 @@ attached. The same crash replayed under probes:
       <span class="t-grn">dsq_id              SCX_DSQ_INVALID  →  SCX_DSQ_LOCAL</span>
       <span class="t-grn">slice               19982063         →  20000000</span>
       scx_flags           RESET_RUNNABLE_AT|DEQD_FOR_SLEEP|ENABLED
-  do_enqueue_task                                               kernel/sched/ext.c:1885
+  enqueue_task_scx                                              kernel/sched/ext.c
     rq *rq
       cpu                 0
     task_struct *p

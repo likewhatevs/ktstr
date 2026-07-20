@@ -311,7 +311,7 @@ changes:
 <div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">auto-repro probe excerpt</span></div>
 
 <pre>
-do_enqueue_task                                               kernel/sched/ext.c
+enqueue_task_scx                                              kernel/sched/ext.c
   rq *rq
     cpu         1
   task_struct *p
@@ -321,9 +321,9 @@ do_enqueue_task                                               kernel/sched/ext.c
 ...
     <span class="t-grn">scx_flags   QUEUED|DEQD_FOR_SLEEP    →  QUEUED</span></pre></div>
 
-On by default. ktstr selects the kernel's native typed scheduler-exit hook:
+On by default. ktstr selects the kernel's native scheduler-exit hook:
 `tp_btf/sched_ext_exit` on the newest kernels,
-`fexit/scx_vexit` on the preceding generation, or filtered
+a raw `scx_vexit` entry/return pair on the preceding generation, or filtered
 `fentry/scx_dump_state` on global-era kernels.
 See [Auto-Repro](running-tests/auto-repro.md).
 
@@ -364,7 +364,7 @@ See [ctprof](reference/ctprof.md).
 | CI-tested series | 6.14 and 7.1, on x86_64 and aarch64, every push |
 | Watchdog-timeout override | 7.1+ via BTF (`scx_sched.watchdog_timeout`); older kernels via the static `scx_watchdog_timeout` symbol |
 | sched_ext event counters | 6.16+ (two BTF layouts); sampling is disabled when neither is present |
-| Auto-repro probe trigger | `sched_ext_exit` typed tracepoint (newest), five-argument `scx_vexit` (preceding generation), or two-argument `scx_dump_state` (global era) |
+| Auto-repro probe trigger | `sched_ext_exit` typed tracepoint (newest), raw `scx_vexit` entry/return pair (preceding generation), or two-argument `scx_dump_state` (global era) |
 
 Outside the CI-tested series, the monitor degrades feature by feature
 rather than failing: tests still run, and unavailable capabilities are

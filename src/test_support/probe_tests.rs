@@ -25,10 +25,10 @@ fn phase_a_status_is_consumed_and_missing_publication_fails_closed() {
         "a terminal latch cannot be interpreted as implicit success"
     );
 
-    *pipeline.phase_a_status.lock().unwrap() = Some(Err("typed hook rejected".to_string()));
+    *pipeline.phase_a_status.lock().unwrap() = Some(Err("exit hook rejected".to_string()));
     assert_eq!(
         take_phase_a_status(&pipeline),
-        Err("typed hook rejected".to_string()),
+        Err("exit hook rejected".to_string()),
         "the concrete worker failure must cross the Phase-A latch"
     );
 }
@@ -1559,7 +1559,7 @@ fn diag_with_events(
 
 #[test]
 fn stitch_drop_cause_trigger_never_fired() {
-    // bpf_trigger_fires == 0 → the selected typed handler never executed.
+    // bpf_trigger_fires == 0 → the selected handler never executed.
     // Either the scheduler clean-exited (kind < SCX_EXIT_ERROR
     // hits the early-return at probe.bpf.c:565) or the scheduler
     // crashed before reaching the selected trigger at all. The cause
@@ -2887,13 +2887,13 @@ fn condense_probe_reason_prefers_libbpf_log_tail() {
     // condense_probe_reason surfaces that tail line, not the leading errno.
     let err = "skeleton load (retry): Permission denied; original error \
                before retry: Permission denied; LIBBPF-LOG>>>\n\
-               libbpf: prog 'ktstr_trigger_fexit': BPF program load failed\n\
-               libbpf: failed to find kernel BTF type ID of 'scx_vexit': -3\n\
+               libbpf: prog 'ktstr_trigger_vexit_return': BPF program load failed\n\
+               libbpf: failed to load raw scx_vexit return probe: -22\n\
                <<<LIBBPF-LOG";
     let condensed = condense_probe_reason(err);
     assert_eq!(
         condensed,
-        "libbpf: failed to find kernel BTF type ID of 'scx_vexit': -3",
+        "libbpf: failed to load raw scx_vexit return probe: -22",
     );
 }
 

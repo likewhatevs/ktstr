@@ -767,7 +767,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     };
 
     // Phase 2b: Probe Phase A (before scheduler starts).
-    // Attaches kprobes + the kernel-selected typed exit trigger so an
+    // Attaches kprobes + the kernel-selected exit trigger so an
     // accepted scheduler error is captured even if the scheduler
     // crashes immediately on startup.
     let _s_phase2b = tracing::debug_span!("phase2b_probe_phase_a").entered();
@@ -1252,7 +1252,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
 
     // Phase 6b: probe finalisation. Now that the scheduler is
     // killed and `/sched_disable` has run, the kernel's
-    // sched_ext disable path has crossed the kernel-selected typed
+    // sched_ext disable path has crossed the kernel-selected
     // error hook. The probe's listener is
     // STILL attached at this point because
     // [`crate::test_support::probe::publish_result_and_collect`]

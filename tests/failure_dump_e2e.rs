@@ -1028,7 +1028,7 @@ static __KTSTR_ENTRY_FAILURE_DUMP_CAPTURES: ktstr::test_support::KtstrTestEntry 
 ///      null in the JSON);
 ///   2. `probe_counters.trigger_count` is present and numeric. Zero is a
 ///      valid precise-freeze result: the hardware watchpoint linearizes on
-///      the scheduler's `exit_kind` write before the selected typed trigger
+///      the scheduler's `exit_kind` write before the selected trigger
 ///      increments this slot;
 ///   3. `probe_counters.probe_count > 0` — kprobes attached and
 ///      fired (confirms the host-side sum walks the array, since
@@ -1146,7 +1146,7 @@ fn validate_required_probe_dump(
 /// hardware-linearized dump may observe `trigger_count == 0`.
 /// Delaying capture to make it non-zero would lose the stronger invariant that
 /// the probe skeleton and its map are still alive. `probe_count > 0` is the
-/// independent live-array proof: the Phase-A `do_enqueue_task` kprobe has
+/// independent live-array proof: the Phase-A `enqueue_task_scx` kprobe has
 /// already fired before the scheduler stalls.
 fn validate_probe_counters(
     probe_counters: &serde_json::Value,
@@ -1164,7 +1164,7 @@ fn validate_probe_counters(
         })?;
 
     // `probe_count` cross-validates the array walk: the primary readiness
-    // path attaches `do_enqueue_task`, which fires during scheduler startup
+    // path attaches `enqueue_task_scx`, which fires during scheduler startup
     // and workload dispatch. A non-zero value here proves the host-side reader
     // walked the per-CPU slots (rather than reading a stub-zero
     // value from index 0 of an empty array).

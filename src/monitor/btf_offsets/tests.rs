@@ -1183,14 +1183,17 @@ fn probe_bpf_object_emits_atomic_for_err_exit_latch() {
         )
     });
     // Locate all program sections. libbpf names sections after the SEC()
-    // macro argument. A future restructure that drops any generation's
-    // typed hook surfaces as a clear test failure with the expected name.
-    const TARGET_SECTIONS: &[&str] = &[
-        "tp_btf/sched_ext_exit",
-        "fexit/scx_vexit",
-        "fentry/scx_dump_state",
+    // macro argument. The raw scx_vexit entry half only saves arguments;
+    // its return half publishes the latch and therefore owns the cmpxchg.
+    // A future restructure that drops either correlation half must fail even
+    // though only the return section is expected to contain an atomic.
+    const TARGET_SECTIONS: &[(&str, bool)] = &[
+        ("tp_btf/sched_ext_exit", true),
+        ("kprobe/scx_vexit", false),
+        ("kretprobe/scx_vexit", true),
+        ("fentry/scx_dump_state", true),
     ];
-    for target_section in TARGET_SECTIONS {
+    for (target_section, requires_atomic) in TARGET_SECTIONS {
         let mut found_section = false;
         let mut atomic_count: usize = 0;
         for sh in &elf.section_headers {
@@ -1234,14 +1237,70 @@ fn probe_bpf_object_emits_atomic_for_err_exit_latch() {
             "probe.o is missing the expected `{target_section}` section — \
              SEC() macro changed?"
         );
+        if *requires_atomic {
+            assert!(
+                atomic_count >= 1,
+                "probe.o `{target_section}` section has no BPF_STX|BPF_ATOMIC|cmpxchg \
+                 instruction — `__sync_val_compare_and_swap` was silently \
+                 lowered to a non-atomic store. Cross-core ordering on aarch64 \
+                 would be broken by this regression."
+            );
+        }
+    }
+}
+
+/// The pre-tracepoint scx_vexit path uses BPF_PROG_TYPE_KPROBE, where 7.1
+/// rejects the sched_ext-only `scx_bpf_events` kfunc. Pin the compiled ELF
+/// rather than only the C source: a future refactor may move the call through
+/// another inline helper while still looking harmless at the raw wrapper.
+#[test]
+fn raw_scx_vexit_programs_do_not_reference_tracing_only_kfunc() {
+    let probe_obj_path = std::path::PathBuf::from(env!("OUT_DIR")).join("probe.o");
+    let bytes = std::fs::read(&probe_obj_path).unwrap_or_else(|e| {
+        panic!(
+            "probe.o missing or unreadable at {}: {e}",
+            probe_obj_path.display()
+        )
+    });
+    let elf = goblin::elf::Elf::parse(&bytes).unwrap_or_else(|e| {
+        panic!(
+            "probe.o at {} is not valid ELF: {e}",
+            probe_obj_path.display()
+        )
+    });
+
+    let referenced_symbols = |target_section: &str| {
+        let target_idx = elf
+            .section_headers
+            .iter()
+            .position(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(target_section))
+            .unwrap_or_else(|| panic!("probe.o is missing `{target_section}`"));
+
+        elf.shdr_relocs
+            .iter()
+            .filter(|(reloc_idx, _)| elf.section_headers[*reloc_idx].sh_info as usize == target_idx)
+            .flat_map(|(_, relocs)| relocs.iter())
+            .filter_map(|reloc| elf.syms.get(reloc.r_sym))
+            .filter_map(|sym| elf.strtab.get_at(sym.st_name))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    for section in ["kprobe/scx_vexit", "kretprobe/scx_vexit"] {
+        let symbols = referenced_symbols(section);
         assert!(
-            atomic_count >= 1,
-            "probe.o `{target_section}` section has no BPF_STX|BPF_ATOMIC|cmpxchg \
-             instruction — `__sync_val_compare_and_swap` was silently \
-             lowered to a non-atomic store. Cross-core ordering on aarch64 \
-             would be broken by this regression."
+            !symbols.contains("scx_bpf_events"),
+            "`{section}` must not reference tracing-only scx_bpf_events; \
+             7.1 rejects the whole probe object when a raw kprobe contains \
+             that kfunc relocation (symbols: {symbols:?})"
         );
     }
+
+    let trace_symbols = referenced_symbols("tp_btf/sched_ext_exit");
+    assert!(
+        trace_symbols.contains("scx_bpf_events"),
+        "the typed tracepoint should retain the event-counter snapshot; \
+         otherwise the raw-path absence check is vacuous"
+    );
 }
 
 /// `ScxWalkerOffsets::missing_groups` enumerates exactly the

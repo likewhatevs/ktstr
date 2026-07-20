@@ -937,7 +937,7 @@ pub struct ProbeBssCounters {
     /// `tp_btf/preempt_enable` outermost-transition fires.
     pub preempt_enable_count: u64,
     /// `KTSTR_PCPU_TRIGGER_COUNT` summed across CPUs — every accepted
-    /// selected typed trigger fire. The modern `scx_vexit` program
+    /// selected trigger fire. The raw `scx_vexit` return program
     /// also counts non-error kinds like DONE / UNREG; the global-era
     /// `scx_dump_state` program counts only error-class entries.
     pub trigger_count: u64,
@@ -2374,7 +2374,7 @@ pub struct CrossBtfFwdIndex<'a> {
 ///
 /// Used as a fallback by [`dump_state`] when
 /// [`super::scx_walker::read_scx_sched_state`] returned `None`
-/// because `*scx_root == 0` at freeze time. The probe's selected typed
+/// because `*scx_root == 0` at freeze time. The probe's selected
 /// scheduler-exit handler captured the same scalars BEFORE kernel teardown
 /// nulled `scx_root`, so this path produces a coherent view of
 /// what the scheduler looked like AT THE INSTANT IT ERRORED OUT —
@@ -2858,7 +2858,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                         // Live read failed — `*scx_root == 0` because
                         // the scheduler has already torn down by
                         // freeze time. Fall back to the BPF .bss
-                        // snapshot the probe's selected typed handler latched
+                        // snapshot the probe's selected handler latched
                         // at error-exit time. The snapshot is the
                         // strict subset of scheduler state the host
                         // renderer needs; the sched_pa stays None

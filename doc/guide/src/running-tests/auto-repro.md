@@ -72,7 +72,7 @@ arrow between entry and exit values:
       vtime               0
       weight              100
       scx_flags           RESET_RUNNABLE_AT|DEQD_FOR_SLEEP|ENABLED
-  do_enqueue_task                                               kernel/sched/ext.c:1885
+  enqueue_task_scx                                              kernel/sched/ext.c
     rq *rq
       cpu                 0
     task_struct *p
@@ -90,7 +90,7 @@ Reading it as a progression: pid 40 entered `select_cpu` off any
 dispatch queue with a nearly expired slice; by exit it sat on the
 local DSQ with a refilled 20 ms slice (`SCX_DSQ_INVALID →
 SCX_DSQ_LOCAL`, `19982063 → 20000000`); the kernel's
-`do_enqueue_task` then queued it. Healthy scheduling decisions,
+`enqueue_task_scx` then queued it. Healthy scheduling decisions,
 captured right up to the frame where `ktstr_dispatch` called
 `scx_bpf_error()` — the chain shows what the scheduler did with its
 last tasks on the way into the error, not just where it died.
@@ -124,7 +124,7 @@ about 17 seconds.
    machinery, trampolines) are filtered out.
 2. **BPF discovery** — in the repro VM, loaded struct_ops programs
    are discovered and added to the probe list along with their
-   kernel-side callers (e.g. `enqueue` → `do_enqueue_task`), so the
+   kernel-side callers (e.g. `enqueue` → `enqueue_task_scx`), so the
    pipeline still probes something when the crash produced no
    extractable stack.
 3. **BTF resolution** — signatures come from vmlinux BTF and program
@@ -133,9 +133,9 @@ about 17 seconds.
    scalar/enum/cpumask fields auto-discovered.
 4. **Probed rerun** — the second VM reruns the scenario with kprobes
    on kernel entry, fentry/fexit on BPF callbacks and kernel exits,
-   and the kernel-selected typed scheduler-exit trigger:
+   and the kernel-selected scheduler-exit trigger:
    `tp_btf/sched_ext_exit` on the newest kernels,
-   `fexit/scx_vexit` on the preceding generation, or filtered
+   a raw `scx_vexit` entry/return pair on the preceding generation, or filtered
    `fentry/scx_dump_state` on global-era kernels.
 5. **Stitching** — events are filtered to the task that triggered the
    exit, sorted by timestamp, and rendered with decoded values.
@@ -150,8 +150,8 @@ reading the repro as evidence.
 ## Kernel requirement
 
 The probe trigger needs one compatible sched_ext target: the typed
-`sched_ext_exit` tracepoint on the newest kernels, the five-argument
-`scx_vexit` function on the preceding generation, or the two-argument
+`sched_ext_exit` tracepoint on the newest kernels, a raw entry/return pair
+around `scx_vexit` on the preceding generation, or the two-argument
 `scx_dump_state` function on global-era kernels. ktstr reads vmlinux BTF
 before loading the probe object, picks the first compatible target in that
 order, and disables every unused program before load. The tracepoint takes

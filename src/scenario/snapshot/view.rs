@@ -1049,7 +1049,7 @@ impl<'a> Snapshot<'a> {
     /// not loaded), the program BTF can't be parsed, or the
     /// array's offset doesn't resolve. A populated
     /// `trigger_count > 0` is the structural signal that the
-    /// selected typed scheduler-exit handler fired during the run.
+    /// selected scheduler-exit handler fired during the run.
     pub fn probe_counters(&self) -> Option<&'a ProbeBssCounters> {
         self.report.probe_counters.as_ref()
     }
