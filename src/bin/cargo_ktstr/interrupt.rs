@@ -2101,17 +2101,22 @@ fn startup_supervisor_inner() -> io::Result<libc::c_int> {
         }
 
         if subtree.worker_status.is_none() {
-            let mut raw = 0;
-            // SAFETY: worker_pid is the exact direct child and WNOHANG is
-            // non-blocking.
-            let waited = unsafe { libc::waitpid(worker_pid, &mut raw, libc::WNOHANG) };
-            if waited == worker_pid {
-                subtree.worker_status = Some(raw);
-            } else if waited < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
+            // The supervisor is the nearest subreaper for the complete
+            // cargo-ktstr tree. Descendants which are killed after their
+            // immediate parent has exited are therefore reparented here,
+            // including short-lived workload helpers created by nextest
+            // children while the main worker remains alive. Reap every
+            // available direct child continuously, retaining the main
+            // worker's status separately. Waiting only for `worker_pid`
+            // left those adopted descendants as zombies until the whole
+            // cargo-ktstr invocation ended; their process groups remained
+            // observable and process-tree tests accumulated one zombie per
+            // attempt under a large nextest storm.
+            let no_children = startup_reap_nonblocking(worker_pid, &mut subtree.worker_status)?;
+            if no_children && subtree.worker_status.is_none() {
+                return Err(io::Error::other(
+                    "startup worker disappeared without a wait status",
+                ));
             }
         }
 
@@ -4051,6 +4056,28 @@ mod tests {
             commit_startup_worker_exit(0);
             return;
         }
+        if mode == "live-adopted-reap" {
+            let pidfile_text = pidfile.to_string_lossy().into_owned();
+            let release = pidfile.with_extension("live-adopted-reap.release");
+            let release_text = release.to_string_lossy().into_owned();
+            let status = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(
+                    "( /bin/sh -c \
+                        'printf \"%s\\n\" \"$$\" >> \"$KTSTR_STARTUP_PIDFILE\"; \
+                         while [ ! -e \"$KTSTR_STARTUP_RELEASE\" ]; do sleep 0.01; done' \
+                      & ); \
+                     exit 0",
+                )
+                .env("KTSTR_STARTUP_PIDFILE", &pidfile_text)
+                .env("KTSTR_STARTUP_RELEASE", &release_text)
+                .status()
+                .expect("spawn and reap live-adopted-reap intermediate");
+            assert!(status.success(), "double-fork intermediate exits cleanly");
+            loop {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        }
         if matches!(
             mode.as_str(),
             "clean-fork"
@@ -4564,6 +4591,66 @@ mod tests {
             .expect("read already-reaped nested owner status");
         assert_eq!(owner_status.signal(), Some(libc::SIGKILL));
         assert_startup_pids_exit(&pids, &pidfds);
+    }
+
+    #[test]
+    fn startup_supervisor_reaps_adopted_descendants_while_worker_is_live() {
+        if startup_test_role_if_requested() {
+            return;
+        }
+        let _serial = test_serial_guard();
+        let root = tempfile::tempdir().expect("startup supervision tempdir");
+        let pidfile = root.path().join("live-adopted-reap.pids");
+        let release = pidfile.with_extension("live-adopted-reap.release");
+        let test_name = std::thread::current()
+            .name()
+            .expect("libtest supplies the current test name")
+            .to_owned();
+        let mut owner = spawn_startup_test_owner(&test_name, "live-adopted-reap", &pidfile);
+        let owner_pidfd = test_pidfd_open(owner.id() as libc::pid_t);
+        let pids = startup_test_pids(&pidfile, 2);
+        let worker_pidfd = test_pidfd_open(pids[0]);
+        let adopted_pidfd = test_pidfd_open(pids[1]);
+
+        std::fs::write(&release, b"release").expect("release adopted descendant");
+        assert!(
+            wait_until(STARTUP_TEST_OBSERVATION_BACKSTOP, || {
+                test_pidfd_exited(&adopted_pidfd)
+            }),
+            "adopted descendant did not exit",
+        );
+        assert!(
+            wait_until(STARTUP_TEST_OBSERVATION_BACKSTOP, || {
+                // The pidfd above observes the exact descendant's exit.
+                // Before this test creates another process, signal zero on
+                // its numeric PID distinguishes an unreaped zombie from an
+                // entry already removed from the process table.
+                (unsafe { libc::kill(pids[1], 0) }) != 0
+            }),
+            "startup supervisor left an exited adopted descendant as a zombie \
+             while its main worker remained live",
+        );
+        assert!(
+            !test_pidfd_exited(&worker_pidfd),
+            "main worker must remain live while the supervisor reaps its adopted descendant",
+        );
+        assert!(
+            owner
+                .try_wait()
+                .expect("query nested startup owner")
+                .is_none(),
+            "startup owner must remain live until explicitly terminated",
+        );
+
+        test_pidfd_kill(&owner_pidfd);
+        let owner_status = owner.wait().expect("reap nested startup owner");
+        assert_eq!(owner_status.signal(), Some(libc::SIGKILL));
+        assert!(
+            wait_until(STARTUP_TEST_OBSERVATION_BACKSTOP, || {
+                test_pidfd_exited(&worker_pidfd)
+            }),
+            "owner death did not drain the still-live startup worker",
+        );
     }
 
     #[test]
