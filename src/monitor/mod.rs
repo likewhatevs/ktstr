@@ -811,10 +811,11 @@ pub(crate) struct ProgressLedger {
     /// the watchdog failure dump's `busiest_vcpu_window` line — the quantity
     /// `cpu_trickle_stalled` compares against the floor. Relaxed.
     pub(crate) busiest_vcpu_window_ns: AtomicU64,
-    /// Bumped UNCONDITIONALLY every monitor tick — pure liveness. A
-    /// stalled `monitor_heartbeat` means the monitor thread itself is
-    /// wedged (distinct from the guest making no progress), which the
-    /// watchdog must not misread as a guest hang. Relaxed.
+    /// Bumped unconditionally every monitor tick and periodically during
+    /// bounded pre-sampling setup waits — pure sensor-thread liveness. A
+    /// stalled `monitor_heartbeat` means the monitor thread itself is wedged
+    /// (distinct from the guest making no progress), which the watchdog must
+    /// not misread as a guest hang. Relaxed.
     pub(crate) monitor_heartbeat: AtomicU64,
     /// Monotone terminal/unavailable sensor for the host monitor.
     ///
@@ -895,6 +896,20 @@ pub(crate) struct ProgressLedger {
 }
 
 impl ProgressLedger {
+    /// Publish that the monitor thread itself is alive while it is still in
+    /// pre-sampling setup.
+    ///
+    /// `start_monitor` intentionally waits for guest boot publications before
+    /// it can construct the guest-memory readers that feed
+    /// [`Self::record_liveness`]. Those bounded waits can be longer than the
+    /// watchdog's monitor-liveness window. Pulse only the heartbeat during
+    /// that interval: this prevents an intentional setup wait from looking
+    /// like a dead monitor without fabricating CPU, runnable-demand, or
+    /// guest-channel evidence.
+    pub(crate) fn record_monitor_heartbeat(&self) {
+        self.monitor_heartbeat.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Stamp the per-tick liveness fields and bump `monitor_heartbeat`
     /// unconditionally. Called every monitor tick regardless of whether
     /// progress was observed.
@@ -925,7 +940,7 @@ impl ProgressLedger {
         self.evidence_channels_live
             .store(evidence_channels_live, Ordering::Relaxed);
         // Unconditional — this is the monitor's own liveness pulse.
-        self.monitor_heartbeat.fetch_add(1, Ordering::Relaxed);
+        self.record_monitor_heartbeat();
     }
 
     /// Publish that the host monitor is terminal or unavailable.
@@ -1178,7 +1193,7 @@ pub(crate) struct LedgerSnapshot {
     /// heartbeats, and accepted attach boundaries). Kernel scheduling noise
     /// never bumps it.
     pub(crate) progress_epoch: u64,
-    /// Monitor liveness pulse (bumped unconditionally every tick).
+    /// Monitor liveness pulse (bumped every tick and during pre-sample waits).
     pub(crate) monitor_heartbeat: u64,
     /// True once the host monitor is known to be terminal or unavailable.
     /// Unlike heartbeat-derived liveness, this is an explicit monotone
@@ -1202,6 +1217,24 @@ mod progress_ledger_tests {
     //! independent of the dispatch driver.
     use super::{CPU_CURRENCY_PTHREAD, LifecycleStage, ProgressLedger, StageClass};
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn bootstrap_heartbeat_does_not_fabricate_guest_evidence() {
+        let l = ProgressLedger::default();
+
+        for expected in 1..=8 {
+            l.record_monitor_heartbeat();
+            let snapshot = l.snapshot();
+            assert_eq!(snapshot.monitor_heartbeat, expected);
+            assert_eq!(snapshot.cpu_ns_now, 0);
+            assert_eq!(snapshot.max_vcpu_cpu_in_phase_ns, 0);
+            assert_eq!(snapshot.cpu_currency, super::CPU_CURRENCY_NONE);
+            assert!(!snapshot.cpu_trickle_stalled);
+            assert!(!snapshot.runnable_demand);
+            assert!(!snapshot.evidence_channels_live);
+            assert!(!snapshot.monitor_terminal);
+        }
+    }
 
     #[test]
     fn monitor_terminal_defaults_false_and_publication_is_monotone() {

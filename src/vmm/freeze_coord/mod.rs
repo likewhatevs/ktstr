@@ -15804,6 +15804,14 @@ impl KtstrVm {
                 // perf-mode-gated: `service_cpu` is `None` without a reserved
                 // CPU.
                 set_rt_priority(2, "monitor");
+                // The guest-memory sampler cannot start until the bounded
+                // SYS_RDY / KERN_ADDRS waits below finish. The watchdog still
+                // needs to know that its sensor thread is alive during those
+                // waits; otherwise the 2 s heartbeat window expires inside an
+                // intentional 5-15 s setup interval and a host-starved boot is
+                // falsely killed as "monitor dead" at its wall deadline.
+                // Bootstrap pulses carry no CPU/demand/channel evidence.
+                progress_ledger.record_monitor_heartbeat();
                 // Pre-resolution boot-complete wait, hoisted ABOVE
                 // the `phys_base` / `pco_pa` / scx_root_pa /
                 // watchdog_pa / `page_offset_base_pa` resolution
@@ -15923,17 +15931,34 @@ impl KtstrVm {
                         // or kill set before a return below) the kill early-
                         // returns override to NotConfigured regardless — see
                         // the decl comment's `Fired ⟺ sampled` invariant.
-                        match boot_epoll.wait(5_000, &mut boot_buf) {
-                            Ok(0) => {
+                        let boot_wait_deadline = Instant::now() + Duration::from_secs(5);
+                        loop {
+                            progress_ledger.record_monitor_heartbeat();
+                            let remaining =
+                                boot_wait_deadline.saturating_duration_since(Instant::now());
+                            if remaining.is_zero() {
                                 boot_wait_outcome = monitor::BootWaitOutcome::TimedOut;
+                                break;
                             }
-                            Ok(n) => {
-                                if boot_buf[..n].iter().any(|e| e.fd() == boot_fd) {
-                                    boot_wait_outcome = monitor::BootWaitOutcome::Fired;
+                            // Match the monitor's steady-state 100 ms cadence
+                            // while retaining the original event-driven wake.
+                            let wait_ms = remaining
+                                .min(Duration::from_millis(100))
+                                .as_millis()
+                                .max(1) as i32;
+                            match boot_epoll.wait(wait_ms, &mut boot_buf) {
+                                Ok(0) => continue,
+                                Ok(n) => {
+                                    if boot_buf[..n].iter().any(|e| e.fd() == boot_fd) {
+                                        boot_wait_outcome = monitor::BootWaitOutcome::Fired;
+                                    }
+                                    break;
                                 }
-                            }
-                            Err(e) => {
-                                tracing::warn!(err = %e, "monitor: boot epoll_wait failed");
+                                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                                Err(e) => {
+                                    tracing::warn!(err = %e, "monitor: boot epoll_wait failed");
+                                    break;
+                                }
                             }
                         }
                     }
@@ -16014,6 +16039,10 @@ impl KtstrVm {
                     // leaves ample sampling overlap.
                     let mut guest_published = false;
                     for _ in 0..100 {
+                        // This bounded KERN_ADDRS wait is still monitor setup,
+                        // not a dead sensor. Keep the watchdog's liveness pulse
+                        // moving without claiming guest-memory evidence.
+                        progress_ledger.record_monitor_heartbeat();
                         if kill_clone.load(std::sync::atomic::Ordering::Acquire) {
                             break;
                         }

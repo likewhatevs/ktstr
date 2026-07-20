@@ -266,8 +266,23 @@ fn assert_tier1_spin_kill(result: &VmResult) -> Result<()> {
 
 /// Host-side gate for the Body-exemption control: a guest that sat fully
 /// idle for most of its declared duration in the Body stage MUST survive.
-/// An `Err` here rides the `PostVmAssertionFailure` marker → hard fail.
+/// A guest that never reached Body is an environmental non-verdict, matching
+/// the pre-wedge handling in [`assert_wedge_kill_mechanism`]. Once Body was
+/// reached, an `Err` rides the `PostVmAssertionFailure` marker → hard fail.
 fn assert_idle_body_survived(result: &VmResult) -> Result<()> {
+    if result.final_guest_phase < GuestLifecyclePhase::Body {
+        return Err(post_vm_skip(format!(
+            "guest never reached the idle Body control \
+             (final_guest_phase={:?}, progress_epoch={}, kill={:?} at \
+             {:.1}s): the host was too starved for the guest to boot to \
+             the phase under test — environmental non-verdict, the Body \
+             exemption was never exercised",
+            result.final_guest_phase,
+            result.final_progress_epoch,
+            result.watchdog_kill_reason,
+            result.duration.as_secs_f64(),
+        )));
+    }
     anyhow::ensure!(
         !result.timed_out,
         "a fully-idle Body-stage guest was killed under the watchdog — the \

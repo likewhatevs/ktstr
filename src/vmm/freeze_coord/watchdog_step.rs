@@ -605,10 +605,11 @@ pub(crate) struct MonitorLiveness {
 }
 
 impl MonitorLiveness {
-    /// Seed at the heartbeat's zero-init value. Before any monitor tick
-    /// the heartbeat is 0; the first `observe` that sees a bumped value
-    /// clears the miss counter. If no monitor ever runs the heartbeat
-    /// stays 0, so this seeds the natural no-monitor stall.
+    /// Seed at the heartbeat's zero-init value. Before the monitor thread
+    /// first runs (either a pre-sampling setup pulse or a full sample tick)
+    /// the heartbeat is 0; the first `observe` that sees a bumped value clears
+    /// the miss counter. If no monitor ever runs the heartbeat stays 0, so
+    /// this seeds the natural no-monitor stall.
     pub(crate) fn new() -> Self {
         Self {
             prev_heartbeat: 0,
@@ -634,7 +635,7 @@ impl MonitorLiveness {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::monitor::CPU_CURRENCY_PMU;
+    use crate::monitor::{CPU_CURRENCY_NONE, CPU_CURRENCY_PMU, ProgressLedger};
 
     // Lifecycle discriminants (mirror `monitor::LifecycleStage`; written
     // against the raw ids so this stays independent of that enum).
@@ -1425,6 +1426,29 @@ mod tests {
             !last,
             "a heartbeat frozen at 0 latches not-live after N ticks"
         );
+    }
+
+    #[test]
+    fn bootstrap_heartbeat_keeps_monitor_live_without_sample_evidence() {
+        let ledger = ProgressLedger::default();
+        let mut live = MonitorLiveness::new();
+
+        // Run for twice the frozen-heartbeat miss budget. A pre-sampling
+        // monitor that is alive and pulsing must never be mistaken for a
+        // dead sensor even though it cannot publish guest evidence yet.
+        for tick in 1..=2 * WATCHDOG_MONITOR_LIVENESS_MISS_TICKS {
+            ledger.record_monitor_heartbeat();
+            let snapshot = ledger.snapshot();
+            assert!(
+                live.observe(snapshot.monitor_heartbeat),
+                "bootstrap pulse {tick} must keep the monitor live"
+            );
+            assert_eq!(snapshot.cpu_currency, CPU_CURRENCY_NONE);
+            assert_eq!(snapshot.max_vcpu_cpu_in_phase_ns, 0);
+            assert!(!snapshot.cpu_trickle_stalled);
+            assert!(!snapshot.runnable_demand);
+            assert!(!snapshot.evidence_channels_live);
+        }
     }
 
     // ---- evaluate_progress: ledger snapshot → tier decision glue ----
