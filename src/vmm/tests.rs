@@ -626,6 +626,95 @@ fn availability_replanning_keeps_one_replaceable_live_candidate() {
 }
 
 #[test]
+fn stale_granted_replan_retains_the_registry_designation() {
+    let make_candidate = |llc: usize, cpu: usize| host_topology::PerformancePinningCandidate {
+        plan: host_topology::PinningPlan {
+            assignments: vec![(0, cpu)],
+            service_cpu: None,
+            llc_indices: vec![llc],
+            locks: Vec::new(),
+        },
+        llc_mode: host_topology::LlcLockMode::Shared,
+        cpu_mode: crate::flock::FlockMode::Exclusive,
+        cpu_reservations: vec![cpu],
+    };
+    let (candidate, claim, target) = flexible_candidate_parts(make_candidate(0, 0));
+    let mut candidates = vec![candidate];
+    let mut claims = vec![claim];
+    let mut targets = vec![target];
+    let static_len = candidates.len();
+
+    let current = stage_granted_candidate(
+        static_len,
+        make_candidate(1, 1),
+        &mut candidates,
+        &mut claims,
+        &mut targets,
+    );
+    let designated = claims[current].clone();
+    assert_eq!(
+        retain_granted_designation(
+            static_len,
+            &designated,
+            &mut candidates,
+            &mut claims,
+            &mut targets,
+        )
+        .unwrap(),
+        static_len,
+    );
+
+    let pending = stage_granted_candidate(
+        static_len,
+        make_candidate(2, 2),
+        &mut candidates,
+        &mut claims,
+        &mut targets,
+    );
+    assert_eq!(pending, static_len + 1);
+    assert_eq!(claims.len(), static_len + 2);
+
+    // Simulate the registry rejecting that replacement as stale: its next
+    // callback still designates the prior exact claim. The local state must
+    // retain it and discard only the speculative replacement.
+    let retained = retain_granted_designation(
+        static_len,
+        &designated,
+        &mut candidates,
+        &mut claims,
+        &mut targets,
+    )
+    .unwrap();
+    assert_eq!(retained, static_len);
+    assert_eq!(claims.len(), static_len + 1);
+    assert_eq!(claims[retained], designated);
+    assert_eq!(candidates[retained].cpu_reservations, vec![1]);
+
+    // If a replacement does commit, the next authoritative designation
+    // promotes it and drops the old dynamic candidate.
+    let committed = stage_granted_candidate(
+        static_len,
+        make_candidate(3, 3),
+        &mut candidates,
+        &mut claims,
+        &mut targets,
+    );
+    let committed_claim = claims[committed].clone();
+    let retained = retain_granted_designation(
+        static_len,
+        &committed_claim,
+        &mut candidates,
+        &mut claims,
+        &mut targets,
+    )
+    .unwrap();
+    assert_eq!(retained, static_len);
+    assert_eq!(claims.len(), static_len + 1);
+    assert_eq!(claims[retained], committed_claim);
+    assert_eq!(candidates[retained].cpu_reservations, vec![3]);
+}
+
+#[test]
 fn coordinator_synthesis_builds_a_nonadjacent_ready_live_candidate() {
     let host = host_topology::HostTopology::new_for_tests(&[
         (vec![0], 0),

@@ -760,6 +760,78 @@ fn install_live_candidate(
     static_len
 }
 
+/// Retain the exact candidate named by a granted callback while discarding
+/// speculative alternatives from earlier callbacks.
+///
+/// A granted callback runs without the registry EX lock. Its proposed
+/// replacement may therefore be rejected as stale after the callback returns.
+/// Until the next callback supplies the authoritative designation, the local
+/// planner must retain both the current dynamic candidate and at most one
+/// speculative replacement. Overwriting the current slot eagerly loses the
+/// only mapping from the still-published claim back to its physical plan.
+fn retain_granted_designation(
+    static_len: usize,
+    designated: &host_topology::protocol::ClaimSet,
+    candidates: &mut Vec<FlexibleRunCandidate>,
+    claims: &mut Vec<host_topology::protocol::ClaimSet>,
+    targets: &mut Vec<Vec<host_topology::protocol::ResourceLock>>,
+) -> Result<usize> {
+    debug_assert_eq!(candidates.len(), claims.len());
+    debug_assert_eq!(candidates.len(), targets.len());
+    let index = claims
+        .iter()
+        .position(|claim| claim == designated)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "queue designated an unknown placement: designated={designated:?}; \
+                 locally retained claims={claims:?}"
+            )
+        })?;
+    if index < static_len {
+        candidates.truncate(static_len);
+        claims.truncate(static_len);
+        targets.truncate(static_len);
+        return Ok(index);
+    }
+
+    candidates.swap(static_len, index);
+    claims.swap(static_len, index);
+    targets.swap(static_len, index);
+    candidates.truncate(static_len + 1);
+    claims.truncate(static_len + 1);
+    targets.truncate(static_len + 1);
+    Ok(static_len)
+}
+
+/// Stage one replacement beside the callback's retained designation.
+///
+/// Unlike [`install_live_candidate`], this never overwrites the current
+/// dynamic slot. The following callback's designation is the commit verdict
+/// and [`retain_granted_designation`] then collapses the two slots back to one.
+fn stage_granted_candidate(
+    static_len: usize,
+    candidate: host_topology::PerformancePinningCandidate,
+    candidates: &mut Vec<FlexibleRunCandidate>,
+    claims: &mut Vec<host_topology::protocol::ClaimSet>,
+    targets: &mut Vec<Vec<host_topology::protocol::ResourceLock>>,
+) -> usize {
+    let (candidate, claim, target) = flexible_candidate_parts(candidate);
+    if let Some(index) = claims
+        .iter()
+        .position(|retained_claim| *retained_claim == claim)
+    {
+        return index;
+    }
+
+    debug_assert!(candidates.len() <= static_len + 1);
+    debug_assert_eq!(candidates.len(), claims.len());
+    debug_assert_eq!(candidates.len(), targets.len());
+    candidates.push(candidate);
+    claims.push(claim);
+    targets.push(target);
+    candidates.len() - 1
+}
+
 fn synthesize_ready_candidate(
     host_topo: &host_topology::HostTopology,
     topology: &Topology,
@@ -1952,10 +2024,13 @@ impl KtstrVm {
         );
         let initial_claim = claims[0].clone();
         let register = |probe: &mut protocol::GrantedProbe| {
-            let index = claims
-                .iter()
-                .position(|claim| claim == probe.designated())
-                .ok_or_else(|| anyhow::anyhow!("queue designated an unknown default placement"))?;
+            let index = retain_granted_designation(
+                static_len,
+                probe.designated(),
+                &mut candidates,
+                &mut claims,
+                &mut targets,
+            )?;
             let candidate = &candidates[index];
             if let Some(locks) = probe.try_acquire(&claims[index], || {
                 host_topology::acquire_resources_granted_with_evidence(
@@ -1979,7 +2054,7 @@ impl KtstrVm {
                 &watch_llcs,
                 |claim| probe.candidate_ready(claim),
             )? {
-                let ready = install_live_candidate(
+                let ready = stage_granted_candidate(
                     static_len,
                     candidate,
                     &mut candidates,
@@ -2029,7 +2104,16 @@ impl KtstrVm {
                     no_perf_cpus: None,
                 });
             }
-            protocol::TicketWork::Coordinator(coordinator) => coordinator,
+            protocol::TicketWork::Coordinator(coordinator) => {
+                // Granted-callback staging is complete. The coordinator
+                // replans from an authoritative availability snapshot and
+                // needs only the immutable static set plus its one
+                // replaceable live slot.
+                candidates.truncate(static_len);
+                claims.truncate(static_len);
+                targets.truncate(static_len);
+                coordinator
+            }
         };
         let mut step = |held: &mut protocol::HeldLocks| {
             let live = synthesize_ready_candidate(
