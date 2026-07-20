@@ -335,7 +335,7 @@ mod tests {
     /// times out and bails with the literal format produced at
     /// `acquire_flock_with_timeout`'s deadline arm. Both
     /// `LOCK_EX → LOCK_SH` (the cache shared-lock path) and
-    /// `LOCK_EX → LOCK_EX` (the cache store-lock / sidecar /
+    /// `LOCK_EX → LOCK_EX` (the cache store-lock / sidecar epoch-reset /
     /// disk-template path) are exercised so
     /// a regression that affects only one mode label still trips
     /// the assertion.

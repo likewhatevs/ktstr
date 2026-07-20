@@ -1889,10 +1889,10 @@ fn is_run_directory_rejects_regular_files() {
     );
 }
 
-// -- run_dir_lock_path / acquire_run_dir_flock tests --
+// -- run-dir flock and epoch-publication tests --
 //
-// Pin the cross-process flock contract added for the
-// concurrent-write collision fix:
+// Pin the lockfile primitive plus the SH matching-epoch / EX reset
+// publication protocol:
 //
 // 1. `run_dir_lock_path` derives the canonical
 //    `{parent}/.locks/{leaf}.lock` shape so two callers
@@ -2040,6 +2040,310 @@ fn acquire_run_dir_flock_times_out_when_peer_holds_lock() {
     assert!(
         msg.contains("LOCK_EX"),
         "error must name the flock mode for operator triage; got: {msg}",
+    );
+}
+
+/// A matching orchestrated epoch is a shared publication rail, not the old
+/// one-writer-at-a-time exclusive rail. Keep an independent SH anchor alive
+/// while a 96-thread herd enters together: every publication acquire must
+/// succeed and report SH. An EX regression would time out behind the anchor
+/// (and, without the anchor, serialize the herd).
+#[test]
+fn matching_epoch_publication_herd_uses_only_shared_rail() {
+    const WRITERS: usize = 96;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().join("matching-epoch");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(super::SESSION_SENTINEL), b"epoch-A").unwrap();
+
+    let anchor = super::try_run_dir_flock(&dir, crate::flock::FlockMode::Shared)
+        .expect("open SH anchor")
+        .expect("fresh publication rail must admit SH anchor");
+    let start = std::sync::Arc::new(std::sync::Barrier::new(WRITERS + 1));
+    let dir = std::sync::Arc::new(dir);
+    let mut writers = Vec::with_capacity(WRITERS);
+    for _ in 0..WRITERS {
+        let start = std::sync::Arc::clone(&start);
+        let dir = std::sync::Arc::clone(&dir);
+        writers.push(std::thread::spawn(move || {
+            start.wait();
+            let (guard, mode) = super::acquire_run_dir_publication_lock_with_timeout(
+                &dir,
+                Some("epoch-A"),
+                std::time::Duration::from_secs(2),
+            )
+            .expect("matching writer must join the shared rail");
+            assert_eq!(
+                mode,
+                crate::flock::FlockMode::Shared,
+                "matching epoch must never enter the run-dir EX rail",
+            );
+            drop(guard);
+        }));
+    }
+    start.wait();
+    for writer in writers {
+        writer.join().expect("matching writer thread");
+    }
+    drop(anchor);
+}
+
+/// An empty run directory elects one EX initializer; the rest of a same-epoch
+/// herd waits for SH and fans out together after the sentinel appears. This
+/// pins the startup case so removing steady-state EX serialization does not
+/// merely move the 100 ms cohort queue to the first publication wave.
+#[test]
+fn uninitialized_epoch_herd_elects_one_ex_initializer() {
+    const WRITERS: usize = 96;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = std::sync::Arc::new(tmp.path().join("new-epoch"));
+    std::fs::create_dir_all(dir.as_ref()).unwrap();
+    let start = std::sync::Arc::new(std::sync::Barrier::new(WRITERS + 1));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut writers = Vec::with_capacity(WRITERS);
+    for _ in 0..WRITERS {
+        let start = std::sync::Arc::clone(&start);
+        let dir = std::sync::Arc::clone(&dir);
+        let tx = tx.clone();
+        writers.push(std::thread::spawn(move || {
+            start.wait();
+            let (guard, mode) = super::acquire_run_dir_publication_lock_with_timeout(
+                &dir,
+                Some("epoch-first"),
+                std::time::Duration::from_secs(2),
+            )
+            .expect("same-epoch startup writer");
+            tx.send(mode).expect("report publication mode");
+            drop(guard);
+        }));
+    }
+    drop(tx);
+    start.wait();
+    for writer in writers {
+        writer.join().expect("startup writer thread");
+    }
+    let modes: Vec<_> = rx.into_iter().collect();
+    assert_eq!(modes.len(), WRITERS);
+    assert_eq!(
+        modes
+            .iter()
+            .filter(|mode| **mode == crate::flock::FlockMode::Exclusive)
+            .count(),
+        1,
+        "exactly one writer must initialize the epoch under EX: {modes:?}",
+    );
+    assert_eq!(
+        modes
+            .iter()
+            .filter(|mode| **mode == crate::flock::FlockMode::Shared)
+            .count(),
+        WRITERS - 1,
+        "all non-initializers must fan out under SH: {modes:?}",
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join(super::SESSION_SENTINEL)).unwrap(),
+        "epoch-first",
+    );
+}
+
+/// An orchestrated initializer must not report success after failing to publish
+/// the epoch sentinel: peers would otherwise keep observing a mismatch and
+/// collapse back into repeated EX resets.
+#[test]
+fn epoch_initialization_fails_when_sentinel_cannot_be_published() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().join("sentinel-failure");
+    std::fs::create_dir_all(dir.join(SESSION_SENTINEL)).unwrap();
+
+    let error = acquire_run_dir_publication_lock_with_timeout(
+        &dir,
+        Some("epoch-A"),
+        std::time::Duration::from_secs(2),
+    )
+    .expect_err("a directory at the sentinel path must make publication fail");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("publish run epoch sentinel"),
+        "sentinel failure must retain authoritative context: {message}",
+    );
+    assert!(
+        try_run_dir_flock(&dir, crate::flock::FlockMode::Exclusive)
+            .expect("probe released initializer lock")
+            .is_some(),
+        "failed epoch initialization must release EX",
+    );
+}
+
+/// An epoch sentinel certifies that the prior snapshot was completely wiped.
+/// If even one matching artifact cannot be removed, retain the old sentinel so
+/// the next writer retries under EX instead of admitting the new epoch under
+/// SH with stale files still present.
+#[test]
+fn epoch_reset_never_publishes_after_an_unlink_failure() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().join("incomplete-reset");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(SESSION_SENTINEL), b"epoch-old").unwrap();
+    let stale = dir.join("stale-0000000000000001.ktstr.json");
+    std::fs::write(&stale, b"{}").unwrap();
+
+    let error = reset_run_dir_for_session_with_remover(&dir, Some("epoch-new"), |path| {
+        assert_eq!(path, stale.as_path());
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected unlink failure",
+        ))
+    })
+    .expect_err("an incomplete wipe must reject epoch publication");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("remove prior-epoch artifact"),
+        "unlink failure must retain reset context: {message}",
+    );
+    assert!(stale.exists(), "the injected unlink failure leaves its victim");
+    assert_eq!(
+        std::fs::read_to_string(dir.join(SESSION_SENTINEL)).unwrap(),
+        "epoch-old",
+        "an incomplete wipe must not certify the new epoch",
+    );
+}
+
+/// Raw runs have no epoch to certify, so their historical cleanup remains
+/// best-effort: one failed unlink does not prevent later entries in the same
+/// shallow sweep from being reaped.
+#[test]
+fn raw_reset_continues_after_an_unlink_failure() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().join("raw-best-effort");
+    std::fs::create_dir_all(&dir).unwrap();
+    let blocked = dir.join("blocked-0000000000000001.ktstr.json");
+    let removable = dir.join("removable-0000000000000002.ktstr.json");
+    std::fs::write(&blocked, b"{}").unwrap();
+    std::fs::write(&removable, b"{}").unwrap();
+
+    reset_run_dir_for_session_with_remover(&dir, None, |path| {
+        if path == blocked.as_path() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected raw unlink failure",
+            ))
+        } else {
+            std::fs::remove_file(path)
+        }
+    })
+    .expect("raw reset remains best-effort");
+    assert!(blocked.exists(), "the injected raw failure leaves its victim");
+    assert!(
+        !removable.exists(),
+        "a failed raw unlink must not stop the rest of the sweep",
+    );
+    assert!(
+        !dir.join(SESSION_SENTINEL).exists(),
+        "raw cleanup must never publish an epoch sentinel",
+    );
+}
+
+/// Raw `cargo nextest run` has no epoch identity with which peers can prove
+/// compatibility, so it must retain EX and the process-local pre-clear-once
+/// behavior.
+#[test]
+fn no_token_publication_remains_exclusive_and_preclears_once() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().join("raw-no-token");
+    std::fs::create_dir_all(&dir).unwrap();
+    let stale = dir.join("stale-0000000000000001.ktstr.json");
+    std::fs::write(&stale, b"{}").unwrap();
+
+    let (first, first_mode) = super::acquire_run_dir_publication_lock_with_timeout(
+        &dir,
+        None,
+        std::time::Duration::from_secs(2),
+    )
+    .expect("first raw publication");
+    assert_eq!(first_mode, crate::flock::FlockMode::Exclusive);
+    assert!(!stale.exists(), "first raw publication must pre-clear");
+    assert!(
+        super::try_run_dir_flock(&dir, crate::flock::FlockMode::Shared)
+            .expect("probe raw EX")
+            .is_none(),
+        "raw publication must exclude even shared writers",
+    );
+    let current = dir.join("current-0000000000000002.ktstr.json");
+    std::fs::write(&current, b"{}").unwrap();
+    drop(first);
+
+    let (second, second_mode) = super::acquire_run_dir_publication_lock_with_timeout(
+        &dir,
+        None,
+        std::time::Duration::from_secs(2),
+    )
+    .expect("second raw publication");
+    assert_eq!(second_mode, crate::flock::FlockMode::Exclusive);
+    assert!(
+        current.exists(),
+        "same process must pre-clear a raw run directory only once",
+    );
+    drop(second);
+}
+
+/// A validated matching writer holds SH through publication, so an epoch
+/// reset's EX cannot cross its rename. The old-epoch file may land before the
+/// reset, but the reset must then wipe it before publishing the new sentinel;
+/// it can never survive on the far side of that reset.
+#[test]
+fn matching_epoch_publication_cannot_cross_epoch_reset() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().join("epoch-reset");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(super::SESSION_SENTINEL), b"epoch-A").unwrap();
+
+    let (writer_guard, writer_mode) =
+        super::acquire_run_dir_publication_lock_with_timeout(
+            &dir,
+            Some("epoch-A"),
+            std::time::Duration::from_secs(2),
+        )
+        .expect("epoch-A writer acquire");
+    assert_eq!(writer_mode, crate::flock::FlockMode::Shared);
+
+    let race = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let reset_dir = dir.clone();
+    let reset_race = std::sync::Arc::clone(&race);
+    let reset = std::thread::spawn(move || {
+        reset_race.wait();
+        let (guard, mode) = super::acquire_run_dir_publication_lock_with_timeout(
+            &reset_dir,
+            Some("epoch-B"),
+            std::time::Duration::from_secs(2),
+        )
+        .expect("epoch-B reset acquire");
+        assert_eq!(
+            mode,
+            crate::flock::FlockMode::Exclusive,
+            "a mismatched epoch must initialize under EX",
+        );
+        assert_eq!(
+            std::fs::read_to_string(reset_dir.join(super::SESSION_SENTINEL)).unwrap(),
+            "epoch-B",
+        );
+        drop(guard);
+    });
+
+    race.wait();
+    let old_epoch_sidecar = dir.join("epoch-a-result-0000000000000001.ktstr.json");
+    let staging = dir.join("epoch-a-result-0000000000000001.ktstr.json.tmp.test");
+    std::fs::write(&staging, b"{}").unwrap();
+    std::fs::rename(&staging, &old_epoch_sidecar).unwrap();
+    drop(writer_guard);
+
+    reset.join().expect("epoch reset thread");
+    assert!(
+        !old_epoch_sidecar.exists(),
+        "an old-epoch publication must not survive the reset boundary",
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join(super::SESSION_SENTINEL)).unwrap(),
+        "epoch-B",
     );
 }
 
@@ -3224,7 +3528,13 @@ fn summarize_dump_with_passing_sidecar_not_flagged() {
 
 #[test]
 fn finalize_sidecar_verdict_records_inversion_and_no_ops_ordinary() {
+    let _lock = lock_env();
     let tmp = tempfile::TempDir::new().unwrap();
+    let _override = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, tmp.path());
+    let _override_anchor =
+        try_run_dir_flock(tmp.path(), crate::flock::FlockMode::Exclusive)
+            .expect("open override rail anchor")
+            .expect("fresh override rail anchor");
     // A raw Fail sidecar finalized to Pass (an expect_err inversion):
     // the verdict bits flip to pass AND expected_failure is set (so
     // `perf-delta` still excludes the failure-mode telemetry).
@@ -3258,6 +3568,103 @@ fn finalize_sidecar_verdict_records_inversion_and_no_ops_ordinary() {
         after2.passed && !after2.expected_failure,
         "an ordinary pass stays pass with expected_failure=false (no inversion)",
     );
+}
+
+#[test]
+fn finalize_holds_shared_epoch_rail_through_rename_and_cannot_cross_reset() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().join("finalize-reset");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(SESSION_SENTINEL), b"epoch-A").unwrap();
+    let path = dir.join("t-0000000000000000.ktstr.json");
+    let mut raw = SidecarResult::test_fixture();
+    raw.passed = false;
+    std::fs::write(&path, serde_json::to_string(&raw).unwrap()).unwrap();
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+    let finalize_path = path.clone();
+    let finalizer = std::thread::spawn(move || {
+        finalize_sidecar_verdict_inner(
+            &finalize_path,
+            true,
+            false,
+            false,
+            true,
+            Some("epoch-A"),
+            || {
+                ready_tx.send(()).expect("signal staged finalize");
+                proceed_rx.recv().expect("release staged finalize");
+            },
+        );
+    });
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("finalizer must reach the pre-rename seam");
+
+    assert!(
+        try_run_dir_flock(&dir, crate::flock::FlockMode::Exclusive)
+            .expect("probe reset EX while finalizer is staged")
+            .is_none(),
+        "finalizer must retain SH across its exact-token recheck and rename",
+    );
+    proceed_tx.send(()).expect("release finalizer");
+    finalizer.join().expect("finalizer thread");
+    let finalized: SidecarResult =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(finalized.passed && finalized.expected_failure);
+
+    let (reset, mode) = acquire_run_dir_publication_lock_with_timeout(
+        &dir,
+        Some("epoch-B"),
+        std::time::Duration::from_secs(2),
+    )
+    .expect("epoch-B reset");
+    assert_eq!(mode, crate::flock::FlockMode::Exclusive);
+    drop(reset);
+    assert!(
+        !path.exists(),
+        "the reset following finalize must wipe epoch-A's publication",
+    );
+
+    // A late epoch-A finalizer must observe B under SH and return before it
+    // can recreate the path that B's reset removed.
+    finalize_sidecar_verdict_inner(
+        &path,
+        true,
+        false,
+        false,
+        true,
+        Some("epoch-A"),
+        || panic!("stale finalizer must not reach rename"),
+    );
+    assert!(
+        !path.exists(),
+        "a stale finalizer must not recreate its sidecar after reset",
+    );
+}
+
+#[test]
+fn raw_no_token_finalize_retains_exclusive_rail() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().join("raw-finalize");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("t-0000000000000000.ktstr.json");
+    let mut raw = SidecarResult::test_fixture();
+    raw.passed = false;
+    std::fs::write(&path, serde_json::to_string(&raw).unwrap()).unwrap();
+
+    finalize_sidecar_verdict_inner(&path, true, false, false, true, None, || {
+        assert!(
+            try_run_dir_flock(&dir, crate::flock::FlockMode::Shared)
+                .expect("probe raw finalize rail")
+                .is_none(),
+            "raw no-token finalize must hold EX through rename",
+        );
+    });
+    let finalized: SidecarResult =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(finalized.passed && finalized.expected_failure);
 }
 
 #[test]
