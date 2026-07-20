@@ -1522,7 +1522,6 @@ impl VcpuThread {
     /// `ImmediateExitHandle::set` upgrades its Weak mapping reference to a
     /// transient Arc before checking active, so a stale participation read
     /// remains safe even if the run-loop VcpuFd completes concurrently.
-    #[cfg(test)]
     pub(crate) fn kick(&self) {
         if let Some(ref ie) = self.immediate_exit
             && self.alive.load(Ordering::Acquire)
@@ -1540,10 +1539,8 @@ impl VcpuThread {
         }
     }
 
-    /// Wait for the thread to exit, retrying a signal-only wake every 10ms.
-    /// Teardown deliberately does not write `immediate_exit`: repeated
-    /// SIGRTMIN delivery closes a signal-before-KVM_RUN lost wake, and
-    /// `unpark` releases a userspace park without consulting mmap lifetime.
+    /// Wait for the thread to exit, retrying an immediate-exit + signal wake
+    /// every 10ms. `unpark` additionally releases a userspace park.
     ///
     /// Implementation: blocks in `epoll_wait` on `self.exit_evt`
     /// (bumped by the AP thread after `exited.store(true)` and by
@@ -1616,7 +1613,7 @@ impl VcpuThread {
                             // Drain timerfd expiry counter (counter
                             // mode); the read value is uninteresting.
                             let _ = kick_timer.wait();
-                            self.signal();
+                            self.kick();
                             self.handle.thread().unpark();
                         }
                     }

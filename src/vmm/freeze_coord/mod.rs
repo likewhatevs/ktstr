@@ -1880,12 +1880,15 @@ fn ap_teardown_service_budget_exhausted(anchor_ns: u64, now_ns: u64) -> bool {
     now_ns.saturating_sub(anchor_ns) > AP_TEARDOWN_SERVICE_BUDGET_NS
 }
 
-/// Wake one AP during teardown without touching `kvm_run`. Periodic SIGRTMIN
-/// delivery plus `unpark` closes the signal-before-KVM_RUN lost-wake window,
-/// while remaining valid even if panic-unwind concurrently completes and
-/// drops the vCPU's run-loop owner.
+/// Wake one AP during teardown through the same immediate-exit + SIGRTMIN
+/// protocol used by freeze rendezvous. Signal-only teardown leaves a
+/// signal-before-KVM_RUN window: the handler may run in userspace just before
+/// the AP enters KVM_RUN, after which the AP can block forever despite the
+/// already-published kill flag. `ImmediateExitHandle` is lifetime-safe across
+/// owner completion, and the AP's `alive` flag suppresses the write after a
+/// panic edge. `unpark` additionally releases a userspace park.
 fn wake_ap_for_teardown(vt: &VcpuThread) {
-    vt.signal();
+    vt.kick();
     vt.handle.thread().unpark();
 }
 
@@ -2043,6 +2046,7 @@ mod ap_join_accounting_tests {
 
     const AP_TEARDOWN_PRODUCTION_CHILD: &str = "KTSTR_AP_TEARDOWN_PRODUCTION_CHILD";
     const HOST_DELAY_MODE: &str = "host-delay";
+    const IMMEDIATE_EXIT_MODE: &str = "immediate-exit";
     const MULTI_AP_MODE: &str = "multi-ap";
     const UNWINDING_MODE: &str = "unwinding";
     const IE_REWRITE_EXIT_CODE: i32 = 71;
@@ -2155,6 +2159,42 @@ mod ap_join_accounting_tests {
         };
         register_vcpu_signal_handler();
         match mode.to_str().expect("ASCII AP teardown child mode") {
+            IMMEDIATE_EXIT_MODE => {
+                let (vcpu, immediate_exit) = real_vcpu();
+                let exited = Arc::new(AtomicBool::new(false));
+                let exit_evt = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+                let alive = Arc::new(AtomicBool::new(true));
+                let ready = Arc::new(Latch::new());
+
+                let immediate_exit_ap = immediate_exit.clone();
+                let exited_ap = Arc::clone(&exited);
+                let exit_evt_ap = Arc::clone(&exit_evt);
+                let ready_ap = Arc::clone(&ready);
+                let handle = std::thread::Builder::new()
+                    .name("ap-teardown-immediate-exit".into())
+                    .spawn(move || {
+                        register_vcpu_signal_handler();
+                        ready_ap.set();
+                        loop {
+                            std::thread::park();
+                            if immediate_exit_ap.read_byte() == Some(1) {
+                                break;
+                            }
+                        }
+                        exited_ap.store(true, Ordering::Release);
+                        exit_evt_ap.write(1).unwrap();
+                        vcpu.into_inner()
+                    })
+                    .unwrap();
+                ready.wait();
+                let vt = vcpu_thread(handle, exited, immediate_exit, exit_evt, alive);
+
+                // This AP deliberately has no other exit condition. A
+                // signal-only production wake merely interrupts/restarts its
+                // park and eventually hits the wall backstop; the real
+                // immediate-exit kick makes the production helper retire it.
+                kick_and_join_ap_threads(vec![vt]);
+            }
             MULTI_AP_MODE => {
                 const AP_COUNT: usize = 3;
                 let completed = Arc::new(AtomicUsize::new(0));
@@ -2317,14 +2357,11 @@ mod ap_join_accounting_tests {
                 assert!(exited.load(Ordering::Acquire));
                 assert!(!alive.load(Ordering::Acquire));
 
-                // Every production retry after the panic edge must remain
-                // signal-only. Poison the secondary liveness gate back to
-                // true so an accidental call to the old `kick()` path cannot
-                // pass merely because that method also checks `alive`.
-                // `_burn` keeps the real VcpuFd/kvm_run mapping valid, making
-                // this a safe, observable write sentinel while `exited=true`
-                // remains the authoritative production edge.
-                alive.store(true, Ordering::Release);
+                // Every production retry after the panic edge must honour
+                // `alive=false` and skip the unnecessary immediate-exit
+                // write. `_burn` keeps the real VcpuFd/kvm_run mapping valid,
+                // making this a safe, observable sentinel while the teardown
+                // helper spends its service budget on the blocked unwind.
                 std::thread::spawn(move || {
                     loop {
                         if matches!(immediate_exit.read_byte(), Some(byte) if byte != 0) {
@@ -2377,7 +2414,19 @@ mod ap_join_accounting_tests {
     }
 
     #[test]
-    fn production_teardown_fail_closes_unwinding_ap_without_ie_rewrite() {
+    fn production_teardown_writes_immediate_exit_before_signalling() {
+        let output = run_production_child(IMMEDIATE_EXIT_MODE);
+        assert!(
+            output.status.success(),
+            "production teardown did not use the immediate-exit wake needed \
+             to close the signal-before-KVM_RUN window: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    fn production_teardown_fail_closes_unwinding_ap_without_post_panic_ie_rewrite() {
         use std::os::unix::process::ExitStatusExt;
 
         let output = run_production_child(UNWINDING_MODE);
@@ -5608,9 +5657,9 @@ impl KtstrVm {
         // kept out of `VcpuThread` so that struct carries only run-thread
         // lifecycle and targeting state. The freeze coordinator owns these
         // Vecs for the rest of run_vm. `pthread_t`s and immediate-exit handles
-        // still come from `ap_threads` because the coordinator needs them for
-        // rendezvous/watchpoint kicks; production teardown itself is
-        // signal-only and does not write `immediate_exit`.
+        // still come from `ap_threads` because both coordinator rendezvous and
+        // production teardown use the lifetime-safe immediate-exit + signal
+        // kick protocol.
         let ApFreezeHandles {
             parked: freeze_coord_ap_parked,
             regs: freeze_coord_ap_regs,
