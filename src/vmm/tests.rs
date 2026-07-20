@@ -664,6 +664,59 @@ fn effective_run_placement_uses_runtime_plan_for_every_service_consumer() {
 }
 
 #[test]
+fn exact_plan_expands_to_dense_default_interactive_pins() {
+    let selected = host_topology::PinningPlan {
+        assignments: vec![(0, 20), (1, 21), (2, 22), (3, 23)],
+        service_cpu: None,
+        llc_indices: vec![4, 5],
+        locks: Vec::new(),
+    };
+    assert_eq!(
+        pin_targets_from_plan(Some(&selected), 4),
+        vec![Some(20), Some(21), Some(22), Some(23)],
+        "the interactive default path must consume every vCPU assignment from \
+         the exact candidate it reserved",
+    );
+    assert_eq!(
+        pin_targets_from_plan(None, 4),
+        vec![None; 4],
+        "an unreserved interactive run must remain unpinned",
+    );
+}
+
+#[test]
+fn interactive_unreserved_placement_never_resurrects_build_shape() {
+    let run_locks = RunLocks::unreserved();
+    let (plan, placement) = KtstrVm::interactive_run_placement(&run_locks);
+    assert!(plan.is_none());
+    assert!(placement.service_cpu.is_none());
+    assert!(
+        placement.no_perf_cpus.is_none(),
+        "contention fallback is defined entirely by the current acquisition; \
+         no stale build-time no-perf mask may reappear",
+    );
+}
+
+#[test]
+fn interactive_performance_mode_skips_physical_acquisition() {
+    let acquire_called = std::cell::Cell::new(false);
+    let run_locks =
+        KtstrVm::interactive_run_locks_for_mode(true, || -> anyhow::Result<RunLocks> {
+            acquire_called.set(true);
+            anyhow::bail!("performance shell must not evaluate physical admission")
+        })
+        .expect("interactive performance mode is explicitly reservation-free");
+    assert!(
+        !acquire_called.get(),
+        "performance shell must not probe or queue for an exact reservation",
+    );
+    assert!(run_locks.locks.is_empty());
+    assert!(run_locks.default_cpu_mask.is_none());
+    assert!(run_locks.pinning_plan.is_none());
+    assert!(run_locks.no_perf_cpus.is_none());
+}
+
+#[test]
 fn default_candidate_scan_reuses_one_aggregate_snapshot_and_fences_survivors() {
     struct ResetOverrides;
     impl Drop for ResetOverrides {
@@ -757,6 +810,10 @@ fn degrade_contention_to_overcommit_maps_contention_to_lockfree() {
     );
     assert!(rl.default_cpu_mask.is_none());
     assert!(rl.pinning_plan.is_none());
+    assert!(
+        rl.no_perf_cpus.is_none(),
+        "interactive contention must not resurrect the build-time no-perf mask",
+    );
 }
 
 /// degrade_contention_to_overcommit passes a successful acquire through

@@ -3241,6 +3241,11 @@ pub(crate) struct RunVmThreadGuard {
     bpf_write: Option<JoinHandle<()>>,
     freeze_coord: Option<JoinHandle<()>>,
     watchdog: Option<JoinHandle<()>>,
+    /// Physical LLC/CPU reservation attached by `KtstrVm::run` after
+    /// `run_vm` returns its armed supervisor. The normal cleanup path releases
+    /// it immediately after every AP/device/helper is quiescent; the Drop path
+    /// runs the same joins before this field is dropped automatically.
+    run_locks: Option<super::RunLocks>,
     kill: Arc<AtomicBool>,
     kill_evt: Arc<EventFd>,
     freeze: Arc<AtomicBool>,
@@ -3250,6 +3255,20 @@ pub(crate) struct RunVmThreadGuard {
     /// armed at the cleanup-window boundary on the normal path. An early-error
     /// guard which never reached that boundary derives one deadline at Drop.
     worker_wall_deadline: Option<Instant>,
+}
+
+impl RunVmThreadGuard {
+    pub(super) fn attach_run_locks(&mut self, run_locks: super::RunLocks) {
+        debug_assert!(
+            self.run_locks.is_none(),
+            "one VM run may attach exactly one physical reservation"
+        );
+        self.run_locks = Some(run_locks);
+    }
+
+    fn release_run_locks(&mut self) {
+        drop(self.run_locks.take());
+    }
 }
 
 impl Drop for RunVmThreadGuard {
@@ -4219,11 +4238,10 @@ impl KtstrVm {
         effective_pinning_plan: Option<&super::host_topology::PinningPlan>,
         // Refreshed no-perf CPU list from `acquire_run_locks`' run-time
         // replan. `Some` only on the no-perf path; used in preference to
-        // the stale build-time `self.no_perf_plan.cpus` for every affinity
-        // mask below (vCPU-thread mask, BSP mask, virtio-blk worker
-        // placement) so those masks match the LLCs the run-scoped flocks
-        // hold. `None` keeps the pre-replan `no_perf_plan` / default-mask
-        // fallback (the interactive path and every non-no-perf run).
+        // any build-time shape for every affinity mask below (vCPU-thread
+        // mask, BSP mask, virtio-blk worker placement) so those masks match
+        // the LLCs the run-scoped flocks hold. `None` leaves only the separate
+        // default-overcommit mask available.
         effective_no_perf_cpus: Option<&[usize]>,
     ) -> Result<VmRunState> {
         let effective_placement =
@@ -4661,20 +4679,13 @@ impl KtstrVm {
         let mut vcpus = std::mem::take(&mut vm.vcpus);
         let bsp = vcpus.remove(0);
 
-        // Build per-vCPU pin targets from the stored pinning plan.
-        // Index i holds the host CPU for vCPU i. BSP is index 0.
-        let pin_targets: Vec<Option<usize>> = if let Some(plan) = effective_pinning_plan {
-            let total = self.topology.total_cpus() as usize;
-            let mut targets = vec![None; total];
-            for &(vcpu_id, host_cpu) in &plan.assignments {
-                if (vcpu_id as usize) < total {
-                    targets[vcpu_id as usize] = Some(host_cpu);
-                }
-            }
-            targets
-        } else {
-            Vec::new()
-        };
+        // Build per-vCPU pin targets from the acquired plan through the same
+        // dense mapper the interactive default path consumes. Index i holds
+        // the host CPU for vCPU i; BSP is index 0.
+        let pin_targets = super::pin_targets_from_plan(
+            effective_pinning_plan,
+            self.topology.total_cpus() as usize,
+        );
 
         // AP pin targets: indices 1..N.
         let ap_pins: Vec<Option<usize>> = if pin_targets.len() > 1 {
@@ -4686,16 +4697,11 @@ impl KtstrVm {
         // No-perf + --cpu-cap: flat CPU list from the LLC plan gets
         // sched_setaffinity'd on every vCPU thread as a mask (not a
         // hard pin). Mutually exclusive with perf-mode's pin_targets.
-        // The run-time replan's `effective_no_perf_cpus` wins over the
-        // build-time `no_perf_plan.cpus`: they name the LLCs the
-        // run-scoped flocks actually hold, whereas the build-time plan
-        // may have Spread-planned against then-truthful-now-stale holder
-        // counts. Falls through to `no_perf_plan` (interactive path,
-        // where no replan runs) and finally `default_cpu_mask`
-        // (overcommit).
-        let no_perf_mask: Option<&[usize]> = effective_no_perf_cpus
-            .or(self.no_perf_plan.as_ref().map(|p| p.cpus.as_slice()))
-            .or(default_cpu_mask);
+        // Only the run-time replan may supply a no-perf mask: it names the
+        // exact LLC/CPU resources protected by this invocation's fds. A
+        // build-time shape is never resurrected as placement. The default
+        // overcommit mask is the separate unreserved fallback.
+        let no_perf_mask: Option<&[usize]> = effective_no_perf_cpus.or(default_cpu_mask);
 
         // Per-AP TID slots — each AP thread stamps gettid() into its
         // `AtomicI32` and fires the paired `Latch` at startup so the
@@ -4795,6 +4801,7 @@ impl KtstrVm {
             bpf_write: None,
             freeze_coord: None,
             watchdog: None,
+            run_locks: None,
             kill: kill.clone(),
             kill_evt: kill_evt.clone(),
             freeze: freeze.clone(),
@@ -17537,6 +17544,12 @@ impl KtstrVm {
         if crate::vmm::debug_logging_enabled() {
             eprintln!("CLEANUP: bpf_write joined {:?}", cleanup_t.elapsed());
         }
+        // AP exit drops the last vCPU/device clones, including the
+        // virtio-blk worker owner; monitor and BPF helpers are now joined too.
+        // Release exact topology admission at this lifecycle boundary so the
+        // next VM can start while the ownership-free message parsing,
+        // verifier-stat rendering, and result assembly below proceed.
+        run.run_threads.release_run_locks();
 
         // Drain the virtio-console port-1 TX accumulator: the guest
         // wrote bulk TLV-framed messages (STIMULUS, EXIT, SCHED_EXIT,
@@ -19289,6 +19302,7 @@ mod run_vm_thread_guard_tests {
             bpf_write: Some(kill_watching_worker(kill.clone(), joined.clone())),
             freeze_coord: Some(kill_watching_worker(kill.clone(), joined.clone())),
             watchdog: Some(kill_watching_worker(kill.clone(), joined.clone())),
+            run_locks: None,
             kill: kill.clone(),
             kill_evt: evt(),
             freeze: Arc::new(AtomicBool::new(true)),
@@ -19307,6 +19321,61 @@ mod run_vm_thread_guard_tests {
             "Drop JOINS every handle (each worker bumps the counter before exit) \
              — a detach would leave the count below 3"
         );
+    }
+
+    /// A run reservation is owned by the thread supervisor, not by the outer
+    /// result-rendering scope. Drop must keep the flock live while it signals
+    /// and joins helpers, then release it immediately afterward.
+    #[test]
+    fn run_thread_guard_releases_reservation_only_after_helper_teardown() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let path = temp.path().join("run-resource.lock");
+        let held = crate::flock::try_flock(&path, crate::flock::FlockMode::Shared)
+            .expect("open run resource")
+            .expect("take initial shared reservation");
+        let kill = Arc::new(AtomicBool::new(false));
+        let saw_reservation = Arc::new(AtomicBool::new(false));
+        let helper_kill = Arc::clone(&kill);
+        let helper_saw = Arc::clone(&saw_reservation);
+        let helper_path = path.clone();
+        let helper = std::thread::spawn(move || {
+            while !helper_kill.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            let probe = crate::flock::try_flock(&helper_path, crate::flock::FlockMode::Exclusive)
+                .expect("probe reservation during helper teardown");
+            helper_saw.store(probe.is_none(), Ordering::Release);
+            drop(probe);
+        });
+        let guard = RunVmThreadGuard {
+            ap_threads: Vec::new(),
+            monitor: None,
+            bpf_write: Some(helper),
+            freeze_coord: None,
+            watchdog: None,
+            run_locks: Some(super::super::RunLocks {
+                locks: vec![held],
+                default_cpu_mask: None,
+                pinning_plan: None,
+                no_perf_cpus: None,
+            }),
+            kill: Arc::clone(&kill),
+            kill_evt: evt(),
+            freeze: Arc::new(AtomicBool::new(false)),
+            bsp_done: Arc::new(AtomicBool::new(false)),
+            bsp_done_evt: evt(),
+            worker_wall_deadline: None,
+        };
+
+        drop(guard);
+        assert!(
+            saw_reservation.load(Ordering::Acquire),
+            "helper teardown must observe the run reservation still held",
+        );
+        let released = crate::flock::try_flock(&path, crate::flock::FlockMode::Exclusive)
+            .expect("probe reservation after supervisor drop")
+            .expect("reservation must release after every helper joins");
+        drop(released);
     }
 
     /// Regression for the normal-path hole which used to disarm the guard
@@ -19357,6 +19426,7 @@ mod run_vm_thread_guard_tests {
                         )),
                         freeze_coord: None,
                         watchdog: None,
+                        run_locks: None,
                         kill,
                         kill_evt: evt(),
                         freeze: Arc::new(AtomicBool::new(false)),

@@ -636,8 +636,8 @@ impl HostTopology {
     }
 
     /// Enumerate performance placements using only CPUs allowed by the
-    /// caller's affinity/cgroup. Build-time probing and run-time admission
-    /// both call this exact entry point.
+    /// caller's affinity/cgroup. Ownership-free build mapping and run-time
+    /// admission both call this exact entry point.
     pub(crate) fn performance_pinning_candidates_for_cpus(
         &self,
         topo: &super::topology::Topology,
@@ -1769,7 +1769,7 @@ fn acquire_resource_locks_waiting_impl(
         protocol::TicketWork::Coordinator(coordinator) => coordinator,
     };
     let mut step = |held: &mut protocol::HeldLocks| {
-        if let Some(locks) = held.probe_complete(&target)? {
+        if let Some(locks) = held.probe_complete_if_ready(&claim, &target)? {
             Ok(protocol::CoordinatorStep::Complete {
                 claim: claim.clone(),
                 value: locks,
@@ -2024,9 +2024,10 @@ pub(crate) fn pid_window_offset(pid: u32, max_start: usize) -> usize {
 // --cpu-cap PLAN pipeline — CpuCap / LlcSnapshot / LlcPlan + discover/plan/acquire
 // ===========================================================================
 //
-// Entry point [`acquire_llc_plan`] is the single non-perf-mode
-// reservation path: kernel builds and no-perf-mode VMs both call it
-// with or without `--cpu-cap N`. `--cpu-cap` is a CPU-count budget:
+// Entry point [`acquire_llc_plan`] is the workload-time non-perf-mode
+// reservation path: kernel-build workloads and no-perf VM runs both use it.
+// The separate KtstrVm builder's no-perf sizing uses the ownership-free
+// [`plan_llc_selection_only`] twin. `--cpu-cap` is a CPU-count budget:
 // the planner reserves exactly N host CPUs by walking whole LLCs in
 // contention- / NUMA-aware order and partial-taking the last LLC
 // so `plan.cpus.len() == N`. Each plan holds `LOCK_SH` on the selected
@@ -2042,10 +2043,10 @@ pub(crate) fn pid_window_offset(pid: u32, max_start: usize) -> usize {
 // Perf-mode never reaches this path; it uses topology-candidate admission
 // with LLC and CPU modes recorded explicitly in each exact claim.
 //
-// The pipeline has three phases: discover (snapshot holders per
+// The acquisition pipeline has three phases: discover (snapshot holders per
 // LLC, filtered to the process's allowed cpuset), plan (NUMA-aware
-// selection under the caller's [`PlacementPolicy`] — Consolidate
-// for builds, Spread for no-perf VMs), acquire (non-blocking `LOCK_SH`
+// selection under the caller's [`PlacementPolicy`] — Consolidate for
+// kernel-build workloads, Spread for no-perf VM runs), acquire (non-blocking `LOCK_SH`
 // on each selected LLC and exact selected CPU). Up to
 // ACQUIRE_MAX_TOCTOU_RETRIES retries
 // absorb the window between the discover snapshot and the
@@ -2273,10 +2274,10 @@ impl CpuCap {
 /// for no-perf VM vCPU placement, where Consolidate is
 /// pathological: every concurrent VM cell would mask its vCPU
 /// threads onto the same most-held LLCs — and since plans are
-/// computed at `build()` while the `LOCK_SH` set is deferred to
-/// `run()`, a fan-out of simultaneously-planning cells all snapshot
-/// ZERO holders and the llc_idx-ASC tiebreak stacks every one of
-/// them onto the identical LLC-0-upward prefix. Observed in the scx
+/// computed at `build()` without live holder state, a fan-out of
+/// simultaneously-planning cells all see the same zero-occupancy shape and
+/// the llc_idx-ASC tiebreak stacks every one of them onto the identical
+/// LLC-0-upward prefix. Observed in the scx
 /// verifier sweep: a 30-cell matrix on a 16-LLC runner piled every
 /// small and mid-sized cell's mask onto the same low-LLC prefix
 /// (the widest cells' whole-host masks overlapping it) while the
@@ -2540,17 +2541,11 @@ fn discover_llc_snapshots_impl(
 
     let mut snapshots = Vec::with_capacity(paths.len());
     for (row, (llc_idx, _)) in paths.into_iter().enumerate() {
-        // Exclude the calling process from the PLAN-driving holder
-        // count. No-perf `build()` now holds this LLC's `LOCK_SH` from
-        // build through run, so at the run-time replan our own
-        // build-time fd shows up in `/proc/locks` for this very LLC.
-        // Counting it would make every LLC we already reserved look one
-        // holder busier to ourselves and push the Spread policy to FLEE
-        // our own reservation onto a different LLC — the opposite of the
-        // truthful-holder-count fix. At build time we hold nothing yet,
-        // so this filter is a no-op there. The full `holders` vec is
-        // kept intact for diagnostics / `ktstr locks`; only the sort key
-        // drops self.
+        // Exclude the calling process from the PLAN-driving holder count.
+        // A process may already own a related probe or another run plan;
+        // treating that as peer load would make Spread flee its own claim.
+        // The full `holders` vec is kept intact for diagnostics /
+        // `ktstr locks`; only the sort key drops self.
         let holder_count = states[row]
             .holder_pids
             .iter()
@@ -2867,8 +2862,9 @@ fn try_acquire_llc_plan_locks_with_evidence(
 /// [`ACQUIRE_MAX_TOCTOU_RETRIES`] retries (each separated by a
 /// per-retry sleep from [`TOCTOU_RETRY_DELAYS`]) as the acquisition
 /// protocol's non-blocking FAST PHASE — claim-subtracted and
-/// all-or-nothing (see [`protocol`]). `wait == false` (builds, the
-/// interactive shell) bails with `ResourceContention` the moment that
+/// all-or-nothing (see [`protocol`]). `wait == false` (non-waiting kernel
+/// builds, the interactive shell, and other non-blocking probes) bails with
+/// `ResourceContention` the moment that
 /// budget is spent. `wait == true` (the test run path) then joins the
 /// cross-invocation registry and, as coordinator, RE-PLANS AGAINST LIVE HOLDER
 /// STATE ON EVERY WAKE — plans are never cached across waits — waiting
@@ -2922,34 +2918,6 @@ pub fn acquire_llc_plan_interruptible(
     acquire_llc_plan_impl(topo, test_topo, cpu_cap, policy, true, Some(cancelled))
 }
 
-/// Waiting run-time replan that preserves acquire-before-release. No-perf runs
-/// keep their build-time SH reservations through the fast probe and through
-/// publication of the replacement ticket, then release them before the ticket
-/// state is inspected or any granted callback runs.
-pub fn acquire_llc_plan_with_wait_handoff(
-    topo: &HostTopology,
-    test_topo: &crate::topology::TestTopology,
-    cpu_cap: Option<CpuCap>,
-    policy: PlacementPolicy,
-    after_publish: impl FnOnce(),
-) -> Result<LlcPlan> {
-    if crate::cargo_test_mode::cargo_test_mode_active() {
-        return acquire_llc_plan(topo, test_topo, cpu_cap, policy, true);
-    }
-    acquire_llc_plan_with_acquire_fn_and_handoff(
-        LlcPlanAcquireRequest {
-            topo,
-            test_topo,
-            cpu_cap,
-            policy,
-            wait: true,
-            cancelled: None,
-        },
-        Some(after_publish),
-        try_acquire_llc_plan_locks_with_evidence,
-    )
-}
-
 #[derive(Clone, Copy)]
 struct LlcPlanAcquireRequest<'a> {
     topo: &'a HostTopology,
@@ -2970,59 +2938,16 @@ fn acquire_llc_plan_impl(
 ) -> Result<LlcPlan> {
     check_acquire_cancelled(cancelled)?;
     if crate::cargo_test_mode::cargo_test_mode_active() {
-        // Bare `cargo test` mode: no peer-coordination contract.
-        // Synthesise a degenerate plan that names every LLC and
-        // every allowed CPU but holds no flocks. The vmm caller
-        // strips `locks` after build (see `KtstrVmBuilder::build`)
-        // and re-acquires through run-time host admission
-        // — also short-circuited above. `cpus` is the calling
-        // process's allowed cpuset so the `sched_setaffinity`
-        // sites inside the vmm have a valid mask to apply
-        // (allowed cpuset = whatever the OS schedules us onto).
-        let allowed = host_allowed_cpus();
-        if allowed.is_empty() {
-            return Err(ResourceContention {
-                reason: "could not determine allowed CPU set \
-                         (sched_getaffinity and /proc/self/status both failed)"
-                    .into(),
-            }
-            .into());
-        }
+        // Bare `cargo test` mode: no peer-coordination contract. Both
+        // build-time shape planning and run-time acquisition use this exact
+        // helper so the stamped CPU budget and applied mask cannot diverge.
         let _ = test_topo;
         let _ = cpu_cap;
-        let allowed_set: std::collections::BTreeSet<usize> = allowed.iter().copied().collect();
-        let locked_llcs: Vec<usize> = topo
-            .llc_groups
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, group)| {
-                if group.cpus.iter().any(|c| allowed_set.contains(c)) {
-                    Some(idx)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let mems: std::collections::BTreeSet<usize> = locked_llcs
-            .iter()
-            .filter_map(|&idx| {
-                topo.llc_groups
-                    .get(idx)
-                    .and_then(|g| g.cpus.first().copied())
-                    .and_then(|c| topo.cpu_to_node.get(&c).copied())
-            })
-            .collect();
-        let plan = LlcPlan {
-            locked_llcs,
-            cpus: allowed,
-            mems,
-            snapshot: Vec::new(),
-            locks: Vec::new(),
-        };
+        let plan = cargo_test_mode_llc_plan(topo)?;
         check_acquire_cancelled(cancelled)?;
         return Ok(plan);
     }
-    acquire_llc_plan_with_acquire_fn_and_handoff(
+    acquire_llc_plan_with_acquire_fn_impl(
         LlcPlanAcquireRequest {
             topo,
             test_topo,
@@ -3031,9 +2956,48 @@ fn acquire_llc_plan_impl(
             wait,
             cancelled,
         },
-        None::<fn()>,
         try_acquire_llc_plan_locks_with_evidence,
     )
+}
+
+/// Ownership-free plan used by both build and run when
+/// `KTSTR_CARGO_TEST_MODE` is active.
+///
+/// Cargo-test mode deliberately ignores CPU caps and names the complete
+/// allowed cpuset, matching its "no host coordination" contract. Keeping this
+/// in one helper prevents the build-side budget stamp from describing a
+/// cap-truncated mask while the run side actually uses the full cpuset.
+fn cargo_test_mode_llc_plan(topo: &HostTopology) -> Result<LlcPlan> {
+    let allowed = host_allowed_cpus();
+    if allowed.is_empty() {
+        return Err(ResourceContention {
+            reason: "could not determine allowed CPU set \
+                     (sched_getaffinity and /proc/self/status both failed)"
+                .into(),
+        }
+        .into());
+    }
+    let allowed_set: std::collections::BTreeSet<usize> = allowed.iter().copied().collect();
+    let locked_llcs: Vec<usize> = topo
+        .llc_groups
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, group)| {
+            if group.cpus.iter().any(|c| allowed_set.contains(c)) {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mems = plan_mems(&allowed, topo);
+    Ok(LlcPlan {
+        locked_llcs,
+        cpus: allowed,
+        mems,
+        snapshot: Vec::new(),
+        locks: Vec::new(),
+    })
 }
 
 fn check_acquire_cancelled(cancelled: Option<&AtomicBool>) -> Result<()> {
@@ -3093,7 +3057,7 @@ fn acquire_llc_plan_with_acquire_fn<F>(
 where
     F: FnMut(&[usize], &[usize], &[LlcSnapshot]) -> Result<Option<Vec<std::os::fd::OwnedFd>>>,
 {
-    acquire_llc_plan_with_acquire_fn_and_handoff(
+    acquire_llc_plan_with_acquire_fn_impl(
         LlcPlanAcquireRequest {
             topo,
             test_topo,
@@ -3102,20 +3066,17 @@ where
             wait,
             cancelled,
         },
-        None::<fn()>,
         acquire_fn,
     )
 }
 
-fn acquire_llc_plan_with_acquire_fn_and_handoff<F, H, A>(
+fn acquire_llc_plan_with_acquire_fn_impl<F, A>(
     request: LlcPlanAcquireRequest<'_>,
-    mut after_publish: Option<H>,
     mut acquire_fn: F,
 ) -> Result<LlcPlan>
 where
     F: FnMut(&[usize], &[usize], &[LlcSnapshot]) -> Result<A>,
     A: IntoLlcLockAttempt,
-    H: FnOnce(),
 {
     let LlcPlanAcquireRequest {
         topo,
@@ -3125,23 +3086,6 @@ where
         wait,
         cancelled,
     } = request;
-    struct Handoff<F: FnOnce()>(Option<F>);
-
-    impl<F: FnOnce()> Handoff<F> {
-        fn run(&mut self) {
-            if let Some(handoff) = self.0.take() {
-                handoff();
-            }
-        }
-    }
-
-    impl<F: FnOnce()> Drop for Handoff<F> {
-        fn drop(&mut self) {
-            self.run();
-        }
-    }
-
-    let mut handoff = Handoff(after_publish.take());
     check_acquire_cancelled(cancelled)?;
     // Resolve the calling process's allowed cpuset. Plans must fit
     // inside this set — sched_setaffinity against a mask outside the
@@ -3611,20 +3555,13 @@ where
     };
     let coordinator_seed_claim = queued_claim.clone();
     let ticket = if contention.is_empty() {
-        protocol::register_ticket_or_acquire_after_publish(
-            queued_claim,
-            queued_watch,
-            cancelled,
-            || handoff.run(),
-            register,
-        )?
+        protocol::register_ticket_or_acquire(queued_claim, queued_watch, cancelled, register)?
     } else {
-        protocol::register_ticket_after_contentions_and_publish(
+        protocol::register_ticket_after_contentions(
             queued_claim,
             queued_watch,
             contention,
             cancelled,
-            || handoff.run(),
             register,
         )?
     };
@@ -3703,7 +3640,7 @@ where
             &cpus,
             FlockMode::Shared,
         );
-        if let Some(locks) = held.probe_complete(&target)? {
+        if let Some(locks) = held.probe_complete_if_ready(&coordinator_claim, &target)? {
             Ok(protocol::CoordinatorStep::Complete {
                 claim: protocol::ClaimSet::with_modes(
                     selected.iter().copied(),
@@ -3733,23 +3670,27 @@ where
     }
 }
 
-/// PLAN-ONLY variant of [`acquire_llc_plan`]: DISCOVER → PLAN →
-/// materialize, taking NO locks. Used by the no-perf build path when
-/// its non-blocking reservation is contended (a perf `LOCK_EX` coordinator
-/// or its claim covering the pool): the build plan only shapes setup
-/// — budget size and affinity masks — and the run-time replan
-/// re-acquires real locks through the admission registry, so failing
-/// the build over a transient claim would only feed retry storms.
-/// The returned plan's `locks` is empty by construction; peers'
-/// DISCOVER will not see this cell's reservation until the run-time
-/// replan takes real fds (an accepted truthfulness gap — the cell
-/// owns nothing yet).
+/// Static, ownership-free shape planner for no-perf builds.
+///
+/// This path consults only the cached host topology, the calling process's
+/// allowed cpuset, and the NUMA distance matrix. It performs no registry read,
+/// lockfile materialization, `/proc/locks` scan, or flock attempt. Live holder
+/// state is intentionally irrelevant: the resulting plan sizes diagnostics
+/// and other build-time metadata, while the run-time replan performs
+/// authoritative admission after immutable preparation.
+///
+/// The returned plan's `locks` is empty by construction.
 pub fn plan_llc_selection_only(
     topo: &HostTopology,
     test_topo: &crate::topology::TestTopology,
     cpu_cap: Option<CpuCap>,
     policy: PlacementPolicy,
 ) -> Result<LlcPlan> {
+    if crate::cargo_test_mode::cargo_test_mode_active() {
+        let _ = test_topo;
+        let _ = cpu_cap;
+        return cargo_test_mode_llc_plan(topo);
+    }
     let allowed_vec = host_allowed_cpus();
     if allowed_vec.is_empty() {
         return Err(ResourceContention {
@@ -3764,53 +3705,33 @@ pub fn plan_llc_selection_only(
         Some(cap) => cap.effective_count(allowed.len())?,
         None => default_cpu_budget(allowed.len()),
     };
-    let mountinfo = crate::flock::read_mountinfo().map_err(|e| ResourceContention {
-        reason: format!("read /proc/self/mountinfo: {e}"),
-    })?;
-    let snapshots = discover_llc_snapshot_counts(topo, &allowed, &mountinfo).map_err(|e| {
-        ResourceContention {
-            reason: format!("discover LLC snapshots: {e}"),
-        }
-    })?;
-    let cpu_states = discover_cpu_placement_states(&allowed, &mountinfo)?;
-    let eligible_allowed = cpu_eligible_allowed(&allowed, &cpu_states, |_| Ok(false))?;
-    let ready_snapshots: Vec<_> = snapshots
+    let snapshots: Vec<_> = topo
+        .llc_groups
         .iter()
-        .filter(|snapshot| !snapshot.exclusive_held)
-        .cloned()
+        .enumerate()
+        .filter(|(_, group)| group.cpus.iter().any(|cpu| allowed.contains(cpu)))
+        .map(|(llc_idx, _)| LlcSnapshot {
+            llc_idx,
+            holders: Vec::new(),
+            holder_count: 0,
+            exclusive_held: false,
+        })
         .collect();
-    let mut selected = plan_from_snapshots(
-        &ready_snapshots,
+    let cpu_states = allowed
+        .iter()
+        .copied()
+        .map(|cpu| (cpu, CpuPlacementState::default()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let selected = plan_from_snapshots(
+        &snapshots,
         target_cpus,
         topo,
-        &eligible_allowed,
+        &allowed,
         |from, to| test_topo.numa_distance(from, to),
         policy,
     );
-    let mut materialized = materialize_plan_cpus(
-        &selected,
-        topo,
-        &eligible_allowed,
-        &cpu_states,
-        target_cpus,
-        policy,
-    );
-    if materialized.is_none() {
-        // PLAN-ONLY shapes a future run and holds no resources. Prefer CPUs
-        // without a current EX holder, but do not turn temporary contention
-        // into a build failure: the run-time admission path authoritatively
-        // waits before launching.
-        selected = plan_from_snapshots(
-            &snapshots,
-            target_cpus,
-            topo,
-            &allowed,
-            |from, to| test_topo.numa_distance(from, to),
-            policy,
-        );
-        materialized =
-            materialize_plan_cpus(&selected, topo, &allowed, &cpu_states, target_cpus, policy);
-    }
+    let materialized =
+        materialize_plan_cpus(&selected, topo, &allowed, &cpu_states, target_cpus, policy);
     let Some((cpus, mems)) = materialized else {
         return Err(ResourceContention {
             reason: format!(

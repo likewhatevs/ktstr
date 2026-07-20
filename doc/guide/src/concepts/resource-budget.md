@@ -152,7 +152,7 @@ makes this work across disjoint invocations sharing one
   set non-blocking, all-or-nothing, in canonical lock order — cells
   satisfiable *right now* never register, and no fast-path partial ever
   persists (everything is released on any bounce).
-- **The v6 registry.** A bounced acquirer publishes one monotonic
+- **The v7 registry.** A bounced acquirer publishes one monotonic
   fixed-size ticket containing its exact CPU/LLC claim. Each record also
   caches four predecessor-prefix bitsets (CPU-any, CPU-exclusive,
   LLC-any, LLC-exclusive), published epoch-last with the resource

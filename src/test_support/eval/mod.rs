@@ -145,8 +145,8 @@ pub(crate) const ERR_GUEST_CRASHED_PREFIX: &str = "guest crashed:";
 /// No pre-build path constructs any of these errors today. Every
 /// `ResourceContention` / `TopologyInsufficient` / `PerfModeUnavailable`
 /// construction site in the crate (`vmm::host_topology`, `vmm::mod`, and
-/// the `validate_performance_mode` / `acquire_slot_with_locks` pre-checks in
-/// `vmm::builder`) fires from inside `builder.build()` or `vm.run()` — all
+/// the `validate_performance_mode` / `plan_performance_slot` capacity checks
+/// in `vmm::builder`) fires from inside `builder.build()` or `vm.run()` — all
 /// already record their own sidecar at the bail point via the per-site
 /// `record_skip_sidecar` calls in the match arms below. The
 /// pre-build helpers (`ensure_kvm`, `resolve_test_kernel`,

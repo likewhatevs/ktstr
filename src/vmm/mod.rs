@@ -165,8 +165,8 @@ pub(crate) use contention::{
 pub(crate) use pi_mutex::PiMutex;
 pub(crate) use terminal::TerminalRawGuard;
 pub(crate) use vcpu::{
-    BpfMapWriteParams, ImmediateExitVcpu, WatchBpfMapParams, register_vcpu_signal_handler,
-    set_thread_cpumask, vcpu_signal,
+    BpfMapWriteParams, ImmediateExitVcpu, WatchBpfMapParams, pin_current_thread,
+    register_vcpu_signal_handler, set_thread_cpumask, vcpu_signal,
 };
 pub(crate) use vmlinux::{cached_vmlinux_artifacts, cached_vmlinux_bytes, find_vmlinux};
 
@@ -401,45 +401,24 @@ pub struct KtstrVm {
     /// Persisted on KtstrVm so the deferred-lock contract in
     /// `KtstrVm::run` does not need to re-read the env every spawn.
     pub(crate) no_perf_mode: bool,
-    /// Pinning plan computed during build() when performance_mode is
-    /// enabled. The flock fds carried by the plan are stripped at
-    /// build time — `KtstrVm::run` re-acquires the exact LLC+CPU claim
-    /// through flexible coordinator admission at the TOP
-    /// of the run (before initramfs/KVM/kernel setup, so a waiting
-    /// cell holds no guest resources) and releases them on return, so
-    /// concurrent peers see the LLCs free as soon as the run
-    /// completes (and the window between `build()` and `run()`
-    /// carries no locks). The `assignments` /
-    /// `service_cpu` / `llc_indices` payload is what `setup` and
-    /// `freeze_coord` consume during the run.
+    /// Ownership-free pinning shape computed during build() when
+    /// performance_mode is enabled. `KtstrVm::run` performs the first physical
+    /// LLC+CPU acquisition through flexible coordinator admission after
+    /// immutable initrd preparation but before KVM/kernel setup, and releases
+    /// it after run-scoped workers quiesce. The `assignments` / `service_cpu` /
+    /// `llc_indices` payload is a capacity witness only; run-time consumers use
+    /// the candidate actually acquired.
     pub(crate) pinning_plan: Option<host_topology::PinningPlan>,
     /// Per-guest-NUMA-node host NUMA nodes for mbind. Indexed by guest
     /// node ID. Each entry is the set of host NUMA nodes that the guest
     /// node's vCPUs are pinned to. Empty when performance_mode is off.
     pub(crate) mbind_node_map: Vec<Vec<usize>>,
-    /// No-perf-mode resource plan. Populated for every no-perf-mode
-    /// VM — either the operator-set CPU count
-    /// (`--cpu-cap N` / `KTSTR_CPU_CAP=N`) or the 30%-of-allowed
-    /// default when neither is present.
-    ///
-    /// The plan's build-time LLC and exact-CPU `LOCK_SH` flock fds are HELD, not
-    /// stripped — but they live on [`Self::no_perf_build_locks`], NOT on
-    /// this plan: `build()` moves them off `LlcPlan.locks` into that
-    /// dedicated slot so `acquire_run_locks` (`&self`) can release them
-    /// once the run-time replan adopts its own locks. Holding them is
-    /// what makes a concurrent peer's DISCOVER of these LLCs observe a
-    /// truthful holder count. `build()` used to strip them immediately
-    /// and re-plan-free at run time; that left the holder-count feedback
-    /// dead, so a concurrent Spread sweep saw zero holders and
-    /// re-clustered every cell onto the same low LLCs. Now `run()`'s
-    /// `acquire_run_locks` re-plans against the (now-truthful) live
-    /// holder counts, adopting the fresh plan and its fds BEFORE the
-    /// build-time fds in `no_perf_build_locks` drop so peers never see an
-    /// empty window (see [`Self::no_perf_effective_cap`]). The plan's
-    /// `cpus` slice still drives the build-time `setup` paths that must
-    /// know a no-perf CPU mask before `run()` — the run-time replan then
-    /// threads its refreshed CPUs to those same consumers so mask + lock
-    /// identity holds by construction.
+    /// No-perf-mode shape plan. Populated for every coordinated no-perf VM
+    /// and used for build-time sizing only. It owns no flock fds: immutable
+    /// image preparation and every other pre-run operation must remain
+    /// outside physical topology admission. `acquire_run_locks` replans
+    /// against live registry state, acquires the exact run-time LLC/CPU set,
+    /// and threads that fresh plan's CPUs to every affinity consumer.
     ///
     /// `None` only in the degraded-sysfs case (no-perf-mode on a
     /// host whose `/sys/devices/system/cpu` cannot be read AND no
@@ -459,30 +438,6 @@ pub struct KtstrVm {
     /// bypass) and for perf-mode; those paths never replan.
     #[allow(dead_code)]
     pub(crate) no_perf_effective_cap: Option<host_topology::CpuCap>,
-    /// Build-time LLC and exact-CPU `LOCK_SH` flock fds for the no-perf
-    /// [`Self::no_perf_plan`],
-    /// moved off `LlcPlan.locks` at `build()` time so they can be released
-    /// under a shared borrow.
-    ///
-    /// These are the reservations that let a concurrent peer's DISCOVER see a
-    /// truthful holder count on the LLCs and shared occupancy on the exact CPUs
-    /// this VM planned against.
-    /// They are held from plan time through the setup window, then dropped
-    /// the instant `acquire_run_locks`' no-perf replan arm has acquired its
-    /// OWN fresh locks — acquire-before-release, so retained LLCs never
-    /// flicker free. Kept in a `Mutex` (not on the plan) because
-    /// `acquire_run_locks` takes `&self`: the plan itself is immutable
-    /// there, but the interior-mutable slot lets the replan `mem::take` and
-    /// drop the stale fds without waiting for `KtstrVm` drop. Were they left
-    /// on the plan, a cell whose replan moved to different LLCs would
-    /// double-report — peers counting its pid on both the abandoned
-    /// build-time LLCs and the adopted run-time LLCs for the whole run.
-    ///
-    /// Empty (a `Mutex<Vec<_>>` holding no fds) whenever `no_perf_plan` is
-    /// `None` (degraded sysfs / bypass) and for perf-mode / the deferred
-    /// default; those paths never populate it.
-    #[allow(dead_code)]
-    pub(crate) no_perf_build_locks: std::sync::Mutex<Vec<std::os::fd::OwnedFd>>,
     /// Cached host topology snapshot read once at `build()` time
     /// from `/sys/devices/system/cpu`. `KtstrVm::run`'s default-else
     /// branch threads this through the shared topology planner,
@@ -699,14 +654,23 @@ struct RunLocks {
     pinning_plan: Option<host_topology::PinningPlan>,
     /// Refreshed no-perf CPU list from the run-time replan. `Some` only
     /// on the `no_perf_mode` arm that re-plans against live holder
-    /// counts; the run threads it (in preference to the stale
-    /// build-time `no_perf_plan.cpus`) to `run_vm`'s affinity-mask
-    /// consumers — the vCPU-thread mask, the BSP mask, and the
-    /// virtio-blk worker placement — so the mask every consumer applies
-    /// matches the LLCs the run-scoped fds in `locks` actually protect.
-    /// `None` on every other arm, where the consumers fall back to
-    /// `no_perf_plan` / `default_cpu_mask` exactly as before.
+    /// counts; the run threads it to `run_vm`'s affinity-mask consumers — the
+    /// vCPU-thread mask, the BSP mask, and the virtio-blk worker placement — so
+    /// the mask every consumer applies matches the LLCs the run-scoped fds in
+    /// `locks` actually protect. `None` never resurrects the build-time shape:
+    /// only the separate default-overcommit mask remains a valid fallback.
     no_perf_cpus: Option<Vec<usize>>,
+}
+
+impl RunLocks {
+    fn unreserved() -> Self {
+        Self {
+            locks: Vec::new(),
+            default_cpu_mask: None,
+            pinning_plan: None,
+            no_perf_cpus: None,
+        }
+    }
 }
 
 struct FlexibleRunCandidate {
@@ -871,9 +835,9 @@ fn synthesize_ready_candidate(
 /// One run's resolved host-thread placement.
 ///
 /// Performance admission may select an equivalent plan other than the
-/// build-time probe. Keeping its service CPU and the no-perf replan's CPU mask
-/// in one copyable value prevents individual run consumers from accidentally
-/// falling back to stale builder state.
+/// build-time shape witness. Keeping its service CPU and the no-perf replan's
+/// CPU mask in one copyable value prevents individual run consumers from
+/// accidentally falling back to stale builder state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EffectiveRunPlacement<'a> {
     pub(crate) service_cpu: Option<usize>,
@@ -890,6 +854,25 @@ impl<'a> EffectiveRunPlacement<'a> {
             no_perf_cpus,
         }
     }
+}
+
+/// Expand one acquired exact plan into a dense vCPU-indexed pin vector.
+///
+/// Shared by normal and interactive execution so a default interactive run
+/// cannot reserve one exact placement while launching its vCPUs unpinned.
+fn pin_targets_from_plan(
+    pinning_plan: Option<&host_topology::PinningPlan>,
+    total_vcpus: usize,
+) -> Vec<Option<usize>> {
+    let mut targets = vec![None; total_vcpus];
+    if let Some(plan) = pinning_plan {
+        for &(vcpu_id, host_cpu) in &plan.assignments {
+            if (vcpu_id as usize) < total_vcpus {
+                targets[vcpu_id as usize] = Some(host_cpu);
+            }
+        }
+    }
+    targets
 }
 
 /// Owns every thread and wake source created by [`KtstrVm::run_interactive`]
@@ -1350,18 +1333,17 @@ impl KtstrVm {
             vm.set_halt_poll(ns);
         }
 
-        let effective_plan = run_locks
-            .pinning_plan
-            .as_ref()
-            .or(self.pinning_plan.as_ref());
-        // No-perf run-time replan output: the fresh plan's CPUs, taken in
-        // preference to the stale build-time `no_perf_plan.cpus` so every
-        // affinity mask inside `run_vm` binds to the LLCs the run-scoped
-        // `run_locks.locks` actually hold. `None` on every non-no-perf /
-        // degraded arm, where `run_vm` keeps its `no_perf_plan` /
-        // `default_cpu_mask` fallback.
+        // Exact affinity is valid only when backed by this invocation's
+        // physical acquisition. The build-time performance shape is a capacity
+        // witness and must never be resurrected as run placement.
+        let effective_plan = run_locks.pinning_plan.as_ref();
+        // No-perf run-time replan output: every affinity mask inside `run_vm`
+        // binds to the LLCs these run-scoped fds actually hold. `None` on a
+        // degraded no-perf arm means no affinity, never the stale build-time
+        // shape; the separate default-overcommit arm may still supply its
+        // authoritative `default_cpu_mask`.
         let effective_no_perf_cpus = run_locks.no_perf_cpus.as_deref();
-        let run = self.run_vm(
+        let mut run = self.run_vm(
             run_start,
             vm,
             run_locks.default_cpu_mask.as_deref(),
@@ -1380,7 +1362,11 @@ impl KtstrVm {
             .default_cpu_mask
             .as_ref()
             .map(|m| (m.len() as u32).max(1));
-        drop(run_locks);
+        // Couple the physical reservation to the existing run-thread
+        // supervisor before entering teardown. Its normal path releases the
+        // fds immediately after every AP/device/helper has quiesced; its Drop
+        // path joins those workers first and only then drops the fds.
+        run.run_threads.attach_run_locks(run_locks);
 
         let mut result = self.collect_results(start, run)?;
         if let Some(budget) = overcommit_budget {
@@ -1409,19 +1395,13 @@ impl KtstrVm {
 
     /// Acquire the run-scoped flock fds the VM needs for the
     /// duration of [`Self::run`] / [`Self::run_interactive`].
-    /// Perf-mode strips its build-time probe flocks and the deferred default
-    /// creates no build-time plan; this fn acquires the effective resources at
-    /// the TOP of `run()` — before the initramfs build, KVM
-    /// VM creation, and kernel load — so a cell parked in the
+    /// Every build-time plan is lock-free; this fn acquires the effective
+    /// resources after immutable image preparation but before KVM VM creation
+    /// and kernel load, so a cell parked in the
     /// admission registry is cheap (one fixed ticket/futex; only the
-    /// coordinator owns inotify; no guest memory). The no-perf path additionally
-    /// HOLDS its build-time `LOCK_SH` fds (parked in
-    /// [`Self::no_perf_build_locks`]) so peers' holder counts stay
-    /// truthful, releasing them either the instant its replan adopts
-    /// fresh locks or before registering on contention (a waiting ticket
-    /// must hold nothing — see the no-perf arm). The returned
-    /// `Vec<OwnedFd>` is dropped at the end of the run, releasing
-    /// every run-scoped lock for concurrent peers.
+    /// coordinator owns inotify; no guest memory). The returned `Vec<OwnedFd>`
+    /// is dropped at the end of the run, releasing every run-scoped lock for
+    /// concurrent peers.
     ///
     /// `wait` selects the contention policy: the test path
     /// ([`Self::run`]) passes `true`, so a contended reservation joins
@@ -1437,18 +1417,16 @@ impl KtstrVm {
     /// Branch table (mirrors `build()`'s plan switch):
     /// * `no_perf_mode` + cached `no_perf_plan`: re-runs the full
     ///   `acquire_llc_plan` (DISCOVER+PLAN+ACQUIRE) against the
-    ///   `no_perf_effective_cap` budget, now that the build-time
-    ///   `LOCK_SH` fds are still held and peers' holder counts are
-    ///   truthful. The fresh plan's fds ride the run; its refreshed
-    ///   `cpus` thread through `RunLocks::no_perf_cpus` to every mask
-    ///   consumer so mask + lock identity holds by construction.
+    ///   `no_perf_effective_cap` budget. The fresh plan's fds ride the run;
+    ///   its refreshed `cpus` thread through `RunLocks::no_perf_cpus` to every
+    ///   mask consumer so mask + lock identity holds by construction.
     /// * `no_perf_mode` + missing plan (bypass / degraded sysfs):
     ///   returns an empty Vec — `build()` already warned, no
     ///   coordination is possible on this host.
     /// * `performance_mode` + `pinning_plan`: re-enumerates the shared
     ///   mapper's exact candidates, probes every complete claim, and on
     ///   contention enters flexible admission. The acquired candidate—not the
-    ///   build-time probe—becomes the effective affinity and NUMA plan.
+    ///   build-time shape witness—becomes the effective affinity and NUMA plan.
     /// * default else: uses that same mapper without a service CPU, taking
     ///   LLC-SH plus exact CPU-EX reservations. A busy exact-candidate set
     ///   enters flexible admission and can re-plan from the coordinator's
@@ -1460,34 +1438,13 @@ impl KtstrVm {
     ///   is in effect.
     fn acquire_run_locks(&self, wait: bool) -> Result<RunLocks> {
         if self.no_perf_mode {
-            // Re-PLAN at run time rather than reusing the build-time
-            // LLC selection. The old code forwarded `no_perf_plan`'s
-            // stored `locked_llcs` straight into fixed-set acquisition
-            // on the theory that replanning could drift the LLC set out
-            // from under masks already computed from the build plan.
-            // That reasoning is now inverted by two facts: (1) the
-            // build-time `LOCK_SH` fds are HELD through this point (see
-            // `KtstrVm::no_perf_plan`), so a full DISCOVER here finally
-            // sees peers' reservations — the holder-count feedback the
-            // Spread policy needs was dead as long as `build()` stripped
-            // those fds before any peer planned; and (2) mask/lock
-            // identity is preserved by CONSTRUCTION, not by freezing the
-            // plan — the fresh plan's own `cpus` are threaded (via
-            // `RunLocks::no_perf_cpus`) to every downstream mask consumer
-            // (`run_vm`'s vCPU mask, the BSP mask, the virtio-blk worker
-            // placement), so those masks match the fresh plan's locks,
-            // not the stale build plan's. The fresh plan's fds are
-            // acquired BEFORE the build-time fds release: this arm takes
-            // the fresh locks, then `mem::take`s and drops the build-time
-            // fds out of `self.no_perf_build_locks` (interior-mutable, so
-            // a `&self` borrow can release them), so a peer never observes
-            // an empty window on a retained LLC — and, crucially, an LLC
-            // the replan ABANDONED stops showing our pid the moment we
-            // return, instead of holding a phantom reservation until
-            // `KtstrVm` drop. When the plan is `None` (degraded-sysfs /
-            // bypass branch in `build()`), no coordination is possible —
-            // return empty locks; `build()` already emitted the
-            // diagnostic. `acquire_llc_plan` inherits the
+            // Re-plan at run time rather than freezing the build-time shape.
+            // The fresh plan owns the only physical resource fds and its
+            // `cpus` are threaded through `RunLocks::no_perf_cpus` to every
+            // downstream mask consumer, preserving mask/lock identity by
+            // construction. When the build plan is absent (degraded sysfs /
+            // bypass), no coordination is possible and build() already
+            // emitted the diagnostic. `acquire_llc_plan` inherits the
             // `KTSTR_CARGO_TEST_MODE` short-circuit (a degenerate
             // lock-free plan naming the full allowed cpuset), so bare
             // `cargo test` needs no special-casing here.
@@ -1499,44 +1456,25 @@ impl KtstrVm {
                     // the same static topology, not a stashed handle.
                     let test_topo = crate::topology::TestTopology::from_system()?;
                     // `no_perf_effective_cap` is the exact build-time budget.
-                    // A waiting run performs one fast replan while the build
-                    // SH fds still make holder counts truthful. On
-                    // contention, the handoff publishes the replacement exact
-                    // ticket before dropping those fds; fast success instead
-                    // keeps acquire-before-release continuity below.
-                    let fresh = if wait {
-                        host_topology::acquire_llc_plan_with_wait_handoff(
-                            host_topo,
-                            &test_topo,
-                            self.no_perf_effective_cap,
-                            host_topology::PlacementPolicy::spread_for_process(),
-                            || {
-                                drop(std::mem::take(
-                                    &mut *self.no_perf_build_locks.lock().unwrap(),
-                                ));
-                            },
-                        )?
-                    } else {
-                        host_topology::acquire_llc_plan(
-                            host_topo,
-                            &test_topo,
-                            self.no_perf_effective_cap,
-                            host_topology::PlacementPolicy::spread_for_process(),
-                            false,
-                        )?
-                    };
+                    let fresh = host_topology::acquire_llc_plan(
+                        host_topo,
+                        &test_topo,
+                        self.no_perf_effective_cap,
+                        host_topology::PlacementPolicy::spread_for_process(),
+                        wait,
+                    )?;
+                    // The build-time shape is deliberately static and may not
+                    // resemble the placement selected after a queue wait.
+                    // Diagnose cross-node spill from the authoritative fresh
+                    // plan only. Cargo-test mode holds no real resources and
+                    // therefore emits no reservation diagnostic.
+                    if !fresh.locks.is_empty() {
+                        host_topology::warn_if_cross_node_spill(&fresh, host_topo);
+                    }
                     // Move the RAII fds into `RunLocks` so they release at
                     // end-of-run, and carry the refreshed CPUs so the mask
                     // consumers bind to exactly these locked LLCs.
                     let host_topology::LlcPlan { cpus, locks, .. } = fresh;
-                    // Fresh locks are now held; release the build-time
-                    // `LOCK_SH` fds. Acquire-before-release keeps any LLC
-                    // retained across the replan continuously reserved,
-                    // while any LLC the replan abandoned stops listing our
-                    // pid immediately rather than at `KtstrVm` drop.
-                    drop(std::mem::take(
-                        &mut *self.no_perf_build_locks.lock().unwrap(),
-                    ));
                     Ok(RunLocks {
                         locks,
                         default_cpu_mask: None,
@@ -1556,12 +1494,10 @@ impl KtstrVm {
                 (Some(host_topo), Some(plan)) => {
                     Self::acquire_performance_run_locks(host_topo, &self.topology, plan, wait)
                 }
-                _ => Ok(RunLocks {
-                    locks: Vec::new(),
-                    default_cpu_mask: None,
-                    pinning_plan: None,
-                    no_perf_cpus: None,
-                }),
+                _ => anyhow::bail!(
+                    "performance-mode VM reached run admission without its \
+                     validated host topology and build-time shape witness"
+                ),
             }
         } else {
             // Default: probe every bounded exact candidate (LLC-SH +
@@ -1582,7 +1518,47 @@ impl KtstrVm {
     /// and waits for the holder (see [`Self::acquire_run_locks`]).
     /// Non-contention errors still propagate.
     fn acquire_interactive_run_locks(&self) -> Result<RunLocks> {
-        Self::degrade_contention_to_overcommit(self.acquire_run_locks(false))
+        Self::interactive_run_locks_for_mode(self.performance_mode, || {
+            self.acquire_run_locks(false)
+        })
+    }
+
+    /// Apply the interactive admission policy without eagerly evaluating the
+    /// physical acquisition closure.
+    ///
+    /// Interactive performance-mode pinning is intentionally unsupported (see
+    /// `run_interactive`'s public contract). Reserving an exact perf candidate
+    /// while launching unpinned vCPUs would sequester resources the shell does
+    /// not actually use, so this mode does not call `acquire` at all.
+    fn interactive_run_locks_for_mode(
+        performance_mode: bool,
+        acquire: impl FnOnce() -> Result<RunLocks>,
+    ) -> Result<RunLocks> {
+        if performance_mode {
+            Ok(RunLocks::unreserved())
+        } else {
+            Self::degrade_contention_to_overcommit(acquire())
+        }
+    }
+
+    /// Resolve only placement backed by this interactive invocation's
+    /// successful acquisition.
+    ///
+    /// In particular, a contention-to-overcommit result carries no plan or
+    /// mask and must stay that way: resurrecting `self.no_perf_plan` or
+    /// `self.pinning_plan` here would bind workers to a stale build-time shape
+    /// whose resources this run does not own.
+    fn interactive_run_placement<'a>(
+        run_locks: &'a RunLocks,
+    ) -> (
+        Option<&'a host_topology::PinningPlan>,
+        EffectiveRunPlacement<'a>,
+    ) {
+        let pinning_plan = run_locks.pinning_plan.as_ref();
+        (
+            pinning_plan,
+            EffectiveRunPlacement::new(pinning_plan, run_locks.no_perf_cpus.as_deref()),
+        )
     }
 
     /// Map an [`Self::acquire_run_locks`] result for the one-shot shell path: a
@@ -1602,12 +1578,7 @@ impl KtstrVm {
                     "ktstr: host CPUs busy ({e}); booting the shell without a \
                      host-resource reservation"
                 );
-                Ok(RunLocks {
-                    locks: Vec::new(),
-                    default_cpu_mask: None,
-                    pinning_plan: None,
-                    no_perf_cpus: None,
-                })
+                Ok(RunLocks::unreserved())
             }
             other => other,
         }
@@ -2089,7 +2060,7 @@ impl KtstrVm {
             }
             active.extend((0..static_len).filter(|index| Some(*index) != live));
             for &i in &active {
-                if let Some(locks) = held.probe_complete(&targets[i])? {
+                if let Some(locks) = held.probe_complete_if_ready(&claims[i], &targets[i])? {
                     return Ok(protocol::CoordinatorStep::Complete {
                         claim: claims[i].clone(),
                         value: (i, locks),
@@ -2229,18 +2200,17 @@ impl KtstrVm {
         // and every placement consumer below uses the matching run-time CPU
         // mask rather than independently consulting the build-time plan.
         let run_locks = self.acquire_interactive_run_locks()?;
-        let effective_plan = run_locks
-            .pinning_plan
-            .as_ref()
-            .or(self.pinning_plan.as_ref());
-        let effective_no_perf_cpus = run_locks
-            .no_perf_cpus
-            .as_deref()
-            .or_else(|| self.no_perf_plan.as_ref().map(|plan| plan.cpus.as_slice()));
-        let effective_placement =
-            EffectiveRunPlacement::new(effective_plan, effective_no_perf_cpus);
+        let (effective_plan, effective_placement) = Self::interactive_run_placement(&run_locks);
+        debug_assert!(
+            !self.performance_mode || effective_plan.is_none(),
+            "interactive performance mode must never carry an exact reservation"
+        );
+        // Performance pinning is documented as ignored for an interactive
+        // shell, so its build-time NUMA map is ignored with it. Default and
+        // no-perf builds carry an empty map.
+        let interactive_mbind_node_map: &[Vec<usize>] = &[];
 
-        let (mut vm, kernel_result) = self.create_vm_and_load_kernel(&self.mbind_node_map)?;
+        let (mut vm, kernel_result) = self.create_vm_and_load_kernel(interactive_mbind_node_map)?;
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -2248,7 +2218,7 @@ impl KtstrVm {
                 &mut vm,
                 kernel_result,
                 prepared_initrd,
-                &self.mbind_node_map,
+                interactive_mbind_node_map,
             )?;
             self.setup_vcpus(&vm, kr.entry)?;
         }
@@ -2258,7 +2228,7 @@ impl KtstrVm {
                 &mut vm,
                 kernel_result,
                 prepared_initrd,
-                &self.mbind_node_map,
+                interactive_mbind_node_map,
             )?;
             self.setup_vcpus_aarch64(&vm, kr.entry)?;
         }
@@ -2501,12 +2471,15 @@ impl KtstrVm {
         let (mut bsp, bsp_ie) = ImmediateExitVcpu::new(bsp, has_immediate_exit, vcpu_run_size)
             .context("map interactive BSP kvm_run for immediate-exit")?;
 
-        let ap_pins = vec![None; vcpus.len()];
-        // Shell/interactive path mirrors run_vm: no-perf + --cpu-cap
-        // applies the admitted CPU list as a sched_setaffinity mask
-        // on every vCPU thread. Perf-mode's pin_targets doesn't
-        // apply here — interactive shell runs under no-perf by
-        // convention, and `pin_targets` is empty in this branch.
+        // Default-mode interactive admission returns an exact plan; consume
+        // the same dense pin map as `run_vm` so the reservation and placement
+        // cannot diverge. Performance-mode interactive runs are explicitly
+        // unreserved/unpinned, while no-perf uses the admitted mask below.
+        let pin_targets =
+            pin_targets_from_plan(effective_plan, self.topology.total_cpus() as usize);
+        let ap_pins = pin_targets.get(1..).unwrap_or_default().to_vec();
+        // No-perf + --cpu-cap applies the admitted CPU list as a
+        // sched_setaffinity mask on every vCPU thread.
         let no_perf_mask = effective_placement.no_perf_cpus;
         // Interactive shell does not run a freeze coordinator, so
         // discard the freeze-handle Vecs. Interactive mode also skips
@@ -2951,13 +2924,12 @@ impl KtstrVm {
         // deadline. Keep an inert long-duration argument for the shared
         // signature.
         //
-        // Apply the no-perf + --cpu-cap mask to the BSP thread so
-        // interactive `ktstr shell --no-perf-mode --cpu-cap N` runs
-        // inside the reserved LLCs just like run_vm's BSP. No pin
-        // here — perf-mode doesn't apply to interactive shell:
-        // `--cpu-cap` requires `--no-perf-mode` on Shell (clap
-        // `requires` attribute on the cpu_cap field).
-        if let Some(mask) = effective_placement.no_perf_cpus {
+        // Apply the exact default pin or the no-perf admitted mask to the BSP
+        // just as `run_vm` does. Performance-mode interactive runs carry
+        // neither because their documented pinning is disabled.
+        if let Some(Some(host_cpu)) = pin_targets.first() {
+            pin_current_thread(*host_cpu, "BSP (shell)");
+        } else if let Some(mask) = effective_placement.no_perf_cpus {
             set_thread_cpumask(mask, "BSP (shell)");
         }
         let interactive_timeout = Duration::from_secs(24 * 60 * 60);

@@ -1012,17 +1012,13 @@ fn acquire_llc_plan_skips_an_exclusive_held_llc_when_a_ready_alternative_exists(
 /// PLAN-driving `holder_count`, but keeps it in the diagnostic
 /// `holders` vec — while a PEER process's hold DOES count.
 ///
-/// Rationale: no-perf `build()` now holds each planned LLC's
-/// `LOCK_SH` from build through run (the fd strip was removed), so at
-/// the run-time replan our own build-time fd is present in
-/// `/proc/locks` for the very LLCs we already reserved. If
-/// `holder_count` counted it, the Spread policy — which prefers the
-/// LEAST-held LLCs — would flee our own reservation onto a different
-/// LLC, the exact opposite of the truthful-holder-count fix. This
-/// test holds `LOCK_SH` on LLC 0 from the test PROCESS and on LLC 1
-/// from a `flock(1)` CHILD, then asserts LLC 0's `holder_count` is 0
-/// (self excluded) with self still in the `holders` vec, and LLC 1's
-/// `holder_count` is 1 (the peer counts).
+/// A process can already own a related probe or a second run plan.
+/// If `holder_count` counted that self-owned fd, Spread — which
+/// prefers the least-held LLCs — would treat its own claim as peer
+/// pressure. This test holds `LOCK_SH` on LLC 0 from the test PROCESS
+/// and on LLC 1 from a `flock(1)` CHILD, then asserts LLC 0's
+/// `holder_count` is 0 (self excluded) with self still in the
+/// `holders` vec, and LLC 1's `holder_count` is 1 (the peer counts).
 ///
 /// Uses `flock(1)` for the peer so the holder is a genuinely
 /// different pid; absent util-linux the test skips rather than fails
@@ -1249,131 +1245,80 @@ fn count_only_discover_resolves_no_holder_cmdlines() {
     );
 }
 
-/// The plan `acquire_llc_plan` returns carries its `LOCK_SH` flock
-/// fds LIVE: held through the plan's lifetime, visible to a peer's
-/// `/proc/locks` read, and released on drop. This is the precondition
-/// the no-perf `build()` fix relies on — `build()` now forwards the
-/// plan's `locks` onto `KtstrVm::no_perf_plan` UNSTRIPPED (the
-/// historical `drop(std::mem::take(&mut plan.locks))` is gone), so a
-/// concurrent peer's DISCOVER observes a truthful holder count from
-/// build through run. With the fds stripped (the old behavior) the
-/// Spread policy's holder-count feedback was dead.
-///
-/// Asserts: (1) `plan.locks` is non-empty; (2) our pid is a holder of
-/// the locked LLC's lockfile while the plan lives; (3) after
-/// `drop(plan)` our pid is gone from that lockfile's holders.
+/// No-perf build planning must remain ownership-free, while the matching
+/// run-time acquisition must own the exact LLC and CPU resources it returns.
+/// This pins the phase boundary that keeps initrd/CAS preparation outside
+/// topology admission without weakening run-time isolation.
 #[test]
-fn acquire_llc_plan_holds_locks_live_until_drop() {
+fn plan_only_holds_nothing_and_runtime_plan_holds_exact_resources() {
     let _llc_prefix = LlcLockPrefixGuard::new();
-    let _allowed = AllowedCpusGuard::new(vec![0, 1]);
-    let topo = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
+    let _cpu_prefix = CpuLockPrefixGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![93640, 93641]);
+    let topo = HostTopology::new_for_tests(&[(vec![93640], 0), (vec![93641], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(2, 1);
     let cap = CpuCap::new(1).expect("cap=1 valid");
+    let registry_reads_before = protocol::aggregate_snapshot_read_count_for_tests();
 
-    let plan = acquire_llc_plan(
+    let build_plan = plan_llc_selection_only(
+        &topo,
+        &test_topo,
+        Some(cap),
+        PlacementPolicy::spread_for_process(),
+    )
+    .expect("build-time plan-only selection must succeed");
+    assert!(
+        build_plan.locks.is_empty(),
+        "build-time no-perf planning must retain zero real resource fds",
+    );
+    assert_eq!(
+        protocol::aggregate_snapshot_read_count_for_tests(),
+        registry_reads_before,
+        "shape-only planning must not consult the live admission registry",
+    );
+    let build_llc = build_plan.locked_llcs[0];
+    let build_cpu = build_plan.cpus[0];
+    assert!(
+        !std::path::Path::new(&llc_lock_path(build_llc)).exists(),
+        "shape-only planning must not materialize its selected LLC lockfile",
+    );
+    assert!(
+        !std::path::Path::new(&cpu_lock_path(build_cpu)).exists(),
+        "shape-only planning must not materialize its selected CPU lockfile",
+    );
+    let build_llc_probe = try_flock(llc_lock_path(build_llc), FlockMode::Exclusive)
+        .expect("probe build-time LLC")
+        .expect("build-time plan must not own its selected LLC");
+    let build_cpu_probe = try_flock(cpu_lock_path(build_cpu), FlockMode::Exclusive)
+        .expect("probe build-time CPU")
+        .expect("build-time plan must not own its selected CPU");
+    drop((build_llc_probe, build_cpu_probe, build_plan));
+
+    let runtime_plan = acquire_llc_plan(
         &topo,
         &test_topo,
         Some(cap),
         PlacementPolicy::spread_for_process(),
         false,
     )
-    .expect("acquire_llc_plan must succeed on a fresh two-LLC host");
+    .expect("run-time acquisition must succeed on a fresh two-LLC host");
     assert!(
-        !plan.locks.is_empty(),
-        "the plan must carry its live LOCK_SH fds (the build-time fd \
-         strip is gone); got empty locks",
-    );
-
-    let locked = *plan
-        .locked_llcs
-        .first()
-        .expect("a cap=1 plan locks exactly one LLC");
-    let lock_path = std::path::PathBuf::from(llc_lock_path(locked));
-    let self_pid = std::process::id();
-
-    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo while plan alive");
-    let held = crate::flock::read_holders_with_mountinfo(&lock_path, &mountinfo)
-        .expect("read holders while plan alive");
-    assert!(
-        held.iter().any(|h| h.pid == self_pid),
-        "our LOCK_SH must be visible in /proc/locks while the plan \
-         lives; holders={held:?}",
-    );
-
-    drop(plan);
-
-    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo after drop");
-    let after = crate::flock::read_holders_with_mountinfo(&lock_path, &mountinfo)
-        .expect("read holders after drop");
-    assert!(
-        after.iter().all(|h| h.pid != self_pid),
-        "dropping the plan must release our LOCK_SH; holders still \
-         list us: {after:?}",
-    );
-}
-
-/// The build-time no-perf fds live in a `Mutex<Vec<OwnedFd>>` on
-/// `KtstrVm` (not on the plan) so `acquire_run_locks`, which only has
-/// `&self`, can release them the moment its replan adopts fresh locks.
-/// This test exercises exactly that release path: park a held
-/// `LOCK_SH` fd in such a slot, confirm our pid is a holder, then run
-/// the `drop(std::mem::take(&mut *slot.lock().unwrap()))` release
-/// through a SHARED (`&`) borrow of the slot — the same expression the
-/// no-perf replan arm runs — and confirm our pid drops out of
-/// `/proc/locks`. Without the interior-mutable slot the fd could only
-/// release at `KtstrVm` drop, leaving a phantom hold on any LLC the
-/// replan abandoned for the whole run.
-#[test]
-fn parked_build_locks_release_through_shared_borrow() {
-    let _llc_prefix = LlcLockPrefixGuard::new();
-    let lock_path_s = llc_lock_path(0);
-    let lock_path = std::path::PathBuf::from(&lock_path_s);
-    crate::flock::materialize(&lock_path_s).expect("materialize lockfile");
-    let fd = try_flock(&lock_path_s, FlockMode::Shared)
-        .expect("open lockfile")
-        .expect("SH on a fresh lockfile must succeed");
-
-    // The slot as it lives on `KtstrVm`. Bind by shared ref to prove
-    // the release needs only `&self`, not `&mut`.
-    let slot: std::sync::Mutex<Vec<std::os::fd::OwnedFd>> = std::sync::Mutex::new(vec![fd]);
-    let slot_ref: &std::sync::Mutex<Vec<std::os::fd::OwnedFd>> = &slot;
-
-    let self_pid = std::process::id();
-    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo while parked");
-    let held = crate::flock::read_holders_with_mountinfo(&lock_path, &mountinfo)
-        .expect("read holders while parked");
-    assert!(
-        held.iter().any(|h| h.pid == self_pid),
-        "the parked fd must hold LOCK_SH; holders={held:?}",
-    );
-
-    // The exact release expression from `acquire_run_locks`' no-perf arm.
-    drop(std::mem::take(&mut *slot_ref.lock().unwrap()));
-
-    // Another test thread may fork while this fd is live. CLOEXEC closes the
-    // inherited copy at exec, but cannot prevent inheritance by the raw-fork
-    // queue test, whose children retain it until `_exit`. The kernel's flock
-    // entry can therefore outlive our local close briefly in a parallel
-    // cargo-test process. Require disappearance within a tight diagnostic
-    // deadline rather than in the same instant.
-    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo after release");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    let after = loop {
-        let holders = crate::flock::read_holders_with_mountinfo(&lock_path, &mountinfo)
-            .expect("read holders after release");
-        if holders.is_empty() || std::time::Instant::now() >= deadline {
-            break holders;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    };
-    assert!(
-        after.is_empty(),
-        "take-and-drop through the shared borrow must release our \
-         LOCK_SH and every fork-inherited copy; holders remain: {after:?}",
+        !runtime_plan.locks.is_empty(),
+        "run-time plan must carry its live resource fds",
     );
     assert!(
-        slot_ref.lock().unwrap().is_empty(),
-        "the slot must be drained after the take",
+        try_flock(
+            llc_lock_path(runtime_plan.locked_llcs[0]),
+            FlockMode::Exclusive,
+        )
+        .expect("probe run-time LLC")
+        .is_none(),
+        "run-time plan must hold its selected LLC",
+    );
+    assert!(
+        try_flock(cpu_lock_path(runtime_plan.cpus[0]), FlockMode::Exclusive)
+            .expect("probe run-time CPU")
+            .is_none(),
+        "run-time plan must hold its selected CPU",
     );
 }
 
@@ -1630,7 +1575,7 @@ fn acquire_llc_plan_wait_phase_acquires_beyond_the_seam() {
 }
 
 #[test]
-fn plan_only_falls_back_to_a_full_static_shape_when_every_llc_is_exclusive_held() {
+fn plan_only_ignores_live_exclusive_holders() {
     let _llc_prefix = LlcLockPrefixGuard::new();
     let _allowed = AllowedCpusGuard::new(vec![93720, 93721]);
     let topo = synth_host_topo(&[(vec![93720], 0), (vec![93721], 0)]);
@@ -1653,6 +1598,53 @@ fn plan_only_falls_back_to_a_full_static_shape_when_every_llc_is_exclusive_held(
     assert_eq!(plan.locked_llcs, vec![0, 1]);
     assert_eq!(plan.cpus, vec![93720, 93721]);
     assert!(plan.locks.is_empty(), "plan-only never owns resource fds");
+}
+
+#[test]
+fn plan_only_cargo_test_mode_matches_runtime_full_allowed_cpuset() {
+    let _env_guard = env_lock();
+    let _cargo = EnvGuard::set(crate::KTSTR_CARGO_TEST_MODE_ENV, "1");
+    let _llc_prefix = LlcLockPrefixGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![93730, 93731]);
+    let topo = synth_host_topo(&[(vec![93730], 0), (vec![93731], 1)]);
+    let test_topo = crate::topology::TestTopology::synthetic(2, 1);
+    let cap = CpuCap::new(1).expect("cap=1");
+
+    let build_plan = plan_llc_selection_only(
+        &topo,
+        &test_topo,
+        Some(cap),
+        PlacementPolicy::Spread { rotation: 0 },
+    )
+    .expect("cargo-test build plan");
+    let runtime_plan = acquire_llc_plan(
+        &topo,
+        &test_topo,
+        Some(cap),
+        PlacementPolicy::Spread { rotation: 0 },
+        true,
+    )
+    .expect("cargo-test runtime plan");
+
+    assert_eq!(build_plan.cpus, vec![93730, 93731]);
+    assert_eq!(
+        build_plan.cpus, runtime_plan.cpus,
+        "build budget and runtime mask must describe the same full allowed cpuset",
+    );
+    assert_eq!(build_plan.locked_llcs, runtime_plan.locked_llcs);
+    assert!(build_plan.locks.is_empty());
+    assert!(runtime_plan.locks.is_empty());
+    for path in [
+        llc_lock_path(0),
+        llc_lock_path(1),
+        cpu_lock_path(93730),
+        cpu_lock_path(93731),
+    ] {
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "cargo-test shape/acquire bypass must not materialize {path}",
+        );
+    }
 }
 
 #[test]
@@ -1708,127 +1700,6 @@ fn registered_claim_fast_fails_without_acquire_or_diagnostic_enrichment() {
         "aggregate-proven contention must not run enriched final diagnostics",
     );
     drop(coordinator);
-}
-
-#[test]
-fn waiting_handoff_publishes_ticket_before_releasing_old_locks() {
-    let _llc_prefix = LlcLockPrefixGuard::new();
-    let _allowed = AllowedCpusGuard::new(vec![93775]);
-    let topo = synth_host_topo(&[(vec![93775], 0)]);
-    let test_topo = crate::topology::TestTopology::synthetic(1, 1);
-    let blocker = try_flock(llc_lock_path(0), FlockMode::Exclusive)
-        .expect("open build-time blocker")
-        .expect("hold build-time blocker");
-    let handed_off = std::cell::Cell::new(false);
-    let attempts = std::cell::Cell::new(0usize);
-    let enrichment_before =
-        crate::flock::proc_locks::batch_holder_info_resolution_count_for_tests();
-    let plan = acquire_llc_plan_with_acquire_fn_and_handoff(
-        LlcPlanAcquireRequest {
-            topo: &topo,
-            test_topo: &test_topo,
-            cpu_cap: None,
-            policy: PlacementPolicy::Spread { rotation: 0 },
-            wait: true,
-            cancelled: None,
-        },
-        Some(|| {
-            let records = admission_protocol::ticket_registry_snapshot_for_tests()
-                .expect("handoff hook must be able to read the published ticket");
-            assert_eq!(
-                records.len(),
-                1,
-                "replacement ticket must be durable before inherited locks release",
-            );
-            assert_eq!(
-                records[0].2.llcs,
-                [0usize].into_iter().collect(),
-                "an all-busy wait must retain a nonempty static LLC designation",
-            );
-            assert_eq!(
-                records[0].2.cpus,
-                [93775usize].into_iter().collect(),
-                "an all-busy wait must retain the full-budget static CPU designation",
-            );
-            handed_off.set(true);
-            drop(blocker);
-        }),
-        |selected, cpus, snapshots| {
-            assert!(
-                !handed_off.get(),
-                "old reservations must remain held through the fast probe",
-            );
-            attempts.set(attempts.get() + 1);
-            Ok(
-                match try_acquire_llc_plan_locks_with_evidence(selected, cpus, snapshots)? {
-                    LlcLockAttempt::Acquired(locks) => Some(locks),
-                    LlcLockAttempt::Contended(_) | LlcLockAttempt::Unavailable => None,
-                },
-            )
-        },
-    )
-    .expect("handoff release must let the registered coordinator acquire");
-    assert!(
-        handed_off.get(),
-        "contention must invoke the post-publication handoff"
-    );
-    assert_eq!(
-        attempts.get(),
-        0,
-        "known-busy discovery must publish directly instead of retrying the fast acquire seam",
-    );
-    assert_eq!(
-        crate::flock::proc_locks::batch_holder_info_resolution_count_for_tests(),
-        enrichment_before,
-        "waiting handoff must use count-only discovery",
-    );
-    assert_eq!(plan.locked_llcs, vec![0]);
-}
-
-#[test]
-fn waiting_handoff_releases_inherited_locks_on_acquire_error() {
-    let _llc_prefix = LlcLockPrefixGuard::new();
-    let _allowed = AllowedCpusGuard::new(vec![93776]);
-    let topo = synth_host_topo(&[(vec![93776], 0)]);
-    let test_topo = crate::topology::TestTopology::synthetic(1, 1);
-    let inherited = try_flock(llc_lock_path(0), FlockMode::Shared)
-        .expect("open inherited reservation")
-        .expect("hold inherited reservation");
-    let handed_off = std::cell::Cell::new(false);
-    let handed_off_in_hook = &handed_off;
-
-    let error = acquire_llc_plan_with_acquire_fn_and_handoff(
-        LlcPlanAcquireRequest {
-            topo: &topo,
-            test_topo: &test_topo,
-            cpu_cap: None,
-            policy: PlacementPolicy::Spread { rotation: 0 },
-            wait: true,
-            cancelled: None,
-        },
-        Some(move || {
-            handed_off_in_hook.set(true);
-            drop(inherited);
-        }),
-        |_, _, _| -> anyhow::Result<Option<Vec<std::os::fd::OwnedFd>>> {
-            anyhow::bail!("injected runtime replan failure")
-        },
-    )
-    .expect_err("injected acquisition error must propagate");
-    assert!(
-        error
-            .to_string()
-            .contains("injected runtime replan failure"),
-        "unexpected handoff error: {error:#}"
-    );
-    assert!(
-        handed_off.get(),
-        "every error exit must drain inherited no-perf reservations"
-    );
-    let released = try_flock(llc_lock_path(0), FlockMode::Exclusive)
-        .expect("probe released inherited reservation")
-        .expect("inherited reservation must not survive an acquisition error");
-    drop(released);
 }
 
 /// `plan_from_snapshots` MUST-CONSOLIDATE invariant: on a

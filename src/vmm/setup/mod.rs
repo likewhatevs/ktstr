@@ -1025,19 +1025,18 @@ impl KtstrVm {
         // Perf-mode produces `pinning_plan.service_cpu` (a dedicated
         // host CPU reserved away from vCPU pins) — the worker pins
         // there to keep its cache footprint out of the workload-
-        // measured cpuset. Non-perf + `--cpu-cap` produces
-        // `no_perf_plan.cpus` (the LLC mask shared with vCPUs); the
-        // worker shares the LLC but stays inside the resource budget.
-        // The two paths are orthogonal (perf-mode never has
-        // `no_perf_plan` and vice versa); both `None` means inherit
-        // the parent's affinity (degraded-sysfs / non-cap-set
+        // measured cpuset. Non-perf + `--cpu-cap` supplies the CPUs
+        // from the run-time plan acquired immediately before VM setup;
+        // the worker shares the LLC but stays inside the exact resource
+        // budget this invocation owns.
+        // The two effective placement modes are orthogonal; both `None`
+        // means inherit the parent's affinity (degraded-sysfs / non-cap-set
         // fallback). The setter only takes effect on the next worker
         // spawn — `with_options` deferred initial spawn to DRIVER_OK
         // (matching the respawn path), so this call lands inside the
         // window and the first worker observes the placement. The
-        // run-time-replan `no_perf_cpus` override wins over the
-        // build-time `no_perf_plan.cpus` so the worker binds to the same
-        // LLCs the run-scoped flocks hold.
+        // Build-time shape plans are never consulted here, so the worker
+        // can only bind to the same LLCs the run-scoped flocks hold.
         let placement = virtio_blk::WorkerPlacement {
             service_cpu: effective_placement.service_cpu,
             no_perf_cpus: effective_placement.no_perf_cpus.map(<[usize]>::to_vec),

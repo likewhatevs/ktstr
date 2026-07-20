@@ -229,11 +229,12 @@ v2 cpuset — no pinning, no RT scheduling, no hugetlb. Shared CPU claims
 let compatible no-perf peers overlap deliberately while still fencing
 exclusive default/performance owners. Placement is *Spread*: concurrent
 no-perf VMs fan out across available LLCs rather than stacking onto the
-same low-LLC prefix (builds keep *Consolidate*). The build-time `LOCK_SH` fds
-are held through setup so a concurrent peer's holder count reads true, then
-`run()` re-plans against those now-truthful counts and adopts the fresh
-plan's own fds (acquire-before-release, so retained LLCs never flicker
-free — [`acquire_run_locks`](https://github.com/likewhatevs/ktstr/blob/main/src/vmm/mod.rs),
+same low-LLC prefix. Build-time planning is shape-only and owns no resource
+fds, so immutable image preparation and other cold setup cannot sequester
+host capacity. After image preparation, `run()` re-plans against live
+holder counts and acquires the fresh plan's exact LLC and CPU set; that
+same set drives every vCPU and worker affinity mask
+([`acquire_run_locks`](https://github.com/likewhatevs/ktstr/blob/main/src/vmm/mod.rs),
 no-perf arm in
 [`builder.rs`](https://github.com/likewhatevs/ktstr/blob/main/src/vmm/builder.rs)).
 The CPU-budget resolution and the cpuset sandbox live in
