@@ -334,17 +334,41 @@ fn cover_cache_yield_wake_affine(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::performance::custom_cache_yield_wake_affine(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
+// Wake-latency CV is wall-clock dispersion and cannot be normalized from
+// host dilation after the run: preemption can widen or tighten it depending
+// on which samples it hits. Keep the guest shape unchanged, but give this
+// latency assertion the same hard performance-mode contract as the
+// cache-yield sibling above so a loaded host cannot turn scheduler signal
+// into retry-dependent noise.
+#[ktstr_test(
+    llcs = 1,
+    cores = 4,
+    threads = 1,
+    memory_mib = 2048,
+    performance_mode = true
+)]
 fn cover_cache_pipe_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::performance::custom_cache_pipe_io_compute_imbalance(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
+#[ktstr_test(
+    llcs = 1,
+    cores = 4,
+    threads = 1,
+    memory_mib = 2048,
+    performance_mode = true
+)]
 fn cover_fan_out_wake(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::performance::custom_fan_out_wake(ctx)
 }
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
+#[ktstr_test(
+    llcs = 1,
+    cores = 4,
+    threads = 1,
+    memory_mib = 2048,
+    performance_mode = true
+)]
 fn cover_fan_out_compute(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::performance::custom_fan_out_compute(ctx)
 }
