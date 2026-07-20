@@ -116,8 +116,6 @@ pub(crate) use mountinfo::read_mountinfo;
 pub(crate) use primitives::{
     InterruptibleFlockWaiter, TryFlockOutcome, materialize, try_flock_with_witness,
 };
-#[cfg(test)]
-pub(crate) use proc_locks::read_holders_with_mountinfo;
 pub(crate) use proc_locks::{
     FlockResourceState, read_flock_mode_summaries, read_flock_states_batch_with_mountinfo,
     read_holders,

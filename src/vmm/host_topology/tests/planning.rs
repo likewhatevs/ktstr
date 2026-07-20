@@ -1257,7 +1257,8 @@ fn plan_only_holds_nothing_and_runtime_plan_holds_exact_resources() {
     let topo = HostTopology::new_for_tests(&[(vec![93640], 0), (vec![93641], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(2, 1);
     let cap = CpuCap::new(1).expect("cap=1 valid");
-    let registry_reads_before = protocol::aggregate_snapshot_read_count_for_tests();
+    let registry_reads_before =
+        crate::vmm::host_topology::protocol::aggregate_snapshot_read_count_for_tests();
 
     let build_plan = plan_llc_selection_only(
         &topo,
@@ -1271,7 +1272,7 @@ fn plan_only_holds_nothing_and_runtime_plan_holds_exact_resources() {
         "build-time no-perf planning must retain zero real resource fds",
     );
     assert_eq!(
-        protocol::aggregate_snapshot_read_count_for_tests(),
+        crate::vmm::host_topology::protocol::aggregate_snapshot_read_count_for_tests(),
         registry_reads_before,
         "shape-only planning must not consult the live admission registry",
     );
