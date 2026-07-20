@@ -176,8 +176,8 @@ local-package-boot ver:
     set -euo pipefail
     rpm="$(pwd)/target/ktstr-synthetic-{{ver}}.rpm"
     KTSTR_E2E_KERNEL_VERSION='{{ver}}' KTSTR_E2E_RPM_OUT="$rpm" \
-        cargo nextest run -p ktstr --run-ignored only \
-        -E 'test(pack_built_kernel_into_synthetic_rpm)'
+        cargo run --bin cargo-ktstr -- ktstr test --kernel '{{ver}}' -- \
+        --run-ignored only -E 'test(pack_built_kernel_into_synthetic_rpm)'
     errlog=$(mktemp)
     rel=$(cargo run --bin cargo-ktstr -- ktstr shell --kernel "$rpm" --exec 'uname -r' 2>"$errlog") \
         || { echo "FAIL: synthetic-rpm boot exited nonzero; stderr:"; cat "$errlog"; rm -f "$errlog"; exit 1; }

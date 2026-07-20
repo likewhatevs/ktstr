@@ -1483,6 +1483,16 @@ fn scheduler_source_tree_digest(
             if entry.path() == target_dir || entry.path().starts_with(&target_dir) {
                 return false;
             }
+            if entry.path() != root
+                && entry.file_type().is_dir()
+                && std::fs::symlink_metadata(entry.path().join(".git")).is_ok()
+            {
+                // A nested repository/worktree is a separate source boundary,
+                // not an ignored/generated input of its parent checkout. Any
+                // nested repository Cargo actually reaches is present in
+                // `source_roots` and hashed independently.
+                return false;
+            }
             if entry
                 .path()
                 .strip_prefix(root)
@@ -3849,6 +3859,8 @@ mod tests {
         std::fs::create_dir_all(checkout.path().join("generated")).expect("create generated");
         std::fs::create_dir_all(checkout.path().join(".git/objects")).expect("create git metadata");
         std::fs::create_dir_all(checkout.path().join("target/debug")).expect("create target");
+        std::fs::create_dir_all(checkout.path().join("nested-worktree/target/debug"))
+            .expect("create nested worktree target");
         std::fs::write(checkout.path().join(".gitignore"), "generated/\n").expect("write ignore");
         std::fs::write(
             checkout.path().join("generated/input.rs"),
@@ -3859,6 +3871,16 @@ mod tests {
             .expect("write git metadata");
         std::fs::write(checkout.path().join("target/debug/output"), "one\n")
             .expect("write target output");
+        std::fs::write(
+            checkout.path().join("nested-worktree/.git"),
+            "gitdir: elsewhere\n",
+        )
+        .expect("write nested worktree marker");
+        std::fs::write(
+            checkout.path().join("nested-worktree/target/debug/output"),
+            "one\n",
+        )
+        .expect("write nested worktree output");
         std::fs::write(
             external.path().join("input.rs"),
             "pub const EXTERNAL: u8 = 1;\n",
@@ -3883,10 +3905,15 @@ mod tests {
             .expect("change git metadata");
         std::fs::write(checkout.path().join("target/debug/output"), "two\n")
             .expect("change target output");
+        std::fs::write(
+            checkout.path().join("nested-worktree/target/debug/output"),
+            "two\n",
+        )
+        .expect("change nested worktree output");
         assert_eq!(
             digest(),
             original,
-            ".git and the actual target directory, including an alias, are outputs not inputs",
+            ".git, nested repositories, and actual target directories are outputs not inputs",
         );
 
         std::fs::write(

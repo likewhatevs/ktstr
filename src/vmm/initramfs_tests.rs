@@ -1141,7 +1141,12 @@ fn build_initramfs_base_includes_extra_shared_libs() {
     let exe = crate::resolve_current_exe().unwrap();
     let sched = crate::test_support::require_binary("scx-ktstr");
     let extras: Vec<(&str, &Path)> = vec![("scheduler", sched.as_path())];
-    let base = build_initramfs_base(&exe, &extras, &[], None).unwrap();
+    let inputs =
+        crate::vmm::initramfs_cache::prepare_base_inputs(&exe, &extras, &[], None).unwrap();
+    let prepared =
+        crate::vmm::initramfs_cache::get_or_prepare_base(inputs, InitrdCompression::Uncompressed)
+            .unwrap();
+    let base = prepared.read_uncompressed_for_test().unwrap();
     let s = String::from_utf8_lossy(&base);
 
     // Every shared lib the extra resolves to must be packed into the base.

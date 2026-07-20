@@ -3435,6 +3435,32 @@ pub(crate) struct PreparedBase {
     payload: Option<PinnedInput>,
 }
 
+impl PreparedBase {
+    /// Read an uncompressed prepared base through the same immutable CAS
+    /// object production uses.
+    ///
+    /// Archive-shape tests need the cpio bytes for assertions. Keeping this
+    /// test-only accessor here ensures those tests cannot accidentally bypass
+    /// preparation and repeat a large binary transform in every nextest
+    /// process.
+    #[cfg(test)]
+    pub(crate) fn read_uncompressed_for_test(&self) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            self.compression == initramfs::InitrdCompression::Uncompressed,
+            "test requested bytes from a compressed prepared base"
+        );
+        anyhow::ensure!(
+            self.object.header.payload_len == self.object.header.part_uncompressed_len,
+            "uncompressed prepared base length mismatch"
+        );
+        self.object.read_exact_at(
+            0,
+            usize::try_from(self.object.header.payload_len)
+                .context("prepared base payload length exceeds usize")?,
+        )
+    }
+}
+
 #[derive(Debug)]
 struct PinnedArchiveInput {
     archive_name: String,

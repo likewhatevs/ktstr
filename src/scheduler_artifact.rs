@@ -1517,11 +1517,15 @@ mod tests {
 
         let interrupted = Arc::new(AtomicBool::new(false));
         let wake = Arc::clone(&interrupted);
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::sync_channel(1);
         let trigger = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(25));
+            let cancelled_at = std::time::Instant::now();
+            cancelled_tx
+                .send(cancelled_at)
+                .expect("publish cancellation instant");
             wake.store(true, Ordering::Release);
         });
-        let started = std::time::Instant::now();
         let error = match load_or_build_scheduler_workspace_artifacts_at_root(
             root.path(),
             identity,
@@ -1536,14 +1540,16 @@ mod tests {
             Ok(_) => panic!("cancelled cache wait must not succeed"),
             Err(error) => error,
         };
+        let completed_at = std::time::Instant::now();
         trigger.join().expect("interrupt trigger");
+        let cancelled_at = cancelled_rx.recv().expect("cancellation instant");
         assert!(
             error.contains("scheduler workspace build cache wait interrupted"),
             "unexpected interrupt error: {error}",
         );
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "100ms parked retries must observe cancellation promptly",
+            completed_at.duration_since(cancelled_at) < std::time::Duration::from_secs(1),
+            "100ms parked retries must observe a delivered cancellation promptly",
         );
     }
 
@@ -1566,11 +1572,15 @@ mod tests {
 
         let interrupted = Arc::new(AtomicBool::new(false));
         let wake = Arc::clone(&interrupted);
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::sync_channel(1);
         let trigger = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(25));
+            let cancelled_at = std::time::Instant::now();
+            cancelled_tx
+                .send(cancelled_at)
+                .expect("publish cancellation instant");
             wake.store(true, Ordering::Release);
         });
-        let started = std::time::Instant::now();
         let error = wait_for_scheduler_build_lock(
             &mut successor,
             "cargo ktstr test",
@@ -1579,7 +1589,9 @@ mod tests {
             &|| interrupted.load(Ordering::Acquire),
         )
         .expect_err("cancelled successor election");
+        let completed_at = std::time::Instant::now();
         trigger.join().expect("interrupt trigger");
+        let cancelled_at = cancelled_rx.recv().expect("cancellation instant");
         assert!(
             error
                 .to_string()
@@ -1587,8 +1599,8 @@ mod tests {
             "unexpected successor interrupt error: {error:#}",
         );
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "100ms parked retries must observe successor cancellation promptly",
+            completed_at.duration_since(cancelled_at) < std::time::Duration::from_secs(1),
+            "100ms parked retries must observe delivered successor cancellation promptly",
         );
     }
 

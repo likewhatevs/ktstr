@@ -335,8 +335,16 @@ impl TestTaskServiceWatchdog {
         for (index, source) in self.sources.iter().enumerate() {
             let current = source.snapshot();
             let mut delivered_cpu_ns = 0u64;
-            any_runnable |=
-                current.pending || current.tasks.values().any(|sample| sample.state == b'R');
+            // A task in uninterruptible I/O sleep is still an active producer:
+            // it is waiting for kernel/device service, not for another test
+            // actor. Treat D consistently with the pre-publication process
+            // probe above so an I/O-heavy storm cannot make the observer burn
+            // its "every producer is blocked" CPU budget spuriously.
+            any_runnable |= current.pending
+                || current
+                    .tasks
+                    .values()
+                    .any(|sample| matches!(sample.state, b'R' | b'D'));
             made_progress |= current.pending != self.previous[index].pending
                 || !current.tasks.keys().eq(self.previous[index].tasks.keys());
             for (task, sample) in &current.tasks {
@@ -3613,7 +3621,12 @@ impl TicketChild {
 
     fn release_and_wait(self) {
         std::fs::write(&self.release, b"release").expect("release ticket helper");
-        let services = ticket_helper_services(&[self.pid]);
+        // Releasing the protocol worker only finishes the ignored helper test.
+        // Libtest still has to hand the result back to its harness thread and
+        // terminate the process, so account service from the whole helper
+        // process while waiting for Child::try_wait rather than watching the
+        // worker TID after its work is already complete.
+        let services = [TestTaskService::process(self.pid)];
         let status =
             wait_with_external_task_service("released ticket-helper exit", &services, || {
                 Ok(self.try_status())
@@ -3734,7 +3747,7 @@ impl TicketChild {
     }
 
     fn wait_for_injected_crash(&self) {
-        let services = ticket_helper_services(&[self.pid]);
+        let services = [TestTaskService::process(self.pid)];
         let status = wait_with_external_task_service("injected registry crash", &services, || {
             Ok(self.try_status())
         })
@@ -3759,6 +3772,12 @@ impl TicketChild {
 impl Drop for TicketChild {
     fn drop(&mut self) {
         self.kill_and_wait();
+        // Worker threads are reused across libtest cases. Keeping a reaped
+        // helper keyed only by PID lets rapid process churn alias a later,
+        // unrelated process and poisons live_ticket_helper_services().
+        TICKET_HELPER_LOGS.with(|logs| {
+            logs.borrow_mut().remove(&self.pid);
+        });
     }
 }
 
