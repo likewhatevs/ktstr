@@ -449,6 +449,8 @@ struct ElfStampReader<'a> {
     data: &'a [u8],
     elf: Elf<'a>,
     relative_relocation_type: u32,
+    dynrela_relative_prefix: usize,
+    dynrel_relative_prefix: usize,
     exceptional_pointer_relocations: OnceLock<HashMap<u64, PointerRelocation>>,
 }
 
@@ -600,61 +602,121 @@ impl<'a> ElfStampReader<'a> {
                         )
                     })?;
         }
+        let (declared_rela_count, declared_rel_count) = elf
+            .dynamic
+            .as_ref()
+            .map(|dynamic| (dynamic.info.relacount, dynamic.info.relcount))
+            .unwrap_or_default();
+        let dynrela_relative_prefix = Self::relative_prefix_len(
+            &elf.dynrelas,
+            declared_rela_count,
+            relative_type,
+        );
+        let dynrel_relative_prefix =
+            Self::relative_prefix_len(&elf.dynrels, declared_rel_count, relative_type);
 
         Ok(Self {
             source,
             data,
             elf,
             relative_relocation_type: relative_type,
+            dynrela_relative_prefix,
+            dynrel_relative_prefix,
             exceptional_pointer_relocations: OnceLock::new(),
         })
+    }
+
+    fn relative_prefix_len(
+        relocations: &RelocSection<'_>,
+        declared_count: usize,
+        relative_type: u32,
+    ) -> usize {
+        let declared_count = declared_count.min(relocations.len());
+        if declared_count != 0 {
+            return declared_count;
+        }
+        if relocations
+            .get(0)
+            .is_none_or(|relocation| relocation.r_type != relative_type)
+        {
+            return 0;
+        }
+
+        // Mold omits DT_REL[A]COUNT, but still emits an ordered leading block
+        // of relative relocations followed by a non-relative suffix. Locate
+        // that partition once in O(log n) so every stamp pointer can search
+        // the actual relative block. A non-partitioned external ELF can only
+        // make this fast path miss; the in-place pointer and lazy exceptional
+        // index remain the correctness path for such inputs.
+        if relocations
+            .get(relocations.len() - 1)
+            .is_some_and(|relocation| relocation.r_type == relative_type)
+        {
+            return relocations.len();
+        }
+        let mut start = 1usize;
+        let mut end = relocations.len();
+        while start < end {
+            let middle = start + (end - start) / 2;
+            if relocations
+                .get(middle)
+                .is_some_and(|relocation| relocation.r_type == relative_type)
+            {
+                start = middle + 1;
+            } else {
+                end = middle;
+            }
+        }
+        start
     }
 
     fn relocation_at(
         &self,
         relocations: &RelocSection<'_>,
-        relative_count: usize,
+        relative_prefix: usize,
         field_va: u64,
     ) -> Option<goblin::elf::reloc::Reloc> {
-        // DT_REL[A]COUNT identifies the leading contiguous relative
-        // relocations. GNU ld, lld, and mold order that prefix by r_offset, so
-        // a binary search touches O(log n) 24-byte entries instead of
+        fn binary_search(
+            relocations: &RelocSection<'_>,
+            mut start: usize,
+            mut end: usize,
+            field_va: u64,
+        ) -> Option<goblin::elf::reloc::Reloc> {
+            while start < end {
+                let middle = start + (end - start) / 2;
+                let relocation = relocations
+                    .get(middle)
+                    .expect("middle is bounded by relocation count");
+                match relocation.r_offset.cmp(&field_va) {
+                    std::cmp::Ordering::Less => start = middle + 1,
+                    std::cmp::Ordering::Greater => end = middle,
+                    std::cmp::Ordering::Equal => return Some(relocation),
+                }
+            }
+            None
+        }
+
+        // GNU ld/lld publish DT_REL[A]COUNT; mold's equivalent leading block
+        // is derived once in `relative_prefix_len`. All three order that block
+        // by r_offset, so a lookup touches O(log n) 24-byte entries instead of
         // materializing the 100k-300k unrelated relocations common in Rust
         // test executables.
-        let mut start = 0usize;
-        let mut end = relative_count.min(relocations.len());
-        while start < end {
-            let middle = start + (end - start) / 2;
-            let relocation = relocations
-                .get(middle)
-                .expect("middle is bounded by relocation count");
-            match relocation.r_offset.cmp(&field_va) {
-                std::cmp::Ordering::Less => start = middle + 1,
-                std::cmp::Ordering::Greater => end = middle,
-                std::cmp::Ordering::Equal => return Some(relocation),
-            }
-        }
-        // Non-relative relocations follow the counted prefix and are grouped
-        // rather than globally sorted. They should never back a valid stamp
-        // pointer, but scan that comparatively tiny tail so a corrupted or
-        // externally linked stamp gets a precise unsupported-relocation
-        // diagnostic. Linkers without DT_REL[A]COUNT take this path for their
-        // whole (typically small) table.
-        relocations
-            .iter()
-            .skip(relative_count.min(relocations.len()))
-            .find(|relocation| relocation.r_offset == field_va)
+        binary_search(
+            relocations,
+            0,
+            relative_prefix.min(relocations.len()),
+            field_va,
+        )
     }
 
     fn pointer_relocation(&self, field_va: u64) -> Result<Option<PointerRelocation>, String> {
-        let (rela_count, rel_count) = self
-            .elf
-            .dynamic
-            .as_ref()
-            .map(|dynamic| (dynamic.info.relacount, dynamic.info.relcount))
-            .unwrap_or_default();
-        let rela = self.relocation_at(&self.elf.dynrelas, rela_count, field_va);
-        let rel = self.relocation_at(&self.elf.dynrels, rel_count, field_va);
+        let rela = self.relocation_at(
+            &self.elf.dynrelas,
+            self.dynrela_relative_prefix,
+            field_va,
+        );
+        let rel =
+            self.relocation_at(&self.elf.dynrels, self.dynrel_relative_prefix, field_va);
         self.classify_pointer_relocation(field_va, rela, rel)
     }
 
@@ -1703,12 +1765,67 @@ mod tests {
     }
 
     #[test]
-    fn unsorted_relative_prefix_uses_sound_exceptional_index() {
+    fn stamp_relative_relocations_are_resolved_by_the_sparse_fast_path() {
+        let (executable, mapping) = map_current_test_executable_copy();
+        let reader =
+            ElfStampReader::new(&executable, &mapping).expect("sparsely parse test executable");
+        let stamp_ranges = [DECLARATION_SECTION, TEST_SECTION]
+            .map(|section| {
+                let (address, bytes) = reader
+                    .section(section)
+                    .expect("find scheduler-manifest stamp section")
+                    .expect("scheduler-manifest stamp section must be linked");
+                address..address + bytes.len() as u64
+            });
+
+        let mut checked = 0usize;
+        for (relocations, relative_prefix) in [
+            (&reader.elf.dynrelas, reader.dynrela_relative_prefix),
+            (&reader.elf.dynrels, reader.dynrel_relative_prefix),
+        ] {
+            for relocation in relocations.iter().filter(|relocation| {
+                relocation.r_type == reader.relative_relocation_type
+                    && stamp_ranges
+                        .iter()
+                        .any(|range| range.contains(&relocation.r_offset))
+            }) {
+                assert!(
+                    reader
+                        .relocation_at(relocations, relative_prefix, relocation.r_offset)
+                        .is_some(),
+                    "relative stamp relocation at 0x{:x} must be found in the ordered prefix",
+                    relocation.r_offset,
+                );
+                checked += 1;
+            }
+        }
+        assert_ne!(
+            checked, 0,
+            "unit-test executable must carry relative stamp relocations"
+        );
+
+        let declared_count = reader
+            .elf
+            .dynamic
+            .as_ref()
+            .map(|dynamic| dynamic.info.relacount)
+            .unwrap_or_default();
+        if declared_count == 0 && !reader.elf.dynrelas.is_empty() {
+            assert_ne!(
+                reader.dynrela_relative_prefix, 0,
+                "count-less mold output must derive its leading relative block"
+            );
+        }
+    }
+
+    #[test]
+    fn unsorted_dynamic_relocations_use_sound_exceptional_index() {
         let (executable, mut mapping) = map_current_test_executable_copy();
         let (
             test_record,
             field_va,
             expected_pointer,
+            pointer_slot_file_offset,
             relocation_file_offset,
             relocation_size,
             relocation_index,
@@ -1746,10 +1863,6 @@ mod tests {
                 .position(|relocation| relocation.r_offset == field_va)
                 .expect("test-name pointer must have a dynamic RELA relocation");
             assert!(
-                relocation_index < dynamic.info.relacount,
-                "test-name pointer must be in the DT_RELACOUNT prefix"
-            );
-            assert!(
                 relocation_index > 0,
                 "test-name relocation must leave room for an ordering inversion"
             );
@@ -1763,12 +1876,16 @@ mod tests {
                 .r_addend
                 .expect("x86_64/aarch64 dynamic pointer uses RELA")
                 as u64;
+            let pointer_slot_file_offset = reader
+                .va_file_offset(field_va, size_of::<u64>(), "test-name pointer slot")
+                .expect("test-name pointer slot must be file-backed");
             let relocation_size = dynamic.info.relaent as usize;
             assert!(relocation_size > 0);
             (
                 test_record,
                 field_va,
                 expected_pointer,
+                pointer_slot_file_offset,
                 dynamic.info.rela,
                 relocation_size,
                 relocation_index,
@@ -1779,6 +1896,7 @@ mod tests {
         for index in 0..relocation_size {
             mapping.swap(relocation_file_offset + index, target_start + index);
         }
+        mapping[pointer_slot_file_offset..pointer_slot_file_offset + size_of::<u64>()].fill(0);
 
         let reader =
             ElfStampReader::new(&executable, &mapping).expect("parse unsorted test executable");
