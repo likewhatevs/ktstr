@@ -378,6 +378,7 @@ pub struct SchedulerManifestTestStampV1 {
     test: SchedulerManifestStampStrV1,
     schedulers: SchedulerManifestStampSliceV1<SchedulerManifestUseStampV1>,
     expected_scheduler_count: u64,
+    legacy_entry: *const KtstrTestEntry,
 }
 
 unsafe impl Sync for SchedulerManifestTestStampV1 {}
@@ -387,24 +388,6 @@ impl SchedulerManifestTestStampV1 {
     /// staged scheduler in declaration order.
     #[doc(hidden)]
     pub const fn new(
-        test: &'static str,
-        schedulers: &'static [SchedulerManifestUseStampV1],
-    ) -> Self {
-        Self {
-            header: StampHeaderV1::new(STAMP_KIND_TEST, size_of::<SchedulerManifestTestStampV1>()),
-            test: SchedulerManifestStampStrV1::new(test),
-            schedulers: SchedulerManifestStampSliceV1::new(schedulers),
-            expected_scheduler_count: schedulers.len() as u64,
-        }
-    }
-
-    /// Build a stamp alongside a manually registered entry.
-    ///
-    /// The encoded expected count makes an entry with staged schedulers fail
-    /// introspection instead of silently dropping edges. Use `#[ktstr_test]`
-    /// for staged entries so the proc macro can project every scheduler.
-    #[doc(hidden)]
-    pub const fn from_manual_entry(
         entry: &'static KtstrTestEntry,
         schedulers: &'static [SchedulerManifestUseStampV1],
     ) -> Self {
@@ -413,6 +396,7 @@ impl SchedulerManifestTestStampV1 {
             test: SchedulerManifestStampStrV1::new(entry.name),
             schedulers: SchedulerManifestStampSliceV1::new(schedulers),
             expected_scheduler_count: 1 + entry.staged_schedulers.len() as u64,
+            legacy_entry: entry,
         }
     }
 
@@ -425,6 +409,7 @@ impl SchedulerManifestTestStampV1 {
             test: SchedulerManifestStampStrV1::empty(),
             schedulers: SchedulerManifestStampSliceV1::empty(),
             expected_scheduler_count: 0,
+            legacy_entry: std::ptr::null(),
         }
     }
 }
@@ -1067,7 +1052,16 @@ impl<'a> ElfStampReader<'a> {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(ParsedTestStamp { test, schedulers })
+        let legacy_entry = self.pointer(
+            base,
+            offset_of!(SchedulerManifestTestStampV1, legacy_entry),
+            &format!("{what}.legacy_entry"),
+        )?;
+        Ok(ParsedTestStamp {
+            test,
+            schedulers,
+            legacy_entry,
+        })
     }
 }
 
@@ -1082,6 +1076,7 @@ struct ParsedSchedulerUse {
 struct ParsedTestStamp {
     test: String,
     schedulers: Vec<ParsedSchedulerUse>,
+    legacy_entry: u64,
 }
 
 fn parse_record_section<T>(
@@ -1230,6 +1225,62 @@ fn validate_registry_count(
     Ok(())
 }
 
+fn order_tests_by_legacy_registry(
+    reader: &ElfStampReader<'_>,
+    tests: &mut [ParsedTestStamp],
+) -> Result<(), String> {
+    let section = "linkme_KTSTR_TESTS";
+    let (base, bytes) = reader.section(section)?.ok_or_else(|| {
+        format!(
+            "scheduler-manifest ELF {} is missing {section}",
+            reader.source.display()
+        )
+    })?;
+    let record_size = size_of::<KtstrTestEntry>() as u64;
+    let record_count = bytes.len() / size_of::<KtstrTestEntry>();
+    let mut seen = BTreeSet::new();
+    for test in tests.iter() {
+        let relative = test.legacy_entry.checked_sub(base).ok_or_else(|| {
+            format!(
+                "test {:?} scheduler-manifest stamp in {} points before {section}",
+                test.test,
+                reader.source.display()
+            )
+        })?;
+        if relative % record_size != 0 {
+            return Err(format!(
+                "test {:?} scheduler-manifest stamp in {} points to an unaligned \
+                 {section} address 0x{:x}",
+                test.test,
+                reader.source.display(),
+                test.legacy_entry
+            ));
+        }
+        let index = usize::try_from(relative / record_size).map_err(|_| {
+            format!(
+                "test {:?} scheduler-manifest registry index is unrepresentable in {}",
+                test.test,
+                reader.source.display()
+            )
+        })?;
+        if index >= record_count {
+            return Err(format!(
+                "test {:?} scheduler-manifest stamp in {} points outside {section}",
+                test.test,
+                reader.source.display()
+            ));
+        }
+        if !seen.insert(index) {
+            return Err(format!(
+                "scheduler-manifest ELF {} has duplicate stamps for {section} record {index}",
+                reader.source.display()
+            ));
+        }
+    }
+    tests.sort_by_key(|test| test.legacy_entry);
+    Ok(())
+}
+
 /// Read the versioned scheduler manifest directly from a final ELF.
 ///
 /// `Ok(None)` means the binary does not link ktstr's v1 stamp registries (for
@@ -1296,7 +1347,7 @@ pub fn read_scheduler_manifest_stamp(
              required peer section {DECLARATION_SECTION}",
             path.display()
         )),
-        (Some(declarations), Some(tests)) => {
+        (Some(declarations), Some(mut tests)) => {
             validate_registry_count(
                 &reader,
                 "linkme_KTSTR_SCHEDULERS",
@@ -1311,6 +1362,7 @@ pub fn read_scheduler_manifest_stamp(
                 tests.len(),
                 "test entry/entries",
             )?;
+            order_tests_by_legacy_registry(&reader, &mut tests)?;
             reconstruct_manifest(declarations, tests).map(Some)
         }
     }
@@ -1333,7 +1385,7 @@ mod tests {
         assert_eq!(size_of::<SchedulerManifestStampSysctlV1>(), 32);
         assert_eq!(size_of::<SchedulerManifestUseStampV1>(), 56);
         assert_eq!(size_of::<SchedulerManifestDeclarationStampV1>(), 256);
-        assert_eq!(size_of::<SchedulerManifestTestStampV1>(), 56);
+        assert_eq!(size_of::<SchedulerManifestTestStampV1>(), 64);
         assert_eq!(offset_of!(StampHeaderV1, magic), 0);
         assert_eq!(offset_of!(StampHeaderV1, version), 8);
         assert_eq!(offset_of!(StampHeaderV1, kind), 10);
@@ -1379,6 +1431,7 @@ mod tests {
             offset_of!(SchedulerManifestTestStampV1, expected_scheduler_count),
             48
         );
+        assert_eq!(offset_of!(SchedulerManifestTestStampV1, legacy_entry), 56);
     }
 
     #[test]
@@ -1395,6 +1448,7 @@ mod tests {
                     manifest_dir: scheduler.manifest_dir.to_string(),
                     binary_kind: BinaryKindJson::Discover("scx-direct".to_string()),
                 }],
+                legacy_entry: 0,
             }],
         )
         .expect("reconstruct");

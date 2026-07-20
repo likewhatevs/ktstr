@@ -765,7 +765,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         static #manifest_entry_name:
             ::ktstr::test_support::SchedulerManifestTestStampV1 =
             ::ktstr::test_support::SchedulerManifestTestStampV1::new(
-                #name_str,
+                &#entry_name,
                 &[
                     #manifest_primary_scheduler,
                     #(#manifest_staged_schedulers),*

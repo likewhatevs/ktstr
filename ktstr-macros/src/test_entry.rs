@@ -25,7 +25,7 @@ pub(crate) fn expand(item: ItemStatic) -> syn::Result<TokenStream> {
         )]
         #[linkme(crate = ::ktstr::linkme)]
         static #stamp: ::ktstr::test_support::SchedulerManifestTestStampV1 =
-            ::ktstr::test_support::SchedulerManifestTestStampV1::from_manual_entry(
+            ::ktstr::test_support::SchedulerManifestTestStampV1::new(
                 &#entry,
                 &[
                     ::ktstr::test_support::SchedulerManifestUseStampV1::new(
