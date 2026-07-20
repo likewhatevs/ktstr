@@ -157,6 +157,29 @@ pub(crate) struct VmlinuxArtifacts {
     pub build_id: Option<Vec<u8>>,
 }
 
+/// Immutable vmlinux inputs prepared before a VM acquires host CPU/LLC
+/// admission or allocates guest memory.
+///
+/// A cold [`cached_vmlinux_artifacts`] call may wait behind the one
+/// cross-process sidecar builder for this kernel. Carrying both the resolved
+/// path and derived products through the run keeps that wait out of the
+/// admitted VM lifetime and lets every later consumer use the exact same
+/// artifact without another path lookup or cache rendezvous.
+pub(crate) struct PreparedVmlinux {
+    pub(crate) path: PathBuf,
+    pub(crate) artifacts: Arc<VmlinuxArtifacts>,
+}
+
+/// Resolve and derive the immutable vmlinux products needed by one VM run.
+///
+/// `None` preserves the existing graceful degradation when no matching
+/// vmlinux exists or its ELF/symbol products cannot be read.
+pub(crate) fn prepare_vmlinux(kernel_path: &Path) -> Option<PreparedVmlinux> {
+    let path = find_vmlinux(kernel_path)?;
+    let artifacts = cached_vmlinux_artifacts(&path)?;
+    Some(PreparedVmlinux { path, artifacts })
+}
+
 /// Extract the GNU build-id (`NT_GNU_BUILD_ID`, owner `"GNU"`) from a
 /// parsed vmlinux ELF's note headers. `None` when the note is absent
 /// (a build without `--build-id`) or unreadable.
@@ -998,6 +1021,48 @@ mod tests {
             psi_group_avg: 200,
             psi_irq_full_idx: Some(6),
         }
+    }
+
+    /// Preparing a VM resolves the sibling vmlinux and promotes its
+    /// cross-process sidecar into the process cache before admission. A
+    /// second preparation must reuse the exact same immutable artifact
+    /// allocation instead of parsing (or even decoding) it again.
+    #[test]
+    fn prepare_vmlinux_resolves_sidecar_and_reuses_artifacts() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
+        let entry = tmp.path().join("kentry");
+        std::fs::create_dir_all(&entry).unwrap();
+        let kernel = entry.join("bzImage");
+        std::fs::write(&kernel, b"fake-kernel").unwrap();
+        let vmlinux = entry.join("vmlinux");
+        std::fs::write(&vmlinux, b"not-an-elf").unwrap();
+        let canon = std::fs::canonicalize(&vmlinux).unwrap();
+
+        let original = VmlinuxArtifacts {
+            symbols: synthetic_symbols(),
+            all_symbols: synthetic_all_symbols(),
+            monitor: None,
+            guest_hz: Some(1000),
+            build_id: Some(vec![0xaa, 0xbb]),
+        };
+        write_artifacts_sidecar(&artifacts_sidecar_path(&canon), &original);
+        clear_vmlinux_cache_for_tests();
+
+        let first = prepare_vmlinux(&kernel).expect("fresh sidecar prepares vmlinux");
+        assert_eq!(first.path, vmlinux);
+        assert_eq!(first.artifacts.guest_hz, Some(1000));
+        assert_eq!(first.artifacts.build_id.as_deref(), Some(&[0xaa, 0xbb][..]));
+        assert_eq!(first.artifacts.all_symbols, original.all_symbols);
+
+        let second = prepare_vmlinux(&kernel).expect("second prepare hits process cache");
+        assert_eq!(second.path, first.path);
+        assert!(
+            Arc::ptr_eq(&first.artifacts, &second.artifacts),
+            "the second preparation must reuse the promoted artifact allocation",
+        );
     }
 
     /// Write the sidecar from a monitor-absent `VmlinuxArtifacts`, then

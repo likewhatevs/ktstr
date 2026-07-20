@@ -168,7 +168,9 @@ pub(crate) use vcpu::{
     BpfMapWriteParams, ImmediateExitVcpu, WatchBpfMapParams, pin_current_thread,
     register_vcpu_signal_handler, set_thread_cpumask, vcpu_signal,
 };
-pub(crate) use vmlinux::{cached_vmlinux_artifacts, cached_vmlinux_bytes, find_vmlinux};
+pub(crate) use vmlinux::{
+    cached_vmlinux_artifacts, cached_vmlinux_bytes, find_vmlinux, prepare_vmlinux,
+};
 
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
@@ -1322,6 +1324,18 @@ impl KtstrVm {
             eprintln!("  initramfs prepared: {:?}", start.elapsed());
         }
 
+        // Resolve every immutable vmlinux-derived product before exact
+        // topology admission, just like the initramfs above. A cold
+        // cross-process artifacts-sidecar miss elects one parser and blocks
+        // sibling cells behind it; doing that after admission would
+        // sequester CPU/LLC claims, resident guest memory, and already-spawned
+        // AP threads while no guest can run. It would also place the wait
+        // after `run_start`, falsely charging it to the guest watchdog.
+        let prepared_vmlinux = prepare_vmlinux(&self.kernel);
+        if dbg {
+            eprintln!("  vmlinux artifacts prepared: {:?}", start.elapsed());
+        }
+
         // Acquire the run-scoped host reservation before KVM VM creation,
         // guest-memory allocation, kernel load, and vCPU setup. Under the
         // lock-dir admission registry (see
@@ -1414,7 +1428,13 @@ impl KtstrVm {
         // default's fallback bind every affinity consumer to the exact CPU
         // pool protected by this invocation's LLC-SH/CPU-SH locks.
         let shared_cpu_mask = run_locks.shared_cpu_mask.as_deref();
-        let mut run = self.run_vm(run_start, vm, effective_plan, shared_cpu_mask)?;
+        let mut run = self.run_vm(
+            run_start,
+            vm,
+            effective_plan,
+            shared_cpu_mask,
+            prepared_vmlinux,
+        )?;
         // Default fallback may run fewer host CPUs than guest vCPUs. Record the
         // admitted pool rather than the build-time 1:1 capacity witness.
         let overcommit_budget = run_locks

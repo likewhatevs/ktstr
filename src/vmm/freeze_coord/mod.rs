@@ -40,7 +40,7 @@ use super::vcpu::{
     pin_current_thread, register_vcpu_signal_handler, self_arm_watchpoint, set_rt_priority,
     set_thread_cpumask, vcpu_signal,
 };
-use super::vmlinux::{cached_vmlinux_bytes, find_vmlinux};
+use super::vmlinux::{PreparedVmlinux, VmlinuxArtifacts, cached_vmlinux_bytes, find_vmlinux};
 use super::{
     KtstrVm, console, host_comms, vcpu_panic, virtio_blk, virtio_console, virtio_net, wire,
 };
@@ -4308,6 +4308,7 @@ impl KtstrVm {
         // no-perf mode and default fallback use it for every affinity consumer
         // so masks match the LLC-SH/CPU-SH locks held by this invocation.
         shared_cpu_mask: Option<&[usize]>,
+        prepared_vmlinux: Option<PreparedVmlinux>,
     ) -> Result<VmRunState> {
         let effective_placement =
             super::EffectiveRunPlacement::new(effective_pinning_plan, shared_cpu_mask);
@@ -5026,29 +5027,20 @@ impl KtstrVm {
         let kern_virt_kaslr: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
         let kern_virt_kaslr_evt = Arc::new(EventFd::new(0).expect("eventfd for kern_virt_kaslr"));
-        // Link-time KVAs from vmlinux for the two virt-KASLR
-        // derivation paths. Resolved once here so both the dispatch
-        // sinks (the KERN_ADDRS arm subtracts `_text` to derive)
-        // and `run_bsp_loop` (the BSP MSR_LSTAR path subtracts
-        // `entry_SYSCALL_64`) share a single source of truth.
-        // `find_vmlinux` is cheap path discovery; the
-        // `cached_vmlinux_artifacts` hit is shared with the monitor's
-        // later `start_monitor` lookup so the host pays the ELF read
-        // AND the symbol/BTF parse at most once per (path, mtime) per
-        // process. Both fields land 0 when the symbol is
-        // absent — `_text` only on extremely stripped vmlinux,
-        // `entry_SYSCALL_64` on aarch64 and non-x86_64 builds.
-        // Both paths short-circuit on a 0 link KVA, leaving the
-        // shared Arc at 0 (matches the KASLR-off semantics the
-        // nokaslr karg also produces). KASLR shifts every text
-        // symbol by the same `kaslr_offset`, so the two link
-        // KVAs back distinct derivations that produce identical
-        // offsets — guaranteeing the two writers don't race on
-        // different values.
-        let host_vmlinux_path: Option<std::path::PathBuf> = find_vmlinux(&self.kernel);
-        let host_vmlinux_artifacts = host_vmlinux_path
-            .as_ref()
-            .and_then(|p| super::vmlinux::cached_vmlinux_artifacts(p));
+        // Link-time KVAs from vmlinux for the two virt-KASLR derivation paths.
+        // The path and parsed products were prepared before topology
+        // admission, VM allocation, AP spawn, and `run_start`; a cold
+        // cross-process sidecar-builder wait therefore cannot sequester an
+        // admitted slot or consume the guest's watchdog budget. Dispatch,
+        // BSP KASLR derivation, the monitor, and failure-dump accessors all
+        // share this exact Arc. Both fields land 0 when the symbol is absent —
+        // `_text` only on extremely stripped vmlinux,
+        // `entry_SYSCALL_64` on aarch64 and non-x86_64 builds. Both paths
+        // short-circuit on a 0 link KVA, matching KASLR-off semantics.
+        let (host_vmlinux_path, host_vmlinux_artifacts) = match prepared_vmlinux {
+            Some(prepared) => (Some(prepared.path), Some(prepared.artifacts)),
+            None => (None, None),
+        };
         let host_kernel_symbols: Option<crate::monitor::symbols::KernelSymbols> =
             host_vmlinux_artifacts.as_ref().map(|a| a.symbols.clone());
         // This vmlinux's GNU build-id — compared in the KERN_BUILD_ID
@@ -5121,6 +5113,9 @@ impl KtstrVm {
         let periodic_window_end_for_coord = periodic_window_end_at.clone();
         let monitor_handle = self.start_monitor(
             &vm,
+            host_vmlinux_path
+                .as_deref()
+                .zip(host_vmlinux_artifacts.as_ref()),
             &kill,
             &kill_evt,
             run_start,
@@ -5512,9 +5507,9 @@ impl KtstrVm {
             .as_ref()
             .map(|cache| cache.symbols_arc());
         let freeze_coord_kernel_symbols = host_kernel_symbols.clone();
-        // Reuse the BTF and symbol products `cached_vmlinux_artifacts`
-        // already loaded above. In particular, a cross-process sidecar hit
-        // reconstructed this Arc<Btf> without reading the full vmlinux.
+        // Reuse the BTF and symbol products prepared before admission. In
+        // particular, a cross-process sidecar hit reconstructed this Arc<Btf>
+        // without reading the full vmlinux.
         // The coordinator previously discarded that result, eagerly read the
         // whole ELF, then parsed it twice more (`load_btf_from_bytes` and
         // `KernelSymbols::from_vmlinux_bytes`) in every VM process. Fast
@@ -15582,6 +15577,7 @@ impl KtstrVm {
     pub(super) fn start_monitor(
         &self,
         vm: &kvm::KtstrKvm,
+        prepared_vmlinux: Option<(&std::path::Path, &Arc<VmlinuxArtifacts>)>,
         kill: &Arc<AtomicBool>,
         kill_evt: &Arc<EventFd>,
         run_start: Instant,
@@ -15602,28 +15598,19 @@ impl KtstrVm {
         kern_addrs_frames: Arc<std::sync::atomic::AtomicU64>,
         kern_addrs_crc_bad: Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<Option<JoinHandle<monitor::reader::MonitorLoopResult>>> {
-        let Some(vmlinux) = find_vmlinux(&self.kernel) else {
+        // Immutable path + parsed products were resolved before topology
+        // admission and `run_start`, then threaded through `run_vm`. A cold
+        // cross-process cache wait must never hold an admitted VM or consume
+        // its watchdog budget. All products are owned, so this function only
+        // clones the pieces its monitor closure needs.
+        let Some((vmlinux, artifacts)) = prepared_vmlinux else {
             progress_ledger.publish_monitor_terminal();
             return Ok(None);
         };
-        // Parse the vmlinux once per (path, mtime) per process and
-        // share the derived products with the freeze-coord inline
-        // link-KVA path (which populated this same cache entry earlier
-        // in `run_vm`). The previous structure re-ran
-        // `goblin::elf::Elf::parse` over ~50 MB+ of vmlinux and
-        // `KernelSymbols::from_elf` here even though the inline path
-        // already did both — seconds of duplicate CPU per VM. The BTF
-        // parse (previously here, hitting `load_btf_from_elf` +
-        // `Btf::from_bytes` once) is now folded into the same cached
-        // parse so it still happens exactly once; the boot-window
-        // concern (early samples seeing the rq's pre-AP-online state
-        // when BTF was parsed twice) is preserved. All products are
-        // owned, so the monitor closure below clones them out of the
-        // shared `Arc` exactly as if it had parsed them itself.
-        let Some(artifacts) = super::vmlinux::cached_vmlinux_artifacts(&vmlinux) else {
-            progress_ledger.publish_monitor_terminal();
-            return Ok(None);
-        };
+        // The monitor closure outlives this borrowed run_vm call. Own the
+        // path before spawning it; the artifact Arc is cloned into owned
+        // monitor products below.
+        let vmlinux = vmlinux.to_path_buf();
         // `monitor: None` means the BTF load or `KernelOffsets`
         // resolution failed — no monitor thread, matching the pre-cache
         // `load_btf_from_elf` / `from_btf` early returns. `symbols`
@@ -15652,7 +15639,7 @@ impl KtstrVm {
         let watch_vmlinux_data = if self.watch_bpf_maps.is_empty() {
             None
         } else {
-            match super::vmlinux::cached_vmlinux_bytes(&vmlinux) {
+            match cached_vmlinux_bytes(&vmlinux) {
                 Some(data) => Some(data),
                 None => {
                     progress_ledger.publish_monitor_terminal();
