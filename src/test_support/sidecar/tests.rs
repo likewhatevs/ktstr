@@ -2200,7 +2200,10 @@ fn epoch_reset_never_publishes_after_an_unlink_failure() {
         message.contains("remove prior-epoch artifact"),
         "unlink failure must retain reset context: {message}",
     );
-    assert!(stale.exists(), "the injected unlink failure leaves its victim");
+    assert!(
+        stale.exists(),
+        "the injected unlink failure leaves its victim"
+    );
     assert_eq!(
         std::fs::read_to_string(dir.join(SESSION_SENTINEL)).unwrap(),
         "epoch-old",
@@ -2232,7 +2235,10 @@ fn raw_reset_continues_after_an_unlink_failure() {
         }
     })
     .expect("raw reset remains best-effort");
-    assert!(blocked.exists(), "the injected raw failure leaves its victim");
+    assert!(
+        blocked.exists(),
+        "the injected raw failure leaves its victim"
+    );
     assert!(
         !removable.exists(),
         "a failed raw unlink must not stop the rest of the sweep",
@@ -2297,13 +2303,12 @@ fn matching_epoch_publication_cannot_cross_epoch_reset() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(super::SESSION_SENTINEL), b"epoch-A").unwrap();
 
-    let (writer_guard, writer_mode) =
-        super::acquire_run_dir_publication_lock_with_timeout(
-            &dir,
-            Some("epoch-A"),
-            std::time::Duration::from_secs(2),
-        )
-        .expect("epoch-A writer acquire");
+    let (writer_guard, writer_mode) = super::acquire_run_dir_publication_lock_with_timeout(
+        &dir,
+        Some("epoch-A"),
+        std::time::Duration::from_secs(2),
+    )
+    .expect("epoch-A writer acquire");
     assert_eq!(writer_mode, crate::flock::FlockMode::Shared);
 
     let race = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -3531,10 +3536,9 @@ fn finalize_sidecar_verdict_records_inversion_and_no_ops_ordinary() {
     let _lock = lock_env();
     let tmp = tempfile::TempDir::new().unwrap();
     let _override = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, tmp.path());
-    let _override_anchor =
-        try_run_dir_flock(tmp.path(), crate::flock::FlockMode::Exclusive)
-            .expect("open override rail anchor")
-            .expect("fresh override rail anchor");
+    let _override_anchor = try_run_dir_flock(tmp.path(), crate::flock::FlockMode::Exclusive)
+        .expect("open override rail anchor")
+        .expect("fresh override rail anchor");
     // A raw Fail sidecar finalized to Pass (an expect_err inversion):
     // the verdict bits flip to pass AND expected_failure is set (so
     // `perf-delta` still excludes the failure-mode telemetry).
@@ -3629,15 +3633,9 @@ fn finalize_holds_shared_epoch_rail_through_rename_and_cannot_cross_reset() {
 
     // A late epoch-A finalizer must observe B under SH and return before it
     // can recreate the path that B's reset removed.
-    finalize_sidecar_verdict_inner(
-        &path,
-        true,
-        false,
-        false,
-        true,
-        Some("epoch-A"),
-        || panic!("stale finalizer must not reach rename"),
-    );
+    finalize_sidecar_verdict_inner(&path, true, false, false, true, Some("epoch-A"), || {
+        panic!("stale finalizer must not reach rename")
+    });
     assert!(
         !path.exists(),
         "a stale finalizer must not recreate its sidecar after reset",

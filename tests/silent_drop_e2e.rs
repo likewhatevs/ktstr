@@ -127,9 +127,7 @@ fn check_captured_emit_schema(result: &VmResult) -> Result<()> {
         .get("schema")
         .and_then(|s| s.as_str())
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "dump JSON missing top-level `schema` field; {dump_artifact}"
-            )
+            anyhow::anyhow!("dump JSON missing top-level `schema` field; {dump_artifact}")
         })?;
     anyhow::ensure!(
         schema == SCHEMA_SINGLE,

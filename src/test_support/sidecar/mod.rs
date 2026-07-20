@@ -3672,9 +3672,7 @@ fn reset_run_dir_for_session(
     dir: &std::path::Path,
     session_token: Option<&str>,
 ) -> anyhow::Result<()> {
-    reset_run_dir_for_session_with_remover(dir, session_token, |path| {
-        std::fs::remove_file(path)
-    })
+    reset_run_dir_for_session_with_remover(dir, session_token, |path| std::fs::remove_file(path))
 }
 
 /// Testable implementation of [`reset_run_dir_for_session`].
@@ -3900,8 +3898,7 @@ fn acquire_run_dir_publication_lock_with_timeout(
         // Unlocked read is only a fast-path hint. The matching result is
         // authoritative only after the shared acquire and recheck below.
         if session_sentinel_matches(dir, token) {
-            let shared =
-                acquire_run_dir_flock_mode_with_timeout(dir, FlockMode::Shared, timeout)?;
+            let shared = acquire_run_dir_flock_mode_with_timeout(dir, FlockMode::Shared, timeout)?;
             if session_sentinel_matches(dir, token) {
                 return Ok((shared, FlockMode::Shared));
             }
