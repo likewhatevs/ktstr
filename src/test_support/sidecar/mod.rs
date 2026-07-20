@@ -1546,14 +1546,13 @@ pub(crate) struct FailedTest {
     /// multiple failing variants this is a representative one; the
     /// full per-variant set is in `stats_sidecars`.
     pub(crate) topology: Option<String>,
-    /// `{test}-{variant_hash}.failure-dump.json` for whichever variant
-    /// the run-dir scan classified last (unsorted read_dir order);
-    /// single-slot. The fail signal keys off the per-variant
-    /// `dump_hashes` set, not this path.
-    pub(crate) failure_dump: Option<PathBuf>,
-    /// `{test}-{variant_hash}.repro.failure-dump.json` for whichever
-    /// variant the scan classified last (auto-repro retry).
-    pub(crate) repro_failure_dump: Option<PathBuf>,
+    /// Every primary failure dump for this test, sorted. This includes
+    /// attempt-qualified nextest retry archives as well as the final
+    /// attempt's canonical path.
+    pub(crate) failure_dumps: Vec<PathBuf>,
+    /// Every auto-repro failure dump for this test, sorted, including
+    /// attempt-qualified nextest retry archives.
+    pub(crate) repro_failure_dumps: Vec<PathBuf>,
     /// Every `{test}-{variant_hash}.ktstr.json` stats sidecar for
     /// this test, sorted — one per gauntlet variant (distinct
     /// variant hashes coexist). Empty for a dump-only failure.
@@ -1668,11 +1667,12 @@ fn split_variant_stem(stem: &str) -> (&str, u64) {
 /// is ALWAYS variant-keyed by [`write_sidecar`], so a non-hashed one is
 /// malformed and is dropped (`None`).
 ///
-/// Suffix order is load-bearing: the `.repro.` shapes are checked
-/// BEFORE their bare counterparts so `{test}-{hash}.repro.failure-dump.json`
-/// classifies as [`RunArtifactKind::ReproFailureDump`] with
-/// `test_name = {test}` rather than the bare-`.failure-dump.json`
-/// branch stripping less and yielding `{test}-{hash}.repro`.
+/// Failure dumps may include an attempt archive suffix:
+/// `{test}-{hash}.attempt-N.failure-dump.json` or
+/// `{test}-{hash}.repro.attempt-N.failure-dump.json`. The attempt is
+/// intentionally not part of variant identity: every retry is the
+/// same nextest test variant and is correlated with the same stats
+/// sidecar hash.
 fn classify_run_artifact(name: &str) -> Option<(&str, u64, RunArtifactKind)> {
     if let Some(stem) = name.strip_suffix(".host-skip.json") {
         let (test, hash) = split_variant_stem(stem);
@@ -1686,13 +1686,24 @@ fn classify_run_artifact(name: &str) -> Option<(&str, u64, RunArtifactKind)> {
         let (test, hash) = split_variant_stem(stem);
         return Some((test, hash, RunArtifactKind::ExpectErrLoad));
     }
-    if let Some(stem) = name.strip_suffix(".repro.failure-dump.json") {
-        let (test, hash) = split_variant_stem(stem);
-        return Some((test, hash, RunArtifactKind::ReproFailureDump));
-    }
     if let Some(stem) = name.strip_suffix(".failure-dump.json") {
+        let stem = match stem.rsplit_once(".attempt-") {
+            Some((base, attempt))
+                if attempt
+                    .parse::<u32>()
+                    .ok()
+                    .is_some_and(|attempt| attempt > 0) =>
+            {
+                base
+            }
+            _ => stem,
+        };
+        let (stem, kind) = match stem.strip_suffix(".repro") {
+            Some(base) => (base, RunArtifactKind::ReproFailureDump),
+            None => (stem, RunArtifactKind::FailureDump),
+        };
         let (test, hash) = split_variant_stem(stem);
-        return Some((test, hash, RunArtifactKind::FailureDump));
+        return Some((test, hash, kind));
     }
     if let Some(stem) = name.strip_suffix(".repro.wprof.pb") {
         let (test, hash) = split_variant_stem(stem);
@@ -1740,13 +1751,11 @@ fn summarize_one_run_dir(
     use std::collections::{BTreeMap, BTreeSet};
     #[derive(Default)]
     struct Acc {
-        // The writer names these per-variant (hashed, `{test}-{hash}.…`);
-        // each is a single Option collapsed to whichever variant the
-        // read_dir scan classified last (unsorted order). The fail
-        // signal below does NOT rely on them — it keys off the
-        // per-variant `dump_hashes` set.
-        failure_dump: Option<PathBuf>,
-        repro_failure_dump: Option<PathBuf>,
+        // Every per-variant dump, including nextest attempt archives.
+        // The fail signal below keys off `dump_hashes`; these vectors
+        // retain all concrete evidence paths for the footer.
+        failure_dumps: Vec<PathBuf>,
+        repro_failure_dumps: Vec<PathBuf>,
         wprof: Option<PathBuf>,
         repro_wprof: Option<PathBuf>,
         // EVERY variant's stats sidecar (distinct variant-hash
@@ -1811,11 +1820,11 @@ fn summarize_one_run_dir(
         match kind {
             RunArtifactKind::FailureDump => {
                 acc.dump_hashes.insert(variant_hash);
-                acc.failure_dump = Some(path);
+                acc.failure_dumps.push(path);
             }
             RunArtifactKind::ReproFailureDump => {
                 acc.dump_hashes.insert(variant_hash);
-                acc.repro_failure_dump = Some(path);
+                acc.repro_failure_dumps.push(path);
             }
             RunArtifactKind::Wprof => {
                 wprof_traces += 1;
@@ -1938,13 +1947,15 @@ fn summarize_one_run_dir(
         };
         // Sort so the rendered footer is deterministic regardless of
         // `read_dir` order.
+        acc.failure_dumps.sort();
+        acc.repro_failure_dumps.sort();
         acc.stats_sidecars.sort();
         failed.push(FailedTest {
             test_name,
             scheduler,
             topology,
-            failure_dump: acc.failure_dump,
-            repro_failure_dump: acc.repro_failure_dump,
+            failure_dumps: acc.failure_dumps,
+            repro_failure_dumps: acc.repro_failure_dumps,
             stats_sidecars: acc.stats_sidecars,
             wprof: acc.wprof,
             repro_wprof: acc.repro_wprof,
@@ -2039,10 +2050,10 @@ pub fn format_run_artifact_footer(
                 _ => String::new(),
             };
             out.push_str(&format!("    FAILED  {}{variant}\n", f.test_name));
-            if let Some(p) = &f.failure_dump {
+            for p in &f.failure_dumps {
                 out.push_str(&format!("      {:<13} {}\n", "failure dump", p.display()));
             }
-            if let Some(p) = &f.repro_failure_dump {
+            for p in &f.repro_failure_dumps {
                 out.push_str(&format!("      {:<13} {}\n", "repro dump", p.display()));
             }
             for p in &f.stats_sidecars {
@@ -3455,10 +3466,8 @@ fn finalize_sidecar_verdict_inner<F>(
     }
 }
 
-/// Remove the failure-dump artifacts
-/// (`{test}-{variant_hash}.failure-dump.json` and
-/// `{test}-{variant_hash}.repro.failure-dump.json`) for `test_name` in
-/// the current sidecar dir.
+/// Remove every failure-dump artifact for this exact test variant,
+/// including nextest retry archives.
 ///
 /// Called when a run's FINAL outcome is a pass/skip but it wrote NO
 /// sidecar — the run crashed before the guest produced a parseable
@@ -3473,11 +3482,26 @@ fn finalize_sidecar_verdict_inner<F>(
 /// (final = Fail) does NOT call this, so its dump still flags.
 pub(crate) fn suppress_failure_dumps(test_name: &str, variant_hash: u64) {
     let dir = sidecar_dir();
-    // Remove THIS variant's dumps by the precise `{test}-{hash}` key, not
-    // a `{test}-*` glob: a glob would also delete a SIBLING gauntlet
-    // preset's legitimately-failing dump in the same run dir.
-    for suffix in [".failure-dump.json", ".repro.failure-dump.json"] {
-        let _ = std::fs::remove_file(dir.join(format!("{test_name}-{variant_hash:016x}{suffix}")));
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some((candidate, hash, kind)) = classify_run_artifact(name) else {
+            continue;
+        };
+        if candidate == test_name
+            && hash == variant_hash
+            && matches!(
+                kind,
+                RunArtifactKind::FailureDump | RunArtifactKind::ReproFailureDump
+            )
+        {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 

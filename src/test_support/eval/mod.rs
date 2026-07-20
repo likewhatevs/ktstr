@@ -323,6 +323,81 @@ fn primary_failure_dump_path(entry_name: &str, variant_hash: u64) -> std::path::
     ))
 }
 
+/// The 1-indexed nextest attempt number for this test process.
+///
+/// Nextest gives every retry its own process and exports
+/// `NEXTEST_ATTEMPT`. A direct invocation (or an older runner) has no
+/// variable and retains the historical single-attempt behavior.
+fn nextest_attempt() -> Option<u32> {
+    let raw = std::env::var_os("NEXTEST_ATTEMPT")?;
+    match raw.to_str().and_then(|s| s.parse::<u32>().ok()) {
+        Some(attempt) if attempt > 0 => Some(attempt),
+        _ => {
+            tracing::warn!(
+                value = %raw.to_string_lossy(),
+                "eval: ignoring invalid NEXTEST_ATTEMPT"
+            );
+            None
+        }
+    }
+}
+
+/// Insert `.attempt-{attempt}` immediately before
+/// `.failure-dump.json`.
+///
+/// This preserves the final suffix consumed by the CI artifact glob
+/// while handling both primary and repro shapes uniformly:
+///
+/// - `t-H.failure-dump.json` -> `t-H.attempt-1.failure-dump.json`
+/// - `t-H.repro.failure-dump.json` ->
+///   `t-H.repro.attempt-1.failure-dump.json`
+fn archived_failure_dump_path(path: &std::path::Path, attempt: u32) -> std::path::PathBuf {
+    const SUFFIX: &str = ".failure-dump.json";
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return path.with_extension(format!("attempt-{attempt}.failure-dump.json"));
+    };
+    let stem = name.strip_suffix(SUFFIX).unwrap_or(name);
+    path.with_file_name(format!("{stem}.attempt-{attempt}{SUFFIX}"))
+}
+
+/// Make the canonical failure-dump path available for `attempt`
+/// without destroying evidence from the preceding nextest attempt.
+///
+/// Within one attempt the path remains stable because guest code,
+/// post-VM callbacks, and the freeze coordinator all resolve the
+/// canonical filename. At retry startup the preceding process is
+/// already gone, so a same-directory rename is an atomic, zero-copy
+/// handoff to the attempt-qualified archive.
+fn prepare_failure_dump_path(path: &std::path::Path, attempt: Option<u32>) {
+    let Some(previous_attempt) = attempt
+        .filter(|attempt| *attempt > 1)
+        .map(|attempt| attempt - 1)
+    else {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "eval: failed to pre-clear stale failure-dump file"
+            ),
+        }
+        return;
+    };
+
+    let archive = archived_failure_dump_path(path, previous_attempt);
+    match std::fs::rename(path, &archive) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            path = %path.display(),
+            archive = %archive.display(),
+            error = %e,
+            "eval: failed to preserve preceding attempt's failure-dump"
+        ),
+    }
+}
+
 /// Read the primary VM's `scx_sched_state.exit_kind` from its
 /// failure-dump JSON. `None` when the dump is absent/unparseable or
 /// lacks the field — the caller treats `None` as "not a stall" and
@@ -373,9 +448,6 @@ fn read_primary_exit_kind(entry_name: &str, variant_hash: u64) -> Option<u64> {
 /// normal stderr path; the stub is a best-effort augment, so the
 /// helper does not propagate any io::Error.
 fn write_placeholder_failure_dump_if_missing(path: &std::path::Path, result: &vmm::VmResult) {
-    if path.exists() {
-        return;
-    }
     let stage_label =
         crate::test_support::output::classify_init_stage(result.guest_messages.as_ref());
     // Fold BUG SUMMARY into the on-disk reason so the disk artifact
@@ -389,7 +461,7 @@ fn write_placeholder_failure_dump_if_missing(path: &std::path::Path, result: &vm
     };
     let raw_dump = extract_sched_ext_dump(&result.stderr).unwrap_or_default();
     let bug_summary = crate::test_support::output::extract_bug_summary(sched_log_input, &raw_dump);
-    let reason = match bug_summary {
+    let mut reason = match bug_summary {
         Some(s) => format!(
             "test failed at stage `{stage_label}`; no BPF state captured \
              (probe did not attach before failure). BUG SUMMARY: {s}"
@@ -399,6 +471,77 @@ fn write_placeholder_failure_dump_if_missing(path: &std::path::Path, result: &vm
              (probe did not attach before failure)"
         ),
     };
+    if let Some(diagnostic) = failure_dump_runtime_diagnostic(result)
+        && !reason.contains(&diagnostic)
+    {
+        reason.push_str(". RUNTIME DIAGNOSTIC: ");
+        reason.push_str(&diagnostic);
+    }
+    write_placeholder_failure_dump_reason_if_missing(path, reason);
+}
+
+const MAX_FAILURE_DUMP_DIAGNOSTIC_BYTES: usize = 4096;
+
+fn bounded_failure_dump_diagnostic(value: &str) -> String {
+    if value.len() <= MAX_FAILURE_DUMP_DIAGNOSTIC_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_FAILURE_DUMP_DIAGNOSTIC_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [truncated]", &value[..end])
+}
+
+/// Preserve crash/error evidence that otherwise exists only in
+/// nextest's stdout/stderr stream. Prefer the structured panic/crash
+/// field, then retain diagnostic lines for fatal signals and host/guest
+/// protocol failures.
+fn failure_dump_runtime_diagnostic(result: &vmm::VmResult) -> Option<String> {
+    if let Some(crash) = result
+        .crash_message
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Some(bounded_failure_dump_diagnostic(crash.trim()));
+    }
+
+    const MARKERS: [&str; 7] = [
+        "sigsegv",
+        "fatal signal",
+        "segmentation fault",
+        "queue designated",
+        "ktstr fatal",
+        "panic:",
+        "protocol",
+    ];
+    for stream in [&result.stderr, &result.output] {
+        let selected = stream
+            .lines()
+            .filter(|line| {
+                let lower = line.to_ascii_lowercase();
+                MARKERS.iter().any(|marker| lower.contains(marker))
+            })
+            .take(8)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !selected.is_empty() {
+            return Some(bounded_failure_dump_diagnostic(&selected));
+        }
+    }
+    None
+}
+
+/// Atomically write a placeholder carrying an already-classified
+/// reason. This lower-level form is also used when `build()` or `run()`
+/// returns an error before a [`vmm::VmResult`] exists.
+fn write_placeholder_failure_dump_reason_if_missing(
+    path: &std::path::Path,
+    reason: impl Into<String>,
+) {
+    if path.exists() {
+        return;
+    }
     let stub = crate::monitor::dump::FailureDumpReport::placeholder(reason);
     let json = match serde_json::to_string_pretty(&stub) {
         Ok(j) => j,
@@ -699,37 +842,19 @@ fn run_ktstr_test_inner_impl(
 
     let no_perf_mode = super::runtime::no_perf_mode_for_entry(entry);
 
-    // Pre-clear stale failure-dump files before the primary VM
-    // boots. A passing rerun after a prior failed invocation must
-    // not be masked by the prior failure's leftovers — the E2E
-    // test (`tests/failure_dump_e2e.rs`) reads from the primary
-    // path and an operator inspecting the sidecar dir looks at
-    // both. Both files are variant-keyed per test
-    // (`{name}-{variant_hash}.failure-dump.json` and
-    // `{name}-{variant_hash}.repro.failure-dump.json`), so we can
-    // safely unlink both from this single primary-dispatch
-    // entry — auto-repro fires only after a primary failure
-    // emits a dump, so any repro file present here is stale by
-    // construction. NotFound is silenced; other unlink errors
-    // emit `tracing::warn!` and dispatch proceeds (the freeze
-    // coord's own write would overwrite a stale file in
-    // practice; the warn flags permission / fs anomalies for the
-    // operator).
+    // Make the canonical primary/repro paths available before boot.
+    // Direct and first-attempt runs clear stale files as before.
+    // Nextest retries atomically archive the preceding attempt first,
+    // preserving its useful dump even when this attempt fails earlier
+    // and can produce only an init-never placeholder.
     let primary_dump_path = primary_failure_dump_path(entry.name, variant_hash);
     let repro_dump_path = super::sidecar::sidecar_dir().join(format!(
         "{}-{variant_hash:016x}.repro.failure-dump.json",
         entry.name
     ));
+    let attempt = nextest_attempt();
     for stale in [&primary_dump_path, &repro_dump_path] {
-        match std::fs::remove_file(stale) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!(
-                path = %stale.display(),
-                error = %e,
-                "eval: failed to pre-clear stale failure-dump file"
-            ),
-        }
+        prepare_failure_dump_path(stale, attempt);
     }
 
     // Attach the primary failure-dump JSON sink at this dispatch
@@ -1173,6 +1298,15 @@ fn run_ktstr_test_inner_impl(
                         &resolved_topology,
                         class,
                     );
+                } else {
+                    write_placeholder_failure_dump_reason_if_missing(
+                        &primary_dump_path,
+                        format!(
+                            "host failed before VM result at stage `build ktstr_test VM`; \
+                             RUNTIME DIAGNOSTIC: {}",
+                            bounded_failure_dump_diagnostic(&format!("{e:#}"))
+                        ),
+                    );
                 }
                 return Err(e.context("build ktstr_test VM"));
             }
@@ -1187,6 +1321,15 @@ fn run_ktstr_test_inner_impl(
                         entry,
                         &resolved_topology,
                         class,
+                    );
+                } else {
+                    write_placeholder_failure_dump_reason_if_missing(
+                        &primary_dump_path,
+                        format!(
+                            "host failed before VM result at stage `run ktstr_test VM`; \
+                             RUNTIME DIAGNOSTIC: {}",
+                            bounded_failure_dump_diagnostic(&format!("{e:#}"))
+                        ),
                     );
                 }
                 Err(e.context("run ktstr_test VM"))

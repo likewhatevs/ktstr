@@ -3416,6 +3416,14 @@ fn classify_run_artifact_recognizes_each_shape() {
         Some(("t", 0xa, RunArtifactKind::ReproFailureDump))
     ));
     assert!(matches!(
+        classify_run_artifact("t-000000000000000a.attempt-2.failure-dump.json"),
+        Some(("t", 0xa, RunArtifactKind::FailureDump))
+    ));
+    assert!(matches!(
+        classify_run_artifact("t-000000000000000a.repro.attempt-3.failure-dump.json"),
+        Some(("t", 0xa, RunArtifactKind::ReproFailureDump))
+    ));
+    assert!(matches!(
         classify_run_artifact("t-000000000000000a.wprof.pb"),
         Some(("t", 0xa, RunArtifactKind::Wprof))
     ));
@@ -3472,8 +3480,36 @@ fn summarize_detects_dump_only_failure_without_sidecar() {
     assert_eq!(f.test_name, "load_fail");
     assert!(f.scheduler.is_none());
     assert!(f.topology.is_none());
-    assert!(f.failure_dump.is_some());
+    assert_eq!(f.failure_dumps.len(), 1);
     assert!(!f.replayable);
+}
+
+#[test]
+fn summarize_retains_every_retry_attempt_dump() {
+    let root = tempfile::TempDir::new().unwrap();
+    let run = root.path().join("7.1.0-abc1234");
+    std::fs::create_dir(&run).unwrap();
+    for name in [
+        "retried-000000000000000a.attempt-1.failure-dump.json",
+        "retried-000000000000000a.attempt-2.failure-dump.json",
+        "retried-000000000000000a.failure-dump.json",
+        "retried-000000000000000a.repro.attempt-1.failure-dump.json",
+    ] {
+        std::fs::write(run.join(name), b"{}").unwrap();
+    }
+
+    let summaries = summarize_run_artifacts(root.path(), std::time::UNIX_EPOCH);
+    let failed = &summaries[0].failed[0];
+    assert_eq!(failed.test_name, "retried");
+    assert_eq!(failed.failure_dumps.len(), 3);
+    assert_eq!(failed.repro_failure_dumps.len(), 1);
+    assert!(
+        failed
+            .failure_dumps
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]),
+        "attempt paths must render in deterministic order",
+    );
 }
 
 #[test]
@@ -3697,6 +3733,16 @@ fn suppress_failure_dumps_removes_only_named_tests_dumps() {
     )
     .unwrap();
     std::fs::write(
+        dir.join("crashpass-000000000000000a.attempt-1.failure-dump.json"),
+        b"{}",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("crashpass-000000000000000a.repro.attempt-1.failure-dump.json"),
+        b"{}",
+    )
+    .unwrap();
+    std::fs::write(
         dir.join("crashpass-000000000000000b.failure-dump.json"),
         b"{}",
     )
@@ -3709,6 +3755,14 @@ fn suppress_failure_dumps_removes_only_named_tests_dumps() {
     );
     assert!(
         !dir.join("crashpass-000000000000000a.repro.failure-dump.json")
+            .exists()
+    );
+    assert!(
+        !dir.join("crashpass-000000000000000a.attempt-1.failure-dump.json")
+            .exists()
+    );
+    assert!(
+        !dir.join("crashpass-000000000000000a.repro.attempt-1.failure-dump.json")
             .exists()
     );
     assert!(
