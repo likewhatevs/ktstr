@@ -1,6 +1,6 @@
 //! Cross-process host-resource admission under nextest.
 //!
-//! Every ktstr process sharing a lock directory participates in one v6
+//! Every ktstr process sharing a lock directory participates in one v7
 //! fixed-record mmap registry. A ticket publishes one exact, non-empty CPU/LLC
 //! reservation claim plus the resources its planner may watch. Claims preserve
 //! the resource-lock semantics exactly: CPU and LLC claims independently use
@@ -206,7 +206,7 @@ const TEST_RETRY_WAKE_MARKER: &str = ".ktstr-test-retry-wake";
 
 /// Directory the protocol files live in — derived from the LLC
 /// lockfile path so the test-only lock-prefix override isolates the
-/// v6 registry files into the same per-test tempdir as the LLC locks
+/// v7 registry files into the same per-test tempdir as the LLC locks
 /// they coordinate.
 fn protocol_dir() -> PathBuf {
     Path::new(&super::llc_lock_path(0))
@@ -1166,15 +1166,18 @@ pub(crate) fn exercise_candidate_ready_matrix_for_tests() -> Result<()> {
 }
 
 #[cfg(test)]
-pub(crate) fn claim_from_resource_modes_for_tests(
-    resources: impl IntoIterator<Item = (ResourceKey, FlockMode)>,
-) -> Result<ClaimSet> {
-    claim_from_resource_modes(resources.into_iter().collect())
+pub(crate) fn registry_initializer_temp_count_for_tests() -> Result<usize> {
+    registry::initializer_temp_count_for_tests()
 }
 
 #[cfg(test)]
-pub(crate) fn registry_initializer_temp_count_for_tests() -> Result<usize> {
-    registry::initializer_temp_count_for_tests()
+pub(crate) fn observer_preserves_uninitialized_header_for_tests() -> Result<bool> {
+    registry::observer_preserves_uninitialized_header_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_zeroed_uninitialized_header_for_tests() -> Result<()> {
+    registry::prepare_zeroed_uninitialized_header_for_tests()
 }
 
 #[cfg(test)]
@@ -1230,9 +1233,7 @@ pub(crate) fn exercise_registry_high_water_for_tests(waiters: usize) -> Result<u
             &BTreeSet::new(),
             &BTreeSet::new(),
             false,
-            None,
             &[],
-            None,
             &[],
             false,
             None,
@@ -1250,6 +1251,13 @@ pub(crate) fn exercise_registry_high_water_for_tests(waiters: usize) -> Result<u
     Ok(snapshot.len())
 }
 
+#[cfg(test)]
+pub(crate) fn exercise_granted_only_drain_election_reads_for_tests(
+    waiters: usize,
+) -> Result<usize> {
+    registry::exercise_granted_only_drain_election_reads_for_tests(waiters)
+}
+
 /// Register one exact, non-empty priority claim in the fixed-record registry.
 /// Only the elected coordinator scans records and routes grants; ordinary
 /// waiters sleep on their own shared futex word and therefore add neither a
@@ -1260,36 +1268,7 @@ pub(crate) fn register_ticket_or_acquire<T>(
     cancelled: Option<&AtomicBool>,
     try_acquire: impl FnMut(&mut GrantedProbe) -> Result<Option<T>>,
 ) -> Result<TicketWork<T>> {
-    register_ticket_or_acquire_impl(
-        initial_claim,
-        watch_claim,
-        None,
-        None::<fn()>,
-        cancelled,
-        try_acquire,
-    )
-}
-
-/// Register the ticket, then run `after_publish` before inspecting its state or
-/// invoking an acquisition callback. The hook is the acquire-before-release
-/// handoff point for reservations inherited from an earlier phase: the new
-/// exact record is already durable, so releasing the old flocks cannot create
-/// an unclaimed interval.
-pub(crate) fn register_ticket_or_acquire_after_publish<T>(
-    initial_claim: ClaimSet,
-    watch_claim: ClaimSet,
-    cancelled: Option<&AtomicBool>,
-    after_publish: impl FnOnce(),
-    try_acquire: impl FnMut(&mut GrantedProbe) -> Result<Option<T>>,
-) -> Result<TicketWork<T>> {
-    register_ticket_or_acquire_impl(
-        initial_claim,
-        watch_claim,
-        None,
-        Some(after_publish),
-        cancelled,
-        try_acquire,
-    )
+    register_ticket_or_acquire_impl(initial_claim, watch_claim, None, cancelled, try_acquire)
 }
 
 pub(crate) fn register_ticket_after_contention<T>(
@@ -1303,7 +1282,6 @@ pub(crate) fn register_ticket_after_contention<T>(
         initial_claim,
         watch_claim,
         Some(contention.into()),
-        None::<fn()>,
         cancelled,
         try_acquire,
     )
@@ -1320,41 +1298,18 @@ pub(crate) fn register_ticket_after_contentions<T>(
         initial_claim,
         watch_claim,
         Some(contention),
-        None::<fn()>,
         cancelled,
         try_acquire,
     )
 }
 
-pub(crate) fn register_ticket_after_contentions_and_publish<T>(
-    initial_claim: ClaimSet,
-    watch_claim: ClaimSet,
-    contention: ContentionSet,
-    cancelled: Option<&AtomicBool>,
-    after_publish: impl FnOnce(),
-    try_acquire: impl FnMut(&mut GrantedProbe) -> Result<Option<T>>,
-) -> Result<TicketWork<T>> {
-    register_ticket_or_acquire_impl(
-        initial_claim,
-        watch_claim,
-        Some(contention),
-        Some(after_publish),
-        cancelled,
-        try_acquire,
-    )
-}
-
-fn register_ticket_or_acquire_impl<T, H>(
+fn register_ticket_or_acquire_impl<T>(
     initial_claim: ClaimSet,
     watch_claim: ClaimSet,
     initial_contention: Option<ContentionSet>,
-    after_publish: Option<H>,
     cancelled: Option<&AtomicBool>,
     mut try_acquire: impl FnMut(&mut GrantedProbe) -> Result<Option<T>>,
-) -> Result<TicketWork<T>>
-where
-    H: FnOnce(),
-{
+) -> Result<TicketWork<T>> {
     check_interrupted(cancelled)?;
     let mut ticket = check_result(
         registry::Ticket::register_after_contention(
@@ -1365,9 +1320,6 @@ where
         ),
         cancelled,
     )?;
-    if let Some(after_publish) = after_publish {
-        after_publish();
-    }
     let stagger = Duration::from_millis((std::process::id() as u64 * 37) % 1000);
     loop {
         super::tick_reservation_wait_progress();
@@ -1434,6 +1386,7 @@ pub(crate) struct HeldLocks {
     watch: Option<ClaimSet>,
     predecessors: Option<registry::AggregateSnapshot>,
     availability: Option<registry::AvailabilitySnapshot>,
+    commit_token: Option<registry::CoordinatorCommitToken>,
 }
 
 impl HeldLocks {
@@ -1441,6 +1394,7 @@ impl HeldLocks {
         self.watch = Some(snapshot.candidate_watch.clone());
         self.predecessors = Some(snapshot.predecessors.clone());
         self.availability = Some(snapshot.availability.clone());
+        self.commit_token = Some(snapshot.commit_token);
     }
 
     /// Whether one complete alternative is ready according to the same
@@ -1468,15 +1422,39 @@ impl HeldLocks {
         availability.allows(candidate)
     }
 
+    /// Probe one exact physical target only when the current mode-aware
+    /// predecessor and availability snapshots license its claim.
+    pub(crate) fn probe_complete_if_ready(
+        &mut self,
+        claim: &ClaimSet,
+        target: &[ResourceLock],
+    ) -> Result<Option<Vec<OwnedFd>>> {
+        validate_probe_target(claim, target)?;
+        if !self.candidate_ready(claim)? {
+            return Ok(None);
+        }
+        self.probe_complete_inner(target)
+    }
+
+    fn commit_token(&self) -> Result<registry::CoordinatorCommitToken> {
+        self.commit_token
+            .ok_or_else(|| anyhow::anyhow!("coordinator commit snapshot is missing"))
+    }
+
     /// All-or-nothing nonblocking probe of `candidate`.
     ///
     /// On success the complete fd set is returned in candidate order. On
     /// failure every fd acquired by this attempt is dropped before returning,
     /// while exact blocker evidence remains live until the registry update.
+    #[cfg(test)]
     pub(crate) fn probe_complete(
         &mut self,
         candidate: &[ResourceLock],
     ) -> Result<Option<Vec<OwnedFd>>> {
+        self.probe_complete_inner(candidate)
+    }
+
+    fn probe_complete_inner(&mut self, candidate: &[ResourceLock]) -> Result<Option<Vec<OwnedFd>>> {
         let mut fresh = Vec::with_capacity(candidate.len());
         for lock in candidate {
             match try_flock_with_witness(&lock.path, lock.mode)? {
@@ -1509,38 +1487,52 @@ impl HeldLocks {
     }
 }
 
-#[cfg(test)]
-fn claim_from_resource_modes(
-    resources: std::collections::BTreeMap<ResourceKey, FlockMode>,
-) -> Result<ClaimSet> {
+fn validate_probe_target(claim: &ClaimSet, target: &[ResourceLock]) -> Result<()> {
     let mut cpus = BTreeSet::new();
     let mut llcs = BTreeSet::new();
-    let mut cpu_mode = None;
-    let mut llc_mode = None;
-    for (resource, mode) in resources {
-        match resource {
+    for lock in target {
+        match lock.resource {
             ResourceKey::Cpu(cpu) => {
-                if cpu_mode.is_some_and(|existing| existing != mode) {
-                    anyhow::bail!("coordinator accumulated mixed CPU lock modes");
-                }
-                cpu_mode = Some(mode);
-                cpus.insert(cpu);
+                anyhow::ensure!(
+                    cpus.insert(cpu),
+                    "coordinator probe target repeats CPU {cpu}"
+                );
+                anyhow::ensure!(
+                    ClaimMode::from(lock.mode) == claim.cpu_mode,
+                    "coordinator probe target CPU {cpu} mode {:?} does not match claim mode {:?}",
+                    lock.mode,
+                    claim.cpu_mode,
+                );
+                anyhow::ensure!(
+                    lock.path == super::cpu_lock_path(cpu),
+                    "coordinator probe target CPU {cpu} uses noncanonical lock path {}",
+                    lock.path,
+                );
             }
             ResourceKey::Llc(llc) => {
-                if llc_mode.is_some_and(|existing| existing != mode) {
-                    anyhow::bail!("coordinator accumulated mixed LLC lock modes");
-                }
-                llc_mode = Some(mode);
-                llcs.insert(llc);
+                anyhow::ensure!(
+                    llcs.insert(llc),
+                    "coordinator probe target repeats LLC {llc}"
+                );
+                anyhow::ensure!(
+                    ClaimMode::from(lock.mode) == claim.llc_mode,
+                    "coordinator probe target LLC {llc} mode {:?} does not match claim mode {:?}",
+                    lock.mode,
+                    claim.llc_mode,
+                );
+                anyhow::ensure!(
+                    lock.path == super::llc_lock_path(llc),
+                    "coordinator probe target LLC {llc} uses noncanonical lock path {}",
+                    lock.path,
+                );
             }
         }
     }
-    Ok(ClaimSet::with_modes(
-        llcs,
-        cpus,
-        llc_mode.unwrap_or(FlockMode::Shared),
-        cpu_mode.unwrap_or(FlockMode::Shared),
-    ))
+    anyhow::ensure!(
+        cpus == claim.cpus && llcs == claim.llcs,
+        "coordinator physical probe target does not exactly match its registry claim"
+    );
+    Ok(())
 }
 
 /// One coordinator-loop iteration's verdict, produced by the caller's step
@@ -1831,6 +1823,7 @@ fn acquire_as_coordinator_impl<T>(
     let mut watched_resources = ClaimSet::default();
     let mut observer = HolderObserver::new();
     let mut first = true;
+    let mut force_step = false;
     let mut retry_due = false;
     let mut retry_deadline = std::time::Instant::now() + COORDINATOR_WAKE_FALLBACK;
     let mut pending_events = LockDirEvents::default();
@@ -1846,9 +1839,7 @@ fn acquire_as_coordinator_impl<T>(
                 &pending_events.cpu_closes,
                 &pending_events.llc_closes,
                 pending_events.overflow,
-                None,
                 &[],
-                None,
                 &closed_tickets,
                 first || retry_due,
                 first.then_some(PREWATCH_LIVENESS_RECONCILE_DELAY),
@@ -1860,7 +1851,8 @@ fn acquire_as_coordinator_impl<T>(
         retry_due = false;
         let mut liveness_deadline = std::time::Instant::now() + snapshot.liveness_due_in;
         watched_resources = snapshot.watch.clone();
-        let mut should_step = first || snapshot.should_step;
+        let mut should_step = first || force_step || snapshot.should_step;
+        force_step = false;
         if let Some(request) = snapshot.observation.take() {
             let observation = observer.observe(&request);
             snapshot = check_result(
@@ -1894,18 +1886,33 @@ fn acquire_as_coordinator_impl<T>(
                     check_interrupted(cancelled)?;
                     let contention = held.take_contention();
                     let markers = contention.marker_vec();
+                    let commit_token = held.commit_token()?;
                     // `finish_acquired` publishes the held flocks and removes
-                    // the coordinator record atomically. Once it returns
-                    // success, cancellation is for the caller's next lifecycle
-                    // phase—not grounds to roll back this committed acquire.
-                    coordinator.ticket.finish_acquired(
+                    // the coordinator record atomically. Once it commits,
+                    // cancellation is for the caller's next lifecycle phase—
+                    // not grounds to roll back this committed acquire.
+                    match coordinator.ticket.finish_acquired(
                         &claim,
-                        &ClaimSet::default(),
+                        commit_token,
                         &markers,
                         cancelled,
-                    )?;
-                    drop(contention);
-                    break CoordinatorOutcome::Acquired(value);
+                    )? {
+                        registry::FinishAcquireResult::Committed => {
+                            drop(contention);
+                            break CoordinatorOutcome::Acquired(value);
+                        }
+                        registry::FinishAcquireResult::Stale => {
+                            // An earlier callback changed its reservation after
+                            // this planner snapshot. Drop the stale physical fd
+                            // set, retain the coordinator ticket, and force one
+                            // fresh planner turn after the pending prefix scan.
+                            drop(value);
+                            drop(contention);
+                            first = false;
+                            force_step = true;
+                            continue;
+                        }
+                    }
                 }
                 CoordinatorStep::Abort { reason } => {
                     break CoordinatorOutcome::Aborted { reason };
@@ -1926,9 +1933,7 @@ fn acquire_as_coordinator_impl<T>(
                             &BTreeSet::new(),
                             &BTreeSet::new(),
                             false,
-                            None,
                             &markers,
-                            None,
                             &closed_tickets,
                             false,
                             None,

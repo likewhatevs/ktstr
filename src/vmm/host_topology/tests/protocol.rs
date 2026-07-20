@@ -223,8 +223,8 @@ fn uncontended_fast_fence_does_not_create_registry_metadata() {
     let protocol_dir = std::path::Path::new(&cpu_path)
         .parent()
         .expect("resource lock parent");
-    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v6");
-    let event_dir = protocol_dir.join("ktstr-acquire-events-v6");
+    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v7");
+    let event_dir = protocol_dir.join("ktstr-acquire-events-v7");
     assert!(!registry_dir.exists());
     assert!(!event_dir.exists());
 
@@ -284,7 +284,44 @@ fn failed_complete_probe_releases_its_fresh_prefix_immediately() {
 }
 
 #[test]
-fn failed_coordinator_sweep_does_not_sequester_its_free_prefix() {
+fn coordinator_probe_rejects_a_target_that_does_not_exactly_match_its_claim() {
+    let _prefixes = LockPrefixesGuard::new();
+    let claim = protocol::ClaimSet::new(
+        std::iter::empty(),
+        [1usize],
+        crate::flock::FlockMode::Exclusive,
+    );
+    let wrong_resource = protocol::canonical_lock_order(&[], crate::flock::FlockMode::Shared, &[2]);
+    let mut held = protocol::HeldLocks::default();
+    let resource_error = held
+        .probe_complete_if_ready(&claim, &wrong_resource)
+        .expect_err("a physical target for CPU 2 cannot publish a CPU 1 claim");
+    assert!(
+        resource_error
+            .to_string()
+            .contains("does not exactly match"),
+        "resource mismatch must fail diagnostically: {resource_error:#}",
+    );
+
+    let shared_claim = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [1usize],
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Shared,
+    );
+    let exclusive_target =
+        protocol::canonical_lock_order(&[], crate::flock::FlockMode::Shared, &[1]);
+    let mode_error = held
+        .probe_complete_if_ready(&shared_claim, &exclusive_target)
+        .expect_err("an EX physical target cannot publish a SH CPU claim");
+    assert!(
+        mode_error.to_string().contains("does not match claim mode"),
+        "mode mismatch must fail diagnostically: {mode_error:#}",
+    );
+}
+
+#[test]
+fn failed_complete_probe_does_not_sequester_its_free_prefix() {
     let _prefixes = LockPrefixesGuard::new();
     let blocked_cpu = 4;
     let blocker = crate::flock::try_flock(
@@ -626,13 +663,7 @@ fn empty_resource_modes_are_canonical_across_construction_union_and_record_round
         crate::flock::FlockMode::Shared,
         crate::flock::FlockMode::Shared,
     );
-    let llc_reconstructed = protocol::claim_from_resource_modes_for_tests([(
-        protocol::ResourceKey::Llc(7),
-        crate::flock::FlockMode::Shared,
-    )])
-    .expect("reconstruct LLC-only held claim");
     assert_eq!(llc_new, llc_with_modes);
-    assert_eq!(llc_new, llc_reconstructed);
 
     let cpu_shared = protocol::ClaimSet::with_modes(
         std::iter::empty(),
@@ -640,13 +671,6 @@ fn empty_resource_modes_are_canonical_across_construction_union_and_record_round
         crate::flock::FlockMode::Shared,
         crate::flock::FlockMode::Shared,
     );
-    let cpu_reconstructed = protocol::claim_from_resource_modes_for_tests([(
-        protocol::ResourceKey::Cpu(9),
-        crate::flock::FlockMode::Shared,
-    )])
-    .expect("reconstruct CPU-only held claim");
-    assert_eq!(cpu_shared, cpu_reconstructed);
-
     let empty = protocol::ClaimSet::default();
     assert_eq!(
         protocol::union_claims_for_tests(&llc_new, &empty),
@@ -677,42 +701,6 @@ fn empty_resource_modes_are_canonical_across_construction_union_and_record_round
             .expect("round-trip independently-modeled claim and watch");
     assert_eq!(round_trip_claim, llc_new);
     assert_eq!(round_trip_watch, cpu_shared);
-}
-
-#[test]
-fn reconstructed_cpu_holds_accept_uniform_shared_mode_and_reject_mixed_modes() {
-    let shared = protocol::claim_from_resource_modes_for_tests([
-        (
-            protocol::ResourceKey::Cpu(1),
-            crate::flock::FlockMode::Shared,
-        ),
-        (
-            protocol::ResourceKey::Cpu(2),
-            crate::flock::FlockMode::Shared,
-        ),
-    ])
-    .expect("uniform CPU SH holds form one claim");
-    assert_eq!(
-        shared,
-        protocol::ClaimSet::with_modes(
-            std::iter::empty(),
-            [1usize, 2usize],
-            crate::flock::FlockMode::Shared,
-            crate::flock::FlockMode::Shared,
-        ),
-    );
-    let error = protocol::claim_from_resource_modes_for_tests([
-        (
-            protocol::ResourceKey::Cpu(1),
-            crate::flock::FlockMode::Shared,
-        ),
-        (
-            protocol::ResourceKey::Cpu(2),
-            crate::flock::FlockMode::Exclusive,
-        ),
-    ])
-    .expect_err("mixed CPU lock modes cannot be represented by one exact claim");
-    assert!(error.to_string().contains("mixed CPU lock modes"));
 }
 
 #[test]
@@ -763,6 +751,17 @@ fn fixed_registry_handles_five_hundred_waiters_without_per_waiter_watchers() {
             .expect("empty registry after stress")
             .is_empty(),
         "normal teardown must recycle every high-water slot",
+    );
+}
+
+#[test]
+fn draining_granted_callbacks_does_not_rescan_for_a_nonexistent_waiter() {
+    let _prefixes = LockPrefixesGuard::new();
+    let election_reads = protocol::exercise_granted_only_drain_election_reads_for_tests(500)
+        .expect("drain a callback-only active list");
+    assert_eq!(
+        election_reads, 0,
+        "removing GRANTED callbacks cannot create WAITING work and must not rescan the shrinking list",
     );
 }
 
@@ -1954,7 +1953,7 @@ fn granted_commit_is_terminal_even_if_cancellation_arrives_afterward() {
                 coordinator,
                 &worker_coordinator_cancelled,
                 |held| {
-                    if let Some(locks) = held.probe_complete(&target)? {
+                    if let Some(locks) = held.probe_complete_if_ready(&claim, &target)? {
                         Ok(protocol::CoordinatorStep::Complete {
                             claim: claim.clone(),
                             value: locks,
@@ -2080,6 +2079,7 @@ const TICKET_HELPER_AFTER_ACQUIRE_GATE: &str = "KTSTR_TEST_TICKET_AFTER_ACQUIRE_
 const TICKET_HELPER_AFTER_ACQUIRE_ENTERED: &str = "KTSTR_TEST_TICKET_AFTER_ACQUIRE_ENTERED";
 const TICKET_HELPER_BEFORE_COORDINATOR_GATE: &str = "KTSTR_TEST_TICKET_BEFORE_COORDINATOR_GATE";
 const TICKET_HELPER_COORDINATOR_ENTERED: &str = "KTSTR_TEST_TICKET_COORDINATOR_ENTERED";
+const TICKET_HELPER_COORDINATOR_WAITING: &str = "KTSTR_TEST_TICKET_COORDINATOR_WAITING";
 
 thread_local! {
     static TICKET_HELPER_LOGS:
@@ -2122,7 +2122,7 @@ fn try_ticket_candidate(
 
 /// Self-exec helper for the registry tests below. Each process publishes one
 /// monotonic ticket and either bypasses on an exact compatible candidate or,
-/// as coordinator, accumulates only its primary exact candidate.
+/// as coordinator, probes only its primary exact candidate.
 #[test]
 #[ignore]
 fn ticket_registry_process_helper() {
@@ -2175,6 +2175,8 @@ fn ticket_registry_process_helper() {
         std::env::var_os(TICKET_HELPER_BEFORE_COORDINATOR_GATE).map(std::path::PathBuf::from);
     let coordinator_entered =
         std::env::var_os(TICKET_HELPER_COORDINATOR_ENTERED).map(std::path::PathBuf::from);
+    let coordinator_waiting =
+        std::env::var_os(TICKET_HELPER_COORDINATOR_WAITING).map(std::path::PathBuf::from);
     let claims: Vec<_> = candidates
         .iter()
         .map(|candidate| ticket_claim(candidate))
@@ -2257,7 +2259,7 @@ fn ticket_registry_process_helper() {
                     .expect("open coordinator probe log");
                 std::io::Write::write_all(&mut probe_log, b"probe\n")
                     .expect("publish coordinator probe");
-                if let Some(locks) = held.probe_complete(&target)? {
+                if let Some(locks) = held.probe_complete_if_ready(&claim, &target)? {
                     if let Some(entered) = &after_acquire_entered {
                         std::fs::write(entered, b"entered")
                             .expect("publish coordinator acquired-probe entry");
@@ -2270,6 +2272,10 @@ fn ticket_registry_process_helper() {
                         value: locks,
                     })
                 } else {
+                    if let Some(waiting) = &coordinator_waiting {
+                        std::fs::write(waiting, b"waiting")
+                            .expect("publish coordinator waiting entry");
+                    }
                     Ok(protocol::CoordinatorStep::Waiting {
                         claim: claim.clone(),
                     })
@@ -2315,6 +2321,7 @@ struct TicketSpawnOptions<'a> {
     before_probe_gate: Option<&'a std::path::Path>,
     after_acquire_gate: Option<(&'a std::path::Path, &'a std::path::Path)>,
     before_coordinator_gate: Option<(&'a std::path::Path, &'a std::path::Path)>,
+    coordinator_waiting: Option<&'a std::path::Path>,
 }
 
 impl TicketChild {
@@ -2488,6 +2495,9 @@ impl TicketChild {
             command
                 .env(TICKET_HELPER_BEFORE_COORDINATOR_GATE, gate)
                 .env(TICKET_HELPER_COORDINATOR_ENTERED, entered);
+        }
+        if let Some(waiting) = options.coordinator_waiting {
+            command.env(TICKET_HELPER_COORDINATOR_WAITING, waiting);
         }
         let child = command.spawn().expect("spawn ticket helper");
         let pid = child.id();
@@ -2727,6 +2737,27 @@ fn wait_for_ticket_pids(expected: &[u32]) {
     }
 }
 
+fn wait_for_ticket_claim(child: &TicketChild, expected: &protocol::ClaimSet) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        child.assert_running("expected registry claim");
+        let claim = protocol::ticket_registry_snapshot_for_tests()
+            .expect("ticket registry snapshot")
+            .into_iter()
+            .find_map(|(_, pid, claim)| (pid == child.pid).then_some(claim));
+        if claim.as_ref() == Some(expected) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ticket helper {} did not publish expected claim {expected:?}; observed={claim:?}; {}",
+            child.pid,
+            child.diagnostics(),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 #[test]
 fn disjoint_ticket_bypasses_a_blocked_coordinator() {
     let _prefixes = LockPrefixesGuard::new();
@@ -2749,6 +2780,208 @@ fn disjoint_ticket_bypasses_a_blocked_coordinator() {
     drop(blocker);
     coordinator.wait_for_acquired();
     coordinator.release_and_wait();
+}
+
+#[test]
+fn coordinator_election_skips_a_live_granted_head_for_disjoint_waiting_work() {
+    let _prefixes = LockPrefixesGuard::new();
+    let markers = tempfile::TempDir::new().expect("marker dir");
+    let first_blocker =
+        crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Exclusive)
+            .expect("open first coordinator blocker")
+            .expect("hold first coordinator blocker");
+    let third_blocker =
+        crate::flock::try_flock(cpu_lock_path(3), crate::flock::FlockMode::Exclusive)
+            .expect("open third-ticket blocker")
+            .expect("hold third-ticket blocker");
+
+    let first = TicketChild::spawn(markers.path(), "first", "1", false);
+    wait_for_ticket_pids(&[first.pid]);
+
+    let granted_gate = markers.path().join("commit-granted-head");
+    let granted_entered = markers.path().join("granted-head-acquired-lock");
+    let granted = TicketChild::spawn_after_acquire_gate(
+        markers.path(),
+        "granted-head",
+        "2",
+        &granted_gate,
+        &granted_entered,
+    );
+    granted.wait_for_path(&granted_entered, "granted-head physical acquisition");
+
+    let successor_gate = markers.path().join("start-successor-coordinator");
+    let successor_entered = markers.path().join("successor-became-coordinator");
+    let successor = TicketChild::spawn_before_coordinator_gate(
+        markers.path(),
+        "waiting-successor",
+        "3",
+        &successor_gate,
+        &successor_entered,
+    );
+    wait_for_ticket_pids(&[first.pid, granted.pid, successor.pid]);
+
+    drop(first_blocker);
+    first.wait_for_acquired();
+    successor.wait_for_path(
+        &successor_entered,
+        "coordinator election behind a live granted head",
+    );
+    assert!(
+        !granted.acquired.exists(),
+        "the earlier granted callback must remain live and uncommitted during successor election",
+    );
+
+    drop(third_blocker);
+    std::fs::write(&successor_gate, b"run").expect("release successor coordinator gate");
+    successor.wait_for_acquired();
+    assert!(
+        !granted.acquired.exists(),
+        "disjoint coordinator work must complete without waiting for the earlier granted callback",
+    );
+    successor.release_and_wait();
+
+    std::fs::write(&granted_gate, b"commit").expect("release granted-head commit gate");
+    granted.wait_for_acquired();
+    granted.release_and_wait();
+    first.release_and_wait();
+}
+
+#[test]
+fn coordinator_behind_a_granted_predecessor_does_not_probe_its_conflicting_claim() {
+    let _prefixes = LockPrefixesGuard::new();
+    let markers = tempfile::TempDir::new().expect("marker dir");
+    let first_blocker =
+        crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Exclusive)
+            .expect("open first coordinator blocker")
+            .expect("hold first coordinator blocker");
+
+    let first = TicketChild::spawn(markers.path(), "first", "1", false);
+    wait_for_ticket_pids(&[first.pid]);
+
+    let granted_probe_gate = markers.path().join("run-granted-head-probe");
+    let granted = TicketChild::spawn_before_probe_gate(
+        markers.path(),
+        "granted-head",
+        "2",
+        &granted_probe_gate,
+    );
+    granted.wait_for_probe();
+
+    let successor_gate = markers.path().join("start-conflicting-coordinator");
+    let successor_entered = markers
+        .path()
+        .join("conflicting-successor-became-coordinator");
+    let successor_waiting = markers
+        .path()
+        .join("conflicting-successor-remained-waiting");
+    let successor = TicketChild::spawn_with_options(
+        markers.path(),
+        "conflicting-successor",
+        "2",
+        TicketSpawnOptions {
+            before_coordinator_gate: Some((&successor_gate, &successor_entered)),
+            coordinator_waiting: Some(&successor_waiting),
+            ..TicketSpawnOptions::default()
+        },
+    );
+    wait_for_ticket_pids(&[first.pid, granted.pid, successor.pid]);
+
+    drop(first_blocker);
+    first.wait_for_acquired();
+    successor.wait_for_path(
+        &successor_entered,
+        "conflicting coordinator election behind a granted head",
+    );
+    std::fs::write(&successor_gate, b"run").expect("release conflicting coordinator gate");
+    successor.wait_for_path(
+        &successor_waiting,
+        "mode-aware predecessor rejection before physical probing",
+    );
+    assert!(
+        !successor.acquired.exists(),
+        "the later coordinator must not acquire a claim reserved by its granted predecessor",
+    );
+
+    std::fs::write(&granted_probe_gate, b"probe").expect("release granted-head physical probe");
+    granted.wait_for_acquired();
+    assert!(
+        !successor.acquired.exists(),
+        "the earlier granted callback must retain admission priority",
+    );
+    granted.release_and_wait();
+
+    successor.wait_for_acquired();
+    successor.release_and_wait();
+    first.release_and_wait();
+}
+
+#[test]
+fn coordinator_retries_physical_success_if_an_earlier_replan_claims_its_target() {
+    let _prefixes = LockPrefixesGuard::new();
+    let markers = tempfile::TempDir::new().expect("marker dir");
+    let first_blocker =
+        crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Exclusive)
+            .expect("open first coordinator blocker")
+            .expect("hold first coordinator blocker");
+    let target_blocker =
+        crate::flock::try_flock(cpu_lock_path(3), crate::flock::FlockMode::Exclusive)
+            .expect("open later coordinator target blocker")
+            .expect("hold later coordinator target blocker");
+
+    let first = TicketChild::spawn(markers.path(), "first", "1", false);
+    wait_for_ticket_pids(&[first.pid]);
+
+    let replan_gate = markers.path().join("publish-earlier-replan");
+    let earlier =
+        TicketChild::spawn_before_probe_gate(markers.path(), "earlier-replan", "2;3", &replan_gate);
+    earlier.wait_for_probe();
+    wait_for_ticket_claim(&earlier, &ticket_claim(&[2]));
+
+    let coordinator_gate = markers.path().join("run-later-coordinator");
+    let coordinator_entered = markers.path().join("later-became-coordinator");
+    let stale_commit_gate = markers.path().join("commit-later-physical-success");
+    let physical_success = markers.path().join("later-physical-success");
+    let later = TicketChild::spawn_with_options(
+        markers.path(),
+        "later-coordinator",
+        "3",
+        TicketSpawnOptions {
+            after_acquire_gate: Some((&stale_commit_gate, &physical_success)),
+            before_coordinator_gate: Some((&coordinator_gate, &coordinator_entered)),
+            ..TicketSpawnOptions::default()
+        },
+    );
+    wait_for_ticket_pids(&[first.pid, earlier.pid, later.pid]);
+
+    drop(first_blocker);
+    first.wait_for_acquired();
+    later.wait_for_path(
+        &coordinator_entered,
+        "later coordinator election behind a live REPLAN callback",
+    );
+
+    drop(target_blocker);
+    std::fs::write(&coordinator_gate, b"run").expect("release later coordinator gate");
+    later.wait_for_path(
+        &physical_success,
+        "later coordinator physical success before registry commit",
+    );
+
+    std::fs::write(&replan_gate, b"replan").expect("release earlier REPLAN callback");
+    let target_claim = ticket_claim(&[3]);
+    wait_for_ticket_claim(&earlier, &target_claim);
+
+    std::fs::write(&stale_commit_gate, b"commit").expect("release stale later-coordinator commit");
+    earlier.wait_for_acquired();
+    assert!(
+        !later.acquired.exists(),
+        "the later coordinator must drop physical success from a stale predecessor snapshot",
+    );
+
+    earlier.release_and_wait();
+    later.wait_for_acquired();
+    later.release_and_wait();
+    first.release_and_wait();
 }
 
 #[test]
@@ -3086,6 +3319,120 @@ fn fast_probe_prunes_a_killed_sole_ticket_before_fencing() {
             panic!("killed sole ticket must be pruned before the fast path is fenced")
         }
     }
+}
+
+#[test]
+fn observer_winning_first_registry_lock_leaves_layout_choice_to_the_registrant() {
+    let _prefixes = LockPrefixesGuard::new();
+    assert!(
+        protocol::observer_preserves_uninitialized_header_for_tests()
+            .expect("observe missing, zero-length, and zeroed registry headers"),
+        "a non-authoritative observer must leave every unpublished header representation untouched",
+    );
+
+    let sparse_llc = 8191usize;
+    let claim = protocol::ClaimSet::new(
+        [sparse_llc],
+        std::iter::empty(),
+        crate::flock::FlockMode::Exclusive,
+    );
+    let coordinator =
+        match protocol::register_ticket_or_acquire(claim.clone(), claim.clone(), None, |_| {
+            Ok::<Option<()>, anyhow::Error>(None)
+        })
+        .expect("let the authoritative sparse-LLC registrant choose the host layout")
+        {
+            protocol::TicketWork::Coordinator(coordinator) => coordinator,
+            protocol::TicketWork::Acquired(()) => {
+                panic!("first sparse-LLC registrant must become coordinator")
+            }
+        };
+    let snapshot =
+        protocol::ticket_registry_snapshot_for_tests().expect("read sparse-LLC registration");
+    assert_eq!(
+        snapshot.len(),
+        1,
+        "sparse-LLC registration must publish exactly one ticket",
+    );
+    assert_eq!(
+        snapshot[0].2, claim,
+        "the observer must not freeze the registry below the sparse LLC id",
+    );
+    drop(coordinator);
+}
+
+fn register_sparse_first_ticket_after_observation() {
+    let sparse_llc = 8191usize;
+    let claim = protocol::ClaimSet::new(
+        [sparse_llc],
+        std::iter::empty(),
+        crate::flock::FlockMode::Exclusive,
+    );
+    let coordinator =
+        match protocol::register_ticket_or_acquire(claim.clone(), claim.clone(), None, |_| {
+            Ok::<Option<()>, anyhow::Error>(None)
+        })
+        .expect("let the authoritative sparse-LLC registrant choose the host layout")
+        {
+            protocol::TicketWork::Coordinator(coordinator) => coordinator,
+            protocol::TicketWork::Acquired(()) => {
+                panic!("first sparse-LLC registrant must become coordinator")
+            }
+        };
+    let snapshot =
+        protocol::ticket_registry_snapshot_for_tests().expect("read sparse-LLC registration");
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(
+        snapshot[0].2, claim,
+        "an observer must not freeze the registry below the first registrant's sparse LLC id",
+    );
+    drop(coordinator);
+}
+
+#[test]
+fn aggregate_snapshot_of_zeroed_header_leaves_sparse_layout_to_first_registrant() {
+    let _prefixes = LockPrefixesGuard::new();
+    protocol::prepare_zeroed_uninitialized_header_for_tests()
+        .expect("prepare interrupted zeroed header");
+    let low = protocol::ClaimSet::new(
+        std::iter::empty(),
+        [1usize],
+        crate::flock::FlockMode::Exclusive,
+    );
+    let snapshot =
+        protocol::registered_claim_snapshot(&low).expect("observe zeroed aggregate header");
+    assert!(
+        !snapshot.conflicts(&low).expect("query empty aggregate"),
+        "an unpublished zeroed header must read as an empty registry",
+    );
+    register_sparse_first_ticket_after_observation();
+}
+
+#[test]
+fn fast_fence_of_zeroed_header_leaves_sparse_layout_to_first_registrant() {
+    let _prefixes = LockPrefixesGuard::new();
+    protocol::prepare_zeroed_uninitialized_header_for_tests()
+        .expect("prepare interrupted zeroed header");
+    let low = protocol::ClaimSet::new(
+        std::iter::empty(),
+        [1usize],
+        crate::flock::FlockMode::Exclusive,
+    );
+    match protocol::with_registry_fence(&low, || Ok::<_, anyhow::Error>(17usize))
+        .expect("run fast probe through zeroed header")
+    {
+        protocol::RegistryFence::Ran { value, watched } => {
+            assert_eq!(value, 17);
+            assert!(
+                !watched,
+                "an unpublished zeroed header cannot contain a watched resource",
+            );
+        }
+        protocol::RegistryFence::Fenced => {
+            panic!("an unpublished zeroed header must be an empty fence")
+        }
+    }
+    register_sparse_first_ticket_after_observation();
 }
 
 #[test]

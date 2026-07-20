@@ -22,8 +22,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-const MAGIC: u64 = 0x4b54_5354_5251_3036; // "KTSTRQ06"
-const VERSION: u32 = 6;
+const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ07");
+const VERSION: u32 = 7;
 const HEADER_FIXED: usize = 256;
 const HEADER_ALIGN: usize = 4096;
 const RECORD_FIXED: usize = 128;
@@ -32,8 +32,8 @@ const RECORDS_PER_CHUNK: usize = 64;
 const NONE_SLOT: u64 = u64::MAX;
 const MAX_RESOURCE_BITS: usize = 1 << 20;
 const MAX_REGISTRY_SLOTS: u64 = 1 << 16;
-const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v6-init-";
-const LIVENESS_PREFIX: &str = "ktstr-acquire-v6-slot-";
+const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v7-init-";
+const LIVENESS_PREFIX: &str = "ktstr-acquire-v7-slot-";
 const LIVENESS_SEPARATOR: &str = "-ticket-";
 const LIVENESS_SUFFIX: &str = ".live";
 
@@ -164,6 +164,8 @@ thread_local! {
         const { std::cell::Cell::new(0) };
     static ACTIVE_LIST_RECORD_READS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static COORDINATOR_ELECTION_RECORD_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
     #[cfg(test)]
     static CANCEL_GRANTED_AFTER_COMMIT: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
@@ -186,9 +188,21 @@ pub(super) struct ScheduleSnapshot {
     pub candidate_watch: ClaimSet,
     pub predecessors: AggregateSnapshot,
     pub availability: AvailabilitySnapshot,
+    pub commit_token: CoordinatorCommitToken,
     pub should_step: bool,
     pub observation: Option<ObservationRequest>,
     pub liveness_due_in: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CoordinatorCommitToken {
+    claim_epoch: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FinishAcquireResult {
+    Committed,
+    Stale,
 }
 
 #[derive(Debug)]
@@ -281,7 +295,7 @@ pub(super) enum FenceResult<T> {
     Ran { value: T, watched: bool },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AggregateSnapshot {
     bits: usize,
     cpu_any: Vec<u64>,
@@ -561,7 +575,9 @@ impl Ticket {
                 .ok_or_else(|| anyhow::anyhow!("queue ticket id overflow"))?,
         );
         table.bump_generation()?;
-        table.elect_coordinator_in_transaction()?;
+        if initial_state == STATE_WAITING {
+            table.elect_coordinator_in_transaction()?;
+        }
         table.finish_transaction();
         let wake = table.map_futex(slot)?;
         drop(table);
@@ -998,9 +1014,7 @@ impl Ticket {
         closed_cpus: &BTreeSet<usize>,
         closed_llcs: &BTreeSet<usize>,
         overflow: bool,
-        newly_held: Option<&ClaimSet>,
         contention: &[ContentionMarker],
-        abandoned: Option<&ClaimSet>,
         closed_tickets: &[(u64, u64)],
         reobserve_watch: bool,
         reconcile_liveness_after: Option<Duration>,
@@ -1010,9 +1024,7 @@ impl Ticket {
         let pure_release_batch = coordinator_claim.is_none()
             && (!closed_cpus.is_empty() || !closed_llcs.is_empty())
             && !overflow
-            && newly_held.is_none()
             && contention.is_empty()
-            && abandoned.is_none()
             && closed_tickets.is_empty()
             && !reobserve_watch
             && reconcile_liveness_after.is_none()
@@ -1046,21 +1058,9 @@ impl Ticket {
             validate_claim(claim)?;
             validate_claim_within_watch(claim, &record.watch)?;
         }
-        if let Some(claim) = newly_held
-            && !claim.is_empty()
-        {
-            validate_claim(claim)?;
-            validate_claim_within_watch(claim, &record.watch)?;
-        }
-        if let Some(claim) = abandoned
-            && !claim.is_empty()
-        {
-            validate_claim(claim)?;
-            validate_claim_within_watch(claim, &record.watch)?;
-        }
         validate_contention_within_watch(contention, &record.watch)?;
-        let mut event_cpus;
-        let mut event_llcs;
+        let event_cpus;
+        let event_llcs;
         if overflow {
             let aggregate = table.aggregate_watch()?;
             event_cpus = aggregate.cpus;
@@ -1068,12 +1068,7 @@ impl Ticket {
         } else {
             (event_cpus, event_llcs) = table.watched_subset(closed_cpus, closed_llcs)?;
         }
-        if let Some(released) = abandoned {
-            event_cpus.extend(released.cpus.iter().copied());
-            event_llcs.extend(released.llcs.iter().copied());
-        }
         let claim_changed = coordinator_claim.is_some_and(|claim| *claim != record.claim);
-        let publish_busy = newly_held.is_some_and(|claim| !claim.is_empty());
         let mut release_plan = table.possible_release_plan(&event_cpus, &event_llcs)?;
         if reobserve_watch {
             // The coordinator installs its inotify watch before this first
@@ -1083,8 +1078,7 @@ impl Ticket {
             let watch = table.aggregate_watch()?;
             release_plan.extend(table.possible_release_plan(&watch.cpus, &watch.llcs)?);
         }
-        let registry_changed =
-            claim_changed || publish_busy || !release_plan.is_empty() || !contention.is_empty();
+        let registry_changed = claim_changed || !release_plan.is_empty() || !contention.is_empty();
         if registry_changed {
             table.begin_transaction()?;
             if let Some(claim) = coordinator_claim.filter(|claim| **claim != record.claim) {
@@ -1099,19 +1093,16 @@ impl Ticket {
                     false,
                 )?;
             }
-            if let Some(claim) = newly_held.filter(|claim| !claim.is_empty()) {
-                table.publish_claim_busy(claim)?;
-            }
             table.apply_possible_release(&release_plan)?;
             table.mark_blockers_unknown(contention)?;
             table.bump_generation()?;
             table.finish_transaction();
         }
         let should_scan = table.pending_flags() & PENDING_RESCAN != 0;
-        let watch = if should_scan {
+        let (watch, coordinator_prefix_changed) = if should_scan {
             table.grant_compatible()?
         } else {
-            table.aggregate_watch()?
+            (table.aggregate_watch()?, false)
         };
         let predecessors = table.cached_prefix(self.slot)?.1;
         let availability = table.availability_snapshot();
@@ -1120,7 +1111,10 @@ impl Ticket {
             candidate_watch: record.watch,
             predecessors,
             availability,
-            should_step: false,
+            commit_token: CoordinatorCommitToken {
+                claim_epoch: table.claim_epoch(),
+            },
+            should_step: coordinator_prefix_changed,
             observation: table.observation_request()?,
             liveness_due_in,
         })
@@ -1246,6 +1240,9 @@ impl Ticket {
             candidate_watch: record.watch,
             predecessors,
             availability,
+            commit_token: CoordinatorCommitToken {
+                claim_epoch: read_u64(&header, H_CLAIM_EPOCH).max(1),
+            },
             // The registry already knew these resources were free. Their
             // writable closes cannot improve the coordinator's last planning
             // snapshot and are discarded without another planner pass.
@@ -1284,10 +1281,10 @@ impl Ticket {
         // from the state they proved. A split release/reacquire lets a fast SH
         // fenced acquirer steal the resource between proof and waiter wake.
         release_proofs();
-        let watch = if table.pending_flags() & PENDING_RESCAN != 0 {
+        let (watch, coordinator_prefix_changed) = if table.pending_flags() & PENDING_RESCAN != 0 {
             table.grant_compatible()?
         } else {
-            table.aggregate_watch()?
+            (table.aggregate_watch()?, false)
         };
         let predecessors = table.cached_prefix(self.slot)?.1;
         let availability = table.availability_snapshot();
@@ -1296,7 +1293,10 @@ impl Ticket {
             candidate_watch: record.watch,
             predecessors,
             availability,
-            should_step: planner_serial_after > planner_serial_before,
+            commit_token: CoordinatorCommitToken {
+                claim_epoch: table.claim_epoch(),
+            },
+            should_step: planner_serial_after > planner_serial_before || coordinator_prefix_changed,
             observation: table.observation_request()?,
             liveness_due_in: table.liveness_due_in()?,
         })
@@ -1307,6 +1307,27 @@ impl Ticket {
         self.state_shared(false, None)?
             .ok_or_else(|| anyhow::anyhow!("test state read unexpectedly required recovery"))?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn commit_token_for_tests(&self) -> Result<CoordinatorCommitToken> {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let record = table
+            .record(self.slot)?
+            .filter(|record| record.ticket == self.ticket)
+            .ok_or_else(|| {
+                anyhow::anyhow!("test coordinator ticket {} disappeared", self.ticket)
+            })?;
+        if record.state != STATE_COORDINATOR
+            || table.coordinator_ticket() != self.ticket
+            || table.coordinator_slot()? != self.slot
+        {
+            anyhow::bail!("test ticket {} is not the queue coordinator", self.ticket);
+        }
+        Ok(CoordinatorCommitToken {
+            claim_epoch: table.claim_epoch(),
+        })
     }
 
     #[cfg(test)]
@@ -1331,18 +1352,14 @@ impl Ticket {
     pub(super) fn finish_acquired(
         &mut self,
         exact: &ClaimSet,
-        abandoned: &ClaimSet,
+        commit_token: CoordinatorCommitToken,
         contention: &[ContentionMarker],
         cancelled: Option<&AtomicBool>,
-    ) -> Result<()> {
+    ) -> Result<FinishAcquireResult> {
         if self.finished {
-            return Ok(());
+            return Ok(FinishAcquireResult::Committed);
         }
         validate_claim(exact)?;
-        if !abandoned.is_empty() {
-            validate_claim(abandoned)?;
-        }
-        self.wake.take();
         let _lock = lock_registry_interruptible_existing(cancelled)?;
         let mut table = Table::open_existing()?;
         table.repair_consistency_if_needed()?;
@@ -1350,15 +1367,42 @@ impl Ticket {
             .record(self.slot)?
             .filter(|record| record.ticket == self.ticket)
             .ok_or_else(|| anyhow::anyhow!("coordinator ticket {} disappeared", self.ticket))?;
-        validate_claim_within_watch(exact, &record.watch)?;
-        if !abandoned.is_empty() {
-            validate_claim_within_watch(abandoned, &record.watch)?;
+        if record.state != STATE_COORDINATOR
+            || table.coordinator_ticket() != self.ticket
+            || table.coordinator_slot()? != self.slot
+        {
+            anyhow::bail!("ticket {} lost the queue coordinator license", self.ticket);
         }
+        validate_claim_within_watch(exact, &record.watch)?;
         validate_contention_within_watch(contention, &record.watch)?;
+        let stale = table.claim_epoch() != commit_token.claim_epoch
+            && table.min_changed_ticket() < record.ticket;
+        if stale {
+            // The physical probe raced an earlier callback that changed or
+            // removed its reservation. Preserve this coordinator ticket,
+            // publish any exact negative evidence gathered in the same planner
+            // turn, and let the next scan refresh its predecessor prefix before
+            // probing again.
+            if !contention.is_empty() {
+                table.begin_transaction()?;
+                table.mark_blockers_unknown(contention)?;
+                table.bump_generation()?;
+                table.finish_transaction();
+            }
+            drop(table);
+            drop(_lock);
+            if !contention.is_empty() {
+                notify_coordinator();
+            }
+            return Ok(FinishAcquireResult::Stale);
+        }
+        // A slot cannot be recycled while this process still maps its futex.
+        // Keep that mapping live until every stale-success check above has
+        // passed, because a stale physical fd set is retried by this ticket.
+        self.wake.take();
         let claim_unchanged = &record.claim == exact;
         table.begin_transaction()?;
         table.publish_claim_busy(exact)?;
-        table.mark_possible_release(&abandoned.cpus, &abandoned.llcs)?;
         table.mark_blockers_unknown(contention)?;
         table.remove_record_in_transaction(&record, true)?;
         if !claim_unchanged {
@@ -1381,7 +1425,7 @@ impl Ticket {
         let _ = std::fs::remove_file(&self.liveness_path);
         notify_coordinator();
         cancel_coordinator_commit_for_tests(cancelled);
-        Ok(())
+        Ok(FinishAcquireResult::Committed)
     }
 
     #[cfg(test)]
@@ -1491,13 +1535,18 @@ pub(super) fn aggregate_snapshot(required: &ClaimSet) -> Result<AggregateSnapsho
         let layout = match HeaderLayout::validate(&map) {
             Ok(layout) => layout,
             Err(_) if map.iter().all(|byte| *byte == 0) => {
-                drop(map);
-                drop(file);
-                drop(shared);
-                let _lock = lock_registry_existing(FlockMode::Exclusive)?;
-                let mut table = Table::open(required_layout.bits)?;
-                table.repair_consistency_if_needed()?;
-                continue;
+                // A creator may have died after sizing the inode but before
+                // publishing the initialized image. This is still an empty
+                // registry, not authority for an observer to choose the
+                // process-wide resource width. Keep SH through this read and
+                // leave replacement to the first ticket registrant under EX.
+                return Ok(AggregateSnapshot {
+                    bits: required_layout.bits,
+                    cpu_any: vec![0; required_layout.words],
+                    cpu_exclusive: vec![0; required_layout.words],
+                    llc_any: vec![0; required_layout.words],
+                    llc_exclusive: vec![0; required_layout.words],
+                });
             }
             Err(error) => return Err(error),
         };
@@ -1773,16 +1822,18 @@ pub(super) fn with_aggregate_fence<T>(
         let layout = match HeaderLayout::validate(&map) {
             Ok(layout) => layout,
             Err(_) if map.iter().all(|byte| *byte == 0) => {
-                drop(map);
-                drop(file);
-                drop(shared);
                 // A creator may have died before publishing the initialized
-                // inode. Only an entirely zeroed image is unambiguously
-                // unpublished; malformed nonzero v6 state is never replaced.
-                let _lock = lock_registry_existing(FlockMode::Exclusive)?;
-                let mut table = Table::open(required_resource_bits(candidate))?;
-                table.repair_consistency_if_needed()?;
-                continue;
+                // inode. An entirely zeroed image is unambiguously
+                // unpublished, so treat it like the zero-length case while
+                // retaining SH across the physical probe. Only the first
+                // ticket registrant may choose and initialize the layout.
+                return Ok(FenceResult::Ran {
+                    value: match speculative.take() {
+                        Some(value) => value,
+                        None => run.take().expect("probe runs once")()?,
+                    },
+                    watched: false,
+                });
             }
             Err(error) => return Err(error),
         };
@@ -1858,6 +1909,20 @@ pub(super) fn snapshot() -> Result<Vec<(u64, u32, ClaimSet)>> {
         // authoritative empty-registry state until the first ticket publishes.
         return Ok(Vec::new());
     };
+    let header = match File::open(header_path()) {
+        Ok(header) => header,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("open existing queue registry header"),
+    };
+    if header.metadata()?.len() == 0 {
+        return Ok(Vec::new());
+    }
+    let unpublished = unsafe { Mmap::map(&header) }?;
+    if unpublished.iter().all(|byte| *byte == 0) {
+        return Ok(Vec::new());
+    }
+    drop(unpublished);
+    drop(header);
     let mut table = Table::open_existing()?;
     table.repair_consistency_if_needed()?;
     table.prune_dead()?;
@@ -2013,6 +2078,36 @@ fn set_cpu_free_for_tests(table: &mut Table, cpu: usize, free: bool) -> Result<(
 }
 
 #[cfg(test)]
+pub(super) fn exercise_granted_only_drain_election_reads_for_tests(
+    waiters: usize,
+) -> Result<usize> {
+    if waiters == 0 {
+        return Ok(0);
+    }
+    let claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+    let mut tickets = Vec::with_capacity(waiters);
+    for _ in 0..waiters {
+        tickets.push(Ticket::register(claim.clone(), claim.clone(), None)?);
+    }
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.begin_transaction()?;
+        table.set_coordinator(0, NONE_SLOT)?;
+        for ticket in &tickets {
+            table.set_record_state(ticket.slot, STATE_GRANTED)?;
+        }
+        table.finish_transaction();
+    }
+
+    let reads_before = COORDINATOR_ELECTION_RECORD_READS.with(std::cell::Cell::get);
+    while let Some(ticket) = tickets.pop() {
+        drop(ticket);
+    }
+    Ok(COORDINATOR_ELECTION_RECORD_READS.with(std::cell::Cell::get) - reads_before)
+}
+
+#[cfg(test)]
 pub(super) fn exercise_known_free_close_storm_for_tests(
     closes: usize,
 ) -> Result<(usize, u64, usize, u64, u64)> {
@@ -2024,9 +2119,7 @@ pub(super) fn exercise_known_free_close_storm_for_tests(
         &empty,
         &empty,
         false,
-        None,
         &[],
-        None,
         &[],
         false,
         None,
@@ -2061,9 +2154,7 @@ pub(super) fn exercise_known_free_close_storm_for_tests(
             &closed,
             &empty,
             false,
-            None,
             &[],
-            None,
             &[],
             false,
             None,
@@ -2097,9 +2188,7 @@ pub(super) fn exercise_llc_sh_only_shared_to_free_close_for_tests() -> Result<(b
         &empty,
         &empty,
         false,
-        None,
         &[],
-        None,
         &[],
         false,
         None,
@@ -2138,9 +2227,7 @@ pub(super) fn exercise_llc_sh_only_shared_to_free_close_for_tests() -> Result<(b
         &empty,
         &closed,
         false,
-        None,
         &[],
-        None,
         &[],
         false,
         None,
@@ -2165,9 +2252,7 @@ pub(super) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usi
         &empty,
         &empty,
         false,
-        None,
         &[],
-        None,
         &[],
         false,
         None,
@@ -2197,9 +2282,7 @@ pub(super) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usi
         &closed,
         &empty,
         false,
-        None,
         &[],
-        None,
         &[],
         false,
         None,
@@ -2495,9 +2578,7 @@ pub(super) fn exercise_coordinator_turnover_for_tests(
             &empty,
             &empty,
             false,
-            None,
             &[],
-            None,
             &[],
             true,
             Some(Duration::from_secs(60 * 60)),
@@ -2633,9 +2714,7 @@ pub(super) fn exercise_exact_commit_scan_elision_for_tests(commits: usize) -> Re
             &empty,
             &empty,
             false,
-            None,
             &[],
-            None,
             &[],
             false,
             None,
@@ -2669,7 +2748,8 @@ pub(super) fn exercise_mismatched_commit_rescan_for_tests() -> Result<(u64, bool
         table.finish_claim_scan();
     }
     let exact = ClaimSet::new(std::iter::empty(), [2usize], FlockMode::Exclusive);
-    first.finish_acquired(&exact, &ClaimSet::default(), &[], None)?;
+    let commit_token = first.commit_token_for_tests()?;
+    first.finish_acquired(&exact, commit_token, &[], None)?;
     let scans_before = diagnostic_counter_for_tests(H_GRANT_SCANS)?;
     let empty = BTreeSet::new();
     middle.schedule(
@@ -2677,9 +2757,7 @@ pub(super) fn exercise_mismatched_commit_rescan_for_tests() -> Result<(u64, bool
         &empty,
         &empty,
         false,
-        None,
         &[],
-        None,
         &[],
         false,
         None,
@@ -2722,7 +2800,8 @@ pub(super) fn exercise_superset_commit_rescan_for_tests() -> Result<(u64, bool)>
         table.finish_claim_scan();
     }
     let exact = ClaimSet::new(std::iter::empty(), [1usize, 2usize], FlockMode::Exclusive);
-    first.finish_acquired(&exact, &ClaimSet::default(), &[], None)?;
+    let commit_token = first.commit_token_for_tests()?;
+    first.finish_acquired(&exact, commit_token, &[], None)?;
     let scans_before = diagnostic_counter_for_tests(H_GRANT_SCANS)?;
     let empty = BTreeSet::new();
     middle.schedule(
@@ -2730,9 +2809,7 @@ pub(super) fn exercise_superset_commit_rescan_for_tests() -> Result<(u64, bool)>
         &empty,
         &empty,
         false,
-        None,
         &[],
-        None,
         &[],
         false,
         None,
@@ -2777,7 +2854,8 @@ pub(super) fn exercise_shared_commit_improvement_for_tests() -> Result<(u64, boo
         table.finish_claim_scan();
     }
     let exact = ClaimSet::new([1usize], std::iter::empty(), FlockMode::Shared);
-    first.finish_acquired(&exact, &ClaimSet::default(), &[], None)?;
+    let commit_token = first.commit_token_for_tests()?;
+    first.finish_acquired(&exact, commit_token, &[], None)?;
     let scans_before = diagnostic_counter_for_tests(H_GRANT_SCANS)?;
     let empty = BTreeSet::new();
     middle.schedule(
@@ -2785,9 +2863,7 @@ pub(super) fn exercise_shared_commit_improvement_for_tests() -> Result<(u64, boo
         &empty,
         &empty,
         false,
-        None,
         &[],
-        None,
         &[],
         false,
         None,
@@ -2830,7 +2906,8 @@ pub(super) fn exercise_cpu_shared_commit_improvement_for_tests() -> Result<(u64,
         write_u64(&mut table.header, H_PENDING_FLAGS, 0);
         table.finish_claim_scan();
     }
-    first.finish_acquired(&shared, &ClaimSet::default(), &[], None)?;
+    let commit_token = first.commit_token_for_tests()?;
+    first.finish_acquired(&shared, commit_token, &[], None)?;
     let scans_before = diagnostic_counter_for_tests(H_GRANT_SCANS)?;
     let empty = BTreeSet::new();
     middle.schedule(
@@ -2838,9 +2915,7 @@ pub(super) fn exercise_cpu_shared_commit_improvement_for_tests() -> Result<(u64,
         &empty,
         &empty,
         false,
-        None,
         &[],
-        None,
         &[],
         false,
         None,
@@ -3092,9 +3167,7 @@ pub(super) fn exercise_prefix_epoch_validation_for_tests() -> Result<(usize, boo
         &empty,
         &empty,
         false,
-        None,
         &[],
-        None,
         &[],
         false,
         None,
@@ -3562,6 +3635,51 @@ pub(super) fn initializer_temp_count_for_tests() -> Result<usize> {
     Ok(count)
 }
 
+#[cfg(test)]
+pub(super) fn observer_preserves_uninitialized_header_for_tests() -> Result<bool> {
+    std::fs::create_dir_all(registry_data_dir())?;
+    std::fs::create_dir_all(event_dir())?;
+    crate::flock::materialize(registry_lock_path())?;
+    let missing_snapshot = snapshot()?;
+    let missing_preserved = !header_path().exists();
+
+    crate::flock::materialize(header_path())?;
+    let zero_snapshot = snapshot()?;
+    let zero_preserved = std::fs::metadata(header_path())?.len() == 0;
+
+    let zero_header = OpenOptions::new()
+        .write(true)
+        .open(header_path())
+        .context("open zeroed observer-test header")?;
+    zero_header.set_len(HEADER_ALIGN as u64)?;
+    drop(zero_header);
+    let zeroed_snapshot = snapshot()?;
+    let zeroed_preserved = std::fs::read(header_path())?
+        .into_iter()
+        .all(|byte| byte == 0);
+    Ok(missing_snapshot.is_empty()
+        && zero_snapshot.is_empty()
+        && zeroed_snapshot.is_empty()
+        && missing_preserved
+        && zero_preserved
+        && zeroed_preserved)
+}
+
+#[cfg(test)]
+pub(super) fn prepare_zeroed_uninitialized_header_for_tests() -> Result<()> {
+    std::fs::create_dir_all(registry_data_dir())?;
+    std::fs::create_dir_all(event_dir())?;
+    crate::flock::materialize(registry_lock_path())?;
+    let header = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(header_path())
+        .context("create zeroed observer-test header")?;
+    header.set_len(HEADER_ALIGN as u64)?;
+    Ok(())
+}
+
 fn validate_claim(claim: &ClaimSet) -> Result<()> {
     if claim.is_empty() {
         anyhow::bail!("queue claims must designate a non-empty exact reservation");
@@ -3657,7 +3775,7 @@ fn required_resource_bits(claim: &ClaimSet) -> usize {
         .max()
         .unwrap_or(0)
         .saturating_add(1);
-    // The v6 mapping is deliberately overprovisioned once. It never needs a
+    // The v7 mapping is deliberately overprovisioned once. It never needs a
     // migration/grow protocol when the first low-index ticket is followed by a
     // valid sparse CPU/LLC index on the same host.
     claim_bits.max(host_cpu_resource_bits()).max(4096)
@@ -3698,11 +3816,11 @@ fn notify_path() -> PathBuf {
 }
 
 fn registry_data_dir() -> PathBuf {
-    protocol_dir().join("ktstr-acquire-registry-v6")
+    protocol_dir().join("ktstr-acquire-registry-v7")
 }
 
 pub(super) fn event_dir() -> PathBuf {
-    protocol_dir().join("ktstr-acquire-events-v6")
+    protocol_dir().join("ktstr-acquire-events-v7")
 }
 
 pub(super) fn notify_basename() -> Result<std::ffi::OsString> {
@@ -4086,7 +4204,25 @@ impl Table {
     }
 
     fn open_existing() -> Result<Self> {
-        Self::open(1)
+        let path = header_path();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open existing queue registry {}", path.display()))?;
+        if file.metadata()?.len() == 0 {
+            anyhow::bail!(
+                "existing queue registry {} has no initialized header",
+                path.display()
+            );
+        }
+        let header = unsafe { MmapMut::map_mut(&file) }?;
+        let layout = HeaderLayout::validate(&header)?;
+        Ok(Self {
+            header,
+            layout,
+            chunks: BTreeMap::new(),
+        })
     }
 
     fn next_ticket(&self) -> Result<u64> {
@@ -4800,6 +4936,7 @@ impl Table {
     }
 
     fn remove_record(&mut self, record: &Record, acquired: bool) -> Result<()> {
+        let removed_coordinator = self.coordinator_ticket() == record.ticket;
         self.begin_transaction()?;
         if acquired {
             self.publish_claim_busy(&record.claim)?;
@@ -4809,7 +4946,9 @@ impl Table {
             self.mark_claim_changed(record.ticket)?;
         }
         crash_at_for_tests("remove_record_before_election");
-        self.elect_coordinator_in_transaction()?;
+        if removed_coordinator {
+            self.elect_coordinator_in_transaction()?;
+        }
         if !acquired {
             self.set_pending_flag(PENDING_RESCAN);
         }
@@ -4818,12 +4957,7 @@ impl Table {
     }
 
     fn remove_record_in_transaction(&mut self, record: &Record, acquired: bool) -> Result<()> {
-        if !acquired && self.coordinator_ticket() == record.ticket {
-            // The coordinator may have acquired partials for a freshly
-            // planned alternative but crashed before publishing that exact
-            // claim. Its immutable watch is the only sound crash envelope.
-            self.mark_possible_release(&record.watch.cpus, &record.watch.llcs)?;
-        } else if !acquired && record.state == STATE_GRANTED {
+        if !acquired && record.state == STATE_GRANTED {
             // A granted callback probes without EX and may die while
             // holding its exact fds, before committing acquired removal.
             self.mark_possible_release(&record.claim.cpus, &record.claim.llcs)?;
@@ -4955,7 +5089,7 @@ impl Table {
         Ok(FutexSlot { _map: map, ptr })
     }
 
-    fn grant_compatible(&mut self) -> Result<ClaimSet> {
+    fn grant_compatible(&mut self) -> Result<(ClaimSet, bool)> {
         let records = self.records()?;
         let mut cpu_any = vec![0u64; self.layout.words];
         let mut cpu_exclusive = vec![0u64; self.layout.words];
@@ -4963,6 +5097,7 @@ impl Table {
         let mut llc_exclusive = vec![0u64; self.layout.words];
         let claim_epoch = self.claim_epoch();
         let mut changed = false;
+        let mut coordinator_prefix_changed = false;
         self.bump_grant_scans();
 
         for record in records {
@@ -5003,7 +5138,32 @@ impl Table {
                     }
                     _ => true,
                 };
-            if record.state == STATE_REPLAN
+            if record.state == STATE_COORDINATOR {
+                // A coordinator can now sit behind live GRANTED/REPLAN
+                // callbacks. Keep its cached predecessor prefix synchronized
+                // by the same authoritative scan that refreshes callback
+                // prefixes. In particular, a predecessor that commits and
+                // later releases must disappear from this cache before the
+                // coordinator can retry the formerly-conflicting target.
+                let prefix = aggregate_from_words(
+                    self.layout.bits,
+                    &cpu_any,
+                    &cpu_exclusive,
+                    &llc_any,
+                    &llc_exclusive,
+                );
+                let (published_epoch, published_prefix) = self.cached_prefix(record.slot)?;
+                if published_epoch != claim_epoch || published_prefix != prefix {
+                    coordinator_prefix_changed |= published_prefix != prefix;
+                    self.publish_prefix(
+                        record.slot,
+                        &prefix,
+                        R_GRANT_EPOCH,
+                        claim_epoch,
+                        watch_serial,
+                    )?;
+                }
+            } else if record.state == STATE_REPLAN
                 && (replan_invalidated || prefix_invalid || watch_serial != record.issue_serial)
             {
                 // The callback runs outside the registry fence. Stamp its
@@ -5121,7 +5281,7 @@ impl Table {
         }
         self.finish_claim_scan();
         self.clear_pending_flag(PENDING_RESCAN);
-        self.aggregate_watch()
+        Ok((self.aggregate_watch()?, coordinator_prefix_changed))
     }
 
     fn prune_dead(&mut self) -> Result<()> {
@@ -5212,7 +5372,10 @@ impl Table {
                 // in-flight/dead heads. Batch every corpse and elect once.
                 self.prune_dead()?;
             }
-            return self.elect_coordinator();
+            // Clean transactions elect synchronously whenever a record enters
+            // WAITING. With no coordinator, a live callback-only list therefore
+            // contains no work that an election scan could discover.
+            return Ok(());
         }
         if coordinator != 0 {
             let _record = self
@@ -5250,20 +5413,32 @@ impl Table {
         if self.coordinator_ticket() != 0 {
             return Ok(());
         }
-        let head = read_u64(&self.header, H_ACTIVE_HEAD);
-        if head != NONE_SLOT {
-            let record = self.record(head)?.ok_or_else(|| {
-                anyhow::anyhow!("queue active-list head {head} does not name an active record")
+        let next_slot = self.next_slot()?;
+        let mut slot = read_u64(&self.header, H_ACTIVE_HEAD);
+        let mut visited = 0u64;
+        while slot != NONE_SLOT {
+            if visited >= next_slot {
+                anyhow::bail!(
+                    "queue registry v{VERSION} active list contains a cycle during coordinator election"
+                );
+            }
+            #[cfg(test)]
+            COORDINATOR_ELECTION_RECORD_READS
+                .with(|reads| reads.set(reads.get().saturating_add(1)));
+            let record = self.record(slot)?.ok_or_else(|| {
+                anyhow::anyhow!("queue active slot {slot} disappeared during coordinator election")
             })?;
-            if record.state != STATE_WAITING {
+            if record.state == STATE_WAITING {
+                self.set_coordinator(record.ticket, record.slot)?;
+                crash_at_for_tests("elect_header_before_state");
+                self.set_record_state(record.slot, STATE_COORDINATOR)?;
+                self.clear_record_blocked(record.slot)?;
+                self.wake_slot(record.slot)?;
+                self.bump_generation()?;
                 return Ok(());
             }
-            self.set_coordinator(record.ticket, record.slot)?;
-            crash_at_for_tests("elect_header_before_state");
-            self.set_record_state(record.slot, STATE_COORDINATOR)?;
-            self.clear_record_blocked(record.slot)?;
-            self.wake_slot(record.slot)?;
-            self.bump_generation()?;
+            slot = record.next_active;
+            visited += 1;
         }
         Ok(())
     }
