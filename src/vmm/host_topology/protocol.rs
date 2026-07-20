@@ -1509,6 +1509,7 @@ impl HeldLocks {
     }
 }
 
+#[cfg(test)]
 fn claim_from_resource_modes(
     resources: std::collections::BTreeMap<ResourceKey, FlockMode>,
 ) -> Result<ClaimSet> {
