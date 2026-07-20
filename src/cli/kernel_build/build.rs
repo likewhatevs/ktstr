@@ -2148,10 +2148,9 @@ mod tests {
         let (waiting_tx, waiting_rx) = std::sync::mpsc::sync_channel(1);
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
         let _worker = std::thread::spawn(move || {
-            let result =
-                acquire_source_tree_lock_with_wait_hook(&worker_canonical, "test", || {
-                    let _ = waiting_tx.send(());
-                });
+            let result = acquire_source_tree_lock_with_wait_hook(&worker_canonical, "test", || {
+                let _ = waiting_tx.send(());
+            });
             let _ = result_tx.send(result);
         });
 

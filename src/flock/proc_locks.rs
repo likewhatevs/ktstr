@@ -700,8 +700,7 @@ malformed
             "the placement batch must not resolve any cmdlines",
         );
 
-        let holder_rows =
-            resolve_holder_pid_sets_with(pid_rows, resolve_batched_holder_info);
+        let holder_rows = resolve_holder_pid_sets_with(pid_rows, resolve_batched_holder_info);
         assert!(
             holder_rows
                 .iter()

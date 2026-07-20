@@ -8,7 +8,7 @@
 //! readable directly from the final ELF.
 //!
 //! The wire records deliberately do not expose the Rust layout of
-//! [`Scheduler`](super::Scheduler) or [`KtstrTestEntry`](super::KtstrTestEntry).
+//! [`Scheduler`] or [`KtstrTestEntry`].
 //! They contain fixed-width scalars and explicit pointer/length descriptors.
 //! The pointers are final-ELF virtual addresses: in PIEs the reader applies
 //! dynamic `RELATIVE` relocations, while ET_EXEC and RELR-packed PIEs already
@@ -607,11 +607,8 @@ impl<'a> ElfStampReader<'a> {
             .as_ref()
             .map(|dynamic| (dynamic.info.relacount, dynamic.info.relcount))
             .unwrap_or_default();
-        let dynrela_relative_prefix = Self::relative_prefix_len(
-            &elf.dynrelas,
-            declared_rela_count,
-            relative_type,
-        );
+        let dynrela_relative_prefix =
+            Self::relative_prefix_len(&elf.dynrelas, declared_rela_count, relative_type);
         let dynrel_relative_prefix =
             Self::relative_prefix_len(&elf.dynrels, declared_rel_count, relative_type);
 
@@ -710,13 +707,8 @@ impl<'a> ElfStampReader<'a> {
     }
 
     fn pointer_relocation(&self, field_va: u64) -> Result<Option<PointerRelocation>, String> {
-        let rela = self.relocation_at(
-            &self.elf.dynrelas,
-            self.dynrela_relative_prefix,
-            field_va,
-        );
-        let rel =
-            self.relocation_at(&self.elf.dynrels, self.dynrel_relative_prefix, field_va);
+        let rela = self.relocation_at(&self.elf.dynrelas, self.dynrela_relative_prefix, field_va);
+        let rel = self.relocation_at(&self.elf.dynrels, self.dynrel_relative_prefix, field_va);
         self.classify_pointer_relocation(field_va, rela, rel)
     }
 
@@ -1769,14 +1761,13 @@ mod tests {
         let (executable, mapping) = map_current_test_executable_copy();
         let reader =
             ElfStampReader::new(&executable, &mapping).expect("sparsely parse test executable");
-        let stamp_ranges = [DECLARATION_SECTION, TEST_SECTION]
-            .map(|section| {
-                let (address, bytes) = reader
-                    .section(section)
-                    .expect("find scheduler-manifest stamp section")
-                    .expect("scheduler-manifest stamp section must be linked");
-                address..address + bytes.len() as u64
-            });
+        let stamp_ranges = [DECLARATION_SECTION, TEST_SECTION].map(|section| {
+            let (address, bytes) = reader
+                .section(section)
+                .expect("find scheduler-manifest stamp section")
+                .expect("scheduler-manifest stamp section must be linked");
+            address..address + bytes.len() as u64
+        });
 
         let mut checked = 0usize;
         for (relocations, relative_prefix) in [
