@@ -88,6 +88,9 @@ mod argsplit;
 #[cfg(test)]
 #[path = "cargo_ktstr/parse_tests.rs"]
 mod parse_tests;
+#[cfg(test)]
+#[path = "cargo_ktstr/test_env.rs"]
+mod test_env;
 
 use clap::{CommandFactory, Parser};
 use ktstr::cli::KernelCommand;

@@ -1438,8 +1438,7 @@ fn render_failure_dump_file_single_schema() {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     std::fs::write(tmp.path(), json).expect("write tempfile");
 
-    let rendered =
-        render_failure_dump_file(tmp.path()).expect("single-schema must render Some");
+    let rendered = render_failure_dump_file(tmp.path()).expect("single-schema must render Some");
     assert!(
         rendered.starts_with("--- repro VM failure dump ---"),
         "header missing: {rendered}"
@@ -1470,8 +1469,7 @@ fn render_failure_dump_file_dual_schema() {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     std::fs::write(tmp.path(), json).expect("write tempfile");
 
-    let rendered =
-        render_failure_dump_file(tmp.path()).expect("dual-schema must render Some");
+    let rendered = render_failure_dump_file(tmp.path()).expect("dual-schema must render Some");
     assert!(
         rendered.starts_with("--- repro VM failure dump ---"),
         "header missing: {rendered}"
@@ -1492,8 +1490,7 @@ fn render_failure_dump_file_absent_schema_still_preserves_artifact_pointer() {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     std::fs::write(tmp.path(), json).expect("write tempfile");
 
-    let rendered =
-        render_failure_dump_file(tmp.path()).expect("existing artifact must summarize");
+    let rendered = render_failure_dump_file(tmp.path()).expect("existing artifact must summarize");
     assert!(rendered.contains(&tmp.path().display().to_string()));
 }
 
@@ -1502,8 +1499,7 @@ fn render_failure_dump_file_unknown_schema_still_preserves_artifact_pointer() {
     let json = r#"{"schema":"triple","maps":[],"vcpu_regs":[],"sdt_allocations":[]}"#;
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     std::fs::write(tmp.path(), json).expect("write tempfile");
-    let rendered =
-        render_failure_dump_file(tmp.path()).expect("existing artifact must summarize");
+    let rendered = render_failure_dump_file(tmp.path()).expect("existing artifact must summarize");
     assert!(rendered.contains(&tmp.path().display().to_string()));
 }
 
@@ -1511,8 +1507,7 @@ fn render_failure_dump_file_unknown_schema_still_preserves_artifact_pointer() {
 fn render_failure_dump_file_invalid_json_still_preserves_artifact_pointer() {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     std::fs::write(tmp.path(), "not json").expect("write tempfile");
-    let rendered =
-        render_failure_dump_file(tmp.path()).expect("existing artifact must summarize");
+    let rendered = render_failure_dump_file(tmp.path()).expect("existing artifact must summarize");
     assert!(rendered.contains(&tmp.path().display().to_string()));
 }
 

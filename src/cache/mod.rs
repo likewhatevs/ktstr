@@ -103,6 +103,31 @@ pub fn cargo_build_output_lock_root() -> anyhow::Result<std::path::PathBuf> {
     resolve_cache_root_with_suffix("cargo-build-output-v2")
 }
 
+/// Coordination namespace for input-addressed scheduler workspace builds.
+///
+/// `cargo-ktstr` is a separate binary crate, so this public (hidden)
+/// entrypoint gives its scheduler prebuild planner the same cache-root
+/// cascade as the library's content CAS. The cache implementation keeps its
+/// own versioned record/lock subdirectories below this root; there is no
+/// lookup of an older scheduler-build namespace.
+#[doc(hidden)]
+pub fn scheduler_build_cache_root() -> anyhow::Result<std::path::PathBuf> {
+    resolve_cache_root_with_suffix("scheduler-build-v1")
+}
+
+/// Return ktstr's stable, fixed-seed fast digest for one exact file revision.
+///
+/// This is the source-input half of the scheduler-build cache identity. It
+/// uses the same machine-wide inode-revision memo as content-CAS publication,
+/// so repeated source-tree walks do not reread unchanged files in one shared
+/// checkout.
+#[doc(hidden)]
+pub fn content_file_digest(path: impl AsRef<std::path::Path>) -> anyhow::Result<u64> {
+    let path = path.as_ref();
+    let pinned = pin_content_file(path)?;
+    content::cached_file_digest(pinned.source(), pinned.identity)
+}
+
 /// One immutable, content-addressed snapshot of an input file.
 ///
 /// The original file descriptor and the shared CAS lease remain live until

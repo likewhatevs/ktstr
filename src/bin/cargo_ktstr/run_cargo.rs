@@ -1871,9 +1871,10 @@ fn run_cargo_sub(
     // identical instrumented build. User-owned retain/merge modes keep their
     // own no-clean semantics.
     //
-    // acquire_build_reservation uses Consolidate placement (packs onto
-    // already-held LLCs, leaving whole LLCs free for exclusive perf-mode
-    // reservations — right for a throughput-elastic compile).
+    // acquire_build_reservation consolidates the LLC footprint (leaving whole
+    // cache domains free for exclusive perf-mode reservations), while choosing
+    // least-held CPUs within it and sizing elastic parallelism from unshared
+    // capacity first.
     let needs_prebuild = cargo_sub_needs_reserved_prebuild(sub_argv, &args);
     let archive_reuse_path = if cargo_sub_uses_nextest(sub_argv, &args)
         && !llvm_cov_has_lifecycle_flag(&args, "--no-run")
@@ -3704,8 +3705,9 @@ pub(crate) fn run_llvm_cov(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
-    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+    use std::sync::Arc;
+
+    use crate::test_env::{ChildEnv, is_reexec_case, reexec_current_test};
 
     fn v(s: &str) -> Version {
         Version::parse(s).expect("test version literal is valid semver")
@@ -4876,54 +4878,6 @@ mod tests {
         );
     }
 
-    /// Serialize env mutation across this binary's tests. nextest runs
-    /// tests as parallel threads in ONE process, and `set_var` is
-    /// process-global; the lib's `lock_env`/`EnvVarGuard` are
-    /// `pub(crate)` to the `ktstr` crate and unreachable from this
-    /// binary crate, so the orchestrator-env tests carry their own
-    /// lock + save/restore guard.
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Save-and-restore guard for a single env var; restores the prior
-    /// value (or absence) on drop. Hold the [`env_lock`] for its life.
-    struct EnvVar {
-        key: &'static str,
-        prev: Option<OsString>,
-    }
-
-    impl EnvVar {
-        fn set(key: &'static str, val: impl AsRef<std::ffi::OsStr>) -> Self {
-            let prev = std::env::var_os(key);
-            // SAFETY: `env_lock` serializes env-mutating tests; no other
-            // test reads CARGO_TARGET_DIR / KTSTR_RUNS_ROOT concurrently.
-            unsafe { std::env::set_var(key, val) };
-            Self { key, prev }
-        }
-        fn remove(key: &'static str) -> Self {
-            let prev = std::env::var_os(key);
-            // SAFETY: see `set`.
-            unsafe { std::env::remove_var(key) };
-            Self { key, prev }
-        }
-    }
-
-    impl Drop for EnvVar {
-        fn drop(&mut self) {
-            // SAFETY: see `EnvVar::set`.
-            unsafe {
-                match &self.prev {
-                    Some(v) => std::env::set_var(self.key, v),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
-
     /// The orchestrator stamps `KTSTR_RUNS_ROOT` = `{target}/ktstr`
     /// (absolute) so child test processes' sidecar writes AND the
     /// post-run footer reader resolve the SAME dir — the workspace
@@ -4931,14 +4885,24 @@ mod tests {
     /// pre-set override, `install_runs_root_env` must export that path.
     #[test]
     fn install_runs_root_env_stamps_absolute_target_subdir() {
-        let _lock = env_lock();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _g0 = EnvVar::remove(ktstr::KTSTR_RUNS_ROOT_ENV);
-        let _g1 = EnvVar::set("CARGO_TARGET_DIR", tmp.path());
+        const CASE: &str = "install-runs-root-absolute";
+        if !is_reexec_case(CASE) {
+            let tmp = tempfile::TempDir::new().unwrap();
+            reexec_current_test(
+                CASE,
+                [
+                    ChildEnv::remove(ktstr::KTSTR_RUNS_ROOT_ENV),
+                    ChildEnv::set("CARGO_TARGET_DIR", tmp.path()),
+                ],
+            );
+            return;
+        }
+
+        let target_dir = std::path::PathBuf::from(std::env::var_os("CARGO_TARGET_DIR").unwrap());
         install_runs_root_env();
         assert_eq!(
             std::env::var_os(ktstr::KTSTR_RUNS_ROOT_ENV).map(std::path::PathBuf::from),
-            Some(tmp.path().join("ktstr")),
+            Some(target_dir.join("ktstr")),
             "orchestrator must export the absolute {{target}}/ktstr so the \
              child writers and the footer reader agree on one dir",
         );
@@ -4949,11 +4913,22 @@ mod tests {
     /// rather than clobbering it with the cargo target dir.
     #[test]
     fn install_runs_root_env_is_idempotent_when_already_set() {
-        let _lock = env_lock();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let preset = tmp.path().join("operator-chosen-root");
-        let _g0 = EnvVar::set(ktstr::KTSTR_RUNS_ROOT_ENV, &preset);
-        let _g1 = EnvVar::set("CARGO_TARGET_DIR", tmp.path());
+        const CASE: &str = "install-runs-root-idempotent";
+        if !is_reexec_case(CASE) {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let preset = tmp.path().join("operator-chosen-root");
+            reexec_current_test(
+                CASE,
+                [
+                    ChildEnv::set(ktstr::KTSTR_RUNS_ROOT_ENV, &preset),
+                    ChildEnv::set("CARGO_TARGET_DIR", tmp.path()),
+                ],
+            );
+            return;
+        }
+
+        let preset =
+            std::path::PathBuf::from(std::env::var_os(ktstr::KTSTR_RUNS_ROOT_ENV).unwrap());
         install_runs_root_env();
         assert_eq!(
             std::env::var_os(ktstr::KTSTR_RUNS_ROOT_ENV).map(std::path::PathBuf::from),
@@ -4969,9 +4944,18 @@ mod tests {
     /// empty-footer split.
     #[test]
     fn install_runs_root_env_absolutizes_relative_target() {
-        let _lock = env_lock();
-        let _g0 = EnvVar::remove(ktstr::KTSTR_RUNS_ROOT_ENV);
-        let _g1 = EnvVar::set("CARGO_TARGET_DIR", "relative/target");
+        const CASE: &str = "install-runs-root-relative";
+        if !is_reexec_case(CASE) {
+            reexec_current_test(
+                CASE,
+                [
+                    ChildEnv::remove(ktstr::KTSTR_RUNS_ROOT_ENV),
+                    ChildEnv::set("CARGO_TARGET_DIR", "relative/target"),
+                ],
+            );
+            return;
+        }
+
         install_runs_root_env();
         let got = std::env::var_os(ktstr::KTSTR_RUNS_ROOT_ENV).map(std::path::PathBuf::from);
         let expected = std::env::current_dir()
@@ -6379,14 +6363,24 @@ cargo-llvm-cov diagnostic
     /// `acquire_build_reservation_plan_and_make_jobs_consistent`.
     #[test]
     fn reserved_prebuild_takes_llc_lock_sh_under_lock_dir_isolation() {
-        let _lock = env_lock();
-        let lock_dir = tempfile::TempDir::new().expect("tempdir");
-        // Isolate the flock namespace into the tempdir and clear every
-        // short-circuit so the reservation actually attempts the flock.
-        let _g_lockdir = EnvVar::set(ktstr::KTSTR_LOCK_DIR_ENV, lock_dir.path());
-        let _g_bypass = EnvVar::remove(ktstr::KTSTR_BYPASS_LLC_LOCKS_ENV);
-        let _g_testmode = EnvVar::remove(ktstr::KTSTR_CARGO_TEST_MODE_ENV);
-        let _g_cap = EnvVar::remove(ktstr::KTSTR_CPU_CAP_ENV);
+        const CASE: &str = "reserved-prebuild-lock-isolation";
+        if !is_reexec_case(CASE) {
+            let lock_dir = tempfile::TempDir::new().expect("tempdir");
+            // Isolate the flock namespace into the tempdir and clear every
+            // short-circuit so the reservation actually attempts the flock.
+            reexec_current_test(
+                CASE,
+                [
+                    ChildEnv::set(ktstr::KTSTR_LOCK_DIR_ENV, lock_dir.path()),
+                    ChildEnv::remove(ktstr::KTSTR_BYPASS_LLC_LOCKS_ENV),
+                    ChildEnv::remove(ktstr::KTSTR_CARGO_TEST_MODE_ENV),
+                    ChildEnv::remove(ktstr::KTSTR_CPU_CAP_ENV),
+                ],
+            );
+            return;
+        }
+        let lock_dir =
+            std::path::PathBuf::from(std::env::var_os(ktstr::KTSTR_LOCK_DIR_ENV).unwrap());
 
         match ktstr::cli::acquire_build_reservation_waiting("test", None) {
             Ok(reservation) => {
@@ -6401,7 +6395,7 @@ cargo-llvm-cov diagnostic
                 // reserved LLC into the isolated dir. Assert at least one
                 // `ktstr-llc-*.lock` landed there while the reservation is
                 // still held.
-                let has_llc_lock = std::fs::read_dir(lock_dir.path())
+                let has_llc_lock = std::fs::read_dir(&lock_dir)
                     .expect("read isolated lock dir")
                     .flatten()
                     .any(|e| {

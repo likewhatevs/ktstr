@@ -93,6 +93,44 @@ fn scheduler_exit_autoload_selects_one_complete_generation() {
     );
 }
 
+/// Linux 7.3 introduces `sched_ext_exit` with
+/// `TP_PROTO(struct scx_sched *sch, __u32 kind)`. `BPF_PROG` exposes those
+/// explicit tracepoint arguments in order, so dropping the leading scheduler
+/// pointer would reinterpret arg0 as `kind` and make the verifier reject the
+/// resulting pointer-to-u32 operations. Keep the source-level ABI contract
+/// pinned independently of the selector/autoload tests above.
+#[test]
+fn sched_ext_exit_source_matches_linux_7_3_tracepoint_abi() {
+    let source = include_str!("../bpf/probe.bpf.c");
+    let prototype = "int BPF_PROG(ktstr_trigger_tp, struct scx_sched *sch, unsigned int kind)";
+    assert!(
+        source.contains(prototype),
+        "7.3 sched_ext_exit wrapper must bind `sch` to arg0 and `kind` to arg1"
+    );
+    assert!(
+        !source.contains("int BPF_PROG(ktstr_trigger_tp, unsigned int kind)"),
+        "one-argument wrapper reads the scheduler pointer as the exit kind"
+    );
+
+    let wrapper = source
+        .split_once(prototype)
+        .map(|(_, suffix)| suffix)
+        .expect("sched_ext_exit wrapper prototype")
+        .split_once("SEC(\"kprobe/scx_vexit\")")
+        .map(|(body, _)| body)
+        .expect("sched_ext_exit wrapper ends before the older-kernel fallback");
+    for required in [
+        "if (kind < SCX_EXIT_ERROR)",
+        "ktstr_trigger_error(ctx, sch, kind,",
+        "kind == SCX_EXIT_ERROR_BPF, true",
+    ] {
+        assert!(
+            wrapper.contains(required),
+            "7.3 sched_ext_exit wrapper lost `{required}`"
+        );
+    }
+}
+
 #[test]
 fn raw_scx_vexit_source_pairs_entry_state_with_accepted_return() {
     let source = include_str!("../bpf/probe.bpf.c");

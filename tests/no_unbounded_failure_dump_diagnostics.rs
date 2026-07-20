@@ -8,9 +8,7 @@ const ASSERTION_FILES: &[&str] = &[
     "tests/failure_dump_e2e.rs",
     "tests/silent_drop_e2e.rs",
 ];
-const PRODUCTION_FAILURE_OUTPUT_FILES: &[&str] = &[
-    "src/test_support/probe.rs",
-];
+const PRODUCTION_FAILURE_OUTPUT_FILES: &[&str] = &["src/test_support/probe.rs"];
 const FORBIDDEN: &[&str] = &[
     "{any}",
     "{report}",

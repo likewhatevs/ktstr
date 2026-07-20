@@ -1686,6 +1686,123 @@ fn plan_from_snapshots_consolidation_overrides_fresh_ordering() {
     );
 }
 
+/// Elastic planners retain held-first Consolidate ordering while rotating the
+/// fresh suffix. Distinct process-stable rotations must therefore fan out both
+/// on a cold host and when a partially usable held LLC cannot cover the whole
+/// target. Returned plans remain sorted in canonical acquisition order.
+#[test]
+fn elastic_fresh_rotations_fan_out_cold_prefix_and_warm_spill_suffix() {
+    let topo = synth_host_topo(&[
+        (vec![0], 0),
+        (vec![1], 0),
+        (vec![2], 0),
+        (vec![3], 0),
+        (vec![4], 0),
+        (vec![5], 0),
+        (vec![6], 0),
+        (vec![7], 0),
+    ]);
+    let cold_snapshots: Vec<LlcSnapshot> = (0..8)
+        .map(|llc_idx| LlcSnapshot {
+            llc_idx,
+            holders: Vec::new(),
+            holder_count: 0,
+            exclusive_held: false,
+        })
+        .collect();
+    let allowed: std::collections::BTreeSet<usize> = (0..8).collect();
+    let barrier = std::sync::Barrier::new(3);
+
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            barrier.wait();
+            plan_from_snapshots_with_fresh_rotation(
+                &cold_snapshots,
+                2,
+                &topo,
+                &allowed,
+                |_, _| 10,
+                PlacementPolicy::Consolidate,
+                Some(0),
+            )
+        });
+        let second = scope.spawn(|| {
+            barrier.wait();
+            plan_from_snapshots_with_fresh_rotation(
+                &cold_snapshots,
+                2,
+                &topo,
+                &allowed,
+                |_, _| 10,
+                PlacementPolicy::Consolidate,
+                Some(2),
+            )
+        });
+        barrier.wait();
+        (
+            first.join().expect("first cold planner"),
+            second.join().expect("second cold planner"),
+        )
+    });
+
+    assert_eq!(first, vec![0, 1]);
+    assert_eq!(second, vec![2, 3]);
+    let first: std::collections::BTreeSet<_> = first.into_iter().collect();
+    let second: std::collections::BTreeSet<_> = second.into_iter().collect();
+    assert!(
+        first.is_disjoint(&second),
+        "distinct cold rotations must choose disjoint LLC prefixes",
+    );
+
+    let warm_topo = synth_host_topo(&[
+        (vec![0, 1, 2, 3], 0),
+        (vec![4, 5, 6, 7], 0),
+        (vec![8, 9, 10, 11], 0),
+        (vec![12, 13, 14, 15], 0),
+        (vec![16, 17, 18, 19], 0),
+    ]);
+    let warm_snapshots: Vec<LlcSnapshot> = (0..5)
+        .map(|llc_idx| LlcSnapshot {
+            llc_idx,
+            holders: Vec::new(),
+            holder_count: if llc_idx == 4 { 3 } else { 0 },
+            exclusive_held: false,
+        })
+        .collect();
+    // The held LLC contributes only CPUs 16 and 17 inside this cpuset. A
+    // six-CPU target must consolidate there first, then take one whole fresh
+    // four-CPU LLC. Distinct rotations should choose distinct spill LLCs.
+    let warm_allowed: std::collections::BTreeSet<usize> = (0..18).collect();
+    let first = plan_from_snapshots_with_fresh_rotation(
+        &warm_snapshots,
+        6,
+        &warm_topo,
+        &warm_allowed,
+        |_, _| 10,
+        PlacementPolicy::Consolidate,
+        Some(0),
+    );
+    let second = plan_from_snapshots_with_fresh_rotation(
+        &warm_snapshots,
+        6,
+        &warm_topo,
+        &warm_allowed,
+        |_, _| 10,
+        PlacementPolicy::Consolidate,
+        Some(2),
+    );
+    assert_eq!(
+        first,
+        vec![0, 4],
+        "held LLC must score first, with the final plan sorted for acquisition",
+    );
+    assert_eq!(
+        second,
+        vec![2, 4],
+        "the held LLC stays selected while the fresh spill suffix rotates",
+    );
+}
+
 /// `plan_from_snapshots` NUMA-locality invariant: a single-node
 /// fit (target ≤ seed-node capacity) must NEVER spill. 4 LLCs
 /// split 2+2 across nodes 0/1, all fresh, target=2 → selected
@@ -1998,7 +2115,10 @@ fn elastic_build_uses_shared_capacity_when_no_cpu_is_unshared() {
         "equal held LLCs consolidate deterministically onto the first domain",
     );
     assert_eq!(
-        plan.cpus.iter().copied().collect::<std::collections::BTreeSet<_>>(),
+        plan.cpus
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
         [0usize, 1].into_iter().collect(),
         "fallback CPUs must remain inside the consolidated footprint",
     );

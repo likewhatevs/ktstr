@@ -405,6 +405,13 @@ impl CoordinationFile {
         flock_retry(&self.file, rustix::fs::FlockOperation::LockShared)
     }
 
+    pub(crate) fn try_lock_shared(&mut self) -> rustix::io::Result<()> {
+        rustix::fs::flock(
+            &self.file,
+            rustix::fs::FlockOperation::NonBlockingLockShared,
+        )
+    }
+
     /// Enter the kernel writer queue after a winner vanished without
     /// publication. A blocking writer cannot be starved by a reader herd.
     pub(crate) fn lock_exclusive(&mut self) -> rustix::io::Result<()> {
@@ -444,12 +451,44 @@ pub(crate) fn load_or_build<T, L, B>(
     namespace_gate_path: &Path,
     lock_path: &Path,
     subject: &str,
-    mut load: L,
+    load: L,
     build: B,
 ) -> Result<T>
 where
     L: FnMut() -> Result<Option<T>>,
     B: FnOnce() -> Result<T>,
+{
+    load_or_build_with_wait(
+        namespace_gate_path,
+        lock_path,
+        subject,
+        load,
+        build,
+        |coordination| coordination.lock_shared().map_err(anyhow::Error::from),
+        |coordination| coordination.lock_exclusive().map_err(anyhow::Error::from),
+    )
+}
+
+/// [`load_or_build`] with caller-owned behavior around contended waits.
+///
+/// Cache layers whose producer can legitimately run for minutes use this to
+/// surface a heartbeat while retaining this module's exact election,
+/// successor, and namespace-gate semantics. Each hook must ultimately acquire
+/// the requested lock on the supplied coordination file.
+pub(crate) fn load_or_build_with_wait<T, L, B, WS, WX>(
+    namespace_gate_path: &Path,
+    lock_path: &Path,
+    subject: &str,
+    mut load: L,
+    build: B,
+    mut wait_shared: WS,
+    mut wait_exclusive: WX,
+) -> Result<T>
+where
+    L: FnMut() -> Result<Option<T>>,
+    B: FnOnce() -> Result<T>,
+    WS: FnMut(&mut CoordinationFile) -> Result<()>,
+    WX: FnMut(&mut CoordinationFile) -> Result<()>,
 {
     if let Some(value) = load()? {
         return Ok(value);
@@ -459,12 +498,18 @@ where
     let mut wait_for_successor = false;
     loop {
         let mut coordination = open_coord_file(namespace_gate_path, lock_path)?;
-        let election = if wait_for_successor {
-            coordination.lock_exclusive()
-        } else {
-            coordination.try_lock_exclusive()
-        };
-        match election {
+        if wait_for_successor {
+            wait_exclusive(&mut coordination)
+                .with_context(|| format!("elect successor {subject} builder"))?;
+            coordination.release_namespace_gate();
+            if let Some(value) = load()? {
+                return Ok(value);
+            }
+            return build
+                .take()
+                .context("content builder closure was already consumed")?();
+        }
+        match coordination.try_lock_exclusive() {
             Ok(()) => {
                 coordination.release_namespace_gate();
                 if let Some(value) = load()? {
@@ -476,9 +521,7 @@ where
                 );
             }
             Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
-                coordination
-                    .lock_shared()
-                    .with_context(|| format!("wait for {subject}"))?;
+                wait_shared(&mut coordination).with_context(|| format!("wait for {subject}"))?;
                 coordination.release_namespace_gate();
                 if let Some(value) = load()? {
                     return Ok(value);

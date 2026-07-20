@@ -253,6 +253,109 @@ fn hugepage_even_split_mib(total_mib: u32, nodes: u32) -> Vec<u32> {
         .collect()
 }
 
+/// Expand an explicit per-node memory declaration to a larger deferred total.
+///
+/// `Topology::with_nodes` describes the relative memory shape as well as the
+/// minimum amount attached to each node. Deferred payload sizing may discover
+/// that the VM needs more RAM than that declared minimum. Preserve the
+/// declaration exactly when it already covers the computed total; otherwise
+/// distribute only the excess in proportion to each node's declared memory.
+///
+/// Growth is apportioned in whole 2 MiB units with the largest-remainder
+/// method: floor every proportional share, then hand the remaining units to
+/// the largest fractional remainders, breaking ties by ascending node index.
+/// If the excess has a final odd MiB, it lands on the last memory-bearing
+/// node. Thus a declaration whose internal boundaries are 2 MiB-aligned stays
+/// hugetlb-compatible after deferred growth. A declaration that is already
+/// internally unaligned is preserved as-is, and a declared zero-memory node
+/// keeps zero memory.
+fn explicit_node_memory_mib(
+    nodes: &[super::topology::NumaNode],
+    total_memory_mib: u32,
+) -> Result<Vec<u32>> {
+    let declared_total_mib = nodes
+        .iter()
+        .try_fold(0u64, |total, node| {
+            total.checked_add(u64::from(node.memory_mib))
+        })
+        .context("sum explicit NUMA node memory")?;
+    anyhow::ensure!(
+        u64::from(total_memory_mib) >= declared_total_mib,
+        "total_memory_mib ({total_memory_mib}) must be at least \
+         sum of node memory_mib ({declared_total_mib})"
+    );
+    anyhow::ensure!(
+        declared_total_mib > 0,
+        "at least one node must have non-zero memory"
+    );
+
+    let excess_mib = u64::from(total_memory_mib) - declared_total_mib;
+    if excess_mib == 0 {
+        return Ok(nodes.iter().map(|node| node.memory_mib).collect());
+    }
+
+    let excess_hugepages = excess_mib / 2;
+    let odd_tail_mib = excess_mib % 2;
+    let mut result = Vec::with_capacity(nodes.len());
+    let mut fractional_remainders = Vec::with_capacity(nodes.len());
+    let mut distributed_hugepages = 0u64;
+    for node in nodes {
+        let scaled = excess_hugepages * u64::from(node.memory_mib);
+        let share = scaled / declared_total_mib;
+        let remainder = scaled % declared_total_mib;
+        distributed_hugepages += share;
+        let share_mib = share
+            .checked_mul(2)
+            .context("explicit NUMA excess hugepage share overflow")?;
+        result.push(
+            node.memory_mib
+                .checked_add(
+                    u32::try_from(share_mib).context("explicit NUMA excess hugepage share")?,
+                )
+                .context("expanded explicit NUMA node memory overflow")?,
+        );
+        fractional_remainders.push(remainder);
+    }
+
+    let remainder_hugepages = excess_hugepages - distributed_hugepages;
+    let mut remainder_order = (0..nodes.len()).collect::<Vec<_>>();
+    remainder_order.sort_by(|&a, &b| {
+        fractional_remainders[b]
+            .cmp(&fractional_remainders[a])
+            .then(a.cmp(&b))
+    });
+    anyhow::ensure!(
+        remainder_hugepages <= remainder_order.len() as u64,
+        "explicit NUMA proportional remainder ({remainder_hugepages} hugepages) \
+         exceeds node count ({})",
+        remainder_order.len()
+    );
+    for node_idx in remainder_order
+        .into_iter()
+        .take(remainder_hugepages as usize)
+    {
+        result[node_idx] = result[node_idx]
+            .checked_add(2)
+            .context("expanded explicit NUMA remainder overflow")?;
+    }
+    if odd_tail_mib != 0 {
+        let tail_node = nodes
+            .iter()
+            .rposition(|node| node.memory_mib != 0)
+            .expect("declared_total_mib > 0 guarantees a memory-bearing node");
+        result[tail_node] = result[tail_node]
+            .checked_add(1)
+            .context("expanded explicit NUMA odd tail overflow")?;
+    }
+
+    debug_assert_eq!(
+        result.iter().map(|&mib| u64::from(mib)).sum::<u64>(),
+        u64::from(total_memory_mib),
+        "expanded explicit NUMA memory must preserve the deferred total"
+    );
+    Ok(result)
+}
+
 impl NumaMemoryLayout {
     const HUGE_2MB: u64 = 2 * 1024 * 1024;
 
@@ -299,8 +402,10 @@ impl NumaMemoryLayout {
     /// `DRAM_START` on aarch64).
     ///
     /// `total_memory_mib`: total guest memory in MiB. For `with_nodes`
-    /// topologies, must equal the sum of all `NumaNode::memory_mib`.
-    /// For uniform topologies, memory is divided evenly across
+    /// topologies, the declared per-node sizes are minimums: an equal total is
+    /// preserved exactly, while a larger deferred total distributes only the
+    /// excess proportionally across the declared node sizes. A smaller total
+    /// is rejected. For uniform topologies, memory is divided evenly across
     /// `numa_nodes` nodes.
     /// `mmio_gap`: `Some((gap_start, gap_end))` on x86_64 (the sub-4GB
     /// device-MMIO hole `[0xC000_0000, 0x1_0000_0000)`); `None` on
@@ -324,15 +429,9 @@ impl NumaMemoryLayout {
 
         match topo.nodes {
             Some(nodes) => {
-                let node_total_mib: u32 = nodes.iter().map(|n| n.memory_mib).sum();
-                anyhow::ensure!(
-                    total_memory_mib == node_total_mib,
-                    "total_memory_mib ({total_memory_mib}) must equal \
-                     sum of node memory_mib ({node_total_mib})"
-                );
-
-                for (i, node) in nodes.iter().enumerate() {
-                    let size = (node.memory_mib as u64) << 20;
+                let effective_memory_mib = explicit_node_memory_mib(nodes, total_memory_mib)?;
+                for (i, memory_mib) in effective_memory_mib.into_iter().enumerate() {
+                    let size = u64::from(memory_mib) << 20;
                     if size == 0 {
                         continue;
                     }
@@ -1139,6 +1238,81 @@ mod tests {
         assert_eq!(layout.regions()[1].gpa_start, 128 << 20);
     }
 
+    #[test]
+    fn explicit_nodes_deferred_growth_distributes_only_the_excess() {
+        let topo = Topology::with_nodes(2, 1, &ASYM_NODES);
+        let layout = NumaMemoryLayout::compute(&topo, 1024, 0, None).unwrap();
+
+        assert_eq!(layout.regions().len(), 2);
+        assert_eq!(layout.regions()[0].size, 256 << 20);
+        assert_eq!(layout.regions()[1].size, 768 << 20);
+        assert_eq!(layout.regions()[1].gpa_start, 256 << 20);
+        assert_eq!(layout.total_bytes(), 1024 << 20);
+        assert_eq!(
+            topo.nodes.unwrap(),
+            &ASYM_NODES,
+            "deferred sizing must not mutate the declared topology"
+        );
+    }
+
+    #[test]
+    fn explicit_nodes_deferred_growth_uses_deterministic_largest_remainder() {
+        static ROUNDING_NODES: [NumaNode; 3] = [
+            NumaNode::new(1, 1),
+            NumaNode::new(1, 2),
+            NumaNode::new(1, 3),
+        ];
+        let topo = Topology::with_nodes(1, 1, &ROUNDING_NODES);
+        let layout = NumaMemoryLayout::compute(&topo, 10, 0, None).unwrap();
+        let sizes_mib = layout
+            .regions()
+            .iter()
+            .map(|region| region.size >> 20)
+            .collect::<Vec<_>>();
+
+        // Declared total is 6 MiB and excess is two 2 MiB units. Floored
+        // proportional shares are [0, 0, 1]; the final unit goes to node 1,
+        // whose fractional remainder is largest.
+        assert_eq!(sizes_mib, vec![1, 4, 5]);
+        assert_eq!(layout.total_bytes(), 10 << 20);
+    }
+
+    #[test]
+    fn explicit_nodes_deferred_growth_breaks_equal_remainders_by_node_id() {
+        static EQUAL_NODES: [NumaNode; 3] = [
+            NumaNode::new(1, 1),
+            NumaNode::new(1, 1),
+            NumaNode::new(1, 1),
+        ];
+        let topo = Topology::with_nodes(1, 1, &EQUAL_NODES);
+        let layout = NumaMemoryLayout::compute(&topo, 5, 0, None).unwrap();
+        let sizes_mib = layout
+            .regions()
+            .iter()
+            .map(|region| region.size >> 20)
+            .collect::<Vec<_>>();
+
+        assert_eq!(sizes_mib, vec![3, 1, 1]);
+        assert_eq!(layout.total_bytes(), 5 << 20);
+    }
+
+    #[test]
+    fn explicit_nodes_deferred_odd_tail_preserves_internal_hugetlb_boundary() {
+        let topo = Topology::with_nodes(4, 2, &TWO_NODES);
+        let layout = NumaMemoryLayout::compute(&topo, 513, 0, None).unwrap();
+
+        assert_eq!(layout.regions().len(), 2);
+        assert_eq!(layout.regions()[0].size, 256 << 20);
+        assert_eq!(layout.regions()[1].gpa_start, 256 << 20);
+        assert_eq!(layout.regions()[1].size, 257 << 20);
+        assert_eq!(layout.total_bytes(), 513 << 20);
+        assert_eq!(
+            layout.choose_memory_backing(true, false, 0).unwrap(),
+            MemoryBacking::HugeTlb2M,
+            "the final odd MiB must not make an internal NUMA boundary unaligned"
+        );
+    }
+
     static CXL_NODES: [NumaNode; 3] = [
         NumaNode::new(2, 256),
         NumaNode::new(2, 256),
@@ -1173,6 +1347,19 @@ mod tests {
     }
 
     #[test]
+    fn cxl_zero_memory_node_stays_zero_under_deferred_growth() {
+        let topo = Topology::with_nodes(4, 1, &CXL_ZERO_MEM);
+        let layout = NumaMemoryLayout::compute(&topo, 768, 0, None).unwrap();
+
+        assert_eq!(layout.regions().len(), 2);
+        assert_eq!(layout.regions()[0].node_id, 0);
+        assert_eq!(layout.regions()[0].size, 384 << 20);
+        assert_eq!(layout.regions()[1].node_id, 2);
+        assert_eq!(layout.regions()[1].size, 384 << 20);
+        assert_eq!(layout.total_bytes(), 768 << 20);
+    }
+
+    #[test]
     fn aarch64_dram_base() {
         let topo = Topology::with_nodes(4, 2, &TWO_NODES);
         let dram_base = 0x4000_0000u64;
@@ -1184,10 +1371,10 @@ mod tests {
     }
 
     #[test]
-    fn memory_mismatch_error() {
+    fn explicit_nodes_reject_total_below_declared_sum() {
         let topo = Topology::with_nodes(4, 2, &TWO_NODES);
-        let err = NumaMemoryLayout::compute(&topo, 1024, 0, None).unwrap_err();
-        assert!(format!("{err}").contains("must equal"), "got: {err}");
+        let err = NumaMemoryLayout::compute(&topo, 511, 0, None).unwrap_err();
+        assert!(format!("{err}").contains("must be at least"), "got: {err}");
     }
 
     #[test]

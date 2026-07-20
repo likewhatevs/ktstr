@@ -311,7 +311,7 @@ fn render_failure_dump_file(path: &std::path::Path) -> Option<String> {
         || summary.lines().count() > MAX_INLINE_FAILURE_DUMP_SUMMARY_LINES
     {
         tracing::warn!(
-            path = %path.display(),
+            path_bytes = path.as_os_str().as_encoded_bytes().len(),
             bytes = metadata.len(),
             "auto-repro failure-dump path exceeded the inline diagnostic limit"
         );

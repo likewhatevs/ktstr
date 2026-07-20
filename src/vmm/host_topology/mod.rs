@@ -2746,7 +2746,10 @@ fn discover_llc_snapshots_impl(
 ///
 /// Composite sort driven by three ordered keys:
 ///   1. Placement policy — [`PlacementPolicy::Consolidate`] prefers
-///      LLCs already holding peers (holder_count DESC);
+///      LLCs already holding peers (holder_count DESC); elastic
+///      callers rotate only the fresh suffix so simultaneous cold
+///      starts and post-consolidation spill do not converge on one
+///      prefix;
 ///      [`PlacementPolicy::Spread`] prefers the least-held LLCs
 ///      (holder_count ASC) with a caller-rotated tiebreak.
 ///   2. NUMA locality — after seeding on the highest-scored LLC's
@@ -2781,6 +2784,33 @@ fn plan_from_snapshots(
     allowed: &std::collections::BTreeSet<usize>,
     distance_fn: impl Fn(usize, usize) -> u8,
     policy: PlacementPolicy,
+) -> Vec<usize> {
+    plan_from_snapshots_with_fresh_rotation(
+        snapshots,
+        target_cpus,
+        topo,
+        allowed,
+        distance_fn,
+        policy,
+        None,
+    )
+}
+
+/// Elastic-build form of [`plan_from_snapshots`].
+///
+/// Every simultaneous elastic process would otherwise choose the same
+/// LLC-index prefix after exhausting any peer-held consolidation candidates.
+/// An explicit process-stable rotation breaks only the fresh-suffix symmetry;
+/// peer-held candidates retain ordinary Consolidate scoring and always remain
+/// ahead of every fresh candidate.
+fn plan_from_snapshots_with_fresh_rotation(
+    snapshots: &[LlcSnapshot],
+    target_cpus: usize,
+    topo: &HostTopology,
+    allowed: &std::collections::BTreeSet<usize>,
+    distance_fn: impl Fn(usize, usize) -> u8,
+    policy: PlacementPolicy,
+    consolidate_fresh_rotation: Option<usize>,
 ) -> Vec<usize> {
     if target_cpus == 0 {
         return Vec::new();
@@ -2847,6 +2877,12 @@ fn plan_from_snapshots(
                     .then(a.llc_idx.cmp(&b.llc_idx))
             });
             fresh.sort_by_key(|s| s.llc_idx);
+            if let Some(rotation) = consolidate_fresh_rotation
+                && !fresh.is_empty()
+            {
+                let count = fresh.len();
+                fresh.rotate_left(rotation % count);
+            }
             consolidation.into_iter().chain(fresh).collect()
         }
         // Least-held first, ties broken by rotated eligible position
@@ -3386,6 +3422,12 @@ where
         sizing,
         cancelled,
     } = request;
+    // Elastic builders preserve peer-held Consolidate ordering and give every
+    // process a stable tie rotation for the fresh suffix. This fans out both
+    // a cold-start herd and planners that need capacity beyond the currently
+    // held LLCs.
+    let elastic_fresh_rotation =
+        (sizing == LlcPlanSizing::Elastic).then(|| pid_window_offset(std::process::id(), 1 << 16));
     check_acquire_cancelled(cancelled)?;
     // Resolve the calling process's allowed cpuset. Plans must fit
     // inside this set — sched_setaffinity against a mask outside the
@@ -3523,13 +3565,14 @@ where
         );
         let claim_capacity_insufficient = live_capacity.is_none();
         let selected = if let Some(live_capacity) = &live_capacity {
-            plan_from_snapshots(
+            plan_from_snapshots_with_fresh_rotation(
                 &eligible,
                 live_capacity.target,
                 topo,
                 &live_capacity.eligible,
                 |from, to| test_topo.numa_distance(from, to),
                 llc_policy,
+                elastic_fresh_rotation,
             )
         } else {
             Vec::new()
@@ -3716,13 +3759,14 @@ where
         &queued_cpu_states,
     )
     .expect("a statically valid queued designation must have CPU capacity");
-    let queued_selected = plan_from_snapshots(
+    let queued_selected = plan_from_snapshots_with_fresh_rotation(
         &queued_snapshots,
         queued_capacity.target,
         topo,
         &queued_capacity.eligible,
         |from, to| test_topo.numa_distance(from, to),
         llc_policy,
+        elastic_fresh_rotation,
     );
     if queued_selected.is_empty() {
         return Err(ResourceContention {
@@ -3864,13 +3908,14 @@ where
             // needed while the live/registry snapshot exposes zero capacity.
             return Ok(None);
         };
-        let next_selected = plan_from_snapshots(
+        let next_selected = plan_from_snapshots_with_fresh_rotation(
             &snapshots,
             live_capacity.target,
             topo,
             &live_capacity.eligible,
             |from, to| test_topo.numa_distance(from, to),
             llc_policy,
+            elastic_fresh_rotation,
         );
         if next_selected.is_empty() {
             // Every statically valid alternative is temporarily excluded by
@@ -4013,13 +4058,14 @@ where
             &eligible_allowed,
             &cpu_states,
         ) {
-            let selected = plan_from_snapshots(
+            let selected = plan_from_snapshots_with_fresh_rotation(
                 &ready_snapshots,
                 live_capacity.target,
                 topo,
                 &live_capacity.eligible,
                 |from, to| test_topo.numa_distance(from, to),
                 llc_policy,
+                elastic_fresh_rotation,
             );
             if let Some((cpus, _)) = materialize_plan_cpus(
                 &selected,
@@ -4237,11 +4283,7 @@ fn live_cpu_capacity(
         let unshared = compatible
             .iter()
             .copied()
-            .filter(|cpu| {
-                states
-                    .get(cpu)
-                    .is_none_or(|state| state.other_holders == 0)
-            })
+            .filter(|cpu| states.get(cpu).is_none_or(|state| state.other_holders == 0))
             .collect::<std::collections::BTreeSet<_>>();
         let unshared_capacity = unshared.len();
         if unshared_capacity > 0 {
@@ -4341,10 +4383,7 @@ fn materialize_plan_cpus(
                 .flat_map(|idx| topo.llc_groups[*idx].cpus.iter().copied())
                 .filter(|cpu| eligible.contains(cpu))
                 .collect::<Vec<_>>();
-            rank(
-                &mut candidates,
-                PlacementPolicy::Spread { rotation },
-            );
+            rank(&mut candidates, PlacementPolicy::Spread { rotation });
             if candidates.len() < target_cpus {
                 return None;
             }
