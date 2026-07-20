@@ -111,9 +111,9 @@ const INITRD_ADDR: u64 = 0x800_0000; // 128 MiB
 /// avoids conflicts with early kernel allocations near the kernel image.
 ///
 /// Aligned to the prepared mapping granule (2 MiB), which satisfies both the
-/// guest-range geometry and Linux's hugetlb `MAP_FIXED` replacement rules.
-/// Destination host virtual addresses are validated separately against the
-/// runtime host page size.
+/// guest-range geometry and the complete-hugetlb-unmap boundary. Destination
+/// host virtual addresses are validated separately against the runtime host
+/// page size.
 #[cfg(target_arch = "aarch64")]
 fn aarch64_initrd_addr(memory_mib: u32, total_cpus: u32, initrd_max_size: u64) -> Result<u64> {
     // Ceiling is the PVTIME carve base, NOT the FDT address. setup_pvtime
@@ -315,9 +315,9 @@ fn validate_prepared_backing_extent(
 }
 
 /// Validate every property that can be checked before the first unsafe
-/// `MAP_FIXED`. Keeping this pure over prepared-range metadata makes the exact
-/// production validator directly testable with malformed gap/overlap/reorder
-/// fixtures.
+/// destination unmap. Keeping this pure over prepared-range metadata makes the
+/// exact production validator directly testable with malformed
+/// gap/overlap/reorder fixtures.
 fn validate_prepared_load(
     total_compressed: usize,
     compression: initramfs::InitrdCompression,
@@ -421,7 +421,12 @@ struct ValidatedPreparedSubrange {
 #[derive(Debug)]
 struct ValidatedPreparedRange {
     range: PreparedMapping,
+    /// Complete original destination extents. These are unmapped before any
+    /// file VMA is installed, including when the original backing is hugetlb.
     subranges: Vec<ValidatedPreparedSubrange>,
+    /// Primary extents with every overlay interval subtracted. Together with
+    /// `overlays`, these form one exact, disjoint cover of `subranges`.
+    primary_subranges: Vec<ValidatedPreparedSubrange>,
     overlays: Vec<ValidatedPreparedOverlay>,
 }
 
@@ -478,6 +483,120 @@ fn validate_prepared_extent_subranges(
     Ok(subranges)
 }
 
+fn prepared_subrange_slice(
+    source: ValidatedPreparedSubrange,
+    guest_start: u64,
+    guest_end: u64,
+) -> Result<ValidatedPreparedSubrange> {
+    anyhow::ensure!(
+        guest_start >= source.guest_addr
+            && guest_end > guest_start
+            && guest_end <= source.guest_addr.saturating_add(source.len as u64),
+        "prepared subrange slice escapes its source"
+    );
+    let delta = usize::try_from(guest_start - source.guest_addr)?;
+    let len = usize::try_from(guest_end - guest_start)?;
+    let host_addr = (source.host_addr as usize)
+        .checked_add(delta)
+        .context("prepared subrange slice host address overflow")? as *mut u8;
+    let file_offset = source
+        .file_offset
+        .checked_add(delta as u64)
+        .context("prepared subrange slice file offset overflow")?;
+    Ok(ValidatedPreparedSubrange {
+        guest_addr: guest_start,
+        host_addr,
+        file_offset,
+        len,
+    })
+}
+
+/// Subtract all validated overlay intervals from the primary extents.
+///
+/// The returned primary fragments plus the overlays are an exact disjoint
+/// cover of the original destination. This is computed before the first
+/// `munmap`, so every arithmetic/geometry failure remains non-destructive.
+fn disjoint_prepared_primary_subranges(
+    primary: &[ValidatedPreparedSubrange],
+    overlays: &[ValidatedPreparedOverlay],
+) -> Result<Vec<ValidatedPreparedSubrange>> {
+    let overlay_subranges: Vec<ValidatedPreparedSubrange> = overlays
+        .iter()
+        .flat_map(|overlay| overlay.subranges.iter().copied())
+        .collect();
+    anyhow::ensure!(
+        overlay_subranges.windows(2).all(|pair| {
+            pair[0].guest_addr.saturating_add(pair[0].len as u64) <= pair[1].guest_addr
+        }),
+        "prepared overlay subranges are not globally ordered and disjoint"
+    );
+
+    let mut fragments = Vec::new();
+    for source in primary.iter().copied() {
+        let source_end = source
+            .guest_addr
+            .checked_add(source.len as u64)
+            .context("prepared primary subrange end overflow")?;
+        let mut cursor = source.guest_addr;
+        for overlay in &overlay_subranges {
+            let overlay_end = overlay
+                .guest_addr
+                .checked_add(overlay.len as u64)
+                .context("prepared overlay subrange end overflow")?;
+            if overlay_end <= cursor {
+                continue;
+            }
+            if overlay.guest_addr >= source_end {
+                break;
+            }
+            anyhow::ensure!(
+                overlay.guest_addr >= cursor,
+                "prepared overlay subranges overlap while partitioning the primary"
+            );
+            if overlay.guest_addr > cursor {
+                fragments.push(prepared_subrange_slice(
+                    source,
+                    cursor,
+                    overlay.guest_addr.min(source_end),
+                )?);
+            }
+            cursor = overlay_end.min(source_end);
+            if cursor == source_end {
+                break;
+            }
+        }
+        if cursor < source_end {
+            fragments.push(prepared_subrange_slice(source, cursor, source_end)?);
+        }
+    }
+
+    let primary_len = primary.iter().try_fold(0usize, |total, subrange| {
+        total
+            .checked_add(subrange.len)
+            .context("prepared primary coverage length overflow")
+    })?;
+    let fragment_len = fragments.iter().try_fold(0usize, |total, subrange| {
+        total
+            .checked_add(subrange.len)
+            .context("prepared primary-fragment coverage length overflow")
+    })?;
+    let overlay_len = overlay_subranges
+        .iter()
+        .try_fold(0usize, |total, subrange| {
+            total
+                .checked_add(subrange.len)
+                .context("prepared overlay coverage length overflow")
+        })?;
+    anyhow::ensure!(
+        fragment_len
+            .checked_add(overlay_len)
+            .context("prepared disjoint coverage length overflow")?
+            == primary_len,
+        "prepared primary fragments and overlays do not exactly cover the destination"
+    );
+    Ok(fragments)
+}
+
 /// Resolve the complete guest-memory split before mutating any VMA. A mapping
 /// range may cross adjacent NUMA slots whose host virtual addresses are
 /// unrelated, but every resulting subrange must preserve the allocator's
@@ -523,9 +642,11 @@ fn validate_prepared_subranges(
             )?;
             overlays.push(ValidatedPreparedOverlay { overlay, subranges });
         }
+        let primary_subranges = disjoint_prepared_primary_subranges(&subranges, &overlays)?;
         validated.push(ValidatedPreparedRange {
             range,
             subranges,
+            primary_subranges,
             overlays,
         });
     }
@@ -558,7 +679,7 @@ where
             });
         }
         if let Err(error) = restore_numa(&subrange) {
-            // MAP_FIXED already installed this file mapping.
+            // The exact hole mapping is already live.
             guards.push(initramfs::CowOverlayGuard::new(fd));
             return Err(error).with_context(|| {
                 format!(
@@ -573,26 +694,45 @@ where
     Ok(())
 }
 
-/// Consume prevalidated ranges through the one strict production mapping
-/// shape. The callback seam lets unit tests observe ordering and injected
-/// failure without invoking `MAP_FIXED`; production supplies only
-/// `cow_overlay_file_borrowed`, so there is no byte-copy fallback branch.
-fn map_validated_prepared_ranges<Map, RestoreNuma>(
+/// Consume prevalidated ranges through the strict disjoint production shape.
+///
+/// Every complete destination is unmapped first. Only after all destinations
+/// are holes do we install primary fragments and overlays as non-overlapping
+/// file VMAs. The callback seams let tests prove ordering and partial-failure
+/// ownership; production uses `munmap` + `MAP_FIXED_NOREPLACE`, with no
+/// byte-copy or nested-replacement branch.
+fn map_validated_prepared_ranges<Unmap, Map, RestoreNuma>(
     guards: &mut Vec<initramfs::CowOverlayGuard>,
     validated: Vec<ValidatedPreparedRange>,
+    mut unmap: Unmap,
     mut map: Map,
     mut restore_numa: RestoreNuma,
 ) -> Result<()>
 where
+    Unmap: FnMut(&ValidatedPreparedSubrange) -> Result<()>,
     Map: FnMut(&ValidatedPreparedSubrange, &OwnedFd) -> Result<()>,
     RestoreNuma: FnMut(&ValidatedPreparedSubrange) -> Result<()>,
 {
+    // Complete the destructive phase before installing any file VMA. This
+    // dissolves hugetlb mappings only at their validated 2 MiB boundaries and
+    // ensures MAP_FIXED_NOREPLACE can enforce a truly disjoint final layout.
+    for validated_range in &validated {
+        for subrange in &validated_range.subranges {
+            unmap(subrange).with_context(|| {
+                format!(
+                    "unmap prepared initrd destination at guest {:#x} (len={})",
+                    subrange.guest_addr, subrange.len
+                )
+            })?;
+        }
+    }
+
     for validated_range in validated {
         map_one_validated_prepared_extent(
             guards,
             validated_range.range.fd,
-            validated_range.subranges,
-            "prepared initrd",
+            validated_range.primary_subranges,
+            "prepared initrd primary fragment",
             &mut map,
             &mut restore_numa,
         )?;
@@ -1443,7 +1583,7 @@ impl KtstrVm {
             // explicit-hugepage bit here would bypass that distinction and
             // turn a racy pre-check into a strict no-fallback request.
             Some(mib) => kvm::KtstrKvm::new(self.topology, mib, self.performance_mode)
-                .context("create VM")?,
+                .context("create VM with unregistered memory")?,
             None => kvm::KtstrKvm::new_deferred(self.topology, false, self.performance_mode)
                 .context("create VM (deferred memory)")?,
         };
@@ -1464,8 +1604,8 @@ impl KtstrVm {
             if self.performance_mode && !mbind_node_map.is_empty() {
                 let layout = vm.numa_layout.as_ref().expect(
                     "numa_layout is Some on the non-deferred allocation path: \
-                     allocate_and_register_memory ran during `vm_new` because \
-                     memory_mib was provided up front, and that call sets \
+                     memory allocation ran during `vm_new` because memory_mib \
+                     was provided up front, and that call sets \
                      numa_layout to Some(...) in src/vmm/{x86_64,aarch64}/kvm.rs",
                 );
                 layout.mbind_regions(&vm.guest_mem, mbind_node_map);
@@ -1585,10 +1725,10 @@ impl KtstrVm {
     /// Map a prepared initrd's immutable CAS ranges directly into guest RAM.
     /// Returns `total_compressed_size`.
     ///
-    /// Every path after a successful `MAP_FIXED` transfers the backing fd to
-    /// `vm.cow_overlay_guards`, including later mmap/NUMA-policy errors. This
-    /// preserves the CAS object's shared lock for the complete lifetime of
-    /// any partial overlay. VM drop order is structural: `_reservation`
+    /// Every path after a successful exact hole mapping transfers the backing
+    /// fd to `vm.cow_overlay_guards`, including later mmap/NUMA-policy errors.
+    /// This preserves the CAS object's shared lock for the complete lifetime
+    /// of any partial mapping. VM drop order is structural: `_reservation`
     /// unmaps the COW VMAs before the guards release their locks.
     fn load_prepared_initrd(
         &self,
@@ -1657,8 +1797,19 @@ impl KtstrVm {
         map_validated_prepared_ranges(
             &mut vm.cow_overlay_guards,
             validated,
+            |subrange| {
+                // SAFETY: validation proved this is the complete destination
+                // subrange inside the VM-owned reservation. No KVM memslot is
+                // registered yet on the production builder path.
+                let result = unsafe { libc::munmap(subrange.host_addr.cast(), subrange.len) };
+                if result != 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .context("munmap prepared initrd destination");
+                }
+                Ok(())
+            },
             |subrange, fd| unsafe {
-                initramfs::cow_overlay_file_borrowed(
+                initramfs::cow_map_file_into_hole_borrowed(
                     subrange.host_addr,
                     subrange.len,
                     fd,
@@ -1794,7 +1945,7 @@ impl KtstrVm {
     ///
     /// x86_64-only: aarch64 uses
     /// `Self::compute_memory_and_allocate_aarch64`, which orders
-    /// the load_addr computation after `allocate_and_register_memory`
+    /// the load_addr computation after `allocate_memory`
     /// (the FDT-relative initrd address depends on `memory_mib`,
     /// which is itself computed from the post-compress total size).
     #[cfg(target_arch = "x86_64")]
@@ -1830,8 +1981,9 @@ impl KtstrVm {
             "deferred_memory_computed",
         );
 
-        // Allocate and register guest memory.
-        vm.allocate_and_register_memory(memory_mib)
+        // Allocate guest memory without registering it. The final disjoint
+        // prepared-initrd COW layout is installed before KVM sees this HVA.
+        vm.allocate_memory(memory_mib)
             .with_context(|| format!("allocate deferred memory ({memory_mib}MiB)"))?;
 
         Ok((prepared, memory_mib))
@@ -1846,157 +1998,6 @@ impl KtstrVm {
                 (total_bytes >> 20) as u32
             }
         }
-    }
-
-    /// Try to COW-overlay the compressed base from LZ4 SHM into guest
-    /// memory. Returns `Some(CowOverlayGuard)` on success — the guard
-    /// owns the SHM fd and holds `LOCK_SH` for the mapping's lifetime,
-    /// and MUST be kept alive as long as the COW overlay is in use
-    /// (typically the VM lifetime). Validates the segment starts with
-    /// LZ4 legacy magic to reject stale data from a previous
-    /// compression format.
-    ///
-    /// Associated function (no `&self`): the COW path is a pure
-    /// transform of `(guest_mem, key, expected_len, load_addr)` —
-    /// it reads the SHM segment keyed by `key.0` and maps it into
-    /// `guest_mem`, touching no VM instance state. Keeping it
-    /// `self`-free lets the unit test drive the real overlay logic
-    /// without constructing a full `KtstrVm`.
-    #[cfg(test)]
-    fn try_cow_overlay(
-        guest_mem: &GuestMemoryMmap,
-        key: &BaseKey,
-        expected_len: usize,
-        load_addr: u64,
-    ) -> Option<initramfs::CowOverlayGuard> {
-        let (fd, len) = initramfs::shm_open_lz4(key.0)?;
-        if len != expected_len {
-            initramfs::shm_close_fd(fd);
-            return None;
-        }
-        // Validate LZ4 legacy magic before COW-mapping. pread the
-        // first 4 bytes directly — no need to mmap the entire segment
-        // just to peek at the header.
-        let mut magic = [0u8; 4];
-        // SAFETY: `fd` is owned by `shm_open_lz4` and remains valid
-        // until `shm_close_fd` below; `magic` is a 4-byte stack buffer
-        // and the read length is exactly 4. The fd refers to a SHM
-        // segment with `len >= expected_len` bytes (verified above and
-        // by `shm_open_lz4`'s fstat check).
-        let n = unsafe {
-            libc::pread(
-                fd.as_raw_fd(),
-                magic.as_mut_ptr() as *mut libc::c_void,
-                4,
-                0,
-            )
-        };
-        if n != 4 {
-            initramfs::shm_close_fd(fd);
-            return None;
-        }
-        if magic != initramfs::LZ4_LEGACY_MAGIC {
-            tracing::warn!(
-                magic = format!(
-                    "{:02x}{:02x}{:02x}{:02x}",
-                    magic[0], magic[1], magic[2], magic[3]
-                ),
-                "stale compressed shm segment in COW path, skipping"
-            );
-            initramfs::shm_close_fd(fd);
-            return None;
-        }
-        // Refuse zero-length: mmap(len=0) is EINVAL and serves no
-        // purpose; the suffix-write fallback handles empty bases
-        // trivially. Also refuse load_addr + len overflow before
-        // bounds-checking, since GuestAddress arithmetic wraps
-        // silently on u64 overflow.
-        if len == 0 || load_addr.checked_add(len as u64).is_none() {
-            tracing::debug!(
-                load_addr = format!("{:#x}", load_addr),
-                len,
-                "cow_overlay: invalid range (zero-length or overflow), falling back"
-            );
-            initramfs::shm_close_fd(fd);
-            return None;
-        }
-        // The MAP_FIXED mmap rounds `len` up to the next host page
-        // boundary internally — Apple Silicon kernels run with 16 KB
-        // pages, so a 5000-byte segment mapped against a 16 KB-page
-        // host actually clobbers 16384 bytes of host VA. Bounds-check
-        // against the rounded-up length so we don't accept a mapping
-        // that overruns the guest region, and reject load_addr that
-        // isn't host-page-aligned (mmap returns EINVAL otherwise).
-        #[cfg(target_arch = "aarch64")]
-        let host_page = host_page_size();
-        // x86_64 hosts always run with 4 KB pages, and the call sites
-        // page-align load_addr to 4 KB; the rounded-up length matches
-        // `len` exactly. Use the constant instead of paying for a
-        // sysconf(2) on every overlay attempt.
-        #[cfg(target_arch = "x86_64")]
-        let host_page: u64 = 0x1000;
-        if load_addr & (host_page - 1) != 0 {
-            tracing::debug!(
-                load_addr = format!("{:#x}", load_addr),
-                host_page,
-                "cow_overlay: load_addr not host-page-aligned, falling back"
-            );
-            initramfs::shm_close_fd(fd);
-            return None;
-        }
-        let rounded_len = (len as u64)
-            .checked_add(host_page - 1)
-            .map(|v| v & !(host_page - 1));
-        let Some(rounded_len) = rounded_len else {
-            tracing::debug!(
-                load_addr = format!("{:#x}", load_addr),
-                len,
-                "cow_overlay: rounded length overflows u64, falling back"
-            );
-            initramfs::shm_close_fd(fd);
-            return None;
-        };
-        // Bounds-check [load_addr, load_addr + rounded_len) against
-        // guest memory BEFORE the MAP_FIXED mmap. `get_host_address`
-        // only validates the start address — without a length check,
-        // MAP_FIXED would silently overwrite whatever host VA happens
-        // to follow the region (other guest regions, reserved VA, or
-        // unrelated mappings). `get_slice` fails if the range extends
-        // past the region's end or spans a region boundary, which is
-        // exactly the guarantee MAP_FIXED needs.
-        let rounded_usize = match usize::try_from(rounded_len) {
-            Ok(v) => v,
-            Err(_) => {
-                tracing::debug!(
-                    load_addr = format!("{:#x}", load_addr),
-                    rounded_len,
-                    "cow_overlay: rounded length exceeds usize, falling back"
-                );
-                initramfs::shm_close_fd(fd);
-                return None;
-            }
-        };
-        if guest_mem
-            .get_slice(GuestAddress(load_addr), rounded_usize)
-            .is_err()
-        {
-            tracing::debug!(
-                load_addr = format!("{:#x}", load_addr),
-                len,
-                rounded_len,
-                "cow_overlay: range exceeds guest memory region, falling back"
-            );
-            initramfs::shm_close_fd(fd);
-            return None;
-        }
-        let Ok(host_addr) = guest_mem.get_host_address(GuestAddress(load_addr)) else {
-            initramfs::shm_close_fd(fd);
-            return None;
-        };
-        // cow_overlay takes ownership of `fd` on both Some and None
-        // paths: on success the guard carries it; on failure
-        // cow_overlay itself closes it. Do NOT call shm_close_fd here.
-        unsafe { initramfs::cow_overlay(host_addr, len, fd) }
     }
 
     /// Write cmdline, boot params, and topology tables to guest memory.
@@ -2041,19 +2042,19 @@ impl KtstrVm {
                 None => {
                     // No initramfs — allocate minimum memory.
                     let memory_mib = 256u32;
-                    vm.allocate_and_register_memory(memory_mib)
+                    vm.allocate_memory(memory_mib)
                         .context("allocate deferred memory (no initramfs)")?;
                     (None, memory_mib)
                 }
             };
 
-            // This must precede the prepared MAP_FIXED overlay:
+            // This must precede the prepared file mappings:
             // mbind_regions performs MADV_POPULATE_WRITE across anonymous
             // guest RAM. Running it after the overlay eagerly COWs every
             // initrd page and defeats machine-wide sharing.
             if self.performance_mode && !mbind_node_map.is_empty() {
                 let layout = vm.numa_layout.as_ref().expect(
-                    "numa_layout is Some after the deferred allocate_and_register_memory \
+                    "numa_layout is Some after the deferred allocate_memory \
                      call above: that call sets numa_layout to Some(...) in \
                      src/vmm/{x86_64,aarch64}/kvm.rs before this branch can reach here",
                 );
@@ -2076,6 +2077,13 @@ impl KtstrVm {
 
             (kr, initrd_addr, initrd_size)
         };
+
+        // The guest-memory HVA becomes immutable at this boundary. Kernel and
+        // NUMA setup may have populated anonymous RAM, and the complete
+        // prepared initrd is now a disjoint COW VMA layout; no MAP_FIXED is
+        // permitted after KVM learns the address range.
+        vm.register_memory()
+            .context("register final guest-memory layout with KVM")?;
 
         // Resolve effective memory_mib for boot params / ACPI / SHM.
         let memory_mib = self.effective_memory_mib(&vm.guest_mem);
@@ -2103,7 +2111,7 @@ impl KtstrVm {
                 "numa_layout is Some by the time setup_acpi runs: \
                  memory allocation (whether deferred or not) ran earlier \
                  in this function and set numa_layout via \
-                 allocate_and_register_memory in src/vmm/x86_64/kvm.rs",
+                 allocate_memory in src/vmm/x86_64/kvm.rs",
             ),
             vm.pci_enabled,
             self.networks.len(),
@@ -2347,7 +2355,7 @@ impl KtstrVm {
                 None => {
                     // No initramfs — allocate minimum memory.
                     let memory_mib = 256u32;
-                    vm.allocate_and_register_memory(memory_mib)
+                    vm.allocate_memory(memory_mib)
                         .context("allocate deferred memory (no initramfs, aarch64)")?;
                     (None, None)
                 }
@@ -2380,6 +2388,11 @@ impl KtstrVm {
             (kr, initrd_addr, initrd_size)
         };
 
+        // PVTIME setup in finish_aarch64_setup resolves its GPA through a
+        // memslot, so register immediately after the final COW mapping and
+        // before that ioctl. No later operation replaces a VMA.
+        vm.register_memory()
+            .context("register final aarch64 guest-memory layout with KVM")?;
         self.finish_aarch64_setup(vm, kernel_result, initrd_addr, initrd_size)
     }
 
@@ -2467,7 +2480,7 @@ impl KtstrVm {
             "deferred_memory_computed",
         );
 
-        vm.allocate_and_register_memory(memory_mib)
+        vm.allocate_memory(memory_mib)
             .with_context(|| format!("allocate deferred memory ({memory_mib}MiB, aarch64)"))?;
 
         // Compute load_addr only AFTER memory_mib is known: it determines
@@ -2584,7 +2597,7 @@ impl KtstrVm {
                 "numa_layout is Some by the time FDT creation runs: \
                  memory allocation (whether deferred or not) ran earlier \
                  in this function and set numa_layout via \
-                 allocate_and_register_memory in src/vmm/aarch64/kvm.rs",
+                 allocate_memory in src/vmm/aarch64/kvm.rs",
             ),
             self.disk.is_some(),
             !self.networks.is_empty(),

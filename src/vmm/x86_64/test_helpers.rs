@@ -6,8 +6,9 @@ use crate::vmm::kvm::KtstrKvm;
 use crate::vmm::topology::Topology;
 
 /// 1-LLC / 1-core / 1-thread / 1-NUMA KVM instance with 64 MiB
-/// guest memory — the smallest VM that boots through `KtstrKvm::new`
-/// and exposes a single vCPU at `vm.vcpus[0]`.
+/// guest memory — the smallest VM that constructs through `KtstrKvm::new`
+/// and exposes a single vCPU at `vm.vcpus[0]`. Memory remains unregistered
+/// because these helpers only drive non-execution ioctls.
 ///
 /// Used by every test that doesn't care about topology shape and
 /// just needs a vCPU to drive an ioctl through (boot MSR seed,

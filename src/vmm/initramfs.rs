@@ -1862,8 +1862,7 @@ pub(crate) fn shm_load_base(content_hash: u64) -> Option<MappedShm> {
 /// `LOCK_EX` is granted only when no reader holds `LOCK_SH`, so a
 /// successful acquire guarantees no live mapping, and on contention we
 /// skip (never truncate). The reader-side flock lifetime lives in
-/// `shm_load_base` (via `MappedShm`), `shm_open_lz4`, and
-/// `cow_overlay`.
+/// `shm_load_base` (via `MappedShm`) and `shm_load_lz4`.
 ///
 /// A blocking `LOCK_EX` here starved indefinitely: Linux flock grants
 /// no writer preference, so under sustained host concurrency fresh
@@ -1871,8 +1870,8 @@ pub(crate) fn shm_load_base(content_hash: u64) -> Option<MappedShm> {
 /// ahead of the waiting writer, wedging the suite. Skipping is correct
 /// because writes are content-addressed (below): a held segment has
 /// the same hash, hence the same bytes, so the skipped rewrite was
-/// redundant; `try_cow_overlay` re-opens by hash, so a peer's write is
-/// still COW-shared.
+/// redundant; `shm_load_lz4` re-opens by hash, so a peer's write is
+/// still reused.
 ///
 /// Writes are content-addressed at the caller: callers hash `data`
 /// to form the segment name. When two callers write the same content
@@ -1917,8 +1916,8 @@ fn shm_store(name: &str, data: &[u8]) -> Result<()> {
             // A reader holds LOCK_SH (live COW overlay / MappedShm) or
             // a peer holds LOCK_EX. The segment is in use or being
             // written by the peer; skip the write. Content-addressing
-            // makes our rewrite redundant, and try_cow_overlay re-opens
-            // by hash so the peer's segment is still COW-shared. Do NOT
+            // makes our rewrite redundant, and shm_load_lz4 re-opens
+            // by hash so the peer's segment is still reused. Do NOT
             // unlink: the segment may be a valid one a peer is reading.
             tracing::debug!(
                 segment = name,
@@ -2082,14 +2081,14 @@ pub(crate) fn shm_load_lz4(content_hash: u64) -> Option<Vec<u8>> {
 
 /// RAII guard for a live COW-overlay mapping.
 ///
-/// A COW overlay is `MAP_PRIVATE | MAP_FIXED` onto guest memory from
-/// an immutable backing file. `MAP_PRIVATE` pages are lazily read from
-/// the page cache on first access. Holding the fd with `LOCK_SH` for
-/// the mapping's lifetime prevents the prepared-initrd GC from
-/// unlinking the backing object until after the mapping is torn down.
+/// A prepared COW extent is a `MAP_PRIVATE | MAP_FIXED_NOREPLACE` file VMA
+/// installed into a prevalidated hole. `MAP_PRIVATE` pages are lazily read
+/// from the page cache on first access. Holding the fd with `LOCK_SH` for the
+/// mapping's lifetime prevents the prepared-initrd GC from unlinking the
+/// backing object until after the mapping is torn down.
 ///
 /// Drop order: the guard releases `LOCK_UN` and `close` only. The
-/// MAP_FIXED region itself is owned by the caller's VA reservation
+/// file VMA itself is owned by the caller's VA reservation
 /// (e.g. `ReservationGuard` in the VMM) and is munmapped when that
 /// reservation drops — which must happen BEFORE this guard drops,
 /// so the lock protects the mapping right up until tear-down.
@@ -2112,78 +2111,22 @@ impl Drop for CowOverlayGuard {
     }
 }
 
-/// COW-overlay `len` bytes from `shm_fd` at `host_addr` using
-/// `MAP_PRIVATE | MAP_FIXED`. The guest sees the backing content but writes
-/// go to private anonymous pages (copy-on-write). Deliberately omit
-/// `MAP_POPULATE`: verifier storms should demand-page only what a VM touches,
-/// not fault every hundreds-of-MiB initrd page into every cell at setup.
+/// Install one immutable prepared-initrd extent into an already-unmapped
+/// destination hole.
 ///
-/// On success, returns `Some(CowOverlayGuard)` — the guard owns
-/// `shm_fd` and holds `LOCK_SH` for the mapping's lifetime. The
-/// caller MUST keep the guard alive for as long as the MAP_FIXED
-/// mapping is in use (typically the VM lifetime) and drop the guard
-/// AFTER the VA region is munmapped.
-///
-/// On failure, returns `None` and CLOSES `shm_fd` (releasing
-/// `LOCK_SH`) so the caller does not need to clean it up.
+/// `MAP_FIXED_NOREPLACE` makes the final VMA layout constructive rather than
+/// destructive: primaries are split around every boundary overlay, and no
+/// file mapping is ever overwritten by a later mapping. A stale or accidental
+/// mapping in the destination is therefore an error instead of being silently
+/// replaced.
 ///
 /// # Safety
 ///
-/// The caller MUST have validated that the entire range
-/// `[host_addr, host_addr + len)` lies within one contiguous guest
-/// memory region. `MAP_FIXED` unmaps whatever is already present
-/// across the full range and replaces it with the new mapping; if
-/// `len` extends past the region, `MAP_FIXED` silently corrupts
-/// unrelated host mappings (kernel-defined behaviour at the mmap
-/// layer) and violates Rust's aliasing invariants at the process
-/// level. The caller is also responsible for ensuring `shm_fd` is a
-/// valid, open file descriptor with `LOCK_SH` already held (the
-/// guard inherits both).
-#[cfg(test)]
-pub(crate) unsafe fn cow_overlay(
-    host_addr: *mut u8,
-    len: usize,
-    shm_fd: std::os::fd::OwnedFd,
-) -> Option<CowOverlayGuard> {
-    unsafe { cow_overlay_file(host_addr, len, shm_fd, 0) }.ok()
-}
-
-/// Strict offset-aware variant used by the prepared-initrd CAS.
-///
-/// Unlike [`cow_overlay`], failures are returned with their OS error so the
-/// uniform direct-mapping loader can fail closed instead of copying bytes.
-///
-/// # Safety
-///
-/// The caller must uphold the same complete destination-range invariant as
-/// [`cow_overlay`]. `file_offset` must be host-page aligned and the backing
-/// file must cover the kernel-rounded mapping length.
-#[cfg(test)]
-pub(crate) unsafe fn cow_overlay_file(
-    host_addr: *mut u8,
-    len: usize,
-    backing_fd: std::os::fd::OwnedFd,
-    file_offset: u64,
-) -> Result<CowOverlayGuard> {
-    unsafe { cow_overlay_file_borrowed(host_addr, len, &backing_fd, file_offset) }?;
-    Ok(CowOverlayGuard::new(backing_fd))
-}
-
-/// Map one range while leaving ownership of the locked backing fd with the
-/// caller.
-///
-/// This is used when one logical prepared range crosses aligned guest-memory
-/// region boundaries: every subrange maps from the same open file description,
-/// and one [`CowOverlayGuard`] retains its `LOCK_SH` for all of them. Duplicated
-/// fds would share the same flock and the first guard drop could unlock while
-/// sibling mappings remained live.
-///
-/// # Safety
-///
-/// The caller must validate the complete destination range before the first
-/// MAP_FIXED and keep `backing_fd` locked/alive until every resulting VMA is
+/// The caller must own the complete destination range, have already unmapped
+/// exactly `[host_addr, host_addr + len)`, validate the source extent and
+/// alignment, and retain `backing_fd` until the containing reservation is
 /// torn down.
-pub(crate) unsafe fn cow_overlay_file_borrowed(
+pub(crate) unsafe fn cow_map_file_into_hole_borrowed(
     host_addr: *mut u8,
     len: usize,
     backing_fd: &std::os::fd::OwnedFd,
@@ -2191,22 +2134,28 @@ pub(crate) unsafe fn cow_overlay_file_borrowed(
 ) -> Result<()> {
     use std::os::fd::AsRawFd;
 
-    // SAFETY: caller guarantees [host_addr, host_addr + len) is
-    // entirely within a single valid guest memory region and backing_fd
-    // is a valid fd holding LOCK_SH. See function-level docs.
     let ptr = unsafe {
         libc::mmap(
-            host_addr as *mut libc::c_void,
+            host_addr.cast(),
             len,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_FIXED,
+            libc::MAP_PRIVATE | libc::MAP_FIXED_NOREPLACE,
             backing_fd.as_raw_fd(),
             libc::off_t::try_from(file_offset).context("COW file offset exceeds off_t")?,
         )
     };
     if ptr == libc::MAP_FAILED {
-        let error = std::io::Error::last_os_error();
-        return Err(error).context("MAP_PRIVATE prepared initrd overlay");
+        return Err(std::io::Error::last_os_error())
+            .context("MAP_PRIVATE prepared initrd mapping into reserved hole");
+    }
+    if ptr != host_addr.cast() {
+        // Linux before MAP_FIXED_NOREPLACE support may ignore the flag and
+        // choose a different free address. Never leak that mapping or accept
+        // a non-exact guest-memory layout.
+        unsafe {
+            libc::munmap(ptr, len);
+        }
+        anyhow::bail!("MAP_FIXED_NOREPLACE was ignored: requested {host_addr:p}, got {ptr:p}");
     }
     Ok(())
 }

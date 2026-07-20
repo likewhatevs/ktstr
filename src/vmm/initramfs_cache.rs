@@ -9,11 +9,12 @@
 //! A 2 MiB planner maps pages owned by one part directly. Ordinary mixed-part
 //! pages use content-addressed stitches; the final per-cell tail instead
 //! composes one reusable full-page underlay with the smallest host-page-aligned
-//! tail overlay. The VMM installs every layer over anonymous guest RAM with
-//! `MAP_PRIVATE | MAP_FIXED`, so parallel VMs share clean page-cache pages and
-//! pay for private memory only when the guest writes. Per-key `flock` election
-//! ensures one transform per recipe across nextest workers; a versioned
-//! namespace gate makes lock-file GC race-safe.
+//! tail boundary object. Before KVM registration, the VMM unmaps each complete
+//! destination and installs a disjoint cover of primary fragments and boundary
+//! objects with `MAP_PRIVATE | MAP_FIXED_NOREPLACE`. Parallel VMs therefore
+//! share clean page-cache pages and pay for private memory only when the guest
+//! writes. Per-key `flock` election ensures one transform per recipe across
+//! nextest workers; a versioned namespace gate makes lock-file GC race-safe.
 //!
 //! The older process-local/POSIX-SHM base cache below is retained only for
 //! compatibility unit tests. Production verifier and ordinary VM paths use
@@ -410,8 +411,8 @@ const CONTENT_HASH_CHUNK_LEN: usize = 1 << 20;
 const PREPARED_NAMESPACE_GATE: &str = "namespace-v1.lock";
 const PREPARED_GC_LOCK: &str = "gc.lock";
 /// Uniform direct-map granule. It is host-page aligned on every supported
-/// host and also satisfies Linux hugetlb's MAP_FIXED unmap boundary rule for
-/// the VM's optional MAP_HUGETLB|MAP_HUGE_2MB guest backing.
+/// host and also satisfies Linux hugetlb's complete-unmap boundary for the
+/// VM's optional MAP_HUGETLB|MAP_HUGE_2MB guest backing.
 pub(crate) const PREPARED_MAPPING_GRANULE: usize = 2 << 20;
 
 fn prepared_file_alignment() -> Result<usize> {
@@ -3364,13 +3365,12 @@ pub(crate) struct PreparedMapping {
     pub(crate) file_offset: u64,
     pub(crate) guest_offset: u64,
     pub(crate) map_len: usize,
-    /// Host-page overlays installed after this mapping.
+    /// Host-page boundary objects whose intervals supersede primary bytes.
     ///
-    /// A hugetlb-backed guest first needs one complete 2 MiB replacement to
-    /// dissolve the original hugetlb VMA. A small boundary object can then
-    /// replace only the host pages which contain the per-cell tail. Nesting
-    /// those overlays under their complete primary range keeps the logical
-    /// stream non-overlapping while preserving the exact mmap order.
+    /// The loader subtracts these intervals from the primary mapping before
+    /// installing either source. Primary fragments plus these objects form an
+    /// exact disjoint cover, so KVM sees one stable final VMA layout and never
+    /// observes nested `MAP_FIXED` replacement.
     pub(crate) overlays: Vec<PreparedOverlay>,
 }
 
@@ -4692,7 +4692,7 @@ pub(crate) fn get_or_compress_base_shm(content_hash: u64, base_bytes: &[u8]) -> 
     let seg_name = initramfs::shm_lz4_segment_name(content_hash);
 
     // Fast path: an already-written compressed segment. Pin it so a
-    // peer's cleanup_stale_shm cannot unlink it before try_cow_overlay.
+    // peer's cleanup_stale_shm cannot unlink it before reuse.
     if let Some(lz4) = initramfs::shm_load_lz4(content_hash) {
         hold_shm_lock(&seg_name);
         return lz4;
@@ -4705,8 +4705,7 @@ pub(crate) fn get_or_compress_base_shm(content_hash: u64, base_bytes: &[u8]) -> 
             let lz4 = initramfs::lz4_legacy_compress(base_bytes);
             shm_write_and_release(fd, &lz4, &seg_name);
             // Pin the segment for the process lifetime so a peer's
-            // cleanup_stale_shm cannot unlink it before this VM's
-            // try_cow_overlay re-opens it by hash for the COW mapping.
+            // cleanup_stale_shm cannot unlink it before another lookup.
             hold_shm_lock(&seg_name);
             return lz4;
         }
@@ -4735,8 +4734,8 @@ pub(crate) fn get_or_compress_base_shm(content_hash: u64, base_bytes: &[u8]) -> 
     // fallback (the store is the non-blocking-skip writer).
     let lz4 = initramfs::lz4_legacy_compress(base_bytes);
     match initramfs::shm_store_lz4(content_hash, &lz4) {
-        // Stored (or skipped because a peer holds it) -- pin so it
-        // survives cleanup until try_cow_overlay.
+        // Stored (or skipped because a peer holds it) -- pin so it survives
+        // cleanup until the next lookup.
         Ok(()) => hold_shm_lock(&seg_name),
         Err(e) => tracing::warn!("shm_store_lz4: {e:#}"),
     }
@@ -7403,9 +7402,21 @@ mod tests {
         };
         assert_ne!(address, libc::MAP_FAILED);
         let address = address.cast::<u8>();
+        let unmap_result = unsafe { libc::munmap(address.cast(), page) };
+        assert_eq!(
+            unmap_result,
+            0,
+            "unmap prepared-object test destination: {}",
+            std::io::Error::last_os_error()
+        );
         unsafe {
-            initramfs::cow_overlay_file_borrowed(address, page, fd, object.data_offset as u64)
-                .unwrap();
+            initramfs::cow_map_file_into_hole_borrowed(
+                address,
+                page,
+                fd,
+                object.data_offset as u64,
+            )
+            .unwrap();
         }
         assert_eq!(unsafe { address.read_volatile() }, 0x6d);
         let private_value = (index as u8).wrapping_add(1);
@@ -8284,7 +8295,61 @@ mod tests {
     }
 
     #[test]
-    fn prepared_cow_overlay_after_anon_prefault_stays_clean_and_isolated() {
+    fn prepared_cow_mapping_refuses_occupied_destination_without_replacement() {
+        let host_page = crate::vmm::setup::host_page_size() as usize;
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), vec![0x4d; host_page]).unwrap();
+        temp.as_file().sync_all().unwrap();
+        let file: OwnedFd = OpenOptions::new()
+            .read(true)
+            .open(temp.path())
+            .unwrap()
+            .into();
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockShared).unwrap();
+
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                host_page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(address, libc::MAP_FAILED);
+        let address = address.cast::<u8>();
+        unsafe {
+            address.write_volatile(0xa7);
+            address.add(host_page - 1).write_volatile(0x3c);
+        }
+
+        let error =
+            unsafe { initramfs::cow_map_file_into_hole_borrowed(address, host_page, &file, 0) }
+                .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("reserved hole") || rendered.contains("was ignored"),
+            "occupied destination must fail through the exact-map guard: {rendered}"
+        );
+        assert_eq!(
+            unsafe { address.read_volatile() },
+            0xa7,
+            "a failed exact mapping must not replace the existing first byte"
+        );
+        assert_eq!(
+            unsafe { address.add(host_page - 1).read_volatile() },
+            0x3c,
+            "a failed exact mapping must not replace the existing last byte"
+        );
+
+        unsafe {
+            libc::munmap(address.cast(), host_page);
+        }
+    }
+
+    #[test]
+    fn prepared_cow_mapping_after_anon_prefault_stays_clean_and_isolated() {
         let host_page = crate::vmm::setup::host_page_size() as usize;
         let len = host_page * 4;
         let backing_bytes: Vec<u8> = (0..len).map(|index| (index % 251) as u8).collect();
@@ -8321,15 +8386,22 @@ mod tests {
                     address.add(offset).write_volatile(0xa5);
                 }
             }
+            let unmap_result = unsafe { libc::munmap(address.cast(), len) };
+            assert_eq!(
+                unmap_result,
+                0,
+                "unmap prefaulted prepared-object destination: {}",
+                std::io::Error::last_os_error()
+            );
             unsafe {
-                initramfs::cow_overlay_file_borrowed(address, len, &file, 0).unwrap();
+                initramfs::cow_map_file_into_hole_borrowed(address, len, &file, 0).unwrap();
             }
         }
 
         assert_eq!(
             unsafe { std::slice::from_raw_parts(first, len) },
             backing_bytes,
-            "MAP_FIXED must replace the prefaulted anonymous pages"
+            "the hole mapping must reconstruct the prefaulted destination"
         );
         assert_eq!(
             smaps_value_kib(first, "Anonymous"),
@@ -8359,7 +8431,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_cow_overlay_replaces_real_hugetlb_vma_when_available() {
+    fn prepared_cow_mapping_dissolves_real_hugetlb_vma_when_available() {
         let len = PREPARED_MAPPING_GRANULE;
         let host_page = crate::vmm::setup::host_page_size() as usize;
         let address = unsafe {
@@ -8376,7 +8448,7 @@ mod tests {
             let error = std::io::Error::last_os_error();
             skip!(
                 "2 MiB MAP_HUGETLB reservation unavailable; \
-                 regular-file MAP_FIXED regression not applicable: {error}"
+                 disjoint regular-file hole-mapping regression not applicable: {error}"
             );
         }
         let address = address.cast::<u8>();
@@ -8402,9 +8474,16 @@ mod tests {
             .into();
         rustix::fs::flock(&file, rustix::fs::FlockOperation::LockShared).unwrap();
 
+        let unmap_result = unsafe { libc::munmap(address.cast(), len) };
+        assert_eq!(
+            unmap_result,
+            0,
+            "unmap hugetlb prepared-object destination: {}",
+            std::io::Error::last_os_error()
+        );
         unsafe {
-            initramfs::cow_overlay_file_borrowed(address, len, &file, host_page as u64)
-                .expect("replace 2 MiB hugetlb VMA with host-page-aligned regular file");
+            initramfs::cow_map_file_into_hole_borrowed(address, len, &file, host_page as u64)
+                .expect("map host-page-aligned regular file into the dissolved hugetlb hole");
         }
         assert_eq!(unsafe { address.read_volatile() }, backing_bytes[host_page]);
         assert_eq!(

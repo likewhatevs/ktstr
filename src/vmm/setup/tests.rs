@@ -346,7 +346,7 @@ fn prepared_subrange_validation_covers_adjacent_regions_and_rejects_holes() {
 }
 
 #[test]
-fn prepared_multi_region_direct_cow_maps_primary_then_overlay_and_isolates_both() {
+fn prepared_multi_region_direct_cow_maps_disjoint_primary_and_overlay_fragments() {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
     use vm_memory::mmap::{GuestRegionMmap, MmapRegion};
@@ -521,6 +521,23 @@ fn prepared_multi_region_direct_cow_maps_primary_then_overlay_and_isolates_both(
     assert_eq!(validated[0].subranges[1].host_addr, second_host);
     assert_eq!(validated[0].subranges[1].file_offset, granule as u64);
     assert_eq!(validated[0].subranges[1].len, granule);
+    assert_eq!(
+        validated[0].primary_subranges.len(),
+        3,
+        "the overlay must split only its containing NUMA subrange"
+    );
+    assert_eq!(validated[0].primary_subranges[0].guest_addr, 0);
+    assert_eq!(validated[0].primary_subranges[0].len, granule);
+    assert_eq!(validated[0].primary_subranges[1].guest_addr, granule as u64);
+    assert_eq!(validated[0].primary_subranges[1].len, host_page);
+    assert_eq!(
+        validated[0].primary_subranges[2].guest_addr,
+        (overlay_guest_offset + overlay_len) as u64
+    );
+    assert_eq!(
+        validated[0].primary_subranges[2].len,
+        granule - host_page - overlay_len
+    );
     assert_eq!(validated[0].overlays.len(), 1);
     assert_eq!(validated[0].overlays[0].subranges.len(), 1);
     assert_eq!(
@@ -534,16 +551,28 @@ fn prepared_multi_region_direct_cow_maps_primary_then_overlay_and_isolates_both(
     assert_eq!(validated[0].overlays[0].subranges[0].len, overlay_len);
     assert_eq!(second_host as usize, first_host as usize + 3 * granule);
 
+    let mut unmap_order = Vec::new();
     let mut map_order = Vec::new();
     map_validated_prepared_ranges(
         &mut cow_guards,
         validated,
+        |subrange| {
+            unmap_order.push((subrange.guest_addr, subrange.len));
+            // SAFETY: this test owns both complete destination VMAs.
+            let result = unsafe { libc::munmap(subrange.host_addr.cast(), subrange.len) };
+            anyhow::ensure!(
+                result == 0,
+                "unmap test destination: {}",
+                std::io::Error::last_os_error()
+            );
+            Ok(())
+        },
         |subrange, fd| {
             map_order.push(rustix::fs::fstat(fd).unwrap().st_ino);
-            // SAFETY: production validation above proved that each complete
-            // destination subrange lies inside one live guest-memory region.
+            // SAFETY: production validation and the preceding callback proved
+            // that this disjoint fragment lies inside an unmapped hole.
             unsafe {
-                initramfs::cow_overlay_file_borrowed(
+                initramfs::cow_map_file_into_hole_borrowed(
                     subrange.host_addr,
                     subrange.len,
                     fd,
@@ -555,14 +584,19 @@ fn prepared_multi_region_direct_cow_maps_primary_then_overlay_and_isolates_both(
     )
     .unwrap();
     assert_eq!(
+        unmap_order,
+        [(0, granule), (granule as u64, granule)],
+        "the mapper must dissolve each complete original destination first"
+    );
+    assert_eq!(
         cow_guards.len(),
         2,
         "the split primary and its overlay must retain both locked backing fds"
     );
     assert_eq!(
         map_order,
-        [underlay_ino, underlay_ino, overlay_ino],
-        "every primary subrange must be installed before its nested overlay"
+        [underlay_ino, underlay_ino, underlay_ino, overlay_ino],
+        "all disjoint primary fragments must be installed before the overlay"
     );
 
     let mut magic = [0; 4];
@@ -592,7 +626,7 @@ fn prepared_multi_region_direct_cow_maps_primary_then_overlay_and_isolates_both(
     assert_eq!(
         visible_overlay,
         overlay_bytes[overlay_file_offset..],
-        "the nested overlay must replace exactly its declared guest bytes"
+        "the disjoint boundary object must provide exactly its declared guest bytes"
     );
     guest_mem
         .read_slice(
@@ -605,6 +639,26 @@ fn prepared_multi_region_direct_cow_maps_primary_then_overlay_and_isolates_both(
         [0x72],
         "bytes immediately after the overlay must remain mapped from the primary"
     );
+
+    let mut expected_stream = underlay_bytes.clone();
+    expected_stream[overlay_guest_offset..overlay_guest_offset + overlay_len]
+        .copy_from_slice(&overlay_bytes[overlay_file_offset..]);
+    let mut actual_stream = vec![0; expected_stream.len()];
+    guest_mem
+        .read_slice(&mut actual_stream, GuestAddress(0))
+        .unwrap();
+    if actual_stream != expected_stream {
+        let mismatch = actual_stream
+            .iter()
+            .zip(&expected_stream)
+            .position(|(actual, expected)| actual != expected)
+            .unwrap();
+        panic!(
+            "complete read-only primary-plus-boundary-overlay stream differs at \
+             {mismatch:#x}: expected {:#04x}, got {:#04x}",
+            expected_stream[mismatch], actual_stream[mismatch]
+        );
+    }
 
     let private_underlay_offset = host_page;
     guest_mem
@@ -1135,12 +1189,12 @@ fn prepared_multirange_cross_process_child() {
         .sum();
     assert!(
         overlay_count > 0,
-        "the cross-process fixture must exercise a nested boundary overlay"
+        "the cross-process fixture must exercise a disjoint boundary object"
     );
     let backing_count = observations.len() + overlay_count;
 
-    // Guards are declared before guest memory so the MAP_FIXED VMAs are
-    // unmapped before their shared CAS locks are released.
+    // Guards are declared before guest memory so the file VMAs are unmapped
+    // before their shared CAS locks are released.
     let mut cow_guards = Vec::with_capacity(backing_count);
     let guest_mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), mapped_len)]).unwrap();
     let validated =
@@ -1155,13 +1209,24 @@ fn prepared_multirange_cross_process_child() {
             .iter()
             .flat_map(|range| &range.overlays)
             .all(|overlay| overlay.subranges.len() == 1),
-        "one contiguous base-page guest region must not split nested overlays"
+        "one contiguous base-page guest region must not split boundary objects"
     );
     map_validated_prepared_ranges(
         &mut cow_guards,
         validated,
+        |subrange| {
+            // SAFETY: the child exclusively owns this complete guest-memory
+            // destination and validation finished before this callback.
+            let result = unsafe { libc::munmap(subrange.host_addr.cast(), subrange.len) };
+            anyhow::ensure!(
+                result == 0,
+                "unmap cross-process test destination: {}",
+                std::io::Error::last_os_error()
+            );
+            Ok(())
+        },
         |subrange, fd| unsafe {
-            initramfs::cow_overlay_file_borrowed(
+            initramfs::cow_map_file_into_hole_borrowed(
                 subrange.host_addr,
                 subrange.len,
                 fd,
@@ -1174,7 +1239,7 @@ fn prepared_multirange_cross_process_child() {
     assert_eq!(
         cow_guards.len(),
         backing_count,
-        "every primary and nested overlay must retain its own locked CAS fd"
+        "every primary and boundary object must retain its own locked CAS fd"
     );
 
     let hashes: Vec<u64> = observations
@@ -1307,28 +1372,42 @@ fn prepared_multirange_cross_process_reuses_every_cas_range_and_cow_isolates() {
 fn prepared_mapper_keeps_primary_and_overlay_guards_on_overlay_failures() {
     let page = host_page_size() as usize;
     let validated_fixture = || {
-        let primary = test_prepared_mapping(&initramfs::LZ4_LEGACY_MAGIC, 0, 2 * page);
-        let overlay = test_prepared_overlay(&[], 0, 2 * page);
+        let primary = test_prepared_mapping(&initramfs::LZ4_LEGACY_MAGIC, 0, 4 * page);
+        let overlay = test_prepared_overlay(&[], page as u64, 2 * page);
         vec![ValidatedPreparedRange {
             range: primary,
             subranges: vec![ValidatedPreparedSubrange {
                 guest_addr: 0,
                 host_addr: page as *mut u8,
                 file_offset: 0,
-                len: 2 * page,
+                len: 4 * page,
             }],
+            primary_subranges: vec![
+                ValidatedPreparedSubrange {
+                    guest_addr: 0,
+                    host_addr: page as *mut u8,
+                    file_offset: 0,
+                    len: page,
+                },
+                ValidatedPreparedSubrange {
+                    guest_addr: (3 * page) as u64,
+                    host_addr: (4 * page) as *mut u8,
+                    file_offset: (3 * page) as u64,
+                    len: page,
+                },
+            ],
             overlays: vec![ValidatedPreparedOverlay {
                 overlay,
                 subranges: vec![
                     ValidatedPreparedSubrange {
-                        guest_addr: 0,
-                        host_addr: page as *mut u8,
+                        guest_addr: page as u64,
+                        host_addr: (2 * page) as *mut u8,
                         file_offset: 0,
                         len: page,
                     },
                     ValidatedPreparedSubrange {
-                        guest_addr: page as u64,
-                        host_addr: (2 * page) as *mut u8,
+                        guest_addr: (2 * page) as u64,
+                        host_addr: (3 * page) as *mut u8,
                         file_offset: page as u64,
                         len: page,
                     },
@@ -1342,17 +1421,18 @@ fn prepared_mapper_keeps_primary_and_overlay_guards_on_overlay_failures() {
     let error = map_validated_prepared_ranges(
         &mut guards,
         validated_fixture(),
+        |_| Ok(()),
         |_, _| {
             map_calls += 1;
-            anyhow::ensure!(map_calls < 3, "injected overlay MAP_FIXED failure");
+            anyhow::ensure!(map_calls < 4, "injected overlay mapping failure");
             Ok(())
         },
         |_| Ok(()),
     )
     .unwrap_err();
     assert_eq!(
-        map_calls, 3,
-        "the mapper must install the primary and first overlay subrange before failing"
+        map_calls, 4,
+        "the mapper must install both primary fragments and the first overlay subrange before failing"
     );
     assert_eq!(
         guards.len(),
@@ -1360,13 +1440,13 @@ fn prepared_mapper_keeps_primary_and_overlay_guards_on_overlay_failures() {
         "the completed primary and partially live overlay must retain both backing fds"
     );
     assert!(
-        format!("{error:#}").contains("injected overlay MAP_FIXED failure"),
+        format!("{error:#}").contains("injected overlay mapping failure"),
         "the strict mapper must return the overlay mapping failure without a copy fallback: \
          {error:#}"
     );
     assert!(
         format!("{error:#}").contains("prepared initrd overlay subrange"),
-        "the partial-map error must identify the nested overlay: {error:#}"
+        "the partial-map error must identify the boundary object: {error:#}"
     );
 
     let mut guards = Vec::new();
@@ -1375,22 +1455,23 @@ fn prepared_mapper_keeps_primary_and_overlay_guards_on_overlay_failures() {
     let error = map_validated_prepared_ranges(
         &mut guards,
         validated_fixture(),
+        |_| Ok(()),
         |_, _| {
             map_calls += 1;
             Ok(())
         },
         |_| {
             numa_calls += 1;
-            anyhow::ensure!(numa_calls < 2, "injected overlay NUMA restore failure");
+            anyhow::ensure!(numa_calls < 3, "injected overlay NUMA restore failure");
             Ok(())
         },
     )
     .unwrap_err();
     assert_eq!(
-        map_calls, 2,
-        "NUMA failure must occur after the primary and first overlay mapping"
+        map_calls, 3,
+        "NUMA failure must occur after both primary fragments and the first overlay mapping"
     );
-    assert_eq!(numa_calls, 2);
+    assert_eq!(numa_calls, 3);
     assert_eq!(
         guards.len(),
         2,
@@ -1402,7 +1483,7 @@ fn prepared_mapper_keeps_primary_and_overlay_guards_on_overlay_failures() {
     );
     assert!(
         format!("{error:#}").contains("prepared initrd overlay subrange"),
-        "the NUMA error must identify the nested overlay: {error:#}"
+        "the NUMA error must identify the boundary object: {error:#}"
     );
 }
 
@@ -1425,7 +1506,8 @@ fn prepared_mapper_keeps_guard_on_partial_primary_map() {
     ];
     let validated = vec![ValidatedPreparedRange {
         range: test_prepared_mapping(&initramfs::LZ4_LEGACY_MAGIC, 0, 2 * page),
-        subranges,
+        subranges: subranges.clone(),
+        primary_subranges: subranges,
         overlays: Vec::new(),
     }];
     let mut guards = Vec::new();
@@ -1433,9 +1515,10 @@ fn prepared_mapper_keeps_guard_on_partial_primary_map() {
     let error = map_validated_prepared_ranges(
         &mut guards,
         validated,
+        |_| Ok(()),
         |_, _| {
             map_calls += 1;
-            anyhow::ensure!(map_calls < 2, "injected MAP_FIXED failure");
+            anyhow::ensure!(map_calls < 2, "injected prepared mapping failure");
             Ok(())
         },
         |_| Ok(()),
@@ -1448,8 +1531,66 @@ fn prepared_mapper_keeps_guard_on_partial_primary_map() {
         "a partially live range must retain its backing fd and shared lock"
     );
     assert!(
-        format!("{error:#}").contains("injected MAP_FIXED failure"),
+        format!("{error:#}").contains("injected prepared mapping failure"),
         "the strict mapper must return the mapping failure without a copy fallback: {error:#}"
+    );
+}
+
+#[test]
+fn prepared_mapper_completes_destructive_phase_before_mapping() {
+    let page = host_page_size() as usize;
+    let subranges = vec![
+        ValidatedPreparedSubrange {
+            guest_addr: 0,
+            host_addr: page as *mut u8,
+            file_offset: 0,
+            len: page,
+        },
+        ValidatedPreparedSubrange {
+            guest_addr: page as u64,
+            host_addr: (2 * page) as *mut u8,
+            file_offset: page as u64,
+            len: page,
+        },
+    ];
+    let validated = vec![ValidatedPreparedRange {
+        range: test_prepared_mapping(&initramfs::LZ4_LEGACY_MAGIC, 0, 2 * page),
+        subranges: subranges.clone(),
+        primary_subranges: subranges,
+        overlays: Vec::new(),
+    }];
+    let mut guards = Vec::new();
+    let mut unmap_calls = 0usize;
+    let mut map_calls = 0usize;
+    let error = map_validated_prepared_ranges(
+        &mut guards,
+        validated,
+        |_| {
+            unmap_calls += 1;
+            anyhow::ensure!(unmap_calls < 2, "injected destination unmap failure");
+            Ok(())
+        },
+        |_, _| {
+            map_calls += 1;
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+    .unwrap_err();
+    assert_eq!(unmap_calls, 2);
+    assert_eq!(
+        map_calls, 0,
+        "no file VMA may be installed until every destination is a hole"
+    );
+    assert!(
+        guards.is_empty(),
+        "an unmap failure cannot leave a file mapping whose fd needs retaining"
+    );
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("injected destination unmap failure")
+            && rendered.contains("unmap prepared initrd destination"),
+        "the destructive-phase error must retain its destination context: {rendered}"
     );
 }
 
@@ -1530,7 +1671,7 @@ fn prepared_hugetlb_split_requires_huge_aligned_destination_not_file_offset() {
 }
 
 #[test]
-fn prepared_nested_overlay_replaces_real_hugetlb_vma_when_available() {
+fn prepared_disjoint_overlay_dissolves_real_hugetlb_vma_when_available() {
     use std::io::Write as _;
     use vm_memory::mmap::{GuestRegionMmap, MmapRegion};
 
@@ -1559,7 +1700,7 @@ fn prepared_nested_overlay_replaces_real_hugetlb_vma_when_available() {
     };
     if address == libc::MAP_FAILED {
         skip!(
-            "2 MiB MAP_HUGETLB reservation unavailable; nested replacement not applicable: {}",
+            "2 MiB MAP_HUGETLB reservation unavailable; disjoint mapping not applicable: {}",
             std::io::Error::last_os_error()
         );
     }
@@ -1621,11 +1762,31 @@ fn prepared_nested_overlay_replaces_real_hugetlb_vma_when_available() {
             .unwrap();
     let validated =
         validate_prepared_subranges(&guest_mem, vec![range], 0, granule, host_page).unwrap();
+    assert_eq!(validated[0].subranges.len(), 1);
+    assert_eq!(validated[0].subranges[0].len, granule);
+    assert_eq!(validated[0].primary_subranges.len(), 1);
+    assert_eq!(
+        validated[0].primary_subranges[0].len,
+        granule - host_page,
+        "the final host page must be absent from the primary file VMA"
+    );
+    let mut unmapped = Vec::new();
     map_validated_prepared_ranges(
         &mut guards,
         validated,
+        |subrange| {
+            unmapped.push((subrange.host_addr as usize, subrange.len));
+            // SAFETY: the test owns the complete aligned hugetlb VMA.
+            let result = unsafe { libc::munmap(subrange.host_addr.cast(), subrange.len) };
+            anyhow::ensure!(
+                result == 0,
+                "unmap hugetlb test destination: {}",
+                std::io::Error::last_os_error()
+            );
+            Ok(())
+        },
         |subrange, fd| unsafe {
-            initramfs::cow_overlay_file_borrowed(
+            initramfs::cow_map_file_into_hole_borrowed(
                 subrange.host_addr,
                 subrange.len,
                 fd,
@@ -1634,8 +1795,9 @@ fn prepared_nested_overlay_replaces_real_hugetlb_vma_when_available() {
         },
         |_| Ok(()),
     )
-    .expect("replace the complete hugetlb VMA before its host-page overlay");
+    .expect("dissolve the complete hugetlb VMA and install a disjoint host-page overlay");
 
+    assert_eq!(unmapped, [(host_addr as usize, granule)]);
     assert_eq!(guards.len(), 2);
     let mut actual = [0u8; 1];
     guest_mem.read_slice(&mut actual, GuestAddress(0)).unwrap();
@@ -1652,6 +1814,123 @@ fn prepared_nested_overlay_replaces_real_hugetlb_vma_when_available() {
     drop(guest_mem);
     drop(reservation);
     drop(guards);
+}
+
+/// Execute bytes from a boundary overlay through the exact production memory
+/// lifecycle: allocate userspace RAM, construct the final disjoint COW VMA
+/// layout, register that immutable layout with KVM, then enter the vCPU.
+///
+/// This catches a regression that host reads alone cannot: the userspace
+/// `GuestMemoryMmap` may observe correct overlay bytes even when a memslot was
+/// published across an earlier VMA identity and KVM later executes stale
+/// underlay pages.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn prepared_disjoint_overlay_executes_through_final_kvm_memslot() {
+    use kvm_ioctls::VcpuExit;
+    use std::io::Write as _;
+
+    let host_page = host_page_size() as usize;
+    let granule = PREPARED_MAPPING_GRANULE;
+    assert!(host_page < granule);
+
+    let mut primary_file = tempfile::tempfile().unwrap();
+    let mut primary_bytes = vec![0x90; granule];
+    primary_bytes[..initramfs::LZ4_LEGACY_MAGIC.len()]
+        .copy_from_slice(&initramfs::LZ4_LEGACY_MAGIC);
+    primary_file.write_all(&primary_bytes).unwrap();
+    rustix::fs::flock(&primary_file, rustix::fs::FlockOperation::LockShared).unwrap();
+
+    // Real-mode code at the second host page (GPA 0x1000 on x86):
+    //   mov dx, 0x1234
+    //   mov al, 0x5a
+    //   out dx, al
+    //   hlt
+    let code = [0xba, 0x34, 0x12, 0xb0, 0x5a, 0xee, 0xf4];
+    let mut overlay_file = tempfile::tempfile().unwrap();
+    overlay_file.set_len(host_page as u64).unwrap();
+    overlay_file.write_all(&code).unwrap();
+    rustix::fs::flock(&overlay_file, rustix::fs::FlockOperation::LockShared).unwrap();
+
+    let ranges = vec![PreparedMapping {
+        fd: primary_file.into(),
+        file_offset: 0,
+        guest_offset: 0,
+        map_len: granule,
+        overlays: vec![PreparedOverlay {
+            fd: overlay_file.into(),
+            file_offset: 0,
+            guest_offset: host_page as u64,
+            map_len: host_page,
+        }],
+    }];
+    validate_prepared_load(
+        granule,
+        initramfs::InitrdCompression::Lz4,
+        granule,
+        host_page,
+        0,
+        &ranges,
+    )
+    .unwrap();
+
+    let mut vm =
+        kvm::KtstrKvm::new(crate::vmm::topology::Topology::new(1, 1, 1, 1), 64, false).unwrap();
+    let validated =
+        validate_prepared_subranges(&vm.guest_mem, ranges, 0, host_page, host_page).unwrap();
+    assert_eq!(validated[0].primary_subranges.len(), 2);
+    assert_eq!(validated[0].overlays[0].subranges.len(), 1);
+
+    map_validated_prepared_ranges(
+        &mut vm.cow_overlay_guards,
+        validated,
+        |subrange| {
+            // SAFETY: validation proved the complete destination lies inside
+            // the unregistered VM-owned reservation.
+            let result = unsafe { libc::munmap(subrange.host_addr.cast(), subrange.len) };
+            anyhow::ensure!(
+                result == 0,
+                "unmap KVM execution test destination: {}",
+                std::io::Error::last_os_error()
+            );
+            Ok(())
+        },
+        |subrange, fd| unsafe {
+            initramfs::cow_map_file_into_hole_borrowed(
+                subrange.host_addr,
+                subrange.len,
+                fd,
+                subrange.file_offset,
+            )
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    vm.register_memory().unwrap();
+    assert!(
+        vm.register_memory().is_err(),
+        "the final KVM registration boundary must be one-way"
+    );
+
+    let vcpu = &mut vm.vcpus[0];
+    let mut sregs = vcpu.get_sregs().unwrap();
+    sregs.cs.base = 0;
+    sregs.cs.selector = 0;
+    vcpu.set_sregs(&sregs).unwrap();
+    vcpu.set_regs(&kvm_bindings::kvm_regs {
+        rip: host_page as u64,
+        rflags: 0x2,
+        ..Default::default()
+    })
+    .unwrap();
+
+    match vcpu.run().unwrap() {
+        VcpuExit::IoOut(port, data) => {
+            assert_eq!(port, 0x1234);
+            assert_eq!(data, [0x5a]);
+        }
+        exit => panic!("expected overlay code to exit through port I/O, got {exit:?}"),
+    }
 }
 
 /// Regression for the PVTIME/initrd overlap: the initrd top
@@ -2050,262 +2329,6 @@ fn assemble_extras_and_key_threads_staged_into_basekey_in_both_modes() {
          must differ — confirms each arm calls its respective \
          BaseKey constructor",
     );
-}
-
-/// Drive the legacy test-only SHM compatibility helper against a live LZ4
-/// segment and a two-region `GuestMemoryMmap`. The overlay must succeed (return
-/// `Some`), map the SHM bytes into region A, and leave the adjacent
-/// marker region B byte-for-byte untouched. Exercises that compatibility
-/// path — `shm_open_lz4`, the LZ4-magic pread validation, the rounded-
-/// length bounds check, and the `MAP_FIXED` overlay via `cow_overlay` —
-/// not the production prepared-CAS loader.
-#[test]
-fn try_cow_overlay_maps_segment_and_preserves_adjacent_region() {
-    use vm_memory::{Bytes, GuestAddress};
-
-    let page = host_page_size() as usize;
-    // Region A holds the overlay target; region B holds a marker that
-    // must survive. Each is several host pages so the rounded-up overlay
-    // length fits comfortably inside region A.
-    let region_a_size = page * 4;
-    let region_b_size = page * 4;
-    let region_a_start: u64 = 0;
-    let region_b_start: u64 = (region_a_size as u64) + (1 << 20); // 1 MiB gap
-    let mem = GuestMemoryMmap::<()>::from_ranges(&[
-        (GuestAddress(region_a_start), region_a_size),
-        (GuestAddress(region_b_start), region_b_size),
-    ])
-    .unwrap();
-
-    // Plant a detectable marker across the whole of region B.
-    let marker: Vec<u8> = (0..region_b_size).map(|i| (i & 0xff) as u8).collect();
-    mem.write_slice(&marker, GuestAddress(region_b_start))
-        .unwrap();
-
-    // Store a real LZ4-magic SHM segment (one host page of content) and
-    // key the overlay off its content hash. Use a hash unlikely to
-    // collide with any concurrent test's segment.
-    let hash = 0xC0FF_EE00_DEAD_F00Du64;
-    let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
-    let mut segment = initramfs::LZ4_LEGACY_MAGIC.to_vec();
-    segment.extend((segment.len()..page).map(|i| (i & 0xff) as u8));
-    assert_eq!(segment.len(), page, "segment sized to one host page");
-    initramfs::shm_store_lz4(hash, &segment).unwrap();
-
-    let key = BaseKey(hash);
-    let guard = KtstrVm::try_cow_overlay(&mem, &key, segment.len(), region_a_start);
-    assert!(
-        guard.is_some(),
-        "overlay of a valid, in-bounds, page-aligned segment must succeed",
-    );
-
-    // Region A now reflects the SHM segment content (MAP_PRIVATE reads
-    // see the backing bytes until first write).
-    let mut a_readback = vec![0u8; segment.len()];
-    mem.read_slice(&mut a_readback, GuestAddress(region_a_start))
-        .unwrap();
-    assert_eq!(
-        a_readback, segment,
-        "region A must reflect the COW-mapped segment bytes",
-    );
-
-    // Region B is byte-for-byte untouched — the overlay never reached it.
-    let mut b_readback = vec![0u8; region_b_size];
-    mem.read_slice(&mut b_readback, GuestAddress(region_b_start))
-        .unwrap();
-    assert_eq!(
-        b_readback, marker,
-        "adjacent region B must be untouched by the overlay",
-    );
-
-    // Match the prod teardown order (x86_64/kvm.rs, aarch64 mirror):
-    // guest memory unmaps the MAP_FIXED COW region FIRST, then the guard
-    // releases LOCK_SH + closes the fd.
-    drop(mem);
-    drop(guard);
-    let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
-}
-
-/// Drive the legacy test-only SHM compatibility helper with a request whose
-/// rounded length overruns region A into the inter-region gap. Its bounds check
-/// (`get_slice` on the rounded length) must reject it: `try_cow_overlay`
-/// returns `None`, never invokes `MAP_FIXED`, and the adjacent marker
-/// region survives. Unlike the dependency-contract pin in
-/// `initramfs_tests.rs` (which calls `get_slice` directly), this routes
-/// through the compatibility function, so dropping the guard or bounds-
-/// checking `len` instead of `rounded_len` would fail here.
-#[test]
-fn try_cow_overlay_rejects_oversized_request_and_preserves_region() {
-    use vm_memory::{Bytes, GuestAddress};
-
-    let page = host_page_size() as usize;
-    let region_a_size = page * 2;
-    let region_b_size = page * 2;
-    let region_a_start: u64 = 0;
-    let region_b_start: u64 = (region_a_size as u64) + (1 << 20); // 1 MiB gap
-    let mem = GuestMemoryMmap::<()>::from_ranges(&[
-        (GuestAddress(region_a_start), region_a_size),
-        (GuestAddress(region_b_start), region_b_size),
-    ])
-    .unwrap();
-
-    let marker: Vec<u8> = (0..region_b_size).map(|i| (i & 0xff) as u8).collect();
-    mem.write_slice(&marker, GuestAddress(region_b_start))
-        .unwrap();
-
-    // Segment one host page LARGER than region A: the rounded overlay
-    // length cannot fit, so the bounds check must reject it.
-    let hash = 0xBADC_0DE0_0BAD_F00Du64;
-    let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
-    let oversized_len = region_a_size + page;
-    let mut segment = initramfs::LZ4_LEGACY_MAGIC.to_vec();
-    segment.extend((segment.len()..oversized_len).map(|i| (i & 0xff) as u8));
-    assert_eq!(segment.len(), oversized_len);
-    initramfs::shm_store_lz4(hash, &segment).unwrap();
-
-    let key = BaseKey(hash);
-    let guard = KtstrVm::try_cow_overlay(&mem, &key, segment.len(), region_a_start);
-    assert!(
-        guard.is_none(),
-        "an overlay whose rounded length overruns region A must be rejected",
-    );
-
-    // Region B is untouched: MAP_FIXED was never invoked.
-    let mut b_readback = vec![0u8; region_b_size];
-    mem.read_slice(&mut b_readback, GuestAddress(region_b_start))
-        .unwrap();
-    assert_eq!(
-        b_readback, marker,
-        "region B must survive a rejected overlay",
-    );
-
-    drop(mem);
-    let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
-}
-
-/// Drive the legacy test-only SHM compatibility helper against a stored segment
-/// whose length matches `expected_len` but whose first 4 bytes are NOT the
-/// LZ4 legacy magic. The magic-validation arm (`if magic !=
-/// initramfs::LZ4_LEGACY_MAGIC`) must reject it: `try_cow_overlay`
-/// closes the fd and returns `None`, never reaching the `MAP_FIXED`
-/// overlay, so the adjacent marker region stays byte-identical. The two
-/// existing overlay tests only store segments whose header IS the magic,
-/// so this stale-format rejection arm was never executed.
-#[test]
-fn try_cow_overlay_rejects_stale_non_lz4_magic_segment() {
-    use vm_memory::{Bytes, GuestAddress};
-
-    let page = host_page_size() as usize;
-    // Same two-region fixture as the success path: region A is the
-    // overlay target, region B holds a marker that must survive.
-    let region_a_size = page * 4;
-    let region_b_size = page * 4;
-    let region_a_start: u64 = 0;
-    let region_b_start: u64 = (region_a_size as u64) + (1 << 20); // 1 MiB gap
-    let mem = GuestMemoryMmap::<()>::from_ranges(&[
-        (GuestAddress(region_a_start), region_a_size),
-        (GuestAddress(region_b_start), region_b_size),
-    ])
-    .unwrap();
-
-    let marker: Vec<u8> = (0..region_b_size).map(|i| (i & 0xff) as u8).collect();
-    mem.write_slice(&marker, GuestAddress(region_b_start))
-        .unwrap();
-
-    // One host page of content whose first 4 bytes are 0xAB.. — never
-    // the LZ4 legacy magic (0x184C2102 little-endian). `expected_len`
-    // equals the stored length so the len check passes and execution
-    // reaches the magic pread.
-    let hash = 0x5741_4C45_F00D_BEEFu64;
-    let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
-    let segment: Vec<u8> = vec![0xABu8; page];
-    assert_ne!(
-        segment[..4],
-        initramfs::LZ4_LEGACY_MAGIC,
-        "fixture header must NOT be the LZ4 legacy magic",
-    );
-    initramfs::shm_store_lz4(hash, &segment).unwrap();
-
-    let key = BaseKey(hash);
-    let guard = KtstrVm::try_cow_overlay(&mem, &key, segment.len(), region_a_start);
-    assert!(
-        guard.is_none(),
-        "a segment without the LZ4 legacy magic must be rejected",
-    );
-
-    // Region B is byte-for-byte untouched — MAP_FIXED never ran.
-    let mut b_readback = vec![0u8; region_b_size];
-    mem.read_slice(&mut b_readback, GuestAddress(region_b_start))
-        .unwrap();
-    assert_eq!(
-        b_readback, marker,
-        "region B must survive a magic-rejected overlay",
-    );
-
-    drop(mem);
-    let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
-}
-
-/// Drive the legacy test-only SHM compatibility helper with a
-/// non-host-page-aligned `load_addr`. The alignment gate
-/// (`if load_addr & (host_page - 1) !=
-/// 0`) must reject it: `try_cow_overlay` returns `None` and never
-/// invokes `MAP_FIXED` (mmap would return `EINVAL` on a mid-page
-/// target). The segment carries a VALID LZ4 magic so execution passes
-/// the magic check and reaches the alignment gate; `load_addr = 1` sits
-/// inside region A's bounds yet fails the page-alignment test on every
-/// supported host page size. The two existing overlay tests pass
-/// `load_addr = 0` (page-aligned), so this arm was never executed.
-#[test]
-fn try_cow_overlay_rejects_unaligned_load_addr() {
-    use vm_memory::{Bytes, GuestAddress};
-
-    let page = host_page_size() as usize;
-    let region_a_size = page * 4;
-    let region_b_size = page * 4;
-    let region_a_start: u64 = 0;
-    let region_b_start: u64 = (region_a_size as u64) + (1 << 20); // 1 MiB gap
-    let mem = GuestMemoryMmap::<()>::from_ranges(&[
-        (GuestAddress(region_a_start), region_a_size),
-        (GuestAddress(region_b_start), region_b_size),
-    ])
-    .unwrap();
-
-    let marker: Vec<u8> = (0..region_b_size).map(|i| (i & 0xff) as u8).collect();
-    mem.write_slice(&marker, GuestAddress(region_b_start))
-        .unwrap();
-
-    // Valid one-host-page LZ4 segment so the magic + len + bounds checks
-    // all pass; only the alignment gate must trip.
-    let hash = 0x0FF5_E700_A11A_BEEFu64;
-    let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
-    let mut segment = initramfs::LZ4_LEGACY_MAGIC.to_vec();
-    segment.extend((segment.len()..page).map(|i| (i & 0xff) as u8));
-    assert_eq!(segment.len(), page, "segment sized to one host page");
-    initramfs::shm_store_lz4(hash, &segment).unwrap();
-
-    // load_addr = 1: inside region A [0, region_a_size) but not aligned
-    // to any host page size (4 KiB or 16 KiB).
-    let unaligned_addr: u64 = 1;
-    let key = BaseKey(hash);
-    let guard = KtstrVm::try_cow_overlay(&mem, &key, segment.len(), unaligned_addr);
-    assert!(
-        guard.is_none(),
-        "a non-host-page-aligned load_addr must be rejected",
-    );
-
-    // No overlay touched memory: region B (and region A's marker-free
-    // start) survive. Assert region B against its planted marker.
-    let mut b_readback = vec![0u8; region_b_size];
-    mem.read_slice(&mut b_readback, GuestAddress(region_b_start))
-        .unwrap();
-    assert_eq!(
-        b_readback, marker,
-        "region B must survive an alignment-rejected overlay",
-    );
-
-    drop(mem);
-    let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
 }
 
 /// `aarch64_initrd_addr` aligns both the ceiling and mapped extent to the

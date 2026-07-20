@@ -545,15 +545,11 @@ fn suffix_emits_kernel_modules_in_order() {
 }
 
 #[test]
-fn try_cow_overlay_rejects_cross_region_span() {
-    // The bounds check in try_cow_overlay relies on
-    // GuestMemoryMmap::get_slice failing when a range would cross
-    // a region boundary. This test locks that semantic in: two
-    // non-contiguous regions; a range that starts in region A but
-    // extends past its end must be rejected. If this ever passes
-    // (e.g. vm-memory swaps in multi-region get_slices semantics
-    // here), try_cow_overlay's MAP_FIXED would silently clobber
-    // whatever host mapping sits between the regions.
+fn guest_memory_get_slice_rejects_cross_region_span() {
+    // Keep the vm-memory single-region slice contract explicit: the prepared
+    // loader intentionally uses get_slices to split a validated range across
+    // NUMA regions, while any caller needing one contiguous HVA must use
+    // get_slice and receive an error at the boundary.
     use vm_memory::{GuestAddress, GuestMemory};
     let region_a_size: usize = 64 * 1024;
     let region_b_size: usize = 64 * 1024;
@@ -573,8 +569,7 @@ fn try_cow_overlay_rejects_cross_region_span() {
     );
 
     // Range starting mid-region-A and extending past region A's
-    // end: must fail. This is the exact shape of the hazardous
-    // cow_overlay case.
+    // end: must fail.
     let overrun_start = region_a_start + (region_a_size as u64 / 2);
     let overrun_len = region_a_size; // well past the region's end
     assert!(
@@ -591,16 +586,6 @@ fn try_cow_overlay_rejects_cross_region_span() {
         "gap-start slice must fail"
     );
 }
-
-// NOTE: the former `try_cow_overlay_preserves_adjacent_region_bytes`
-// test lived here but never invoked the production `try_cow_overlay`
-// (it re-implemented the bounds check inline and asserted that NOT
-// writing leaves memory unchanged — a tautology). It is replaced by
-// `try_cow_overlay_maps_segment_and_preserves_adjacent_region` and
-// `try_cow_overlay_rejects_oversized_request_and_preserves_region`
-// in `src/vmm/setup/tests.rs`, which drive the real function against
-// a live LZ4 SHM segment. The `try_cow_overlay_rejects_cross_region_span`
-// test below remains as the vm_memory `get_slice` dependency-contract pin.
 
 /// Each non-LZ4 format must round-trip through the matching vendored
 /// decoder — the same codec family the kernel's RD_* unpacker uses —

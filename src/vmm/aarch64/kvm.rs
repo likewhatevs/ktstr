@@ -138,11 +138,14 @@ pub struct KtstrKvm {
     pub guest_mem: ManuallyDrop<GuestMemoryMmap>,
     pub topology: Topology,
     /// Per-node GPA layout used by FDT memory nodes and NUMA distance map.
-    /// `None` in deferred mode before `allocate_and_register_memory()`.
+    /// `None` in deferred mode before [`Self::allocate_memory`].
     pub(crate) numa_layout: Option<NumaMemoryLayout>,
     /// Actual backing selected by the allocator. `None` only before deferred
     /// memory allocation.
     pub(crate) memory_backing: Option<MemoryBacking>,
+    /// True only after the final guest-memory VMA layout has been published
+    /// to KVM.
+    memory_registered: bool,
     pub has_immediate_exit: bool,
     /// True when the host KVM advertises Cap::ArmPmuV3. Threaded into
     /// FDT generation so the arm,armv8-pmuv3 node is only emitted when
@@ -193,29 +196,17 @@ impl Drop for KtstrKvm {
 }
 
 impl KtstrKvm {
-    /// Create a new KVM VM with the given topology and memory size.
-    pub fn new(topo: Topology, memory_mib: u32, performance_mode: bool) -> Result<Self> {
+    /// Create a VM with allocated but deliberately unregistered guest RAM.
+    pub(crate) fn new(topo: Topology, memory_mib: u32, performance_mode: bool) -> Result<Self> {
         Self::new_inner(topo, Some(memory_mib), false, performance_mode)
-    }
-
-    /// Create a new KVM VM with hugepage-backed guest memory.
-    // Standard setup requests hugepages opportunistically through
-    // `performance_mode`; retain this constructor as the strict, no-fallback
-    // API for callers that explicitly require hugetlb backing.
-    #[allow(dead_code)]
-    pub fn new_with_hugepages(
-        topo: Topology,
-        memory_mib: u32,
-        performance_mode: bool,
-    ) -> Result<Self> {
-        Self::new_inner(topo, Some(memory_mib), true, performance_mode)
     }
 
     /// Create a KVM VM without allocating guest memory.
     ///
     /// Sets up /dev/kvm, VM fd, vCPUs, GICv3, and PMUv3 (when host
     /// supports) — none of which depend on guest memory size. Memory is
-    /// allocated later via [`Self::allocate_and_register_memory`].
+    /// allocated later via [`Self::allocate_memory`] and published via
+    /// [`Self::register_memory`].
     pub fn new_deferred(
         topo: Topology,
         use_hugepages: bool,
@@ -224,20 +215,22 @@ impl KtstrKvm {
         Self::new_inner(topo, None, use_hugepages, performance_mode)
     }
 
-    /// Allocate guest memory and register it with KVM.
+    /// Allocate guest memory without registering it with KVM.
     ///
-    /// Should be called exactly once on a VM created with
-    /// `new_deferred`; calling twice unconditionally replaces the
-    /// backing memory. Replaces the placeholder guest memory with a
-    /// real allocation of `memory_mib` mebibytes at DRAM_START and
-    /// sets `numa_layout` to the computed per-node GPA layout.
+    /// Called exactly once on a VM created with `new_deferred`; a second
+    /// allocation is rejected. Replaces the placeholder guest memory with a
+    /// real allocation of `memory_mib` mebibytes at DRAM_START and sets
+    /// `numa_layout` to the computed per-node GPA layout.
     /// Re-checks hugepage availability when performance_mode is set,
     /// since memory_mib was unknown at construction time and
     /// `use_hugepages` may have been false.
-    pub fn allocate_and_register_memory(&mut self, memory_mib: u32) -> Result<()> {
+    pub(crate) fn allocate_memory(&mut self, memory_mib: u32) -> Result<()> {
+        anyhow::ensure!(
+            self._reservation.is_none() && self.numa_layout.is_none(),
+            "guest memory is already allocated"
+        );
         let layout = NumaMemoryLayout::compute(&self.topology, memory_mib, DRAM_START, None)?;
-        let alloc =
-            layout.allocate_and_register(&self.vm_fd, self.use_hugepages, self.performance_mode)?;
+        let alloc = layout.allocate(self.use_hugepages, self.performance_mode)?;
         // SAFETY: guest_mem is ManuallyDrop — explicit drop before
         // replacement prevents leaking the placeholder mapping.
         unsafe { ManuallyDrop::drop(&mut self.guest_mem) };
@@ -245,6 +238,22 @@ impl KtstrKvm {
         self._reservation = Some(alloc.reservation);
         self.memory_backing = Some(alloc.backing);
         self.numa_layout = Some(layout);
+        self.memory_registered = false;
+        Ok(())
+    }
+
+    /// Publish the final guest-memory VMA layout to KVM exactly once.
+    pub(crate) fn register_memory(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            !self.memory_registered,
+            "guest memory is already registered"
+        );
+        let layout = self
+            .numa_layout
+            .as_ref()
+            .context("cannot register guest memory before allocation")?;
+        layout.register(&self.vm_fd, &self.guest_mem)?;
+        self.memory_registered = true;
         Ok(())
     }
 
@@ -343,8 +352,7 @@ impl KtstrKvm {
         let (guest_mem, numa_layout, reservation, memory_backing) = match memory_mib {
             Some(mb) => {
                 let layout = NumaMemoryLayout::compute(&topo, mb, DRAM_START, None)?;
-                let alloc =
-                    layout.allocate_and_register(&vm_fd, use_hugepages, performance_mode)?;
+                let alloc = layout.allocate(use_hugepages, performance_mode)?;
                 (
                     alloc.guest_mem,
                     Some(layout),
@@ -467,6 +475,7 @@ impl KtstrKvm {
             topology: topo,
             numa_layout,
             memory_backing,
+            memory_registered: false,
             has_immediate_exit,
             has_pmu: pmu_supported,
             gic_fd: ManuallyDrop::new(gic_fd),

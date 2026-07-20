@@ -330,11 +330,15 @@ pub struct KtstrKvm {
     pub guest_mem: ManuallyDrop<GuestMemoryMmap>,
     pub topology: Topology,
     /// Per-node GPA layout used by ACPI SRAT/HMAT generation. `None`
-    /// in deferred mode before `allocate_and_register_memory()`.
+    /// in deferred mode before [`Self::allocate_memory`].
     pub(crate) numa_layout: Option<NumaMemoryLayout>,
     /// Actual backing selected by the allocator. `None` only before deferred
     /// memory allocation.
     pub(crate) memory_backing: Option<MemoryBacking>,
+    /// True only after every final guest-memory VMA has been published to KVM.
+    /// Production setup keeps this false while installing the prepared-initrd
+    /// COW layout, then crosses the registration boundary exactly once.
+    memory_registered: bool,
     /// Whether KVM supports the immediate_exit mechanism (KVM_CAP_IMMEDIATE_EXIT).
     pub has_immediate_exit: bool,
     /// Split IRQ chip mode: LAPIC in kernel, PIC/IOAPIC emulated in userspace.
@@ -391,29 +395,46 @@ impl Drop for KtstrKvm {
 }
 
 impl KtstrKvm {
-    /// Create a new KVM VM with the given topology and memory size.
-    pub fn new(topo: Topology, memory_mib: u32, performance_mode: bool) -> Result<Self> {
-        Self::new_inner(topo, Some(memory_mib), false, performance_mode)
+    fn validate_ram_top(
+        layout: &NumaMemoryLayout,
+        cpuid: &[kvm_bindings::kvm_cpuid_entry2],
+    ) -> Result<()> {
+        let phys_bits = cpuid
+            .iter()
+            .find(|entry| entry.function == 0x8000_0008)
+            .map(|entry| entry.eax & 0xff)
+            .unwrap_or(36);
+        if let Some(top) = layout.ram_top_exceeds_phys_bits(phys_bits) {
+            return Err(anyhow::Error::new(
+                crate::vmm::host_topology::TopologyInsufficient {
+                    reason: format!(
+                        "guest RAM top {top:#x} exceeds the guest MAXPHYADDR \
+                         (1<<{phys_bits}); this host's physical-address \
+                         width cannot back a VM this large — RAM above the \
+                         MAXPHYADDR is unreachable (a guest access faults on \
+                         the MMU reserved-bits check)"
+                    ),
+                },
+            ));
+        }
+        Ok(())
     }
 
-    /// Create a new KVM VM with hugepage-backed guest memory.
-    // Standard setup requests hugepages opportunistically through
-    // `performance_mode`; retain this constructor as the strict, no-fallback
-    // API for callers that explicitly require hugetlb backing.
-    #[allow(dead_code)]
-    pub fn new_with_hugepages(
-        topo: Topology,
-        memory_mib: u32,
-        performance_mode: bool,
-    ) -> Result<Self> {
-        Self::new_inner(topo, Some(memory_mib), true, performance_mode)
+    /// Create a VM with allocated but deliberately unregistered guest RAM.
+    ///
+    /// Production setup uses this when the requested memory size is known
+    /// up front. It can load the kernel and install the complete disjoint COW
+    /// initrd layout before exposing a single immutable HVA layout to KVM.
+    pub(crate) fn new(topo: Topology, memory_mib: u32, performance_mode: bool) -> Result<Self> {
+        Self::new_inner(topo, Some(memory_mib), false, performance_mode)
     }
 
     /// Create a KVM VM without allocating guest memory.
     ///
     /// Sets up /dev/kvm, VM fd, TSS, identity map, IRQ chip, vCPUs, and
     /// CPUID — none of which depend on guest memory size. Memory is
-    /// allocated later via `allocate_and_register_memory`.
+    /// allocated later via [`Self::allocate_memory`] and published via
+    /// [`Self::register_memory`].
     pub fn new_deferred(
         topo: Topology,
         use_hugepages: bool,
@@ -422,25 +443,28 @@ impl KtstrKvm {
         Self::new_inner(topo, None, use_hugepages, performance_mode)
     }
 
-    /// Allocate guest memory and register it with KVM.
+    /// Allocate guest memory without registering it with KVM.
     ///
-    /// Should be called exactly once on a VM created with
-    /// `new_deferred`; calling twice unconditionally replaces the
-    /// backing memory. Replaces the placeholder guest memory with a
-    /// real allocation of `memory_mib` mebibytes and sets
-    /// `numa_layout` to the computed per-node GPA layout. Re-checks
-    /// hugepage availability when performance_mode is set, since
-    /// memory_mib was unknown at construction time and `use_hugepages`
-    /// may have been false.
-    pub fn allocate_and_register_memory(&mut self, memory_mib: u32) -> Result<()> {
+    /// Called exactly once on a deferred VM. The complete final COW layout may
+    /// then be installed before [`Self::register_memory`] freezes the HVA
+    /// layout visible to KVM.
+    pub(crate) fn allocate_memory(&mut self, memory_mib: u32) -> Result<()> {
+        anyhow::ensure!(
+            self._reservation.is_none() && self.numa_layout.is_none(),
+            "guest memory is already allocated"
+        );
         let layout = NumaMemoryLayout::compute(
             &self.topology,
             memory_mib,
             0,
             Some((MMIO_GAP_START, MMIO_GAP_END)),
         )?;
-        let alloc =
-            layout.allocate_and_register(&self.vm_fd, self.use_hugepages, self.performance_mode)?;
+        let cpuid = self
+            .kvm
+            .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .context("get supported CPUID for deferred RAM-top validation")?;
+        Self::validate_ram_top(&layout, cpuid.as_slice())?;
+        let alloc = layout.allocate(self.use_hugepages, self.performance_mode)?;
         // SAFETY: this is the only call to ManuallyDrop::drop on
         // self.guest_mem; the next line replaces it with
         // ManuallyDrop::new(...).
@@ -449,6 +473,22 @@ impl KtstrKvm {
         self._reservation = Some(alloc.reservation);
         self.memory_backing = Some(alloc.backing);
         self.numa_layout = Some(layout);
+        self.memory_registered = false;
+        Ok(())
+    }
+
+    /// Publish the final guest-memory VMA layout to KVM exactly once.
+    pub(crate) fn register_memory(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            !self.memory_registered,
+            "guest memory is already registered"
+        );
+        let layout = self
+            .numa_layout
+            .as_ref()
+            .context("cannot register guest memory before allocation")?;
+        layout.register(&self.vm_fd, &self.guest_mem)?;
+        self.memory_registered = true;
         Ok(())
     }
 
@@ -500,8 +540,7 @@ impl KtstrKvm {
             Some(mb) => {
                 let layout =
                     NumaMemoryLayout::compute(&topo, mb, 0, Some((MMIO_GAP_START, MMIO_GAP_END)))?;
-                let alloc =
-                    layout.allocate_and_register(&vm_fd, use_hugepages, performance_mode)?;
+                let alloc = layout.allocate(use_hugepages, performance_mode)?;
                 (
                     alloc.guest_mem,
                     Some(layout),
@@ -533,6 +572,7 @@ impl KtstrKvm {
             topology: topo,
             numa_layout,
             memory_backing,
+            memory_registered: false,
             has_immediate_exit,
             split_irqchip,
             ioapic,
@@ -722,25 +762,7 @@ impl KtstrKvm {
         // widen to max(RAM, MMIO) top if a high MMIO window above RAM is ever
         // added.
         if let Some(layout) = &numa_layout {
-            let phys_bits = base_cpuid
-                .as_slice()
-                .iter()
-                .find(|e| e.function == 0x8000_0008)
-                .map(|e| e.eax & 0xff)
-                .unwrap_or(36);
-            if let Some(top) = layout.ram_top_exceeds_phys_bits(phys_bits) {
-                return Err(anyhow::Error::new(
-                    crate::vmm::host_topology::TopologyInsufficient {
-                        reason: format!(
-                            "guest RAM top {top:#x} exceeds the guest MAXPHYADDR \
-                             (1<<{phys_bits}); this host's physical-address \
-                             width cannot back a VM this large — RAM above the \
-                             MAXPHYADDR is unreachable (a guest access faults on \
-                             the MMU reserved-bits check)"
-                        ),
-                    },
-                ));
-            }
+            Self::validate_ram_top(layout, base_cpuid.as_slice())?;
         }
 
         // Create vCPUs with topology-specific CPUID. KVM_CREATE_VCPU

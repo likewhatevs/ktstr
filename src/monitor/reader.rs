@@ -8476,9 +8476,7 @@ mod tests {
         let topo = Topology::new(1, 2, 4, 2);
         let gap = Some((0xC000_0000u64, 0x1_0000_0000u64));
         let layout = NumaMemoryLayout::compute(&topo, 4096, 0, gap).unwrap();
-        let kvm = kvm_ioctls::Kvm::new().unwrap();
-        let vm_fd = kvm.create_vm().unwrap();
-        let alloc = layout.allocate_and_register(&vm_fd, false, false).unwrap();
+        let alloc = layout.allocate(false, false).unwrap();
         let mem = GuestMem::from_layout(&layout, &alloc.guest_mem);
         // Offset extent = high region offset (4 GiB) + its size (1 GiB) =
         // 5 GiB; RAM total is only 4 GiB.

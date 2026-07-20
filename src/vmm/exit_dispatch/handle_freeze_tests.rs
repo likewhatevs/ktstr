@@ -35,6 +35,9 @@ fn handle_freeze_drain_swallows_eintr_and_resets_state() {
         llc_cores: None,
     };
     let mut vm = KtstrKvm::new(topo, 64, false).unwrap();
+    // This path enters KVM_RUN (with immediate_exit already armed). Keep the
+    // test on the same one-way registration boundary as a real VM.
+    vm.register_memory().unwrap();
     crate::vmm::x86_64::boot::setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();
     let run_size = vm.vm_fd.run_size();
     let (mut vcpu, _) =

@@ -27,7 +27,7 @@ impl Drop for ReservationGuard {
     }
 }
 
-/// Result of `NumaMemoryLayout::allocate_and_register`.
+/// Result of [`NumaMemoryLayout::allocate`].
 pub(crate) struct AllocatedMemory {
     pub guest_mem: GuestMemoryMmap,
     pub reservation: ReservationGuard,
@@ -121,7 +121,7 @@ pub struct NumaMemoryLayout {
     /// above-gap region relocated to `gap_end`, both carrying the same
     /// `node_id`. Total RAM is preserved (the in-gap bytes move above
     /// the gap, not dropped). The host VA backing stays packed and
-    /// contiguous (sum of region sizes); see `allocate_and_register`.
+    /// contiguous (sum of region sizes); see [`Self::allocate`].
     regions: Vec<NodeRegion>,
 }
 
@@ -386,7 +386,7 @@ impl NumaMemoryLayout {
 
     /// Test helper — total guest memory in bytes (sum of all node
     /// regions). Production code derives per-region hugepage counts
-    /// directly in `allocate_and_register`'s gate, so the layout total is
+    /// directly in `allocate`'s gate, so the layout total is
     /// only needed by tests asserting the advertised RAM.
     #[cfg(test)]
     pub fn total_bytes(&self) -> u64 {
@@ -458,20 +458,18 @@ impl NumaMemoryLayout {
         self.regions.last().map_or(0, |r| r.slot + 1)
     }
 
-    /// Reserve contiguous VA, per-node MAP_FIXED mmap, register per-node
-    /// KVM memory slots, and return the multi-region `GuestMemoryMmap`
-    /// with a `ReservationGuard` that owns the VA range.
+    /// Reserve contiguous VA, install per-node anonymous mappings, and wrap
+    /// them in a multi-region `GuestMemoryMmap`.
     ///
     /// Each node gets its own MAP_FIXED mmap within the reserved VA.
     /// The `MmapRegion` wrappers have `owned=false` (via `build_raw`),
     /// so their Drop is a no-op. The `ReservationGuard` munmaps the
     /// entire reservation on drop, releasing all sub-mappings.
-    pub fn allocate_and_register(
-        &self,
-        vm_fd: &kvm_ioctls::VmFd,
-        use_hugepages: bool,
-        performance_mode: bool,
-    ) -> Result<AllocatedMemory> {
+    ///
+    /// This deliberately does not publish KVM memory slots. Production VM
+    /// setup installs the complete final COW layout first and calls
+    /// [`Self::register`] only after no further VMA replacement can occur.
+    pub fn allocate(&self, use_hugepages: bool, performance_mode: bool) -> Result<AllocatedMemory> {
         let hugetlb_compatible = self.hugetlb_compatible();
         self.choose_memory_backing(use_hugepages, false, 0)?;
         let opportunistic_hugepages = !use_hugepages && performance_mode && hugetlb_compatible;
@@ -534,10 +532,7 @@ impl NumaMemoryLayout {
             (self.map_reservation(false)?, MemoryBacking::BasePages)
         };
 
-        // Register only after every host VMA has been allocated. A failed
-        // opportunistic hugepage attempt can therefore be dropped and retried
-        // without leaving partially registered KVM memory slots behind.
-        let guest_regions = self.register_mapped_regions(vm_fd, mapped.base, &mapped.va_spans)?;
+        let guest_regions = self.wrap_mapped_regions(mapped.base, &mapped.va_spans)?;
         let guest_mem = GuestMemoryMmap::from_regions(guest_regions)
             .context("create multi-region GuestMemoryMmap")?;
 
@@ -680,12 +675,11 @@ impl NumaMemoryLayout {
         })
     }
 
-    /// Wrap a fully mapped reservation as `vm-memory` regions and publish all
-    /// KVM memory slots. `base` and `va_spans` come from
-    /// [`Self::map_reservation`] and remain owned by its guard.
-    fn register_mapped_regions(
+    /// Wrap a fully mapped reservation as non-owning `vm-memory` regions.
+    /// `base` and `va_spans` come from [`Self::map_reservation`] and remain
+    /// owned by its guard.
+    fn wrap_mapped_regions(
         &self,
-        vm_fd: &kvm_ioctls::VmFd,
         base: *mut libc::c_void,
         va_spans: &[usize],
     ) -> Result<Vec<GuestRegionMmap>> {
@@ -713,7 +707,28 @@ impl NumaMemoryLayout {
                     anyhow::anyhow!("GuestRegionMmap overflow for node {}", region.node_id)
                 })?;
             guest_regions.push(guest_region);
+        }
+        Ok(guest_regions)
+    }
 
+    /// Publish the already-final guest-memory VMA layout as KVM memory slots.
+    ///
+    /// Callers must not replace or unmap any part of `guest_mem` after this
+    /// succeeds. Host writes and private COW faults remain valid; only the VMA
+    /// identity/layout is frozen at this boundary.
+    pub fn register(&self, vm_fd: &kvm_ioctls::VmFd, guest_mem: &GuestMemoryMmap) -> Result<()> {
+        self.register_with(guest_mem, |region, mem_region, rollback| {
+            let operation = if rollback {
+                format!(
+                    "roll back KVM memory slot {} for node {}",
+                    region.slot, region.node_id
+                )
+            } else {
+                format!(
+                    "set KVM memory slot {} for node {}",
+                    region.slot, region.node_id
+                )
+            };
             // Step 7: Register KVM memory slot. KVM_SET_USER_MEMORY_REGION
             // can fail with the host-resource errnos that
             // [`super::map_transient_to_contention`] classifies as
@@ -739,27 +754,73 @@ impl NumaMemoryLayout {
             //     arch/x86 mmu.c).
             //   - EFAULT: arm64/riscv guest-phys-bounds violation
             //     (arch/arm64/kvm/mmu.c, arch/riscv/kvm/mmu.c).
-            let mem_region = kvm_bindings::kvm_userspace_memory_region {
-                slot: region.slot,
-                guest_phys_addr: region.gpa_start,
-                memory_size: region.size,
-                userspace_addr: node_addr as u64,
-                flags: 0,
-            };
             unsafe {
-                vm_fd.set_user_memory_region(mem_region).map_err(|e| {
-                    super::map_transient_to_contention(
-                        e,
+                vm_fd
+                    .set_user_memory_region(mem_region)
+                    .map_err(|error| super::map_transient_to_contention(error, operation))
+            }
+        })
+    }
+
+    /// Precompute every memory-slot descriptor, then publish them as one
+    /// logical transaction. KVM has no multi-slot atomic ioctl, so a failure
+    /// rolls back every earlier slot in reverse order before returning.
+    ///
+    /// The callback seam makes the partial-failure protocol deterministic in
+    /// tests without requiring the kernel to fail a particular slot.
+    fn register_with<Update>(&self, guest_mem: &GuestMemoryMmap, mut update: Update) -> Result<()>
+    where
+        Update: FnMut(&NodeRegion, kvm_bindings::kvm_userspace_memory_region, bool) -> Result<()>,
+    {
+        let registrations = self
+            .regions
+            .iter()
+            .map(|region| {
+                let node_addr = guest_mem
+                    .get_host_address(GuestAddress(region.gpa_start))
+                    .with_context(|| {
                         format!(
-                            "set KVM memory slot {} for node {}",
+                            "resolve host address for KVM memory slot {} (node {})",
                             region.slot, region.node_id
-                        ),
-                    )
-                })?;
+                        )
+                    })?;
+                Ok((
+                    region,
+                    kvm_bindings::kvm_userspace_memory_region {
+                        slot: region.slot,
+                        guest_phys_addr: region.gpa_start,
+                        memory_size: region.size,
+                        userspace_addr: node_addr as u64,
+                        flags: 0,
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        for (index, (region, mem_region)) in registrations.iter().enumerate() {
+            if let Err(register_error) = update(region, *mem_region, false) {
+                let mut rollback_errors = Vec::new();
+                for (registered_region, registered_mem_region) in
+                    registrations[..index].iter().rev()
+                {
+                    let removal = kvm_bindings::kvm_userspace_memory_region {
+                        memory_size: 0,
+                        ..*registered_mem_region
+                    };
+                    if let Err(error) = update(registered_region, removal, true) {
+                        rollback_errors.push(format!("{error:#}"));
+                    }
+                }
+                if rollback_errors.is_empty() {
+                    return Err(register_error);
+                }
+                return Err(register_error).context(format!(
+                    "KVM memory-slot registration rollback also failed: {}",
+                    rollback_errors.join("; ")
+                ));
             }
         }
-
-        Ok(guest_regions)
+        Ok(())
     }
 
     /// Bind each node's region to the corresponding host NUMA node(s),
@@ -812,8 +873,8 @@ impl NumaMemoryLayout {
         }
     }
 
-    /// Reapply NUMA policy to a file-backed range that replaced part of a
-    /// guest-memory region with `MAP_FIXED`.
+    /// Reapply NUMA policy to a file-backed range installed into a
+    /// guest-memory destination hole.
     ///
     /// Unlike [`Self::mbind_regions`], this deliberately does not populate
     /// or write-fault any page. The immutable prepared-initrd mapping must
@@ -852,9 +913,9 @@ impl NumaMemoryLayout {
         if nodes.is_empty() || len == 0 {
             return Ok(());
         }
-        // SAFETY: load_prepared_initrd calls this immediately after a
-        // successful MAP_FIXED of exactly `(host_addr, len)`. The subrange
-        // was prevalidated to lie wholly within this NodeRegion.
+        // SAFETY: load_prepared_initrd calls this immediately after installing
+        // exactly `(host_addr, len)` into its prevalidated destination hole.
+        // The subrange lies wholly within this NodeRegion.
         unsafe {
             super::host_topology::mbind_to_nodes(host_addr, len, nodes);
         }
@@ -1161,7 +1222,8 @@ mod tests {
         let kvm = kvm_ioctls::Kvm::new().unwrap();
         let vm_fd = kvm.create_vm().unwrap();
 
-        let alloc = layout.allocate_and_register(&vm_fd, false, false).unwrap();
+        let alloc = layout.allocate(false, false).unwrap();
+        layout.register(&vm_fd, &alloc.guest_mem).unwrap();
 
         use vm_memory::GuestMemoryRegion;
         let total: u64 = alloc.guest_mem.iter().map(|r| r.len()).sum();
@@ -1177,13 +1239,55 @@ mod tests {
         let kvm = kvm_ioctls::Kvm::new().unwrap();
         let vm_fd = kvm.create_vm().unwrap();
 
-        let alloc = layout.allocate_and_register(&vm_fd, false, false).unwrap();
+        let alloc = layout.allocate(false, false).unwrap();
+        layout.register(&vm_fd, &alloc.guest_mem).unwrap();
 
         use vm_memory::GuestMemoryRegion;
         let total: u64 = alloc.guest_mem.iter().map(|r| r.len()).sum();
         assert_eq!(total, 512 << 20);
         // Per-node MAP_FIXED: one GuestMemoryMmap region per node.
         assert_eq!(alloc.guest_mem.iter().count(), 2);
+    }
+
+    #[test]
+    fn register_transaction_rolls_back_partial_slots_in_reverse_order() {
+        let topo = Topology::new(3, 3, 1, 1);
+        let layout = NumaMemoryLayout::compute(&topo, 96, 0, None).unwrap();
+        let ranges = layout
+            .regions()
+            .iter()
+            .map(|region| {
+                (
+                    GuestAddress(region.gpa_start),
+                    usize::try_from(region.size).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let guest_mem = GuestMemoryMmap::<()>::from_ranges(&ranges).unwrap();
+
+        let mut operations = Vec::new();
+        let error = layout
+            .register_with(&guest_mem, |region, mem_region, rollback| {
+                operations.push((rollback, region.slot, mem_region.memory_size));
+                anyhow::ensure!(
+                    rollback || region.slot != 2,
+                    "injected third-slot registration failure"
+                );
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("injected third-slot registration failure"));
+        assert_eq!(
+            operations,
+            [
+                (false, 0, 32 << 20),
+                (false, 1, 32 << 20),
+                (false, 2, 32 << 20),
+                (true, 1, 0),
+                (true, 0, 0),
+            ],
+            "a partial publish must delete every live slot in reverse order"
+        );
     }
 
     #[test]
@@ -1210,8 +1314,9 @@ mod tests {
         // The bug manifested as a hard EINVAL from the MAP_HUGETLB |
         // MAP_FIXED mmap; .expect() pins the fix.
         let alloc = layout
-            .allocate_and_register(&vm_fd, true, false)
+            .allocate(true, false)
             .expect("hugepage MAP_FIXED allocate must not EINVAL on a snapped odd split");
+        layout.register(&vm_fd, &alloc.guest_mem).unwrap();
         const TWO_MIB: usize = 2 << 20;
         for r in layout.regions() {
             let hva = alloc
@@ -1403,11 +1508,7 @@ mod tests {
     fn contiguous_host_va() {
         let topo = Topology::with_nodes(4, 2, &TWO_NODES);
         let layout = NumaMemoryLayout::compute(&topo, 512, 0, None).unwrap();
-
-        let kvm = kvm_ioctls::Kvm::new().unwrap();
-        let vm_fd = kvm.create_vm().unwrap();
-
-        let alloc = layout.allocate_and_register(&vm_fd, false, false).unwrap();
+        let alloc = layout.allocate(false, false).unwrap();
 
         let base = alloc.guest_mem.get_host_address(GuestAddress(0)).unwrap();
         let mid = alloc
@@ -1422,11 +1523,7 @@ mod tests {
     fn cross_region_write_read() {
         let topo = Topology::with_nodes(4, 2, &TWO_NODES);
         let layout = NumaMemoryLayout::compute(&topo, 512, 0, None).unwrap();
-
-        let kvm = kvm_ioctls::Kvm::new().unwrap();
-        let vm_fd = kvm.create_vm().unwrap();
-
-        let alloc = layout.allocate_and_register(&vm_fd, false, false).unwrap();
+        let alloc = layout.allocate(false, false).unwrap();
 
         use vm_memory::Bytes;
 
@@ -1450,11 +1547,7 @@ mod tests {
         let topo = Topology::new(2, 2, 2, 1);
         let layout = NumaMemoryLayout::compute(&topo, 128, 0, None).unwrap();
         assert_eq!(layout.regions().len(), 2);
-
-        let kvm = kvm_ioctls::Kvm::new().unwrap();
-        let vm_fd = kvm.create_vm().unwrap();
-
-        let alloc = layout.allocate_and_register(&vm_fd, false, false).unwrap();
+        let alloc = layout.allocate(false, false).unwrap();
 
         use vm_memory::GuestMemoryRegion;
         let total: u64 = alloc.guest_mem.iter().map(|r| r.len()).sum();
@@ -1467,11 +1560,7 @@ mod tests {
     fn reservation_guard_munmaps_on_drop() {
         let topo = Topology::new(1, 1, 1, 1);
         let layout = NumaMemoryLayout::compute(&topo, 64, 0, None).unwrap();
-
-        let kvm = kvm_ioctls::Kvm::new().unwrap();
-        let vm_fd = kvm.create_vm().unwrap();
-
-        let alloc = layout.allocate_and_register(&vm_fd, false, false).unwrap();
+        let alloc = layout.allocate(false, false).unwrap();
 
         let addr = alloc.reservation.addr;
         let size = alloc.reservation.size;
@@ -1508,11 +1597,7 @@ mod tests {
         let topo = Topology::with_nodes(4, 1, &CXL_NODES);
         let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
         assert_eq!(layout.regions().len(), 3);
-
-        let kvm = kvm_ioctls::Kvm::new().unwrap();
-        let vm_fd = kvm.create_vm().unwrap();
-
-        let alloc = layout.allocate_and_register(&vm_fd, false, false).unwrap();
+        let alloc = layout.allocate(false, false).unwrap();
 
         use vm_memory::GuestMemoryRegion;
         assert_eq!(alloc.guest_mem.iter().count(), 3);
@@ -1688,7 +1773,8 @@ mod tests {
         let layout = NumaMemoryLayout::compute(&topo, 4096, 0, X86_GAP).unwrap();
         let kvm = kvm_ioctls::Kvm::new().unwrap();
         let vm_fd = kvm.create_vm().unwrap();
-        let alloc = layout.allocate_and_register(&vm_fd, false, false).unwrap();
+        let alloc = layout.allocate(false, false).unwrap();
+        layout.register(&vm_fd, &alloc.guest_mem).unwrap();
         assert!(
             alloc
                 .guest_mem
