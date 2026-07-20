@@ -134,6 +134,12 @@ const CHILD_OWNERSHIP_FAIL_CLOSED_EXIT_CODE: libc::c_int = 70;
 const CHILD_OWNERSHIP_FAIL_CLOSED_DIAGNOSTIC: &[u8] =
     b"cargo ktstr fatal: child process ownership could not be closed safely; terminating instead of detaching work\n";
 
+const BUILD_DIAGNOSTICS_DIR_ENV: &str = "KTSTR_BUILD_DIAGNOSTICS_DIR";
+const OWNED_DESCENDANT_DIAGNOSTIC_LIMIT: usize = 64;
+const OWNED_DESCENDANT_FIELD_LIMIT: usize = 512;
+static OWNED_DESCENDANT_DIAGNOSTIC_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// First SIGINT/SIGTERM caught by the current guard; zero means none.
 static CAUGHT_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
@@ -2567,6 +2573,8 @@ struct GroupChild {
     child: Child,
     anchor: GroupAnchor,
     subtree: AnchoredSubtreeOwner,
+    program: std::ffi::OsString,
+    spawned_at: Instant,
     armed: bool,
     published: bool,
     leader_pid: libc::pid_t,
@@ -2851,6 +2859,8 @@ where
     }
 
     command.process_group(anchor.pgid);
+    let program = command.get_program().to_os_string();
+    let spawned_at = Instant::now();
     let child = match spawn_with_unblocked_signals(&mut command) {
         Ok(child) => child,
         Err(error) => {
@@ -2879,6 +2889,8 @@ where
         child,
         anchor,
         subtree,
+        program,
+        spawned_at,
         armed: true,
         published: false,
         leader_pid,
@@ -3301,6 +3313,113 @@ fn snapshot_owned_subtree(group: &GroupChild) -> io::Result<Vec<OwnedProcess>> {
 
     members.sort_by_key(|process| (process.depth, process.member.identity.pid));
     Ok(members)
+}
+
+/// Preserve the first non-empty post-leader ownership snapshot when the
+/// caller requested CI diagnostics.
+///
+/// This is deliberately independent of Cargo output capture: the descendant
+/// tree belongs to the process runner, and recording it here also covers
+/// commands which closed both pipes before their leader exited. The snapshot
+/// contains no environment or argv bytes. `comm` and the executable symlink
+/// are sufficient to distinguish a persistent compiler-cache server from an
+/// ordinary short-lived Cargo helper without leaking command-line secrets.
+fn persist_owned_descendants_after_leader(
+    group: &GroupChild,
+    processes: &[OwnedProcess],
+) -> io::Result<Option<std::path::PathBuf>> {
+    if processes.is_empty() {
+        return Ok(None);
+    }
+    let Some(root) = std::env::var_os(BUILD_DIAGNOSTICS_DIR_ENV)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+    else {
+        return Ok(None);
+    };
+    std::fs::create_dir_all(&root)?;
+    let sequence =
+        OWNED_DESCENDANT_DIAGNOSTIC_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = root.join(format!(
+        "owned-descendants-owner{}-leader{}-{sequence}.log",
+        std::process::id(),
+        group.leader_pid,
+    ));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    let mut writer = std::io::BufWriter::new(file);
+    writeln!(
+        writer,
+        "owner_pid={} leader_pid={} anchor_pgid={} leader_observed_after_ms={} program={} descendants={} recorded={} omitted={}",
+        std::process::id(),
+        group.leader_pid,
+        group.anchor.pgid,
+        group.spawned_at.elapsed().as_millis(),
+        bounded_diagnostic_field(group.program.as_encoded_bytes()),
+        processes.len(),
+        processes.len().min(OWNED_DESCENDANT_DIAGNOSTIC_LIMIT),
+        processes
+            .len()
+            .saturating_sub(OWNED_DESCENDANT_DIAGNOSTIC_LIMIT),
+    )?;
+    for process in processes.iter().take(OWNED_DESCENDANT_DIAGNOSTIC_LIMIT) {
+        let pid = process.member.identity.pid;
+        let comm = read_bounded_proc_field(format!("/proc/{pid}/comm"))?;
+        let executable = match std::fs::read_link(format!("/proc/{pid}/exe")) {
+            Ok(path) => bounded_diagnostic_field(path.as_os_str().as_encoded_bytes()),
+            Err(error) if process_gone(&error) => "<exited>".to_string(),
+            Err(error) => format!("<error:{}>", error.raw_os_error().unwrap_or_default()),
+        };
+        writeln!(
+            writer,
+            "pid={pid} ppid={} start_ticks={} cpu_ticks={} state={} direct={} depth={} comm={} exe={}",
+            process.member.ppid,
+            process.member.identity.starttime_ticks,
+            process.member.cpu_ticks,
+            char::from(process.member.state).escape_default(),
+            process.direct,
+            process.depth,
+            comm,
+            executable,
+        )?;
+    }
+    writer.flush()?;
+    Ok(Some(path))
+}
+
+fn read_bounded_proc_field(path: impl AsRef<std::path::Path>) -> io::Result<String> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if process_gone(&error) => return Ok("<exited>".to_string()),
+        Err(error) => return Err(error),
+    };
+    let mut bytes = Vec::with_capacity(OWNED_DESCENDANT_FIELD_LIMIT + 1);
+    file.by_ref()
+        .take((OWNED_DESCENDANT_FIELD_LIMIT + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    Ok(bounded_diagnostic_field(&bytes))
+}
+
+fn bounded_diagnostic_field(bytes: &[u8]) -> String {
+    let truncated = bytes.len() > OWNED_DESCENDANT_FIELD_LIMIT;
+    let bytes = &bytes[..bytes.len().min(OWNED_DESCENDANT_FIELD_LIMIT)];
+    let mut rendered = String::with_capacity(bytes.len());
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &byte in bytes {
+        if byte.is_ascii_alphanumeric() || b"-._/:+@".contains(&byte) {
+            rendered.push(char::from(byte));
+        } else {
+            rendered.push_str("\\x");
+            rendered.push(char::from(HEX[usize::from(byte >> 4)]));
+            rendered.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    if truncated {
+        rendered.push_str("<truncated>");
+    }
+    rendered
 }
 
 struct TaskServiceBudget {
@@ -3902,6 +4021,7 @@ fn drain_group_capture<O: StdoutObserver>(
     let mut budget = None::<TaskServiceBudget>;
     let mut next_group_scan = Instant::now();
     let mut empty_since = None::<Instant>;
+    let mut descendant_snapshot_persisted = false;
 
     loop {
         observer.tick();
@@ -3915,6 +4035,14 @@ fn drain_group_capture<O: StdoutObserver>(
 
         if let Some(leader_status) = leader_status.as_ref().filter(|_| now >= next_group_scan) {
             let processes = snapshot_owned_subtree(group)?;
+            if !descendant_snapshot_persisted && !processes.is_empty() {
+                if let Err(error) = persist_owned_descendants_after_leader(group, &processes) {
+                    eprintln!(
+                        "cargo ktstr: could not preserve post-leader descendant diagnostics: {error}"
+                    );
+                }
+                descendant_snapshot_persisted = true;
+            }
             let members: Vec<_> = processes.iter().map(|process| process.member).collect();
             match &mut budget {
                 Some(budget) => budget.observe(&members),
@@ -6504,6 +6632,26 @@ mod tests {
         assert!(
             !process_gone(&io::Error::from_raw_os_error(libc::EIO)),
             "procfs I/O failures must remain visible",
+        );
+    }
+
+    #[test]
+    fn descendant_diagnostic_fields_are_single_line_and_byte_exact() {
+        assert_eq!(
+            bounded_diagnostic_field(b"sccache server\n\xff"),
+            "sccache\\x20server\\x0a\\xff",
+        );
+    }
+
+    #[test]
+    fn descendant_diagnostic_fields_bound_raw_proc_input() {
+        let mut bytes = vec![b'a'; OWNED_DESCENDANT_FIELD_LIMIT];
+        assert_eq!(bounded_diagnostic_field(&bytes), "a".repeat(bytes.len()));
+        bytes.push(b'b');
+        let rendered = bounded_diagnostic_field(&bytes);
+        assert_eq!(
+            rendered,
+            format!("{}<truncated>", "a".repeat(OWNED_DESCENDANT_FIELD_LIMIT)),
         );
     }
 
