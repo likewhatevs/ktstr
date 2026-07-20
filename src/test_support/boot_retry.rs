@@ -13,10 +13,11 @@
 //!     PANICs on a gap; the panic reaches the host as
 //!     [`crate::vmm::VmResult::crash_message`] carrying
 //!     [`AP_BRINGUP_GAP_MARKER`].
-//!   * Host side — the AP-ready boot gate in `KtstrVm::run_vm` bails with
+//!   * Host side — the progressive AP-ready gate in
+//!     `KtstrVm::spawn_ap_threads` bails with
 //!     [`crate::vmm::freeze_coord::ApGateTimeout`] when an AP host thread
-//!     never reaches `KVM_RUN` within the bring-up cap, so the guest is
-//!     never even released to boot.
+//!     receives excessive setup/blocked-observer service without reaching
+//!     `KVM_RUN`, so the guest is never even released to boot.
 //!
 //! Recovery is a fresh cold boot — exactly what bare metal does — so the
 //! scheduler only ever sees a topology assembled by a clean boot, never
@@ -83,8 +84,7 @@ pub(crate) const AP_GAP_BOOT_ATTEMPTS: u32 = 3;
 ///      [`crate::vmm::freeze_coord::ApGateTimeout`] — the host-side
 ///      AP-ready boot gate tripped because an AP thread never reached
 ///      `KVM_RUN`. (`downcast_ref` traverses the anyhow context chain,
-///      so the `.context(...)` both production call sites wrap the error
-///      with does not hide it.)
+///      so the production call site's `.context(...)` layers do not hide it.)
 ///
 /// Both are pre-test infra faults with no test/scheduler side effects yet,
 /// so a fresh cold boot is a safe, idempotent recovery. The one
@@ -305,11 +305,13 @@ mod tests {
     /// An `anyhow::Error` wrapping an [`ApGateTimeout`] — the host-side
     /// AP-ready gate trip the retry now recognizes. `ctx`, when set, adds
     /// a `.context(...)` layer to prove the downcast still traverses the
-    /// chain (both production call sites wrap the error with context).
+    /// chain (the production path wraps the error with context).
     fn gate_timeout_err(ctx: Option<&str>) -> anyhow::Error {
         let e = anyhow::Error::new(crate::vmm::freeze_coord::ApGateTimeout {
             not_ready: vec![3],
             elapsed: std::time::Duration::from_secs(30),
+            delivered_service: std::time::Duration::from_secs(2),
+            blocked_observer_service: std::time::Duration::ZERO,
             killed: false,
             evidence: "  vCPU 3: never scheduled (no TID stamped)\n".to_string(),
         });
@@ -368,8 +370,8 @@ mod tests {
     }
 
     /// A context-wrapped gate trip still downcasts through the anyhow
-    /// chain, so the `.context(...)` both production call sites add does
-    /// not defeat the retry.
+    /// chain, so the production path's `.context(...)` layers do not defeat
+    /// the retry.
     #[test]
     fn retries_context_wrapped_gate_timeout() {
         let calls = Cell::new(0u32);
