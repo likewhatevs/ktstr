@@ -301,8 +301,7 @@ fn failed_coordinator_sweep_does_not_sequester_its_free_prefix() {
     let mut held = protocol::HeldLocks::default();
 
     assert!(
-        held
-            .probe_complete(&target)
+        held.probe_complete(&target)
             .expect("probe four-CPU target")
             .is_none(),
         "a target missing its final resource must not report partial progress",

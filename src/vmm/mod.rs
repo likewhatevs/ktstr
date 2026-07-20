@@ -1311,12 +1311,8 @@ impl KtstrVm {
         };
         #[cfg(target_arch = "aarch64")]
         let _kernel_result = {
-            let kr = self.setup_memory_aarch64(
-                &mut vm,
-                kernel_result,
-                prepared_initrd,
-                mbind_node_map,
-            )?;
+            let kr =
+                self.setup_memory_aarch64(&mut vm, kernel_result, prepared_initrd, mbind_node_map)?;
             self.setup_vcpus_aarch64(&vm, kr.entry)?;
             kr
         };

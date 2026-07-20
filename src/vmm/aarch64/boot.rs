@@ -60,14 +60,12 @@ pub fn load_kernel(
     if magic == GZIP_MAGIC {
         let source_identity = crate::cache::content::StableFileIdentity::from_file(&kernel_file)
             .with_context(|| format!("stat gzip kernel: {}", kernel_path.display()))?;
-        let content_hash =
-            crate::cache::content::cached_file_digest(&kernel_file, source_identity)
-                .with_context(|| format!("digest gzip kernel: {}", kernel_path.display()))?;
+        let content_hash = crate::cache::content::cached_file_digest(&kernel_file, source_identity)
+            .with_context(|| format!("digest gzip kernel: {}", kernel_path.display()))?;
         let paths = decompressed_cache_paths(content_hash)?;
 
         anyhow::ensure!(
-            crate::cache::content::StableFileIdentity::from_file(&kernel_file)?
-                == source_identity,
+            crate::cache::content::StableFileIdentity::from_file(&kernel_file)? == source_identity,
             "gzip kernel changed before decompressed-cache lookup: {}",
             kernel_path.display()
         );
@@ -87,8 +85,7 @@ pub fn load_kernel(
             },
         )?;
         anyhow::ensure!(
-            crate::cache::content::StableFileIdentity::from_file(&kernel_file)?
-                == source_identity,
+            crate::cache::content::StableFileIdentity::from_file(&kernel_file)? == source_identity,
             "gzip kernel changed during decompressed-cache lookup: {}",
             kernel_path.display()
         );
@@ -111,8 +108,8 @@ fn decompressed_cache_paths(content_hash: u64) -> Result<DecompressedCachePaths>
     // `KTSTR_CACHE_DIR` intentionally resolves to the override verbatim, so
     // retain a component-specific directory below it. This also keeps the
     // derived-object locks separate from the shared input-digest namespace.
-    let root = crate::cache::resolve_cache_root_with_suffix("vmm-derived")?
-        .join(DECOMPRESSED_CACHE_DIR);
+    let root =
+        crate::cache::resolve_cache_root_with_suffix("vmm-derived")?.join(DECOMPRESSED_CACHE_DIR);
     let objects = root.join(DECOMPRESSED_OBJECTS_DIR);
     let locks = root.join(DECOMPRESSED_LOCKS_DIR);
     std::fs::create_dir_all(&objects)

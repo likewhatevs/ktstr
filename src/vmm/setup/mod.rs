@@ -2036,8 +2036,7 @@ impl KtstrVm {
             // one shot with no estimation.
             let (prepared_initrd, _memory_mib) = match prepared_initrd {
                 Some(prepared) => {
-                    let (prepared, memory_mib) =
-                        self.compute_memory_and_allocate(vm, prepared)?;
+                    let (prepared, memory_mib) = self.compute_memory_and_allocate(vm, prepared)?;
                     (Some(prepared), memory_mib)
                 }
                 None => {
