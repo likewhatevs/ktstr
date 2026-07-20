@@ -1873,7 +1873,7 @@ fn build_synthetic_staged_set(
 }
 
 /// Helper: pre-compute staged_extras_names the same way
-/// spawn_initramfs_resolve does.
+/// prepare_initramfs does.
 fn staged_extras_names_for(staged: &[crate::vmm::builder::StagedScheduler]) -> Vec<String> {
     staged
         .iter()

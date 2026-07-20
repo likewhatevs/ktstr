@@ -10,8 +10,9 @@
 //! elected coordinator scans tickets in monotonic order and grants a waiter
 //! when its exact claim is compatible with every earlier live claim. Thus an
 //! incompatible predecessor remains a hard fence, while fully disjoint work can
-//! pass it. Only the coordinator may retain partial resource locks while
-//! waiting, which preserves the no-deadlock invariant.
+//! pass it. Coordinator probes are all-or-nothing: a failed target releases
+//! every real lock acquired by that attempt before waiting, so an exact queue
+//! reservation never sequesters an otherwise usable subset of the host.
 //!
 //! Nonqueued acquisition remains all-or-nothing. It holds the registry's shared
 //! fence from the aggregate-claim check through the real nonblocking flock
@@ -49,7 +50,7 @@ pub(crate) enum ResourceKey {
 
 /// One canonical host-resource lock together with the exact registry identity
 /// it represents. Keeping the identity attached avoids reparsing test-specific
-/// lock paths and lets partial coordinator holds publish mode-correct state.
+/// lock paths and lets coordinator attempts publish mode-correct state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResourceLock {
     pub(crate) path: String,
@@ -1423,34 +1424,16 @@ where
     }
 }
 
-/// The coordinator's accumulated partial holds, keyed by lockfile path.
-/// Only the registry-elected coordinator may retain these while waiting.
+/// One coordinator's live planning snapshot and exact contention evidence.
+///
+/// Physical resource probes are deliberately attempt-local: success transfers
+/// the complete fd set to the caller, and failure drops the complete prefix.
 #[derive(Default)]
 pub(crate) struct HeldLocks {
-    map: std::collections::BTreeMap<String, HeldLock>,
-    newly_held: std::collections::BTreeMap<ResourceKey, FlockMode>,
-    abandoned_resources: std::collections::BTreeMap<ResourceKey, FlockMode>,
-    abandoned_fds: Vec<HeldLock>,
     contention: ContentionSet,
     watch: Option<ClaimSet>,
     predecessors: Option<registry::AggregateSnapshot>,
     availability: Option<registry::AvailabilitySnapshot>,
-}
-
-struct HeldLock {
-    fd: OwnedFd,
-    mode: FlockMode,
-    resource: ResourceKey,
-}
-
-struct HeldRegistryUpdate {
-    newly_held: ClaimSet,
-    abandoned: ClaimSet,
-    contention: ContentionSet,
-    // These descriptors intentionally outlive the registry transaction that
-    // marks their resources UNKNOWN. Dropping them sooner recreates the
-    // close-before-publication lost-wake race.
-    _abandoned_fds: Vec<HeldLock>,
 }
 
 impl HeldLocks {
@@ -1463,10 +1446,7 @@ impl HeldLocks {
     /// Whether one complete alternative is ready according to the same
     /// mode-aware registry snapshot used by granted waiter callbacks.
     ///
-    /// Exact coordinator-held locks are removed from the live-holder query:
-    /// once published they correctly appear unavailable globally, but they are
-    /// already usable by this coordinator. Predecessor reservations remain an
-    /// independent hard fence.
+    /// Predecessor reservations remain an independent hard fence.
     pub(crate) fn candidate_ready(&self, candidate: &ClaimSet) -> Result<bool> {
         let watch = self
             .watch
@@ -1485,133 +1465,22 @@ impl HeldLocks {
             return Ok(false);
         }
 
-        let mut unheld = candidate.clone();
-        unheld.cpus.retain(|&cpu| {
-            !self.map.values().any(|held| {
-                held.resource == ResourceKey::Cpu(cpu)
-                    && held.mode
-                        == match candidate.cpu_mode {
-                            ClaimMode::Exclusive => FlockMode::Exclusive,
-                            ClaimMode::Shared => FlockMode::Shared,
-                        }
-            })
-        });
-        unheld.llcs.retain(|&llc| {
-            !self.map.values().any(|held| {
-                held.resource == ResourceKey::Llc(llc)
-                    && held.mode
-                        == match candidate.llc_mode {
-                            ClaimMode::Exclusive => FlockMode::Exclusive,
-                            ClaimMode::Shared => FlockMode::Shared,
-                        }
-            })
-        });
-        if unheld.is_empty() {
-            Ok(true)
-        } else {
-            availability.allows(&unheld)
-        }
+        availability.allows(candidate)
     }
 
-    /// Stage every partial not present with the exact same mode in `target`.
-    /// Staged fds remain locked until the registry publishes the corresponding
-    /// UNKNOWN transition.
-    pub(crate) fn retain_target(&mut self, target: &[ResourceLock]) {
-        let keep: std::collections::BTreeMap<_, _> = target
-            .iter()
-            .map(|lock| (lock.path.as_str(), lock.mode))
-            .collect();
-        let abandoned: Vec<_> = self
-            .map
-            .iter()
-            .filter(|(path, held)| keep.get(path.as_str()).copied() != Some(held.mode))
-            .map(|(path, _)| path.clone())
-            .collect();
-        for path in abandoned {
-            let held = self
-                .map
-                .remove(&path)
-                .expect("staged coordinator hold disappeared");
-            self.newly_held.remove(&held.resource);
-            self.abandoned_resources.insert(held.resource, held.mode);
-            self.abandoned_fds.push(held);
-        }
-    }
-
-    /// Non-blocking sweep: acquire, in the given (canonical) order,
-    /// every lock in `target` not already held. Returns how many NEW
-    /// locks were gained. Never blocks — the coordinator's waiting happens
-    /// on the inotify watch, not inside flock.
-    pub(crate) fn sweep(&mut self, target: &[ResourceLock]) -> Result<usize> {
-        let mut gained = 0;
-        for lock in target {
-            if self
-                .map
-                .get(&lock.path)
-                .is_some_and(|held| held.mode == lock.mode)
-            {
-                continue;
-            }
-            // A differently-mode-held path cannot be upgraded while its old
-            // open-file description remains locked. The next retain_target
-            // publishes and releases it before a later sweep retries.
-            let std::collections::btree_map::Entry::Vacant(entry) =
-                self.map.entry(lock.path.clone())
-            else {
-                continue;
-            };
-            match try_flock_with_witness(&lock.path, lock.mode)? {
-                TryFlockOutcome::Acquired(fd) => {
-                    entry.insert(HeldLock {
-                        fd,
-                        mode: lock.mode,
-                        resource: lock.resource,
-                    });
-                    self.newly_held.insert(lock.resource, lock.mode);
-                    gained += 1;
-                }
-                TryFlockOutcome::Contended(witness) => {
-                    drop(entry);
-                    self.record_contention(ContentionEvidence {
-                        blocker: lock.resource,
-                        mode: lock.mode,
-                        _witness: witness,
-                    });
-                }
-            }
-        }
-        Ok(gained)
-    }
-
-    /// All-or-nothing probe of `candidate` reusing held locks: any
-    /// lock already held counts; missing ones are tried non-blocking.
-    /// On success the candidate's fds are REMOVED from the held map
-    /// and returned in candidate order. On failure the newly taken
-    /// fds are released and previously held ones stay — the probe
-    /// must not regress accumulated progress.
+    /// All-or-nothing nonblocking probe of `candidate`.
+    ///
+    /// On success the complete fd set is returned in candidate order. On
+    /// failure every fd acquired by this attempt is dropped before returning,
+    /// while exact blocker evidence remains live until the registry update.
     pub(crate) fn probe_complete(
         &mut self,
         candidate: &[ResourceLock],
     ) -> Result<Option<Vec<OwnedFd>>> {
-        let mut fresh: Vec<(String, HeldLock)> = Vec::new();
+        let mut fresh = Vec::with_capacity(candidate.len());
         for lock in candidate {
-            match self.map.get(&lock.path) {
-                Some(held) if held.mode == lock.mode => continue,
-                Some(_) => {
-                    drop(fresh);
-                    return Ok(None);
-                }
-                None => {}
-            }
             match try_flock_with_witness(&lock.path, lock.mode)? {
-                TryFlockOutcome::Acquired(fd) => fresh.push((
-                    lock.path.clone(),
-                    HeldLock {
-                        fd,
-                        mode: lock.mode,
-                        resource: lock.resource,
-                    },
-                )),
+                TryFlockOutcome::Acquired(fd) => fresh.push(fd),
                 TryFlockOutcome::Contended(witness) => {
                     drop(fresh);
                     self.record_contention(ContentionEvidence {
@@ -1623,61 +1492,20 @@ impl HeldLocks {
                 }
             }
         }
-        for (path, held) in fresh {
-            self.newly_held.insert(held.resource, held.mode);
-            self.map.insert(path, held);
-        }
-        let mut out = Vec::with_capacity(candidate.len());
-        for lock in candidate {
-            out.push(
-                self.map
-                    .remove(&lock.path)
-                    .expect("probe_complete: candidate path must be held")
-                    .fd,
-            );
-        }
-        Ok(Some(out))
-    }
-
-    /// Whether every lock in `target` is currently held.
-    pub(crate) fn covers(&self, target: &[ResourceLock]) -> bool {
-        target.iter().all(|lock| {
-            self.map
-                .get(&lock.path)
-                .is_some_and(|held| held.mode == lock.mode)
-        })
-    }
-
-    /// Take the fds for `target` out of the map, in target order.
-    /// Caller must have verified [`Self::covers`].
-    pub(crate) fn take(&mut self, target: &[ResourceLock]) -> Vec<OwnedFd> {
-        target
-            .iter()
-            .map(|lock| {
-                self.map
-                    .remove(&lock.path)
-                    .expect("take: target path must be held")
-                    .fd
-            })
-            .collect()
-    }
-
-    /// Paths currently held (for plan_live's overlap preference).
-    pub(crate) fn held_paths(&self) -> BTreeSet<String> {
-        self.map.keys().cloned().collect()
+        Ok(Some(fresh))
     }
 
     fn record_contention(&mut self, evidence: ContentionEvidence) {
         self.contention.insert(evidence);
     }
 
-    fn take_registry_update(&mut self) -> Result<HeldRegistryUpdate> {
-        Ok(HeldRegistryUpdate {
-            newly_held: claim_from_resource_modes(std::mem::take(&mut self.newly_held))?,
-            abandoned: claim_from_resource_modes(std::mem::take(&mut self.abandoned_resources))?,
-            contention: std::mem::take(&mut self.contention),
-            _abandoned_fds: std::mem::take(&mut self.abandoned_fds),
-        })
+    #[cfg(test)]
+    pub(crate) fn contention_markers_for_tests(&self) -> Vec<ContentionMarker> {
+        self.contention.marker_vec()
+    }
+
+    fn take_contention(&mut self) -> ContentionSet {
+        std::mem::take(&mut self.contention)
     }
 }
 
@@ -2063,20 +1891,19 @@ fn acquire_as_coordinator_impl<T>(
             match next {
                 CoordinatorStep::Complete { claim, value } => {
                     check_interrupted(cancelled)?;
-                    held.retain_target(&[]);
-                    let update = held.take_registry_update()?;
-                    let markers = update.contention.marker_vec();
+                    let contention = held.take_contention();
+                    let markers = contention.marker_vec();
                     // `finish_acquired` publishes the held flocks and removes
                     // the coordinator record atomically. Once it returns
                     // success, cancellation is for the caller's next lifecycle
                     // phase—not grounds to roll back this committed acquire.
                     coordinator.ticket.finish_acquired(
                         &claim,
-                        &update.abandoned,
+                        &ClaimSet::default(),
                         &markers,
                         cancelled,
                     )?;
-                    drop(update);
+                    drop(contention);
                     break CoordinatorOutcome::Acquired(value);
                 }
                 CoordinatorStep::Abort { reason } => {
@@ -2088,17 +1915,19 @@ fn acquire_as_coordinator_impl<T>(
                             "registry coordinator produced an empty priority claim"
                         ));
                     }
-                    let update = held.take_registry_update()?;
-                    let markers = update.contention.marker_vec();
+                    // Waiting publishes the exact reservation while every
+                    // incomplete physical probe has already released its fds.
+                    let contention = held.take_contention();
+                    let markers = contention.marker_vec();
                     let snapshot = check_result(
                         coordinator.ticket.schedule(
                             Some(&claim),
                             &BTreeSet::new(),
                             &BTreeSet::new(),
                             false,
-                            Some(&update.newly_held),
+                            None,
                             &markers,
-                            Some(&update.abandoned),
+                            None,
                             &closed_tickets,
                             false,
                             None,
@@ -2107,7 +1936,7 @@ fn acquire_as_coordinator_impl<T>(
                         ),
                         cancelled,
                     )?;
-                    drop(update);
+                    drop(contention);
                     let observe_before_sleep = snapshot.observation.is_some();
                     liveness_deadline = std::time::Instant::now() + snapshot.liveness_due_in;
                     watched_resources = snapshot.watch;
@@ -2168,9 +1997,8 @@ fn acquire_as_coordinator_impl<T>(
 /// Canonical global lock order for a resource set: LLC locks by
 /// ascending index, then CPU locks by ascending index. Every
 /// acquirer — fast path and coordinator alike — walks locks in this order,
-/// which is what lets the coordinator hold partials
-/// safely and keeps overlapping fast-path sets from half-blocking
-/// each other.
+/// keeping each all-or-nothing probe deterministic and preventing overlapping
+/// attempts from half-blocking each other.
 #[cfg(test)]
 pub(crate) fn canonical_lock_order(
     llc_indices: &[usize],

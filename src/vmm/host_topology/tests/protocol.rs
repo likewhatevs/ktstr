@@ -284,6 +284,51 @@ fn failed_complete_probe_releases_its_fresh_prefix_immediately() {
 }
 
 #[test]
+fn failed_coordinator_sweep_does_not_sequester_its_free_prefix() {
+    let _prefixes = LockPrefixesGuard::new();
+    let blocked_cpu = 4;
+    let blocker = crate::flock::try_flock(
+        cpu_lock_path(blocked_cpu),
+        crate::flock::FlockMode::Exclusive,
+    )
+    .expect("open final CPU blocker")
+    .expect("lock final CPU");
+    let target = protocol::canonical_lock_order(
+        &[],
+        crate::flock::FlockMode::Shared,
+        &[1, 2, 3, blocked_cpu],
+    );
+    let mut held = protocol::HeldLocks::default();
+
+    assert!(
+        held
+            .probe_complete(&target)
+            .expect("probe four-CPU target")
+            .is_none(),
+        "a target missing its final resource must not report partial progress",
+    );
+    assert_eq!(
+        held.contention_markers_for_tests(),
+        vec![protocol::ContentionMarker {
+            blocker: protocol::ResourceKey::Cpu(blocked_cpu),
+            mode: crate::flock::FlockMode::Exclusive,
+        }],
+        "the failed all-or-nothing attempt must retain exact blocker evidence",
+    );
+
+    let mut reusable = Vec::new();
+    for cpu in [1, 2, 3] {
+        reusable.push(
+            crate::flock::try_flock(cpu_lock_path(cpu), crate::flock::FlockMode::Exclusive)
+                .expect("probe free prefix CPU")
+                .expect("the failed coordinator attempt must release every free prefix CPU"),
+        );
+    }
+    drop(reusable);
+    drop(blocker);
+}
+
+#[test]
 fn cpu_only_exact_claim_keeps_independent_canonical_modes() {
     let _prefixes = LockPrefixesGuard::new();
     let initial = protocol::ClaimSet::new(
@@ -1910,11 +1955,10 @@ fn granted_commit_is_terminal_even_if_cancellation_arrives_afterward() {
                 coordinator,
                 &worker_coordinator_cancelled,
                 |held| {
-                    held.sweep(&target)?;
-                    if held.covers(&target) {
+                    if let Some(locks) = held.probe_complete(&target)? {
                         Ok(protocol::CoordinatorStep::Complete {
                             claim: claim.clone(),
-                            value: held.take(&target),
+                            value: locks,
                         })
                     } else {
                         Ok(protocol::CoordinatorStep::Waiting {
@@ -2214,8 +2258,7 @@ fn ticket_registry_process_helper() {
                     .expect("open coordinator probe log");
                 std::io::Write::write_all(&mut probe_log, b"probe\n")
                     .expect("publish coordinator probe");
-                held.sweep(&target)?;
-                if held.covers(&target) {
+                if let Some(locks) = held.probe_complete(&target)? {
                     if let Some(entered) = &after_acquire_entered {
                         std::fs::write(entered, b"entered")
                             .expect("publish coordinator acquired-probe entry");
@@ -2225,7 +2268,7 @@ fn ticket_registry_process_helper() {
                     }
                     Ok(protocol::CoordinatorStep::Complete {
                         claim: claim.clone(),
-                        value: held.take(&target),
+                        value: locks,
                     })
                 } else {
                     Ok(protocol::CoordinatorStep::Waiting {

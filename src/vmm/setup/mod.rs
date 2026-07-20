@@ -13,7 +13,6 @@ use anyhow::{Context, Result};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::time::Instant;
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
@@ -23,7 +22,7 @@ use super::initramfs_cache::BaseKey;
 #[cfg(any(target_arch = "aarch64", test))]
 use super::initramfs_cache::PREPARED_MAPPING_GRANULE;
 use super::initramfs_cache::{
-    PreparedBase, PreparedInitrd, PreparedMapping, PreparedOverlay, complete_prepared_initrd,
+    PreparedInitrd, PreparedMapping, PreparedOverlay, complete_prepared_initrd,
     get_or_prepare_base, prepare_base_inputs,
 };
 use super::memory_budget::{
@@ -54,15 +53,6 @@ use super::x86_64::{acpi, boot, kvm, mptable};
 
 fn framework_infrastructure<T>(result: Result<T>) -> Result<T> {
     result.context(crate::test_support::FrameworkInfrastructureFailure)
-}
-
-fn join_prepared_base(handle: JoinHandle<Result<PreparedBase>>) -> Result<PreparedBase> {
-    framework_infrastructure(
-        handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))
-            .and_then(|result| result),
-    )
 }
 
 /// Host-side handles for the x86_64 virtio-net PCI device. The device
@@ -723,7 +713,7 @@ fn numa_balancing_cmdline_token(topology: &crate::vmm::topology::Topology) -> &'
 
 /// Pure helper: assemble the `extras` slice and the [`BaseKey`] from
 /// the resolved scheduler/probe/worker/staged-binary paths. Extracted
-/// out of [`KtstrVm::spawn_initramfs_resolve`] so the staged-extras
+/// out of [`KtstrVm::prepare_initramfs`] so the staged-extras
 /// path-format contract, the per-staged iteration order, and the
 /// shell-mode-vs-non-shell BaseKey threading can be unit-tested
 /// without spawning the resolve thread or running the full
@@ -785,7 +775,7 @@ pub(crate) fn assemble_extras_and_key<'a>(
 
     // Shell-mode determination: busybox flag, non-empty includes,
     // or any jemalloc extras (probe / worker present). Mirrors the
-    // pre-extraction logic in spawn_initramfs_resolve — kept
+    // pre-extraction logic in prepare_initramfs — kept
     // explicit here so the helper is a closed unit under test
     // without a hidden dependency on the caller's shell_mode
     // computation.
@@ -1493,11 +1483,10 @@ impl KtstrVm {
         Ok((vm, kernel_result))
     }
 
-    /// Spawn initramfs resolution on a background thread.
-    /// Returns the handle to join later (after KVM creation completes).
-    pub(super) fn spawn_initramfs_resolve(
-        &self,
-    ) -> Result<Option<JoinHandle<Result<PreparedBase>>>> {
+    /// Resolve the complete immutable initrd before entering exact topology
+    /// admission. Cold cells may contend on a shared CAS builder here, but
+    /// none of them can sequester CPUs or LLCs while waiting for it.
+    pub(super) fn prepare_initramfs(&self) -> Result<Option<PreparedInitrd>> {
         let Some(bin) = self.init_binary.as_ref() else {
             return Ok(None);
         };
@@ -1512,90 +1501,86 @@ impl KtstrVm {
         let compression = self.initrd_compression;
         #[cfg(feature = "wprof")]
         let wprof_host_path: Option<PathBuf> = self.wprof.as_ref().map(|w| w.host_path.clone());
-        let handle = std::thread::Builder::new()
-            .name("initramfs-resolve".into())
-            .spawn(move || -> Result<PreparedBase> {
-                // Extras are stripped by `build_initramfs_base`
-                // before write. The scheduler and probe can lose
-                // their DWARF without functional impact — the probe
-                // resolves `tsd_s.thread_allocated` offsets against
-                // the TARGET process's `/proc/<pid>/exe`, not against
-                // its own binary, so its own DWARF is dead weight.
-                // The worker (the probe's target) MUST retain DWARF:
-                // a stripped worker has no DWARF for the probe to
-                // walk. Route scheduler + probe through `extras`
-                // (stripped), worker through `include_files`
-                // (verbatim). Packing the probe unstripped inflated
-                // the initramfs by ~900MB per run in debug builds,
-                // which was enough to time out VM init before the
-                // test binary loaded.
-                //
-                // Staged schedulers ride the same `extras` path,
-                // packed under `staging/schedulers/<name>/scheduler`
-                // so the cpio extractor's silent parent-dir
-                // requirement gets satisfied via the auto-registered
-                // ancestor entries (see `build_initramfs_base`'s
-                // `register_parent_dirs` loop). Each staged binary
-                // contributes its own DT_NEEDED set to the shared-lib
-                // resolution chain — schedulers built against
-                // different libbpf revisions are correctly handled
-                // without operator intervention.
-                let staged_extras_names: Vec<String> = staged_schedulers
-                    .iter()
-                    .map(|s| {
-                        format!(
-                            "{}/scheduler",
-                            crate::test_support::staged::staged_scheduler_archive_dir(&s.name),
-                        )
-                    })
-                    .collect();
-                // Merge include_files with worker so both the cache
-                // key and the actual archive build see the same
-                // worker entry; the probe is added to extras inside
-                // `assemble_extras_and_key`. wprof (when set) also
-                // rides include_files so DT_NEEDED resolution pulls
-                // its dynamic dependencies (libelf, libz, blazesym
-                // C ABI) into the archive alongside the binary;
-                // without that, wprof fails to load inside the
-                // guest.
-                let mut merged_includes: Vec<(String, PathBuf)> = include_files.clone();
-                if let Some((archive_path, host_path)) = kernel_config {
-                    merged_includes.push((archive_path, host_path));
-                }
-                if let Some(w) = worker.as_deref() {
-                    merged_includes.push((
-                        "bin/ktstr-jemalloc-alloc-worker".to_string(),
-                        w.to_path_buf(),
-                    ));
-                }
-                #[cfg(feature = "wprof")]
-                if let Some(wprof_path) = wprof_host_path.as_deref() {
-                    merged_includes.push(("bin/wprof".to_string(), wprof_path.to_path_buf()));
-                }
-
-                let mut extras: Vec<(&str, &std::path::Path)> = Vec::new();
-                if let Some(scheduler) = scheduler.as_deref() {
-                    extras.push(("scheduler", scheduler));
-                }
-                if let Some(probe) = probe.as_deref() {
-                    extras.push(("bin/ktstr-jemalloc-probe", probe));
-                }
-                for (index, staged) in staged_schedulers.iter().enumerate() {
-                    extras.push((staged_extras_names[index].as_str(), staged.binary.as_path()));
-                }
-                framework_infrastructure(
-                    prepare_base_inputs(
-                        &payload,
-                        &extras,
-                        &merged_includes,
-                        busybox_bytes.as_deref(),
-                    )
-                    .and_then(|inputs| get_or_prepare_base(inputs, compression)),
+        // Extras are stripped by `build_initramfs_base` before write. The
+        // scheduler and probe can lose their DWARF without functional impact
+        // — the probe resolves `tsd_s.thread_allocated` offsets against the
+        // TARGET process's `/proc/<pid>/exe`, not against its own binary, so
+        // its own DWARF is dead weight. The worker (the probe's target) MUST
+        // retain DWARF: a stripped worker has no DWARF for the probe to walk.
+        // Route scheduler + probe through `extras` (stripped), worker through
+        // `include_files` (verbatim). Packing the probe unstripped inflated
+        // the initramfs by ~900MB per run in debug builds, which was enough to
+        // time out VM init before the test binary loaded.
+        //
+        // Staged schedulers ride the same `extras` path, packed under
+        // `staging/schedulers/<name>/scheduler` so the cpio extractor's silent
+        // parent-dir requirement gets satisfied via the auto-registered
+        // ancestor entries (see `build_initramfs_base`'s
+        // `register_parent_dirs` loop). Each staged binary contributes its own
+        // DT_NEEDED set to the shared-lib resolution chain.
+        let staged_extras_names: Vec<String> = staged_schedulers
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}/scheduler",
+                    crate::test_support::staged::staged_scheduler_archive_dir(&s.name),
                 )
             })
-            .context("spawn initramfs-resolve thread")
-            .context(crate::test_support::FrameworkInfrastructureFailure)?;
-        Ok(Some(handle))
+            .collect();
+
+        // Merge include_files with worker so both the cache key and the actual
+        // archive build see the same worker entry; the probe is added to
+        // extras inside `assemble_extras_and_key`. wprof (when set) also rides
+        // include_files so DT_NEEDED resolution pulls its dynamic dependencies
+        // into the archive alongside the binary.
+        let mut merged_includes: Vec<(String, PathBuf)> = include_files;
+        if let Some((archive_path, host_path)) = kernel_config {
+            merged_includes.push((archive_path, host_path));
+        }
+        if let Some(w) = worker.as_deref() {
+            merged_includes.push((
+                "bin/ktstr-jemalloc-alloc-worker".to_string(),
+                w.to_path_buf(),
+            ));
+        }
+        #[cfg(feature = "wprof")]
+        if let Some(wprof_path) = wprof_host_path.as_deref() {
+            merged_includes.push(("bin/wprof".to_string(), wprof_path.to_path_buf()));
+        }
+
+        let mut extras: Vec<(&str, &std::path::Path)> = Vec::new();
+        if let Some(scheduler) = scheduler.as_deref() {
+            extras.push(("scheduler", scheduler));
+        }
+        if let Some(probe) = probe.as_deref() {
+            extras.push(("bin/ktstr-jemalloc-probe", probe));
+        }
+        for (index, staged) in staged_schedulers.iter().enumerate() {
+            extras.push((staged_extras_names[index].as_str(), staged.binary.as_path()));
+        }
+
+        let t0 = Instant::now();
+        let prepared_base = framework_infrastructure(
+            prepare_base_inputs(
+                &payload,
+                &extras,
+                &merged_includes,
+                busybox_bytes.as_deref(),
+            )
+            .and_then(|inputs| get_or_prepare_base(inputs, compression)),
+        )?;
+        let prepared = framework_infrastructure(complete_prepared_initrd(
+            prepared_base,
+            &self.suffix_params(),
+        ))?;
+        tracing::debug!(
+            elapsed_us = t0.elapsed().as_micros(),
+            uncompressed_bytes = prepared.uncompressed_len(),
+            compressed_bytes = prepared.compressed_len(),
+            cache_hits = prepared.cache_hits(),
+            "prepare_initrd",
+        );
+        Ok(Some(prepared))
     }
 
     /// Map a prepared initrd's immutable CAS ranges directly into guest RAM.
@@ -1749,48 +1734,28 @@ impl KtstrVm {
         TmpfsFraction::for_kernel_version(version)
     }
 
-    /// Join the initramfs thread and load the result into guest memory.
-    /// Memory must already be allocated (non-deferred path). Validates
-    /// that allocated memory is sufficient for the initramfs.
+    /// Validate and load a prepared initramfs into already allocated guest
+    /// memory.
     ///
     /// x86_64-only: aarch64 uses
-    /// `Self::join_and_load_initramfs_aarch64`, which computes the
-    /// FDT-relative load address from the compressed size after the
-    /// suffix is built (the address depends on `memory_mib` AND the
-    /// total compressed size, neither of which is known until after
-    /// the suffix and compression run).
+    /// `Self::validate_and_load_initramfs_aarch64`, which computes the
+    /// FDT-relative load address from the prepared stream's compressed size.
     #[cfg(target_arch = "x86_64")]
-    fn join_and_load_initramfs(
+    fn validate_and_load_initramfs(
         &self,
         vm: &mut kvm::KtstrKvm,
-        handle: JoinHandle<Result<PreparedBase>>,
+        prepared: PreparedInitrd,
         load_addr: u64,
         mbind_node_map: &[Vec<usize>],
     ) -> Result<(Option<u64>, Option<u32>)> {
-        let t0 = Instant::now();
-        let prepared_base = join_prepared_base(handle)?;
-        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "initramfs_join");
-
-        let t0 = Instant::now();
-        let prepared = framework_infrastructure(complete_prepared_initrd(
-            prepared_base,
-            &self.suffix_params(),
-        ))?;
         let uncompressed_size = prepared.uncompressed_len();
         let compressed_size = prepared.compressed_len();
-        tracing::debug!(
-            elapsed_us = t0.elapsed().as_micros(),
-            uncompressed_bytes = uncompressed_size,
-            compressed_bytes = compressed_size,
-            cache_hits = prepared.cache_hits(),
-            "prepare_initrd",
-        );
 
         // Enforce minimum memory for initramfs extraction.
         // This path is only reached when memory_mib was set explicitly.
         let memory_mib = self.memory_mib.expect(
-            "join_and_load_initramfs called in deferred mode; \
-             use join_compute_memory_and_allocate instead",
+            "validate_and_load_initramfs called in deferred mode; \
+             use compute_memory_and_allocate instead",
         );
         let kernel_init_size = read_kernel_init_size(&self.kernel)?;
         let (init_coverage_instrumented, instrumented_reserve_bytes) = prepared.coverage();
@@ -1820,43 +1785,27 @@ impl KtstrVm {
         Ok((Some(load_addr), Some(size)))
     }
 
-    /// Deferred memory path: join initramfs, compute memory from actual
-    /// size, and allocate anonymous guest memory. The caller must apply
-    /// NUMA policy/prefault and load the kernel before mapping the returned
-    /// prepared initrd, otherwise `MADV_POPULATE_WRITE` would eagerly COW
-    /// every file-backed initrd page.
+    /// Deferred memory path: compute memory from the prepared initramfs and
+    /// allocate anonymous guest memory. The caller must apply NUMA
+    /// policy/prefault and load the kernel before mapping the returned initrd,
+    /// otherwise `MADV_POPULATE_WRITE` would eagerly COW every file-backed
+    /// initrd page.
     ///
     /// Returns `(prepared_initrd, memory_mib)`.
     ///
     /// x86_64-only: aarch64 uses
-    /// `Self::join_compute_memory_and_allocate_aarch64`, which orders
+    /// `Self::compute_memory_and_allocate_aarch64`, which orders
     /// the load_addr computation after `allocate_and_register_memory`
     /// (the FDT-relative initrd address depends on `memory_mib`,
     /// which is itself computed from the post-compress total size).
     #[cfg(target_arch = "x86_64")]
-    fn join_compute_memory_and_allocate(
+    fn compute_memory_and_allocate(
         &self,
         vm: &mut kvm::KtstrKvm,
-        handle: JoinHandle<Result<PreparedBase>>,
+        prepared: PreparedInitrd,
     ) -> Result<(PreparedInitrd, u32)> {
-        let t0 = Instant::now();
-        let prepared_base = join_prepared_base(handle)?;
-        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "initramfs_join");
-
-        let t0 = Instant::now();
-        let prepared = framework_infrastructure(complete_prepared_initrd(
-            prepared_base,
-            &self.suffix_params(),
-        ))?;
         let uncompressed_size = prepared.uncompressed_len();
         let compressed_size = prepared.compressed_len();
-        tracing::debug!(
-            elapsed_us = t0.elapsed().as_micros(),
-            uncompressed_bytes = uncompressed_size,
-            compressed_bytes = compressed_size,
-            cache_hits = prepared.cache_hits(),
-            "prepare_initrd",
-        );
 
         // Compute memory from actual sizes, honoring the
         // topology-requested minimum when non-zero.
@@ -2054,15 +2003,15 @@ impl KtstrVm {
     /// Write cmdline, boot params, and topology tables to guest memory.
     ///
     /// When `kernel_result` is `None` (deferred memory mode), this method
-    /// first joins the initramfs thread to learn the actual size, allocates
-    /// guest memory from that size, does mbind, and loads the kernel — all
-    /// before proceeding with the normal initramfs load and boot param setup.
+    /// allocates guest memory from the prepared initramfs's exact size, does
+    /// mbind, and loads the kernel before the normal initramfs mapping and boot
+    /// parameter setup.
     #[cfg(target_arch = "x86_64")]
     pub(super) fn setup_memory(
         &self,
         vm: &mut kvm::KtstrKvm,
         kernel_result: Option<boot::KernelLoadResult>,
-        initramfs_handle: Option<JoinHandle<Result<PreparedBase>>>,
+        prepared_initrd: Option<PreparedInitrd>,
         mbind_node_map: &[Vec<usize>],
     ) -> Result<boot::KernelLoadResult> {
         // Deferred memory path: join initramfs first to learn its size,
@@ -2074,9 +2023,9 @@ impl KtstrVm {
             // directly onto vm.cow_overlay_guards before any fallible
             // operation, so a mid-function `?` cannot drop the guard
             // before the COW VMAs are torn down.
-            let (initrd_addr, initrd_size) = match initramfs_handle {
-                Some(handle) => {
-                    self.join_and_load_initramfs(vm, handle, INITRD_ADDR, mbind_node_map)?
+            let (initrd_addr, initrd_size) = match prepared_initrd {
+                Some(prepared) => {
+                    self.validate_and_load_initramfs(vm, prepared, INITRD_ADDR, mbind_node_map)?
                 }
                 None => (None, None),
             };
@@ -2085,10 +2034,10 @@ impl KtstrVm {
             // Deferred memory path: join initramfs first to learn its size,
             // then allocate memory, load kernel, and load initramfs — all in
             // one shot with no estimation.
-            let (prepared_initrd, _memory_mib) = match initramfs_handle {
-                Some(handle) => {
+            let (prepared_initrd, _memory_mib) = match prepared_initrd {
+                Some(prepared) => {
                     let (prepared, memory_mib) =
-                        self.join_compute_memory_and_allocate(vm, handle)?;
+                        self.compute_memory_and_allocate(vm, prepared)?;
                     (Some(prepared), memory_mib)
                 }
                 None => {
@@ -2356,7 +2305,7 @@ impl KtstrVm {
         &self,
         vm: &mut kvm::KtstrKvm,
         kernel_result: Option<boot::KernelLoadResult>,
-        initramfs_handle: Option<JoinHandle<Result<PreparedBase>>>,
+        prepared_initrd: Option<PreparedInitrd>,
         mbind_node_map: &[Vec<usize>],
     ) -> Result<boot::KernelLoadResult> {
         // Deferred memory path for aarch64.
@@ -2366,8 +2315,8 @@ impl KtstrVm {
             // directly onto vm.cow_overlay_guards before any fallible
             // operation, so a mid-function `?` cannot drop the guard
             // before the COW VMAs are torn down.
-            let (initrd_addr, initrd_size) = match initramfs_handle {
-                Some(handle) => {
+            let (initrd_addr, initrd_size) = match prepared_initrd {
+                Some(prepared) => {
                     // `self.memory_mib` is required on the non-deferred
                     // path: deferred boots take the early-return branch
                     // below, so we only reach this site after the builder
@@ -2378,7 +2327,12 @@ impl KtstrVm {
                     let memory_mib = self.memory_mib.context(
                         "internal: non-deferred aarch64 path requires memory_mib to be set",
                     )?;
-                    self.join_and_load_initramfs_aarch64(vm, handle, memory_mib, mbind_node_map)?
+                    self.validate_and_load_initramfs_aarch64(
+                        vm,
+                        prepared,
+                        memory_mib,
+                        mbind_node_map,
+                    )?
                 }
                 None => (None, None),
             };
@@ -2386,10 +2340,10 @@ impl KtstrVm {
         } else {
             // Deferred memory path: join initramfs first to learn its
             // size, allocate memory, then load kernel and initramfs.
-            let (prepared_initrd, prepared_load_addr) = match initramfs_handle {
-                Some(handle) => {
+            let (prepared_initrd, prepared_load_addr) = match prepared_initrd {
+                Some(prepared) => {
                     let (prepared, _memory_mib, load_addr) =
-                        self.join_compute_memory_and_allocate_aarch64(vm, handle)?;
+                        self.compute_memory_and_allocate_aarch64(vm, prepared)?;
                     (Some(prepared), Some(load_addr))
                 }
                 None => {
@@ -2431,39 +2385,21 @@ impl KtstrVm {
         self.finish_aarch64_setup(vm, kernel_result, initrd_addr, initrd_size)
     }
 
-    /// Non-deferred aarch64 initramfs load: join preparation, finish the
-    /// independently cached parts, validate that `memory_mib` is sufficient,
-    /// compute the FDT-relative load address, then direct-map the compressed
-    /// stream into guest memory via the shared
-    /// [`Self::load_prepared_initrd`] path.
-    fn join_and_load_initramfs_aarch64(
+    /// Non-deferred aarch64 initramfs load: validate that `memory_mib` is
+    /// sufficient, compute the FDT-relative load address, then direct-map the
+    /// prepared compressed stream into guest memory.
+    fn validate_and_load_initramfs_aarch64(
         &self,
         vm: &mut kvm::KtstrKvm,
-        handle: JoinHandle<Result<PreparedBase>>,
+        prepared: PreparedInitrd,
         memory_mib: u32,
         mbind_node_map: &[Vec<usize>],
     ) -> Result<(Option<u64>, Option<u32>)> {
-        let t0 = Instant::now();
-        let prepared_base = join_prepared_base(handle)?;
-        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "initramfs_join");
-
-        let t0 = Instant::now();
-        let prepared = framework_infrastructure(complete_prepared_initrd(
-            prepared_base,
-            &self.suffix_params(),
-        ))?;
         let uncompressed_size = prepared.uncompressed_len();
         let compressed_size = prepared.compressed_len();
-        tracing::debug!(
-            elapsed_us = t0.elapsed().as_micros(),
-            uncompressed_bytes = uncompressed_size,
-            compressed_bytes = compressed_size,
-            cache_hits = prepared.cache_hits(),
-            "prepare_initrd",
-        );
 
         // Validate the operator-supplied memory_mib against the
-        // initramfs budget. Mirrors the x86_64 join_and_load_initramfs
+        // initramfs budget. Mirrors the x86_64 validate_and_load_initramfs
         // contract: a builder with too-small memory_mib fails fast here
         // instead of OOMing during boot.
         let kernel_init_size = read_kernel_init_size(&self.kernel)?;
@@ -2499,37 +2435,17 @@ impl KtstrVm {
         Ok((Some(load_addr), Some(size)))
     }
 
-    /// Deferred aarch64 initramfs preparation: join, build immutable parts,
-    /// compute the memory budget, allocate anonymous guest memory, and return
-    /// the prepared image plus its final address. The caller applies NUMA
-    /// policy/prefault and loads the kernel before installing the file-backed
-    /// COW mappings.
-    fn join_compute_memory_and_allocate_aarch64(
+    /// Deferred aarch64 memory setup: compute the memory budget, allocate
+    /// anonymous guest memory, and return the prepared image plus its final
+    /// address. The caller applies NUMA policy/prefault and loads the kernel
+    /// before installing the file-backed COW mappings.
+    fn compute_memory_and_allocate_aarch64(
         &self,
         vm: &mut kvm::KtstrKvm,
-        handle: JoinHandle<Result<PreparedBase>>,
+        prepared: PreparedInitrd,
     ) -> Result<(PreparedInitrd, u32, u64)> {
-        let t0 = Instant::now();
-        let prepared_base = join_prepared_base(handle)?;
-        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "initramfs_join");
-
-        let t0 = Instant::now();
-        let prepared = framework_infrastructure(complete_prepared_initrd(
-            prepared_base,
-            &self.suffix_params(),
-        ))?;
         let uncompressed_size = prepared.uncompressed_len();
         let compressed_size = prepared.compressed_len();
-        tracing::debug!(
-            elapsed_us = t0.elapsed().as_micros(),
-            uncompressed_bytes = uncompressed_size,
-            compressed_bytes = compressed_size,
-            cache_hits = prepared.cache_hits(),
-            "prepare_initrd",
-        );
-
-        // Prepare before computing memory so the budget formula and load
-        // use the same exact compressed bytes.
 
         let kernel_init_size = read_kernel_init_size(&self.kernel)?;
         let (init_coverage_instrumented, instrumented_reserve_bytes) = prepared.coverage();

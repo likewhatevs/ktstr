@@ -856,9 +856,6 @@ fn cached_coverage_probe(root: &Path, payload: &PinnedInput) -> Result<(bool, u6
                     .context("create coverage probe memo temp")?;
                 temp.write_all(&bytes)
                     .context("write coverage probe memo")?;
-                temp.as_file()
-                    .sync_all()
-                    .context("sync coverage probe memo")?;
                 temp.persist(&record_path)
                     .map_err(|error| error.error)
                     .with_context(|| {
@@ -1608,7 +1605,6 @@ fn get_or_resolve_pinned_closure(
                     .tempfile_in(root.join(PREPARED_CLOSURES_DIR))
                     .context("create loader closure temp")?;
                 temp.write_all(&bytes).context("write loader closure")?;
-                temp.as_file().sync_all().context("sync loader closure")?;
                 temp.persist(&record_path)
                     .map_err(|error| error.error)
                     .with_context(|| format!("publish loader closure {}", record_path.display()))?;
@@ -2028,9 +2024,6 @@ fn publish_prepared_validation_record(
         .context("create prepared-object validation memo temp")?;
     temp.write_all(&bytes)
         .context("write prepared-object validation memo")?;
-    temp.as_file()
-        .sync_all()
-        .context("sync prepared-object validation memo")?;
     temp.persist(&record_path)
         .map_err(|error| error.error)
         .with_context(|| {
@@ -2368,10 +2361,6 @@ fn publish_prepared_object(
         built.payload.len() == usize::try_from(built.header.payload_len)?,
         "prepared object builder payload length mismatch"
     );
-    anyhow::ensure!(
-        content_hash_bytes(&built.payload) == built.header.payload_hash,
-        "prepared object builder payload digest mismatch"
-    );
     let file_alignment =
         usize::try_from(built.header.file_alignment).context("file alignment exceeds usize")?;
     anyhow::ensure!(
@@ -2417,22 +2406,12 @@ fn publish_prepared_object(
                 .context("write prepared object payload page")?;
         }
     }
-    temp.as_file()
-        .sync_all()
-        .context("sync prepared object temp")?;
     #[cfg(unix)]
     {
         temp.as_file()
             .set_permissions(std::fs::Permissions::from_mode(0o444))
             .context("mark prepared object read-only")?;
     }
-    // The data sync above does not necessarily persist the later chmod.
-    // Flush the permission transition before making the inode visible: a
-    // cache hit must never accept an owner-writable backing object after a
-    // crash/recovery boundary.
-    temp.as_file()
-        .sync_all()
-        .context("sync prepared object read-only permission")?;
 
     // Readers use this separate lock only when the tiny validation memo is
     // missing or names an older inode revision. Taking it before rename closes
@@ -2449,13 +2428,6 @@ fn publish_prepared_object(
         .persist(final_path)
         .map_err(|error| error.error)
         .with_context(|| format!("publish prepared object {}", final_path.display()))?;
-    if let Err(error) = crate::cache::fsync_parent(final_path) {
-        tracing::warn!(
-            path = %final_path.display(),
-            %error,
-            "prepared initrd CAS parent fsync failed; validation remains fail-closed"
-        );
-    }
     let identity = StableFileIdentity::from_file(&published)
         .context("stat published prepared object for validation memo")?;
     publish_prepared_validation_record(
@@ -2468,16 +2440,6 @@ fn publish_prepared_object(
             padding_is_zero: true,
         },
     )?;
-    let validation_record =
-        prepared_validation_record_path(root, built.header.kind, built.header.key);
-    if let Err(error) = crate::cache::fsync_parent(&validation_record) {
-        tracing::warn!(
-            path = %validation_record.display(),
-            %error,
-            "prepared initrd validation-memo parent fsync failed; \
-             the next opener will verify the payload"
-        );
-    }
     Ok(())
 }
 
@@ -2619,13 +2581,9 @@ fn publish_gc_stamp(root: &Path, path: &Path, now: u64) -> Result<()> {
         .context("create prepared initrd GC stamp temp")?;
     temp.write_all(&now.to_le_bytes())
         .context("write prepared initrd GC stamp")?;
-    temp.as_file()
-        .sync_all()
-        .context("sync prepared initrd GC stamp")?;
     temp.persist(path)
         .map_err(|error| error.error)
         .with_context(|| format!("publish prepared initrd GC stamp {}", path.display()))?;
-    crate::cache::fsync_parent(path).context("sync prepared initrd GC stamp parent")?;
     Ok(())
 }
 

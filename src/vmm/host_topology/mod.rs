@@ -1769,11 +1769,10 @@ fn acquire_resource_locks_waiting_impl(
         protocol::TicketWork::Coordinator(coordinator) => coordinator,
     };
     let mut step = |held: &mut protocol::HeldLocks| {
-        held.sweep(&target)?;
-        if held.covers(&target) {
+        if let Some(locks) = held.probe_complete(&target)? {
             Ok(protocol::CoordinatorStep::Complete {
                 claim: claim.clone(),
-                value: held.take(&target),
+                value: locks,
             })
         } else {
             Ok(protocol::CoordinatorStep::Waiting {
@@ -1878,8 +1877,7 @@ pub(crate) fn cpu_lock_path(cpu: usize) -> String {
 /// canonical order — see [`protocol`]). Returns the held fds
 /// on success, or an error string describing which resource was
 /// busy; on ANY failure every lock taken so far is released before
-/// returning, so no fast-path partial ever persists (only the elected
-/// coordinator may retain partials).
+/// returning, so no partial reservation ever persists.
 ///
 /// Claim-aware: an incompatible live ticket claim fails the attempt before
 /// touching its reserved lockfiles.
@@ -2913,7 +2911,7 @@ pub fn acquire_llc_plan(
 ///
 /// This is the harness-build reservation path: normal contention retains one
 /// exact ticket, while cancellation interrupts either its futex wait or the
-/// coordinator's inotify sleep and releases every partial hold.
+/// coordinator's inotify sleep.
 pub fn acquire_llc_plan_interruptible(
     topo: &HostTopology,
     test_topo: &crate::topology::TestTopology,
@@ -3077,12 +3075,11 @@ fn check_acquire_cancelled(cancelled: Option<&AtomicBool>) -> Result<()> {
 /// the admission registry after its first failed all-or-nothing attempt;
 /// repeating DISCOVER→PLAN against a published claim or real flock cannot beat
 /// that holder and only multiplies procfs and registry traffic. Once elected
-/// coordinator, the waiting path re-runs DISCOVER→PLAN against LIVE holder state on every
-/// lock-dir wake — the re-plan-on-wake contract — accumulating
-/// `LOCK_SH` on the freshly selected LLCs and CPUs under the coordinator license
-/// (partials retained across re-plans exactly when the new plan still
-/// selects them) until the plan completes. Ordinary tickets wait on targeted
-/// futexes; the coordinator waits on filtered inotify events.
+/// coordinator, the waiting path re-runs DISCOVER→PLAN against LIVE holder state
+/// on every lock-dir wake — the re-plan-on-wake contract — and probes the
+/// freshly selected LLCs and CPUs all-or-nothing. An incomplete probe releases
+/// its N-1 available resources before sleeping on the blocker. Ordinary tickets
+/// wait on targeted futexes; the coordinator waits on filtered inotify events.
 #[cfg(test)]
 fn acquire_llc_plan_with_acquire_fn<F>(
     topo: &HostTopology,
@@ -3445,11 +3442,9 @@ where
         }));
     }
 
-    // ---- WAIT PHASE: register, then accumulate if elected coordinator with
-    // re-plan-on-every-wake (see `protocol`). While waiting, this caller
-    // holds NO resource locks (every fast-phase attempt above was
-    // all-or-nothing); as coordinator, its `LOCK_SH` partials are retained
-    // across re-plans exactly when the fresh plan still selects them.
+    // ---- WAIT PHASE: register, then re-plan on every coordinator wake (see
+    // `protocol`). Every target probe remains all-or-nothing: the exact claim
+    // stays published while an incomplete attempt releases its real flocks.
     check_acquire_cancelled(cancelled)?;
     let queued_snapshots = queue_seed_snapshots
         .expect("waiting acquisition must preserve its failed fast-phase snapshot");
@@ -3708,10 +3703,7 @@ where
             &cpus,
             FlockMode::Shared,
         );
-        held.retain_target(&target);
-        held.sweep(&target)?;
-        if held.covers(&target) {
-            let locks = held.take(&target);
+        if let Some(locks) = held.probe_complete(&target)? {
             Ok(protocol::CoordinatorStep::Complete {
                 claim: protocol::ClaimSet::with_modes(
                     selected.iter().copied(),

@@ -285,7 +285,7 @@ pub struct KtstrVm {
     ///
     /// The materialized
     /// [`StagedScheduler`](crate::vmm::builder::StagedScheduler)
-    /// shape is held here so `spawn_initramfs_resolve` can hand the
+    /// shape is held here so `prepare_initramfs` can hand the
     /// binary paths to
     /// [`BaseKey::new`](crate::vmm::initramfs_cache::BaseKey) on
     /// the resolve thread. The companion
@@ -564,7 +564,7 @@ pub struct KtstrVm {
     pub(crate) exec_timeout: Duration,
     /// Optional host path to `ktstr-jemalloc-probe`. When `Some`, the
     /// probe is packed into the guest initramfs as an extra binary at
-    /// `bin/ktstr-jemalloc-probe`. Consumed by `spawn_initramfs_resolve`.
+    /// `bin/ktstr-jemalloc-probe`. Consumed by `prepare_initramfs`.
     pub(crate) jemalloc_probe_binary: Option<PathBuf>,
     /// Optional host path to `ktstr-jemalloc-alloc-worker`. When
     /// `Some`, the worker is packed alongside the probe as an
@@ -1231,7 +1231,7 @@ impl KtstrVm {
     /// type into the `pub` `SuffixParams` field signature.
     fn suffix_params(&self) -> initramfs::SuffixParams<'_> {
         // Production invariant: the initramfs path is reached only with an
-        // init_binary (spawn_initramfs_resolve bails otherwise), so payload
+        // init_binary (prepare_initramfs bails otherwise), so payload
         // is always Some here. A None would make build_suffix emit an
         // /init-less, unbootable image silently — trip it in debug/test.
         debug_assert!(
@@ -1257,14 +1257,23 @@ impl KtstrVm {
         let start = Instant::now();
         let dbg = debug_logging_enabled();
 
-        // Acquire the run-scoped host reservation FIRST — before the
-        // initramfs build, KVM VM creation, kernel load, and vCPU
-        // setup. Under the lock-dir admission registry (see
+        // Resolve the immutable initrd before exact topology admission.
+        // Cold cells may wait for the same cross-process CAS builder, and
+        // doing so before admission prevents that wait from sequestering
+        // CPUs or LLCs needed by already-prepared cells.
+        let prepared_initrd = self.prepare_initramfs()?;
+        if dbg {
+            eprintln!("  initramfs prepared: {:?}", start.elapsed());
+        }
+
+        // Acquire the run-scoped host reservation before KVM VM creation,
+        // guest-memory allocation, kernel load, and vCPU setup. Under the
+        // lock-dir admission registry (see
         // host_topology::protocol), nextest admits every cell at once and
         // cells park here until capacity frees; a waiting cell must be cheap:
-        // it holds one fixed ticket/futex, while only the coordinator owns an
-        // inotify fd — not a guest memory map with a resident kernel
-        // image, not vCPU fds. Acquisition WAITS on contention
+        // it holds immutable CAS handles plus one fixed ticket/futex, while
+        // only the coordinator owns an inotify fd — not a guest memory map
+        // with a resident kernel image, not vCPU fds. Acquisition WAITS on contention
         // (wait = true) for the authoritative flock release rather
         // than converting a transient peer hold into a host-skip.
         let run_locks = self.acquire_run_locks(true)?;
@@ -1283,10 +1292,6 @@ impl KtstrVm {
             .as_deref()
             .unwrap_or(&self.mbind_node_map);
 
-        let initramfs_handle = self.spawn_initramfs_resolve()?;
-        if dbg {
-            eprintln!("  initramfs spawn: {:?}", start.elapsed());
-        }
         let (mut vm, kernel_result) = self.create_vm_and_load_kernel(mbind_node_map)?;
         if dbg {
             eprintln!("  kvm+kernel: {:?}", start.elapsed());
@@ -1294,9 +1299,9 @@ impl KtstrVm {
 
         #[cfg(target_arch = "x86_64")]
         let _kernel_result = {
-            let kr = self.setup_memory(&mut vm, kernel_result, initramfs_handle, mbind_node_map)?;
+            let kr = self.setup_memory(&mut vm, kernel_result, prepared_initrd, mbind_node_map)?;
             if dbg {
-                eprintln!("  setup_memory (joins initramfs): {:?}", start.elapsed());
+                eprintln!("  setup_memory: {:?}", start.elapsed());
             }
             self.setup_vcpus(&vm, kr.entry)?;
             if dbg {
@@ -1309,7 +1314,7 @@ impl KtstrVm {
             let kr = self.setup_memory_aarch64(
                 &mut vm,
                 kernel_result,
-                initramfs_handle,
+                prepared_initrd,
                 mbind_node_map,
             )?;
             self.setup_vcpus_aarch64(&vm, kr.entry)?;
@@ -1739,11 +1744,9 @@ impl KtstrVm {
     ///   cross-invocation registry and, if elected coordinator, RE-PLANS ON EVERY WAKE:
     ///   each lock-dir event re-probes EVERY candidate all-or-nothing
     ///   (so a fully-freed alternative is taken immediately — never
-    ///   kept waiting on the original choice), and while none
-    ///   completes it accumulates the primary candidate (maximum
-    ///   overlap with already-held locks, ties to the pid-staggered
-    ///   scan order) under the coordinator license, publishing it as the
-    ///   exact claim. It waits for the authoritative flock release; the
+    ///   kept waiting on the original choice). While none completes it
+    ///   publishes one exact designation but retains no physical subset.
+    ///   It waits for the authoritative flock release; the
     ///   holder's VM watchdog and nextest process lifecycle own
     ///   bounds, so host preemption cannot be misclassified as
     ///   contention.
@@ -2080,11 +2083,10 @@ impl KtstrVm {
                 )
             });
 
-            // RE-PLAN on every wake: probe EVERY candidate
-            // all-or-nothing (reusing held locks) so a fully-freed
-            // alternative is taken the moment it appears — the coordinator
-            // never keeps waiting on its original choice while a
-            // different sufficient set sits free.
+            // RE-PLAN on every wake and probe every candidate
+            // all-or-nothing, so a fully-freed alternative is taken the
+            // moment it appears. Failed candidates release every real flock
+            // before the next candidate is considered.
             let mut active = Vec::with_capacity(static_len + usize::from(live.is_some()));
             if let Some(live) = live {
                 active.push(live);
@@ -2098,35 +2100,13 @@ impl KtstrVm {
                     });
                 }
             }
-            // None complete: accumulate toward the PRIMARY candidate —
-            // maximum overlap with what we already hold (dropping
-            // partials the fresh choice still needs would be wasted
-            // makespan), ties to pid-staggered scan order.
-            let held_paths = held.held_paths();
+            // None complete: keep one exact registry designation while
+            // holding no physical subset. Prefer a newly synthesized live
+            // placement, then the pid-staggered static planner order.
             let primary = active
                 .into_iter()
-                .max_by_key(|&i| {
-                    let overlap = targets[i]
-                        .iter()
-                        .filter(|lock| held_paths.contains(&lock.path))
-                        .count();
-                    // Stable tie-break toward scan order.
-                    (overlap, std::cmp::Reverse(i))
-                })
+                .next()
                 .expect("candidates is non-empty — checked by caller");
-            let target = &targets[primary];
-            held.retain_target(target);
-            held.sweep(target)?;
-            if held.covers(target) {
-                // A holder released between the probe pass and this
-                // sweep and the sweep finished the set — complete now
-                // rather than sleeping on a satisfied target.
-                let locks = held.take(target);
-                return Ok(protocol::CoordinatorStep::Complete {
-                    claim: claims[primary].clone(),
-                    value: (primary, locks),
-                });
-            }
             Ok(protocol::CoordinatorStep::Waiting {
                 claim: claims[primary].clone(),
             })
@@ -2244,6 +2224,10 @@ impl KtstrVm {
     /// do not apply to interactive shell sessions.
     pub fn run_interactive(&self) -> Result<Option<i32>> {
         let start = Instant::now();
+        // Keep immutable image preparation outside exact admission just as in
+        // the non-interactive path.
+        let prepared_initrd = self.prepare_initramfs()?;
+
         // Resolve admission before allocating guest memory or starting device
         // workers. The returned fds remain live for the whole interactive run,
         // and every placement consumer below uses the matching run-time CPU
@@ -2260,7 +2244,6 @@ impl KtstrVm {
         let effective_placement =
             EffectiveRunPlacement::new(effective_plan, effective_no_perf_cpus);
 
-        let initramfs_handle = self.spawn_initramfs_resolve()?;
         let (mut vm, kernel_result) = self.create_vm_and_load_kernel(&self.mbind_node_map)?;
 
         #[cfg(target_arch = "x86_64")]
@@ -2268,7 +2251,7 @@ impl KtstrVm {
             let kr = self.setup_memory(
                 &mut vm,
                 kernel_result,
-                initramfs_handle,
+                prepared_initrd,
                 &self.mbind_node_map,
             )?;
             self.setup_vcpus(&vm, kr.entry)?;
@@ -2278,7 +2261,7 @@ impl KtstrVm {
             let kr = self.setup_memory_aarch64(
                 &mut vm,
                 kernel_result,
-                initramfs_handle,
+                prepared_initrd,
                 &self.mbind_node_map,
             )?;
             self.setup_vcpus_aarch64(&vm, kr.entry)?;

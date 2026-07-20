@@ -16,11 +16,27 @@ pub struct KernelLoadResult {
 /// Gzip magic bytes.
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 
+/// Machine-wide derivation cache for gzip-compressed arm64 kernels.
+///
+/// The directory version is the recipe version: changing the decompressor or
+/// the bytes persisted as an object must move to a new namespace.
+const DECOMPRESSED_CACHE_DIR: &str = "arm64-kernel-decompressed-v1";
+const DECOMPRESSED_OBJECTS_DIR: &str = "objects";
+const DECOMPRESSED_LOCKS_DIR: &str = ".locks";
+const DECOMPRESSED_NAMESPACE_GATE: &str = "namespace.lock";
+
+struct DecompressedCachePaths {
+    object: std::path::PathBuf,
+    lock: std::path::PathBuf,
+    namespace_gate: std::path::PathBuf,
+}
+
 /// Load an aarch64 kernel into guest memory.
 ///
 /// Accepts both raw PE Image files and gzip-compressed vmlinuz files.
 /// Compressed kernels (identified by gzip magic `1f 8b`) are decompressed
-/// in memory before loading via the PE loader.
+/// once per compressed-content hash across processes, then loaded via the PE
+/// loader.
 pub fn load_kernel(
     guest_mem: &GuestMemoryMmap,
     kernel_path: &std::path::Path,
@@ -42,76 +58,41 @@ pub fn load_kernel(
         .context("seek kernel to start")?;
 
     if magic == GZIP_MAGIC {
-        // Content-cache the decompressed Image next to the cached kernel as a
-        // `<kernel>.decompressed` sidecar. nextest runs each cell in its own
-        // process, so without this every cell re-inflates the same
-        // multi-MB vmlinuz. Canonicalize first (symlink-safe, mirroring the
-        // `.btf` sidecar's canonicalize-at-top) so the sidecar path and its
-        // mtime freshness track the real cached file; a failure leaves us on
-        // the plain-path fallback, which the cache-membership gate below
-        // rejects anyway.
-        let canon =
-            std::fs::canonicalize(kernel_path).unwrap_or_else(|_| kernel_path.to_path_buf());
-        // Gate reads and writes on cache-root membership so ktstr never
-        // deposits a sibling artifact in a directory it does not own (a source
-        // tree, a distro path) — identical policy to the vmlinux sidecars.
-        let cache_ok = crate::cache::path_inside_cache_root(&canon);
-        let sidecar = decompressed_sidecar_path(&canon);
+        let source_identity = crate::cache::content::StableFileIdentity::from_file(&kernel_file)
+            .with_context(|| format!("stat gzip kernel: {}", kernel_path.display()))?;
+        let content_hash =
+            crate::cache::content::cached_file_digest(&kernel_file, source_identity)
+                .with_context(|| format!("digest gzip kernel: {}", kernel_path.display()))?;
+        let paths = decompressed_cache_paths(content_hash)?;
 
-        // HIT: a fresh sidecar inside the cache. mmap it read-only — the point
-        // is page-cache sharing across concurrent cells loading the same
-        // kernel, and PE::load reads volatile straight into guest memory with
-        // no heap copy of the whole image. No version tag: the sidecar is the
-        // RAW decompressed Image (not a versioned struct like `.artifacts`),
-        // so the mtime freshness rule alone suffices — the same reasoning the
-        // raw-bytes `.btf` sidecar relies on.
-        if cache_ok && crate::monitor::btf_offsets::sidecar_fresh(&sidecar, &canon) {
-            match load_pe_from_sidecar(guest_mem, &sidecar) {
-                Ok(entry) => return Ok(KernelLoadResult { entry }),
-                Err(e) => {
-                    // Defensive: a fresh-looking sidecar that fails PE::load is
-                    // truncated/corrupt. Remove it and fall through to inflate;
-                    // the miss path below rewrites a good one.
-                    tracing::warn!(
-                        path = %sidecar.display(),
-                        err = %e,
-                        "decompressed-Image sidecar failed PE::load; removing and re-inflating",
-                    );
-                    let _ = std::fs::remove_file(&sidecar);
-                }
-            }
-        }
-
-        // MISS (or the defensive fallback above): inflate as before.
-        let mut decoder = flate2::read::GzDecoder::new(kernel_file);
-        let mut decompressed = Vec::new();
-        decoder
-            .read_to_end(&mut decompressed)
-            .context("decompress gzip kernel")?;
-        // Borrow the bytes for PE::load (Cursor<&[u8]> is ReadVolatile) so the
-        // Vec is still owned afterwards for the sidecar write.
-        let mut cursor = std::io::Cursor::new(&decompressed[..]);
-        let result = PE::load(
-            guest_mem,
-            Some(GuestAddress(KERNEL_LOAD_ADDR)),
-            &mut cursor,
-            None,
-        )
-        .context("load decompressed aarch64 Image")?;
-        // PE::load accepted the bytes -> cache them for sibling cells. Written
-        // only after validation so a corrupt inflate is never persisted;
-        // best-effort (the load already succeeded) and suppressed outside the
-        // cache root.
-        if cache_ok && let Err(e) = write_decompressed_sidecar(&sidecar, &decompressed) {
-            tracing::warn!(
-                path = %sidecar.display(),
-                err = %e,
-                "decompressed-Image sidecar write failed; re-inflated on next load",
-            );
-        }
-        Ok(KernelLoadResult {
-            entry: result.kernel_load.raw_value(),
-        })
+        anyhow::ensure!(
+            crate::cache::content::StableFileIdentity::from_file(&kernel_file)?
+                == source_identity,
+            "gzip kernel changed before decompressed-cache lookup: {}",
+            kernel_path.display()
+        );
+        let entry = crate::cache::content::load_or_build(
+            &paths.namespace_gate,
+            &paths.lock,
+            &format!("decompressed arm64 kernel {content_hash:016x}"),
+            || try_load_decompressed_object(guest_mem, &paths.object),
+            || {
+                build_decompressed_object(
+                    guest_mem,
+                    &mut kernel_file,
+                    source_identity,
+                    content_hash,
+                    &paths.object,
+                )
+            },
+        )?;
+        anyhow::ensure!(
+            crate::cache::content::StableFileIdentity::from_file(&kernel_file)?
+                == source_identity,
+            "gzip kernel changed during decompressed-cache lookup: {}",
+            kernel_path.display()
+        );
+        Ok(KernelLoadResult { entry })
     } else {
         let result = PE::load(
             guest_mem,
@@ -126,32 +107,37 @@ pub fn load_kernel(
     }
 }
 
-/// Sidecar path for a cached kernel image: append `.decompressed` so it sits
-/// next to the kernel in the same cache entry (`<entry>/vmlinuz` →
-/// `<entry>/vmlinuz.decompressed`). Append-suffix (not `with_extension`)
-/// preserves any existing extension, matching `btf_sidecar_path`.
-fn decompressed_sidecar_path(path: &std::path::Path) -> std::path::PathBuf {
-    let mut name = path.as_os_str().to_os_string();
-    name.push(".decompressed");
-    std::path::PathBuf::from(name)
+fn decompressed_cache_paths(content_hash: u64) -> Result<DecompressedCachePaths> {
+    // `KTSTR_CACHE_DIR` intentionally resolves to the override verbatim, so
+    // retain a component-specific directory below it. This also keeps the
+    // derived-object locks separate from the shared input-digest namespace.
+    let root = crate::cache::resolve_cache_root_with_suffix("vmm-derived")?
+        .join(DECOMPRESSED_CACHE_DIR);
+    let objects = root.join(DECOMPRESSED_OBJECTS_DIR);
+    let locks = root.join(DECOMPRESSED_LOCKS_DIR);
+    std::fs::create_dir_all(&objects)
+        .with_context(|| format!("create decompressed-kernel CAS {}", objects.display()))?;
+    std::fs::create_dir_all(&locks)
+        .with_context(|| format!("create decompressed-kernel lock dir {}", locks.display()))?;
+    Ok(DecompressedCachePaths {
+        object: objects.join(format!("{content_hash:016x}.image")),
+        lock: locks.join(format!("object-{content_hash:016x}.lock")),
+        namespace_gate: locks.join(DECOMPRESSED_NAMESPACE_GATE),
+    })
 }
 
-/// Load a raw (already-decompressed) arm64 Image from the sidecar into guest
-/// memory via a read-only mmap, returning the PE loader's entry address.
-///
-/// The mmap (not `fs::read`) is deliberate: concurrent cells loading the same
-/// cached kernel share the sidecar's page cache, and `PE::load` reads volatile
-/// straight into guest memory without a heap copy of the whole image.
-fn load_pe_from_sidecar(guest_mem: &GuestMemoryMmap, sidecar: &std::path::Path) -> Result<u64> {
+/// Load a raw arm64 Image from one pinned immutable CAS inode.
+fn load_pe_from_object(
+    guest_mem: &GuestMemoryMmap,
+    file: std::fs::File,
+    object: &std::path::Path,
+) -> Result<u64> {
     use linux_loader::loader::{KernelLoader, pe::PE};
-    let file = std::fs::File::open(sidecar)
-        .with_context(|| format!("open decompressed sidecar: {}", sidecar.display()))?;
-    // SAFETY: the sidecar is only ever replaced atomically (tempfile +
-    // rename in `write_decompressed_sidecar`), never modified in place, so the
-    // mapped pages are stable for this map's lifetime even if a concurrent
-    // cell rewrites the sidecar (which swaps the inode, leaving our pages).
+    // SAFETY: published objects are read-only and replaced only by atomic
+    // rename during corruption recovery. The open inode remains stable even
+    // if another process replaces its pathname.
     let mmap = unsafe { memmap2::Mmap::map(&file) }
-        .with_context(|| format!("mmap decompressed sidecar: {}", sidecar.display()))?;
+        .with_context(|| format!("mmap decompressed kernel object: {}", object.display()))?;
     let mut cursor = std::io::Cursor::new(mmap);
     let result = PE::load(
         guest_mem,
@@ -159,28 +145,148 @@ fn load_pe_from_sidecar(guest_mem: &GuestMemoryMmap, sidecar: &std::path::Path) 
         &mut cursor,
         None,
     )
-    .context("load decompressed Image from sidecar")?;
+    .context("load decompressed Image from content cache")?;
     Ok(result.kernel_load.raw_value())
 }
 
-/// Atomically write `bytes` to the `.decompressed` sidecar via a tempfile in
-/// the same directory + fsync + rename, so a concurrent reader sees either the
-/// old sidecar or the new one, never a partial write. Mirrors the vmlinux
-/// `atomic_write_sidecar`.
-fn write_decompressed_sidecar(sidecar: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let parent = sidecar
+fn remove_decompressed_object(object: &std::path::Path) -> Result<()> {
+    match std::fs::remove_file(object) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("remove decompressed kernel object {}", object.display())),
+    }
+}
+
+/// Return a checked cache hit. A malformed or writable object is invalidated
+/// and becomes a coordinated miss; no caller privately inflates around a cache
+/// failure.
+fn try_load_decompressed_object(
+    guest_mem: &GuestMemoryMmap,
+    object: &std::path::Path,
+) -> Result<Option<u64>> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let Some((file, identity)) =
+        crate::cache::content::open_cache_record(object, "decompressed kernel object")?
+    else {
+        return Ok(None);
+    };
+    let mode = file
+        .metadata()
+        .with_context(|| format!("stat decompressed kernel object {}", object.display()))?
+        .permissions()
+        .mode();
+    if identity.size == 0 || mode & 0o222 != 0 {
+        drop(file);
+        remove_decompressed_object(object)?;
+        return Ok(None);
+    }
+    match load_pe_from_object(guest_mem, file, object) {
+        Ok(entry) => Ok(Some(entry)),
+        Err(error) => {
+            tracing::warn!(
+                path = %object.display(),
+                %error,
+                "decompressed kernel cache object failed PE validation; rebuilding",
+            );
+            remove_decompressed_object(object)?;
+            Ok(None)
+        }
+    }
+}
+
+/// Atomically publish bytes already accepted by `PE::load`.
+fn publish_decompressed_object(object: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let parent = object
         .parent()
-        .context("decompressed sidecar path has no parent directory")?;
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)
-        .context("create tempfile for decompressed sidecar")?;
+        .context("decompressed kernel object has no parent directory")?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".tmp-decompressed-kernel-")
+        .tempfile_in(parent)
+        .context("create decompressed kernel object temp")?;
     tmp.write_all(bytes)
-        .context("write decompressed sidecar contents")?;
+        .context("write decompressed kernel object")?;
     tmp.as_file()
-        .sync_all()
-        .context("fsync decompressed sidecar before rename")?;
-    tmp.persist(sidecar)
-        .map_err(|e| anyhow::anyhow!("persist decompressed sidecar: {}", e.error))?;
+        .set_permissions(std::fs::Permissions::from_mode(0o444))
+        .context("mark decompressed kernel object read-only")?;
+    tmp.persist(object)
+        .map_err(|error| error.error)
+        .with_context(|| format!("publish decompressed kernel object {}", object.display()))?;
+    Ok(())
+}
+
+fn build_decompressed_object(
+    guest_mem: &GuestMemoryMmap,
+    source: &mut std::fs::File,
+    source_identity: crate::cache::content::StableFileIdentity,
+    _content_hash: u64,
+    object: &std::path::Path,
+) -> Result<u64> {
+    use linux_loader::loader::{KernelLoader, pe::PE};
+    use std::io::Read as _;
+
+    anyhow::ensure!(
+        crate::cache::content::StableFileIdentity::from_file(source)? == source_identity,
+        "gzip kernel changed before decompression"
+    );
+    source
+        .seek(std::io::SeekFrom::Start(0))
+        .context("seek gzip kernel for decompression")?;
+    let mut decompressed = Vec::new();
+    {
+        let mut decoder = flate2::read::GzDecoder::new(&mut *source);
+        decoder
+            .read_to_end(&mut decompressed)
+            .context("decompress gzip kernel")?;
+    }
+    anyhow::ensure!(
+        crate::cache::content::StableFileIdentity::from_file(source)? == source_identity,
+        "gzip kernel changed during decompression"
+    );
+
+    // Validate before publication, preserving the old sidecar invariant that a
+    // bad gzip payload never becomes a reusable cache object.
+    let mut cursor = std::io::Cursor::new(&decompressed[..]);
+    let result = PE::load(
+        guest_mem,
+        Some(GuestAddress(KERNEL_LOAD_ADDR)),
+        &mut cursor,
+        None,
+    )
+    .context("load decompressed aarch64 Image")?;
+
+    #[cfg(test)]
+    record_decompressed_builder_claim_for_test(_content_hash)?;
+    publish_decompressed_object(object, &decompressed)?;
+    Ok(result.kernel_load.raw_value())
+}
+
+#[cfg(test)]
+fn record_decompressed_builder_claim_for_test(content_hash: u64) -> Result<()> {
+    use std::io::Write as _;
+
+    let Some(path) = std::env::var_os("KTSTR_ARM64_DECOMPRESSED_BUILDER_CLAIMS") else {
+        return Ok(());
+    };
+    let mut claims = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| {
+            format!(
+                "open decompressed-kernel builder claims {}",
+                std::path::Path::new(&path).display()
+            )
+        })?;
+    writeln!(claims, "{content_hash:016x} {}", std::process::id())
+        .context("record decompressed-kernel builder claim")?;
+    claims
+        .sync_data()
+        .context("sync decompressed-kernel builder claim")?;
     Ok(())
 }
 
@@ -281,122 +387,144 @@ mod tests {
         GuestMemoryMmap::from_ranges(&[(GuestAddress(KERNEL_LOAD_ADDR), 0x1000)]).unwrap()
     }
 
-    // The four W2c tests exercise the aarch64 gzip-kernel sidecar cache. They
-    // compile and run only on aarch64 (this whole module is
+    // These tests compile and run only on aarch64 (this whole module is
     // `#[cfg(target_arch = "aarch64")]` via `vmm/mod.rs`), i.e. on arm64 CI.
 
-    /// MISS: no sidecar -> inflate, load, and write the raw Image sidecar.
+    fn object_path_for(kernel: &std::path::Path) -> std::path::PathBuf {
+        let file = std::fs::File::open(kernel).unwrap();
+        let identity = crate::cache::content::StableFileIdentity::from_file(&file).unwrap();
+        let hash = crate::cache::content::cached_file_digest(&file, identity).unwrap();
+        decompressed_cache_paths(hash).unwrap().object
+    }
+
     #[test]
-    fn gzip_miss_inflates_and_writes_sidecar() {
+    fn gzip_content_aliases_share_one_machine_object() {
         use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        use std::os::unix::fs::PermissionsExt as _;
+
         let _lock = lock_env();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _g = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
-        let entry = tmp.path().join("kentry");
-        std::fs::create_dir_all(&entry).unwrap();
-        let kernel = entry.join("Image");
+        let cache = tempfile::TempDir::new().unwrap();
+        let _g = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, cache.path());
+        let sources = tempfile::TempDir::new().unwrap();
+        let first = sources.path().join("first-vmlinuz");
+        let alias = sources.path().join("byte-identical-alias-vmlinuz");
+        let raw = minimal_arm64_image();
+        let compressed = gzip(&raw);
+        std::fs::write(&first, &compressed).unwrap();
+        // A distinct inode with identical bytes proves the derived key is
+        // content-addressed rather than path/inode-addressed.
+        std::fs::write(&alias, &compressed).unwrap();
+
+        let first_object = object_path_for(&first);
+        let alias_object = object_path_for(&alias);
+        assert_eq!(first_object, alias_object);
+        assert!(!first_object.exists());
+
+        for kernel in [&first, &alias] {
+            let result = load_kernel(&tiny_guest_mem(), kernel).unwrap();
+            assert_eq!(result.entry, KERNEL_LOAD_ADDR);
+        }
+        assert_eq!(std::fs::read(&first_object).unwrap(), raw);
+        assert_eq!(
+            std::fs::metadata(&first_object)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o222,
+            0,
+            "published decompressed objects must be immutable",
+        );
+        let mut old_sidecar = first.as_os_str().to_os_string();
+        old_sidecar.push(".decompressed");
+        assert!(
+            !std::path::Path::new(&old_sidecar).exists(),
+            "content-CAS loading must not recreate pathname sidecars",
+        );
+    }
+
+    #[test]
+    fn gzip_corrupt_content_object_is_checked_and_rebuilt() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _lock = lock_env();
+        let cache = tempfile::TempDir::new().unwrap();
+        let _g = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, cache.path());
+        let sources = tempfile::TempDir::new().unwrap();
+        let kernel = sources.path().join("vmlinuz");
         let raw = minimal_arm64_image();
         std::fs::write(&kernel, gzip(&raw)).unwrap();
+        let object = object_path_for(&kernel);
+        std::fs::write(&object, b"not-an-arm64-Image").unwrap();
+        std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o444)).unwrap();
 
-        let gm = tiny_guest_mem();
-        let r = load_kernel(&gm, &kernel).expect("first load must inflate + succeed");
-        assert_eq!(r.entry, KERNEL_LOAD_ADDR);
-
-        let canon = std::fs::canonicalize(&kernel).unwrap();
-        let sidecar = decompressed_sidecar_path(&canon);
-        assert!(sidecar.exists(), "miss must write the decompressed sidecar");
+        let result = load_kernel(&tiny_guest_mem(), &kernel).unwrap();
+        assert_eq!(result.entry, KERNEL_LOAD_ADDR);
         assert_eq!(
-            std::fs::read(&sidecar).unwrap(),
+            std::fs::read(&object).unwrap(),
             raw,
-            "sidecar must hold the raw decompressed Image bytes",
+            "a cache object rejected by PE::load must be replaced atomically",
         );
     }
 
-    /// HIT: a fresh in-cache sidecar is used even when the ORIGINAL gzip body
-    /// is corrupt. The original keeps the gzip magic (so the gzip branch is
-    /// taken) but a garbage body that would fail to inflate — so a successful
-    /// load proves the bytes came from the sidecar, not a re-inflate.
     #[test]
-    fn gzip_hit_loads_from_sidecar_ignoring_original() {
-        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
-        let _lock = lock_env();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _g = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
-        let entry = tmp.path().join("kentry");
-        std::fs::create_dir_all(&entry).unwrap();
-        let kernel = entry.join("Image");
-        std::fs::write(&kernel, [0x1f, 0x8b, 0xde, 0xad, 0xbe, 0xef]).unwrap();
-        let canon = std::fs::canonicalize(&kernel).unwrap();
-        let sidecar = decompressed_sidecar_path(&canon);
-        // Written after the original, so its mtime is >= the original's and
-        // `sidecar_fresh` (a `>=` compare) treats it as a hit.
-        std::fs::write(&sidecar, minimal_arm64_image()).unwrap();
-        assert!(
-            crate::monitor::btf_offsets::sidecar_fresh(&sidecar, &canon),
-            "precondition: sidecar must be fresh vs the original",
-        );
+    fn gzip_cold_process_storm_elects_one_inflater() {
+        const CHILD_KERNEL: &str = "KTSTR_ARM64_DECOMPRESSED_CHILD_KERNEL";
+        const CLAIMS: &str = "KTSTR_ARM64_DECOMPRESSED_BUILDER_CLAIMS";
 
-        let gm = tiny_guest_mem();
-        let r = load_kernel(&gm, &kernel).expect("hit must load from the sidecar");
-        assert_eq!(r.entry, KERNEL_LOAD_ADDR);
-    }
+        if let Some(kernel) = std::env::var_os(CHILD_KERNEL) {
+            let result = load_kernel(&tiny_guest_mem(), std::path::Path::new(&kernel)).unwrap();
+            assert_eq!(result.entry, KERNEL_LOAD_ADDR);
+            return;
+        }
 
-    /// STALE: a sidecar older than its kernel is ignored; the kernel is
-    /// re-inflated and the sidecar rewritten fresh. The planted sidecar is
-    /// garbage, so if it were (wrongly) used PE::load would fail.
-    #[test]
-    fn gzip_stale_sidecar_ignored_and_rewritten() {
-        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
-        let _lock = lock_env();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _g = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
-        let entry = tmp.path().join("kentry");
-        std::fs::create_dir_all(&entry).unwrap();
-        let kernel = entry.join("Image");
-        let raw = minimal_arm64_image();
-        std::fs::write(&kernel, gzip(&raw)).unwrap();
-        let canon = std::fs::canonicalize(&kernel).unwrap();
-        let sidecar = decompressed_sidecar_path(&canon);
-        std::fs::write(&sidecar, b"garbage-not-an-image").unwrap();
-        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-        let f = std::fs::File::options().write(true).open(&sidecar).unwrap();
-        f.set_modified(past).unwrap();
-        drop(f);
-        assert!(
-            !crate::monitor::btf_offsets::sidecar_fresh(&sidecar, &canon),
-            "precondition: planted sidecar must be stale",
-        );
-
-        let gm = tiny_guest_mem();
-        let r = load_kernel(&gm, &kernel).expect("stale sidecar ignored; inflate succeeds");
-        assert_eq!(r.entry, KERNEL_LOAD_ADDR);
-        assert_eq!(
-            std::fs::read(&sidecar).unwrap(),
-            raw,
-            "stale sidecar must be rewritten with the real Image",
-        );
-    }
-
-    /// A kernel OUTSIDE the cache root gets no sidecar (ktstr never deposits
-    /// artifacts in directories it does not own).
-    #[test]
-    fn gzip_outside_cache_root_writes_no_sidecar() {
         use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
         let _lock = lock_env();
         let cache = tempfile::TempDir::new().unwrap();
         let _g = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, cache.path());
-        let outside = tempfile::TempDir::new().unwrap();
-        let kernel = outside.path().join("Image");
-        std::fs::write(&kernel, gzip(&minimal_arm64_image())).unwrap();
+        let sources = tempfile::TempDir::new().unwrap();
+        let kernel = sources.path().join("vmlinuz");
+        let raw = minimal_arm64_image();
+        std::fs::write(&kernel, gzip(&raw)).unwrap();
+        let object = object_path_for(&kernel);
+        let claims = sources.path().join("builder-claims");
+        let test_name = std::thread::current()
+            .name()
+            .expect("test harness named this thread")
+            .to_owned();
 
-        let gm = tiny_guest_mem();
-        let r = load_kernel(&gm, &kernel).expect("outside-cache load still succeeds");
-        assert_eq!(r.entry, KERNEL_LOAD_ADDR);
-        let sidecar = decompressed_sidecar_path(&std::fs::canonicalize(&kernel).unwrap());
-        assert!(
-            !sidecar.exists(),
-            "no sidecar may be written outside the cache root",
+        let mut children = Vec::new();
+        for _ in 0..8 {
+            children.push(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("--exact")
+                    .arg(&test_name)
+                    .arg("--nocapture")
+                    .env(CHILD_KERNEL, &kernel)
+                    .env(CLAIMS, &claims)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        for child in children {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "cold-storm child failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+
+        let claims = std::fs::read_to_string(&claims).unwrap();
+        assert_eq!(
+            claims.lines().count(),
+            1,
+            "one content key must elect exactly one cross-process inflater",
         );
+        assert_eq!(std::fs::read(object).unwrap(), raw);
     }
 
     #[test]
