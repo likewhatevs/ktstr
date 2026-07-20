@@ -3116,16 +3116,16 @@ pub fn acquire_llc_plan(
     policy: PlacementPolicy,
     wait: bool,
 ) -> Result<LlcPlan> {
-    acquire_llc_plan_impl(
+    acquire_llc_plan_impl(LlcPlanAcquireRequest {
         topo,
         test_topo,
         cpu_cap,
-        policy,
-        CpuSelectionPolicy::WithinEachLlc(policy),
+        llc_policy: policy,
+        cpu_policy: CpuSelectionPolicy::WithinEachLlc(policy),
         wait,
-        LlcPlanSizing::Exact,
-        None,
-    )
+        sizing: LlcPlanSizing::Exact,
+        cancelled: None,
+    })
 }
 
 /// Interruptible form of [`acquire_llc_plan`] for VM admission. It is the same
@@ -3139,16 +3139,16 @@ pub(crate) fn acquire_llc_plan_interruptible(
     wait: bool,
     cancelled: Option<&AtomicBool>,
 ) -> Result<LlcPlan> {
-    acquire_llc_plan_impl(
+    acquire_llc_plan_impl(LlcPlanAcquireRequest {
         topo,
         test_topo,
         cpu_cap,
-        policy,
-        CpuSelectionPolicy::WithinEachLlc(policy),
+        llc_policy: policy,
+        cpu_policy: CpuSelectionPolicy::WithinEachLlc(policy),
         wait,
-        LlcPlanSizing::Exact,
+        sizing: LlcPlanSizing::Exact,
         cancelled,
-    )
+    })
 }
 
 /// Work-conserving waiting acquisition for throughput-elastic builds.
@@ -3173,16 +3173,16 @@ pub(crate) fn acquire_elastic_build_llc_plan(
     cpu_cap: Option<CpuCap>,
     cancelled: Option<&AtomicBool>,
 ) -> Result<LlcPlan> {
-    acquire_llc_plan_impl(
+    acquire_llc_plan_impl(LlcPlanAcquireRequest {
         topo,
         test_topo,
         cpu_cap,
-        PlacementPolicy::Consolidate,
-        CpuSelectionPolicy::least_held_for_process(),
-        true,
-        LlcPlanSizing::Elastic,
+        llc_policy: PlacementPolicy::Consolidate,
+        cpu_policy: CpuSelectionPolicy::least_held_for_process(),
+        wait: true,
+        sizing: LlcPlanSizing::Elastic,
         cancelled,
-    )
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3225,16 +3225,17 @@ struct LlcPlanAcquireRequest<'a> {
     cancelled: Option<&'a AtomicBool>,
 }
 
-fn acquire_llc_plan_impl(
-    topo: &HostTopology,
-    test_topo: &crate::topology::TestTopology,
-    cpu_cap: Option<CpuCap>,
-    llc_policy: PlacementPolicy,
-    cpu_policy: CpuSelectionPolicy,
-    wait: bool,
-    sizing: LlcPlanSizing,
-    cancelled: Option<&AtomicBool>,
-) -> Result<LlcPlan> {
+fn acquire_llc_plan_impl(request: LlcPlanAcquireRequest<'_>) -> Result<LlcPlan> {
+    let LlcPlanAcquireRequest {
+        topo,
+        test_topo,
+        cpu_cap,
+        llc_policy,
+        cpu_policy,
+        wait,
+        sizing,
+        cancelled,
+    } = request;
     check_acquire_cancelled(cancelled)?;
     if crate::cargo_test_mode::cargo_test_mode_active() {
         // Bare `cargo test` mode: no peer-coordination contract. Both

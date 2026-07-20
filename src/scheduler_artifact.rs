@@ -829,34 +829,54 @@ where
             "scheduler build cache packages must be non-empty, sorted, unique names: {packages:?}"
         ));
     }
+    if cancelled() {
+        return Err("scheduler workspace build cache operation interrupted".to_string());
+    }
     ensure_scheduler_build_cache_dirs(root).map_err(|error| error.to_string())?;
     let (record_path, lock_path, namespace_gate) = scheduler_build_cache_paths(root, identity);
     crate::cache::content::load_or_build_with_wait(
         &namespace_gate,
         &lock_path,
         &format!("scheduler workspace build {identity:016x}"),
-        || match read_scheduler_build_cache_record(&record_path, identity, packages) {
-            Ok(Some(record)) => {
-                if !validate_identity().map_err(anyhow::Error::msg)? {
-                    anyhow::bail!(
-                        "scheduler workspace inputs changed before accepting cached build \
-                         {identity:016x}"
-                    );
-                }
-                Ok(Some(record))
+        || {
+            if cancelled() {
+                anyhow::bail!("scheduler workspace build cache operation interrupted");
             }
-            Ok(None) => Ok(None),
-            Err(error) => {
-                tracing::debug!(
-                    path = %record_path.display(),
-                    error = %error,
-                    "rebuilding invalid reconstructible scheduler build cache record",
-                );
-                Ok(None)
+            match read_scheduler_build_cache_record(&record_path, identity, packages) {
+                Ok(Some(record)) => {
+                    if cancelled() {
+                        anyhow::bail!("scheduler workspace build cache operation interrupted");
+                    }
+                    if !validate_identity().map_err(anyhow::Error::msg)? {
+                        anyhow::bail!(
+                            "scheduler workspace inputs changed before accepting cached build \
+                             {identity:016x}"
+                        );
+                    }
+                    if cancelled() {
+                        anyhow::bail!("scheduler workspace build cache operation interrupted");
+                    }
+                    Ok(Some(record))
+                }
+                Ok(None) => Ok(None),
+                Err(error) => {
+                    tracing::debug!(
+                        path = %record_path.display(),
+                        error = %error,
+                        "rebuilding invalid reconstructible scheduler build cache record",
+                    );
+                    Ok(None)
+                }
             }
         },
         || {
+            if cancelled() {
+                anyhow::bail!("scheduler workspace build cache operation interrupted");
+            }
             let pinned = build().map_err(anyhow::Error::msg)?;
+            if cancelled() {
+                anyhow::bail!("scheduler workspace build cache operation interrupted");
+            }
             if pinned.keys().ne(packages.iter()) {
                 anyhow::bail!(
                     "scheduler workspace builder emitted packages {:?}, expected {packages:?}",
@@ -876,6 +896,9 @@ where
                     "scheduler workspace inputs changed before publishing build \
                      {identity:016x}"
                 );
+            }
+            if cancelled() {
+                anyhow::bail!("scheduler workspace build cache operation interrupted");
             }
             publish_scheduler_build_cache_record(&record_path, identity, packages, &paths)
                 .map_err(anyhow::Error::msg)?;
@@ -1335,6 +1358,25 @@ mod tests {
         assert_eq!(hit.paths[&packages[0]], object);
         drop(hit);
         assert_eq!(builds.load(Ordering::SeqCst), 1);
+
+        let interrupted_hit = match load_or_build_scheduler_workspace_artifacts_at_root(
+            root.path(),
+            0x51ceda7a,
+            &packages,
+            "cargo ktstr test",
+            || Ok(true),
+            || true,
+            || -> Result<BTreeMap<String, crate::cache::PinnedContentFile>, String> {
+                panic!("cancellation before a warm hit must not invoke the builder")
+            },
+        ) {
+            Ok(_) => panic!("cancellation must be checked before accepting a warm cache hit"),
+            Err(error) => error,
+        };
+        assert!(
+            interrupted_hit.contains("cache operation interrupted"),
+            "unexpected warm-hit cancellation error: {interrupted_hit}",
+        );
 
         let (record, _, _) = scheduler_build_cache_paths(root.path(), 0x51ceda7a);
         std::fs::remove_file(&record).expect("remove immutable cache record");

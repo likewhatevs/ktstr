@@ -22,8 +22,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ09");
-const VERSION: u32 = 9;
+const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ10");
+const VERSION: u32 = 10;
 const HEADER_FIXED: usize = 256;
 const HEADER_ALIGN: usize = 4096;
 const RECORD_FIXED: usize = 128;
@@ -32,8 +32,8 @@ const RECORDS_PER_CHUNK: usize = 64;
 const NONE_SLOT: u64 = u64::MAX;
 const MAX_RESOURCE_BITS: usize = 1 << 20;
 const MAX_REGISTRY_SLOTS: u64 = 1 << 16;
-const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v9-init-";
-const LIVENESS_PREFIX: &str = "ktstr-acquire-v9-slot-";
+const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v10-init-";
+const LIVENESS_PREFIX: &str = "ktstr-acquire-v10-slot-";
 const LIVENESS_SEPARATOR: &str = "-ticket-";
 const LIVENESS_SUFFIX: &str = ".live";
 
@@ -752,7 +752,7 @@ impl Ticket {
         if initial_state == STATE_WAITING {
             table.elect_coordinator_in_transaction()?;
         }
-        table.finish_transaction();
+        table.finish_transaction()?;
         let wake = table.map_futex(slot)?;
         drop(table);
         drop(_lock);
@@ -1120,7 +1120,7 @@ impl Ticket {
                 table.bump_generation()?;
             }
             if return_to_waiting || released_acquired {
-                table.finish_transaction();
+                table.finish_transaction()?;
             }
             // Keep the resource unavailable across the registry unlock, then
             // release the stale physical payload before publishing the wake.
@@ -1194,7 +1194,7 @@ impl Ticket {
             table.set_record_issue_serial(self.slot, current_watch_serial)?;
             table.set_pending_flag(PENDING_RESCAN);
             table.elect_coordinator_in_transaction()?;
-            table.finish_transaction();
+            table.finish_transaction()?;
         }
         table.bump_generation()?;
         drop(table);
@@ -1294,7 +1294,7 @@ impl Ticket {
             table.apply_possible_release(&release_plan)?;
             table.mark_blockers_unknown(contention)?;
             table.bump_generation()?;
-            table.finish_transaction();
+            table.finish_transaction()?;
         }
         let should_scan = table.pending_flags() & PENDING_RESCAN != 0;
         let (watch, coordinator_prefix_changed) = if should_scan {
@@ -1532,7 +1532,7 @@ impl Ticket {
         let planner_serial_before = table.max_planner_watch_serial(&record.watch, &record.claim)?;
         table.begin_transaction()?;
         table.apply_observation(request, observation)?;
-        table.finish_transaction();
+        table.finish_transaction()?;
         let planner_serial_after = table.max_planner_watch_serial(&record.watch, &record.claim)?;
         // Keep the registry EX fence while dropping proof flocks, then grant
         // from the state they proved. A split release/reacquire lets a fast SH
@@ -1655,7 +1655,7 @@ impl Ticket {
                 table.begin_transaction()?;
                 table.mark_blockers_unknown(contention)?;
                 table.bump_generation()?;
-                table.finish_transaction();
+                table.finish_transaction()?;
             }
             drop(table);
             drop(_lock);
@@ -2287,6 +2287,61 @@ pub(super) fn expire_coordinator_lease_for_tests() -> Result<()> {
 }
 
 #[cfg(test)]
+pub(super) fn exercise_clean_coordinator_mismatch_recovery_for_tests() -> Result<()> {
+    let first_claim = ClaimSet::with_modes(
+        std::iter::empty(),
+        [1usize],
+        FlockMode::Exclusive,
+        FlockMode::Exclusive,
+    );
+    let first = Ticket::register(first_claim.clone(), first_claim, None)?;
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.repair_consistency_if_needed()?;
+        let slot = table.coordinator_slot()?;
+        anyhow::ensure!(
+            table.coordinator_ticket() == first.ticket && slot == first.slot,
+            "test setup did not elect the first ticket"
+        );
+        // Model the observed CI image: the transaction marker is clean, but
+        // the header still names a record whose state no longer grants the
+        // coordinator license.
+        table.set_record_state(slot, STATE_WAITING)?;
+        atomic_u64(&table.header, H_AGGREGATE_DIRTY).store(0, Ordering::SeqCst);
+    }
+
+    let second_claim = ClaimSet::with_modes(
+        std::iter::empty(),
+        [2usize],
+        FlockMode::Exclusive,
+        FlockMode::Exclusive,
+    );
+    let second = Ticket::register(second_claim.clone(), second_claim, None)?;
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let coordinator = table.coordinator_ticket();
+        let slot = table.coordinator_slot()?;
+        let record = table
+            .record(slot)?
+            .filter(|record| record.ticket == coordinator && record.state == STATE_COORDINATOR)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "coordinator recovery left ticket={coordinator}, slot={slot} incoherent"
+                )
+            })?;
+        anyhow::ensure!(
+            record.ticket == first.ticket,
+            "record repair unexpectedly replaced the live first coordinator"
+        );
+    }
+    drop(second);
+    drop(first);
+    Ok(())
+}
+
+#[cfg(test)]
 pub(super) fn churn_registry_generation_for_tests(rounds: usize) -> Result<()> {
     let _lock = lock_registry_existing(FlockMode::Exclusive)?;
     let mut table = Table::open_existing()?;
@@ -2476,7 +2531,7 @@ pub(super) fn exercise_granted_only_drain_election_reads_for_tests(
         for ticket in &tickets {
             table.set_record_state(ticket.slot, STATE_GRANTED)?;
         }
-        table.finish_transaction();
+        table.finish_transaction()?;
     }
 
     let reads_before = COORDINATOR_ELECTION_RECORD_READS.with(std::cell::Cell::get);
@@ -2721,7 +2776,7 @@ pub(super) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64,
         mode: FlockMode::Exclusive,
     })?;
     table.set_pending_flag(PENDING_RESCAN);
-    table.finish_transaction();
+    table.finish_transaction()?;
     table.grant_compatible()?;
     if table
         .record(shared.slot)?
@@ -2813,7 +2868,7 @@ pub(super) fn exercise_cpu_ex_contention_shared_wake_for_tests() -> Result<CpuEx
         mode: FlockMode::Exclusive,
     })?;
     table.set_pending_flag(PENDING_RESCAN);
-    table.finish_transaction();
+    table.finish_transaction()?;
     table.grant_compatible()?;
     if table
         .record(shared.slot)?
@@ -4242,7 +4297,7 @@ fn required_resource_bits(claim: &ClaimSet) -> usize {
         .max()
         .unwrap_or(0)
         .saturating_add(1);
-    // The v9 mapping is deliberately overprovisioned once. It never needs a
+    // The v10 mapping is deliberately overprovisioned once. It never needs a
     // migration/grow protocol when the first low-index ticket is followed by a
     // valid sparse CPU/LLC index on the same host.
     claim_bits.max(host_cpu_resource_bits()).max(4096)
@@ -4283,11 +4338,11 @@ fn notify_path() -> PathBuf {
 }
 
 fn registry_data_dir() -> PathBuf {
-    protocol_dir().join("ktstr-acquire-registry-v9")
+    protocol_dir().join("ktstr-acquire-registry-v10")
 }
 
 pub(super) fn event_dir() -> PathBuf {
-    protocol_dir().join("ktstr-acquire-events-v9")
+    protocol_dir().join("ktstr-acquire-events-v10")
 }
 
 pub(super) fn notify_basename() -> Result<std::ffi::OsString> {
@@ -4491,7 +4546,7 @@ fn publish_acquired_in_table(table: &mut Table, claim: &ClaimSet) -> Result<Held
     );
     table.mark_claim_changed(ticket)?;
     table.bump_generation()?;
-    table.finish_transaction();
+    table.finish_transaction()?;
     Ok(HeldClaim {
         slot,
         ticket,
@@ -5382,7 +5437,7 @@ impl Table {
             blocked,
             persist_blocker,
         )?;
-        self.finish_transaction();
+        self.finish_transaction()?;
         Ok(())
     }
 
@@ -5524,7 +5579,7 @@ impl Table {
             self.elect_coordinator_in_transaction()?;
         }
         self.bump_generation()?;
-        self.finish_transaction();
+        self.finish_transaction()?;
         Ok(())
     }
 
@@ -5545,7 +5600,7 @@ impl Table {
         if !acquired {
             self.set_pending_flag(PENDING_RESCAN);
         }
-        self.finish_transaction();
+        self.finish_transaction()?;
         Ok(())
     }
 
@@ -5922,7 +5977,7 @@ impl Table {
         crash_at_for_tests("remove_record_before_election");
         self.elect_coordinator_in_transaction()?;
         self.bump_generation()?;
-        self.finish_transaction();
+        self.finish_transaction()?;
         for record in dead {
             let _ = std::fs::remove_file(liveness_path(record.slot, record.ticket));
         }
@@ -5956,7 +6011,7 @@ impl Table {
         }
         self.elect_coordinator_in_transaction()?;
         self.bump_generation()?;
-        self.finish_transaction();
+        self.finish_transaction()?;
         for record in dead {
             let _ = std::fs::remove_file(liveness_path(record.slot, record.ticket));
         }
@@ -5964,8 +6019,8 @@ impl Table {
     }
 
     fn recover_coordinator_if_dead(&mut self) -> Result<()> {
-        let coordinator = self.coordinator_ticket();
-        let slot = self.coordinator_slot()?;
+        let mut coordinator = self.coordinator_ticket();
+        let mut slot = self.coordinator_slot()?;
         if coordinator == 0 {
             let head = read_u64(&self.header, H_ACTIVE_HEAD);
             if head != NONE_SLOT
@@ -5981,15 +6036,31 @@ impl Table {
             // contains no work that an election scan could discover.
             return Ok(());
         }
-        let record = self
+        let mut record = self
             .record(slot)?
-            .filter(|record| record.ticket == coordinator && record.state == STATE_COORDINATOR)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "queue registry v{VERSION} coordinator header ticket={coordinator}, \
+            .filter(|record| record.ticket == coordinator && record.state == STATE_COORDINATOR);
+        if record.is_none() {
+            // The record table is authoritative. A clean header/record
+            // mismatch must not permanently poison admission, so defensively
+            // rebuild the active/free lists, aggregates, coordinator header,
+            // and record states together. Current v10 publication validates
+            // this pair before clearing the dirty bit.
+            self.repair_consistency()?;
+            coordinator = self.coordinator_ticket();
+            slot = self.coordinator_slot()?;
+            if coordinator == 0 {
+                return Ok(());
+            }
+            record = self
+                .record(slot)?
+                .filter(|record| record.ticket == coordinator && record.state == STATE_COORDINATOR);
+        }
+        let record = record.ok_or_else(|| {
+            anyhow::anyhow!(
+                "queue registry v{VERSION} coordinator header ticket={coordinator}, \
                      slot={slot} does not name its coordinator record"
-                )
-            })?;
+            )
+        })?;
         if !ticket_is_live(slot, coordinator)? {
             // Coordinator death commonly accompanies a cancelled job with a
             // dead prefix. This is a rare recovery scan: batch every dead
@@ -6035,7 +6106,7 @@ impl Table {
             })
             .ok_or_else(|| anyhow::anyhow!("queue takeover successor changed during recovery"))?;
         if coordinator_activity_is_fresh(&self.header, monotonic_now_ns()?) {
-            self.finish_transaction();
+            self.finish_transaction()?;
             return Ok(());
         }
         self.set_record_state(current.slot, STATE_COORDINATOR_STANDBY)?;
@@ -6046,7 +6117,7 @@ impl Table {
         self.bump_generation()?;
         self.wake_slot(current.slot)?;
         self.wake_slot(successor.slot)?;
-        self.finish_transaction();
+        self.finish_transaction()?;
         Ok(())
     }
 
@@ -6056,7 +6127,7 @@ impl Table {
         }
         self.begin_transaction()?;
         self.elect_coordinator_in_transaction()?;
-        self.finish_transaction();
+        self.finish_transaction()?;
         Ok(())
     }
 
@@ -6100,8 +6171,26 @@ impl Table {
         Ok(())
     }
 
-    fn finish_transaction(&mut self) {
+    fn finish_transaction(&mut self) -> Result<()> {
+        let coordinator = self.coordinator_ticket();
+        let slot = self.coordinator_slot()?;
+        if coordinator == 0 {
+            anyhow::ensure!(
+                slot == NONE_SLOT,
+                "queue registry v{VERSION} cannot publish an empty coordinator ticket with slot {slot}"
+            );
+        } else {
+            let record = self.record(slot)?;
+            anyhow::ensure!(
+                record.as_ref().is_some_and(|record| {
+                    record.ticket == coordinator && record.state == STATE_COORDINATOR
+                }),
+                "queue registry v{VERSION} cannot publish coordinator header ticket={coordinator}, \
+                 slot={slot} without its coordinator record"
+            );
+        }
         atomic_u64(&self.header, H_AGGREGATE_DIRTY).store(0, Ordering::SeqCst);
+        Ok(())
     }
 
     fn bitmap_bit(&self, which: usize, index: usize) -> Result<bool> {

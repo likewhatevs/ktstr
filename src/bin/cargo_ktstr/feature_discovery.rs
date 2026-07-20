@@ -306,13 +306,12 @@ fn rebase_config_value(value: &str, invocation_dir: Option<&Path>) -> String {
     }
 }
 
-/// Rebase scalar Cargo config values whose schema defines a filesystem path.
+/// Decode one scalar Cargo config value whose schema defines a filesystem path.
 ///
-/// `--config KEY=VALUE` resolves relative paths against Cargo's current
-/// directory. Scheduler discovery/build changes that directory, so the common
-/// path-bearing keys (especially `[patch].*.path`) need the same treatment as
-/// a `--config path.toml` argument. Bare executable names remain PATH lookups.
-fn rebase_inline_config_path(value: &str, invocation_dir: &Path) -> Option<String> {
+/// This is shared with the scheduler-build cache planner so a path rebased for
+/// Cargo execution can be represented by its semantic contents instead of its
+/// checkout-specific absolute spelling.
+pub(crate) fn cargo_inline_config_path(value: &str) -> Option<(&str, String)> {
     let (key, raw_value) = value.split_once('=')?;
     let key = key.trim();
     let raw_value = raw_value.trim();
@@ -337,11 +336,18 @@ fn rebase_inline_config_path(value: &str, invocation_dir: &Path) -> Option<Strin
             | "doc.browser"
     ) || key.ends_with(".linker")
         || key.ends_with(".runner");
-    if !non_executable_path
-        && !(executable_path && (decoded.contains('/') || decoded.contains('\\')))
-    {
-        return None;
-    }
+    (non_executable_path || (executable_path && (decoded.contains('/') || decoded.contains('\\'))))
+        .then_some((key, decoded))
+}
+
+/// Rebase scalar Cargo config values whose schema defines a filesystem path.
+///
+/// `--config KEY=VALUE` resolves relative paths against Cargo's current
+/// directory. Scheduler discovery/build changes that directory, so the common
+/// path-bearing keys (especially `[patch].*.path`) need the same treatment as
+/// a `--config path.toml` argument. Bare executable names remain PATH lookups.
+fn rebase_inline_config_path(value: &str, invocation_dir: &Path) -> Option<String> {
+    let (key, decoded) = cargo_inline_config_path(value)?;
     let rebased = rebase_path(&decoded, invocation_dir);
     Some(format!(
         "{key}={}",

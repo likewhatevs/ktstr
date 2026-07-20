@@ -600,8 +600,8 @@ fn uncontended_fast_fence_does_not_create_registry_metadata() {
     let protocol_dir = std::path::Path::new(&cpu_path)
         .parent()
         .expect("resource lock parent");
-    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v9");
-    let event_dir = protocol_dir.join("ktstr-acquire-events-v9");
+    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v10");
+    let event_dir = protocol_dir.join("ktstr-acquire-events-v10");
     assert!(!registry_dir.exists());
     assert!(!event_dir.exists());
 
@@ -4446,7 +4446,7 @@ fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
     let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .expect("re-block waiter after epoch transition");
-    // Leave the replacement as an external, unregistered flock. A current-v9
+    // Leave the replacement as an external, unregistered flock. A current-v10
     // HELD publication would authoritatively revoke the in-flight grant before
     // its callback returned, bypassing the stale-negative-evidence path this
     // test is meant to pin.
@@ -4694,7 +4694,7 @@ fn remove_crash_after_counts_before_free_is_repaired() {
     let markers = tempfile::TempDir::new().expect("marker dir");
     let removing =
         TicketChild::spawn_crashing(markers.path(), "removing", "1", "remove_counts_before_free");
-    // The v9 HELD lifecycle removes its registry record only after the
+    // The v10 HELD lifecycle removes its registry record only after the
     // physical reservation is released. Let the helper pass its normal
     // release barrier so the injected crash observes that production ordering.
     std::fs::write(&removing.release, b"release").expect("release crash-test reservation");
@@ -4836,6 +4836,13 @@ fn election_crash_after_header_publish_is_repaired_by_the_next_waiter() {
             .is_empty(),
         "recovery must prune both crashed tickets and recycle their slots",
     );
+}
+
+#[test]
+fn clean_coordinator_header_mismatch_is_repaired_by_the_next_registrant() {
+    let _prefixes = LockPrefixesGuard::new();
+    protocol::exercise_clean_coordinator_mismatch_recovery_for_tests()
+        .expect("repair a clean coordinator header/record mismatch");
 }
 
 #[test]
