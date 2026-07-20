@@ -93,8 +93,8 @@ const SMALL_RESPONSE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Return the process-wide shared [`reqwest::blocking::Client`]. First
 /// call constructs it via `Client::builder()` with
-/// [`SHARED_CLIENT_CONNECT_TIMEOUT`] and
-/// [`SMALL_RESPONSE_REQUEST_TIMEOUT`] applied; every subsequent call returns
+/// `SHARED_CLIENT_CONNECT_TIMEOUT` and
+/// `SMALL_RESPONSE_REQUEST_TIMEOUT` applied; every subsequent call returns
 /// a reference to the same instance. This helper is for top-level CLI entries
 /// that want the default client.
 ///
