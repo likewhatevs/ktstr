@@ -1107,14 +1107,23 @@ fn discover_tracks_self_and_peer_exclusive_llc_holds_separately_from_occupancy()
     let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let snapshots = loop {
+        // This assertion needs only compatibility and occupancy, not holder
+        // cmdlines. More importantly, /proc/locks is a live seq-file rather
+        // than an atomic snapshot: under a lock storm one traversal can
+        // observe the newly spawned peer while momentarily skipping another
+        // stable entry. Accept only an image containing both facts that the
+        // test is about instead of breaking on the first half-image.
         let snapshots =
-            discover_llc_snapshots(&topo, &allowed, &mountinfo).expect("discover EX holders");
-        if snapshots
+            discover_llc_snapshot_counts(&topo, &allowed, &mountinfo).expect("discover EX holders");
+        let self_seen = snapshots
+            .iter()
+            .find(|snapshot| snapshot.llc_idx == 0)
+            .is_some_and(|snapshot| snapshot.exclusive_held && snapshot.holder_count == 0);
+        let peer_seen = snapshots
             .iter()
             .find(|snapshot| snapshot.llc_idx == 1)
-            .is_some_and(|snapshot| snapshot.exclusive_held && snapshot.holder_count == 1)
-            || std::time::Instant::now() >= deadline
-        {
+            .is_some_and(|snapshot| snapshot.exclusive_held && snapshot.holder_count == 1);
+        if (self_seen && peer_seen) || std::time::Instant::now() >= deadline {
             break snapshots;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1863,28 +1872,25 @@ fn elastic_build_wait_replans_to_largest_partial_release() {
             .expect("reserve exact-holder CPU");
         exact_holders.push((llc, cpu));
     }
-    let released = exact_holders.split_off(2);
+    let mut released = Some(exact_holders.split_off(2));
     let retained = exact_holders;
-    let (finish_tx, finish_rx) = std::sync::mpsc::channel();
-    let releaser = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        drop(released);
-        // A generous fail-safe turns a missed wake into a deterministic
-        // assertion failure rather than hanging the entire test binary.
-        let _ = finish_rx.recv_timeout(std::time::Duration::from_secs(5));
-        drop(retained);
-    });
-
-    let started = std::time::Instant::now();
     let proc_reads_before = crate::flock::proc_locks::proc_locks_read_count_for_tests();
-    let plan =
-        acquire_elastic_build_llc_plan(&topo, &test_topo, Some(CpuCap::new(3).unwrap()), None)
-            .expect("the two-CPU release must satisfy an elastic build");
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < std::time::Duration::from_secs(5),
-        "the build waited for the fixed maximum instead of taking the partial release: {elapsed:?}",
-    );
+    let plan = acquire_elastic_build_llc_plan_with_coordinator_step_hook(
+        &topo,
+        &test_topo,
+        Some(CpuCap::new(3).unwrap()),
+        None,
+        || {
+            // Release exactly two CPUs only after the waiter has crossed
+            // registration and is executing its first coordinator replan.
+            // This replaces both the guessed 250 ms startup delay and the
+            // five-second "drop everything" escape hatch: success while
+            // `retained` is still live proves the partial release itself
+            // satisfied the elastic request.
+            drop(released.take());
+        },
+    )
+    .expect("the two-CPU release must satisfy an elastic build");
     assert_eq!(plan.locked_llcs, vec![2, 3]);
     assert_eq!(plan.cpus, vec![2, 3]);
     assert_eq!(make_jobs_for_plan(&plan), 2);
@@ -1895,10 +1901,7 @@ fn elastic_build_wait_replans_to_largest_partial_release() {
     );
 
     drop(plan);
-    let _ = finish_tx.send(());
-    releaser
-        .join()
-        .expect("exact-holder releaser must not panic");
+    drop(retained);
 }
 
 /// `no_perf_cpu_budget` sizes a no-perf VM to its EXACT vCPU count

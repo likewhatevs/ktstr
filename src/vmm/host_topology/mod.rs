@@ -3182,6 +3182,7 @@ fn acquire_llc_plan_impl(
             cancelled,
         },
         try_acquire_llc_plan_locks_with_evidence,
+        || {},
     )
 }
 
@@ -3293,16 +3294,45 @@ where
             cancelled,
         },
         acquire_fn,
+        || {},
     )
 }
 
-fn acquire_llc_plan_with_acquire_fn_impl<F, A>(
+/// Test-only elastic entry point with an event hook at the first coordinator
+/// replan. This lets lock-release tests drive the real wait path from protocol
+/// state rather than guessing wall-clock sleeps.
+#[cfg(test)]
+fn acquire_elastic_build_llc_plan_with_coordinator_step_hook(
+    topo: &HostTopology,
+    test_topo: &crate::topology::TestTopology,
+    cpu_cap: Option<CpuCap>,
+    cancelled: Option<&AtomicBool>,
+    on_coordinator_step: impl FnMut(),
+) -> Result<LlcPlan> {
+    acquire_llc_plan_with_acquire_fn_impl(
+        LlcPlanAcquireRequest {
+            topo,
+            test_topo,
+            cpu_cap,
+            policy: PlacementPolicy::Consolidate,
+            wait: true,
+            sizing: LlcPlanSizing::Elastic,
+            cancelled,
+        },
+        try_acquire_llc_plan_locks_with_evidence,
+        on_coordinator_step,
+    )
+}
+
+fn acquire_llc_plan_with_acquire_fn_impl<F, A, C>(
     request: LlcPlanAcquireRequest<'_>,
     mut acquire_fn: F,
+    mut on_coordinator_step: C,
 ) -> Result<LlcPlan>
 where
     F: FnMut(&[usize], &[usize], &[LlcSnapshot]) -> Result<A>,
     A: IntoLlcLockAttempt,
+    C: FnMut(),
 {
     let LlcPlanAcquireRequest {
         topo,
@@ -3861,6 +3891,7 @@ where
     };
     let mut coordinator_claim = coordinator_seed_claim;
     let step = |held: &mut protocol::HeldLocks| {
+        on_coordinator_step();
         // RE-PLAN against live holder state on every wake — plans are
         // never cached across waits. The freed capacity may satisfy a
         // different selection than the one that was busy last wake.

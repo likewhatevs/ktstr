@@ -2113,8 +2113,14 @@ fn uninitialized_epoch_herd_elects_one_ex_initializer() {
                 std::time::Duration::from_secs(2),
             )
             .expect("same-epoch startup writer");
-            tx.send(mode).expect("report publication mode");
+            // Release the elected initializer before doing even the
+            // bookkeeping needed to report its mode. Under an oversubscribed
+            // test storm the thread can be descheduled at any instruction;
+            // retaining EX across the channel send turns scheduler delay
+            // after successful initialization into false SH timeouts in all
+            // peers.
             drop(guard);
+            tx.send(mode).expect("report publication mode");
         }));
     }
     drop(tx);
