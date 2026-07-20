@@ -78,26 +78,34 @@ const STARTUP_TEST_OBSERVATION_BACKSTOP: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const STARTUP_TEST_PROMPT_BACKSTOP: Duration = Duration::from_secs(5);
 #[cfg(not(test))]
-const STARTUP_READY_BACKSTOP: Duration = Duration::from_secs(30);
+const STARTUP_READY_SERVICE_BACKSTOP: Duration = Duration::from_secs(30);
 #[cfg(test)]
-const STARTUP_READY_BACKSTOP: Duration = STARTUP_TEST_OBSERVATION_BACKSTOP;
+const STARTUP_READY_SERVICE_BACKSTOP: Duration = Duration::from_millis(500);
 #[cfg(not(test))]
-const STARTUP_REAP_BACKSTOP: Duration = Duration::from_secs(30);
+const STARTUP_REAP_SERVICE_BACKSTOP: Duration = Duration::from_secs(30);
 #[cfg(test)]
-const STARTUP_REAP_BACKSTOP: Duration = STARTUP_TEST_OBSERVATION_BACKSTOP;
+const STARTUP_REAP_SERVICE_BACKSTOP: Duration = Duration::from_millis(500);
 #[cfg(not(test))]
-const STARTUP_COMMIT_BACKSTOP: Duration = Duration::from_secs(30);
+const STARTUP_COMMIT_SERVICE_BACKSTOP: Duration = Duration::from_secs(30);
 #[cfg(test)]
-const STARTUP_COMMIT_BACKSTOP: Duration = STARTUP_TEST_OBSERVATION_BACKSTOP;
+const STARTUP_COMMIT_SERVICE_BACKSTOP: Duration = Duration::from_millis(500);
+/// Absolute backstop for a startup participant which receives no measurable
+/// CPU service at all. Ordinary protocol deadlines are charged to delivered
+/// task service; this exists only to keep a stopped/uninterruptible process
+/// from making startup ownership wait forever.
+#[cfg(not(test))]
+const STARTUP_STARVATION_BACKSTOP: Duration = Duration::from_secs(5 * 60);
+#[cfg(test)]
+const STARTUP_STARVATION_BACKSTOP: Duration = STARTUP_TEST_OBSERVATION_BACKSTOP;
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const STARTUP_SIGNAL_READY_GRACE: Duration = Duration::from_secs(1);
 
 /// Post-leader CPU service a residual owned subtree may consume before it is
 /// conclusively a leak. Host descheduling consumes no budget.
 #[cfg(not(test))]
-const GROUP_TAIL_SERVICE_BUDGET_NS: u128 = 2_000_000_000;
+const GROUP_TAIL_SERVICE_BUDGET: Duration = Duration::from_secs(2);
 #[cfg(test)]
-const GROUP_TAIL_SERVICE_BUDGET_NS: u128 = 500_000_000;
+const GROUP_TAIL_SERVICE_BUDGET: Duration = Duration::from_millis(500);
 
 /// Absolute starvation backstop for a residual owned subtree.
 #[cfg(not(test))]
@@ -1045,7 +1053,7 @@ fn startup_test_checkpoint_if(mode: &str, phase: &str, wait_for_release: bool) -
         return Ok(());
     }
     let release = startup_test_checkpoint_path(phase, "release")?;
-    let deadline = Instant::now() + STARTUP_READY_BACKSTOP;
+    let deadline = Instant::now() + STARTUP_TEST_OBSERVATION_BACKSTOP;
     while !release.exists() {
         if Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -1238,17 +1246,17 @@ fn initialize_startup_worker_signal_state() -> io::Result<()> {
 }
 
 fn startup_wait_child_bounded(child: &mut Child, timeout: Duration) -> io::Result<ExitStatus> {
-    let deadline = Instant::now() + timeout;
+    let child_pid = libc::pid_t::try_from(child.id())
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| io::Error::other("startup supervisor has an invalid pid"))?;
+    let own_pid = unsafe { libc::getpid() };
+    let mut budget = StartupServiceBudget::exact(&[own_pid, child_pid], timeout)?;
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
         }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("startup supervisor {} did not exit", child.id()),
-            ));
-        }
+        budget.check("startup supervisor exit")?;
         std::thread::sleep(STARTUP_POLL_INTERVAL);
     }
 }
@@ -1288,7 +1296,7 @@ fn startup_launcher_fail(
     // until its descendant closure has been drained.
     drop(owner);
     if let Some(child) = supervisor.as_mut() {
-        let _ = startup_wait_child_bounded(child, STARTUP_REAP_BACKSTOP);
+        let _ = startup_wait_child_bounded(child, STARTUP_REAP_SERVICE_BACKSTOP);
     }
     let caught = signals.restore().unwrap_or(None);
     eprintln!("cargo ktstr fatal: startup supervision failed: {error}");
@@ -1302,9 +1310,12 @@ fn startup_launcher_read_ready(
     report: &OwnedFd,
     token: &[u8; STARTUP_TOKEN_BYTES],
     buffer: &mut Vec<u8>,
+    supervisor_pid: libc::pid_t,
 ) -> io::Result<()> {
     let wanted = prefixed_token_frame(STARTUP_REPORT_READY_MAGIC, token);
-    let ready_deadline = Instant::now() + STARTUP_READY_BACKSTOP;
+    let own_pid = unsafe { libc::getpid() };
+    let mut budget =
+        StartupServiceBudget::exact(&[own_pid, supervisor_pid], STARTUP_READY_SERVICE_BACKSTOP)?;
     let mut signal_deadline = None;
     loop {
         let eof = drain_startup_read(report.as_raw_fd(), buffer)?;
@@ -1328,21 +1339,15 @@ fn startup_launcher_read_ready(
                 ));
             }
         }
-        if now >= ready_deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "startup supervisor did not become ready before its bounded protocol deadline",
-            ));
-        }
+        budget.check("startup supervisor readiness")?;
         let mut pollfd = [libc::pollfd {
             fd: report.as_raw_fd(),
             events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
             revents: 0,
         }];
-        let poll_deadline =
-            signal_deadline.map_or(ready_deadline, |deadline| deadline.min(ready_deadline));
-        let wait = poll_deadline
-            .saturating_duration_since(now)
+        let wait = signal_deadline
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .unwrap_or(STARTUP_POLL_INTERVAL)
             .min(STARTUP_POLL_INTERVAL);
         poll_startup_fds(&mut pollfd, wait)?;
     }
@@ -1465,7 +1470,7 @@ fn startup_launcher_main() -> ! {
     }
 
     let mut report = Vec::new();
-    if let Err(error) = startup_launcher_read_ready(&report_read, &token, &mut report) {
+    if let Err(error) = startup_launcher_read_ready(&report_read, &token, &mut report, pgid) {
         startup_launcher_fail(signals, Some(owner_write), Some(&mut supervisor), error);
     }
     // Keep the handler in SPAWNING through authenticated worker readiness.
@@ -1496,13 +1501,13 @@ fn startup_launcher_main() -> ! {
     if let Err(error) = signals.hide(pgid) {
         startup_launcher_fail(signals, Some(owner_write), Some(&mut supervisor), error);
     }
-    let supervisor_status = match startup_wait_child_bounded(&mut supervisor, STARTUP_REAP_BACKSTOP)
-    {
-        Ok(status) => status,
-        Err(error) => {
-            startup_launcher_fail(signals, Some(owner_write), None, error);
-        }
-    };
+    let supervisor_status =
+        match startup_wait_child_bounded(&mut supervisor, STARTUP_REAP_SERVICE_BACKSTOP) {
+            Ok(status) => status,
+            Err(error) => {
+                startup_launcher_fail(signals, Some(owner_write), None, error);
+            }
+        };
     if supervisor_status.into_raw() != raw {
         startup_launcher_fail(
             signals,
@@ -1667,7 +1672,8 @@ fn startup_kill_and_reap_descendants(
     worker_pid: libc::pid_t,
     worker_status: &mut Option<libc::c_int>,
 ) -> io::Result<libc::c_int> {
-    let mut deadline = Instant::now() + STARTUP_REAP_BACKSTOP;
+    let own_pid = unsafe { libc::getpid() };
+    let mut budget = StartupServiceBudget::tree(own_pid, STARTUP_REAP_SERVICE_BACKSTOP)?;
     loop {
         if startup_reap_nonblocking(worker_pid, worker_status)? {
             return (*worker_status).ok_or_else(|| {
@@ -1677,11 +1683,10 @@ fn startup_kill_and_reap_descendants(
         for pid in startup_direct_children()? {
             startup_kill_direct_child(pid)?;
         }
-        if Instant::now() >= deadline {
-            let _ = std::io::stderr().write_all(
-                b"cargo ktstr fatal: startup descendant cleanup exceeded its reap backstop; continuing fail-closed drain\n",
-            );
-            deadline = Instant::now() + STARTUP_REAP_BACKSTOP;
+        if let Err(error) = budget.check("startup descendant cleanup") {
+            let diagnostic = format!("cargo ktstr fatal: {error}; continuing fail-closed drain\n");
+            let _ = std::io::stderr().write_all(diagnostic.as_bytes());
+            budget = StartupServiceBudget::tree(own_pid, STARTUP_REAP_SERVICE_BACKSTOP)?;
         }
         std::thread::sleep(STARTUP_POLL_INTERVAL);
     }
@@ -1922,10 +1927,16 @@ impl Drop for StartupSubtreeOwner {
     }
 }
 
-fn startup_wait_owner_hello(owner: &OwnedFd, token: &[u8; STARTUP_TOKEN_BYTES]) -> io::Result<()> {
+fn startup_wait_owner_hello(
+    owner: &OwnedFd,
+    token: &[u8; STARTUP_TOKEN_BYTES],
+    owner_pid: libc::pid_t,
+) -> io::Result<()> {
     set_nonblocking(owner.as_raw_fd())?;
     let wanted = prefixed_token_frame(STARTUP_OWNER_HELLO_MAGIC, token);
-    let deadline = Instant::now() + STARTUP_READY_BACKSTOP;
+    let own_pid = unsafe { libc::getpid() };
+    let mut budget =
+        StartupServiceBudget::exact(&[owner_pid, own_pid], STARTUP_READY_SERVICE_BACKSTOP)?;
     let mut buffer = Vec::new();
     loop {
         let eof = drain_startup_read(owner.as_raw_fd(), &mut buffer)?;
@@ -1944,12 +1955,7 @@ fn startup_wait_owner_hello(owner: &OwnedFd, token: &[u8; STARTUP_TOKEN_BYTES]) 
                 "startup owner disappeared before authentication",
             ));
         }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "startup owner did not authenticate",
-            ));
-        }
+        budget.check("startup owner authentication")?;
         let mut pollfd = [libc::pollfd {
             fd: owner.as_raw_fd(),
             events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
@@ -1963,11 +1969,14 @@ fn startup_wait_owner_ack(
     owner: &OwnedFd,
     buffer: &mut Vec<u8>,
     raw: libc::c_int,
+    owner_pid: libc::pid_t,
 ) -> io::Result<()> {
     let mut wanted = [0_u8; 12];
     wanted[..8].copy_from_slice(STARTUP_OWNER_ACK_MAGIC);
     wanted[8..].copy_from_slice(&raw.to_be_bytes());
-    let deadline = Instant::now() + STARTUP_COMMIT_BACKSTOP;
+    let own_pid = unsafe { libc::getpid() };
+    let mut budget =
+        StartupServiceBudget::exact(&[owner_pid, own_pid], STARTUP_COMMIT_SERVICE_BACKSTOP)?;
     loop {
         let eof = drain_startup_read(owner.as_raw_fd(), buffer)?;
         if eof {
@@ -1985,12 +1994,7 @@ fn startup_wait_owner_ack(
             }
             return Ok(());
         }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "startup owner did not acknowledge worker status",
-            ));
-        }
+        budget.check("startup owner status acknowledgement")?;
         let mut pollfd = [libc::pollfd {
             fd: owner.as_raw_fd(),
             events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
@@ -2064,7 +2068,7 @@ fn startup_supervisor_inner() -> io::Result<libc::c_int> {
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    startup_wait_owner_hello(&owner, &token)?;
+    startup_wait_owner_hello(&owner, &token, declared_parent)?;
 
     let own_pid = unsafe { libc::getpid() };
     #[cfg(test)]
@@ -2080,8 +2084,11 @@ fn startup_supervisor_inner() -> io::Result<libc::c_int> {
     let mut ready_reported = false;
     let mut clean_code = None::<u8>;
     let mut worker_eof = false;
-    let ready_deadline = Instant::now() + STARTUP_READY_BACKSTOP;
-    let mut clean_deadline = None::<Instant>;
+    let mut ready_budget = StartupServiceBudget::exact(
+        &[declared_parent, own_pid, worker_pid],
+        STARTUP_READY_SERVICE_BACKSTOP,
+    )?;
+    let mut clean_budget = None::<StartupServiceBudget>;
 
     loop {
         let owner_eof = drain_startup_read(owner.as_raw_fd(), &mut owner_buffer)?;
@@ -2153,7 +2160,10 @@ fn startup_supervisor_inner() -> io::Result<libc::c_int> {
                 ));
             }
             clean_code = Some(worker_buffer[8]);
-            clean_deadline = Some(Instant::now() + STARTUP_COMMIT_BACKSTOP);
+            clean_budget = Some(StartupServiceBudget::exact(
+                &[declared_parent, own_pid, worker_pid],
+                STARTUP_COMMIT_SERVICE_BACKSTOP,
+            )?);
             worker_buffer.drain(..9);
         }
         if clean_code.is_some() && !worker_buffer.is_empty() {
@@ -2186,19 +2196,13 @@ fn startup_supervisor_inner() -> io::Result<libc::c_int> {
             }
         }
 
-        if !worker_ready && Instant::now() >= ready_deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "startup worker did not become ready",
-            ));
+        if !worker_ready {
+            ready_budget.check("startup worker readiness")?;
         }
-        if subtree.worker_status.is_none()
-            && clean_deadline.is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "startup worker did not exit after its clean record",
-            ));
+        if subtree.worker_status.is_none() {
+            if let Some(clean_budget) = clean_budget.as_mut() {
+                clean_budget.check("startup worker clean exit")?;
+            }
         }
 
         if let Some(raw) = subtree.worker_status {
@@ -2222,7 +2226,7 @@ fn startup_supervisor_inner() -> io::Result<libc::c_int> {
             status_frame[8..].copy_from_slice(&raw.to_be_bytes());
             write_startup_frame(report.as_raw_fd(), &status_frame)?;
 
-            startup_wait_owner_ack(&owner, &mut owner_buffer, raw)?;
+            startup_wait_owner_ack(&owner, &mut owner_buffer, raw, declared_parent)?;
             subtree.release();
             #[cfg(test)]
             startup_test_checkpoint_if("owner-death-post-ack", "post-ack", true)?;
@@ -3094,6 +3098,150 @@ fn verified_process_children(member: GroupMember) -> io::Result<Vec<libc::pid_t>
     Ok(children)
 }
 
+#[derive(Clone)]
+struct ExactProcessServiceScope {
+    identities: Vec<ProcessIdentity>,
+}
+
+impl ExactProcessServiceScope {
+    fn capture(pids: &[libc::pid_t]) -> io::Result<Self> {
+        let mut identities = Vec::with_capacity(pids.len());
+        for &pid in pids {
+            let member = read_process_stat(pid)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("startup service participant {pid} disappeared"),
+                )
+            })?;
+            if !identities.contains(&member.identity) {
+                identities.push(member.identity);
+            }
+        }
+        Ok(Self { identities })
+    }
+
+    fn members(&self) -> io::Result<Vec<GroupMember>> {
+        let mut members = Vec::with_capacity(self.identities.len());
+        for identity in &self.identities {
+            let Some(member) = read_process_stat(identity.pid)? else {
+                continue;
+            };
+            if member.identity == *identity {
+                members.push(member);
+            }
+        }
+        Ok(members)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProcessTreeServiceScope {
+    root: ProcessIdentity,
+}
+
+impl ProcessTreeServiceScope {
+    fn capture(root_pid: libc::pid_t) -> io::Result<Self> {
+        let root = read_process_stat(root_pid)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "startup service root exited"))?
+            .identity;
+        Ok(Self { root })
+    }
+
+    fn members(&self) -> io::Result<Vec<GroupMember>> {
+        let Some(root) = read_process_stat(self.root.pid)? else {
+            return Ok(Vec::new());
+        };
+        if root.identity != self.root {
+            return Ok(Vec::new());
+        }
+
+        let mut seen = HashSet::from([root.identity]);
+        let mut queue = VecDeque::from([root]);
+        let mut members = Vec::new();
+        while let Some(member) = queue.pop_front() {
+            for child_pid in verified_process_children(member)? {
+                let Some((child, pidfd)) =
+                    open_verified_descendant(child_pid, member.identity.pid)?
+                else {
+                    continue;
+                };
+                drop(pidfd);
+                if seen.insert(child.identity) {
+                    queue.push_back(child);
+                }
+            }
+            members.push(member);
+        }
+        Ok(members)
+    }
+}
+
+enum StartupServiceScope {
+    Exact(ExactProcessServiceScope),
+    Tree(ProcessTreeServiceScope),
+}
+
+impl StartupServiceScope {
+    fn members(&self) -> io::Result<Vec<GroupMember>> {
+        match self {
+            Self::Exact(scope) => scope.members(),
+            Self::Tree(scope) => scope.members(),
+        }
+    }
+}
+
+struct StartupServiceBudget {
+    scope: StartupServiceScope,
+    budget: TaskServiceBudget,
+}
+
+impl StartupServiceBudget {
+    fn exact(pids: &[libc::pid_t], service_budget: Duration) -> io::Result<Self> {
+        let scope = StartupServiceScope::Exact(ExactProcessServiceScope::capture(pids)?);
+        Self::start(scope, service_budget)
+    }
+
+    fn tree(root_pid: libc::pid_t, service_budget: Duration) -> io::Result<Self> {
+        let scope = StartupServiceScope::Tree(ProcessTreeServiceScope::capture(root_pid)?);
+        Self::start(scope, service_budget)
+    }
+
+    fn start(scope: StartupServiceScope, service_budget: Duration) -> io::Result<Self> {
+        let members = scope.members()?;
+        let budget = TaskServiceBudget::start(
+            Instant::now(),
+            &members,
+            service_budget,
+            STARTUP_STARVATION_BACKSTOP,
+        )?;
+        Ok(Self { scope, budget })
+    }
+
+    fn observe(&mut self) -> io::Result<()> {
+        self.budget.observe(&self.scope.members()?);
+        Ok(())
+    }
+
+    fn check(&mut self, phase: &str) -> io::Result<()> {
+        self.observe()?;
+        let now = Instant::now();
+        let cause = if self.budget.service_exhausted() {
+            Some("CPU-service budget")
+        } else if self.budget.wall_exhausted(now) {
+            Some("starvation wall backstop")
+        } else {
+            None
+        };
+        if let Some(cause) = cause {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{phase} exceeded its {cause}"),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Snapshot only descendants of this exact runner.
 ///
 /// The worker is a subreaper for the complete command epoch, so an orphaned
@@ -3149,15 +3297,22 @@ fn snapshot_owned_subtree(group: &GroupChild) -> io::Result<Vec<OwnedProcess>> {
     Ok(members)
 }
 
-struct GroupTailBudget {
+struct TaskServiceBudget {
     started: Instant,
     ticks_per_second: u64,
     prior_ticks: HashMap<ProcessIdentity, u64>,
     delivered_ticks: u128,
+    service_budget_ns: u128,
+    wall_backstop: Duration,
 }
 
-impl GroupTailBudget {
-    fn start(now: Instant, members: &[GroupMember]) -> io::Result<Self> {
+impl TaskServiceBudget {
+    fn start(
+        now: Instant,
+        members: &[GroupMember],
+        service_budget: Duration,
+        wall_backstop: Duration,
+    ) -> io::Result<Self> {
         // SAFETY: sysconf with _SC_CLK_TCK has no pointers or side effects.
         let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
         if ticks_per_second <= 0 {
@@ -3173,6 +3328,8 @@ impl GroupTailBudget {
                 .map(|member| (member.identity, member.cpu_ticks))
                 .collect(),
             delivered_ticks: 0,
+            service_budget_ns: service_budget.as_nanos(),
+            wall_backstop,
         })
     }
 
@@ -3191,11 +3348,13 @@ impl GroupTailBudget {
 
     fn service_exhausted(&self) -> bool {
         self.delivered_ticks.saturating_mul(1_000_000_000)
-            > GROUP_TAIL_SERVICE_BUDGET_NS.saturating_mul(self.ticks_per_second as u128)
+            > self
+                .service_budget_ns
+                .saturating_mul(self.ticks_per_second as u128)
     }
 
     fn wall_exhausted(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.started) > GROUP_TAIL_WALL_BACKSTOP
+        now.saturating_duration_since(self.started) > self.wall_backstop
     }
 }
 
@@ -3734,7 +3893,7 @@ fn drain_group_capture<O: StdoutObserver>(
     observer: &mut O,
 ) -> io::Result<GroupCapture> {
     let mut leader_status = None;
-    let mut budget = None::<GroupTailBudget>;
+    let mut budget = None::<TaskServiceBudget>;
     let mut next_group_scan = Instant::now();
     let mut empty_since = None::<Instant>;
 
@@ -3753,7 +3912,14 @@ fn drain_group_capture<O: StdoutObserver>(
             let members: Vec<_> = processes.iter().map(|process| process.member).collect();
             match &mut budget {
                 Some(budget) => budget.observe(&members),
-                None => budget = Some(GroupTailBudget::start(now, &members)?),
+                None => {
+                    budget = Some(TaskServiceBudget::start(
+                        now,
+                        &members,
+                        GROUP_TAIL_SERVICE_BUDGET,
+                        GROUP_TAIL_WALL_BACKSTOP,
+                    )?)
+                }
             }
 
             if members.is_empty() {
@@ -4108,6 +4274,11 @@ mod tests {
         );
         append_startup_test_pid(&pidfile, unsafe { libc::getpid() });
         let mode = std::env::var(STARTUP_TEST_MODE_ENV).expect("startup test mode");
+        if mode == "pre-ready-spin" {
+            loop {
+                std::hint::spin_loop();
+            }
+        }
         if mode == "pre-ready" {
             loop {
                 std::thread::sleep(Duration::from_secs(60));
@@ -4833,6 +5004,28 @@ mod tests {
             signalled.elapsed() < STARTUP_TEST_PROMPT_BACKSTOP,
             "pre-ready signal cancellation waited for its protocol backstop",
         );
+        assert_startup_pids_exit(&pids, &pidfds);
+    }
+
+    #[test]
+    fn startup_pre_ready_cpu_burn_exhausts_service_not_wall_time() {
+        if startup_test_role_if_requested() {
+            return;
+        }
+        let _serial = test_serial_guard();
+        let root = tempfile::tempdir().expect("startup supervision tempdir");
+        let pidfile = root.path().join("pre-ready-spin.pids");
+        let test_name = std::thread::current()
+            .name()
+            .expect("libtest supplies the current test name")
+            .to_owned();
+        let mut owner = spawn_startup_test_owner(&test_name, "pre-ready-spin", &pidfile);
+        let pids = startup_test_pids(&pidfile, 1);
+        let pidfds: Vec<_> = pids.iter().copied().map(test_pidfd_open).collect();
+
+        let status = wait_startup_test_owner(&mut owner, "pre-ready CPU burner");
+
+        assert_startup_fail_closed(&status);
         assert_startup_pids_exit(&pids, &pidfds);
     }
 
