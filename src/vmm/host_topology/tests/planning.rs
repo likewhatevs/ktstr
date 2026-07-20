@@ -1842,6 +1842,126 @@ fn default_cpu_budget_30_percent_rounded_up_min_one() {
     assert_eq!(default_cpu_budget(100), 30, "exact 30%");
 }
 
+#[test]
+fn elastic_sizing_uses_every_available_cpu_up_to_its_maximum() {
+    let sizing = LlcPlanSizing::Elastic;
+    assert_eq!(sizing.target_for_capacity(8, 0), None);
+    assert_eq!(sizing.target_for_capacity(8, 1), Some(1));
+    assert_eq!(sizing.target_for_capacity(8, 5), Some(5));
+    assert_eq!(sizing.target_for_capacity(8, 8), Some(8));
+    assert_eq!(sizing.target_for_capacity(8, 13), Some(8));
+    assert_eq!(sizing.queued_target(8), 1);
+
+    let exact = LlcPlanSizing::Exact;
+    assert_eq!(exact.target_for_capacity(8, 7), None);
+    assert_eq!(exact.target_for_capacity(8, 8), Some(8));
+    assert_eq!(exact.target_for_capacity(8, 13), Some(8));
+    assert_eq!(exact.queued_target(8), 8);
+}
+
+/// An elastic build must start immediately on every currently compatible CPU
+/// instead of joining the fixed-budget queue. Two exact VM-shaped holders own
+/// CPUs/LLCs 0 and 1; a 3-CPU build therefore contracts to the two free CPUs,
+/// carries matching SH locks, and reports `-j2`.
+#[test]
+fn elastic_build_plan_takes_largest_immediately_available_subset() {
+    let _prefixes = LockPrefixesGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3]);
+    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(4, 1);
+
+    let exact_holders: Vec<_> = [0usize, 1]
+        .into_iter()
+        .flat_map(|index| [llc_lock_path(index), cpu_lock_path(index)])
+        .map(|path| {
+            try_flock(&path, FlockMode::Exclusive)
+                .expect("open exact-holder lock")
+                .expect("reserve exact-holder resource")
+        })
+        .collect();
+
+    let plan =
+        acquire_elastic_build_llc_plan(&topo, &test_topo, Some(CpuCap::new(3).unwrap()), None)
+            .expect("two free CPUs must start an elastic three-CPU-max build");
+    assert_eq!(plan.locked_llcs, vec![2, 3]);
+    assert_eq!(plan.cpus, vec![2, 3]);
+    assert_eq!(plan.locks.len(), 4, "one LLC and CPU SH lock per CPU");
+    assert_eq!(
+        make_jobs_for_plan(&plan),
+        2,
+        "build parallelism must follow the contracted reservation",
+    );
+    for index in &plan.cpus {
+        assert!(
+            try_flock(cpu_lock_path(*index), FlockMode::Exclusive)
+                .expect("probe returned CPU lock")
+                .is_none(),
+            "the elastic plan must retain its exact SH CPU reservation",
+        );
+    }
+
+    drop(plan);
+    drop(exact_holders);
+    let full =
+        acquire_elastic_build_llc_plan(&topo, &test_topo, Some(CpuCap::new(3).unwrap()), None)
+            .expect("idle capacity must restore the configured elastic maximum");
+    assert_eq!(full.cpus.len(), 3);
+    assert_eq!(make_jobs_for_plan(&full), 3);
+}
+
+/// With every resource initially owned by exact VM-shaped EX holders, an
+/// elastic build queues. Releasing two of four CPUs must wake it into a 2-CPU
+/// plan even though its configured maximum is three; it must neither wait for
+/// a fixed three-CPU shape nor overlap the two holders that remain.
+#[test]
+fn elastic_build_wait_replans_to_largest_partial_release() {
+    let _prefixes = LockPrefixesGuard::new_real_wake();
+    let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3]);
+    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(4, 1);
+
+    let mut exact_holders = Vec::new();
+    for index in 0usize..4 {
+        let llc = try_flock(llc_lock_path(index), FlockMode::Exclusive)
+            .expect("open exact-holder LLC lock")
+            .expect("reserve exact-holder LLC");
+        let cpu = try_flock(cpu_lock_path(index), FlockMode::Exclusive)
+            .expect("open exact-holder CPU lock")
+            .expect("reserve exact-holder CPU");
+        exact_holders.push((llc, cpu));
+    }
+    let released = exact_holders.split_off(2);
+    let retained = exact_holders;
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        drop(released);
+        // A generous fail-safe turns a missed wake into a deterministic
+        // assertion failure rather than hanging the entire test binary.
+        let _ = finish_rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(retained);
+    });
+
+    let started = std::time::Instant::now();
+    let plan =
+        acquire_elastic_build_llc_plan(&topo, &test_topo, Some(CpuCap::new(3).unwrap()), None)
+            .expect("the two-CPU release must satisfy an elastic build");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the build waited for the fixed maximum instead of taking the partial release: {elapsed:?}",
+    );
+    assert_eq!(plan.locked_llcs, vec![2, 3]);
+    assert_eq!(plan.cpus, vec![2, 3]);
+    assert_eq!(make_jobs_for_plan(&plan), 2);
+
+    drop(plan);
+    let _ = finish_tx.send(());
+    releaser
+        .join()
+        .expect("exact-holder releaser must not panic");
+}
+
 /// `no_perf_cpu_budget` sizes a no-perf VM to its EXACT vCPU count
 /// (clamped to the allowed cpuset, min-1) — the topology's real need,
 /// with the 30% `default_cpu_budget` acting as NEITHER a floor nor a

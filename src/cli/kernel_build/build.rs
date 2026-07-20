@@ -135,10 +135,13 @@ pub fn acquire_build_reservation(
 /// perf-mode work temporarily owns too much LLC capacity.
 ///
 /// Harness prebuilds use this variant because many independent CI invocations
-/// compile concurrently and have no source-tree lock to serialize them. A
-/// transient `LOCK_EX` holder must delay compilation, not abort the entire
-/// test job after four nonblocking probes. Kernel builds retain
-/// [`acquire_build_reservation`]'s interactive nonblocking behavior.
+/// compile concurrently and have no source-tree lock to serialize them. The
+/// resolved CPU budget is a ceiling: this path immediately takes the largest
+/// non-empty placement that does not overlap an exact VM reservation, and
+/// derives Cargo/make parallelism from that actual placement. It joins the
+/// queue only while every compatible CPU is occupied, then repeats that
+/// largest-fit plan on each wake. Kernel builds retain
+/// [`acquire_build_reservation`]'s exact, interactive nonblocking behavior.
 pub fn acquire_build_reservation_waiting(
     cli_label: &str,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
@@ -149,9 +152,10 @@ pub fn acquire_build_reservation_waiting(
 /// Cancellation-aware harness-build reservation.
 ///
 /// A signal-published `cancelled` flag interrupts either the ticket's futex
-/// wait or the coordinator's inotify wait, releasing the exact registry claim,
-/// partial LLC holds, and any completed plan before returning
-/// [`std::io::ErrorKind::Interrupted`].
+/// wait or the coordinator's inotify wait, releasing the current elastic
+/// registry claim, partial LLC holds, and any completed plan before returning
+/// [`std::io::ErrorKind::Interrupted`]. Sizing otherwise matches
+/// [`acquire_build_reservation_waiting`].
 pub fn acquire_build_reservation_waiting_interruptible(
     cli_label: &str,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
@@ -165,7 +169,8 @@ pub fn acquire_build_reservation_waiting_interruptible(
 /// `progress` runs on the acquiring thread while an ordinary admission ticket is
 /// parked or its elected coordinator is blocked in inotify. The protocol only
 /// slices those blocking syscalls; reservation ordering, retry deadlines, and
-/// liveness deadlines are unchanged.
+/// liveness deadlines are unchanged. Sizing otherwise matches
+/// [`acquire_build_reservation_waiting`].
 pub fn acquire_build_reservation_waiting_interruptible_with_progress(
     cli_label: &str,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
@@ -180,7 +185,7 @@ pub fn acquire_build_reservation_waiting_interruptible_with_progress(
 fn acquire_build_reservation_impl(
     cli_label: &str,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
-    wait: bool,
+    elastic: bool,
     cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<BuildReservation> {
     check_reservation_cancelled(cancelled)?;
@@ -208,21 +213,18 @@ fn acquire_build_reservation_impl(
         // LLCs leaves whole LLCs free for exclusive perf-mode
         // reservations, and a build is throughput-elastic where a VM's
         // vCPU threads are not (VMs use Spread — see `PlacementPolicy`).
-        let acquired_plan = match cancelled {
-            Some(flag) => crate::vmm::host_topology::acquire_llc_plan_interruptible(
+        let acquired_plan = if elastic {
+            crate::vmm::host_topology::acquire_elastic_build_llc_plan(
+                &host_topo, &test_topo, cpu_cap, cancelled,
+            )?
+        } else {
+            crate::vmm::host_topology::acquire_llc_plan(
                 &host_topo,
                 &test_topo,
                 cpu_cap,
                 crate::vmm::host_topology::PlacementPolicy::Consolidate,
-                flag,
-            )?,
-            None => crate::vmm::host_topology::acquire_llc_plan(
-                &host_topo,
-                &test_topo,
-                cpu_cap,
-                crate::vmm::host_topology::PlacementPolicy::Consolidate,
-                wait,
-            )?,
+                false,
+            )?
         };
         check_reservation_cancelled(cancelled)?;
         crate::vmm::host_topology::warn_if_cross_node_spill(&acquired_plan, &host_topo);

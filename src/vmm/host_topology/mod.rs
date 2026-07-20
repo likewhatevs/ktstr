@@ -2900,22 +2900,68 @@ pub fn acquire_llc_plan(
     policy: PlacementPolicy,
     wait: bool,
 ) -> Result<LlcPlan> {
-    acquire_llc_plan_impl(topo, test_topo, cpu_cap, policy, wait, None)
+    acquire_llc_plan_impl(
+        topo,
+        test_topo,
+        cpu_cap,
+        policy,
+        wait,
+        LlcPlanSizing::Exact,
+        None,
+    )
 }
 
-/// Cancellation-aware waiting LLC-plan acquisition.
+/// Work-conserving waiting acquisition for throughput-elastic builds.
 ///
-/// This is the harness-build reservation path: normal contention retains one
-/// exact ticket, while cancellation interrupts either its futex wait or the
-/// coordinator's inotify sleep.
-pub fn acquire_llc_plan_interruptible(
+/// The resolved CPU budget is a maximum. Each admission turn takes the
+/// largest currently SH-compatible placement from one CPU through that
+/// maximum. Exact VM reservations retain their CPU/LLC modes and therefore
+/// remain a hard fence; only otherwise-idle capacity is contracted. When no
+/// CPU is currently available, the caller queues behind a one-CPU exact
+/// designation and replans against the full immutable watch on every wake.
+pub(crate) fn acquire_elastic_build_llc_plan(
     topo: &HostTopology,
     test_topo: &crate::topology::TestTopology,
     cpu_cap: Option<CpuCap>,
-    policy: PlacementPolicy,
-    cancelled: &AtomicBool,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<LlcPlan> {
-    acquire_llc_plan_impl(topo, test_topo, cpu_cap, policy, true, Some(cancelled))
+    acquire_llc_plan_impl(
+        topo,
+        test_topo,
+        cpu_cap,
+        PlacementPolicy::Consolidate,
+        true,
+        LlcPlanSizing::Elastic,
+        cancelled,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LlcPlanSizing {
+    /// The resolved budget is a fixed resource contract.
+    Exact,
+    /// The resolved budget is a ceiling; any non-empty compatible subset can
+    /// make forward progress.
+    Elastic,
+}
+
+impl LlcPlanSizing {
+    fn target_for_capacity(self, maximum: usize, available: usize) -> Option<usize> {
+        match self {
+            Self::Exact => (available >= maximum).then_some(maximum),
+            Self::Elastic => {
+                let target = maximum.min(available);
+                (target > 0).then_some(target)
+            }
+        }
+    }
+
+    fn queued_target(self, maximum: usize) -> usize {
+        match self {
+            Self::Exact => maximum,
+            Self::Elastic => 1,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2925,6 +2971,7 @@ struct LlcPlanAcquireRequest<'a> {
     cpu_cap: Option<CpuCap>,
     policy: PlacementPolicy,
     wait: bool,
+    sizing: LlcPlanSizing,
     cancelled: Option<&'a AtomicBool>,
 }
 
@@ -2934,6 +2981,7 @@ fn acquire_llc_plan_impl(
     cpu_cap: Option<CpuCap>,
     policy: PlacementPolicy,
     wait: bool,
+    sizing: LlcPlanSizing,
     cancelled: Option<&AtomicBool>,
 ) -> Result<LlcPlan> {
     check_acquire_cancelled(cancelled)?;
@@ -2954,6 +3002,7 @@ fn acquire_llc_plan_impl(
             cpu_cap,
             policy,
             wait,
+            sizing,
             cancelled,
         },
         try_acquire_llc_plan_locks_with_evidence,
@@ -3064,6 +3113,7 @@ where
             cpu_cap,
             policy,
             wait,
+            sizing: LlcPlanSizing::Exact,
             cancelled,
         },
         acquire_fn,
@@ -3084,6 +3134,7 @@ where
         cpu_cap,
         policy,
         wait,
+        sizing,
         cancelled,
     } = request;
     check_acquire_cancelled(cancelled)?;
@@ -3212,17 +3263,33 @@ where
         let registry_claim_filtered = registry_llc_filtered || registry_cpu_filtered;
         let real_holder_filtered = real_llc_filtered || real_cpu_filtered;
         let dynamic_filtered = registry_claim_filtered || real_holder_filtered;
+        let static_capacity = snapshots
+            .iter()
+            .flat_map(|snapshot| topo.llc_groups[snapshot.llc_idx].cpus.iter().copied())
+            .filter(|cpu| allowed.contains(cpu))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        if sizing == LlcPlanSizing::Elastic && static_capacity < target_cpus {
+            return Err(ResourceContention {
+                reason: format!(
+                    "host LLC topology exposes only {static_capacity} distinct CPUs from the \
+                     process's allowed set, fewer than the elastic build maximum {target_cpus}"
+                ),
+            }
+            .into());
+        }
         let eligible_capacity = eligible
             .iter()
             .flat_map(|snapshot| topo.llc_groups[snapshot.llc_idx].cpus.iter().copied())
             .filter(|cpu| eligible_allowed.contains(cpu))
             .collect::<std::collections::BTreeSet<_>>()
             .len();
-        let claim_capacity_insufficient = eligible_capacity < target_cpus;
-        let selected = if !claim_capacity_insufficient {
+        let planned_target = sizing.target_for_capacity(target_cpus, eligible_capacity);
+        let claim_capacity_insufficient = planned_target.is_none();
+        let selected = if let Some(planned_target) = planned_target {
             plan_from_snapshots(
                 &eligible,
-                target_cpus,
+                planned_target,
                 topo,
                 &eligible_allowed,
                 |from, to| test_topo.numa_distance(from, to),
@@ -3256,14 +3323,15 @@ where
                 topo,
                 &eligible_allowed,
                 &cpu_states,
-                target_cpus,
+                planned_target.expect("a non-empty plan must have a target"),
                 policy,
             )
         };
         if !selected.is_empty() && selected_materialized.is_none() {
             return Err(ResourceContention {
                 reason: format!(
-                    "selected LLCs did not contain the required {target_cpus} distinct eligible CPUs"
+                    "selected LLCs did not contain the required {} distinct eligible CPUs",
+                    planned_target.expect("a non-empty plan must have a target"),
                 ),
             }
             .into());
@@ -3396,9 +3464,10 @@ where
         .expect("waiting acquisition must preserve its failed fast-phase CPU snapshot");
     let queued_allowed = queue_seed_universe
         .expect("waiting acquisition must preserve its full static CPU universe");
+    let queued_target_cpus = sizing.queued_target(target_cpus);
     let queued_selected = plan_from_snapshots(
         &queued_snapshots,
-        target_cpus,
+        queued_target_cpus,
         topo,
         &queued_allowed,
         |from, to| test_topo.numa_distance(from, to),
@@ -3418,12 +3487,12 @@ where
         topo,
         &queued_allowed,
         &queued_cpu_states,
-        target_cpus,
+        queued_target_cpus,
         policy,
     ) else {
         return Err(ResourceContention {
             reason: format!(
-                "host LLC topology contains fewer than the required {target_cpus} distinct allowed CPUs"
+                "host LLC topology contains fewer than the required {queued_target_cpus} distinct allowed CPUs"
             ),
         }
         .into());
@@ -3472,7 +3541,8 @@ where
         let designated_is_live = selected
             .iter()
             .all(|idx| snapshots.iter().any(|snapshot| snapshot.llc_idx == *idx));
-        if designated_is_live
+        if sizing == LlcPlanSizing::Exact
+            && designated_is_live
             && let Some(acquired) = probe.try_acquire(&designated, || {
                 Ok(
                     match try_acquire_llc_plan_locks_with_evidence(&selected, &cpus, &snapshots)? {
@@ -3510,16 +3580,45 @@ where
             ))
         })?;
         snapshots.retain(|snapshot| !snapshot.exclusive_held);
-        snapshots = avoid_preceding_claims_when_possible(
-            &snapshots,
-            target_cpus,
-            topo,
-            &eligible_allowed,
-            |candidate| probe.conflicts_with_predecessors(candidate),
-        )?;
+        snapshots = match sizing {
+            LlcPlanSizing::Exact => avoid_preceding_claims_when_possible(
+                &snapshots,
+                target_cpus,
+                topo,
+                &eligible_allowed,
+                |candidate| probe.conflicts_with_predecessors(candidate),
+            )?,
+            LlcPlanSizing::Elastic => {
+                let mut predecessor_free = Vec::with_capacity(snapshots.len());
+                for snapshot in snapshots {
+                    let candidate = protocol::ClaimSet::new(
+                        [snapshot.llc_idx],
+                        std::iter::empty(),
+                        FlockMode::Shared,
+                    );
+                    if !probe.conflicts_with_predecessors(&candidate)? {
+                        predecessor_free.push(snapshot);
+                    }
+                }
+                predecessor_free
+            }
+        };
+        let eligible_capacity = snapshots
+            .iter()
+            .flat_map(|snapshot| topo.llc_groups[snapshot.llc_idx].cpus.iter().copied())
+            .filter(|cpu| eligible_allowed.contains(cpu))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let Some(next_target_cpus) = sizing.target_for_capacity(target_cpus, eligible_capacity)
+        else {
+            // The full immutable watch covers every resource that can make
+            // this elastic ticket runnable; no speculative physical probe is
+            // needed while the live/registry snapshot exposes zero capacity.
+            return Ok(None);
+        };
         let next_selected = plan_from_snapshots(
             &snapshots,
-            target_cpus,
+            next_target_cpus,
             topo,
             &eligible_allowed,
             |from, to| test_topo.numa_distance(from, to),
@@ -3537,7 +3636,7 @@ where
             topo,
             &eligible_allowed,
             &cpu_states,
-            target_cpus,
+            next_target_cpus,
             policy,
         ) else {
             // The ready subset lost capacity between planning dimensions.
@@ -3546,10 +3645,37 @@ where
         };
         let next_claim = protocol::ClaimSet::with_modes(
             next_selected.iter().copied(),
-            next_cpus,
+            next_cpus.iter().copied(),
             FlockMode::Shared,
             FlockMode::Shared,
         );
+        if sizing == LlcPlanSizing::Elastic
+            && next_claim == designated
+            && designated_is_live
+            && let Some(acquired) = probe.try_acquire(&designated, || {
+                Ok(
+                    match try_acquire_llc_plan_locks_with_evidence(
+                        &next_selected,
+                        &next_cpus,
+                        &snapshots,
+                    )? {
+                        LlcLockAttempt::Acquired(locks) => protocol::ProbeOutcome::Acquired((
+                            next_selected.clone(),
+                            snapshots.clone(),
+                            locks,
+                            next_cpus.clone(),
+                        )),
+                        LlcLockAttempt::Contended(evidence) => {
+                            protocol::ProbeOutcome::Contended(evidence)
+                        }
+                        #[cfg(test)]
+                        LlcLockAttempt::Unavailable => protocol::ProbeOutcome::Unavailable,
+                    },
+                )
+            })?
+        {
+            return Ok(Some(acquired));
+        }
         probe.reserve(&next_claim)?;
         Ok(None)
     };
@@ -3597,34 +3723,67 @@ where
             });
         }
         let cpu_states = discover_cpu_placement_states(&allowed, &mountinfo)?;
-        let eligible_allowed = cpu_eligible_allowed(&allowed, &cpu_states, |_| Ok(false))?;
-        let ready_snapshots: Vec<_> = snapshots
+        let eligible_allowed = cpu_eligible_allowed(&allowed, &cpu_states, |cpu| match sizing {
+            LlcPlanSizing::Exact => Ok(false),
+            LlcPlanSizing::Elastic => held
+                .candidate_ready(&protocol::ClaimSet::with_modes(
+                    std::iter::empty(),
+                    [cpu],
+                    FlockMode::Shared,
+                    FlockMode::Shared,
+                ))
+                .map(|ready| !ready),
+        })?;
+        let mut ready_snapshots: Vec<_> = snapshots
             .iter()
             .filter(|snapshot| !snapshot.exclusive_held)
             .cloned()
             .collect();
-        let selected = plan_from_snapshots(
-            &ready_snapshots,
-            target_cpus,
-            topo,
-            &eligible_allowed,
-            |from, to| test_topo.numa_distance(from, to),
-            policy,
-        );
-        if let Some((cpus, _)) = materialize_plan_cpus(
-            &selected,
-            topo,
-            &eligible_allowed,
-            &cpu_states,
-            target_cpus,
-            policy,
-        ) {
-            coordinator_claim = protocol::ClaimSet::with_modes(
-                selected,
-                cpus,
-                FlockMode::Shared,
-                FlockMode::Shared,
+        if sizing == LlcPlanSizing::Elastic {
+            let mut predecessor_free = Vec::with_capacity(ready_snapshots.len());
+            for snapshot in ready_snapshots {
+                let candidate = protocol::ClaimSet::with_modes(
+                    [snapshot.llc_idx],
+                    std::iter::empty(),
+                    FlockMode::Shared,
+                    FlockMode::Shared,
+                );
+                if held.candidate_ready(&candidate)? {
+                    predecessor_free.push(snapshot);
+                }
+            }
+            ready_snapshots = predecessor_free;
+        }
+        let eligible_capacity = ready_snapshots
+            .iter()
+            .flat_map(|snapshot| topo.llc_groups[snapshot.llc_idx].cpus.iter().copied())
+            .filter(|cpu| eligible_allowed.contains(cpu))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        if let Some(next_target_cpus) = sizing.target_for_capacity(target_cpus, eligible_capacity) {
+            let selected = plan_from_snapshots(
+                &ready_snapshots,
+                next_target_cpus,
+                topo,
+                &eligible_allowed,
+                |from, to| test_topo.numa_distance(from, to),
+                policy,
             );
+            if let Some((cpus, _)) = materialize_plan_cpus(
+                &selected,
+                topo,
+                &eligible_allowed,
+                &cpu_states,
+                next_target_cpus,
+                policy,
+            ) {
+                coordinator_claim = protocol::ClaimSet::with_modes(
+                    selected,
+                    cpus,
+                    FlockMode::Shared,
+                    FlockMode::Shared,
+                );
+            }
         }
         // If real EX holders leave no full ready alternative, retain the
         // previous exact designation and probe it. The resulting contention
@@ -3632,7 +3791,12 @@ where
         // temporary scarcity is never a terminal topology error.
         let selected: Vec<usize> = coordinator_claim.llcs.iter().copied().collect();
         let cpus: Vec<usize> = coordinator_claim.cpus.iter().copied().collect();
-        debug_assert_eq!(cpus.len(), target_cpus);
+        match sizing {
+            LlcPlanSizing::Exact => debug_assert_eq!(cpus.len(), target_cpus),
+            LlcPlanSizing::Elastic => {
+                debug_assert!(!cpus.is_empty() && cpus.len() <= target_cpus)
+            }
+        }
         let mems = plan_mems(&cpus, topo);
         let target = protocol::canonical_lock_order_with_modes(
             &selected,
