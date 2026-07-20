@@ -180,6 +180,9 @@ thread_local! {
     #[cfg(test)]
     static HELD_DROP_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static NOTIFY_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +220,25 @@ pub(super) struct GrantAttempt<T> {
     pub acquired: Option<T>,
     pub next_claim: ClaimSet,
     pub contention: Option<ContentionEvidence>,
+}
+
+#[cfg(test)]
+struct DropProbe {
+    dropped: std::rc::Rc<std::cell::Cell<bool>>,
+    registry_unlocked: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+#[cfg(test)]
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.dropped.set(true);
+        self.registry_unlocked.set(
+            try_lock_registry_existing_nonblocking(FlockMode::Shared)
+                .ok()
+                .flatten()
+                .is_some(),
+        );
+    }
 }
 
 pub(super) enum GrantResult<T> {
@@ -1045,24 +1067,51 @@ impl Ticket {
             || (stale && !accept_stale_contention)
         {
             // A changed publication token means the coordinator already issued
-            // a fresh callback snapshot. Leave that runnable state intact. A
-            // resource or claim change without a newer publication must return
-            // through WAITING so the coordinator can publish one.
-            if record.state == expected_state
-                && record.claim == designated
-                && unissued_change
-                && !epoch_publication_changed
-                && !issue_serial_changed
-            {
+            // a fresh callback snapshot. Preserve an unrelated new claim, but
+            // revoke a same-claim grant below when this callback proved that
+            // snapshot stale by physically acquiring the resource.
+            let released_acquired = result.acquired.is_some();
+            // A newer grant for the same exact claim may have been published
+            // while the old callback physically held that claim. It was
+            // issued from an availability snapshot the old payload disproves,
+            // so consume that grant instead of letting this thread reacquire
+            // immediately after dropping the stale payload.
+            let invalidate_regrant =
+                released_acquired && record.state == STATE_GRANTED && record.claim == designated;
+            let return_to_waiting = invalidate_regrant
+                || (record.state == expected_state
+                    && record.claim == designated
+                    && unissued_change
+                    && !epoch_publication_changed
+                    && !issue_serial_changed);
+            if return_to_waiting || released_acquired {
+                table.begin_transaction()?;
+            }
+            if return_to_waiting {
                 table.set_record_state(self.slot, STATE_WAITING)?;
                 table.clear_record_blocked(self.slot)?;
                 table.set_pending_flag(PENDING_RESCAN);
                 table.bump_generation()?;
-                table.elect_coordinator()?;
+                table.elect_coordinator_in_transaction()?;
             }
+            if released_acquired {
+                // The optimistic availability snapshot predates this physical
+                // acquisition. Revoke it before releasing the payload so no
+                // waiter can be regranted from the stale free snapshot.
+                table.mark_unknown(&designated.cpus, &designated.llcs)?;
+                table.bump_generation()?;
+            }
+            if return_to_waiting || released_acquired {
+                table.finish_transaction();
+            }
+            // Keep the resource unavailable across the registry unlock, then
+            // release the stale physical payload before publishing the wake.
+            // Dropping an opaque caller-owned T while holding the registry
+            // fence could deadlock if its destructor re-enters admission.
             drop(table);
             drop(lock);
-            if stale {
+            drop(result);
+            if stale || released_acquired {
                 notify_coordinator();
             }
             return Ok(GrantResult::LostGrant);
@@ -2081,6 +2130,61 @@ pub(super) fn snapshot() -> Result<Vec<(u64, u32, ClaimSet)>> {
 }
 
 #[cfg(test)]
+pub(super) fn diagnostics_for_tests() -> Result<String> {
+    let Some(_lock) = try_lock_registry_existing_nonblocking(FlockMode::Exclusive)? else {
+        return Ok(if registry_lock_path().exists() {
+            "registry=busy".to_owned()
+        } else {
+            "registry=absent".to_owned()
+        });
+    };
+    let mut table = Table::open_existing()?;
+    table.repair_consistency_if_needed()?;
+    let records = table.records()?;
+    let mut rows = Vec::with_capacity(records.len());
+    for record in records {
+        let state = match record.state {
+            STATE_WAITING => "waiting",
+            STATE_GRANTED => "granted",
+            STATE_COORDINATOR => "coordinator",
+            STATE_REPLAN => "replan",
+            STATE_HELD => "held",
+            STATE_FREE => "free",
+            _ => "invalid",
+        };
+        let watch_serial = table.max_watch_serial(&record.watch)?;
+        rows.push(format!(
+            "ticket={} pid={} state={} claim={:?} watch={:?} blocked={:?} \
+             issue_serial={} watch_serial={} grant_epoch={} replan_epoch={} prefix_epoch={}",
+            record.ticket,
+            record.pid,
+            state,
+            record.claim,
+            record.watch,
+            record.blocked_on,
+            record.issue_serial,
+            watch_serial,
+            record.grant_epoch,
+            record.replan_claim_epoch,
+            record.prefix_epoch,
+        ));
+    }
+    Ok(format!(
+        "coordinator={} coordinator_slot={} generation={} claim_epoch={} \
+         min_changed_ticket={} pending_flags={:#x} global_serial={} grant_scans={}; [{}]",
+        table.coordinator_ticket(),
+        table.coordinator_slot()?,
+        table.generation(),
+        table.claim_epoch(),
+        table.min_changed_ticket(),
+        table.pending_flags(),
+        table.global_serial(),
+        read_u64(&table.header, H_GRANT_SCANS),
+        rows.join("; "),
+    ))
+}
+
+#[cfg(test)]
 pub(super) fn hold_registry_shared_for_tests() -> Result<OwnedFd> {
     lock_registry_existing(FlockMode::Shared)
 }
@@ -2125,7 +2229,7 @@ pub(super) fn ticket_blocked_at_current_serial_for_tests(pid: u32) -> Result<boo
 
 #[cfg(test)]
 pub(super) fn ticket_is_waiting_for_tests(pid: u32) -> Result<bool> {
-    let Some(_lock) = try_lock_registry_existing(FlockMode::Shared)? else {
+    let Some(_lock) = try_lock_registry_existing_nonblocking(FlockMode::Shared)? else {
         return Ok(false);
     };
     let mut table = Table::open_existing()?;
@@ -3670,6 +3774,85 @@ pub(super) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool
 }
 
 #[cfg(test)]
+pub(super) fn exercise_stale_acquired_release_order_for_tests()
+-> Result<(bool, bool, bool, bool, bool, bool)> {
+    let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+    let mut waiter = Ticket::register(claim.clone(), claim, None)?;
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, 1, true)?;
+        table.set_record_state(waiter.slot, STATE_WAITING)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible()?;
+    }
+    if waiter.state(None)? != State::Granted {
+        anyhow::bail!("stale-acquired exercise failed to prepare a live grant");
+    }
+
+    let payload_dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+    let registry_unlocked_at_drop = std::rc::Rc::new(std::cell::Cell::new(false));
+    let dropped_at_notify = std::rc::Rc::new(std::cell::Cell::new(false));
+    let hook_payload_dropped = std::rc::Rc::clone(&payload_dropped);
+    let hook_observation = std::rc::Rc::clone(&dropped_at_notify);
+    NOTIFY_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "a coordinator-notify hook is already installed on this test thread"
+        );
+        *slot.borrow_mut() = Some(Box::new(move || {
+            hook_observation.set(hook_payload_dropped.get());
+        }));
+    });
+
+    let coordinator_ticket = coordinator.ticket;
+    let result = waiter.run_granted(
+        None,
+        |designated, _watch, allowed, _predecessors, _availability| {
+            if !allowed {
+                anyhow::bail!("stale-acquired exercise lost its acquisition license");
+            }
+            let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+            let mut table = Table::open_existing()?;
+            table.mark_claim_changed(coordinator_ticket)?;
+            table.bump_generation()?;
+            table.grant_compatible()?;
+            Ok(GrantAttempt {
+                acquired: Some(DropProbe {
+                    dropped: std::rc::Rc::clone(&payload_dropped),
+                    registry_unlocked: std::rc::Rc::clone(&registry_unlocked_at_drop),
+                }),
+                next_claim: designated.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    let lost_grant = matches!(result, GrantResult::LostGrant);
+    let regrant_revoked = waiter.state(None)? == State::Waiting;
+    let payload_dropped = payload_dropped.get();
+    let registry_unlocked_at_drop = registry_unlocked_at_drop.get();
+    let dropped_at_notify = dropped_at_notify.get();
+    let observation_requested = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let table = Table::open_existing()?;
+        table.observation_request()?.is_some()
+    };
+
+    waiter.finish(None)?;
+    coordinator.finish(None)?;
+    Ok((
+        lost_grant,
+        regrant_revoked,
+        payload_dropped,
+        registry_unlocked_at_drop,
+        dropped_at_notify,
+        observation_requested,
+    ))
+}
+
+#[cfg(test)]
 pub(super) fn exercise_stale_contention_commit_for_tests() -> Result<(bool, bool, bool, bool)> {
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
     let mut coordinator =
@@ -4126,6 +4309,10 @@ fn lock_registry_interruptible_existing(cancelled: Option<&AtomicBool>) -> Resul
 }
 
 fn notify_coordinator() {
+    #[cfg(test)]
+    if let Some(hook) = NOTIFY_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
     let path = notify_path();
     if let Err(error) = OpenOptions::new()
         .write(true)

@@ -1070,6 +1070,11 @@ pub(crate) fn ticket_registry_snapshot_for_tests() -> Result<Vec<(u64, u32, Clai
 }
 
 #[cfg(test)]
+pub(crate) fn ticket_registry_diagnostics_for_tests() -> Result<String> {
+    registry::diagnostics_for_tests()
+}
+
+#[cfg(test)]
 pub(crate) fn active_free_head_is_rejected_for_tests() -> Result<()> {
     registry::active_free_head_is_rejected_for_tests()
 }
@@ -1188,6 +1193,12 @@ pub(crate) fn exercise_prefix_refresh_after_predecessor_release_for_tests()
 #[cfg(test)]
 pub(crate) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool, bool)> {
     registry::exercise_issue_serial_race_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_stale_acquired_release_order_for_tests()
+-> Result<(bool, bool, bool, bool, bool, bool)> {
+    registry::exercise_stale_acquired_release_order_for_tests()
 }
 
 #[cfg(test)]

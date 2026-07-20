@@ -99,7 +99,7 @@ fn protocol_test_thread_cpu_time_ns() -> anyhow::Result<u64> {
         .saturating_add(timestamp.tv_nsec as u64))
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum TestTaskService {
     Process {
         pid: u32,
@@ -277,7 +277,7 @@ impl TestTaskService {
 struct TestTaskServiceWatchdog {
     sources: Vec<TestTaskService>,
     previous: Vec<TestTaskServiceSnapshot>,
-    charged_cpu_ns: u64,
+    charged_cpu_ns: Vec<u64>,
     blocked_observer_started_ns: u64,
     blocked_observer_budget_ns: u64,
 }
@@ -286,10 +286,11 @@ impl TestTaskServiceWatchdog {
     fn new(sources: &[TestTaskService], blocked_observer_budget_ns: u64) -> anyhow::Result<Self> {
         let sources = sources.to_vec();
         let previous = sources.iter().map(TestTaskService::snapshot).collect();
+        let source_count = sources.len();
         Ok(Self {
             sources,
             previous,
-            charged_cpu_ns: 0,
+            charged_cpu_ns: vec![0; source_count],
             blocked_observer_started_ns: protocol_test_thread_cpu_time_ns()?,
             blocked_observer_budget_ns,
         })
@@ -302,14 +303,14 @@ impl TestTaskServiceWatchdog {
 
         for (index, source) in self.sources.iter().enumerate() {
             let current = source.snapshot();
+            let mut delivered_cpu_ns = 0u64;
             any_runnable |=
                 current.pending || current.tasks.values().any(|sample| sample.state == b'R');
             made_progress |= current.pending != self.previous[index].pending
                 || !current.tasks.keys().eq(self.previous[index].tasks.keys());
             for (task, sample) in &current.tasks {
                 if let Some(previous) = self.previous[index].tasks.get(task) {
-                    self.charged_cpu_ns = self
-                        .charged_cpu_ns
+                    delivered_cpu_ns = delivered_cpu_ns
                         .saturating_add(sample.cpu_ns.saturating_sub(previous.cpu_ns));
                     made_progress |= sample.cpu_ns != previous.cpu_ns
                         || sample.run_delay_ns != previous.run_delay_ns;
@@ -317,15 +318,16 @@ impl TestTaskServiceWatchdog {
                     made_progress = true;
                 }
             }
+            self.charged_cpu_ns[index] =
+                self.charged_cpu_ns[index].saturating_add(delivered_cpu_ns);
+            anyhow::ensure!(
+                self.charged_cpu_ns[index] <= TEST_TRANSITION_SERVICE_BUDGET_NS,
+                "{context} did not complete after awaited producer {index} ({source:?}) \
+                 received {}ns of CPU service",
+                self.charged_cpu_ns[index],
+            );
             self.previous[index] = current;
         }
-
-        anyhow::ensure!(
-            self.charged_cpu_ns <= TEST_TRANSITION_SERVICE_BUDGET_NS,
-            "{context} did not complete after its producer tasks received {}ns \
-             of CPU service",
-            self.charged_cpu_ns,
-        );
 
         if any_runnable || made_progress {
             self.blocked_observer_started_ns = observer_now;
@@ -2063,9 +2065,9 @@ fn default_hard_perf_contention_is_no_wait_and_cancellable() {
     // flag before entering its blocking wait, it can unregister before the
     // broker sees a live generation and no targeted signal is expected. The
     // dedicated broker test above separately requires signal delivery while a
-    // waiter is known to remain blocked. Track both potential producers here:
-    // if the worker remains blocked, a runnable-but-starved broker must not be
-    // misclassified as an all-actor deadlock.
+    // waiter is known to remain blocked. Either the worker consumes the flag
+    // directly or the broker wakes it; account both causal producers
+    // independently so their service does not amplify one shared budget.
     let result = recv_with_task_service(
         &result_rx,
         "cancelled default waiter unwind",
@@ -2679,6 +2681,44 @@ fn stale_negative_probe_commits_current_blocker_and_discards_stale_alternative()
 }
 
 #[test]
+fn stale_positive_probe_releases_payload_before_coordinator_notification() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (
+        lost_grant,
+        regrant_revoked,
+        payload_dropped,
+        registry_unlocked_at_drop,
+        dropped_at_notify,
+        observation_requested,
+    ) = protocol::exercise_stale_acquired_release_order_for_tests()
+        .expect("exercise stale acquired-payload release ordering");
+    assert!(
+        lost_grant,
+        "an acquired payload from an invalidated callback must lose its stale grant",
+    );
+    assert!(
+        regrant_revoked,
+        "a same-claim regrant issued while the stale payload was held must be revoked",
+    );
+    assert!(
+        payload_dropped,
+        "the physical payload must be released on the lost-grant path",
+    );
+    assert!(
+        registry_unlocked_at_drop,
+        "caller-owned payload destruction must not run under the registry fence",
+    );
+    assert!(
+        dropped_at_notify,
+        "the physical payload must be released before notifying the coordinator",
+    );
+    assert!(
+        observation_requested,
+        "discarding a stale positive probe must invalidate optimistic availability",
+    );
+}
+
+#[test]
 fn predecessor_prefixes_preserve_modes_order_and_dirty_repair() {
     let _prefixes = LockPrefixesGuard::new();
     let (initial_modes, successor_excluded, repaired_modes, repaired_order) =
@@ -2985,6 +3025,7 @@ const TICKET_HELPER_FORCE_OBSERVER_NONE: &str = "KTSTR_TEST_TICKET_FORCE_OBSERVE
 const TICKET_HELPER_PROBE_BARRIER_DIR: &str = "KTSTR_TEST_TICKET_PROBE_BARRIER_DIR";
 const TICKET_HELPER_PROBE_BARRIER_COUNT: &str = "KTSTR_TEST_TICKET_PROBE_BARRIER_COUNT";
 const TICKET_HELPER_BEFORE_PROBE_GATE: &str = "KTSTR_TEST_TICKET_BEFORE_PROBE_GATE";
+const TICKET_HELPER_RETAIN_FINAL_CANDIDATE: &str = "KTSTR_TEST_TICKET_RETAIN_FINAL_CANDIDATE";
 const TICKET_HELPER_AFTER_ACQUIRE_GATE: &str = "KTSTR_TEST_TICKET_AFTER_ACQUIRE_GATE";
 const TICKET_HELPER_AFTER_ACQUIRE_ENTERED: &str = "KTSTR_TEST_TICKET_AFTER_ACQUIRE_ENTERED";
 const TICKET_HELPER_BEFORE_COORDINATOR_GATE: &str = "KTSTR_TEST_TICKET_BEFORE_COORDINATOR_GATE";
@@ -2994,6 +3035,7 @@ const TICKET_HELPER_COORDINATOR_WAITING: &str = "KTSTR_TEST_TICKET_COORDINATOR_W
 thread_local! {
     static TICKET_HELPER_LOGS:
         std::cell::RefCell<std::collections::BTreeMap<u32, (
+            String,
             std::path::PathBuf,
             std::path::PathBuf,
             std::path::PathBuf,
@@ -3131,6 +3173,7 @@ fn ticket_registry_process_helper() {
     });
     let before_probe_gate =
         std::env::var_os(TICKET_HELPER_BEFORE_PROBE_GATE).map(std::path::PathBuf::from);
+    let retain_final_candidate = std::env::var_os(TICKET_HELPER_RETAIN_FINAL_CANDIDATE).is_some();
     let after_acquire_gate =
         std::env::var_os(TICKET_HELPER_AFTER_ACQUIRE_GATE).map(std::path::PathBuf::from);
     let after_acquire_entered =
@@ -3187,7 +3230,12 @@ fn ticket_registry_process_helper() {
                 }
                 return Ok(Some((index, locks)));
             }
-            probe.reserve(&claims[(index + 1) % claims.len()])?;
+            let next = if retain_final_candidate && index + 1 == claims.len() {
+                index
+            } else {
+                (index + 1) % claims.len()
+            };
+            probe.reserve(&claims[next])?;
             Ok(None)
         })
         .expect("helper queue");
@@ -3255,6 +3303,7 @@ fn ticket_registry_process_helper() {
 
 struct TicketChild {
     child: std::cell::RefCell<Option<std::process::Child>>,
+    label: String,
     pid: u32,
     acquired: std::path::PathBuf,
     probed: std::path::PathBuf,
@@ -3270,6 +3319,7 @@ struct TicketSpawnOptions<'a> {
     force_observer_none: bool,
     probe_barrier: Option<(&'a std::path::Path, usize)>,
     before_probe_gate: Option<&'a std::path::Path>,
+    retain_final_candidate: bool,
     after_acquire_gate: Option<(&'a std::path::Path, &'a std::path::Path)>,
     before_coordinator_gate: Option<(&'a std::path::Path, &'a std::path::Path)>,
     coordinator_waiting: Option<&'a std::path::Path>,
@@ -3340,6 +3390,24 @@ impl TicketChild {
             candidates,
             TicketSpawnOptions {
                 before_probe_gate: Some(gate),
+                ..TicketSpawnOptions::default()
+            },
+        )
+    }
+
+    fn spawn_before_probe_gate_retain_final(
+        marker_dir: &std::path::Path,
+        label: &str,
+        candidates: &str,
+        gate: &std::path::Path,
+    ) -> Self {
+        Self::spawn_with_options(
+            marker_dir,
+            label,
+            candidates,
+            TicketSpawnOptions {
+                before_probe_gate: Some(gate),
+                retain_final_candidate: true,
                 ..TicketSpawnOptions::default()
             },
         )
@@ -3439,6 +3507,9 @@ impl TicketChild {
         if let Some(gate) = options.before_probe_gate {
             command.env(TICKET_HELPER_BEFORE_PROBE_GATE, gate);
         }
+        if options.retain_final_candidate {
+            command.env(TICKET_HELPER_RETAIN_FINAL_CANDIDATE, "1");
+        }
         if let Some((gate, entered)) = options.after_acquire_gate {
             command
                 .env(TICKET_HELPER_AFTER_ACQUIRE_GATE, gate)
@@ -3455,11 +3526,19 @@ impl TicketChild {
         let child = command.spawn().expect("spawn ticket helper");
         let pid = child.id();
         TICKET_HELPER_LOGS.with(|logs| {
-            logs.borrow_mut()
-                .insert(pid, (stdout.clone(), stderr.clone(), service_tid.clone()));
+            logs.borrow_mut().insert(
+                pid,
+                (
+                    label.to_owned(),
+                    stdout.clone(),
+                    stderr.clone(),
+                    service_tid.clone(),
+                ),
+            );
         });
         Self {
             child: std::cell::RefCell::new(Some(child)),
+            label: label.to_owned(),
             pid,
             acquired,
             probed,
@@ -3491,7 +3570,7 @@ impl TicketChild {
 
     fn release_and_wait(self) {
         std::fs::write(&self.release, b"release").expect("release ticket helper");
-        let services = ticket_helper_services();
+        let services = ticket_helper_services(&[self.pid]);
         let status =
             wait_with_external_task_service("released ticket-helper exit", &services, || {
                 Ok(self.try_status())
@@ -3518,7 +3597,10 @@ impl TicketChild {
             .unwrap_or_else(|error| format!("<read {}: {error}>", self.stdout.display()));
         let stderr = std::fs::read_to_string(&self.stderr)
             .unwrap_or_else(|error| format!("<read {}: {error}>", self.stderr.display()));
-        format!("stdout={stdout:?} stderr={stderr:?}")
+        format!(
+            "label={:?} pid={} stdout={stdout:?} stderr={stderr:?}",
+            self.label, self.pid
+        )
     }
 
     fn try_status(&self) -> Option<std::process::ExitStatus> {
@@ -3539,11 +3621,11 @@ impl TicketChild {
     }
 
     fn wait_for_observation<T>(&self, context: &str, mut observe: impl FnMut() -> Option<T>) -> T {
-        // A queued child's transition is often produced by the elected
-        // coordinator or a predecessor rather than by that child itself.
-        // Account every live helper in this test so productive work by the
-        // actual actor prevents a false all-blocked diagnosis.
-        let services = ticket_helper_services();
+        // A queued child's transition may require service from its
+        // coordinator or a predecessor before this endpoint can publish it.
+        // Track every live helper, but charge each independently so adding
+        // participants cannot amplify one transition's CPU-service budget.
+        let services = live_ticket_helper_services();
         wait_with_external_task_service(context, &services, || {
             if let Some(value) = observe() {
                 return Ok(Some(value));
@@ -3558,10 +3640,22 @@ impl TicketChild {
             Ok(None)
         })
         .unwrap_or_else(|error| {
+            let pids = TICKET_HELPER_LOGS.with(|logs| {
+                logs.borrow()
+                    .keys()
+                    .copied()
+                    .filter(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
+                    .collect::<Vec<_>>()
+            });
+            let helpers = ticket_helper_diagnostics(&pids);
+            let registry = protocol::ticket_registry_diagnostics_for_tests()
+                .unwrap_or_else(|error| format!("<unavailable: {error:#}>"));
             panic!(
-                "ticket helper {} failed to reach {context}: {error:#}; {}",
+                "ticket helper {:?} ({}) failed to reach {context}: {error:#}; {}; \
+                 all helpers: {helpers}; registry: {registry}",
+                self.label,
                 self.pid,
-                self.diagnostics(),
+                self.diagnostics()
             )
         })
     }
@@ -3597,7 +3691,7 @@ impl TicketChild {
     }
 
     fn wait_for_injected_crash(&self) {
-        let services = ticket_helper_services();
+        let services = ticket_helper_services(&[self.pid]);
         let status = wait_with_external_task_service("injected registry crash", &services, || {
             Ok(self.try_status())
         })
@@ -3638,14 +3732,19 @@ fn ticket_helper_diagnostics(pids: &[u32]) -> String {
         pids.iter()
             .map(|pid| {
                 logs.get(pid)
-                    .map(|(stdout, stderr, _)| {
+                    .map(|(label, stdout, stderr, _)| {
                         let stdout = std::fs::read_to_string(stdout).unwrap_or_else(|error| {
                             format!("<read {}: {error}>", stdout.display())
                         });
                         let stderr = std::fs::read_to_string(stderr).unwrap_or_else(|error| {
                             format!("<read {}: {error}>", stderr.display())
                         });
-                        format!("pid={pid} stdout={stdout:?} stderr={stderr:?}")
+                        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                            .unwrap_or_else(|error| format!("<unavailable: {error}>"));
+                        format!(
+                            "label={label:?} pid={pid} stat={stat:?} \
+                             stdout={stdout:?} stderr={stderr:?}"
+                        )
                     })
                     .unwrap_or_else(|| format!("pid={pid} helper logs unavailable"))
             })
@@ -3654,12 +3753,26 @@ fn ticket_helper_diagnostics(pids: &[u32]) -> String {
     })
 }
 
-fn ticket_helper_services() -> Vec<TestTaskService> {
+fn ticket_helper_services(pids: &[u32]) -> Vec<TestTaskService> {
+    TICKET_HELPER_LOGS.with(|logs| {
+        let logs = logs.borrow();
+        pids.iter()
+            .filter(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
+            .filter_map(|pid| {
+                logs.get(pid).map(|(_, _, _, service_tid)| {
+                    TestTaskService::helper_thread(*pid, service_tid.clone())
+                })
+            })
+            .collect()
+    })
+}
+
+fn live_ticket_helper_services() -> Vec<TestTaskService> {
     TICKET_HELPER_LOGS.with(|logs| {
         logs.borrow()
             .iter()
             .filter(|(pid, _)| std::path::Path::new(&format!("/proc/{pid}")).exists())
-            .map(|(pid, (_, _, service_tid))| {
+            .map(|(pid, (_, _, _, service_tid))| {
                 TestTaskService::helper_thread(*pid, service_tid.clone())
             })
             .collect()
@@ -3667,9 +3780,17 @@ fn ticket_helper_services() -> Vec<TestTaskService> {
 }
 
 fn wait_for_ticket_pids(expected: &[u32]) {
-    let services = ticket_helper_services();
-    wait_with_external_task_service("ticket registry publication", &services, || {
-        for &pid in expected {
+    for &awaited_pid in expected {
+        let already_published = protocol::ticket_registry_snapshot_for_tests()
+            .expect("ticket registry snapshot")
+            .iter()
+            .any(|(_, pid, _)| *pid == awaited_pid);
+        if already_published {
+            continue;
+        }
+        let services = live_ticket_helper_services();
+        wait_with_external_task_service("ticket registry publication", &services, || {
+            let pid = awaited_pid;
             let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
                 .ok()
                 .and_then(|stat| {
@@ -3683,23 +3804,30 @@ fn wait_for_ticket_pids(expected: &[u32]) {
                      {diagnostics}"
                 );
             }
-        }
-        let actual: Vec<u32> = protocol::ticket_registry_snapshot_for_tests()
-            .expect("ticket registry snapshot")
-            .into_iter()
-            .map(|(_, pid, _)| pid)
-            .collect();
-        if actual == expected {
-            return Ok(Some(()));
-        }
-        Ok(None)
-    })
-    .unwrap_or_else(|error| {
-        panic!(
-            "ticket order mismatch: expected={expected:?}; {error:#}; {}",
-            ticket_helper_diagnostics(expected),
-        )
-    });
+            let published = protocol::ticket_registry_snapshot_for_tests()
+                .expect("ticket registry snapshot")
+                .iter()
+                .any(|(_, pid, _)| *pid == awaited_pid);
+            Ok(published.then_some(()))
+        })
+        .unwrap_or_else(|error| {
+            panic!(
+                "ticket {awaited_pid} was not published: {error:#}; {}",
+                ticket_helper_diagnostics(&[awaited_pid]),
+            )
+        });
+    }
+    let actual: Vec<u32> = protocol::ticket_registry_snapshot_for_tests()
+        .expect("ticket registry snapshot")
+        .into_iter()
+        .map(|(_, pid, _)| pid)
+        .collect();
+    assert_eq!(
+        actual,
+        expected,
+        "ticket order mismatch; {}",
+        ticket_helper_diagnostics(expected),
+    );
 }
 
 fn wait_for_ticket_claim(child: &TicketChild, expected: &protocol::ClaimSet) {
@@ -4109,26 +4237,19 @@ fn disjoint_granted_callbacks_probe_concurrently_without_registry_ex_convoy() {
     let barrier = markers.path().join("concurrent-probes");
     let second = TicketChild::spawn_probe_barrier(markers.path(), "second", "2", &barrier, 2);
     let third = TicketChild::spawn_probe_barrier(markers.path(), "third", "3", &barrier, 2);
-    let services = ticket_helper_services();
-    wait_with_external_task_service("concurrent helper probe barrier", &services, || {
-        let entered = std::fs::read_dir(&barrier)
-            .map(|entries| entries.count())
-            .unwrap_or(0);
-        if entered == 2 {
-            return Ok(Some(()));
-        }
-        second.assert_running("concurrent probe barrier");
-        third.assert_running("concurrent probe barrier");
-        Ok(None)
-    })
-    .unwrap_or_else(|error| {
-        panic!(
-            "disjoint granted callbacks did not overlap: {error:#}; \
-             second: {}; third: {}",
-            second.diagnostics(),
-            third.diagnostics(),
-        )
-    });
+    for child in [&second, &third] {
+        let entered = barrier.join(child.pid.to_string());
+        child.wait_for_observation("concurrent helper probe barrier", || {
+            entered.exists().then_some(())
+        });
+    }
+    assert_eq!(
+        std::fs::read_dir(&barrier)
+            .expect("read concurrent probe barrier")
+            .count(),
+        2,
+        "both disjoint granted callbacks must overlap at the probe barrier",
+    );
 
     second.wait_for_acquired();
     third.wait_for_acquired();
@@ -4153,8 +4274,15 @@ fn invalidated_inflight_grant_drops_its_acquired_payload_before_commit() {
     wait_for_ticket_pids(&[coordinator.pid]);
 
     let earlier_gate = markers.path().join("release-earlier-probe");
-    let earlier =
-        TicketChild::spawn_before_probe_gate(markers.path(), "earlier", "2;3", &earlier_gate);
+    // Rotate once from blocked CPU 2 onto CPU 3, then retain CPU 3 if its
+    // first probe races the still-gated stale payload. The stable exact claim
+    // is the FIFO invariant this test needs while that payload is released.
+    let earlier = TicketChild::spawn_before_probe_gate_retain_final(
+        markers.path(),
+        "earlier",
+        "2;3",
+        &earlier_gate,
+    );
     earlier.wait_for_probe();
 
     let later_gate = markers.path().join("release-later-acquired-probe");
@@ -4169,7 +4297,27 @@ fn invalidated_inflight_grant_drops_its_acquired_payload_before_commit() {
     later.wait_for_path(&later_entered, "post-acquire gate marker");
 
     std::fs::write(&earlier_gate, b"release").expect("release earlier alternative probe");
-    earlier.wait_for_probe_count(2);
+    let revocation_services = ticket_helper_services(&[earlier.pid, coordinator.pid]);
+    wait_with_external_task_service(
+        "later in-flight grant revocation",
+        &revocation_services,
+        || {
+            coordinator.assert_running("later in-flight grant revocation");
+            earlier.assert_running("later in-flight grant revocation");
+            later.assert_running("later in-flight grant revocation");
+            Ok(protocol::ticket_is_waiting_for_tests(later.pid)
+                .expect("read later ticket state")
+                .then_some(()))
+        },
+    )
+    .unwrap_or_else(|error| {
+        let registry = protocol::ticket_registry_diagnostics_for_tests()
+            .unwrap_or_else(|error| format!("<unavailable: {error:#}>"));
+        panic!(
+            "later in-flight grant was not revoked: {error:#}; {}; registry: {registry}",
+            ticket_helper_diagnostics(&[coordinator.pid, earlier.pid, later.pid]),
+        )
+    });
     std::fs::write(&later_gate, b"release").expect("release stale acquired probe");
 
     earlier.wait_for_acquired();
