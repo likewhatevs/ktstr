@@ -1296,14 +1296,8 @@ fn probe_url_status_with(
         reqwest::header::RANGE,
         reqwest::header::HeaderValue::from_static("bytes=0-0"),
     );
-    let response = get_with_transient_retry_and_headers(
-        client,
-        url,
-        Some(timeout),
-        "probe",
-        retry,
-        &headers,
-    )?;
+    let response =
+        get_with_transient_retry_and_headers(client, url, Some(timeout), "probe", retry, &headers)?;
     Ok(response.status())
 }
 

@@ -6,12 +6,12 @@
 //! high-water mark and are never truncated while another process may still
 //! have a futex word mapped.
 
+#[cfg(test)]
+use super::CpuExContentionSharedWake;
 use super::{
     ClaimMode, ClaimSet, ContentionEvidence, ContentionMarker, ContentionSet, ResourceKey,
     interrupted, protocol_dir,
 };
-#[cfg(test)]
-use super::CpuExContentionSharedWake;
 use crate::flock::{FlockMode, InterruptibleFlockWaiter, block_flock, try_flock};
 use anyhow::{Context, Result};
 use memmap2::{Mmap, MmapMut};
@@ -2319,8 +2319,8 @@ pub(super) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64,
 }
 
 #[cfg(test)]
-pub(super) fn exercise_cpu_ex_contention_shared_wake_for_tests()
--> Result<CpuExContentionSharedWake> {
+pub(super) fn exercise_cpu_ex_contention_shared_wake_for_tests() -> Result<CpuExContentionSharedWake>
+{
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
     let coordinator_watch =
         ClaimSet::new(std::iter::empty(), [0usize, 1usize], FlockMode::Exclusive);

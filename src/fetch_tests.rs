@@ -2907,9 +2907,7 @@ fn metadata_request_timeout_bounds_headers_then_stalled_body() {
         "unexpected metadata request head: {request:?}",
     );
     socket
-        .write_all(
-            b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\nconnection: keep-alive\r\n\r\n",
-        )
+        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\nconnection: keep-alive\r\n\r\n")
         .expect("write response headers");
     socket.flush().expect("flush response headers");
 

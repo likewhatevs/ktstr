@@ -958,8 +958,8 @@ pub(crate) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64,
 }
 
 #[cfg(test)]
-pub(crate) fn exercise_cpu_ex_contention_shared_wake_for_tests()
--> Result<CpuExContentionSharedWake> {
+pub(crate) fn exercise_cpu_ex_contention_shared_wake_for_tests() -> Result<CpuExContentionSharedWake>
+{
     registry::exercise_cpu_ex_contention_shared_wake_for_tests()
 }
 
