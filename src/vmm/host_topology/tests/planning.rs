@@ -1801,6 +1801,29 @@ fn elastic_sizing_uses_every_available_cpu_up_to_its_maximum() {
     assert_eq!(exact.queued_target(8), 8);
 }
 
+/// A storm of compatible Cargo builds must not all choose the same lowest
+/// CPU/LLC prefix. The build entry point uses the process-rotated Spread
+/// policy, so an otherwise-idle one-CPU reservation starts at this process's
+/// rotation rather than Consolidate's fixed LLC 0.
+#[test]
+fn elastic_build_uses_process_rotated_spread_placement() {
+    let _prefixes = LockPrefixesGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3]);
+    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(4, 1);
+    let expected = match PlacementPolicy::spread_for_process() {
+        PlacementPolicy::Spread { rotation } => rotation % 4,
+        PlacementPolicy::Consolidate => unreachable!("build placement must be Spread"),
+    };
+
+    let plan =
+        acquire_elastic_build_llc_plan(&topo, &test_topo, Some(CpuCap::new(1).unwrap()), None)
+            .expect("idle host must admit a one-CPU elastic build");
+
+    assert_eq!(plan.locked_llcs, vec![expected]);
+    assert_eq!(plan.cpus, vec![expected]);
+}
+
 /// An elastic build must start immediately on every currently compatible CPU
 /// instead of joining the fixed-budget queue. Two exact VM-shaped holders own
 /// CPUs/LLCs 0 and 1; a 3-CPU build therefore contracts to the two free CPUs,

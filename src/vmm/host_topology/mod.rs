@@ -2382,7 +2382,9 @@ impl CpuCap {
 /// actually locked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlacementPolicy {
-    /// Pack onto already-held LLCs (kernel builds).
+    /// Pack onto already-held LLCs. Direct fixed-size kernel builds use this
+    /// policy; elastic harness and scheduler prebuilds use [`Self::Spread`] so
+    /// concurrent Cargo processes do not converge on one busy CPU prefix.
     Consolidate,
     /// Fan out across least-held LLCs, tie-broken by `rotation`
     /// (no-perf VM placement). `rotation` is reduced modulo the
@@ -3038,12 +3040,13 @@ fn try_acquire_llc_plan_locks_with_evidence(
 /// fallback — so plans are always schedulable under cgroup-restricted
 /// runners (CI hosts, systemd slices, sudo under a limited cpuset).
 ///
-/// `policy` picks the placement preference among eligible LLCs —
-/// [`PlacementPolicy::Consolidate`] for builds,
-/// [`PlacementPolicy::Spread`] for no-perf VM placement (see the enum
-/// docs for the clustering failure Spread exists to prevent). Both
-/// policies use the host distance matrix from [`crate::topology::TestTopology`]
-/// so spill order matches actual NUMA cost. Hosts whose
+/// `policy` picks the placement preference among eligible LLCs. Shared VM and
+/// elastic harness/scheduler reservations use process-rotated
+/// [`PlacementPolicy::Spread`] (see the enum docs for the clustering failure
+/// Spread exists to prevent); direct fixed-size kernel builds use
+/// [`PlacementPolicy::Consolidate`] for cache-domain packing. Both policies use
+/// the host distance matrix from [`crate::topology::TestTopology`] so spill
+/// order matches actual NUMA cost. Hosts whose
 /// `/sys/devices/system/node/*/distance` failed to parse degrade to a
 /// numerically-adjacent ordering via the distance closure (`10` for
 /// same-node, `20` for cross-node).
@@ -3092,9 +3095,12 @@ pub(crate) fn acquire_llc_plan_interruptible(
 /// The resolved CPU budget is a maximum. Each admission turn takes the
 /// largest currently SH-compatible placement from one CPU through that
 /// maximum. Performance reservations remain a hard EX fence; default,
-/// no-perf, and build holders are SH-compatible and may overlap. When no CPU
-/// is currently available, the caller queues behind a one-CPU exact
-/// designation and replans against the full immutable watch on every wake.
+/// no-perf, and build holders are SH-compatible and may overlap. Compatible
+/// work is placed with the same process-rotated Spread policy as shared VM
+/// work, preventing independent Cargo processes from stacking their whole
+/// parallelism allowance onto one most-held CPU prefix. When no CPU is
+/// currently available, the caller queues behind a one-CPU exact designation
+/// and replans against the full immutable watch on every wake.
 pub(crate) fn acquire_elastic_build_llc_plan(
     topo: &HostTopology,
     test_topo: &crate::topology::TestTopology,
@@ -3105,7 +3111,7 @@ pub(crate) fn acquire_elastic_build_llc_plan(
         topo,
         test_topo,
         cpu_cap,
-        PlacementPolicy::Consolidate,
+        PlacementPolicy::spread_for_process(),
         true,
         LlcPlanSizing::Elastic,
         cancelled,
@@ -3314,7 +3320,7 @@ fn acquire_elastic_build_llc_plan_with_coordinator_step_hook(
             topo,
             test_topo,
             cpu_cap,
-            policy: PlacementPolicy::Consolidate,
+            policy: PlacementPolicy::spread_for_process(),
             wait: true,
             sizing: LlcPlanSizing::Elastic,
             cancelled,

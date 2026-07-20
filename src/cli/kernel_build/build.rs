@@ -209,10 +209,16 @@ fn acquire_build_reservation_impl(
         None
     } else if let Ok(host_topo) = crate::vmm::host_topology::HostTopology::from_sysfs() {
         let test_topo = crate::topology::TestTopology::from_system()?;
-        // Builds keep Consolidate placement: packing onto already-held
-        // LLCs leaves whole LLCs free for exclusive perf-mode
-        // reservations, and a build is throughput-elastic where a VM's
-        // vCPU threads are not (VMs use Spread — see `PlacementPolicy`).
+        // Concurrent harness/scheduler prebuilds use the same
+        // process-rotated Spread placement as shared VM work. Consolidating
+        // those independent Cargo processes onto the most-held LLCs is
+        // pathological during a runner storm: every build selects the same
+        // busy CPU prefix while the rest of the host sits available.
+        //
+        // A direct kernel build keeps its fixed Consolidate contract. It is
+        // non-elastic, may hold a source-tree lock, and deliberately packs
+        // one bounded compile rather than participating in the independently
+        // fanned-out harness-build storm.
         let acquired_plan = if elastic {
             crate::vmm::host_topology::acquire_elastic_build_llc_plan(
                 &host_topo, &test_topo, cpu_cap, cancelled,
