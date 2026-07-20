@@ -2318,6 +2318,12 @@ pub(crate) struct PsiCaptureCfg {
 /// Bundles the parameters that `monitor_loop` needs beyond the
 /// required `mem`, `rq_pas`, `offsets`, `interval`, `kill`, and `run_start`.
 pub(crate) struct MonitorConfig<'a> {
+    /// Unit-test sampling budget. Production loops terminate through the VM
+    /// kill edge; tests that exercise an exact number of state-machine
+    /// transitions use this service-progress bound instead of racing a
+    /// wall-clock sleeper against the sampler.
+    #[cfg(test)]
+    pub sample_limit: Option<usize>,
     /// Per-CPU physical addresses of `scx_sched_pcpu` (or
     /// `scx_event_stats` on pre-6.18 kernels). When `rq_refresh` is
     /// `None` and `event_offsets` exist, each sample includes event
@@ -4498,6 +4504,14 @@ pub(crate) fn monitor_loop(
             psi_irq,
         });
 
+        #[cfg(test)]
+        if cfg
+            .sample_limit
+            .is_some_and(|sample_limit| samples.len() >= sample_limit)
+        {
+            break;
+        }
+
         // Block until the next tick or a kill_evt write. -1 timeout
         // is OK because both fds carry hard wakes — a missing
         // kill_evt write means the sampler keeps running on the
@@ -4554,7 +4568,7 @@ mod tests {
     #[test]
     fn monitor_terminal_guard_publishes_on_unexpected_return() {
         let ledger = ProgressLedger::default();
-        let kill = AtomicBool::new(false);
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
         {
             let _guard = MonitorTerminalGuard::new(&ledger, &kill);
         }
@@ -4805,6 +4819,7 @@ mod tests {
 
     fn test_config() -> MonitorConfig<'static> {
         MonitorConfig {
+            sample_limit: None,
             event_pcpu_pas: None,
             dump_trigger: None,
             watchdog_override: None,
@@ -5103,6 +5118,7 @@ mod tests {
         // rq_refresh: None => data_valid latches true from tick 1, so the
         // capture block fires immediately.
         let cfg = MonitorConfig {
+            sample_limit: None,
             event_pcpu_pas: None,
             dump_trigger: None,
             watchdog_override: None,
@@ -6697,7 +6713,7 @@ mod tests {
         // SAFETY: combined is a live local buffer (Vec<u8> or stack
         // array) whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
-        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill = AtomicBool::new(false);
         let kill_evt = test_kill_evt();
 
         let virtio_con = test_virtio_console();
@@ -6711,15 +6727,8 @@ mod tests {
             virtio_con: Some(virtio_con.clone()),
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
-                kill.store(true, Ordering::Release);
-            })
-        };
-
         let cfg = MonitorConfig {
+            sample_limit: Some(3),
             dump_trigger: Some(&trigger),
             ..test_config()
         };
@@ -6733,9 +6742,8 @@ mod tests {
             Instant::now(),
             &cfg,
         );
-        handle.join().unwrap();
 
-        assert!(!samples.is_empty());
+        assert_eq!(samples.len(), 3);
         // Check `SIGNAL_VC_DUMP` was queued for the guest. Without
         // DRIVER_OK on the queue the byte stays in `port0_pending_rx`
         // — that's the observable for tests.
@@ -6764,7 +6772,7 @@ mod tests {
         // SAFETY: combined is a live local buffer (Vec<u8> or stack
         // array) whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
-        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill = AtomicBool::new(false);
         let kill_evt = test_kill_evt();
 
         let virtio_con = test_virtio_console();
@@ -6779,15 +6787,8 @@ mod tests {
             virtio_con: Some(virtio_con.clone()),
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
-                kill.store(true, Ordering::Release);
-            })
-        };
-
         let cfg = MonitorConfig {
+            sample_limit: Some(3),
             dump_trigger: Some(&trigger),
             ..test_config()
         };
@@ -6801,14 +6802,10 @@ mod tests {
             Instant::now(),
             &cfg,
         );
-        handle.join().unwrap();
 
-        // Should have enough samples for 2+ stuck pairs.
-        assert!(
-            samples.len() >= 3,
-            "need >= 3 samples for 2 stuck pairs, got {}",
-            samples.len()
-        );
+        // Three completed sampling passes are exactly the two stuck pairs
+        // required by sustained_samples=2.
+        assert_eq!(samples.len(), 3);
         // Dump should have fired due to sustained stuck condition.
         let pending = virtio_con.lock().pending_rx_bytes_for_test();
         assert!(

@@ -16426,6 +16426,8 @@ impl KtstrVm {
                     }
                 };
                 let mon_cfg = monitor::reader::MonitorConfig {
+                    #[cfg(test)]
+                    sample_limit: None,
                     // `event_pcpu_pas` left `None` here: the loop
                     // recomputes it each iteration via
                     // `rq_refresh.event` so newly attached

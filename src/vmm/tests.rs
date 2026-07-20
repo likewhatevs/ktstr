@@ -260,32 +260,134 @@ fn spawn_interactive_relay_child(
     (child, stderr_reader)
 }
 
+#[derive(Debug, Default)]
+struct InteractiveChildServiceSample {
+    tasks: std::collections::BTreeMap<u32, (u64, u64)>,
+    runnable_tasks: usize,
+}
+
+fn interactive_child_service_sample(pid: u32) -> InteractiveChildServiceSample {
+    let mut sample = InteractiveChildServiceSample::default();
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return sample;
+    };
+    for task in tasks.flatten() {
+        let Ok(tid) = task.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let task_path = task.path();
+        if let Ok(schedstat) = std::fs::read_to_string(task_path.join("schedstat")) {
+            let mut fields = schedstat.split_whitespace();
+            if let (Some(cpu), Some(delay)) = (
+                fields.next().and_then(|v| v.parse::<u64>().ok()),
+                fields.next().and_then(|v| v.parse::<u64>().ok()),
+            ) {
+                sample.tasks.insert(tid, (cpu, delay));
+            }
+        }
+        if let Ok(stat) = std::fs::read_to_string(task_path.join("stat"))
+            && stat
+                .rfind(") ")
+                .and_then(|close| stat.as_bytes().get(close + 2))
+                == Some(&b'R')
+        {
+            sample.runnable_tasks += 1;
+        }
+    }
+    sample
+}
+
+struct InteractiveChildWatchdog {
+    previous: InteractiveChildServiceSample,
+    charged_cpu_ns: u64,
+    last_service_progress: Instant,
+    cpu_budget: Duration,
+}
+
+impl InteractiveChildWatchdog {
+    fn new(child: &std::process::Child, cpu_budget: Duration) -> Self {
+        Self {
+            previous: interactive_child_service_sample(child.id()),
+            charged_cpu_ns: 0,
+            last_service_progress: Instant::now(),
+            cpu_budget,
+        }
+    }
+
+    fn poll(
+        &mut self,
+        child: &mut std::process::Child,
+    ) -> Result<Option<std::process::ExitStatus>, String> {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("poll interactive relay child: {error}"))?
+        {
+            return Ok(Some(status));
+        }
+
+        let current = interactive_child_service_sample(child.id());
+        let task_set_changed = !current.tasks.keys().eq(self.previous.tasks.keys());
+        let mut counters_changed = false;
+        for (tid, &(cpu_ns, delay_ns)) in &current.tasks {
+            if let Some(&(previous_cpu_ns, previous_delay_ns)) = self.previous.tasks.get(tid) {
+                self.charged_cpu_ns = self
+                    .charged_cpu_ns
+                    .saturating_add(cpu_ns.saturating_sub(previous_cpu_ns));
+                counters_changed |= cpu_ns != previous_cpu_ns || delay_ns != previous_delay_ns;
+            }
+        }
+        if task_set_changed || counters_changed || current.runnable_tasks > 0 {
+            self.last_service_progress = Instant::now();
+        }
+        self.previous = current;
+
+        if self.charged_cpu_ns >= self.cpu_budget.as_nanos() as u64 {
+            return Err(format!(
+                "interactive relay subprocess consumed {:?} of task CPU service \
+                 without completing (budget {:?})",
+                Duration::from_nanos(self.charged_cpu_ns),
+                self.cpu_budget,
+            ));
+        }
+
+        // A runnable task is delayed host service, not a VMM hang. Likewise,
+        // changing task CPU/run-delay counters prove forward scheduler
+        // service. Only a process whose complete task set remains blocked and
+        // unchanged is eligible for the stall verdict.
+        const BLOCKED_STALL_BUDGET: Duration = Duration::from_secs(10);
+        if self.last_service_progress.elapsed() >= BLOCKED_STALL_BUDGET {
+            return Err(format!(
+                "interactive relay subprocess made no task-service progress \
+                 while every task was blocked for {BLOCKED_STALL_BUDGET:?}"
+            ));
+        }
+        Ok(None)
+    }
+}
+
+fn terminate_interactive_relay_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let reap_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < reap_deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn wait_interactive_relay_child(
     child: &mut std::process::Child,
-    timeout: Duration,
-) -> std::process::ExitStatus {
-    let started = Instant::now();
+    watchdog: &mut InteractiveChildWatchdog,
+) -> Result<std::process::ExitStatus, String> {
     loop {
-        if let Some(status) = child.try_wait().expect("poll interactive relay child") {
-            return status;
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let reap_deadline = Instant::now() + Duration::from_secs(2);
-            while Instant::now() < reap_deadline {
-                if child
-                    .try_wait()
-                    .expect("poll killed interactive relay child")
-                    .is_some()
-                {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
+        match watchdog.poll(child) {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                terminate_interactive_relay_child(child);
+                return Err(error);
             }
-            panic!(
-                "interactive relay subprocess exceeded its {:?} hard timeout",
-                timeout,
-            );
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -294,8 +396,15 @@ fn wait_interactive_relay_child(
 fn assert_interactive_relay_child(mode: &str) {
     let (mut child, stderr_reader) =
         spawn_interactive_relay_child(mode, std::process::Stdio::null());
-    let status = wait_interactive_relay_child(&mut child, Duration::from_secs(20));
+    let mut watchdog = InteractiveChildWatchdog::new(&child, Duration::from_secs(20));
+    let outcome = wait_interactive_relay_child(&mut child, &mut watchdog);
     let stderr = stderr_reader.join().unwrap_or_default();
+    let status = outcome.unwrap_or_else(|error| {
+        panic!(
+            "interactive relay {mode} child watchdog failed: {error}; stderr={}",
+            String::from_utf8_lossy(&stderr),
+        )
+    });
     assert!(
         status.success(),
         "interactive relay {mode} child failed with {status}; stderr={}",
@@ -331,6 +440,7 @@ fn boot_kernel_interactive_stdout_failure_relay_exits_blocked_bsp() {
 
     let (mut child, stderr_reader) =
         spawn_interactive_relay_child(INTERACTIVE_RELAY_STDOUT_MODE, std::process::Stdio::piped());
+    let mut watchdog = InteractiveChildWatchdog::new(&child, Duration::from_secs(20));
     let stdout = child.stdout.take().expect("capture relay child stdout");
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let stdout_reader = std::thread::spawn(move || {
@@ -358,21 +468,50 @@ fn boot_kernel_interactive_stdout_failure_relay_exits_blocked_bsp() {
         }
     });
 
-    let ready = ready_rx
-        .recv_timeout(Duration::from_secs(15))
-        .unwrap_or(false);
-    if !ready {
-        let _ = child.kill();
-        let _ = wait_interactive_relay_child(&mut child, Duration::from_secs(2));
+    let ready = loop {
+        match ready_rx.try_recv() {
+            Ok(ready) => break Ok(ready),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break Ok(false),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        match watchdog.poll(&mut child) {
+            Ok(Some(status)) => {
+                break Err(format!(
+                    "interactive relay child exited with {status} before the stdout marker"
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                terminate_interactive_relay_child(&mut child);
+                break Err(error);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    if ready != Ok(true) {
+        terminate_interactive_relay_child(&mut child);
+        let _ = stdout_reader.join();
+        let stderr = stderr_reader.join().unwrap_or_default();
+        panic!(
+            "guest never produced the stdout relay readiness marker{}; stderr={}",
+            ready
+                .err()
+                .as_deref()
+                .map(|error| format!(": {error}"))
+                .unwrap_or_default(),
+            String::from_utf8_lossy(&stderr),
+        );
     }
-    assert!(
-        ready,
-        "guest never produced the stdout relay readiness marker"
-    );
 
-    let status = wait_interactive_relay_child(&mut child, Duration::from_secs(20));
+    let outcome = wait_interactive_relay_child(&mut child, &mut watchdog);
     let _ = stdout_reader.join();
     let stderr = stderr_reader.join().unwrap_or_default();
+    let status = outcome.unwrap_or_else(|error| {
+        panic!(
+            "interactive stdout-failure child watchdog failed: {error}; stderr={}",
+            String::from_utf8_lossy(&stderr),
+        )
+    });
     assert!(
         status.success(),
         "interactive stdout-failure relay child failed with {status}; stderr={}",
