@@ -358,11 +358,16 @@ fn pathology_wake_chain_iterates() {
             wake: WakeMechanism::Futex,
             work_per_hop: Duration::from_micros(50),
         },
+        park_after_iterations: Some(1),
+        signal_first_iteration: true,
         ..Default::default()
     };
     let mut h = WorkloadHandle::spawn(&cfg).expect("WakeChain must spawn");
     h.start();
-    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        h.wait_first_iteration_all(Instant::now() + Duration::from_secs(30), cfg.num_workers),
+        "every WakeChain worker must complete an iteration before the test stops it",
+    );
     let reports = h.stop_and_collect();
     assert_eq!(reports.len(), 2);
     let total: u64 = reports.iter().map(|r| r.iterations).sum();
