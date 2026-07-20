@@ -29,7 +29,7 @@ impl Drop for InterruptibleFlockBrokerGuard {
     }
 }
 
-fn wait_for_broker_signal_after(previous: usize) {
+fn interruptible_flock_broker_service() -> TestTaskService {
     let broker_tid = loop {
         let tid = crate::flock::primitives::interruptible_flock_broker_tid();
         if tid != 0 {
@@ -39,7 +39,11 @@ fn wait_for_broker_signal_after(previous: usize) {
         // its first instruction yet, so no delivered service can be charged.
         std::thread::yield_now();
     };
-    let service = TestTaskService::thread(std::process::id(), broker_tid);
+    TestTaskService::thread(std::process::id(), broker_tid)
+}
+
+fn wait_for_broker_signal_after(previous: usize) {
+    let service = interruptible_flock_broker_service();
     wait_with_task_service(
         "eventfd broker targeted RT wake",
         std::slice::from_ref(&service),
@@ -55,10 +59,11 @@ fn wait_for_broker_signal_after(previous: usize) {
 
 fn cancel_registry_worker(cancelled: &std::sync::atomic::AtomicBool) {
     let waiter = crate::flock::interruptible_flock_waiter_id();
-    // Capture the generation before publishing cancellation. The waiter may
-    // observe the flag and unregister immediately; loading afterward would
-    // then skip the eventfd write while callers still expect the broker
-    // handoff they deliberately requested.
+    // Capture the generation before publishing cancellation so a waiter that
+    // remains blocked can receive the broker wake. The waiter may instead
+    // consume the flag and unregister before either this call or the broker
+    // rechecks the generation; its completed Interrupted result is then the
+    // authoritative cancellation edge and no targeted signal is necessary.
     cancelled.store(true, std::sync::atomic::Ordering::Release);
     if waiter != 0 {
         crate::flock::wake_interruptible_flock_waiter(waiter);
@@ -1567,6 +1572,66 @@ fn targeted_broker_wake_cancels_one_registry_waiter() {
 }
 
 #[test]
+fn cancelled_waiter_can_unregister_before_broker_handoff() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+
+    let _broker = InterruptibleFlockBrokerGuard::start();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
+    let (registered_tx, registered_rx) = mpsc::sync_channel(1);
+    let (observe_tx, observe_rx) = mpsc::sync_channel(1);
+    let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+    let worker = TestServiceThread::spawn(move || {
+        let registration =
+            crate::flock::InterruptibleFlockWaiter::register().expect("register waiter");
+        let waiter_id = crate::flock::interruptible_flock_waiter_id();
+        assert_ne!(waiter_id, 0, "registration must publish its generation");
+        registered_tx
+            .send(waiter_id)
+            .expect("publish waiter generation");
+        observe_rx
+            .recv()
+            .expect("observe cancellation before unregistering");
+        assert!(
+            worker_cancelled.load(Ordering::Acquire),
+            "worker must observe the published cancellation",
+        );
+        drop(registration);
+        completed_tx
+            .send(())
+            .expect("publish cancellation completion");
+    });
+
+    let waiter_id =
+        recv_from_service_thread(&registered_rx, "waiter generation publication", &worker)
+            .expect("waiter generation");
+    let signal_count = crate::flock::primitives::interruptible_flock_broker_signal_count();
+    cancelled.store(true, Ordering::Release);
+    observe_tx.send(()).expect("release cancelled waiter");
+    recv_from_service_thread(
+        &completed_rx,
+        "cancellation completion before broker handoff",
+        &worker,
+    )
+    .expect("cancelled waiter must unregister");
+    assert_eq!(
+        crate::flock::interruptible_flock_waiter_id(),
+        0,
+        "completed cancellation must tear down its waiter generation",
+    );
+
+    crate::flock::wake_interruptible_flock_waiter(waiter_id);
+    assert_eq!(
+        crate::flock::primitives::interruptible_flock_broker_signal_count(),
+        signal_count,
+        "a wake requested after valid cancellation completion must not signal \
+         a dead waiter generation",
+    );
+    worker.join().expect("cancelled waiter worker");
+}
+
+#[test]
 fn stale_broker_generation_cannot_interrupt_the_next_registration() {
     use std::sync::mpsc;
 
@@ -1992,11 +2057,21 @@ fn default_hard_perf_contention_is_no_wait_and_cancellable() {
         || Ok((crate::flock::interruptible_flock_waiter_id() != 0).then_some(())),
     )
     .expect("default waiter must publish its cancellation generation");
-    let signal_count = crate::flock::primitives::interruptible_flock_broker_signal_count();
+    let broker_service = interruptible_flock_broker_service();
     cancel_registry_worker(&cancelled);
-    wait_for_broker_signal_after(signal_count);
-    let result = recv_from_service_thread(&result_rx, "cancelled default waiter unwind", &worker)
-        .expect("cancelled default waiter must unwind");
+    // Cancellation completion is authoritative. If the worker observes the
+    // flag before entering its blocking wait, it can unregister before the
+    // broker sees a live generation and no targeted signal is expected. The
+    // dedicated broker test above separately requires signal delivery while a
+    // waiter is known to remain blocked. Track both potential producers here:
+    // if the worker remains blocked, a runnable-but-starved broker must not be
+    // misclassified as an all-actor deadlock.
+    let result = recv_with_task_service(
+        &result_rx,
+        "cancelled default waiter unwind",
+        &[worker.service.clone(), broker_service],
+    )
+    .expect("cancelled default waiter must unwind");
     worker.join().expect("cancelled default waiter");
     let error = match result {
         Ok(_) => panic!("cancelled admission must not acquire through perf EX"),
