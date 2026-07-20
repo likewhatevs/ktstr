@@ -300,8 +300,49 @@ fn interactive_child_service_sample(pid: u32) -> InteractiveChildServiceSample {
 struct InteractiveChildWatchdog {
     previous: InteractiveChildServiceSample,
     charged_cpu_ns: u64,
-    last_service_progress: Instant,
+    blocked_watch: InteractiveBlockedServiceWatch,
     cpu_budget: Duration,
+}
+
+fn interactive_observer_cpu_time_ns() -> Result<u64, String> {
+    let mut timestamp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `timestamp` is a valid out-pointer and `clock_gettime` only
+    // writes the sampled clock value through it.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut timestamp) } != 0 {
+        return Err(format!(
+            "sample interactive relay observer CPU service: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if timestamp.tv_sec < 0 || timestamp.tv_nsec < 0 {
+        return Err(format!(
+            "sample interactive relay observer CPU service: negative timestamp \
+             {}.{:09}",
+            timestamp.tv_sec, timestamp.tv_nsec
+        ));
+    }
+    Ok((timestamp.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(timestamp.tv_nsec as u64))
+}
+
+#[derive(Debug, Default)]
+struct InteractiveBlockedServiceWatch {
+    observer_anchor_ns: Option<u64>,
+}
+
+impl InteractiveBlockedServiceWatch {
+    fn observe(&mut self, made_progress: bool, observer_service_ns: u64) -> u64 {
+        if made_progress {
+            self.observer_anchor_ns = None;
+            return 0;
+        }
+        let anchor = self.observer_anchor_ns.get_or_insert(observer_service_ns);
+        observer_service_ns.saturating_sub(*anchor)
+    }
 }
 
 impl InteractiveChildWatchdog {
@@ -309,7 +350,7 @@ impl InteractiveChildWatchdog {
         Self {
             previous: interactive_child_service_sample(child.id()),
             charged_cpu_ns: 0,
-            last_service_progress: Instant::now(),
+            blocked_watch: InteractiveBlockedServiceWatch::default(),
             cpu_budget,
         }
     }
@@ -336,9 +377,7 @@ impl InteractiveChildWatchdog {
                 counters_changed |= cpu_ns != previous_cpu_ns || delay_ns != previous_delay_ns;
             }
         }
-        if task_set_changed || counters_changed || current.runnable_tasks > 0 {
-            self.last_service_progress = Instant::now();
-        }
+        let made_progress = task_set_changed || counters_changed || current.runnable_tasks > 0;
         self.previous = current;
 
         if self.charged_cpu_ns >= self.cpu_budget.as_nanos() as u64 {
@@ -353,16 +392,48 @@ impl InteractiveChildWatchdog {
         // A runnable task is delayed host service, not a VMM hang. Likewise,
         // changing task CPU/run-delay counters prove forward scheduler
         // service. Only a process whose complete task set remains blocked and
-        // unchanged is eligible for the stall verdict.
-        const BLOCKED_STALL_BUDGET: Duration = Duration::from_secs(10);
-        if self.last_service_progress.elapsed() >= BLOCKED_STALL_BUDGET {
+        // unchanged is eligible for the stall verdict. Charge that verdict to
+        // CPU service delivered to this observer, not host wall time: a
+        // descheduled observer cannot prove that a blocked child remained
+        // unchanged during the interval it did not inspect.
+        const BLOCKED_OBSERVER_SERVICE_BUDGET: Duration = Duration::from_millis(250);
+        let observer_service_ns = interactive_observer_cpu_time_ns()?;
+        let blocked_observer_service_ns = self
+            .blocked_watch
+            .observe(made_progress, observer_service_ns);
+        if blocked_observer_service_ns >= BLOCKED_OBSERVER_SERVICE_BUDGET.as_nanos() as u64 {
             return Err(format!(
                 "interactive relay subprocess made no task-service progress \
-                 while every task was blocked for {BLOCKED_STALL_BUDGET:?}"
+                 while every task was blocked and the observer received {:?} \
+                 of CPU service (budget {BLOCKED_OBSERVER_SERVICE_BUDGET:?})",
+                Duration::from_nanos(blocked_observer_service_ns),
             ));
         }
         Ok(None)
     }
+}
+
+#[test]
+fn interactive_blocked_watch_ignores_unobserved_wall_time() {
+    let mut watch = InteractiveBlockedServiceWatch::default();
+    assert_eq!(watch.observe(false, 10), 0);
+    assert_eq!(watch.observe(false, 10), 0);
+}
+
+#[test]
+fn interactive_blocked_watch_charges_only_delivered_observer_service() {
+    let mut watch = InteractiveBlockedServiceWatch::default();
+    assert_eq!(watch.observe(false, 10), 0);
+    assert_eq!(watch.observe(false, 110), 100);
+}
+
+#[test]
+fn interactive_blocked_watch_reanchors_on_child_progress() {
+    let mut watch = InteractiveBlockedServiceWatch::default();
+    assert_eq!(watch.observe(false, 10), 0);
+    assert_eq!(watch.observe(false, 110), 100);
+    assert_eq!(watch.observe(true, 120), 0);
+    assert_eq!(watch.observe(false, 10_000), 0);
 }
 
 fn terminate_interactive_relay_child(child: &mut std::process::Child) {
