@@ -2763,40 +2763,6 @@ fn accept_retry_test_connection(
     }
 }
 
-/// Accept a connection while a main-driven test client is still running.
-///
-/// Unlike the background-server helpers used by older network tests, these
-/// tests perform accept/read/write on the test thread. That prevents a
-/// saturated nextest/KVM run from starving the mock server after the client
-/// has already consumed its timeout budget. Returning `None` when the client
-/// finishes also turns a missing retry into an immediate assertion failure
-/// instead of a blocked second `accept`.
-fn accept_retry_test_connection_while_running<T>(
-    listener: &std::net::TcpListener,
-    client: &std::thread::JoinHandle<T>,
-) -> std::io::Result<Option<std::net::TcpStream>> {
-    listener.set_nonblocking(true)?;
-    let deadline = std::time::Instant::now() + RETRY_TEST_ACCEPT_TIMEOUT;
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => return configure_retry_test_connection(stream).map(Some),
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                if client.is_finished() {
-                    return Ok(None);
-                }
-                if std::time::Instant::now() >= deadline {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "timed out waiting for main-driven HTTP test connection",
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(err) => return Err(err),
-        }
-    }
-}
-
 fn configure_retry_test_unix_connection(
     stream: std::os::unix::net::UnixStream,
 ) -> std::io::Result<std::os::unix::net::UnixStream> {
