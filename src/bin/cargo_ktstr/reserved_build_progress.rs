@@ -4,7 +4,8 @@
 //! interruptible child runner. This module observes both streams because
 //! wrappers such as `cargo llvm-cov` forward nested Cargo JSON on stderr. It
 //! incrementally counts `compiler-artifact` messages and records Cargo's
-//! `build-finished` phase without consuming or rewriting JSON.
+//! `build-finished` phase. Machine records on stderr are consumed from the
+//! live display while ordinary diagnostics are forwarded unchanged.
 
 use std::io::IsTerminal;
 use std::io::Write;
@@ -281,24 +282,27 @@ impl ReservedBuildProgress {
         }
     }
 
-    fn observe_json_line(&mut self, line: &[u8]) {
-        const ARTIFACT: &[u8] = br#""compiler-artifact""#;
-        const FINISHED: &[u8] = br#""build-finished""#;
-        if !contains_bytes(line, ARTIFACT) && !contains_bytes(line, FINISHED) {
-            return;
-        }
+    /// Parse one complete line and report whether it is a Cargo machine
+    /// record. Every record with a string `reason` is hidden from the live
+    /// stderr stream; the child runner still retains the original bytes in its
+    /// captured [`std::process::Output`].
+    fn observe_json_line(&mut self, line: &[u8]) -> bool {
         let Ok(message) = serde_json::from_slice::<serde_json::Value>(line) else {
-            return;
+            return false;
         };
-        match message.get("reason").and_then(|reason| reason.as_str()) {
-            Some("compiler-artifact") => {
+        let Some(reason) = message.get("reason").and_then(|reason| reason.as_str()) else {
+            return false;
+        };
+        match reason {
+            "compiler-artifact" => {
                 self.artifacts = self.artifacts.saturating_add(1);
             }
-            Some("build-finished") => {
+            "build-finished" => {
                 self.cargo_finished = message.get("success").and_then(|value| value.as_bool());
             }
             _ => {}
         }
+        true
     }
 
     fn observe_bytes(&mut self, bytes: &[u8], stderr: bool) {
@@ -315,9 +319,12 @@ impl ReservedBuildProgress {
             return;
         };
         let before = (self.artifacts, self.cargo_finished);
-        for line in complete.split(|byte| *byte == b'\n') {
-            if !line.is_empty() {
-                self.observe_json_line(line);
+        for line in complete.split_inclusive(|byte| *byte == b'\n') {
+            let content = line.strip_suffix(b"\n").unwrap_or(line);
+            let content = content.strip_suffix(b"\r").unwrap_or(content);
+            let machine_record = !content.is_empty() && self.observe_json_line(content);
+            if stderr && !machine_record {
+                (self.stderr_tee)(line);
             }
         }
         if before != (self.artifacts, self.cargo_finished) {
@@ -335,8 +342,8 @@ impl ReservedBuildProgress {
         if !stdout.is_empty() {
             self.observe_json_line(&stdout);
         }
-        if !stderr.is_empty() {
-            self.observe_json_line(&stderr);
+        if !stderr.is_empty() && !self.observe_json_line(&stderr) {
+            (self.stderr_tee)(&stderr);
         }
         if before != (self.artifacts, self.cargo_finished) {
             self.refresh_tty();
@@ -466,7 +473,6 @@ impl StdoutObserver for ReservedBuildProgress {
     }
 
     fn observe_stderr(&mut self, bytes: &[u8]) {
-        (self.stderr_tee)(bytes);
         self.observe_bytes(bytes, true);
     }
 
@@ -526,12 +532,6 @@ fn escape_free(value: &str) -> String {
             }
         })
         .collect()
-}
-
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|candidate| candidate == needle)
 }
 
 fn take_complete_lines(partial: &mut Vec<u8>) -> Option<Vec<u8>> {
@@ -644,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn stderr_is_teed_exactly_and_parsed_independently_from_stdout() {
+    fn stderr_suppresses_machine_records_and_preserves_diagnostics_exactly() {
         let started = Instant::now();
         let lines = Arc::new(Mutex::new(Vec::new()));
         let line_output = Arc::clone(&lines);
@@ -668,9 +668,10 @@ mod tests {
                     .extend_from_slice(bytes)
             }),
         );
-        let stderr_first = b"warning: live diagnostic\n{\"reason\":\"compiler-art";
-        let stderr_last =
-            b"ifact\"}\n{\"reason\":\"build-finished\",\"success\":true}\ntrailing diagnostic";
+        let stderr_first = b"warning: live diagnostic\r\n{\"reason\":\"compiler-art";
+        let stderr_last = b"ifact\"}\n\
+            {\"reason\":\"compiler-message\",\"message\":{\"rendered\":\"hidden\"}}\n\
+            {\"reason\":\"build-finished\",\"success\":true}\ntrailing diagnostic";
 
         progress.observe_stdout(br#"{"reason":"compiler-art"#);
         progress.observe_stderr(stderr_first);
@@ -678,13 +679,55 @@ mod tests {
         progress.observe_stderr(stderr_last);
         progress.finish_status(&ExitStatus::from_raw(0));
 
-        let mut expected_stderr = stderr_first.to_vec();
-        expected_stderr.extend_from_slice(stderr_last);
-        assert_eq!(*stderr.lock().expect("stderr bytes"), expected_stderr);
+        assert_eq!(
+            *stderr.lock().expect("stderr bytes"),
+            b"warning: live diagnostic\r\ntrailing diagnostic",
+        );
         let lines = lines.lock().expect("lines");
         let completion = lines.last().expect("completion");
         assert!(completion.contains("compiler-artifacts=2"));
         assert!(completion.contains("build-finished=success"));
+    }
+
+    #[test]
+    fn stderr_forwards_non_cargo_json_and_invalid_fragmented_json() {
+        let started = Instant::now();
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let line_output = Arc::clone(&lines);
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let stderr_output = Arc::clone(&stderr);
+        let mut progress = ReservedBuildProgress::plain_for_test_with_stderr(
+            "cargo ktstr verifier",
+            "coverage harness pre-build",
+            started,
+            Duration::from_secs(10),
+            Box::new(move |line| {
+                line_output
+                    .lock()
+                    .expect("line capture lock")
+                    .push(line.to_string())
+            }),
+            Box::new(move |bytes| {
+                stderr_output
+                    .lock()
+                    .expect("stderr capture lock")
+                    .extend_from_slice(bytes)
+            }),
+        );
+
+        progress.observe_stderr(b"{\"event\":\"application-json\"}\n{not");
+        assert_eq!(
+            *stderr.lock().expect("stderr bytes"),
+            b"{\"event\":\"application-json\"}\n",
+            "a partial diagnostic must wait for its line boundary",
+        );
+        progress.observe_stderr(b" json}\nunterminated diagnostic");
+        progress.finish_error(&std::io::Error::other("child failed"));
+
+        assert_eq!(
+            *stderr.lock().expect("stderr bytes"),
+            b"{\"event\":\"application-json\"}\n{not json}\nunterminated diagnostic",
+        );
     }
 
     #[test]
