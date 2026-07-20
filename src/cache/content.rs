@@ -365,9 +365,7 @@ fn gc_content_cache_at(
         .write(true)
         .open(&stamp)
         .with_context(|| format!("update content GC stamp {}", stamp.display()))?;
-    stamp_file
-        .sync_data()
-        .with_context(|| format!("sync content GC stamp {}", stamp.display()))?;
+    drop(stamp_file);
     Ok(())
 }
 
@@ -751,15 +749,13 @@ pub(crate) fn cached_file_digest_at_root(
             temporary
                 .write_all(&bytes)
                 .context("write file digest memo")?;
-            temporary
-                .as_file()
-                .sync_all()
-                .context("sync file digest memo")?;
+            // This is reconstructible cache state. The checksum and fixed
+            // envelope make a torn post-crash record fail closed, while
+            // persist keeps live readers from observing a partial write.
             temporary
                 .persist(&record_path)
                 .map_err(|error| error.error)
                 .with_context(|| format!("publish file digest memo {}", record_path.display()))?;
-            super::fsync_parent(&record_path).context("sync file digest memo parent")?;
             Ok(digest)
         },
     )?;
@@ -908,15 +904,13 @@ fn publish_content_object(
         .as_file()
         .set_permissions(std::fs::Permissions::from_mode(0o555))
         .context("make content object read-only executable")?;
-    temporary
-        .as_file()
-        .sync_all()
-        .context("sync content object temp")?;
+    // The object is reconstructible from the still-pinned source. Atomic
+    // publication and chmod-before-rename provide the live-process
+    // invariants without putting every cold builder behind storage barriers.
     let published = temporary
         .persist(final_path)
         .map_err(|error| error.error)
         .with_context(|| format!("publish content object {}", final_path.display()))?;
-    super::fsync_parent(final_path).context("sync content object parent")?;
     Ok(published)
 }
 
