@@ -540,6 +540,14 @@ fn wait_for_bpf_map_write_ready(
 
 const BPF_MAP_WRITE_CONSOLE_LOCK_POLL: Duration = Duration::from_millis(1);
 
+type ResolvedBpfMapWrite = (
+    BpfMapWriteParams,
+    monitor::bpf_map::BpfMapInfo,
+    usize,
+    usize,
+);
+type BpfMapWriteOutcome = (Option<u32>, bool, Option<u32>);
+
 /// Apply a resolved BPF-map write batch and publish its guest completion edge
 /// as one transaction with respect to virtio-console MMIO.
 ///
@@ -582,6 +590,65 @@ fn commit_bpf_map_writes_and_notify(
     // consumes the completion byte can never race ahead of host-side delivery
     // evidence.
     delivery.store(2, Ordering::Release);
+    true
+}
+
+/// Commit a fully resolved writer batch and render its per-field diagnostics.
+///
+/// Formatting and stderr I/O deliberately happen after
+/// [`commit_bpf_map_writes_and_notify`] releases the console. Captured output
+/// backpressure must never lengthen the device critical section which excludes
+/// vCPU console MMIO.
+fn apply_resolved_bpf_map_writes_and_notify(
+    accessor: &monitor::bpf_map::GuestMemMapAccessor<'_>,
+    resolved: &[ResolvedBpfMapWrite],
+    virtio_con: &PiMutex<virtio_console::VirtioConsole>,
+    kill: &AtomicBool,
+    delivery: &AtomicU8,
+) -> bool {
+    let mut outcomes: Vec<Option<BpfMapWriteOutcome>> = vec![None; resolved.len()];
+    if !commit_bpf_map_writes_and_notify(virtio_con, kill, delivery, || {
+        for ((params, map_info, offset, width), outcome) in resolved.iter().zip(&mut outcomes) {
+            // `write_value_u32` is a fixed 4-byte store; a field of a
+            // different width would truncate or clobber adjacent bytes.
+            if *width != 4 {
+                continue;
+            }
+            let before = accessor.read_value_u32(map_info, *offset);
+            let ok = accessor.write_value_u32(map_info, *offset, params.value);
+            let after = accessor.read_value_u32(map_info, *offset);
+            *outcome = Some((before, ok, after));
+        }
+    }) {
+        eprintln!("bpf_map_write: VM exited before the atomic write/completion transaction");
+        return false;
+    }
+
+    for ((params, map_info, offset, width), outcome) in resolved.iter().zip(&outcomes) {
+        if *width != 4 {
+            // A skipped write still gets a completion edge: phase 2 already
+            // resolved the map/field, and withholding the signal here would
+            // strand the guest in wait_for_map_write. The current crash/stall
+            // fields are both four-byte volatile ints.
+            eprintln!(
+                "bpf_map_write: field '{}' width {} != 4 in map '{}' — skipping (value is u32)",
+                params.field,
+                width,
+                map_info.name(),
+            );
+        } else if let Some((before, ok, after)) = outcome {
+            eprintln!(
+                "bpf_map_write: map '{}' field '{}' off={} write={} (value={} before={:?} after={:?})",
+                map_info.name(),
+                params.field,
+                offset,
+                ok,
+                params.value,
+                before,
+                after,
+            );
+        }
+    }
     true
 }
 
@@ -17751,75 +17818,14 @@ impl KtstrVm {
                 // contract: teardown before ownership means zero writes;
                 // ownership means the entire write + notification transaction
                 // completes even if the first store triggers teardown.
-                let mut write_outcomes = vec![None; resolved.len()];
-                let committed = commit_bpf_map_writes_and_notify(
+                if !apply_resolved_bpf_map_writes_and_notify(
+                    &accessor,
+                    &resolved,
                     &virtio_con,
                     &kill_clone,
                     &delivery,
-                    || {
-                        for ((params, map_info, offset, width), outcome) in
-                            resolved.iter().zip(&mut write_outcomes)
-                        {
-                            // `write_value_u32` is a fixed 4-byte store; a
-                            // field of a different width would truncate or
-                            // clobber adjacent bytes. crash/stall are
-                            // `volatile int` (4 bytes) — skip loudly rather
-                            // than silently mis-write any non-4-byte field
-                            // (the `BpfMapWrite` value is a `u32`). NOTE: a
-                            // skipped write still lets the completion edge
-                            // fire (signalling that every applicable write
-                            // completed). This asymmetry vs phase 2's
-                            // all-or-nothing resolution abort is deliberate:
-                            // phase 2 aborts BEFORE signalling because it
-                            // cannot proceed, whereas here the map/field DID
-                            // resolve — withholding the signal would hang the
-                            // guest in `wait_for_map_write` with no recovery,
-                            // so a loud skip + completed handshake is
-                            // preferred. Unreachable for the 4-byte
-                            // crash/stall fields today; the eprintln surfaces
-                            // it if a future non-4-byte field is queued.
-                            if *width != 4 {
-                                continue;
-                            }
-                            let before = accessor.read_value_u32(map_info, *offset);
-                            let ok =
-                                accessor.write_value_u32(map_info, *offset, params.value);
-                            let after = accessor.read_value_u32(map_info, *offset);
-                            *outcome = Some((before, ok, after));
-                        }
-                    },
-                );
-                if !committed {
-                    eprintln!(
-                        "bpf_map_write: VM exited before the atomic write/completion transaction"
-                    );
+                ) {
                     return;
-                }
-                // Keep formatting and stderr I/O outside the console critical
-                // section. A captured-output pipe must never lengthen the
-                // device transaction which excludes vCPU console MMIO.
-                for ((params, map_info, offset, width), outcome) in
-                    resolved.iter().zip(&write_outcomes)
-                {
-                    if *width != 4 {
-                        eprintln!(
-                            "bpf_map_write: field '{}' width {} != 4 in map '{}' — skipping (value is u32)",
-                            params.field,
-                            width,
-                            map_info.name(),
-                        );
-                    } else if let Some((before, ok, after)) = outcome {
-                        eprintln!(
-                            "bpf_map_write: map '{}' field '{}' off={} write={} (value={} before={:?} after={:?})",
-                            map_info.name(),
-                            params.field,
-                            offset,
-                            ok,
-                            params.value,
-                            before,
-                            after,
-                        );
-                    }
                 }
                 // Delivery evidence is published inside the transaction after
                 // every queued write and the console completion byte. The
