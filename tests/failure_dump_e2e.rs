@@ -40,7 +40,7 @@
 mod common;
 
 use anyhow::Result;
-use common::failure_dump::read_failure_dump;
+use common::failure_dump::{failure_dump_artifact, read_failure_dump};
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::prelude::{SCHEMA_SINGLE, VmResult};
@@ -76,6 +76,7 @@ fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Resul
 /// marker even though `expect_err` inverts the stall itself to PASS.
 fn check_bss_dump(result: &VmResult) -> Result<()> {
     let value = read_failure_dump(result)?;
+    let dump_artifact = failure_dump_artifact(result);
 
     // The full-dump happy path expects SCHEMA_SINGLE; a `degraded`
     // schema here means the freeze coordinator's capture-vs-degraded
@@ -127,8 +128,8 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
         })
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "dump has no scheduler `.bss` map (got {} maps): {value}",
-                maps.len()
+                "dump has no scheduler `.bss` map (got {} maps); {dump_artifact}",
+                maps.len(),
             )
         })?;
 
@@ -146,7 +147,7 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
     if kind != "struct" {
         anyhow::bail!(
             "expected .bss value to render as a Struct (kind=\"struct\"), got kind={kind:?}: \
-             {value_field}"
+             {dump_artifact}"
         );
     }
     let members = value_field
@@ -250,8 +251,8 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
             "dump JSON `vcpu_regs` has no entry with non-zero \
              instruction_pointer — every slot is null or has zero IP. \
              Capture-on-vCPU-thread path may be broken or rendezvous \
-             timed out before any vCPU completed handle_freeze. \
-             Full vcpu_regs: {vcpu_regs:?}"
+             timed out before any vCPU completed handle_freeze; \
+             {dump_artifact}"
         );
     }
 
@@ -361,8 +362,8 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
                  declares one via lib/arena_map.h, so either the dump \
                  path filtered it out, the map enumeration missed it, \
                  or the scheduler failed to load the arena. Got {} \
-                 maps total: {value}",
-                maps.len()
+                 maps total; {dump_artifact}",
+                maps.len(),
             )
         })?;
     // Arena map JSON shape:
@@ -379,7 +380,7 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
              BPF_MAP_TYPE_ARENA arm did not populate ArenaSnapshot \
              (likely arena_offsets was None: kernel BTF lacks \
              struct bpf_arena, or BpfArenaOffsets::from_btf failed). \
-             arena map JSON: {arena_map}"
+             {dump_artifact}"
         )
     })?;
 
@@ -391,7 +392,7 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
         Some(p) => p.as_array().map(|a| a.as_slice()).ok_or_else(|| {
             anyhow::anyhow!(
                 "arena.pages is present but not an array — \
-                 ArenaSnapshot serde shape changed. arena field: {arena_field}"
+                 ArenaSnapshot serde shape changed; {dump_artifact}"
             )
         })?,
         None => &[],
@@ -402,7 +403,7 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
              returned no pages. Either the PTE walker found no mapped \
              pgoffs (kern_vm translation failed for every page), \
              max_entries is 0, or scx_task_alloc never ran on any task \
-             (alloc_count={alloc_count_int}). arena field: {arena_field}"
+             (alloc_count={alloc_count_int}); {dump_artifact}"
         );
     }
 
@@ -420,16 +421,15 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
         anyhow::bail!(
             "arena.declared_pages is 0 (or absent) — \
              ArenaWalkPlan computed a zero-page span, meaning \
-             `info.max_entries` was unreadable or zero at dump time. \
-             arena field: {arena_field}"
+             `info.max_entries` was unreadable or zero at dump time; \
+             {dump_artifact}"
         );
     }
     if (arena_pages.len() as u64) > declared_pages {
         anyhow::bail!(
             "arena.pages.len() ({}) exceeds declared_pages ({}) — \
              walker invariant violated; ArenaWalkPlan should never \
-             emit more pages than the declared capacity. arena field: \
-             {arena_field}",
+             emit more pages than the declared capacity; {dump_artifact}",
             arena_pages.len(),
             declared_pages
         );
@@ -452,14 +452,14 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
     const KTSTR_ARENA_MAGIC_LE: [u8; 8] = KTSTR_ARENA_MAGIC.to_le_bytes();
     let mut magic_hits = 0usize;
     let mut total_bytes = 0usize;
-    for page in arena_pages {
+    for (page_index, page) in arena_pages.iter().enumerate() {
         let bytes = page
             .get("bytes")
             .and_then(|b| b.as_array())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "arena page missing `bytes` array — \
-                     ArenaPage serde shape changed. page: {page}"
+                    "arena page {page_index} is missing its `bytes` array — \
+                     ArenaPage serde shape changed; {dump_artifact}"
                 )
             })?;
         // Each element must be a u8; collect into a flat Vec<u8>.
@@ -605,6 +605,7 @@ fn failure_dump_renders_array_entries(ctx: &ktstr::scenario::Ctx) -> Result<Asse
 /// even though expect_err inverts the stall itself to PASS.
 fn check_array_entries_dump(result: &VmResult) -> Result<()> {
     let value = read_failure_dump(result)?;
+    let dump_artifact = failure_dump_artifact(result);
 
     let schema = value
         .get("schema")
@@ -639,8 +640,8 @@ fn check_array_entries_dump(result: &VmResult) -> Result<()> {
             anyhow::anyhow!(
                 "dump has no multi-entry ARRAY fixture (map_type=2, max_entries=16) — \
                  the scx-ktstr ktstr_array_fixture map is missing from the IDR walk \
-                 or was mis-typed by the renderer. maps={}: {value}",
-                maps.len()
+                 or was mis-typed by the renderer. maps={}; {dump_artifact}",
+                maps.len(),
             )
         })?;
 
@@ -777,6 +778,7 @@ fn scenario_failure_dump_renders_capture_modules(
 /// marker even though `expect_err` inverts the stall itself to PASS.
 fn check_capture_dump(result: &VmResult) -> Result<()> {
     let value = read_failure_dump(result)?;
+    let dump_artifact = failure_dump_artifact(result);
 
     // The freeze coordinator captures one `vcpu_regs` slot per booted
     // vCPU (BSP + APs), so its length is the authoritative online-CPU
@@ -791,7 +793,7 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "dump JSON missing `vcpu_regs` — cannot determine the expected \
-                 per-CPU count for the walker cross-check. Full JSON: {value}"
+                 per-CPU count for the walker cross-check; {dump_artifact}"
             )
         })?;
 
@@ -807,7 +809,7 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
         anyhow::bail!(
             "scx_walker_unavailable={reason:?} — capture_scx::build returned \
              None or the walker reached no state. Captures must always \
-             produce data when scx-ktstr is loaded. Full JSON: {value}"
+             produce data when scx-ktstr is loaded; {dump_artifact}"
         );
     }
     let rq_scx_states = value
@@ -816,7 +818,7 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "dump JSON missing `rq_scx_states` array — capture_scx \
-                 wiring did not populate the field. Full JSON: {value}"
+                 wiring did not populate the field; {dump_artifact}"
             )
         })?;
     if rq_scx_states.len() != num_cpus {
@@ -826,7 +828,7 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
              collect_vcpu_regs). walk_rq_scx silently skips a CPU on \
              sub-group offset / per-CPU rq translate failure, so fewer \
              entries means a skipped CPU; more means a walker over-count. \
-             Full rq_scx_states: {rq_scx_states:?}",
+             {dump_artifact}",
             rq_scx_states.len(),
         );
     }
@@ -846,7 +848,7 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
              CPU's rq->scx scalar read came back zero, meaning the walker \
              ran but every per-CPU scx_rq is empty. Either no scx tasks \
              were ever runnable or the rq_pa translate produced wrong \
-             addresses. Full rq_scx_states: {rq_scx_states:?}"
+             addresses; {dump_artifact}"
         );
     }
 
@@ -856,14 +858,14 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "dump JSON missing `dsq_states` array — capture_scx \
-                 wiring did not populate the field. Full JSON: {value}"
+                 wiring did not populate the field; {dump_artifact}"
             )
         })?;
     if dsq_states.is_empty() {
         anyhow::bail!(
             "dsq_states is empty — walk_dsqs reached no DSQs. The \
              global DSQ (SCX_DSQ_GLOBAL per-node) must always be \
-             reachable when *scx_root is non-null. Full JSON: {value}"
+             reachable when *scx_root is non-null; {dump_artifact}"
         );
     }
 
@@ -873,7 +875,7 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
         anyhow::bail!(
             "scx_sched_state is absent or null — read_scx_sched_state \
              returned None. *scx_root was unreadable or the BTF offsets \
-             didn't resolve. Full JSON: {value}"
+             didn't resolve; {dump_artifact}"
         );
     }
 
@@ -891,8 +893,8 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
         anyhow::bail!(
             "task_enrichments_unavailable={reason:?} — capture_tasks::build \
              returned None or the walker yielded zero tasks. Captures \
-             must always produce data when scx tasks are runnable. Full \
-             JSON: {value}"
+             must always produce data when scx tasks are runnable; \
+             {dump_artifact}"
         );
     }
     let task_enrichments = value
@@ -902,14 +904,14 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
             anyhow::anyhow!(
                 "dump JSON missing `task_enrichments` array — \
                  capture_tasks wiring did not populate the field. \
-                 Full JSON: {value}"
+                 {dump_artifact}"
             )
         })?;
     if task_enrichments.is_empty() {
         anyhow::bail!(
             "task_enrichments is empty — runnable_list walker found no \
              tasks. With workers_per_cgroup>0 driving load, at least \
-             one task must be runnable at freeze time. Full JSON: {value}"
+             one task must be runnable at freeze time; {dump_artifact}"
         );
     }
     // At least one enrichment must carry an identity that proves the
@@ -929,7 +931,8 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
             "no task_enrichment entry has pid>0 AND non-empty comm — \
              every task_struct read produced pid<=0 or empty comm, \
              meaning the slab translate fell back to garbage memory. \
-             Full task_enrichments: {task_enrichments:?}"
+             entries={}; {dump_artifact}",
+            task_enrichments.len(),
         );
     }
 
@@ -954,7 +957,7 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
         anyhow::bail!(
             "per_node_numa is empty AND per_node_numa_unavailable is \
              absent — the dump pipeline broke its own contract that \
-             one of the two must be populated. Full JSON: {value}"
+             one of the two must be populated; {dump_artifact}"
         );
     }
 
@@ -1052,6 +1055,7 @@ fn scenario_failure_dump_renders_probe_counters(
 /// inverts the stall itself to PASS.
 fn check_probe_dump(result: &VmResult) -> Result<()> {
     let value = read_failure_dump(result)?;
+    let dump_artifact = failure_dump_artifact(result);
 
     // `probe_counters` is `skip_serializing_if = "Option::is_none"`,
     // so its absence in the JSON means the host-side decoder
@@ -1063,15 +1067,15 @@ fn check_probe_dump(result: &VmResult) -> Result<()> {
             "dump JSON missing `probe_counters` field — \
              decode_probe_counters_snapshot returned None. \
              Probe `.bss` map absent, BTF lookup failed, or the \
-             `ktstr_pcpu_counters` array offset didn't resolve. \
-             Full JSON: {value}"
+             `ktstr_pcpu_counters` array offset didn't resolve; \
+             {dump_artifact}"
         )
     })?;
     if probe_counters.is_null() {
         anyhow::bail!(
             "`probe_counters` is null — decoder ran but produced None; \
-             same prerequisite-missing failure modes as above. \
-             Full JSON: {value}"
+             same prerequisite-missing failure modes as above; \
+             {dump_artifact}"
         );
     }
 

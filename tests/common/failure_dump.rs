@@ -35,6 +35,19 @@
 use anyhow::{Context, Result};
 use ktstr::prelude::{VmResult, post_vm_skip};
 
+/// A bounded diagnostic that points at the authoritative JSON artifact.
+///
+/// Failure dumps can contain captured arena pages and other large byte arrays.
+/// Embedding the parsed top-level value in an assertion error duplicates that
+/// artifact onto nextest's stdout and can emit hundreds of megabytes during a
+/// storm. Keep assertion messages actionable without copying the payload.
+pub fn failure_dump_artifact(result: &VmResult) -> String {
+    match result.failure_dump_path() {
+        Ok(path) => format!("full dump preserved at {}", path.display()),
+        Err(error) => format!("full dump path unavailable: {error:#}"),
+    }
+}
+
 /// Reads + parses the freeze coordinator's host-side failure dump for
 /// `result`, skipping (via [`post_vm_skip`]) only when the dump is a
 /// PLACEHOLDER — the freeze captured no real state (rendezvous timeout

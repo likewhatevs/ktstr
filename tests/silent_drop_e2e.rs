@@ -62,7 +62,7 @@
 mod common;
 
 use anyhow::Result;
-use common::failure_dump::read_dump_skip_placeholder;
+use common::failure_dump::{failure_dump_artifact, read_dump_skip_placeholder};
 use ktstr::assert::AssertResult;
 use ktstr::prelude::{SCHEMA_SINGLE, VmResult};
 use ktstr::scenario::ops::{HoldSpec, Step, await_accessor_ready, execute_steps};
@@ -121,12 +121,15 @@ fn check_captured_emit_schema(result: &VmResult) -> Result<()> {
         .entry_name
         .ok_or_else(|| anyhow::anyhow!("VmResult.entry_name is None"))?;
     let value = read_dump_skip_placeholder(result)?;
+    let dump_artifact = failure_dump_artifact(result);
 
     let schema = value
         .get("schema")
         .and_then(|s| s.as_str())
         .ok_or_else(|| {
-            anyhow::anyhow!("dump JSON missing top-level `schema` field; payload: {value}")
+            anyhow::anyhow!(
+                "dump JSON missing top-level `schema` field; {dump_artifact}"
+            )
         })?;
     anyhow::ensure!(
         schema == SCHEMA_SINGLE,
