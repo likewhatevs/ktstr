@@ -44,8 +44,8 @@ use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use super::FlockMode;
@@ -335,18 +335,29 @@ static INTERRUPTIBLE_HANDLER_WRITERS: AtomicUsize = AtomicUsize::new(0);
 /// Eventfd handoff from the async handler to the normal-context broker.
 static INTERRUPTIBLE_BROKER_EVENTFD: AtomicI32 = AtomicI32::new(NO_BROKER_EVENTFD);
 static INTERRUPTIBLE_BROKER_REQUEST: AtomicU32 = AtomicU32::new(NO_INTERRUPTIBLE_WAITER);
-static INTERRUPTIBLE_BROKER_STOPPING: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static INTERRUPTIBLE_BROKER_SIGNAL_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static INTERRUPTIBLE_BROKER_TID: AtomicU32 = AtomicU32::new(0);
 
 struct InterruptibleFlockBroker {
     eventfd: OwnedFd,
+    stopping: Arc<AtomicBool>,
     thread: JoinHandle<()>,
 }
 
-static INTERRUPTIBLE_BROKER: Mutex<Option<InterruptibleFlockBroker>> = Mutex::new(None);
+struct InterruptibleFlockBrokerState {
+    active: Option<InterruptibleFlockBroker>,
+    retired: Vec<JoinHandle<()>>,
+}
 
-fn broker_state() -> std::sync::MutexGuard<'static, Option<InterruptibleFlockBroker>> {
+static INTERRUPTIBLE_BROKER: Mutex<InterruptibleFlockBrokerState> =
+    Mutex::new(InterruptibleFlockBrokerState {
+        active: None,
+        retired: Vec::new(),
+    });
+
+fn broker_state() -> std::sync::MutexGuard<'static, InterruptibleFlockBrokerState> {
     INTERRUPTIBLE_BROKER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -361,7 +372,16 @@ fn broker_state() -> std::sync::MutexGuard<'static, Option<InterruptibleFlockBro
 /// unit tests isolated.
 pub fn start_interruptible_flock_broker() -> Result<()> {
     let mut state = broker_state();
-    if state.is_some() {
+    // A normal cargo-ktstr process owns one broker epoch and exits after
+    // stopping it. Tests may deliberately restart the broker; join retired
+    // generations here, before publishing any new request/eventfd state, so
+    // an old reader can never consume a later generation's request.
+    for retired in state.retired.drain(..) {
+        if retired.join().is_err() {
+            anyhow::bail!("retired interruptible flock broker thread panicked");
+        }
+    }
+    if state.active.is_some() {
         anyhow::bail!("interruptible flock broker is already running");
     }
     if INTERRUPTIBLE_WAITER_ID.load(Ordering::SeqCst) != NO_INTERRUPTIBLE_WAITER {
@@ -410,31 +430,42 @@ pub fn start_interruptible_flock_broker() -> Result<()> {
     }
 
     INTERRUPTIBLE_BROKER_REQUEST.store(NO_INTERRUPTIBLE_WAITER, Ordering::SeqCst);
-    INTERRUPTIBLE_BROKER_STOPPING.store(false, Ordering::SeqCst);
     #[cfg(test)]
     INTERRUPTIBLE_BROKER_SIGNAL_COUNT.store(0, Ordering::SeqCst);
+    let broker_eventfd = eventfd
+        .try_clone()
+        .map_err(|error| anyhow::anyhow!("clone interruptible flock broker eventfd: {error}"))?;
+    let stopping = Arc::new(AtomicBool::new(false));
+    let broker_stopping = Arc::clone(&stopping);
     let thread = std::thread::Builder::new()
         .name("ktstr-flock-wake".into())
-        .spawn(move || interruptible_flock_broker_loop(raw_fd))
+        .spawn(move || interruptible_flock_broker_loop(broker_eventfd, broker_stopping))
         .map_err(|error| anyhow::anyhow!("spawn interruptible flock broker: {error}"))?;
 
     // Publish only after the broker thread exists and owns its read loop.
     INTERRUPTIBLE_BROKER_EVENTFD.store(raw_fd, Ordering::SeqCst);
-    *state = Some(InterruptibleFlockBroker { eventfd, thread });
+    state.active = Some(InterruptibleFlockBroker {
+        eventfd,
+        stopping,
+        thread,
+    });
     Ok(())
 }
 
-/// Stop and join the interruptible-flock broker.
+/// Stop the interruptible-flock broker without waiting for its thread to run.
 ///
 /// Hiding the eventfd and draining handler writers before the owned wake/close
-/// ensures an async handler can never write through a recycled fd number.
+/// ensures an async handler can never write through a recycled fd number. The
+/// broker owns a duplicate eventfd and a generation-local stop flag, so it can
+/// finish asynchronously even when the host scheduler has starved that one
+/// thread. A later explicit restart joins retired generations before publishing
+/// new global request state.
 pub fn stop_interruptible_flock_broker() {
     let mut state = broker_state();
-    let Some(broker) = state.take() else {
+    let Some(broker) = state.active.take() else {
         return;
     };
 
-    INTERRUPTIBLE_BROKER_STOPPING.store(true, Ordering::SeqCst);
     let raw_fd = broker.eventfd.as_raw_fd();
     let hidden = INTERRUPTIBLE_BROKER_EVENTFD.compare_exchange(
         raw_fd,
@@ -451,9 +482,10 @@ pub fn stop_interruptible_flock_broker() {
         std::hint::spin_loop();
     }
 
+    broker.stopping.store(true, Ordering::SeqCst);
     // Wake the broker through the still-owned fd after handlers can no longer
-    // load it. Failure is harmless only if the broker already observed STOPPING
-    // after a prior handler wake.
+    // load it. Its duplicate keeps the eventfd object alive until the broker
+    // observes this generation's stop flag and exits.
     let one = 1_u64;
     unsafe {
         libc::write(
@@ -462,21 +494,24 @@ pub fn stop_interruptible_flock_broker() {
             std::mem::size_of::<u64>(),
         );
     }
-    broker
-        .thread
-        .join()
-        .expect("interruptible flock broker thread panicked");
     drop(broker.eventfd);
-
     INTERRUPTIBLE_BROKER_REQUEST.store(NO_INTERRUPTIBLE_WAITER, Ordering::SeqCst);
     INTERRUPTIBLE_BROKER_EVENTFD.store(NO_BROKER_EVENTFD, Ordering::SeqCst);
-    INTERRUPTIBLE_BROKER_STOPPING.store(false, Ordering::SeqCst);
+    state.retired.push(broker.thread);
 }
 
-fn interruptible_flock_broker_loop(eventfd: RawFd) {
+fn interruptible_flock_broker_loop(eventfd: OwnedFd, stopping: Arc<AtomicBool>) {
+    #[cfg(test)]
+    {
+        // SAFETY: `SYS_gettid` has no pointer arguments.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+        assert!(tid > 0 && tid <= u32::MAX as libc::c_long);
+        INTERRUPTIBLE_BROKER_TID.store(tid as u32, Ordering::SeqCst);
+    }
+    let raw_fd = eventfd.as_raw_fd();
     loop {
         let mut pollfd = libc::pollfd {
-            fd: eventfd,
+            fd: raw_fd,
             events: libc::POLLIN,
             revents: 0,
         };
@@ -489,8 +524,8 @@ fn interruptible_flock_broker_loop(eventfd: RawFd) {
             continue;
         }
 
-        drain_interruptible_broker_eventfd(eventfd);
-        if INTERRUPTIBLE_BROKER_STOPPING.load(Ordering::SeqCst) {
+        drain_interruptible_broker_eventfd(raw_fd);
+        if stopping.load(Ordering::SeqCst) {
             break;
         }
 
@@ -504,14 +539,14 @@ fn interruptible_flock_broker_loop(eventfd: RawFd) {
         // queue contention therefore retains one FIFO flock request, while a
         // signal that landed just before syscall entry cannot strand it.
         loop {
-            if INTERRUPTIBLE_BROKER_STOPPING.load(Ordering::SeqCst)
-                || !broker_signal_waiter_if_live(waiter_id)
-            {
+            if stopping.load(Ordering::SeqCst) || !broker_signal_waiter_if_live(waiter_id) {
                 break;
             }
             std::thread::sleep(INTERRUPT_WAKE_RETRY);
         }
     }
+    #[cfg(test)]
+    INTERRUPTIBLE_BROKER_TID.store(0, Ordering::SeqCst);
 }
 
 fn drain_interruptible_broker_eventfd(eventfd: RawFd) {
@@ -568,6 +603,11 @@ pub fn interruptible_flock_waiter_id() -> u32 {
 #[cfg(test)]
 pub(crate) fn interruptible_flock_broker_signal_count() -> usize {
     INTERRUPTIBLE_BROKER_SIGNAL_COUNT.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+pub(crate) fn interruptible_flock_broker_tid() -> u32 {
+    INTERRUPTIBLE_BROKER_TID.load(Ordering::SeqCst)
 }
 
 /// Hand cancellation of an exact waiter generation to the broker.

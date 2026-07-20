@@ -516,8 +516,10 @@ impl Drop for InterruptGuard {
         }
 
         // No cleanup-owned waiter remains when the top-level guard drops.
-        // Hide and join the broker while our handler is still installed, so a
-        // late handler can observe only a closed broker epoch.
+        // Hide and retire the broker while our handler is still installed, so
+        // a late handler can observe only a closed broker epoch. Retirement is
+        // deliberately non-blocking: error reporting must not wait for a
+        // scheduler-starved broker thread to receive a userspace timeslice.
         ktstr::flock::stop_interruptible_flock_broker();
 
         // SAFETY: these are the dispositions returned by `sigaction` during
@@ -2335,31 +2337,19 @@ pub(crate) fn commit_startup_worker_exit(code: u8) {
 /// Enter the hidden process-group anchor mode.
 ///
 /// Called as the first line of cargo-ktstr's `main`. A normal invocation
-/// returns false. An anchor invocation acknowledges readiness on stdout,
-/// ignores SIGINT/SIGTERM, and blocks until its stdin control pipe reaches
-/// EOF, then returns true so main exits cleanly.
+/// returns false. An anchor inherits SIGINT/SIGTERM blocked across spawn,
+/// installs ignored dispositions before unblocking them, and then blocks
+/// until its stdin control pipe reaches EOF. The inherited mask makes the
+/// kernel-established process group safe to publish immediately: anchor
+/// userspace does not need to run before the real child can start.
 pub(crate) fn run_anchor_mode_if_requested() -> bool {
     if std::env::var_os(ANCHOR_MODE_ENV).is_none() {
         return false;
     }
 
-    // The ready byte is the parent's proof that this process can pin the pgid
-    // across forwarded terminal signals. Never acknowledge readiness after a
-    // partial disposition or mask install.
     if initialize_anchor_signal_state().is_err() {
         fail_closed_child_ownership();
     }
-
-    use std::io::Write;
-    let mut stdout = std::io::stdout().lock();
-    if stdout
-        .write_all(b"R")
-        .and_then(|()| stdout.flush())
-        .is_err()
-    {
-        return true;
-    }
-    drop(stdout);
 
     let mut stdin = std::io::stdin().lock();
     let mut byte = [0_u8; 64];
@@ -2579,7 +2569,7 @@ struct SignalMaskGuard {
 }
 
 impl SignalMaskGuard {
-    fn unblock_for_spawn() -> io::Result<Self> {
+    fn update_for_spawn(operation: libc::c_int) -> io::Result<Self> {
         // SAFETY: valid signal-set pointers; pthread_sigmask changes only the
         // calling thread, which is exactly the mask the child inherits.
         unsafe {
@@ -2588,12 +2578,20 @@ impl SignalMaskGuard {
             libc::sigaddset(&mut set, libc::SIGINT);
             libc::sigaddset(&mut set, libc::SIGTERM);
             let mut previous: libc::sigset_t = std::mem::zeroed();
-            let rc = libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, &mut previous);
+            let rc = libc::pthread_sigmask(operation, &set, &mut previous);
             if rc != 0 {
                 return Err(io::Error::from_raw_os_error(rc));
             }
             Ok(Self { previous })
         }
+    }
+
+    fn unblock_for_spawn() -> io::Result<Self> {
+        Self::update_for_spawn(libc::SIG_UNBLOCK)
+    }
+
+    fn block_for_spawn() -> io::Result<Self> {
+        Self::update_for_spawn(libc::SIG_BLOCK)
     }
 }
 
@@ -2608,6 +2606,11 @@ impl Drop for SignalMaskGuard {
 
 fn spawn_with_unblocked_signals(command: &mut Command) -> io::Result<Child> {
     let _mask = SignalMaskGuard::unblock_for_spawn()?;
+    command.spawn()
+}
+
+fn spawn_with_blocked_terminal_signals(command: &mut Command) -> io::Result<Child> {
+    let _mask = SignalMaskGuard::block_for_spawn()?;
     command.spawn()
 }
 
@@ -2667,10 +2670,12 @@ fn anchor_command() -> io::Result<Command> {
     #[cfg(test)]
     {
         // A libtest binary does not enter cargo-ktstr's main, so use a shell
-        // composed entirely of builtins as the test anchor.
+        // composed entirely of builtins as the test anchor. It deliberately
+        // has no userspace readiness protocol: unit tests exercise the same
+        // kernel-established pgid handoff as production.
         let mut command = Command::new("/bin/sh");
         command.arg("-c").arg(
-            "trap '' INT TERM; printf R; \
+            "trap '' INT TERM; \
              while IFS= read -r _ktstr_anchor_line; do :; done",
         );
         Ok(command)
@@ -2681,91 +2686,44 @@ fn spawn_anchor() -> io::Result<GroupAnchor> {
     let mut command = anchor_command()?;
     command
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0);
-    let mut owner = ArmedChild::new(spawn_with_unblocked_signals(&mut command)?);
+    // The anchor must survive terminal signals delivered after its pgid is
+    // published but before its userspace entry point is scheduled. Inherit
+    // those signals blocked; anchor mode installs SIG_IGN before unblocking.
+    let mut owner = ArmedChild::new(spawn_with_blocked_terminal_signals(&mut command)?);
     let pgid = libc::pid_t::try_from(owner.child().id())
         .ok()
         .filter(|pid| *pid > 0)
         .ok_or_else(|| io::Error::other("anchor child id is not a valid process-group id"))?;
+    // `process_group(0)` is applied as part of the spawn operation, before
+    // Command::spawn returns. This check therefore depends only on kernel
+    // state, never on the anchor receiving a userspace timeslice.
+    // SAFETY: `pgid` is the live, unreaped anchor child.
+    let actual_pgid = unsafe { libc::getpgid(pgid) };
+    if actual_pgid < 0 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("inspect process group for anchor pid {pgid}: {error}"),
+        ));
+    }
+    if actual_pgid != pgid {
+        return Err(io::Error::other(format!(
+            "anchor process group was not established (pid {pgid}, pgid {actual_pgid})",
+        )));
+    }
     let control = owner
         .child_mut()
         .stdin
         .take()
         .ok_or_else(|| io::Error::other("anchor stdin control pipe missing"))?;
-    let mut ready = owner
-        .child_mut()
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("anchor stdout ready pipe missing"))?;
-    let mut anchor = GroupAnchor {
+    Ok(GroupAnchor {
         child: owner.into_child(),
         control: Some(control),
         pgid,
-    };
-    let byte = match read_anchor_ready(&mut ready, pgid) {
-        Ok(byte) => byte,
-        Err(error) => {
-            if release_anchor(&mut anchor).is_err() {
-                fail_closed_child_ownership();
-            }
-            return Err(error);
-        }
-    };
-    if byte != b'R' {
-        if release_anchor(&mut anchor).is_err() {
-            fail_closed_child_ownership();
-        }
-        return Err(io::Error::other("anchor emitted an invalid ready byte"));
-    }
-    // SAFETY: `pgid` is the live anchor's positive child pid. Readiness means
-    // it is already executing its blocking anchor mode.
-    let actual_pgid = unsafe { libc::getpgid(pgid) };
-    if actual_pgid != pgid {
-        if release_anchor(&mut anchor).is_err() {
-            fail_closed_child_ownership();
-        }
-        return Err(io::Error::other(format!(
-            "anchor process group was not established (pid {pgid}, pgid {actual_pgid})",
-        )));
-    }
-    Ok(anchor)
-}
-
-fn read_anchor_ready(ready: &mut ChildStdout, anchor_pid: libc::pid_t) -> io::Result<u8> {
-    set_nonblocking(ready.as_raw_fd())?;
-    // The exact unreaped child pid cannot be reused. A pre-ready SIGSTOP must
-    // not turn readiness into an unbounded pipe read.
-    // SAFETY: signal the exact child pid only.
-    let _ = unsafe { libc::kill(anchor_pid, libc::SIGCONT) };
-    let deadline = Instant::now() + ANCHOR_REAP_BACKSTOP;
-    let mut byte = [0_u8; 1];
-    loop {
-        match ready.read(&mut byte) {
-            Ok(1) => return Ok(byte[0]),
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "process-group anchor closed its ready pipe",
-                ));
-            }
-            Ok(_) => unreachable!("one-byte anchor ready read"),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                ) => {}
-            Err(error) => return Err(error),
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "process-group anchor did not become ready",
-            ));
-        }
-        std::thread::sleep(GROUP_SCAN_INTERVAL);
-    }
+    })
 }
 
 fn release_anchor(anchor: &mut GroupAnchor) -> io::Result<ExitStatus> {
@@ -5402,7 +5360,7 @@ mod tests {
             |_| Ok(()),
             || Err(io::Error::other("injected mask failure")),
         )
-        .expect_err("an anchor mask failure must prevent readiness");
+        .expect_err("an anchor mask failure must prevent initialization");
         assert!(error.to_string().contains("mask failure"));
     }
 
@@ -5941,6 +5899,33 @@ mod tests {
         );
         assert_eq!(active_group_for_test(), IDLE);
         drop(guard);
+    }
+
+    #[test]
+    fn anchor_spawn_uses_kernel_group_and_inherited_terminal_mask() {
+        let _serial = test_serial_guard();
+
+        let mut anchor = spawn_anchor().expect("kernel-established anchor process group");
+        let status = std::fs::read_to_string(format!("/proc/{}/status", anchor.pgid))
+            .expect("read anchor signal mask");
+        let blocked = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigBlk:\t"))
+            .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+            .expect("parse anchor SigBlk mask");
+        let terminal_mask = (1_u64 << (libc::SIGINT - 1)) | (1_u64 << (libc::SIGTERM - 1));
+
+        let release = release_anchor(&mut anchor);
+
+        assert_eq!(
+            blocked & terminal_mask,
+            terminal_mask,
+            "anchor inherits both terminal signals blocked without a userspace handshake",
+        );
+        assert!(
+            release.expect("reap anchor").success(),
+            "anchor exits on control EOF",
+        );
     }
 
     #[test]
