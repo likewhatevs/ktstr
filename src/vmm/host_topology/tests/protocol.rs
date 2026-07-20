@@ -2975,10 +2975,13 @@ fn granted_commit_is_terminal_even_if_cancellation_arrives_afterward() {
         });
         let _ = waiter_tx.send(result);
     });
-    let locks = match recv_from_service_thread(
+    let locks = match recv_with_task_service(
         &waiter_rx,
         "disjoint granted waiter completion",
-        &waiter_worker,
+        &[
+            waiter_worker.service.clone(),
+            coordinator_worker.service.clone(),
+        ],
     ) {
         Ok(result) => result.expect("granted waiter must return committed success"),
         Err(error) => {

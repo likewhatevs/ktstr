@@ -25,6 +25,8 @@
 use std::path::{Path, PathBuf};
 
 const CARGO_KTSTR_BINARY: &str = env!("CARGO_BIN_EXE_cargo-ktstr");
+const FIXTURE_RESOLVER: &str = "3";
+const FIXTURE_TEST_DEBUG: &str = "line-tables-only";
 
 fn toml_string(path: &Path) -> String {
     serde_json::to_string(&path.to_string_lossy()).expect("path JSON string")
@@ -50,6 +52,158 @@ fn shared_target_dir() -> PathBuf {
         .and_then(Path::parent)
         .expect("integration test executable under target/<profile>/deps")
         .to_path_buf()
+}
+
+/// Keep nested workspaces below the repository so Cargo discovers the same
+/// ancestor `.cargo/config.toml` (and therefore the same rustflags) as the
+/// parent build and every sibling fixture sharing its target directory.
+fn fixture_tempdir(ktstr_root: &Path) -> tempfile::TempDir {
+    let scratch = ktstr_root.join("target/verifier-discovery-fixtures");
+    std::fs::create_dir_all(&scratch).expect("create verifier fixture scratch directory");
+    tempfile::Builder::new()
+        .prefix("workspace-")
+        .tempdir_in(scratch)
+        .expect("fixture tempdir")
+}
+
+fn fixture_diagnostics_dir(temp: &tempfile::TempDir) -> PathBuf {
+    std::env::var_os("KTSTR_BUILD_DIAGNOSTICS_DIR")
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+        .map(|root| {
+            root.join("verifier-discovery").join(
+                temp.path()
+                    .file_name()
+                    .expect("verifier fixture tempdir has a basename"),
+            )
+        })
+        .unwrap_or_else(|| temp.path().join("cargo-diagnostics"))
+}
+
+/// Render a fixture dependency with this parent test binary's ktstr features.
+///
+/// These nested workspaces intentionally share the parent target directory.
+/// Keeping their feature fingerprint identical makes the conflict and success
+/// fixtures share one dependency unit: narrower per-fixture dependencies made
+/// Cargo build separate whole-ktstr variants while nextest saturated the host.
+fn parent_ktstr_dependency(dependency: &str, ktstr_root: &Path) -> String {
+    let mut features = Vec::new();
+    for (name, enabled) in [
+        ("integration", cfg!(feature = "integration")),
+        ("wprof", cfg!(feature = "wprof")),
+        ("pretty-labels", cfg!(feature = "pretty-labels")),
+        ("remote-cache", cfg!(feature = "remote-cache")),
+    ] {
+        if enabled {
+            features.push(name);
+        }
+    }
+    format!(
+        "{dependency} = {{ package = \"ktstr\", path = {}, optional = true, features = {} }}",
+        toml_string(ktstr_root),
+        serde_json::to_string(&features).expect("serialize fixture feature list"),
+    )
+}
+
+/// Reproduce the parent integration-test dependency graph as well as its ktstr
+/// feature set. Cargo fingerprints ktstr's direct dependency units, so root
+/// dev-dependency feature unification (for example
+/// `virtio-queue/test-utils`) is part of whether its library artifact can be
+/// reused by the sibling nested build.
+fn parent_dev_dependencies(ktstr_root: &Path) -> String {
+    let manifest =
+        std::fs::read_to_string(ktstr_root.join("Cargo.toml")).expect("read parent ktstr manifest");
+    let marker = "\n[dev-dependencies]\n";
+    let (_, table) = manifest
+        .split_once(marker)
+        .expect("parent manifest has a dev-dependencies table");
+    let end = table.find("\n[").unwrap_or(table.len());
+    format!("[dev-dependencies]\n{}", table[..end].trim_end())
+}
+
+fn active_parent_ktstr_features() -> std::collections::BTreeSet<String> {
+    [
+        ("default", cfg!(feature = "default")),
+        ("cli-bins", cfg!(feature = "cli-bins")),
+        ("export", cfg!(feature = "export")),
+        ("vendored", cfg!(feature = "vendored")),
+        ("integration", cfg!(feature = "integration")),
+        ("wprof", cfg!(feature = "wprof")),
+        ("pretty-labels", cfg!(feature = "pretty-labels")),
+        ("remote-cache", cfg!(feature = "remote-cache")),
+    ]
+    .into_iter()
+    .filter(|(_, enabled)| *enabled)
+    .map(|(name, _)| name.to_owned())
+    .collect()
+}
+
+/// Assert that nested Cargo resolved exactly the parent's ktstr feature set.
+///
+/// The root package is a primary workspace unit while these fixtures consume
+/// it as a dependency, so Cargo may legitimately assign the two units
+/// different artifact hashes. Exact feature parity still makes both nested
+/// fixtures share one dependency-unit variant instead of compiling separate
+/// no-feature and vendored-only copies.
+fn assert_parent_ktstr_artifact_feature_parity(diagnostics: &Path, ktstr_root: &Path) {
+    let expected_manifest = ktstr_root
+        .join("Cargo.toml")
+        .canonicalize()
+        .expect("canonicalize parent ktstr manifest");
+    let expected_features = active_parent_ktstr_features();
+    let mut found_library_artifact = false;
+    for entry in std::fs::read_dir(diagnostics).expect("read nested Cargo diagnostics") {
+        let path = entry.expect("nested Cargo diagnostic entry").path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.contains("selected-test-binary-compile") || !name.ends_with(".stdout.log") {
+            continue;
+        }
+        let stream = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        for line in stream.lines() {
+            let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if message["reason"] != "compiler-artifact"
+                || message["target"]["name"] != "ktstr"
+                || !message["target"]["kind"]
+                    .as_array()
+                    .is_some_and(|kinds| kinds.iter().any(|kind| kind == "lib"))
+            {
+                continue;
+            }
+            let Some(manifest) = message["manifest_path"].as_str() else {
+                continue;
+            };
+            if Path::new(manifest) != expected_manifest {
+                continue;
+            }
+            found_library_artifact = true;
+            let observed_features = message["features"]
+                .as_array()
+                .expect("ktstr artifact features are an array")
+                .iter()
+                .map(|feature| {
+                    feature
+                        .as_str()
+                        .expect("ktstr artifact feature is a string")
+                        .to_owned()
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                observed_features, expected_features,
+                "nested verifier fixture resolved a different ktstr feature fingerprint; \
+                 full artifact (including hash/fresh evidence)={message}",
+            );
+        }
+    }
+    assert!(
+        found_library_artifact,
+        "nested verifier diagnostics contained no parent ktstr library artifact under {}",
+        diagnostics.display(),
+    );
 }
 
 fn copy_tree(source: &Path, destination: &Path) {
@@ -106,6 +260,46 @@ fn exactly_one_verifier_cell_passed(stderr: &str) -> bool {
 }
 
 #[test]
+fn nested_fixture_dependency_aliases_have_identical_cargo_fingerprint_inputs() {
+    let ktstr_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let direct = parent_ktstr_dependency("ktstr", &ktstr_root);
+    let aliased = parent_ktstr_dependency("test_harness", &ktstr_root);
+    let direct_value = direct
+        .split_once(" = ")
+        .expect("direct dependency assignment")
+        .1;
+    let aliased_value = aliased
+        .split_once(" = ")
+        .expect("aliased dependency assignment")
+        .1;
+    assert_eq!(
+        direct_value, aliased_value,
+        "dependency aliases must not create distinct nested ktstr variants",
+    );
+
+    let dev_dependencies = parent_dev_dependencies(&ktstr_root);
+    assert!(
+        dev_dependencies.starts_with("[dev-dependencies]\n")
+            && !dev_dependencies["[dev-dependencies]\n".len()..].contains("\n["),
+        "mirrored dev-dependencies must be exactly one narrowly delimited TOML table",
+    );
+
+    let root_manifest =
+        std::fs::read_to_string(ktstr_root.join("Cargo.toml")).expect("read root manifest");
+    assert!(
+        root_manifest.contains(&format!(
+            "[workspace]\nmembers = [\".\", \"ktstr-macros\", \"scx-ktstr\"]\n\
+             resolver = \"{FIXTURE_RESOLVER}\"",
+        )),
+        "root and nested fixture workspaces must use the same resolver",
+    );
+    assert!(
+        root_manifest.contains(&format!("[profile.test]\ndebug = \"{FIXTURE_TEST_DEBUG}\"",)),
+        "root and nested fixture workspaces must use the same test profile",
+    );
+}
+
+#[test]
 fn exact_one_cell_summary_accepts_ansi_without_weakening_counts() {
     let colored = concat!(
         "\u{1b}[1mSummary\u{1b}[0m [ 28.848s] ",
@@ -143,18 +337,8 @@ fn write_member(
 ) {
     let root = workspace.join(package);
     std::fs::create_dir_all(root.join("tests")).expect("create member tests directory");
-    let dependency_spec = if dependency == "ktstr" {
-        format!(
-            "ktstr = {{ path = {}, optional = true, default-features = false }}",
-            toml_string(ktstr_root),
-        )
-    } else {
-        format!(
-            "{dependency} = {{ package = \"ktstr\", path = {}, optional = true, \
-             default-features = false }}",
-            toml_string(ktstr_root),
-        )
-    };
+    let dependency_spec = parent_ktstr_dependency(dependency, ktstr_root);
+    let dev_dependencies = parent_dev_dependencies(ktstr_root);
     std::fs::write(
         root.join("Cargo.toml"),
         format!(
@@ -168,6 +352,8 @@ edition = "2024"
 
 [dependencies]
 {dependency_spec}
+
+{dev_dependencies}
 
 [[test]]
 name = "{package}_scheduler_declaration"
@@ -210,6 +396,7 @@ fn write_success_member(workspace: &Path, ktstr_root: &Path) {
     let root = workspace.join("verifier-e2e");
     std::fs::create_dir_all(root.join("tests")).expect("create success member tests directory");
     std::fs::create_dir_all(root.join("src")).expect("create success member source directory");
+    let dev_dependencies = parent_dev_dependencies(ktstr_root);
     std::fs::write(
         root.join("Cargo.toml"),
         format!(
@@ -222,7 +409,9 @@ edition = "2024"
 verification-tests = ["dep:test_harness"]
 
 [dependencies]
-test_harness = {{ package = "ktstr", path = {}, optional = true, default-features = false, features = ["vendored"] }}
+{}
+
+{dev_dependencies}
 
 [[test]]
 name = "recursive_scheduler_declaration"
@@ -234,7 +423,7 @@ name = "recursive_scheduler_declaration_duplicate"
 path = "tests/scheduler_duplicate.rs"
 required-features = ["verification-tests"]
 "#,
-            toml_string(ktstr_root),
+            parent_ktstr_dependency("test_harness", ktstr_root),
         ),
     )
     .expect("write success member manifest");
@@ -281,13 +470,19 @@ fn declaration_binary_was_built() {
 
 #[test]
 fn bare_verifier_recursively_discovers_feature_gated_workspace_test_binaries() {
-    let temp = tempfile::tempdir().expect("fixture tempdir");
-    let workspace = temp.path().join("workspace");
     let ktstr_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let temp = fixture_tempdir(&ktstr_root);
+    let workspace = temp.path().join("workspace");
     std::fs::create_dir(&workspace).expect("create fixture workspace");
     std::fs::write(
         workspace.join("Cargo.toml"),
-        "[workspace]\nmembers = [\"alpha\", \"beta\"]\nresolver = \"2\"\n",
+        format!(
+            "[workspace]\n\
+             members = [\"alpha\", \"beta\"]\n\
+             resolver = \"{FIXTURE_RESOLVER}\"\n\n\
+             [profile.test]\n\
+             debug = \"{FIXTURE_TEST_DEBUG}\"\n",
+        ),
     )
     .expect("write workspace manifest");
     std::fs::copy(ktstr_root.join("Cargo.lock"), workspace.join("Cargo.lock"))
@@ -321,6 +516,7 @@ fn bare_verifier_recursively_discovers_feature_gated_workspace_test_binaries() {
     std::fs::write(kernel.join("bzImage"), b"discovery-only").expect("write kernel placeholder");
     #[cfg(target_arch = "aarch64")]
     std::fs::write(kernel.join("Image"), b"discovery-only").expect("write kernel placeholder");
+    let diagnostics = fixture_diagnostics_dir(&temp);
 
     let output = std::process::Command::new(CARGO_KTSTR_BINARY)
         .current_dir(&workspace)
@@ -330,6 +526,7 @@ fn bare_verifier_recursively_discovers_feature_gated_workspace_test_binaries() {
         .env("KTSTR_BYPASS_LLC_LOCKS", "1")
         .env("KTSTR_CACHE_DIR", temp.path().join("cache"))
         .env("KTSTR_RUNS_ROOT", temp.path().join("runs"))
+        .env("KTSTR_BUILD_DIAGNOSTICS_DIR", &diagnostics)
         .env(ktstr::KTSTR_KERNEL_ENV, &kernel)
         // The parent nextest process exports its selected profile. This
         // nested, hermetic workspace deliberately has no project nextest
@@ -368,6 +565,7 @@ fn bare_verifier_recursively_discovers_feature_gated_workspace_test_binaries() {
         !stderr.contains("dispatching to nextest (verifier/ cells only)"),
         "the discovery conflict must abort before the KVM-running nextest phase:\n{stderr}",
     );
+    assert_parent_ktstr_artifact_feature_parity(&diagnostics, &ktstr_root);
 }
 
 #[test]
@@ -395,15 +593,16 @@ fn bare_verifier_runs_recursively_discovered_scheduler_cell_end_to_end() {
         .parent()
         .expect("a resolved ktstr kernel image has a parent directory");
 
-    let temp = tempfile::tempdir().expect("fixture tempdir");
-    let workspace = temp.path().join("workspace");
     let ktstr_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let temp = fixture_tempdir(&ktstr_root);
+    let workspace = temp.path().join("workspace");
     std::fs::create_dir(&workspace).expect("create success fixture workspace");
     std::fs::write(
         workspace.join("Cargo.toml"),
-        r#"[workspace]
+        format!(
+            r#"[workspace]
 members = ["verifier-e2e", "scx-ktstr"]
-resolver = "2"
+resolver = "{FIXTURE_RESOLVER}"
 
 [workspace.package]
 edition = "2024"
@@ -414,7 +613,11 @@ repository = "https://github.com/likewhatevs/ktstr"
 [profile.release]
 lto = "thin"
 panic = "abort"
+
+[profile.test]
+debug = "{FIXTURE_TEST_DEBUG}"
 "#,
+        ),
     )
     .expect("write success workspace manifest");
     std::fs::copy(ktstr_root.join("Cargo.lock"), workspace.join("Cargo.lock"))
@@ -425,6 +628,7 @@ panic = "abort"
     );
     copy_tree(&ktstr_root.join("scx-ktstr"), &workspace.join("scx-ktstr"));
     write_success_member(&workspace, &ktstr_root);
+    let diagnostics = fixture_diagnostics_dir(&temp);
 
     let output = std::process::Command::new(CARGO_KTSTR_BINARY)
         .current_dir(&workspace)
@@ -435,6 +639,7 @@ panic = "abort"
         .args(["ktstr", "verifier"])
         .env("CARGO_TARGET_DIR", shared_target_dir())
         .env("KTSTR_RUNS_ROOT", temp.path().join("runs"))
+        .env("KTSTR_BUILD_DIAGNOSTICS_DIR", &diagnostics)
         .env(ktstr::KTSTR_KERNEL_ENV, kernel_dir)
         // The parent nextest process exports its selected profile, but the
         // nested fixture has no matching project profile. The verifier command
@@ -467,4 +672,5 @@ panic = "abort"
         "the parent result grid must prove the generated KVM cell completed successfully:\n\
          stdout:\n{stdout}\nstderr:\n{stderr}",
     );
+    assert_parent_ktstr_artifact_feature_parity(&diagnostics, &ktstr_root);
 }
