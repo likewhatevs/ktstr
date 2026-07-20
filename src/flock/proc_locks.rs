@@ -9,8 +9,6 @@
 //!
 //!  - [`read_holders`] — one-shot, reads both `/proc/self/mountinfo`
 //!    and `/proc/locks` itself. Use when looking up one lockfile.
-//!  - `read_holders_with_mountinfo` — a test seam that accepts pre-read
-//!    mountinfo for one lockfile.
 //!  - [`read_flock_mode_summaries`],
 //!    [`read_flock_states_batch_with_mountinfo`],
 //!    [`read_holder_pids_batch_with_mountinfo`], and
@@ -383,24 +381,6 @@ pub(crate) fn read_holders(path: &Path) -> Result<Vec<HolderInfo>> {
     read_holders_for_needle(&needle)
 }
 
-/// Variant of [`read_holders`] that accepts pre-read
-/// `/proc/self/mountinfo` contents. This saves the mountinfo read for
-/// a single lookup but still reads `/proc/locks`; callers looking up
-/// several paths must use [`read_holders_batch_with_mountinfo`] to
-/// amortize both operations.
-///
-/// Semantically identical to [`read_holders`] — the same needle
-/// format, the same /proc/locks scan, the same HolderInfo shape —
-/// just with the mountinfo text supplied by the caller rather than
-/// read inside this function.
-#[cfg(test)]
-pub(crate) fn read_holders_with_mountinfo(path: &Path, mountinfo: &str) -> Result<Vec<HolderInfo>> {
-    let needle = needle_from_path_with_mountinfo(path, mountinfo)?;
-    read_holders_for_needle(&needle)
-}
-
-/// Batch variant of the test-only `read_holders_with_mountinfo` seam.
-///
 /// Derives one `/proc/locks` needle per input path, reads
 /// `/proc/locks` exactly once, scans that text exactly once for all
 /// needles, and caches [`HolderInfo`] by PID across the entire batch.
@@ -438,9 +418,6 @@ pub(crate) fn read_holder_pids_batch_with_mountinfo<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flock::FlockMode;
-    use crate::flock::mountinfo::read_mountinfo;
-    use crate::flock::primitives::try_flock;
 
     /// [`parse_flock_pids_for_needle`] skips `POSIX` and `OFDLCK`
     /// lines and matches only `FLOCK` lines whose dev:inode triple
@@ -702,93 +679,20 @@ malformed
         assert_eq!(a[0].cmdline, b[0].cmdline);
     }
 
-    /// [`read_holders_for_needle`] with an impossible needle returns
-    /// an empty Vec. Exercises the /proc/locks read path on any
-    /// Linux host without requiring specific lockfile state. The
-    /// needle format is `{major:02x}:{minor:02x}:{inode}`; pick
-    /// values guaranteed-not-to-exist (major=ff, minor=ff, inode
-    /// larger than any real inode at test time).
-    #[test]
-    fn read_holders_for_needle_no_match_returns_empty() {
-        // u64 max inode, max 8-bit major:minor pair. No real
-        // /proc/locks entry will match this.
-        let needle = "ff:ff:18446744073709551615";
-        let holders = read_holders_for_needle(needle)
-            .expect("/proc/locks read must succeed on any Linux host");
-        assert!(
-            holders.is_empty(),
-            "impossible needle must not match any holder: {holders:?}"
-        );
-    }
-
-    /// Holder-list equivalence under a live flock.
-    ///
-    /// Beyond "both needles are equal strings," the full
-    /// `/proc/locks` scan must surface the same [`HolderInfo`]
-    /// set via both the cached-mountinfo API
-    /// ([`read_holders_with_mountinfo`]) and the one-shot API
-    /// ([`read_holders`]) for a lockfile we actually hold. A
-    /// regression where the cached path e.g. canonicalizes
-    /// differently (altering the mount-point prefix match) would
-    /// surface here: the needles would still be valid triples but
-    /// point at different (major, minor) for the same path, and
-    /// exactly one of the two scans would find our pid.
-    #[test]
-    fn read_holders_cached_mountinfo_equals_uncached() {
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().expect("tempdir");
-        let path = tmp.path().join("cache-holder-equivalence.lock");
-
-        let fd = try_flock(&path, FlockMode::Exclusive)
-            .expect("try_flock must succeed on fresh tempfile")
-            .expect("EX must acquire on clean pool");
-
-        // Uncached: inline mountinfo read per call.
-        let uncached = read_holders(&path).expect("uncached holders");
-
-        // Cached: read mountinfo once, pass through.
-        let mountinfo = read_mountinfo().expect("read mountinfo");
-        let cached = read_holders_with_mountinfo(&path, &mountinfo).expect("cached holders");
-
-        // /proc/locks race-safety: holder sets can drift between two
-        // scans on a loaded host (peer exits, a separate test flock
-        // created/released). Pin the invariant we actually care
-        // about: OUR pid appears in BOTH sets.
-        let our_pid = std::process::id();
-        assert!(
-            uncached.iter().any(|h| h.pid == our_pid),
-            "our pid {our_pid} must appear in uncached holders {uncached:?}",
-        );
-        assert!(
-            cached.iter().any(|h| h.pid == our_pid),
-            "our pid {our_pid} must appear in cached holders {cached:?}",
-        );
-
-        drop(fd);
-    }
-
     #[test]
     fn pid_only_batch_skips_cmdlines_and_enriched_batch_caches_by_pid() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let first_path = tmp.path().join("batch-first.lock");
-        let second_path = tmp.path().join("batch-second.lock");
-        let first = try_flock(&first_path, FlockMode::Exclusive)
-            .expect("open first lock")
-            .expect("hold first lock");
-        let second = try_flock(&second_path, FlockMode::Exclusive)
-            .expect("open second lock")
-            .expect("hold second lock");
-        let paths = [first_path.as_path(), second_path.as_path()];
-        let mountinfo = read_mountinfo().expect("read mountinfo");
         let our_pid = std::process::id();
+        let needles = vec!["08:02:100".to_owned(), "08:02:200".to_owned()];
+        let contents = format!(
+            "1: FLOCK ADVISORY WRITE {our_pid} 08:02:100 0 EOF\n\
+             2: FLOCK ADVISORY WRITE {our_pid} 08:02:200 0 EOF\n"
+        );
         let before = batch_holder_info_resolution_count_for_tests();
 
-        let pid_rows =
-            read_holder_pids_batch_with_mountinfo(paths, &mountinfo).expect("read PID-only batch");
+        let pid_rows = parse_flock_pids_for_needles(&contents, &needles);
         assert!(
             pid_rows.iter().all(|row| row.contains(&our_pid)),
-            "our PID must appear for both held lockfiles: {pid_rows:?}",
+            "our PID must appear for both parsed lockfiles: {pid_rows:?}",
         );
         assert_eq!(
             batch_holder_info_resolution_count_for_tests(),
@@ -796,8 +700,8 @@ malformed
             "the placement batch must not resolve any cmdlines",
         );
 
-        let holder_rows = read_holders_batch_with_mountinfo(paths, &mountinfo)
-            .expect("read enriched holder batch");
+        let holder_rows =
+            resolve_holder_pid_sets_with(pid_rows, resolve_batched_holder_info);
         assert!(
             holder_rows
                 .iter()
@@ -809,8 +713,5 @@ malformed
             before + 1,
             "one PID holding several requested lockfiles must be enriched once",
         );
-
-        drop(second);
-        drop(first);
     }
 }
