@@ -734,16 +734,12 @@ ktstr::declare_scheduler!(TEST_DECLARE, {
 
 const MANIFEST_STAMP_DIRECT_PRIMARY: ktstr::test_support::Scheduler =
     ktstr::test_support::Scheduler::named("manifest_stamp_direct_primary")
-        .binary(ktstr::test_support::SchedulerSpec::Discover(
-            "stamp-primary-bin",
-        ))
-        .manifest_dir("/stamp/direct-primary");
+        .binary(ktstr::test_support::SchedulerSpec::Discover("scx-ktstr"))
+        .manifest_dir(env!("CARGO_MANIFEST_DIR"));
 const MANIFEST_STAMP_DIRECT_STAGED: ktstr::test_support::Scheduler =
     ktstr::test_support::Scheduler::named("manifest_stamp_direct_staged")
-        .binary(ktstr::test_support::SchedulerSpec::Path(
-            "/stamp/direct-staged",
-        ))
-        .manifest_dir("/stamp/direct-staged-workspace");
+        .binary(ktstr::test_support::SchedulerSpec::Path("/bin/true"))
+        .manifest_dir(env!("CARGO_MANIFEST_DIR"));
 
 /// Direct (non-`declare_scheduler!`) schedulers still contribute exact
 /// executable requirements through the test-edge stamp. The staged edge also
@@ -815,13 +811,13 @@ fn scheduler_manifest_elf_stamp_matches_runtime_test_registry() {
     }));
     assert!(stamped.artifact_requirements.iter().any(|requirement| {
         requirement.binary_kind
-            == ktstr::test_support::BinaryKindJson::Discover("stamp-primary-bin".to_string())
-            && requirement.manifest_dir == "/stamp/direct-primary"
+            == ktstr::test_support::BinaryKindJson::Discover("scx-ktstr".to_string())
+            && requirement.manifest_dir == env!("CARGO_MANIFEST_DIR")
     }));
     assert!(stamped.artifact_requirements.iter().any(|requirement| {
         requirement.binary_kind
-            == ktstr::test_support::BinaryKindJson::Path("/stamp/direct-staged".to_string())
-            && requirement.manifest_dir == "/stamp/direct-staged-workspace"
+            == ktstr::test_support::BinaryKindJson::Path("/bin/true".to_string())
+            && requirement.manifest_dir == env!("CARGO_MANIFEST_DIR")
     }));
 }
 

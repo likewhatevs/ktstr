@@ -19,7 +19,11 @@ use std::mem::{offset_of, size_of};
 use std::path::Path;
 use std::sync::OnceLock;
 
-use goblin::elf::Elf;
+use goblin::elf::{
+    Elf, dynamic::Dynamic, program_header::ProgramHeader, reloc::RelocSection,
+    section_header::SectionHeader,
+};
+use goblin::strtab::Strtab;
 use linkme::distributed_slice;
 
 use super::{
@@ -437,6 +441,7 @@ enum PointerRelocation {
     Relative(u64),
     RelativeInPlace,
     Unsupported(u32),
+    Duplicate,
 }
 
 struct ElfStampReader<'a> {
@@ -444,13 +449,43 @@ struct ElfStampReader<'a> {
     data: &'a [u8],
     elf: Elf<'a>,
     relative_relocation_type: u32,
-    pointer_relocations: OnceLock<HashMap<u64, PointerRelocation>>,
+    exceptional_pointer_relocations: OnceLock<HashMap<u64, PointerRelocation>>,
 }
 
 impl<'a> ElfStampReader<'a> {
     fn new(source: &'a Path, data: &'a [u8]) -> Result<Self, String> {
-        let elf = Elf::parse(data).map_err(|error| {
-            format!("parse scheduler-manifest ELF {}: {error}", source.display())
+        // `Elf::parse` eagerly decodes the static and dynamic symbol tables,
+        // every section relocation, symbol versions, and other metadata that
+        // the stamp reader never consults. Rust test executables routinely
+        // carry hundreds of megabytes of that data. Assemble a deliberately
+        // sparse `Elf` view instead: ELF/program/section headers, the section
+        // name table, and the two dynamic relocation tables needed to resolve
+        // pointer fields in stamp records.
+        let header = Elf::parse_header(data).map_err(|error| {
+            format!(
+                "parse scheduler-manifest ELF header {}: {error}",
+                source.display()
+            )
+        })?;
+        let ctx = goblin::container::Ctx::new(
+            header.container().map_err(|error| {
+                format!(
+                    "parse scheduler-manifest ELF class {}: {error}",
+                    source.display()
+                )
+            })?,
+            header.endianness().map_err(|error| {
+                format!(
+                    "parse scheduler-manifest ELF byte order {}: {error}",
+                    source.display()
+                )
+            })?,
+        );
+        let mut elf = Elf::lazy_parse(header).map_err(|error| {
+            format!(
+                "parse scheduler-manifest ELF identity {}: {error}",
+                source.display()
+            )
         })?;
         if !elf.is_64 {
             return Err(format!(
@@ -485,41 +520,201 @@ impl<'a> ElfStampReader<'a> {
                 ));
             }
         };
+
+        elf.program_headers = ProgramHeader::parse(
+            data,
+            elf.header.e_phoff as usize,
+            elf.header.e_phnum as usize,
+            ctx,
+        )
+        .map_err(|error| {
+            format!(
+                "parse scheduler-manifest ELF program headers {}: {error}",
+                source.display()
+            )
+        })?;
+        elf.section_headers = SectionHeader::parse(
+            data,
+            elf.header.e_shoff as usize,
+            elf.header.e_shnum as usize,
+            ctx,
+        )
+        .map_err(|error| {
+            format!(
+                "parse scheduler-manifest ELF section headers {}: {error}",
+                source.display()
+            )
+        })?;
+        if !elf.section_headers.is_empty() {
+            let section_name_index = if elf.header.e_shstrndx as usize
+                == goblin::elf::section_header::SHN_XINDEX as usize
+            {
+                elf.section_headers[0].sh_link as usize
+            } else {
+                elf.header.e_shstrndx as usize
+            };
+            let section_names = elf.section_headers.get(section_name_index).ok_or_else(|| {
+                format!(
+                    "scheduler-manifest ELF {} has section-name index {} outside {} \
+                         section headers",
+                    source.display(),
+                    section_name_index,
+                    elf.section_headers.len(),
+                )
+            })?;
+            elf.shdr_strtab = Strtab::parse(
+                data,
+                section_names.sh_offset as usize,
+                section_names.sh_size as usize,
+                0,
+            )
+            .map_err(|error| {
+                format!(
+                    "parse scheduler-manifest ELF section names {}: {error}",
+                    source.display()
+                )
+            })?;
+        }
+
+        elf.dynamic = Dynamic::parse(data, &elf.program_headers, ctx).map_err(|error| {
+            format!(
+                "parse scheduler-manifest ELF dynamic table {}: {error}",
+                source.display()
+            )
+        })?;
+        if let Some(dynamic) = elf.dynamic.as_ref() {
+            elf.dynrelas =
+                RelocSection::parse(data, dynamic.info.rela, dynamic.info.relasz, true, ctx)
+                    .map_err(|error| {
+                        format!(
+                            "parse scheduler-manifest ELF dynamic RELA table {}: {error}",
+                            source.display()
+                        )
+                    })?;
+            elf.dynrels =
+                RelocSection::parse(data, dynamic.info.rel, dynamic.info.relsz, false, ctx)
+                    .map_err(|error| {
+                        format!(
+                            "parse scheduler-manifest ELF dynamic REL table {}: {error}",
+                            source.display()
+                        )
+                    })?;
+        }
+
         Ok(Self {
             source,
             data,
             elf,
             relative_relocation_type: relative_type,
-            // Most Cargo test targets carry only the two sentinel records.
-            // Avoid parsing tens of thousands of unrelated dynamic
-            // relocations until a real declaration/test record asks for its
-            // first pointer.
-            pointer_relocations: OnceLock::new(),
+            exceptional_pointer_relocations: OnceLock::new(),
         })
     }
 
-    fn pointer_relocations(&self) -> &HashMap<u64, PointerRelocation> {
-        self.pointer_relocations.get_or_init(|| {
-            self.elf
-                .dynrelas
-                .iter()
-                .chain(self.elf.dynrels.iter())
-                .map(|relocation| {
-                    let kind = if relocation.r_type == self.relative_relocation_type {
-                        match relocation.r_addend {
-                            Some(addend) => PointerRelocation::Relative(addend as u64),
-                            // REL stores the addend in the relocated pointer
-                            // slot. `pointer()` maps r_offset (a VA, not a
-                            // file offset) through PT_LOAD before reading it.
-                            None => PointerRelocation::RelativeInPlace,
-                        }
-                    } else {
-                        PointerRelocation::Unsupported(relocation.r_type)
-                    };
-                    (relocation.r_offset, kind)
-                })
-                .collect()
-        })
+    fn relocation_at(
+        &self,
+        relocations: &RelocSection<'_>,
+        relative_count: usize,
+        field_va: u64,
+    ) -> Option<goblin::elf::reloc::Reloc> {
+        // DT_REL[A]COUNT identifies the leading contiguous relative
+        // relocations. GNU ld, lld, and mold order that prefix by r_offset, so
+        // a binary search touches O(log n) 24-byte entries instead of
+        // materializing the 100k-300k unrelated relocations common in Rust
+        // test executables.
+        let mut start = 0usize;
+        let mut end = relative_count.min(relocations.len());
+        while start < end {
+            let middle = start + (end - start) / 2;
+            let relocation = relocations
+                .get(middle)
+                .expect("middle is bounded by relocation count");
+            match relocation.r_offset.cmp(&field_va) {
+                std::cmp::Ordering::Less => start = middle + 1,
+                std::cmp::Ordering::Greater => end = middle,
+                std::cmp::Ordering::Equal => return Some(relocation),
+            }
+        }
+        // Non-relative relocations follow the counted prefix and are grouped
+        // rather than globally sorted. They should never back a valid stamp
+        // pointer, but scan that comparatively tiny tail so a corrupted or
+        // externally linked stamp gets a precise unsupported-relocation
+        // diagnostic. Linkers without DT_REL[A]COUNT take this path for their
+        // whole (typically small) table.
+        relocations
+            .iter()
+            .skip(relative_count.min(relocations.len()))
+            .find(|relocation| relocation.r_offset == field_va)
+    }
+
+    fn pointer_relocation(&self, field_va: u64) -> Result<Option<PointerRelocation>, String> {
+        let (rela_count, rel_count) = self
+            .elf
+            .dynamic
+            .as_ref()
+            .map(|dynamic| (dynamic.info.relacount, dynamic.info.relcount))
+            .unwrap_or_default();
+        let rela = self.relocation_at(&self.elf.dynrelas, rela_count, field_va);
+        let rel = self.relocation_at(&self.elf.dynrels, rel_count, field_va);
+        self.classify_pointer_relocation(field_va, rela, rel)
+    }
+
+    fn exceptional_pointer_relocation(
+        &self,
+        field_va: u64,
+    ) -> Result<Option<PointerRelocation>, String> {
+        let relocations = self.exceptional_pointer_relocations.get_or_init(|| {
+            let mut relocations = HashMap::new();
+            for relocation in self.elf.dynrelas.iter().chain(self.elf.dynrels.iter()) {
+                let kind = if relocation.r_type != self.relative_relocation_type {
+                    PointerRelocation::Unsupported(relocation.r_type)
+                } else {
+                    match relocation.r_addend {
+                        Some(addend) => PointerRelocation::Relative(addend as u64),
+                        None => PointerRelocation::RelativeInPlace,
+                    }
+                };
+                relocations
+                    .entry(relocation.r_offset)
+                    .and_modify(|existing| *existing = PointerRelocation::Duplicate)
+                    .or_insert(kind);
+            }
+            relocations
+        });
+        match relocations.get(&field_va).copied() {
+            Some(PointerRelocation::Duplicate) => Err(format!(
+                "scheduler-manifest ELF {} carries duplicate dynamic relocations at \
+                 virtual address 0x{field_va:x}",
+                self.source.display()
+            )),
+            relocation => Ok(relocation),
+        }
+    }
+
+    fn classify_pointer_relocation(
+        &self,
+        field_va: u64,
+        rela: Option<goblin::elf::reloc::Reloc>,
+        rel: Option<goblin::elf::reloc::Reloc>,
+    ) -> Result<Option<PointerRelocation>, String> {
+        let relocation = match (rela, rel) {
+            (Some(_), Some(_)) => {
+                return Err(format!(
+                    "scheduler-manifest ELF {} carries both RELA and REL relocations at \
+                     virtual address 0x{field_va:x}",
+                    self.source.display()
+                ));
+            }
+            (Some(relocation), None) | (None, Some(relocation)) => relocation,
+            (None, None) => return Ok(None),
+        };
+        if relocation.r_type != self.relative_relocation_type {
+            return Ok(Some(PointerRelocation::Unsupported(relocation.r_type)));
+        }
+        Ok(Some(match relocation.r_addend {
+            Some(addend) => PointerRelocation::Relative(addend as u64),
+            // REL stores the addend in the relocated pointer slot.
+            None => PointerRelocation::RelativeInPlace,
+        }))
     }
 
     fn section(&self, name: &str) -> Result<Option<(u64, &'a [u8])>, String> {
@@ -667,7 +862,7 @@ impl<'a> ElfStampReader<'a> {
                 self.source.display()
             )
         })?;
-        match self.pointer_relocations().get(&field_va).copied() {
+        match self.pointer_relocation(field_va)? {
             Some(PointerRelocation::Relative(addend)) => Ok(addend),
             Some(PointerRelocation::RelativeInPlace) => self.raw_u64(field_va, what),
             Some(PointerRelocation::Unsupported(kind)) => Err(format!(
@@ -675,10 +870,37 @@ impl<'a> ElfStampReader<'a> {
                  type {kind} at virtual address 0x{field_va:x}",
                 self.source.display()
             )),
+            Some(PointerRelocation::Duplicate) => unreachable!(
+                "duplicate relocations are rejected before pointer relocation is returned"
+            ),
             // ET_EXEC stores an absolute VA. DT_RELR-packed ET_DYN stores the
             // relative relocation's addend in place, so the same read covers
             // both without depending on section headers for SHT_RELR.
-            None => self.raw_u64(field_va, what),
+            None => {
+                let pointer = self.raw_u64(field_va, what)?;
+                if pointer != 0 && self.va_file_offset(pointer, 1, what).is_ok() {
+                    return Ok(pointer);
+                }
+                // DT_REL[A]COUNT does not itself promise offset ordering.
+                // Normal GNU ld/lld/mold output takes the binary-search path,
+                // while this fallback preserves correctness for a valid
+                // unsorted relative prefix. Only a pointer whose in-place
+                // value cannot already designate file-backed ELF data pays
+                // to build the exceptional relocation index.
+                match self.exceptional_pointer_relocation(field_va)? {
+                    Some(PointerRelocation::Relative(addend)) => Ok(addend),
+                    Some(PointerRelocation::RelativeInPlace) => Ok(pointer),
+                    Some(PointerRelocation::Unsupported(kind)) => Err(format!(
+                        "{what} in scheduler-manifest ELF {} uses unsupported dynamic \
+                         relocation type {kind} at virtual address 0x{field_va:x}",
+                        self.source.display()
+                    )),
+                    Some(PointerRelocation::Duplicate) => unreachable!(
+                        "duplicate relocations are rejected before pointer relocation is returned"
+                    ),
+                    None => Ok(pointer),
+                }
+            }
         }
     }
 
@@ -722,7 +944,6 @@ impl<'a> ElfStampReader<'a> {
     }
 
     fn string(&self, base: u64, what: &str) -> Result<String, String> {
-        let pointer = self.pointer(base, offset_of!(SchedulerManifestStampStrV1, ptr), what)?;
         let len = self.raw_u64(
             base + offset_of!(SchedulerManifestStampStrV1, len) as u64,
             what,
@@ -736,6 +957,7 @@ impl<'a> ElfStampReader<'a> {
         if len == 0 {
             return Ok(String::new());
         }
+        let pointer = self.pointer(base, offset_of!(SchedulerManifestStampStrV1, ptr), what)?;
         if pointer == 0 {
             return Err(format!(
                 "{what} in scheduler-manifest ELF {} has a null pointer for a non-empty string",
@@ -789,11 +1011,6 @@ impl<'a> ElfStampReader<'a> {
     }
 
     fn slice_descriptor<T>(&self, base: u64, what: &str) -> Result<(u64, usize), String> {
-        let pointer = self.pointer(
-            base,
-            offset_of!(SchedulerManifestStampSliceV1<T>, ptr),
-            what,
-        )?;
         let len = self.raw_u64(
             base + offset_of!(SchedulerManifestStampSliceV1<T>, len) as u64,
             what,
@@ -811,8 +1028,13 @@ impl<'a> ElfStampReader<'a> {
             )
         })?;
         if bytes == 0 {
-            return Ok((pointer, 0));
+            return Ok((0, 0));
         }
+        let pointer = self.pointer(
+            base,
+            offset_of!(SchedulerManifestStampSliceV1<T>, ptr),
+            what,
+        )?;
         if pointer == 0 {
             return Err(format!(
                 "{what} in scheduler-manifest ELF {} has a null pointer for {len} elements",
@@ -1372,6 +1594,17 @@ pub fn read_scheduler_manifest_stamp(
 mod tests {
     use super::*;
 
+    fn map_current_test_executable_copy() -> (std::path::PathBuf, memmap2::MmapMut) {
+        let executable = std::env::current_exe().expect("locate unit-test executable");
+        let file = std::fs::File::open(&executable).expect("open unit-test executable");
+        // SAFETY: this is a private, copy-on-write mapping. Mutations in the
+        // relocation-order test cannot affect the executable on disk or any
+        // concurrently running test process.
+        let mapping = unsafe { memmap2::MmapOptions::new().map_copy(&file) }
+            .expect("copy-map unit-test executable");
+        (executable, mapping)
+    }
+
     #[test]
     fn v1_wire_layout_is_pinned() {
         assert_eq!(size_of::<StampHeaderV1>(), 16);
@@ -1432,6 +1665,148 @@ mod tests {
             48
         );
         assert_eq!(offset_of!(SchedulerManifestTestStampV1, legacy_entry), 56);
+    }
+
+    #[test]
+    fn sparse_reader_leaves_unrelated_elf_tables_unparsed() {
+        let (executable, mapping) = map_current_test_executable_copy();
+        let reader =
+            ElfStampReader::new(&executable, &mapping).expect("sparsely parse test executable");
+
+        assert!(!reader.elf.program_headers.is_empty());
+        assert!(!reader.elf.section_headers.is_empty());
+        assert_ne!(reader.elf.shdr_strtab.len(), 0);
+        assert!(
+            reader.elf.syms.is_empty(),
+            "the static symbol table must remain lazy"
+        );
+        assert!(
+            reader.elf.strtab.len() == 0,
+            "the static symbol string table must remain lazy"
+        );
+        assert!(
+            reader.elf.dynsyms.is_empty(),
+            "dynamic symbols are unrelated to relative stamp pointers"
+        );
+        assert!(
+            reader.elf.dynstrtab.len() == 0,
+            "dynamic symbol strings are unrelated to stamp pointers"
+        );
+        assert!(
+            reader.elf.pltrelocs.is_empty(),
+            "PLT relocations cannot back immutable stamp pointers"
+        );
+        assert!(
+            reader.elf.shdr_relocs.is_empty(),
+            "section relocation tables must remain lazy"
+        );
+    }
+
+    #[test]
+    fn unsorted_relative_prefix_uses_sound_exceptional_index() {
+        let (executable, mut mapping) = map_current_test_executable_copy();
+        let (
+            test_record,
+            field_va,
+            expected_pointer,
+            relocation_file_offset,
+            relocation_size,
+            relocation_index,
+        ) = {
+            let reader = ElfStampReader::new(&executable, &mapping).expect("parse test executable");
+            let (test_section, bytes) = reader
+                .section(TEST_SECTION)
+                .expect("find test stamp section")
+                .expect("test stamp section must be linked");
+            let record_size = size_of::<SchedulerManifestTestStampV1>();
+            let record_index = (0..bytes.len() / record_size)
+                .find(|index| {
+                    reader
+                        .header(
+                            test_section + (*index * record_size) as u64,
+                            record_size,
+                            TEST_SECTION,
+                            *index,
+                        )
+                        .expect("decode test stamp header")
+                        == STAMP_KIND_TEST
+                })
+                .expect("unit-test executable must contain a real ktstr test stamp");
+            let test_record = test_section + (record_index * record_size) as u64;
+            let field_va = test_record + offset_of!(SchedulerManifestTestStampV1, test) as u64;
+            let dynamic = reader
+                .elf
+                .dynamic
+                .as_ref()
+                .expect("PIE unit-test executable must have a dynamic table");
+            let relocation_index = reader
+                .elf
+                .dynrelas
+                .iter()
+                .position(|relocation| relocation.r_offset == field_va)
+                .expect("test-name pointer must have a dynamic RELA relocation");
+            assert!(
+                relocation_index < dynamic.info.relacount,
+                "test-name pointer must be in the DT_RELACOUNT prefix"
+            );
+            assert!(
+                relocation_index > 0,
+                "test-name relocation must leave room for an ordering inversion"
+            );
+            let relocation = reader
+                .elf
+                .dynrelas
+                .get(relocation_index)
+                .expect("indexed relocation");
+            assert_eq!(relocation.r_type, reader.relative_relocation_type);
+            let expected_pointer = relocation
+                .r_addend
+                .expect("x86_64/aarch64 dynamic pointer uses RELA")
+                as u64;
+            let relocation_size = dynamic.info.relaent as usize;
+            assert!(relocation_size > 0);
+            (
+                test_record,
+                field_va,
+                expected_pointer,
+                dynamic.info.rela,
+                relocation_size,
+                relocation_index,
+            )
+        };
+
+        let target_start = relocation_file_offset + relocation_index * relocation_size;
+        for index in 0..relocation_size {
+            mapping.swap(relocation_file_offset + index, target_start + index);
+        }
+
+        let reader =
+            ElfStampReader::new(&executable, &mapping).expect("parse unsorted test executable");
+        assert!(
+            reader.exceptional_pointer_relocations.get().is_none(),
+            "exceptional relocation index must stay lazy"
+        );
+        assert!(
+            reader
+                .pointer_relocation(field_va)
+                .expect("fast relocation lookup")
+                .is_none(),
+            "fixture must force the ordered-prefix fast path to miss"
+        );
+        assert_eq!(
+            reader
+                .pointer(
+                    test_record,
+                    offset_of!(SchedulerManifestTestStampV1, test),
+                    "unsorted test-name pointer",
+                )
+                .expect("exceptional index must resolve the pointer"),
+            expected_pointer,
+        );
+        assert!(
+            reader.exceptional_pointer_relocations.get().is_some(),
+            "binary-search miss must initialize the exceptional index"
+        );
     }
 
     #[test]
