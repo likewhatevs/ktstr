@@ -2797,9 +2797,42 @@ fn accept_retry_test_connection_while_running<T>(
     }
 }
 
-fn read_retry_test_request_head(stream: &mut std::net::TcpStream) -> std::io::Result<String> {
-    use std::io::Read;
+fn configure_retry_test_unix_connection(
+    stream: std::os::unix::net::UnixStream,
+) -> std::io::Result<std::os::unix::net::UnixStream> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(RETRY_TEST_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(RETRY_TEST_IO_TIMEOUT))?;
+    Ok(stream)
+}
 
+fn accept_retry_test_unix_connection_while_running<T>(
+    listener: &std::os::unix::net::UnixListener,
+    client: &std::thread::JoinHandle<T>,
+) -> std::io::Result<Option<std::os::unix::net::UnixStream>> {
+    listener.set_nonblocking(true)?;
+    let deadline = std::time::Instant::now() + RETRY_TEST_ACCEPT_TIMEOUT;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return configure_retry_test_unix_connection(stream).map(Some),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if client.is_finished() {
+                    return Ok(None);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out waiting for Unix-socket HTTP test connection",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn read_retry_test_request_head(stream: &mut impl std::io::Read) -> std::io::Result<String> {
     const MAX_REQUEST_HEAD: usize = 64 * 1024;
     let mut head = Vec::new();
     let mut chunk = [0u8; 1024];
@@ -2862,10 +2895,11 @@ const RESPONSE_503: &str =
 const RESPONSE_200: &str = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
 
 /// A server that completes the response head and then holds the body open must
-/// be interrupted by the request-layer timeout. The server work runs on this
-/// test thread, so observing a complete request and writing the response head
-/// cannot be starved behind the client. A ten-second socket keeper is only a
-/// fail-safe: the asserted sub-five-second timeout must fire first.
+/// be interrupted by the request-layer timeout. HTTP rides a Unix-domain
+/// socket so the test exercises reqwest's real response-body read path without
+/// depending on loopback access, DNS, routing, or ghars network policy. The
+/// server work runs on this test thread, so observing a complete request and
+/// writing the response head cannot be starved behind the client.
 #[test]
 fn metadata_request_timeout_bounds_headers_then_stalled_body() {
     use std::io::Write;
@@ -2873,13 +2907,16 @@ fn metadata_request_timeout_bounds_headers_then_stalled_body() {
     const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
     const SOCKET_FAILSAFE: std::time::Duration = std::time::Duration::from_secs(10);
 
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind localhost listener");
-    let addr = listener.local_addr().expect("read listener address");
-    let url = format!("http://{addr}/metadata");
+    let root = tempfile::tempdir().expect("metadata Unix-socket tempdir");
+    let socket_path = root.path().join("metadata-http.sock");
+    let listener =
+        std::os::unix::net::UnixListener::bind(&socket_path).expect("bind metadata Unix socket");
+    let url = "http://metadata.invalid/metadata".to_owned();
     let client_url = url.clone();
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .no_proxy()
+        .unix_socket(socket_path)
         .build()
         .expect("build timeout-test client");
     let worker = std::thread::spawn(move || {
@@ -2887,18 +2924,10 @@ fn metadata_request_timeout_bounds_headers_then_stalled_body() {
             attempts: 1,
             backoff_unit: std::time::Duration::ZERO,
         };
-        let started = std::time::Instant::now();
-        let result = super::fetch_metadata_bytes_with(
-            &client,
-            &client_url,
-            "fetch",
-            &one_attempt,
-            BODY_TIMEOUT,
-        );
-        (result, started.elapsed())
+        super::fetch_metadata_bytes_with(&client, &client_url, "fetch", &one_attempt, BODY_TIMEOUT)
     });
 
-    let mut socket = accept_retry_test_connection_while_running(&listener, &worker)
+    let mut socket = accept_retry_test_unix_connection_while_running(&listener, &worker)
         .expect("accept metadata request")
         .expect("client must remain active until response headers arrive");
     let request = read_retry_test_request_head(&mut socket).expect("read metadata request");
@@ -2910,6 +2939,7 @@ fn metadata_request_timeout_bounds_headers_then_stalled_body() {
         .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\nconnection: keep-alive\r\n\r\n")
         .expect("write response headers");
     socket.flush().expect("flush response headers");
+    let body_stall_started = std::time::Instant::now();
 
     // Keep the response body open and empty while the worker performs its
     // blocking read. If the request timeout regresses, dropping the socket
@@ -2919,7 +2949,8 @@ fn metadata_request_timeout_bounds_headers_then_stalled_body() {
         let _ = release_rx.recv_timeout(SOCKET_FAILSAFE);
         drop(socket);
     });
-    let (result, elapsed) = worker.join().expect("metadata client thread");
+    let result = worker.join().expect("metadata client thread");
+    let body_stall_elapsed = body_stall_started.elapsed();
     let _ = release_tx.send(());
     keeper.join().expect("socket keeper thread");
 
@@ -2940,25 +2971,30 @@ fn metadata_request_timeout_bounds_headers_then_stalled_body() {
         "stalled body must surface a timeout error: {err:#}",
     );
     assert!(
-        elapsed < std::time::Duration::from_secs(5),
-        "{BODY_TIMEOUT:?} body timeout took {elapsed:?}; the socket fail-safe \
+        body_stall_elapsed < std::time::Duration::from_secs(5),
+        "{BODY_TIMEOUT:?} body timeout took {body_stall_elapsed:?}; the socket fail-safe \
          must not be what unblocked the read",
     );
 }
 
 /// The live package-URL probe must retry a transient gateway response and
-/// preserve its one-byte `Range` header on the successful attempt.
+/// preserve its one-byte `Range` header on the successful attempt. HTTP rides
+/// a Unix-domain socket so the complete production retry path remains covered
+/// without depending on loopback access under ghars.
 #[test]
 fn url_probe_retries_503_and_reapplies_range_header() {
     use std::io::Write;
 
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind localhost listener");
-    let addr = listener.local_addr().expect("read listener address");
-    let url = format!("http://{addr}/package");
+    let root = tempfile::tempdir().expect("probe Unix-socket tempdir");
+    let socket_path = root.path().join("probe-http.sock");
+    let listener =
+        std::os::unix::net::UnixListener::bind(&socket_path).expect("bind probe Unix socket");
+    let url = "http://probe.invalid/package".to_owned();
     let client_url = url.clone();
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .no_proxy()
+        .unix_socket(socket_path)
         .build()
         .expect("build probe-test client");
     let worker = std::thread::spawn(move || {
@@ -2980,7 +3016,7 @@ fn url_probe_retries_503_and_reapplies_range_header() {
         "HTTP/1.1 206 Partial Content\r\ncontent-length: 1\r\n\
          content-range: bytes 0-0/1\r\nconnection: close\r\n\r\nx",
     ] {
-        let mut socket = accept_retry_test_connection_while_running(&listener, &worker)
+        let mut socket = accept_retry_test_unix_connection_while_running(&listener, &worker)
             .expect("accept probe request")
             .expect("probe client stopped before issuing every expected attempt");
         requests.push(read_retry_test_request_head(&mut socket).expect("read probe request"));
