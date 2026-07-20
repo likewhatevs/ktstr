@@ -3,8 +3,11 @@
 //! Cargo's machine-readable output remains captured byte-for-byte by the
 //! interruptible child runner. This module observes both streams because
 //! wrappers such as `cargo llvm-cov` forward nested Cargo JSON on stderr. It
-//! incrementally counts `compiler-artifact` messages and records Cargo's
-//! `build-finished` phase. Machine records on stderr are consumed from the
+//! incrementally counts completed `compiler-artifact` messages and records
+//! Cargo's `build-finished` phase. The count is completion-based: a plateau
+//! means Cargo still has one or more compiler/linker jobs in flight that have
+//! not emitted their artifact record yet, not that artifact discovery is
+//! walking targets serially. Machine records on stderr are consumed from the
 //! live display while ordinary diagnostics are forwarded unchanged.
 
 use std::io::IsTerminal;
@@ -266,7 +269,7 @@ impl ReservedBuildProgress {
 
     fn tty_message(&self) -> String {
         format!(
-            "{}: {} — {}; {} compiler artifacts",
+            "{}: {} — {}; {} Cargo artifacts completed",
             self.label,
             self.description,
             self.phase(),
@@ -352,7 +355,7 @@ impl ReservedBuildProgress {
 
     fn heartbeat_line(&self, now: Instant) -> String {
         format!(
-            "{}: {} — {}; elapsed={}; compiler-artifacts={}; build-finished={}",
+            "{}: {} — {}; elapsed={}; cargo-artifacts-completed={}; build-finished={}",
             self.label,
             self.description,
             self.phase(),
@@ -389,7 +392,7 @@ impl ReservedBuildProgress {
             "failed"
         };
         format!(
-            "{}: {outcome} {} in {}; compiler-artifacts={}; \
+            "{}: {outcome} {} in {}; cargo-artifacts-completed={}; \
              build-finished={}; exit={}",
             self.label,
             self.description,
@@ -413,7 +416,7 @@ impl ReservedBuildProgress {
     fn finish_error(&mut self, error: &std::io::Error) {
         self.consume_trailing_lines();
         let message = format!(
-            "{}: failed {} after {}; compiler-artifacts={}; \
+            "{}: failed {} after {}; cargo-artifacts-completed={}; \
              build-finished={}; error={}",
             self.label,
             self.description,
@@ -613,7 +616,7 @@ mod tests {
         let lines = lines.lock().expect("lines");
         assert_eq!(lines.len(), 2);
         assert!(lines[1].contains("elapsed=10.0s"));
-        assert!(lines[1].contains("compiler-artifacts=0"));
+        assert!(lines[1].contains("cargo-artifacts-completed=0"));
         assert!(lines[1].contains("build-finished=pending"));
         assert!(
             lines.iter().all(|line| !line.contains('\u{1b}')),
@@ -634,11 +637,11 @@ mod tests {
         progress.finish_status(&ExitStatus::from_raw(0));
 
         let lines = lines.lock().expect("lines");
-        assert!(lines[1].contains("compiler-artifacts=2"));
+        assert!(lines[1].contains("cargo-artifacts-completed=2"));
         assert!(lines[1].contains("build-finished=pending"));
         let completion = lines.last().expect("completion");
         assert!(completion.contains("completed reserved harness pre-build"));
-        assert!(completion.contains("compiler-artifacts=2"));
+        assert!(completion.contains("cargo-artifacts-completed=2"));
         assert!(completion.contains("build-finished=success"));
         assert!(completion.contains("exit=success"));
     }
@@ -685,7 +688,7 @@ mod tests {
         );
         let lines = lines.lock().expect("lines");
         let completion = lines.last().expect("completion");
-        assert!(completion.contains("compiler-artifacts=2"));
+        assert!(completion.contains("cargo-artifacts-completed=2"));
         assert!(completion.contains("build-finished=success"));
     }
 

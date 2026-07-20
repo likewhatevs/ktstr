@@ -2564,7 +2564,7 @@ pub(crate) fn run_reserved_prebuild_collect_test_bins(
     run_reserved_build_output_under_lease(
         warm_cmd,
         cli_label,
-        "harness pre-build with Cargo artifact discovery",
+        "selected test-binary compile with Cargo artifact capture",
         target_dir,
         |output| {
             if !output.status.success() {
