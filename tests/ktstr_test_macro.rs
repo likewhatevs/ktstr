@@ -732,6 +732,99 @@ ktstr::declare_scheduler!(TEST_DECLARE, {
     config_file = "test-config.toml",
 });
 
+const MANIFEST_STAMP_DIRECT_PRIMARY: ktstr::test_support::Scheduler =
+    ktstr::test_support::Scheduler::named("manifest_stamp_direct_primary")
+        .binary(ktstr::test_support::SchedulerSpec::Discover(
+            "stamp-primary-bin",
+        ))
+        .manifest_dir("/stamp/direct-primary");
+const MANIFEST_STAMP_DIRECT_STAGED: ktstr::test_support::Scheduler =
+    ktstr::test_support::Scheduler::named("manifest_stamp_direct_staged")
+        .binary(ktstr::test_support::SchedulerSpec::Path(
+            "/stamp/direct-staged",
+        ))
+        .manifest_dir("/stamp/direct-staged-workspace");
+
+/// Direct (non-`declare_scheduler!`) schedulers still contribute exact
+/// executable requirements through the test-edge stamp. The staged edge also
+/// pins primary-before-staged ordering.
+#[ktstr_test(
+    ignore,
+    scheduler = MANIFEST_STAMP_DIRECT_PRIMARY,
+    staged_schedulers = [MANIFEST_STAMP_DIRECT_STAGED]
+)]
+fn manifest_stamp_direct_and_staged_edges(_ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+
+fn manifest_stamp_manual_entry_body(_ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+
+#[ktstr::ktstr_test_entry]
+static MANIFEST_STAMP_MANUAL_ENTRY: ktstr::test_support::KtstrTestEntry =
+    ktstr::test_support::KtstrTestEntry {
+        name: "manifest_stamp_manual_entry",
+        func: manifest_stamp_manual_entry_body,
+        scheduler: &MANIFEST_STAMP_DIRECT_PRIMARY,
+        ..ktstr::test_support::KtstrTestEntry::DEFAULT
+    };
+
+/// The no-exec ELF projection must match the retained runtime registry for
+/// macro-generated primary/staged edges and a manual entry.
+#[test]
+fn scheduler_manifest_elf_stamp_matches_runtime_test_registry() {
+    let executable = std::env::current_exe().expect("locate integration-test executable");
+    let stamped = ktstr::test_support::read_scheduler_manifest_stamp(&executable)
+        .expect("read scheduler-manifest ELF stamp")
+        .expect("integration-test binary must carry the v1 stamp");
+    let profile_dir = tempfile::tempdir().expect("runtime parity profile directory");
+    let output = std::process::Command::new(&executable)
+        .arg(ktstr::test_support::SCHEDULER_MANIFEST_PROBE_ARG)
+        .env(
+            "LLVM_PROFILE_FILE",
+            profile_dir.path().join("runtime-%p-%m.profraw"),
+        )
+        .output()
+        .expect("run retained runtime parity oracle");
+    assert!(
+        output.status.success(),
+        "runtime manifest probe failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let runtime: ktstr::test_support::SchedulerManifestProbe =
+        serde_json::from_slice(&output.stdout).expect("decode runtime manifest probe");
+    assert_eq!(stamped, runtime);
+
+    let direct_tests = stamped
+        .tests
+        .iter()
+        .filter(|mapping| mapping.test == "manifest_stamp_direct_and_staged_edges")
+        .map(|mapping| mapping.scheduler.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        direct_tests,
+        [
+            "manifest_stamp_direct_primary",
+            "manifest_stamp_direct_staged"
+        ]
+    );
+    assert!(stamped.tests.iter().any(|mapping| {
+        mapping.test == "manifest_stamp_manual_entry"
+            && mapping.scheduler == "manifest_stamp_direct_primary"
+    }));
+    assert!(stamped.artifact_requirements.iter().any(|requirement| {
+        requirement.binary_kind
+            == ktstr::test_support::BinaryKindJson::Discover("stamp-primary-bin".to_string())
+            && requirement.manifest_dir == "/stamp/direct-primary"
+    }));
+    assert!(stamped.artifact_requirements.iter().any(|requirement| {
+        requirement.binary_kind
+            == ktstr::test_support::BinaryKindJson::Path("/stamp/direct-staged".to_string())
+            && requirement.manifest_dir == "/stamp/direct-staged-workspace"
+    }));
+}
+
 /// Check the macro generates a const Scheduler with the correct name.
 #[test]
 fn declare_scheduler_const_name() {

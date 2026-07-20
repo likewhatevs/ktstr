@@ -209,6 +209,7 @@ fn declaration_binary_was_built() {{}}
 fn write_success_member(workspace: &Path, ktstr_root: &Path) {
     let root = workspace.join("verifier-e2e");
     std::fs::create_dir_all(root.join("tests")).expect("create success member tests directory");
+    std::fs::create_dir_all(root.join("src")).expect("create success member source directory");
     std::fs::write(
         root.join("Cargo.toml"),
         format!(
@@ -237,7 +238,9 @@ required-features = ["verification-tests"]
         ),
     )
     .expect("write success member manifest");
-    let declaration = r#"extern crate test_harness as ktstr;
+    let declaration = r#"#![cfg(feature = "verification-tests")]
+
+extern crate test_harness as ktstr;
 
 use ktstr::declare_scheduler;
 use ktstr::test_support::TopologyConstraints;
@@ -256,14 +259,24 @@ declare_scheduler!(RECURSIVE_DISCOVERY_SUCCESS_SCHEDULER, {
         max_cpus: Some(4),
     },
 });
+"#;
+    std::fs::write(root.join("src/lib.rs"), declaration)
+        .expect("write dependency-level feature-gated scheduler declaration");
+
+    let integration_test = r#"use verifier_e2e::RECURSIVE_DISCOVERY_SUCCESS_SCHEDULER;
 
 #[test]
-fn declaration_binary_was_built() {}
+fn declaration_binary_was_built() {
+    assert_eq!(
+        RECURSIVE_DISCOVERY_SUCCESS_SCHEDULER.name,
+        "recursive-discovery-success",
+    );
+}
 "#;
-    std::fs::write(root.join("tests/scheduler.rs"), declaration)
-        .expect("write successful feature-gated scheduler declaration");
-    std::fs::write(root.join("tests/scheduler_duplicate.rs"), declaration)
-        .expect("write duplicate feature-gated scheduler declaration");
+    std::fs::write(root.join("tests/scheduler.rs"), integration_test)
+        .expect("write successful feature-gated scheduler consumer");
+    std::fs::write(root.join("tests/scheduler_duplicate.rs"), integration_test)
+        .expect("write duplicate feature-gated scheduler consumer");
 }
 
 #[test]

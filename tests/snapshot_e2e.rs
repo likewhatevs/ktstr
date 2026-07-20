@@ -411,8 +411,7 @@ fn scenario_snapshot_op_captures_in_vm(
     Ok(result)
 }
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_SNAPSHOT_OP_IN_VM: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "snapshot_op_captures_in_vm",
@@ -571,8 +570,7 @@ fn scenario_watch_snapshot_op_captures_exit_state(
     Ok(result)
 }
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_WATCH_SNAPSHOT_EXIT: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "watch_snapshot_op_captures_exit_state",
@@ -743,8 +741,7 @@ fn scenario_snapshotmap_iter_against_synthetic_cgroup_map(
     Ok(result)
 }
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_SNAPSHOTMAP_ITER: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "snapshotmap_iter_against_synthetic_cgroup_map",

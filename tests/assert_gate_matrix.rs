@@ -34,8 +34,7 @@ macro_rules! gate_test {
         }
 
         #[allow(non_upper_case_globals)]
-        #[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-        #[linkme(crate = ktstr::linkme)]
+        #[ktstr::ktstr_test_entry]
         static $name: KtstrTestEntry = KtstrTestEntry {
             name: stringify!($name),
             func: $name::scenario,
@@ -182,8 +181,7 @@ macro_rules! gap_negative_test {
         }
 
         #[allow(non_upper_case_globals)]
-        #[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-        #[linkme(crate = ktstr::linkme)]
+        #[ktstr::ktstr_test_entry]
         static $name: KtstrTestEntry = KtstrTestEntry {
             name: stringify!($name),
             func: $name::scenario,

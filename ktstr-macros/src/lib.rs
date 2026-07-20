@@ -11,6 +11,30 @@ mod json;
 mod ktstr_test;
 mod payload;
 mod scheduler;
+mod test_entry;
+
+/// Register a manually constructed `KtstrTestEntry`.
+///
+/// This is the manual-entry counterpart to [`ktstr_test`]: it registers the
+/// static in `KTSTR_TESTS` and emits the versioned ELF scheduler-manifest
+/// record consumed by `cargo ktstr`. Manual entries with staged schedulers
+/// should use `#[ktstr_test]`, whose attribute grammar can project every
+/// staged edge into the stamp.
+#[proc_macro_attribute]
+pub fn ktstr_test_entry(attr: TokenStream, item: TokenStream) -> TokenStream {
+    if !attr.is_empty() {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "ktstr_test_entry does not accept arguments",
+        )
+        .to_compile_error()
+        .into();
+    }
+    let item = parse_macro_input!(item as syn::ItemStatic);
+    test_entry::expand(item)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
 
 /// Attribute macro that registers a function as a ktstr integration test.
 ///
@@ -291,8 +315,10 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   `Scheduler`.
 /// - A hidden `static __KTSTR_SCHED_REG_MITOSIS: &'static Scheduler`
 ///   registered in `KTSTR_SCHEDULERS` (`ktstr::test_support::KTSTR_SCHEDULERS`)
-///   via linkme so the verifier can discover the declaration by
-///   spawning the test binary with `--ktstr-list-schedulers`.
+///   via linkme for in-process lookup.
+/// - A hidden, versioned scheduler-manifest record in a link-retained ELF
+///   section. `cargo ktstr` reads this record directly from warmed test
+///   binaries, so verifier discovery does not start each binary.
 ///
 /// # Visibility prefix
 ///

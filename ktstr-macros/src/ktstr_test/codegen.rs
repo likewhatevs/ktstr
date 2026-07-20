@@ -20,6 +20,10 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
     let orig_name = &input.sig.ident;
     let inner_name = format_ident!("__ktstr_inner_{}", orig_name);
     let entry_name = format_ident!("__KTSTR_ENTRY_{}", orig_name.to_string().to_uppercase());
+    let manifest_entry_name = format_ident!(
+        "__KTSTR_SCHED_MANIFEST_TEST_{}",
+        orig_name.to_string().to_uppercase()
+    );
     let name_str = orig_name.to_string();
 
     // Destructure attrs into per-field bare locals. The codegen
@@ -286,6 +290,14 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
     } else {
         quote! {}
     };
+    let manifest_primary_scheduler = quote! {
+        ::ktstr::test_support::SchedulerManifestUseStampV1::new(#scheduler_tokens)
+    };
+    let manifest_staged_schedulers = staged_schedulers_slice.iter().map(|scheduler| {
+        quote! {
+            ::ktstr::test_support::SchedulerManifestUseStampV1::new(&#scheduler)
+        }
+    });
 
     // Conditionally-emitted KtstrTestEntry fields. Each block is
     // either an empty TokenStream (so the field is left to
@@ -745,6 +757,20 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
             #workload_root_cgroup_field
             ..::ktstr::test_support::KtstrTestEntry::DEFAULT
         };
+
+        #[::ktstr::distributed_slice(
+            ::ktstr::test_support::KTSTR_SCHEDULER_MANIFEST_TESTS_V1
+        )]
+        #[linkme(crate = ::ktstr::linkme)]
+        static #manifest_entry_name:
+            ::ktstr::test_support::SchedulerManifestTestStampV1 =
+            ::ktstr::test_support::SchedulerManifestTestStampV1::new(
+                #name_str,
+                &[
+                    #manifest_primary_scheduler,
+                    #(#manifest_staged_schedulers),*
+                ],
+            );
 
         #pairing_assert
 

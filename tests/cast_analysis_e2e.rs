@@ -558,8 +558,7 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
     Ok(())
 }
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_CAST_ANALYSIS_KERNEL_KPTR: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "cast_analysis_chases_kernel_kptr",
@@ -1013,8 +1012,7 @@ fn check_cast_analysis_chases_bss_to_arena(result: &VmResult) -> Result<()> {
     Ok(())
 }
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_CAST_ANALYSIS_BSS_TO_ARENA: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "cast_analysis_chases_bss_to_arena",
@@ -1484,8 +1482,7 @@ fn check_cast_analysis_cross_subprog_arena_chase(result: &VmResult) -> Result<()
     Ok(())
 }
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_CAST_ANALYSIS_CROSS_SUBPROG: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "cast_analysis_cross_subprog_arena_chase",
@@ -1504,8 +1501,7 @@ static __KTSTR_ENTRY_CAST_ANALYSIS_CROSS_SUBPROG: ktstr::test_support::KtstrTest
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_CAST_ANALYSIS_SDT_ALLOC_BRIDGE: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "cast_analysis_sdt_alloc_bridge_resolves_fwd",

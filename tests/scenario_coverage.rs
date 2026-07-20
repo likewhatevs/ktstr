@@ -437,8 +437,7 @@ fn neg_crash_injection_starvation_gate(result: &ktstr::prelude::VmResult) -> any
     Ok(())
 }
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_FORCED_STALL: KtstrTestEntry = KtstrTestEntry {
     name: "cover_watchdog_forced_stall",
     func: ktstr::scenario::basic::custom_crash_light,
@@ -451,8 +450,7 @@ static __KTSTR_ENTRY_FORCED_STALL: KtstrTestEntry = KtstrTestEntry {
     ..KtstrTestEntry::DEFAULT
 };
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_STALL_DETECT: KtstrTestEntry = KtstrTestEntry {
     name: "neg_stuck_detection_scx_exit",
     func: ktstr::scenario::basic::custom_crash_light,
@@ -465,8 +463,7 @@ static __KTSTR_ENTRY_STALL_DETECT: KtstrTestEntry = KtstrTestEntry {
     ..KtstrTestEntry::DEFAULT
 };
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_SCHED_DEATH: KtstrTestEntry = KtstrTestEntry {
     name: "neg_sched_death_no_check_result",
     func: ktstr::scenario::basic::custom_crash_light,
@@ -479,8 +476,7 @@ static __KTSTR_ENTRY_SCHED_DEATH: KtstrTestEntry = KtstrTestEntry {
     ..KtstrTestEntry::DEFAULT
 };
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_AUTO_REPRO_CHECK: KtstrTestEntry = KtstrTestEntry {
     name: "neg_auto_repro_on_check_failure",
     func: scenario_forced_failure,
@@ -490,8 +486,7 @@ static __KTSTR_ENTRY_AUTO_REPRO_CHECK: KtstrTestEntry = KtstrTestEntry {
     ..KtstrTestEntry::DEFAULT
 };
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_CRASH_AFTER: KtstrTestEntry = KtstrTestEntry {
     name: "neg_crash_after_auto_repro",
     func: ktstr::scenario::basic::custom_crash_light,
@@ -534,8 +529,7 @@ fn neg_expect_scx_bpf_error_contains_e2e(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::basic::custom_crash_light(ctx)
 }
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
     name: "neg_host_crash_auto_repro",
     func: scenario_yield_heavy,

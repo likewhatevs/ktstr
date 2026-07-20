@@ -2462,3 +2462,26 @@ fn suffix_emits_workload_root_cgroup_and_scheduler_cgroup_parent() {
         );
     }
 }
+
+/// Verifier preparation uses this exact debug-section rewrite on warmed test
+/// executables. The allocated scheduler-manifest sections and every relocation
+/// they reference must survive byte-for-byte semantically.
+#[test]
+fn debug_strip_preserves_scheduler_manifest_elf_stamp() {
+    let executable = crate::resolve_current_exe().expect("locate unit-test executable");
+    let before = crate::test_support::read_scheduler_manifest_stamp(&executable)
+        .expect("read scheduler-manifest stamp before strip")
+        .expect("ktstr unit-test binary must carry v1 stamp sentinels");
+    assert!(
+        !before.tests.is_empty(),
+        "strip fixture must exercise relocation-backed test records, not only sentinels",
+    );
+    let bytes = std::fs::read(&executable).expect("read unit-test executable");
+    let stripped = strip_debug_sections(&bytes).expect("run production debug-strip rewrite");
+    let output = tempfile::NamedTempFile::new().expect("temporary stripped executable");
+    std::fs::write(output.path(), stripped).expect("write stripped executable");
+    let after = crate::test_support::read_scheduler_manifest_stamp(output.path())
+        .expect("read scheduler-manifest stamp after strip")
+        .expect("debug strip must retain v1 stamp sentinels");
+    assert_eq!(after, before);
+}

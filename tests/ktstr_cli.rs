@@ -721,3 +721,49 @@ fn ctprof_compare_invalid_sort_by_direction_errors() {
         .stderr(predicate::str::contains("invalid direction"))
         .stderr(predicate::str::contains("bogus"));
 }
+
+/// A binary that links ktstr but declares no schedulers or ktstr tests still
+/// carries both v1 sentinels. This distinguishes a valid empty registry from
+/// an unrelated/old binary with no stamp.
+#[test]
+fn scheduler_manifest_stamp_represents_a_valid_empty_binary() {
+    // Inspect a separately linked binary which never calls the reader itself.
+    // This proves link retention, rather than accidentally retaining the
+    // sentinels because this integration-test target references their module.
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_ktstr"));
+    let manifest = ktstr::test_support::read_scheduler_manifest_stamp(executable)
+        .expect("read empty scheduler-manifest stamp")
+        .expect("ktstr-linked binary must carry v1 sentinels");
+    assert!(manifest.declarations.is_empty());
+    assert!(manifest.artifact_requirements.is_empty());
+    assert!(manifest.tests.is_empty());
+}
+
+/// Corrupting a versioned record is a hard, local diagnostic rather than an
+/// attempted process launch or a silent "no declarations" result.
+#[test]
+fn scheduler_manifest_stamp_rejects_corrupt_record_magic() {
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_ktstr"));
+    let mut bytes = std::fs::read(executable).expect("read standalone ktstr executable");
+    let offset = {
+        let elf = goblin::elf::Elf::parse(&bytes).expect("parse integration-test ELF");
+        let section = elf
+            .section_headers
+            .iter()
+            .find(|section| {
+                elf.shdr_strtab.get_at(section.sh_name)
+                    == Some("linkme_KTSTR_SCHEDULER_MANIFEST_DECLARATIONS_V1")
+            })
+            .expect("declaration stamp section");
+        usize::try_from(section.sh_offset).expect("section offset")
+    };
+    bytes[offset] ^= 0xff;
+    let temp = tempfile::NamedTempFile::new().expect("temporary corrupt ELF");
+    std::fs::write(temp.path(), bytes).expect("write corrupt ELF");
+    let error = ktstr::test_support::read_scheduler_manifest_stamp(temp.path())
+        .expect_err("corrupt stamp must fail");
+    assert!(
+        error.contains("invalid magic"),
+        "corruption diagnostic must name the invalid magic: {error}",
+    );
+}

@@ -258,8 +258,7 @@ fn check_captured_content(result: &VmResult) -> Result<()> {
     Ok(())
 }
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_SILENT_DROP_WATCHDOG_STALL_CAPTURED_SCHEMA:
     ktstr::test_support::KtstrTestEntry = ktstr::test_support::KtstrTestEntry {
     name: "silent_drop_watchdog_stall_captured_schema",
@@ -276,8 +275,7 @@ static __KTSTR_ENTRY_SILENT_DROP_WATCHDOG_STALL_CAPTURED_SCHEMA:
     ..ktstr::test_support::KtstrTestEntry::DEFAULT
 };
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_SILENT_DROP_CLEAN_EXIT_GATE_SUPPRESSION: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "silent_drop_clean_exit_gate_suppression",
@@ -294,8 +292,7 @@ static __KTSTR_ENTRY_SILENT_DROP_CLEAN_EXIT_GATE_SUPPRESSION: ktstr::test_suppor
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_SILENT_DROP_WATCHDOG_STALL_CAPTURED_CONTENT:
     ktstr::test_support::KtstrTestEntry = ktstr::test_support::KtstrTestEntry {
     name: "silent_drop_watchdog_stall_captured_content",

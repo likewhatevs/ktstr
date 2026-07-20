@@ -10,15 +10,16 @@
 //! (0 = accepted, 2 = "registered but rejected", other = "not registered
 //! here") and miss-stderr bookkeeping live in [`process_bin_with_runner`].
 //!
-//! Quick shell, scheduler-manifest, and export-acceptance discriminators have a
-//! 60-second child deadline. Export first selects an accepted owner through
-//! that bounded path, then invokes only that binary's real exporter through an
-//! unbounded anchored runner which tees both output streams and emits elapsed
-//! heartbeats while scheduler build and executable packaging proceed.
+//! Quick shell and export-acceptance discriminators have a 60-second child
+//! deadline. Scheduler manifests take a separate no-exec path which reads
+//! versioned ELF records. Export first selects an accepted owner through the
+//! bounded process path, then invokes only that binary's real exporter through
+//! an unbounded anchored runner which tees both output streams and emits
+//! elapsed heartbeats while scheduler build and executable packaging proceed.
 //!
-//! The export/shell exit-code contract and combined scheduler-manifest wire
-//! payload are private agreements between cargo-ktstr and test-support ctors,
-//! not ktstr-library general capabilities.
+//! The export/shell exit-code contract and scheduler-manifest ELF wire format
+//! are private agreements between cargo-ktstr and test-support, not
+//! ktstr-library general capabilities.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
@@ -239,6 +240,7 @@ fn run_unbounded_export_output(binary: &Path, command: Command) -> std::io::Resu
 /// non-zero exits mean that binary does not link the requested probe ctor and
 /// remain ordinary misses. Signals, runner errors, and successful-output
 /// decode errors are terminal and count as failed progress items.
+#[cfg(test)]
 fn collect_probe_outputs<T>(
     bins: &[PathBuf],
     configure_cmd: impl Fn(&Path) -> Command,
@@ -283,66 +285,18 @@ fn collect_probe_outputs<T>(
     Ok(collected)
 }
 
-pub(crate) fn probe_collect_from_bins_bounded<T>(
-    bins: &[PathBuf],
-    description: &str,
-    configure_cmd: impl Fn(&Path) -> Command,
-    on_success: impl Fn(&Path, &Output) -> Result<T, String>,
-) -> Result<Vec<T>, String> {
-    if bins.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut progress = crate::run_cargo::ItemProgress::start(
-        &format!("cargo ktstr: probing {description}"),
-        bins.len(),
-    );
-    let result = collect_probe_outputs(
-        bins,
-        configure_cmd,
-        on_success,
-        |binary, command| {
-            run_bounded_probe_output(description, binary, command, ProbeStreams::Capture)
-        },
-        |success| progress.item_finished(success),
-    );
-    match &result {
-        Err(error) => progress.finish_error(error),
-        Ok(_) => progress.finish_success(),
-    }
-    result
-}
-
-fn probe_dylib_path(
-    loader_paths: &[PathBuf],
-) -> Result<Option<(&'static str, std::ffi::OsString)>, String> {
-    if loader_paths.is_empty() {
-        return Ok(None);
-    }
-    #[cfg(target_os = "macos")]
-    let variable = "DYLD_FALLBACK_LIBRARY_PATH";
-    #[cfg(windows)]
-    let variable = "PATH";
-    #[cfg(all(not(target_os = "macos"), not(windows)))]
-    let variable = "LD_LIBRARY_PATH";
-
-    let inherited = std::env::var_os(variable)
-        .into_iter()
-        .flat_map(|value| std::env::split_paths(&value).collect::<Vec<_>>());
-    let value = std::env::join_paths(loader_paths.iter().cloned().chain(inherited))
-        .map_err(|error| format!("construct scheduler-probe {variable}: {error}"))?;
-    Ok(Some((variable, value)))
-}
-
-/// Probe the combined scheduler payload from every distinct selected binary.
+/// Read the combined scheduler payload from every distinct selected binary.
 ///
-/// Coverage-instrumented registries receive a disposable `%p/%m` profile
-/// destination, and dynamically linked nextest archives receive their exact
-/// loader path. Descriptor-backed verifier binaries can provide a map back to
-/// Cargo's canonical emitted executable so cell ownership retains stable
-/// provenance after the descriptors are dropped.
+/// The payload is a versioned, link-retained ELF stamp emitted by
+/// `declare_scheduler!` and `#[ktstr_test]`; no candidate binary is executed.
+/// `loader_paths` remains in the private call shape because the other probe
+/// families still need it, but scheduler-manifest discovery is independent of
+/// the dynamic loader. Descriptor-backed verifier binaries can provide a map
+/// back to Cargo's canonical emitted executable so cell ownership retains
+/// stable provenance after the descriptors are dropped.
 pub(crate) fn probe_scheduler_manifests_from_bins(
     bins: &[PathBuf],
-    loader_paths: &[PathBuf],
+    _loader_paths: &[PathBuf],
     provenance: Option<&HashMap<PathBuf, PathBuf>>,
     description: &str,
 ) -> Result<Vec<ProbedSchedulerManifest>, String> {
@@ -353,36 +307,19 @@ pub(crate) fn probe_scheduler_manifests_from_bins(
     bins.sort();
     bins.dedup();
 
-    let dylib_path = probe_dylib_path(loader_paths)?;
-    let profile_dir = tempfile::Builder::new()
-        .prefix("ktstr-scheduler-manifest-probe-profraw-")
-        .tempdir()
-        .map_err(|error| {
-            format!("create temporary scheduler-manifest probe profile directory: {error}")
-        })?;
-    let profile_pattern = profile_dir.path().join("probe-%p-%m.profraw");
-    let mut manifests = probe_collect_from_bins_bounded(
-        &bins,
-        description,
-        |bin| {
-            let mut command = Command::new(bin);
-            command
-                .arg(ktstr::test_support::SCHEDULER_MANIFEST_PROBE_ARG)
-                .env("LLVM_PROFILE_FILE", &profile_pattern);
-            if let Some((variable, value)) = &dylib_path {
-                command.env(variable, value);
-            }
-            command
-        },
-        |bin, output| {
-            let manifest = serde_json::from_slice(&output.stdout).map_err(|error| {
-                format!(
-                    "parse --ktstr-list-scheduler-manifest output from {}: {error}",
-                    bin.display(),
-                )
-            })?;
+    let mut progress = crate::run_cargo::ItemProgress::start(
+        &format!("cargo ktstr: reading {description}"),
+        bins.len(),
+    );
+    let result: Result<Vec<ProbedSchedulerManifest>, String> = (|| {
+        let mut manifests = Vec::new();
+        for bin in bins {
+            let Some(manifest) = ktstr::test_support::read_scheduler_manifest_stamp(&bin)? else {
+                progress.item_finished(true);
+                continue;
+            };
             let executable = if let Some(provenance) = provenance {
-                provenance.get(bin).cloned().ok_or_else(|| {
+                provenance.get(&bin).cloned().ok_or_else(|| {
                     format!(
                         "scheduler-manifest probe path {} has no warmed Cargo \
                          executable provenance",
@@ -390,18 +327,24 @@ pub(crate) fn probe_scheduler_manifests_from_bins(
                     )
                 })?
             } else {
-                bin.to_path_buf()
+                bin.clone()
             };
-            Ok(ProbedSchedulerManifest {
+            manifests.push(ProbedSchedulerManifest {
                 executable,
                 manifest,
-            })
-        },
-    )?;
-    manifests.sort_by(|left, right| left.executable.cmp(&right.executable));
-    let mut seen = HashSet::new();
-    manifests.retain(|binary| seen.insert(binary.executable.clone()));
-    Ok(manifests)
+            });
+            progress.item_finished(true);
+        }
+        manifests.sort_by(|left, right| left.executable.cmp(&right.executable));
+        let mut seen = HashSet::new();
+        manifests.retain(|binary| seen.insert(binary.executable.clone()));
+        Ok(manifests)
+    })();
+    match &result {
+        Ok(_) => progress.finish_success(),
+        Err(error) => progress.finish_error(error),
+    }
+    result
 }
 
 /// Aggregate of all-binaries-tried-and-missed. The caller renders

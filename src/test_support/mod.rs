@@ -96,6 +96,14 @@ pub use eval::{
 };
 pub use profraw::current_binary_is_coverage_instrumented;
 pub mod runtime;
+mod scheduler_manifest_stamp;
+#[doc(hidden)]
+pub use scheduler_manifest_stamp::{
+    KTSTR_SCHEDULER_MANIFEST_DECLARATIONS_V1, KTSTR_SCHEDULER_MANIFEST_TESTS_V1,
+    SchedulerManifestDeclarationStampV1, SchedulerManifestStampSliceV1,
+    SchedulerManifestStampStrV1, SchedulerManifestStampSysctlV1, SchedulerManifestTestStampV1,
+    SchedulerManifestUseStampV1, read_scheduler_manifest_stamp,
+};
 mod shell_descriptor;
 pub use shell_descriptor::{SchedulerKind, ShellTestDescriptor};
 #[cfg(feature = "wprof")]
@@ -457,14 +465,13 @@ pub(crate) fn require_bpf_prog_offsets(
 mod tests {
     use super::*;
     use crate::ktstr_test;
-    use linkme::distributed_slice;
 
     // Register a test entry in the distributed slice for unit testing find_test.
     fn __ktstr_inner_unit_test_dummy(_ctx: &Ctx) -> Result<AssertResult> {
         Ok(AssertResult::pass())
     }
 
-    #[distributed_slice(KTSTR_TESTS)]
+    #[crate::ktstr_test_entry]
     static __KTSTR_ENTRY_UNIT_TEST_DUMMY: KtstrTestEntry = KtstrTestEntry {
         name: "__unit_test_dummy__",
         func: __ktstr_inner_unit_test_dummy,

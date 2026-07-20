@@ -732,6 +732,32 @@ pub(crate) fn declare_scheduler_inner(
     };
 
     let registry_ident = format_ident!("__KTSTR_SCHED_REG_{}", const_name);
+    let manifest_registry_ident = format_ident!("__KTSTR_SCHED_MANIFEST_REG_{}", const_name);
+    let manifest_sched_args = sched_args.iter().map(|value| {
+        quote! {
+            ::ktstr::test_support::SchedulerManifestStampStrV1::new(#value)
+        }
+    });
+    let manifest_sysctls = sched_sysctls.iter().map(|value| {
+        quote! {
+            ::ktstr::test_support::SchedulerManifestStampSysctlV1::new(#value)
+        }
+    });
+    let manifest_kargs = sched_kargs.iter().map(|value| {
+        quote! {
+            ::ktstr::test_support::SchedulerManifestStampStrV1::new(#value)
+        }
+    });
+    let manifest_kernels = sched_kernels.iter().map(|value| {
+        quote! {
+            ::ktstr::test_support::SchedulerManifestStampStrV1::new(#value)
+        }
+    });
+    let manifest_excluded_topologies = sched_verifier_exclude_topologies.iter().map(|value| {
+        quote! {
+            ::ktstr::test_support::SchedulerManifestStampStrV1::new(#value)
+        }
+    });
 
     // Default the emitted const's visibility to `pub` when the user
     // omits a prefix. Explicit prefixes (`pub`, `pub(crate)`,
@@ -761,6 +787,25 @@ pub(crate) fn declare_scheduler_inner(
         #[::ktstr::distributed_slice(::ktstr::test_support::KTSTR_SCHEDULERS)]
         #[linkme(crate = ::ktstr::linkme)]
         static #registry_ident: &'static ::ktstr::test_support::Scheduler = &#const_name;
+
+        // Stable final-ELF projection consumed directly by cargo-ktstr.
+        // The compiler evaluates `#const_name` before materializing this
+        // record, so const-path constraints and const Sysctl expressions
+        // retain their exact values without executing the test binary.
+        #[::ktstr::distributed_slice(
+            ::ktstr::test_support::KTSTR_SCHEDULER_MANIFEST_DECLARATIONS_V1
+        )]
+        #[linkme(crate = ::ktstr::linkme)]
+        static #manifest_registry_ident:
+            ::ktstr::test_support::SchedulerManifestDeclarationStampV1 =
+            ::ktstr::test_support::SchedulerManifestDeclarationStampV1::new(
+                &#const_name,
+                &[#(#manifest_sched_args),*],
+                &[#(#manifest_sysctls),*],
+                &[#(#manifest_kargs),*],
+                &[#(#manifest_kernels),*],
+                &[#(#manifest_excluded_topologies),*],
+            );
     };
 
     Ok(expanded)

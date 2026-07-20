@@ -1207,7 +1207,7 @@ fn host_only_listing_stub(
 /// double-fire.
 const HOST_ONLY_LISTING_NAME: &str = "__unit_test_host_only_listing__";
 
-#[linkme::distributed_slice(KTSTR_TESTS)]
+#[crate::ktstr_test_entry]
 static __HOST_ONLY_LISTING_ENTRY: KtstrTestEntry = KtstrTestEntry {
     name: HOST_ONLY_LISTING_NAME,
     func: host_only_listing_stub,
@@ -2799,7 +2799,7 @@ fn perf_skip_listing_stub(
 const PERF_MODE_SKIP_NAME: &str = "__unit_test_perf_mode_skip__";
 const PERF_ONLY_SKIP_NAME: &str = "__unit_test_perf_only_skip__";
 
-#[linkme::distributed_slice(KTSTR_TESTS)]
+#[crate::ktstr_test_entry]
 static __PERF_MODE_SKIP_ENTRY: KtstrTestEntry = KtstrTestEntry {
     name: PERF_MODE_SKIP_NAME,
     func: perf_skip_listing_stub,
@@ -2807,7 +2807,7 @@ static __PERF_MODE_SKIP_ENTRY: KtstrTestEntry = KtstrTestEntry {
     ..KtstrTestEntry::DEFAULT
 };
 
-#[linkme::distributed_slice(KTSTR_TESTS)]
+#[crate::ktstr_test_entry]
 static __PERF_ONLY_SKIP_ENTRY: KtstrTestEntry = KtstrTestEntry {
     name: PERF_ONLY_SKIP_NAME,
     func: perf_skip_listing_stub,

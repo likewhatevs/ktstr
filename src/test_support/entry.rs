@@ -2820,9 +2820,9 @@ pub static KTSTR_TESTS: [KtstrTestEntry];
 
 /// Distributed slice collecting all `declare_scheduler!` registrations
 /// via linkme. Each entry is a `&'static Scheduler` pointing at a
-/// const emitted by the macro. The verifier discovers schedulers by
-/// spawning the test binary with `--ktstr-list-schedulers`; a per-binary
-/// ctor walks this slice and serializes each entry to JSON.
+/// const emitted by the macro. Runtime lookup and retained private probe
+/// commands walk this slice; `cargo ktstr` discovery reads the parallel
+/// versioned ELF-stamp registry without starting the binary.
 #[distributed_slice]
 pub static KTSTR_SCHEDULERS: [&'static Scheduler];
 
@@ -3013,13 +3013,12 @@ pub struct SchedulerArtifactRequirement {
     pub use_count: usize,
 }
 
-/// Complete scheduler metadata emitted by one test-binary probe.
+/// Complete scheduler metadata projected from one test binary.
 ///
-/// `cargo ktstr` consumes this object through
-/// `--ktstr-list-scheduler-manifest`, avoiding separate process startups for
-/// declaration discovery, executable requirement discovery, and per-test
-/// scheduler mapping while keeping the legacy individual probe payloads
-/// available to existing callers.
+/// `cargo ktstr` reconstructs this object from the binary's versioned ELF
+/// stamp without executing it. The private
+/// `--ktstr-list-scheduler-manifest` runtime projection remains available to
+/// internal callers and as an exact parity oracle.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchedulerManifestProbe {
     /// Every scheduler declaration linked into this test binary.
