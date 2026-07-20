@@ -2407,8 +2407,116 @@ fn run_prepared_reserved_build_output(
     tracing::debug!("{cli_label}: reserved {description}");
     let progress =
         crate::reserved_build_progress::ReservedBuildProgress::start(cli_label, description);
-    crate::interrupt::run_output_observed(command, progress)
-        .map_err(|error| format!("{cli_label}: spawn {description}: {error}"))
+    let output = crate::interrupt::run_output_observed(command, progress)
+        .map_err(|error| format!("{cli_label}: spawn {description}: {error}"))?;
+    if let Err(error) = persist_reserved_build_diagnostics(&output, cli_label, description) {
+        eprintln!("{cli_label}: could not preserve reserved-build diagnostics: {error}");
+    }
+    Ok(output)
+}
+
+const BUILD_DIAGNOSTICS_DIR_ENV: &str = "KTSTR_BUILD_DIAGNOSTICS_DIR";
+const BUILD_DIAGNOSTIC_STREAM_LIMIT: usize = 16 * 1024 * 1024;
+static BUILD_DIAGNOSTIC_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Preserve the exact captured streams when CI (or an operator) requests a
+/// diagnostics directory. Live stderr remains concise, while the raw Cargo
+/// machine stream and wrapper diagnostics stay downloadable after the run.
+fn persist_reserved_build_diagnostics(
+    output: &std::process::Output,
+    cli_label: &str,
+    description: &str,
+) -> Result<Option<PathBuf>, String> {
+    let Some(root) = std::env::var_os(BUILD_DIAGNOSTICS_DIR_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    else {
+        return Ok(None);
+    };
+    persist_reserved_build_diagnostics_to(&root, output, cli_label, description).map(Some)
+}
+
+fn persist_reserved_build_diagnostics_to(
+    root: &std::path::Path,
+    output: &std::process::Output,
+    cli_label: &str,
+    description: &str,
+) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(root)
+        .map_err(|error| format!("create diagnostics directory {}: {error}", root.display()))?;
+    let sequence = BUILD_DIAGNOSTIC_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stem = format!(
+        "{}-{}-{}-{sequence}",
+        diagnostic_filename_component(cli_label),
+        diagnostic_filename_component(description),
+        std::process::id(),
+    );
+    let stdout_path = root.join(format!("{stem}.stdout.log"));
+    let stderr_path = root.join(format!("{stem}.stderr.log"));
+    write_bounded_diagnostic_stream(&stdout_path, &output.stdout)?;
+    write_bounded_diagnostic_stream(&stderr_path, &output.stderr)?;
+    Ok(root.to_path_buf())
+}
+
+fn diagnostic_filename_component(value: &str) -> String {
+    let mut component = String::with_capacity(value.len().min(64));
+    let mut separator = false;
+    for character in value.chars() {
+        if component.len() >= 64 {
+            break;
+        }
+        if character.is_ascii_alphanumeric() {
+            component.push(character.to_ascii_lowercase());
+            separator = false;
+        } else if !separator && !component.is_empty() {
+            component.push('-');
+            separator = true;
+        }
+    }
+    while component.ends_with('-') {
+        component.pop();
+    }
+    if component.is_empty() {
+        component.push_str("build");
+    }
+    component
+}
+
+fn write_bounded_diagnostic_stream(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    write_bounded_diagnostic_stream_with_limit(path, bytes, BUILD_DIAGNOSTIC_STREAM_LIMIT)
+}
+
+fn write_bounded_diagnostic_stream_with_limit(
+    path: &std::path::Path,
+    bytes: &[u8],
+    limit: usize,
+) -> Result<(), String> {
+    use std::io::Write as _;
+
+    debug_assert!(limit >= 2, "diagnostic stream limit must retain both ends");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("create {}: {error}", path.display()))?;
+    if bytes.len() <= limit {
+        file.write_all(bytes)
+            .map_err(|error| format!("write {}: {error}", path.display()))?;
+        return Ok(());
+    }
+
+    let half = limit / 2;
+    let omitted = bytes.len() - (half * 2);
+    file.write_all(&bytes[..half])
+        .and_then(|()| {
+            writeln!(
+                file,
+                "\n--- ktstr omitted {omitted} diagnostic bytes to keep this artifact bounded ---"
+            )
+        })
+        .and_then(|()| file.write_all(&bytes[bytes.len() - half..]))
+        .map_err(|error| format!("write bounded {}: {error}", path.display()))
 }
 
 /// Run a reserved Cargo build while extending target-dir writer ownership
@@ -5920,6 +6028,84 @@ cargo-llvm-cov diagnostic
             .unwrap(),
             Vec::<PathBuf>::new(),
             "a confirmed build with zero test executables is valid",
+        );
+    }
+
+    #[test]
+    fn reserved_build_diagnostics_preserve_both_captured_streams() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let directory = tempfile::tempdir().expect("diagnostics tempdir");
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"{\"reason\":\"compiler-artifact\"}\n".to_vec(),
+            stderr: b"warning: human diagnostic\n".to_vec(),
+        };
+        let root = persist_reserved_build_diagnostics_to(
+            directory.path(),
+            &output,
+            "cargo ktstr: verifier",
+            "scheduler workspace pre-build",
+        )
+        .expect("persist diagnostics");
+        assert_eq!(root, directory.path());
+
+        let mut entries = std::fs::read_dir(directory.path())
+            .expect("read diagnostics")
+            .map(|entry| entry.expect("diagnostic entry").path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        assert_eq!(entries.len(), 2);
+        let stdout = entries
+            .iter()
+            .find(|path| path.to_string_lossy().ends_with(".stdout.log"))
+            .expect("stdout artifact");
+        let stderr = entries
+            .iter()
+            .find(|path| path.to_string_lossy().ends_with(".stderr.log"))
+            .expect("stderr artifact");
+        assert_eq!(
+            std::fs::read(stdout).expect("read stdout artifact"),
+            output.stdout,
+        );
+        assert_eq!(
+            std::fs::read(stderr).expect("read stderr artifact"),
+            output.stderr,
+        );
+        assert!(
+            entries.iter().all(|path| {
+                path.file_name()
+                    .expect("artifact filename")
+                    .to_string_lossy()
+                    .starts_with("cargo-ktstr-verifier-scheduler-workspace-pre-build-")
+            }),
+            "artifact names must remain path-safe and identify their phase",
+        );
+    }
+
+    #[test]
+    fn reserved_build_diagnostic_bound_retains_stream_head_and_tail() {
+        let directory = tempfile::tempdir().expect("diagnostics tempdir");
+        let path = directory.path().join("bounded.stderr.log");
+        let bytes = b"0123456789abcdefghijklmnop";
+        write_bounded_diagnostic_stream_with_limit(&path, bytes, 12)
+            .expect("write bounded diagnostics");
+        let written = std::fs::read_to_string(path).expect("read bounded diagnostics");
+        assert!(written.starts_with("012345"));
+        assert!(written.contains("ktstr omitted 14 diagnostic bytes"));
+        assert!(written.ends_with("klmnop"));
+    }
+
+    #[test]
+    fn diagnostic_filename_component_is_safe_bounded_and_never_empty() {
+        assert_eq!(
+            diagnostic_filename_component(" Cargo ktstr:\nVerifier / Build! "),
+            "cargo-ktstr-verifier-build",
+        );
+        assert_eq!(diagnostic_filename_component("\n/"), "build");
+        assert!(
+            diagnostic_filename_component(&"x".repeat(100)).len() <= 64,
+            "diagnostic filenames must stay bounded",
         );
     }
 
