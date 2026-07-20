@@ -5,6 +5,15 @@
 #include <bpf/bpf_core_read.h>
 #include "intf.h"
 
+/*
+ * Per-scheduler sched_ext generations expose this type through vmlinux BTF;
+ * global-era kernels do not.  Keep one file-scope incomplete declaration so
+ * the optional typed hooks below still compile against an older vmlinux.h.
+ * Userspace disables both hooks before load when their exact BTF targets are
+ * absent.
+ */
+struct scx_sched;
+
 char _license[] SEC("license") = "GPL";
 
 /* Per-CPU counter infrastructure. Each hot counter is a slot in a
