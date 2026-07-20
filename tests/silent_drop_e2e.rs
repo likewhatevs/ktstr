@@ -344,6 +344,10 @@ static __KTSTR_ENTRY_SILENT_DROP_WATCHDOG_STALL_CAPTURED_CONTENT:
 mod clean_exit_gate_tests {
     use super::assert_clean_exit_dump_suppression;
 
+    fn fixture_dump_path(dir: &std::path::Path, stem: &str) -> std::path::PathBuf {
+        dir.join(stem).with_extension("failure-dump.json")
+    }
+
     #[test]
     fn failed_primary_run_preserves_dump_without_resolving_artifacts() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -371,7 +375,7 @@ mod clean_exit_gate_tests {
     #[test]
     fn successful_primary_run_rejects_primary_dump() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dump_path = tmp.path().join("unexpected.failure-dump.json");
+        let dump_path = fixture_dump_path(tmp.path(), "unexpected");
         std::fs::write(&dump_path, b"{}").expect("write unexpected dump");
 
         let err = assert_clean_exit_dump_suppression(true, || Ok((dump_path.clone(), Vec::new())))
@@ -390,7 +394,7 @@ mod clean_exit_gate_tests {
     #[test]
     fn successful_primary_run_rejects_snapshot_sibling() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dump_path = tmp.path().join("absent.failure-dump.json");
+        let dump_path = fixture_dump_path(tmp.path(), "absent");
         let sibling = tmp.path().join("unexpected.snapshot.watchpoint.json");
         std::fs::write(&sibling, b"{}").expect("write unexpected sibling");
 
@@ -411,7 +415,7 @@ mod clean_exit_gate_tests {
     #[test]
     fn successful_primary_run_accepts_absent_artifacts() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dump_path = tmp.path().join("absent.failure-dump.json");
+        let dump_path = fixture_dump_path(tmp.path(), "absent");
 
         assert_clean_exit_dump_suppression(true, || Ok((dump_path, Vec::new())))
             .expect("clean success without dump artifacts must pass");

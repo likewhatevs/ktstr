@@ -2199,10 +2199,10 @@ fn startup_supervisor_inner() -> io::Result<libc::c_int> {
         if !worker_ready {
             ready_budget.check("startup worker readiness")?;
         }
-        if subtree.worker_status.is_none() {
-            if let Some(clean_budget) = clean_budget.as_mut() {
-                clean_budget.check("startup worker clean exit")?;
-            }
+        if subtree.worker_status.is_none()
+            && let Some(clean_budget) = clean_budget.as_mut()
+        {
+            clean_budget.check("startup worker clean exit")?;
         }
 
         if let Some(raw) = subtree.worker_status {
