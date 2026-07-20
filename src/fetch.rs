@@ -109,13 +109,10 @@ const SMALL_RESPONSE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// in `cached_releases_with` routes a non-singleton client to a
 /// direct `fetch_releases` call against `RELEASES_URL` (the
 /// production URL — the bypass skips the cache, NOT the URL). For
-/// full URL injection (e.g. localhost mock server testing), call
-/// either `fetch_releases` directly with the mock URL — see
-/// `fetch_releases_against_localhost_mock_returns_parsed` — or use
-/// the cache-aware seam `cached_releases_with_url`, which routes
-/// the non-singleton bypass branch through the supplied URL while
-/// preserving the singleton/cache routing identical to
-/// `cached_releases_with`.
+/// full URL injection, call `fetch_releases` directly. Cache-routing
+/// tests inject the fetch operation into `cached_releases_with_fetch`
+/// so they can prove the bypass without scheduling a local HTTP
+/// server.
 ///
 /// # Panics
 ///
@@ -236,11 +233,7 @@ fn is_shared_client(client: &Client) -> bool {
 /// pointer-equality gate. [`cached_releases`] is the no-`Client`
 /// wrapper for top-level CLI entries.
 ///
-/// Tests that need URL injection on the bypass branch (e.g.
-/// localhost mock server testing) call
-/// [`cached_releases_with_url`] directly with their mock URL —
-/// the URL-injectable form preserves identical routing
-/// semantics. This wrapper is the production entry point and
+/// This wrapper is the production entry point and
 /// pins the URL to [`RELEASES_URL`]; production code MUST go
 /// through this wrapper. A singleton call with a non-RELEASES_URL
 /// would otherwise populate [`RELEASES_CACHE`] with
@@ -256,17 +249,10 @@ fn cached_releases_with(client: &Client) -> Result<Vec<Release>> {
     cached_releases_with_url(client, RELEASES_URL)
 }
 
-/// URL-injectable form of [`cached_releases_with`]. Production
-/// always reaches this through the [`cached_releases_with`]
-/// wrapper, which pins `url` to [`RELEASES_URL`]; the explicit
-/// `url` parameter exists so the bypass-branch test can route
-/// the non-singleton path through a localhost
-/// [`std::net::TcpListener`]-backed mock instead of hitting real
-/// kernel.org. Without this seam, the bypass test would either
-/// (a) require a real network round-trip on every run, or
-/// (b) accept a 5s timeout penalty on offline hosts to surface
-/// `Err` as a bypass-confirmation signal — both costs the seam
-/// eliminates.
+/// URL-explicit form of [`cached_releases_with`]. Production reaches this
+/// through the wrapper above, which pins `url` to [`RELEASES_URL`]. The
+/// routing core below accepts an injected fetch operation for deterministic
+/// cache/bypass tests.
 ///
 /// Cache contract is identical to [`cached_releases_with`]:
 /// non-singleton clients bypass [`RELEASES_CACHE`] and call
@@ -298,9 +284,22 @@ fn cached_releases_with(client: &Client) -> Result<Vec<Release>> {
 /// thread — observes the populated slot via the `get` fast-path
 /// and skips the network.
 fn cached_releases_with_url(client: &Client, url: &str) -> Result<Vec<Release>> {
+    cached_releases_with_fetch(client, url, fetch_releases)
+}
+
+/// Cache-routing core with an injectable fetch operation.
+///
+/// Production passes [`fetch_releases`]. Keeping the network operation behind
+/// this narrow seam lets cache-routing tests prove singleton/bypass behavior
+/// without starting a localhost HTTP runtime whose response thread can be
+/// starved by a full CI storm.
+fn cached_releases_with_fetch<F>(client: &Client, url: &str, fetch: F) -> Result<Vec<Release>>
+where
+    F: FnOnce(&Client, &str) -> Result<Vec<Release>>,
+{
     // Non-singleton clients bypass the cache (test fault injection).
     if !is_shared_client(client) {
-        return fetch_releases(client, url);
+        return fetch(client, url);
     }
     // Cache-poison guard: the singleton path populates
     // RELEASES_CACHE on miss. A test author that mistakenly
@@ -332,12 +331,12 @@ fn cached_releases_with_url(client: &Client, url: &str) -> Result<Vec<Release>> 
     // dev builds; this branch only catches the misuse that
     // slipped through to release.
     if url != RELEASES_URL {
-        return fetch_releases(client, url);
+        return fetch(client, url);
     }
     if let Some(cached) = RELEASES_CACHE.get() {
         return Ok(cached.clone());
     }
-    let fresh = fetch_releases(client, url)?;
+    let fresh = fetch(client, url)?;
     // Race-loss: `set` returns `Err(clone)` carrying back the
     // clone we passed in; we discard it and return the original
     // `fresh` below. See the rustdoc above for full semantics.
@@ -1453,19 +1452,34 @@ fn resolve_expected_sha256(
     resolve_expected_sha256_from_url(client, &sha256sums_url(major), tarball_name, skip_sha256)
 }
 
-/// URL-injectable core of [`resolve_expected_sha256`]: the skip-gate,
-/// fetch-then-parse, and per-cause warn-and-downgrade logic, against
-/// an arbitrary `sha256sums_url`. Production reaches this only via
-/// [`resolve_expected_sha256`], which pins the URL to
-/// [`sha256sums_url`]; the seam exists so the no-skip arm's
-/// fetch-and-parse path is testable against a localhost mock without a
-/// real cdn.kernel.org round-trip — mirrors [`cached_releases_with_url`].
+/// URL-explicit HTTP wrapper for [`resolve_expected_sha256`]. Production
+/// reaches this with [`sha256sums_url`]; the routing core below accepts an
+/// injected fetch operation for deterministic no-network tests.
 fn resolve_expected_sha256_from_url(
     client: &Client,
     sha256sums_url: &str,
     tarball_name: &str,
     skip_sha256: bool,
 ) -> Option<String> {
+    resolve_expected_sha256_with(tarball_name, skip_sha256, || {
+        fetch_sha256sums_from_url(client, sha256sums_url)
+    })
+}
+
+/// Checksum-resolution core with an injectable manifest fetch.
+///
+/// Production supplies the real retrying HTTP operation through
+/// [`resolve_expected_sha256_from_url`]. The seam keeps parsing and
+/// warn-and-continue routing directly testable without making a synthetic
+/// localhost server compete with thousands of CI test processes.
+fn resolve_expected_sha256_with<F>(
+    tarball_name: &str,
+    skip_sha256: bool,
+    fetch_manifest: F,
+) -> Option<String>
+where
+    F: FnOnce() -> Result<String>,
+{
     if skip_sha256 {
         tracing::warn!(
             tarball = %tarball_name,
@@ -1482,7 +1496,7 @@ fn resolve_expected_sha256_from_url(
     // download still proceeds. The warning surfaces the cause so an
     // operator triaging "kernel build went weird" can spot that
     // verification was skipped.
-    match fetch_sha256sums_from_url(client, sha256sums_url) {
+    match fetch_manifest() {
         Ok(manifest) => match parse_sha256_for_file(&manifest, tarball_name) {
             Some(hex) => Some(hex),
             None => {
@@ -2386,7 +2400,8 @@ fn patch_level(version: &str) -> Option<u32> {
     }
 }
 
-/// Production URL for `releases.json`. Tests call [`fetch_releases`] directly with a localhost mock URL.
+/// Production URL for `releases.json`. Transport tests may pass a local URL
+/// directly to [`fetch_releases`].
 pub(crate) const RELEASES_URL: &str = "https://www.kernel.org/releases.json";
 
 /// Fetch `releases.json` from `url` and return a vector of

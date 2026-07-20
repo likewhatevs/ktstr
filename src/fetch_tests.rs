@@ -801,20 +801,18 @@ fn inspect_local_source_state_detects_mid_build_modification() {
 /// Bypass-branch routing is covered by two complementary
 /// tests: the `is_shared_client` predicate is unit-tested by
 /// [`is_shared_client_rejects_test_constructed_clients`],
-/// and the end-to-end branch through
-/// [`cached_releases_with_url`] is exercised by
+/// and the end-to-end routing core is exercised by
 /// [`cached_releases_with_non_singleton_bypasses_cache`] —
-/// which drives the bypass against a localhost mock URL via
-/// the URL-injection seam and proves the non-singleton
-/// `Client` skips [`RELEASES_CACHE`] and reaches
-/// [`fetch_releases`] with the supplied URL.
+/// which injects a deterministic fetch operation and proves the
+/// non-singleton `Client` skips [`RELEASES_CACHE`] and forwards the
+/// supplied client and URL.
 /// [`fetch_releases`]'s parse mechanics — the same
 /// [`parse_releases_body`] call the bypass branch runs on the
 /// response body, which production callers reach on cache
 /// miss (with [`RELEASES_URL`] pinned by the
 /// [`cached_releases_with`] wrapper) — are covered
 /// deterministically by
-/// [`fetch_releases_against_localhost_mock_returns_parsed`]
+/// [`parse_releases_body_returns_structured_releases`]
 /// via a direct [`parse_releases_body`] call, plus the
 /// `fetch_releases_*` family of error-path tests
 /// (HTTP 500, malformed JSON, missing array, partial rows,
@@ -1105,15 +1103,10 @@ fn series_resolution_routing_through_cache() {
     );
 }
 
-/// End-to-end bypass-branch routing through
-/// [`cached_releases_with_url`]: a non-singleton `Client`
-/// MUST skip [`RELEASES_CACHE`] and exercise
-/// [`fetch_releases`] against the supplied URL, NOT consult
-/// the cache. Routes through the URL-injection seam
-/// ([`cached_releases_with_url`]) so the bypass-branch fetch
-/// hits a localhost [`std::net::TcpListener`] mock that
-/// returns deterministic non-synthetic data — no real
-/// kernel.org round-trip, no offline-host timeout penalty.
+/// End-to-end bypass-branch routing through the same core as
+/// [`cached_releases_with_url`]: a non-singleton `Client` MUST skip
+/// [`RELEASES_CACHE`] and invoke the supplied fetch operation with the
+/// exact client and URL.
 ///
 /// Coexistence with `cached_releases_routing_singleton_path`:
 /// both tests pre-populate [`RELEASES_CACHE`] with the SAME
@@ -1126,21 +1119,11 @@ fn series_resolution_routing_through_cache() {
 /// test's `is_ok()` invariant was relaxed to the same
 /// tolerance for the same reason.
 ///
-/// Mock-served data is deliberately distinct from the
-/// synthetic cache contents — different version strings (in
-/// the 9.x range, never seen on real kernel.org) so a
-/// regression that mis-routed the non-singleton through the
-/// cache would return the synthetic verbatim and the
-/// `data != mock_payload` proof would surface as a value
-/// mismatch. The `Ok(...)` arm of the match below requires a
-/// successful round-trip to the mock; the `Err(_)` arm is
-/// retained as a defensive fallback for the (improbable)
-/// case where mock setup or the underlying TCP exchange
-/// fails on a constrained test host — bypass is still
-/// proven because the cache-hit path returns Ok
-/// unconditionally and any Err means
-/// [`cached_releases_with_url`] reached [`fetch_releases`],
-/// which is the bypass branch's only entry.
+/// Injected data is deliberately distinct from the synthetic cache contents
+/// so a regression that mis-routed the non-singleton through the cache returns
+/// a visibly different value. The injected operation removes localhost
+/// runtime scheduling from this routing test; HTTP and parsing have their own
+/// focused coverage.
 #[test]
 fn cached_releases_with_non_singleton_bypasses_cache() {
     // SAME synthetic data the singleton-path test uses —
@@ -1179,12 +1162,12 @@ fn cached_releases_with_non_singleton_bypasses_cache() {
     // Verify byte-equal contents, not just length. A peer test
     // populating the cache with the same row count but
     // different moniker/version would defeat the bypass
-    // assertion below — the `data != mock_payload` check
+    // assertion below — the `data != fetched_payload` check
     // would still succeed but against the wrong baseline,
     // missing a peer-data corruption regression.
     assert_releases_eq(in_cache, &synthetic, "cache populate sanity");
 
-    // Mock body: 2 entries with version strings (9.x range)
+    // Fetched body: 2 entries with version strings (9.x range)
     // distinct from both the synthetic cache contents and
     // anything that has ever appeared on real kernel.org.
     // A regression that mis-routed the non-singleton through
@@ -1196,13 +1179,12 @@ fn cached_releases_with_non_singleton_bypasses_cache() {
                 { "moniker": "longterm", "version": "9.98.50" }
             ]
         }"#;
-    let (_server, mock_url, _mock) = mock_releases(200, mock_body);
+    let mock_url = "https://fixture.invalid/releases.json";
 
-    // Build a non-singleton client via the shared 60s-timeout
-    // builder helper. The address differs from
+    // Build a non-singleton client. Its address differs from
     // `shared_client()`'s OnceLock-stored address, so
     // `is_shared_client(&non_singleton)` returns false and
-    // `cached_releases_with_url` takes the bypass branch.
+    // `cached_releases_with_fetch` takes the bypass branch.
     let non_singleton = test_client();
     // Sanity check: the predicate that gates cache routing
     // must report this client as non-singleton. Without
@@ -1214,26 +1196,37 @@ fn cached_releases_with_non_singleton_bypasses_cache() {
         !super::is_shared_client(&non_singleton),
         "test precondition: non-singleton client MUST NOT compare \
              equal to the shared_client() singleton — the bypass-branch \
-             proof relies on `cached_releases_with_url` taking the \
+             proof relies on `cached_releases_with_fetch` taking the \
              non-singleton path",
     );
 
-    // Drive the bypass branch through the URL-injection
-    // seam. Mock returns the 2-entry deterministic payload;
+    // Drive the bypass branch through the fetch-operation seam.
+    // It returns the 2-entry deterministic payload;
     // a regression that mis-routed through the cache would
     // return the 3-entry synthetic instead. The match
-    // structure handles both the (expected) Ok path and the
-    // defensive Err fallback for a hypothetical TCP-level
-    // exchange failure.
-    let result = super::cached_releases_with_url(&non_singleton, &mock_url);
+    let fetch_calls = std::cell::Cell::new(0usize);
+    let data = super::cached_releases_with_fetch(&non_singleton, mock_url, |client, url| {
+        fetch_calls.set(fetch_calls.get() + 1);
+        assert!(
+            std::ptr::eq(client, &non_singleton),
+            "bypass must forward the caller's exact client"
+        );
+        assert_eq!(url, mock_url, "bypass must forward the exact URL");
+        super::parse_releases_body(mock_body)
+    })
+    .expect("injected bypass fetch succeeds");
+    assert_eq!(
+        fetch_calls.get(),
+        1,
+        "non-singleton bypass must invoke the fetch operation exactly once"
+    );
 
-    // Mock-payload reference for the Ok-arm assertion. Bypass
-    // routing is proven by `data == mock_payload` (positive
-    // confirmation: the mock URL was actually reached) AND
+    // Bypass routing is proven by `data == fetched_payload` (positive
+    // confirmation: the fetch operation was actually reached) AND
     // `data != synthetic` (the cache was skipped). Both
     // checks together pin BOTH directions of the bypass-vs-
     // cache routing decision.
-    let mock_payload = vec![
+    let fetched_payload = vec![
         Release {
             moniker: "stable".to_string(),
             version: "9.99.99".to_string(),
@@ -1243,55 +1236,22 @@ fn cached_releases_with_non_singleton_bypasses_cache() {
             version: "9.98.50".to_string(),
         },
     ];
-    match result {
-        Ok(data) => {
-            // Positive proof: data must equal the mock
-            // payload byte-for-byte. The cache-hit path
-            // returns the 3-entry synthetic; the bypass
-            // branch reaches the mock and returns the
-            // 2-entry mock payload. Equality against
-            // mock_payload directly tests both the routing
-            // (cache vs bypass) AND the mock-server
-            // exchange (URL injection actually delivered).
-            assert_releases_eq(
-                &data,
-                &mock_payload,
-                "bypass branch must return the mock-served payload",
-            );
-            // Negative proof: data must NOT match the
-            // synthetic cache contents. Redundant with the
-            // positive check above (mock_payload and
-            // synthetic differ on length and values), but
-            // surfaces a clearer assertion message if a
-            // future regression somehow returned a third
-            // shape that happens to equal the synthetic.
-            let same_as_cache = data.len() == synthetic.len()
-                && data
-                    .iter()
-                    .zip(synthetic.iter())
-                    .all(|(got, want)| got.moniker == want.moniker && got.version == want.version);
-            assert!(
-                !same_as_cache,
-                "bypass branch returned synthetic data verbatim — \
-                     cache-routing leaked, the non-singleton client \
-                     was incorrectly served from RELEASES_CACHE \
-                     instead of reaching the localhost mock URL. \
-                     Synthetic was {synthetic:?}; got identical {data:?}",
-            );
-        }
-        Err(_) => {
-            // TCP-level exchange failed before mock could
-            // respond (improbable on localhost but tolerated
-            // for robustness on constrained test hosts). The
-            // mere fact that an Err surfaces — rather than
-            // Ok(synthetic) — proves the bypass branch was
-            // taken: the cache-hit path returns Ok
-            // unconditionally because RELEASES_CACHE is
-            // populated with a Vec, not a Result. Bypass is
-            // confirmed; mock-payload positive check is
-            // skipped under this branch.
-        }
-    }
+    assert_releases_eq(
+        &data,
+        &fetched_payload,
+        "bypass branch must return the injected fetched payload",
+    );
+    let same_as_cache = data.len() == synthetic.len()
+        && data
+            .iter()
+            .zip(synthetic.iter())
+            .all(|(got, want)| got.moniker == want.moniker && got.version == want.version);
+    assert!(
+        !same_as_cache,
+        "bypass branch returned synthetic data verbatim — cache routing \
+         leaked and the non-singleton client was incorrectly served from \
+         RELEASES_CACHE. Synthetic was {synthetic:?}; got identical {data:?}",
+    );
 
     // Cache-unchanged invariant: the bypass branch must NOT
     // populate RELEASES_CACHE. After the bypass call returns,
@@ -1301,7 +1261,7 @@ fn cached_releases_with_non_singleton_bypasses_cache() {
     // RELEASES_CACHE (for instance, if a future refactor
     // moved the `RELEASES_CACHE.set` call before the
     // singleton check) would surface here as a cache that
-    // contains the mock payload (or a network-fetched
+    // contains the injected payload
     // shape) instead of the synthetic.
     let post = super::RELEASES_CACHE.get().expect(
         "RELEASES_CACHE must remain populated after the bypass call — \
@@ -1315,39 +1275,21 @@ fn cached_releases_with_non_singleton_bypasses_cache() {
     );
 }
 
-/// Create a mockito server with a canned /releases.json
-/// response. Returns (server, url, mock). The server owns the
-/// port — no port collisions under parallel nextest.
-fn mock_releases(status: usize, body: &str) -> (mockito::ServerGuard, String, mockito::Mock) {
-    let mut server = mockito::Server::new();
-    let mock = server
-        .mock("GET", "/releases.json")
-        .with_status(status)
-        .with_body(body)
-        .create();
-    let url = format!("{}/releases.json", server.url());
-    (server, url, mock)
-}
-
-/// [`parse_releases_body`] parses a canned `releases.json`
-/// string into a structured `Vec<Release>`. Drives the parse
-/// path directly on a literal body — no network, no
-/// [`fetch_releases`] invocation, exit shape pinned to "Ok
-/// with synthetic data".
+/// [`parse_releases_body`] parses a canned `releases.json` string into a
+/// structured `Vec<Release>`. Drives the parse path directly on a literal
+/// body — no network and no [`fetch_releases`] invocation.
 ///
 /// Covers the parse half of [`fetch_releases`]'s GET-and-parse
 /// path — the same [`parse_releases_body`] call that
 /// [`fetch_releases`] runs on the response body. The GET half,
-/// and the bypass-branch routing decision (non-singleton
-/// reaches `fetch_releases` with the supplied URL, NOT
-/// [`RELEASES_CACHE`]), are verified separately by
+/// and the bypass-branch routing decision (non-singleton invokes the supplied
+/// fetch operation, not [`RELEASES_CACHE`]), are verified separately by
 /// [`is_shared_client_rejects_test_constructed_clients`]
 /// (predicate-level) and by
 /// [`cached_releases_with_non_singleton_bypasses_cache`]
-/// (end-to-end through the cache helper, driven against a
-/// localhost mock URL via [`cached_releases_with_url`]).
+/// (end-to-end through the cache-routing core).
 #[test]
-fn fetch_releases_against_localhost_mock_returns_parsed() {
+fn parse_releases_body_returns_structured_releases() {
     let mock_body = r#"{
             "releases": [
                 { "moniker": "stable",   "version": "9.99.99" },
@@ -1715,9 +1657,20 @@ fn get_with_transient_retry_connection_refused_surfaces_url_context() {
     let addr = listener.local_addr().expect("read addr");
     drop(listener);
     let url = format!("http://{addr}/releases.json");
-    let client = test_client();
-    let err = super::get_with_transient_retry(&client, &url, None, "fetch", &NO_BACKOFF_RETRY)
-        .expect_err("connection refused must surface as Err");
+    // A different saturated process can reuse the just-released ephemeral
+    // port before this request runs. Bound each attempt tightly so rare port
+    // reuse becomes a prompt timeout rather than four 30-second waits. The
+    // production retry count and final error-context path are still exercised.
+    let timeout = std::time::Duration::from_millis(250);
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(timeout)
+        .timeout(timeout)
+        .no_proxy()
+        .build()
+        .expect("build bounded localhost client");
+    let err =
+        super::get_with_transient_retry(&client, &url, Some(timeout), "fetch", &NO_BACKOFF_RETRY)
+            .expect_err("connection refused must surface as Err");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("fetch "),
@@ -2393,8 +2346,7 @@ fn resolve_expected_sha256_skip_returns_none_without_network() {
 
 /// Create a mockito server with a canned `sha256sums.asc`
 /// response. Returns (server, url, mock). The server owns the
-/// port — no port collisions under parallel nextest. Mirrors
-/// [`mock_releases`] for the checksum-manifest endpoint.
+/// port — no port collisions under parallel nextest.
 fn mock_sha256sums(status: usize, body: &str) -> (mockito::ServerGuard, String, mockito::Mock) {
     let mut server = mockito::Server::new();
     let mock = server
@@ -2441,20 +2393,24 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  linux-6.14.2.t
 }
 
 /// `resolve_expected_sha256` (no-skip) downgrades to `None` when
-/// the manifest is fetched but carries no entry for the requested
-/// tarball — the warn-and-continue fallback that keeps a build
-/// progressing through schema drift / a rotated entry. Drives the
-/// real fetch-then-parse path against a localhost mock so the
-/// `Ok(manifest) => None` arm of the production match is exercised
-/// (not just `parse_sha256_for_file` in isolation).
+/// the fetched manifest carries no entry for the requested tarball.
+/// An injected manifest fetch exercises the production
+/// `Ok(manifest) => None` routing without a schedulable localhost server.
 #[test]
 fn resolve_expected_sha256_no_skip_returns_none_when_entry_absent() {
     let manifest = "\
 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  linux-6.14.1.tar.xz
 ";
-    let (_server, url, _mock) = mock_sha256sums(200, manifest);
-    let client = test_client();
-    let got = super::resolve_expected_sha256_from_url(&client, &url, "linux-9.99.99.tar.xz", false);
+    let fetch_calls = std::cell::Cell::new(0usize);
+    let got = super::resolve_expected_sha256_with("linux-9.99.99.tar.xz", false, || {
+        fetch_calls.set(fetch_calls.get() + 1);
+        Ok(manifest.to_string())
+    });
+    assert_eq!(
+        fetch_calls.get(),
+        1,
+        "no-skip path must fetch the manifest exactly once"
+    );
     assert!(
         got.is_none(),
         "no-skip path must return None when the fetched manifest \
@@ -2463,16 +2419,21 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  linux-6.14.1.t
 }
 
 /// `resolve_expected_sha256` (no-skip) downgrades to `None` when
-/// the manifest fetch itself fails (HTTP 404). Drives the
-/// `Err(err) => None` arm of the production match through the
-/// URL-injection seam against a localhost mock returning 404 —
-/// the fetch-failure fallback that lets a transient CDN outage
-/// proceed without verification rather than wedging the build.
+/// the manifest fetch itself fails (HTTP 404). An injected error drives the
+/// production `Err(err) => None` arm; retry transport behavior is covered by
+/// the dedicated retry tests.
 #[test]
 fn resolve_expected_sha256_no_skip_returns_none_on_fetch_error() {
-    let (_server, url, _mock) = mock_sha256sums(404, "Not Found");
-    let client = test_client();
-    let got = super::resolve_expected_sha256_from_url(&client, &url, "linux-999.0.0.tar.xz", false);
+    let fetch_calls = std::cell::Cell::new(0usize);
+    let got = super::resolve_expected_sha256_with("linux-999.0.0.tar.xz", false, || {
+        fetch_calls.set(fetch_calls.get() + 1);
+        anyhow::bail!("fetch fixture: HTTP 404 Not Found")
+    });
+    assert_eq!(
+        fetch_calls.get(),
+        1,
+        "no-skip path must attempt the manifest fetch exactly once"
+    );
     assert!(
         got.is_none(),
         "no-skip path must return None when the manifest fetch \
