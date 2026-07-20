@@ -92,7 +92,7 @@ test(/^ktstr\//)
 | (
   binary(=ktstr)
   & (
-    test(/^vmm::tests::(boot_kernel_.*|bench_boot_time.*|monitor_data_valid_latch_records_live_page_offset|sys_rdy_releases_monitor_before_5s_timeout|monitor_exits_cleanly_when_guest_panics_before_sys_rdy|first_sample_has_valid_rq_clock_thanks_to_sys_rdy|watchdog_timeout_override_lands_in_guest_memory|watchdog_override_prevents_stall_exit|sched_domain_data_populated|builder_performance_mode_valid_succeeds|builder_performance_mode_preserves_in_vm|builder_performance_mode_mbind_nodes_populated)$/)
+    test(/^vmm::tests::(boot_kernel_.*|bench_boot_time.*|monitor_data_valid_latch_records_live_page_offset|sys_rdy_releases_monitor_before_5s_timeout|monitor_exits_cleanly_when_guest_panics_before_sys_rdy|first_sample_has_valid_rq_clock_thanks_to_sys_rdy|watchdog_timeout_override_lands_in_guest_memory|watchdog_override_prevents_stall_exit|sched_domain_data_populated)$/)
     | test(/^cli::kernel_build::build::tests::acquire_build_reservation_(bypass_empty_string_rejected|plan_and_make_jobs_consistent)$/)
   )
 )
@@ -112,7 +112,7 @@ test(/^ktstr\//)
 )
 | (
   binary(=cargo_ktstr_verifier_discovery)
-  & test(=bare_verifier_runs_recursively_discovered_scheduler_cell_end_to_end)
+  & test(/^bare_verifier_(recursively_discovers_feature_gated_workspace_test_binaries|runs_recursively_discovered_scheduler_cell_end_to_end)$/)
 )
 '''
 slow-timeout = { period = "180s", terminate-after = 7 }
@@ -269,7 +269,7 @@ not(
   | (
     binary(=ktstr)
     & (
-      test(/^vmm::tests::(boot_kernel_.*|bench_boot_time.*|monitor_data_valid_latch_records_live_page_offset|sys_rdy_releases_monitor_before_5s_timeout|monitor_exits_cleanly_when_guest_panics_before_sys_rdy|first_sample_has_valid_rq_clock_thanks_to_sys_rdy|watchdog_timeout_override_lands_in_guest_memory|watchdog_override_prevents_stall_exit|sched_domain_data_populated|builder_performance_mode_valid_succeeds|builder_performance_mode_preserves_in_vm|builder_performance_mode_mbind_nodes_populated)$/)
+      test(/^vmm::tests::(boot_kernel_.*|bench_boot_time.*|monitor_data_valid_latch_records_live_page_offset|sys_rdy_releases_monitor_before_5s_timeout|monitor_exits_cleanly_when_guest_panics_before_sys_rdy|first_sample_has_valid_rq_clock_thanks_to_sys_rdy|watchdog_timeout_override_lands_in_guest_memory|watchdog_override_prevents_stall_exit|sched_domain_data_populated)$/)
       | test(/^cli::kernel_build::build::tests::acquire_build_reservation_(bypass_empty_string_rejected|plan_and_make_jobs_consistent)$/)
     )
   )
@@ -289,7 +289,7 @@ not(
   )
   | (
     binary(=cargo_ktstr_verifier_discovery)
-    & test(=bare_verifier_runs_recursively_discovered_scheduler_cell_end_to_end)
+    & test(/^bare_verifier_(recursively_discovers_feature_gated_workspace_test_binaries|runs_recursively_discovered_scheduler_cell_end_to_end)$/)
   )
 )
 '''
@@ -337,7 +337,7 @@ test(/^ktstr\//)
 | (
   binary(=ktstr)
   & (
-    test(/^vmm::tests::(boot_kernel_.*|bench_boot_time.*|monitor_data_valid_latch_records_live_page_offset|sys_rdy_releases_monitor_before_5s_timeout|monitor_exits_cleanly_when_guest_panics_before_sys_rdy|first_sample_has_valid_rq_clock_thanks_to_sys_rdy|watchdog_timeout_override_lands_in_guest_memory|watchdog_override_prevents_stall_exit|sched_domain_data_populated|builder_performance_mode_valid_succeeds|builder_performance_mode_preserves_in_vm|builder_performance_mode_mbind_nodes_populated)$/)
+    test(/^vmm::tests::(boot_kernel_.*|bench_boot_time.*|monitor_data_valid_latch_records_live_page_offset|sys_rdy_releases_monitor_before_5s_timeout|monitor_exits_cleanly_when_guest_panics_before_sys_rdy|first_sample_has_valid_rq_clock_thanks_to_sys_rdy|watchdog_timeout_override_lands_in_guest_memory|watchdog_override_prevents_stall_exit|sched_domain_data_populated)$/)
     | test(/^cli::kernel_build::build::tests::acquire_build_reservation_(bypass_empty_string_rejected|plan_and_make_jobs_consistent)$/)
   )
 )
@@ -357,7 +357,7 @@ test(/^ktstr\//)
 )
 | (
   binary(=cargo_ktstr_verifier_discovery)
-  & test(=bare_verifier_runs_recursively_discovered_scheduler_cell_end_to_end)
+  & test(/^bare_verifier_(recursively_discovers_feature_gated_workspace_test_binaries|runs_recursively_discovered_scheduler_cell_end_to_end)$/)
 )
 '''
 slow-timeout = { period = "180s", terminate-after = 7 }
@@ -548,7 +548,7 @@ test(/^ktstr\//)
 | (
   binary(=ktstr)
   & (
-    test(/^vmm::tests::(boot_kernel_.*|bench_boot_time.*|monitor_data_valid_latch_records_live_page_offset|sys_rdy_releases_monitor_before_5s_timeout|monitor_exits_cleanly_when_guest_panics_before_sys_rdy|first_sample_has_valid_rq_clock_thanks_to_sys_rdy|watchdog_timeout_override_lands_in_guest_memory|watchdog_override_prevents_stall_exit|sched_domain_data_populated|builder_performance_mode_valid_succeeds|builder_performance_mode_preserves_in_vm|builder_performance_mode_mbind_nodes_populated)$/)
+    test(/^vmm::tests::(boot_kernel_.*|bench_boot_time.*|monitor_data_valid_latch_records_live_page_offset|sys_rdy_releases_monitor_before_5s_timeout|monitor_exits_cleanly_when_guest_panics_before_sys_rdy|first_sample_has_valid_rq_clock_thanks_to_sys_rdy|watchdog_timeout_override_lands_in_guest_memory|watchdog_override_prevents_stall_exit|sched_domain_data_populated)$/)
     | test(/^cli::kernel_build::build::tests::acquire_build_reservation_(bypass_empty_string_rejected|plan_and_make_jobs_consistent)$/)
   )
 )
@@ -568,7 +568,7 @@ test(/^ktstr\//)
 )
 | (
   binary(=cargo_ktstr_verifier_discovery)
-  & test(=bare_verifier_runs_recursively_discovered_scheduler_cell_end_to_end)
+  & test(/^bare_verifier_(recursively_discovers_feature_gated_workspace_test_binaries|runs_recursively_discovered_scheduler_cell_end_to_end)$/)
 )
 '''
 test-group = "@global"
@@ -589,7 +589,7 @@ not(
   | (
     binary(=ktstr)
     & (
-      test(/^vmm::tests::(boot_kernel_.*|bench_boot_time.*|monitor_data_valid_latch_records_live_page_offset|sys_rdy_releases_monitor_before_5s_timeout|monitor_exits_cleanly_when_guest_panics_before_sys_rdy|first_sample_has_valid_rq_clock_thanks_to_sys_rdy|watchdog_timeout_override_lands_in_guest_memory|watchdog_override_prevents_stall_exit|sched_domain_data_populated|builder_performance_mode_valid_succeeds|builder_performance_mode_preserves_in_vm|builder_performance_mode_mbind_nodes_populated)$/)
+      test(/^vmm::tests::(boot_kernel_.*|bench_boot_time.*|monitor_data_valid_latch_records_live_page_offset|sys_rdy_releases_monitor_before_5s_timeout|monitor_exits_cleanly_when_guest_panics_before_sys_rdy|first_sample_has_valid_rq_clock_thanks_to_sys_rdy|watchdog_timeout_override_lands_in_guest_memory|watchdog_override_prevents_stall_exit|sched_domain_data_populated)$/)
       | test(/^cli::kernel_build::build::tests::acquire_build_reservation_(bypass_empty_string_rejected|plan_and_make_jobs_consistent)$/)
     )
   )
@@ -609,7 +609,7 @@ not(
   )
   | (
     binary(=cargo_ktstr_verifier_discovery)
-    & test(=bare_verifier_runs_recursively_discovered_scheduler_cell_end_to_end)
+    & test(/^bare_verifier_(recursively_discovers_feature_gated_workspace_test_binaries|runs_recursively_discovered_scheduler_cell_end_to_end)$/)
   )
 )
 '''

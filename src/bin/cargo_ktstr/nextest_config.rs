@@ -478,6 +478,24 @@ mod tests {
             "host/-named verifier API drivers boot KtstrVm internally and must \
              remain in the resource-admission pool",
         );
+        assert!(
+            resource.contains(
+                "test(/^bare_verifier_(recursively_discovers_feature_gated_workspace_test_binaries|runs_recursively_discovered_scheduler_cell_end_to_end)$/)"
+            ),
+            "both bare-verifier integration paths recursively invoke cargo ktstr \
+             and must remain in the resource-admission pool",
+        );
+        for pure_builder_test in [
+            "builder_performance_mode_valid_succeeds",
+            "builder_performance_mode_preserves_in_vm",
+            "builder_performance_mode_mbind_nodes_populated",
+        ] {
+            assert!(
+                !resource.contains(pure_builder_test),
+                "{pure_builder_test} only plans immutable VM state and must remain \
+                 ordinary host work",
+            );
+        }
 
         for profile in ["ci", "default"] {
             let blocks = profile_override_blocks(CONFIG, profile);
