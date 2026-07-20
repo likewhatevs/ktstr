@@ -6,13 +6,14 @@
 //! every supported initrd format and published as immutable regular files.
 //! Only the small control tail varies per test cell.
 //!
-//! A 2 MiB planner maps pages owned by one part directly and materializes
-//! content-addressed stitch pages only at part boundaries. The VMM installs
-//! those files over anonymous guest RAM with `MAP_PRIVATE | MAP_FIXED`, so
-//! parallel VMs share clean page-cache pages and pay for private memory only
-//! when the guest writes. Per-key `flock` election ensures one transform per
-//! recipe across nextest workers; a versioned namespace gate makes lock-file
-//! GC race-safe.
+//! A 2 MiB planner maps pages owned by one part directly. Ordinary mixed-part
+//! pages use content-addressed stitches; the final per-cell tail instead
+//! composes one reusable full-page underlay with the smallest host-page-aligned
+//! tail overlay. The VMM installs every layer over anonymous guest RAM with
+//! `MAP_PRIVATE | MAP_FIXED`, so parallel VMs share clean page-cache pages and
+//! pay for private memory only when the guest writes. Per-key `flock` election
+//! ensures one transform per recipe across nextest workers; a versioned
+//! namespace gate makes lock-file GC race-safe.
 //!
 //! The older process-local/POSIX-SHM base cache below is retained only for
 //! compatibility unit tests. Production verifier and ordinary VM paths use
@@ -27,7 +28,7 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Arc;
@@ -376,7 +377,7 @@ impl AsRef<[u8]> for BaseRef {
 // The production prepared-initrd CAS lives alongside a cfg(test)-only
 // compatibility cache for older base/suffix fixtures.
 
-const PREPARED_CAS_SCHEMA: u32 = 6;
+const PREPARED_CAS_SCHEMA: u32 = 7;
 const PREPARED_CAS_MAGIC: &[u8; 8] = b"KTSTRIR\0";
 const PREPARED_CAS_HEADER_LEN: usize = 128;
 const PREPARED_CAS_MAX_BYTES: u64 = 8 << 30;
@@ -399,12 +400,12 @@ const CLOSURE_RECORD_MAX_INITIAL_SEQUENCE_ALLOCATION: usize = 1 << 20;
 // binaries do not participate in the namespace-gate protocol below; keeping
 // their objects, memos, and locks in separate directories prevents an old GC
 // from unlinking a live object coordinated by this version's lock inode.
-const PREPARED_OBJECTS_DIR: &str = "prepared-initrd-v6-objects";
-const PREPARED_LOCKS_DIR: &str = ".prepared-initrd-v6-locks";
-const PREPARED_DIGESTS_DIR: &str = "prepared-initrd-v6-digests";
-const PREPARED_PROBES_DIR: &str = "prepared-initrd-v6-probes";
-const PREPARED_CLOSURES_DIR: &str = "prepared-initrd-v6-closures";
-const PREPARED_GC_STAMP: &str = ".prepared-initrd-v6-gc-stamp";
+const PREPARED_OBJECTS_DIR: &str = "prepared-initrd-v7-objects";
+const PREPARED_LOCKS_DIR: &str = ".prepared-initrd-v7-locks";
+const PREPARED_DIGESTS_DIR: &str = "prepared-initrd-v7-digests";
+const PREPARED_PROBES_DIR: &str = "prepared-initrd-v7-probes";
+const PREPARED_CLOSURES_DIR: &str = "prepared-initrd-v7-closures";
+const PREPARED_GC_STAMP: &str = ".prepared-initrd-v7-gc-stamp";
 const CONTENT_HASH_CHUNK_LEN: usize = 1 << 20;
 const PREPARED_NAMESPACE_GATE: &str = "namespace-v1.lock";
 const PREPARED_GC_LOCK: &str = "gc.lock";
@@ -441,6 +442,7 @@ enum PreparedObjectKind {
     PayloadView = 5,
     ModulesView = 6,
     Stitch = 7,
+    Boundary = 8,
 }
 
 impl PreparedObjectKind {
@@ -453,6 +455,7 @@ impl PreparedObjectKind {
             5 => Ok(Self::PayloadView),
             6 => Ok(Self::ModulesView),
             7 => Ok(Self::Stitch),
+            8 => Ok(Self::Boundary),
             _ => anyhow::bail!("unknown prepared initrd object kind {tag}"),
         }
     }
@@ -466,6 +469,7 @@ impl PreparedObjectKind {
             Self::PayloadView => "payload-view",
             Self::ModulesView => "modules-view",
             Self::Stitch => "stitch",
+            Self::Boundary => "boundary",
         }
     }
 }
@@ -1778,6 +1782,17 @@ impl PreparedObjectHeader {
                     "stitch object must contain exactly one page"
                 );
             }
+            PreparedObjectKind::Boundary => {
+                anyhow::ensure!(
+                    leading == 0
+                        && self.payload_len > 0
+                        && self.payload_len <= self.mapping_granule
+                        && self.payload_len.is_multiple_of(self.file_alignment)
+                        && self.part_compressed_len == self.payload_len
+                        && self.part_uncompressed_len == 0,
+                    "boundary object must contain a non-empty host-page-aligned overlay"
+                );
+            }
         }
         Ok(())
     }
@@ -2696,6 +2711,7 @@ fn parse_object_filename(name: &str) -> Option<(PreparedObjectKind, u64)> {
         PreparedObjectKind::PayloadView,
         PreparedObjectKind::ModulesView,
         PreparedObjectKind::Stitch,
+        PreparedObjectKind::Boundary,
     ] {
         if let Some(key) = stem.strip_prefix(&format!("{}-", kind.stem()))
             && key.len() == 16
@@ -2716,6 +2732,7 @@ fn parse_temp_object_filename(name: &str) -> Option<(PreparedObjectKind, u64)> {
         PreparedObjectKind::PayloadView,
         PreparedObjectKind::ModulesView,
         PreparedObjectKind::Stitch,
+        PreparedObjectKind::Boundary,
     ] {
         let Some(key_and_random) = stem.strip_prefix(&format!("{}-", kind.stem())) else {
             continue;
@@ -2817,6 +2834,10 @@ fn metadata_modified_secs(metadata: &std::fs::Metadata) -> u64 {
         .unwrap_or(0)
 }
 
+fn metadata_allocated_bytes(metadata: &std::fs::Metadata) -> u64 {
+    metadata.blocks().saturating_mul(512)
+}
+
 fn collect_memo_gc_candidates(
     root: &Path,
     kind: GcMemoKind,
@@ -2835,20 +2856,21 @@ fn collect_memo_gc_candidates(
             continue;
         }
         let modified_secs = metadata_modified_secs(&metadata);
+        let allocated_bytes = metadata_allocated_bytes(&metadata);
         if let Some(key) = parse_keyed_temp_filename(&name, kind.temp_prefix()) {
             let candidate = GcMemoCandidate {
                 path: entry.path(),
                 kind,
                 key,
                 modified_secs,
-                len: metadata.len(),
+                len: allocated_bytes,
             };
             if now.saturating_sub(modified_secs) > PREPARED_CAS_GC_INTERVAL_SECS
                 && try_collect_memo(root, &candidate, namespace)?
             {
                 continue;
             }
-            *total = total.saturating_add(metadata.len());
+            *total = total.saturating_add(allocated_bytes);
             continue;
         }
         let Some(key) = name
@@ -2858,13 +2880,13 @@ fn collect_memo_gc_candidates(
         else {
             continue;
         };
-        *total = total.saturating_add(metadata.len());
+        *total = total.saturating_add(allocated_bytes);
         candidates.push(GcMemoCandidate {
             path: entry.path(),
             kind,
             key,
             modified_secs,
-            len: metadata.len(),
+            len: allocated_bytes,
         });
     }
     Ok(())
@@ -2915,7 +2937,12 @@ fn sweep_idle_coordination_locks(root: &Path, _namespace: &GcNamespaceGuard) -> 
     Ok(removed)
 }
 
-fn run_prepared_cache_gc(root: &Path, now: u64, namespace: &GcNamespaceGuard) -> Result<()> {
+fn run_prepared_cache_gc_with_limit(
+    root: &Path,
+    now: u64,
+    namespace: &GcNamespaceGuard,
+    max_bytes: u64,
+) -> Result<()> {
     let mut candidates = Vec::new();
     let mut total = 0u64;
     for entry in std::fs::read_dir(root.join(PREPARED_OBJECTS_DIR))? {
@@ -2924,6 +2951,7 @@ fn run_prepared_cache_gc(root: &Path, now: u64, namespace: &GcNamespaceGuard) ->
             continue;
         };
         let metadata = entry.metadata()?;
+        let allocated_bytes = metadata_allocated_bytes(&metadata);
         if let Some((kind, key)) = parse_temp_object_filename(&name) {
             let modified_secs = metadata_modified_secs(&metadata);
             if now.saturating_sub(modified_secs) > PREPARED_CAS_GC_INTERVAL_SECS {
@@ -2932,7 +2960,7 @@ fn run_prepared_cache_gc(root: &Path, now: u64, namespace: &GcNamespaceGuard) ->
                     continue;
                 }
             }
-            total = total.saturating_add(metadata.len());
+            total = total.saturating_add(allocated_bytes);
             continue;
         }
         let Some((kind, key)) = parse_object_filename(&name) else {
@@ -2942,13 +2970,13 @@ fn run_prepared_cache_gc(root: &Path, now: u64, namespace: &GcNamespaceGuard) ->
             continue;
         }
         let modified_secs = metadata_modified_secs(&metadata);
-        total = total.saturating_add(metadata.len());
+        total = total.saturating_add(allocated_bytes);
         candidates.push(GcCandidate {
             path: entry.path(),
             kind,
             key,
             modified_secs,
-            len: metadata.len(),
+            len: allocated_bytes,
         });
     }
     let mut memo_candidates = Vec::new();
@@ -2984,8 +3012,8 @@ fn run_prepared_cache_gc(root: &Path, now: u64, namespace: &GcNamespaceGuard) ->
             ),
         };
         let too_old = now.saturating_sub(modified_secs) > PREPARED_CAS_MAX_AGE_SECS;
-        let over_size = total > PREPARED_CAS_MAX_BYTES;
-        if !too_old && !over_size {
+        let over_size = total > max_bytes;
+        if !too_old && (!over_size || len == 0) {
             continue;
         }
         let removed = match candidate {
@@ -3002,6 +3030,10 @@ fn run_prepared_cache_gc(root: &Path, now: u64, namespace: &GcNamespaceGuard) ->
     }
     sweep_idle_coordination_locks(root, namespace)?;
     Ok(())
+}
+
+fn run_prepared_cache_gc(root: &Path, now: u64, namespace: &GcNamespaceGuard) -> Result<()> {
+    run_prepared_cache_gc_with_limit(root, now, namespace, PREPARED_CAS_MAX_BYTES)
 }
 
 fn maybe_gc_prepared_cache(root: &Path) {
@@ -3260,6 +3292,93 @@ fn stitch_recipe_key(
     hasher.finish()
 }
 
+fn boundary_underlay_recipe_key(
+    stable_segments: &[PageSegment],
+    parts: &[PreparedPart],
+    mapping_granule: usize,
+    file_alignment: usize,
+    compression: initramfs::InitrdCompression,
+) -> u64 {
+    let mut hasher = recipe_prefix(
+        b"ktstr-prepared-initrd-boundary-underlay",
+        mapping_granule,
+        file_alignment,
+        compression,
+    );
+    hash_u64(&mut hasher, stable_segments.len() as u64);
+    for segment in stable_segments {
+        hash_u64(&mut hasher, parts[segment.part_index].object.header.key);
+        hash_u64(&mut hasher, segment.part_offset as u64);
+        hash_u64(&mut hasher, segment.page_offset as u64);
+        hash_u64(&mut hasher, segment.len as u64);
+    }
+    hasher.finish()
+}
+
+fn boundary_overlay_recipe_key(
+    segments: &[PageSegment],
+    parts: &[PreparedPart],
+    overlay_start: usize,
+    overlay_len: usize,
+    mapping_granule: usize,
+    file_alignment: usize,
+    compression: initramfs::InitrdCompression,
+) -> u64 {
+    let mut hasher = recipe_prefix(
+        b"ktstr-prepared-initrd-boundary-overlay",
+        mapping_granule,
+        file_alignment,
+        compression,
+    );
+    hash_u64(&mut hasher, overlay_start as u64);
+    hash_u64(&mut hasher, overlay_len as u64);
+    hash_u64(&mut hasher, segments.len() as u64);
+    for segment in segments {
+        hash_u64(&mut hasher, parts[segment.part_index].object.header.key);
+        hash_u64(&mut hasher, segment.part_offset as u64);
+        hash_u64(&mut hasher, segment.page_offset as u64);
+        hash_u64(&mut hasher, segment.len as u64);
+    }
+    hasher.finish()
+}
+
+fn materialize_page_slice(
+    parts: &[PreparedPart],
+    segments: &[PageSegment],
+    slice_start: usize,
+    slice_len: usize,
+) -> Result<Vec<u8>> {
+    let slice_end = slice_start
+        .checked_add(slice_len)
+        .context("prepared page slice end overflow")?;
+    let mut bytes = vec![0u8; slice_len];
+    for segment in segments {
+        let segment_end = segment
+            .page_offset
+            .checked_add(segment.len)
+            .context("prepared page segment end overflow")?;
+        let copy_start = slice_start.max(segment.page_offset);
+        let copy_end = slice_end.min(segment_end);
+        if copy_start >= copy_end {
+            continue;
+        }
+        let source_part_offset = segment
+            .part_offset
+            .checked_add(copy_start - segment.page_offset)
+            .context("prepared page-slice source offset overflow")?;
+        let layout_offset = usize::try_from(parts[segment.part_index].object.header.leading_pad)?
+            .checked_add(source_part_offset)
+            .context("prepared page-slice layout offset overflow")?;
+        let len = copy_end - copy_start;
+        let source = parts[segment.part_index]
+            .object
+            .read_exact_at(layout_offset, len)?;
+        let destination_start = copy_start - slice_start;
+        bytes[destination_start..destination_start + len].copy_from_slice(&source);
+    }
+    Ok(bytes)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedRangePlan {
     pub(crate) part_count: usize,
@@ -3269,11 +3388,27 @@ pub(crate) struct PreparedRangePlan {
 }
 
 #[derive(Debug)]
+pub(crate) struct PreparedOverlay {
+    pub(crate) fd: OwnedFd,
+    pub(crate) file_offset: u64,
+    pub(crate) guest_offset: u64,
+    pub(crate) map_len: usize,
+}
+
+#[derive(Debug)]
 pub(crate) struct PreparedMapping {
     pub(crate) fd: OwnedFd,
     pub(crate) file_offset: u64,
     pub(crate) guest_offset: u64,
     pub(crate) map_len: usize,
+    /// Host-page overlays installed after this mapping.
+    ///
+    /// A hugetlb-backed guest first needs one complete 2 MiB replacement to
+    /// dissolve the original hugetlb VMA. A small boundary object can then
+    /// replace only the host pages which contain the per-cell tail. Nesting
+    /// those overlays under their complete primary range keeps the logical
+    /// stream non-overlapping while preserving the exact mmap order.
+    pub(crate) overlays: Vec<PreparedOverlay>,
 }
 
 #[derive(Debug)]
@@ -3671,7 +3806,9 @@ where
         compression,
     } = geometry;
     anyhow::ensure!(
-        kind != PreparedObjectKind::Base && kind != PreparedObjectKind::Stitch,
+        kind != PreparedObjectKind::Base
+            && kind != PreparedObjectKind::Stitch
+            && kind != PreparedObjectKind::Boundary,
         "generic archive part has an invalid kind"
     );
     let expectation = PreparedObjectExpectation {
@@ -3841,6 +3978,11 @@ pub(crate) fn get_or_prepare_base(
 enum PlannedSource {
     Part(usize),
     Stitch(PreparedObject),
+    Boundary {
+        underlay: PreparedObject,
+        overlay: PreparedObject,
+        overlay_guest_offset: usize,
+    },
 }
 
 struct PlannedMapping {
@@ -3959,6 +4101,128 @@ fn plan_prepared_mappings(
             continue;
         }
 
+        // The final page normally combines a large immutable part with the
+        // tiny per-cell tail. Materializing that whole 2 MiB page under the
+        // tail-derived key made every cell copy and publish the same large
+        // prefix again. Keep the hugetlb-safe complete replacement, but key
+        // it only from the stable prefix. After that primary mmap dissolves
+        // any hugetlb VMA, install the smallest host-page-aligned boundary
+        // object over the bytes which can actually differ.
+        let page_content_len = total_compressed_len
+            .saturating_sub(page_start)
+            .min(page_size);
+        let tail_position = segments.iter().position(|segment| {
+            parts[segment.part_index].object.header.kind == PreparedObjectKind::Tail
+        });
+        if page_start
+            .checked_add(page_size)
+            .is_some_and(|page_end| page_end >= total_compressed_len)
+            && let Some(tail_position) = tail_position
+            && tail_position + 1 == segments.len()
+        {
+            let tail_segment = segments[tail_position];
+            let overlay_start = tail_segment.page_offset / file_alignment * file_alignment;
+            let overlay_end = round_up(page_content_len, file_alignment)?;
+            let overlay_len = overlay_end
+                .checked_sub(overlay_start)
+                .context("prepared boundary overlay underflow")?;
+            if overlay_len > 0 && overlay_len < page_size {
+                let stable_segments = &segments[..tail_position];
+                let underlay_key = boundary_underlay_recipe_key(
+                    stable_segments,
+                    parts,
+                    page_size,
+                    file_alignment,
+                    compression,
+                );
+                let underlay_expectation = PreparedObjectExpectation {
+                    kind: PreparedObjectKind::Stitch,
+                    compression,
+                    key: underlay_key,
+                    mapping_granule: page_size as u64,
+                    file_alignment: file_alignment as u64,
+                    leading_pad: Some(0),
+                    parent_key: Some(underlay_key),
+                };
+                let underlay = get_or_build_prepared_object(root, underlay_expectation, || {
+                    let payload = materialize_page_slice(parts, stable_segments, 0, page_size)?;
+                    Ok(BuiltPreparedObject {
+                        header: PreparedObjectHeader {
+                            kind: PreparedObjectKind::Stitch,
+                            compression,
+                            key: underlay_key,
+                            mapping_granule: page_size as u64,
+                            payload_len: page_size as u64,
+                            payload_hash: content_hash_bytes(&payload),
+                            part_uncompressed_len: 0,
+                            part_compressed_len: page_size as u64,
+                            leading_pad: 0,
+                            stream_offset_mod: 0,
+                            file_alignment: file_alignment as u64,
+                            parent_key: underlay_key,
+                            reserved_len: 0,
+                        },
+                        payload,
+                    })
+                })?;
+
+                let overlay_key = boundary_overlay_recipe_key(
+                    &segments,
+                    parts,
+                    overlay_start,
+                    overlay_len,
+                    page_size,
+                    file_alignment,
+                    compression,
+                );
+                let overlay_expectation = PreparedObjectExpectation {
+                    kind: PreparedObjectKind::Boundary,
+                    compression,
+                    key: overlay_key,
+                    mapping_granule: page_size as u64,
+                    file_alignment: file_alignment as u64,
+                    leading_pad: Some(0),
+                    parent_key: Some(overlay_key),
+                };
+                let overlay = get_or_build_prepared_object(root, overlay_expectation, || {
+                    let payload =
+                        materialize_page_slice(parts, &segments, overlay_start, overlay_len)?;
+                    Ok(BuiltPreparedObject {
+                        header: PreparedObjectHeader {
+                            kind: PreparedObjectKind::Boundary,
+                            compression,
+                            key: overlay_key,
+                            mapping_granule: page_size as u64,
+                            payload_len: overlay_len as u64,
+                            payload_hash: content_hash_bytes(&payload),
+                            part_uncompressed_len: 0,
+                            part_compressed_len: overlay_len as u64,
+                            leading_pad: 0,
+                            stream_offset_mod: 0,
+                            file_alignment: file_alignment as u64,
+                            parent_key: overlay_key,
+                            reserved_len: 0,
+                        },
+                        payload,
+                    })
+                })?;
+                stitch_cache_hits += usize::from(underlay.cache_hit);
+                stitch_cache_hits += usize::from(overlay.cache_hit);
+                stitch_pages += 1;
+                planned.push(PlannedMapping {
+                    source: PlannedSource::Boundary {
+                        underlay,
+                        overlay,
+                        overlay_guest_offset: page_start + overlay_start,
+                    },
+                    file_offset: 0,
+                    guest_offset: page_start,
+                    map_len: page_size,
+                });
+                continue;
+            }
+        }
+
         let stitch_key =
             stitch_recipe_key(&segments, parts, page_size, file_alignment, compression);
         let expectation = PreparedObjectExpectation {
@@ -4017,22 +4281,55 @@ fn plan_prepared_mappings(
         .count();
     let mut mappings = Vec::with_capacity(planned.len());
     for planned in planned {
-        let fd = match planned.source {
-            PlannedSource::Part(index) => parts[index]
-                .object
-                .fd
-                .take()
-                .context("prepared part fd was needed by multiple disjoint ranges")?,
-            PlannedSource::Stitch(mut stitch) => stitch
-                .fd
-                .take()
-                .context("prepared stitch fd already consumed")?,
+        let (fd, file_offset, overlays) = match planned.source {
+            PlannedSource::Part(index) => (
+                parts[index]
+                    .object
+                    .fd
+                    .take()
+                    .context("prepared part fd was needed by multiple disjoint ranges")?,
+                planned.file_offset,
+                Vec::new(),
+            ),
+            PlannedSource::Stitch(mut stitch) => (
+                stitch
+                    .fd
+                    .take()
+                    .context("prepared stitch fd already consumed")?,
+                planned.file_offset,
+                Vec::new(),
+            ),
+            PlannedSource::Boundary {
+                mut underlay,
+                mut overlay,
+                overlay_guest_offset,
+            } => {
+                let overlay_fd = overlay
+                    .fd
+                    .take()
+                    .context("prepared boundary overlay fd already consumed")?;
+                let overlay_len = usize::try_from(overlay.header.payload_len)?;
+                (
+                    underlay
+                        .fd
+                        .take()
+                        .context("prepared boundary underlay fd already consumed")?,
+                    underlay.data_offset,
+                    vec![PreparedOverlay {
+                        fd: overlay_fd,
+                        file_offset: overlay.data_offset as u64,
+                        guest_offset: overlay_guest_offset as u64,
+                        map_len: overlay_len,
+                    }],
+                )
+            }
         };
         mappings.push(PreparedMapping {
             fd,
-            file_offset: planned.file_offset as u64,
+            file_offset: file_offset as u64,
             guest_offset: planned.guest_offset as u64,
             map_len: planned.map_len,
+            overlays,
         });
     }
     Ok((mappings, direct_ranges, stitch_pages, stitch_cache_hits))
@@ -4044,8 +4341,9 @@ fn plan_prepared_mappings(
 /// format, and both supported architectures. `/init` stripping/compression is
 /// keyed only by the pinned payload recipe, modules form another stable part,
 /// and only the tiny control tail varies per cell. Logical pages wholly owned
-/// by one part map its inode directly; pages spanning any number of adjacent
-/// parts use a single immutable content-addressed stitch.
+/// by one part map its inode directly. Ordinary mixed-part pages use a single
+/// immutable stitch; a final page containing the tail uses a shared stable
+/// underlay plus a minimal tail-sensitive overlay.
 pub(crate) fn complete_prepared_initrd(
     prepared_base: PreparedBase,
     params: &initramfs::SuffixParams<'_>,
@@ -4632,7 +4930,6 @@ pub(crate) fn shm_write_and_release(fd: std::os::fd::OwnedFd, data: &[u8], seg_n
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::MetadataExt as _;
 
     /// `shm_try_create_excl` winner gets a locked fd; a second call
     /// with the same name returns `Exists`. The winner's
@@ -5201,19 +5498,130 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct TestBoundaryIdentity {
+        underlay_device: u64,
+        underlay_inode: u64,
+        underlay_key: u64,
+        boundary_device: u64,
+        boundary_inode: u64,
+        boundary_key: u64,
+        boundary_len: usize,
+    }
+
+    fn inspect_boundary_mapping(
+        prepared: &PreparedInitrd,
+        file_alignment: usize,
+    ) -> TestBoundaryIdentity {
+        let boundary_ranges: Vec<_> = prepared
+            .ranges
+            .iter()
+            .filter(|range| !range.overlays.is_empty())
+            .collect();
+        assert_eq!(
+            boundary_ranges.len(),
+            1,
+            "a tiny final tail must require exactly one boundary range"
+        );
+        let range = boundary_ranges[0];
+        assert_eq!(
+            range.overlays.len(),
+            1,
+            "a boundary range must carry exactly one minimal overlay"
+        );
+        assert_eq!(range.map_len, PREPARED_MAPPING_GRANULE);
+
+        let underlay_file = File::from(range.fd.try_clone().unwrap());
+        let underlay_header = read_header_at(&underlay_file).unwrap();
+        let underlay_metadata = underlay_file.metadata().unwrap();
+        assert_eq!(underlay_header.kind, PreparedObjectKind::Stitch);
+        assert_eq!(
+            underlay_header.payload_len, PREPARED_MAPPING_GRANULE as u64,
+            "the stable underlay must still dissolve a complete hugetlb mapping"
+        );
+
+        let overlay = &range.overlays[0];
+        let overlay_file = File::from(overlay.fd.try_clone().unwrap());
+        let overlay_header = read_header_at(&overlay_file).unwrap();
+        let overlay_metadata = overlay_file.metadata().unwrap();
+        assert_eq!(overlay_header.kind, PreparedObjectKind::Boundary);
+        assert_eq!(overlay_header.payload_len, overlay.map_len as u64);
+        assert!(
+            overlay.map_len > 0,
+            "a boundary overlay must never be empty"
+        );
+        assert!(
+            overlay.map_len < PREPARED_MAPPING_GRANULE,
+            "a boundary overlay must remain smaller than its 2 MiB underlay"
+        );
+        assert_eq!(
+            overlay.map_len % file_alignment,
+            0,
+            "boundary length must be host-page aligned"
+        );
+        assert_eq!(
+            overlay.guest_offset % file_alignment as u64,
+            0,
+            "boundary guest offset must be host-page aligned"
+        );
+        assert_eq!(
+            overlay.file_offset % file_alignment as u64,
+            0,
+            "boundary file offset must be host-page aligned"
+        );
+        assert!(overlay.guest_offset >= range.guest_offset);
+        assert!(
+            overlay.guest_offset + overlay.map_len as u64
+                <= range.guest_offset + range.map_len as u64,
+            "the minimal overlay must be contained by its complete underlay"
+        );
+
+        TestBoundaryIdentity {
+            underlay_device: underlay_metadata.dev(),
+            underlay_inode: underlay_metadata.ino(),
+            underlay_key: underlay_header.key,
+            boundary_device: overlay_metadata.dev(),
+            boundary_inode: overlay_metadata.ino(),
+            boundary_key: overlay_header.key,
+            boundary_len: overlay.map_len,
+        }
+    }
+
     fn read_prepared_stream(prepared: PreparedInitrd) -> Vec<u8> {
         let compressed_len = prepared.compressed_len();
         let mut stream = Vec::new();
         for range in prepared.into_ranges() {
-            let file = File::from(range.fd);
-            let mut bytes = vec![0u8; range.map_len];
+            let PreparedMapping {
+                fd,
+                file_offset,
+                guest_offset,
+                map_len,
+                overlays,
+            } = range;
+            let file = File::from(fd);
+            let mut bytes = vec![0u8; map_len];
             let mut offset = 0usize;
             while offset < bytes.len() {
                 let read = file
-                    .read_at(&mut bytes[offset..], range.file_offset + offset as u64)
+                    .read_at(&mut bytes[offset..], file_offset + offset as u64)
                     .unwrap();
                 assert!(read > 0);
                 offset += read;
+            }
+            for overlay in overlays {
+                let overlay_offset = usize::try_from(overlay.guest_offset - guest_offset).unwrap();
+                let overlay_file = File::from(overlay.fd);
+                let mut done = 0usize;
+                while done < overlay.map_len {
+                    let read = overlay_file
+                        .read_at(
+                            &mut bytes[overlay_offset + done..overlay_offset + overlay.map_len],
+                            overlay.file_offset + done as u64,
+                        )
+                        .unwrap();
+                    assert!(read > 0);
+                    done += read;
+                }
             }
             stream.extend_from_slice(&bytes);
         }
@@ -5307,6 +5715,61 @@ mod tests {
     }
 
     #[test]
+    fn distinct_tails_share_boundary_underlay_but_not_minimal_overlay() {
+        let temp = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(temp.path()).unwrap();
+        let compression = initramfs::InitrdCompression::Uncompressed;
+        let file_alignment = prepared_file_alignment().unwrap();
+        let mut identities = Vec::new();
+
+        for value in ["short-tail", "a-distinct-and-slightly-longer-tail"] {
+            let args = vec![value.to_owned()];
+            let params = initramfs::SuffixParams {
+                args: &args,
+                ..Default::default()
+            };
+            let expected = initramfs::build_dynamic_tail(0, &params).unwrap();
+            let prepared_base = test_prepared_base(temp.path(), 0xb001_1000, compression, &[]);
+            let prepared = complete_prepared_initrd(prepared_base, &params).unwrap();
+            let identity = inspect_boundary_mapping(&prepared, file_alignment);
+            assert_eq!(
+                identity.boundary_len,
+                round_up(expected.len(), file_alignment).unwrap(),
+                "the tail-sensitive overlay must contain only the touched host pages"
+            );
+            assert_eq!(
+                read_prepared_stream(prepared),
+                expected,
+                "underlay plus minimal overlay must reconstruct the exact tail"
+            );
+            identities.push(identity);
+        }
+
+        assert_eq!(
+            (
+                identities[0].underlay_device,
+                identities[0].underlay_inode,
+                identities[0].underlay_key,
+            ),
+            (
+                identities[1].underlay_device,
+                identities[1].underlay_inode,
+                identities[1].underlay_key,
+            ),
+            "different tails must reuse the identical stable underlay object"
+        );
+        assert_ne!(
+            identities[0].boundary_key, identities[1].boundary_key,
+            "boundary identity must include the tail content"
+        );
+        assert_ne!(
+            (identities[0].boundary_device, identities[0].boundary_inode,),
+            (identities[1].boundary_device, identities[1].boundary_inode,),
+            "different boundary keys must publish distinct immutable inodes"
+        );
+    }
+
+    #[test]
     fn prepared_completion_keeps_the_base_payload_open_description() {
         let temp = tempfile::tempdir().unwrap();
         ensure_prepared_cache_dirs(temp.path()).unwrap();
@@ -5359,6 +5822,9 @@ mod tests {
         ensure_prepared_cache_dirs(temp.path()).unwrap();
         let compression = initramfs::InitrdCompression::Uncompressed;
         let file_alignment = prepared_file_alignment().unwrap();
+        let mut underlay_identities = std::collections::HashSet::new();
+        let mut boundary_identities = std::collections::HashSet::new();
+        let mut total_boundary_bytes = 0u64;
 
         for index in 0..CELLS {
             let args = vec![format!("cell-{index:02}-has-distinct-tail-content")];
@@ -5369,6 +5835,18 @@ mod tests {
             let prepared_base = test_prepared_base(temp.path(), 0xb002, compression, &[]);
             let expected = (index == 0).then(|| initramfs::build_dynamic_tail(0, &params).unwrap());
             let prepared = complete_prepared_initrd(prepared_base, &params).unwrap();
+            let identity = inspect_boundary_mapping(&prepared, file_alignment);
+            underlay_identities.insert((
+                identity.underlay_device,
+                identity.underlay_inode,
+                identity.underlay_key,
+            ));
+            boundary_identities.insert((
+                identity.boundary_device,
+                identity.boundary_inode,
+                identity.boundary_key,
+            ));
+            total_boundary_bytes += identity.boundary_len as u64;
             if let Some(expected) = expected {
                 assert_eq!(
                     read_prepared_stream(prepared),
@@ -5377,29 +5855,59 @@ mod tests {
                 );
             }
         }
+        assert_eq!(
+            underlay_identities.len(),
+            1,
+            "all {CELLS} tails must reuse one stable 2 MiB underlay inode and key"
+        );
+        assert_eq!(
+            boundary_identities.len(),
+            CELLS,
+            "every distinct tail must retain its own tail-sensitive boundary identity"
+        );
+        assert!(
+            total_boundary_bytes <= CELLS as u64 * 2 * file_alignment as u64,
+            "{CELLS} tiny tails consumed {total_boundary_bytes} bytes of boundary overlays"
+        );
 
         let mut logical_bytes = 0u64;
         let mut allocated_bytes = 0u64;
+        let mut stitch_objects = 0usize;
+        let mut boundary_objects = 0usize;
         for entry in std::fs::read_dir(temp.path().join(PREPARED_OBJECTS_DIR)).unwrap() {
-            let metadata = entry.unwrap().metadata().unwrap();
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
             if metadata.is_file() {
                 logical_bytes += metadata.len();
                 allocated_bytes += metadata.blocks() * 512;
             }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            match parse_object_filename(&name).map(|(kind, _)| kind) {
+                Some(PreparedObjectKind::Stitch) => stitch_objects += 1,
+                Some(PreparedObjectKind::Boundary) => boundary_objects += 1,
+                _ => {}
+            }
         }
+        assert_eq!(
+            stitch_objects, 1,
+            "stable final-page bytes must occupy one shared underlay object"
+        );
+        assert_eq!(boundary_objects, CELLS);
 
-        let compact_upper_bound = (CELLS as u64)
-            * (PREPARED_MAPPING_GRANULE as u64 + 4 * file_alignment as u64)
-            + 4 * file_alignment as u64;
+        let compact_upper_bound = PREPARED_MAPPING_GRANULE as u64
+            + (CELLS as u64) * 4 * file_alignment as u64
+            + 8 * file_alignment as u64;
         assert!(
             logical_bytes <= compact_upper_bound,
             "{CELLS} tiny tails consumed {logical_bytes} logical bytes, above the \
              host-page-aligned bound {compact_upper_bound}"
         );
         assert!(
-            allocated_bytes * 4 < logical_bytes,
-            "zero padding was physically allocated: {allocated_bytes} allocated of \
-             {logical_bytes} logical bytes"
+            allocated_bytes <= compact_upper_bound,
+            "{CELLS} tiny tails physically consumed {allocated_bytes} bytes, above the \
+             reduced unique-storage bound {compact_upper_bound}"
         );
     }
 
@@ -6853,8 +7361,40 @@ mod tests {
         unsafe {
             libc::munmap(address.cast(), page);
         }
-        std::fs::write(
-            results.join(index.to_string()),
+        let result = if mode == "storm" {
+            let args = vec![format!("cross-process-boundary-{index:02}")];
+            let params = initramfs::SuffixParams {
+                args: &args,
+                ..Default::default()
+            };
+            let expected = initramfs::build_dynamic_tail(0, &params).unwrap();
+            let prepared_base = test_prepared_base(
+                &root,
+                key.wrapping_add(0x1000_0000),
+                initramfs::InitrdCompression::Uncompressed,
+                &[],
+            );
+            let prepared = complete_prepared_initrd(prepared_base, &params).unwrap();
+            let boundary_cache_hits = prepared.cache_hits();
+            let identity = inspect_boundary_mapping(&prepared, file_alignment);
+            assert_eq!(read_prepared_stream(prepared), expected);
+            format!(
+                "{} {} {} {} {} {} {} {} {} {} {} {} {}",
+                stat.st_dev,
+                stat.st_ino,
+                persisted[0],
+                private_value,
+                u8::from(object.cache_hit),
+                identity.underlay_device,
+                identity.underlay_inode,
+                identity.underlay_key,
+                identity.boundary_device,
+                identity.boundary_inode,
+                identity.boundary_key,
+                identity.boundary_len,
+                boundary_cache_hits,
+            )
+        } else {
             format!(
                 "{} {} {} {} {}",
                 stat.st_dev,
@@ -6862,9 +7402,9 @@ mod tests {
                 persisted[0],
                 private_value,
                 u8::from(object.cache_hit)
-            ),
-        )
-        .unwrap();
+            )
+        };
+        std::fs::write(results.join(index.to_string()), result).unwrap();
     }
 
     #[test]
@@ -6918,21 +7458,45 @@ mod tests {
             "the barriered process storm must run exactly one transform"
         );
         let mut inodes = std::collections::HashSet::new();
+        let mut boundary_underlays = std::collections::HashSet::new();
+        let mut boundaries = std::collections::HashSet::new();
         let mut cache_hits = 0usize;
+        let mut boundary_cache_hits = 0usize;
         for index in 0..CELLS {
             let result = std::fs::read_to_string(results.join(index.to_string())).unwrap();
             let fields: Vec<u64> = result
                 .split_whitespace()
                 .map(|field| field.parse().unwrap())
                 .collect();
-            assert_eq!(fields.len(), 5);
+            assert_eq!(fields.len(), 13);
             inodes.insert((fields[0], fields[1]));
             assert_eq!(fields[2], 0x6d);
             assert_eq!(fields[3] as u8, (index as u8).wrapping_add(1));
             cache_hits += fields[4] as usize;
+            boundary_underlays.insert((fields[5], fields[6], fields[7]));
+            boundaries.insert((fields[8], fields[9], fields[10]));
+            assert!(fields[11] > 0);
+            assert!(fields[11] < PREPARED_MAPPING_GRANULE as u64);
+            assert_eq!(fields[11] % prepared_file_alignment().unwrap() as u64, 0);
+            boundary_cache_hits += fields[12] as usize;
         }
         assert_eq!(inodes.len(), 1, "every process must map the same CAS inode");
         assert_eq!(cache_hits, CELLS - 1);
+        assert_eq!(
+            boundary_underlays.len(),
+            1,
+            "all processes must map the same elected stable underlay inode and key"
+        );
+        assert_eq!(
+            boundaries.len(),
+            CELLS,
+            "distinct process-local tails must publish distinct minimal boundaries"
+        );
+        assert_eq!(
+            boundary_cache_hits,
+            2 * (CELLS - 1),
+            "one process must build each stable base/underlay while every peer reuses both"
+        );
     }
 
     #[test]
@@ -7493,18 +8057,143 @@ mod tests {
         assert!(!coverage.exists());
         assert!(!closure.exists());
 
-        let oversized = temp
+        let sparse = temp
             .path()
             .join(PREPARED_DIGESTS_DIR)
             .join("000000000000b003.digest");
-        File::create(&oversized)
+        File::create(&sparse)
             .unwrap()
             .set_len(PREPARED_CAS_MAX_BYTES + 1)
             .unwrap();
         run_prepared_cache_gc(temp.path(), unix_now_secs(), &namespace).unwrap();
         assert!(
-            !oversized.exists(),
-            "memo files must participate in the global 8 GiB cache cap"
+            sparse.exists(),
+            "a sparse memo must be charged by allocated storage, not logical length"
+        );
+
+        let allocated = temp
+            .path()
+            .join(PREPARED_DIGESTS_DIR)
+            .join("000000000000b004.digest");
+        std::fs::write(&allocated, vec![0xa5; 16 << 10]).unwrap();
+        run_prepared_cache_gc_with_limit(temp.path(), unix_now_secs(), &namespace, 4 << 10)
+            .unwrap();
+        assert!(
+            !allocated.exists(),
+            "allocated memo blocks must count toward the cap"
+        );
+        assert!(
+            sparse.exists(),
+            "size GC must not evict a zero-block sparse memo"
+        );
+    }
+
+    #[test]
+    fn gc_accounts_for_sparse_and_allocated_prepared_objects_and_temps() {
+        let finals = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(finals.path()).unwrap();
+        let sparse_final = prepared_object_path(finals.path(), PreparedObjectKind::Stitch, 0xb101);
+        File::create(&sparse_final)
+            .unwrap()
+            .set_len(PREPARED_CAS_MAX_BYTES + 1)
+            .unwrap();
+        let allocated_final =
+            prepared_object_path(finals.path(), PreparedObjectKind::Boundary, 0xb102);
+        std::fs::write(&allocated_final, vec![0xa5; 16 << 10]).unwrap();
+        assert_eq!(
+            metadata_allocated_bytes(&sparse_final.metadata().unwrap()),
+            0,
+            "the sparse-final fixture must have no allocated data blocks"
+        );
+        assert!(
+            metadata_allocated_bytes(&allocated_final.metadata().unwrap()) > 0,
+            "the allocated-final fixture must consume data blocks"
+        );
+        let namespace = try_lock_gc_namespace(finals.path()).unwrap().unwrap();
+        run_prepared_cache_gc_with_limit(finals.path(), unix_now_secs(), &namespace, 0).unwrap();
+        assert!(
+            sparse_final.exists(),
+            "size GC must not evict a zero-block sparse final object"
+        );
+        assert!(
+            !allocated_final.exists(),
+            "allocated final-object blocks must count toward the cap"
+        );
+
+        let sparse_temp_root = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(sparse_temp_root.path()).unwrap();
+        let sparse_temp = sparse_temp_root
+            .path()
+            .join(PREPARED_OBJECTS_DIR)
+            .join(".tmp-object-boundary-000000000000b103-sparse");
+        File::create(&sparse_temp)
+            .unwrap()
+            .set_len(PREPARED_CAS_MAX_BYTES + 1)
+            .unwrap();
+        let sparse_sentinel = prepared_object_path(
+            sparse_temp_root.path(),
+            PreparedObjectKind::Boundary,
+            0xb104,
+        );
+        std::fs::write(&sparse_sentinel, vec![0x5a; 16 << 10]).unwrap();
+        let sparse_sentinel_bytes = metadata_allocated_bytes(&sparse_sentinel.metadata().unwrap());
+        assert_eq!(
+            metadata_allocated_bytes(&sparse_temp.metadata().unwrap()),
+            0,
+            "the sparse-temp fixture must have no allocated data blocks"
+        );
+        let namespace = try_lock_gc_namespace(sparse_temp_root.path())
+            .unwrap()
+            .unwrap();
+        run_prepared_cache_gc_with_limit(
+            sparse_temp_root.path(),
+            unix_now_secs(),
+            &namespace,
+            sparse_sentinel_bytes,
+        )
+        .unwrap();
+        assert!(sparse_temp.exists());
+        assert!(
+            sparse_sentinel.exists(),
+            "a huge but zero-block fresh temp must not force final-object eviction"
+        );
+
+        let allocated_temp_root = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(allocated_temp_root.path()).unwrap();
+        let allocated_temp = allocated_temp_root
+            .path()
+            .join(PREPARED_OBJECTS_DIR)
+            .join(".tmp-object-boundary-000000000000b105-allocated");
+        std::fs::write(&allocated_temp, vec![0xc3; 16 << 10]).unwrap();
+        let allocated_sentinel = prepared_object_path(
+            allocated_temp_root.path(),
+            PreparedObjectKind::Boundary,
+            0xb106,
+        );
+        std::fs::write(&allocated_sentinel, vec![0x3c; 16 << 10]).unwrap();
+        let allocated_sentinel_bytes =
+            metadata_allocated_bytes(&allocated_sentinel.metadata().unwrap());
+        assert!(
+            metadata_allocated_bytes(&allocated_temp.metadata().unwrap()) > 0,
+            "the allocated-temp fixture must consume data blocks"
+        );
+        let namespace = try_lock_gc_namespace(allocated_temp_root.path())
+            .unwrap()
+            .unwrap();
+        run_prepared_cache_gc_with_limit(
+            allocated_temp_root.path(),
+            unix_now_secs(),
+            &namespace,
+            allocated_sentinel_bytes,
+        )
+        .unwrap();
+        assert!(
+            allocated_temp.exists(),
+            "fresh temp objects remain protected from direct size eviction"
+        );
+        assert!(
+            !allocated_sentinel.exists(),
+            "allocated temp blocks must still contribute to total cache pressure"
         );
     }
 

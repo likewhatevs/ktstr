@@ -12,6 +12,21 @@ fn test_prepared_mapping(magic: &[u8], guest_offset: u64, map_len: usize) -> Pre
         file_offset: 0,
         guest_offset,
         map_len,
+        overlays: Vec::new(),
+    }
+}
+
+fn test_prepared_overlay(bytes: &[u8], guest_offset: u64, map_len: usize) -> PreparedOverlay {
+    use std::io::Write as _;
+
+    let mut file = tempfile::tempfile().unwrap();
+    file.set_len(map_len as u64).unwrap();
+    file.write_all(bytes).unwrap();
+    PreparedOverlay {
+        fd: file.into(),
+        file_offset: 0,
+        guest_offset,
+        map_len,
     }
 }
 
@@ -145,6 +160,140 @@ fn prepared_load_rejects_invalid_backing_extents_before_mapping() {
 }
 
 #[test]
+fn prepared_load_rejects_malformed_nested_overlays_before_mapping() {
+    let page = PREPARED_MAPPING_GRANULE;
+    let host_page = host_page_size() as usize;
+    let valid_overlay = |guest_offset, map_len| {
+        test_prepared_overlay(&initramfs::LZ4_LEGACY_MAGIC, guest_offset, map_len)
+    };
+    let validate = |overlays| {
+        let mut range = test_prepared_mapping(&initramfs::LZ4_LEGACY_MAGIC, 0, page);
+        range.overlays = overlays;
+        validate_prepared_load(
+            1,
+            initramfs::InitrdCompression::Lz4,
+            page,
+            host_page,
+            0,
+            &[range],
+        )
+        .unwrap_err()
+    };
+
+    for (name, overlay, expected) in [
+        (
+            "zero length",
+            valid_overlay(0, 0),
+            "overlay length is not aligned",
+        ),
+        (
+            "misaligned length",
+            valid_overlay(0, host_page + 1),
+            "overlay length is not aligned",
+        ),
+        (
+            "misaligned guest offset",
+            valid_overlay(1, host_page),
+            "overlay guest offset is not aligned",
+        ),
+        (
+            "escapes primary mapping",
+            valid_overlay((page - host_page) as u64, 2 * host_page),
+            "overlay escapes its primary mapping",
+        ),
+    ] {
+        let error = validate(vec![overlay]);
+        assert!(
+            format!("{error:#}").contains(expected),
+            "{name} reached mapping instead of failing overlay validation: {error:#}"
+        );
+    }
+
+    let mut misaligned_file_offset = valid_overlay(0, host_page);
+    misaligned_file_offset.file_offset = 1;
+    let error = validate(vec![misaligned_file_offset]);
+    assert!(
+        format!("{error:#}").contains("file offset is not aligned"),
+        "a misaligned overlay file offset reached mapping: {error:#}"
+    );
+
+    for (name, overlays) in [
+        (
+            "overlap",
+            vec![
+                valid_overlay(host_page as u64, 2 * host_page),
+                valid_overlay((2 * host_page) as u64, host_page),
+            ],
+        ),
+        (
+            "reordering",
+            vec![
+                valid_overlay((2 * host_page) as u64, host_page),
+                valid_overlay(host_page as u64, host_page),
+            ],
+        ),
+    ] {
+        let error = validate(overlays);
+        assert!(
+            format!("{error:#}").contains("overlays overlap or are reordered"),
+            "{name} reached mapping instead of failing overlay ordering: {error:#}"
+        );
+    }
+
+    let truncated = valid_overlay(0, host_page);
+    rustix::fs::ftruncate(&truncated.fd, (host_page - 1) as u64).unwrap();
+    let error = validate(vec![truncated]);
+    assert!(
+        format!("{error:#}").contains("overlay exceeds its backing file"),
+        "a truncated overlay reached mapping: {error:#}"
+    );
+}
+
+#[test]
+fn prepared_load_validates_magic_from_offset_zero_overlay() {
+    let page = PREPARED_MAPPING_GRANULE;
+    let host_page = host_page_size() as usize;
+
+    let mut visible_magic = test_prepared_mapping(b"nope", 0, page);
+    visible_magic.overlays.push(test_prepared_overlay(
+        &initramfs::LZ4_LEGACY_MAGIC,
+        0,
+        host_page,
+    ));
+    assert_eq!(
+        validate_prepared_load(
+            initramfs::LZ4_LEGACY_MAGIC.len(),
+            initramfs::InitrdCompression::Lz4,
+            page,
+            host_page,
+            0,
+            &[visible_magic],
+        )
+        .unwrap(),
+        initramfs::LZ4_LEGACY_MAGIC.len() as u32,
+        "compression validation must read the offset-zero overlay visible to the guest"
+    );
+
+    let mut hidden_magic = test_prepared_mapping(&initramfs::LZ4_LEGACY_MAGIC, 0, page);
+    hidden_magic
+        .overlays
+        .push(test_prepared_overlay(b"nope", 0, host_page));
+    let error = validate_prepared_load(
+        initramfs::LZ4_LEGACY_MAGIC.len(),
+        initramfs::InitrdCompression::Lz4,
+        page,
+        host_page,
+        0,
+        &[hidden_magic],
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("invalid LZ4 legacy magic"),
+        "a valid but hidden primary header must not mask invalid visible overlay bytes: {error:#}"
+    );
+}
+
+#[test]
 fn prepared_subrange_validation_covers_adjacent_regions_and_rejects_holes() {
     let page = host_page_size() as usize;
     let adjacent = GuestMemoryMmap::<()>::from_ranges(&[
@@ -197,7 +346,7 @@ fn prepared_subrange_validation_covers_adjacent_regions_and_rejects_holes() {
 }
 
 #[test]
-fn prepared_multi_region_direct_cow_preserves_offsets_and_private_writes() {
+fn prepared_multi_region_direct_cow_maps_primary_then_overlay_and_isolates_both() {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
     use vm_memory::mmap::{GuestRegionMmap, MmapRegion};
@@ -273,21 +422,40 @@ fn prepared_multi_region_direct_cow_preserves_offsets_and_private_writes() {
         );
     }
 
-    let mut named = tempfile::NamedTempFile::new().unwrap();
-    let mut backing_bytes = vec![0x31; 2 * granule];
-    backing_bytes[..initramfs::LZ4_LEGACY_MAGIC.len()]
+    let mut underlay_named = tempfile::NamedTempFile::new().unwrap();
+    let mut underlay_bytes = vec![0x31; 2 * granule];
+    underlay_bytes[..initramfs::LZ4_LEGACY_MAGIC.len()]
         .copy_from_slice(&initramfs::LZ4_LEGACY_MAGIC);
-    backing_bytes[granule..].fill(0x72);
-    named.write_all(&backing_bytes).unwrap();
-    named.as_file().sync_all().unwrap();
-    let backing_path = named.into_temp_path();
-    std::fs::set_permissions(&backing_path, std::fs::Permissions::from_mode(0o444)).unwrap();
-    let backing = std::fs::OpenOptions::new()
+    underlay_bytes[granule..].fill(0x72);
+    underlay_named.write_all(&underlay_bytes).unwrap();
+    underlay_named.as_file().sync_all().unwrap();
+    let underlay_path = underlay_named.into_temp_path();
+    std::fs::set_permissions(&underlay_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let underlay = std::fs::OpenOptions::new()
         .read(true)
-        .open(&backing_path)
+        .open(&underlay_path)
         .unwrap();
-    let observer = backing.try_clone().unwrap();
-    rustix::fs::flock(&backing, rustix::fs::FlockOperation::LockShared).unwrap();
+    let underlay_observer = underlay.try_clone().unwrap();
+    rustix::fs::flock(&underlay, rustix::fs::FlockOperation::LockShared).unwrap();
+
+    let overlay_guest_offset = granule + host_page;
+    let overlay_len = 2 * host_page;
+    let overlay_file_offset = host_page;
+    let mut overlay_named = tempfile::NamedTempFile::new().unwrap();
+    let mut overlay_bytes = vec![0x19; overlay_file_offset + overlay_len];
+    overlay_bytes[overlay_file_offset..].fill(0xb6);
+    overlay_named.write_all(&overlay_bytes).unwrap();
+    overlay_named.as_file().sync_all().unwrap();
+    let overlay_path = overlay_named.into_temp_path();
+    std::fs::set_permissions(&overlay_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let overlay = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&overlay_path)
+        .unwrap();
+    let overlay_observer = overlay.try_clone().unwrap();
+    rustix::fs::flock(&overlay, rustix::fs::FlockOperation::LockShared).unwrap();
+    let underlay_ino = rustix::fs::fstat(&underlay).unwrap().st_ino;
+    let overlay_ino = rustix::fs::fstat(&overlay).unwrap().st_ino;
 
     // SAFETY: both raw regions describe the complete live anonymous VMAs
     // installed above. `Reservation` owns and outlives these non-owning
@@ -318,14 +486,20 @@ fn prepared_multi_region_direct_cow_preserves_offsets_and_private_writes() {
     .unwrap();
 
     let ranges = vec![PreparedMapping {
-        fd: backing.into(),
+        fd: underlay.into(),
         file_offset: 0,
         guest_offset: 0,
-        map_len: backing_bytes.len(),
+        map_len: underlay_bytes.len(),
+        overlays: vec![PreparedOverlay {
+            fd: overlay.into(),
+            file_offset: overlay_file_offset as u64,
+            guest_offset: overlay_guest_offset as u64,
+            map_len: overlay_len,
+        }],
     }];
     assert_eq!(
         validate_prepared_load(
-            backing_bytes.len(),
+            underlay_bytes.len(),
             initramfs::InitrdCompression::Lz4,
             granule,
             host_page,
@@ -333,7 +507,7 @@ fn prepared_multi_region_direct_cow_preserves_offsets_and_private_writes() {
             &ranges,
         )
         .unwrap(),
-        backing_bytes.len() as u32
+        underlay_bytes.len() as u32
     );
     let validated =
         validate_prepared_subranges(&guest_mem, ranges, 0, host_page, host_page).unwrap();
@@ -347,12 +521,25 @@ fn prepared_multi_region_direct_cow_preserves_offsets_and_private_writes() {
     assert_eq!(validated[0].subranges[1].host_addr, second_host);
     assert_eq!(validated[0].subranges[1].file_offset, granule as u64);
     assert_eq!(validated[0].subranges[1].len, granule);
+    assert_eq!(validated[0].overlays.len(), 1);
+    assert_eq!(validated[0].overlays[0].subranges.len(), 1);
+    assert_eq!(
+        validated[0].overlays[0].subranges[0].guest_addr,
+        overlay_guest_offset as u64
+    );
+    assert_eq!(
+        validated[0].overlays[0].subranges[0].file_offset,
+        overlay_file_offset as u64
+    );
+    assert_eq!(validated[0].overlays[0].subranges[0].len, overlay_len);
     assert_eq!(second_host as usize, first_host as usize + 3 * granule);
 
+    let mut map_order = Vec::new();
     map_validated_prepared_ranges(
         &mut cow_guards,
         validated,
         |subrange, fd| {
+            map_order.push(rustix::fs::fstat(fd).unwrap().st_ino);
             // SAFETY: production validation above proved that each complete
             // destination subrange lies inside one live guest-memory region.
             unsafe {
@@ -369,8 +556,13 @@ fn prepared_multi_region_direct_cow_preserves_offsets_and_private_writes() {
     .unwrap();
     assert_eq!(
         cow_guards.len(),
-        1,
-        "both split mappings must retain one locked backing fd"
+        2,
+        "the split primary and its overlay must retain both locked backing fds"
+    );
+    assert_eq!(
+        map_order,
+        [underlay_ino, underlay_ino, overlay_ino],
+        "every primary subrange must be installed before its nested overlay"
     );
 
     let mut magic = [0; 4];
@@ -383,32 +575,92 @@ fn prepared_multi_region_direct_cow_preserves_offsets_and_private_writes() {
     assert_eq!(first_byte, [0x31]);
     let mut second_byte = [0];
     guest_mem
-        .read_slice(&mut second_byte, GuestAddress((granule + host_page) as u64))
+        .read_slice(&mut second_byte, GuestAddress(granule as u64))
         .unwrap();
     assert_eq!(
         second_byte,
         [0x72],
         "the second guest region must map from the second file offset"
     );
-
-    let private_write_offset = granule + host_page;
+    let mut visible_overlay = vec![0; overlay_len];
     guest_mem
-        .write_slice(&[0xe5], GuestAddress(private_write_offset as u64))
+        .read_slice(
+            &mut visible_overlay,
+            GuestAddress(overlay_guest_offset as u64),
+        )
+        .unwrap();
+    assert_eq!(
+        visible_overlay,
+        overlay_bytes[overlay_file_offset..],
+        "the nested overlay must replace exactly its declared guest bytes"
+    );
+    guest_mem
+        .read_slice(
+            &mut second_byte,
+            GuestAddress((overlay_guest_offset + overlay_len) as u64),
+        )
+        .unwrap();
+    assert_eq!(
+        second_byte,
+        [0x72],
+        "bytes immediately after the overlay must remain mapped from the primary"
+    );
+
+    let private_underlay_offset = host_page;
+    guest_mem
+        .write_slice(&[0xe5], GuestAddress(private_underlay_offset as u64))
         .unwrap();
     guest_mem
-        .read_slice(&mut second_byte, GuestAddress(private_write_offset as u64))
+        .read_slice(
+            &mut second_byte,
+            GuestAddress(private_underlay_offset as u64),
+        )
         .unwrap();
     assert_eq!(second_byte, [0xe5]);
     assert_eq!(
-        observer
-            .read_at(&mut second_byte, private_write_offset as u64)
+        underlay_observer
+            .read_at(&mut second_byte, private_underlay_offset as u64)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        second_byte,
+        [0x31],
+        "MAP_PRIVATE writes to primary-visible bytes must not modify the underlay"
+    );
+
+    let private_overlay_offset = overlay_guest_offset + host_page;
+    guest_mem
+        .write_slice(&[0xd7], GuestAddress(private_overlay_offset as u64))
+        .unwrap();
+    guest_mem
+        .read_slice(
+            &mut second_byte,
+            GuestAddress(private_overlay_offset as u64),
+        )
+        .unwrap();
+    assert_eq!(second_byte, [0xd7]);
+    assert_eq!(
+        overlay_observer
+            .read_at(&mut second_byte, (overlay_file_offset + host_page) as u64,)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        second_byte,
+        [0xb6],
+        "MAP_PRIVATE writes to overlay-visible bytes must not modify the overlay object"
+    );
+    assert_eq!(
+        underlay_observer
+            .read_at(&mut second_byte, private_overlay_offset as u64)
             .unwrap(),
         1
     );
     assert_eq!(
         second_byte,
         [0x72],
-        "MAP_PRIVATE guest writes must not modify the immutable backing object"
+        "overlay-visible writes must not reach the hidden underlay object"
     );
 
     // Preserve the production lifetime order explicitly: wrappers first,
@@ -556,8 +808,8 @@ fn prepared_multirange_hash_update(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-struct PreparedMultirangeObservation {
-    index: usize,
+struct PreparedMultirangeBackingObservation {
+    label: String,
     dev: u64,
     ino: u64,
     file_offset: u64,
@@ -570,6 +822,46 @@ struct PreparedMultirangeObservation {
     observer: std::fs::File,
 }
 
+struct PreparedMultirangeObservation {
+    index: usize,
+    primary: PreparedMultirangeBackingObservation,
+    overlays: Vec<PreparedMultirangeBackingObservation>,
+}
+
+fn prepared_multirange_backing_observation(
+    label: String,
+    fd: &OwnedFd,
+    file_offset: u64,
+    guest_offset: u64,
+    map_len: usize,
+    sample_relative_offset: usize,
+    child_index: usize,
+) -> PreparedMultirangeBackingObservation {
+    assert!(
+        sample_relative_offset < map_len,
+        "{label} sample lies outside its mapping"
+    );
+    let stat = rustix::fs::fstat(fd).unwrap();
+    let observer = std::fs::File::from(fd.try_clone().unwrap());
+    let sample_file_offset = file_offset + sample_relative_offset as u64;
+    let sample_guest_offset = guest_offset + sample_relative_offset as u64;
+    let mut original = [0u8; 1];
+    prepared_multirange_read_exact_at(&observer, sample_file_offset, &mut original);
+    PreparedMultirangeBackingObservation {
+        label,
+        dev: stat.st_dev,
+        ino: stat.st_ino,
+        file_offset,
+        guest_offset,
+        map_len,
+        sample_file_offset,
+        sample_guest_offset,
+        original: original[0],
+        private: original[0].wrapping_add(child_index as u8 + 1),
+        observer,
+    }
+}
+
 fn prepared_multirange_observations(
     ranges: &[PreparedMapping],
     child_index: usize,
@@ -579,28 +871,47 @@ fn prepared_multirange_observations(
         .iter()
         .enumerate()
         .map(|(index, range)| {
-            assert!(
-                range.map_len > host_page,
-                "prepared range {index} is too short for a COW sample"
+            let primary_sample = (0..range.map_len)
+                .step_by(host_page)
+                .find(|relative| {
+                    let guest = range.guest_offset + *relative as u64;
+                    range.overlays.iter().all(|overlay| {
+                        guest < overlay.guest_offset
+                            || guest >= overlay.guest_offset + overlay.map_len as u64
+                    })
+                })
+                .unwrap_or_else(|| {
+                    panic!("prepared range {index} has no primary-visible page to sample")
+                });
+            let primary = prepared_multirange_backing_observation(
+                format!("range {index} primary"),
+                &range.fd,
+                range.file_offset,
+                range.guest_offset,
+                range.map_len,
+                primary_sample,
+                child_index,
             );
-            let stat = rustix::fs::fstat(&range.fd).unwrap();
-            let observer = std::fs::File::from(range.fd.try_clone().unwrap());
-            let sample_file_offset = range.file_offset + host_page as u64;
-            let sample_guest_offset = range.guest_offset + host_page as u64;
-            let mut original = [0u8; 1];
-            prepared_multirange_read_exact_at(&observer, sample_file_offset, &mut original);
+            let overlays = range
+                .overlays
+                .iter()
+                .enumerate()
+                .map(|(overlay_index, overlay)| {
+                    prepared_multirange_backing_observation(
+                        format!("range {index} overlay {overlay_index}"),
+                        &overlay.fd,
+                        overlay.file_offset,
+                        overlay.guest_offset,
+                        overlay.map_len,
+                        0,
+                        child_index,
+                    )
+                })
+                .collect();
             PreparedMultirangeObservation {
                 index,
-                dev: stat.st_dev,
-                ino: stat.st_ino,
-                file_offset: range.file_offset,
-                guest_offset: range.guest_offset,
-                map_len: range.map_len,
-                sample_file_offset,
-                sample_guest_offset,
-                original: original[0],
-                private: original[0].wrapping_add(child_index as u8 + 1),
-                observer,
+                primary,
+                overlays,
             }
         })
         .collect()
@@ -610,43 +921,34 @@ fn prepared_multirange_assert_complete_mapping(
     guest_mem: &GuestMemoryMmap,
     observation: &PreparedMultirangeObservation,
 ) -> u64 {
-    const CHUNK: usize = 64 << 10;
-    let mut expected = vec![0u8; CHUNK];
-    let mut actual = vec![0u8; CHUNK];
-    let mut consumed = 0usize;
-    let mut hash = 0xcbf2_9ce4_8422_2325;
-    while consumed < observation.map_len {
-        let len = (observation.map_len - consumed).min(CHUNK);
+    let primary = &observation.primary;
+    let mut expected = vec![0u8; primary.map_len];
+    prepared_multirange_read_exact_at(&primary.observer, primary.file_offset, &mut expected);
+    for overlay in &observation.overlays {
+        let destination = usize::try_from(overlay.guest_offset - primary.guest_offset).unwrap();
         prepared_multirange_read_exact_at(
-            &observation.observer,
-            observation.file_offset + consumed as u64,
-            &mut expected[..len],
+            &overlay.observer,
+            overlay.file_offset,
+            &mut expected[destination..destination + overlay.map_len],
         );
-        guest_mem
-            .read_slice(
-                &mut actual[..len],
-                GuestAddress(observation.guest_offset + consumed as u64),
-            )
-            .unwrap();
-        if expected[..len] != actual[..len] {
-            let mismatch = expected[..len]
-                .iter()
-                .zip(&actual[..len])
-                .position(|(expected, actual)| expected != actual)
-                .unwrap();
-            panic!(
-                "prepared range {} differs from its CAS object at logical offset {:#x}: \
-                 expected {:#04x}, got {:#04x}",
-                observation.index,
-                consumed + mismatch,
-                expected[mismatch],
-                actual[mismatch]
-            );
-        }
-        hash = prepared_multirange_hash_update(hash, &expected[..len]);
-        consumed += len;
     }
-    hash
+    let mut actual = vec![0u8; primary.map_len];
+    guest_mem
+        .read_slice(&mut actual, GuestAddress(primary.guest_offset))
+        .unwrap();
+    if expected != actual {
+        let mismatch = expected
+            .iter()
+            .zip(&actual)
+            .position(|(expected, actual)| expected != actual)
+            .unwrap();
+        panic!(
+            "prepared range {} differs from its primary-plus-overlay composition at \
+             logical offset {mismatch:#x}: expected {:#04x}, got {:#04x}",
+            observation.index, expected[mismatch], actual[mismatch]
+        );
+    }
+    prepared_multirange_hash_update(0xcbf2_9ce4_8422_2325, &expected)
 }
 
 fn prepared_multirange_assert_guest_samples(
@@ -655,38 +957,42 @@ fn prepared_multirange_assert_guest_samples(
     private: bool,
 ) {
     for observation in observations {
-        let mut actual = [0u8; 1];
-        guest_mem
-            .read_slice(&mut actual, GuestAddress(observation.sample_guest_offset))
-            .unwrap();
-        let expected = if private {
-            observation.private
-        } else {
-            observation.original
-        };
-        assert_eq!(
-            actual[0],
-            expected,
-            "prepared range {} has the wrong {} sample",
-            observation.index,
-            if private { "private" } else { "shared" }
-        );
+        for backing in std::iter::once(&observation.primary).chain(&observation.overlays) {
+            let mut actual = [0u8; 1];
+            guest_mem
+                .read_slice(&mut actual, GuestAddress(backing.sample_guest_offset))
+                .unwrap();
+            let expected = if private {
+                backing.private
+            } else {
+                backing.original
+            };
+            assert_eq!(
+                actual[0],
+                expected,
+                "{} has the wrong {} sample",
+                backing.label,
+                if private { "private" } else { "shared" }
+            );
+        }
     }
 }
 
 fn prepared_multirange_assert_backing_samples(observations: &[PreparedMultirangeObservation]) {
     for observation in observations {
-        let mut actual = [0u8; 1];
-        prepared_multirange_read_exact_at(
-            &observation.observer,
-            observation.sample_file_offset,
-            &mut actual,
-        );
-        assert_eq!(
-            actual[0], observation.original,
-            "MAP_PRIVATE write changed prepared CAS range {}",
-            observation.index
-        );
+        for backing in std::iter::once(&observation.primary).chain(&observation.overlays) {
+            let mut actual = [0u8; 1];
+            prepared_multirange_read_exact_at(
+                &backing.observer,
+                backing.sample_file_offset,
+                &mut actual,
+            );
+            assert_eq!(
+                actual[0], backing.original,
+                "MAP_PRIVATE write changed {}",
+                backing.label
+            );
+        }
     }
 }
 
@@ -695,12 +1001,14 @@ fn prepared_multirange_write_private_samples(
     observations: &[PreparedMultirangeObservation],
 ) {
     for observation in observations {
-        guest_mem
-            .write_slice(
-                &[observation.private],
-                GuestAddress(observation.sample_guest_offset),
-            )
-            .unwrap();
+        for backing in std::iter::once(&observation.primary).chain(&observation.overlays) {
+            guest_mem
+                .write_slice(
+                    &[backing.private],
+                    GuestAddress(backing.sample_guest_offset),
+                )
+                .unwrap();
+        }
     }
 }
 
@@ -711,25 +1019,45 @@ fn prepared_multirange_child_result(
 ) -> String {
     use std::fmt::Write as _;
 
+    let backing_count: usize = observations
+        .iter()
+        .map(|observation| 1 + observation.overlays.len())
+        .sum();
     let mut result = format!(
-        "plan {} {} {} {}\n",
+        "plan {} {} {} {} {}\n",
         plan.part_count,
         plan.direct_ranges,
         plan.stitch_pages,
-        observations.len()
+        observations.len(),
+        backing_count,
     );
     for (observation, hash) in observations.iter().zip(hashes) {
+        let primary = &observation.primary;
         writeln!(
             result,
-            "range {} {} {} {} {} {} {hash:016x}",
+            "range {} primary {} {} {} {} {} {hash:016x}",
             observation.index,
-            observation.dev,
-            observation.ino,
-            observation.file_offset,
-            observation.guest_offset,
-            observation.map_len,
+            primary.dev,
+            primary.ino,
+            primary.file_offset,
+            primary.guest_offset,
+            primary.map_len,
         )
         .unwrap();
+        for (overlay_index, overlay) in observation.overlays.iter().enumerate() {
+            writeln!(
+                result,
+                "range {} overlay {} {} {} {} {} {}",
+                observation.index,
+                overlay_index,
+                overlay.dev,
+                overlay.ino,
+                overlay.file_offset,
+                overlay.guest_offset,
+                overlay.map_len,
+            )
+            .unwrap();
+        }
     }
     result
 }
@@ -801,10 +1129,19 @@ fn prepared_multirange_cross_process_child() {
         compressed_len as u32
     );
     let observations = prepared_multirange_observations(&ranges, child_index, host_page);
+    let overlay_count: usize = observations
+        .iter()
+        .map(|observation| observation.overlays.len())
+        .sum();
+    assert!(
+        overlay_count > 0,
+        "the cross-process fixture must exercise a nested boundary overlay"
+    );
+    let backing_count = observations.len() + overlay_count;
 
     // Guards are declared before guest memory so the MAP_FIXED VMAs are
     // unmapped before their shared CAS locks are released.
-    let mut cow_guards = Vec::with_capacity(ranges.len());
+    let mut cow_guards = Vec::with_capacity(backing_count);
     let guest_mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), mapped_len)]).unwrap();
     let validated =
         validate_prepared_subranges(&guest_mem, ranges, 0, host_page, host_page).unwrap();
@@ -812,6 +1149,13 @@ fn prepared_multirange_cross_process_child() {
     assert!(
         validated.iter().all(|range| range.subranges.len() == 1),
         "one contiguous base-page guest region must not split logical ranges"
+    );
+    assert!(
+        validated
+            .iter()
+            .flat_map(|range| &range.overlays)
+            .all(|overlay| overlay.subranges.len() == 1),
+        "one contiguous base-page guest region must not split nested overlays"
     );
     map_validated_prepared_ranges(
         &mut cow_guards,
@@ -829,8 +1173,8 @@ fn prepared_multirange_cross_process_child() {
     .unwrap();
     assert_eq!(
         cow_guards.len(),
-        observations.len(),
-        "every prepared mapping must retain its own locked CAS fd"
+        backing_count,
+        "every primary and nested overlay must retain its own locked CAS fd"
     );
 
     let hashes: Vec<u64> = observations
@@ -950,13 +1294,120 @@ fn prepared_multirange_cross_process_reuses_every_cas_range_and_cow_isolates() {
          inode, file offset, guest offset, length, and content"
     );
     assert!(
-        writer.lines().count() >= 5,
-        "fixture must report one plan plus at least four mapped CAS ranges:\n{writer}"
+        writer.lines().any(|line| line.contains(" overlay ")),
+        "fixture must report at least one cross-process-reused overlay CAS object:\n{writer}"
+    );
+    assert!(
+        writer.lines().count() >= 6,
+        "fixture must report one plan, at least four primary CAS ranges, and an overlay:\n{writer}"
     );
 }
 
 #[test]
-fn prepared_mapper_keeps_guards_on_partial_map_and_numa_failures() {
+fn prepared_mapper_keeps_primary_and_overlay_guards_on_overlay_failures() {
+    let page = host_page_size() as usize;
+    let validated_fixture = || {
+        let primary = test_prepared_mapping(&initramfs::LZ4_LEGACY_MAGIC, 0, 2 * page);
+        let overlay = test_prepared_overlay(&[], 0, 2 * page);
+        vec![ValidatedPreparedRange {
+            range: primary,
+            subranges: vec![ValidatedPreparedSubrange {
+                guest_addr: 0,
+                host_addr: page as *mut u8,
+                file_offset: 0,
+                len: 2 * page,
+            }],
+            overlays: vec![ValidatedPreparedOverlay {
+                overlay,
+                subranges: vec![
+                    ValidatedPreparedSubrange {
+                        guest_addr: 0,
+                        host_addr: page as *mut u8,
+                        file_offset: 0,
+                        len: page,
+                    },
+                    ValidatedPreparedSubrange {
+                        guest_addr: page as u64,
+                        host_addr: (2 * page) as *mut u8,
+                        file_offset: page as u64,
+                        len: page,
+                    },
+                ],
+            }],
+        }]
+    };
+
+    let mut guards = Vec::new();
+    let mut map_calls = 0usize;
+    let error = map_validated_prepared_ranges(
+        &mut guards,
+        validated_fixture(),
+        |_, _| {
+            map_calls += 1;
+            anyhow::ensure!(map_calls < 3, "injected overlay MAP_FIXED failure");
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+    .unwrap_err();
+    assert_eq!(
+        map_calls, 3,
+        "the mapper must install the primary and first overlay subrange before failing"
+    );
+    assert_eq!(
+        guards.len(),
+        2,
+        "the completed primary and partially live overlay must retain both backing fds"
+    );
+    assert!(
+        format!("{error:#}").contains("injected overlay MAP_FIXED failure"),
+        "the strict mapper must return the overlay mapping failure without a copy fallback: \
+         {error:#}"
+    );
+    assert!(
+        format!("{error:#}").contains("prepared initrd overlay subrange"),
+        "the partial-map error must identify the nested overlay: {error:#}"
+    );
+
+    let mut guards = Vec::new();
+    let mut map_calls = 0usize;
+    let mut numa_calls = 0usize;
+    let error = map_validated_prepared_ranges(
+        &mut guards,
+        validated_fixture(),
+        |_, _| {
+            map_calls += 1;
+            Ok(())
+        },
+        |_| {
+            numa_calls += 1;
+            anyhow::ensure!(numa_calls < 2, "injected overlay NUMA restore failure");
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        map_calls, 2,
+        "NUMA failure must occur after the primary and first overlay mapping"
+    );
+    assert_eq!(numa_calls, 2);
+    assert_eq!(
+        guards.len(),
+        2,
+        "the completed primary and NUMA-failed overlay must retain both backing fds"
+    );
+    assert!(
+        format!("{error:#}").contains("injected overlay NUMA restore failure"),
+        "the mapper must return the overlay NUMA failure: {error:#}"
+    );
+    assert!(
+        format!("{error:#}").contains("prepared initrd overlay subrange"),
+        "the NUMA error must identify the nested overlay: {error:#}"
+    );
+}
+
+#[test]
+fn prepared_mapper_keeps_guard_on_partial_primary_map() {
     let page = host_page_size() as usize;
     let subranges = vec![
         ValidatedPreparedSubrange {
@@ -974,7 +1425,8 @@ fn prepared_mapper_keeps_guards_on_partial_map_and_numa_failures() {
     ];
     let validated = vec![ValidatedPreparedRange {
         range: test_prepared_mapping(&initramfs::LZ4_LEGACY_MAGIC, 0, 2 * page),
-        subranges: subranges.clone(),
+        subranges,
+        overlays: Vec::new(),
     }];
     let mut guards = Vec::new();
     let mut map_calls = 0usize;
@@ -999,35 +1451,6 @@ fn prepared_mapper_keeps_guards_on_partial_map_and_numa_failures() {
         format!("{error:#}").contains("injected MAP_FIXED failure"),
         "the strict mapper must return the mapping failure without a copy fallback: {error:#}"
     );
-
-    let validated = vec![ValidatedPreparedRange {
-        range: test_prepared_mapping(&initramfs::LZ4_LEGACY_MAGIC, 0, 2 * page),
-        subranges,
-    }];
-    let mut guards = Vec::new();
-    let mut map_calls = 0usize;
-    let mut numa_calls = 0usize;
-    let error = map_validated_prepared_ranges(
-        &mut guards,
-        validated,
-        |_, _| {
-            map_calls += 1;
-            Ok(())
-        },
-        |_| {
-            numa_calls += 1;
-            anyhow::bail!("injected NUMA restore failure")
-        },
-    )
-    .unwrap_err();
-    assert_eq!(map_calls, 1);
-    assert_eq!(numa_calls, 1);
-    assert_eq!(
-        guards.len(),
-        1,
-        "a mapped range must stay guarded when policy restoration fails"
-    );
-    assert!(format!("{error:#}").contains("injected NUMA restore failure"));
 }
 
 #[test]
@@ -1104,6 +1527,131 @@ fn prepared_hugetlb_split_requires_huge_aligned_destination_not_file_offset() {
         validate_prepared_file_offset((host_page + 1) as u64, host_page).is_err(),
         "an offset that is not aligned to the runtime base page must be rejected"
     );
+}
+
+#[test]
+fn prepared_nested_overlay_replaces_real_hugetlb_vma_when_available() {
+    use std::io::Write as _;
+    use vm_memory::mmap::{GuestRegionMmap, MmapRegion};
+
+    struct Reservation {
+        address: *mut libc::c_void,
+        len: usize,
+    }
+
+    impl Drop for Reservation {
+        fn drop(&mut self) {
+            let _ = unsafe { libc::munmap(self.address, self.len) };
+        }
+    }
+
+    let granule = PREPARED_MAPPING_GRANULE;
+    let host_page = host_page_size() as usize;
+    let address = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            granule,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB | libc::MAP_HUGE_2MB,
+            -1,
+            0,
+        )
+    };
+    if address == libc::MAP_FAILED {
+        skip!(
+            "2 MiB MAP_HUGETLB reservation unavailable; nested replacement not applicable: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    let mut guards = Vec::new();
+    let reservation = Reservation {
+        address,
+        len: granule,
+    };
+    let host_addr = address.cast::<u8>();
+    assert_eq!((host_addr as usize) % granule, 0);
+
+    let mut primary_file = tempfile::tempfile().unwrap();
+    let mut primary_bytes = vec![0x4a; granule];
+    primary_bytes[..initramfs::LZ4_LEGACY_MAGIC.len()]
+        .copy_from_slice(&initramfs::LZ4_LEGACY_MAGIC);
+    primary_file.write_all(&primary_bytes).unwrap();
+    rustix::fs::flock(&primary_file, rustix::fs::FlockOperation::LockShared).unwrap();
+
+    let overlay_guest_offset = granule - host_page;
+    let mut overlay_file = tempfile::tempfile().unwrap();
+    let overlay_bytes = vec![0xc7; host_page];
+    overlay_file.write_all(&overlay_bytes).unwrap();
+    rustix::fs::flock(&overlay_file, rustix::fs::FlockOperation::LockShared).unwrap();
+
+    let range = PreparedMapping {
+        fd: primary_file.into(),
+        file_offset: 0,
+        guest_offset: 0,
+        map_len: granule,
+        overlays: vec![PreparedOverlay {
+            fd: overlay_file.into(),
+            file_offset: 0,
+            guest_offset: overlay_guest_offset as u64,
+            map_len: host_page,
+        }],
+    };
+    validate_prepared_load(
+        granule,
+        initramfs::InitrdCompression::Lz4,
+        granule,
+        host_page,
+        0,
+        std::slice::from_ref(&range),
+    )
+    .unwrap();
+
+    let region = unsafe {
+        MmapRegion::build_raw(
+            host_addr,
+            granule,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB | libc::MAP_HUGE_2MB,
+        )
+        .unwrap()
+    };
+    let guest_mem =
+        GuestMemoryMmap::from_regions(vec![GuestRegionMmap::new(region, GuestAddress(0)).unwrap()])
+            .unwrap();
+    let validated =
+        validate_prepared_subranges(&guest_mem, vec![range], 0, granule, host_page).unwrap();
+    map_validated_prepared_ranges(
+        &mut guards,
+        validated,
+        |subrange, fd| unsafe {
+            initramfs::cow_overlay_file_borrowed(
+                subrange.host_addr,
+                subrange.len,
+                fd,
+                subrange.file_offset,
+            )
+        },
+        |_| Ok(()),
+    )
+    .expect("replace the complete hugetlb VMA before its host-page overlay");
+
+    assert_eq!(guards.len(), 2);
+    let mut actual = [0u8; 1];
+    guest_mem.read_slice(&mut actual, GuestAddress(0)).unwrap();
+    assert_eq!(actual, [initramfs::LZ4_LEGACY_MAGIC[0]]);
+    guest_mem
+        .read_slice(&mut actual, GuestAddress(overlay_guest_offset as u64))
+        .unwrap();
+    assert_eq!(
+        actual,
+        [0xc7],
+        "the host-page overlay must remain visible after replacing the hugetlb VMA"
+    );
+
+    drop(guest_mem);
+    drop(reservation);
+    drop(guards);
 }
 
 /// Regression for the PVTIME/initrd overlap: the initrd top
