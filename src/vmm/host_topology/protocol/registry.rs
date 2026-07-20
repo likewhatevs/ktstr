@@ -2828,6 +2828,7 @@ pub(super) fn exercise_exact_commit_scan_elision_for_tests(commits: usize) -> Re
 
     let scans_before = diagnostic_counter_for_tests(H_GRANT_SCANS)?;
     let empty = BTreeSet::new();
+    let mut held = Vec::with_capacity(commits);
     for (ticket, claim) in &mut waiters {
         // Keep this helper falsifiable against the old implementation, whose
         // prior acquired commit advanced the epoch for every later grant.
@@ -2852,9 +2853,10 @@ pub(super) fn exercise_exact_commit_scan_elision_for_tests(commits: usize) -> Re
                 })
             },
         )?;
-        if !matches!(result, GrantResult::Acquired((), _)) {
-            anyhow::bail!("exact-commit waiter did not commit its prepared acquisition");
-        }
+        held.push(match result {
+            GrantResult::Acquired((), held) => held,
+            _ => anyhow::bail!("exact-commit waiter did not commit its prepared acquisition"),
+        });
         coordinator.schedule(
             None,
             &empty,
@@ -2869,6 +2871,7 @@ pub(super) fn exercise_exact_commit_scan_elision_for_tests(commits: usize) -> Re
         )?;
     }
     let scans = diagnostic_counter_for_tests(H_GRANT_SCANS)? - scans_before;
+    drop(held);
     coordinator.finish(None)?;
     Ok(scans)
 }
@@ -3491,20 +3494,27 @@ pub(super) fn exercise_prefix_refresh_after_predecessor_release_for_tests()
             })
         },
     )?;
-    if !matches!(acquired, GrantResult::Acquired((), _)) {
-        anyhow::bail!("release-prefix predecessor did not commit acquisition");
-    }
+    let held = match acquired {
+        GrantResult::Acquired((), held) => held,
+        _ => anyhow::bail!("release-prefix predecessor did not commit acquisition"),
+    };
 
     let candidate = predecessor_claim;
-    let (stale_before, refreshed_prefix, refreshed_serial) = {
+    let stale_before = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
         let (_, before) = table.cached_prefix(waiter.slot)?;
-        let stale_before = before.conflicts(&candidate)?;
+        before.conflicts(&candidate)?
+    };
 
-        // Model the acquired predecessor's real flock closing. The improvement
-        // scan must refresh an already-REPLAN suffix record even though the
-        // claim epoch did not change.
+    // Release the acquired predecessor before publishing the corresponding
+    // physical-lock improvement. The HELD record must remain live through the
+    // stale-prefix sample above; discarding it at the acquisition match would
+    // test a second synthetic release instead of the production lifecycle.
+    drop(held);
+    let (refreshed_prefix, refreshed_serial) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
         set_cpu_free_for_tests(&mut table, 1, true)?;
         table.stamp_resource_improvement(S_CPU_EX, 1)?;
         table.set_pending_flag(PENDING_RESCAN);
@@ -3515,7 +3525,6 @@ pub(super) fn exercise_prefix_refresh_after_predecessor_release_for_tests()
             .ok_or_else(|| anyhow::anyhow!("release-prefix waiter disappeared"))?;
         let (_, after) = table.cached_prefix(waiter.slot)?;
         (
-            stale_before,
             !after.conflicts(&candidate)?,
             record.issue_serial == table.max_watch_serial(&record.watch)?,
         )

@@ -3678,8 +3678,10 @@ fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
     let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .expect("re-block waiter after epoch transition");
-    let blocker_two =
-        protocol::publish_acquired(&claim, blocker_two).expect("publish replacement external hold");
+    // Leave the replacement as an external, unregistered flock. A current-v8
+    // HELD publication would authoritatively revoke the in-flight grant before
+    // its callback returned, bypassing the stale-negative-evidence path this
+    // test is meant to pin.
     std::fs::write(&gate, b"release").expect("release stale-epoch probe");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while !protocol::ticket_blocked_at_current_serial_for_tests(waiter.pid)
@@ -3925,6 +3927,10 @@ fn remove_crash_after_counts_before_free_is_repaired() {
     let markers = tempfile::TempDir::new().expect("marker dir");
     let removing =
         TicketChild::spawn_crashing(markers.path(), "removing", "1", "remove_counts_before_free");
+    // The v8 HELD lifecycle removes its registry record only after the
+    // physical reservation is released. Let the helper pass its normal
+    // release barrier so the injected crash observes that production ordering.
+    std::fs::write(&removing.release, b"release").expect("release crash-test reservation");
     removing.wait_for_injected_crash();
 
     let replacement = TicketChild::spawn(markers.path(), "replacement", "1", false);
