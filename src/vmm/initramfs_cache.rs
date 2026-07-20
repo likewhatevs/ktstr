@@ -1579,7 +1579,12 @@ fn get_or_resolve_pinned_closure(
     let record_path = root
         .join(PREPARED_CLOSURES_DIR)
         .join(format!("{key:016x}.closure"));
-    if let Some(closure) = read_pinned_closure_record(&record_path, key)? {
+    // Closure records are derived cache metadata. A torn writer from an
+    // interrupted older process must not permanently poison every future
+    // consumer of the same content key. Treat malformed records as misses;
+    // the elected builder below replaces them atomically while holding the
+    // per-key exclusive lock.
+    if let Some(closure) = read_pinned_closure_record(&record_path, key).unwrap_or(None) {
         return Ok(closure);
     }
     let lock_path = root
@@ -1596,7 +1601,8 @@ fn get_or_resolve_pinned_closure(
         match election {
             Ok(()) => {
                 coordination.release_namespace_gate();
-                if let Some(closure) = read_pinned_closure_record(&record_path, key)? {
+                if let Some(closure) = read_pinned_closure_record(&record_path, key).unwrap_or(None)
+                {
                     return Ok(closure);
                 }
                 let (record, closure) = build_pinned_closure(root, binary, original_path, loader)?;
@@ -1616,7 +1622,8 @@ fn get_or_resolve_pinned_closure(
                     format!("wait for loader closure {}", record_path.display())
                 })?;
                 coordination.release_namespace_gate();
-                if let Some(closure) = read_pinned_closure_record(&record_path, key)? {
+                if let Some(closure) = read_pinned_closure_record(&record_path, key).unwrap_or(None)
+                {
                     return Ok(closure);
                 }
                 wait_for_successor = true;
@@ -6747,6 +6754,34 @@ mod tests {
         assert!(
             read_pinned_closure_record(&path, key).is_err(),
             "a decodable postcard payload must still fail its envelope checksum"
+        );
+    }
+
+    #[test]
+    fn corrupt_closure_record_is_rebuilt_under_its_builder_lock() {
+        let root = tempfile::tempdir().unwrap();
+        ensure_prepared_cache_dirs(root.path()).unwrap();
+        let binary_path = Path::new("/bin/true");
+        let binary = pin_input(root.path(), binary_path).unwrap();
+        let loader = PinnedLoaderInputs::pin(root.path()).unwrap();
+        let key = closure_recipe_key(&binary, binary_path, &loader);
+        let record_path = root
+            .path()
+            .join(PREPARED_CLOSURES_DIR)
+            .join(format!("{key:016x}.closure"));
+
+        let first = get_or_resolve_pinned_closure(root.path(), &binary, binary_path, &loader)
+            .expect("build initial loader closure");
+        std::fs::write(&record_path, b"truncated").unwrap();
+
+        let rebuilt = get_or_resolve_pinned_closure(root.path(), &binary, binary_path, &loader)
+            .expect("rebuild malformed loader closure");
+        assert_eq!(rebuilt.entries.len(), first.entries.len());
+        assert!(
+            read_pinned_closure_record(&record_path, key)
+                .unwrap()
+                .is_some(),
+            "the exclusive builder must atomically replace the malformed record"
         );
     }
 

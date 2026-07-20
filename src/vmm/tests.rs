@@ -267,12 +267,27 @@ fn spawn_interactive_relay_child(
 #[derive(Debug, Default)]
 struct InteractiveChildServiceSample {
     tasks: std::collections::BTreeMap<u32, (u64, u64)>,
-    runnable_tasks: usize,
+    serviceable_tasks: usize,
     runtime_started: bool,
 }
 
 fn interactive_runtime_thread(comm: &str) -> bool {
     comm.starts_with("vcpu-") || comm.starts_with("interactive-") || comm.starts_with("ktstr-exec-")
+}
+
+fn interactive_task_is_serviceable(stat: &[u8]) -> bool {
+    let Some(state) = stat
+        .windows(2)
+        .rposition(|window| window == b") ")
+        .and_then(|close| stat.get(close + 2))
+    else {
+        return false;
+    };
+    // A runnable task is waiting for host CPU service. An uninterruptible
+    // task is waiting for kernel I/O service and is equally incapable of
+    // responding to the relay until that service completes. Neither state
+    // proves a wedged userspace VMM.
+    matches!(state, b'R' | b'D')
 }
 
 fn interactive_child_service_sample(pid: u32) -> InteractiveChildServiceSample {
@@ -297,13 +312,10 @@ fn interactive_child_service_sample(pid: u32) -> InteractiveChildServiceSample {
                 sample.tasks.insert(tid, (cpu, delay));
             }
         }
-        if let Ok(stat) = std::fs::read_to_string(task_path.join("stat"))
-            && stat
-                .rfind(") ")
-                .and_then(|close| stat.as_bytes().get(close + 2))
-                == Some(&b'R')
+        if let Ok(stat) = std::fs::read(task_path.join("stat"))
+            && interactive_task_is_serviceable(&stat)
         {
-            sample.runnable_tasks += 1;
+            sample.serviceable_tasks += 1;
         }
     }
     sample
@@ -394,7 +406,7 @@ impl InteractiveChildWatchdog {
                 counters_changed |= cpu_ns != previous_cpu_ns || delay_ns != previous_delay_ns;
             }
         }
-        let made_progress = task_set_changed || counters_changed || current.runnable_tasks > 0;
+        let made_progress = task_set_changed || counters_changed || current.serviceable_tasks > 0;
         self.previous = current;
 
         if self.charged_cpu_ns >= self.cpu_budget.as_nanos() as u64 {
@@ -446,6 +458,18 @@ fn interactive_runtime_thread_recognizes_linux_truncated_names() {
     assert!(interactive_runtime_thread("interactive-kil"));
     assert!(interactive_runtime_thread("ktstr-exec-dead"));
     assert!(!interactive_runtime_thread("vmm::tests::boot"));
+}
+
+#[test]
+fn interactive_task_service_state_includes_uninterruptible_io() {
+    assert!(interactive_task_is_serviceable(b"123 (vmm worker) R 1 2 3"));
+    assert!(interactive_task_is_serviceable(
+        b"123 (vmm (worker)) D 1 2 3"
+    ));
+    assert!(!interactive_task_is_serviceable(
+        b"123 (vmm worker) S 1 2 3"
+    ));
+    assert!(!interactive_task_is_serviceable(b"malformed"));
 }
 
 #[test]
