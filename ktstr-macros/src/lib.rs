@@ -15,7 +15,7 @@ mod test_entry;
 
 /// Register a manually constructed `KtstrTestEntry`.
 ///
-/// This is the manual-entry counterpart to [`ktstr_test`]: it registers the
+/// This is the manual-entry counterpart to [`macro@ktstr_test`]: it registers the
 /// static in `KTSTR_TESTS` and emits the versioned ELF scheduler-manifest
 /// record consumed by `cargo ktstr`. Manual entries with staged schedulers
 /// should use `#[ktstr_test]`, whose attribute grammar can project every
