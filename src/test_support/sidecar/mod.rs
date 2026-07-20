@@ -1326,7 +1326,7 @@ pub(crate) fn format_kvm_stats(sidecars: &[SidecarResult]) -> String {
 /// (e.g. re-running the same suite without committing changes) reuse
 /// the same directory, with the second run pre-clearing any
 /// `*.ktstr.json` files left by the first via
-/// [`reset_run_dir_for_session`] — the directory is a last-writer-wins
+/// `reset_run_dir_for_session` — the directory is a last-writer-wins
 /// snapshot keyed on (kernel, project commit), not an append-only
 /// archive of every invocation.
 pub fn sidecar_dir() -> PathBuf {
