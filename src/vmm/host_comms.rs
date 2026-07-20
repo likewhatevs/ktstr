@@ -266,16 +266,20 @@ pub fn acknowledge_attach_finished(virtio_con: &Arc<PiMutex<VirtioConsole>>, gen
     virtio_con.lock().queue_input(&packet);
 }
 
-/// Notify the guest that the host's `bpf-map-write` thread finished
-/// applying every queued `bpf_map_write`. Pushes
-/// `SIGNAL_BPF_WRITE_DONE` through the virtio-console RX queue; the
-/// guest's `hvc0_poll_loop` recognises the byte and sets the
-/// `bpf_map_write_done` latch so a scenario blocked on
-/// [`crate::scenario::Ctx::wait_for_map_write`] resumes. Replaces the
-/// legacy SHM signal-slot rendezvous (host writes slot 0, guest blocks
-/// on slot 0) with a single wake byte.
-pub fn request_bpf_map_write_done(virtio_con: &Arc<PiMutex<VirtioConsole>>) {
-    virtio_con.lock().queue_input(&[SIGNAL_BPF_WRITE_DONE]);
+/// Notify the guest that the host's `bpf-map-write` thread finished applying
+/// every queued `bpf_map_write`.
+///
+/// The BPF-map writer acquires the console before mutating the live scheduler
+/// map and holds that guard through completion publication. This variant keeps
+/// the map mutation and its guest rendezvous indivisible with respect to vCPU
+/// console MMIO, so a scheduler crash caused by the mutation cannot overtake a
+/// second, post-mutation mutex acquisition. Pushes
+/// `SIGNAL_BPF_WRITE_DONE` through the virtio-console RX queue; the guest's
+/// `hvc0_poll_loop` recognises the byte and sets the `bpf_map_write_done` latch
+/// so a scenario blocked on [`crate::scenario::Ctx::wait_for_map_write`]
+/// resumes.
+pub(crate) fn request_bpf_map_write_done(virtio_con: &mut VirtioConsole) {
+    virtio_con.queue_input(&[SIGNAL_BPF_WRITE_DONE]);
 }
 
 /// Notify the guest that the freeze coordinator has adopted its

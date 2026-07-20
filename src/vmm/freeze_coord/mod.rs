@@ -19,7 +19,7 @@ use std::io::{Read, Seek};
 use std::os::fd::AsRawFd;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU16, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use vm_memory::{GuestAddress, GuestMemory};
@@ -535,6 +535,152 @@ fn wait_for_bpf_map_write_ready(
             tracing::warn!("BPF-map-write readiness poll reported an invalid eventfd");
             return false;
         }
+    }
+}
+
+const BPF_MAP_WRITE_CONSOLE_LOCK_POLL: Duration = Duration::from_millis(1);
+
+/// Apply a resolved BPF-map write batch and publish its guest completion edge
+/// as one transaction with respect to virtio-console MMIO.
+///
+/// A write such as `crash=1` can make the scheduler terminate immediately.
+/// Acquiring the console *after* that store lets VM teardown overtake the
+/// completion byte and strand this guest-memory-owning worker behind a console
+/// lock whose vCPU owner is itself exiting. Acquire first, then retain the
+/// guard through every store, the RX enqueue, and the delivery-state publish.
+/// A guest vCPU cannot reset or service the console between those operations.
+///
+/// Lock acquisition remains cooperatively cancellable: the writer may be
+/// waiting behind a healthy vCPU MMIO critical section when unrelated VM
+/// teardown starts. `try_lock` plus a bounded park lets the run's kill edge
+/// retire the worker without weakening the all-or-nothing write semantics. Once
+/// the guard is acquired and kill is rechecked, the small transaction runs to
+/// completion even if the write itself triggers teardown.
+fn commit_bpf_map_writes_and_notify(
+    virtio_con: &PiMutex<virtio_console::VirtioConsole>,
+    kill: &AtomicBool,
+    delivery: &AtomicU8,
+    apply_writes: impl FnOnce(),
+) -> bool {
+    let mut console = loop {
+        if kill.load(Ordering::Acquire) {
+            return false;
+        }
+        if let Some(console) = virtio_con.try_lock() {
+            break console;
+        }
+        std::thread::park_timeout(BPF_MAP_WRITE_CONSOLE_LOCK_POLL);
+    };
+    if kill.load(Ordering::Acquire) {
+        return false;
+    }
+
+    apply_writes();
+    host_comms::request_bpf_map_write_done(&mut console);
+    // Release pairs with the result snapshot after the writer join. Because
+    // the store occurs while the console guard is still held, a vCPU which
+    // consumes the completion byte can never race ahead of host-side delivery
+    // evidence.
+    delivery.store(2, Ordering::Release);
+    true
+}
+
+#[cfg(test)]
+mod bpf_map_write_transaction_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
+
+    #[test]
+    fn teardown_cannot_interpose_between_map_mutation_and_completion() {
+        let console = Arc::new(PiMutex::new(virtio_console::VirtioConsole::new()));
+        let kill = Arc::new(AtomicBool::new(false));
+        let delivery = Arc::new(AtomicU8::new(1));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let (mutated_tx, mutated_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let writer_console = Arc::clone(&console);
+        let writer_kill = Arc::clone(&kill);
+        let writer_delivery = Arc::clone(&delivery);
+        let writer_writes = Arc::clone(&writes);
+        let writer = std::thread::spawn(move || {
+            assert!(commit_bpf_map_writes_and_notify(
+                &writer_console,
+                &writer_kill,
+                &writer_delivery,
+                || {
+                    writer_writes.fetch_add(1, Ordering::Release);
+                    mutated_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            ));
+        });
+        mutated_rx.recv().unwrap();
+
+        // Models a teardown/reset owner reaching the same device immediately
+        // after the map mutation. The transaction already owns the console,
+        // so this observer can acquire only after the completion byte and the
+        // delivery state are both published.
+        let teardown_console = Arc::clone(&console);
+        let teardown_delivery = Arc::clone(&delivery);
+        let (teardown_started_tx, teardown_started_rx) = mpsc::channel();
+        let teardown = std::thread::spawn(move || {
+            teardown_started_tx.send(()).unwrap();
+            let console = teardown_console.lock();
+            (
+                console.pending_rx_bytes_for_test(),
+                teardown_delivery.load(Ordering::Acquire),
+            )
+        });
+        teardown_started_rx.recv().unwrap();
+        release_tx.send(()).unwrap();
+
+        writer.join().unwrap();
+        let (pending, observed_delivery) = teardown.join().unwrap();
+        assert_eq!(writes.load(Ordering::Acquire), 1);
+        assert_eq!(
+            pending,
+            vec![virtio_console::SIGNAL_BPF_WRITE_DONE],
+            "teardown observed the console only after completion publication"
+        );
+        assert_eq!(
+            observed_delivery, 2,
+            "teardown observed the synchronized delivery state"
+        );
+    }
+
+    #[test]
+    fn kill_cancels_contended_console_before_any_map_mutation() {
+        let console = Arc::new(PiMutex::new(virtio_console::VirtioConsole::new()));
+        let held = console.lock();
+        let kill = Arc::new(AtomicBool::new(false));
+        let delivery = Arc::new(AtomicU8::new(1));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let writer_console = Arc::clone(&console);
+        let writer_kill = Arc::clone(&kill);
+        let writer_delivery = Arc::clone(&delivery);
+        let writer_writes = Arc::clone(&writes);
+        let (started_tx, started_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            commit_bpf_map_writes_and_notify(
+                &writer_console,
+                &writer_kill,
+                &writer_delivery,
+                || {
+                    writer_writes.fetch_add(1, Ordering::Release);
+                },
+            )
+        });
+        started_rx.recv().unwrap();
+        kill.store(true, Ordering::Release);
+        writer.thread().unpark();
+
+        assert!(!writer.join().unwrap());
+        assert_eq!(writes.load(Ordering::Acquire), 0);
+        assert_eq!(delivery.load(Ordering::Acquire), 1);
+        assert!(held.pending_rx_bytes_for_test().is_empty());
     }
 }
 
@@ -3717,8 +3863,9 @@ mod accessor_init_thread_guard_tests {
 /// RAII guard that joins the vCPU / monitor / bpf-write / freeze-coordinator /
 /// watchdog threads [`KtstrVm::run_vm`] spawns BEFORE the `vm` local (and its
 /// `guest_mem` mmap) drops, on EVERY exit path. The normal Ok teardown
-/// consumes the watchdog/coordinator handles, then moves this still-armed owner
-/// into [`VmRunState`] with the AP/monitor/BPF handles. Any `?`, panic-unwind,
+/// consumes the watchdog/coordinator/BPF-writer handles, then moves this
+/// still-armed owner into [`VmRunState`] with the AP/monitor handles. Any `?`,
+/// panic-unwind,
 /// or abandoned handoff therefore triggers `Drop`. Without it, an early exit
 /// DETACHES those threads —
 /// they hold BARE raw pointers into `vm.guest_mem` (no `Arc`) and run `KVM_RUN`,
@@ -3794,8 +3941,10 @@ impl Drop for RunVmThreadGuard {
         // coordinator before their target threads so no logical kick or
         // guest-memory work survives run teardown. In-flight immediate-exit
         // accesses pin their mappings through transient Arcs; the ordering
-        // remains required for the broader lifecycle. Join the monitor next:
-        // its cached pthread CPU clock IDs remain valid only while APs live.
+        // remains required for the broader lifecycle. Join the BPF writer
+        // before any vCPU teardown: its terminal transaction may still own or
+        // acquire the console device. Join the monitor next; its cached
+        // pthread CPU clock IDs remain valid only while APs live.
         self.bsp_done.store(true, Ordering::Release);
         let _ = self.bsp_done_evt.write(1);
         super::publish_vm_kill(&self.kill, &self.kill_evt);
@@ -3825,14 +3974,14 @@ impl Drop for RunVmThreadGuard {
                 wall_deadline,
             );
         }
-        if let Some(h) = self.monitor.take() {
-            let _ = join_vm_worker_bounded(h, VmWorkerFamily::Monitor, &kill_wake, wall_deadline);
-        }
-        kick_and_join_ap_threads(std::mem::take(&mut self.ap_threads));
         if let Some(h) = self.bpf_write.take() {
             let _ =
                 join_vm_worker_bounded(h, VmWorkerFamily::BpfMapWriter, &kill_wake, wall_deadline);
         }
+        if let Some(h) = self.monitor.take() {
+            let _ = join_vm_worker_bounded(h, VmWorkerFamily::Monitor, &kill_wake, wall_deadline);
+        }
+        kick_and_join_ap_threads(std::mem::take(&mut self.ap_threads));
     }
 }
 
@@ -15569,8 +15718,8 @@ impl KtstrVm {
         // memory-safe and are stopped immediately after the coordinator joins.
         // Sample cleanup start at the earliest moment after BSP exit so
         // every host-side teardown step lands inside the window, in
-        // execution order: watchdog + coordinator joins, monitor join, AP
-        // joins, BPF writer join, bulk drain, exit-code and
+        // execution order: watchdog + coordinator joins, BPF writer join,
+        // monitor join, AP joins, bulk drain, exit-code and
         // crash-message extraction, and verifier-stat read (the rest
         // run inside `collect_results`). `collect_results` reads
         // `Instant::now()` at the end and the difference becomes
@@ -15638,10 +15787,11 @@ impl KtstrVm {
             }
         }
 
-        // Consume only the two control workers which must finish before the
-        // post-run guest-memory reads below. AP, monitor, and BPF-writer
-        // handles remain inside the armed guard throughout those reads; a
-        // panic therefore cannot detach a guest-memory reader.
+        // Consume the two control workers which must finish before the
+        // post-run guest-memory reads below. The BPF writer is consumed just
+        // after their clean-drain edge and before those reads; AP and monitor
+        // handles remain inside the armed guard throughout, so a panic cannot
+        // detach a guest-memory reader.
         let worker_wall_deadline = guard
             .worker_wall_deadline
             .expect("cleanup boundary arms one worker wall deadline");
@@ -15696,10 +15846,27 @@ impl KtstrVm {
             );
         }
         // The coordinator has completed every guest-memory dispatch and
-        // joined its nested accessor worker. Now stop the monitor and BPF map
-        // writer promptly; their later bounded joins retain ownership until
-        // each handle is observably finished.
+        // joined its nested accessor worker. Stop the monitor and BPF map
+        // writer now. The writer is joined immediately, before any post-run
+        // guest-memory reads or vCPU teardown: its terminal map-write +
+        // virtio-console completion transaction must finish while the device
+        // and every possible vCPU lock owner are still structurally live.
         super::publish_vm_kill(&kill, &kill_evt);
+        let kill_worker_wake = VmWorkerWake {
+            kill: Some((kill.as_ref(), kill_evt.as_ref())),
+            bsp_done: None,
+        };
+        if let Some(h) = guard.bpf_write.take() {
+            let _ = join_vm_worker_bounded(
+                h,
+                VmWorkerFamily::BpfMapWriter,
+                &kill_worker_wake,
+                worker_wall_deadline,
+            );
+        }
+        if crate::vmm::debug_logging_enabled() {
+            eprintln!("CLEANUP: bpf_write joined");
+        }
         let framework_error = cast_analysis_error
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -15797,6 +15964,9 @@ impl KtstrVm {
         // moves; `run_threads` is declared before `vm`, so dropping a completed
         // VmRunState also joins guest-memory readers before unmapping memory.
         let watchdog_kill_reason_raw = watchdog_kill_reason.load(Ordering::Acquire);
+        // The BPF writer joined above, so this load is its synchronized final
+        // delivery state rather than a pre-join snapshot which could report
+        // `Some(false)` after the transaction had actually completed.
         let bpf_map_write_delivery_raw = bpf_map_write_delivery.load(Ordering::Acquire);
         let periodic_prereqs_ready_ns_raw = periodic_prereqs_ready_at.load(Ordering::Acquire);
         let periodic_window_end_ns_raw = periodic_window_end_at.load(Ordering::Acquire);
@@ -17572,53 +17742,91 @@ impl KtstrVm {
                         .join(", "),
                 );
 
-                for (params, map_info, offset, width) in &resolved {
-                    // `write_value_u32` is a fixed 4-byte store; a field of a
-                    // different width would truncate or clobber adjacent bytes.
-                    // crash/stall are `volatile int` (4 bytes) — skip loudly
-                    // rather than silently mis-write any non-4-byte field (the
-                    // `BpfMapWrite` value is a `u32`). NOTE: a skipped write
-                    // still lets `request_bpf_map_write_done` fire below
-                    // (signalling the guest all writes completed). This
-                    // asymmetry vs phase 2's all-or-nothing resolution abort
-                    // is deliberate: phase 2 aborts BEFORE signalling because
-                    // it cannot proceed, whereas here the map/field DID
-                    // resolve — withholding the signal would hang the guest in
-                    // `wait_for_map_write` with no recovery, so a loud skip +
-                    // a completed handshake is preferred. Unreachable for the
-                    // 4-byte crash/stall fields today; the eprintln surfaces
-                    // it if a future non-4-byte field is queued.
+                // Acquire the console before the first mutation and hold it
+                // through completion publication. A crash/stall store can
+                // terminate the scheduler immediately; acquiring the console
+                // afterward let VM teardown overtake this writer and strand it
+                // behind a departing vCPU's device critical section. The
+                // cancellable acquisition preserves the all-or-nothing
+                // contract: teardown before ownership means zero writes;
+                // ownership means the entire write + notification transaction
+                // completes even if the first store triggers teardown.
+                let mut write_outcomes = vec![None; resolved.len()];
+                let committed = commit_bpf_map_writes_and_notify(
+                    &virtio_con,
+                    &kill_clone,
+                    &delivery,
+                    || {
+                        for ((params, map_info, offset, width), outcome) in
+                            resolved.iter().zip(&mut write_outcomes)
+                        {
+                            // `write_value_u32` is a fixed 4-byte store; a
+                            // field of a different width would truncate or
+                            // clobber adjacent bytes. crash/stall are
+                            // `volatile int` (4 bytes) — skip loudly rather
+                            // than silently mis-write any non-4-byte field
+                            // (the `BpfMapWrite` value is a `u32`). NOTE: a
+                            // skipped write still lets the completion edge
+                            // fire (signalling that every applicable write
+                            // completed). This asymmetry vs phase 2's
+                            // all-or-nothing resolution abort is deliberate:
+                            // phase 2 aborts BEFORE signalling because it
+                            // cannot proceed, whereas here the map/field DID
+                            // resolve — withholding the signal would hang the
+                            // guest in `wait_for_map_write` with no recovery,
+                            // so a loud skip + completed handshake is
+                            // preferred. Unreachable for the 4-byte
+                            // crash/stall fields today; the eprintln surfaces
+                            // it if a future non-4-byte field is queued.
+                            if *width != 4 {
+                                continue;
+                            }
+                            let before = accessor.read_value_u32(map_info, *offset);
+                            let ok =
+                                accessor.write_value_u32(map_info, *offset, params.value);
+                            let after = accessor.read_value_u32(map_info, *offset);
+                            *outcome = Some((before, ok, after));
+                        }
+                    },
+                );
+                if !committed {
+                    eprintln!(
+                        "bpf_map_write: VM exited before the atomic write/completion transaction"
+                    );
+                    return;
+                }
+                // Keep formatting and stderr I/O outside the console critical
+                // section. A captured-output pipe must never lengthen the
+                // device transaction which excludes vCPU console MMIO.
+                for ((params, map_info, offset, width), outcome) in
+                    resolved.iter().zip(&write_outcomes)
+                {
                     if *width != 4 {
                         eprintln!(
                             "bpf_map_write: field '{}' width {} != 4 in map '{}' — skipping (value is u32)",
-                            params.field, width, map_info.name(),
+                            params.field,
+                            width,
+                            map_info.name(),
                         );
-                        continue;
+                    } else if let Some((before, ok, after)) = outcome {
+                        eprintln!(
+                            "bpf_map_write: map '{}' field '{}' off={} write={} (value={} before={:?} after={:?})",
+                            map_info.name(),
+                            params.field,
+                            offset,
+                            ok,
+                            params.value,
+                            before,
+                            after,
+                        );
                     }
-                    let before = accessor.read_value_u32(map_info, *offset);
-                    let ok = accessor.write_value_u32(map_info, *offset, params.value);
-                    let after = accessor.read_value_u32(map_info, *offset);
-                    eprintln!(
-                        "bpf_map_write: map '{}' field '{}' off={} write={} (value={} before={:?} after={:?})",
-                        map_info.name(), params.field, offset, ok, params.value, before, after,
-                    );
                 }
-
-                // Notify the guest that every queued write landed by
-                // pushing `SIGNAL_BPF_WRITE_DONE` into virtio-console
-                // RX. The guest's `hvc0_poll_loop` blocks on
-                // `/dev/hvc0`, recognises the byte, and sets the
-                // `bpf_map_write_done` latch. A scenario blocked on
-                // [`crate::scenario::Ctx::wait_for_map_write`] resumes
-                // when the latch fires. Replaces the legacy SHM signal
-                // slot 0 notification.
-                super::host_comms::request_bpf_map_write_done(&virtio_con);
-                // Delivery evidence: every queued write landed and the guest
-                // was signalled. The neg_* starvation gates read the decoded
+                // Delivery evidence is published inside the transaction after
+                // every queued write and the console completion byte. The
+                // neg_* starvation gates read the decoded
                 // `VmResult::bpf_map_writes_delivered` — `Some(true)` here
-                // means an absent expected-crash is a REAL detection failure,
+                // means an absent expected crash is a real detection failure,
                 // never an injection no-show.
-                delivery.store(2, Ordering::Release);
                 let _ = (&kill_clone, &probes_ready_evt, &mem);
             })
             .context("spawn bpf-map-write thread")?;
@@ -18152,6 +18360,18 @@ impl KtstrVm {
             kill: Some((worker_kill.as_ref(), worker_kill_evt.as_ref())),
             bsp_done: None,
         };
+        // Normal run_vm teardown joins this writer before constructing
+        // VmRunState. Keep the fallback here for structural robustness, but
+        // preserve the same lifetime rule: a writer which may own the console
+        // must finish before monitor/AP teardown can retire device lock owners.
+        if let Some(h) = run.run_threads.bpf_write.take() {
+            let _ = join_vm_worker_bounded(
+                h,
+                VmWorkerFamily::BpfMapWriter,
+                &worker_wake,
+                worker_wall_deadline,
+            );
+        }
         // The monitor owns CPU clock IDs derived from the AP pthread handles.
         // Join it while every AP is still alive; `kill_evt` above wakes its
         // epoll loop promptly, so this does not wait for the sample cadence.
@@ -18254,19 +18474,6 @@ impl KtstrVm {
             }
             None => (None, BulkDrainResult::default(), Vec::new()),
         };
-        let cleanup_t = std::time::Instant::now();
-
-        if let Some(h) = run.run_threads.bpf_write.take() {
-            let _ = join_vm_worker_bounded(
-                h,
-                VmWorkerFamily::BpfMapWriter,
-                &worker_wake,
-                worker_wall_deadline,
-            );
-        }
-        if crate::vmm::debug_logging_enabled() {
-            eprintln!("CLEANUP: bpf_write joined {:?}", cleanup_t.elapsed());
-        }
         // AP exit drops the last vCPU/device clones, including the
         // virtio-blk worker owner; monitor and BPF helpers are now joined too.
         // Release exact topology admission at this lifecycle boundary so the
@@ -18493,9 +18700,9 @@ impl KtstrVm {
         // Sample cleanup elapsed AFTER every blocking step that runs on
         // the post-BSP-exit critical path so the duration captures the
         // full host-side teardown cost, not a partial window. The full
-        // ordered set is: watchdog + coordinator joins (in `run_vm`, before
-        // `cleanup_start` is stored on `VmRunState`), monitor join, AP joins,
-        // BPF writer join, bulk drain, exit-code and crash-message
+        // ordered set is: watchdog + coordinator + BPF-writer joins (in
+        // `run_vm`, before `cleanup_start` is stored on `VmRunState`), monitor
+        // join, AP joins, bulk drain, exit-code and crash-message
         // extraction, verifier-stat read. Captured before constructing
         // the result so the `Instant::now()` here is the latest possible
         // read.
@@ -18514,7 +18721,10 @@ impl KtstrVm {
             "auto_repro: collect_results",
         );
         if crate::vmm::debug_logging_enabled() {
-            eprintln!("CLEANUP: collect_results done {:?}", cleanup_t.elapsed());
+            eprintln!(
+                "CLEANUP: collect_results done {:?}",
+                collect_results_start.elapsed()
+            );
         }
 
         // Forward the scheduler-stats client. `run.stats_client` is
