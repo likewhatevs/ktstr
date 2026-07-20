@@ -1351,6 +1351,11 @@ pub(crate) fn ticket_blocked_at_current_serial_for_tests(pid: u32) -> Result<boo
 }
 
 #[cfg(test)]
+pub(crate) fn ticket_is_waiting_for_tests(pid: u32) -> Result<bool> {
+    registry::ticket_is_waiting_for_tests(pid)
+}
+
+#[cfg(test)]
 pub(crate) fn coordinator_liveness_probe_for_tests() -> Result<((u64, u64), bool)> {
     registry::coordinator_liveness_probe_for_tests()
 }

@@ -30,64 +30,348 @@ impl Drop for InterruptibleFlockBrokerGuard {
 }
 
 fn wait_for_broker_signal_after(previous: usize) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while crate::flock::primitives::interruptible_flock_broker_signal_count() <= previous
-        && std::time::Instant::now() < deadline
-    {
+    let broker_tid = loop {
+        let tid = crate::flock::primitives::interruptible_flock_broker_tid();
+        if tid != 0 {
+            break tid;
+        }
+        // An unpublished TID means the newly spawned broker has not executed
+        // its first instruction yet, so no delivered service can be charged.
         std::thread::yield_now();
-    }
-    assert!(
-        crate::flock::primitives::interruptible_flock_broker_signal_count() > previous,
-        "eventfd broker must deliver a targeted RT wake",
-    );
+    };
+    let service = TestTaskService::thread(std::process::id(), broker_tid);
+    wait_with_task_service(
+        "eventfd broker targeted RT wake",
+        std::slice::from_ref(&service),
+        || {
+            Ok(
+                (crate::flock::primitives::interruptible_flock_broker_signal_count() > previous)
+                    .then_some(()),
+            )
+        },
+    )
+    .expect("eventfd broker must deliver a targeted RT wake");
 }
 
 fn cancel_registry_worker(cancelled: &std::sync::atomic::AtomicBool) {
-    cancelled.store(true, std::sync::atomic::Ordering::Release);
     let waiter = crate::flock::interruptible_flock_waiter_id();
+    // Capture the generation before publishing cancellation. The waiter may
+    // observe the flag and unregister immediately; loading afterward would
+    // then skip the eventfd write while callers still expect the broker
+    // handoff they deliberately requested.
+    cancelled.store(true, std::sync::atomic::Ordering::Release);
     if waiter != 0 {
         crate::flock::wake_interruptible_flock_waiter(waiter);
     }
 }
 
-/// Wait for one deterministic test handshake without charging time in which
-/// the host scheduler did not run this test.
-///
-/// These protocol tests intentionally run in the ordinary host-test pool while
-/// several CI jobs share one machine. A fixed wall deadline therefore tests
-/// host scheduling latency rather than the protocol transition. The waiter
-/// spins cooperatively and consumes a budget from its own
-/// `CLOCK_THREAD_CPUTIME_ID`: a starved test keeps waiting, while a real missing
-/// transition fails after the observer itself received ample CPU service.
-fn wait_with_delivered_service<T>(
-    context: &str,
-    mut observe: impl FnMut() -> anyhow::Result<Option<T>>,
-) -> anyhow::Result<T> {
-    const SERVICE_BUDGET_NS: u64 = 1_000_000_000;
+const TEST_TRANSITION_SERVICE_BUDGET_NS: u64 = 1_000_000_000;
+// Cross-process protocol transitions may deliberately wait through the
+// 3-second waiter-crash recovery period plus its sub-second PID stagger.
+// Charge the observer only after every live helper is blocked, and allow that
+// one real semantic timer to expire before diagnosing an all-actor deadlock.
+const TEST_EXTERNAL_BLOCKED_SERVICE_BUDGET_NS: u64 = 5_000_000_000;
 
-    fn thread_cpu_time_ns() -> anyhow::Result<u64> {
-        let mut timestamp = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: `timestamp` is a valid out-pointer and `clock_gettime` writes
-        // exactly one `timespec`.
-        if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut timestamp) } != 0 {
-            anyhow::bail!(
-                "read protocol-test thread CPU clock: {}",
-                std::io::Error::last_os_error(),
-            );
-        }
-        anyhow::ensure!(
-            timestamp.tv_sec >= 0 && timestamp.tv_nsec >= 0,
-            "protocol-test thread CPU clock returned a negative timestamp",
+fn protocol_test_thread_cpu_time_ns() -> anyhow::Result<u64> {
+    let mut timestamp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `timestamp` is a valid out-pointer and `clock_gettime` writes
+    // exactly one `timespec`.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut timestamp) } != 0 {
+        anyhow::bail!(
+            "read protocol-test thread CPU clock: {}",
+            std::io::Error::last_os_error(),
         );
-        Ok((timestamp.tv_sec as u64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add(timestamp.tv_nsec as u64))
+    }
+    anyhow::ensure!(
+        timestamp.tv_sec >= 0 && timestamp.tv_nsec >= 0,
+        "protocol-test thread CPU clock returned a negative timestamp",
+    );
+    Ok((timestamp.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(timestamp.tv_nsec as u64))
+}
+
+#[derive(Clone)]
+enum TestTaskService {
+    Process {
+        pid: u32,
+    },
+    HelperThread {
+        pid: u32,
+        tid_path: std::path::PathBuf,
+    },
+    Thread {
+        pid: u32,
+        tid: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    },
+}
+
+impl TestTaskService {
+    fn process(pid: u32) -> Self {
+        Self::Process { pid }
     }
 
-    let started = thread_cpu_time_ns()?;
+    fn helper_thread(pid: u32, tid_path: std::path::PathBuf) -> Self {
+        Self::HelperThread { pid, tid_path }
+    }
+
+    fn thread(pid: u32, tid: u32) -> Self {
+        Self::Thread {
+            pid,
+            tid: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(tid)),
+        }
+    }
+
+    fn published_thread() -> Self {
+        Self::Thread {
+            pid: std::process::id(),
+            tid: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        }
+    }
+
+    fn publish_current_thread(&self) {
+        // SAFETY: `SYS_gettid` has no pointer arguments and cannot violate
+        // memory safety.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+        assert!(tid > 0 && tid <= u32::MAX as libc::c_long);
+        let Self::Thread { tid: published, .. } = self else {
+            panic!("only a thread service source can publish its current TID");
+        };
+        published.store(tid as u32, std::sync::atomic::Ordering::Release);
+    }
+}
+
+struct TestServiceThread<T> {
+    handle: std::thread::JoinHandle<T>,
+    service: TestTaskService,
+}
+
+impl<T: Send + 'static> TestServiceThread<T> {
+    fn spawn(run: impl FnOnce() -> T + Send + 'static) -> Self {
+        let service = TestTaskService::published_thread();
+        let worker_service = service.clone();
+        let handle = std::thread::spawn(move || {
+            worker_service.publish_current_thread();
+            run()
+        });
+        Self { handle, service }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    fn join(self) -> std::thread::Result<T> {
+        self.handle.join()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TestTaskServiceSample {
+    cpu_ns: u64,
+    run_delay_ns: u64,
+    state: u8,
+}
+
+fn test_task_sample(pid: u32, tid: u32) -> Option<TestTaskServiceSample> {
+    let task = format!("/proc/{pid}/task/{tid}");
+    let schedstat = std::fs::read_to_string(format!("{task}/schedstat")).ok()?;
+    let mut fields = schedstat.split_whitespace();
+    let cpu_ns = fields.next()?.parse().ok()?;
+    let run_delay_ns = fields.next()?.parse().ok()?;
+    let stat = std::fs::read_to_string(format!("{task}/stat")).ok()?;
+    let state = stat
+        .rfind(") ")
+        .and_then(|close| stat.as_bytes().get(close + 2))
+        .copied()?;
+    Some(TestTaskServiceSample {
+        cpu_ns,
+        run_delay_ns,
+        state,
+    })
+}
+
+fn process_has_schedulable_task(pid: u32) -> bool {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return false;
+    };
+    tasks.flatten().any(|task| {
+        let Ok(tid) = task.file_name().to_string_lossy().parse::<u32>() else {
+            return false;
+        };
+        test_task_sample(pid, tid).is_some_and(|sample| matches!(sample.state, b'R' | b'D'))
+    })
+}
+
+#[derive(Default)]
+struct TestTaskServiceSnapshot {
+    pending: bool,
+    tasks: std::collections::BTreeMap<(u32, u32), TestTaskServiceSample>,
+}
+
+impl TestTaskService {
+    fn snapshot(&self) -> TestTaskServiceSnapshot {
+        match self {
+            Self::Process { pid } => {
+                let mut snapshot = TestTaskServiceSnapshot::default();
+                let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+                    return snapshot;
+                };
+                for task in tasks.flatten() {
+                    let Ok(tid) = task.file_name().to_string_lossy().parse::<u32>() else {
+                        continue;
+                    };
+                    if let Some(sample) = test_task_sample(*pid, tid) {
+                        snapshot.tasks.insert((*pid, tid), sample);
+                    }
+                }
+                snapshot
+            }
+            Self::HelperThread { pid, tid_path } => {
+                let Some(tid) = std::fs::read_to_string(tid_path)
+                    .ok()
+                    .and_then(|tid| tid.trim().parse::<u32>().ok())
+                else {
+                    // The libtest worker has not entered the ignored helper
+                    // test yet. Track whether any startup task is actually
+                    // schedulable, but charge none of the harness process's
+                    // unrelated startup service. If startup itself deadlocks,
+                    // the observer budget still diagnoses it.
+                    return TestTaskServiceSnapshot {
+                        pending: process_has_schedulable_task(*pid),
+                        ..TestTaskServiceSnapshot::default()
+                    };
+                };
+                let mut snapshot = TestTaskServiceSnapshot::default();
+                if let Some(sample) = test_task_sample(*pid, tid) {
+                    snapshot.tasks.insert((*pid, tid), sample);
+                }
+                snapshot
+            }
+            Self::Thread { pid, tid } => {
+                let tid = tid.load(std::sync::atomic::Ordering::Acquire);
+                if tid == 0 {
+                    return TestTaskServiceSnapshot {
+                        pending: true,
+                        ..TestTaskServiceSnapshot::default()
+                    };
+                }
+                let mut snapshot = TestTaskServiceSnapshot::default();
+                if let Some(sample) = test_task_sample(*pid, tid) {
+                    snapshot.tasks.insert((*pid, tid), sample);
+                }
+                snapshot
+            }
+        }
+    }
+}
+
+struct TestTaskServiceWatchdog {
+    sources: Vec<TestTaskService>,
+    previous: Vec<TestTaskServiceSnapshot>,
+    charged_cpu_ns: u64,
+    blocked_observer_started_ns: u64,
+    blocked_observer_budget_ns: u64,
+}
+
+impl TestTaskServiceWatchdog {
+    fn new(sources: &[TestTaskService], blocked_observer_budget_ns: u64) -> anyhow::Result<Self> {
+        let sources = sources.to_vec();
+        let previous = sources.iter().map(TestTaskService::snapshot).collect();
+        Ok(Self {
+            sources,
+            previous,
+            charged_cpu_ns: 0,
+            blocked_observer_started_ns: protocol_test_thread_cpu_time_ns()?,
+            blocked_observer_budget_ns,
+        })
+    }
+
+    fn poll(&mut self, context: &str) -> anyhow::Result<()> {
+        let observer_now = protocol_test_thread_cpu_time_ns()?;
+        let mut any_runnable = false;
+        let mut made_progress = false;
+
+        for (index, source) in self.sources.iter().enumerate() {
+            let current = source.snapshot();
+            any_runnable |=
+                current.pending || current.tasks.values().any(|sample| sample.state == b'R');
+            made_progress |= current.pending != self.previous[index].pending
+                || !current.tasks.keys().eq(self.previous[index].tasks.keys());
+            for (task, sample) in &current.tasks {
+                if let Some(previous) = self.previous[index].tasks.get(task) {
+                    self.charged_cpu_ns = self
+                        .charged_cpu_ns
+                        .saturating_add(sample.cpu_ns.saturating_sub(previous.cpu_ns));
+                    made_progress |= sample.cpu_ns != previous.cpu_ns
+                        || sample.run_delay_ns != previous.run_delay_ns;
+                } else {
+                    made_progress = true;
+                }
+            }
+            self.previous[index] = current;
+        }
+
+        anyhow::ensure!(
+            self.charged_cpu_ns <= TEST_TRANSITION_SERVICE_BUDGET_NS,
+            "{context} did not complete after its producer tasks received {}ns \
+             of CPU service",
+            self.charged_cpu_ns,
+        );
+
+        if any_runnable || made_progress {
+            self.blocked_observer_started_ns = observer_now;
+        } else {
+            let blocked_observer_service =
+                observer_now.saturating_sub(self.blocked_observer_started_ns);
+            anyhow::ensure!(
+                blocked_observer_service <= self.blocked_observer_budget_ns,
+                "{context} made no producer-task progress after every producer \
+                 blocked and the observer received {blocked_observer_service}ns \
+                 of CPU service",
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Wait for one deterministic test handshake without charging host time in
+/// which the task responsible for the transition did not run.
+///
+/// A runnable-but-starved producer consumes neither its CPU-service budget nor
+/// the observer's blocked-state budget. Once every producer is blocked, the
+/// observer's own delivered service bounds a genuinely missing transition.
+fn wait_with_task_service<T>(
+    context: &str,
+    sources: &[TestTaskService],
+    observe: impl FnMut() -> anyhow::Result<Option<T>>,
+) -> anyhow::Result<T> {
+    wait_with_task_service_config(context, sources, TEST_TRANSITION_SERVICE_BUDGET_NS, observe)
+}
+
+fn wait_with_external_task_service<T>(
+    context: &str,
+    sources: &[TestTaskService],
+    observe: impl FnMut() -> anyhow::Result<Option<T>>,
+) -> anyhow::Result<T> {
+    wait_with_task_service_config(
+        context,
+        sources,
+        TEST_EXTERNAL_BLOCKED_SERVICE_BUDGET_NS,
+        observe,
+    )
+}
+
+fn wait_with_task_service_config<T>(
+    context: &str,
+    sources: &[TestTaskService],
+    blocked_observer_budget_ns: u64,
+    mut observe: impl FnMut() -> anyhow::Result<Option<T>>,
+) -> anyhow::Result<T> {
+    let mut watchdog = TestTaskServiceWatchdog::new(sources, blocked_observer_budget_ns)?;
     let mut polls = 0usize;
     loop {
         if let Some(value) = observe()? {
@@ -96,27 +380,38 @@ fn wait_with_delivered_service<T>(
         std::thread::yield_now();
         polls = polls.wrapping_add(1);
         if polls.is_multiple_of(64) {
-            let consumed = thread_cpu_time_ns()?.saturating_sub(started);
-            anyhow::ensure!(
-                consumed <= SERVICE_BUDGET_NS,
-                "{context} did not complete after the waiting test thread received \
-                 {consumed}ns of CPU service",
-            );
+            watchdog.poll(context)?;
         }
     }
 }
 
-fn recv_with_delivered_service<T>(
+fn wait_with_delivered_service<T>(
+    context: &str,
+    observe: impl FnMut() -> anyhow::Result<Option<T>>,
+) -> anyhow::Result<T> {
+    wait_with_task_service(context, &[], observe)
+}
+
+fn recv_with_task_service<T>(
     receiver: &std::sync::mpsc::Receiver<T>,
     context: &str,
+    sources: &[TestTaskService],
 ) -> anyhow::Result<T> {
-    wait_with_delivered_service(context, || match receiver.try_recv() {
+    wait_with_task_service(context, sources, || match receiver.try_recv() {
         Ok(value) => Ok(Some(value)),
         Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
             anyhow::bail!("{context} channel disconnected before publishing")
         }
     })
+}
+
+fn recv_from_service_thread<T, U>(
+    receiver: &std::sync::mpsc::Receiver<T>,
+    context: &str,
+    worker: &TestServiceThread<U>,
+) -> anyhow::Result<T> {
+    recv_with_task_service(receiver, context, std::slice::from_ref(&worker.service))
 }
 
 /// EMPIRICAL verification of the inotify wake contract the coordinator
@@ -1152,7 +1447,7 @@ fn ordinary_state_reads_overlap_registry_shared_readers() {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let (go_tx, go_rx) = mpsc::sync_channel(1);
     let (result_tx, result_rx) = mpsc::sync_channel(1);
-    let reader = std::thread::spawn(move || {
+    let reader = TestServiceThread::spawn(move || {
         LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
         CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
         let claim = protocol::ClaimSet::new(
@@ -1181,13 +1476,13 @@ fn ordinary_state_reads_overlap_registry_shared_readers() {
             .expect("report overlapping state read");
         drop(coordinator);
     });
-    recv_with_delivered_service(&ready_rx, "coordinator registration")
+    recv_from_service_thread(&ready_rx, "coordinator registration", &reader)
         .expect("coordinator registration must complete");
     let held_reader =
         protocol::hold_registry_shared_for_tests().expect("hold first registry SH reader");
     go_tx.send(()).expect("start overlapping state read");
     let (result, delta) =
-        recv_with_delivered_service(&result_rx, "overlapping SH registry state read")
+        recv_from_service_thread(&result_rx, "overlapping SH registry state read", &reader)
             .expect("a second SH state read must not serialize behind the first");
     result.expect("read coordinator state through readonly mapping");
     assert_eq!(
@@ -1226,7 +1521,7 @@ fn targeted_broker_wake_cancels_one_registry_waiter() {
     let worker_cancelled = Arc::clone(&cancelled);
     let worker_claim = claim.clone();
     let (result_tx, result_rx) = mpsc::sync_channel(1);
-    let waiter = std::thread::spawn(move || {
+    let waiter = TestServiceThread::spawn(move || {
         LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = llc_prefix);
         CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = cpu_prefix);
         let result = protocol::register_ticket_or_acquire(
@@ -1239,23 +1534,22 @@ fn targeted_broker_wake_cancels_one_registry_waiter() {
         result_tx.send(result).expect("report waiter result");
     });
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    let waiter_id = loop {
-        let id = crate::flock::interruptible_flock_waiter_id();
-        if id != 0 {
-            break id;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "registry futex waiter did not publish its cancellation generation"
-        );
-        std::thread::yield_now();
-    };
+    let waiter_id = wait_with_task_service(
+        "registry futex cancellation-generation publication",
+        std::slice::from_ref(&waiter.service),
+        || {
+            let id = crate::flock::interruptible_flock_waiter_id();
+            Ok((id != 0).then_some(id))
+        },
+    )
+    .expect("registry futex waiter must publish its cancellation generation");
     cancelled.store(true, Ordering::Release);
+    let signal_count = crate::flock::primitives::interruptible_flock_broker_signal_count();
     crate::flock::wake_interruptible_flock_waiter(waiter_id);
-    let result = result_rx
-        .recv_timeout(std::time::Duration::from_secs(2))
-        .expect("targeted wake must cancel the registry wait");
+    wait_for_broker_signal_after(signal_count);
+    let result =
+        recv_from_service_thread(&result_rx, "targeted registry-wait cancellation", &waiter)
+            .expect("targeted wake must cancel the registry wait");
     assert!(
         result
             .expect_err("cancelled registry wait must not acquire")
@@ -1284,7 +1578,7 @@ fn stale_broker_generation_cannot_interrupt_the_next_registration() {
     let (advance_tx, advance_rx) = mpsc::sync_channel(1);
     let (second_id_tx, second_id_rx) = mpsc::sync_channel(1);
     let (poll_tx, poll_rx) = mpsc::sync_channel(1);
-    let worker = std::thread::spawn(move || {
+    let worker = TestServiceThread::spawn(move || {
         LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = llc_prefix);
         CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = cpu_prefix);
 
@@ -1336,23 +1630,20 @@ fn stale_broker_generation_cannot_interrupt_the_next_registration() {
         drop(second);
     });
 
-    let first_id = first_id_rx
-        .recv_timeout(std::time::Duration::from_secs(2))
+    let first_id = recv_from_service_thread(&first_id_rx, "first waiter generation", &worker)
         .expect("first generation");
     let signal_count = crate::flock::primitives::interruptible_flock_broker_signal_count();
     crate::flock::wake_interruptible_flock_waiter(first_id);
     wait_for_broker_signal_after(signal_count);
     advance_tx.send(()).expect("advance worker");
-    let second_id = second_id_rx
-        .recv_timeout(std::time::Duration::from_secs(2))
+    let second_id = recv_from_service_thread(&second_id_rx, "second waiter generation", &worker)
         .expect("second generation");
     assert_ne!(
         first_id, second_id,
         "successive registrations need distinct generations"
     );
     assert!(
-        poll_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
+        recv_from_service_thread(&poll_rx, "second-generation bounded poll", &worker)
             .expect("second generation poll")
             .is_ok(),
         "an old broker retry must not interrupt a later registration",
@@ -1367,7 +1658,7 @@ fn interruptible_broker_stops_during_retry_and_restarts() {
     let _broker = InterruptibleFlockBrokerGuard::start();
     let (id_tx, id_rx) = mpsc::sync_channel(1);
     let (release_tx, release_rx) = mpsc::sync_channel(1);
-    let worker = std::thread::spawn(move || {
+    let worker = TestServiceThread::spawn(move || {
         let registration =
             crate::flock::InterruptibleFlockWaiter::register().expect("live registration");
         id_tx
@@ -1376,8 +1667,7 @@ fn interruptible_broker_stops_during_retry_and_restarts() {
         release_rx.recv().expect("release registration");
         drop(registration);
     });
-    let waiter_id = id_rx
-        .recv_timeout(std::time::Duration::from_secs(2))
+    let waiter_id = recv_from_service_thread(&id_rx, "live waiter generation", &worker)
         .expect("live registration generation");
     let signal_count = crate::flock::primitives::interruptible_flock_broker_signal_count();
     crate::flock::wake_interruptible_flock_waiter(waiter_id);
@@ -1411,7 +1701,7 @@ fn default_exact_is_best_effort_and_shared_fallbacks_overlap() {
     let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
     let first_host = host.clone();
     let (first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
-    let first_worker = std::thread::spawn(move || {
+    let first_worker = TestServiceThread::spawn(move || {
         LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
         CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
         ALLOWED_CPUS_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(vec![0, 1]));
@@ -1419,9 +1709,13 @@ fn default_exact_is_best_effort_and_shared_fallbacks_overlap() {
             crate::vmm::KtstrVm::acquire_default_run_locks(Some(&first_host), &topo, false);
         let _ = first_tx.send(result);
     });
-    let first = recv_with_delivered_service(&first_rx, "non-waiting default shared fallback")
-        .expect("default fallback worker must publish")
-        .expect("SH peers permit immediate shared fallback");
+    let first = recv_from_service_thread(
+        &first_rx,
+        "non-waiting default shared fallback",
+        &first_worker,
+    )
+    .expect("default fallback worker must publish")
+    .expect("SH peers permit immediate shared fallback");
     first_worker.join().expect("default fallback worker");
     let mut first_mask = first
         .shared_cpu_mask
@@ -1520,7 +1814,7 @@ fn default_conversion_fence_never_coexists_with_performance_ex() {
     let (release_default_tx, release_default_rx) = mpsc::sync_channel(0);
     let default_llc_prefix = llc_prefix.clone();
     let default_cpu_prefix = cpu_prefix.clone();
-    let default = std::thread::spawn(move || {
+    let default = TestServiceThread::spawn(move || {
         LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = default_llc_prefix);
         CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = default_cpu_prefix);
         let target = protocol::canonical_lock_order_with_modes(
@@ -1562,7 +1856,7 @@ fn default_conversion_fence_never_coexists_with_performance_ex() {
         drop(acquired);
     });
 
-    recv_with_delivered_service(&paused_rx, "default conversion pause")
+    recv_from_service_thread(&paused_rx, "default conversion pause", &default)
         .expect("default conversion must reach the deterministic pause");
     assert!(
         protocol::registry_shared_probe_is_blocked_for_tests()
@@ -1572,7 +1866,7 @@ fn default_conversion_fence_never_coexists_with_performance_ex() {
 
     let (perf_started_tx, perf_started_rx) = mpsc::sync_channel(0);
     let (perf_result_tx, perf_result_rx) = mpsc::sync_channel(0);
-    let perf = std::thread::spawn(move || {
+    let perf = TestServiceThread::spawn(move || {
         LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
         CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
         perf_started_tx.send(()).expect("publish perf start");
@@ -1583,19 +1877,31 @@ fn default_conversion_fence_never_coexists_with_performance_ex() {
         );
         perf_result_tx.send(contended).expect("publish perf result");
     });
-    recv_with_delivered_service(&perf_started_rx, "performance conversion-fence probe start")
-        .expect("performance probe must start");
+    recv_from_service_thread(
+        &perf_started_rx,
+        "performance conversion-fence probe start",
+        &perf,
+    )
+    .expect("performance probe must start");
     assert!(
         perf_result_rx.try_recv().is_err(),
         "performance must not cross the paused conversion fence",
     );
 
     resume_tx.send(()).expect("resume default conversion");
-    recv_with_delivered_service(&default_ready_rx, "default retained-SH publication")
-        .expect("default must publish retained SH");
+    recv_from_service_thread(
+        &default_ready_rx,
+        "default retained-SH publication",
+        &default,
+    )
+    .expect("default must publish retained SH");
     assert!(
-        recv_with_delivered_service(&perf_result_rx, "performance conversion-fence result")
-            .expect("performance probe must finish after conversion"),
+        recv_from_service_thread(
+            &perf_result_rx,
+            "performance conversion-fence result",
+            &perf,
+        )
+        .expect("performance probe must finish after conversion"),
         "performance EX must observe and reject the retained default SH claim",
     );
     release_default_tx
@@ -1667,7 +1973,7 @@ fn default_hard_perf_contention_is_no_wait_and_cancellable() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = Arc::clone(&cancelled);
     let (result_tx, result_rx) = mpsc::sync_channel(1);
-    let worker = std::thread::spawn(move || {
+    let worker = TestServiceThread::spawn(move || {
         LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
         CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
         ALLOWED_CPUS_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(vec![0, 1]));
@@ -1680,10 +1986,16 @@ fn default_hard_perf_contention_is_no_wait_and_cancellable() {
         ALLOWED_CPUS_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
         let _ = result_tx.send(result);
     });
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    wait_with_task_service(
+        "default waiter cancellation-generation publication",
+        std::slice::from_ref(&worker.service),
+        || Ok((crate::flock::interruptible_flock_waiter_id() != 0).then_some(())),
+    )
+    .expect("default waiter must publish its cancellation generation");
+    let signal_count = crate::flock::primitives::interruptible_flock_broker_signal_count();
     cancel_registry_worker(&cancelled);
-    let result = result_rx
-        .recv_timeout(std::time::Duration::from_secs(3))
+    wait_for_broker_signal_after(signal_count);
+    let result = recv_from_service_thread(&result_rx, "cancelled default waiter unwind", &worker)
         .expect("cancelled default waiter must unwind");
     worker.join().expect("cancelled default waiter");
     let error = match result {
@@ -1725,7 +2037,7 @@ fn small_shared_cell_proceeds_while_coordinator_hungers() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = Arc::clone(&cancelled);
     let (coordinator_tx, coordinator_rx) = mpsc::sync_channel(1);
-    let coordinator_thread = std::thread::spawn(move || {
+    let coordinator_thread = TestServiceThread::spawn(move || {
         LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = llc_prefix);
         CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = cpu_prefix);
         let result = acquire_resource_locks_waiting_impl(
@@ -1738,25 +2050,31 @@ fn small_shared_cell_proceeds_while_coordinator_hungers() {
         );
         let _ = coordinator_tx.send(result);
     });
-    // Wait for the coordinator's exact claim, charging only CPU service
-    // delivered to this observer. This is a registry-state handshake because
-    // the high-level acquisition API deliberately has no test callback in its
-    // registration path.
-    let ready = wait_with_delivered_service("coordinator exact-claim publication", || {
-        if !protocol::ticket_registry_snapshot_for_tests()?.is_empty() {
-            Ok(Some(()))
-        } else if coordinator_thread.is_finished() {
-            anyhow::bail!("coordinator returned before publishing its blocked claim")
-        } else {
-            Ok(None)
-        }
-    });
+    // The high-level acquisition API deliberately has no test callback in its
+    // registration path, so observe the registry state while charging service
+    // delivered to the coordinator which must publish it.
+    let ready = wait_with_task_service(
+        "coordinator exact-claim publication",
+        std::slice::from_ref(&coordinator_thread.service),
+        || {
+            if !protocol::ticket_registry_snapshot_for_tests()?.is_empty() {
+                Ok(Some(()))
+            } else if coordinator_thread.is_finished() {
+                anyhow::bail!("coordinator returned before publishing its blocked claim")
+            } else {
+                Ok(None)
+            }
+        },
+    );
     if let Err(error) = ready {
         cancel_registry_worker(&cancelled);
         drop(peer_sh);
-        let result =
-            recv_with_delivered_service(&coordinator_rx, "cancelled fixed-set coordinator unwind")
-                .expect("cancelled fixed-set coordinator must unwind");
+        let result = recv_from_service_thread(
+            &coordinator_rx,
+            "cancelled fixed-set coordinator unwind",
+            &coordinator_thread,
+        )
+        .expect("cancelled fixed-set coordinator must unwind");
         coordinator_thread
             .join()
             .expect("cancelled fixed-set coordinator thread");
@@ -1768,7 +2086,7 @@ fn small_shared_cell_proceeds_while_coordinator_hungers() {
     let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
     let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
     let (small_tx, small_rx) = std::sync::mpsc::sync_channel(1);
-    let small_thread = std::thread::spawn(move || {
+    let small_thread = TestServiceThread::spawn(move || {
         LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
         CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
         let result = acquire_resource_locks_waiting_impl(
@@ -1781,10 +2099,13 @@ fn small_shared_cell_proceeds_while_coordinator_hungers() {
         );
         let _ = small_tx.send(result);
     });
-    let outcome =
-        recv_with_delivered_service(&small_rx, "disjoint non-waiting shared-cell admission")
-            .expect("small-cell worker must publish")
-            .expect("small-cell acquisition");
+    let outcome = recv_from_service_thread(
+        &small_rx,
+        "disjoint non-waiting shared-cell admission",
+        &small_thread,
+    )
+    .expect("small-cell worker must publish")
+    .expect("small-cell acquisition");
     small_thread.join().expect("small-cell worker");
     let (_, locks) = unwrap_acquired(
         outcome,
@@ -1798,22 +2119,26 @@ fn small_shared_cell_proceeds_while_coordinator_hungers() {
 
     // Release the peer; the coordinator must now complete.
     drop(peer_sh);
-    let coordinator_outcome =
-        match recv_with_delivered_service(&coordinator_rx, "coordinator post-release completion") {
-            Ok(result) => result.expect("coordinator acquire"),
-            Err(error) => {
-                cancel_registry_worker(&cancelled);
-                let _ = recv_with_delivered_service(
-                    &coordinator_rx,
-                    "cancelled fixed-set coordinator unwind",
-                )
-                .expect("cancelled fixed-set coordinator must unwind");
-                coordinator_thread
-                    .join()
-                    .expect("cancelled fixed-set coordinator thread");
-                panic!("coordinator did not complete after release: {error:#}");
-            }
-        };
+    let coordinator_outcome = match recv_from_service_thread(
+        &coordinator_rx,
+        "coordinator post-release completion",
+        &coordinator_thread,
+    ) {
+        Ok(result) => result.expect("coordinator acquire"),
+        Err(error) => {
+            cancel_registry_worker(&cancelled);
+            let _ = recv_from_service_thread(
+                &coordinator_rx,
+                "cancelled fixed-set coordinator unwind",
+                &coordinator_thread,
+            )
+            .expect("cancelled fixed-set coordinator must unwind");
+            coordinator_thread
+                .join()
+                .expect("cancelled fixed-set coordinator thread");
+            panic!("coordinator did not complete after release: {error:#}");
+        }
+    };
     coordinator_thread
         .join()
         .expect("completed coordinator thread");
@@ -1846,7 +2171,7 @@ fn coordinator_reprobes_when_a_release_races_the_initial_watch_transition() {
     let worker_cancelled = Arc::clone(&cancelled);
     let (first_step_tx, first_step_rx) = mpsc::sync_channel(1);
     let (result_tx, result_rx) = mpsc::sync_channel(1);
-    let worker = std::thread::spawn(move || {
+    let worker = TestServiceThread::spawn(move || {
         LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
         CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
         let result = (|| {
@@ -1898,13 +2223,16 @@ fn coordinator_reprobes_when_a_release_races_the_initial_watch_transition() {
         let _ = result_tx.send(result);
     });
     if let Err(error) =
-        recv_with_delivered_service(&first_step_rx, "initial coordinator planning step")
+        recv_from_service_thread(&first_step_rx, "initial coordinator planning step", &worker)
     {
         cancel_registry_worker(&cancelled);
         drop(blocker);
-        let result =
-            recv_with_delivered_service(&result_rx, "cancelled transition-race worker unwind")
-                .expect("cancelled transition-race worker must unwind");
+        let result = recv_from_service_thread(
+            &result_rx,
+            "cancelled transition-race worker unwind",
+            &worker,
+        )
+        .expect("cancelled transition-race worker must unwind");
         worker
             .join()
             .expect("cancelled transition-race coordinator worker");
@@ -1914,16 +2242,20 @@ fn coordinator_reprobes_when_a_release_races_the_initial_watch_transition() {
         );
     }
     drop(blocker);
-    let steps = match recv_with_delivered_service(
+    let steps = match recv_from_service_thread(
         &result_rx,
         "transition-race coordinator post-release completion",
+        &worker,
     ) {
         Ok(result) => result.expect("coordinator transition-race acquire"),
         Err(error) => {
             cancel_registry_worker(&cancelled);
-            let _ =
-                recv_with_delivered_service(&result_rx, "cancelled transition-race worker unwind")
-                    .expect("cancelled transition-race worker must unwind");
+            let _ = recv_from_service_thread(
+                &result_rx,
+                "cancelled transition-race worker unwind",
+                &worker,
+            )
+            .expect("cancelled transition-race worker must unwind");
             worker
                 .join()
                 .expect("cancelled transition-race coordinator worker");
@@ -2052,13 +2384,21 @@ fn failed_cpu_ex_probe_wakes_only_the_compatible_shared_waiter() {
 fn exclusive_coordinator_waits_for_shared_holder_without_reprobe_spin() {
     let _prefixes = LockPrefixesGuard::new_real_wake();
     let markers = tempfile::TempDir::new().expect("marker dir");
+    let coordinator_waiting = markers.path().join("exclusive-coordinator.waiting");
     let shared_holder = crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Shared)
         .expect("open shared CPU holder")
         .expect("hold CPU in shared mode");
-    let coordinator = TicketChild::spawn(markers.path(), "exclusive-coordinator", "1", false);
+    let coordinator = TicketChild::spawn_with_options(
+        markers.path(),
+        "exclusive-coordinator",
+        "1",
+        TicketSpawnOptions {
+            coordinator_waiting: Some(&coordinator_waiting),
+            ..TicketSpawnOptions::default()
+        },
+    );
     coordinator.wait_for_probe();
-
-    std::thread::sleep(std::time::Duration::from_millis(250));
+    coordinator.wait_for_path(&coordinator_waiting, "coordinator waiting marker");
     assert_eq!(
         coordinator.probe_count(),
         1,
@@ -2390,7 +2730,7 @@ fn granted_commit_is_terminal_even_if_cancellation_arrives_afterward() {
     let worker_coordinator_cancelled = Arc::clone(&coordinator_cancelled);
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let (coordinator_tx, coordinator_rx) = mpsc::sync_channel(1);
-    let coordinator_worker = std::thread::spawn(move || {
+    let coordinator_worker = TestServiceThread::spawn(move || {
         LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
         CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
         let result = (|| {
@@ -2434,14 +2774,17 @@ fn granted_commit_is_terminal_even_if_cancellation_arrives_afterward() {
         })();
         let _ = coordinator_tx.send(result);
     });
-    if let Err(error) =
-        recv_with_delivered_service(&ready_rx, "granted-path coordinator publication")
-    {
+    if let Err(error) = recv_from_service_thread(
+        &ready_rx,
+        "granted-path coordinator publication",
+        &coordinator_worker,
+    ) {
         coordinator_cancelled.store(true, Ordering::Release);
         drop(blocker);
-        let result = recv_with_delivered_service(
+        let result = recv_from_service_thread(
             &coordinator_rx,
             "cancelled granted-path coordinator unwind",
+            &coordinator_worker,
         )
         .expect("cancelled granted-path coordinator must unwind");
         coordinator_worker
@@ -2458,7 +2801,7 @@ fn granted_commit_is_terminal_even_if_cancellation_arrives_afterward() {
     let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
     let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
     let (waiter_tx, waiter_rx) = mpsc::sync_channel(1);
-    let waiter_worker = std::thread::spawn(move || {
+    let waiter_worker = TestServiceThread::spawn(move || {
         LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
         CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
         protocol::cancel_granted_after_commit_for_tests();
@@ -2477,18 +2820,26 @@ fn granted_commit_is_terminal_even_if_cancellation_arrives_afterward() {
         });
         let _ = waiter_tx.send(result);
     });
-    let locks = match recv_with_delivered_service(&waiter_rx, "disjoint granted waiter completion")
-    {
+    let locks = match recv_from_service_thread(
+        &waiter_rx,
+        "disjoint granted waiter completion",
+        &waiter_worker,
+    ) {
         Ok(result) => result.expect("granted waiter must return committed success"),
         Err(error) => {
             cancel_registry_worker(&waiter_cancelled);
             drop(blocker);
-            let _ = recv_with_delivered_service(&waiter_rx, "cancelled granted waiter unwind")
-                .expect("cancelled granted waiter must unwind");
+            let _ = recv_from_service_thread(
+                &waiter_rx,
+                "cancelled granted waiter unwind",
+                &waiter_worker,
+            )
+            .expect("cancelled granted waiter must unwind");
             waiter_worker.join().expect("cancelled granted waiter");
-            let _ = recv_with_delivered_service(
+            let _ = recv_from_service_thread(
                 &coordinator_rx,
                 "released granted-path coordinator completion",
+                &coordinator_worker,
             )
             .expect("released coordinator must complete");
             coordinator_worker
@@ -2516,9 +2867,10 @@ fn granted_commit_is_terminal_even_if_cancellation_arrives_afterward() {
     );
 
     drop(blocker);
-    match recv_with_delivered_service(
+    match recv_from_service_thread(
         &coordinator_rx,
         "granted-path coordinator post-release completion",
+        &coordinator_worker,
     ) {
         Ok(result) => result.expect("coordinator completes after blocker release"),
         Err(error) => {
@@ -2529,9 +2881,10 @@ fn granted_commit_is_terminal_even_if_cancellation_arrives_afterward() {
                     .open(cpu_lock_path(1))
                     .expect("wake cancelled coordinator"),
             );
-            let _ = recv_with_delivered_service(
+            let _ = recv_from_service_thread(
                 &coordinator_rx,
                 "cancelled granted-path coordinator unwind",
+                &coordinator_worker,
             )
             .expect("cancelled coordinator must unwind");
             coordinator_worker
@@ -2551,6 +2904,7 @@ const TICKET_HELPER_CANDIDATES: &str = "KTSTR_TEST_TICKET_CANDIDATES";
 const TICKET_HELPER_ACQUIRED: &str = "KTSTR_TEST_TICKET_ACQUIRED";
 const TICKET_HELPER_PROBED: &str = "KTSTR_TEST_TICKET_PROBED";
 const TICKET_HELPER_RELEASE: &str = "KTSTR_TEST_TICKET_RELEASE";
+const TICKET_HELPER_SERVICE_TID: &str = "KTSTR_TEST_TICKET_SERVICE_TID";
 const TICKET_HELPER_DISABLE_BYPASS: &str = "KTSTR_TEST_TICKET_DISABLE_BYPASS";
 const TICKET_HELPER_FORCE_OBSERVER_NONE: &str = "KTSTR_TEST_TICKET_FORCE_OBSERVER_NONE";
 const TICKET_HELPER_PROBE_BARRIER_DIR: &str = "KTSTR_TEST_TICKET_PROBE_BARRIER_DIR";
@@ -2564,8 +2918,55 @@ const TICKET_HELPER_COORDINATOR_WAITING: &str = "KTSTR_TEST_TICKET_COORDINATOR_W
 
 thread_local! {
     static TICKET_HELPER_LOGS:
-        std::cell::RefCell<std::collections::BTreeMap<u32, (std::path::PathBuf, std::path::PathBuf)>> =
+        std::cell::RefCell<std::collections::BTreeMap<u32, (
+            std::path::PathBuf,
+            std::path::PathBuf,
+            std::path::PathBuf,
+        )>> =
         const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+fn wait_for_ticket_fs_state<T>(
+    watch_dir: &std::path::Path,
+    context: &str,
+    mut observe: impl FnMut() -> Option<T>,
+) -> T {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+    use std::os::fd::AsFd;
+
+    let inotify = Inotify::init(InitFlags::IN_CLOEXEC | InitFlags::IN_NONBLOCK)
+        .unwrap_or_else(|error| panic!("{context}: initialize inotify: {error}"));
+    inotify
+        .add_watch(
+            watch_dir,
+            AddWatchFlags::IN_CREATE
+                | AddWatchFlags::IN_MOVED_TO
+                | AddWatchFlags::IN_CLOSE_WRITE
+                | AddWatchFlags::IN_MODIFY
+                | AddWatchFlags::IN_DELETE,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "{context}: watch helper synchronization directory {}: {error}",
+                watch_dir.display(),
+            )
+        });
+    loop {
+        if let Some(value) = observe() {
+            return value;
+        }
+        let mut fds = [PollFd::new(inotify.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut fds, PollTimeout::NONE) {
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(error) => panic!("{context}: wait for helper filesystem event: {error}"),
+        }
+        match inotify.read_events() {
+            Ok(_) | Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EINTR) => {}
+            Err(error) => panic!("{context}: drain helper filesystem events: {error}"),
+        }
+    }
 }
 
 fn ticket_claim(cpus: &[usize]) -> protocol::ClaimSet {
@@ -2610,6 +3011,13 @@ fn ticket_registry_process_helper() {
     let Some(candidate_text) = std::env::var_os(TICKET_HELPER_CANDIDATES) else {
         return;
     };
+    let service_tid_path =
+        std::path::PathBuf::from(std::env::var_os(TICKET_HELPER_SERVICE_TID).unwrap());
+    // SAFETY: `SYS_gettid` has no pointer arguments.
+    let service_tid = unsafe { libc::syscall(libc::SYS_gettid) };
+    assert!(service_tid > 0 && service_tid <= u32::MAX as libc::c_long);
+    std::fs::write(&service_tid_path, service_tid.to_string())
+        .expect("publish helper test-worker TID");
     let candidates: Vec<Vec<usize>> = candidate_text
         .to_string_lossy()
         .split(';')
@@ -2676,20 +3084,12 @@ fn ticket_registry_process_helper() {
                 std::fs::create_dir_all(barrier_dir).expect("create probe barrier");
                 std::fs::write(barrier_dir.join(std::process::id().to_string()), b"entered")
                     .expect("enter probe barrier");
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                loop {
+                wait_for_ticket_fs_state(barrier_dir, "probe barrier", || {
                     let entered = std::fs::read_dir(barrier_dir)
                         .expect("read probe barrier")
                         .count();
-                    if entered >= *expected {
-                        break;
-                    }
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "probe barrier timed out with {entered}/{expected} callbacks"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
+                    (entered >= *expected).then_some(())
+                });
             }
             if let Some(gate) = &before_probe_gate {
                 wait_for_ticket_path(gate);
@@ -2774,14 +3174,7 @@ fn ticket_registry_process_helper() {
         }
     };
     std::fs::write(&acquired_path, index.to_string()).expect("publish helper acquisition");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !release_path.exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "helper release barrier timed out"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    wait_for_ticket_path(&release_path);
     drop(locks);
 }
 
@@ -2928,6 +3321,7 @@ impl TicketChild {
         let acquired = marker_dir.join(format!("{label}.acquired"));
         let probed = marker_dir.join(format!("{label}.probed"));
         let release = marker_dir.join(format!("{label}.release"));
+        let service_tid = marker_dir.join(format!("{label}.service-tid"));
         let stdout = marker_dir.join(format!("{label}.stdout"));
         let stderr = marker_dir.join(format!("{label}.stderr"));
         let mut command =
@@ -2946,6 +3340,7 @@ impl TicketChild {
             .env(TICKET_HELPER_ACQUIRED, &acquired)
             .env(TICKET_HELPER_PROBED, &probed)
             .env(TICKET_HELPER_RELEASE, &release)
+            .env(TICKET_HELPER_SERVICE_TID, &service_tid)
             .stdout(std::process::Stdio::from(
                 std::fs::File::create(&stdout).expect("create helper stdout log"),
             ))
@@ -2986,7 +3381,7 @@ impl TicketChild {
         let pid = child.id();
         TICKET_HELPER_LOGS.with(|logs| {
             logs.borrow_mut()
-                .insert(pid, (stdout.clone(), stderr.clone()));
+                .insert(pid, (stdout.clone(), stderr.clone(), service_tid.clone()));
         });
         Self {
             child: std::cell::RefCell::new(Some(child)),
@@ -3010,18 +3405,9 @@ impl TicketChild {
     }
 
     fn wait_for_probe_count(&self, expected: usize) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while self.probe_count() < expected {
-            self.assert_running("probe-count marker");
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for helper {} to reach {expected} probes; observed {}; {}",
-                self.pid,
-                self.probe_count(),
-                self.diagnostics(),
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        self.wait_for_observation("probe-count marker", || {
+            (self.probe_count() >= expected).then_some(())
+        });
     }
 
     fn wait_for_acquired(&self) {
@@ -3030,15 +3416,20 @@ impl TicketChild {
 
     fn release_and_wait(self) {
         std::fs::write(&self.release, b"release").expect("release ticket helper");
-        let status = self.wait_for_status(std::time::Duration::from_secs(10));
-        let status = status.unwrap_or_else(|| {
-            self.terminate_bounded();
-            panic!(
-                "timed out waiting for ticket helper {} after release; {}",
-                self.pid,
-                self.diagnostics(),
-            );
-        });
+        let services = ticket_helper_services();
+        let status =
+            wait_with_external_task_service("released ticket-helper exit", &services, || {
+                Ok(self.try_status())
+            })
+            .unwrap_or_else(|error| {
+                self.terminate_bounded();
+                panic!(
+                    "ticket helper {} did not exit after release: {error:#}; {}",
+                    self.pid,
+                    self.diagnostics(),
+                );
+            });
+        self.child.borrow_mut().take();
         assert!(
             status.success(),
             "ticket helper {} failed with {status}; {}",
@@ -3072,33 +3463,36 @@ impl TicketChild {
         }
     }
 
-    fn wait_for_path(&self, path: &std::path::Path, marker: &str) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !path.exists() {
-            self.assert_running(marker);
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for ticket helper {} {marker} {}; {}",
+    fn wait_for_observation<T>(&self, context: &str, mut observe: impl FnMut() -> Option<T>) -> T {
+        // A queued child's transition is often produced by the elected
+        // coordinator or a predecessor rather than by that child itself.
+        // Account every live helper in this test so productive work by the
+        // actual actor prevents a false all-blocked diagnosis.
+        let services = ticket_helper_services();
+        wait_with_external_task_service(context, &services, || {
+            if let Some(value) = observe() {
+                return Ok(Some(value));
+            }
+            if let Some(status) = self.try_status() {
+                anyhow::bail!(
+                    "ticket helper {} exited with {status} while waiting for {context}; {}",
+                    self.pid,
+                    self.diagnostics(),
+                );
+            }
+            Ok(None)
+        })
+        .unwrap_or_else(|error| {
+            panic!(
+                "ticket helper {} failed to reach {context}: {error:#}; {}",
                 self.pid,
-                path.display(),
                 self.diagnostics(),
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+            )
+        })
     }
 
-    fn wait_for_status(&self, timeout: std::time::Duration) -> Option<std::process::ExitStatus> {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if let Some(status) = self.try_status() {
-                self.child.borrow_mut().take();
-                return Some(status);
-            }
-            if std::time::Instant::now() >= deadline {
-                return None;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+    fn wait_for_path(&self, path: &std::path::Path, marker: &str) {
+        self.wait_for_observation(marker, || path.exists().then_some(()));
     }
 
     fn terminate_bounded(&self) {
@@ -3112,9 +3506,14 @@ impl TicketChild {
             };
             let _ = child.kill();
         }
-        let _ = self.wait_for_status(std::time::Duration::from_secs(2));
+        let service = TestTaskService::process(self.pid);
+        let _ = wait_with_external_task_service(
+            "killed ticket-helper reap",
+            std::slice::from_ref(&service),
+            || Ok(self.try_status()),
+        );
         // `kill(2)` has already made forward progress independent of the
-        // helper. Never turn test cleanup into another unbounded wait.
+        // helper. Never turn test cleanup failure into a second panic.
         self.child.borrow_mut().take();
     }
 
@@ -3123,25 +3522,25 @@ impl TicketChild {
     }
 
     fn wait_for_injected_crash(&self) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            if let Some(status) = self.try_status() {
-                assert_eq!(
-                    status.code(),
-                    Some(86),
-                    "helper must stop at the requested registry crash point: {status}; {}",
-                    self.diagnostics(),
-                );
-                self.child.borrow_mut().take();
-                return;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for injected registry crash; {}",
+        let services = ticket_helper_services();
+        let status = wait_with_external_task_service("injected registry crash", &services, || {
+            Ok(self.try_status())
+        })
+        .unwrap_or_else(|error| {
+            self.terminate_bounded();
+            panic!(
+                "ticket helper {} did not reach its injected registry crash: {error:#}; {}",
+                self.pid,
                 self.diagnostics(),
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+            )
+        });
+        assert_eq!(
+            status.code(),
+            Some(86),
+            "helper must stop at the requested registry crash point: {status}; {}",
+            self.diagnostics(),
+        );
+        self.child.borrow_mut().take();
     }
 }
 
@@ -3152,15 +3551,10 @@ impl Drop for TicketChild {
 }
 
 fn wait_for_ticket_path(path: &std::path::Path) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !path.exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for ticket helper marker {}",
-            path.display(),
-        );
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    let parent = path.parent().expect("ticket helper marker parent");
+    wait_for_ticket_fs_state(parent, "ticket helper marker", || {
+        path.exists().then_some(())
+    });
 }
 
 fn ticket_helper_diagnostics(pids: &[u32]) -> String {
@@ -3169,7 +3563,7 @@ fn ticket_helper_diagnostics(pids: &[u32]) -> String {
         pids.iter()
             .map(|pid| {
                 logs.get(pid)
-                    .map(|(stdout, stderr)| {
+                    .map(|(stdout, stderr, _)| {
                         let stdout = std::fs::read_to_string(stdout).unwrap_or_else(|error| {
                             format!("<read {}: {error}>", stdout.display())
                         });
@@ -3185,9 +3579,21 @@ fn ticket_helper_diagnostics(pids: &[u32]) -> String {
     })
 }
 
+fn ticket_helper_services() -> Vec<TestTaskService> {
+    TICKET_HELPER_LOGS.with(|logs| {
+        logs.borrow()
+            .iter()
+            .filter(|(pid, _)| std::path::Path::new(&format!("/proc/{pid}")).exists())
+            .map(|(pid, (_, _, service_tid))| {
+                TestTaskService::helper_thread(*pid, service_tid.clone())
+            })
+            .collect()
+    })
+}
+
 fn wait_for_ticket_pids(expected: &[u32]) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
+    let services = ticket_helper_services();
+    wait_with_external_task_service("ticket registry publication", &services, || {
         for &pid in expected {
             let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
                 .ok()
@@ -3209,36 +3615,29 @@ fn wait_for_ticket_pids(expected: &[u32]) {
             .map(|(_, pid, _)| pid)
             .collect();
         if actual == expected {
-            return;
+            return Ok(Some(()));
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "ticket order mismatch: expected={expected:?} actual={actual:?}; {}",
+        Ok(None)
+    })
+    .unwrap_or_else(|error| {
+        panic!(
+            "ticket order mismatch: expected={expected:?}; {error:#}; {}",
             ticket_helper_diagnostics(expected),
-        );
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+        )
+    });
 }
 
 fn wait_for_ticket_claim(child: &TicketChild, expected: &protocol::ClaimSet) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        child.assert_running("expected registry claim");
+    child.wait_for_observation("expected registry claim", || {
         let claim = protocol::ticket_registry_snapshot_for_tests()
             .expect("ticket registry snapshot")
             .into_iter()
             .find_map(|(_, pid, claim)| (pid == child.pid).then_some(claim));
         if claim.as_ref() == Some(expected) {
-            return;
+            return Some(());
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "ticket helper {} did not publish expected claim {expected:?}; observed={claim:?}; {}",
-            child.pid,
-            child.diagnostics(),
-        );
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+        None
+    });
 }
 
 #[test]
@@ -3601,7 +4000,8 @@ fn ticket_death_before_successor_installs_watch_is_reconciled_promptly() {
     // B's first post-watch pass re-observes Z as free. C's stale claim still
     // fences D until the shared short reconciliation deadline prunes C; the
     // periodic 30-second maintenance sweep is deliberately deferred above,
-    // while every helper wait below has its own ten-second deadline.
+    // while the helpers below are bounded by service delivered to every
+    // process that can produce their next transition.
     fenced_successor.wait_for_acquired();
     assert!(
         !successor.acquired.exists(),
@@ -3634,25 +4034,26 @@ fn disjoint_granted_callbacks_probe_concurrently_without_registry_ex_convoy() {
     let barrier = markers.path().join("concurrent-probes");
     let second = TicketChild::spawn_probe_barrier(markers.path(), "second", "2", &barrier, 2);
     let third = TicketChild::spawn_probe_barrier(markers.path(), "third", "3", &barrier, 2);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
+    let services = ticket_helper_services();
+    wait_with_external_task_service("concurrent helper probe barrier", &services, || {
         let entered = std::fs::read_dir(&barrier)
             .map(|entries| entries.count())
             .unwrap_or(0);
         if entered == 2 {
-            break;
+            return Ok(Some(()));
         }
         second.assert_running("concurrent probe barrier");
         third.assert_running("concurrent probe barrier");
-        assert!(
-            std::time::Instant::now() < deadline,
-            "disjoint granted callbacks did not overlap; only {entered}/2 entered the barrier; \
+        Ok(None)
+    })
+    .unwrap_or_else(|error| {
+        panic!(
+            "disjoint granted callbacks did not overlap: {error:#}; \
              second: {}; third: {}",
             second.diagnostics(),
             third.diagnostics(),
-        );
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+        )
+    });
 
     second.wait_for_acquired();
     third.wait_for_acquired();
@@ -4144,7 +4545,11 @@ fn conflicting_ticket_cannot_bypass_an_earlier_live_claim() {
     earlier.wait_for_probe();
     let conflicting = TicketChild::spawn(markers.path(), "conflicting", "2", false);
     wait_for_ticket_pids(&[coordinator.pid, earlier.pid, conflicting.pid]);
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    conflicting.wait_for_observation("conflicting ticket entered the waiting state", || {
+        protocol::ticket_is_waiting_for_tests(conflicting.pid)
+            .expect("read conflicting ticket state")
+            .then_some(())
+    });
     assert!(
         !conflicting.probed.exists() && !conflicting.acquired.exists(),
         "a conflicting successor must not even receive a probe grant",

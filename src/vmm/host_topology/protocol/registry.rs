@@ -2124,6 +2124,19 @@ pub(super) fn ticket_blocked_at_current_serial_for_tests(pid: u32) -> Result<boo
 }
 
 #[cfg(test)]
+pub(super) fn ticket_is_waiting_for_tests(pid: u32) -> Result<bool> {
+    let Some(_lock) = try_lock_registry_existing(FlockMode::Shared)? else {
+        return Ok(false);
+    };
+    let mut table = Table::open_existing()?;
+    Ok(table
+        .records()?
+        .into_iter()
+        .find(|record| record.pid == pid)
+        .is_some_and(|record| record.state == STATE_WAITING))
+}
+
+#[cfg(test)]
 pub(super) fn coordinator_liveness_probe_for_tests() -> Result<((u64, u64), bool)> {
     let _lock = lock_registry_existing(FlockMode::Exclusive)?;
     let mut table = Table::open_existing()?;
