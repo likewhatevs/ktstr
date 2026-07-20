@@ -1954,8 +1954,10 @@ pub(crate) struct VmRunState {
     /// falls back to `0`, which produces correct translations on
     /// non-KASLR boots.
     pub(crate) cr3: Arc<std::sync::atomic::AtomicU64>,
-    /// Cached vmlinux bytes for collect_verifier_stats. Avoids
-    /// re-reading from disk (14-28s on cold cache).
+    /// Optional preloaded vmlinux bytes for the exceptional
+    /// `collect_verifier_stats` fallback. Ordinary VM runs leave this `None`:
+    /// the live prog accessor consumes the shared derived artifacts, and the
+    /// fallback loads bytes lazily only when it is genuinely needed.
     pub(crate) vmlinux_data: Option<Arc<Vec<u8>>>,
     /// Pre-built prog accessor from the accessor-init worker.
     /// When present, `collect_verifier_stats` skips the ~4s

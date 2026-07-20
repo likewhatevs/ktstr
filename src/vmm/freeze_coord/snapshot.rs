@@ -18,8 +18,8 @@
 //!    every WATCH request through `arm_user_watchpoint`).
 //!
 //! No state, no statics — only functions and the
-//! [`VmlinuxSymbolCache`] which is built once per coordinator at
-//! `run_vm` scope.
+//! [`VmlinuxSymbolCache`], a lightweight view over the uniform parsed-vmlinux
+//! artifact shared by every consumer.
 
 use crate::sync::MutexExt;
 use std::sync::Arc;
@@ -154,46 +154,19 @@ pub(super) fn decode_snapshot_request(payload: &[u8]) -> Option<SnapshotRequest>
     })
 }
 
-/// Cached `name -> KVA` map built once at coordinator init from the
-/// vmlinux ELF symbol table. Lets [`arm_user_watchpoint`] look up
-/// `Op::WatchSnapshot` symbols without re-reading and re-parsing
-/// the 50MB+ vmlinux per request.
+/// Shared `name -> KVA` view over the complete symbol map stored in
+/// [`crate::vmm::vmlinux::VmlinuxArtifacts`]. Lets
+/// [`arm_user_watchpoint`] look up `Op::WatchSnapshot` symbols without a
+/// coordinator-specific vmlinux read, ELF parse, or duplicate HashMap.
 pub(super) struct VmlinuxSymbolCache {
     symbols: std::sync::Arc<std::collections::HashMap<String, u64>>,
 }
 
 impl VmlinuxSymbolCache {
-    /// Read and parse `path` once, extracting every symbol whose
-    /// `st_shndx` is not `SHN_UNDEF` into the cache. Errors propagate
-    /// as caller-side diagnostics so arming surfaces the same reason
-    /// strings the per-call parse used.
-    ///
-    /// SHN_UNDEF (== 0 per ELF spec) marks linker placeholders and
-    /// imports; those have no defining section and must be filtered.
-    /// Filtering on `st_value == 0` instead would also drop legitimate
-    /// symbols at section offset 0 (the percpu
-    /// case, and the same filter masks any defined symbol whose KVA
-    /// happens to be 0 — `arm_user_watchpoint` rejects `kva == 0`
-    /// downstream so a 0-valued defined symbol still surfaces a
-    /// diagnostic instead of being silently absent).
-    pub(super) fn from_path(path: &std::path::Path) -> std::result::Result<Self, String> {
-        const SHN_UNDEF: usize = 0;
-        let data_arc = super::super::vmlinux::cached_vmlinux_bytes(path)
-            .ok_or_else(|| format!("read vmlinux at {}", path.display()))?;
-        let data = &*data_arc;
-        let elf = goblin::elf::Elf::parse(data).map_err(|e| format!("parse vmlinux ELF: {e}"))?;
-        let mut symbols = std::collections::HashMap::new();
-        for s in elf.syms.iter() {
-            if s.st_shndx == SHN_UNDEF {
-                continue;
-            }
-            if let Some(name) = elf.strtab.get_at(s.st_name) {
-                symbols.insert(name.to_string(), s.st_value);
-            }
-        }
-        Ok(Self {
-            symbols: std::sync::Arc::new(symbols),
-        })
+    pub(super) fn from_symbols(
+        symbols: std::sync::Arc<std::collections::HashMap<String, u64>>,
+    ) -> Self {
+        Self { symbols }
     }
 
     pub(super) fn lookup(&self, symbol: &str) -> Option<u64> {
@@ -207,9 +180,8 @@ impl VmlinuxSymbolCache {
         self.symbols.clone()
     }
 
-    /// Test-only constructor that bypasses the vmlinux ELF read /
-    /// parse path of [`Self::from_path`] and seeds the cache from a
-    /// pre-built `name -> KVA` map. Lets unit tests exercise
+    /// Test-only constructor that seeds the cache from a pre-built
+    /// `name -> KVA` map. Lets unit tests exercise
     /// [`Self::lookup`] and [`arm_user_watchpoint`]'s symbol /
     /// alignment / slot dispatch without needing a real 50MB+
     /// vmlinux blob on disk. Mirrors the production invariant that

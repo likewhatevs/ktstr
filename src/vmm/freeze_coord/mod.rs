@@ -2762,8 +2762,7 @@ enum VmWorkerTeardownFailCause {
 }
 
 struct VmWorkerWake<'a> {
-    kill: &'a AtomicBool,
-    kill_evt: &'a EventFd,
+    kill: Option<(&'a AtomicBool, &'a EventFd)>,
     bsp_done: Option<(&'a AtomicBool, &'a EventFd)>,
 }
 
@@ -2773,7 +2772,9 @@ impl VmWorkerWake<'_> {
             bsp_done.store(true, Ordering::Release);
             let _ = bsp_done_evt.write(1);
         }
-        super::publish_vm_kill(self.kill, self.kill_evt);
+        if let Some((kill, kill_evt)) = self.kill {
+            super::publish_vm_kill(kill, kill_evt);
+        }
     }
 }
 
@@ -2945,9 +2946,13 @@ mod vm_worker_shutdown_tests {
                 VmWorkerFamily::Watchdog | VmWorkerFamily::FreezeCoordinator
             )
             .then_some((bsp_done.as_ref(), bsp_done_evt.as_ref()));
+            let kill_wake = (!matches!(
+                family,
+                VmWorkerFamily::Watchdog | VmWorkerFamily::FreezeCoordinator
+            ))
+            .then_some((kill.as_ref(), kill_evt.as_ref()));
             let wake = VmWorkerWake {
-                kill: kill.as_ref(),
-                kill_evt: kill_evt.as_ref(),
+                kill: kill_wake,
                 bsp_done: bsp_wake,
             };
             let result = wait_vm_worker_shutdown(
@@ -2960,6 +2965,16 @@ mod vm_worker_shutdown_tests {
             handle.join().expect("finished worker join cannot block");
             assert_eq!(result, Ok(()), "{family:?} must accept its stop edge");
             assert!(exited.load(Ordering::Acquire));
+            if matches!(
+                family,
+                VmWorkerFamily::Watchdog | VmWorkerFamily::FreezeCoordinator
+            ) {
+                assert!(
+                    !kill.load(Ordering::Acquire),
+                    "{family:?} normal shutdown must preserve the coordinator's \
+                     nested-worker/final-drain lifetime until BSP_DONE is consumed"
+                );
+            }
         }
     }
 
@@ -3014,9 +3029,13 @@ mod vm_worker_shutdown_tests {
             VmWorkerFamily::Watchdog | VmWorkerFamily::FreezeCoordinator
         )
         .then_some((bsp_done.as_ref(), bsp_done_evt.as_ref()));
+        let kill_wake = (!matches!(
+            family,
+            VmWorkerFamily::Watchdog | VmWorkerFamily::FreezeCoordinator
+        ))
+        .then_some((kill.as_ref(), kill_evt.as_ref()));
         let wake = VmWorkerWake {
-            kill: kill.as_ref(),
-            kill_evt: kill_evt.as_ref(),
+            kill: kill_wake,
             bsp_done: bsp_wake,
         };
         let started = Instant::now();
@@ -3300,13 +3319,14 @@ impl Drop for RunVmThreadGuard {
             .worker_wall_deadline
             .unwrap_or_else(|| Instant::now() + VM_WORKER_TEARDOWN_WALL_BACKSTOP);
         let bsp_wake = VmWorkerWake {
-            kill: self.kill.as_ref(),
-            kill_evt: self.kill_evt.as_ref(),
+            // Drop is the early-error/unwind path: `kill` was published
+            // immediately above, so republish both eventfd edges while
+            // bounded joins retain every guest-memory lease.
+            kill: Some((self.kill.as_ref(), self.kill_evt.as_ref())),
             bsp_done: Some((self.bsp_done.as_ref(), self.bsp_done_evt.as_ref())),
         };
         let kill_wake = VmWorkerWake {
-            kill: self.kill.as_ref(),
-            kill_evt: self.kill_evt.as_ref(),
+            kill: Some((self.kill.as_ref(), self.kill_evt.as_ref())),
             bsp_done: None,
         };
         if let Some(h) = self.watchdog.take() {
@@ -5414,41 +5434,25 @@ impl KtstrVm {
         // unavailable on the host; both consumers gracefully degrade
         // to "no perf data" without aborting the run.
         let freeze_coord_perf_capture = perf_capture.clone();
-        let freeze_coord_vmlinux = find_vmlinux(&self.kernel);
-        // Read vmlinux bytes once at run_vm scope. Shared via Arc
-        // with the coordinator closure (for accessor init, dump_btf,
-        // dump_cpu_time_symbols) and VmRunState (for
-        // collect_verifier_stats). Eliminates the 14-28s cold-cache
-        // re-read that caused cleanup hangs.
-        let vmlinux_data_shared: Option<Arc<Vec<u8>>> = freeze_coord_vmlinux
-            .as_ref()
-            .and_then(|p| super::vmlinux::cached_vmlinux_bytes(p));
         // Cached `name -> KVA` map for `Op::WatchSnapshot` arming.
         // Build once here at run_vm scope so every TLV-driven
         // WATCH request is an O(1) HashMap lookup instead of a
         // 50MB+ vmlinux read + ELF parse. None when vmlinux can't
         // be found or the parse failed — `arm_user_watchpoint`
-        // will report a clean diagnostic on lookup. Hoisted out of
-        // the closure so the spawn-time parse cost is paid once
-        // even when the run ends without any WATCH requests.
-        let vmlinux_data_for_result = vmlinux_data_shared.clone();
+        // will report a clean diagnostic on lookup.
         let prog_accessor_slot: Arc<
             std::sync::Mutex<Option<crate::monitor::bpf_prog::GuestMemProgAccessorOwned>>,
         > = Arc::new(std::sync::Mutex::new(None));
         let prog_accessor_slot_for_coord = prog_accessor_slot.clone();
-        let freeze_coord_symbol_cache: Option<Arc<VmlinuxSymbolCache>> = freeze_coord_vmlinux
-            .as_deref()
-            .and_then(|p| match VmlinuxSymbolCache::from_path(p) {
-                Ok(c) => Some(Arc::new(c)),
-                Err(e) => {
-                    tracing::warn!(
-                        path = %p.display(),
-                        error = %e,
-                        "freeze-coord: vmlinux symbol cache build failed; \
-                         Op::WatchSnapshot WATCH requests will return errors"
-                    );
-                    None
-                }
+        // The complete symbol map is one of the uniform parsed-vmlinux
+        // artifacts. A sidecar hit shares this Arc directly, so neither the
+        // coordinator nor its accessor worker reads/parses the ELF or builds a
+        // private multi-hundred-thousand-entry HashMap.
+        let freeze_coord_symbol_cache: Option<Arc<VmlinuxSymbolCache>> =
+            host_vmlinux_artifacts.as_ref().map(|artifacts| {
+                Arc::new(VmlinuxSymbolCache::from_symbols(Arc::clone(
+                    &artifacts.all_symbols,
+                )))
             });
         // Accessor-init consumes the same complete symbol map and BTF offset
         // tables that run_vm already derived before any live-VM helper starts.
@@ -5459,6 +5463,20 @@ impl KtstrVm {
             .as_ref()
             .map(|cache| cache.symbols_arc());
         let freeze_coord_kernel_symbols = host_kernel_symbols.clone();
+        // Reuse the BTF and symbol products `cached_vmlinux_artifacts`
+        // already loaded above. In particular, a cross-process sidecar hit
+        // reconstructed this Arc<Btf> without reading the full vmlinux.
+        // The coordinator previously discarded that result, eagerly read the
+        // whole ELF, then parsed it twice more (`load_btf_from_bytes` and
+        // `KernelSymbols::from_vmlinux_bytes`) in every VM process. Fast
+        // guests could finish while this duplicate initialization was still
+        // running, turning ordinary teardown into a service/wall-budget
+        // failure and multiplying memory bandwidth under a verifier storm.
+        let freeze_coord_dump_btf = host_vmlinux_artifacts
+            .as_ref()
+            .and_then(|a| a.monitor.as_ref())
+            .map(|m| Arc::clone(&m.btf));
+        let freeze_coord_dump_symbols = host_kernel_symbols.clone();
         let freeze_coord_bpf_map_offsets = host_vmlinux_artifacts
             .as_ref()
             .and_then(|a| a.monitor.as_ref())
@@ -5947,10 +5965,6 @@ impl KtstrVm {
                 // permanently if the guest hadn't booted yet,
                 // disabling freeze detection AND the dump for the
                 // entire run.
-                // Cached vmlinux bytes remain available to dump/render
-                // consumers below, but accessor init does not touch them.
-                let _tvmr = std::time::Instant::now();
-                let vmlinux_data: Option<Arc<Vec<u8>>> = vmlinux_data_shared.clone();
                 // Worker-populated accessor pair. Built off the freeze
                 // coordinator thread because the guest bootstrap handshake
                 // can transiently fail while the kernel comes up. All host
@@ -6456,13 +6470,12 @@ impl KtstrVm {
                 // offsets → arena maps fall back to an explanatory
                 // error string in the report).
                 //
-                // Arena offsets derive from the same parsed `Btf`
-                // handle (`from_btf`, not `from_vmlinux`) so the
-                // ELF-to-BTF parse runs exactly once per coordinator
-                // — a second `from_vmlinux` would re-read and
-                // re-parse the same file.
-                let dump_btf = vmlinux_data.as_deref().zip(freeze_coord_vmlinux.as_ref())
-                    .and_then(|(data, path)| crate::monitor::btf_offsets::load_btf_from_bytes(data, path).ok());
+                // The parsed BTF and ELF symbols come from the shared
+                // vmlinux-artifact cache prepared before helper threads
+                // started. Deriving the small dump-specific offset groups
+                // below is cheap; reading and reparsing the full ELF here is
+                // neither necessary nor cancellation-safe.
+                let dump_btf = freeze_coord_dump_btf;
                 let dump_arena_offsets = dump_btf
                     .as_ref()
                     .and_then(|btf| crate::monitor::arena::BpfArenaOffsets::from_btf(btf).ok());
@@ -6490,8 +6503,7 @@ impl KtstrVm {
                 let dump_cgroup_psi_offsets = dump_btf.as_ref().and_then(|btf| {
                     crate::monitor::btf_offsets::PsiGroupOffsets::from_btf(btf).ok()
                 });
-                let dump_cpu_time_symbols = vmlinux_data.as_deref()
-                    .and_then(|data| crate::monitor::symbols::KernelSymbols::from_vmlinux_bytes(data).ok());
+                let dump_cpu_time_symbols = freeze_coord_dump_symbols;
                 // SCX walker BTF sub-group offsets. Resolved once at
                 // coord start; per-sub-group resolution failures land
                 // inside the composite as None so the walker's
@@ -9771,7 +9783,7 @@ impl KtstrVm {
                                 let reply = if let Some(owned) = owned_accessor.as_ref() {
                                     kernel_op_dispatch::dispatch_kernel_op_batch(
                                         owned.guest_kernel(),
-                                        dump_btf.as_ref(),
+                                        dump_btf.as_deref(),
                                         coord_kaslr_offset(),
                                         req,
                                     )
@@ -14875,12 +14887,13 @@ impl KtstrVm {
         // `freeze_coord_bsp_done.load(Acquire)` if the eventfd
         // fails to deliver.
         let _ = bsp_done_evt.write(1);
-        // Stop the monitor (wakes via kill_evt epoll) and bpf-write
-        // thread (observes kill on next 200ms poll cycle).
-        // Previously kill was deferred to collect_results, leaving
-        // the monitor sampling at 100ms cadence through the entire
-        // run_vm cleanup window (watchdog join + coord join).
-        super::publish_vm_kill(&kill, &kill_evt);
+        // Do not publish the run-wide kill edge yet. BSP_DONE is the
+        // coordinator's clean-shutdown edge and deliberately grants its final
+        // dispatch/deferred-request drain while the nested accessor worker
+        // remains live. Publishing kill here cancels that worker before the
+        // final pass can adopt it; republishing kill from the bounded join
+        // turns the race into a certainty. The monitor and BPF writer remain
+        // memory-safe and are stopped immediately after the coordinator joins.
         // Sample cleanup start at the earliest moment after BSP exit so
         // every host-side teardown step lands inside the window, in
         // execution order: watchdog + coordinator joins, monitor join, AP
@@ -14960,8 +14973,10 @@ impl KtstrVm {
             .worker_wall_deadline
             .expect("cleanup boundary arms one worker wall deadline");
         let bsp_worker_wake = VmWorkerWake {
-            kill: kill.as_ref(),
-            kill_evt: kill_evt.as_ref(),
+            // Normal teardown is BSP_DONE-only until the coordinator has
+            // completed its final/deferred drain. The early-error Drop path
+            // uses a distinct wake carrying both BSP_DONE and kill.
+            kill: None,
             bsp_done: Some((bsp_done.as_ref(), bsp_done_evt.as_ref())),
         };
 
@@ -15007,6 +15022,11 @@ impl KtstrVm {
                 worker_wall_deadline,
             );
         }
+        // The coordinator has completed every guest-memory dispatch and
+        // joined its nested accessor worker. Now stop the monitor and BPF map
+        // writer promptly; their later bounded joins retain ownership until
+        // each handle is observably finished.
+        super::publish_vm_kill(&kill, &kill_evt);
         let framework_error = cast_analysis_error
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -15146,7 +15166,11 @@ impl KtstrVm {
             snapshot_bridge,
             tcr_el1: tcr_el1_cache,
             cr3: cr3_cache,
-            vmlinux_data: vmlinux_data_for_result,
+            // The common path already has a live prog accessor and the
+            // no-scheduler path never asks for verifier stats. Keep the
+            // hundreds-of-MB vmlinux read lazy for the exceptional
+            // post-teardown fallback in `collect_verifier_stats`.
+            vmlinux_data: None,
             prog_accessor,
             kern_phys_base,
             // Snapshot the kern_virt_kaslr Arc at run-end. The Arc
@@ -15568,16 +15592,23 @@ impl KtstrVm {
         // (PSI_IRQ_FULL absent from BTF) or psi_group is absent → loud-absent.
         let psi_offsets = mon.psi_offsets;
         let btf = Arc::clone(&mon.btf);
-        // Raw vmlinux bytes for the `watch_bpf_maps` per-map program-BTF
-        // split-base. A byte-cache hit — `cached_vmlinux_artifacts`
-        // above already read and cached these. Only consumed when the
-        // test declared watch targets; the `None` arm keeps the
-        // pre-cache "unreadable vmlinux → no monitor" early return.
-        let vmlinux_data_arc = match super::vmlinux::cached_vmlinux_bytes(&vmlinux) {
-            Some(d) => d,
-            None => {
-                progress_ledger.publish_monitor_terminal();
-                return Ok(None);
+        // Raw vmlinux bytes are needed only by the optional
+        // `watch_bpf_maps` per-map program-BTF split-base. Most VM cells do
+        // not declare any watch target; on a cross-process artifacts-sidecar
+        // hit, eagerly touching the bytes here defeated that cache by reading
+        // the entire multi-hundred-MB ELF anyway. Keep the previous
+        // unreadable-vmlinux -> no-monitor behaviour when a watcher actually
+        // requested the bytes, but leave the ordinary monitor path entirely
+        // on the derived artifacts.
+        let watch_vmlinux_data = if self.watch_bpf_maps.is_empty() {
+            None
+        } else {
+            match super::vmlinux::cached_vmlinux_bytes(&vmlinux) {
+                Some(data) => Some(data),
+                None => {
+                    progress_ledger.publish_monitor_terminal();
+                    return Ok(None);
+                }
             }
         };
         // BTF-capability probe for the `SCX_EV_*` event counters:
@@ -16405,13 +16436,17 @@ impl KtstrVm {
                 let watch_cfg = if watch_targets.is_empty() {
                     None
                 } else {
-                    match (watch_prog_offsets, symbols.prog_idr) {
-                        (Some(prog_offsets), Some(prog_idr_kva)) => {
+                    match (
+                        watch_prog_offsets,
+                        symbols.prog_idr,
+                        watch_vmlinux_data,
+                    ) {
+                        (Some(prog_offsets), Some(prog_idr_kva), Some(vmlinux_data)) => {
                             Some(monitor::reader::WatchBpfMapsCfg {
                                 targets: watch_targets,
                                 mem: Arc::clone(&mem),
                                 vmlinux: vmlinux.clone(),
-                                vmlinux_data: Arc::clone(&vmlinux_data_arc),
+                                vmlinux_data,
                                 base_btf: Arc::clone(&btf),
                                 cr3_pa,
                                 cr3: cr3.clone(),
@@ -17417,8 +17452,7 @@ impl KtstrVm {
         let worker_kill = Arc::clone(&run.kill);
         let worker_kill_evt = Arc::clone(&run.kill_evt);
         let worker_wake = VmWorkerWake {
-            kill: worker_kill.as_ref(),
-            kill_evt: worker_kill_evt.as_ref(),
+            kill: Some((worker_kill.as_ref(), worker_kill_evt.as_ref())),
             bsp_done: None,
         };
         // The monitor owns CPU clock IDs derived from the AP pthread handles.
