@@ -980,6 +980,32 @@ fn effective_run_placement_uses_runtime_plan_for_every_service_consumer() {
 }
 
 #[test]
+fn run_helper_cpu_mask_comes_from_the_admitted_run() {
+    let exact = host_topology::PinningPlan {
+        assignments: vec![(2, 9), (0, 3), (1, 7), (3, 7)],
+        service_cpu: Some(11),
+        llc_indices: vec![1],
+        locks: host_topology::protocol::Acquired::untracked(Vec::new()),
+    };
+    assert_eq!(
+        freeze_coord::run_owned_helper_cpus(Some(&exact), Some(&[20, 21]), &[30, 31]),
+        vec![3, 7, 9],
+        "an exact run uses its vCPU assignments, excluding its service CPU and \
+         ignoring an inapplicable shared/fallback mask",
+    );
+    assert_eq!(
+        freeze_coord::run_owned_helper_cpus(None, Some(&[21, 20, 21]), &[30, 31]),
+        vec![20, 21],
+        "a shared run uses the CPU pool admission actually granted it",
+    );
+    assert_eq!(
+        freeze_coord::run_owned_helper_cpus(None, None, &[31, 30, 31]),
+        vec![30, 31],
+        "an untracked run falls back to the caller's pre-BSP affinity",
+    );
+}
+
+#[test]
 fn exact_plan_expands_to_dense_default_interactive_pins() {
     let selected = host_topology::PinningPlan {
         assignments: vec![(0, 20), (1, 21), (2, 22), (3, 23)],
@@ -1031,6 +1057,93 @@ fn interactive_affinity_guard_restores_the_calling_thread() {
         nix::sched::sched_getaffinity(pid).expect("read the restored affinity"),
         original,
         "interactive teardown must restore the caller before its reservation is released",
+    );
+}
+
+#[test]
+fn run_helpers_broaden_bsp_inheritance_without_escaping_the_cell() {
+    fn current_affinity_cpus() -> Vec<usize> {
+        let mask = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0))
+            .expect("read helper affinity");
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|cpu| mask.is_set(*cpu).unwrap_or(false))
+            .collect()
+    }
+
+    let pid = nix::unistd::Pid::from_raw(0);
+    let original =
+        nix::sched::sched_getaffinity(pid).expect("read the test thread's original affinity");
+    let allowed = (0..libc::CPU_SETSIZE as usize)
+        .filter(|cpu| original.is_set(*cpu).unwrap_or(false))
+        .collect::<Vec<_>>();
+    if allowed.len() < 3 {
+        // We need two admitted vCPU CPUs plus a distinct service CPU to prove
+        // both placement shapes and exclusion of every unrelated CPU.
+        return;
+    }
+
+    let guard = freeze_coord::BspAffinityGuard::capture();
+    let mut narrowed = nix::sched::CpuSet::new();
+    narrowed
+        .set(allowed[0])
+        .expect("construct a one-CPU BSP mask");
+    nix::sched::sched_setaffinity(pid, &narrowed).expect("apply the temporary BSP pin");
+
+    let admitted = vec![allowed[0], allowed[1]];
+    let admitted_for_thread = admitted.clone();
+    let default_mask = std::thread::spawn(move || {
+        freeze_coord::place_run_helper_thread(
+            None,
+            &admitted_for_thread,
+            "helper-affinity-default-test",
+        );
+        let own_mask = current_affinity_cpus();
+        let nested_mask = std::thread::spawn(current_affinity_cpus)
+            .join()
+            .expect("join nested accessor-shaped helper");
+        (own_mask, nested_mask)
+    })
+    .join()
+    .expect("join default helper");
+    let (default_mask, nested_mask) = default_mask;
+    assert_eq!(
+        default_mask, admitted,
+        "a default/no-perf helper must broaden past the inherited BSP singleton \
+         to exactly the run-owned admitted mask",
+    );
+    assert_eq!(
+        nested_mask, admitted,
+        "an accessor worker spawned by the freeze coordinator must inherit the \
+         coordinator's broadened cell mask rather than the BSP singleton",
+    );
+    assert!(
+        !default_mask.contains(&allowed[2]),
+        "the broadened helper must not escape onto an unadmitted CPU",
+    );
+
+    let service_cpu = allowed[2];
+    let admitted_for_thread = admitted.clone();
+    let service_mask = std::thread::spawn(move || {
+        freeze_coord::place_run_helper_thread(
+            Some(service_cpu),
+            &admitted_for_thread,
+            "helper-affinity-service-test",
+        );
+        current_affinity_cpus()
+    })
+    .join()
+    .expect("join service helper");
+    assert_eq!(
+        service_mask,
+        vec![service_cpu],
+        "a performance service helper must use its separately reserved CPU",
+    );
+
+    drop(guard);
+    assert_eq!(
+        nix::sched::sched_getaffinity(pid).expect("read the restored affinity"),
+        original,
+        "the parent BSP affinity must still restore after spawning helpers",
     );
 }
 

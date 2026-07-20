@@ -4081,6 +4081,24 @@ impl BspAffinityGuard {
             saved: nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).ok(),
         }
     }
+
+    /// Expand the captured pre-BSP affinity into a stable CPU list.
+    ///
+    /// This is the last-resort placement for run helpers when topology
+    /// admission was unavailable. Read it from the captured mask rather than
+    /// after BSP pinning: Linux threads inherit the spawning thread's current
+    /// affinity, so querying later would reproduce the singleton-inheritance
+    /// bug this fallback exists to prevent.
+    fn saved_cpus(&self) -> Vec<usize> {
+        self.saved
+            .as_ref()
+            .map(|saved| {
+                (0..libc::CPU_SETSIZE as usize)
+                    .filter(|cpu| saved.is_set(*cpu).unwrap_or(false))
+                    .collect()
+            })
+            .unwrap_or_else(super::host_topology::host_allowed_cpus)
+    }
 }
 
 impl Drop for BspAffinityGuard {
@@ -4088,6 +4106,47 @@ impl Drop for BspAffinityGuard {
         if let Some(saved) = &self.saved {
             let _ = nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), saved);
         }
+    }
+}
+
+/// Resolve the CPU mask shared by this run's non-vCPU helpers.
+///
+/// Exact placement contributes only its vCPU assignments: its service CPU is
+/// deliberately excluded and applied separately to service-role workers.
+/// Shared/default-fallback placement already carries the CPUs admitted for the
+/// run. Only a run without either admission product falls back to the caller's
+/// pre-BSP affinity.
+pub(super) fn run_owned_helper_cpus(
+    pinning_plan: Option<&super::host_topology::PinningPlan>,
+    shared_cpu_mask: Option<&[usize]>,
+    caller_cpus: &[usize],
+) -> Vec<usize> {
+    let mut cpus = if let Some(plan) = pinning_plan {
+        plan.assignments
+            .iter()
+            .map(|&(_, host_cpu)| host_cpu)
+            .collect()
+    } else if let Some(shared) = shared_cpu_mask {
+        shared.to_vec()
+    } else {
+        caller_cpus.to_vec()
+    };
+    cpus.sort_unstable();
+    cpus.dedup();
+    cpus
+}
+
+/// Place one run helper without inheriting the BSP's singleton affinity.
+///
+/// Performance-mode service workers use the separately reserved service CPU.
+/// Every other helper receives the run-owned admitted mask, allowing default
+/// participants to share while preventing a helper from escaping into CPUs
+/// owned by another performance cell.
+pub(super) fn place_run_helper_thread(service_cpu: Option<usize>, run_cpus: &[usize], label: &str) {
+    if let Some(cpu) = service_cpu {
+        pin_current_thread(cpu, label);
+    } else {
+        set_thread_cpumask(run_cpus, label);
     }
 }
 
@@ -5569,7 +5628,11 @@ impl KtstrVm {
         // drops FIRST (joining every AP) and this guard restores affinity
         // AFTER, leaving `run_vm` affinity-neutral for any retry/next VM in the
         // same process. See [`BspAffinityGuard`] for why the leak matters.
-        let _bsp_affinity_guard = BspAffinityGuard::capture();
+        let bsp_affinity_guard = BspAffinityGuard::capture();
+        let caller_cpus = bsp_affinity_guard.saved_cpus();
+        let run_helper_cpus: Arc<[usize]> =
+            run_owned_helper_cpus(effective_pinning_plan, shared_cpu_mask, &caller_cpus).into();
+        let _bsp_affinity_guard = bsp_affinity_guard;
         let mut guard = RunVmThreadGuard {
             ap_threads,
             monitor: None,
@@ -5835,6 +5898,7 @@ impl KtstrVm {
             &kill_evt,
             run_start,
             effective_placement,
+            Arc::clone(&run_helper_cpus),
             vcpu_pthreads,
             contention_recorder.clone(),
             perf_capture.clone(),
@@ -5981,6 +6045,8 @@ impl KtstrVm {
             kern_phys_base.clone(),
             bpf_map_write_delivery.clone(),
             bpf_map_write_ready_evt,
+            effective_placement,
+            Arc::clone(&run_helper_cpus),
         )?;
         // Same as the monitor: the bpf-map-write thread holds a raw pointer into
         // guest_mem, so the guard must join it on an early-return past here.
@@ -6631,9 +6697,19 @@ impl KtstrVm {
         // [`kvm_get_clock_via_raw_fd`] +
         // [`kvm_set_clock_via_raw_fd`].
         let vm_fd_raw_for_coord: i32 = vm.vm_fd.as_raw_fd();
+        let freeze_coord_run_helper_cpus = Arc::clone(&run_helper_cpus);
         let freeze_coord_handle = std::thread::Builder::new()
             .name("vmm-freeze-coord".into())
             .spawn(move || {
+                // The coordinator and its nested accessor-initialization
+                // worker must not inherit the BSP's singleton pin. Keep both
+                // inside this cell's admitted vCPU/shared mask; the child
+                // inherits this broadened mask when it is spawned below.
+                place_run_helper_thread(
+                    None,
+                    &freeze_coord_run_helper_cpus,
+                    "freeze-coord",
+                );
                 // The hang detector's own sensing must not dilate with the
                 // load it measures. This thread runs the dispatch sinks whose
                 // `advance_stage` -> `ProgressLedger::record_progress` bumps
@@ -6642,15 +6718,13 @@ impl KtstrVm {
                 // dilation, a milestone the guest already earned lands late,
                 // `wall_since_milestone` grows, and it feeds an inert misread.
                 // So it gets the same UNCONDITIONAL FIFO-2 as the watchdog and
-                // monitor. It is NOT pinned, deliberately: the watchdog and
-                // monitor pin to the single reserved `service_cpu`, and this
-                // thread's freeze-time guest-memory scans would head-of-line
-                // block those same-priority FIFO threads if colocated there —
-                // the exact monitor starvation being fixed. Left unpinned it
-                // may briefly preempt a FIFO-1 vCPU on wake in perf mode
-                // (intended, sensing wins) but is epoll-idle between events,
-                // so it does not erode perf-mode vCPU isolation during a body
-                // run. Best-effort — warns once/process without CAP_SYS_NICE.
+                // monitor. It uses the admitted vCPU mask rather than the
+                // single reserved service CPU: freeze-time guest-memory scans
+                // would head-of-line block those same-priority FIFO workers if
+                // colocated there. It may briefly preempt a FIFO-1 vCPU on wake
+                // in perf mode (intended, sensing wins) but remains inside the
+                // cell and is epoll-idle between events. Best-effort — warns
+                // once/process without CAP_SYS_NICE.
                 set_rt_priority(2, "freeze-coord");
                 // Per-CPU runnable_at scanner context. Holds every
                 // input the scanner needs, all resolved once and
@@ -14870,6 +14944,7 @@ impl KtstrVm {
             None,
         )
         .context("initialize watchdog wake sources")?;
+        let watchdog_run_helper_cpus = Arc::clone(&run_helper_cpus);
         let watchdog = std::thread::Builder::new()
             .name("ktstr-watchdog".into())
             .spawn(move || {
@@ -14877,9 +14952,11 @@ impl KtstrVm {
                     mut tick_tfd,
                     epoll,
                 } = watchdog_wake;
-                if let Some(cpu) = wd_service_cpu {
-                    pin_current_thread(cpu, "ktstr-watchdog");
-                }
+                place_run_helper_thread(
+                    wd_service_cpu,
+                    &watchdog_run_helper_cpus,
+                    "ktstr-watchdog",
+                );
                 // The hang detector's own sensing must not dilate with the
                 // load it measures. FIFO-2 is therefore UNCONDITIONAL (not
                 // perf-mode-gated): under extreme host dilation a SCHED_OTHER
@@ -14892,9 +14969,9 @@ impl KtstrVm {
                 // perf mode vCPUs at FIFO-1 stay below it; in no-perf/default
                 // mode it now outranks SCHED_OTHER vCPUs — intended, sensing
                 // must win. Best-effort — warns once/process without
-                // CAP_SYS_NICE (see `set_rt_priority`). The service-CPU PIN
-                // above stays perf-mode-gated: `wd_service_cpu` is `None`
-                // without a reserved CPU, so there is nothing to pin to.
+                // CAP_SYS_NICE (see `set_rt_priority`). Placement above uses
+                // the reserved service CPU in performance mode and this run's
+                // admitted shared/vCPU mask otherwise.
                 set_rt_priority(2, "ktstr-watchdog");
                 let hard_deadline = watchdog_hard_deadline(run_start, timeout);
                 // Soft phase needs enough headroom for the guest to
@@ -16451,6 +16528,7 @@ impl KtstrVm {
         kill_evt: &Arc<EventFd>,
         run_start: Instant,
         effective_placement: super::EffectiveRunPlacement<'_>,
+        run_helper_cpus: Arc<[usize]>,
         vcpu_pthreads: Vec<libc::pthread_t>,
         contention_recorder: Arc<ContentionWitnessRecorder>,
         perf_capture: Arc<Option<monitor::perf_counters::PerfCountersCapture>>,
@@ -16654,9 +16732,7 @@ impl KtstrVm {
                         progress_ledger.as_ref(),
                         kill_clone.as_ref(),
                     );
-                if let Some(cpu) = service_cpu {
-                    pin_current_thread(cpu, "monitor");
-                }
+                place_run_helper_thread(service_cpu, &run_helper_cpus, "monitor");
                 // The hang detector's own sensing must not dilate with the
                 // load it measures. FIFO-2 is UNCONDITIONAL (not perf-mode-
                 // gated): the monitor bumps `monitor_heartbeat` and writes
@@ -16669,9 +16745,9 @@ impl KtstrVm {
                 // vCPUs at FIFO-1 stay below it; in no-perf/default mode it
                 // now outranks SCHED_OTHER vCPUs — intended, sensing must
                 // win. Best-effort — warns once/process without CAP_SYS_NICE
-                // (see `set_rt_priority`). The service-CPU PIN above stays
-                // perf-mode-gated: `service_cpu` is `None` without a reserved
-                // CPU.
+                // (see `set_rt_priority`). Placement above uses the reserved
+                // service CPU in performance mode and this run's admitted
+                // shared/vCPU mask otherwise.
                 set_rt_priority(2, "monitor");
                 // The guest-memory sampler cannot start until the bounded
                 // SYS_RDY / KERN_ADDRS waits below finish. The watchdog still
@@ -17514,6 +17590,8 @@ impl KtstrVm {
         kern_phys_base: Arc<std::sync::atomic::AtomicU64>,
         delivery: Arc<std::sync::atomic::AtomicU8>,
         ready_evt: Option<Arc<EventFd>>,
+        effective_placement: super::EffectiveRunPlacement<'_>,
+        run_helper_cpus: Arc<[usize]>,
     ) -> Result<Option<JoinHandle<()>>> {
         if self.bpf_map_writes.is_empty() {
             return Ok(None);
@@ -17553,11 +17631,13 @@ impl KtstrVm {
         let kill_clone = kill.clone();
         let kill_evt_clone = kill_evt.clone();
         let writes = self.bpf_map_writes.clone();
+        let service_cpu = effective_placement.service_cpu;
 
         let handle = std::thread::Builder::new()
             .name("bpf-map-write".into())
             .spawn(move || {
                 use crate::monitor::bpf_map::BpfMapAccessor;
+                place_run_helper_thread(service_cpu, &run_helper_cpus, "bpf-map-write");
                 if kill_clone.load(Ordering::Acquire) {
                     return;
                 }
