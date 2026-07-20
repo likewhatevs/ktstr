@@ -1029,12 +1029,17 @@ fn startup_test_checkpoint_if(mode: &str, phase: &str, wait_for_release: bool) -
         return Ok(());
     }
     let marker = startup_test_checkpoint_path(phase, "ready")?;
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(marker)?;
+    let parent = marker.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "startup test checkpoint has no parent directory",
+        )
+    })?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
     writeln!(file, "{}", unsafe { libc::getpid() })?;
     file.flush()?;
+    file.persist_noclobber(&marker)
+        .map_err(|error| error.error)?;
     if !wait_for_release {
         return Ok(());
     }
