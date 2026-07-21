@@ -3,6 +3,67 @@ use super::super::*;
 use super::*;
 use crate::vmm::topology::Topology;
 
+/// Own a test helper and the fresh process group it leads.
+///
+/// Several placement tests use `flock(1) ... sleep` as a real peer process.
+/// Keeping cleanup in the test tail leaks that peer when an assertion panics;
+/// nextest may retry the test successfully, but the original `flock` then
+/// survives the test binary and keeps cargo-ktstr's owned-child wait alive.
+/// This guard makes both the normal and unwind paths kill the complete group
+/// and reap its leader.
+#[must_use = "dropping the guard is what kills and reaps the test process group"]
+struct ProcessGroupChild {
+    child: Option<std::process::Child>,
+    pgid: nix::unistd::Pid,
+}
+
+impl ProcessGroupChild {
+    fn spawn(command: &mut std::process::Command) -> std::io::Result<Self> {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut child = command.process_group(0).spawn()?;
+        let Some(pgid) = libc::pid_t::try_from(child.id())
+            .ok()
+            .filter(|&pid| pid > 0)
+            .map(nix::unistd::Pid::from_raw)
+        else {
+            let _ = child.kill();
+            loop {
+                match child.wait() {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    _ => break,
+                }
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "spawned child pid cannot name a safe process group",
+            ));
+        };
+        Ok(Self {
+            child: Some(child),
+            pgid,
+        })
+    }
+}
+
+impl Drop for ProcessGroupChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = nix::sys::signal::killpg(self.pgid, nix::sys::signal::Signal::SIGKILL);
+        // The leader fallback also makes a surprising process-group setup
+        // failure bounded instead of turning Drop into a 300-second wait.
+        let _ = child.kill();
+        loop {
+            match child.wait() {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                _ => break,
+            }
+        }
+    }
+}
+
 /// `CpuCap::new(1)` succeeds — minimum legal cap.
 #[test]
 fn cpu_cap_new_accepts_one() {
@@ -878,12 +939,10 @@ fn acquire_llc_plan_skips_an_exclusive_held_llc_when_a_ready_alternative_exists(
     let topo = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
     let peer_path = llc_lock_path(1);
     crate::flock::materialize(&peer_path).expect("materialize peer EX lockfile");
-    use std::os::unix::process::CommandExt as _;
-    let child = std::process::Command::new("flock")
-        .args(["-x", "-n", &peer_path, "sleep", "300"])
-        .process_group(0)
-        .spawn();
-    let mut child = match child {
+    let child = ProcessGroupChild::spawn(
+        std::process::Command::new("flock").args(["-x", "-n", &peer_path, "sleep", "300"]),
+    );
+    let peer = match child {
         Ok(child) => child,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
@@ -925,15 +984,7 @@ fn acquire_llc_plan_skips_an_exclusive_held_llc_when_a_ready_alternative_exists(
             None,
         )
     });
-    if let Some(pgid) = libc::pid_t::try_from(child.id())
-        .ok()
-        .filter(|&pid| pid > 0)
-        .map(nix::unistd::Pid::from_raw)
-    {
-        let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
-    }
-    let _ = child.wait();
-
+    drop(peer);
     assert!(peer_seen, "peer LLC EX hold did not become observable");
     let plan = plan
         .expect("peer was visible, so acquisition was attempted")
@@ -959,7 +1010,8 @@ fn acquire_llc_plan_skips_an_exclusive_held_llc_when_a_ready_alternative_exists(
 ///
 /// Uses `flock(1)` for the peer so the holder is a genuinely
 /// different pid; absent util-linux the test skips rather than fails
-/// (same convention as `acquire_llc_plan_consolidates_on_peer_held_llc`).
+/// (same convention as
+/// `acquire_llc_plan_skips_an_exclusive_held_llc_when_a_ready_alternative_exists`).
 #[test]
 fn discover_excludes_self_pid_from_holder_count() {
     let _llc_prefix = LlcLockPrefixGuard::new();
@@ -979,15 +1031,17 @@ fn discover_excludes_self_pid_from_holder_count() {
     // the child opens the same inode the parent's discover stats.
     let peer_lock_path = llc_lock_path(1);
     crate::flock::materialize(&peer_lock_path).expect("materialize peer lockfile");
-    // Lead a fresh process group so the kill below reaches `flock`'s
-    // `sleep` grandchild too, not just `flock` (mirrors the make(1)
-    // spawn+killpg pattern in cli::kernel_build::make).
-    use std::os::unix::process::CommandExt as _;
-    let child = std::process::Command::new("flock")
-        .args(["-s", "-n", &peer_lock_path, "sleep", "300"])
-        .process_group(0)
-        .spawn();
-    let mut child = match child {
+    // Lead a fresh process group so the guard reaches `flock`'s `sleep`
+    // grandchild too, not just `flock` (mirrors the make(1) spawn+killpg
+    // pattern in cli::kernel_build::make).
+    let child = ProcessGroupChild::spawn(std::process::Command::new("flock").args([
+        "-s",
+        "-n",
+        &peer_lock_path,
+        "sleep",
+        "300",
+    ]));
+    let peer = match child {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
@@ -1007,18 +1061,31 @@ fn discover_excludes_self_pid_from_holder_count() {
     // window can never fall outside the peer's hold.
     let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let self_pid = std::process::id();
     let snapshots = loop {
         let snaps =
             discover_llc_snapshots(&topo, &allowed, &mountinfo).expect("discover must succeed");
+        // `/proc/locks` is a live seq-file, not an atomic image. Under a lock
+        // storm one traversal can see the new peer while momentarily omitting
+        // the stable self hold. Accept only a single traversal containing both
+        // facts this test asserts so a retry cannot leak through a half-image.
+        let self_seen = snaps
+            .iter()
+            .find(|snapshot| snapshot.llc_idx == 0)
+            .is_some_and(|snapshot| {
+                snapshot.holder_count == 0
+                    && snapshot.holders.iter().any(|holder| holder.pid == self_pid)
+            });
         let peer_seen = snaps
             .iter()
-            .find(|s| s.llc_idx == 1)
-            .is_some_and(|s| s.holder_count == 1);
-        if peer_seen || std::time::Instant::now() >= deadline {
+            .find(|snapshot| snapshot.llc_idx == 1)
+            .is_some_and(|snapshot| snapshot.holder_count == 1);
+        if (self_seen && peer_seen) || std::time::Instant::now() >= deadline {
             break snaps;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
+    drop(peer);
 
     let llc0 = snapshots
         .iter()
@@ -1029,7 +1096,6 @@ fn discover_excludes_self_pid_from_holder_count() {
         .find(|s| s.llc_idx == 1)
         .expect("LLC 1 snapshot present");
 
-    let self_pid = std::process::id();
     assert!(
         llc0.holders.iter().any(|h| h.pid == self_pid),
         "self must remain in the diagnostic holders vec for LLC 0; \
@@ -1061,20 +1127,6 @@ fn discover_excludes_self_pid_from_holder_count() {
         "self never locked LLC 1, so must not appear there; holders={:?}",
         llc1.holders,
     );
-
-    // The child holds until killed (sleep 300); sweep its whole process
-    // group so `flock` AND its `sleep` grandchild die, then reap `flock`
-    // so we leave neither a lingering process nor a zombie. Guard the
-    // pgid cast as make's killpg does: a non-positive pgid would broadcast
-    // to the caller's group.
-    if let Some(pgid) = libc::pid_t::try_from(child.id())
-        .ok()
-        .filter(|&p| p > 0)
-        .map(nix::unistd::Pid::from_raw)
-    {
-        let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
-    }
-    let _ = child.wait();
 }
 
 #[test]
@@ -1091,12 +1143,10 @@ fn discover_tracks_self_and_peer_exclusive_llc_holds_separately_from_occupancy()
 
     let peer_path = llc_lock_path(1);
     crate::flock::materialize(&peer_path).expect("materialize peer EX lockfile");
-    use std::os::unix::process::CommandExt as _;
-    let child = std::process::Command::new("flock")
-        .args(["-x", "-n", &peer_path, "sleep", "300"])
-        .process_group(0)
-        .spawn();
-    let mut child = match child {
+    let child = ProcessGroupChild::spawn(
+        std::process::Command::new("flock").args(["-x", "-n", &peer_path, "sleep", "300"]),
+    );
+    let peer = match child {
         Ok(child) => child,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
@@ -1132,15 +1182,7 @@ fn discover_tracks_self_and_peer_exclusive_llc_holds_separately_from_occupancy()
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
-
-    if let Some(pgid) = libc::pid_t::try_from(child.id())
-        .ok()
-        .filter(|&pid| pid > 0)
-        .map(nix::unistd::Pid::from_raw)
-    {
-        let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
-    }
-    let _ = child.wait();
+    drop(peer);
 
     let self_snapshot = snapshots
         .iter()

@@ -42,9 +42,10 @@ fn shared_target_dir() -> PathBuf {
         };
     }
 
-    // Integration tests live at <target>/<profile>/deps/<binary>. Reusing the
-    // parent target directory lets the nested fixture build share the exact
-    // ktstr/dependency artifacts which compiled this test.
+    // Integration tests live at <target>/<profile>/deps/<binary>. Cached
+    // nextest runs place that binary in a private COW materialization; using
+    // its target root lets nested Cargo reuse compatible files without ever
+    // mutating the shared artifact-tree record.
     std::env::current_exe()
         .expect("current test executable")
         .parent()
@@ -80,45 +81,20 @@ fn fixture_diagnostics_dir(temp: &tempfile::TempDir) -> PathBuf {
         .unwrap_or_else(|| temp.path().join("cargo-diagnostics"))
 }
 
-/// Render a fixture dependency with this parent test binary's ktstr features.
+/// Render the one optional ktstr edge used by a generated fixture package.
 ///
-/// These nested workspaces intentionally share the parent target directory.
-/// Keeping their feature fingerprint identical makes the conflict and success
-/// fixtures share one dependency unit: narrower per-fixture dependencies made
-/// Cargo build separate whole-ktstr variants while nextest saturated the host.
-fn parent_ktstr_dependency(dependency: &str, ktstr_root: &Path) -> String {
-    let mut features = Vec::new();
-    for (name, enabled) in [
-        ("integration", cfg!(feature = "integration")),
-        ("wprof", cfg!(feature = "wprof")),
-        ("pretty-labels", cfg!(feature = "pretty-labels")),
-        ("remote-cache", cfg!(feature = "remote-cache")),
-    ] {
-        if enabled {
-            features.push(name);
-        }
-    }
+/// The conflict fixture only reads declaration metadata and aborts before BPF
+/// or KVM setup, so it needs no ktstr feature. The success fixture executes a
+/// real cell and therefore needs functional vendored BPF skeletons. Neither
+/// shape depends on the outer test matrix's `integration`/`wprof` features.
+fn fixture_ktstr_dependency(dependency: &str, ktstr_root: &Path, vendored: bool) -> String {
+    let features = if vendored { &["vendored"][..] } else { &[] };
     format!(
-        "{dependency} = {{ package = \"ktstr\", path = {}, optional = true, features = {} }}",
+        "{dependency} = {{ package = \"ktstr\", path = {}, optional = true, \
+         default-features = false, features = {} }}",
         toml_string(ktstr_root),
         serde_json::to_string(&features).expect("serialize fixture feature list"),
     )
-}
-
-/// Reproduce the parent integration-test dependency graph as well as its ktstr
-/// feature set. Cargo fingerprints ktstr's direct dependency units, so root
-/// dev-dependency feature unification (for example
-/// `virtio-queue/test-utils`) is part of whether its library artifact can be
-/// reused by the sibling nested build.
-fn parent_dev_dependencies(ktstr_root: &Path) -> String {
-    let manifest =
-        std::fs::read_to_string(ktstr_root.join("Cargo.toml")).expect("read parent ktstr manifest");
-    let marker = "\n[dev-dependencies]\n";
-    let (_, table) = manifest
-        .split_once(marker)
-        .expect("parent manifest has a dev-dependencies table");
-    let end = table.find("\n[").unwrap_or(table.len());
-    format!("[dev-dependencies]\n{}", table[..end].trim_end())
 }
 
 fn copy_tree(source: &Path, destination: &Path) {
@@ -174,17 +150,16 @@ fn exactly_one_verifier_cell_passed(stderr: &str) -> bool {
         == 1
 }
 
-/// The dependency renderer is driven directly by this test binary's `cfg!`
-/// feature set. Keeping both aliases byte-identical statically prevents Cargo
-/// from compiling two nested ktstr variants. The end-to-end tests below prove
-/// smart feature activation independently: their declaration binaries have
-/// `required-features`, so neither the conflict nor the generated cell can be
-/// observed unless the package-qualified roots were enabled.
+/// Dependency aliases must describe the same deliberately lean ktstr unit.
+/// The end-to-end tests prove smart feature activation independently: their
+/// declaration binaries have `required-features`, so neither the conflict nor
+/// the generated cell can be observed unless the package-qualified roots were
+/// enabled.
 #[test]
 fn nested_fixture_dependency_aliases_have_identical_cargo_fingerprint_inputs() {
     let ktstr_root = ktstr::writable_source_path(env!("CARGO_MANIFEST_DIR"));
-    let direct = parent_ktstr_dependency("ktstr", &ktstr_root);
-    let aliased = parent_ktstr_dependency("test_harness", &ktstr_root);
+    let direct = fixture_ktstr_dependency("ktstr", &ktstr_root, false);
+    let aliased = fixture_ktstr_dependency("test_harness", &ktstr_root, false);
     let direct_value = direct
         .split_once(" = ")
         .expect("direct dependency assignment")
@@ -197,12 +172,15 @@ fn nested_fixture_dependency_aliases_have_identical_cargo_fingerprint_inputs() {
         direct_value, aliased_value,
         "dependency aliases must not create distinct nested ktstr variants",
     );
-
-    let dev_dependencies = parent_dev_dependencies(&ktstr_root);
     assert!(
-        dev_dependencies.starts_with("[dev-dependencies]\n")
-            && !dev_dependencies["[dev-dependencies]\n".len()..].contains("\n["),
-        "mirrored dev-dependencies must be exactly one narrowly delimited TOML table",
+        direct_value.contains("default-features = false") && direct_value.contains("features = []"),
+        "conflict fixtures must not inherit the outer ktstr feature matrix",
+    );
+    let success = fixture_ktstr_dependency("test_harness", &ktstr_root, true);
+    assert!(
+        success.contains("default-features = false")
+            && success.contains("features = [\"vendored\"]"),
+        "the real-cell fixture needs vendored BPF without unrelated outer features",
     );
 
     let root_manifest =
@@ -258,8 +236,7 @@ fn write_member(
 ) {
     let root = workspace.join(package);
     std::fs::create_dir_all(root.join("tests")).expect("create member tests directory");
-    let dependency_spec = parent_ktstr_dependency(dependency, ktstr_root);
-    let dev_dependencies = parent_dev_dependencies(ktstr_root);
+    let dependency_spec = fixture_ktstr_dependency(dependency, ktstr_root, false);
     std::fs::write(
         root.join("Cargo.toml"),
         format!(
@@ -273,8 +250,6 @@ edition = "2024"
 
 [dependencies]
 {dependency_spec}
-
-{dev_dependencies}
 
 [[test]]
 name = "{package}_scheduler_declaration"
@@ -317,7 +292,6 @@ fn write_success_member(workspace: &Path, ktstr_root: &Path) {
     let root = workspace.join("verifier-e2e");
     std::fs::create_dir_all(root.join("tests")).expect("create success member tests directory");
     std::fs::create_dir_all(root.join("src")).expect("create success member source directory");
-    let dev_dependencies = parent_dev_dependencies(ktstr_root);
     std::fs::write(
         root.join("Cargo.toml"),
         format!(
@@ -332,8 +306,6 @@ verification-tests = ["dep:test_harness"]
 [dependencies]
 {}
 
-{dev_dependencies}
-
 [[test]]
 name = "recursive_scheduler_declaration"
 path = "tests/scheduler.rs"
@@ -344,7 +316,7 @@ name = "recursive_scheduler_declaration_duplicate"
 path = "tests/scheduler_duplicate.rs"
 required-features = ["verification-tests"]
 "#,
-            parent_ktstr_dependency("test_harness", ktstr_root),
+            fixture_ktstr_dependency("test_harness", ktstr_root, true),
         ),
     )
     .expect("write success member manifest");

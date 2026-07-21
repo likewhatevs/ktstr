@@ -210,9 +210,12 @@ coverage kernel extra-features="":
 sccache-stats:
     sccache --show-stats
 
-# Show the last run's gauntlet analysis (CI posts it as a post-test step)
-stats:
-    cargo run --bin cargo-ktstr -- ktstr stats last-run
+# Show the last run's gauntlet analysis (CI posts it as a post-test step).
+# Keep the cargo-ktstr feature shape identical to the preceding test build so
+# an embedded-tool feature such as `wprof` reuses that binary instead of
+# compiling a second no-feature variant solely for reporting.
+stats extra-features="":
+    cargo run --bin cargo-ktstr {{ if extra-features != "" { "--features " + extra-features } else { "" } }} -- ktstr stats last-run
 
 # Compare performance_mode metrics: HEAD vs a baseline commit (noise-adjusted; runs per side defaults to 5)
 perf-delta kernel base="" runs="5":

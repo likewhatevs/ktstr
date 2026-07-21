@@ -139,7 +139,7 @@ jobs:
       - if: ${{ !cancelled() }}
         run: just sccache-stats
       - if: ${{ !cancelled() }}
-        run: just stats
+        run: just stats ${{ matrix.features }}
       - name: Upload cargo-ktstr build diagnostics
         if: ${{ always() }}
         uses: actions/upload-artifact@v7.0.0
@@ -193,7 +193,7 @@ jobs:
       - if: ${{ !cancelled() }}
         run: just sccache-stats
       - if: ${{ !cancelled() }}
-        run: just stats
+        run: just stats ${{ matrix.features }}
       - name: Upload cargo-ktstr build diagnostics
         if: ${{ always() }}
         uses: actions/upload-artifact@v7.0.0
