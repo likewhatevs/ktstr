@@ -21,6 +21,8 @@
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -213,6 +215,19 @@ fn llvm_cov_has_lifecycle_flag(args: &[String], wanted: &str) -> bool {
 
 fn llvm_cov_retains_artifacts(args: &[String]) -> bool {
     ["--no-clean", "--no-report", "--no-run"]
+        .iter()
+        .any(|flag| llvm_cov_has_lifecycle_flag(args, flag))
+}
+
+/// Whether a nextest-backed llvm-cov invocation requires cargo-llvm-cov's
+/// ordinary mutable target rather than ktstr's reusable COW closure.
+///
+/// `--no-run` is report-only and `--no-clean` explicitly asks to accumulate in
+/// the caller-owned target. A lone `--no-report` is different: ktstr can retain
+/// the exact private closure as one bounded persistent bundle and provide a
+/// replay script, so it remains eligible for cached artifact reuse.
+fn llvm_cov_requires_ordinary_retained_target(args: &[String]) -> bool {
+    ["--no-clean", "--no-run"]
         .iter()
         .any(|flag| llvm_cov_has_lifecycle_flag(args, flag))
 }
@@ -2417,6 +2432,13 @@ fn cached_llvm_cov_report_args(
 
 const PROFRAW_CLEANUP_DIAGNOSTIC_LIMIT: usize = 4;
 const PROFRAW_CLEANUP_DIAGNOSTIC_CHARS: usize = 320;
+const COVERAGE_RECOVERY_PREFIX: &str = "report-";
+const COVERAGE_RECOVERY_LIVE_LOCK: &str = ".ktstr-live.lock";
+const COVERAGE_RECOVERY_GC_LOCK: &str = ".ktstr-gc.lock";
+const COVERAGE_RECOVERY_SIZE_FILE: &str = ".ktstr-logical-bytes";
+const COVERAGE_RECOVERY_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+const COVERAGE_RECOVERY_MAX_BUNDLES: usize = 4;
+const COVERAGE_RECOVERY_MAX_BYTES: u64 = 8 << 30;
 
 /// Post-run state needed to finish a cached cargo-llvm-cov invocation.
 ///
@@ -2461,9 +2483,86 @@ struct ProfrawCleanup {
 /// live shards itself, then holds the shards here until the report outcome is
 /// known. Success drops the directory; failure detaches it for recovery.
 struct StagedProfraw {
-    directory: Option<tempfile::TempDir>,
+    directory: Option<CoverageRecoveryDirectory>,
     recovery_parent: PathBuf,
     count: usize,
+}
+
+/// One live coverage recovery bundle.
+///
+/// The lock prevents a concurrent opportunistic collector from reclaiming a
+/// bundle while raw profiles, a merged profile, or a retained artifact tree
+/// are still being installed. Persisting the bundle disarms TempDir cleanup;
+/// dropping it on the green report path removes everything immediately.
+struct CoverageRecoveryDirectory {
+    directory: tempfile::TempDir,
+    _live: std::fs::File,
+}
+
+impl CoverageRecoveryDirectory {
+    fn path(&self) -> &Path {
+        self.directory.path()
+    }
+
+    fn close(self) -> std::io::Result<()> {
+        self.directory.close()
+    }
+
+    fn keep(self, recovery_parent: &Path) -> PathBuf {
+        let Self { directory, _live } = self;
+        let protected = directory.path().to_path_buf();
+        // Persist a constant-time size summary before detaching ownership.
+        // Recovery bundles are immutable until an operator explicitly uses
+        // them, so later green coverage runs do not restat an entire retained
+        // Cargo artifact closure merely to enforce the byte budget.
+        let _ = coverage_recovery_bundle_bytes(&protected);
+        if let Err(error) = gc_coverage_recovery_bundles_in(
+            recovery_parent,
+            std::time::SystemTime::now(),
+            CoverageRecoveryLimits::DEFAULT,
+            Some(&protected),
+        ) {
+            tracing::warn!(
+                error = %error,
+                parent = %recovery_parent.display(),
+                "could not prune retained coverage recovery bundles",
+            );
+        }
+        let path = directory.keep();
+        drop(_live);
+        // Run once more after publishing/unlocking. Concurrent persistors may
+        // all have been live during the protected pass; serializing this
+        // unlocked pass through the global GC gate guarantees the last
+        // finisher observes and bounds every earlier completed bundle.
+        if let Err(error) = gc_coverage_recovery_bundles_in(
+            recovery_parent,
+            std::time::SystemTime::now(),
+            CoverageRecoveryLimits::DEFAULT,
+            None,
+        ) {
+            tracing::warn!(
+                error = %error,
+                parent = %recovery_parent.display(),
+                "could not finalize coverage recovery bundle pruning",
+            );
+        }
+        path
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CoverageRecoveryLimits {
+    max_age: std::time::Duration,
+    max_bundles: usize,
+    max_bytes: u64,
+}
+
+impl CoverageRecoveryLimits {
+    const DEFAULT: Self = Self {
+        max_age: COVERAGE_RECOVERY_MAX_AGE,
+        max_bundles: COVERAGE_RECOVERY_MAX_BUNDLES,
+        max_bytes: COVERAGE_RECOVERY_MAX_BYTES,
+    };
 }
 
 impl StagedProfraw {
@@ -2480,8 +2579,20 @@ impl StagedProfraw {
         })
     }
 
-    fn persist(mut self, merged_profdata: &Path) -> Result<Option<PathBuf>, String> {
-        if self.directory.is_none() && merged_profdata.is_file() {
+    fn persist(self, merged_profdata: &Path) -> Result<Option<PathBuf>, String> {
+        self.persist_with(merged_profdata, false, |_| Ok(()))
+    }
+
+    fn persist_with<F>(
+        mut self,
+        merged_profdata: &Path,
+        require_directory: bool,
+        populate: F,
+    ) -> Result<Option<PathBuf>, String>
+    where
+        F: FnOnce(&Path) -> Result<(), String>,
+    {
+        if self.directory.is_none() && (require_directory || merged_profdata.is_file()) {
             self.directory = Some(create_coverage_recovery_dir(&self.recovery_parent)?);
         }
         let Some(directory) = self.directory.take() else {
@@ -2490,7 +2601,7 @@ impl StagedProfraw {
         if merged_profdata.is_file() {
             let destination = directory.path().join("merged.profdata");
             if let Err(error) = std::fs::copy(merged_profdata, &destination) {
-                let retained = directory.keep();
+                let retained = directory.keep(&self.recovery_parent);
                 return Err(format!(
                     "preserve merged coverage profile {} -> {}: {error}; raw shards retained at {}",
                     merged_profdata.display(),
@@ -2499,7 +2610,14 @@ impl StagedProfraw {
                 ));
             }
         }
-        Ok(Some(directory.keep()))
+        if let Err(error) = populate(directory.path()) {
+            let retained = directory.keep(&self.recovery_parent);
+            return Err(format!(
+                "populate retained coverage bundle: {error}; partial bundle retained at {}",
+                retained.display(),
+            ));
+        }
+        Ok(Some(directory.keep(&self.recovery_parent)))
     }
 }
 
@@ -2509,22 +2627,264 @@ fn coverage_recovery_parent() -> Result<PathBuf, String> {
     Ok(cache_root.join("coverage-profraw-recovery-v1"))
 }
 
-fn create_coverage_recovery_dir(recovery_parent: &Path) -> Result<tempfile::TempDir, String> {
+fn coverage_recovery_bundle_bytes(path: &Path) -> Result<u64, String> {
+    let size_path = path.join(COVERAGE_RECOVERY_SIZE_FILE);
+    if let Ok(size) = std::fs::read_to_string(&size_path)
+        && let Ok(size) = size.trim().parse::<u64>()
+    {
+        return Ok(size);
+    }
+    let mut bytes = 0u64;
+    for entry in walkdir::WalkDir::new(path).follow_links(false) {
+        let entry = entry.map_err(|error| {
+            format!("walk coverage recovery bundle {}: {error}", path.display(),)
+        })?;
+        if entry.file_type().is_file()
+            && entry.path().file_name() != Some(OsStr::new(COVERAGE_RECOVERY_SIZE_FILE))
+        {
+            bytes = bytes.saturating_add(
+                entry
+                    .metadata()
+                    .map_err(|error| {
+                        format!(
+                            "inspect coverage recovery entry {}: {error}",
+                            entry.path().display(),
+                        )
+                    })?
+                    .len(),
+            );
+        }
+    }
+    // This marker is only an acceleration hint. A read-only or manually
+    // damaged bundle remains reclaimable through the measured value above.
+    let _ = std::fs::write(&size_path, format!("{bytes}\n"));
+    Ok(bytes)
+}
+
+struct CoverageRecoveryCandidate {
+    path: PathBuf,
+    modified: std::time::SystemTime,
+    bytes: u64,
+    _live: std::fs::File,
+}
+
+/// Opportunistically bound persisted report-failure and `--no-report`
+/// bundles.
+///
+/// Active writers are excluded by their per-bundle liveness flock. Expired
+/// bundles are always removed. The remaining unlocked bundles are oldest-first
+/// reclaimed until both count and logical-byte bounds hold. One newest bundle
+/// is retained even when it alone exceeds the byte cap, so the most recent
+/// failure remains diagnosable without allowing repeated jobs to accumulate
+/// without bound.
+fn gc_coverage_recovery_bundles_in(
+    recovery_parent: &Path,
+    now: std::time::SystemTime,
+    limits: CoverageRecoveryLimits,
+    protected: Option<&Path>,
+) -> Result<(), String> {
     std::fs::create_dir_all(recovery_parent).map_err(|error| {
         format!(
             "create coverage recovery directory {}: {error}",
             recovery_parent.display(),
         )
     })?;
-    tempfile::Builder::new()
-        .prefix("report-")
+    let Some(_collector) = ktstr::flock::try_flock(
+        &recovery_parent.join(COVERAGE_RECOVERY_GC_LOCK),
+        ktstr::flock::FlockMode::Exclusive,
+    )
+    .map_err(|error| {
+        format!(
+            "acquire coverage recovery GC lock in {}: {error:#}",
+            recovery_parent.display(),
+        )
+    })?
+    else {
+        return Ok(());
+    };
+
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(recovery_parent).map_err(|error| {
+        format!(
+            "scan coverage recovery directory {}: {error}",
+            recovery_parent.display(),
+        )
+    })? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::debug!(error = %error, "could not read coverage recovery entry");
+                continue;
+            }
+        };
+        if !entry
+            .file_name()
+            .as_bytes()
+            .starts_with(COVERAGE_RECOVERY_PREFIX.as_bytes())
+        {
+            continue;
+        }
+        let path = entry.path();
+        if protected.is_some_and(|protected| protected == path) {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_dir() => metadata,
+            Ok(_) => continue,
+            Err(error) => {
+                tracing::debug!(path = %path.display(), error = %error, "could not inspect coverage recovery bundle");
+                continue;
+            }
+        };
+        let modified = metadata.modified().unwrap_or(now);
+        let live_path = path.join(COVERAGE_RECOVERY_LIVE_LOCK);
+        let live = match ktstr::flock::try_flock(&live_path, ktstr::flock::FlockMode::Exclusive) {
+            Ok(Some(live)) => live,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::debug!(path = %path.display(), error = %error, "could not probe coverage recovery liveness");
+                continue;
+            }
+        };
+        let bytes = match coverage_recovery_bundle_bytes(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::debug!(path = %path.display(), error = %error, "could not size coverage recovery bundle");
+                continue;
+            }
+        };
+        candidates.push(CoverageRecoveryCandidate {
+            path,
+            modified,
+            bytes,
+            _live: live.into(),
+        });
+    }
+    candidates.sort_by(|left, right| {
+        left.modified.cmp(&right.modified).then_with(|| {
+            left.path
+                .as_os_str()
+                .as_bytes()
+                .cmp(right.path.as_os_str().as_bytes())
+        })
+    });
+
+    let mut retained = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let expired = now
+            .duration_since(candidate.modified)
+            .unwrap_or(std::time::Duration::ZERO)
+            >= limits.max_age;
+        if expired {
+            match std::fs::remove_dir_all(&candidate.path) {
+                Ok(()) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => tracing::debug!(
+                    path = %candidate.path.display(),
+                    error = %error,
+                    "could not remove expired coverage recovery bundle",
+                ),
+            }
+        }
+        retained.push(candidate);
+    }
+
+    let protected_count = if protected.is_some_and(|path| path.exists()) {
+        1
+    } else {
+        0
+    };
+    let protected_bytes = protected
+        .filter(|path| path.exists())
+        .and_then(|path| coverage_recovery_bundle_bytes(path).ok())
+        .unwrap_or(0);
+    let mut total_count = retained.len().saturating_add(protected_count);
+    let mut total_bytes = retained.iter().fold(protected_bytes, |total, candidate| {
+        total.saturating_add(candidate.bytes)
+    });
+    // With no protected in-progress bundle, preserve the newest completed
+    // bundle even if its own profile happens to exceed the nominal byte cap.
+    let minimum_unprotected = if protected_count == 0 && !retained.is_empty() {
+        1
+    } else {
+        0
+    };
+    let mut remaining_unprotected = retained.len();
+    for candidate in retained {
+        if total_count <= limits.max_bundles && total_bytes <= limits.max_bytes {
+            break;
+        }
+        if remaining_unprotected <= minimum_unprotected {
+            break;
+        }
+        remaining_unprotected = remaining_unprotected.saturating_sub(1);
+        match std::fs::remove_dir_all(&candidate.path) {
+            Ok(()) => {
+                total_count = total_count.saturating_sub(1);
+                total_bytes = total_bytes.saturating_sub(candidate.bytes);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                total_count = total_count.saturating_sub(1);
+                total_bytes = total_bytes.saturating_sub(candidate.bytes);
+            }
+            Err(error) => tracing::debug!(
+                path = %candidate.path.display(),
+                error = %error,
+                "could not prune coverage recovery bundle",
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn create_coverage_recovery_dir(
+    recovery_parent: &Path,
+) -> Result<CoverageRecoveryDirectory, String> {
+    std::fs::create_dir_all(recovery_parent).map_err(|error| {
+        format!(
+            "create coverage recovery directory {}: {error}",
+            recovery_parent.display(),
+        )
+    })?;
+    if let Err(error) = gc_coverage_recovery_bundles_in(
+        recovery_parent,
+        std::time::SystemTime::now(),
+        CoverageRecoveryLimits::DEFAULT,
+        None,
+    ) {
+        tracing::warn!(
+            error = %error,
+            parent = %recovery_parent.display(),
+            "could not prune coverage recovery bundles before staging",
+        );
+    }
+    let directory = tempfile::Builder::new()
+        .prefix(COVERAGE_RECOVERY_PREFIX)
         .tempdir_in(recovery_parent)
         .map_err(|error| {
             format!(
                 "create coverage recovery staging directory in {}: {error}",
                 recovery_parent.display(),
             )
-        })
+        })?;
+    let live_path = directory.path().join(COVERAGE_RECOVERY_LIVE_LOCK);
+    let live = ktstr::flock::try_flock(&live_path, ktstr::flock::FlockMode::Exclusive)
+        .map_err(|error| {
+            format!(
+                "acquire coverage recovery liveness lock {}: {error:#}",
+                live_path.display(),
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "new coverage recovery liveness lock is unexpectedly held: {}",
+                live_path.display(),
+            )
+        })?;
+    Ok(CoverageRecoveryDirectory {
+        directory,
+        _live: live.into(),
+    })
 }
 
 fn environment_value<'a>(environment: &'a [(OsString, OsString)], name: &str) -> Option<&'a OsStr> {
@@ -2845,7 +3205,7 @@ fn stage_profraw_for_report_in(
             .ok_or_else(|| format!("coverage profile has no file name: {}", profile.display()))?;
         let destination = recovery.path().join(name);
         if let Err(error) = std::fs::rename(profile, &destination) {
-            let retained = recovery.keep();
+            let retained = recovery.keep(&recovery_parent);
             return Err(format!(
                 "stage coverage profile {} -> {}: {error}; already-staged shards retained at {}",
                 profile.display(),
@@ -2953,6 +3313,173 @@ fn remove_cached_profraw_shards(directory: &Path) -> ProfrawCleanup {
         }
     }
     cleanup
+}
+
+fn append_shell_word(script: &mut Vec<u8>, value: &OsStr) {
+    script.push(b'\'');
+    for byte in value.as_bytes() {
+        if *byte == b'\'' {
+            script.extend_from_slice(b"'\"'\"'");
+        } else {
+            script.push(*byte);
+        }
+    }
+    script.push(b'\'');
+}
+
+fn write_retained_coverage_report_script(
+    bundle: &Path,
+    report_dir: &Path,
+    environment: &[(OsString, OsString)],
+    llvm_cov_flags: &OsStr,
+    report_args: &[String],
+    target_directory: &Path,
+    build_directory: &Path,
+) -> Result<PathBuf, String> {
+    let profile_name = environment_value(environment, "LLVM_PROFILE_FILE")
+        .and_then(|value| Path::new(value).file_name())
+        .map_or_else(
+            || OsString::from("ktstr-%p-%m.profraw"),
+            OsStr::to_os_string,
+        );
+    let mut environment = environment
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    environment.insert(
+        OsString::from("CARGO_LLVM_COV_TARGET_DIR"),
+        target_directory.as_os_str().to_os_string(),
+    );
+    environment.insert(
+        OsString::from("CARGO_LLVM_COV_BUILD_DIR"),
+        build_directory.as_os_str().to_os_string(),
+    );
+    environment.insert(
+        OsString::from("LLVM_PROFILE_FILE"),
+        target_directory.join(profile_name).into_os_string(),
+    );
+    environment.insert(
+        OsString::from("LLVM_COV_FLAGS"),
+        llvm_cov_flags.to_os_string(),
+    );
+
+    let mut script = b"#!/bin/sh\nset -eu\nexec 9>".to_vec();
+    append_shell_word(
+        &mut script,
+        bundle.join(COVERAGE_RECOVERY_LIVE_LOCK).as_os_str(),
+    );
+    script.extend_from_slice(b"\nflock --exclusive 9\nrm -f ");
+    append_shell_word(
+        &mut script,
+        bundle.join(COVERAGE_RECOVERY_SIZE_FILE).as_os_str(),
+    );
+    script.extend_from_slice(b"\ncd ");
+    append_shell_word(&mut script, report_dir.as_os_str());
+    script.push(b'\n');
+    for (name, value) in &environment {
+        let name_bytes = name.as_bytes();
+        let valid_name = !name_bytes.is_empty()
+            && (name_bytes[0].is_ascii_alphabetic() || name_bytes[0] == b'_')
+            && name_bytes[1..]
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
+        if !valid_name {
+            return Err(format!(
+                "coverage report environment has invalid shell variable name: {:?}",
+                name,
+            ));
+        }
+        script.extend_from_slice(b"export ");
+        script.extend_from_slice(name_bytes);
+        script.push(b'=');
+        append_shell_word(&mut script, value);
+        script.push(b'\n');
+    }
+    script.extend_from_slice(b"exec cargo llvm-cov");
+    for argument in report_args {
+        script.push(b' ');
+        append_shell_word(&mut script, OsStr::new(argument));
+    }
+    script.push(b'\n');
+
+    let path = bundle.join("report.sh");
+    std::fs::write(&path, script)
+        .map_err(|error| format!("write retained coverage report script: {error}"))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).map_err(|error| {
+        format!(
+            "make retained coverage report script executable {}: {error}",
+            path.display(),
+        )
+    })?;
+    Ok(path)
+}
+
+/// Retain a complete cached `--no-report` run for a later report.
+///
+/// Raw shards are merged with the cached producer profile first, then moved
+/// out of cargo-llvm-cov's scan directory so a later report consumes the exact
+/// merged profile instead of overwriting it. The complete instrumented
+/// artifact materialization is installed beside those raw recovery inputs and
+/// an executable report script records the rebased environment and report
+/// argv.
+fn retain_cached_coverage_for_later_report(
+    coverage: &CachedCoverageReport,
+    cached: crate::nextest_artifact_cache::MaterializedNextestArtifacts,
+) -> Result<PathBuf, String> {
+    let runtime_profraw = profraw_files(&coverage.profraw_directory)?;
+    let mut inputs = Vec::with_capacity(runtime_profraw.len() + 1);
+    if let Some(producer_profdata) = &coverage.producer_profdata {
+        inputs.push(producer_profdata.clone());
+    }
+    inputs.extend(runtime_profraw);
+    let merge_failure = if inputs.is_empty() {
+        None
+    } else {
+        merge_profdata(
+            &coverage.report_dir,
+            &coverage.environment,
+            &inputs,
+            &coverage.merged_profdata,
+            llvm_cov_failure_mode(&coverage.report_args),
+        )
+        .err()
+    };
+    // On a successful merge, keep raw shards beside the bundle's recovery
+    // metadata so the replay target contains only the authoritative merged
+    // profile. If merging failed, leave the raws inside the artifact tree;
+    // preserving every input is more important than manufacturing a partial
+    // bundle which cannot be retried.
+    let staged = if merge_failure.is_none() {
+        stage_profraw_for_report(&coverage.profraw_directory)?
+    } else {
+        StagedProfraw {
+            directory: None,
+            recovery_parent: coverage_recovery_parent()?,
+            count: 0,
+        }
+    };
+    let retained = staged
+        .persist_with(&coverage.merged_profdata, true, |bundle| {
+            let (target_directory, build_directory) = cached.persist_for_coverage(bundle)?;
+            write_retained_coverage_report_script(
+                bundle,
+                &coverage.report_dir,
+                &coverage.environment,
+                &coverage.llvm_cov_flags,
+                &coverage.report_args,
+                &target_directory,
+                &build_directory,
+            )?;
+            Ok(())
+        })?
+        .ok_or_else(|| "--no-report produced no persistent coverage bundle".to_string())?;
+    if let Some(error) = merge_failure {
+        return Err(format!(
+            "pre-merge retained --no-report coverage: {error}; complete raw inputs and artifact closure retained at {}",
+            retained.display(),
+        ));
+    }
+    Ok(retained)
 }
 
 fn llvm_cov_flags_with_path_equivalence(
@@ -3941,9 +4468,9 @@ fn run_cargo_sub(
     } else {
         None
     };
-    let cached_nextest = if needs_prebuild
+    let mut cached_nextest = if needs_prebuild
         && archive_reuse_path.is_none()
-        && (sub_argv == TEST_SUB_ARGV || !llvm_cov_retains_artifacts(&args))
+        && (sub_argv == TEST_SUB_ARGV || !llvm_cov_requires_ordinary_retained_target(&args))
         && let Some(metadata) = nextest_metadata.as_ref()
     {
         let build_args = direct_nextest_build_surface_args(sub_argv, &args)?;
@@ -4239,17 +4766,49 @@ fn run_cargo_sub(
     if let Some(coverage) = &cached_coverage_report {
         if !status.success() && coverage.ignore_run_fail {
             eprintln!(
-                "cargo ktstr: coverage test run failed under --ignore-run-fail; generating report"
+                "cargo ktstr: coverage test run failed under --ignore-run-fail; {}",
+                if coverage.no_report {
+                    "retaining coverage inputs"
+                } else {
+                    "generating report"
+                },
             );
             final_success = true;
             final_failure = None;
         }
         // cargo-llvm-cov can merge every shard emitted before a failed test
-        // run stopped. Always perform that merge/report unless the user owns
-        // the raw lifecycle through --no-report. A report failure is
-        // secondary to an existing nextest failure and must not replace its
-        // authoritative signal.
-        if !coverage.no_report {
+        // run stopped. A cached --no-report invocation retains the complete
+        // COW artifact closure and a replay script in the bounded recovery
+        // namespace; ordinary invocations merge/report immediately. A
+        // post-run failure is secondary to an existing nextest failure and
+        // must not replace its authoritative signal.
+        if coverage.no_report {
+            let retention = cached_nextest
+                .take()
+                .ok_or_else(|| {
+                    "cached --no-report invocation lost its artifact closure".to_string()
+                })
+                .and_then(|cached| retain_cached_coverage_for_later_report(coverage, cached));
+            match retention {
+                Ok(path) => eprintln!(
+                    "cargo ktstr: retained --no-report coverage bundle at {}; run {}/report.sh to generate the report",
+                    path.display(),
+                    path.display(),
+                ),
+                Err(error) => {
+                    final_success = false;
+                    let retention_failure =
+                        format!("retain cached --no-report coverage inputs: {error}");
+                    if final_failure.is_some() {
+                        eprintln!(
+                            "cargo ktstr: coverage retention also failed; preserving the original test failure: {retention_failure}"
+                        );
+                    } else {
+                        final_failure = Some(retention_failure);
+                    }
+                }
+            }
+        } else {
             let runtime_profraw = profraw_files(&coverage.profraw_directory);
             let prepared = runtime_profraw.and_then(|runtime_profraw| {
                 let mut inputs = Vec::with_capacity(runtime_profraw.len() + 1);
@@ -7442,6 +8001,202 @@ path = "junit.xml"
         );
     }
 
+    fn recovery_bundle_fixture(
+        parent: &Path,
+        name: &str,
+        bytes: usize,
+        modified: std::time::SystemTime,
+    ) -> PathBuf {
+        let bundle = parent.join(name);
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("payload.profraw"), vec![b'x'; bytes]).unwrap();
+        std::fs::File::open(&bundle)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        bundle
+    }
+
+    #[test]
+    fn coverage_recovery_gc_removes_expired_bundles_deterministically() {
+        let root = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let expired = recovery_bundle_fixture(
+            root.path(),
+            "report-expired",
+            4,
+            now - std::time::Duration::from_secs(500),
+        );
+        let recent = recovery_bundle_fixture(
+            root.path(),
+            "report-recent",
+            4,
+            now - std::time::Duration::from_secs(10),
+        );
+
+        gc_coverage_recovery_bundles_in(
+            root.path(),
+            now,
+            CoverageRecoveryLimits {
+                max_age: std::time::Duration::from_secs(100),
+                max_bundles: 8,
+                max_bytes: 1_024,
+            },
+            None,
+        )
+        .unwrap();
+
+        assert!(!expired.exists());
+        assert!(recent.exists());
+    }
+
+    #[test]
+    fn coverage_recovery_gc_enforces_count_and_bytes_oldest_first() {
+        let root = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000);
+        let oldest = recovery_bundle_fixture(
+            root.path(),
+            "report-a",
+            4,
+            now - std::time::Duration::from_secs(30),
+        );
+        let middle = recovery_bundle_fixture(
+            root.path(),
+            "report-b",
+            5,
+            now - std::time::Duration::from_secs(20),
+        );
+        let newest = recovery_bundle_fixture(
+            root.path(),
+            "report-c",
+            6,
+            now - std::time::Duration::from_secs(10),
+        );
+
+        gc_coverage_recovery_bundles_in(
+            root.path(),
+            now,
+            CoverageRecoveryLimits {
+                max_age: std::time::Duration::from_secs(1_000),
+                max_bundles: 2,
+                max_bytes: 10,
+            },
+            None,
+        )
+        .unwrap();
+
+        assert!(!oldest.exists(), "count bound removes the oldest bundle");
+        assert!(
+            !middle.exists(),
+            "byte bound continues oldest-first pruning"
+        );
+        assert!(newest.exists(), "the newest diagnostic bundle is retained");
+    }
+
+    #[test]
+    fn coverage_recovery_gc_never_reclaims_a_live_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let live = create_coverage_recovery_dir(root.path()).unwrap();
+        let live_path = live.path().to_path_buf();
+        std::fs::write(live.path().join("active.profraw"), b"active").unwrap();
+        let now = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+
+        gc_coverage_recovery_bundles_in(
+            root.path(),
+            now,
+            CoverageRecoveryLimits {
+                max_age: std::time::Duration::ZERO,
+                max_bundles: 1,
+                max_bytes: 1,
+            },
+            None,
+        )
+        .unwrap();
+
+        assert!(live_path.exists());
+        drop(live);
+        assert!(
+            !live_path.exists(),
+            "green-path TempDir cleanup remains intact"
+        );
+    }
+
+    #[test]
+    fn no_report_bundle_is_persistent_and_contains_replayable_report_script() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let profiles = root.path().join("profiles");
+        let recovery = root.path().join("recovery");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(profiles.join("runtime.profraw"), b"raw").unwrap();
+        let merged = profiles.join("workspace.profdata");
+        std::fs::write(&merged, b"merged").unwrap();
+        let staged = stage_profraw_for_report_in(&profiles, recovery).unwrap();
+
+        let retained = staged
+            .persist_with(&merged, true, |bundle| {
+                let target = bundle.join("artifacts/target");
+                let build = target.join("build");
+                std::fs::create_dir_all(&build).unwrap();
+                write_retained_coverage_report_script(
+                    bundle,
+                    Path::new("/work/it's-here"),
+                    &[(
+                        OsString::from("LLVM_PROFILE_FILE"),
+                        OsString::from("/ephemeral/old-%p.profraw"),
+                    )],
+                    OsStr::new("--path-equivalence=/cache,/work"),
+                    &strs(&["report", "--lcov", "--output-path=/work/lcov.info"]),
+                    &target,
+                    &build,
+                )?;
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(retained.join("runtime.profraw")).unwrap(),
+            b"raw"
+        );
+        assert_eq!(
+            std::fs::read(retained.join("merged.profdata")).unwrap(),
+            b"merged"
+        );
+        let script_path = retained.join("report.sh");
+        let script = std::fs::read(&script_path).unwrap();
+        assert!(
+            script
+                .windows(b"artifacts/target".len())
+                .any(|window| window == b"artifacts/target")
+        );
+        assert!(
+            !script
+                .windows(b"/ephemeral/".len())
+                .any(|window| window == b"/ephemeral/")
+        );
+        assert!(
+            script
+                .windows(b"'\"'\"'".len())
+                .any(|window| window == b"'\"'\"'")
+        );
+        assert!(
+            script
+                .windows(b"flock --exclusive 9".len())
+                .any(|window| window == b"flock --exclusive 9"),
+            "replay must hold the same liveness lock as recovery GC",
+        );
+        assert_eq!(
+            std::fs::metadata(script_path).unwrap().permissions().mode() & 0o777,
+            0o700,
+        );
+        assert!(
+            retained.exists(),
+            "TempDir ownership was detached on retention"
+        );
+    }
+
     #[test]
     fn cached_coverage_missing_profile_directory_is_an_empty_input_set() {
         let root = tempfile::tempdir().expect("coverage deletion fixture");
@@ -8914,6 +9669,24 @@ path = "junit.xml"
             );
             assert_eq!(argv, strs(&["llvm-cov", "nextest", retained]));
         }
+    }
+
+    #[test]
+    fn cached_coverage_retains_lone_no_report_but_not_mutable_target_modes() {
+        assert!(
+            !llvm_cov_requires_ordinary_retained_target(&strs(&["--no-report"])),
+            "a lone --no-report is retained as one bounded complete COW bundle",
+        );
+        assert!(llvm_cov_requires_ordinary_retained_target(&strs(&[
+            "--no-clean"
+        ])));
+        assert!(llvm_cov_requires_ordinary_retained_target(&strs(&[
+            "--no-run"
+        ])));
+        assert!(llvm_cov_requires_ordinary_retained_target(&strs(&[
+            "--no-report",
+            "--no-clean",
+        ])));
     }
 
     #[test]

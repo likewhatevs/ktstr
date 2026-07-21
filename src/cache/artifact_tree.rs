@@ -698,6 +698,57 @@ impl MaterializedArtifactTree {
         self.directory.path()
     }
 
+    /// Move this private COW materialization into a caller-owned persistent
+    /// directory.
+    ///
+    /// The rename occurs while the materialization liveness lock and artifact
+    /// closure lease are still held. This closes the otherwise-racy gap
+    /// between disabling [`tempfile::TempDir`] cleanup and installing the tree
+    /// in a lifecycle-managed namespace. The destination must be on the same
+    /// filesystem and must not already exist.
+    #[doc(hidden)]
+    pub fn persist_at(self, destination: &Path) -> Result<PathBuf> {
+        anyhow::ensure!(
+            !destination.exists(),
+            "persistent artifact-tree destination already exists: {}",
+            destination.display(),
+        );
+        let parent = destination.parent().with_context(|| {
+            format!(
+                "persistent artifact-tree destination has no parent: {}",
+                destination.display(),
+            )
+        })?;
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "create persistent artifact-tree parent {}",
+                parent.display(),
+            )
+        })?;
+
+        let MaterializedArtifactTree {
+            directory,
+            _live,
+            _closure,
+            ..
+        } = self;
+        let source = directory.path().to_path_buf();
+        std::fs::rename(&source, destination).with_context(|| {
+            format!(
+                "persist artifact-tree materialization {} -> {}",
+                source.display(),
+                destination.display(),
+            )
+        })?;
+        // The directory has moved while its liveness lock was held. Disarm
+        // TempDir cleanup before releasing that lock; the caller's lifecycle
+        // manager owns the destination from this point forward.
+        let _detached_source = directory.keep();
+        drop(_live);
+        drop(_closure);
+        Ok(destination.to_path_buf())
+    }
+
     /// Input-addressed identity of this tree.
     pub fn identity(&self) -> u64 {
         self.identity

@@ -107,6 +107,54 @@ impl MaterializedNextestArtifacts {
         self.tree.cache_hit()
     }
 
+    /// Install the complete instrumented closure in a persistent coverage
+    /// recovery bundle.
+    ///
+    /// `--no-report` must retain more than raw counters: a later
+    /// `cargo llvm-cov report` also needs the exact instrumented binaries and
+    /// build layout which produced them. All regular files remain private
+    /// FICLONE inodes; this moves the already-materialized tree without
+    /// copying its contents.
+    pub(crate) fn persist_for_coverage(
+        self,
+        bundle_root: &Path,
+    ) -> Result<(PathBuf, PathBuf), String> {
+        let materialization_root = self.tree.root().to_path_buf();
+        let target_relative = self
+            .target_directory
+            .strip_prefix(&materialization_root)
+            .map_err(|_| {
+                format!(
+                    "cached coverage target {} is outside materialization {}",
+                    self.target_directory.display(),
+                    materialization_root.display(),
+                )
+            })?
+            .to_path_buf();
+        let build_relative = self
+            .build_directory
+            .strip_prefix(&materialization_root)
+            .map_err(|_| {
+                format!(
+                    "cached coverage build directory {} is outside materialization {}",
+                    self.build_directory.display(),
+                    materialization_root.display(),
+                )
+            })?
+            .to_path_buf();
+        let destination = bundle_root.join("artifacts");
+        self.tree.persist_at(&destination).map_err(|error| {
+            format!(
+                "persist cached coverage artifact closure at {}: {error:#}",
+                destination.display(),
+            )
+        })?;
+        Ok((
+            destination.join(target_relative),
+            destination.join(build_relative),
+        ))
+    }
+
     pub(crate) fn remap_cargo_args(&self, arguments: &[String]) -> Vec<String> {
         self._stable_source.remap_cargo_args(arguments)
     }

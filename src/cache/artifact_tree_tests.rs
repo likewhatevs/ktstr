@@ -449,6 +449,42 @@ fn cow_clone_reads_the_leased_inode_after_its_path_is_replaced() {
 }
 
 #[test]
+fn persistent_materialization_moves_under_liveness_lock_and_survives_drop() {
+    let _environment = lock_env();
+    let temp = tempfile::tempdir().unwrap();
+    let cache_root = temp.path().join("cas");
+    let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, &cache_root);
+    let source_root = temp.path().join("checkout");
+    let materializations = temp.path().join("materializations");
+    let destination = temp.path().join("coverage/report-artifacts");
+    write_fixture_tree(&source_root, b"retained-cow-tree");
+
+    let tree = ArtifactTreeCache::new(temp.path().join("records"))
+        .load_or_build(
+            0xc0_0c_0a_9e,
+            &materializations,
+            "persistent-artifact-tree-test",
+            || Ok(true),
+            || false,
+            || Ok(source_from_fixture(&source_root)),
+        )
+        .unwrap();
+    let former_root = tree.root().to_path_buf();
+    let retained = tree.persist_at(&destination).unwrap();
+
+    assert_eq!(retained, destination);
+    assert!(!former_root.exists());
+    assert_eq!(
+        std::fs::read(retained.join("target/debug/deps/harness-a1b2")).unwrap(),
+        b"retained-cow-tree",
+    );
+    assert!(
+        retained.exists(),
+        "consuming the TempDir-backed owner must not remove the installed tree",
+    );
+}
+
+#[test]
 fn stale_materialization_gc_observes_cross_process_liveness_lock() {
     let temp = tempfile::tempdir().unwrap();
     let stale = temp.path().join(format!("{MATERIALIZATION_PREFIX}dead"));
