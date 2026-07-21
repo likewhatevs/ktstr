@@ -138,6 +138,7 @@ pub fn read_scheduler_manifest_and_validate_admission_stamp(
             path.display(),
         )
     })?;
+    scheduler_manifest_stamp::advise_sparse_elf(&data);
     let reader = scheduler_manifest_stamp::ElfStampReader::new(path, &data)?;
     let manifest = scheduler_manifest_stamp::read_scheduler_manifest_stamp_reader(&reader)?;
     admission_stamp::validate_admission_stamp_envelope_reader(&reader)?;

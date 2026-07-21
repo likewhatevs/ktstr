@@ -2654,6 +2654,74 @@ const TOCTOU_RETRY_DELAYS: [std::time::Duration; ACQUIRE_MAX_TOCTOU_RETRIES as u
     std::time::Duration::from_millis(200),
 ];
 
+/// `/proc/locks` is a live seq-file rather than an atomic snapshot. Retry-
+/// exhausted diagnostics may therefore need a few independent reads to
+/// attribute a stable holder which the authoritative flock probe already
+/// observed. This budget is deliberately failure-only: successful admission
+/// and the bounded TOCTOU retry loop pay none of it.
+const HOLDER_DIAGNOSTIC_MAX_SAMPLES: usize = 4;
+const HOLDER_DIAGNOSTIC_RESCAN_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+const HOLDER_DIAGNOSTIC_RESCAN_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
+
+fn holder_snapshot_covers_expected_llcs(
+    snapshots: &[LlcSnapshot],
+    expected_llcs: &std::collections::BTreeSet<usize>,
+) -> bool {
+    expected_llcs.iter().all(|expected| {
+        snapshots
+            .iter()
+            .find(|snapshot| snapshot.llc_idx == *expected)
+            .is_some_and(|snapshot| !snapshot.holders.is_empty())
+    })
+}
+
+fn retry_exhausted_holder_snapshots_with<Scan, Wait>(
+    expected_llcs: &std::collections::BTreeSet<usize>,
+    max_samples: usize,
+    mut scan: Scan,
+    mut wait_for_rescan: Wait,
+) -> Result<Vec<LlcSnapshot>>
+where
+    Scan: FnMut() -> Result<Vec<LlcSnapshot>>,
+    Wait: FnMut(usize) -> bool,
+{
+    anyhow::ensure!(max_samples > 0, "holder diagnostic sample budget is zero");
+    let mut snapshots = scan()?;
+    let mut completed_samples = 1usize;
+    while !holder_snapshot_covers_expected_llcs(&snapshots, expected_llcs)
+        && completed_samples < max_samples
+        && wait_for_rescan(completed_samples)
+    {
+        snapshots = scan()?;
+        completed_samples += 1;
+    }
+    Ok(snapshots)
+}
+
+fn retry_exhausted_holder_snapshots(
+    topo: &HostTopology,
+    allowed: &std::collections::BTreeSet<usize>,
+    mountinfo: &str,
+    expected_llcs: &std::collections::BTreeSet<usize>,
+) -> Result<Vec<LlcSnapshot>> {
+    let mut deadline = None;
+    retry_exhausted_holder_snapshots_with(
+        expected_llcs,
+        HOLDER_DIAGNOSTIC_MAX_SAMPLES,
+        || discover_llc_snapshots(topo, allowed, mountinfo),
+        |_| {
+            let deadline = *deadline
+                .get_or_insert_with(|| std::time::Instant::now() + HOLDER_DIAGNOSTIC_RESCAN_WINDOW);
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            std::thread::sleep(HOLDER_DIAGNOSTIC_RESCAN_DELAY.min(deadline - now));
+            true
+        },
+    )
+}
+
 /// DISCOVER phase — read-only LLC snapshot.
 ///
 /// Walks ONLY the LLCs whose CPUs overlap `allowed` (the calling
@@ -3485,12 +3553,11 @@ impl MemoryPermitPool {
     }
 }
 
-/// Capacity held while a test process prepares immutable artifacts and waits
-/// for its exact run placement. Preparation is deliberately expressed in the
-/// same abstract CPU and memory permit namespaces as a running VM. A complete
-/// preparation wave can therefore consume only its one-quarter private/COW
-/// budget, and activation replaces that estimate with the computed guest
-/// demand in the same admission transaction before guest allocation.
+/// Capacity held while a test process prepares immutable artifacts. Active
+/// preparation is expressed in the same abstract CPU and memory namespaces as
+/// a running VM. Once preparation completes, the CPU side is released and the
+/// same PENDING ticket retains only its token plus private/COW memory charge
+/// until exact admission replaces that estimate with computed guest demand.
 pub(super) struct PreparationPermit {
     pub(super) index: usize,
     pub(super) token_permit: usize,
@@ -3528,13 +3595,38 @@ impl PreparationPermit {
         } else {
             protocol::AdmissionClass::Ordinary
         };
+        let claimed_cpu = self
+            .affinity_lock
+            .as_ref()
+            .map(|_| std::slice::from_ref(&self.affinity_cpu))
+            .unwrap_or_default();
         resource_claim_with_permits(
             &[],
             LlcLockMode::Shared,
-            &[self.affinity_cpu],
+            claimed_cpu,
             FlockMode::Shared,
             &self.all_permits(),
             admission_class,
+        )
+    }
+
+    /// Claim retained after immutable preparation and before exact run
+    /// admission. The token bounds the number of resident prepared processes,
+    /// while the fixed memory charge accounts their private/COW footprint.
+    /// CPU permits and the physical affinity CPU are preparation-time work
+    /// resources and must not remain in the exact-admission queue.
+    pub(super) fn residency_claim(&self) -> protocol::ClaimSet {
+        let mut permits = Vec::with_capacity(1 + self.memory_permits.len());
+        permits.push(self.token_permit);
+        permits.extend_from_slice(&self.memory_permits);
+        permits.sort_unstable();
+        resource_claim_with_permits(
+            &[],
+            LlcLockMode::Shared,
+            &[],
+            FlockMode::Shared,
+            &permits,
+            protocol::AdmissionClass::Ordinary,
         )
     }
 
@@ -3605,6 +3697,26 @@ impl PreparationPermit {
             .context("restore affinity before exact VM admission")?;
         self.affinity_constrained = false;
         Ok(())
+    }
+
+    /// Release the CPU side of preparation after the registry has replaced
+    /// the active-preparation claim with [`Self::residency_claim`]. This is
+    /// deliberately infallible after construction/import validation: once the
+    /// registry transition commits, returning with CPU OFDs retained would
+    /// recreate the convoy this phase boundary exists to prevent.
+    pub(super) fn release_preparation_cpu(&mut self) {
+        debug_assert!(!self.affinity_constrained);
+        drop(self.affinity_lock.take());
+        let cpu_permits = std::mem::take(&mut self.cpu_permits)
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        self.permit_fds
+            .retain(|(permit, _)| !cpu_permits.contains(permit));
+        debug_assert_eq!(
+            self.permit_fds.len(),
+            1 + self.memory_permits.len(),
+            "prepared residency must retain exactly its token and memory OFDs",
+        );
     }
 
     /// The exact registry claim has atomically replaced PENDING, so its
@@ -3821,6 +3933,7 @@ enum PreparationAffinityAttempt {
 fn try_acquire_preparation_affinity_cpu(
     allowed: &[usize],
     rotation: usize,
+    wait_for_registry: bool,
 ) -> Result<PreparationAffinityAttempt> {
     anyhow::ensure!(!allowed.is_empty(), "preparation has no allowed host CPU");
     let required = protocol::ClaimSet::with_modes(
@@ -3829,7 +3942,16 @@ fn try_acquire_preparation_affinity_cpu(
         FlockMode::Shared,
         FlockMode::Shared,
     );
-    let snapshot = protocol::registered_claim_snapshot(&required)?;
+    let snapshot = if wait_for_registry {
+        protocol::registered_claim_snapshot(&required)?
+    } else {
+        let Some(snapshot) = protocol::try_registered_claim_snapshot(&required)? else {
+            return Ok(PreparationAffinityAttempt::Contended(
+                std::path::PathBuf::from(cpu_lock_path(allowed[rotation % allowed.len()])),
+            ));
+        };
+        snapshot
+    };
     let start = rotation % allowed.len();
     let mut candidates = Vec::with_capacity(allowed.len());
     for (rank, &cpu) in allowed
@@ -3877,14 +3999,35 @@ fn try_acquire_preparation_affinity_cpu(
 
 enum PreparationPermitAttempt {
     Acquired(PreparationPermit, protocol::ClaimSet),
-    Contended(std::path::PathBuf, FlockMode),
+    TokenContended {
+        index: usize,
+        token_permit: usize,
+        path: std::path::PathBuf,
+    },
+    ResourceContended(std::path::PathBuf, FlockMode),
 }
 
-fn try_acquire_preparation_permit(
+#[cfg(test)]
+thread_local! {
+    static PREPARATION_RESOURCE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_preparation_resource_probe_count_for_tests() {
+    PREPARATION_RESOURCE_PROBES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn preparation_resource_probe_count_for_tests() -> usize {
+    PREPARATION_RESOURCE_PROBES.with(std::cell::Cell::get)
+}
+
+fn try_acquire_preparation_permit_at(
     index: usize,
     token_permit: usize,
     rotation: usize,
     preheld_token: Option<std::os::fd::OwnedFd>,
+    wait_for_registry: bool,
 ) -> Result<PreparationPermitAttempt> {
     let cpu = AdmissionPermitPool::for_host(possible_cpu_width());
     let memory = MemoryPermitPool::for_host()?;
@@ -3902,12 +4045,15 @@ fn try_acquire_preparation_permit(
     } else if let Some(fd) = acquire_one(token_permit)? {
         fd
     } else {
-        return Ok(PreparationPermitAttempt::Contended(
-            std::path::PathBuf::from(permit_lock_path(token_permit)),
-            FlockMode::Exclusive,
-        ));
+        return Ok(PreparationPermitAttempt::TokenContended {
+            index,
+            token_permit,
+            path: std::path::PathBuf::from(permit_lock_path(token_permit)),
+        });
     };
     permit_fds.push((token_permit, token_fd));
+    #[cfg(test)]
+    PREPARATION_RESOURCE_PROBES.with(|count| count.set(count.get().saturating_add(1)));
 
     let ordered_cpu = cpu.all().collect::<Vec<_>>();
     let cpu_start = rotation % ordered_cpu.len();
@@ -3925,7 +4071,7 @@ fn try_acquire_preparation_permit(
         }
     }
     if permit_fds.len() != 1 + PREPARATION_CPU_PERMITS {
-        return Ok(PreparationPermitAttempt::Contended(
+        return Ok(PreparationPermitAttempt::ResourceContended(
             first_cpu_contention.expect("incomplete CPU preparation weight observed contention"),
             FlockMode::Exclusive,
         ));
@@ -3950,7 +4096,7 @@ fn try_acquire_preparation_permit(
         }
     }
     if permit_fds.len() != 1 + PREPARATION_CPU_PERMITS + memory_required {
-        return Ok(PreparationPermitAttempt::Contended(
+        return Ok(PreparationPermitAttempt::ResourceContended(
             first_memory_contention
                 .expect("incomplete memory preparation weight observed contention"),
             FlockMode::Exclusive,
@@ -3968,13 +4114,19 @@ fn try_acquire_preparation_permit(
     let affinity_rotation = cpu_permits
         .iter()
         .fold(rotation, |seed, permit| seed.rotate_left(7) ^ permit);
-    let (affinity_cpu, affinity_lock) =
-        match try_acquire_preparation_affinity_cpu(&original_affinity, affinity_rotation)? {
-            PreparationAffinityAttempt::Acquired(cpu, fd) => (cpu, fd),
-            PreparationAffinityAttempt::Contended(path) => {
-                return Ok(PreparationPermitAttempt::Contended(path, FlockMode::Shared));
-            }
-        };
+    let (affinity_cpu, affinity_lock) = match try_acquire_preparation_affinity_cpu(
+        &original_affinity,
+        affinity_rotation,
+        wait_for_registry,
+    )? {
+        PreparationAffinityAttempt::Acquired(cpu, fd) => (cpu, fd),
+        PreparationAffinityAttempt::Contended(path) => {
+            return Ok(PreparationPermitAttempt::ResourceContended(
+                path,
+                FlockMode::Shared,
+            ));
+        }
+    };
     permit_fds.sort_by_key(|(permit, _)| *permit);
     let preparation = PreparationPermit {
         index,
@@ -3991,6 +4143,84 @@ fn try_acquire_preparation_permit(
     Ok(PreparationPermitAttempt::Acquired(preparation, claim))
 }
 
+fn try_acquire_preparation_permit_sweep(
+    tokens: &std::ops::Range<usize>,
+    start: usize,
+    rotation_bias: usize,
+    turn: usize,
+    wait_for_registry: bool,
+) -> Result<PreparationPermitAttempt> {
+    let mut first_token_contention = None;
+    for offset in 0..tokens.len() {
+        let index = (start + offset) % tokens.len();
+        match try_acquire_preparation_permit_at(
+            index,
+            tokens.start + index,
+            start
+                .wrapping_add(offset)
+                .wrapping_add(turn)
+                .wrapping_add(rotation_bias),
+            None,
+            wait_for_registry,
+        )? {
+            acquired @ PreparationPermitAttempt::Acquired(_, _) => return Ok(acquired),
+            contended @ PreparationPermitAttempt::TokenContended { .. } => {
+                first_token_contention.get_or_insert(contended);
+            }
+            contended @ PreparationPermitAttempt::ResourceContended(_, _) => {
+                // CPU, memory, and affinity selection each scans its complete
+                // global namespace. Once one free token reaches such a miss,
+                // rotating to another token cannot create capacity and would
+                // only repeat thousands of identical flock probes.
+                return Ok(contended);
+            }
+        }
+    }
+    Ok(first_token_contention.expect("non-empty preparation token range was fully scanned"))
+}
+
+pub(super) enum PreparationCandidateDecision<T> {
+    Accepted(T),
+    Retry,
+    Contended,
+}
+
+/// Visit each immediately available preparation tuple once without sleeping.
+/// A registry claim conflict may reject one tuple and continue at the next
+/// token; registry-lock or global physical contention terminates the sweep.
+pub(super) fn try_preparation_candidates_once<T>(
+    rotation_bias: usize,
+    mut decide: impl FnMut(
+        PreparationPermit,
+        protocol::ClaimSet,
+    ) -> Result<PreparationCandidateDecision<T>>,
+) -> Result<Option<T>> {
+    let tokens = preparation_token_range()?;
+    let count = tokens.len();
+    let start = (pid_window_offset(std::process::id(), count) + rotation_bias) % count;
+    for offset in 0..count {
+        let index = (start + offset) % count;
+        match try_acquire_preparation_permit_at(
+            index,
+            tokens.start + index,
+            start.wrapping_add(offset).wrapping_add(rotation_bias),
+            None,
+            false,
+        )? {
+            PreparationPermitAttempt::Acquired(preparation, claim) => {
+                match decide(preparation, claim)? {
+                    PreparationCandidateDecision::Accepted(value) => return Ok(Some(value)),
+                    PreparationCandidateDecision::Retry => {}
+                    PreparationCandidateDecision::Contended => return Ok(None),
+                }
+            }
+            PreparationPermitAttempt::TokenContended { .. } => {}
+            PreparationPermitAttempt::ResourceContended(_, _) => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
 pub(super) fn acquire_preparation_permit(
     rotation_bias: usize,
 ) -> Result<(PreparationPermit, protocol::ClaimSet)> {
@@ -4004,51 +4234,51 @@ pub(super) fn acquire_preparation_permit(
     // one busy token after other token queues have drained.
     let mut turn = 0usize;
     loop {
-        for offset in 0..count {
-            let index = (start + offset) % count;
-            if let PreparationPermitAttempt::Acquired(preparation, claim) =
-                try_acquire_preparation_permit(
-                    index,
-                    tokens.start + index,
-                    start
-                        .wrapping_add(offset)
-                        .wrapping_add(turn)
-                        .wrapping_add(rotation_bias),
-                    None,
-                )?
-            {
+        match try_acquire_preparation_permit_sweep(&tokens, start, rotation_bias, turn, true)? {
+            PreparationPermitAttempt::Acquired(preparation, claim) => {
                 return Ok((preparation, claim));
             }
-        }
-
-        let index = (start + turn) % count;
-        let token_permit = tokens.start + index;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        if let Some(token_fd) = block_flock_deadline(
-            permit_lock_path(token_permit),
-            FlockMode::Exclusive,
-            deadline,
-        )? {
-            match try_acquire_preparation_permit(
+            PreparationPermitAttempt::ResourceContended(path, mode) => {
+                drop(block_flock_deadline(
+                    path,
+                    mode,
+                    std::time::Instant::now() + std::time::Duration::from_secs(2),
+                )?);
+            }
+            PreparationPermitAttempt::TokenContended {
                 index,
                 token_permit,
-                start.wrapping_add(turn).wrapping_add(rotation_bias),
-                Some(token_fd),
-            )? {
-                PreparationPermitAttempt::Acquired(preparation, claim) => {
-                    return Ok((preparation, claim));
-                }
-                PreparationPermitAttempt::Contended(path, mode) => {
-                    // The token fd and every partial resource owner were
-                    // dropped with the failed attempt. Sleep on the concrete
-                    // resource that prevented a complete preparation set;
-                    // granting it is only a wake event, so release it before
-                    // the next all-token scan.
-                    drop(block_flock_deadline(
-                        path,
-                        mode,
-                        std::time::Instant::now() + std::time::Duration::from_secs(2),
-                    )?);
+                path,
+            } => {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                if let Some(token_fd) = block_flock_deadline(path, FlockMode::Exclusive, deadline)?
+                {
+                    match try_acquire_preparation_permit_at(
+                        index,
+                        token_permit,
+                        start.wrapping_add(turn).wrapping_add(rotation_bias),
+                        Some(token_fd),
+                        true,
+                    )? {
+                        PreparationPermitAttempt::Acquired(preparation, claim) => {
+                            return Ok((preparation, claim));
+                        }
+                        PreparationPermitAttempt::ResourceContended(path, mode) => {
+                            // The token fd and every partial resource owner were
+                            // dropped with the failed attempt. Sleep on the concrete
+                            // resource that prevented a complete preparation set;
+                            // granting it is only a wake event, so release it before
+                            // the next all-token scan.
+                            drop(block_flock_deadline(
+                                path,
+                                mode,
+                                std::time::Instant::now() + std::time::Duration::from_secs(2),
+                            )?);
+                        }
+                        PreparationPermitAttempt::TokenContended { .. } => {
+                            unreachable!("a preheld preparation token cannot be contended")
+                        }
+                    }
                 }
             }
         }
@@ -5316,11 +5546,22 @@ where
 
     if !wait {
         // Rebuild holder diagnostics from a FRESH read so the error
-        // points at the peer that actually won.
+        // points at the peer that actually won. `/proc/locks` is a live
+        // seq-file, so an authoritative physical-contention marker whose
+        // holder is absent from one image gets a bounded failure-only rescan.
         let mountinfo = crate::flock::read_mountinfo().map_err(|e| ResourceContention {
             reason: format!("read /proc/self/mountinfo for holder diagnostics: {e}"),
         })?;
-        let final_snapshots = discover_llc_snapshots(topo, &allowed, &mountinfo)?;
+        let expected_holder_llcs = contention
+            .marker_vec()
+            .into_iter()
+            .filter_map(|marker| match marker.blocker {
+                protocol::ResourceKey::Llc(llc) => Some(llc),
+                protocol::ResourceKey::Cpu(_) | protocol::ResourceKey::Permit(_) => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let final_snapshots =
+            retry_exhausted_holder_snapshots(topo, &allowed, &mountinfo, &expected_holder_llcs)?;
         let holders: Vec<String> = final_snapshots
             .iter()
             .filter(|s| !s.holders.is_empty())

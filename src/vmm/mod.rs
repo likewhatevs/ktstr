@@ -1295,7 +1295,7 @@ impl KtstrVm {
         // heavyweight test binary is exec'd. Presence is authoritative: a
         // malformed or mismatched handoff is an error, never a silent second
         // acquisition.
-        let pending_admission = match take_pending_exec_handoff(self)? {
+        let mut pending_admission = match take_pending_exec_handoff(self)? {
             Some(pending) => pending,
             None => host_topology::protocol::register_pending_admission(
                 host_topology::admission_resource_capacity_hint()?,
@@ -1334,6 +1334,7 @@ impl KtstrVm {
         // (wait = true) for the authoritative flock release rather
         // than converting a transient peer hold into a host-skip.
         let memory_mib = self.prepared_memory_mib(prepared_initrd.as_ref())?;
+        pending_admission.finish_preparation()?;
         let run_locks = self.acquire_run_locks(true, Some(pending_admission), memory_mib)?;
         let runtime_mbind_node_map = if self.performance_mode {
             run_locks
@@ -1646,6 +1647,22 @@ impl KtstrVm {
         } else {
             self.acquire_run_locks(false, Some(pending), memory_mib)
         }
+    }
+
+    /// Acquire only immediately available preparation capacity for an
+    /// interactive shell. Generated test cells deliberately wait here, but a
+    /// shell's documented no-wait admission must surface saturation before
+    /// immutable preparation instead of joining the continuous nextest wave.
+    fn register_interactive_pending_admission() -> Result<host_topology::protocol::PendingAdmission>
+    {
+        host_topology::protocol::try_register_pending_admission(
+            host_topology::admission_resource_capacity_hint()?,
+        )?
+        .ok_or_else(|| {
+            anyhow::Error::new(host_topology::ResourceContention {
+                reason: "CPU/memory preparation admission is busy".into(),
+            })
+        })
     }
 
     /// Resolve only placement backed by this interactive invocation's
@@ -2703,9 +2720,7 @@ impl KtstrVm {
         let start = Instant::now();
         let pending = match take_pending_exec_handoff(self)? {
             Some(pending) => pending,
-            None => host_topology::protocol::register_pending_admission(
-                host_topology::admission_resource_capacity_hint()?,
-            )?,
+            None => Self::register_interactive_pending_admission()?,
         };
         // Keep immutable image preparation outside exact admission just as in
         // the non-interactive path.

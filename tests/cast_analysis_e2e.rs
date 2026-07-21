@@ -167,6 +167,62 @@ fn struct_member<'a>(
     })
 }
 
+/// Peel every truncation wrapper around a rendered value.
+///
+/// A clipped pointer chase legitimately produces two wrappers: the
+/// chase records that its read was shorter than the pointee's BTF
+/// size, then the inner struct renderer independently records that
+/// the same byte slice was shorter than the struct. Keep walking
+/// until the underlying value is reached rather than baking in one
+/// particular number of clipping layers.
+fn peel_truncated<'a>(
+    mut value: &'a serde_json::Value,
+    dump_artifact: &str,
+) -> Result<(&'a serde_json::Value, usize)> {
+    let mut depth = 0usize;
+    while value.get("kind").and_then(|kind| kind.as_str()) == Some("truncated") {
+        value = value.get("partial").ok_or_else(|| {
+            anyhow::anyhow!(
+                "Truncated value at depth {depth} has no `partial`; \
+                 {dump_artifact}"
+            )
+        })?;
+        depth += 1;
+    }
+    Ok((value, depth))
+}
+
+#[test]
+fn peel_truncated_reaches_struct_through_multiple_clipping_layers() {
+    let rendered = serde_json::json!({
+        "kind": "truncated",
+        "needed": 8240,
+        "had": 4096,
+        "partial": {
+            "kind": "truncated",
+            "needed": 8240,
+            "had": 4096,
+            "partial": {
+                "kind": "struct",
+                "type_name": "task_struct",
+                "members": [],
+            },
+        },
+    });
+
+    let (inner, depth) = peel_truncated(&rendered, "synthetic dump")
+        .expect("nested truncation wrappers must be transparent");
+    assert_eq!(depth, 2);
+    assert_eq!(
+        inner.get("kind").and_then(|kind| kind.as_str()),
+        Some("struct")
+    );
+    assert_eq!(
+        inner.get("type_name").and_then(|name| name.as_str()),
+        Some("task_struct")
+    );
+}
+
 /// Asserts that scx-ktstr's per-task arena context (`struct
 /// ktstr_arena_ctx`) renders with its `task_kptr` u64 field
 /// rewritten by the cast analysis pipeline into a typed Ptr that
@@ -251,36 +307,126 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
         );
     }
 
-    // Each payload should be a Struct{type_name: Some("ktstr_arena_ctx"), members: [...]}.
-    // Pick the first one whose layout matches expectations and run
-    // the per-member assertions on it.
-    let payload = payloads
+    // Each payload should be a Struct{type_name: Some("ktstr_arena_ctx"),
+    // members: [...]}. A task_struct is larger than the pointer-chase cap,
+    // and kernel reads stop at the current page edge. Consequently an entry
+    // whose task_struct begins near the page tail may not include the later
+    // `pid` and `comm` members even though the cast and dereference both
+    // succeeded. Scan all typed payloads and pick one whose page window
+    // contains those identity fields, as the comment above promises, rather
+    // than making correctness depend on TASK_STORAGE iteration order.
+    let typed_payloads: Vec<&serde_json::Value> = payloads
         .iter()
-        .find(|p| {
-            p.get("kind").and_then(|k| k.as_str()) == Some("struct")
-                && p.get("type_name").and_then(|n| n.as_str()) == Some("ktstr_arena_ctx")
-        })
         .copied()
-        .ok_or_else(|| {
-            let kinds: Vec<String> = payloads
-                .iter()
-                .map(|p| {
-                    let k = p
-                        .get("kind")
-                        .and_then(|k| k.as_str())
-                        .unwrap_or("<no-kind>");
-                    let n = p
-                        .get("type_name")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("<no-name>");
-                    format!("{k}/{n}")
-                })
-                .collect();
-            anyhow::anyhow!(
-                "no payload rendered as Struct(type_name=\"ktstr_arena_ctx\"); \
-                 saw kinds/type_names: {kinds:?}; {dump_artifact}"
-            )
-        })?;
+        .filter(|payload| {
+            payload.get("kind").and_then(|kind| kind.as_str()) == Some("struct")
+                && payload.get("type_name").and_then(|name| name.as_str())
+                    == Some("ktstr_arena_ctx")
+        })
+        .collect();
+    if typed_payloads.is_empty() {
+        let kinds: Vec<String> = payloads
+            .iter()
+            .take(12)
+            .map(|payload| {
+                let kind = payload
+                    .get("kind")
+                    .and_then(|kind| kind.as_str())
+                    .unwrap_or("<no-kind>");
+                let name = payload
+                    .get("type_name")
+                    .and_then(|name| name.as_str())
+                    .unwrap_or("<no-name>");
+                format!("{kind}/{name}")
+            })
+            .collect();
+        anyhow::bail!(
+            "no payload rendered as Struct(type_name=\"ktstr_arena_ctx\"); \
+             non_null_payloads={}; first_kinds/type_names={kinds:?}; \
+             {dump_artifact}",
+            payloads.len(),
+        );
+    }
+
+    let mut ptr_count = 0usize;
+    let mut nonzero_ptr_count = 0usize;
+    let mut deref_count = 0usize;
+    let mut task_struct_count = 0usize;
+    let mut min_had: Option<u64> = None;
+    let mut max_had: Option<u64> = None;
+    let mut min_truncation_depth: Option<usize> = None;
+    let mut max_truncation_depth: Option<usize> = None;
+    let mut selected_payload = None;
+    for payload in &typed_payloads {
+        let Ok(task_kptr) = struct_member(payload, "task_kptr", &dump_artifact) else {
+            continue;
+        };
+        if task_kptr.get("kind").and_then(|kind| kind.as_str()) != Some("ptr") {
+            continue;
+        }
+        ptr_count += 1;
+        if !matches!(
+            task_kptr.get("value").and_then(|value| value.as_u64()),
+            Some(value) if value != 0
+        ) || task_kptr
+            .get("deref_skipped_reason")
+            .and_then(|reason| reason.as_str())
+            .is_some()
+        {
+            continue;
+        }
+        nonzero_ptr_count += 1;
+        let Some(deref) = task_kptr.get("deref") else {
+            continue;
+        };
+        deref_count += 1;
+        if let Some(had) = deref.get("had").and_then(|had| had.as_u64()) {
+            min_had = Some(min_had.map_or(had, |current| current.min(had)));
+            max_had = Some(max_had.map_or(had, |current| current.max(had)));
+        }
+        let Ok((deref_struct, truncation_depth)) = peel_truncated(deref, &dump_artifact) else {
+            continue;
+        };
+        min_truncation_depth = Some(
+            min_truncation_depth.map_or(truncation_depth, |current| current.min(truncation_depth)),
+        );
+        max_truncation_depth = Some(
+            max_truncation_depth.map_or(truncation_depth, |current| current.max(truncation_depth)),
+        );
+        if deref_struct.get("kind").and_then(|kind| kind.as_str()) != Some("struct")
+            || deref_struct.get("type_name").and_then(|name| name.as_str()) != Some("task_struct")
+        {
+            continue;
+        }
+        task_struct_count += 1;
+        let Some(members) = deref_struct
+            .get("members")
+            .and_then(|members| members.as_array())
+        else {
+            continue;
+        };
+        let has_pid = members
+            .iter()
+            .any(|member| member.get("name").and_then(|name| name.as_str()) == Some("pid"));
+        let has_comm = members
+            .iter()
+            .any(|member| member.get("name").and_then(|name| name.as_str()) == Some("comm"));
+        if has_pid && has_comm {
+            selected_payload = Some(*payload);
+            break;
+        }
+    }
+    let payload = selected_payload.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no ktstr_arena_ctx payload exposed a cast-chased task_struct \
+             containing both `pid` and `comm`; typed_payloads={}; ptrs={ptr_count}; \
+             nonzero_ptrs_without_skip={nonzero_ptr_count}; derefs={deref_count}; \
+             task_structs={task_struct_count}; outer_read_had={min_had:?}..={max_had:?}; \
+             truncation_depth={min_truncation_depth:?}..={max_truncation_depth:?}; \
+             {dump_artifact}",
+            typed_payloads.len(),
+        )
+    })?;
 
     // Negative assertion #1: `magic` must render as plain Uint, NOT
     // as a Ptr. The cast analyzer must NOT have flagged offset 0 of
@@ -437,26 +583,11 @@ fn check_cast_analysis_chases_kernel_kptr(result: &VmResult) -> Result<()> {
     // walks the struct and surfaces its members. The exact set of
     // members visible depends on POINTER_CHASE_CAP truncating the
     // read; modern task_struct is far larger than 4 KiB, so we
-    // expect Truncated{partial: Struct{...}} OR Struct{...} —
-    // accept both.
-    let (deref_struct, was_truncated) = match deref.get("kind").and_then(|k| k.as_str()) {
-        Some("struct") => (deref, false),
-        Some("truncated") => (
-            deref
-                .get("partial")
-                .ok_or_else(|| anyhow::anyhow!("Truncated has no `partial`; {dump_artifact}"))?,
-            true,
-        ),
-        Some(other) => {
-            anyhow::bail!(
-                "`task_kptr` deref must be Struct or Truncated{{partial: Struct}}, \
-                 got kind={other:?}; {dump_artifact}"
-            );
-        }
-        None => {
-            anyhow::bail!("`task_kptr` deref has no `kind` field; {dump_artifact}");
-        }
-    };
+    // expect one or more Truncated{partial: ...} wrappers around a
+    // Struct, or a Struct directly. The outer pointer chase and the
+    // inner struct renderer each record their own clipping boundary.
+    let (deref_struct, truncation_depth) = peel_truncated(deref, &dump_artifact)?;
+    let was_truncated = truncation_depth > 0;
     let deref_kind = deref_struct
         .get("kind")
         .and_then(|k| k.as_str())

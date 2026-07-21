@@ -70,6 +70,95 @@ fn live_pending_head_fences_snapshot_and_probe_without_ex_recovery() {
 }
 
 #[test]
+fn completed_preparation_releases_cpu_convoy_but_retains_residency() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (pending, ticket, affinity_cpu, cpu_permits, memory_permits, token_permit, residency) =
+        protocol::exercise_preparation_residency_transition_for_tests()
+            .expect("transition active preparation to prepared residency");
+
+    assert_eq!(cpu_permits.len(), PREPARATION_CPU_PERMITS);
+    assert!(
+        residency.cpus.is_empty(),
+        "residency must not fence perf CPUs"
+    );
+    assert!(residency.llcs.is_empty());
+    assert!(residency.permits.contains(&token_permit));
+    assert_eq!(
+        residency
+            .permits
+            .intersection(&memory_permits.iter().copied().collect())
+            .count(),
+        memory_permits.len(),
+    );
+    assert!(
+        residency
+            .permits
+            .intersection(&cpu_permits.iter().copied().collect())
+            .next()
+            .is_none(),
+        "prepared residency must release every cooperative CPU permit",
+    );
+
+    let snapshot =
+        protocol::ticket_registry_snapshot_for_tests().expect("snapshot relaxed PENDING record");
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(
+        snapshot[0].0, ticket,
+        "relaxation must retain ticket identity"
+    );
+    assert_eq!(snapshot[0].2, residency);
+
+    drop(
+        crate::flock::try_flock(
+            cpu_lock_path(affinity_cpu),
+            crate::flock::FlockMode::Exclusive,
+        )
+        .expect("probe released preparation affinity CPU")
+        .expect("completed preparation still owns its affinity CPU"),
+    );
+    for permit in &cpu_permits {
+        drop(
+            crate::flock::try_flock(
+                permit_lock_path(*permit),
+                crate::flock::FlockMode::Exclusive,
+            )
+            .expect("probe released preparation CPU permit")
+            .unwrap_or_else(|| panic!("completed preparation still owns CPU permit {permit}")),
+        );
+    }
+    for permit in memory_permits.iter().chain(std::iter::once(&token_permit)) {
+        assert!(
+            crate::flock::try_flock(
+                permit_lock_path(*permit),
+                crate::flock::FlockMode::Exclusive,
+            )
+            .expect("probe retained prepared-residency permit")
+            .is_none(),
+            "prepared residency released permit {permit} before exact admission",
+        );
+    }
+
+    let perf_probe = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [affinity_cpu],
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Exclusive,
+    );
+    assert!(
+        !protocol::registered_claim_conflicts(&perf_probe)
+            .expect("probe perf admission after preparation completion"),
+        "a prepared waiter must not fence CPU-EX admission",
+    );
+
+    drop(pending);
+    assert!(
+        protocol::ticket_registry_snapshot_for_tests()
+            .expect("snapshot released prepared residency")
+            .is_empty(),
+    );
+}
+
+#[test]
 fn synchronous_pending_retirement_cannot_self_fence_a_fresh_probe() {
     let _prefixes = LockPrefixesGuard::new();
     let retiring_claim = protocol::ClaimSet::with_modes(
@@ -2451,6 +2540,157 @@ fn default_hard_perf_contention_is_no_wait_and_cancellable() {
     drop(perf);
 }
 
+#[test]
+fn interactive_preparation_saturation_is_immediate_resource_contention() {
+    let _prefixes = LockPrefixesGuard::new();
+    let token_locks = preparation_token_range()
+        .expect("resolve preparation token namespace")
+        .map(|permit| {
+            crate::flock::try_flock(permit_lock_path(permit), crate::flock::FlockMode::Exclusive)
+                .expect("probe preparation token")
+                .expect("hold every preparation token")
+        })
+        .collect::<Vec<_>>();
+    assert!(!token_locks.is_empty());
+
+    // Lock-path overrides are thread-local. Point the worker at the saturated
+    // pool, then require its no-wait operation to complete within delivered
+    // CPU service rather than sleeping until one of these tokens is released.
+    let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
+    let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let worker = TestServiceThread::spawn(move || {
+        LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
+        CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
+        let result = crate::vmm::KtstrVm::register_interactive_pending_admission();
+        LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        let observation = match result {
+            Ok(pending) => {
+                drop(pending);
+                (
+                    false,
+                    "interactive preparation unexpectedly acquired".into(),
+                )
+            }
+            Err(error) => (
+                error.downcast_ref::<ResourceContention>().is_some(),
+                error.to_string(),
+            ),
+        };
+        let _ = result_tx.send(observation);
+    });
+    let observed = recv_from_service_thread(
+        &result_rx,
+        "nonblocking interactive preparation saturation",
+        &worker,
+    );
+
+    // Always unblock and join a regressed blocking implementation before an
+    // assertion can unwind the isolated lock-directory guard.
+    drop(token_locks);
+    worker.join().expect("interactive preparation worker");
+    let (is_contention, diagnostic) =
+        observed.expect("interactive preparation must not sleep behind saturated tokens");
+    assert!(
+        is_contention,
+        "saturation must surface ResourceContention: {diagnostic}",
+    );
+    assert!(
+        diagnostic.contains("CPU/memory preparation admission is busy"),
+        "unexpected interactive contention diagnostic: {diagnostic}",
+    );
+}
+
+#[test]
+fn interactive_preparation_does_not_wait_for_registry_writer() {
+    let _prefixes = LockPrefixesGuard::new();
+    let registry = protocol::hold_registry_exclusive_for_tests()
+        .expect("hold the admission registry writer lock");
+    let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
+    let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let worker = TestServiceThread::spawn(move || {
+        LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
+        CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
+        let result = crate::vmm::KtstrVm::register_interactive_pending_admission();
+        LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        let _ = result_tx.send(match result {
+            Ok(pending) => {
+                drop(pending);
+                false
+            }
+            Err(error) => error.downcast_ref::<ResourceContention>().is_some(),
+        });
+    });
+    let observed = recv_from_service_thread(
+        &result_rx,
+        "nonblocking interactive registry publication",
+        &worker,
+    );
+    drop(registry);
+    worker.join().expect("interactive registry worker");
+    assert!(
+        observed.expect("interactive registry contention must not wait"),
+        "busy registry writer must surface immediate ResourceContention",
+    );
+}
+
+#[test]
+fn interactive_preparation_tries_a_second_tuple_after_candidate_rejection() {
+    let _prefixes = LockPrefixesGuard::new();
+    assert!(
+        preparation_token_range()
+            .expect("resolve preparation tokens")
+            .len()
+            >= 2,
+        "test host must fund two preparation candidates",
+    );
+    let mut attempted_tokens = Vec::new();
+    let selected = try_preparation_candidates_once(0, |preparation, _claim| {
+        attempted_tokens.push(preparation.token_permit);
+        if attempted_tokens.len() == 1 {
+            drop(preparation);
+            Ok(PreparationCandidateDecision::Retry)
+        } else {
+            Ok(PreparationCandidateDecision::Accepted(
+                preparation.token_permit,
+            ))
+        }
+    })
+    .expect("scan preparation candidates")
+    .expect("second preparation candidate");
+    assert_eq!(attempted_tokens.len(), 2);
+    assert_ne!(attempted_tokens[0], selected);
+}
+
+#[test]
+fn preparation_sweep_stops_after_one_global_cpu_shortage() {
+    let _prefixes = LockPrefixesGuard::new();
+    let pool = AdmissionPermitPool::for_host(possible_cpu_width());
+    let cpu_permits = pool
+        .all()
+        .map(|permit| {
+            crate::flock::try_flock(permit_lock_path(permit), crate::flock::FlockMode::Exclusive)
+                .expect("probe CPU admission permit")
+                .expect("hold CPU admission permit")
+        })
+        .collect::<Vec<_>>();
+    assert!(!cpu_permits.is_empty());
+    reset_preparation_resource_probe_count_for_tests();
+    let selected = try_preparation_candidates_once::<()>(0, |_preparation, _claim| {
+        panic!("global CPU shortage must prevent a complete preparation candidate")
+    })
+    .expect("probe globally saturated CPU admission");
+    assert!(selected.is_none());
+    assert_eq!(
+        preparation_resource_probe_count_for_tests(),
+        1,
+        "a global resource miss must not be repeated for every free token",
+    );
+}
+
 /// WORK CONSERVATION: while a big `LOCK_EX` request is the coordinator
 /// and hungering for a claimed LLC, a concurrent small `LOCK_SH` cell
 /// wanting DIFFERENT capacity completes immediately — it never waits
@@ -2718,17 +2958,36 @@ fn known_free_close_storm_does_no_observation_scan_or_planner_work() {
         protocol::exercise_known_free_close_storm_for_tests(2_000)
             .expect("exercise known-free close storm");
     assert_eq!(
-        (
-            observations,
-            scans,
-            planner_steps,
-            generation_changes,
-            ex_acquisitions,
-        ),
-        (0, 0, 0, 0, 0),
+        (observations, scans, planner_steps, generation_changes,),
+        (0, 0, 0, 0),
         "writable closes on already-free watched resources must be discarded \
-         under SH before any registry mutation/EX acquisition, procfs \
-         observation, grant scan, or planner execution",
+         before any registry mutation, procfs observation, grant scan, or \
+         planner execution",
+    );
+    // The normal live-heartbeat path stays SH-only. A host that denies this
+    // process service for the full coordinator lease may legitimately take
+    // the slow EX path solely to refresh liveness; the forced-stale regression
+    // below covers that path without making this stress test wall-clock flaky.
+    assert!(
+        ex_acquisitions <= 1,
+        "known-free closes repeatedly fell out of the SH fast path",
+    );
+}
+
+#[test]
+fn stale_heartbeat_release_fallback_ignores_unwatched_out_of_range_indices() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (observations, scans, planner_steps, generation_changes, ex_acquisitions) =
+        protocol::exercise_stale_heartbeat_known_free_close_for_tests()
+            .expect("exercise stale-heartbeat known-free release fallback");
+    assert_eq!(
+        (observations, scans, planner_steps, generation_changes),
+        (0, 0, 0, 0),
+        "the stale-heartbeat fallback must preserve known-free fast-path semantics",
+    );
+    assert!(
+        ex_acquisitions > 0,
+        "test setup did not force the slow registry path",
     );
 }
 

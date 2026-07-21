@@ -904,6 +904,15 @@ fn string(reader: &ElfStampReader<'_>, base: u64, what: &str) -> Result<String, 
         return Ok(String::new());
     }
     let pointer = reader.pointer(base, offset_of!(AdmissionStrV2, ptr), what)?;
+    string_from_pointer(reader, pointer, len, what)
+}
+
+fn string_from_pointer(
+    reader: &ElfStampReader<'_>,
+    pointer: u64,
+    len: usize,
+    what: &str,
+) -> Result<String, String> {
     if pointer == 0 {
         return Err(format!(
             "{what} in admission ELF {} has a null pointer for a non-empty string",
@@ -1686,12 +1695,15 @@ fn validate_key_envelope(
             slots.len(),
         ));
     }
-
+    let target_fields = slots
+        .iter()
+        .map(|slot| slot.base + table.record_offset as u64)
+        .collect::<Vec<_>>();
+    let targets = reader.pointers(&target_fields, "admission compact-key target batch")?;
     let record_indices = records.records.iter().copied().collect::<BTreeMap<_, _>>();
-    let mut targets = BTreeSet::new();
-    let mut names = BTreeSet::new();
-    for slot in slots {
-        let target = key_record_target(reader, table, slot)?;
+    let mut seen_targets = BTreeSet::new();
+    let mut indexed_targets = Vec::with_capacity(targets.len());
+    for (&target, slot) in targets.iter().zip(&slots) {
         let index = record_indices.get(&target).copied().ok_or_else(|| {
             format!(
                 "{} record {} in admission ELF {} points to 0x{target:x}, which is not a \
@@ -1701,7 +1713,7 @@ fn validate_key_envelope(
                 reader.source.display(),
             )
         })?;
-        if !targets.insert(target) {
+        if !seen_targets.insert(target) {
             return Err(format!(
                 "admission ELF {} contains duplicate {} keys for {record_section} record \
                  {index}",
@@ -1709,11 +1721,34 @@ fn validate_key_envelope(
                 table.section,
             ));
         }
-        let name = string(
-            reader,
-            target + record_name_offset as u64,
-            &format!("{record_family} record {index}.name"),
-        )?;
+        indexed_targets.push((target, index));
+    }
+
+    let name_fields = indexed_targets
+        .iter()
+        .map(|(target, _)| target + record_name_offset as u64)
+        .collect::<Vec<_>>();
+    let name_pointers = reader.pointers(&name_fields, "admission record-name pointer batch")?;
+    let mut names = BTreeSet::new();
+    for (((slot, &(target, index)), pointer), name_field) in slots
+        .iter()
+        .zip(&indexed_targets)
+        .zip(name_pointers)
+        .zip(name_fields)
+    {
+        let what = format!("{record_family} record {index}.name");
+        let len = reader.raw_u64(name_field + offset_of!(AdmissionStrV2, len) as u64, &what)?;
+        let len = usize::try_from(len).map_err(|_| {
+            format!(
+                "{what} in admission ELF {} has an unrepresentable string length",
+                reader.source.display(),
+            )
+        })?;
+        let name = if len == 0 {
+            String::new()
+        } else {
+            string_from_pointer(reader, pointer, len, &what)?
+        };
         if name.is_empty() || !names.insert(name.clone()) {
             return Err(format!(
                 "admission ELF {} contains an empty or duplicate {record_family} name {:?}",
@@ -1721,11 +1756,12 @@ fn validate_key_envelope(
                 name,
             ));
         }
-        if key_name_hash(reader, table, slot)? != admission_name_hash(&name)
-            || key_name_len(reader, table, slot)? != name.len() as u64
+        if key_name_hash(reader, table, *slot)? != admission_name_hash(&name)
+            || key_name_len(reader, table, *slot)? != name.len() as u64
         {
             return Err(format!(
-                "{} record {} in admission ELF {} does not match its target name {:?}",
+                "{} record {} in admission ELF {} does not match its target name {:?} \
+                 at 0x{target:x}",
                 table.section,
                 slot.index,
                 reader.source.display(),
@@ -1740,9 +1776,12 @@ fn validate_key_envelope(
 /// discovery without decoding every test and preset topology.
 ///
 /// This keeps mixed-version, missing-section, malformed-header, compact-key,
-/// duplicate-name, and registry-count failures eager. Payload validation is
-/// deliberately deferred to the exact-name target-runner lookup, which fully
-/// decodes the selected test and preset before acquiring admission resources.
+/// duplicate-name, and registry-count failures eager. Pointer fields are
+/// resolved in section-sized ordered batches so this strict pass does not do
+/// an independent cold binary search through a multi-megabyte relocation
+/// table for every key and name. Topology payload validation remains deferred
+/// to the exact-name target-runner lookup, which fully decodes the selected
+/// test and preset before acquiring admission resources.
 pub(super) fn validate_admission_stamp_envelope_reader(
     reader: &ElfStampReader<'_>,
 ) -> Result<(), String> {
@@ -1846,6 +1885,7 @@ fn read_index(path: &Path) -> Result<Option<AdmissionIndex>, String> {
             path.display(),
         )
     })?;
+    super::scheduler_manifest_stamp::advise_sparse_elf(&data);
     let reader = ElfStampReader::new(path, &data)?;
     read_index_from_reader(&reader)
 }
@@ -2269,6 +2309,7 @@ pub fn read_admission_cell_stamp(
             path.display(),
         )
     })?;
+    super::scheduler_manifest_stamp::advise_sparse_elf(&data);
     let reader = ElfStampReader::new(path, &data)?;
     read_admission_cell_stamp_from_reader(&reader, path, exact_name)
 }
@@ -2394,6 +2435,36 @@ mod tests {
             error.contains("unsupported admission stamp version"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn scheduler_discovery_batches_relocated_admission_key_targets_exactly() {
+        let (executable, mapping) = map_current_test_executable_copy();
+        let reader = ElfStampReader::new(&executable, &mapping).expect("parse test executable");
+        let table = test_key_table(&reader)
+            .expect("read admission test-key table")
+            .expect("test-key table is linked");
+        let slots = table
+            .slots
+            .iter()
+            .copied()
+            .filter(|slot| slot.kind == table.expected_kind)
+            .collect::<Vec<_>>();
+        let scalar = slots
+            .iter()
+            .map(|slot| key_record_target(&reader, &table, *slot))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("resolve scalar key targets");
+        let fields = slots
+            .iter()
+            .map(|slot| slot.base + table.record_offset as u64)
+            .collect::<Vec<_>>();
+        let batched = reader
+            .pointers(&fields, "unit-test admission key target batch")
+            .expect("resolve batched key targets");
+
+        assert_eq!(batched, scalar);
+        validate_admission_stamp_envelope_reader(&reader).expect("validate admission envelope");
     }
 
     #[test]

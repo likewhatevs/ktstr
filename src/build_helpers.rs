@@ -62,6 +62,612 @@ where
     ))
 }
 
+const BUILD_BLOB_CACHE_SCHEMA: &str = "ktstr-build-blob-v1";
+const BUILD_BLOB_INPUT_SENTINEL: &str = ".ktstr-input-key";
+const BUILD_BLOB_OUTPUT_SENTINEL: &str = ".ktstr-blob-key";
+const BUILD_BLOB_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+const BUILD_BLOB_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Resolve the shared build-blob cache under the same override cascade as the
+/// runtime caches. `KTSTR_CACHE_DIR` names the common root directly; the
+/// XDG/HOME fallbacks add ktstr's conventional directory first.
+///
+/// The build script cannot call `crate::cache` (it is a separate crate), so
+/// this deliberately mirrors that small, std-only resolution seam. Requiring
+/// an absolute path prevents the cross-process namespace from moving with a
+/// runner's current directory.
+fn build_blob_cache_root(namespace: &str) -> Result<std::path::PathBuf, String> {
+    fn absolute(path: std::path::PathBuf, variable: &str) -> Result<std::path::PathBuf, String> {
+        if path.is_absolute() {
+            Ok(path)
+        } else {
+            Err(format!(
+                "{variable}={:?} is not absolute; the shared build-blob cache must have a stable machine path",
+                path
+            ))
+        }
+    }
+
+    if let Some(cache) = std::env::var_os("KTSTR_CACHE_DIR").filter(|value| !value.is_empty()) {
+        return absolute(std::path::PathBuf::from(cache), "KTSTR_CACHE_DIR")
+            .map(|root| root.join("build-blobs-v1").join(namespace));
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
+        return absolute(std::path::PathBuf::from(xdg), "XDG_CACHE_HOME")
+            .map(|root| root.join("ktstr/build-blobs-v1").join(namespace));
+    }
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "HOME is unset or empty and neither KTSTR_CACHE_DIR nor XDG_CACHE_HOME names the shared build-blob cache"
+                .to_string()
+        })?;
+    absolute(std::path::PathBuf::from(home), "HOME")
+        .map(|root| root.join(".cache/ktstr/build-blobs-v1").join(namespace))
+}
+
+fn executable_file(path: &std::path::Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Resolve one program exactly as an ordinary `Command::new(program)` lookup
+/// would on the Linux hosts supported by ktstr. The returned pathname is used
+/// only to fingerprint the executable bytes; it is deliberately not retained
+/// in the cache identity because ghars installs identical toolchains below
+/// runner-specific home prefixes.
+fn resolve_tool_program(program: &str) -> Result<std::path::PathBuf, String> {
+    if program.is_empty() {
+        return Err("tool program is empty".to_string());
+    }
+    let direct = std::path::Path::new(program);
+    if direct.components().count() > 1 || direct.is_absolute() {
+        return executable_file(direct)
+            .then(|| direct.to_path_buf())
+            .ok_or_else(|| format!("tool program {program:?} is not an executable regular file"));
+    }
+    let path = std::env::var_os("PATH")
+        .ok_or_else(|| format!("PATH is unset while resolving tool program {program:?}"))?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(program))
+        .find(|candidate| executable_file(candidate))
+        .ok_or_else(|| format!("tool program {program:?} was not found on PATH"))
+}
+
+/// Stable identity for an executable independent of the directory spelling
+/// used to reach it. The basename is retained because multicall tools select
+/// behavior from argv[0]; the executable bytes and mode distinguish patched
+/// tools that report the same version.
+fn stable_tool_program_identity(program: &str) -> Result<String, String> {
+    let path = resolve_tool_program(program)?;
+    let snapshot = snapshot_prebuilt_blob(&path, "tool executable").map_err(|error| {
+        format!(
+            "fingerprint tool program {program:?} at {}: {error}",
+            path.display()
+        )
+    })?;
+    let permissions = std::fs::metadata(&path)
+        .map_err(|error| format!("stat tool program {}: {error}", path.display()))?
+        .permissions();
+    let basename = std::path::Path::new(program)
+        .file_name()
+        .or_else(|| path.file_name())
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| format!("tool program {program:?} has no UTF-8 basename"))?;
+    Ok(format!(
+        "exec:{}:{basename}:{}:{}:{}",
+        basename.len(),
+        snapshot.len,
+        snapshot.content_key,
+        build_blob_permission_identity(&permissions),
+    ))
+}
+
+/// Parse the argv-like subset accepted for cached native-build tool
+/// assignments. Shell control flow, expansion, and globbing are rejected: they
+/// cannot be normalized without executing arbitrary discovery-time commands,
+/// and retaining their raw spelling would reintroduce runner-path-specific
+/// cache keys. Quotes and backslash escaping remain supported.
+fn split_tool_command(command: &str) -> Result<Vec<String>, String> {
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut quote = Quote::None;
+    let mut chars = command.chars();
+    while let Some(character) = chars.next() {
+        match quote {
+            Quote::Single => {
+                if character == '\'' {
+                    quote = Quote::None;
+                } else {
+                    word.push(character);
+                }
+            }
+            Quote::Double => match character {
+                '"' => quote = Quote::None,
+                '\\' => {
+                    let escaped = chars.next().ok_or_else(|| {
+                        format!("tool command {command:?} ends in an incomplete escape")
+                    })?;
+                    word.push(escaped);
+                    started = true;
+                }
+                '$' | '`' => {
+                    return Err(format!(
+                        "tool command {command:?} uses shell expansion, which has no stable build-cache identity"
+                    ));
+                }
+                _ => word.push(character),
+            },
+            Quote::None => match character {
+                character if character.is_whitespace() => {
+                    if started {
+                        words.push(std::mem::take(&mut word));
+                        started = false;
+                    }
+                }
+                '\'' => {
+                    quote = Quote::Single;
+                    started = true;
+                }
+                '"' => {
+                    quote = Quote::Double;
+                    started = true;
+                }
+                '\\' => {
+                    let escaped = chars.next().ok_or_else(|| {
+                        format!("tool command {command:?} ends in an incomplete escape")
+                    })?;
+                    word.push(escaped);
+                    started = true;
+                }
+                '|' | '&' | ';' | '<' | '>' | '(' | ')' | '$' | '`' | '*' | '?' | '[' => {
+                    return Err(format!(
+                        "tool command {command:?} uses shell control or expansion syntax, which has no stable build-cache identity"
+                    ));
+                }
+                '~' if !started => {
+                    return Err(format!(
+                        "tool command {command:?} uses tilde expansion, which has no stable build-cache identity"
+                    ));
+                }
+                '#' if !started => {
+                    return Err(format!(
+                        "tool command {command:?} uses a shell comment, which has no stable build-cache identity"
+                    ));
+                }
+                _ => {
+                    word.push(character);
+                    started = true;
+                }
+            },
+        }
+    }
+    if quote != Quote::None {
+        return Err(format!(
+            "tool command {command:?} has an unterminated quote"
+        ));
+    }
+    if started {
+        words.push(word);
+    }
+    if words.is_empty() {
+        return Err("tool command is empty".to_string());
+    }
+    Ok(words)
+}
+
+/// Normalize a make tool assignment to semantic argv. Any word that resolves
+/// to an executable is replaced by basename + content/mode identity; all other
+/// arguments remain length-prefixed verbatim. This lets `/runner-a/.../rustc`
+/// and `/runner-b/.../rustc` share a cache entry when their actual executable
+/// bytes match without conflating different flags or wrapper/compiler chains.
+fn stable_tool_command_identity(command: &str) -> Result<String, String> {
+    let words = split_tool_command(command)?;
+    let mut identity = String::new();
+    for word in words {
+        let normalized = stable_tool_program_identity(&word)
+            .unwrap_or_else(|_| format!("arg:{}:{word}", word.len()));
+        identity.push_str(&normalized.len().to_string());
+        identity.push(':');
+        identity.push_str(&normalized);
+        identity.push('\n');
+    }
+    Ok(identity)
+}
+
+/// Fixed-seed, non-cryptographic identity for one exact build input tuple.
+/// Length-prefixing prevents tuple ambiguity and keeps the key stable across
+/// processes without paying for a cryptographic digest.
+fn build_blob_content_id(parts: &[&str]) -> String {
+    use std::hash::{BuildHasher as _, Hasher as _};
+
+    let state = ahash::RandomState::with_seeds(
+        0x4b54_5354_522d_4341,
+        0x532d_424c_4f42_5631,
+        0xa076_1d64_78bd_642f,
+        0xe703_7ed1_a0b4_28db,
+    );
+    let mut hasher = state.build_hasher();
+    hasher.write_u64(BUILD_BLOB_CACHE_SCHEMA.len() as u64);
+    hasher.write(BUILD_BLOB_CACHE_SCHEMA.as_bytes());
+    for part in parts {
+        hasher.write_u64(part.len() as u64);
+        hasher.write(part.as_bytes());
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+fn build_blob_input_manifest(parts: &[&str]) -> String {
+    let mut manifest = String::from(BUILD_BLOB_CACHE_SCHEMA);
+    for part in parts {
+        manifest.push('\n');
+        manifest.push_str(&part.len().to_string());
+        manifest.push(':');
+        manifest.push_str(part);
+    }
+    manifest
+}
+
+fn validate_build_blob_name(blob_name: &str) -> Result<(), String> {
+    let mut components = std::path::Path::new(blob_name).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err(format!(
+            "build-blob name must be one normal path component, got {blob_name:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn build_blob_output_manifest(path: &std::path::Path, blob_name: &str) -> Result<String, String> {
+    let snapshot = snapshot_prebuilt_blob(path, blob_name).map_err(|error| {
+        format!(
+            "fingerprint built blob {} before publication: {error}",
+            path.display()
+        )
+    })?;
+    let permissions = std::fs::metadata(path)
+        .map_err(|error| format!("stat built blob {}: {error}", path.display()))?
+        .permissions();
+    Ok(format!(
+        "{BUILD_BLOB_CACHE_SCHEMA}\n{blob_name}\n{}\n{}\n{}\n",
+        snapshot.len,
+        snapshot.content_key,
+        build_blob_permission_identity(&permissions)
+    ))
+}
+
+fn build_blob_permission_identity(permissions: &std::fs::Permissions) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        format!("unix:{:o}", permissions.mode())
+    }
+    #[cfg(not(unix))]
+    {
+        format!("readonly:{}", permissions.readonly())
+    }
+}
+
+fn parsed_build_blob_output_manifest(value: &str) -> Option<(&str, u64, &str, &str)> {
+    let mut lines = value.lines();
+    if lines.next()? != BUILD_BLOB_CACHE_SCHEMA {
+        return None;
+    }
+    let blob_name = lines.next()?;
+    let len = lines.next()?.parse().ok()?;
+    let content_key = lines.next()?;
+    let permissions = lines.next()?;
+    if blob_name.is_empty()
+        || len == 0
+        || content_key.is_empty()
+        || permissions.is_empty()
+        || lines.next().is_some()
+    {
+        return None;
+    }
+    Some((blob_name, len, content_key, permissions))
+}
+
+fn cached_build_blob_complete(
+    entry: &std::path::Path,
+    input_manifest: &str,
+    blob_name: &str,
+) -> bool {
+    if !std::fs::read_to_string(entry.join(BUILD_BLOB_INPUT_SENTINEL))
+        .is_ok_and(|value| value == input_manifest)
+    {
+        return false;
+    }
+    let Ok(output_manifest) = std::fs::read_to_string(entry.join(BUILD_BLOB_OUTPUT_SENTINEL))
+    else {
+        return false;
+    };
+    let Some((manifest_name, manifest_len, manifest_key, manifest_permissions)) =
+        parsed_build_blob_output_manifest(&output_manifest)
+    else {
+        return false;
+    };
+    if manifest_name != blob_name {
+        return false;
+    }
+    let path = entry.join(blob_name);
+    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        return false;
+    };
+    if !metadata.file_type().is_file()
+        || metadata.len() != manifest_len
+        || build_blob_permission_identity(&metadata.permissions()) != manifest_permissions
+    {
+        return false;
+    }
+    snapshot_prebuilt_blob(&path, blob_name)
+        .is_ok_and(|snapshot| snapshot.len == manifest_len && snapshot.content_key == manifest_key)
+}
+
+struct RemoveBuildBlobStage(Option<std::path::PathBuf>);
+
+impl RemoveBuildBlobStage {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for RemoveBuildBlobStage {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn remove_build_blob_path(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => std::fs::remove_dir_all(path)
+            .map_err(|error| format!("remove directory {}: {error}", path.display())),
+        Ok(_) => std::fs::remove_file(path)
+            .map_err(|error| format!("remove file {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "inspect {} before removal: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn remove_stale_build_blob_stages(root: &std::path::Path, id: &str) -> Result<(), String> {
+    let prefix = format!(".{id}.work-");
+    for entry in std::fs::read_dir(root)
+        .map_err(|error| format!("scan build-blob cache {}: {error}", root.display()))?
+    {
+        let entry = entry.map_err(|error| format!("read build-blob cache entry: {error}"))?;
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            remove_build_blob_path(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Elect one cross-process builder for an exact input tuple and atomically
+/// publish one immutable executable blob. A crash leaves only a private stage;
+/// the next elected builder removes it. Deleted or incomplete final entries
+/// fail validation and are rebuilt under the same lock.
+fn ensure_cached_build_blob<Build>(
+    root: &std::path::Path,
+    parts: &[&str],
+    label: &str,
+    blob_name: &str,
+    build: Build,
+) -> Result<std::path::PathBuf, String>
+where
+    Build: FnOnce(&std::path::Path) -> Result<(), String>,
+{
+    validate_build_blob_name(blob_name)?;
+    let id = build_blob_content_id(parts);
+    let input_manifest = build_blob_input_manifest(parts);
+    let entry = root.join(&id);
+    if cached_build_blob_complete(&entry, &input_manifest, blob_name) {
+        return Ok(entry.join(blob_name));
+    }
+
+    std::fs::create_dir_all(root)
+        .map_err(|error| format!("create build-blob cache {}: {error}", root.display()))?;
+    let lock_path = root.join(format!(".{id}.lock"));
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| format!("open build-blob lock {}: {error}", lock_path.display()))?;
+    let started = std::time::Instant::now();
+    let mut next_heartbeat = BUILD_BLOB_HEARTBEAT;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if started.elapsed() >= next_heartbeat {
+                    println!(
+                        "cargo:warning={label}: waiting for shared builder; elapsed={:.1}s",
+                        started.elapsed().as_secs_f64()
+                    );
+                    next_heartbeat += BUILD_BLOB_HEARTBEAT;
+                }
+                std::thread::sleep(BUILD_BLOB_LOCK_POLL);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "acquire build-blob lock {}: {error}",
+                    lock_path.display()
+                ));
+            }
+        }
+    }
+
+    if cached_build_blob_complete(&entry, &input_manifest, blob_name) {
+        return Ok(entry.join(blob_name));
+    }
+    remove_build_blob_path(&entry)?;
+    remove_stale_build_blob_stages(root, &id)?;
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let stage = root.join(format!(".{id}.work-{}-{nonce}", std::process::id()));
+    remove_build_blob_path(&stage)?;
+    std::fs::create_dir_all(&stage)
+        .map_err(|error| format!("create build-blob stage {}: {error}", stage.display()))?;
+    let stage_guard = RemoveBuildBlobStage(Some(stage.clone()));
+
+    println!("cargo:warning={label}: elected shared builder");
+    build(&stage)?;
+    let blob = stage.join(blob_name);
+    let output_manifest = build_blob_output_manifest(&blob, blob_name)?;
+    atomic_write_blob_file(
+        &stage.join(BUILD_BLOB_OUTPUT_SENTINEL),
+        output_manifest.as_bytes(),
+        "output-key",
+    )
+    .map_err(|error| format!("write built-blob output sentinel: {error}"))?;
+    atomic_write_blob_file(
+        &stage.join(BUILD_BLOB_INPUT_SENTINEL),
+        input_manifest.as_bytes(),
+        "input-key",
+    )
+    .map_err(|error| format!("write built-blob input sentinel: {error}"))?;
+    if !cached_build_blob_complete(&stage, &input_manifest, blob_name) {
+        return Err(format!(
+            "{label}: builder returned without a complete {blob_name} blob"
+        ));
+    }
+    std::fs::File::open(&blob)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("sync built blob {}: {error}", blob.display()))?;
+    std::fs::File::open(&stage)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync build-blob stage {}: {error}", stage.display()))?;
+    std::fs::rename(&stage, &entry).map_err(|error| {
+        format!(
+            "atomically publish build-blob cache {} -> {}: {error}",
+            stage.display(),
+            entry.display()
+        )
+    })?;
+    stage_guard.disarm();
+    std::fs::File::open(root)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync build-blob cache {}: {error}", root.display()))?;
+    println!(
+        "cargo:warning={label}: published shared blob in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(entry.join(blob_name))
+}
+
+#[cfg(target_os = "linux")]
+fn ficlone_build_blob(destination: &std::fs::File, source: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    const FICLONE_IOCTL: std::os::raw::c_ulong = 0x4004_9409;
+    unsafe extern "C" {
+        fn ioctl(
+            fd: std::os::raw::c_int,
+            request: std::os::raw::c_ulong,
+            ...
+        ) -> std::os::raw::c_int;
+    }
+    // SAFETY: FICLONE consumes two valid descriptors for the duration of the
+    // call and does not retain them. The destination is open read/write.
+    let result = unsafe { ioctl(destination.as_raw_fd(), FICLONE_IOCTL, source.as_raw_fd()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ficlone_build_blob(
+    _destination: &std::fs::File,
+    _source: &std::fs::File,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "FICLONE is only available on Linux",
+    ))
+}
+
+fn materialize_build_blob_with<Clone>(
+    source_path: &std::path::Path,
+    destination_path: &std::path::Path,
+    clone: Clone,
+) -> std::io::Result<()>
+where
+    Clone: FnOnce(&std::fs::File, &std::fs::File) -> std::io::Result<()>,
+{
+    let source = std::fs::File::open(source_path)?;
+    let metadata = source.metadata()?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "cached build blob {} is not a non-empty regular file",
+                source_path.display()
+            ),
+        ));
+    }
+    let (temporary, destination) = AtomicSibling::create(destination_path, "reflink")?;
+    clone(&destination, &source).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "FICLONE {} -> {} failed ({error}); place KTSTR_CACHE_DIR and Cargo's target directory on the same reflink-capable filesystem",
+                source_path.display(),
+                temporary.path().display()
+            ),
+        )
+    })?;
+    destination.set_permissions(metadata.permissions())?;
+    destination.sync_all()?;
+    drop(destination);
+    temporary.publish(destination_path)
+}
+
+/// Materialize an immutable cached blob into one private OUT_DIR inode. This
+/// is intentionally strict: a byte-copy fallback would multiply every large
+/// embedded blob across concurrent Cargo runners and hide a broken COW setup.
+fn materialize_build_blob(
+    source_path: &std::path::Path,
+    destination_path: &std::path::Path,
+) -> std::io::Result<()> {
+    materialize_build_blob_with(source_path, destination_path, |destination, source| {
+        ficlone_build_blob(destination, source)
+    })
+}
+
 const PREBUILT_BLOB_STAMP_SCHEMA: &str = "ktstr-prebuilt-blob-v1";
 
 /// Result of considering a `KTSTR_{BUSYBOX,WPROF}_BIN` handoff.
@@ -81,17 +687,22 @@ fn is_nonempty_regular_file(path: &std::path::Path) -> bool {
     std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PrebuiltBlobSnapshot {
     content_key: String,
     len: u64,
-    permissions: std::fs::Permissions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ValidatedBuiltBlob {
+    snapshot: PrebuiltBlobSnapshot,
+    permissions: String,
 }
 
 /// A same-directory temporary that removes itself unless `publish()` wins.
 ///
 /// Keeping the temporary beside the target makes the final rename atomic and
-/// prevents a build-script crash from exposing a partially copied executable
+/// prevents a build-script crash from exposing a partially materialized executable
 /// through the fixed path consumed by `include_bytes!`.
 struct AtomicSibling {
     path: Option<std::path::PathBuf>,
@@ -114,7 +725,12 @@ impl AtomicSibling {
                 ".{name}.ktstr-{purpose}-{}-{nonce}",
                 std::process::id()
             ));
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
                 Ok(file) => {
                     return Ok((Self { path: Some(path) }, file));
                 }
@@ -180,8 +796,7 @@ fn same_prebuilt_source(left: &std::fs::Metadata, right: &std::fs::Metadata) -> 
     }
 }
 
-/// Hash one stable snapshot of a handed-over blob and optionally copy the same
-/// bytes into `sink`.
+/// Hash one stable snapshot of a handed-over blob.
 ///
 /// Fixed seeds match the repository's other build-time content addressing.
 /// The source is checked through both its open descriptor and its pathname
@@ -190,10 +805,9 @@ fn same_prebuilt_source(left: &std::fs::Metadata, right: &std::fs::Metadata) -> 
 fn snapshot_prebuilt_blob(
     src: &std::path::Path,
     blob_name: &str,
-    mut sink: Option<&mut std::fs::File>,
 ) -> std::io::Result<PrebuiltBlobSnapshot> {
     use std::hash::{BuildHasher, Hasher};
-    use std::io::{Read, Write};
+    use std::io::Read;
 
     let mut source = std::fs::File::open(src)?;
     let before = source.metadata()?;
@@ -227,9 +841,6 @@ fn snapshot_prebuilt_blob(
             break;
         }
         hasher.write(&buffer[..count]);
-        if let Some(output) = sink.as_mut() {
-            output.write_all(&buffer[..count])?;
-        }
         copied = copied
             .checked_add(count as u64)
             .ok_or_else(|| std::io::Error::other("prebuilt blob length overflow"))?;
@@ -253,7 +864,6 @@ fn snapshot_prebuilt_blob(
     Ok(PrebuiltBlobSnapshot {
         content_key: format!("{:016x}", hasher.finish()),
         len: copied,
-        permissions: before.permissions(),
     })
 }
 
@@ -280,6 +890,185 @@ fn prebuilt_destination_identity(metadata: &std::fs::Metadata) -> String {
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
         format!("{}:{modified:?}", metadata.len())
     }
+}
+
+const BUILT_BLOB_STAMP_SCHEMA: &str = "ktstr-built-blob-v1";
+
+fn built_blob_stamp(
+    blob_name: &str,
+    input_id: &str,
+    snapshot: &PrebuiltBlobSnapshot,
+    destination: &std::fs::Metadata,
+) -> String {
+    format!(
+        "{BUILT_BLOB_STAMP_SCHEMA}\n{blob_name}\n{input_id}\n{}\n{}\n{}\n{}\n",
+        snapshot.content_key,
+        snapshot.len,
+        build_blob_permission_identity(&destination.permissions()),
+        prebuilt_destination_identity(destination),
+    )
+}
+
+fn parsed_built_blob_stamp<'a>(
+    stamp: &'a str,
+    blob_name: &str,
+    input_id: &str,
+) -> Option<(&'a str, u64, &'a str, &'a str)> {
+    let mut lines = stamp.lines();
+    if lines.next()? != BUILT_BLOB_STAMP_SCHEMA
+        || lines.next()? != blob_name
+        || lines.next()? != input_id
+    {
+        return None;
+    }
+    let content_key = lines.next()?;
+    let len = lines.next()?.parse().ok()?;
+    let permissions = lines.next()?;
+    let identity = lines.next()?;
+    if content_key.is_empty()
+        || len == 0
+        || permissions.is_empty()
+        || identity.is_empty()
+        || lines.next().is_some()
+    {
+        return None;
+    }
+    Some((content_key, len, permissions, identity))
+}
+
+/// Validate a private OUT_DIR materialization against a content-bound stamp.
+///
+/// The inode identity makes the common path metadata-only. Any replacement or
+/// in-place write changes that identity and forces a complete content hash;
+/// identical cache restores are then re-stamped, while corruption fails
+/// closed and can be repaired from the shared CAS.
+fn validated_built_blob(
+    stamp_path: &std::path::Path,
+    blob_path: &std::path::Path,
+    blob_name: &str,
+    input_id: &str,
+) -> Option<ValidatedBuiltBlob> {
+    let stamp = std::fs::read_to_string(stamp_path).ok()?;
+    let (content_key, len, permissions, stamped_identity) =
+        parsed_built_blob_stamp(&stamp, blob_name, input_id)?;
+    let metadata = std::fs::symlink_metadata(blob_path).ok()?;
+    if !metadata.file_type().is_file()
+        || metadata.len() != len
+        || build_blob_permission_identity(&metadata.permissions()) != permissions
+    {
+        return None;
+    }
+    let expected = ValidatedBuiltBlob {
+        snapshot: PrebuiltBlobSnapshot {
+            content_key: content_key.to_string(),
+            len,
+        },
+        permissions: permissions.to_string(),
+    };
+    if prebuilt_destination_identity(&metadata) == stamped_identity {
+        return Some(expected);
+    }
+
+    let actual = snapshot_prebuilt_blob(blob_path, blob_name).ok()?;
+    if actual != expected.snapshot {
+        return None;
+    }
+    let refreshed = built_blob_stamp(blob_name, input_id, &actual, &metadata);
+    atomic_write_prebuilt_stamp(stamp_path, &refreshed).ok()?;
+    Some(expected)
+}
+
+/// Ensure both sides of one build-blob handoff: a validated shared CAS entry
+/// and its private OUT_DIR COW inode.
+///
+/// A valid local inode can reseed a manually deleted or corrupt shared entry,
+/// avoiding a repeated source build. A corrupt local inode is never trusted:
+/// an intact CAS repairs it, and only loss of both copies invokes `build`.
+fn ensure_materialized_build_blob<Build>(
+    root: &std::path::Path,
+    parts: &[&str],
+    label: &str,
+    blob_name: &str,
+    destination: &std::path::Path,
+    stamp_path: &std::path::Path,
+    build: Build,
+) -> Result<std::path::PathBuf, String>
+where
+    Build: FnOnce(&std::path::Path) -> Result<(), String>,
+{
+    let input_id = build_blob_content_id(parts);
+    let local = validated_built_blob(stamp_path, destination, blob_name, &input_id);
+    let local_seed = local.clone();
+    let cached = ensure_cached_build_blob(root, parts, label, blob_name, |stage| {
+        if let Some(expected) = local_seed {
+            let staged = stage.join(blob_name);
+            materialize_build_blob(destination, &staged).map_err(|error| {
+                format!(
+                    "COW-reseed {label} from {} into shared cache: {error}",
+                    destination.display()
+                )
+            })?;
+            let actual = snapshot_prebuilt_blob(&staged, blob_name)
+                .map_err(|error| format!("verify COW-reseeded {label}: {error}"))?;
+            let permissions = std::fs::metadata(&staged)
+                .map_err(|error| format!("stat COW-reseeded {label}: {error}"))?
+                .permissions();
+            if actual != expected.snapshot
+                || build_blob_permission_identity(&permissions) != expected.permissions
+            {
+                return Err(format!(
+                    "{label}: local blob changed while reseeding the shared cache"
+                ));
+            }
+            Ok(())
+        } else {
+            build(stage)
+        }
+    })?;
+
+    let cached_snapshot = snapshot_prebuilt_blob(&cached, blob_name)
+        .map_err(|error| format!("fingerprint cached {label}: {error}"))?;
+    let cached_permissions = std::fs::metadata(&cached)
+        .map_err(|error| format!("stat cached {label}: {error}"))?
+        .permissions();
+    let cached_permission_id = build_blob_permission_identity(&cached_permissions);
+    let local_matches = local.is_some_and(|local| {
+        local.snapshot == cached_snapshot
+            && local.permissions == cached_permission_id
+            && std::fs::symlink_metadata(destination).is_ok_and(|metadata| {
+                metadata.file_type().is_file()
+                    && build_blob_permission_identity(&metadata.permissions())
+                        == cached_permission_id
+            })
+    });
+    if !local_matches {
+        materialize_build_blob(&cached, destination).map_err(|error| {
+            format!(
+                "COW-materialize cached {label} {} -> {}: {error}",
+                cached.display(),
+                destination.display()
+            )
+        })?;
+    }
+
+    let published = snapshot_prebuilt_blob(destination, blob_name)
+        .map_err(|error| format!("fingerprint materialized {label}: {error}"))?;
+    if published != cached_snapshot {
+        return Err(format!(
+            "{label}: materialized output differs from the validated shared cache"
+        ));
+    }
+    let destination_metadata = std::fs::metadata(destination)
+        .map_err(|error| format!("stat materialized {label}: {error}"))?;
+    if build_blob_permission_identity(&destination_metadata.permissions()) != cached_permission_id {
+        return Err(format!(
+            "{label}: materialized output permissions differ from the validated shared cache"
+        ));
+    }
+    let stamp = built_blob_stamp(blob_name, &input_id, &published, &destination_metadata);
+    atomic_write_prebuilt_stamp(stamp_path, &stamp)
+        .map_err(|error| format!("stamp materialized {label}: {error}"))?;
+    Ok(cached)
 }
 
 fn prebuilt_blob_stamp(
@@ -350,7 +1139,7 @@ fn reuse_prebuilt_blob_without_source(
     // restore and atomic replacement commonly publish the same bytes under a
     // new identity. Hash only on that cold path, then bind the sidecar to the
     // replacement without rewriting the executable itself.
-    let Ok(snapshot) = snapshot_prebuilt_blob(dest, blob_name, None) else {
+    let Ok(snapshot) = snapshot_prebuilt_blob(dest, blob_name) else {
         return false;
     };
     if snapshot.len != len || snapshot.content_key != content_key {
@@ -400,7 +1189,7 @@ fn install_skipped_blob(dest: &std::path::Path, stamp_path: &std::path::Path, bl
 }
 
 /// Reuse a pre-built blob binary that `cargo-ktstr` already embedded and
-/// extracted, instead of fetching + compiling another copy.
+/// extracted, instead of fetching + compiling another instance.
 ///
 /// The handoff is content-addressed rather than keyed only by its environment
 /// path or by the existence of `$OUT_DIR/{blob_name}`. This matters when Cargo
@@ -410,7 +1199,7 @@ fn install_skipped_blob(dest: &std::path::Path, stamp_path: &std::path::Path, bl
 /// source path changes. A compact destination identity in the sidecar stamp
 /// makes that common path metadata-only; if the identity drifted, the helper
 /// hashes the destination and re-stamps identical bytes before deciding that a
-/// copy is necessary. The stamp also retains the caller's logical source
+/// COW refresh is necessary. The stamp also retains the caller's logical source
 /// revision, so content addressing supplements pin invalidation rather than
 /// making a later wprof revision look current merely because an old handoff
 /// still exists.
@@ -426,8 +1215,6 @@ fn install_prebuilt_blob(
     blob_name: &str,
     source_revision: &str,
 ) -> PrebuiltBlobStatus {
-    use std::io::Write;
-
     let src = match src {
         Some(src) if !src.is_empty() => std::path::Path::new(src),
         _ => return PrebuiltBlobStatus::NotRequested,
@@ -442,9 +1229,9 @@ fn install_prebuilt_blob(
         return PrebuiltBlobStatus::Rejected;
     }
 
-    let source = snapshot_prebuilt_blob(src, blob_name, None).unwrap_or_else(|err| {
+    let source = snapshot_prebuilt_blob(src, blob_name).unwrap_or_else(|err| {
         panic!(
-            "fingerprint prebuilt {blob_name} at {} before copying: {err}",
+            "fingerprint prebuilt {blob_name} at {} before COW materialization: {err}",
             src.display()
         )
     });
@@ -474,7 +1261,7 @@ fn install_prebuilt_blob(
                 // A missing/legacy stamp or changed destination identity is
                 // not proof that the bytes differ. Hash once before rewriting
                 // so same-content handoffs remain true no-ops.
-                let current = snapshot_prebuilt_blob(dest, blob_name, None).unwrap_or_else(|err| {
+                let current = snapshot_prebuilt_blob(dest, blob_name).unwrap_or_else(|err| {
                     panic!(
                         "fingerprint existing prebuilt {blob_name} at {}: {err}",
                         dest.display()
@@ -495,41 +1282,26 @@ fn install_prebuilt_blob(
         }
     }
 
-    let (temp, mut output) = AtomicSibling::create(dest, "blob").unwrap_or_else(|err| {
+    materialize_build_blob(src, dest).unwrap_or_else(|err| {
         panic!(
-            "create temporary for prebuilt {blob_name} at {}: {err}",
+            "COW-materialize prebuilt {blob_name} from {} to {}: {err}",
+            src.display(),
             dest.display()
         )
     });
-    let copied = snapshot_prebuilt_blob(src, blob_name, Some(&mut output)).unwrap_or_else(|err| {
+    let copied = snapshot_prebuilt_blob(dest, blob_name).unwrap_or_else(|err| {
         panic!(
-            "copy prebuilt {blob_name} from {} to {}: {err}",
-            src.display(),
-            temp.path().display()
+            "fingerprint COW-materialized prebuilt {blob_name} at {}: {err}",
+            dest.display()
         )
     });
-    output.flush().unwrap_or_else(|err| {
-        panic!(
-            "flush copied prebuilt {blob_name} at {}: {err}",
-            temp.path().display()
-        )
-    });
-    std::fs::set_permissions(temp.path(), copied.permissions.clone()).unwrap_or_else(|err| {
-        panic!(
-            "preserve prebuilt {blob_name} permissions at {}: {err}",
-            temp.path().display()
-        )
-    });
-    drop(output);
     assert_eq!(
         (copied.content_key.as_str(), copied.len),
         (source.content_key.as_str(), source.len),
-        "prebuilt {blob_name} at {} changed between fingerprint and copy; \
+        "prebuilt {blob_name} at {} changed between fingerprint and COW materialization; \
          refusing to publish inconsistent bytes",
         src.display(),
     );
-    temp.publish(dest)
-        .unwrap_or_else(|err| panic!("publish prebuilt {blob_name} at {}: {err}", dest.display()));
     let destination = std::fs::metadata(dest).unwrap_or_else(|err| {
         panic!(
             "validate published prebuilt {blob_name} at {}: {err}",
@@ -618,6 +1390,98 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    fn build_blob_cache_root_is_absolute_and_namespaced() {
+        let root = build_blob_cache_root("fixture").expect("resolve build-blob cache root");
+        assert!(root.is_absolute(), "cache root must be absolute: {root:?}");
+        assert!(
+            root.ends_with("build-blobs-v1/fixture"),
+            "cache root must carry schema and namespace: {root:?}",
+        );
+    }
+
+    #[test]
+    fn tool_identity_ignores_runner_directory_but_not_bytes_basename_or_argv() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let left_dir = temp.path().join("ghars-ktstr-x64-1/toolchain/bin");
+        let right_dir = temp.path().join("ghars-ktstr-x64-9/toolchain/bin");
+        std::fs::create_dir_all(&left_dir).expect("create left tool directory");
+        std::fs::create_dir_all(&right_dir).expect("create right tool directory");
+        let left = left_dir.join("rustc");
+        let right = right_dir.join("rustc");
+        std::fs::write(&left, b"identical-tool-payload").expect("write left tool");
+        std::fs::write(&right, b"identical-tool-payload").expect("write right tool");
+        #[cfg(unix)]
+        for path in [&left, &right] {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("make fixture executable");
+        }
+
+        let left_command = format!("{} --crate-name fixture", left.display());
+        let right_command = format!("{} --crate-name fixture", right.display());
+        assert_eq!(
+            stable_tool_command_identity(&left_command).expect("left identity"),
+            stable_tool_command_identity(&right_command).expect("right identity"),
+            "runner-local parent directories must not split identical tool payloads"
+        );
+        assert_ne!(
+            stable_tool_command_identity(&left_command).expect("left identity"),
+            stable_tool_command_identity(&format!("{} --crate-name changed", right.display()))
+                .expect("changed-argv identity"),
+            "command arguments remain part of exact build semantics"
+        );
+
+        std::fs::write(&right, b"different-tool-payload").expect("replace right tool bytes");
+        assert_ne!(
+            stable_tool_command_identity(&left_command).expect("left identity"),
+            stable_tool_command_identity(&right_command).expect("changed-content identity"),
+            "different executable bytes must split cache entries"
+        );
+
+        let alias = right_dir.join("cargo");
+        std::fs::write(&alias, b"identical-tool-payload").expect("write basename alias");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&alias, std::fs::Permissions::from_mode(0o755))
+                .expect("make alias executable");
+        }
+        assert_ne!(
+            stable_tool_program_identity(left.to_str().expect("UTF-8 fixture path"))
+                .expect("rustc identity"),
+            stable_tool_program_identity(alias.to_str().expect("UTF-8 fixture path"))
+                .expect("cargo identity"),
+            "argv[0] basename remains semantic for multicall executables"
+        );
+    }
+
+    #[test]
+    fn tool_command_parser_supports_argv_quoting_and_rejects_expansion() {
+        assert_eq!(
+            split_tool_command("ccache 'clang compiler' \"-DVALUE=two words\" escaped\\ value")
+                .expect("parse argv-like command"),
+            [
+                "ccache",
+                "clang compiler",
+                "-DVALUE=two words",
+                "escaped value"
+            ]
+        );
+        for command in [
+            "gcc $CFLAGS",
+            "gcc $(hostname)",
+            "gcc *.c",
+            "gcc | tee output",
+            "~/bin/gcc",
+        ] {
+            assert!(
+                split_tool_command(command).is_err(),
+                "unstable shell expression must be rejected: {command:?}"
+            );
+        }
+    }
+
+    #[test]
     fn succeeds_on_first_try_no_sleep() {
         let calls = Cell::new(0u32);
         let started = Instant::now();
@@ -653,8 +1517,415 @@ mod tests {
         let _: Result<(), String> = retry_with_backoff("max-zero", 0, |_| Ok(()));
     }
 
+    const BUILD_BLOB_HELPER_MODE: &str = "KTSTR_BUILD_BLOB_HELPER_MODE";
+    const BUILD_BLOB_HELPER_ROOT: &str = "KTSTR_BUILD_BLOB_HELPER_ROOT";
+    const BUILD_BLOB_HELPER_GATE: &str = "KTSTR_BUILD_BLOB_HELPER_GATE";
+    const BUILD_BLOB_HELPER_COUNT: &str = "KTSTR_BUILD_BLOB_HELPER_COUNT";
+    const BUILD_BLOB_HELPER_PARTS: &[&str] = &[
+        "fixture-recipe",
+        "fixture-revision",
+        "x86_64",
+        "fixture-toolchain",
+    ];
+
+    fn spawn_build_blob_helper(
+        root: &std::path::Path,
+        gate: &std::path::Path,
+        count: &std::path::Path,
+        mode: &str,
+    ) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "build_helpers::tests::build_blob_cache_process_helper",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(BUILD_BLOB_HELPER_MODE, mode)
+            .env(BUILD_BLOB_HELPER_ROOT, root)
+            .env(BUILD_BLOB_HELPER_GATE, gate)
+            .env(BUILD_BLOB_HELPER_COUNT, count)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn build-blob cache helper")
+    }
+
+    fn wait_build_blob_helper(mut child: std::process::Child, expected_code: i32) {
+        use std::io::Read as _;
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let (status, timed_out) = loop {
+            match child.try_wait().expect("poll build-blob helper") {
+                Some(status) => break (status, false),
+                None if Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                None => {
+                    let _ = child.kill();
+                    break (child.wait().expect("reap build-blob helper"), true);
+                }
+            }
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        child
+            .stdout
+            .take()
+            .expect("helper stdout")
+            .read_to_end(&mut stdout)
+            .expect("read helper stdout");
+        child
+            .stderr
+            .take()
+            .expect("helper stderr")
+            .read_to_end(&mut stderr)
+            .expect("read helper stderr");
+        assert!(
+            !timed_out,
+            "build-blob helper timed out\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+        assert_eq!(
+            status.code(),
+            Some(expected_code),
+            "build-blob helper exited {status}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+
     #[test]
-    fn install_prebuilt_blob_copies_nonempty_source() {
+    #[ignore = "invoked by cross-process build-blob cache tests"]
+    fn build_blob_cache_process_helper() {
+        use std::io::Write as _;
+
+        let mode = std::env::var(BUILD_BLOB_HELPER_MODE).expect("helper mode");
+        let root = std::path::PathBuf::from(
+            std::env::var_os(BUILD_BLOB_HELPER_ROOT).expect("helper cache root"),
+        );
+        let gate = std::path::PathBuf::from(
+            std::env::var_os(BUILD_BLOB_HELPER_GATE).expect("helper gate"),
+        );
+        let count = std::path::PathBuf::from(
+            std::env::var_os(BUILD_BLOB_HELPER_COUNT).expect("helper count"),
+        );
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while !gate.exists() {
+            assert!(Instant::now() < deadline, "parent did not open helper gate");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        ensure_cached_build_blob(
+            &root,
+            BUILD_BLOB_HELPER_PARTS,
+            "build-blob process fixture",
+            "fixture",
+            |stage| {
+                let mut builders = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&count)
+                    .map_err(|error| error.to_string())?;
+                writeln!(builders, "{mode}:{}", std::process::id())
+                    .map_err(|error| error.to_string())?;
+                builders.sync_all().map_err(|error| error.to_string())?;
+                match mode.as_str() {
+                    "waiter" | "takeover" => {
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        std::fs::write(stage.join("fixture"), b"published-build-blob")
+                            .map_err(|error| error.to_string())
+                    }
+                    "crash" => {
+                        std::fs::write(stage.join("partial"), b"unpublished")
+                            .map_err(|error| error.to_string())?;
+                        std::process::exit(97);
+                    }
+                    other => Err(format!("unknown helper mode {other}")),
+                }
+            },
+        )
+        .expect("helper obtains cached build blob");
+    }
+
+    #[test]
+    fn build_blob_cache_elects_one_builder_across_processes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("cache");
+        let gate = temp.path().join("gate");
+        let count = temp.path().join("builders");
+        let children: Vec<_> = (0..8)
+            .map(|_| spawn_build_blob_helper(&root, &gate, &count, "waiter"))
+            .collect();
+        std::fs::write(&gate, b"go").expect("open helper gate");
+        for child in children {
+            wait_build_blob_helper(child, 0);
+        }
+        let builders = std::fs::read_to_string(&count).expect("read builder record");
+        assert_eq!(
+            builders.lines().count(),
+            1,
+            "only one process may perform expensive work; records:\n{builders}"
+        );
+        let entry = root.join(build_blob_content_id(BUILD_BLOB_HELPER_PARTS));
+        assert_eq!(
+            std::fs::read(entry.join("fixture")).expect("read shared result"),
+            b"published-build-blob"
+        );
+    }
+
+    #[test]
+    fn build_blob_cache_recovers_after_crashed_builder() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("cache");
+        let gate = temp.path().join("gate");
+        let count = temp.path().join("builders");
+        let crashed = spawn_build_blob_helper(&root, &gate, &count, "crash");
+        std::fs::write(&gate, b"go").expect("open helper gate");
+        wait_build_blob_helper(crashed, 97);
+
+        let id = build_blob_content_id(BUILD_BLOB_HELPER_PARTS);
+        let stage_prefix = format!(".{id}.work-");
+        assert!(
+            std::fs::read_dir(&root)
+                .expect("scan crash-leftover cache")
+                .any(|entry| entry
+                    .expect("cache entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&stage_prefix)),
+            "a process exit must model a realistic unpublished stage"
+        );
+
+        let takeover = spawn_build_blob_helper(&root, &gate, &count, "takeover");
+        wait_build_blob_helper(takeover, 0);
+        assert_eq!(
+            std::fs::read(root.join(id).join("fixture")).expect("read takeover result"),
+            b"published-build-blob"
+        );
+        assert!(
+            std::fs::read_dir(&root)
+                .expect("scan recovered cache")
+                .all(|entry| !entry
+                    .expect("cache entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&stage_prefix)),
+            "the takeover must remove crash-leftover stages"
+        );
+    }
+
+    #[test]
+    fn build_blob_cache_rebuilds_deleted_incomplete_and_corrupt_entries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("cache");
+        let parts = ["recipe", "revision", "aarch64", "toolchain"];
+        let entry = root.join(build_blob_content_id(&parts));
+        let builds = std::cell::Cell::new(0usize);
+        let build = |stage: &std::path::Path| {
+            builds.set(builds.get() + 1);
+            std::fs::write(stage.join("artifact"), b"correct-content")
+                .map_err(|error| error.to_string())
+        };
+
+        ensure_cached_build_blob(&root, &parts, "fixture", "artifact", &build)
+            .expect("initial build");
+        std::fs::remove_dir_all(&entry).expect("delete complete cache entry");
+        ensure_cached_build_blob(&root, &parts, "fixture", "artifact", &build)
+            .expect("rebuild deleted entry");
+
+        std::fs::remove_file(entry.join(BUILD_BLOB_OUTPUT_SENTINEL))
+            .expect("make entry incomplete");
+        ensure_cached_build_blob(&root, &parts, "fixture", "artifact", &build)
+            .expect("rebuild incomplete entry");
+
+        std::fs::write(entry.join("artifact"), b"corrupt-content")
+            .expect("corrupt cached artifact at same length");
+        ensure_cached_build_blob(&root, &parts, "fixture", "artifact", &build)
+            .expect("rebuild corrupt entry");
+        assert_eq!(builds.get(), 4, "each invalid cache state elects a rebuild");
+        assert_eq!(
+            std::fs::read(entry.join("artifact")).expect("read repaired artifact"),
+            b"correct-content"
+        );
+    }
+
+    #[test]
+    fn materialized_build_blob_heals_deleted_cache_and_local_corruption() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("cache");
+        let destination = temp.path().join("out-artifact");
+        let stamp = temp.path().join("out-artifact.stamp");
+        let parts = ["recipe", "revision", "x86_64", "exact-tools"];
+        let entry = root.join(build_blob_content_id(&parts));
+        let builds = std::cell::Cell::new(0usize);
+        let build = |stage: &std::path::Path| {
+            builds.set(builds.get() + 1);
+            std::fs::write(stage.join("artifact"), b"correct-content")
+                .map_err(|error| error.to_string())
+        };
+
+        ensure_materialized_build_blob(
+            &root,
+            &parts,
+            "materialized fixture",
+            "artifact",
+            &destination,
+            &stamp,
+            &build,
+        )
+        .expect("initial build and materialization");
+        assert_eq!(builds.get(), 1);
+        assert!(
+            std::fs::read_to_string(&stamp)
+                .expect("read content-bound stamp")
+                .starts_with(BUILT_BLOB_STAMP_SCHEMA),
+            "the local fast path must carry output content, not only an input id"
+        );
+
+        std::fs::remove_dir_all(&entry).expect("delete shared CAS entry");
+        ensure_materialized_build_blob(
+            &root,
+            &parts,
+            "materialized fixture",
+            "artifact",
+            &destination,
+            &stamp,
+            &build,
+        )
+        .expect("reseed deleted CAS from validated local COW inode");
+        assert_eq!(builds.get(), 1, "CAS deletion must not repeat source work");
+        assert_eq!(
+            std::fs::read(entry.join("artifact")).expect("read reseeded CAS"),
+            b"correct-content"
+        );
+
+        let corrupt = temp.path().join("corrupt-local");
+        std::fs::write(&corrupt, b"corrupt-content").expect("write corrupt replacement");
+        std::fs::rename(&corrupt, &destination).expect("replace local inode with corruption");
+        ensure_materialized_build_blob(
+            &root,
+            &parts,
+            "materialized fixture",
+            "artifact",
+            &destination,
+            &stamp,
+            &build,
+        )
+        .expect("repair corrupt local output from intact CAS");
+        assert_eq!(builds.get(), 1, "local corruption must reuse an intact CAS");
+        assert_eq!(
+            std::fs::read(&destination).expect("read repaired local output"),
+            b"correct-content"
+        );
+
+        std::fs::write(entry.join("artifact"), b"corrupt-content").expect("corrupt shared CAS");
+        ensure_materialized_build_blob(
+            &root,
+            &parts,
+            "materialized fixture",
+            "artifact",
+            &destination,
+            &stamp,
+            &build,
+        )
+        .expect("repair corrupt CAS from intact local output");
+        assert_eq!(
+            builds.get(),
+            1,
+            "an intact local copy must reseed corrupt CAS"
+        );
+
+        let corrupt = temp.path().join("corrupt-local-again");
+        std::fs::write(&corrupt, b"corrupt-content").expect("write second corruption");
+        std::fs::rename(&corrupt, &destination).expect("replace local output again");
+        std::fs::remove_dir_all(&entry).expect("delete CAS while local is corrupt");
+        ensure_materialized_build_blob(
+            &root,
+            &parts,
+            "materialized fixture",
+            "artifact",
+            &destination,
+            &stamp,
+            &build,
+        )
+        .expect("rebuild after both copies are lost");
+        assert_eq!(
+            builds.get(),
+            2,
+            "loss of both validated copies must rebuild"
+        );
+    }
+
+    #[test]
+    fn build_blob_identity_separates_source_revision_arch_recipe_and_toolchain() {
+        let base =
+            build_blob_content_id(&["recipe-v1", "rev-a", "source-sha-a", "x86_64", "gcc-a"]);
+        for changed in [
+            ["recipe-v2", "rev-a", "source-sha-a", "x86_64", "gcc-a"],
+            ["recipe-v1", "rev-b", "source-sha-a", "x86_64", "gcc-a"],
+            ["recipe-v1", "rev-a", "source-sha-b", "x86_64", "gcc-a"],
+            ["recipe-v1", "rev-a", "source-sha-a", "aarch64", "gcc-a"],
+            ["recipe-v1", "rev-a", "source-sha-a", "x86_64", "gcc-b"],
+        ] {
+            assert_ne!(base, build_blob_content_id(&changed));
+        }
+    }
+
+    #[test]
+    fn build_blob_materialization_never_byte_copies_on_ficlone_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        std::fs::write(&source, b"new-cached-content").expect("write source");
+        std::fs::write(&destination, b"old-destination").expect("write old destination");
+        let error = materialize_build_blob_with(&source, &destination, |_destination, _source| {
+            Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+        })
+        .expect_err("unsupported FICLONE must fail rather than copying bytes");
+        assert!(error.to_string().contains("FICLONE"));
+        assert_eq!(
+            std::fs::read(&destination).expect("read preserved destination"),
+            b"old-destination",
+            "atomic failure must preserve the previous fixed-path blob"
+        );
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .expect("scan materialization directory")
+                .count(),
+            2,
+            "failed clone temporary must be removed"
+        );
+    }
+
+    #[test]
+    fn build_blob_materialization_uses_real_cross_inode_cow() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        std::fs::write(&source, b"direct-ficlone-content").expect("write source");
+        materialize_build_blob(&source, &destination).expect("direct FICLONE materialization");
+        assert_eq!(
+            std::fs::read(&destination).expect("read materialized blob"),
+            b"direct-ficlone-content"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            assert_ne!(
+                std::fs::metadata(&source).expect("source metadata").ino(),
+                std::fs::metadata(&destination)
+                    .expect("destination metadata")
+                    .ino(),
+                "materialization must create a private COW inode, not a hard link"
+            );
+        }
+    }
+
+    #[test]
+    fn install_prebuilt_blob_cow_materializes_nonempty_source() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let src = tmp.path().join("src-busybox");
         std::fs::write(&src, b"BUSYBOX-BINARY-BYTES").expect("write src");

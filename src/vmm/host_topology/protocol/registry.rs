@@ -930,6 +930,27 @@ impl Ticket {
         required_bits: usize,
         claim: ClaimSet,
     ) -> Result<PendingRegistration> {
+        Self::register_pending_impl(required_bits, claim, false)?.ok_or_else(|| {
+            anyhow::anyhow!("blocking pending registration unexpectedly reported contention")
+        })
+    }
+
+    /// Attempt to publish a same-PID pre-exec owner without waiting for the
+    /// registry writer. `None` means the registry flock was busy; a claim
+    /// conflict remains a distinct `PendingRegistration::Contended` result so
+    /// the caller may try another physical preparation tuple.
+    pub(super) fn try_register_pending(
+        required_bits: usize,
+        claim: ClaimSet,
+    ) -> Result<Option<PendingRegistration>> {
+        Self::register_pending_impl(required_bits, claim, true)
+    }
+
+    fn register_pending_impl(
+        required_bits: usize,
+        claim: ClaimSet,
+        nonblocking: bool,
+    ) -> Result<Option<PendingRegistration>> {
         let namespace = RegistryNamespace::resolve();
         let _namespace = namespace.enter();
         validate_claim(&claim)?;
@@ -939,12 +960,27 @@ impl Ticket {
         );
         let watch = claim.clone();
         materialize_claim_paths(&watch)?;
-        let _lock = lock_registry_interruptible(None)?;
+        let _lock = if nonblocking {
+            let Some(lock) = try_lock_registry_for_initialization()? else {
+                return Ok(None);
+            };
+            lock
+        } else {
+            lock_registry_interruptible(None)?
+        };
         let mut table = Table::open(required_bits.max(required_resource_bits(&watch)).max(1))?;
-        table.repair_consistency_if_needed()?;
-        table.recover_coordinator_if_dead()?;
+        if nonblocking {
+            if atomic_u64(&table.header, H_AGGREGATE_DIRTY).load(Ordering::SeqCst) != 0 {
+                return Ok(None);
+            }
+        } else {
+            table.repair_consistency_if_needed()?;
+            table.recover_coordinator_if_dead()?;
+        }
         if table.claim_conflicts_aggregate(&claim)? {
-            return Ok(PendingRegistration::Contended(table.generation_wake()));
+            return Ok(Some(PendingRegistration::Contended(
+                table.generation_wake(),
+            )));
         }
         table.begin_transaction()?;
 
@@ -983,7 +1019,7 @@ impl Ticket {
         drop(table);
         drop(_lock);
 
-        Ok(PendingRegistration::Registered(Self {
+        Ok(Some(PendingRegistration::Registered(Self {
             namespace,
             slot,
             ticket,
@@ -992,7 +1028,135 @@ impl Ticket {
             wake: Some(wake),
             _interrupt_waiter: None,
             finished: false,
-        }))
+        })))
+    }
+
+    /// Atomically replace this process's bounded preparation claim with one
+    /// complete schedulable claim. No intermediate state double-counts or
+    /// drops its CPU/memory capacity.
+    pub(super) fn relax_pending_preparation(
+        &mut self,
+        expected: &ClaimSet,
+        residency: &ClaimSet,
+    ) -> Result<()> {
+        let _namespace = self.namespace.enter();
+        validate_claim(expected)?;
+        validate_claim(residency)?;
+        anyhow::ensure!(
+            residency.cpus.is_empty() && residency.llcs.is_empty(),
+            "prepared residency must not retain physical topology claims",
+        );
+        anyhow::ensure!(
+            residency.permits.is_subset(&expected.permits),
+            "prepared residency introduced a permit absent from active preparation",
+        );
+        materialize_claim_paths(residency)?;
+
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.repair_consistency_if_needed()?;
+        table.recover_coordinator_if_dead()?;
+        let record = table
+            .record(self.slot)?
+            .filter(|record| record.ticket == self.ticket)
+            .ok_or_else(|| anyhow::anyhow!("pending ticket {} disappeared", self.ticket))?;
+        anyhow::ensure!(
+            record.state == STATE_PENDING,
+            "pending ticket {} is in state {}, not PENDING",
+            self.ticket,
+            record.state,
+        );
+        anyhow::ensure!(
+            record.pid == std::process::id(),
+            "pending ticket {} belongs to PID {}, current PID is {}",
+            self.ticket,
+            record.pid,
+            std::process::id(),
+        );
+        anyhow::ensure!(
+            record.claim == *expected && record.watch == *expected,
+            "pending ticket {} active-preparation claim changed before relaxation",
+            self.ticket,
+        );
+
+        let issue_serial = table.max_watch_serial(residency)?;
+        table.begin_transaction()?;
+        table.adjust_claim_counts(&record.claim, false)?;
+        table.adjust_watch_counts(&record.watch, false)?;
+        let newly_watched = table.newly_watched(residency)?;
+        table.adjust_claim_counts(residency, true)?;
+        table.adjust_watch_counts(residency, true)?;
+        table.mark_observation_modes(&newly_watched)?;
+        let layout = table.layout;
+        {
+            let bytes = table
+                .record_bytes_mut(self.slot)?
+                .ok_or_else(|| anyhow::anyhow!("pending slot {} disappeared", self.slot))?;
+            clear_record_claim_bits(bytes, layout);
+            clear_record_watch_bits(bytes, layout);
+            write_u32(
+                bytes,
+                R_CLAIM_LLC_MODE,
+                u32::from(residency.llc_mode == ClaimMode::Exclusive),
+            );
+            write_u32(
+                bytes,
+                R_CLAIM_CPU_MODE,
+                u32::from(residency.cpu_mode == ClaimMode::Exclusive),
+            );
+            write_u32(
+                bytes,
+                R_CLAIM_PERMIT_MODE,
+                u32::from(residency.permit_mode == ClaimMode::Exclusive),
+            );
+            write_u32(
+                bytes,
+                R_WATCH_LLC_MODE,
+                u32::from(residency.llc_mode == ClaimMode::Exclusive),
+            );
+            write_u32(
+                bytes,
+                R_WATCH_CPU_MODE,
+                u32::from(residency.cpu_mode == ClaimMode::Exclusive),
+            );
+            write_u32(
+                bytes,
+                R_WATCH_PERMIT_MODE,
+                u32::from(residency.permit_mode == ClaimMode::Exclusive),
+            );
+            write_u32(
+                bytes,
+                R_CLAIM_CLASS,
+                encode_admission_class(residency.admission_class),
+            );
+            write_u32(
+                bytes,
+                R_WATCH_CLASS,
+                encode_admission_class(residency.admission_class),
+            );
+            encode_claim(bytes, layout, residency, residency)?;
+            write_u64(bytes, R_ISSUE_SERIAL, issue_serial);
+            write_u64(bytes, R_GRANT_EPOCH, 0);
+            write_u64(bytes, R_REPLAN_CLAIM_EPOCH, 0);
+            write_u64(bytes, R_PREFIX_EPOCH, 0);
+            write_u32(
+                bytes,
+                R_BACKFILL_CREDIT,
+                backfill_credit_for_watch(residency),
+            );
+            write_u64(bytes, R_BLOCKED_SERIAL, 0);
+            write_u32(bytes, R_BLOCK_KIND, BLOCK_NONE);
+            write_u32(bytes, R_BLOCK_MODE, 0);
+            write_u64(bytes, R_BLOCK_INDEX, 0);
+            write_u32(bytes, R_STATE, STATE_PENDING);
+        }
+        table.mark_claim_changed(self.ticket)?;
+        table.bump_generation()?;
+        table.finish_transaction()?;
+        drop(table);
+        drop(_lock);
+        notify_coordinator();
+        Ok(())
     }
 
     /// Atomically replace this process's bounded preparation claim with one
@@ -2433,24 +2597,38 @@ pub(super) fn aggregate_conflicts(candidate: &ClaimSet) -> Result<bool> {
     ))
 }
 
-pub(super) fn aggregate_snapshot(required: &ClaimSet) -> Result<AggregateSnapshot> {
+fn aggregate_snapshot_impl(
+    required: &ClaimSet,
+    nonblocking: bool,
+) -> Result<Option<AggregateSnapshot>> {
     validate_claim(required)?;
     let required_layout = HeaderLayout::new(required_resource_bits(required))
         .context("aggregate snapshot exceeds admission registry capacity")?;
     loop {
-        let Some(shared) = try_lock_registry_existing(FlockMode::Shared)? else {
-            return Ok(AggregateSnapshot::empty(required_layout));
+        let shared = if nonblocking {
+            match probe_lock_registry_existing_nonblocking(FlockMode::Shared)? {
+                NonblockingRegistryLock::Acquired(shared) => shared,
+                NonblockingRegistryLock::Missing => {
+                    return Ok(Some(AggregateSnapshot::empty(required_layout)));
+                }
+                NonblockingRegistryLock::Contended => return Ok(None),
+            }
+        } else {
+            let Some(shared) = try_lock_registry_existing(FlockMode::Shared)? else {
+                return Ok(Some(AggregateSnapshot::empty(required_layout)));
+            };
+            shared
         };
         let path = header_path();
         let file = match File::open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(AggregateSnapshot::empty(required_layout));
+                return Ok(Some(AggregateSnapshot::empty(required_layout)));
             }
             Err(error) => return Err(error).with_context(|| format!("open {}", path.display())),
         };
         if file.metadata()?.len() == 0 {
-            return Ok(AggregateSnapshot::empty(required_layout));
+            return Ok(Some(AggregateSnapshot::empty(required_layout)));
         }
         let map = unsafe { Mmap::map(&file) }
             .with_context(|| format!("map queue aggregate {}", path.display()))?;
@@ -2464,7 +2642,7 @@ pub(super) fn aggregate_snapshot(required: &ClaimSet) -> Result<AggregateSnapsho
                 // registry, not authority for an observer to choose the
                 // process-wide resource width. Keep SH through this read and
                 // leave replacement to the first ticket registrant under EX.
-                return Ok(AggregateSnapshot::empty(required_layout));
+                return Ok(Some(AggregateSnapshot::empty(required_layout)));
             }
             Err(error) => return Err(error),
         };
@@ -2479,6 +2657,9 @@ pub(super) fn aggregate_snapshot(required: &ClaimSet) -> Result<AggregateSnapsho
             drop(map);
             drop(file);
             drop(shared);
+            if nonblocking {
+                return Ok(None);
+            }
             let _lock = lock_registry_existing(FlockMode::Exclusive)?;
             let mut table = Table::open_existing()?;
             table.repair_consistency_if_needed()?;
@@ -2509,7 +2690,7 @@ pub(super) fn aggregate_snapshot(required: &ClaimSet) -> Result<AggregateSnapsho
         // The common disjoint snapshot is a pure SH/read-only operation. Only
         // a claim that is actually fenced needs any liveness work.
         if !snapshot.conflicts(required)? {
-            return Ok(snapshot);
+            return Ok(Some(snapshot));
         }
         let coordinator = read_u64(&map, H_COORDINATOR);
         let coordinator_slot = read_u64(&map, H_COORDINATOR_SLOT);
@@ -2525,17 +2706,30 @@ pub(super) fn aggregate_snapshot(required: &ClaimSet) -> Result<AggregateSnapsho
             ticket_is_live(coordinator_slot, coordinator)?
         };
         if progress_is_live {
-            return Ok(snapshot);
+            return Ok(Some(snapshot));
         }
         drop(map);
         drop(file);
         drop(shared);
+        if nonblocking {
+            return Ok(None);
+        }
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
         table.repair_consistency_if_needed()?;
         table.recover_coordinator_if_dead()?;
         continue;
     }
+}
+
+pub(super) fn aggregate_snapshot(required: &ClaimSet) -> Result<AggregateSnapshot> {
+    aggregate_snapshot_impl(required, false)?.ok_or_else(|| {
+        anyhow::anyhow!("blocking aggregate snapshot unexpectedly reported registry contention")
+    })
+}
+
+pub(super) fn try_aggregate_snapshot(required: &ClaimSet) -> Result<Option<AggregateSnapshot>> {
+    aggregate_snapshot_impl(required, true)
 }
 
 #[cfg(test)]
@@ -3026,6 +3220,11 @@ pub(super) fn hold_registry_shared_for_tests() -> Result<OwnedFd> {
 }
 
 #[cfg(test)]
+pub(super) fn hold_registry_exclusive_for_tests() -> Result<OwnedFd> {
+    lock_registry_interruptible(None)
+}
+
+#[cfg(test)]
 pub(super) fn shared_state_read_count_for_tests() -> usize {
     SHARED_STATE_READS.with(std::cell::Cell::get)
 }
@@ -3428,6 +3627,20 @@ pub(super) fn exercise_granted_only_drain_election_reads_for_tests(
 pub(super) fn exercise_known_free_close_storm_for_tests(
     closes: usize,
 ) -> Result<(usize, u64, usize, u64, u64)> {
+    exercise_known_free_close_storm_impl(closes, false)
+}
+
+#[cfg(test)]
+pub(super) fn exercise_stale_heartbeat_known_free_close_for_tests()
+-> Result<(usize, u64, usize, u64, u64)> {
+    exercise_known_free_close_storm_impl(1, true)
+}
+
+#[cfg(test)]
+fn exercise_known_free_close_storm_impl(
+    closes: usize,
+    force_stale_heartbeat: bool,
+) -> Result<(usize, u64, usize, u64, u64)> {
     let claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
     let mut ticket = Ticket::register(claim.clone(), claim, None)?;
     let empty = BTreeSet::new();
@@ -3460,18 +3673,29 @@ pub(super) fn exercise_known_free_close_storm_for_tests(
     if !initial.should_step {
         anyhow::bail!("first free observation must publish one persisted improvement");
     }
+    if force_stale_heartbeat {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.repair_consistency_if_needed()?;
+        anyhow::ensure!(
+            table.coordinator_ticket() == ticket.ticket && table.coordinator_slot()? == ticket.slot,
+            "test ticket lost coordinator ownership before heartbeat expiry",
+        );
+        write_u64(&mut table.header, H_COORDINATOR_HEARTBEAT_NS, 0);
+    }
     let scans_before = diagnostic_counter_for_tests(H_GRANT_SCANS)?;
     let generation_before = diagnostic_counter_for_tests(H_GENERATION)?;
     let ex_before = REGISTRY_EX_ACQUISITIONS.with(std::cell::Cell::get);
     let mut observations = 0;
     let mut planner_steps = 0;
     let closed = BTreeSet::from([1usize, usize::MAX]);
+    let closed_unwatched = BTreeSet::from([usize::MAX]);
     for _ in 0..closes {
         let snapshot = ticket.schedule(
             None,
             &closed,
-            &empty,
-            &empty,
+            &closed_unwatched,
+            &closed_unwatched,
             false,
             &[],
             &[],
@@ -5572,13 +5796,21 @@ fn try_lock_registry_existing(mode: FlockMode) -> Result<Option<OwnedFd>> {
     Ok(Some(file.into()))
 }
 
-fn try_lock_registry_existing_nonblocking(mode: FlockMode) -> Result<Option<OwnedFd>> {
+enum NonblockingRegistryLock {
+    Acquired(OwnedFd),
+    Missing,
+    Contended,
+}
+
+fn probe_lock_registry_existing_nonblocking(mode: FlockMode) -> Result<NonblockingRegistryLock> {
     use rustix::fs::{FlockOperation, flock};
 
     let path = registry_lock_path();
     let file = match OpenOptions::new().read(true).write(true).open(&path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(NonblockingRegistryLock::Missing);
+        }
         Err(error) => {
             return Err(error).with_context(|| {
                 format!("open existing admission registry lock {}", path.display())
@@ -5595,12 +5827,27 @@ fn try_lock_registry_existing_nonblocking(mode: FlockMode) -> Result<Option<Owne
             if mode == FlockMode::Exclusive {
                 REGISTRY_EX_ACQUISITIONS.with(|count| count.set(count.get().saturating_add(1)));
             }
-            Ok(Some(file.into()))
+            Ok(NonblockingRegistryLock::Acquired(file.into()))
         }
-        Err(error) if error == rustix::io::Errno::WOULDBLOCK => Ok(None),
+        Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
+            Ok(NonblockingRegistryLock::Contended)
+        }
         Err(errno) => Err(std::io::Error::from_raw_os_error(errno.raw_os_error()))
             .with_context(|| format!("lock existing admission registry {}", path.display())),
     }
+}
+
+fn try_lock_registry_existing_nonblocking(mode: FlockMode) -> Result<Option<OwnedFd>> {
+    Ok(match probe_lock_registry_existing_nonblocking(mode)? {
+        NonblockingRegistryLock::Acquired(lock) => Some(lock),
+        NonblockingRegistryLock::Missing | NonblockingRegistryLock::Contended => None,
+    })
+}
+
+fn try_lock_registry_for_initialization() -> Result<Option<OwnedFd>> {
+    std::fs::create_dir_all(registry_data_dir())?;
+    std::fs::create_dir_all(event_dir())?;
+    try_flock(registry_lock_path(), FlockMode::Exclusive)
 }
 
 fn check_cancelled(cancelled: Option<&AtomicBool>) -> Result<()> {
@@ -8619,25 +8866,21 @@ impl Table {
         llcs: &BTreeSet<usize>,
         permits: &BTreeSet<usize>,
     ) -> Result<(BTreeSet<usize>, BTreeSet<usize>, BTreeSet<usize>)> {
-        let mut watched_cpus = BTreeSet::new();
-        let mut watched_llcs = BTreeSet::new();
-        let mut watched_permits = BTreeSet::new();
-        for &cpu in cpus {
-            if self.bitmap_bit(B_WATCH_CPUS, cpu)? {
-                watched_cpus.insert(cpu);
-            }
-        }
-        for &llc in llcs {
-            if self.bitmap_bit(B_WATCH_LLCS, llc)? {
-                watched_llcs.insert(llc);
-            }
-        }
-        for &permit in permits {
-            if self.bitmap_bit(B_WATCH_CPUS, permit_resource_index(permit)?)? {
-                watched_permits.insert(permit);
-            }
-        }
-        Ok((watched_cpus, watched_llcs, watched_permits))
+        // Release notifications are observations, not claims. They may cover
+        // resources outside this registry layout (including resources no live
+        // ticket has ever watched), so intersect with the valid aggregate
+        // watch before touching layout-indexed bitmaps. The SH fast path does
+        // the same intersection; falling back after a stale coordinator
+        // heartbeat must preserve that behavior rather than rejecting an
+        // otherwise irrelevant event index.
+        let watch_llcs = self.bitmap_indices(B_WATCH_LLCS);
+        let (watch_cpus, watch_permits) =
+            split_cpu_permit_indices(self.bitmap_indices(B_WATCH_CPUS));
+        Ok((
+            cpus.intersection(&watch_cpus).copied().collect(),
+            llcs.intersection(&watch_llcs).copied().collect(),
+            permits.intersection(&watch_permits).copied().collect(),
+        ))
     }
 
     fn adjust_aggregate_bit(&mut self, which: usize, bit: usize, add: bool) -> Result<()> {

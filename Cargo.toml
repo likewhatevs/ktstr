@@ -447,7 +447,6 @@ export = []
 # mold, elfutils-devel, zlib-devel on the host; takes several minutes cold).
 wprof = [
     "ktstr-macros/wprof",
-    "dep:fs2",
     "dep:gix",
 ]
 # Pretty thread-name labels in `ctprof_compare` output. Enables
@@ -530,7 +529,9 @@ virtio-queue = { version = "0.17", features = ["test-utils"] }
 # handoffs. Unconditional because busybox is prepared on the default build;
 # the wprof source-acquisition path reuses the same host-side crate.
 ahash = "0.8"
-fs2 = { version = "0.4", optional = true }
+# The build-script blob CAS is used by the default BusyBox build, so its
+# cross-process publication lock cannot be gated on the optional wprof path.
+fs2 = "0.4"
 # Optional with `wprof`: default builds do not compile a second host-side gix
 # graph merely for a build-script path that is disabled.
 gix = { version = "0.83", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-curl-rustls", "worktree-mutation", "progress-tree", "parallel"], optional = true }

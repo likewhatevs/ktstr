@@ -14,6 +14,7 @@
 //! dynamic `RELATIVE` relocations, while ET_EXEC and RELR-packed PIEs already
 //! carry their addend in the pointer slot.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::mem::{offset_of, size_of};
 use std::path::Path;
@@ -45,6 +46,21 @@ const BINARY_EEVDF: u8 = 0;
 const BINARY_DISCOVER: u8 = 1;
 const BINARY_PATH: u8 = 2;
 const BINARY_KERNEL_BUILTIN: u8 = 3;
+
+pub(super) fn advise_sparse_elf(mapping: &memmap2::Mmap) {
+    #[cfg(unix)]
+    {
+        // Scheduler/admission metadata touches the ELF header, section table,
+        // dynamic relocations, compact stamp sections, and a small set of
+        // pointed-to strings spread across otherwise untouched 100–500 MiB
+        // test executables. Default mmap readahead turns those sparse faults
+        // into substantial unrelated I/O when many CI jobs read reflinked
+        // artifact trees concurrently.
+        let _ = mapping.advise(memmap2::Advice::Random);
+    }
+    #[cfg(not(unix))]
+    let _ = mapping;
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -452,6 +468,7 @@ pub(super) struct ElfStampReader<'a> {
     dynrela_relative_prefix: usize,
     dynrel_relative_prefix: usize,
     exceptional_pointer_relocations: OnceLock<HashMap<u64, PointerRelocation>>,
+    pointer_values: RefCell<HashMap<u64, u64>>,
 }
 
 impl<'a> ElfStampReader<'a> {
@@ -611,7 +628,6 @@ impl<'a> ElfStampReader<'a> {
             Self::relative_prefix_len(&elf.dynrelas, declared_rela_count, relative_type);
         let dynrel_relative_prefix =
             Self::relative_prefix_len(&elf.dynrels, declared_rel_count, relative_type);
-
         Ok(Self {
             source,
             data,
@@ -620,6 +636,7 @@ impl<'a> ElfStampReader<'a> {
             dynrela_relative_prefix,
             dynrel_relative_prefix,
             exceptional_pointer_relocations: OnceLock::new(),
+            pointer_values: RefCell::new(HashMap::new()),
         })
     }
 
@@ -706,6 +723,60 @@ impl<'a> ElfStampReader<'a> {
         )
     }
 
+    fn relocations_at_sorted_fields(
+        relocations: &RelocSection<'_>,
+        relative_prefix: usize,
+        fields: &[u64],
+    ) -> Vec<Option<goblin::elf::reloc::Reloc>> {
+        if fields.is_empty() {
+            return Vec::new();
+        }
+        debug_assert!(fields.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let end = relative_prefix.min(relocations.len());
+        // Find the first relocation at or after the first requested pointer
+        // field. The remaining requested fields and linker relative
+        // relocations are both ordered by virtual address, so one forward
+        // walk resolves the whole stamp section. This avoids one cold O(log
+        // n) mmap access pattern per pointer in 300k-entry Rust test-binary
+        // relocation tables.
+        let mut lower = 0usize;
+        let mut upper = end;
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2;
+            if relocations
+                .get(middle)
+                .is_some_and(|relocation| relocation.r_offset < fields[0])
+            {
+                lower = middle + 1;
+            } else {
+                upper = middle;
+            }
+        }
+
+        let mut relocation_index = lower;
+        let mut found = Vec::with_capacity(fields.len());
+        for &field in fields {
+            while relocation_index < end
+                && relocations
+                    .get(relocation_index)
+                    .is_some_and(|relocation| relocation.r_offset < field)
+            {
+                relocation_index += 1;
+            }
+            let relocation = if relocation_index < end {
+                relocations
+                    .get(relocation_index)
+                    .filter(|relocation| relocation.r_offset == field)
+            } else {
+                None
+            };
+            found.push(relocation);
+        }
+        found
+    }
+
+    #[cfg(test)]
     fn pointer_relocation(&self, field_va: u64) -> Result<Option<PointerRelocation>, String> {
         let rela = self.relocation_at(&self.elf.dynrelas, self.dynrela_relative_prefix, field_va);
         let rel = self.relocation_at(&self.elf.dynrels, self.dynrel_relative_prefix, field_va);
@@ -769,6 +840,129 @@ impl<'a> ElfStampReader<'a> {
             // REL stores the addend in the relocated pointer slot.
             None => PointerRelocation::RelativeInPlace,
         }))
+    }
+
+    fn pointer_at_field(
+        &self,
+        field_va: u64,
+        what: &str,
+        rela: Option<goblin::elf::reloc::Reloc>,
+        rel: Option<goblin::elf::reloc::Reloc>,
+    ) -> Result<u64, String> {
+        match self.classify_pointer_relocation(field_va, rela, rel)? {
+            Some(PointerRelocation::Relative(addend)) => Ok(addend),
+            Some(PointerRelocation::RelativeInPlace) => self.raw_u64(field_va, what),
+            Some(PointerRelocation::Unsupported(kind)) => Err(format!(
+                "{what} in scheduler-manifest ELF {} uses unsupported dynamic relocation \
+                 type {kind} at virtual address 0x{field_va:x}",
+                self.source.display()
+            )),
+            Some(PointerRelocation::Duplicate) => unreachable!(
+                "duplicate relocations are rejected before pointer relocation is returned"
+            ),
+            // ET_EXEC stores an absolute VA. DT_RELR-packed ET_DYN stores the
+            // relative relocation's addend in place, so the same read covers
+            // both without depending on section headers for SHT_RELR.
+            None => {
+                let pointer = self.raw_u64(field_va, what)?;
+                if self.elf.header.e_type == goblin::elf::header::ET_DYN {
+                    // DT_REL[A]COUNT guarantees a leading relative prefix,
+                    // but not r_offset ordering. A sparse ordered lookup may
+                    // therefore miss a valid unsorted REL[A] entry. Consult
+                    // the authoritative exceptional index before accepting
+                    // even a plausible in-place VA; only a real index miss
+                    // permits the value to be interpreted as DT_RELR.
+                    return match self.exceptional_pointer_relocation(field_va)? {
+                        Some(PointerRelocation::Relative(addend)) => Ok(addend),
+                        Some(PointerRelocation::RelativeInPlace) => Ok(pointer),
+                        Some(PointerRelocation::Unsupported(kind)) => Err(format!(
+                            "{what} in scheduler-manifest ELF {} uses unsupported dynamic \
+                             relocation type {kind} at virtual address 0x{field_va:x}",
+                            self.source.display()
+                        )),
+                        Some(PointerRelocation::Duplicate) => unreachable!(
+                            "duplicate relocations are rejected before pointer relocation is returned"
+                        ),
+                        None => Ok(pointer),
+                    };
+                }
+                if pointer != 0 && self.va_file_offset(pointer, 1, what).is_ok() {
+                    return Ok(pointer);
+                }
+                // ET_EXEC normally carries absolute in-place VAs. Preserve a
+                // precise diagnostic for an unusual invalid in-place value
+                // backed by a dynamic relocation.
+                match self.exceptional_pointer_relocation(field_va)? {
+                    Some(PointerRelocation::Relative(addend)) => Ok(addend),
+                    Some(PointerRelocation::RelativeInPlace) => Ok(pointer),
+                    Some(PointerRelocation::Unsupported(kind)) => Err(format!(
+                        "{what} in scheduler-manifest ELF {} uses unsupported dynamic \
+                         relocation type {kind} at virtual address 0x{field_va:x}",
+                        self.source.display()
+                    )),
+                    Some(PointerRelocation::Duplicate) => unreachable!(
+                        "duplicate relocations are rejected before pointer relocation is returned"
+                    ),
+                    None => Ok(pointer),
+                }
+            }
+        }
+    }
+
+    /// Resolve a batch of pointer fields while retaining input order.
+    ///
+    /// GNU ld/lld/mold relative relocation prefixes and callers' stamp fields
+    /// are ordered by virtual address. Resolving a section-sized batch turns
+    /// hundreds of independent logarithmic mmap walks into one logarithmic
+    /// lower bound and a short sequential scan. A miss in ET_DYN consults the
+    /// authoritative exceptional index before accepting an in-place RELR
+    /// value, so REL, RELA, RELR, and valid unsorted external ELFs retain the
+    /// same correctness paths as [`Self::pointer`].
+    pub(super) fn pointers(&self, fields: &[u64], what: &str) -> Result<Vec<u64>, String> {
+        if fields.is_empty() {
+            return Ok(Vec::new());
+        }
+        let missing_fields = {
+            let cached = self.pointer_values.borrow();
+            fields
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .filter(|field| !cached.contains_key(field))
+                .collect::<Vec<_>>()
+        };
+        if !missing_fields.is_empty() {
+            let relas = Self::relocations_at_sorted_fields(
+                &self.elf.dynrelas,
+                self.dynrela_relative_prefix,
+                &missing_fields,
+            );
+            let rels = Self::relocations_at_sorted_fields(
+                &self.elf.dynrels,
+                self.dynrel_relative_prefix,
+                &missing_fields,
+            );
+            let values = missing_fields
+                .iter()
+                .copied()
+                .zip(relas)
+                .zip(rels)
+                .map(|((field, rela), rel)| self.pointer_at_field(field, what, rela, rel))
+                .collect::<Result<Vec<_>, _>>()?;
+            self.pointer_values
+                .borrow_mut()
+                .extend(missing_fields.into_iter().zip(values));
+        }
+        let cached = self.pointer_values.borrow();
+        Ok(fields
+            .iter()
+            .map(|field| {
+                *cached
+                    .get(field)
+                    .expect("every requested pointer field was cached")
+            })
+            .collect())
     }
 
     pub(super) fn section(&self, name: &str) -> Result<Option<(u64, &'a [u8])>, String> {
@@ -916,46 +1110,14 @@ impl<'a> ElfStampReader<'a> {
                 self.source.display()
             )
         })?;
-        match self.pointer_relocation(field_va)? {
-            Some(PointerRelocation::Relative(addend)) => Ok(addend),
-            Some(PointerRelocation::RelativeInPlace) => self.raw_u64(field_va, what),
-            Some(PointerRelocation::Unsupported(kind)) => Err(format!(
-                "{what} in scheduler-manifest ELF {} uses unsupported dynamic relocation \
-                 type {kind} at virtual address 0x{field_va:x}",
-                self.source.display()
-            )),
-            Some(PointerRelocation::Duplicate) => unreachable!(
-                "duplicate relocations are rejected before pointer relocation is returned"
-            ),
-            // ET_EXEC stores an absolute VA. DT_RELR-packed ET_DYN stores the
-            // relative relocation's addend in place, so the same read covers
-            // both without depending on section headers for SHT_RELR.
-            None => {
-                let pointer = self.raw_u64(field_va, what)?;
-                if pointer != 0 && self.va_file_offset(pointer, 1, what).is_ok() {
-                    return Ok(pointer);
-                }
-                // DT_REL[A]COUNT does not itself promise offset ordering.
-                // Normal GNU ld/lld/mold output takes the binary-search path,
-                // while this fallback preserves correctness for a valid
-                // unsorted relative prefix. Only a pointer whose in-place
-                // value cannot already designate file-backed ELF data pays
-                // to build the exceptional relocation index.
-                match self.exceptional_pointer_relocation(field_va)? {
-                    Some(PointerRelocation::Relative(addend)) => Ok(addend),
-                    Some(PointerRelocation::RelativeInPlace) => Ok(pointer),
-                    Some(PointerRelocation::Unsupported(kind)) => Err(format!(
-                        "{what} in scheduler-manifest ELF {} uses unsupported dynamic \
-                         relocation type {kind} at virtual address 0x{field_va:x}",
-                        self.source.display()
-                    )),
-                    Some(PointerRelocation::Duplicate) => unreachable!(
-                        "duplicate relocations are rejected before pointer relocation is returned"
-                    ),
-                    None => Ok(pointer),
-                }
-            }
+        if let Some(pointer) = self.pointer_values.borrow().get(&field_va).copied() {
+            return Ok(pointer);
         }
+        let rela = self.relocation_at(&self.elf.dynrelas, self.dynrela_relative_prefix, field_va);
+        let rel = self.relocation_at(&self.elf.dynrels, self.dynrel_relative_prefix, field_va);
+        let pointer = self.pointer_at_field(field_va, what, rela, rel)?;
+        self.pointer_values.borrow_mut().insert(field_va, pointer);
+        Ok(pointer)
     }
 
     fn header(
@@ -1146,6 +1308,236 @@ impl<'a> ElfStampReader<'a> {
                 self.source.display()
             )),
         }
+    }
+
+    fn field(base: u64, offset: usize, what: &str) -> Result<u64, String> {
+        base.checked_add(offset as u64)
+            .ok_or_else(|| format!("{what} pointer-field address overflow"))
+    }
+
+    fn collect_string_pointer_field(
+        &self,
+        base: u64,
+        what: &str,
+        fields: &mut Vec<u64>,
+    ) -> Result<(), String> {
+        let len_field = Self::field(base, offset_of!(SchedulerManifestStampStrV1, len), what)?;
+        if self.raw_u64(len_field, what)? != 0 {
+            fields.push(Self::field(
+                base,
+                offset_of!(SchedulerManifestStampStrV1, ptr),
+                what,
+            )?);
+        }
+        Ok(())
+    }
+
+    fn collect_slice_pointer_field<T>(
+        &self,
+        base: u64,
+        what: &str,
+        fields: &mut Vec<u64>,
+    ) -> Result<(), String> {
+        let len_field = Self::field(
+            base,
+            offset_of!(SchedulerManifestStampSliceV1<T>, len),
+            what,
+        )?;
+        if self.raw_u64(len_field, what)? != 0 {
+            fields.push(Self::field(
+                base,
+                offset_of!(SchedulerManifestStampSliceV1<T>, ptr),
+                what,
+            )?);
+        }
+        Ok(())
+    }
+
+    fn collect_optional_string_pointer_field(
+        &self,
+        base: u64,
+        what: &str,
+        fields: &mut Vec<u64>,
+    ) -> Result<(), String> {
+        if self.u8(base, offset_of!(StampOptionalStrV1, present), what)? == 1 {
+            self.collect_string_pointer_field(
+                Self::field(base, offset_of!(StampOptionalStrV1, value), what)?,
+                what,
+                fields,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn prefetch_string_slice(&self, base: u64, what: &str) -> Result<(), String> {
+        let (pointer, len) = self.slice_descriptor::<SchedulerManifestStampStrV1>(base, what)?;
+        let mut fields = Vec::with_capacity(len);
+        for index in 0..len {
+            self.collect_string_pointer_field(
+                pointer + (index * size_of::<SchedulerManifestStampStrV1>()) as u64,
+                what,
+                &mut fields,
+            )?;
+        }
+        self.pointers(&fields, what).map(|_| ())
+    }
+
+    fn prefetch_sysctl_slice(&self, base: u64, what: &str) -> Result<(), String> {
+        let (pointer, len) = self.slice_descriptor::<SchedulerManifestStampSysctlV1>(base, what)?;
+        let mut fields = Vec::with_capacity(len.saturating_mul(2));
+        for index in 0..len {
+            let element = pointer + (index * size_of::<SchedulerManifestStampSysctlV1>()) as u64;
+            self.collect_string_pointer_field(
+                element + offset_of!(SchedulerManifestStampSysctlV1, key) as u64,
+                what,
+                &mut fields,
+            )?;
+            self.collect_string_pointer_field(
+                element + offset_of!(SchedulerManifestStampSysctlV1, value) as u64,
+                what,
+                &mut fields,
+            )?;
+        }
+        self.pointers(&fields, what).map(|_| ())
+    }
+
+    fn prefetch_scheduler_use_slice(&self, base: u64, what: &str) -> Result<(), String> {
+        let (pointer, len) = self.slice_descriptor::<SchedulerManifestUseStampV1>(base, what)?;
+        let mut fields = Vec::with_capacity(len.saturating_mul(3));
+        for index in 0..len {
+            let element = pointer + (index * size_of::<SchedulerManifestUseStampV1>()) as u64;
+            self.collect_string_pointer_field(
+                element + offset_of!(SchedulerManifestUseStampV1, name) as u64,
+                what,
+                &mut fields,
+            )?;
+            self.collect_string_pointer_field(
+                element + offset_of!(SchedulerManifestUseStampV1, manifest_dir) as u64,
+                what,
+                &mut fields,
+            )?;
+            self.collect_string_pointer_field(
+                element + offset_of!(SchedulerManifestUseStampV1, binary_value) as u64,
+                what,
+                &mut fields,
+            )?;
+        }
+        self.pointers(&fields, what).map(|_| ())
+    }
+
+    fn prefetch_manifest_pointers(
+        &self,
+        declarations: &[RecordSlot],
+        tests: &[RecordSlot],
+    ) -> Result<(), String> {
+        let mut fields = Vec::new();
+        for slot in declarations {
+            let base = slot.base;
+            for offset in [
+                offset_of!(SchedulerManifestDeclarationStampV1, name),
+                offset_of!(SchedulerManifestDeclarationStampV1, manifest_dir),
+                offset_of!(SchedulerManifestDeclarationStampV1, binary_value),
+            ] {
+                self.collect_string_pointer_field(
+                    base + offset as u64,
+                    "declaration string",
+                    &mut fields,
+                )?;
+            }
+            self.collect_slice_pointer_field::<SchedulerManifestStampStrV1>(
+                base + offset_of!(SchedulerManifestDeclarationStampV1, sched_args) as u64,
+                "declaration sched_args",
+                &mut fields,
+            )?;
+            self.collect_slice_pointer_field::<SchedulerManifestStampSysctlV1>(
+                base + offset_of!(SchedulerManifestDeclarationStampV1, sysctls) as u64,
+                "declaration sysctls",
+                &mut fields,
+            )?;
+            for offset in [
+                offset_of!(SchedulerManifestDeclarationStampV1, kargs),
+                offset_of!(SchedulerManifestDeclarationStampV1, kernels),
+                offset_of!(
+                    SchedulerManifestDeclarationStampV1,
+                    verifier_exclude_topologies
+                ),
+            ] {
+                self.collect_slice_pointer_field::<SchedulerManifestStampStrV1>(
+                    base + offset as u64,
+                    "declaration string slice",
+                    &mut fields,
+                )?;
+            }
+            for offset in [
+                offset_of!(SchedulerManifestDeclarationStampV1, cgroup_parent),
+                offset_of!(SchedulerManifestDeclarationStampV1, config_file),
+            ] {
+                self.collect_optional_string_pointer_field(
+                    base + offset as u64,
+                    "declaration optional string",
+                    &mut fields,
+                )?;
+            }
+        }
+        self.pointers(&fields, "scheduler declaration pointer batch")?;
+
+        fields.clear();
+        for slot in tests {
+            self.collect_string_pointer_field(
+                slot.base + offset_of!(SchedulerManifestTestStampV1, test) as u64,
+                "test name",
+                &mut fields,
+            )?;
+            self.collect_slice_pointer_field::<SchedulerManifestUseStampV1>(
+                slot.base + offset_of!(SchedulerManifestTestStampV1, schedulers) as u64,
+                "test schedulers",
+                &mut fields,
+            )?;
+            fields.push(Self::field(
+                slot.base,
+                offset_of!(SchedulerManifestTestStampV1, legacy_entry),
+                "test legacy entry",
+            )?);
+        }
+        self.pointers(&fields, "scheduler test pointer batch")?;
+
+        for slot in declarations {
+            let base = slot.base;
+            self.prefetch_string_slice(
+                base + offset_of!(SchedulerManifestDeclarationStampV1, sched_args) as u64,
+                "declaration sched_args elements",
+            )?;
+            self.prefetch_sysctl_slice(
+                base + offset_of!(SchedulerManifestDeclarationStampV1, sysctls) as u64,
+                "declaration sysctl elements",
+            )?;
+            for (offset, what) in [
+                (
+                    offset_of!(SchedulerManifestDeclarationStampV1, kargs),
+                    "declaration karg elements",
+                ),
+                (
+                    offset_of!(SchedulerManifestDeclarationStampV1, kernels),
+                    "declaration kernel elements",
+                ),
+                (
+                    offset_of!(
+                        SchedulerManifestDeclarationStampV1,
+                        verifier_exclude_topologies
+                    ),
+                    "declaration verifier topology elements",
+                ),
+            ] {
+                self.prefetch_string_slice(base + offset as u64, what)?;
+            }
+        }
+        for slot in tests {
+            self.prefetch_scheduler_use_slice(
+                slot.base + offset_of!(SchedulerManifestTestStampV1, schedulers) as u64,
+                "test scheduler-use elements",
+            )?;
+        }
+        Ok(())
     }
 
     fn declaration(&self, base: u64, index: usize) -> Result<SchedulerJson, String> {
@@ -1355,13 +1747,18 @@ struct ParsedTestStamp {
     legacy_entry: u64,
 }
 
-fn parse_record_section<T>(
+#[derive(Clone, Copy)]
+struct RecordSlot {
+    base: u64,
+    index: usize,
+}
+
+fn record_section_slots(
     reader: &ElfStampReader<'_>,
     section_name: &str,
     wire_size: usize,
     expected_kind: u16,
-    mut parse: impl FnMut(u64, usize) -> Result<T, String>,
-) -> Result<Option<Vec<T>>, String> {
+) -> Result<Option<Vec<RecordSlot>>, String> {
     let Some((section_va, bytes)) = reader.section(section_name)? else {
         return Ok(None);
     };
@@ -1379,7 +1776,7 @@ fn parse_record_section<T>(
         let base = section_va + (index * wire_size) as u64;
         match reader.header(base, wire_size, section_name, index)? {
             STAMP_KIND_SENTINEL => sentinel_count += 1,
-            kind if kind == expected_kind => records.push(parse(base, index)?),
+            kind if kind == expected_kind => records.push(RecordSlot { base, index }),
             kind => {
                 return Err(format!(
                     "corrupt scheduler-manifest section {section_name} in {}: record {index} \
@@ -1568,19 +1965,17 @@ fn order_tests_by_legacy_registry(
 pub(super) fn read_scheduler_manifest_stamp_reader(
     reader: &ElfStampReader<'_>,
 ) -> Result<Option<SchedulerManifestProbe>, String> {
-    let declarations = parse_record_section(
+    let declarations = record_section_slots(
         reader,
         DECLARATION_SECTION,
         size_of::<SchedulerManifestDeclarationStampV1>(),
         STAMP_KIND_DECLARATION,
-        |base, index| reader.declaration(base, index),
     )?;
-    let tests = parse_record_section(
+    let tests = record_section_slots(
         reader,
         TEST_SECTION,
         size_of::<SchedulerManifestTestStampV1>(),
         STAMP_KIND_TEST,
-        |base, index| reader.test(base, index),
     )?;
     match (declarations, tests) {
         (None, None) => {
@@ -1607,7 +2002,16 @@ pub(super) fn read_scheduler_manifest_stamp_reader(
              required peer section {DECLARATION_SECTION}",
             reader.source.display()
         )),
-        (Some(declarations), Some(mut tests)) => {
+        (Some(declaration_slots), Some(test_slots)) => {
+            reader.prefetch_manifest_pointers(&declaration_slots, &test_slots)?;
+            let declarations = declaration_slots
+                .iter()
+                .map(|slot| reader.declaration(slot.base, slot.index))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut tests = test_slots
+                .iter()
+                .map(|slot| reader.test(slot.base, slot.index))
+                .collect::<Result<Vec<_>, _>>()?;
             validate_registry_count(
                 reader,
                 "linkme_KTSTR_SCHEDULERS",
@@ -1646,6 +2050,7 @@ pub fn read_scheduler_manifest_stamp(
             path.display()
         )
     })?;
+    advise_sparse_elf(&data);
     let reader = ElfStampReader::new(path, &data)?;
     read_scheduler_manifest_stamp_reader(&reader)
 }
@@ -1663,6 +2068,52 @@ mod tests {
         let mapping = unsafe { memmap2::MmapOptions::new().map_copy(&file) }
             .expect("copy-map unit-test executable");
         (executable, mapping)
+    }
+
+    #[test]
+    fn manifest_reconstruction_has_no_scalar_pointer_misses_after_prefetch() {
+        let (executable, mapping) = map_current_test_executable_copy();
+        let reader = ElfStampReader::new(&executable, &mapping).expect("parse test executable");
+        let declarations = record_section_slots(
+            &reader,
+            DECLARATION_SECTION,
+            size_of::<SchedulerManifestDeclarationStampV1>(),
+            STAMP_KIND_DECLARATION,
+        )
+        .expect("read declaration slots")
+        .expect("declaration stamp section is linked");
+        let tests = record_section_slots(
+            &reader,
+            TEST_SECTION,
+            size_of::<SchedulerManifestTestStampV1>(),
+            STAMP_KIND_TEST,
+        )
+        .expect("read test slots")
+        .expect("test stamp section is linked");
+        reader
+            .prefetch_manifest_pointers(&declarations, &tests)
+            .expect("prefetch every manifest pointer");
+        let prefetched = reader.pointer_values.borrow().len();
+        assert!(
+            prefetched != 0,
+            "fixture must contain pointer-bearing records"
+        );
+
+        for slot in &declarations {
+            reader
+                .declaration(slot.base, slot.index)
+                .expect("decode declaration from prefetched pointers");
+        }
+        for slot in &tests {
+            reader
+                .test(slot.base, slot.index)
+                .expect("decode test from prefetched pointers");
+        }
+        assert_eq!(
+            reader.pointer_values.borrow().len(),
+            prefetched,
+            "manifest decoding must not fall back to scalar relocation lookup",
+        );
     }
 
     #[test]
@@ -1893,7 +2344,8 @@ mod tests {
         for index in 0..relocation_size {
             mapping.swap(relocation_file_offset + index, target_start + index);
         }
-        mapping[pointer_slot_file_offset..pointer_slot_file_offset + size_of::<u64>()].fill(0);
+        mapping[pointer_slot_file_offset..pointer_slot_file_offset + size_of::<u64>()]
+            .copy_from_slice(&test_record.to_le_bytes());
 
         let reader =
             ElfStampReader::new(&executable, &mapping).expect("parse unsorted test executable");
@@ -1901,12 +2353,31 @@ mod tests {
             reader.exceptional_pointer_relocations.get().is_none(),
             "exceptional relocation index must stay lazy"
         );
+        assert_eq!(
+            reader
+                .raw_u64(field_va, "mutated test-name pointer slot")
+                .expect("read mutated pointer slot"),
+            test_record,
+            "fixture must carry a plausible but incorrect in-place VA"
+        );
+        assert!(
+            reader
+                .va_file_offset(test_record, 1, "plausible wrong pointer")
+                .is_ok(),
+            "wrong in-place VA must be file-backed so validity checks cannot mask the bug"
+        );
         assert!(
             reader
                 .pointer_relocation(field_va)
                 .expect("fast relocation lookup")
                 .is_none(),
             "fixture must force the ordered-prefix fast path to miss"
+        );
+        assert_eq!(
+            reader
+                .pointers(&[field_va], "unsorted batched test-name pointer")
+                .expect("batched exceptional index must resolve the pointer"),
+            vec![expected_pointer],
         );
         assert_eq!(
             reader

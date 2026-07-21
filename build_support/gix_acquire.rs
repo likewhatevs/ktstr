@@ -87,13 +87,13 @@ pub(crate) fn cache_entry(root: &Path, parts: &[&str]) -> PathBuf {
     root.join(content_id(parts))
 }
 
-/// Elect one builder for `parts`, before it performs network or build work,
-/// and atomically publish its completed directory.
+/// Test-facing adapter around the fully cancellable cache implementation.
 ///
-/// The lock file is persistent but the advisory lock is owned by the open
-/// descriptor, so a crashed builder cannot strand waiters. Every waiter
-/// rechecks the immutable result after acquiring the lock and therefore
-/// reuses the winner instead of duplicating the expensive operation.
+/// Production callers use the cancellable entry points below. Keeping this
+/// adapter test-only lets the cross-process integration fixture exercise the
+/// same election and publication path without carrying an otherwise unused
+/// build-script symbol.
+#[cfg(test)]
 pub(crate) fn ensure_cached<Complete, Build>(
     root: &Path,
     parts: &[&str],
@@ -1631,7 +1631,7 @@ impl ProgressReporter {
         }
     }
 
-    fn finish(mut self) {
+    pub(crate) fn finish(mut self) {
         self.shutdown();
         println!(
             "cargo:warning={}: complete in {}",

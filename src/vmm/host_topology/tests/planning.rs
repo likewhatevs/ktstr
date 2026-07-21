@@ -1530,6 +1530,69 @@ fn live_ex_holder_uses_fresh_holder_diagnostics_not_registered_claim_error() {
     );
 }
 
+#[test]
+fn retry_exhausted_diagnostics_rescan_until_expected_holder_is_visible() {
+    let expected = std::collections::BTreeSet::from([0usize]);
+    let scans = std::cell::Cell::new(0usize);
+    let waits = std::cell::Cell::new(0usize);
+    let snapshots = retry_exhausted_holder_snapshots_with(
+        &expected,
+        4,
+        || {
+            let sample = scans.get() + 1;
+            scans.set(sample);
+            Ok(vec![LlcSnapshot {
+                llc_idx: 0,
+                holders: if sample == 1 {
+                    Vec::new()
+                } else {
+                    vec![crate::flock::HolderInfo {
+                        pid: 42,
+                        cmdline: "stable-holder".into(),
+                    }]
+                },
+                holder_count: 0,
+                exclusive_held: true,
+            }])
+        },
+        |_| {
+            waits.set(waits.get() + 1);
+            true
+        },
+    )
+    .expect("rescan injected holder snapshots");
+    assert_eq!(
+        scans.get(),
+        2,
+        "the coherent second image must stop rescans"
+    );
+    assert_eq!(waits.get(), 1);
+    assert!(holder_snapshot_covers_expected_llcs(&snapshots, &expected));
+}
+
+#[test]
+fn retry_exhausted_diagnostics_respect_the_sample_cap() {
+    let expected = std::collections::BTreeSet::from([0usize]);
+    let scans = std::cell::Cell::new(0usize);
+    let snapshots = retry_exhausted_holder_snapshots_with(
+        &expected,
+        3,
+        || {
+            scans.set(scans.get() + 1);
+            Ok(vec![LlcSnapshot {
+                llc_idx: 0,
+                holders: Vec::new(),
+                holder_count: 0,
+                exclusive_held: true,
+            }])
+        },
+        |_| true,
+    )
+    .expect("bound injected holder snapshots");
+    assert_eq!(scans.get(), 3, "diagnostics exceeded their sample cap");
+    assert!(!holder_snapshot_covers_expected_llcs(&snapshots, &expected));
+}
+
 /// A waiting caller performs one real fast attempt, then uses the registry as
 /// its retry mechanism. The seam always bounces while the real lockfile pool is
 /// free, so the elected coordinator completes immediately.

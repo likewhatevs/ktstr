@@ -498,6 +498,15 @@ pub(crate) fn registered_claim_snapshot(required: &ClaimSet) -> Result<Registere
     })
 }
 
+/// Copy aggregate reservation state only when the registry's shared fence is
+/// immediately available. Interactive admission uses this to preserve its
+/// no-wait contract under concurrent queue publication or repair.
+pub(crate) fn try_registered_claim_snapshot(
+    required: &ClaimSet,
+) -> Result<Option<RegisteredClaimSnapshot>> {
+    Ok(registry::try_aggregate_snapshot(required)?.map(|inner| RegisteredClaimSnapshot { inner }))
+}
+
 #[cfg(test)]
 pub(crate) fn aggregate_snapshot_read_count_for_tests() -> usize {
     registry::aggregate_snapshot_read_count_for_tests()
@@ -1192,8 +1201,9 @@ pub(crate) enum TicketWork<T> {
 }
 
 /// Same-PID pre-exec admission identity. Its registry record and physical
-/// flocks describe one bounded CPU+memory preparation footprint; activation
-/// replaces that footprint with the exact run claim in the same ticket.
+/// flocks first describe one bounded CPU+memory preparation footprint, then a
+/// memory+token prepared-residency footprint. Activation replaces either
+/// PENDING phase with the exact run claim in the same ticket.
 pub(crate) struct PendingAdmission {
     ticket: Option<registry::Ticket>,
     preparation: Option<super::PreparationPermit>,
@@ -1276,6 +1286,32 @@ impl PendingAdmission {
             .restore_affinity()
     }
 
+    /// Complete immutable preparation without consuming the PENDING ticket.
+    /// Affinity is restored while the old physical/registry CPU fence is still
+    /// intact. The registry then atomically shrinks the same PENDING record to
+    /// prepared-residency memory+token ownership, after which the now-redundant
+    /// physical CPU-SH and CPU-permit OFDs are released.
+    pub(crate) fn finish_preparation(&mut self) -> Result<()> {
+        let ticket = self
+            .ticket
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("pending admission was already consumed"))?;
+        let preparation = self
+            .preparation
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("pending preparation permit was already consumed"))?;
+        if preparation.cpu_permits.is_empty() {
+            return Ok(());
+        }
+        preparation.restore_affinity()?;
+        let active = preparation.claim();
+        let residency = preparation.residency_claim();
+        ticket.relax_pending_preparation(&active, &residency)?;
+        preparation.release_preparation_cpu();
+        debug_assert_eq!(preparation.claim(), residency);
+        Ok(())
+    }
+
     pub(crate) fn preparation_cpu_permits(&self) -> &[usize] {
         self.preparation
             .as_ref()
@@ -1311,6 +1347,53 @@ impl PendingAdmission {
     }
 }
 
+fn pending_admission_from_parts(
+    ticket: registry::Ticket,
+    preparation: super::PreparationPermit,
+) -> Result<PendingAdmission> {
+    let mut pending = PendingAdmission {
+        ticket: Some(ticket),
+        preparation: Some(preparation),
+    };
+    pending
+        .preparation
+        .as_mut()
+        .expect("fresh pending admission owns preparation")
+        .constrain_affinity()?;
+    Ok(pending)
+}
+
+/// Publish one bounded preparation owner without sleeping.
+///
+/// Every physical preparation slot is considered once. A physical-capacity
+/// miss or a conflicting older registry claim returns `None`; unlike normal
+/// generated-test pre-admission, this path never waits for either to change.
+pub(crate) fn try_register_pending_admission(
+    max_permit_index: usize,
+) -> Result<Option<PendingAdmission>> {
+    let required = registry::required_bits_for_permit_index(max_permit_index);
+    super::try_preparation_candidates_once(0, |preparation, claim| {
+        Ok(
+            match registry::Ticket::try_register_pending(required, claim)? {
+                Some(registry::PendingRegistration::Registered(ticket)) => {
+                    super::PreparationCandidateDecision::Accepted(pending_admission_from_parts(
+                        ticket,
+                        preparation,
+                    )?)
+                }
+                Some(registry::PendingRegistration::Contended(_)) => {
+                    drop(preparation);
+                    super::PreparationCandidateDecision::Retry
+                }
+                None => {
+                    drop(preparation);
+                    super::PreparationCandidateDecision::Contended
+                }
+            },
+        )
+    })
+}
+
 pub(crate) fn register_pending_admission(max_permit_index: usize) -> Result<PendingAdmission> {
     let required = registry::required_bits_for_permit_index(max_permit_index);
     let mut rotation_bias = 0usize;
@@ -1322,16 +1405,7 @@ pub(crate) fn register_pending_admission(max_permit_index: usize) -> Result<Pend
         let (preparation, claim) = super::acquire_preparation_permit(rotation_bias)?;
         match registry::Ticket::register_pending(required, claim)? {
             registry::PendingRegistration::Registered(ticket) => {
-                let mut pending = PendingAdmission {
-                    ticket: Some(ticket),
-                    preparation: Some(preparation),
-                };
-                pending
-                    .preparation
-                    .as_mut()
-                    .expect("fresh pending admission owns preparation")
-                    .constrain_affinity()?;
-                return Ok(pending);
+                return pending_admission_from_parts(ticket, preparation);
             }
             registry::PendingRegistration::Contended(generation) => {
                 drop(preparation);
@@ -1340,6 +1414,58 @@ pub(crate) fn register_pending_admission(max_permit_index: usize) -> Result<Pend
         }
         rotation_bias = rotation_bias.wrapping_add(1);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_preparation_residency_transition_for_tests() -> Result<(
+    PendingAdmission,
+    u64,
+    usize,
+    Vec<usize>,
+    Vec<usize>,
+    usize,
+    ClaimSet,
+)> {
+    let (preparation, active) = super::acquire_preparation_permit(0)?;
+    let affinity_cpu = preparation.affinity_cpu;
+    let cpu_permits = preparation.cpu_permits.clone();
+    let memory_permits = preparation.memory_permits.clone();
+    let token_permit = preparation.token_permit;
+    let required =
+        registry::required_bits_for_permit_index(super::admission_resource_capacity_hint()?);
+    let ticket = match registry::Ticket::register_pending(required, active)? {
+        registry::PendingRegistration::Registered(ticket) => ticket,
+        registry::PendingRegistration::Contended(_) => {
+            anyhow::bail!("isolated preparation transition unexpectedly contended")
+        }
+    };
+    // Deliberately bypass affinity constraining: this helper exercises the
+    // claim/OFD phase transition without perturbing sibling test threads.
+    let mut pending = PendingAdmission {
+        ticket: Some(ticket),
+        preparation: Some(preparation),
+    };
+    let ticket_id = pending
+        .ticket
+        .as_ref()
+        .expect("fresh test pending ticket")
+        .pending_exec_handoff_parts()?
+        .1;
+    pending.finish_preparation()?;
+    let residency = pending
+        .preparation
+        .as_ref()
+        .expect("relaxed test preparation")
+        .claim();
+    Ok((
+        pending,
+        ticket_id,
+        affinity_cpu,
+        cpu_permits,
+        memory_permits,
+        token_permit,
+        residency,
+    ))
 }
 
 #[cfg(test)]
@@ -1462,6 +1588,12 @@ pub(crate) fn exercise_known_free_close_storm_for_tests(
     closes: usize,
 ) -> Result<(usize, u64, usize, u64, u64)> {
     registry::exercise_known_free_close_storm_for_tests(closes)
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_stale_heartbeat_known_free_close_for_tests()
+-> Result<(usize, u64, usize, u64, u64)> {
+    registry::exercise_stale_heartbeat_known_free_close_for_tests()
 }
 
 #[cfg(test)]
@@ -1757,6 +1889,11 @@ pub(crate) fn prepare_zeroed_uninitialized_header_for_tests() -> Result<()> {
 #[cfg(test)]
 pub(crate) fn hold_registry_shared_for_tests() -> Result<OwnedFd> {
     registry::hold_registry_shared_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn hold_registry_exclusive_for_tests() -> Result<OwnedFd> {
+    registry::hold_registry_exclusive_for_tests()
 }
 
 #[cfg(test)]
