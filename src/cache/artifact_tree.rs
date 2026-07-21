@@ -1138,14 +1138,15 @@ impl ArtifactTreeCache {
                 cache_hit: true,
             });
         }
-        if final_root.exists() {
-            remove_stable_tree(&final_root).with_context(|| {
-                format!(
-                    "remove incomplete stable artifact tree {}",
-                    final_root.display()
-                )
-            })?;
-        }
+        // This must inspect the directory entry itself rather than `exists()`:
+        // a dangling attacker-controlled symlink is still stale cache state
+        // which must be unlinked before the atomic installation below.
+        remove_stable_tree(&final_root).with_context(|| {
+            format!(
+                "remove incomplete stable artifact tree {}",
+                final_root.display()
+            )
+        })?;
 
         let tree = self.load_or_build_with_validators(
             identity,
@@ -1206,9 +1207,9 @@ impl ArtifactTreeCache {
 }
 
 fn prepare_stable_cargo_build(root: &Path) -> Result<StableCargoBuild> {
-    if root.exists() {
-        remove_stable_tree(root)?;
-    }
+    // `remove_stable_tree` also handles dangling symlinks, for which
+    // `Path::exists()` deliberately returns false.
+    remove_stable_tree(root)?;
     let target_directory = root.join("target");
     std::fs::create_dir_all(&target_directory).with_context(|| {
         format!(
@@ -1613,8 +1614,19 @@ fn stable_cargo_build_is_complete(root: &Path, identity: u64) -> Result<bool> {
 }
 
 fn remove_stable_tree(root: &Path) -> Result<()> {
-    if !root.exists() {
-        return Ok(());
+    let root_metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("stat stale stable tree {}", root.display()));
+        }
+    };
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        // Unlink the directory entry itself. In particular, never pass a
+        // symlink root to recursive removal or chmod any node through it.
+        return std::fs::remove_file(root)
+            .with_context(|| format!("remove stale stable-tree entry {}", root.display()));
     }
     for entry in walkdir::WalkDir::new(root)
         .follow_links(false)
@@ -1637,7 +1649,7 @@ fn remove_stable_tree(root: &Path) -> Result<()> {
 
 fn stable_tree_is_complete(root: &Path, identity: u64) -> Result<bool> {
     let marker = root.join(STABLE_TREE_MARKER);
-    let root_metadata = match std::fs::metadata(root) {
+    let root_metadata = match std::fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => {
@@ -1645,7 +1657,10 @@ fn stable_tree_is_complete(root: &Path, identity: u64) -> Result<bool> {
                 .with_context(|| format!("stat stable artifact-tree root {}", root.display()));
         }
     };
-    if !root_metadata.is_dir() || root_metadata.permissions().mode() & 0o222 != 0 {
+    if !root_metadata.is_dir()
+        || root_metadata.file_type().is_symlink()
+        || root_metadata.permissions().mode() & 0o222 != 0
+    {
         return Ok(false);
     }
     let marker_metadata = match std::fs::symlink_metadata(&marker) {

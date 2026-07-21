@@ -1016,6 +1016,89 @@ fn stable_tree_survives_owner_drop_and_is_immutable_on_reuse() {
     assert_eq!(second.root(), root);
 }
 
+#[test]
+fn stable_tree_rejects_and_replaces_symlink_root_without_touching_target() {
+    let _environment = lock_env();
+    let temp = tempfile::tempdir().unwrap();
+    let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, temp.path().join("cas"));
+    let input = temp.path().join("input");
+    std::fs::write(&input, b"trusted-source").unwrap();
+    let records = temp.path().join("records");
+    let stable_parent = temp.path().join("stable");
+    std::fs::create_dir(&stable_parent).unwrap();
+    let identity = 0x0057_a11a_c0de_u64;
+    let final_root = stable_parent.join(format!("{identity:016x}"));
+
+    let attacker_target = temp.path().join("attacker-target");
+    std::fs::create_dir(&attacker_target).unwrap();
+    let attacker_marker = attacker_target.join(STABLE_TREE_MARKER);
+    let sentinel = attacker_target.join("sentinel");
+    std::fs::write(&attacker_marker, format!("{identity:016x}\n")).unwrap();
+    std::fs::write(&sentinel, b"attacker-owned").unwrap();
+    std::fs::set_permissions(&attacker_marker, std::fs::Permissions::from_mode(0o444)).unwrap();
+    std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o444)).unwrap();
+    std::fs::set_permissions(&attacker_target, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let attacker_before = std::fs::symlink_metadata(&attacker_target).unwrap();
+    std::os::unix::fs::symlink(&attacker_target, &final_root).unwrap();
+
+    assert!(
+        !stable_tree_is_complete(&final_root, identity).unwrap(),
+        "a symlink root must never satisfy the stable-tree marker check",
+    );
+    let built = std::cell::Cell::new(false);
+    let cache = ArtifactTreeCache::new(&records);
+    let tree = cache
+        .load_or_build_stable(
+            identity,
+            &stable_parent,
+            "stable-tree-symlink-test",
+            || Ok(true),
+            || false,
+            || {
+                built.set(true);
+                let mut source = ArtifactTreeSource::new();
+                source.insert_immutable_path("source/file", &input)?;
+                Ok(source)
+            },
+        )
+        .unwrap();
+
+    assert!(
+        built.get(),
+        "the attacker-controlled tree was accepted as a hit"
+    );
+    let installed = std::fs::symlink_metadata(&final_root).unwrap();
+    assert!(installed.is_dir());
+    assert!(!installed.file_type().is_symlink());
+    assert_eq!(
+        std::fs::read(final_root.join("source/file")).unwrap(),
+        b"trusted-source",
+    );
+    assert_eq!(
+        std::fs::read(&attacker_marker).unwrap(),
+        format!("{identity:016x}\n").as_bytes()
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"attacker-owned");
+    let attacker_after = std::fs::symlink_metadata(&attacker_target).unwrap();
+    assert_eq!(
+        (
+            attacker_after.dev(),
+            attacker_after.ino(),
+            attacker_after.permissions().mode() & 0o7777,
+        ),
+        (
+            attacker_before.dev(),
+            attacker_before.ino(),
+            attacker_before.permissions().mode() & 0o7777,
+        ),
+        "stable-tree replacement changed the attacker-controlled target",
+    );
+
+    drop(tree);
+    remove_stable_tree(&final_root).unwrap();
+    std::fs::set_permissions(&attacker_target, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 const CHILD_TEST: &str = "cache::artifact_tree::tests::artifact_tree_cache_cross_process_child";
 const CHILD_ROOT: &str = "KTSTR_ARTIFACT_TREE_CHILD_ROOT";
 const CHILD_INDEX: &str = "KTSTR_ARTIFACT_TREE_CHILD_INDEX";
