@@ -156,10 +156,7 @@ pub fn reflink_file_required(
             drop(destination_file);
             let _ = std::fs::remove_file(destination);
             Err(error).with_context(|| {
-                format!(
-                    "stat strict reflink destination {}",
-                    destination.display(),
-                )
+                format!("stat strict reflink destination {}", destination.display(),)
             })
         }
     }
