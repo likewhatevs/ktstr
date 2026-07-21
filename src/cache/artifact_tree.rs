@@ -2021,7 +2021,7 @@ fn collect_artifact_cache(
             // taking namespace EX here would form election-EX -> namespace-EX
             // / namespace-SH -> election-SH ABBA. Keep the whole namespace
             // active for this collection pass and reclaim other namespaces.
-            for ((candidate_namespace, identity), _) in &election_keys {
+            for (candidate_namespace, identity) in election_keys.keys() {
                 if candidate_namespace == namespace {
                     election_active.insert(*identity);
                 }
@@ -2029,7 +2029,7 @@ fn collect_artifact_cache(
             continue;
         }
         let Some(gate) = open_namespace_gate_at(lock_dir)? else {
-            for ((candidate_namespace, identity), _) in &election_keys {
+            for (candidate_namespace, identity) in election_keys.keys() {
                 if candidate_namespace == namespace {
                     election_active.insert(*identity);
                 }
@@ -2047,7 +2047,7 @@ fn collect_artifact_cache(
                 // A producer may have opened its election inode but not yet
                 // flocked it. Without namespace EX, unlinking that pathname
                 // could create two live lock generations and two builders.
-                for ((candidate_namespace, identity), _) in &election_keys {
+                for (candidate_namespace, identity) in election_keys.keys() {
                     if candidate_namespace == namespace {
                         election_active.insert(*identity);
                     }
@@ -2888,13 +2888,13 @@ fn seal_open_stable_cargo_directory(
             "stable Cargo file changed while sealing: {}",
             child_display.display()
         );
-        let mode = u32::try_from(opened.st_mode).unwrap_or_default() & 0o7777;
+        let mode = opened.st_mode & 0o7777;
         rustix::fs::fchmod(&child, rustix::fs::Mode::from_raw_mode(mode & !0o222))
             .with_context(|| format!("seal stable Cargo file {}", child_display.display()))?;
     }
     let metadata = rustix::fs::fstat(directory)
         .with_context(|| format!("stat stable Cargo directory {}", display_path.display()))?;
-    let mode = u32::try_from(metadata.st_mode).unwrap_or_default() & 0o7777;
+    let mode = metadata.st_mode & 0o7777;
     rustix::fs::fchmod(directory, rustix::fs::Mode::from_raw_mode(mode | 0o700)).with_context(
         || {
             format!(

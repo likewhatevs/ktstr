@@ -69,6 +69,51 @@ fn live_pending_head_fences_snapshot_and_probe_without_ex_recovery() {
     );
 }
 
+#[test]
+fn synchronous_pending_retirement_cannot_self_fence_a_fresh_probe() {
+    let _prefixes = LockPrefixesGuard::new();
+    let retiring_claim = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [0usize],
+        crate::flock::FlockMode::Exclusive,
+        crate::flock::FlockMode::Exclusive,
+    );
+    let live_disjoint_claim = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [1usize],
+        crate::flock::FlockMode::Exclusive,
+        crate::flock::FlockMode::Exclusive,
+    );
+    let retiring = protocol::register_pending_claim_for_tests(retiring_claim.clone())
+        .expect("publish the claim which will be retired");
+    let _live_disjoint = protocol::register_pending_claim_for_tests(live_disjoint_claim)
+        .expect("keep an unrelated live PENDING record in the aggregate");
+
+    retiring
+        .retire_synchronously()
+        .expect("synchronously retire the caller's own PENDING claim");
+
+    let snapshot = protocol::registered_claim_snapshot(&retiring_claim)
+        .expect("read aggregate after synchronous retirement");
+    assert!(
+        !snapshot
+            .conflicts(&retiring_claim)
+            .expect("retired-claim conflict query"),
+        "an unrelated live PENDING record must not preserve the retired self-claim",
+    );
+    let ran = std::cell::Cell::new(false);
+    let outcome = protocol::with_registry_fence(&retiring_claim, || {
+        ran.set(true);
+        Ok::<_, anyhow::Error>(())
+    })
+    .expect("fresh probe after synchronous PENDING retirement");
+    assert!(matches!(outcome, protocol::RegistryFence::Ran { .. }));
+    assert!(
+        ran.get(),
+        "the retired claim must not fence its owner's fresh probe"
+    );
+}
+
 struct InterruptibleFlockBrokerGuard {
     _serial: std::sync::MutexGuard<'static, ()>,
 }

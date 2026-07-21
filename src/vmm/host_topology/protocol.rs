@@ -1241,6 +1241,21 @@ impl PendingAdmission {
             .restore_affinity()
     }
 
+    /// Retire this PENDING publication before an immediate nonblocking probe.
+    ///
+    /// `Ticket::drop` is deliberately best-effort/nonblocking. Under a
+    /// registry writer storm that can leave this process's closed-liveness
+    /// claim in the aggregate until a coordinator prunes it, making the fresh
+    /// probe reject capacity which this very owner just released. Synchronous
+    /// retirement keeps the preparation flocks live until the claim has been
+    /// removed, then drops the complete owner on return.
+    pub(crate) fn retire_for_nonblocking_probe(mut self) -> Result<()> {
+        self.ticket
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("pending admission was already consumed"))?
+            .finish(None)
+    }
+
     pub(crate) fn preparation_cpu_permits(&self) -> &[usize] {
         self.preparation
             .as_ref()
@@ -1324,13 +1339,23 @@ pub(crate) fn exercise_pending_activation_overlap_watch_for_tests() -> Result<(b
 
 #[cfg(test)]
 pub(crate) struct PendingClaimForTests {
-    _ticket: registry::Ticket,
+    ticket: Option<registry::Ticket>,
+}
+
+#[cfg(test)]
+impl PendingClaimForTests {
+    pub(crate) fn retire_synchronously(mut self) -> Result<()> {
+        self.ticket
+            .as_mut()
+            .expect("test pending claim was already consumed")
+            .finish(None)
+    }
 }
 
 #[cfg(test)]
 pub(crate) fn register_pending_claim_for_tests(claim: ClaimSet) -> Result<PendingClaimForTests> {
     Ok(PendingClaimForTests {
-        _ticket: registry::register_pending_claim_for_tests(claim)?,
+        ticket: Some(registry::register_pending_claim_for_tests(claim)?),
     })
 }
 

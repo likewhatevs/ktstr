@@ -1244,13 +1244,26 @@ fn write_sidecar_defaults_to_target_dir_without_env() {
 /// a workspace's real target layout (incl. a `.cargo/config target-dir`)
 /// rather than a bare CWD-relative `target/`. The subprocess CWD is set
 /// on the `Command` via the `dir` argument — never a process-wide chdir
-/// — so the test stays hermetic against concurrent tests.
+/// — so the test stays hermetic against concurrent tests. Cargo output
+/// overrides from the outer test build are cleared because this fixture is
+/// specifically exercising the nested package's default output layout.
 #[test]
 fn cargo_metadata_target_dir_reads_package_target_directory() {
+    let _lock = lock_env();
     let ws = tempfile::TempDir::new().unwrap();
+    let poisoned_output = ws.path().join("outer-read-only-artifact-tree");
+    std::fs::write(&poisoned_output, b"not a writable output directory").unwrap();
+    // Model cargo-ktstr's reusable nextest execution environment. Its
+    // materialized target/build trees are immutable and belong to the outer
+    // workspace; inheriting either one makes this nested fixture fail before
+    // metadata is emitted (or report the outer target instead of `ws/target`).
+    let _outer_target = EnvVarGuard::set("CARGO_TARGET_DIR", &poisoned_output);
+    let _outer_build = EnvVarGuard::set("CARGO_BUILD_BUILD_DIR", &poisoned_output);
+    let _nested_target = EnvVarGuard::remove("CARGO_TARGET_DIR");
+    let _nested_build = EnvVarGuard::remove("CARGO_BUILD_BUILD_DIR");
     std::fs::write(
         ws.path().join("Cargo.toml"),
-        "[package]\nname = \"ktstr_runs_root_probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        "[workspace]\n\n[package]\nname = \"ktstr_runs_root_probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
     )
     .unwrap();
     std::fs::create_dir(ws.path().join("src")).unwrap();

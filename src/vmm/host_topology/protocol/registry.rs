@@ -2143,7 +2143,13 @@ impl Ticket {
         })
     }
 
-    #[cfg(test)]
+    /// Synchronously remove this process's own publication.
+    ///
+    /// Ordinary `Drop` must remain nonblocking so teardown cannot join an EX
+    /// convoy. A caller which will immediately perform a fresh nonblocking
+    /// admission probe needs a stronger boundary: leaving its dead PENDING
+    /// claim for liveness pruning can make that probe fence itself while a
+    /// different live ticket keeps the aggregate snapshot authoritative.
     pub(super) fn finish(&mut self, cancelled: Option<&AtomicBool>) -> Result<()> {
         let _namespace = self.namespace.enter();
         if self.finished {
@@ -2228,7 +2234,6 @@ impl Ticket {
         Ok(FinishAcquireResult::Committed(held))
     }
 
-    #[cfg(test)]
     fn remove_record_interruptible(&mut self, cancelled: Option<&AtomicBool>) -> Result<()> {
         let _namespace = self.namespace.enter();
         let _lock = lock_registry_interruptible_existing(cancelled)?;

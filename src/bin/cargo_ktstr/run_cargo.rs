@@ -2119,8 +2119,6 @@ const LLVM_COV_REPORT_VALUE_OPTIONS: &[&str] = &[
     "--fail-uncovered-regions",
     "--fail-uncovered-functions",
     "--dep-coverage",
-    "-F",
-    "--features",
     "--target",
     "--color",
     "--manifest-path",
@@ -2143,8 +2141,6 @@ const LLVM_COV_REPORT_FLAGS: &[&str] = &[
     "--show-missing-lines",
     "--include-build-script",
     "--skip-functions",
-    "--all-features",
-    "--no-default-features",
     "-r",
     "--release",
     "--frozen",
@@ -2161,6 +2157,67 @@ const LLVM_COV_REPORT_FLAGS: &[&str] = &[
     "--verbose",
     "-q",
     "--quiet",
+];
+
+/// Options accepted by a build/test invocation but rejected by
+/// cargo-llvm-cov's `report` subcommand. Keep these explicit even though the
+/// report projection is allow-listed: consuming a separate value prevents an
+/// option-looking value from being reinterpreted as a report flag.
+const LLVM_COV_BUILD_OR_RUN_ONLY_VALUE_OPTIONS: &[&str] = &[
+    "-F",
+    "--features",
+    "-j",
+    "--jobs",
+    "--build-jobs",
+    "-p",
+    "--package",
+    "--exclude",
+    "--exclude-from-test",
+    "--exclude-from-report",
+    "--bin",
+    "--example",
+    "--test",
+    "--bench",
+    "--target-dir",
+    "--cargo-message-format",
+    "--profile",
+    "--test-threads",
+    "--retries",
+    "--max-fail",
+    "--config",
+    "--archive-file",
+    "--archive-format",
+    "--zstd-level",
+    "--config-file",
+    "--user-config-file",
+    "--tool-config-file",
+    "-P",
+    "-E",
+    "--filterset",
+    "--filter-expr",
+];
+
+const LLVM_COV_BUILD_OR_RUN_ONLY_FLAGS: &[&str] = &[
+    "--workspace",
+    "--all",
+    "--lib",
+    "--bins",
+    "--examples",
+    "--tests",
+    "--benches",
+    "--all-targets",
+    "--all-features",
+    "--no-default-features",
+    "--fail-fast",
+    "--ff",
+    "--no-fail-fast",
+    "--nff",
+    "--unit-graph",
+    "--timings",
+    "--cargo-quiet",
+    "--cargo-verbose",
+    "--ignore-rust-version",
+    "--future-incompat-report",
 ];
 
 fn llvm_cov_report_selection_args(args: &[String]) -> Vec<String> {
@@ -2247,6 +2304,16 @@ fn cached_llvm_cov_report_args(
             index += 1;
             continue;
         }
+        if LLVM_COV_BUILD_OR_RUN_ONLY_VALUE_OPTIONS.contains(&argument.as_str()) {
+            index += 2;
+            continue;
+        }
+        if option_has_joined_value(argument, LLVM_COV_BUILD_OR_RUN_ONLY_VALUE_OPTIONS)
+            || LLVM_COV_BUILD_OR_RUN_ONLY_FLAGS.contains(&argument.as_str())
+        {
+            index += 1;
+            continue;
+        }
         if LLVM_COV_REPORT_VALUE_OPTIONS.contains(&argument.as_str()) {
             out.push(argument.clone());
             index += 1;
@@ -2329,6 +2396,17 @@ struct CachedCoverageReport {
     profraw_directory: PathBuf,
     no_report: bool,
     ignore_run_fail: bool,
+}
+
+/// The final failure footer must name nextest only when nextest remains the
+/// authoritative failure. A successful (or explicitly ignored) test run
+/// followed by a failed coverage report is a post-run failure instead.
+fn should_render_nextest_failure_footer(
+    final_success: bool,
+    nextest_success: bool,
+    ignore_run_fail: bool,
+) -> bool {
+    !final_success && !nextest_success && !ignore_run_fail
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -3769,7 +3847,10 @@ fn run_cargo_sub(
     if !footer.is_empty() {
         eprint!("{footer}");
     }
-    if !final_success {
+    let ignore_run_fail = cached_coverage_report
+        .as_ref()
+        .is_some_and(|coverage| coverage.ignore_run_fail);
+    if should_render_nextest_failure_footer(final_success, status.success(), ignore_run_fail) {
         // nextest is the authoritative pass/fail signal. The footer
         // above lists per-test artifacts for failures that produced
         // them; a failure that left NO artifact — a build / vm.run
@@ -6507,8 +6588,6 @@ path = "junit.xml"
                 "report",
                 "--profile",
                 "release",
-                "--features",
-                "integration,wprof",
                 "--lcov",
                 "--output-path",
                 "/work/coverage/lcov.info",
@@ -6518,6 +6597,70 @@ path = "junit.xml"
                 "renamed-scheduler",
             ]),
             "nextest runtime controls stay out of the separate report command",
+        );
+    }
+
+    #[test]
+    fn cached_coverage_report_partitions_build_and_run_options_from_report_options() {
+        let metadata = llvm_cov_feature_metadata();
+        assert_eq!(
+            cached_llvm_cov_report_args(
+                LLVM_COV_SUB_ARGV,
+                &strs(&[
+                    "nextest",
+                    "--workspace",
+                    "--features",
+                    "integration,wprof",
+                    "-Fextra",
+                    "--all-features",
+                    "--no-default-features",
+                    "--build-jobs",
+                    "32",
+                    "--profile",
+                    "ci",
+                    "--test-threads=1000000",
+                    "--retries",
+                    "2",
+                    "--branch",
+                    "--lcov",
+                    "--fail-under-lines",
+                    "80",
+                    "--output-path=coverage/lcov.info",
+                ]),
+                false,
+                &metadata,
+                Path::new("/work"),
+            ),
+            strs(&[
+                "report",
+                "--branch",
+                "--lcov",
+                "--fail-under-lines",
+                "80",
+                "--output-path=/work/coverage/lcov.info",
+                "--package",
+                "ordinary-scheduler",
+                "--package",
+                "renamed-scheduler",
+            ]),
+            "the report receives only report/package-selection controls, never build features or nextest runtime controls",
+        );
+    }
+
+    #[test]
+    fn coverage_failure_footer_attributes_only_authoritative_nextest_failures() {
+        assert!(should_render_nextest_failure_footer(false, false, false));
+        assert!(
+            !should_render_nextest_failure_footer(false, true, false),
+            "a report-only failure must not be blamed on nextest",
+        );
+        assert!(
+            !should_render_nextest_failure_footer(false, false, true),
+            "an ignored test failure must not replace a report failure's attribution",
+        );
+        assert!(
+            !should_render_nextest_failure_footer(true, false, false),
+            "no failure footer is emitted when the invocation succeeds",
         );
     }
 

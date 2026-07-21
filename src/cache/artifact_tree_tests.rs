@@ -1785,7 +1785,7 @@ fn artifact_tree_cache_elects_one_cross_process_builder() {
     }
     rustix::fs::flock(&start, rustix::fs::FlockOperation::Unlock).unwrap();
     let completion_deadline = Instant::now() + Duration::from_secs(15);
-    let mut completed = vec![false; CHILDREN];
+    let mut completed = [false; CHILDREN];
     while completed.iter().any(|done| !done) {
         for (index, child) in children.iter_mut().enumerate() {
             if completed[index] {

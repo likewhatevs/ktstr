@@ -606,19 +606,29 @@ fn create_content_temporary_at(
     }
 }
 
-fn publish_bytes_at<F>(
-    temporary_directory: &OwnedFd,
-    final_directory: &OwnedFd,
-    temporary_prefix: &str,
-    final_name: &OsStr,
-    bytes: &[u8],
+struct BytesPublication<'a> {
+    temporary_directory: &'a OwnedFd,
+    final_directory: &'a OwnedFd,
+    temporary_prefix: &'a str,
+    final_name: &'a OsStr,
+    bytes: &'a [u8],
     mode: u32,
-    subject: &str,
-    post_rename: F,
-) -> Result<()>
+    subject: &'a str,
+}
+
+fn publish_bytes_at<F>(publication: BytesPublication<'_>, post_rename: F) -> Result<()>
 where
     F: FnOnce() -> Result<()>,
 {
+    let BytesPublication {
+        temporary_directory,
+        final_directory,
+        temporary_prefix,
+        final_name,
+        bytes,
+        mode,
+        subject,
+    } = publication;
     let (mut temporary, temporary_name) =
         create_content_temporary_at(temporary_directory, temporary_prefix, subject)?;
     let mut published = false;
@@ -756,16 +766,28 @@ fn try_remove_coordinated_pair_at(
     }
 }
 
-fn try_remove_temporary_entry_at(
-    namespace_locked: &File,
-    lock_dir: &OwnedFd,
-    lock_name: &OsStr,
-    temporary_dir: &OwnedFd,
-    temporary_name: &OsStr,
-    data_dir: &OwnedFd,
-    data_name: &OsStr,
-    subject: &str,
-) -> Result<bool> {
+struct TemporaryEntryCleanup<'a> {
+    namespace_locked: &'a File,
+    lock_dir: &'a OwnedFd,
+    lock_name: &'a OsStr,
+    temporary_dir: &'a OwnedFd,
+    temporary_name: &'a OsStr,
+    data_dir: &'a OwnedFd,
+    data_name: &'a OsStr,
+    subject: &'a str,
+}
+
+fn try_remove_temporary_entry_at(cleanup: TemporaryEntryCleanup<'_>) -> Result<bool> {
+    let TemporaryEntryCleanup {
+        namespace_locked,
+        lock_dir,
+        lock_name,
+        temporary_dir,
+        temporary_name,
+        data_dir,
+        data_name,
+        subject,
+    } = cleanup;
     let lock = open_lock_file_at(lock_dir, lock_name, subject)?;
     match flock_retry(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => {
@@ -837,16 +859,16 @@ fn gc_content_cache_in(dirs: &ContentCacheDirs, now: SystemTime, max_age: Durati
                 && cache_stat_is_old(&stat, now, CONTENT_ORPHAN_TEMP_GRACE)
             {
                 let lock_name = digest_lock_name(key);
-                try_remove_temporary_entry_at(
-                    &namespace_gate,
-                    &dirs.root,
-                    &lock_name,
-                    &dirs.digests,
-                    &name,
-                    &dirs.digests,
-                    &OsString::from(format!("{key}.digest")),
-                    "temporary digest memo",
-                )?;
+                try_remove_temporary_entry_at(TemporaryEntryCleanup {
+                    namespace_locked: &namespace_gate,
+                    lock_dir: &dirs.root,
+                    lock_name: &lock_name,
+                    temporary_dir: &dirs.digests,
+                    temporary_name: &name,
+                    data_dir: &dirs.digests,
+                    data_name: &OsString::from(format!("{key}.digest")),
+                    subject: "temporary digest memo",
+                })?;
             }
             continue;
         }
@@ -903,16 +925,16 @@ fn gc_content_cache_in(dirs: &ContentCacheDirs, now: SystemTime, max_age: Durati
         }
         if let Some(key) = parse_temporary_cache_key(name_str, ".content-object-") {
             let lock_name = object_lock_name(key);
-            try_remove_temporary_entry_at(
-                &namespace_gate,
-                &dirs.root,
-                &lock_name,
-                &dirs.staging,
-                &name,
-                &dirs.objects,
-                &OsString::from(format!("{key}.object")),
-                "temporary content object",
-            )?;
+            try_remove_temporary_entry_at(TemporaryEntryCleanup {
+                namespace_locked: &namespace_gate,
+                lock_dir: &dirs.root,
+                lock_name: &lock_name,
+                temporary_dir: &dirs.staging,
+                temporary_name: &name,
+                data_dir: &dirs.objects,
+                data_name: &OsString::from(format!("{key}.object")),
+                subject: "temporary content object",
+            })?;
         }
     }
 
@@ -923,13 +945,15 @@ fn gc_content_cache_in(dirs: &ContentCacheDirs, now: SystemTime, max_age: Durati
 
     validate_content_cache_dirs_reachable(dirs)?;
     publish_bytes_at(
-        &dirs.staging,
-        &dirs.root,
-        ".content-gc-stamp-",
-        OsStr::new(CONTENT_GC_STAMP),
-        &[],
-        0o644,
-        "content GC stamp",
+        BytesPublication {
+            temporary_directory: &dirs.staging,
+            final_directory: &dirs.root,
+            temporary_prefix: ".content-gc-stamp-",
+            final_name: OsStr::new(CONTENT_GC_STAMP),
+            bytes: &[],
+            mode: 0o644,
+            subject: "content GC stamp",
+        },
         || validate_content_cache_dirs_reachable(dirs),
     )?;
     validate_content_cache_dirs_reachable(dirs)?;
@@ -1734,13 +1758,15 @@ pub(crate) fn cached_file_digest_at_root(
             // descriptor-relative rename keeps live readers from observing a
             // partial write or a substituted namespace.
             publish_bytes_at(
-                &dirs.digests,
-                &dirs.digests,
-                &format!(".tmp-digest-{identity_key:016x}-"),
-                &record_name,
-                &bytes,
-                0o600,
-                "file digest memo",
+                BytesPublication {
+                    temporary_directory: &dirs.digests,
+                    final_directory: &dirs.digests,
+                    temporary_prefix: &format!(".tmp-digest-{identity_key:016x}-"),
+                    final_name: &record_name,
+                    bytes: &bytes,
+                    mode: 0o600,
+                    subject: "file digest memo",
+                },
                 || validate_content_cache_dirs_reachable(&dirs),
             )?;
             Ok(digest)
@@ -1896,13 +1922,15 @@ impl ContentNamespaceLease {
             serde_json::to_vec(&reference).context("serialize artifact content reference")?;
         let final_name = OsString::from(format!("{owner:016x}.json"));
         publish_bytes_at(
-            &self.dirs.references,
-            &self.dirs.references,
-            &format!(".artifact-reference-{owner:016x}-"),
-            &final_name,
-            &bytes,
-            0o444,
-            "artifact content reference",
+            BytesPublication {
+                temporary_directory: &self.dirs.references,
+                final_directory: &self.dirs.references,
+                temporary_prefix: &format!(".artifact-reference-{owner:016x}-"),
+                final_name: &final_name,
+                bytes: &bytes,
+                mode: 0o444,
+                subject: "artifact content reference",
+            },
             || validate_content_cache_dirs_reachable(&self.dirs),
         )?;
         validate_content_cache_dirs_reachable(&self.dirs)
@@ -2592,13 +2620,15 @@ mod tests {
         let final_name = OsStr::new("1111222233334444.json");
 
         let error = publish_bytes_at(
-            &dirs.references,
-            &dirs.references,
-            ".artifact-reference-test-",
-            final_name,
-            b"published bytes",
-            0o444,
-            "test artifact reference",
+            BytesPublication {
+                temporary_directory: &dirs.references,
+                final_directory: &dirs.references,
+                temporary_prefix: ".artifact-reference-test-",
+                final_name,
+                bytes: b"published bytes",
+                mode: 0o444,
+                subject: "test artifact reference",
+            },
             || {
                 std::fs::rename(&reference_namespace, &detached_namespace)?;
                 std::fs::create_dir(&reference_namespace)?;

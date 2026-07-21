@@ -1628,10 +1628,11 @@ impl KtstrVm {
         memory_mib: u32,
     ) -> Result<RunLocks> {
         pending.restore_preparation_affinity()?;
-        // Interactive admission is a single non-blocking attempt. Release the
-        // pre-exec preparation publication before that attempt instead of
-        // activating it into the waiting protocol.
-        drop(pending);
+        // Interactive admission remains a single non-blocking attempt. Retire
+        // the pre-exec publication synchronously first: ordinary Ticket Drop
+        // may defer cleanup behind a registry writer, in which case the fresh
+        // probe can otherwise fence itself on its own dead PENDING claim.
+        pending.retire_for_nonblocking_probe()?;
         if self.performance_mode {
             let allowed = host_topology::host_allowed_cpus();
             Self::acquire_default_shared_run_locks(
