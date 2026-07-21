@@ -3738,7 +3738,15 @@ fn materialize(
     directory_modes.sort_by_key(|(path, _)| std::cmp::Reverse(path.len()));
     for (path, mode) in directory_modes {
         let path = checked_relative_bytes(path)?;
-        std::fs::set_permissions(root.join(path), std::fs::Permissions::from_mode(*mode))?;
+        // Directory write protection is not an immutability boundary for the
+        // owning uid, but it can poison a runner workspace if the process is
+        // killed before TempDir or stable-tree cleanup gets to chmod it back.
+        // Keep every materialized directory owner-removable from the moment
+        // it becomes visible; regular-file modes remain exact and read-only.
+        std::fs::set_permissions(
+            root.join(path),
+            std::fs::Permissions::from_mode(*mode | 0o700),
+        )?;
     }
     Ok(MaterializedArtifactTree {
         directory,

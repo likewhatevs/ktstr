@@ -217,6 +217,47 @@ fn cross_root_hit_survives_source_deletion_and_restores_modes_and_links() {
 }
 
 #[test]
+fn materialized_read_only_directories_are_immediately_owner_removable() {
+    let _environment = lock_env();
+    let temp = tempfile::tempdir().unwrap();
+    let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, temp.path().join("cas"));
+    let cache = ArtifactTreeCache::new(temp.path().join("records"));
+    let materializations = temp.path().join("materializations");
+    let input = temp.path().join("payload");
+    std::fs::write(&input, b"payload").unwrap();
+    let identity = 0x0d1e_c70f_1e50_0001;
+    let tree = cache
+        .load_or_build(
+            identity,
+            &materializations,
+            "owner-removable-directory-test",
+            || Ok(true),
+            || false,
+            || {
+                let mut source = ArtifactTreeSource::new();
+                source.insert_directory("readonly", 0o555)?;
+                source.insert_file("readonly/file", &input)?;
+                Ok(source)
+            },
+        )
+        .unwrap();
+    let root = tree.root().to_path_buf();
+    assert_eq!(
+        std::fs::metadata(root.join("readonly"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o700,
+        0o700,
+    );
+    drop(tree);
+    assert!(
+        !root.exists(),
+        "dropping a materialization must not leave a read-only runner-workspace poison tree",
+    );
+}
+
+#[test]
 fn unpublished_objects_and_crash_temp_do_not_form_a_visible_tree() {
     let _environment = lock_env();
     let temp = tempfile::tempdir().expect("artifact crash test root");
