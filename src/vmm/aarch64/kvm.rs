@@ -207,6 +207,7 @@ impl KtstrKvm {
     /// supports) — none of which depend on guest memory size. Memory is
     /// allocated later via [`Self::allocate_memory`] and published via
     /// [`Self::register_memory`].
+    #[cfg(test)]
     pub fn new_deferred(
         topo: Topology,
         use_hugepages: bool,

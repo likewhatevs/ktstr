@@ -778,6 +778,63 @@ fn acquired_drop_releases_physical_flock_before_held_record() {
 }
 
 #[test]
+fn tracked_acquired_drop_keeps_its_registry_namespace_across_threads() {
+    let _prefixes = LockPrefixesGuard::new();
+    let claim = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [2usize],
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let acquired = protocol::publish_acquired(&claim, ()).expect("publish isolated HELD claim");
+    assert_eq!(
+        protocol::ticket_registry_snapshot_for_tests()
+            .expect("read isolated HELD record")
+            .len(),
+        1,
+    );
+
+    // Give the dropping thread a different valid protocol namespace and hold
+    // that registry's EX lock. A teardown path which re-resolves thread-local
+    // prefixes will block here; a captured owner must remove its record from
+    // the original namespace without touching this lock.
+    let wrong = tempfile::TempDir::new().expect("wrong-namespace tempdir");
+    let wrong_llc_prefix = format!("{}/llc-", wrong.path().display());
+    let wrong_cpu_prefix = format!("{}/cpu-", wrong.path().display());
+    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v14");
+    std::fs::create_dir_all(&wrong_registry).expect("create wrong registry directory");
+    let wrong_registry_lock = crate::flock::try_flock(
+        wrong_registry.join("registry.lock"),
+        FlockMode::Exclusive,
+    )
+    .expect("open wrong registry lock")
+    .expect("hold wrong registry EX");
+
+    let (dropped_tx, dropped_rx) = std::sync::mpsc::sync_channel(1);
+    let dropper = TestServiceThread::spawn(move || {
+        LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(wrong_llc_prefix));
+        CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(wrong_cpu_prefix));
+        drop(acquired);
+        dropped_tx.send(()).expect("publish cross-thread drop");
+    });
+    let completed = recv_from_service_thread(
+        &dropped_rx,
+        "captured-namespace HELD cleanup while the current namespace is locked",
+        &dropper,
+    );
+    drop(wrong_registry_lock);
+    dropper.join().expect("cross-thread HELD drop");
+    completed.expect("HELD cleanup must not enter the dropping thread's registry");
+
+    assert!(
+        protocol::ticket_registry_snapshot_for_tests()
+            .expect("read isolated registry after cross-thread drop")
+            .is_empty(),
+        "cross-thread Drop must remove the exact original HELD publication",
+    );
+}
+
+#[test]
 fn dead_held_publication_is_pruned_by_the_next_conflicting_snapshot() {
     let _prefixes = LockPrefixesGuard::new();
     let claim = protocol::ClaimSet::with_modes(

@@ -5229,6 +5229,7 @@ pub(super) fn event_dir() -> PathBuf {
     active_protocol_dir().join("ktstr-acquire-events-v14")
 }
 
+#[cfg(test)]
 pub(super) fn protocol_dir_path() -> PathBuf {
     active_protocol_dir()
 }
