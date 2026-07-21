@@ -136,7 +136,8 @@ distro-boot spec pattern:
     set -euo pipefail
     cargo run --bin cargo-ktstr -- ktstr kernel build --kernel {{spec}}
     errlog=$(mktemp)
-    rel=$(cargo run --bin cargo-ktstr -- ktstr shell --kernel {{spec}} --exec 'uname -r' 2>"$errlog") \
+    rel=$(cargo run --bin cargo-ktstr -- ktstr shell --kernel {{spec}} --exec 'uname -r' \
+        2> >(tee "$errlog" >&2)) \
         || { echo "FAIL: {{spec}} boot exited nonzero; stderr:"; cat "$errlog"; rm -f "$errlog"; exit 1; }
     rm -f "$errlog"
     printf 'boot %-12s uname -r => %s\n' '{{spec}}' "$rel"
@@ -157,7 +158,7 @@ gke-boot:
     rel=$(cargo run --bin cargo-ktstr -- ktstr shell --kernel gke --no-perf-mode \
         --disk 256mib \
         --exec 'test -b /dev/vda && grep -qw btrfs /proc/filesystems && uname -r' \
-        2>"$errlog") \
+        2> >(tee "$errlog" >&2)) \
         || { echo "FAIL: gke disk/Btrfs boot exited nonzero; stderr:"; cat "$errlog"; rm -f "$errlog"; exit 1; }
     rm -f "$errlog"
     printf 'boot %-12s uname -r => %s\n' 'gke' "$rel"
@@ -179,7 +180,8 @@ local-package-boot ver:
         cargo run --bin cargo-ktstr -- ktstr test --kernel '{{ver}}' -- \
         --run-ignored only -E 'test(pack_built_kernel_into_synthetic_rpm)'
     errlog=$(mktemp)
-    rel=$(cargo run --bin cargo-ktstr -- ktstr shell --kernel "$rpm" --exec 'uname -r' 2>"$errlog") \
+    rel=$(cargo run --bin cargo-ktstr -- ktstr shell --kernel "$rpm" --exec 'uname -r' \
+        2> >(tee "$errlog" >&2)) \
         || { echo "FAIL: synthetic-rpm boot exited nonzero; stderr:"; cat "$errlog"; rm -f "$errlog"; exit 1; }
     rm -f "$errlog"
     printf 'local-package boot uname -r => %s\n' "$rel"
