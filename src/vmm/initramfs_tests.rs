@@ -1139,32 +1139,61 @@ fn init_lives_in_suffix_not_base() {
 #[test]
 fn build_initramfs_base_includes_extra_shared_libs() {
     let exe = crate::resolve_current_exe().unwrap();
-    let sched = crate::test_support::require_binary("scx-ktstr");
-    let extras: Vec<(&str, &Path)> = vec![("scheduler", sched.as_path())];
+    // This test covers generic extra-ELF dependency packing. Building the
+    // large workspace scheduler from inside each libtest process made the
+    // assertion take minutes under nextest storms while adding no scheduler
+    // behavior coverage. GNU coreutils `/bin/ls` is a small, ubiquitous ELF
+    // on the glibc Linux hosts ktstr supports, and its libselinux/libpcre2
+    // closure gives us dependencies the Rust test payload does not carry.
+    let extra = Path::new("/bin/ls");
+    assert!(
+        extra.is_file() && is_elf(extra),
+        "test host must provide an ELF /bin/ls"
+    );
+
+    let payload_libs = resolve_shared_libs(&exe).unwrap();
+    let payload_guest_paths: std::collections::HashSet<&str> = payload_libs
+        .found
+        .iter()
+        .map(|(guest_path, _)| guest_path.as_str())
+        .collect();
+    let extra_libs = resolve_shared_libs(extra).unwrap();
+    let delta: Vec<_> = extra_libs
+        .found
+        .iter()
+        .filter(|(guest_path, _)| !payload_guest_paths.contains(guest_path.as_str()))
+        .collect();
+    assert!(
+        !delta.is_empty(),
+        "/bin/ls must add at least one shared library beyond the payload; \
+         payload closure: {:?}; /bin/ls closure: {:?}",
+        payload_libs.found,
+        extra_libs.found
+    );
+
+    let extras: Vec<(&str, &Path)> = vec![("extra", extra)];
     let inputs =
         crate::vmm::initramfs_cache::prepare_base_inputs(&exe, &extras, &[], None).unwrap();
     let prepared =
         crate::vmm::initramfs_cache::get_or_prepare_base(inputs, InitrdCompression::Uncompressed)
             .unwrap();
     let base = prepared.read_uncompressed_for_test().unwrap();
-    let s = String::from_utf8_lossy(&base);
+    let base_entries: std::collections::HashMap<_, _> = cpio_entries(&base)
+        .into_iter()
+        .map(|(name, size, _, _)| (name, size))
+        .collect();
 
-    // Every shared lib the extra resolves to must be packed into the base.
-    // Assert the resolved SET rather than a hardcoded soname: whether the
-    // scheduler static- or dynamic-links libbpf/libelf is a property of
-    // the scx-ktstr build, not of build_initramfs_base's lib-packing
-    // (which is what this test guards).
-    let resolved = resolve_shared_libs(sched.as_path()).unwrap();
-    assert!(
-        !resolved.found.is_empty(),
-        "scx-ktstr should resolve at least its C-runtime libs"
-    );
-    for (guest_path, _host) in &resolved.found {
+    // Check only the closure delta: finding one of the payload's existing
+    // libc-family entries would not prove that processing the extra ELF added
+    // anything to the archive.
+    for (guest_path, host_path) in delta {
+        let size = base_entries.get(guest_path.as_str());
         assert!(
-            s.contains(guest_path.as_str()),
-            "base must contain extra's resolved lib {guest_path}; \
-             resolved set: {:?}",
-            resolved.found
+            size.is_some_and(|size| *size > 0),
+            "base must contain non-empty extra-only dependency {guest_path} \
+             resolved from {}; extra closure: {:?}",
+            host_path.display(),
+            extra_libs.found
         );
     }
 }

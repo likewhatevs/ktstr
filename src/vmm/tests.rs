@@ -1855,14 +1855,14 @@ fn sys_rdy_releases_monitor_before_5s_timeout() {
 /// pre-sample boot wait MUST observe the kill eventfd and
 /// fall through — not block until the 5 s sys_rdy ceiling.
 ///
-/// Wallclock budget: 12 s. The path to a kill_evt-driven
-/// monitor wakeup is "kernel panic → reboot exit → BSP loop
+/// The path to a kill_evt-driven monitor wakeup is "kernel panic
+/// → reboot exit → BSP loop
 /// sets kill → freeze coordinator writes kill_evt → monitor
 /// boot wait wakes". A regression that left the monitor
 /// blocked on sys_rdy alone (no kill_evt registration) would
-/// hold the VM open for the full 5 s ceiling — still under
-/// the 12 s budget, but a kill_evt regression that blocks
-/// indefinitely on a different fd would still surface here.
+/// hold the VM open for the full 5 s ceiling, while a kill_evt
+/// regression that blocks indefinitely on a different fd would
+/// still surface through the VM timeout.
 ///
 /// `init=/nonexistent` is supplied via the builder cmdline
 /// (this test sets no `init_binary`, so no `rdinit=/init`
@@ -1897,44 +1897,11 @@ fn monitor_exits_cleanly_when_guest_panics_before_sys_rdy() {
          is not holding. Stderr tail: {:?}",
         result.stderr.lines().rev().take(5).collect::<Vec<_>>(),
     );
-    // Wallclock budget: 12 s. The monitor's 5 s sys_rdy ceiling
-    // plus VM setup + guest panic + reboot + teardown nominally
-    // finishes in 3-5 s on an idle host. The 12 s budget absorbs
-    // host contention (observed runs at 8-9 s under load) while
-    // still catching a regression that blocks the boot wait
-    // indefinitely (e.g. kill_evt unregistered, sys_rdy not
-    // promoted to the eventfd) — that path would either hit the
-    // builder's 15 s timeout (caught above) or sit on the 5 s
-    // ceiling under heavy overhead (well past 12 s).
-    // The 12 s budget is an IDLE-host expectation: setup + panic +
-    // reboot + teardown nominally finishes in 3-5 s. Under host dilation
-    // the wall inflates without the monitor misbehaving, so the budget is
-    // enforced only on a quiet host (D <= 1.1). The test's real invariant
-    // — the monitor woke on kill_evt rather than hanging on the sys_rdy
-    // ceiling — is already proven by the guest-rebooted check above (a
-    // hung monitor would have hit the builder's 15 s timeout, failing
-    // that assert). Under dilation the budget is downgraded to a note.
-    let d = result.host_vcpu_schedstat.and_then(|s| s.dilation());
-    if d.is_none_or(|d| d <= 1.1) {
-        assert!(
-            result.duration < Duration::from_secs(12),
-            "VM ran for {:?} on a quiet host (D={}) — past the 12 s budget. \
-             The monitor's boot wait did not wake on kill_evt; the loop sat on \
-             the sys_rdy ceiling instead. timed_out={}, exit_code={}",
-            result.duration,
-            d.map_or_else(|| "n/a".to_string(), |d| format!("{d:.2}x")),
-            result.timed_out,
-            result.exit_code,
-        );
-    } else if result.duration >= Duration::from_secs(12) {
-        eprintln!(
-            "ktstr: monitor_exits_cleanly ran {:?} (> 12 s budget) under host \
-             dilation D={:.2}x — budget not enforced (the no-hang invariant is \
-             covered by the guest-rebooted check); wall is a host artifact",
-            result.duration,
-            d.unwrap_or(0.0),
-        );
-    }
+    // `VmResult::duration` intentionally includes admission queue time. A
+    // wall-clock bound here would therefore fail when this test spends longer
+    // than the guest timeout waiting to be admitted, even though the monitor
+    // exits promptly once the VM starts. The `timed_out` assertion above is
+    // the run-phase no-hang invariant and is evaluated by the VM watchdog.
 }
 
 /// Asserts at least one of the first 5 monitor samples (no

@@ -8,13 +8,16 @@
 
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, SystemTime};
 
 use ahash::AHasher;
@@ -24,16 +27,22 @@ const FILE_DIGEST_RECORD_LEN: usize = 88;
 const FILE_DIGEST_SCHEMA: u32 = 1;
 const CONTENT_HASH_CHUNK_LEN: usize = 1 << 20;
 const FILE_DIGEST_MEMO_DIR: &str = "digests-v1";
-const FILE_DIGEST_LOCK_DIR: &str = ".locks-v1";
-const FILE_DIGEST_NAMESPACE_GATE: &str = "namespace.lock";
-const CONTENT_OBJECT_DIR: &str = "objects-v2";
+const CONTENT_NAMESPACE_GATE: &str = ".namespace-gate-v3.lock";
+const CONTENT_DIGEST_LOCK_PREFIX: &str = ".digest-lock-v3-";
+const CONTENT_OBJECT_LOCK_PREFIX: &str = ".object-lock-v3-";
+const CONTENT_OBJECT_DIR: &str = "objects-v3";
+const CONTENT_STAGING_DIR: &str = ".staging-v3";
+const CONTENT_RETIRED_V2_DIR: &str = ".retired-content-v2";
 const ARTIFACT_REFERENCE_DIR: &str = "artifact-references-v1";
 const ARTIFACT_REFERENCE_SCHEMA: u32 = 1;
 const ARTIFACT_REFERENCE_MAX_BYTES: u64 = 64 << 20;
-const CONTENT_GC_STAMP: &str = ".gc-v2";
+const CONTENT_GC_STAMP: &str = ".gc-v3";
 const CONTENT_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const CONTENT_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const CONTENT_ORPHAN_TEMP_GRACE: Duration = Duration::from_secs(60);
+const LEGACY_CONTENT_V2_ENTRIES: &[&str] = &["objects-v2", ".locks-v1", ".gc-v2"];
+
+static CONTENT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn fixed_hasher() -> AHasher {
     ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher()
@@ -185,17 +194,472 @@ fn open_lock_file(path: &Path) -> Result<File> {
         .with_context(|| format!("open content coordination lock {}", path.display()))
 }
 
-fn ensure_content_dirs(root: &Path) -> Result<()> {
-    for path in [
-        root.join(FILE_DIGEST_MEMO_DIR),
-        root.join(FILE_DIGEST_LOCK_DIR),
-        root.join(CONTENT_OBJECT_DIR),
-        root.join(ARTIFACT_REFERENCE_DIR),
+struct ContentCacheDirs {
+    display_root: PathBuf,
+    root: OwnedFd,
+    digests: OwnedFd,
+    objects: OwnedFd,
+    staging: OwnedFd,
+    retired_v2: OwnedFd,
+    references: OwnedFd,
+}
+
+fn create_and_open_content_dir(root: &OwnedFd, display_root: &Path, name: &str) -> Result<OwnedFd> {
+    match rustix::fs::mkdirat(root, name, rustix::fs::Mode::from_raw_mode(0o777)) {
+        Ok(()) => {}
+        Err(error) if error == rustix::io::Errno::EXIST => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "create shared content cache namespace {}",
+                    display_root.join(name).display()
+                )
+            });
+        }
+    }
+    rustix::fs::openat(
+        root,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .with_context(|| {
+        format!(
+            "open shared content cache namespace without following links {}",
+            display_root.join(name).display()
+        )
+    })
+}
+
+fn open_content_cache_dirs(root: &Path) -> Result<ContentCacheDirs> {
+    let requested_root = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolve current directory for shared content cache")?
+            .join(root)
+    };
+    std::fs::create_dir_all(&requested_root).with_context(|| {
+        format!(
+            "create shared content cache root {}",
+            requested_root.display()
+        )
+    })?;
+    let root_fd = rustix::fs::open(
+        &requested_root,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .with_context(|| {
+        format!(
+            "open shared content cache root without following links {}",
+            requested_root.display()
+        )
+    })?;
+    let display_root = std::fs::read_link(format!("/proc/self/fd/{}", root_fd.as_raw_fd()))
+        .with_context(|| {
+            format!(
+                "resolve canonical path of pinned shared content cache root {}",
+                requested_root.display()
+            )
+        })?;
+    anyhow::ensure!(
+        display_root.is_absolute(),
+        "pinned shared content cache root did not resolve to an absolute path: {}",
+        display_root.display(),
+    );
+    let digests = create_and_open_content_dir(&root_fd, &display_root, FILE_DIGEST_MEMO_DIR)?;
+    let objects = create_and_open_content_dir(&root_fd, &display_root, CONTENT_OBJECT_DIR)?;
+    let staging = create_and_open_content_dir(&root_fd, &display_root, CONTENT_STAGING_DIR)?;
+    let retired_v2 = create_and_open_content_dir(&root_fd, &display_root, CONTENT_RETIRED_V2_DIR)?;
+    let references = create_and_open_content_dir(&root_fd, &display_root, ARTIFACT_REFERENCE_DIR)?;
+    let dirs = ContentCacheDirs {
+        display_root,
+        root: root_fd,
+        digests,
+        objects,
+        staging,
+        retired_v2,
+        references,
+    };
+    validate_content_cache_dirs_reachable(&dirs)?;
+    Ok(dirs)
+}
+
+fn same_content_cache_inode(left: &rustix::fs::Stat, right: &rustix::fs::Stat) -> bool {
+    left.st_dev == right.st_dev && left.st_ino == right.st_ino
+}
+
+fn validate_content_cache_dirs_reachable(dirs: &ContentCacheDirs) -> Result<()> {
+    let reopened_root = rustix::fs::open(
+        &dirs.display_root,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "shared content cache root was detached or replaced: {}: {error}",
+            dirs.display_root.display()
+        )
+    })?;
+    let pinned_root = rustix::fs::fstat(&dirs.root).context("stat pinned content cache root")?;
+    let current_root =
+        rustix::fs::fstat(&reopened_root).context("stat reachable content cache root")?;
+    anyhow::ensure!(
+        same_content_cache_inode(&pinned_root, &current_root),
+        "shared content cache root was detached or replaced: {}",
+        dirs.display_root.display(),
+    );
+
+    for (name, pinned) in [
+        (FILE_DIGEST_MEMO_DIR, &dirs.digests),
+        (CONTENT_OBJECT_DIR, &dirs.objects),
+        (CONTENT_STAGING_DIR, &dirs.staging),
+        (CONTENT_RETIRED_V2_DIR, &dirs.retired_v2),
+        (ARTIFACT_REFERENCE_DIR, &dirs.references),
     ] {
-        std::fs::create_dir_all(&path)
-            .with_context(|| format!("create shared content cache dir {}", path.display()))?;
+        let reachable = rustix::fs::openat(
+            &dirs.root,
+            name,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "shared content cache namespace was detached or replaced: {}: {error}",
+                dirs.display_root.join(name).display()
+            )
+        })?;
+        let pinned = rustix::fs::fstat(pinned)
+            .with_context(|| format!("stat pinned content cache namespace {name}"))?;
+        let reachable = rustix::fs::fstat(&reachable)
+            .with_context(|| format!("stat reachable content cache namespace {name}"))?;
+        anyhow::ensure!(
+            same_content_cache_inode(&pinned, &reachable),
+            "shared content cache namespace was detached or replaced: {}",
+            dirs.display_root.join(name).display(),
+        );
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn ensure_content_dirs(root: &Path) -> Result<()> {
+    drop(open_content_cache_dirs(root)?);
+    Ok(())
+}
+
+fn pinned_directory_entry_names(directory: &OwnedFd, description: &str) -> Result<Vec<OsString>> {
+    let proc_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    std::fs::read_dir(&proc_path)
+        .with_context(|| format!("scan pinned {description}"))?
+        .map(|entry| {
+            entry
+                .with_context(|| format!("read pinned {description} entry"))
+                .map(|entry| entry.file_name())
+        })
+        .collect()
+}
+
+fn stat_entry_at(
+    directory: &OwnedFd,
+    name: &OsStr,
+    subject: &str,
+) -> Result<Option<rustix::fs::Stat>> {
+    match rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => Ok(Some(stat)),
+        Err(error) if error == rustix::io::Errno::NOENT => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("stat pinned {subject}")),
+    }
+}
+
+fn remove_retired_content_entry_at(
+    parent: &OwnedFd,
+    name: &OsStr,
+    display_path: &Path,
+) -> Result<()> {
+    let Some(before) = stat_entry_at(parent, name, "retired content generation")? else {
+        return Ok(());
+    };
+    if !rustix::fs::FileType::from_raw_mode(before.st_mode).is_dir() {
+        let Some(current) = stat_entry_at(parent, name, "retired content generation")? else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            same_content_cache_inode(&before, &current),
+            "retired content entry changed before removal: {}",
+            display_path.display(),
+        );
+        return match rustix::fs::unlinkat(parent, name, rustix::fs::AtFlags::empty()) {
+            Ok(()) => Ok(()),
+            Err(error) if error == rustix::io::Errno::NOENT => Ok(()),
+            Err(error) => Err(error).with_context(|| {
+                format!("remove retired content entry {}", display_path.display())
+            }),
+        };
+    }
+
+    let directory = match rustix::fs::openat(
+        parent,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(directory) => directory,
+        Err(error)
+            if error == rustix::io::Errno::NOENT
+                || error == rustix::io::Errno::NOTDIR
+                || error == rustix::io::Errno::LOOP =>
+        {
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "open retired content directory without following links {}",
+                    display_path.display()
+                )
+            });
+        }
+    };
+    let opened = rustix::fs::fstat(&directory)
+        .with_context(|| format!("stat retired content directory {}", display_path.display()))?;
+    anyhow::ensure!(
+        same_content_cache_inode(&before, &opened),
+        "retired content directory changed while opening: {}",
+        display_path.display(),
+    );
+
+    loop {
+        let proc_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        let mut found = false;
+        for entry in std::fs::read_dir(&proc_path)
+            .with_context(|| format!("scan retired content directory {}", display_path.display()))?
+        {
+            let entry = entry.with_context(|| {
+                format!(
+                    "read retired content entry beneath {}",
+                    display_path.display()
+                )
+            })?;
+            found = true;
+            let child_name = entry.file_name();
+            remove_retired_content_entry_at(
+                &directory,
+                &child_name,
+                &display_path.join(&child_name),
+            )?;
+        }
+        if !found {
+            break;
+        }
+    }
+
+    let Some(current) = stat_entry_at(parent, name, "emptied retired content directory")? else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        same_content_cache_inode(&opened, &current),
+        "retired content directory changed before removal: {}",
+        display_path.display(),
+    );
+    match rustix::fs::unlinkat(parent, name, rustix::fs::AtFlags::REMOVEDIR) {
+        Ok(()) => Ok(()),
+        Err(error) if error == rustix::io::Errno::NOENT => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "remove retired content directory {}",
+                display_path.display()
+            )
+        }),
+    }
+}
+
+fn retire_obsolete_content_v2(dirs: &ContentCacheDirs) -> Result<Vec<OsString>> {
+    let mut retired = BTreeSet::new();
+    for &legacy_name in LEGACY_CONTENT_V2_ENTRIES {
+        if stat_entry_at(
+            &dirs.root,
+            OsStr::new(legacy_name),
+            "obsolete content-v2 namespace",
+        )?
+        .is_none()
+        {
+            continue;
+        }
+        let sequence = CONTENT_TEMP_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+        let retired_name = OsString::from(format!(
+            "{legacy_name}-{}-{sequence:016x}",
+            std::process::id(),
+        ));
+        match rustix::fs::renameat(
+            &dirs.root,
+            OsStr::new(legacy_name),
+            &dirs.retired_v2,
+            &retired_name,
+        ) {
+            Ok(()) => {
+                retired.insert(retired_name);
+            }
+            Err(error) if error == rustix::io::Errno::NOENT => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("retire obsolete content-v2 namespace {legacy_name}")
+                });
+            }
+        }
+    }
+    for name in pinned_directory_entry_names(&dirs.retired_v2, "retired content generations")? {
+        retired.insert(name);
+    }
+    Ok(retired.into_iter().collect())
+}
+
+fn cache_stat_is_old(stat: &rustix::fs::Stat, now: SystemTime, max_age: Duration) -> bool {
+    if stat.st_mtime < 0 || !(0..1_000_000_000).contains(&stat.st_mtime_nsec) {
+        return true;
+    }
+    SystemTime::UNIX_EPOCH
+        .checked_add(Duration::new(
+            stat.st_mtime as u64,
+            stat.st_mtime_nsec as u32,
+        ))
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age >= max_age)
+}
+
+fn remove_if_present_at(directory: &OwnedFd, name: &OsStr, subject: &str) -> Result<bool> {
+    match rustix::fs::unlinkat(directory, name, rustix::fs::AtFlags::empty()) {
+        Ok(()) => Ok(true),
+        Err(error) if error == rustix::io::Errno::NOENT => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("remove pinned {subject}")),
+    }
+}
+
+fn open_lock_file_at(directory: &OwnedFd, name: &OsStr, subject: &str) -> Result<File> {
+    let lock = rustix::fs::openat(
+        directory,
+        name,
+        rustix::fs::OFlags::RDWR
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::from_raw_mode(0o666),
+    )
+    .with_context(|| format!("open pinned {subject}"))?;
+    Ok(File::from(lock))
+}
+
+fn unlink_opened_file_at(
+    directory: &OwnedFd,
+    name: &OsStr,
+    opened: &File,
+    subject: &str,
+) -> Result<bool> {
+    let opened = rustix::fs::fstat(opened).with_context(|| format!("stat opened {subject}"))?;
+    let Some(current) = stat_entry_at(directory, name, subject)? else {
+        return Ok(false);
+    };
+    if opened.st_dev != current.st_dev || opened.st_ino != current.st_ino {
+        return Ok(false);
+    }
+    remove_if_present_at(directory, name, subject)
+}
+
+fn create_content_temporary_at(
+    directory: &OwnedFd,
+    prefix: &str,
+    subject: &str,
+) -> Result<(File, OsString)> {
+    loop {
+        let sequence = CONTENT_TEMP_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+        let name = OsString::from(format!("{prefix}{}-{sequence:016x}", std::process::id()));
+        match rustix::fs::openat(
+            directory,
+            &name,
+            rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        ) {
+            Ok(file) => return Ok((File::from(file), name)),
+            Err(error) if error == rustix::io::Errno::EXIST => continue,
+            Err(error) => return Err(error).with_context(|| format!("create pinned {subject}")),
+        }
+    }
+}
+
+fn publish_bytes_at<F>(
+    temporary_directory: &OwnedFd,
+    final_directory: &OwnedFd,
+    temporary_prefix: &str,
+    final_name: &OsStr,
+    bytes: &[u8],
+    mode: u32,
+    subject: &str,
+    post_rename: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let (mut temporary, temporary_name) =
+        create_content_temporary_at(temporary_directory, temporary_prefix, subject)?;
+    let mut published = false;
+    let result: Result<()> = (|| {
+        temporary
+            .write_all(bytes)
+            .with_context(|| format!("write {subject}"))?;
+        temporary
+            .flush()
+            .with_context(|| format!("flush {subject}"))?;
+        rustix::fs::fchmod(&temporary, rustix::fs::Mode::from_raw_mode(mode))
+            .with_context(|| format!("seal {subject}"))?;
+        rustix::fs::renameat(
+            temporary_directory,
+            &temporary_name,
+            final_directory,
+            final_name,
+        )
+        .with_context(|| format!("publish {subject}"))?;
+        published = true;
+        post_rename()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        if published {
+            let _ = unlink_opened_file_at(
+                final_directory,
+                final_name,
+                &temporary,
+                &format!("failed published {subject}"),
+            );
+        } else {
+            let _ = unlink_opened_file_at(
+                temporary_directory,
+                &temporary_name,
+                &temporary,
+                &format!("failed temporary {subject}"),
+            );
+        }
+    }
+    result
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -267,69 +731,53 @@ fn absolute_cache_path(path: &Path) -> Result<PathBuf> {
         .join(path))
 }
 
-fn cache_entry_is_old(metadata: &std::fs::Metadata, now: SystemTime, max_age: Duration) -> bool {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|modified| now.duration_since(modified).ok())
-        .is_some_and(|age| age >= max_age)
-}
-
-fn remove_if_present(path: &Path) -> Result<bool> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => {
-            Err(error).with_context(|| format!("remove content cache {}", path.display()))
-        }
-    }
-}
-
-fn try_remove_coordinated_pair(
+fn try_remove_coordinated_pair_at(
     namespace_locked: &File,
-    lock_path: &Path,
-    data_path: &Path,
+    lock_dir: &OwnedFd,
+    lock_name: &OsStr,
+    data_dir: &OwnedFd,
+    data_name: &OsStr,
+    subject: &str,
 ) -> Result<bool> {
-    let lock = open_lock_file(lock_path)?;
+    let lock = open_lock_file_at(lock_dir, lock_name, subject)?;
     match flock_retry(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => {
-            let removed = remove_if_present(data_path)?;
+            let removed = remove_if_present_at(data_dir, data_name, subject)?;
             // The namespace gate is exclusively held, so no process can open
             // this pathname between unlinking the data and lock. A process
             // which already opened the lock either made the try-lock fail or
             // no longer needs the pathname.
             let _ = namespace_locked;
-            remove_if_present(lock_path)?;
+            unlink_opened_file_at(lock_dir, lock_name, &lock, subject)?;
             Ok(removed)
         }
         Err(error) if error == rustix::io::Errno::WOULDBLOCK => Ok(false),
-        Err(error) => Err(error).with_context(|| {
-            format!(
-                "try-lock content cache entry for cleanup {}",
-                lock_path.display()
-            )
-        }),
+        Err(error) => Err(error).with_context(|| format!("try-lock {subject} for cleanup")),
     }
 }
 
-fn try_remove_temporary_object(
+fn try_remove_temporary_entry_at(
     namespace_locked: &File,
-    lock_path: &Path,
-    temporary_path: &Path,
+    lock_dir: &OwnedFd,
+    lock_name: &OsStr,
+    temporary_dir: &OwnedFd,
+    temporary_name: &OsStr,
+    data_dir: &OwnedFd,
+    data_name: &OsStr,
+    subject: &str,
 ) -> Result<bool> {
-    let lock = open_lock_file(lock_path)?;
+    let lock = open_lock_file_at(lock_dir, lock_name, subject)?;
     match flock_retry(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => {
             let _ = namespace_locked;
-            remove_if_present(temporary_path)
+            let removed = remove_if_present_at(temporary_dir, temporary_name, subject)?;
+            if removed && stat_entry_at(data_dir, data_name, subject)?.is_none() {
+                unlink_opened_file_at(lock_dir, lock_name, &lock, subject)?;
+            }
+            Ok(removed)
         }
         Err(error) if error == rustix::io::Errno::WOULDBLOCK => Ok(false),
-        Err(error) => Err(error).with_context(|| {
-            format!(
-                "try-lock temporary content object for cleanup {}",
-                lock_path.display()
-            )
-        }),
+        Err(error) => Err(error).with_context(|| format!("try-lock {subject} for cleanup")),
     }
 }
 
@@ -338,11 +786,34 @@ fn parse_cache_key(name: &str, prefix: &str, suffix: &str) -> Option<String> {
     (key.len() == 16 && key.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| key.to_string())
 }
 
+fn parse_temporary_cache_key<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = name.strip_prefix(prefix)?;
+    rest.get(..16)
+        .filter(|key| key.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .filter(|_| rest.as_bytes().get(16) == Some(&b'-'))
+}
+
+fn digest_lock_name(key: &str) -> OsString {
+    OsString::from(format!("{CONTENT_DIGEST_LOCK_PREFIX}{key}.lock"))
+}
+
+fn object_lock_name(key: &str) -> OsString {
+    OsString::from(format!("{CONTENT_OBJECT_LOCK_PREFIX}{key}.lock"))
+}
+
+#[cfg(test)]
 fn gc_content_cache_at(root: &Path, now: SystemTime, max_age: Duration) -> Result<()> {
-    ensure_content_dirs(root)?;
-    let lock_dir = root.join(FILE_DIGEST_LOCK_DIR);
-    let namespace_gate_path = lock_dir.join(FILE_DIGEST_NAMESPACE_GATE);
-    let namespace_gate = open_lock_file(&namespace_gate_path)?;
+    let dirs = open_content_cache_dirs(root)?;
+    gc_content_cache_in(&dirs, now, max_age)
+}
+
+fn gc_content_cache_in(dirs: &ContentCacheDirs, now: SystemTime, max_age: Duration) -> Result<()> {
+    validate_content_cache_dirs_reachable(dirs)?;
+    let namespace_gate = open_lock_file_at(
+        &dirs.root,
+        OsStr::new(CONTENT_NAMESPACE_GATE),
+        "content namespace gate",
+    )?;
     match flock_retry(
         &namespace_gate,
         rustix::fs::FlockOperation::NonBlockingLockExclusive,
@@ -351,77 +822,136 @@ fn gc_content_cache_at(root: &Path, now: SystemTime, max_age: Duration) -> Resul
         Err(error) if error == rustix::io::Errno::WOULDBLOCK => return Ok(()),
         Err(error) => return Err(error).context("lock shared content namespace for cleanup"),
     }
+    validate_content_cache_dirs_reachable(dirs)?;
+    let retired_content_v2 = retire_obsolete_content_v2(dirs)?;
 
-    let digest_dir = root.join(FILE_DIGEST_MEMO_DIR);
-    for entry in std::fs::read_dir(&digest_dir)
-        .with_context(|| format!("scan content digest cache {}", digest_dir.display()))?
-    {
-        let entry = entry.context("read content digest cache entry")?;
-        let name = entry.file_name();
+    for name in pinned_directory_entry_names(&dirs.digests, "content digest cache")? {
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if let Some(key) = parse_temporary_cache_key(name_str, ".tmp-digest-") {
+            let Some(stat) = stat_entry_at(&dirs.digests, &name, "temporary digest memo")? else {
+                continue;
+            };
+            if rustix::fs::FileType::from_raw_mode(stat.st_mode).is_file()
+                && cache_stat_is_old(&stat, now, CONTENT_ORPHAN_TEMP_GRACE)
+            {
+                let lock_name = digest_lock_name(key);
+                try_remove_temporary_entry_at(
+                    &namespace_gate,
+                    &dirs.root,
+                    &lock_name,
+                    &dirs.digests,
+                    &name,
+                    &dirs.digests,
+                    &OsString::from(format!("{key}.digest")),
+                    "temporary digest memo",
+                )?;
+            }
+            continue;
+        }
         let Some(key) = name
             .to_str()
             .and_then(|name| parse_cache_key(name, "", ".digest"))
         else {
             continue;
         };
-        let metadata = entry
-            .metadata()
-            .with_context(|| format!("stat content digest memo {}", entry.path().display()))?;
-        if metadata.is_file() && cache_entry_is_old(&metadata, now, max_age) {
-            try_remove_coordinated_pair(
+        let Some(stat) = stat_entry_at(&dirs.digests, &name, "content digest memo")? else {
+            continue;
+        };
+        if rustix::fs::FileType::from_raw_mode(stat.st_mode).is_file()
+            && cache_stat_is_old(&stat, now, max_age)
+        {
+            let lock_name = digest_lock_name(&key);
+            try_remove_coordinated_pair_at(
                 &namespace_gate,
-                &lock_dir.join(format!("digest-{key}.lock")),
-                &entry.path(),
+                &dirs.root,
+                &lock_name,
+                &dirs.digests,
+                &name,
+                "content digest memo",
             )?;
         }
     }
 
-    // Content objects are deliberately not collected here. Artifact-tree
-    // consumers now retain this namespace gate in SH mode across complete
-    // record validation and bounded materialization, so a future collector can
-    // safely use this EX gate for closure-aware reclamation. Choosing which
-    // records remain reachable still belongs at the artifact-tree layer (and
-    // the former blind 8-GiB ceiling was smaller than one normal ktstr nextest
-    // closure). Until that retention protocol exists, immutable CAS objects
-    // remain durable. Digest memos and genuinely orphaned lock inodes remain
-    // reconstructible and are still bounded below.
-    let object_dir = root.join(CONTENT_OBJECT_DIR);
-
-    // Reclaim old orphan per-key locks left by a killed process after its data
-    // entry was already removed. Only the fixed current namespace is parsed.
-    for entry in std::fs::read_dir(&lock_dir)
-        .with_context(|| format!("scan content lock cache {}", lock_dir.display()))?
-    {
-        let entry = entry.context("read content lock cache entry")?;
-        let name = entry.file_name();
-        let Some((kind, key)) = name.to_str().and_then(|name| {
-            parse_cache_key(name, "digest-", ".lock")
-                .map(|key| ("digest", key))
-                .or_else(|| parse_cache_key(name, "object-", ".lock").map(|key| ("object", key)))
-        }) else {
+    // Transient files live in their own same-filesystem namespace. Periodic
+    // cleanup is therefore proportional to active/crashed publishers rather
+    // than to the cardinality of the immutable multi-terabyte object CAS.
+    for name in pinned_directory_entry_names(&dirs.staging, "content staging cache")? {
+        let Some(name_str) = name.to_str() else {
             continue;
         };
-        let data_path = match kind {
-            "digest" => digest_dir.join(format!("{key}.digest")),
-            "object" => object_dir.join(format!("{key}.object")),
-            _ => unreachable!(),
+        let Some(stat) = stat_entry_at(&dirs.staging, &name, "content staging file")? else {
+            continue;
         };
-        let metadata = entry
-            .metadata()
-            .with_context(|| format!("stat content lock {}", entry.path().display()))?;
-        if !data_path.exists() && cache_entry_is_old(&metadata, now, max_age) {
-            try_remove_coordinated_pair(&namespace_gate, &entry.path(), &data_path)?;
+        if !rustix::fs::FileType::from_raw_mode(stat.st_mode).is_file()
+            || !cache_stat_is_old(&stat, now, CONTENT_ORPHAN_TEMP_GRACE)
+        {
+            continue;
+        }
+        if name_str.starts_with(".generated-artifact-") {
+            remove_if_present_at(
+                &dirs.staging,
+                &name,
+                "orphan generated artifact staging file",
+            )?;
+            continue;
+        }
+        if name_str.starts_with(".content-gc-stamp-") {
+            remove_if_present_at(&dirs.staging, &name, "temporary content GC stamp")?;
+            continue;
+        }
+        if let Some(key) = parse_temporary_cache_key(name_str, ".content-object-") {
+            let lock_name = object_lock_name(key);
+            try_remove_temporary_entry_at(
+                &namespace_gate,
+                &dirs.root,
+                &lock_name,
+                &dirs.staging,
+                &name,
+                &dirs.objects,
+                &OsString::from(format!("{key}.object")),
+                "temporary content object",
+            )?;
         }
     }
 
-    let stamp = root.join(CONTENT_GC_STAMP);
-    let stamp_file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&stamp)
-        .with_context(|| format!("update content GC stamp {}", stamp.display()))?;
-    drop(stamp_file);
+    // Immutable objects and their durable per-key locks are deliberately not
+    // scanned here. Closure-aware artifact GC owns object reclamation; keyed
+    // crash temporaries above remove their own orphan lock when no canonical
+    // data exists. This keeps periodic metadata GC independent of CAS size.
+
+    validate_content_cache_dirs_reachable(dirs)?;
+    publish_bytes_at(
+        &dirs.staging,
+        &dirs.root,
+        ".content-gc-stamp-",
+        OsStr::new(CONTENT_GC_STAMP),
+        &[],
+        0o644,
+        "content GC stamp",
+        || validate_content_cache_dirs_reachable(dirs),
+    )?;
+    validate_content_cache_dirs_reachable(dirs)?;
+    // The v3 namespace is live before any retired tree is removed. Release its
+    // global gate first so a one-time multi-terabyte v2 unlink walk cannot
+    // serialize current publishers and consumers behind obsolete storage.
+    drop(namespace_gate);
+    for retired_name in retired_content_v2 {
+        let display_path = dirs
+            .display_root
+            .join(CONTENT_RETIRED_V2_DIR)
+            .join(&retired_name);
+        if let Err(error) =
+            remove_retired_content_entry_at(&dirs.retired_v2, &retired_name, &display_path)
+        {
+            tracing::warn!(
+                path = %display_path.display(),
+                error = %error,
+                "deferred incomplete retired content-v2 cleanup",
+            );
+        }
+    }
     Ok(())
 }
 
@@ -448,10 +978,22 @@ fn collect_unreachable_content_objects_at_root(
     now: SystemTime,
     blocking: bool,
 ) -> Result<bool> {
-    ensure_content_dirs(&root)?;
-    let lock_dir = root.join(FILE_DIGEST_LOCK_DIR);
-    let namespace_gate_path = lock_dir.join(FILE_DIGEST_NAMESPACE_GATE);
-    let namespace_gate = open_lock_file(&namespace_gate_path)?;
+    let dirs = open_content_cache_dirs(root)?;
+    collect_unreachable_content_objects_in(&dirs, retained, now, blocking)
+}
+
+fn collect_unreachable_content_objects_in(
+    dirs: &ContentCacheDirs,
+    retained: &BTreeSet<(u64, u64)>,
+    now: SystemTime,
+    blocking: bool,
+) -> Result<bool> {
+    validate_content_cache_dirs_reachable(dirs)?;
+    let namespace_gate = open_lock_file_at(
+        &dirs.root,
+        OsStr::new(CONTENT_NAMESPACE_GATE),
+        "content namespace gate",
+    )?;
     let operation = if blocking {
         rustix::fs::FlockOperation::LockExclusive
     } else {
@@ -462,36 +1004,38 @@ fn collect_unreachable_content_objects_at_root(
         Err(error) if error == rustix::io::Errno::WOULDBLOCK => return Ok(false),
         Err(error) => return Err(error).context("lock content objects for closure collection"),
     }
+    validate_content_cache_dirs_reachable(dirs)?;
 
     let mut globally_retained = retained.clone();
-    let reference_dir = root.join(ARTIFACT_REFERENCE_DIR);
-    for entry in std::fs::read_dir(&reference_dir).with_context(|| {
-        format!(
-            "scan artifact content references {}",
-            reference_dir.display()
-        )
-    })? {
-        let entry = entry.context("read artifact content-reference entry")?;
-        let name = entry.file_name();
+    for name in pinned_directory_entry_names(&dirs.references, "artifact content references")? {
         let Some(name) = name.to_str() else {
             continue;
         };
         if name.starts_with(".artifact-reference-") {
-            let metadata = entry.metadata().with_context(|| {
-                format!(
-                    "stat temporary artifact content reference {}",
-                    entry.path().display()
-                )
-            })?;
-            if metadata.is_file() && cache_entry_is_old(&metadata, now, CONTENT_ORPHAN_TEMP_GRACE) {
-                remove_if_present(&entry.path())?;
+            let Some(stat) = stat_entry_at(
+                &dirs.references,
+                OsStr::new(name),
+                "temporary artifact content reference",
+            )?
+            else {
+                continue;
+            };
+            if rustix::fs::FileType::from_raw_mode(stat.st_mode).is_file()
+                && cache_stat_is_old(&stat, now, CONTENT_ORPHAN_TEMP_GRACE)
+            {
+                remove_if_present_at(
+                    &dirs.references,
+                    OsStr::new(name),
+                    "temporary artifact content reference",
+                )?;
             }
             continue;
         }
         let Some(owner) = parse_cache_key(name, "", ".json") else {
             continue;
         };
-        let reference = match read_artifact_reference(&entry.path()) {
+        let display_path = dirs.display_root.join(ARTIFACT_REFERENCE_DIR).join(name);
+        let reference = match read_artifact_reference_at(&dirs.references, OsStr::new(name)) {
             Ok(reference) => reference,
             Err(error) => {
                 // The edge itself is reconstructible cache state. Remove it
@@ -500,20 +1044,28 @@ fn collect_unreachable_content_objects_at_root(
                 // the exact edge; otherwise a later pass reclaims its orphaned
                 // objects and that record becomes a clean rebuild miss.
                 tracing::warn!(
-                    path = %entry.path().display(),
+                    path = %display_path.display(),
                     error = %error,
                     "removing invalid artifact reference and deferring content sweep",
                 );
-                remove_if_present(&entry.path())?;
+                remove_if_present_at(
+                    &dirs.references,
+                    OsStr::new(name),
+                    "invalid artifact content reference",
+                )?;
                 return Ok(false);
             }
         };
         if format!("{:016x}", reference.owner) != owner {
             tracing::warn!(
-                path = %entry.path().display(),
+                path = %display_path.display(),
                 "removing mismatched artifact reference and deferring content sweep",
             );
-            remove_if_present(&entry.path())?;
+            remove_if_present_at(
+                &dirs.references,
+                OsStr::new(name),
+                "mismatched artifact content reference",
+            )?;
             return Ok(false);
         }
         let record_path =
@@ -529,7 +1081,11 @@ fn collect_unreachable_content_objects_at_root(
                 // Publication orders ref before record while namespace SH is
                 // held; under this EX gate, a missing record is therefore a
                 // crash leftover or an eviction whose record was hidden first.
-                remove_if_present(&entry.path())?;
+                remove_if_present_at(
+                    &dirs.references,
+                    OsStr::new(name),
+                    "orphan artifact content reference",
+                )?;
             }
             Err(error) => {
                 tracing::warn!(
@@ -546,12 +1102,7 @@ fn collect_unreachable_content_objects_at_root(
         .iter()
         .map(|(content_hash, _)| *content_hash)
         .collect::<BTreeSet<_>>();
-    let object_dir = root.join(CONTENT_OBJECT_DIR);
-    for entry in std::fs::read_dir(&object_dir)
-        .with_context(|| format!("scan content objects {}", object_dir.display()))?
-    {
-        let entry = entry.context("read content object entry")?;
-        let name = entry.file_name();
+    for name in pinned_directory_entry_names(&dirs.objects, "content objects")? {
         let Some(name) = name.to_str() else {
             continue;
         };
@@ -561,67 +1112,69 @@ fn collect_unreachable_content_objects_at_root(
             if retained_hashes.contains(&content_hash) {
                 continue;
             }
-            try_remove_coordinated_pair(
+            let lock_name = object_lock_name(&key);
+            try_remove_coordinated_pair_at(
                 &namespace_gate,
-                &lock_dir.join(format!("object-{key}.lock")),
-                &entry.path(),
+                &dirs.root,
+                &lock_name,
+                &dirs.objects,
+                OsStr::new(name),
+                "unreachable content object",
             )?;
-            continue;
         }
-
-        let Some(rest) = name.strip_prefix(".content-object-") else {
-            continue;
-        };
-        let metadata = entry
-            .metadata()
-            .with_context(|| format!("stat temporary content object {}", entry.path().display()))?;
-        if !metadata.is_file() || !cache_entry_is_old(&metadata, now, CONTENT_ORPHAN_TEMP_GRACE) {
-            continue;
-        }
-        let keyed = rest
-            .get(..16)
-            .filter(|key| key.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            .filter(|_| rest.as_bytes().get(16) == Some(&b'-'));
-        let Some(key) = keyed else {
-            // Unkeyed temporaries belong to a protocol which has no per-key
-            // coordination inode. They cannot be proven dead, so current
-            // collectors deliberately ignore them instead of carrying a
-            // mixed-version compatibility rail into the deletion protocol.
-            continue;
-        };
-        try_remove_temporary_object(
-            &namespace_gate,
-            &lock_dir.join(format!("object-{key}.lock")),
-            &entry.path(),
-        )?;
     }
+    validate_content_cache_dirs_reachable(dirs)?;
     Ok(true)
 }
 
-fn read_artifact_reference(path: &Path) -> Result<ArtifactContentReference> {
-    let metadata = std::fs::metadata(path)
-        .with_context(|| format!("stat artifact content reference {}", path.display()))?;
+fn read_artifact_reference_at(
+    reference_dir: &OwnedFd,
+    name: &OsStr,
+) -> Result<ArtifactContentReference> {
+    let opened = rustix::fs::openat(
+        reference_dir,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .context("open pinned artifact content reference")?;
+    let stat = rustix::fs::fstat(&opened).context("stat pinned artifact content reference")?;
     anyhow::ensure!(
-        metadata.is_file() && metadata.len() <= ARTIFACT_REFERENCE_MAX_BYTES,
-        "artifact content reference has invalid size/type: {}",
-        path.display()
+        rustix::fs::FileType::from_raw_mode(stat.st_mode).is_file()
+            && stat.st_size >= 0
+            && stat.st_size as u64 <= ARTIFACT_REFERENCE_MAX_BYTES,
+        "artifact content reference has invalid size/type",
     );
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("read artifact content reference {}", path.display()))?;
-    let reference: ArtifactContentReference = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse artifact content reference {}", path.display()))?;
+    let opened = File::from(opened);
+    let mut bytes = Vec::with_capacity(stat.st_size as usize);
+    opened
+        .take(ARTIFACT_REFERENCE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("read pinned artifact content reference")?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= ARTIFACT_REFERENCE_MAX_BYTES,
+        "artifact content reference grew past the maximum size while reading",
+    );
+    let reference: ArtifactContentReference =
+        serde_json::from_slice(&bytes).context("parse pinned artifact content reference")?;
     validate_artifact_reference(&reference)?;
     Ok(reference)
 }
 
-fn maybe_gc_content_cache(root: &Path) -> Result<()> {
-    let stamp = root.join(CONTENT_GC_STAMP);
-    if stamp.metadata().ok().is_some_and(|metadata| {
-        !cache_entry_is_old(&metadata, SystemTime::now(), CONTENT_GC_INTERVAL)
-    }) {
+fn maybe_gc_content_cache_in(dirs: &ContentCacheDirs) -> Result<()> {
+    let now = SystemTime::now();
+    if stat_entry_at(&dirs.root, OsStr::new(CONTENT_GC_STAMP), "content GC stamp")?.is_some_and(
+        |stat| {
+            rustix::fs::FileType::from_raw_mode(stat.st_mode).is_file()
+                && !cache_stat_is_old(&stat, now, CONTENT_GC_INTERVAL)
+        },
+    ) {
         return Ok(());
     }
-    gc_content_cache_at(root, SystemTime::now(), CONTENT_MAX_AGE)
+    gc_content_cache_in(dirs, now, CONTENT_MAX_AGE)
 }
 
 /// A per-key coordination inode opened while holding its namespace gate.
@@ -690,6 +1243,24 @@ pub(crate) fn open_coord_file(
     })
 }
 
+fn open_content_coord_file(dirs: &ContentCacheDirs, lock_name: &OsStr) -> Result<CoordinationFile> {
+    validate_content_cache_dirs_reachable(dirs)?;
+    let namespace_gate = open_lock_file_at(
+        &dirs.root,
+        OsStr::new(CONTENT_NAMESPACE_GATE),
+        "content namespace gate",
+    )?;
+    flock_retry(&namespace_gate, rustix::fs::FlockOperation::LockShared)
+        .context("lock root-pinned content coordination namespace")?;
+    validate_content_cache_dirs_reachable(dirs)?;
+    let file = open_lock_file_at(&dirs.root, lock_name, "content coordination lock")?;
+    validate_content_cache_dirs_reachable(dirs)?;
+    Ok(CoordinationFile {
+        file,
+        namespace_gate: Some(namespace_gate),
+    })
+}
+
 /// Load one published entry or elect exactly one builder across processes.
 ///
 /// The first contender takes nonblocking `LOCK_EX`. Losers wait under
@@ -728,16 +1299,36 @@ pub(crate) fn load_or_build_with_wait<T, L, B, WS, WX>(
     namespace_gate_path: &Path,
     lock_path: &Path,
     subject: &str,
-    mut load: L,
+    load: L,
     build: B,
-    mut wait_shared: WS,
-    mut wait_exclusive: WX,
+    wait_shared: WS,
+    wait_exclusive: WX,
 ) -> Result<T>
 where
     L: FnMut() -> Result<Option<T>>,
     B: FnOnce() -> Result<T>,
     WS: FnMut(&mut CoordinationFile) -> Result<()>,
     WX: FnMut(&mut CoordinationFile) -> Result<()>,
+{
+    load_or_build_with_wait_open(subject, load, build, wait_shared, wait_exclusive, || {
+        open_coord_file(namespace_gate_path, lock_path)
+    })
+}
+
+fn load_or_build_with_wait_open<T, L, B, WS, WX, O>(
+    subject: &str,
+    mut load: L,
+    build: B,
+    mut wait_shared: WS,
+    mut wait_exclusive: WX,
+    mut open_coordination: O,
+) -> Result<T>
+where
+    L: FnMut() -> Result<Option<T>>,
+    B: FnOnce() -> Result<T>,
+    WS: FnMut(&mut CoordinationFile) -> Result<()>,
+    WX: FnMut(&mut CoordinationFile) -> Result<()>,
+    O: FnMut() -> Result<CoordinationFile>,
 {
     if let Some(value) = load()? {
         return Ok(value);
@@ -746,7 +1337,7 @@ where
     let mut build = Some(build);
     let mut wait_for_successor = false;
     loop {
-        let mut coordination = open_coord_file(namespace_gate_path, lock_path)?;
+        let mut coordination = open_coordination()?;
         if wait_for_successor {
             wait_exclusive(&mut coordination)
                 .with_context(|| format!("elect successor {subject} builder"))?;
@@ -782,6 +1373,37 @@ where
             }
         }
     }
+}
+
+fn load_or_build_content<T, L, B>(
+    dirs: &ContentCacheDirs,
+    lock_name: &OsStr,
+    subject: &str,
+    mut load: L,
+    build: B,
+) -> Result<T>
+where
+    L: FnMut() -> Result<Option<T>>,
+    B: FnOnce() -> Result<T>,
+{
+    load_or_build_with_wait_open(
+        subject,
+        || {
+            validate_content_cache_dirs_reachable(dirs)?;
+            let value = load()?;
+            validate_content_cache_dirs_reachable(dirs)?;
+            Ok(value)
+        },
+        || {
+            validate_content_cache_dirs_reachable(dirs)?;
+            let value = build()?;
+            validate_content_cache_dirs_reachable(dirs)?;
+            Ok(value)
+        },
+        |coordination| coordination.lock_shared().map_err(anyhow::Error::from),
+        |coordination| coordination.lock_exclusive().map_err(anyhow::Error::from),
+        || open_content_coord_file(dirs, lock_name),
+    )
 }
 
 pub(crate) fn open_cache_record(
@@ -833,6 +1455,32 @@ pub(crate) fn read_fixed_cache_record<const N: usize>(
     Ok(Some(bytes))
 }
 
+fn read_fixed_cache_record_at<const N: usize>(
+    directory: &OwnedFd,
+    name: &OsStr,
+    display_path: &Path,
+    subject: &str,
+) -> Result<Option<[u8; N]>> {
+    let Some((file, identity)) = open_cache_record_at(directory, name, display_path, subject)?
+    else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        identity.size == N as u64,
+        "{subject} has invalid length {}: {}",
+        identity.size,
+        display_path.display(),
+    );
+    let mut bytes = [0u8; N];
+    pread_exact(&file, 0, &mut bytes, subject)?;
+    anyhow::ensure!(
+        StableFileIdentity::from_file(&file)? == identity,
+        "{subject} changed while reading: {}",
+        display_path.display(),
+    );
+    Ok(Some(bytes))
+}
+
 pub(crate) fn file_digest_identity_key(identity: StableFileIdentity) -> u64 {
     let mut hasher = fixed_hasher();
     hash_len_prefixed(&mut hasher, b"ktstr-file-digest-identity");
@@ -841,12 +1489,18 @@ pub(crate) fn file_digest_identity_key(identity: StableFileIdentity) -> u64 {
     hasher.finish()
 }
 
-fn read_file_digest_record(
-    record_path: &Path,
+fn read_file_digest_record_at(
+    dirs: &ContentCacheDirs,
+    name: &OsStr,
     identity: StableFileIdentity,
 ) -> Result<Option<u64>> {
-    let Some(bytes) =
-        read_fixed_cache_record::<FILE_DIGEST_RECORD_LEN>(record_path, "file digest memo")?
+    let display_path = dirs.display_root.join(FILE_DIGEST_MEMO_DIR).join(name);
+    let Some(bytes) = read_fixed_cache_record_at::<FILE_DIGEST_RECORD_LEN>(
+        &dirs.digests,
+        name,
+        &display_path,
+        "file digest memo",
+    )?
     else {
         return Ok(None);
     };
@@ -1046,21 +1700,22 @@ pub(crate) fn cached_file_digest_at_root(
     file: &File,
     identity: StableFileIdentity,
 ) -> Result<u64> {
-    ensure_content_dirs(root)?;
-    maybe_gc_content_cache(root)?;
-    let memo_dir = root.join(FILE_DIGEST_MEMO_DIR);
-    let lock_dir = root.join(FILE_DIGEST_LOCK_DIR);
-    let namespace_gate = lock_dir.join(FILE_DIGEST_NAMESPACE_GATE);
+    let dirs = open_content_cache_dirs(root)?;
+    maybe_gc_content_cache_in(&dirs)?;
 
     let identity_key = file_digest_identity_key(identity);
-    let record_path = memo_dir.join(format!("{identity_key:016x}.digest"));
-    let lock_path = lock_dir.join(format!("digest-{identity_key:016x}.lock"));
+    let record_name = OsString::from(format!("{identity_key:016x}.digest"));
+    let record_path = dirs
+        .display_root
+        .join(FILE_DIGEST_MEMO_DIR)
+        .join(&record_name);
+    let lock_name = digest_lock_name(&format!("{identity_key:016x}"));
     let before_lookup = source_identity_before_cache_lookup(file, identity, "file digest")?;
-    let digest = load_or_build(
-        &namespace_gate,
-        &lock_path,
+    let digest = load_or_build_content(
+        &dirs,
+        &lock_name,
         &format!("file digest {}", record_path.display()),
-        || read_file_digest_record(&record_path, identity),
+        || read_file_digest_record_at(&dirs, &record_name, identity),
         || {
             let digest = hash_pinned_file(file, identity)?;
             let mut bytes = Vec::with_capacity(FILE_DIGEST_RECORD_LEN);
@@ -1074,20 +1729,20 @@ pub(crate) fn cached_file_digest_at_root(
             bytes[80..88].copy_from_slice(&checksum.to_le_bytes());
             debug_assert_eq!(bytes.len(), FILE_DIGEST_RECORD_LEN);
 
-            let mut temporary = tempfile::Builder::new()
-                .prefix(&format!(".tmp-digest-{identity_key:016x}-"))
-                .tempfile_in(&memo_dir)
-                .context("create file digest memo temp")?;
-            temporary
-                .write_all(&bytes)
-                .context("write file digest memo")?;
             // This is reconstructible cache state. The checksum and fixed
             // envelope make a torn post-crash record fail closed, while
-            // persist keeps live readers from observing a partial write.
-            temporary
-                .persist(&record_path)
-                .map_err(|error| error.error)
-                .with_context(|| format!("publish file digest memo {}", record_path.display()))?;
+            // descriptor-relative rename keeps live readers from observing a
+            // partial write or a substituted namespace.
+            publish_bytes_at(
+                &dirs.digests,
+                &dirs.digests,
+                &format!(".tmp-digest-{identity_key:016x}-"),
+                &record_name,
+                &bytes,
+                0o600,
+                "file digest memo",
+                || validate_content_cache_dirs_reachable(&dirs),
+            )?;
             Ok(digest)
         },
     )?;
@@ -1121,42 +1776,63 @@ pub(crate) fn open_pinned_generated_artifact(
     mode: u32,
 ) -> Result<(File, StableFileIdentity)> {
     let root = content_cache_root()?;
-    ensure_content_dirs(&root)?;
-    let object_dir = root.join(CONTENT_OBJECT_DIR);
-    let mut temporary = tempfile::Builder::new()
-        .prefix(".generated-artifact-")
-        .tempfile_in(&object_dir)
-        .with_context(|| {
-            format!(
-                "create generated artifact staging file in {}",
-                object_dir.display()
-            )
-        })?;
-    temporary
-        .write_all(bytes)
-        .context("write generated artifact staging file")?;
-    temporary
-        .as_file()
-        .set_permissions(std::fs::Permissions::from_mode(mode))
-        .context("set generated artifact staging mode")?;
-    let file = temporary.into_file();
-    let identity =
-        StableFileIdentity::from_file(&file).context("stat generated artifact staging file")?;
-    Ok((file, identity))
+    let dirs = open_content_cache_dirs(&root)?;
+    validate_content_cache_dirs_reachable(&dirs)?;
+    let namespace_gate = open_lock_file_at(
+        &dirs.root,
+        OsStr::new(CONTENT_NAMESPACE_GATE),
+        "content namespace gate for generated staging",
+    )?;
+    flock_retry(&namespace_gate, rustix::fs::FlockOperation::LockShared)
+        .context("lease content namespace for generated artifact staging")?;
+    validate_content_cache_dirs_reachable(&dirs)?;
+    let (mut temporary, temporary_name) = create_content_temporary_at(
+        &dirs.staging,
+        ".generated-artifact-",
+        "generated artifact staging file",
+    )?;
+    let result: Result<StableFileIdentity> = (|| {
+        temporary
+            .write_all(bytes)
+            .context("write generated artifact staging file")?;
+        temporary
+            .flush()
+            .context("flush generated artifact staging file")?;
+        rustix::fs::fchmod(&temporary, rustix::fs::Mode::from_raw_mode(mode))
+            .context("set generated artifact staging mode")?;
+        validate_content_cache_dirs_reachable(&dirs)?;
+        anyhow::ensure!(
+            unlink_opened_file_at(
+                &dirs.staging,
+                &temporary_name,
+                &temporary,
+                "generated artifact staging file",
+            )?,
+            "generated artifact staging pathname changed before unlink",
+        );
+        validate_content_cache_dirs_reachable(&dirs)?;
+        StableFileIdentity::from_file(&temporary).context("stat generated artifact staging file")
+    })();
+    if result.is_err() {
+        let _ = unlink_opened_file_at(
+            &dirs.staging,
+            &temporary_name,
+            &temporary,
+            "generated artifact staging file",
+        );
+    }
+    drop(namespace_gate);
+    Ok((temporary, result?))
 }
 
 fn content_cache_root() -> Result<PathBuf> {
     super::resolve_cache_root_with_suffix("content").context("resolve machine-wide content cache")
 }
 
+#[cfg(test)]
 fn content_object_path(root: &Path, content_hash: u64) -> PathBuf {
     root.join(CONTENT_OBJECT_DIR)
         .join(format!("{content_hash:016x}.object"))
-}
-
-fn content_object_lock_path(root: &Path, content_hash: u64) -> PathBuf {
-    root.join(FILE_DIGEST_LOCK_DIR)
-        .join(format!("object-{content_hash:016x}.lock"))
 }
 
 /// One shared lease over the complete content-object namespace.
@@ -1170,7 +1846,7 @@ fn content_object_lock_path(root: &Path, content_hash: u64) -> PathBuf {
 /// for FICLONE materialization.
 pub(super) struct ContentNamespaceLease {
     _gate: File,
-    root: PathBuf,
+    dirs: ContentCacheDirs,
 }
 
 impl ContentNamespaceLease {
@@ -1182,8 +1858,12 @@ impl ContentNamespaceLease {
         content_hash: u64,
         expected_len: u64,
     ) -> Result<Option<(File, PathBuf)>> {
-        let path = content_object_path(&self.root, content_hash);
-        Ok(open_content_object_at(&path, expected_len)?.map(|file| (file, path)))
+        validate_content_cache_dirs_reachable(&self.dirs)?;
+        let name = OsString::from(format!("{content_hash:016x}.object"));
+        let path = self.dirs.display_root.join(CONTENT_OBJECT_DIR).join(&name);
+        let object = open_content_object_in(&self.dirs.objects, &name, &path, expected_len)?;
+        validate_content_cache_dirs_reachable(&self.dirs)?;
+        Ok(object.map(|file| (file, path)))
     }
 
     /// Publish the global reachability edge for one artifact-tree record.
@@ -1198,6 +1878,7 @@ impl ContentNamespaceLease {
         identity: u64,
         objects: &BTreeSet<(u64, u64)>,
     ) -> Result<()> {
+        validate_content_cache_dirs_reachable(&self.dirs)?;
         let record_path = absolute_cache_path(record_path)?;
         let owner = artifact_reference_owner(&record_path, identity);
         let mut reference = ArtifactContentReference {
@@ -1211,37 +1892,20 @@ impl ContentNamespaceLease {
         reference.integrity_ahash = artifact_reference_integrity(&reference);
         validate_artifact_reference(&reference)?;
 
-        let directory = self.root.join(ARTIFACT_REFERENCE_DIR);
-        let final_path = directory.join(format!("{owner:016x}.json"));
-        let mut temporary = tempfile::Builder::new()
-            .prefix(&format!(".artifact-reference-{owner:016x}-"))
-            .tempfile_in(&directory)
-            .with_context(|| {
-                format!(
-                    "create artifact content-reference temporary in {}",
-                    directory.display()
-                )
-            })?;
-        serde_json::to_writer(temporary.as_file_mut(), &reference)
-            .context("serialize artifact content reference")?;
-        temporary
-            .as_file_mut()
-            .flush()
-            .context("flush artifact content reference")?;
-        temporary
-            .as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o444))
-            .context("seal artifact content reference")?;
-        temporary
-            .persist(&final_path)
-            .map_err(|error| error.error)
-            .with_context(|| {
-                format!(
-                    "publish artifact content reference {}",
-                    final_path.display()
-                )
-            })?;
-        Ok(())
+        let bytes =
+            serde_json::to_vec(&reference).context("serialize artifact content reference")?;
+        let final_name = OsString::from(format!("{owner:016x}.json"));
+        publish_bytes_at(
+            &self.dirs.references,
+            &self.dirs.references,
+            &format!(".artifact-reference-{owner:016x}-"),
+            &final_name,
+            &bytes,
+            0o444,
+            "artifact content reference",
+            || validate_content_cache_dirs_reachable(&self.dirs),
+        )?;
+        validate_content_cache_dirs_reachable(&self.dirs)
     }
 }
 
@@ -1250,38 +1914,77 @@ impl ContentNamespaceLease {
 /// of artifact-tree cardinality.
 pub(super) fn lease_content_namespace() -> Result<ContentNamespaceLease> {
     let root = content_cache_root()?;
-    ensure_content_dirs(&root)?;
-    maybe_gc_content_cache(&root)?;
-    let gate_path = root
-        .join(FILE_DIGEST_LOCK_DIR)
-        .join(FILE_DIGEST_NAMESPACE_GATE);
-    let gate = open_lock_file(&gate_path)?;
-    flock_retry(&gate, rustix::fs::FlockOperation::LockShared)
-        .with_context(|| format!("lease content namespace {}", gate_path.display()))?;
-    Ok(ContentNamespaceLease { _gate: gate, root })
+    lease_content_namespace_at_root(&root)
 }
 
-fn open_content_object_at(path: &Path, expected_len: u64) -> Result<Option<File>> {
-    use std::os::unix::fs::PermissionsExt as _;
+fn lease_content_namespace_at_root(root: &Path) -> Result<ContentNamespaceLease> {
+    let dirs = open_content_cache_dirs(root)?;
+    maybe_gc_content_cache_in(&dirs)?;
+    let gate = open_lock_file_at(
+        &dirs.root,
+        OsStr::new(CONTENT_NAMESPACE_GATE),
+        "content namespace gate",
+    )?;
+    flock_retry(&gate, rustix::fs::FlockOperation::LockShared)
+        .with_context(|| format!("lease content namespace {}", root.display()))?;
+    validate_content_cache_dirs_reachable(&dirs)?;
+    Ok(ContentNamespaceLease { _gate: gate, dirs })
+}
 
-    let Some((file, identity)) = open_cache_record(path, "content object")? else {
+fn open_cache_record_at(
+    directory: &OwnedFd,
+    name: &OsStr,
+    display_path: &Path,
+    subject: &str,
+) -> Result<Option<(File, StableFileIdentity)>> {
+    let opened = match rustix::fs::openat(
+        directory,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(opened) => opened,
+        Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("open {subject} {}", display_path.display()));
+        }
+    };
+    let file = File::from(opened);
+    let identity = StableFileIdentity::from_file(&file)
+        .with_context(|| format!("stat {subject} {}", display_path.display()))?;
+    Ok(Some((file, identity)))
+}
+
+fn open_content_object_in(
+    directory: &OwnedFd,
+    name: &OsStr,
+    display_path: &Path,
+    expected_len: u64,
+) -> Result<Option<File>> {
+    let Some((file, identity)) =
+        open_cache_record_at(directory, name, display_path, "content object")?
+    else {
         return Ok(None);
     };
     anyhow::ensure!(
         identity.size == expected_len,
         "content object {} has length {}, expected {expected_len}",
-        path.display(),
+        display_path.display(),
         identity.size
     );
     let mode = file
         .metadata()
-        .with_context(|| format!("stat content object mode {}", path.display()))?
+        .with_context(|| format!("stat content object mode {}", display_path.display()))?
         .permissions()
         .mode();
     anyhow::ensure!(
         mode & 0o222 == 0 && mode & 0o111 != 0,
         "content object must be read-only executable: {}",
-        path.display()
+        display_path.display()
     );
     Ok(Some(file))
 }
@@ -1290,107 +1993,125 @@ fn open_content_object_at(path: &Path, expected_len: u64) -> Result<Option<File>
 #[cfg(test)]
 pub(crate) fn open_content_object(content_hash: u64, expected_len: u64) -> Result<Option<File>> {
     let root = content_cache_root()?;
-    ensure_content_dirs(&root)?;
-    maybe_gc_content_cache(&root)?;
-    open_content_object_at(&content_object_path(&root, content_hash), expected_len)
+    let dirs = open_content_cache_dirs(&root)?;
+    maybe_gc_content_cache_in(&dirs)?;
+    validate_content_cache_dirs_reachable(&dirs)?;
+    let name = OsString::from(format!("{content_hash:016x}.object"));
+    let path = dirs.display_root.join(CONTENT_OBJECT_DIR).join(&name);
+    let object = open_content_object_in(&dirs.objects, &name, &path, expected_len)?;
+    validate_content_cache_dirs_reachable(&dirs)?;
+    Ok(object)
 }
 
 /// Publish a pinned input as one immutable content object.
 ///
-/// FICLONE shares source extents when the filesystem supports it. Other local
-/// filesystems stream the pinned descriptor once into the same immutable CAS
-/// inode; all consumers still mmap that single inode with private/COW
-/// semantics. Publication is atomic and source mutation is checked on both
-/// sides of the copy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ContentPublicationPolicy {
-    AllowCopyFallback,
-    RequireReflink,
-}
-
+/// Every publication uses FICLONE so all consumers share one backing extent
+/// and retain private/COW semantics across processes. There is deliberately no
+/// byte-copy fallback. Publication is descriptor-relative and atomic, and the
+/// pinned source revision is checked on both sides of the clone.
 fn publish_content_object(
+    dirs: &ContentCacheDirs,
     expected_hash: u64,
     source: &File,
     source_identity: StableFileIdentity,
-    final_path: &Path,
-    policy: ContentPublicationPolicy,
 ) -> Result<File> {
-    let parent = final_path
-        .parent()
-        .context("content object path has no parent")?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("create content object dir {}", parent.display()))?;
+    publish_content_object_with_post_rename(dirs, expected_hash, source, source_identity, || Ok(()))
+}
+
+fn publish_content_object_with_post_rename<F>(
+    dirs: &ContentCacheDirs,
+    expected_hash: u64,
+    source: &File,
+    source_identity: StableFileIdentity,
+    post_rename: F,
+) -> Result<File>
+where
+    F: FnOnce() -> Result<()>,
+{
+    validate_content_cache_dirs_reachable(dirs)?;
     let before_copy = StableFileIdentity::from_file(source)?;
     anyhow::ensure!(
         before_copy.same_open_content_version(source_identity),
         "content source changed before CAS publication"
     );
 
-    let mut temporary = tempfile::Builder::new()
-        .prefix(&format!(".content-object-{expected_hash:016x}-"))
-        .tempfile_in(parent)
-        .context("create content object temp")?;
-    match crate::reflink::ficlone(temporary.as_file(), source) {
-        Ok(()) => {}
-        Err(error)
-            if policy == ContentPublicationPolicy::AllowCopyFallback
-                && error.raw_os_error().is_some_and(|code| {
-                    matches!(code, libc::EXDEV | libc::EOPNOTSUPP | libc::ENOTTY)
-                }) =>
-        {
-            let mut offset = 0u64;
-            let mut buffer =
-                vec![
-                    0u8;
-                    usize::try_from(source_identity.size.min(CONTENT_HASH_CHUNK_LEN as u64))?
-                ];
-            while offset < source_identity.size {
-                let chunk_len =
-                    usize::try_from((source_identity.size - offset).min(buffer.len() as u64))?;
-                pread_exact(
-                    source,
-                    offset,
-                    &mut buffer[..chunk_len],
-                    "pinned content object source",
-                )?;
-                temporary
-                    .write_all(&buffer[..chunk_len])
-                    .context("write content object temp")?;
-                offset = offset
-                    .checked_add(u64::try_from(chunk_len)?)
-                    .context("content object copy offset overflow")?;
-            }
-        }
-        Err(error) => return Err(error).context("FICLONE pinned content object"),
-    }
-    let after_copy = StableFileIdentity::from_file(source)?;
-    anyhow::ensure!(
-        after_copy.same_open_content_version(source_identity),
-        "content source changed during CAS publication"
-    );
-    if before_copy != source_identity || after_copy != source_identity || before_copy != after_copy
-    {
-        let temporary_identity = StableFileIdentity::from_file(temporary.as_file())
-            .context("stat content object temp for source-race validation")?;
-        let actual_hash = hash_pinned_file_exact_identity(temporary.as_file(), temporary_identity)
-            .context("hash content object temp after source revision transition")?;
+    let (temporary, temporary_name) = create_content_temporary_at(
+        &dirs.staging,
+        &format!(".content-object-{expected_hash:016x}-"),
+        "content object temporary",
+    )?;
+    let final_name = OsString::from(format!("{expected_hash:016x}.object"));
+    let result: Result<File> = (|| {
+        crate::reflink::ficlone(&temporary, source).context("FICLONE pinned content object")?;
+        let after_copy = StableFileIdentity::from_file(source)?;
         anyhow::ensure!(
-            actual_hash == expected_hash,
-            "content object captured bytes from a transient source revision"
+            after_copy.same_open_content_version(source_identity),
+            "content source changed during CAS publication"
         );
+        if before_copy != source_identity
+            || after_copy != source_identity
+            || before_copy != after_copy
+        {
+            let temporary_identity = StableFileIdentity::from_file(&temporary)
+                .context("stat content object temp for source-race validation")?;
+            let actual_hash = hash_pinned_file_exact_identity(&temporary, temporary_identity)
+                .context("hash content object temp after source revision transition")?;
+            anyhow::ensure!(
+                actual_hash == expected_hash,
+                "content object captured bytes from a transient source revision"
+            );
+        }
+        rustix::fs::fchmod(&temporary, rustix::fs::Mode::from_raw_mode(0o555))
+            .context("make content object read-only executable")?;
+        validate_content_cache_dirs_reachable(dirs)?;
+        rustix::fs::renameat(&dirs.staging, &temporary_name, &dirs.objects, &final_name)
+            .context("publish content object beneath pinned namespace")?;
+        post_rename()?;
+        let published = open_content_object_in(
+            &dirs.objects,
+            &final_name,
+            &dirs.display_root.join(CONTENT_OBJECT_DIR).join(&final_name),
+            source_identity.size,
+        )?
+        .context("reopen published content object read-only")?;
+        let temporary_stat = rustix::fs::fstat(&temporary)
+            .context("stat writable content object construction descriptor")?;
+        let published_stat =
+            rustix::fs::fstat(&published).context("stat reopened content object descriptor")?;
+        anyhow::ensure!(
+            same_content_cache_inode(&temporary_stat, &published_stat)
+                && temporary_stat.st_size == published_stat.st_size
+                && published_stat.st_size >= 0
+                && published_stat.st_size as u64 == source_identity.size
+                && temporary_stat.st_mode == published_stat.st_mode
+                && published_stat.st_mode & 0o7777 == 0o555,
+            "reopened content object does not exactly match the published inode",
+        );
+        validate_content_cache_dirs_reachable(dirs)?;
+        Ok(published)
+    })();
+    match result {
+        Ok(published) => {
+            drop(temporary);
+            Ok(published)
+        }
+        Err(error) => {
+            let _ = unlink_opened_file_at(
+                &dirs.staging,
+                &temporary_name,
+                &temporary,
+                "content object temporary",
+            );
+            let _ = unlink_opened_file_at(
+                &dirs.objects,
+                &final_name,
+                &temporary,
+                "failed published content object",
+            );
+            drop(temporary);
+            Err(error)
+        }
     }
-    temporary
-        .as_file()
-        .set_permissions(std::fs::Permissions::from_mode(0o555))
-        .context("make content object read-only executable")?;
-    // The object is reconstructible from the still-pinned source. Atomic
-    // publication and chmod-before-rename provide the live-process
-    // invariants without putting every cold builder behind storage barriers.
-    let published = temporary
-        .persist(final_path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("publish content object {}", final_path.display()))?;
-    Ok(published)
 }
 
 /// Open or publish one immutable object under the machine-wide content key.
@@ -1398,28 +2119,33 @@ fn publish_content_object(
 /// The content namespace owns this election rather than any caller-specific
 /// analysis/preparation cache, so identical bytes converge on one inode even
 /// when different components and checkouts request them concurrently.
-fn open_or_publish_content_object_at_root_with_policy(
-    root: &Path,
+fn open_or_publish_content_object_in(
+    dirs: &ContentCacheDirs,
     content_hash: u64,
     source: &File,
     source_identity: StableFileIdentity,
-    policy: ContentPublicationPolicy,
 ) -> Result<File> {
-    ensure_content_dirs(root)?;
-    maybe_gc_content_cache(root)?;
-    let object_path = content_object_path(root, content_hash);
-    let lock_path = content_object_lock_path(root, content_hash);
-    let namespace_gate = root
-        .join(FILE_DIGEST_LOCK_DIR)
-        .join(FILE_DIGEST_NAMESPACE_GATE);
+    let object_name = OsString::from(format!("{content_hash:016x}.object"));
+    let object_path = dirs
+        .display_root
+        .join(CONTENT_OBJECT_DIR)
+        .join(&object_name);
+    let lock_name = object_lock_name(&format!("{content_hash:016x}"));
     let before_lookup =
         source_identity_before_cache_lookup(source, source_identity, "content object")?;
-    let object = load_or_build(
-        &namespace_gate,
-        &lock_path,
+    let object = load_or_build_content(
+        dirs,
+        &lock_name,
         &format!("content object {content_hash:016x}"),
-        || open_content_object_at(&object_path, source_identity.size),
-        || publish_content_object(content_hash, source, source_identity, &object_path, policy),
+        || {
+            open_content_object_in(
+                &dirs.objects,
+                &object_name,
+                &object_path,
+                source_identity.size,
+            )
+        },
+        || publish_content_object(dirs, content_hash, source, source_identity),
     )?;
     validate_source_after_cache_operation(
         source,
@@ -1431,19 +2157,24 @@ fn open_or_publish_content_object_at_root_with_policy(
     Ok(object)
 }
 
+fn open_or_publish_content_object_at_root(
+    root: &Path,
+    content_hash: u64,
+    source: &File,
+    source_identity: StableFileIdentity,
+) -> Result<File> {
+    let dirs = open_content_cache_dirs(root)?;
+    maybe_gc_content_cache_in(&dirs)?;
+    open_or_publish_content_object_in(&dirs, content_hash, source, source_identity)
+}
+
 pub(crate) fn open_or_publish_content_object(
     content_hash: u64,
     source: &File,
     source_identity: StableFileIdentity,
 ) -> Result<File> {
     let root = content_cache_root()?;
-    open_or_publish_content_object_at_root_with_policy(
-        &root,
-        content_hash,
-        source,
-        source_identity,
-        ContentPublicationPolicy::AllowCopyFallback,
-    )
+    open_or_publish_content_object_at_root(&root, content_hash, source, source_identity)
 }
 
 /// Shared-lock lease over one immutable content object.
@@ -1456,6 +2187,7 @@ pub(crate) fn open_or_publish_content_object(
 pub(crate) struct ContentObjectLease {
     _file: File,
     _coordination: CoordinationFile,
+    _dirs: ContentCacheDirs,
     path: PathBuf,
 }
 
@@ -1465,52 +2197,78 @@ impl ContentObjectLease {
     }
 }
 
+fn lease_content_object_in(
+    dirs: &ContentCacheDirs,
+    content_hash: u64,
+    expected_len: u64,
+) -> Result<Option<(File, CoordinationFile, PathBuf)>> {
+    validate_content_cache_dirs_reachable(dirs)?;
+    let key = format!("{content_hash:016x}");
+    let object_name = OsString::from(format!("{key}.object"));
+    let object_path = dirs
+        .display_root
+        .join(CONTENT_OBJECT_DIR)
+        .join(&object_name);
+    let lock_name = object_lock_name(&key);
+    let mut coordination = open_content_coord_file(dirs, &lock_name)?;
+    coordination
+        .lock_shared()
+        .with_context(|| format!("lease content object {content_hash:016x}"))?;
+    coordination.release_namespace_gate();
+    let Some(file) =
+        open_content_object_in(&dirs.objects, &object_name, &object_path, expected_len)?
+    else {
+        return Ok(None);
+    };
+    validate_content_cache_dirs_reachable(dirs)?;
+    Ok(Some((file, coordination, object_path)))
+}
+
+#[cfg(test)]
 fn lease_content_object_at_root(
     root: &Path,
     content_hash: u64,
     expected_len: u64,
 ) -> Result<Option<ContentObjectLease>> {
-    let object_path = content_object_path(root, content_hash);
-    let lock_path = content_object_lock_path(root, content_hash);
-    let namespace_gate = root
-        .join(FILE_DIGEST_LOCK_DIR)
-        .join(FILE_DIGEST_NAMESPACE_GATE);
-    let mut coordination = open_coord_file(&namespace_gate, &lock_path)?;
-    coordination
-        .lock_shared()
-        .with_context(|| format!("lease content object {content_hash:016x}"))?;
-    coordination.release_namespace_gate();
-    let Some(file) = open_content_object_at(&object_path, expected_len)? else {
+    let dirs = open_content_cache_dirs(root)?;
+    maybe_gc_content_cache_in(&dirs)?;
+    let Some((file, coordination, path)) =
+        lease_content_object_in(&dirs, content_hash, expected_len)?
+    else {
         return Ok(None);
     };
-    let path = std::fs::canonicalize(&object_path)
-        .with_context(|| format!("canonicalize content object {}", object_path.display()))?;
     Ok(Some(ContentObjectLease {
         _file: file,
         _coordination: coordination,
+        _dirs: dirs,
         path,
     }))
 }
 
-pub(crate) fn open_or_publish_content_object_lease_with_policy(
+pub(crate) fn open_or_publish_content_object_lease(
     content_hash: u64,
     source: &File,
     source_identity: StableFileIdentity,
-    policy: ContentPublicationPolicy,
 ) -> Result<ContentObjectLease> {
     let root = content_cache_root()?;
+    let dirs = open_content_cache_dirs(&root)?;
+    maybe_gc_content_cache_in(&dirs)?;
     loop {
-        drop(open_or_publish_content_object_at_root_with_policy(
-            &root,
+        drop(open_or_publish_content_object_in(
+            &dirs,
             content_hash,
             source,
             source_identity,
-            policy,
         )?);
-        if let Some(lease) =
-            lease_content_object_at_root(&root, content_hash, source_identity.size)?
+        if let Some((file, coordination, path)) =
+            lease_content_object_in(&dirs, content_hash, source_identity.size)?
         {
-            return Ok(lease);
+            return Ok(ContentObjectLease {
+                _file: file,
+                _coordination: coordination,
+                _dirs: dirs,
+                path,
+            });
         }
     }
 }
@@ -1652,25 +2410,14 @@ mod tests {
         let (source, identity) = open_pinned_file(&source_path).unwrap();
         let content_hash = hash_pinned_file(&source, identity).unwrap();
         drop(
-            open_or_publish_content_object_at_root_with_policy(
-                root.path(),
-                content_hash,
-                &source,
-                identity,
-                ContentPublicationPolicy::AllowCopyFallback,
-            )
-            .unwrap(),
+            open_or_publish_content_object_at_root(root.path(), content_hash, &source, identity)
+                .unwrap(),
         );
 
         rewrite_same_size_and_restore_mtime(&source_path, b"new scheduler bytes", identity);
-        let error = open_or_publish_content_object_at_root_with_policy(
-            root.path(),
-            content_hash,
-            &source,
-            identity,
-            ContentPublicationPolicy::AllowCopyFallback,
-        )
-        .unwrap_err();
+        let error =
+            open_or_publish_content_object_at_root(root.path(), content_hash, &source, identity)
+                .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1689,14 +2436,9 @@ mod tests {
         let content_hash = hash_pinned_file(&source, identity).unwrap();
 
         rewrite_same_size_and_restore_mtime(&source_path, b"new scheduler bytes", identity);
-        let error = open_or_publish_content_object_at_root_with_policy(
-            root.path(),
-            content_hash,
-            &source,
-            identity,
-            ContentPublicationPolicy::AllowCopyFallback,
-        )
-        .unwrap_err();
+        let error =
+            open_or_publish_content_object_at_root(root.path(), content_hash, &source, identity)
+                .unwrap_err();
         assert!(
             format!("{error:#}").contains("transient source revision"),
             "unexpected stale publication rejection: {error:#}",
@@ -1708,45 +2450,289 @@ mod tests {
     }
 
     #[test]
+    fn published_content_object_returns_read_only_descriptor() {
+        use std::io::Write as _;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let source_dir = tempfile::TempDir::new().unwrap();
+        let source_path = source_dir.path().join("source");
+        std::fs::write(&source_path, b"strict reflink content").unwrap();
+        let (source, identity) = open_pinned_file(&source_path).unwrap();
+        let content_hash = hash_pinned_file(&source, identity).unwrap();
+
+        let published =
+            open_or_publish_content_object_at_root(root.path(), content_hash, &source, identity)
+                .unwrap();
+        let access = rustix::fs::fcntl_getfl(&published).unwrap() & rustix::fs::OFlags::ACCMODE;
+        assert_eq!(access, rustix::fs::OFlags::RDONLY);
+        let mut attempted_writer = published.try_clone().unwrap();
+        let error = attempted_writer.write_all(b"x").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[test]
+    fn strict_content_namespace_retires_and_never_reuses_legacy_v2_object() {
+        let root = tempfile::TempDir::new().unwrap();
+        let legacy_dir = root.path().join("objects-v2");
+        std::fs::create_dir(&legacy_dir).unwrap();
+        let source_dir = tempfile::TempDir::new().unwrap();
+        let source_path = source_dir.path().join("source");
+        std::fs::write(&source_path, b"strict-object").unwrap();
+        let (source, identity) = open_pinned_file(&source_path).unwrap();
+        let content_hash = hash_pinned_file(&source, identity).unwrap();
+        let legacy_path = legacy_dir.join(format!("{content_hash:016x}.object"));
+        std::fs::write(&legacy_path, b"legacy-object").unwrap();
+        std::fs::set_permissions(&legacy_path, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let legacy_locks = root.path().join(".locks-v1");
+        std::fs::create_dir(&legacy_locks).unwrap();
+        std::fs::write(legacy_locks.join("obsolete.lock"), b"").unwrap();
+        std::fs::write(root.path().join(".gc-v2"), b"").unwrap();
+
+        let published =
+            open_or_publish_content_object_at_root(root.path(), content_hash, &source, identity)
+                .unwrap();
+        let current_path = content_object_path(root.path(), content_hash);
+        assert_eq!(std::fs::read(&current_path).unwrap(), b"strict-object");
+        assert!(!legacy_path.exists());
+        assert!(!legacy_dir.exists());
+        assert!(!legacy_locks.exists());
+        assert!(!root.path().join(".gc-v2").exists());
+        assert_eq!(
+            std::fs::read_dir(root.path().join(CONTENT_RETIRED_V2_DIR))
+                .unwrap()
+                .count(),
+            0,
+        );
+        assert_eq!(
+            published.metadata().unwrap().ino(),
+            std::fs::metadata(&current_path).unwrap().ino(),
+        );
+        assert!(current_path.starts_with(root.path().join(CONTENT_OBJECT_DIR)));
+    }
+
+    #[test]
+    fn leased_content_path_survives_ancestor_symlink_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let base = tempfile::TempDir::new().unwrap();
+        let first = base.path().join("first");
+        let second = base.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let alias = base.path().join("alias");
+        symlink(&first, &alias).unwrap();
+        let requested_root = alias.join("content");
+        let source_path = first.join("source");
+        std::fs::write(&source_path, b"canonical pinned path").unwrap();
+        let (source, identity) = open_pinned_file(&source_path).unwrap();
+        let content_hash = hash_pinned_file(&source, identity).unwrap();
+        drop(
+            open_or_publish_content_object_at_root(
+                &requested_root,
+                content_hash,
+                &source,
+                identity,
+            )
+            .unwrap(),
+        );
+        let lease = lease_content_object_at_root(&requested_root, content_hash, identity.size)
+            .unwrap()
+            .unwrap();
+        let expected_path = first
+            .join("content")
+            .join(CONTENT_OBJECT_DIR)
+            .join(format!("{content_hash:016x}.object"));
+        assert_eq!(lease.path(), expected_path);
+
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&second, &alias).unwrap();
+
+        assert_eq!(lease.path(), expected_path);
+        assert_eq!(
+            std::fs::read(lease.path()).unwrap(),
+            b"canonical pinned path"
+        );
+    }
+
+    #[test]
+    fn failed_post_rename_validation_removes_exact_published_inode() {
+        let root = tempfile::TempDir::new().unwrap();
+        let source_dir = tempfile::TempDir::new().unwrap();
+        let source_path = source_dir.path().join("source");
+        std::fs::write(&source_path, b"post rename cleanup").unwrap();
+        let (source, identity) = open_pinned_file(&source_path).unwrap();
+        let content_hash = hash_pinned_file(&source, identity).unwrap();
+        let dirs = open_content_cache_dirs(root.path()).unwrap();
+        let object_namespace = root.path().join(CONTENT_OBJECT_DIR);
+        let detached_namespace = root.path().join("detached-objects");
+
+        let error =
+            publish_content_object_with_post_rename(&dirs, content_hash, &source, identity, || {
+                std::fs::rename(&object_namespace, &detached_namespace)?;
+                std::fs::create_dir(&object_namespace)?;
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("detached or replaced"));
+        assert!(
+            !detached_namespace
+                .join(format!("{content_hash:016x}.object"))
+                .exists()
+        );
+        assert_eq!(std::fs::read_dir(&object_namespace).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn failed_small_record_post_rename_validation_removes_exact_published_inode() {
+        let root = tempfile::TempDir::new().unwrap();
+        let dirs = open_content_cache_dirs(root.path()).unwrap();
+        let reference_namespace = root.path().join(ARTIFACT_REFERENCE_DIR);
+        let detached_namespace = root.path().join("detached-references");
+        let final_name = OsStr::new("1111222233334444.json");
+
+        let error = publish_bytes_at(
+            &dirs.references,
+            &dirs.references,
+            ".artifact-reference-test-",
+            final_name,
+            b"published bytes",
+            0o444,
+            "test artifact reference",
+            || {
+                std::fs::rename(&reference_namespace, &detached_namespace)?;
+                std::fs::create_dir(&reference_namespace)?;
+                validate_content_cache_dirs_reachable(&dirs)
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("detached or replaced"));
+        assert!(!detached_namespace.join(final_name).exists());
+        assert_eq!(std::fs::read_dir(&reference_namespace).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn gc_collects_crash_orphaned_digest_object_and_generated_temporaries_safely() {
+        let root = tempfile::TempDir::new().unwrap();
+        let dirs = open_content_cache_dirs(root.path()).unwrap();
+        let key = "1111222233334444";
+        let digest_temporary = root
+            .path()
+            .join(FILE_DIGEST_MEMO_DIR)
+            .join(format!(".tmp-digest-{key}-crash"));
+        let generated_temporary = root
+            .path()
+            .join(CONTENT_STAGING_DIR)
+            .join(".generated-artifact-crash");
+        let immutable_namespace_decoy = root
+            .path()
+            .join(CONTENT_OBJECT_DIR)
+            .join(".generated-artifact-not-staging");
+        let object_key = "5555666677778888";
+        let object_temporary = root
+            .path()
+            .join(CONTENT_STAGING_DIR)
+            .join(format!(".content-object-{object_key}-crash"));
+        std::fs::write(&digest_temporary, b"partial digest").unwrap();
+        std::fs::write(&generated_temporary, b"partial generated artifact").unwrap();
+        std::fs::write(&immutable_namespace_decoy, b"immutable namespace decoy").unwrap();
+        std::fs::write(&object_temporary, b"partial object").unwrap();
+        let digest_lock = open_lock_file_at(
+            &dirs.root,
+            &digest_lock_name(key),
+            "test live digest publisher",
+        )
+        .unwrap();
+        flock_retry(&digest_lock, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        let object_lock = open_lock_file_at(
+            &dirs.root,
+            &object_lock_name(object_key),
+            "test live object publisher",
+        )
+        .unwrap();
+        flock_retry(&object_lock, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        let future = SystemTime::now() + CONTENT_ORPHAN_TEMP_GRACE + Duration::from_secs(1);
+
+        gc_content_cache_at(root.path(), future, CONTENT_MAX_AGE).unwrap();
+        assert!(digest_temporary.exists());
+        assert!(root.path().join(digest_lock_name(key)).exists());
+        assert!(!generated_temporary.exists());
+        assert!(object_temporary.exists());
+        assert!(root.path().join(object_lock_name(object_key)).exists());
+        assert!(
+            immutable_namespace_decoy.exists(),
+            "periodic temp GC must not scan the immutable object namespace",
+        );
+
+        drop(digest_lock);
+        drop(object_lock);
+        gc_content_cache_at(root.path(), future, CONTENT_MAX_AGE).unwrap();
+        assert!(!digest_temporary.exists());
+        assert!(!root.path().join(digest_lock_name(key)).exists());
+        assert!(!object_temporary.exists());
+        assert!(!root.path().join(object_lock_name(object_key)).exists());
+
+        std::fs::write(&generated_temporary, b"live generated artifact").unwrap();
+        let namespace_gate = open_lock_file_at(
+            &dirs.root,
+            OsStr::new(CONTENT_NAMESPACE_GATE),
+            "test live generated publisher",
+        )
+        .unwrap();
+        flock_retry(&namespace_gate, rustix::fs::FlockOperation::LockShared).unwrap();
+        gc_content_cache_at(root.path(), future, CONTENT_MAX_AGE).unwrap();
+        assert!(generated_temporary.exists());
+        drop(namespace_gate);
+        gc_content_cache_at(root.path(), future, CONTENT_MAX_AGE).unwrap();
+        assert!(!generated_temporary.exists());
+    }
+
+    #[test]
     fn gc_reclaims_metadata_but_never_partially_collects_content_closures() {
         let root = tempfile::TempDir::new().unwrap();
         ensure_content_dirs(root.path()).unwrap();
         let digest_dir = root.path().join(FILE_DIGEST_MEMO_DIR);
         let object_dir = root.path().join(CONTENT_OBJECT_DIR);
-        let lock_dir = root.path().join(FILE_DIGEST_LOCK_DIR);
+        let lock_dir = root.path();
 
         let digest_key = "1111111111111111";
         let object_key = "2222222222222222";
         let live_key = "3333333333333333";
         let orphan_key = "4444444444444444";
         std::fs::write(digest_dir.join(format!("{digest_key}.digest")), b"memo").unwrap();
-        std::fs::write(lock_dir.join(format!("digest-{digest_key}.lock")), b"").unwrap();
+        std::fs::write(lock_dir.join(digest_lock_name(digest_key)), b"").unwrap();
         std::fs::write(
             object_dir.join(format!("{object_key}.object")),
             vec![0u8; 4096],
         )
         .unwrap();
-        std::fs::write(lock_dir.join(format!("object-{object_key}.lock")), b"").unwrap();
+        std::fs::write(lock_dir.join(object_lock_name(object_key)), b"").unwrap();
         std::fs::write(
             object_dir.join(format!("{live_key}.object")),
             vec![0u8; 4096],
         )
         .unwrap();
-        let live_lock_path = lock_dir.join(format!("object-{live_key}.lock"));
+        let live_lock_path = lock_dir.join(object_lock_name(live_key));
         let live_lock = open_lock_file(&live_lock_path).unwrap();
         flock_retry(&live_lock, rustix::fs::FlockOperation::LockExclusive).unwrap();
-        let orphan_lock_path = lock_dir.join(format!("object-{orphan_key}.lock"));
+        let orphan_lock_path = lock_dir.join(object_lock_name(orphan_key));
         std::fs::write(&orphan_lock_path, b"").unwrap();
+        let orphan_temporary = root
+            .path()
+            .join(CONTENT_STAGING_DIR)
+            .join(format!(".content-object-{orphan_key}-crash"));
+        std::fs::write(&orphan_temporary, b"partial object").unwrap();
 
         let future = SystemTime::now() + CONTENT_MAX_AGE + Duration::from_secs(1);
         gc_content_cache_at(root.path(), future, CONTENT_MAX_AGE).unwrap();
         assert!(!digest_dir.join(format!("{digest_key}.digest")).exists());
-        assert!(!lock_dir.join(format!("digest-{digest_key}.lock")).exists());
+        assert!(!lock_dir.join(digest_lock_name(digest_key)).exists());
         assert!(
             object_dir.join(format!("{object_key}.object")).exists(),
             "GC must retain an unleased object until closure-level collection exists"
         );
-        assert!(lock_dir.join(format!("object-{object_key}.lock")).exists());
+        assert!(lock_dir.join(object_lock_name(object_key)).exists());
         assert!(
             object_dir.join(format!("{live_key}.object")).exists(),
             "GC must retain every member of a possible artifact closure"
@@ -1754,15 +2740,16 @@ mod tests {
         assert!(live_lock_path.exists());
         assert!(
             !orphan_lock_path.exists(),
-            "an old object lock with no object or owner is reconstructible"
+            "a crashed keyed object temporary and its orphan lock are reconstructible"
         );
+        assert!(!orphan_temporary.exists());
 
         drop(live_lock);
         gc_content_cache_at(root.path(), future, CONTENT_MAX_AGE).unwrap();
         assert!(object_dir.join(format!("{live_key}.object")).exists());
         assert!(live_lock_path.exists());
         assert!(
-            lock_dir.join(FILE_DIGEST_NAMESPACE_GATE).exists(),
+            lock_dir.join(CONTENT_NAMESPACE_GATE).exists(),
             "the namespace gate itself is never a GC candidate"
         );
     }
@@ -1841,6 +2828,191 @@ mod tests {
     }
 
     #[test]
+    fn content_cache_rejects_root_and_fixed_namespace_symlinks_without_touching_sentinel() {
+        use std::os::unix::fs::symlink;
+
+        for namespace in [
+            None,
+            Some(FILE_DIGEST_MEMO_DIR),
+            Some(CONTENT_OBJECT_DIR),
+            Some(CONTENT_STAGING_DIR),
+            Some(CONTENT_RETIRED_V2_DIR),
+            Some(ARTIFACT_REFERENCE_DIR),
+        ] {
+            let base = tempfile::TempDir::new().unwrap();
+            let external = tempfile::TempDir::new().unwrap();
+            let sentinel = external.path().join("sentinel");
+            std::fs::write(&sentinel, b"external sentinel").unwrap();
+            let root = base.path().join("content");
+
+            match namespace {
+                None => symlink(external.path(), &root).unwrap(),
+                Some(namespace) => {
+                    ensure_content_dirs(&root).unwrap();
+                    let path = root.join(namespace);
+                    std::fs::remove_dir(&path).unwrap();
+                    symlink(external.path(), path).unwrap();
+                }
+            }
+
+            let error = collect_unreachable_content_objects_at_root(
+                &root,
+                &BTreeSet::new(),
+                SystemTime::now(),
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("without following links"),
+                "unexpected fixed-namespace rejection: {error:#}",
+            );
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"external sentinel");
+            assert_eq!(
+                std::fs::read_dir(external.path()).unwrap().count(),
+                1,
+                "cache initialization escaped through {namespace:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn closure_gc_unlinks_reference_symlink_without_touching_external_sentinel() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::TempDir::new().unwrap();
+        ensure_content_dirs(root.path()).unwrap();
+        let external = tempfile::TempDir::new().unwrap();
+        let sentinel = external.path().join("sentinel.json");
+        std::fs::write(&sentinel, b"external sentinel").unwrap();
+        let reference = root
+            .path()
+            .join(ARTIFACT_REFERENCE_DIR)
+            .join("1111222233334444.json");
+        symlink(&sentinel, &reference).unwrap();
+
+        assert!(
+            !collect_unreachable_content_objects_at_root(
+                root.path(),
+                &BTreeSet::new(),
+                SystemTime::now(),
+                false,
+            )
+            .unwrap(),
+            "an invalid reference must defer its content sweep",
+        );
+        assert!(!reference.exists());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"external sentinel");
+    }
+
+    #[test]
+    fn content_gc_stamp_replaces_symlink_without_touching_external_sentinel() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::TempDir::new().unwrap();
+        ensure_content_dirs(root.path()).unwrap();
+        let external = tempfile::TempDir::new().unwrap();
+        let sentinel = external.path().join("sentinel");
+        std::fs::write(&sentinel, b"external sentinel").unwrap();
+        let stamp = root.path().join(CONTENT_GC_STAMP);
+        symlink(&sentinel, &stamp).unwrap();
+
+        gc_content_cache_at(root.path(), SystemTime::now(), CONTENT_MAX_AGE).unwrap();
+
+        assert!(std::fs::symlink_metadata(&stamp).unwrap().is_file());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"external sentinel");
+    }
+
+    #[test]
+    fn content_gc_fails_closed_after_pinned_root_path_swap() {
+        use std::os::unix::fs::symlink;
+
+        let base = tempfile::TempDir::new().unwrap();
+        let root = base.path().join("content");
+        let dirs = open_content_cache_dirs(&root).unwrap();
+        let pinned_root = base.path().join("content-pinned");
+        std::fs::rename(&root, &pinned_root).unwrap();
+        let external = tempfile::TempDir::new().unwrap();
+        let sentinel = external.path().join("sentinel");
+        std::fs::write(&sentinel, b"external sentinel").unwrap();
+        symlink(external.path(), &root).unwrap();
+
+        let error = gc_content_cache_in(&dirs, SystemTime::now(), CONTENT_MAX_AGE).unwrap_err();
+
+        assert!(format!("{error:#}").contains("detached or replaced"));
+        assert!(!pinned_root.join(CONTENT_GC_STAMP).exists());
+        assert!(!external.path().join(CONTENT_GC_STAMP).exists());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"external sentinel");
+    }
+
+    #[test]
+    fn reference_publication_fails_closed_after_namespace_path_swap() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let lease = lease_content_namespace_at_root(root.path()).unwrap();
+        let reference_path = root.path().join(ARTIFACT_REFERENCE_DIR);
+        let pinned_reference_path = root.path().join("references-pinned");
+        std::fs::rename(&reference_path, &pinned_reference_path).unwrap();
+        let external = tempfile::TempDir::new().unwrap();
+        let sentinel = external.path().join("sentinel");
+        std::fs::write(&sentinel, b"external sentinel").unwrap();
+        symlink(external.path(), &reference_path).unwrap();
+
+        let record_path = root.path().join("record.json");
+        let identity = 0x1111_2222_3333_4444;
+        let objects = BTreeSet::from([(0x5555_6666_7777_8888, 4096)]);
+        let error = lease
+            .publish_artifact_reference(&record_path, identity, &objects)
+            .unwrap_err();
+
+        let owner = artifact_reference_owner(&record_path, identity);
+        assert!(format!("{error:#}").contains("detached or replaced"));
+        assert!(
+            !pinned_reference_path
+                .join(format!("{owner:016x}.json"))
+                .is_file(),
+            "reference was published into a detached directory",
+        );
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"external sentinel");
+        assert_eq!(std::fs::read_dir(external.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn closure_gc_fails_closed_after_object_namespace_path_swap() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::TempDir::new().unwrap();
+        ensure_content_dirs(root.path()).unwrap();
+        let content_hash = 0x1111_2222_3333_4444;
+        let object_path = content_object_path(root.path(), content_hash);
+        std::fs::write(&object_path, b"unreachable").unwrap();
+        let dirs = open_content_cache_dirs(root.path()).unwrap();
+        let object_namespace = root.path().join(CONTENT_OBJECT_DIR);
+        let pinned_object_namespace = root.path().join("objects-pinned");
+        std::fs::rename(&object_namespace, &pinned_object_namespace).unwrap();
+        let external = tempfile::TempDir::new().unwrap();
+        let sentinel = external.path().join("sentinel");
+        std::fs::write(&sentinel, b"external sentinel").unwrap();
+        symlink(external.path(), &object_namespace).unwrap();
+
+        let error = collect_unreachable_content_objects_in(
+            &dirs,
+            &BTreeSet::new(),
+            SystemTime::now(),
+            false,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("detached or replaced"));
+        assert!(
+            pinned_object_namespace
+                .join(format!("{content_hash:016x}.object"))
+                .exists()
+        );
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"external sentinel");
+        assert_eq!(std::fs::read_dir(external.path()).unwrap().count(), 1);
+    }
+
+    #[test]
     fn cow_mapping_is_private_and_uses_the_content_inode() {
         let root = tempfile::TempDir::new().unwrap();
         let path = root.path().join("object");
@@ -1882,14 +3054,7 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             let (file, identity) = open_pinned_file(&path).unwrap();
             drop(
-                open_or_publish_content_object_at_root_with_policy(
-                    root.path(),
-                    hash,
-                    &file,
-                    identity,
-                    ContentPublicationPolicy::AllowCopyFallback,
-                )
-                .unwrap(),
+                open_or_publish_content_object_at_root(root.path(), hash, &file, identity).unwrap(),
             );
             leases.push(
                 lease_content_object_at_root(root.path(), hash, identity.size)

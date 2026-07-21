@@ -10,10 +10,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::hash::{BuildHasher as _, Hasher as _};
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-const IDENTITY_SCHEMA: u32 = 6;
+const IDENTITY_SCHEMA: u32 = 7;
 const SOURCE_IDENTITY_SCHEMA: u32 = 5;
 const STAMP_SCHEMA: u32 = 1;
 const CARGO_METADATA_PATH: &str = "meta/cargo-metadata.json";
@@ -268,6 +269,22 @@ fn insert_depth_one(
     Ok(())
 }
 
+fn insert_structural_directory(
+    source: &mut ktstr::cache::artifact_tree::ArtifactTreeSource,
+    relative: &Path,
+    path: &Path,
+    what: &str,
+) -> Result<(), String> {
+    let directory = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect {what} {}: {error}", path.display()))?;
+    if !directory.is_dir() || directory.file_type().is_symlink() {
+        return Err(format!("{what} is not a directory: {}", path.display()));
+    }
+    source
+        .insert_directory(relative, directory.permissions().mode() & 0o7777)
+        .map_err(|error| format!("capture {what} {}: {error:#}", path.display()))
+}
+
 fn read_stamps_parallel(binaries: &[(PathBuf, PathBuf)]) -> Result<Vec<CachedBinaryStamp>, String> {
     if binaries.is_empty() {
         return Ok(Vec::new());
@@ -388,6 +405,21 @@ pub(crate) fn capture_source_with_producer_profiles(
     let stamps = serde_json::to_vec(&stamps)
         .map_err(|error| format!("serialize ktstr scheduler/admission metadata: {error}"))?;
     let mut source = ktstr::cache::artifact_tree::ArtifactTreeSource::new();
+    // Nextest canonicalizes both reuse-build remap roots before it reads any
+    // binary metadata. Cargo's separate build-dir support deliberately puts
+    // every executable below `build`, so an otherwise-complete plain build
+    // can leave `target` with no captured descendant at all. Preserve both
+    // structural roots explicitly instead of relying on file materialization
+    // to create their ancestors.
+    insert_structural_directory(
+        &mut source,
+        Path::new("target"),
+        target,
+        "nextest target directory",
+    )?;
+    if build != target {
+        insert_structural_directory(&mut source, build_prefix, build, "nextest build directory")?;
+    }
     for (relative, path) in files {
         source
             .insert_file(&relative, &path)
@@ -2869,6 +2901,46 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         output.stdout
+    }
+
+    #[test]
+    fn separate_build_directory_materializes_empty_target_remap_root() {
+        let _environment = lock_env();
+        let temp = tempfile::tempdir().unwrap();
+        let cache_root = temp.path().join("cache");
+        let _cache = EnvVarGuard::set(ktstr::KTSTR_CACHE_DIR_ENV, &cache_root);
+        let target = temp.path().join("producer-target");
+        let build = temp.path().join("producer-build");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&build).unwrap();
+        let metadata = serde_json::json!({
+            "rust-build-meta": {
+                "target-directory": target,
+                "build-directory": build,
+            },
+            "rust-binaries": {},
+        });
+        let source = capture_source(&serde_json::to_vec(&metadata).unwrap(), b"{}").unwrap();
+        let materialized =
+            ktstr::cache::artifact_tree::ArtifactTreeCache::new(cache_root.join("records"))
+                .load_or_build(
+                    0x5e9a_7a7e,
+                    &cache_root.join("materialized"),
+                    "separate build-dir fixture",
+                    || Ok(true),
+                    || false,
+                    || Ok(source),
+                )
+                .unwrap();
+
+        assert!(
+            materialized.root().join("target").is_dir(),
+            "--target-dir-remap must remain canonicalizable even when the target tree is empty",
+        );
+        assert!(
+            materialized.root().join("build").is_dir(),
+            "--build-dir-remap must retain its structural root independently",
+        );
     }
 
     #[test]

@@ -29,6 +29,46 @@ fn pending_activation_republishes_an_overlapping_watch_observation() {
     );
 }
 
+#[test]
+fn live_pending_head_fences_snapshot_and_probe_without_ex_recovery() {
+    let _prefixes = LockPrefixesGuard::new();
+    let claim = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [1usize],
+        crate::flock::FlockMode::Exclusive,
+        crate::flock::FlockMode::Exclusive,
+    );
+    let _pending = protocol::register_pending_claim_for_tests(claim.clone())
+        .expect("publish a live coordinatorless PENDING head");
+    let ex_before = protocol::registry_ex_acquisition_count_for_tests();
+
+    let snapshot = protocol::registered_claim_snapshot(&claim)
+        .expect("read the live PENDING claim without recovery");
+    assert!(
+        snapshot.conflicts(&claim).expect("pending conflict"),
+        "the PENDING preparation claim must remain visible to snapshot planning",
+    );
+    assert_eq!(
+        protocol::registry_ex_acquisition_count_for_tests(),
+        ex_before,
+        "a live PENDING head must not send aggregate snapshot through EX recovery",
+    );
+
+    let ran = std::cell::Cell::new(false);
+    let outcome = protocol::with_registry_fence(&claim, || {
+        ran.set(true);
+        Ok::<_, anyhow::Error>(())
+    })
+    .expect("fence the live PENDING claim without recovery");
+    assert!(matches!(outcome, protocol::RegistryFence::Fenced));
+    assert!(!ran.get(), "a conflicting fast probe must remain fenced");
+    assert_eq!(
+        protocol::registry_ex_acquisition_count_for_tests(),
+        ex_before,
+        "a live PENDING head must not send the fast fence through EX recovery",
+    );
+}
+
 struct InterruptibleFlockBrokerGuard {
     _serial: std::sync::MutexGuard<'static, ()>,
 }
@@ -2018,7 +2058,7 @@ fn default_exact_is_best_effort_and_shared_fallbacks_overlap() {
         "free admission prefers exact 1:1"
     );
 
-    let exact_peer = crate::vmm::KtstrVm::acquire_default_preferred_run_locks(
+    let fallback_peer = crate::vmm::KtstrVm::acquire_default_preferred_run_locks(
         Some(&host),
         &topo,
         false,
@@ -2026,11 +2066,17 @@ fn default_exact_is_best_effort_and_shared_fallbacks_overlap() {
         None,
         256,
     )
-    .expect("disjoint exact capacity remains preferable");
+    .expect("a second default may share the first exact run's service footprint");
     assert!(
-        exact_peer.pinning_plan.is_some(),
-        "a second default should use the remaining unshared exact CPU",
+        fallback_peer.pinning_plan.is_none(),
+        "the first exact run owns CPU-SH service headroom, so another default must fall back",
     );
+    let mut fallback_mask = fallback_peer
+        .shared_cpu_mask
+        .clone()
+        .expect("fallback retains its admitted CPU set");
+    fallback_mask.sort_unstable();
+    assert_eq!(fallback_mask, vec![0, 1]);
 
     let overlapping = crate::vmm::KtstrVm::acquire_default_preferred_run_locks(
         Some(&host),

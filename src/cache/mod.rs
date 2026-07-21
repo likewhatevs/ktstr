@@ -216,27 +216,15 @@ pub(crate) fn pin_generated_artifact_bytes(
 }
 
 /// Publish an already-pinned file revision into the shared content CAS.
+///
+/// Publication is uniformly FICLONE-only so every snapshot preserves shared
+/// backing extents and private/COW behavior across processes.
 pub fn snapshot_pinned_content_file(
     pinned: PinnedContentFile,
 ) -> anyhow::Result<ContentFileSnapshot> {
-    snapshot_pinned_content_file_with_policy(
-        pinned,
-        content::ContentPublicationPolicy::AllowCopyFallback,
-    )
-}
-
-fn snapshot_pinned_content_file_with_policy(
-    pinned: PinnedContentFile,
-    policy: content::ContentPublicationPolicy,
-) -> anyhow::Result<ContentFileSnapshot> {
     let (source, identity, _) = pinned.into_parts();
     let content_hash = content::cached_file_digest(&source, identity)?;
-    let lease = content::open_or_publish_content_object_lease_with_policy(
-        content_hash,
-        &source,
-        identity,
-        policy,
-    )?;
+    let lease = content::open_or_publish_content_object_lease(content_hash, &source, identity)?;
     Ok(ContentFileSnapshot {
         _source: source,
         lease,
@@ -252,10 +240,7 @@ fn snapshot_pinned_content_file_with_policy(
 pub(crate) fn snapshot_pinned_artifact_file(
     pinned: PinnedContentFile,
 ) -> anyhow::Result<ContentFileSnapshot> {
-    snapshot_pinned_content_file_with_policy(
-        pinned,
-        content::ContentPublicationPolicy::RequireReflink,
-    )
+    snapshot_pinned_content_file(pinned)
 }
 
 impl ContentFileSnapshot {

@@ -801,7 +801,7 @@ fn invoke_nextest(
     if let Some(p) = profile {
         cmd.env(ktstr::KTSTR_SCHEDULER_PROFILE_ENV, p);
     }
-    let status = crate::interrupt::run_status(cmd).context("spawn `cargo nextest run`")?;
+    let status = crate::nextest_process::run_status(cmd).context("spawn `cargo nextest run`")?;
     Ok(status.code().unwrap_or(1))
 }
 

@@ -837,6 +837,21 @@ pub(super) fn exercise_pending_activation_overlap_watch_for_tests() -> Result<(b
     Ok(result)
 }
 
+#[cfg(test)]
+pub(super) fn register_pending_claim_for_tests(claim: ClaimSet) -> Result<Ticket> {
+    match Ticket::register_pending(required_resource_bits(&claim), claim)? {
+        PendingRegistration::Registered(ticket) => Ok(ticket),
+        PendingRegistration::Contended(_) => {
+            anyhow::bail!("isolated pending-claim test unexpectedly contended")
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn registry_ex_acquisition_count_for_tests() -> u64 {
+    REGISTRY_EX_ACQUISITIONS.with(std::cell::Cell::get)
+}
+
 struct FutexSlot {
     _map: MmapMut,
     ptr: *mut AtomicU32,
@@ -8782,10 +8797,11 @@ fn ticket_is_live(slot: u64, ticket: u64) -> Result<bool> {
     }
 }
 
-/// With no elected coordinator, the active head may legitimately be executing
-/// a GRANTED acquisition or a REPLAN callback. That in-flight record is the
-/// authoritative progress owner; treating coordinator==0 as failure convoys
-/// every timeout and conflicting fast probe through the EX recovery path.
+/// With no elected coordinator, the active head may legitimately be preparing
+/// a PENDING run, executing a GRANTED acquisition or REPLAN callback, or
+/// holding its acquired resources. That in-flight record is the authoritative
+/// progress owner; treating coordinator==0 as failure convoys every timeout
+/// and conflicting fast probe through the EX recovery path.
 fn shared_live_inflight_head(header: &[u8], layout: HeaderLayout, next_slot: u64) -> Result<bool> {
     let slot = read_u64(header, H_ACTIVE_HEAD);
     if slot == NONE_SLOT {
@@ -8807,7 +8823,10 @@ fn shared_live_inflight_head(header: &[u8], layout: HeaderLayout, next_slot: u64
     }
     let bytes = &map[range];
     let state = read_u32(bytes, R_STATE);
-    if !matches!(state, STATE_GRANTED | STATE_REPLAN | STATE_HELD) {
+    if !matches!(
+        state,
+        STATE_PENDING | STATE_GRANTED | STATE_REPLAN | STATE_HELD
+    ) {
         return Ok(false);
     }
     let ticket = read_u64(bytes, R_TICKET);

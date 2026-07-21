@@ -1519,7 +1519,11 @@ fn set_or_replace_environment(
 fn stable_cargo_producer_environment(
     environment: &[(OsString, OsString)],
 ) -> Vec<(OsString, OsString)> {
-    let mut environment = environment.to_vec();
+    let mut environment = environment
+        .iter()
+        .filter(|(name, _)| !crate::nextest_process::is_runtime_environment(name))
+        .cloned()
+        .collect::<Vec<_>>();
     set_or_replace_environment(&mut environment, "CARGO_INCREMENTAL", "0");
     environment
 }
@@ -1540,6 +1544,7 @@ fn llvm_cov_build_environment(
         .env("CARGO_LLVM_COV_TARGET_DIR", output_target)
         .env("CARGO_LLVM_COV_BUILD_DIR", output_build);
     apply_command_envs(&mut command, producer_environment);
+    crate::nextest_process::remove_runtime_environment(&mut command);
     let output = crate::interrupt::run_output(command)
         .map_err(|error| format!("run cargo llvm-cov show-env: {error}"))?;
     if !output.status.success() {
@@ -2470,6 +2475,7 @@ fn nextest_binary_list_command(
     command.args(force_nextest_output(build_args, output_target));
     command.args(["--list-type=binaries-only", "--message-format=json"]);
     apply_command_envs(&mut command, producer_environment);
+    crate::nextest_process::remove_runtime_environment(&mut command);
     command
 }
 
@@ -2490,6 +2496,7 @@ fn cargo_metadata_json(
         .current_dir(stable_workspace)
         .env("CARGO_TARGET_DIR", output_target);
     apply_command_envs(&mut command, producer_environment);
+    crate::nextest_process::remove_runtime_environment(&mut command);
     let output = crate::interrupt::run_output(command)
         .map_err(|error| format!("run Cargo metadata for nextest reuse: {error}"))?;
     if !output.status.success() {
@@ -2522,18 +2529,21 @@ fn producer_environment_identity(
     let mut identity = Vec::with_capacity(environment.len());
     for (name, value) in environment {
         let name_text = name.to_string_lossy();
-        if matches!(
-            name_text.as_ref(),
-            ktstr::KTSTR_NO_PERF_MODE_ENV
-                | ktstr::KTSTR_NO_SKIP_MODE_ENV
-                | ktstr::KTSTR_SCHEDULER_PROFILE_ENV
-                | ktstr::KTSTR_ORCHESTRATED_ENV
-                | ktstr::KTSTR_KERNEL_COMMIT_ENV
-                | ktstr::KTSTR_KERNEL_LIST_ENV
-                | ktstr::KTSTR_KERNEL_ENV
-        ) {
+        if crate::nextest_process::is_runtime_environment(name)
+            || matches!(
+                name_text.as_ref(),
+                ktstr::KTSTR_NO_PERF_MODE_ENV
+                    | ktstr::KTSTR_NO_SKIP_MODE_ENV
+                    | ktstr::KTSTR_SCHEDULER_PROFILE_ENV
+                    | ktstr::KTSTR_ORCHESTRATED_ENV
+                    | ktstr::KTSTR_KERNEL_COMMIT_ENV
+                    | ktstr::KTSTR_KERNEL_LIST_ENV
+                    | ktstr::KTSTR_KERNEL_ENV
+            )
+        {
             // These values shape runtime scheduling/listing, not the Cargo
-            // artifact closure. Kernel build identity is represented by the
+            // artifact closure. Nextest coordinates describe only the current
+            // test attempt. Kernel build identity is represented by the
             // selected BTF content above, never by its checkout pathname.
             continue;
         }
@@ -3675,8 +3685,12 @@ fn run_cargo_sub(
     // The shared runner creates a dedicated process group and forwards a
     // caught SIGINT/SIGTERM to it. The outer wrapper keeps the parent alive
     // through cleanup and re-raises afterward.
-    let status = crate::interrupt::run_status(cmd)
-        .map_err(|e| format!("spawn cargo {}: {e}", sub_argv.join(" ")))?;
+    let status = if cargo_sub_uses_nextest(sub_argv, &args) {
+        crate::nextest_process::run_status(cmd)
+    } else {
+        crate::interrupt::run_status(cmd)
+    }
+    .map_err(|e| format!("spawn cargo {}: {e}", sub_argv.join(" ")))?;
     let mut final_success = status.success();
     let mut final_failure = (!status.success()).then(|| {
         format!(
@@ -7692,6 +7706,80 @@ path = "junit.xml"
                 .iter()
                 .any(|entry| entry == "producer-env:CARGO_INCREMENTAL=1"),
             "the inherited incremental setting must not survive normalization",
+        );
+    }
+
+    #[test]
+    fn harness_producer_ignores_and_removes_nextest_retry_coordinates() {
+        let environment = |attempt: &str, slot: &str, test_name: &str, fixture: &str| {
+            vec![
+                (OsString::from("NEXTEST"), OsString::from("1")),
+                (OsString::from("NEXTEST_ATTEMPT"), OsString::from(attempt)),
+                (
+                    OsString::from("NEXTEST_TEST_GLOBAL_SLOT"),
+                    OsString::from(slot),
+                ),
+                (
+                    OsString::from("NEXTEST_TEST_NAME"),
+                    OsString::from(test_name),
+                ),
+                (
+                    OsString::from("SCHEDULER_FIXTURE_MODE"),
+                    OsString::from(fixture),
+                ),
+            ]
+        };
+        let first = environment("1", "3", "ktstr::nested_retry", "semantic-a");
+        let retry = environment("7", "91", "ktstr::nested_retry/retry", "semantic-a");
+        assert_eq!(
+            producer_environment_identity(&retry).unwrap(),
+            producer_environment_identity(&first).unwrap(),
+            "nextest retry coordinates must not split the harness Cargo cache",
+        );
+        assert_ne!(
+            producer_environment_identity(&environment(
+                "7",
+                "91",
+                "ktstr::nested_retry/retry",
+                "semantic-b",
+            ))
+            .unwrap(),
+            producer_environment_identity(&first).unwrap(),
+            "an arbitrary inherited build-script input must still split the harness cache",
+        );
+
+        let command = nextest_binary_list_command(
+            Path::new("/stable/workspace"),
+            Path::new("/stable/output"),
+            &[],
+            false,
+            &retry,
+        );
+        let command_environment = cmd_env_map(&command);
+        for removed in [
+            "NEXTEST",
+            "NEXTEST_ATTEMPT",
+            "NEXTEST_TEST_GLOBAL_SLOT",
+            "NEXTEST_TEST_NAME",
+        ] {
+            assert_eq!(
+                command_environment.get(OsStr::new(removed)),
+                Some(&None),
+                "{removed} must be explicitly absent from the harness Cargo producer",
+            );
+        }
+        assert_eq!(
+            command_environment.get(OsStr::new("SCHEDULER_FIXTURE_MODE")),
+            Some(&Some(OsString::from("semantic-a"))),
+            "arbitrary build-script inputs must remain visible to the harness producer",
+        );
+
+        let stable = stable_cargo_producer_environment(&retry);
+        assert!(
+            stable
+                .iter()
+                .all(|(name, _)| !crate::nextest_process::is_runtime_environment(name)),
+            "normalized producer overlays must not retain nextest runtime coordinates",
         );
     }
 

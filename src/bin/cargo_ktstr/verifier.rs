@@ -1373,6 +1373,9 @@ fn scheduler_identity_not_cancelled(cancelled: &dyn Fn() -> bool) -> Result<(), 
 }
 
 fn scheduler_build_environment_is_nonsemantic(name: &std::ffi::OsStr) -> bool {
+    if crate::nextest_process::is_runtime_environment(name) {
+        return true;
+    }
     let Some(name) = name.to_str() else {
         return false;
     };
@@ -1460,8 +1463,6 @@ fn scheduler_build_environment_is_nonsemantic(name: &std::ffi::OsStr) -> bool {
         "MAKEFLAGS",
         "MFLAGS",
         "NO_COLOR",
-        "NEXTEST",
-        "NEXTEST_RUN_ID",
         "NUM_JOBS",
         "OLDPWD",
         "PAGER",
@@ -1612,11 +1613,10 @@ fn sanitize_scheduler_build_child_environment(command: &mut Command) {
         "KTSTR_VERIFIER_RESULT_DIR",
         "KTSTR_VERIFIER_SCHEDULER",
         "LLVM_PROFILE_FILE",
-        "NEXTEST",
-        "NEXTEST_RUN_ID",
     ] {
         command.env_remove(name);
     }
+    crate::nextest_process::remove_runtime_environment(command);
     for (name, _) in std::env::vars_os() {
         if name
             .to_str()
@@ -2522,7 +2522,7 @@ pub(crate) fn run_verifier(
         if crate::interrupt::INTERRUPTED.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(None);
         }
-        let status = crate::interrupt::run_status(cmd)
+        let status = crate::nextest_process::run_status(cmd)
             .map_err(|e| format!("spawn cargo nextest run: {e}"))?;
 
         // From the records each cell wrote into `result_dir`: print the
@@ -3173,6 +3173,37 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_identity_ignores_nextest_retry_coordinates_but_tracks_build_inputs() {
+        let workspace = Path::new("/runner/work/ktstr");
+        let identity = |attempt: &str, slot: &str, test_name: &str, fixture: &str| {
+            scheduler_build_environment_from(
+                workspace,
+                vec![
+                    ("NEXTEST".into(), "1".into()),
+                    ("NEXTEST_ATTEMPT".into(), attempt.into()),
+                    ("NEXTEST_TEST_GLOBAL_SLOT".into(), slot.into()),
+                    ("NEXTEST_TEST_NAME".into(), test_name.into()),
+                    ("SCHEDULER_FIXTURE_MODE".into(), fixture.into()),
+                ],
+                &|| false,
+            )
+            .expect("scheduler environment identity")
+        };
+
+        let first = identity("1", "3", "ktstr::nested_retry", "semantic-a");
+        let retry = identity("7", "91", "ktstr::nested_retry/retry", "semantic-a");
+        assert_eq!(
+            retry, first,
+            "nextest attempt, slot, and test-name coordinates must not split the Cargo cache",
+        );
+        assert_ne!(
+            identity("7", "91", "ktstr::nested_retry/retry", "semantic-b"),
+            first,
+            "an arbitrary inherited build-script input must still split the Cargo cache",
+        );
+    }
+
+    #[test]
     fn scheduler_build_child_removes_runtime_orchestration_but_keeps_sccache() {
         let mut command = Command::new("cargo");
         command
@@ -3183,6 +3214,10 @@ mod tests {
                 "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER",
             )
             .env("LLVM_PROFILE_FILE", "/tmp/profraw-%p")
+            .env("NEXTEST", "1")
+            .env("NEXTEST_ATTEMPT", "7")
+            .env("NEXTEST_TEST_GLOBAL_SLOT", "41")
+            .env("NEXTEST_TEST_NAME", "ktstr::nested_retry")
             .env("CARGO_INCREMENTAL", "1")
             .env("RUSTC_WRAPPER", "/usr/local/bin/sccache")
             .env("SCHEDULER_FIXTURE_MODE", "semantic");
@@ -3198,6 +3233,10 @@ mod tests {
             "KTSTR_SIDECAR_DIR",
             "KTSTR_ADMISSION_TARGET_ENV_KEY",
             "LLVM_PROFILE_FILE",
+            "NEXTEST",
+            "NEXTEST_ATTEMPT",
+            "NEXTEST_TEST_GLOBAL_SLOT",
+            "NEXTEST_TEST_NAME",
         ] {
             assert_eq!(
                 environment.get(std::ffi::OsStr::new(removed)),

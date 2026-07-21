@@ -3760,6 +3760,19 @@ fn materialize(
     })
 }
 
+struct MaterializationGcGate(std::os::fd::OwnedFd);
+
+impl Drop for MaterializationGcGate {
+    fn drop(&mut self) {
+        // Closing a CLOEXEC descriptor normally releases its flock, but a
+        // concurrent fork can inherit the same open-file description until
+        // exec closes its copy. Explicit LOCK_UN applies to that shared OFD,
+        // so a completed collector cannot leave a transient phantom owner
+        // which makes the next opportunistic pass skip.
+        let _ = super::content::flock_retry(&self.0, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
 /// Remove crash-left private trees without touching a live consumer.
 ///
 /// Every materialization owns an exclusive flock inside its directory. One
@@ -3770,11 +3783,13 @@ fn materialize(
 /// The grace interval closes the tiny create-before-flock window.
 fn gc_stale_materializations(parent: &Path, now: SystemTime) -> Result<()> {
     let lock_path = parent.join(MATERIALIZATION_GC_LOCK);
-    let Some(_collector) = crate::flock::try_flock(&lock_path, crate::flock::FlockMode::Exclusive)
-        .with_context(|| format!("acquire materialization GC gate {}", lock_path.display()))?
+    let Some(collector) =
+        crate::flock::try_flock(&lock_path, crate::flock::FlockMode::Exclusive)
+            .with_context(|| format!("acquire materialization GC gate {}", lock_path.display()))?
     else {
         return Ok(());
     };
+    let _collector = MaterializationGcGate(collector);
     let stamp_path = parent.join(MATERIALIZATION_GC_STAMP);
     let now_nanos = now
         .duration_since(SystemTime::UNIX_EPOCH)

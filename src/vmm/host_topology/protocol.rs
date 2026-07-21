@@ -1323,6 +1323,23 @@ pub(crate) fn exercise_pending_activation_overlap_watch_for_tests() -> Result<(b
 }
 
 #[cfg(test)]
+pub(crate) struct PendingClaimForTests {
+    _ticket: registry::Ticket,
+}
+
+#[cfg(test)]
+pub(crate) fn register_pending_claim_for_tests(claim: ClaimSet) -> Result<PendingClaimForTests> {
+    Ok(PendingClaimForTests {
+        _ticket: registry::register_pending_claim_for_tests(claim)?,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn registry_ex_acquisition_count_for_tests() -> u64 {
+    registry::registry_ex_acquisition_count_for_tests()
+}
+
+#[cfg(test)]
 pub(crate) fn exercise_resource_weighted_backfill_accounting_for_tests() -> (u32, u32, u32, u32) {
     registry::exercise_resource_weighted_backfill_accounting_for_tests()
 }

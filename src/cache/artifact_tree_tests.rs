@@ -62,7 +62,7 @@ fn generated_bytes_are_staged_on_the_content_cas_filesystem() {
     assert_eq!(*mode, 0o444);
     assert_eq!(
         pinned.source().metadata().unwrap().dev(),
-        std::fs::metadata(cache_root.join("objects-v2"))
+        std::fs::metadata(cache_root.join("objects-v3"))
             .unwrap()
             .dev(),
         "strict-FICLONE metadata staging must share the CAS filesystem",
@@ -363,7 +363,7 @@ fn corrupt_record_and_missing_content_object_are_reconstructible_misses() {
         })
         .expect("file object in record");
     let object = cache_root
-        .join("objects-v2")
+        .join("objects-v3")
         .join(format!("{content_hash:016x}.object"));
     std::fs::remove_file(&object).expect("remove content object after leases drop");
     let rebuilt = cache
@@ -477,6 +477,27 @@ fn stale_materialization_gc_observes_cross_process_liveness_lock() {
     )
     .unwrap();
     assert!(!live.exists());
+}
+
+#[test]
+fn materialization_gc_gate_drop_disarms_a_fork_inherited_descriptor() {
+    let temp = tempfile::tempdir().unwrap();
+    let lock_path = temp.path().join(MATERIALIZATION_GC_LOCK);
+    let collector = crate::flock::try_flock(&lock_path, crate::flock::FlockMode::Exclusive)
+        .unwrap()
+        .expect("acquire materialization collector gate");
+    // dup() shares the same open-file description, exactly as a descriptor
+    // inherited across fork before CLOEXEC takes effect at exec.
+    let inherited = rustix::io::fcntl_dupfd_cloexec(&collector, 0)
+        .expect("duplicate materialization collector gate");
+
+    drop(MaterializationGcGate(collector));
+    let successor = crate::flock::try_flock(&lock_path, crate::flock::FlockMode::Exclusive)
+        .unwrap()
+        .expect("explicit unlock must disarm the inherited collector fd");
+
+    drop(successor);
+    drop(inherited);
 }
 
 #[test]
@@ -1501,21 +1522,25 @@ fn stable_installer_contender_drops_closure_before_waiting_for_turn() {
 
     let contender_records = records.clone();
     let contender_stable = stable.clone();
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let (build_started_tx, build_started_rx) = std::sync::mpsc::channel();
     let contender = std::thread::spawn(move || {
-        let result = ArtifactTreeCache::new(contender_records).load_or_build_stable(
-            identity,
-            &contender_stable,
-            "stable-installer-contender",
-            || Ok(true),
-            || false,
-            || {
-                let mut source = ArtifactTreeSource::new();
-                source.insert_immutable_path("source/file", &input)?;
-                Ok(source)
-            },
-        );
-        done_tx.send(result.map(drop)).unwrap();
+        ArtifactTreeCache::new(contender_records)
+            .load_or_build_stable(
+                identity,
+                &contender_stable,
+                "stable-installer-contender",
+                || Ok(true),
+                || false,
+                || {
+                    build_started_tx
+                        .send(())
+                        .expect("report contender build-closure entry");
+                    let mut source = ArtifactTreeSource::new();
+                    source.insert_immutable_path("source/file", &input)?;
+                    Ok(source)
+                },
+            )
+            .map(drop)
     });
 
     let lifecycle_root = records.parent().unwrap();
@@ -1547,16 +1572,18 @@ fn stable_installer_contender_drops_closure_before_waiting_for_turn() {
         std::thread::sleep(Duration::from_millis(10));
     };
     drop(installer);
-    assert!(
-        done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
-        "contender bypassed the deliberately held closure EX"
-    );
+    match build_started_rx.recv_timeout(Duration::from_millis(100)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        Ok(()) => panic!("contender bypassed the deliberately held closure EX"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("stable installer contender exited before build-closure entry")
+        }
+    }
     drop(closure);
-    done_rx
+    build_started_rx
         .recv_timeout(Duration::from_secs(3))
-        .expect("stable installer contender remained blocked")
-        .unwrap();
-    contender.join().unwrap();
+        .expect("stable installer contender remained blocked before build-closure entry");
+    contender.join().unwrap().unwrap();
 }
 
 #[test]
