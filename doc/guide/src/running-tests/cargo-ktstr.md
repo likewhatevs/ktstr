@@ -280,10 +280,15 @@ merge every variant's profraw into a single report.
 
 <a id="profraw-layout"></a>
 
-Managed `cargo ktstr coverage` runs remove their private `*.profraw`
-shards after `cargo llvm-cov report` merges them successfully. A failed
-merge, `--no-report`, or an interrupted run preserves the shards so the
-operator can recover or inspect them. Host-side files from plain
+Managed `cargo ktstr coverage` runs merge producer/build-script shards into
+one cached `*.profdata`; raw producer shards never enter the stable artifact
+tree or content cache. After the tests, ktstr merges that seed with the live
+runtime shards and removes the private raws only after `cargo llvm-cov report`
+succeeds. A failed merge/report or an interrupted report retains the available
+raws and merged profile below the ktstr cache's
+`coverage-profraw-recovery-v1/` directory and prints the exact recovery path.
+`--no-report` keeps cargo-llvm-cov's ordinary user-owned artifact lifecycle.
+Host-side files from plain
 `cargo ktstr test` also remain next to the cargo-ktstr binary (an
 `LLVM_PROFILE_FILE` injection keeps `default.profraw` out of your kernel
 source tree; export `LLVM_PROFILE_FILE` yourself to opt out). To remove

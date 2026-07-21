@@ -14,12 +14,13 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-const IDENTITY_SCHEMA: u32 = 8;
+const IDENTITY_SCHEMA: u32 = 9;
 const SOURCE_IDENTITY_SCHEMA: u32 = 5;
 const STAMP_SCHEMA: u32 = 1;
 const CARGO_METADATA_PATH: &str = "meta/cargo-metadata.json";
 const BINARIES_METADATA_PATH: &str = "meta/binaries-metadata.json";
 const KTSTR_STAMPS_PATH: &str = "meta/ktstr-scheduler-admission.json";
+const COVERAGE_PRODUCER_PROFDATA_PATH: &str = "meta/coverage-producer.profdata";
 const METADATA_MAX_BYTES: usize = 64 << 20;
 
 #[derive(Debug, serde::Deserialize)]
@@ -85,6 +86,12 @@ pub(crate) struct MaterializedNextestArtifacts {
     pub binaries_metadata: PathBuf,
     pub target_directory: PathBuf,
     pub build_directory: PathBuf,
+    /// Producer/build-script coverage compacted before cache publication.
+    ///
+    /// This is deliberately outside `target`: cargo-llvm-cov must not mistake
+    /// it for the final workspace-named profile, and no raw profile is allowed
+    /// into the immutable artifact record or content CAS.
+    pub producer_profdata: Option<PathBuf>,
     pub test_binaries: Vec<PathBuf>,
     pub loader_paths: Vec<PathBuf>,
     pub scheduler_stamps: Vec<CachedBinaryStamp>,
@@ -344,18 +351,19 @@ pub(crate) fn capture_source(
     binaries_metadata: &[u8],
     cargo_metadata: &[u8],
 ) -> Result<ktstr::cache::artifact_tree::ArtifactTreeSource, String> {
-    capture_source_with_producer_profiles(binaries_metadata, cargo_metadata, None)
+    capture_source_with_producer_profdata(binaries_metadata, cargo_metadata, None)
 }
 
-/// Capture a coverage producer's build-script/proc-macro profiles beside the
-/// reusable target closure. cargo-llvm-cov finds raw profiles only in the
-/// immediate target directory, so each private materialization starts with
-/// those profiles directly below `target`; the final nextest run writes there
-/// too before llvm-cov reports.
-pub(crate) fn capture_source_with_producer_profiles(
+/// Capture a coverage producer's already-merged build-script/proc-macro
+/// profile beside the reusable target closure.
+///
+/// Raw producer shards are intentionally excluded. The producer compacts them
+/// before calling this function, so neither the stable Cargo tree nor the
+/// content CAS can retain one raw file per compiler/build-script process.
+pub(crate) fn capture_source_with_producer_profdata(
     binaries_metadata: &[u8],
     cargo_metadata: &[u8],
-    producer_profiles: Option<&Path>,
+    producer_profdata: Option<&Path>,
 ) -> Result<ktstr::cache::artifact_tree::ArtifactTreeSource, String> {
     if binaries_metadata.len() > METADATA_MAX_BYTES || cargo_metadata.len() > METADATA_MAX_BYTES {
         return Err("nextest reuse metadata exceeds the 64 MiB safety limit".to_string());
@@ -448,45 +456,27 @@ pub(crate) fn capture_source_with_producer_profiles(
             &build.join(relative),
         )?;
     }
-    if let Some(producer_profiles) = producer_profiles {
-        let mut entries = std::fs::read_dir(producer_profiles)
-            .map_err(|error| {
-                format!(
-                    "read coverage producer profiles {}: {error}",
-                    producer_profiles.display()
-                )
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                format!(
-                    "read coverage producer profile entry in {}: {error}",
-                    producer_profiles.display()
-                )
-            })?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let path = entry.path();
-            if path.extension() != Some(OsStr::new("profraw")) {
-                continue;
-            }
-            let file_type = entry.file_type().map_err(|error| {
-                format!(
-                    "inspect coverage producer profile {}: {error}",
-                    path.display()
-                )
-            })?;
-            if !file_type.is_file() {
-                continue;
-            }
-            source
-                .insert_file(Path::new("target").join(entry.file_name()), &path)
-                .map_err(|error| {
-                    format!(
-                        "capture coverage producer profile {}: {error:#}",
-                        path.display()
-                    )
-                })?;
+    if let Some(producer_profdata) = producer_profdata {
+        let metadata = std::fs::symlink_metadata(producer_profdata).map_err(|error| {
+            format!(
+                "inspect merged coverage producer profile {}: {error}",
+                producer_profdata.display(),
+            )
+        })?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(format!(
+                "merged coverage producer profile is not a regular file: {}",
+                producer_profdata.display(),
+            ));
         }
+        source
+            .insert_file(COVERAGE_PRODUCER_PROFDATA_PATH, producer_profdata)
+            .map_err(|error| {
+                format!(
+                    "capture merged coverage producer profile {}: {error:#}",
+                    producer_profdata.display(),
+                )
+            })?;
     }
     source
         .insert_bytes(CARGO_METADATA_PATH, cargo_metadata, 0o444)
@@ -519,6 +509,25 @@ pub(crate) fn finish_materialization(
         .map_err(|error| format!("parse materialized nextest metadata: {error}"))?;
     let build_prefix = build_prefix(&metadata);
     let target_directory = tree.root().join("target");
+    let producer_profdata_path = tree.root().join(COVERAGE_PRODUCER_PROFDATA_PATH);
+    let producer_profdata = match std::fs::symlink_metadata(&producer_profdata_path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            Some(producer_profdata_path)
+        }
+        Ok(_) => {
+            return Err(format!(
+                "cached coverage producer profile is not a regular file: {}",
+                producer_profdata_path.display(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(format!(
+                "inspect cached coverage producer profile {}: {error}",
+                producer_profdata_path.display(),
+            ));
+        }
+    };
     let materialized_build_directory = tree.root().join(build_prefix);
     let original_build = build_directory(&metadata);
     let mut test_binaries = metadata
@@ -579,6 +588,7 @@ pub(crate) fn finish_materialization(
         binaries_metadata,
         target_directory,
         build_directory: materialized_build_directory,
+        producer_profdata,
         test_binaries,
         loader_paths,
         scheduler_stamps: stamps.binaries,
@@ -2856,6 +2866,13 @@ pub(crate) fn identity_plan_for_invocation(
         }
         format!("{:016x}", env_hasher.finish())
     };
+    // Keep cache-miss diagnostics actionable without disclosing environment
+    // values. The aggregate digest proves that an environment differs, but it
+    // cannot identify the remaining non-semantic coordinate when otherwise
+    // identical producers run under separate service instances. Per-name
+    // value digests let operators compare those identities safely; the actual
+    // values never enter the diagnostic artifact.
+    let environment_components = environment_diagnostic_components(&environment);
     Ok(IdentityPlan {
         identity,
         components: serde_json::json!({
@@ -2867,9 +2884,26 @@ pub(crate) fn identity_plan_for_invocation(
             "external_packages": external_packages,
             "tool_fingerprints": tool_fingerprint_components,
             "environment_digest": environment_digest,
+            "environment_components": environment_components,
         }),
         source,
     })
+}
+
+fn environment_diagnostic_components(
+    environment: &[(std::ffi::OsString, Vec<u8>)],
+) -> Vec<serde_json::Value> {
+    environment
+        .iter()
+        .map(|(name, value)| {
+            let mut value_hasher = fixed_hasher();
+            hash_bytes(&mut value_hasher, value);
+            serde_json::json!({
+                "name": name.to_string_lossy(),
+                "value_digest": format!("{:016x}", value_hasher.finish()),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2935,6 +2969,31 @@ mod tests {
     }
 
     #[test]
+    fn environment_diagnostics_name_inputs_without_disclosing_values() {
+        let environment = vec![
+            (
+                std::ffi::OsString::from("A_STABLE_INPUT"),
+                b"ordinary-value".to_vec(),
+            ),
+            (
+                std::ffi::OsString::from("Z_SECRET_INPUT"),
+                b"must-never-appear".to_vec(),
+            ),
+        ];
+
+        let components = environment_diagnostic_components(&environment);
+        let rendered = serde_json::to_string(&components).unwrap();
+        assert!(rendered.contains("A_STABLE_INPUT"));
+        assert!(rendered.contains("Z_SECRET_INPUT"));
+        assert!(!rendered.contains("ordinary-value"));
+        assert!(!rendered.contains("must-never-appear"));
+        assert_ne!(
+            components[0]["value_digest"], components[1]["value_digest"],
+            "different values should remain distinguishable by digest",
+        );
+    }
+
+    #[test]
     fn separate_build_directory_materializes_empty_target_remap_root() {
         let _environment = lock_env();
         let temp = tempfile::tempdir().unwrap();
@@ -2975,7 +3034,7 @@ mod tests {
     }
 
     #[test]
-    fn coverage_producer_profiles_materialize_at_the_report_scan_root() {
+    fn coverage_producer_profiles_are_compacted_outside_the_report_scan_root() {
         let _environment = lock_env();
         let temp = tempfile::tempdir().unwrap();
         let cache_root = temp.path().join("cache");
@@ -2985,7 +3044,8 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         std::fs::create_dir_all(&build).unwrap();
         std::fs::write(target.join("producer-%p.profraw"), b"raw-profile").unwrap();
-        std::fs::write(target.join("not-a-profile.profdata"), b"merged-profile").unwrap();
+        let producer_profdata = target.join("producer.profdata");
+        std::fs::write(&producer_profdata, b"merged-profile").unwrap();
         let nested = target.join("nested.profraw");
         std::fs::create_dir(&nested).unwrap();
         std::fs::write(nested.join("hidden.profraw"), b"nested-profile").unwrap();
@@ -2996,10 +3056,10 @@ mod tests {
             },
             "rust-binaries": {},
         });
-        let source = capture_source_with_producer_profiles(
+        let source = capture_source_with_producer_profdata(
             &serde_json::to_vec(&metadata).unwrap(),
             b"{}",
-            Some(&target),
+            Some(&producer_profdata),
         )
         .unwrap();
         let materialized =
@@ -3015,16 +3075,17 @@ mod tests {
                 .unwrap();
         let materialized_target = materialized.root().join("target");
 
-        assert_eq!(
-            std::fs::read(materialized_target.join("producer-%p.profraw")).unwrap(),
-            b"raw-profile",
-        );
+        assert!(!materialized_target.join("producer-%p.profraw").exists());
         assert!(
             !materialized_target.join("ktstr-profraw").exists(),
-            "profiles must not be hidden below the directory cargo-llvm-cov scans",
+            "raw profiles must not be hidden elsewhere in the cached target",
         );
-        assert!(!materialized_target.join("not-a-profile.profdata").exists());
+        assert!(!materialized_target.join("producer.profdata").exists());
         assert!(!materialized_target.join("nested.profraw").exists());
+        assert_eq!(
+            std::fs::read(materialized.root().join(COVERAGE_PRODUCER_PROFDATA_PATH),).unwrap(),
+            b"merged-profile",
+        );
     }
 
     #[test]

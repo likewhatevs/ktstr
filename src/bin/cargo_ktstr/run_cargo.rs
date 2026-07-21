@@ -2430,6 +2430,8 @@ struct CachedCoverageReport {
     report_dir: PathBuf,
     llvm_cov_flags: OsString,
     profraw_directory: PathBuf,
+    producer_profdata: Option<PathBuf>,
+    merged_profdata: PathBuf,
     no_report: bool,
     ignore_run_fail: bool,
 }
@@ -2450,6 +2452,413 @@ struct ProfrawCleanup {
     removed: usize,
     failures: usize,
     diagnostics: Vec<String>,
+}
+
+/// Raw coverage shards temporarily removed from cargo-llvm-cov's scan root.
+///
+/// cargo-llvm-cov overwrites an existing profdata whenever any `*.profraw`
+/// remains beside it. ktstr therefore merges the cached producer seed and the
+/// live shards itself, then holds the shards here until the report outcome is
+/// known. Success drops the directory; failure detaches it for recovery.
+struct StagedProfraw {
+    directory: Option<tempfile::TempDir>,
+    recovery_parent: PathBuf,
+    count: usize,
+}
+
+impl StagedProfraw {
+    fn discard(mut self) -> Result<(), String> {
+        let Some(directory) = self.directory.take() else {
+            return Ok(());
+        };
+        let path = directory.path().to_path_buf();
+        directory.close().map_err(|error| {
+            format!(
+                "remove successfully reported coverage raw shards under {}: {error}",
+                path.display(),
+            )
+        })
+    }
+
+    fn persist(mut self, merged_profdata: &Path) -> Result<Option<PathBuf>, String> {
+        if self.directory.is_none() && merged_profdata.is_file() {
+            self.directory = Some(create_coverage_recovery_dir(&self.recovery_parent)?);
+        }
+        let Some(directory) = self.directory.take() else {
+            return Ok(None);
+        };
+        if merged_profdata.is_file() {
+            let destination = directory.path().join("merged.profdata");
+            if let Err(error) = std::fs::copy(merged_profdata, &destination) {
+                let retained = directory.keep();
+                return Err(format!(
+                    "preserve merged coverage profile {} -> {}: {error}; raw shards retained at {}",
+                    merged_profdata.display(),
+                    destination.display(),
+                    retained.display(),
+                ));
+            }
+        }
+        Ok(Some(directory.keep()))
+    }
+}
+
+fn coverage_recovery_parent() -> Result<PathBuf, String> {
+    let cache_root = ktstr::cache::cargo_artifact_tree_cache_root()
+        .map_err(|error| format!("resolve coverage recovery cache root: {error:#}"))?;
+    Ok(cache_root.join("coverage-profraw-recovery-v1"))
+}
+
+fn create_coverage_recovery_dir(recovery_parent: &Path) -> Result<tempfile::TempDir, String> {
+    std::fs::create_dir_all(recovery_parent).map_err(|error| {
+        format!(
+            "create coverage recovery directory {}: {error}",
+            recovery_parent.display(),
+        )
+    })?;
+    tempfile::Builder::new()
+        .prefix("report-")
+        .tempdir_in(recovery_parent)
+        .map_err(|error| {
+            format!(
+                "create coverage recovery staging directory in {}: {error}",
+                recovery_parent.display(),
+            )
+        })
+}
+
+fn environment_value<'a>(environment: &'a [(OsString, OsString)], name: &str) -> Option<&'a OsStr> {
+    environment
+        .iter()
+        .rev()
+        .find(|(candidate, _)| candidate == OsStr::new(name))
+        .map(|(_, value)| value.as_os_str())
+}
+
+fn resolve_llvm_profdata(
+    current_dir: &Path,
+    environment: &[(OsString, OsString)],
+) -> Result<PathBuf, String> {
+    if let Some(tool) = environment_value(environment, "LLVM_PROFDATA")
+        .filter(|tool| !tool.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("LLVM_PROFDATA")
+                .filter(|tool| !tool.is_empty())
+                .map(PathBuf::from)
+        })
+    {
+        return Ok(tool);
+    }
+
+    let rustc = environment_value(environment, "RUSTC")
+        .filter(|tool| !tool.is_empty())
+        .map(OsStr::to_os_string)
+        .or_else(|| std::env::var_os("RUSTC").filter(|tool| !tool.is_empty()))
+        .or_else(|| {
+            environment_value(environment, "CARGO_BUILD_RUSTC")
+                .filter(|tool| !tool.is_empty())
+                .map(OsStr::to_os_string)
+        })
+        .or_else(|| std::env::var_os("CARGO_BUILD_RUSTC").filter(|tool| !tool.is_empty()))
+        .unwrap_or_else(|| OsString::from("rustc"));
+    let mut command = Command::new(&rustc);
+    command
+        .args(["--print", "target-libdir"])
+        .current_dir(current_dir);
+    apply_command_envs(&mut command, environment);
+    let output = crate::interrupt::run_output(command)
+        .map_err(|error| format!("resolve llvm-profdata via rustc target-libdir: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "resolve llvm-profdata via {} --print target-libdir failed with {}: {}",
+            rustc.to_string_lossy(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ));
+    }
+    let target_libdir = std::str::from_utf8(&output.stdout)
+        .map_err(|error| format!("rustc target-libdir was not UTF-8: {error}"))?
+        .trim();
+    if target_libdir.is_empty() {
+        return Err("rustc returned an empty target-libdir".to_string());
+    }
+    let tool = llvm_profdata_from_target_libdir(Path::new(target_libdir))?;
+    if !tool.is_file() {
+        return Err(format!(
+            "llvm-profdata is missing at {}; install rustup component llvm-tools-preview or set LLVM_PROFDATA",
+            tool.display(),
+        ));
+    }
+    Ok(tool)
+}
+
+fn llvm_profdata_from_target_libdir(target_libdir: &Path) -> Result<PathBuf, String> {
+    let mut tool = target_libdir.to_path_buf();
+    if !tool.pop() {
+        return Err(format!(
+            "rustc target-libdir has no parent: {}",
+            target_libdir.display(),
+        ));
+    }
+    tool.push("bin");
+    tool.push("llvm-profdata");
+    Ok(tool)
+}
+
+fn profraw_files(directory: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "read coverage profile directory {}: {error}",
+                directory.display(),
+            ));
+        }
+    };
+    let mut profiles = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("read coverage profile entry: {error}")),
+        };
+        let path = entry.path();
+        if path.extension() != Some(OsStr::new("profraw")) {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "inspect coverage profile {}: {error}",
+                    path.display(),
+                ));
+            }
+        };
+        if !file_type.is_file() {
+            return Err(format!(
+                "coverage profile is not a regular file: {}",
+                path.display(),
+            ));
+        }
+        profiles.push(path);
+    }
+    profiles.sort();
+    Ok(profiles)
+}
+
+fn llvm_profdata_flags(environment: &[(OsString, OsString)]) -> Result<Vec<OsString>, String> {
+    let command_value = |name| {
+        environment_value(environment, name)
+            .map(OsStr::to_os_string)
+            .or_else(|| std::env::var_os(name))
+    };
+    let flags =
+        command_value("LLVM_PROFDATA_FLAGS").or_else(|| command_value("CARGO_LLVM_PROFDATA_FLAGS"));
+    let Some(flags) = flags else {
+        return Ok(Vec::new());
+    };
+    let flags = flags
+        .into_string()
+        .map_err(|_| "LLVM_PROFDATA_FLAGS is not valid UTF-8".to_string())?;
+    Ok(flags
+        .split(' ')
+        .filter(|flag| !flag.trim_start().is_empty())
+        .map(OsString::from)
+        .collect())
+}
+
+fn configure_llvm_profdata_merge(
+    command: &mut Command,
+    input_list: &Path,
+    output: &Path,
+    failure_mode: Option<&str>,
+    flags: impl IntoIterator<Item = OsString>,
+) {
+    command
+        .args(["merge", "-sparse"])
+        .arg("-f")
+        .arg(input_list)
+        .arg("-o")
+        .arg(output);
+    if let Some(failure_mode) = failure_mode {
+        command.arg(format!("-failure-mode={failure_mode}"));
+    }
+    command.args(flags);
+}
+
+fn llvm_cov_failure_mode(report_args: &[String]) -> Option<&str> {
+    let mut index = 0;
+    while index < report_args.len() {
+        let argument = &report_args[index];
+        if argument == "--failure-mode" {
+            return report_args.get(index + 1).map(String::as_str);
+        }
+        if let Some(value) = argument.strip_prefix("--failure-mode=") {
+            return Some(value);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Match cargo-llvm-cov's `Workspace::new` profile lookup exactly: its merged
+/// profile is `<CARGO_LLVM_COV_TARGET_DIR>/<workspace-root-basename>.profdata`.
+fn cargo_llvm_cov_profdata_path(target_directory: &Path, workspace_root: &Path) -> PathBuf {
+    let mut name = workspace_root
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("default"))
+        .to_os_string();
+    name.push(".profdata");
+    target_directory.join(name)
+}
+
+fn merge_profdata(
+    current_dir: &Path,
+    environment: &[(OsString, OsString)],
+    inputs: &[PathBuf],
+    output: &Path,
+    failure_mode: Option<&str>,
+) -> Result<(), String> {
+    if inputs.is_empty() {
+        return Err("no coverage profile inputs were produced".to_string());
+    }
+    let parent = output.parent().ok_or_else(|| {
+        format!(
+            "merged coverage profile has no parent directory: {}",
+            output.display(),
+        )
+    })?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "create merged coverage profile directory {}: {error}",
+            parent.display(),
+        )
+    })?;
+    let mut input_list = tempfile::Builder::new()
+        .prefix(".ktstr-profdata-inputs-")
+        .tempfile_in(parent)
+        .map_err(|error| {
+            format!(
+                "create llvm-profdata input list in {}: {error}",
+                parent.display()
+            )
+        })?;
+    for input in inputs {
+        use std::io::Write as _;
+        let input = input.to_str().ok_or_else(|| {
+            format!(
+                "coverage profile path is not valid UTF-8: {}",
+                input.display()
+            )
+        })?;
+        if input.contains(['\n', '\r']) {
+            return Err(format!(
+                "coverage profile path contains a newline: {input:?}"
+            ));
+        }
+        writeln!(input_list.as_file_mut(), "{input}")
+            .map_err(|error| format!("write llvm-profdata input list: {error}"))?;
+    }
+    input_list
+        .as_file_mut()
+        .sync_all()
+        .map_err(|error| format!("flush llvm-profdata input list: {error}"))?;
+    let staged_dir = tempfile::Builder::new()
+        .prefix(".ktstr-profdata-output-")
+        .tempdir_in(parent)
+        .map_err(|error| {
+            format!(
+                "create llvm-profdata output directory in {}: {error}",
+                parent.display()
+            )
+        })?;
+    let staged = staged_dir.path().join("merged.profdata");
+    let tool = resolve_llvm_profdata(current_dir, environment)?;
+    let mut command = Command::new(&tool);
+    configure_llvm_profdata_merge(
+        &mut command,
+        input_list.path(),
+        &staged,
+        failure_mode,
+        llvm_profdata_flags(environment)?,
+    );
+    command.current_dir(current_dir);
+    apply_command_envs(&mut command, environment);
+    let status = crate::interrupt::run_status(command)
+        .map_err(|error| format!("spawn {}: {error}", tool.display()))?;
+    if !status.success() {
+        return Err(format!(
+            "llvm-profdata merge exited with {}",
+            status
+                .code()
+                .map_or("signal".to_string(), |code| code.to_string()),
+        ));
+    }
+    std::fs::rename(&staged, output).map_err(|error| {
+        format!(
+            "publish merged coverage profile {} -> {}: {error}",
+            staged.display(),
+            output.display(),
+        )
+    })?;
+    Ok(())
+}
+
+fn compact_coverage_producer_profiles(
+    current_dir: &Path,
+    environment: &[(OsString, OsString)],
+    profile_directory: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let profiles = profraw_files(profile_directory)?;
+    if profiles.is_empty() {
+        return Ok(None);
+    }
+    let merged = profile_directory.join(".ktstr-coverage-producer.profdata");
+    merge_profdata(current_dir, environment, &profiles, &merged, None)?;
+    Ok(Some(merged))
+}
+
+fn stage_profraw_for_report(directory: &Path) -> Result<StagedProfraw, String> {
+    stage_profraw_for_report_in(directory, coverage_recovery_parent()?)
+}
+
+fn stage_profraw_for_report_in(
+    directory: &Path,
+    recovery_parent: PathBuf,
+) -> Result<StagedProfraw, String> {
+    let profiles = profraw_files(directory)?;
+    if profiles.is_empty() {
+        return Ok(StagedProfraw {
+            directory: None,
+            recovery_parent,
+            count: 0,
+        });
+    }
+    let recovery = create_coverage_recovery_dir(&recovery_parent)?;
+    for profile in &profiles {
+        let name = profile
+            .file_name()
+            .ok_or_else(|| format!("coverage profile has no file name: {}", profile.display()))?;
+        let destination = recovery.path().join(name);
+        if let Err(error) = std::fs::rename(profile, &destination) {
+            let retained = recovery.keep();
+            return Err(format!(
+                "stage coverage profile {} -> {}: {error}; already-staged shards retained at {}",
+                profile.display(),
+                destination.display(),
+                retained.display(),
+            ));
+        }
+    }
+    Ok(StagedProfraw {
+        directory: Some(recovery),
+        recovery_parent,
+        count: profiles.len(),
+    })
 }
 
 impl ProfrawCleanup {
@@ -2815,11 +3224,21 @@ pub(crate) fn load_or_build_nextest_artifacts(
                     ));
                 }
                 if mode == CachedNextestMode::Coverage {
-                    crate::nextest_artifact_cache::capture_source_with_producer_profiles(
+                    let producer_profdata = compact_coverage_producer_profiles(
+                        &stable_invocation_dir,
+                        &environment,
+                        output_target,
+                    )?;
+                    let source = crate::nextest_artifact_cache::capture_source_with_producer_profdata(
                         &build.stdout,
                         &cargo_metadata,
-                        Some(output_target),
-                    )
+                        producer_profdata.as_deref(),
+                    )?;
+                    let cleanup = remove_cached_profraw_shards(output_target);
+                    if let Some(error) = cleanup.failure_message(output_target) {
+                        return Err(error);
+                    }
+                    Ok(source)
                 } else {
                     crate::nextest_artifact_cache::capture_source(&build.stdout, &cargo_metadata)
                 }
@@ -3431,6 +3850,17 @@ fn run_cargo_sub(
         .map(|(name, value)| (OsString::from(*name), value.clone()))
         .collect::<Vec<_>>();
     producer_environment.push((OsString::from("GIT_OPTIONAL_LOCKS"), OsString::from("0")));
+    if sub_argv != TEST_SUB_ARGV {
+        for name in [
+            "LLVM_PROFDATA",
+            "LLVM_PROFDATA_FLAGS",
+            "CARGO_LLVM_PROFDATA_FLAGS",
+        ] {
+            if let Some(value) = std::env::var_os(name) {
+                producer_environment.push((OsString::from(name), value));
+            }
+        }
+    }
     cmd.env("GIT_OPTIONAL_LOCKS", "0");
     if sub_argv == TEST_SUB_ARGV
         && let Some(pattern) = profraw_inject
@@ -3743,6 +4173,11 @@ fn run_cargo_sub(
                     metadata.workspace_root.as_std_path(),
                 )?,
                 profraw_directory,
+                producer_profdata: cached.producer_profdata.clone(),
+                merged_profdata: cargo_llvm_cov_profdata_path(
+                    &cached.target_directory,
+                    metadata.workspace_root.as_std_path(),
+                ),
                 no_report: llvm_cov_has_lifecycle_flag(&args, "--no-report"),
                 ignore_run_fail,
             });
@@ -3815,30 +4250,96 @@ fn run_cargo_sub(
         // secondary to an existing nextest failure and must not replace its
         // authoritative signal.
         if !coverage.no_report {
-            let mut report = Command::new("cargo");
-            report
-                .arg("llvm-cov")
-                .args(&coverage.report_args)
-                .current_dir(&coverage.report_dir);
-            apply_command_envs(&mut report, &coverage.environment);
-            report.env("LLVM_COV_FLAGS", &coverage.llvm_cov_flags);
-            let report_failure = match crate::interrupt::run_status(report) {
-                Ok(report_status) if report_status.success() => {
-                    let cleanup = remove_cached_profraw_shards(&coverage.profraw_directory);
-                    tracing::debug!(
-                        removed = cleanup.removed,
-                        directory = %coverage.profraw_directory.display(),
-                        "removed merged cached coverage raw profiles",
-                    );
-                    cleanup.failure_message(&coverage.profraw_directory)
+            let runtime_profraw = profraw_files(&coverage.profraw_directory);
+            let prepared = runtime_profraw.and_then(|runtime_profraw| {
+                let mut inputs = Vec::with_capacity(runtime_profraw.len() + 1);
+                if let Some(producer_profdata) = &coverage.producer_profdata {
+                    inputs.push(producer_profdata.clone());
                 }
-                Ok(report_status) => Some(format!(
-                    "cargo llvm-cov report exited with {}",
-                    report_status
-                        .code()
-                        .map_or("signal".to_string(), |code| code.to_string()),
-                )),
-                Err(error) => Some(format!("spawn cargo llvm-cov report: {error}")),
+                inputs.extend(runtime_profraw);
+                merge_profdata(
+                    &coverage.report_dir,
+                    &coverage.environment,
+                    &inputs,
+                    &coverage.merged_profdata,
+                    llvm_cov_failure_mode(&coverage.report_args),
+                )?;
+                stage_profraw_for_report(&coverage.profraw_directory)
+            });
+            let report_failure = match prepared {
+                Ok(staged) => {
+                    tracing::debug!(
+                        staged = staged.count,
+                        directory = %coverage.profraw_directory.display(),
+                        "merged and staged cached coverage raw profiles",
+                    );
+                    let mut report = Command::new("cargo");
+                    report
+                        .arg("llvm-cov")
+                        .args(&coverage.report_args)
+                        .current_dir(&coverage.report_dir);
+                    apply_command_envs(&mut report, &coverage.environment);
+                    report.env("LLVM_COV_FLAGS", &coverage.llvm_cov_flags);
+                    match crate::interrupt::run_status(report) {
+                        Ok(report_status) if report_status.success() => staged.discard().err(),
+                        Ok(report_status) => {
+                            let recovery = staged.persist(&coverage.merged_profdata);
+                            let recovery = match recovery {
+                                Ok(Some(path)) => format!(
+                                    "; raw shards and merged profile retained at {}",
+                                    path.display(),
+                                ),
+                                Ok(None) => String::new(),
+                                Err(error) => format!(
+                                    "; additionally failed to retain coverage inputs: {error}"
+                                ),
+                            };
+                            Some(format!(
+                                "cargo llvm-cov report exited with {}{recovery}",
+                                report_status
+                                    .code()
+                                    .map_or("signal".to_string(), |code| code.to_string()),
+                            ))
+                        }
+                        Err(error) => {
+                            let recovery = staged.persist(&coverage.merged_profdata);
+                            let recovery = match recovery {
+                                Ok(Some(path)) => format!(
+                                    "; raw shards and merged profile retained at {}",
+                                    path.display(),
+                                ),
+                                Ok(None) => String::new(),
+                                Err(error) => format!(
+                                    "; additionally failed to retain coverage inputs: {error}"
+                                ),
+                            };
+                            Some(format!("spawn cargo llvm-cov report: {error}{recovery}"))
+                        }
+                    }
+                }
+                Err(error) => {
+                    let recovery =
+                        stage_profraw_for_report(&coverage.profraw_directory).and_then(|staged| {
+                            let retained_profile = coverage
+                                .producer_profdata
+                                .as_deref()
+                                .unwrap_or(&coverage.merged_profdata);
+                            staged.persist(retained_profile)
+                        });
+                    let recovery = match recovery {
+                        Ok(Some(path)) => format!(
+                            "; raw shards and available merged profile retained at {}",
+                            path.display(),
+                        ),
+                        Ok(None) => String::new(),
+                        Err(recovery_error) => {
+                            format!(
+                                "; additionally failed to retain coverage inputs: {recovery_error}"
+                            )
+                        }
+                    };
+                    Some(format!("prepare cargo llvm-cov report: {error}{recovery}"))
+                }
             };
             if let Some(report_failure) = report_failure {
                 final_success = false;
@@ -6880,6 +7381,142 @@ path = "junit.xml"
             .expect("cleanup failures are rendered");
         assert!(message.contains("10 failure(s)"));
         assert!(message.contains("6 additional failure(s) omitted"));
+    }
+
+    #[test]
+    fn cached_coverage_stages_raw_shards_until_success() {
+        let root = tempfile::tempdir().expect("coverage staging fixture");
+        let profiles = root.path().join("profiles");
+        let recovery = root.path().join("recovery");
+        std::fs::create_dir(&profiles).unwrap();
+        let raw_a = profiles.join("a.profraw");
+        let raw_b = profiles.join("b.profraw");
+        let merged = profiles.join("workspace.profdata");
+        std::fs::write(&raw_a, b"raw-a").unwrap();
+        std::fs::write(&raw_b, b"raw-b").unwrap();
+        std::fs::write(&merged, b"merged").unwrap();
+
+        let staged = stage_profraw_for_report_in(&profiles, recovery).unwrap();
+        assert_eq!(staged.count, 2);
+        assert!(!raw_a.exists());
+        assert!(!raw_b.exists());
+        let staging_path = staged.directory.as_ref().unwrap().path().to_path_buf();
+        assert_eq!(
+            std::fs::read(staging_path.join("a.profraw")).unwrap(),
+            b"raw-a"
+        );
+        drop(staged);
+
+        assert!(
+            !staging_path.exists(),
+            "successful report drops staged raw data"
+        );
+        assert_eq!(std::fs::read(merged).unwrap(), b"merged");
+    }
+
+    #[test]
+    fn cached_coverage_failure_persists_raw_and_merged_profiles() {
+        let root = tempfile::tempdir().expect("coverage recovery fixture");
+        let profiles = root.path().join("profiles");
+        let recovery = root.path().join("recovery");
+        std::fs::create_dir(&profiles).unwrap();
+        let raw = profiles.join("runtime.profraw");
+        let merged = profiles.join("workspace.profdata");
+        std::fs::write(&raw, b"runtime-raw").unwrap();
+        std::fs::write(&merged, b"merged-profile").unwrap();
+
+        let staged = stage_profraw_for_report_in(&profiles, recovery).unwrap();
+        let retained = staged
+            .persist(&merged)
+            .unwrap()
+            .expect("a failed report retains its inputs");
+
+        assert!(!raw.exists());
+        assert_eq!(
+            std::fs::read(retained.join("runtime.profraw")).unwrap(),
+            b"runtime-raw",
+        );
+        assert_eq!(
+            std::fs::read(retained.join("merged.profdata")).unwrap(),
+            b"merged-profile",
+        );
+    }
+
+    #[test]
+    fn cached_coverage_missing_profile_directory_is_an_empty_input_set() {
+        let root = tempfile::tempdir().expect("coverage deletion fixture");
+        let missing = root.path().join("deleted-materialization");
+        assert!(profraw_files(&missing).unwrap().is_empty());
+        let staged = stage_profraw_for_report_in(&missing, root.path().join("recovery")).unwrap();
+        assert_eq!(staged.count, 0);
+        assert!(staged.directory.is_none());
+    }
+
+    #[test]
+    fn cached_coverage_rejects_non_regular_raw_profile_paths() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("coverage input fixture");
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("actual"), b"raw").unwrap();
+        symlink("actual", target.join("alias.profraw")).unwrap();
+        let error = profraw_files(&target).unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
+    }
+
+    #[test]
+    fn llvm_profdata_path_matches_rustup_llvm_tools_layout() {
+        assert_eq!(
+            llvm_profdata_from_target_libdir(Path::new(
+                "/toolchain/lib/rustlib/x86_64-unknown-linux-gnu/lib",
+            ))
+            .unwrap(),
+            PathBuf::from("/toolchain/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata",),
+        );
+    }
+
+    #[test]
+    fn cached_profdata_name_matches_non_ktstr_workspace_basename() {
+        assert_eq!(
+            cargo_llvm_cov_profdata_path(
+                Path::new("/cache/private-target"),
+                Path::new("/work/checkouts/acme-schedulers"),
+            ),
+            PathBuf::from("/cache/private-target/acme-schedulers.profdata"),
+        );
+    }
+
+    #[test]
+    fn llvm_profdata_merge_argv_and_explicit_flags_are_exact() {
+        let environment = vec![(
+            OsString::from("LLVM_PROFDATA_FLAGS"),
+            OsString::from("-num-threads=4 -debug-info-correlate"),
+        )];
+        let flags = llvm_profdata_flags(&environment).unwrap();
+        let mut command = Command::new("/tool/llvm-profdata");
+        configure_llvm_profdata_merge(
+            &mut command,
+            Path::new("/profiles/inputs"),
+            Path::new("/profiles/merged.profdata"),
+            Some("any"),
+            flags,
+        );
+        assert_eq!(command.get_program(), OsStr::new("/tool/llvm-profdata"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                OsStr::new("merge"),
+                OsStr::new("-sparse"),
+                OsStr::new("-f"),
+                OsStr::new("/profiles/inputs"),
+                OsStr::new("-o"),
+                OsStr::new("/profiles/merged.profdata"),
+                OsStr::new("-failure-mode=any"),
+                OsStr::new("-num-threads=4"),
+                OsStr::new("-debug-info-correlate"),
+            ],
+        );
     }
 
     #[test]
