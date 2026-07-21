@@ -1315,7 +1315,7 @@ impl PendingAdmission {
 
     /// Complete immutable preparation without consuming or weakening the
     /// PENDING ticket. Affinity is restored, while the combined selected-final
-    /// + preparation claim and all physical preparation OFDs remain intact
+    /// and preparation claim and all physical preparation OFDs remain intact
     /// until exact activation replaces them atomically.
     pub(crate) fn finish_preparation(&mut self) -> Result<()> {
         self.ticket
@@ -1549,7 +1549,7 @@ pub(crate) fn register_intent_for_preparation(
                             CoordinatorStep::Prepare {
                                 final_claim: selected,
                                 preparation_claim: claim,
-                                preparation,
+                                preparation: Box::new(preparation),
                             }
                         }
                         super::PreparationProbe::Contended(evidence) => {
@@ -1562,7 +1562,7 @@ pub(crate) fn register_intent_for_preparation(
                     })
                 };
                 return match acquire_as_coordinator(coordinator, &mut step)? {
-                    CoordinatorOutcome::Prepared(pending) => Ok(pending),
+                    CoordinatorOutcome::Prepared(pending) => Ok(*pending),
                     CoordinatorOutcome::Acquired(_) => {
                         unreachable!("intent coordinator published its run claim as HELD")
                     }
@@ -2723,7 +2723,7 @@ pub(in crate::vmm) enum CoordinatorStep<T> {
     Prepare {
         final_claim: ClaimSet,
         preparation_claim: ClaimSet,
-        preparation: super::PreparationPermit,
+        preparation: Box<super::PreparationPermit>,
     },
     /// Still waiting. `claim` is the freshly planned target to publish
     /// before sleeping for the next release event.
@@ -2736,7 +2736,7 @@ pub(in crate::vmm) enum CoordinatorStep<T> {
 /// Outcome of [`acquire_as_coordinator`].
 pub(in crate::vmm) enum CoordinatorOutcome<T> {
     Acquired(Acquired<T>),
-    Prepared(PendingAdmission),
+    Prepared(Box<PendingAdmission>),
     Aborted { reason: String },
 }
 
@@ -3099,10 +3099,10 @@ fn acquire_as_coordinator_impl<T>(
                             drop(held.preparation.take());
                             let pending = pending_admission_from_parts(
                                 coordinator.ticket,
-                                preparation,
+                                *preparation,
                                 pending_claim,
                             )?;
-                            break CoordinatorOutcome::Prepared(pending);
+                            break CoordinatorOutcome::Prepared(Box::new(pending));
                         }
                         registry::FinishPreparationResult::Stale => {
                             drop(preparation);

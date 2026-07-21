@@ -2690,7 +2690,7 @@ fn gc_coverage_recovery_bundles_in(
         )
     })?;
     let Some(_collector) = ktstr::flock::try_flock(
-        &recovery_parent.join(COVERAGE_RECOVERY_GC_LOCK),
+        recovery_parent.join(COVERAGE_RECOVERY_GC_LOCK),
         ktstr::flock::FlockMode::Exclusive,
     )
     .map_err(|error| {
