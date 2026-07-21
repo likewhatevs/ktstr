@@ -3572,9 +3572,9 @@ impl MemoryPermitPool {
 
 /// Capacity held while a test process prepares immutable artifacts. Active
 /// preparation is expressed in the same abstract CPU and memory namespaces as
-/// a running VM. The selected final intent and all preparation resources stay
-/// published and physically held until exact admission replaces the combined
-/// PENDING claim with computed guest demand.
+/// a running VM. The physical preparation resources stay claimed and held,
+/// while the selected final intent remains attached to the same ticket's watch
+/// until exact admission atomically replaces both with computed guest demand.
 pub(super) struct PreparationPermit {
     pub(super) index: usize,
     pub(super) token_permit: usize,

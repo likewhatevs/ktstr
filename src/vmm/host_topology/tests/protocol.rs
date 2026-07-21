@@ -54,10 +54,61 @@ fn sustained_wait_diagnostics_use_a_bounded_cross_process_ring() {
     let newest = diagnostics.path().join("queue-wait-07.txt");
     let rendered = std::fs::read_to_string(&newest).expect("read newest queue diagnostic");
     assert!(rendered.starts_with("bucket=111\n"));
+    assert!(rendered.contains("active_records=70"));
     assert!(rendered.contains("records_rendered=64 records_truncated=true"));
     assert!(rendered.len() <= 128 * 1024 + "\ntruncated_bytes=true\n".len());
 
     drop(pending);
+}
+
+#[test]
+fn sustained_wait_diagnostics_keep_the_largest_live_queue_in_each_bucket() {
+    let _prefixes = LockPrefixesGuard::new();
+    let diagnostics = tempfile::TempDir::new().expect("queue diagnostics tempdir");
+    let bucket = 200;
+    let output = diagnostics.path().join("queue-wait-00.txt");
+    let mut pending = vec![
+        protocol::register_pending_claim_for_tests(protocol::ClaimSet::with_modes(
+            [0usize],
+            std::iter::empty(),
+            crate::flock::FlockMode::Shared,
+            crate::flock::FlockMode::Shared,
+        ))
+        .expect("publish small diagnostic fixture"),
+    ];
+
+    protocol::persist_wait_diagnostic_for_tests(diagnostics.path(), bucket)
+        .expect("persist small queue diagnostic");
+    assert!(
+        std::fs::read_to_string(&output)
+            .expect("read small queue diagnostic")
+            .contains("active_records=1")
+    );
+
+    for llc in 1usize..12 {
+        pending.push(
+            protocol::register_pending_claim_for_tests(protocol::ClaimSet::with_modes(
+                [llc],
+                std::iter::empty(),
+                crate::flock::FlockMode::Shared,
+                crate::flock::FlockMode::Shared,
+            ))
+            .expect("grow diagnostic fixture"),
+        );
+    }
+    protocol::persist_wait_diagnostic_for_tests(diagnostics.path(), bucket)
+        .expect("replace bucket with larger queue diagnostic");
+    let largest = std::fs::read_to_string(&output).expect("read larger queue diagnostic");
+    assert!(largest.contains("active_records=12"));
+
+    pending.truncate(1);
+    protocol::persist_wait_diagnostic_for_tests(diagnostics.path(), bucket)
+        .expect("retain larger queue diagnostic after smaller observation");
+    assert_eq!(
+        std::fs::read_to_string(&output).expect("read retained queue diagnostic"),
+        largest,
+        "a later small fixture must not overwrite the useful large-queue snapshot",
+    );
 }
 
 #[test]

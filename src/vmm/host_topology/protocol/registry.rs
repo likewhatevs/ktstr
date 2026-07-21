@@ -3231,8 +3231,9 @@ pub(super) fn with_aggregate_fence<T>(
 /// Persist one compact, cross-process admission snapshot after a coordinator
 /// has remained active long enough to be interesting. The diagnostics root is
 /// already lifecycle-managed and uploaded by CI. A fixed eight-slot,
-/// thirty-second ring keeps even a permanently wedged host bounded, while a
-/// per-slot flock elects one writer across every ktstr process.
+/// thirty-second ring keeps even a permanently wedged host bounded. A per-slot
+/// flock serializes writers, and the largest live queue observed in each bucket
+/// wins so an isolated protocol fixture cannot hide the production queue.
 pub(super) fn persist_wait_diagnostic_if_enabled() {
     let Some(root) = std::env::var_os("KTSTR_BUILD_DIAGNOSTICS_DIR")
         .filter(|root| !root.is_empty())
@@ -3257,34 +3258,46 @@ pub(super) fn persist_wait_diagnostic(root: &Path, bucket: u64, unix_secs: u64) 
         return Ok(());
     };
     let output_path = root.join(format!("queue-wait-{ring_slot:02}.txt"));
+    let Some(snapshot) = bounded_wait_diagnostic(bucket, unix_secs)? else {
+        return Ok(());
+    };
     let bucket_header = format!("bucket={bucket}");
-    if std::fs::read_to_string(&output_path)
-        .ok()
-        .and_then(|text| text.lines().next().map(str::to_owned))
-        .as_deref()
-        == Some(bucket_header.as_str())
+    if let Ok(existing) = std::fs::read_to_string(&output_path)
+        && existing.lines().next() == Some(bucket_header.as_str())
+        && wait_diagnostic_active_records(&existing).unwrap_or(0) >= snapshot.active_records
     {
         return Ok(());
     }
-    let Some(mut snapshot) = bounded_wait_diagnostic(bucket, unix_secs)? else {
-        return Ok(());
-    };
-    if snapshot.len() > WAIT_DIAGNOSTIC_MAX_BYTES {
-        snapshot.truncate(WAIT_DIAGNOSTIC_MAX_BYTES);
-        snapshot.push_str("\ntruncated_bytes=true\n");
+    let mut rendered = snapshot.rendered;
+    if rendered.len() > WAIT_DIAGNOSTIC_MAX_BYTES {
+        rendered.truncate(WAIT_DIAGNOSTIC_MAX_BYTES);
+        rendered.push_str("\ntruncated_bytes=true\n");
     }
     let temp_path = root.join(format!(
         ".queue-wait-{ring_slot:02}-{}.tmp",
         std::process::id()
     ));
-    std::fs::write(&temp_path, snapshot)
+    std::fs::write(&temp_path, rendered)
         .with_context(|| format!("write queue diagnostic {}", temp_path.display()))?;
     std::fs::rename(&temp_path, &output_path)
         .with_context(|| format!("publish queue diagnostic {}", output_path.display()))?;
     Ok(())
 }
 
-fn bounded_wait_diagnostic(bucket: u64, unix_secs: u64) -> Result<Option<String>> {
+struct WaitDiagnosticSnapshot {
+    rendered: String,
+    active_records: u64,
+}
+
+fn wait_diagnostic_active_records(rendered: &str) -> Option<u64> {
+    rendered.split_ascii_whitespace().find_map(|field| {
+        field
+            .strip_prefix("active_records=")
+            .and_then(|count| count.parse().ok())
+    })
+}
+
+fn bounded_wait_diagnostic(bucket: u64, unix_secs: u64) -> Result<Option<WaitDiagnosticSnapshot>> {
     let Some(_registry) = try_lock_registry_existing_nonblocking(FlockMode::Shared)? else {
         return Ok(None);
     };
@@ -3299,76 +3312,98 @@ fn bounded_wait_diagnostic(bucket: u64, unix_secs: u64) -> Result<Option<String>
     drop(header);
     let mut table = Table::open_existing()?;
     if atomic_u64(&table.header, H_AGGREGATE_DIRTY).load(Ordering::SeqCst) != 0 {
-        return Ok(Some(format!(
-            "bucket={bucket}\ncaptured_unix_secs={unix_secs}\nregistry=dirty\n"
-        )));
+        return Ok(Some(WaitDiagnosticSnapshot {
+            rendered: format!(
+                "bucket={bucket}\ncaptured_unix_secs={unix_secs}\n\
+                 registry=dirty active_records=0\n"
+            ),
+            active_records: 0,
+        }));
     }
     let next_slot = table.next_slot()?;
     let mut slot = read_u64(&table.header, H_ACTIVE_HEAD);
     let active_tail = read_u64(&table.header, H_ACTIVE_TAIL);
     let mut visited = 0u64;
     let mut rows = Vec::new();
-    while slot != NONE_SLOT && rows.len() < WAIT_DIAGNOSTIC_MAX_RECORDS {
+    while slot != NONE_SLOT {
         if visited >= next_slot {
-            rows.push("active_list_cycle=true".to_owned());
+            if rows.len() < WAIT_DIAGNOSTIC_MAX_RECORDS {
+                rows.push("active_list_cycle=true".to_owned());
+            }
             break;
         }
-        let Some(record) = table.record(slot)? else {
-            rows.push(format!("slot={slot} record=missing"));
-            break;
+        let next_active = if rows.len() < WAIT_DIAGNOSTIC_MAX_RECORDS {
+            let Some(record) = table.record(slot)? else {
+                rows.push(format!("slot={slot} record=missing"));
+                break;
+            };
+            let state = record_state_name(record.state);
+            let watch_serial = table.max_watch_serial(&record.watch)?;
+            rows.push(format!(
+                "slot={} ticket={} pid={} state={} claim={:?} watch={:?} blocked={:?} \
+                 issue_serial={} watch_serial={} grant_epoch={} replan_epoch={} prefix_epoch={} \
+                 backfill_capacity={} backfill_started_ns={}",
+                record.slot,
+                record.ticket,
+                record.pid,
+                state,
+                record.claim,
+                record.watch,
+                record.blocked_on,
+                record.issue_serial,
+                watch_serial,
+                record.grant_epoch,
+                record.replan_claim_epoch,
+                record.prefix_epoch,
+                record.backfill_capacity,
+                record.backfill_started_ns,
+            ));
+            record.next_active
+        } else {
+            let Some(bytes) = table.record_bytes(slot)? else {
+                break;
+            };
+            if read_u32(bytes, R_STATE) == STATE_FREE {
+                break;
+            }
+            read_u64(bytes, R_NEXT_ACTIVE)
         };
-        let state = record_state_name(record.state);
-        let watch_serial = table.max_watch_serial(&record.watch)?;
-        rows.push(format!(
-            "slot={} ticket={} pid={} state={} claim={:?} watch={:?} blocked={:?} \
-             issue_serial={} watch_serial={} grant_epoch={} replan_epoch={} prefix_epoch={} \
-             backfill_capacity={} backfill_started_ns={}",
-            record.slot,
-            record.ticket,
-            record.pid,
-            state,
-            record.claim,
-            record.watch,
-            record.blocked_on,
-            record.issue_serial,
-            watch_serial,
-            record.grant_epoch,
-            record.replan_claim_epoch,
-            record.prefix_epoch,
-            record.backfill_capacity,
-            record.backfill_started_ns,
-        ));
-        slot = record.next_active;
         visited += 1;
+        slot = next_active;
     }
-    let truncated_records = slot != NONE_SLOT;
+    let active_records = visited;
+    let truncated_records = active_records > rows.len() as u64 || slot != NONE_SLOT;
     let now_ns = monotonic_now_ns()?;
     let last_progress_ns = read_u64(&table.header, H_LAST_PROGRESS_NS);
     let stalled_ns = now_ns.saturating_sub(last_progress_ns);
-    Ok(Some(format!(
-        "bucket={bucket}\ncaptured_unix_secs={unix_secs}\nregistry_version={VERSION} \
+    Ok(Some(WaitDiagnosticSnapshot {
+        rendered: format!(
+            "bucket={bucket}\ncaptured_unix_secs={unix_secs}\nregistry_version={VERSION} \
          coordinator={} coordinator_slot={} coordinator_epoch={} coordinator_heartbeat_ns={} \
          last_progress_ns={} stalled_ns={} generation={} claim_epoch={} min_changed_ticket={} \
          pending_flags={:#x} global_serial={} grant_scans={} next_slot={} active_tail={} \
-         records_rendered={} records_truncated={}\n{}\n",
-        table.coordinator_ticket(),
-        table.coordinator_slot()?,
-        table.coordinator_epoch(),
-        read_u64(&table.header, H_COORDINATOR_HEARTBEAT_NS),
-        last_progress_ns,
-        stalled_ns,
-        table.generation(),
-        table.claim_epoch(),
-        table.min_changed_ticket(),
-        table.pending_flags(),
-        table.global_serial(),
-        read_u64(&table.header, H_GRANT_SCANS),
-        next_slot,
-        active_tail,
-        rows.len(),
-        truncated_records,
-        rows.join("\n"),
-    )))
+         active_records={} records_rendered={} records_truncated={}\n{}\n",
+            table.coordinator_ticket(),
+            table.coordinator_slot()?,
+            table.coordinator_epoch(),
+            read_u64(&table.header, H_COORDINATOR_HEARTBEAT_NS),
+            last_progress_ns,
+            stalled_ns,
+            table.generation(),
+            table.claim_epoch(),
+            table.min_changed_ticket(),
+            table.pending_flags(),
+            table.global_serial(),
+            read_u64(&table.header, H_GRANT_SCANS),
+            next_slot,
+            active_tail,
+            active_records,
+            rows.len(),
+            truncated_records,
+            rows.join("\n"),
+        ),
+        active_records,
+    }))
 }
 
 fn record_state_name(state: u32) -> &'static str {
