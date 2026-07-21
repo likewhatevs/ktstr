@@ -2307,6 +2307,126 @@ fn cached_llvm_cov_report_args(
     out
 }
 
+const PROFRAW_CLEANUP_DIAGNOSTIC_LIMIT: usize = 4;
+const PROFRAW_CLEANUP_DIAGNOSTIC_CHARS: usize = 320;
+
+/// Post-run state needed to finish a cached cargo-llvm-cov invocation.
+///
+/// The test process writes raw counters into the stable cached target, while
+/// the report itself runs from the caller's writable checkout. Keeping the
+/// owned raw directory here makes report/merge and reclamation one ordered
+/// lifecycle instead of leaving failed test runs to accumulate shards.
+struct CachedCoverageReport {
+    report_args: Vec<String>,
+    environment: Vec<(OsString, OsString)>,
+    report_dir: PathBuf,
+    llvm_cov_flags: OsString,
+    profraw_directory: PathBuf,
+    no_report: bool,
+    ignore_run_fail: bool,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct ProfrawCleanup {
+    removed: usize,
+    failures: usize,
+    diagnostics: Vec<String>,
+}
+
+impl ProfrawCleanup {
+    fn record_failure(&mut self, diagnostic: impl AsRef<str>) {
+        self.failures = self.failures.saturating_add(1);
+        if self.diagnostics.len() >= PROFRAW_CLEANUP_DIAGNOSTIC_LIMIT {
+            return;
+        }
+        let diagnostic = diagnostic.as_ref();
+        let mut characters = diagnostic.chars();
+        let mut bounded = characters
+            .by_ref()
+            .take(PROFRAW_CLEANUP_DIAGNOSTIC_CHARS)
+            .map(|character| match character {
+                '\n' | '\r' | '\t' => ' ',
+                character => character,
+            })
+            .collect::<String>();
+        if characters.next().is_some() {
+            bounded.push('…');
+        }
+        self.diagnostics.push(bounded);
+    }
+
+    fn failure_message(&self, directory: &Path) -> Option<String> {
+        if self.failures == 0 {
+            return None;
+        }
+        let omitted = self.failures.saturating_sub(self.diagnostics.len());
+        let detail = if self.diagnostics.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", self.diagnostics.join("; "))
+        };
+        let omitted = if omitted == 0 {
+            String::new()
+        } else {
+            format!("; {omitted} additional failure(s) omitted")
+        };
+        Some(format!(
+            "remove cached coverage .profraw shards under {}: {} failure(s){detail}{omitted}",
+            directory.display(),
+            self.failures,
+        ))
+    }
+}
+
+/// Remove only raw coverage shards after cargo-llvm-cov has successfully
+/// merged them. Missing directories and files are normal: cargo-llvm-cov may
+/// consume them itself, and concurrent cleanup may win the unlink race.
+/// Symlinks, directories, merged profiles, and report output are preserved.
+fn remove_cached_profraw_shards(directory: &Path) -> ProfrawCleanup {
+    let mut cleanup = ProfrawCleanup::default();
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return cleanup,
+        Err(error) => {
+            cleanup.record_failure(format!("read {}: {error}", directory.display()));
+            return cleanup;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                cleanup.record_failure(format!("read directory entry: {error}"));
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension() != Some(OsStr::new("profraw")) {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                cleanup.record_failure(format!("inspect {}: {error}", path.display()));
+                continue;
+            }
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => cleanup.removed = cleanup.removed.saturating_add(1),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                cleanup.record_failure(format!("remove {}: {error}", path.display()));
+            }
+        }
+    }
+    cleanup
+}
+
 fn llvm_cov_flags_with_path_equivalence(
     existing: Option<OsString>,
     stable_workspace: &Path,
@@ -3495,19 +3615,26 @@ fn run_cargo_sub(
                 &producer_environment,
             )?;
             apply_command_envs(&mut cmd, &coverage_environment);
-            cached_coverage_report = Some((
-                cached_llvm_cov_report_args(sub_argv, &args, release, metadata, &invocation_dir),
-                coverage_environment,
-                invocation_dir.clone(),
-                llvm_cov_flags_with_path_equivalence(
+            cached_coverage_report = Some(CachedCoverageReport {
+                report_args: cached_llvm_cov_report_args(
+                    sub_argv,
+                    &args,
+                    release,
+                    metadata,
+                    &invocation_dir,
+                ),
+                environment: coverage_environment,
+                report_dir: invocation_dir.clone(),
+                llvm_cov_flags: llvm_cov_flags_with_path_equivalence(
                     std::env::var_os("LLVM_COV_FLAGS")
                         .or_else(|| std::env::var_os("CARGO_LLVM_COV_FLAGS")),
                     &cached.stable_workspace_root,
                     metadata.workspace_root.as_std_path(),
                 )?,
-                llvm_cov_has_lifecycle_flag(&args, "--no-report"),
+                profraw_directory,
+                no_report: llvm_cov_has_lifecycle_flag(&args, "--no-report"),
                 ignore_run_fail,
-            ));
+            });
         }
         cached.apply_execution_context(&mut cmd)?;
     }
@@ -3559,40 +3686,54 @@ fn run_cargo_sub(
                 .map_or("signal".to_string(), |code| code.to_string()),
         )
     });
-    if let Some((
-        report_args,
-        environment,
-        report_dir,
-        llvm_cov_flags,
-        no_report,
-        ignore_run_fail,
-    )) = &cached_coverage_report
-    {
-        if !status.success() && *ignore_run_fail {
+    if let Some(coverage) = &cached_coverage_report {
+        if !status.success() && coverage.ignore_run_fail {
             eprintln!(
                 "cargo ktstr: coverage test run failed under --ignore-run-fail; generating report"
             );
             final_success = true;
             final_failure = None;
         }
-        if (status.success() || *ignore_run_fail) && !*no_report {
+        // cargo-llvm-cov can merge every shard emitted before a failed test
+        // run stopped. Always perform that merge/report unless the user owns
+        // the raw lifecycle through --no-report. A report failure is
+        // secondary to an existing nextest failure and must not replace its
+        // authoritative signal.
+        if !coverage.no_report {
             let mut report = Command::new("cargo");
             report
                 .arg("llvm-cov")
-                .args(report_args)
-                .current_dir(report_dir);
-            apply_command_envs(&mut report, environment);
-            report.env("LLVM_COV_FLAGS", llvm_cov_flags);
-            let report_status = crate::interrupt::run_status(report)
-                .map_err(|error| format!("spawn cargo llvm-cov report: {error}"))?;
-            if !report_status.success() {
-                final_success = false;
-                final_failure = Some(format!(
+                .args(&coverage.report_args)
+                .current_dir(&coverage.report_dir);
+            apply_command_envs(&mut report, &coverage.environment);
+            report.env("LLVM_COV_FLAGS", &coverage.llvm_cov_flags);
+            let report_failure = match crate::interrupt::run_status(report) {
+                Ok(report_status) if report_status.success() => {
+                    let cleanup = remove_cached_profraw_shards(&coverage.profraw_directory);
+                    tracing::debug!(
+                        removed = cleanup.removed,
+                        directory = %coverage.profraw_directory.display(),
+                        "removed merged cached coverage raw profiles",
+                    );
+                    cleanup.failure_message(&coverage.profraw_directory)
+                }
+                Ok(report_status) => Some(format!(
                     "cargo llvm-cov report exited with {}",
                     report_status
                         .code()
                         .map_or("signal".to_string(), |code| code.to_string()),
-                ));
+                )),
+                Err(error) => Some(format!("spawn cargo llvm-cov report: {error}")),
+            };
+            if let Some(report_failure) = report_failure {
+                final_success = false;
+                if final_failure.is_some() {
+                    eprintln!(
+                        "cargo ktstr: coverage post-run also failed; preserving the original test failure: {report_failure}"
+                    );
+                } else {
+                    final_failure = Some(report_failure);
+                }
             }
         }
     }
@@ -6445,6 +6586,71 @@ path = "junit.xml"
             .unwrap(),
             OsString::from("-show-branches=count --path-equivalence=/cache/source,/work/source"),
         );
+    }
+
+    #[test]
+    fn cached_coverage_cleanup_removes_only_regular_profraw_shards() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("coverage cleanup fixture");
+        let raw_a = root.path().join("ktstr-a.profraw");
+        let raw_b = root.path().join("ktstr-b.profraw");
+        let merged = root.path().join("ktstr.profdata");
+        let report = root.path().join("lcov.info");
+        let named_directory = root.path().join("keep.profraw");
+        let named_symlink = root.path().join("keep-link.profraw");
+        std::fs::write(&raw_a, b"raw-a").expect("write first raw shard");
+        std::fs::write(&raw_b, b"raw-b").expect("write second raw shard");
+        std::fs::write(&merged, b"merged").expect("write merged profile");
+        std::fs::write(&report, b"report").expect("write report");
+        std::fs::create_dir(&named_directory).expect("create profraw-named directory");
+        std::fs::write(named_directory.join("nested.profraw"), b"nested")
+            .expect("write nested raw fixture");
+        symlink("ktstr-a.profraw", &named_symlink).expect("create profraw-named symlink");
+
+        let cleanup = remove_cached_profraw_shards(root.path());
+
+        assert_eq!(cleanup.removed, 2);
+        assert_eq!(cleanup.failures, 0, "{cleanup:?}");
+        assert!(!raw_a.exists());
+        assert!(!raw_b.exists());
+        assert_eq!(std::fs::read(merged).unwrap(), b"merged");
+        assert_eq!(std::fs::read(report).unwrap(), b"report");
+        assert!(named_directory.join("nested.profraw").exists());
+        assert!(
+            std::fs::symlink_metadata(named_symlink)
+                .expect("profraw-named symlink remains")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn cached_coverage_cleanup_tolerates_an_already_deleted_directory() {
+        let root = tempfile::tempdir().expect("coverage cleanup fixture");
+        let deleted = root.path().join("already-deleted");
+        assert_eq!(
+            remove_cached_profraw_shards(&deleted),
+            ProfrawCleanup::default(),
+        );
+    }
+
+    #[test]
+    fn cached_coverage_cleanup_diagnostics_are_count_and_length_bounded() {
+        let mut cleanup = ProfrawCleanup::default();
+        for index in 0..10 {
+            cleanup.record_failure(format!("{index}:{}", "x".repeat(1000)));
+        }
+        assert_eq!(cleanup.failures, 10);
+        assert_eq!(cleanup.diagnostics.len(), PROFRAW_CLEANUP_DIAGNOSTIC_LIMIT,);
+        assert!(cleanup.diagnostics.iter().all(|diagnostic| {
+            diagnostic.chars().count() <= PROFRAW_CLEANUP_DIAGNOSTIC_CHARS + 1
+        }));
+        let message = cleanup
+            .failure_message(Path::new("/cache/profraw"))
+            .expect("cleanup failures are rendered");
+        assert!(message.contains("10 failure(s)"));
+        assert!(message.contains("6 additional failure(s) omitted"));
     }
 
     #[test]
