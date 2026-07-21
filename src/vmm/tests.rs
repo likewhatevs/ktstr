@@ -799,6 +799,42 @@ fn acquire_default_run_locks_uses_shared_pool_when_host_too_small() {
     assert!(rl.default_shared_fallback);
 }
 
+/// Default's preferred CPU-EX probe is best-effort even after the caller has
+/// entered the queue. A shared holder must route the coordinator directly to
+/// the CPU-SH fallback rather than becoming an invalid durable EX marker on
+/// the ticket's deliberately shared watch.
+#[test]
+fn acquire_default_waiting_run_discards_best_effort_ex_contention() {
+    let host = host_topology::HostTopology::new_for_tests(&[(vec![0, 1], 0)]);
+    let topo = Topology::new(1, 1, 1, 1);
+    let _guard = DefaultAdmissionTestGuard::new(vec![0, 1]);
+    let _peer0 = crate::flock::try_flock(
+        host_topology::cpu_lock_path(0),
+        crate::flock::FlockMode::Shared,
+    )
+    .expect("open CPU 0 peer lock")
+    .expect("take CPU 0 shared peer lock");
+    let _peer1 = crate::flock::try_flock(
+        host_topology::cpu_lock_path(1),
+        crate::flock::FlockMode::Shared,
+    )
+    .expect("open CPU 1 peer lock")
+    .expect("take CPU 1 shared peer lock");
+
+    let admitted =
+        KtstrVm::acquire_default_preferred_run_locks(Some(&host), &topo, true, None, None, 256)
+            .expect("shared peers must route queued default admission to its shared fallback");
+
+    assert!(admitted.pinning_plan.is_none());
+    assert!(admitted.default_shared_fallback);
+    let mut mask = admitted
+        .shared_cpu_mask
+        .clone()
+        .expect("shared fallback retains its admitted CPU mask");
+    mask.sort_unstable();
+    assert_eq!(mask, vec![0, 1]);
+}
+
 /// Performance admission must publish every exact whole-LLC placement, not
 /// freeze an all-busy storm onto the builder's first slot. The order is
 /// process-rotated, so compare the set.

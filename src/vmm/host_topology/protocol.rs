@@ -1020,13 +1020,48 @@ impl GrantedProbe {
         candidate: &ClaimSet,
         acquire: impl FnOnce() -> Result<O>,
     ) -> Result<Option<T>> {
+        self.try_acquire_impl(candidate, acquire, true)
+    }
+
+    /// Probe default mode's preferred unshared placement without turning a
+    /// miss into durable queue contention. The published claim deliberately
+    /// remains CPU-SH: a failed CPU-EX probe is only the signal to try the
+    /// shared fallback, not a blocker that the registry must wait to clear.
+    pub(crate) fn try_acquire_default_exact<T, O: IntoProbeOutcome<T>>(
+        &mut self,
+        candidate: &ClaimSet,
+        acquire: impl FnOnce() -> Result<O>,
+    ) -> Result<Option<T>> {
+        anyhow::ensure!(
+            candidate.cpu_mode == ClaimMode::Shared,
+            "default exact probe requires a shared published CPU claim",
+        );
+        anyhow::ensure!(
+            candidate.llc_mode == ClaimMode::Shared,
+            "default exact probe requires a shared published LLC claim",
+        );
+        anyhow::ensure!(
+            candidate.permit_mode == ClaimMode::Exclusive,
+            "default exact probe requires exclusive weighted permits",
+        );
+        self.try_acquire_impl(candidate, acquire, false)
+    }
+
+    fn try_acquire_impl<T, O: IntoProbeOutcome<T>>(
+        &mut self,
+        candidate: &ClaimSet,
+        acquire: impl FnOnce() -> Result<O>,
+        retain_contention: bool,
+    ) -> Result<Option<T>> {
         if !self.acquisition_allowed || !self.allows(candidate) {
             return Ok(None);
         }
         match acquire()?.into_probe_outcome() {
             ProbeOutcome::Acquired(value) => Ok(Some(value)),
             ProbeOutcome::Contended(evidence) => {
-                self.contention = Some(evidence);
+                if retain_contention {
+                    self.contention = Some(evidence);
+                }
                 Ok(None)
             }
             ProbeOutcome::Unavailable => Ok(None),
@@ -1930,7 +1965,7 @@ impl HeldLocks {
         if !self.candidate_ready(claim)? {
             return Ok(None);
         }
-        self.probe_complete_inner(target)
+        self.probe_complete_inner(target, true)
     }
 
     /// Probe default mode's opportunistic exact placement. Its published
@@ -1956,13 +1991,30 @@ impl HeldLocks {
             published_claim.permit_mode == ClaimMode::Exclusive,
             "default exact probe requires exclusive weighted permits",
         );
-        let mut physical_claim = published_claim.clone();
-        physical_claim.cpu_mode = ClaimMode::Exclusive;
-        validate_probe_target(&physical_claim, target)?;
+        // The complete published CPU-SH footprint includes service headroom.
+        // Only mapped vCPUs are transiently probed EX; normalize those modes
+        // to SH solely for exact resource-set/path validation.
+        let mut published_target = target.to_vec();
+        for lock in &mut published_target {
+            if matches!(lock.resource, ResourceKey::Cpu(_)) {
+                anyhow::ensure!(
+                    matches!(lock.mode, FlockMode::Shared | FlockMode::Exclusive),
+                    "default exact probe target has an invalid CPU flock mode",
+                );
+                lock.mode = FlockMode::Shared;
+            }
+        }
+        anyhow::ensure!(
+            target.iter().any(|lock| {
+                matches!(lock.resource, ResourceKey::Cpu(_)) && lock.mode == FlockMode::Exclusive
+            }),
+            "default exact probe requires at least one exclusive mapped vCPU",
+        );
+        validate_probe_target(published_claim, &published_target)?;
         if !self.candidate_ready(published_claim)? {
             return Ok(None);
         }
-        self.probe_complete_inner(target)
+        self.probe_complete_inner(target, false)
     }
 
     fn commit_token(&self) -> Result<registry::CoordinatorCommitToken> {
@@ -1980,10 +2032,14 @@ impl HeldLocks {
         &mut self,
         candidate: &[ResourceLock],
     ) -> Result<Option<Vec<OwnedFd>>> {
-        self.probe_complete_inner(candidate)
+        self.probe_complete_inner(candidate, true)
     }
 
-    fn probe_complete_inner(&mut self, candidate: &[ResourceLock]) -> Result<Option<Vec<OwnedFd>>> {
+    fn probe_complete_inner(
+        &mut self,
+        candidate: &[ResourceLock],
+        retain_contention: bool,
+    ) -> Result<Option<Vec<OwnedFd>>> {
         let mut fresh = Vec::with_capacity(candidate.len());
         let mut reusable = self
             .clone_reusable_permits()?
@@ -2000,11 +2056,14 @@ impl HeldLocks {
                 TryFlockOutcome::Acquired(fd) => fresh.push(fd),
                 TryFlockOutcome::Contended(witness) => {
                     drop(fresh);
-                    self.record_contention(ContentionEvidence {
+                    let evidence = ContentionEvidence {
                         blocker: lock.resource,
                         mode: lock.mode,
                         _witness: witness,
-                    });
+                    };
+                    if retain_contention {
+                        self.record_contention(evidence);
+                    }
                     return Ok(None);
                 }
             }

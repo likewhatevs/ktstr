@@ -873,6 +873,17 @@ struct FlexibleRunCandidate {
     cpu_reservations: Vec<usize>,
 }
 
+/// Default's opportunistic 1:1 placement and the complete cooperative
+/// footprint retained for either outcome. The exact subset is probed CPU-EX,
+/// while the service-headroom remainder is acquired CPU-SH from the outset;
+/// both outcomes publish and retain the same full shared claim.
+struct DefaultRunCandidate {
+    plan: host_topology::PinningPlan,
+    exact_cpus: Vec<usize>,
+    shared_llcs: Vec<usize>,
+    shared_cpus: Vec<usize>,
+}
+
 /// One run's resolved host-thread placement.
 ///
 /// Performance admission may select an equivalent plan other than the
@@ -1953,20 +1964,66 @@ impl KtstrVm {
             Err(error) => return Err(error),
         };
         let start = host_topology::pid_window_offset(std::process::id(), flat.len());
-        let candidates = (0..flat.len())
-            .map(|offset| {
-                let mapped = &flat[(start + offset) % flat.len()];
-                FlexibleRunCandidate {
-                    plan: mapped.plan.clone_unlocked(),
-                    llc_mode: host_topology::LlcLockMode::Shared,
-                    cpu_mode: crate::flock::FlockMode::Shared,
-                    cpu_reservations: mapped.cpu_reservations.clone(),
+        let shared_target =
+            host_topology::no_perf_cpu_budget(allowed.len(), topology.total_cpus() as usize);
+        let cpu_start = host_topology::pid_window_offset(std::process::id(), allowed.len());
+        let mut candidates = Vec::with_capacity(flat.len());
+        for offset in 0..flat.len() {
+            let mapped = &flat[(start + offset) % flat.len()];
+            let mut shared_cpus = mapped.cpu_reservations.clone();
+            shared_cpus.sort_unstable();
+            shared_cpus.dedup();
+
+            // Prefer service headroom in an LLC already used by the mapped
+            // vCPUs, then spill across the remaining allowed CPUs in the same
+            // process-rotated order. CPU-SH on every selected CPU remains the
+            // hard bridge to topology-unavailable performance claimants.
+            for prefer_mapped_llc in [true, false] {
+                for index in 0..allowed.len() {
+                    if shared_cpus.len() == shared_target {
+                        break;
+                    }
+                    let cpu = allowed[(cpu_start + index) % allowed.len()];
+                    if shared_cpus.contains(&cpu) {
+                        continue;
+                    }
+                    let llc = host_topo
+                        .llc_groups
+                        .iter()
+                        .position(|group| group.cpus.contains(&cpu));
+                    let in_mapped_llc =
+                        llc.is_some_and(|llc| mapped.plan.llc_indices.binary_search(&llc).is_ok());
+                    if in_mapped_llc == prefer_mapped_llc {
+                        shared_cpus.push(cpu);
+                    }
                 }
-            })
-            .collect::<Vec<_>>();
+            }
+            anyhow::ensure!(
+                shared_cpus.len() == shared_target,
+                "default shared candidate contains {} CPUs, expected {shared_target}",
+                shared_cpus.len(),
+            );
+            shared_cpus.sort_unstable();
+
+            let mut shared_llcs = mapped.plan.llc_indices.clone();
+            shared_llcs.extend(shared_cpus.iter().filter_map(|cpu| {
+                host_topo
+                    .llc_groups
+                    .iter()
+                    .position(|group| group.cpus.contains(cpu))
+            }));
+            shared_llcs.sort_unstable();
+            shared_llcs.dedup();
+            candidates.push(DefaultRunCandidate {
+                plan: mapped.plan.clone_unlocked(),
+                exact_cpus: mapped.cpu_reservations.clone(),
+                shared_llcs,
+                shared_cpus,
+            });
+        }
         let permit_pool = host_topology::VmPermitPool::new_with_preparation(
             allowed.len(),
-            candidates[0].cpu_reservations.len(),
+            shared_target,
             memory_mib,
             pending.as_ref(),
         )?;
@@ -1980,17 +2037,18 @@ impl KtstrVm {
                     continue;
                 };
                 let claim = host_topology::resource_claim_with_permits(
-                    &candidate.plan.llc_indices,
+                    &candidate.shared_llcs,
                     host_topology::LlcLockMode::Shared,
-                    &candidate.cpu_reservations,
+                    &candidate.shared_cpus,
                     crate::flock::FlockMode::Shared,
                     &permits.all_permits(),
                     permits.admission_class,
                 );
                 match protocol::with_registry_fence(&claim, || {
-                    host_topology::acquire_default_exact_with_permits_granted(
-                        &candidate.plan.llc_indices,
-                        &candidate.cpu_reservations,
+                    host_topology::acquire_default_exact_footprint_with_permits_granted(
+                        &candidate.shared_llcs,
+                        &candidate.shared_cpus,
+                        &candidate.exact_cpus,
                         &permits.all_permits(),
                     )
                 })? {
@@ -2023,12 +2081,12 @@ impl KtstrVm {
         let initial_permits = permit_pool
             .select_registered()?
             .expect("a validated default permit pool can seed admission");
-        let claim_for = |candidate: &FlexibleRunCandidate,
+        let claim_for = |candidate: &DefaultRunCandidate,
                          permits: &host_topology::VmPermitReservation| {
             host_topology::resource_claim_with_permits(
-                &candidate.plan.llc_indices,
+                &candidate.shared_llcs,
                 host_topology::LlcLockMode::Shared,
-                &candidate.cpu_reservations,
+                &candidate.shared_cpus,
                 crate::flock::FlockMode::Shared,
                 &permits.all_permits(),
                 permits.admission_class,
@@ -2039,9 +2097,9 @@ impl KtstrVm {
             .iter()
             .map(|candidate| {
                 host_topology::resource_claim_with_modes(
-                    &candidate.plan.llc_indices,
+                    &candidate.shared_llcs,
                     host_topology::LlcLockMode::Shared,
-                    &candidate.cpu_reservations,
+                    &candidate.shared_cpus,
                     crate::flock::FlockMode::Shared,
                 )
             })
@@ -2058,16 +2116,15 @@ impl KtstrVm {
             // Ordinary watch represents both selection classes.
             protocol::AdmissionClass::Ordinary,
         );
-        let matches_designation = |candidate: &FlexibleRunCandidate, claim: &protocol::ClaimSet| {
+        let matches_designation = |candidate: &DefaultRunCandidate, claim: &protocol::ClaimSet| {
             candidate
-                .plan
-                .llc_indices
+                .shared_llcs
                 .iter()
                 .copied()
                 .collect::<std::collections::BTreeSet<_>>()
                 == claim.llcs
                 && candidate
-                    .cpu_reservations
+                    .shared_cpus
                     .iter()
                     .copied()
                     .collect::<std::collections::BTreeSet<_>>()
@@ -2086,25 +2143,28 @@ impl KtstrVm {
             let reusable_permits = probe.clone_reusable_permits()?;
             let exact = exact_attempts > 0;
             let designated_permits = designated.permits.iter().copied().collect::<Vec<_>>();
-            let result = probe.try_acquire(&designated, || {
-                if exact {
-                    host_topology::acquire_default_exact_with_permits_granted_reusing(
-                        &candidate.plan.llc_indices,
-                        &candidate.cpu_reservations,
+            let result = if exact {
+                probe.try_acquire_default_exact(&designated, || {
+                    host_topology::acquire_default_exact_footprint_with_permits_granted_reusing(
+                        &candidate.shared_llcs,
+                        &candidate.shared_cpus,
+                        &candidate.exact_cpus,
                         &designated_permits,
                         &reusable_permits,
                     )
-                } else {
+                })?
+            } else {
+                probe.try_acquire(&designated, || {
                     host_topology::acquire_resources_with_permits_granted_reusing(
-                        &candidate.plan.llc_indices,
+                        &candidate.shared_llcs,
                         host_topology::LlcLockMode::Shared,
-                        &candidate.cpu_reservations,
+                        &candidate.shared_cpus,
                         crate::flock::FlockMode::Shared,
                         &designated_permits,
                         &reusable_permits,
                     )
-                }
-            })?;
+                })?
+            };
             if let Some(locks) = result {
                 return Ok(Some((index, exact, locks)));
             }
@@ -2143,7 +2203,7 @@ impl KtstrVm {
                     })
                 } else {
                     Ok(Self::build_default_shared_run_locks(
-                        candidates[index].cpu_reservations.clone(),
+                        candidates[index].shared_cpus.clone(),
                         topology.total_cpus() as usize,
                         locks,
                     ))
@@ -2168,13 +2228,12 @@ impl KtstrVm {
                     continue;
                 }
                 designation = claim;
-                let target = protocol::canonical_lock_order_with_permits(
-                    &candidate.plan.llc_indices,
-                    crate::flock::FlockMode::Shared,
-                    &candidate.cpu_reservations,
-                    crate::flock::FlockMode::Exclusive,
+                let target = host_topology::default_exact_footprint_lock_order_with_permits(
+                    &candidate.shared_llcs,
+                    &candidate.shared_cpus,
+                    &candidate.exact_cpus,
                     &designation.permits.iter().copied().collect::<Vec<_>>(),
-                );
+                )?;
                 if let Some(locks) = held.probe_default_exact_if_ready(&designation, &target)? {
                     host_topology::convert_default_exact_locks(&target, &locks)?;
                     return Ok(protocol::CoordinatorStep::Complete {
@@ -2193,9 +2252,9 @@ impl KtstrVm {
                 }
                 designation = claim;
                 let target = protocol::canonical_lock_order_with_permits(
-                    &candidate.plan.llc_indices,
+                    &candidate.shared_llcs,
                     crate::flock::FlockMode::Shared,
-                    &candidate.cpu_reservations,
+                    &candidate.shared_cpus,
                     crate::flock::FlockMode::Shared,
                     &designation.permits.iter().copied().collect::<Vec<_>>(),
                 );
@@ -2230,7 +2289,7 @@ impl KtstrVm {
                     })
                 } else {
                     Ok(Self::build_default_shared_run_locks(
-                        candidates[index].cpu_reservations.clone(),
+                        candidates[index].shared_cpus.clone(),
                         topology.total_cpus() as usize,
                         locks,
                     ))

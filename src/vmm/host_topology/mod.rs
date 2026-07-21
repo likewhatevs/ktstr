@@ -2026,8 +2026,15 @@ fn try_acquire_resources_unfenced_with_permits_reusing(
         cpu_mode,
         permits,
     );
+    try_acquire_lock_target_unfenced_reusing(&target, reusable_permits)
+}
+
+fn try_acquire_lock_target_unfenced_reusing(
+    target: &[protocol::ResourceLock],
+    reusable_permits: &[(usize, std::os::fd::OwnedFd)],
+) -> Result<RawAcquireAll> {
     let mut locks = Vec::with_capacity(target.len());
-    for lock in &target {
+    for lock in target {
         if let protocol::ResourceKey::Permit(permit) = lock.resource
             && let Some((_, fd)) = reusable_permits
                 .iter()
@@ -2106,39 +2113,77 @@ pub(crate) fn acquire_resources_with_permits_granted_reusing(
     )
 }
 
-/// Prove a default placement starts on unshared CPUs, then retain the same
-/// footprint cooperatively. The ready registry designation is already SH, so
-/// no incompatible current-version EX claimant can enter while Linux converts
-/// the CPU flocks from EX to SH.
-pub(crate) fn acquire_default_exact_with_permits_granted(
-    llc_indices: &[usize],
-    cpus: &[usize],
+/// Canonical physical target for default's opportunistic exact probe. The
+/// registry publishes the complete cooperative footprint as LLC-SH/CPU-SH;
+/// only the mapped vCPU subset is transiently probed CPU-EX. Service headroom
+/// is acquired CPU-SH in the same all-or-nothing pass, so the physical fds and
+/// published claim always name the same resource set.
+pub(crate) fn default_exact_footprint_lock_order_with_permits(
+    shared_llcs: &[usize],
+    shared_cpus: &[usize],
+    exact_cpus: &[usize],
     permits: &[usize],
-) -> Result<protocol::ProbeOutcome<Vec<std::os::fd::OwnedFd>>> {
-    acquire_default_exact_with_permits_granted_reusing(llc_indices, cpus, permits, &[])
+) -> Result<Vec<protocol::ResourceLock>> {
+    let shared = shared_cpus
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let exact = exact_cpus
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    anyhow::ensure!(
+        !exact.is_empty(),
+        "default exact probe requires at least one mapped vCPU"
+    );
+    anyhow::ensure!(
+        exact.is_subset(&shared),
+        "default exact CPU subset is outside its shared footprint"
+    );
+    let mut target = protocol::canonical_lock_order_with_permits(
+        shared_llcs,
+        FlockMode::Shared,
+        shared_cpus,
+        FlockMode::Shared,
+        permits,
+    );
+    for lock in &mut target {
+        if matches!(lock.resource, protocol::ResourceKey::Cpu(cpu) if exact.contains(&cpu)) {
+            lock.mode = FlockMode::Exclusive;
+        }
+    }
+    Ok(target)
 }
 
-pub(crate) fn acquire_default_exact_with_permits_granted_reusing(
-    llc_indices: &[usize],
-    cpus: &[usize],
+pub(crate) fn acquire_default_exact_footprint_with_permits_granted(
+    shared_llcs: &[usize],
+    shared_cpus: &[usize],
+    exact_cpus: &[usize],
+    permits: &[usize],
+) -> Result<protocol::ProbeOutcome<Vec<std::os::fd::OwnedFd>>> {
+    acquire_default_exact_footprint_with_permits_granted_reusing(
+        shared_llcs,
+        shared_cpus,
+        exact_cpus,
+        permits,
+        &[],
+    )
+}
+
+pub(crate) fn acquire_default_exact_footprint_with_permits_granted_reusing(
+    shared_llcs: &[usize],
+    shared_cpus: &[usize],
+    exact_cpus: &[usize],
     permits: &[usize],
     reusable_permits: &[(usize, std::os::fd::OwnedFd)],
 ) -> Result<protocol::ProbeOutcome<Vec<std::os::fd::OwnedFd>>> {
-    let target = protocol::canonical_lock_order_with_permits(
-        llc_indices,
-        FlockMode::Shared,
-        cpus,
-        FlockMode::Exclusive,
+    let target = default_exact_footprint_lock_order_with_permits(
+        shared_llcs,
+        shared_cpus,
+        exact_cpus,
         permits,
-    );
-    let locks = match try_acquire_resources_unfenced_with_permits_reusing(
-        llc_indices,
-        LlcLockMode::Shared,
-        cpus,
-        FlockMode::Exclusive,
-        permits,
-        reusable_permits,
-    )? {
+    )?;
+    let locks = match try_acquire_lock_target_unfenced_reusing(&target, reusable_permits)? {
         RawAcquireAll::Acquired(locks) => locks,
         RawAcquireAll::Contended {
             evidence: Some(evidence),
