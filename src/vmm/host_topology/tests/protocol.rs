@@ -72,9 +72,16 @@ fn live_pending_head_fences_snapshot_and_probe_without_ex_recovery() {
 #[test]
 fn completed_preparation_releases_cpu_convoy_but_retains_residency() {
     let _prefixes = LockPrefixesGuard::new();
-    let (pending, ticket, affinity_cpu, cpu_permits, memory_permits, token_permit, residency) =
-        protocol::exercise_preparation_residency_transition_for_tests()
-            .expect("transition active preparation to prepared residency");
+    let protocol::PreparationResidencyTransitionForTests {
+        pending,
+        ticket,
+        affinity_cpu,
+        cpu_permits,
+        memory_permits,
+        token_permit,
+        residency,
+    } = protocol::exercise_preparation_residency_transition_for_tests()
+        .expect("transition active preparation to prepared residency");
 
     assert_eq!(cpu_permits.len(), PREPARATION_CPU_PERMITS);
     assert!(
@@ -2541,7 +2548,7 @@ fn default_hard_perf_contention_is_no_wait_and_cancellable() {
 }
 
 #[test]
-fn interactive_preparation_saturation_is_immediate_resource_contention() {
+fn bare_interactive_preparation_saturation_is_immediate_resource_contention() {
     let _prefixes = LockPrefixesGuard::new();
     let token_locks = preparation_token_range()
         .expect("resolve preparation token namespace")
@@ -2562,7 +2569,7 @@ fn interactive_preparation_saturation_is_immediate_resource_contention() {
     let worker = TestServiceThread::spawn(move || {
         LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
         CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
-        let result = crate::vmm::KtstrVm::register_interactive_pending_admission();
+        let result = crate::vmm::KtstrVm::register_interactive_pending_admission(false);
         LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
         CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
         let observation = match result {
@@ -2603,7 +2610,7 @@ fn interactive_preparation_saturation_is_immediate_resource_contention() {
 }
 
 #[test]
-fn interactive_preparation_does_not_wait_for_registry_writer() {
+fn bare_interactive_preparation_does_not_wait_for_registry_writer() {
     let _prefixes = LockPrefixesGuard::new();
     let registry = protocol::hold_registry_exclusive_for_tests()
         .expect("hold the admission registry writer lock");
@@ -2613,7 +2620,7 @@ fn interactive_preparation_does_not_wait_for_registry_writer() {
     let worker = TestServiceThread::spawn(move || {
         LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
         CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
-        let result = crate::vmm::KtstrVm::register_interactive_pending_admission();
+        let result = crate::vmm::KtstrVm::register_interactive_pending_admission(false);
         LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
         CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
         let _ = result_tx.send(match result {
@@ -2635,6 +2642,65 @@ fn interactive_preparation_does_not_wait_for_registry_writer() {
         observed.expect("interactive registry contention must not wait"),
         "busy registry writer must surface immediate ResourceContention",
     );
+}
+
+#[test]
+fn interactive_exec_preparation_waits_for_capacity_then_acquires() {
+    let _prefixes = LockPrefixesGuard::new();
+    let token_locks = preparation_token_range()
+        .expect("resolve preparation token namespace")
+        .map(|permit| {
+            crate::flock::try_flock(permit_lock_path(permit), crate::flock::FlockMode::Exclusive)
+                .expect("probe preparation token")
+                .expect("hold every preparation token")
+        })
+        .collect::<Vec<_>>();
+    assert!(!token_locks.is_empty());
+
+    let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
+    let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let worker = TestServiceThread::spawn(move || {
+        LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
+        CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
+        let result =
+            crate::vmm::KtstrVm::register_interactive_pending_admission(true).map(|pending| {
+                // Pending admission is intentionally thread-affine. Retire it
+                // on its owner and send only the semantic result to the
+                // observing test thread.
+                drop(pending);
+            });
+        LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        let _ = result_tx.send(result);
+    });
+
+    wait_with_delivered_service("interactive exec parks on preparation capacity", || {
+        let snapshot = worker.service.snapshot();
+        let parked =
+            !snapshot.pending && snapshot.tasks.values().any(|sample| sample.state == b'S');
+        match result_rx.try_recv() {
+            Ok(_) => {
+                anyhow::bail!("interactive exec returned while every preparation token was held")
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                anyhow::bail!("interactive exec worker exited before releasing capacity")
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        Ok(parked.then_some(()))
+    })
+    .expect("observe interactive exec waiting in the kernel");
+
+    drop(token_locks);
+    recv_from_service_thread(
+        &result_rx,
+        "interactive exec acquires released preparation capacity",
+        &worker,
+    )
+    .expect("interactive exec must wake after capacity release")
+    .expect("interactive exec preparation admission");
+    worker.join().expect("interactive exec preparation worker");
 }
 
 #[test]

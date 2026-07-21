@@ -1649,16 +1649,23 @@ impl KtstrVm {
         }
     }
 
-    /// Acquire only immediately available preparation capacity for an
-    /// interactive shell. Generated test cells deliberately wait here, but a
-    /// shell's documented no-wait admission must surface saturation before
-    /// immutable preparation instead of joining the continuous nextest wave.
-    fn register_interactive_pending_admission() -> Result<host_topology::protocol::PendingAdmission>
-    {
-        host_topology::protocol::try_register_pending_admission(
-            host_topology::admission_resource_capacity_hint()?,
-        )?
-        .ok_or_else(|| {
+    /// Acquire preparation capacity for the interactive VMM entry point.
+    ///
+    /// A bare operator shell preserves its no-wait contract and reports a
+    /// saturated preparation pool immediately. `--exec` is an unattended
+    /// one-shot operation, however, and must behave like every other queued
+    /// test invocation: park on the ordinary preparation flocks until capacity
+    /// is released. This distinction is based on the public execution mode,
+    /// not on a test-only environment marker, so nested `cargo ktstr shell
+    /// --exec` calls and production automation use exactly the same path.
+    fn register_interactive_pending_admission(
+        wait_for_capacity: bool,
+    ) -> Result<host_topology::protocol::PendingAdmission> {
+        let capacity = host_topology::admission_resource_capacity_hint()?;
+        if wait_for_capacity {
+            return host_topology::protocol::register_pending_admission(capacity);
+        }
+        host_topology::protocol::try_register_pending_admission(capacity)?.ok_or_else(|| {
             anyhow::Error::new(host_topology::ResourceContention {
                 reason: "CPU/memory preparation admission is busy".into(),
             })
@@ -2718,9 +2725,10 @@ impl KtstrVm {
     /// do not apply to interactive shell sessions.
     pub fn run_interactive(&self) -> Result<Option<i32>> {
         let start = Instant::now();
+        let exec_mode = self.exec_cmd.is_some();
         let pending = match take_pending_exec_handoff(self)? {
             Some(pending) => pending,
-            None => Self::register_interactive_pending_admission()?,
+            None => Self::register_interactive_pending_admission(exec_mode)?,
         };
         // Keep immutable image preparation outside exact admission just as in
         // the non-interactive path.
@@ -2949,9 +2957,6 @@ impl KtstrVm {
         };
         #[cfg(not(target_arch = "x86_64"))]
         let virtio_net = self.init_virtio_net(&vm)?;
-
-        // Non-interactive exec mode (--exec) does not need a TTY.
-        let exec_mode = self.exec_cmd.is_some();
 
         // Pre-flight: verify stdin is a tty, enter raw mode, and create
         // the wakeup pipe before spawning threads. Failing after thread

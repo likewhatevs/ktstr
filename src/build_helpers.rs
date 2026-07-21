@@ -1452,9 +1452,8 @@ mod tests {
         );
         let removals = command
             .get_envs()
-            .filter_map(|(name, value)| {
-                value.is_none().then(|| name.to_string_lossy().into_owned())
-            })
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(
             removals,
@@ -1800,20 +1799,20 @@ mod tests {
                 .map_err(|error| error.to_string())
         };
 
-        ensure_cached_build_blob(&root, &parts, "fixture", "artifact", &build)
+        ensure_cached_build_blob(&root, &parts, "fixture", "artifact", build)
             .expect("initial build");
         std::fs::remove_dir_all(&entry).expect("delete complete cache entry");
-        ensure_cached_build_blob(&root, &parts, "fixture", "artifact", &build)
+        ensure_cached_build_blob(&root, &parts, "fixture", "artifact", build)
             .expect("rebuild deleted entry");
 
         std::fs::remove_file(entry.join(BUILD_BLOB_OUTPUT_SENTINEL))
             .expect("make entry incomplete");
-        ensure_cached_build_blob(&root, &parts, "fixture", "artifact", &build)
+        ensure_cached_build_blob(&root, &parts, "fixture", "artifact", build)
             .expect("rebuild incomplete entry");
 
         std::fs::write(entry.join("artifact"), b"corrupt-content")
             .expect("corrupt cached artifact at same length");
-        ensure_cached_build_blob(&root, &parts, "fixture", "artifact", &build)
+        ensure_cached_build_blob(&root, &parts, "fixture", "artifact", build)
             .expect("rebuild corrupt entry");
         assert_eq!(builds.get(), 4, "each invalid cache state elects a rebuild");
         assert_eq!(
@@ -1844,7 +1843,7 @@ mod tests {
             "artifact",
             &destination,
             &stamp,
-            &build,
+            build,
         )
         .expect("initial build and materialization");
         assert_eq!(builds.get(), 1);
@@ -1863,7 +1862,7 @@ mod tests {
             "artifact",
             &destination,
             &stamp,
-            &build,
+            build,
         )
         .expect("reseed deleted CAS from validated local COW inode");
         assert_eq!(builds.get(), 1, "CAS deletion must not repeat source work");
@@ -1882,7 +1881,7 @@ mod tests {
             "artifact",
             &destination,
             &stamp,
-            &build,
+            build,
         )
         .expect("repair corrupt local output from intact CAS");
         assert_eq!(builds.get(), 1, "local corruption must reuse an intact CAS");
@@ -1899,7 +1898,7 @@ mod tests {
             "artifact",
             &destination,
             &stamp,
-            &build,
+            build,
         )
         .expect("repair corrupt CAS from intact local output");
         assert_eq!(
@@ -1919,7 +1918,7 @@ mod tests {
             "artifact",
             &destination,
             &stamp,
-            &build,
+            build,
         )
         .expect("rebuild after both copies are lost");
         assert_eq!(

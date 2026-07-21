@@ -1417,15 +1417,19 @@ pub(crate) fn register_pending_admission(max_permit_index: usize) -> Result<Pend
 }
 
 #[cfg(test)]
-pub(crate) fn exercise_preparation_residency_transition_for_tests() -> Result<(
-    PendingAdmission,
-    u64,
-    usize,
-    Vec<usize>,
-    Vec<usize>,
-    usize,
-    ClaimSet,
-)> {
+pub(crate) struct PreparationResidencyTransitionForTests {
+    pub(crate) pending: PendingAdmission,
+    pub(crate) ticket: u64,
+    pub(crate) affinity_cpu: usize,
+    pub(crate) cpu_permits: Vec<usize>,
+    pub(crate) memory_permits: Vec<usize>,
+    pub(crate) token_permit: usize,
+    pub(crate) residency: ClaimSet,
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_preparation_residency_transition_for_tests()
+-> Result<PreparationResidencyTransitionForTests> {
     let (preparation, active) = super::acquire_preparation_permit(0)?;
     let affinity_cpu = preparation.affinity_cpu;
     let cpu_permits = preparation.cpu_permits.clone();
@@ -1457,15 +1461,15 @@ pub(crate) fn exercise_preparation_residency_transition_for_tests() -> Result<(
         .as_ref()
         .expect("relaxed test preparation")
         .claim();
-    Ok((
+    Ok(PreparationResidencyTransitionForTests {
         pending,
-        ticket_id,
+        ticket: ticket_id,
         affinity_cpu,
         cpu_permits,
         memory_permits,
         token_permit,
         residency,
-    ))
+    })
 }
 
 #[cfg(test)]
