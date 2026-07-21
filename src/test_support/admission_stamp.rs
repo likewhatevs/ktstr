@@ -16,35 +16,36 @@ use linkme::distributed_slice;
 use super::scheduler_manifest_stamp::ElfStampReader;
 use super::{KtstrTestEntry, Topology};
 
-const ADMISSION_MAGIC: [u8; 8] = *b"KTSTRAD2";
-const ADMISSION_VERSION: u16 = 2;
+const ADMISSION_MAGIC: [u8; 8] = *b"KTSTRAD3";
+const ADMISSION_VERSION: u16 = 3;
 const ADMISSION_KIND_SENTINEL: u16 = 0;
 const ADMISSION_KIND_TEST: u16 = 1;
 const ADMISSION_KIND_PRESET: u16 = 2;
 const ADMISSION_KIND_TEST_KEY: u16 = 3;
 const ADMISSION_KIND_PRESET_KEY: u16 = 4;
 
-const TEST_SECTION: &str = "linkme_KTSTR_ADMISSION_TESTS_V2";
-const PRESET_SECTION: &str = "linkme_KTSTR_ADMISSION_PRESETS_V2";
-const TEST_KEY_SECTION: &str = "linkme_KTSTR_ADMISSION_TEST_KEYS_V2";
-const PRESET_KEY_SECTION: &str = "linkme_KTSTR_ADMISSION_PRESET_KEYS_V2";
+const TEST_SECTION: &str = "linkme_KTSTR_ADMISSION_TESTS_V3";
+const PRESET_SECTION: &str = "linkme_KTSTR_ADMISSION_PRESETS_V3";
+const TEST_KEY_SECTION: &str = "linkme_KTSTR_ADMISSION_TEST_KEYS_V3";
+const PRESET_KEY_SECTION: &str = "linkme_KTSTR_ADMISSION_PRESET_KEYS_V3";
 const LEGACY_TEST_SECTION: &str = "linkme_KTSTR_TESTS";
 
-// KVM's topology surface is capped below 256 vCPUs.  Fixed-width arrays make
-// the stamp self-contained: explicit NUMA and sparse-LLC declarations do not
-// leak the Rust layout of `NumaNode` or depend on nested pointer relocations.
+// Fixed-width component arrays make the stamp self-contained: explicit NUMA
+// and sparse-LLC declarations do not leak the Rust layout of `NumaNode` or
+// depend on nested pointer relocations. The bound applies to component-list
+// lengths, not total vCPUs; wide supported topologies remain representable.
 const MAX_TOPOLOGY_COMPONENTS: usize = 255;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct AdmissionHeaderV2 {
+struct AdmissionHeaderV3 {
     magic: [u8; 8],
     version: u16,
     kind: u16,
     record_size: u32,
 }
 
-impl AdmissionHeaderV2 {
+impl AdmissionHeaderV3 {
     const fn new(kind: u16, record_size: usize) -> Self {
         Self {
             magic: ADMISSION_MAGIC,
@@ -57,15 +58,15 @@ impl AdmissionHeaderV2 {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct AdmissionStrV2 {
+struct AdmissionStrV3 {
     ptr: *const u8,
     len: u64,
 }
 
 // Every emitted pointer refers to an immutable static string.
-unsafe impl Sync for AdmissionStrV2 {}
+unsafe impl Sync for AdmissionStrV3 {}
 
-impl AdmissionStrV2 {
+impl AdmissionStrV3 {
     const fn new(value: &'static str) -> Self {
         Self {
             ptr: value.as_ptr(),
@@ -83,13 +84,13 @@ impl AdmissionStrV2 {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct AdmissionOptionalU32V2 {
+struct AdmissionOptionalU32V3 {
     value: u32,
     present: u8,
     reserved: [u8; 3],
 }
 
-impl AdmissionOptionalU32V2 {
+impl AdmissionOptionalU32V3 {
     const fn new(value: Option<u32>) -> Self {
         match value {
             Some(value) => Self {
@@ -108,7 +109,7 @@ impl AdmissionOptionalU32V2 {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct AdmissionTopologyStampV2 {
+struct AdmissionTopologyStampV3 {
     numa_nodes: u32,
     llcs: u32,
     cores_per_llc: u32,
@@ -122,7 +123,7 @@ struct AdmissionTopologyStampV2 {
     llc_cores: [u32; MAX_TOPOLOGY_COMPONENTS],
 }
 
-impl AdmissionTopologyStampV2 {
+impl AdmissionTopologyStampV3 {
     const fn new(topology: Topology) -> Self {
         let mut node_llcs = [0; MAX_TOPOLOGY_COMPONENTS];
         let (explicit_nodes, node_llcs_len) = match topology.nodes {
@@ -190,60 +191,66 @@ impl AdmissionTopologyStampV2 {
     }
 }
 
-/// Version-2 admission record emitted for every `KtstrTestEntry`.
+/// Version-3 admission record emitted for every `KtstrTestEntry`.
 ///
 /// Public only because proc-macro expansions in downstream crates construct
 /// it.  It is not a source-level extension point.
 #[doc(hidden)]
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct AdmissionTestStampV2 {
-    header: AdmissionHeaderV2,
-    name: AdmissionStrV2,
-    topology: AdmissionTopologyStampV2,
-    cpu_budget: AdmissionOptionalU32V2,
+pub struct AdmissionTestStampV3 {
+    header: AdmissionHeaderV3,
+    name: AdmissionStrV3,
+    topology: AdmissionTopologyStampV3,
+    cpu_budget: AdmissionOptionalU32V3,
+    memory_mib: u32,
     host_only: u8,
     performance_mode: u8,
     no_perf_mode: u8,
     expect_auto_repro: u8,
-    reserved: [u8; 4],
+    wprof: u8,
+    reserved: [u8; 3],
     legacy_entry: *const KtstrTestEntry,
 }
 
-unsafe impl Sync for AdmissionTestStampV2 {}
+unsafe impl Sync for AdmissionTestStampV3 {}
 
-impl AdmissionTestStampV2 {
-    /// Project one const-evaluated test entry into the v2 admission wire shape.
+impl AdmissionTestStampV3 {
+    /// Project one const-evaluated test entry into the v3 admission wire shape.
     #[doc(hidden)]
     pub const fn new(entry: &'static KtstrTestEntry) -> Self {
         Self {
-            header: AdmissionHeaderV2::new(ADMISSION_KIND_TEST, size_of::<AdmissionTestStampV2>()),
-            name: AdmissionStrV2::new(entry.name),
-            topology: AdmissionTopologyStampV2::new(entry.topology),
-            cpu_budget: AdmissionOptionalU32V2::new(entry.cpu_budget),
+            header: AdmissionHeaderV3::new(ADMISSION_KIND_TEST, size_of::<AdmissionTestStampV3>()),
+            name: AdmissionStrV3::new(entry.name),
+            topology: AdmissionTopologyStampV3::new(entry.topology),
+            cpu_budget: AdmissionOptionalU32V3::new(entry.cpu_budget),
+            memory_mib: entry.memory_mib,
             host_only: entry.host_only as u8,
             performance_mode: entry.performance_mode as u8,
             no_perf_mode: entry.no_perf_mode as u8,
             expect_auto_repro: entry.expect_auto_repro as u8,
-            reserved: [0; 4],
+            wprof: entry.wprof as u8,
+            reserved: [0; 3],
             legacy_entry: entry,
         }
     }
 
     const fn sentinel() -> Self {
         Self {
-            header: AdmissionHeaderV2::new(
+            header: AdmissionHeaderV3::new(
                 ADMISSION_KIND_SENTINEL,
-                size_of::<AdmissionTestStampV2>(),
+                size_of::<AdmissionTestStampV3>(),
             ),
-            name: AdmissionStrV2::empty(),
-            topology: AdmissionTopologyStampV2::sentinel(),
-            cpu_budget: AdmissionOptionalU32V2::new(None),
+            name: AdmissionStrV3::empty(),
+            topology: AdmissionTopologyStampV3::sentinel(),
+            cpu_budget: AdmissionOptionalU32V3::new(None),
+            memory_mib: 0,
             host_only: 0,
             performance_mode: 0,
             no_perf_mode: 0,
             expect_auto_repro: 0,
-            reserved: [0; 4],
+            wprof: 0,
+            reserved: [0; 3],
             legacy_entry: std::ptr::null(),
         }
     }
@@ -251,43 +258,48 @@ impl AdmissionTestStampV2 {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct AdmissionPresetStampV2 {
-    header: AdmissionHeaderV2,
-    name: AdmissionStrV2,
-    topology: AdmissionTopologyStampV2,
-    forced_cpu_budget: AdmissionOptionalU32V2,
+struct AdmissionPresetStampV3 {
+    header: AdmissionHeaderV3,
+    name: AdmissionStrV3,
+    topology: AdmissionTopologyStampV3,
+    forced_cpu_budget: AdmissionOptionalU32V3,
     sentinel_expected_count: u32,
-    reserved: [u8; 4],
+    verifier_memory_cap_mib: u32,
 }
 
-unsafe impl Sync for AdmissionPresetStampV2 {}
+unsafe impl Sync for AdmissionPresetStampV3 {}
 
-impl AdmissionPresetStampV2 {
-    const fn new(name: &'static str, topology: Topology, forced_cpu_budget: Option<u32>) -> Self {
+impl AdmissionPresetStampV3 {
+    const fn new(
+        name: &'static str,
+        topology: Topology,
+        forced_cpu_budget: Option<u32>,
+        verifier_memory_cap_mib: u32,
+    ) -> Self {
         Self {
-            header: AdmissionHeaderV2::new(
+            header: AdmissionHeaderV3::new(
                 ADMISSION_KIND_PRESET,
-                size_of::<AdmissionPresetStampV2>(),
+                size_of::<AdmissionPresetStampV3>(),
             ),
-            name: AdmissionStrV2::new(name),
-            topology: AdmissionTopologyStampV2::new(topology),
-            forced_cpu_budget: AdmissionOptionalU32V2::new(forced_cpu_budget),
+            name: AdmissionStrV3::new(name),
+            topology: AdmissionTopologyStampV3::new(topology),
+            forced_cpu_budget: AdmissionOptionalU32V3::new(forced_cpu_budget),
             sentinel_expected_count: 0,
-            reserved: [0; 4],
+            verifier_memory_cap_mib,
         }
     }
 
     const fn sentinel(expected_count: u32) -> Self {
         Self {
-            header: AdmissionHeaderV2::new(
+            header: AdmissionHeaderV3::new(
                 ADMISSION_KIND_SENTINEL,
-                size_of::<AdmissionPresetStampV2>(),
+                size_of::<AdmissionPresetStampV3>(),
             ),
-            name: AdmissionStrV2::empty(),
-            topology: AdmissionTopologyStampV2::sentinel(),
-            forced_cpu_budget: AdmissionOptionalU32V2::new(None),
+            name: AdmissionStrV3::empty(),
+            topology: AdmissionTopologyStampV3::sentinel(),
+            forced_cpu_budget: AdmissionOptionalU32V3::new(None),
             sentinel_expected_count: expected_count,
-            reserved: [0; 4],
+            verifier_memory_cap_mib: 0,
         }
     }
 }
@@ -313,25 +325,25 @@ const fn admission_name_hash(value: &str) -> u64 {
 #[doc(hidden)]
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct AdmissionTestKeyV2 {
-    header: AdmissionHeaderV2,
+pub struct AdmissionTestKeyV3 {
+    header: AdmissionHeaderV3,
     name_hash: u64,
     name_len: u64,
-    record: *const AdmissionTestStampV2,
+    record: *const AdmissionTestStampV3,
 }
 
-unsafe impl Sync for AdmissionTestKeyV2 {}
+unsafe impl Sync for AdmissionTestKeyV3 {}
 
-impl AdmissionTestKeyV2 {
+impl AdmissionTestKeyV3 {
     #[doc(hidden)]
     pub const fn new(
         entry: &'static KtstrTestEntry,
-        record: &'static AdmissionTestStampV2,
+        record: &'static AdmissionTestStampV3,
     ) -> Self {
         Self {
-            header: AdmissionHeaderV2::new(
+            header: AdmissionHeaderV3::new(
                 ADMISSION_KIND_TEST_KEY,
-                size_of::<AdmissionTestKeyV2>(),
+                size_of::<AdmissionTestKeyV3>(),
             ),
             name_hash: admission_name_hash(entry.name),
             name_len: entry.name.len() as u64,
@@ -341,9 +353,9 @@ impl AdmissionTestKeyV2 {
 
     const fn sentinel() -> Self {
         Self {
-            header: AdmissionHeaderV2::new(
+            header: AdmissionHeaderV3::new(
                 ADMISSION_KIND_SENTINEL,
-                size_of::<AdmissionTestKeyV2>(),
+                size_of::<AdmissionTestKeyV3>(),
             ),
             name_hash: 0,
             name_len: 0,
@@ -354,21 +366,21 @@ impl AdmissionTestKeyV2 {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct AdmissionPresetKeyV2 {
-    header: AdmissionHeaderV2,
+struct AdmissionPresetKeyV3 {
+    header: AdmissionHeaderV3,
     name_hash: u64,
     name_len: u64,
-    record: *const AdmissionPresetStampV2,
+    record: *const AdmissionPresetStampV3,
 }
 
-unsafe impl Sync for AdmissionPresetKeyV2 {}
+unsafe impl Sync for AdmissionPresetKeyV3 {}
 
-impl AdmissionPresetKeyV2 {
-    const fn new(name: &'static str, record: &'static AdmissionPresetStampV2) -> Self {
+impl AdmissionPresetKeyV3 {
+    const fn new(name: &'static str, record: &'static AdmissionPresetStampV3) -> Self {
         Self {
-            header: AdmissionHeaderV2::new(
+            header: AdmissionHeaderV3::new(
                 ADMISSION_KIND_PRESET_KEY,
-                size_of::<AdmissionPresetKeyV2>(),
+                size_of::<AdmissionPresetKeyV3>(),
             ),
             name_hash: admission_name_hash(name),
             name_len: name.len() as u64,
@@ -378,9 +390,9 @@ impl AdmissionPresetKeyV2 {
 
     const fn sentinel() -> Self {
         Self {
-            header: AdmissionHeaderV2::new(
+            header: AdmissionHeaderV3::new(
                 ADMISSION_KIND_SENTINEL,
-                size_of::<AdmissionPresetKeyV2>(),
+                size_of::<AdmissionPresetKeyV3>(),
             ),
             name_hash: 0,
             name_len: 0,
@@ -389,51 +401,51 @@ impl AdmissionPresetKeyV2 {
     }
 }
 
-/// Link-retained v2 test-admission records.
+/// Link-retained v3 test-admission records.
 #[doc(hidden)]
 #[distributed_slice]
-pub static KTSTR_ADMISSION_TESTS_V2: [AdmissionTestStampV2];
+pub static KTSTR_ADMISSION_TESTS_V3: [AdmissionTestStampV3];
 
 #[distributed_slice]
-static KTSTR_ADMISSION_PRESETS_V2: [AdmissionPresetStampV2];
+static KTSTR_ADMISSION_PRESETS_V3: [AdmissionPresetStampV3];
 
-/// Compact link-retained lookup keys for v2 test-admission records.
+/// Compact link-retained lookup keys for v3 test-admission records.
 #[doc(hidden)]
 #[distributed_slice]
-pub static KTSTR_ADMISSION_TEST_KEYS_V2: [AdmissionTestKeyV2];
+pub static KTSTR_ADMISSION_TEST_KEYS_V3: [AdmissionTestKeyV3];
 
 #[distributed_slice]
-static KTSTR_ADMISSION_PRESET_KEYS_V2: [AdmissionPresetKeyV2];
+static KTSTR_ADMISSION_PRESET_KEYS_V3: [AdmissionPresetKeyV3];
 
-#[distributed_slice(KTSTR_ADMISSION_TESTS_V2)]
-static KTSTR_ADMISSION_TESTS_V2_SENTINEL: AdmissionTestStampV2 = AdmissionTestStampV2::sentinel();
+#[distributed_slice(KTSTR_ADMISSION_TESTS_V3)]
+static KTSTR_ADMISSION_TESTS_V3_SENTINEL: AdmissionTestStampV3 = AdmissionTestStampV3::sentinel();
 
-#[distributed_slice(KTSTR_ADMISSION_TEST_KEYS_V2)]
-static KTSTR_ADMISSION_TEST_KEYS_V2_SENTINEL: AdmissionTestKeyV2 = AdmissionTestKeyV2::sentinel();
+#[distributed_slice(KTSTR_ADMISSION_TEST_KEYS_V3)]
+static KTSTR_ADMISSION_TEST_KEYS_V3_SENTINEL: AdmissionTestKeyV3 = AdmissionTestKeyV3::sentinel();
 
 #[cfg(target_arch = "aarch64")]
 const CANNED_PRESET_COUNT: u32 = 14;
 #[cfg(not(target_arch = "aarch64"))]
 const CANNED_PRESET_COUNT: u32 = 26;
 
-#[distributed_slice(KTSTR_ADMISSION_PRESETS_V2)]
-static KTSTR_ADMISSION_PRESETS_V2_SENTINEL: AdmissionPresetStampV2 =
-    AdmissionPresetStampV2::sentinel(CANNED_PRESET_COUNT);
+#[distributed_slice(KTSTR_ADMISSION_PRESETS_V3)]
+static KTSTR_ADMISSION_PRESETS_V3_SENTINEL: AdmissionPresetStampV3 =
+    AdmissionPresetStampV3::sentinel(CANNED_PRESET_COUNT);
 
-#[distributed_slice(KTSTR_ADMISSION_PRESET_KEYS_V2)]
-static KTSTR_ADMISSION_PRESET_KEYS_V2_SENTINEL: AdmissionPresetKeyV2 =
-    AdmissionPresetKeyV2::sentinel();
+#[distributed_slice(KTSTR_ADMISSION_PRESET_KEYS_V3)]
+static KTSTR_ADMISSION_PRESET_KEYS_V3_SENTINEL: AdmissionPresetKeyV3 =
+    AdmissionPresetKeyV3::sentinel();
 
 macro_rules! admission_preset {
     (
         $(#[$meta:meta])*
         $static_name:ident, $name:literal,
         $numa_nodes:expr, $llcs:expr, $cores:expr, $threads:expr,
-        $llc_cores:expr, $forced_cpu_budget:expr
+        $llc_cores:expr, $forced_cpu_budget:expr, $verifier_memory_cap_mib:expr
     ) => {
         $(#[$meta])*
-        #[distributed_slice(KTSTR_ADMISSION_PRESETS_V2)]
-        static $static_name: AdmissionPresetStampV2 = AdmissionPresetStampV2::new(
+        #[distributed_slice(KTSTR_ADMISSION_PRESETS_V3)]
+        static $static_name: AdmissionPresetStampV3 = AdmissionPresetStampV3::new(
             $name,
             Topology {
                 numa_nodes: $numa_nodes,
@@ -445,6 +457,7 @@ macro_rules! admission_preset {
                 llc_cores: $llc_cores,
             },
             $forced_cpu_budget,
+            $verifier_memory_cap_mib,
         );
 
         $(#[$meta])*
@@ -452,9 +465,9 @@ macro_rules! admission_preset {
         mod $static_name {
             use super::*;
 
-            #[distributed_slice(KTSTR_ADMISSION_PRESET_KEYS_V2)]
-            static KEY: AdmissionPresetKeyV2 =
-                AdmissionPresetKeyV2::new($name, &super::$static_name);
+            #[distributed_slice(KTSTR_ADMISSION_PRESET_KEYS_V3)]
+            static KEY: AdmissionPresetKeyV3 =
+                AdmissionPresetKeyV3::new($name, &super::$static_name);
         }
     };
 }
@@ -467,7 +480,8 @@ admission_preset!(
     4,
     1,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     PRESET_4C_2L_NOSMT,
@@ -477,7 +491,8 @@ admission_preset!(
     2,
     1,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     PRESET_9C_3L_NOSMT,
@@ -487,7 +502,8 @@ admission_preset!(
     3,
     1,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     PRESET_15C_5L_NOSMT,
@@ -497,7 +513,8 @@ admission_preset!(
     3,
     1,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     PRESET_14C_7L_NOSMT,
@@ -507,7 +524,8 @@ admission_preset!(
     2,
     1,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     #[cfg(not(target_arch = "aarch64"))]
@@ -518,7 +536,8 @@ admission_preset!(
     2,
     2,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     #[cfg(not(target_arch = "aarch64"))]
@@ -529,7 +548,8 @@ admission_preset!(
     2,
     2,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     #[cfg(not(target_arch = "aarch64"))]
@@ -540,7 +560,8 @@ admission_preset!(
     4,
     2,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     #[cfg(not(target_arch = "aarch64"))]
@@ -551,7 +572,8 @@ admission_preset!(
     4,
     2,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     #[cfg(not(target_arch = "aarch64"))]
@@ -562,7 +584,8 @@ admission_preset!(
     16,
     2,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     #[cfg(not(target_arch = "aarch64"))]
@@ -573,7 +596,8 @@ admission_preset!(
     8,
     2,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     #[cfg(not(target_arch = "aarch64"))]
@@ -584,7 +608,8 @@ admission_preset!(
     8,
     2,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     #[cfg(not(target_arch = "aarch64"))]
@@ -595,7 +620,8 @@ admission_preset!(
     9,
     2,
     None,
-    None
+    None,
+    4096
 );
 admission_preset!(
     PRESET_32C_4L_NOSMT,
@@ -605,7 +631,8 @@ admission_preset!(
     8,
     1,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     PRESET_64C_8L_NOSMT,
@@ -615,7 +642,8 @@ admission_preset!(
     8,
     1,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     PRESET_128C_4L_NOSMT,
@@ -625,7 +653,8 @@ admission_preset!(
     32,
     1,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     PRESET_128C_8L_NOSMT,
@@ -635,7 +664,8 @@ admission_preset!(
     16,
     1,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     PRESET_240C_15L_NOSMT,
@@ -645,7 +675,8 @@ admission_preset!(
     16,
     1,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     PRESET_252C_14L_NOSMT,
@@ -655,7 +686,8 @@ admission_preset!(
     18,
     1,
     None,
-    None
+    None,
+    4096
 );
 admission_preset!(
     #[cfg(not(target_arch = "aarch64"))]
@@ -666,7 +698,8 @@ admission_preset!(
     8,
     2,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     PRESET_2N_16C_4L_NOSMT,
@@ -676,7 +709,8 @@ admission_preset!(
     4,
     1,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     #[cfg(not(target_arch = "aarch64"))]
@@ -687,7 +721,8 @@ admission_preset!(
     8,
     2,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     PRESET_2N_128C_8L_NOSMT,
@@ -697,7 +732,8 @@ admission_preset!(
     16,
     1,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     PRESET_4N_32C_8L_NOSMT,
@@ -707,7 +743,8 @@ admission_preset!(
     4,
     1,
     None,
-    None
+    None,
+    2048
 );
 admission_preset!(
     #[cfg(not(target_arch = "aarch64"))]
@@ -718,7 +755,8 @@ admission_preset!(
     8,
     2,
     None,
-    None
+    None,
+    4096
 );
 
 #[cfg(not(target_arch = "aarch64"))]
@@ -732,7 +770,8 @@ admission_preset!(
     9,
     2,
     Some(&UNEVEN_11LLC_CORES),
-    Some(96)
+    Some(96),
+    4096
 );
 
 /// Which generated ktstr test family an admission descriptor belongs to.
@@ -800,6 +839,18 @@ pub struct AdmissionCellDescriptor {
     pub kernel: Option<String>,
     pub topology: AdmissionTopologyDescriptor,
     pub cpu_budget: Option<u32>,
+    /// Exact pre-preparation lower bound for this cell's guest memory.
+    ///
+    /// Immutable image sizing may raise the final allocation, but it may
+    /// never lower it. This lets the lightweight target runner publish the
+    /// same initial memory weight that VM construction will enforce.
+    pub memory_min_mib: u32,
+    /// Whether the selected test entry attaches wprof.
+    ///
+    /// Verifier cells are always false. Keeping the bit in the owned
+    /// descriptor makes the preparation intent independently auditable even
+    /// though `memory_min_mib` already includes the stamped 2-GiB floor.
+    pub wprof: bool,
     pub mode: AdmissionMode,
     pub host_only: bool,
     pub performance_mode: bool,
@@ -814,6 +865,8 @@ struct ParsedAdmissionTest {
     name: String,
     topology: AdmissionTopologyDescriptor,
     cpu_budget: Option<u32>,
+    memory_mib: u32,
+    wprof: bool,
     host_only: bool,
     performance_mode: bool,
     no_perf_mode: bool,
@@ -829,6 +882,7 @@ struct ParsedAdmissionPreset {
     name: String,
     topology: AdmissionTopologyDescriptor,
     forced_cpu_budget: Option<u32>,
+    verifier_memory_cap_mib: u32,
 }
 
 #[cfg(test)]
@@ -862,7 +916,7 @@ fn header(
 ) -> Result<u16, String> {
     let what = format!("{section} record {index}");
     let magic = reader.bytes_at_va(
-        base + offset_of!(AdmissionHeaderV2, magic) as u64,
+        base + offset_of!(AdmissionHeaderV3, magic) as u64,
         ADMISSION_MAGIC.len(),
         &what,
     )?;
@@ -873,7 +927,7 @@ fn header(
             magic,
         ));
     }
-    let version = reader.u16(base, offset_of!(AdmissionHeaderV2, version), &what)?;
+    let version = reader.u16(base, offset_of!(AdmissionHeaderV3, version), &what)?;
     if version != ADMISSION_VERSION {
         return Err(format!(
             "unsupported admission stamp version {version} in {} ({what}); expected version \
@@ -881,7 +935,7 @@ fn header(
             reader.source.display(),
         ));
     }
-    let encoded_size = reader.u32(base, offset_of!(AdmissionHeaderV2, record_size), &what)?;
+    let encoded_size = reader.u32(base, offset_of!(AdmissionHeaderV3, record_size), &what)?;
     if encoded_size as usize != record_size {
         return Err(format!(
             "corrupt admission stamp in {}: {what} declares record size {encoded_size}, \
@@ -889,11 +943,11 @@ fn header(
             reader.source.display(),
         ));
     }
-    reader.u16(base, offset_of!(AdmissionHeaderV2, kind), &what)
+    reader.u16(base, offset_of!(AdmissionHeaderV3, kind), &what)
 }
 
 fn string(reader: &ElfStampReader<'_>, base: u64, what: &str) -> Result<String, String> {
-    let len = reader.raw_u64(base + offset_of!(AdmissionStrV2, len) as u64, what)?;
+    let len = reader.raw_u64(base + offset_of!(AdmissionStrV3, len) as u64, what)?;
     let len = usize::try_from(len).map_err(|_| {
         format!(
             "{what} in admission ELF {} has an unrepresentable string length",
@@ -903,7 +957,7 @@ fn string(reader: &ElfStampReader<'_>, base: u64, what: &str) -> Result<String, 
     if len == 0 {
         return Ok(String::new());
     }
-    let pointer = reader.pointer(base, offset_of!(AdmissionStrV2, ptr), what)?;
+    let pointer = reader.pointer(base, offset_of!(AdmissionStrV3, ptr), what)?;
     string_from_pointer(reader, pointer, len, what)
 }
 
@@ -931,10 +985,10 @@ fn string_from_pointer(
 }
 
 fn optional_u32(reader: &ElfStampReader<'_>, base: u64, what: &str) -> Result<Option<u32>, String> {
-    match reader.u8(base, offset_of!(AdmissionOptionalU32V2, present), what)? {
+    match reader.u8(base, offset_of!(AdmissionOptionalU32V3, present), what)? {
         0 => Ok(None),
         1 => reader
-            .u32(base, offset_of!(AdmissionOptionalU32V2, value), what)
+            .u32(base, offset_of!(AdmissionOptionalU32V3, value), what)
             .map(Some),
         other => Err(format!(
             "{what} in admission ELF {} has invalid option tag {other}",
@@ -964,38 +1018,38 @@ fn topology(
     base: u64,
     what: &str,
 ) -> Result<AdmissionTopologyDescriptor, String> {
-    let numa_nodes = reader.u32(base, offset_of!(AdmissionTopologyStampV2, numa_nodes), what)?;
-    let llcs = reader.u32(base, offset_of!(AdmissionTopologyStampV2, llcs), what)?;
+    let numa_nodes = reader.u32(base, offset_of!(AdmissionTopologyStampV3, numa_nodes), what)?;
+    let llcs = reader.u32(base, offset_of!(AdmissionTopologyStampV3, llcs), what)?;
     let cores_per_llc = reader.u32(
         base,
-        offset_of!(AdmissionTopologyStampV2, cores_per_llc),
+        offset_of!(AdmissionTopologyStampV3, cores_per_llc),
         what,
     )?;
     let threads_per_core = reader.u32(
         base,
-        offset_of!(AdmissionTopologyStampV2, threads_per_core),
+        offset_of!(AdmissionTopologyStampV3, threads_per_core),
         what,
     )?;
     let explicit_nodes = boolean(
         reader,
         base,
-        offset_of!(AdmissionTopologyStampV2, explicit_nodes),
+        offset_of!(AdmissionTopologyStampV3, explicit_nodes),
         &format!("{what}.explicit_nodes"),
     )?;
     let llc_cores_present = boolean(
         reader,
         base,
-        offset_of!(AdmissionTopologyStampV2, llc_cores_present),
+        offset_of!(AdmissionTopologyStampV3, llc_cores_present),
         &format!("{what}.llc_cores_present"),
     )?;
     let node_llcs_len = reader.u16(
         base,
-        offset_of!(AdmissionTopologyStampV2, node_llcs_len),
+        offset_of!(AdmissionTopologyStampV3, node_llcs_len),
         &format!("{what}.node_llcs_len"),
     )? as usize;
     let llc_cores_len = reader.u16(
         base,
-        offset_of!(AdmissionTopologyStampV2, llc_cores_len),
+        offset_of!(AdmissionTopologyStampV3, llc_cores_len),
         &format!("{what}.llc_cores_len"),
     )? as usize;
     if node_llcs_len > MAX_TOPOLOGY_COMPONENTS || llc_cores_len > MAX_TOPOLOGY_COMPONENTS {
@@ -1030,7 +1084,7 @@ fn topology(
     let node_llcs = explicit_nodes
         .then(|| {
             read_array(
-                offset_of!(AdmissionTopologyStampV2, node_llcs),
+                offset_of!(AdmissionTopologyStampV3, node_llcs),
                 node_llcs_len,
                 "node_llcs",
             )
@@ -1039,7 +1093,7 @@ fn topology(
     let llc_cores = llc_cores_present
         .then(|| {
             read_array(
-                offset_of!(AdmissionTopologyStampV2, llc_cores),
+                offset_of!(AdmissionTopologyStampV3, llc_cores),
                 llc_cores_len,
                 "llc_cores",
             )
@@ -1126,13 +1180,13 @@ fn test_record(
     let performance_mode = boolean(
         reader,
         base,
-        offset_of!(AdmissionTestStampV2, performance_mode),
+        offset_of!(AdmissionTestStampV3, performance_mode),
         &format!("{what}.performance_mode"),
     )?;
     let no_perf_mode = boolean(
         reader,
         base,
-        offset_of!(AdmissionTestStampV2, no_perf_mode),
+        offset_of!(AdmissionTestStampV3, no_perf_mode),
         &format!("{what}.no_perf_mode"),
     )?;
     if performance_mode && no_perf_mode {
@@ -1141,28 +1195,46 @@ fn test_record(
             reader.source.display(),
         ));
     }
+    let memory_mib = reader.u32(
+        base,
+        offset_of!(AdmissionTestStampV3, memory_mib),
+        &format!("{what}.memory_mib"),
+    )?;
+    if memory_mib == 0 {
+        return Err(format!(
+            "{what} in admission ELF {} declares a zero memory floor",
+            reader.source.display(),
+        ));
+    }
     Ok(ParsedAdmissionTest {
         #[cfg(test)]
         record_base: base,
         name: string(
             reader,
-            base + offset_of!(AdmissionTestStampV2, name) as u64,
+            base + offset_of!(AdmissionTestStampV3, name) as u64,
             &format!("{what}.name"),
         )?,
         topology: topology(
             reader,
-            base + offset_of!(AdmissionTestStampV2, topology) as u64,
+            base + offset_of!(AdmissionTestStampV3, topology) as u64,
             &format!("{what}.topology"),
         )?,
         cpu_budget: optional_u32(
             reader,
-            base + offset_of!(AdmissionTestStampV2, cpu_budget) as u64,
+            base + offset_of!(AdmissionTestStampV3, cpu_budget) as u64,
             &format!("{what}.cpu_budget"),
+        )?,
+        memory_mib,
+        wprof: boolean(
+            reader,
+            base,
+            offset_of!(AdmissionTestStampV3, wprof),
+            &format!("{what}.wprof"),
         )?,
         host_only: boolean(
             reader,
             base,
-            offset_of!(AdmissionTestStampV2, host_only),
+            offset_of!(AdmissionTestStampV3, host_only),
             &format!("{what}.host_only"),
         )?,
         performance_mode,
@@ -1170,13 +1242,13 @@ fn test_record(
         expect_auto_repro: boolean(
             reader,
             base,
-            offset_of!(AdmissionTestStampV2, expect_auto_repro),
+            offset_of!(AdmissionTestStampV3, expect_auto_repro),
             &format!("{what}.expect_auto_repro"),
         )?,
         #[cfg(test)]
         legacy_entry: reader.pointer(
             base,
-            offset_of!(AdmissionTestStampV2, legacy_entry),
+            offset_of!(AdmissionTestStampV3, legacy_entry),
             &format!("{what}.legacy_entry"),
         )?,
     })
@@ -1188,24 +1260,36 @@ fn preset_record(
     index: usize,
 ) -> Result<ParsedAdmissionPreset, String> {
     let what = format!("admission preset record {index}");
+    let verifier_memory_cap_mib = reader.u32(
+        base,
+        offset_of!(AdmissionPresetStampV3, verifier_memory_cap_mib),
+        &format!("{what}.verifier_memory_cap_mib"),
+    )?;
+    if verifier_memory_cap_mib == 0 {
+        return Err(format!(
+            "{what} in admission ELF {} declares a zero verifier memory cap",
+            reader.source.display(),
+        ));
+    }
     Ok(ParsedAdmissionPreset {
         #[cfg(test)]
         record_base: base,
         name: string(
             reader,
-            base + offset_of!(AdmissionPresetStampV2, name) as u64,
+            base + offset_of!(AdmissionPresetStampV3, name) as u64,
             &format!("{what}.name"),
         )?,
         topology: topology(
             reader,
-            base + offset_of!(AdmissionPresetStampV2, topology) as u64,
+            base + offset_of!(AdmissionPresetStampV3, topology) as u64,
             &format!("{what}.topology"),
         )?,
         forced_cpu_budget: optional_u32(
             reader,
-            base + offset_of!(AdmissionPresetStampV2, forced_cpu_budget) as u64,
+            base + offset_of!(AdmissionPresetStampV3, forced_cpu_budget) as u64,
             &format!("{what}.forced_cpu_budget"),
         )?,
+        verifier_memory_cap_mib,
     })
 }
 
@@ -1348,10 +1432,10 @@ fn test_key_table(reader: &ElfStampReader<'_>) -> Result<Option<AdmissionKeyTabl
         reader,
         TEST_KEY_SECTION,
         ADMISSION_KIND_TEST_KEY,
-        size_of::<AdmissionTestKeyV2>(),
-        offset_of!(AdmissionTestKeyV2, name_hash),
-        offset_of!(AdmissionTestKeyV2, name_len),
-        offset_of!(AdmissionTestKeyV2, record),
+        size_of::<AdmissionTestKeyV3>(),
+        offset_of!(AdmissionTestKeyV3, name_hash),
+        offset_of!(AdmissionTestKeyV3, name_len),
+        offset_of!(AdmissionTestKeyV3, record),
     )
 }
 
@@ -1360,10 +1444,10 @@ fn preset_key_table(reader: &ElfStampReader<'_>) -> Result<Option<AdmissionKeyTa
         reader,
         PRESET_KEY_SECTION,
         ADMISSION_KIND_PRESET_KEY,
-        size_of::<AdmissionPresetKeyV2>(),
-        offset_of!(AdmissionPresetKeyV2, name_hash),
-        offset_of!(AdmissionPresetKeyV2, name_len),
-        offset_of!(AdmissionPresetKeyV2, record),
+        size_of::<AdmissionPresetKeyV3>(),
+        offset_of!(AdmissionPresetKeyV3, name_hash),
+        offset_of!(AdmissionPresetKeyV3, name_len),
+        offset_of!(AdmissionPresetKeyV3, record),
     )
 }
 
@@ -1570,14 +1654,14 @@ fn read_index_from_reader(reader: &ElfStampReader<'_>) -> Result<Option<Admissio
     let tests = section_records(
         reader,
         TEST_SECTION,
-        size_of::<AdmissionTestStampV2>(),
+        size_of::<AdmissionTestStampV3>(),
         ADMISSION_KIND_TEST,
         test_record,
     )?;
     let presets = section_records(
         reader,
         PRESET_SECTION,
-        size_of::<AdmissionPresetStampV2>(),
+        size_of::<AdmissionPresetStampV3>(),
         ADMISSION_KIND_PRESET,
         preset_record,
     )?;
@@ -1624,7 +1708,7 @@ fn read_index_from_reader(reader: &ElfStampReader<'_>) -> Result<Option<Admissio
 
     let expected = reader.u32(
         preset_sentinel,
-        offset_of!(AdmissionPresetStampV2, sentinel_expected_count),
+        offset_of!(AdmissionPresetStampV3, sentinel_expected_count),
         "admission preset sentinel expected count",
     )? as usize;
     if tests.presets.len() != expected {
@@ -1737,7 +1821,7 @@ fn validate_key_envelope(
         .zip(name_fields)
     {
         let what = format!("{record_family} record {index}.name");
-        let len = reader.raw_u64(name_field + offset_of!(AdmissionStrV2, len) as u64, &what)?;
+        let len = reader.raw_u64(name_field + offset_of!(AdmissionStrV3, len) as u64, &what)?;
         let len = usize::try_from(len).map_err(|_| {
             format!(
                 "{what} in admission ELF {} has an unrepresentable string length",
@@ -1788,13 +1872,13 @@ pub(super) fn validate_admission_stamp_envelope_reader(
     let tests = record_section_envelope(
         reader,
         TEST_SECTION,
-        size_of::<AdmissionTestStampV2>(),
+        size_of::<AdmissionTestStampV3>(),
         ADMISSION_KIND_TEST,
     )?;
     let presets = record_section_envelope(
         reader,
         PRESET_SECTION,
-        size_of::<AdmissionPresetStampV2>(),
+        size_of::<AdmissionPresetStampV3>(),
         ADMISSION_KIND_PRESET,
     )?;
     let test_keys = test_key_table(reader)?;
@@ -1839,7 +1923,7 @@ pub(super) fn validate_admission_stamp_envelope_reader(
     validate_test_registry_count(reader, tests.records.len())?;
     let expected = reader.u32(
         presets.sentinel,
-        offset_of!(AdmissionPresetStampV2, sentinel_expected_count),
+        offset_of!(AdmissionPresetStampV3, sentinel_expected_count),
         "admission preset sentinel expected count",
     )? as usize;
     if presets.records.len() != expected {
@@ -1855,7 +1939,7 @@ pub(super) fn validate_admission_stamp_envelope_reader(
         reader,
         &test_keys,
         TEST_SECTION,
-        offset_of!(AdmissionTestStampV2, name),
+        offset_of!(AdmissionTestStampV3, name),
         &tests,
         "test-entry",
     )?;
@@ -1863,7 +1947,7 @@ pub(super) fn validate_admission_stamp_envelope_reader(
         reader,
         &preset_keys,
         PRESET_SECTION,
-        offset_of!(AdmissionPresetStampV2, name),
+        offset_of!(AdmissionPresetStampV3, name),
         &presets,
         "preset",
     )
@@ -1908,8 +1992,20 @@ fn descriptor_from_test(
     cpu_budget: Option<u32>,
     preset_name: Option<String>,
     kernel: Option<String>,
-) -> AdmissionCellDescriptor {
-    AdmissionCellDescriptor {
+) -> Result<AdmissionCellDescriptor, String> {
+    let total_cpus = topology.total_cpus();
+    let memory_min_mib = super::runtime::checked_derive_test_memory_min_mib(
+        total_cpus,
+        test.memory_mib,
+        test.wprof,
+    )
+    .ok_or_else(|| {
+        format!(
+            "generated test cell {exact_name:?} has {total_cpus} vCPUs, which overflows the \
+             64 MiB/vCPU admission memory floor"
+        )
+    })?;
+    Ok(AdmissionCellDescriptor {
         exact_name: exact_name.to_string(),
         kind,
         entry_name: Some(test.name.clone()),
@@ -1918,12 +2014,14 @@ fn descriptor_from_test(
         kernel,
         topology,
         cpu_budget,
+        memory_min_mib,
+        wprof: test.wprof,
         mode: mode(test),
         host_only: test.host_only,
         performance_mode: test.performance_mode,
         no_perf_mode: test.no_perf_mode,
         expect_auto_repro: test.expect_auto_repro,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -2017,11 +2115,11 @@ fn direct_tables(reader: &ElfStampReader<'_>) -> Result<Option<DirectAdmissionTa
             reader.source.display(),
         )),
         (Some(tests), Some(presets)) => {
-            validate_record_section_shape(reader, TEST_SECTION, size_of::<AdmissionTestStampV2>())?;
+            validate_record_section_shape(reader, TEST_SECTION, size_of::<AdmissionTestStampV3>())?;
             validate_record_section_shape(
                 reader,
                 PRESET_SECTION,
-                size_of::<AdmissionPresetStampV2>(),
+                size_of::<AdmissionPresetStampV3>(),
             )?;
             Ok(Some(DirectAdmissionTables { tests, presets }))
         }
@@ -2083,7 +2181,7 @@ fn lookup_tests(
             let index = target_record_index(
                 reader,
                 TEST_SECTION,
-                size_of::<AdmissionTestStampV2>(),
+                size_of::<AdmissionTestStampV3>(),
                 ADMISSION_KIND_TEST,
                 target,
             )?;
@@ -2114,7 +2212,7 @@ fn lookup_presets(
             let index = target_record_index(
                 reader,
                 PRESET_SECTION,
-                size_of::<AdmissionPresetStampV2>(),
+                size_of::<AdmissionPresetStampV3>(),
                 ADMISSION_KIND_PRESET,
                 target,
             )?;
@@ -2165,7 +2263,7 @@ fn read_admission_cell_stamp_from_reader(
             return Err(format!("malformed host test name {exact_name:?}"));
         }
         let test = direct_test_match(reader, &tables.tests, path, exact_name, "host", rest, true)?;
-        return Ok(Some(descriptor_from_test(
+        return descriptor_from_test(
             exact_name,
             AdmissionCellKind::Host,
             &test,
@@ -2173,7 +2271,8 @@ fn read_admission_cell_stamp_from_reader(
             test.cpu_budget,
             None,
             None,
-        )));
+        )
+        .map(Some);
     }
 
     if let Some(rest) = exact_name.strip_prefix("ktstr/") {
@@ -2194,7 +2293,7 @@ fn read_admission_cell_stamp_from_reader(
             );
         }
         let (test, kernel) = unique_match(path, exact_name, "ktstr", matches)?;
-        return Ok(Some(descriptor_from_test(
+        return descriptor_from_test(
             exact_name,
             AdmissionCellKind::Ktstr,
             &test,
@@ -2202,7 +2301,8 @@ fn read_admission_cell_stamp_from_reader(
             test.cpu_budget,
             None,
             kernel,
-        )));
+        )
+        .map(Some);
     }
 
     if let Some(rest) = exact_name.strip_prefix("gauntlet/") {
@@ -2239,7 +2339,7 @@ fn read_admission_cell_stamp_from_reader(
                 preset.name,
             ));
         }
-        return Ok(Some(descriptor_from_test(
+        return descriptor_from_test(
             exact_name,
             AdmissionCellKind::Gauntlet,
             &test,
@@ -2247,7 +2347,8 @@ fn read_admission_cell_stamp_from_reader(
             test.cpu_budget,
             Some(preset.name),
             kernel,
-        )));
+        )
+        .map(Some);
     }
 
     let rest = exact_name
@@ -2263,6 +2364,17 @@ fn read_admission_cell_stamp_from_reader(
         "verifier",
         lookup_presets(reader, &tables.presets, parts[2])?,
     )?;
+    let total_cpus = preset.topology.total_cpus();
+    let memory_min_mib = super::runtime::checked_verifier_preset_memory_min_mib(
+        total_cpus,
+        preset.verifier_memory_cap_mib as usize,
+    )
+    .ok_or_else(|| {
+        format!(
+            "generated verifier cell {exact_name:?} has {total_cpus} vCPUs, which overflows the \
+             64 MiB/vCPU admission memory floor"
+        )
+    })?;
     Ok(Some(AdmissionCellDescriptor {
         exact_name: exact_name.to_string(),
         kind: AdmissionCellKind::Verifier,
@@ -2272,6 +2384,8 @@ fn read_admission_cell_stamp_from_reader(
         kernel: Some(parts[1].to_string()),
         topology: preset.topology,
         cpu_budget: preset.forced_cpu_budget,
+        memory_min_mib,
+        wprof: false,
         mode: AdmissionMode::NoPerf,
         host_only: false,
         performance_mode: false,
@@ -2335,6 +2449,35 @@ mod tests {
             .expect("section slice comes from the executable mapping")
     }
 
+    fn test_record_file_offset(
+        executable: &Path,
+        mapping: &memmap2::MmapMut,
+        entry_name: &str,
+    ) -> usize {
+        let reader = ElfStampReader::new(executable, mapping).expect("parse test executable");
+        let (section_va, section) = reader
+            .section(TEST_SECTION)
+            .expect("find admission test section")
+            .expect("test section is linked");
+        let record_size = size_of::<AdmissionTestStampV3>();
+        let record_index = (0..section.len() / record_size)
+            .find(|index| {
+                let base = section_va + (*index * record_size) as u64;
+                header(&reader, base, record_size, TEST_SECTION, *index)
+                    .expect("decode admission record header")
+                    == ADMISSION_KIND_TEST
+                    && string(
+                        &reader,
+                        base + offset_of!(AdmissionTestStampV3, name) as u64,
+                        "fixture test name",
+                    )
+                    .expect("decode fixture test name")
+                        == entry_name
+            })
+            .unwrap_or_else(|| panic!("admission fixture {entry_name:?} is linked"));
+        section_file_offset(mapping, section) + record_index * record_size
+    }
+
     static EXPLICIT_NODES: [crate::test_support::NumaNode; 3] = [
         crate::test_support::NumaNode {
             llcs: 1,
@@ -2388,30 +2531,39 @@ mod tests {
     static ADMISSION_GUEST_ENTRY: KtstrTestEntry = KtstrTestEntry {
         name: "__unit_test_admission_guest__",
         func: explicit_nodes_fixture,
+        memory_mib: 768,
+        wprof: cfg!(feature = "wprof"),
         performance_mode: true,
         ..KtstrTestEntry::DEFAULT
     };
 
     #[test]
-    fn v2_wire_layout_is_pinned() {
-        assert_eq!(size_of::<AdmissionHeaderV2>(), 16);
-        assert_eq!(size_of::<AdmissionStrV2>(), 16);
-        assert_eq!(size_of::<AdmissionOptionalU32V2>(), 8);
-        assert_eq!(size_of::<AdmissionTopologyStampV2>(), 2064);
-        assert_eq!(size_of::<AdmissionTestStampV2>(), 2120);
-        assert_eq!(size_of::<AdmissionPresetStampV2>(), 2112);
-        assert_eq!(size_of::<AdmissionTestKeyV2>(), 40);
-        assert_eq!(size_of::<AdmissionPresetKeyV2>(), 40);
-        assert_eq!(offset_of!(AdmissionTestStampV2, header), 0);
-        assert_eq!(offset_of!(AdmissionTestStampV2, name), 16);
-        assert_eq!(offset_of!(AdmissionTestStampV2, topology), 32);
-        assert_eq!(offset_of!(AdmissionTestStampV2, cpu_budget), 2096);
-        assert_eq!(offset_of!(AdmissionTestStampV2, legacy_entry), 2112);
-        assert_eq!(offset_of!(AdmissionPresetStampV2, topology), 32);
-        assert_eq!(offset_of!(AdmissionPresetStampV2, forced_cpu_budget), 2096);
-        assert_eq!(offset_of!(AdmissionTestKeyV2, name_hash), 16);
-        assert_eq!(offset_of!(AdmissionTestKeyV2, name_len), 24);
-        assert_eq!(offset_of!(AdmissionTestKeyV2, record), 32);
+    fn v3_wire_layout_is_pinned() {
+        assert_eq!(size_of::<AdmissionHeaderV3>(), 16);
+        assert_eq!(size_of::<AdmissionStrV3>(), 16);
+        assert_eq!(size_of::<AdmissionOptionalU32V3>(), 8);
+        assert_eq!(size_of::<AdmissionTopologyStampV3>(), 2064);
+        assert_eq!(size_of::<AdmissionTestStampV3>(), 2128);
+        assert_eq!(size_of::<AdmissionPresetStampV3>(), 2112);
+        assert_eq!(size_of::<AdmissionTestKeyV3>(), 40);
+        assert_eq!(size_of::<AdmissionPresetKeyV3>(), 40);
+        assert_eq!(offset_of!(AdmissionTestStampV3, header), 0);
+        assert_eq!(offset_of!(AdmissionTestStampV3, name), 16);
+        assert_eq!(offset_of!(AdmissionTestStampV3, topology), 32);
+        assert_eq!(offset_of!(AdmissionTestStampV3, cpu_budget), 2096);
+        assert_eq!(offset_of!(AdmissionTestStampV3, memory_mib), 2104);
+        assert_eq!(offset_of!(AdmissionTestStampV3, host_only), 2108);
+        assert_eq!(offset_of!(AdmissionTestStampV3, wprof), 2112);
+        assert_eq!(offset_of!(AdmissionTestStampV3, legacy_entry), 2120);
+        assert_eq!(offset_of!(AdmissionPresetStampV3, topology), 32);
+        assert_eq!(offset_of!(AdmissionPresetStampV3, forced_cpu_budget), 2096);
+        assert_eq!(
+            offset_of!(AdmissionPresetStampV3, verifier_memory_cap_mib),
+            2108
+        );
+        assert_eq!(offset_of!(AdmissionTestKeyV3, name_hash), 16);
+        assert_eq!(offset_of!(AdmissionTestKeyV3, name_len), 24);
+        assert_eq!(offset_of!(AdmissionTestKeyV3, record), 32);
     }
 
     #[test]
@@ -2423,7 +2575,7 @@ mod tests {
                 .section(TEST_KEY_SECTION)
                 .expect("find admission test-key section")
                 .expect("test-key section is linked");
-            section_file_offset(&mapping, section) + offset_of!(AdmissionHeaderV2, version)
+            section_file_offset(&mapping, section) + offset_of!(AdmissionHeaderV3, version)
         };
         mapping[version_file_offset..version_file_offset + size_of::<u16>()]
             .copy_from_slice(&(ADMISSION_VERSION + 1).to_le_bytes());
@@ -2488,14 +2640,14 @@ mod tests {
                     let index = target_record_index(
                         &reader,
                         TEST_SECTION,
-                        size_of::<AdmissionTestStampV2>(),
+                        size_of::<AdmissionTestStampV3>(),
                         ADMISSION_KIND_TEST,
                         target,
                     )
                     .expect("key points to an admission test record");
                     string(
                         &reader,
-                        target + offset_of!(AdmissionTestStampV2, name) as u64,
+                        target + offset_of!(AdmissionTestStampV3, name) as u64,
                         &format!("admission test record {index}.name"),
                     )
                     .expect("decode admission key target name")
@@ -2507,8 +2659,8 @@ mod tests {
                 .expect("find admission test-key section")
                 .expect("test-key section is linked");
             section_file_offset(&mapping, section)
-                + slot.index * size_of::<AdmissionTestKeyV2>()
-                + offset_of!(AdmissionTestKeyV2, name_hash)
+                + slot.index * size_of::<AdmissionTestKeyV3>()
+                + offset_of!(AdmissionTestKeyV3, name_hash)
         };
         let encoded_hash = u64::from_le_bytes(
             mapping[hash_file_offset..hash_file_offset + size_of::<u64>()]
@@ -2534,7 +2686,7 @@ mod tests {
                 .section(TEST_SECTION)
                 .expect("find admission test section")
                 .expect("test section is linked");
-            let record_size = size_of::<AdmissionTestStampV2>();
+            let record_size = size_of::<AdmissionTestStampV3>();
             let record_index = (0..section.len() / record_size)
                 .find(|index| {
                     let base = section_va + (*index * record_size) as u64;
@@ -2543,7 +2695,7 @@ mod tests {
                         == ADMISSION_KIND_TEST
                         && string(
                             &reader,
-                            base + offset_of!(AdmissionTestStampV2, name) as u64,
+                            base + offset_of!(AdmissionTestStampV3, name) as u64,
                             "fixture test name",
                         )
                         .expect("decode fixture test name")
@@ -2552,8 +2704,8 @@ mod tests {
                 .expect("explicit-node admission fixture is linked");
             section_file_offset(&mapping, section)
                 + record_index * record_size
-                + offset_of!(AdmissionTestStampV2, topology)
-                + offset_of!(AdmissionTopologyStampV2, explicit_nodes)
+                + offset_of!(AdmissionTestStampV3, topology)
+                + offset_of!(AdmissionTopologyStampV3, explicit_nodes)
         };
         mapping[explicit_nodes_file_offset] = 2;
 
@@ -2574,7 +2726,50 @@ mod tests {
     }
 
     #[test]
-    fn exact_name_resolution_preserves_entry_and_preset_admission() {
+    fn exact_pre_exec_lookup_applies_stamped_wprof_floor_independent_of_reader_features() {
+        const ENTRY: &str = "__unit_test_admission_guest__";
+
+        let (executable, mut mapping) = map_current_test_executable_copy();
+        let record_offset = test_record_file_offset(&executable, &mapping, ENTRY);
+        mapping[record_offset + offset_of!(AdmissionTestStampV3, wprof)] = 1;
+
+        let reader = ElfStampReader::new(&executable, &mapping).expect("parse mutated executable");
+        let descriptor =
+            read_admission_cell_stamp_from_reader(&reader, &executable, &format!("ktstr/{ENTRY}"))
+                .expect("read stamped wprof descriptor")
+                .expect("generated ktstr descriptor");
+        assert!(descriptor.wprof);
+        assert_eq!(
+            descriptor.memory_min_mib,
+            crate::test_support::runtime::WPROF_MIN_MEMORY_MIB,
+            "the ELF's wprof bit, not the reader binary's feature set, owns the floor",
+        );
+    }
+
+    #[test]
+    fn exact_pre_exec_lookup_rejects_cpu_memory_scaling_overflow() {
+        const ENTRY: &str = "__unit_test_admission_guest__";
+
+        let (executable, mut mapping) = map_current_test_executable_copy();
+        let record_offset = test_record_file_offset(&executable, &mapping, ENTRY);
+        let cores_offset = record_offset
+            + offset_of!(AdmissionTestStampV3, topology)
+            + offset_of!(AdmissionTopologyStampV3, cores_per_llc);
+        mapping[cores_offset..cores_offset + size_of::<u32>()]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let reader = ElfStampReader::new(&executable, &mapping).expect("parse mutated executable");
+        let error =
+            read_admission_cell_stamp_from_reader(&reader, &executable, &format!("ktstr/{ENTRY}"))
+                .expect_err("an unrepresentable stamped memory floor must be rejected");
+        assert!(
+            error.contains("overflows the 64 MiB/vCPU admission memory floor"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn exact_name_resolution_preserves_ktstr_gauntlet_and_verifier_intent() {
         let executable = std::env::current_exe().expect("locate unit-test executable");
 
         let host = read_admission_cell_stamp(&executable, "host/cpu_budget_codegen_probe")
@@ -2600,27 +2795,38 @@ mod tests {
         .expect("base guest descriptor");
         assert_eq!(guest.mode, AdmissionMode::Performance);
         assert_eq!(guest.kernel.as_deref(), Some("kernel_7_3"));
+        assert_eq!(guest.wprof, cfg!(feature = "wprof"));
+        assert_eq!(
+            guest.memory_min_mib,
+            if cfg!(feature = "wprof") { 2048 } else { 768 }
+        );
 
         let gauntlet = read_admission_cell_stamp(
             &executable,
-            "gauntlet/__unit_test_admission_guest__/4cpu-2llc-nosmt/kernel_7_3",
+            "gauntlet/__unit_test_admission_guest__/64cpu-8llc-nosmt/kernel_7_3",
         )
         .expect("read gauntlet admission")
         .expect("gauntlet descriptor");
         assert_eq!(gauntlet.kind, AdmissionCellKind::Gauntlet);
-        assert_eq!(gauntlet.topology.total_cpus(), 4);
-        assert_eq!(gauntlet.topology.llcs, 2);
+        assert_eq!(gauntlet.topology.total_cpus(), 64);
+        assert_eq!(gauntlet.topology.llcs, 8);
         assert_eq!(gauntlet.kernel.as_deref(), Some("kernel_7_3"));
         assert_eq!(gauntlet.mode, AdmissionMode::Performance);
+        assert_eq!(gauntlet.memory_min_mib, 4096);
+        assert_eq!(gauntlet.wprof, cfg!(feature = "wprof"));
 
-        let verifier =
-            read_admission_cell_stamp(&executable, "verifier/scx-ktstr/kernel_7_3/4cpu-1llc-nosmt")
-                .expect("read verifier admission")
-                .expect("verifier descriptor");
+        let verifier = read_admission_cell_stamp(
+            &executable,
+            "verifier/scx-ktstr/kernel_7_3/252cpu-14llc-nosmt",
+        )
+        .expect("read verifier admission")
+        .expect("verifier descriptor");
         assert_eq!(verifier.kind, AdmissionCellKind::Verifier);
         assert_eq!(verifier.mode, AdmissionMode::NoPerf);
         assert_eq!(verifier.scheduler_name.as_deref(), Some("scx-ktstr"));
-        assert_eq!(verifier.topology.total_cpus(), 4);
+        assert_eq!(verifier.topology.total_cpus(), 252);
+        assert_eq!(verifier.memory_min_mib, 4096);
+        assert!(!verifier.wprof);
 
         assert!(
             read_admission_cell_stamp(&executable, "ordinary_unit_test")
@@ -2695,6 +2901,8 @@ mod tests {
         assert_eq!(verifier.cpu_budget, Some(96));
         assert_eq!(verifier.topology.llc_cores.as_ref().map(Vec::len), Some(11));
         assert_eq!(verifier.topology.total_cpus(), 192);
+        assert_eq!(verifier.memory_min_mib, 4096);
+        assert!(!verifier.wprof);
 
         let error = read_admission_cell_stamp(
             &executable,
@@ -2716,12 +2924,21 @@ mod tests {
         let decoded = index
             .presets
             .into_iter()
-            .map(|preset| (preset.name, (preset.topology, preset.forced_cpu_budget)))
+            .map(|preset| {
+                (
+                    preset.name,
+                    (
+                        preset.topology,
+                        preset.forced_cpu_budget,
+                        preset.verifier_memory_cap_mib,
+                    ),
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         let runtime = crate::gauntlet::gauntlet_presets();
         assert_eq!(decoded.len(), runtime.len());
         for preset in runtime {
-            let (topology, forced_budget) = decoded
+            let (topology, forced_budget, verifier_memory_cap_mib) = decoded
                 .get(preset.name)
                 .unwrap_or_else(|| panic!("missing admission preset {:?}", preset.name));
             assert_eq!(topology.numa_nodes, preset.topology.numa_nodes);
@@ -2739,6 +2956,12 @@ mod tests {
                 preset.name,
             );
             assert_eq!(*forced_budget, preset.forced_cpu_budget);
+            assert_eq!(
+                usize::try_from(*verifier_memory_cap_mib).unwrap(),
+                preset.memory_mib,
+                "{}",
+                preset.name,
+            );
         }
     }
 }

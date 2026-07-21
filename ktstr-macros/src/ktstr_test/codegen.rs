@@ -781,20 +781,20 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
             );
 
         #[::ktstr::distributed_slice(
-            ::ktstr::test_support::KTSTR_ADMISSION_TESTS_V2
+            ::ktstr::test_support::KTSTR_ADMISSION_TESTS_V3
         )]
         #[linkme(crate = ::ktstr::linkme)]
         static #admission_entry_name:
-            ::ktstr::test_support::AdmissionTestStampV2 =
-            ::ktstr::test_support::AdmissionTestStampV2::new(&#entry_name);
+            ::ktstr::test_support::AdmissionTestStampV3 =
+            ::ktstr::test_support::AdmissionTestStampV3::new(&#entry_name);
 
         #[::ktstr::distributed_slice(
-            ::ktstr::test_support::KTSTR_ADMISSION_TEST_KEYS_V2
+            ::ktstr::test_support::KTSTR_ADMISSION_TEST_KEYS_V3
         )]
         #[linkme(crate = ::ktstr::linkme)]
         static #admission_key_name:
-            ::ktstr::test_support::AdmissionTestKeyV2 =
-            ::ktstr::test_support::AdmissionTestKeyV2::new(
+            ::ktstr::test_support::AdmissionTestKeyV3 =
+            ::ktstr::test_support::AdmissionTestKeyV3::new(
                 &#entry_name,
                 &#admission_entry_name,
             );

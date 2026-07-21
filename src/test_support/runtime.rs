@@ -466,7 +466,13 @@ pub(crate) fn attach_wprof_if_requested(
 /// `.memory_deferred_min(mib)`, which raises the actual allocation to
 /// fit the real initramfs, so the final boot memory may exceed this.
 pub(crate) fn cpu_scaled_memory_mib(cpus: u32) -> u32 {
-    (cpus * 64).max(256)
+    checked_cpu_scaled_memory_mib(cpus)
+        .expect("validated live topology overflows the 64 MiB/vCPU memory floor")
+}
+
+/// Fallible scalar form used when decoding topology dimensions from an ELF.
+pub(crate) fn checked_cpu_scaled_memory_mib(cpus: u32) -> Option<u32> {
+    cpus.checked_mul(64).map(|scaled| scaled.max(256))
 }
 
 /// Memory floor for one verifier topology preset.
@@ -477,27 +483,75 @@ pub(crate) fn cpu_scaled_memory_mib(cpus: u32) -> u32 {
 /// has many vCPUs when the preset explicitly budgets 4 GiB. Small presets keep
 /// the ordinary 64 MiB/vCPU floor.
 pub(crate) fn verifier_preset_memory_min_mib(cpus: u32, preset_memory_mib: usize) -> u32 {
+    checked_verifier_preset_memory_min_mib(cpus, preset_memory_mib)
+        .expect("validated live verifier topology overflows the 64 MiB/vCPU memory floor")
+}
+
+/// Fallible verifier-memory projection for topology data decoded from an ELF.
+pub(crate) fn checked_verifier_preset_memory_min_mib(
+    cpus: u32,
+    preset_memory_mib: usize,
+) -> Option<u32> {
     let preset_cap = u32::try_from(preset_memory_mib).unwrap_or(u32::MAX);
-    cpu_scaled_memory_mib(cpus).min(preset_cap)
+    checked_cpu_scaled_memory_mib(cpus).map(|scaled| scaled.min(preset_cap))
+}
+
+/// Minimum guest memory required by a stamped wprof attachment.
+///
+/// This constant is always compiled because the cargo-ktstr admission runner
+/// can read an ELF built with a different feature set from its own. The public
+/// wprof API remains feature-gated and aliases this value.
+pub(crate) const WPROF_MIN_MEMORY_MIB: u32 = 2048;
+
+/// Apply the feature-independent memory floor encoded by a stamped wprof bit.
+pub(crate) fn apply_wprof_memory_floor(raw_mib: u32, wprof: bool) -> u32 {
+    if wprof && raw_mib < WPROF_MIN_MEMORY_MIB {
+        WPROF_MIN_MEMORY_MIB
+    } else {
+        raw_mib
+    }
+}
+
+/// Compute the exact deferred-memory floor from admission-stamp scalars.
+///
+/// This is the process-independent core of [`derive_test_memory_mib`].  The
+/// pre-exec target runner has only the final ELF stamp, not a live
+/// [`KtstrTestEntry`], and must publish the same lower bound before it starts
+/// the heavyweight test process. Keeping the scalar projection here prevents
+/// admission and VM construction from acquiring different memory weights.
+pub(crate) fn derive_test_memory_min_mib(cpus: u32, declared_memory_mib: u32, wprof: bool) -> u32 {
+    checked_derive_test_memory_min_mib(cpus, declared_memory_mib, wprof)
+        .expect("validated live topology overflows the 64 MiB/vCPU memory floor")
+}
+
+/// Fallible admission-memory projection for topology data decoded from an ELF.
+pub(crate) fn checked_derive_test_memory_min_mib(
+    cpus: u32,
+    declared_memory_mib: u32,
+    wprof: bool,
+) -> Option<u32> {
+    let raw = checked_cpu_scaled_memory_mib(cpus)?.max(declared_memory_mib);
+    Some(apply_wprof_memory_floor(raw, wprof))
 }
 
 /// Derive the test VM's memory floor from a CPU count + entry.
 ///
 /// Returns `max(cpu_scaled_memory_mib(cpus), entry.memory_mib)`. When
-/// the `wprof` feature is enabled and `entry.wprof` is true, bumps
-/// to `WPROF_MIN_MEMORY_MIB` if below that floor.
+/// `entry.wprof` is true, bumps to the feature-independent stamped wprof
+/// memory floor if below it. The tracer attachment itself remains gated by
+/// the `wprof` feature.
 ///
 /// The returned value is the LOWER BOUND on guest memory; the
 /// VM builder ultimately uses `.memory_deferred_min(mib)` which
 /// also accounts for the initramfs size, so the final boot memory
 /// may exceed this value.
 pub(crate) fn derive_test_memory_mib(cpus: u32, entry: &KtstrTestEntry) -> u32 {
-    let raw = cpu_scaled_memory_mib(cpus).max(entry.memory_mib);
+    let memory_min_mib = derive_test_memory_min_mib(cpus, entry.memory_mib, entry.wprof);
     #[cfg(feature = "wprof")]
     {
-        use crate::vmm::wprof::{WPROF_MIN_MEMORY_MIB, apply_wprof_memory_floor};
-        let mem = apply_wprof_memory_floor(raw, entry.wprof);
-        if mem != raw {
+        use crate::vmm::wprof::WPROF_MIN_MEMORY_MIB;
+        let raw = cpu_scaled_memory_mib(cpus).max(entry.memory_mib);
+        if memory_min_mib != raw {
             tracing::info!(
                 test = %entry.name,
                 requested_mib = raw,
@@ -506,10 +560,8 @@ pub(crate) fn derive_test_memory_mib(cpus: u32, entry: &KtstrTestEntry) -> u32 {
                  WPROF_MIN_MEMORY_MIB"
             );
         }
-        mem
     }
-    #[cfg(not(feature = "wprof"))]
-    raw
+    memory_min_mib
 }
 
 /// Resolve the VM topology and memory size from an optional
@@ -1843,6 +1895,11 @@ mod tests {
         };
         let mem = derive_test_memory_mib(2, &entry);
         assert_eq!(mem, 256, "2 cpus * 64 = 128, floor 256 wins");
+        assert_eq!(
+            derive_test_memory_min_mib(2, entry.memory_mib, entry.wprof),
+            mem,
+            "the admission-stamp scalar projection must equal entry-based VM sizing",
+        );
     }
 
     #[test]
@@ -1854,6 +1911,25 @@ mod tests {
         assert_eq!(cpu_scaled_memory_mib(4), 256, "4 cpus * 64 = 256, tie");
         assert_eq!(cpu_scaled_memory_mib(8), 512, "8 cpus * 64 = 512 wins");
         assert_eq!(cpu_scaled_memory_mib(16), 1024, "16 cpus * 64 = 1024 wins");
+    }
+
+    #[test]
+    fn stamped_wprof_memory_floor_is_feature_independent() {
+        assert_eq!(
+            derive_test_memory_min_mib(2, 768, true),
+            WPROF_MIN_MEMORY_MIB,
+        );
+        assert_eq!(derive_test_memory_min_mib(2, 768, false), 768);
+    }
+
+    #[test]
+    fn checked_admission_memory_scaling_rejects_overflow() {
+        assert_eq!(checked_cpu_scaled_memory_mib(u32::MAX), None);
+        assert_eq!(
+            checked_derive_test_memory_min_mib(u32::MAX, 256, false),
+            None
+        );
+        assert_eq!(checked_verifier_preset_memory_min_mib(u32::MAX, 4096), None);
     }
 
     #[test]
@@ -1955,6 +2031,11 @@ mod tests {
             mem,
             crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
             "helper must floor wprof memory regardless of caller; got {mem}"
+        );
+        assert_eq!(
+            derive_test_memory_min_mib(2, entry.memory_mib, entry.wprof),
+            mem,
+            "pre-exec admission must apply the same wprof floor as VM sizing",
         );
 
         // wprof=false: derivation returns the raw formula

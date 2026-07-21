@@ -43,18 +43,18 @@ pub(crate) fn expand(item: ItemStatic) -> syn::Result<TokenStream> {
             );
 
         #[::ktstr::distributed_slice(
-            ::ktstr::test_support::KTSTR_ADMISSION_TESTS_V2
+            ::ktstr::test_support::KTSTR_ADMISSION_TESTS_V3
         )]
         #[linkme(crate = ::ktstr::linkme)]
-        static #admission_stamp: ::ktstr::test_support::AdmissionTestStampV2 =
-            ::ktstr::test_support::AdmissionTestStampV2::new(&#entry);
+        static #admission_stamp: ::ktstr::test_support::AdmissionTestStampV3 =
+            ::ktstr::test_support::AdmissionTestStampV3::new(&#entry);
 
         #[::ktstr::distributed_slice(
-            ::ktstr::test_support::KTSTR_ADMISSION_TEST_KEYS_V2
+            ::ktstr::test_support::KTSTR_ADMISSION_TEST_KEYS_V3
         )]
         #[linkme(crate = ::ktstr::linkme)]
-        static #admission_key: ::ktstr::test_support::AdmissionTestKeyV2 =
-            ::ktstr::test_support::AdmissionTestKeyV2::new(
+        static #admission_key: ::ktstr::test_support::AdmissionTestKeyV3 =
+            ::ktstr::test_support::AdmissionTestKeyV3::new(
                 &#entry,
                 &#admission_stamp,
             );

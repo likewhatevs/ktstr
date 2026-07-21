@@ -57,9 +57,9 @@ mod admission_stamp;
 mod args;
 #[doc(hidden)]
 pub use admission_stamp::{
-    AdmissionCellDescriptor, AdmissionCellKind, AdmissionMode, AdmissionTestKeyV2,
-    AdmissionTestStampV2, AdmissionTopologyDescriptor, KTSTR_ADMISSION_TEST_KEYS_V2,
-    KTSTR_ADMISSION_TESTS_V2, read_admission_cell_stamp,
+    AdmissionCellDescriptor, AdmissionCellKind, AdmissionMode, AdmissionTestKeyV3,
+    AdmissionTestStampV3, AdmissionTopologyDescriptor, KTSTR_ADMISSION_TEST_KEYS_V3,
+    KTSTR_ADMISSION_TESTS_V3, read_admission_cell_stamp,
 };
 // Re-exported for the workload-side CgroupChurn worker, which resolves the
 // same workload cgroup root the host-side setup uses but lives outside the

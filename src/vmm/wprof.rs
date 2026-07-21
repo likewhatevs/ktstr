@@ -50,7 +50,7 @@ use anyhow::Result;
 /// Tracks `WprofConfig::default_args`: a future change to
 /// `--ringbuf-size` or `--ringbuf-cnt` invalidates the 2048
 /// derivation and this const should move with the args.
-pub const WPROF_MIN_MEMORY_MIB: u32 = 2048;
+pub const WPROF_MIN_MEMORY_MIB: u32 = crate::test_support::runtime::WPROF_MIN_MEMORY_MIB;
 
 /// Apply the wprof memory floor to a raw memory size.
 ///
@@ -70,11 +70,7 @@ pub const WPROF_MIN_MEMORY_MIB: u32 = 2048;
 /// conditional are a regression per the
 /// derive_test_memory_mib/attach_wprof_if_requested precedent.
 pub fn apply_wprof_memory_floor(raw_mib: u32, wprof: bool) -> u32 {
-    if wprof && raw_mib < WPROF_MIN_MEMORY_MIB {
-        WPROF_MIN_MEMORY_MIB
-    } else {
-        raw_mib
-    }
+    crate::test_support::runtime::apply_wprof_memory_floor(raw_mib, wprof)
 }
 
 /// wprof invocation args + binary path. Passed to
