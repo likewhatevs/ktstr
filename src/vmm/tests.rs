@@ -865,6 +865,43 @@ fn default_early_intent_preserves_exact_preference_inside_shared_fallback() {
     );
 }
 
+#[test]
+fn early_intent_selects_weighted_permits_once_for_all_topology_candidates() {
+    let host = host_topology::HostTopology::new_for_tests(&[(vec![0, 1], 0), (vec![2, 3], 0)]);
+    let topology = Topology::new(1, 1, 1, 1);
+    let candidates = default_intent_candidates(Some(&host), &topology, &[0, 1, 2, 3], 2)
+        .expect("build default early-intent candidates");
+    assert!(candidates.len() > 1);
+    let count_permit_probes = |candidates| {
+        let plan = AdmissionIntentPlan {
+            candidates,
+            permit_pool: host_topology::VmPermitPool::new_with_preparation(4, 2, 256, None)
+                .expect("construct test permit pool"),
+        };
+        let permit_only_probes = std::cell::Cell::new(0usize);
+        let selected = plan
+            .select(
+                |claim| {
+                    if claim.cpus.is_empty() && claim.llcs.is_empty() {
+                        permit_only_probes.set(permit_only_probes.get() + 1);
+                    }
+                    Ok(true)
+                },
+                |_| Ok((0, 0)),
+            )
+            .expect("select early-intent placement");
+        assert!(selected.is_some());
+        permit_only_probes.get()
+    };
+    let one_candidate_probes = count_permit_probes(vec![candidates[0].clone()]);
+    let all_candidate_probes = count_permit_probes(candidates);
+    assert!(one_candidate_probes > 0);
+    assert_eq!(
+        all_candidate_probes, one_candidate_probes,
+        "weighted permit selection must not restart for every topology candidate",
+    );
+}
+
 fn pending_exec_descriptor_for_validation(
     memory_min_mib: u32,
     wprof: bool,

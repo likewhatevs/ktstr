@@ -273,12 +273,17 @@ pub(crate) fn take_pending_exec_handoff() -> Result<Option<ImportedPendingExecHa
         affinity_lock,
         header.original_affinity.clone(),
     )?;
-    let ticket = registry::import_pending_exec_handoff(
+    let (ticket, pending_claim) = registry::import_pending_exec_handoff(
         header.slot,
         header.ticket,
-        liveness,
+        &liveness,
         &preparation.claim(),
     )?;
+    // Establish the physical-first Drop ordering before any further fallible
+    // work. The registry ticket owns a duplicate liveness fd, so the inherited
+    // descriptor can now close without withdrawing the PENDING publication.
+    let pending = PendingAdmission::from_imported_ticket(ticket, preparation, pending_claim);
+    drop(liveness);
     let metadata_offset = HEADER_LEN
         + header.preparation_fds.len() * 2 * std::mem::size_of::<u32>()
         + 2 * std::mem::size_of::<u32>()
@@ -288,10 +293,7 @@ pub(crate) fn take_pending_exec_handoff() -> Result<Option<ImportedPendingExecHa
         metadata.len() == header.metadata_len,
         "pending admission metadata length changed during decode",
     );
-    Ok(Some(ImportedPendingExecHandoff {
-        pending: PendingAdmission::from_imported_ticket(ticket, preparation),
-        metadata,
-    }))
+    Ok(Some(ImportedPendingExecHandoff { pending, metadata }))
 }
 
 fn encode(header: Header, metadata: &[u8]) -> Result<Vec<u8>> {

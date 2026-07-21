@@ -1347,11 +1347,11 @@ impl AdmissionIntentPlan {
         mut ready: impl FnMut(&host_topology::protocol::ClaimSet) -> Result<bool>,
         mut pressure: impl FnMut(&AdmissionIntentCandidate) -> Result<(usize, usize)>,
     ) -> Result<Option<host_topology::protocol::ClaimSet>> {
+        let Some(permits) = self.permit_pool.select(&mut ready)? else {
+            return Ok(None);
+        };
         let mut best = None;
         for candidate in &self.candidates {
-            let Some(permits) = self.permit_pool.select(&mut ready)? else {
-                return Ok(None);
-            };
             let claim = Self::claim(candidate, &permits);
             if !ready(&claim)? {
                 continue;

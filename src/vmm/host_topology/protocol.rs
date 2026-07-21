@@ -1,6 +1,6 @@
 //! Cross-process host-resource admission under nextest.
 //!
-//! Every ktstr process sharing a lock directory participates in one v16
+//! Every ktstr process sharing a lock directory participates in one v17
 //! fixed-record mmap registry. A ticket publishes one exact, non-empty CPU/LLC
 //! reservation claim plus the resources its planner may watch. Claims preserve
 //! the resource-lock semantics exactly: CPU and LLC claims independently use
@@ -1214,13 +1214,26 @@ pub(crate) enum TicketWork<T> {
     Coordinator(Box<CoordinatorTicket>),
 }
 
-/// Same-PID pre-exec admission identity. Its registry record and physical
-/// flocks first describe one bounded CPU+memory preparation footprint, then a
-/// memory+token prepared-residency footprint. Activation replaces either
-/// PENDING phase with the exact run claim in the same ticket.
+/// Same-PID pre-exec admission identity. Its registry record continuously
+/// publishes the selected final intent together with every physically held
+/// preparation resource. Activation replaces that combined PENDING claim
+/// with the exact run claim in the same ticket.
 pub(crate) struct PendingAdmission {
     ticket: Option<registry::Ticket>,
     preparation: Option<super::PreparationPermit>,
+    pending_claim: Option<ClaimSet>,
+}
+
+impl Drop for PendingAdmission {
+    fn drop(&mut self) {
+        // Keep the authoritative registry publication in place until every
+        // physical preparation OFD has been released. Otherwise ordinary
+        // field-order destruction removes the ticket first and briefly leaves
+        // unregistered CPU/permit contention behind on error and cancellation
+        // paths.
+        drop(self.preparation.take());
+        drop(self.ticket.take());
+    }
 }
 
 /// The only probe surface available while atomically consuming a PENDING
@@ -1300,29 +1313,22 @@ impl PendingAdmission {
             .restore_affinity()
     }
 
-    /// Complete immutable preparation without consuming the PENDING ticket.
-    /// Affinity is restored while the old physical/registry CPU fence is still
-    /// intact. The registry then atomically shrinks the same PENDING record to
-    /// prepared-residency memory+token ownership, after which the now-redundant
-    /// physical CPU-SH and CPU-permit OFDs are released.
+    /// Complete immutable preparation without consuming or weakening the
+    /// PENDING ticket. Affinity is restored, while the combined selected-final
+    /// + preparation claim and all physical preparation OFDs remain intact
+    /// until exact activation replaces them atomically.
     pub(crate) fn finish_preparation(&mut self) -> Result<()> {
-        let ticket = self
-            .ticket
-            .as_mut()
+        self.ticket
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("pending admission was already consumed"))?;
+        self.pending_claim
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("pending admission claim was already consumed"))?;
         let preparation = self
             .preparation
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("pending preparation permit was already consumed"))?;
-        if preparation.cpu_permits.is_empty() {
-            return Ok(());
-        }
         preparation.restore_affinity()?;
-        let active = preparation.claim();
-        let residency = preparation.residency_claim();
-        ticket.relax_pending_preparation(&active, &residency)?;
-        preparation.release_preparation_cpu();
-        debug_assert_eq!(preparation.claim(), residency);
         Ok(())
     }
 
@@ -1338,7 +1344,7 @@ impl PendingAdmission {
             .map_or(&[], |preparation| preparation.memory_permits.as_slice())
     }
 
-    fn take_parts(&mut self) -> Result<(registry::Ticket, super::PreparationPermit)> {
+    fn take_parts(&mut self) -> Result<(registry::Ticket, super::PreparationPermit, ClaimSet)> {
         let ticket = self
             .ticket
             .take()
@@ -1347,16 +1353,22 @@ impl PendingAdmission {
             .preparation
             .take()
             .ok_or_else(|| anyhow::anyhow!("pending preparation permit was already consumed"))?;
-        Ok((ticket, preparation))
+        let pending_claim = self
+            .pending_claim
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("pending admission claim was already consumed"))?;
+        Ok((ticket, preparation, pending_claim))
     }
 
     fn from_imported_ticket(
         ticket: registry::Ticket,
         preparation: super::PreparationPermit,
+        pending_claim: ClaimSet,
     ) -> Self {
         Self {
             ticket: Some(ticket),
             preparation: Some(preparation),
+            pending_claim: Some(pending_claim),
         }
     }
 }
@@ -1364,10 +1376,12 @@ impl PendingAdmission {
 fn pending_admission_from_parts(
     ticket: registry::Ticket,
     preparation: super::PreparationPermit,
+    pending_claim: ClaimSet,
 ) -> Result<PendingAdmission> {
     let mut pending = PendingAdmission {
         ticket: Some(ticket),
         preparation: Some(preparation),
+        pending_claim: Some(pending_claim),
     };
     pending
         .preparation
@@ -1380,8 +1394,8 @@ fn pending_admission_from_parts(
 /// Publish a lightweight exact/flexible run intent before acquiring any
 /// physical preparation capacity. The ordinary queue selects among all
 /// visible intents. A selected callback probes the preparation pool exactly
-/// once and either commits PENDING immediately or revokes/requeues its final
-/// claim, so run resources are never retained while waiting for a slot.
+/// once and either commits the selected final + preparation union as PENDING
+/// immediately or revokes/requeues the selection.
 pub(crate) fn register_intent_for_preparation(
     initial_claim: ClaimSet,
     watch: ClaimSet,
@@ -1389,6 +1403,11 @@ pub(crate) fn register_intent_for_preparation(
     mut coordinator_candidate: impl FnMut(&HeldLocks) -> Result<Option<ClaimSet>>,
 ) -> Result<PendingAdmission> {
     let preparation_watch = super::preparation_resource_watch()?;
+    let host_allowed = super::host_allowed_cpus();
+    anyhow::ensure!(
+        !host_allowed.is_empty(),
+        "could not determine allowed CPU set for selected-intent preparation admission",
+    );
     registry::validate_claim_within_watch(&initial_claim, &watch)?;
     let mut ticket = registry::Ticket::register_after_contention_with_capacity(
         initial_claim.clone(),
@@ -1448,9 +1467,15 @@ pub(crate) fn register_intent_for_preparation(
                             });
                         }
 
+                        let preparation_cpus =
+                            super::preparation_affinity_candidates(&designated.cpus, &host_allowed);
+                        anyhow::ensure!(
+                            !preparation_cpus.is_empty(),
+                            "selected final claim has no CPU in the process cpuset",
+                        );
                         let selected = super::try_preparation_candidates_once(
                             rotation_bias,
-                            &designated.cpus.iter().copied().collect::<Vec<_>>(),
+                            &preparation_cpus,
                             |preparation, claim| {
                                 Ok(super::PreparationCandidateDecision::Accepted((
                                     preparation,
@@ -1478,8 +1503,8 @@ pub(crate) fn register_intent_for_preparation(
                     },
                 )?;
                 match result {
-                    registry::GrantResult::Prepared(preparation) => {
-                        return pending_admission_from_parts(ticket, preparation);
+                    registry::GrantResult::Prepared(preparation, pending_claim) => {
+                        return pending_admission_from_parts(ticket, preparation, pending_claim);
                     }
                     registry::GrantResult::Acquired(_, _) => {
                         unreachable!("intent callback published its run claim as HELD")
@@ -1502,9 +1527,15 @@ pub(crate) fn register_intent_for_preparation(
                     if !held.candidate_ready(&selected)? {
                         return Ok(CoordinatorStep::<()>::Waiting { claim: selected });
                     }
+                    let preparation_cpus =
+                        super::preparation_affinity_candidates(&selected.cpus, &host_allowed);
+                    anyhow::ensure!(
+                        !preparation_cpus.is_empty(),
+                        "selected final claim has no CPU in the process cpuset",
+                    );
                     let prepared = super::try_preparation_candidates_once(
                         rotation_bias,
-                        &selected.cpus.iter().copied().collect::<Vec<_>>(),
+                        &preparation_cpus,
                         |preparation, claim| {
                             Ok(super::PreparationCandidateDecision::Accepted((
                                 preparation,
@@ -1515,7 +1546,11 @@ pub(crate) fn register_intent_for_preparation(
                     rotation_bias = rotation_bias.wrapping_add(1);
                     Ok(match prepared {
                         super::PreparationProbe::Acquired((preparation, claim)) => {
-                            CoordinatorStep::Prepare { claim, preparation }
+                            CoordinatorStep::Prepare {
+                                final_claim: selected,
+                                preparation_claim: claim,
+                                preparation,
+                            }
                         }
                         super::PreparationProbe::Contended(evidence) => {
                             held.record_external_contention(evidence);
@@ -1555,12 +1590,14 @@ pub(crate) fn try_register_pending_admission(
     let required = registry::required_bits_for_permit_index(max_permit_index);
     let allowed = super::host_allowed_cpus();
     match super::try_preparation_candidates_once(0, &allowed, |preparation, claim| {
+        let pending_claim = claim.clone();
         Ok(
             match registry::Ticket::try_register_pending(required, claim)? {
                 Some(registry::PendingRegistration::Registered(ticket)) => {
                     super::PreparationCandidateDecision::Accepted(pending_admission_from_parts(
                         ticket,
                         preparation,
+                        pending_claim,
                     )?)
                 }
                 Some(registry::PendingRegistration::Contended(_)) => {
@@ -1588,9 +1625,9 @@ pub(crate) fn register_pending_admission(max_permit_index: usize) -> Result<Pend
         // the physical probe, registration returns None and all flocks are
         // dropped before the next rotated scan.
         let (preparation, claim) = super::acquire_preparation_permit(rotation_bias)?;
-        match registry::Ticket::register_pending(required, claim)? {
+        match registry::Ticket::register_pending(required, claim.clone())? {
             registry::PendingRegistration::Registered(ticket) => {
-                return pending_admission_from_parts(ticket, preparation);
+                return pending_admission_from_parts(ticket, preparation, claim);
             }
             registry::PendingRegistration::Contended(generation) => {
                 drop(preparation);
@@ -1602,19 +1639,18 @@ pub(crate) fn register_pending_admission(max_permit_index: usize) -> Result<Pend
 }
 
 #[cfg(test)]
-pub(crate) struct PreparationResidencyTransitionForTests {
+pub(crate) struct PreparationContinuityForTests {
     pub(crate) pending: PendingAdmission,
     pub(crate) ticket: u64,
     pub(crate) affinity_cpu: usize,
     pub(crate) cpu_permits: Vec<usize>,
     pub(crate) memory_permits: Vec<usize>,
     pub(crate) token_permit: usize,
-    pub(crate) residency: ClaimSet,
+    pub(crate) pending_claim: ClaimSet,
 }
 
 #[cfg(test)]
-pub(crate) fn exercise_preparation_residency_transition_for_tests()
--> Result<PreparationResidencyTransitionForTests> {
+pub(crate) fn exercise_preparation_continuity_for_tests() -> Result<PreparationContinuityForTests> {
     let (preparation, active) = super::acquire_preparation_permit(0)?;
     let affinity_cpu = preparation.affinity_cpu;
     let cpu_permits = preparation.cpu_permits.clone();
@@ -1622,17 +1658,18 @@ pub(crate) fn exercise_preparation_residency_transition_for_tests()
     let token_permit = preparation.token_permit;
     let required =
         registry::required_bits_for_permit_index(super::admission_resource_capacity_hint()?);
-    let ticket = match registry::Ticket::register_pending(required, active)? {
+    let ticket = match registry::Ticket::register_pending(required, active.clone())? {
         registry::PendingRegistration::Registered(ticket) => ticket,
         registry::PendingRegistration::Contended(_) => {
             anyhow::bail!("isolated preparation transition unexpectedly contended")
         }
     };
-    // Deliberately bypass affinity constraining: this helper exercises the
-    // claim/OFD phase transition without perturbing sibling test threads.
+    // Deliberately bypass affinity constraining: this helper exercises
+    // completion-time claim/OFD continuity without perturbing sibling threads.
     let mut pending = PendingAdmission {
         ticket: Some(ticket),
         preparation: Some(preparation),
+        pending_claim: Some(active),
     };
     let ticket_id = pending
         .ticket
@@ -1641,19 +1678,19 @@ pub(crate) fn exercise_preparation_residency_transition_for_tests()
         .pending_exec_handoff_parts()?
         .1;
     pending.finish_preparation()?;
-    let residency = pending
+    let pending_claim = pending
         .preparation
         .as_ref()
-        .expect("relaxed test preparation")
+        .expect("completed test preparation")
         .claim();
-    Ok(PreparationResidencyTransitionForTests {
+    Ok(PreparationContinuityForTests {
         pending,
         ticket: ticket_id,
         affinity_cpu,
         cpu_permits,
         memory_permits,
         token_permit,
-        residency,
+        pending_claim,
     })
 }
 
@@ -2244,13 +2281,13 @@ pub(crate) fn activate_pending_ticket<T>(
     mut try_acquire: impl FnMut(&mut GrantedProbe) -> Result<Option<T>>,
 ) -> Result<TicketWork<T>> {
     check_interrupted(cancelled)?;
-    let (mut ticket, mut preparation) = pending.take_parts()?;
+    let (mut ticket, mut preparation, pending_claim) = pending.take_parts()?;
     anyhow::ensure!(
         !preparation.affinity_constrained,
         "preparation affinity must be restored before exact activation",
     );
     check_result(
-        ticket.activate_pending(initial_claim, watch_claim, cancelled),
+        ticket.activate_pending(&pending_claim, initial_claim, watch_claim, cancelled),
         cancelled,
     )?;
     preparation.release_resources_for_exact()?;
@@ -2268,14 +2305,13 @@ pub(crate) fn try_activate_pending_once<T>(
     mut pending: PendingAdmission,
     attempt: impl FnOnce(&PendingOneShotProbe<'_>) -> Result<Option<(ClaimSet, T)>>,
 ) -> Result<Option<Acquired<T>>> {
-    let (mut ticket, preparation) = pending.take_parts()?;
+    let (mut ticket, preparation, pending_claim) = pending.take_parts()?;
     anyhow::ensure!(
         !preparation.affinity_constrained,
         "preparation affinity must be restored before one-shot activation",
     );
-    let expected_preparation = preparation.claim();
     let reusable_permits = preparation.clone_permit_fds()?;
-    let activated = ticket.try_activate_pending_once(&expected_preparation, move |registry| {
+    let activated = ticket.try_activate_pending_once(&pending_claim, move |registry| {
         let result = {
             let probe = PendingOneShotProbe {
                 registry,
@@ -2359,7 +2395,7 @@ fn drive_registered_ticket<T>(
                         drop(preparation.take());
                         return Ok(TicketWork::Acquired(acquired));
                     }
-                    Ok(registry::GrantResult::Prepared(_)) => {
+                    Ok(registry::GrantResult::Prepared(_, _)) => {
                         unreachable!("ordinary run acquisition committed preparation ownership")
                     }
                     result => result,
@@ -2369,7 +2405,7 @@ fn drive_registered_ticket<T>(
                     registry::GrantResult::Acquired(_, _) => {
                         unreachable!("terminal acquisition returned above")
                     }
-                    registry::GrantResult::Prepared(_) => {
+                    registry::GrantResult::Prepared(_, _) => {
                         unreachable!("prepared result returned through ordinary ticket drive")
                     }
                     registry::GrantResult::Requeued | registry::GrantResult::LostGrant => continue,
@@ -2681,10 +2717,12 @@ pub(in crate::vmm) enum CoordinatorStep<T> {
     /// planning alternative.
     Complete { claim: ClaimSet, value: T },
     /// The coordinator selected this run intent and acquired one bounded
-    /// physical preparation tuple. Commit replaces the intent with PENDING in
-    /// the same ticket; it does not publish the final run claim as HELD.
+    /// physical preparation tuple. Commit publishes their combined footprint
+    /// as PENDING in the same ticket; it does not publish the final run claim
+    /// as HELD.
     Prepare {
-        claim: ClaimSet,
+        final_claim: ClaimSet,
+        preparation_claim: ClaimSet,
         preparation: super::PreparationPermit,
     },
     /// Still waiting. `claim` is the freshly planned target to publish
@@ -3037,7 +3075,11 @@ fn acquire_as_coordinator_impl<T>(
                         }
                     }
                 }
-                CoordinatorStep::Prepare { claim, preparation } => {
+                CoordinatorStep::Prepare {
+                    final_claim,
+                    preparation_claim,
+                    preparation,
+                } => {
                     check_interrupted(cancelled)?;
                     let preparation_contention = held.take_preparation_contention();
                     anyhow::ensure!(
@@ -3045,16 +3087,21 @@ fn acquire_as_coordinator_impl<T>(
                         "coordinator prepared while retaining preparation contention",
                     );
                     let commit_token = held.commit_token()?;
-                    match coordinator
-                        .ticket
-                        .finish_preparation(&claim, commit_token, cancelled)?
-                    {
-                        registry::FinishPreparationResult::Committed => {
+                    match coordinator.ticket.finish_preparation(
+                        &final_claim,
+                        &preparation_claim,
+                        commit_token,
+                        cancelled,
+                    )? {
+                        registry::FinishPreparationResult::Committed(pending_claim) => {
                             drop(held.take_contention());
                             drop(preparation_contention);
                             drop(held.preparation.take());
-                            let pending =
-                                pending_admission_from_parts(coordinator.ticket, preparation)?;
+                            let pending = pending_admission_from_parts(
+                                coordinator.ticket,
+                                preparation,
+                                pending_claim,
+                            )?;
                             break CoordinatorOutcome::Prepared(pending);
                         }
                         registry::FinishPreparationResult::Stale => {

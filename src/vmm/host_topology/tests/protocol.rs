@@ -121,67 +121,66 @@ fn live_pending_head_fences_snapshot_and_probe_without_ex_recovery() {
 }
 
 #[test]
-fn completed_preparation_releases_cpu_convoy_but_retains_residency() {
+fn completed_preparation_retains_full_pending_claim_and_physical_ownership() {
     let _prefixes = LockPrefixesGuard::new();
-    let protocol::PreparationResidencyTransitionForTests {
+    let protocol::PreparationContinuityForTests {
         pending,
         ticket,
         affinity_cpu,
         cpu_permits,
         memory_permits,
         token_permit,
-        residency,
-    } = protocol::exercise_preparation_residency_transition_for_tests()
-        .expect("transition active preparation to prepared residency");
+        pending_claim,
+    } = protocol::exercise_preparation_continuity_for_tests()
+        .expect("complete preparation without weakening PENDING ownership");
 
     assert_eq!(cpu_permits.len(), PREPARATION_CPU_PERMITS);
-    assert!(
-        residency.cpus.is_empty(),
-        "residency must not fence perf CPUs"
-    );
-    assert!(residency.llcs.is_empty());
-    assert!(residency.permits.contains(&token_permit));
+    assert!(pending_claim.cpus.contains(&affinity_cpu));
+    assert!(pending_claim.llcs.is_empty());
+    assert!(pending_claim.permits.contains(&token_permit));
     assert_eq!(
-        residency
+        pending_claim
             .permits
             .intersection(&memory_permits.iter().copied().collect())
             .count(),
         memory_permits.len(),
     );
-    assert!(
-        residency
+    assert_eq!(
+        pending_claim
             .permits
             .intersection(&cpu_permits.iter().copied().collect())
-            .next()
-            .is_none(),
-        "prepared residency must release every cooperative CPU permit",
+            .count(),
+        cpu_permits.len(),
+        "completed preparation must retain every cooperative CPU permit",
     );
 
     let snapshot =
-        protocol::ticket_registry_snapshot_for_tests().expect("snapshot relaxed PENDING record");
+        protocol::ticket_registry_snapshot_for_tests().expect("snapshot completed PENDING record");
     assert_eq!(snapshot.len(), 1);
     assert_eq!(
         snapshot[0].0, ticket,
-        "relaxation must retain ticket identity"
+        "preparation completion must retain ticket identity"
     );
-    assert_eq!(snapshot[0].2, residency);
+    assert_eq!(snapshot[0].2, pending_claim);
 
-    drop(
+    assert!(
         crate::flock::try_flock(
             cpu_lock_path(affinity_cpu),
             crate::flock::FlockMode::Exclusive,
         )
-        .expect("probe released preparation affinity CPU")
-        .expect("completed preparation still owns its affinity CPU"),
+        .expect("probe retained preparation affinity CPU")
+        .is_none(),
+        "completed preparation released its affinity CPU before exact activation",
     );
     for permit in &cpu_permits {
-        drop(
+        assert!(
             crate::flock::try_flock(
                 permit_lock_path(*permit),
                 crate::flock::FlockMode::Exclusive,
             )
-            .expect("probe released preparation CPU permit")
-            .unwrap_or_else(|| panic!("completed preparation still owns CPU permit {permit}")),
+            .expect("probe retained preparation CPU permit")
+            .is_none(),
+            "completed preparation released CPU permit {permit} before exact activation",
         );
     }
     for permit in memory_permits.iter().chain(std::iter::once(&token_permit)) {
@@ -190,9 +189,9 @@ fn completed_preparation_releases_cpu_convoy_but_retains_residency() {
                 permit_lock_path(*permit),
                 crate::flock::FlockMode::Exclusive,
             )
-            .expect("probe retained prepared-residency permit")
+            .expect("probe retained preparation permit")
             .is_none(),
-            "prepared residency released permit {permit} before exact admission",
+            "completed preparation released permit {permit} before exact activation",
         );
     }
 
@@ -203,15 +202,15 @@ fn completed_preparation_releases_cpu_convoy_but_retains_residency() {
         crate::flock::FlockMode::Exclusive,
     );
     assert!(
-        !protocol::registered_claim_conflicts(&perf_probe)
+        protocol::registered_claim_conflicts(&perf_probe)
             .expect("probe perf admission after preparation completion"),
-        "a prepared waiter must not fence CPU-EX admission",
+        "completed preparation must retain its CPU fence until exact activation",
     );
 
     drop(pending);
     assert!(
         protocol::ticket_registry_snapshot_for_tests()
-            .expect("snapshot released prepared residency")
+            .expect("snapshot released completed preparation")
             .is_empty(),
     );
 }
@@ -1016,8 +1015,8 @@ fn uncontended_fast_fence_does_not_create_registry_metadata() {
     let protocol_dir = std::path::Path::new(&cpu_path)
         .parent()
         .expect("resource lock parent");
-    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v16");
-    let event_dir = protocol_dir.join("ktstr-acquire-events-v16");
+    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v17");
+    let event_dir = protocol_dir.join("ktstr-acquire-events-v17");
     assert!(!registry_dir.exists());
     assert!(!event_dir.exists());
 
@@ -1189,7 +1188,7 @@ fn tracked_acquired_drop_keeps_its_registry_namespace_across_threads() {
     let wrong = tempfile::TempDir::new().expect("wrong-namespace tempdir");
     let wrong_llc_prefix = format!("{}/llc-", wrong.path().display());
     let wrong_cpu_prefix = format!("{}/cpu-", wrong.path().display());
-    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v16");
+    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v17");
     std::fs::create_dir_all(&wrong_registry).expect("create wrong registry directory");
     let wrong_registry_lock =
         crate::flock::try_flock(wrong_registry.join("registry.lock"), FlockMode::Exclusive)
@@ -2907,13 +2906,20 @@ fn early_final_intent_is_visible_before_preparation_and_transitions_same_ticket_
         .find(|(ticket, _, _)| *ticket == early_ticket)
         .map(|(_, _, claim)| claim)
         .expect("same ticket must remain published after preparation acquisition");
-    assert_ne!(pending_claim, &final_claim);
+    assert!(final_claim.cpus.is_subset(&pending_claim.cpus));
+    assert!(final_claim.llcs.is_subset(&pending_claim.llcs));
+    assert_eq!(pending_claim.cpu_mode, protocol::ClaimMode::Exclusive);
     assert!(pending_claim.cpus.contains(&prepared_cpu));
     assert!(
         preparation_permits
             .iter()
             .all(|permit| pending_claim.permits.contains(permit)),
         "PENDING claim must publish every physically held preparation permit",
+    );
+    assert!(
+        protocol::registered_claim_conflicts(&final_claim)
+            .expect("probe retained selected-final claim during PENDING"),
+        "PENDING must continuously fence the selected final intent",
     );
 
     release_tx
@@ -2952,17 +2958,23 @@ fn selected_performance_and_default_intents_share_preparation_affinity_path() {
         crate::flock::FlockMode::Exclusive,
         crate::flock::FlockMode::Shared,
     ] {
+        let admission_class = if cpu_mode == crate::flock::FlockMode::Shared {
+            protocol::AdmissionClass::DefaultBorrow
+        } else {
+            protocol::AdmissionClass::Ordinary
+        };
         let claim = protocol::ClaimSet::with_modes(
             std::iter::empty(),
             [affinity_cpu],
             crate::flock::FlockMode::Shared,
             cpu_mode,
-        );
+        )
+        .with_admission_class(admission_class);
         let granted_claim = claim.clone();
         let coordinator_claim = claim.clone();
         let mut pending = protocol::register_intent_for_preparation(
             claim.clone(),
-            claim,
+            claim.clone(),
             move |_| Ok(Some(granted_claim.clone())),
             move |_| Ok(Some(coordinator_claim.clone())),
         )
@@ -2975,6 +2987,24 @@ fn selected_performance_and_default_intents_share_preparation_affinity_path() {
                 .expect("inspect selected preparation affinity")
                 .0,
             affinity_cpu,
+        );
+        let ticket = pending
+            .exec_handoff_parts()
+            .expect("inspect selected preparation ticket")
+            .1;
+        let pending_claim = protocol::ticket_registry_snapshot_for_tests()
+            .expect("snapshot selected preparation")
+            .into_iter()
+            .find(|(candidate, _, _)| *candidate == ticket)
+            .map(|(_, _, claim)| claim)
+            .expect("selected preparation remains published");
+        assert_eq!(pending_claim.cpu_mode, cpu_mode.into());
+        assert_eq!(pending_claim.admission_class, admission_class);
+        assert_eq!(
+            protocol::registered_claim_conflicts(&claim)
+                .expect("probe selected-final sharing semantics"),
+            cpu_mode == crate::flock::FlockMode::Exclusive,
+            "PENDING must preserve performance EX and default SH semantics",
         );
         let disjoint_ex = protocol::ClaimSet::with_modes(
             std::iter::empty(),
@@ -3007,6 +3037,25 @@ fn selected_performance_and_default_intents_share_preparation_affinity_path() {
             "retiring one selected preparation must leave only the anchor",
         );
     }
+}
+
+#[test]
+fn selected_preparation_affinity_intersects_process_cpuset_without_shrinking_final_claim() {
+    let selected = [2usize, 3, 8, 9]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        preparation_affinity_candidates(&selected, &[3, 7, 9]),
+        vec![3, 9]
+    );
+    assert_eq!(
+        selected,
+        [2usize, 3, 8, 9]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "preparation affinity filtering must not mutate the selected final footprint",
+    );
+    assert!(preparation_affinity_candidates(&selected, &[0, 1]).is_empty());
 }
 
 #[test]
@@ -4156,15 +4205,30 @@ fn pending_exec_v3_export_process_helper() {
     if !install_pending_v3_prefixes() {
         return;
     }
-    let pending = protocol::register_pending_admission(
-        admission_resource_capacity_hint().expect("pending v3 resource capacity"),
+    let affinity_cpu = *host_allowed_cpus()
+        .first()
+        .expect("pending v3 exporter has an allowed CPU");
+    let final_claim = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [affinity_cpu],
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Exclusive,
+    );
+    let granted_claim = final_claim.clone();
+    let coordinator_claim = final_claim.clone();
+    let pending = protocol::register_intent_for_preparation(
+        final_claim.clone(),
+        final_claim,
+        move |_| Ok(Some(granted_claim.clone())),
+        move |_| Ok(Some(coordinator_claim.clone())),
     )
-    .expect("register pending v3 admission");
-    let (affinity_cpu, _, original_affinity) = pending
+    .expect("register selected-final pending v3 admission");
+    let (prepared_cpu, _, original_affinity) = pending
         .preparation_affinity_handoff_parts()
         .expect("read pending v3 affinity");
+    assert_eq!(prepared_cpu, affinity_cpu);
     let metadata = format!(
-        "{affinity_cpu}|{}",
+        "{prepared_cpu}|{}",
         original_affinity
             .iter()
             .map(usize::to_string)
@@ -4251,6 +4315,15 @@ fn pending_exec_v3_import_process_helper() {
     assert_eq!(
         imported_claim.permits.iter().copied().collect::<Vec<_>>(),
         permits,
+    );
+    assert_eq!(
+        imported_claim.cpu_mode,
+        protocol::ClaimMode::Exclusive,
+        "same-exec handoff must recover the selected final CPU-EX intent, not only CPU-SH preparation",
+    );
+    assert_eq!(
+        imported_claim.admission_class,
+        protocol::AdmissionClass::Ordinary,
     );
     assert!(
         crate::flock::try_flock(
@@ -5784,7 +5857,7 @@ fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
     let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .expect("re-block waiter after epoch transition");
-    // Leave the replacement as an external, unregistered flock. A current-v16
+    // Leave the replacement as an external, unregistered flock. A current-v17
     // HELD publication would authoritatively revoke the in-flight grant before
     // its callback returned, bypassing the stale-negative-evidence path this
     // test is meant to pin.
@@ -6032,7 +6105,7 @@ fn remove_crash_after_counts_before_free_is_repaired() {
     let markers = tempfile::TempDir::new().expect("marker dir");
     let removing =
         TicketChild::spawn_crashing(markers.path(), "removing", "1", "remove_counts_before_free");
-    // The v16 HELD lifecycle removes its registry record only after the
+    // The v17 HELD lifecycle removes its registry record only after the
     // physical reservation is released. Let the helper pass its normal
     // release barrier so the injected crash observes that production ordering.
     std::fs::write(&removing.release, b"release").expect("release crash-test reservation");

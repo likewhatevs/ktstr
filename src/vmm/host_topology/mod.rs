@@ -2323,6 +2323,20 @@ pub(crate) fn host_allowed_cpus() -> Vec<usize> {
     Vec::new()
 }
 
+/// CPUs eligible for selected-intent preparation. The final claim retains its
+/// complete topology footprint, but temporary preparation affinity can only
+/// name CPUs the current process is actually permitted to enter.
+pub(super) fn preparation_affinity_candidates(
+    selected: &std::collections::BTreeSet<usize>,
+    allowed: &[usize],
+) -> Vec<usize> {
+    allowed
+        .iter()
+        .copied()
+        .filter(|cpu| selected.contains(cpu))
+        .collect()
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test-only override for [`host_allowed_cpus`]. Set via
@@ -3558,9 +3572,9 @@ impl MemoryPermitPool {
 
 /// Capacity held while a test process prepares immutable artifacts. Active
 /// preparation is expressed in the same abstract CPU and memory namespaces as
-/// a running VM. Once preparation completes, the CPU side is released and the
-/// same PENDING ticket retains only its token plus private/COW memory charge
-/// until exact admission replaces that estimate with computed guest demand.
+/// a running VM. The selected final intent and all preparation resources stay
+/// published and physically held until exact admission replaces the combined
+/// PENDING claim with computed guest demand.
 pub(super) struct PreparationPermit {
     pub(super) index: usize,
     pub(super) token_permit: usize,
@@ -3610,26 +3624,6 @@ impl PreparationPermit {
             FlockMode::Shared,
             &self.all_permits(),
             admission_class,
-        )
-    }
-
-    /// Claim retained after immutable preparation and before exact run
-    /// admission. The token bounds the number of resident prepared processes,
-    /// while the fixed memory charge accounts their private/COW footprint.
-    /// CPU permits and the physical affinity CPU are preparation-time work
-    /// resources and must not remain in the exact-admission queue.
-    pub(super) fn residency_claim(&self) -> protocol::ClaimSet {
-        let mut permits = Vec::with_capacity(1 + self.memory_permits.len());
-        permits.push(self.token_permit);
-        permits.extend_from_slice(&self.memory_permits);
-        permits.sort_unstable();
-        resource_claim_with_permits(
-            &[],
-            LlcLockMode::Shared,
-            &[],
-            FlockMode::Shared,
-            &permits,
-            protocol::AdmissionClass::Ordinary,
         )
     }
 
@@ -3700,26 +3694,6 @@ impl PreparationPermit {
             .context("restore affinity before exact VM admission")?;
         self.affinity_constrained = false;
         Ok(())
-    }
-
-    /// Release the CPU side of preparation after the registry has replaced
-    /// the active-preparation claim with [`Self::residency_claim`]. This is
-    /// deliberately infallible after construction/import validation: once the
-    /// registry transition commits, returning with CPU OFDs retained would
-    /// recreate the convoy this phase boundary exists to prevent.
-    pub(super) fn release_preparation_cpu(&mut self) {
-        debug_assert!(!self.affinity_constrained);
-        drop(self.affinity_lock.take());
-        let cpu_permits = std::mem::take(&mut self.cpu_permits)
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>();
-        self.permit_fds
-            .retain(|(permit, _)| !cpu_permits.contains(permit));
-        debug_assert_eq!(
-            self.permit_fds.len(),
-            1 + self.memory_permits.len(),
-            "prepared residency must retain exactly its token and memory OFDs",
-        );
     }
 
     /// The exact registry claim has atomically replaced PENDING, so its
