@@ -7938,10 +7938,7 @@ path = "junit.xml"
                 "{runtime} must remain runtime-only for the cached producer",
             );
             assert!(
-                !matches!(
-                    command_environment.get(OsStr::new(runtime)),
-                    Some(Some(_))
-                ),
+                !matches!(command_environment.get(OsStr::new(runtime)), Some(Some(_))),
                 "{runtime} must be absent from the Cargo child",
             );
         }
