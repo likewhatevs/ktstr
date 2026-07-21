@@ -1591,6 +1591,183 @@ fn force_nextest_output(args: &[String], output_target: &Path) -> Vec<String> {
     out
 }
 
+/// Move nextest's independent run store alongside the writable Cargo output.
+///
+/// `--target-dir` only controls Cargo. Nextest resolves `[store].dir` against
+/// the workspace root and eagerly creates it whenever the selected profile has
+/// JUnit enabled, including for `nextest list`. Cached producers execute from
+/// ktstr's immutable stable source, so leaving the default `target/nextest`
+/// there turns a read-only source snapshot into an output directory and fails
+/// before Cargo can build anything.
+///
+/// Materialize the exact selected repository config with only `store.dir`
+/// replaced by an absolute path under this producer/materialization's private
+/// target directory. An explicit `--config-file` keeps all of its settings;
+/// otherwise the workspace default is copied when present. Supplying the
+/// generated file through nextest's highest-priority `--config-file` surface
+/// also relocates an explicitly configured relative store rather than relying
+/// on lower-priority tool config.
+pub(crate) fn remap_nextest_store_output(
+    args: &[String],
+    workspace_root: &Path,
+    invocation_dir: &Path,
+    output_target: &Path,
+) -> Result<Vec<String>, String> {
+    let separator = args
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(args.len());
+    let mut explicit = None;
+    let mut explicit_range = None;
+    let mut index = 0;
+    while index < separator {
+        let argument = &args[index];
+        if argument == "--config-file" {
+            let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
+                // Preserve malformed argv for nextest's own diagnostic.
+                return Ok(args.to_vec());
+            };
+            if explicit.is_some() {
+                // Clap owns duplicate-option semantics; do not accidentally
+                // turn malformed input into a successful invocation.
+                return Ok(args.to_vec());
+            }
+            explicit = Some(value.as_str());
+            explicit_range = Some(index..index + 2);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--config-file=") {
+            if value.is_empty() || explicit.is_some() {
+                return Ok(args.to_vec());
+            }
+            explicit = Some(value);
+            explicit_range = Some(index..index + 1);
+        }
+        index += 1;
+    }
+
+    let source = explicit.map_or_else(
+        || workspace_root.join(".config/nextest.toml"),
+        |value| {
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                path
+            } else {
+                invocation_dir.join(path)
+            }
+        },
+    );
+    let mut config = if source.is_file() {
+        let text = std::fs::read_to_string(&source).map_err(|error| {
+            format!(
+                "cargo ktstr: read nextest config {} for output remapping: {error}",
+                source.display(),
+            )
+        })?;
+        text.parse::<toml::Table>().map_err(|error| {
+            format!(
+                "cargo ktstr: parse nextest config {} for output remapping: {error}",
+                source.display(),
+            )
+        })?
+    } else if explicit.is_some() {
+        // Preserve nextest's native missing-file error and exact argv.
+        return Ok(args.to_vec());
+    } else {
+        toml::Table::new()
+    };
+
+    let store = config
+        .entry("store")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let store = store.as_table_mut().ok_or_else(|| {
+        format!(
+            "cargo ktstr: nextest config {} has non-table `store`",
+            source.display(),
+        )
+    })?;
+    let output_target = if output_target.is_absolute() {
+        output_target.to_path_buf()
+    } else {
+        invocation_dir.join(output_target)
+    };
+    let store_dir = output_target.join("nextest");
+    let store_dir = store_dir.to_str().ok_or_else(|| {
+        format!(
+            "cargo ktstr: nextest store path is not valid UTF-8: {}",
+            store_dir.display(),
+        )
+    })?;
+    store.insert(
+        "dir".to_string(),
+        toml::Value::String(store_dir.to_string()),
+    );
+
+    let overlay_dir = output_target.join(".ktstr-nextest");
+    std::fs::create_dir_all(&overlay_dir).map_err(|error| {
+        format!(
+            "cargo ktstr: create nextest output-config directory {}: {error}",
+            overlay_dir.display(),
+        )
+    })?;
+    let rendered = toml::to_string(&config)
+        .map_err(|error| format!("cargo ktstr: encode remapped nextest config: {error}"))?;
+    let overlay = publish_nextest_output_config(&overlay_dir, rendered.as_bytes())?;
+
+    let replacement = format!("--config-file={}", overlay.display());
+    let mut out = args.to_vec();
+    if let Some(range) = explicit_range {
+        out.splice(range, [replacement]);
+    } else {
+        out.insert(separator, replacement);
+    }
+    Ok(out)
+}
+
+fn publish_nextest_output_config(directory: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    use std::io::Write as _;
+
+    let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
+    hasher.write_u64(b"ktstr-nextest-output-config".len() as u64);
+    hasher.write(b"ktstr-nextest-output-config");
+    hasher.write_u64(bytes.len() as u64);
+    hasher.write(bytes);
+    let target = directory.join(format!("config-{:016x}.toml", hasher.finish()));
+    if std::fs::read(&target).is_ok_and(|current| current == bytes) {
+        return Ok(target);
+    }
+
+    let mut staging = tempfile::Builder::new()
+        .prefix(".config-staging-")
+        .tempfile_in(directory)
+        .map_err(|error| {
+            format!(
+                "cargo ktstr: create nextest output-config staging file in {}: {error}",
+                directory.display(),
+            )
+        })?;
+    staging
+        .write_all(bytes)
+        .and_then(|()| staging.flush())
+        .map_err(|error| {
+            format!(
+                "cargo ktstr: write nextest output-config staging file in {}: {error}",
+                directory.display(),
+            )
+        })?;
+    match staging.persist_noclobber(&target) {
+        Ok(_) => Ok(target),
+        Err(_error) if std::fs::read(&target).is_ok_and(|current| current == bytes) => Ok(target),
+        Err(error) => Err(format!(
+            "cargo ktstr: publish nextest output config {}: {}",
+            target.display(),
+            error.error,
+        )),
+    }
+}
+
 fn remap_workspace_argument_path(
     value: &str,
     original_workspace: &Path,
@@ -2333,6 +2510,12 @@ pub(crate) fn load_or_build_nextest_artifacts(
         );
         let output_target = &stable_build.target_directory;
         let output_build = stable_build.root.join("build");
+        let build_args = remap_nextest_store_output(
+            &build_args,
+            &stable.workspace_root,
+            &stable_invocation_dir,
+            output_target,
+        )?;
         // Artifact closure publication is strict FICLONE. Keep producer-side
         // profiles on the deterministic Cargo-output filesystem rather than
         // the process-global temporary filesystem, which is commonly a
@@ -3245,6 +3428,13 @@ fn run_cargo_sub(
         } else {
             run_args
         };
+        let stable_run_args = cached.remap_cargo_args(&run_args);
+        let run_args = remap_nextest_store_output(
+            &stable_run_args,
+            &cached.workspace_root,
+            &cached.invocation_root,
+            &target_dir_path,
+        )?;
         let cached_args =
             inject_nextest_reuse_args(TEST_SUB_ARGV, run_args, &cached.reuse_build_args());
         cmd = build_cargo_command(
@@ -5641,6 +5831,126 @@ mod tests {
             assert!(!args.iter().any(|argument| argument == "-j"));
         }
         assert!(warm_args.iter().any(|argument| argument == "--no-run"));
+    }
+
+    #[test]
+    fn cached_nextest_store_is_authoritatively_remapped_out_of_stable_source() {
+        let fixture = tempfile::tempdir().expect("temporary nextest output-remap fixture");
+        let stable_workspace = fixture.path().join("stable-source/source/primary");
+        let invocation = stable_workspace.join("member");
+        let config_dir = stable_workspace.join(".config");
+        let output_target = fixture.path().join("stable-build/target");
+        std::fs::create_dir_all(&invocation).expect("create stable invocation");
+        std::fs::create_dir_all(&config_dir).expect("create stable nextest config directory");
+        std::fs::write(
+            config_dir.join("nextest.toml"),
+            r#"
+[store]
+dir = "repo-relative-store"
+
+[profile.ci]
+test-threads = 77
+
+[profile.ci.junit]
+path = "junit.xml"
+"#,
+        )
+        .expect("write stable nextest config");
+
+        let args = strs(&["--profile", "ci", "--", "--nocapture"]);
+        let remapped =
+            remap_nextest_store_output(&args, &stable_workspace, &invocation, &output_target)
+                .expect("remap nextest store");
+        let separator = remapped
+            .iter()
+            .position(|argument| argument == "--")
+            .expect("test-binary separator retained");
+        let overlay = remapped[..separator]
+            .iter()
+            .find_map(|argument| argument.strip_prefix("--config-file="))
+            .map(PathBuf::from)
+            .expect("authoritative config-file injected before suffix");
+        assert_eq!(&remapped[separator..], &["--", "--nocapture"]);
+        assert!(overlay.starts_with(&output_target));
+
+        let config = std::fs::read_to_string(&overlay)
+            .expect("read generated nextest config")
+            .parse::<toml::Table>()
+            .expect("parse generated nextest config");
+        assert_eq!(
+            config["store"]["dir"].as_str(),
+            output_target.join("nextest").to_str(),
+            "repo-relative store must be overridden by the private writable target",
+        );
+        assert_eq!(
+            config["profile"]["ci"]["test-threads"].as_integer(),
+            Some(77),
+            "all non-output repository config semantics must be preserved",
+        );
+        assert_eq!(
+            config["profile"]["ci"]["junit"]["path"].as_str(),
+            Some("junit.xml"),
+        );
+        assert!(
+            std::fs::read_to_string(config_dir.join("nextest.toml"))
+                .expect("original config remains readable")
+                .contains("repo-relative-store"),
+            "immutable source config must not be modified",
+        );
+    }
+
+    #[test]
+    fn explicit_nextest_config_is_rewritten_in_place_without_touching_suffix() {
+        let fixture = tempfile::tempdir().expect("temporary explicit nextest config fixture");
+        let workspace = fixture.path().join("workspace");
+        let invocation = workspace.join("member");
+        let output_target = fixture.path().join("output/target");
+        std::fs::create_dir_all(&invocation).expect("create invocation directory");
+        std::fs::write(
+            invocation.join("custom-nextest.toml"),
+            "[profile.default]\nretries = 9\n",
+        )
+        .expect("write explicit nextest config");
+        let args = strs(&[
+            "--config-file",
+            "custom-nextest.toml",
+            "--run-ignored",
+            "all",
+            "--",
+            "--config-file",
+            "opaque-to-nextest",
+        ]);
+
+        let remapped = remap_nextest_store_output(&args, &workspace, &invocation, &output_target)
+            .expect("remap explicit nextest config");
+        assert!(
+            !remapped
+                .iter()
+                .any(|argument| argument == "custom-nextest.toml")
+        );
+        assert_eq!(
+            &remapped[remapped
+                .iter()
+                .position(|argument| argument == "--")
+                .expect("suffix separator retained")..],
+            &["--", "--config-file", "opaque-to-nextest"],
+        );
+        let overlay = remapped
+            .iter()
+            .find_map(|argument| argument.strip_prefix("--config-file="))
+            .expect("explicit config replaced by overlay");
+        let config = std::fs::read_to_string(overlay)
+            .expect("read explicit overlay")
+            .parse::<toml::Table>()
+            .expect("parse explicit overlay");
+        assert_eq!(
+            config["profile"]["default"]["retries"].as_integer(),
+            Some(9),
+        );
+        assert_eq!(
+            config["store"]["dir"].as_str(),
+            output_target.join("nextest").to_str(),
+        );
     }
 
     #[test]

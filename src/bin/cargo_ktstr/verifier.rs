@@ -2390,8 +2390,15 @@ pub(crate) fn run_verifier(
             None
         };
         let binary_declarations = if let Some(cached) = &cached_artifacts {
+            let nextest_args = cached.remap_cargo_args(&nextest_args);
+            let nextest_args = crate::run_cargo::remap_nextest_store_output(
+                &nextest_args,
+                &cached.workspace_root,
+                &cached.invocation_root,
+                &harness_target_dir,
+            )?;
             let cached_command = crate::run_cargo::inject_nextest_command_reuse_args(
-                nextest_args.clone(),
+                nextest_args,
                 &cached.reuse_build_args(),
             )?;
             cmd = Command::new("cargo");

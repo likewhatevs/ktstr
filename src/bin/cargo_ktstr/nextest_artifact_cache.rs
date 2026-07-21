@@ -2374,9 +2374,9 @@ pub(crate) struct StableCargoSource {
 }
 
 impl StableCargoSource {
-    /// Remap explicit Cargo files and inline path-valued config onto immutable
-    /// files and source roots captured in this stable source. Named target
-    /// triples and non-path inline config remain unchanged.
+    /// Remap explicit Cargo/nextest files and inline path-valued config onto
+    /// immutable files and source roots captured in this stable source. Named
+    /// target triples and non-path inline config remain unchanged.
     pub(crate) fn remap_cargo_args(&self, arguments: &[String]) -> Vec<String> {
         let absolute_argument_path = |value: &str| {
             let path = Path::new(value);
@@ -2426,12 +2426,14 @@ impl StableCargoSource {
         let mut index = 0;
         while index < arguments.len() {
             let argument = &arguments[index];
-            if matches!(argument.as_str(), "--config" | "--target") {
+            if matches!(argument.as_str(), "--config" | "--config-file" | "--target") {
                 remapped.push(argument.clone());
                 index += 1;
                 if let Some(value) = arguments.get(index) {
                     let value = if argument == "--config" {
                         remap_config_value(value)
+                    } else if argument == "--config-file" {
+                        remap_source_path(value)
                     } else {
                         remap_explicit_file(value)
                     };
@@ -2444,6 +2446,12 @@ impl StableCargoSource {
                 remapped.push(
                     remap_config_value(value)
                         .map(|value| format!("--config={value}"))
+                        .unwrap_or_else(|| argument.clone()),
+                );
+            } else if let Some(value) = argument.strip_prefix("--config-file=") {
+                remapped.push(
+                    remap_source_path(value)
+                        .map(|value| format!("--config-file={value}"))
                         .unwrap_or_else(|| argument.clone()),
                 );
             } else if let Some(value) = argument.strip_prefix("--target=") {
