@@ -22,8 +22,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ14");
-const VERSION: u32 = 14;
+const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ15");
+const VERSION: u32 = 15;
 const HEADER_FIXED: usize = 256;
 const HEADER_ALIGN: usize = 4096;
 const RECORD_FIXED: usize = 192;
@@ -32,8 +32,8 @@ const RECORDS_PER_CHUNK: usize = 64;
 const NONE_SLOT: u64 = u64::MAX;
 const MAX_RESOURCE_BITS: usize = 1 << 20;
 const MAX_REGISTRY_SLOTS: u64 = 1 << 16;
-const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v14-init-";
-const LIVENESS_PREFIX: &str = "ktstr-acquire-v14-slot-";
+const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v15-init-";
+const LIVENESS_PREFIX: &str = "ktstr-acquire-v15-slot-";
 const LIVENESS_SEPARATOR: &str = "-ticket-";
 const LIVENESS_SUFFIX: &str = ".live";
 
@@ -182,9 +182,16 @@ const R_PREFIX_EPOCH: usize = 112;
 const R_WATCH_PERMIT_MODE: usize = 120;
 const R_CLAIM_CLASS: usize = 124;
 const R_WATCH_CLASS: usize = 128;
-/// Remaining cooperative CPU-permit units which may backfill while this exact
-/// ticket is the oldest physically unavailable admission candidate.
-const R_BACKFILL_CREDIT: usize = 132;
+/// Maximum cooperative CPU-permit units which may be outstanding as backfill
+/// while this exact ticket is the oldest physically unavailable candidate.
+/// Completed bypass work is subtracted from the live scan, not permanently
+/// debited from this capacity.
+const R_BACKFILL_CAPACITY: usize = 132;
+/// Monotonic timestamp at which this claim first became the oldest physically
+/// unavailable admission candidate. Reclaiming completed backfill keeps the
+/// host busy only for a bounded interval; after this age expires, new
+/// conflicting grants stop and the outstanding wave drains for the head.
+const R_BACKFILL_STARTED_NS: usize = 136;
 const R_BITS: usize = RECORD_FIXED;
 
 const RB_CLAIM_CPUS: usize = 0;
@@ -274,6 +281,13 @@ const COORDINATOR_HEARTBEAT_REFRESH_NS: u64 = 30_000_000_000;
 /// to survive severe host oversubscription while still bounding a live process
 /// that stopped advancing the shared queue.
 const COORDINATOR_LEASE_NS: u64 = 120_000_000_000;
+/// Keep a physically blocked exact head work-conserving for one coordinator
+/// lease while bounding starvation. During this interval the backfill capacity
+/// limits *currently outstanding* bypass work, so a completed small cell can
+/// be replaced instead of manufacturing a low-utilization drain bubble. Once
+/// the interval expires, no replacement conflicts are issued and at most one
+/// capacity wave remains to drain before the head runs.
+const BACKFILL_MAX_AGE_NS: u64 = COORDINATOR_LEASE_NS;
 
 #[cfg(test)]
 thread_local! {
@@ -619,7 +633,8 @@ struct Record {
     replan_claim_epoch: u64,
     grant_epoch: u64,
     prefix_epoch: u64,
-    backfill_credit: u32,
+    backfill_capacity: u32,
+    backfill_started_ns: u64,
     prev_active: u64,
     next_active: u64,
 }
@@ -1141,9 +1156,10 @@ impl Ticket {
             write_u64(bytes, R_PREFIX_EPOCH, 0);
             write_u32(
                 bytes,
-                R_BACKFILL_CREDIT,
-                backfill_credit_for_watch(residency),
+                R_BACKFILL_CAPACITY,
+                backfill_capacity_for_watch(residency),
             );
+            write_u64(bytes, R_BACKFILL_STARTED_NS, 0);
             write_u64(bytes, R_BLOCKED_SERIAL, 0);
             write_u32(bytes, R_BLOCK_KIND, BLOCK_NONE);
             write_u32(bytes, R_BLOCK_MODE, 0);
@@ -1263,7 +1279,12 @@ impl Ticket {
             write_u64(bytes, R_GRANT_EPOCH, 0);
             write_u64(bytes, R_REPLAN_CLAIM_EPOCH, 0);
             write_u64(bytes, R_PREFIX_EPOCH, 0);
-            write_u32(bytes, R_BACKFILL_CREDIT, backfill_credit_for_watch(&watch));
+            write_u32(
+                bytes,
+                R_BACKFILL_CAPACITY,
+                backfill_capacity_for_watch(&watch),
+            );
+            write_u64(bytes, R_BACKFILL_STARTED_NS, 0);
             write_u64(bytes, R_BLOCKED_SERIAL, 0);
             write_u32(bytes, R_BLOCK_KIND, BLOCK_NONE);
             write_u32(bytes, R_BLOCK_MODE, 0);
@@ -3097,7 +3118,7 @@ pub(super) fn diagnostics_for_tests() -> Result<String> {
         rows.push(format!(
             "ticket={} pid={} state={} claim={:?} watch={:?} blocked={:?} \
              issue_serial={} watch_serial={} grant_epoch={} replan_epoch={} prefix_epoch={} \
-             backfill_credit={}",
+             backfill_capacity={} backfill_started_ns={}",
             record.ticket,
             record.pid,
             state,
@@ -3109,7 +3130,8 @@ pub(super) fn diagnostics_for_tests() -> Result<String> {
             record.grant_epoch,
             record.replan_claim_epoch,
             record.prefix_epoch,
-            record.backfill_credit,
+            record.backfill_capacity,
+            record.backfill_started_ns,
         ));
     }
     Ok(format!(
@@ -3412,7 +3434,7 @@ pub(super) fn exercise_resource_weighted_backfill_accounting_for_tests() -> (u32
         FlockMode::Exclusive,
     );
     (
-        backfill_credit_for_watch(&watch),
+        backfill_capacity_for_watch(&watch),
         backfill_cost_for_claim(&light),
         backfill_cost_for_claim(&heavy),
         backfill_cost_for_claim(&non_cooperative),
@@ -3421,17 +3443,17 @@ pub(super) fn exercise_resource_weighted_backfill_accounting_for_tests() -> (u32
 
 #[cfg(test)]
 pub(super) fn exercise_work_conserving_backfill_for_tests()
--> Result<(usize, usize, usize, bool, bool, bool, bool)> {
-    const TEST_CREDIT: u32 = 3;
-    const CONFLICTING: usize = TEST_CREDIT as usize + 2;
-    const DISJOINT: usize = TEST_CREDIT as usize + 5;
+-> Result<(usize, usize, usize, bool, bool, bool, bool, bool)> {
+    const TEST_CAPACITY: u32 = 3;
+    const CONFLICTING: usize = TEST_CAPACITY as usize + 2;
+    const DISJOINT: usize = TEST_CAPACITY as usize + 5;
 
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [3usize], FlockMode::Exclusive);
     let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
     let wide = ClaimSet::with_permits(
         std::iter::empty(),
         [0usize, 1usize],
-        0..TEST_CREDIT as usize,
+        0..TEST_CAPACITY as usize,
         FlockMode::Exclusive,
         FlockMode::Exclusive,
         FlockMode::Exclusive,
@@ -3455,13 +3477,32 @@ pub(super) fn exercise_work_conserving_backfill_for_tests()
     let mut disjoint = (0..DISJOINT)
         .map(|_| Ticket::register(disjoint_claim.clone(), disjoint_claim.clone(), None))
         .collect::<Result<Vec<_>>>()?;
+    let count_state = |table: &mut Table, tickets: &[Ticket], state| -> Result<usize> {
+        tickets.iter().try_fold(0usize, |count, ticket| {
+            Ok(count
+                + if table
+                    .record(ticket.slot)?
+                    .is_some_and(|record| record.state == state)
+                {
+                    1
+                } else {
+                    0
+                })
+        })
+    };
 
-    let (charged_grants, waiting_after_budget, disjoint_grants) = {
+    let (initial_grants, initial_waiters, disjoint_grants, backfill_started_ns) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
         table.set_record_state(coordinator.slot, STATE_COORDINATOR)?;
         table.set_record_state(wide_ticket.slot, STATE_WAITING)?;
-        table.set_record_backfill_credit(wide_ticket.slot, TEST_CREDIT)?;
+        table.set_record_backfill_capacity(wide_ticket.slot, TEST_CAPACITY)?;
+        let scan_now_ns = monotonic_now_ns()?.max(1);
+        let stale_future_ns = scan_now_ns
+            .checked_add(BACKFILL_MAX_AGE_NS)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| anyhow::anyhow!("synthetic future backfill epoch overflow"))?;
+        table.set_record_backfill_started_ns(wide_ticket.slot, stale_future_ns)?;
         table.clear_record_blocked(wide_ticket.slot)?;
         for ticket in conflicting.iter().chain(&disjoint) {
             table.set_record_state(ticket.slot, STATE_WAITING)?;
@@ -3471,78 +3512,91 @@ pub(super) fn exercise_work_conserving_backfill_for_tests()
         set_cpu_free_for_tests(&mut table, 1, false)?;
         set_cpu_free_for_tests(&mut table, 2, true)?;
         set_cpu_free_for_tests(&mut table, 3, true)?;
-        for permit in 0..TEST_CREDIT as usize {
+        for permit in 0..TEST_CAPACITY as usize {
             set_cpu_free_for_tests(&mut table, permit_resource_index(permit)?, true)?;
         }
         table.set_pending_flag(PENDING_RESCAN);
-        table.grant_compatible()?;
+        table.grant_compatible_at(scan_now_ns)?;
 
-        let remaining = table
+        let head = table
             .record(wide_ticket.slot)?
-            .ok_or_else(|| anyhow::anyhow!("wide backfill head disappeared"))?
-            .backfill_credit;
+            .ok_or_else(|| anyhow::anyhow!("wide backfill head disappeared"))?;
         anyhow::ensure!(
-            remaining == 0,
-            "wide backfill head retained {remaining} resource units after its wave"
+            head.backfill_capacity == TEST_CAPACITY,
+            "wide backfill head mutated its {}-unit capacity to {}",
+            TEST_CAPACITY,
+            head.backfill_capacity,
         );
-
-        let count_state = |table: &mut Table, tickets: &[Ticket], state| -> Result<usize> {
-            tickets.iter().try_fold(0usize, |count, ticket| {
-                Ok(count
-                    + if table
-                        .record(ticket.slot)?
-                        .is_some_and(|record| record.state == state)
-                    {
-                        1
-                    } else {
-                        0
-                    })
-            })
-        };
+        anyhow::ensure!(
+            head.backfill_started_ns == scan_now_ns,
+            "wide backfill head did not normalize and persist its bounded-admission start: {} != {scan_now_ns}",
+            head.backfill_started_ns,
+        );
         (
             count_state(&mut table, &conflicting, STATE_GRANTED)?,
             count_state(&mut table, &conflicting, STATE_WAITING)?,
             count_state(&mut table, &disjoint, STATE_GRANTED)?,
+            head.backfill_started_ns,
         )
     };
 
-    let admitted_survives_drain = {
+    // Remove one member of the first bypass wave. The next scan must reclaim
+    // that live capacity and admit the oldest waiting replacement rather than
+    // entering a permanent low-utilization drain.
+    conflicting[0].finish(None)?;
+    let refilled_after_completion = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
         set_cpu_availability_for_tests(&mut table, 0, CpuAvailability::SharedHeld)?;
         set_cpu_free_for_tests(&mut table, 1, false)?;
         table.set_pending_flag(PENDING_RESCAN);
-        table.grant_compatible()?;
-        conflicting[..TEST_CREDIT as usize].iter().all(|ticket| {
-            table
-                .record(ticket.slot)
-                .ok()
-                .flatten()
+        table.grant_compatible_at(backfill_started_ns.saturating_add(1))?;
+        count_state(&mut table, &conflicting, STATE_GRANTED)? == TEST_CAPACITY as usize
+            && table
+                .record(conflicting[TEST_CAPACITY as usize].slot)?
                 .is_some_and(|record| record.state == STATE_GRANTED)
-        }) && conflicting[TEST_CREDIT as usize..].iter().all(|ticket| {
-            table
-                .record(ticket.slot)
-                .ok()
-                .flatten()
-                .is_some_and(|record| record.state == STATE_WAITING)
-        })
+            && table
+                .record(wide_ticket.slot)?
+                .is_some_and(|record| record.backfill_capacity == TEST_CAPACITY)
     };
 
-    let racer_index = TEST_CREDIT as usize;
+    // Once the same head's admission age expires, removing another member may
+    // not be replaced. Existing bypass work drains naturally, bounding the
+    // delay before an exclusive performance-mode head can run.
+    conflicting[1].finish(None)?;
+    let expired_now_ns = backfill_started_ns
+        .checked_add(BACKFILL_MAX_AGE_NS)
+        .ok_or_else(|| anyhow::anyhow!("synthetic backfill age overflow"))?;
+    let expired_head_stops_refill = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_availability_for_tests(&mut table, 0, CpuAvailability::SharedHeld)?;
+        set_cpu_free_for_tests(&mut table, 1, false)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(expired_now_ns)?;
+        count_state(&mut table, &conflicting, STATE_GRANTED)? == TEST_CAPACITY as usize - 1
+            && table
+                .record(conflicting[CONFLICTING - 1].slot)?
+                .is_some_and(|record| record.state == STATE_WAITING)
+    };
+
+    let racer_index = CONFLICTING - 1;
     let (wide_wins, racer_revoked, disjoint_preserved) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
-        // Model the admitted burst having released. The extra GRANTED record
+        // Model the remaining admitted burst having released. The extra GRANTED record
         // models a callback issued from the old availability snapshot just as
         // the wide head becomes viable.
-        for ticket in &conflicting[..TEST_CREDIT as usize] {
-            table.set_record_state(ticket.slot, STATE_WAITING)?;
+        for ticket in &conflicting[2..racer_index] {
+            if table.record(ticket.slot)?.is_some() {
+                table.set_record_state(ticket.slot, STATE_WAITING)?;
+            }
         }
         table.set_record_state(conflicting[racer_index].slot, STATE_GRANTED)?;
         set_cpu_free_for_tests(&mut table, 0, true)?;
         set_cpu_free_for_tests(&mut table, 1, true)?;
         table.set_pending_flag(PENDING_RESCAN);
-        table.grant_compatible()?;
+        table.grant_compatible_at(expired_now_ns)?;
         (
             table
                 .record(wide_ticket.slot)?
@@ -3583,10 +3637,11 @@ pub(super) fn exercise_work_conserving_backfill_for_tests()
     wide_ticket.finish(None)?;
     coordinator.finish(None)?;
     Ok((
-        charged_grants,
-        waiting_after_budget,
+        initial_grants,
+        initial_waiters,
         disjoint_grants,
-        admitted_survives_drain,
+        refilled_after_completion,
+        expired_head_stops_refill,
         wide_wins,
         racer_revoked && disjoint_preserved,
         stale_callback_suppressed,
@@ -5586,7 +5641,7 @@ fn required_resource_bits(claim: &ClaimSet) -> usize {
                 .saturating_add(1)
         })
         .unwrap_or(0);
-    // The v14 mapping is deliberately overprovisioned once. It never needs a
+    // The v15 mapping is deliberately overprovisioned once. It never needs a
     // migration/grow protocol when the first low-index ticket is followed by a
     // valid sparse CPU/LLC/permit index on the same host. Permit indices occupy
     // a disjoint internal bit range immediately after possible host CPUs.
@@ -5673,11 +5728,11 @@ fn notify_path() -> PathBuf {
 }
 
 fn registry_data_dir() -> PathBuf {
-    active_protocol_dir().join("ktstr-acquire-registry-v14")
+    active_protocol_dir().join("ktstr-acquire-registry-v15")
 }
 
 pub(super) fn event_dir() -> PathBuf {
-    active_protocol_dir().join("ktstr-acquire-events-v14")
+    active_protocol_dir().join("ktstr-acquire-events-v15")
 }
 
 #[cfg(test)]
@@ -6569,7 +6624,12 @@ impl Table {
             R_WATCH_CLASS,
             encode_admission_class(watch.admission_class),
         );
-        write_u32(bytes, R_BACKFILL_CREDIT, backfill_credit_for_watch(watch));
+        write_u32(
+            bytes,
+            R_BACKFILL_CAPACITY,
+            backfill_capacity_for_watch(watch),
+        );
+        write_u64(bytes, R_BACKFILL_STARTED_NS, 0);
         write_u64(bytes, R_BLOCKED_SERIAL, 0);
         write_u64(bytes, R_NEXT_FREE, NONE_SLOT);
         write_u64(bytes, R_GRANT_EPOCH, 0);
@@ -6868,23 +6928,31 @@ impl Table {
         Ok(read_u64(bytes, R_PREFIX_EPOCH))
     }
 
-    fn set_record_backfill_credit(&mut self, slot: u64, credit: u32) -> Result<()> {
+    fn set_record_backfill_capacity(&mut self, slot: u64, capacity: u32) -> Result<()> {
         let maximum = self
             .record(slot)?
-            .map(|record| backfill_credit_for_watch(&record.watch))
+            .map(|record| backfill_capacity_for_watch(&record.watch))
             .ok_or_else(|| {
-                anyhow::anyhow!("queue slot {slot} disappeared during backfill-credit update")
+                anyhow::anyhow!("queue slot {slot} disappeared during backfill-capacity update")
             })?;
-        if credit > maximum {
+        if capacity > maximum {
             anyhow::bail!(
-                "queue backfill credit {credit} exceeds the ticket's resource-weighted maximum \
+                "queue backfill capacity {capacity} exceeds the ticket's resource-weighted maximum \
                  {maximum}"
             );
         }
         let bytes = self.record_bytes_mut(slot)?.ok_or_else(|| {
-            anyhow::anyhow!("queue slot {slot} disappeared during backfill-credit update")
+            anyhow::anyhow!("queue slot {slot} disappeared during backfill-capacity update")
         })?;
-        write_u32(bytes, R_BACKFILL_CREDIT, credit);
+        write_u32(bytes, R_BACKFILL_CAPACITY, capacity);
+        Ok(())
+    }
+
+    fn set_record_backfill_started_ns(&mut self, slot: u64, started_ns: u64) -> Result<()> {
+        let bytes = self.record_bytes_mut(slot)?.ok_or_else(|| {
+            anyhow::anyhow!("queue slot {slot} disappeared during backfill-age update")
+        })?;
+        write_u64(bytes, R_BACKFILL_STARTED_NS, started_ns);
         Ok(())
     }
 
@@ -7019,6 +7087,7 @@ impl Table {
             write_u64(bytes, R_BLOCK_INDEX, 0);
             write_u64(bytes, R_ISSUE_SERIAL, issue_serial);
             write_u64(bytes, R_REPLAN_CLAIM_EPOCH, replan_claim_epoch);
+            write_u64(bytes, R_BACKFILL_STARTED_NS, 0);
             if persist_blocker && let Some((evidence, serial)) = blocked {
                 let (kind, index) = match evidence.blocker {
                     ResourceKey::Cpu(index) => (BLOCK_CPU, index),
@@ -7286,13 +7355,18 @@ impl Table {
     }
 
     fn grant_compatible(&mut self) -> Result<(ClaimSet, bool)> {
+        self.grant_compatible_at(monotonic_now_ns()?.max(1))
+    }
+
+    fn grant_compatible_at(&mut self, backfill_now_ns: u64) -> Result<(ClaimSet, bool)> {
         struct BackfillHead {
-            slot: u64,
             claim: ClaimSet,
-            credit: u32,
+            available: u32,
+            admission_open: bool,
         }
 
         let records = self.records()?;
+        let backfill_now_ns = backfill_now_ns.max(1);
         let mut cpu_any = vec![0u64; self.layout.words];
         let mut cpu_exclusive = vec![0u64; self.layout.words];
         let mut llc_any = vec![0u64; self.layout.words];
@@ -7308,6 +7382,14 @@ impl Table {
             // PENDING does not participate in coordinator election, but its
             // bounded preparation footprint is a real predecessor claim.
             if record.state == STATE_PENDING {
+                if let Some(head) = backfill_head
+                    .as_mut()
+                    .filter(|head| claims_conflict(&head.claim, &record.claim))
+                {
+                    head.available = head
+                        .available
+                        .saturating_sub(backfill_cost_for_claim(&record.claim));
+                }
                 add_claim_bits(
                     &record.claim,
                     &mut cpu_any,
@@ -7316,6 +7398,10 @@ impl Table {
                     &mut llc_exclusive,
                     self.layout.bits,
                 )?;
+                if record.backfill_started_ns != 0 {
+                    self.set_record_backfill_started_ns(record.slot, 0)?;
+                    changed = true;
+                }
                 continue;
             }
             let conflict = claim_conflicts_bits(
@@ -7371,19 +7457,26 @@ impl Table {
             } else {
                 true
             };
-            // One complete cooperative-capacity wave may bypass the oldest
-            // unavailable head. Charge resource units, not callbacks: a herd
-            // of small cells can therefore fill the same weighted permit pool
-            // that normally bounds it. Existing GRANTED/HELD backfill keeps
-            // running after the credit is spent and drains before the head.
+            // One complete cooperative-capacity wave may remain outstanding
+            // behind the oldest unavailable head. Charge resource units, not
+            // callbacks: a herd of small cells can therefore fill the same
+            // weighted permit pool that normally bounds it. Recompute the
+            // live debit from PENDING/GRANTED/HELD records on every scan so a
+            // completed bypass claim immediately makes room for replacement
+            // work while this head's bounded admission interval remains open.
             let backfill_cost = backfill_head.as_ref().and_then(|head| {
                 claims_conflict(&head.claim, &record.claim)
                     .then(|| backfill_cost_for_claim(&record.claim))
             });
-            let fairness_blocked = backfill_head
-                .as_ref()
-                .zip(backfill_cost)
-                .is_some_and(|(head, cost)| cost > head.credit);
+            if matches!(record.state, STATE_GRANTED | STATE_HELD)
+                && let (Some(head), Some(cost)) = (backfill_head.as_mut(), backfill_cost)
+            {
+                head.available = head.available.saturating_sub(cost);
+            }
+            let fairness_blocked = match (backfill_head.as_ref(), backfill_cost) {
+                (Some(head), Some(cost)) => !head.admission_open || cost > head.available,
+                _ => false,
+            };
             let acquisition_viable =
                 !conflict && availability_compatible && blocker_ready && !fairness_blocked;
             let mut scan_state = record.state;
@@ -7457,20 +7550,11 @@ impl Table {
                 && acquisition_viable
             {
                 // Charge only an actual new conflicting grant. Disjoint work
-                // is unbounded, and a callback already in GRANTED/HELD state
-                // consumed its weighted units on the scan which first issued
-                // it.
-                if let Some(head) = backfill_head
-                    .as_mut()
-                    .filter(|head| claims_conflict(&head.claim, &record.claim))
-                {
-                    let cost = backfill_cost_for_claim(&record.claim);
-                    debug_assert!(cost <= head.credit);
-                    head.credit -= cost;
-                    // Publish the debit before the grant. A killed writer can
-                    // conservatively shorten a wave, but cannot grant
-                    // uncharged resource units forever across recovery.
-                    self.set_record_backfill_credit(head.slot, head.credit)?;
+                // is unbounded; existing PENDING/GRANTED/HELD callbacks were
+                // charged above from the authoritative record states.
+                if let (Some(head), Some(cost)) = (backfill_head.as_mut(), backfill_cost) {
+                    debug_assert!(head.admission_open && cost <= head.available);
+                    head.available -= cost;
                 }
                 let prefix = aggregate_from_words(
                     self.layout.bits,
@@ -7554,9 +7638,18 @@ impl Table {
             // and therefore does not fence: its callback can only publish a
             // WAITING replacement, which forces a fresh authoritative scan
             // before that replacement may acquire anything.
+            if record.state == STATE_COORDINATOR
+                && acquisition_viable
+                && let (Some(head), Some(cost)) = (backfill_head.as_mut(), backfill_cost)
+            {
+                debug_assert!(head.admission_open && cost <= head.available);
+                head.available -= cost;
+            }
+
             let preserves_fence = matches!(scan_state, STATE_GRANTED | STATE_HELD)
                 || revoked_grant_fence
                 || (scan_state == STATE_COORDINATOR && acquisition_viable);
+            let mut selected_backfill_head = false;
             if preserves_fence {
                 add_claim_bits(
                     &record.claim,
@@ -7574,13 +7667,28 @@ impl Table {
             {
                 // Protect only the oldest physically blocked exact candidate.
                 // Once it runs, queue order inductively gives the next blocked
-                // record its own finite burst. This avoids an O(N²) list of
-                // fairness barriers while still bounding starvation.
+                // record its own bounded work-conserving interval. This avoids
+                // an O(N²) list of fairness barriers while still bounding
+                // starvation.
+                let started_ns = if record.backfill_started_ns == 0
+                    || record.backfill_started_ns > backfill_now_ns
+                {
+                    self.set_record_backfill_started_ns(record.slot, backfill_now_ns)?;
+                    changed = true;
+                    backfill_now_ns
+                } else {
+                    record.backfill_started_ns
+                };
                 backfill_head = Some(BackfillHead {
-                    slot: record.slot,
-                    claim: record.claim,
-                    credit: record.backfill_credit,
+                    claim: record.claim.clone(),
+                    available: record.backfill_capacity,
+                    admission_open: backfill_now_ns - started_ns < BACKFILL_MAX_AGE_NS,
                 });
+                selected_backfill_head = true;
+            }
+            if !selected_backfill_head && record.backfill_started_ns != 0 {
+                self.set_record_backfill_started_ns(record.slot, 0)?;
+                changed = true;
             }
         }
         if changed {
@@ -7692,7 +7800,7 @@ impl Table {
             // The record table is authoritative. A clean header/record
             // mismatch must not permanently poison admission, so defensively
             // rebuild the active/free lists, aggregates, coordinator header,
-            // and record states together. Current v14 publication validates
+            // and record states together. Current v15 publication validates
             // this pair before clearing the dirty bit.
             self.repair_consistency()?;
             coordinator = self.coordinator_ticket();
@@ -9458,12 +9566,12 @@ fn decode_record(bytes: &[u8], layout: HeaderLayout, slot: u64) -> Result<Record
             anyhow::bail!("queue registry v{VERSION} slot {slot} has invalid blocker kind {kind}")
         }
     };
-    let backfill_credit = read_u32(bytes, R_BACKFILL_CREDIT);
-    let maximum_backfill_credit = backfill_credit_for_watch(&watch);
-    if backfill_credit > maximum_backfill_credit {
+    let backfill_capacity = read_u32(bytes, R_BACKFILL_CAPACITY);
+    let maximum_backfill_capacity = backfill_capacity_for_watch(&watch);
+    if backfill_capacity > maximum_backfill_capacity {
         anyhow::bail!(
-            "queue registry v{VERSION} slot {slot} has invalid backfill credit \
-             {backfill_credit} > {maximum_backfill_credit}"
+            "queue registry v{VERSION} slot {slot} has invalid backfill capacity \
+             {backfill_capacity} > {maximum_backfill_capacity}"
         );
     }
     Ok(Record {
@@ -9478,7 +9586,8 @@ fn decode_record(bytes: &[u8], layout: HeaderLayout, slot: u64) -> Result<Record
         replan_claim_epoch: read_u64(bytes, R_REPLAN_CLAIM_EPOCH),
         grant_epoch: read_u64(bytes, R_GRANT_EPOCH),
         prefix_epoch: read_u64(bytes, R_PREFIX_EPOCH),
-        backfill_credit,
+        backfill_capacity,
+        backfill_started_ns: read_u64(bytes, R_BACKFILL_STARTED_NS),
         prev_active: read_u64(bytes, R_PREV_ACTIVE),
         next_active: read_u64(bytes, R_NEXT_ACTIVE),
     })
@@ -9557,12 +9666,13 @@ fn clear_record_claim_bits(bytes: &mut [u8], layout: HeaderLayout) {
 }
 
 fn clear_record_watch_bits(bytes: &mut [u8], layout: HeaderLayout) {
-    // The credit is derived from the immutable watch. Reset it before
+    // The capacity is derived from the immutable watch. Reset it before
     // publishing an empty watch so every intermediate record remains
     // decodable if a coordinator scan observes this transition. Activation
     // overwrites it from the replacement watch; HELD records keep the
-    // canonical empty-watch credit.
-    write_u32(bytes, R_BACKFILL_CREDIT, 1);
+    // canonical empty-watch capacity.
+    write_u32(bytes, R_BACKFILL_CAPACITY, 1);
+    write_u64(bytes, R_BACKFILL_STARTED_NS, 0);
     let start = record_bitset_offset(layout, RB_WATCH_CPUS);
     let end = record_bitset_offset(layout, RB_PREFIX_CPU_ANY);
     bytes[start..end].fill(0);
@@ -9690,10 +9800,10 @@ fn claims_conflict(a: &ClaimSet, b: &ClaimSet) -> bool {
 
 /// Measure one backfill wave in the same CPU-permit units that bound
 /// cooperative VM oversubscription. A production VM watch contains the whole
-/// cooperative permit pool, so this credit cannot stop admission before that
+/// cooperative permit pool, so this capacity cannot stop admission before that
 /// pool itself is full. CPU/LLC width is the fallback for build claims and
 /// synthetic/test claims which use another permit namespace.
-fn backfill_credit_for_watch(watch: &ClaimSet) -> u32 {
+fn backfill_capacity_for_watch(watch: &ClaimSet) -> u32 {
     let cooperative_end = super::super::cooperative_cpu_permit_end();
     let permit_units = watch.permits.range(..cooperative_end).count();
     let physical_units = watch.cpus.len().max(watch.llcs.len()).max(1);

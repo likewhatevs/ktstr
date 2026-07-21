@@ -965,8 +965,8 @@ fn uncontended_fast_fence_does_not_create_registry_metadata() {
     let protocol_dir = std::path::Path::new(&cpu_path)
         .parent()
         .expect("resource lock parent");
-    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v14");
-    let event_dir = protocol_dir.join("ktstr-acquire-events-v14");
+    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v15");
+    let event_dir = protocol_dir.join("ktstr-acquire-events-v15");
     assert!(!registry_dir.exists());
     assert!(!event_dir.exists());
 
@@ -1138,7 +1138,7 @@ fn tracked_acquired_drop_keeps_its_registry_namespace_across_threads() {
     let wrong = tempfile::TempDir::new().expect("wrong-namespace tempdir");
     let wrong_llc_prefix = format!("{}/llc-", wrong.path().display());
     let wrong_cpu_prefix = format!("{}/cpu-", wrong.path().display());
-    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v14");
+    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v15");
     std::fs::create_dir_all(&wrong_registry).expect("create wrong registry directory");
     let wrong_registry_lock =
         crate::flock::try_flock(wrong_registry.join("registry.lock"), FlockMode::Exclusive)
@@ -3239,13 +3239,14 @@ fn backfill_is_weighted_by_cooperative_capacity_instead_of_callback_count() {
 }
 
 #[test]
-fn unavailable_wide_head_backfills_one_resource_wave_then_drains_without_convoy() {
+fn unavailable_wide_head_refills_live_backfill_capacity_until_bounded_age_then_drains() {
     let _prefixes = LockPrefixesGuard::new();
     let (
         conflicting_grants,
         conflicting_waiters,
         disjoint_grants,
-        admitted_survives_drain,
+        refilled_after_completion,
+        expired_head_stops_refill,
         wide_wins,
         racer_revoked_without_placement_damage,
         stale_callback_suppressed,
@@ -3253,19 +3254,23 @@ fn unavailable_wide_head_backfills_one_resource_wave_then_drains_without_convoy(
         .expect("exercise work-conserving bounded backfill");
     assert_eq!(
         conflicting_grants, 3,
-        "the blocked wide head must admit exactly its configured conflicting resource wave",
+        "the blocked wide head must admit exactly its configured outstanding resource capacity",
     );
     assert_eq!(
         conflicting_waiters, 2,
-        "new conflicting work must wait once the head's full-wave credit is spent",
+        "new conflicting work must wait while the head's full live capacity is occupied",
     );
     assert_eq!(
         disjoint_grants, 8,
-        "disjoint suffix work must remain unbounded by the fairness credit",
+        "disjoint suffix work must remain unbounded by the fairness capacity",
     );
     assert!(
-        admitted_survives_drain,
-        "already admitted backfill must finish while the zero-credit head blocks only new conflicts",
+        refilled_after_completion,
+        "completed bypass work must immediately open replacement capacity instead of creating a low-utilization drain",
+    );
+    assert!(
+        expired_head_stops_refill,
+        "an aged head must stop admitting replacement conflicts so exclusive work cannot starve",
     );
     assert!(
         wide_wins,
@@ -5456,7 +5461,7 @@ fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
     let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .expect("re-block waiter after epoch transition");
-    // Leave the replacement as an external, unregistered flock. A current-v14
+    // Leave the replacement as an external, unregistered flock. A current-v15
     // HELD publication would authoritatively revoke the in-flight grant before
     // its callback returned, bypassing the stale-negative-evidence path this
     // test is meant to pin.
@@ -5704,7 +5709,7 @@ fn remove_crash_after_counts_before_free_is_repaired() {
     let markers = tempfile::TempDir::new().expect("marker dir");
     let removing =
         TicketChild::spawn_crashing(markers.path(), "removing", "1", "remove_counts_before_free");
-    // The v14 HELD lifecycle removes its registry record only after the
+    // The v15 HELD lifecycle removes its registry record only after the
     // physical reservation is released. Let the helper pass its normal
     // release barrier so the injected crash observes that production ordering.
     std::fs::write(&removing.release, b"release").expect("release crash-test reservation");

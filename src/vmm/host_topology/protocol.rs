@@ -1,6 +1,6 @@
 //! Cross-process host-resource admission under nextest.
 //!
-//! Every ktstr process sharing a lock directory participates in one v14
+//! Every ktstr process sharing a lock directory participates in one v15
 //! fixed-record mmap registry. A ticket publishes one exact, non-empty CPU/LLC
 //! reservation claim plus the resources its planner may watch. Claims preserve
 //! the resource-lock semantics exactly: CPU and LLC claims independently use
@@ -1553,7 +1553,7 @@ pub(crate) fn exercise_resource_weighted_backfill_accounting_for_tests() -> (u32
 
 #[cfg(test)]
 pub(crate) fn exercise_work_conserving_backfill_for_tests()
--> Result<(usize, usize, usize, bool, bool, bool, bool)> {
+-> Result<(usize, usize, usize, bool, bool, bool, bool, bool)> {
     registry::exercise_work_conserving_backfill_for_tests()
 }
 
