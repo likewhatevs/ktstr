@@ -59,7 +59,7 @@
 //! resolve_test_kernel single-kernel fallback that would silently
 //! run a cell against an unrelated kernel).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -68,7 +68,7 @@ use cargo_metadata::semver::Version;
 use cargo_metadata::{Metadata, PackageId};
 
 use crate::feature_discovery::{
-    MetadataMode, PackageFeatureActivation, TargetContext, VersionScope, cargo_inline_config_path,
+    MetadataMode, PackageFeatureActivation, TargetContext, VersionScope,
     declaring_metadata_options, effective_target_context, has_package_selector,
     has_workspace_selector, infer_ktstr_feature_roots_for_context, inject_feature_activations,
     package_spec_name, query_metadata_for_target, query_resolved_metadata, scheduler_build_options,
@@ -83,18 +83,12 @@ use crate::kernel::{
     encode_kernel_list, path_kernel_label, resolve_kernel_image, resolve_kernel_set,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SchedulerSourceRoot {
-    semantic_name: String,
-    path: PathBuf,
-}
-
 #[derive(Debug, Clone)]
 struct SchedulerWorkspace {
+    metadata: Metadata,
     root: PathBuf,
     target_dir: PathBuf,
     package_id: PackageId,
-    source_roots: Vec<SchedulerSourceRoot>,
 }
 
 type SchedulerWorkspaceCache = BTreeMap<(String, String), Option<SchedulerWorkspace>>;
@@ -107,17 +101,56 @@ struct DiscoverSchedulerRequest {
     workspace_root: PathBuf,
     target_dir: PathBuf,
     package_id: PackageId,
-    source_roots: Vec<SchedulerSourceRoot>,
+    metadata: Metadata,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct WorkspaceSchedulerBuild {
     root: PathBuf,
     target_dir: PathBuf,
     /// package name -> Cargo package ID
     packages: BTreeMap<String, PackageId>,
-    source_roots: BTreeMap<(String, PathBuf), SchedulerSourceRoot>,
     requests: Vec<DiscoverSchedulerRequest>,
+    metadata: Option<Metadata>,
+}
+
+fn scheduler_group_remapped_to_stable_source(
+    group: &WorkspaceSchedulerBuild,
+    stable_workspace: &Path,
+    build_options: &[String],
+) -> Result<WorkspaceSchedulerBuild, String> {
+    let mut command = cargo_metadata::MetadataCommand::new();
+    let mut options = crate::feature_discovery::metadata_passthrough_options(build_options);
+    options.extend(crate::feature_discovery::metadata_resolution_options(
+        build_options,
+    ));
+    command
+        .cargo_path("cargo")
+        .current_dir(stable_workspace)
+        .no_deps()
+        .other_options(options);
+    let metadata = command.exec().map_err(|error| {
+        format!(
+            "cargo metadata from stable scheduler workspace {} failed: {error}",
+            stable_workspace.display()
+        )
+    })?;
+    let members = metadata.workspace_members.iter().collect::<HashSet<_>>();
+    let mut remapped = group.clone();
+    for (name, id) in &mut remapped.packages {
+        let package = metadata
+            .packages
+            .iter()
+            .find(|package| members.contains(&package.id) && package.name.as_str() == name)
+            .ok_or_else(|| {
+                format!(
+                    "stable scheduler workspace {} has no member package {name:?}",
+                    stable_workspace.display()
+                )
+            })?;
+        *id = package.id.clone();
+    }
+    Ok(remapped)
 }
 
 /// Scheduler declarations retained with the exact warmed test executable
@@ -457,7 +490,9 @@ fn verifier_selection_args(args: &[String]) -> Vec<String> {
 }
 
 /// Resolve the verifier package partition before either nextest warm-up or run.
-fn query_verifier_package_plan(args: &[String]) -> Result<VerifierPackagePlan, String> {
+fn query_verifier_package_plan(
+    args: &[String],
+) -> Result<(VerifierPackagePlan, Option<Metadata>), String> {
     let cli = Version::parse(env!("CARGO_PKG_VERSION"))
         .expect("cargo-ktstr's own CARGO_PKG_VERSION is valid semver");
     let target = effective_target_context(args)
@@ -477,11 +512,14 @@ fn query_verifier_package_plan(args: &[String]) -> Result<VerifierPackagePlan, S
         // compatibility plan injects no features or package widening; the
         // unchanged selector reaches nextest/Cargo, which remains the
         // authoritative parser and diagnostic source.
-        return Ok(VerifierPackagePlan {
-            compatible: Vec::new(),
-            older: Vec::new(),
-            newer: Vec::new(),
-        });
+        return Ok((
+            VerifierPackagePlan {
+                compatible: Vec::new(),
+                older: Vec::new(),
+                newer: Vec::new(),
+            },
+            None,
+        ));
     }
     let activations = selected_activations_for_context(
         &manifests,
@@ -511,7 +549,7 @@ fn query_verifier_package_plan(args: &[String]) -> Result<VerifierPackagePlan, S
         plan.newer
             .retain(|package| selected.contains(&package.name));
     }
-    Ok(plan)
+    Ok((plan, Some(metadata)))
 }
 
 fn has_explicit_package_selector(args: &[String]) -> bool {
@@ -801,6 +839,19 @@ fn probe_scheduler_declarations(
     })
 }
 
+fn cached_scheduler_declarations(
+    build_directory: &Path,
+    stamps: &[crate::nextest_artifact_cache::CachedBinaryStamp],
+) -> Vec<TestBinarySchedulerDeclarations> {
+    stamps
+        .iter()
+        .map(|stamp| TestBinarySchedulerDeclarations {
+            executable: build_directory.join(&stamp.relative_binary),
+            declarations: stamp.manifest.declarations.clone(),
+        })
+        .collect()
+}
+
 fn probe_scheduler_artifact_requirements(
     test_bins: &[PathBuf],
     loader_paths: &[PathBuf],
@@ -809,7 +860,12 @@ fn probe_scheduler_artifact_requirements(
         return Ok(Vec::new());
     }
     let per_binary = probe_scheduler_manifests(test_bins, loader_paths, None)?;
+    merge_scheduler_artifact_requirements(per_binary.into_iter().map(|binary| binary.manifest))
+}
 
+fn merge_scheduler_artifact_requirements(
+    manifests: impl IntoIterator<Item = ktstr::test_support::SchedulerManifestProbe>,
+) -> Result<Vec<ktstr::test_support::SchedulerArtifactRequirement>, String> {
     struct RequirementAccumulator {
         binary_kind: ktstr::test_support::BinaryKindJson,
         manifest_dir: String,
@@ -817,9 +873,9 @@ fn probe_scheduler_artifact_requirements(
         use_count: usize,
     }
     let mut merged: BTreeMap<(u8, String, String), RequirementAccumulator> = BTreeMap::new();
-    for requirement in per_binary
+    for requirement in manifests
         .into_iter()
-        .flat_map(|binary| binary.manifest.artifact_requirements)
+        .flat_map(|manifest| manifest.artifact_requirements)
     {
         let (kind_order, value) = match &requirement.binary_kind {
             ktstr::test_support::BinaryKindJson::Discover(value) => (0, value.clone()),
@@ -949,77 +1005,12 @@ fn declaring_workspace(
             )
         })?;
     let target_dir = metadata.target_directory.clone().into_std_path_buf();
-    let by_id = metadata
-        .packages
-        .iter()
-        .map(|candidate| (&candidate.id, candidate))
-        .collect::<HashMap<_, _>>();
-    let nodes = metadata
-        .resolve
-        .as_ref()
-        .map(|resolve| {
-            resolve
-                .nodes
-                .iter()
-                .map(|node| (&node.id, node))
-                .collect::<HashMap<_, _>>()
-        })
-        .unwrap_or_default();
-    let mut pending = vec![package.id.clone()];
-    let mut visited = HashSet::new();
-    let mut source_roots = BTreeMap::new();
-    while let Some(id) = pending.pop() {
-        if !visited.insert(id.clone()) {
-            continue;
-        }
-        let Some(candidate) = by_id.get(&id).copied() else {
-            continue;
-        };
-        if candidate.source.is_none() {
-            let parent = candidate
-                .manifest_path
-                .parent()
-                .ok_or_else(|| {
-                    format!(
-                        "local scheduler dependency {} has a manifest without a parent: {}",
-                        candidate.name, candidate.manifest_path,
-                    )
-                })?
-                .as_std_path();
-            let path = std::fs::canonicalize(parent).map_err(|error| {
-                format!(
-                    "canonicalize local scheduler dependency {} source root {}: {error}",
-                    candidate.name,
-                    parent.display(),
-                )
-            })?;
-            let location = path.strip_prefix(&workspace_root).map_or_else(
-                |_| format!("path:{}@{}", candidate.name, candidate.version),
-                |relative| {
-                    format!(
-                        "workspace:{}:{}@{}",
-                        relative.to_string_lossy(),
-                        candidate.name,
-                        candidate.version,
-                    )
-                },
-            );
-            source_roots
-                .entry(path.clone())
-                .or_insert(SchedulerSourceRoot {
-                    semantic_name: location,
-                    path,
-                });
-        }
-        if let Some(node) = nodes.get(&id) {
-            pending.extend(node.dependencies.iter().cloned());
-        }
-    }
+    let package_id = package.id.clone();
     Ok(Some(SchedulerWorkspace {
+        metadata,
         root: workspace_root,
         target_dir,
-        package_id: package.id.clone(),
-        source_roots: source_roots.into_values().collect(),
+        package_id,
     }))
 }
 
@@ -1109,7 +1100,7 @@ fn selected_scheduler_plan(
             workspace_root: workspace.root,
             target_dir: workspace.target_dir,
             package_id: workspace.package_id,
-            source_roots: workspace.source_roots,
+            metadata: workspace.metadata,
         });
     }
     discover_requests.sort_by(|left, right| {
@@ -1190,8 +1181,8 @@ fn plan_workspace_scheduler_builds(
                 root,
                 target_dir,
                 packages: BTreeMap::new(),
-                source_roots: BTreeMap::new(),
                 requests: Vec::new(),
+                metadata: Some(request.metadata.clone()),
             });
         if let Some(previous) = group
             .packages
@@ -1204,12 +1195,6 @@ fn plan_workspace_scheduler_builds(
                 group.root.display(),
                 request.package,
             ));
-        }
-        for source_root in &request.source_roots {
-            group
-                .source_roots
-                .entry((source_root.semantic_name.clone(), source_root.path.clone()))
-                .or_insert_with(|| source_root.clone());
         }
         group.requests.push(request.clone());
     }
@@ -1356,618 +1341,35 @@ fn scheduler_workspace_execution(
     (build_args, target_dir)
 }
 
+fn force_scheduler_stable_target(mut args: Vec<String>, target: &Path) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len() + 2);
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--target-dir" {
+            index += 2;
+        } else if args[index].starts_with("--target-dir=") {
+            index += 1;
+        } else {
+            out.push(std::mem::take(&mut args[index]));
+            index += 1;
+        }
+    }
+    out.extend(["--target-dir".to_string(), target.display().to_string()]);
+    out
+}
+
 struct WorkspaceSchedulerArtifacts {
     paths: BTreeMap<String, PathBuf>,
-    snapshots: Vec<ktstr::scheduler_artifact::SchedulerArtifactSnapshot>,
-}
-
-const SCHEDULER_BUILD_IDENTITY_SCHEMA: u32 = 2;
-
-fn scheduler_build_identity_hasher() -> ahash::AHasher {
-    use std::hash::BuildHasher as _;
-
-    ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher()
-}
-
-fn scheduler_build_hash_bytes(hasher: &mut ahash::AHasher, bytes: &[u8]) {
-    use std::hash::Hasher as _;
-
-    hasher.write_u64(bytes.len() as u64);
-    hasher.write(bytes);
+    tree: ktstr::cache::artifact_tree::MaterializedArtifactTree,
+    stable_source: crate::nextest_artifact_cache::StableCargoSource,
 }
 
 fn scheduler_identity_not_cancelled(cancelled: &dyn Fn() -> bool) -> Result<(), String> {
     if cancelled() {
-        Err("scheduler workspace build identity scan interrupted".to_string())
+        Err("scheduler build identity planning interrupted".to_string())
     } else {
         Ok(())
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SchedulerSymlinkTarget {
-    Missing,
-    File,
-    Directory,
-}
-
-fn hash_scheduler_symlink_target(
-    hasher: &mut ahash::AHasher,
-    semantic_root: &Path,
-    path: &Path,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<SchedulerSymlinkTarget, String> {
-    use std::hash::Hasher as _;
-    use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::MetadataExt as _;
-
-    scheduler_identity_not_cancelled(cancelled)?;
-    let target = std::fs::read_link(path)
-        .map_err(|error| format!("read scheduler source symlink {}: {error}", path.display()))?;
-    let resolved = if target.is_absolute() {
-        target
-    } else {
-        path.parent().unwrap_or(semantic_root).join(target)
-    };
-    match std::fs::canonicalize(&resolved) {
-        Ok(resolved) => match resolved.strip_prefix(semantic_root) {
-            Ok(relative) => {
-                scheduler_build_hash_bytes(hasher, b"internal");
-                scheduler_build_hash_bytes(hasher, relative.as_os_str().as_bytes());
-            }
-            Err(_) => {
-                // External checkout paths differ across runners. The target
-                // type and reachable contents below are the semantic input.
-                scheduler_build_hash_bytes(hasher, b"external");
-            }
-        },
-        Err(_) => {
-            // A missing target can never produce a successful Cargo build,
-            // but it still needs a stable state distinct from a live link.
-            scheduler_build_hash_bytes(hasher, b"missing");
-        }
-    }
-    scheduler_identity_not_cancelled(cancelled)?;
-    match std::fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => {
-            hasher.write_u8(b'f');
-            hasher.write_u8(u8::from(metadata.mode() & 0o111 != 0));
-            hasher.write_u64(metadata.len());
-            hasher.write_u64(ktstr::cache::content_file_digest(path).map_err(|error| {
-                format!(
-                    "digest scheduler symlink target {} with shared fast hash: {error:#}",
-                    path.display(),
-                )
-            })?);
-            scheduler_identity_not_cancelled(cancelled)?;
-            Ok(SchedulerSymlinkTarget::File)
-        }
-        Ok(metadata) if metadata.is_dir() => {
-            hasher.write_u8(b'd');
-            Ok(SchedulerSymlinkTarget::Directory)
-        }
-        Ok(_) => Err(format!(
-            "scheduler source symlink target is not a file or directory: {}",
-            path.display()
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            hasher.write_u8(b'x');
-            Ok(SchedulerSymlinkTarget::Missing)
-        }
-        Err(error) => Err(format!(
-            "stat scheduler source symlink target {}: {error}",
-            path.display()
-        )),
-    }
-}
-
-fn scheduler_source_tree_digest(
-    root: &Path,
-    excluded_target_dir: &Path,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<u64, String> {
-    use std::hash::Hasher as _;
-    use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::MetadataExt as _;
-
-    scheduler_identity_not_cancelled(cancelled)?;
-    let mut hasher = scheduler_build_identity_hasher();
-    scheduler_build_hash_bytes(&mut hasher, b"ktstr-scheduler-source-tree");
-    let target_dir = std::fs::canonicalize(excluded_target_dir)
-        .unwrap_or_else(|_| excluded_target_dir.to_path_buf());
-    let walker = walkdir::WalkDir::new(root)
-        .follow_links(true)
-        .sort_by_file_name()
-        .into_iter()
-        .filter_entry(|entry| {
-            if entry.path() == target_dir || entry.path().starts_with(&target_dir) {
-                return false;
-            }
-            if entry.path() != root
-                && entry.file_type().is_dir()
-                && std::fs::symlink_metadata(entry.path().join(".git")).is_ok()
-            {
-                // A nested repository/worktree is a separate source boundary,
-                // not an ignored/generated input of its parent checkout. Any
-                // nested repository Cargo actually reaches is present in
-                // `source_roots` and hashed independently.
-                return false;
-            }
-            if entry
-                .path()
-                .strip_prefix(root)
-                .ok()
-                .is_some_and(|relative| {
-                    relative
-                        .components()
-                        .any(|component| component.as_os_str() == ".git")
-                })
-            {
-                return false;
-            }
-            if entry.file_type().is_dir() || entry.path_is_symlink() {
-                let Ok(resolved) = std::fs::canonicalize(entry.path()) else {
-                    return true;
-                };
-                if resolved == target_dir || resolved.starts_with(&target_dir) {
-                    return false;
-                }
-                if resolved
-                    .components()
-                    .any(|component| component.as_os_str() == ".git")
-                {
-                    return false;
-                }
-            }
-            true
-        });
-    for entry in walker {
-        scheduler_identity_not_cancelled(cancelled)?;
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) if error.loop_ancestor().is_some() => {
-                // A followed symlink cycle is a finite semantic relationship,
-                // not a reason to recurse forever or reject an otherwise
-                // buildable source tree.
-                scheduler_build_hash_bytes(&mut hasher, b"symlink-loop");
-                for path in [error.path(), error.loop_ancestor()].into_iter().flatten() {
-                    let relative = path.strip_prefix(root).unwrap_or(path);
-                    scheduler_build_hash_bytes(&mut hasher, relative.as_os_str().as_bytes());
-                }
-                continue;
-            }
-            Err(error) => {
-                return Err(format!(
-                    "walk scheduler source tree {}: {error}",
-                    root.display()
-                ));
-            }
-        };
-        let path = entry.path();
-        let relative = path.strip_prefix(root).map_err(|error| {
-            format!(
-                "strip scheduler source root {} from {}: {error}",
-                root.display(),
-                path.display(),
-            )
-        })?;
-        scheduler_build_hash_bytes(&mut hasher, relative.as_os_str().as_bytes());
-        let metadata = std::fs::symlink_metadata(path)
-            .map_err(|error| format!("stat scheduler source input {}: {error}", path.display()))?;
-        let file_type = metadata.file_type();
-        if file_type.is_dir() {
-            hasher.write_u8(b'd');
-        } else if file_type.is_symlink() {
-            hasher.write_u8(b'l');
-            hash_scheduler_symlink_target(&mut hasher, root, path, cancelled)?;
-        } else if file_type.is_file() {
-            hasher.write_u8(b'f');
-            // Cargo preserves executable source bits in a few build-script
-            // and generated-tool flows. Hash only the semantic executable
-            // class, not checkout umask/group bits.
-            hasher.write_u8(u8::from(metadata.mode() & 0o111 != 0));
-            let digest = ktstr::cache::content_file_digest(path).map_err(|error| {
-                format!(
-                    "digest scheduler source input {} with shared fast hash: {error:#}",
-                    path.display(),
-                )
-            })?;
-            hasher.write_u64(digest);
-            hasher.write_u64(metadata.len());
-            scheduler_identity_not_cancelled(cancelled)?;
-        } else {
-            return Err(format!(
-                "scheduler source input is not a file, directory, or symlink: {}",
-                path.display()
-            ));
-        }
-    }
-    scheduler_identity_not_cancelled(cancelled)?;
-    Ok(hasher.finish())
-}
-
-fn scheduler_git_head(root: &Path) -> Option<String> {
-    let repository = gix::discover(root).ok()?;
-    let worktree = repository.workdir()?;
-    if !root.starts_with(worktree) {
-        return None;
-    }
-    repository.head_id().ok().map(|id| id.detach().to_string())
-}
-
-fn scheduler_git_source_digest(
-    repository_root: &Path,
-    excluded_target_dir: &Path,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<(u64, Option<String>), String> {
-    use gix::bstr::BString;
-    use std::collections::BTreeSet;
-    use std::ffi::OsStr;
-    use std::hash::Hasher as _;
-    use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::MetadataExt as _;
-
-    scheduler_identity_not_cancelled(cancelled)?;
-    let repository = gix::open(repository_root).map_err(|error| {
-        format!(
-            "open scheduler source repository {}: {error}",
-            repository_root.display()
-        )
-    })?;
-    let workdir = repository.workdir().ok_or_else(|| {
-        format!(
-            "scheduler source repository has no worktree: {}",
-            repository_root.display()
-        )
-    })?;
-    let index = repository.index().map_err(|error| {
-        format!(
-            "read scheduler source repository index {}: {error}",
-            repository_root.display()
-        )
-    })?;
-    let mut paths = index
-        .entries()
-        .iter()
-        .map(|entry| entry.path(&index).to_vec())
-        .collect::<BTreeSet<_>>();
-    scheduler_identity_not_cancelled(cancelled)?;
-    let status = repository
-        .status(gix::progress::Discard)
-        .map_err(|error| {
-            format!(
-                "open scheduler source worktree status {}: {error}",
-                repository_root.display()
-            )
-        })?
-        .untracked_files(gix::status::UntrackedFiles::Files)
-        .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled)
-        .index_worktree_submodules(gix::status::Submodule::Given {
-            ignore: gix::submodule::config::Ignore::All,
-            check_dirty: false,
-        })
-        .index_worktree_options_mut(ktstr::git_status::configure_index_worktree_parallelism)
-        .into_iter(Vec::<BString>::new())
-        .map_err(|error| {
-            format!(
-                "create scheduler source status iterator {}: {error}",
-                repository_root.display()
-            )
-        })?;
-    scheduler_identity_not_cancelled(cancelled)?;
-    for item in status {
-        scheduler_identity_not_cancelled(cancelled)?;
-        let item = item.map_err(|error| {
-            format!(
-                "read scheduler source status item {}: {error}",
-                repository_root.display()
-            )
-        })?;
-        paths.insert(item.location().to_vec());
-    }
-
-    let target_dir = std::fs::canonicalize(excluded_target_dir)
-        .unwrap_or_else(|_| excluded_target_dir.to_path_buf());
-    let mut hasher = scheduler_build_identity_hasher();
-    scheduler_build_hash_bytes(&mut hasher, b"ktstr-scheduler-git-source-set");
-    for relative_bytes in paths {
-        scheduler_identity_not_cancelled(cancelled)?;
-        let relative = Path::new(OsStr::from_bytes(&relative_bytes));
-        let path = workdir.join(relative);
-        if path == target_dir || path.starts_with(&target_dir) {
-            continue;
-        }
-        scheduler_build_hash_bytes(&mut hasher, &relative_bytes);
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                hasher.write_u8(b'l');
-                hash_scheduler_symlink_target(&mut hasher, workdir, &path, cancelled)?;
-            }
-            Ok(metadata) if metadata.is_file() => {
-                hasher.write_u8(b'f');
-                hasher.write_u8(u8::from(metadata.mode() & 0o111 != 0));
-                hasher.write_u64(metadata.len());
-                hasher.write_u64(ktstr::cache::content_file_digest(&path).map_err(|error| {
-                    format!(
-                        "digest scheduler repository input {}: {error:#}",
-                        path.display()
-                    )
-                })?);
-                scheduler_identity_not_cancelled(cancelled)?;
-            }
-            Ok(metadata) if metadata.is_dir() => {
-                // A tracked directory is a gitlink/submodule. Its resolved
-                // HEAD is the semantic worktree input; local path dependency
-                // roots inside it are additionally fingerprinted as their own
-                // repository below.
-                hasher.write_u8(b'g');
-                scheduler_build_hash_bytes(
-                    &mut hasher,
-                    scheduler_git_head(&path)
-                        .as_deref()
-                        .unwrap_or("<unavailable-submodule-head>")
-                        .as_bytes(),
-                );
-            }
-            Ok(_) => {
-                return Err(format!(
-                    "scheduler repository input has unsupported file type: {}",
-                    path.display()
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // Tracked deletion and staged deletion are semantic source
-                // states too. Keep an explicit absence marker.
-                hasher.write_u8(b'x');
-            }
-            Err(error) => {
-                return Err(format!(
-                    "stat scheduler repository input {}: {error}",
-                    path.display()
-                ));
-            }
-        }
-    }
-    scheduler_identity_not_cancelled(cancelled)?;
-    Ok((hasher.finish(), scheduler_git_head(workdir)))
-}
-
-fn scheduler_source_input_digests(
-    group: &WorkspaceSchedulerBuild,
-    excluded_target_dir: &Path,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<Vec<(String, u64, Option<String>)>, String> {
-    scheduler_identity_not_cancelled(cancelled)?;
-    let mut roots = group.source_roots.values().cloned().collect::<Vec<_>>();
-    roots.push(SchedulerSourceRoot {
-        semantic_name: "declaring-workspace".to_string(),
-        path: group.root.clone(),
-    });
-
-    let mut repositories: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
-    let mut trees: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
-    for source in roots {
-        scheduler_identity_not_cancelled(cancelled)?;
-        trees
-            .entry(source.path.clone())
-            .or_default()
-            .insert(source.semantic_name.clone());
-        let repository = gix::discover(&source.path)
-            .ok()
-            .and_then(|repository| repository.workdir().map(Path::to_path_buf))
-            .and_then(|workdir| std::fs::canonicalize(workdir).ok());
-        if let Some(repository) = repository {
-            repositories
-                .entry(repository)
-                .or_default()
-                .insert(source.semantic_name);
-        }
-    }
-
-    // The repository digest captures tracked workspace-wide build inputs and
-    // HEAD identity. Every reachable local Cargo source root is additionally
-    // walked in full so ignored/generated inputs participate too.
-    let mut digests = Vec::with_capacity(repositories.len() + trees.len());
-    for (repository, labels) in repositories {
-        scheduler_identity_not_cancelled(cancelled)?;
-        let (digest, head) =
-            scheduler_git_source_digest(&repository, excluded_target_dir, cancelled)?;
-        digests.push((
-            format!("git:{}", labels.into_iter().collect::<Vec<_>>().join("+")),
-            digest,
-            head,
-        ));
-    }
-    for (path, labels) in trees {
-        scheduler_identity_not_cancelled(cancelled)?;
-        digests.push((
-            format!("tree:{}", labels.into_iter().collect::<Vec<_>>().join("+")),
-            scheduler_source_tree_digest(&path, excluded_target_dir, cancelled)?,
-            None,
-        ));
-    }
-    digests.sort();
-    scheduler_identity_not_cancelled(cancelled)?;
-    Ok(digests)
-}
-
-fn hash_optional_scheduler_input_file(
-    hasher: &mut ahash::AHasher,
-    label: &[u8],
-    path: &Path,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<(), String> {
-    use std::hash::Hasher as _;
-
-    scheduler_identity_not_cancelled(cancelled)?;
-    scheduler_build_hash_bytes(hasher, label);
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() => {
-            hasher.write_u8(1);
-            hasher.write_u64(metadata.len());
-            hasher.write_u64(ktstr::cache::content_file_digest(path).map_err(|error| {
-                format!("digest scheduler build input {}: {error:#}", path.display())
-            })?);
-            scheduler_identity_not_cancelled(cancelled)?;
-        }
-        Ok(_) => {
-            return Err(format!(
-                "scheduler build input is not a regular file: {}",
-                path.display()
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            hasher.write_u8(0);
-        }
-        Err(error) => {
-            return Err(format!(
-                "stat scheduler build input {}: {error}",
-                path.display()
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn hash_scheduler_workspace_controls(
-    hasher: &mut ahash::AHasher,
-    workspace_root: &Path,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<(), String> {
-    for name in [
-        "Cargo.toml",
-        "Cargo.lock",
-        "rust-toolchain",
-        "rust-toolchain.toml",
-    ] {
-        hash_optional_scheduler_input_file(
-            hasher,
-            format!("workspace/{name}").as_bytes(),
-            &workspace_root.join(name),
-            cancelled,
-        )?;
-    }
-
-    // Cargo searches `.cargo/config{,.toml}` from the invocation directory
-    // through its ancestors. Hash each present semantic config by content,
-    // without folding checkout-specific ancestor paths into the key.
-    let mut present_config = 0usize;
-    for ancestor in workspace_root.ancestors() {
-        scheduler_identity_not_cancelled(cancelled)?;
-        for name in ["config", "config.toml"] {
-            let path = ancestor.join(".cargo").join(name);
-            if path.is_file() {
-                hash_optional_scheduler_input_file(
-                    hasher,
-                    format!("ancestor-cargo-config/{present_config}/{name}").as_bytes(),
-                    &path,
-                    cancelled,
-                )?;
-                present_config += 1;
-            }
-        }
-    }
-    let cargo_home = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")));
-    if let Some(cargo_home) = cargo_home {
-        for name in ["config", "config.toml"] {
-            hash_optional_scheduler_input_file(
-                hasher,
-                format!("cargo-home/{name}").as_bytes(),
-                &cargo_home.join(name),
-                cancelled,
-            )?;
-        }
-    }
-    scheduler_identity_not_cancelled(cancelled)?;
-    Ok(())
-}
-
-fn scheduler_command_version(
-    program: &std::ffi::OsStr,
-    args: &[&str],
-    current_dir: &Path,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<Vec<u8>, String> {
-    scheduler_identity_not_cancelled(cancelled)?;
-    let output = Command::new(program)
-        .args(args)
-        .current_dir(current_dir)
-        .output()
-        .map_err(|error| {
-            format!(
-                "run {} {} for scheduler build identity: {error}",
-                Path::new(program).display(),
-                args.join(" "),
-            )
-        })?;
-    scheduler_identity_not_cancelled(cancelled)?;
-    if !output.status.success() {
-        return Err(format!(
-            "{} {} failed while identifying scheduler toolchain ({})",
-            Path::new(program).display(),
-            args.join(" "),
-            output
-                .status
-                .code()
-                .map_or_else(|| "signal".to_string(), |code| code.to_string()),
-        ));
-    }
-    let mut identity = output.stdout;
-    identity.extend_from_slice(&output.stderr);
-    Ok(identity)
-}
-
-fn resolve_scheduler_tool(program: &std::ffi::OsStr, current_dir: &Path) -> Option<PathBuf> {
-    if program.is_empty() {
-        return None;
-    }
-    let path = Path::new(program);
-    if path.components().count() > 1 {
-        let path = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            current_dir.join(path)
-        };
-        return std::fs::canonicalize(path)
-            .ok()
-            .filter(|resolved| resolved.is_file());
-    }
-    std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-        .map(|directory| directory.join(path))
-        .find_map(|candidate| {
-            std::fs::canonicalize(candidate)
-                .ok()
-                .filter(|resolved| resolved.is_file())
-        })
-}
-
-fn hash_scheduler_tool(
-    hasher: &mut ahash::AHasher,
-    label: &[u8],
-    program: &std::ffi::OsStr,
-    current_dir: &Path,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<(), String> {
-    use std::hash::Hasher as _;
-    use std::os::unix::ffi::OsStrExt as _;
-
-    scheduler_identity_not_cancelled(cancelled)?;
-    scheduler_build_hash_bytes(hasher, label);
-    if let Some(path) = resolve_scheduler_tool(program, current_dir) {
-        hasher.write_u8(1);
-        hasher.write_u64(ktstr::cache::content_file_digest(&path).map_err(|error| {
-            format!("digest scheduler build tool {}: {error:#}", path.display())
-        })?);
-        scheduler_identity_not_cancelled(cancelled)?;
-    } else {
-        hasher.write_u8(0);
-        scheduler_build_hash_bytes(hasher, program.as_bytes());
-    }
-    Ok(())
 }
 
 fn scheduler_build_environment_is_nonsemantic(name: &std::ffi::OsStr) -> bool {
@@ -2020,6 +1422,7 @@ fn scheduler_build_environment_is_nonsemantic(name: &std::ffi::OsStr) -> bool {
         "GITHUB_TRIGGERING_ACTOR",
         "GITHUB_WORKSPACE",
         "GIT_ASKPASS",
+        "GIT_OPTIONAL_LOCKS",
         "HOSTNAME",
         "INVOCATION_ID",
         "JOURNAL_STREAM",
@@ -2158,284 +1561,11 @@ fn scheduler_build_environment_from(
     Ok(semantic)
 }
 
-fn scheduler_build_environment(
+pub(crate) fn scheduler_build_environment(
     workspace_root: &Path,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<(std::ffi::OsString, Vec<u8>)>, String> {
     scheduler_build_environment_from(workspace_root, std::env::vars_os().collect(), cancelled)
-}
-
-fn scheduler_semantic_build_options(
-    build_options: &[String],
-    current_dir: &Path,
-    excluded_target_dir: &Path,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<Vec<(String, Option<u64>)>, String> {
-    fn resolved_path(value: &str, current_dir: &Path) -> PathBuf {
-        let path = Path::new(value);
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            current_dir.join(path)
-        }
-    }
-
-    fn inline_config_input(
-        value: &str,
-        current_dir: &Path,
-        excluded_target_dir: &Path,
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<Option<(String, Option<u64>)>, String> {
-        let Some((key, value)) = cargo_inline_config_path(value) else {
-            return Ok(None);
-        };
-        if matches!(
-            key,
-            "build.target-dir" | "build.build-dir" | "build.dep-info-basedir"
-        ) {
-            return Ok(Some((format!("inline-config:{key}=<output-path>"), None)));
-        }
-
-        scheduler_identity_not_cancelled(cancelled)?;
-        let path = resolved_path(&value, current_dir);
-        match std::fs::metadata(&path) {
-            Ok(metadata) if metadata.is_file() => {
-                let digest = ktstr::cache::content_file_digest(&path).map_err(|error| {
-                    format!(
-                        "digest scheduler inline Cargo config input {}: {error:#}",
-                        path.display()
-                    )
-                })?;
-                scheduler_identity_not_cancelled(cancelled)?;
-                Ok(Some((format!("inline-config:{key}=<file>"), Some(digest))))
-            }
-            Ok(metadata) if metadata.is_dir() => Ok(Some((
-                format!("inline-config:{key}=<directory>"),
-                Some(scheduler_source_tree_digest(
-                    &path,
-                    excluded_target_dir,
-                    cancelled,
-                )?),
-            ))),
-            Ok(_) => Err(format!(
-                "scheduler inline Cargo config path is not a file or directory: {}",
-                path.display()
-            )),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(Some((format!("inline-config:{key}=<missing>"), None)))
-            }
-            Err(error) => Err(format!(
-                "stat scheduler inline Cargo config input {}: {error}",
-                path.display()
-            )),
-        }
-    }
-
-    let mut semantic = Vec::new();
-    let mut index = 0;
-    while index < build_options.len() {
-        scheduler_identity_not_cancelled(cancelled)?;
-        let argument = &build_options[index];
-        if argument == "--target-dir" {
-            index += 2;
-            continue;
-        }
-        if argument.starts_with("--target-dir=") {
-            index += 1;
-            continue;
-        }
-        if matches!(argument.as_str(), "--config" | "--target") {
-            semantic.push((argument.clone(), None));
-            index += 1;
-            if let Some(value) = build_options.get(index) {
-                if argument == "--config"
-                    && let Some(config) =
-                        inline_config_input(value, current_dir, excluded_target_dir, cancelled)?
-                {
-                    semantic.push(config);
-                } else {
-                    let path = resolved_path(value, current_dir);
-                    if path.is_file() {
-                        let digest = ktstr::cache::content_file_digest(&path).map_err(|error| {
-                            format!(
-                                "digest scheduler Cargo option input {}: {error:#}",
-                                path.display()
-                            )
-                        })?;
-                        scheduler_identity_not_cancelled(cancelled)?;
-                        semantic.push((
-                            format!(
-                                "{}:{}",
-                                argument.trim_start_matches('-'),
-                                path.file_name().unwrap_or_default().to_string_lossy()
-                            ),
-                            Some(digest),
-                        ));
-                    } else {
-                        semantic.push((value.clone(), None));
-                    }
-                }
-            }
-            index += 1;
-            continue;
-        }
-        if let Some(value) = argument.strip_prefix("--config=") {
-            if let Some((config, digest)) =
-                inline_config_input(value, current_dir, excluded_target_dir, cancelled)?
-            {
-                semantic.push((format!("config={config}"), digest));
-            } else {
-                let path = resolved_path(value, current_dir);
-                if path.is_file() {
-                    semantic.push((
-                        format!(
-                            "config={}",
-                            path.file_name().unwrap_or_default().to_string_lossy()
-                        ),
-                        Some(ktstr::cache::content_file_digest(&path).map_err(|error| {
-                            format!(
-                                "digest scheduler Cargo config {}: {error:#}",
-                                path.display()
-                            )
-                        })?),
-                    ));
-                    scheduler_identity_not_cancelled(cancelled)?;
-                } else {
-                    semantic.push((argument.clone(), None));
-                }
-            }
-        } else if let Some(value) = argument.strip_prefix("--target=") {
-            let path = resolved_path(value, current_dir);
-            if path.is_file() {
-                semantic.push((
-                    format!(
-                        "target={}",
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    ),
-                    Some(ktstr::cache::content_file_digest(&path).map_err(|error| {
-                        format!(
-                            "digest scheduler custom target {}: {error:#}",
-                            path.display()
-                        )
-                    })?),
-                ));
-                scheduler_identity_not_cancelled(cancelled)?;
-            } else {
-                semantic.push((argument.clone(), None));
-            }
-        } else {
-            semantic.push((argument.clone(), None));
-        }
-        index += 1;
-    }
-    scheduler_identity_not_cancelled(cancelled)?;
-    Ok(semantic)
-}
-
-fn scheduler_workspace_build_identity_with_cancel(
-    group: &WorkspaceSchedulerBuild,
-    profile: &str,
-    build_options: &[String],
-    cancelled: &dyn Fn() -> bool,
-) -> Result<u64, String> {
-    use std::hash::Hasher as _;
-    use std::os::unix::ffi::OsStrExt as _;
-
-    scheduler_identity_not_cancelled(cancelled)?;
-    let mut hasher = scheduler_build_identity_hasher();
-    scheduler_build_hash_bytes(&mut hasher, b"ktstr-scheduler-workspace-build");
-    hasher.write_u32(SCHEDULER_BUILD_IDENTITY_SCHEMA);
-    scheduler_build_hash_bytes(&mut hasher, profile.as_bytes());
-    hasher.write_u64(group.packages.len() as u64);
-    for package in group.packages.keys() {
-        scheduler_identity_not_cancelled(cancelled)?;
-        scheduler_build_hash_bytes(&mut hasher, package.as_bytes());
-    }
-    let target_dir = effective_scheduler_target_dir(group, build_options);
-    for (argument, digest) in
-        scheduler_semantic_build_options(build_options, &group.root, &target_dir, cancelled)?
-    {
-        scheduler_identity_not_cancelled(cancelled)?;
-        scheduler_build_hash_bytes(&mut hasher, argument.as_bytes());
-        hasher.write_u64(digest.unwrap_or_default());
-        hasher.write_u8(u8::from(digest.is_some()));
-    }
-
-    for (semantic_name, digest, head) in
-        scheduler_source_input_digests(group, &target_dir, cancelled)?
-    {
-        scheduler_identity_not_cancelled(cancelled)?;
-        scheduler_build_hash_bytes(&mut hasher, semantic_name.as_bytes());
-        hasher.write_u64(digest);
-        scheduler_build_hash_bytes(
-            &mut hasher,
-            head.as_deref().unwrap_or("<non-git-or-unborn>").as_bytes(),
-        );
-    }
-    hash_scheduler_workspace_controls(&mut hasher, &group.root, cancelled)?;
-
-    let cargo_version = scheduler_command_version(
-        std::ffi::OsStr::new("cargo"),
-        &["-vV"],
-        &group.root,
-        cancelled,
-    )?;
-    scheduler_build_hash_bytes(&mut hasher, b"cargo-version");
-    scheduler_build_hash_bytes(&mut hasher, &cargo_version);
-    let rustc = std::env::var_os("RUSTC")
-        .filter(|value| !value.is_empty())
-        .or_else(|| std::env::var_os("CARGO_BUILD_RUSTC"))
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "rustc".into());
-    let rustc_version = scheduler_command_version(&rustc, &["-vV"], &group.root, cancelled)?;
-    scheduler_build_hash_bytes(&mut hasher, b"rustc-version");
-    scheduler_build_hash_bytes(&mut hasher, &rustc_version);
-    hash_scheduler_tool(
-        &mut hasher,
-        b"cargo-tool",
-        std::ffi::OsStr::new("cargo"),
-        &group.root,
-        cancelled,
-    )?;
-    hash_scheduler_tool(&mut hasher, b"rustc-tool", &rustc, &group.root, cancelled)?;
-    for variable in [
-        "RUSTC_WRAPPER",
-        "RUSTC_WORKSPACE_WRAPPER",
-        "CARGO_BUILD_RUSTC_WRAPPER",
-        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
-    ] {
-        scheduler_identity_not_cancelled(cancelled)?;
-        scheduler_build_hash_bytes(&mut hasher, variable.as_bytes());
-        if let Some(wrapper) = std::env::var_os(variable).filter(|value| !value.is_empty()) {
-            hasher.write_u8(1);
-            hash_scheduler_tool(
-                &mut hasher,
-                variable.as_bytes(),
-                &wrapper,
-                &group.root,
-                cancelled,
-            )?;
-        } else {
-            hasher.write_u8(0);
-        }
-    }
-    for (name, value) in scheduler_build_environment(&group.root, cancelled)? {
-        scheduler_identity_not_cancelled(cancelled)?;
-        scheduler_build_hash_bytes(&mut hasher, name.as_os_str().as_bytes());
-        scheduler_build_hash_bytes(&mut hasher, &value);
-    }
-    scheduler_identity_not_cancelled(cancelled)?;
-    Ok(hasher.finish())
-}
-
-fn scheduler_workspace_build_identity(
-    group: &WorkspaceSchedulerBuild,
-    profile: &str,
-    build_options: &[String],
-) -> Result<u64, String> {
-    scheduler_workspace_build_identity_with_cancel(group, profile, build_options, &|| {
-        crate::interrupt::INTERRUPTED.load(std::sync::atomic::Ordering::Acquire)
-    })
 }
 
 /// Remove cargo-ktstr's run-instance state from a scheduler Cargo child.
@@ -2497,99 +1627,103 @@ fn build_scheduler_workspace(
     build_options: &[String],
     cli_label: &str,
 ) -> Result<WorkspaceSchedulerArtifacts, String> {
-    let (build_args, target_dir) = scheduler_workspace_execution(group, profile, build_options);
+    let metadata = group.metadata.as_ref().ok_or_else(|| {
+        format!(
+            "scheduler workspace {} has no Cargo metadata for stable source materialization",
+            group.root.display()
+        )
+    })?;
+    let (identity_build_args, identity_target_dir) =
+        scheduler_workspace_execution(group, profile, build_options);
+    let identity_plan = crate::nextest_artifact_cache::identity_plan_for_invocation(
+        metadata,
+        "scheduler-workspace",
+        &identity_build_args,
+        std::slice::from_ref(&identity_target_dir),
+        &group.root,
+    )?;
+    let identity = identity_plan.identity;
+    let stable_source = identity_plan.stable_source(cli_label)?;
+    let stable_build_options = stable_source.remap_cargo_args(build_options);
+    let (build_args, _identity_target_dir) =
+        scheduler_workspace_execution(group, profile, &stable_build_options);
     let packages = group.packages.keys().cloned().collect::<Vec<_>>();
-    for attempt in 1..=3 {
-        let identity = scheduler_workspace_build_identity(group, profile, build_options)?;
-        let input_drifted = std::cell::Cell::new(false);
-        let cached = ktstr::scheduler_artifact::load_or_build_scheduler_workspace_artifacts(
-            identity,
-            &packages,
-            cli_label,
-            || {
-                let after = scheduler_workspace_build_identity(group, profile, build_options)?;
-                let matches = after == identity;
-                input_drifted.set(!matches);
-                Ok(matches)
-            },
-            || crate::interrupt::INTERRUPTED.load(std::sync::atomic::Ordering::Acquire),
-            || {
-                let mut command = Command::new("cargo");
-                command.current_dir(&group.root).args(&build_args);
-                sanitize_scheduler_build_child_environment(&mut command);
-                crate::run_cargo::run_reserved_build_output_under_lease(
-                    command,
-                    cli_label,
-                    "scheduler workspace pre-build",
-                    &target_dir,
-                    |output| {
-                        if !output.status.success() {
-                            return Err(format!(
-                                "scheduler prebuild in workspace {} failed ({}) — see Cargo \
-                                 output above",
-                                group.root.display(),
-                                output
-                                    .status
-                                    .code()
-                                    .map_or("signal".to_string(), |code| code.to_string()),
-                            ));
-                        }
-                        map_scheduler_artifacts(&output.stdout, group)?
-                            .into_iter()
-                            .map(|(package, path)| {
-                                let pinned =
-                                    ktstr::cache::pin_content_file(&path).map_err(|error| {
-                                        format!(
-                                            "pin Cargo-emitted scheduler package {package:?} \
-                                             artifact {} while target output is exclusively \
-                                             owned: {error:#}",
-                                            path.display(),
-                                        )
-                                    })?;
-                                Ok((package, pinned))
-                            })
-                            .collect::<Result<BTreeMap<_, _>, String>>()
-                    },
-                )
-            },
-        );
-        if input_drifted.get() {
-            eprintln!(
-                "{cli_label}: scheduler workspace inputs changed during build; \
-                 retrying from a fresh identity ({attempt}/3)"
-            );
-            continue;
-        }
-        let cached = cached?;
-        let accepted = scheduler_workspace_build_identity(group, profile, build_options)?;
-        if accepted != identity {
-            eprintln!(
-                "{cli_label}: scheduler workspace inputs changed while accepting cached \
-                 artifacts; retrying from a fresh identity ({attempt}/3)"
-            );
-            continue;
-        }
-        if cached.cache_hit {
-            eprintln!(
-                "{cli_label}: reused input-addressed scheduler workspace build \
-                 {identity:016x}"
-            );
-        }
-        return Ok(WorkspaceSchedulerArtifacts {
-            paths: cached.paths,
-            snapshots: cached.snapshots,
-        });
+    let cached = ktstr::scheduler_artifact::load_or_build_scheduler_workspace_artifacts_stable(
+        identity,
+        &packages,
+        cli_label,
+        || Ok(true),
+        || crate::interrupt::INTERRUPTED.load(std::sync::atomic::Ordering::Acquire),
+        |stable_build| {
+            // The build consumes only the immutable stable source whose
+            // identity was validated before publication. There is no live
+            // checkout left to rewalk after Cargo exits.
+            let stable_group = scheduler_group_remapped_to_stable_source(
+                group,
+                &stable_source.workspace_root,
+                &stable_build_options,
+            )?;
+            let mut command = Command::new("cargo");
+            let stable_build_dir = stable_build.root.join("build");
+            command
+                .current_dir(&stable_source.workspace_root)
+                .args(force_scheduler_stable_target(
+                    build_args.clone(),
+                    &stable_build.target_directory,
+                ))
+                .env("CARGO_BUILD_BUILD_DIR", &stable_build_dir)
+                .env("GIT_OPTIONAL_LOCKS", "0");
+            sanitize_scheduler_build_child_environment(&mut command);
+            crate::run_cargo::run_reserved_build_output_under_lease(
+                command,
+                cli_label,
+                "scheduler workspace pre-build",
+                &stable_build.target_directory,
+                |output| {
+                    if !output.status.success() {
+                        return Err(format!(
+                            "scheduler prebuild in workspace {} failed ({}) — see Cargo \
+                             output above",
+                            group.root.display(),
+                            output
+                                .status
+                                .code()
+                                .map_or("signal".to_string(), |code| code.to_string()),
+                        ));
+                    }
+                    map_scheduler_artifacts(&output.stdout, &stable_group)?
+                        .into_iter()
+                        .map(|(package, path)| {
+                            let pinned = ktstr::cache::pin_content_file(&path).map_err(|error| {
+                                format!(
+                                    "pin Cargo-emitted scheduler package {package:?} artifact {} \
+                                     while target output is exclusively owned: {error:#}",
+                                    path.display(),
+                                )
+                            })?;
+                            Ok((package, pinned))
+                        })
+                        .collect::<Result<BTreeMap<_, _>, String>>()
+                },
+            )
+        },
+    )?;
+    if cached.cache_hit {
+        eprintln!("{cli_label}: reused input-addressed scheduler workspace build {identity:016x}");
     }
-    Err(format!(
-        "scheduler workspace inputs changed during three consecutive Cargo builds in {}",
-        group.root.display()
-    ))
+    Ok(WorkspaceSchedulerArtifacts {
+        paths: cached.paths,
+        tree: cached.tree,
+        stable_source,
+    })
 }
 
 /// Parent-owned scheduler handoff kept alive through one nextest run.
 pub(crate) struct PreparedSchedulerArtifacts {
     _owner: tempfile::TempDir,
     _snapshots: Vec<ktstr::scheduler_artifact::SchedulerArtifactSnapshot>,
+    _scheduler_trees: Vec<ktstr::cache::artifact_tree::MaterializedArtifactTree>,
+    _scheduler_sources: Vec<crate::nextest_artifact_cache::StableCargoSource>,
     pub(crate) manifest_path: PathBuf,
     pub(crate) binaries: Vec<PathBuf>,
 }
@@ -2609,12 +1743,44 @@ pub(crate) fn prepare_scheduler_artifacts(
     cargo_args: &[String],
     invocation_dir: &Path,
 ) -> Result<PreparedSchedulerArtifacts, String> {
+    let requirements = probe_scheduler_artifact_requirements(test_bins, loader_paths)?;
+    prepare_scheduler_artifacts_from_requirements(
+        requirements,
+        cli_profile,
+        cargo_args,
+        invocation_dir,
+    )
+}
+
+/// Prepare scheduler artifacts from scheduler/admission manifests captured in
+/// the generic nextest artifact closure. Cache hits use this path and never
+/// reopen the large test executables merely to rediscover the same stamps.
+pub(crate) fn prepare_scheduler_artifacts_from_cached_manifests(
+    manifests: &[ktstr::test_support::SchedulerManifestProbe],
+    cli_profile: Option<&str>,
+    cargo_args: &[String],
+    invocation_dir: &Path,
+) -> Result<PreparedSchedulerArtifacts, String> {
+    let requirements = merge_scheduler_artifact_requirements(manifests.iter().cloned())?;
+    prepare_scheduler_artifacts_from_requirements(
+        requirements,
+        cli_profile,
+        cargo_args,
+        invocation_dir,
+    )
+}
+
+fn prepare_scheduler_artifacts_from_requirements(
+    requirements: Vec<ktstr::test_support::SchedulerArtifactRequirement>,
+    cli_profile: Option<&str>,
+    cargo_args: &[String],
+    invocation_dir: &Path,
+) -> Result<PreparedSchedulerArtifacts, String> {
     use ktstr::scheduler_artifact::{
         SCHEDULER_ARTIFACT_MANIFEST_VERSION, SchedulerArtifactEntry, SchedulerArtifactManifest,
         SchedulerArtifactSpec,
     };
 
-    let requirements = probe_scheduler_artifact_requirements(test_bins, loader_paths)?;
     let profile = scheduler_profile_for_run(cli_profile);
     let metadata_options = declaring_metadata_options(cargo_args, invocation_dir);
     let build_options = scheduler_build_options(cargo_args, invocation_dir);
@@ -2700,7 +1866,7 @@ pub(crate) fn prepare_scheduler_artifacts(
                     workspace_root: workspace.root,
                     target_dir: workspace.target_dir,
                     package_id: workspace.package_id,
-                    source_roots: workspace.source_roots,
+                    metadata: workspace.metadata,
                 });
                 discover_scheduler_names
                     .insert((requirement.manifest_dir, package), requirement.schedulers);
@@ -2719,12 +1885,15 @@ pub(crate) fn prepare_scheduler_artifacts(
     }
     let mut snapshot_paths: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
     let mut snapshots = Vec::new();
+    let mut scheduler_trees = Vec::new();
+    let mut scheduler_sources = Vec::new();
     for group in &groups {
         let artifacts = build_scheduler_workspace(group, &profile, &build_options, "cargo ktstr")?;
         for path in artifacts.paths.values() {
             snapshot_paths.insert(path.clone(), path.clone());
         }
-        snapshots.extend(artifacts.snapshots);
+        scheduler_trees.push(artifacts.tree);
+        scheduler_sources.push(artifacts.stable_source);
         for request in &group.requests {
             let emitted = artifacts
                 .paths
@@ -2780,6 +1949,8 @@ pub(crate) fn prepare_scheduler_artifacts(
     Ok(PreparedSchedulerArtifacts {
         _owner: owner,
         _snapshots: snapshots,
+        _scheduler_trees: scheduler_trees,
+        _scheduler_sources: scheduler_sources,
         manifest_path,
         binaries,
     })
@@ -2793,6 +1964,8 @@ struct SchedulerPrebuildContext<'a> {
 struct PreparedSchedulerManifest {
     manifest: ktstr::scheduler_artifact::SchedulerArtifactManifest,
     _snapshots: Vec<ktstr::scheduler_artifact::SchedulerArtifactSnapshot>,
+    _scheduler_trees: Vec<ktstr::cache::artifact_tree::MaterializedArtifactTree>,
+    _scheduler_sources: Vec<crate::nextest_artifact_cache::StableCargoSource>,
 }
 
 fn prebuild_scheduler_manifest(
@@ -2825,6 +1998,8 @@ fn prebuild_scheduler_manifest(
         BTreeMap::new();
     let mut snapshot_paths: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
     let mut snapshots = Vec::new();
+    let mut scheduler_trees = Vec::new();
+    let mut scheduler_sources = Vec::new();
     for group in &groups {
         if context
             .interrupted
@@ -2841,7 +2016,8 @@ fn prebuild_scheduler_manifest(
         for path in artifacts.paths.values() {
             snapshot_paths.insert(path.clone(), path.clone());
         }
-        snapshots.extend(artifacts.snapshots);
+        scheduler_trees.push(artifacts.tree);
+        scheduler_sources.push(artifacts.stable_source);
         if context
             .interrupted
             .load(std::sync::atomic::Ordering::Acquire)
@@ -2955,6 +2131,8 @@ fn prebuild_scheduler_manifest(
             entries,
         },
         _snapshots: snapshots,
+        _scheduler_trees: scheduler_trees,
+        _scheduler_sources: scheduler_sources,
     })
 }
 
@@ -3019,7 +2197,7 @@ pub(crate) fn run_verifier(
 ) -> Result<(), String> {
     let invocation_dir = std::env::current_dir()
         .map_err(|error| format!("cargo ktstr verifier: read invocation directory: {error}"))?;
-    let package_plan = query_verifier_package_plan(&args)?;
+    let (package_plan, verifier_metadata) = query_verifier_package_plan(&args)?;
     if let Some(package) = package_plan.newer.first() {
         let versions = package
             .versions
@@ -3132,10 +2310,15 @@ pub(crate) fn run_verifier(
     cmd.env(ktstr::KTSTR_KERNEL_ENV, &resolved[0].1);
     let encoded = encode_kernel_list(&resolved)?;
     cmd.env(ktstr::KTSTR_KERNEL_LIST_ENV, encoded);
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
     // Mark this test invocation as cargo-ktstr-orchestrated so
     // VM-boot tests can skip when run under raw nextest. Mirrors
     // the `cargo ktstr test` dispatcher in run_cargo.rs.
     cmd.env(ktstr::KTSTR_ORCHESTRATED_ENV, "1");
+    let base_command_environment = cmd
+        .get_envs()
+        .filter_map(|(name, value)| value.map(|value| (name.to_os_string(), value.to_os_string())))
+        .collect::<Vec<_>>();
 
     // Reserve + cgroup-confine the harness COMPILE phase only, exactly as
     // `run_cargo_sub` does for `cargo ktstr test` (see the block comment
@@ -3178,26 +2361,70 @@ pub(crate) fn run_verifier(
             return Ok(None);
         }
 
-        let mut warm = Command::new("cargo");
-        warm.args(crate::run_cargo::prebuild_no_run_json_args(&nextest_args));
-        for (var, val) in &blob_envs {
-            warm.env(var, val);
-        }
-        warm.env(ktstr::KTSTR_KERNEL_ENV, &resolved[0].1);
-        let pinned_test_bins = crate::run_cargo::run_reserved_prebuild_collect_test_bins(
-            warm,
-            "cargo ktstr verifier",
-            &harness_target_dir,
-        )?;
-        if crate::interrupt::INTERRUPTED.load(std::sync::atomic::Ordering::Acquire) {
-            return Ok(None);
-        }
-        let test_bins = pinned_test_bins.probe_paths();
-        let probe_provenance = pinned_test_bins.probe_provenance();
-        let binary_declarations = probe_scheduler_declarations(&test_bins, &[], &probe_provenance)?;
-        // Ownership now records Cargo's canonical emitted paths; no later
-        // phase reads through the warmed executable descriptors.
-        drop(pinned_test_bins);
+        let mut producer_environment = blob_envs
+            .iter()
+            .map(|(name, value)| (std::ffi::OsString::from(*name), value.clone()))
+            .collect::<Vec<_>>();
+        producer_environment.push((
+            std::ffi::OsString::from("GIT_OPTIONAL_LOCKS"),
+            std::ffi::OsString::from("0"),
+        ));
+        producer_environment.push((
+            std::ffi::OsString::from(ktstr::KTSTR_KERNEL_ENV),
+            resolved[0].1.as_os_str().to_os_string(),
+        ));
+        let cached_artifacts = if let Some(metadata) = verifier_metadata.as_ref() {
+            let build_args = crate::run_cargo::nextest_command_build_surface(&nextest_args)?;
+            Some(crate::run_cargo::load_or_build_nextest_artifacts(
+                metadata,
+                crate::run_cargo::CachedNextestMode::Plain,
+                &build_args,
+                &[],
+                false,
+                std::slice::from_ref(&harness_target_dir),
+                &producer_environment,
+                Some(&resolved[0].1),
+                "cargo ktstr verifier nextest artifact cache",
+            )?)
+        } else {
+            None
+        };
+        let binary_declarations = if let Some(cached) = &cached_artifacts {
+            let cached_command = crate::run_cargo::inject_nextest_command_reuse_args(
+                nextest_args.clone(),
+                &cached.reuse_build_args(),
+            )?;
+            cmd = Command::new("cargo");
+            cmd.args(cached_command)
+                .current_dir(&cached.invocation_root);
+            for (name, value) in &base_command_environment {
+                cmd.env(name, value);
+            }
+            cached_scheduler_declarations(&cached.build_directory, &cached.scheduler_stamps)
+        } else {
+            let mut warm = Command::new("cargo");
+            warm.args(crate::run_cargo::prebuild_no_run_json_args(&nextest_args));
+            for (var, val) in &blob_envs {
+                warm.env(var, val);
+            }
+            warm.env(ktstr::KTSTR_KERNEL_ENV, &resolved[0].1);
+            let pinned_test_bins = crate::run_cargo::run_reserved_prebuild_collect_test_bins(
+                warm,
+                "cargo ktstr verifier",
+                &harness_target_dir,
+            )?;
+            if crate::interrupt::INTERRUPTED.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(None);
+            }
+            let test_bins = pinned_test_bins.probe_paths();
+            let probe_provenance = pinned_test_bins.probe_provenance();
+            let binary_declarations =
+                probe_scheduler_declarations(&test_bins, &[], &probe_provenance)?;
+            // Ownership now records Cargo's canonical emitted paths; no later
+            // phase reads through the warmed executable descriptors.
+            drop(pinned_test_bins);
+            binary_declarations
+        };
         if crate::interrupt::INTERRUPTED.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(None);
         }
@@ -3339,10 +2566,93 @@ pub(crate) fn run_verifier(
 mod tests {
     use super::*;
 
-    use crate::test_env::{ChildEnv, is_reexec_case, reexec_current_test};
-
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn recursive_verifier_cached_reuse_strips_build_surface_and_keeps_cell_filter() {
+        let command = strings(&[
+            "nextest",
+            "run",
+            "--workspace",
+            "--features",
+            "integration,verifier-tests",
+            "--run-ignored",
+            "all",
+            "--test-threads=1000000",
+            "-E",
+            "test(/^verifier/)",
+            "--",
+            "--nocapture",
+        ]);
+        let reuse = strings(&[
+            "--cargo-metadata",
+            "/cache/cargo.json",
+            "--binaries-metadata",
+            "/cache/binaries.json",
+        ]);
+        assert_eq!(
+            crate::run_cargo::inject_nextest_command_reuse_args(command, &reuse).unwrap(),
+            strings(&[
+                "nextest",
+                "run",
+                "--run-ignored",
+                "all",
+                "--test-threads=1000000",
+                "-E",
+                "test(/^verifier/)",
+                "--cargo-metadata",
+                "/cache/cargo.json",
+                "--binaries-metadata",
+                "/cache/binaries.json",
+                "--",
+                "--nocapture",
+            ]),
+            "cached verifier runs must not combine reuse metadata with conflicting Cargo opts",
+        );
+    }
+
+    #[test]
+    fn recursive_verifier_cache_miss_builds_only_the_cargo_surface() {
+        assert_eq!(
+            crate::run_cargo::nextest_command_build_surface(&strings(&[
+                "nextest",
+                "run",
+                "--workspace",
+                "--features",
+                "integration,verifier-tests",
+                "--run-ignored",
+                "all",
+                "--test-threads=1000000",
+                "--retries",
+                "2",
+                "-E",
+                "test(/^verifier/)",
+            ]))
+            .unwrap(),
+            strings(&["--workspace", "--features", "integration,verifier-tests",]),
+            "the elected cache producer must compile once without executing/listing cells",
+        );
+    }
+
+    #[test]
+    fn recursive_verifier_cached_stamp_restores_binary_owner_without_elf_probe() {
+        let stamps = vec![crate::nextest_artifact_cache::CachedBinaryStamp {
+            relative_binary: PathBuf::from("debug/deps/verifier_fixture-deadbeef"),
+            manifest: ktstr::test_support::SchedulerManifestProbe {
+                declarations: Vec::new(),
+                artifact_requirements: Vec::new(),
+                tests: Vec::new(),
+            },
+        }];
+        let declarations = cached_scheduler_declarations(Path::new("/cow/build"), &stamps);
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(
+            declarations[0].executable,
+            Path::new("/cow/build/debug/deps/verifier_fixture-deadbeef"),
+        );
+        assert!(declarations[0].declarations.is_empty());
     }
 
     fn discover_declaration(
@@ -3669,8 +2979,8 @@ mod tests {
             root: PathBuf::from("/w"),
             target_dir: PathBuf::from("/w/target"),
             packages: BTreeMap::from([("scx_a".to_string(), package_id)]),
-            source_roots: BTreeMap::new(),
             requests: Vec::new(),
+            metadata: None,
         };
         let stream = concat!(
             r#"{"reason":"compiler-artifact","package_id":"scx_a 1.0.0 (path+file:///w/scx_a)","target":{"name":"different_bin_name","kind":["bin"],"src_path":"/w/scx_a/src/main.rs"},"profile":{"opt_level":"3","debug_assertions":false,"overflow_checks":false,"test":false},"features":[],"filenames":["/w/target/release/different_bin_name"],"executable":"/w/target/release/different_bin_name","fresh":true}"#,
@@ -3694,8 +3004,8 @@ mod tests {
             root: PathBuf::from("/w"),
             target_dir: PathBuf::from("/w/target"),
             packages: BTreeMap::from([("scx_b".to_string(), b), ("scx_a".to_string(), a)]),
-            source_roots: BTreeMap::new(),
             requests: Vec::new(),
+            metadata: None,
         };
         let outer = strings(&[
             "--locked",
@@ -3752,8 +3062,8 @@ mod tests {
             // otherwise write `/w/relative`, outside the output lease.
             target_dir: PathBuf::from("/w/member/relative"),
             packages: BTreeMap::from([("scx_a".to_string(), package)]),
-            source_roots: BTreeMap::new(),
             requests: Vec::new(),
+            metadata: None,
         };
 
         let (args, locked_target) = scheduler_workspace_execution(&group, "release", &[]);
@@ -3776,115 +3086,6 @@ mod tests {
                 .count(),
             1,
             "an explicit rebased target-dir remains authoritative",
-        );
-    }
-
-    fn scheduler_identity_group(root: &Path) -> WorkspaceSchedulerBuild {
-        let package: PackageId =
-            serde_json::from_str(r#""scx_fixture 1.0.0 (path+file:///semantic/scx_fixture)""#)
-                .expect("scheduler identity PackageId");
-        let source = root.join("scx-fixture");
-        WorkspaceSchedulerBuild {
-            root: root.to_path_buf(),
-            target_dir: root.join("target"),
-            packages: BTreeMap::from([("scx_fixture".to_string(), package)]),
-            source_roots: BTreeMap::from([(
-                (
-                    "workspace:scx-fixture:scx_fixture@1.0.0".to_string(),
-                    source.clone(),
-                ),
-                SchedulerSourceRoot {
-                    semantic_name: "workspace:scx-fixture:scx_fixture@1.0.0".to_string(),
-                    path: source,
-                },
-            )]),
-            requests: Vec::new(),
-        }
-    }
-
-    fn write_scheduler_identity_checkout(root: &Path) {
-        std::fs::create_dir_all(root.join("scx-fixture/src")).expect("create scheduler source");
-        std::fs::create_dir_all(root.join("build_support")).expect("create build support");
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"scx-fixture\"]\nresolver = \"3\"\n",
-        )
-        .expect("write workspace manifest");
-        std::fs::write(root.join("Cargo.lock"), "# fixture lock\n").expect("write lock");
-        std::fs::write(
-            root.join("scx-fixture/Cargo.toml"),
-            "[package]\nname=\"scx_fixture\"\nversion=\"1.0.0\"\nedition=\"2024\"\n",
-        )
-        .expect("write package manifest");
-        std::fs::write(
-            root.join("scx-fixture/src/main.rs"),
-            "fn main() { println!(\"fixture\"); }\n",
-        )
-        .expect("write package source");
-        std::fs::write(
-            root.join("build_support/gix_acquire.rs"),
-            "pub const INPUT: &str = \"one\";\n",
-        )
-        .expect("write workspace-external build input");
-    }
-
-    #[test]
-    fn scheduler_build_identity_is_checkout_independent_and_invalidates_all_workspace_inputs() {
-        const CASE: &str = "scheduler-build-identity";
-        if !is_reexec_case(CASE) {
-            let cache = tempfile::tempdir().expect("scheduler identity cache");
-            reexec_current_test(
-                CASE,
-                [ChildEnv::set(ktstr::KTSTR_CACHE_DIR_ENV, cache.path())],
-            );
-            return;
-        }
-
-        let first = tempfile::tempdir().expect("first scheduler checkout");
-        let second = tempfile::tempdir().expect("second scheduler checkout");
-        write_scheduler_identity_checkout(first.path());
-        write_scheduler_identity_checkout(second.path());
-        let first_group = scheduler_identity_group(first.path());
-        let second_group = scheduler_identity_group(second.path());
-
-        let identity =
-            scheduler_workspace_build_identity(&first_group, "release", &[]).expect("first key");
-        assert_eq!(
-            scheduler_workspace_build_identity(&second_group, "release", &[]).expect("second key"),
-            identity,
-            "checkout paths, inode numbers, and mtimes must not enter the semantic key",
-        );
-
-        std::fs::write(
-            second.path().join("build_support/gix_acquire.rs"),
-            "pub const INPUT: &str = \"two\";\n",
-        )
-        .expect("change workspace-external build input");
-        assert_ne!(
-            scheduler_workspace_build_identity(&second_group, "release", &[])
-                .expect("changed source key"),
-            identity,
-            "workspace-external files consumed by a package build script must invalidate",
-        );
-
-        write_scheduler_identity_checkout(second.path());
-        std::fs::create_dir_all(second.path().join("target/debug")).expect("create target output");
-        std::fs::write(
-            second.path().join("target/debug/irrelevant-output"),
-            b"target output is not a build input",
-        )
-        .expect("write target output");
-        assert_eq!(
-            scheduler_workspace_build_identity(&second_group, "release", &[])
-                .expect("target-excluded key"),
-            identity,
-            "Cargo output placement and contents must not defeat cross-runner reuse",
-        );
-        assert_ne!(
-            scheduler_workspace_build_identity(&second_group, "scheduler-dev", &[])
-                .expect("profile key"),
-            identity,
-            "profile is part of the exact scheduler artifact identity",
         );
     }
 
@@ -3991,255 +3192,6 @@ mod tests {
             environment.get(std::ffi::OsStr::new("SCHEDULER_FIXTURE_MODE")),
             Some(&Some("semantic".into())),
             "arbitrary scheduler build inputs remain inherited",
-        );
-    }
-
-    #[test]
-    fn scheduler_source_tree_hashes_ignored_and_external_inputs_but_not_git_or_targets() {
-        const CASE: &str = "scheduler-source-tree-completeness";
-        if !is_reexec_case(CASE) {
-            let cache = tempfile::tempdir().expect("scheduler source cache");
-            reexec_current_test(
-                CASE,
-                [ChildEnv::set(ktstr::KTSTR_CACHE_DIR_ENV, cache.path())],
-            );
-            return;
-        }
-
-        use std::os::unix::fs::symlink;
-
-        let checkout = tempfile::tempdir().expect("scheduler source checkout");
-        let external = tempfile::tempdir().expect("external scheduler source");
-        std::fs::create_dir_all(checkout.path().join("generated")).expect("create generated");
-        std::fs::create_dir_all(checkout.path().join(".git/objects")).expect("create git metadata");
-        std::fs::create_dir_all(checkout.path().join("target/debug")).expect("create target");
-        std::fs::create_dir_all(checkout.path().join("nested-worktree/target/debug"))
-            .expect("create nested worktree target");
-        std::fs::write(checkout.path().join(".gitignore"), "generated/\n").expect("write ignore");
-        std::fs::write(
-            checkout.path().join("generated/input.rs"),
-            "pub const INPUT: u8 = 1;\n",
-        )
-        .expect("write ignored generated input");
-        std::fs::write(checkout.path().join(".git/objects/noise"), "one\n")
-            .expect("write git metadata");
-        std::fs::write(checkout.path().join("target/debug/output"), "one\n")
-            .expect("write target output");
-        std::fs::write(
-            checkout.path().join("nested-worktree/.git"),
-            "gitdir: elsewhere\n",
-        )
-        .expect("write nested worktree marker");
-        std::fs::write(
-            checkout.path().join("nested-worktree/target/debug/output"),
-            "one\n",
-        )
-        .expect("write nested worktree output");
-        std::fs::write(
-            external.path().join("input.rs"),
-            "pub const EXTERNAL: u8 = 1;\n",
-        )
-        .expect("write external source");
-        symlink(external.path(), checkout.path().join("external"))
-            .expect("link external source root");
-        symlink(
-            checkout.path().join("target"),
-            checkout.path().join("target-alias"),
-        )
-        .expect("link target alias");
-
-        let target = checkout.path().join("target");
-        let digest = || {
-            scheduler_source_tree_digest(checkout.path(), &target, &|| false)
-                .expect("scheduler source digest")
-        };
-        let original = digest();
-
-        std::fs::write(checkout.path().join(".git/objects/noise"), "two\n")
-            .expect("change git metadata");
-        std::fs::write(checkout.path().join("target/debug/output"), "two\n")
-            .expect("change target output");
-        std::fs::write(
-            checkout.path().join("nested-worktree/target/debug/output"),
-            "two\n",
-        )
-        .expect("change nested worktree output");
-        assert_eq!(
-            digest(),
-            original,
-            ".git, nested repositories, and actual target directories are outputs not inputs",
-        );
-
-        std::fs::write(
-            checkout.path().join("generated/input.rs"),
-            "pub const INPUT: u8 = 2;\n",
-        )
-        .expect("change ignored generated input");
-        let generated = digest();
-        assert_ne!(
-            generated, original,
-            "ignored/generated files under a local Cargo source root must invalidate",
-        );
-
-        std::fs::write(
-            external.path().join("input.rs"),
-            "pub const EXTERNAL: u8 = 2;\n",
-        )
-        .expect("change external source");
-        assert_ne!(
-            digest(),
-            generated,
-            "reachable contents behind an external symlink must invalidate",
-        );
-    }
-
-    #[test]
-    fn scheduler_build_identity_scan_observes_cancellation_after_it_starts() {
-        let checkout = tempfile::tempdir().expect("scheduler cancellation checkout");
-        write_scheduler_identity_checkout(checkout.path());
-        let group = scheduler_identity_group(checkout.path());
-        let polls = std::cell::Cell::new(0usize);
-        let error = scheduler_workspace_build_identity_with_cancel(&group, "release", &[], &|| {
-            let poll = polls.get() + 1;
-            polls.set(poll);
-            poll >= 4
-        })
-        .expect_err("identity scan must stop after cancellation");
-        assert!(
-            polls.get() >= 4 && error.contains("identity scan interrupted"),
-            "unexpected cancellation result after {} polls: {error}",
-            polls.get(),
-        );
-    }
-
-    #[test]
-    fn scheduler_build_option_files_resolve_from_declaring_workspace_and_hash_contents() {
-        const CASE: &str = "scheduler-build-options";
-        if !is_reexec_case(CASE) {
-            let cache = tempfile::tempdir().expect("scheduler option cache");
-            reexec_current_test(
-                CASE,
-                [ChildEnv::set(ktstr::KTSTR_CACHE_DIR_ENV, cache.path())],
-            );
-            return;
-        }
-
-        let checkout = tempfile::tempdir().expect("scheduler option checkout");
-        std::fs::create_dir(checkout.path().join("config")).expect("create config directory");
-        std::fs::create_dir(checkout.path().join("targets")).expect("create targets directory");
-        std::fs::write(
-            checkout.path().join("config/build.toml"),
-            "net.offline=true\n",
-        )
-        .expect("write Cargo config");
-        std::fs::write(
-            checkout.path().join("targets/custom.json"),
-            "{\"arch\":\"x86_64\"}\n",
-        )
-        .expect("write target JSON");
-        let options = vec![
-            "--config".to_string(),
-            "config/build.toml".to_string(),
-            "--target=targets/custom.json".to_string(),
-            "--target-dir".to_string(),
-            "target/output".to_string(),
-        ];
-        let first = scheduler_semantic_build_options(
-            &options,
-            checkout.path(),
-            &checkout.path().join("target"),
-            &|| false,
-        )
-        .expect("semantic scheduler options");
-        assert!(
-            first.iter().all(|(argument, _)| !argument
-                .contains(checkout.path().to_str().expect("temporary path is UTF-8"))),
-            "checkout-specific absolute paths must not enter the cache identity",
-        );
-        assert!(
-            first
-                .iter()
-                .all(|(argument, _)| !argument.contains("target/output")),
-            "target-dir is output placement, not scheduler artifact identity",
-        );
-
-        std::fs::write(
-            checkout.path().join("config/build.toml"),
-            "net.offline=false\n",
-        )
-        .expect("change Cargo config");
-        let changed = scheduler_semantic_build_options(
-            &options,
-            checkout.path(),
-            &checkout.path().join("target"),
-            &|| false,
-        )
-        .expect("changed semantic scheduler options");
-        assert_ne!(first, changed, "config file contents must invalidate");
-
-        let mirror = tempfile::tempdir().expect("scheduler option mirror");
-        for root in [checkout.path(), mirror.path()] {
-            std::fs::create_dir_all(root.join("patched/src")).expect("create patched source");
-            std::fs::write(
-                root.join("patched/src/lib.rs"),
-                "pub const PATCHED: u8 = 1;\n",
-            )
-            .expect("write patched source");
-        }
-        let inline_options = |root: &Path| {
-            vec![
-                "--config".to_string(),
-                format!(
-                    "patch.crates-io.fixture.path={}",
-                    serde_json::to_string(&root.join("patched").to_string_lossy())
-                        .expect("serialize inline config path")
-                ),
-                "--config".to_string(),
-                format!(
-                    "build.build-dir={}",
-                    serde_json::to_string(&root.join("target/build").to_string_lossy())
-                        .expect("serialize build directory")
-                ),
-            ]
-        };
-        let inline_first = scheduler_semantic_build_options(
-            &inline_options(checkout.path()),
-            checkout.path(),
-            &checkout.path().join("target"),
-            &|| false,
-        )
-        .expect("first inline options");
-        let inline_mirror = scheduler_semantic_build_options(
-            &inline_options(mirror.path()),
-            mirror.path(),
-            &mirror.path().join("target"),
-            &|| false,
-        )
-        .expect("mirrored inline options");
-        assert_eq!(
-            inline_first, inline_mirror,
-            "rebased inline Cargo paths must be keyed by kind and contents, not checkout path",
-        );
-        assert!(inline_first.iter().all(|(argument, _)| {
-            !argument.contains(checkout.path().to_str().expect("UTF-8 checkout"))
-                && !argument.contains(mirror.path().to_str().expect("UTF-8 mirror"))
-        }));
-
-        std::fs::write(
-            mirror.path().join("patched/src/lib.rs"),
-            "pub const PATCHED: u8 = 2;\n",
-        )
-        .expect("change mirrored patch");
-        assert_ne!(
-            scheduler_semantic_build_options(
-                &inline_options(mirror.path()),
-                mirror.path(),
-                &mirror.path().join("target"),
-                &|| false,
-            )
-            .expect("changed inline options"),
-            inline_first,
-            "inline path source contents must still invalidate",
         );
     }
 

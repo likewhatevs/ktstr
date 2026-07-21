@@ -429,20 +429,6 @@ impl KtstrKvm {
         Self::new_inner(topo, Some(memory_mib), false, performance_mode)
     }
 
-    /// Create a KVM VM without allocating guest memory.
-    ///
-    /// Sets up /dev/kvm, VM fd, TSS, identity map, IRQ chip, vCPUs, and
-    /// CPUID — none of which depend on guest memory size. Memory is
-    /// allocated later via [`Self::allocate_memory`] and published via
-    /// [`Self::register_memory`].
-    pub fn new_deferred(
-        topo: Topology,
-        use_hugepages: bool,
-        performance_mode: bool,
-    ) -> Result<Self> {
-        Self::new_inner(topo, None, use_hugepages, performance_mode)
-    }
-
     /// Allocate guest memory without registering it with KVM.
     ///
     /// Called exactly once on a deferred VM. The complete final COW layout may

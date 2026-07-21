@@ -28,7 +28,6 @@ const CONTENT_OBJECT_DIR: &str = "objects-v2";
 const CONTENT_GC_STAMP: &str = ".gc-v2";
 const CONTENT_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const CONTENT_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-const CONTENT_MAX_OBJECT_BYTES: u64 = 8 << 30;
 
 fn fixed_hasher() -> AHasher {
     ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher()
@@ -242,12 +241,7 @@ fn parse_cache_key(name: &str, prefix: &str, suffix: &str) -> Option<String> {
     (key.len() == 16 && key.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| key.to_string())
 }
 
-fn gc_content_cache_at(
-    root: &Path,
-    now: SystemTime,
-    max_age: Duration,
-    max_object_bytes: u64,
-) -> Result<()> {
+fn gc_content_cache_at(root: &Path, now: SystemTime, max_age: Duration) -> Result<()> {
     ensure_content_dirs(root)?;
     let lock_dir = root.join(FILE_DIGEST_LOCK_DIR);
     let namespace_gate_path = lock_dir.join(FILE_DIGEST_NAMESPACE_GATE);
@@ -285,51 +279,18 @@ fn gc_content_cache_at(
         }
     }
 
-    struct ObjectCandidate {
-        path: PathBuf,
-        lock: PathBuf,
-        modified: SystemTime,
-        len: u64,
-        expired: bool,
-    }
+    // Content objects are deliberately not collected here. An artifact-tree
+    // record names a closure of many objects, but consumers necessarily acquire
+    // the per-object SH leases one at a time while decoding that record. A
+    // per-object age/size sweep can therefore unlink a later member after an
+    // earlier member was leased, turning a valid cross-process hit into a
+    // partial miss (and the former 8-GiB ceiling was smaller than one normal
+    // ktstr nextest closure). Reclamation belongs at the artifact-tree layer,
+    // where a per-identity lease can protect the complete closure atomically.
+    // Until that protocol exists, retaining immutable CAS objects is the only
+    // sound policy. Digest memos and genuinely orphaned lock inodes remain
+    // reconstructible and are still bounded below.
     let object_dir = root.join(CONTENT_OBJECT_DIR);
-    let mut objects = Vec::new();
-    let mut total_bytes = 0u64;
-    for entry in std::fs::read_dir(&object_dir)
-        .with_context(|| format!("scan content object cache {}", object_dir.display()))?
-    {
-        let entry = entry.context("read content object cache entry")?;
-        let name = entry.file_name();
-        let Some(key) = name
-            .to_str()
-            .and_then(|name| parse_cache_key(name, "", ".object"))
-        else {
-            continue;
-        };
-        let metadata = entry
-            .metadata()
-            .with_context(|| format!("stat content object {}", entry.path().display()))?;
-        if !metadata.is_file() {
-            continue;
-        }
-        total_bytes = total_bytes.saturating_add(metadata.len());
-        objects.push(ObjectCandidate {
-            path: entry.path(),
-            lock: lock_dir.join(format!("object-{key}.lock")),
-            modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-            len: metadata.len(),
-            expired: cache_entry_is_old(&metadata, now, max_age),
-        });
-    }
-    objects.sort_by_key(|candidate| candidate.modified);
-    for object in objects {
-        if !object.expired && total_bytes <= max_object_bytes {
-            continue;
-        }
-        if try_remove_coordinated_pair(&namespace_gate, &object.lock, &object.path)? {
-            total_bytes = total_bytes.saturating_sub(object.len);
-        }
-    }
 
     // Reclaim old orphan per-key locks left by a killed process after its data
     // entry was already removed. Only the fixed current namespace is parsed.
@@ -376,12 +337,7 @@ fn maybe_gc_content_cache(root: &Path) -> Result<()> {
     }) {
         return Ok(());
     }
-    gc_content_cache_at(
-        root,
-        SystemTime::now(),
-        CONTENT_MAX_AGE,
-        CONTENT_MAX_OBJECT_BYTES,
-    )
+    gc_content_cache_at(root, SystemTime::now(), CONTENT_MAX_AGE)
 }
 
 /// A per-key coordination inode opened while holding its namespace gate.
@@ -416,6 +372,15 @@ impl CoordinationFile {
     /// publication. A blocking writer cannot be starved by a reader herd.
     pub(crate) fn lock_exclusive(&mut self) -> rustix::io::Result<()> {
         flock_retry(&self.file, rustix::fs::FlockOperation::LockExclusive)
+    }
+
+    /// Retain a lock acquired on a replacement open file description.
+    ///
+    /// The namespace gate remains held while the caller enters the blocking
+    /// kernel queue, so adopting the granted descriptor preserves the same
+    /// open-before-unlink invariant as locking `self.file` directly.
+    pub(crate) fn adopt_locked_file(&mut self, file: std::os::fd::OwnedFd) {
+        self.file = File::from(file);
     }
 
     pub(crate) fn release_namespace_gate(&mut self) {
@@ -634,6 +599,8 @@ fn hash_pinned_file(file: &File, identity: StableFileIdentity) -> Result<u64> {
         StableFileIdentity::from_file(file)?.same_open_content_version(identity),
         "pinned input changed before hashing"
     );
+    #[cfg(test)]
+    record_test_content_hash_read(identity);
     let mut hasher = fixed_hasher();
     let mut offset = 0u64;
     let buffer_len = usize::try_from(identity.size.min(CONTENT_HASH_CHUNK_LEN as u64))?;
@@ -719,6 +686,8 @@ fn hash_pinned_file_exact_identity(file: &File, identity: StableFileIdentity) ->
         StableFileIdentity::from_file(file)? == identity,
         "pinned input changed before exact content validation"
     );
+    #[cfg(test)]
+    record_test_content_hash_read(identity);
     let mut hasher = fixed_hasher();
     let mut offset = 0u64;
     let buffer_len = usize::try_from(identity.size.min(CONTENT_HASH_CHUNK_LEN as u64))?;
@@ -742,6 +711,42 @@ fn hash_pinned_file_exact_identity(file: &File, identity: StableFileIdentity) ->
         "pinned input changed during exact content validation"
     );
     Ok(digest)
+}
+
+#[cfg(test)]
+fn test_content_hash_reads()
+-> &'static std::sync::Mutex<std::collections::BTreeMap<(u64, u64), usize>> {
+    static READS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<(u64, u64), usize>>,
+    > = std::sync::OnceLock::new();
+    READS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn record_test_content_hash_read(identity: StableFileIdentity) {
+    *test_content_hash_reads()
+        .lock()
+        .expect("content hash read counter poisoned")
+        .entry((identity.dev, identity.ino))
+        .or_default() += 1;
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_content_hash_read_count(identity: StableFileIdentity) {
+    test_content_hash_reads()
+        .lock()
+        .expect("content hash read counter poisoned")
+        .remove(&(identity.dev, identity.ino));
+}
+
+#[cfg(test)]
+pub(crate) fn test_content_hash_read_count(identity: StableFileIdentity) -> usize {
+    test_content_hash_reads()
+        .lock()
+        .expect("content hash read counter poisoned")
+        .get(&(identity.dev, identity.ino))
+        .copied()
+        .unwrap_or_default()
 }
 
 /// Digest one pinned file revision exactly once across processes.
@@ -819,6 +824,43 @@ pub(crate) fn open_pinned_file(path: &Path) -> Result<(File, StableFileIdentity)
     Ok((file, identity))
 }
 
+/// Create and pin generated artifact bytes on the content-CAS filesystem.
+///
+/// Artifact-tree publication requires FICLONE without a byte-copy fallback.
+/// Staging generated metadata in the process-global temporary directory would
+/// therefore fail with EXDEV whenever `/tmp` and `KTSTR_CACHE_DIR` are on
+/// different mounts. The bytes originate in memory, so write them once into an
+/// unlinked staging inode beside the CAS objects; publication can then clone
+/// that inode through the same strict path as every other artifact input.
+pub(crate) fn open_pinned_generated_artifact(
+    bytes: &[u8],
+    mode: u32,
+) -> Result<(File, StableFileIdentity)> {
+    let root = content_cache_root()?;
+    ensure_content_dirs(&root)?;
+    let object_dir = root.join(CONTENT_OBJECT_DIR);
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".generated-artifact-")
+        .tempfile_in(&object_dir)
+        .with_context(|| {
+            format!(
+                "create generated artifact staging file in {}",
+                object_dir.display()
+            )
+        })?;
+    temporary
+        .write_all(bytes)
+        .context("write generated artifact staging file")?;
+    temporary
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(mode))
+        .context("set generated artifact staging mode")?;
+    let file = temporary.into_file();
+    let identity =
+        StableFileIdentity::from_file(&file).context("stat generated artifact staging file")?;
+    Ok((file, identity))
+}
+
 fn content_cache_root() -> Result<PathBuf> {
     super::resolve_cache_root_with_suffix("content").context("resolve machine-wide content cache")
 }
@@ -874,11 +916,18 @@ pub(crate) fn open_content_object(content_hash: u64, expected_len: u64) -> Resul
 /// inode; all consumers still mmap that single inode with private/COW
 /// semantics. Publication is atomic and source mutation is checked on both
 /// sides of the copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContentPublicationPolicy {
+    AllowCopyFallback,
+    RequireReflink,
+}
+
 fn publish_content_object(
     expected_hash: u64,
     source: &File,
     source_identity: StableFileIdentity,
     final_path: &Path,
+    policy: ContentPublicationPolicy,
 ) -> Result<File> {
     let parent = final_path
         .parent()
@@ -898,9 +947,10 @@ fn publish_content_object(
     match crate::reflink::ficlone(temporary.as_file(), source) {
         Ok(()) => {}
         Err(error)
-            if error.raw_os_error().is_some_and(|code| {
-                matches!(code, libc::EXDEV | libc::EOPNOTSUPP | libc::ENOTTY)
-            }) =>
+            if policy == ContentPublicationPolicy::AllowCopyFallback
+                && error.raw_os_error().is_some_and(|code| {
+                    matches!(code, libc::EXDEV | libc::EOPNOTSUPP | libc::ENOTTY)
+                }) =>
         {
             let mut offset = 0u64;
             let mut buffer =
@@ -962,11 +1012,12 @@ fn publish_content_object(
 /// The content namespace owns this election rather than any caller-specific
 /// analysis/preparation cache, so identical bytes converge on one inode even
 /// when different components and checkouts request them concurrently.
-fn open_or_publish_content_object_at_root(
+fn open_or_publish_content_object_at_root_with_policy(
     root: &Path,
     content_hash: u64,
     source: &File,
     source_identity: StableFileIdentity,
+    policy: ContentPublicationPolicy,
 ) -> Result<File> {
     ensure_content_dirs(root)?;
     maybe_gc_content_cache(root)?;
@@ -982,7 +1033,7 @@ fn open_or_publish_content_object_at_root(
         &lock_path,
         &format!("content object {content_hash:016x}"),
         || open_content_object_at(&object_path, source_identity.size),
-        || publish_content_object(content_hash, source, source_identity, &object_path),
+        || publish_content_object(content_hash, source, source_identity, &object_path, policy),
     )?;
     validate_source_after_cache_operation(
         source,
@@ -1000,7 +1051,13 @@ pub(crate) fn open_or_publish_content_object(
     source_identity: StableFileIdentity,
 ) -> Result<File> {
     let root = content_cache_root()?;
-    open_or_publish_content_object_at_root(&root, content_hash, source, source_identity)
+    open_or_publish_content_object_at_root_with_policy(
+        &root,
+        content_hash,
+        source,
+        source_identity,
+        ContentPublicationPolicy::AllowCopyFallback,
+    )
 }
 
 /// Shared-lock lease over one immutable content object.
@@ -1019,6 +1076,13 @@ pub(crate) struct ContentObjectLease {
 impl ContentObjectLease {
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Descriptor for the exact immutable object revision covered by this
+    /// lease. Callers which consume bytes must prefer this over reopening the
+    /// diagnostic pathname.
+    pub(crate) fn file(&self) -> &File {
+        &self._file
     }
 }
 
@@ -1049,24 +1113,35 @@ fn lease_content_object_at_root(
     }))
 }
 
-/// Publish and lease one immutable object under the machine-wide content key.
+/// Lease one already-published immutable object by its manifest identity.
 ///
-/// Publication may briefly race an unrelated GC pass before the shared lease
-/// is established. If GC wins that gap, this retries publication; once the
-/// shared flock is held, the canonical pathname is stable for the lease
-/// lifetime.
-pub(crate) fn open_or_publish_content_object_lease(
+/// Tree manifests store only the fast content key and exact length, never a
+/// mutable source pathname. A missing object is a reconstructible cache miss;
+/// the shared lease prevents content GC from unlinking a successful lookup.
+pub(super) fn lease_content_object(
+    content_hash: u64,
+    expected_len: u64,
+) -> Result<Option<ContentObjectLease>> {
+    let root = content_cache_root()?;
+    ensure_content_dirs(&root)?;
+    maybe_gc_content_cache(&root)?;
+    lease_content_object_at_root(&root, content_hash, expected_len)
+}
+
+pub(crate) fn open_or_publish_content_object_lease_with_policy(
     content_hash: u64,
     source: &File,
     source_identity: StableFileIdentity,
+    policy: ContentPublicationPolicy,
 ) -> Result<ContentObjectLease> {
     let root = content_cache_root()?;
     loop {
-        drop(open_or_publish_content_object_at_root(
+        drop(open_or_publish_content_object_at_root_with_policy(
             &root,
             content_hash,
             source,
             source_identity,
+            policy,
         )?);
         if let Some(lease) =
             lease_content_object_at_root(&root, content_hash, source_identity.size)?
@@ -1213,14 +1288,25 @@ mod tests {
         let (source, identity) = open_pinned_file(&source_path).unwrap();
         let content_hash = hash_pinned_file(&source, identity).unwrap();
         drop(
-            open_or_publish_content_object_at_root(root.path(), content_hash, &source, identity)
-                .unwrap(),
+            open_or_publish_content_object_at_root_with_policy(
+                root.path(),
+                content_hash,
+                &source,
+                identity,
+                ContentPublicationPolicy::AllowCopyFallback,
+            )
+            .unwrap(),
         );
 
         rewrite_same_size_and_restore_mtime(&source_path, b"new scheduler bytes", identity);
-        let error =
-            open_or_publish_content_object_at_root(root.path(), content_hash, &source, identity)
-                .unwrap_err();
+        let error = open_or_publish_content_object_at_root_with_policy(
+            root.path(),
+            content_hash,
+            &source,
+            identity,
+            ContentPublicationPolicy::AllowCopyFallback,
+        )
+        .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1239,9 +1325,14 @@ mod tests {
         let content_hash = hash_pinned_file(&source, identity).unwrap();
 
         rewrite_same_size_and_restore_mtime(&source_path, b"new scheduler bytes", identity);
-        let error =
-            open_or_publish_content_object_at_root(root.path(), content_hash, &source, identity)
-                .unwrap_err();
+        let error = open_or_publish_content_object_at_root_with_policy(
+            root.path(),
+            content_hash,
+            &source,
+            identity,
+            ContentPublicationPolicy::AllowCopyFallback,
+        )
+        .unwrap_err();
         assert!(
             format!("{error:#}").contains("transient source revision"),
             "unexpected stale publication rejection: {error:#}",
@@ -1253,7 +1344,7 @@ mod tests {
     }
 
     #[test]
-    fn gc_bounds_objects_digests_and_locks_but_skips_live_builder() {
+    fn gc_reclaims_metadata_but_never_partially_collects_content_closures() {
         let root = tempfile::TempDir::new().unwrap();
         ensure_content_dirs(root.path()).unwrap();
         let digest_dir = root.path().join(FILE_DIGEST_MEMO_DIR);
@@ -1263,6 +1354,7 @@ mod tests {
         let digest_key = "1111111111111111";
         let object_key = "2222222222222222";
         let live_key = "3333333333333333";
+        let orphan_key = "4444444444444444";
         std::fs::write(digest_dir.join(format!("{digest_key}.digest")), b"memo").unwrap();
         std::fs::write(lock_dir.join(format!("digest-{digest_key}.lock")), b"").unwrap();
         std::fs::write(
@@ -1279,23 +1371,32 @@ mod tests {
         let live_lock_path = lock_dir.join(format!("object-{live_key}.lock"));
         let live_lock = open_lock_file(&live_lock_path).unwrap();
         flock_retry(&live_lock, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        let orphan_lock_path = lock_dir.join(format!("object-{orphan_key}.lock"));
+        std::fs::write(&orphan_lock_path, b"").unwrap();
 
         let future = SystemTime::now() + CONTENT_MAX_AGE + Duration::from_secs(1);
-        gc_content_cache_at(root.path(), future, CONTENT_MAX_AGE, 0).unwrap();
+        gc_content_cache_at(root.path(), future, CONTENT_MAX_AGE).unwrap();
         assert!(!digest_dir.join(format!("{digest_key}.digest")).exists());
         assert!(!lock_dir.join(format!("digest-{digest_key}.lock")).exists());
-        assert!(!object_dir.join(format!("{object_key}.object")).exists());
-        assert!(!lock_dir.join(format!("object-{object_key}.lock")).exists());
+        assert!(
+            object_dir.join(format!("{object_key}.object")).exists(),
+            "GC must retain an unleased object until closure-level collection exists"
+        );
+        assert!(lock_dir.join(format!("object-{object_key}.lock")).exists());
         assert!(
             object_dir.join(format!("{live_key}.object")).exists(),
-            "GC must not unlink an object whose per-key builder lock is live"
+            "GC must retain every member of a possible artifact closure"
         );
         assert!(live_lock_path.exists());
+        assert!(
+            !orphan_lock_path.exists(),
+            "an old object lock with no object or owner is reconstructible"
+        );
 
         drop(live_lock);
-        gc_content_cache_at(root.path(), future, CONTENT_MAX_AGE, 0).unwrap();
-        assert!(!object_dir.join(format!("{live_key}.object")).exists());
-        assert!(!live_lock_path.exists());
+        gc_content_cache_at(root.path(), future, CONTENT_MAX_AGE).unwrap();
+        assert!(object_dir.join(format!("{live_key}.object")).exists());
+        assert!(live_lock_path.exists());
         assert!(
             lock_dir.join(FILE_DIGEST_NAMESPACE_GATE).exists(),
             "the namespace gate itself is never a GC candidate"
@@ -1330,7 +1431,7 @@ mod tests {
     }
 
     #[test]
-    fn executable_leases_converge_and_block_gc_until_drop() {
+    fn executable_leases_converge_and_content_survives_lease_drop() {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let root = tempfile::TempDir::new().unwrap();
@@ -1344,7 +1445,14 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             let (file, identity) = open_pinned_file(&path).unwrap();
             drop(
-                open_or_publish_content_object_at_root(root.path(), hash, &file, identity).unwrap(),
+                open_or_publish_content_object_at_root_with_policy(
+                    root.path(),
+                    hash,
+                    &file,
+                    identity,
+                    ContentPublicationPolicy::AllowCopyFallback,
+                )
+                .unwrap(),
             );
             leases.push(
                 lease_content_object_at_root(root.path(), hash, identity.size)
@@ -1363,7 +1471,7 @@ mod tests {
         );
 
         let future = SystemTime::now() + CONTENT_MAX_AGE + Duration::from_secs(1);
-        gc_content_cache_at(root.path(), future, CONTENT_MAX_AGE, 0).unwrap();
+        gc_content_cache_at(root.path(), future, CONTENT_MAX_AGE).unwrap();
         assert!(
             leases[0].path().exists(),
             "shared lease must prevent GC from unlinking a live manifest path"
@@ -1371,10 +1479,10 @@ mod tests {
 
         let object_path = leases[0].path().to_path_buf();
         drop(leases);
-        gc_content_cache_at(root.path(), future, CONTENT_MAX_AGE, 0).unwrap();
+        gc_content_cache_at(root.path(), future, CONTENT_MAX_AGE).unwrap();
         assert!(
-            !object_path.exists(),
-            "dropping every flock lease must make the object reclaimable"
+            object_path.exists(),
+            "per-object GC must not tear down a multi-object closure after leases drop"
         );
     }
 }

@@ -1327,12 +1327,9 @@ pub(crate) fn collect_verifier_output_with_memory_min(
     // perf-mode tuning (CPU pinning, RT priority, hugepages, NUMA mbind,
     // KVM exit suppression). So the verifier VM ALWAYS runs with
     // performance mode disabled: it needs none of that tuning. Disabling
-    // perf mode also moves the run OFF the default run-lock path — whose
-    // per-offset `LOCK_SH` search hard-fails "all N LLC slots busy
-    // (LOCK_SH)" (`acquire_default_run_locks`, src/vmm/mod.rs) when no
-    // candidate offset is free, the failure the verifier was hitting —
-    // ONTO the no-perf-mode plan, which reserves a shared (`LOCK_SH`)
-    // SUBSET of LLCs via `acquire_llc_plan`. `LOCK_SH` holders are
+    // perf mode also routes the run through the no-perf plan, which reserves
+    // a shared (`LOCK_SH`) subset of LLCs and admission permits atomically.
+    // `LOCK_SH` holders are
     // mutually compatible, so parallel verifier / no-perf cells no longer
     // starve each other on the LLC lock; a `performance_mode` peer holding
     // `LOCK_EX` on those LLCs can still defer a cell (nextest retries it),

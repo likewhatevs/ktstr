@@ -25,12 +25,14 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::export::build_test_binaries;
 
 const PROBE_CHILD_TIMEOUT: Duration = Duration::from_secs(60);
 const EXPORT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const SCHEDULER_STAMP_READ_MAX_PARALLELISM: usize = 16;
 
 /// One decoded combined scheduler manifest retained with the executable which
 /// emitted it. `executable` is rewritten through `provenance` when the caller
@@ -285,6 +287,74 @@ fn collect_probe_outputs<T>(
     Ok(collected)
 }
 
+/// Read independent ELF stamps with bounded host parallelism while retaining
+/// input-ordered results and errors.
+///
+/// Completion reporting follows real completion order so long reads continue
+/// to produce useful progress. Semantic consumption happens only after every
+/// worker joins and walks the indexed result vector, making the selected error
+/// deterministic even when a later binary fails first.
+fn read_scheduler_stamps_parallel_with<T: Send>(
+    bins: &[PathBuf],
+    max_parallelism: usize,
+    read: impl Fn(&Path) -> Result<Option<T>, String> + Sync,
+    mut item_finished: impl FnMut(bool),
+) -> Result<Vec<Option<T>>, String> {
+    if bins.is_empty() {
+        return Ok(Vec::new());
+    }
+    let workers = max_parallelism.max(1).min(bins.len());
+    let next = AtomicUsize::new(0);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut results = std::iter::repeat_with(|| None)
+        .take(bins.len())
+        .collect::<Vec<Option<Result<Option<T>, String>>>>();
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let sender = sender.clone();
+            let read = &read;
+            let next = &next;
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(binary) = bins.get(index) else {
+                        break;
+                    };
+                    if sender.send((index, read(binary))).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+        for (index, result) in receiver {
+            item_finished(result.is_ok());
+            results[index] = Some(result);
+        }
+    });
+
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            result.ok_or_else(|| {
+                format!(
+                    "scheduler stamp worker returned no result for {} (input index {index})",
+                    bins[index].display(),
+                )
+            })?
+        })
+        .collect()
+}
+
+fn scheduler_stamp_read_parallelism(binary_count: usize) -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(SCHEDULER_STAMP_READ_MAX_PARALLELISM)
+        .min(binary_count.max(1))
+}
+
 /// Read the combined scheduler payload from every distinct selected binary.
 ///
 /// The payload is a versioned, link-retained ELF stamp emitted by
@@ -312,31 +382,34 @@ pub(crate) fn probe_scheduler_manifests_from_bins(
         bins.len(),
     );
     let result: Result<Vec<ProbedSchedulerManifest>, String> = (|| {
-        let mut manifests = Vec::new();
-        for bin in bins {
-            let Some(manifest) =
-                ktstr::test_support::read_scheduler_manifest_and_validate_admission_stamp(&bin)?
-            else {
-                progress.item_finished(true);
-                continue;
-            };
-            let executable = if let Some(provenance) = provenance {
-                provenance.get(&bin).cloned().ok_or_else(|| {
-                    format!(
-                        "scheduler-manifest probe path {} has no warmed Cargo \
-                         executable provenance",
-                        bin.display(),
-                    )
-                })?
-            } else {
-                bin.clone()
-            };
-            manifests.push(ProbedSchedulerManifest {
-                executable,
-                manifest,
-            });
-            progress.item_finished(true);
-        }
+        let reads = read_scheduler_stamps_parallel_with(
+            &bins,
+            scheduler_stamp_read_parallelism(bins.len()),
+            |bin| {
+                let Some(manifest) =
+                    ktstr::test_support::read_scheduler_manifest_and_validate_admission_stamp(bin)?
+                else {
+                    return Ok(None);
+                };
+                let executable = if let Some(provenance) = provenance {
+                    provenance.get(bin).cloned().ok_or_else(|| {
+                        format!(
+                            "scheduler-manifest probe path {} has no warmed Cargo \
+                             executable provenance",
+                            bin.display(),
+                        )
+                    })?
+                } else {
+                    bin.to_path_buf()
+                };
+                Ok(Some(ProbedSchedulerManifest {
+                    executable,
+                    manifest,
+                }))
+            },
+            |success| progress.item_finished(success),
+        )?;
+        let mut manifests = reads.into_iter().flatten().collect::<Vec<_>>();
         manifests.sort_by(|left, right| left.executable.cmp(&right.executable));
         let mut seen = HashSet::new();
         manifests.retain(|binary| seen.insert(binary.executable.clone()));
@@ -657,6 +730,87 @@ mod tests {
             stdout: stdout.to_vec(),
             stderr: stderr.to_vec(),
         }
+    }
+
+    fn fake_bin_index(binary: &Path) -> usize {
+        binary
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("bin"))
+            .and_then(|index| index.parse().ok())
+            .expect("fake binary carries its numeric index")
+    }
+
+    #[test]
+    fn parallel_stamp_reads_are_bounded_and_preserve_input_order() {
+        let bins = (0..8).map(fake_bin).collect::<Vec<_>>();
+        let gate = std::sync::Barrier::new(3);
+        let active = AtomicUsize::new(0);
+        let maximum = AtomicUsize::new(0);
+        let mut completed = Vec::new();
+        let results = read_scheduler_stamps_parallel_with(
+            &bins,
+            3,
+            |binary| {
+                let index = fake_bin_index(binary);
+                let current_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(current_active, Ordering::SeqCst);
+                if index < 3 {
+                    gate.wait();
+                }
+                std::thread::yield_now();
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok((index != 5).then_some(index))
+            },
+            |success| completed.push(success),
+        )
+        .expect("parallel reads succeed");
+
+        assert_eq!(maximum.load(Ordering::SeqCst), 3);
+        assert_eq!(completed, vec![true; bins.len()]);
+        assert_eq!(
+            results,
+            vec![
+                Some(0),
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+                None,
+                Some(6),
+                Some(7),
+            ],
+            "worker completion order must not reorder the semantic results",
+        );
+    }
+
+    #[test]
+    fn parallel_stamp_reads_report_the_first_input_error_after_all_workers_finish() {
+        let bins = (0..4).map(fake_bin).collect::<Vec<_>>();
+        let gate = std::sync::Barrier::new(4);
+        let mut completed = Vec::new();
+        let error = read_scheduler_stamps_parallel_with(
+            &bins,
+            4,
+            |binary| {
+                let index = fake_bin_index(binary);
+                gate.wait();
+                match index {
+                    1 => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        Err("earlier input failed later".to_string())
+                    }
+                    2 => Err("later input failed first".to_string()),
+                    _ => Ok(Some(index)),
+                }
+            },
+            |success| completed.push(success),
+        )
+        .expect_err("two reads fail");
+
+        assert_eq!(error, "earlier input failed later");
+        assert_eq!(completed.len(), bins.len());
+        assert_eq!(completed.iter().filter(|success| !**success).count(), 2);
     }
 
     #[test]

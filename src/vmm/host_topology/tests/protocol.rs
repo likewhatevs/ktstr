@@ -9,6 +9,26 @@ use super::*;
 
 static INTERRUPTIBLE_FLOCK_BROKER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[test]
+fn pending_activation_republishes_an_overlapping_watch_observation() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (watched, candidate, pending) =
+        protocol::exercise_pending_activation_overlap_watch_for_tests()
+            .expect("exercise overlapping PENDING watch replacement");
+    assert!(
+        watched,
+        "the exact record must retain the overlapping watch"
+    );
+    assert!(
+        candidate,
+        "the overlapping shared mode must remain observable"
+    );
+    assert!(
+        pending,
+        "dropping the old sole watch must request a fresh observation before scheduling",
+    );
+}
+
 struct InterruptibleFlockBrokerGuard {
     _serial: std::sync::MutexGuard<'static, ()>,
 }
@@ -608,8 +628,8 @@ fn uncontended_fast_fence_does_not_create_registry_metadata() {
     let protocol_dir = std::path::Path::new(&cpu_path)
         .parent()
         .expect("resource lock parent");
-    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v10");
-    let event_dir = protocol_dir.join("ktstr-acquire-events-v10");
+    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v14");
+    let event_dir = protocol_dir.join("ktstr-acquire-events-v14");
     assert!(!registry_dir.exists());
     assert!(!event_dir.exists());
 
@@ -1332,6 +1352,67 @@ fn registry_cpu_aggregate_uses_the_shared_exclusive_compatibility_matrix() {
 }
 
 #[test]
+fn live_build_and_default_borrower_may_share_but_perf_ex_remains_a_hard_fence() {
+    let _prefixes = LockPrefixesGuard::new();
+    let build = protocol::ClaimSet::with_permits(
+        std::iter::empty(),
+        [41usize],
+        [8usize],
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Exclusive,
+    )
+    .with_admission_class(protocol::AdmissionClass::Build);
+    let coordinator =
+        match protocol::register_ticket_or_acquire(build.clone(), build.clone(), None, |_| {
+            Ok::<Option<()>, anyhow::Error>(None)
+        })
+        .expect("register live build")
+        {
+            protocol::TicketWork::Coordinator(coordinator) => coordinator,
+            protocol::TicketWork::Acquired(_) => panic!("fresh registry must elect a coordinator"),
+        };
+
+    let default = protocol::ClaimSet::with_permits(
+        std::iter::empty(),
+        [41usize],
+        [7usize],
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Exclusive,
+    )
+    .with_admission_class(protocol::AdmissionClass::DefaultBorrow);
+    assert!(
+        !protocol::registered_claim_conflicts(&default)
+            .expect("query compatible default-borrow claim"),
+        "build demand is a placement preference, not a hard fence for default CPU-SH work",
+    );
+    let default_held = protocol::publish_acquired(&default, Vec::<std::os::fd::OwnedFd>::new())
+        .expect("publish compatible default borrower");
+    let snapshot =
+        protocol::registered_claim_snapshot(&build).expect("read aggregate with live build claim");
+    assert!(
+        snapshot
+            .cpu_build_claimed(41)
+            .expect("query build CPU count"),
+        "preparation placement must observe CPUs used by live build claims",
+    );
+
+    let performance = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [41usize],
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Exclusive,
+    );
+    assert!(
+        protocol::registered_claim_conflicts(&performance).expect("query performance CPU-EX claim"),
+        "performance CPU-EX must remain incompatible with cooperative/build CPU-SH",
+    );
+    drop(default_held);
+    drop(coordinator);
+}
+
+#[test]
 fn fixed_registry_handles_five_hundred_waiters_without_per_waiter_watchers() {
     let _prefixes = LockPrefixesGuard::new();
     assert_eq!(
@@ -1820,8 +1901,14 @@ fn default_exact_is_best_effort_and_shared_fallbacks_overlap() {
         LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
         CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
         ALLOWED_CPUS_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(vec![0, 1]));
-        let result =
-            crate::vmm::KtstrVm::acquire_default_run_locks(Some(&first_host), &topo, false);
+        let result = crate::vmm::KtstrVm::acquire_default_preferred_run_locks(
+            Some(&first_host),
+            &topo,
+            false,
+            None,
+            None,
+            256,
+        );
         let _ = first_tx.send(result);
     });
     let first = recv_from_service_thread(
@@ -1840,8 +1927,15 @@ fn default_exact_is_best_effort_and_shared_fallbacks_overlap() {
     assert_eq!(first_mask, vec![0, 1]);
     assert!(first.pinning_plan.is_none());
 
-    let second = crate::vmm::KtstrVm::acquire_default_run_locks(Some(&host), &topo, false)
-        .expect("a second default fallback may overlap the first");
+    let second = crate::vmm::KtstrVm::acquire_default_preferred_run_locks(
+        Some(&host),
+        &topo,
+        false,
+        None,
+        None,
+        256,
+    )
+    .expect("a second default fallback may overlap the first");
     let mut second_mask = second
         .shared_cpu_mask
         .clone()
@@ -1854,23 +1948,44 @@ fn default_exact_is_best_effort_and_shared_fallbacks_overlap() {
     drop(first);
     drop(peer1);
     drop(peer0);
-    let exact = crate::vmm::KtstrVm::acquire_default_run_locks(Some(&host), &topo, false)
-        .expect("free default placement");
+    let exact = crate::vmm::KtstrVm::acquire_default_preferred_run_locks(
+        Some(&host),
+        &topo,
+        false,
+        None,
+        None,
+        256,
+    )
+    .expect("free default placement");
     assert!(exact.shared_cpu_mask.is_none());
     assert!(
         exact.pinning_plan.is_some(),
         "free admission prefers exact 1:1"
     );
 
-    let exact_peer = crate::vmm::KtstrVm::acquire_default_run_locks(Some(&host), &topo, false)
-        .expect("disjoint exact capacity remains preferable");
+    let exact_peer = crate::vmm::KtstrVm::acquire_default_preferred_run_locks(
+        Some(&host),
+        &topo,
+        false,
+        None,
+        None,
+        256,
+    )
+    .expect("disjoint exact capacity remains preferable");
     assert!(
         exact_peer.pinning_plan.is_some(),
         "a second default should use the remaining unshared exact CPU",
     );
 
-    let overlapping = crate::vmm::KtstrVm::acquire_default_run_locks(Some(&host), &topo, false)
-        .expect("exact defaults retain SH and permit a shared default peer");
+    let overlapping = crate::vmm::KtstrVm::acquire_default_preferred_run_locks(
+        Some(&host),
+        &topo,
+        false,
+        None,
+        None,
+        256,
+    )
+    .expect("exact defaults retain SH and permit a shared default peer");
     assert!(
         overlapping.pinning_plan.is_none(),
         "once exact capacity is occupied, default must fall back without waiting",
@@ -1908,124 +2023,6 @@ fn default_exact_is_best_effort_and_shared_fallbacks_overlap() {
     ));
 }
 
-/// Linux flock conversion is not atomic, so the default EX probe converts and
-/// publishes its lifetime SH claim under registry EX. A concurrent performance
-/// probe cannot enter that window: it blocks on the normal registry SH fence,
-/// then observes the published SH holder and remains excluded.
-#[test]
-fn default_conversion_fence_never_coexists_with_performance_ex() {
-    use std::sync::mpsc;
-
-    let _prefixes = LockPrefixesGuard::new();
-    let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
-    let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
-    let probe =
-        protocol::ClaimSet::with_modes([0usize], [0usize], FlockMode::Shared, FlockMode::Exclusive);
-    let published =
-        protocol::ClaimSet::with_modes([0usize], [0usize], FlockMode::Shared, FlockMode::Shared);
-    let (paused_tx, paused_rx) = mpsc::sync_channel(0);
-    let (resume_tx, resume_rx) = mpsc::sync_channel(0);
-    let (default_ready_tx, default_ready_rx) = mpsc::sync_channel(0);
-    let (release_default_tx, release_default_rx) = mpsc::sync_channel(0);
-    let default_llc_prefix = llc_prefix.clone();
-    let default_cpu_prefix = cpu_prefix.clone();
-    let default = TestServiceThread::spawn(move || {
-        LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = default_llc_prefix);
-        CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = default_cpu_prefix);
-        let target = protocol::canonical_lock_order_with_modes(
-            &[0],
-            FlockMode::Shared,
-            &[0],
-            FlockMode::Exclusive,
-        );
-        let acquired = protocol::with_exclusive_conversion_fence(&probe, &published, None, || {
-            let locks = target
-                .iter()
-                .map(|resource| {
-                    crate::flock::try_flock(&resource.path, resource.mode)
-                        .expect("physical conversion probe")
-                        .expect("fresh physical conversion footprint")
-                })
-                .collect::<Vec<_>>();
-            paused_tx.send(()).expect("publish paused conversion");
-            resume_rx.recv().expect("resume conversion");
-            for (resource, fd) in target.iter().zip(&locks) {
-                if matches!(resource.resource, protocol::ResourceKey::Cpu(_)) {
-                    assert!(
-                        crate::flock::try_convert_flock(fd, FlockMode::Shared)
-                            .expect("convert CPU EX to SH"),
-                        "registry EX must preserve an uncontended conversion",
-                    );
-                }
-            }
-            Ok(Some(locks))
-        })
-        .expect("conversion fence");
-        let protocol::ConversionFence::Acquired(acquired) = acquired else {
-            panic!("fresh conversion must acquire");
-        };
-        default_ready_tx
-            .send(())
-            .expect("publish retained default SH");
-        release_default_rx.recv().expect("release retained default");
-        drop(acquired);
-    });
-
-    recv_from_service_thread(&paused_rx, "default conversion pause", &default)
-        .expect("default conversion must reach the deterministic pause");
-    assert!(
-        protocol::registry_shared_probe_is_blocked_for_tests()
-            .expect("probe conversion registry fence"),
-        "the conversion callback must retain registry EX",
-    );
-
-    let (perf_started_tx, perf_started_rx) = mpsc::sync_channel(0);
-    let (perf_result_tx, perf_result_rx) = mpsc::sync_channel(0);
-    let perf = TestServiceThread::spawn(move || {
-        LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
-        CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
-        perf_started_tx.send(()).expect("publish perf start");
-        let contended = matches!(
-            try_acquire_resources(&[0], LlcLockMode::Shared, &[0], FlockMode::Exclusive,)
-                .expect("performance probe"),
-            TryAcquireAll::Contended { .. },
-        );
-        perf_result_tx.send(contended).expect("publish perf result");
-    });
-    recv_from_service_thread(
-        &perf_started_rx,
-        "performance conversion-fence probe start",
-        &perf,
-    )
-    .expect("performance probe must start");
-    assert!(
-        perf_result_rx.try_recv().is_err(),
-        "performance must not cross the paused conversion fence",
-    );
-
-    resume_tx.send(()).expect("resume default conversion");
-    recv_from_service_thread(
-        &default_ready_rx,
-        "default retained-SH publication",
-        &default,
-    )
-    .expect("default must publish retained SH");
-    assert!(
-        recv_from_service_thread(
-            &perf_result_rx,
-            "performance conversion-fence result",
-            &perf,
-        )
-        .expect("performance probe must finish after conversion"),
-        "performance EX must observe and reject the retained default SH claim",
-    );
-    release_default_tx
-        .send(())
-        .expect("release retained default SH");
-    perf.join().expect("performance probe thread");
-    default.join().expect("default conversion thread");
-}
-
 #[test]
 fn default_shared_fallback_uses_disjoint_capacity_but_never_perf_ex() {
     let _prefixes = LockPrefixesGuard::new();
@@ -2047,8 +2044,15 @@ fn default_shared_fallback_uses_disjoint_capacity_but_never_perf_ex() {
         })
         .collect::<Vec<_>>();
 
-    let admitted = crate::vmm::KtstrVm::acquire_default_run_locks(Some(&host), &topo, false)
-        .expect("disjoint shared capacity must remain usable");
+    let admitted = crate::vmm::KtstrVm::acquire_default_preferred_run_locks(
+        Some(&host),
+        &topo,
+        false,
+        None,
+        None,
+        256,
+    )
+    .expect("disjoint shared capacity must remain usable");
     let mask = admitted
         .shared_cpu_mask
         .as_deref()
@@ -2077,7 +2081,14 @@ fn default_hard_perf_contention_is_no_wait_and_cancellable() {
         TryAcquireAll::Contended { reason, .. } => panic!("fresh perf EX contended: {reason}"),
     };
 
-    let error = match crate::vmm::KtstrVm::acquire_default_run_locks(Some(&host), &topo, false) {
+    let error = match crate::vmm::KtstrVm::acquire_default_preferred_run_locks(
+        Some(&host),
+        &topo,
+        false,
+        None,
+        None,
+        256,
+    ) {
         Ok(_) => panic!("interactive/no-wait default must surface hard perf contention"),
         Err(error) => error,
     };
@@ -2092,11 +2103,13 @@ fn default_hard_perf_contention_is_no_wait_and_cancellable() {
         LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
         CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
         ALLOWED_CPUS_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(vec![0, 1]));
-        let result = crate::vmm::KtstrVm::acquire_default_run_locks_interruptible(
+        let result = crate::vmm::KtstrVm::acquire_default_preferred_run_locks(
             Some(&host),
             &topo,
             true,
-            &worker_cancelled,
+            Some(&worker_cancelled),
+            None,
+            256,
         );
         ALLOWED_CPUS_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
         let _ = result_tx.send(result);
@@ -2572,6 +2585,72 @@ fn exact_acquired_commits_do_not_force_full_grant_scans() {
         scans, 0,
         "publishing an unchanged exact claim busy leaves every later grant valid; overlap waits \
          for the real release instead of scanning the whole registry at commit",
+    );
+}
+
+#[test]
+fn backfill_is_weighted_by_cooperative_capacity_instead_of_callback_count() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (wave_credit, light_cost, heavy_cost, non_cooperative_cost) =
+        protocol::exercise_resource_weighted_backfill_accounting_for_tests();
+    assert!(
+        wave_credit >= 4,
+        "one backfill wave must expose at least the four cooperative lanes of one possible CPU",
+    );
+    assert_eq!(
+        light_cost, 1,
+        "one cooperative CPU permit costs one wave unit"
+    );
+    assert_eq!(
+        heavy_cost, 4,
+        "one callback consuming four CPU permits must cost four units, not one callback",
+    );
+    assert_eq!(
+        non_cooperative_cost, 2,
+        "claims outside the cooperative permit namespace fall back to physical width",
+    );
+}
+
+#[test]
+fn unavailable_wide_head_backfills_one_resource_wave_then_drains_without_convoy() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (
+        conflicting_grants,
+        conflicting_waiters,
+        disjoint_grants,
+        admitted_survives_drain,
+        wide_wins,
+        racer_revoked_without_placement_damage,
+        stale_callback_suppressed,
+    ) = protocol::exercise_work_conserving_backfill_for_tests()
+        .expect("exercise work-conserving bounded backfill");
+    assert_eq!(
+        conflicting_grants, 3,
+        "the blocked wide head must admit exactly its configured conflicting resource wave",
+    );
+    assert_eq!(
+        conflicting_waiters, 2,
+        "new conflicting work must wait once the head's full-wave credit is spent",
+    );
+    assert_eq!(
+        disjoint_grants, 8,
+        "disjoint suffix work must remain unbounded by the fairness credit",
+    );
+    assert!(
+        admitted_survives_drain,
+        "already admitted backfill must finish while the zero-credit head blocks only new conflicts",
+    );
+    assert!(
+        wide_wins,
+        "once the admitted burst releases, the now-viable wide head must receive the next exact grant",
+    );
+    assert!(
+        racer_revoked_without_placement_damage,
+        "the viability scan must revoke a stale conflicting callback while preserving disjoint grants",
+    );
+    assert!(
+        stale_callback_suppressed,
+        "a callback revoked by the wide-head scan must not execute planner or acquisition code",
     );
 }
 
@@ -3082,6 +3161,267 @@ const TICKET_HELPER_AFTER_ACQUIRE_ENTERED: &str = "KTSTR_TEST_TICKET_AFTER_ACQUI
 const TICKET_HELPER_BEFORE_COORDINATOR_GATE: &str = "KTSTR_TEST_TICKET_BEFORE_COORDINATOR_GATE";
 const TICKET_HELPER_COORDINATOR_ENTERED: &str = "KTSTR_TEST_TICKET_COORDINATOR_ENTERED";
 const TICKET_HELPER_COORDINATOR_WAITING: &str = "KTSTR_TEST_TICKET_COORDINATOR_WAITING";
+
+const PENDING_V3_LLC_PREFIX: &str = "KTSTR_TEST_PENDING_V3_LLC_PREFIX";
+const PENDING_V3_CPU_PREFIX: &str = "KTSTR_TEST_PENDING_V3_CPU_PREFIX";
+const PENDING_V3_MARKER: &str = "KTSTR_TEST_PENDING_V3_MARKER";
+
+fn install_pending_v3_prefixes() -> bool {
+    let Some(llc) = std::env::var_os(PENDING_V3_LLC_PREFIX) else {
+        return false;
+    };
+    let cpu = std::env::var(PENDING_V3_CPU_PREFIX).expect("pending v3 CPU prefix");
+    LLC_LOCK_PREFIX_OVERRIDE
+        .with(|slot| *slot.borrow_mut() = Some(llc.to_string_lossy().into_owned()));
+    CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(cpu));
+    true
+}
+
+#[test]
+#[ignore]
+fn pending_exec_v3_export_process_helper() {
+    if !install_pending_v3_prefixes() {
+        return;
+    }
+    let pending = protocol::register_pending_admission(
+        admission_resource_capacity_hint().expect("pending v3 resource capacity"),
+    )
+    .expect("register pending v3 admission");
+    let (affinity_cpu, _, original_affinity) = pending
+        .preparation_affinity_handoff_parts()
+        .expect("read pending v3 affinity");
+    let metadata = format!(
+        "{affinity_cpu}|{}",
+        original_affinity
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    let handoff = protocol::prepare_pending_exec_handoff(&pending, metadata.as_bytes())
+        .expect("prepare pending v3 exec handoff");
+    let seals = unsafe { libc::fcntl(handoff.descriptor_fd_for_tests(), libc::F_GET_SEALS) };
+    assert_eq!(
+        seals & (libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE),
+        libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE,
+    );
+
+    let mut command =
+        std::process::Command::new(std::env::current_exe().expect("current test executable"));
+    command.args([
+        "--ignored",
+        "--exact",
+        "vmm::host_topology::tests::protocol::pending_exec_v3_import_process_helper",
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    handoff.configure_exec(&mut command);
+    use std::os::unix::process::CommandExt;
+    let error = command.exec();
+    panic!("pending v3 exec consumer failed: {error}");
+}
+
+#[test]
+#[ignore]
+fn pending_exec_v3_import_process_helper() {
+    if !install_pending_v3_prefixes() {
+        return;
+    }
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let reader_barrier = barrier.clone();
+    let reader = std::thread::spawn(move || {
+        reader_barrier.wait();
+        for _ in 0..1_000 {
+            assert!(std::env::var_os(protocol::EXEC_HANDOFF_ENV).is_some());
+        }
+    });
+    barrier.wait();
+    let imported = protocol::take_pending_exec_handoff()
+        .expect("validate pending v3 handoff while another thread reads the environment")
+        .expect("wrapper supplied pending v3 handoff");
+    reader.join().expect("environment reader thread");
+    assert!(
+        protocol::take_pending_exec_handoff()
+            .expect("second pending v3 read")
+            .is_none(),
+        "one inherited descriptor must be consumed exactly once",
+    );
+
+    let metadata = String::from_utf8(imported.metadata).expect("pending v3 metadata is UTF-8");
+    let (affinity_cpu, original) = metadata.split_once('|').expect("pending v3 metadata shape");
+    let affinity_cpu: usize = affinity_cpu.parse().expect("pending v3 affinity CPU");
+    let original = original
+        .split(',')
+        .map(|cpu| cpu.parse().expect("pending v3 original affinity CPU"))
+        .collect::<Vec<usize>>();
+    assert_eq!(host_allowed_cpus(), vec![affinity_cpu]);
+
+    let mut pending = imported.pending;
+    let (_, preparation_fds) = pending
+        .preparation_handoff_parts()
+        .expect("imported preparation descriptors");
+    let permits = preparation_fds
+        .iter()
+        .map(|(permit, _)| *permit)
+        .collect::<Vec<_>>();
+    assert!(
+        permits.len() > 1,
+        "CPU, memory, and token permits must cross exec"
+    );
+    let snapshot = protocol::ticket_registry_snapshot_for_tests()
+        .expect("read imported PENDING registry record");
+    let imported_claim = snapshot
+        .iter()
+        .map(|(_, _, claim)| claim)
+        .find(|claim| claim.cpus.contains(&affinity_cpu) && claim.permits.len() == permits.len())
+        .expect("imported PENDING claim remains published");
+    assert_eq!(
+        imported_claim.permits.iter().copied().collect::<Vec<_>>(),
+        permits,
+    );
+    assert!(
+        crate::flock::try_flock(
+            cpu_lock_path(affinity_cpu),
+            crate::flock::FlockMode::Exclusive
+        )
+        .expect("probe inherited affinity flock")
+        .is_none(),
+    );
+    for permit in &permits {
+        assert!(
+            crate::flock::try_flock(
+                permit_lock_path(*permit),
+                crate::flock::FlockMode::Exclusive
+            )
+            .expect("probe inherited preparation permit")
+            .is_none(),
+            "preparation permit {permit} did not survive exec",
+        );
+    }
+
+    pending
+        .restore_preparation_affinity()
+        .expect("restore pre-exec affinity after import");
+    assert_eq!(host_allowed_cpus(), original);
+    let exact = resource_claim_with_modes(
+        &[],
+        LlcLockMode::Shared,
+        &[affinity_cpu],
+        crate::flock::FlockMode::Shared,
+    );
+    let target = protocol::canonical_lock_order_with_modes(
+        &[],
+        crate::flock::FlockMode::Shared,
+        &[affinity_cpu],
+        crate::flock::FlockMode::Shared,
+    );
+    let work =
+        protocol::activate_pending_ticket(pending, exact.clone(), exact.clone(), None, |probe| {
+            let designated = probe.designated().clone();
+            let reusable = probe.clone_reusable_permits()?;
+            probe.try_acquire(&designated, || {
+                acquire_resources_with_permits_granted_reusing(
+                    &[],
+                    LlcLockMode::Shared,
+                    &[affinity_cpu],
+                    crate::flock::FlockMode::Shared,
+                    &[],
+                    &reusable,
+                )
+            })
+        })
+        .expect("activate imported PENDING admission");
+    let acquired = match work {
+        protocol::TicketWork::Acquired(acquired) => acquired,
+        protocol::TicketWork::Coordinator(coordinator) => {
+            match protocol::acquire_as_coordinator(coordinator, |held| {
+                if let Some(locks) = held.probe_complete_if_ready(&exact, &target)? {
+                    Ok(protocol::CoordinatorStep::Complete {
+                        claim: exact.clone(),
+                        value: locks,
+                    })
+                } else {
+                    Ok(protocol::CoordinatorStep::Waiting {
+                        claim: exact.clone(),
+                    })
+                }
+            })
+            .expect("coordinate imported exact activation")
+            {
+                protocol::CoordinatorOutcome::Acquired(acquired) => acquired,
+                protocol::CoordinatorOutcome::Aborted { reason } => {
+                    panic!("imported exact activation aborted: {reason}")
+                }
+            }
+        }
+    };
+    assert_eq!(
+        protocol::registered_claim_snapshot(&exact)
+            .expect("read activated exact claim")
+            .cpu_holder_count(affinity_cpu)
+            .expect("activated CPU holder count"),
+        1,
+    );
+    drop(acquired);
+    drop(
+        crate::flock::try_flock(
+            cpu_lock_path(affinity_cpu),
+            crate::flock::FlockMode::Exclusive,
+        )
+        .expect("probe released exact CPU")
+        .expect("exact CPU flock must release with the imported owner"),
+    );
+    assert_eq!(
+        protocol::registered_claim_snapshot(&exact)
+            .expect("read released exact claim")
+            .cpu_holder_count(affinity_cpu)
+            .expect("released CPU holder count"),
+        0,
+    );
+    std::fs::write(
+        std::env::var_os(PENDING_V3_MARKER).expect("pending v3 completion marker"),
+        b"ok",
+    )
+    .expect("publish pending v3 completion");
+}
+
+#[test]
+fn pending_exec_v3_preserves_preparation_and_exact_lifecycle_across_real_exec() {
+    let _prefixes = LockPrefixesGuard::new_real_wake();
+    let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE
+        .with(|slot| slot.borrow().clone())
+        .expect("parent LLC prefix");
+    let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE
+        .with(|slot| slot.borrow().clone())
+        .expect("parent CPU prefix");
+    let temp = tempfile::tempdir().expect("pending v3 test directory");
+    let marker = temp.path().join("complete");
+    let output =
+        std::process::Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--ignored",
+                "--exact",
+                "vmm::host_topology::tests::protocol::pending_exec_v3_export_process_helper",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PENDING_V3_LLC_PREFIX, llc_prefix)
+            .env(PENDING_V3_CPU_PREFIX, cpu_prefix)
+            .env(PENDING_V3_MARKER, &marker)
+            .output()
+            .expect("run pending v3 exec process");
+    assert!(
+        output.status.success(),
+        "pending-v3 process failed: status={} stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        std::fs::read(marker).expect("read pending v3 marker"),
+        b"ok"
+    );
+}
 
 thread_local! {
     static TICKET_HELPER_LOGS:
@@ -4465,7 +4805,7 @@ fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
     let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .expect("re-block waiter after epoch transition");
-    // Leave the replacement as an external, unregistered flock. A current-v10
+    // Leave the replacement as an external, unregistered flock. A current-v14
     // HELD publication would authoritatively revoke the in-flight grant before
     // its callback returned, bypassing the stale-negative-evidence path this
     // test is meant to pin.
@@ -4713,7 +5053,7 @@ fn remove_crash_after_counts_before_free_is_repaired() {
     let markers = tempfile::TempDir::new().expect("marker dir");
     let removing =
         TicketChild::spawn_crashing(markers.path(), "removing", "1", "remove_counts_before_free");
-    // The v10 HELD lifecycle removes its registry record only after the
+    // The v14 HELD lifecycle removes its registry record only after the
     // physical reservation is released. Let the helper pass its normal
     // release barrier so the injected crash observes that production ordering.
     std::fs::write(&removing.release, b"release").expect("release crash-test reservation");

@@ -1,6 +1,6 @@
 //! Cross-process host-resource admission under nextest.
 //!
-//! Every ktstr process sharing a lock directory participates in one v10
+//! Every ktstr process sharing a lock directory participates in one v14
 //! fixed-record mmap registry. A ticket publishes one exact, non-empty CPU/LLC
 //! reservation claim plus the resources its planner may watch. Claims preserve
 //! the resource-lock semantics exactly: CPU and LLC claims independently use
@@ -39,13 +39,28 @@ use std::time::Duration;
 
 use crate::flock::{FlockMode, TryFlockOutcome, try_flock_with_witness};
 
+mod exec_handoff;
 mod registry;
+
+#[cfg(test)]
+pub(crate) use exec_handoff::EXEC_HANDOFF_ENV;
+pub(crate) use exec_handoff::{prepare_pending_exec_handoff, take_pending_exec_handoff};
 
 /// Stable identity of one host reservation lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ResourceKey {
     Llc(usize),
     Cpu(usize),
+    Permit(usize),
+}
+
+/// Registry-visible intent attached to a complete resource claim.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum AdmissionClass {
+    #[default]
+    Ordinary,
+    DefaultBorrow,
+    Build,
 }
 
 /// One canonical host-resource lock together with the exact registry identity
@@ -206,7 +221,7 @@ const TEST_RETRY_WAKE_MARKER: &str = ".ktstr-test-retry-wake";
 
 /// Directory the protocol files live in — derived from the LLC
 /// lockfile path so the test-only lock-prefix override isolates the
-/// v10 registry files into the same per-test tempdir as the LLC locks
+/// current registry files into the same per-test tempdir as the LLC locks
 /// they coordinate.
 fn protocol_dir() -> PathBuf {
     Path::new(&super::llc_lock_path(0))
@@ -241,19 +256,25 @@ impl From<FlockMode> for ClaimMode {
 pub(crate) struct ClaimSet {
     pub llcs: BTreeSet<usize>,
     pub cpus: BTreeSet<usize>,
+    pub permits: BTreeSet<usize>,
     pub llc_mode: ClaimMode,
     pub cpu_mode: ClaimMode,
+    pub permit_mode: ClaimMode,
+    pub admission_class: AdmissionClass,
 }
 
 impl ClaimSet {
-    fn from_claim_modes(
+    fn from_all_claim_modes(
         llcs: impl IntoIterator<Item = usize>,
         cpus: impl IntoIterator<Item = usize>,
+        permits: impl IntoIterator<Item = usize>,
         llc_mode: ClaimMode,
         cpu_mode: ClaimMode,
+        permit_mode: ClaimMode,
     ) -> Self {
         let llcs = llcs.into_iter().collect::<BTreeSet<_>>();
         let cpus = cpus.into_iter().collect::<BTreeSet<_>>();
+        let permits = permits.into_iter().collect::<BTreeSet<_>>();
         Self {
             llc_mode: if llcs.is_empty() {
                 ClaimMode::Exclusive
@@ -265,18 +286,27 @@ impl ClaimSet {
             } else {
                 cpu_mode
             },
+            permit_mode: if permits.is_empty() {
+                ClaimMode::Exclusive
+            } else {
+                permit_mode
+            },
             llcs,
             cpus,
+            permits,
+            admission_class: AdmissionClass::Ordinary,
         }
     }
 
-    pub(super) fn with_claim_modes(
+    pub(super) fn with_all_claim_modes(
         llcs: impl IntoIterator<Item = usize>,
         cpus: impl IntoIterator<Item = usize>,
+        permits: impl IntoIterator<Item = usize>,
         llc_mode: ClaimMode,
         cpu_mode: ClaimMode,
+        permit_mode: ClaimMode,
     ) -> Self {
-        Self::from_claim_modes(llcs, cpus, llc_mode, cpu_mode)
+        Self::from_all_claim_modes(llcs, cpus, permits, llc_mode, cpu_mode, permit_mode)
     }
 
     pub(crate) fn new(
@@ -284,7 +314,14 @@ impl ClaimSet {
         cpus: impl IntoIterator<Item = usize>,
         llc_mode: FlockMode,
     ) -> Self {
-        Self::from_claim_modes(llcs, cpus, llc_mode.into(), ClaimMode::Exclusive)
+        Self::from_all_claim_modes(
+            llcs,
+            cpus,
+            std::iter::empty(),
+            llc_mode.into(),
+            ClaimMode::Exclusive,
+            ClaimMode::Exclusive,
+        )
     }
 
     pub(crate) fn with_modes(
@@ -293,11 +330,41 @@ impl ClaimSet {
         llc_mode: FlockMode,
         cpu_mode: FlockMode,
     ) -> Self {
-        Self::from_claim_modes(llcs, cpus, llc_mode.into(), cpu_mode.into())
+        Self::from_all_claim_modes(
+            llcs,
+            cpus,
+            std::iter::empty(),
+            llc_mode.into(),
+            cpu_mode.into(),
+            ClaimMode::Exclusive,
+        )
+    }
+
+    pub(crate) fn with_permits(
+        llcs: impl IntoIterator<Item = usize>,
+        cpus: impl IntoIterator<Item = usize>,
+        permits: impl IntoIterator<Item = usize>,
+        llc_mode: FlockMode,
+        cpu_mode: FlockMode,
+        permit_mode: FlockMode,
+    ) -> Self {
+        Self::from_all_claim_modes(
+            llcs,
+            cpus,
+            permits,
+            llc_mode.into(),
+            cpu_mode.into(),
+            permit_mode.into(),
+        )
+    }
+
+    pub(crate) fn with_admission_class(mut self, admission_class: AdmissionClass) -> Self {
+        self.admission_class = admission_class;
+        self
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.llcs.is_empty() && self.cpus.is_empty()
+        self.llcs.is_empty() && self.cpus.is_empty() && self.permits.is_empty()
     }
 
     /// Union two alternative footprints while preserving the strongest mode
@@ -313,9 +380,10 @@ impl ClaimSet {
             }
             (false, false) => ClaimMode::Shared,
         };
-        Self::from_claim_modes(
+        Self::from_all_claim_modes(
             self.llcs.union(&other.llcs).copied(),
             self.cpus.union(&other.cpus).copied(),
+            self.permits.union(&other.permits).copied(),
             strongest(
                 self.llcs.is_empty(),
                 self.llc_mode,
@@ -328,7 +396,14 @@ impl ClaimSet {
                 other.cpus.is_empty(),
                 other.cpu_mode,
             ),
+            strongest(
+                self.permits.is_empty(),
+                self.permit_mode,
+                other.permits.is_empty(),
+                other.permit_mode,
+            ),
         )
+        .with_admission_class(self.admission_class.max(other.admission_class))
     }
 
     /// Whether `request_mode` on `llc_idx` is incompatible with this live
@@ -350,6 +425,17 @@ impl ClaimSet {
         if self.cpus.iter().any(|cpu| other.cpus.contains(cpu))
             && matches!(
                 (self.cpu_mode, other.cpu_mode),
+                (ClaimMode::Exclusive, _) | (_, ClaimMode::Exclusive)
+            )
+        {
+            return true;
+        }
+        if self
+            .permits
+            .iter()
+            .any(|permit| other.permits.contains(permit))
+            && matches!(
+                (self.permit_mode, other.permit_mode),
                 (ClaimMode::Exclusive, _) | (_, ClaimMode::Exclusive)
             )
         {
@@ -390,6 +476,10 @@ impl RegisteredClaimSnapshot {
         self.inner.cpu_exclusive_held(cpu)
     }
 
+    pub(crate) fn cpu_build_claimed(&self, cpu: usize) -> Result<bool> {
+        self.inner.cpu_build_claimed(cpu)
+    }
+
     pub(crate) fn llc_holder_count(&self, llc: usize) -> Result<usize> {
         self.inner.llc_holder_count(llc)
     }
@@ -414,11 +504,6 @@ pub(crate) fn aggregate_snapshot_read_count_for_tests() -> usize {
 }
 
 #[cfg(test)]
-pub(crate) fn registry_shared_probe_is_blocked_for_tests() -> Result<bool> {
-    registry::shared_probe_is_blocked_for_tests()
-}
-
-#[cfg(test)]
 pub(crate) fn union_claims_for_tests(a: &ClaimSet, b: &ClaimSet) -> ClaimSet {
     registry::union_claims_for_tests(a, b)
 }
@@ -440,12 +525,6 @@ pub(crate) enum RegistryFence<T> {
     },
 }
 
-pub(crate) enum ConversionFence<T> {
-    Fenced,
-    Unavailable,
-    Acquired(Acquired<T>),
-}
-
 /// Run one all-or-nothing nonblocking resource probe while holding the
 /// registry's shared fence. Ticket publication and claim replacement require
 /// EX, so no earlier exact claim can appear between the aggregate check and
@@ -460,28 +539,6 @@ pub(crate) fn with_registry_fence<T>(
             Ok(RegistryFence::Ran { value, watched })
         }
         Err(error) => Err(error),
-    }
-}
-
-/// Serialize a physical lock-mode conversion against every normal fast probe.
-///
-/// `probe` is the strong instantaneous claim used to test isolation;
-/// `published` is the weaker lifetime claim retained after `run` converts the
-/// real flock set. The registry EX fence spans aggregate validation, the
-/// nonblocking callback, and HELD publication, so no current-version SH-fenced
-/// probe can enter a non-atomic `flock` conversion window.
-pub(crate) fn with_exclusive_conversion_fence<T>(
-    probe: &ClaimSet,
-    published: &ClaimSet,
-    cancelled: Option<&AtomicBool>,
-    run: impl FnOnce() -> Result<Option<T>>,
-) -> Result<ConversionFence<T>> {
-    match registry::with_exclusive_conversion_fence(probe, published, cancelled, run)? {
-        registry::ExclusivePublishResult::Fenced => Ok(ConversionFence::Fenced),
-        registry::ExclusivePublishResult::Ran(None) => Ok(ConversionFence::Unavailable),
-        registry::ExclusivePublishResult::Ran(Some((value, held))) => {
-            Ok(ConversionFence::Acquired(Acquired::tracked(value, held)))
-        }
     }
 }
 
@@ -518,12 +575,14 @@ struct RealInotifyWake {
 struct ResourceWatch {
     llc_prefix: Option<std::ffi::OsString>,
     cpu_prefix: Option<std::ffi::OsString>,
+    permit_prefix: Option<std::ffi::OsString>,
 }
 
 #[derive(Default)]
 pub(crate) struct LockDirEvents {
     llc_closes: BTreeSet<usize>,
     cpu_closes: BTreeSet<usize>,
+    permit_closes: BTreeSet<usize>,
     registry_notify: bool,
     liveness_closes: BTreeSet<(u64, u64)>,
     overflow: bool,
@@ -534,6 +593,7 @@ impl LockDirEvents {
     fn merge(&mut self, other: Self) {
         self.llc_closes.extend(other.llc_closes);
         self.cpu_closes.extend(other.cpu_closes);
+        self.permit_closes.extend(other.permit_closes);
         self.registry_notify |= other.registry_notify;
         self.liveness_closes.extend(other.liveness_closes);
         self.overflow |= other.overflow;
@@ -543,6 +603,7 @@ impl LockDirEvents {
     fn is_actionable(&self) -> bool {
         !self.llc_closes.is_empty()
             || !self.cpu_closes.is_empty()
+            || !self.permit_closes.is_empty()
             || self.registry_notify
             || !self.liveness_closes.is_empty()
             || self.overflow
@@ -579,6 +640,7 @@ impl RealInotifyWake {
         use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
         let llc_path = super::llc_lock_path(0);
         let cpu_path = super::cpu_lock_path(0);
+        let permit_path = super::permit_lock_path(0);
         let event_dir = registry::event_dir();
         let llc_dir = Path::new(&llc_path)
             .parent()
@@ -588,7 +650,13 @@ impl RealInotifyWake {
             .parent()
             .ok_or_else(|| anyhow::anyhow!("CPU resource lock path has no parent: {cpu_path}"))?
             .to_path_buf();
-        if event_dir == llc_dir || event_dir == cpu_dir {
+        let permit_dir = Path::new(&permit_path)
+            .parent()
+            .ok_or_else(|| {
+                anyhow::anyhow!("permit resource lock path has no parent: {permit_path}")
+            })?
+            .to_path_buf();
+        if event_dir == llc_dir || event_dir == cpu_dir || event_dir == permit_dir {
             anyhow::bail!(
                 "admission event directory must be distinct from resource lock directories"
             );
@@ -602,6 +670,8 @@ impl RealInotifyWake {
             Some(resource_basename_prefix(&llc_path)?);
         resources.entry(cpu_dir).or_default().cpu_prefix =
             Some(resource_basename_prefix(&cpu_path)?);
+        resources.entry(permit_dir).or_default().permit_prefix =
+            Some(resource_basename_prefix(&permit_path)?);
         let mut resource_watches = std::collections::BTreeMap::new();
         for (dir, resource) in resources {
             std::fs::create_dir_all(&dir)?;
@@ -731,6 +801,14 @@ impl RealInotifyWake {
                 .filter(|index| watched.cpus.contains(index))
             {
                 batch.cpu_closes.insert(index);
+            }
+            if let Some(index) = resource
+                .permit_prefix
+                .as_deref()
+                .and_then(|prefix| resource_index(name, prefix))
+                .filter(|index| watched.permits.contains(index))
+            {
+                batch.permit_closes.insert(index);
             }
         }
     }
@@ -873,6 +951,7 @@ pub(crate) struct GrantedProbe {
     contention: Option<ContentionEvidence>,
     predecessors: registry::AggregateSnapshot,
     availability: registry::AvailabilitySnapshot,
+    reusable_permits: Vec<(usize, OwnedFd)>,
 }
 
 impl GrantedProbe {
@@ -885,6 +964,13 @@ impl GrantedProbe {
 
     pub(crate) fn designated(&self) -> &ClaimSet {
         &self.designated
+    }
+
+    pub(crate) fn clone_reusable_permits(&self) -> Result<Vec<(usize, OwnedFd)>> {
+        self.reusable_permits
+            .iter()
+            .map(|(permit, fd)| Ok((*permit, fd.try_clone()?)))
+            .collect()
     }
 
     /// Whether `candidate` conflicts with any exact claim preceding this
@@ -917,6 +1003,11 @@ impl GrantedProbe {
                         candidate.llcs.contains(&llc)
                             && (evidence.mode == FlockMode::Shared
                                 || candidate.llc_mode == ClaimMode::Exclusive)
+                    }
+                    ResourceKey::Permit(permit) => {
+                        candidate.permits.contains(&permit)
+                            && (evidence.mode == FlockMode::Shared
+                                || candidate.permit_mode == ClaimMode::Exclusive)
                     }
                 });
         Ok(!just_contended
@@ -953,6 +1044,7 @@ impl GrantedProbe {
 
 pub(crate) struct CoordinatorTicket {
     ticket: registry::Ticket,
+    preparation: Option<super::PreparationPermit>,
 }
 
 #[cfg(test)]
@@ -1064,6 +1156,122 @@ pub(crate) enum TicketWork<T> {
     Coordinator(CoordinatorTicket),
 }
 
+/// Same-PID pre-exec admission identity. Its registry record and physical
+/// flocks describe one bounded CPU+memory preparation footprint; activation
+/// replaces that footprint with the exact run claim in the same ticket.
+pub(crate) struct PendingAdmission {
+    ticket: Option<registry::Ticket>,
+    preparation: Option<super::PreparationPermit>,
+}
+
+impl PendingAdmission {
+    pub(crate) fn exec_handoff_parts(&self) -> Result<(u64, u64, std::os::fd::RawFd)> {
+        self.ticket
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("pending admission was already consumed"))?
+            .pending_exec_handoff_parts()
+    }
+
+    pub(crate) fn preparation_handoff_parts(
+        &self,
+    ) -> Result<(usize, Vec<(usize, std::os::fd::RawFd)>)> {
+        use std::os::fd::AsRawFd;
+        let preparation = self
+            .preparation
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("pending preparation permit was already consumed"))?;
+        Ok((
+            preparation.index,
+            preparation
+                .permit_fds
+                .iter()
+                .map(|(permit, fd)| (*permit, fd.as_raw_fd()))
+                .collect(),
+        ))
+    }
+
+    pub(crate) fn preparation_affinity_handoff_parts(
+        &self,
+    ) -> Result<(usize, std::os::fd::RawFd, &[usize])> {
+        self.preparation
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("pending preparation permit was already consumed"))?
+            .affinity_handoff_parts()
+    }
+
+    pub(crate) fn restore_preparation_affinity(&mut self) -> Result<()> {
+        self.preparation
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("pending preparation permit was already consumed"))?
+            .restore_affinity()
+    }
+
+    pub(crate) fn preparation_cpu_permits(&self) -> &[usize] {
+        self.preparation
+            .as_ref()
+            .map_or(&[], |preparation| preparation.cpu_permits.as_slice())
+    }
+
+    pub(crate) fn preparation_memory_permits(&self) -> &[usize] {
+        self.preparation
+            .as_ref()
+            .map_or(&[], |preparation| preparation.memory_permits.as_slice())
+    }
+
+    fn take_parts(&mut self) -> Result<(registry::Ticket, super::PreparationPermit)> {
+        let ticket = self
+            .ticket
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("pending admission was already consumed"))?;
+        let preparation = self
+            .preparation
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("pending preparation permit was already consumed"))?;
+        Ok((ticket, preparation))
+    }
+
+    fn from_imported_ticket(
+        ticket: registry::Ticket,
+        preparation: super::PreparationPermit,
+    ) -> Self {
+        Self {
+            ticket: Some(ticket),
+            preparation: Some(preparation),
+        }
+    }
+}
+
+pub(crate) fn register_pending_admission(max_permit_index: usize) -> Result<PendingAdmission> {
+    let required = registry::required_bits_for_permit_index(max_permit_index);
+    let mut rotation_bias = 0usize;
+    loop {
+        // Scan every preparation slot before waiting.  Publication occurs
+        // under the registry EX lock; if an older READY claim appeared after
+        // the physical probe, registration returns None and all flocks are
+        // dropped before the next rotated scan.
+        let (preparation, claim) = super::acquire_preparation_permit(rotation_bias)?;
+        match registry::Ticket::register_pending(required, claim)? {
+            registry::PendingRegistration::Registered(ticket) => {
+                let mut pending = PendingAdmission {
+                    ticket: Some(ticket),
+                    preparation: Some(preparation),
+                };
+                pending
+                    .preparation
+                    .as_mut()
+                    .expect("fresh pending admission owns preparation")
+                    .constrain_affinity()?;
+                return Ok(pending);
+            }
+            registry::PendingRegistration::Contended(generation) => {
+                drop(preparation);
+                registry::wait_for_generation_change(generation, Duration::from_secs(2))?;
+            }
+        }
+        rotation_bias = rotation_bias.wrapping_add(1);
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn ticket_registry_snapshot_for_tests() -> Result<Vec<(u64, u32, ClaimSet)>> {
     registry::snapshot()
@@ -1072,6 +1280,22 @@ pub(crate) fn ticket_registry_snapshot_for_tests() -> Result<Vec<(u64, u32, Clai
 #[cfg(test)]
 pub(crate) fn ticket_registry_diagnostics_for_tests() -> Result<String> {
     registry::diagnostics_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_pending_activation_overlap_watch_for_tests() -> Result<(bool, bool, bool)> {
+    registry::exercise_pending_activation_overlap_watch_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_resource_weighted_backfill_accounting_for_tests() -> (u32, u32, u32, u32) {
+    registry::exercise_resource_weighted_backfill_accounting_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_work_conserving_backfill_for_tests()
+-> Result<(usize, usize, usize, bool, bool, bool, bool)> {
+    registry::exercise_work_conserving_backfill_for_tests()
 }
 
 #[cfg(test)]
@@ -1262,6 +1486,7 @@ pub(crate) fn exercise_candidate_ready_matrix_for_tests() -> Result<()> {
         contention: None,
         predecessors,
         availability,
+        reusable_permits: Vec::new(),
     };
     let cpu =
         |index, mode| ClaimSet::with_modes(std::iter::empty(), [index], FlockMode::Exclusive, mode);
@@ -1413,6 +1638,7 @@ pub(crate) fn exercise_registry_high_water_for_tests(waiters: usize) -> Result<u
             Some(&claim),
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeSet::new(),
             false,
             &[],
             &[],
@@ -1492,7 +1718,7 @@ fn register_ticket_or_acquire_impl<T>(
     mut try_acquire: impl FnMut(&mut GrantedProbe) -> Result<Option<T>>,
 ) -> Result<TicketWork<T>> {
     check_interrupted(cancelled)?;
-    let mut ticket = check_result(
+    let ticket = check_result(
         registry::Ticket::register_after_contention(
             initial_claim,
             watch_claim,
@@ -1501,6 +1727,41 @@ fn register_ticket_or_acquire_impl<T>(
         ),
         cancelled,
     )?;
+    drive_registered_ticket(ticket, cancelled, &mut try_acquire, None)
+}
+
+/// Consume a same-PID PENDING record and publish the complete ready claim in
+/// that exact slot before entering the ordinary grant/coordinator loop.
+pub(crate) fn activate_pending_ticket<T>(
+    mut pending: PendingAdmission,
+    initial_claim: ClaimSet,
+    watch_claim: ClaimSet,
+    cancelled: Option<&AtomicBool>,
+    mut try_acquire: impl FnMut(&mut GrantedProbe) -> Result<Option<T>>,
+) -> Result<TicketWork<T>> {
+    check_interrupted(cancelled)?;
+    let (mut ticket, mut preparation) = pending.take_parts()?;
+    anyhow::ensure!(
+        !preparation.affinity_constrained,
+        "preparation affinity must be restored before exact activation",
+    );
+    check_result(
+        ticket.activate_pending(initial_claim, watch_claim, cancelled),
+        cancelled,
+    )?;
+    preparation.release_resources_for_exact()?;
+    // Keep only the preparation token until exact physical ownership is
+    // published. It bounds resident prepared processes without causing the
+    // exact claim to self-contend on its own CPU or memory resources.
+    drive_registered_ticket(ticket, cancelled, &mut try_acquire, Some(preparation))
+}
+
+fn drive_registered_ticket<T>(
+    mut ticket: registry::Ticket,
+    cancelled: Option<&AtomicBool>,
+    try_acquire: &mut impl FnMut(&mut GrantedProbe) -> Result<Option<T>>,
+    mut preparation: Option<super::PreparationPermit>,
+) -> Result<TicketWork<T>> {
     let stagger = Duration::from_millis((std::process::id() as u64 * 37) % 1000);
     loop {
         super::tick_reservation_wait_progress();
@@ -1510,9 +1771,17 @@ fn register_ticket_or_acquire_impl<T>(
             cancelled,
         )? {
             registry::State::Coordinator => {
-                return Ok(TicketWork::Coordinator(CoordinatorTicket { ticket }));
+                return Ok(TicketWork::Coordinator(CoordinatorTicket {
+                    ticket,
+                    preparation,
+                }));
             }
             registry::State::Granted | registry::State::Replan => {
+                let reusable_permits = preparation
+                    .as_ref()
+                    .map(super::PreparationPermit::clone_permit_fds)
+                    .transpose()?
+                    .unwrap_or_default();
                 let result = ticket.run_granted(
                     cancelled,
                     |designated, watch, acquisition_allowed, predecessors, availability| {
@@ -1524,6 +1793,7 @@ fn register_ticket_or_acquire_impl<T>(
                             contention: None,
                             predecessors,
                             availability,
+                            reusable_permits,
                         };
                         let acquired = try_acquire(&mut probe)?;
                         Ok(registry::GrantAttempt {
@@ -1540,7 +1810,9 @@ fn register_ticket_or_acquire_impl<T>(
                         // Cancellation that arrives after it must not turn
                         // success into an unwind that drops those flocks behind
                         // the sole observer.
-                        return Ok(TicketWork::Acquired(Acquired::tracked(acquired, held)));
+                        let acquired = Acquired::tracked(acquired, held);
+                        drop(preparation.take());
+                        return Ok(TicketWork::Acquired(acquired));
                     }
                     result => result,
                 };
@@ -1573,6 +1845,7 @@ pub(crate) struct HeldLocks {
     predecessors: Option<registry::AggregateSnapshot>,
     availability: Option<registry::AvailabilitySnapshot>,
     commit_token: Option<registry::CoordinatorCommitToken>,
+    preparation: Option<super::PreparationPermit>,
 }
 
 impl HeldLocks {
@@ -1608,6 +1881,14 @@ impl HeldLocks {
         availability.allows(candidate)
     }
 
+    pub(crate) fn clone_reusable_permits(&self) -> Result<Vec<(usize, OwnedFd)>> {
+        self.preparation
+            .as_ref()
+            .map(super::PreparationPermit::clone_permit_fds)
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
     /// Probe one exact physical target only when the current mode-aware
     /// predecessor and availability snapshots license its claim.
     pub(crate) fn probe_complete_if_ready(
@@ -1617,6 +1898,38 @@ impl HeldLocks {
     ) -> Result<Option<Vec<OwnedFd>>> {
         validate_probe_target(claim, target)?;
         if !self.candidate_ready(claim)? {
+            return Ok(None);
+        }
+        self.probe_complete_inner(target)
+    }
+
+    /// Probe default mode's opportunistic exact placement. Its published
+    /// registry claim is deliberately CPU-SH so later default/no-perf work may
+    /// overlap it, while this one transient probe asks the physical CPU flock
+    /// for EX to establish that the placement was unshared at selection time.
+    /// Keep this exception explicit rather than weakening target validation
+    /// for every coordinator path.
+    pub(crate) fn probe_default_exact_if_ready(
+        &mut self,
+        published_claim: &ClaimSet,
+        target: &[ResourceLock],
+    ) -> Result<Option<Vec<OwnedFd>>> {
+        anyhow::ensure!(
+            published_claim.cpu_mode == ClaimMode::Shared,
+            "default exact probe requires a shared published CPU claim",
+        );
+        anyhow::ensure!(
+            published_claim.llc_mode == ClaimMode::Shared,
+            "default exact probe requires a shared published LLC claim",
+        );
+        anyhow::ensure!(
+            published_claim.permit_mode == ClaimMode::Exclusive,
+            "default exact probe requires exclusive weighted permits",
+        );
+        let mut physical_claim = published_claim.clone();
+        physical_claim.cpu_mode = ClaimMode::Exclusive;
+        validate_probe_target(&physical_claim, target)?;
+        if !self.candidate_ready(published_claim)? {
             return Ok(None);
         }
         self.probe_complete_inner(target)
@@ -1642,7 +1955,17 @@ impl HeldLocks {
 
     fn probe_complete_inner(&mut self, candidate: &[ResourceLock]) -> Result<Option<Vec<OwnedFd>>> {
         let mut fresh = Vec::with_capacity(candidate.len());
+        let mut reusable = self
+            .clone_reusable_permits()?
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
         for lock in candidate {
+            if let ResourceKey::Permit(permit) = lock.resource
+                && let Some(fd) = reusable.remove(&permit)
+            {
+                fresh.push(fd);
+                continue;
+            }
             match try_flock_with_witness(&lock.path, lock.mode)? {
                 TryFlockOutcome::Acquired(fd) => fresh.push(fd),
                 TryFlockOutcome::Contended(witness) => {
@@ -1676,6 +1999,7 @@ impl HeldLocks {
 fn validate_probe_target(claim: &ClaimSet, target: &[ResourceLock]) -> Result<()> {
     let mut cpus = BTreeSet::new();
     let mut llcs = BTreeSet::new();
+    let mut permits = BTreeSet::new();
     for lock in target {
         match lock.resource {
             ResourceKey::Cpu(cpu) => {
@@ -1712,10 +2036,29 @@ fn validate_probe_target(claim: &ClaimSet, target: &[ResourceLock]) -> Result<()
                     lock.path,
                 );
             }
+            ResourceKey::Permit(permit) => {
+                anyhow::ensure!(
+                    permits.insert(permit),
+                    "coordinator probe target repeats permit {permit}"
+                );
+                anyhow::ensure!(
+                    lock.mode == FlockMode::Exclusive,
+                    "coordinator probe target permit {permit} must use an exclusive physical flock",
+                );
+                anyhow::ensure!(
+                    claim.permit_mode == ClaimMode::Exclusive,
+                    "coordinator physical probe cannot materialize shared permit claim {permit}",
+                );
+                anyhow::ensure!(
+                    lock.path == super::permit_lock_path(permit),
+                    "coordinator probe target permit {permit} uses noncanonical lock path {}",
+                    lock.path,
+                );
+            }
         }
     }
     anyhow::ensure!(
-        cpus == claim.cpus && llcs == claim.llcs,
+        cpus == claim.cpus && llcs == claim.llcs && permits == claim.permits,
         "coordinator physical probe target does not exactly match its registry claim"
     );
     Ok(())
@@ -1801,6 +2144,7 @@ impl HolderObserver {
             let path = match key {
                 ResourceKey::Llc(index) => super::llc_lock_path(index),
                 ResourceKey::Cpu(index) => super::cpu_lock_path(index),
+                ResourceKey::Permit(index) => super::permit_lock_path(index),
             };
             let file = std::fs::OpenOptions::new().read(true).open(&path)?;
             entry.insert(file);
@@ -1891,6 +2235,22 @@ impl HolderObserver {
                 );
             }
         }
+        for &permit in request.permits.keys() {
+            let key = ResourceKey::Permit(permit);
+            let availability = if self.try_proof(key, FlockMode::Exclusive)? {
+                registry::CpuAvailability::Free
+            } else {
+                registry::CpuAvailability::ExclusiveHeld
+            };
+            observation.permits.insert(
+                permit,
+                registry::CpuObservation {
+                    availability,
+                    sh_resolved: true,
+                    ex_resolved: true,
+                },
+            );
+        }
         Ok(observation)
     }
 
@@ -1935,7 +2295,10 @@ fn acquire_as_coordinator_impl<T>(
     check_interrupted(cancelled)?;
     let watch = check_result(LockDirWatch::new(), cancelled)?;
     check_interrupted(cancelled)?;
-    let mut held = HeldLocks::default();
+    let mut held = HeldLocks {
+        preparation: coordinator.preparation.take(),
+        ..HeldLocks::default()
+    };
     let mut watched_resources = ClaimSet::default();
     let mut observer = HolderObserver::new();
     let mut first = true;
@@ -1954,6 +2317,7 @@ fn acquire_as_coordinator_impl<T>(
                 None,
                 &pending_events.cpu_closes,
                 &pending_events.llc_closes,
+                &pending_events.permit_closes,
                 pending_events.overflow,
                 &[],
                 &closed_tickets,
@@ -2015,6 +2379,7 @@ fn acquire_as_coordinator_impl<T>(
                     )? {
                         registry::FinishAcquireResult::Committed(publication) => {
                             drop(contention);
+                            drop(held.preparation.take());
                             break CoordinatorOutcome::Acquired(Acquired::tracked(
                                 value,
                                 publication,
@@ -2049,6 +2414,7 @@ fn acquire_as_coordinator_impl<T>(
                     let snapshot = check_result(
                         coordinator.ticket.schedule(
                             Some(&claim),
+                            &BTreeSet::new(),
                             &BTreeSet::new(),
                             &BTreeSet::new(),
                             false,
@@ -2139,13 +2505,26 @@ pub(crate) fn canonical_lock_order_with_modes(
     cpus: &[usize],
     cpu_mode: FlockMode,
 ) -> Vec<ResourceLock> {
+    canonical_lock_order_with_permits(llc_indices, llc_mode, cpus, cpu_mode, &[])
+}
+
+pub(crate) fn canonical_lock_order_with_permits(
+    llc_indices: &[usize],
+    llc_mode: FlockMode,
+    cpus: &[usize],
+    cpu_mode: FlockMode,
+    permits: &[usize],
+) -> Vec<ResourceLock> {
     let mut llcs: Vec<usize> = llc_indices.to_vec();
     llcs.sort_unstable();
     llcs.dedup();
     let mut cpu_sorted: Vec<usize> = cpus.to_vec();
     cpu_sorted.sort_unstable();
     cpu_sorted.dedup();
-    let mut out = Vec::with_capacity(llcs.len() + cpu_sorted.len());
+    let mut permit_sorted = permits.to_vec();
+    permit_sorted.sort_unstable();
+    permit_sorted.dedup();
+    let mut out = Vec::with_capacity(llcs.len() + cpu_sorted.len() + permit_sorted.len());
     for idx in llcs {
         out.push(ResourceLock {
             path: super::llc_lock_path(idx),
@@ -2158,6 +2537,13 @@ pub(crate) fn canonical_lock_order_with_modes(
             path: super::cpu_lock_path(cpu),
             mode: cpu_mode,
             resource: ResourceKey::Cpu(cpu),
+        });
+    }
+    for permit in permit_sorted {
+        out.push(ResourceLock {
+            path: super::permit_lock_path(permit),
+            mode: FlockMode::Exclusive,
+            resource: ResourceKey::Permit(permit),
         });
     }
     out

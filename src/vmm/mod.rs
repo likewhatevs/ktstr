@@ -668,6 +668,14 @@ struct RunLocks {
     default_shared_fallback: bool,
 }
 
+const PENDING_EXEC_METADATA_VERSION: u16 = 2;
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PendingExecMetadataV2 {
+    version: u16,
+    descriptor: crate::test_support::AdmissionCellDescriptor,
+}
+
 impl RunLocks {
     #[allow(dead_code)]
     fn unreserved() -> Self {
@@ -681,230 +689,188 @@ impl RunLocks {
     }
 }
 
+fn take_pending_exec_handoff(
+    vm: &KtstrVm,
+) -> Result<Option<host_topology::protocol::PendingAdmission>> {
+    let Some(imported) = host_topology::protocol::take_pending_exec_handoff()? else {
+        return Ok(None);
+    };
+    let metadata: PendingExecMetadataV2 =
+        postcard::from_bytes(&imported.metadata).context("decode pending pre-exec admission")?;
+    anyhow::ensure!(
+        metadata.version == PENDING_EXEC_METADATA_VERSION,
+        "unsupported pending pre-exec admission version {} (expected {})",
+        metadata.version,
+        PENDING_EXEC_METADATA_VERSION,
+    );
+    let expected_topology = admission_topology_descriptor(&vm.topology);
+    anyhow::ensure!(
+        metadata.descriptor.topology == expected_topology,
+        "pending pre-exec admission for {:?} carries topology {:?}, but the test built {:?}",
+        metadata.descriptor.exact_name,
+        metadata.descriptor.topology,
+        expected_topology,
+    );
+    let expected_mode = if vm.no_perf_mode {
+        crate::test_support::AdmissionMode::NoPerf
+    } else if vm.performance_mode {
+        crate::test_support::AdmissionMode::Performance
+    } else {
+        crate::test_support::AdmissionMode::Default
+    };
+    anyhow::ensure!(
+        metadata.descriptor.mode == expected_mode,
+        "pending pre-exec admission for {:?} carries {:?} mode, but the test built {:?} mode",
+        metadata.descriptor.exact_name,
+        metadata.descriptor.mode,
+        expected_mode,
+    );
+    Ok(Some(imported.pending))
+}
+
+fn admission_topology_descriptor(
+    topology: &Topology,
+) -> crate::test_support::AdmissionTopologyDescriptor {
+    crate::test_support::AdmissionTopologyDescriptor {
+        numa_nodes: topology.numa_nodes,
+        llcs: topology.llcs,
+        cores_per_llc: topology.cores_per_llc,
+        threads_per_core: topology.threads_per_core,
+        node_llcs: topology
+            .nodes
+            .map(|nodes| nodes.iter().map(|node| node.llcs).collect()),
+        llc_cores: topology.llc_cores.map(<[u32]>::to_vec),
+    }
+}
+
+fn topology_from_admission_descriptor(
+    descriptor: &crate::test_support::AdmissionTopologyDescriptor,
+) -> Result<Topology> {
+    let nodes = descriptor.node_llcs.as_ref().map(|node_llcs| {
+        let nodes = node_llcs
+            .iter()
+            .map(|&llcs| topology::NumaNode::new(llcs, 2 * 1024))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        &*Box::leak(nodes)
+    });
+    let llc_cores = descriptor
+        .llc_cores
+        .as_ref()
+        .map(|cores| &*Box::leak(cores.clone().into_boxed_slice()));
+    let topology = Topology {
+        numa_nodes: descriptor.numa_nodes,
+        llcs: descriptor.llcs,
+        cores_per_llc: descriptor.cores_per_llc,
+        threads_per_core: descriptor.threads_per_core,
+        nodes,
+        distances: None,
+        llc_cores,
+    };
+    topology
+        .validate()
+        .map_err(anyhow::Error::msg)
+        .context("validate pre-exec admission topology")?;
+    Ok(topology)
+}
+
+/// Opaque ownership of one exact test cell's host admission until `exec`.
+///
+/// This is a hidden cargo-ktstr integration surface, not a downstream VMM
+/// API. The wrapper must replace itself with the test process; spawning would
+/// create two independent RAII owners and is rejected by the handoff protocol.
+#[doc(hidden)]
+pub struct AdmissionExecGuard {
+    pending: Option<host_topology::protocol::PendingAdmission>,
+    descriptor: crate::test_support::AdmissionCellDescriptor,
+}
+
+impl AdmissionExecGuard {
+    /// Transfer this admission into `command` and replace the wrapper.
+    #[doc(hidden)]
+    pub fn exec(self, mut command: std::process::Command) -> Result<()> {
+        use std::os::unix::process::CommandExt;
+
+        let Some(pending) = self.pending.as_ref() else {
+            // Host-only, filtered, overcommit-skipped, and host-classified
+            // cells deliberately have no reservation to transfer. Replace
+            // this lightweight wrapper directly; metadata is meaningful only
+            // when it is bound to inherited reservation descriptors.
+            let description = format!("{command:?}");
+            return Err(anyhow::Error::new(command.exec()))
+                .with_context(|| format!("exec unreserved test cell via {description}"));
+        };
+        let metadata = postcard::to_stdvec(&PendingExecMetadataV2 {
+            version: PENDING_EXEC_METADATA_VERSION,
+            descriptor: self.descriptor,
+        })
+        .context("encode pending pre-exec admission")?;
+        let handoff = host_topology::protocol::prepare_pending_exec_handoff(pending, &metadata)?;
+        handoff.configure_exec(&mut command);
+        let description = format!("{command:?}");
+        Err(anyhow::Error::new(command.exec()))
+            .with_context(|| format!("exec pre-admitted test cell via {description}"))
+    }
+}
+
+/// Acquire the exact production admission for a generated test cell without
+/// loading its heavyweight test binary.
+#[doc(hidden)]
+pub fn pre_admit_test_cell(
+    mut descriptor: crate::test_support::AdmissionCellDescriptor,
+) -> Result<AdmissionExecGuard> {
+    let unreserved = |descriptor| AdmissionExecGuard {
+        pending: None,
+        descriptor,
+    };
+    let nonempty_env = |name| {
+        std::env::var(name)
+            .ok()
+            .is_some_and(|value| !value.is_empty())
+    };
+    let no_perf = nonempty_env(crate::KTSTR_NO_PERF_MODE_ENV);
+    let perf_only = nonempty_env(crate::KTSTR_PERF_ONLY_ENV);
+    if descriptor.host_only
+        || (descriptor.performance_mode && no_perf)
+        || (perf_only && !descriptor.performance_mode)
+    {
+        // The real dispatch still runs so it can render and persist the
+        // canonical skip. It simply does not reserve host capacity first.
+        return Ok(unreserved(descriptor));
+    }
+    if no_perf && descriptor.mode == crate::test_support::AdmissionMode::Default {
+        descriptor.mode = crate::test_support::AdmissionMode::NoPerf;
+        descriptor.no_perf_mode = true;
+    }
+    if crate::test_support::runtime::overcommit_skip_reason(
+        descriptor.topology.total_cpus(),
+        host_topology::host_allowed_cpus().len(),
+        descriptor.cpu_budget,
+        descriptor.expect_auto_repro,
+    )
+    .is_some()
+    {
+        return Ok(unreserved(descriptor));
+    }
+    // Validate the topology description before publishing the bounded
+    // preparation footprint. The child will rebuild the VM and atomically
+    // replace this same slot only after its immutable artifacts are prepared
+    // and its exact guest-memory requirement is known.
+    topology_from_admission_descriptor(&descriptor.topology)?;
+    let pending = host_topology::protocol::register_pending_admission(
+        host_topology::admission_resource_capacity_hint()?,
+    )?;
+    Ok(AdmissionExecGuard {
+        pending: Some(pending),
+        descriptor,
+    })
+}
+
 struct FlexibleRunCandidate {
     plan: host_topology::PinningPlan,
     llc_mode: host_topology::LlcLockMode,
     cpu_mode: crate::flock::FlockMode,
     cpu_reservations: Vec<usize>,
-}
-
-fn first_ready_alternative(
-    current: usize,
-    claims: &[host_topology::protocol::ClaimSet],
-    mut ready: impl FnMut(&host_topology::protocol::ClaimSet) -> Result<bool>,
-) -> Result<Option<usize>> {
-    for (index, claim) in claims.iter().enumerate() {
-        if index != current && ready(claim)? {
-            return Ok(Some(index));
-        }
-    }
-    Ok(None)
-}
-
-fn flexible_candidate_parts(
-    candidate: host_topology::PerformancePinningCandidate,
-) -> (
-    FlexibleRunCandidate,
-    host_topology::protocol::ClaimSet,
-    Vec<host_topology::protocol::ResourceLock>,
-) {
-    let claim = host_topology::resource_claim_with_modes(
-        &candidate.plan.llc_indices,
-        candidate.llc_mode,
-        &candidate.cpu_reservations,
-        candidate.cpu_mode,
-    );
-    let target = host_topology::protocol::canonical_lock_order_with_modes(
-        &candidate.plan.llc_indices,
-        match candidate.llc_mode {
-            host_topology::LlcLockMode::Exclusive => crate::flock::FlockMode::Exclusive,
-            host_topology::LlcLockMode::Shared => crate::flock::FlockMode::Shared,
-        },
-        &candidate.cpu_reservations,
-        candidate.cpu_mode,
-    );
-    (
-        FlexibleRunCandidate {
-            plan: candidate.plan,
-            llc_mode: candidate.llc_mode,
-            cpu_mode: candidate.cpu_mode,
-            cpu_reservations: candidate.cpu_reservations,
-        },
-        claim,
-        target,
-    )
-}
-
-/// Install one availability-synthesized candidate without retaining planning
-/// history. Static candidates are immutable; slot `static_len`, when present,
-/// is the single replaceable live alternative.
-fn install_live_candidate(
-    static_len: usize,
-    candidate: host_topology::PerformancePinningCandidate,
-    candidates: &mut Vec<FlexibleRunCandidate>,
-    claims: &mut Vec<host_topology::protocol::ClaimSet>,
-    targets: &mut Vec<Vec<host_topology::protocol::ResourceLock>>,
-) -> usize {
-    let (candidate, claim, target) = flexible_candidate_parts(candidate);
-    if let Some(index) = claims[..static_len]
-        .iter()
-        .position(|static_claim| *static_claim == claim)
-    {
-        return index;
-    }
-
-    debug_assert!(candidates.len() <= static_len + 1);
-    debug_assert_eq!(candidates.len(), claims.len());
-    debug_assert_eq!(candidates.len(), targets.len());
-    if candidates.len() == static_len {
-        candidates.push(candidate);
-        claims.push(claim);
-        targets.push(target);
-    } else {
-        candidates[static_len] = candidate;
-        claims[static_len] = claim;
-        targets[static_len] = target;
-    }
-    static_len
-}
-
-/// Retain the exact candidate named by a granted callback while discarding
-/// speculative alternatives from earlier callbacks.
-///
-/// A granted callback runs without the registry EX lock. Its proposed
-/// replacement may therefore be rejected as stale after the callback returns.
-/// Until the next callback supplies the authoritative designation, the local
-/// planner must retain both the current dynamic candidate and at most one
-/// speculative replacement. Overwriting the current slot eagerly loses the
-/// only mapping from the still-published claim back to its physical plan.
-fn retain_granted_designation(
-    static_len: usize,
-    designated: &host_topology::protocol::ClaimSet,
-    candidates: &mut Vec<FlexibleRunCandidate>,
-    claims: &mut Vec<host_topology::protocol::ClaimSet>,
-    targets: &mut Vec<Vec<host_topology::protocol::ResourceLock>>,
-) -> Result<usize> {
-    debug_assert_eq!(candidates.len(), claims.len());
-    debug_assert_eq!(candidates.len(), targets.len());
-    let index = claims
-        .iter()
-        .position(|claim| claim == designated)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "queue designated an unknown placement: designated={designated:?}; \
-                 locally retained claims={claims:?}"
-            )
-        })?;
-    if index < static_len {
-        candidates.truncate(static_len);
-        claims.truncate(static_len);
-        targets.truncate(static_len);
-        return Ok(index);
-    }
-
-    candidates.swap(static_len, index);
-    claims.swap(static_len, index);
-    targets.swap(static_len, index);
-    candidates.truncate(static_len + 1);
-    claims.truncate(static_len + 1);
-    targets.truncate(static_len + 1);
-    Ok(static_len)
-}
-
-/// Stage one replacement beside the callback's retained designation.
-///
-/// Unlike [`install_live_candidate`], this never overwrites the current
-/// dynamic slot. The following callback's designation is the commit verdict
-/// and [`retain_granted_designation`] then collapses the two slots back to one.
-fn stage_granted_candidate(
-    static_len: usize,
-    candidate: host_topology::PerformancePinningCandidate,
-    candidates: &mut Vec<FlexibleRunCandidate>,
-    claims: &mut Vec<host_topology::protocol::ClaimSet>,
-    targets: &mut Vec<Vec<host_topology::protocol::ResourceLock>>,
-) -> usize {
-    let (candidate, claim, target) = flexible_candidate_parts(candidate);
-    if let Some(index) = claims
-        .iter()
-        .position(|retained_claim| *retained_claim == claim)
-    {
-        return index;
-    }
-
-    debug_assert!(candidates.len() <= static_len + 1);
-    debug_assert_eq!(candidates.len(), claims.len());
-    debug_assert_eq!(candidates.len(), targets.len());
-    candidates.push(candidate);
-    claims.push(claim);
-    targets.push(target);
-    candidates.len() - 1
-}
-
-fn synthesize_ready_candidate(
-    host_topo: &host_topology::HostTopology,
-    topology: &Topology,
-    allowed: &[usize],
-    watch_llcs: &[usize],
-    mut ready: impl FnMut(&host_topology::protocol::ClaimSet) -> Result<bool>,
-) -> Result<Option<host_topology::PerformancePinningCandidate>> {
-    let mut preferred_cpus = std::collections::BTreeSet::new();
-    for &cpu in allowed {
-        let claim = host_topology::resource_claim_with_modes(
-            &[],
-            host_topology::LlcLockMode::Shared,
-            &[cpu],
-            crate::flock::FlockMode::Exclusive,
-        );
-        if ready(&claim)? {
-            preferred_cpus.insert(cpu);
-        }
-    }
-
-    let mut preferred_shared_llcs = std::collections::BTreeSet::new();
-    let mut preferred_exclusive_llcs = std::collections::BTreeSet::new();
-    for &llc in watch_llcs {
-        let shared = host_topology::resource_claim_with_modes(
-            &[llc],
-            host_topology::LlcLockMode::Shared,
-            &[],
-            crate::flock::FlockMode::Exclusive,
-        );
-        if ready(&shared)? {
-            preferred_shared_llcs.insert(llc);
-        }
-        let exclusive = host_topology::resource_claim_with_modes(
-            &[llc],
-            host_topology::LlcLockMode::Exclusive,
-            &host_topo.llc_groups[llc].cpus,
-            crate::flock::FlockMode::Exclusive,
-        );
-        if ready(&exclusive)? {
-            preferred_exclusive_llcs.insert(llc);
-        }
-    }
-
-    let planned = host_topo.topology_pinning_candidates(
-        topology,
-        host_topology::PinningKind::Performance,
-        allowed,
-        Some(host_topology::PinningPreferences {
-            cpus: &preferred_cpus,
-            shared_llcs: &preferred_shared_llcs,
-            exclusive_llcs: &preferred_exclusive_llcs,
-        }),
-    )?;
-    for candidate in planned {
-        let claim = host_topology::resource_claim_with_modes(
-            &candidate.plan.llc_indices,
-            candidate.llc_mode,
-            &candidate.cpu_reservations,
-            candidate.cpu_mode,
-        );
-        if ready(&claim)? {
-            return Ok(Some(candidate));
-        }
-    }
-    Ok(None)
 }
 
 /// One run's resolved host-thread placement.
@@ -1314,6 +1280,16 @@ impl KtstrVm {
     pub fn run(&self) -> Result<VmResult> {
         let start = Instant::now();
         let dbg = debug_logging_enabled();
+        // A cargo/nextest target runner can acquire admission before this
+        // heavyweight test binary is exec'd. Presence is authoritative: a
+        // malformed or mismatched handoff is an error, never a silent second
+        // acquisition.
+        let pending_admission = match take_pending_exec_handoff(self)? {
+            Some(pending) => pending,
+            None => host_topology::protocol::register_pending_admission(
+                host_topology::admission_resource_capacity_hint()?,
+            )?,
+        };
 
         // Resolve the immutable initrd before exact topology admission.
         // Cold cells may wait for the same cross-process CAS builder, and
@@ -1346,7 +1322,8 @@ impl KtstrVm {
         // with a resident kernel image, not vCPU fds. Acquisition WAITS on contention
         // (wait = true) for the authoritative flock release rather
         // than converting a transient peer hold into a host-skip.
-        let run_locks = self.acquire_run_locks(true)?;
+        let memory_mib = self.prepared_memory_mib(prepared_initrd.as_ref())?;
+        let run_locks = self.acquire_run_locks(true, Some(pending_admission), memory_mib)?;
         let runtime_mbind_node_map = if self.performance_mode {
             run_locks
                 .pinning_plan
@@ -1362,14 +1339,20 @@ impl KtstrVm {
             .as_deref()
             .unwrap_or(&self.mbind_node_map);
 
-        let (mut vm, kernel_result) = self.create_vm_and_load_kernel(mbind_node_map)?;
+        let (mut vm, kernel_result) = self.create_vm_and_load_kernel(mbind_node_map, memory_mib)?;
         if dbg {
             eprintln!("  kvm+kernel: {:?}", start.elapsed());
         }
 
         #[cfg(target_arch = "x86_64")]
         let _kernel_result = {
-            let kr = self.setup_memory(&mut vm, kernel_result, prepared_initrd, mbind_node_map)?;
+            let kr = self.setup_memory(
+                &mut vm,
+                kernel_result,
+                prepared_initrd,
+                mbind_node_map,
+                memory_mib,
+            )?;
             if dbg {
                 eprintln!("  setup_memory: {:?}", start.elapsed());
             }
@@ -1381,8 +1364,13 @@ impl KtstrVm {
         };
         #[cfg(target_arch = "aarch64")]
         let _kernel_result = {
-            let kr =
-                self.setup_memory_aarch64(&mut vm, kernel_result, prepared_initrd, mbind_node_map)?;
+            let kr = self.setup_memory_aarch64(
+                &mut vm,
+                kernel_result,
+                prepared_initrd,
+                mbind_node_map,
+                memory_mib,
+            )?;
             self.setup_vcpus_aarch64(&vm, kr.entry)?;
             kr
         };
@@ -1498,9 +1486,9 @@ impl KtstrVm {
     ///   `no_perf_effective_cap` budget. The fresh plan's fds ride the run;
     ///   its refreshed `cpus` thread through `RunLocks::shared_cpu_mask` to every
     ///   mask consumer so mask + lock identity holds by construction.
-    /// * `no_perf_mode` + missing plan (bypass / degraded sysfs):
-    ///   returns an empty Vec — `build()` already warned, no
-    ///   coordination is possible on this host.
+    /// * `no_perf_mode` + missing plan (bypass / degraded sysfs): uses the
+    ///   topology-independent CPU-SH + weighted CPU/memory admission path, so
+    ///   degraded cache discovery does not bypass run accounting.
     /// * `performance_mode` + `pinning_plan`: re-enumerates the shared
     ///   mapper's exact candidates, probes every complete claim, and on
     ///   contention enters flexible admission. The acquired candidate—not the
@@ -1515,7 +1503,15 @@ impl KtstrVm {
     ///   This is the path
     ///   test fixtures take when neither `--perf-mode` nor `--no-perf-mode`
     ///   is in effect.
-    fn acquire_run_locks(&self, wait: bool) -> Result<RunLocks> {
+    fn acquire_run_locks(
+        &self,
+        wait: bool,
+        mut pending: Option<host_topology::protocol::PendingAdmission>,
+        memory_mib: u32,
+    ) -> Result<RunLocks> {
+        if let Some(pending) = pending.as_mut() {
+            pending.restore_preparation_affinity()?;
+        }
         if self.no_perf_mode {
             // Re-plan at run time rather than freezing the build-time shape.
             // The fresh plan owns the only physical resource fds and its
@@ -1535,12 +1531,15 @@ impl KtstrVm {
                     // the same static topology, not a stashed handle.
                     let test_topo = crate::topology::TestTopology::from_system()?;
                     // `no_perf_effective_cap` is the exact build-time budget.
-                    let fresh = host_topology::acquire_llc_plan(
+                    let fresh = host_topology::acquire_llc_plan_interruptible(
                         host_topo,
                         &test_topo,
                         self.no_perf_effective_cap,
                         host_topology::PlacementPolicy::spread_for_process(),
                         wait,
+                        None,
+                        pending,
+                        Some(memory_mib),
                     )?;
                     // The build-time shape is deliberately static and may not
                     // resemble the placement selected after a queue wait.
@@ -1562,29 +1561,46 @@ impl KtstrVm {
                         default_shared_fallback: false,
                     })
                 }
-                _ => Ok(RunLocks {
-                    locks: host_topology::protocol::Acquired::untracked(Vec::new()),
-                    pinning_plan: None,
-                    shared_cpu_mask: None,
-                    default_shared_cpu_claim: false,
-                    default_shared_fallback: false,
-                }),
+                _ => {
+                    let allowed = host_topology::host_allowed_cpus();
+                    let mut locks = Self::acquire_default_shared_run_locks(
+                        None,
+                        allowed,
+                        self.topology.total_cpus() as usize,
+                        wait,
+                        None,
+                        pending,
+                        memory_mib,
+                    )?;
+                    locks.default_shared_cpu_claim = false;
+                    locks.default_shared_fallback = false;
+                    Ok(locks)
+                }
             }
         } else if self.performance_mode {
             match (self.host_topo.as_ref(), self.pinning_plan.as_ref()) {
-                (Some(host_topo), Some(plan)) => {
-                    Self::acquire_performance_run_locks(host_topo, &self.topology, plan, wait)
-                }
+                (Some(host_topo), Some(plan)) => Self::acquire_performance_run_locks(
+                    host_topo,
+                    &self.topology,
+                    plan,
+                    wait,
+                    pending,
+                    memory_mib,
+                ),
                 _ => anyhow::bail!(
                     "performance-mode VM reached run admission without its \
                      validated host topology and build-time shape witness"
                 ),
             }
         } else {
-            // Default: probe every bounded exact candidate with a momentary
-            // LLC-SH/CPU-EX check, retain LLC-SH/CPU-SH on success, or
-            // immediately use shared admission.
-            Self::acquire_default_run_locks(self.host_topo.as_ref(), &self.topology, wait)
+            Self::acquire_default_preferred_run_locks(
+                self.host_topo.as_ref(),
+                &self.topology,
+                wait,
+                None,
+                pending,
+                memory_mib,
+            )
         }
     }
 
@@ -1595,17 +1611,29 @@ impl KtstrVm {
     /// surface contention. A performance-configured shell still ignores exact
     /// performance pinning, but uses the same default shared fallback so it
     /// cannot run through another performance VM's exclusive reservation.
-    fn acquire_interactive_run_locks(&self) -> Result<RunLocks> {
+    fn acquire_interactive_run_locks(
+        &self,
+        mut pending: host_topology::protocol::PendingAdmission,
+        memory_mib: u32,
+    ) -> Result<RunLocks> {
+        pending.restore_preparation_affinity()?;
+        // Interactive admission is a single non-blocking attempt. Release the
+        // pre-exec preparation publication before that attempt instead of
+        // activating it into the waiting protocol.
+        drop(pending);
         if self.performance_mode {
+            let allowed = host_topology::host_allowed_cpus();
             Self::acquire_default_shared_run_locks(
                 self.host_topo.as_ref(),
-                host_topology::host_allowed_cpus(),
+                allowed,
                 self.topology.total_cpus() as usize,
                 false,
                 None,
+                None,
+                memory_mib,
             )
         } else {
-            self.acquire_run_locks(false)
+            self.acquire_run_locks(false, None, memory_mib)
         }
     }
 
@@ -1639,6 +1667,8 @@ impl KtstrVm {
         topology: &Topology,
         _build_plan: &host_topology::PinningPlan,
         wait: bool,
+        pending: Option<host_topology::protocol::PendingAdmission>,
+        memory_mib: u32,
     ) -> Result<RunLocks> {
         let allowed = host_topology::host_allowed_cpus();
         let candidates = Self::performance_run_candidates(host_topo, topology, &allowed)?;
@@ -1648,61 +1678,12 @@ impl KtstrVm {
             }));
         }
 
-        let claims: Vec<_> = candidates
-            .iter()
-            .map(|candidate| {
-                host_topology::resource_claim_with_modes(
-                    &candidate.plan.llc_indices,
-                    candidate.llc_mode,
-                    &candidate.cpu_reservations,
-                    candidate.cpu_mode,
-                )
-            })
-            .collect();
-        let required = claims
-            .iter()
-            .cloned()
-            .reduce(|envelope, claim| envelope.union_envelope(&claim))
-            .expect("performance candidates are non-empty");
-        let aggregate = host_topology::protocol::registered_claim_snapshot(&required)?;
-        let mut contention = host_topology::protocol::ContentionSet::default();
-        for (candidate, claim) in candidates.iter().zip(&claims) {
-            if aggregate.conflicts(claim)? {
-                continue;
-            }
-            match host_topology::try_acquire_resources(
-                &candidate.plan.llc_indices,
-                candidate.llc_mode,
-                &candidate.cpu_reservations,
-                candidate.cpu_mode,
-            )? {
-                host_topology::TryAcquireAll::Acquired(locks) => {
-                    return Ok(RunLocks {
-                        locks,
-                        pinning_plan: Some(candidate.plan.clone_unlocked()),
-                        shared_cpu_mask: None,
-                        default_shared_cpu_claim: false,
-                        default_shared_fallback: false,
-                    });
-                }
-                host_topology::TryAcquireAll::Contended {
-                    evidence: Some(evidence),
-                    ..
-                } => contention.insert(evidence),
-                host_topology::TryAcquireAll::Contended { evidence: None, .. } => {}
-            }
-        }
         if !wait {
             return Err(anyhow::Error::new(host_topology::ResourceContention {
-                reason: format!(
-                    "all {} equivalent performance-mode placements are busy",
-                    candidates.len(),
-                ),
+                reason: "non-waiting performance admission is unsupported".into(),
             }));
         }
-        Self::acquire_performance_as_coordinator(
-            host_topo, topology, &allowed, candidates, contention, None,
-        )
+        Self::acquire_performance_with_permits(&allowed, candidates, pending, memory_mib, None)
     }
 
     /// Enumerate the exact placements which satisfy one performance-mode
@@ -1731,177 +1712,39 @@ impl KtstrVm {
             .collect())
     }
 
-    /// Default (non-perf, non-no-perf) run-lock acquisition. Every exact
-    /// 1:1 candidate gets one nonblocking, claim-fenced LLC-SH/CPU-EX probe.
-    /// A successful probe is converted to LLC-SH/CPU-SH before publication,
-    /// so exact placement is an optimization, never an exclusion contract:
-    ///
-    /// * A candidate acquired → 1:1 pinned run.
-    /// * No exact candidate maps, or every candidate is busy → immediately
-    ///   request a `vcpus + 1` (clamped) Spread pool through the shared
-    ///   LLC-SH/CPU-SH planner. Default peers may overlap that pool.
-    /// * `wait == true` may wait only when performance EX ownership or an
-    ///   earlier incompatible EX claim leaves insufficient shared capacity.
-    /// * `wait == false` surfaces that hard contention to an interactive
-    ///   caller; there is no lock-free degradation.
-    ///
-    /// Associated fn (no `&self`) over host topology and guest topology so the
-    /// exact-vs-shared decision is testable against synthetic hosts.
-    fn acquire_default_run_locks(
-        host_topo: Option<&host_topology::HostTopology>,
-        topology: &Topology,
-        wait: bool,
-    ) -> Result<RunLocks> {
-        Self::acquire_default_run_locks_impl(host_topo, topology, wait, None)
-    }
-
-    #[cfg(test)]
-    fn acquire_default_run_locks_interruptible(
-        host_topo: Option<&host_topology::HostTopology>,
-        topology: &Topology,
-        wait: bool,
-        cancelled: &AtomicBool,
-    ) -> Result<RunLocks> {
-        Self::acquire_default_run_locks_impl(host_topo, topology, wait, Some(cancelled))
-    }
-
-    fn acquire_default_run_locks_impl(
-        host_topo: Option<&host_topology::HostTopology>,
-        topology: &Topology,
-        wait: bool,
-        cancelled: Option<&AtomicBool>,
-    ) -> Result<RunLocks> {
-        let allowed = host_topology::host_allowed_cpus();
-        let Some(host_topo) = host_topo else {
-            // No cached topology can name LLCs, so use the CPU-SH fallback
-            // bridge. Whole-performance ownership names every CPU in its LLC,
-            // preserving the hard EX fence even on this degraded path.
-            return Self::acquire_default_shared_run_locks(
-                None,
-                allowed,
-                topology.total_cpus() as usize,
-                wait,
-                cancelled,
-            );
-        };
-        let flat = match host_topo.default_pinning_candidates_for_cpus(topology, &allowed) {
-            Ok(candidates) => candidates,
-            Err(error)
-                if error
-                    .downcast_ref::<host_topology::TopologyInsufficient>()
-                    .is_some() =>
-            {
-                return Self::acquire_default_shared_run_locks(
-                    Some(host_topo),
-                    allowed,
-                    topology.total_cpus() as usize,
-                    wait,
-                    cancelled,
-                );
-            }
-            Err(error) => return Err(error),
-        };
-        let start = host_topology::pid_window_offset(std::process::id(), flat.len().max(1));
-        let candidates: Vec<FlexibleRunCandidate> = (0..flat.len())
-            .map(|i| {
-                let candidate = &flat[(start + i) % flat.len()];
-                FlexibleRunCandidate {
-                    plan: candidate.plan.clone_unlocked(),
-                    llc_mode: candidate.llc_mode,
-                    cpu_mode: candidate.cpu_mode,
-                    cpu_reservations: candidate.cpu_reservations.clone(),
-                }
-            })
-            .collect();
-        drop(flat);
-        if candidates.is_empty() {
-            return Self::acquire_default_shared_run_locks(
-                Some(host_topo),
-                allowed,
-                topology.total_cpus() as usize,
-                wait,
-                cancelled,
-            );
-        }
-        // Copy the registry aggregates once for the whole candidate window.
-        // Local filtering avoids one SH flock/open/mmap per already-fenced CPU
-        // window; every candidate that survives still enters its authoritative
-        // shared fence around the real all-or-nothing flock probe.
-        let claims: Vec<_> = candidates
-            .iter()
-            .map(|candidate| {
-                host_topology::resource_claim_with_modes(
-                    &candidate.plan.llc_indices,
-                    candidate.llc_mode,
-                    &candidate.cpu_reservations,
-                    candidate.cpu_mode,
-                )
-            })
-            .collect();
-        let required = claims
-            .iter()
-            .cloned()
-            .reduce(|envelope, claim| envelope.union_envelope(&claim))
-            .expect("default candidates are non-empty");
-        let aggregate = host_topology::protocol::registered_claim_snapshot(&required)?;
-        // FAST PATH: one non-blocking, all-or-nothing bounce per locally
-        // eligible candidate.
-        for (candidate, claim) in candidates.iter().zip(&claims) {
-            if aggregate.conflicts(claim)? {
-                continue;
-            }
-            match host_topology::try_acquire_default_exact_resources(
-                &candidate.plan.llc_indices,
-                &candidate.cpu_reservations,
-                cancelled,
-            )? {
-                host_topology::TryAcquireAll::Acquired(locks) => {
-                    return Ok(RunLocks {
-                        locks,
-                        pinning_plan: Some(candidate.plan.clone_unlocked()),
-                        shared_cpu_mask: None,
-                        default_shared_cpu_claim: true,
-                        default_shared_fallback: false,
-                    });
-                }
-                host_topology::TryAcquireAll::Contended { .. } => {}
-            }
-        }
-        Self::acquire_default_shared_run_locks(
-            Some(host_topo),
-            allowed,
-            topology.total_cpus() as usize,
-            wait,
-            cancelled,
-        )
-    }
-
-    /// Registry/coordinator phase for exact performance-mode placement.
-    fn acquire_performance_as_coordinator(
-        host_topo: &host_topology::HostTopology,
-        topology: &Topology,
+    fn acquire_performance_with_permits(
         allowed: &[usize],
-        mut candidates: Vec<FlexibleRunCandidate>,
-        contention: host_topology::protocol::ContentionSet,
+        candidates: Vec<FlexibleRunCandidate>,
+        pending: Option<host_topology::protocol::PendingAdmission>,
+        memory_mib: u32,
         cancelled: Option<&AtomicBool>,
     ) -> Result<RunLocks> {
         use host_topology::protocol;
-        // Pre-compute each candidate's canonical lock order and claim.
-        let mut targets: Vec<Vec<protocol::ResourceLock>> = candidates
-            .iter()
-            .map(|candidate| {
-                protocol::canonical_lock_order_with_modes(
-                    &candidate.plan.llc_indices,
-                    match candidate.llc_mode {
-                        host_topology::LlcLockMode::Exclusive => crate::flock::FlockMode::Exclusive,
-                        host_topology::LlcLockMode::Shared => crate::flock::FlockMode::Shared,
-                    },
-                    &candidate.cpu_reservations,
-                    candidate.cpu_mode,
-                )
-            })
-            .collect();
-        let mut claims: Vec<protocol::ClaimSet> = candidates
+
+        let cpu_required = candidates[0].plan.assignments.len()
+            + usize::from(candidates[0].plan.service_cpu.is_some());
+        let permit_pool = host_topology::VmPermitPool::new_with_preparation(
+            allowed.len(),
+            cpu_required,
+            memory_mib,
+            pending.as_ref(),
+        )?;
+        let initial_permits = permit_pool
+            .select_registered()?
+            .expect("a validated VM permit pool can seed an exact designation");
+        let claim_for = |candidate: &FlexibleRunCandidate,
+                         permits: &host_topology::VmPermitReservation| {
+            host_topology::resource_claim_with_permits(
+                &candidate.plan.llc_indices,
+                candidate.llc_mode,
+                &candidate.cpu_reservations,
+                candidate.cpu_mode,
+                &permits.all_permits(),
+                permits.admission_class,
+            )
+        };
+        let initial_claim = claim_for(&candidates[0], &initial_permits);
+        let topology_envelope = candidates
             .iter()
             .map(|candidate| {
                 host_topology::resource_claim_with_modes(
@@ -1911,114 +1754,78 @@ impl KtstrVm {
                     candidate.cpu_mode,
                 )
             })
-            .collect();
-        let static_len = candidates.len();
-        debug_assert!(
-            claims
+            .reduce(|envelope, claim| envelope.union_envelope(&claim))
+            .expect("performance candidates are non-empty");
+        let watch_claim = host_topology::resource_claim_with_permits(
+            &topology_envelope.llcs.iter().copied().collect::<Vec<_>>(),
+            host_topology::LlcLockMode::Exclusive,
+            &topology_envelope.cpus.iter().copied().collect::<Vec<_>>(),
+            crate::flock::FlockMode::Exclusive,
+            &permit_pool.watch_permits(),
+            // The envelope describes alternatives, not a concrete selection
+            // from the cooperative fallback suffix. Candidate claims carry
+            // their selected permit class; the Ordinary watch admits either
+            // class without itself claiming fallback capacity.
+            protocol::AdmissionClass::Ordinary,
+        );
+        let matches_designation = |candidate: &FlexibleRunCandidate, claim: &protocol::ClaimSet| {
+            let topology = host_topology::resource_claim_with_modes(
+                &candidate.plan.llc_indices,
+                candidate.llc_mode,
+                &candidate.cpu_reservations,
+                candidate.cpu_mode,
+            );
+            topology.llcs == claim.llcs
+                && topology.cpus == claim.cpus
+                && topology.llc_mode == claim.llc_mode
+                && topology.cpu_mode == claim.cpu_mode
+        };
+        let register = |probe: &mut protocol::GrantedProbe| {
+            let designated = probe.designated().clone();
+            let reusable_permits = probe.clone_reusable_permits()?;
+            if let Some((index, candidate)) = candidates
                 .iter()
                 .enumerate()
-                .all(|(index, claim)| !claims[..index].contains(claim)),
-            "flexible admission candidates must have unique exact claims",
-        );
-        // The private watch covers every alternative, but the registry claim
-        // is always one exact designated candidate. This lets a later smaller
-        // waiter use capacity disjoint from that designation without sniping
-        // resources the earlier waiter has actually reserved.
-        // The immutable private watch covers every resource from which this
-        // topology can build an equivalent candidate, including sibling CPUs
-        // outside this process's cpuset when whole-LLC performance isolation
-        // claims the complete cache domain. This permits a granted callback to
-        // synthesize one fragmented availability-driven placement without
-        // weakening the exact public designation.
-        let allowed_set = allowed
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        let watch_llcs = host_topo
-            .llc_groups
-            .iter()
-            .enumerate()
-            .filter(|(_, group)| group.cpus.iter().any(|cpu| allowed_set.contains(cpu)))
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        let mut watch_cpus = allowed.to_vec();
-        watch_cpus.extend(
-            watch_llcs
-                .iter()
-                .flat_map(|&llc| host_topo.llc_groups[llc].cpus.iter().copied()),
-        );
-        let watch_claim = host_topology::resource_claim_with_modes(
-            &watch_llcs,
-            host_topology::LlcLockMode::Exclusive,
-            &watch_cpus,
-            crate::flock::FlockMode::Exclusive,
-        );
-        let initial_claim = claims[0].clone();
-        let register = |probe: &mut protocol::GrantedProbe| {
-            let index = retain_granted_designation(
-                static_len,
-                probe.designated(),
-                &mut candidates,
-                &mut claims,
-                &mut targets,
-            )?;
-            let candidate = &candidates[index];
-            if let Some(locks) = probe.try_acquire(&claims[index], || {
-                host_topology::acquire_resources_granted_with_evidence(
-                    &candidate.plan.llc_indices,
-                    candidate.llc_mode,
-                    &candidate.cpu_reservations,
-                    candidate.cpu_mode,
-                )
-            })? {
-                return Ok(Some((index, locks)));
-            }
-
-            // Feed the same mode-aware snapshot through the bounded topology
-            // planner. Keep exactly one replaceable live slot: prior snapshots
-            // are planning history, not useful queue alternatives.
-            if let Some(candidate) =
-                synthesize_ready_candidate(host_topo, topology, allowed, &watch_llcs, |claim| {
-                    probe.candidate_ready(claim)
+                .find(|(_, candidate)| matches_designation(candidate, &designated))
+                && let Some(locks) = probe.try_acquire(&designated, || {
+                    host_topology::acquire_resources_with_permits_granted_reusing(
+                        &candidate.plan.llc_indices,
+                        candidate.llc_mode,
+                        &candidate.cpu_reservations,
+                        candidate.cpu_mode,
+                        &designated.permits.iter().copied().collect::<Vec<_>>(),
+                        &reusable_permits,
+                    )
                 })?
             {
-                let ready = stage_granted_candidate(
-                    static_len,
-                    candidate,
-                    &mut candidates,
-                    &mut claims,
-                    &mut targets,
-                );
-                probe.reserve(&claims[ready])?;
-                return Ok(None);
+                return Ok(Some((index, locks)));
             }
-            // Availability is an observed, mode-aware registry snapshot, not
-            // a blind round-robin hint. Pick the first complete ready
-            // alternative in planner order; it may be arbitrarily far from
-            // the current designation and is selected in this callback.
-            if let Some(ready) =
-                first_ready_alternative(index, &claims, |claim| probe.candidate_ready(claim))?
-            {
-                probe.reserve(&claims[ready])?;
-            } else {
-                // Retain the current exact designation until an observed
-                // alternative is actually usable.
-                probe.reserve(&claims[index])?;
+            for candidate in &candidates {
+                let Some(permits) = permit_pool.select(|claim| probe.candidate_ready(claim))?
+                else {
+                    break;
+                };
+                let claim = claim_for(candidate, &permits);
+                if probe.candidate_ready(&claim)? {
+                    probe.reserve(&claim)?;
+                    return Ok(None);
+                }
             }
+            probe.reserve(&designated)?;
             Ok(None)
         };
-        let ticket = if contention.is_empty() {
-            protocol::register_ticket_or_acquire(
+        let ticket = if let Some(pending) = pending {
+            protocol::activate_pending_ticket(
+                pending,
                 initial_claim.clone(),
                 watch_claim,
                 cancelled,
                 register,
             )?
         } else {
-            protocol::register_ticket_after_contentions(
-                initial_claim,
+            protocol::register_ticket_or_acquire(
+                initial_claim.clone(),
                 watch_claim,
-                contention,
                 cancelled,
                 register,
             )?
@@ -2034,76 +1841,402 @@ impl KtstrVm {
                     default_shared_fallback: false,
                 });
             }
-            protocol::TicketWork::Coordinator(coordinator) => {
-                // Granted-callback staging is complete. The coordinator
-                // replans from an authoritative availability snapshot and
-                // needs only the immutable static set plus its one
-                // replaceable live slot.
-                candidates.truncate(static_len);
-                claims.truncate(static_len);
-                targets.truncate(static_len);
-                coordinator
-            }
+            protocol::TicketWork::Coordinator(coordinator) => coordinator,
         };
-        let mut step = |held: &mut protocol::HeldLocks| {
-            let live =
-                synthesize_ready_candidate(host_topo, topology, allowed, &watch_llcs, |claim| {
-                    held.candidate_ready(claim)
-                })?
-                .map(|candidate| {
-                    install_live_candidate(
-                        static_len,
-                        candidate,
-                        &mut candidates,
-                        &mut claims,
-                        &mut targets,
-                    )
-                });
-
-            // RE-PLAN on every wake and probe every candidate
-            // all-or-nothing, so a fully-freed alternative is taken the
-            // moment it appears. Failed candidates release every real flock
-            // before the next candidate is considered.
-            let mut active = Vec::with_capacity(static_len + usize::from(live.is_some()));
-            if let Some(live) = live {
-                active.push(live);
-            }
-            active.extend((0..static_len).filter(|index| Some(*index) != live));
-            for &i in &active {
-                if let Some(locks) = held.probe_complete_if_ready(&claims[i], &targets[i])? {
+        let mut designation = initial_claim;
+        let step = |held: &mut protocol::HeldLocks| {
+            for (index, candidate) in candidates.iter().enumerate() {
+                let Some(permits) = permit_pool.select(|claim| held.candidate_ready(claim))? else {
+                    break;
+                };
+                let claim = claim_for(candidate, &permits);
+                if !held.candidate_ready(&claim)? {
+                    continue;
+                }
+                designation = claim;
+                let target = protocol::canonical_lock_order_with_permits(
+                    &candidate.plan.llc_indices,
+                    match candidate.llc_mode {
+                        host_topology::LlcLockMode::Exclusive => crate::flock::FlockMode::Exclusive,
+                        host_topology::LlcLockMode::Shared => crate::flock::FlockMode::Shared,
+                    },
+                    &candidate.cpu_reservations,
+                    candidate.cpu_mode,
+                    &designation.permits.iter().copied().collect::<Vec<_>>(),
+                );
+                if let Some(locks) = held.probe_complete_if_ready(&designation, &target)? {
                     return Ok(protocol::CoordinatorStep::Complete {
-                        claim: claims[i].clone(),
-                        value: (i, locks),
+                        claim: designation.clone(),
+                        value: (index, locks),
                     });
                 }
             }
-            // None complete: keep one exact registry designation while
-            // holding no physical subset. Prefer a newly synthesized live
-            // placement, then the pid-staggered static planner order.
-            let primary = active
-                .into_iter()
-                .next()
-                .expect("candidates is non-empty — checked by caller");
             Ok(protocol::CoordinatorStep::Waiting {
-                claim: claims[primary].clone(),
+                claim: designation.clone(),
             })
         };
         let outcome = match cancelled {
             Some(cancelled) => {
-                protocol::acquire_as_coordinator_interruptible(coordinator, cancelled, &mut step)?
+                protocol::acquire_as_coordinator_interruptible(coordinator, cancelled, step)?
             }
-            None => protocol::acquire_as_coordinator(coordinator, &mut step)?,
+            None => protocol::acquire_as_coordinator(coordinator, step)?,
         };
         match outcome {
             protocol::CoordinatorOutcome::Acquired(acquired) => {
-                let (i, locks) = acquired.split_map(|(i, locks)| (i, locks));
+                let (index, locks) = acquired.split_map(|(index, locks)| (index, locks));
                 Ok(RunLocks {
                     locks,
-                    pinning_plan: Some(candidates[i].plan.clone_unlocked()),
+                    pinning_plan: Some(candidates[index].plan.clone_unlocked()),
                     shared_cpu_mask: None,
                     default_shared_cpu_claim: false,
                     default_shared_fallback: false,
                 })
+            }
+            protocol::CoordinatorOutcome::Aborted { reason } => {
+                Err(anyhow::Error::new(host_topology::ResourceContention {
+                    reason,
+                }))
+            }
+        }
+    }
+
+    fn acquire_default_preferred_run_locks(
+        host_topo: Option<&host_topology::HostTopology>,
+        topology: &Topology,
+        wait: bool,
+        cancelled: Option<&AtomicBool>,
+        pending: Option<host_topology::protocol::PendingAdmission>,
+        memory_mib: u32,
+    ) -> Result<RunLocks> {
+        use host_topology::protocol;
+
+        let allowed = host_topology::host_allowed_cpus();
+        let Some(host_topo) = host_topo else {
+            return Self::acquire_default_shared_run_locks(
+                None,
+                allowed,
+                topology.total_cpus() as usize,
+                wait,
+                cancelled,
+                pending,
+                memory_mib,
+            );
+        };
+        let flat = match host_topo.default_pinning_candidates_for_cpus(topology, &allowed) {
+            Ok(flat) if !flat.is_empty() => flat,
+            Ok(_) => {
+                return Self::acquire_default_shared_run_locks(
+                    Some(host_topo),
+                    allowed,
+                    topology.total_cpus() as usize,
+                    wait,
+                    cancelled,
+                    pending,
+                    memory_mib,
+                );
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<host_topology::TopologyInsufficient>()
+                    .is_some() =>
+            {
+                return Self::acquire_default_shared_run_locks(
+                    Some(host_topo),
+                    allowed,
+                    topology.total_cpus() as usize,
+                    wait,
+                    cancelled,
+                    pending,
+                    memory_mib,
+                );
+            }
+            Err(error) => return Err(error),
+        };
+        let start = host_topology::pid_window_offset(std::process::id(), flat.len());
+        let candidates = (0..flat.len())
+            .map(|offset| {
+                let mapped = &flat[(start + offset) % flat.len()];
+                FlexibleRunCandidate {
+                    plan: mapped.plan.clone_unlocked(),
+                    llc_mode: host_topology::LlcLockMode::Shared,
+                    cpu_mode: crate::flock::FlockMode::Shared,
+                    cpu_reservations: mapped.cpu_reservations.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let permit_pool = host_topology::VmPermitPool::new_with_preparation(
+            allowed.len(),
+            candidates[0].cpu_reservations.len(),
+            memory_mib,
+            pending.as_ref(),
+        )?;
+        if !wait {
+            anyhow::ensure!(
+                pending.is_none(),
+                "non-waiting default admission cannot consume a pending owner",
+            );
+            for candidate in &candidates {
+                let Some(permits) = permit_pool.select_registered()? else {
+                    continue;
+                };
+                let claim = host_topology::resource_claim_with_permits(
+                    &candidate.plan.llc_indices,
+                    host_topology::LlcLockMode::Shared,
+                    &candidate.cpu_reservations,
+                    crate::flock::FlockMode::Shared,
+                    &permits.all_permits(),
+                    permits.admission_class,
+                );
+                match protocol::with_registry_fence(&claim, || {
+                    host_topology::acquire_default_exact_with_permits_granted(
+                        &candidate.plan.llc_indices,
+                        &candidate.cpu_reservations,
+                        &permits.all_permits(),
+                    )
+                })? {
+                    protocol::RegistryFence::Fenced => {}
+                    protocol::RegistryFence::Ran {
+                        value: protocol::ProbeOutcome::Acquired(locks),
+                        ..
+                    } => {
+                        return Ok(RunLocks {
+                            locks: protocol::publish_acquired(&claim, locks)?,
+                            pinning_plan: Some(candidate.plan.clone_unlocked()),
+                            shared_cpu_mask: None,
+                            default_shared_cpu_claim: true,
+                            default_shared_fallback: false,
+                        });
+                    }
+                    protocol::RegistryFence::Ran { .. } => {}
+                }
+            }
+            return Self::acquire_default_shared_run_locks(
+                Some(host_topo),
+                allowed,
+                topology.total_cpus() as usize,
+                false,
+                cancelled,
+                None,
+                memory_mib,
+            );
+        }
+        let initial_permits = permit_pool
+            .select_registered()?
+            .expect("a validated default permit pool can seed admission");
+        let claim_for = |candidate: &FlexibleRunCandidate,
+                         permits: &host_topology::VmPermitReservation| {
+            host_topology::resource_claim_with_permits(
+                &candidate.plan.llc_indices,
+                host_topology::LlcLockMode::Shared,
+                &candidate.cpu_reservations,
+                crate::flock::FlockMode::Shared,
+                &permits.all_permits(),
+                permits.admission_class,
+            )
+        };
+        let initial = claim_for(&candidates[0], &initial_permits);
+        let envelope = candidates
+            .iter()
+            .map(|candidate| {
+                host_topology::resource_claim_with_modes(
+                    &candidate.plan.llc_indices,
+                    host_topology::LlcLockMode::Shared,
+                    &candidate.cpu_reservations,
+                    crate::flock::FlockMode::Shared,
+                )
+            })
+            .reduce(|envelope, claim| envelope.union_envelope(&claim))
+            .expect("default candidates are non-empty");
+        let watch = host_topology::resource_claim_with_permits(
+            &envelope.llcs.iter().copied().collect::<Vec<_>>(),
+            host_topology::LlcLockMode::Shared,
+            &envelope.cpus.iter().copied().collect::<Vec<_>>(),
+            crate::flock::FlockMode::Shared,
+            &permit_pool.watch_permits(),
+            // Concrete candidate claims carry DefaultBorrow only when their
+            // selected permits use the cooperative fallback suffix. The broad
+            // Ordinary watch represents both selection classes.
+            protocol::AdmissionClass::Ordinary,
+        );
+        let matches_designation = |candidate: &FlexibleRunCandidate, claim: &protocol::ClaimSet| {
+            candidate
+                .plan
+                .llc_indices
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                == claim.llcs
+                && candidate
+                    .cpu_reservations
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    == claim.cpus
+                && claim.llc_mode == protocol::ClaimMode::Shared
+                && claim.cpu_mode == protocol::ClaimMode::Shared
+        };
+        let mut exact_attempts = candidates.len();
+        let register = |probe: &mut protocol::GrantedProbe| {
+            let designated = probe.designated().clone();
+            let index = candidates
+                .iter()
+                .position(|candidate| matches_designation(candidate, &designated))
+                .ok_or_else(|| anyhow::anyhow!("default queue designated an unknown placement"))?;
+            let candidate = &candidates[index];
+            let reusable_permits = probe.clone_reusable_permits()?;
+            let exact = exact_attempts > 0;
+            let designated_permits = designated.permits.iter().copied().collect::<Vec<_>>();
+            let result = probe.try_acquire(&designated, || {
+                if exact {
+                    host_topology::acquire_default_exact_with_permits_granted_reusing(
+                        &candidate.plan.llc_indices,
+                        &candidate.cpu_reservations,
+                        &designated_permits,
+                        &reusable_permits,
+                    )
+                } else {
+                    host_topology::acquire_resources_with_permits_granted_reusing(
+                        &candidate.plan.llc_indices,
+                        host_topology::LlcLockMode::Shared,
+                        &candidate.cpu_reservations,
+                        crate::flock::FlockMode::Shared,
+                        &designated_permits,
+                        &reusable_permits,
+                    )
+                }
+            })?;
+            if let Some(locks) = result {
+                return Ok(Some((index, exact, locks)));
+            }
+            if exact_attempts > 0 {
+                exact_attempts -= 1;
+            }
+            for offset in 1..=candidates.len() {
+                let next = (index + offset) % candidates.len();
+                let Some(permits) = permit_pool.select(|claim| probe.candidate_ready(claim))?
+                else {
+                    break;
+                };
+                let claim = claim_for(&candidates[next], &permits);
+                if probe.candidate_ready(&claim)? {
+                    probe.reserve(&claim)?;
+                    return Ok(None);
+                }
+            }
+            probe.reserve(&designated)?;
+            Ok(None)
+        };
+        let ticket = if let Some(pending) = pending {
+            protocol::activate_pending_ticket(pending, initial.clone(), watch, cancelled, register)?
+        } else {
+            protocol::register_ticket_or_acquire(initial.clone(), watch, cancelled, register)?
+        };
+        let coordinator = match ticket {
+            protocol::TicketWork::Acquired(acquired) => {
+                let ((index, exact), locks) =
+                    acquired.split_map(|(index, exact, locks)| ((index, exact), locks));
+                return if exact {
+                    Ok(RunLocks {
+                        locks,
+                        pinning_plan: Some(candidates[index].plan.clone_unlocked()),
+                        shared_cpu_mask: None,
+                        default_shared_cpu_claim: true,
+                        default_shared_fallback: false,
+                    })
+                } else {
+                    Ok(Self::build_default_shared_run_locks(
+                        candidates[index].cpu_reservations.clone(),
+                        topology.total_cpus() as usize,
+                        locks,
+                    ))
+                };
+            }
+            protocol::TicketWork::Coordinator(coordinator) => coordinator,
+        };
+        let mut designation = initial;
+        let mut exact_attempts = candidates.len();
+        let mut next_exact = 0usize;
+        let step = |held: &mut protocol::HeldLocks| {
+            while exact_attempts > 0 {
+                let index = next_exact % candidates.len();
+                next_exact = next_exact.wrapping_add(1);
+                exact_attempts -= 1;
+                let candidate = &candidates[index];
+                let Some(permits) = permit_pool.select(|claim| held.candidate_ready(claim))? else {
+                    break;
+                };
+                let claim = claim_for(candidate, &permits);
+                if !held.candidate_ready(&claim)? {
+                    continue;
+                }
+                designation = claim;
+                let target = protocol::canonical_lock_order_with_permits(
+                    &candidate.plan.llc_indices,
+                    crate::flock::FlockMode::Shared,
+                    &candidate.cpu_reservations,
+                    crate::flock::FlockMode::Exclusive,
+                    &designation.permits.iter().copied().collect::<Vec<_>>(),
+                );
+                if let Some(locks) = held.probe_default_exact_if_ready(&designation, &target)? {
+                    host_topology::convert_default_exact_locks(&target, &locks)?;
+                    return Ok(protocol::CoordinatorStep::Complete {
+                        claim: designation.clone(),
+                        value: (index, true, locks),
+                    });
+                }
+            }
+            for (index, candidate) in candidates.iter().enumerate() {
+                let Some(permits) = permit_pool.select(|claim| held.candidate_ready(claim))? else {
+                    break;
+                };
+                let claim = claim_for(candidate, &permits);
+                if !held.candidate_ready(&claim)? {
+                    continue;
+                }
+                designation = claim;
+                let target = protocol::canonical_lock_order_with_permits(
+                    &candidate.plan.llc_indices,
+                    crate::flock::FlockMode::Shared,
+                    &candidate.cpu_reservations,
+                    crate::flock::FlockMode::Shared,
+                    &designation.permits.iter().copied().collect::<Vec<_>>(),
+                );
+                if let Some(locks) = held.probe_complete_if_ready(&designation, &target)? {
+                    return Ok(protocol::CoordinatorStep::Complete {
+                        claim: designation.clone(),
+                        value: (index, false, locks),
+                    });
+                }
+            }
+            Ok(protocol::CoordinatorStep::Waiting {
+                claim: designation.clone(),
+            })
+        };
+        let outcome = match cancelled {
+            Some(cancelled) => {
+                protocol::acquire_as_coordinator_interruptible(coordinator, cancelled, step)?
+            }
+            None => protocol::acquire_as_coordinator(coordinator, step)?,
+        };
+        match outcome {
+            protocol::CoordinatorOutcome::Acquired(acquired) => {
+                let ((index, exact), locks) =
+                    acquired.split_map(|(index, exact, locks)| ((index, exact), locks));
+                if exact {
+                    Ok(RunLocks {
+                        locks,
+                        pinning_plan: Some(candidates[index].plan.clone_unlocked()),
+                        shared_cpu_mask: None,
+                        default_shared_cpu_claim: true,
+                        default_shared_fallback: false,
+                    })
+                } else {
+                    Ok(Self::build_default_shared_run_locks(
+                        candidates[index].cpu_reservations.clone(),
+                        topology.total_cpus() as usize,
+                        locks,
+                    ))
+                }
             }
             protocol::CoordinatorOutcome::Aborted { reason } => {
                 Err(anyhow::Error::new(host_topology::ResourceContention {
@@ -2119,14 +2252,18 @@ impl KtstrVm {
     /// compatible spread placement and returns the authoritative mask.
     ///
     /// Without cached LLC topology, retain the hard performance fence through
-    /// a CPU-SH bridge over the target-sized mask: whole-LLC performance
-    /// reservations also own every constituent CPU EX.
+    /// exact CPU-SH plus weighted CPU/memory admission over a target-sized
+    /// mask: whole-LLC performance reservations also own every constituent CPU
+    /// EX. The legacy bridge remains only for a non-waiting caller without a
+    /// pre-admission owner.
     fn acquire_default_shared_run_locks(
         host_topo: Option<&host_topology::HostTopology>,
         allowed: Vec<usize>,
         vcpus: usize,
         wait: bool,
         cancelled: Option<&AtomicBool>,
+        pending: Option<host_topology::protocol::PendingAdmission>,
+        memory_mib: u32,
     ) -> Result<RunLocks> {
         let target = host_topology::no_perf_cpu_budget(allowed.len(), vcpus);
         if let Some(host_topo) = host_topo {
@@ -2139,6 +2276,8 @@ impl KtstrVm {
                 host_topology::PlacementPolicy::spread_for_process(),
                 wait,
                 cancelled,
+                pending,
+                Some(memory_mib),
             )?;
             let host_topology::LlcPlan { cpus, locks, .. } = plan;
             return Ok(Self::build_default_shared_run_locks(cpus, vcpus, locks));
@@ -2152,11 +2291,211 @@ impl KtstrVm {
         let cpus = (0..target)
             .map(|index| allowed[(start + index) % allowed.len()])
             .collect::<Vec<_>>();
-        match host_topology::acquire_shared_fallback_bridge(&cpus, wait, cancelled)? {
-            host_topology::LockOutcome::Acquired { locks, .. } => {
-                Ok(Self::build_default_shared_run_locks(cpus, vcpus, locks))
+        if !wait && pending.is_none() {
+            return match host_topology::acquire_shared_fallback_bridge(&cpus, false, cancelled)? {
+                host_topology::LockOutcome::Acquired { locks, .. } => {
+                    Ok(Self::build_default_shared_run_locks(cpus, vcpus, locks))
+                }
+                host_topology::LockOutcome::Unavailable(reason) => {
+                    Err(anyhow::Error::new(host_topology::ResourceContention {
+                        reason,
+                    }))
+                }
+            };
+        }
+
+        let (cpus, locks) =
+            Self::acquire_cpu_shared_with_permits(allowed, target, pending, memory_mib, cancelled)?;
+        Ok(Self::build_default_shared_run_locks(cpus, vcpus, locks))
+    }
+
+    /// Topology-independent exact admission used when cache/NUMA discovery is
+    /// unavailable. CPU-SH is sufficient because every performance placement
+    /// owns its constituent CPUs EX. Weighted CPU and memory permits remain in
+    /// the same registry claim as the physical mask, and a PENDING wrapper is
+    /// atomically activated rather than discarded.
+    fn acquire_cpu_shared_with_permits(
+        allowed: Vec<usize>,
+        target: usize,
+        pending: Option<host_topology::protocol::PendingAdmission>,
+        memory_mib: u32,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<(
+        Vec<usize>,
+        host_topology::protocol::Acquired<Vec<std::os::fd::OwnedFd>>,
+    )> {
+        use host_topology::protocol;
+
+        anyhow::ensure!(
+            target > 0 && target <= allowed.len(),
+            "invalid CPU-only admission target"
+        );
+        anyhow::ensure!(
+            allowed.windows(2).all(|pair| pair[0] < pair[1]),
+            "CPU-only admission requires a sorted, unique allowed mask"
+        );
+        let permit_pool = host_topology::VmPermitPool::new_with_preparation(
+            allowed.len(),
+            target,
+            memory_mib,
+            pending.as_ref(),
+        )?;
+        let initial_permits = permit_pool
+            .select_registered()?
+            .expect("a validated VM permit pool can seed CPU-only admission");
+        let start = host_topology::pid_window_offset(std::process::id(), allowed.len());
+        let initial_cpus = (0..target)
+            .map(|offset| allowed[(start + offset) % allowed.len()])
+            .collect::<Vec<_>>();
+        let claim_for = |cpus: &[usize], permits: &host_topology::VmPermitReservation| {
+            host_topology::resource_claim_with_permits(
+                &[],
+                host_topology::LlcLockMode::Shared,
+                cpus,
+                crate::flock::FlockMode::Shared,
+                &permits.all_permits(),
+                permits.admission_class,
+            )
+        };
+        let initial_claim = claim_for(&initial_cpus, &initial_permits);
+        let watch = host_topology::resource_claim_with_permits(
+            &[],
+            host_topology::LlcLockMode::Shared,
+            &allowed,
+            crate::flock::FlockMode::Shared,
+            &permit_pool.watch_permits(),
+            // Concrete selections carry DefaultBorrow if they use the
+            // cooperative fallback suffix; the broad Ordinary watch represents
+            // both selection classes.
+            protocol::AdmissionClass::Ordinary,
+        );
+        let allowed_set = allowed
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let register = |probe: &mut protocol::GrantedProbe| {
+            let designated = probe.designated().clone();
+            let cpus = designated.cpus.iter().copied().collect::<Vec<_>>();
+            anyhow::ensure!(
+                cpus.len() == target && cpus.iter().all(|cpu| allowed_set.contains(cpu)),
+                "CPU-only queue designated a malformed placement"
+            );
+            let permits = designated.permits.iter().copied().collect::<Vec<_>>();
+            let reusable = probe.clone_reusable_permits()?;
+            if let Some(locks) = probe.try_acquire(&designated, || {
+                host_topology::acquire_resources_with_permits_granted_reusing(
+                    &[],
+                    host_topology::LlcLockMode::Shared,
+                    &cpus,
+                    crate::flock::FlockMode::Shared,
+                    &permits,
+                    &reusable,
+                )
+            })? {
+                return Ok(Some((cpus, locks)));
             }
-            host_topology::LockOutcome::Unavailable(reason) => {
+
+            let Some(next_permits) = permit_pool.select(|claim| probe.candidate_ready(claim))?
+            else {
+                probe.reserve(&designated)?;
+                return Ok(None);
+            };
+            let mut next_cpus = Vec::with_capacity(target);
+            for &cpu in allowed.iter().cycle().skip(start).take(allowed.len()) {
+                let cpu_claim = host_topology::resource_claim_with_modes(
+                    &[],
+                    host_topology::LlcLockMode::Shared,
+                    &[cpu],
+                    crate::flock::FlockMode::Shared,
+                );
+                if probe.candidate_ready(&cpu_claim)? {
+                    next_cpus.push(cpu);
+                    if next_cpus.len() == target {
+                        break;
+                    }
+                }
+            }
+            if next_cpus.len() == target {
+                let next = claim_for(&next_cpus, &next_permits);
+                if probe.candidate_ready(&next)? {
+                    probe.reserve(&next)?;
+                    return Ok(None);
+                }
+            }
+            probe.reserve(&designated)?;
+            Ok(None)
+        };
+        let ticket = if let Some(pending) = pending {
+            protocol::activate_pending_ticket(
+                pending,
+                initial_claim.clone(),
+                watch,
+                cancelled,
+                register,
+            )?
+        } else {
+            protocol::register_ticket_or_acquire(initial_claim.clone(), watch, cancelled, register)?
+        };
+        let coordinator = match ticket {
+            protocol::TicketWork::Acquired(acquired) => {
+                let (cpus, locks) = acquired.split_map(|(cpus, locks)| (cpus, locks));
+                return Ok((cpus, locks));
+            }
+            protocol::TicketWork::Coordinator(coordinator) => coordinator,
+        };
+        let mut designation = initial_claim;
+        let step = |held: &mut protocol::HeldLocks| {
+            if let Some(permits) = permit_pool.select(|claim| held.candidate_ready(claim))? {
+                let mut cpus = Vec::with_capacity(target);
+                for &cpu in allowed.iter().cycle().skip(start).take(allowed.len()) {
+                    let cpu_claim = host_topology::resource_claim_with_modes(
+                        &[],
+                        host_topology::LlcLockMode::Shared,
+                        &[cpu],
+                        crate::flock::FlockMode::Shared,
+                    );
+                    if held.candidate_ready(&cpu_claim)? {
+                        cpus.push(cpu);
+                        if cpus.len() == target {
+                            break;
+                        }
+                    }
+                }
+                if cpus.len() == target {
+                    cpus.sort_unstable();
+                    let claim = claim_for(&cpus, &permits);
+                    let target_locks = protocol::canonical_lock_order_with_permits(
+                        &[],
+                        crate::flock::FlockMode::Shared,
+                        &cpus,
+                        crate::flock::FlockMode::Shared,
+                        &permits.all_permits(),
+                    );
+                    if let Some(locks) = held.probe_complete_if_ready(&claim, &target_locks)? {
+                        return Ok(protocol::CoordinatorStep::Complete {
+                            claim,
+                            value: (cpus, locks),
+                        });
+                    }
+                    designation = claim;
+                }
+            }
+            Ok(protocol::CoordinatorStep::Waiting {
+                claim: designation.clone(),
+            })
+        };
+        let outcome = match cancelled {
+            Some(cancelled) => {
+                protocol::acquire_as_coordinator_interruptible(coordinator, cancelled, step)?
+            }
+            None => protocol::acquire_as_coordinator(coordinator, step)?,
+        };
+        match outcome {
+            protocol::CoordinatorOutcome::Acquired(acquired) => {
+                let (cpus, locks) = acquired.split_map(|(cpus, locks)| (cpus, locks));
+                Ok((cpus, locks))
+            }
+            protocol::CoordinatorOutcome::Aborted { reason } => {
                 Err(anyhow::Error::new(host_topology::ResourceContention {
                     reason,
                 }))
@@ -2195,15 +2534,22 @@ impl KtstrVm {
     /// do not apply to interactive shell sessions.
     pub fn run_interactive(&self) -> Result<Option<i32>> {
         let start = Instant::now();
+        let pending = match take_pending_exec_handoff(self)? {
+            Some(pending) => pending,
+            None => host_topology::protocol::register_pending_admission(
+                host_topology::admission_resource_capacity_hint()?,
+            )?,
+        };
         // Keep immutable image preparation outside exact admission just as in
         // the non-interactive path.
         let prepared_initrd = self.prepare_initramfs()?;
+        let memory_mib = self.prepared_memory_mib(prepared_initrd.as_ref())?;
 
         // Resolve admission before allocating guest memory or starting device
         // workers. The returned fds remain live for the whole interactive run,
         // and every placement consumer below uses the matching run-time CPU
         // mask rather than independently consulting the build-time plan.
-        let run_locks = self.acquire_interactive_run_locks()?;
+        let run_locks = self.acquire_interactive_run_locks(pending, memory_mib)?;
         // Capture after admission so this guard is declared after `run_locks`.
         // Rust drops locals in reverse declaration order: every return path
         // therefore restores the caller's original affinity before releasing
@@ -2219,7 +2565,8 @@ impl KtstrVm {
         // no-perf builds carry an empty map.
         let interactive_mbind_node_map: &[Vec<usize>] = &[];
 
-        let (mut vm, kernel_result) = self.create_vm_and_load_kernel(interactive_mbind_node_map)?;
+        let (mut vm, kernel_result) =
+            self.create_vm_and_load_kernel(interactive_mbind_node_map, memory_mib)?;
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -2228,6 +2575,7 @@ impl KtstrVm {
                 kernel_result,
                 prepared_initrd,
                 interactive_mbind_node_map,
+                memory_mib,
             )?;
             self.setup_vcpus(&vm, kr.entry)?;
         }
@@ -2238,6 +2586,7 @@ impl KtstrVm {
                 kernel_result,
                 prepared_initrd,
                 interactive_mbind_node_map,
+                memory_mib,
             )?;
             self.setup_vcpus_aarch64(&vm, kr.entry)?;
         }

@@ -557,6 +557,12 @@ pub mod verifier;
 pub(crate) mod vmm;
 pub mod worker_ready;
 
+/// Internal cargo-ktstr target-runner bridge. Kept at the library root because
+/// cargo-ktstr is a separate crate target while the VMM implementation remains
+/// crate-private.
+#[doc(hidden)]
+pub use vmm::{AdmissionExecGuard, pre_admit_test_cell};
+
 #[cfg(feature = "wprof")]
 pub use vmm::wprof::{WPROF_MIN_MEMORY_MIB, apply_wprof_memory_floor};
 

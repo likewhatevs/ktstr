@@ -3396,7 +3396,7 @@ fn read_bounded_proc_field(path: impl AsRef<std::path::Path>) -> io::Result<Stri
         Err(error) => return Err(error),
     };
     let mut bytes = Vec::with_capacity(OWNED_DESCENDANT_FIELD_LIMIT + 1);
-    file.by_ref()
+    Read::by_ref(&mut file)
         .take((OWNED_DESCENDANT_FIELD_LIMIT + 1) as u64)
         .read_to_end(&mut bytes)?;
     Ok(bounded_diagnostic_field(&bytes))

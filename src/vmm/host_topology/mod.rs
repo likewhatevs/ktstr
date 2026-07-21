@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 // (production + `super::*` tests) compiling unchanged.
 #[cfg(test)]
 use crate::flock::try_flock;
-use crate::flock::{FlockMode, TryFlockOutcome, try_flock_with_witness};
+use crate::flock::{FlockMode, TryFlockOutcome, block_flock_deadline, try_flock_with_witness};
 
 // Cross-invocation acquisition protocol: exact fixed-record claims,
 // work-conserving grants, the coordinator watch, and lifecycle-bound blocking.
@@ -649,9 +649,9 @@ impl HostTopology {
     }
 
     /// Enumerate opportunistic default 1:1 placements using the same mapper as
-    /// performance mode. The only policy differences are no service CPU and
-    /// SH LLC locks. Failure to acquire one is not a reason to queue: default
-    /// immediately falls through to shared admission.
+    /// performance mode. The policy differences are no service CPU and shared
+    /// LLC ownership. Failure to acquire one falls through to shared
+    /// admission instead of changing the guest topology.
     pub(crate) fn default_pinning_candidates_for_cpus(
         &self,
         topo: &super::topology::Topology,
@@ -1817,6 +1817,25 @@ pub(crate) fn resource_claim_with_modes(
     )
 }
 
+pub(crate) fn resource_claim_with_permits(
+    llc_indices: &[usize],
+    llc_mode: LlcLockMode,
+    cpus: &[usize],
+    cpu_mode: FlockMode,
+    permits: &[usize],
+    admission_class: protocol::AdmissionClass,
+) -> protocol::ClaimSet {
+    protocol::ClaimSet::with_permits(
+        llc_indices.iter().copied(),
+        cpus.iter().copied(),
+        permits.iter().copied(),
+        llc_flock_mode(llc_mode),
+        cpu_mode,
+        FlockMode::Exclusive,
+    )
+    .with_admission_class(admission_class)
+}
+
 /// Compose the LLC lockfile prefix from the resolved lock directory.
 /// Returns `{lock_dir}/ktstr-llc-`.
 fn llc_lock_prefix() -> String {
@@ -1827,6 +1846,14 @@ fn llc_lock_prefix() -> String {
 /// Returns `{lock_dir}/ktstr-cpu-`.
 fn cpu_lock_prefix() -> String {
     format!("{}/ktstr-cpu-", crate::cache::resolve_lock_dir().display())
+}
+
+/// Compose the weighted admission-permit lockfile prefix.
+fn permit_lock_prefix() -> String {
+    format!(
+        "{}/ktstr-permit-",
+        crate::cache::resolve_lock_dir().display()
+    )
 }
 
 #[cfg(test)]
@@ -1872,6 +1899,19 @@ pub(crate) fn cpu_lock_path(cpu: usize) -> String {
         }
     }
     format!("{}{cpu}.lock", cpu_lock_prefix())
+}
+
+/// Compose the per-permit lockfile path. Permit identities are independent of
+/// host CPU identities; the registry stores them as a first-class resource
+/// class and physical ownership is always an exclusive flock.
+pub(crate) fn permit_lock_path(permit: usize) -> String {
+    #[cfg(test)]
+    {
+        if let Some(p) = CPU_LOCK_PREFIX_OVERRIDE.with(|p| p.borrow().clone()) {
+            return format!("{p}permit-{permit}.lock");
+        }
+    }
+    format!("{}{permit}.lock", permit_lock_prefix())
 }
 
 /// Try to acquire all resource locks (all-or-nothing, non-blocking,
@@ -1945,99 +1985,61 @@ pub(crate) fn try_acquire_resources(
     }
 }
 
-/// Probe one default 1:1 placement as LLC-SH/CPU-EX, then retain the same
-/// physical footprint as LLC-SH/CPU-SH.
-///
-/// CPU EX is only an instantaneous proof that the exact placement begins on
-/// unshared CPUs. The conversion and weaker HELD publication run under the
-/// registry EX fence, while every current-version ordinary probe holds the
-/// registry SH fence. This closes Linux's non-atomic `flock` conversion window
-/// without turning default exactness into a queue: any physical or registered
-/// conflict returns `Contended`, and the caller immediately tries shared
-/// placement.
-pub(crate) fn try_acquire_default_exact_resources(
-    llc_indices: &[usize],
-    cpus: &[usize],
-    cancelled: Option<&AtomicBool>,
-) -> Result<TryAcquireAll> {
-    let probe =
-        resource_claim_with_modes(llc_indices, LlcLockMode::Shared, cpus, FlockMode::Exclusive);
-    if probe.is_empty() {
-        return Ok(TryAcquireAll::Acquired(protocol::Acquired::untracked(
-            Vec::new(),
-        )));
-    }
-    let published =
-        resource_claim_with_modes(llc_indices, LlcLockMode::Shared, cpus, FlockMode::Shared);
-    let target = protocol::canonical_lock_order_with_modes(
-        llc_indices,
-        FlockMode::Shared,
-        cpus,
-        FlockMode::Exclusive,
-    );
-    let mut unavailable = None;
-    let outcome = protocol::with_exclusive_conversion_fence(&probe, &published, cancelled, || {
-        let locks = match try_acquire_resources_unfenced(
-            llc_indices,
-            LlcLockMode::Shared,
-            cpus,
-            FlockMode::Exclusive,
-        )? {
-            RawAcquireAll::Acquired(locks) => locks,
-            RawAcquireAll::Contended { reason, evidence } => {
-                unavailable = Some((reason, evidence));
-                return Ok(None);
-            }
-        };
-        debug_assert_eq!(target.len(), locks.len());
-        for (resource, fd) in target.iter().zip(&locks) {
-            if matches!(resource.resource, protocol::ResourceKey::Cpu(_))
-                && !crate::flock::try_convert_flock(fd, FlockMode::Shared)?
-            {
-                unavailable = Some((
-                    format!(
-                        "{} changed owners while converting default exact placement to shared",
-                        resource.path
-                    ),
-                    None,
-                ));
-                return Ok(None);
-            }
-        }
-        Ok(Some(locks))
-    })?;
-    match outcome {
-        protocol::ConversionFence::Acquired(locks) => Ok(TryAcquireAll::Acquired(locks)),
-        protocol::ConversionFence::Fenced => Ok(TryAcquireAll::Contended {
-            reason: "reservation claimed by an earlier registered ticket".into(),
-            evidence: None,
-        }),
-        protocol::ConversionFence::Unavailable => {
-            let (reason, evidence) = unavailable.unwrap_or_else(|| {
-                (
-                    "default exact placement became unavailable during conversion".into(),
-                    None,
-                )
-            });
-            Ok(TryAcquireAll::Contended { reason, evidence })
-        }
-    }
-}
-
 fn try_acquire_resources_unfenced(
     llc_indices: &[usize],
     llc_mode: LlcLockMode,
     cpus: &[usize],
     cpu_mode: FlockMode,
 ) -> Result<RawAcquireAll> {
-    let target = protocol::canonical_lock_order_with_modes(
+    try_acquire_resources_unfenced_with_permits(llc_indices, llc_mode, cpus, cpu_mode, &[])
+}
+
+fn try_acquire_resources_unfenced_with_permits(
+    llc_indices: &[usize],
+    llc_mode: LlcLockMode,
+    cpus: &[usize],
+    cpu_mode: FlockMode,
+    permits: &[usize],
+) -> Result<RawAcquireAll> {
+    try_acquire_resources_unfenced_with_permits_reusing(
+        llc_indices,
+        llc_mode,
+        cpus,
+        cpu_mode,
+        permits,
+        &[],
+    )
+}
+
+fn try_acquire_resources_unfenced_with_permits_reusing(
+    llc_indices: &[usize],
+    llc_mode: LlcLockMode,
+    cpus: &[usize],
+    cpu_mode: FlockMode,
+    permits: &[usize],
+    reusable_permits: &[(usize, std::os::fd::OwnedFd)],
+) -> Result<RawAcquireAll> {
+    let target = protocol::canonical_lock_order_with_permits(
         llc_indices,
         llc_flock_mode(llc_mode),
         cpus,
         cpu_mode,
+        permits,
     );
     let mut locks = Vec::with_capacity(target.len());
     for lock in &target {
+        if let protocol::ResourceKey::Permit(permit) = lock.resource
+            && let Some((_, fd)) = reusable_permits
+                .iter()
+                .find(|(candidate, _)| *candidate == permit)
+        {
+            // dup(2) retains the same open-file description and therefore the
+            // already-held flock.  The duplicate becomes part of the exact
+            // reservation; the preparation owner can close its copy only
+            // after the registry publishes HELD.
+            locks.push(fd.try_clone()?);
+            continue;
+        }
         match try_flock_with_witness(&lock.path, lock.mode)? {
             TryFlockOutcome::Acquired(fd) => locks.push(fd),
             // Dropping `locks` on return releases everything taken
@@ -2058,14 +2060,40 @@ fn try_acquire_resources_unfenced(
     Ok(RawAcquireAll::Acquired(locks))
 }
 
-pub(crate) fn acquire_resources_granted_with_evidence(
+pub(crate) fn acquire_resources_with_permits_granted(
     llc_indices: &[usize],
     llc_mode: LlcLockMode,
     cpus: &[usize],
     cpu_mode: FlockMode,
+    permits: &[usize],
+) -> Result<protocol::ProbeOutcome<Vec<std::os::fd::OwnedFd>>> {
+    acquire_resources_with_permits_granted_reusing(
+        llc_indices,
+        llc_mode,
+        cpus,
+        cpu_mode,
+        permits,
+        &[],
+    )
+}
+
+pub(crate) fn acquire_resources_with_permits_granted_reusing(
+    llc_indices: &[usize],
+    llc_mode: LlcLockMode,
+    cpus: &[usize],
+    cpu_mode: FlockMode,
+    permits: &[usize],
+    reusable_permits: &[(usize, std::os::fd::OwnedFd)],
 ) -> Result<protocol::ProbeOutcome<Vec<std::os::fd::OwnedFd>>> {
     Ok(
-        match try_acquire_resources_unfenced(llc_indices, llc_mode, cpus, cpu_mode)? {
+        match try_acquire_resources_unfenced_with_permits_reusing(
+            llc_indices,
+            llc_mode,
+            cpus,
+            cpu_mode,
+            permits,
+            reusable_permits,
+        )? {
             RawAcquireAll::Acquired(locks) => protocol::ProbeOutcome::Acquired(locks),
             RawAcquireAll::Contended {
                 evidence: Some(evidence),
@@ -2078,11 +2106,72 @@ pub(crate) fn acquire_resources_granted_with_evidence(
     )
 }
 
-/// Diffuse a pid across `[0, max_start)` so adjacent pids do not
-/// land on adjacent offsets. Used by the default-else run-lock path
-/// (`KtstrVm::acquire_default_run_locks`) to pick a starting LLC slot so
-/// two ktstr invocations launching simultaneously don't both probe slot 0
-/// first.
+/// Prove a default placement starts on unshared CPUs, then retain the same
+/// footprint cooperatively. The ready registry designation is already SH, so
+/// no incompatible current-version EX claimant can enter while Linux converts
+/// the CPU flocks from EX to SH.
+pub(crate) fn acquire_default_exact_with_permits_granted(
+    llc_indices: &[usize],
+    cpus: &[usize],
+    permits: &[usize],
+) -> Result<protocol::ProbeOutcome<Vec<std::os::fd::OwnedFd>>> {
+    acquire_default_exact_with_permits_granted_reusing(llc_indices, cpus, permits, &[])
+}
+
+pub(crate) fn acquire_default_exact_with_permits_granted_reusing(
+    llc_indices: &[usize],
+    cpus: &[usize],
+    permits: &[usize],
+    reusable_permits: &[(usize, std::os::fd::OwnedFd)],
+) -> Result<protocol::ProbeOutcome<Vec<std::os::fd::OwnedFd>>> {
+    let target = protocol::canonical_lock_order_with_permits(
+        llc_indices,
+        FlockMode::Shared,
+        cpus,
+        FlockMode::Exclusive,
+        permits,
+    );
+    let locks = match try_acquire_resources_unfenced_with_permits_reusing(
+        llc_indices,
+        LlcLockMode::Shared,
+        cpus,
+        FlockMode::Exclusive,
+        permits,
+        reusable_permits,
+    )? {
+        RawAcquireAll::Acquired(locks) => locks,
+        RawAcquireAll::Contended {
+            evidence: Some(evidence),
+            ..
+        } => return Ok(protocol::ProbeOutcome::Contended(evidence)),
+        RawAcquireAll::Contended { evidence: None, .. } => {
+            anyhow::bail!("default exact probe lost contention evidence")
+        }
+    };
+    convert_default_exact_locks(&target, &locks)?;
+    Ok(protocol::ProbeOutcome::Acquired(locks))
+}
+
+pub(crate) fn convert_default_exact_locks(
+    target: &[protocol::ResourceLock],
+    locks: &[std::os::fd::OwnedFd],
+) -> Result<()> {
+    use rustix::fs::{FlockOperation, flock};
+
+    debug_assert_eq!(target.len(), locks.len());
+    for (resource, fd) in target.iter().zip(locks) {
+        if matches!(resource.resource, protocol::ResourceKey::Cpu(_)) {
+            flock(fd, FlockOperation::LockShared)
+                .map_err(|errno| std::io::Error::from_raw_os_error(errno.raw_os_error()))
+                .with_context(|| format!("convert {} from exclusive to shared", resource.path))?;
+        }
+    }
+    Ok(())
+}
+
+/// Diffuse a pid across `[0, max_start)` so adjacent processes do not land on
+/// adjacent offsets. Topology and permit planners use this to rotate otherwise
+/// equivalent choices across a launch herd.
 ///
 /// Bare `pid % max_start` collapses adjacent pids onto adjacent
 /// offsets (Linux's pid allocator walks `pid_max` sequentially),
@@ -2474,6 +2563,9 @@ pub struct LlcPlan {
     /// Preserves LLC ordering: CPUs from `locked_llcs[0]` come
     /// before CPUs from `locked_llcs[1]`, etc.
     pub cpus: Vec<usize>,
+    /// Weighted host-admission permits held atomically with the topology
+    /// locks. Empty only for ownership-free/static planning paths.
+    pub(crate) permits: Vec<usize>,
     /// Union of NUMA nodes hosting the locked LLCs. When the plan
     /// spans > 1 node (cross-node spill — seed node exhausted, plan
     /// spilled to nearest-by-distance neighbors), `mems`
@@ -3101,36 +3193,9 @@ fn try_acquire_llc_plan_locks_with_evidence(
 /// exact reservations. Shared VM reservations use process-rotated
 /// [`PlacementPolicy::Spread`] (see the enum docs for the clustering failure
 /// Spread exists to prevent); direct fixed-size kernel builds use
-/// [`PlacementPolicy::Consolidate`] for cache-domain packing. Elastic build
-/// admission has a dedicated entry point which consolidates only its LLC
-/// footprint and spreads CPU selection within it. Both policies use the host
-/// distance matrix from [`crate::topology::TestTopology`] so spill order
-/// matches actual NUMA cost. Hosts whose
-/// `/sys/devices/system/node/*/distance` failed to parse degrade to a
-/// numerically-adjacent ordering via the distance closure (`10` for
-/// same-node, `20` for cross-node).
-pub fn acquire_llc_plan(
-    topo: &HostTopology,
-    test_topo: &crate::topology::TestTopology,
-    cpu_cap: Option<CpuCap>,
-    policy: PlacementPolicy,
-    wait: bool,
-) -> Result<LlcPlan> {
-    acquire_llc_plan_impl(LlcPlanAcquireRequest {
-        topo,
-        test_topo,
-        cpu_cap,
-        llc_policy: policy,
-        cpu_policy: CpuSelectionPolicy::WithinEachLlc(policy),
-        wait,
-        sizing: LlcPlanSizing::Exact,
-        cancelled: None,
-    })
-}
-
-/// Interruptible form of [`acquire_llc_plan`] for VM admission. It is the same
-/// exact LLC-SH/CPU-SH planner and queue; only cancellation is additionally
-/// observed while waiting behind hard exclusive pressure.
+/// Exact LLC-SH/CPU-SH planner used for cooperative VM admission. It acquires
+/// topology locks and weighted admission permits in one registry claim, and
+/// observes cancellation while waiting behind hard-exclusive pressure.
 pub(crate) fn acquire_llc_plan_interruptible(
     topo: &HostTopology,
     test_topo: &crate::topology::TestTopology,
@@ -3138,6 +3203,8 @@ pub(crate) fn acquire_llc_plan_interruptible(
     policy: PlacementPolicy,
     wait: bool,
     cancelled: Option<&AtomicBool>,
+    pending: Option<protocol::PendingAdmission>,
+    memory_mib: Option<u32>,
 ) -> Result<LlcPlan> {
     acquire_llc_plan_impl(LlcPlanAcquireRequest {
         topo,
@@ -3147,7 +3214,10 @@ pub(crate) fn acquire_llc_plan_interruptible(
         cpu_policy: CpuSelectionPolicy::WithinEachLlc(policy),
         wait,
         sizing: LlcPlanSizing::Exact,
+        permit_admission: PermitAdmission::Cooperative,
         cancelled,
+        pending,
+        memory_mib,
     })
 }
 
@@ -3181,8 +3251,1166 @@ pub(crate) fn acquire_elastic_build_llc_plan(
         cpu_policy: CpuSelectionPolicy::least_held_for_process(),
         wait: true,
         sizing: LlcPlanSizing::Elastic,
+        permit_admission: PermitAdmission::Build,
         cancelled,
+        pending: None,
+        memory_mib: None,
     })
+}
+
+pub(crate) fn acquire_build_llc_plan(
+    topo: &HostTopology,
+    test_topo: &crate::topology::TestTopology,
+    cpu_cap: Option<CpuCap>,
+    wait: bool,
+    cancelled: Option<&AtomicBool>,
+) -> Result<LlcPlan> {
+    acquire_llc_plan_impl(LlcPlanAcquireRequest {
+        topo,
+        test_topo,
+        cpu_cap,
+        llc_policy: PlacementPolicy::Consolidate,
+        cpu_policy: CpuSelectionPolicy::WithinEachLlc(PlacementPolicy::Consolidate),
+        wait,
+        sizing: LlcPlanSizing::Exact,
+        permit_admission: PermitAdmission::Build,
+        cancelled,
+        pending: None,
+        memory_mib: None,
+    })
+}
+
+/// Cooperative work may oversubscribe each allowed host CPU by this factor.
+/// A full-width VM therefore consumes one of four host-width lanes, while the
+/// physical CPU/LLC SH locks continue to describe the topology it may share.
+const COOPERATIVE_OVERSUBSCRIPTION: usize = 4;
+const BUILD_RESERVED_PERCENT: usize = 30;
+const MEMORY_PERMIT_CHUNK_MIB: usize = 256;
+const HOST_MEMORY_RESERVE_MIB: usize = 4 * 1024;
+const HOST_MEMORY_RESERVE_PERCENT: usize = 10;
+const PREPARATION_WORKING_SET_MIB: usize = 2 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PermitAdmission {
+    None,
+    Cooperative,
+    Build,
+}
+
+struct AdmissionPermitPool {
+    general: Vec<usize>,
+    reserved: Vec<usize>,
+}
+
+impl AdmissionPermitPool {
+    fn for_host(cpu_count: usize) -> Self {
+        let total_count = cpu_count.saturating_mul(COOPERATIVE_OVERSUBSCRIPTION);
+        let reserved_count = total_count
+            .saturating_mul(BUILD_RESERVED_PERCENT)
+            .div_ceil(100)
+            .min(total_count.saturating_sub(1));
+        let general_count = total_count - reserved_count;
+        Self {
+            general: (0..general_count).collect(),
+            reserved: (general_count..total_count).collect(),
+        }
+    }
+
+    fn all(&self) -> impl Iterator<Item = usize> + '_ {
+        self.general.iter().chain(&self.reserved).copied()
+    }
+
+    fn len(&self) -> usize {
+        self.general.len() + self.reserved.len()
+    }
+
+    /// Build concurrency is bounded independently from cooperative VM CPU
+    /// accounting. Default VMs may occupy the cooperative reserved suffix, but
+    /// that ownership is deliberately soft: a build never waits for those
+    /// borrower OFDs and is constrained only by this build-only namespace plus
+    /// the ordinary physical LLC/CPU SH locks. Performance CPU/LLC EX remains
+    /// the hard fence.
+    fn for_build_host(cpu_count: usize) -> Result<Self> {
+        Ok(Self {
+            general: build_permit_range(cpu_count)?.collect(),
+            reserved: Vec::new(),
+        })
+    }
+}
+
+struct MemoryPermitPool {
+    permits: Vec<usize>,
+    usable_mib: usize,
+}
+
+fn possible_cpu_width() -> usize {
+    std::fs::read_to_string("/sys/devices/system/cpu/possible")
+        .ok()
+        .map(|raw| parse_cpu_list_lenient(&raw))
+        .and_then(|cpus| cpus.into_iter().max())
+        .unwrap_or(63)
+        .saturating_add(1)
+}
+
+fn memory_permit_base_for_possible_width(possible_width: usize) -> usize {
+    possible_width.saturating_mul(COOPERATIVE_OVERSUBSCRIPTION)
+}
+
+/// Exclusive permit identities below this bound account cooperative VM CPU
+/// pressure. Later permit namespaces account memory, preparation tokens, and
+/// builds independently. The queue uses the same boundary to measure a full
+/// backfill wave in resource units rather than in an arbitrary callback count.
+pub(super) fn cooperative_cpu_permit_end() -> usize {
+    memory_permit_base_for_possible_width(possible_cpu_width())
+}
+
+fn host_mem_total_mib() -> Result<usize> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").context("read /proc/meminfo")?;
+    let kib = meminfo
+        .lines()
+        .find_map(|line| {
+            let value = line.strip_prefix("MemTotal:")?.trim();
+            value.split_whitespace().next()?.parse::<usize>().ok()
+        })
+        .ok_or_else(|| anyhow::anyhow!("/proc/meminfo does not contain a valid MemTotal"))?;
+    Ok(kib / 1024)
+}
+
+fn memory_capacity_from_total(total_mib: usize) -> (usize, usize) {
+    let percentage = total_mib
+        .saturating_mul(HOST_MEMORY_RESERVE_PERCENT)
+        .div_ceil(100);
+    let reserve = HOST_MEMORY_RESERVE_MIB.max(percentage).min(total_mib);
+    let usable_mib = total_mib.saturating_sub(reserve);
+    (usable_mib, usable_mib / MEMORY_PERMIT_CHUNK_MIB)
+}
+
+impl MemoryPermitPool {
+    fn for_host() -> Result<Self> {
+        let total_mib = host_mem_total_mib()?;
+        let (usable_mib, chunks) = memory_capacity_from_total(total_mib);
+        let base = memory_permit_base_for_possible_width(possible_cpu_width());
+        let end = base
+            .checked_add(chunks)
+            .ok_or_else(|| anyhow::anyhow!("memory permit namespace overflow"))?;
+        Ok(Self {
+            permits: (base..end).collect(),
+            usable_mib,
+        })
+    }
+
+    fn required_chunks(&self, memory_mib: u32) -> Result<usize> {
+        let requested = usize::try_from(memory_mib).context("guest memory does not fit usize")?;
+        let chunks = requested.div_ceil(MEMORY_PERMIT_CHUNK_MIB);
+        anyhow::ensure!(
+            chunks <= self.permits.len(),
+            "guest requests {requested}MiB, exceeding the host admission capacity of {}MiB \
+             after reserving max({HOST_MEMORY_RESERVE_MIB}MiB, \
+             {HOST_MEMORY_RESERVE_PERCENT}% of MemTotal) for the host",
+            self.usable_mib,
+        );
+        Ok(chunks)
+    }
+}
+
+/// Capacity held while a test process prepares immutable artifacts and waits
+/// for its exact run placement.  Preparation is deliberately expressed in the
+/// same abstract CPU and memory permit namespaces as a running VM: otherwise a
+/// storm could consume one complete RAM budget in prepared test processes and
+/// a second complete budget in guests.
+pub(super) struct PreparationPermit {
+    pub(super) index: usize,
+    pub(super) token_permit: usize,
+    pub(super) cpu_permits: Vec<usize>,
+    pub(super) memory_permits: Vec<usize>,
+    pub(super) permit_fds: Vec<(usize, std::os::fd::OwnedFd)>,
+    /// One real CPU-SH owner matching `affinity_cpu`. The PENDING claim
+    /// publishes the same CPU, so a performance reservation cannot enter
+    /// between placement and `sched_setaffinity`.
+    affinity_lock: Option<std::os::fd::OwnedFd>,
+    affinity_cpu: usize,
+    original_affinity: Vec<usize>,
+    affinity_constrained: bool,
+}
+
+impl PreparationPermit {
+    fn all_permits(&self) -> Vec<usize> {
+        let mut permits =
+            Vec::with_capacity(1 + self.cpu_permits.len() + self.memory_permits.len());
+        permits.push(self.token_permit);
+        permits.extend_from_slice(&self.cpu_permits);
+        permits.extend_from_slice(&self.memory_permits);
+        permits.sort_unstable();
+        permits
+    }
+
+    pub(super) fn claim(&self) -> protocol::ClaimSet {
+        let cpu = AdmissionPermitPool::for_host(possible_cpu_width());
+        let admission_class = if self
+            .cpu_permits
+            .iter()
+            .any(|permit| cpu.reserved.contains(permit))
+        {
+            protocol::AdmissionClass::DefaultBorrow
+        } else {
+            protocol::AdmissionClass::Ordinary
+        };
+        resource_claim_with_permits(
+            &[],
+            LlcLockMode::Shared,
+            &[self.affinity_cpu],
+            FlockMode::Shared,
+            &self.all_permits(),
+            admission_class,
+        )
+    }
+
+    pub(super) fn clone_permit_fds(&self) -> Result<Vec<(usize, std::os::fd::OwnedFd)>> {
+        anyhow::ensure!(
+            self.all_permits().len() == self.permit_fds.len(),
+            "preparation permit {} has inconsistent resource/fd counts",
+            self.index,
+        );
+        self.permit_fds
+            .iter()
+            .map(|(permit, fd)| Ok((*permit, fd.try_clone()?)))
+            .collect()
+    }
+
+    pub(super) fn affinity_handoff_parts(&self) -> Result<(usize, std::os::fd::RawFd, &[usize])> {
+        use std::os::fd::AsRawFd;
+        anyhow::ensure!(
+            self.affinity_constrained,
+            "preparation affinity is not active at exec handoff",
+        );
+        let fd = self
+            .affinity_lock
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("preparation physical CPU lock was already released"))?;
+        Ok((self.affinity_cpu, fd.as_raw_fd(), &self.original_affinity))
+    }
+
+    pub(super) fn constrain_affinity(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self.affinity_lock.is_some(),
+            "preparation physical CPU lock was already released",
+        );
+        if self.affinity_constrained {
+            return Ok(());
+        }
+        // Mark the transition active before the multi-thread walk. If a later
+        // thread rejects the mask after earlier threads accepted it, Drop must
+        // still restore the original mask rather than leaving a partially
+        // pinned process behind.
+        self.affinity_constrained = true;
+        if let Err(error) = set_process_thread_affinity(&[self.affinity_cpu]) {
+            let restore = self.restore_affinity();
+            return match restore {
+                Ok(()) => Err(error).with_context(|| {
+                    format!(
+                        "pin preparation work to admitted host CPU {}",
+                        self.affinity_cpu
+                    )
+                }),
+                Err(restore) => Err(error).with_context(|| {
+                    format!(
+                        "pin preparation work to admitted host CPU {}; restoring the original \
+                         mask also failed: {restore:#}",
+                        self.affinity_cpu
+                    )
+                }),
+            };
+        }
+        Ok(())
+    }
+
+    pub(super) fn restore_affinity(&mut self) -> Result<()> {
+        if !self.affinity_constrained {
+            return Ok(());
+        }
+        set_process_thread_affinity(&self.original_affinity)
+            .context("restore affinity before exact VM admission")?;
+        self.affinity_constrained = false;
+        Ok(())
+    }
+
+    /// The exact registry claim has atomically replaced PENDING, so its
+    /// predecessor fence now protects this process while it probes the exact
+    /// physical target. Drop the preparation CPU-SH and weighted CPU/memory
+    /// flocks here; retaining any of them makes the exact claim observe its
+    /// own preparation owner as unavailable. The preparation token stays held
+    /// until exact HELD publication, bounding the number of resident prepared
+    /// processes without overlapping the exact claim's resource footprint.
+    pub(super) fn release_resources_for_exact(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            !self.affinity_constrained,
+            "preparation affinity must be restored before exact activation",
+        );
+        drop(self.affinity_lock.take());
+        let token = self
+            .permit_fds
+            .iter()
+            .position(|(permit, _)| *permit == self.token_permit)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "preparation permit {} lost token permit {}",
+                    self.index,
+                    self.token_permit,
+                )
+            })?;
+        let (_, token_fd) = self.permit_fds.swap_remove(token);
+        self.permit_fds.clear();
+        self.permit_fds.push((self.token_permit, token_fd));
+        self.cpu_permits.clear();
+        self.memory_permits.clear();
+        Ok(())
+    }
+
+    pub(super) fn imported(
+        index: usize,
+        token_permit: usize,
+        cpu_permits: Vec<usize>,
+        memory_permits: Vec<usize>,
+        permit_fds: Vec<(usize, std::os::fd::OwnedFd)>,
+        affinity_cpu: usize,
+        affinity_lock: std::os::fd::OwnedFd,
+        original_affinity: Vec<usize>,
+    ) -> Self {
+        Self {
+            index,
+            token_permit,
+            cpu_permits,
+            memory_permits,
+            permit_fds,
+            affinity_lock: Some(affinity_lock),
+            affinity_cpu,
+            original_affinity,
+            // A same-PID exec preserves the calling thread's mask.
+            affinity_constrained: true,
+        }
+    }
+}
+
+impl Drop for PreparationPermit {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore_affinity() {
+            tracing::warn!(
+                error = %error,
+                preparation_cpu = self.affinity_cpu,
+                "failed to restore process affinity while releasing preparation admission"
+            );
+        }
+    }
+}
+
+/// Apply one affinity mask to every thread currently in this process. The
+/// calling thread is changed first, so newly-created children inherit the new
+/// mask; the bounded rescan closes the race with threads spawned by an older
+/// already-running worker while the first `/proc/self/task` walk is in flight.
+fn set_process_thread_affinity(cpus: &[usize]) -> Result<()> {
+    anyhow::ensure!(!cpus.is_empty(), "cannot install an empty affinity mask");
+    let max_cpu = cpus.iter().copied().max().unwrap_or(0);
+    let word_bits = libc::c_ulong::BITS as usize;
+    let words = max_cpu
+        .checked_div(word_bits)
+        .and_then(|word| word.checked_add(1))
+        .ok_or_else(|| anyhow::anyhow!("affinity mask size overflow"))?;
+    let mut mask = vec![0 as libc::c_ulong; words];
+    for &cpu in cpus {
+        mask[cpu / word_bits] |= (1 as libc::c_ulong) << (cpu % word_bits);
+    }
+    let bytes = std::mem::size_of_val(mask.as_slice());
+    let apply = |tid: libc::pid_t| -> Result<()> {
+        // SAFETY: `mask` is live for `bytes` and the syscall only reads it.
+        let result =
+            unsafe { libc::syscall(libc::SYS_sched_setaffinity, tid, bytes, mask.as_ptr()) };
+        if result == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            return Err(error).with_context(|| format!("sched_setaffinity tid={tid}"));
+        }
+        Ok(())
+    };
+
+    // `0` is the calling thread and establishes inheritance before walking
+    // the rest of the process.
+    apply(0)?;
+    let mut previous = std::collections::BTreeSet::new();
+    for _ in 0..8 {
+        let tids = std::fs::read_dir("/proc/self/task")
+            .context("enumerate process threads for affinity transition")?
+            .filter_map(|entry| {
+                entry
+                    .ok()?
+                    .file_name()
+                    .to_str()?
+                    .parse::<libc::pid_t>()
+                    .ok()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        for &tid in &tids {
+            apply(tid)?;
+        }
+        if tids == previous {
+            return Ok(());
+        }
+        previous = tids;
+    }
+    anyhow::bail!("process thread set did not stabilize during affinity transition")
+}
+
+const PREPARATION_MEMORY_FRACTION: usize = 4;
+const PREPARATION_CPU_PERMITS: usize = COOPERATIVE_OVERSUBSCRIPTION;
+
+fn preparation_token_range() -> Result<std::ops::Range<usize>> {
+    let possible_width = possible_cpu_width();
+    let cpu = AdmissionPermitPool::for_host(possible_width);
+    let memory = MemoryPermitPool::for_host()?;
+    let memory_per_slot = PREPARATION_WORKING_SET_MIB.div_ceil(MEMORY_PERMIT_CHUNK_MIB);
+    anyhow::ensure!(
+        memory_per_slot > 0,
+        "preparation memory weight resolved to zero"
+    );
+
+    // At most one quarter of the common memory-permit namespace can be tied
+    // up by preparation.  The remaining three quarters guarantee conversion
+    // headroom for READY work even when every preparation slot is occupied.
+    let memory_slots = memory.permits.len() / PREPARATION_MEMORY_FRACTION / memory_per_slot;
+    let cpu_slots = cpu.len() / PREPARATION_CPU_PERMITS;
+    let slots = memory_slots
+        .min(cpu_slots)
+        .min(possible_width.saturating_mul(2));
+    anyhow::ensure!(
+        slots > 0,
+        "host admission capacity cannot fund one {PREPARATION_WORKING_SET_MIB}MiB preparation slot"
+    );
+
+    let base = memory.permits.last().copied().map_or_else(
+        || memory_permit_base_for_possible_width(possible_width),
+        |last| last.saturating_add(1),
+    );
+    let end = base
+        .checked_add(slots)
+        .ok_or_else(|| anyhow::anyhow!("preparation token namespace overflow"))?;
+    Ok(base..end)
+}
+
+fn build_permit_range(cpu_count: usize) -> Result<std::ops::Range<usize>> {
+    let preparation = preparation_token_range()?;
+    let cooperative_capacity = cpu_count.saturating_mul(COOPERATIVE_OVERSUBSCRIPTION);
+    let build_capacity = cooperative_capacity
+        .saturating_mul(BUILD_RESERVED_PERCENT)
+        .div_ceil(100)
+        .max(1);
+    let base = preparation.end;
+    let end = base
+        .checked_add(build_capacity)
+        .ok_or_else(|| anyhow::anyhow!("build permit namespace overflow"))?;
+    Ok(base..end)
+}
+
+/// Choose and physically hold the CPU on which immutable preparation runs.
+/// CPU-EX claims/holders are excluded. Among the remaining SH-compatible
+/// CPUs, prefer the complement of live Build-class claims, then the lowest
+/// holder count, with a process/permit-derived rotation as the final tie
+/// breaker. If builds cover the complete allowed set the first key is equal
+/// and preparation cooperatively overlaps the least-held CPU instead of
+/// stalling an otherwise runnable host.
+enum PreparationAffinityAttempt {
+    Acquired(usize, std::os::fd::OwnedFd),
+    Contended(std::path::PathBuf),
+}
+
+fn try_acquire_preparation_affinity_cpu(
+    allowed: &[usize],
+    rotation: usize,
+) -> Result<PreparationAffinityAttempt> {
+    anyhow::ensure!(!allowed.is_empty(), "preparation has no allowed host CPU");
+    let required = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        allowed.iter().copied(),
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let snapshot = protocol::registered_claim_snapshot(&required)?;
+    let start = rotation % allowed.len();
+    let mut candidates = Vec::with_capacity(allowed.len());
+    for (rank, &cpu) in allowed
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(allowed.len())
+        .enumerate()
+    {
+        let shared = protocol::ClaimSet::with_modes(
+            std::iter::empty(),
+            [cpu],
+            FlockMode::Shared,
+            FlockMode::Shared,
+        );
+        candidates.push((
+            snapshot.conflicts(&shared)? || snapshot.cpu_exclusive_held(cpu)?,
+            snapshot.cpu_build_claimed(cpu)?,
+            snapshot.cpu_holder_count(cpu)?,
+            rank,
+            cpu,
+        ));
+    }
+    candidates.sort_unstable();
+    let mut first_contended = None;
+    for (registry_blocked, _, _, _, cpu) in candidates {
+        let path = std::path::PathBuf::from(cpu_lock_path(cpu));
+        if registry_blocked {
+            first_contended.get_or_insert(path);
+            continue;
+        }
+        match try_flock_with_witness(cpu_lock_path(cpu), FlockMode::Shared)? {
+            TryFlockOutcome::Acquired(fd) => {
+                return Ok(PreparationAffinityAttempt::Acquired(cpu, fd));
+            }
+            TryFlockOutcome::Contended(_) => {
+                first_contended.get_or_insert(path);
+            }
+        }
+    }
+    Ok(PreparationAffinityAttempt::Contended(
+        first_contended.unwrap_or_else(|| std::path::PathBuf::from(cpu_lock_path(allowed[start]))),
+    ))
+}
+
+enum PreparationPermitAttempt {
+    Acquired(PreparationPermit, protocol::ClaimSet),
+    Contended(std::path::PathBuf, FlockMode),
+}
+
+fn try_acquire_preparation_permit(
+    index: usize,
+    token_permit: usize,
+    rotation: usize,
+    preheld_token: Option<std::os::fd::OwnedFd>,
+) -> Result<PreparationPermitAttempt> {
+    let cpu = AdmissionPermitPool::for_host(possible_cpu_width());
+    let memory = MemoryPermitPool::for_host()?;
+    let memory_required = PREPARATION_WORKING_SET_MIB.div_ceil(MEMORY_PERMIT_CHUNK_MIB);
+    let mut permit_fds = Vec::with_capacity(1 + PREPARATION_CPU_PERMITS + memory_required);
+
+    let acquire_one = |permit| -> Result<Option<std::os::fd::OwnedFd>> {
+        match try_flock_with_witness(permit_lock_path(permit), FlockMode::Exclusive)? {
+            TryFlockOutcome::Acquired(fd) => Ok(Some(fd)),
+            TryFlockOutcome::Contended(_) => Ok(None),
+        }
+    };
+    let token_fd = if let Some(fd) = preheld_token {
+        fd
+    } else if let Some(fd) = acquire_one(token_permit)? {
+        fd
+    } else {
+        return Ok(PreparationPermitAttempt::Contended(
+            std::path::PathBuf::from(permit_lock_path(token_permit)),
+            FlockMode::Exclusive,
+        ));
+    };
+    permit_fds.push((token_permit, token_fd));
+
+    let ordered_cpu = cpu.all().collect::<Vec<_>>();
+    let cpu_start = rotation % ordered_cpu.len();
+    let mut first_cpu_contention = None;
+    for offset in 0..ordered_cpu.len() {
+        let permit = ordered_cpu[(cpu_start + offset) % ordered_cpu.len()];
+        if let Some(fd) = acquire_one(permit)? {
+            permit_fds.push((permit, fd));
+            if permit_fds.len() == 1 + PREPARATION_CPU_PERMITS {
+                break;
+            }
+        } else {
+            first_cpu_contention
+                .get_or_insert_with(|| std::path::PathBuf::from(permit_lock_path(permit)));
+        }
+    }
+    if permit_fds.len() != 1 + PREPARATION_CPU_PERMITS {
+        return Ok(PreparationPermitAttempt::Contended(
+            first_cpu_contention.expect("incomplete CPU preparation weight observed contention"),
+            FlockMode::Exclusive,
+        ));
+    }
+    let cpu_permits = permit_fds[1..]
+        .iter()
+        .map(|(permit, _)| *permit)
+        .collect::<Vec<_>>();
+
+    let memory_start = rotation % memory.permits.len();
+    let mut first_memory_contention = None;
+    for offset in 0..memory.permits.len() {
+        let permit = memory.permits[(memory_start + offset) % memory.permits.len()];
+        if let Some(fd) = acquire_one(permit)? {
+            permit_fds.push((permit, fd));
+            if permit_fds.len() == 1 + PREPARATION_CPU_PERMITS + memory_required {
+                break;
+            }
+        } else {
+            first_memory_contention
+                .get_or_insert_with(|| std::path::PathBuf::from(permit_lock_path(permit)));
+        }
+    }
+    if permit_fds.len() != 1 + PREPARATION_CPU_PERMITS + memory_required {
+        return Ok(PreparationPermitAttempt::Contended(
+            first_memory_contention
+                .expect("incomplete memory preparation weight observed contention"),
+            FlockMode::Exclusive,
+        ));
+    }
+    let memory_permits = permit_fds[1 + PREPARATION_CPU_PERMITS..]
+        .iter()
+        .map(|(permit, _)| *permit)
+        .collect::<Vec<_>>();
+    let original_affinity = host_allowed_cpus();
+    anyhow::ensure!(
+        !original_affinity.is_empty(),
+        "could not determine allowed CPU set for preparation admission",
+    );
+    let affinity_rotation = cpu_permits
+        .iter()
+        .fold(rotation, |seed, permit| seed.rotate_left(7) ^ permit);
+    let (affinity_cpu, affinity_lock) =
+        match try_acquire_preparation_affinity_cpu(&original_affinity, affinity_rotation)? {
+            PreparationAffinityAttempt::Acquired(cpu, fd) => (cpu, fd),
+            PreparationAffinityAttempt::Contended(path) => {
+                return Ok(PreparationPermitAttempt::Contended(path, FlockMode::Shared));
+            }
+        };
+    permit_fds.sort_by_key(|(permit, _)| *permit);
+    let preparation = PreparationPermit {
+        index,
+        token_permit,
+        cpu_permits,
+        memory_permits,
+        permit_fds,
+        affinity_lock: Some(affinity_lock),
+        affinity_cpu,
+        original_affinity,
+        affinity_constrained: false,
+    };
+    let claim = preparation.claim();
+    Ok(PreparationPermitAttempt::Acquired(preparation, claim))
+}
+
+pub(super) fn acquire_preparation_permit(
+    rotation_bias: usize,
+) -> Result<(PreparationPermit, protocol::ClaimSet)> {
+    let tokens = preparation_token_range()?;
+    let count = tokens.len();
+    let start = (pid_window_offset(std::process::id(), count) + rotation_bias) % count;
+    // One opportunistic sweep preserves work conservation. Once every token is
+    // occupied, park in the kernel on one rotated token instead of making each
+    // of thousands of nextest children rescan every inode every 10ms. The
+    // bounded deadline exists only to prevent a tail waiter from remaining on
+    // one busy token after other token queues have drained.
+    let mut turn = 0usize;
+    loop {
+        for offset in 0..count {
+            let index = (start + offset) % count;
+            if let PreparationPermitAttempt::Acquired(preparation, claim) =
+                try_acquire_preparation_permit(
+                    index,
+                    tokens.start + index,
+                    start
+                        .wrapping_add(offset)
+                        .wrapping_add(turn)
+                        .wrapping_add(rotation_bias),
+                    None,
+                )?
+            {
+                return Ok((preparation, claim));
+            }
+        }
+
+        let index = (start + turn) % count;
+        let token_permit = tokens.start + index;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        if let Some(token_fd) = block_flock_deadline(
+            permit_lock_path(token_permit),
+            FlockMode::Exclusive,
+            deadline,
+        )? {
+            match try_acquire_preparation_permit(
+                index,
+                token_permit,
+                start.wrapping_add(turn).wrapping_add(rotation_bias),
+                Some(token_fd),
+            )? {
+                PreparationPermitAttempt::Acquired(preparation, claim) => {
+                    return Ok((preparation, claim));
+                }
+                PreparationPermitAttempt::Contended(path, mode) => {
+                    // The token fd and every partial resource owner were
+                    // dropped with the failed attempt. Sleep on the concrete
+                    // resource that prevented a complete preparation set;
+                    // granting it is only a wake event, so release it before
+                    // the next all-token scan.
+                    drop(block_flock_deadline(
+                        path,
+                        mode,
+                        std::time::Instant::now() + std::time::Duration::from_secs(2),
+                    )?);
+                }
+            }
+        }
+        turn = turn.wrapping_add(PREPARATION_CPU_PERMITS.max(1));
+    }
+}
+
+pub(super) fn validate_preparation_permit(
+    index: usize,
+    permit_fds: Vec<(usize, std::os::fd::OwnedFd)>,
+    affinity_cpu: usize,
+    affinity_lock: std::os::fd::OwnedFd,
+    original_affinity: Vec<usize>,
+) -> Result<PreparationPermit> {
+    use std::os::unix::fs::MetadataExt;
+
+    let tokens = preparation_token_range()?;
+    let token_permit = tokens
+        .clone()
+        .nth(index)
+        .ok_or_else(|| anyhow::anyhow!("inherited preparation permit index {index} is invalid"))?;
+    let cpu = AdmissionPermitPool::for_host(possible_cpu_width());
+    let memory = MemoryPermitPool::for_host()?;
+    let mut permits = permit_fds
+        .iter()
+        .map(|(permit, _)| *permit)
+        .collect::<Vec<_>>();
+    permits.sort_unstable();
+    anyhow::ensure!(
+        permits.windows(2).all(|pair| pair[0] != pair[1]),
+        "inherited preparation permit repeats a resource"
+    );
+    anyhow::ensure!(
+        permits.contains(&token_permit),
+        "inherited preparation permit {index} omits token resource {token_permit}",
+    );
+    let cpu_permits = permits
+        .iter()
+        .copied()
+        .filter(|permit| cpu.general.contains(permit) || cpu.reserved.contains(permit))
+        .collect::<Vec<_>>();
+    let memory_permits = permits
+        .iter()
+        .copied()
+        .filter(|permit| memory.permits.binary_search(permit).is_ok())
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        cpu_permits.len() == PREPARATION_CPU_PERMITS,
+        "inherited preparation permit has the wrong CPU weight"
+    );
+    anyhow::ensure!(
+        memory_permits.len() == PREPARATION_WORKING_SET_MIB.div_ceil(MEMORY_PERMIT_CHUNK_MIB),
+        "inherited preparation permit has the wrong memory weight"
+    );
+    anyhow::ensure!(
+        1 + cpu_permits.len() + memory_permits.len() == permits.len(),
+        "inherited preparation permit contains an unknown resource"
+    );
+    anyhow::ensure!(
+        !original_affinity.is_empty() && original_affinity.contains(&affinity_cpu),
+        "inherited preparation affinity CPU {affinity_cpu} is outside its original mask",
+    );
+    for (permit, fd) in &permit_fds {
+        let actual = std::fs::File::from(fd.try_clone()?)
+            .metadata()
+            .context("stat inherited preparation permit")?;
+        let expected_path = permit_lock_path(*permit);
+        let expected = std::fs::metadata(&expected_path)
+            .with_context(|| format!("stat preparation permit {expected_path}"))?;
+        anyhow::ensure!(
+            actual.dev() == expected.dev() && actual.ino() == expected.ino(),
+            "inherited descriptor does not name preparation permit resource {permit}",
+        );
+    }
+    let actual = std::fs::File::from(affinity_lock.try_clone()?)
+        .metadata()
+        .context("stat inherited preparation CPU lock")?;
+    let expected_path = cpu_lock_path(affinity_cpu);
+    let expected = std::fs::metadata(&expected_path)
+        .with_context(|| format!("stat preparation CPU lock {expected_path}"))?;
+    anyhow::ensure!(
+        actual.dev() == expected.dev() && actual.ino() == expected.ino(),
+        "inherited descriptor does not name preparation CPU resource {affinity_cpu}",
+    );
+    Ok(PreparationPermit::imported(
+        index,
+        token_permit,
+        cpu_permits,
+        memory_permits,
+        permit_fds,
+        affinity_cpu,
+        affinity_lock,
+        original_affinity,
+    ))
+}
+
+/// Highest compact permit identity a pending wrapper may activate on this
+/// host. The namespace is derived from host-wide possible CPUs, not the
+/// caller's cgroup mask, so different runners agree on the memory range.
+pub(crate) fn admission_resource_capacity_hint() -> Result<usize> {
+    preparation_token_range()?
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("host has no preparation admission resources"))
+}
+
+#[derive(Clone)]
+struct PermitSelection {
+    permits: Vec<usize>,
+    admission_class: protocol::AdmissionClass,
+}
+
+#[derive(Clone)]
+struct VmPermitSelection {
+    cpu_permits: Vec<usize>,
+    memory_permits: Vec<usize>,
+    admission_class: protocol::AdmissionClass,
+}
+
+impl VmPermitSelection {
+    fn all_permits(&self) -> Vec<usize> {
+        let mut permits = Vec::with_capacity(self.cpu_permits.len() + self.memory_permits.len());
+        permits.extend_from_slice(&self.cpu_permits);
+        permits.extend_from_slice(&self.memory_permits);
+        permits
+    }
+}
+
+fn split_vm_permits(
+    permits: impl IntoIterator<Item = usize>,
+    memory_pool: Option<&MemoryPermitPool>,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut cpu = Vec::new();
+    let mut memory = Vec::new();
+    for permit in permits {
+        if memory_pool.is_some_and(|pool| pool.permits.binary_search(&permit).is_ok()) {
+            memory.push(permit);
+        } else {
+            cpu.push(permit);
+        }
+    }
+    (cpu, memory)
+}
+
+fn permit_only_claim(selection: &PermitSelection) -> protocol::ClaimSet {
+    resource_claim_with_permits(
+        &[],
+        LlcLockMode::Shared,
+        &[],
+        FlockMode::Shared,
+        &selection.permits,
+        selection.admission_class,
+    )
+}
+
+fn select_admission_permits(
+    kind: PermitAdmission,
+    pool: &AdmissionPermitPool,
+    maximum: usize,
+    minimum: usize,
+    rotation: usize,
+    preferred: &[usize],
+    mut ready: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
+) -> Result<Option<PermitSelection>> {
+    if kind == PermitAdmission::None {
+        return Ok(Some(PermitSelection {
+            permits: Vec::new(),
+            admission_class: protocol::AdmissionClass::Ordinary,
+        }));
+    }
+    let (first, second) = match kind {
+        PermitAdmission::Cooperative => (&pool.general, &pool.reserved),
+        PermitAdmission::Build => (&pool.reserved, &pool.general),
+        PermitAdmission::None => unreachable!(),
+    };
+    let mut ordered = Vec::with_capacity(first.len() + second.len());
+    for group in [first, second] {
+        if group.is_empty() {
+            continue;
+        }
+        // Preserve the admission class preference before OFD reuse. In
+        // particular, cooperative/default work first tries general capacity;
+        // inherited preparation owners in the reserved suffix are reused only
+        // after the general class is exhausted.
+        ordered.extend(
+            preferred
+                .iter()
+                .copied()
+                .filter(|permit| group.contains(permit)),
+        );
+        let start = rotation % group.len();
+        ordered.extend((0..group.len()).map(|offset| group[(start + offset) % group.len()]));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    ordered.retain(|permit| seen.insert(*permit));
+    let mut permits = Vec::with_capacity(maximum);
+    for permit in ordered {
+        let admission_class = match kind {
+            PermitAdmission::Cooperative if pool.reserved.contains(&permit) => {
+                protocol::AdmissionClass::DefaultBorrow
+            }
+            PermitAdmission::Cooperative => protocol::AdmissionClass::Ordinary,
+            PermitAdmission::Build => protocol::AdmissionClass::Build,
+            PermitAdmission::None => unreachable!(),
+        };
+        let candidate = PermitSelection {
+            permits: vec![permit],
+            admission_class,
+        };
+        if ready(&permit_only_claim(&candidate))? {
+            permits.push(permit);
+            if permits.len() == maximum {
+                break;
+            }
+        }
+    }
+    if permits.len() < minimum {
+        return Ok(None);
+    }
+    permits.sort_unstable();
+    let admission_class = match kind {
+        PermitAdmission::Cooperative
+            if permits.iter().any(|permit| pool.reserved.contains(permit)) =>
+        {
+            protocol::AdmissionClass::DefaultBorrow
+        }
+        PermitAdmission::Cooperative => protocol::AdmissionClass::Ordinary,
+        PermitAdmission::Build => protocol::AdmissionClass::Build,
+        PermitAdmission::None => unreachable!(),
+    };
+    let selection = PermitSelection {
+        permits,
+        admission_class,
+    };
+    if ready(&permit_only_claim(&selection))? {
+        Ok(Some(selection))
+    } else {
+        Ok(None)
+    }
+}
+
+fn select_memory_permits(
+    pool: &MemoryPermitPool,
+    required: usize,
+    admission_class: protocol::AdmissionClass,
+    rotation: usize,
+    preferred: &[usize],
+    mut ready: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
+) -> Result<Option<Vec<usize>>> {
+    if required == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let mut selected = Vec::with_capacity(required);
+    let mut ordered = preferred
+        .iter()
+        .copied()
+        .filter(|permit| pool.permits.binary_search(permit).is_ok())
+        .collect::<Vec<_>>();
+    let start = rotation % pool.permits.len();
+    ordered.extend(
+        (0..pool.permits.len()).map(|offset| pool.permits[(start + offset) % pool.permits.len()]),
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    ordered.retain(|permit| seen.insert(*permit));
+    for permit in ordered {
+        let candidate = PermitSelection {
+            permits: vec![permit],
+            admission_class,
+        };
+        if ready(&permit_only_claim(&candidate))? {
+            selected.push(permit);
+            if selected.len() == required {
+                break;
+            }
+        }
+    }
+    if selected.len() < required {
+        return Ok(None);
+    }
+    selected.sort_unstable();
+    let candidate = PermitSelection {
+        permits: selected.clone(),
+        admission_class,
+    };
+    ready(&permit_only_claim(&candidate)).map(|ready| ready.then_some(selected))
+}
+
+fn select_vm_permits(
+    kind: PermitAdmission,
+    cpu_pool: &AdmissionPermitPool,
+    memory_pool: Option<&MemoryPermitPool>,
+    maximum_cpus: usize,
+    minimum_cpus: usize,
+    required_memory: usize,
+    cpu_rotation: usize,
+    memory_rotation: usize,
+    preferred_cpu: &[usize],
+    preferred_memory: &[usize],
+    mut ready: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
+) -> Result<Option<VmPermitSelection>> {
+    let Some(cpu) = select_admission_permits(
+        kind,
+        cpu_pool,
+        maximum_cpus,
+        minimum_cpus,
+        cpu_rotation,
+        preferred_cpu,
+        &mut ready,
+    )?
+    else {
+        return Ok(None);
+    };
+    let memory = match memory_pool {
+        Some(pool) => select_memory_permits(
+            pool,
+            required_memory,
+            cpu.admission_class,
+            memory_rotation,
+            preferred_memory,
+            &mut ready,
+        )?,
+        None => Some(Vec::new()),
+    };
+    let Some(memory_permits) = memory else {
+        return Ok(None);
+    };
+    let selection = VmPermitSelection {
+        cpu_permits: cpu.permits,
+        memory_permits,
+        admission_class: cpu.admission_class,
+    };
+    let combined = PermitSelection {
+        permits: selection.all_permits(),
+        admission_class: selection.admission_class,
+    };
+    ready(&permit_only_claim(&combined)).map(|is_ready| is_ready.then_some(selection))
+}
+
+pub(crate) struct VmPermitPool {
+    cpu: AdmissionPermitPool,
+    memory: MemoryPermitPool,
+    cpu_required: usize,
+    memory_required: usize,
+    cpu_rotation: usize,
+    memory_rotation: usize,
+    preferred_cpu: Vec<usize>,
+    preferred_memory: Vec<usize>,
+}
+
+#[derive(Clone)]
+pub(crate) struct VmPermitReservation {
+    pub(crate) cpu_permits: Vec<usize>,
+    pub(crate) memory_permits: Vec<usize>,
+    pub(crate) admission_class: protocol::AdmissionClass,
+}
+
+impl VmPermitReservation {
+    pub(crate) fn all_permits(&self) -> Vec<usize> {
+        let mut permits = Vec::with_capacity(self.cpu_permits.len() + self.memory_permits.len());
+        permits.extend_from_slice(&self.cpu_permits);
+        permits.extend_from_slice(&self.memory_permits);
+        permits
+    }
+}
+
+impl VmPermitPool {
+    pub(crate) fn new_with_preparation(
+        allowed_cpu_count: usize,
+        cpu_required: usize,
+        memory_mib: u32,
+        pending: Option<&protocol::PendingAdmission>,
+    ) -> Result<Self> {
+        let cpu = AdmissionPermitPool::for_host(allowed_cpu_count);
+        let memory = MemoryPermitPool::for_host()?;
+        let memory_required = memory.required_chunks(memory_mib)?;
+        Ok(Self {
+            cpu_rotation: pid_window_offset(std::process::id(), cpu.len().max(1)),
+            memory_rotation: pid_window_offset(std::process::id(), memory.permits.len().max(1)),
+            cpu,
+            memory,
+            cpu_required,
+            memory_required,
+            preferred_cpu: pending.map_or_else(Vec::new, |pending| {
+                pending.preparation_cpu_permits().to_vec()
+            }),
+            preferred_memory: pending.map_or_else(Vec::new, |pending| {
+                pending.preparation_memory_permits().to_vec()
+            }),
+        })
+    }
+
+    pub(crate) fn watch_permits(&self) -> Vec<usize> {
+        self.cpu
+            .all()
+            .chain(self.memory.permits.iter().copied())
+            .collect()
+    }
+
+    pub(crate) fn select(
+        &self,
+        ready: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
+    ) -> Result<Option<VmPermitReservation>> {
+        select_vm_permits(
+            PermitAdmission::Cooperative,
+            &self.cpu,
+            Some(&self.memory),
+            self.cpu_required,
+            self.cpu_required,
+            self.memory_required,
+            self.cpu_rotation,
+            self.memory_rotation,
+            &self.preferred_cpu,
+            &self.preferred_memory,
+            ready,
+        )
+        .map(|selection| {
+            selection.map(|selection| VmPermitReservation {
+                cpu_permits: selection.cpu_permits,
+                memory_permits: selection.memory_permits,
+                admission_class: selection.admission_class,
+            })
+        })
+    }
+
+    /// Choose an initial exact permit set against the live registry aggregate,
+    /// subtracting the caller's own PENDING OFDs. General cooperative capacity
+    /// remains the first choice even when a wrapper owns reusable preparation
+    /// permits in the reserved suffix; that suffix is a soft fallback, not a
+    /// hard build/default interoperability fence.
+    pub(crate) fn select_registered(&self) -> Result<Option<VmPermitReservation>> {
+        let watch = resource_claim_with_permits(
+            &[],
+            LlcLockMode::Shared,
+            &[],
+            FlockMode::Shared,
+            &self.watch_permits(),
+            protocol::AdmissionClass::Ordinary,
+        );
+        let snapshot = protocol::registered_claim_snapshot(&watch)?;
+        let owned = self
+            .preferred_cpu
+            .iter()
+            .chain(&self.preferred_memory)
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let selected = self.select(|candidate| {
+            let mut external = candidate.clone();
+            external.permits.retain(|permit| !owned.contains(permit));
+            snapshot.conflicts(&external).map(|busy| !busy)
+        })?;
+        if selected.is_some() {
+            Ok(selected)
+        } else {
+            // A queued exact designation still needs a complete canonical
+            // shape when every compatible permit is currently occupied.
+            self.select(|_| Ok(true))
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3213,7 +4441,6 @@ impl LlcPlanSizing {
     }
 }
 
-#[derive(Clone, Copy)]
 struct LlcPlanAcquireRequest<'a> {
     topo: &'a HostTopology,
     test_topo: &'a crate::topology::TestTopology,
@@ -3222,7 +4449,10 @@ struct LlcPlanAcquireRequest<'a> {
     cpu_policy: CpuSelectionPolicy,
     wait: bool,
     sizing: LlcPlanSizing,
+    permit_admission: PermitAdmission,
     cancelled: Option<&'a AtomicBool>,
+    pending: Option<protocol::PendingAdmission>,
+    memory_mib: Option<u32>,
 }
 
 fn acquire_llc_plan_impl(request: LlcPlanAcquireRequest<'_>) -> Result<LlcPlan> {
@@ -3234,7 +4464,10 @@ fn acquire_llc_plan_impl(request: LlcPlanAcquireRequest<'_>) -> Result<LlcPlan> 
         cpu_policy,
         wait,
         sizing,
+        permit_admission,
         cancelled,
+        pending,
+        memory_mib,
     } = request;
     check_acquire_cancelled(cancelled)?;
     if crate::cargo_test_mode::cargo_test_mode_active() {
@@ -3256,7 +4489,10 @@ fn acquire_llc_plan_impl(request: LlcPlanAcquireRequest<'_>) -> Result<LlcPlan> 
             cpu_policy,
             wait,
             sizing,
+            permit_admission,
             cancelled,
+            pending,
+            memory_mib,
         },
         try_acquire_llc_plan_locks_with_evidence,
         || {},
@@ -3297,6 +4533,7 @@ fn cargo_test_mode_llc_plan(topo: &HostTopology) -> Result<LlcPlan> {
     Ok(LlcPlan {
         locked_llcs,
         cpus: allowed,
+        permits: Vec::new(),
         mems,
         snapshot: Vec::new(),
         locks: protocol::Acquired::untracked(Vec::new()),
@@ -3369,7 +4606,10 @@ where
             cpu_policy: CpuSelectionPolicy::WithinEachLlc(policy),
             wait,
             sizing: LlcPlanSizing::Exact,
+            permit_admission: PermitAdmission::None,
             cancelled,
+            pending: None,
+            memory_mib: None,
         },
         acquire_fn,
         || {},
@@ -3396,7 +4636,10 @@ fn acquire_elastic_build_llc_plan_with_coordinator_step_hook(
             cpu_policy: CpuSelectionPolicy::least_held_for_process(),
             wait: true,
             sizing: LlcPlanSizing::Elastic,
+            permit_admission: PermitAdmission::Build,
             cancelled,
+            pending: None,
+            memory_mib: None,
         },
         try_acquire_llc_plan_locks_with_evidence,
         on_coordinator_step,
@@ -3421,7 +4664,10 @@ where
         cpu_policy,
         wait,
         sizing,
+        permit_admission,
         cancelled,
+        mut pending,
+        memory_mib,
     } = request;
     // Elastic builders preserve peer-held Consolidate ordering and give every
     // process a stable tie rotation for the fresh suffix. This fans out both
@@ -3449,6 +4695,34 @@ where
     }
     let allowed: std::collections::BTreeSet<usize> = allowed_vec.iter().copied().collect();
     let allowed_cpus = allowed.len();
+    let preferred_cpu_permits = pending.as_ref().map_or_else(Vec::new, |pending| {
+        pending.preparation_cpu_permits().to_vec()
+    });
+    let preferred_memory_permits = pending.as_ref().map_or_else(Vec::new, |pending| {
+        pending.preparation_memory_permits().to_vec()
+    });
+    let permit_pool = match permit_admission {
+        PermitAdmission::Build => AdmissionPermitPool::for_build_host(allowed_cpus)?,
+        PermitAdmission::Cooperative | PermitAdmission::None => {
+            AdmissionPermitPool::for_host(allowed_cpus)
+        }
+    };
+    let permit_rotation = pid_window_offset(std::process::id(), permit_pool.len().max(1));
+    let memory_pool = memory_mib
+        .map(|_| MemoryPermitPool::for_host())
+        .transpose()?;
+    let memory_required = match (memory_pool.as_ref(), memory_mib) {
+        (Some(pool), Some(memory_mib)) => pool.required_chunks(memory_mib)?,
+        (None, None) => 0,
+        _ => unreachable!("memory pool and requested memory are constructed together"),
+    };
+    let memory_rotation = memory_pool.as_ref().map_or(0, |pool| {
+        pid_window_offset(std::process::id(), pool.permits.len().max(1))
+    });
+    anyhow::ensure!(
+        pending.is_none() || wait,
+        "a pending exec admission can only be activated by a waiting run"
+    );
 
     let target_cpus = match cpu_cap {
         Some(cap) => cap.effective_count(allowed_cpus)?,
@@ -3491,14 +4765,14 @@ where
             .iter()
             .filter_map(|marker| match marker.blocker {
                 protocol::ResourceKey::Llc(llc) => Some(llc),
-                protocol::ResourceKey::Cpu(_) => None,
+                protocol::ResourceKey::Cpu(_) | protocol::ResourceKey::Permit(_) => None,
             })
             .collect::<std::collections::BTreeSet<_>>();
         let contended_cpus = contention_markers
             .iter()
             .filter_map(|marker| match marker.blocker {
                 protocol::ResourceKey::Cpu(cpu) => Some(cpu),
-                protocol::ResourceKey::Llc(_) => None,
+                protocol::ResourceKey::Llc(_) | protocol::ResourceKey::Permit(_) => None,
             })
             .collect::<std::collections::BTreeSet<_>>();
         let mut eligible: Vec<LlcSnapshot> = Vec::with_capacity(snapshots.len());
@@ -3565,7 +4839,7 @@ where
             &cpu_states,
         );
         let claim_capacity_insufficient = live_capacity.is_none();
-        let selected = if let Some(live_capacity) = &live_capacity {
+        let mut selected = if let Some(live_capacity) = &live_capacity {
             plan_from_snapshots_with_fresh_rotation(
                 &eligible,
                 live_capacity.target,
@@ -3625,20 +4899,137 @@ where
             }
             .into());
         }
-        let (selected_cpus, selected_mems) = selected_materialized.unwrap_or_default();
+        let (mut selected_cpus, mut selected_mems) = selected_materialized.unwrap_or_default();
+        let permit_selection = if permit_admission == PermitAdmission::None {
+            Some(VmPermitSelection {
+                cpu_permits: Vec::new(),
+                memory_permits: Vec::new(),
+                admission_class: protocol::AdmissionClass::Ordinary,
+            })
+        } else {
+            let watch_class = match permit_admission {
+                // The envelope spans both general and fallback permits. Each
+                // concrete selection below carries DefaultBorrow only when it
+                // actually consumes the fallback suffix.
+                PermitAdmission::Cooperative => protocol::AdmissionClass::Ordinary,
+                PermitAdmission::Build => protocol::AdmissionClass::Build,
+                PermitAdmission::None => unreachable!(),
+            };
+            let mut watch_permits = permit_pool.all().collect::<Vec<_>>();
+            if let Some(memory_pool) = memory_pool.as_ref() {
+                watch_permits.extend_from_slice(&memory_pool.permits);
+            }
+            let watch = resource_claim_with_permits(
+                &[],
+                LlcLockMode::Shared,
+                &[],
+                FlockMode::Shared,
+                &watch_permits,
+                watch_class,
+            );
+            let permit_snapshot = protocol::registered_claim_snapshot(&watch)?;
+            let preparation_owned = preferred_cpu_permits
+                .iter()
+                .chain(&preferred_memory_permits)
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            let minimum = if sizing == LlcPlanSizing::Elastic {
+                1
+            } else {
+                selected_cpus.len()
+            };
+            select_vm_permits(
+                permit_admission,
+                &permit_pool,
+                memory_pool.as_ref(),
+                selected_cpus.len(),
+                minimum,
+                memory_required,
+                permit_rotation,
+                memory_rotation,
+                &preferred_cpu_permits,
+                &preferred_memory_permits,
+                |candidate| {
+                    // The PENDING record contributes these exact permit bits
+                    // to the machine aggregate. They are this process's
+                    // already-held OFDs, not external contention; exact probe
+                    // reuses them and retains any surplus until HELD.
+                    let mut external = candidate.clone();
+                    external
+                        .permits
+                        .retain(|permit| !preparation_owned.contains(permit));
+                    permit_snapshot.conflicts(&external).map(|busy| !busy)
+                },
+            )?
+        };
+        if sizing == LlcPlanSizing::Elastic
+            && let Some(selection) = permit_selection.as_ref()
+            && selection.cpu_permits.len() < selected_cpus.len()
+        {
+            selected_cpus.truncate(selection.cpu_permits.len());
+            selected.retain(|llc| {
+                topo.llc_groups[*llc]
+                    .cpus
+                    .iter()
+                    .any(|cpu| selected_cpus.contains(cpu))
+            });
+            selected_mems = plan_mems(&selected_cpus, topo);
+        }
+        if pending.is_some() {
+            // The pre-exec wrapper already owns its bounded CPU/memory/token
+            // permits and one physical CPU-SH claim. Do not create a second
+            // fast-path owner: preserve this discovery only as the queue seed,
+            // then atomically replace that preparation footprint with the
+            // complete topology + CPU + memory claim in the same record below.
+            queue_seed_snapshots = Some(snapshots);
+            queue_seed_cpu_states = Some(cpu_states);
+            queue_seed_universe = Some(allowed.clone());
+            break;
+        }
         let mut registry_fenced = false;
-        let acquired = if selected.is_empty() {
+        let acquired = if selected.is_empty() || permit_selection.is_none() {
             // Claim-blocked: bounce without touching any lockfile.
             None
         } else {
-            let exact = protocol::ClaimSet::with_modes(
-                selected.iter().copied(),
-                selected_cpus.iter().copied(),
+            let permit_selection = permit_selection.as_ref().expect("checked above");
+            let all_permits = permit_selection.all_permits();
+            let exact = resource_claim_with_permits(
+                &selected,
+                LlcLockMode::Shared,
+                &selected_cpus,
                 FlockMode::Shared,
-                FlockMode::Shared,
+                &all_permits,
+                permit_selection.admission_class,
             );
-            match protocol::with_registry_fence(&exact, || {
-                acquire_fn(&selected, &selected_cpus, &snapshots)
+            match protocol::with_registry_fence(&exact, || -> Result<LlcLockAttempt> {
+                if permit_admission == PermitAdmission::None {
+                    Ok(acquire_fn(&selected, &selected_cpus, &snapshots)?.into_llc_lock_attempt())
+                } else {
+                    Ok(
+                        match acquire_resources_with_permits_granted(
+                            &selected,
+                            LlcLockMode::Shared,
+                            &selected_cpus,
+                            FlockMode::Shared,
+                            &all_permits,
+                        )? {
+                            protocol::ProbeOutcome::Acquired(locks) => {
+                                LlcLockAttempt::Acquired(locks)
+                            }
+                            protocol::ProbeOutcome::Contended(evidence) => {
+                                LlcLockAttempt::Contended(evidence)
+                            }
+                            protocol::ProbeOutcome::Unavailable => {
+                                #[cfg(test)]
+                                {
+                                    LlcLockAttempt::Unavailable
+                                }
+                                #[cfg(not(test))]
+                                unreachable!("physical permit probe cannot return unavailable")
+                            }
+                        },
+                    )
+                }
             })
             .map_err(|e| ResourceContention {
                 reason: format!("acquire LLC and CPU locks: {e}"),
@@ -3667,8 +5058,21 @@ where
             }
         };
         if let Some(locks) = acquired {
-            let plan =
-                materialize_llc_plan(selected, snapshots, locks, selected_cpus, selected_mems);
+            let plan = materialize_llc_plan(
+                selected,
+                snapshots,
+                locks,
+                selected_cpus,
+                permit_selection
+                    .as_ref()
+                    .expect("successful acquisition has permit selection")
+                    .cpu_permits
+                    .clone(),
+                permit_selection
+                    .expect("successful acquisition has permit selection")
+                    .memory_permits,
+                selected_mems,
+            );
             return Ok(plan);
         }
         if !wait
@@ -3778,7 +5182,7 @@ where
         }
         .into());
     }
-    let Some((queued_cpus, _)) = materialize_plan_cpus(
+    let Some((mut queued_cpus, _)) = materialize_plan_cpus(
         &queued_selected,
         topo,
         &queued_capacity.eligible,
@@ -3793,21 +5197,65 @@ where
         }
         .into());
     };
-    let queued_claim = protocol::ClaimSet::with_modes(
-        queued_selected.iter().copied(),
-        queued_cpus.iter().copied(),
+    let queued_permits = select_vm_permits(
+        permit_admission,
+        &permit_pool,
+        memory_pool.as_ref(),
+        queued_cpus.len(),
+        if sizing == LlcPlanSizing::Elastic {
+            1
+        } else {
+            queued_cpus.len()
+        },
+        memory_required,
+        permit_rotation,
+        memory_rotation,
+        &preferred_cpu_permits,
+        &preferred_memory_permits,
+        |_| Ok(true),
+    )?
+    .expect("a non-empty host permit pool must seed a queued designation");
+    if sizing == LlcPlanSizing::Elastic {
+        queued_cpus.truncate(queued_permits.cpu_permits.len());
+    }
+    let queued_all_permits = queued_permits.all_permits();
+    let queued_claim = resource_claim_with_permits(
+        &queued_selected,
+        LlcLockMode::Shared,
+        &queued_cpus,
         FlockMode::Shared,
-        FlockMode::Shared,
+        &queued_all_permits,
+        queued_permits.admission_class,
     );
     // Watch the immutable static resource universe for releases, while
     // fencing successors with only the exact plan currently designated in
     // the registry. A transiently busy resource must remain in the watch or
     // its release cannot wake this ticket.
-    let queued_watch = protocol::ClaimSet::with_modes(
-        queued_snapshots.iter().map(|snapshot| snapshot.llc_idx),
-        allowed.iter().copied(),
+    let watch_class = match permit_admission {
+        PermitAdmission::None => protocol::AdmissionClass::Ordinary,
+        // Candidate claims, not the broad immutable watch, decide whether the
+        // selected set actually borrows build-reserved cooperative capacity.
+        PermitAdmission::Cooperative => protocol::AdmissionClass::Ordinary,
+        PermitAdmission::Build => protocol::AdmissionClass::Build,
+    };
+    let mut watch_permits = if permit_admission == PermitAdmission::None {
+        Vec::new()
+    } else {
+        permit_pool.all().collect::<Vec<_>>()
+    };
+    if let Some(memory_pool) = memory_pool.as_ref() {
+        watch_permits.extend_from_slice(&memory_pool.permits);
+    }
+    let queued_watch = resource_claim_with_permits(
+        &queued_snapshots
+            .iter()
+            .map(|snapshot| snapshot.llc_idx)
+            .collect::<Vec<_>>(),
+        LlcLockMode::Shared,
+        &allowed.iter().copied().collect::<Vec<_>>(),
         FlockMode::Shared,
-        FlockMode::Shared,
+        &watch_permits,
+        watch_class,
     );
     let register = |probe: &mut protocol::GrantedProbe| {
         let (mut snapshots, cpu_states, _) = discover_registered_placement_states(topo, &allowed)
@@ -3829,8 +5277,12 @@ where
             .into());
         }
         let designated = probe.designated().clone();
+        let reusable_permits = probe.clone_reusable_permits()?;
         let selected: Vec<usize> = designated.llcs.iter().copied().collect();
         let cpus: Vec<usize> = designated.cpus.iter().copied().collect();
+        let permits: Vec<usize> = designated.permits.iter().copied().collect();
+        let (cpu_permits, memory_permits) =
+            split_vm_permits(permits.iter().copied(), memory_pool.as_ref());
         let designated_is_live = selected
             .iter()
             .all(|idx| snapshots.iter().any(|snapshot| snapshot.llc_idx == *idx));
@@ -3838,12 +5290,40 @@ where
             && designated_is_live
             && let Some(acquired) = probe.try_acquire(&designated, || {
                 Ok(
-                    match try_acquire_llc_plan_locks_with_evidence(&selected, &cpus, &snapshots)? {
+                    match if permit_admission == PermitAdmission::None {
+                        try_acquire_llc_plan_locks_with_evidence(&selected, &cpus, &snapshots)?
+                    } else {
+                        match acquire_resources_with_permits_granted_reusing(
+                            &selected,
+                            LlcLockMode::Shared,
+                            &cpus,
+                            FlockMode::Shared,
+                            &permits,
+                            &reusable_permits,
+                        )? {
+                            protocol::ProbeOutcome::Acquired(locks) => {
+                                LlcLockAttempt::Acquired(locks)
+                            }
+                            protocol::ProbeOutcome::Contended(evidence) => {
+                                LlcLockAttempt::Contended(evidence)
+                            }
+                            protocol::ProbeOutcome::Unavailable => {
+                                #[cfg(test)]
+                                {
+                                    LlcLockAttempt::Unavailable
+                                }
+                                #[cfg(not(test))]
+                                unreachable!()
+                            }
+                        }
+                    } {
                         LlcLockAttempt::Acquired(locks) => protocol::ProbeOutcome::Acquired((
                             selected.clone(),
                             snapshots.clone(),
                             locks,
                             cpus.clone(),
+                            cpu_permits.clone(),
+                            memory_permits.clone(),
                         )),
                         LlcLockAttempt::Contended(evidence) => {
                             protocol::ProbeOutcome::Contended(evidence)
@@ -3925,7 +5405,7 @@ where
             // routes the relevant release serial back to this ticket.
             return Ok(None);
         }
-        let Some((next_cpus, _)) = materialize_plan_cpus(
+        let Some((mut next_cpus, _)) = materialize_plan_cpus(
             &next_selected,
             topo,
             &live_capacity.eligible,
@@ -3937,27 +5417,90 @@ where
             // This is transient contention, not a malformed static topology.
             return Ok(None);
         };
-        let next_claim = protocol::ClaimSet::with_modes(
-            next_selected.iter().copied(),
-            next_cpus.iter().copied(),
+        let Some(next_permits) = select_vm_permits(
+            permit_admission,
+            &permit_pool,
+            memory_pool.as_ref(),
+            next_cpus.len(),
+            if sizing == LlcPlanSizing::Elastic {
+                1
+            } else {
+                next_cpus.len()
+            },
+            memory_required,
+            permit_rotation,
+            memory_rotation,
+            &preferred_cpu_permits,
+            &preferred_memory_permits,
+            |candidate| probe.candidate_ready(candidate),
+        )?
+        else {
+            return Ok(None);
+        };
+        if sizing == LlcPlanSizing::Elastic {
+            next_cpus.truncate(next_permits.cpu_permits.len());
+        }
+        let next_selected = next_selected
+            .into_iter()
+            .filter(|llc| {
+                topo.llc_groups[*llc]
+                    .cpus
+                    .iter()
+                    .any(|cpu| next_cpus.contains(cpu))
+            })
+            .collect::<Vec<_>>();
+        let next_all_permits = next_permits.all_permits();
+        let next_claim = resource_claim_with_permits(
+            &next_selected,
+            LlcLockMode::Shared,
+            &next_cpus,
             FlockMode::Shared,
-            FlockMode::Shared,
+            &next_all_permits,
+            next_permits.admission_class,
         );
         if sizing == LlcPlanSizing::Elastic
             && next_claim == designated
             && designated_is_live
             && let Some(acquired) = probe.try_acquire(&designated, || {
                 Ok(
-                    match try_acquire_llc_plan_locks_with_evidence(
-                        &next_selected,
-                        &next_cpus,
-                        &snapshots,
-                    )? {
+                    match if permit_admission == PermitAdmission::None {
+                        try_acquire_llc_plan_locks_with_evidence(
+                            &next_selected,
+                            &next_cpus,
+                            &snapshots,
+                        )?
+                    } else {
+                        match acquire_resources_with_permits_granted_reusing(
+                            &next_selected,
+                            LlcLockMode::Shared,
+                            &next_cpus,
+                            FlockMode::Shared,
+                            &next_all_permits,
+                            &reusable_permits,
+                        )? {
+                            protocol::ProbeOutcome::Acquired(locks) => {
+                                LlcLockAttempt::Acquired(locks)
+                            }
+                            protocol::ProbeOutcome::Contended(evidence) => {
+                                LlcLockAttempt::Contended(evidence)
+                            }
+                            protocol::ProbeOutcome::Unavailable => {
+                                #[cfg(test)]
+                                {
+                                    LlcLockAttempt::Unavailable
+                                }
+                                #[cfg(not(test))]
+                                unreachable!()
+                            }
+                        }
+                    } {
                         LlcLockAttempt::Acquired(locks) => protocol::ProbeOutcome::Acquired((
                             next_selected.clone(),
                             snapshots.clone(),
                             locks,
                             next_cpus.clone(),
+                            next_permits.cpu_permits.clone(),
+                            next_permits.memory_permits.clone(),
                         )),
                         LlcLockAttempt::Contended(evidence) => {
                             protocol::ProbeOutcome::Contended(evidence)
@@ -3974,7 +5517,9 @@ where
         Ok(None)
     };
     let coordinator_seed_claim = queued_claim.clone();
-    let ticket = if contention.is_empty() {
+    let ticket = if let Some(pending) = pending.take() {
+        protocol::activate_pending_ticket(pending, queued_claim, queued_watch, cancelled, register)?
+    } else if contention.is_empty() {
         protocol::register_ticket_or_acquire(queued_claim, queued_watch, cancelled, register)?
     } else {
         protocol::register_ticket_after_contentions(
@@ -3987,12 +5532,25 @@ where
     };
     let coordinator = match ticket {
         protocol::TicketWork::Acquired(acquired) => {
-            let ((selected, snapshots, cpus), locks) =
-                acquired.split_map(|(selected, snapshots, locks, cpus)| {
-                    ((selected, snapshots, cpus), locks)
-                });
+            let ((selected, snapshots, cpus, cpu_permits, memory_permits), locks) = acquired
+                .split_map(
+                    |(selected, snapshots, locks, cpus, cpu_permits, memory_permits)| {
+                        (
+                            (selected, snapshots, cpus, cpu_permits, memory_permits),
+                            locks,
+                        )
+                    },
+                );
             let mems = plan_mems(&cpus, topo);
-            let plan = materialize_llc_plan(selected, snapshots, locks, cpus, mems);
+            let plan = materialize_llc_plan(
+                selected,
+                snapshots,
+                locks,
+                cpus,
+                cpu_permits,
+                memory_permits,
+                mems,
+            );
             return Ok(plan);
         }
         protocol::TicketWork::Coordinator(coordinator) => coordinator,
@@ -4059,7 +5617,7 @@ where
             &eligible_allowed,
             &cpu_states,
         ) {
-            let selected = plan_from_snapshots_with_fresh_rotation(
+            let mut selected = plan_from_snapshots_with_fresh_rotation(
                 &ready_snapshots,
                 live_capacity.target,
                 topo,
@@ -4068,7 +5626,7 @@ where
                 llc_policy,
                 elastic_fresh_rotation,
             );
-            if let Some((cpus, _)) = materialize_plan_cpus(
+            if let Some((mut cpus, _)) = materialize_plan_cpus(
                 &selected,
                 topo,
                 &live_capacity.eligible,
@@ -4076,12 +5634,42 @@ where
                 live_capacity.target,
                 cpu_policy,
             ) {
-                coordinator_claim = protocol::ClaimSet::with_modes(
-                    selected,
-                    cpus,
-                    FlockMode::Shared,
-                    FlockMode::Shared,
-                );
+                if let Some(permits) = select_vm_permits(
+                    permit_admission,
+                    &permit_pool,
+                    memory_pool.as_ref(),
+                    cpus.len(),
+                    if sizing == LlcPlanSizing::Elastic {
+                        1
+                    } else {
+                        cpus.len()
+                    },
+                    memory_required,
+                    permit_rotation,
+                    memory_rotation,
+                    &preferred_cpu_permits,
+                    &preferred_memory_permits,
+                    |candidate| held.candidate_ready(candidate),
+                )? {
+                    if sizing == LlcPlanSizing::Elastic {
+                        cpus.truncate(permits.cpu_permits.len());
+                        selected.retain(|llc| {
+                            topo.llc_groups[*llc]
+                                .cpus
+                                .iter()
+                                .any(|cpu| cpus.contains(cpu))
+                        });
+                    }
+                    let all_permits = permits.all_permits();
+                    coordinator_claim = resource_claim_with_permits(
+                        &selected,
+                        LlcLockMode::Shared,
+                        &cpus,
+                        FlockMode::Shared,
+                        &all_permits,
+                        permits.admission_class,
+                    );
+                }
             }
         }
         // If real EX holders leave no full ready alternative, retain the
@@ -4090,6 +5678,9 @@ where
         // temporary scarcity is never a terminal topology error.
         let selected: Vec<usize> = coordinator_claim.llcs.iter().copied().collect();
         let cpus: Vec<usize> = coordinator_claim.cpus.iter().copied().collect();
+        let permits: Vec<usize> = coordinator_claim.permits.iter().copied().collect();
+        let (cpu_permits, memory_permits) =
+            split_vm_permits(permits.iter().copied(), memory_pool.as_ref());
         match sizing {
             LlcPlanSizing::Exact => debug_assert_eq!(cpus.len(), target_cpus),
             LlcPlanSizing::Elastic => {
@@ -4097,21 +5688,25 @@ where
             }
         }
         let mems = plan_mems(&cpus, topo);
-        let target = protocol::canonical_lock_order_with_modes(
+        let target = protocol::canonical_lock_order_with_permits(
             &selected,
             FlockMode::Shared,
             &cpus,
             FlockMode::Shared,
+            &permits,
         );
         if let Some(locks) = held.probe_complete_if_ready(&coordinator_claim, &target)? {
             Ok(protocol::CoordinatorStep::Complete {
-                claim: protocol::ClaimSet::with_modes(
-                    selected.iter().copied(),
-                    cpus.iter().copied(),
-                    FlockMode::Shared,
-                    FlockMode::Shared,
+                claim: coordinator_claim.clone(),
+                value: (
+                    selected,
+                    snapshots,
+                    locks,
+                    cpus,
+                    cpu_permits,
+                    memory_permits,
+                    mems,
                 ),
-                value: (selected, snapshots, locks, cpus, mems),
             })
         } else {
             Ok(protocol::CoordinatorStep::Waiting {
@@ -4125,11 +5720,24 @@ where
     };
     match outcome {
         protocol::CoordinatorOutcome::Acquired(acquired) => {
-            let ((selected, snapshots, cpus, mems), locks) =
-                acquired.split_map(|(selected, snapshots, locks, cpus, mems)| {
-                    ((selected, snapshots, cpus, mems), locks)
-                });
-            Ok(materialize_llc_plan(selected, snapshots, locks, cpus, mems))
+            let ((selected, snapshots, cpus, cpu_permits, memory_permits, mems), locks) = acquired
+                .split_map(
+                    |(selected, snapshots, locks, cpus, cpu_permits, memory_permits, mems)| {
+                        (
+                            (selected, snapshots, cpus, cpu_permits, memory_permits, mems),
+                            locks,
+                        )
+                    },
+                );
+            Ok(materialize_llc_plan(
+                selected,
+                snapshots,
+                locks,
+                cpus,
+                cpu_permits,
+                memory_permits,
+                mems,
+            ))
         }
         protocol::CoordinatorOutcome::Aborted { reason } => {
             Err(anyhow::Error::new(ResourceContention { reason }))
@@ -4219,6 +5827,8 @@ pub fn plan_llc_selection_only(
         snapshots,
         protocol::Acquired::untracked(Vec::new()),
         cpus,
+        Vec::new(),
+        Vec::new(),
         mems,
     ))
 }
@@ -4409,11 +6019,14 @@ fn materialize_llc_plan(
     snapshots: Vec<LlcSnapshot>,
     locks: protocol::Acquired<Vec<std::os::fd::OwnedFd>>,
     cpus: Vec<usize>,
+    permits: Vec<usize>,
+    _memory_permits: Vec<usize>,
     mems: std::collections::BTreeSet<usize>,
 ) -> LlcPlan {
     LlcPlan {
         locked_llcs: selected,
         cpus,
+        permits,
         mems,
         snapshot: snapshots,
         locks,
@@ -4432,7 +6045,11 @@ fn materialize_llc_plan(
 /// `plan.cpus.len()` to make keeps gcc's parallel width aligned with
 /// the reserved capacity.
 pub fn make_jobs_for_plan(plan: &LlcPlan) -> usize {
-    plan.cpus.len().max(1)
+    if plan.permits.is_empty() {
+        plan.cpus.len().max(1)
+    } else {
+        plan.permits.len().max(1)
+    }
 }
 
 /// Render selected LLC indices for user-facing warning text.

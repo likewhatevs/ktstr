@@ -252,14 +252,8 @@ fn acquire_llc_plan_rejects_cap_over_allowed_cpus() {
     let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
     let cap = CpuCap::new(3).unwrap();
-    let err = acquire_llc_plan(
-        &topo,
-        &test_topo,
-        Some(cap),
-        PlacementPolicy::Consolidate,
-        false,
-    )
-    .expect_err("cap > allowed_cpus must error");
+    let err = plan_llc_selection_only(&topo, &test_topo, Some(cap), PlacementPolicy::Consolidate)
+        .expect_err("cap > allowed_cpus must error");
     assert!(
         err.downcast_ref::<CpuBudgetUnsatisfiable>().is_some(),
         "must be CpuBudgetUnsatisfiable: {err:#}"
@@ -628,6 +622,7 @@ fn make_jobs_for_plan_matches_cpu_count() {
     let plan = LlcPlan {
         locked_llcs: vec![0, 1],
         cpus: vec![0, 1, 2, 3],
+        permits: Vec::new(),
         mems: std::collections::BTreeSet::new(),
         snapshot: Vec::new(),
         locks: admission_protocol::Acquired::untracked(Vec::new()),
@@ -644,6 +639,7 @@ fn make_jobs_for_plan_empty_cpus_floors_to_one() {
     let plan = LlcPlan {
         locked_llcs: Vec::new(),
         cpus: Vec::new(),
+        permits: Vec::new(),
         mems: std::collections::BTreeSet::new(),
         snapshot: Vec::new(),
         locks: admission_protocol::Acquired::untracked(Vec::new()),
@@ -758,6 +754,7 @@ fn warn_if_cross_node_spill_predicate_gates_stderr() {
     let multi_plan = LlcPlan {
         locked_llcs: vec![0, 1],
         cpus: vec![0, 1],
+        permits: Vec::new(),
         mems: [0usize, 1].into_iter().collect(),
         snapshot: Vec::new(),
         locks: admission_protocol::Acquired::untracked(Vec::new()),
@@ -789,6 +786,7 @@ fn warn_if_cross_node_spill_predicate_gates_stderr() {
     let single_plan = LlcPlan {
         locked_llcs: vec![0],
         cpus: vec![0],
+        permits: Vec::new(),
         mems: [0usize].into_iter().collect(),
         snapshot: Vec::new(),
         locks: admission_protocol::Acquired::untracked(Vec::new()),
@@ -841,12 +839,15 @@ fn acquire_llc_plan_consolidates_on_peer_held_llc() {
     let test_topo = crate::topology::TestTopology::synthetic(2, 1);
     let cap = CpuCap::new(1).expect("cap=1 valid");
     let proc_reads_before = crate::flock::proc_locks::proc_locks_read_count_for_tests();
-    let plan = acquire_llc_plan(
+    let plan = acquire_llc_plan_interruptible(
         &topo,
         &test_topo,
         Some(cap),
         PlacementPolicy::Consolidate,
         false,
+        None,
+        None,
+        None,
     )
     .expect("current-version SH occupancy remains compatible");
     assert_eq!(
@@ -913,12 +914,15 @@ fn acquire_llc_plan_skips_an_exclusive_held_llc_when_a_ready_alternative_exists(
     };
     let test_topo = crate::topology::TestTopology::synthetic(2, 1);
     let plan = peer_seen.then(|| {
-        acquire_llc_plan(
+        acquire_llc_plan_interruptible(
             &topo,
             &test_topo,
             CpuCap::new(1).ok(),
             PlacementPolicy::Consolidate,
             false,
+            None,
+            None,
+            None,
         )
     });
     if let Some(pgid) = libc::pid_t::try_from(child.id())
@@ -1236,12 +1240,15 @@ fn plan_only_holds_nothing_and_runtime_plan_holds_exact_resources() {
         .expect("build-time plan must not own its selected CPU");
     drop((build_llc_probe, build_cpu_probe, build_plan));
 
-    let runtime_plan = acquire_llc_plan(
+    let runtime_plan = acquire_llc_plan_interruptible(
         &topo,
         &test_topo,
         Some(cap),
         PlacementPolicy::spread_for_process(),
         false,
+        None,
+        None,
+        None,
     )
     .expect("run-time acquisition must succeed on a fresh two-LLC host");
     assert!(
@@ -1459,12 +1466,15 @@ fn live_ex_holder_uses_fresh_holder_diagnostics_not_registered_claim_error() {
     let _held = try_flock(llc_lock_path(0), FlockMode::Exclusive)
         .expect("open live LLC blocker")
         .expect("take live LLC blocker");
-    let error = acquire_llc_plan(
+    let error = acquire_llc_plan_interruptible(
         &topo,
         &test_topo,
         CpuCap::new(1).ok(),
         PlacementPolicy::Consolidate,
         false,
+        None,
+        None,
+        None,
     )
     .expect_err("the only LLC is held EX");
     let message = format!("{error:#}");
@@ -1560,12 +1570,15 @@ fn plan_only_cargo_test_mode_matches_runtime_full_allowed_cpuset() {
         PlacementPolicy::Spread { rotation: 0 },
     )
     .expect("cargo-test build plan");
-    let runtime_plan = acquire_llc_plan(
+    let runtime_plan = acquire_llc_plan_interruptible(
         &topo,
         &test_topo,
         Some(cap),
         PlacementPolicy::Spread { rotation: 0 },
         true,
+        None,
+        None,
+        None,
     )
     .expect("cargo-test runtime plan");
 
@@ -1916,6 +1929,112 @@ fn elastic_sizing_uses_every_available_cpu_up_to_its_maximum() {
     assert_eq!(exact.target_for_capacity(8, 8), Some(8));
     assert_eq!(exact.target_for_capacity(8, 13), Some(8));
     assert_eq!(exact.queued_target(8), 8);
+}
+
+#[test]
+fn cooperative_permits_admit_four_host_width_claims_and_reject_a_fifth() {
+    let host_width = 8;
+    let pool = AdmissionPermitPool::for_host(host_width);
+    assert_eq!(pool.len(), host_width * COOPERATIVE_OVERSUBSCRIPTION);
+    let mut held = std::collections::BTreeSet::new();
+
+    for lane in 0..COOPERATIVE_OVERSUBSCRIPTION {
+        let selection = select_admission_permits(
+            PermitAdmission::Cooperative,
+            &pool,
+            host_width,
+            host_width,
+            lane * host_width,
+            &[],
+            |candidate| Ok(candidate.permits.is_disjoint(&held)),
+        )
+        .unwrap()
+        .expect("each of four host-width cooperative lanes must fit");
+        assert_eq!(selection.permits.len(), host_width);
+        assert!(selection.permits.iter().all(|permit| held.insert(*permit)));
+    }
+
+    assert_eq!(held.len(), pool.len());
+    assert!(
+        select_admission_permits(
+            PermitAdmission::Cooperative,
+            &pool,
+            host_width,
+            host_width,
+            0,
+            &[],
+            |candidate| Ok(candidate.permits.is_disjoint(&held)),
+        )
+        .unwrap()
+        .is_none(),
+        "a fifth host-width claim must wait until one of the four lanes releases",
+    );
+}
+
+#[test]
+fn build_permits_are_bounded_but_never_blocked_by_live_default_borrowers() {
+    let cooperative = AdmissionPermitPool::for_host(8);
+    let borrowed = cooperative
+        .reserved
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        !borrowed.is_empty(),
+        "the fixture must expose borrowable default capacity"
+    );
+
+    let build = AdmissionPermitPool::for_build_host(8).expect("construct build-only namespace");
+    assert!(
+        build
+            .all()
+            .all(|permit| !cooperative.general.contains(&permit)
+                && !cooperative.reserved.contains(&permit)),
+        "build permits must be disjoint from both general and borrowed default capacity",
+    );
+    let selection =
+        select_admission_permits(PermitAdmission::Build, &build, 1, 1, 0, &[], |candidate| {
+            Ok(candidate.permits.is_disjoint(&borrowed))
+        })
+        .expect("select one build permit")
+        .expect("a live default borrower must not delay build admission");
+    assert_eq!(
+        selection.admission_class,
+        admission_protocol::AdmissionClass::Build
+    );
+    assert_eq!(selection.permits.len(), 1);
+}
+
+#[test]
+fn cooperative_selection_borrows_reserved_capacity_when_general_capacity_is_exhausted() {
+    let pool = AdmissionPermitPool::for_host(8);
+    assert!(!pool.general.is_empty() && !pool.reserved.is_empty());
+    let exhausted_general = pool
+        .general
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let selection = select_admission_permits(
+        PermitAdmission::Cooperative,
+        &pool,
+        1,
+        1,
+        0,
+        &[],
+        |candidate| Ok(candidate.permits.is_disjoint(&exhausted_general)),
+    )
+    .expect("select cooperative fallback capacity")
+    .expect("reserved capacity must remain a soft default fallback");
+    assert_eq!(
+        selection.admission_class,
+        admission_protocol::AdmissionClass::DefaultBorrow,
+    );
+    assert!(
+        selection
+            .permits
+            .iter()
+            .all(|permit| pool.reserved.contains(permit)),
+    );
 }
 
 /// A heavily SH-held LLC can satisfy the complete build maximum, but must not
@@ -2323,7 +2442,7 @@ fn acquire_llc_plan_bails_when_no_llc_overlaps_allowed() {
     let _allowed = AllowedCpusGuard::new(vec![100, 101]);
     let topo = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
-    let err = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate, false)
+    let err = plan_llc_selection_only(&topo, &test_topo, None, PlacementPolicy::Consolidate)
         .expect_err("no LLC overlap must bail, not silently run");
     let msg = format!("{err:#}");
     assert!(
@@ -2400,12 +2519,15 @@ fn acquire_llc_plan_partial_take_last_llc_matches_exact_budget() {
     let topo = HostTopology::new_for_tests(&[(vec![0, 1, 2, 3], 0), (vec![4, 5, 6, 7], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
     let cap = CpuCap::new(5).expect("cap=5 valid");
-    let plan = acquire_llc_plan(
+    let plan = acquire_llc_plan_interruptible(
         &topo,
         &test_topo,
         Some(cap),
         PlacementPolicy::Consolidate,
         false,
+        None,
+        None,
+        None,
     )
     .expect("clean pool must allow SH on both LLCs");
 
@@ -2487,12 +2609,15 @@ fn acquire_llc_plan_cross_node_spill_mems_union() {
     let test_topo = crate::topology::TestTopology::synthetic(4, 2);
     // Each LLC has 1 CPU, so cap=3 CPUs → exactly 3 LLCs.
     let cap = CpuCap::new(3).expect("cap=3 valid");
-    let plan = acquire_llc_plan(
+    let plan = acquire_llc_plan_interruptible(
         &topo,
         &test_topo,
         Some(cap),
         PlacementPolicy::Consolidate,
         false,
+        None,
+        None,
+        None,
     )
     .expect("clean pool must allow 3-CPU acquisition");
 

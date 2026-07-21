@@ -9,8 +9,8 @@
 #[cfg(test)]
 use super::CpuExContentionSharedWake;
 use super::{
-    ClaimMode, ClaimSet, ContentionEvidence, ContentionMarker, ContentionSet, ResourceKey,
-    interrupted, protocol_dir,
+    AdmissionClass, ClaimMode, ClaimSet, ContentionEvidence, ContentionMarker, ContentionSet,
+    ResourceKey, interrupted, protocol_dir,
 };
 use crate::flock::{FlockMode, InterruptibleFlockWaiter, block_flock, try_flock};
 use anyhow::{Context, Result};
@@ -22,18 +22,18 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ10");
-const VERSION: u32 = 10;
+const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ14");
+const VERSION: u32 = 14;
 const HEADER_FIXED: usize = 256;
 const HEADER_ALIGN: usize = 4096;
-const RECORD_FIXED: usize = 128;
+const RECORD_FIXED: usize = 192;
 const RECORD_ALIGN: usize = 64;
 const RECORDS_PER_CHUNK: usize = 64;
 const NONE_SLOT: u64 = u64::MAX;
 const MAX_RESOURCE_BITS: usize = 1 << 20;
 const MAX_REGISTRY_SLOTS: u64 = 1 << 16;
-const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v10-init-";
-const LIVENESS_PREFIX: &str = "ktstr-acquire-v10-slot-";
+const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v14-init-";
+const LIVENESS_PREFIX: &str = "ktstr-acquire-v14-slot-";
 const LIVENESS_SEPARATOR: &str = "-ticket-";
 const LIVENESS_SUFFIX: &str = ".live";
 
@@ -63,7 +63,11 @@ const H_LIVENESS_RECONCILE_BY_NS: usize = 160;
 const H_COORDINATOR_EPOCH: usize = 168;
 const H_COORDINATOR_HEARTBEAT_NS: usize = 176;
 const H_LAST_PROGRESS_NS: usize = 184;
+/// Futex sequence paired with `H_GENERATION`. The generation remains a full
+/// u64 diagnostic/epoch while waiters sleep on this non-overlapping u32 word.
+const H_GENERATION_WAKE: usize = 192;
 const _: () = assert!(H_AGGREGATE_DIRTY.is_multiple_of(std::mem::align_of::<AtomicU64>()));
+const _: () = assert!(H_GENERATION_WAKE.is_multiple_of(std::mem::align_of::<AtomicU32>()));
 
 const R_STATE: usize = 0;
 const R_WAKE: usize = 4;
@@ -88,20 +92,29 @@ const R_NEXT_ACTIVE: usize = 88;
 const R_CLAIM_LLC_MODE: usize = 96;
 const R_CLAIM_CPU_MODE: usize = 100;
 const R_WATCH_CPU_MODE: usize = 104;
+const R_CLAIM_PERMIT_MODE: usize = 108;
 /// Publication stamp for the four derived predecessor bitsets. Zero means a
 /// writer died before publishing a complete snapshot.
 const R_PREFIX_EPOCH: usize = 112;
+const R_WATCH_PERMIT_MODE: usize = 120;
+const R_CLAIM_CLASS: usize = 124;
+const R_WATCH_CLASS: usize = 128;
+/// Remaining cooperative CPU-permit units which may backfill while this exact
+/// ticket is the oldest physically unavailable admission candidate.
+const R_BACKFILL_CREDIT: usize = 132;
 const R_BITS: usize = RECORD_FIXED;
 
 const RB_CLAIM_CPUS: usize = 0;
 const RB_CLAIM_LLCS: usize = 1;
-const RB_WATCH_CPUS: usize = 2;
-const RB_WATCH_LLCS: usize = 3;
-const RB_PREFIX_CPU_ANY: usize = 4;
-const RB_PREFIX_CPU_EXCLUSIVE: usize = 5;
-const RB_PREFIX_LLC_ANY: usize = 6;
-const RB_PREFIX_LLC_EXCLUSIVE: usize = 7;
-const RECORD_BITMAPS: usize = 8;
+const RB_CLAIM_PERMITS: usize = 2;
+const RB_WATCH_CPUS: usize = 3;
+const RB_WATCH_LLCS: usize = 4;
+const RB_WATCH_PERMITS: usize = 5;
+const RB_PREFIX_CPU_ANY: usize = 6;
+const RB_PREFIX_CPU_EXCLUSIVE: usize = 7;
+const RB_PREFIX_LLC_ANY: usize = 8;
+const RB_PREFIX_LLC_EXCLUSIVE: usize = 9;
+const RECORD_BITMAPS: usize = 10;
 
 const STATE_FREE: u32 = 0;
 const STATE_WAITING: u32 = 1;
@@ -113,10 +126,17 @@ const STATE_HELD: u32 = 5;
 /// successor. Its logical reservation is parked until it is elected again;
 /// physical flock modes remain the final compatibility fence.
 const STATE_COORDINATOR_STANDBY: u32 = 6;
+/// A same-PID pre-exec arrival marker. Pending records carry the bounded
+/// preparation CPU/memory/token/physical-CPU footprint and enter predecessor
+/// aggregates, but remain ineligible for coordinator election. Activation
+/// atomically replaces that footprint with one complete ready claim after
+/// immutable VM artifacts have been prepared.
+const STATE_PENDING: u32 = 7;
 
 const BLOCK_NONE: u32 = 0;
 const BLOCK_CPU: u32 = 1;
 const BLOCK_LLC: u32 = 2;
+const BLOCK_PERMIT: u32 = 3;
 
 const PENDING_RESCAN: u64 = 1 << 0;
 const PENDING_OBSERVATION: u64 = 1 << 1;
@@ -148,7 +168,12 @@ const B_CANDIDATE_CPU_EX: usize = 23;
 const B_CANDIDATE_LLC_SH: usize = 24;
 const B_CANDIDATE_LLC_EX: usize = 25;
 const HEADER_BITMAPS: usize = 26;
-const AGGREGATE_BITMAPS: usize = 12;
+/// Per-CPU count of live Build-class exact claims. Preparation placement reads
+/// this aggregate once and prefers its complement, keeping immutable-image
+/// work off the physical CPUs currently licensed to Cargo/kernel builds while
+/// still allowing cooperative overlap when the complement is exhausted.
+const C_BUILD_CLAIM_CPUS: usize = 12;
+const AGGREGATE_BITMAPS: usize = 13;
 
 const S_CPU_SH: usize = 0;
 const S_CPU_EX: usize = 1;
@@ -265,6 +290,7 @@ pub(super) enum GrantResult<T> {
 pub(super) struct ObservationRequest {
     pub cpus: BTreeMap<usize, (Option<u64>, Option<u64>)>,
     pub llcs: BTreeMap<usize, (Option<u64>, Option<u64>)>,
+    pub permits: BTreeMap<usize, (Option<u64>, Option<u64>)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,6 +325,7 @@ pub(super) struct LlcObservation {
 pub(super) struct AvailabilityObservation {
     pub cpus: BTreeMap<usize, CpuObservation>,
     pub llcs: BTreeMap<usize, LlcObservation>,
+    pub permits: BTreeMap<usize, CpuObservation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,6 +341,8 @@ struct PossibleReleasePlan {
     cpu_ex: BTreeSet<usize>,
     llc_sh: BTreeSet<usize>,
     llc_ex: BTreeSet<usize>,
+    permit_sh: BTreeSet<usize>,
+    permit_ex: BTreeSet<usize>,
 }
 
 impl PossibleReleasePlan {
@@ -322,6 +351,8 @@ impl PossibleReleasePlan {
             && self.cpu_ex.is_empty()
             && self.llc_sh.is_empty()
             && self.llc_ex.is_empty()
+            && self.permit_sh.is_empty()
+            && self.permit_ex.is_empty()
     }
 
     fn extend(&mut self, other: Self) {
@@ -329,17 +360,14 @@ impl PossibleReleasePlan {
         self.cpu_ex.extend(other.cpu_ex);
         self.llc_sh.extend(other.llc_sh);
         self.llc_ex.extend(other.llc_ex);
+        self.permit_sh.extend(other.permit_sh);
+        self.permit_ex.extend(other.permit_ex);
     }
 }
 
 pub(super) enum FenceResult<T> {
     Fenced,
     Ran { value: T, watched: bool },
-}
-
-pub(super) enum ExclusivePublishResult<T> {
-    Fenced,
-    Ran(Option<(T, HeldClaim)>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,6 +381,7 @@ pub(super) struct AggregateSnapshot {
     cpu_exclusive_holders: Vec<u32>,
     llc_shared_holders: Vec<u32>,
     llc_exclusive_holders: Vec<u32>,
+    build_cpu_claims: Vec<u32>,
 }
 
 impl AggregateSnapshot {
@@ -367,6 +396,7 @@ impl AggregateSnapshot {
             cpu_exclusive_holders: vec![0; layout.bits],
             llc_shared_holders: vec![0; layout.bits],
             llc_exclusive_holders: vec![0; layout.bits],
+            build_cpu_claims: vec![0; layout.bits],
         }
     }
 
@@ -404,6 +434,11 @@ impl AggregateSnapshot {
         Ok(self.llc_exclusive_holders[llc] != 0)
     }
 
+    pub(super) fn cpu_build_claimed(&self, cpu: usize) -> Result<bool> {
+        self.ensure_index(cpu, "CPU")?;
+        Ok(self.build_cpu_claims[cpu] != 0)
+    }
+
     fn ensure_index(&self, index: usize, kind: &str) -> Result<()> {
         if index >= self.bits {
             anyhow::bail!("{kind} index {index} exceeds queue registry capacity");
@@ -439,6 +474,20 @@ impl AvailabilitySnapshot {
                 return Ok(false);
             }
         }
+        let permit_available = match candidate.permit_mode {
+            ClaimMode::Shared => &self.cpu_sh_available,
+            ClaimMode::Exclusive => &self.cpu_ex_available,
+        };
+        for &permit in &candidate.permits {
+            let index = permit_resource_index(permit)?;
+            if index >= self.bits {
+                anyhow::bail!("permit index {permit} exceeds queue registry capacity");
+            }
+            let mask = 1u64 << (index % 64);
+            if self.cpu_known[index / 64] & mask == 0 || permit_available[index / 64] & mask == 0 {
+                return Ok(false);
+            }
+        }
         let llc_available = match candidate.llc_mode {
             ClaimMode::Shared => &self.llc_sh_available,
             ClaimMode::Exclusive => &self.llc_ex_available,
@@ -461,7 +510,6 @@ struct Record {
     slot: u64,
     state: u32,
     ticket: u64,
-    #[cfg(test)]
     pid: u32,
     claim: ClaimSet,
     watch: ClaimSet,
@@ -470,6 +518,7 @@ struct Record {
     replan_claim_epoch: u64,
     grant_epoch: u64,
     prefix_epoch: u64,
+    backfill_credit: u32,
     prev_active: u64,
     next_active: u64,
 }
@@ -482,6 +531,11 @@ pub(super) struct Ticket {
     wake: Option<FutexSlot>,
     _interrupt_waiter: Option<InterruptibleFlockWaiter>,
     finished: bool,
+}
+
+pub(super) enum PendingRegistration {
+    Registered(Ticket),
+    Contended(u32),
 }
 
 /// One registry-owned publication of a live physical reservation.
@@ -539,6 +593,78 @@ impl HeldClaim {
     }
 }
 
+/// Rebuild the sole owner of a PENDING record after a same-PID exec. The
+/// inherited liveness fd is checked against both the record identity and the
+/// canonical liveness inode, and the transferred preparation OFDs must
+/// reconstruct the record's exact claim, before it is accepted as RAII
+/// authority.
+pub(super) fn import_pending_exec_handoff(
+    slot: u64,
+    ticket: u64,
+    liveness: OwnedFd,
+    preparation_claim: &ClaimSet,
+) -> Result<Ticket> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+    let mut table = Table::open_existing()?;
+    table.repair_consistency_if_needed()?;
+    let record = table
+        .record(slot)?
+        .filter(|record| record.ticket == ticket)
+        .ok_or_else(|| anyhow::anyhow!("pending exec-handoff ticket {ticket} disappeared"))?;
+    anyhow::ensure!(
+        record.state == STATE_PENDING,
+        "pending exec-handoff ticket {ticket} is in state {}, not PENDING",
+        record.state,
+    );
+    anyhow::ensure!(
+        record.pid == std::process::id(),
+        "pending exec-handoff ticket {ticket} belongs to PID {}, current PID is {}",
+        record.pid,
+        std::process::id(),
+    );
+    anyhow::ensure!(
+        &record.claim == preparation_claim && &record.watch == preparation_claim,
+        "pending exec-handoff preparation resources do not match ticket {ticket}",
+    );
+    let liveness_path = liveness_path(slot, ticket);
+    let actual = File::from(
+        liveness
+            .try_clone()
+            .context("duplicate pending exec-handoff liveness descriptor")?,
+    )
+    .metadata()
+    .context("stat pending exec-handoff liveness descriptor")?;
+    let expected = std::fs::metadata(&liveness_path)
+        .with_context(|| format!("stat pending liveness path {}", liveness_path.display()))?;
+    anyhow::ensure!(
+        actual.mode() & libc::S_IFMT == libc::S_IFREG
+            && (actual.dev(), actual.ino()) == (expected.dev(), expected.ino()),
+        "pending exec-handoff liveness descriptor does not name {}",
+        liveness_path.display(),
+    );
+    // The raw identity is also checked here to make accidental replacement
+    // during future refactors obvious in diagnostics.
+    anyhow::ensure!(
+        liveness.as_raw_fd() >= 0,
+        "invalid pending liveness descriptor"
+    );
+    let wake = table.map_futex(slot)?;
+    drop(table);
+    drop(_lock);
+    Ok(Ticket {
+        slot,
+        ticket,
+        liveness_path,
+        liveness: Some(liveness),
+        wake: Some(wake),
+        _interrupt_waiter: None,
+        finished: false,
+    })
+}
+
 impl Drop for HeldClaim {
     fn drop(&mut self) {
         #[cfg(test)]
@@ -572,6 +698,52 @@ pub(super) fn set_held_drop_hook_for_tests(hook: impl FnOnce() + 'static) {
 #[cfg(test)]
 pub(super) fn abandon_held_for_tests(held: HeldClaim) {
     held.abandon_for_tests();
+}
+
+#[cfg(test)]
+pub(super) fn exercise_pending_activation_overlap_watch_for_tests() -> Result<(bool, bool, bool)> {
+    let initial = ClaimSet::with_modes(
+        std::iter::empty(),
+        [1usize],
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let mut ticket = match Ticket::register_pending(3, initial.clone())? {
+        PendingRegistration::Registered(ticket) => ticket,
+        PendingRegistration::Contended(_) => {
+            anyhow::bail!("isolated pending activation test unexpectedly contended")
+        }
+    };
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        // Model the observer having resolved the PENDING watch before exact
+        // activation. Replacing the sole watch must either preserve that
+        // observation or publish a fresh observation request.
+        table.set_bitmap_bit(B_CPU_KNOWN, 1, true)?;
+        table.set_bitmap_bit(B_CPU_SH_AVAILABLE, 1, true)?;
+        table.set_bitmap_bit(B_PENDING_CPU_SH, 1, false)?;
+        table.set_bitmap_bit(B_CANDIDATE_CPU_SH, 1, true)?;
+        table.refresh_pending_observation_flag()?;
+    }
+    let exact = ClaimSet::with_modes(
+        std::iter::empty(),
+        [1usize, 2usize],
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    ticket.activate_pending(exact.clone(), exact, None)?;
+    let result = {
+        let _lock = lock_registry_existing(FlockMode::Shared)?;
+        let table = Table::open_existing()?;
+        (
+            table.bitmap_bit(B_WATCH_CPUS, 1)?,
+            table.bitmap_bit(B_CANDIDATE_CPU_SH, 1)?,
+            table.bitmap_bit(B_PENDING_CPU_SH, 1)?,
+        )
+    };
+    drop(ticket);
+    Ok(result)
 }
 
 struct FutexSlot {
@@ -621,6 +793,207 @@ impl FutexSlot {
 }
 
 impl Ticket {
+    /// Publish a same-PID pre-exec arrival together with its complete bounded
+    /// preparation footprint.  The caller already owns the matching physical
+    /// permit flocks.  Returning `None` means an older registry claim won the
+    /// race; the caller must drop those flocks and try another preparation
+    /// candidate.
+    pub(super) fn register_pending(
+        required_bits: usize,
+        claim: ClaimSet,
+    ) -> Result<PendingRegistration> {
+        validate_claim(&claim)?;
+        anyhow::ensure!(
+            !claim.is_empty(),
+            "PENDING admission must reserve preparation capacity"
+        );
+        let watch = claim.clone();
+        materialize_claim_paths(&watch)?;
+        let _lock = lock_registry_interruptible(None)?;
+        let mut table = Table::open(required_bits.max(required_resource_bits(&watch)).max(1))?;
+        table.repair_consistency_if_needed()?;
+        table.recover_coordinator_if_dead()?;
+        if table.claim_conflicts_aggregate(&claim)? {
+            return Ok(PendingRegistration::Contended(table.generation_wake()));
+        }
+        table.begin_transaction()?;
+
+        let ticket = table.next_ticket()?;
+        let slot = table.allocate_slot()?;
+        let liveness_path = liveness_path(slot, ticket);
+        let liveness = try_flock(&liveness_path, FlockMode::Exclusive)?.ok_or_else(|| {
+            anyhow::anyhow!("fresh pending-ticket liveness file is already locked")
+        })?;
+        let predecessors = table.aggregate_claim_snapshot();
+        let newly_watched = table.newly_watched(&watch)?;
+        let issue_serial = table.max_watch_serial(&watch)?;
+        table.initialize_record(
+            slot,
+            ticket,
+            std::process::id(),
+            &claim,
+            &watch,
+            STATE_PENDING,
+            &predecessors,
+            table.claim_epoch(),
+            issue_serial,
+        )?;
+        table.append_active(slot)?;
+        table.adjust_claim_counts(&claim, true)?;
+        table.adjust_watch_counts(&watch, true)?;
+        table.mark_observation_modes(&newly_watched)?;
+        table.set_next_ticket(
+            ticket
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("queue ticket id overflow"))?,
+        );
+        table.bump_generation()?;
+        table.finish_transaction()?;
+        let wake = table.map_futex(slot)?;
+        drop(table);
+        drop(_lock);
+
+        Ok(PendingRegistration::Registered(Self {
+            slot,
+            ticket,
+            liveness_path,
+            liveness: Some(liveness),
+            wake: Some(wake),
+            _interrupt_waiter: None,
+            finished: false,
+        }))
+    }
+
+    /// Atomically replace this process's bounded preparation claim with one
+    /// complete schedulable claim. No intermediate state double-counts or
+    /// drops its CPU/memory capacity.
+    pub(super) fn activate_pending(
+        &mut self,
+        claim: ClaimSet,
+        watch: ClaimSet,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<()> {
+        validate_claim(&claim)?;
+        let watch = union_claims(&watch, &claim);
+        validate_claim_within_watch(&claim, &watch)?;
+        materialize_claim_paths(&watch)?;
+        let interrupt_waiter = cancelled
+            .map(|_| InterruptibleFlockWaiter::register())
+            .transpose()?;
+
+        let _lock = lock_registry_interruptible_existing(cancelled)?;
+        let mut table = Table::open(required_resource_bits(&watch))?;
+        table.repair_consistency_if_needed()?;
+        table.recover_coordinator_if_dead()?;
+        let record = table
+            .record(self.slot)?
+            .filter(|record| record.ticket == self.ticket)
+            .ok_or_else(|| anyhow::anyhow!("pending ticket {} disappeared", self.ticket))?;
+        anyhow::ensure!(
+            record.state == STATE_PENDING,
+            "pending ticket {} is in state {}, not PENDING",
+            self.ticket,
+            record.state,
+        );
+        anyhow::ensure!(
+            record.pid == std::process::id(),
+            "pending ticket {} belongs to PID {}, current PID is {}",
+            self.ticket,
+            record.pid,
+            std::process::id(),
+        );
+
+        let issue_serial = table.max_watch_serial(&watch)?;
+        table.begin_transaction()?;
+        table.adjust_claim_counts(&record.claim, false)?;
+        table.adjust_watch_counts(&record.watch, false)?;
+        // Compute the observation transition only after removing the old
+        // PENDING watch.  Otherwise an overlapping PENDING -> WAITING watch
+        // looks pre-existing here, then drops to zero below and loses its
+        // observed mode permanently.
+        let newly_watched = table.newly_watched(&watch)?;
+        table.adjust_claim_counts(&claim, true)?;
+        table.adjust_watch_counts(&watch, true)?;
+        table.mark_observation_modes(&newly_watched)?;
+        let layout = table.layout;
+        {
+            let bytes = table
+                .record_bytes_mut(self.slot)?
+                .ok_or_else(|| anyhow::anyhow!("pending slot {} disappeared", self.slot))?;
+            clear_record_claim_bits(bytes, layout);
+            clear_record_watch_bits(bytes, layout);
+            write_u32(
+                bytes,
+                R_CLAIM_LLC_MODE,
+                u32::from(claim.llc_mode == ClaimMode::Exclusive),
+            );
+            write_u32(
+                bytes,
+                R_CLAIM_CPU_MODE,
+                u32::from(claim.cpu_mode == ClaimMode::Exclusive),
+            );
+            write_u32(
+                bytes,
+                R_CLAIM_PERMIT_MODE,
+                u32::from(claim.permit_mode == ClaimMode::Exclusive),
+            );
+            write_u32(
+                bytes,
+                R_WATCH_LLC_MODE,
+                u32::from(watch.llc_mode == ClaimMode::Exclusive),
+            );
+            write_u32(
+                bytes,
+                R_WATCH_CPU_MODE,
+                u32::from(watch.cpu_mode == ClaimMode::Exclusive),
+            );
+            write_u32(
+                bytes,
+                R_WATCH_PERMIT_MODE,
+                u32::from(watch.permit_mode == ClaimMode::Exclusive),
+            );
+            write_u32(
+                bytes,
+                R_CLAIM_CLASS,
+                encode_admission_class(claim.admission_class),
+            );
+            write_u32(
+                bytes,
+                R_WATCH_CLASS,
+                encode_admission_class(watch.admission_class),
+            );
+            encode_claim(bytes, layout, &claim, &watch)?;
+            write_u64(bytes, R_ISSUE_SERIAL, issue_serial);
+            write_u64(bytes, R_GRANT_EPOCH, 0);
+            write_u64(bytes, R_REPLAN_CLAIM_EPOCH, 0);
+            write_u64(bytes, R_PREFIX_EPOCH, 0);
+            write_u32(bytes, R_BACKFILL_CREDIT, backfill_credit_for_watch(&watch));
+            write_u64(bytes, R_BLOCKED_SERIAL, 0);
+            write_u32(bytes, R_BLOCK_KIND, BLOCK_NONE);
+            write_u32(bytes, R_BLOCK_MODE, 0);
+            write_u64(bytes, R_BLOCK_INDEX, 0);
+            // Publish the complete record last.
+            write_u32(bytes, R_STATE, STATE_WAITING);
+        }
+        table.mark_claim_changed(self.ticket)?;
+        table.bump_generation()?;
+        table.elect_coordinator_in_transaction()?;
+        table.finish_transaction()?;
+        self._interrupt_waiter = interrupt_waiter;
+        drop(table);
+        drop(_lock);
+        notify_coordinator();
+        Ok(())
+    }
+
+    pub(super) fn pending_exec_handoff_parts(&self) -> Result<(u64, u64, std::os::fd::RawFd)> {
+        use std::os::fd::AsRawFd;
+        let liveness = self.liveness.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("pending admission liveness descriptor was already consumed")
+        })?;
+        Ok((self.slot, self.ticket, liveness.as_raw_fd()))
+    }
+
     #[cfg(test)]
     pub(super) fn register(
         claim: ClaimSet,
@@ -659,6 +1032,17 @@ impl Ticket {
                 claim.cpu_mode
             );
         }
+        if !watch.permits.is_empty()
+            && !claim.permits.is_empty()
+            && watch.permit_mode != ClaimMode::Exclusive
+            && watch.permit_mode != claim.permit_mode
+        {
+            anyhow::bail!(
+                "queue watch permit mode {:?} does not cover exact claim mode {:?}",
+                watch.permit_mode,
+                claim.permit_mode
+            );
+        }
         let watch = union_claims(&watch, &claim);
         let contention_markers = initial_contention
             .as_ref()
@@ -695,6 +1079,7 @@ impl Ticket {
                 .find(|marker| match marker.blocker {
                     ResourceKey::Cpu(index) => claim.cpus.contains(&index),
                     ResourceKey::Llc(index) => claim.llcs.contains(&index),
+                    ResourceKey::Permit(index) => claim.permits.contains(&index),
                 });
         let contended_exact = exact_blocker.is_some();
         let initial_state = if has_predecessor
@@ -1062,6 +1447,10 @@ impl Ticket {
                         designated.llcs.contains(&index)
                             && ClaimMode::from(evidence.mode) == designated.llc_mode
                     }
+                    ResourceKey::Permit(index) => {
+                        designated.permits.contains(&index)
+                            && ClaimMode::from(evidence.mode) == designated.permit_mode
+                    }
                 });
         // A failed nonblocking flock is authoritative current negative
         // evidence even if a predecessor epoch or availability serial changed
@@ -1116,7 +1505,7 @@ impl Ticket {
                 // The optimistic availability snapshot predates this physical
                 // acquisition. Revoke it before releasing the payload so no
                 // waiter can be regranted from the stale free snapshot.
-                table.mark_unknown(&designated.cpus, &designated.llcs)?;
+                table.mark_unknown(&designated.cpus, &designated.llcs, &designated.permits)?;
                 table.bump_generation()?;
             }
             if return_to_waiting || released_acquired {
@@ -1212,6 +1601,7 @@ impl Ticket {
         coordinator_claim: Option<&ClaimSet>,
         closed_cpus: &BTreeSet<usize>,
         closed_llcs: &BTreeSet<usize>,
+        closed_permits: &BTreeSet<usize>,
         overflow: bool,
         contention: &[ContentionMarker],
         closed_tickets: &[(u64, u64)],
@@ -1221,7 +1611,7 @@ impl Ticket {
         cancelled: Option<&AtomicBool>,
     ) -> Result<ScheduleSnapshot> {
         let pure_release_batch = coordinator_claim.is_none()
-            && (!closed_cpus.is_empty() || !closed_llcs.is_empty())
+            && (!closed_cpus.is_empty() || !closed_llcs.is_empty() || !closed_permits.is_empty())
             && !overflow
             && contention.is_empty()
             && closed_tickets.is_empty()
@@ -1229,8 +1619,12 @@ impl Ticket {
             && reconcile_liveness_after.is_none()
             && !force_liveness_maintenance;
         if pure_release_batch
-            && let Some(snapshot) =
-                self.try_known_free_release_snapshot(closed_cpus, closed_llcs, cancelled)?
+            && let Some(snapshot) = self.try_known_free_release_snapshot(
+                closed_cpus,
+                closed_llcs,
+                closed_permits,
+                cancelled,
+            )?
         {
             return Ok(snapshot);
         }
@@ -1259,22 +1653,30 @@ impl Ticket {
         validate_contention_within_watch(contention, &record.watch)?;
         let event_cpus;
         let event_llcs;
+        let event_permits;
         if overflow {
             let aggregate = table.aggregate_watch()?;
             event_cpus = aggregate.cpus;
             event_llcs = aggregate.llcs;
+            event_permits = aggregate.permits;
         } else {
-            (event_cpus, event_llcs) = table.watched_subset(closed_cpus, closed_llcs)?;
+            (event_cpus, event_llcs, event_permits) =
+                table.watched_subset(closed_cpus, closed_llcs, closed_permits)?;
         }
         let claim_changed = coordinator_claim.is_some_and(|claim| *claim != record.claim);
-        let mut release_plan = table.possible_release_plan(&event_cpus, &event_llcs)?;
+        let mut release_plan =
+            table.possible_release_plan(&event_cpus, &event_llcs, &event_permits)?;
         if reobserve_watch {
             // The coordinator installs its inotify watch before this first
             // schedule call. Re-observe only modes that could have become less
             // restrictive before that watch existed: known-free modes cannot
             // improve, while existing unknown/pending work remains durable.
             let watch = table.aggregate_watch()?;
-            release_plan.extend(table.possible_release_plan(&watch.cpus, &watch.llcs)?);
+            release_plan.extend(table.possible_release_plan(
+                &watch.cpus,
+                &watch.llcs,
+                &watch.permits,
+            )?);
         }
         let registry_changed = claim_changed || !release_plan.is_empty() || !contention.is_empty();
         if registry_changed {
@@ -1365,6 +1767,7 @@ impl Ticket {
         &self,
         closed_cpus: &BTreeSet<usize>,
         closed_llcs: &BTreeSet<usize>,
+        closed_permits: &BTreeSet<usize>,
         cancelled: Option<&AtomicBool>,
     ) -> Result<Option<ScheduleSnapshot>> {
         check_cancelled(cancelled)?;
@@ -1410,18 +1813,26 @@ impl Ticket {
         let record = decode_record(record_bytes, layout, self.slot)?;
 
         let watch_llcs = decode_header_bitset(&header, layout, B_WATCH_LLCS);
-        let watch_cpus = decode_header_bitset(&header, layout, B_WATCH_CPUS);
+        let (watch_cpus, watch_permits) =
+            split_cpu_permit_indices(decode_header_bitset(&header, layout, B_WATCH_CPUS));
         let watch_llc_exclusive = decode_header_bitset(&header, layout, B_WATCH_LLC_EXCLUSIVE);
-        let watch_cpu_exclusive = decode_header_bitset(&header, layout, B_WATCH_CPU_EXCLUSIVE);
-        let watch = ClaimSet::with_claim_modes(
+        let (watch_cpu_exclusive, watch_permit_exclusive) =
+            split_cpu_permit_indices(decode_header_bitset(&header, layout, B_WATCH_CPU_EXCLUSIVE));
+        let watch = ClaimSet::with_all_claim_modes(
             watch_llcs,
             watch_cpus,
+            watch_permits,
             if watch_llc_exclusive.is_empty() {
                 ClaimMode::Shared
             } else {
                 ClaimMode::Exclusive
             },
             if watch_cpu_exclusive.is_empty() {
+                ClaimMode::Shared
+            } else {
+                ClaimMode::Exclusive
+            },
+            if watch_permit_exclusive.is_empty() {
                 ClaimMode::Shared
             } else {
                 ClaimMode::Exclusive
@@ -1447,6 +1858,7 @@ impl Ticket {
             cpu_exclusive_holders: vec![0; layout.bits],
             llc_shared_holders: vec![0; layout.bits],
             llc_exclusive_holders: vec![0; layout.bits],
+            build_cpu_claims: vec![0; layout.bits],
         };
         let header_words = |which| {
             (0..layout.words)
@@ -1469,6 +1881,7 @@ impl Ticket {
         };
         let watched_cpus = closed_cpus.intersection(&watch.cpus).copied();
         let watched_llcs = closed_llcs.intersection(&watch.llcs).copied();
+        let watched_permits = closed_permits.intersection(&watch.permits).copied();
         let cpus_free = watched_cpus.into_iter().all(|cpu| {
             header_bitmap_bit(&header, layout, B_CPU_KNOWN, cpu)
                 && header_bitmap_bit(&header, layout, B_CPU_SH_AVAILABLE, cpu)
@@ -1481,7 +1894,16 @@ impl Ticket {
                 && (!watch_llc_exclusive.contains(&llc)
                     || header_bitmap_bit(&header, layout, B_LLC_EX_AVAILABLE, llc))
         });
-        if !cpus_free || !llcs_free {
+        let permits_free = watched_permits.into_iter().all(|permit| {
+            let Ok(index) = permit_resource_index(permit) else {
+                return false;
+            };
+            header_bitmap_bit(&header, layout, B_CPU_KNOWN, index)
+                && header_bitmap_bit(&header, layout, B_CPU_SH_AVAILABLE, index)
+                && (!watch_permit_exclusive.contains(&permit)
+                    || header_bitmap_bit(&header, layout, B_CPU_EX_AVAILABLE, index))
+        });
+        if !cpus_free || !llcs_free || !permits_free {
             return Ok(None);
         }
         check_cancelled(cancelled)?;
@@ -1740,11 +2162,6 @@ pub(super) fn aggregate_conflicts(candidate: &ClaimSet) -> Result<bool> {
     ))
 }
 
-#[cfg(test)]
-pub(super) fn shared_probe_is_blocked_for_tests() -> Result<bool> {
-    Ok(try_lock_registry_existing_nonblocking(FlockMode::Shared)?.is_none())
-}
-
 pub(super) fn aggregate_snapshot(required: &ClaimSet) -> Result<AggregateSnapshot> {
     validate_claim(required)?;
     let required_layout = HeaderLayout::new(required_resource_bits(required))
@@ -1816,6 +2233,7 @@ pub(super) fn aggregate_snapshot(required: &ClaimSet) -> Result<AggregateSnapsho
             cpu_exclusive_holders: read_counts(B_HELD_CPU_EXCLUSIVE),
             llc_shared_holders: read_counts(B_HELD_LLC_SHARED),
             llc_exclusive_holders: read_counts(B_HELD_LLC_EXCLUSIVE),
+            build_cpu_claims: read_counts(C_BUILD_CLAIM_CPUS),
         };
         // The common disjoint snapshot is a pure SH/read-only operation. Only
         // a claim that is actually fenced needs any liveness work.
@@ -1874,8 +2292,10 @@ pub(super) fn round_trip_claim_modes_for_tests(
         .cpus
         .iter()
         .chain(claim.llcs.iter())
+        .chain(claim.permits.iter())
         .chain(watch.cpus.iter())
         .chain(watch.llcs.iter())
+        .chain(watch.permits.iter())
         .copied()
         .max()
         .unwrap_or(0);
@@ -1900,6 +2320,16 @@ pub(super) fn round_trip_claim_modes_for_tests(
         &mut bytes,
         R_WATCH_CPU_MODE,
         u32::from(watch.cpu_mode == ClaimMode::Exclusive),
+    );
+    write_u32(
+        &mut bytes,
+        R_CLAIM_PERMIT_MODE,
+        u32::from(claim.permit_mode == ClaimMode::Exclusive),
+    );
+    write_u32(
+        &mut bytes,
+        R_WATCH_PERMIT_MODE,
+        u32::from(watch.permit_mode == ClaimMode::Exclusive),
     );
     encode_claim(&mut bytes, layout, claim, watch)?;
     let record = decode_record(&bytes, layout, 0)?;
@@ -2140,45 +2570,6 @@ pub(super) fn with_aggregate_fence<T>(
     }
 }
 
-/// Run one nonblocking physical EX→SH conversion while holding the registry's
-/// exclusive fence, then publish the weaker lifetime claim before releasing
-/// that fence.
-///
-/// Ordinary fast probes retain the scalable shared fence. Only conversions
-/// whose old physical lock is momentarily released by `flock(LOCK_SH)` use
-/// this short EX section, preventing another current-version fast probe from
-/// entering the conversion window.
-pub(super) fn with_exclusive_conversion_fence<T>(
-    probe: &ClaimSet,
-    published: &ClaimSet,
-    cancelled: Option<&AtomicBool>,
-    run: impl FnOnce() -> Result<Option<T>>,
-) -> Result<ExclusivePublishResult<T>> {
-    validate_claim(probe)?;
-    validate_claim(published)?;
-    anyhow::ensure!(
-        probe.cpus == published.cpus && probe.llcs == published.llcs,
-        "conversion probe and lifetime publication must name identical resources"
-    );
-    validate_claim_within_watch(published, probe)?;
-    materialize_claim_paths(probe)?;
-    let _lock = lock_registry_interruptible(cancelled)?;
-    let mut table = Table::open(required_resource_bits(probe))?;
-    table.repair_consistency_if_needed()?;
-    table.recover_coordinator_if_dead()?;
-    if table.claim_conflicts_aggregate(probe)? {
-        return Ok(ExclusivePublishResult::Fenced);
-    }
-    let Some(value) = run()? else {
-        return Ok(ExclusivePublishResult::Ran(None));
-    };
-    let held = publish_acquired_in_table(&mut table, published)?;
-    drop(table);
-    drop(_lock);
-    notify_coordinator();
-    Ok(ExclusivePublishResult::Ran(Some((value, held))))
-}
-
 #[cfg(test)]
 pub(super) fn snapshot() -> Result<Vec<(u64, u32, ClaimSet)>> {
     let Some(_lock) = try_lock_registry_existing(FlockMode::Exclusive)? else {
@@ -2227,6 +2618,7 @@ pub(super) fn diagnostics_for_tests() -> Result<String> {
     let mut rows = Vec::with_capacity(records.len());
     for record in records {
         let state = match record.state {
+            STATE_PENDING => "pending",
             STATE_WAITING => "waiting",
             STATE_GRANTED => "granted",
             STATE_COORDINATOR => "coordinator",
@@ -2239,7 +2631,8 @@ pub(super) fn diagnostics_for_tests() -> Result<String> {
         let watch_serial = table.max_watch_serial(&record.watch)?;
         rows.push(format!(
             "ticket={} pid={} state={} claim={:?} watch={:?} blocked={:?} \
-             issue_serial={} watch_serial={} grant_epoch={} replan_epoch={} prefix_epoch={}",
+             issue_serial={} watch_serial={} grant_epoch={} replan_epoch={} prefix_epoch={} \
+             backfill_credit={}",
             record.ticket,
             record.pid,
             state,
@@ -2251,6 +2644,7 @@ pub(super) fn diagnostics_for_tests() -> Result<String> {
             record.grant_epoch,
             record.replan_claim_epoch,
             record.prefix_epoch,
+            record.backfill_credit,
         ));
     }
     Ok(format!(
@@ -2512,6 +2906,224 @@ fn set_cpu_free_for_tests(table: &mut Table, cpu: usize, free: bool) -> Result<(
 }
 
 #[cfg(test)]
+pub(super) fn exercise_resource_weighted_backfill_accounting_for_tests() -> (u32, u32, u32, u32) {
+    let cooperative_end = super::super::cooperative_cpu_permit_end();
+    let heavy_units = cooperative_end.min(4);
+    let watch = ClaimSet::with_permits(
+        std::iter::empty(),
+        [0usize],
+        0..cooperative_end,
+        FlockMode::Shared,
+        FlockMode::Shared,
+        FlockMode::Exclusive,
+    );
+    let light = ClaimSet::with_permits(
+        std::iter::empty(),
+        [0usize],
+        [0usize],
+        FlockMode::Shared,
+        FlockMode::Shared,
+        FlockMode::Exclusive,
+    );
+    let heavy = ClaimSet::with_permits(
+        std::iter::empty(),
+        [0usize],
+        0..heavy_units,
+        FlockMode::Shared,
+        FlockMode::Shared,
+        FlockMode::Exclusive,
+    );
+    let non_cooperative = ClaimSet::with_permits(
+        std::iter::empty(),
+        [0usize, 1usize],
+        [cooperative_end],
+        FlockMode::Shared,
+        FlockMode::Shared,
+        FlockMode::Exclusive,
+    );
+    (
+        backfill_credit_for_watch(&watch),
+        backfill_cost_for_claim(&light),
+        backfill_cost_for_claim(&heavy),
+        backfill_cost_for_claim(&non_cooperative),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn exercise_work_conserving_backfill_for_tests()
+-> Result<(usize, usize, usize, bool, bool, bool, bool)> {
+    const TEST_CREDIT: u32 = 3;
+    const CONFLICTING: usize = TEST_CREDIT as usize + 2;
+    const DISJOINT: usize = TEST_CREDIT as usize + 5;
+
+    let coordinator_claim = ClaimSet::new(std::iter::empty(), [3usize], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let wide = ClaimSet::with_permits(
+        std::iter::empty(),
+        [0usize, 1usize],
+        0..TEST_CREDIT as usize,
+        FlockMode::Exclusive,
+        FlockMode::Exclusive,
+        FlockMode::Exclusive,
+    );
+    let mut wide_ticket = Ticket::register(wide.clone(), wide, None)?;
+    let conflicting_claim = ClaimSet::with_modes(
+        std::iter::empty(),
+        [0usize],
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let mut conflicting = (0..CONFLICTING)
+        .map(|_| Ticket::register(conflicting_claim.clone(), conflicting_claim.clone(), None))
+        .collect::<Result<Vec<_>>>()?;
+    let disjoint_claim = ClaimSet::with_modes(
+        std::iter::empty(),
+        [2usize],
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let mut disjoint = (0..DISJOINT)
+        .map(|_| Ticket::register(disjoint_claim.clone(), disjoint_claim.clone(), None))
+        .collect::<Result<Vec<_>>>()?;
+
+    let (charged_grants, waiting_after_budget, disjoint_grants) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.set_record_state(coordinator.slot, STATE_COORDINATOR)?;
+        table.set_record_state(wide_ticket.slot, STATE_WAITING)?;
+        table.set_record_backfill_credit(wide_ticket.slot, TEST_CREDIT)?;
+        table.clear_record_blocked(wide_ticket.slot)?;
+        for ticket in conflicting.iter().chain(&disjoint) {
+            table.set_record_state(ticket.slot, STATE_WAITING)?;
+            table.clear_record_blocked(ticket.slot)?;
+        }
+        set_cpu_free_for_tests(&mut table, 0, true)?;
+        set_cpu_free_for_tests(&mut table, 1, false)?;
+        set_cpu_free_for_tests(&mut table, 2, true)?;
+        set_cpu_free_for_tests(&mut table, 3, true)?;
+        for permit in 0..TEST_CREDIT as usize {
+            set_cpu_free_for_tests(&mut table, permit_resource_index(permit)?, true)?;
+        }
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible()?;
+
+        let remaining = table
+            .record(wide_ticket.slot)?
+            .ok_or_else(|| anyhow::anyhow!("wide backfill head disappeared"))?
+            .backfill_credit;
+        anyhow::ensure!(
+            remaining == 0,
+            "wide backfill head retained {remaining} resource units after its wave"
+        );
+
+        let count_state = |table: &mut Table, tickets: &[Ticket], state| -> Result<usize> {
+            tickets.iter().try_fold(0usize, |count, ticket| {
+                Ok(count
+                    + if table
+                        .record(ticket.slot)?
+                        .is_some_and(|record| record.state == state)
+                    {
+                        1
+                    } else {
+                        0
+                    })
+            })
+        };
+        (
+            count_state(&mut table, &conflicting, STATE_GRANTED)?,
+            count_state(&mut table, &conflicting, STATE_WAITING)?,
+            count_state(&mut table, &disjoint, STATE_GRANTED)?,
+        )
+    };
+
+    let admitted_survives_drain = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_availability_for_tests(&mut table, 0, CpuAvailability::SharedHeld)?;
+        set_cpu_free_for_tests(&mut table, 1, false)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible()?;
+        conflicting[..TEST_CREDIT as usize].iter().all(|ticket| {
+            table
+                .record(ticket.slot)
+                .ok()
+                .flatten()
+                .is_some_and(|record| record.state == STATE_GRANTED)
+        }) && conflicting[TEST_CREDIT as usize..].iter().all(|ticket| {
+            table
+                .record(ticket.slot)
+                .ok()
+                .flatten()
+                .is_some_and(|record| record.state == STATE_WAITING)
+        })
+    };
+
+    let racer_index = TEST_CREDIT as usize;
+    let (wide_wins, racer_revoked, disjoint_preserved) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        // Model the admitted burst having released. The extra GRANTED record
+        // models a callback issued from the old availability snapshot just as
+        // the wide head becomes viable.
+        for ticket in &conflicting[..TEST_CREDIT as usize] {
+            table.set_record_state(ticket.slot, STATE_WAITING)?;
+        }
+        table.set_record_state(conflicting[racer_index].slot, STATE_GRANTED)?;
+        set_cpu_free_for_tests(&mut table, 0, true)?;
+        set_cpu_free_for_tests(&mut table, 1, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible()?;
+        (
+            table
+                .record(wide_ticket.slot)?
+                .is_some_and(|record| record.state == STATE_GRANTED),
+            table
+                .record(conflicting[racer_index].slot)?
+                .is_some_and(|record| record.state == STATE_WAITING),
+            disjoint.iter().all(|ticket| {
+                table
+                    .record(ticket.slot)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.state == STATE_GRANTED)
+            }),
+        )
+    };
+    let mut racer_callbacks = 0usize;
+    let racer_result = conflicting[racer_index].run_granted(
+        None,
+        |_designated, _watch, _allowed, _predecessors, _availability| {
+            racer_callbacks += 1;
+            Ok(GrantAttempt::<()> {
+                acquired: None,
+                next_claim: conflicting_claim.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    let stale_callback_suppressed =
+        matches!(racer_result, GrantResult::LostGrant) && racer_callbacks == 0;
+
+    for ticket in &mut disjoint {
+        ticket.finish(None)?;
+    }
+    for ticket in &mut conflicting {
+        ticket.finish(None)?;
+    }
+    wide_ticket.finish(None)?;
+    coordinator.finish(None)?;
+    Ok((
+        charged_grants,
+        waiting_after_budget,
+        disjoint_grants,
+        admitted_survives_drain,
+        wide_wins,
+        racer_revoked && disjoint_preserved,
+        stale_callback_suppressed,
+    ))
+}
+
+#[cfg(test)]
 pub(super) fn exercise_granted_only_drain_election_reads_for_tests(
     waiters: usize,
 ) -> Result<usize> {
@@ -2552,6 +3164,7 @@ pub(super) fn exercise_known_free_close_storm_for_tests(
         None,
         &empty,
         &empty,
+        &empty,
         false,
         &[],
         &[],
@@ -2587,6 +3200,7 @@ pub(super) fn exercise_known_free_close_storm_for_tests(
             None,
             &closed,
             &empty,
+            &empty,
             false,
             &[],
             &[],
@@ -2619,6 +3233,7 @@ pub(super) fn exercise_llc_sh_only_shared_to_free_close_for_tests() -> Result<(b
     let empty = BTreeSet::new();
     let initial = ticket.schedule(
         None,
+        &empty,
         &empty,
         &empty,
         false,
@@ -2660,6 +3275,7 @@ pub(super) fn exercise_llc_sh_only_shared_to_free_close_for_tests() -> Result<(b
         None,
         &empty,
         &closed,
+        &empty,
         false,
         &[],
         &[],
@@ -2683,6 +3299,7 @@ pub(super) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usi
     let empty = BTreeSet::new();
     let initial = ticket.schedule(
         None,
+        &empty,
         &empty,
         &empty,
         false,
@@ -2714,6 +3331,7 @@ pub(super) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usi
     let pending = ticket.schedule(
         None,
         &closed,
+        &empty,
         &empty,
         false,
         &[],
@@ -3011,6 +3629,7 @@ pub(super) fn exercise_coordinator_turnover_for_tests(
             None,
             &empty,
             &empty,
+            &empty,
             false,
             &[],
             &[],
@@ -3149,6 +3768,7 @@ pub(super) fn exercise_exact_commit_scan_elision_for_tests(commits: usize) -> Re
             None,
             &empty,
             &empty,
+            &empty,
             false,
             &[],
             &[],
@@ -3191,6 +3811,7 @@ pub(super) fn exercise_mismatched_commit_rescan_for_tests() -> Result<(u64, bool
     let empty = BTreeSet::new();
     middle.schedule(
         None,
+        &empty,
         &empty,
         &empty,
         false,
@@ -3243,6 +3864,7 @@ pub(super) fn exercise_superset_commit_rescan_for_tests() -> Result<(u64, bool)>
     let empty = BTreeSet::new();
     middle.schedule(
         None,
+        &empty,
         &empty,
         &empty,
         false,
@@ -3299,6 +3921,7 @@ pub(super) fn exercise_shared_commit_improvement_for_tests() -> Result<(u64, boo
         None,
         &empty,
         &empty,
+        &empty,
         false,
         &[],
         &[],
@@ -3349,6 +3972,7 @@ pub(super) fn exercise_cpu_shared_commit_improvement_for_tests() -> Result<(u64,
     let empty = BTreeSet::new();
     middle.schedule(
         None,
+        &empty,
         &empty,
         &empty,
         false,
@@ -3601,6 +4225,7 @@ pub(super) fn exercise_prefix_epoch_validation_for_tests() -> Result<(usize, boo
     let empty = BTreeSet::new();
     coordinator.schedule(
         None,
+        &empty,
         &empty,
         &empty,
         false,
@@ -4212,6 +4837,7 @@ fn validate_claim(claim: &ClaimSet) -> Result<()> {
 pub(super) fn validate_claim_within_watch(claim: &ClaimSet, watch: &ClaimSet) -> Result<()> {
     if !claim.cpus.is_subset(&watch.cpus)
         || !claim.llcs.is_subset(&watch.llcs)
+        || !claim.permits.is_subset(&watch.permits)
         || (!claim.cpus.is_empty()
             && !watch.cpus.is_empty()
             && watch.cpu_mode != ClaimMode::Exclusive
@@ -4220,6 +4846,18 @@ pub(super) fn validate_claim_within_watch(claim: &ClaimSet, watch: &ClaimSet) ->
             && !watch.llcs.is_empty()
             && watch.llc_mode != ClaimMode::Exclusive
             && claim.llc_mode != watch.llc_mode)
+        || (!claim.permits.is_empty()
+            && !watch.permits.is_empty()
+            && watch.permit_mode != ClaimMode::Exclusive
+            && claim.permit_mode != watch.permit_mode)
+        || !matches!(
+            (watch.admission_class, claim.admission_class),
+            (AdmissionClass::Ordinary, AdmissionClass::Ordinary)
+                | (AdmissionClass::Ordinary, AdmissionClass::DefaultBorrow)
+                | (AdmissionClass::DefaultBorrow, AdmissionClass::Ordinary)
+                | (AdmissionClass::DefaultBorrow, AdmissionClass::DefaultBorrow)
+                | (AdmissionClass::Build, AdmissionClass::Build)
+        )
     {
         anyhow::bail!(
             "queue claim is outside its immutable watch set: claim={claim:?}, watch={watch:?}"
@@ -4244,6 +4882,11 @@ fn validate_contention_within_watch(
                     && (watch.llc_mode == ClaimMode::Exclusive
                         || ClaimMode::from(marker.mode) == watch.llc_mode)
             }
+            ResourceKey::Permit(index) => {
+                watch.permits.contains(&index)
+                    && (watch.permit_mode == ClaimMode::Exclusive
+                        || ClaimMode::from(marker.mode) == watch.permit_mode)
+            }
         };
         if !valid {
             anyhow::bail!(
@@ -4264,6 +4907,9 @@ fn claim_is_flexible(claim: &ClaimSet, watch: &ClaimSet) -> bool {
         || claim.llcs != watch.llcs
         || claim.cpu_mode != watch.cpu_mode
         || claim.llc_mode != watch.llc_mode
+        || claim.permits != watch.permits
+        || claim.permit_mode != watch.permit_mode
+        || claim.admission_class != watch.admission_class
 }
 
 fn materialize_claim_paths(claim: &ClaimSet) -> Result<()> {
@@ -4272,6 +4918,9 @@ fn materialize_claim_paths(claim: &ClaimSet) -> Result<()> {
     }
     for &cpu in &claim.cpus {
         materialize_if_missing(super::super::cpu_lock_path(cpu))?;
+    }
+    for &permit in &claim.permits {
+        materialize_if_missing(super::super::permit_lock_path(permit))?;
     }
     Ok(())
 }
@@ -4289,7 +4938,7 @@ fn materialize_if_missing(path: impl AsRef<std::path::Path>) -> Result<()> {
 }
 
 fn required_resource_bits(claim: &ClaimSet) -> usize {
-    let claim_bits = claim
+    let physical_bits = claim
         .llcs
         .iter()
         .chain(&claim.cpus)
@@ -4297,10 +4946,68 @@ fn required_resource_bits(claim: &ClaimSet) -> usize {
         .max()
         .unwrap_or(0)
         .saturating_add(1);
-    // The v10 mapping is deliberately overprovisioned once. It never needs a
+    let permit_bits = claim
+        .permits
+        .iter()
+        .copied()
+        .max()
+        .map(|permit| {
+            host_cpu_resource_bits()
+                .saturating_add(permit)
+                .saturating_add(1)
+        })
+        .unwrap_or(0);
+    // The v14 mapping is deliberately overprovisioned once. It never needs a
     // migration/grow protocol when the first low-index ticket is followed by a
-    // valid sparse CPU/LLC index on the same host.
-    claim_bits.max(host_cpu_resource_bits()).max(4096)
+    // valid sparse CPU/LLC/permit index on the same host. Permit indices occupy
+    // a disjoint internal bit range immediately after possible host CPUs.
+    physical_bits
+        .max(permit_bits)
+        .max(
+            host_cpu_resource_bits()
+                .saturating_mul(2)
+                .min(MAX_RESOURCE_BITS),
+        )
+        .max(4096)
+}
+
+pub(super) fn required_bits_for_permit_index(max_permit: usize) -> usize {
+    host_cpu_resource_bits()
+        .saturating_add(max_permit)
+        .saturating_add(1)
+        .max(
+            host_cpu_resource_bits()
+                .saturating_mul(2)
+                .min(MAX_RESOURCE_BITS),
+        )
+        .max(4096)
+        .min(MAX_RESOURCE_BITS)
+}
+
+fn permit_resource_index(permit: usize) -> Result<usize> {
+    let index = host_cpu_resource_bits()
+        .checked_add(permit)
+        .ok_or_else(|| anyhow::anyhow!("permit resource index overflow"))?;
+    if index >= MAX_RESOURCE_BITS {
+        anyhow::bail!(
+            "permit index {permit} maps to resource index {index}, exceeding registry capacity"
+        );
+    }
+    Ok(index)
+}
+
+fn split_cpu_permit_indices(indices: BTreeSet<usize>) -> (BTreeSet<usize>, BTreeSet<usize>) {
+    let base = host_cpu_resource_bits();
+    let mut cpus = BTreeSet::new();
+    let mut permits = BTreeSet::new();
+    for index in indices {
+        if index < base {
+            cpus.insert(index);
+        } else {
+            permits.insert(index - base);
+        }
+    }
+    (cpus, permits)
 }
 
 fn host_cpu_resource_bits() -> usize {
@@ -4338,11 +5045,11 @@ fn notify_path() -> PathBuf {
 }
 
 fn registry_data_dir() -> PathBuf {
-    protocol_dir().join("ktstr-acquire-registry-v10")
+    protocol_dir().join("ktstr-acquire-registry-v14")
 }
 
 pub(super) fn event_dir() -> PathBuf {
-    protocol_dir().join("ktstr-acquire-events-v10")
+    protocol_dir().join("ktstr-acquire-events-v14")
 }
 
 pub(super) fn notify_basename() -> Result<std::ffi::OsString> {
@@ -4369,6 +5076,49 @@ pub(super) fn parse_liveness_basename(name: &std::ffi::OsStr) -> Option<(u64, u6
         .strip_suffix(LIVENESS_SUFFIX)?;
     let (slot, ticket) = payload.split_once(LIVENESS_SEPARATOR)?;
     Some((slot.parse().ok()?, ticket.parse().ok()?))
+}
+
+/// Sleep until a registry mutation can change a rejected PENDING placement.
+/// Sampling occurs while holding the registry SH flock; the futex value then
+/// closes the unlock-to-wait race without polling or repeatedly rebuilding
+/// heavyweight preparation state.
+pub(super) fn wait_for_generation_change(expected: u32, timeout: Duration) -> Result<()> {
+    let lock = lock_registry_existing(FlockMode::Shared)?;
+    let file = File::open(header_path()).context("open admission generation futex")?;
+    let map = unsafe { Mmap::map(&file) }.context("map admission generation futex")?;
+    HeaderLayout::validate(&map)?;
+    let wake = atomic_u32(&map, H_GENERATION_WAKE);
+    if wake.load(Ordering::Acquire) != expected {
+        return Ok(());
+    }
+    drop(lock);
+
+    let ts = libc::timespec {
+        tv_sec: timeout.as_secs().try_into().unwrap_or(libc::time_t::MAX),
+        tv_nsec: timeout.subsec_nanos().into(),
+    };
+    // SAFETY: `wake` is an aligned u32 in a live MAP_SHARED mapping. A change
+    // between the sample and this call yields EAGAIN instead of sleeping past
+    // the mutation.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            (wake as *const AtomicU32).cast::<u32>(),
+            libc::FUTEX_WAIT,
+            expected,
+            &ts as *const libc::timespec,
+            std::ptr::null::<u32>(),
+            0u32,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EAGAIN) | Some(libc::EINTR) | Some(libc::ETIMEDOUT) => Ok(()),
+        _ => Err(error).context("wait for admission registry generation change"),
+    }
 }
 
 fn lock_registry_for_initialization() -> Result<OwnedFd> {
@@ -4779,12 +5529,33 @@ impl Table {
         read_u64(&self.header, H_GENERATION)
     }
 
+    fn generation_wake(&self) -> u32 {
+        atomic_u32(&self.header, H_GENERATION_WAKE).load(Ordering::Acquire)
+    }
+
     fn bump_generation(&mut self) -> Result<()> {
         let next = self
             .generation()
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("queue registry generation exhausted"))?;
         write_u64(&mut self.header, H_GENERATION, next);
+        let wake = atomic_u32(&self.header, H_GENERATION_WAKE);
+        wake.fetch_add(1, Ordering::Release);
+        // SAFETY: this is an aligned AtomicU32 in a MAP_SHARED registry
+        // mapping. Wake every registration waiter because each may hold a
+        // different physical preparation candidate and can make progress on
+        // the same logical transition.
+        unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                (wake as *const AtomicU32).cast::<u32>(),
+                libc::FUTEX_WAKE,
+                i32::MAX,
+                std::ptr::null::<libc::timespec>(),
+                std::ptr::null::<u32>(),
+                0u32,
+            );
+        }
         Ok(())
     }
 
@@ -5115,6 +5886,27 @@ impl Table {
             R_WATCH_CPU_MODE,
             u32::from(watch.cpu_mode == ClaimMode::Exclusive),
         );
+        write_u32(
+            bytes,
+            R_CLAIM_PERMIT_MODE,
+            u32::from(claim.permit_mode == ClaimMode::Exclusive),
+        );
+        write_u32(
+            bytes,
+            R_WATCH_PERMIT_MODE,
+            u32::from(watch.permit_mode == ClaimMode::Exclusive),
+        );
+        write_u32(
+            bytes,
+            R_CLAIM_CLASS,
+            encode_admission_class(claim.admission_class),
+        );
+        write_u32(
+            bytes,
+            R_WATCH_CLASS,
+            encode_admission_class(watch.admission_class),
+        );
+        write_u32(bytes, R_BACKFILL_CREDIT, backfill_credit_for_watch(watch));
         write_u64(bytes, R_BLOCKED_SERIAL, 0);
         write_u64(bytes, R_NEXT_FREE, NONE_SLOT);
         write_u64(bytes, R_GRANT_EPOCH, 0);
@@ -5211,11 +6003,15 @@ impl Table {
                 | STATE_COORDINATOR
                 | STATE_HELD
                 | STATE_COORDINATOR_STANDBY
+                | STATE_PENDING
         ) {
             anyhow::bail!("queue registry v{VERSION} slot {slot} has invalid state {state}");
         }
         let record = decode_record(bytes, layout, slot)?;
-        if record.ticket == 0 || record.claim.is_empty() {
+        if record.ticket == 0
+            || record.claim.is_empty()
+            || (record.state == STATE_PENDING && record.watch.is_empty())
+        {
             anyhow::bail!(
                 "queue registry v{VERSION} slot {slot} is active with ticket {} and an {} claim",
                 record.ticket,
@@ -5294,6 +6090,7 @@ impl Table {
             cpu_exclusive_holders: self.header_counts(B_HELD_CPU_EXCLUSIVE),
             llc_shared_holders: self.header_counts(B_HELD_LLC_SHARED),
             llc_exclusive_holders: self.header_counts(B_HELD_LLC_EXCLUSIVE),
+            build_cpu_claims: self.header_counts(C_BUILD_CLAIM_CPUS),
         }
     }
 
@@ -5362,8 +6159,43 @@ impl Table {
                 cpu_exclusive_holders: vec![0; layout.bits],
                 llc_shared_holders: vec![0; layout.bits],
                 llc_exclusive_holders: vec![0; layout.bits],
+                build_cpu_claims: vec![0; layout.bits],
             },
         ))
+    }
+
+    fn cached_prefix_matches_words(
+        &mut self,
+        slot: u64,
+        cpu_any: &[u64],
+        cpu_exclusive: &[u64],
+        llc_any: &[u64],
+        llc_exclusive: &[u64],
+    ) -> Result<bool> {
+        let layout = self.layout;
+        if [cpu_any, cpu_exclusive, llc_any, llc_exclusive]
+            .iter()
+            .any(|words| words.len() != layout.words)
+        {
+            anyhow::bail!("queue prefix comparison used mismatched registry words");
+        }
+        let bytes = self.record_bytes(slot)?.ok_or_else(|| {
+            anyhow::anyhow!("queue slot {slot} disappeared during prefix comparison")
+        })?;
+        for (which, expected) in [
+            (RB_PREFIX_CPU_ANY, cpu_any),
+            (RB_PREFIX_CPU_EXCLUSIVE, cpu_exclusive),
+            (RB_PREFIX_LLC_ANY, llc_any),
+            (RB_PREFIX_LLC_EXCLUSIVE, llc_exclusive),
+        ] {
+            let offset = record_bitset_offset(layout, which);
+            for (word, expected) in expected.iter().copied().enumerate() {
+                if read_u64(bytes, offset + word * std::mem::size_of::<u64>()) != expected {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 
     fn record_prefix_epoch(&mut self, slot: u64) -> Result<u64> {
@@ -5371,6 +6203,26 @@ impl Table {
             anyhow::anyhow!("queue slot {slot} disappeared during prefix epoch read")
         })?;
         Ok(read_u64(bytes, R_PREFIX_EPOCH))
+    }
+
+    fn set_record_backfill_credit(&mut self, slot: u64, credit: u32) -> Result<()> {
+        let maximum = self
+            .record(slot)?
+            .map(|record| backfill_credit_for_watch(&record.watch))
+            .ok_or_else(|| {
+                anyhow::anyhow!("queue slot {slot} disappeared during backfill-credit update")
+            })?;
+        if credit > maximum {
+            anyhow::bail!(
+                "queue backfill credit {credit} exceeds the ticket's resource-weighted maximum \
+                 {maximum}"
+            );
+        }
+        let bytes = self.record_bytes_mut(slot)?.ok_or_else(|| {
+            anyhow::anyhow!("queue slot {slot} disappeared during backfill-credit update")
+        })?;
+        write_u32(bytes, R_BACKFILL_CREDIT, credit);
+        Ok(())
     }
 
     /// Publish one complete predecessor cache. The epoch is invalidated first
@@ -5487,6 +6339,16 @@ impl Table {
                 R_CLAIM_CPU_MODE,
                 u32::from(new.cpu_mode == ClaimMode::Exclusive),
             );
+            write_u32(
+                bytes,
+                R_CLAIM_PERMIT_MODE,
+                u32::from(new.permit_mode == ClaimMode::Exclusive),
+            );
+            write_u32(
+                bytes,
+                R_CLAIM_CLASS,
+                encode_admission_class(new.admission_class),
+            );
             encode_exact_claim(bytes, layout, new)?;
             write_u64(bytes, R_BLOCKED_SERIAL, 0);
             write_u32(bytes, R_BLOCK_KIND, BLOCK_NONE);
@@ -5498,6 +6360,7 @@ impl Table {
                 let (kind, index) = match evidence.blocker {
                     ResourceKey::Cpu(index) => (BLOCK_CPU, index),
                     ResourceKey::Llc(index) => (BLOCK_LLC, index),
+                    ResourceKey::Permit(index) => (BLOCK_PERMIT, index),
                 };
                 write_u64(bytes, R_BLOCKED_SERIAL, serial);
                 write_u32(bytes, R_BLOCK_KIND, kind);
@@ -5561,6 +6424,16 @@ impl Table {
                     R_CLAIM_CPU_MODE,
                     u32::from(exact.cpu_mode == ClaimMode::Exclusive),
                 );
+                write_u32(
+                    bytes,
+                    R_CLAIM_PERMIT_MODE,
+                    u32::from(exact.permit_mode == ClaimMode::Exclusive),
+                );
+                write_u32(
+                    bytes,
+                    R_CLAIM_CLASS,
+                    encode_admission_class(exact.admission_class),
+                );
                 encode_exact_claim(bytes, layout, exact)?;
             }
             clear_record_watch_bits(bytes, layout);
@@ -5611,7 +6484,11 @@ impl Table {
             // A HELD owner is pruned only after its physical fds have closed
             // (normal RAII teardown or process death), so both states may
             // represent a genuine compatibility improvement.
-            self.mark_possible_release(&record.claim.cpus, &record.claim.llcs)?;
+            self.mark_possible_release(
+                &record.claim.cpus,
+                &record.claim.llcs,
+                &record.claim.permits,
+            )?;
         }
         self.adjust_claim_counts(&record.claim, false)?;
         if record.state == STATE_HELD {
@@ -5667,6 +6544,7 @@ impl Table {
         let (kind, index) = match evidence.blocker {
             ResourceKey::Cpu(index) => (BLOCK_CPU, index),
             ResourceKey::Llc(index) => (BLOCK_LLC, index),
+            ResourceKey::Permit(index) => (BLOCK_PERMIT, index),
         };
         write_u32(bytes, R_BLOCK_KIND, kind);
         write_u32(
@@ -5745,17 +6623,38 @@ impl Table {
     }
 
     fn grant_compatible(&mut self) -> Result<(ClaimSet, bool)> {
+        struct BackfillHead {
+            slot: u64,
+            claim: ClaimSet,
+            credit: u32,
+        }
+
         let records = self.records()?;
         let mut cpu_any = vec![0u64; self.layout.words];
         let mut cpu_exclusive = vec![0u64; self.layout.words];
         let mut llc_any = vec![0u64; self.layout.words];
         let mut llc_exclusive = vec![0u64; self.layout.words];
         let claim_epoch = self.claim_epoch();
+        let coordinator_ticket = self.coordinator_ticket();
         let mut changed = false;
         let mut coordinator_prefix_changed = false;
+        let mut backfill_head: Option<BackfillHead> = None;
         self.bump_grant_scans();
 
         for record in records {
+            // PENDING does not participate in coordinator election, but its
+            // bounded preparation footprint is a real predecessor claim.
+            if record.state == STATE_PENDING {
+                add_claim_bits(
+                    &record.claim,
+                    &mut cpu_any,
+                    &mut cpu_exclusive,
+                    &mut llc_any,
+                    &mut llc_exclusive,
+                    self.layout.bits,
+                )?;
+                continue;
+            }
             let conflict = claim_conflicts_bits(
                 &record.claim,
                 &cpu_any,
@@ -5773,6 +6672,7 @@ impl Table {
                     let still_designated = match blocked.key {
                         ResourceKey::Cpu(index) => record.claim.cpus.contains(&index),
                         ResourceKey::Llc(index) => record.claim.llcs.contains(&index),
+                        ResourceKey::Permit(index) => record.claim.permits.contains(&index),
                     };
                     !still_designated
                         || self.blocker_serial(blocked.key, blocked.mode)? > blocked.serial
@@ -5794,6 +6694,37 @@ impl Table {
                     }
                     _ => true,
                 };
+            let prefix_matches = if matches!(
+                record.state,
+                STATE_GRANTED | STATE_REPLAN | STATE_COORDINATOR
+            ) {
+                self.cached_prefix_matches_words(
+                    record.slot,
+                    &cpu_any,
+                    &cpu_exclusive,
+                    &llc_any,
+                    &llc_exclusive,
+                )?
+            } else {
+                true
+            };
+            // One complete cooperative-capacity wave may bypass the oldest
+            // unavailable head. Charge resource units, not callbacks: a herd
+            // of small cells can therefore fill the same weighted permit pool
+            // that normally bounds it. Existing GRANTED/HELD backfill keeps
+            // running after the credit is spent and drains before the head.
+            let backfill_cost = backfill_head.as_ref().and_then(|head| {
+                claims_conflict(&head.claim, &record.claim)
+                    .then(|| backfill_cost_for_claim(&record.claim))
+            });
+            let fairness_blocked = backfill_head
+                .as_ref()
+                .zip(backfill_cost)
+                .is_some_and(|(head, cost)| cost > head.credit);
+            let acquisition_viable =
+                !conflict && availability_compatible && blocker_ready && !fairness_blocked;
+            let mut scan_state = record.state;
+            let mut revoked_grant_fence = false;
             if record.state == STATE_COORDINATOR {
                 // A coordinator can now sit behind live GRANTED/REPLAN
                 // callbacks. Keep its cached predecessor prefix synchronized
@@ -5808,9 +6739,8 @@ impl Table {
                     &llc_any,
                     &llc_exclusive,
                 );
-                let (published_epoch, published_prefix) = self.cached_prefix(record.slot)?;
-                if published_epoch != claim_epoch || published_prefix != prefix {
-                    coordinator_prefix_changed |= published_prefix != prefix;
+                if record.prefix_epoch != claim_epoch || !prefix_matches {
+                    coordinator_prefix_changed |= !prefix_matches;
                     self.publish_prefix(
                         record.slot,
                         &prefix,
@@ -5820,7 +6750,10 @@ impl Table {
                     )?;
                 }
             } else if record.state == STATE_REPLAN
-                && (replan_invalidated || prefix_invalid || watch_serial != record.issue_serial)
+                && (replan_invalidated
+                    || prefix_invalid
+                    || !prefix_matches
+                    || watch_serial != record.issue_serial)
             {
                 // The callback runs outside the registry fence. Stamp its
                 // record before clearing the global suffix invalidation so its
@@ -5850,12 +6783,32 @@ impl Table {
                 self.set_record_state(record.slot, STATE_WAITING)?;
                 self.clear_record_blocked(record.slot)?;
                 changed = true;
+                scan_state = STATE_WAITING;
+                // Keep the old grant in this scan's prefix. Its callback may
+                // already own the real flock outside the registry fence; the
+                // next scan may omit it after the revoked callback observes
+                // WAITING and releases any stale payload.
+                revoked_grant_fence = true;
             } else if record.state == STATE_WAITING
-                && record.ticket != self.coordinator_ticket()
-                && !conflict
-                && availability_compatible
-                && blocker_ready
+                && record.ticket != coordinator_ticket
+                && acquisition_viable
             {
+                // Charge only an actual new conflicting grant. Disjoint work
+                // is unbounded, and a callback already in GRANTED/HELD state
+                // consumed its weighted units on the scan which first issued
+                // it.
+                if let Some(head) = backfill_head
+                    .as_mut()
+                    .filter(|head| claims_conflict(&head.claim, &record.claim))
+                {
+                    let cost = backfill_cost_for_claim(&record.claim);
+                    debug_assert!(cost <= head.credit);
+                    head.credit -= cost;
+                    // Publish the debit before the grant. A killed writer can
+                    // conservatively shorten a wave, but cannot grant
+                    // uncharged resource units forever across recovery.
+                    self.set_record_backfill_credit(head.slot, head.credit)?;
+                }
                 let prefix = aggregate_from_words(
                     self.layout.bits,
                     &cpu_any,
@@ -5875,13 +6828,18 @@ impl Table {
                 crash_at_for_tests("grant_state_before_wake");
                 self.wake_slot(record.slot)?;
                 changed = true;
+                scan_state = STATE_GRANTED;
             } else if record.state == STATE_WAITING
-                && record.ticket != self.coordinator_ticket()
+                && record.ticket != coordinator_ticket
                 && flexible
             {
                 let earlier_claim_changed = record.replan_claim_epoch != claim_epoch
                     && self.min_changed_ticket() < record.ticket;
-                if watch_serial != record.issue_serial || earlier_claim_changed || prefix_invalid {
+                if watch_serial != record.issue_serial
+                    || earlier_claim_changed
+                    || prefix_invalid
+                    || !prefix_matches
+                {
                     let prefix = aggregate_from_words(
                         self.layout.bits,
                         &cpu_any,
@@ -5900,10 +6858,12 @@ impl Table {
                     self.clear_record_blocked(record.slot)?;
                     self.wake_slot(record.slot)?;
                     changed = true;
+                    scan_state = STATE_REPLAN;
                 }
             } else if record.state == STATE_GRANTED
                 && (record.grant_epoch != claim_epoch
                     || prefix_invalid
+                    || !prefix_matches
                     || watch_serial != record.issue_serial)
             {
                 // This grant remains valid, but its callback must observe the
@@ -5923,7 +6883,18 @@ impl Table {
                     watch_serial,
                 )?;
             }
-            if record.state != STATE_COORDINATOR_STANDBY {
+
+            // Only real/published owners and exact claims which can run now
+            // reserve resources from later queue records. An unavailable wide
+            // WAITING head no longer drains unrelated host capacity merely by
+            // being earlier in ticket order. REPLAN has no acquisition license
+            // and therefore does not fence: its callback can only publish a
+            // WAITING replacement, which forces a fresh authoritative scan
+            // before that replacement may acquire anything.
+            let preserves_fence = matches!(scan_state, STATE_GRANTED | STATE_HELD)
+                || revoked_grant_fence
+                || (scan_state == STATE_COORDINATOR && acquisition_viable);
+            if preserves_fence {
                 add_claim_bits(
                     &record.claim,
                     &mut cpu_any,
@@ -5932,6 +6903,21 @@ impl Table {
                     &mut llc_exclusive,
                     self.layout.bits,
                 )?;
+            } else if backfill_head.is_none()
+                && !conflict
+                && !fairness_blocked
+                && (!availability_compatible || !blocker_ready)
+                && (scan_state == STATE_COORDINATOR || (scan_state == STATE_WAITING && !flexible))
+            {
+                // Protect only the oldest physically blocked exact candidate.
+                // Once it runs, queue order inductively gives the next blocked
+                // record its own finite burst. This avoids an O(N²) list of
+                // fairness barriers while still bounding starvation.
+                backfill_head = Some(BackfillHead {
+                    slot: record.slot,
+                    claim: record.claim,
+                    credit: record.backfill_credit,
+                });
             }
         }
         if changed {
@@ -6043,7 +7029,7 @@ impl Table {
             // The record table is authoritative. A clean header/record
             // mismatch must not permanently poison admission, so defensively
             // rebuild the active/free lists, aggregates, coordinator header,
-            // and record states together. Current v10 publication validates
+            // and record states together. Current v14 publication validates
             // this pair before clearing the dirty bit.
             self.repair_consistency()?;
             coordinator = self.coordinator_ticket();
@@ -6265,6 +7251,19 @@ impl Table {
                 return Ok(false);
             }
         }
+        for &permit in &claim.permits {
+            let index = permit_resource_index(permit)?;
+            if !self.bitmap_bit(B_CPU_KNOWN, index)? {
+                return Ok(false);
+            }
+            let available = match claim.permit_mode {
+                ClaimMode::Shared => self.bitmap_bit(B_CPU_SH_AVAILABLE, index)?,
+                ClaimMode::Exclusive => self.bitmap_bit(B_CPU_EX_AVAILABLE, index)?,
+            };
+            if !available {
+                return Ok(false);
+            }
+        }
         for &llc in &claim.llcs {
             if !self.bitmap_bit(B_LLC_KNOWN, llc)? {
                 return Ok(false);
@@ -6306,6 +7305,12 @@ impl Table {
             (ResourceKey::Llc(index), FlockMode::Exclusive) => {
                 self.resource_serial(S_LLC_EX, index)
             }
+            (ResourceKey::Permit(index), FlockMode::Shared) => {
+                self.resource_serial(S_CPU_SH, permit_resource_index(index)?)
+            }
+            (ResourceKey::Permit(index), FlockMode::Exclusive) => {
+                self.resource_serial(S_CPU_EX, permit_resource_index(index)?)
+            }
         }
     }
 
@@ -6321,6 +7326,13 @@ impl Table {
             serial = serial.max(self.resource_serial(S_LLC_SH, llc)?);
             if watch.llc_mode == ClaimMode::Exclusive {
                 serial = serial.max(self.resource_serial(S_LLC_EX, llc)?);
+            }
+        }
+        for &permit in &watch.permits {
+            let index = permit_resource_index(permit)?;
+            serial = serial.max(self.resource_serial(S_CPU_SH, index)?);
+            if watch.permit_mode == ClaimMode::Exclusive {
+                serial = serial.max(self.resource_serial(S_CPU_EX, index)?);
             }
         }
         Ok(serial)
@@ -6351,11 +7363,24 @@ impl Table {
         for &llc in &watch.llcs {
             serial = serial.max(self.resource_serial(llc_serial, llc)?);
         }
+        let permit_serial = match claim.permit_mode {
+            ClaimMode::Shared => S_CPU_SH,
+            ClaimMode::Exclusive => S_CPU_EX,
+        };
+        for &permit in &watch.permits {
+            serial =
+                serial.max(self.resource_serial(permit_serial, permit_resource_index(permit)?)?);
+        }
         Ok(serial)
     }
 
-    fn mark_unknown(&mut self, cpus: &BTreeSet<usize>, llcs: &BTreeSet<usize>) -> Result<bool> {
-        let plan = self.watched_observation_plan(cpus, llcs)?;
+    fn mark_unknown(
+        &mut self,
+        cpus: &BTreeSet<usize>,
+        llcs: &BTreeSet<usize>,
+        permits: &BTreeSet<usize>,
+    ) -> Result<bool> {
+        let plan = self.watched_observation_plan(cpus, llcs, permits)?;
         self.mark_observation_modes(&plan)
     }
 
@@ -6388,6 +7413,20 @@ impl Table {
             self.set_bitmap_bit(B_PENDING_LLC_EX, llc, true)?;
             self.set_resource_request(Q_LLC_EX, llc, request)?;
         }
+        for &permit in &plan.permit_sh {
+            let index = permit_resource_index(permit)?;
+            self.set_bitmap_bit(B_CANDIDATE_CPU_SH, index, true)?;
+            self.set_bitmap_bit(B_CPU_SH_AVAILABLE, index, false)?;
+            self.set_bitmap_bit(B_PENDING_CPU_SH, index, true)?;
+            self.set_resource_request(Q_CPU_SH, index, request)?;
+        }
+        for &permit in &plan.permit_ex {
+            let index = permit_resource_index(permit)?;
+            self.set_bitmap_bit(B_CANDIDATE_CPU_EX, index, true)?;
+            self.set_bitmap_bit(B_CPU_EX_AVAILABLE, index, false)?;
+            self.set_bitmap_bit(B_PENDING_CPU_EX, index, true)?;
+            self.set_resource_request(Q_CPU_EX, index, request)?;
+        }
         Ok(true)
     }
 
@@ -6395,6 +7434,7 @@ impl Table {
         &self,
         cpus: &BTreeSet<usize>,
         llcs: &BTreeSet<usize>,
+        permits: &BTreeSet<usize>,
     ) -> Result<PossibleReleasePlan> {
         let mut plan = PossibleReleasePlan::default();
         for &cpu in cpus {
@@ -6413,6 +7453,15 @@ impl Table {
                 plan.llc_ex.insert(llc);
             }
         }
+        for &permit in permits {
+            let index = permit_resource_index(permit)?;
+            if self.bitmap_bit(B_WATCH_CPUS, index)? {
+                plan.permit_sh.insert(permit);
+            }
+            if self.bitmap_bit(B_WATCH_CPU_EXCLUSIVE, index)? {
+                plan.permit_ex.insert(permit);
+            }
+        }
         Ok(plan)
     }
 
@@ -6426,6 +7475,7 @@ impl Table {
         &self,
         cpus: &BTreeSet<usize>,
         llcs: &BTreeSet<usize>,
+        permits: &BTreeSet<usize>,
     ) -> Result<PossibleReleasePlan> {
         let mut plan = PossibleReleasePlan::default();
         for &cpu in cpus {
@@ -6452,6 +7502,20 @@ impl Table {
             }
             if self.bitmap_bit(B_WATCH_LLC_EXCLUSIVE, llc)? && !ex_available && !ex_pending {
                 plan.llc_ex.insert(llc);
+            }
+        }
+        for &permit in permits {
+            let index = permit_resource_index(permit)?;
+            let known = self.bitmap_bit(B_CPU_KNOWN, index)?;
+            let sh_pending = self.bitmap_bit(B_PENDING_CPU_SH, index)?;
+            let ex_pending = self.bitmap_bit(B_PENDING_CPU_EX, index)?;
+            let sh_available = known && self.bitmap_bit(B_CPU_SH_AVAILABLE, index)?;
+            let ex_available = known && self.bitmap_bit(B_CPU_EX_AVAILABLE, index)?;
+            if self.bitmap_bit(B_WATCH_CPUS, index)? && !sh_available && !sh_pending {
+                plan.permit_sh.insert(permit);
+            }
+            if self.bitmap_bit(B_WATCH_CPU_EXCLUSIVE, index)? && !ex_available && !ex_pending {
+                plan.permit_ex.insert(permit);
             }
         }
         Ok(plan)
@@ -6482,6 +7546,18 @@ impl Table {
             self.set_bitmap_bit(B_PENDING_LLC_EX, llc, true)?;
             self.set_resource_request(Q_LLC_EX, llc, request)?;
         }
+        for &permit in &plan.permit_sh {
+            let index = permit_resource_index(permit)?;
+            self.set_bitmap_bit(B_CANDIDATE_CPU_SH, index, true)?;
+            self.set_bitmap_bit(B_PENDING_CPU_SH, index, true)?;
+            self.set_resource_request(Q_CPU_SH, index, request)?;
+        }
+        for &permit in &plan.permit_ex {
+            let index = permit_resource_index(permit)?;
+            self.set_bitmap_bit(B_CANDIDATE_CPU_EX, index, true)?;
+            self.set_bitmap_bit(B_PENDING_CPU_EX, index, true)?;
+            self.set_resource_request(Q_CPU_EX, index, request)?;
+        }
         Ok(true)
     }
 
@@ -6489,17 +7565,21 @@ impl Table {
         &mut self,
         cpus: &BTreeSet<usize>,
         llcs: &BTreeSet<usize>,
+        permits: &BTreeSet<usize>,
     ) -> Result<bool> {
-        let plan = self.possible_release_plan(cpus, llcs)?;
+        let plan = self.possible_release_plan(cpus, llcs, permits)?;
         self.apply_possible_release(&plan)
     }
 
     fn mark_blocker_unknown(&mut self, evidence: ContentionMarker) -> Result<()> {
-        let (cpus, llcs) = match evidence.blocker {
-            ResourceKey::Cpu(index) => (BTreeSet::from([index]), BTreeSet::new()),
-            ResourceKey::Llc(index) => (BTreeSet::new(), BTreeSet::from([index])),
+        let (cpus, llcs, permits) = match evidence.blocker {
+            ResourceKey::Cpu(index) => (BTreeSet::from([index]), BTreeSet::new(), BTreeSet::new()),
+            ResourceKey::Llc(index) => (BTreeSet::new(), BTreeSet::from([index]), BTreeSet::new()),
+            ResourceKey::Permit(index) => {
+                (BTreeSet::new(), BTreeSet::new(), BTreeSet::from([index]))
+            }
         };
-        self.mark_unknown(&cpus, &llcs)?;
+        self.mark_unknown(&cpus, &llcs, &permits)?;
         Ok(())
     }
 
@@ -6509,6 +7589,7 @@ impl Table {
         }
         let mut cpus = BTreeSet::new();
         let mut llcs = BTreeSet::new();
+        let mut permits = BTreeSet::new();
         for marker in evidence {
             match marker.blocker {
                 ResourceKey::Cpu(index) => {
@@ -6517,9 +7598,12 @@ impl Table {
                 ResourceKey::Llc(index) => {
                     llcs.insert(index);
                 }
+                ResourceKey::Permit(index) => {
+                    permits.insert(index);
+                }
             }
         }
-        self.mark_unknown(&cpus, &llcs).map(|_| ())
+        self.mark_unknown(&cpus, &llcs, &permits).map(|_| ())
     }
 
     fn publish_claim_busy(&mut self, claim: &ClaimSet) -> Result<()> {
@@ -6542,6 +7626,29 @@ impl Table {
             self.set_bitmap_bit(B_PENDING_CPU_EX, cpu, false)?;
             self.set_bitmap_bit(B_CANDIDATE_CPU_SH, cpu, false)?;
             self.set_bitmap_bit(B_CANDIDATE_CPU_EX, cpu, false)?;
+        }
+        for &permit in &claim.permits {
+            let index = permit_resource_index(permit)?;
+            let known = self.bitmap_bit(B_CPU_KNOWN, index)?;
+            let sh_available = known && self.bitmap_bit(B_CPU_SH_AVAILABLE, index)?;
+            let pending = self.bitmap_bit(B_PENDING_CPU_SH, index)?
+                || self.bitmap_bit(B_PENDING_CPU_EX, index)?;
+            invalidated_observation |= pending;
+            if claim.permit_mode == ClaimMode::Shared && !sh_available {
+                self.stamp_resource_improvement(S_CPU_SH, index)?;
+                compatibility_improved = true;
+            }
+            self.set_bitmap_bit(B_CPU_KNOWN, index, true)?;
+            self.set_bitmap_bit(
+                B_CPU_SH_AVAILABLE,
+                index,
+                claim.permit_mode == ClaimMode::Shared,
+            )?;
+            self.set_bitmap_bit(B_CPU_EX_AVAILABLE, index, false)?;
+            self.set_bitmap_bit(B_PENDING_CPU_SH, index, false)?;
+            self.set_bitmap_bit(B_PENDING_CPU_EX, index, false)?;
+            self.set_bitmap_bit(B_CANDIDATE_CPU_SH, index, false)?;
+            self.set_bitmap_bit(B_CANDIDATE_CPU_EX, index, false)?;
         }
         for &llc in &claim.llcs {
             let known = self.bitmap_bit(B_LLC_KNOWN, llc)?;
@@ -6608,6 +7715,7 @@ impl Table {
         }
         let mut cpus = BTreeMap::new();
         let mut llcs = BTreeMap::new();
+        let mut permits = BTreeMap::new();
         let pending_cpu_sh = self.bitmap_indices(B_PENDING_CPU_SH);
         let pending_cpu_ex = self.bitmap_indices(B_PENDING_CPU_EX);
         for index in pending_cpu_sh.union(&pending_cpu_ex).copied() {
@@ -6619,7 +7727,11 @@ impl Table {
                 .contains(&index)
                 .then(|| self.resource_request(Q_CPU_EX, index))
                 .transpose()?;
-            cpus.insert(index, (sh, ex));
+            if index < host_cpu_resource_bits() {
+                cpus.insert(index, (sh, ex));
+            } else {
+                permits.insert(index - host_cpu_resource_bits(), (sh, ex));
+            }
         }
         let pending_sh = self.bitmap_indices(B_PENDING_LLC_SH);
         let pending_ex = self.bitmap_indices(B_PENDING_LLC_EX);
@@ -6634,10 +7746,14 @@ impl Table {
                 .transpose()?;
             llcs.insert(index, (sh, ex));
         }
-        if cpus.is_empty() && llcs.is_empty() {
+        if cpus.is_empty() && llcs.is_empty() && permits.is_empty() {
             return Ok(None);
         }
-        Ok(Some(ObservationRequest { cpus, llcs }))
+        Ok(Some(ObservationRequest {
+            cpus,
+            llcs,
+            permits,
+        }))
     }
 
     fn apply_observation(
@@ -6689,6 +7805,53 @@ impl Table {
             }
             if ex_matches && ex_candidate && ex_available {
                 self.stamp_resource_improvement(S_CPU_EX, cpu)?;
+                improved = true;
+            }
+        }
+        for (&permit, &(sh_request, ex_request)) in &request.permits {
+            let index = permit_resource_index(permit)?;
+            let Some(observed) = observation.permits.get(&permit).copied() else {
+                continue;
+            };
+            let sh_matches = if let Some(serial) = sh_request {
+                observed.sh_resolved
+                    && self.bitmap_bit(B_PENDING_CPU_SH, index)?
+                    && self.resource_request(Q_CPU_SH, index)? == serial
+            } else {
+                false
+            };
+            let ex_matches = if let Some(serial) = ex_request {
+                observed.ex_resolved
+                    && self.bitmap_bit(B_PENDING_CPU_EX, index)?
+                    && self.resource_request(Q_CPU_EX, index)? == serial
+            } else {
+                false
+            };
+            if !sh_matches && !ex_matches {
+                continue;
+            }
+            let availability = observed.availability;
+            let sh_available = availability != CpuAvailability::ExclusiveHeld;
+            let ex_available = availability == CpuAvailability::Free;
+            let sh_candidate = self.bitmap_bit(B_CANDIDATE_CPU_SH, index)?;
+            let ex_candidate = self.bitmap_bit(B_CANDIDATE_CPU_EX, index)?;
+            self.set_bitmap_bit(B_CPU_KNOWN, index, true)?;
+            if sh_matches {
+                self.set_bitmap_bit(B_CPU_SH_AVAILABLE, index, sh_available)?;
+                self.set_bitmap_bit(B_PENDING_CPU_SH, index, false)?;
+                self.set_bitmap_bit(B_CANDIDATE_CPU_SH, index, false)?;
+            }
+            if ex_matches {
+                self.set_bitmap_bit(B_CPU_EX_AVAILABLE, index, ex_available)?;
+                self.set_bitmap_bit(B_PENDING_CPU_EX, index, false)?;
+                self.set_bitmap_bit(B_CANDIDATE_CPU_EX, index, false)?;
+            }
+            if sh_matches && sh_candidate && sh_available {
+                self.stamp_resource_improvement(S_CPU_SH, index)?;
+                improved = true;
+            }
+            if ex_matches && ex_candidate && ex_available {
+                self.stamp_resource_improvement(S_CPU_EX, index)?;
                 improved = true;
             }
         }
@@ -6751,6 +7914,16 @@ impl Table {
             if claim.cpu_mode == ClaimMode::Exclusive {
                 self.adjust_aggregate_bit(B_CLAIM_CPU_EXCLUSIVE, cpu, add)?;
             }
+            if claim.admission_class == AdmissionClass::Build {
+                self.adjust_aggregate_count(C_BUILD_CLAIM_CPUS, cpu, add)?;
+            }
+        }
+        for &permit in &claim.permits {
+            let index = permit_resource_index(permit)?;
+            self.adjust_aggregate_bit(B_CLAIM_CPUS, index, add)?;
+            if claim.permit_mode == ClaimMode::Exclusive {
+                self.adjust_aggregate_bit(B_CLAIM_CPU_EXCLUSIVE, index, add)?;
+            }
         }
         for &llc in &claim.llcs {
             self.adjust_aggregate_bit(B_CLAIM_LLC_ANY, llc, add)?;
@@ -6768,6 +7941,13 @@ impl Table {
         };
         for &cpu in &claim.cpus {
             self.adjust_aggregate_bit(cpu_which, cpu, add)?;
+        }
+        let permit_which = match claim.permit_mode {
+            ClaimMode::Shared => B_HELD_CPU_SHARED,
+            ClaimMode::Exclusive => B_HELD_CPU_EXCLUSIVE,
+        };
+        for &permit in &claim.permits {
+            self.adjust_aggregate_bit(permit_which, permit_resource_index(permit)?, add)?;
         }
         let llc_which = match claim.llc_mode {
             ClaimMode::Shared => B_HELD_LLC_SHARED,
@@ -6797,6 +7977,26 @@ impl Table {
                 self.set_bitmap_bit(B_PENDING_CPU_SH, cpu, false)?;
                 self.set_bitmap_bit(B_CANDIDATE_CPU_SH, cpu, false)?;
                 self.set_resource_request(Q_CPU_SH, cpu, 0)?;
+            }
+        }
+        for &permit in &watch.permits {
+            let index = permit_resource_index(permit)?;
+            self.adjust_aggregate_bit(B_WATCH_CPUS, index, add)?;
+            if watch.permit_mode == ClaimMode::Exclusive {
+                self.adjust_aggregate_bit(B_WATCH_CPU_EXCLUSIVE, index, add)?;
+            }
+            if !add && !self.bitmap_bit(B_WATCH_CPU_EXCLUSIVE, index)? {
+                self.set_bitmap_bit(B_CPU_EX_AVAILABLE, index, false)?;
+                self.set_bitmap_bit(B_PENDING_CPU_EX, index, false)?;
+                self.set_bitmap_bit(B_CANDIDATE_CPU_EX, index, false)?;
+                self.set_resource_request(Q_CPU_EX, index, 0)?;
+            }
+            if !add && !self.bitmap_bit(B_WATCH_CPUS, index)? {
+                self.set_bitmap_bit(B_CPU_KNOWN, index, false)?;
+                self.set_bitmap_bit(B_CPU_SH_AVAILABLE, index, false)?;
+                self.set_bitmap_bit(B_PENDING_CPU_SH, index, false)?;
+                self.set_bitmap_bit(B_CANDIDATE_CPU_SH, index, false)?;
+                self.set_resource_request(Q_CPU_SH, index, 0)?;
             }
         }
         for &llc in &watch.llcs {
@@ -6838,6 +8038,19 @@ impl Table {
                 }
             }
         }
+        for &permit in &watch.permits {
+            let index = permit_resource_index(permit)?;
+            let offset = self.layout.count_offset(B_WATCH_CPUS) + index * 4;
+            if read_u32(&self.header, offset) == 0 {
+                plan.permit_sh.insert(permit);
+            }
+            if watch.permit_mode == ClaimMode::Exclusive {
+                let offset = self.layout.count_offset(B_WATCH_CPU_EXCLUSIVE) + index * 4;
+                if read_u32(&self.header, offset) == 0 {
+                    plan.permit_ex.insert(permit);
+                }
+            }
+        }
         for &llc in &watch.llcs {
             let offset = self.layout.count_offset(B_WATCH_LLCS) + llc * 4;
             if read_u32(&self.header, offset) == 0 {
@@ -6855,24 +8068,39 @@ impl Table {
 
     fn aggregate_watch(&self) -> Result<ClaimSet> {
         let llcs = self.bitmap_indices(B_WATCH_LLCS);
-        let cpus = self.bitmap_indices(B_WATCH_CPUS);
+        let (cpus, permits) = split_cpu_permit_indices(self.bitmap_indices(B_WATCH_CPUS));
+        let (exclusive_cpus, exclusive_permits) =
+            split_cpu_permit_indices(self.bitmap_indices(B_WATCH_CPU_EXCLUSIVE));
         let llc_mode = if self.bitmap_indices(B_WATCH_LLC_EXCLUSIVE).is_empty() {
             ClaimMode::Shared
         } else {
             ClaimMode::Exclusive
         };
-        let cpu_mode = if self.bitmap_indices(B_WATCH_CPU_EXCLUSIVE).is_empty() {
+        let cpu_mode = if exclusive_cpus.is_empty() {
             ClaimMode::Shared
         } else {
             ClaimMode::Exclusive
         };
-        Ok(ClaimSet::with_claim_modes(llcs, cpus, llc_mode, cpu_mode))
+        let permit_mode = if exclusive_permits.is_empty() {
+            ClaimMode::Shared
+        } else {
+            ClaimMode::Exclusive
+        };
+        Ok(ClaimSet::with_all_claim_modes(
+            llcs,
+            cpus,
+            permits,
+            llc_mode,
+            cpu_mode,
+            permit_mode,
+        ))
     }
 
     #[allow(dead_code)]
     fn watched_intersection(&self, claim: &ClaimSet) -> Result<ClaimSet> {
         let mut cpus = BTreeSet::new();
         let mut llcs = BTreeSet::new();
+        let mut permits = BTreeSet::new();
         for &cpu in &claim.cpus {
             if cpu < self.layout.bits && self.bitmap_bit(B_WATCH_CPUS, cpu)? {
                 cpus.insert(cpu);
@@ -6883,11 +8111,19 @@ impl Table {
                 llcs.insert(llc);
             }
         }
-        Ok(ClaimSet::with_claim_modes(
+        for &permit in &claim.permits {
+            let index = permit_resource_index(permit)?;
+            if index < self.layout.bits && self.bitmap_bit(B_WATCH_CPUS, index)? {
+                permits.insert(permit);
+            }
+        }
+        Ok(ClaimSet::with_all_claim_modes(
             llcs,
             cpus,
+            permits,
             claim.llc_mode,
             claim.cpu_mode,
+            claim.permit_mode,
         ))
     }
 
@@ -6895,9 +8131,11 @@ impl Table {
         &self,
         cpus: &BTreeSet<usize>,
         llcs: &BTreeSet<usize>,
-    ) -> Result<(BTreeSet<usize>, BTreeSet<usize>)> {
+        permits: &BTreeSet<usize>,
+    ) -> Result<(BTreeSet<usize>, BTreeSet<usize>, BTreeSet<usize>)> {
         let mut watched_cpus = BTreeSet::new();
         let mut watched_llcs = BTreeSet::new();
+        let mut watched_permits = BTreeSet::new();
         for &cpu in cpus {
             if self.bitmap_bit(B_WATCH_CPUS, cpu)? {
                 watched_cpus.insert(cpu);
@@ -6908,7 +8146,12 @@ impl Table {
                 watched_llcs.insert(llc);
             }
         }
-        Ok((watched_cpus, watched_llcs))
+        for &permit in permits {
+            if self.bitmap_bit(B_WATCH_CPUS, permit_resource_index(permit)?)? {
+                watched_permits.insert(permit);
+            }
+        }
+        Ok((watched_cpus, watched_llcs, watched_permits))
     }
 
     fn adjust_aggregate_bit(&mut self, which: usize, bit: usize, add: bool) -> Result<()> {
@@ -6937,6 +8180,24 @@ impl Table {
         Ok(())
     }
 
+    fn adjust_aggregate_count(&mut self, which: usize, bit: usize, add: bool) -> Result<()> {
+        if bit >= self.layout.bits {
+            anyhow::bail!("resource index {bit} exceeds queue registry capacity");
+        }
+        let count_offset = self.layout.count_offset(which) + bit * 4;
+        let old = read_u32(&self.header, count_offset);
+        let new = if add {
+            old.checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("queue aggregate reference count overflow"))?
+        } else {
+            old.checked_sub(1).ok_or_else(|| {
+                anyhow::anyhow!("queue aggregate reference count underflow at bit {bit}")
+            })?
+        };
+        write_u32(&mut self.header, count_offset, new);
+        Ok(())
+    }
+
     fn repair_consistency_if_needed(&mut self) -> Result<()> {
         if atomic_u64(&self.header, H_AGGREGATE_DIRTY).load(Ordering::SeqCst) != 0 {
             self.repair_consistency()?;
@@ -6953,9 +8214,11 @@ impl Table {
         let mut max_ticket = 0u64;
         for slot in (0..next_slot).rev() {
             let record = self.record(slot)?;
-            let valid = record
-                .as_ref()
-                .is_some_and(|record| record.ticket != 0 && !record.claim.is_empty());
+            let valid = record.as_ref().is_some_and(|record| {
+                record.ticket != 0
+                    && !record.claim.is_empty()
+                    && (record.state != STATE_PENDING || !record.watch.is_empty())
+            });
             if valid {
                 let record = record.expect("checked above");
                 if !tickets.insert(record.ticket) {
@@ -7033,16 +8296,22 @@ impl Table {
             .iter()
             .flat_map(|record| record.watch.llcs.iter().copied())
             .collect();
-        self.mark_unknown(&watched_cpus, &watched_llcs)?;
+        let watched_permits = records
+            .iter()
+            .flat_map(|record| record.watch.permits.iter().copied())
+            .collect();
+        self.mark_unknown(&watched_cpus, &watched_llcs, &watched_permits)?;
         self.set_pending_flag(PENDING_RESCAN);
         let previous = self.coordinator_ticket();
         let coordinator = records
             .iter()
-            .find(|record| record.ticket == previous && record.state != STATE_HELD)
+            .find(|record| {
+                record.ticket == previous && !matches!(record.state, STATE_HELD | STATE_PENDING)
+            })
             .or_else(|| {
                 records
                     .iter()
-                    .filter(|record| record.state != STATE_HELD)
+                    .filter(|record| !matches!(record.state, STATE_HELD | STATE_PENDING))
                     .min_by_key(|record| record.ticket)
             });
         let (coordinator, coordinator_slot) = coordinator
@@ -7053,6 +8322,19 @@ impl Table {
         let mut prefix = AggregateSnapshot::empty(self.layout);
         let prefix_bits = prefix.bits;
         for record in &records {
+            if record.state == STATE_PENDING {
+                self.set_record_state(record.slot, STATE_PENDING)?;
+                self.clear_record_blocked(record.slot)?;
+                add_claim_bits(
+                    &record.claim,
+                    &mut prefix.cpu_any,
+                    &mut prefix.cpu_exclusive,
+                    &mut prefix.llc_any,
+                    &mut prefix.llc_exclusive,
+                    prefix_bits,
+                )?;
+                continue;
+            }
             if record.state == STATE_HELD {
                 self.set_record_state(record.slot, STATE_HELD)?;
                 self.clear_record_blocked(record.slot)?;
@@ -7353,32 +8635,78 @@ fn decode_mode(bytes: &[u8], offset: usize, slot: u64, label: &str) -> Result<Cl
     }
 }
 
+fn encode_admission_class(class: AdmissionClass) -> u32 {
+    match class {
+        AdmissionClass::Ordinary => 0,
+        AdmissionClass::DefaultBorrow => 1,
+        AdmissionClass::Build => 2,
+    }
+}
+
+fn decode_admission_class(
+    bytes: &[u8],
+    offset: usize,
+    slot: u64,
+    label: &str,
+) -> Result<AdmissionClass> {
+    match read_u32(bytes, offset) {
+        0 => Ok(AdmissionClass::Ordinary),
+        1 => Ok(AdmissionClass::DefaultBorrow),
+        2 => Ok(AdmissionClass::Build),
+        class => anyhow::bail!(
+            "queue registry v{VERSION} slot {slot} has invalid {label} admission class {class}"
+        ),
+    }
+}
+
 fn decode_record(bytes: &[u8], layout: HeaderLayout, slot: u64) -> Result<Record> {
     let watch_llc_mode = decode_mode(bytes, R_WATCH_LLC_MODE, slot, "LLC watch")?;
     let claim_llc_mode = decode_mode(bytes, R_CLAIM_LLC_MODE, slot, "exact LLC claim")?;
     let watch_cpu_mode = decode_mode(bytes, R_WATCH_CPU_MODE, slot, "CPU watch")?;
     let claim_cpu_mode = decode_mode(bytes, R_CLAIM_CPU_MODE, slot, "exact CPU claim")?;
-    let claim = ClaimSet::with_claim_modes(
+    let watch_permit_mode = decode_mode(bytes, R_WATCH_PERMIT_MODE, slot, "permit watch")?;
+    let claim_permit_mode = decode_mode(bytes, R_CLAIM_PERMIT_MODE, slot, "exact permit claim")?;
+    let claim = ClaimSet::with_all_claim_modes(
         decode_bitset(bytes, record_bitset_offset(layout, RB_CLAIM_LLCS), layout)?,
         decode_bitset(bytes, record_bitset_offset(layout, RB_CLAIM_CPUS), layout)?,
+        decode_bitset(
+            bytes,
+            record_bitset_offset(layout, RB_CLAIM_PERMITS),
+            layout,
+        )?,
         claim_llc_mode,
         claim_cpu_mode,
-    );
-    let watch = ClaimSet::with_claim_modes(
+        claim_permit_mode,
+    )
+    .with_admission_class(decode_admission_class(
+        bytes,
+        R_CLAIM_CLASS,
+        slot,
+        "exact claim",
+    )?);
+    let watch = ClaimSet::with_all_claim_modes(
         decode_bitset(bytes, record_bitset_offset(layout, RB_WATCH_LLCS), layout)?,
         decode_bitset(bytes, record_bitset_offset(layout, RB_WATCH_CPUS), layout)?,
+        decode_bitset(
+            bytes,
+            record_bitset_offset(layout, RB_WATCH_PERMITS),
+            layout,
+        )?,
         watch_llc_mode,
         watch_cpu_mode,
-    );
+        watch_permit_mode,
+    )
+    .with_admission_class(decode_admission_class(bytes, R_WATCH_CLASS, slot, "watch")?);
     let blocked_on = match read_u32(bytes, R_BLOCK_KIND) {
         BLOCK_NONE => None,
-        kind @ (BLOCK_CPU | BLOCK_LLC) => {
+        kind @ (BLOCK_CPU | BLOCK_LLC | BLOCK_PERMIT) => {
             let index = usize::try_from(read_u64(bytes, R_BLOCK_INDEX))
                 .context("blocked resource index does not fit this process")?;
-            let key = if kind == BLOCK_CPU {
-                ResourceKey::Cpu(index)
-            } else {
-                ResourceKey::Llc(index)
+            let key = match kind {
+                BLOCK_CPU => ResourceKey::Cpu(index),
+                BLOCK_LLC => ResourceKey::Llc(index),
+                BLOCK_PERMIT => ResourceKey::Permit(index),
+                _ => unreachable!("block kind matched above"),
             };
             let mode = match read_u32(bytes, R_BLOCK_MODE) {
                 0 => FlockMode::Shared,
@@ -7397,11 +8725,18 @@ fn decode_record(bytes: &[u8], layout: HeaderLayout, slot: u64) -> Result<Record
             anyhow::bail!("queue registry v{VERSION} slot {slot} has invalid blocker kind {kind}")
         }
     };
+    let backfill_credit = read_u32(bytes, R_BACKFILL_CREDIT);
+    let maximum_backfill_credit = backfill_credit_for_watch(&watch);
+    if backfill_credit > maximum_backfill_credit {
+        anyhow::bail!(
+            "queue registry v{VERSION} slot {slot} has invalid backfill credit \
+             {backfill_credit} > {maximum_backfill_credit}"
+        );
+    }
     Ok(Record {
         slot,
         state: read_u32(bytes, R_STATE),
         ticket: read_u64(bytes, R_TICKET),
-        #[cfg(test)]
         pid: read_u32(bytes, R_PID),
         claim,
         watch,
@@ -7410,6 +8745,7 @@ fn decode_record(bytes: &[u8], layout: HeaderLayout, slot: u64) -> Result<Record
         replan_claim_epoch: read_u64(bytes, R_REPLAN_CLAIM_EPOCH),
         grant_epoch: read_u64(bytes, R_GRANT_EPOCH),
         prefix_epoch: read_u64(bytes, R_PREFIX_EPOCH),
+        backfill_credit,
         prev_active: read_u64(bytes, R_PREV_ACTIVE),
         next_active: read_u64(bytes, R_NEXT_ACTIVE),
     })
@@ -7433,6 +8769,12 @@ fn encode_claim(
         record_bitset_offset(layout, RB_WATCH_LLCS),
         layout,
         &watch.llcs,
+    )?;
+    encode_bitset(
+        bytes,
+        record_bitset_offset(layout, RB_WATCH_PERMITS),
+        layout,
+        &watch.permits,
     )
 }
 
@@ -7448,6 +8790,12 @@ fn encode_exact_claim(bytes: &mut [u8], layout: HeaderLayout, claim: &ClaimSet) 
         record_bitset_offset(layout, RB_CLAIM_LLCS),
         layout,
         &claim.llcs,
+    )?;
+    encode_bitset(
+        bytes,
+        record_bitset_offset(layout, RB_CLAIM_PERMITS),
+        layout,
+        &claim.permits,
     )
 }
 
@@ -7561,6 +8909,20 @@ fn claim_conflicts_bits(
             return Ok(true);
         }
     }
+    let permit_fence = if claim.permit_mode == ClaimMode::Exclusive {
+        cpu_any
+    } else {
+        cpu_exclusive
+    };
+    for &permit in &claim.permits {
+        let index = permit_resource_index(permit)?;
+        if index >= bits {
+            anyhow::bail!("permit index {permit} exceeds queue registry capacity");
+        }
+        if permit_fence[index / 64] & (1u64 << (index % 64)) != 0 {
+            return Ok(true);
+        }
+    }
     let llc_fence = if claim.llc_mode == ClaimMode::Exclusive {
         llc_any
     } else {
@@ -7575,6 +8937,40 @@ fn claim_conflicts_bits(
         }
     }
     Ok(false)
+}
+
+fn claims_conflict(a: &ClaimSet, b: &ClaimSet) -> bool {
+    let incompatible = |a_mode: ClaimMode, b_mode: ClaimMode| {
+        a_mode == ClaimMode::Exclusive || b_mode == ClaimMode::Exclusive
+    };
+    (incompatible(a.cpu_mode, b.cpu_mode) && a.cpus.iter().any(|cpu| b.cpus.contains(cpu)))
+        || (incompatible(a.permit_mode, b.permit_mode)
+            && a.permits.iter().any(|permit| b.permits.contains(permit)))
+        || (incompatible(a.llc_mode, b.llc_mode) && a.llcs.iter().any(|llc| b.llcs.contains(llc)))
+}
+
+/// Measure one backfill wave in the same CPU-permit units that bound
+/// cooperative VM oversubscription. A production VM watch contains the whole
+/// cooperative permit pool, so this credit cannot stop admission before that
+/// pool itself is full. CPU/LLC width is the fallback for build claims and
+/// synthetic/test claims which use another permit namespace.
+fn backfill_credit_for_watch(watch: &ClaimSet) -> u32 {
+    let cooperative_end = super::super::cooperative_cpu_permit_end();
+    let permit_units = watch.permits.range(..cooperative_end).count();
+    let physical_units = watch.cpus.len().max(watch.llcs.len()).max(1);
+    u32::try_from(permit_units.max(physical_units)).unwrap_or(u32::MAX)
+}
+
+fn backfill_cost_for_claim(claim: &ClaimSet) -> u32 {
+    let cooperative_end = super::super::cooperative_cpu_permit_end();
+    let permit_units = claim.permits.range(..cooperative_end).count();
+    let physical_units = claim.cpus.len().max(claim.llcs.len()).max(1);
+    u32::try_from(if permit_units == 0 {
+        physical_units
+    } else {
+        permit_units
+    })
+    .unwrap_or(u32::MAX)
 }
 
 fn aggregate_from_words(
@@ -7594,6 +8990,7 @@ fn aggregate_from_words(
         cpu_exclusive_holders: vec![0; bits],
         llc_shared_holders: vec![0; bits],
         llc_exclusive_holders: vec![0; bits],
+        build_cpu_claims: vec![0; bits],
     }
 }
 
@@ -7612,6 +9009,16 @@ fn add_claim_bits(
         cpu_any[cpu / 64] |= 1u64 << (cpu % 64);
         if claim.cpu_mode == ClaimMode::Exclusive {
             cpu_exclusive[cpu / 64] |= 1u64 << (cpu % 64);
+        }
+    }
+    for &permit in &claim.permits {
+        let index = permit_resource_index(permit)?;
+        if index >= bits {
+            anyhow::bail!("permit index {permit} exceeds queue registry capacity");
+        }
+        cpu_any[index / 64] |= 1u64 << (index % 64);
+        if claim.permit_mode == ClaimMode::Exclusive {
+            cpu_exclusive[index / 64] |= 1u64 << (index % 64);
         }
     }
     for &llc in &claim.llcs {
@@ -7641,6 +9048,24 @@ fn aggregate_map_conflicts(map: &[u8], layout: HeaderLayout, candidate: &ClaimSe
         }
         let word = read_u64(map, layout.bitset_offset(cpu_which) + cpu / 64 * 8);
         if word & (1u64 << (cpu % 64)) != 0 {
+            return Ok(true);
+        }
+    }
+    let permit_which = if candidate.permit_mode == ClaimMode::Exclusive {
+        B_CLAIM_CPUS
+    } else {
+        B_CLAIM_CPU_EXCLUSIVE
+    };
+    for &permit in &candidate.permits {
+        let index = permit_resource_index(permit)?;
+        if index >= layout.bits {
+            anyhow::bail!(
+                "permit index {permit} exceeds queue registry v{VERSION} capacity {}",
+                layout.bits
+            );
+        }
+        let word = read_u64(map, layout.bitset_offset(permit_which) + index / 64 * 8);
+        if word & (1u64 << (index % 64)) != 0 {
             return Ok(true);
         }
     }
@@ -7675,6 +9100,16 @@ fn claim_intersects_watch_map(map: &[u8], layout: HeaderLayout, claim: &ClaimSet
             continue;
         }
         let word = read_u64(map, layout.bitset_offset(which) + index / 64 * 8);
+        if word & (1u64 << (index % 64)) != 0 {
+            return Ok(true);
+        }
+    }
+    for &permit in &claim.permits {
+        let index = permit_resource_index(permit)?;
+        if index >= layout.bits {
+            continue;
+        }
+        let word = read_u64(map, layout.bitset_offset(B_WATCH_CPUS) + index / 64 * 8);
         if word & (1u64 << (index % 64)) != 0 {
             return Ok(true);
         }

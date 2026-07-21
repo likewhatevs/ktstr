@@ -226,12 +226,8 @@ fn acquire_build_reservation_impl(
                 &host_topo, &test_topo, cpu_cap, cancelled,
             )?
         } else {
-            crate::vmm::host_topology::acquire_llc_plan(
-                &host_topo,
-                &test_topo,
-                cpu_cap,
-                crate::vmm::host_topology::PlacementPolicy::Consolidate,
-                false,
+            crate::vmm::host_topology::acquire_build_llc_plan(
+                &host_topo, &test_topo, cpu_cap, false, cancelled,
             )?
         };
         check_reservation_cancelled(cancelled)?;

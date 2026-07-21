@@ -9,20 +9,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
-use std::hash::{BuildHasher as _, Hasher as _};
-use std::io::{Read, Write as _};
-use std::os::unix::ffi::OsStrExt as _;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Current schema version for [`SchedulerArtifactManifest`].
 pub const SCHEDULER_ARTIFACT_MANIFEST_VERSION: u32 = 1;
 
-const SCHEDULER_BUILD_CACHE_SCHEMA: u32 = 1;
-const SCHEDULER_BUILD_RECORD_DIR: &str = "records-v1";
-const SCHEDULER_BUILD_LOCK_DIR: &str = ".locks-v1";
-const SCHEDULER_BUILD_NAMESPACE_GATE: &str = "namespace.lock";
-const SCHEDULER_BUILD_RECORD_MAX_BYTES: u64 = 1 << 20;
+const SCHEDULER_ARTIFACT_TREE_NAMESPACE: &str = "scheduler-workspace-v1";
 
 /// Parent-owned scheduler artifacts for one orchestrated test run.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -410,7 +404,7 @@ pub fn snapshot_pinned_scheduler_artifact(
         ));
     }
 
-    let snapshot = crate::cache::snapshot_pinned_content_file(pinned).map_err(|error| {
+    let snapshot = crate::cache::snapshot_pinned_artifact_file(pinned).map_err(|error| {
         format!(
             "publish pinned scheduler artifact {} in shared content cache: {error:#}",
             source_path.display()
@@ -419,392 +413,17 @@ pub fn snapshot_pinned_scheduler_artifact(
     Ok(SchedulerArtifactSnapshot { snapshot })
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SchedulerBuildCacheRecord {
-    version: u32,
-    identity: u64,
-    packages: Vec<String>,
-    artifacts: BTreeMap<String, PathBuf>,
-    integrity_ahash: u64,
-}
-
 /// One input-addressed scheduler workspace build result.
 ///
-/// Every path names the ordinary immutable machine content CAS. The snapshot
-/// leases keep those pathnames alive while the caller's child manifest uses
-/// them. A cache hit therefore has exactly the same artifact ownership as a
-/// fresh Cargo build, but never enters Cargo or the target-directory lease.
+/// Every path names a private COW materialization of the generic Cargo
+/// artifact-tree cache. Keeping `tree` alive keeps both that materialization
+/// and its immutable content-object leases alive through the child run. A
+/// cache hit never invokes Cargo or enters the target-directory/build leases.
 #[doc(hidden)]
 pub struct CachedSchedulerWorkspaceArtifacts {
     pub paths: BTreeMap<String, PathBuf>,
-    pub snapshots: Vec<SchedulerArtifactSnapshot>,
+    pub tree: crate::cache::artifact_tree::MaterializedArtifactTree,
     pub cache_hit: bool,
-}
-
-fn scheduler_build_fixed_hasher() -> ahash::AHasher {
-    ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher()
-}
-
-fn hash_scheduler_build_bytes(hasher: &mut ahash::AHasher, bytes: &[u8]) {
-    hasher.write_u64(bytes.len() as u64);
-    hasher.write(bytes);
-}
-
-fn scheduler_build_record_integrity(
-    version: u32,
-    identity: u64,
-    packages: &[String],
-    artifacts: &BTreeMap<String, PathBuf>,
-) -> u64 {
-    let mut hasher = scheduler_build_fixed_hasher();
-    hash_scheduler_build_bytes(&mut hasher, b"ktstr-scheduler-build-record");
-    hasher.write_u32(version);
-    hasher.write_u64(identity);
-    hasher.write_u64(packages.len() as u64);
-    for package in packages {
-        hash_scheduler_build_bytes(&mut hasher, package.as_bytes());
-    }
-    hasher.write_u64(artifacts.len() as u64);
-    for (package, path) in artifacts {
-        hash_scheduler_build_bytes(&mut hasher, package.as_bytes());
-        hash_scheduler_build_bytes(&mut hasher, path.as_os_str().as_bytes());
-    }
-    hasher.finish()
-}
-
-fn scheduler_build_cache_paths(root: &Path, identity: u64) -> (PathBuf, PathBuf, PathBuf) {
-    let records = root.join(SCHEDULER_BUILD_RECORD_DIR);
-    let locks = root.join(SCHEDULER_BUILD_LOCK_DIR);
-    (
-        records.join(format!("{identity:016x}.json")),
-        locks.join(format!("{identity:016x}.lock")),
-        locks.join(SCHEDULER_BUILD_NAMESPACE_GATE),
-    )
-}
-
-fn ensure_scheduler_build_cache_dirs(root: &Path) -> anyhow::Result<()> {
-    let directories = [
-        root.to_path_buf(),
-        root.join(SCHEDULER_BUILD_RECORD_DIR),
-        root.join(SCHEDULER_BUILD_LOCK_DIR),
-    ];
-    for directory in &directories {
-        std::fs::create_dir_all(directory).map_err(|error| {
-            anyhow::anyhow!(
-                "create scheduler build cache directory {}: {error}",
-                directory.display()
-            )
-        })?;
-    }
-    Ok(())
-}
-
-fn scheduler_build_error_is_not_found(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-    })
-}
-
-fn reopen_cached_scheduler_artifact(
-    path: &Path,
-) -> Result<Option<SchedulerArtifactSnapshot>, String> {
-    let pinned = match crate::cache::pin_content_file(path) {
-        Ok(pinned) => pinned,
-        Err(error) if scheduler_build_error_is_not_found(&error) => return Ok(None),
-        Err(error) => {
-            return Err(format!(
-                "open cached scheduler artifact {}: {error:#}",
-                path.display()
-            ));
-        }
-    };
-    let snapshot = snapshot_pinned_scheduler_artifact(pinned)?;
-    if snapshot.path() != path {
-        return Err(format!(
-            "cached scheduler artifact {} did not reopen as its canonical content object {}",
-            path.display(),
-            snapshot.path().display(),
-        ));
-    }
-    Ok(Some(snapshot))
-}
-
-fn read_scheduler_build_cache_record(
-    path: &Path,
-    identity: u64,
-    packages: &[String],
-) -> Result<Option<CachedSchedulerWorkspaceArtifacts>, String> {
-    let Some((mut file, file_identity)) =
-        crate::cache::content::open_cache_record(path, "scheduler build cache record")
-            .map_err(|error| error.to_string())?
-    else {
-        return Ok(None);
-    };
-    if file_identity.size > SCHEDULER_BUILD_RECORD_MAX_BYTES {
-        return Err(format!(
-            "scheduler build cache record {} is too large: {} bytes",
-            path.display(),
-            file_identity.size,
-        ));
-    }
-    let mut bytes = Vec::with_capacity(file_identity.size as usize);
-    file.read_to_end(&mut bytes).map_err(|error| {
-        format!(
-            "read scheduler build cache record {}: {error}",
-            path.display()
-        )
-    })?;
-    let after = crate::cache::content::StableFileIdentity::from_file(&file)
-        .map_err(|error| error.to_string())?;
-    if after != file_identity {
-        return Err(format!(
-            "scheduler build cache record changed while reading: {}",
-            path.display()
-        ));
-    }
-    let record: SchedulerBuildCacheRecord = serde_json::from_slice(&bytes).map_err(|error| {
-        format!(
-            "parse scheduler build cache record {}: {error}",
-            path.display()
-        )
-    })?;
-    if record.version != SCHEDULER_BUILD_CACHE_SCHEMA {
-        return Err(format!(
-            "unsupported scheduler build cache record version {} in {}",
-            record.version,
-            path.display(),
-        ));
-    }
-    if record.identity != identity {
-        return Err(format!(
-            "scheduler build cache identity collision in {}: expected {identity:016x}, got \
-             {:016x}",
-            path.display(),
-            record.identity,
-        ));
-    }
-    if record.packages != packages {
-        return Err(format!(
-            "scheduler build cache package-set collision in {}: expected {:?}, got {:?}",
-            path.display(),
-            packages,
-            record.packages,
-        ));
-    }
-    if record.artifacts.keys().ne(packages.iter()) {
-        return Err(format!(
-            "scheduler build cache artifact set in {} does not match packages {:?}",
-            path.display(),
-            packages,
-        ));
-    }
-    let expected_integrity = scheduler_build_record_integrity(
-        record.version,
-        record.identity,
-        &record.packages,
-        &record.artifacts,
-    );
-    if record.integrity_ahash != expected_integrity {
-        return Err(format!(
-            "scheduler build cache record integrity mismatch: {}",
-            path.display()
-        ));
-    }
-
-    let mut paths = BTreeMap::new();
-    let mut snapshots = Vec::with_capacity(record.artifacts.len());
-    for (package, artifact) in record.artifacts {
-        let Some(snapshot) = reopen_cached_scheduler_artifact(&artifact)? else {
-            // Content GC may legally reclaim an object while no manifest
-            // leases it. The immutable build record then becomes a cache miss;
-            // the elected successor rebuilds and atomically replaces it.
-            return Ok(None);
-        };
-        paths.insert(package, snapshot.path().to_path_buf());
-        snapshots.push(snapshot);
-    }
-    Ok(Some(CachedSchedulerWorkspaceArtifacts {
-        paths,
-        snapshots,
-        cache_hit: true,
-    }))
-}
-
-fn publish_scheduler_build_cache_record(
-    path: &Path,
-    identity: u64,
-    packages: &[String],
-    artifacts: &BTreeMap<String, PathBuf>,
-) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let mut record = SchedulerBuildCacheRecord {
-        version: SCHEDULER_BUILD_CACHE_SCHEMA,
-        identity,
-        packages: packages.to_vec(),
-        artifacts: artifacts.clone(),
-        integrity_ahash: 0,
-    };
-    record.integrity_ahash = scheduler_build_record_integrity(
-        record.version,
-        record.identity,
-        &record.packages,
-        &record.artifacts,
-    );
-    let parent = path.parent().ok_or_else(|| {
-        format!(
-            "scheduler build cache path has no parent: {}",
-            path.display()
-        )
-    })?;
-    let mut temporary = tempfile::Builder::new()
-        .prefix(&format!(".tmp-{identity:016x}-"))
-        .tempfile_in(parent)
-        .map_err(|error| {
-            format!(
-                "create scheduler build cache record temp in {}: {error}",
-                parent.display()
-            )
-        })?;
-    serde_json::to_writer(temporary.as_file_mut(), &record)
-        .map_err(|error| format!("serialize scheduler build cache record: {error}"))?;
-    temporary
-        .as_file_mut()
-        .flush()
-        .map_err(|error| format!("flush scheduler build cache record: {error}"))?;
-    temporary
-        .as_file()
-        .set_permissions(std::fs::Permissions::from_mode(0o444))
-        .map_err(|error| format!("make scheduler build cache record immutable: {error}"))?;
-    temporary.persist(path).map_err(|error| {
-        format!(
-            "atomically publish scheduler build cache record {}: {}",
-            path.display(),
-            error.error,
-        )
-    })?;
-    Ok(())
-}
-
-#[derive(Clone, Copy)]
-enum SchedulerBuildWaitState {
-    Started,
-    Heartbeat,
-    Acquired,
-}
-
-#[derive(Clone, Copy)]
-enum SchedulerBuildWaitKind {
-    Producer,
-    Successor,
-}
-
-fn format_scheduler_build_wait(
-    label: &str,
-    identity: u64,
-    elapsed: std::time::Duration,
-    kind: SchedulerBuildWaitKind,
-    state: SchedulerBuildWaitState,
-) -> String {
-    let elapsed = humantime::format_duration(elapsed).to_string();
-    match (kind, state) {
-        (SchedulerBuildWaitKind::Producer, SchedulerBuildWaitState::Started) => format!(
-            "{label}: waiting for input-addressed scheduler workspace build \
-             {identity:016x}; elapsed={elapsed}"
-        ),
-        (SchedulerBuildWaitKind::Producer, SchedulerBuildWaitState::Heartbeat) => format!(
-            "{label}: still waiting for input-addressed scheduler workspace build \
-             {identity:016x}; elapsed={elapsed}"
-        ),
-        (SchedulerBuildWaitKind::Producer, SchedulerBuildWaitState::Acquired) => format!(
-            "{label}: scheduler workspace build producer {identity:016x} finished; \
-             validating reusable artifacts after {elapsed}"
-        ),
-        (SchedulerBuildWaitKind::Successor, SchedulerBuildWaitState::Started) => format!(
-            "{label}: waiting to become successor for scheduler workspace build \
-             {identity:016x}; elapsed={elapsed}"
-        ),
-        (SchedulerBuildWaitKind::Successor, SchedulerBuildWaitState::Heartbeat) => format!(
-            "{label}: still waiting to become successor for scheduler workspace build \
-             {identity:016x}; elapsed={elapsed}"
-        ),
-        (SchedulerBuildWaitKind::Successor, SchedulerBuildWaitState::Acquired) => format!(
-            "{label}: acquired successor election for scheduler workspace build \
-             {identity:016x} after {elapsed}"
-        ),
-    }
-}
-
-fn wait_for_scheduler_build_lock<C>(
-    coordination: &mut crate::cache::content::CoordinationFile,
-    label: &str,
-    identity: u64,
-    kind: SchedulerBuildWaitKind,
-    cancelled: &C,
-) -> anyhow::Result<()>
-where
-    C: Fn() -> bool,
-{
-    const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-    const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-    let started = std::time::Instant::now();
-    eprintln!(
-        "{}",
-        format_scheduler_build_wait(
-            label,
-            identity,
-            std::time::Duration::ZERO,
-            kind,
-            SchedulerBuildWaitState::Started,
-        )
-    );
-    let mut next_heartbeat = HEARTBEAT_INTERVAL;
-    loop {
-        if cancelled() {
-            return Err(
-                anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EINTR))
-                    .context("scheduler workspace build cache wait interrupted"),
-            );
-        }
-        let acquired = match kind {
-            SchedulerBuildWaitKind::Producer => coordination.try_lock_shared(),
-            SchedulerBuildWaitKind::Successor => coordination.try_lock_exclusive(),
-        };
-        match acquired {
-            Ok(()) => break,
-            Err(error) if error == rustix::io::Errno::WOULDBLOCK => {}
-            Err(error) => return Err(error.into()),
-        }
-        let elapsed = started.elapsed();
-        if elapsed >= next_heartbeat {
-            eprintln!(
-                "{}",
-                format_scheduler_build_wait(
-                    label,
-                    identity,
-                    elapsed,
-                    kind,
-                    SchedulerBuildWaitState::Heartbeat,
-                )
-            );
-            next_heartbeat = elapsed + HEARTBEAT_INTERVAL;
-        }
-        std::thread::park_timeout(RETRY_INTERVAL.min(next_heartbeat.saturating_sub(elapsed)));
-    }
-    eprintln!(
-        "{}",
-        format_scheduler_build_wait(
-            label,
-            identity,
-            started.elapsed(),
-            kind,
-            SchedulerBuildWaitState::Acquired,
-        )
-    );
-    Ok(())
 }
 
 fn load_or_build_scheduler_workspace_artifacts_at_root<F, V, C>(
@@ -829,105 +448,55 @@ where
             "scheduler build cache packages must be non-empty, sorted, unique names: {packages:?}"
         ));
     }
-    if cancelled() {
-        return Err("scheduler workspace build cache operation interrupted".to_string());
-    }
-    ensure_scheduler_build_cache_dirs(root).map_err(|error| error.to_string())?;
-    let (record_path, lock_path, namespace_gate) = scheduler_build_cache_paths(root, identity);
-    crate::cache::content::load_or_build_with_wait(
-        &namespace_gate,
-        &lock_path,
-        &format!("scheduler workspace build {identity:016x}"),
-        || {
-            if cancelled() {
-                anyhow::bail!("scheduler workspace build cache operation interrupted");
-            }
-            match read_scheduler_build_cache_record(&record_path, identity, packages) {
-                Ok(Some(record)) => {
-                    if cancelled() {
-                        anyhow::bail!("scheduler workspace build cache operation interrupted");
-                    }
-                    if !validate_identity().map_err(anyhow::Error::msg)? {
-                        anyhow::bail!(
-                            "scheduler workspace inputs changed before accepting cached build \
-                             {identity:016x}"
-                        );
-                    }
-                    if cancelled() {
-                        anyhow::bail!("scheduler workspace build cache operation interrupted");
-                    }
-                    Ok(Some(record))
-                }
-                Ok(None) => Ok(None),
-                Err(error) => {
-                    tracing::debug!(
-                        path = %record_path.display(),
-                        error = %error,
-                        "rebuilding invalid reconstructible scheduler build cache record",
-                    );
-                    Ok(None)
-                }
-            }
-        },
-        || {
-            if cancelled() {
-                anyhow::bail!("scheduler workspace build cache operation interrupted");
-            }
-            let pinned = build().map_err(anyhow::Error::msg)?;
-            if cancelled() {
-                anyhow::bail!("scheduler workspace build cache operation interrupted");
-            }
-            if pinned.keys().ne(packages.iter()) {
-                anyhow::bail!(
+    let cache = crate::cache::artifact_tree::ArtifactTreeCache::new(
+        root.join(SCHEDULER_ARTIFACT_TREE_NAMESPACE),
+    );
+    let materializations = root.join("materialized");
+    let tree = cache
+        .load_or_build(
+            identity,
+            &materializations,
+            progress_label,
+            || validate_identity().map_err(anyhow::Error::msg),
+            &cancelled,
+            || {
+                let pinned = build().map_err(anyhow::Error::msg)?;
+                anyhow::ensure!(
+                    pinned.keys().eq(packages.iter()),
                     "scheduler workspace builder emitted packages {:?}, expected {packages:?}",
                     pinned.keys().collect::<Vec<_>>(),
                 );
-            }
-            let mut paths = BTreeMap::new();
-            let mut snapshots = Vec::with_capacity(pinned.len());
-            for (package, artifact) in pinned {
-                let snapshot =
-                    snapshot_pinned_scheduler_artifact(artifact).map_err(anyhow::Error::msg)?;
-                paths.insert(package, snapshot.path().to_path_buf());
-                snapshots.push(snapshot);
-            }
-            if !validate_identity().map_err(anyhow::Error::msg)? {
-                anyhow::bail!(
-                    "scheduler workspace inputs changed before publishing build \
-                     {identity:016x}"
-                );
-            }
-            if cancelled() {
-                anyhow::bail!("scheduler workspace build cache operation interrupted");
-            }
-            publish_scheduler_build_cache_record(&record_path, identity, packages, &paths)
-                .map_err(anyhow::Error::msg)?;
-            Ok(CachedSchedulerWorkspaceArtifacts {
-                paths,
-                snapshots,
-                cache_hit: false,
-            })
-        },
-        |coordination| {
-            wait_for_scheduler_build_lock(
-                coordination,
-                progress_label,
-                identity,
-                SchedulerBuildWaitKind::Producer,
-                &cancelled,
-            )
-        },
-        |coordination| {
-            wait_for_scheduler_build_lock(
-                coordination,
-                progress_label,
-                identity,
-                SchedulerBuildWaitKind::Successor,
-                &cancelled,
-            )
-        },
-    )
-    .map_err(|error| format!("{error:#}"))
+                let mut source = crate::cache::artifact_tree::ArtifactTreeSource::new();
+                for (package, artifact) in pinned {
+                    source.insert_immutable_pinned_file(
+                        Path::new("artifacts").join(package),
+                        artifact,
+                    )?;
+                }
+                Ok(source)
+            },
+        )
+        .map_err(|error| format!("{error:#}"))?;
+    let paths = packages
+        .iter()
+        .map(|package| (package.clone(), tree.root().join("artifacts").join(package)))
+        .collect();
+    let cache_hit = tree.cache_hit();
+    if let Err(error) = tree.persist_decision_diagnostic(
+        "scheduler-workspace",
+        serde_json::json!({
+            "namespace": SCHEDULER_ARTIFACT_TREE_NAMESPACE,
+            "normalized_inputs_digest": format!("{identity:016x}"),
+            "packages": packages,
+        }),
+    ) {
+        tracing::warn!(error = %error, "could not persist scheduler artifact-cache decision");
+    }
+    Ok(CachedSchedulerWorkspaceArtifacts {
+        paths,
+        tree,
+        cache_hit,
+    })
 }
 
 /// Reuse or build one exact scheduler workspace output identity.
@@ -950,8 +519,8 @@ where
     V: Fn() -> Result<bool, String>,
     C: Fn() -> bool,
 {
-    let root = crate::cache::scheduler_build_cache_root()
-        .map_err(|error| format!("resolve scheduler build cache root: {error:#}"))?;
+    let root = crate::cache::cargo_artifact_tree_cache_root()
+        .map_err(|error| format!("resolve Cargo artifact tree cache root: {error:#}"))?;
     load_or_build_scheduler_workspace_artifacts_at_root(
         &root,
         identity,
@@ -961,6 +530,112 @@ where
         cancelled,
         build,
     )
+}
+
+/// Build scheduler workspaces through the same deterministic stable-output
+/// producer used by ordinary, coverage, and verifier harness closures.
+///
+/// Scheduler binaries may embed `OUT_DIR`, so the Cargo child must write at
+/// the final persistent pathname supplied to `build`; execution still uses a
+/// private reflink materialization.
+#[doc(hidden)]
+pub fn load_or_build_scheduler_workspace_artifacts_stable<F, V, C>(
+    identity: u64,
+    packages: &[String],
+    progress_label: &str,
+    validate_identity: V,
+    cancelled: C,
+    build: F,
+) -> Result<CachedSchedulerWorkspaceArtifacts, String>
+where
+    F: FnOnce(
+        &crate::cache::artifact_tree::StableCargoBuild,
+    ) -> Result<BTreeMap<String, crate::cache::PinnedContentFile>, String>,
+    V: Fn() -> Result<bool, String>,
+    C: Fn() -> bool,
+{
+    if packages.is_empty()
+        || packages.windows(2).any(|pair| pair[0] >= pair[1])
+        || packages.iter().any(String::is_empty)
+    {
+        return Err(format!(
+            "scheduler build cache packages must be non-empty, sorted, unique names: {packages:?}"
+        ));
+    }
+    let root = crate::cache::cargo_artifact_tree_cache_root()
+        .map_err(|error| format!("resolve Cargo artifact tree cache root: {error:#}"))?;
+    let cache = crate::cache::artifact_tree::ArtifactTreeCache::new(
+        root.join(SCHEDULER_ARTIFACT_TREE_NAMESPACE),
+    );
+    let tree = cache
+        .load_or_build_with_stable_cargo_output(
+            identity,
+            &root.join("stable-builds-v1"),
+            &root.join("materialized"),
+            progress_label,
+            || validate_identity().map_err(anyhow::Error::msg),
+            cancelled,
+            |stable| {
+                let pinned = build(stable).map_err(anyhow::Error::msg)?;
+                anyhow::ensure!(
+                    pinned.keys().eq(packages.iter()),
+                    "scheduler workspace builder emitted packages {:?}, expected {packages:?}",
+                    pinned.keys().collect::<Vec<_>>(),
+                );
+                let mut source = crate::cache::artifact_tree::ArtifactTreeSource::new();
+                for (package, artifact) in pinned {
+                    let stable_path = artifact.source_path().to_path_buf();
+                    let stable_relative = stable_path.strip_prefix(&stable.root).map_err(|_| {
+                        anyhow::anyhow!(
+                            "scheduler artifact {} is outside stable Cargo output {}",
+                            stable_path.display(),
+                            stable.root.display(),
+                        )
+                    })?;
+                    anyhow::ensure!(
+                        stable_relative.starts_with("target"),
+                        "scheduler artifact {} is outside stable Cargo target {}",
+                        stable_path.display(),
+                        stable.target_directory.display(),
+                    );
+                    source.insert_immutable_pinned_file(
+                        Path::new("artifacts").join(package),
+                        artifact,
+                    )?;
+                    // Preserve the exact absolute Cargo output pathname as
+                    // part of the generic closure. Scheduler binaries may
+                    // embed OUT_DIR/CARGO_BIN_EXE paths even though consumers
+                    // execute the convenient `artifacts/<package>` alias.
+                    source.insert_immutable_path(stable_relative, &stable_path)?;
+                }
+                let stable_build_directory = stable.root.join("build");
+                if stable_build_directory.is_dir() {
+                    source.insert_immutable_tree("build", &stable_build_directory)?;
+                }
+                Ok(source)
+            },
+        )
+        .map_err(|error| format!("{error:#}"))?;
+    let paths = packages
+        .iter()
+        .map(|package| (package.clone(), tree.root().join("artifacts").join(package)))
+        .collect();
+    let cache_hit = tree.cache_hit();
+    if let Err(error) = tree.persist_decision_diagnostic(
+        "scheduler-workspace",
+        serde_json::json!({
+            "namespace": SCHEDULER_ARTIFACT_TREE_NAMESPACE,
+            "normalized_inputs_digest": format!("{identity:016x}"),
+            "packages": packages,
+        }),
+    ) {
+        tracing::warn!(error = %error, "could not persist scheduler artifact-cache decision");
+    }
+    Ok(CachedSchedulerWorkspaceArtifacts {
+        paths,
+        tree,
+        cache_hit,
+    })
 }
 
 /// Atomically publish one immutable scheduler artifact manifest.
@@ -1268,7 +943,11 @@ mod tests {
 
     #[test]
     fn snapshot_pins_bytes_and_inode_across_source_replacement() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+
+        let _environment = lock_env();
         let source_dir = tempfile::tempdir().expect("source tempdir");
+        let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, source_dir.path().join("cache"));
         let source = source_dir.path().join("scheduler");
         std::fs::write(&source, b"old scheduler bytes").expect("write source");
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755))
@@ -1302,166 +981,20 @@ mod tests {
         );
     }
 
-    fn write_scheduler_build_fixture(path: &Path, bytes: &[u8]) {
-        std::fs::write(path, bytes).expect("write scheduler build fixture");
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod scheduler build fixture");
-    }
-
     #[test]
-    fn scheduler_build_cache_hit_skips_builder_and_reconstructible_damage_rebuilds() {
-        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+    fn scheduler_workspace_build_uses_generic_artifact_tree_and_skips_warm_builder() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let _environment = lock_env();
-        let root = tempfile::tempdir().expect("scheduler build cache root");
-        let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, root.path());
+        let root = tempfile::tempdir().expect("scheduler artifact-tree root");
         let source = root.path().join("scheduler-source");
-        write_scheduler_build_fixture(&source, b"scheduler-cache-fixture-v1");
-        let packages = vec!["scx_cache_fixture".to_string()];
+        std::fs::write(&source, b"generic-scheduler-tree").expect("write scheduler fixture");
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod scheduler fixture");
+        let packages = vec!["scx_generic_cache".to_string()];
         let builds = AtomicUsize::new(0);
-
-        let build = || {
-            builds.fetch_add(1, Ordering::SeqCst);
-            Ok(BTreeMap::from([(
-                packages[0].clone(),
-                crate::cache::pin_content_file(&source).expect("pin fixture"),
-            )]))
-        };
         let first = load_or_build_scheduler_workspace_artifacts_at_root(
             root.path(),
-            0x51ceda7a,
-            &packages,
-            "cargo ktstr test",
-            || Ok(true),
-            || false,
-            build,
-        )
-        .expect("cold scheduler workspace build");
-        assert!(!first.cache_hit);
-        let object = first.paths[&packages[0]].clone();
-        drop(first);
-
-        let hit = load_or_build_scheduler_workspace_artifacts_at_root(
-            root.path(),
-            0x51ceda7a,
-            &packages,
-            "cargo ktstr test",
-            || Ok(true),
-            || false,
-            || -> Result<BTreeMap<String, crate::cache::PinnedContentFile>, String> {
-                panic!("a valid cache hit must not invoke the builder")
-            },
-        )
-        .expect("warm scheduler workspace build");
-        assert!(hit.cache_hit);
-        assert_eq!(hit.paths[&packages[0]], object);
-        drop(hit);
-        assert_eq!(builds.load(Ordering::SeqCst), 1);
-
-        let interrupted_hit = match load_or_build_scheduler_workspace_artifacts_at_root(
-            root.path(),
-            0x51ceda7a,
-            &packages,
-            "cargo ktstr test",
-            || Ok(true),
-            || true,
-            || -> Result<BTreeMap<String, crate::cache::PinnedContentFile>, String> {
-                panic!("cancellation before a warm hit must not invoke the builder")
-            },
-        ) {
-            Ok(_) => panic!("cancellation must be checked before accepting a warm cache hit"),
-            Err(error) => error,
-        };
-        assert!(
-            interrupted_hit.contains("cache operation interrupted"),
-            "unexpected warm-hit cancellation error: {interrupted_hit}",
-        );
-
-        let (record, _, _) = scheduler_build_cache_paths(root.path(), 0x51ceda7a);
-        std::fs::remove_file(&record).expect("remove immutable cache record");
-        std::fs::write(&record, b"{").expect("write corrupt cache record");
-        let rebuilt = load_or_build_scheduler_workspace_artifacts_at_root(
-            root.path(),
-            0x51ceda7a,
-            &packages,
-            "cargo ktstr test",
-            || Ok(true),
-            || false,
-            build,
-        )
-        .expect("corrupt record rebuild");
-        assert!(!rebuilt.cache_hit);
-        assert_eq!(builds.load(Ordering::SeqCst), 2);
-        drop(rebuilt);
-
-        std::fs::remove_file(&object).expect("simulate content-CAS collection");
-        let rebuilt = load_or_build_scheduler_workspace_artifacts_at_root(
-            root.path(),
-            0x51ceda7a,
-            &packages,
-            "cargo ktstr test",
-            || Ok(true),
-            || false,
-            build,
-        )
-        .expect("stale record rebuild");
-        assert!(!rebuilt.cache_hit);
-        assert_eq!(builds.load(Ordering::SeqCst), 3);
-        assert_eq!(
-            std::fs::read(&rebuilt.paths[&packages[0]]).expect("read rebuilt object"),
-            b"scheduler-cache-fixture-v1",
-        );
-    }
-
-    #[test]
-    fn scheduler_build_cache_rejects_hit_and_publication_input_drift() {
-        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
-        use std::cell::Cell;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let _environment = lock_env();
-        let root = tempfile::tempdir().expect("scheduler build cache root");
-        let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, root.path());
-        let source = root.path().join("scheduler-source");
-        write_scheduler_build_fixture(&source, b"scheduler-drift-fixture");
-        let packages = vec!["scx_drift_fixture".to_string()];
-        let builds = AtomicUsize::new(0);
-        let drifted = Cell::new(false);
-        let identity = 0xd11f7ed;
-
-        let publication_error = match load_or_build_scheduler_workspace_artifacts_at_root(
-            root.path(),
-            identity,
-            &packages,
-            "cargo ktstr test",
-            || Ok(!drifted.get()),
-            || false,
-            || {
-                builds.fetch_add(1, Ordering::SeqCst);
-                let pinned =
-                    crate::cache::pin_content_file(&source).map_err(|error| error.to_string())?;
-                drifted.set(true);
-                Ok(BTreeMap::from([(packages[0].clone(), pinned)]))
-            },
-        ) {
-            Ok(_) => panic!("mutation during a cold build must prevent publication"),
-            Err(error) => error,
-        };
-        assert!(
-            publication_error.contains("inputs changed before publishing"),
-            "unexpected publication drift error: {publication_error}",
-        );
-        let (record, _, _) = scheduler_build_cache_paths(root.path(), identity);
-        assert!(
-            !record.exists(),
-            "a drifted cold build must not publish a reusable record",
-        );
-
-        drifted.set(false);
-        let warmable = load_or_build_scheduler_workspace_artifacts_at_root(
-            root.path(),
-            identity,
+            0x5ced_7aee,
             &packages,
             "cargo ktstr test",
             || Ok(true),
@@ -1474,318 +1007,97 @@ mod tests {
                 )]))
             },
         )
-        .expect("stable cold build");
-        assert!(!warmable.cache_hit);
-        drop(warmable);
-
-        let hit_error = match load_or_build_scheduler_workspace_artifacts_at_root(
-            root.path(),
-            identity,
-            &packages,
-            "cargo ktstr test",
-            || Ok(false),
-            || false,
-            || -> Result<BTreeMap<String, crate::cache::PinnedContentFile>, String> {
-                panic!("a drifted cache hit must not invoke the old-key builder")
-            },
-        ) {
-            Ok(_) => panic!("mutation before hit acceptance must reject stale artifacts"),
-            Err(error) => error,
-        };
-        assert!(
-            hit_error.contains("inputs changed before accepting cached build"),
-            "unexpected hit drift error: {hit_error}",
+        .expect("cold scheduler artifact tree");
+        assert!(!first.cache_hit);
+        assert_eq!(
+            std::fs::read(&first.paths[&packages[0]]).expect("read cold scheduler artifact"),
+            b"generic-scheduler-tree",
         );
-        assert_eq!(builds.load(Ordering::SeqCst), 2);
-    }
+        drop(first);
 
-    #[test]
-    fn scheduler_build_cache_wait_is_promptly_interruptible() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let root = tempfile::tempdir().expect("scheduler build cache root");
-        ensure_scheduler_build_cache_dirs(root.path()).expect("create scheduler cache dirs");
-        let packages = vec!["scx_interrupt_fixture".to_string()];
-        let identity = 0x1a7e22;
-        let (_, lock, namespace) = scheduler_build_cache_paths(root.path(), identity);
-        let mut producer =
-            crate::cache::content::open_coord_file(&namespace, &lock).expect("open producer lock");
-        producer
-            .try_lock_exclusive()
-            .expect("hold scheduler producer election");
-
-        let interrupted = Arc::new(AtomicBool::new(false));
-        let wake = Arc::clone(&interrupted);
-        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::sync_channel(1);
-        let trigger = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(25));
-            let cancelled_at = std::time::Instant::now();
-            cancelled_tx
-                .send(cancelled_at)
-                .expect("publish cancellation instant");
-            wake.store(true, Ordering::Release);
-        });
-        let error = match load_or_build_scheduler_workspace_artifacts_at_root(
+        let hit = load_or_build_scheduler_workspace_artifacts_at_root(
             root.path(),
-            identity,
+            0x5ced_7aee,
             &packages,
             "cargo ktstr test",
             || Ok(true),
-            || interrupted.load(Ordering::Acquire),
+            || false,
             || -> Result<BTreeMap<String, crate::cache::PinnedContentFile>, String> {
-                panic!("an interrupted waiter must not become the builder")
+                panic!("a generic artifact-tree hit must not invoke the Cargo builder")
             },
-        ) {
-            Ok(_) => panic!("cancelled cache wait must not succeed"),
-            Err(error) => error,
-        };
-        let completed_at = std::time::Instant::now();
-        trigger.join().expect("interrupt trigger");
-        let cancelled_at = cancelled_rx.recv().expect("cancellation instant");
-        assert!(
-            error.contains("scheduler workspace build cache wait interrupted"),
-            "unexpected interrupt error: {error}",
-        );
-        assert!(
-            completed_at.duration_since(cancelled_at) < std::time::Duration::from_secs(1),
-            "100ms parked retries must observe a delivered cancellation promptly",
-        );
-    }
-
-    #[test]
-    fn scheduler_build_cache_successor_wait_is_promptly_interruptible() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let root = tempfile::tempdir().expect("scheduler build cache root");
-        ensure_scheduler_build_cache_dirs(root.path()).expect("create scheduler cache dirs");
-        let identity = 0x5acce5502;
-        let (_, lock, namespace) = scheduler_build_cache_paths(root.path(), identity);
-        let mut producer =
-            crate::cache::content::open_coord_file(&namespace, &lock).expect("open producer lock");
-        producer
-            .try_lock_exclusive()
-            .expect("hold scheduler producer election");
-        let mut successor =
-            crate::cache::content::open_coord_file(&namespace, &lock).expect("open successor lock");
-
-        let interrupted = Arc::new(AtomicBool::new(false));
-        let wake = Arc::clone(&interrupted);
-        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::sync_channel(1);
-        let trigger = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(25));
-            let cancelled_at = std::time::Instant::now();
-            cancelled_tx
-                .send(cancelled_at)
-                .expect("publish cancellation instant");
-            wake.store(true, Ordering::Release);
-        });
-        let error = wait_for_scheduler_build_lock(
-            &mut successor,
-            "cargo ktstr test",
-            identity,
-            SchedulerBuildWaitKind::Successor,
-            &|| interrupted.load(Ordering::Acquire),
         )
-        .expect_err("cancelled successor election");
-        let completed_at = std::time::Instant::now();
-        trigger.join().expect("interrupt trigger");
-        let cancelled_at = cancelled_rx.recv().expect("cancellation instant");
-        assert!(
-            error
-                .to_string()
-                .contains("scheduler workspace build cache wait interrupted"),
-            "unexpected successor interrupt error: {error:#}",
+        .expect("warm scheduler artifact tree");
+        assert!(hit.cache_hit);
+        assert_eq!(
+            std::fs::read(&hit.paths[&packages[0]]).expect("read warm scheduler artifact"),
+            b"generic-scheduler-tree",
         );
-        assert!(
-            completed_at.duration_since(cancelled_at) < std::time::Duration::from_secs(1),
-            "100ms parked retries must observe delivered successor cancellation promptly",
-        );
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn scheduler_build_cache_wait_messages_are_deterministic() {
-        assert_eq!(
-            format_scheduler_build_wait(
-                "cargo ktstr test",
-                0x123,
-                std::time::Duration::from_secs(20),
-                SchedulerBuildWaitKind::Producer,
-                SchedulerBuildWaitState::Heartbeat,
-            ),
-            "cargo ktstr test: still waiting for input-addressed scheduler workspace build \
-             0000000000000123; elapsed=20s",
-        );
-        assert_eq!(
-            format_scheduler_build_wait(
-                "cargo ktstr test",
-                0x123,
-                std::time::Duration::from_secs(20),
-                SchedulerBuildWaitKind::Successor,
-                SchedulerBuildWaitState::Heartbeat,
-            ),
-            "cargo ktstr test: still waiting to become successor for scheduler workspace build \
-             0000000000000123; elapsed=20s",
-        );
-    }
+    fn stable_scheduler_workspace_preserves_original_target_and_build_closure() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
 
-    const SCHEDULER_BUILD_CHILD_TEST: &str =
-        "scheduler_artifact::tests::scheduler_build_cache_cross_process_child";
-    const SCHEDULER_BUILD_CHILD_ROOT: &str = "KTSTR_SCHEDULER_BUILD_CHILD_ROOT";
-    const SCHEDULER_BUILD_CHILD_INDEX: &str = "KTSTR_SCHEDULER_BUILD_CHILD_INDEX";
-    const SCHEDULER_BUILD_CHILD_READY: &str = "KTSTR_SCHEDULER_BUILD_CHILD_READY";
-    const SCHEDULER_BUILD_CHILD_START: &str = "KTSTR_SCHEDULER_BUILD_CHILD_START";
-    const SCHEDULER_BUILD_CHILD_COUNTER: &str = "KTSTR_SCHEDULER_BUILD_CHILD_COUNTER";
-    const SCHEDULER_BUILD_CHILD_RESULTS: &str = "KTSTR_SCHEDULER_BUILD_CHILD_RESULTS";
+        let _environment = lock_env();
+        let temp = tempfile::tempdir().unwrap();
+        let cache_root = temp.path().join("cache");
+        let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, &cache_root);
+        let identity = 0x5ced_57ab;
+        let packages = vec!["scx_stable_cache".to_string()];
 
-    #[test]
-    fn scheduler_build_cache_cross_process_child() {
-        use std::io::Write as _;
-        use std::os::unix::ffi::OsStrExt as _;
-
-        let Some(root) = std::env::var_os(SCHEDULER_BUILD_CHILD_ROOT).map(PathBuf::from) else {
-            return;
-        };
-        let index = std::env::var(SCHEDULER_BUILD_CHILD_INDEX)
-            .expect("child index")
-            .parse::<usize>()
-            .expect("parse child index");
-        let ready = PathBuf::from(
-            std::env::var_os(SCHEDULER_BUILD_CHILD_READY).expect("child ready directory"),
-        );
-        let start =
-            PathBuf::from(std::env::var_os(SCHEDULER_BUILD_CHILD_START).expect("child start lock"));
-        let counter = PathBuf::from(
-            std::env::var_os(SCHEDULER_BUILD_CHILD_COUNTER).expect("child build counter"),
-        );
-        let results = PathBuf::from(
-            std::env::var_os(SCHEDULER_BUILD_CHILD_RESULTS).expect("child result directory"),
-        );
-        // SAFETY: this exact subprocess runs one selected test with one libtest
-        // thread; no peer thread can concurrently read the process environment.
-        unsafe {
-            std::env::set_var(crate::KTSTR_CACHE_DIR_ENV, &root);
-        }
-        let start = std::fs::File::open(start).expect("open child start lock");
-        std::fs::write(ready.join(index.to_string()), b"ready").expect("publish child ready");
-        rustix::fs::flock(&start, rustix::fs::FlockOperation::LockShared)
-            .expect("wait for child start");
-
-        let packages = vec!["scx_cross_process".to_string()];
-        let result = load_or_build_scheduler_workspace_artifacts_at_root(
-            &root,
-            0xc2055cace,
+        let cached = load_or_build_scheduler_workspace_artifacts_stable(
+            identity,
             &packages,
-            "cargo ktstr test",
+            "stable scheduler artifact-tree test",
             || Ok(true),
             || false,
-            || {
-                let mut attempts = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&counter)
+            |stable| {
+                let scheduler = stable.target_directory.join("release/scx_stable_cache");
+                let out_file = stable.root.join("build/scx-stable/out/generated");
+                std::fs::create_dir_all(scheduler.parent().unwrap())
                     .map_err(|error| error.to_string())?;
-                writeln!(attempts, "builder-{index}").map_err(|error| error.to_string())?;
-                attempts.sync_all().map_err(|error| error.to_string())?;
-                let source = root.join(format!("scheduler-source-{index}"));
-                write_scheduler_build_fixture(&source, b"cross-process-scheduler-bytes");
+                std::fs::create_dir_all(out_file.parent().unwrap())
+                    .map_err(|error| error.to_string())?;
+                std::fs::write(&scheduler, b"stable scheduler")
+                    .map_err(|error| error.to_string())?;
+                std::fs::set_permissions(&scheduler, std::fs::Permissions::from_mode(0o755))
+                    .map_err(|error| error.to_string())?;
+                std::fs::write(&out_file, b"embedded OUT_DIR payload")
+                    .map_err(|error| error.to_string())?;
+                let junk = stable.target_directory.join("release/deps/unrecorded");
+                std::fs::create_dir_all(&junk).map_err(|error| error.to_string())?;
+                std::fs::write(junk.join("junk"), b"discard").map_err(|error| error.to_string())?;
                 Ok(BTreeMap::from([(
                     packages[0].clone(),
-                    crate::cache::pin_content_file(source).map_err(|error| error.to_string())?,
+                    crate::cache::pin_content_file(&scheduler)
+                        .map_err(|error| error.to_string())?,
                 )]))
             },
         )
-        .expect("cross-process scheduler build cache");
-        std::fs::write(
-            results.join(index.to_string()),
-            result.paths[&packages[0]].as_os_str().as_bytes(),
-        )
-        .expect("write child cache result");
-    }
+        .unwrap();
 
-    #[test]
-    fn scheduler_build_cache_elects_one_cross_process_builder() {
-        const CHILDREN: usize = 8;
-
-        let temp = tempfile::tempdir().expect("cross-process scheduler cache tempdir");
-        let root = temp.path().join("cache");
-        let ready = temp.path().join("ready");
-        let results = temp.path().join("results");
-        std::fs::create_dir_all(&root).expect("create scheduler cache root");
-        std::fs::create_dir(&ready).expect("create ready directory");
-        std::fs::create_dir(&results).expect("create result directory");
-        let start_path = temp.path().join("start");
-        let start = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&start_path)
-            .expect("create start lock");
-        rustix::fs::flock(&start, rustix::fs::FlockOperation::LockExclusive)
-            .expect("lock start barrier");
-        let counter = temp.path().join("builds");
-        let executable = std::env::current_exe().expect("current test executable");
-        let mut children = (0..CHILDREN)
-            .map(|index| {
-                std::process::Command::new(&executable)
-                    .arg("--exact")
-                    .arg(SCHEDULER_BUILD_CHILD_TEST)
-                    .arg("--nocapture")
-                    .arg("--test-threads=1")
-                    .env(SCHEDULER_BUILD_CHILD_ROOT, &root)
-                    .env(SCHEDULER_BUILD_CHILD_INDEX, index.to_string())
-                    .env(SCHEDULER_BUILD_CHILD_READY, &ready)
-                    .env(SCHEDULER_BUILD_CHILD_START, &start_path)
-                    .env(SCHEDULER_BUILD_CHILD_COUNTER, &counter)
-                    .env(SCHEDULER_BUILD_CHILD_RESULTS, &results)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::inherit())
-                    .spawn()
-                    .expect("spawn scheduler cache child")
-            })
-            .collect::<Vec<_>>();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        while std::fs::read_dir(&ready)
-            .expect("read ready directory")
-            .count()
-            != CHILDREN
-        {
-            for child in &mut children {
-                if let Some(status) = child.try_wait().expect("poll child") {
-                    panic!("scheduler cache child exited before barrier: {status}");
-                }
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "scheduler cache children did not reach start barrier"
-            );
-            std::thread::yield_now();
-        }
-        rustix::fs::flock(&start, rustix::fs::FlockOperation::Unlock)
-            .expect("release start barrier");
-        for child in &mut children {
-            assert!(child.wait().expect("wait for cache child").success());
-        }
-        let attempts = std::fs::read_to_string(counter).expect("read build counter");
         assert_eq!(
-            attempts.lines().count(),
-            1,
-            "all same-input processes must share one scheduler Cargo producer"
+            std::fs::read(&cached.paths[&packages[0]]).unwrap(),
+            b"stable scheduler",
         );
-        let mut published = std::fs::read_dir(results)
-            .expect("read cache results")
-            .map(|entry| {
-                std::fs::read(entry.expect("result entry").path()).expect("read cache result")
-            })
-            .collect::<Vec<_>>();
-        published.sort();
-        published.dedup();
         assert_eq!(
-            published.len(),
-            1,
-            "every process must lease the same immutable content-CAS object"
+            std::fs::read(cached.tree.root().join("target/release/scx_stable_cache")).unwrap(),
+            b"stable scheduler",
         );
+        assert_eq!(
+            std::fs::read(cached.tree.root().join("build/scx-stable/out/generated"),).unwrap(),
+            b"embedded OUT_DIR payload",
+        );
+        let stable_root = cache_root
+            .join("stable-builds-v1")
+            .join(format!("{identity:016x}"));
+        assert!(
+            stable_root
+                .join("target/release/scx_stable_cache")
+                .is_file()
+        );
+        assert!(stable_root.join("build/scx-stable/out/generated").is_file());
+        assert!(!stable_root.join("target/release/deps/unrecorded").exists());
     }
 }

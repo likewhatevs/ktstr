@@ -45,6 +45,8 @@
 
 use crate::flock::LOCK_DIR_NAME;
 
+#[doc(hidden)]
+pub mod artifact_tree;
 mod cache_dir;
 pub(crate) mod content;
 mod housekeeping;
@@ -93,26 +95,32 @@ pub fn affected_cache_root() -> anyhow::Result<std::path::PathBuf> {
     resolve_cache_root_with_suffix("affected")
 }
 
-/// Coordination namespace for wrapper-owned Cargo output locks.
+/// Host-global coordination namespace for wrapper-owned Cargo output locks.
+///
+/// Output ownership follows the canonical Cargo target directory, not the
+/// caller's artifact-cache selection. Two invocations which deliberately use
+/// different `KTSTR_CACHE_DIR`s can still write the same `CARGO_TARGET_DIR`;
+/// placing this lock below either cache root would let both writers enter
+/// Cargo's artifact lock while holding separate ktstr build reservations.
+/// `KTSTR_LOCK_DIR` is the existing machine-wide coordination namespace for
+/// ktstr participants, with `/tmp` as its normal fallback.
 ///
 /// The version is intentionally part of the directory name. Every ktstr
 /// writer participating in this protocol acquires the same per-target-dir
 /// lock before spawning Cargo and retains it until emitted artifacts are
-/// pinned; older wrappers do not participate in this protocol.
+/// pinned. There is no lookup of an older cache-rooted namespace.
 pub fn cargo_build_output_lock_root() -> anyhow::Result<std::path::PathBuf> {
-    resolve_cache_root_with_suffix("cargo-build-output-v2")
+    Ok(resolve_lock_dir().join("ktstr-cargo-build-output-v3"))
 }
 
-/// Coordination namespace for input-addressed scheduler workspace builds.
+/// Machine-local record namespace for reusable Cargo artifact trees.
 ///
-/// `cargo-ktstr` is a separate binary crate, so this public (hidden)
-/// entrypoint gives its scheduler prebuild planner the same cache-root
-/// cascade as the library's content CAS. The cache implementation keeps its
-/// own versioned record/lock subdirectories below this root; there is no
-/// lookup of an older scheduler-build namespace.
+/// The files referenced by these records live in the ordinary shared content
+/// CAS; this root contains only small, reconstructible tree manifests and
+/// their cross-process election locks.
 #[doc(hidden)]
-pub fn scheduler_build_cache_root() -> anyhow::Result<std::path::PathBuf> {
-    resolve_cache_root_with_suffix("scheduler-build-v1")
+pub fn cargo_artifact_tree_cache_root() -> anyhow::Result<std::path::PathBuf> {
+    resolve_cache_root_with_suffix("cargo-artifact-tree-v1")
 }
 
 /// Return ktstr's stable, fixed-seed fast digest for one exact file revision.
@@ -128,6 +136,33 @@ pub fn content_file_digest(path: impl AsRef<std::path::Path>) -> anyhow::Result<
     content::cached_file_digest(pinned.source(), pinned.identity)
 }
 
+#[cfg(test)]
+mod coordination_tests {
+    use super::*;
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+
+    #[test]
+    fn cargo_output_lock_root_is_independent_of_artifact_cache_root() {
+        let _env = lock_env();
+        let lock_dir = tempfile::tempdir().expect("lock directory");
+        let first_cache = tempfile::tempdir().expect("first cache directory");
+        let second_cache = tempfile::tempdir().expect("second cache directory");
+        let _lock_dir = EnvVarGuard::set(crate::KTSTR_LOCK_DIR_ENV, lock_dir.path());
+
+        let first = {
+            let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, first_cache.path());
+            cargo_build_output_lock_root().expect("first output lock root")
+        };
+        let second = {
+            let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, second_cache.path());
+            cargo_build_output_lock_root().expect("second output lock root")
+        };
+
+        assert_eq!(first, second);
+        assert_eq!(first, lock_dir.path().join("ktstr-cargo-build-output-v3"));
+    }
+}
+
 /// One immutable, content-addressed snapshot of an input file.
 ///
 /// The original file descriptor and the shared CAS lease remain live until
@@ -137,6 +172,8 @@ pub fn content_file_digest(path: impl AsRef<std::path::Path>) -> anyhow::Result<
 pub struct ContentFileSnapshot {
     _source: std::fs::File,
     lease: content::ContentObjectLease,
+    content_hash: u64,
+    len: u64,
 }
 
 /// One opened regular-file revision retained independently of its pathname.
@@ -191,23 +228,97 @@ pub fn pin_content_file(path: impl AsRef<std::path::Path>) -> anyhow::Result<Pin
     })
 }
 
+/// Pin generated artifact metadata in an inode on the content-CAS filesystem.
+///
+/// The returned descriptor has no durable source pathname. Keeping the open
+/// file description alive is sufficient for strict FICLONE publication and
+/// avoids making `/tmp` filesystem placement part of artifact-cache behavior.
+pub(crate) fn pin_generated_artifact_bytes(
+    bytes: &[u8],
+    mode: u32,
+) -> anyhow::Result<PinnedContentFile> {
+    let (source, identity) = content::open_pinned_generated_artifact(bytes, mode)?;
+    Ok(PinnedContentFile {
+        source,
+        identity,
+        display_path: std::path::PathBuf::from("<generated artifact metadata>"),
+    })
+}
+
 /// Publish an already-pinned file revision into the shared content CAS.
 pub fn snapshot_pinned_content_file(
     pinned: PinnedContentFile,
 ) -> anyhow::Result<ContentFileSnapshot> {
+    snapshot_pinned_content_file_with_policy(
+        pinned,
+        content::ContentPublicationPolicy::AllowCopyFallback,
+    )
+}
+
+fn snapshot_pinned_content_file_with_policy(
+    pinned: PinnedContentFile,
+    policy: content::ContentPublicationPolicy,
+) -> anyhow::Result<ContentFileSnapshot> {
     let (source, identity, _) = pinned.into_parts();
     let content_hash = content::cached_file_digest(&source, identity)?;
-    let lease = content::open_or_publish_content_object_lease(content_hash, &source, identity)?;
+    let lease = content::open_or_publish_content_object_lease_with_policy(
+        content_hash,
+        &source,
+        identity,
+        policy,
+    )?;
     Ok(ContentFileSnapshot {
         _source: source,
         lease,
+        content_hash,
+        len: identity.size,
     })
+}
+
+/// Publish an artifact-tree input with a strict FICLONE requirement.
+///
+/// Artifact closures deliberately have no byte-copy fallback: both CAS
+/// publication and private materialization must preserve cross-process COW.
+pub(crate) fn snapshot_pinned_artifact_file(
+    pinned: PinnedContentFile,
+) -> anyhow::Result<ContentFileSnapshot> {
+    snapshot_pinned_content_file_with_policy(
+        pinned,
+        content::ContentPublicationPolicy::RequireReflink,
+    )
 }
 
 impl ContentFileSnapshot {
     /// Return the canonical pathname of the leased immutable object.
     pub fn path(&self) -> &std::path::Path {
         self.lease.path()
+    }
+
+    /// Open descriptor for the exact leased CAS inode.
+    ///
+    /// Artifact-tree materialization clones from this descriptor rather than
+    /// reopening [`Self::path`], so namespace replacement can never retarget
+    /// a consumer after the lease was validated.
+    pub(crate) fn file(&self) -> &std::fs::File {
+        self.lease.file()
+    }
+
+    /// Stable fast content key used by reconstructible cache manifests.
+    #[doc(hidden)]
+    pub fn content_hash(&self) -> u64 {
+        self.content_hash
+    }
+
+    /// Exact byte length validated by the content-object lease.
+    #[doc(hidden)]
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the immutable object is empty.
+    #[doc(hidden)]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 }
 

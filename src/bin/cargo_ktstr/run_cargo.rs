@@ -20,14 +20,16 @@
 //! build profile).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cargo_metadata::semver::Version;
 
 use crate::feature_discovery::{
-    MetadataMode, augment_test_features_from_metadata_for_context, effective_target_context,
-    query_metadata_for_target, query_resolved_metadata, selected_workspace_packages,
+    MetadataMode, augment_test_features_from_metadata_for_context_at, effective_target_context,
+    query_metadata_for_target, query_resolved_metadata_for_invocation,
+    selected_workspace_packages_for_invocation,
 };
 use crate::kernel::{encode_kernel_list, resolve_kernel_set};
 
@@ -157,6 +159,7 @@ fn llvm_cov_uses_nextest(args: &[String]) -> bool {
 /// `test` / `coverage` in package selection, target filtering, inferred
 /// features, or version checks. Non-test llvm-cov modes never call the
 /// preparer and retain their exact argv.
+#[cfg(test)]
 fn prepare_llvm_cov_args_with(
     args: Vec<String>,
     prepare: impl FnOnce(Vec<String>) -> Result<Vec<String>, String>,
@@ -958,6 +961,7 @@ const NEXTEST_ARCHIVE_DROP_FLAGS: &[&str] = &[
     "--extract-overwrite",
     "--persist-extract-tempdir",
     "--ignore-run-fail",
+    "--no-run",
 ];
 
 const LLVM_COV_ARCHIVE_DROP_REPORT_VALUE_OPTIONS: &[&str] = &[
@@ -1098,10 +1102,9 @@ fn llvm_cov_or_nextest_joined_value_option(argument: &str) -> bool {
 /// archive itself metadata-sized. cargo-llvm-cov owns the clean_partial call
 /// for this supported subcommand, so no private cleanup behavior is duplicated
 /// here.
-fn llvm_cov_nextest_archive_args(
+fn nextest_build_surface_args(
     sub_argv: &[&str],
     args: &[String],
-    archive_path: &std::path::Path,
 ) -> Result<(Vec<String>, Vec<String>), String> {
     let raw_nextest_index = (sub_argv == LLVM_COV_SUB_ARGV)
         .then(|| llvm_cov_nextest_index(args))
@@ -1226,6 +1229,55 @@ fn llvm_cov_nextest_archive_args(
     if let Some(build_jobs) = raw_build_jobs {
         projected.extend(["--build-jobs".to_string(), build_jobs]);
     }
+    Ok((globals, projected))
+}
+
+/// Project a complete `cargo nextest run ...` argv onto the generic cached
+/// build surface. Verifier recursion uses this entry point so it cannot drift
+/// from ordinary `cargo ktstr test` filtering of run-only arguments.
+pub(crate) fn nextest_command_build_surface(args: &[String]) -> Result<Vec<String>, String> {
+    if args.first().map(String::as_str) != Some("nextest")
+        || args.get(1).map(String::as_str) != Some("run")
+    {
+        return Err("cached nextest command must begin with `nextest run`".to_string());
+    }
+    direct_nextest_build_surface_args(TEST_SUB_ARGV, &args[2..])
+}
+
+/// Project a complete `cargo nextest run ...` argv onto the run-only surface
+/// accepted beside nextest reuse-build metadata.
+pub(crate) fn nextest_command_run_surface(args: &[String]) -> Result<Vec<String>, String> {
+    if args.first().map(String::as_str) != Some("nextest")
+        || args.get(1).map(String::as_str) != Some("run")
+    {
+        return Err("cached nextest command must begin with `nextest run`".to_string());
+    }
+    let mut out = vec!["nextest".to_string(), "run".to_string()];
+    out.extend(cached_nextest_run_args(TEST_SUB_ARGV, &args[2..]));
+    Ok(out)
+}
+
+/// Add nextest reuse-build metadata to a complete run command, ahead of the
+/// opaque test-binary suffix.
+pub(crate) fn inject_nextest_command_reuse_args(
+    args: Vec<String>,
+    reuse: &[String],
+) -> Result<Vec<String>, String> {
+    let mut args = nextest_command_run_surface(&args)?;
+    let insertion = args
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(args.len());
+    args.splice(insertion..insertion, reuse.iter().cloned());
+    Ok(args)
+}
+
+fn llvm_cov_nextest_archive_args(
+    sub_argv: &[&str],
+    args: &[String],
+    archive_path: &std::path::Path,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let (globals, mut projected) = nextest_build_surface_args(sub_argv, args)?;
     projected.extend([
         "--archive-file".to_string(),
         archive_path.to_string_lossy().into_owned(),
@@ -1270,6 +1322,1084 @@ fn build_llvm_cov_archive_warm_command(
         command.env(ktstr::KTSTR_SCHEDULER_PROFILE_ENV, profile);
     }
     Ok(command)
+}
+
+/// Build flavor stored in the generic nextest artifact cache.
+///
+/// Verifier recursion is a plain nextest consumer, exactly like `test`.
+/// Coverage differs only in the instrumentation environment used by the cold
+/// producer and in the final cargo-llvm-cov report wrapper; both flavors use
+/// the same binary-only listing, artifact-tree capture, and reuse-build args.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CachedNextestMode {
+    Plain,
+    Coverage,
+}
+
+impl CachedNextestMode {
+    fn identity_label(self) -> &'static str {
+        match self {
+            Self::Plain => "nextest",
+            Self::Coverage => "llvm-cov-nextest",
+        }
+    }
+}
+
+fn apply_command_envs(command: &mut Command, environment: &[(OsString, OsString)]) {
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+}
+
+/// Decode one shell-escaped value emitted by `cargo llvm-cov show-env`'s
+/// default `KEY=value` format.
+///
+/// cargo-llvm-cov uses `shell_escape::escape`, which emits a single POSIX shell
+/// word (possibly assembled from adjacent quoted and unquoted spans). Parsing
+/// that word directly avoids executing a shell just to transfer environment
+/// variables into the binary-only nextest listing.
+fn decode_shell_word(value: &str) -> Result<String, String> {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        Unquoted,
+        Single,
+        Double,
+    }
+
+    let mut quote = Quote::Unquoted;
+    let mut escaped = false;
+    let mut decoded = String::with_capacity(value.len());
+    for character in value.chars() {
+        if escaped {
+            decoded.push(character);
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Quote::Unquoted => match character {
+                '\'' => quote = Quote::Single,
+                '"' => quote = Quote::Double,
+                '\\' => escaped = true,
+                character if character.is_whitespace() => {
+                    return Err("unquoted whitespace in escaped shell word".to_string());
+                }
+                _ => decoded.push(character),
+            },
+            Quote::Single => {
+                if character == '\'' {
+                    quote = Quote::Unquoted;
+                } else {
+                    decoded.push(character);
+                }
+            }
+            Quote::Double => match character {
+                '"' => quote = Quote::Unquoted,
+                '\\' => escaped = true,
+                _ => decoded.push(character),
+            },
+        }
+    }
+    if escaped || !matches!(quote, Quote::Unquoted) {
+        return Err("unterminated escape or quote in escaped shell word".to_string());
+    }
+    Ok(decoded)
+}
+
+fn parse_llvm_cov_show_env(stdout: &[u8]) -> Result<Vec<(OsString, OsString)>, String> {
+    let text = std::str::from_utf8(stdout)
+        .map_err(|error| format!("cargo llvm-cov show-env emitted non-UTF-8 output: {error}"))?;
+    let mut environment = Vec::new();
+    for (line_index, line) in text.lines().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let (name, value) = line.split_once('=').ok_or_else(|| {
+            format!(
+                "cargo llvm-cov show-env line {} is not KEY=value: {line:?}",
+                line_index + 1,
+            )
+        })?;
+        if name.is_empty()
+            || !name.bytes().enumerate().all(|(index, byte)| {
+                byte == b'_'
+                    || byte.is_ascii_alphanumeric() && (index > 0 || !byte.is_ascii_digit())
+            })
+        {
+            return Err(format!(
+                "cargo llvm-cov show-env line {} has an invalid environment name: {name:?}",
+                line_index + 1,
+            ));
+        }
+        environment.push((
+            OsString::from(name),
+            OsString::from(decode_shell_word(value).map_err(|error| {
+                format!(
+                    "decode cargo llvm-cov show-env line {} ({name}): {error}",
+                    line_index + 1,
+                )
+            })?),
+        ));
+    }
+    if environment.is_empty() {
+        return Err("cargo llvm-cov show-env emitted no environment variables".to_string());
+    }
+    Ok(environment)
+}
+
+const LLVM_COV_SHOW_ENV_VALUE_OPTIONS: &[&str] = &["--target", "--manifest-path", "--dep-coverage"];
+
+const LLVM_COV_SHOW_ENV_FLAGS: &[&str] = &[
+    "--branch",
+    "--mcdc",
+    "--doctests",
+    "--coverage-target-only",
+    "--coverage-host-only",
+    "--include-ffi",
+    "--no-rustc-wrapper",
+    "--no-cfg-coverage",
+    "--no-cfg-coverage-nightly",
+    "--remap-path-prefix",
+];
+
+fn llvm_cov_show_env_args(sub_argv: &[&str], args: &[String]) -> Vec<String> {
+    let raw_nextest_index = (sub_argv == LLVM_COV_SUB_ARGV)
+        .then(|| llvm_cov_nextest_index(args))
+        .flatten();
+    let separator = args
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(args.len());
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < separator {
+        if Some(index) == raw_nextest_index {
+            index += 1;
+            continue;
+        }
+        let argument = &args[index];
+        if LLVM_COV_SHOW_ENV_VALUE_OPTIONS.contains(&argument.as_str()) {
+            out.push(argument.clone());
+            index += 1;
+            if index < separator {
+                out.push(args[index].clone());
+            }
+            index += 1;
+            continue;
+        }
+        let joined_value = LLVM_COV_SHOW_ENV_VALUE_OPTIONS.iter().any(|option| {
+            let short = option.starts_with('-') && !option.starts_with("--");
+            argument
+                .strip_prefix(option)
+                .is_some_and(|suffix| suffix.starts_with('=') || short && !suffix.is_empty())
+        });
+        if joined_value || LLVM_COV_SHOW_ENV_FLAGS.contains(&argument.as_str()) {
+            out.push(argument.clone());
+        }
+        index += 1;
+    }
+    out
+}
+
+fn set_or_replace_environment(
+    environment: &mut Vec<(OsString, OsString)>,
+    name: &str,
+    value: impl Into<OsString>,
+) {
+    let value = value.into();
+    if let Some((_, current)) = environment
+        .iter_mut()
+        .find(|(candidate, _)| candidate == OsStr::new(name))
+    {
+        *current = value;
+    } else {
+        environment.push((OsString::from(name), value));
+    }
+}
+
+fn llvm_cov_build_environment(
+    stable_workspace: &Path,
+    output_target: &Path,
+    output_build: &Path,
+    profraw_directory: &Path,
+    show_env_args: &[String],
+    producer_environment: &[(OsString, OsString)],
+) -> Result<Vec<(OsString, OsString)>, String> {
+    let mut command = Command::new("cargo");
+    command
+        .args(["llvm-cov", "show-env"])
+        .args(show_env_args)
+        .current_dir(stable_workspace)
+        .env("CARGO_LLVM_COV_TARGET_DIR", output_target)
+        .env("CARGO_LLVM_COV_BUILD_DIR", output_build);
+    apply_command_envs(&mut command, producer_environment);
+    let output = crate::interrupt::run_output(command)
+        .map_err(|error| format!("run cargo llvm-cov show-env: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo llvm-cov show-env failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ));
+    }
+    let mut environment = parse_llvm_cov_show_env(&output.stdout)?;
+    set_or_replace_environment(
+        &mut environment,
+        "CARGO_LLVM_COV_TARGET_DIR",
+        output_target.as_os_str(),
+    );
+    set_or_replace_environment(
+        &mut environment,
+        "CARGO_LLVM_COV_BUILD_DIR",
+        output_build.as_os_str(),
+    );
+    let profile_name = environment
+        .iter()
+        .find(|(name, _)| name == OsStr::new("LLVM_PROFILE_FILE"))
+        .and_then(|(_, value)| Path::new(value).file_name())
+        .map_or_else(
+            || OsString::from("ktstr-%p-%m.profraw"),
+            OsStr::to_os_string,
+        );
+    set_or_replace_environment(
+        &mut environment,
+        "LLVM_PROFILE_FILE",
+        profraw_directory.join(profile_name).into_os_string(),
+    );
+    Ok(environment)
+}
+
+fn force_nextest_output(args: &[String], output_target: &Path) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len() + 2);
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--target-dir" {
+            index += 2;
+            continue;
+        }
+        if argument.starts_with("--target-dir=") {
+            index += 1;
+            continue;
+        }
+        out.push(argument.clone());
+        index += 1;
+    }
+    out.extend([
+        "--target-dir".to_string(),
+        output_target.display().to_string(),
+    ]);
+    out
+}
+
+fn remap_workspace_argument_path(
+    value: &str,
+    original_workspace: &Path,
+    invocation_dir: &Path,
+    stable_workspace: &Path,
+) -> String {
+    let path = Path::new(value);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        invocation_dir.join(path)
+    };
+    absolute
+        .strip_prefix(original_workspace)
+        .map_or(absolute.clone(), |relative| stable_workspace.join(relative))
+        .display()
+        .to_string()
+}
+
+fn remap_cached_build_paths(
+    args: &[String],
+    original_workspace: &Path,
+    invocation_dir: &Path,
+    stable_workspace: &Path,
+) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if matches!(argument.as_str(), "--manifest-path" | "--target") {
+            out.push(argument.clone());
+            index += 1;
+            if let Some(value) = args.get(index) {
+                let path_like_target = argument != "--target"
+                    || value.ends_with(".json")
+                    || value.contains('/')
+                    || value.contains('\\');
+                out.push(if path_like_target {
+                    remap_workspace_argument_path(
+                        value,
+                        original_workspace,
+                        invocation_dir,
+                        stable_workspace,
+                    )
+                } else {
+                    value.clone()
+                });
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--manifest-path=") {
+            out.push(format!(
+                "--manifest-path={}",
+                remap_workspace_argument_path(
+                    value,
+                    original_workspace,
+                    invocation_dir,
+                    stable_workspace,
+                )
+            ));
+        } else if let Some(value) = argument.strip_prefix("--target=") {
+            let path_like = value.ends_with(".json") || value.contains('/') || value.contains('\\');
+            if path_like {
+                out.push(format!(
+                    "--target={}",
+                    remap_workspace_argument_path(
+                        value,
+                        original_workspace,
+                        invocation_dir,
+                        stable_workspace,
+                    )
+                ));
+            } else {
+                out.push(argument.clone());
+            }
+        } else {
+            out.push(argument.clone());
+        }
+        index += 1;
+    }
+    out
+}
+
+fn inject_nextest_reuse_args(
+    sub_argv: &[&str],
+    mut args: Vec<String>,
+    reuse: &[String],
+) -> Vec<String> {
+    let Some(region_start) = nextest_region_start(sub_argv, &args) else {
+        return args;
+    };
+    let insertion = args[region_start..]
+        .iter()
+        .position(|argument| argument == "--")
+        .map_or(args.len(), |offset| region_start + offset);
+    args.splice(insertion..insertion, reuse.iter().cloned());
+    args
+}
+
+const LLVM_COV_DIRECT_ONLY_VALUE_OPTIONS: &[&str] = &[
+    "--dep-coverage",
+    "--exclude-from-report",
+    "--output-path",
+    "--output-dir",
+    "--failure-mode",
+    "--ignore-filename-regex",
+    "--fail-under-functions",
+    "--fail-under-lines",
+    "--fail-under-file-lines",
+    "--fail-under-regions",
+    "--fail-uncovered-lines",
+    "--fail-uncovered-regions",
+    "--fail-uncovered-functions",
+    "--nextest-archive-file",
+];
+
+const LLVM_COV_DIRECT_ONLY_FLAGS: &[&str] = &[
+    "--no-clean",
+    "--no-report",
+    "--ignore-run-fail",
+    "--json",
+    "--lcov",
+    "--cobertura",
+    "--codecov",
+    "--text",
+    "--html",
+    "--open",
+    "--summary-only",
+    "--no-default-ignore-filename-regex",
+    "--disable-default-ignore-filename-regex",
+    "--show-instantiations",
+    "--hide-instantiations",
+    "--show-missing-lines",
+    "--include-build-script",
+    "--skip-functions",
+    "--branch",
+    "--mcdc",
+    "--doctests",
+    "--coverage-target-only",
+    "--coverage-host-only",
+    "--include-ffi",
+    "--no-rustc-wrapper",
+    "--no-cfg-coverage",
+    "--no-cfg-coverage-nightly",
+    "--remap-path-prefix",
+];
+
+const NEXTEST_REUSE_CARGO_VALUE_OPTIONS: &[&str] = &[
+    "-p",
+    "--package",
+    "--exclude",
+    "--bin",
+    "--example",
+    "--test",
+    "--bench",
+    "-F",
+    "--features",
+    "--build-jobs",
+    "--cargo-profile",
+    "--target",
+    "--target-dir",
+    "--cargo-message-format",
+    "--manifest-path",
+    "-Z",
+];
+
+const NEXTEST_REUSE_CARGO_FLAGS: &[&str] = &[
+    "--workspace",
+    "--all",
+    "--lib",
+    "--bins",
+    "--examples",
+    "--tests",
+    "--benches",
+    "--all-targets",
+    "--all-features",
+    "--no-default-features",
+    "-r",
+    "--release",
+    "--frozen",
+    "--locked",
+    "--offline",
+    "--unit-graph",
+    "--timings",
+    "--cargo-quiet",
+    "--cargo-verbose",
+    "--ignore-rust-version",
+    "--future-incompat-report",
+];
+
+fn option_has_joined_value(argument: &str, options: &[&str]) -> bool {
+    options.iter().any(|option| {
+        let short = option.starts_with('-') && !option.starts_with("--");
+        argument
+            .strip_prefix(option)
+            .is_some_and(|suffix| suffix.starts_with('=') || short && !suffix.is_empty())
+    })
+}
+
+/// Convert cargo-llvm-cov's build surface to the argv accepted by a direct
+/// `cargo nextest list`. cargo-llvm-cov-only instrumentation and report flags
+/// live in the show-env/report commands; `--exclude-from-test` is the one
+/// build selector whose spelling must be translated for nextest itself.
+fn direct_nextest_build_surface_args(
+    sub_argv: &[&str],
+    args: &[String],
+) -> Result<Vec<String>, String> {
+    let (globals, projected) = nextest_build_surface_args(sub_argv, args)?;
+    let combined = globals.into_iter().chain(projected).collect::<Vec<_>>();
+    let mut out = Vec::with_capacity(combined.len());
+    let mut index = 0;
+    while index < combined.len() {
+        let argument = &combined[index];
+        if argument == "--exclude-from-test" {
+            out.push("--exclude".to_string());
+            index += 1;
+            if let Some(value) = combined.get(index) {
+                out.push(value.clone());
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--exclude-from-test=") {
+            out.push(format!("--exclude={value}"));
+            index += 1;
+            continue;
+        }
+        if LLVM_COV_DIRECT_ONLY_VALUE_OPTIONS.contains(&argument.as_str()) {
+            index += 2;
+            continue;
+        }
+        if option_has_joined_value(argument, LLVM_COV_DIRECT_ONLY_VALUE_OPTIONS)
+            || LLVM_COV_DIRECT_ONLY_FLAGS.contains(&argument.as_str())
+        {
+            index += 1;
+            continue;
+        }
+        out.push(argument.clone());
+        index += 1;
+    }
+    Ok(out)
+}
+
+/// Project a cached invocation onto nextest's run-only surface. Reuse-build
+/// explicitly conflicts with Cargo package/target/feature/build options; the
+/// cached binary metadata already embodies those choices, while filters,
+/// retries, profiles, output controls, and test-binary arguments remain live.
+fn cached_nextest_run_args(sub_argv: &[&str], args: &[String]) -> Vec<String> {
+    let raw_nextest = (sub_argv == LLVM_COV_SUB_ARGV)
+        .then(|| llvm_cov_nextest_index(args))
+        .flatten();
+    let mut out = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        if Some(index) == raw_nextest {
+            index += 1;
+            continue;
+        }
+        let argument = &args[index];
+        if argument == "--" {
+            out.extend_from_slice(&args[index..]);
+            break;
+        }
+        if NEXTEST_REUSE_CARGO_VALUE_OPTIONS.contains(&argument.as_str())
+            || LLVM_COV_DIRECT_ONLY_VALUE_OPTIONS.contains(&argument.as_str())
+            || matches!(
+                argument.as_str(),
+                "--exclude-from-test" | "--exclude-from-report" | "--dep-coverage"
+            )
+        {
+            index += 2;
+            continue;
+        }
+        if option_has_joined_value(argument, NEXTEST_REUSE_CARGO_VALUE_OPTIONS)
+            || option_has_joined_value(argument, LLVM_COV_DIRECT_ONLY_VALUE_OPTIONS)
+            || argument.starts_with("--exclude-from-test=")
+            || argument.starts_with("--exclude-from-report=")
+            || argument.starts_with("--dep-coverage=")
+            || argument.starts_with("--timings=")
+            || NEXTEST_REUSE_CARGO_FLAGS.contains(&argument.as_str())
+            || LLVM_COV_DIRECT_ONLY_FLAGS.contains(&argument.as_str())
+        {
+            index += 1;
+            continue;
+        }
+        out.push(argument.clone());
+        index += 1;
+    }
+    out
+}
+
+/// cargo-llvm-cov's `--ignore-run-fail` runs the complete test set before it
+/// reports. Once ktstr decomposes that command into a direct nextest run plus a
+/// report command, reproduce that behavior explicitly and keep the test-binary
+/// suffix opaque.
+fn force_nextest_no_fail_fast(args: Vec<String>) -> Vec<String> {
+    let separator = args
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(args.len());
+    let mut out = Vec::with_capacity(args.len() + 1);
+    let mut index = 0;
+    while index < separator {
+        match args[index].as_str() {
+            "--fail-fast" | "--ff" | "--no-fail-fast" | "--nff" => {
+                index += 1;
+            }
+            "--max-fail" => {
+                index += 2;
+            }
+            argument if argument.starts_with("--max-fail=") => {
+                index += 1;
+            }
+            _ => {
+                out.push(args[index].clone());
+                index += 1;
+            }
+        }
+    }
+    out.push("--no-fail-fast".to_string());
+    out.extend_from_slice(&args[separator..]);
+    out
+}
+
+const LLVM_COV_REPORT_VALUE_OPTIONS: &[&str] = &[
+    "--output-path",
+    "--output-dir",
+    "--failure-mode",
+    "--ignore-filename-regex",
+    "--fail-under-functions",
+    "--fail-under-lines",
+    "--fail-under-file-lines",
+    "--fail-under-regions",
+    "--fail-uncovered-lines",
+    "--fail-uncovered-regions",
+    "--fail-uncovered-functions",
+    "--dep-coverage",
+    "-F",
+    "--features",
+    "--target",
+    "--color",
+    "--manifest-path",
+    "-Z",
+];
+
+const LLVM_COV_REPORT_FLAGS: &[&str] = &[
+    "--json",
+    "--lcov",
+    "--cobertura",
+    "--codecov",
+    "--text",
+    "--html",
+    "--open",
+    "--summary-only",
+    "--no-default-ignore-filename-regex",
+    "--disable-default-ignore-filename-regex",
+    "--show-instantiations",
+    "--hide-instantiations",
+    "--show-missing-lines",
+    "--include-build-script",
+    "--skip-functions",
+    "--all-features",
+    "--no-default-features",
+    "-r",
+    "--release",
+    "--frozen",
+    "--locked",
+    "--offline",
+    "--doctests",
+    "--coverage-target-only",
+    "--coverage-host-only",
+    "--remap-path-prefix",
+    "--include-ffi",
+    "--branch",
+    "--mcdc",
+    "-v",
+    "--verbose",
+    "-q",
+    "--quiet",
+];
+
+fn llvm_cov_report_selection_args(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--" {
+            out.extend_from_slice(&args[index..]);
+            break;
+        }
+        if argument == "--exclude-from-test" {
+            index += 2;
+            continue;
+        }
+        if argument == "--exclude-from-report" {
+            out.push("--exclude".to_string());
+            index += 1;
+            if let Some(value) = args.get(index) {
+                out.push(value.clone());
+            }
+            index += 1;
+            continue;
+        }
+        if argument.starts_with("--exclude-from-test=") {
+            index += 1;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--exclude-from-report=") {
+            out.push(format!("--exclude={value}"));
+            index += 1;
+            continue;
+        }
+        out.push(argument.clone());
+        index += 1;
+    }
+    out
+}
+
+fn cached_llvm_cov_report_args(
+    sub_argv: &[&str],
+    args: &[String],
+    release: bool,
+    metadata: &cargo_metadata::Metadata,
+    invocation_dir: &Path,
+) -> Vec<String> {
+    fn remap_report_path(value: &str, invocation_dir: &Path) -> String {
+        let path = Path::new(value);
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            invocation_dir.join(path)
+        };
+        absolute.display().to_string()
+    }
+
+    let raw_nextest = (sub_argv == LLVM_COV_SUB_ARGV)
+        .then(|| llvm_cov_nextest_index(args))
+        .flatten();
+    let mut out = vec!["report".to_string()];
+    if release {
+        out.push("--release".to_string());
+    }
+    let mut index = 0;
+    while index < args.len() {
+        if Some(index) == raw_nextest {
+            index += 1;
+            continue;
+        }
+        let argument = &args[index];
+        if argument == "--" {
+            break;
+        }
+        if argument == "--cargo-profile" {
+            index += 1;
+            if let Some(value) = args.get(index) {
+                out.extend(["--profile".to_string(), value.clone()]);
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--cargo-profile=") {
+            out.push(format!("--profile={value}"));
+            index += 1;
+            continue;
+        }
+        if LLVM_COV_REPORT_VALUE_OPTIONS.contains(&argument.as_str()) {
+            out.push(argument.clone());
+            index += 1;
+            if let Some(value) = args.get(index) {
+                let value = if matches!(
+                    argument.as_str(),
+                    "--output-path" | "--output-dir" | "--manifest-path"
+                ) {
+                    remap_report_path(value, invocation_dir)
+                } else {
+                    value.clone()
+                };
+                out.push(value);
+            }
+            index += 1;
+            continue;
+        }
+        if let Some((option, value)) = argument.split_once('=').filter(|(option, _)| {
+            matches!(
+                *option,
+                "--output-path" | "--output-dir" | "--manifest-path"
+            )
+        }) {
+            out.push(format!(
+                "{option}={}",
+                remap_report_path(value, invocation_dir)
+            ));
+            index += 1;
+            continue;
+        }
+        if option_has_joined_value(argument, LLVM_COV_REPORT_VALUE_OPTIONS)
+            || LLVM_COV_REPORT_FLAGS.contains(&argument.as_str())
+        {
+            out.push(argument.clone());
+        }
+        index += 1;
+    }
+    let wants_directory_report =
+        llvm_cov_has_lifecycle_flag(args, "--html") || llvm_cov_has_lifecycle_flag(args, "--open");
+    let has_output_directory = args
+        .iter()
+        .take_while(|argument| *argument != "--")
+        .any(|argument| argument == "--output-dir" || argument.starts_with("--output-dir="));
+    if wants_directory_report && !has_output_directory {
+        out.extend([
+            "--output-dir".to_string(),
+            metadata
+                .target_directory
+                .as_std_path()
+                .join("llvm-cov")
+                .display()
+                .to_string(),
+        ]);
+    }
+    let report_selection = llvm_cov_report_selection_args(args);
+    if let Some(packages) =
+        selected_workspace_packages_for_invocation(metadata, &report_selection, invocation_dir)
+    {
+        for package in packages {
+            out.extend(["--package".to_string(), package.name.to_string()]);
+        }
+    }
+    out
+}
+
+fn llvm_cov_flags_with_path_equivalence(
+    existing: Option<OsString>,
+    stable_workspace: &Path,
+    original_workspace: &Path,
+) -> Result<OsString, String> {
+    let stable = stable_workspace.to_string_lossy();
+    let original = original_workspace.to_string_lossy();
+    if stable.contains(' ')
+        || stable.contains(',')
+        || original.contains(' ')
+        || original.contains(',')
+    {
+        return Err(format!(
+            "cargo ktstr: llvm-cov path equivalence cannot encode workspace paths containing spaces or commas: {} -> {}",
+            stable_workspace.display(),
+            original_workspace.display(),
+        ));
+    }
+    let mut flags = existing.unwrap_or_default();
+    if !flags.is_empty() {
+        flags.push(" ");
+    }
+    flags.push(format!("--path-equivalence={stable},{original}"));
+    Ok(flags)
+}
+
+fn nextest_binary_list_command(
+    stable_workspace: &Path,
+    output_target: &Path,
+    build_args: &[String],
+    release: bool,
+    producer_environment: &[(OsString, OsString)],
+) -> Command {
+    let mut command = Command::new("cargo");
+    command
+        .args(["nextest", "list"])
+        .current_dir(stable_workspace);
+    if release {
+        command.args(["--cargo-profile", "release"]);
+    }
+    command.args(force_nextest_output(build_args, output_target));
+    command.args(["--list-type=binaries-only", "--message-format=json"]);
+    apply_command_envs(&mut command, producer_environment);
+    command
+}
+
+fn cargo_metadata_json(
+    stable_workspace: &Path,
+    output_target: &Path,
+    build_args: &[String],
+    producer_environment: &[(OsString, OsString)],
+) -> Result<Vec<u8>, String> {
+    let mut options = crate::feature_discovery::metadata_passthrough_options(build_args);
+    options.extend(crate::feature_discovery::metadata_resolution_options(
+        build_args,
+    ));
+    let mut command = Command::new("cargo");
+    command
+        .args(["metadata", "--format-version=1"])
+        .args(options)
+        .current_dir(stable_workspace)
+        .env("CARGO_TARGET_DIR", output_target);
+    apply_command_envs(&mut command, producer_environment);
+    let output = crate::interrupt::run_output(command)
+        .map_err(|error| format!("run Cargo metadata for nextest reuse: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Cargo metadata for nextest reuse failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ));
+    }
+    Ok(output.stdout)
+}
+
+fn kernel_build_identity(kernel_dir: Option<&Path>) -> Result<String, String> {
+    let kernel = kernel_dir.and_then(Path::to_str);
+    let Some(btf) = ktstr::kernel_path::resolve_btf(kernel) else {
+        return Ok("kernel-btf=absent".to_string());
+    };
+    let digest = ktstr::cache::content_file_digest(&btf).map_err(|error| {
+        format!(
+            "cargo ktstr: digest selected kernel BTF {} for harness cache identity: {error:#}",
+            btf.display(),
+        )
+    })?;
+    Ok(format!("kernel-btf={digest:016x}"))
+}
+
+fn producer_environment_identity(
+    environment: &[(OsString, OsString)],
+) -> Result<Vec<String>, String> {
+    let mut identity = Vec::with_capacity(environment.len());
+    for (name, value) in environment {
+        let name_text = name.to_string_lossy();
+        if matches!(
+            name_text.as_ref(),
+            ktstr::KTSTR_NO_PERF_MODE_ENV
+                | ktstr::KTSTR_NO_SKIP_MODE_ENV
+                | ktstr::KTSTR_SCHEDULER_PROFILE_ENV
+                | ktstr::KTSTR_ORCHESTRATED_ENV
+                | ktstr::KTSTR_KERNEL_COMMIT_ENV
+                | ktstr::KTSTR_KERNEL_LIST_ENV
+                | ktstr::KTSTR_KERNEL_ENV
+        ) {
+            // These values shape runtime scheduling/listing, not the Cargo
+            // artifact closure. Kernel build identity is represented by the
+            // selected BTF content above, never by its checkout pathname.
+            continue;
+        }
+        if name_text == "BPF_EXTRA_CFLAGS_PRE_INCL" {
+            let text = value.to_string_lossy();
+            let mut words = text.split_whitespace();
+            let mut normalized = Vec::new();
+            while let Some(word) = words.next() {
+                normalized.push(word.to_string());
+                if word == "-include"
+                    && let Some(path) = words.next()
+                {
+                    let digest = ktstr::cache::content_file_digest(Path::new(path)).map_err(
+                        |error| {
+                            format!(
+                                "cargo ktstr: digest BTF anchor {path} for harness cache identity: {error:#}",
+                            )
+                        },
+                    )?;
+                    normalized.push(format!("content:{digest:016x}"));
+                }
+            }
+            identity.push(format!("producer-env:{name_text}={}", normalized.join(" ")));
+            continue;
+        }
+        let value_path = Path::new(value);
+        let semantic_value = if value_path.is_file() {
+            let digest = ktstr::cache::content_file_digest(value_path).map_err(|error| {
+                format!(
+                    "cargo ktstr: digest producer input {} for {}: {error:#}",
+                    value_path.display(),
+                    name.to_string_lossy(),
+                )
+            })?;
+            format!("file:{digest:016x}")
+        } else {
+            value.to_string_lossy().into_owned()
+        };
+        identity.push(format!("producer-env:{}={semantic_value}", name_text));
+    }
+    identity.sort();
+    Ok(identity)
+}
+
+/// Build or reuse the exact binary closure for one nextest invocation.
+///
+/// This is the single producer used by ordinary tests, recursive verifier
+/// dispatch, and llvm-cov nextest. On a miss it builds from the immutable
+/// source snapshot into a private output directory, asks nextest for binary
+/// metadata without executing any harness, and pins the complete closure while
+/// the output lease is still held. Hits never invoke Cargo and materialize a
+/// private reflink tree directly.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_or_build_nextest_artifacts(
+    metadata: &cargo_metadata::Metadata,
+    mode: CachedNextestMode,
+    build_args: &[String],
+    llvm_cov_environment_args: &[String],
+    release: bool,
+    output_roots: &[PathBuf],
+    producer_environment: &[(OsString, OsString)],
+    kernel_dir: Option<&Path>,
+    cli_label: &str,
+) -> Result<crate::nextest_artifact_cache::MaterializedNextestArtifacts, String> {
+    let invocation_dir = std::env::current_dir()
+        .map_err(|error| format!("read nextest producer invocation directory: {error}"))?;
+    let mut identity_surface = Vec::new();
+    identity_surface.push(format!("release={release}"));
+    identity_surface.push(kernel_build_identity(kernel_dir)?);
+    identity_surface.extend(
+        llvm_cov_environment_args
+            .iter()
+            .map(|argument| format!("llvm-cov-env:{argument}")),
+    );
+    identity_surface.extend(
+        build_args
+            .iter()
+            .map(|argument| format!("nextest:{argument}")),
+    );
+    identity_surface.extend(producer_environment_identity(producer_environment)?);
+    let plan = crate::nextest_artifact_cache::identity_plan(
+        metadata,
+        mode.identity_label(),
+        &identity_surface,
+        output_roots,
+    )?;
+    plan.load_or_build(cli_label, |stable, stable_build| {
+        let stable_invocation_dir = stable.invocation_root.clone();
+        let build_args = stable.remap_cargo_args(build_args);
+        let build_args = remap_cached_build_paths(
+            &build_args,
+            metadata.workspace_root.as_std_path(),
+            &invocation_dir,
+            &stable.workspace_root,
+        );
+        let llvm_cov_environment_args = stable.remap_cargo_args(llvm_cov_environment_args);
+        let llvm_cov_environment_args = remap_cached_build_paths(
+            &llvm_cov_environment_args,
+            metadata.workspace_root.as_std_path(),
+            &invocation_dir,
+            &stable.workspace_root,
+        );
+        let output_target = &stable_build.target_directory;
+        let output_build = stable_build.root.join("build");
+        // Artifact closure publication is strict FICLONE. Keep producer-side
+        // profiles on the deterministic Cargo-output filesystem rather than
+        // the process-global temporary filesystem, which is commonly a
+        // separate tmpfs and would make coverage publication fail with EXDEV.
+        let profraw = output_target.join("ktstr-profraw");
+        std::fs::create_dir_all(&profraw).map_err(|error| {
+            format!(
+                "create nextest producer profraw directory {}: {error}",
+                profraw.display()
+            )
+        })?;
+        let mut environment = producer_environment.to_vec();
+        set_or_replace_environment(
+            &mut environment,
+            "CARGO_BUILD_BUILD_DIR",
+            output_build.as_os_str(),
+        );
+        if mode == CachedNextestMode::Coverage {
+            environment.extend(llvm_cov_build_environment(
+                &stable_invocation_dir,
+                output_target,
+                &output_build,
+                &profraw,
+                &llvm_cov_environment_args,
+                producer_environment,
+            )?);
+        }
+        let cargo_metadata = cargo_metadata_json(
+            &stable_invocation_dir,
+            output_target,
+            &build_args,
+            &environment,
+        )?;
+        let command = nextest_binary_list_command(
+            &stable_invocation_dir,
+            output_target,
+            &build_args,
+            release,
+            &environment,
+        );
+        run_reserved_build_output_under_lease(
+            command,
+            cli_label,
+            "nextest binary-only build with reusable artifact capture",
+            output_target,
+            |build| {
+                if !build.status.success() {
+                    return Err(format!(
+                        "{cli_label}: nextest binary-only build failed ({}) — see Cargo output above",
+                        build
+                            .status
+                            .code()
+                            .map_or("signal".to_string(), |code| code.to_string()),
+                    ));
+                }
+                if mode == CachedNextestMode::Coverage {
+                    crate::nextest_artifact_cache::capture_source_with_producer_profiles(
+                        &build.stdout,
+                        &cargo_metadata,
+                        Some(&profraw),
+                    )
+                } else {
+                    crate::nextest_artifact_cache::capture_source(&build.stdout, &cargo_metadata)
+                }
+            },
+        )
+    })
 }
 
 const NEXTEST_ARCHIVE_BINARIES_METADATA: &str = "target/nextest/binaries-metadata.json";
@@ -1687,6 +2817,7 @@ fn run_cargo_sub(
     profile: Option<String>,
     nextest_profile: Option<String>,
     include_eol: bool,
+    nextest_metadata: Option<cargo_metadata::Metadata>,
     args: Vec<String>,
 ) -> Result<(), String> {
     let invocation_dir = std::env::current_dir()
@@ -1758,14 +2889,18 @@ fn run_cargo_sub(
         cmd.env(var, val);
     }
 
-    if let Some(pat) = profraw_inject_for(sub_argv, std::env::var_os("LLVM_PROFILE_FILE")) {
-        cmd.env("LLVM_PROFILE_FILE", pat);
+    let inherited_profraw = std::env::var_os("LLVM_PROFILE_FILE");
+    let profraw_inject = profraw_inject_for(sub_argv, inherited_profraw.clone());
+    if let Some(pattern) = &profraw_inject {
+        cmd.env("LLVM_PROFILE_FILE", pattern);
     }
 
     // Empty `kernel` (flag omitted) -> empty set, auto-discovery path.
     // Non-empty but all-whitespace -> actionable bail (see
     // `kernel_set_or_bail`). Otherwise the resolved (label, dir) set.
     let resolved = kernel_set_or_bail(&kernel, include_eol)?;
+    let mut kernel_commit_map = None;
+    let mut encoded_kernel_list = None;
     if !resolved.is_empty() {
         // `KTSTR_KERNEL` always points at the first resolved entry
         // so downstream code that inspects the env directly (e.g.
@@ -1812,7 +2947,8 @@ fn run_cargo_sub(
             .collect::<Vec<_>>()
             .join(";");
         if !commit_map.is_empty() {
-            cmd.env(ktstr::KTSTR_KERNEL_COMMIT_ENV, commit_map);
+            cmd.env(ktstr::KTSTR_KERNEL_COMMIT_ENV, &commit_map);
+            kernel_commit_map = Some(commit_map);
         }
 
         if resolved.len() > 1 {
@@ -1821,7 +2957,8 @@ fn run_cargo_sub(
                 "cargo ktstr: fanning gauntlet across {n} kernels",
                 n = resolved.len(),
             );
-            cmd.env(ktstr::KTSTR_KERNEL_LIST_ENV, encoded);
+            cmd.env(ktstr::KTSTR_KERNEL_LIST_ENV, &encoded);
+            encoded_kernel_list = Some(encoded);
         }
     }
 
@@ -1859,6 +2996,71 @@ fn run_cargo_sub(
         .map_err(|error| format!("cargo ktstr: enter cleanup phase: {error}"))?;
     let _shm_cleanup = ShmCleanupGuard;
 
+    // Every environment value the final Cargo build can observe is replayed
+    // on the cache producer. File-valued inputs are content-digested by the
+    // generic cache helper, so embedded blob and BTF-anchor paths do not turn
+    // a checkout/cache location into identity while their bytes still do.
+    let mut producer_environment = blob_envs
+        .iter()
+        .map(|(name, value)| (OsString::from(*name), value.clone()))
+        .collect::<Vec<_>>();
+    producer_environment.push((OsString::from("GIT_OPTIONAL_LOCKS"), OsString::from("0")));
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
+    if sub_argv == TEST_SUB_ARGV
+        && let Some(pattern) = profraw_inject
+            .as_ref()
+            .map(|path| path.as_os_str())
+            .or_else(|| inherited_profraw.as_ref().map(|value| value.as_os_str()))
+    {
+        producer_environment.push((OsString::from("LLVM_PROFILE_FILE"), pattern.to_os_string()));
+    }
+    if let Some(inject) = &btf_anchor_inject {
+        producer_environment.push((
+            OsString::from("BPF_EXTRA_CFLAGS_PRE_INCL"),
+            OsString::from(inject),
+        ));
+    }
+    if no_perf_mode {
+        producer_environment.push((
+            OsString::from(ktstr::KTSTR_NO_PERF_MODE_ENV),
+            OsString::from("1"),
+        ));
+    }
+    if no_skip_mode {
+        producer_environment.push((
+            OsString::from(ktstr::KTSTR_NO_SKIP_MODE_ENV),
+            OsString::from("1"),
+        ));
+    }
+    if let Some(profile) = &profile {
+        producer_environment.push((
+            OsString::from(ktstr::KTSTR_SCHEDULER_PROFILE_ENV),
+            OsString::from(profile),
+        ));
+    }
+    if let Some((_, first_dir)) = resolved.first() {
+        producer_environment.push((
+            OsString::from(ktstr::KTSTR_KERNEL_ENV),
+            first_dir.as_os_str().to_os_string(),
+        ));
+        producer_environment.push((
+            OsString::from(ktstr::KTSTR_ORCHESTRATED_ENV),
+            OsString::from("1"),
+        ));
+    }
+    if let Some(commit_map) = &kernel_commit_map {
+        producer_environment.push((
+            OsString::from(ktstr::KTSTR_KERNEL_COMMIT_ENV),
+            OsString::from(commit_map),
+        ));
+    }
+    if let Some(kernel_list) = &encoded_kernel_list {
+        producer_environment.push((
+            OsString::from(ktstr::KTSTR_KERNEL_LIST_ENV),
+            OsString::from(kernel_list),
+        ));
+    }
+
     // Reserve + cgroup-confine the harness COMPILE phase only — NOT the
     // test-running phase (each VM cell takes its own LLC reservation; a
     // reservation still held here would deadlock/starve them). Plain nextest
@@ -1883,8 +3085,47 @@ fn run_cargo_sub(
     } else {
         None
     };
+    let cached_nextest = if needs_prebuild
+        && archive_reuse_path.is_none()
+        && (sub_argv == TEST_SUB_ARGV || !llvm_cov_retains_artifacts(&args))
+        && let Some(metadata) = nextest_metadata.as_ref()
+    {
+        let build_args = direct_nextest_build_surface_args(sub_argv, &args)?;
+        let coverage_environment_args = if sub_argv == TEST_SUB_ARGV {
+            Vec::new()
+        } else {
+            llvm_cov_show_env_args(sub_argv, &args)
+        };
+        let mode = if sub_argv == TEST_SUB_ARGV {
+            CachedNextestMode::Plain
+        } else {
+            CachedNextestMode::Coverage
+        };
+        let materialized = load_or_build_nextest_artifacts(
+            metadata,
+            mode,
+            &build_args,
+            &coverage_environment_args,
+            release,
+            std::slice::from_ref(&target_dir_path),
+            &producer_environment,
+            resolved.first().map(|(_, directory)| directory.as_path()),
+            "cargo ktstr nextest artifact cache",
+        )?;
+        eprintln!(
+            "cargo ktstr: {} reusable nextest build",
+            if materialized.cache_hit() {
+                "reused"
+            } else {
+                "published"
+            },
+        );
+        Some(materialized)
+    } else {
+        None
+    };
     let archive_dir =
-        if needs_prebuild && sub_argv != TEST_SUB_ARGV {
+        if needs_prebuild && cached_nextest.is_none() && sub_argv != TEST_SUB_ARGV {
             Some(tempfile::tempdir().map_err(|error| {
                 format!("cargo ktstr: create coverage warm archive dir: {error}")
             })?)
@@ -1901,7 +3142,9 @@ fn run_cargo_sub(
             extract_nextest_archive_test_binaries(archive_path)
         })
         .transpose()?;
-    let (test_bins, pinned_test_bins) = if needs_prebuild {
+    let (test_bins, pinned_test_bins) = if let Some(cached) = &cached_nextest {
+        (cached.test_binaries.clone(), None)
+    } else if needs_prebuild {
         let mut warm = if let Some(archive_dir) = &archive_dir {
             build_llvm_cov_archive_warm_command(
                 sub_argv,
@@ -1952,12 +3195,34 @@ fn run_cargo_sub(
             None,
         )
     };
-    let prepared_scheduler_artifacts = if needs_prebuild || archive_probe.is_some() {
+    let cached_scheduler_manifests = cached_nextest.as_ref().map(|cached| {
+        cached
+            .scheduler_stamps
+            .iter()
+            .map(|stamp| stamp.manifest.clone())
+            .collect::<Vec<_>>()
+    });
+    let prepared_scheduler_artifacts = if let Some(manifests) = &cached_scheduler_manifests {
+        Some(
+            crate::verifier::prepare_scheduler_artifacts_from_cached_manifests(
+                manifests,
+                profile.as_deref(),
+                &args,
+                &invocation_dir,
+            )?,
+        )
+    } else if needs_prebuild || archive_probe.is_some() {
+        let loader_paths = cached_nextest.as_ref().map_or_else(
+            || {
+                archive_probe
+                    .as_ref()
+                    .map_or(&[][..], |archive| archive.loader_paths.as_slice())
+            },
+            |cached| cached.loader_paths.as_slice(),
+        );
         Some(crate::verifier::prepare_scheduler_artifacts(
             &test_bins,
-            archive_probe
-                .as_ref()
-                .map_or(&[][..], |archive| archive.loader_paths.as_slice()),
+            loader_paths,
             profile.as_deref(),
             &args,
             &invocation_dir,
@@ -1969,6 +3234,78 @@ fn run_cargo_sub(
     // Release test-binary fds before the potentially long nextest run; the
     // prepared scheduler manifest owns all durable artifacts it needs.
     drop(pinned_test_bins);
+
+    let mut cached_coverage_report = None;
+    if let Some(cached) = &cached_nextest {
+        let ignore_run_fail =
+            sub_argv != TEST_SUB_ARGV && llvm_cov_has_lifecycle_flag(&args, "--ignore-run-fail");
+        let run_args = cached_nextest_run_args(sub_argv, &args);
+        let run_args = if ignore_run_fail {
+            force_nextest_no_fail_fast(run_args)
+        } else {
+            run_args
+        };
+        let cached_args =
+            inject_nextest_reuse_args(TEST_SUB_ARGV, run_args, &cached.reuse_build_args());
+        cmd = build_cargo_command(
+            TEST_SUB_ARGV,
+            false,
+            profile.as_deref(),
+            nextest_profile.as_deref(),
+            no_perf_mode,
+            no_skip_mode,
+            &cached_args,
+        );
+        let metadata = nextest_metadata
+            .as_ref()
+            .expect("cached nextest artifacts require resolved metadata");
+        let final_run_dir = cached.original_invocation_root.clone();
+        cmd.current_dir(&final_run_dir);
+        apply_command_envs(&mut cmd, &producer_environment);
+        if sub_argv == TEST_SUB_ARGV {
+            if let Some(pattern) = &profraw_inject {
+                cmd.env("LLVM_PROFILE_FILE", pattern);
+            }
+        } else {
+            let profraw_directory = cached.target_directory.join("ktstr-profraw");
+            std::fs::create_dir_all(&profraw_directory).map_err(|error| {
+                format!(
+                    "cargo ktstr: create cached coverage profile directory {}: {error}",
+                    profraw_directory.display(),
+                )
+            })?;
+            let coverage_environment_args = llvm_cov_show_env_args(sub_argv, &args);
+            let coverage_environment_args = cached.remap_cargo_args(&coverage_environment_args);
+            let coverage_environment_args = remap_cached_build_paths(
+                &coverage_environment_args,
+                metadata.workspace_root.as_std_path(),
+                &invocation_dir,
+                &cached.workspace_root,
+            );
+            let coverage_environment = llvm_cov_build_environment(
+                &final_run_dir,
+                &cached.target_directory,
+                &cached.build_directory,
+                &profraw_directory,
+                &coverage_environment_args,
+                &producer_environment,
+            )?;
+            apply_command_envs(&mut cmd, &coverage_environment);
+            cached_coverage_report = Some((
+                cached_llvm_cov_report_args(sub_argv, &args, release, metadata, &invocation_dir),
+                coverage_environment,
+                invocation_dir.clone(),
+                llvm_cov_flags_with_path_equivalence(
+                    std::env::var_os("LLVM_COV_FLAGS")
+                        .or_else(|| std::env::var_os("CARGO_LLVM_COV_FLAGS")),
+                    &cached.workspace_root,
+                    metadata.workspace_root.as_std_path(),
+                )?,
+                llvm_cov_has_lifecycle_flag(&args, "--no-report"),
+                ignore_run_fail,
+            ));
+        }
+    }
 
     // Analyze only requirement-derived, parent-snapshotted scheduler
     // artifacts. Export the same strict manifest to ordinary tests, coverage,
@@ -2008,6 +3345,52 @@ fn run_cargo_sub(
     // through cleanup and re-raises afterward.
     let status = crate::interrupt::run_status(cmd)
         .map_err(|e| format!("spawn cargo {}: {e}", sub_argv.join(" ")))?;
+    let mut final_success = status.success();
+    let mut final_failure = (!status.success()).then(|| {
+        format!(
+            "cargo nextest run exited with {}",
+            status
+                .code()
+                .map_or("signal".to_string(), |code| code.to_string()),
+        )
+    });
+    if let Some((
+        report_args,
+        environment,
+        report_dir,
+        llvm_cov_flags,
+        no_report,
+        ignore_run_fail,
+    )) = &cached_coverage_report
+    {
+        if !status.success() && *ignore_run_fail {
+            eprintln!(
+                "cargo ktstr: coverage test run failed under --ignore-run-fail; generating report"
+            );
+            final_success = true;
+            final_failure = None;
+        }
+        if (status.success() || *ignore_run_fail) && !*no_report {
+            let mut report = Command::new("cargo");
+            report
+                .arg("llvm-cov")
+                .args(report_args)
+                .current_dir(report_dir);
+            apply_command_envs(&mut report, environment);
+            report.env("LLVM_COV_FLAGS", llvm_cov_flags);
+            let report_status = crate::interrupt::run_status(report)
+                .map_err(|error| format!("spawn cargo llvm-cov report: {error}"))?;
+            if !report_status.success() {
+                final_success = false;
+                final_failure = Some(format!(
+                    "cargo llvm-cov report exited with {}",
+                    report_status
+                        .code()
+                        .map_or("signal".to_string(), |code| code.to_string()),
+                ));
+            }
+        }
+    }
     drop(archive_snapshot);
     // Surface per-test debugging artefacts: name each test that
     // FAILED this run and the concrete path to each of its artifacts
@@ -2026,7 +3409,7 @@ fn run_cargo_sub(
     if !footer.is_empty() {
         eprint!("{footer}");
     }
-    if !status.success() {
+    if !final_success {
         // nextest is the authoritative pass/fail signal. The footer
         // above lists per-test artifacts for failures that produced
         // them; a failure that left NO artifact — a build / vm.run
@@ -2043,16 +3426,10 @@ fn run_cargo_sub(
             runs_root.display(),
         );
     }
-    if status.success() {
+    if final_success {
         Ok(())
     } else {
-        Err(format!(
-            "cargo {} exited with {}",
-            sub_argv.join(" "),
-            status
-                .code()
-                .map_or("signal".to_string(), |c| c.to_string()),
-        ))
+        Err(final_failure.unwrap_or_else(|| "cached nextest invocation failed".to_string()))
     }
 }
 
@@ -2534,20 +3911,33 @@ pub(crate) fn run_reserved_build_output_under_lease<T>(
     target_dir: &std::path::Path,
     postprocess: impl FnOnce(&std::process::Output) -> Result<T, String>,
 ) -> Result<T, String> {
-    // Reservation comes first: a queued compile must not own and idle-block
-    // its target directory before Cargo is ready to become that directory's
-    // writer. Every leased build follows this one ordering.
-    let reservation = prepare_reserved_prebuild(&mut command, cli_label)?;
-    let lease = acquire_cargo_build_output_lease(target_dir, cli_label)?;
+    // A target directory is already a single-writer resource inside Cargo.
+    // Own that exact directory before claiming scarce build permits so every
+    // same-target waiter remains outside admission instead of hoarding CPU
+    // capacity while Cargo serializes it on the artifact-directory lock.
+    // Every leased build follows this one ordering.
+    let (lease, reservation) = acquire_cargo_build_resources(
+        || acquire_cargo_build_output_lease(target_dir, cli_label),
+        || prepare_reserved_prebuild(&mut command, cli_label),
+    )?;
     tracing::debug!(
         target_dir = %lease.target_dir().display(),
         "{cli_label}: acquired Cargo build-output ownership",
     );
     let output = run_prepared_reserved_build_output(command, cli_label, description)?;
     let processed = postprocess(&output);
-    drop(lease);
     drop(reservation);
+    drop(lease);
     processed
+}
+
+fn acquire_cargo_build_resources<L, R>(
+    acquire_lease: impl FnOnce() -> Result<L, String>,
+    acquire_reservation: impl FnOnce() -> Result<R, String>,
+) -> Result<(L, R), String> {
+    let lease = acquire_lease()?;
+    let reservation = acquire_reservation()?;
+    Ok((lease, reservation))
 }
 
 /// Reserved warm-up variant used by scheduler-declaration discovery.
@@ -3344,15 +4734,38 @@ fn selected_resolved_ktstr_versions<'metadata>(
     selected_resolved_ktstr_versions_for_context(meta, args, None)
 }
 
+#[cfg(test)]
 fn selected_resolved_ktstr_versions_for_context<'metadata>(
     meta: &'metadata cargo_metadata::Metadata,
     args: &[String],
     target: Option<&crate::feature_discovery::TargetContext>,
 ) -> Vec<&'metadata Version> {
-    let Some(packages) = selected_workspace_packages(meta, args) else {
+    let Some(packages) = crate::feature_discovery::selected_workspace_packages(meta, args) else {
         // Malformed/unsupported selection is left for Cargo to diagnose.
         return Vec::new();
     };
+    selected_resolved_ktstr_versions_from_packages(meta, packages, target)
+}
+
+fn selected_resolved_ktstr_versions_for_context_at<'metadata>(
+    meta: &'metadata cargo_metadata::Metadata,
+    args: &[String],
+    target: Option<&crate::feature_discovery::TargetContext>,
+    invocation_dir: &Path,
+) -> Vec<&'metadata Version> {
+    let Some(packages) = selected_workspace_packages_for_invocation(meta, args, invocation_dir)
+    else {
+        // Malformed/unsupported selection is left for Cargo to diagnose.
+        return Vec::new();
+    };
+    selected_resolved_ktstr_versions_from_packages(meta, packages, target)
+}
+
+fn selected_resolved_ktstr_versions_from_packages<'metadata>(
+    meta: &'metadata cargo_metadata::Metadata,
+    packages: Vec<&'metadata cargo_metadata::Package>,
+    target: Option<&crate::feature_discovery::TargetContext>,
+) -> Vec<&'metadata Version> {
     let mut versions = packages
         .into_iter()
         .flat_map(|package| linked_ktstr_versions_for_context(meta, &package.id, target))
@@ -3374,10 +4787,12 @@ fn check_ktstr_version_compat(
     meta: &cargo_metadata::Metadata,
     args: &[String],
     target: &crate::feature_discovery::TargetContext,
+    invocation_dir: &Path,
 ) -> Result<(), String> {
     let cli = Version::parse(env!("CARGO_PKG_VERSION"))
         .expect("cargo-ktstr's own CARGO_PKG_VERSION is valid semver");
-    let tests = selected_resolved_ktstr_versions_for_context(meta, args, Some(target));
+    let tests =
+        selected_resolved_ktstr_versions_for_context_at(meta, args, Some(target), invocation_dir);
     if tests.is_empty() {
         // No linked `ktstr` (or no resolve graph) — running outside a
         // ktstr-dependent project, or cannot assess; nothing to guard.
@@ -3413,7 +4828,14 @@ fn check_ktstr_version_compat(
 /// Metadata inspection has historically been best-effort on these general test
 /// paths. Preserve that behavior: if it fails, warn and let the underlying
 /// Cargo command diagnose (or successfully handle) its own arguments.
-pub(crate) fn prepare_nextest_args(args: Vec<String>) -> Result<Vec<String>, String> {
+struct PreparedNextestArgs {
+    args: Vec<String>,
+    metadata: Option<cargo_metadata::Metadata>,
+}
+
+fn prepare_nextest_invocation(args: Vec<String>) -> Result<PreparedNextestArgs, String> {
+    let invocation_dir = std::env::current_dir()
+        .map_err(|error| format!("read Cargo invocation directory: {error}"))?;
     let target = match effective_target_context(&args) {
         Ok(target) => target,
         Err(error) => {
@@ -3421,7 +4843,10 @@ pub(crate) fn prepare_nextest_args(args: Vec<String>) -> Result<Vec<String>, Str
                 error,
                 "ktstr target discovery/version guard failed; forwarding original Cargo args"
             );
-            return Ok(args);
+            return Ok(PreparedNextestArgs {
+                args,
+                metadata: None,
+            });
         }
     };
     let manifests = match query_metadata_for_target(&args, MetadataMode::NoDeps, &target) {
@@ -3431,23 +4856,46 @@ pub(crate) fn prepare_nextest_args(args: Vec<String>) -> Result<Vec<String>, Str
                 error,
                 "ktstr feature discovery/version guard failed; forwarding original Cargo args"
             );
-            return Ok(args);
+            return Ok(PreparedNextestArgs {
+                args,
+                metadata: None,
+            });
         }
     };
-    let augmented =
-        augment_test_features_from_metadata_for_context(args.clone(), &manifests, Some(&target));
-    let resolved = match query_resolved_metadata(&augmented, &augmented, &manifests, &target) {
+    let augmented = augment_test_features_from_metadata_for_context_at(
+        args.clone(),
+        &manifests,
+        Some(&target),
+        &invocation_dir,
+    );
+    let resolved = match query_resolved_metadata_for_invocation(
+        &augmented,
+        &augmented,
+        &manifests,
+        &target,
+        &invocation_dir,
+    ) {
         Ok(metadata) => metadata,
         Err(error) => {
             tracing::warn!(
                 error,
                 "ktstr version guard could not resolve inferred features; forwarding Cargo args"
             );
-            return Ok(augmented);
+            return Ok(PreparedNextestArgs {
+                args: augmented,
+                metadata: None,
+            });
         }
     };
-    check_ktstr_version_compat(&resolved, &augmented, &target)?;
-    Ok(augmented)
+    check_ktstr_version_compat(&resolved, &augmented, &target, &invocation_dir)?;
+    Ok(PreparedNextestArgs {
+        args: augmented,
+        metadata: Some(resolved),
+    })
+}
+
+pub(crate) fn prepare_nextest_args(args: Vec<String>) -> Result<Vec<String>, String> {
+    prepare_nextest_invocation(args).map(|prepared| prepared.args)
 }
 
 /// Split nextest FILTERSET tokens (`-E` / `--filterset` / the legacy
@@ -3586,12 +5034,22 @@ pub(crate) fn run_test(
     // Smart feature inference must precede registry discovery: `--relevant`
     // probes the exact feature/package/target/profile selection the eventual
     // nextest run will build, rather than a second workspace-wide default.
-    let args = if llvm_cov_reuses_archive(TEST_SUB_ARGV, &args) {
-        args
+    let prepared = if llvm_cov_reuses_archive(TEST_SUB_ARGV, &args) {
+        PreparedNextestArgs {
+            args,
+            metadata: None,
+        }
     } else {
-        prepare_nextest_args(args)?
+        prepare_nextest_invocation(args)?
     };
-    let args = apply_relevant_narrowing(args, relevant, base, base_ref, default_branch, release)?;
+    let args = apply_relevant_narrowing(
+        prepared.args,
+        relevant,
+        base,
+        base_ref,
+        default_branch,
+        release,
+    )?;
     run_cargo_sub(
         TEST_SUB_ARGV,
         "tests",
@@ -3602,6 +5060,7 @@ pub(crate) fn run_test(
         profile,
         nextest_profile,
         include_eol,
+        prepared.metadata,
         args,
     )
 }
@@ -3637,12 +5096,22 @@ pub(crate) fn run_coverage(
     ktstr::cli::check_tools(&["cargo-nextest", "cargo-llvm-cov"]).map_err(|e| format!("{e:#}"))?;
     // `coverage` runs the same suite through `cargo llvm-cov nextest`, so use
     // the same version guard and targeted feature inference as `test`.
-    let args = if llvm_cov_reuses_archive(COVERAGE_SUB_ARGV, &args) {
-        args
+    let prepared = if llvm_cov_reuses_archive(COVERAGE_SUB_ARGV, &args) {
+        PreparedNextestArgs {
+            args,
+            metadata: None,
+        }
     } else {
-        prepare_nextest_args(args)?
+        prepare_nextest_invocation(args)?
     };
-    let args = apply_relevant_narrowing(args, relevant, base, base_ref, default_branch, release)?;
+    let args = apply_relevant_narrowing(
+        prepared.args,
+        relevant,
+        base,
+        base_ref,
+        default_branch,
+        release,
+    )?;
     run_cargo_sub(
         COVERAGE_SUB_ARGV,
         "coverage",
@@ -3653,6 +5122,7 @@ pub(crate) fn run_coverage(
         profile,
         nextest_profile,
         include_eol,
+        prepared.metadata,
         args,
     )
 }
@@ -3686,8 +5156,16 @@ pub(crate) fn run_llvm_cov(
     // ktstr tests, so they retain exact passthrough semantics. Explicit
     // `llvm-cov nextest` is the same test suite as `coverage`, and therefore
     // goes through the identical target-aware feature and version preflight.
-    let args = prepare_llvm_cov_args_with(args, prepare_nextest_args)
-        .map_err(|error| format!("cargo ktstr llvm-cov nextest: {error}"))?;
+    let prepared =
+        if llvm_cov_uses_nextest(&args) && !llvm_cov_reuses_archive(LLVM_COV_SUB_ARGV, &args) {
+            prepare_nextest_invocation(args)
+                .map_err(|error| format!("cargo ktstr llvm-cov nextest: {error}"))?
+        } else {
+            PreparedNextestArgs {
+                args,
+                metadata: None,
+            }
+        };
     run_cargo_sub(
         LLVM_COV_SUB_ARGV,
         "llvm-cov",
@@ -3698,7 +5176,8 @@ pub(crate) fn run_llvm_cov(
         None,
         None,
         include_eol,
-        args,
+        prepared.metadata,
+        prepared.args,
     )
 }
 
@@ -3867,6 +5346,81 @@ mod tests {
         assert_eq!(
             std::fs::read(&artifact).expect("read current Cargo output"),
             b"second scheduler revision",
+        );
+    }
+
+    #[test]
+    fn cargo_output_lease_excludes_same_target_across_cache_roots() {
+        const HOLDER_CASE: &str = "cargo-output-lock-cross-cache-holder";
+        const CONTENDER_CASE: &str = "cargo-output-lock-cross-cache-contender";
+        const TARGET_ENV: &str = "__KTSTR_TEST_CARGO_OUTPUT_TARGET";
+        const CONTENDER_CACHE_ENV: &str = "__KTSTR_TEST_CARGO_OUTPUT_CONTENDER_CACHE";
+
+        let target_dir = std::env::var_os(TARGET_ENV).map(PathBuf::from);
+        if is_reexec_case(CONTENDER_CASE) {
+            let target_dir = target_dir.expect("contender target directory");
+            let root =
+                ktstr::cache::cargo_build_output_lock_root().expect("contender output-lock root");
+            let canonical_target =
+                canonical_cargo_target_dir(&target_dir).expect("canonical contender target");
+            let lock_path = cargo_build_output_lock_path(&root, &canonical_target);
+            assert!(
+                ktstr::flock::try_flock(&lock_path, ktstr::flock::FlockMode::Exclusive)
+                    .expect("probe holder's output lock")
+                    .is_none(),
+                "a distinct KTSTR_CACHE_DIR must not create a distinct lock for the same target",
+            );
+            return;
+        }
+        if is_reexec_case(HOLDER_CASE) {
+            let target_dir = target_dir.expect("holder target directory");
+            let contender_cache =
+                std::env::var_os(CONTENDER_CACHE_ENV).expect("contender cache directory");
+            let _lease = acquire_cargo_build_output_lease(&target_dir, "holder")
+                .expect("holder acquires output lease");
+            reexec_current_test(
+                CONTENDER_CASE,
+                [ChildEnv::set(ktstr::KTSTR_CACHE_DIR_ENV, contender_cache)],
+            );
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("cross-cache output-lock fixture");
+        let lock_dir = directory.path().join("locks");
+        let first_cache = directory.path().join("cache-first");
+        let second_cache = directory.path().join("cache-second");
+        let target_dir = directory.path().join("target");
+        reexec_current_test(
+            HOLDER_CASE,
+            [
+                ChildEnv::set(ktstr::KTSTR_LOCK_DIR_ENV, &lock_dir),
+                ChildEnv::set(ktstr::KTSTR_CACHE_DIR_ENV, &first_cache),
+                ChildEnv::set(TARGET_ENV, &target_dir),
+                ChildEnv::set(CONTENDER_CACHE_ENV, &second_cache),
+            ],
+        );
+    }
+
+    #[test]
+    fn cargo_output_lease_precedes_build_reservation() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let resources = acquire_cargo_build_resources(
+            || {
+                events.borrow_mut().push("target-output-lease");
+                Ok::<_, String>("lease")
+            },
+            || {
+                events.borrow_mut().push("build-reservation");
+                Ok::<_, String>("reservation")
+            },
+        )
+        .expect("acquire ordered build resources");
+
+        assert_eq!(resources, ("lease", "reservation"));
+        assert_eq!(
+            events.into_inner(),
+            ["target-output-lease", "build-reservation"],
+            "same-target waiters must not claim build capacity before they own Cargo output",
         );
     }
 
@@ -4228,6 +5782,337 @@ mod tests {
             normalize_nextest_admission(LLVM_COV_SUB_ARGV, report.clone()),
             report,
             "non-nextest raw llvm-cov must remain byte-for-byte passthrough"
+        );
+    }
+
+    #[test]
+    fn direct_cached_build_projects_only_cargo_build_surface() {
+        let args = normalize_nextest_admission(
+            LLVM_COV_SUB_ARGV,
+            strs(&[
+                "--branch",
+                "--manifest-path",
+                "Cargo.toml",
+                "nextest",
+                "--workspace",
+                "--exclude-from-test",
+                "slow-package",
+                "--features",
+                "integration,wprof",
+                "--lcov",
+                "--output-path",
+                "coverage/lcov.info",
+                "--retries",
+                "2",
+                "-E",
+                "test(/scheduler/)",
+                "name-filter",
+            ]),
+        );
+        assert_eq!(
+            direct_nextest_build_surface_args(LLVM_COV_SUB_ARGV, &args).unwrap(),
+            strs(&[
+                "--manifest-path",
+                "Cargo.toml",
+                "--workspace",
+                "--exclude",
+                "slow-package",
+                "--features",
+                "integration,wprof",
+            ]),
+            "the producer receives Cargo selectors, not coverage/report/run controls",
+        );
+    }
+
+    #[test]
+    fn cached_reuse_run_keeps_only_nextest_runtime_surface() {
+        let args = strs(&[
+            "--branch",
+            "--manifest-path",
+            "Cargo.toml",
+            "nextest",
+            "--workspace",
+            "--features",
+            "integration,wprof",
+            "--timings=html",
+            "--profile",
+            "ci",
+            "--tool-config-file=ktstr:/tmp/nextest.toml",
+            "--test-threads=1000000",
+            "--retries",
+            "2",
+            "--lcov",
+            "--output-path",
+            "lcov.info",
+            "-E",
+            "test(/scheduler/)",
+            "name-filter",
+            "--",
+            "--nocapture",
+        ]);
+        assert_eq!(
+            cached_nextest_run_args(LLVM_COV_SUB_ARGV, &args),
+            strs(&[
+                "--profile",
+                "ci",
+                "--tool-config-file=ktstr:/tmp/nextest.toml",
+                "--test-threads=1000000",
+                "--retries",
+                "2",
+                "-E",
+                "test(/scheduler/)",
+                "name-filter",
+                "--",
+                "--nocapture",
+            ]),
+            "reuse-build conflicts are removed while every run selector remains",
+        );
+    }
+
+    #[test]
+    fn ignore_run_fail_forces_complete_nextest_run_without_touching_test_args() {
+        assert_eq!(
+            force_nextest_no_fail_fast(strs(&[
+                "--fail-fast",
+                "--max-fail",
+                "2",
+                "-E",
+                "all()",
+                "--",
+                "--fail-fast",
+                "--max-fail=1",
+            ])),
+            strs(&[
+                "-E",
+                "all()",
+                "--no-fail-fast",
+                "--",
+                "--fail-fast",
+                "--max-fail=1",
+            ]),
+        );
+    }
+
+    #[test]
+    fn cached_reuse_args_are_inserted_before_test_binary_suffix() {
+        assert_eq!(
+            inject_nextest_reuse_args(
+                TEST_SUB_ARGV,
+                strs(&["-E", "all()", "--", "--nocapture"]),
+                &strs(&["--cargo-metadata", "/cache/cargo.json"]),
+            ),
+            strs(&[
+                "-E",
+                "all()",
+                "--cargo-metadata",
+                "/cache/cargo.json",
+                "--",
+                "--nocapture",
+            ]),
+        );
+    }
+
+    #[test]
+    fn llvm_cov_show_env_projection_is_instrumentation_only() {
+        assert_eq!(
+            llvm_cov_show_env_args(
+                LLVM_COV_SUB_ARGV,
+                &strs(&[
+                    "--branch",
+                    "--dep-coverage",
+                    "serde,anyhow",
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
+                    "nextest",
+                    "--workspace",
+                    "--features",
+                    "integration",
+                    "--profile",
+                    "ci",
+                    "--lcov",
+                    "--include-build-script",
+                    "--no-cfg-coverage-nightly",
+                ]),
+            ),
+            strs(&[
+                "--branch",
+                "--dep-coverage",
+                "serde,anyhow",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "--no-cfg-coverage-nightly",
+            ]),
+            "dependency coverage changes the rustc-wrapper allow-list, while include-build-script is report-only",
+        );
+    }
+
+    #[test]
+    fn llvm_cov_show_env_parser_decodes_shell_escape_without_exec() {
+        let parsed = parse_llvm_cov_show_env(
+            b"LLVM_PROFILE_FILE='/tmp/a b/'ktstr-%p.profraw\nRUSTFLAGS=-Cinstrument-coverage\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                (
+                    OsString::from("LLVM_PROFILE_FILE"),
+                    OsString::from("/tmp/a b/ktstr-%p.profraw"),
+                ),
+                (
+                    OsString::from("RUSTFLAGS"),
+                    OsString::from("-Cinstrument-coverage"),
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn cached_build_paths_are_rebased_into_the_stable_source() {
+        assert_eq!(
+            remap_cached_build_paths(
+                &strs(&[
+                    "--manifest-path=/work/member/Cargo.toml",
+                    "--target",
+                    "targets/custom.json",
+                    "--features",
+                    "integration",
+                ]),
+                Path::new("/work"),
+                Path::new("/work/member"),
+                Path::new("/cache/source"),
+            ),
+            strs(&[
+                "--manifest-path=/cache/source/member/Cargo.toml",
+                "--target",
+                "/cache/source/member/targets/custom.json",
+                "--features",
+                "integration",
+            ]),
+        );
+    }
+
+    #[test]
+    fn cached_coverage_report_is_report_only_and_writes_to_the_invocation_tree() {
+        let metadata = llvm_cov_feature_metadata();
+        let report = cached_llvm_cov_report_args(
+            LLVM_COV_SUB_ARGV,
+            &strs(&[
+                "--cargo-profile",
+                "release",
+                "nextest",
+                "--workspace",
+                "--features",
+                "integration,wprof",
+                "--profile",
+                "ci",
+                "--test-threads=1000000",
+                "--lcov",
+                "--output-path",
+                "coverage/lcov.info",
+            ]),
+            false,
+            &metadata,
+            Path::new("/work"),
+        );
+        assert_eq!(
+            report,
+            strs(&[
+                "report",
+                "--profile",
+                "release",
+                "--features",
+                "integration,wprof",
+                "--lcov",
+                "--output-path",
+                "/work/coverage/lcov.info",
+                "--package",
+                "ordinary-scheduler",
+                "--package",
+                "renamed-scheduler",
+            ]),
+            "nextest runtime controls stay out of the separate report command",
+        );
+    }
+
+    #[test]
+    fn cached_coverage_report_rebases_joined_output_and_manifest_paths() {
+        let metadata = llvm_cov_feature_metadata();
+        assert_eq!(
+            cached_llvm_cov_report_args(
+                LLVM_COV_SUB_ARGV,
+                &strs(&[
+                    "--manifest-path=/w/renamed-scheduler/Cargo.toml",
+                    "nextest",
+                    "--lcov",
+                    "--output-path=coverage/lcov.info",
+                    "--output-dir=/tmp/html",
+                ]),
+                false,
+                &metadata,
+                Path::new("/w"),
+            ),
+            strs(&[
+                "report",
+                "--manifest-path=/w/renamed-scheduler/Cargo.toml",
+                "--lcov",
+                "--output-path=/w/coverage/lcov.info",
+                "--output-dir=/tmp/html",
+                "--package",
+                "renamed-scheduler",
+            ]),
+            "an explicit member manifest keeps coverage reporting on that member",
+        );
+    }
+
+    #[test]
+    fn cached_coverage_report_keeps_test_and_report_exclusions_independent() {
+        let metadata = llvm_cov_feature_metadata();
+        assert_eq!(
+            cached_llvm_cov_report_args(
+                LLVM_COV_SUB_ARGV,
+                &strs(&[
+                    "nextest",
+                    "--workspace",
+                    "--exclude-from-test=ordinary-scheduler",
+                    "--exclude-from-report",
+                    "renamed-scheduler",
+                    "--lcov",
+                ]),
+                false,
+                &metadata,
+                Path::new("/w"),
+            ),
+            strs(&["report", "--lcov", "--package", "ordinary-scheduler",]),
+            "report selection ignores test-only exclusions and applies report-only exclusions",
+        );
+    }
+
+    #[test]
+    fn cached_html_report_defaults_to_persistent_original_target_directory() {
+        let metadata = llvm_cov_feature_metadata();
+        let report = cached_llvm_cov_report_args(
+            LLVM_COV_SUB_ARGV,
+            &strs(&["nextest", "--html"]),
+            false,
+            &metadata,
+            Path::new("/w/member"),
+        );
+        assert!(report.windows(2).any(|pair| {
+            pair == ["--output-dir".to_string(), "/w/target/llvm-cov".to_string()]
+        }));
+    }
+
+    #[test]
+    fn cached_report_path_equivalence_preserves_existing_llvm_cov_flags() {
+        assert_eq!(
+            llvm_cov_flags_with_path_equivalence(
+                Some(OsString::from("-show-branches=count")),
+                Path::new("/cache/source"),
+                Path::new("/work/source"),
+            )
+            .unwrap(),
+            OsString::from("-show-branches=count --path-equivalence=/cache/source,/work/source"),
         );
     }
 
@@ -5219,6 +7104,19 @@ mod tests {
         assert!(
             profraw_inject_for(TEST_SUB_ARGV, Some(existing)).is_none(),
             "an operator-set LLVM_PROFILE_FILE must not be overridden",
+        );
+    }
+
+    #[test]
+    fn ordinary_profraw_environment_participates_in_producer_identity() {
+        let identity = producer_environment_identity(&[(
+            OsString::from("LLVM_PROFILE_FILE"),
+            OsString::from("/tmp/operator-%p.profraw"),
+        )])
+        .unwrap();
+        assert_eq!(
+            identity,
+            vec!["producer-env:LLVM_PROFILE_FILE=/tmp/operator-%p.profraw".to_string()],
         );
     }
 

@@ -112,10 +112,14 @@ pub use scheduler_manifest_stamp::{
     SchedulerManifestUseStampV1, read_scheduler_manifest_stamp,
 };
 
-/// Read scheduler discovery metadata and globally validate admission metadata
-/// through one ELF mapping. Cargo invokes this once per warmed binary; target
-/// runner children can then use the compact direct admission keys without
-/// rescanning unrelated full records.
+/// Read scheduler discovery metadata and validate the admission wire-format
+/// envelope through one ELF mapping.
+///
+/// Cargo invokes this once per warmed binary. This path checks versions,
+/// section/header shape, registry counts, and compact-key integrity without
+/// decoding every topology payload. The target runner subsequently performs
+/// strict exact-name lookup and fully decodes the selected cell before it
+/// acquires resources or executes the test binary.
 #[doc(hidden)]
 pub fn read_scheduler_manifest_and_validate_admission_stamp(
     path: &std::path::Path,
@@ -136,7 +140,7 @@ pub fn read_scheduler_manifest_and_validate_admission_stamp(
     })?;
     let reader = scheduler_manifest_stamp::ElfStampReader::new(path, &data)?;
     let manifest = scheduler_manifest_stamp::read_scheduler_manifest_stamp_reader(&reader)?;
-    admission_stamp::validate_admission_stamp_reader(&reader)?;
+    admission_stamp::validate_admission_stamp_envelope_reader(&reader)?;
     Ok(manifest)
 }
 mod shell_descriptor;

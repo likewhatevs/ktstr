@@ -809,6 +809,7 @@ pub struct AdmissionCellDescriptor {
 
 #[derive(Debug, Clone)]
 struct ParsedAdmissionTest {
+    #[cfg(test)]
     record_base: u64,
     name: String,
     topology: AdmissionTopologyDescriptor,
@@ -817,17 +818,20 @@ struct ParsedAdmissionTest {
     performance_mode: bool,
     no_perf_mode: bool,
     expect_auto_repro: bool,
+    #[cfg(test)]
     legacy_entry: u64,
 }
 
 #[derive(Debug, Clone)]
 struct ParsedAdmissionPreset {
+    #[cfg(test)]
     record_base: u64,
     name: String,
     topology: AdmissionTopologyDescriptor,
     forced_cpu_budget: Option<u32>,
 }
 
+#[cfg(test)]
 struct AdmissionIndex {
     tests: Vec<ParsedAdmissionTest>,
     presets: Vec<ParsedAdmissionPreset>,
@@ -1130,6 +1134,7 @@ fn test_record(
         ));
     }
     Ok(ParsedAdmissionTest {
+        #[cfg(test)]
         record_base: base,
         name: string(
             reader,
@@ -1160,6 +1165,7 @@ fn test_record(
             offset_of!(AdmissionTestStampV2, expect_auto_repro),
             &format!("{what}.expect_auto_repro"),
         )?,
+        #[cfg(test)]
         legacy_entry: reader.pointer(
             base,
             offset_of!(AdmissionTestStampV2, legacy_entry),
@@ -1175,6 +1181,7 @@ fn preset_record(
 ) -> Result<ParsedAdmissionPreset, String> {
     let what = format!("admission preset record {index}");
     Ok(ParsedAdmissionPreset {
+        #[cfg(test)]
         record_base: base,
         name: string(
             reader,
@@ -1241,6 +1248,36 @@ fn section_records<T>(
         )
     })?;
     Ok(Some((records, sentinel)))
+}
+
+/// Validate only the fixed-width envelope of one admission record section.
+///
+/// Scheduler discovery needs to reject mixed-version or structurally corrupt
+/// binaries before publishing their manifests, but it does not need to decode
+/// every test topology. The exact selected cell is decoded later by
+/// `read_admission_cell_stamp_from_reader` in the target-runner path. Reusing
+/// `section_records` while retaining only each record's address and index keeps
+/// the header, kind, record-size, and single-sentinel checks identical to the
+/// exhaustive test parser.
+struct AdmissionRecordEnvelope {
+    records: Vec<(u64, usize)>,
+    sentinel: u64,
+}
+
+fn record_section_envelope(
+    reader: &ElfStampReader<'_>,
+    section: &str,
+    record_size: usize,
+    expected_kind: u16,
+) -> Result<Option<AdmissionRecordEnvelope>, String> {
+    section_records(
+        reader,
+        section,
+        record_size,
+        expected_kind,
+        |_reader, base, index| Ok((base, index)),
+    )
+    .map(|records| records.map(|(records, sentinel)| AdmissionRecordEnvelope { records, sentinel }))
 }
 
 fn key_table(
@@ -1384,6 +1421,7 @@ fn matching_key_targets(
         .collect()
 }
 
+#[cfg(test)]
 fn validate_key_registry(
     reader: &ElfStampReader<'_>,
     table: &AdmissionKeyTable,
@@ -1406,6 +1444,7 @@ fn validate_key_registry(
     validate_key_bindings(reader.source, table.section, records, &bindings)
 }
 
+#[cfg(test)]
 fn validate_key_bindings(
     source: &Path,
     section: &str,
@@ -1453,33 +1492,12 @@ fn validate_key_bindings(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_test_registry(
     reader: &ElfStampReader<'_>,
     tests: &[ParsedAdmissionTest],
 ) -> Result<(), String> {
-    let (registry_va, bytes) = reader.section(LEGACY_TEST_SECTION)?.ok_or_else(|| {
-        format!(
-            "admission ELF {} is missing {LEGACY_TEST_SECTION}",
-            reader.source.display(),
-        )
-    })?;
-    if !bytes.len().is_multiple_of(size_of::<KtstrTestEntry>()) {
-        return Err(format!(
-            "admission ELF {} has a malformed {LEGACY_TEST_SECTION} byte length {}",
-            reader.source.display(),
-            bytes.len(),
-        ));
-    }
-    let linked_count = bytes.len() / size_of::<KtstrTestEntry>();
-    if linked_count != tests.len() {
-        return Err(format!(
-            "admission ELF {} has {linked_count} linked test entries but {} version-{} \
-             admission records; rebuild every selected test target with this ktstr version",
-            reader.source.display(),
-            tests.len(),
-            ADMISSION_VERSION,
-        ));
-    }
+    let (registry_va, linked_count) = validate_test_registry_count(reader, tests.len())?;
 
     let record_size = size_of::<KtstrTestEntry>() as u64;
     let mut slots = BTreeSet::new();
@@ -1509,6 +1527,37 @@ fn validate_test_registry(
     Ok(())
 }
 
+fn validate_test_registry_count(
+    reader: &ElfStampReader<'_>,
+    admission_count: usize,
+) -> Result<(u64, usize), String> {
+    let (registry_va, bytes) = reader.section(LEGACY_TEST_SECTION)?.ok_or_else(|| {
+        format!(
+            "admission ELF {} is missing {LEGACY_TEST_SECTION}",
+            reader.source.display(),
+        )
+    })?;
+    if !bytes.len().is_multiple_of(size_of::<KtstrTestEntry>()) {
+        return Err(format!(
+            "admission ELF {} has a malformed {LEGACY_TEST_SECTION} byte length {}",
+            reader.source.display(),
+            bytes.len(),
+        ));
+    }
+    let linked_count = bytes.len() / size_of::<KtstrTestEntry>();
+    if linked_count != admission_count {
+        return Err(format!(
+            "admission ELF {} has {linked_count} linked test entries but {} version-{} \
+             admission records; rebuild every selected test target with this ktstr version",
+            reader.source.display(),
+            admission_count,
+            ADMISSION_VERSION,
+        ));
+    }
+    Ok((registry_va, linked_count))
+}
+
+#[cfg(test)]
 fn read_index_from_reader(reader: &ElfStampReader<'_>) -> Result<Option<AdmissionIndex>, String> {
     let tests = section_records(
         reader,
@@ -1615,6 +1664,173 @@ fn read_index_from_reader(reader: &ElfStampReader<'_>) -> Result<Option<Admissio
     Ok(Some(tests))
 }
 
+fn validate_key_envelope(
+    reader: &ElfStampReader<'_>,
+    table: &AdmissionKeyTable,
+    record_section: &'static str,
+    record_name_offset: usize,
+    records: &AdmissionRecordEnvelope,
+    record_family: &str,
+) -> Result<(), String> {
+    let slots = table
+        .slots
+        .iter()
+        .copied()
+        .filter(|slot| slot.kind == table.expected_kind)
+        .collect::<Vec<_>>();
+    if slots.len() != records.records.len() {
+        return Err(format!(
+            "admission ELF {} has {} {record_section} records but {} compact \
+             lookup keys",
+            reader.source.display(),
+            records.records.len(),
+            slots.len(),
+        ));
+    }
+
+    let record_indices = records.records.iter().copied().collect::<BTreeMap<_, _>>();
+    let mut targets = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    for slot in slots {
+        let target = key_record_target(reader, table, slot)?;
+        let index = record_indices.get(&target).copied().ok_or_else(|| {
+            format!(
+                "{} record {} in admission ELF {} points to 0x{target:x}, which is not a \
+                 version-{ADMISSION_VERSION} {record_section} record",
+                table.section,
+                slot.index,
+                reader.source.display(),
+            )
+        })?;
+        if !targets.insert(target) {
+            return Err(format!(
+                "admission ELF {} contains duplicate {} keys for {record_section} record \
+                 {index}",
+                reader.source.display(),
+                table.section,
+            ));
+        }
+        let name = string(
+            reader,
+            target + record_name_offset as u64,
+            &format!("{record_family} record {index}.name"),
+        )?;
+        if name.is_empty() || !names.insert(name.clone()) {
+            return Err(format!(
+                "admission ELF {} contains an empty or duplicate {record_family} name {:?}",
+                reader.source.display(),
+                name,
+            ));
+        }
+        if key_name_hash(reader, table, slot)? != admission_name_hash(&name)
+            || key_name_len(reader, table, slot)? != name.len() as u64
+        {
+            return Err(format!(
+                "{} record {} in admission ELF {} does not match its target name {:?}",
+                table.section,
+                slot.index,
+                reader.source.display(),
+                name,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the admission wire-format envelope used during scheduler
+/// discovery without decoding every test and preset topology.
+///
+/// This keeps mixed-version, missing-section, malformed-header, compact-key,
+/// duplicate-name, and registry-count failures eager. Payload validation is
+/// deliberately deferred to the exact-name target-runner lookup, which fully
+/// decodes the selected test and preset before acquiring admission resources.
+pub(super) fn validate_admission_stamp_envelope_reader(
+    reader: &ElfStampReader<'_>,
+) -> Result<(), String> {
+    let tests = record_section_envelope(
+        reader,
+        TEST_SECTION,
+        size_of::<AdmissionTestStampV2>(),
+        ADMISSION_KIND_TEST,
+    )?;
+    let presets = record_section_envelope(
+        reader,
+        PRESET_SECTION,
+        size_of::<AdmissionPresetStampV2>(),
+        ADMISSION_KIND_PRESET,
+    )?;
+    let test_keys = test_key_table(reader)?;
+    let preset_keys = preset_key_table(reader)?;
+    if tests.is_none() && presets.is_none() && test_keys.is_none() && preset_keys.is_none() {
+        if reader.section(LEGACY_TEST_SECTION)?.is_some() {
+            return Err(format!(
+                "ktstr-linked test binary {} is missing required version-{} admission stamp \
+                 and lookup sections; rebuild every selected test target",
+                reader.source.display(),
+                ADMISSION_VERSION,
+            ));
+        }
+        return Ok(());
+    }
+
+    let tests = tests.ok_or_else(|| {
+        format!(
+            "admission ELF {} is missing required {TEST_SECTION}",
+            reader.source.display(),
+        )
+    })?;
+    let presets = presets.ok_or_else(|| {
+        format!(
+            "admission ELF {} is missing required {PRESET_SECTION}",
+            reader.source.display(),
+        )
+    })?;
+    let test_keys = test_keys.ok_or_else(|| {
+        format!(
+            "admission ELF {} is missing required {TEST_KEY_SECTION}",
+            reader.source.display(),
+        )
+    })?;
+    let preset_keys = preset_keys.ok_or_else(|| {
+        format!(
+            "admission ELF {} is missing required {PRESET_KEY_SECTION}",
+            reader.source.display(),
+        )
+    })?;
+
+    validate_test_registry_count(reader, tests.records.len())?;
+    let expected = reader.u32(
+        presets.sentinel,
+        offset_of!(AdmissionPresetStampV2, sentinel_expected_count),
+        "admission preset sentinel expected count",
+    )? as usize;
+    if presets.records.len() != expected {
+        return Err(format!(
+            "admission ELF {} contains {} preset records but its version sentinel requires \
+             {expected}",
+            reader.source.display(),
+            presets.records.len(),
+        ));
+    }
+
+    validate_key_envelope(
+        reader,
+        &test_keys,
+        TEST_SECTION,
+        offset_of!(AdmissionTestStampV2, name),
+        &tests,
+        "test-entry",
+    )?;
+    validate_key_envelope(
+        reader,
+        &preset_keys,
+        PRESET_SECTION,
+        offset_of!(AdmissionPresetStampV2, name),
+        &presets,
+        "preset",
+    )
+}
+
 #[cfg(test)]
 fn read_index(path: &Path) -> Result<Option<AdmissionIndex>, String> {
     let file = std::fs::File::open(path).map_err(|error| {
@@ -1633,10 +1849,6 @@ fn read_index(path: &Path) -> Result<Option<AdmissionIndex>, String> {
     })?;
     let reader = ElfStampReader::new(path, &data)?;
     read_index_from_reader(&reader)
-}
-
-pub(super) fn validate_admission_stamp_reader(reader: &ElfStampReader<'_>) -> Result<(), String> {
-    read_index_from_reader(reader).map(|_| ())
 }
 
 fn mode(test: &ParsedAdmissionTest) -> AdmissionMode {
@@ -2066,6 +2278,23 @@ pub fn read_admission_cell_stamp(
 mod tests {
     use super::*;
 
+    fn map_current_test_executable_copy() -> (std::path::PathBuf, memmap2::MmapMut) {
+        let executable = std::env::current_exe().expect("locate unit-test executable");
+        let file = std::fs::File::open(&executable).expect("open unit-test executable");
+        // SAFETY: this is a private copy-on-write mapping. Each mutation below
+        // changes one metadata page and cannot affect the executable on disk
+        // or a concurrently running test process.
+        let mapping = unsafe { memmap2::MmapOptions::new().map_copy(&file) }
+            .expect("copy-map unit-test executable");
+        (executable, mapping)
+    }
+
+    fn section_file_offset(mapping: &memmap2::MmapMut, section: &[u8]) -> usize {
+        (section.as_ptr() as usize)
+            .checked_sub(mapping.as_ptr() as usize)
+            .expect("section slice comes from the executable mapping")
+    }
+
     static EXPLICIT_NODES: [crate::test_support::NumaNode; 3] = [
         crate::test_support::NumaNode {
             llcs: 1,
@@ -2143,6 +2372,135 @@ mod tests {
         assert_eq!(offset_of!(AdmissionTestKeyV2, name_hash), 16);
         assert_eq!(offset_of!(AdmissionTestKeyV2, name_len), 24);
         assert_eq!(offset_of!(AdmissionTestKeyV2, record), 32);
+    }
+
+    #[test]
+    fn scheduler_discovery_envelope_rejects_a_key_section_version_mismatch() {
+        let (executable, mut mapping) = map_current_test_executable_copy();
+        let version_file_offset = {
+            let reader = ElfStampReader::new(&executable, &mapping).expect("parse test executable");
+            let (_, section) = reader
+                .section(TEST_KEY_SECTION)
+                .expect("find admission test-key section")
+                .expect("test-key section is linked");
+            section_file_offset(&mapping, section) + offset_of!(AdmissionHeaderV2, version)
+        };
+        mapping[version_file_offset..version_file_offset + size_of::<u16>()]
+            .copy_from_slice(&(ADMISSION_VERSION + 1).to_le_bytes());
+
+        let reader = ElfStampReader::new(&executable, &mapping).expect("parse mutated executable");
+        let error = validate_admission_stamp_envelope_reader(&reader)
+            .expect_err("mixed-version key envelope must be rejected");
+        assert!(
+            error.contains("unsupported admission stamp version"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn exact_pre_exec_lookup_rejects_a_corrupt_selected_key_binding() {
+        const ENTRY: &str = "__unit_test_admission_explicit_nodes__";
+
+        let (executable, mut mapping) = map_current_test_executable_copy();
+        let hash_file_offset = {
+            let reader = ElfStampReader::new(&executable, &mapping).expect("parse test executable");
+            let table = test_key_table(&reader)
+                .expect("read admission test-key table")
+                .expect("test-key table is linked");
+            let slot = table
+                .slots
+                .iter()
+                .copied()
+                .filter(|slot| slot.kind == table.expected_kind)
+                .find(|slot| {
+                    let target = key_record_target(&reader, &table, *slot)
+                        .expect("decode admission key target");
+                    let index = target_record_index(
+                        &reader,
+                        TEST_SECTION,
+                        size_of::<AdmissionTestStampV2>(),
+                        ADMISSION_KIND_TEST,
+                        target,
+                    )
+                    .expect("key points to an admission test record");
+                    string(
+                        &reader,
+                        target + offset_of!(AdmissionTestStampV2, name) as u64,
+                        &format!("admission test record {index}.name"),
+                    )
+                    .expect("decode admission key target name")
+                        == ENTRY
+                })
+                .expect("explicit-node fixture has a compact key");
+            let (_, section) = reader
+                .section(TEST_KEY_SECTION)
+                .expect("find admission test-key section")
+                .expect("test-key section is linked");
+            section_file_offset(&mapping, section)
+                + slot.index * size_of::<AdmissionTestKeyV2>()
+                + offset_of!(AdmissionTestKeyV2, name_hash)
+        };
+        let encoded_hash = u64::from_le_bytes(
+            mapping[hash_file_offset..hash_file_offset + size_of::<u64>()]
+                .try_into()
+                .expect("hash slot width"),
+        );
+        mapping[hash_file_offset..hash_file_offset + size_of::<u64>()]
+            .copy_from_slice(&(encoded_hash ^ 1).to_le_bytes());
+
+        let reader = ElfStampReader::new(&executable, &mapping).expect("parse mutated executable");
+        let error =
+            read_admission_cell_stamp_from_reader(&reader, &executable, &format!("host/{ENTRY}"))
+                .expect_err("a selected key with the wrong hash must never execute");
+        assert!(error.contains("has no admission stamp"), "{error}");
+    }
+
+    #[test]
+    fn scheduler_discovery_defers_payload_decode_to_exact_pre_exec_lookup() {
+        let (executable, mut mapping) = map_current_test_executable_copy();
+        let explicit_nodes_file_offset = {
+            let reader = ElfStampReader::new(&executable, &mapping).expect("parse test executable");
+            let (section_va, section) = reader
+                .section(TEST_SECTION)
+                .expect("find admission test section")
+                .expect("test section is linked");
+            let record_size = size_of::<AdmissionTestStampV2>();
+            let record_index = (0..section.len() / record_size)
+                .find(|index| {
+                    let base = section_va + (*index * record_size) as u64;
+                    header(&reader, base, record_size, TEST_SECTION, *index)
+                        .expect("decode admission record header")
+                        == ADMISSION_KIND_TEST
+                        && string(
+                            &reader,
+                            base + offset_of!(AdmissionTestStampV2, name) as u64,
+                            "fixture test name",
+                        )
+                        .expect("decode fixture test name")
+                            == "__unit_test_admission_explicit_nodes__"
+                })
+                .expect("explicit-node admission fixture is linked");
+            section_file_offset(&mapping, section)
+                + record_index * record_size
+                + offset_of!(AdmissionTestStampV2, topology)
+                + offset_of!(AdmissionTopologyStampV2, explicit_nodes)
+        };
+        mapping[explicit_nodes_file_offset] = 2;
+
+        let reader = ElfStampReader::new(&executable, &mapping).expect("parse mutated executable");
+        validate_admission_stamp_envelope_reader(&reader)
+            .expect("scheduler discovery intentionally avoids topology payloads");
+        let full_error = read_index_from_reader(&reader)
+            .err()
+            .expect("the exhaustive test-only parser must still reject the payload");
+        assert!(full_error.contains("invalid boolean 2"), "{full_error}");
+        let exact_error = read_admission_cell_stamp_from_reader(
+            &reader,
+            &executable,
+            "host/__unit_test_admission_explicit_nodes__",
+        )
+        .expect_err("the exact pre-exec lookup must fully decode its selected payload");
+        assert!(exact_error.contains("invalid boolean 2"), "{exact_error}");
     }
 
     #[test]

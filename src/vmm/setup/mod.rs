@@ -1570,23 +1570,19 @@ impl KtstrVm {
     pub(super) fn create_vm_and_load_kernel(
         &self,
         mbind_node_map: &[Vec<usize>],
+        memory_mib: u32,
     ) -> Result<(kvm::KtstrKvm, Option<boot::KernelLoadResult>)> {
         let t0 = Instant::now();
 
         // `mut` is used only on x86_64, where `vm.pci_enabled` is assigned below;
         // on aarch64 (no PCI field) `vm` is never mutated after construction.
         #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
-        let mut vm = match self.memory_mib {
-            // Performance-mode hugepages are opportunistic. The allocator
-            // serializes its free-count check with MAP_HUGETLB so a process
-            // storm cannot all spend the same observed pool. Passing the
-            // explicit-hugepage bit here would bypass that distinction and
-            // turn a racy pre-check into a strict no-fallback request.
-            Some(mib) => kvm::KtstrKvm::new(self.topology, mib, self.performance_mode)
-                .context("create VM with unregistered memory")?,
-            None => kvm::KtstrKvm::new_deferred(self.topology, false, self.performance_mode)
-                .context("create VM (deferred memory)")?,
-        };
+        // Performance-mode hugepages are opportunistic. The allocator
+        // serializes its free-count check with MAP_HUGETLB so a process storm
+        // cannot all spend the same observed pool. Immutable preparation has
+        // already supplied the exact memory requirement before admission.
+        let mut vm = kvm::KtstrKvm::new(self.topology, memory_mib, self.performance_mode)
+            .context("create VM with unregistered memory")?;
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "kvm_create");
 
         // Propagate the builder's PCI-enable flag to the VM so the run loops
@@ -1598,26 +1594,18 @@ impl KtstrVm {
             vm.pci_enabled = self.pci_enabled;
         }
 
-        // When memory is already allocated (non-deferred path), do mbind
-        // and load kernel now. Deferred path does this in setup_memory.
-        let kernel_result = if self.memory_mib.is_some() {
-            if self.performance_mode && !mbind_node_map.is_empty() {
-                let layout = vm.numa_layout.as_ref().expect(
-                    "numa_layout is Some on the non-deferred allocation path: \
-                     memory allocation ran during `vm_new` because memory_mib \
-                     was provided up front, and that call sets \
-                     numa_layout to Some(...) in src/vmm/{x86_64,aarch64}/kvm.rs",
-                );
-                layout.mbind_regions(&vm.guest_mem, mbind_node_map);
-            }
+        if self.performance_mode && !mbind_node_map.is_empty() {
+            let layout = vm
+                .numa_layout
+                .as_ref()
+                .expect("numa_layout is present after exact memory allocation");
+            layout.mbind_regions(&vm.guest_mem, mbind_node_map);
+        }
 
-            let t0 = Instant::now();
-            let kr = boot::load_kernel(&vm.guest_mem, &self.kernel).context("load kernel")?;
-            tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "load_kernel");
-            Some(kr)
-        } else {
-            None
-        };
+        let t0 = Instant::now();
+        let kr = boot::load_kernel(&vm.guest_mem, &self.kernel).context("load kernel")?;
+        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "load_kernel");
+        let kernel_result = Some(kr);
 
         Ok((vm, kernel_result))
     }
@@ -1884,6 +1872,38 @@ impl KtstrVm {
         TmpfsFraction::for_kernel_version(version)
     }
 
+    /// Resolve the exact guest-memory allocation from immutable prepared
+    /// inputs. This runs before host admission so the queue claim and the KVM
+    /// allocation use the same value.
+    pub(super) fn prepared_memory_mib(&self, prepared: Option<&PreparedInitrd>) -> Result<u32> {
+        let computed_min = if let Some(prepared) = prepared {
+            let uncompressed_size = prepared.uncompressed_len();
+            let compressed_size = prepared.compressed_len();
+            let kernel_init_size = read_kernel_init_size(&self.kernel)?;
+            let (init_coverage_instrumented, instrumented_reserve_bytes) = prepared.coverage();
+            let budget = MemoryBudget {
+                uncompressed_initramfs_bytes: uncompressed_size as u64,
+                compressed_initrd_bytes: compressed_size as u64,
+                kernel_init_size,
+                init_coverage_instrumented,
+                instrumented_reserve_bytes,
+                tmpfs_fraction: self.tmpfs_fraction(),
+            };
+            initramfs_min_memory_mib(&budget).max(self.memory_min_mib)
+        } else {
+            256u32.max(self.memory_min_mib)
+        };
+        if let Some(configured) = self.memory_mib {
+            anyhow::ensure!(
+                configured >= computed_min,
+                "VM memory {configured}MiB is below the prepared image minimum of {computed_min}MiB"
+            );
+            Ok(configured)
+        } else {
+            Ok(computed_min)
+        }
+    }
+
     /// Validate and load a prepared initramfs into already allocated guest
     /// memory.
     ///
@@ -1897,16 +1917,12 @@ impl KtstrVm {
         prepared: PreparedInitrd,
         load_addr: u64,
         mbind_node_map: &[Vec<usize>],
+        memory_mib: u32,
     ) -> Result<(Option<u64>, Option<u32>)> {
         let uncompressed_size = prepared.uncompressed_len();
         let compressed_size = prepared.compressed_len();
 
-        // Enforce minimum memory for initramfs extraction.
-        // This path is only reached when memory_mib was set explicitly.
-        let memory_mib = self.memory_mib.expect(
-            "validate_and_load_initramfs called in deferred mode; \
-             use compute_memory_and_allocate instead",
-        );
+        // Enforce the same minimum used before admission.
         let kernel_init_size = read_kernel_init_size(&self.kernel)?;
         let (init_coverage_instrumented, instrumented_reserve_bytes) = prepared.coverage();
         let budget = MemoryBudget {
@@ -2013,6 +2029,7 @@ impl KtstrVm {
         kernel_result: Option<boot::KernelLoadResult>,
         prepared_initrd: Option<PreparedInitrd>,
         mbind_node_map: &[Vec<usize>],
+        admitted_memory_mib: u32,
     ) -> Result<boot::KernelLoadResult> {
         // Deferred memory path: join initramfs first to learn its size,
         // then allocate memory, load kernel, and load initramfs — all in
@@ -2024,9 +2041,13 @@ impl KtstrVm {
             // operation, so a mid-function `?` cannot drop the guard
             // before the COW VMAs are torn down.
             let (initrd_addr, initrd_size) = match prepared_initrd {
-                Some(prepared) => {
-                    self.validate_and_load_initramfs(vm, prepared, INITRD_ADDR, mbind_node_map)?
-                }
+                Some(prepared) => self.validate_and_load_initramfs(
+                    vm,
+                    prepared,
+                    INITRD_ADDR,
+                    mbind_node_map,
+                    admitted_memory_mib,
+                )?,
                 None => (None, None),
             };
             (kr, initrd_addr, initrd_size)
@@ -2313,6 +2334,7 @@ impl KtstrVm {
         kernel_result: Option<boot::KernelLoadResult>,
         prepared_initrd: Option<PreparedInitrd>,
         mbind_node_map: &[Vec<usize>],
+        admitted_memory_mib: u32,
     ) -> Result<boot::KernelLoadResult> {
         // Deferred memory path for aarch64.
         let (kernel_result, initrd_addr, initrd_size) = if let Some(kr) = kernel_result {
@@ -2330,13 +2352,10 @@ impl KtstrVm {
                     // error rather than `unwrap()` so a future refactor
                     // that drops the deferred guard fails loudly with an
                     // actionable diagnostic instead of an opaque panic.
-                    let memory_mib = self.memory_mib.context(
-                        "internal: non-deferred aarch64 path requires memory_mib to be set",
-                    )?;
                     self.validate_and_load_initramfs_aarch64(
                         vm,
                         prepared,
-                        memory_mib,
+                        admitted_memory_mib,
                         mbind_node_map,
                     )?
                 }

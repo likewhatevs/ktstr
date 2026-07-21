@@ -114,8 +114,7 @@ pub(crate) use acquire::acquire_flock_with_timeout;
 pub(crate) use holder::NO_HOLDERS_RECORDED;
 pub(crate) use mountinfo::read_mountinfo;
 pub(crate) use primitives::{
-    InterruptibleFlockWaiter, TryFlockOutcome, materialize, try_convert_flock,
-    try_flock_with_witness,
+    InterruptibleFlockWaiter, TryFlockOutcome, materialize, try_flock_with_witness,
 };
 pub(crate) use proc_locks::{
     FlockResourceState, read_flock_states_batch_with_mountinfo, read_holders,

@@ -627,8 +627,17 @@ fn acquire_llc_plan_none_cap_reserves_thirty_percent_cpus() {
     // TestTopology only needs to be a valid synthetic().
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
 
-    let plan = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate, false)
-        .expect("clean pool must allow SH on every selected LLC");
+    let plan = acquire_llc_plan_interruptible(
+        &topo,
+        &test_topo,
+        None,
+        PlacementPolicy::Consolidate,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect("clean pool must allow SH on every selected LLC");
     // 30% of 10 CPUs = ceil(3.0) = 3 CPUs. 2-CPU LLCs: LLC 0
     // contributes 2, LLC 1 contributes 1 (partial-take), total
     // exactly 3.
@@ -679,8 +688,17 @@ fn acquire_llc_plan_bails_on_exclusive_peer() {
         .expect("peer EX must acquire on clean pool");
 
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
-    let err = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate, false)
-        .expect_err("EX peer must block SH acquisition of the only LLC");
+    let err = acquire_llc_plan_interruptible(
+        &topo,
+        &test_topo,
+        None,
+        PlacementPolicy::Consolidate,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect_err("EX peer must block SH acquisition of the only LLC");
     let rendered = format!("{err:#}");
     assert!(
         rendered.contains("LLC 0"),
@@ -715,8 +733,17 @@ fn acquire_llc_plan_coexists_with_shared_peer() {
         .expect("peer SH must acquire on clean pool");
 
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
-    let plan = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate, false)
-        .expect("second SH caller must coexist with the first");
+    let plan = acquire_llc_plan_interruptible(
+        &topo,
+        &test_topo,
+        None,
+        PlacementPolicy::Consolidate,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect("second SH caller must coexist with the first");
     assert_eq!(
         plan.locks.len(),
         topo.llc_groups.len() + plan.cpus.len(),
@@ -799,8 +826,17 @@ fn acquire_llc_plan_waits_out_real_exclusive_peer() {
     });
 
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
-    let plan = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate, true)
-        .expect("wait-enabled acquisition must complete after the peer releases");
+    let plan = acquire_llc_plan_interruptible(
+        &topo,
+        &test_topo,
+        None,
+        PlacementPolicy::Consolidate,
+        true,
+        None,
+        None,
+        None,
+    )
+    .expect("wait-enabled acquisition must complete after the peer releases");
     assert_eq!(
         plan.locks.len(),
         2,

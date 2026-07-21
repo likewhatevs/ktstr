@@ -8,7 +8,7 @@
 //! selectors, avoiding a broad `--all-features` build.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 
@@ -72,11 +72,7 @@ impl TargetContext {
         }
     }
 
-    fn custom(
-        name: impl Into<String>,
-        cargo_target: impl Into<String>,
-        cfg: Vec<Cfg>,
-    ) -> Self {
+    fn custom(name: impl Into<String>, cargo_target: impl Into<String>, cfg: Vec<Cfg>) -> Self {
         Self {
             name: name.into(),
             cargo_target: cargo_target.into(),
@@ -641,11 +637,18 @@ fn scoped_metadata_resolution_options(
     args: &[String],
     selection_args: &[String],
     manifests: &Metadata,
+    invocation_dir: Option<&Path>,
 ) -> Vec<String> {
     let Some((explicit, all_features, no_default_features)) = parsed_feature_modes(args) else {
         return metadata_resolution_options(args);
     };
-    let Some(selected) = selected_workspace_packages(manifests, selection_args) else {
+    let selected = invocation_dir.map_or_else(
+        || selected_workspace_packages(manifests, selection_args),
+        |invocation_dir| {
+            selected_workspace_packages_for_invocation(manifests, selection_args, invocation_dir)
+        },
+    );
+    let Some(selected) = selected else {
         return metadata_resolution_options(args);
     };
 
@@ -747,7 +750,9 @@ pub(crate) fn query_metadata_for_target(
         MetadataMode::NoDeps => execute_metadata(args, mode, target, &[]),
         MetadataMode::Default => {
             let manifests = execute_metadata(args, MetadataMode::NoDeps, target, &[])?;
-            query_resolved_metadata(args, args, &manifests, target)
+            let invocation_dir = std::env::current_dir()
+                .map_err(|error| format!("read Cargo invocation directory: {error}"))?;
+            query_resolved_metadata_for_invocation(args, args, &manifests, target, &invocation_dir)
         }
     }
 }
@@ -759,7 +764,22 @@ pub(crate) fn query_resolved_metadata(
     manifests: &Metadata,
     target: &TargetContext,
 ) -> Result<Metadata, String> {
-    let resolution = scoped_metadata_resolution_options(args, selection_args, manifests);
+    let resolution = scoped_metadata_resolution_options(args, selection_args, manifests, None);
+    execute_metadata(args, MetadataMode::Default, target, &resolution)
+}
+
+/// Resolve a test selection using Cargo's effective manifest at the original
+/// invocation directory. A member manifest selects that member implicitly;
+/// only the workspace-root manifest selects `workspace.default-members`.
+pub(crate) fn query_resolved_metadata_for_invocation(
+    args: &[String],
+    selection_args: &[String],
+    manifests: &Metadata,
+    target: &TargetContext,
+    invocation_dir: &Path,
+) -> Result<Metadata, String> {
+    let resolution =
+        scoped_metadata_resolution_options(args, selection_args, manifests, Some(invocation_dir));
     execute_metadata(args, MetadataMode::Default, target, &resolution)
 }
 
@@ -1283,6 +1303,54 @@ pub(crate) fn has_workspace_selector(args: &[String]) -> bool {
         .any(|arg| matches!(arg.as_str(), "--workspace" | "--all"))
 }
 
+fn explicit_manifest_path(args: &[String], invocation_dir: &Path) -> Option<PathBuf> {
+    let args = cargo_args(args);
+    let mut selected = None;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        let value = if argument == "--manifest-path" {
+            index += 1;
+            Some(args.get(index)?.as_str())
+        } else {
+            argument.strip_prefix("--manifest-path=")
+        };
+        if let Some(value) = value {
+            if value.is_empty() {
+                return None;
+            }
+            let path = Path::new(value);
+            selected = Some(if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                invocation_dir.join(path)
+            });
+        }
+        index += 1;
+    }
+    selected
+}
+
+fn effective_manifest_path(args: &[String], invocation_dir: &Path) -> Option<PathBuf> {
+    if cargo_args(args)
+        .iter()
+        .any(|argument| argument == "--manifest-path" || argument.starts_with("--manifest-path="))
+    {
+        return explicit_manifest_path(args, invocation_dir)
+            .map(|path| std::fs::canonicalize(&path).unwrap_or(path));
+    }
+    invocation_dir.ancestors().find_map(|directory| {
+        let manifest = directory.join("Cargo.toml");
+        manifest
+            .is_file()
+            .then(|| std::fs::canonicalize(&manifest).unwrap_or(manifest))
+    })
+}
+
+fn canonical_manifest_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn explicit_all_features(args: &[String]) -> bool {
     cargo_args(args).iter().any(|arg| arg == "--all-features")
 }
@@ -1295,9 +1363,10 @@ fn explicit_all_features(args: &[String]) -> bool {
 /// those callers. `None` means an explicit selector was malformed or could not
 /// be interpreted safely; an empty `Some` means the specs matched no package
 /// (which the eventual Cargo command will diagnose).
-pub(crate) fn selected_workspace_packages<'metadata>(
+fn selected_workspace_packages_with_invocation<'metadata>(
     metadata: &'metadata Metadata,
     args: &[String],
+    invocation_dir: Option<&Path>,
 ) -> Option<Vec<&'metadata cargo_metadata::Package>> {
     let member_ids = metadata.workspace_members.iter().collect::<HashSet<_>>();
     let explicit_specs = explicit_package_specs(args);
@@ -1315,6 +1384,31 @@ pub(crate) fn selected_workspace_packages<'metadata>(
         };
     let default_ids = default_ids.iter().collect::<HashSet<_>>();
     let exclusion_specs = explicit_package_exclusion_specs(args)?;
+    let implicit_manifest_member = if has_workspace_selector(args) || explicit_specs.is_some() {
+        None
+    } else if let Some(invocation_dir) = invocation_dir {
+        let manifest = effective_manifest_path(args, invocation_dir)?;
+        let workspace_manifest_path = metadata.workspace_root.as_std_path().join("Cargo.toml");
+        let workspace_manifest = canonical_manifest_path(&workspace_manifest_path);
+        if manifest == workspace_manifest {
+            None
+        } else {
+            Some(
+                metadata
+                    .packages
+                    .iter()
+                    .find(|package| {
+                        member_ids.contains(&package.id)
+                            && canonical_manifest_path(package.manifest_path.as_std_path())
+                                == manifest
+                    })?
+                    .id
+                    .clone(),
+            )
+        }
+    } else {
+        None
+    };
 
     let mut packages = metadata
         .packages
@@ -1325,6 +1419,8 @@ pub(crate) fn selected_workspace_packages<'metadata>(
                 true
             } else if let Some(specs) = &explicit_specs {
                 specs.iter().any(|spec| package_matches_spec(package, spec))
+            } else if let Some(member) = &implicit_manifest_member {
+                &package.id == member
             } else {
                 default_ids.contains(&package.id)
             }
@@ -1342,6 +1438,21 @@ pub(crate) fn selected_workspace_packages<'metadata>(
             .then_with(|| left.id.repr.cmp(&right.id.repr))
     });
     Some(packages)
+}
+
+pub(crate) fn selected_workspace_packages<'metadata>(
+    metadata: &'metadata Metadata,
+    args: &[String],
+) -> Option<Vec<&'metadata cargo_metadata::Package>> {
+    selected_workspace_packages_with_invocation(metadata, args, None)
+}
+
+pub(crate) fn selected_workspace_packages_for_invocation<'metadata>(
+    metadata: &'metadata Metadata,
+    args: &[String],
+    invocation_dir: &Path,
+) -> Option<Vec<&'metadata cargo_metadata::Package>> {
+    selected_workspace_packages_with_invocation(metadata, args, Some(invocation_dir))
 }
 
 /// Infer activations only for the workspace packages Cargo will select.
@@ -1364,7 +1475,37 @@ pub(crate) fn selected_activations_for_context(
     scope: VersionScope<'_>,
     target: Option<&TargetContext>,
 ) -> Vec<PackageFeatureActivation> {
-    let mut activations = selected_workspace_packages(metadata, args)
+    selected_activations_for_context_with_invocation(metadata, args, scope, target, None)
+}
+
+pub(crate) fn selected_activations_for_context_at(
+    metadata: &Metadata,
+    args: &[String],
+    scope: VersionScope<'_>,
+    target: Option<&TargetContext>,
+    invocation_dir: &Path,
+) -> Vec<PackageFeatureActivation> {
+    selected_activations_for_context_with_invocation(
+        metadata,
+        args,
+        scope,
+        target,
+        Some(invocation_dir),
+    )
+}
+
+fn selected_activations_for_context_with_invocation(
+    metadata: &Metadata,
+    args: &[String],
+    scope: VersionScope<'_>,
+    target: Option<&TargetContext>,
+    invocation_dir: Option<&Path>,
+) -> Vec<PackageFeatureActivation> {
+    let selected = invocation_dir.map_or_else(
+        || selected_workspace_packages(metadata, args),
+        |invocation_dir| selected_workspace_packages_for_invocation(metadata, args, invocation_dir),
+    );
+    let mut activations = selected
         .unwrap_or_default()
         .into_iter()
         .filter_map(|package| {
@@ -1431,8 +1572,13 @@ fn selected_workspace_package_feature_activation(
     args: &[String],
     package_name: &str,
     requested_features: &[&str],
+    invocation_dir: Option<&Path>,
 ) -> Option<PackageFeatureActivation> {
-    let package = selected_workspace_packages(metadata, args)?
+    let selected = invocation_dir.map_or_else(
+        || selected_workspace_packages(metadata, args),
+        |invocation_dir| selected_workspace_packages_for_invocation(metadata, args, invocation_dir),
+    );
+    let package = selected?
         .into_iter()
         .find(|package| package.name.as_str() == package_name)?;
     let mut features = requested_features
@@ -1463,15 +1609,23 @@ pub(crate) fn augment_test_features_with_workspace_package_features(
     if explicit_all_features(&args) {
         return Ok(args);
     }
+    let invocation_dir = std::env::current_dir()
+        .map_err(|error| format!("read Cargo invocation directory: {error}"))?;
     let target = effective_target_context(&args)?;
     let metadata = query_metadata_for_target(&args, MetadataMode::NoDeps, &target)?;
-    let mut activations =
-        selected_activations_for_context(&metadata, &args, VersionScope::Any, Some(&target));
+    let mut activations = selected_activations_for_context_at(
+        &metadata,
+        &args,
+        VersionScope::Any,
+        Some(&target),
+        &invocation_dir,
+    );
     if let Some(activation) = selected_workspace_package_feature_activation(
         &metadata,
         &args,
         workspace_package,
         workspace_package_features,
+        Some(&invocation_dir),
     ) {
         activations.push(activation);
     }
@@ -1488,12 +1642,29 @@ pub(crate) fn augment_test_features_from_metadata(
     inject_feature_activations(args, &activations)
 }
 
+#[cfg(test)]
 pub(crate) fn augment_test_features_from_metadata_for_context(
     args: Vec<String>,
     metadata: &Metadata,
     target: Option<&TargetContext>,
 ) -> Vec<String> {
     let activations = selected_activations_for_context(metadata, &args, VersionScope::Any, target);
+    inject_feature_activations(args, &activations)
+}
+
+pub(crate) fn augment_test_features_from_metadata_for_context_at(
+    args: Vec<String>,
+    metadata: &Metadata,
+    target: Option<&TargetContext>,
+    invocation_dir: &Path,
+) -> Vec<String> {
+    let activations = selected_activations_for_context_at(
+        metadata,
+        &args,
+        VersionScope::Any,
+        target,
+        invocation_dir,
+    );
     inject_feature_activations(args, &activations)
 }
 
@@ -1588,6 +1759,21 @@ mod tests {
             ),
         );
         serde_json::from_str(&json).expect("metadata fixture deserializes")
+    }
+
+    fn selection_metadata_at(root: &Path) -> Metadata {
+        let mut metadata = selection_metadata();
+        metadata.workspace_root = root.to_string_lossy().into_owned().into();
+        metadata.target_directory = root.join("target").to_string_lossy().into_owned().into();
+        for package in &mut metadata.packages {
+            package.manifest_path = root
+                .join(package.name.as_str())
+                .join("Cargo.toml")
+                .to_string_lossy()
+                .into_owned()
+                .into();
+        }
+        metadata
     }
 
     fn write_package(root: &Path, relative: &str, manifest: &str) {
@@ -1750,6 +1936,90 @@ unrelated-mode = []
     }
 
     #[test]
+    fn implicit_selection_follows_member_cwd_and_manifest_for_every_nextest_frontend() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        for member in ["cosmos", "lavd"] {
+            std::fs::create_dir(root.join(member)).unwrap();
+            std::fs::write(root.join(member).join("Cargo.toml"), "[package]\n").unwrap();
+        }
+        let metadata = selection_metadata_at(root);
+        let lavd = root.join("lavd");
+
+        let selected = selected_workspace_packages_for_invocation(&metadata, &[], &lavd)
+            .expect("member-directory selection");
+        assert_eq!(
+            selected
+                .iter()
+                .map(|package| package.name.as_str())
+                .collect::<Vec<_>>(),
+            ["lavd"],
+        );
+        assert_eq!(
+            selected_activations_for_context_at(&metadata, &[], VersionScope::Any, None, &lavd,),
+            vec![PackageFeatureActivation {
+                package: "lavd".to_string(),
+                features: vec!["verify".to_string()],
+            }],
+        );
+        assert!(
+            selected_activations_for_context_at(
+                &metadata,
+                &[],
+                VersionScope::Matches(&Version::parse("0.42.0").unwrap()),
+                None,
+                &lavd,
+            )
+            .is_empty(),
+            "version-scoped verifier inference must classify the selected member, not defaults",
+        );
+
+        for args in [
+            strings(&["--manifest-path", "lavd/Cargo.toml"]),
+            strings(&["nextest", "--manifest-path=lavd/Cargo.toml"]),
+        ] {
+            assert_eq!(
+                selected_activations_for_context_at(
+                    &metadata,
+                    &args,
+                    VersionScope::Any,
+                    None,
+                    root,
+                ),
+                vec![PackageFeatureActivation {
+                    package: "lavd".to_string(),
+                    features: vec!["verify".to_string()],
+                }],
+                "test/coverage and raw llvm-cov nextest must share manifest selection: {args:?}",
+            );
+        }
+
+        assert_eq!(
+            selected_workspace_packages_for_invocation(
+                &metadata,
+                &strings(&["-p", "cosmos"]),
+                &lavd,
+            )
+            .unwrap()
+            .iter()
+            .map(|package| package.name.as_str())
+            .collect::<Vec<_>>(),
+            ["cosmos"],
+            "an explicit package remains authoritative over the member cwd",
+        );
+        assert_eq!(
+            selected_workspace_packages_for_invocation(&metadata, &[], root)
+                .unwrap()
+                .iter()
+                .map(|package| package.name.as_str())
+                .collect::<Vec<_>>(),
+            ["cosmos"],
+            "the workspace-root manifest retains workspace.default-members",
+        );
+    }
+
+    #[test]
     fn workspace_package_capabilities_are_selected_declared_and_package_qualified() {
         let metadata = selection_metadata();
         let selected = selected_workspace_package_feature_activation(
@@ -1757,6 +2027,7 @@ unrelated-mode = []
             &[],
             "cosmos",
             &["missing", "ktstr-tests"],
+            None,
         );
         assert_eq!(
             selected,
@@ -1775,7 +2046,13 @@ unrelated-mode = []
             "the capability is emitted only in package-qualified form",
         );
         assert_eq!(
-            selected_workspace_package_feature_activation(&metadata, &[], "lavd", &["verify"],),
+            selected_workspace_package_feature_activation(
+                &metadata,
+                &[],
+                "lavd",
+                &["verify"],
+                None,
+            ),
             None,
             "an unselected workspace member must not receive a feature",
         );
@@ -1785,6 +2062,7 @@ unrelated-mode = []
                 &strings(&["-p", "lavd"]),
                 "lavd",
                 &["verify"],
+                None,
             ),
             Some(PackageFeatureActivation {
                 package: "lavd".to_string(),
@@ -1798,6 +2076,7 @@ unrelated-mode = []
                 &strings(&["--workspace"]),
                 "not-a-member",
                 &["verify"],
+                None,
             ),
             None,
             "a dependency or unrelated package name can never receive consumer features",

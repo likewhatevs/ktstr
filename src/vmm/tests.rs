@@ -752,7 +752,14 @@ fn build_default_shared_run_locks_uses_admitted_mask() {
 #[test]
 fn acquire_default_run_locks_uses_shared_bridge_with_no_host_topo() {
     let _guard = DefaultAdmissionTestGuard::new(vec![0, 1]);
-    let rl = KtstrVm::acquire_default_run_locks(None, &Topology::new(1, 1, 1, 1), false);
+    let rl = KtstrVm::acquire_default_preferred_run_locks(
+        None,
+        &Topology::new(1, 1, 1, 1),
+        false,
+        None,
+        None,
+        256,
+    );
     let rl = rl.expect("no-host overcommit is Ok, not an error");
     let mut shared_cpu_mask = rl
         .shared_cpu_mask
@@ -775,7 +782,8 @@ fn acquire_default_run_locks_uses_shared_pool_when_host_too_small() {
     let host = host_topology::HostTopology::new_for_tests(&[(vec![0, 1], 0)]);
     let topo = Topology::new(1, 2, 1, 1);
     let _guard = DefaultAdmissionTestGuard::new(vec![0, 1]);
-    let rl = KtstrVm::acquire_default_run_locks(Some(&host), &topo, false);
+    let rl =
+        KtstrVm::acquire_default_preferred_run_locks(Some(&host), &topo, false, None, None, 256);
     let rl = rl.expect("a too-small host overcommits, it does not error or skip");
     let mut shared_cpu_mask = rl
         .shared_cpu_mask
@@ -847,183 +855,6 @@ fn performance_run_candidates_cover_every_disjoint_cpu_grain() {
             .all(|candidate| candidate.llc_mode == host_topology::LlcLockMode::Shared)
     );
     assert!(footprints.len() <= allowed.len());
-}
-
-#[test]
-fn granted_scan_selects_a_far_ready_alternative_in_one_pass() {
-    let claims = (0..4)
-        .map(|cpu| {
-            host_topology::protocol::ClaimSet::new(
-                std::iter::empty(),
-                [cpu],
-                crate::flock::FlockMode::Exclusive,
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut visited = Vec::new();
-    let selected = first_ready_alternative(0, &claims, |claim| {
-        let cpu = *claim.cpus.iter().next().unwrap();
-        visited.push(cpu);
-        Ok(cpu == 3)
-    })
-    .unwrap();
-    assert_eq!(selected, Some(3));
-    assert_eq!(
-        visited,
-        vec![1, 2, 3],
-        "scan must not stop at the next busy claim"
-    );
-}
-
-#[test]
-fn availability_replanning_keeps_one_replaceable_live_candidate() {
-    let make_candidate = |llc: usize, cpu: usize| host_topology::PerformancePinningCandidate {
-        plan: host_topology::PinningPlan {
-            assignments: vec![(0, cpu)],
-            service_cpu: None,
-            llc_indices: vec![llc],
-            locks: host_topology::protocol::Acquired::untracked(Vec::new()),
-        },
-        llc_mode: host_topology::LlcLockMode::Shared,
-        cpu_mode: crate::flock::FlockMode::Exclusive,
-        cpu_reservations: vec![cpu],
-    };
-    let (candidate, claim, target) = flexible_candidate_parts(make_candidate(0, 0));
-    let mut candidates = vec![candidate];
-    let mut claims = vec![claim];
-    let mut targets = vec![target];
-    let static_len = candidates.len();
-
-    for resource in 1..128 {
-        let live = install_live_candidate(
-            static_len,
-            make_candidate(resource, resource),
-            &mut candidates,
-            &mut claims,
-            &mut targets,
-        );
-        assert_eq!(live, static_len);
-        assert_eq!(candidates.len(), static_len + 1);
-        assert_eq!(claims.len(), static_len + 1);
-        assert_eq!(targets.len(), static_len + 1);
-        assert_eq!(
-            candidates[static_len].cpu_reservations,
-            vec![resource],
-            "the live slot must be replaced, not retain planner history",
-        );
-    }
-}
-
-#[test]
-fn stale_granted_replan_retains_the_registry_designation() {
-    let make_candidate = |llc: usize, cpu: usize| host_topology::PerformancePinningCandidate {
-        plan: host_topology::PinningPlan {
-            assignments: vec![(0, cpu)],
-            service_cpu: None,
-            llc_indices: vec![llc],
-            locks: host_topology::protocol::Acquired::untracked(Vec::new()),
-        },
-        llc_mode: host_topology::LlcLockMode::Shared,
-        cpu_mode: crate::flock::FlockMode::Exclusive,
-        cpu_reservations: vec![cpu],
-    };
-    let (candidate, claim, target) = flexible_candidate_parts(make_candidate(0, 0));
-    let mut candidates = vec![candidate];
-    let mut claims = vec![claim];
-    let mut targets = vec![target];
-    let static_len = candidates.len();
-
-    let current = stage_granted_candidate(
-        static_len,
-        make_candidate(1, 1),
-        &mut candidates,
-        &mut claims,
-        &mut targets,
-    );
-    let designated = claims[current].clone();
-    assert_eq!(
-        retain_granted_designation(
-            static_len,
-            &designated,
-            &mut candidates,
-            &mut claims,
-            &mut targets,
-        )
-        .unwrap(),
-        static_len,
-    );
-
-    let pending = stage_granted_candidate(
-        static_len,
-        make_candidate(2, 2),
-        &mut candidates,
-        &mut claims,
-        &mut targets,
-    );
-    assert_eq!(pending, static_len + 1);
-    assert_eq!(claims.len(), static_len + 2);
-
-    // Simulate the registry rejecting that replacement as stale: its next
-    // callback still designates the prior exact claim. The local state must
-    // retain it and discard only the speculative replacement.
-    let retained = retain_granted_designation(
-        static_len,
-        &designated,
-        &mut candidates,
-        &mut claims,
-        &mut targets,
-    )
-    .unwrap();
-    assert_eq!(retained, static_len);
-    assert_eq!(claims.len(), static_len + 1);
-    assert_eq!(claims[retained], designated);
-    assert_eq!(candidates[retained].cpu_reservations, vec![1]);
-
-    // If a replacement does commit, the next authoritative designation
-    // promotes it and drops the old dynamic candidate.
-    let committed = stage_granted_candidate(
-        static_len,
-        make_candidate(3, 3),
-        &mut candidates,
-        &mut claims,
-        &mut targets,
-    );
-    let committed_claim = claims[committed].clone();
-    let retained = retain_granted_designation(
-        static_len,
-        &committed_claim,
-        &mut candidates,
-        &mut claims,
-        &mut targets,
-    )
-    .unwrap();
-    assert_eq!(retained, static_len);
-    assert_eq!(claims.len(), static_len + 1);
-    assert_eq!(claims[retained], committed_claim);
-    assert_eq!(candidates[retained].cpu_reservations, vec![3]);
-}
-
-#[test]
-fn coordinator_synthesis_builds_a_nonadjacent_ready_live_candidate() {
-    let host = host_topology::HostTopology::new_for_tests(&[
-        (vec![0, 1], 0),
-        (vec![2, 3], 0),
-        (vec![4, 5], 0),
-        (vec![6, 7], 0),
-    ]);
-    let ready_cpus = std::collections::BTreeSet::from([0usize, 1, 4, 5]);
-    let ready_llcs = std::collections::BTreeSet::from([0usize, 2]);
-    let candidate = synthesize_ready_candidate(
-        &host,
-        &Topology::new(1, 2, 1, 1),
-        &[0, 1, 2, 3, 4, 5, 6, 7],
-        &[0, 1, 2, 3],
-        |claim| Ok(claim.cpus.is_subset(&ready_cpus) && claim.llcs.is_subset(&ready_llcs)),
-    )
-    .unwrap()
-    .expect("the coordinator snapshot must synthesize LLCs 0+2");
-    assert_eq!(candidate.plan.llc_indices, vec![0, 2]);
-    assert_eq!(candidate.cpu_reservations, vec![0, 1, 4, 5]);
 }
 
 #[test]
@@ -1261,7 +1092,14 @@ fn predecessor_ex_claim_fences_exact_and_shared_default_admission() {
     };
     let host = host_topology::HostTopology::new_for_tests(&[(vec![0, 1, 2, 3], 0)]);
     let topo = Topology::new(1, 1, 1, 1);
-    let error = match KtstrVm::acquire_default_run_locks(Some(&host), &topo, false) {
+    let error = match KtstrVm::acquire_default_preferred_run_locks(
+        Some(&host),
+        &topo,
+        false,
+        None,
+        None,
+        256,
+    ) {
         Ok(_) => panic!("the union EX claim must fence exact and shared default placement"),
         Err(error) => error,
     };
@@ -1273,8 +1111,9 @@ fn predecessor_ex_claim_fences_exact_and_shared_default_admission() {
     );
 
     drop(coordinator);
-    let acquired = KtstrVm::acquire_default_run_locks(Some(&host), &topo, false)
-        .expect("an unfenced default candidate must acquire");
+    let acquired =
+        KtstrVm::acquire_default_preferred_run_locks(Some(&host), &topo, false, None, None, 256)
+            .expect("an unfenced default candidate must acquire");
     assert!(
         acquired.pinning_plan.is_some(),
         "free host prefers exact 1:1"
