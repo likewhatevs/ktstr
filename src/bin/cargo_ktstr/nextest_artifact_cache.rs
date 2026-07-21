@@ -1751,20 +1751,13 @@ fn plan_source_layout(
     // roots collapse to their shallowest ancestor.
     let mut root_kinds = BTreeMap::<PathBuf, bool>::new();
     let mut non_git = Vec::new();
-    for package_root in package_roots {
-        if let Some(repository) = discover_git_workdir(&package_root) {
-            root_kinds.insert(repository, true);
+    let mut git_backed_package_roots = Vec::new();
+    for package_root in &package_roots {
+        if let Some(repository) = discover_git_workdir(package_root) {
+            root_kinds.insert(repository.clone(), true);
+            git_backed_package_roots.push((package_root.clone(), repository));
         } else {
-            non_git.push(package_root);
-        }
-    }
-    non_git.sort_by_key(|root| (root.components().count(), root.clone()));
-    for root in non_git {
-        if !root_kinds
-            .iter()
-            .any(|(existing, git)| !*git && root.starts_with(existing))
-        {
-            root_kinds.insert(root, false);
+            non_git.push(package_root.clone());
         }
     }
     let mut git_inputs = BTreeMap::<PathBuf, GitSourceInputs>::new();
@@ -1794,6 +1787,57 @@ fn plan_source_layout(
             }
         }
         git_inputs.insert(root, inputs);
+    }
+
+    // A Cargo workspace can deliberately live below a containing repository's
+    // ignored/generated directory (test fixtures and generated SDK workspaces
+    // are common examples). `gix status` correctly omits those files, but the
+    // local Cargo metadata proves that they are build inputs. Without a local
+    // overlay the stable invocation directory is empty; Cargo then walks to an
+    // ancestor `Cargo.toml` and applies package-qualified features to an
+    // entirely different workspace.
+    //
+    // Detect that shape by the one file every local Cargo root must own. A
+    // shallow non-Git overlay captures the complete generated workspace while
+    // preserving the containing repository for tracked path dependencies and
+    // ancestor Cargo configuration. Overlapping generated package roots
+    // collapse below, so one ignored workspace is scanned only once.
+    for (package_root, repository) in git_backed_package_roots {
+        let manifest = package_root.join("Cargo.toml");
+        let Ok(relative_manifest) = manifest.strip_prefix(&repository) else {
+            continue;
+        };
+        let captured = git_inputs
+            .get(&repository)
+            .is_some_and(|inputs| inputs.paths.contains(relative_manifest));
+        if captured {
+            continue;
+        }
+        if package_root == repository {
+            // A generated repository may ignore its own Cargo source. The
+            // source root cannot appear twice in `root_kinds`, so merge the
+            // bounded non-Git view into the explicit-input set while retaining
+            // the Git metadata needed by build scripts. Keeping these paths in
+            // `declared_package_inputs` also makes identity revalidation apply
+            // the exact same overlay after publication.
+            let overlay = non_git_source_input_paths(&package_root, &outputs)?;
+            declared_package_inputs.extend(
+                overlay
+                    .into_iter()
+                    .map(|relative| package_root.join(relative)),
+            );
+        } else {
+            non_git.push(package_root);
+        }
+    }
+    non_git.sort_by_key(|root| (root.components().count(), root.clone()));
+    for root in non_git {
+        if !root_kinds
+            .iter()
+            .any(|(existing, git)| !*git && root.starts_with(existing))
+        {
+            root_kinds.insert(root, false);
+        }
     }
     let roots = root_kinds.keys().cloned().collect::<Vec<_>>();
     let relations = roots
@@ -3229,6 +3273,113 @@ rustflags = ['-C', 'target-cpu=x86-64-v3']\n",
 
         let paths = non_git_source_input_paths(&root, &[target, cache]).unwrap();
         assert_eq!(paths, BTreeSet::from([PathBuf::from("src/lib.rs")]));
+    }
+
+    #[test]
+    fn ignored_nested_workspace_keeps_its_package_scoped_features_in_stable_source() {
+        let _environment = lock_env();
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let _cache = EnvVarGuard::set(ktstr::KTSTR_CACHE_DIR_ENV, &cache);
+        let repository = temp.path().join("repository");
+        std::fs::create_dir_all(repository.join("outer/src")).unwrap();
+        git_output(&repository, &["init", "-q"]);
+        std::fs::write(
+            repository.join("Cargo.toml"),
+            b"[workspace]\nmembers = ['outer']\nresolver = '3'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repository.join("outer/Cargo.toml"),
+            b"[package]\nname = 'outer'\nversion = '0.1.0'\nedition = '2024'\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("outer/src/lib.rs"), b"pub fn outer() {}\n").unwrap();
+        std::fs::write(repository.join(".gitignore"), b"/generated/\n").unwrap();
+        git_output(&repository, &["add", "."]);
+
+        let workspace = repository.join("generated/workspace");
+        for (package, feature) in [("alpha", "scheduler-tests"), ("beta", "verifier-fixtures")] {
+            let root = workspace.join(package);
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(
+                root.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = '{package}'\nversion = '0.1.0'\n\
+                     edition = '2024'\n\n[features]\n{feature} = []\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(root.join("src/lib.rs"), b"pub fn fixture() {}\n").unwrap();
+        }
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            b"[workspace]\nmembers = ['alpha', 'beta']\nresolver = '3'\n",
+        )
+        .unwrap();
+
+        let metadata = cargo_metadata::MetadataCommand::new()
+            .manifest_path(workspace.join("Cargo.toml"))
+            .exec()
+            .unwrap();
+        assert!(workspace.join("Cargo.lock").is_file());
+        let layout = plan_source_layout(
+            &metadata,
+            &[metadata.target_directory.as_std_path().to_path_buf()],
+            &[
+                "--features".to_string(),
+                "alpha/scheduler-tests,beta/verifier-fixtures".to_string(),
+            ],
+            &workspace,
+        )
+        .unwrap();
+        let overlay = layout
+            .roots
+            .iter()
+            .find(|root| root.source == workspace)
+            .expect("ignored workspace has a local stable-source overlay");
+        assert!(!overlay.is_git);
+        for input in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "alpha/Cargo.toml",
+            "alpha/src/lib.rs",
+            "beta/Cargo.toml",
+            "beta/src/lib.rs",
+        ] {
+            assert!(
+                overlay.input_paths.contains(Path::new(input)),
+                "stable-source overlay is missing {input}",
+            );
+        }
+
+        let stable = materialize_stable_source(&layout, "ignored workspace fixture").unwrap();
+        let output = std::process::Command::new("cargo")
+            .args([
+                "metadata",
+                "--format-version=1",
+                "--no-deps",
+                "--locked",
+                "--features",
+                "alpha/scheduler-tests,beta/verifier-fixtures",
+            ])
+            .current_dir(&stable.invocation_root)
+            .env("CARGO_TARGET_DIR", temp.path().join("stable-target"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "package-scoped features must resolve in the captured nested workspace: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stable_metadata: cargo_metadata::Metadata =
+            serde_json::from_slice(&output.stdout).unwrap();
+        let packages = stable_metadata
+            .packages
+            .iter()
+            .map(|package| package.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(packages, BTreeSet::from(["alpha", "beta"]));
     }
 
     #[test]

@@ -121,91 +121,6 @@ fn parent_dev_dependencies(ktstr_root: &Path) -> String {
     format!("[dev-dependencies]\n{}", table[..end].trim_end())
 }
 
-fn active_parent_ktstr_features() -> std::collections::BTreeSet<String> {
-    [
-        ("default", cfg!(feature = "default")),
-        ("cli-bins", cfg!(feature = "cli-bins")),
-        ("export", cfg!(feature = "export")),
-        ("vendored", cfg!(feature = "vendored")),
-        ("integration", cfg!(feature = "integration")),
-        ("wprof", cfg!(feature = "wprof")),
-        ("pretty-labels", cfg!(feature = "pretty-labels")),
-        ("remote-cache", cfg!(feature = "remote-cache")),
-    ]
-    .into_iter()
-    .filter(|(_, enabled)| *enabled)
-    .map(|(name, _)| name.to_owned())
-    .collect()
-}
-
-/// Assert that nested Cargo resolved exactly the parent's ktstr feature set.
-///
-/// The root package is a primary workspace unit while these fixtures consume
-/// it as a dependency, so Cargo may legitimately assign the two units
-/// different artifact hashes. Exact feature parity still makes both nested
-/// fixtures share one dependency-unit variant instead of compiling separate
-/// no-feature and vendored-only copies.
-fn assert_parent_ktstr_artifact_feature_parity(diagnostics: &Path, ktstr_root: &Path) {
-    let expected_manifest = ktstr_root
-        .join("Cargo.toml")
-        .canonicalize()
-        .expect("canonicalize parent ktstr manifest");
-    let expected_features = active_parent_ktstr_features();
-    let mut found_library_artifact = false;
-    for entry in std::fs::read_dir(diagnostics).expect("read nested Cargo diagnostics") {
-        let path = entry.expect("nested Cargo diagnostic entry").path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !name.contains("selected-test-binary-compile") || !name.ends_with(".stdout.log") {
-            continue;
-        }
-        let stream = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-        for line in stream.lines() {
-            let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-            if message["reason"] != "compiler-artifact"
-                || message["target"]["name"] != "ktstr"
-                || !message["target"]["kind"]
-                    .as_array()
-                    .is_some_and(|kinds| kinds.iter().any(|kind| kind == "lib"))
-            {
-                continue;
-            }
-            let Some(manifest) = message["manifest_path"].as_str() else {
-                continue;
-            };
-            if Path::new(manifest) != expected_manifest {
-                continue;
-            }
-            found_library_artifact = true;
-            let observed_features = message["features"]
-                .as_array()
-                .expect("ktstr artifact features are an array")
-                .iter()
-                .map(|feature| {
-                    feature
-                        .as_str()
-                        .expect("ktstr artifact feature is a string")
-                        .to_owned()
-                })
-                .collect::<std::collections::BTreeSet<_>>();
-            assert_eq!(
-                observed_features, expected_features,
-                "nested verifier fixture resolved a different ktstr feature fingerprint; \
-                 full artifact (including hash/fresh evidence)={message}",
-            );
-        }
-    }
-    assert!(
-        found_library_artifact,
-        "nested verifier diagnostics contained no parent ktstr library artifact under {}",
-        diagnostics.display(),
-    );
-}
-
 fn copy_tree(source: &Path, destination: &Path) {
     std::fs::create_dir_all(destination)
         .unwrap_or_else(|error| panic!("create {}: {error}", destination.display()));
@@ -259,6 +174,12 @@ fn exactly_one_verifier_cell_passed(stderr: &str) -> bool {
         == 1
 }
 
+/// The dependency renderer is driven directly by this test binary's `cfg!`
+/// feature set. Keeping both aliases byte-identical statically prevents Cargo
+/// from compiling two nested ktstr variants. The end-to-end tests below prove
+/// smart feature activation independently: their declaration binaries have
+/// `required-features`, so neither the conflict nor the generated cell can be
+/// observed unless the package-qualified roots were enabled.
 #[test]
 fn nested_fixture_dependency_aliases_have_identical_cargo_fingerprint_inputs() {
     let ktstr_root = ktstr::writable_source_path(env!("CARGO_MANIFEST_DIR"));
@@ -565,7 +486,6 @@ fn bare_verifier_recursively_discovers_feature_gated_workspace_test_binaries() {
         !stderr.contains("dispatching to nextest (verifier/ cells only)"),
         "the discovery conflict must abort before the KVM-running nextest phase:\n{stderr}",
     );
-    assert_parent_ktstr_artifact_feature_parity(&diagnostics, &ktstr_root);
 }
 
 #[test]
@@ -672,5 +592,4 @@ debug = "{FIXTURE_TEST_DEBUG}"
         "the parent result grid must prove the generated KVM cell completed successfully:\n\
          stdout:\n{stdout}\nstderr:\n{stderr}",
     );
-    assert_parent_ktstr_artifact_feature_parity(&diagnostics, &ktstr_root);
 }
