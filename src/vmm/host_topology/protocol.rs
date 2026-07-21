@@ -1559,8 +1559,8 @@ pub(crate) fn exercise_prefix_refresh_after_predecessor_release_for_tests()
 }
 
 #[cfg(test)]
-pub(crate) fn exercise_waiting_publication_release_progress_for_tests(
-) -> Result<(bool, bool, bool, bool)> {
+pub(crate) fn exercise_waiting_publication_release_progress_for_tests()
+-> Result<(bool, bool, bool, bool)> {
     registry::exercise_waiting_publication_release_progress_for_tests()
 }
 

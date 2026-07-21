@@ -4751,8 +4751,8 @@ pub(super) fn exercise_prefix_refresh_after_predecessor_release_for_tests()
 /// Reproduce a predecessor release after the coordinator planner returned
 /// WAITING but before that WAITING publication takes the registry fence.
 #[cfg(test)]
-pub(super) fn exercise_waiting_publication_release_progress_for_tests(
-) -> Result<(bool, bool, bool, bool)> {
+pub(super) fn exercise_waiting_publication_release_progress_for_tests()
+-> Result<(bool, bool, bool, bool)> {
     let claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
     let mut predecessor = Ticket::register(claim.clone(), claim.clone(), None)?;
     let mut coordinator = Ticket::register(claim.clone(), claim.clone(), None)?;
