@@ -2704,6 +2704,8 @@ mod tests {
         assert!(!root.path().join(object_lock_name(object_key)).exists());
 
         std::fs::write(&generated_temporary, b"live generated artifact").unwrap();
+        let generated_future =
+            SystemTime::now() + CONTENT_ORPHAN_TEMP_GRACE + Duration::from_secs(1);
         let namespace_gate = open_lock_file_at(
             &dirs.root,
             OsStr::new(CONTENT_NAMESPACE_GATE),
@@ -2711,10 +2713,10 @@ mod tests {
         )
         .unwrap();
         flock_retry(&namespace_gate, rustix::fs::FlockOperation::LockShared).unwrap();
-        gc_content_cache_at(root.path(), future, CONTENT_MAX_AGE).unwrap();
+        gc_content_cache_at(root.path(), generated_future, CONTENT_MAX_AGE).unwrap();
         assert!(generated_temporary.exists());
         drop(namespace_gate);
-        gc_content_cache_at(root.path(), future, CONTENT_MAX_AGE).unwrap();
+        gc_content_cache_at(root.path(), generated_future, CONTENT_MAX_AGE).unwrap();
         assert!(!generated_temporary.exists());
     }
 
