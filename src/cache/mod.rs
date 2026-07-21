@@ -80,6 +80,91 @@ pub(crate) use resolve::{
     path_inside_cache_root, resolve_cache_root_with_suffix, resolve_lock_dir,
 };
 
+/// Create one strict copy-on-write clone of `source` at `destination`.
+///
+/// This is the pathname-facing boundary used by cross-crate cache lifecycle
+/// code. Unlike the older kernel-cache staging helper, it deliberately has no
+/// byte-copy fallback: callers choosing this API require shared backing
+/// extents and must keep both paths on one reflink-capable filesystem.
+/// `destination` must not already exist. A failed clone removes the empty
+/// destination inode before returning.
+///
+/// # Errors
+///
+/// Returns an error when either path cannot be opened safely, `source` is not
+/// a regular file, the files are not on a reflink-capable filesystem, or the
+/// destination metadata cannot be finalized.
+#[doc(hidden)]
+pub fn reflink_file_required(
+    source: impl AsRef<std::path::Path>,
+    destination: impl AsRef<std::path::Path>,
+) -> anyhow::Result<u64> {
+    use anyhow::Context as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let source = source.as_ref();
+    let destination = destination.as_ref();
+    let source_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(source)
+        .with_context(|| format!("open strict reflink source {}", source.display()))?;
+    let source_metadata = source_file
+        .metadata()
+        .with_context(|| format!("stat strict reflink source {}", source.display()))?;
+    anyhow::ensure!(
+        source_metadata.is_file(),
+        "strict reflink source is not a regular file: {}",
+        source.display(),
+    );
+    let destination_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(destination)
+        .with_context(|| {
+            format!(
+                "create strict reflink destination {}",
+                destination.display(),
+            )
+        })?;
+    if let Err(error) = crate::reflink::ficlone(&destination_file, &source_file) {
+        drop(destination_file);
+        let _ = std::fs::remove_file(destination);
+        return Err(error).with_context(|| {
+            format!(
+                "FICLONE is required for cached COW persistence {} -> {}; place both paths on the same reflink-capable filesystem",
+                source.display(),
+                destination.display(),
+            )
+        });
+    }
+    if let Err(error) = destination_file.set_permissions(source_metadata.permissions()) {
+        drop(destination_file);
+        let _ = std::fs::remove_file(destination);
+        return Err(error).with_context(|| {
+            format!(
+                "preserve strict reflink destination permissions {}",
+                destination.display(),
+            )
+        });
+    }
+    match destination_file.metadata() {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) => {
+            drop(destination_file);
+            let _ = std::fs::remove_file(destination);
+            Err(error).with_context(|| {
+                format!(
+                    "stat strict reflink destination {}",
+                    destination.display(),
+                )
+            })
+        }
+    }
+}
+
 /// Cache root for the `cargo ktstr affected` per-scheduler input-set cache.
 ///
 /// Exposed as `pub` (unlike the crate-internal

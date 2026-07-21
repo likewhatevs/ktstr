@@ -2600,10 +2600,10 @@ impl StagedProfraw {
         };
         if merged_profdata.is_file() {
             let destination = directory.path().join("merged.profdata");
-            if let Err(error) = std::fs::copy(merged_profdata, &destination) {
+            if let Err(error) = ktstr::cache::reflink_file_required(merged_profdata, &destination) {
                 let retained = directory.keep(&self.recovery_parent);
                 return Err(format!(
-                    "preserve merged coverage profile {} -> {}: {error}; raw shards retained at {}",
+                    "preserve merged coverage profile as a strict COW clone {} -> {}: {error:#}; raw shards retained at {}",
                     merged_profdata.display(),
                     destination.display(),
                     retained.display(),
@@ -7975,6 +7975,8 @@ path = "junit.xml"
 
     #[test]
     fn cached_coverage_failure_persists_raw_and_merged_profiles() {
+        use std::os::unix::fs::MetadataExt as _;
+
         let root = tempfile::tempdir().expect("coverage recovery fixture");
         let profiles = root.path().join("profiles");
         let recovery = root.path().join("recovery");
@@ -7998,6 +8000,52 @@ path = "junit.xml"
         assert_eq!(
             std::fs::read(retained.join("merged.profdata")).unwrap(),
             b"merged-profile",
+        );
+        let source_identity = std::fs::metadata(&merged).unwrap();
+        let retained_identity = std::fs::metadata(retained.join("merged.profdata")).unwrap();
+        assert_eq!(
+            source_identity.dev(),
+            retained_identity.dev(),
+            "strict recovery reflinks stay on the cache filesystem",
+        );
+        assert_ne!(
+            source_identity.ino(),
+            retained_identity.ino(),
+            "the retained profile must be an independent COW inode",
+        );
+        std::fs::write(retained.join("merged.profdata"), b"private-write").unwrap();
+        assert_eq!(
+            std::fs::read(&merged).unwrap(),
+            b"merged-profile",
+            "writes to the retained COW inode must not alter the live merged profile",
+        );
+    }
+
+    #[test]
+    fn cached_coverage_failure_survives_deleted_merged_profile() {
+        let root = tempfile::tempdir().expect("coverage deletion recovery fixture");
+        let profiles = root.path().join("profiles");
+        let recovery = root.path().join("recovery");
+        std::fs::create_dir(&profiles).unwrap();
+        let raw = profiles.join("runtime.profraw");
+        let merged = profiles.join("workspace.profdata");
+        std::fs::write(&raw, b"runtime-raw").unwrap();
+        std::fs::write(&merged, b"merged-profile").unwrap();
+
+        let staged = stage_profraw_for_report_in(&profiles, recovery).unwrap();
+        std::fs::remove_file(&merged).unwrap();
+        let retained = staged
+            .persist(&merged)
+            .unwrap()
+            .expect("raw recovery remains useful after merged-profile deletion");
+
+        assert_eq!(
+            std::fs::read(retained.join("runtime.profraw")).unwrap(),
+            b"runtime-raw",
+        );
+        assert!(
+            !retained.join("merged.profdata").exists(),
+            "a deleted merged profile is not recreated from stale state",
         );
     }
 
