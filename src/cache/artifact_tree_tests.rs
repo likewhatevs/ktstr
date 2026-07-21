@@ -120,7 +120,7 @@ fn large_source_capture_bounds_pinned_descriptor_ownership() {
     let cache = ArtifactTreeCache::new(temp.path().join("records"));
     let tree = cache
         .load_or_build(
-            0xfd_b0_001,
+            0x0fdb_0001,
             &temp.path().join("materializations"),
             "bounded-descriptor-test",
             || Ok(true),

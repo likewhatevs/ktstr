@@ -544,7 +544,12 @@ fn normalized_argument(argument: &str, source: &SourceLayout) -> Vec<u8> {
 fn source_path_is_excluded(root: &Path, path: &Path, outputs: &[PathBuf]) -> bool {
     outputs
         .iter()
-        .any(|output| path == output || path.starts_with(output))
+        // An output can only exclude source files when the output is inside
+        // this source root.  Stable scheduler discovery deliberately plans a
+        // second source closure from a workspace inside ktstr's cache.  In
+        // that case the cache root is an ancestor of the source root, not an
+        // output contained by it, and must not exclude the source itself.
+        .any(|output| output.starts_with(root) && (path == output || path.starts_with(output)))
         || path.strip_prefix(root).ok().is_some_and(|relative| {
             relative.components().any(|component| {
                 component.as_os_str() == ".git"
@@ -3150,6 +3155,110 @@ rustflags = ['-C', 'target-cpu=x86-64-v3']\n",
 
         let paths = non_git_source_input_paths(&root, &[target, cache]).unwrap();
         assert_eq!(paths, BTreeSet::from([PathBuf::from("src/lib.rs")]));
+    }
+
+    #[test]
+    fn stable_source_can_resnapshot_nested_scheduler_workspace_inside_cache() {
+        let _environment = lock_env();
+        let checkout = std::env::current_dir().unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix(".ktstr-nested-stable-source-")
+            .tempdir_in(checkout.parent().unwrap())
+            .unwrap();
+        let cache = temp.path().join("cache");
+        let _cache = EnvVarGuard::set(ktstr::KTSTR_CACHE_DIR_ENV, &cache);
+        let repository = temp.path().join("repository");
+        std::fs::create_dir_all(repository.join("scheduler/src")).unwrap();
+        let git_init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repository)
+            .env("GIT_DIR", repository.join(".git"))
+            .env("GIT_WORK_TREE", &repository)
+            .output()
+            .unwrap();
+        assert!(
+            git_init.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&git_init.stderr),
+        );
+        assert!(repository.join(".git").is_dir());
+        std::fs::write(
+            repository.join("Cargo.toml"),
+            b"[workspace]\nmembers = ['scheduler']\nresolver = '3'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repository.join("scheduler/Cargo.toml"),
+            b"[package]\nname = 'scheduler'\nversion = '0.1.0'\nedition = '2024'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repository.join("scheduler/src/lib.rs"),
+            b"pub fn scheduler() {}\n",
+        )
+        .unwrap();
+        let metadata = cargo_metadata::MetadataCommand::new()
+            .manifest_path(repository.join("Cargo.toml"))
+            .exec()
+            .unwrap();
+        assert!(repository.join("Cargo.lock").is_file());
+        git_output(&repository, &["add", "."]);
+        let first = plan_source_layout(
+            &metadata,
+            &[metadata.target_directory.as_std_path().to_path_buf()],
+            &[],
+            &repository,
+        )
+        .unwrap();
+        let first = materialize_stable_source(&first, "outer stable-source fixture").unwrap();
+        let stable_scheduler = first.workspace_root.join("scheduler");
+        assert!(stable_scheduler.join("Cargo.toml").is_file());
+        assert!(first.workspace_root.join("Cargo.lock").is_file());
+
+        let scheduler_metadata = cargo_metadata::MetadataCommand::new()
+            .manifest_path(stable_scheduler.join("Cargo.toml"))
+            .no_deps()
+            .exec()
+            .unwrap();
+        let second = plan_source_layout(
+            &scheduler_metadata,
+            &[scheduler_metadata
+                .target_directory
+                .as_std_path()
+                .to_path_buf()],
+            &[],
+            scheduler_metadata.workspace_root.as_std_path(),
+        )
+        .unwrap();
+        let nested_root = second
+            .roots
+            .iter()
+            .find(|root| root.source.starts_with(&cache))
+            .unwrap_or_else(|| {
+                panic!(
+                    "nested source plan escaped its cache tree: {:?}",
+                    second
+                        .roots
+                        .iter()
+                        .map(|root| &root.source)
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(nested_root.input_paths.contains(Path::new("Cargo.toml")));
+        assert!(
+            nested_root
+                .input_paths
+                .contains(Path::new("scheduler/Cargo.toml"))
+        );
+
+        let second = materialize_stable_source(&second, "nested stable-source fixture").unwrap();
+        assert!(second.workspace_root.join("Cargo.toml").is_file());
+        assert!(second.workspace_root.join("scheduler/Cargo.toml").is_file());
+        cargo_metadata::MetadataCommand::new()
+            .manifest_path(second.workspace_root.join("scheduler/Cargo.toml"))
+            .no_deps()
+            .exec()
+            .unwrap();
     }
 
     #[test]

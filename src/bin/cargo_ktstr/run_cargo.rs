@@ -2560,6 +2560,7 @@ pub(crate) fn load_or_build_nextest_artifacts(
             command,
             cli_label,
             "nextest binary-only build with reusable artifact capture",
+            crate::reserved_build_progress::ReservedBuildOutputKind::Opaque,
             output_target,
             |build| {
                 if !build.status.success() {
@@ -3971,10 +3972,14 @@ fn run_prepared_reserved_build_output(
     command: Command,
     cli_label: &str,
     description: &str,
+    output_kind: crate::reserved_build_progress::ReservedBuildOutputKind,
 ) -> Result<std::process::Output, String> {
     tracing::debug!("{cli_label}: reserved {description}");
-    let progress =
-        crate::reserved_build_progress::ReservedBuildProgress::start(cli_label, description);
+    let progress = crate::reserved_build_progress::ReservedBuildProgress::start(
+        cli_label,
+        description,
+        output_kind,
+    );
     let output = crate::interrupt::run_output_observed(command, progress)
         .map_err(|error| format!("{cli_label}: spawn {description}: {error}"))?;
     if let Err(error) = persist_reserved_build_diagnostics(&output, cli_label, description) {
@@ -4098,6 +4103,7 @@ pub(crate) fn run_reserved_build_output_under_lease<T>(
     mut command: Command,
     cli_label: &str,
     description: &str,
+    output_kind: crate::reserved_build_progress::ReservedBuildOutputKind,
     target_dir: &std::path::Path,
     postprocess: impl FnOnce(&std::process::Output) -> Result<T, String>,
 ) -> Result<T, String> {
@@ -4114,7 +4120,7 @@ pub(crate) fn run_reserved_build_output_under_lease<T>(
         target_dir = %lease.target_dir().display(),
         "{cli_label}: acquired Cargo build-output ownership",
     );
-    let output = run_prepared_reserved_build_output(command, cli_label, description)?;
+    let output = run_prepared_reserved_build_output(command, cli_label, description, output_kind)?;
     let processed = postprocess(&output);
     drop(reservation);
     drop(lease);
@@ -4146,6 +4152,7 @@ pub(crate) fn run_reserved_prebuild_collect_test_bins(
         warm_cmd,
         cli_label,
         "selected test-binary compile with Cargo artifact capture",
+        crate::reserved_build_progress::ReservedBuildOutputKind::CargoJson,
         target_dir,
         |output| {
             if !output.status.success() {

@@ -1678,6 +1678,7 @@ fn build_scheduler_workspace(
                 command,
                 cli_label,
                 "scheduler workspace pre-build",
+                crate::reserved_build_progress::ReservedBuildOutputKind::CargoJson,
                 &stable_build.target_directory,
                 |output| {
                     if !output.status.success() {

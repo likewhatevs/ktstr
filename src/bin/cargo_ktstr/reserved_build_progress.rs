@@ -1,14 +1,20 @@
-//! Live progress for reserved Cargo JSON builds.
+//! Live progress for reserved build children.
 //!
-//! Cargo's machine-readable output remains captured byte-for-byte by the
-//! interruptible child runner. This module observes both streams because
-//! wrappers such as `cargo llvm-cov` forward nested Cargo JSON on stderr. It
-//! incrementally counts completed `compiler-artifact` messages and records
-//! Cargo's `build-finished` phase. The count is completion-based: a plateau
-//! means Cargo still has one or more compiler/linker jobs in flight that have
-//! not emitted their artifact record yet, not that artifact discovery is
-//! walking targets serially. Machine records on stderr are consumed from the
-//! live display while ordinary diagnostics are forwarded unchanged.
+//! Cargo-JSON children retain their machine-readable output byte-for-byte in
+//! the interruptible child runner while this module observes both streams.
+//! Wrappers such as `cargo llvm-cov` can forward nested Cargo JSON on stderr,
+//! so that mode incrementally counts completed `compiler-artifact` messages
+//! and records Cargo's `build-finished` phase. The count is completion-based:
+//! a plateau means Cargo still has one or more compiler/linker jobs in flight
+//! that have not emitted their artifact record yet, not that artifact
+//! discovery is walking targets serially. Machine records on stderr are
+//! consumed from the live display while ordinary diagnostics are forwarded
+//! unchanged.
+//!
+//! Opaque children, notably `cargo nextest list --message-format=json`, use
+//! stdout for a different machine protocol. Their progress reports elapsed
+//! time and process outcome only, forwards stderr exactly, and leaves stdout
+//! untouched for the caller's authoritative parser.
 
 use std::io::IsTerminal;
 use std::io::Write;
@@ -29,6 +35,16 @@ type ByteEmitter = Box<dyn FnMut(&[u8]) + Send>;
 enum ProgressTarget {
     Tty(ProgressBar),
     Plain(PlainEmitter),
+}
+
+/// Machine-output contract of one reserved build child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReservedBuildOutputKind {
+    /// Newline-delimited Cargo messages may arrive on either stream.
+    CargoJson,
+    /// Stdout belongs to another protocol; only elapsed time and exit status
+    /// are meaningful to the generic progress reporter.
+    Opaque,
 }
 
 /// Synchronous progress for the admission wait that precedes a reserved build.
@@ -157,10 +173,11 @@ impl Drop for ReservationWaitProgress {
     }
 }
 
-/// An observer for the otherwise-silent reserved Cargo pre-builds.
+/// An observer for otherwise-silent reserved build children.
 pub(crate) struct ReservedBuildProgress {
     label: String,
     description: String,
+    output_kind: ReservedBuildOutputKind,
     started: Instant,
     next_heartbeat: Instant,
     heartbeat_interval: Duration,
@@ -179,7 +196,11 @@ impl ReservedBuildProgress {
     /// A TTY gets an indicatif spinner whose message includes the current
     /// Cargo phase and artifact count. CI gets a plain start line immediately
     /// and one escape-free heartbeat at least every ten seconds thereafter.
-    pub(crate) fn start(cli_label: &str, description: &str) -> Self {
+    pub(crate) fn start(
+        cli_label: &str,
+        description: &str,
+        output_kind: ReservedBuildOutputKind,
+    ) -> Self {
         let label = escape_free(cli_label);
         let description = escape_free(description);
         let started = Instant::now();
@@ -196,6 +217,7 @@ impl ReservedBuildProgress {
                 let mut progress = Self {
                     label,
                     description,
+                    output_kind,
                     started,
                     next_heartbeat: started + HEARTBEAT_INTERVAL,
                     heartbeat_interval: HEARTBEAT_INTERVAL,
@@ -217,6 +239,7 @@ impl ReservedBuildProgress {
         Self::plain(
             label,
             description,
+            output_kind,
             started,
             HEARTBEAT_INTERVAL,
             Box::new(|line| {
@@ -229,6 +252,7 @@ impl ReservedBuildProgress {
     fn plain(
         label: String,
         description: String,
+        output_kind: ReservedBuildOutputKind,
         started: Instant,
         heartbeat_interval: Duration,
         mut emit: PlainEmitter,
@@ -238,6 +262,7 @@ impl ReservedBuildProgress {
         Self {
             label,
             description,
+            output_kind,
             started,
             next_heartbeat: started + heartbeat_interval,
             heartbeat_interval,
@@ -252,6 +277,9 @@ impl ReservedBuildProgress {
     }
 
     fn phase(&self) -> &'static str {
+        if self.output_kind == ReservedBuildOutputKind::Opaque {
+            return "running";
+        }
         match self.cargo_finished {
             None => "building",
             Some(true) => "cargo build finished",
@@ -268,13 +296,18 @@ impl ReservedBuildProgress {
     }
 
     fn tty_message(&self) -> String {
-        format!(
-            "{}: {} — {}; {} Cargo artifacts completed",
-            self.label,
-            self.description,
-            self.phase(),
-            self.artifacts,
-        )
+        match self.output_kind {
+            ReservedBuildOutputKind::CargoJson => format!(
+                "{}: {} — {}; {} Cargo artifacts completed",
+                self.label,
+                self.description,
+                self.phase(),
+                self.artifacts,
+            ),
+            ReservedBuildOutputKind::Opaque => {
+                format!("{}: {} — running", self.label, self.description)
+            }
+        }
     }
 
     fn refresh_tty(&mut self) {
@@ -309,6 +342,12 @@ impl ReservedBuildProgress {
     }
 
     fn observe_bytes(&mut self, bytes: &[u8], stderr: bool) {
+        if self.output_kind == ReservedBuildOutputKind::Opaque {
+            if stderr {
+                (self.stderr_tee)(bytes);
+            }
+            return;
+        }
         let complete = {
             let partial = if stderr {
                 &mut self.partial_stderr_line
@@ -336,6 +375,11 @@ impl ReservedBuildProgress {
     }
 
     fn consume_trailing_lines(&mut self) {
+        if self.output_kind == ReservedBuildOutputKind::Opaque {
+            debug_assert!(self.partial_stdout_line.is_empty());
+            debug_assert!(self.partial_stderr_line.is_empty());
+            return;
+        }
         let stdout = std::mem::take(&mut self.partial_stdout_line);
         let stderr = std::mem::take(&mut self.partial_stderr_line);
         if stdout.is_empty() && stderr.is_empty() {
@@ -354,15 +398,23 @@ impl ReservedBuildProgress {
     }
 
     fn heartbeat_line(&self, now: Instant) -> String {
-        format!(
-            "{}: {} — {}; elapsed={}; cargo-artifacts-completed={}; build-finished={}",
-            self.label,
-            self.description,
-            self.phase(),
-            format_elapsed(now.saturating_duration_since(self.started)),
-            self.artifacts,
-            self.cargo_finished_label(),
-        )
+        match self.output_kind {
+            ReservedBuildOutputKind::CargoJson => format!(
+                "{}: {} — {}; elapsed={}; cargo-artifacts-completed={}; build-finished={}",
+                self.label,
+                self.description,
+                self.phase(),
+                format_elapsed(now.saturating_duration_since(self.started)),
+                self.artifacts,
+                self.cargo_finished_label(),
+            ),
+            ReservedBuildOutputKind::Opaque => format!(
+                "{}: {} — running; elapsed={}",
+                self.label,
+                self.description,
+                format_elapsed(now.saturating_duration_since(self.started)),
+            ),
+        }
     }
 
     fn tick_at(&mut self, now: Instant) {
@@ -391,16 +443,25 @@ impl ReservedBuildProgress {
         } else {
             "failed"
         };
-        format!(
-            "{}: {outcome} {} in {}; cargo-artifacts-completed={}; \
-             build-finished={}; exit={}",
-            self.label,
-            self.description,
-            format_elapsed(self.started.elapsed()),
-            self.artifacts,
-            self.cargo_finished_label(),
-            exit_label(status),
-        )
+        match self.output_kind {
+            ReservedBuildOutputKind::CargoJson => format!(
+                "{}: {outcome} {} in {}; cargo-artifacts-completed={}; \
+                 build-finished={}; exit={}",
+                self.label,
+                self.description,
+                format_elapsed(self.started.elapsed()),
+                self.artifacts,
+                self.cargo_finished_label(),
+                exit_label(status),
+            ),
+            ReservedBuildOutputKind::Opaque => format!(
+                "{}: {outcome} {} in {}; exit={}",
+                self.label,
+                self.description,
+                format_elapsed(self.started.elapsed()),
+                exit_label(status),
+            ),
+        }
     }
 
     fn finish_status(&mut self, status: &ExitStatus) {
@@ -415,16 +476,25 @@ impl ReservedBuildProgress {
 
     fn finish_error(&mut self, error: &std::io::Error) {
         self.consume_trailing_lines();
-        let message = format!(
-            "{}: failed {} after {}; cargo-artifacts-completed={}; \
-             build-finished={}; error={}",
-            self.label,
-            self.description,
-            format_elapsed(self.started.elapsed()),
-            self.artifacts,
-            self.cargo_finished_label(),
-            escape_free(&error.to_string()),
-        );
+        let message = match self.output_kind {
+            ReservedBuildOutputKind::CargoJson => format!(
+                "{}: failed {} after {}; cargo-artifacts-completed={}; \
+                 build-finished={}; error={}",
+                self.label,
+                self.description,
+                format_elapsed(self.started.elapsed()),
+                self.artifacts,
+                self.cargo_finished_label(),
+                escape_free(&error.to_string()),
+            ),
+            ReservedBuildOutputKind::Opaque => format!(
+                "{}: failed {} after {}; error={}",
+                self.label,
+                self.description,
+                format_elapsed(self.started.elapsed()),
+                escape_free(&error.to_string()),
+            ),
+        };
         match &mut self.target {
             ProgressTarget::Tty(bar) => bar.finish_with_message(message),
             ProgressTarget::Plain(emit) => emit(&message),
@@ -436,6 +506,7 @@ impl ReservedBuildProgress {
     fn plain_for_test(
         label: &str,
         description: &str,
+        output_kind: ReservedBuildOutputKind,
         started: Instant,
         heartbeat_interval: Duration,
         emit: PlainEmitter,
@@ -443,6 +514,7 @@ impl ReservedBuildProgress {
         Self::plain_for_test_with_stderr(
             label,
             description,
+            output_kind,
             started,
             heartbeat_interval,
             emit,
@@ -454,6 +526,7 @@ impl ReservedBuildProgress {
     fn plain_for_test_with_stderr(
         label: &str,
         description: &str,
+        output_kind: ReservedBuildOutputKind,
         started: Instant,
         heartbeat_interval: Duration,
         emit: PlainEmitter,
@@ -462,6 +535,7 @@ impl ReservedBuildProgress {
         Self::plain(
             escape_free(label),
             escape_free(description),
+            output_kind,
             started,
             heartbeat_interval,
             emit,
@@ -560,11 +634,24 @@ mod tests {
         started: Instant,
         heartbeat_interval: Duration,
     ) -> (ReservedBuildProgress, Arc<Mutex<Vec<String>>>) {
+        capture_kind(
+            ReservedBuildOutputKind::CargoJson,
+            started,
+            heartbeat_interval,
+        )
+    }
+
+    fn capture_kind(
+        output_kind: ReservedBuildOutputKind,
+        started: Instant,
+        heartbeat_interval: Duration,
+    ) -> (ReservedBuildProgress, Arc<Mutex<Vec<String>>>) {
         let lines = Arc::new(Mutex::new(Vec::new()));
         let output = Arc::clone(&lines);
         let progress = ReservedBuildProgress::plain_for_test(
             "cargo ktstr verifier",
             "reserved harness pre-build",
+            output_kind,
             started,
             heartbeat_interval,
             Box::new(move |line| output.lock().expect("capture lock").push(line.to_string())),
@@ -625,6 +712,76 @@ mod tests {
     }
 
     #[test]
+    fn opaque_progress_reports_elapsed_and_exit_without_cargo_fields() {
+        let started = Instant::now();
+        let (mut progress, lines) = capture_kind(
+            ReservedBuildOutputKind::Opaque,
+            started,
+            Duration::from_secs(10),
+        );
+
+        progress.tick_at(started + Duration::from_secs(10));
+        progress.finish_status(&ExitStatus::from_raw(0));
+
+        let lines = lines.lock().expect("lines");
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].contains("— running; elapsed=10.0s"));
+        let completion = lines.last().expect("completion");
+        assert!(completion.contains("completed reserved harness pre-build"));
+        assert!(completion.contains("exit=success"));
+        assert!(
+            lines.iter().all(|line| {
+                !line.contains("cargo-artifacts-completed") && !line.contains("build-finished")
+            }),
+            "opaque progress must not invent Cargo JSON state",
+        );
+    }
+
+    #[test]
+    fn opaque_progress_forwards_stderr_exactly_and_ignores_stdout_protocol() {
+        let started = Instant::now();
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let line_output = Arc::clone(&lines);
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let stderr_output = Arc::clone(&stderr);
+        let mut progress = ReservedBuildProgress::plain_for_test_with_stderr(
+            "cargo ktstr verifier",
+            "nextest binary-list build",
+            ReservedBuildOutputKind::Opaque,
+            started,
+            Duration::from_secs(10),
+            Box::new(move |line| {
+                line_output
+                    .lock()
+                    .expect("line capture lock")
+                    .push(line.to_string())
+            }),
+            Box::new(move |bytes| {
+                stderr_output
+                    .lock()
+                    .expect("stderr capture lock")
+                    .extend_from_slice(bytes)
+            }),
+        );
+
+        progress.observe_stdout(
+            b"{\"reason\":\"compiler-artifact\"}\n{\"reason\":\"build-finished\",\"success\":true}\n",
+        );
+        progress.observe_stderr(b"warning: live diagnostic\r\n{\"reason\":");
+        progress.observe_stderr(b"\"compiler-artifact\"}\ntrailing diagnostic");
+        progress.finish_status(&ExitStatus::from_raw(0));
+
+        assert_eq!(
+            *stderr.lock().expect("stderr bytes"),
+            b"warning: live diagnostic\r\n{\"reason\":\"compiler-artifact\"}\ntrailing diagnostic",
+            "opaque stderr is application output and must remain byte exact",
+        );
+        assert!(lines.lock().expect("lines").iter().all(|line| {
+            !line.contains("cargo-artifacts-completed") && !line.contains("build-finished")
+        }));
+    }
+
+    #[test]
     fn fragmented_json_updates_artifacts_and_preserves_build_phase() {
         let started = Instant::now();
         let (mut progress, lines) = capture(started, Duration::from_secs(10));
@@ -656,6 +813,7 @@ mod tests {
         let mut progress = ReservedBuildProgress::plain_for_test_with_stderr(
             "cargo ktstr verifier",
             "coverage harness pre-build",
+            ReservedBuildOutputKind::CargoJson,
             started,
             Duration::from_secs(10),
             Box::new(move |line| {
@@ -702,6 +860,7 @@ mod tests {
         let mut progress = ReservedBuildProgress::plain_for_test_with_stderr(
             "cargo ktstr verifier",
             "coverage harness pre-build",
+            ReservedBuildOutputKind::CargoJson,
             started,
             Duration::from_secs(10),
             Box::new(move |line| {
