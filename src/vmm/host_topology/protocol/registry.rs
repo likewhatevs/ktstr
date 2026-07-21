@@ -4748,6 +4748,79 @@ pub(super) fn exercise_prefix_refresh_after_predecessor_release_for_tests()
     ))
 }
 
+/// Reproduce a predecessor release after the coordinator planner returned
+/// WAITING but before that WAITING publication takes the registry fence.
+#[cfg(test)]
+pub(super) fn exercise_waiting_publication_release_progress_for_tests(
+) -> Result<(bool, bool, bool, bool)> {
+    let claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+    let mut predecessor = Ticket::register(claim.clone(), claim.clone(), None)?;
+    let mut coordinator = Ticket::register(claim.clone(), claim.clone(), None)?;
+
+    let commit_token = predecessor.commit_token_for_tests()?;
+    let held = match predecessor.finish_acquired(&claim, commit_token, &[], None)? {
+        FinishAcquireResult::Committed(held) => held,
+        FinishAcquireResult::Stale => {
+            anyhow::bail!("release-progress predecessor acquisition unexpectedly became stale")
+        }
+    };
+
+    let stale_prefix = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let record = table
+            .record(coordinator.slot)?
+            .filter(|record| {
+                record.ticket == coordinator.ticket && record.state == STATE_COORDINATOR
+            })
+            .ok_or_else(|| anyhow::anyhow!("release-progress successor was not coordinator"))?;
+        let (_, prefix) = table.cached_prefix(record.slot)?;
+        let stale_prefix = prefix.conflicts(&claim)?;
+
+        // Model the CI ordering: the physical close was already proven free
+        // while the conservative HELD record remained published. Its removal
+        // must make progress through the prefix rescan alone, without another
+        // lock-close observation.
+        set_cpu_free_for_tests(&mut table, 1, true)?;
+        write_u64(&mut table.header, H_PENDING_FLAGS, 0);
+        table.finish_claim_scan();
+        stale_prefix
+    };
+
+    drop(held);
+    let release_published_without_observation = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let table = Table::open_existing()?;
+        table.pending_flags() & PENDING_RESCAN != 0
+            && table.pending_flags() & PENDING_OBSERVATION == 0
+    };
+
+    let empty = BTreeSet::new();
+    let snapshot = coordinator.schedule(
+        Some(&claim),
+        &empty,
+        &empty,
+        &empty,
+        false,
+        &[],
+        &[],
+        false,
+        None,
+        false,
+        None,
+    )?;
+    let prefix_refreshed = !snapshot.predecessors.conflicts(&claim)?;
+    let immediate_step_without_observation = snapshot.should_step && snapshot.observation.is_none();
+
+    coordinator.finish(None)?;
+    Ok((
+        stale_prefix,
+        release_published_without_observation,
+        prefix_refreshed,
+        immediate_step_without_observation,
+    ))
+}
+
 #[cfg(test)]
 pub(super) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool, bool)> {
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);

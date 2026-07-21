@@ -3180,6 +3180,30 @@ fn predecessor_release_refreshes_an_already_runnable_replan_prefix() {
 }
 
 #[test]
+fn waiting_publication_preserves_consumed_predecessor_release_progress() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (stale_prefix, release_published, prefix_refreshed, immediate_step) =
+        protocol::exercise_waiting_publication_release_progress_for_tests()
+            .expect("exercise release during coordinator WAITING publication");
+    assert!(
+        stale_prefix && release_published,
+        "HELD removal must durably publish a prefix rescan even when availability was already free",
+    );
+    assert!(
+        prefix_refreshed && immediate_step,
+        "the WAITING publication must return refreshed predecessors as immediate planner progress without relying on another close event",
+    );
+    assert!(
+        protocol::waiting_publication_requires_immediate_turn_for_tests(true, false),
+        "consuming the one-shot prefix progress signal must skip the coordinator watch wait",
+    );
+    assert!(
+        !protocol::waiting_publication_requires_immediate_turn_for_tests(false, false),
+        "a quiescent WAITING publication must still sleep instead of spinning",
+    );
+}
+
+#[test]
 fn callback_cannot_consume_an_improvement_it_did_not_observe() {
     let _prefixes = LockPrefixesGuard::new();
     let (stale_rejected, fresh_seen, replacement_committed, serial_consumed_by_fresh) =

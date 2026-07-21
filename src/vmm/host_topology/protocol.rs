@@ -1559,6 +1559,20 @@ pub(crate) fn exercise_prefix_refresh_after_predecessor_release_for_tests()
 }
 
 #[cfg(test)]
+pub(crate) fn exercise_waiting_publication_release_progress_for_tests(
+) -> Result<(bool, bool, bool, bool)> {
+    registry::exercise_waiting_publication_release_progress_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn waiting_publication_requires_immediate_turn_for_tests(
+    should_step: bool,
+    observation_pending: bool,
+) -> bool {
+    waiting_publication_requires_immediate_turn(should_step, observation_pending)
+}
+
+#[cfg(test)]
 pub(crate) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool, bool)> {
     registry::exercise_issue_serial_race_for_tests()
 }
@@ -1931,15 +1945,16 @@ pub(crate) fn try_activate_pending_once<T>(
     let expected_preparation = preparation.claim();
     let reusable_permits = preparation.clone_permit_fds()?;
     let activated = ticket.try_activate_pending_once(&expected_preparation, move |registry| {
-        let probe = PendingOneShotProbe {
-            registry,
-            reusable_permits: &reusable_permits,
+        let result = {
+            let probe = PendingOneShotProbe {
+                registry,
+                reusable_permits: &reusable_permits,
+            };
+            attempt(&probe)
         };
-        let result = attempt(&probe);
         // The acquired payload owns clones of every reused OFD it needs. Drop
         // both preparation copies while registry EX still excludes new
         // publications, before the record is promoted to exact HELD.
-        drop(probe);
         drop(reusable_permits);
         drop(preparation);
         result
@@ -2650,9 +2665,22 @@ fn acquire_as_coordinator_impl<T>(
                     )?;
                     drop(contention);
                     let observe_before_sleep = snapshot.observation.is_some();
+                    let retry_before_sleep = waiting_publication_requires_immediate_turn(
+                        snapshot.should_step,
+                        observe_before_sleep,
+                    );
                     liveness_deadline = std::time::Instant::now() + snapshot.liveness_due_in;
                     watched_resources = snapshot.watch;
-                    if observe_before_sleep {
+                    if retry_before_sleep {
+                        // A predecessor can release after this coordinator's
+                        // planner callback but before the WAITING publication
+                        // above takes the registry fence. That schedule turn
+                        // consumes PENDING_RESCAN and refreshes the cached
+                        // prefix. Preserve its one-shot progress signal instead
+                        // of sleeping after the notification was already
+                        // consumed. The next outer turn installs a coherent
+                        // snapshot before invoking the planner again.
+                        force_step |= snapshot.should_step;
                         first = false;
                         pending_events = LockDirEvents::default();
                         continue;
@@ -2704,6 +2732,13 @@ fn acquire_as_coordinator_impl<T>(
         }
     };
     Ok(outcome)
+}
+
+fn waiting_publication_requires_immediate_turn(
+    should_step: bool,
+    observation_pending: bool,
+) -> bool {
+    should_step || observation_pending
 }
 
 /// Canonical global lock order for a resource set: LLC locks by
