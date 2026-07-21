@@ -4126,6 +4126,19 @@ fn permit_only_claim(selection: &PermitSelection) -> protocol::ClaimSet {
     )
 }
 
+/// Remove permit ownership already carried by this process before consulting
+/// the cross-process registry. A fully owned candidate has no external
+/// resource delta and is therefore ready without an empty-claim registry
+/// query; empty claims are deliberately invalid as queue designations.
+fn claim_without_owned_permits(
+    candidate: &protocol::ClaimSet,
+    owned: &std::collections::BTreeSet<usize>,
+) -> Option<protocol::ClaimSet> {
+    let mut external = candidate.clone();
+    external.permits.retain(|permit| !owned.contains(permit));
+    (!external.is_empty()).then_some(external)
+}
+
 fn select_admission_permits(
     kind: PermitAdmission,
     pool: &AdmissionPermitPool,
@@ -4307,6 +4320,9 @@ fn select_vm_permits(
         permits: selection.all_permits(),
         admission_class: selection.admission_class,
     };
+    if combined.permits.is_empty() {
+        return Ok(Some(selection));
+    }
     ready(&permit_only_claim(&combined)).map(|is_ready| is_ready.then_some(selection))
 }
 
@@ -4418,8 +4434,9 @@ impl VmPermitPool {
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
         let selected = self.select(|candidate| {
-            let mut external = candidate.clone();
-            external.permits.retain(|permit| !owned.contains(permit));
+            let Some(external) = claim_without_owned_permits(candidate, &owned) else {
+                return Ok(true);
+            };
             snapshot.conflicts(&external).map(|busy| !busy)
         })?;
         if selected.is_some() {
@@ -4973,10 +4990,10 @@ where
                     // to the machine aggregate. They are this process's
                     // already-held OFDs, not external contention; exact probe
                     // reuses them and retains any surplus until HELD.
-                    let mut external = candidate.clone();
-                    external
-                        .permits
-                        .retain(|permit| !preparation_owned.contains(permit));
+                    let Some(external) = claim_without_owned_permits(candidate, &preparation_owned)
+                    else {
+                        return Ok(true);
+                    };
                     permit_snapshot.conflicts(&external).map(|busy| !busy)
                 },
             )?
@@ -5816,6 +5833,15 @@ pub fn plan_llc_selection_only(
             exclusive_held: false,
         })
         .collect();
+    if snapshots.is_empty() {
+        return Err(ResourceContention {
+            reason: format!(
+                "no host LLC overlaps the process's {}-CPU allowed set — sysfs LLC groups and sched_getaffinity disagree",
+                allowed.len()
+            ),
+        }
+        .into());
+    }
     let cpu_states = allowed
         .iter()
         .copied()

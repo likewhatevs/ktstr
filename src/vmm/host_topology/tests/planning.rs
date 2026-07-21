@@ -1494,8 +1494,11 @@ fn live_ex_holder_uses_fresh_holder_diagnostics_not_registered_claim_error() {
 #[test]
 fn acquire_llc_plan_wait_phase_acquires_beyond_the_seam() {
     let _llc_prefix = LlcLockPrefixGuard::new();
-    let _allowed = AllowedCpusGuard::new(vec![93700]);
-    let topo = synth_host_topo(&[(vec![93700], 0)]);
+    // Queue-registry CPU identities are real host CPU indices and therefore
+    // live below `/sys/devices/system/cpu/possible`. The per-test lock prefix
+    // already provides isolation, so use a valid low synthetic identity here.
+    let _allowed = AllowedCpusGuard::new(vec![0]);
+    let topo = synth_host_topo(&[(vec![0], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(1, 1);
 
     let counter = std::cell::Cell::new(0u32);
@@ -1972,6 +1975,62 @@ fn cooperative_permits_admit_four_host_width_claims_and_reject_a_fifth() {
 }
 
 #[test]
+fn owned_or_absent_permits_never_issue_an_empty_registry_query() {
+    let pool = AdmissionPermitPool::for_host(1);
+    let callback_count = std::cell::Cell::new(0usize);
+    let selection = select_vm_permits(
+        PermitAdmission::None,
+        &pool,
+        None,
+        1,
+        1,
+        0,
+        0,
+        0,
+        &[],
+        &[],
+        |candidate| {
+            callback_count.set(callback_count.get() + 1);
+            assert!(
+                !candidate.is_empty(),
+                "registry readiness callbacks require a real resource claim",
+            );
+            Ok(true)
+        },
+    )
+    .expect("select a permitless admission shape")
+    .expect("permitless admission remains available");
+    assert!(selection.all_permits().is_empty());
+    assert_eq!(
+        callback_count.get(),
+        0,
+        "a permitless selection has no registry resource delta to query",
+    );
+
+    let candidate = permit_only_claim(&PermitSelection {
+        permits: vec![11],
+        admission_class: admission_protocol::AdmissionClass::Ordinary,
+    });
+    assert!(
+        claim_without_owned_permits(&candidate, &std::collections::BTreeSet::from([11usize]))
+            .is_none(),
+        "a fully reused preparation permit has no external contention claim",
+    );
+    let external = claim_without_owned_permits(
+        &permit_only_claim(&PermitSelection {
+            permits: vec![11, 12],
+            admission_class: admission_protocol::AdmissionClass::Ordinary,
+        }),
+        &std::collections::BTreeSet::from([11usize]),
+    )
+    .expect("a non-owned permit remains externally visible");
+    assert_eq!(
+        external.permits,
+        std::collections::BTreeSet::from([12usize])
+    );
+}
+
+#[test]
 fn build_permits_are_bounded_but_never_blocked_by_live_default_borrowers() {
     let cooperative = AdmissionPermitPool::for_host(8);
     let borrowed = cooperative
@@ -2248,7 +2307,7 @@ fn elastic_build_uses_shared_capacity_when_no_cpu_is_unshared() {
 /// An elastic build must start immediately on every currently compatible CPU
 /// instead of joining the fixed-budget queue. Two exact VM-shaped holders own
 /// CPUs/LLCs 0 and 1; a 3-CPU build therefore contracts to the two free CPUs,
-/// carries matching SH locks, and reports `-j2`.
+/// carries matching SH locks plus build permits, and reports `-j2`.
 #[test]
 fn elastic_build_plan_takes_largest_immediately_available_subset() {
     let _prefixes = LockPrefixesGuard::new();
@@ -2271,7 +2330,16 @@ fn elastic_build_plan_takes_largest_immediately_available_subset() {
             .expect("two free CPUs must start an elastic three-CPU-max build");
     assert_eq!(plan.locked_llcs, vec![2, 3]);
     assert_eq!(plan.cpus, vec![2, 3]);
-    assert_eq!(plan.locks.len(), 4, "one LLC and CPU SH lock per CPU");
+    assert_eq!(
+        plan.permits.len(),
+        plan.cpus.len(),
+        "elastic width is bounded by one build permit per admitted CPU",
+    );
+    assert_eq!(
+        plan.locks.len(),
+        plan.locked_llcs.len() + plan.cpus.len() + plan.permits.len(),
+        "the elastic build retains its LLC, CPU, and build-permit ownership",
+    );
     assert_eq!(
         make_jobs_for_plan(&plan),
         2,
