@@ -414,19 +414,18 @@ s32 BPF_STRUCT_OPS(ktstr_select_cpu, struct task_struct *p,
 void BPF_STRUCT_OPS(ktstr_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	__sync_fetch_and_add(&nr_enqueued, 1);
-	/* A stall must trap only the workload's SCHED_NORMAL tasks — never
-	 * kernel threads. In full-switch mode (no SCX_OPS_SWITCH_PARTIAL)
-	 * scx-ktstr owns every SCHED_NORMAL task, INCLUDING the kworker that
-	 * runs the sched_ext runnable-timeout watchdog
-	 * (scx_watchdog_workfn on system_unbound_wq). Parking that kworker in
-	 * SHARED_DSQ under the `if (stall) return` dispatch guard stalls the
-	 * watchdog itself, so it never runs to observe the stalled workload
-	 * and SCX_EXIT_ERROR_STALL never fires — the stall is silently
-	 * suppressed on a quiet host where no other activity keeps the
-	 * watchdog kworker off scx's DSQs. Keep kthreads on a local DSQ so
-	 * the watchdog kworker (and other kernel machinery) keeps running and
-	 * fires deterministically on the parked workload task. */
-	if (stall && (p->flags & PF_KTHREAD)) {
+	/* Kernel threads must never enter SHARED_DSQ. In full-switch mode (no
+	 * SCX_OPS_SWITCH_PARTIAL) scx-ktstr owns every SCHED_NORMAL task,
+	 * INCLUDING the kworker that runs the sched_ext runnable-timeout
+	 * watchdog (scx_watchdog_workfn on the kernel's default/unbound
+	 * workqueue, depending on kernel version). A watchdog
+	 * kworker may already be queued before `stall` flips; gating this
+	 * route on `stall` strands that pre-existing task in SHARED_DSQ under
+	 * ktstr_dispatch's stall guard, preventing the watchdog from observing
+	 * the stalled workload. Routing every kthread locally keeps kernel
+	 * machinery runnable across the transition while workload tasks retain
+	 * the selected shared/scattershot/degrade behavior below. */
+	if (p->flags & PF_KTHREAD) {
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
 		return;
 	}
