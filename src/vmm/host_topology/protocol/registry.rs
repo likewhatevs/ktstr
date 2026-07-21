@@ -22,8 +22,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ17");
-const VERSION: u32 = 17;
+const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ18");
+const VERSION: u32 = 18;
 const HEADER_FIXED: usize = 256;
 const HEADER_ALIGN: usize = 4096;
 const RECORD_FIXED: usize = 192;
@@ -32,8 +32,8 @@ const RECORDS_PER_CHUNK: usize = 64;
 const NONE_SLOT: u64 = u64::MAX;
 const MAX_RESOURCE_BITS: usize = 1 << 20;
 const MAX_REGISTRY_SLOTS: u64 = 1 << 16;
-const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v17-init-";
-const LIVENESS_PREFIX: &str = "ktstr-acquire-v17-slot-";
+const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v18-init-";
+const LIVENESS_PREFIX: &str = "ktstr-acquire-v18-slot-";
 const LIVENESS_SEPARATOR: &str = "-ticket-";
 const LIVENESS_SUFFIX: &str = ".live";
 const WAIT_DIAGNOSTIC_BUCKET_SECS: u64 = 30;
@@ -220,11 +220,11 @@ const STATE_HELD: u32 = 5;
 /// successor. Its logical reservation is parked until it is elected again;
 /// physical flock modes remain the final compatibility fence.
 const STATE_COORDINATOR_STANDBY: u32 = 6;
-/// A same-PID pre-exec arrival marker. Pending records carry the bounded
-/// preparation CPU/memory/token/physical-CPU footprint and enter predecessor
-/// aggregates, but remain ineligible for coordinator election. Activation
-/// atomically replaces that footprint with one complete ready claim after
-/// immutable VM artifacts have been prepared.
+/// A same-PID pre-exec arrival marker. Pending records claim the bounded
+/// preparation CPU/memory/token/physical-CPU footprint and retain the selected
+/// final intent in their watch, but remain ineligible for coordinator election.
+/// Activation atomically replaces both with one complete ready claim/watch
+/// after immutable VM artifacts have been prepared.
 const STATE_PENDING: u32 = 7;
 
 const BLOCK_NONE: u32 = 0;
@@ -799,9 +799,9 @@ impl HeldClaim {
 
 /// Rebuild the sole owner of a PENDING record after a same-PID exec. The
 /// inherited liveness fd is checked against both the record identity and the
-/// canonical liveness inode. The transferred preparation OFDs must remain
-/// covered by the authoritative combined final+preparation claim before it is
-/// accepted as RAII authority.
+/// canonical liveness inode. The record's exact claim must still be the
+/// transferred physical preparation footprint; its watch retains the selected
+/// final intent without sequestering those not-yet-owned run resources.
 pub(super) fn import_pending_exec_handoff(
     slot: u64,
     ticket: u64,
@@ -832,12 +832,12 @@ pub(super) fn import_pending_exec_handoff(
         std::process::id(),
     );
     anyhow::ensure!(
-        record.claim == record.watch,
-        "pending exec-handoff ticket {ticket} does not publish one combined claim/watch",
+        record.claim == *preparation_claim,
+        "pending exec-handoff ticket {ticket} claim does not match its physical preparation owner",
     );
     anyhow::ensure!(
-        claim_covers(&record.claim, preparation_claim),
-        "pending exec-handoff preparation resources are not covered by ticket {ticket}",
+        claim_covers(&record.watch, preparation_claim),
+        "pending exec-handoff preparation resources are not covered by ticket {ticket}'s watch",
     );
     let liveness_path = liveness_path(slot, ticket);
     let actual = File::from(
@@ -1144,9 +1144,9 @@ impl Ticket {
         })))
     }
 
-    /// Atomically replace this process's combined selected-final + preparation
-    /// PENDING claim with one complete schedulable claim. No intermediate
-    /// state drops either the selected intent or its physical preparation.
+    /// Atomically replace this process's physical-preparation PENDING claim
+    /// with one complete schedulable claim. The same ticket and its selected
+    /// intent watch remain published throughout the transition.
     pub(super) fn activate_pending(
         &mut self,
         expected_pending: &ClaimSet,
@@ -1186,8 +1186,8 @@ impl Ticket {
             std::process::id(),
         );
         anyhow::ensure!(
-            record.claim == *expected_pending && record.watch == *expected_pending,
-            "pending ticket {} combined claim changed before exact activation",
+            record.claim == *expected_pending && claim_covers(&record.watch, expected_pending),
+            "pending ticket {} preparation claim/watch changed before exact activation",
             self.ticket,
         );
 
@@ -1280,10 +1280,10 @@ impl Ticket {
     }
 
     /// Consume one PENDING admission with a single nonblocking physical
-    /// attempt. The combined selected-final + preparation claim remains
-    /// published and the registry EX lock remains held until the attempt
-    /// either becomes HELD in this exact slot or is removed synchronously;
-    /// there is no WAITING/coordinator state and no release/re-register window.
+    /// attempt. The physical preparation claim and selected-intent watch remain
+    /// published and the registry EX lock remains held until the attempt either
+    /// becomes HELD in this exact slot or is removed synchronously; there is no
+    /// WAITING/coordinator state and no release/re-register window.
     pub(super) fn try_activate_pending_once<T>(
         &mut self,
         expected_pending: &ClaimSet,
@@ -1313,8 +1313,8 @@ impl Ticket {
             std::process::id(),
         );
         anyhow::ensure!(
-            record.claim == *expected_pending && record.watch == *expected_pending,
-            "pending ticket {} combined claim changed before one-shot activation",
+            record.claim == *expected_pending && claim_covers(&record.watch, expected_pending),
+            "pending ticket {} preparation claim/watch changed before one-shot activation",
             self.ticket,
         );
 
@@ -1392,6 +1392,25 @@ impl Ticket {
             anyhow::anyhow!("pending admission liveness descriptor was already consumed")
         })?;
         Ok((self.slot, self.ticket, liveness.as_raw_fd()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn pending_claim_watch_for_tests(&self) -> Result<(ClaimSet, ClaimSet)> {
+        let _namespace = self.namespace.enter();
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.repair_consistency_if_needed()?;
+        let record = table
+            .record(self.slot)?
+            .filter(|record| record.ticket == self.ticket)
+            .ok_or_else(|| anyhow::anyhow!("pending test ticket {} disappeared", self.ticket))?;
+        anyhow::ensure!(
+            record.state == STATE_PENDING,
+            "pending test ticket {} is in state {}, not PENDING",
+            self.ticket,
+            record.state,
+        );
+        Ok((record.claim, record.watch))
     }
 
     #[cfg(test)]
@@ -5936,13 +5955,13 @@ fn union_claims(a: &ClaimSet, b: &ClaimSet) -> ClaimSet {
     a.union_envelope(b)
 }
 
-fn combined_pending_claim(selected_final: &ClaimSet, preparation: &ClaimSet) -> ClaimSet {
-    let mut combined = selected_final.union_envelope(preparation);
-    // Preparation borrows cooperative capacity transiently. It must not turn
-    // an ordinary/default selected run into a different fairness class while
-    // the ticket is PENDING.
-    combined.admission_class = selected_final.admission_class;
-    combined
+fn pending_intent_watch(selected_final: &ClaimSet, preparation: &ClaimSet) -> ClaimSet {
+    let mut watch = selected_final.union_envelope(preparation);
+    // Preparation borrows cooperative capacity transiently. Preserve the
+    // selected run's fairness identity in the intent envelope; the exact claim
+    // independently describes only the physically owned preparation tuple.
+    watch.admission_class = selected_final.admission_class;
+    watch
 }
 
 fn claim_covers(cover: &ClaimSet, claim: &ClaimSet) -> bool {
@@ -6016,7 +6035,7 @@ fn required_resource_bits(claim: &ClaimSet) -> usize {
                 .saturating_add(1)
         })
         .unwrap_or(0);
-    // The v17 mapping is deliberately overprovisioned once. It never needs a
+    // The v18 mapping is deliberately overprovisioned once. It never needs a
     // migration/grow protocol when the first low-index ticket is followed by a
     // valid sparse CPU/LLC/permit index on the same host. Permit indices occupy
     // a disjoint internal bit range immediately after possible host CPUs.
@@ -6107,11 +6126,11 @@ fn notify_path() -> PathBuf {
 }
 
 fn registry_data_dir() -> PathBuf {
-    active_protocol_dir().join("ktstr-acquire-registry-v17")
+    active_protocol_dir().join("ktstr-acquire-registry-v18")
 }
 
 pub(super) fn event_dir() -> PathBuf {
-    active_protocol_dir().join("ktstr-acquire-events-v17")
+    active_protocol_dir().join("ktstr-acquire-events-v18")
 }
 
 #[cfg(test)]
@@ -7551,14 +7570,14 @@ impl Table {
         Ok(())
     }
 
-    /// Atomically publish the selected run intent together with the physical
-    /// preparation footprint acquired by its callback.
+    /// Atomically park a selected run ticket on the physical preparation
+    /// footprint acquired by its callback.
     ///
-    /// PENDING retains the selected final footprint continuously and adds the
-    /// physical preparation resources in the same transaction. A racing later
-    /// publication therefore cannot leapfrog an already-selected run while it
-    /// prepares, and exact activation can replace the complete combined claim
-    /// without a release/re-register window.
+    /// PENDING claims exactly the resources backed by live preparation OFDs.
+    /// The selected final intent remains in the record's watch and retains the
+    /// same ticket order, but does not sequester CPUs, LLCs, or run permits
+    /// while immutable artifacts are prepared. Exact activation replaces both
+    /// fields in one transaction without a release/re-register window.
     fn transition_record_to_pending(
         &mut self,
         record: &Record,
@@ -7572,15 +7591,17 @@ impl Table {
             !preparation.is_empty(),
             "granted intent produced an empty preparation claim",
         );
-        let pending = combined_pending_claim(selected_final, preparation);
-        validate_claim(&pending)?;
-        materialize_claim_paths(&pending)?;
+        let pending_claim = preparation.clone();
+        let pending_watch = pending_intent_watch(selected_final, preparation);
+        validate_claim(&pending_claim)?;
+        validate_claim_within_watch(&pending_claim, &pending_watch)?;
+        materialize_claim_paths(&pending_watch)?;
         // The ticket already earned this grant against its predecessor prefix.
         // Later tickets may publish while its physical preparation probe runs,
         // but they cannot retroactively veto the older grant. Recompute the
         // prefix under the commit lock and fence only genuine predecessors.
         let predecessors = self.cached_prefix(record.slot)?.1;
-        if let Some(marker) = predecessors.first_conflict(&pending)? {
+        if let Some(marker) = predecessors.first_conflict(&pending_claim)? {
             return Ok(PendingTransition::Contended(marker));
         }
 
@@ -7588,11 +7609,11 @@ impl Table {
         self.clear_record_blocked(record.slot)?;
         self.adjust_claim_counts(&record.claim, false)?;
         self.adjust_watch_counts(&record.watch, false)?;
-        let newly_watched = self.newly_watched(&pending)?;
-        self.adjust_claim_counts(&pending, true)?;
-        self.adjust_watch_counts(&pending, true)?;
+        let newly_watched = self.newly_watched(&pending_watch)?;
+        self.adjust_claim_counts(&pending_claim, true)?;
+        self.adjust_watch_counts(&pending_watch, true)?;
         self.mark_observation_modes(&newly_watched)?;
-        let issue_serial = self.max_watch_serial(&pending)?;
+        let issue_serial = self.max_watch_serial(&pending_watch)?;
         let layout = self.layout;
         {
             let bytes = self
@@ -7604,44 +7625,44 @@ impl Table {
             write_u32(
                 bytes,
                 R_CLAIM_LLC_MODE,
-                u32::from(pending.llc_mode == ClaimMode::Exclusive),
+                u32::from(pending_claim.llc_mode == ClaimMode::Exclusive),
             );
             write_u32(
                 bytes,
                 R_CLAIM_CPU_MODE,
-                u32::from(pending.cpu_mode == ClaimMode::Exclusive),
+                u32::from(pending_claim.cpu_mode == ClaimMode::Exclusive),
             );
             write_u32(
                 bytes,
                 R_CLAIM_PERMIT_MODE,
-                u32::from(pending.permit_mode == ClaimMode::Exclusive),
+                u32::from(pending_claim.permit_mode == ClaimMode::Exclusive),
             );
             write_u32(
                 bytes,
                 R_WATCH_LLC_MODE,
-                u32::from(pending.llc_mode == ClaimMode::Exclusive),
+                u32::from(pending_watch.llc_mode == ClaimMode::Exclusive),
             );
             write_u32(
                 bytes,
                 R_WATCH_CPU_MODE,
-                u32::from(pending.cpu_mode == ClaimMode::Exclusive),
+                u32::from(pending_watch.cpu_mode == ClaimMode::Exclusive),
             );
             write_u32(
                 bytes,
                 R_WATCH_PERMIT_MODE,
-                u32::from(pending.permit_mode == ClaimMode::Exclusive),
+                u32::from(pending_watch.permit_mode == ClaimMode::Exclusive),
             );
             write_u32(
                 bytes,
                 R_CLAIM_CLASS,
-                encode_admission_class(pending.admission_class),
+                encode_admission_class(pending_claim.admission_class),
             );
             write_u32(
                 bytes,
                 R_WATCH_CLASS,
-                encode_admission_class(pending.admission_class),
+                encode_admission_class(pending_watch.admission_class),
             );
-            encode_claim(bytes, layout, &pending, &pending)?;
+            encode_claim(bytes, layout, &pending_claim, &pending_watch)?;
             write_u64(bytes, R_ISSUE_SERIAL, issue_serial);
             write_u64(bytes, R_GRANT_EPOCH, 0);
             write_u64(bytes, R_REPLAN_CLAIM_EPOCH, 0);
@@ -7649,7 +7670,7 @@ impl Table {
             write_u32(
                 bytes,
                 R_BACKFILL_CAPACITY,
-                backfill_capacity_for_watch(&pending),
+                backfill_capacity_for_watch(&pending_watch),
             );
             write_u64(bytes, R_BACKFILL_STARTED_NS, 0);
             write_u64(bytes, R_BLOCKED_SERIAL, 0);
@@ -7666,7 +7687,7 @@ impl Table {
         }
         self.bump_generation()?;
         self.finish_transaction()?;
-        Ok(PendingTransition::Committed(pending))
+        Ok(PendingTransition::Committed(pending_claim))
     }
 
     fn remove_record(&mut self, record: &Record, acquired: bool) -> Result<()> {
@@ -8354,7 +8375,7 @@ impl Table {
             // The record table is authoritative. A clean header/record
             // mismatch must not permanently poison admission, so defensively
             // rebuild the active/free lists, aggregates, coordinator header,
-            // and record states together. Current v17 publication validates
+            // and record states together. Current v18 publication validates
             // this pair before clearing the dirty bit.
             self.repair_consistency()?;
             coordinator = self.coordinator_ticket();

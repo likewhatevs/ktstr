@@ -1,6 +1,6 @@
 //! Cross-process host-resource admission under nextest.
 //!
-//! Every ktstr process sharing a lock directory participates in one v17
+//! Every ktstr process sharing a lock directory participates in one v18
 //! fixed-record mmap registry. A ticket publishes one exact, non-empty CPU/LLC
 //! reservation claim plus the resources its planner may watch. Claims preserve
 //! the resource-lock semantics exactly: CPU and LLC claims independently use
@@ -1214,10 +1214,10 @@ pub(crate) enum TicketWork<T> {
     Coordinator(Box<CoordinatorTicket>),
 }
 
-/// Same-PID pre-exec admission identity. Its registry record continuously
-/// publishes the selected final intent together with every physically held
-/// preparation resource. Activation replaces that combined PENDING claim
-/// with the exact run claim in the same ticket.
+/// Same-PID pre-exec admission identity. Its registry claim continuously
+/// publishes every physically held preparation resource, while its watch keeps
+/// the selected final intent attached to the same ordered ticket. Activation
+/// atomically replaces both with the exact run claim/watch.
 pub(crate) struct PendingAdmission {
     ticket: Option<registry::Ticket>,
     preparation: Option<super::PreparationPermit>,
@@ -1313,9 +1313,17 @@ impl PendingAdmission {
             .restore_affinity()
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_claim_watch_for_tests(&self) -> Result<(ClaimSet, ClaimSet)> {
+        self.ticket
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("pending admission was already consumed"))?
+            .pending_claim_watch_for_tests()
+    }
+
     /// Complete immutable preparation without consuming or weakening the
-    /// PENDING ticket. Affinity is restored, while the combined selected-final
-    /// and preparation claim and all physical preparation OFDs remain intact
+    /// PENDING ticket. Affinity is restored, while the physical preparation
+    /// claim, selected-intent watch, and all preparation OFDs remain intact
     /// until exact activation replaces them atomically.
     pub(crate) fn finish_preparation(&mut self) -> Result<()> {
         self.ticket
@@ -1394,8 +1402,8 @@ fn pending_admission_from_parts(
 /// Publish a lightweight exact/flexible run intent before acquiring any
 /// physical preparation capacity. The ordinary queue selects among all
 /// visible intents. A selected callback probes the preparation pool exactly
-/// once and either commits the selected final + preparation union as PENDING
-/// immediately or revokes/requeues the selection.
+/// once and either commits the physical preparation tuple under the same
+/// selected-intent ticket or revokes/requeues the selection.
 pub(crate) fn register_intent_for_preparation(
     initial_claim: ClaimSet,
     watch: ClaimSet,
@@ -2717,9 +2725,9 @@ pub(in crate::vmm) enum CoordinatorStep<T> {
     /// planning alternative.
     Complete { claim: ClaimSet, value: T },
     /// The coordinator selected this run intent and acquired one bounded
-    /// physical preparation tuple. Commit publishes their combined footprint
-    /// as PENDING in the same ticket; it does not publish the final run claim
-    /// as HELD.
+    /// physical preparation tuple. Commit publishes the physical tuple as the
+    /// PENDING claim and retains the selected final footprint in its watch; it
+    /// does not publish the final run claim as HELD.
     Prepare {
         final_claim: ClaimSet,
         preparation_claim: ClaimSet,
