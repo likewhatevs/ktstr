@@ -3074,17 +3074,33 @@ fn plan_from_snapshots_with_fresh_rotation(
 /// Consolidate prefer disjoint capacity. If the filtered capacity cannot
 /// satisfy the exact budget, return the full snapshot so predecessor resources
 /// remain eligible as the necessary last resort.
+fn physical_candidate_for_watch(
+    llcs: impl IntoIterator<Item = usize>,
+    cpus: impl IntoIterator<Item = usize>,
+    llc_mode: FlockMode,
+    cpu_mode: FlockMode,
+    watch_class: protocol::AdmissionClass,
+) -> protocol::ClaimSet {
+    protocol::ClaimSet::with_modes(llcs, cpus, llc_mode, cpu_mode).with_admission_class(watch_class)
+}
+
 fn avoid_preceding_claims_when_possible(
     snapshots: &[LlcSnapshot],
     target_cpus: usize,
     topo: &HostTopology,
     allowed: &std::collections::BTreeSet<usize>,
+    watch_class: protocol::AdmissionClass,
     mut conflicts: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
 ) -> Result<Vec<LlcSnapshot>> {
     let mut unreserved = Vec::with_capacity(snapshots.len());
     for snapshot in snapshots {
-        let candidate =
-            protocol::ClaimSet::new([snapshot.llc_idx], std::iter::empty(), FlockMode::Shared);
+        let candidate = physical_candidate_for_watch(
+            [snapshot.llc_idx],
+            std::iter::empty(),
+            FlockMode::Shared,
+            FlockMode::Shared,
+            watch_class,
+        );
         if !conflicts(&candidate)? {
             unreserved.push(snapshot.clone());
         }
@@ -5349,11 +5365,12 @@ where
         // capacity can carry the full budget; otherwise retain them as the
         // necessary last resort.
         let eligible_allowed = cpu_eligible_allowed(&allowed, &cpu_states, |cpu| {
-            probe.conflicts_with_predecessors(&protocol::ClaimSet::with_modes(
+            probe.conflicts_with_predecessors(&physical_candidate_for_watch(
                 std::iter::empty(),
                 [cpu],
                 FlockMode::Shared,
                 FlockMode::Shared,
+                watch_class,
             ))
         })?;
         snapshots.retain(|snapshot| !snapshot.exclusive_held);
@@ -5363,15 +5380,18 @@ where
                 target_cpus,
                 topo,
                 &eligible_allowed,
+                watch_class,
                 |candidate| probe.conflicts_with_predecessors(candidate),
             )?,
             LlcPlanSizing::Elastic => {
                 let mut predecessor_free = Vec::with_capacity(snapshots.len());
                 for snapshot in snapshots {
-                    let candidate = protocol::ClaimSet::new(
+                    let candidate = physical_candidate_for_watch(
                         [snapshot.llc_idx],
                         std::iter::empty(),
                         FlockMode::Shared,
+                        FlockMode::Shared,
+                        watch_class,
                     );
                     if !probe.conflicts_with_predecessors(&candidate)? {
                         predecessor_free.push(snapshot);
@@ -5585,11 +5605,12 @@ where
         let eligible_allowed = cpu_eligible_allowed(&allowed, &cpu_states, |cpu| match sizing {
             LlcPlanSizing::Exact => Ok(false),
             LlcPlanSizing::Elastic => held
-                .candidate_ready(&protocol::ClaimSet::with_modes(
+                .candidate_ready(&physical_candidate_for_watch(
                     std::iter::empty(),
                     [cpu],
                     FlockMode::Shared,
                     FlockMode::Shared,
+                    watch_class,
                 ))
                 .map(|ready| !ready),
         })?;
@@ -5601,11 +5622,12 @@ where
         if sizing == LlcPlanSizing::Elastic {
             let mut predecessor_free = Vec::with_capacity(ready_snapshots.len());
             for snapshot in ready_snapshots {
-                let candidate = protocol::ClaimSet::with_modes(
+                let candidate = physical_candidate_for_watch(
                     [snapshot.llc_idx],
                     std::iter::empty(),
                     FlockMode::Shared,
                     FlockMode::Shared,
+                    watch_class,
                 );
                 if held.candidate_ready(&candidate)? {
                     predecessor_free.push(snapshot);

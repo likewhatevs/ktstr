@@ -4834,33 +4834,93 @@ fn validate_claim(claim: &ClaimSet) -> Result<()> {
     Ok(())
 }
 
+const CLAIM_DIAGNOSTIC_INDEX_LIMIT: usize = 8;
+
+fn bounded_index_set(indices: &BTreeSet<usize>) -> String {
+    let mut preview = indices
+        .iter()
+        .take(CLAIM_DIAGNOSTIC_INDEX_LIMIT)
+        .map(usize::to_string)
+        .collect::<Vec<_>>();
+    if indices.len() > CLAIM_DIAGNOSTIC_INDEX_LIMIT {
+        preview.push(format!(
+            "... +{}",
+            indices.len() - CLAIM_DIAGNOSTIC_INDEX_LIMIT
+        ));
+    }
+    format!("len={} [{}]", indices.len(), preview.join(", "))
+}
+
+fn bounded_claim(claim: &ClaimSet) -> String {
+    format!(
+        "class={:?} cpus({}) llcs({}) permits({}) \
+         modes(cpu={:?}, llc={:?}, permit={:?})",
+        claim.admission_class,
+        bounded_index_set(&claim.cpus),
+        bounded_index_set(&claim.llcs),
+        bounded_index_set(&claim.permits),
+        claim.cpu_mode,
+        claim.llc_mode,
+        claim.permit_mode,
+    )
+}
+
 pub(super) fn validate_claim_within_watch(claim: &ClaimSet, watch: &ClaimSet) -> Result<()> {
-    if !claim.cpus.is_subset(&watch.cpus)
-        || !claim.llcs.is_subset(&watch.llcs)
-        || !claim.permits.is_subset(&watch.permits)
-        || (!claim.cpus.is_empty()
-            && !watch.cpus.is_empty()
-            && watch.cpu_mode != ClaimMode::Exclusive
-            && claim.cpu_mode != watch.cpu_mode)
-        || (!claim.llcs.is_empty()
-            && !watch.llcs.is_empty()
-            && watch.llc_mode != ClaimMode::Exclusive
-            && claim.llc_mode != watch.llc_mode)
-        || (!claim.permits.is_empty()
-            && !watch.permits.is_empty()
-            && watch.permit_mode != ClaimMode::Exclusive
-            && claim.permit_mode != watch.permit_mode)
-        || !matches!(
-            (watch.admission_class, claim.admission_class),
-            (AdmissionClass::Ordinary, AdmissionClass::Ordinary)
-                | (AdmissionClass::Ordinary, AdmissionClass::DefaultBorrow)
-                | (AdmissionClass::DefaultBorrow, AdmissionClass::Ordinary)
-                | (AdmissionClass::DefaultBorrow, AdmissionClass::DefaultBorrow)
-                | (AdmissionClass::Build, AdmissionClass::Build)
-        )
-    {
+    let mode_within = |claim_empty, watch_empty, claim_mode, watch_mode| {
+        claim_empty || watch_empty || watch_mode == ClaimMode::Exclusive || claim_mode == watch_mode
+    };
+    let admission_within = matches!(
+        (watch.admission_class, claim.admission_class),
+        (AdmissionClass::Ordinary, AdmissionClass::Ordinary)
+            | (AdmissionClass::Ordinary, AdmissionClass::DefaultBorrow)
+            | (AdmissionClass::DefaultBorrow, AdmissionClass::Ordinary)
+            | (AdmissionClass::DefaultBorrow, AdmissionClass::DefaultBorrow)
+            | (AdmissionClass::Build, AdmissionClass::Build)
+    );
+    let mut violations = Vec::new();
+    if !claim.cpus.is_subset(&watch.cpus) {
+        violations.push("CPU set");
+    }
+    if !claim.llcs.is_subset(&watch.llcs) {
+        violations.push("LLC set");
+    }
+    if !claim.permits.is_subset(&watch.permits) {
+        violations.push("permit set");
+    }
+    if !mode_within(
+        claim.cpus.is_empty(),
+        watch.cpus.is_empty(),
+        claim.cpu_mode,
+        watch.cpu_mode,
+    ) {
+        violations.push("CPU mode");
+    }
+    if !mode_within(
+        claim.llcs.is_empty(),
+        watch.llcs.is_empty(),
+        claim.llc_mode,
+        watch.llc_mode,
+    ) {
+        violations.push("LLC mode");
+    }
+    if !mode_within(
+        claim.permits.is_empty(),
+        watch.permits.is_empty(),
+        claim.permit_mode,
+        watch.permit_mode,
+    ) {
+        violations.push("permit mode");
+    }
+    if !admission_within {
+        violations.push("admission class");
+    }
+    if !violations.is_empty() {
         anyhow::bail!(
-            "queue claim is outside its immutable watch set: claim={claim:?}, watch={watch:?}"
+            "queue claim is outside its immutable watch set ({violations}): claim={claim}, \
+             watch={watch}",
+            violations = violations.join(", "),
+            claim = bounded_claim(claim),
+            watch = bounded_claim(watch),
         );
     }
     Ok(())
@@ -4891,7 +4951,8 @@ fn validate_contention_within_watch(
         if !valid {
             anyhow::bail!(
                 "queue contention marker is outside its immutable watch set: \
-                 marker={marker:?}, watch={watch:?}"
+                 marker={marker:?}, watch={watch}",
+                watch = bounded_claim(watch),
             );
         }
     }
@@ -8823,6 +8884,12 @@ fn clear_record_claim_bits(bytes: &mut [u8], layout: HeaderLayout) {
 }
 
 fn clear_record_watch_bits(bytes: &mut [u8], layout: HeaderLayout) {
+    // The credit is derived from the immutable watch. Reset it before
+    // publishing an empty watch so every intermediate record remains
+    // decodable if a coordinator scan observes this transition. Activation
+    // overwrites it from the replacement watch; HELD records keep the
+    // canonical empty-watch credit.
+    write_u32(bytes, R_BACKFILL_CREDIT, 1);
     let start = record_bitset_offset(layout, RB_WATCH_CPUS);
     let end = record_bitset_offset(layout, RB_PREFIX_CPU_ANY);
     bytes[start..end].fill(0);

@@ -279,16 +279,14 @@ fn gc_content_cache_at(root: &Path, now: SystemTime, max_age: Duration) -> Resul
         }
     }
 
-    // Content objects are deliberately not collected here. An artifact-tree
-    // record names a closure of many objects, but consumers necessarily acquire
-    // the per-object SH leases one at a time while decoding that record. A
-    // per-object age/size sweep can therefore unlink a later member after an
-    // earlier member was leased, turning a valid cross-process hit into a
-    // partial miss (and the former 8-GiB ceiling was smaller than one normal
-    // ktstr nextest closure). Reclamation belongs at the artifact-tree layer,
-    // where a per-identity lease can protect the complete closure atomically.
-    // Until that protocol exists, retaining immutable CAS objects is the only
-    // sound policy. Digest memos and genuinely orphaned lock inodes remain
+    // Content objects are deliberately not collected here. Artifact-tree
+    // consumers now retain this namespace gate in SH mode across complete
+    // record validation and bounded materialization, so a future collector can
+    // safely use this EX gate for closure-aware reclamation. Choosing which
+    // records remain reachable still belongs at the artifact-tree layer (and
+    // the former blind 8-GiB ceiling was smaller than one normal ktstr nextest
+    // closure). Until that retention protocol exists, immutable CAS objects
+    // remain durable. Digest memos and genuinely orphaned lock inodes remain
     // reconstructible and are still bounded below.
     let object_dir = root.join(CONTENT_OBJECT_DIR);
 
@@ -875,6 +873,50 @@ fn content_object_lock_path(root: &Path, content_hash: u64) -> PathBuf {
         .join(format!("object-{content_hash:016x}.lock"))
 }
 
+/// One shared lease over the complete content-object namespace.
+///
+/// Artifact trees can reference thousands of immutable objects. Holding a
+/// per-object flock and object descriptor for the complete tree scales file
+/// descriptor use with the tree size. The collector already takes the
+/// namespace gate exclusively before unlinking any object or coordination
+/// pathname, so one shared gate is sufficient to keep every pathname alive
+/// while a producer publishes its record or a consumer opens bounded batches
+/// for FICLONE materialization.
+pub(super) struct ContentNamespaceLease {
+    _gate: File,
+    root: PathBuf,
+}
+
+impl ContentNamespaceLease {
+    /// Open and validate one immutable object while the namespace remains
+    /// protected from garbage collection. The returned descriptor pins the
+    /// exact inode even if another valid publisher replaces its pathname.
+    pub(super) fn open_object(
+        &self,
+        content_hash: u64,
+        expected_len: u64,
+    ) -> Result<Option<(File, PathBuf)>> {
+        let path = content_object_path(&self.root, content_hash);
+        Ok(open_content_object_at(&path, expected_len)?.map(|file| (file, path)))
+    }
+}
+
+/// Prevent content GC from unlinking any object pathname until this owner is
+/// dropped. Unlike per-object leases, this consumes one descriptor regardless
+/// of artifact-tree cardinality.
+pub(super) fn lease_content_namespace() -> Result<ContentNamespaceLease> {
+    let root = content_cache_root()?;
+    ensure_content_dirs(&root)?;
+    maybe_gc_content_cache(&root)?;
+    let gate_path = root
+        .join(FILE_DIGEST_LOCK_DIR)
+        .join(FILE_DIGEST_NAMESPACE_GATE);
+    let gate = open_lock_file(&gate_path)?;
+    flock_retry(&gate, rustix::fs::FlockOperation::LockShared)
+        .with_context(|| format!("lease content namespace {}", gate_path.display()))?;
+    Ok(ContentNamespaceLease { _gate: gate, root })
+}
+
 fn open_content_object_at(path: &Path, expected_len: u64) -> Result<Option<File>> {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -1077,13 +1119,6 @@ impl ContentObjectLease {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
-
-    /// Descriptor for the exact immutable object revision covered by this
-    /// lease. Callers which consume bytes must prefer this over reopening the
-    /// diagnostic pathname.
-    pub(crate) fn file(&self) -> &File {
-        &self._file
-    }
 }
 
 fn lease_content_object_at_root(
@@ -1111,21 +1146,6 @@ fn lease_content_object_at_root(
         _coordination: coordination,
         path,
     }))
-}
-
-/// Lease one already-published immutable object by its manifest identity.
-///
-/// Tree manifests store only the fast content key and exact length, never a
-/// mutable source pathname. A missing object is a reconstructible cache miss;
-/// the shared lease prevents content GC from unlinking a successful lookup.
-pub(super) fn lease_content_object(
-    content_hash: u64,
-    expected_len: u64,
-) -> Result<Option<ContentObjectLease>> {
-    let root = content_cache_root()?;
-    ensure_content_dirs(&root)?;
-    maybe_gc_content_cache(&root)?;
-    lease_content_object_at_root(&root, content_hash, expected_len)
 }
 
 pub(crate) fn open_or_publish_content_object_lease_with_policy(

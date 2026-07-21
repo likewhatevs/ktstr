@@ -13,6 +13,7 @@ use std::io::{Read as _, Write as _};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool as ProcessAtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result};
@@ -33,18 +34,23 @@ const MATERIALIZATION_GC_CURSOR: &str = ".ktstr-materialization-gc.cursor";
 const ARTIFACT_IO_WORKERS_MAX: usize = 16;
 const STABLE_TREE_MARKER: &str = ".ktstr-artifact-tree-v1";
 const STABLE_BUILD_MARKER: &str = ".ktstr-stable-build-v1";
+static OPENAT2_UNAVAILABLE: ProcessAtomicBool = ProcessAtomicBool::new(false);
 
 enum SourceEntry {
-    Directory {
-        mode: u32,
-    },
-    File {
-        pinned: super::PinnedContentFile,
-        mode: u32,
-    },
-    Symlink {
-        target: PathBuf,
-    },
+    Directory { mode: u32 },
+    File { file: SourceFile, mode: u32 },
+    Symlink { target: PathBuf },
+}
+
+enum SourceFile {
+    /// Exact source inode retained until the next bounded publication wave.
+    Pinned(super::PinnedContentFile),
+    /// Immutable CAS object protected by the tree's one namespace lease.
+    Published { content_hash: u64, len: u64 },
+    /// Temporary state while a bounded worker owns the pinned descriptor. A
+    /// publication error aborts the entire source construction, so this can
+    /// never reach a successfully published tree record.
+    Publishing,
 }
 
 enum PendingTreeEntry {
@@ -55,17 +61,25 @@ enum PendingTreeEntry {
 
 /// One relocatable artifact tree ready for immutable publication.
 ///
-/// Regular files are pinned as they are inserted. Replacing a Cargo output
-/// pathname after this point cannot retarget the bytes eventually published.
+/// Regular files are pinned as they are inserted, then moved through bounded
+/// parallel waves into immutable CAS objects. Replacing a Cargo output
+/// pathname after insertion cannot retarget the bytes eventually published.
 #[doc(hidden)]
 pub struct ArtifactTreeSource {
     entries: BTreeMap<PathBuf, SourceEntry>,
+    // At most one bounded worker wave of source descriptors is retained.
+    // Published objects are protected collectively by this single shared
+    // namespace gate instead of one object lease per file.
+    content_namespace: Option<super::content::ContentNamespaceLease>,
+    pending_pinned_paths: Vec<PathBuf>,
     // Number of descendants already inserted below each normalized path.
     // This makes rejecting a later file/symlink parent logarithmic instead of
     // rescanning the complete tree after every insertion.
     descendant_counts: BTreeMap<PathBuf, usize>,
     #[cfg(test)]
     insertion_validation_visits: usize,
+    #[cfg(test)]
+    peak_pinned_files: usize,
 }
 
 impl ArtifactTreeSource {
@@ -73,9 +87,13 @@ impl ArtifactTreeSource {
     pub fn new() -> Self {
         Self {
             entries: BTreeMap::new(),
+            content_namespace: None,
+            pending_pinned_paths: Vec::new(),
             descendant_counts: BTreeMap::new(),
             #[cfg(test)]
             insertion_validation_visits: 0,
+            #[cfg(test)]
+            peak_pinned_files: 0,
         }
     }
 
@@ -146,7 +164,22 @@ impl ArtifactTreeSource {
         if immutable {
             mode &= !0o222;
         }
-        self.insert_entry(relative, SourceEntry::File { pinned, mode })
+        self.insert_entry(
+            relative.clone(),
+            SourceEntry::File {
+                file: SourceFile::Pinned(pinned),
+                mode,
+            },
+        )?;
+        self.pending_pinned_paths.push(relative);
+        #[cfg(test)]
+        {
+            self.peak_pinned_files = self.peak_pinned_files.max(self.pending_pinned_paths.len());
+        }
+        if self.pending_pinned_paths.len() >= ARTIFACT_IO_WORKERS_MAX {
+            self.publish_pinned_window()?;
+        }
+        Ok(())
     }
 
     /// Add small generated metadata bytes without exposing a mutable staging
@@ -296,41 +329,80 @@ impl ArtifactTreeSource {
             }
         }
 
-        let file_work = captured
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| match entry {
-                PendingTreeEntry::File { source, .. } => Some((index, source.as_path())),
-                PendingTreeEntry::Directory { .. } | PendingTreeEntry::Symlink { .. } => None,
-            })
-            .collect::<Vec<_>>();
-        let pinned = parallel_indexed(file_work, |(index, source)| {
-            let file = super::pin_content_file(source)
-                .with_context(|| format!("pin artifact tree input {}", source.display()))?;
-            Ok((index, file))
-        })?;
-        let mut pinned_by_index = std::iter::repeat_with(|| None)
-            .take(captured.len())
-            .collect::<Vec<Option<super::PinnedContentFile>>>();
-        for (index, pinned) in pinned {
-            pinned_by_index[index] = Some(pinned);
-        }
-
-        for (index, entry) in captured.into_iter().enumerate() {
+        for entry in captured {
             match entry {
                 PendingTreeEntry::Directory { relative, mode } => {
                     self.insert_directory(relative, mode)?;
                 }
-                PendingTreeEntry::File { relative, .. } => {
-                    let pinned = pinned_by_index[index]
-                        .take()
-                        .context("parallel artifact-tree pin returned no file")?;
+                PendingTreeEntry::File { relative, source } => {
+                    let pinned = super::pin_content_file(&source)
+                        .with_context(|| format!("pin artifact tree input {}", source.display()))?;
                     self.insert_pinned_file_with_policy(relative, pinned, immutable)?;
                 }
                 PendingTreeEntry::Symlink { relative, target } => {
                     self.insert_symlink(relative, target)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Publish the currently pinned descriptor window in parallel, then retain
+    /// only compact CAS identities. One namespace gate protects every object
+    /// from GC until the record has been materialized, so descriptor use is
+    /// bounded by the worker count rather than the source-tree cardinality.
+    fn publish_pinned_window(&mut self) -> Result<()> {
+        if self.pending_pinned_paths.is_empty() {
+            return Ok(());
+        }
+        if self.content_namespace.is_none() {
+            self.content_namespace = Some(super::content::lease_content_namespace()?);
+        }
+
+        let pending_paths = std::mem::take(&mut self.pending_pinned_paths);
+        let mut pending = Vec::with_capacity(pending_paths.len());
+        for path in pending_paths {
+            let SourceEntry::File { file, .. } = self
+                .entries
+                .get_mut(&path)
+                .with_context(|| format!("pinned artifact path disappeared: {}", path.display()))?
+            else {
+                anyhow::bail!("pinned artifact changed type: {}", path.display());
+            };
+            let SourceFile::Pinned(pinned) = std::mem::replace(file, SourceFile::Publishing) else {
+                anyhow::bail!(
+                    "pinned artifact file changed state before publication: {}",
+                    path.display()
+                );
+            };
+            pending.push((path, pinned));
+        }
+
+        let published = parallel_indexed(pending, |(path, pinned)| {
+            let snapshot = super::snapshot_pinned_artifact_file(pinned)
+                .with_context(|| format!("publish artifact-tree file {}", path.display()))?;
+            Ok((
+                path,
+                SourceFile::Published {
+                    content_hash: snapshot.content_hash(),
+                    len: snapshot.len(),
+                },
+            ))
+        })?;
+        for (path, published) in published {
+            let SourceEntry::File { file, .. } =
+                self.entries.get_mut(&path).with_context(|| {
+                    format!("published artifact path disappeared: {}", path.display())
+                })?
+            else {
+                anyhow::bail!("published artifact changed type: {}", path.display());
+            };
+            anyhow::ensure!(
+                matches!(file, SourceFile::Publishing),
+                "published artifact file was not awaiting publication: {}",
+                path.display()
+            );
+            *file = published;
         }
         Ok(())
     }
@@ -441,30 +513,12 @@ struct ArtifactTreeRecord {
     integrity_ahash: u64,
 }
 
-enum ObjectLease {
-    Published(super::ContentFileSnapshot),
-    Existing(super::content::ContentObjectLease),
-}
-
-impl ObjectLease {
-    fn path(&self) -> &Path {
-        match self {
-            Self::Published(snapshot) => snapshot.path(),
-            Self::Existing(lease) => lease.path(),
-        }
-    }
-
-    fn file(&self) -> &std::fs::File {
-        match self {
-            Self::Published(snapshot) => snapshot.file(),
-            Self::Existing(lease) => lease.file(),
-        }
-    }
-}
-
 struct LeasedRecord {
     record: ArtifactTreeRecord,
-    objects: BTreeMap<(u64, u64), ObjectLease>,
+    // One shared namespace gate prevents GC from unlinking every referenced
+    // CAS pathname. Individual object descriptors are opened only inside the
+    // bounded materialization worker window.
+    content_namespace: super::content::ContentNamespaceLease,
 }
 
 struct SelectedRecord {
@@ -474,9 +528,9 @@ struct SelectedRecord {
 
 /// One private materialization of a reusable artifact tree.
 ///
-/// The content leases remain live until this value is dropped, so content GC
-/// cannot unlink a source object while nextest executes from the reflinked
-/// tree.
+/// Every regular file is an independent FICLONE inode by construction. CAS
+/// descriptors and the namespace lease are therefore released as soon as the
+/// bounded materialization pass completes.
 #[doc(hidden)]
 pub struct MaterializedArtifactTree {
     directory: tempfile::TempDir,
@@ -485,7 +539,6 @@ pub struct MaterializedArtifactTree {
     // still held. A collector can never acquire the liveness lock in the
     // middle of normal teardown.
     _live: std::fs::File,
-    _objects: BTreeMap<(u64, u64), ObjectLease>,
     cache_root: PathBuf,
     identity: u64,
     cache_hit: bool,
@@ -1116,17 +1169,13 @@ impl ArtifactTreeCache {
             },
         )?;
 
-        // Drop liveness/CAS leases only after detaching TempDir cleanup. The
-        // installed FICLONEs are independent inodes and need no source lease.
+        // Drop the liveness lock only after detaching TempDir cleanup. The
+        // installed FICLONEs are independent inodes and retain no CAS lease.
         let MaterializedArtifactTree {
-            directory,
-            _live,
-            _objects,
-            ..
+            directory, _live, ..
         } = tree;
         let staged = directory.keep();
         drop(_live);
-        drop(_objects);
         std::fs::remove_file(staged.join(MATERIALIZATION_LIVE_LOCK)).with_context(|| {
             format!(
                 "remove private liveness marker from stable artifact tree {}",
@@ -1187,24 +1236,81 @@ fn open_stable_cargo_directory_at(
         });
     }
     checked_relative_path(relative)?;
-    rustix::fs::openat2(
-        root,
-        relative,
-        rustix::fs::OFlags::PATH
-            | rustix::fs::OFlags::DIRECTORY
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-        rustix::fs::ResolveFlags::BENEATH
-            | rustix::fs::ResolveFlags::NO_SYMLINKS
-            | rustix::fs::ResolveFlags::NO_MAGICLINKS,
-    )
-    .with_context(|| {
-        format!(
-            "open stable Cargo directory beneath its root without following links {}",
-            relative.display(),
+    if !OPENAT2_UNAVAILABLE.load(AtomicOrdering::Relaxed) {
+        match rustix::fs::openat2(
+            root,
+            relative,
+            rustix::fs::OFlags::PATH
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+            rustix::fs::ResolveFlags::BENEATH
+                | rustix::fs::ResolveFlags::NO_SYMLINKS
+                | rustix::fs::ResolveFlags::NO_MAGICLINKS,
+        ) {
+            Ok(directory) => return Ok(directory),
+            Err(error) if error == rustix::io::Errno::NOSYS => {
+                // Old kernels and seccomp profiles can both report ENOSYS.
+                // Remember it process-wide so a large sparse-tree walk does
+                // not pay one rejected syscall per directory.
+                OPENAT2_UNAVAILABLE.store(true, AtomicOrdering::Relaxed);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "open stable Cargo directory beneath its root without following links {}",
+                        relative.display(),
+                    )
+                });
+            }
+        }
+    }
+    open_stable_cargo_directory_at_components(root, relative)
+}
+
+/// `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` expressed with portable
+/// `openat` operations for hosts where the syscall is unavailable or filtered.
+///
+/// Every path component is normalized before this function is entered and is
+/// opened relative to the descriptor for its exact parent with O_NOFOLLOW and
+/// O_DIRECTORY. Renames cannot redirect an already-opened ancestor, `..` can
+/// never escape the root, and symlinks (including procfs magic links) cannot be
+/// traversed. This is a security-preserving syscall fallback, not a pathname
+/// or permissive fallback.
+fn open_stable_cargo_directory_at_components(
+    root: &std::os::fd::OwnedFd,
+    relative: &Path,
+) -> Result<std::os::fd::OwnedFd> {
+    if relative.as_os_str().is_empty() {
+        return rustix::io::fcntl_dupfd_cloexec(root, 0)
+            .context("duplicate stable Cargo root fd for component walk");
+    }
+    checked_relative_path(relative)?;
+    let mut current = rustix::io::fcntl_dupfd_cloexec(root, 0)
+        .context("duplicate stable Cargo root fd for component walk")?;
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            unreachable!("checked stable Cargo path contained a non-normal component")
+        };
+        current = rustix::fs::openat(
+            &current,
+            component,
+            rustix::fs::OFlags::PATH
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
         )
-    })
+        .with_context(|| {
+            format!(
+                "open stable Cargo directory component {} without following links while resolving {}",
+                component.to_string_lossy(),
+                relative.display(),
+            )
+        })?;
+    }
+    Ok(current)
 }
 
 fn unlink_stable_cargo_path(
@@ -1780,6 +1886,11 @@ fn validate_record(record: &ArtifactTreeRecord, expected_identity: u64) -> Resul
 }
 
 fn read_and_lease_record(path: &Path, identity: u64) -> Result<Option<LeasedRecord>> {
+    // Acquire the one namespace-wide shared gate before observing the record.
+    // A collector can finish before this point, in which case a missing object
+    // is a clean cache miss; after this point it cannot unlink an object before
+    // the bounded materializer opens it.
+    let content_namespace = super::content::lease_content_namespace()?;
     let Some((mut file, before)) = super::content::open_cache_record(path, "artifact tree record")?
     else {
         return Ok(None);
@@ -1811,7 +1922,7 @@ fn read_and_lease_record(path: &Path, identity: u64) -> Result<Option<LeasedReco
     let record: ArtifactTreeRecord = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse artifact tree record {}", path.display()))?;
     validate_record(&record, identity)?;
-    let mut objects = BTreeMap::new();
+    let mut objects = BTreeSet::new();
     for entry in &record.entries {
         let RecordEntry::File {
             content_hash, len, ..
@@ -1820,15 +1931,18 @@ fn read_and_lease_record(path: &Path, identity: u64) -> Result<Option<LeasedReco
             continue;
         };
         let key = (*content_hash, *len);
-        if objects.contains_key(&key) {
+        if !objects.insert(key) {
             continue;
         }
-        let Some(lease) = super::content::lease_content_object(*content_hash, *len)? else {
+        let Some((object, _)) = content_namespace.open_object(*content_hash, *len)? else {
             return Ok(None);
         };
-        objects.insert(key, ObjectLease::Existing(lease));
+        drop(object);
     }
-    Ok(Some(LeasedRecord { record, objects }))
+    Ok(Some(LeasedRecord {
+        record,
+        content_namespace,
+    }))
 }
 
 fn parallel_indexed<T, R, F>(items: Vec<T>, operation: F) -> Result<Vec<R>>
@@ -1889,51 +2003,46 @@ where
         .collect()
 }
 
-fn publish_source(identity: u64, source: ArtifactTreeSource) -> Result<LeasedRecord> {
+fn publish_source(identity: u64, mut source: ArtifactTreeSource) -> Result<LeasedRecord> {
+    source.publish_pinned_window()?;
     validate_source_shape(&source.entries)?;
-    let published = parallel_indexed(source.entries.into_iter().collect(), |(path, entry)| {
-        let path_bytes = path.as_os_str().as_bytes().to_vec();
-        match entry {
-            SourceEntry::Directory { mode } => Ok((
-                RecordEntry::Directory {
+    let content_namespace = match source.content_namespace.take() {
+        Some(namespace) => namespace,
+        None => super::content::lease_content_namespace()?,
+    };
+    let mut entries = source
+        .entries
+        .into_iter()
+        .map(|(path, entry)| {
+            let path_bytes = path.as_os_str().as_bytes().to_vec();
+            match entry {
+                SourceEntry::Directory { mode } => Ok(RecordEntry::Directory {
                     path: path_bytes,
                     mode,
-                },
-                None,
-            )),
-            SourceEntry::File { pinned, mode } => {
-                let snapshot = super::snapshot_pinned_artifact_file(pinned)
-                    .with_context(|| format!("publish artifact-tree file {}", path.display()))?;
-                let key = (snapshot.content_hash(), snapshot.len());
-                Ok((
-                    RecordEntry::File {
-                        path: path_bytes,
-                        mode,
-                        content_hash: key.0,
-                        len: key.1,
-                    },
-                    Some((key, snapshot)),
-                ))
-            }
-            SourceEntry::Symlink { target } => Ok((
-                RecordEntry::Symlink {
+                }),
+                SourceEntry::File {
+                    file: SourceFile::Published { content_hash, len },
+                    mode,
+                } => Ok(RecordEntry::File {
+                    path: path_bytes,
+                    mode,
+                    content_hash,
+                    len,
+                }),
+                SourceEntry::File {
+                    file: SourceFile::Pinned(_) | SourceFile::Publishing,
+                    ..
+                } => anyhow::bail!(
+                    "artifact-tree file escaped bounded CAS publication: {}",
+                    path.display()
+                ),
+                SourceEntry::Symlink { target } => Ok(RecordEntry::Symlink {
                     path: path_bytes,
                     target: target.as_os_str().as_bytes().to_vec(),
-                },
-                None,
-            )),
-        }
-    })?;
-    let mut entries = Vec::with_capacity(published.len());
-    let mut objects = BTreeMap::new();
-    for (entry, snapshot) in published {
-        entries.push(entry);
-        if let Some((key, snapshot)) = snapshot {
-            objects
-                .entry(key)
-                .or_insert(ObjectLease::Published(snapshot));
-        }
-    }
+                }),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
     entries.sort_by(|left, right| left.path_bytes().cmp(right.path_bytes()));
     let mut record = ArtifactTreeRecord {
         version: RECORD_SCHEMA,
@@ -1943,7 +2052,10 @@ fn publish_source(identity: u64, source: ArtifactTreeSource) -> Result<LeasedRec
     };
     record.integrity_ahash = record_integrity(&record);
     validate_record(&record, identity)?;
-    Ok(LeasedRecord { record, objects })
+    Ok(LeasedRecord {
+        record,
+        content_namespace,
+    })
 }
 
 fn write_record(path: &Path, record: &ArtifactTreeRecord) -> Result<()> {
@@ -2029,13 +2141,13 @@ fn materialize(
                 len,
                 ..
             } => {
-                let object = leased
-                    .objects
-                    .get(&(*content_hash, *len))
+                let (object, object_path) = leased
+                    .content_namespace
+                    .open_object(*content_hash, *len)?
                     .with_context(|| {
-                        format!("artifact tree object lease missing for {content_hash:016x}/{len}")
+                        format!("artifact tree object missing for {content_hash:016x}/{len}")
                     })?;
-                let copied = reflink_required(object.file(), object.path(), &destination)?;
+                let copied = reflink_required(&object, &object_path, &destination)?;
                 anyhow::ensure!(
                     copied == *len,
                     "materialized artifact {} has length {copied}, expected {len}",
@@ -2076,7 +2188,6 @@ fn materialize(
     Ok(MaterializedArtifactTree {
         directory,
         _live: live,
-        _objects: leased.objects,
         cache_root: cache_root.to_path_buf(),
         identity,
         cache_hit,

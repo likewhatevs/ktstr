@@ -1447,6 +1447,36 @@ pub(crate) fn exercise_stale_contention_commit_for_tests() -> Result<(bool, bool
 
 #[cfg(test)]
 pub(crate) fn exercise_candidate_ready_matrix_for_tests() -> Result<()> {
+    let build_watch = ClaimSet::with_permits(
+        0usize..96,
+        0usize..192,
+        0usize..231,
+        FlockMode::Shared,
+        FlockMode::Shared,
+        FlockMode::Exclusive,
+    )
+    .with_admission_class(AdmissionClass::Build);
+    let ordinary_candidate = ClaimSet::with_modes(
+        std::iter::empty(),
+        [0usize],
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let error = registry::validate_claim_within_watch(&ordinary_candidate, &build_watch)
+        .expect_err("an ordinary physical probe must not enter a build watch");
+    let diagnostic = error.to_string();
+    anyhow::ensure!(
+        diagnostic.contains("(admission class)")
+            && diagnostic.contains("cpus(len=192 [")
+            && diagnostic.contains("permits(len=231 [")
+            && diagnostic.len() < 1_024,
+        "immutable-watch diagnostics must identify the invariant without dumping host-sized sets: {diagnostic}",
+    );
+    registry::validate_claim_within_watch(
+        &ordinary_candidate.with_admission_class(AdmissionClass::Build),
+        &build_watch,
+    )?;
+
     let predecessor =
         ClaimSet::with_modes([1usize], [1usize], FlockMode::Shared, FlockMode::Shared);
     let (predecessors, availability) = registry::probe_snapshots_for_tests(

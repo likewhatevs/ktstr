@@ -49,7 +49,10 @@ fn generated_bytes_are_staged_on_the_content_cas_filesystem() {
         .insert_bytes("meta/generated.json", b"{\"generated\":true}", 0o444)
         .expect("stage generated artifact bytes");
 
-    let SourceEntry::File { pinned, mode } = source
+    let SourceEntry::File {
+        file: SourceFile::Pinned(pinned),
+        mode,
+    } = source
         .entries
         .get(Path::new("meta/generated.json"))
         .expect("generated source entry")
@@ -63,6 +66,79 @@ fn generated_bytes_are_staged_on_the_content_cas_filesystem() {
             .unwrap()
             .dev(),
         "strict-FICLONE metadata staging must share the CAS filesystem",
+    );
+}
+
+#[test]
+fn large_source_capture_bounds_pinned_descriptor_ownership() {
+    let _environment = lock_env();
+    let temp = tempfile::tempdir().expect("large artifact source root");
+    let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, temp.path().join("cas"));
+    let input = temp.path().join("input");
+    std::fs::create_dir(&input).expect("create large source input");
+
+    // This is deliberately many publication windows rather than merely one
+    // file beyond the boundary. The invariant being exercised is independent
+    // of the process RLIMIT_NOFILE: source descriptor ownership stays bounded
+    // even when total tree cardinality is arbitrarily larger.
+    let file_count = ARTIFACT_IO_WORKERS_MAX * 17 + 3;
+    for index in 0..file_count {
+        std::fs::write(
+            input.join(format!("entry-{index:04}")),
+            format!("artifact-{index}"),
+        )
+        .expect("write large source entry");
+    }
+
+    let mut source = ArtifactTreeSource::new();
+    source
+        .insert_tree("source", &input)
+        .expect("capture source larger than descriptor window");
+    assert_eq!(source.len(), file_count + 1);
+    assert_eq!(source.peak_pinned_files, ARTIFACT_IO_WORKERS_MAX);
+    assert!(source.pending_pinned_paths.len() < ARTIFACT_IO_WORKERS_MAX);
+    assert_eq!(
+        source
+            .entries
+            .values()
+            .filter(|entry| matches!(
+                entry,
+                SourceEntry::File {
+                    file: SourceFile::Published { .. },
+                    ..
+                }
+            ))
+            .count(),
+        file_count - source.pending_pinned_paths.len(),
+    );
+
+    // Exercise the other former O(files) descriptor owner too: record loading
+    // and private materialization must open CAS objects only inside the same
+    // bounded worker window. Removing the original tree also proves the final
+    // partial pin window names exact inodes rather than mutable pathnames.
+    std::fs::remove_dir_all(&input).expect("remove large source input after capture");
+    let cache = ArtifactTreeCache::new(temp.path().join("records"));
+    let tree = cache
+        .load_or_build(
+            0xfd_b0_001,
+            &temp.path().join("materializations"),
+            "bounded-descriptor-test",
+            || Ok(true),
+            || false,
+            || Ok(source),
+        )
+        .expect("publish and materialize large descriptor-bounded tree");
+    assert_eq!(
+        std::fs::read_to_string(tree.root().join("source/entry-0000")).unwrap(),
+        "artifact-0",
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            tree.root()
+                .join(format!("source/entry-{:04}", file_count - 1)),
+        )
+        .unwrap(),
+        format!("artifact-{}", file_count - 1),
     );
 }
 
@@ -563,7 +639,10 @@ fn stable_cargo_output_is_hashed_once_before_sealing_changes_ctime() {
                 std::fs::write(&output, vec![0x5a; 4 << 20])?;
                 let mut source = ArtifactTreeSource::new();
                 source.insert_file("target/debug/deps/harness", &output)?;
-                let SourceEntry::File { pinned, .. } = source
+                let SourceEntry::File {
+                    file: SourceFile::Pinned(pinned),
+                    ..
+                } = source
                     .entries
                     .get(Path::new("target/debug/deps/harness"))
                     .expect("captured stable Cargo output")
@@ -598,6 +677,58 @@ fn stable_cargo_output_is_hashed_once_before_sealing_changes_ctime() {
     assert_eq!(
         std::fs::read(tree.root().join("target/debug/deps/harness")).unwrap(),
         vec![0x5a; 4 << 20],
+    );
+}
+
+#[test]
+fn stable_cargo_openat_fallback_stays_fd_relative_and_rejects_symlinks() {
+    let temp = tempfile::tempdir().unwrap();
+    let original = temp.path().join("stable-root");
+    let relocated = temp.path().join("stable-root-relocated");
+    std::fs::create_dir_all(original.join("safe/leaf")).unwrap();
+    std::os::unix::fs::symlink("safe", original.join("link")).unwrap();
+    std::os::unix::fs::symlink("leaf", original.join("safe/leaf-link")).unwrap();
+
+    let root = rustix::fs::open(
+        &original,
+        rustix::fs::OFlags::PATH
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .unwrap();
+
+    // Rename the opened tree away and install a different tree at its former
+    // pathname. A pathname-based fallback would now resolve the replacement;
+    // the component walk must remain anchored to the original root fd.
+    std::fs::rename(&original, &relocated).unwrap();
+    std::fs::create_dir_all(original.join("safe/leaf")).unwrap();
+    let opened = open_stable_cargo_directory_at_components(&root, Path::new("safe/leaf"))
+        .expect("open relocated stable directory through its original root fd");
+    let opened_stat = rustix::fs::fstat(&opened).unwrap();
+    let expected = std::fs::metadata(relocated.join("safe/leaf")).unwrap();
+    let replacement = std::fs::metadata(original.join("safe/leaf")).unwrap();
+    assert_eq!(
+        (opened_stat.st_dev, opened_stat.st_ino),
+        (expected.dev(), expected.ino())
+    );
+    assert_ne!(
+        (opened_stat.st_dev, opened_stat.st_ino),
+        (replacement.dev(), replacement.ino()),
+    );
+
+    assert!(
+        open_stable_cargo_directory_at_components(&root, Path::new("link/leaf")).is_err(),
+        "an intermediate symlink must not be traversed",
+    );
+    assert!(
+        open_stable_cargo_directory_at_components(&root, Path::new("safe/leaf-link")).is_err(),
+        "a final symlink must not be traversed",
+    );
+    assert!(
+        open_stable_cargo_directory_at_components(&root, Path::new("safe/../safe/leaf")).is_err(),
+        "a parent component must be rejected before descriptor traversal",
     );
 }
 

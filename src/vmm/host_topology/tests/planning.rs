@@ -2769,6 +2769,7 @@ fn spread_deprioritizes_predecessor_claims_missing_from_proc_locks() {
         1,
         &topo,
         &allowed,
+        admission_protocol::AdmissionClass::Ordinary,
         |candidate| Ok(candidate.llcs.contains(&0)),
     )
     .expect("fold predecessor reservation into snapshots");
@@ -2796,6 +2797,7 @@ fn consolidate_avoids_predecessor_claims_missing_from_proc_locks() {
         1,
         &topo,
         &allowed,
+        admission_protocol::AdmissionClass::Ordinary,
         |candidate| Ok(candidate.llcs.contains(&0)),
     )
     .expect("fold predecessor reservation into snapshots");
@@ -2823,6 +2825,7 @@ fn predecessor_claims_remain_eligible_when_exact_budget_needs_them() {
         2,
         &topo,
         &allowed,
+        admission_protocol::AdmissionClass::Ordinary,
         |candidate| Ok(candidate.llcs.contains(&0)),
     )
     .expect("retain a predecessor when the whole host is required");
@@ -2835,6 +2838,44 @@ fn predecessor_claims_remain_eligible_when_exact_budget_needs_them() {
         PlacementPolicy::Spread { rotation: 0 },
     );
     assert_eq!(selected, vec![0, 1]);
+}
+
+#[test]
+fn physical_replan_candidates_preserve_the_build_watch_class() {
+    let class = admission_protocol::AdmissionClass::Build;
+    let cpu = physical_candidate_for_watch(
+        std::iter::empty(),
+        [7usize],
+        FlockMode::Shared,
+        FlockMode::Shared,
+        class,
+    );
+    let llc = physical_candidate_for_watch(
+        [3usize],
+        std::iter::empty(),
+        FlockMode::Shared,
+        FlockMode::Shared,
+        class,
+    );
+    assert_eq!(cpu.admission_class, class);
+    assert_eq!(llc.admission_class, class);
+
+    let topo = synth_host_topo(&[(vec![0], 0)]);
+    let allowed = std::collections::BTreeSet::from([0usize]);
+    let mut observed = Vec::new();
+    avoid_preceding_claims_when_possible(
+        &spread_snapshots(&[0]),
+        1,
+        &topo,
+        &allowed,
+        class,
+        |candidate| {
+            observed.push(candidate.admission_class);
+            Ok(false)
+        },
+    )
+    .expect("filter build-watch predecessor claims");
+    assert_eq!(observed, vec![class]);
 }
 
 /// The pid-derived rotation breaks the zero-knowledge symmetry:

@@ -264,15 +264,6 @@ impl ContentFileSnapshot {
         self.lease.path()
     }
 
-    /// Open descriptor for the exact leased CAS inode.
-    ///
-    /// Artifact-tree materialization clones from this descriptor rather than
-    /// reopening [`Self::path`], so namespace replacement can never retarget
-    /// a consumer after the lease was validated.
-    pub(crate) fn file(&self) -> &std::fs::File {
-        self.lease.file()
-    }
-
     /// Stable fast content key used by reconstructible cache manifests.
     #[doc(hidden)]
     pub fn content_hash(&self) -> u64 {
