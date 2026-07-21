@@ -1372,13 +1372,90 @@ fn scheduler_identity_not_cancelled(cancelled: &dyn Fn() -> bool) -> Result<(), 
     }
 }
 
+/// Runtime-only ktstr state that must neither split a Cargo artifact identity
+/// nor reach the corresponding stable Cargo producer.
+///
+/// `cargo-ktstr` installs several of these values itself before planning an
+/// artifact (notably the extracted busybox/wprof paths and project/runtime
+/// coordinates). They affect how a finished test or scheduler is executed,
+/// but not the bytes Cargo is asked to build. Keeping one shared list for
+/// identity planning and child sanitization prevents a newly added runtime
+/// coordinate from being fixed on only one side of that contract.
+const CACHED_CARGO_BUILD_KTSTR_RUNTIME_ENVIRONMENT: &[&str] = &[
+    "KTSTR_ADMISSION_CHAINED_RUNNER",
+    "KTSTR_ADMISSION_ORIGINAL_RUNNER",
+    "KTSTR_ADMISSION_TARGET_ENV_KEY",
+    "KTSTR_BUDGET_SECS",
+    "KTSTR_BUILD_DIAGNOSTICS_DIR",
+    "KTSTR_BUSYBOX_PATH",
+    "KTSTR_BYPASS_LLC_LOCKS",
+    "KTSTR_CARGO_TEST_MODE",
+    "KTSTR_CGROUP_WALK_ROOT",
+    "KTSTR_CONTENTION_BYPASS",
+    "KTSTR_CPU_CAP",
+    "KTSTR_DEBUG",
+    "KTSTR_GUEST_INIT",
+    "KTSTR_HOST_CGROUP_PARENT",
+    "KTSTR_JEMALLOC_ALLOC_WORKER_BINARY",
+    "KTSTR_JEMALLOC_PROBE_BINARY",
+    "KTSTR_KERNEL",
+    "KTSTR_KERNEL_COMMIT",
+    "KTSTR_KERNEL_LIST",
+    "KTSTR_KERNEL_PARALLELISM",
+    "KTSTR_LOCK_DIR",
+    "KTSTR_LOG_PASSES",
+    "KTSTR_NO_PERF_MODE",
+    "KTSTR_NO_SKIP_MODE",
+    "KTSTR_ORCHESTRATED",
+    "KTSTR_PERF_ONLY",
+    "KTSTR_PROJECT_COMMIT",
+    "KTSTR_RUN_EPOCH",
+    "KTSTR_RUNS_ROOT",
+    "KTSTR_SCHEDULER",
+    "KTSTR_SCHEDULER_MANIFEST",
+    "KTSTR_SCHEDULER_PROFILE",
+    "KTSTR_SIDECAR_DIR",
+    "KTSTR_SOURCE_ROOT_REMAPS",
+    "KTSTR_STUCK_POLL_MS",
+    "KTSTR_TEST_KERNEL",
+    "KTSTR_VERBOSE",
+    "KTSTR_VERIFIER_CELL_OWNERSHIP_MANIFEST",
+    "KTSTR_VERIFIER_RAW",
+    "KTSTR_VERIFIER_RESULT_DIR",
+    "KTSTR_VERIFIER_SCHEDULER",
+    "KTSTR_WPROF_PATH",
+];
+
+/// Operational cache controls are intentionally inherited by a producer, but
+/// cannot describe its output bytes and therefore must not enter its key.
+/// In particular, ghars supplies one trust-zone-wide `KTSTR_CACHE_DIR`; the
+/// scheduler build script uses it to share exact gix source nodes across
+/// runner homes.
+const SCHEDULER_BUILD_PRESERVED_OPERATIONAL_ENVIRONMENT: &[&str] =
+    &["KTSTR_CACHE_DIR", "KTSTR_GHA_CACHE"];
+
+/// Whether an inherited coordinate belongs to test/runtime orchestration
+/// rather than any cached Cargo producer. Ordinary nextest, llvm-cov nextest,
+/// recursive verifier, and scheduler builds share this classification.
+pub(crate) fn cached_cargo_build_environment_is_runtime(name: &std::ffi::OsStr) -> bool {
+    crate::nextest_process::is_runtime_environment(name)
+        || name
+            .to_str()
+            .is_some_and(|name| CACHED_CARGO_BUILD_KTSTR_RUNTIME_ENVIRONMENT.contains(&name))
+}
+
 fn scheduler_build_environment_is_nonsemantic(name: &std::ffi::OsStr) -> bool {
-    if crate::nextest_process::is_runtime_environment(name) {
+    if cached_cargo_build_environment_is_runtime(name) {
         return true;
     }
     let Some(name) = name.to_str() else {
         return false;
     };
+    if name == "LLVM_PROFILE_FILE"
+        || SCHEDULER_BUILD_PRESERVED_OPERATIONAL_ENVIRONMENT.contains(&name)
+    {
+        return true;
+    }
 
     // This denylist is intentionally operational rather than build-oriented:
     // output placement, concurrency/jobserver controls, terminal/session
@@ -1429,35 +1506,7 @@ fn scheduler_build_environment_is_nonsemantic(name: &std::ffi::OsStr) -> bool {
         "HOSTNAME",
         "INVOCATION_ID",
         "JOURNAL_STREAM",
-        "KTSTR_ADMISSION_CHAINED_RUNNER",
-        "KTSTR_ADMISSION_ORIGINAL_RUNNER",
-        "KTSTR_ADMISSION_TARGET_ENV_KEY",
-        "KTSTR_BUILD_DIAGNOSTICS_DIR",
-        "KTSTR_CACHE_DIR",
-        "KTSTR_CGROUP_WALK_ROOT",
-        "KTSTR_CPU_CAP",
-        "KTSTR_DEBUG",
-        "KTSTR_HOST_CGROUP_PARENT",
-        "KTSTR_KERNEL",
-        "KTSTR_KERNEL_COMMIT",
-        "KTSTR_KERNEL_LIST",
-        "KTSTR_LOCK_DIR",
-        "KTSTR_NO_PERF_MODE",
-        "KTSTR_NO_SKIP_MODE",
-        "KTSTR_ORCHESTRATED",
-        "KTSTR_PERF_ONLY",
-        "KTSTR_RUN_EPOCH",
-        "KTSTR_RUNS_ROOT",
-        "KTSTR_SCHEDULER_MANIFEST",
-        "KTSTR_SIDECAR_DIR",
-        "KTSTR_TEST_KERNEL",
-        "KTSTR_VERBOSE",
-        "KTSTR_VERIFIER_CELL_OWNERSHIP_MANIFEST",
-        "KTSTR_VERIFIER_RAW",
-        "KTSTR_VERIFIER_RESULT_DIR",
-        "KTSTR_VERIFIER_SCHEDULER",
         "LESS",
-        "LLVM_PROFILE_FILE",
         "LOGNAME",
         "LS_COLORS",
         "MAKEFLAGS",
@@ -1584,38 +1633,10 @@ pub(crate) fn scheduler_build_environment(
 /// cache. Compiler wrappers and build-affecting variables remain inherited;
 /// only ktstr runtime orchestration is stripped.
 fn sanitize_scheduler_build_child_environment(command: &mut Command) {
-    for name in [
-        "KTSTR_ADMISSION_CHAINED_RUNNER",
-        "KTSTR_ADMISSION_ORIGINAL_RUNNER",
-        "KTSTR_ADMISSION_TARGET_ENV_KEY",
-        "KTSTR_BUILD_DIAGNOSTICS_DIR",
-        "KTSTR_CACHE_DIR",
-        "KTSTR_CGROUP_WALK_ROOT",
-        "KTSTR_CPU_CAP",
-        "KTSTR_DEBUG",
-        "KTSTR_HOST_CGROUP_PARENT",
-        "KTSTR_KERNEL",
-        "KTSTR_KERNEL_COMMIT",
-        "KTSTR_KERNEL_LIST",
-        "KTSTR_LOCK_DIR",
-        "KTSTR_NO_PERF_MODE",
-        "KTSTR_NO_SKIP_MODE",
-        "KTSTR_ORCHESTRATED",
-        "KTSTR_PERF_ONLY",
-        "KTSTR_RUN_EPOCH",
-        "KTSTR_RUNS_ROOT",
-        "KTSTR_SCHEDULER_MANIFEST",
-        "KTSTR_SIDECAR_DIR",
-        "KTSTR_TEST_KERNEL",
-        "KTSTR_VERBOSE",
-        "KTSTR_VERIFIER_CELL_OWNERSHIP_MANIFEST",
-        "KTSTR_VERIFIER_RAW",
-        "KTSTR_VERIFIER_RESULT_DIR",
-        "KTSTR_VERIFIER_SCHEDULER",
-        "LLVM_PROFILE_FILE",
-    ] {
+    for &name in CACHED_CARGO_BUILD_KTSTR_RUNTIME_ENVIRONMENT {
         command.env_remove(name);
     }
+    command.env_remove("LLVM_PROFILE_FILE");
     crate::nextest_process::remove_runtime_environment(command);
     for (name, _) in std::env::vars_os() {
         if name
@@ -3107,7 +3128,7 @@ mod tests {
     #[test]
     fn scheduler_build_environment_hashes_arbitrary_inputs_but_normalizes_runner_locations() {
         let workspace = Path::new("/runner/work/ktstr");
-        let environment = vec![
+        let mut environment = vec![
             ("HOME".into(), "/runner/home".into()),
             (
                 "PATH".into(),
@@ -3118,24 +3139,32 @@ mod tests {
             ("PWD".into(), "/runner/work/ktstr".into()),
             ("GITHUB_RUN_ID".into(), "123456".into()),
             ("SCCACHE_IDLE_TIMEOUT".into(), "0".into()),
-            ("KTSTR_KERNEL".into(), "/cache/kernel-7.1".into()),
-            (
-                "KTSTR_SIDECAR_DIR".into(),
-                "/runner/work/ktstr/target/sidecars/run-123".into(),
-            ),
-            (
-                "KTSTR_BUILD_DIAGNOSTICS_DIR".into(),
-                "/runner/work/ktstr/target/diagnostics/run-123".into(),
-            ),
-            (
-                "KTSTR_ADMISSION_TARGET_ENV_KEY".into(),
-                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER".into(),
-            ),
             (
                 "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER".into(),
                 "/proc/1234/exe __ktstr_admission_runner".into(),
             ),
         ];
+        environment.extend(
+            CACHED_CARGO_BUILD_KTSTR_RUNTIME_ENVIRONMENT
+                .iter()
+                .map(|name| {
+                    (
+                        std::ffi::OsString::from(*name),
+                        std::ffi::OsString::from(format!("runtime-{name}")),
+                    )
+                }),
+        );
+        environment.push(("LLVM_PROFILE_FILE".into(), "/tmp/profile-%p.profraw".into()));
+        environment.extend(
+            SCHEDULER_BUILD_PRESERVED_OPERATIONAL_ENVIRONMENT
+                .iter()
+                .map(|name| {
+                    (
+                        std::ffi::OsString::from(*name),
+                        std::ffi::OsString::from(format!("operational-{name}")),
+                    )
+                }),
+        );
         let semantic =
             scheduler_build_environment_from(workspace, environment, &|| false).expect("env key");
         let semantic = semantic.into_iter().collect::<BTreeMap<_, _>>();
@@ -3155,16 +3184,19 @@ mod tests {
             Some(&b"0".to_vec()),
             "the scheduler identity must describe the forced non-incremental producer",
         );
-        for operational in [
-            "PWD",
-            "GITHUB_RUN_ID",
-            "SCCACHE_IDLE_TIMEOUT",
-            "KTSTR_KERNEL",
-            "KTSTR_SIDECAR_DIR",
-            "KTSTR_BUILD_DIAGNOSTICS_DIR",
-            "KTSTR_ADMISSION_TARGET_ENV_KEY",
-            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER",
-        ] {
+        for operational in ["PWD", "GITHUB_RUN_ID", "SCCACHE_IDLE_TIMEOUT"]
+            .into_iter()
+            .chain(CACHED_CARGO_BUILD_KTSTR_RUNTIME_ENVIRONMENT.iter().copied())
+            .chain(
+                SCHEDULER_BUILD_PRESERVED_OPERATIONAL_ENVIRONMENT
+                    .iter()
+                    .copied(),
+            )
+            .chain([
+                "LLVM_PROFILE_FILE",
+                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER",
+            ])
+        {
             assert!(
                 !semantic.contains_key(std::ffi::OsStr::new(operational)),
                 "{operational} is operational plumbing rather than a scheduler build input",
@@ -3207,13 +3239,6 @@ mod tests {
     fn scheduler_build_child_removes_runtime_orchestration_but_keeps_sccache() {
         let mut command = Command::new("cargo");
         command
-            .env("KTSTR_KERNEL", "/cache/kernel-7.1")
-            .env("KTSTR_SIDECAR_DIR", "/tmp/sidecars")
-            .env(
-                "KTSTR_ADMISSION_TARGET_ENV_KEY",
-                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER",
-            )
-            .env("LLVM_PROFILE_FILE", "/tmp/profraw-%p")
             .env("NEXTEST", "1")
             .env("NEXTEST_ATTEMPT", "7")
             .env("NEXTEST_TEST_GLOBAL_SLOT", "41")
@@ -3221,6 +3246,13 @@ mod tests {
             .env("CARGO_INCREMENTAL", "1")
             .env("RUSTC_WRAPPER", "/usr/local/bin/sccache")
             .env("SCHEDULER_FIXTURE_MODE", "semantic");
+        for &name in CACHED_CARGO_BUILD_KTSTR_RUNTIME_ENVIRONMENT {
+            command.env(name, format!("runtime-{name}"));
+        }
+        command
+            .env("KTSTR_CACHE_DIR", "/var/cache/ktstr")
+            .env("KTSTR_GHA_CACHE", "1")
+            .env("LLVM_PROFILE_FILE", "/tmp/profile-%p.profraw");
 
         sanitize_scheduler_build_child_environment(&mut command);
         let environment = command
@@ -3228,22 +3260,33 @@ mod tests {
             .map(|(name, value)| (name.to_owned(), value.map(std::ffi::OsStr::to_owned)))
             .collect::<BTreeMap<_, _>>();
 
-        for removed in [
-            "KTSTR_KERNEL",
-            "KTSTR_SIDECAR_DIR",
-            "KTSTR_ADMISSION_TARGET_ENV_KEY",
-            "LLVM_PROFILE_FILE",
-            "NEXTEST",
-            "NEXTEST_ATTEMPT",
-            "NEXTEST_TEST_GLOBAL_SLOT",
-            "NEXTEST_TEST_NAME",
-        ] {
+        for removed in CACHED_CARGO_BUILD_KTSTR_RUNTIME_ENVIRONMENT
+            .iter()
+            .copied()
+            .chain([
+                "LLVM_PROFILE_FILE",
+                "NEXTEST",
+                "NEXTEST_ATTEMPT",
+                "NEXTEST_TEST_GLOBAL_SLOT",
+                "NEXTEST_TEST_NAME",
+            ])
+        {
             assert_eq!(
                 environment.get(std::ffi::OsStr::new(removed)),
                 Some(&None),
                 "{removed} must be explicitly removed from the scheduler Cargo child",
             );
         }
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("KTSTR_CACHE_DIR")),
+            Some(&Some("/var/cache/ktstr".into())),
+            "the machine-wide content cache must remain available to scheduler build scripts",
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("KTSTR_GHA_CACHE")),
+            Some(&Some("1".into())),
+            "remote-cache policy is operational but remains available to the producer",
+        );
         assert_eq!(
             environment.get(std::ffi::OsStr::new("RUSTC_WRAPPER")),
             Some(&Some("/usr/local/bin/sccache".into())),

@@ -109,10 +109,11 @@ fn emit_docsrs_stubs(out_dir: &std::path::Path) {
 /// body apart from taking `out_dir` as a parameter.
 #[cfg(feature = "vendored")]
 fn vendored_main(out_dir: PathBuf) {
-    // Cache invalidation: track the env var that selects a kernel
-    // and the build-script inputs (kernel_path resolver, C generator
-    // source). Deliberately NOT emitting a `rerun-if-changed` on the
-    // BTF source path itself:
+    // Cache invalidation: track the ordinary kernel selector, the explicit
+    // compile-BTF selector used by cargo-ktstr's content-addressed producer,
+    // and the build-script inputs (kernel_path resolver, C generator source).
+    // Deliberately NOT emitting a `rerun-if-changed` on the BTF source path
+    // itself:
     //
     //   1. `vmlinux` is consumed here only as the BTF source for
     //      `vmlinux.h` generation on the C side below, not as an
@@ -144,6 +145,7 @@ fn vendored_main(out_dir: PathBuf) {
     // mirrors `src/test_support/sidecar/mod.rs::sidecar_variant_hash`
     // so the project uses a single stable hash family.
     println!("cargo:rerun-if-env-changed=KTSTR_KERNEL");
+    println!("cargo:rerun-if-env-changed=KTSTR_BUILD_BTF");
     // Build-blob publication uses the same cache-root cascade as runtime
     // artifacts. ghars supplies one trust-zone-wide KTSTR_CACHE_DIR to every
     // runner; the fallbacks retain ordinary local Cargo behavior.
@@ -165,7 +167,16 @@ fn vendored_main(out_dir: PathBuf) {
     // anyway), so a disappearing source is not a build-blocking
     // event. A MISSING `vmlinux.h` still panics below because we
     // have nothing to fall back on.
-    let current_btf = resolve_btf(ktstr_kernel.as_deref());
+    // cargo-ktstr deliberately decouples compile-time BPF type generation
+    // from the selected guest kernel: all matrix lanes on one host/arch use
+    // one explicitly content-keyed BTF, while libbpf applies CO-RE against
+    // each guest's real BTF at load time. Direct Cargo builds retain the
+    // historical KTSTR_KERNEL -> local/host resolver when the explicit build
+    // input is absent.
+    let current_btf = env::var_os("KTSTR_BUILD_BTF")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| resolve_btf(ktstr_kernel.as_deref()));
     // Hash the BTF source for drift detection. Fault-tolerant: a
     // BTF path that resolved but whose bytes cannot be read (EACCES,
     // or a race where the file vanished between resolve and read)

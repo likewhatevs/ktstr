@@ -1345,9 +1345,31 @@ impl CachedNextestMode {
     }
 }
 
+const KTSTR_BUILD_BTF_ENV: &str = "KTSTR_BUILD_BTF";
+
 fn apply_command_envs(command: &mut Command, environment: &[(OsString, OsString)]) {
     for (name, value) in environment {
         command.env(name, value);
+    }
+}
+
+/// Remove test/runtime coordinates from one immutable Cargo producer.
+///
+/// Inspect inherited and explicitly overlaid values. The latter matters when
+/// the parent assembled the command before selecting the stable producer;
+/// `env_remove` must win over both sources. Coverage's LLVM_PROFILE_FILE is
+/// deliberately not part of this generic ktstr-runtime classification.
+fn sanitize_cached_cargo_build_child_environment(command: &mut Command) {
+    let mut names = std::env::vars_os()
+        .map(|(name, _)| name)
+        .chain(command.get_envs().map(|(name, _)| name.to_os_string()))
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    for name in names {
+        if crate::verifier::cached_cargo_build_environment_is_runtime(&name) {
+            command.env_remove(name);
+        }
     }
 }
 
@@ -1521,7 +1543,7 @@ fn stable_cargo_producer_environment(
 ) -> Vec<(OsString, OsString)> {
     let mut environment = environment
         .iter()
-        .filter(|(name, _)| !crate::nextest_process::is_runtime_environment(name))
+        .filter(|(name, _)| !crate::verifier::cached_cargo_build_environment_is_runtime(name))
         .cloned()
         .collect::<Vec<_>>();
     set_or_replace_environment(&mut environment, "CARGO_INCREMENTAL", "0");
@@ -1580,7 +1602,7 @@ fn llvm_cov_build_environment(
         .env("CARGO_LLVM_COV_TARGET_DIR", output_target)
         .env("CARGO_LLVM_COV_BUILD_DIR", output_build);
     apply_command_envs(&mut command, producer_environment);
-    crate::nextest_process::remove_runtime_environment(&mut command);
+    sanitize_cached_cargo_build_child_environment(&mut command);
     let output = crate::interrupt::run_output(command)
         .map_err(|error| format!("run cargo llvm-cov show-env: {error}"))?;
     if !output.status.success() {
@@ -2567,7 +2589,7 @@ fn nextest_binary_list_command(
     command.args(force_nextest_output(build_args, output_target));
     command.args(["--list-type=binaries-only", "--message-format=json"]);
     apply_command_envs(&mut command, producer_environment);
-    crate::nextest_process::remove_runtime_environment(&mut command);
+    sanitize_cached_cargo_build_child_environment(&mut command);
     command
 }
 
@@ -2588,7 +2610,7 @@ fn cargo_metadata_json(
         .current_dir(stable_workspace)
         .env("CARGO_TARGET_DIR", output_target);
     apply_command_envs(&mut command, producer_environment);
-    crate::nextest_process::remove_runtime_environment(&mut command);
+    sanitize_cached_cargo_build_child_environment(&mut command);
     let output = crate::interrupt::run_output(command)
         .map_err(|error| format!("run Cargo metadata for nextest reuse: {error}"))?;
     if !output.status.success() {
@@ -2601,18 +2623,19 @@ fn cargo_metadata_json(
     Ok(output.stdout)
 }
 
-fn kernel_build_identity(kernel_dir: Option<&Path>) -> Result<String, String> {
-    let kernel = kernel_dir.and_then(Path::to_str);
-    let Some(btf) = ktstr::kernel_path::resolve_btf(kernel) else {
-        return Ok("kernel-btf=absent".to_string());
-    };
-    let digest = ktstr::cache::content_file_digest(&btf).map_err(|error| {
-        format!(
-            "cargo ktstr: digest selected kernel BTF {} for harness cache identity: {error:#}",
-            btf.display(),
-        )
-    })?;
-    Ok(format!("kernel-btf={digest:016x}"))
+/// Select one compile-time BTF for all guest-kernel lanes on this host/arch.
+///
+/// ktstr's BPF objects are CO-RE: the selected guest BTF is consumed when the
+/// object is loaded, not when this harness is compiled. Prefer the running
+/// host's stable sysfs BTF, then the ordinary host/local resolver, retaining
+/// the selected guest only as a last-resort source on hosts without either.
+fn cached_cargo_build_btf(kernel_dir: Option<&Path>) -> Option<PathBuf> {
+    let host = Path::new("/sys/kernel/btf/vmlinux");
+    if host.is_file() {
+        return Some(host.to_path_buf());
+    }
+    ktstr::kernel_path::resolve_btf(None)
+        .or_else(|| ktstr::kernel_path::resolve_btf(kernel_dir.and_then(Path::to_str)))
 }
 
 fn producer_environment_identity(
@@ -2621,22 +2644,11 @@ fn producer_environment_identity(
     let mut identity = Vec::with_capacity(environment.len());
     for (name, value) in environment {
         let name_text = name.to_string_lossy();
-        if crate::nextest_process::is_runtime_environment(name)
-            || matches!(
-                name_text.as_ref(),
-                ktstr::KTSTR_NO_PERF_MODE_ENV
-                    | ktstr::KTSTR_NO_SKIP_MODE_ENV
-                    | ktstr::KTSTR_SCHEDULER_PROFILE_ENV
-                    | ktstr::KTSTR_ORCHESTRATED_ENV
-                    | ktstr::KTSTR_KERNEL_COMMIT_ENV
-                    | ktstr::KTSTR_KERNEL_LIST_ENV
-                    | ktstr::KTSTR_KERNEL_ENV
-            )
-        {
+        if crate::verifier::cached_cargo_build_environment_is_runtime(name) {
             // These values shape runtime scheduling/listing, not the Cargo
             // artifact closure. Nextest coordinates describe only the current
-            // test attempt. Kernel build identity is represented by the
-            // selected BTF content above, never by its checkout pathname.
+            // test attempt. The canonical compile BTF is installed below as
+            // an explicit content-digested build input.
             continue;
         }
         if name_text == "BPF_EXTRA_CFLAGS_PRE_INCL" {
@@ -2705,12 +2717,18 @@ pub(crate) fn load_or_build_nextest_artifacts(
     // both dead weight in the captured output and large enough to exhaust a
     // busy CI host. Normalize before computing identity and use the same
     // effective environment for every producer-side Cargo command.
-    let producer_environment = stable_cargo_producer_environment(producer_environment);
+    let mut producer_environment = stable_cargo_producer_environment(producer_environment);
+    if let Some(btf) = cached_cargo_build_btf(kernel_dir) {
+        set_or_replace_environment(
+            &mut producer_environment,
+            KTSTR_BUILD_BTF_ENV,
+            btf.into_os_string(),
+        );
+    }
     let invocation_dir = std::env::current_dir()
         .map_err(|error| format!("read nextest producer invocation directory: {error}"))?;
     let mut identity_surface = Vec::new();
     identity_surface.push(format!("release={release}"));
-    identity_surface.push(kernel_build_identity(kernel_dir)?);
     identity_surface.extend(
         llvm_cov_environment_args
             .iter()
@@ -7873,6 +7891,14 @@ path = "junit.xml"
         let environment = stable_cargo_producer_environment(&[
             (OsString::from("CARGO_INCREMENTAL"), OsString::from("1")),
             (
+                OsString::from(ktstr::KTSTR_KERNEL_ENV),
+                OsString::from("/runtime/guest-kernel"),
+            ),
+            (
+                OsString::from(ktstr::KTSTR_BUSYBOX_PATH_ENV),
+                OsString::from("/runtime/busybox"),
+            ),
+            (
                 OsString::from("SCHEDULER_FIXTURE_MODE"),
                 OsString::from("semantic"),
             ),
@@ -7904,6 +7930,21 @@ path = "junit.xml"
                 .any(|entry| entry == "producer-env:CARGO_INCREMENTAL=1"),
             "the inherited incremental setting must not survive normalization",
         );
+        for runtime in [ktstr::KTSTR_KERNEL_ENV, ktstr::KTSTR_BUSYBOX_PATH_ENV] {
+            assert!(
+                environment
+                    .iter()
+                    .all(|(name, _)| name != OsStr::new(runtime)),
+                "{runtime} must remain runtime-only for the cached producer",
+            );
+            assert!(
+                !matches!(
+                    command_environment.get(OsStr::new(runtime)),
+                    Some(Some(_))
+                ),
+                "{runtime} must be absent from the Cargo child",
+            );
+        }
     }
 
     #[test]
@@ -7923,6 +7964,14 @@ path = "junit.xml"
                 (
                     OsString::from("SCHEDULER_FIXTURE_MODE"),
                     OsString::from(fixture),
+                ),
+                (
+                    OsString::from(ktstr::KTSTR_KERNEL_ENV),
+                    OsString::from(format!("/runtime/kernel-{attempt}")),
+                ),
+                (
+                    OsString::from(ktstr::KTSTR_RUN_EPOCH_ENV),
+                    OsString::from(format!("epoch-{slot}")),
                 ),
             ]
         };
@@ -7958,6 +8007,8 @@ path = "junit.xml"
             "NEXTEST_ATTEMPT",
             "NEXTEST_TEST_GLOBAL_SLOT",
             "NEXTEST_TEST_NAME",
+            ktstr::KTSTR_KERNEL_ENV,
+            ktstr::KTSTR_RUN_EPOCH_ENV,
         ] {
             assert_eq!(
                 command_environment.get(OsStr::new(removed)),
@@ -7973,10 +8024,10 @@ path = "junit.xml"
 
         let stable = stable_cargo_producer_environment(&retry);
         assert!(
-            stable
-                .iter()
-                .all(|(name, _)| !crate::nextest_process::is_runtime_environment(name)),
-            "normalized producer overlays must not retain nextest runtime coordinates",
+            stable.iter().all(|(name, _)| {
+                !crate::verifier::cached_cargo_build_environment_is_runtime(name)
+            }),
+            "normalized producer overlays must not retain nextest or ktstr runtime coordinates",
         );
     }
 
