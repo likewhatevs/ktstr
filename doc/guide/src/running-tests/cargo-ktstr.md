@@ -280,11 +280,14 @@ merge every variant's profraw into a single report.
 
 <a id="profraw-layout"></a>
 
-Profraw files accumulate across runs — including host-side files
-that plain `cargo ktstr test` writes next to the cargo-ktstr binary
-(an `LLVM_PROFILE_FILE` injection that keeps `default.profraw` out
-of your kernel source tree; export `LLVM_PROFILE_FILE` yourself to
-opt out). To clean up:
+Managed `cargo ktstr coverage` runs remove their private `*.profraw`
+shards after `cargo llvm-cov report` merges them successfully. A failed
+merge, `--no-report`, or an interrupted run preserves the shards so the
+operator can recover or inspect them. Host-side files from plain
+`cargo ktstr test` also remain next to the cargo-ktstr binary (an
+`LLVM_PROFILE_FILE` injection keeps `default.profraw` out of your kernel
+source tree; export `LLVM_PROFILE_FILE` yourself to opt out). To remove
+retained shards manually:
 
 ```sh
 cargo ktstr llvm-cov clean --profraw-only          # only *.profraw under target/llvm-cov-target/
