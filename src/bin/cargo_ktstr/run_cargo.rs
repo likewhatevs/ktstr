@@ -1528,11 +1528,47 @@ fn stable_cargo_producer_environment(
     environment
 }
 
+/// Retarget cargo-llvm-cov's complete output environment as one unit.
+///
+/// cargo-llvm-cov discovers raw profiles by scanning the immediate
+/// `CARGO_LLVM_COV_TARGET_DIR` for `*.profraw`. `LLVM_PROFILE_FILE` therefore
+/// has to name a file directly below that same directory: pointing it at a
+/// private child silently lets every test write valid profiles that the later
+/// `report` subcommand cannot see.
+fn retarget_llvm_cov_environment(
+    environment: &mut Vec<(OsString, OsString)>,
+    output_target: &Path,
+    output_build: &Path,
+) {
+    let profile_name = environment
+        .iter()
+        .find(|(name, _)| name == OsStr::new("LLVM_PROFILE_FILE"))
+        .and_then(|(_, value)| Path::new(value).file_name())
+        .map_or_else(
+            || OsString::from("ktstr-%p-%m.profraw"),
+            OsStr::to_os_string,
+        );
+    set_or_replace_environment(
+        environment,
+        "CARGO_LLVM_COV_TARGET_DIR",
+        output_target.as_os_str(),
+    );
+    set_or_replace_environment(
+        environment,
+        "CARGO_LLVM_COV_BUILD_DIR",
+        output_build.as_os_str(),
+    );
+    set_or_replace_environment(
+        environment,
+        "LLVM_PROFILE_FILE",
+        output_target.join(profile_name).into_os_string(),
+    );
+}
+
 fn llvm_cov_build_environment(
     stable_workspace: &Path,
     output_target: &Path,
     output_build: &Path,
-    profraw_directory: &Path,
     show_env_args: &[String],
     producer_environment: &[(OsString, OsString)],
 ) -> Result<Vec<(OsString, OsString)>, String> {
@@ -1555,29 +1591,7 @@ fn llvm_cov_build_environment(
         ));
     }
     let mut environment = parse_llvm_cov_show_env(&output.stdout)?;
-    set_or_replace_environment(
-        &mut environment,
-        "CARGO_LLVM_COV_TARGET_DIR",
-        output_target.as_os_str(),
-    );
-    set_or_replace_environment(
-        &mut environment,
-        "CARGO_LLVM_COV_BUILD_DIR",
-        output_build.as_os_str(),
-    );
-    let profile_name = environment
-        .iter()
-        .find(|(name, _)| name == OsStr::new("LLVM_PROFILE_FILE"))
-        .and_then(|(_, value)| Path::new(value).file_name())
-        .map_or_else(
-            || OsString::from("ktstr-%p-%m.profraw"),
-            OsStr::to_os_string,
-        );
-    set_or_replace_environment(
-        &mut environment,
-        "LLVM_PROFILE_FILE",
-        profraw_directory.join(profile_name).into_os_string(),
-    );
+    retarget_llvm_cov_environment(&mut environment, output_target, output_build);
     Ok(environment)
 }
 
@@ -2384,9 +2398,9 @@ const PROFRAW_CLEANUP_DIAGNOSTIC_CHARS: usize = 320;
 
 /// Post-run state needed to finish a cached cargo-llvm-cov invocation.
 ///
-/// The test process writes raw counters into the stable cached target, while
-/// the report itself runs from the caller's writable checkout. Keeping the
-/// owned raw directory here makes report/merge and reclamation one ordered
+/// The test process writes raw counters into its private materialized target,
+/// while the report itself runs from the caller's writable checkout. Keeping
+/// the owned raw directory here makes report/merge and reclamation one ordered
 /// lifecycle instead of leaving failed test runs to accumulate shards.
 struct CachedCoverageReport {
     report_args: Vec<String>,
@@ -2738,17 +2752,6 @@ pub(crate) fn load_or_build_nextest_artifacts(
             &stable_invocation_dir,
             output_target,
         )?;
-        // Artifact closure publication is strict FICLONE. Keep producer-side
-        // profiles on the deterministic Cargo-output filesystem rather than
-        // the process-global temporary filesystem, which is commonly a
-        // separate tmpfs and would make coverage publication fail with EXDEV.
-        let profraw = output_target.join("ktstr-profraw");
-        std::fs::create_dir_all(&profraw).map_err(|error| {
-            format!(
-                "create nextest producer profraw directory {}: {error}",
-                profraw.display()
-            )
-        })?;
         let mut environment = producer_environment.clone();
         set_or_replace_environment(
             &mut environment,
@@ -2760,7 +2763,6 @@ pub(crate) fn load_or_build_nextest_artifacts(
                 &stable_invocation_dir,
                 output_target,
                 &output_build,
-                &profraw,
                 &llvm_cov_environment_args,
                 &producer_environment,
             )?);
@@ -2798,7 +2800,7 @@ pub(crate) fn load_or_build_nextest_artifacts(
                     crate::nextest_artifact_cache::capture_source_with_producer_profiles(
                         &build.stdout,
                         &cargo_metadata,
-                        Some(&profraw),
+                        Some(output_target),
                     )
                 } else {
                     crate::nextest_artifact_cache::capture_source(&build.stdout, &cargo_metadata)
@@ -3679,7 +3681,11 @@ fn run_cargo_sub(
                 cmd.env("LLVM_PROFILE_FILE", pattern);
             }
         } else {
-            let profraw_directory = cached.target_directory.join("ktstr-profraw");
+            // cargo-llvm-cov's report path scans this directory itself rather
+            // than following LLVM_PROFILE_FILE into a child directory. Keep
+            // execution, report discovery, and post-merge cleanup on the
+            // exact same private materialized target root.
+            let profraw_directory = cached.target_directory.clone();
             std::fs::create_dir_all(&profraw_directory).map_err(|error| {
                 format!(
                     "cargo ktstr: create cached coverage profile directory {}: {error}",
@@ -3698,7 +3704,6 @@ fn run_cargo_sub(
                 &final_run_dir,
                 &cached.target_directory,
                 &cached.build_directory,
-                &profraw_directory,
                 &coverage_environment_args,
                 &producer_environment,
             )?;
@@ -5631,6 +5636,7 @@ pub(crate) fn run_llvm_cov(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use crate::test_env::{ChildEnv, is_reexec_case, reexec_current_test};
@@ -6531,6 +6537,54 @@ path = "junit.xml"
                     OsString::from("-Cinstrument-coverage"),
                 ),
             ],
+        );
+    }
+
+    #[test]
+    fn cached_coverage_retargets_profile_writes_to_the_report_scan_root() {
+        let target = Path::new("/cache/materialized/target");
+        let build = Path::new("/cache/materialized/build");
+        let mut environment = vec![
+            (
+                OsString::from("CARGO_LLVM_COV_TARGET_DIR"),
+                OsString::from("/producer/target"),
+            ),
+            (
+                OsString::from("CARGO_LLVM_COV_BUILD_DIR"),
+                OsString::from("/producer/build"),
+            ),
+            (
+                OsString::from("LLVM_PROFILE_FILE"),
+                OsString::from("/producer/private/fixture-%p-%m.profraw"),
+            ),
+        ];
+
+        retarget_llvm_cov_environment(&mut environment, target, build);
+
+        let environment = environment.into_iter().collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment
+                .get(OsStr::new("CARGO_LLVM_COV_TARGET_DIR"))
+                .map(OsString::as_os_str),
+            Some(target.as_os_str()),
+        );
+        assert_eq!(
+            environment
+                .get(OsStr::new("CARGO_LLVM_COV_BUILD_DIR"))
+                .map(OsString::as_os_str),
+            Some(build.as_os_str()),
+        );
+        let profile = environment
+            .get(OsStr::new("LLVM_PROFILE_FILE"))
+            .expect("retargeted profile environment");
+        assert_eq!(
+            profile,
+            &target.join("fixture-%p-%m.profraw").into_os_string(),
+        );
+        assert_eq!(
+            Path::new(profile).parent(),
+            Some(target),
+            "cargo-llvm-cov report scans only the immediate target directory",
         );
     }
 

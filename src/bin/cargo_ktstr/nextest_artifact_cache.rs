@@ -14,7 +14,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-const IDENTITY_SCHEMA: u32 = 7;
+const IDENTITY_SCHEMA: u32 = 8;
 const SOURCE_IDENTITY_SCHEMA: u32 = 5;
 const STAMP_SCHEMA: u32 = 1;
 const CARGO_METADATA_PATH: &str = "meta/cargo-metadata.json";
@@ -348,9 +348,10 @@ pub(crate) fn capture_source(
 }
 
 /// Capture a coverage producer's build-script/proc-macro profiles beside the
-/// reusable target closure. Each private materialization then starts with
-/// those profiles in `target/ktstr-profraw`, and the final nextest run writes
-/// its own profiles into the same private directory before llvm-cov reports.
+/// reusable target closure. cargo-llvm-cov finds raw profiles only in the
+/// immediate target directory, so each private materialization starts with
+/// those profiles directly below `target`; the final nextest run writes there
+/// too before llvm-cov reports.
 pub(crate) fn capture_source_with_producer_profiles(
     binaries_metadata: &[u8],
     cargo_metadata: &[u8],
@@ -448,14 +449,44 @@ pub(crate) fn capture_source_with_producer_profiles(
         )?;
     }
     if let Some(producer_profiles) = producer_profiles {
-        source
-            .insert_tree(Path::new("target/ktstr-profraw"), producer_profiles)
+        let mut entries = std::fs::read_dir(producer_profiles)
             .map_err(|error| {
                 format!(
-                    "capture coverage producer profiles {}: {error:#}",
+                    "read coverage producer profiles {}: {error}",
+                    producer_profiles.display()
+                )
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                format!(
+                    "read coverage producer profile entry in {}: {error}",
                     producer_profiles.display()
                 )
             })?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            if path.extension() != Some(OsStr::new("profraw")) {
+                continue;
+            }
+            let file_type = entry.file_type().map_err(|error| {
+                format!(
+                    "inspect coverage producer profile {}: {error}",
+                    path.display()
+                )
+            })?;
+            if !file_type.is_file() {
+                continue;
+            }
+            source
+                .insert_file(Path::new("target").join(entry.file_name()), &path)
+                .map_err(|error| {
+                    format!(
+                        "capture coverage producer profile {}: {error:#}",
+                        path.display()
+                    )
+                })?;
+        }
     }
     source
         .insert_bytes(CARGO_METADATA_PATH, cargo_metadata, 0o444)
@@ -2941,6 +2972,59 @@ mod tests {
             materialized.root().join("build").is_dir(),
             "--build-dir-remap must retain its structural root independently",
         );
+    }
+
+    #[test]
+    fn coverage_producer_profiles_materialize_at_the_report_scan_root() {
+        let _environment = lock_env();
+        let temp = tempfile::tempdir().unwrap();
+        let cache_root = temp.path().join("cache");
+        let _cache = EnvVarGuard::set(ktstr::KTSTR_CACHE_DIR_ENV, &cache_root);
+        let target = temp.path().join("producer-target");
+        let build = temp.path().join("producer-build");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(target.join("producer-%p.profraw"), b"raw-profile").unwrap();
+        std::fs::write(target.join("not-a-profile.profdata"), b"merged-profile").unwrap();
+        let nested = target.join("nested.profraw");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("hidden.profraw"), b"nested-profile").unwrap();
+        let metadata = serde_json::json!({
+            "rust-build-meta": {
+                "target-directory": target,
+                "build-directory": build,
+            },
+            "rust-binaries": {},
+        });
+        let source = capture_source_with_producer_profiles(
+            &serde_json::to_vec(&metadata).unwrap(),
+            b"{}",
+            Some(&target),
+        )
+        .unwrap();
+        let materialized =
+            ktstr::cache::artifact_tree::ArtifactTreeCache::new(cache_root.join("records"))
+                .load_or_build(
+                    0xc0ff_ee42,
+                    &cache_root.join("materialized"),
+                    "coverage profile fixture",
+                    || Ok(true),
+                    || false,
+                    || Ok(source),
+                )
+                .unwrap();
+        let materialized_target = materialized.root().join("target");
+
+        assert_eq!(
+            std::fs::read(materialized_target.join("producer-%p.profraw")).unwrap(),
+            b"raw-profile",
+        );
+        assert!(
+            !materialized_target.join("ktstr-profraw").exists(),
+            "profiles must not be hidden below the directory cargo-llvm-cov scans",
+        );
+        assert!(!materialized_target.join("not-a-profile.profdata").exists());
+        assert!(!materialized_target.join("nested.profraw").exists());
     }
 
     #[test]
