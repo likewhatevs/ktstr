@@ -668,11 +668,16 @@ struct RunLocks {
     default_shared_fallback: bool,
 }
 
-const PENDING_EXEC_METADATA_VERSION: u16 = 2;
+const PENDING_EXEC_METADATA_VERSION: u16 = 3;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct PendingExecMetadataV2 {
+struct PendingExecMetadataV3 {
     version: u16,
+    descriptor: crate::test_support::AdmissionCellDescriptor,
+}
+
+struct ImportedPendingAdmission {
+    pending: host_topology::protocol::PendingAdmission,
     descriptor: crate::test_support::AdmissionCellDescriptor,
 }
 
@@ -689,13 +694,11 @@ impl RunLocks {
     }
 }
 
-fn take_pending_exec_handoff(
-    vm: &KtstrVm,
-) -> Result<Option<host_topology::protocol::PendingAdmission>> {
+fn take_pending_exec_handoff(vm: &KtstrVm) -> Result<Option<ImportedPendingAdmission>> {
     let Some(imported) = host_topology::protocol::take_pending_exec_handoff()? else {
         return Ok(None);
     };
-    let metadata: PendingExecMetadataV2 =
+    let metadata: PendingExecMetadataV3 =
         postcard::from_bytes(&imported.metadata).context("decode pending pre-exec admission")?;
     anyhow::ensure!(
         metadata.version == PENDING_EXEC_METADATA_VERSION,
@@ -725,7 +728,58 @@ fn take_pending_exec_handoff(
         metadata.descriptor.mode,
         expected_mode,
     );
-    Ok(Some(imported.pending))
+    Ok(Some(ImportedPendingAdmission {
+        pending: imported.pending,
+        descriptor: metadata.descriptor,
+    }))
+}
+
+fn validate_prepared_exec_handoff(
+    vm: &KtstrVm,
+    descriptor: &crate::test_support::AdmissionCellDescriptor,
+    prepared_memory_mib: u32,
+) -> Result<()> {
+    let built_memory_min_mib = vm.memory_mib.unwrap_or(vm.memory_min_mib.max(256));
+    #[cfg(feature = "wprof")]
+    let built_wprof = vm.wprof.is_some();
+    #[cfg(not(feature = "wprof"))]
+    let built_wprof = false;
+    validate_pending_exec_descriptor(
+        descriptor,
+        built_memory_min_mib,
+        prepared_memory_mib,
+        built_wprof,
+    )
+}
+
+fn validate_pending_exec_descriptor(
+    descriptor: &crate::test_support::AdmissionCellDescriptor,
+    built_memory_min_mib: u32,
+    prepared_memory_mib: u32,
+    built_wprof: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        descriptor.memory_min_mib == built_memory_min_mib,
+        "pending pre-exec admission for {:?} carries a {}MiB memory floor, but the test built {}MiB",
+        descriptor.exact_name,
+        descriptor.memory_min_mib,
+        built_memory_min_mib,
+    );
+    anyhow::ensure!(
+        prepared_memory_mib >= descriptor.memory_min_mib,
+        "pending pre-exec admission for {:?} carries a {}MiB memory floor, but prepared VM memory is {}MiB",
+        descriptor.exact_name,
+        descriptor.memory_min_mib,
+        prepared_memory_mib,
+    );
+    anyhow::ensure!(
+        descriptor.wprof == built_wprof,
+        "pending pre-exec admission for {:?} carries wprof={}, but the test built wprof={}",
+        descriptor.exact_name,
+        descriptor.wprof,
+        built_wprof,
+    );
+    Ok(())
 }
 
 fn admission_topology_descriptor(
@@ -800,7 +854,7 @@ impl AdmissionExecGuard {
             return Err(anyhow::Error::new(command.exec()))
                 .with_context(|| format!("exec unreserved test cell via {description}"));
         };
-        let metadata = postcard::to_stdvec(&PendingExecMetadataV2 {
+        let metadata = postcard::to_stdvec(&PendingExecMetadataV3 {
             version: PENDING_EXEC_METADATA_VERSION,
             descriptor: self.descriptor,
         })
@@ -811,6 +865,236 @@ impl AdmissionExecGuard {
         Err(anyhow::Error::new(command.exec()))
             .with_context(|| format!("exec pre-admitted test cell via {description}"))
     }
+}
+
+fn shared_intent_candidates(
+    host_topo: Option<&host_topology::HostTopology>,
+    allowed: &[usize],
+    target: usize,
+) -> Vec<AdmissionIntentCandidate> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut candidates = Vec::new();
+    let start = host_topology::pid_window_offset(std::process::id(), allowed.len());
+    for offset in 0..allowed.len() {
+        let rotation = (start + offset) % allowed.len();
+        let mut cpus = (0..target)
+            .map(|offset| allowed[(rotation + offset) % allowed.len()])
+            .collect::<Vec<_>>();
+        cpus.sort_unstable();
+        cpus.dedup();
+        let mut llcs = host_topo.map_or_else(Vec::new, |host_topo| {
+            host_topo
+                .llc_groups
+                .iter()
+                .enumerate()
+                .filter_map(|(llc, group)| {
+                    group
+                        .cpus
+                        .iter()
+                        .any(|cpu| cpus.binary_search(cpu).is_ok())
+                        .then_some(llc)
+                })
+                .collect()
+        });
+        llcs.sort_unstable();
+        if seen.insert((llcs.clone(), cpus.clone())) {
+            candidates.push(AdmissionIntentCandidate {
+                llcs,
+                llc_mode: host_topology::LlcLockMode::Shared,
+                cpus,
+                cpu_mode: crate::flock::FlockMode::Shared,
+                preferred_ex_cpus: Vec::new(),
+            });
+        }
+    }
+    candidates
+}
+
+/// Build the same default candidate footprints used by final activation.
+/// Each published claim is the cooperative LLC-SH/CPU-SH envelope retained by
+/// either outcome; `preferred_ex_cpus` records the 1:1 subset that default
+/// tries exclusively before accepting that envelope as a shared fallback.
+fn default_intent_candidates(
+    host_topo: Option<&host_topology::HostTopology>,
+    topology: &Topology,
+    allowed: &[usize],
+    target: usize,
+) -> Result<Vec<AdmissionIntentCandidate>> {
+    let Some(host_topo) = host_topo else {
+        return Ok(shared_intent_candidates(None, allowed, target));
+    };
+    let mapped = match host_topo.default_pinning_candidates_for_cpus(topology, allowed) {
+        Ok(mapped) if !mapped.is_empty() => mapped,
+        Ok(_) => return Ok(shared_intent_candidates(Some(host_topo), allowed, target)),
+        Err(error)
+            if error
+                .downcast_ref::<host_topology::TopologyInsufficient>()
+                .is_some() =>
+        {
+            return Ok(shared_intent_candidates(Some(host_topo), allowed, target));
+        }
+        Err(error) => return Err(error),
+    };
+    let start = host_topology::pid_window_offset(std::process::id(), mapped.len());
+    let cpu_start = host_topology::pid_window_offset(std::process::id(), allowed.len());
+    let mut candidates = Vec::with_capacity(mapped.len());
+    for offset in 0..mapped.len() {
+        let mapped = &mapped[(start + offset) % mapped.len()];
+        let mut cpus = mapped.cpu_reservations.clone();
+        cpus.sort_unstable();
+        cpus.dedup();
+        for prefer_mapped_llc in [true, false] {
+            for index in 0..allowed.len() {
+                if cpus.len() == target {
+                    break;
+                }
+                let cpu = allowed[(cpu_start + index) % allowed.len()];
+                if cpus.contains(&cpu) {
+                    continue;
+                }
+                let llc = host_topo
+                    .llc_groups
+                    .iter()
+                    .position(|group| group.cpus.contains(&cpu));
+                let in_mapped_llc =
+                    llc.is_some_and(|llc| mapped.plan.llc_indices.binary_search(&llc).is_ok());
+                if in_mapped_llc == prefer_mapped_llc {
+                    cpus.push(cpu);
+                }
+            }
+        }
+        anyhow::ensure!(
+            cpus.len() == target,
+            "default admission intent contains {} CPUs, expected {target}",
+            cpus.len(),
+        );
+        cpus.sort_unstable();
+        let mut llcs = mapped.plan.llc_indices.clone();
+        llcs.extend(cpus.iter().filter_map(|cpu| {
+            host_topo
+                .llc_groups
+                .iter()
+                .position(|group| group.cpus.contains(cpu))
+        }));
+        llcs.sort_unstable();
+        llcs.dedup();
+        candidates.push(AdmissionIntentCandidate {
+            llcs,
+            llc_mode: host_topology::LlcLockMode::Shared,
+            cpus,
+            cpu_mode: crate::flock::FlockMode::Shared,
+            preferred_ex_cpus: mapped.cpu_reservations.clone(),
+        });
+    }
+    Ok(candidates)
+}
+
+fn admission_intent_plan(
+    descriptor: &crate::test_support::AdmissionCellDescriptor,
+) -> Result<Option<AdmissionIntentPlan>> {
+    let topology = topology_from_admission_descriptor(&descriptor.topology)?;
+    admission_intent_plan_for(
+        &topology,
+        descriptor.mode,
+        descriptor.cpu_budget,
+        descriptor.memory_min_mib,
+    )
+}
+
+fn admission_intent_plan_for(
+    topology: &Topology,
+    mode: crate::test_support::AdmissionMode,
+    cpu_budget: Option<u32>,
+    memory_min_mib: u32,
+) -> Result<Option<AdmissionIntentPlan>> {
+    let allowed = host_topology::host_allowed_cpus();
+    anyhow::ensure!(
+        !allowed.is_empty(),
+        "admission intent found no allowed host CPUs"
+    );
+    let host_topo = if crate::bypass_llc_locks_active() {
+        None
+    } else {
+        host_topology::HostTopology::cached().ok()
+    };
+
+    let (candidates, cpu_required) = match mode {
+        crate::test_support::AdmissionMode::Performance => {
+            let Some(host_topo) = host_topo.as_ref() else {
+                // The heavyweight builder owns the canonical performance
+                // skip/error rendering when host topology is unavailable.
+                return Ok(None);
+            };
+            let candidates =
+                match KtstrVm::performance_run_candidates(host_topo, topology, &allowed) {
+                    Ok(candidates) if !candidates.is_empty() => candidates,
+                    Ok(_) => return Ok(None),
+                    Err(error)
+                        if error
+                            .downcast_ref::<host_topology::TopologyInsufficient>()
+                            .is_some() =>
+                    {
+                        // The heavyweight builder remains the canonical source
+                        // of the permanent host-capability skip diagnostic.
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                };
+            let cpu_required = candidates[0].plan.assignments.len()
+                + usize::from(candidates[0].plan.service_cpu.is_some());
+            (
+                candidates
+                    .into_iter()
+                    .map(|candidate| AdmissionIntentCandidate {
+                        llcs: candidate.plan.llc_indices,
+                        llc_mode: candidate.llc_mode,
+                        cpus: candidate.cpu_reservations,
+                        cpu_mode: candidate.cpu_mode,
+                        preferred_ex_cpus: Vec::new(),
+                    })
+                    .collect(),
+                cpu_required,
+            )
+        }
+        crate::test_support::AdmissionMode::Default => {
+            let target =
+                host_topology::no_perf_cpu_budget(allowed.len(), topology.total_cpus() as usize);
+            (
+                default_intent_candidates(host_topo.as_ref(), topology, &allowed, target)?,
+                target,
+            )
+        }
+        crate::test_support::AdmissionMode::NoPerf => {
+            let explicit = host_topology::CpuCap::resolve(None)?;
+            let target = match (explicit, cpu_budget) {
+                (Some(cap), _) => cap.effective_count(allowed.len())?,
+                (None, Some(budget)) => {
+                    host_topology::CpuCap::new(budget as usize)?.effective_count(allowed.len())?
+                }
+                (None, None) => {
+                    host_topology::no_perf_cpu_budget(allowed.len(), topology.total_cpus() as usize)
+                }
+            };
+            (
+                shared_intent_candidates(host_topo.as_ref(), &allowed, target),
+                target,
+            )
+        }
+    };
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "admission intent has no host placement"
+    );
+    let permit_pool = host_topology::VmPermitPool::new_with_preparation(
+        allowed.len(),
+        cpu_required,
+        memory_min_mib,
+        None,
+    )?;
+    Ok(Some(AdmissionIntentPlan {
+        candidates,
+        permit_pool,
+    }))
 }
 
 /// Acquire the exact production admission for a generated test cell without
@@ -852,18 +1136,77 @@ pub fn pre_admit_test_cell(
     {
         return Ok(unreserved(descriptor));
     }
-    // Validate the topology description before publishing the bounded
-    // preparation footprint. The child will rebuild the VM and atomically
-    // replace this same slot only after its immutable artifacts are prepared
-    // and its exact guest-memory requirement is known.
-    topology_from_admission_descriptor(&descriptor.topology)?;
-    let pending = host_topology::protocol::register_pending_admission(
-        host_topology::admission_resource_capacity_hint()?,
-    )?;
+    let Some(plan) = admission_intent_plan(&descriptor)? else {
+        return Ok(unreserved(descriptor));
+    };
+    let pending = register_admission_intent(&plan)?;
     Ok(AdmissionExecGuard {
         pending: Some(pending),
         descriptor,
     })
+}
+
+fn register_admission_intent(
+    plan: &AdmissionIntentPlan,
+) -> Result<host_topology::protocol::PendingAdmission> {
+    let initial = plan.initial_claim()?;
+    let watch = plan.watch();
+    host_topology::protocol::register_intent_for_preparation(
+        initial,
+        watch,
+        |probe| {
+            plan.select(
+                |candidate| probe.candidate_ready(candidate),
+                |candidate| {
+                    let exact = probe.candidate_holder_pressure(
+                        &AdmissionIntentPlan::preferred_footprint_claim(candidate),
+                    )?;
+                    let total = probe.candidate_holder_pressure(
+                        &AdmissionIntentPlan::topology_claim(candidate),
+                    )?;
+                    Ok((exact, total))
+                },
+            )
+        },
+        |held| {
+            plan.select(
+                |candidate| held.candidate_ready(candidate),
+                |candidate| {
+                    let exact = held.candidate_holder_pressure(
+                        &AdmissionIntentPlan::preferred_footprint_claim(candidate),
+                    )?;
+                    let total = held.candidate_holder_pressure(
+                        &AdmissionIntentPlan::topology_claim(candidate),
+                    )?;
+                    Ok((exact, total))
+                },
+            )
+        },
+    )
+}
+
+fn register_vm_pending_admission(
+    vm: &KtstrVm,
+    interactive: bool,
+) -> Result<host_topology::protocol::PendingAdmission> {
+    let mode = if interactive && vm.performance_mode {
+        crate::test_support::AdmissionMode::Default
+    } else if vm.no_perf_mode {
+        crate::test_support::AdmissionMode::NoPerf
+    } else if vm.performance_mode {
+        crate::test_support::AdmissionMode::Performance
+    } else {
+        crate::test_support::AdmissionMode::Default
+    };
+    let cpu_budget =
+        (mode == crate::test_support::AdmissionMode::NoPerf).then_some(vm.effective_cpu_budget);
+    let memory_min_mib = vm.memory_mib.unwrap_or(vm.memory_min_mib.max(256));
+    match admission_intent_plan_for(&vm.topology, mode, cpu_budget, memory_min_mib)? {
+        Some(plan) => register_admission_intent(&plan),
+        None => host_topology::protocol::register_pending_admission(
+            host_topology::admission_resource_capacity_hint()?,
+        ),
+    }
 }
 
 struct FlexibleRunCandidate {
@@ -871,6 +1214,161 @@ struct FlexibleRunCandidate {
     llc_mode: host_topology::LlcLockMode,
     cpu_mode: crate::flock::FlockMode,
     cpu_reservations: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct AdmissionIntentCandidate {
+    llcs: Vec<usize>,
+    llc_mode: host_topology::LlcLockMode,
+    cpus: Vec<usize>,
+    cpu_mode: crate::flock::FlockMode,
+    /// Default-mode 1:1 CPUs tried EX before the surrounding shared claim is
+    /// accepted as a fallback. Empty for performance and no-perf intents.
+    preferred_ex_cpus: Vec<usize>,
+}
+
+/// Lightweight final-run envelope published by a target runner before it
+/// owns a preparation slot. Permit selection remains flexible inside the
+/// complete CPU+memory namespace; `memory_min_mib` sizes that namespace before
+/// immutable-image inspection can raise the eventual VM allocation.
+struct AdmissionIntentPlan {
+    candidates: Vec<AdmissionIntentCandidate>,
+    permit_pool: host_topology::VmPermitPool,
+}
+
+impl AdmissionIntentPlan {
+    fn topology_claim(candidate: &AdmissionIntentCandidate) -> host_topology::protocol::ClaimSet {
+        host_topology::resource_claim_with_modes(
+            &candidate.llcs,
+            candidate.llc_mode,
+            &candidate.cpus,
+            candidate.cpu_mode,
+        )
+    }
+
+    fn claim(
+        candidate: &AdmissionIntentCandidate,
+        permits: &host_topology::VmPermitReservation,
+    ) -> host_topology::protocol::ClaimSet {
+        host_topology::resource_claim_with_permits(
+            &candidate.llcs,
+            candidate.llc_mode,
+            &candidate.cpus,
+            candidate.cpu_mode,
+            &permits.all_permits(),
+            permits.admission_class,
+        )
+    }
+
+    fn initial_claim(&self) -> Result<host_topology::protocol::ClaimSet> {
+        let permits = self
+            .permit_pool
+            .select_registered()?
+            .ok_or_else(|| anyhow::anyhow!("admission intent has no weighted permit placement"))?;
+        let snapshot = host_topology::protocol::registered_claim_snapshot(&self.watch())?;
+        let mut best = None;
+        for candidate in &self.candidates {
+            let claim = Self::claim(candidate, &permits);
+            if snapshot.conflicts(&claim)? {
+                continue;
+            }
+            let exact_pressure =
+                candidate
+                    .preferred_ex_cpus
+                    .iter()
+                    .try_fold(0usize, |total, &cpu| {
+                        Ok::<_, anyhow::Error>(
+                            total.saturating_add(snapshot.cpu_holder_count(cpu)?),
+                        )
+                    })?;
+            let total_pressure = Self::holder_pressure(
+                candidate,
+                |cpu| snapshot.cpu_holder_count(cpu),
+                |llc| snapshot.llc_holder_count(llc),
+            )?;
+            let pressure = (exact_pressure, total_pressure);
+            if best
+                .as_ref()
+                .is_none_or(|(best_pressure, _)| pressure < *best_pressure)
+            {
+                best = Some((pressure, claim));
+            }
+        }
+        if let Some((_, claim)) = best {
+            return Ok(claim);
+        }
+        Ok(Self::claim(&self.candidates[0], &permits))
+    }
+
+    fn preferred_footprint_claim(
+        candidate: &AdmissionIntentCandidate,
+    ) -> host_topology::protocol::ClaimSet {
+        host_topology::resource_claim_with_modes(
+            &[],
+            host_topology::LlcLockMode::Shared,
+            &candidate.preferred_ex_cpus,
+            crate::flock::FlockMode::Shared,
+        )
+    }
+
+    fn holder_pressure(
+        candidate: &AdmissionIntentCandidate,
+        mut cpu_holders: impl FnMut(usize) -> Result<usize>,
+        mut llc_holders: impl FnMut(usize) -> Result<usize>,
+    ) -> Result<usize> {
+        let cpu = candidate.cpus.iter().try_fold(0usize, |total, &cpu| {
+            Ok::<_, anyhow::Error>(total.saturating_add(cpu_holders(cpu)?))
+        })?;
+        candidate.llcs.iter().try_fold(cpu, |total, &llc| {
+            Ok::<_, anyhow::Error>(total.saturating_add(llc_holders(llc)?))
+        })
+    }
+
+    fn watch(&self) -> host_topology::protocol::ClaimSet {
+        let topology = self
+            .candidates
+            .iter()
+            .map(Self::topology_claim)
+            .reduce(|watch, candidate| watch.union_envelope(&candidate))
+            .expect("admission intent candidates are non-empty");
+        let permits = host_topology::resource_claim_with_permits(
+            &[],
+            host_topology::LlcLockMode::Shared,
+            &[],
+            crate::flock::FlockMode::Shared,
+            &self.permit_pool.watch_permits(),
+            host_topology::protocol::AdmissionClass::Ordinary,
+        );
+        topology.union_envelope(&permits)
+    }
+
+    fn select(
+        &self,
+        mut ready: impl FnMut(&host_topology::protocol::ClaimSet) -> Result<bool>,
+        mut pressure: impl FnMut(&AdmissionIntentCandidate) -> Result<(usize, usize)>,
+    ) -> Result<Option<host_topology::protocol::ClaimSet>> {
+        let mut best = None;
+        for candidate in &self.candidates {
+            let Some(permits) = self.permit_pool.select(&mut ready)? else {
+                return Ok(None);
+            };
+            let claim = Self::claim(candidate, &permits);
+            if !ready(&claim)? {
+                continue;
+            }
+            let candidate_pressure = pressure(candidate)?;
+            if best
+                .as_ref()
+                .is_none_or(|(best_pressure, _)| candidate_pressure < *best_pressure)
+            {
+                best = Some((candidate_pressure, claim));
+            }
+        }
+        if let Some((_, claim)) = best {
+            return Ok(Some(claim));
+        }
+        Ok(None)
+    }
 }
 
 /// Default's opportunistic 1:1 placement and the complete cooperative
@@ -1295,11 +1793,9 @@ impl KtstrVm {
         // heavyweight test binary is exec'd. Presence is authoritative: a
         // malformed or mismatched handoff is an error, never a silent second
         // acquisition.
-        let mut pending_admission = match take_pending_exec_handoff(self)? {
-            Some(pending) => pending,
-            None => host_topology::protocol::register_pending_admission(
-                host_topology::admission_resource_capacity_hint()?,
-            )?,
+        let (mut pending_admission, imported_descriptor) = match take_pending_exec_handoff(self)? {
+            Some(imported) => (imported.pending, Some(imported.descriptor)),
+            None => (register_vm_pending_admission(self, false)?, None),
         };
 
         // Resolve the immutable initrd before exact topology admission.
@@ -1334,6 +1830,9 @@ impl KtstrVm {
         // (wait = true) for the authoritative flock release rather
         // than converting a transient peer hold into a host-skip.
         let memory_mib = self.prepared_memory_mib(prepared_initrd.as_ref())?;
+        if let Some(descriptor) = imported_descriptor.as_ref() {
+            validate_prepared_exec_handoff(self, descriptor, memory_mib)?;
+        }
         pending_admission.finish_preparation()?;
         let run_locks = self.acquire_run_locks(true, Some(pending_admission), memory_mib)?;
         let runtime_mbind_node_map = if self.performance_mode {
@@ -1929,6 +2428,9 @@ impl KtstrVm {
                     default_shared_fallback: false,
                 })
             }
+            protocol::CoordinatorOutcome::Prepared(_) => {
+                unreachable!("performance run coordinator prepared a VM intent")
+            }
             protocol::CoordinatorOutcome::Aborted { reason } => {
                 Err(anyhow::Error::new(host_topology::ResourceContention {
                     reason,
@@ -2393,6 +2895,9 @@ impl KtstrVm {
                     ))
                 }
             }
+            protocol::CoordinatorOutcome::Prepared(_) => {
+                unreachable!("default run coordinator prepared a VM intent")
+            }
             protocol::CoordinatorOutcome::Aborted { reason } => {
                 Err(anyhow::Error::new(host_topology::ResourceContention {
                     reason,
@@ -2688,6 +3193,9 @@ impl KtstrVm {
                 let (cpus, locks) = acquired.split_map(|(cpus, locks)| (cpus, locks));
                 Ok((cpus, locks))
             }
+            protocol::CoordinatorOutcome::Prepared(_) => {
+                unreachable!("CPU-shared run coordinator prepared a VM intent")
+            }
             protocol::CoordinatorOutcome::Aborted { reason } => {
                 Err(anyhow::Error::new(host_topology::ResourceContention {
                     reason,
@@ -2728,14 +3236,18 @@ impl KtstrVm {
     pub fn run_interactive(&self) -> Result<Option<i32>> {
         let start = Instant::now();
         let exec_mode = self.exec_cmd.is_some();
-        let pending = match take_pending_exec_handoff(self)? {
-            Some(pending) => pending,
-            None => Self::register_interactive_pending_admission(exec_mode)?,
+        let (pending, imported_descriptor) = match take_pending_exec_handoff(self)? {
+            Some(imported) => (imported.pending, Some(imported.descriptor)),
+            None if exec_mode => (register_vm_pending_admission(self, true)?, None),
+            None => (Self::register_interactive_pending_admission(false)?, None),
         };
         // Keep immutable image preparation outside exact admission just as in
         // the non-interactive path.
         let prepared_initrd = self.prepare_initramfs()?;
         let memory_mib = self.prepared_memory_mib(prepared_initrd.as_ref())?;
+        if let Some(descriptor) = imported_descriptor.as_ref() {
+            validate_prepared_exec_handoff(self, descriptor, memory_mib)?;
+        }
 
         // Resolve admission before allocating guest memory or starting device
         // workers. The returned fds remain live for the whole interactive run,

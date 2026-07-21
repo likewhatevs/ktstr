@@ -1791,6 +1791,9 @@ fn acquire_resource_locks_waiting_impl(
         protocol::CoordinatorOutcome::Acquired(locks) => {
             LockOutcome::Acquired { llc_offset, locks }
         }
+        protocol::CoordinatorOutcome::Prepared(_) => {
+            unreachable!("resource-lock coordinator prepared a VM intent")
+        }
         protocol::CoordinatorOutcome::Aborted { reason } => LockOutcome::Unavailable(reason),
     })
 }
@@ -3927,7 +3930,7 @@ fn build_permit_range(cpu_count: usize) -> Result<std::ops::Range<usize>> {
 /// stalling an otherwise runnable host.
 enum PreparationAffinityAttempt {
     Acquired(usize, std::os::fd::OwnedFd),
-    Contended(std::path::PathBuf),
+    Contended(std::path::PathBuf, Option<protocol::ContentionEvidence>),
 }
 
 fn try_acquire_preparation_affinity_cpu(
@@ -3948,6 +3951,7 @@ fn try_acquire_preparation_affinity_cpu(
         let Some(snapshot) = protocol::try_registered_claim_snapshot(&required)? else {
             return Ok(PreparationAffinityAttempt::Contended(
                 std::path::PathBuf::from(cpu_lock_path(allowed[rotation % allowed.len()])),
+                None,
             ));
         };
         snapshot
@@ -3976,25 +3980,74 @@ fn try_acquire_preparation_affinity_cpu(
         ));
     }
     candidates.sort_unstable();
+    let mut first_registry_blocked = None;
     let mut first_contended = None;
     for (registry_blocked, _, _, _, cpu) in candidates {
         let path = std::path::PathBuf::from(cpu_lock_path(cpu));
         if registry_blocked {
-            first_contended.get_or_insert(path);
+            first_registry_blocked.get_or_insert(path);
             continue;
         }
         match try_flock_with_witness(cpu_lock_path(cpu), FlockMode::Shared)? {
             TryFlockOutcome::Acquired(fd) => {
                 return Ok(PreparationAffinityAttempt::Acquired(cpu, fd));
             }
-            TryFlockOutcome::Contended(_) => {
-                first_contended.get_or_insert(path);
+            TryFlockOutcome::Contended(witness) => {
+                first_contended.get_or_insert((
+                    path,
+                    protocol::ContentionEvidence {
+                        blocker: protocol::ResourceKey::Cpu(cpu),
+                        mode: FlockMode::Shared,
+                        _witness: witness,
+                    },
+                ));
             }
         }
     }
-    Ok(PreparationAffinityAttempt::Contended(
-        first_contended.unwrap_or_else(|| std::path::PathBuf::from(cpu_lock_path(allowed[start]))),
-    ))
+    Ok(match first_contended {
+        Some((path, evidence)) => PreparationAffinityAttempt::Contended(path, Some(evidence)),
+        None => PreparationAffinityAttempt::Contended(
+            first_registry_blocked
+                .unwrap_or_else(|| std::path::PathBuf::from(cpu_lock_path(allowed[start]))),
+            None,
+        ),
+    })
+}
+
+/// A queue grant already proved that the selected final CPU claim has no
+/// conflicting predecessor. Ignore the aggregate here (which includes the
+/// caller's own published CPU-EX intent) and use the physical CPU-SH flock as
+/// authority for an active holder or unrelated lock user.
+fn try_acquire_selected_preparation_affinity_cpu(
+    candidates: &[usize],
+    rotation: usize,
+) -> Result<PreparationAffinityAttempt> {
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "preparation has no selected host CPU"
+    );
+    let start = rotation % candidates.len();
+    let mut first = None;
+    for &cpu in candidates.iter().cycle().skip(start).take(candidates.len()) {
+        let path = std::path::PathBuf::from(cpu_lock_path(cpu));
+        match try_flock_with_witness(cpu_lock_path(cpu), FlockMode::Shared)? {
+            TryFlockOutcome::Acquired(fd) => {
+                return Ok(PreparationAffinityAttempt::Acquired(cpu, fd));
+            }
+            TryFlockOutcome::Contended(witness) => {
+                first.get_or_insert((
+                    path,
+                    protocol::ContentionEvidence {
+                        blocker: protocol::ResourceKey::Cpu(cpu),
+                        mode: FlockMode::Shared,
+                        _witness: witness,
+                    },
+                ));
+            }
+        }
+    }
+    let (path, evidence) = first.expect("non-empty selected CPU set was fully probed");
+    Ok(PreparationAffinityAttempt::Contended(path, Some(evidence)))
 }
 
 enum PreparationPermitAttempt {
@@ -4003,8 +4056,13 @@ enum PreparationPermitAttempt {
         index: usize,
         token_permit: usize,
         path: std::path::PathBuf,
+        evidence: protocol::ContentionEvidence,
     },
-    ResourceContended(std::path::PathBuf, FlockMode),
+    ResourceContended {
+        path: std::path::PathBuf,
+        mode: FlockMode,
+        evidence: Option<protocol::ContentionEvidence>,
+    },
 }
 
 #[cfg(test)]
@@ -4028,28 +4086,39 @@ fn try_acquire_preparation_permit_at(
     rotation: usize,
     preheld_token: Option<std::os::fd::OwnedFd>,
     wait_for_registry: bool,
+    affinity_candidates: Option<&[usize]>,
 ) -> Result<PreparationPermitAttempt> {
     let cpu = AdmissionPermitPool::for_host(possible_cpu_width());
     let memory = MemoryPermitPool::for_host()?;
     let memory_required = preparation_memory_chunks();
     let mut permit_fds = Vec::with_capacity(1 + PREPARATION_CPU_PERMITS + memory_required);
 
-    let acquire_one = |permit| -> Result<Option<std::os::fd::OwnedFd>> {
+    let acquire_one = |permit| -> Result<
+        std::result::Result<std::os::fd::OwnedFd, protocol::ContentionEvidence>,
+    > {
         match try_flock_with_witness(permit_lock_path(permit), FlockMode::Exclusive)? {
-            TryFlockOutcome::Acquired(fd) => Ok(Some(fd)),
-            TryFlockOutcome::Contended(_) => Ok(None),
+            TryFlockOutcome::Acquired(fd) => Ok(Ok(fd)),
+            TryFlockOutcome::Contended(witness) => Ok(Err(protocol::ContentionEvidence {
+                blocker: protocol::ResourceKey::Permit(permit),
+                mode: FlockMode::Exclusive,
+                _witness: witness,
+            })),
         }
     };
     let token_fd = if let Some(fd) = preheld_token {
         fd
-    } else if let Some(fd) = acquire_one(token_permit)? {
-        fd
     } else {
-        return Ok(PreparationPermitAttempt::TokenContended {
-            index,
-            token_permit,
-            path: std::path::PathBuf::from(permit_lock_path(token_permit)),
-        });
+        match acquire_one(token_permit)? {
+            Ok(fd) => fd,
+            Err(evidence) => {
+                return Ok(PreparationPermitAttempt::TokenContended {
+                    index,
+                    token_permit,
+                    path: std::path::PathBuf::from(permit_lock_path(token_permit)),
+                    evidence,
+                });
+            }
+        }
     };
     permit_fds.push((token_permit, token_fd));
     #[cfg(test)]
@@ -4060,21 +4129,27 @@ fn try_acquire_preparation_permit_at(
     let mut first_cpu_contention = None;
     for offset in 0..ordered_cpu.len() {
         let permit = ordered_cpu[(cpu_start + offset) % ordered_cpu.len()];
-        if let Some(fd) = acquire_one(permit)? {
-            permit_fds.push((permit, fd));
-            if permit_fds.len() == 1 + PREPARATION_CPU_PERMITS {
-                break;
+        match acquire_one(permit)? {
+            Ok(fd) => {
+                permit_fds.push((permit, fd));
+                if permit_fds.len() == 1 + PREPARATION_CPU_PERMITS {
+                    break;
+                }
             }
-        } else {
-            first_cpu_contention
-                .get_or_insert_with(|| std::path::PathBuf::from(permit_lock_path(permit)));
+            Err(evidence) => {
+                first_cpu_contention
+                    .get_or_insert((std::path::PathBuf::from(permit_lock_path(permit)), evidence));
+            }
         }
     }
     if permit_fds.len() != 1 + PREPARATION_CPU_PERMITS {
-        return Ok(PreparationPermitAttempt::ResourceContended(
-            first_cpu_contention.expect("incomplete CPU preparation weight observed contention"),
-            FlockMode::Exclusive,
-        ));
+        let (path, evidence) =
+            first_cpu_contention.expect("incomplete CPU preparation weight observed contention");
+        return Ok(PreparationPermitAttempt::ResourceContended {
+            path,
+            mode: FlockMode::Exclusive,
+            evidence: Some(evidence),
+        });
     }
     let cpu_permits = permit_fds[1..]
         .iter()
@@ -4085,22 +4160,27 @@ fn try_acquire_preparation_permit_at(
     let mut first_memory_contention = None;
     for offset in 0..memory.permits.len() {
         let permit = memory.permits[(memory_start + offset) % memory.permits.len()];
-        if let Some(fd) = acquire_one(permit)? {
-            permit_fds.push((permit, fd));
-            if permit_fds.len() == 1 + PREPARATION_CPU_PERMITS + memory_required {
-                break;
+        match acquire_one(permit)? {
+            Ok(fd) => {
+                permit_fds.push((permit, fd));
+                if permit_fds.len() == 1 + PREPARATION_CPU_PERMITS + memory_required {
+                    break;
+                }
             }
-        } else {
-            first_memory_contention
-                .get_or_insert_with(|| std::path::PathBuf::from(permit_lock_path(permit)));
+            Err(evidence) => {
+                first_memory_contention
+                    .get_or_insert((std::path::PathBuf::from(permit_lock_path(permit)), evidence));
+            }
         }
     }
     if permit_fds.len() != 1 + PREPARATION_CPU_PERMITS + memory_required {
-        return Ok(PreparationPermitAttempt::ResourceContended(
-            first_memory_contention
-                .expect("incomplete memory preparation weight observed contention"),
-            FlockMode::Exclusive,
-        ));
+        let (path, evidence) = first_memory_contention
+            .expect("incomplete memory preparation weight observed contention");
+        return Ok(PreparationPermitAttempt::ResourceContended {
+            path,
+            mode: FlockMode::Exclusive,
+            evidence: Some(evidence),
+        });
     }
     let memory_permits = permit_fds[1 + PREPARATION_CPU_PERMITS..]
         .iter()
@@ -4111,20 +4191,35 @@ fn try_acquire_preparation_permit_at(
         !original_affinity.is_empty(),
         "could not determine allowed CPU set for preparation admission",
     );
+    let selected_affinity = affinity_candidates.is_some();
+    let affinity_candidates = affinity_candidates.unwrap_or(&original_affinity);
+    anyhow::ensure!(
+        !affinity_candidates.is_empty()
+            && affinity_candidates
+                .iter()
+                .all(|cpu| original_affinity.binary_search(cpu).is_ok()),
+        "preparation affinity candidates are empty or outside the process cpuset",
+    );
     let affinity_rotation = cpu_permits
         .iter()
         .fold(rotation, |seed, permit| seed.rotate_left(7) ^ permit);
-    let (affinity_cpu, affinity_lock) = match try_acquire_preparation_affinity_cpu(
-        &original_affinity,
-        affinity_rotation,
-        wait_for_registry,
-    )? {
+    let affinity_attempt = if selected_affinity {
+        try_acquire_selected_preparation_affinity_cpu(affinity_candidates, affinity_rotation)?
+    } else {
+        try_acquire_preparation_affinity_cpu(
+            affinity_candidates,
+            affinity_rotation,
+            wait_for_registry,
+        )?
+    };
+    let (affinity_cpu, affinity_lock) = match affinity_attempt {
         PreparationAffinityAttempt::Acquired(cpu, fd) => (cpu, fd),
-        PreparationAffinityAttempt::Contended(path) => {
-            return Ok(PreparationPermitAttempt::ResourceContended(
+        PreparationAffinityAttempt::Contended(path, evidence) => {
+            return Ok(PreparationPermitAttempt::ResourceContended {
                 path,
-                FlockMode::Shared,
-            ));
+                mode: FlockMode::Shared,
+                evidence,
+            });
         }
     };
     permit_fds.sort_by_key(|(permit, _)| *permit);
@@ -4162,12 +4257,13 @@ fn try_acquire_preparation_permit_sweep(
                 .wrapping_add(rotation_bias),
             None,
             wait_for_registry,
+            None,
         )? {
             acquired @ PreparationPermitAttempt::Acquired(_, _) => return Ok(acquired),
             contended @ PreparationPermitAttempt::TokenContended { .. } => {
                 first_token_contention.get_or_insert(contended);
             }
-            contended @ PreparationPermitAttempt::ResourceContended(_, _) => {
+            contended @ PreparationPermitAttempt::ResourceContended { .. } => {
                 // CPU, memory, and affinity selection each scans its complete
                 // global namespace. Once one free token reaches such a miss,
                 // rotating to another token cannot create capacity and would
@@ -4185,19 +4281,27 @@ pub(super) enum PreparationCandidateDecision<T> {
     Contended,
 }
 
+pub(super) enum PreparationProbe<T> {
+    Acquired(T),
+    Contended(protocol::ContentionEvidence),
+    Unavailable,
+}
+
 /// Visit each immediately available preparation tuple once without sleeping.
 /// A registry claim conflict may reject one tuple and continue at the next
 /// token; registry-lock or global physical contention terminates the sweep.
 pub(super) fn try_preparation_candidates_once<T>(
     rotation_bias: usize,
+    affinity_candidates: &[usize],
     mut decide: impl FnMut(
         PreparationPermit,
         protocol::ClaimSet,
     ) -> Result<PreparationCandidateDecision<T>>,
-) -> Result<Option<T>> {
+) -> Result<PreparationProbe<T>> {
     let tokens = preparation_token_range()?;
     let count = tokens.len();
     let start = (pid_window_offset(std::process::id(), count) + rotation_bias) % count;
+    let mut first_contention = None;
     for offset in 0..count {
         let index = (start + offset) % count;
         match try_acquire_preparation_permit_at(
@@ -4206,19 +4310,30 @@ pub(super) fn try_preparation_candidates_once<T>(
             start.wrapping_add(offset).wrapping_add(rotation_bias),
             None,
             false,
+            Some(affinity_candidates),
         )? {
             PreparationPermitAttempt::Acquired(preparation, claim) => {
                 match decide(preparation, claim)? {
-                    PreparationCandidateDecision::Accepted(value) => return Ok(Some(value)),
+                    PreparationCandidateDecision::Accepted(value) => {
+                        return Ok(PreparationProbe::Acquired(value));
+                    }
                     PreparationCandidateDecision::Retry => {}
-                    PreparationCandidateDecision::Contended => return Ok(None),
+                    PreparationCandidateDecision::Contended => {
+                        return Ok(PreparationProbe::Unavailable);
+                    }
                 }
             }
-            PreparationPermitAttempt::TokenContended { .. } => {}
-            PreparationPermitAttempt::ResourceContended(_, _) => return Ok(None),
+            PreparationPermitAttempt::TokenContended { evidence, .. } => {
+                first_contention.get_or_insert(evidence);
+            }
+            PreparationPermitAttempt::ResourceContended { evidence, .. } => {
+                return Ok(
+                    evidence.map_or(PreparationProbe::Unavailable, PreparationProbe::Contended)
+                );
+            }
         }
     }
-    Ok(None)
+    Ok(first_contention.map_or(PreparationProbe::Unavailable, PreparationProbe::Contended))
 }
 
 pub(super) fn acquire_preparation_permit(
@@ -4238,7 +4353,7 @@ pub(super) fn acquire_preparation_permit(
             PreparationPermitAttempt::Acquired(preparation, claim) => {
                 return Ok((preparation, claim));
             }
-            PreparationPermitAttempt::ResourceContended(path, mode) => {
+            PreparationPermitAttempt::ResourceContended { path, mode, .. } => {
                 drop(block_flock_deadline(
                     path,
                     mode,
@@ -4249,6 +4364,7 @@ pub(super) fn acquire_preparation_permit(
                 index,
                 token_permit,
                 path,
+                ..
             } => {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
                 if let Some(token_fd) = block_flock_deadline(path, FlockMode::Exclusive, deadline)?
@@ -4259,11 +4375,12 @@ pub(super) fn acquire_preparation_permit(
                         start.wrapping_add(turn).wrapping_add(rotation_bias),
                         Some(token_fd),
                         true,
+                        None,
                     )? {
                         PreparationPermitAttempt::Acquired(preparation, claim) => {
                             return Ok((preparation, claim));
                         }
-                        PreparationPermitAttempt::ResourceContended(path, mode) => {
+                        PreparationPermitAttempt::ResourceContended { path, mode, .. } => {
                             // The token fd and every partial resource owner were
                             // dropped with the failed attempt. Sleep on the concrete
                             // resource that prevented a complete preparation set;
@@ -4284,6 +4401,27 @@ pub(super) fn acquire_preparation_permit(
         }
         turn = turn.wrapping_add(PREPARATION_CPU_PERMITS.max(1));
     }
+}
+
+/// Resource envelope used only to filter coordinator inotify events while a
+/// selected intent is waiting for a physical preparation tuple. It is not a
+/// registry claim and therefore neither reserves capacity nor inflates the
+/// intent's fairness weight.
+pub(super) fn preparation_resource_watch() -> Result<protocol::ClaimSet> {
+    let cpu = AdmissionPermitPool::for_host(possible_cpu_width());
+    let memory = MemoryPermitPool::for_host()?;
+    let permits = preparation_token_range()?
+        .chain(cpu.all())
+        .chain(memory.permits.iter().copied())
+        .collect::<std::collections::BTreeSet<_>>();
+    Ok(protocol::ClaimSet::with_permits(
+        std::iter::empty(),
+        host_allowed_cpus(),
+        permits,
+        FlockMode::Shared,
+        FlockMode::Shared,
+        FlockMode::Exclusive,
+    ))
 }
 
 pub(super) fn validate_preparation_permit(
@@ -6187,6 +6325,9 @@ where
                 memory_permits,
                 mems,
             ))
+        }
+        protocol::CoordinatorOutcome::Prepared(_) => {
+            unreachable!("LLC-plan coordinator prepared a VM intent")
         }
         protocol::CoordinatorOutcome::Aborted { reason } => {
             Err(anyhow::Error::new(ResourceContention { reason }))

@@ -965,8 +965,8 @@ fn uncontended_fast_fence_does_not_create_registry_metadata() {
     let protocol_dir = std::path::Path::new(&cpu_path)
         .parent()
         .expect("resource lock parent");
-    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v15");
-    let event_dir = protocol_dir.join("ktstr-acquire-events-v15");
+    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v16");
+    let event_dir = protocol_dir.join("ktstr-acquire-events-v16");
     assert!(!registry_dir.exists());
     assert!(!event_dir.exists());
 
@@ -1138,7 +1138,7 @@ fn tracked_acquired_drop_keeps_its_registry_namespace_across_threads() {
     let wrong = tempfile::TempDir::new().expect("wrong-namespace tempdir");
     let wrong_llc_prefix = format!("{}/llc-", wrong.path().display());
     let wrong_cpu_prefix = format!("{}/cpu-", wrong.path().display());
-    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v15");
+    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v16");
     std::fs::create_dir_all(&wrong_registry).expect("create wrong registry directory");
     let wrong_registry_lock =
         crate::flock::try_flock(wrong_registry.join("registry.lock"), FlockMode::Exclusive)
@@ -2675,21 +2675,27 @@ fn interactive_exec_preparation_waits_for_capacity_then_acquires() {
         let _ = result_tx.send(result);
     });
 
-    wait_with_delivered_service("interactive exec parks on preparation capacity", || {
-        let snapshot = worker.service.snapshot();
-        let parked =
-            !snapshot.pending && snapshot.tasks.values().any(|sample| sample.state == b'S');
-        match result_rx.try_recv() {
-            Ok(_) => {
-                anyhow::bail!("interactive exec returned while every preparation token was held")
+    wait_with_task_service(
+        "interactive exec parks on preparation capacity",
+        std::slice::from_ref(&worker.service),
+        || {
+            let snapshot = worker.service.snapshot();
+            let parked =
+                !snapshot.pending && snapshot.tasks.values().any(|sample| sample.state == b'S');
+            match result_rx.try_recv() {
+                Ok(_) => {
+                    anyhow::bail!(
+                        "interactive exec returned while every preparation token was held"
+                    )
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    anyhow::bail!("interactive exec worker exited before releasing capacity")
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                anyhow::bail!("interactive exec worker exited before releasing capacity")
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-        }
-        Ok(parked.then_some(()))
-    })
+            Ok(parked.then_some(()))
+        },
+    )
     .expect("observe interactive exec waiting in the kernel");
 
     drop(token_locks);
@@ -2703,6 +2709,255 @@ fn interactive_exec_preparation_waits_for_capacity_then_acquires() {
     worker.join().expect("interactive exec preparation worker");
 }
 
+/// The heavyweight immutable-image phase must not hide a cell's eventual run
+/// footprint.  Publish that footprint first, park while every preparation
+/// token is occupied, then require the very same ticket to become PENDING once
+/// one tuple can be acquired.  Using CPU-EX here also catches the subtle
+/// self-conflict where preparation affinity consulted an aggregate containing
+/// the selected ticket's own performance claim.
+#[test]
+fn early_final_intent_is_visible_before_preparation_and_transitions_same_ticket_to_pending() {
+    let _prefixes = LockPrefixesGuard::new_real_wake();
+    let affinity_cpu = *host_allowed_cpus()
+        .first()
+        .expect("test process must have an allowed host CPU");
+    let final_claim = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [affinity_cpu],
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Exclusive,
+    );
+    // A disjoint live predecessor gives the selected ticket a real predecessor
+    // prefix throughout the transition. Its LLC-only footprint cannot
+    // interfere with either the selected CPU or preparation permits.
+    let _anchor = protocol::register_pending_claim_for_tests(protocol::ClaimSet::with_modes(
+        [0usize],
+        std::iter::empty(),
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Shared,
+    ))
+    .expect("publish a disjoint predecessor");
+    let preparation_tokens = preparation_token_range()
+        .expect("resolve preparation token namespace")
+        .collect::<Vec<_>>();
+    let token_locks = preparation_tokens
+        .iter()
+        .map(|&permit| {
+            crate::flock::try_flock(permit_lock_path(permit), crate::flock::FlockMode::Exclusive)
+                .expect("probe preparation token")
+                .expect("hold every preparation token")
+        })
+        .collect::<Vec<_>>();
+    assert!(!token_locks.is_empty());
+
+    let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
+    let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
+    let planner_steps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let worker_steps = std::sync::Arc::clone(&planner_steps);
+    let worker_claim = final_claim.clone();
+    let (prepared_tx, prepared_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+    let worker = TestServiceThread::spawn(move || -> anyhow::Result<()> {
+        LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
+        CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
+        let granted_claim = worker_claim.clone();
+        let coordinator_claim = worker_claim.clone();
+        let granted_steps = std::sync::Arc::clone(&worker_steps);
+        let coordinator_steps = worker_steps;
+        let mut pending = protocol::register_intent_for_preparation(
+            worker_claim.clone(),
+            worker_claim,
+            move |_| {
+                granted_steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(Some(granted_claim.clone()))
+            },
+            move |_| {
+                coordinator_steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(Some(coordinator_claim.clone()))
+            },
+        )?;
+        let ticket = pending.exec_handoff_parts()?.1;
+        let (prepared_cpu, _, _) = pending.preparation_affinity_handoff_parts()?;
+        let permits = pending
+            .preparation_handoff_parts()?
+            .1
+            .into_iter()
+            .map(|(permit, _)| permit)
+            .collect::<Vec<_>>();
+        prepared_tx
+            .send((ticket, prepared_cpu, permits))
+            .map_err(|_| anyhow::anyhow!("prepared-observation receiver disappeared"))?;
+        release_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("pending-release sender disappeared"))?;
+        pending.restore_preparation_affinity()?;
+        drop(pending);
+        LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        Ok(())
+    });
+
+    let early_ticket = wait_with_task_service(
+        "early final intent publication before preparation",
+        std::slice::from_ref(&worker.service),
+        || {
+            let snapshot = protocol::ticket_registry_snapshot_for_tests()?;
+            Ok(snapshot
+                .into_iter()
+                .find(|(_, pid, claim)| *pid == std::process::id() && *claim == final_claim)
+                .map(|(ticket, _, _)| ticket))
+        },
+    )
+    .expect("the final run intent must be visible while preparation is saturated");
+    wait_with_task_service(
+        "early intent parks after one preparation-capacity miss",
+        std::slice::from_ref(&worker.service),
+        || {
+            let sample = worker.service.snapshot();
+            let parked = planner_steps.load(std::sync::atomic::Ordering::Relaxed) > 0
+                && !sample.pending
+                && sample.tasks.values().any(|sample| sample.state == b'S');
+            Ok(parked.then_some(()))
+        },
+    )
+    .expect("a preparation miss must park instead of hot-regranting the intent");
+
+    // Publish a conflicting *later* ticket after the selected intent has
+    // parked.  The final->PENDING commit is ordered only by the selected
+    // ticket's predecessor prefix; consulting the full aggregate here lets a
+    // later arrival veto an already-selected ticket and collapses a storm.
+    let later_preparation_claim = protocol::ClaimSet::with_permits(
+        std::iter::empty(),
+        std::iter::empty(),
+        preparation_tokens,
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Exclusive,
+    );
+    let _later = protocol::register_pending_claim_for_tests(later_preparation_claim)
+        .expect("publish a later conflicting intent");
+
+    drop(token_locks);
+    let (pending_ticket, prepared_cpu, preparation_permits) = recv_from_service_thread(
+        &prepared_rx,
+        "same-ticket transition into PENDING preparation",
+        &worker,
+    )
+    .expect("released preparation capacity must wake the selected intent");
+    assert_eq!(
+        pending_ticket, early_ticket,
+        "PENDING must reuse the intent ticket"
+    );
+    assert_eq!(prepared_cpu, affinity_cpu);
+    let snapshot = protocol::ticket_registry_snapshot_for_tests()
+        .expect("snapshot same-ticket PENDING transition");
+    let pending_claim = snapshot
+        .iter()
+        .find(|(ticket, _, _)| *ticket == early_ticket)
+        .map(|(_, _, claim)| claim)
+        .expect("same ticket must remain published after preparation acquisition");
+    assert_ne!(pending_claim, &final_claim);
+    assert!(pending_claim.cpus.contains(&prepared_cpu));
+    assert!(
+        preparation_permits
+            .iter()
+            .all(|permit| pending_claim.permits.contains(permit)),
+        "PENDING claim must publish every physically held preparation permit",
+    );
+
+    release_tx
+        .send(())
+        .expect("release the worker-owned pending admission");
+    worker
+        .join()
+        .expect("early-intent preparation worker")
+        .expect("complete early-intent preparation worker");
+}
+
+/// Both performance's CPU-EX intent and default's cooperative CPU-SH intent
+/// must reach the same selected-preparation path.  In particular, an EX intent
+/// cannot reject its own CPU when the preparation phase asks for a temporary
+/// SH affinity owner.
+#[test]
+fn selected_performance_and_default_intents_share_preparation_affinity_path() {
+    let _prefixes = LockPrefixesGuard::new();
+    let allowed = host_allowed_cpus();
+    let affinity_cpu = *allowed
+        .first()
+        .expect("test process must have an allowed host CPU");
+    let disjoint_cpu = *allowed
+        .iter()
+        .find(|&&cpu| cpu != affinity_cpu)
+        .expect("selected-preparation throughput test needs two allowed CPUs");
+    let _anchor = protocol::register_pending_claim_for_tests(protocol::ClaimSet::with_modes(
+        [0usize],
+        std::iter::empty(),
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Shared,
+    ))
+    .expect("publish a disjoint predecessor");
+
+    for cpu_mode in [
+        crate::flock::FlockMode::Exclusive,
+        crate::flock::FlockMode::Shared,
+    ] {
+        let claim = protocol::ClaimSet::with_modes(
+            std::iter::empty(),
+            [affinity_cpu],
+            crate::flock::FlockMode::Shared,
+            cpu_mode,
+        );
+        let granted_claim = claim.clone();
+        let coordinator_claim = claim.clone();
+        let mut pending = protocol::register_intent_for_preparation(
+            claim.clone(),
+            claim,
+            move |_| Ok(Some(granted_claim.clone())),
+            move |_| Ok(Some(coordinator_claim.clone())),
+        )
+        .unwrap_or_else(|error| {
+            panic!("{cpu_mode:?} early intent failed selected preparation: {error:#}")
+        });
+        assert_eq!(
+            pending
+                .preparation_affinity_handoff_parts()
+                .expect("inspect selected preparation affinity")
+                .0,
+            affinity_cpu,
+        );
+        let disjoint_ex = protocol::ClaimSet::with_modes(
+            std::iter::empty(),
+            [disjoint_cpu],
+            crate::flock::FlockMode::Shared,
+            crate::flock::FlockMode::Exclusive,
+        );
+        let ran = std::cell::Cell::new(false);
+        assert!(matches!(
+            protocol::with_registry_fence(&disjoint_ex, || {
+                ran.set(true);
+                Ok::<_, anyhow::Error>(())
+            })
+            .expect("fence a disjoint EX probe during selected preparation"),
+            protocol::RegistryFence::Ran { .. },
+        ));
+        assert!(
+            ran.get(),
+            "PENDING preparation must not blanket-block disjoint CPU-EX throughput",
+        );
+        pending
+            .restore_preparation_affinity()
+            .expect("restore selected preparation affinity");
+        drop(pending);
+        assert_eq!(
+            protocol::ticket_registry_snapshot_for_tests()
+                .expect("snapshot retired selected preparation")
+                .len(),
+            1,
+            "retiring one selected preparation must leave only the anchor",
+        );
+    }
+}
+
 #[test]
 fn interactive_preparation_tries_a_second_tuple_after_candidate_rejection() {
     let _prefixes = LockPrefixesGuard::new();
@@ -2714,7 +2969,8 @@ fn interactive_preparation_tries_a_second_tuple_after_candidate_rejection() {
         "test host must fund two preparation candidates",
     );
     let mut attempted_tokens = Vec::new();
-    let selected = try_preparation_candidates_once(0, |preparation, _claim| {
+    let allowed = host_allowed_cpus();
+    let selected = try_preparation_candidates_once(0, &allowed, |preparation, _claim| {
         attempted_tokens.push(preparation.token_permit);
         if attempted_tokens.len() == 1 {
             drop(preparation);
@@ -2725,8 +2981,10 @@ fn interactive_preparation_tries_a_second_tuple_after_candidate_rejection() {
             ))
         }
     })
-    .expect("scan preparation candidates")
-    .expect("second preparation candidate");
+    .expect("scan preparation candidates");
+    let PreparationProbe::Acquired(selected) = selected else {
+        panic!("second preparation candidate was not acquired");
+    };
     assert_eq!(attempted_tokens.len(), 2);
     assert_ne!(attempted_tokens[0], selected);
 }
@@ -2745,11 +3003,15 @@ fn preparation_sweep_stops_after_one_global_cpu_shortage() {
         .collect::<Vec<_>>();
     assert!(!cpu_permits.is_empty());
     reset_preparation_resource_probe_count_for_tests();
-    let selected = try_preparation_candidates_once::<()>(0, |_preparation, _claim| {
+    let allowed = host_allowed_cpus();
+    let selected = try_preparation_candidates_once::<()>(0, &allowed, |_preparation, _claim| {
         panic!("global CPU shortage must prevent a complete preparation candidate")
     })
     .expect("probe globally saturated CPU admission");
-    assert!(selected.is_none());
+    assert!(
+        !matches!(selected, PreparationProbe::Acquired(())),
+        "global CPU shortage unexpectedly acquired preparation",
+    );
     assert_eq!(
         preparation_resource_probe_count_for_tests(),
         1,
@@ -2845,10 +3107,14 @@ fn small_shared_cell_proceeds_while_coordinator_hungers() {
         );
         let _ = small_tx.send(result);
     });
-    let outcome = recv_from_service_thread(
+    let producer_services = [
+        small_thread.service.clone(),
+        coordinator_thread.service.clone(),
+    ];
+    let outcome = recv_with_task_service(
         &small_rx,
         "disjoint non-waiting shared-cell admission",
-        &small_thread,
+        &producer_services,
     )
     .expect("small-cell worker must publish")
     .expect("small-cell acquisition");
@@ -2960,6 +3226,9 @@ fn coordinator_reprobes_when_a_release_races_the_initial_watch_transition() {
             )?;
             match outcome {
                 protocol::CoordinatorOutcome::Acquired(lock) => drop(lock),
+                protocol::CoordinatorOutcome::Prepared(_) => {
+                    anyhow::bail!("transition-race coordinator prepared a VM intent")
+                }
                 protocol::CoordinatorOutcome::Aborted { reason } => {
                     anyhow::bail!("transition-race coordinator aborted: {reason}")
                 }
@@ -3241,47 +3510,38 @@ fn backfill_is_weighted_by_cooperative_capacity_instead_of_callback_count() {
 #[test]
 fn unavailable_wide_head_refills_live_backfill_capacity_until_bounded_age_then_drains() {
     let _prefixes = LockPrefixesGuard::new();
-    let (
-        conflicting_grants,
-        conflicting_waiters,
-        disjoint_grants,
-        refilled_after_completion,
-        expired_head_stops_refill,
-        wide_wins,
-        racer_revoked_without_placement_damage,
-        stale_callback_suppressed,
-    ) = protocol::exercise_work_conserving_backfill_for_tests()
+    let outcome = protocol::exercise_work_conserving_backfill_for_tests()
         .expect("exercise work-conserving bounded backfill");
     assert_eq!(
-        conflicting_grants, 3,
+        outcome.conflicting_grants, 3,
         "the blocked wide head must admit exactly its configured outstanding resource capacity",
     );
     assert_eq!(
-        conflicting_waiters, 2,
+        outcome.conflicting_waiters, 2,
         "new conflicting work must wait while the head's full live capacity is occupied",
     );
     assert_eq!(
-        disjoint_grants, 8,
+        outcome.disjoint_grants, 8,
         "disjoint suffix work must remain unbounded by the fairness capacity",
     );
     assert!(
-        refilled_after_completion,
+        outcome.refilled_after_completion,
         "completed bypass work must immediately open replacement capacity instead of creating a low-utilization drain",
     );
     assert!(
-        expired_head_stops_refill,
+        outcome.expired_head_stops_refill,
         "an aged head must stop admitting replacement conflicts so exclusive work cannot starve",
     );
     assert!(
-        wide_wins,
+        outcome.wide_wins,
         "once the admitted burst releases, the now-viable wide head must receive the next exact grant",
     );
     assert!(
-        racer_revoked_without_placement_damage,
+        outcome.racer_revoked_without_placement_damage,
         "the viability scan must revoke a stale conflicting callback while preserving disjoint grants",
     );
     assert!(
-        stale_callback_suppressed,
+        outcome.stale_callback_suppressed,
         "a callback revoked by the wide-head scan must not execute planner or acquisition code",
     );
 }
@@ -3590,6 +3850,9 @@ fn coordinator_commit_is_terminal_even_if_cancellation_arrives_afterward() {
     .expect("post-commit cancellation must not replace coordinator success");
     let locks = match outcome {
         protocol::CoordinatorOutcome::Acquired(locks) => locks,
+        protocol::CoordinatorOutcome::Prepared(_) => {
+            panic!("terminal-commit coordinator prepared a VM intent")
+        }
         protocol::CoordinatorOutcome::Aborted { reason } => {
             panic!("terminal-commit coordinator aborted: {reason}")
         }
@@ -3664,6 +3927,9 @@ fn granted_commit_is_terminal_even_if_cancellation_arrives_afterward() {
             )?;
             match outcome {
                 protocol::CoordinatorOutcome::Acquired(locks) => drop(locks),
+                protocol::CoordinatorOutcome::Prepared(_) => {
+                    anyhow::bail!("granted-path coordinator prepared a VM intent")
+                }
                 protocol::CoordinatorOutcome::Aborted { reason } => {
                     anyhow::bail!("granted-path coordinator aborted: {reason}")
                 }
@@ -4005,6 +4271,9 @@ fn pending_exec_v3_import_process_helper() {
             .expect("coordinate imported exact activation")
             {
                 protocol::CoordinatorOutcome::Acquired(acquired) => acquired,
+                protocol::CoordinatorOutcome::Prepared(_) => {
+                    panic!("imported exact activation prepared a VM intent")
+                }
                 protocol::CoordinatorOutcome::Aborted { reason } => {
                     panic!("imported exact activation aborted: {reason}")
                 }
@@ -4337,6 +4606,9 @@ fn ticket_registry_process_helper() {
             .expect("helper coordinator acquire");
             match outcome {
                 protocol::CoordinatorOutcome::Acquired(locks) => (0, locks),
+                protocol::CoordinatorOutcome::Prepared(_) => {
+                    panic!("helper coordinator prepared a VM intent")
+                }
                 protocol::CoordinatorOutcome::Aborted { reason } => {
                     panic!("helper coordinator aborted: {reason}")
                 }
@@ -5461,7 +5733,7 @@ fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
     let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .expect("re-block waiter after epoch transition");
-    // Leave the replacement as an external, unregistered flock. A current-v15
+    // Leave the replacement as an external, unregistered flock. A current-v16
     // HELD publication would authoritatively revoke the in-flight grant before
     // its callback returned, bypassing the stale-negative-evidence path this
     // test is meant to pin.
@@ -5709,7 +5981,7 @@ fn remove_crash_after_counts_before_free_is_repaired() {
     let markers = tempfile::TempDir::new().expect("marker dir");
     let removing =
         TicketChild::spawn_crashing(markers.path(), "removing", "1", "remove_counts_before_free");
-    // The v15 HELD lifecycle removes its registry record only after the
+    // The v16 HELD lifecycle removes its registry record only after the
     // physical reservation is released. Let the helper pass its normal
     // release barrier so the injected crash observes that production ordering.
     std::fs::write(&removing.release, b"release").expect("release crash-test reservation");

@@ -835,6 +835,108 @@ fn acquire_default_waiting_run_discards_best_effort_ex_contention() {
     assert_eq!(mask, vec![0, 1]);
 }
 
+#[test]
+fn default_early_intent_preserves_exact_preference_inside_shared_fallback() {
+    let host = host_topology::HostTopology::new_for_tests(&[(vec![0, 1], 0), (vec![2, 3], 0)]);
+    let topology = Topology::new(1, 1, 1, 1);
+    let candidates = default_intent_candidates(Some(&host), &topology, &[0, 1, 2, 3], 2)
+        .expect("build default early-intent candidates");
+    assert!(!candidates.is_empty());
+    assert!(candidates.iter().all(|candidate| {
+        !candidate.preferred_ex_cpus.is_empty()
+            && candidate
+                .preferred_ex_cpus
+                .iter()
+                .all(|cpu| candidate.cpus.contains(cpu))
+            && candidate.cpu_mode == crate::flock::FlockMode::Shared
+            && candidate.llc_mode == host_topology::LlcLockMode::Shared
+    }));
+
+    let plan = AdmissionIntentPlan {
+        candidates,
+        permit_pool: host_topology::VmPermitPool::new_with_preparation(4, 2, 256, None)
+            .expect("construct test permit pool"),
+    };
+    let watch = plan.watch();
+    assert_eq!(
+        watch.cpu_mode,
+        host_topology::protocol::ClaimMode::Shared,
+        "best-effort exact preference must not promote the published SH watch to EX",
+    );
+}
+
+fn pending_exec_descriptor_for_validation(
+    memory_min_mib: u32,
+    wprof: bool,
+) -> crate::test_support::AdmissionCellDescriptor {
+    crate::test_support::AdmissionCellDescriptor {
+        exact_name: "ktstr/metadata_v3_contract".into(),
+        kind: crate::test_support::AdmissionCellKind::Ktstr,
+        entry_name: Some("metadata_v3_contract".into()),
+        preset_name: Some("1cpu-1llc-nosmt".into()),
+        scheduler_name: None,
+        kernel: Some("test-kernel".into()),
+        topology: crate::test_support::AdmissionTopologyDescriptor {
+            numa_nodes: 1,
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            node_llcs: None,
+            llc_cores: None,
+        },
+        cpu_budget: None,
+        memory_min_mib,
+        wprof,
+        mode: crate::test_support::AdmissionMode::Default,
+        host_only: false,
+        performance_mode: false,
+        no_perf_mode: false,
+        expect_auto_repro: false,
+    }
+}
+
+#[test]
+fn pending_exec_descriptor_rejects_built_memory_floor_mismatch() {
+    let descriptor = pending_exec_descriptor_for_validation(2_048, false);
+    let error = validate_pending_exec_descriptor(&descriptor, 1_024, 2_048, false)
+        .expect_err("the test binary cannot change its stamped memory floor after pre-admission");
+    assert!(
+        error.to_string().contains("test built 1024MiB"),
+        "unexpected memory-floor mismatch diagnostic: {error:#}",
+    );
+}
+
+#[test]
+fn pending_exec_descriptor_rejects_prepared_memory_below_floor() {
+    let descriptor = pending_exec_descriptor_for_validation(2_048, false);
+    let error = validate_pending_exec_descriptor(&descriptor, 2_048, 2_047, false)
+        .expect_err("immutable preparation cannot lower the stamped memory floor");
+    assert!(
+        error.to_string().contains("prepared VM memory is 2047MiB"),
+        "unexpected prepared-memory mismatch diagnostic: {error:#}",
+    );
+}
+
+#[test]
+fn pending_exec_descriptor_rejects_wprof_mismatch() {
+    let descriptor = pending_exec_descriptor_for_validation(2_048, true);
+    let error = validate_pending_exec_descriptor(&descriptor, 2_048, 2_048, false)
+        .expect_err("the exec target cannot drop the wrapper's stamped wprof requirement");
+    assert!(
+        error
+            .to_string()
+            .contains("carries wprof=true, but the test built wprof=false"),
+        "unexpected wprof mismatch diagnostic: {error:#}",
+    );
+}
+
+#[test]
+fn pending_exec_descriptor_accepts_matching_memory_and_wprof_contract() {
+    let descriptor = pending_exec_descriptor_for_validation(2_048, true);
+    validate_pending_exec_descriptor(&descriptor, 2_048, 3_072, true)
+        .expect("prepared memory may exceed an otherwise identical metadata-v3 contract");
+}
+
 /// Performance admission must publish every exact whole-LLC placement, not
 /// freeze an all-busy storm onto the builder's first slot. The order is
 /// process-rotated, so compare the set.

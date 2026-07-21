@@ -22,8 +22,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ15");
-const VERSION: u32 = 15;
+const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ16");
+const VERSION: u32 = 16;
 const HEADER_FIXED: usize = 256;
 const HEADER_ALIGN: usize = 4096;
 const RECORD_FIXED: usize = 192;
@@ -32,8 +32,8 @@ const RECORDS_PER_CHUNK: usize = 64;
 const NONE_SLOT: u64 = u64::MAX;
 const MAX_RESOURCE_BITS: usize = 1 << 20;
 const MAX_REGISTRY_SLOTS: u64 = 1 << 16;
-const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v15-init-";
-const LIVENESS_PREFIX: &str = "ktstr-acquire-v15-slot-";
+const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v16-init-";
+const LIVENESS_PREFIX: &str = "ktstr-acquire-v16-slot-";
 const LIVENESS_SEPARATOR: &str = "-ticket-";
 const LIVENESS_SUFFIX: &str = ".live";
 
@@ -331,6 +331,7 @@ pub(super) enum State {
 #[derive(Debug)]
 pub(super) struct ScheduleSnapshot {
     pub watch: ClaimSet,
+    pub candidate_claim: ClaimSet,
     pub candidate_watch: ClaimSet,
     pub predecessors: AggregateSnapshot,
     pub availability: AvailabilitySnapshot,
@@ -351,9 +352,28 @@ pub(super) enum FinishAcquireResult {
     Stale,
 }
 
+pub(super) enum FinishPreparationResult {
+    Committed,
+    Stale,
+}
+
+enum PendingTransition {
+    Committed,
+    Contended(ContentionMarker),
+}
+
 #[derive(Debug)]
 pub(super) struct GrantAttempt<T> {
     pub acquired: Option<T>,
+    /// When present, a successful callback owns this physical preparation
+    /// claim rather than the ticket's designated run claim. Commit replaces
+    /// the intent with PENDING in the same slot; no final CPU/LLC reservation
+    /// survives while preparation capacity is held.
+    pub preparation_claim: Option<ClaimSet>,
+    /// Physical preparation resource that prevented this selected intent from
+    /// entering PENDING. It may lie outside the final-run watch; the registry
+    /// stores it only as a wake blocker and never folds it into run fairness.
+    pub preparation_contention: Option<ContentionEvidence>,
     pub next_claim: ClaimSet,
     pub contention: Option<ContentionEvidence>,
 }
@@ -379,6 +399,7 @@ impl Drop for DropProbe {
 
 pub(super) enum GrantResult<T> {
     Acquired(T, HeldClaim),
+    Prepared(T),
     Requeued,
     LostGrant,
 }
@@ -525,6 +546,65 @@ impl AggregateSnapshot {
             &self.llc_exclusive,
             self.bits,
         )
+    }
+
+    pub(super) fn first_conflict(&self, candidate: &ClaimSet) -> Result<Option<ContentionMarker>> {
+        validate_claim(candidate)?;
+        let cpu_bits = if candidate.cpu_mode == ClaimMode::Exclusive {
+            &self.cpu_any
+        } else {
+            &self.cpu_exclusive
+        };
+        for &cpu in &candidate.cpus {
+            self.ensure_index(cpu, "CPU")?;
+            if cpu_bits[cpu / 64] & (1u64 << (cpu % 64)) != 0 {
+                return Ok(Some(ContentionMarker {
+                    blocker: ResourceKey::Cpu(cpu),
+                    mode: match candidate.cpu_mode {
+                        ClaimMode::Shared => FlockMode::Shared,
+                        ClaimMode::Exclusive => FlockMode::Exclusive,
+                    },
+                }));
+            }
+        }
+
+        let permit_bits = if candidate.permit_mode == ClaimMode::Exclusive {
+            &self.cpu_any
+        } else {
+            &self.cpu_exclusive
+        };
+        for &permit in &candidate.permits {
+            let index = permit_resource_index(permit)?;
+            self.ensure_index(index, "permit resource")?;
+            if permit_bits[index / 64] & (1u64 << (index % 64)) != 0 {
+                return Ok(Some(ContentionMarker {
+                    blocker: ResourceKey::Permit(permit),
+                    mode: match candidate.permit_mode {
+                        ClaimMode::Shared => FlockMode::Shared,
+                        ClaimMode::Exclusive => FlockMode::Exclusive,
+                    },
+                }));
+            }
+        }
+
+        let llc_bits = if candidate.llc_mode == ClaimMode::Exclusive {
+            &self.llc_any
+        } else {
+            &self.llc_exclusive
+        };
+        for &llc in &candidate.llcs {
+            self.ensure_index(llc, "LLC")?;
+            if llc_bits[llc / 64] & (1u64 << (llc % 64)) != 0 {
+                return Ok(Some(ContentionMarker {
+                    blocker: ResourceKey::Llc(llc),
+                    mode: match candidate.llc_mode {
+                        ClaimMode::Shared => FlockMode::Shared,
+                        ClaimMode::Exclusive => FlockMode::Exclusive,
+                    },
+                }));
+            }
+        }
+        Ok(None)
     }
 
     pub(super) fn cpu_holder_count(&self, cpu: usize) -> Result<usize> {
@@ -1433,6 +1513,22 @@ impl Ticket {
         initial_contention: Option<ContentionSet>,
         cancelled: Option<&AtomicBool>,
     ) -> Result<Self> {
+        Self::register_after_contention_with_capacity(
+            claim,
+            watch,
+            initial_contention,
+            cancelled,
+            0,
+        )
+    }
+
+    pub(super) fn register_after_contention_with_capacity(
+        claim: ClaimSet,
+        watch: ClaimSet,
+        initial_contention: Option<ContentionSet>,
+        cancelled: Option<&AtomicBool>,
+        required_bits_hint: usize,
+    ) -> Result<Self> {
         let namespace = RegistryNamespace::resolve();
         let _namespace = namespace.enter();
         validate_claim(&claim)?;
@@ -1481,7 +1577,7 @@ impl Ticket {
             .transpose()?;
 
         let _lock = lock_registry_interruptible(cancelled)?;
-        let required_bits = required_resource_bits(&watch);
+        let required_bits = required_resource_bits(&watch).max(required_bits_hint);
         let mut table = Table::open(required_bits)?;
         table.repair_consistency_if_needed()?;
         // A dead coordinator cannot consume its own liveness close. Recover
@@ -1837,6 +1933,17 @@ impl Ticket {
             ),
             cancelled,
         )?;
+        anyhow::ensure!(
+            result.acquired.is_some() || result.preparation_claim.is_none(),
+            "queue callback returned a preparation claim without physical ownership",
+        );
+        anyhow::ensure!(
+            result.preparation_contention.is_none()
+                || (result.acquired.is_none()
+                    && result.preparation_claim.is_none()
+                    && result.contention.is_none()),
+            "queue callback mixed preparation contention with another probe result",
+        );
 
         let lock = lock_registry_interruptible_existing(cancelled)?;
         let mut table = Table::open_existing()?;
@@ -1936,7 +2043,12 @@ impl Ticket {
                 // The optimistic availability snapshot predates this physical
                 // acquisition. Revoke it before releasing the payload so no
                 // waiter can be regranted from the stale free snapshot.
-                table.mark_unknown(&designated.cpus, &designated.llcs, &designated.permits)?;
+                let released_claim = result.preparation_claim.as_ref().unwrap_or(&designated);
+                table.mark_unknown(
+                    &released_claim.cpus,
+                    &released_claim.llcs,
+                    &released_claim.permits,
+                )?;
                 table.bump_generation()?;
             }
             if return_to_waiting || released_acquired {
@@ -1962,6 +2074,42 @@ impl Ticket {
                 "replan-only queue wake returned an acquired payload for ticket {}",
                 self.ticket
             );
+            if let Some(preparation_claim) = result.preparation_claim.take() {
+                match table.transition_record_to_pending(&record, &preparation_claim)? {
+                    PendingTransition::Committed => {
+                        drop(table);
+                        drop(lock);
+                        notify_coordinator();
+                        return Ok(GrantResult::Prepared(acquired));
+                    }
+                    PendingTransition::Contended(marker) => {
+                        let blocked_at = table.blocker_serial(marker.blocker, marker.mode)?;
+
+                        // A disjoint publication raced the physical
+                        // preparation probe. Park on its exact registry
+                        // blocker before dropping the stale OFDs; this yields
+                        // the scheduling turn instead of immediately
+                        // regranting the same intent in a probe storm.
+                        table.begin_transaction()?;
+                        table.set_record_state(self.slot, STATE_WAITING)?;
+                        table.set_record_blocked(self.slot, marker, blocked_at)?;
+                        table.mark_unknown(
+                            &preparation_claim.cpus,
+                            &preparation_claim.llcs,
+                            &preparation_claim.permits,
+                        )?;
+                        table.set_pending_flag(PENDING_RESCAN);
+                        table.bump_generation()?;
+                        table.elect_coordinator_in_transaction()?;
+                        table.finish_transaction()?;
+                        drop(table);
+                        drop(lock);
+                        drop(acquired);
+                        notify_coordinator();
+                        return Ok(GrantResult::Requeued);
+                    }
+                }
+            }
             crash_at_for_tests("granted_acquired_before_clear");
             // The physical resource flocks in `acquired` are already held.
             // Convert this exact queue claim into a live HELD publication
@@ -1982,7 +2130,15 @@ impl Ticket {
             validate_contention_within_watch(&[evidence.marker()], &watch)?;
         }
         let changed = result.next_claim != designated;
-        let blocked = if let Some(evidence) = result.contention.as_ref() {
+        anyhow::ensure!(
+            result.preparation_contention.is_none() || !changed,
+            "preparation contention cannot replace the final-run designation",
+        );
+        let blocked_evidence = result
+            .contention
+            .as_ref()
+            .or(result.preparation_contention.as_ref());
+        let blocked = if let Some(evidence) = blocked_evidence {
             let marker = evidence.marker();
             Some((marker, table.blocker_serial(marker.blocker, marker.mode)?))
         } else {
@@ -2002,11 +2158,15 @@ impl Ticket {
             table.elect_coordinator()?;
         } else {
             table.begin_transaction()?;
-            if let Some(evidence) = result.contention.as_ref() {
+            if let Some(evidence) = blocked_evidence {
                 let marker = evidence.marker();
                 let blocked_at = table.blocker_serial(marker.blocker, marker.mode)?;
-                table.mark_blocker_unknown(marker)?;
                 table.set_record_blocked(self.slot, marker, blocked_at)?;
+                // `set_record_blocked` first installs an event-only watch
+                // reference when preparation lies outside the final-run
+                // watch. The same observation machinery can then persist the
+                // UNKNOWN proof without publishing prep as run intent.
+                table.mark_blocker_unknown(marker)?;
             } else {
                 table.clear_record_blocked(self.slot)?;
             }
@@ -2082,6 +2242,9 @@ impl Ticket {
             validate_claim(claim)?;
             validate_claim_within_watch(claim, &record.watch)?;
         }
+        let candidate_claim = coordinator_claim
+            .cloned()
+            .unwrap_or_else(|| record.claim.clone());
         validate_contention_within_watch(contention, &record.watch)?;
         let event_cpus;
         let event_llcs;
@@ -2142,6 +2305,7 @@ impl Ticket {
         table.touch_coordinator_heartbeat()?;
         Ok(ScheduleSnapshot {
             watch,
+            candidate_claim,
             candidate_watch: record.watch,
             predecessors,
             availability,
@@ -2153,6 +2317,45 @@ impl Ticket {
             observation,
             liveness_due_in,
         })
+    }
+
+    /// Publish one preparation-only blocker for the active coordinator.
+    ///
+    /// The blocker contributes to aggregate event watching when its resource
+    /// is outside the ticket's immutable final-run watch (an overlapping
+    /// resource reuses the existing event reference). It never changes that
+    /// immutable watch, claim compatibility, or fairness.
+    pub(super) fn mark_external_contention(
+        &mut self,
+        contention: &[ContentionMarker],
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<()> {
+        let _namespace = self.namespace.enter();
+        anyhow::ensure!(
+            contention.len() == 1,
+            "preparation probe must publish exactly one external blocker",
+        );
+        let marker = contention[0];
+        let _lock = lock_registry_interruptible_existing(cancelled)?;
+        let mut table = Table::open_existing()?;
+        table.repair_consistency_if_needed()?;
+        let record = table
+            .record(self.slot)?
+            .filter(|record| record.ticket == self.ticket)
+            .ok_or_else(|| anyhow::anyhow!("coordinator ticket {} disappeared", self.ticket))?;
+        if record.state != STATE_COORDINATOR
+            || table.coordinator_ticket() != self.ticket
+            || table.coordinator_slot()? != self.slot
+        {
+            anyhow::bail!("ticket {} lost the queue coordinator license", self.ticket);
+        }
+        let blocked_at = table.blocker_serial(marker.blocker, marker.mode)?;
+        table.begin_transaction()?;
+        table.set_record_blocked(self.slot, marker, blocked_at)?;
+        table.mark_blocker_unknown(marker)?;
+        table.bump_generation()?;
+        table.finish_transaction()?;
+        Ok(())
     }
 
     fn open_coordinator_table(
@@ -2343,6 +2546,7 @@ impl Ticket {
         check_cancelled(cancelled)?;
         Ok(Some(ScheduleSnapshot {
             watch,
+            candidate_claim: record.claim,
             candidate_watch: record.watch,
             predecessors,
             availability,
@@ -2386,11 +2590,11 @@ impl Ticket {
         {
             anyhow::bail!("ticket {} lost the queue coordinator license", self.ticket);
         }
-        let planner_serial_before = table.max_planner_watch_serial(&record.watch, &record.claim)?;
+        let planner_serial_before = table.max_coordinator_planner_serial(&record)?;
         table.begin_transaction()?;
         table.apply_observation(request, observation)?;
         table.finish_transaction()?;
-        let planner_serial_after = table.max_planner_watch_serial(&record.watch, &record.claim)?;
+        let planner_serial_after = table.max_coordinator_planner_serial(&record)?;
         // Keep the registry EX fence while dropping proof flocks, then grant
         // from the state they proved. A split release/reacquire lets a fast SH
         // fenced acquirer steal the resource between proof and waiter wake.
@@ -2409,6 +2613,7 @@ impl Ticket {
         table.touch_coordinator_heartbeat()?;
         Ok(ScheduleSnapshot {
             watch,
+            candidate_claim: record.claim,
             candidate_watch: record.watch,
             predecessors,
             availability,
@@ -2542,6 +2747,51 @@ impl Ticket {
         notify_coordinator();
         cancel_coordinator_commit_for_tests(cancelled);
         Ok(FinishAcquireResult::Committed(held))
+    }
+
+    /// Commit a coordinator-selected intent into physical preparation
+    /// ownership without ever publishing the final run claim as HELD.
+    pub(super) fn finish_preparation(
+        &mut self,
+        preparation: &ClaimSet,
+        commit_token: CoordinatorCommitToken,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<FinishPreparationResult> {
+        let _namespace = self.namespace.enter();
+        if self.finished {
+            anyhow::bail!("coordinator ticket was already committed");
+        }
+        validate_claim(preparation)?;
+        let _lock = lock_registry_interruptible_existing(cancelled)?;
+        let mut table = Table::open_existing()?;
+        table.repair_consistency_if_needed()?;
+        let record = table
+            .record(self.slot)?
+            .filter(|record| record.ticket == self.ticket)
+            .ok_or_else(|| anyhow::anyhow!("coordinator ticket {} disappeared", self.ticket))?;
+        if record.state == STATE_COORDINATOR_STANDBY {
+            return Ok(FinishPreparationResult::Stale);
+        }
+        if record.state != STATE_COORDINATOR
+            || table.coordinator_ticket() != self.ticket
+            || table.coordinator_slot()? != self.slot
+        {
+            anyhow::bail!("ticket {} lost the queue coordinator license", self.ticket);
+        }
+        let stale = table.coordinator_epoch() != commit_token.coordinator_epoch
+            || (table.claim_epoch() != commit_token.claim_epoch
+                && table.min_changed_ticket() < record.ticket);
+        if stale {
+            return Ok(FinishPreparationResult::Stale);
+        }
+        match table.transition_record_to_pending(&record, preparation)? {
+            PendingTransition::Committed => {}
+            PendingTransition::Contended(_) => return Ok(FinishPreparationResult::Stale),
+        }
+        drop(table);
+        drop(_lock);
+        notify_coordinator();
+        Ok(FinishPreparationResult::Committed)
     }
 
     #[cfg(test)]
@@ -3442,8 +3692,20 @@ pub(super) fn exercise_resource_weighted_backfill_accounting_for_tests() -> (u32
 }
 
 #[cfg(test)]
-pub(super) fn exercise_work_conserving_backfill_for_tests()
--> Result<(usize, usize, usize, bool, bool, bool, bool, bool)> {
+pub(crate) struct WorkConservingBackfillOutcome {
+    pub(crate) conflicting_grants: usize,
+    pub(crate) conflicting_waiters: usize,
+    pub(crate) disjoint_grants: usize,
+    pub(crate) refilled_after_completion: bool,
+    pub(crate) expired_head_stops_refill: bool,
+    pub(crate) wide_wins: bool,
+    pub(crate) racer_revoked_without_placement_damage: bool,
+    pub(crate) stale_callback_suppressed: bool,
+}
+
+#[cfg(test)]
+pub(super) fn exercise_work_conserving_backfill_for_tests() -> Result<WorkConservingBackfillOutcome>
+{
     const TEST_CAPACITY: u32 = 3;
     const CONFLICTING: usize = TEST_CAPACITY as usize + 2;
     const DISJOINT: usize = TEST_CAPACITY as usize + 5;
@@ -3620,6 +3882,8 @@ pub(super) fn exercise_work_conserving_backfill_for_tests()
             racer_callbacks += 1;
             Ok(GrantAttempt::<()> {
                 acquired: None,
+                preparation_claim: None,
+                preparation_contention: None,
                 next_claim: conflicting_claim.clone(),
                 contention: None,
             })
@@ -3636,16 +3900,16 @@ pub(super) fn exercise_work_conserving_backfill_for_tests()
     }
     wide_ticket.finish(None)?;
     coordinator.finish(None)?;
-    Ok((
-        initial_grants,
-        initial_waiters,
+    Ok(WorkConservingBackfillOutcome {
+        conflicting_grants: initial_grants,
+        conflicting_waiters: initial_waiters,
         disjoint_grants,
         refilled_after_completion,
         expired_head_stops_refill,
         wide_wins,
-        racer_revoked && disjoint_preserved,
+        racer_revoked_without_placement_damage: racer_revoked && disjoint_preserved,
         stale_callback_suppressed,
-    ))
+    })
 }
 
 #[cfg(test)]
@@ -4305,6 +4569,8 @@ pub(super) fn exercise_exact_commit_scan_elision_for_tests(commits: usize) -> Re
                 }
                 Ok(GrantAttempt {
                     acquired: Some(()),
+                    preparation_claim: None,
+                    preparation_contention: None,
                     next_claim: designated.clone(),
                     contention: None,
                 })
@@ -4664,6 +4930,8 @@ pub(super) fn exercise_prefix_callback_scaling_for_tests(
                 }
                 Ok(GrantAttempt::<()> {
                     acquired: None,
+                    preparation_claim: None,
+                    preparation_contention: None,
                     next_claim: designated.clone(),
                     contention: None,
                 })
@@ -4709,6 +4977,8 @@ pub(super) fn exercise_one_shot_replacement_for_tests()
             }
             Ok(GrantAttempt::<()> {
                 acquired: None,
+                preparation_claim: None,
+                preparation_contention: None,
                 next_claim: next_claim.clone(),
                 contention: None,
             })
@@ -4765,6 +5035,8 @@ pub(super) fn exercise_prefix_epoch_validation_for_tests() -> Result<(usize, boo
             callbacks += 1;
             Ok(GrantAttempt::<()> {
                 acquired: None,
+                preparation_claim: None,
+                preparation_contention: None,
                 next_claim: ClaimSet::default(),
                 contention: None,
             })
@@ -4814,6 +5086,8 @@ pub(super) fn exercise_prefix_epoch_validation_for_tests() -> Result<(usize, boo
             callbacks += 1;
             Ok(GrantAttempt::<()> {
                 acquired: None,
+                preparation_claim: None,
+                preparation_contention: None,
                 next_claim: ClaimSet::default(),
                 contention: None,
             })
@@ -4952,6 +5226,8 @@ pub(super) fn exercise_prefix_refresh_after_predecessor_release_for_tests()
             }
             Ok(GrantAttempt {
                 acquired: Some(()),
+                preparation_claim: None,
+                preparation_contention: None,
                 next_claim: designated.clone(),
                 contention: None,
             })
@@ -5004,6 +5280,8 @@ pub(super) fn exercise_prefix_refresh_after_predecessor_release_for_tests()
                 !predecessors.conflicts(&candidate)? && availability.allows(&candidate)?;
             Ok(GrantAttempt::<()> {
                 acquired: None,
+                preparation_claim: None,
+                preparation_contention: None,
                 next_claim: candidate.clone(),
                 contention: None,
             })
@@ -5142,6 +5420,8 @@ pub(super) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool
             stale_snapshot_rejected = true;
             Ok(GrantAttempt::<()> {
                 acquired: None,
+                preparation_claim: None,
+                preparation_contention: None,
                 next_claim: designated.clone(),
                 contention: None,
             })
@@ -5161,6 +5441,8 @@ pub(super) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool
                 !predecessors.conflicts(&candidate)? && availability.allows(&candidate)?;
             Ok(GrantAttempt::<()> {
                 acquired: None,
+                preparation_claim: None,
+                preparation_contention: None,
                 next_claim: candidate.clone(),
                 contention: None,
             })
@@ -5243,6 +5525,8 @@ pub(super) fn exercise_stale_acquired_release_order_for_tests()
                     dropped: std::rc::Rc::clone(&payload_dropped),
                     registry_unlocked: std::rc::Rc::clone(&registry_unlocked_at_drop),
                 }),
+                preparation_claim: None,
+                preparation_contention: None,
                 next_claim: designated.clone(),
                 contention: None,
             })
@@ -5308,6 +5592,8 @@ pub(super) fn exercise_stale_contention_commit_for_tests() -> Result<(bool, bool
             table.grant_compatible()?;
             Ok(GrantAttempt::<()> {
                 acquired: None,
+                preparation_claim: None,
+                preparation_contention: None,
                 next_claim: alternative.clone(),
                 contention: Some(ContentionEvidence {
                     blocker: ResourceKey::Cpu(1),
@@ -5554,23 +5840,7 @@ fn validate_contention_within_watch(
     watch: &ClaimSet,
 ) -> Result<()> {
     for marker in contention {
-        let valid = match marker.blocker {
-            ResourceKey::Cpu(index) => {
-                watch.cpus.contains(&index)
-                    && (watch.cpu_mode == ClaimMode::Exclusive
-                        || ClaimMode::from(marker.mode) == watch.cpu_mode)
-            }
-            ResourceKey::Llc(index) => {
-                watch.llcs.contains(&index)
-                    && (watch.llc_mode == ClaimMode::Exclusive
-                        || ClaimMode::from(marker.mode) == watch.llc_mode)
-            }
-            ResourceKey::Permit(index) => {
-                watch.permits.contains(&index)
-                    && (watch.permit_mode == ClaimMode::Exclusive
-                        || ClaimMode::from(marker.mode) == watch.permit_mode)
-            }
-        };
+        let valid = contention_marker_within_watch(*marker, watch);
         if !valid {
             anyhow::bail!(
                 "queue contention marker is outside its immutable watch set: \
@@ -5580,6 +5850,26 @@ fn validate_contention_within_watch(
         }
     }
     Ok(())
+}
+
+fn contention_marker_within_watch(marker: ContentionMarker, watch: &ClaimSet) -> bool {
+    match marker.blocker {
+        ResourceKey::Cpu(index) => {
+            watch.cpus.contains(&index)
+                && (watch.cpu_mode == ClaimMode::Exclusive
+                    || ClaimMode::from(marker.mode) == watch.cpu_mode)
+        }
+        ResourceKey::Llc(index) => {
+            watch.llcs.contains(&index)
+                && (watch.llc_mode == ClaimMode::Exclusive
+                    || ClaimMode::from(marker.mode) == watch.llc_mode)
+        }
+        ResourceKey::Permit(index) => {
+            watch.permits.contains(&index)
+                && (watch.permit_mode == ClaimMode::Exclusive
+                    || ClaimMode::from(marker.mode) == watch.permit_mode)
+        }
+    }
 }
 
 fn union_claims(a: &ClaimSet, b: &ClaimSet) -> ClaimSet {
@@ -5641,7 +5931,7 @@ fn required_resource_bits(claim: &ClaimSet) -> usize {
                 .saturating_add(1)
         })
         .unwrap_or(0);
-    // The v15 mapping is deliberately overprovisioned once. It never needs a
+    // The v16 mapping is deliberately overprovisioned once. It never needs a
     // migration/grow protocol when the first low-index ticket is followed by a
     // valid sparse CPU/LLC/permit index on the same host. Permit indices occupy
     // a disjoint internal bit range immediately after possible host CPUs.
@@ -5653,6 +5943,10 @@ fn required_resource_bits(claim: &ClaimSet) -> usize {
                 .min(MAX_RESOURCE_BITS),
         )
         .max(4096)
+}
+
+pub(super) fn required_bits_for_claim(claim: &ClaimSet) -> usize {
+    required_resource_bits(claim)
 }
 
 pub(super) fn required_bits_for_permit_index(max_permit: usize) -> usize {
@@ -5728,11 +6022,11 @@ fn notify_path() -> PathBuf {
 }
 
 fn registry_data_dir() -> PathBuf {
-    active_protocol_dir().join("ktstr-acquire-registry-v15")
+    active_protocol_dir().join("ktstr-acquire-registry-v16")
 }
 
 pub(super) fn event_dir() -> PathBuf {
-    active_protocol_dir().join("ktstr-acquire-events-v15")
+    active_protocol_dir().join("ktstr-acquire-events-v16")
 }
 
 #[cfg(test)]
@@ -7045,9 +7339,7 @@ impl Table {
             .filter(|record| record.ticket == ticket)
             .ok_or_else(|| anyhow::anyhow!("queue slot {slot} disappeared during replacement"))?
             .replan_claim_epoch;
-        if let Some((evidence, _)) = blocked {
-            self.mark_blocker_unknown(evidence)?;
-        }
+        self.clear_record_blocked(slot)?;
         self.adjust_claim_counts(old, false)?;
         self.adjust_claim_counts(new, true)?;
         crash_at_for_tests("replace_counts_before_record");
@@ -7089,26 +7381,10 @@ impl Table {
             write_u64(bytes, R_ISSUE_SERIAL, issue_serial);
             write_u64(bytes, R_REPLAN_CLAIM_EPOCH, replan_claim_epoch);
             write_u64(bytes, R_BACKFILL_STARTED_NS, 0);
-            if persist_blocker && let Some((evidence, serial)) = blocked {
-                let (kind, index) = match evidence.blocker {
-                    ResourceKey::Cpu(index) => (BLOCK_CPU, index),
-                    ResourceKey::Llc(index) => (BLOCK_LLC, index),
-                    ResourceKey::Permit(index) => (BLOCK_PERMIT, index),
-                };
-                write_u64(bytes, R_BLOCKED_SERIAL, serial);
-                write_u32(bytes, R_BLOCK_KIND, kind);
-                write_u32(
-                    bytes,
-                    R_BLOCK_MODE,
-                    u32::from(evidence.mode == FlockMode::Exclusive),
-                );
-                write_u64(
-                    bytes,
-                    R_BLOCK_INDEX,
-                    u64::try_from(index)
-                        .context("blocked resource index does not fit registry record")?,
-                );
-            }
+        }
+        if persist_blocker && let Some((evidence, serial)) = blocked {
+            self.set_record_blocked(slot, evidence, serial)?;
+            self.mark_blocker_unknown(evidence)?;
         }
         self.mark_claim_changed(ticket)?;
         crash_at_for_tests("replace_record_before_state_publish");
@@ -7131,6 +7407,7 @@ impl Table {
         validate_claim(exact)?;
         self.begin_transaction()?;
         self.mark_blockers_unknown(contention)?;
+        self.clear_record_blocked(record.slot)?;
         let claim_changed = record.claim != *exact;
         if claim_changed {
             self.adjust_claim_counts(&record.claim, false)?;
@@ -7189,6 +7466,119 @@ impl Table {
         Ok(())
     }
 
+    /// Atomically replace a selected run intent with the physical
+    /// preparation footprint acquired by its callback.
+    ///
+    /// The old final CPU/LLC/permit claim is removed in the same transaction
+    /// that publishes PENDING. A selected intent therefore never reserves run
+    /// resources while it waits for immutable-image preparation, and a racing
+    /// incompatible publication makes this commit fail cleanly rather than
+    /// hiding behind physical flock ownership.
+    fn transition_record_to_pending(
+        &mut self,
+        record: &Record,
+        preparation: &ClaimSet,
+    ) -> Result<PendingTransition> {
+        validate_claim(preparation)?;
+        anyhow::ensure!(
+            !preparation.is_empty(),
+            "granted intent produced an empty preparation claim",
+        );
+        materialize_claim_paths(preparation)?;
+        // The ticket already earned this grant against its predecessor prefix.
+        // Later tickets may publish while its physical preparation probe runs,
+        // but they cannot retroactively veto the older grant. Recompute the
+        // prefix under the commit lock and fence only genuine predecessors.
+        let predecessors = self.cached_prefix(record.slot)?.1;
+        if let Some(marker) = predecessors.first_conflict(preparation)? {
+            return Ok(PendingTransition::Contended(marker));
+        }
+
+        self.begin_transaction()?;
+        self.clear_record_blocked(record.slot)?;
+        self.adjust_claim_counts(&record.claim, false)?;
+        self.adjust_watch_counts(&record.watch, false)?;
+        let newly_watched = self.newly_watched(preparation)?;
+        self.adjust_claim_counts(preparation, true)?;
+        self.adjust_watch_counts(preparation, true)?;
+        self.mark_observation_modes(&newly_watched)?;
+        let issue_serial = self.max_watch_serial(preparation)?;
+        let layout = self.layout;
+        {
+            let bytes = self
+                .record_bytes_mut(record.slot)?
+                .ok_or_else(|| anyhow::anyhow!("queue slot {} disappeared", record.slot))?;
+            write_u32(bytes, R_STATE, STATE_FREE);
+            clear_record_claim_bits(bytes, layout);
+            clear_record_watch_bits(bytes, layout);
+            write_u32(
+                bytes,
+                R_CLAIM_LLC_MODE,
+                u32::from(preparation.llc_mode == ClaimMode::Exclusive),
+            );
+            write_u32(
+                bytes,
+                R_CLAIM_CPU_MODE,
+                u32::from(preparation.cpu_mode == ClaimMode::Exclusive),
+            );
+            write_u32(
+                bytes,
+                R_CLAIM_PERMIT_MODE,
+                u32::from(preparation.permit_mode == ClaimMode::Exclusive),
+            );
+            write_u32(
+                bytes,
+                R_WATCH_LLC_MODE,
+                u32::from(preparation.llc_mode == ClaimMode::Exclusive),
+            );
+            write_u32(
+                bytes,
+                R_WATCH_CPU_MODE,
+                u32::from(preparation.cpu_mode == ClaimMode::Exclusive),
+            );
+            write_u32(
+                bytes,
+                R_WATCH_PERMIT_MODE,
+                u32::from(preparation.permit_mode == ClaimMode::Exclusive),
+            );
+            write_u32(
+                bytes,
+                R_CLAIM_CLASS,
+                encode_admission_class(preparation.admission_class),
+            );
+            write_u32(
+                bytes,
+                R_WATCH_CLASS,
+                encode_admission_class(preparation.admission_class),
+            );
+            encode_claim(bytes, layout, preparation, preparation)?;
+            write_u64(bytes, R_ISSUE_SERIAL, issue_serial);
+            write_u64(bytes, R_GRANT_EPOCH, 0);
+            write_u64(bytes, R_REPLAN_CLAIM_EPOCH, 0);
+            write_u64(bytes, R_PREFIX_EPOCH, 0);
+            write_u32(
+                bytes,
+                R_BACKFILL_CAPACITY,
+                backfill_capacity_for_watch(preparation),
+            );
+            write_u64(bytes, R_BACKFILL_STARTED_NS, 0);
+            write_u64(bytes, R_BLOCKED_SERIAL, 0);
+            write_u32(bytes, R_BLOCK_KIND, BLOCK_NONE);
+            write_u32(bytes, R_BLOCK_MODE, 0);
+            write_u64(bytes, R_BLOCK_INDEX, 0);
+            write_u32(bytes, R_STATE, STATE_PENDING);
+        }
+        self.mark_claim_changed(record.ticket)?;
+        self.set_pending_flag(PENDING_RESCAN);
+        if self.coordinator_ticket() == record.ticket {
+            self.set_coordinator(0, NONE_SLOT)?;
+            self.elect_coordinator_in_transaction()?;
+        }
+        self.bump_generation()?;
+        self.finish_transaction()?;
+        Ok(PendingTransition::Committed)
+    }
+
     fn remove_record(&mut self, record: &Record, acquired: bool) -> Result<()> {
         let removed_coordinator = self.coordinator_ticket() == record.ticket;
         self.begin_transaction()?;
@@ -7223,6 +7613,7 @@ impl Table {
                 &record.claim.permits,
             )?;
         }
+        self.clear_record_blocked(record.slot)?;
         self.adjust_claim_counts(&record.claim, false)?;
         if record.state == STATE_HELD {
             self.adjust_held_counts(&record.claim, false)?;
@@ -7254,6 +7645,18 @@ impl Table {
     }
 
     fn clear_record_blocked(&mut self, slot: u64) -> Result<()> {
+        let record = self.record(slot)?.ok_or_else(|| {
+            anyhow::anyhow!("queue slot {slot} disappeared during blocker update")
+        })?;
+        let external = Self::external_blocker(&record);
+        let owns_transaction = external.is_some()
+            && atomic_u64(&self.header, H_AGGREGATE_DIRTY).load(Ordering::SeqCst) == 0;
+        if owns_transaction {
+            self.begin_transaction()?;
+        }
+        if let Some(marker) = external {
+            self.adjust_external_event_watch(marker, false)?;
+        }
         let bytes = self.record_bytes_mut(slot)?.ok_or_else(|| {
             anyhow::anyhow!("queue slot {slot} disappeared during blocker update")
         })?;
@@ -7261,6 +7664,9 @@ impl Table {
         write_u32(bytes, R_BLOCK_KIND, BLOCK_NONE);
         write_u32(bytes, R_BLOCK_MODE, 0);
         write_u64(bytes, R_BLOCK_INDEX, 0);
+        if owns_transaction {
+            self.finish_transaction()?;
+        }
         Ok(())
     }
 
@@ -7270,6 +7676,25 @@ impl Table {
         evidence: ContentionMarker,
         serial: u64,
     ) -> Result<()> {
+        let record = self.record(slot)?.ok_or_else(|| {
+            anyhow::anyhow!("queue slot {slot} disappeared during blocker update")
+        })?;
+        let old_external = Self::external_blocker(&record);
+        let new_external =
+            (!contention_marker_within_watch(evidence, &record.watch)).then_some(evidence);
+        let owns_transaction = old_external != new_external
+            && atomic_u64(&self.header, H_AGGREGATE_DIRTY).load(Ordering::SeqCst) == 0;
+        if owns_transaction {
+            self.begin_transaction()?;
+        }
+        if old_external != new_external {
+            if let Some(marker) = old_external {
+                self.adjust_external_event_watch(marker, false)?;
+            }
+            if let Some(marker) = new_external {
+                self.adjust_external_event_watch(marker, true)?;
+            }
+        }
         let bytes = self.record_bytes_mut(slot)?.ok_or_else(|| {
             anyhow::anyhow!("queue slot {slot} disappeared during blocker update")
         })?;
@@ -7290,7 +7715,39 @@ impl Table {
             R_BLOCK_INDEX,
             u64::try_from(index).context("blocked resource index does not fit registry record")?,
         );
+        if owns_transaction {
+            self.finish_transaction()?;
+        }
         Ok(())
+    }
+
+    fn external_blocker(record: &Record) -> Option<ContentionMarker> {
+        record.blocked_on.and_then(|blocked| {
+            let marker = ContentionMarker {
+                blocker: blocked.key,
+                mode: blocked.mode,
+            };
+            (!contention_marker_within_watch(marker, &record.watch)).then_some(marker)
+        })
+    }
+
+    fn adjust_external_event_watch(&mut self, marker: ContentionMarker, add: bool) -> Result<()> {
+        let mut watch = ClaimSet::default();
+        match marker.blocker {
+            ResourceKey::Cpu(cpu) => {
+                watch.cpus.insert(cpu);
+                watch.cpu_mode = ClaimMode::from(marker.mode);
+            }
+            ResourceKey::Llc(llc) => {
+                watch.llcs.insert(llc);
+                watch.llc_mode = ClaimMode::from(marker.mode);
+            }
+            ResourceKey::Permit(permit) => {
+                watch.permits.insert(permit);
+                watch.permit_mode = ClaimMode::from(marker.mode);
+            }
+        }
+        self.adjust_watch_counts(&watch, add)
     }
 
     fn set_record_issue_serial(&mut self, slot: u64, serial: u64) -> Result<()> {
@@ -7419,12 +7876,18 @@ impl Table {
             let blocker_ready = match record.blocked_on {
                 None => true,
                 Some(blocked) => {
+                    let marker = ContentionMarker {
+                        blocker: blocked.key,
+                        mode: blocked.mode,
+                    };
                     let still_designated = match blocked.key {
                         ResourceKey::Cpu(index) => record.claim.cpus.contains(&index),
                         ResourceKey::Llc(index) => record.claim.llcs.contains(&index),
                         ResourceKey::Permit(index) => record.claim.permits.contains(&index),
                     };
-                    !still_designated
+                    let external_preparation =
+                        !contention_marker_within_watch(marker, &record.watch);
+                    (!still_designated && !external_preparation)
                         || self.blocker_serial(blocked.key, blocked.mode)? > blocked.serial
                 }
             };
@@ -7801,7 +8264,7 @@ impl Table {
             // The record table is authoritative. A clean header/record
             // mismatch must not permanently poison admission, so defensively
             // rebuild the active/free lists, aggregates, coordinator header,
-            // and record states together. Current v15 publication validates
+            // and record states together. Current v16 publication validates
             // this pair before clearing the dirty bit.
             self.repair_consistency()?;
             coordinator = self.coordinator_ticket();
@@ -8075,6 +8538,16 @@ impl Table {
         candidate: &ClaimSet,
         excluded: &ClaimSet,
     ) -> Result<bool> {
+        Ok(self
+            .first_claim_conflict_aggregate_excluding(candidate, excluded)?
+            .is_some())
+    }
+
+    fn first_claim_conflict_aggregate_excluding(
+        &self,
+        candidate: &ClaimSet,
+        excluded: &ClaimSet,
+    ) -> Result<Option<ContentionMarker>> {
         validate_claim(candidate)?;
         let count_after_excluding = |which: usize, index: usize, contributes: bool| {
             if index >= self.layout.bits {
@@ -8104,7 +8577,13 @@ impl Table {
             let contributes = excluded.cpus.contains(&cpu)
                 && (cpu_which == B_CLAIM_CPUS || excluded.cpu_mode == ClaimMode::Exclusive);
             if count_after_excluding(cpu_which, cpu, contributes)? != 0 {
-                return Ok(true);
+                return Ok(Some(ContentionMarker {
+                    blocker: ResourceKey::Cpu(cpu),
+                    mode: match candidate.cpu_mode {
+                        ClaimMode::Shared => FlockMode::Shared,
+                        ClaimMode::Exclusive => FlockMode::Exclusive,
+                    },
+                }));
             }
         }
 
@@ -8118,7 +8597,13 @@ impl Table {
             let contributes = excluded.permits.contains(&permit)
                 && (permit_which == B_CLAIM_CPUS || excluded.permit_mode == ClaimMode::Exclusive);
             if count_after_excluding(permit_which, index, contributes)? != 0 {
-                return Ok(true);
+                return Ok(Some(ContentionMarker {
+                    blocker: ResourceKey::Permit(permit),
+                    mode: match candidate.permit_mode {
+                        ClaimMode::Shared => FlockMode::Shared,
+                        ClaimMode::Exclusive => FlockMode::Exclusive,
+                    },
+                }));
             }
         }
 
@@ -8131,10 +8616,16 @@ impl Table {
             let contributes = excluded.llcs.contains(&llc)
                 && (llc_which == B_CLAIM_LLC_ANY || excluded.llc_mode == ClaimMode::Exclusive);
             if count_after_excluding(llc_which, llc, contributes)? != 0 {
-                return Ok(true);
+                return Ok(Some(ContentionMarker {
+                    blocker: ResourceKey::Llc(llc),
+                    mode: match candidate.llc_mode {
+                        ClaimMode::Shared => FlockMode::Shared,
+                        ClaimMode::Exclusive => FlockMode::Exclusive,
+                    },
+                }));
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     fn blocker_serial(&self, key: ResourceKey, mode: FlockMode) -> Result<u64> {
@@ -8212,6 +8703,18 @@ impl Table {
         for &permit in &watch.permits {
             serial =
                 serial.max(self.resource_serial(permit_serial, permit_resource_index(permit)?)?);
+        }
+        Ok(serial)
+    }
+
+    /// Highest serial that can make the active coordinator's current planner
+    /// turn runnable. Preparation blockers may intentionally live outside the
+    /// immutable final-run watch, so include their exact observation serial in
+    /// addition to the ordinary designation watch.
+    fn max_coordinator_planner_serial(&self, record: &Record) -> Result<u64> {
+        let mut serial = self.max_planner_watch_serial(&record.watch, &record.claim)?;
+        if let Some(blocked) = record.blocked_on {
+            serial = serial.max(self.blocker_serial(blocked.key, blocked.mode)?);
         }
         Ok(serial)
     }
@@ -9102,6 +9605,13 @@ impl Table {
                 self.adjust_held_counts(&record.claim, true)?;
             } else {
                 self.adjust_watch_counts(&record.watch, true)?;
+            }
+            // An interrupted transaction may leave a persisted preparation
+            // blocker outside the immutable final-run watch. Reconstruct its
+            // event-only reference so the ordinary blocker clearing below can
+            // balance it without underflowing the aggregate watch counts.
+            if let Some(marker) = Self::external_blocker(record) {
+                self.adjust_external_event_watch(marker, true)?;
             }
         }
         records.sort_by_key(|record| record.ticket);

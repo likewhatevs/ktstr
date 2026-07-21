@@ -1,6 +1,6 @@
 //! Cross-process host-resource admission under nextest.
 //!
-//! Every ktstr process sharing a lock directory participates in one v15
+//! Every ktstr process sharing a lock directory participates in one v16
 //! fixed-record mmap registry. A ticket publishes one exact, non-empty CPU/LLC
 //! reservation claim plus the resources its planner may watch. Claims preserve
 //! the resource-lock semantics exactly: CPU and LLC claims independently use
@@ -1024,6 +1024,15 @@ impl GrantedProbe {
             && self.availability.allows(candidate)?)
     }
 
+    pub(crate) fn candidate_holder_pressure(&self, candidate: &ClaimSet) -> Result<usize> {
+        let cpu = candidate.cpus.iter().try_fold(0usize, |total, &cpu| {
+            Ok::<_, anyhow::Error>(total.saturating_add(self.predecessors.cpu_holder_count(cpu)?))
+        })?;
+        candidate.llcs.iter().try_fold(cpu, |total, &llc| {
+            Ok::<_, anyhow::Error>(total.saturating_add(self.predecessors.llc_holder_count(llc)?))
+        })
+    }
+
     pub(crate) fn try_acquire<T, O: IntoProbeOutcome<T>>(
         &mut self,
         candidate: &ClaimSet,
@@ -1089,6 +1098,9 @@ impl GrantedProbe {
 pub(crate) struct CoordinatorTicket {
     ticket: registry::Ticket,
     preparation: Option<super::PreparationPermit>,
+    /// Extra release events relevant only while selecting physical
+    /// preparation. This envelope is never published as a claim/watch.
+    preparation_watch: Option<ClaimSet>,
 }
 
 #[cfg(test)]
@@ -1363,6 +1375,173 @@ fn pending_admission_from_parts(
     Ok(pending)
 }
 
+/// Publish a lightweight exact/flexible run intent before acquiring any
+/// physical preparation capacity. The ordinary queue selects among all
+/// visible intents. A selected callback probes the preparation pool exactly
+/// once and either commits PENDING immediately or revokes/requeues its final
+/// claim, so run resources are never retained while waiting for a slot.
+pub(crate) fn register_intent_for_preparation(
+    initial_claim: ClaimSet,
+    watch: ClaimSet,
+    mut granted_candidate: impl FnMut(&GrantedProbe) -> Result<Option<ClaimSet>>,
+    mut coordinator_candidate: impl FnMut(&HeldLocks) -> Result<Option<ClaimSet>>,
+) -> Result<PendingAdmission> {
+    let preparation_watch = super::preparation_resource_watch()?;
+    registry::validate_claim_within_watch(&initial_claim, &watch)?;
+    let mut ticket = registry::Ticket::register_after_contention_with_capacity(
+        initial_claim.clone(),
+        watch,
+        None,
+        None,
+        registry::required_bits_for_claim(&preparation_watch),
+    )?;
+    let mut rotation_bias = 0usize;
+    loop {
+        super::tick_reservation_wait_progress();
+        match ticket.state_or_wait(WAITER_CRASH_RECOVERY_BASE, None)? {
+            registry::State::Granted | registry::State::Replan => {
+                let result = ticket.run_granted(
+                    None,
+                    |designated, watch, acquisition_allowed, predecessors, availability| {
+                        let mut probe = GrantedProbe {
+                            designated: designated.clone(),
+                            watch: watch.clone(),
+                            next_claim: designated.clone(),
+                            acquisition_allowed,
+                            contention: None,
+                            predecessors,
+                            availability,
+                            reusable_permits: Vec::new(),
+                        };
+                        let selected = granted_candidate(&probe)?;
+                        if !acquisition_allowed {
+                            if let Some(candidate) = selected {
+                                probe.reserve(&candidate)?;
+                            }
+                            return Ok(registry::GrantAttempt {
+                                acquired: None,
+                                preparation_claim: None,
+                                preparation_contention: None,
+                                next_claim: probe.next_claim,
+                                contention: None,
+                            });
+                        }
+                        let Some(candidate) = selected else {
+                            return Ok(registry::GrantAttempt {
+                                acquired: None,
+                                preparation_claim: None,
+                                preparation_contention: None,
+                                next_claim: probe.next_claim,
+                                contention: None,
+                            });
+                        };
+                        if candidate != *designated {
+                            probe.reserve(&candidate)?;
+                            return Ok(registry::GrantAttempt {
+                                acquired: None,
+                                preparation_claim: None,
+                                preparation_contention: None,
+                                next_claim: probe.next_claim,
+                                contention: None,
+                            });
+                        }
+
+                        let selected = super::try_preparation_candidates_once(
+                            rotation_bias,
+                            &designated.cpus.iter().copied().collect::<Vec<_>>(),
+                            |preparation, claim| {
+                                Ok(super::PreparationCandidateDecision::Accepted((
+                                    preparation,
+                                    claim,
+                                )))
+                            },
+                        )?;
+                        rotation_bias = rotation_bias.wrapping_add(1);
+                        let (acquired, preparation_claim, preparation_contention) = match selected {
+                            super::PreparationProbe::Acquired((preparation, claim)) => {
+                                (Some(preparation), Some(claim), None)
+                            }
+                            super::PreparationProbe::Contended(evidence) => {
+                                (None, None, Some(evidence))
+                            }
+                            super::PreparationProbe::Unavailable => (None, None, None),
+                        };
+                        Ok(registry::GrantAttempt {
+                            acquired,
+                            preparation_claim,
+                            preparation_contention,
+                            next_claim: probe.next_claim,
+                            contention: None,
+                        })
+                    },
+                )?;
+                match result {
+                    registry::GrantResult::Prepared(preparation) => {
+                        return pending_admission_from_parts(ticket, preparation);
+                    }
+                    registry::GrantResult::Acquired(_, _) => {
+                        unreachable!("intent callback published its run claim as HELD")
+                    }
+                    registry::GrantResult::Requeued | registry::GrantResult::LostGrant => {}
+                }
+            }
+            registry::State::Coordinator => {
+                let coordinator = CoordinatorTicket {
+                    ticket,
+                    preparation: None,
+                    preparation_watch: Some(preparation_watch.clone()),
+                };
+                let mut step = |held: &mut HeldLocks| {
+                    let Some(selected) = coordinator_candidate(held)? else {
+                        return Ok(CoordinatorStep::<()>::Waiting {
+                            claim: held.designated()?.clone(),
+                        });
+                    };
+                    if !held.candidate_ready(&selected)? {
+                        return Ok(CoordinatorStep::<()>::Waiting { claim: selected });
+                    }
+                    let prepared = super::try_preparation_candidates_once(
+                        rotation_bias,
+                        &selected.cpus.iter().copied().collect::<Vec<_>>(),
+                        |preparation, claim| {
+                            Ok(super::PreparationCandidateDecision::Accepted((
+                                preparation,
+                                claim,
+                            )))
+                        },
+                    )?;
+                    rotation_bias = rotation_bias.wrapping_add(1);
+                    Ok(match prepared {
+                        super::PreparationProbe::Acquired((preparation, claim)) => {
+                            CoordinatorStep::Prepare { claim, preparation }
+                        }
+                        super::PreparationProbe::Contended(evidence) => {
+                            held.record_external_contention(evidence);
+                            CoordinatorStep::Waiting { claim: selected }
+                        }
+                        super::PreparationProbe::Unavailable => {
+                            CoordinatorStep::Waiting { claim: selected }
+                        }
+                    })
+                };
+                return match acquire_as_coordinator(coordinator, &mut step)? {
+                    CoordinatorOutcome::Prepared(pending) => Ok(pending),
+                    CoordinatorOutcome::Acquired(_) => {
+                        unreachable!("intent coordinator published its run claim as HELD")
+                    }
+                    CoordinatorOutcome::Aborted { reason } => {
+                        Err(anyhow::Error::new(super::ResourceContention { reason }))
+                    }
+                };
+            }
+            registry::State::Waiting => {}
+            registry::State::CoordinatorStandby => {
+                anyhow::bail!("new intent entered coordinator standby before ownership handoff")
+            }
+        }
+    }
+}
+
 /// Publish one bounded preparation owner without sleeping.
 ///
 /// Every physical preparation slot is considered once. A physical-capacity
@@ -1372,7 +1551,8 @@ pub(crate) fn try_register_pending_admission(
     max_permit_index: usize,
 ) -> Result<Option<PendingAdmission>> {
     let required = registry::required_bits_for_permit_index(max_permit_index);
-    super::try_preparation_candidates_once(0, |preparation, claim| {
+    let allowed = super::host_allowed_cpus();
+    match super::try_preparation_candidates_once(0, &allowed, |preparation, claim| {
         Ok(
             match registry::Ticket::try_register_pending(required, claim)? {
                 Some(registry::PendingRegistration::Registered(ticket)) => {
@@ -1391,7 +1571,10 @@ pub(crate) fn try_register_pending_admission(
                 }
             },
         )
-    })
+    })? {
+        super::PreparationProbe::Acquired(pending) => Ok(Some(pending)),
+        super::PreparationProbe::Contended(_) | super::PreparationProbe::Unavailable => Ok(None),
+    }
 }
 
 pub(crate) fn register_pending_admission(max_permit_index: usize) -> Result<PendingAdmission> {
@@ -1553,7 +1736,7 @@ pub(crate) fn exercise_resource_weighted_backfill_accounting_for_tests() -> (u32
 
 #[cfg(test)]
 pub(crate) fn exercise_work_conserving_backfill_for_tests()
--> Result<(usize, usize, usize, bool, bool, bool, bool, bool)> {
+-> Result<registry::WorkConservingBackfillOutcome> {
     registry::exercise_work_conserving_backfill_for_tests()
 }
 
@@ -2126,6 +2309,7 @@ fn drive_registered_ticket<T>(
                 return Ok(TicketWork::Coordinator(CoordinatorTicket {
                     ticket,
                     preparation,
+                    preparation_watch: None,
                 }));
             }
             registry::State::Granted | registry::State::Replan => {
@@ -2150,6 +2334,8 @@ fn drive_registered_ticket<T>(
                         let acquired = try_acquire(&mut probe)?;
                         Ok(registry::GrantAttempt {
                             acquired,
+                            preparation_claim: None,
+                            preparation_contention: None,
                             next_claim: probe.next_claim,
                             contention: probe.contention,
                         })
@@ -2166,12 +2352,18 @@ fn drive_registered_ticket<T>(
                         drop(preparation.take());
                         return Ok(TicketWork::Acquired(acquired));
                     }
+                    Ok(registry::GrantResult::Prepared(_)) => {
+                        unreachable!("ordinary run acquisition committed preparation ownership")
+                    }
                     result => result,
                 };
                 let result = check_result(result, cancelled)?;
                 match result {
                     registry::GrantResult::Acquired(_, _) => {
                         unreachable!("terminal acquisition returned above")
+                    }
+                    registry::GrantResult::Prepared(_) => {
+                        unreachable!("prepared result returned through ordinary ticket drive")
                     }
                     registry::GrantResult::Requeued | registry::GrantResult::LostGrant => continue,
                 }
@@ -2193,6 +2385,8 @@ fn drive_registered_ticket<T>(
 #[derive(Default)]
 pub(crate) struct HeldLocks {
     contention: ContentionSet,
+    preparation_contention: ContentionSet,
+    designation: Option<ClaimSet>,
     watch: Option<ClaimSet>,
     predecessors: Option<registry::AggregateSnapshot>,
     availability: Option<registry::AvailabilitySnapshot>,
@@ -2202,6 +2396,7 @@ pub(crate) struct HeldLocks {
 
 impl HeldLocks {
     fn install_schedule_snapshot(&mut self, snapshot: &registry::ScheduleSnapshot) {
+        self.designation = Some(snapshot.candidate_claim.clone());
         self.watch = Some(snapshot.candidate_watch.clone());
         self.predecessors = Some(snapshot.predecessors.clone());
         self.availability = Some(snapshot.availability.clone());
@@ -2231,6 +2426,33 @@ impl HeldLocks {
         }
 
         availability.allows(candidate)
+    }
+
+    fn designated(&self) -> Result<&ClaimSet> {
+        self.designation
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("coordinator designation snapshot is missing"))
+    }
+
+    pub(crate) fn candidate_holder_pressure(&self, candidate: &ClaimSet) -> Result<usize> {
+        let predecessors = self
+            .predecessors
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("coordinator predecessor snapshot is missing"))?;
+        let cpu = candidate.cpus.iter().try_fold(0usize, |total, &cpu| {
+            Ok::<_, anyhow::Error>(total.saturating_add(predecessors.cpu_holder_count(cpu)?))
+        })?;
+        candidate.llcs.iter().try_fold(cpu, |total, &llc| {
+            Ok::<_, anyhow::Error>(total.saturating_add(predecessors.llc_holder_count(llc)?))
+        })
+    }
+
+    /// Retain an exact writable witness from a physical probe performed by a
+    /// helper outside the ordinary topology-lock target. Preparation tokens
+    /// use the same queue blocker machinery, so their close event can park and
+    /// wake the coordinator without a polling loop.
+    fn record_external_contention(&mut self, evidence: ContentionEvidence) {
+        self.preparation_contention.insert(evidence);
     }
 
     pub(crate) fn clone_reusable_permits(&self) -> Result<Vec<(usize, OwnedFd)>> {
@@ -2370,6 +2592,10 @@ impl HeldLocks {
     fn take_contention(&mut self) -> ContentionSet {
         std::mem::take(&mut self.contention)
     }
+
+    fn take_preparation_contention(&mut self) -> ContentionSet {
+        std::mem::take(&mut self.preparation_contention)
+    }
 }
 
 fn validate_probe_target(claim: &ClaimSet, target: &[ResourceLock]) -> Result<()> {
@@ -2442,11 +2668,18 @@ fn validate_probe_target(claim: &ClaimSet, target: &[ResourceLock]) -> Result<()
 
 /// One coordinator-loop iteration's verdict, produced by the caller's step
 /// closure (which owns the path-specific planning + probing logic).
-pub(crate) enum CoordinatorStep<T> {
+pub(in crate::vmm) enum CoordinatorStep<T> {
     /// Acquisition complete. `claim` names the exact resource fds carried by
     /// `value`, which may differ from the coordinator's previously published
     /// planning alternative.
     Complete { claim: ClaimSet, value: T },
+    /// The coordinator selected this run intent and acquired one bounded
+    /// physical preparation tuple. Commit replaces the intent with PENDING in
+    /// the same ticket; it does not publish the final run claim as HELD.
+    Prepare {
+        claim: ClaimSet,
+        preparation: super::PreparationPermit,
+    },
     /// Still waiting. `claim` is the freshly planned target to publish
     /// before sleeping for the next release event.
     Waiting { claim: ClaimSet },
@@ -2456,8 +2689,9 @@ pub(crate) enum CoordinatorStep<T> {
 }
 
 /// Outcome of [`acquire_as_coordinator`].
-pub(crate) enum CoordinatorOutcome<T> {
+pub(in crate::vmm) enum CoordinatorOutcome<T> {
     Acquired(Acquired<T>),
+    Prepared(PendingAdmission),
     Aborted { reason: String },
 }
 
@@ -2643,7 +2877,7 @@ impl HolderObserver {
 /// Run the elected coordinator loop. The step closure re-plans from live holder
 /// state after each relevant wake; the ticket's exact claim is updated before
 /// compatible successors are granted.
-pub(crate) fn acquire_as_coordinator<T>(
+pub(in crate::vmm) fn acquire_as_coordinator<T>(
     coordinator: CoordinatorTicket,
     step: impl FnMut(&mut HeldLocks) -> Result<CoordinatorStep<T>>,
 ) -> Result<CoordinatorOutcome<T>> {
@@ -2655,7 +2889,7 @@ pub(crate) fn acquire_as_coordinator<T>(
 /// The ticket keeps its private wake registration alive across the
 /// waiter-to-coordinator transition, so cancellation interrupts inotify rather
 /// than waiting for the fallback tick.
-pub(crate) fn acquire_as_coordinator_interruptible<T>(
+pub(in crate::vmm) fn acquire_as_coordinator_interruptible<T>(
     coordinator: CoordinatorTicket,
     cancelled: &AtomicBool,
     step: impl FnMut(&mut HeldLocks) -> Result<CoordinatorStep<T>>,
@@ -2675,6 +2909,14 @@ fn acquire_as_coordinator_impl<T>(
     let mut held = HeldLocks {
         preparation: coordinator.preparation.take(),
         ..HeldLocks::default()
+    };
+    let preparation_watch = coordinator.preparation_watch.clone();
+    let event_watch = |watch: ClaimSet| {
+        preparation_watch
+            .as_ref()
+            .map_or(watch.clone(), |preparation| {
+                watch.union_envelope(preparation)
+            })
     };
     let mut watched_resources = ClaimSet::default();
     let mut observer = HolderObserver::new();
@@ -2707,7 +2949,7 @@ fn acquire_as_coordinator_impl<T>(
         )?;
         retry_due = false;
         let mut liveness_deadline = std::time::Instant::now() + snapshot.liveness_due_in;
-        watched_resources = snapshot.watch.clone();
+        watched_resources = event_watch(snapshot.watch.clone());
         let mut should_step = first || force_step || snapshot.should_step;
         force_step = false;
         if let Some(request) = snapshot.observation.take() {
@@ -2722,7 +2964,7 @@ fn acquire_as_coordinator_impl<T>(
                 cancelled,
             )?;
             liveness_deadline = std::time::Instant::now() + snapshot.liveness_due_in;
-            watched_resources = snapshot.watch.clone();
+            watched_resources = event_watch(snapshot.watch.clone());
             should_step |= snapshot.should_step;
         }
         held.install_schedule_snapshot(&snapshot);
@@ -2742,6 +2984,11 @@ fn acquire_as_coordinator_impl<T>(
                 CoordinatorStep::Complete { claim, value } => {
                     check_interrupted(cancelled)?;
                     let contention = held.take_contention();
+                    let preparation_contention = held.take_preparation_contention();
+                    anyhow::ensure!(
+                        preparation_contention.is_empty(),
+                        "coordinator completed while retaining preparation contention",
+                    );
                     let markers = contention.marker_vec();
                     let commit_token = held.commit_token()?;
                     // `finish_acquired` publishes the held flocks and removes
@@ -2756,6 +3003,7 @@ fn acquire_as_coordinator_impl<T>(
                     )? {
                         registry::FinishAcquireResult::Committed(publication) => {
                             drop(contention);
+                            drop(preparation_contention);
                             drop(held.preparation.take());
                             break CoordinatorOutcome::Acquired(Acquired::tracked(
                                 value,
@@ -2769,6 +3017,37 @@ fn acquire_as_coordinator_impl<T>(
                             // fresh planner turn after the pending prefix scan.
                             drop(value);
                             drop(contention);
+                            drop(preparation_contention);
+                            first = false;
+                            force_step = true;
+                            continue;
+                        }
+                    }
+                }
+                CoordinatorStep::Prepare { claim, preparation } => {
+                    check_interrupted(cancelled)?;
+                    let preparation_contention = held.take_preparation_contention();
+                    anyhow::ensure!(
+                        preparation_contention.is_empty(),
+                        "coordinator prepared while retaining preparation contention",
+                    );
+                    let commit_token = held.commit_token()?;
+                    match coordinator
+                        .ticket
+                        .finish_preparation(&claim, commit_token, cancelled)?
+                    {
+                        registry::FinishPreparationResult::Committed => {
+                            drop(held.take_contention());
+                            drop(preparation_contention);
+                            drop(held.preparation.take());
+                            let pending =
+                                pending_admission_from_parts(coordinator.ticket, preparation)?;
+                            break CoordinatorOutcome::Prepared(pending);
+                        }
+                        registry::FinishPreparationResult::Stale => {
+                            drop(preparation);
+                            drop(held.take_contention());
+                            drop(preparation_contention);
                             first = false;
                             force_step = true;
                             continue;
@@ -2788,6 +3067,8 @@ fn acquire_as_coordinator_impl<T>(
                     // incomplete physical probe has already released its fds.
                     let contention = held.take_contention();
                     let markers = contention.marker_vec();
+                    let preparation_contention = held.take_preparation_contention();
+                    let preparation_markers = preparation_contention.marker_vec();
                     let snapshot = check_result(
                         coordinator.ticket.schedule(
                             Some(&claim),
@@ -2805,13 +3086,30 @@ fn acquire_as_coordinator_impl<T>(
                         cancelled,
                     )?;
                     drop(contention);
+                    if !preparation_markers.is_empty() {
+                        check_result(
+                            coordinator
+                                .ticket
+                                .mark_external_contention(&preparation_markers, cancelled),
+                            cancelled,
+                        )?;
+                        // Publish the event-only blocker before closing its
+                        // writable witness. The next turn observes current
+                        // holder state once, then sleeps until a real release
+                        // instead of immediately re-probing in a hot loop.
+                        drop(preparation_contention);
+                        first = false;
+                        pending_events = LockDirEvents::default();
+                        continue;
+                    }
+                    drop(preparation_contention);
                     let observe_before_sleep = snapshot.observation.is_some();
                     let retry_before_sleep = waiting_publication_requires_immediate_turn(
                         snapshot.should_step,
                         observe_before_sleep,
                     );
                     liveness_deadline = std::time::Instant::now() + snapshot.liveness_due_in;
-                    watched_resources = snapshot.watch;
+                    watched_resources = event_watch(snapshot.watch);
                     if retry_before_sleep {
                         // A predecessor can release after this coordinator's
                         // planner callback but before the WAITING publication
