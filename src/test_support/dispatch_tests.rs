@@ -1301,22 +1301,24 @@ fn list_tests_all_host_only_skips_kernel_suffix_under_multi_kernel() {
 /// `list_tests_budget` against the same regression class as the
 /// `list_tests_all` sibling.
 ///
-/// Budget is set generously (10000 secs) so the greedy selector
-/// in `crate::budget::select` picks every distinct-feature
-/// candidate including this fixture (the `HOST_ONLY_SHIFT` bit
-/// in `extract_features` makes the host_only entry's feature set
-/// uniquely contributory — see `budget::extract_features`).
-/// The selector prints to stdout AND `eprintln!`s a summary
-/// line to stderr; only stdout is captured here, so the stderr
-/// summary lands on the test runner's normal stderr.
+/// Candidate construction is tested directly: whether the global greedy
+/// selector chooses this fixture legitimately depends on which other tests
+/// are linked into the binary and must not affect this naming contract.
 #[test]
 fn list_tests_budget_host_only_skips_kernel_suffix_under_multi_kernel() {
-    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
-    let _env_lock = lock_env();
-    let _kernel_list = EnvVarGuard::set(crate::KTSTR_KERNEL_LIST_ENV, TWO_KERNEL_LIST);
-
-    let (_, captured) = capture_stdout(|| list_tests_budget(false, 10_000.0));
-    let lines = host_only_listing_lines(&captured);
+    let mut candidates = Vec::new();
+    push_budget_base_candidates(
+        &mut candidates,
+        &__HOST_ONLY_LISTING_ENTRY,
+        false,
+        false,
+        &__HOST_ONLY_LISTING_ENTRY.topology,
+        &["kernel_6_14_2", "kernel_6_15_0"],
+    );
+    let lines = candidates
+        .into_iter()
+        .map(|candidate| candidate.name)
+        .collect::<Vec<_>>();
 
     assert_eq!(
         lines.len(),

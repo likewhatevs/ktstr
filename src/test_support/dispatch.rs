@@ -1846,7 +1846,7 @@ fn workspace_member_packages(manifest_dir: &str) -> &'static std::collections::H
 /// in that workspace is then gated out rather than emitted for a package
 /// the runtime resolver could not build.
 fn query_workspace_member_packages(manifest_dir: &str) -> std::collections::HashSet<String> {
-    let manifest_path = std::path::Path::new(manifest_dir).join("Cargo.toml");
+    let manifest_path = crate::writable_source_path(manifest_dir).join("Cargo.toml");
     let output = std::process::Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .arg("--manifest-path")
@@ -2527,6 +2527,45 @@ fn run_verifier_cell(full_name: &str) -> i32 {
 /// fan-out). The greedy selector still applies — a low budget
 /// can still trim the base list — but the candidate set is the
 /// same set that the dispatch path would actually run.
+fn push_budget_base_candidates(
+    candidates: &mut Vec<crate::budget::TestCandidate>,
+    entry: &KtstrTestEntry,
+    ignored_only: bool,
+    base_ignored: bool,
+    base_topo: &crate::vmm::topology::Topology,
+    kernel_suffixes: &[&str],
+) {
+    use crate::budget::{TestCandidate, estimate_duration, extract_features};
+
+    if ignored_only && !base_ignored {
+        return;
+    }
+
+    // Host-only tests never boot a VM, so the kernel never affects what
+    // runs. Emit one candidate without a kernel suffix even in multi-kernel
+    // mode; VM tests retain one candidate per selected kernel.
+    if entry.host_only {
+        candidates.push(TestCandidate {
+            name: format!("host/{}: test", entry.name),
+            features: extract_features(entry, base_topo, false, entry.name),
+            estimated_secs: estimate_duration(entry, base_topo),
+        });
+    } else {
+        for suffix in kernel_suffixes {
+            let name = if suffix.is_empty() {
+                format!("ktstr/{}: test", entry.name)
+            } else {
+                format!("ktstr/{}/{suffix}: test", entry.name)
+            };
+            candidates.push(TestCandidate {
+                name,
+                features: extract_features(entry, base_topo, false, entry.name),
+                estimated_secs: estimate_duration(entry, base_topo),
+            });
+        }
+    }
+}
+
 fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
     use crate::budget::{TestCandidate, estimate_duration, extract_features, select};
 
@@ -2555,34 +2594,14 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
         let base_ignored = is_ignored(entry);
         let base_topo = entry.topology;
 
-        // Base test
-        if !ignored_only || base_ignored {
-            // host_only tests never boot a VM, so the kernel never
-            // affects what runs — push one candidate without a
-            // kernel suffix even in multi-kernel mode. Otherwise the
-            // budget selector would consider N identical copies of
-            // the same host-side function.
-            if entry.host_only {
-                candidates.push(TestCandidate {
-                    name: format!("host/{}: test", entry.name),
-                    features: extract_features(entry, &base_topo, false, entry.name),
-                    estimated_secs: estimate_duration(entry, &base_topo),
-                });
-            } else {
-                for suffix in &kernel_suffixes {
-                    let name = if suffix.is_empty() {
-                        format!("ktstr/{}: test", entry.name)
-                    } else {
-                        format!("ktstr/{}/{suffix}: test", entry.name)
-                    };
-                    candidates.push(TestCandidate {
-                        name,
-                        features: extract_features(entry, &base_topo, false, entry.name),
-                        estimated_secs: estimate_duration(entry, &base_topo),
-                    });
-                }
-            }
-        }
+        push_budget_base_candidates(
+            &mut candidates,
+            entry,
+            ignored_only,
+            base_ignored,
+            &base_topo,
+            &kernel_suffixes,
+        );
 
         if entry.host_only {
             continue;

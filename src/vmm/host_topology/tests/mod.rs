@@ -40,14 +40,19 @@ fn reservation_wait_progress_hook_is_synchronous_and_scoped() {
 // `/tmp/ktstr-llc-*.lock` is therefore impossible regardless of
 // the index a test picks.
 //
-// The 9xxxx LLC/CPU indices that remain in some tests
-// (locking.rs 90xxx; planning.rs retry seam 93500/93501/93600,
-// cargo-test-mode bypass 95100/95200) are a legacy/organizational
+// The 9xxxx LLC/CPU indices that remain in some planning tests
+// (retry seam 93500/93501/93600 and cargo-test-mode bypass
+// 95100/95200) are a legacy/organizational
 // convention and double as synthetic CPU IDs / LLC indices —
 // they are NOT a collision-avoidance requirement, since the
 // prefix guards already isolate the lockfile pool. Newer
 // acquire_llc_plan tests use small indices (0, 1, 2, …) under a
 // prefix guard instead.
+//
+// A test that enters the queue registry MUST use CPU identities below the
+// host's `/sys/devices/system/cpu/possible` width. The registry stores weighted
+// permits in the remaining CPU bitmap range, so a legacy 9xxxx CPU identity is
+// decoded as a permit after publication. Sparse LLC identities remain valid.
 //
 // When adding a new test that flocks, install a prefix guard
 // (default to [`LockPrefixesGuard`] when in doubt) so the

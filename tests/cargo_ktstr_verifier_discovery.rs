@@ -38,7 +38,7 @@ fn shared_target_dir() -> PathBuf {
         return if path.is_absolute() {
             path
         } else {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)
+            ktstr::writable_source_path(env!("CARGO_MANIFEST_DIR")).join(path)
         };
     }
 
@@ -261,7 +261,7 @@ fn exactly_one_verifier_cell_passed(stderr: &str) -> bool {
 
 #[test]
 fn nested_fixture_dependency_aliases_have_identical_cargo_fingerprint_inputs() {
-    let ktstr_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let ktstr_root = ktstr::writable_source_path(env!("CARGO_MANIFEST_DIR"));
     let direct = parent_ktstr_dependency("ktstr", &ktstr_root);
     let aliased = parent_ktstr_dependency("test_harness", &ktstr_root);
     let direct_value = direct
@@ -470,7 +470,7 @@ fn declaration_binary_was_built() {
 
 #[test]
 fn bare_verifier_recursively_discovers_feature_gated_workspace_test_binaries() {
-    let ktstr_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let ktstr_root = ktstr::writable_source_path(env!("CARGO_MANIFEST_DIR"));
     let temp = fixture_tempdir(&ktstr_root);
     let workspace = temp.path().join("workspace");
     std::fs::create_dir(&workspace).expect("create fixture workspace");
@@ -593,7 +593,7 @@ fn bare_verifier_runs_recursively_discovered_scheduler_cell_end_to_end() {
         .parent()
         .expect("a resolved ktstr kernel image has a parent directory");
 
-    let ktstr_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let ktstr_root = ktstr::writable_source_path(env!("CARGO_MANIFEST_DIR"));
     let temp = fixture_tempdir(&ktstr_root);
     let workspace = temp.path().join("workspace");
     std::fs::create_dir(&workspace).expect("create success fixture workspace");

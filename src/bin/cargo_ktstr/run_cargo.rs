@@ -1516,6 +1516,14 @@ fn set_or_replace_environment(
     }
 }
 
+fn stable_cargo_producer_environment(
+    environment: &[(OsString, OsString)],
+) -> Vec<(OsString, OsString)> {
+    let mut environment = environment.to_vec();
+    set_or_replace_environment(&mut environment, "CARGO_INCREMENTAL", "0");
+    environment
+}
+
 fn llvm_cov_build_environment(
     stable_workspace: &Path,
     output_target: &Path,
@@ -2470,6 +2478,12 @@ pub(crate) fn load_or_build_nextest_artifacts(
     kernel_dir: Option<&Path>,
     cli_label: &str,
 ) -> Result<crate::nextest_artifact_cache::MaterializedNextestArtifacts, String> {
+    // Stable producers publish complete reusable closures, never an
+    // incrementally resumed compiler workspace. Incremental dep graphs are
+    // both dead weight in the captured output and large enough to exhaust a
+    // busy CI host. Normalize before computing identity and use the same
+    // effective environment for every producer-side Cargo command.
+    let producer_environment = stable_cargo_producer_environment(producer_environment);
     let invocation_dir = std::env::current_dir()
         .map_err(|error| format!("read nextest producer invocation directory: {error}"))?;
     let mut identity_surface = Vec::new();
@@ -2485,7 +2499,7 @@ pub(crate) fn load_or_build_nextest_artifacts(
             .iter()
             .map(|argument| format!("nextest:{argument}")),
     );
-    identity_surface.extend(producer_environment_identity(producer_environment)?);
+    identity_surface.extend(producer_environment_identity(&producer_environment)?);
     let plan = crate::nextest_artifact_cache::identity_plan(
         metadata,
         mode.identity_label(),
@@ -2527,7 +2541,7 @@ pub(crate) fn load_or_build_nextest_artifacts(
                 profraw.display()
             )
         })?;
-        let mut environment = producer_environment.to_vec();
+        let mut environment = producer_environment.clone();
         set_or_replace_environment(
             &mut environment,
             "CARGO_BUILD_BUILD_DIR",
@@ -2540,7 +2554,7 @@ pub(crate) fn load_or_build_nextest_artifacts(
                 &output_build,
                 &profraw,
                 &llvm_cov_environment_args,
-                producer_environment,
+                &producer_environment,
             )?);
         }
         let cargo_metadata = cargo_metadata_json(
@@ -3432,8 +3446,8 @@ fn run_cargo_sub(
         let stable_run_args = cached.remap_cargo_args(&run_args);
         let run_args = remap_nextest_store_output(
             &stable_run_args,
-            &cached.workspace_root,
-            &cached.invocation_root,
+            &cached.stable_workspace_root,
+            &cached.stable_invocation_root,
             &target_dir_path,
         )?;
         let cached_args =
@@ -3450,9 +3464,8 @@ fn run_cargo_sub(
         let metadata = nextest_metadata
             .as_ref()
             .expect("cached nextest artifacts require resolved metadata");
-        let final_run_dir = cached.original_invocation_root.clone();
-        cmd.current_dir(&final_run_dir);
         apply_command_envs(&mut cmd, &producer_environment);
+        let final_run_dir = cached.writable_invocation_root.clone();
         if sub_argv == TEST_SUB_ARGV {
             if let Some(pattern) = &profraw_inject {
                 cmd.env("LLVM_PROFILE_FILE", pattern);
@@ -3471,7 +3484,7 @@ fn run_cargo_sub(
                 &coverage_environment_args,
                 metadata.workspace_root.as_std_path(),
                 &invocation_dir,
-                &cached.workspace_root,
+                &cached.stable_workspace_root,
             );
             let coverage_environment = llvm_cov_build_environment(
                 &final_run_dir,
@@ -3489,13 +3502,14 @@ fn run_cargo_sub(
                 llvm_cov_flags_with_path_equivalence(
                     std::env::var_os("LLVM_COV_FLAGS")
                         .or_else(|| std::env::var_os("CARGO_LLVM_COV_FLAGS")),
-                    &cached.workspace_root,
+                    &cached.stable_workspace_root,
                     metadata.workspace_root.as_std_path(),
                 )?,
                 llvm_cov_has_lifecycle_flag(&args, "--no-report"),
                 ignore_run_fail,
             ));
         }
+        cached.apply_execution_context(&mut cmd)?;
     }
 
     // Analyze only requirement-derived, parent-snapshotted scheduler
@@ -7434,6 +7448,44 @@ path = "junit.xml"
         assert_eq!(
             identity,
             vec!["producer-env:LLVM_PROFILE_FILE=/tmp/operator-%p.profraw".to_string()],
+        );
+    }
+
+    #[test]
+    fn stable_nextest_producer_disables_incremental_before_command_and_identity() {
+        let environment = stable_cargo_producer_environment(&[
+            (OsString::from("CARGO_INCREMENTAL"), OsString::from("1")),
+            (
+                OsString::from("SCHEDULER_FIXTURE_MODE"),
+                OsString::from("semantic"),
+            ),
+        ]);
+        let command = nextest_binary_list_command(
+            Path::new("/stable/workspace"),
+            Path::new("/stable/output"),
+            &[],
+            false,
+            &environment,
+        );
+        let command_environment = cmd_env_map(&command);
+
+        assert_eq!(
+            command_environment.get(OsStr::new("CARGO_INCREMENTAL")),
+            Some(&Some(OsString::from("0"))),
+            "the stable nextest producer must override an inherited incremental setting",
+        );
+        let identity = producer_environment_identity(&environment).unwrap();
+        assert!(
+            identity
+                .iter()
+                .any(|entry| entry == "producer-env:CARGO_INCREMENTAL=0"),
+            "producer identity must describe the same non-incremental environment it executes",
+        );
+        assert!(
+            !identity
+                .iter()
+                .any(|entry| entry == "producer-env:CARGO_INCREMENTAL=1"),
+            "the inherited incremental setting must not survive normalization",
         );
     }
 

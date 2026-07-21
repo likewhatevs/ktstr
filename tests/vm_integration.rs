@@ -1126,8 +1126,7 @@ const CARGO_KTSTR_BINARY: &str = env!("CARGO_BIN_EXE_cargo-ktstr");
 /// source; if the directory is missing, the shim panics with an
 /// actionable message rather than a silent timeout.
 fn linux_source_dir() -> std::path::PathBuf {
-    let crate_root = env!("CARGO_MANIFEST_DIR");
-    std::path::PathBuf::from(crate_root)
+    ktstr::writable_source_path(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("linux")
 }

@@ -71,10 +71,15 @@ pub(crate) struct CachedBinaryStamp {
 
 pub(crate) struct MaterializedNextestArtifacts {
     pub tree: ktstr::cache::artifact_tree::MaterializedArtifactTree,
-    pub workspace_root: PathBuf,
-    pub invocation_root: PathBuf,
-    pub original_workspace_root: PathBuf,
-    pub original_invocation_root: PathBuf,
+    /// Immutable, deterministic source root used only while building and for
+    /// interpreting build metadata.
+    pub stable_workspace_root: PathBuf,
+    /// Immutable invocation directory paired with `stable_workspace_root`.
+    pub stable_invocation_root: PathBuf,
+    /// The caller's writable workspace to which nextest remaps test CWDs.
+    pub writable_workspace_root: PathBuf,
+    /// The caller's writable invocation directory for the nextest process.
+    pub writable_invocation_root: PathBuf,
     pub cargo_metadata: PathBuf,
     pub binaries_metadata: PathBuf,
     pub target_directory: PathBuf,
@@ -98,6 +103,23 @@ impl MaterializedNextestArtifacts {
         self._stable_source.remap_cargo_args(arguments)
     }
 
+    /// Apply the runtime half of a reused build to a nextest command.
+    ///
+    /// Cargo compilation and metadata capture use the immutable stable roots;
+    /// tests execute from the caller's checkout. The exported root map lets
+    /// runtime helpers repair compile-time source paths for the workspace and
+    /// every linked local dependency without making shared snapshots writable.
+    pub(crate) fn apply_execution_context(
+        &self,
+        command: &mut std::process::Command,
+    ) -> Result<(), String> {
+        apply_execution_context(
+            command,
+            &self._stable_source.execution_source_root_remaps(),
+            &self.writable_invocation_root,
+        )
+    }
+
     /// Nextest's supported reuse-build remapping arguments for this private
     /// COW closure. Callers append run/filter/report arguments separately.
     pub fn reuse_build_args(&self) -> Vec<String> {
@@ -107,7 +129,7 @@ impl MaterializedNextestArtifacts {
             "--binaries-metadata".to_string(),
             self.binaries_metadata.display().to_string(),
             "--workspace-remap".to_string(),
-            self.original_workspace_root.display().to_string(),
+            self.writable_workspace_root.display().to_string(),
             "--target-dir-remap".to_string(),
             self.target_directory.display().to_string(),
         ];
@@ -119,6 +141,18 @@ impl MaterializedNextestArtifacts {
         }
         args
     }
+}
+
+fn apply_execution_context(
+    command: &mut std::process::Command,
+    source_root_remaps: &[(PathBuf, PathBuf)],
+    writable_invocation_root: &Path,
+) -> Result<(), String> {
+    let encoded = ktstr::encode_source_root_remaps(source_root_remaps)?;
+    command
+        .current_dir(writable_invocation_root)
+        .env(ktstr::KTSTR_SOURCE_ROOT_REMAPS_ENV, encoded);
+    Ok(())
 }
 
 fn checked_relative(path: &Path, what: &str) -> Result<PathBuf, String> {
@@ -407,10 +441,10 @@ pub(crate) fn finish_materialization(
     tree: ktstr::cache::artifact_tree::MaterializedArtifactTree,
     stable_source: StableCargoSource,
 ) -> Result<MaterializedNextestArtifacts, String> {
-    let workspace_root = stable_source.workspace_root.clone();
-    let invocation_root = stable_source.invocation_root.clone();
-    let original_workspace_root = stable_source.original_workspace_root.clone();
-    let original_invocation_root = stable_source.original_invocation_root.clone();
+    let stable_workspace_root = stable_source.workspace_root.clone();
+    let stable_invocation_root = stable_source.invocation_root.clone();
+    let writable_workspace_root = stable_source.original_workspace_root.clone();
+    let writable_invocation_root = stable_source.original_invocation_root.clone();
     let binaries_metadata = tree.root().join(BINARIES_METADATA_PATH);
     let bytes = std::fs::read(&binaries_metadata).map_err(|error| {
         format!(
@@ -474,10 +508,10 @@ pub(crate) fn finish_materialization(
         ));
     }
     Ok(MaterializedNextestArtifacts {
-        workspace_root,
-        invocation_root,
-        original_workspace_root,
-        original_invocation_root,
+        stable_workspace_root,
+        stable_invocation_root,
+        writable_workspace_root,
+        writable_invocation_root,
         cargo_metadata: tree.root().join(CARGO_METADATA_PATH),
         binaries_metadata,
         target_directory,
@@ -2379,6 +2413,13 @@ pub(crate) struct StableCargoSource {
 }
 
 impl StableCargoSource {
+    fn execution_source_root_remaps(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.cargo_root_remaps
+            .iter()
+            .map(|(writable, stable)| (stable.clone(), writable.clone()))
+            .collect()
+    }
+
     /// Remap explicit Cargo/nextest files and inline path-valued config onto
     /// immutable files and source roots captured in this stable source. Named
     /// target triples and non-path inline config remain unchanged.
@@ -2784,6 +2825,39 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         output.stdout
+    }
+
+    #[test]
+    fn reused_nextest_execution_context_keeps_stable_sources_build_only() {
+        let stable = Path::new("/cache/stable/source/primary");
+        let writable = Path::new("/work/checkout");
+        let stable_external = Path::new("/cache/stable/source/external-scheduler");
+        let writable_external = Path::new("/work/path-deps/scheduler");
+        let invocation = writable.join("member");
+        let remaps = vec![
+            (stable.to_path_buf(), writable.to_path_buf()),
+            (
+                stable_external.to_path_buf(),
+                writable_external.to_path_buf(),
+            ),
+        ];
+        let mut command = std::process::Command::new("cargo");
+        command
+            .current_dir(stable)
+            .env(ktstr::KTSTR_SOURCE_ROOT_REMAPS_ENV, "stale");
+
+        apply_execution_context(&mut command, &remaps, &invocation).unwrap();
+
+        assert_eq!(command.get_current_dir(), Some(invocation.as_path()));
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.map(OsStr::to_owned)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get(OsStr::new(ktstr::KTSTR_SOURCE_ROOT_REMAPS_ENV)),
+            Some(&Some(ktstr::encode_source_root_remaps(&remaps).unwrap())),
+            "the complete source-root map must replace stale inherited state",
+        );
     }
 
     #[test]

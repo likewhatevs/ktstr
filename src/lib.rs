@@ -1382,6 +1382,17 @@ pub const KTSTR_GHA_CACHE_ENV: &str = "KTSTR_GHA_CACHE";
 /// because they're non-empty).
 pub const KTSTR_CARGO_TEST_MODE_ENV: &str = "KTSTR_CARGO_TEST_MODE";
 
+/// Name of the environment variable carrying every immutable-to-writable
+/// source-root mapping for a reused Cargo/nextest artifact closure.
+///
+/// The value is an internal, versioned wire format. It includes the primary
+/// workspace and every linked local source root, so runtime helpers can map
+/// compile-time paths such as `env!("CARGO_MANIFEST_DIR")` back onto their
+/// writable checkout. An absent value disables translation; a malformed value
+/// is rejected.
+#[doc(hidden)]
+pub const KTSTR_SOURCE_ROOT_REMAPS_ENV: &str = "KTSTR_SOURCE_ROOT_REMAPS";
+
 /// Name of the environment variable that overrides ktstr's cache
 /// root directory (kernel-build cache, btf-anchor cache, blob
 /// cache, etc.). Empty / unset falls back to the per-user default
@@ -1916,6 +1927,266 @@ mod scheduler_profile_tests {
     }
 }
 
+const SOURCE_ROOT_REMAPS_WIRE_VERSION: &str = "ktstr-source-root-remaps-v1";
+
+fn normalized_absolute_source_root(path: &std::path::Path) -> bool {
+    path.is_absolute()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+        && path.components().any(|component| {
+            matches!(component, std::path::Component::Normal(_))
+        })
+}
+
+fn validate_source_root_remaps(
+    remaps: impl IntoIterator<Item = (std::path::PathBuf, std::path::PathBuf)>,
+) -> Result<Vec<(std::path::PathBuf, std::path::PathBuf)>, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut unique = std::collections::BTreeMap::new();
+    for (stable, writable) in remaps {
+        if !normalized_absolute_source_root(&stable) {
+            return Err(format!(
+                "stable source root is not a normalized absolute path: {}",
+                stable.display(),
+            ));
+        }
+        if !normalized_absolute_source_root(&writable) {
+            return Err(format!(
+                "writable source root is not a normalized absolute path: {}",
+                writable.display(),
+            ));
+        }
+        if let Some(existing) = unique.insert(stable.clone(), writable.clone())
+            && existing != writable
+        {
+            return Err(format!(
+                "stable source root {} ambiguously maps to both {} and {}",
+                stable.display(),
+                existing.display(),
+                writable.display(),
+            ));
+        }
+    }
+    if unique.is_empty() {
+        return Err("source-root remap set is empty".to_string());
+    }
+    let mut remaps = unique.into_iter().collect::<Vec<_>>();
+    // A nested local source root must win over its parent repository. The
+    // bytewise tie-break keeps serialization deterministic across processes.
+    remaps.sort_by(|left, right| {
+        right
+            .0
+            .components()
+            .count()
+            .cmp(&left.0.components().count())
+            .then_with(|| left.0.as_os_str().as_bytes().cmp(right.0.as_os_str().as_bytes()))
+    });
+    Ok(remaps)
+}
+
+/// Encode all immutable-to-writable source-root mappings for a reused Cargo
+/// build. Paths are base64-encoded as raw Unix bytes, preserving non-UTF-8
+/// checkouts without reserving any pathname characters in the wire format.
+#[doc(hidden)]
+pub fn encode_source_root_remaps(
+    remaps: &[(std::path::PathBuf, std::path::PathBuf)],
+) -> Result<std::ffi::OsString, String> {
+    use base64::Engine as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let remaps = validate_source_root_remaps(remaps.iter().cloned())?;
+    let codec = base64::engine::general_purpose::STANDARD_NO_PAD;
+    let mut encoded = SOURCE_ROOT_REMAPS_WIRE_VERSION.to_string();
+    for (stable, writable) in remaps {
+        encoded.push('\n');
+        encoded.push_str(&codec.encode(stable.as_os_str().as_bytes()));
+        encoded.push('\t');
+        encoded.push_str(&codec.encode(writable.as_os_str().as_bytes()));
+    }
+    Ok(encoded.into())
+}
+
+fn decode_source_root_remaps(
+    encoded: &std::ffi::OsStr,
+) -> Result<Vec<(std::path::PathBuf, std::path::PathBuf)>, String> {
+    use base64::Engine as _;
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let encoded = encoded
+        .to_str()
+        .ok_or_else(|| "source-root remap environment is not ASCII".to_string())?;
+    let mut lines = encoded.split('\n');
+    if lines.next() != Some(SOURCE_ROOT_REMAPS_WIRE_VERSION) {
+        return Err("source-root remap environment has an unsupported version".to_string());
+    }
+    let codec = base64::engine::general_purpose::STANDARD_NO_PAD;
+    let mut remaps = Vec::new();
+    for (index, line) in lines.enumerate() {
+        let (stable, writable) = line.split_once('\t').ok_or_else(|| {
+            format!("source-root remap entry {} has no field separator", index + 1)
+        })?;
+        if writable.contains('\t') {
+            return Err(format!(
+                "source-root remap entry {} has too many fields",
+                index + 1,
+            ));
+        }
+        let stable = codec
+            .decode(stable)
+            .map_err(|error| format!("decode stable source root {}: {error}", index + 1))?;
+        let writable = codec
+            .decode(writable)
+            .map_err(|error| format!("decode writable source root {}: {error}", index + 1))?;
+        remaps.push((
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(stable)),
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(writable)),
+        ));
+    }
+    validate_source_root_remaps(remaps)
+}
+
+fn writable_source_path_with_remaps(
+    path: &std::path::Path,
+    remaps: &[(std::path::PathBuf, std::path::PathBuf)],
+) -> std::path::PathBuf {
+    remaps
+        .iter()
+        .find_map(|(stable, writable)| {
+            path.strip_prefix(stable)
+                .ok()
+                .map(|relative| writable.join(relative))
+        })
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+/// Translate a source pathname embedded by a reusable Cargo build onto the
+/// corresponding writable source checkout.
+///
+/// Outside a reused `cargo-ktstr` run, or when `path` is not below any stable
+/// source root, this returns `path` unchanged. A malformed internal mapping is
+/// rejected immediately instead of risking a write into immutable cache data.
+#[doc(hidden)]
+pub fn writable_source_path(path: impl AsRef<std::path::Path>) -> std::path::PathBuf {
+    let Some(encoded) = std::env::var_os(KTSTR_SOURCE_ROOT_REMAPS_ENV) else {
+        return path.as_ref().to_path_buf();
+    };
+    let remaps = decode_source_root_remaps(&encoded)
+        .unwrap_or_else(|error| panic!("invalid {KTSTR_SOURCE_ROOT_REMAPS_ENV}: {error}"));
+    writable_source_path_with_remaps(path.as_ref(), &remaps)
+}
+
+#[cfg(test)]
+mod writable_source_path_tests {
+    use super::{
+        decode_source_root_remaps, encode_source_root_remaps,
+        validate_source_root_remaps, writable_source_path_with_remaps,
+    };
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::Path;
+
+    #[test]
+    fn stable_workspace_members_map_to_the_writable_checkout() {
+        let stable = Path::new("/cache/stable/source/primary");
+        let writable = Path::new("/work/checkout");
+        let member = stable.join("member/tests");
+        let remaps = vec![(stable.to_path_buf(), writable.to_path_buf())];
+
+        assert_eq!(
+            writable_source_path_with_remaps(&member, &remaps),
+            writable.join("member/tests"),
+        );
+        assert_eq!(
+            writable_source_path_with_remaps(Path::new("/other/workspace"), &remaps),
+            Path::new("/other/workspace"),
+            "unrelated source roots retain their own workspace semantics",
+        );
+    }
+
+    #[test]
+    fn external_path_dependency_uses_longest_stable_source_prefix() {
+        let encoded = encode_source_root_remaps(&[
+            (
+                "/cache/stable/source/repository".into(),
+                "/work/repository".into(),
+            ),
+            (
+                "/cache/stable/source/repository/external".into(),
+                "/work/path-dependencies/scheduler".into(),
+            ),
+        ])
+        .unwrap();
+        let remaps = decode_source_root_remaps(&encoded).unwrap();
+
+        assert_eq!(
+            writable_source_path_with_remaps(
+                Path::new("/cache/stable/source/repository/external/tests/scratch"),
+                &remaps,
+            ),
+            Path::new("/work/path-dependencies/scheduler/tests/scratch"),
+        );
+        assert_eq!(
+            writable_source_path_with_remaps(
+                Path::new("/cache/stable/source/repository/member/src"),
+                &remaps,
+            ),
+            Path::new("/work/repository/member/src"),
+        );
+    }
+
+    #[test]
+    fn malformed_relative_and_ambiguous_source_root_mappings_are_rejected() {
+        assert!(
+            encode_source_root_remaps(&[("relative/stable".into(), "/work/tree".into())])
+                .unwrap_err()
+                .contains("normalized absolute"),
+        );
+        assert!(
+            validate_source_root_remaps([
+                ("/cache/stable".into(), "/work/one".into()),
+                ("/cache/stable".into(), "/work/two".into()),
+            ])
+            .unwrap_err()
+            .contains("ambiguously maps"),
+        );
+        assert!(
+            decode_source_root_remaps(std::ffi::OsStr::new(
+                "ktstr-source-root-remaps-v1\nnot-base64\talso-not-base64",
+            ))
+            .unwrap_err()
+            .contains("decode stable source root"),
+        );
+    }
+
+    #[test]
+    fn verifier_fixture_scratch_is_created_in_the_writable_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let stable = temp.path().join("stable/source/primary");
+        let writable = temp.path().join("checkout");
+        std::fs::create_dir_all(&stable).unwrap();
+        std::fs::create_dir_all(&writable).unwrap();
+        std::fs::set_permissions(&stable, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let embedded_scratch = stable.join("target/verifier-discovery-fixtures");
+        let scratch = writable_source_path_with_remaps(
+            &embedded_scratch,
+            &[(stable.clone(), writable.clone())],
+        );
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        assert_eq!(scratch, writable.join("target/verifier-discovery-fixtures"));
+        assert!(scratch.is_dir());
+        assert!(
+            !stable.join("target").exists(),
+            "runtime scratch must not mutate the immutable stable source",
+        );
+    }
+}
+
 /// Build a cargo binary package and return its output path.
 ///
 /// Runs `cargo build -p <package>` from `workspace_dir` — the manifest
@@ -1926,6 +2197,9 @@ mod scheduler_profile_tests {
 /// working directory. For a `declare_scheduler!` scheduler `workspace_dir`
 /// is the invoking crate's `CARGO_MANIFEST_DIR`; for ktstr's own in-tree
 /// builders it is ktstr's crate dir (the workspace root in this repo).
+/// Reused artifacts may embed an immutable stable-source pathname;
+/// [`writable_source_path`] maps it back to the caller's checkout before Cargo
+/// runs.
 ///
 /// The scheduler-under-test is built with the RELEASE profile by
 /// DEFAULT: a debug sched_ext scheduler is far slower and its BPF
@@ -1949,9 +2223,10 @@ pub fn build_and_find_binary(
         "--profile".into(),
         profile,
     ];
+    let workspace_dir = writable_source_path(workspace_dir);
     let output = std::process::Command::new("cargo")
         .args(&build_args)
-        .current_dir(workspace_dir)
+        .current_dir(&workspace_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()

@@ -1529,11 +1529,17 @@ fn scheduler_replace_identity_path(bytes: &[u8], path: &[u8], replacement: &[u8]
 
 fn scheduler_build_environment_from(
     workspace_root: &Path,
-    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    mut environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<(std::ffi::OsString, Vec<u8>)>, String> {
     use std::os::unix::ffi::OsStrExt as _;
 
+    // Scheduler artifacts are complete, immutable cache entries. Incremental
+    // dep graphs cannot be reused after publication, so keeping them only
+    // consumes cache space. Normalize the value before hashing the producer
+    // environment so inherited settings and actual execution cannot diverge.
+    environment.retain(|(name, _)| name != "CARGO_INCREMENTAL");
+    environment.push(("CARGO_INCREMENTAL".into(), "0".into()));
     let workspace_root =
         std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
     let home = environment
@@ -1619,6 +1625,7 @@ fn sanitize_scheduler_build_child_environment(command: &mut Command) {
             command.env_remove(name);
         }
     }
+    command.env("CARGO_INCREMENTAL", "0");
 }
 
 fn build_scheduler_workspace(
@@ -2394,8 +2401,8 @@ pub(crate) fn run_verifier(
             let nextest_args = cached.remap_cargo_args(&nextest_args);
             let nextest_args = crate::run_cargo::remap_nextest_store_output(
                 &nextest_args,
-                &cached.workspace_root,
-                &cached.invocation_root,
+                &cached.stable_workspace_root,
+                &cached.stable_invocation_root,
                 &harness_target_dir,
             )?;
             let cached_command = crate::run_cargo::inject_nextest_command_reuse_args(
@@ -2403,11 +2410,11 @@ pub(crate) fn run_verifier(
                 &cached.reuse_build_args(),
             )?;
             cmd = Command::new("cargo");
-            cmd.args(cached_command)
-                .current_dir(&cached.invocation_root);
+            cmd.args(cached_command);
             for (name, value) in &base_command_environment {
                 cmd.env(name, value);
             }
+            cached.apply_execution_context(&mut cmd)?;
             cached_scheduler_declarations(&cached.build_directory, &cached.scheduler_stamps)
         } else {
             let mut warm = Command::new("cargo");
@@ -3107,6 +3114,7 @@ mod tests {
                 "/runner/home/.cargo/bin:/runner/work/ktstr/tools:/usr/bin".into(),
             ),
             ("SCHEDULER_FIXTURE_MODE".into(), "semantic-value".into()),
+            ("CARGO_INCREMENTAL".into(), "1".into()),
             ("PWD".into(), "/runner/work/ktstr".into()),
             ("GITHUB_RUN_ID".into(), "123456".into()),
             ("SCCACHE_IDLE_TIMEOUT".into(), "0".into()),
@@ -3142,6 +3150,11 @@ mod tests {
             Some(&b"$HOME/.cargo/bin:$WORKSPACE/tools:/usr/bin".to_vec()),
             "runner-specific home and checkout roots must retain stable semantic spellings",
         );
+        assert_eq!(
+            semantic.get(std::ffi::OsStr::new("CARGO_INCREMENTAL")),
+            Some(&b"0".to_vec()),
+            "the scheduler identity must describe the forced non-incremental producer",
+        );
         for operational in [
             "PWD",
             "GITHUB_RUN_ID",
@@ -3170,6 +3183,7 @@ mod tests {
                 "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER",
             )
             .env("LLVM_PROFILE_FILE", "/tmp/profraw-%p")
+            .env("CARGO_INCREMENTAL", "1")
             .env("RUSTC_WRAPPER", "/usr/local/bin/sccache")
             .env("SCHEDULER_FIXTURE_MODE", "semantic");
 
@@ -3195,6 +3209,11 @@ mod tests {
             environment.get(std::ffi::OsStr::new("RUSTC_WRAPPER")),
             Some(&Some("/usr/local/bin/sccache".into())),
             "scheduler cache reuse must not disable the configured compiler cache",
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("CARGO_INCREMENTAL")),
+            Some(&Some("0".into())),
+            "stable scheduler producers must override inherited incremental compilation",
         );
         assert_eq!(
             environment.get(std::ffi::OsStr::new("SCHEDULER_FIXTURE_MODE")),

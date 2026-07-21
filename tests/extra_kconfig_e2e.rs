@@ -62,8 +62,9 @@ use std::process::Command;
 /// ktstr crate root (matching the kernel build patterns used
 /// throughout the project).
 fn linux_source_dir() -> PathBuf {
-    let crate_root = env!("CARGO_MANIFEST_DIR");
-    PathBuf::from(crate_root).join("..").join("linux")
+    ktstr::writable_source_path(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("linux")
 }
 
 /// Path to the cargo-ktstr binary cargo built for this test pass.

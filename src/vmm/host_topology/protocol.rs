@@ -878,7 +878,7 @@ impl LockDirWatch {
 
 #[cfg(test)]
 fn test_retry_wake_marker_path() -> PathBuf {
-    protocol_dir().join(TEST_RETRY_WAKE_MARKER)
+    registry::protocol_dir_path().join(TEST_RETRY_WAKE_MARKER)
 }
 
 #[cfg(test)]
@@ -2322,6 +2322,7 @@ fn acquire_as_coordinator_impl<T>(
     cancelled: Option<&AtomicBool>,
     mut step: impl FnMut(&mut HeldLocks) -> Result<CoordinatorStep<T>>,
 ) -> Result<CoordinatorOutcome<T>> {
+    let _namespace = coordinator.ticket.enter_namespace();
     check_interrupted(cancelled)?;
     let watch = check_result(LockDirWatch::new(), cancelled)?;
     check_interrupted(cancelled)?;

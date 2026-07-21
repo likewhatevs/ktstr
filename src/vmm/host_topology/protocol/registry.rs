@@ -37,6 +37,89 @@ const LIVENESS_PREFIX: &str = "ktstr-acquire-v14-slot-";
 const LIVENESS_SEPARATOR: &str = "-ticket-";
 const LIVENESS_SUFFIX: &str = ".live";
 
+/// Stable identity of one admission protocol instance.
+///
+/// Test lock prefixes are thread-local, while tickets and held publications
+/// are intentionally `Send`.  Resolving paths again on a different thread can
+/// therefore redirect an existing owner into an unrelated registry (including
+/// the production registry).  Capture the protocol root once, when ownership
+/// is created or imported, and scope every later operation to that root.
+#[derive(Clone, Debug)]
+struct RegistryNamespace {
+    protocol_dir: PathBuf,
+    #[cfg(test)]
+    llc_lock_prefix: Option<String>,
+    #[cfg(test)]
+    cpu_lock_prefix: Option<String>,
+}
+
+thread_local! {
+    static ACTIVE_REGISTRY_NAMESPACE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(super) struct RegistryNamespaceGuard {
+    previous: Option<PathBuf>,
+    #[cfg(test)]
+    previous_llc_lock_prefix: Option<String>,
+    #[cfg(test)]
+    previous_cpu_lock_prefix: Option<String>,
+}
+
+impl RegistryNamespace {
+    fn resolve() -> Self {
+        Self {
+            protocol_dir: protocol_dir(),
+            #[cfg(test)]
+            llc_lock_prefix: super::super::LLC_LOCK_PREFIX_OVERRIDE
+                .with(|prefix| prefix.borrow().clone()),
+            #[cfg(test)]
+            cpu_lock_prefix: super::super::CPU_LOCK_PREFIX_OVERRIDE
+                .with(|prefix| prefix.borrow().clone()),
+        }
+    }
+
+    fn enter(&self) -> RegistryNamespaceGuard {
+        let previous = ACTIVE_REGISTRY_NAMESPACE
+            .with(|active| active.replace(Some(self.protocol_dir.clone())));
+        #[cfg(test)]
+        let previous_llc_lock_prefix = super::super::LLC_LOCK_PREFIX_OVERRIDE
+            .with(|prefix| prefix.replace(self.llc_lock_prefix.clone()));
+        #[cfg(test)]
+        let previous_cpu_lock_prefix = super::super::CPU_LOCK_PREFIX_OVERRIDE
+            .with(|prefix| prefix.replace(self.cpu_lock_prefix.clone()));
+        RegistryNamespaceGuard {
+            previous,
+            #[cfg(test)]
+            previous_llc_lock_prefix,
+            #[cfg(test)]
+            previous_cpu_lock_prefix,
+        }
+    }
+}
+
+impl Drop for RegistryNamespaceGuard {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        super::super::LLC_LOCK_PREFIX_OVERRIDE.with(|prefix| {
+            prefix.replace(self.previous_llc_lock_prefix.take());
+        });
+        #[cfg(test)]
+        super::super::CPU_LOCK_PREFIX_OVERRIDE.with(|prefix| {
+            prefix.replace(self.previous_cpu_lock_prefix.take());
+        });
+        ACTIVE_REGISTRY_NAMESPACE.with(|active| {
+            active.replace(self.previous.take());
+        });
+    }
+}
+
+fn active_protocol_dir() -> PathBuf {
+    ACTIVE_REGISTRY_NAMESPACE
+        .with(|active| active.borrow().clone())
+        .unwrap_or_else(protocol_dir)
+}
+
 const H_MAGIC: usize = 0;
 const H_VERSION: usize = 8;
 const H_WORDS: usize = 12;
@@ -524,6 +607,7 @@ struct Record {
 }
 
 pub(super) struct Ticket {
+    namespace: RegistryNamespace,
     slot: u64,
     ticket: u64,
     liveness_path: PathBuf,
@@ -544,6 +628,7 @@ pub(super) enum PendingRegistration {
 /// owner. Its liveness fd lets another process prune the record after a crash;
 /// normal teardown removes the exact record synchronously.
 pub(super) struct HeldClaim {
+    namespace: RegistryNamespace,
     slot: u64,
     ticket: u64,
     liveness_path: PathBuf,
@@ -560,6 +645,7 @@ impl HeldClaim {
         ticket._interrupt_waiter.take();
         ticket.finished = true;
         Ok(Self {
+            namespace: ticket.namespace.clone(),
             slot: ticket.slot,
             ticket: ticket.ticket,
             liveness_path: ticket.liveness_path.clone(),
@@ -568,6 +654,7 @@ impl HeldClaim {
     }
 
     fn remove_record(&mut self) -> Result<()> {
+        let _namespace = self.namespace.enter();
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
         table.repair_consistency_if_needed()?;
@@ -607,6 +694,8 @@ pub(super) fn import_pending_exec_handoff(
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
 
+    let namespace = RegistryNamespace::resolve();
+    let _namespace = namespace.enter();
     let _lock = lock_registry_existing(FlockMode::Exclusive)?;
     let mut table = Table::open_existing()?;
     table.repair_consistency_if_needed()?;
@@ -655,6 +744,7 @@ pub(super) fn import_pending_exec_handoff(
     drop(table);
     drop(_lock);
     Ok(Ticket {
+        namespace,
         slot,
         ticket,
         liveness_path,
@@ -667,6 +757,7 @@ pub(super) fn import_pending_exec_handoff(
 
 impl Drop for HeldClaim {
     fn drop(&mut self) {
+        let _namespace = self.namespace.enter();
         #[cfg(test)]
         if let Some(hook) = HELD_DROP_HOOK.with(|slot| slot.borrow_mut().take()) {
             hook();
@@ -793,6 +884,10 @@ impl FutexSlot {
 }
 
 impl Ticket {
+    pub(super) fn enter_namespace(&self) -> RegistryNamespaceGuard {
+        self.namespace.enter()
+    }
+
     /// Publish a same-PID pre-exec arrival together with its complete bounded
     /// preparation footprint.  The caller already owns the matching physical
     /// permit flocks.  Returning `None` means an older registry claim won the
@@ -802,6 +897,8 @@ impl Ticket {
         required_bits: usize,
         claim: ClaimSet,
     ) -> Result<PendingRegistration> {
+        let namespace = RegistryNamespace::resolve();
+        let _namespace = namespace.enter();
         validate_claim(&claim)?;
         anyhow::ensure!(
             !claim.is_empty(),
@@ -854,6 +951,7 @@ impl Ticket {
         drop(_lock);
 
         Ok(PendingRegistration::Registered(Self {
+            namespace,
             slot,
             ticket,
             liveness_path,
@@ -873,6 +971,7 @@ impl Ticket {
         watch: ClaimSet,
         cancelled: Option<&AtomicBool>,
     ) -> Result<()> {
+        let _namespace = self.namespace.enter();
         validate_claim(&claim)?;
         let watch = union_claims(&watch, &claim);
         validate_claim_within_watch(&claim, &watch)?;
@@ -988,6 +1087,7 @@ impl Ticket {
 
     pub(super) fn pending_exec_handoff_parts(&self) -> Result<(u64, u64, std::os::fd::RawFd)> {
         use std::os::fd::AsRawFd;
+        let _namespace = self.namespace.enter();
         let liveness = self.liveness.as_ref().ok_or_else(|| {
             anyhow::anyhow!("pending admission liveness descriptor was already consumed")
         })?;
@@ -1009,6 +1109,8 @@ impl Ticket {
         initial_contention: Option<ContentionSet>,
         cancelled: Option<&AtomicBool>,
     ) -> Result<Self> {
+        let namespace = RegistryNamespace::resolve();
+        let _namespace = namespace.enter();
         validate_claim(&claim)?;
         if !watch.llcs.is_empty()
             && !claim.llcs.is_empty()
@@ -1144,6 +1246,7 @@ impl Ticket {
         notify_coordinator();
 
         Ok(Self {
+            namespace,
             slot,
             ticket,
             liveness_path,
@@ -1155,6 +1258,7 @@ impl Ticket {
     }
 
     pub(super) fn state(&self, cancelled: Option<&AtomicBool>) -> Result<State> {
+        let _namespace = self.namespace.enter();
         let _lock = lock_registry_interruptible_existing(cancelled)?;
         let mut table = Table::open_existing()?;
         table.repair_consistency_if_needed()?;
@@ -1178,6 +1282,7 @@ impl Ticket {
         check_coordinator_liveness: bool,
         cancelled: Option<&AtomicBool>,
     ) -> Result<Option<State>> {
+        let _namespace = self.namespace.enter();
         check_cancelled(cancelled)?;
         let _lock = normalize_cancellation(lock_registry_existing(FlockMode::Shared), cancelled)?;
         #[cfg(test)]
@@ -1265,6 +1370,7 @@ impl Ticket {
         timeout: Duration,
         cancelled: Option<&AtomicBool>,
     ) -> Result<State> {
+        let _namespace = self.namespace.enter();
         check_cancelled(cancelled)?;
         let wake = self
             .wake
@@ -1322,6 +1428,7 @@ impl Ticket {
             AvailabilitySnapshot,
         ) -> Result<GrantAttempt<T>>,
     ) -> Result<GrantResult<T>> {
+        let _namespace = self.namespace.enter();
         let (
             designated,
             watch,
@@ -1610,6 +1717,7 @@ impl Ticket {
         force_liveness_maintenance: bool,
         cancelled: Option<&AtomicBool>,
     ) -> Result<ScheduleSnapshot> {
+        let _namespace = self.namespace.enter();
         let pure_release_batch = coordinator_claim.is_none()
             && (!closed_cpus.is_empty() || !closed_llcs.is_empty() || !closed_permits.is_empty())
             && !overflow
@@ -1728,6 +1836,7 @@ impl Ticket {
         cancelled: Option<&AtomicBool>,
         on_park: &mut impl FnMut(),
     ) -> Result<(OwnedFd, Table)> {
+        let _namespace = self.namespace.enter();
         loop {
             let lock = lock_registry_interruptible_existing(cancelled)?;
             let mut table = Table::open_existing()?;
@@ -1770,6 +1879,7 @@ impl Ticket {
         closed_permits: &BTreeSet<usize>,
         cancelled: Option<&AtomicBool>,
     ) -> Result<Option<ScheduleSnapshot>> {
+        let _namespace = self.namespace.enter();
         check_cancelled(cancelled)?;
         let _lock = normalize_cancellation(lock_registry_existing(FlockMode::Shared), cancelled)?;
         let file = File::open(header_path())?;
@@ -1932,6 +2042,7 @@ impl Ticket {
         release_proofs: impl FnOnce(),
         cancelled: Option<&AtomicBool>,
     ) -> Result<ScheduleSnapshot> {
+        let _namespace = self.namespace.enter();
         let mut release_proofs = Some(release_proofs);
         let (_lock, mut table) = {
             let mut release_if_parked = || {
@@ -1996,6 +2107,7 @@ impl Ticket {
 
     #[cfg(test)]
     fn commit_token_for_tests(&self) -> Result<CoordinatorCommitToken> {
+        let _namespace = self.namespace.enter();
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
         let record = table
@@ -2018,6 +2130,7 @@ impl Ticket {
 
     #[cfg(test)]
     pub(super) fn finish(&mut self, cancelled: Option<&AtomicBool>) -> Result<()> {
+        let _namespace = self.namespace.enter();
         if self.finished {
             return Ok(());
         }
@@ -2042,6 +2155,7 @@ impl Ticket {
         contention: &[ContentionMarker],
         cancelled: Option<&AtomicBool>,
     ) -> Result<FinishAcquireResult> {
+        let _namespace = self.namespace.enter();
         if self.finished {
             anyhow::bail!("coordinator ticket was already committed");
         }
@@ -2101,11 +2215,13 @@ impl Ticket {
 
     #[cfg(test)]
     fn remove_record_interruptible(&mut self, cancelled: Option<&AtomicBool>) -> Result<()> {
+        let _namespace = self.namespace.enter();
         let _lock = lock_registry_interruptible_existing(cancelled)?;
         self.remove_record_locked()
     }
 
     fn remove_record_locked(&mut self) -> Result<()> {
+        let _namespace = self.namespace.enter();
         let mut table = Table::open_existing()?;
         table.repair_consistency_if_needed()?;
         if let Some(record) = table.record(self.slot)?
@@ -2120,6 +2236,7 @@ impl Ticket {
 
 impl Drop for Ticket {
     fn drop(&mut self) {
+        let _namespace = self.namespace.enter();
         if self.finished {
             return;
         }
@@ -5105,11 +5222,15 @@ fn notify_path() -> PathBuf {
 }
 
 fn registry_data_dir() -> PathBuf {
-    protocol_dir().join("ktstr-acquire-registry-v14")
+    active_protocol_dir().join("ktstr-acquire-registry-v14")
 }
 
 pub(super) fn event_dir() -> PathBuf {
-    protocol_dir().join("ktstr-acquire-events-v14")
+    active_protocol_dir().join("ktstr-acquire-events-v14")
+}
+
+pub(super) fn protocol_dir_path() -> PathBuf {
+    active_protocol_dir()
 }
 
 pub(super) fn notify_basename() -> Result<std::ffi::OsString> {
@@ -5310,6 +5431,8 @@ fn notify_coordinator() {
 }
 
 pub(super) fn publish_acquired(claim: &ClaimSet) -> Result<HeldClaim> {
+    let namespace = RegistryNamespace::resolve();
+    let _namespace = namespace.enter();
     validate_claim(claim)?;
     materialize_claim_paths(claim)?;
     let _lock = lock_registry_interruptible(None)?;
@@ -5317,14 +5440,18 @@ pub(super) fn publish_acquired(claim: &ClaimSet) -> Result<HeldClaim> {
     let mut table = Table::open(required_bits)?;
     table.repair_consistency_if_needed()?;
     table.recover_coordinator_if_dead()?;
-    let held = publish_acquired_in_table(&mut table, claim)?;
+    let held = publish_acquired_in_table(&mut table, claim, namespace)?;
     drop(table);
     drop(_lock);
     notify_coordinator();
     Ok(held)
 }
 
-fn publish_acquired_in_table(table: &mut Table, claim: &ClaimSet) -> Result<HeldClaim> {
+fn publish_acquired_in_table(
+    table: &mut Table,
+    claim: &ClaimSet,
+    namespace: RegistryNamespace,
+) -> Result<HeldClaim> {
     table.begin_transaction()?;
 
     let ticket = table.next_ticket()?;
@@ -5358,6 +5485,7 @@ fn publish_acquired_in_table(table: &mut Table, claim: &ClaimSet) -> Result<Held
     table.bump_generation()?;
     table.finish_transaction()?;
     Ok(HeldClaim {
+        namespace,
         slot,
         ticket,
         liveness_path,
