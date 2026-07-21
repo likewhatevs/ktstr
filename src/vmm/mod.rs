@@ -1617,35 +1617,37 @@ impl KtstrVm {
     }
 
     /// Run-lock acquisition for the interactive / one-shot shell path
-    /// ([`Self::run_interactive`]). Passes `wait = false` so
-    /// acquisition does not register on a contended reservation. Default and
-    /// no-perf shells therefore take an immediately available shared pool or
-    /// surface contention. A performance-configured shell still ignores exact
+    /// ([`Self::run_interactive`]). A bare operator shell passes `wait = false`
+    /// and therefore takes an immediately available shared pool or surfaces
+    /// contention. An unattended `--exec` passes `wait = true`, preserving its
+    /// ordinary queue position from preparation through the atomic conversion
+    /// to a run placement. A performance-configured shell still ignores exact
     /// performance pinning, but uses the same default shared fallback so it
     /// cannot run through another performance VM's exclusive reservation.
     fn acquire_interactive_run_locks(
         &self,
         mut pending: host_topology::protocol::PendingAdmission,
         memory_mib: u32,
+        wait: bool,
     ) -> Result<RunLocks> {
         pending.restore_preparation_affinity()?;
-        // Interactive admission remains one nonblocking attempt, but consumes
-        // the pre-exec owner in place: its physical permits and PENDING fence
-        // stay continuous until the exact shared run claim is HELD (or the
-        // attempt is retired synchronously).
+        // Consume the pre-exec owner in place: its physical permits and
+        // PENDING fence stay continuous until the shared run claim is HELD.
+        // Bare shells make one nonblocking conversion; unattended one-shots
+        // keep waiting under the ordinary queue policy selected above.
         if self.performance_mode {
             let allowed = host_topology::host_allowed_cpus();
             Self::acquire_default_shared_run_locks(
                 self.host_topo.as_ref(),
                 allowed,
                 self.topology.total_cpus() as usize,
-                false,
+                wait,
                 None,
                 Some(pending),
                 memory_mib,
             )
         } else {
-            self.acquire_run_locks(false, Some(pending), memory_mib)
+            self.acquire_run_locks(wait, Some(pending), memory_mib)
         }
     }
 
@@ -2739,7 +2741,7 @@ impl KtstrVm {
         // workers. The returned fds remain live for the whole interactive run,
         // and every placement consumer below uses the matching run-time CPU
         // mask rather than independently consulting the build-time plan.
-        let run_locks = self.acquire_interactive_run_locks(pending, memory_mib)?;
+        let run_locks = self.acquire_interactive_run_locks(pending, memory_mib, exec_mode)?;
         // Capture after admission so this guard is declared after `run_locks`.
         // Rust drops locals in reverse declaration order: every return path
         // therefore restores the caller's original affinity before releasing
