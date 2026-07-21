@@ -54,9 +54,6 @@ mod metadata;
 mod resolve;
 mod vmlinux_strip;
 
-#[cfg(test)]
-pub(crate) mod shared_test_helpers;
-
 // Public API re-exports — preserve every `crate::cache::*` path that
 // external callers (lib.rs, cli, fetch.rs, monitor/*, probe/btf.rs,
 // vmm/disk_template, test_support/*, remote_cache.rs, stats,
@@ -134,33 +131,6 @@ pub fn content_file_digest(path: impl AsRef<std::path::Path>) -> anyhow::Result<
     let path = path.as_ref();
     let pinned = pin_content_file(path)?;
     content::cached_file_digest(pinned.source(), pinned.identity)
-}
-
-#[cfg(test)]
-mod coordination_tests {
-    use super::*;
-    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
-
-    #[test]
-    fn cargo_output_lock_root_is_independent_of_artifact_cache_root() {
-        let _env = lock_env();
-        let lock_dir = tempfile::tempdir().expect("lock directory");
-        let first_cache = tempfile::tempdir().expect("first cache directory");
-        let second_cache = tempfile::tempdir().expect("second cache directory");
-        let _lock_dir = EnvVarGuard::set(crate::KTSTR_LOCK_DIR_ENV, lock_dir.path());
-
-        let first = {
-            let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, first_cache.path());
-            cargo_build_output_lock_root().expect("first output lock root")
-        };
-        let second = {
-            let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, second_cache.path());
-            cargo_build_output_lock_root().expect("second output lock root")
-        };
-
-        assert_eq!(first, second);
-        assert_eq!(first, lock_dir.path().join("ktstr-cargo-build-output-v3"));
-    }
 }
 
 /// One immutable, content-addressed snapshot of an input file.
@@ -355,3 +325,33 @@ pub(crate) use vmlinux_strip::strip_vmlinux_debug;
 /// [`cache_dir::CacheDir::list`] does not reference the const; it
 /// skips these directories via its broader leading-`.` filter.
 pub(crate) const TMP_DIR_PREFIX: &str = ".tmp-";
+
+#[cfg(test)]
+pub(crate) mod shared_test_helpers;
+
+#[cfg(test)]
+mod coordination_tests {
+    use super::*;
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+
+    #[test]
+    fn cargo_output_lock_root_is_independent_of_artifact_cache_root() {
+        let _env = lock_env();
+        let lock_dir = tempfile::tempdir().expect("lock directory");
+        let first_cache = tempfile::tempdir().expect("first cache directory");
+        let second_cache = tempfile::tempdir().expect("second cache directory");
+        let _lock_dir = EnvVarGuard::set(crate::KTSTR_LOCK_DIR_ENV, lock_dir.path());
+
+        let first = {
+            let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, first_cache.path());
+            cargo_build_output_lock_root().expect("first output lock root")
+        };
+        let second = {
+            let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, second_cache.path());
+            cargo_build_output_lock_root().expect("second output lock root")
+        };
+
+        assert_eq!(first, second);
+        assert_eq!(first, lock_dir.path().join("ktstr-cargo-build-output-v3"));
+    }
+}

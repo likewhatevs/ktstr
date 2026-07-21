@@ -4980,8 +4980,7 @@ pub(super) fn required_bits_for_permit_index(max_permit: usize) -> usize {
                 .saturating_mul(2)
                 .min(MAX_RESOURCE_BITS),
         )
-        .max(4096)
-        .min(MAX_RESOURCE_BITS)
+        .clamp(4096, MAX_RESOURCE_BITS)
 }
 
 fn permit_resource_index(permit: usize) -> Result<usize> {

@@ -1088,17 +1088,16 @@ fn validate_topology(
         }
         None => {}
     }
-    if let Some(llc_cores) = &topology.llc_cores {
-        if llc_cores.len() != topology.llcs as usize
+    if let Some(llc_cores) = &topology.llc_cores
+        && (llc_cores.len() != topology.llcs as usize
             || llc_cores
                 .iter()
-                .any(|cores| *cores == 0 || *cores > topology.cores_per_llc)
-        {
-            return Err(format!(
-                "{what} in admission ELF {} has invalid non-uniform LLC core counts",
-                reader.source.display(),
-            ));
-        }
+                .any(|cores| *cores == 0 || *cores > topology.cores_per_llc))
+    {
+        return Err(format!(
+            "{what} in admission ELF {} has invalid non-uniform LLC core counts",
+            reader.source.display(),
+        ));
     }
     topology.checked_total_cpus().ok_or_else(|| {
         format!(

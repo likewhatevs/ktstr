@@ -195,7 +195,7 @@ fn corrupt_record_and_missing_content_object_are_reconstructible_misses() {
     let source_root = temp.path().join("checkout");
     let record_root = temp.path().join("records");
     let materializations = temp.path().join("materializations");
-    let identity = 0xc022_0a7;
+    let identity = 0x0c02_20a7;
     write_fixture_tree(&source_root, b"reconstructible-tree");
     let cache = ArtifactTreeCache::new(&record_root);
     let builds = AtomicUsize::new(0);
@@ -801,7 +801,7 @@ fn stable_cargo_sealing_is_recursive_and_does_not_follow_symlinks() {
             root: root.clone(),
             target_directory: target.clone(),
         },
-        0x5ea1_ed,
+        0x5e_a1_ed,
     )
     .unwrap();
 
@@ -843,7 +843,7 @@ fn stable_tree_survives_owner_drop_and_is_immutable_on_reuse() {
     let cache = ArtifactTreeCache::new(&records);
     let first = cache
         .load_or_build_stable(
-            0x57ab_1e,
+            0x0057_ab1e,
             &stable,
             "stable-tree-test",
             || Ok(true),
@@ -873,7 +873,7 @@ fn stable_tree_survives_owner_drop_and_is_immutable_on_reuse() {
 
     let second = cache
         .load_or_build_stable(
-            0x57ab_1e,
+            0x0057_ab1e,
             &stable,
             "stable-tree-test",
             || Ok(true),

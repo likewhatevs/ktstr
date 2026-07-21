@@ -2108,9 +2108,7 @@ impl KtstrVm {
             if let Some(locks) = result {
                 return Ok(Some((index, exact, locks)));
             }
-            if exact_attempts > 0 {
-                exact_attempts -= 1;
-            }
+            exact_attempts = exact_attempts.saturating_sub(1);
             for offset in 1..=candidates.len() {
                 let next = (index + offset) % candidates.len();
                 let Some(permits) = permit_pool.select(|claim| probe.candidate_ready(claim))?

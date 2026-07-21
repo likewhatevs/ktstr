@@ -8,7 +8,6 @@
 
 use super::{PendingAdmission, registry};
 use anyhow::{Context, Result};
-use std::ffi::CStr;
 use std::fs::File;
 use std::io::Write;
 use std::marker::PhantomData;
@@ -474,7 +473,7 @@ fn decode(bytes: &[u8]) -> Result<Header> {
 }
 
 fn create_sealed_memfd(bytes: &[u8]) -> Result<OwnedFd> {
-    let name = CStr::from_bytes_with_nul(b"ktstr-pending-admission\0").unwrap();
+    let name = c"ktstr-pending-admission";
     let raw =
         unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
     if raw == -1 {

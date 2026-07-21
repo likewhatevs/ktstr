@@ -2440,7 +2440,7 @@ impl CpuCap {
     }
 }
 
-/// Placement policy for the PLAN phase of [`acquire_llc_plan`]:
+/// Placement policy for the PLAN phase of [`acquire_llc_plan_interruptible`]:
 /// which LLCs a reservation prefers when more are eligible than the
 /// budget needs.
 ///
@@ -2538,7 +2538,7 @@ pub(crate) struct LlcSnapshot {
     pub(crate) exclusive_held: bool,
 }
 
-/// Output of [`acquire_llc_plan`]: the concrete LLC reservation plus
+/// Output of [`acquire_llc_plan_interruptible`]: the concrete LLC reservation plus
 /// every piece of diagnostic context a downstream consumer could
 /// want.
 ///
@@ -3196,6 +3196,7 @@ fn try_acquire_llc_plan_locks_with_evidence(
 /// Exact LLC-SH/CPU-SH planner used for cooperative VM admission. It acquires
 /// topology locks and weighted admission permits in one registry claim, and
 /// observes cancellation while waiting behind hard-exclusive pressure.
+#[allow(clippy::too_many_arguments)] // Each argument is a distinct admission-policy input.
 pub(crate) fn acquire_llc_plan_interruptible(
     topo: &HostTopology,
     test_topo: &crate::topology::TestTopology,
@@ -3566,6 +3567,7 @@ impl PreparationPermit {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // Mirrors the fixed exec-handoff descriptor fields.
     pub(super) fn imported(
         index: usize,
         token_permit: usize,
@@ -4240,6 +4242,7 @@ fn select_memory_permits(
     ready(&permit_only_claim(&candidate)).map(|ready| ready.then_some(selected))
 }
 
+#[allow(clippy::too_many_arguments)] // Preserve the CPU/memory admission axes at this selection seam.
 fn select_vm_permits(
     kind: PermitAdmission,
     cpu_pool: &AdmissionPermitPool,
@@ -4552,7 +4555,7 @@ fn check_acquire_cancelled(cancelled: Option<&AtomicBool>) -> Result<()> {
     }
 }
 
-/// Parameterized form of [`acquire_llc_plan`] that takes the
+/// Parameterized form of [`acquire_llc_plan_interruptible`] that takes the
 /// ACQUIRE closure as a seam. Production calls this with
 /// [`try_acquire_llc_plan_locks_with_evidence`] (non-blocking `LOCK_SH` per resource);
 /// tests can pass a closure that returns `Ok(None)` on attempt 0 and
@@ -4987,11 +4990,9 @@ where
             break;
         }
         let mut registry_fenced = false;
-        let acquired = if selected.is_empty() || permit_selection.is_none() {
-            // Claim-blocked: bounce without touching any lockfile.
-            None
-        } else {
-            let permit_selection = permit_selection.as_ref().expect("checked above");
+        let acquired = if let Some(permit_selection) = permit_selection.as_ref()
+            && !selected.is_empty()
+        {
             let all_permits = permit_selection.all_permits();
             let exact = resource_claim_with_permits(
                 &selected,
@@ -5056,6 +5057,9 @@ where
                     LlcLockAttempt::Unavailable => None,
                 },
             }
+        } else {
+            // Claim-blocked: bounce without touching any lockfile.
+            None
         };
         if let Some(locks) = acquired {
             let plan = materialize_llc_plan(
@@ -5633,43 +5637,41 @@ where
                 &cpu_states,
                 live_capacity.target,
                 cpu_policy,
-            ) {
-                if let Some(permits) = select_vm_permits(
-                    permit_admission,
-                    &permit_pool,
-                    memory_pool.as_ref(),
-                    cpus.len(),
-                    if sizing == LlcPlanSizing::Elastic {
-                        1
-                    } else {
-                        cpus.len()
-                    },
-                    memory_required,
-                    permit_rotation,
-                    memory_rotation,
-                    &preferred_cpu_permits,
-                    &preferred_memory_permits,
-                    |candidate| held.candidate_ready(candidate),
-                )? {
-                    if sizing == LlcPlanSizing::Elastic {
-                        cpus.truncate(permits.cpu_permits.len());
-                        selected.retain(|llc| {
-                            topo.llc_groups[*llc]
-                                .cpus
-                                .iter()
-                                .any(|cpu| cpus.contains(cpu))
-                        });
-                    }
-                    let all_permits = permits.all_permits();
-                    coordinator_claim = resource_claim_with_permits(
-                        &selected,
-                        LlcLockMode::Shared,
-                        &cpus,
-                        FlockMode::Shared,
-                        &all_permits,
-                        permits.admission_class,
-                    );
+            ) && let Some(permits) = select_vm_permits(
+                permit_admission,
+                &permit_pool,
+                memory_pool.as_ref(),
+                cpus.len(),
+                if sizing == LlcPlanSizing::Elastic {
+                    1
+                } else {
+                    cpus.len()
+                },
+                memory_required,
+                permit_rotation,
+                memory_rotation,
+                &preferred_cpu_permits,
+                &preferred_memory_permits,
+                |candidate| held.candidate_ready(candidate),
+            )? {
+                if sizing == LlcPlanSizing::Elastic {
+                    cpus.truncate(permits.cpu_permits.len());
+                    selected.retain(|llc| {
+                        topo.llc_groups[*llc]
+                            .cpus
+                            .iter()
+                            .any(|cpu| cpus.contains(cpu))
+                    });
                 }
+                let all_permits = permits.all_permits();
+                coordinator_claim = resource_claim_with_permits(
+                    &selected,
+                    LlcLockMode::Shared,
+                    &cpus,
+                    FlockMode::Shared,
+                    &all_permits,
+                    permits.admission_class,
+                );
             }
         }
         // If real EX holders leave no full ready alternative, retain the
@@ -6086,7 +6088,7 @@ pub fn format_llc_list(locked: &[usize], topo: &HostTopology) -> String {
 /// caps that fit within a single node) never emit.
 ///
 /// Placement: called by `kernel_build_pipeline` and friends right
-/// after [`acquire_llc_plan`] returns, before the sandbox mount.
+/// after [`acquire_llc_plan_interruptible`] returns, before the sandbox mount.
 /// Extracting this into a helper rather than inlining at the call
 /// site lets the message body be unit-tested via
 /// [`cross_node_spill_warning`] without capturing stderr.

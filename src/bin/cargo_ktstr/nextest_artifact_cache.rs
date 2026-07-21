@@ -1169,7 +1169,7 @@ fn cargo_config_includes(path: &Path) -> Result<Vec<(PathBuf, bool)>, String> {
     let text = std::str::from_utf8(&bytes)
         .map_err(|error| format!("Cargo config {} is not UTF-8: {error}", path.display()))?;
     let document = text
-        .parse::<toml::Value>()
+        .parse::<toml::Table>()
         .map_err(|error| format!("parse Cargo config {}: {error}", path.display()))?;
     let Some(include) = document.get("include") else {
         return Ok(Vec::new());
@@ -1475,7 +1475,7 @@ fn package_declared_include_paths(
         )
     })?;
     let document = text
-        .parse::<toml::Value>()
+        .parse::<toml::Table>()
         .map_err(|error| format!("parse Cargo manifest {}: {error}", manifest.display()))?;
     let Some(patterns) = document
         .get("package")
@@ -2378,14 +2378,24 @@ impl StableCargoSource {
     /// files and source roots captured in this stable source. Named target
     /// triples and non-path inline config remain unchanged.
     pub(crate) fn remap_cargo_args(&self, arguments: &[String]) -> Vec<String> {
-        let remap_value = |value: &str| {
+        let absolute_argument_path = |value: &str| {
             let path = Path::new(value);
             let absolute = if path.is_absolute() {
                 path.to_path_buf()
             } else {
                 self.original_invocation_root.join(path)
             };
-            let absolute = canonical_or_lexical(&absolute);
+            canonical_or_lexical(&absolute)
+        };
+        let remap_explicit_file = |value: &str| {
+            let absolute = absolute_argument_path(value);
+            self.cargo_argument_remaps
+                .get(&absolute)
+                .cloned()
+                .map(|path| path.display().to_string())
+        };
+        let remap_source_path = |value: &str| {
+            let absolute = absolute_argument_path(value);
             self.cargo_argument_remaps
                 .get(&absolute)
                 .cloned()
@@ -2401,7 +2411,7 @@ impl StableCargoSource {
         };
         let remap_config_value = |value: &str| {
             if let Some((key, path)) = crate::feature_discovery::cargo_inline_config_path(value) {
-                return remap_value(&path).map(|path| {
+                return remap_source_path(&path).map(|path| {
                     format!(
                         "{key}={}",
                         serde_json::to_string(&path)
@@ -2409,7 +2419,7 @@ impl StableCargoSource {
                     )
                 });
             }
-            remap_value(value)
+            remap_explicit_file(value)
         };
 
         let mut remapped = Vec::with_capacity(arguments.len());
@@ -2423,7 +2433,7 @@ impl StableCargoSource {
                     let value = if argument == "--config" {
                         remap_config_value(value)
                     } else {
-                        remap_value(value)
+                        remap_explicit_file(value)
                     };
                     remapped.push(value.unwrap_or_else(|| arguments[index].clone()));
                 }
@@ -2438,7 +2448,7 @@ impl StableCargoSource {
                 );
             } else if let Some(value) = argument.strip_prefix("--target=") {
                 remapped.push(
-                    remap_value(value)
+                    remap_explicit_file(value)
                         .map(|value| format!("--target={value}"))
                         .unwrap_or_else(|| argument.clone()),
                 );
@@ -2522,7 +2532,8 @@ impl IdentityPlan {
     ///
     /// The callback is invoked only on a miss and receives the stable source
     /// pathname and deterministic persistent output pathname which Cargo must
-    /// use for that build. It must return an [`ArtifactTreeSource`] while still
+    /// use for that build. It must return an
+    /// [`ArtifactTreeSource`](ktstr::cache::artifact_tree::ArtifactTreeSource) while still
     /// holding exclusive ownership of every Cargo output it captured (normally
     /// by calling [`capture_source`] inside the output-lease postprocess
     /// callback).
@@ -3076,7 +3087,9 @@ mod tests {
         let included = included_dir.join("shared.toml");
         std::fs::write(
             &root,
-            b"include = ['parts/shared.toml', { path = 'missing.toml', optional = true }]\n",
+            b"include = ['parts/shared.toml', { path = 'missing.toml', optional = true }]\n\
+[target.x86_64-unknown-linux-gnu]\n\
+rustflags = ['-C', 'target-cpu=x86-64-v3']\n",
         )
         .unwrap();
         std::fs::write(&included, b"[build]\ntarget-dir = '../build-output'\n").unwrap();

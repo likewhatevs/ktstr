@@ -3008,9 +3008,9 @@ fn run_cargo_sub(
     cmd.env("GIT_OPTIONAL_LOCKS", "0");
     if sub_argv == TEST_SUB_ARGV
         && let Some(pattern) = profraw_inject
-            .as_ref()
-            .map(|path| path.as_os_str())
-            .or_else(|| inherited_profraw.as_ref().map(|value| value.as_os_str()))
+            .as_deref()
+            .map(Path::as_os_str)
+            .or(inherited_profraw.as_deref())
     {
         producer_environment.push((OsString::from("LLVM_PROFILE_FILE"), pattern.to_os_string()));
     }

@@ -692,6 +692,7 @@ impl ArtifactTreeCache {
     /// Callers which have just computed an input identity may accept an
     /// immutable matching hit without repeating that expensive scan, while
     /// still revalidating mutable producer inputs after a long cold build.
+    #[allow(clippy::too_many_arguments)] // Keep cache lifecycle hooks explicit at the API boundary.
     pub fn load_or_build_with_validators<F, VH, VP, C>(
         &self,
         identity: u64,
@@ -725,6 +726,7 @@ impl ArtifactTreeCache {
     /// source inode has reached the content CAS but before the record becomes
     /// visible. Stable Cargo outputs use this boundary to seal their producer
     /// tree without invalidating the identities used for content hashing.
+    #[allow(clippy::too_many_arguments)] // Keep cache lifecycle hooks explicit at the API boundary.
     fn load_or_build_with_validators_and_post_publish<F, U, VH, VP, C, P>(
         &self,
         identity: u64,
@@ -885,6 +887,7 @@ impl ArtifactTreeCache {
     /// This is the uniform producer shape for harness, coverage, and
     /// scheduler builds. The stable output is lifecycle-coupled to the record
     /// election while each execution still receives a private reflink tree.
+    #[allow(clippy::too_many_arguments)] // Keep cache lifecycle hooks explicit at the API boundary.
     pub fn load_or_build_with_stable_cargo_output<F, V, C>(
         &self,
         identity: u64,
@@ -914,6 +917,7 @@ impl ArtifactTreeCache {
 
     /// Stable-output variant with a cheap cached-hit validator and a distinct
     /// post-build validator for mutable producer inputs.
+    #[allow(clippy::too_many_arguments)] // Keep cache lifecycle hooks explicit at the API boundary.
     pub fn load_or_build_with_stable_cargo_output_validators<F, VH, VP, C>(
         &self,
         identity: u64,
@@ -1023,6 +1027,7 @@ impl ArtifactTreeCache {
 
     /// Stable-tree variant with distinct validators for an immutable cache hit
     /// and a freshly captured source closure.
+    #[allow(clippy::too_many_arguments)] // Keep cache lifecycle hooks explicit at the API boundary.
     pub fn load_or_build_stable_with_validators<F, VH, VP, C>(
         &self,
         identity: u64,
@@ -1756,7 +1761,8 @@ fn validate_record(record: &ArtifactTreeRecord, expected_identity: u64) -> Resul
     }
     let nondirectories = source_shape
         .iter()
-        .filter_map(|(path, nondirectory)| (*nondirectory).then(|| path.clone()))
+        .filter(|(_, nondirectory)| **nondirectory)
+        .map(|(path, _)| path.clone())
         .collect::<BTreeSet<_>>();
     for path in source_shape.keys() {
         let mut parent = path.parent();
@@ -2173,14 +2179,14 @@ fn gc_stale_materializations(parent: &Path, now: SystemTime) -> Result<()> {
                 Err(_) => continue,
             }
         }
-        if let Err(error) = std::fs::remove_dir_all(&path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::debug!(
-                    path = %path.display(),
-                    error = %error,
-                    "could not remove stale artifact materialization",
-                );
-            }
+        if let Err(error) = std::fs::remove_dir_all(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(
+                path = %path.display(),
+                error = %error,
+                "could not remove stale artifact materialization",
+            );
         }
     }
     if let Some(index) = selected.last() {

@@ -32,7 +32,7 @@
 //!
 //! This module is Linux-only; callers must arrive here already
 //! holding an `LlcPlan` from a successful
-//! [`acquire_llc_plan`](super::host_topology::acquire_llc_plan)
+//! [`acquire_llc_plan_interruptible`](super::host_topology::acquire_llc_plan_interruptible)
 //! invocation, so the cpu + mem sets are guaranteed to be non-empty.
 
 use crate::cgroup::{CgroupManager, anyhow_first_io_errno};
