@@ -1628,11 +1628,10 @@ impl KtstrVm {
         memory_mib: u32,
     ) -> Result<RunLocks> {
         pending.restore_preparation_affinity()?;
-        // Interactive admission remains a single non-blocking attempt. Retire
-        // the pre-exec publication synchronously first: ordinary Ticket Drop
-        // may defer cleanup behind a registry writer, in which case the fresh
-        // probe can otherwise fence itself on its own dead PENDING claim.
-        pending.retire_for_nonblocking_probe()?;
+        // Interactive admission remains one nonblocking attempt, but consumes
+        // the pre-exec owner in place: its physical permits and PENDING fence
+        // stay continuous until the exact shared run claim is HELD (or the
+        // attempt is retired synchronously).
         if self.performance_mode {
             let allowed = host_topology::host_allowed_cpus();
             Self::acquire_default_shared_run_locks(
@@ -1641,11 +1640,11 @@ impl KtstrVm {
                 self.topology.total_cpus() as usize,
                 false,
                 None,
-                None,
+                Some(pending),
                 memory_mib,
             )
         } else {
-            self.acquire_run_locks(false, None, memory_mib)
+            self.acquire_run_locks(false, Some(pending), memory_mib)
         }
     }
 
@@ -2029,10 +2028,82 @@ impl KtstrVm {
             pending.as_ref(),
         )?;
         if !wait {
-            anyhow::ensure!(
-                pending.is_none(),
-                "non-waiting default admission cannot consume a pending owner",
-            );
+            if let Some(pending) = pending {
+                let activated = protocol::try_activate_pending_once(pending, |probe| {
+                    let reusable_permits = probe.clone_reusable_permits()?;
+                    // Preserve default's ordinary preference: try every 1:1
+                    // footprint once, then every compatible shared fallback,
+                    // all inside the same PENDING conversion transaction.
+                    for exact in [true, false] {
+                        for (index, candidate) in candidates.iter().enumerate() {
+                            let Some(permits) =
+                                permit_pool.select(|claim| probe.candidate_ready(claim))?
+                            else {
+                                break;
+                            };
+                            let all_permits = permits.all_permits();
+                            let claim = host_topology::resource_claim_with_permits(
+                                &candidate.shared_llcs,
+                                host_topology::LlcLockMode::Shared,
+                                &candidate.shared_cpus,
+                                crate::flock::FlockMode::Shared,
+                                &all_permits,
+                                permits.admission_class,
+                            );
+                            let locks = if exact {
+                                probe.try_acquire(&claim, || {
+                                    host_topology::acquire_default_exact_footprint_with_permits_granted_reusing(
+                                        &candidate.shared_llcs,
+                                        &candidate.shared_cpus,
+                                        &candidate.exact_cpus,
+                                        &all_permits,
+                                        &reusable_permits,
+                                    )
+                                })?
+                            } else {
+                                probe.try_acquire(&claim, || {
+                                    host_topology::acquire_resources_with_permits_granted_reusing(
+                                        &candidate.shared_llcs,
+                                        host_topology::LlcLockMode::Shared,
+                                        &candidate.shared_cpus,
+                                        crate::flock::FlockMode::Shared,
+                                        &all_permits,
+                                        &reusable_permits,
+                                    )
+                                })?
+                            };
+                            if let Some(locks) = locks {
+                                return Ok(Some((claim, (index, exact, locks))));
+                            }
+                        }
+                    }
+                    Ok(None)
+                })?;
+                return match activated {
+                    Some(acquired) => {
+                        let ((index, exact), locks) =
+                            acquired.split_map(|(index, exact, locks)| ((index, exact), locks));
+                        if exact {
+                            Ok(RunLocks {
+                                locks,
+                                pinning_plan: Some(candidates[index].plan.clone_unlocked()),
+                                shared_cpu_mask: None,
+                                default_shared_cpu_claim: true,
+                                default_shared_fallback: false,
+                            })
+                        } else {
+                            Ok(Self::build_default_shared_run_locks(
+                                candidates[index].shared_cpus.clone(),
+                                topology.total_cpus() as usize,
+                                locks,
+                            ))
+                        }
+                    }
+                    None => Err(anyhow::Error::new(host_topology::ResourceContention {
+                        reason: "no default host placement was immediately available".into(),
+                    })),
+                };
+            }
             for candidate in &candidates {
                 let Some(permits) = permit_pool.select_registered()? else {
                     continue;
@@ -2362,8 +2433,9 @@ impl KtstrVm {
             };
         }
 
-        let (cpus, locks) =
-            Self::acquire_cpu_shared_with_permits(allowed, target, pending, memory_mib, cancelled)?;
+        let (cpus, locks) = Self::acquire_cpu_shared_with_permits(
+            allowed, target, wait, pending, memory_mib, cancelled,
+        )?;
         Ok(Self::build_default_shared_run_locks(cpus, vcpus, locks))
     }
 
@@ -2375,6 +2447,7 @@ impl KtstrVm {
     fn acquire_cpu_shared_with_permits(
         allowed: Vec<usize>,
         target: usize,
+        wait: bool,
         pending: Option<host_topology::protocol::PendingAdmission>,
         memory_mib: u32,
         cancelled: Option<&AtomicBool>,
@@ -2416,6 +2489,42 @@ impl KtstrVm {
             )
         };
         let initial_claim = claim_for(&initial_cpus, &initial_permits);
+        if !wait && let Some(pending) = pending {
+            let activated = protocol::try_activate_pending_once(pending, |probe| {
+                let reusable = probe.clone_reusable_permits()?;
+                for rotation in 0..allowed.len() {
+                    let Some(permits) = permit_pool.select(|claim| probe.candidate_ready(claim))?
+                    else {
+                        break;
+                    };
+                    let cpus = (0..target)
+                        .map(|offset| allowed[(start + rotation + offset) % allowed.len()])
+                        .collect::<Vec<_>>();
+                    let claim = claim_for(&cpus, &permits);
+                    let all_permits = permits.all_permits();
+                    if let Some(locks) = probe.try_acquire(&claim, || {
+                        host_topology::acquire_resources_with_permits_granted_reusing(
+                            &[],
+                            host_topology::LlcLockMode::Shared,
+                            &cpus,
+                            crate::flock::FlockMode::Shared,
+                            &all_permits,
+                            &reusable,
+                        )
+                    })? {
+                        return Ok(Some((claim, (cpus, locks))));
+                    }
+                }
+                Ok(None)
+            })?;
+            return activated
+                .map(|acquired| acquired.split_map(|(cpus, locks)| (cpus, locks)))
+                .ok_or_else(|| {
+                    anyhow::Error::new(host_topology::ResourceContention {
+                        reason: "no CPU-shared placement was immediately available".into(),
+                    })
+                });
+        }
         let watch = host_topology::resource_claim_with_permits(
             &[],
             host_topology::LlcLockMode::Shared,

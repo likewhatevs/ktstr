@@ -114,6 +114,162 @@ fn synchronous_pending_retirement_cannot_self_fence_a_fresh_probe() {
     );
 }
 
+#[test]
+fn pending_one_shot_promotes_the_same_ticket_without_waiting() {
+    let _prefixes = LockPrefixesGuard::new();
+    let preparation = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [0usize],
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Shared,
+    );
+    let exact = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [0usize, 1usize],
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Shared,
+    );
+    let pending = protocol::register_pending_claim_for_tests(preparation)
+        .expect("publish one-shot PENDING claim");
+    let ticket = protocol::ticket_registry_snapshot_for_tests()
+        .expect("snapshot one-shot PENDING claim")[0]
+        .0;
+    let probes = std::cell::Cell::new(0usize);
+    let waits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let wait_hook = waits.clone();
+    let acquired = with_reservation_wait_progress(
+        move || {
+            wait_hook.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        },
+        || {
+            pending.try_activate_once(exact.clone(), || {
+                probes.set(probes.get() + 1);
+                Ok(Some(()))
+            })
+        },
+    )
+    .expect("atomically promote PENDING to HELD")
+    .expect("one-shot candidate must acquire");
+    assert_eq!(probes.get(), 1, "the physical callback runs exactly once");
+    assert_eq!(
+        waits.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "one-shot activation must not enter reservation waiting",
+    );
+    let snapshot =
+        protocol::ticket_registry_snapshot_for_tests().expect("snapshot one-shot HELD claim");
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(
+        snapshot[0].0, ticket,
+        "activation must retain ticket identity"
+    );
+    assert_eq!(
+        snapshot[0].2, exact,
+        "the same slot must publish exact HELD"
+    );
+    assert_eq!(
+        protocol::registered_claim_snapshot(&exact)
+            .expect("snapshot one-shot HELD aggregate")
+            .cpu_holder_count(1)
+            .expect("exact CPU holder count"),
+        1,
+    );
+    drop(acquired);
+    assert!(
+        protocol::ticket_registry_snapshot_for_tests()
+            .expect("snapshot released one-shot claim")
+            .is_empty(),
+    );
+}
+
+#[test]
+fn pending_one_shot_external_ex_fence_never_probes_or_queues() {
+    let _prefixes = LockPrefixesGuard::new();
+    let preparation = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [0usize],
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Shared,
+    );
+    let exact = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [0usize, 1usize],
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Shared,
+    );
+    let blocker_claim = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [1usize],
+        crate::flock::FlockMode::Exclusive,
+        crate::flock::FlockMode::Exclusive,
+    );
+    let blocker = protocol::publish_acquired(&blocker_claim, ())
+        .expect("publish external performance-style blocker");
+    let pending = protocol::register_pending_claim_for_tests(preparation)
+        .expect("publish PENDING claim beside blocker");
+    let probes = std::cell::Cell::new(0usize);
+    let waits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let wait_hook = waits.clone();
+    let acquired = with_reservation_wait_progress(
+        move || {
+            wait_hook.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        },
+        || {
+            pending.try_activate_once(exact, || {
+                probes.set(probes.get() + 1);
+                Ok(Some(()))
+            })
+        },
+    )
+    .expect("reject externally fenced one-shot candidate");
+    assert!(acquired.is_none());
+    assert_eq!(probes.get(), 0, "registry fencing must precede the probe");
+    assert_eq!(
+        waits.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "fenced one-shot activation must not enter reservation waiting",
+    );
+    let snapshot = protocol::ticket_registry_snapshot_for_tests()
+        .expect("snapshot after fenced one-shot retirement");
+    assert_eq!(snapshot.len(), 1, "only the external HELD record remains");
+    assert_eq!(snapshot[0].2, blocker_claim);
+    drop(blocker);
+}
+
+#[test]
+fn pending_one_shot_physical_miss_probes_once_and_retires() {
+    let _prefixes = LockPrefixesGuard::new();
+    let preparation = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [0usize],
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Shared,
+    );
+    let exact = protocol::ClaimSet::with_modes(
+        std::iter::empty(),
+        [0usize],
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Shared,
+    );
+    let pending = protocol::register_pending_claim_for_tests(preparation)
+        .expect("publish physical-miss PENDING claim");
+    let probes = std::cell::Cell::new(0usize);
+    let acquired = pending
+        .try_activate_once(exact, || {
+            probes.set(probes.get() + 1);
+            Ok::<_, anyhow::Error>(None::<()>)
+        })
+        .expect("complete physical-miss one-shot activation");
+    assert!(acquired.is_none());
+    assert_eq!(probes.get(), 1, "physical miss must not be retried");
+    assert!(
+        protocol::ticket_registry_snapshot_for_tests()
+            .expect("snapshot retired physical-miss claim")
+            .is_empty(),
+        "a physical miss must synchronously remove PENDING",
+    );
+}
+
 struct InterruptibleFlockBrokerGuard {
     _serial: std::sync::MutexGuard<'static, ()>,
 }

@@ -369,6 +369,24 @@ pub(super) enum GrantResult<T> {
     LostGrant,
 }
 
+pub(super) enum PendingOneShotResult<T> {
+    Acquired(T, HeldClaim),
+    Unavailable,
+}
+
+pub(super) struct PendingOneShotProbe<'a> {
+    table: &'a Table,
+    excluded: &'a ClaimSet,
+}
+
+impl PendingOneShotProbe<'_> {
+    pub(super) fn candidate_ready(&self, candidate: &ClaimSet) -> Result<bool> {
+        Ok(!self
+            .table
+            .claim_conflicts_aggregate_excluding(candidate, self.excluded)?)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ObservationRequest {
     pub cpus: BTreeMap<usize, (Option<u64>, Option<u64>)>,
@@ -1098,6 +1116,112 @@ impl Ticket {
         drop(_lock);
         notify_coordinator();
         Ok(())
+    }
+
+    /// Consume one PENDING admission with a single nonblocking physical
+    /// attempt. The preparation claim remains published and the registry EX
+    /// lock remains held until the attempt either becomes HELD in this exact
+    /// slot or is removed synchronously; there is no WAITING/coordinator
+    /// state and no release/re-register window.
+    pub(super) fn try_activate_pending_once<T>(
+        &mut self,
+        expected_preparation: &ClaimSet,
+        attempt: impl FnOnce(&PendingOneShotProbe<'_>) -> Result<Option<(ClaimSet, T)>>,
+    ) -> Result<PendingOneShotResult<T>> {
+        let _namespace = self.namespace.enter();
+        validate_claim(expected_preparation)?;
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.repair_consistency_if_needed()?;
+        table.recover_coordinator_if_dead()?;
+        let record = table
+            .record(self.slot)?
+            .filter(|record| record.ticket == self.ticket)
+            .ok_or_else(|| anyhow::anyhow!("pending ticket {} disappeared", self.ticket))?;
+        anyhow::ensure!(
+            record.state == STATE_PENDING,
+            "pending ticket {} is in state {}, not PENDING",
+            self.ticket,
+            record.state,
+        );
+        anyhow::ensure!(
+            record.pid == std::process::id(),
+            "pending ticket {} belongs to PID {}, current PID is {}",
+            self.ticket,
+            record.pid,
+            std::process::id(),
+        );
+        anyhow::ensure!(
+            record.claim == *expected_preparation && record.watch == *expected_preparation,
+            "pending ticket {} preparation claim changed before one-shot activation",
+            self.ticket,
+        );
+
+        let probe = PendingOneShotProbe {
+            table: &table,
+            excluded: &record.claim,
+        };
+        let attempted = attempt(&probe);
+        let attempted = match attempted {
+            Ok(attempted) => attempted,
+            Err(error) => {
+                table.remove_record(&record, false)?;
+                table.bump_generation()?;
+                self.finish_removed_record();
+                drop(table);
+                drop(_lock);
+                notify_coordinator();
+                return Err(error);
+            }
+        };
+        let Some((exact, value)) = attempted else {
+            table.remove_record(&record, false)?;
+            table.bump_generation()?;
+            self.finish_removed_record();
+            drop(table);
+            drop(_lock);
+            notify_coordinator();
+            return Ok(PendingOneShotResult::Unavailable);
+        };
+
+        let commit = validate_claim(&exact).and_then(|()| {
+            materialize_claim_paths(&exact)?;
+            if table.claim_conflicts_aggregate_excluding(&exact, &record.claim)? {
+                Ok(false)
+            } else {
+                table.promote_record_to_held(&record, &exact, &[])?;
+                Ok(true)
+            }
+        });
+        match commit {
+            Ok(true) => {
+                let held = HeldClaim::from_ticket(self)?;
+                drop(table);
+                drop(_lock);
+                notify_coordinator();
+                Ok(PendingOneShotResult::Acquired(value, held))
+            }
+            Ok(false) => {
+                table.remove_record(&record, false)?;
+                table.bump_generation()?;
+                self.finish_removed_record();
+                drop(table);
+                drop(_lock);
+                drop(value);
+                notify_coordinator();
+                Ok(PendingOneShotResult::Unavailable)
+            }
+            Err(error) => {
+                table.remove_record(&record, false)?;
+                table.bump_generation()?;
+                self.finish_removed_record();
+                drop(table);
+                drop(_lock);
+                drop(value);
+                notify_coordinator();
+                Err(error)
+            }
+        }
     }
 
     pub(super) fn pending_exec_handoff_parts(&self) -> Result<(u64, u64, std::os::fd::RawFd)> {
@@ -2150,6 +2274,7 @@ impl Ticket {
     /// admission probe needs a stronger boundary: leaving its dead PENDING
     /// claim for liveness pruning can make that probe fence itself while a
     /// different live ticket keeps the aggregate snapshot authoritative.
+    #[cfg(test)]
     pub(super) fn finish(&mut self, cancelled: Option<&AtomicBool>) -> Result<()> {
         let _namespace = self.namespace.enter();
         if self.finished {
@@ -2234,6 +2359,7 @@ impl Ticket {
         Ok(FinishAcquireResult::Committed(held))
     }
 
+    #[cfg(test)]
     fn remove_record_interruptible(&mut self, cancelled: Option<&AtomicBool>) -> Result<()> {
         let _namespace = self.namespace.enter();
         let _lock = lock_registry_interruptible_existing(cancelled)?;
@@ -2251,6 +2377,14 @@ impl Ticket {
             table.bump_generation()?;
         }
         Ok(())
+    }
+
+    fn finish_removed_record(&mut self) {
+        self.wake.take();
+        self._interrupt_waiter.take();
+        self.finished = true;
+        self.liveness.take();
+        let _ = std::fs::remove_file(&self.liveness_path);
     }
 }
 
@@ -7502,6 +7636,76 @@ impl Table {
             &read_words(B_CLAIM_LLC_EXCLUSIVE),
             self.layout.bits,
         )
+    }
+
+    /// Test one candidate against every live claim except one exact record
+    /// already owned by this caller. Reference counts make this O(resources)
+    /// without mutating the authoritative aggregate or scanning records.
+    fn claim_conflicts_aggregate_excluding(
+        &self,
+        candidate: &ClaimSet,
+        excluded: &ClaimSet,
+    ) -> Result<bool> {
+        validate_claim(candidate)?;
+        let count_after_excluding = |which: usize, index: usize, contributes: bool| {
+            if index >= self.layout.bits {
+                anyhow::bail!("resource index {index} exceeds queue registry capacity");
+            }
+            let count = read_u32(
+                &self.header,
+                self.layout.count_offset(which) + index * std::mem::size_of::<u32>(),
+            );
+            if contributes {
+                count.checked_sub(1).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "queue aggregate omitted the excluded claim at resource {index}"
+                    )
+                })
+            } else {
+                Ok(count)
+            }
+        };
+
+        let cpu_which = if candidate.cpu_mode == ClaimMode::Exclusive {
+            B_CLAIM_CPUS
+        } else {
+            B_CLAIM_CPU_EXCLUSIVE
+        };
+        for &cpu in &candidate.cpus {
+            let contributes = excluded.cpus.contains(&cpu)
+                && (cpu_which == B_CLAIM_CPUS || excluded.cpu_mode == ClaimMode::Exclusive);
+            if count_after_excluding(cpu_which, cpu, contributes)? != 0 {
+                return Ok(true);
+            }
+        }
+
+        let permit_which = if candidate.permit_mode == ClaimMode::Exclusive {
+            B_CLAIM_CPUS
+        } else {
+            B_CLAIM_CPU_EXCLUSIVE
+        };
+        for &permit in &candidate.permits {
+            let index = permit_resource_index(permit)?;
+            let contributes = excluded.permits.contains(&permit)
+                && (permit_which == B_CLAIM_CPUS || excluded.permit_mode == ClaimMode::Exclusive);
+            if count_after_excluding(permit_which, index, contributes)? != 0 {
+                return Ok(true);
+            }
+        }
+
+        let llc_which = if candidate.llc_mode == ClaimMode::Exclusive {
+            B_CLAIM_LLC_ANY
+        } else {
+            B_CLAIM_LLC_EXCLUSIVE
+        };
+        for &llc in &candidate.llcs {
+            let contributes = excluded.llcs.contains(&llc)
+                && (llc_which == B_CLAIM_LLC_ANY || excluded.llc_mode == ClaimMode::Exclusive);
+            if count_after_excluding(llc_which, llc, contributes)? != 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn blocker_serial(&self, key: ResourceKey, mode: FlockMode) -> Result<u64> {

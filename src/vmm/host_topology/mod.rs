@@ -4800,11 +4800,6 @@ where
     let memory_rotation = memory_pool.as_ref().map_or(0, |pool| {
         pid_window_offset(std::process::id(), pool.permits.len().max(1))
     });
-    anyhow::ensure!(
-        pending.is_none() || wait,
-        "a pending exec admission can only be activated by a waiting run"
-    );
-
     let target_cpus = match cpu_cap {
         Some(cap) => cap.effective_count(allowed_cpus)?,
         None => default_cpu_budget(allowed_cpus),
@@ -5055,6 +5050,101 @@ where
                     .any(|cpu| selected_cpus.contains(cpu))
             });
             selected_mems = plan_mems(&selected_cpus, topo);
+        }
+        if !wait && let Some(pending) = pending.take() {
+            let activated = protocol::try_activate_pending_once(pending, |probe| {
+                let Some(permit_selection) = permit_selection.as_ref() else {
+                    return Ok(None);
+                };
+                if selected.is_empty() {
+                    return Ok(None);
+                }
+                let all_permits = permit_selection.all_permits();
+                let exact = resource_claim_with_permits(
+                    &selected,
+                    LlcLockMode::Shared,
+                    &selected_cpus,
+                    FlockMode::Shared,
+                    &all_permits,
+                    permit_selection.admission_class,
+                );
+                let reusable = probe.clone_reusable_permits()?;
+                let locks = probe.try_acquire(&exact, || {
+                    if permit_admission == PermitAdmission::None {
+                        Ok(
+                            match acquire_fn(&selected, &selected_cpus, &snapshots)?
+                                .into_llc_lock_attempt()
+                            {
+                                LlcLockAttempt::Acquired(locks) => {
+                                    protocol::ProbeOutcome::Acquired(locks)
+                                }
+                                LlcLockAttempt::Contended(evidence) => {
+                                    protocol::ProbeOutcome::Contended(evidence)
+                                }
+                                #[cfg(test)]
+                                LlcLockAttempt::Unavailable => protocol::ProbeOutcome::Unavailable,
+                            },
+                        )
+                    } else {
+                        acquire_resources_with_permits_granted_reusing(
+                            &selected,
+                            LlcLockMode::Shared,
+                            &selected_cpus,
+                            FlockMode::Shared,
+                            &all_permits,
+                            &reusable,
+                        )
+                    }
+                })?;
+                Ok(locks.map(|locks| {
+                    (
+                        exact,
+                        (
+                            selected.clone(),
+                            snapshots.clone(),
+                            locks,
+                            selected_cpus.clone(),
+                            permit_selection.cpu_permits.clone(),
+                            permit_selection.memory_permits.clone(),
+                            selected_mems.clone(),
+                        ),
+                    )
+                }))
+            })?;
+            return match activated {
+                Some(acquired) => {
+                    let ((selected, snapshots, cpus, cpu_permits, memory_permits, mems), locks) =
+                        acquired.split_map(
+                            |(
+                                selected,
+                                snapshots,
+                                locks,
+                                cpus,
+                                cpu_permits,
+                                memory_permits,
+                                mems,
+                            )| {
+                                (
+                                    (selected, snapshots, cpus, cpu_permits, memory_permits, mems),
+                                    locks,
+                                )
+                            },
+                        );
+                    Ok(materialize_llc_plan(
+                        selected,
+                        snapshots,
+                        locks,
+                        cpus,
+                        cpu_permits,
+                        memory_permits,
+                        mems,
+                    ))
+                }
+                None => Err(ResourceContention {
+                    reason: format!("no {target_cpus}-CPU LLC placement was immediately available"),
+                }
+                .into()),
+            };
         }
         if pending.is_some() {
             // The pre-exec wrapper already owns its bounded CPU/memory/token

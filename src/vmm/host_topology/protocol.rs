@@ -1199,6 +1199,41 @@ pub(crate) struct PendingAdmission {
     preparation: Option<super::PreparationPermit>,
 }
 
+/// The only probe surface available while atomically consuming a PENDING
+/// admission. It can test candidates against external registry claims and
+/// reuse the preparation owner's permit OFDs, but cannot queue or retry.
+pub(crate) struct PendingOneShotProbe<'a> {
+    registry: &'a registry::PendingOneShotProbe<'a>,
+    reusable_permits: &'a [(usize, OwnedFd)],
+}
+
+impl PendingOneShotProbe<'_> {
+    pub(crate) fn candidate_ready(&self, candidate: &ClaimSet) -> Result<bool> {
+        self.registry.candidate_ready(candidate)
+    }
+
+    pub(crate) fn clone_reusable_permits(&self) -> Result<Vec<(usize, OwnedFd)>> {
+        self.reusable_permits
+            .iter()
+            .map(|(permit, fd)| Ok((*permit, fd.try_clone()?)))
+            .collect()
+    }
+
+    pub(crate) fn try_acquire<T>(
+        &self,
+        candidate: &ClaimSet,
+        acquire: impl FnOnce() -> Result<ProbeOutcome<T>>,
+    ) -> Result<Option<T>> {
+        if !self.candidate_ready(candidate)? {
+            return Ok(None);
+        }
+        Ok(match acquire()? {
+            ProbeOutcome::Acquired(value) => Some(value),
+            ProbeOutcome::Contended(_) | ProbeOutcome::Unavailable => None,
+        })
+    }
+}
+
 impl PendingAdmission {
     pub(crate) fn exec_handoff_parts(&self) -> Result<(u64, u64, std::os::fd::RawFd)> {
         self.ticket
@@ -1239,21 +1274,6 @@ impl PendingAdmission {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("pending preparation permit was already consumed"))?
             .restore_affinity()
-    }
-
-    /// Retire this PENDING publication before an immediate nonblocking probe.
-    ///
-    /// `Ticket::drop` is deliberately best-effort/nonblocking. Under a
-    /// registry writer storm that can leave this process's closed-liveness
-    /// claim in the aggregate until a coordinator prunes it, making the fresh
-    /// probe reject capacity which this very owner just released. Synchronous
-    /// retirement keeps the preparation flocks live until the claim has been
-    /// removed, then drops the complete owner on return.
-    pub(crate) fn retire_for_nonblocking_probe(mut self) -> Result<()> {
-        self.ticket
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("pending admission was already consumed"))?
-            .finish(None)
     }
 
     pub(crate) fn preparation_cpu_permits(&self) -> &[usize] {
@@ -1349,6 +1369,38 @@ impl PendingClaimForTests {
             .as_mut()
             .expect("test pending claim was already consumed")
             .finish(None)
+    }
+
+    pub(crate) fn try_activate_once<T>(
+        mut self,
+        exact: ClaimSet,
+        attempt: impl FnOnce() -> Result<Option<T>>,
+    ) -> Result<Option<Acquired<T>>> {
+        let mut ticket = self
+            .ticket
+            .take()
+            .expect("test pending claim was already consumed");
+        let expected = ticket_registry_snapshot_for_tests()?
+            .into_iter()
+            .find(|(candidate, _, _)| {
+                ticket
+                    .pending_exec_handoff_parts()
+                    .is_ok_and(|(_, owned, _)| *candidate == owned)
+            })
+            .map(|(_, _, claim)| claim)
+            .ok_or_else(|| anyhow::anyhow!("test PENDING claim disappeared"))?;
+        let activated = ticket.try_activate_pending_once(&expected, |probe| {
+            if !probe.candidate_ready(&exact)? {
+                return Ok(None);
+            }
+            Ok(attempt()?.map(|value| (exact, value)))
+        })?;
+        Ok(match activated {
+            registry::PendingOneShotResult::Acquired(value, held) => {
+                Some(Acquired::tracked(value, held))
+            }
+            registry::PendingOneShotResult::Unavailable => None,
+        })
     }
 }
 
@@ -1861,6 +1913,43 @@ pub(crate) fn activate_pending_ticket<T>(
     // published. It bounds resident prepared processes without causing the
     // exact claim to self-contend on its own CPU or memory resources.
     drive_registered_ticket(ticket, cancelled, &mut try_acquire, Some(preparation))
+}
+
+/// Consume a PENDING pre-exec owner with exactly one nonblocking planning
+/// callback. The preparation flocks and registry record remain continuous
+/// until an acquired exact payload has replaced them in the same slot; a miss
+/// removes the record synchronously and never enters the queue protocol.
+pub(crate) fn try_activate_pending_once<T>(
+    mut pending: PendingAdmission,
+    attempt: impl FnOnce(&PendingOneShotProbe<'_>) -> Result<Option<(ClaimSet, T)>>,
+) -> Result<Option<Acquired<T>>> {
+    let (mut ticket, preparation) = pending.take_parts()?;
+    anyhow::ensure!(
+        !preparation.affinity_constrained,
+        "preparation affinity must be restored before one-shot activation",
+    );
+    let expected_preparation = preparation.claim();
+    let reusable_permits = preparation.clone_permit_fds()?;
+    let activated = ticket.try_activate_pending_once(&expected_preparation, move |registry| {
+        let probe = PendingOneShotProbe {
+            registry,
+            reusable_permits: &reusable_permits,
+        };
+        let result = attempt(&probe);
+        // The acquired payload owns clones of every reused OFD it needs. Drop
+        // both preparation copies while registry EX still excludes new
+        // publications, before the record is promoted to exact HELD.
+        drop(probe);
+        drop(reusable_permits);
+        drop(preparation);
+        result
+    })?;
+    Ok(match activated {
+        registry::PendingOneShotResult::Acquired(value, held) => {
+            Some(Acquired::tracked(value, held))
+        }
+        registry::PendingOneShotResult::Unavailable => None,
+    })
 }
 
 fn drive_registered_ticket<T>(
