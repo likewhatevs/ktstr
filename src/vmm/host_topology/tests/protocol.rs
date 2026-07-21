@@ -10,6 +10,57 @@ use super::*;
 static INTERRUPTIBLE_FLOCK_BROKER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
+fn sustained_wait_diagnostics_use_a_bounded_cross_process_ring() {
+    let _prefixes = LockPrefixesGuard::new();
+    let diagnostics = tempfile::TempDir::new().expect("queue diagnostics tempdir");
+    let mut pending = Vec::new();
+    for llc in 0usize..(64 + 6) {
+        pending.push(
+            protocol::register_pending_claim_for_tests(protocol::ClaimSet::with_modes(
+                [llc],
+                std::iter::empty(),
+                crate::flock::FlockMode::Shared,
+                crate::flock::FlockMode::Shared,
+            ))
+            .expect("publish disjoint diagnostic fixture"),
+        );
+    }
+
+    for bucket in 100u64..112 {
+        protocol::persist_wait_diagnostic_for_tests(diagnostics.path(), bucket)
+            .expect("persist bounded queue diagnostic");
+    }
+
+    let mut text_files = Vec::new();
+    let mut lock_files = Vec::new();
+    for entry in std::fs::read_dir(diagnostics.path()).expect("list queue diagnostics") {
+        let path = entry.expect("queue diagnostic entry").path();
+        match path.extension().and_then(std::ffi::OsStr::to_str) {
+            Some("txt") => text_files.push(path),
+            Some("lock") => lock_files.push(path),
+            other => panic!("unexpected queue diagnostic artifact extension: {other:?}"),
+        }
+    }
+    assert_eq!(
+        text_files.len(),
+        8,
+        "the snapshot ring must stay fixed-size"
+    );
+    assert_eq!(
+        lock_files.len(),
+        8,
+        "the writer-lock ring must stay fixed-size"
+    );
+    let newest = diagnostics.path().join("queue-wait-07.txt");
+    let rendered = std::fs::read_to_string(&newest).expect("read newest queue diagnostic");
+    assert!(rendered.starts_with("bucket=111\n"));
+    assert!(rendered.contains("records_rendered=64 records_truncated=true"));
+    assert!(rendered.len() <= 128 * 1024 + "\ntruncated_bytes=true\n".len());
+
+    drop(pending);
+}
+
+#[test]
 fn pending_activation_republishes_an_overlapping_watch_observation() {
     let _prefixes = LockPrefixesGuard::new();
     let (watched, candidate, pending) =

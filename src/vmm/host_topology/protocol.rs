@@ -199,6 +199,8 @@ const OBSERVATION_RETRY_FALLBACK: Duration = Duration::from_secs(5);
 /// only a missed-event recovery tick; it avoids turning hundreds of queued
 /// cells into a synchronized `/proc/locks` polling herd.
 const WAITER_CRASH_RECOVERY_BASE: Duration = Duration::from_secs(3);
+const WAIT_DIAGNOSTIC_INITIAL_DELAY: Duration = Duration::from_secs(10);
+const WAIT_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(30);
 /// Bound the watch-install handoff gap without making every short-lived
 /// coordinator scan the full registry. The first coordinator that remains
 /// active past this shared, non-postponable deadline performs one sweep;
@@ -1209,7 +1211,7 @@ pub(crate) fn set_held_drop_hook_for_tests(hook: impl FnOnce() + 'static) {
 
 pub(crate) enum TicketWork<T> {
     Acquired(Acquired<T>),
-    Coordinator(CoordinatorTicket),
+    Coordinator(Box<CoordinatorTicket>),
 }
 
 /// Same-PID pre-exec admission identity. Its registry record and physical
@@ -1663,6 +1665,11 @@ pub(crate) fn ticket_registry_snapshot_for_tests() -> Result<Vec<(u64, u32, Clai
 #[cfg(test)]
 pub(crate) fn ticket_registry_diagnostics_for_tests() -> Result<String> {
     registry::diagnostics_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn persist_wait_diagnostic_for_tests(root: &std::path::Path, bucket: u64) -> Result<()> {
+    registry::persist_wait_diagnostic(root, bucket, bucket * 30)
 }
 
 #[cfg(test)]
@@ -2306,11 +2313,11 @@ fn drive_registered_ticket<T>(
             cancelled,
         )? {
             registry::State::Coordinator => {
-                return Ok(TicketWork::Coordinator(CoordinatorTicket {
+                return Ok(TicketWork::Coordinator(Box::new(CoordinatorTicket {
                     ticket,
                     preparation,
                     preparation_watch: None,
-                }));
+                })));
             }
             registry::State::Granted | registry::State::Replan => {
                 let reusable_permits = preparation
@@ -2878,10 +2885,10 @@ impl HolderObserver {
 /// state after each relevant wake; the ticket's exact claim is updated before
 /// compatible successors are granted.
 pub(in crate::vmm) fn acquire_as_coordinator<T>(
-    coordinator: CoordinatorTicket,
+    coordinator: impl Into<Box<CoordinatorTicket>>,
     step: impl FnMut(&mut HeldLocks) -> Result<CoordinatorStep<T>>,
 ) -> Result<CoordinatorOutcome<T>> {
-    acquire_as_coordinator_impl(coordinator, None, step)
+    acquire_as_coordinator_impl(*coordinator.into(), None, step)
 }
 
 /// Cancellation-aware variant of [`acquire_as_coordinator`].
@@ -2890,11 +2897,11 @@ pub(in crate::vmm) fn acquire_as_coordinator<T>(
 /// waiter-to-coordinator transition, so cancellation interrupts inotify rather
 /// than waiting for the fallback tick.
 pub(in crate::vmm) fn acquire_as_coordinator_interruptible<T>(
-    coordinator: CoordinatorTicket,
+    coordinator: impl Into<Box<CoordinatorTicket>>,
     cancelled: &AtomicBool,
     step: impl FnMut(&mut HeldLocks) -> Result<CoordinatorStep<T>>,
 ) -> Result<CoordinatorOutcome<T>> {
-    acquire_as_coordinator_impl(coordinator, Some(cancelled), step)
+    acquire_as_coordinator_impl(*coordinator.into(), Some(cancelled), step)
 }
 
 fn acquire_as_coordinator_impl<T>(
@@ -2924,9 +2931,15 @@ fn acquire_as_coordinator_impl<T>(
     let mut force_step = false;
     let mut retry_due = false;
     let mut retry_deadline = std::time::Instant::now() + COORDINATOR_WAKE_FALLBACK;
+    let mut wait_diagnostic_deadline = std::time::Instant::now() + WAIT_DIAGNOSTIC_INITIAL_DELAY;
     let mut pending_events = LockDirEvents::default();
     let outcome = loop {
         super::tick_reservation_wait_progress();
+        let diagnostic_now = std::time::Instant::now();
+        if diagnostic_now >= wait_diagnostic_deadline {
+            registry::persist_wait_diagnostic_if_enabled();
+            wait_diagnostic_deadline = diagnostic_now + WAIT_DIAGNOSTIC_INTERVAL;
+        }
         check_interrupted(cancelled)?;
         pending_events.merge(check_result(watch.drain(&watched_resources), cancelled)?);
         let drain_backlog = pending_events.backlog;
