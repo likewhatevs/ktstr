@@ -1426,6 +1426,24 @@ const CACHED_CARGO_BUILD_KTSTR_RUNTIME_ENVIRONMENT: &[&str] = &[
     "KTSTR_WPROF_PATH",
 ];
 
+/// Per-service coordinates installed by systemd for the current runner.
+///
+/// The directory variables are the complete family documented by
+/// `systemd.exec` for the corresponding `*Directory=` settings, plus the
+/// credentials directory. The memory-pressure values similarly identify
+/// service-manager-owned runtime endpoints. Their paths differ per runner and
+/// service instance, but none describe bytes requested from a Cargo producer.
+pub(crate) const CACHED_CARGO_BUILD_SYSTEMD_RUNTIME_ENVIRONMENT: &[&str] = &[
+    "CACHE_DIRECTORY",
+    "CONFIGURATION_DIRECTORY",
+    "CREDENTIALS_DIRECTORY",
+    "LOGS_DIRECTORY",
+    "MEMORY_PRESSURE_WATCH",
+    "MEMORY_PRESSURE_WRITE",
+    "RUNTIME_DIRECTORY",
+    "STATE_DIRECTORY",
+];
+
 /// Operational cache controls are intentionally inherited by a producer, but
 /// cannot describe its output bytes and therefore must not enter its key.
 /// In particular, ghars supplies one trust-zone-wide `KTSTR_CACHE_DIR`; the
@@ -1439,9 +1457,10 @@ const SCHEDULER_BUILD_PRESERVED_OPERATIONAL_ENVIRONMENT: &[&str] =
 /// recursive verifier, and scheduler builds share this classification.
 pub(crate) fn cached_cargo_build_environment_is_runtime(name: &std::ffi::OsStr) -> bool {
     crate::nextest_process::is_runtime_environment(name)
-        || name
-            .to_str()
-            .is_some_and(|name| CACHED_CARGO_BUILD_KTSTR_RUNTIME_ENVIRONMENT.contains(&name))
+        || name.to_str().is_some_and(|name| {
+            CACHED_CARGO_BUILD_KTSTR_RUNTIME_ENVIRONMENT.contains(&name)
+                || CACHED_CARGO_BUILD_SYSTEMD_RUNTIME_ENVIRONMENT.contains(&name)
+        })
 }
 
 fn scheduler_build_environment_is_nonsemantic(name: &std::ffi::OsStr) -> bool {
@@ -1624,16 +1643,20 @@ pub(crate) fn scheduler_build_environment(
     scheduler_build_environment_from(workspace_root, std::env::vars_os().collect(), cancelled)
 }
 
-/// Remove cargo-ktstr's run-instance state from a scheduler Cargo child.
+/// Remove run-instance state from a scheduler Cargo child.
 ///
 /// These variables select kernels, result directories, admission modes, and
-/// verifier ownership after the scheduler artifact already exists. Letting a
-/// matrix cell's unique paths reach the child both exposes irrelevant inputs
-/// to build scripts and defeats the machine-wide content-addressed scheduler
-/// cache. Compiler wrappers and build-affecting variables remain inherited;
-/// only ktstr runtime orchestration is stripped.
+/// verifier ownership after the scheduler artifact already exists, or point at
+/// systemd runtime resources belonging to one runner service. Letting those
+/// unique paths reach the child both exposes irrelevant inputs to build scripts
+/// and defeats the machine-wide content-addressed scheduler cache. Compiler
+/// wrappers, operational cache controls, and build-affecting variables remain
+/// inherited.
 fn sanitize_scheduler_build_child_environment(command: &mut Command) {
-    for &name in CACHED_CARGO_BUILD_KTSTR_RUNTIME_ENVIRONMENT {
+    for &name in CACHED_CARGO_BUILD_KTSTR_RUNTIME_ENVIRONMENT
+        .iter()
+        .chain(CACHED_CARGO_BUILD_SYSTEMD_RUNTIME_ENVIRONMENT)
+    {
         command.env_remove(name);
     }
     command.env_remove("LLVM_PROFILE_FILE");
@@ -3154,6 +3177,16 @@ mod tests {
                     )
                 }),
         );
+        environment.extend(
+            CACHED_CARGO_BUILD_SYSTEMD_RUNTIME_ENVIRONMENT
+                .iter()
+                .map(|name| {
+                    (
+                        std::ffi::OsString::from(*name),
+                        std::ffi::OsString::from(format!("systemd-runtime-{name}")),
+                    )
+                }),
+        );
         environment.push(("LLVM_PROFILE_FILE".into(), "/tmp/profile-%p.profraw".into()));
         environment.extend(
             SCHEDULER_BUILD_PRESERVED_OPERATIONAL_ENVIRONMENT
@@ -3187,6 +3220,11 @@ mod tests {
         for operational in ["PWD", "GITHUB_RUN_ID", "SCCACHE_IDLE_TIMEOUT"]
             .into_iter()
             .chain(CACHED_CARGO_BUILD_KTSTR_RUNTIME_ENVIRONMENT.iter().copied())
+            .chain(
+                CACHED_CARGO_BUILD_SYSTEMD_RUNTIME_ENVIRONMENT
+                    .iter()
+                    .copied(),
+            )
             .chain(
                 SCHEDULER_BUILD_PRESERVED_OPERATIONAL_ENVIRONMENT
                     .iter()
@@ -3236,6 +3274,30 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_identity_ignores_systemd_service_coordinates() {
+        let workspace = Path::new("/runner/work/ktstr");
+        let identity = |runner: &str| {
+            let mut environment = vec![
+                ("RUSTC_WRAPPER".into(), "/usr/local/bin/sccache".into()),
+                ("SCHEDULER_FIXTURE_MODE".into(), "semantic".into()),
+            ];
+            environment.extend(
+                CACHED_CARGO_BUILD_SYSTEMD_RUNTIME_ENVIRONMENT
+                    .iter()
+                    .map(|name| ((*name).into(), format!("/run/{runner}/{name}").into())),
+            );
+            scheduler_build_environment_from(workspace, environment, &|| false)
+                .expect("scheduler environment identity")
+        };
+
+        assert_eq!(
+            identity("runner-1"),
+            identity("runner-9"),
+            "systemd's per-service directories and pressure endpoints must not split the scheduler cache",
+        );
+    }
+
+    #[test]
     fn scheduler_build_child_removes_runtime_orchestration_but_keeps_sccache() {
         let mut command = Command::new("cargo");
         command
@@ -3248,6 +3310,9 @@ mod tests {
             .env("SCHEDULER_FIXTURE_MODE", "semantic");
         for &name in CACHED_CARGO_BUILD_KTSTR_RUNTIME_ENVIRONMENT {
             command.env(name, format!("runtime-{name}"));
+        }
+        for &name in CACHED_CARGO_BUILD_SYSTEMD_RUNTIME_ENVIRONMENT {
+            command.env(name, format!("systemd-runtime-{name}"));
         }
         command
             .env("KTSTR_CACHE_DIR", "/var/cache/ktstr")
@@ -3263,6 +3328,11 @@ mod tests {
         for removed in CACHED_CARGO_BUILD_KTSTR_RUNTIME_ENVIRONMENT
             .iter()
             .copied()
+            .chain(
+                CACHED_CARGO_BUILD_SYSTEMD_RUNTIME_ENVIRONMENT
+                    .iter()
+                    .copied(),
+            )
             .chain([
                 "LLVM_PROFILE_FILE",
                 "NEXTEST",

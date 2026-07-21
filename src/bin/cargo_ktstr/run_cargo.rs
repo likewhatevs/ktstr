@@ -8028,6 +8028,69 @@ path = "junit.xml"
         );
     }
 
+    #[test]
+    fn harness_producer_ignores_and_removes_systemd_service_coordinates() {
+        let environment = |runner: &str| {
+            let mut environment = vec![(
+                OsString::from("SCHEDULER_FIXTURE_MODE"),
+                OsString::from("semantic"),
+            )];
+            environment.extend(
+                crate::verifier::CACHED_CARGO_BUILD_SYSTEMD_RUNTIME_ENVIRONMENT
+                    .iter()
+                    .map(|name| {
+                        (
+                            OsString::from(*name),
+                            OsString::from(format!("/run/{runner}/{name}")),
+                        )
+                    }),
+            );
+            environment
+        };
+        let first = environment("runner-1");
+        let second = environment("runner-9");
+
+        assert_eq!(
+            producer_environment_identity(&first).unwrap(),
+            producer_environment_identity(&second).unwrap(),
+            "systemd's per-service directories and pressure endpoints must not split the harness cache",
+        );
+
+        let stable = stable_cargo_producer_environment(&second);
+        assert_eq!(
+            stable,
+            vec![
+                (
+                    OsString::from("SCHEDULER_FIXTURE_MODE"),
+                    OsString::from("semantic"),
+                ),
+                (OsString::from("CARGO_INCREMENTAL"), OsString::from("0")),
+            ],
+            "only semantic inputs and the forced incremental setting reach the normalized producer",
+        );
+
+        let command = nextest_binary_list_command(
+            Path::new("/stable/workspace"),
+            Path::new("/stable/output"),
+            &[],
+            false,
+            &second,
+        );
+        let command_environment = cmd_env_map(&command);
+        for &removed in crate::verifier::CACHED_CARGO_BUILD_SYSTEMD_RUNTIME_ENVIRONMENT {
+            assert_eq!(
+                command_environment.get(OsStr::new(removed)),
+                Some(&None),
+                "{removed} must be explicitly absent from the harness Cargo producer",
+            );
+        }
+        assert_eq!(
+            command_environment.get(OsStr::new("SCHEDULER_FIXTURE_MODE")),
+            Some(&Some(OsString::from("semantic"))),
+            "arbitrary build-script inputs must remain visible to the harness producer",
+        );
+    }
+
     // -- prebuilt_blob_bin_envs --
     //
     // cargo-ktstr re-exports its extracted busybox / wprof paths to the

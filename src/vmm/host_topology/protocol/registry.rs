@@ -6928,6 +6928,7 @@ impl Table {
         Ok(read_u64(bytes, R_PREFIX_EPOCH))
     }
 
+    #[cfg(test)]
     fn set_record_backfill_capacity(&mut self, slot: u64, capacity: u32) -> Result<()> {
         let maximum = self
             .record(slot)?
