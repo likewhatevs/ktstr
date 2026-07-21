@@ -1383,6 +1383,42 @@ fn isolate_wprof_subcrate_workspaces(wprof_src: &std::path::Path) {
     }
 }
 
+#[cfg(feature = "vendored")]
+const BUSYBOX_HERMETIC_MAKE_ASSIGNMENTS: &[(&str, &str)] =
+    &[("KBUILD_OUTPUT", ""), ("KCONFIG_CONFIG", ".config")];
+
+#[cfg(feature = "vendored")]
+const BUSYBOX_KEYED_BUILD_ENVIRONMENT: &[&str] = &[
+    "ARCH",
+    "CFLAGS",
+    "CPPFLAGS",
+    "HOSTCFLAGS",
+    "HOSTLDFLAGS",
+    "KBUILD_BUILD_HOST",
+    "KBUILD_BUILD_TIMESTAMP",
+    "KBUILD_BUILD_USER",
+    "KCFLAGS",
+    "KCONFIG_ALLCONFIG",
+    "KCPPFLAGS",
+    "LDFLAGS",
+    "SOURCE_DATE_EPOCH",
+];
+
+/// Keep the shared BusyBox builder inside its elected CAS stage.
+///
+/// BusyBox's kbuild accepts both variables from the ambient environment. An
+/// operator's kernel-build setup could otherwise send the output to a shared
+/// `KBUILD_OUTPUT` directory or make our config edits target a different file
+/// than kconfig reads. Command-line assignments are stronger than inherited
+/// environment and propagate to recursive makes; removing the environment
+/// entries as well makes the child contract explicit in diagnostics.
+#[cfg(feature = "vendored")]
+fn configure_hermetic_busybox_make(command: &mut std::process::Command) {
+    for (name, value) in BUSYBOX_HERMETIC_MAKE_ASSIGNMENTS {
+        command.env_remove(name).arg(format!("{name}={value}"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1397,6 +1433,40 @@ mod tests {
             root.ends_with("build-blobs-v1/fixture"),
             "cache root must carry schema and namespace: {root:?}",
         );
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn busybox_make_forces_source_local_output_and_config() {
+        let mut command = std::process::Command::new("make");
+        configure_hermetic_busybox_make(&mut command);
+
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            ["KBUILD_OUTPUT=", "KCONFIG_CONFIG=.config"],
+            "command-line make assignments must override both environment and recursive make state"
+        );
+        let removals = command
+            .get_envs()
+            .filter_map(|(name, value)| {
+                value.is_none().then(|| name.to_string_lossy().into_owned())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            removals,
+            ["KBUILD_OUTPUT", "KCONFIG_CONFIG"],
+            "ambient redirect variables must not reach BusyBox make"
+        );
+        for (name, _) in BUSYBOX_HERMETIC_MAKE_ASSIGNMENTS {
+            assert!(
+                !BUSYBOX_KEYED_BUILD_ENVIRONMENT.contains(name),
+                "ignored ambient redirect {name} must not create useless shared-cache splits"
+            );
+        }
     }
 
     #[test]

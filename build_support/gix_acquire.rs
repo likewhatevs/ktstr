@@ -36,18 +36,41 @@ const MAX_PARALLEL_SOURCE_NODES: usize = 8;
 const MAX_SUBMODULE_DEPTH: usize = 32;
 
 /// Return ktstr's persistent cache root, if the host exposes an absolute
-/// XDG/HOME cache location.
+/// cache location.
+///
+/// `KTSTR_CACHE_DIR` is the machine/trust-zone root and therefore takes
+/// precedence verbatim. The ordinary XDG/HOME fallbacks retain the `ktstr`
+/// component they have historically supplied. An explicitly selected
+/// relative `KTSTR_CACHE_DIR` disables cross-process source reuse instead of
+/// silently publishing into a different cache root.
 pub(crate) fn cache_root(namespace: &str) -> Option<PathBuf> {
-    let root = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
+    cache_root_from_values(
+        namespace,
+        std::env::var_os("KTSTR_CACHE_DIR").map(PathBuf::from),
+        std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+pub(crate) fn cache_root_from_values(
+    namespace: &str,
+    ktstr_cache_dir: Option<PathBuf>,
+    xdg_cache_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(root) = ktstr_cache_dir.filter(|path| !path.as_os_str().is_empty()) {
+        return root
+            .is_absolute()
+            .then(|| root.join("content-v1").join(namespace));
+    }
+    let root = xdg_cache_home
+        .filter(|path| !path.as_os_str().is_empty() && path.is_absolute())
+        .map(|root| root.join("ktstr"))
         .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .filter(|path| path.is_absolute())
-                .map(|home| home.join(".cache"))
+            home.filter(|path| !path.as_os_str().is_empty() && path.is_absolute())
+                .map(|home| home.join(".cache/ktstr"))
         })?;
-    Some(root.join("ktstr").join("content-v1").join(namespace))
+    Some(root.join("content-v1").join(namespace))
 }
 
 /// Fixed-seed, non-cryptographic content identifier.
@@ -87,13 +110,13 @@ pub(crate) fn cache_entry(root: &Path, parts: &[&str]) -> PathBuf {
     root.join(content_id(parts))
 }
 
-/// Test-facing adapter around the fully cancellable cache implementation.
+/// Synchronous adapter around the fully cancellable cache implementation.
 ///
-/// Production callers use the cancellable entry points below. Keeping this
-/// adapter test-only lets the cross-process integration fixture exercise the
-/// same election and publication path without carrying an otherwise unused
-/// build-script symbol.
-#[cfg(test)]
+/// The root build script uses the cancellable entry point directly, while
+/// independently included consumers such as `scx-ktstr/build.rs` and the
+/// cross-process fixture use this simpler form. Some include sites therefore
+/// do not reference it even though other production include sites do.
+#[allow(dead_code)]
 pub(crate) fn ensure_cached<Complete, Build>(
     root: &Path,
     parts: &[&str],

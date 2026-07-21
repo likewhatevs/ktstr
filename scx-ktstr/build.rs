@@ -45,6 +45,9 @@ fn scx_source_stamp() -> String {
 
 fn main() {
     println!("cargo:rerun-if-changed=../build_support/gix_acquire.rs");
+    for variable in ["KTSTR_CACHE_DIR", "XDG_CACHE_HOME", "HOME"] {
+        println!("cargo:rerun-if-env-changed={variable}");
+    }
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let scx_lib = out_dir.join("scx-lib");
 

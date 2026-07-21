@@ -432,8 +432,8 @@ int main(void) {{
     // tarball-fetch-failed case more cleanly.
     const BUSYBOX_URL: &str = "https://github.com/mirror/busybox/archive/refs/tags/1_36_1.tar.gz";
     const BUSYBOX_REVISION: &str = "busybox-1_36_1";
-    const BUSYBOX_BUILD_RECIPE: &str =
-        "busybox-static-v2:defconfig;CONFIG_STATIC=y;CONFIG_TC=n;oldconfig-null";
+    const BUSYBOX_BUILD_RECIPE: &str = "busybox-static-v3:defconfig;CONFIG_STATIC=y;\
+         CONFIG_TC=n;oldconfig-null;KBUILD_OUTPUT=;KCONFIG_CONFIG=.config";
     let busybox_bin = out_dir.join("busybox");
     let busybox_stamp = out_dir.join(".busybox-content-key");
     println!("cargo:rerun-if-env-changed=KTSTR_SKIP_BUSYBOX_BUILD");
@@ -701,6 +701,7 @@ impl BusyboxBuildTools {
     }
 
     fn configure_make(&self, make: &mut cargo_make::CargoCoordinatedMake) {
+        configure_hermetic_busybox_make(make);
         for (name, value) in &self.assignments {
             make.arg(format!("{name}={value}"));
         }
@@ -813,23 +814,6 @@ impl BusyboxBuildTools {
 
 #[cfg(feature = "vendored")]
 fn busybox_build_environment_fingerprint() -> String {
-    const VARIABLES: &[&str] = &[
-        "ARCH",
-        "CFLAGS",
-        "CPPFLAGS",
-        "HOSTCFLAGS",
-        "HOSTLDFLAGS",
-        "KBUILD_BUILD_HOST",
-        "KBUILD_BUILD_TIMESTAMP",
-        "KBUILD_BUILD_USER",
-        "KBUILD_OUTPUT",
-        "KCFLAGS",
-        "KCONFIG_ALLCONFIG",
-        "KCONFIG_CONFIG",
-        "KCPPFLAGS",
-        "LDFLAGS",
-        "SOURCE_DATE_EPOCH",
-    ];
     const TOOL_VARIABLES: &[&str] = &[
         "AR",
         "AS",
@@ -855,7 +839,7 @@ fn busybox_build_environment_fingerprint() -> String {
         println!("cargo:rerun-if-env-changed={variable}");
     }
     let mut fingerprint = String::new();
-    for variable in VARIABLES {
+    for variable in BUSYBOX_KEYED_BUILD_ENVIRONMENT {
         println!("cargo:rerun-if-env-changed={variable}");
         let value = std::env::var_os(variable);
         fingerprint.push_str(variable);

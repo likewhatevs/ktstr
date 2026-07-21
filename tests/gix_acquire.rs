@@ -142,6 +142,35 @@ const HELPER_GATE: &str = "KTSTR_GIX_ACQUIRE_HELPER_GATE";
 const HELPER_COUNT: &str = "KTSTR_GIX_ACQUIRE_HELPER_COUNT";
 const PROCESS_PARTS: &[&str] = &["fixture", "cross-process-builder"];
 
+#[test]
+fn cache_root_prefers_the_shared_ktstr_trust_zone() {
+    let root = gix_acquire::cache_root_from_values(
+        "source-nodes",
+        Some(PathBuf::from("/trust-zone/.ktstr")),
+        Some(PathBuf::from("/runner/cache")),
+        Some(PathBuf::from("/runner/home")),
+    );
+    assert_eq!(
+        root,
+        Some(PathBuf::from("/trust-zone/.ktstr/content-v1/source-nodes")),
+        "source-node reuse must follow KTSTR_CACHE_DIR across runner homes"
+    );
+}
+
+#[test]
+fn relative_shared_cache_does_not_fall_through_to_a_different_root() {
+    let root = gix_acquire::cache_root_from_values(
+        "source-nodes",
+        Some(PathBuf::from("relative-cache")),
+        Some(PathBuf::from("/runner/cache")),
+        Some(PathBuf::from("/runner/home")),
+    );
+    assert_eq!(
+        root, None,
+        "an invalid explicit trust-zone root must degrade to the caller's private cache, not silently publish under XDG/HOME"
+    );
+}
+
 fn spawn_cache_helper(root: &Path, gate: &Path, count: &Path, mode: &str) -> std::process::Child {
     Command::new(std::env::current_exe().expect("current integration-test executable"))
         .args([
