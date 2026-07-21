@@ -1444,6 +1444,15 @@ pub(crate) const CACHED_CARGO_BUILD_SYSTEMD_RUNTIME_ENVIRONMENT: &[&str] = &[
     "STATE_DIRECTORY",
 ];
 
+/// Per-job GitHub Actions and runner logging coordinates.
+///
+/// These values differ between matrix jobs which otherwise compile the exact
+/// same Cargo closure. They only identify the Actions orchestration stream and
+/// state/log sinks; cached producers neither consume nor publish through those
+/// endpoints, so strip them from both the identity and the child environment.
+pub(crate) const CACHED_CARGO_BUILD_CI_RUNTIME_ENVIRONMENT: &[&str] =
+    &["ACTIONS_ORCHESTRATION_ID", "GITHUB_STATE", "LOG_NAMESPACE"];
+
 /// Operational cache controls are intentionally inherited by a producer, but
 /// cannot describe its output bytes and therefore must not enter its key.
 /// In particular, ghars supplies one trust-zone-wide `KTSTR_CACHE_DIR`; the
@@ -1460,6 +1469,7 @@ pub(crate) fn cached_cargo_build_environment_is_runtime(name: &std::ffi::OsStr) 
         || name.to_str().is_some_and(|name| {
             CACHED_CARGO_BUILD_KTSTR_RUNTIME_ENVIRONMENT.contains(&name)
                 || CACHED_CARGO_BUILD_SYSTEMD_RUNTIME_ENVIRONMENT.contains(&name)
+                || CACHED_CARGO_BUILD_CI_RUNTIME_ENVIRONMENT.contains(&name)
         })
 }
 
@@ -1656,6 +1666,7 @@ fn sanitize_scheduler_build_child_environment(command: &mut Command) {
     for &name in CACHED_CARGO_BUILD_KTSTR_RUNTIME_ENVIRONMENT
         .iter()
         .chain(CACHED_CARGO_BUILD_SYSTEMD_RUNTIME_ENVIRONMENT)
+        .chain(CACHED_CARGO_BUILD_CI_RUNTIME_ENVIRONMENT)
     {
         command.env_remove(name);
     }
@@ -3187,6 +3198,16 @@ mod tests {
                     )
                 }),
         );
+        environment.extend(
+            CACHED_CARGO_BUILD_CI_RUNTIME_ENVIRONMENT
+                .iter()
+                .map(|name| {
+                    (
+                        std::ffi::OsString::from(*name),
+                        std::ffi::OsString::from(format!("ci-runtime-{name}")),
+                    )
+                }),
+        );
         environment.push(("LLVM_PROFILE_FILE".into(), "/tmp/profile-%p.profraw".into()));
         environment.extend(
             SCHEDULER_BUILD_PRESERVED_OPERATIONAL_ENVIRONMENT
@@ -3225,6 +3246,7 @@ mod tests {
                     .iter()
                     .copied(),
             )
+            .chain(CACHED_CARGO_BUILD_CI_RUNTIME_ENVIRONMENT.iter().copied())
             .chain(
                 SCHEDULER_BUILD_PRESERVED_OPERATIONAL_ENVIRONMENT
                     .iter()
@@ -3274,7 +3296,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_identity_ignores_systemd_service_coordinates() {
+    fn scheduler_identity_ignores_service_and_ci_coordinates() {
         let workspace = Path::new("/runner/work/ktstr");
         let identity = |runner: &str| {
             let mut environment = vec![
@@ -3286,6 +3308,11 @@ mod tests {
                     .iter()
                     .map(|name| ((*name).into(), format!("/run/{runner}/{name}").into())),
             );
+            environment.extend(
+                CACHED_CARGO_BUILD_CI_RUNTIME_ENVIRONMENT
+                    .iter()
+                    .map(|name| ((*name).into(), format!("{runner}-{name}").into())),
+            );
             scheduler_build_environment_from(workspace, environment, &|| false)
                 .expect("scheduler environment identity")
         };
@@ -3293,7 +3320,7 @@ mod tests {
         assert_eq!(
             identity("runner-1"),
             identity("runner-9"),
-            "systemd's per-service directories and pressure endpoints must not split the scheduler cache",
+            "service and CI control-plane coordinates must not split the scheduler cache",
         );
     }
 
@@ -3314,6 +3341,9 @@ mod tests {
         for &name in CACHED_CARGO_BUILD_SYSTEMD_RUNTIME_ENVIRONMENT {
             command.env(name, format!("systemd-runtime-{name}"));
         }
+        for &name in CACHED_CARGO_BUILD_CI_RUNTIME_ENVIRONMENT {
+            command.env(name, format!("ci-runtime-{name}"));
+        }
         command
             .env("KTSTR_CACHE_DIR", "/var/cache/ktstr")
             .env("KTSTR_GHA_CACHE", "1")
@@ -3333,6 +3363,7 @@ mod tests {
                     .iter()
                     .copied(),
             )
+            .chain(CACHED_CARGO_BUILD_CI_RUNTIME_ENVIRONMENT.iter().copied())
             .chain([
                 "LLVM_PROFILE_FILE",
                 "NEXTEST",

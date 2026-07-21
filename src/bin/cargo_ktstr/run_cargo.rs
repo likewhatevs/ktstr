@@ -8666,7 +8666,7 @@ path = "junit.xml"
     }
 
     #[test]
-    fn harness_producer_ignores_and_removes_systemd_service_coordinates() {
+    fn harness_producer_ignores_and_removes_service_and_ci_coordinates() {
         let environment = |runner: &str| {
             let mut environment = vec![(
                 OsString::from("SCHEDULER_FIXTURE_MODE"),
@@ -8682,6 +8682,16 @@ path = "junit.xml"
                         )
                     }),
             );
+            environment.extend(
+                crate::verifier::CACHED_CARGO_BUILD_CI_RUNTIME_ENVIRONMENT
+                    .iter()
+                    .map(|name| {
+                        (
+                            OsString::from(*name),
+                            OsString::from(format!("{runner}-{name}")),
+                        )
+                    }),
+            );
             environment
         };
         let first = environment("runner-1");
@@ -8690,7 +8700,7 @@ path = "junit.xml"
         assert_eq!(
             producer_environment_identity(&first).unwrap(),
             producer_environment_identity(&second).unwrap(),
-            "systemd's per-service directories and pressure endpoints must not split the harness cache",
+            "service and CI control-plane coordinates must not split the harness cache",
         );
 
         let stable = stable_cargo_producer_environment(&second);
@@ -8714,7 +8724,10 @@ path = "junit.xml"
             &second,
         );
         let command_environment = cmd_env_map(&command);
-        for &removed in crate::verifier::CACHED_CARGO_BUILD_SYSTEMD_RUNTIME_ENVIRONMENT {
+        for &removed in crate::verifier::CACHED_CARGO_BUILD_SYSTEMD_RUNTIME_ENVIRONMENT
+            .iter()
+            .chain(crate::verifier::CACHED_CARGO_BUILD_CI_RUNTIME_ENVIRONMENT)
+        {
             assert_eq!(
                 command_environment.get(OsStr::new(removed)),
                 Some(&None),
