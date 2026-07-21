@@ -264,13 +264,8 @@ fn waiting_shared_fallback_bridge_acquires_after_whole_perf_releases() {
     // Registry CPU identities must be real host CPU indices. The per-test
     // lock prefixes already isolate this fixture, so a low identity is both
     // collision-free and unambiguous with the weighted-permit namespace.
-    let whole = try_acquire_resources(
-        &[0],
-        LlcLockMode::Exclusive,
-        &[0],
-        FlockMode::Exclusive,
-    )
-    .unwrap();
+    let whole =
+        try_acquire_resources(&[0], LlcLockMode::Exclusive, &[0], FlockMode::Exclusive).unwrap();
     let locks = match whole {
         TryAcquireAll::Acquired(locks) => locks,
         TryAcquireAll::Contended { reason, .. } => panic!("fresh whole claim contended: {reason}"),

@@ -1937,9 +1937,9 @@ fn normalized_absolute_source_root(path: &std::path::Path) -> bool {
                 std::path::Component::RootDir | std::path::Component::Normal(_)
             )
         })
-        && path.components().any(|component| {
-            matches!(component, std::path::Component::Normal(_))
-        })
+        && path
+            .components()
+            .any(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 fn validate_source_root_remaps(
@@ -1984,7 +1984,12 @@ fn validate_source_root_remaps(
             .components()
             .count()
             .cmp(&left.0.components().count())
-            .then_with(|| left.0.as_os_str().as_bytes().cmp(right.0.as_os_str().as_bytes()))
+            .then_with(|| {
+                left.0
+                    .as_os_str()
+                    .as_bytes()
+                    .cmp(right.0.as_os_str().as_bytes())
+            })
     });
     Ok(remaps)
 }
@@ -2028,7 +2033,10 @@ fn decode_source_root_remaps(
     let mut remaps = Vec::new();
     for (index, line) in lines.enumerate() {
         let (stable, writable) = line.split_once('\t').ok_or_else(|| {
-            format!("source-root remap entry {} has no field separator", index + 1)
+            format!(
+                "source-root remap entry {} has no field separator",
+                index + 1
+            )
         })?;
         if writable.contains('\t') {
             return Err(format!(
@@ -2083,8 +2091,8 @@ pub fn writable_source_path(path: impl AsRef<std::path::Path>) -> std::path::Pat
 #[cfg(test)]
 mod writable_source_path_tests {
     use super::{
-        decode_source_root_remaps, encode_source_root_remaps,
-        validate_source_root_remaps, writable_source_path_with_remaps,
+        decode_source_root_remaps, encode_source_root_remaps, validate_source_root_remaps,
+        writable_source_path_with_remaps,
     };
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::Path;

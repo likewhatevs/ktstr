@@ -7,9 +7,11 @@
 //! expensive-input and cross-process coordination invariants.
 
 use anyhow::{Context, Result};
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
 use std::io::Write;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -25,9 +27,13 @@ const FILE_DIGEST_MEMO_DIR: &str = "digests-v1";
 const FILE_DIGEST_LOCK_DIR: &str = ".locks-v1";
 const FILE_DIGEST_NAMESPACE_GATE: &str = "namespace.lock";
 const CONTENT_OBJECT_DIR: &str = "objects-v2";
+const ARTIFACT_REFERENCE_DIR: &str = "artifact-references-v1";
+const ARTIFACT_REFERENCE_SCHEMA: u32 = 1;
+const ARTIFACT_REFERENCE_MAX_BYTES: u64 = 64 << 20;
 const CONTENT_GC_STAMP: &str = ".gc-v2";
 const CONTENT_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const CONTENT_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const CONTENT_ORPHAN_TEMP_GRACE: Duration = Duration::from_secs(60);
 
 fn fixed_hasher() -> AHasher {
     ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher()
@@ -184,11 +190,81 @@ fn ensure_content_dirs(root: &Path) -> Result<()> {
         root.join(FILE_DIGEST_MEMO_DIR),
         root.join(FILE_DIGEST_LOCK_DIR),
         root.join(CONTENT_OBJECT_DIR),
+        root.join(ARTIFACT_REFERENCE_DIR),
     ] {
         std::fs::create_dir_all(&path)
             .with_context(|| format!("create shared content cache dir {}", path.display()))?;
     }
     Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactContentReference {
+    version: u32,
+    owner: u64,
+    identity: u64,
+    record_path: Vec<u8>,
+    objects: Vec<(u64, u64)>,
+    integrity_ahash: u64,
+}
+
+fn artifact_reference_owner(record_path: &Path, identity: u64) -> u64 {
+    let mut hasher = fixed_hasher();
+    hash_len_prefixed(&mut hasher, b"ktstr-artifact-content-reference-owner");
+    hash_len_prefixed(&mut hasher, record_path.as_os_str().as_bytes());
+    hash_u64(&mut hasher, identity);
+    hasher.finish()
+}
+
+fn artifact_reference_integrity(reference: &ArtifactContentReference) -> u64 {
+    let mut hasher = fixed_hasher();
+    hash_len_prefixed(&mut hasher, b"ktstr-artifact-content-reference");
+    hash_u32(&mut hasher, reference.version);
+    hash_u64(&mut hasher, reference.owner);
+    hash_u64(&mut hasher, reference.identity);
+    hash_len_prefixed(&mut hasher, &reference.record_path);
+    hash_u64(&mut hasher, reference.objects.len() as u64);
+    for (content_hash, len) in &reference.objects {
+        hash_u64(&mut hasher, *content_hash);
+        hash_u64(&mut hasher, *len);
+    }
+    hasher.finish()
+}
+
+fn validate_artifact_reference(reference: &ArtifactContentReference) -> Result<()> {
+    anyhow::ensure!(
+        reference.version == ARTIFACT_REFERENCE_SCHEMA,
+        "unsupported artifact content-reference version {}",
+        reference.version
+    );
+    let record_path = PathBuf::from(std::ffi::OsString::from_vec(reference.record_path.clone()));
+    anyhow::ensure!(
+        record_path.is_absolute(),
+        "artifact content-reference record path is not absolute"
+    );
+    anyhow::ensure!(
+        artifact_reference_owner(&record_path, reference.identity) == reference.owner,
+        "artifact content-reference owner mismatch"
+    );
+    anyhow::ensure!(
+        reference.integrity_ahash == artifact_reference_integrity(reference),
+        "artifact content-reference integrity mismatch"
+    );
+    anyhow::ensure!(
+        reference.objects.windows(2).all(|pair| pair[0] < pair[1]),
+        "artifact content-reference objects are not sorted and unique"
+    );
+    Ok(())
+}
+
+fn absolute_cache_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(std::env::current_dir()
+        .context("resolve current directory for artifact reference")?
+        .join(path))
 }
 
 fn cache_entry_is_old(metadata: &std::fs::Metadata, now: SystemTime, max_age: Duration) -> bool {
@@ -230,6 +306,27 @@ fn try_remove_coordinated_pair(
         Err(error) => Err(error).with_context(|| {
             format!(
                 "try-lock content cache entry for cleanup {}",
+                lock_path.display()
+            )
+        }),
+    }
+}
+
+fn try_remove_temporary_object(
+    namespace_locked: &File,
+    lock_path: &Path,
+    temporary_path: &Path,
+) -> Result<bool> {
+    let lock = open_lock_file(lock_path)?;
+    match flock_retry(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {
+            let _ = namespace_locked;
+            remove_if_present(temporary_path)
+        }
+        Err(error) if error == rustix::io::Errno::WOULDBLOCK => Ok(false),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "try-lock temporary content object for cleanup {}",
                 lock_path.display()
             )
         }),
@@ -326,6 +423,195 @@ fn gc_content_cache_at(root: &Path, now: SystemTime, max_age: Duration) -> Resul
         .with_context(|| format!("update content GC stamp {}", stamp.display()))?;
     drop(stamp_file);
     Ok(())
+}
+
+/// Collect immutable content objects which are outside every retained
+/// artifact-tree closure.
+///
+/// The artifact layer computes whole-closure reachability while holding its
+/// global lifecycle gate. This layer then takes the content namespace gate in
+/// EX mode and each object's own EX lock before unlinking the canonical object
+/// and lock pathname. An in-flight publisher or non-artifact object lease
+/// therefore makes the object a clean skip instead of a partial collection.
+pub(super) fn collect_unreachable_content_objects(
+    retained: &BTreeSet<(u64, u64)>,
+    now: SystemTime,
+    blocking: bool,
+) -> Result<bool> {
+    let root = content_cache_root()?;
+    collect_unreachable_content_objects_at_root(&root, retained, now, blocking)
+}
+
+fn collect_unreachable_content_objects_at_root(
+    root: &Path,
+    retained: &BTreeSet<(u64, u64)>,
+    now: SystemTime,
+    blocking: bool,
+) -> Result<bool> {
+    ensure_content_dirs(&root)?;
+    let lock_dir = root.join(FILE_DIGEST_LOCK_DIR);
+    let namespace_gate_path = lock_dir.join(FILE_DIGEST_NAMESPACE_GATE);
+    let namespace_gate = open_lock_file(&namespace_gate_path)?;
+    let operation = if blocking {
+        rustix::fs::FlockOperation::LockExclusive
+    } else {
+        rustix::fs::FlockOperation::NonBlockingLockExclusive
+    };
+    match flock_retry(&namespace_gate, operation) {
+        Ok(()) => {}
+        Err(error) if error == rustix::io::Errno::WOULDBLOCK => return Ok(false),
+        Err(error) => return Err(error).context("lock content objects for closure collection"),
+    }
+
+    let mut globally_retained = retained.clone();
+    let reference_dir = root.join(ARTIFACT_REFERENCE_DIR);
+    for entry in std::fs::read_dir(&reference_dir).with_context(|| {
+        format!(
+            "scan artifact content references {}",
+            reference_dir.display()
+        )
+    })? {
+        let entry = entry.context("read artifact content-reference entry")?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with(".artifact-reference-") {
+            let metadata = entry.metadata().with_context(|| {
+                format!(
+                    "stat temporary artifact content reference {}",
+                    entry.path().display()
+                )
+            })?;
+            if metadata.is_file() && cache_entry_is_old(&metadata, now, CONTENT_ORPHAN_TEMP_GRACE) {
+                remove_if_present(&entry.path())?;
+            }
+            continue;
+        }
+        let Some(owner) = parse_cache_key(name, "", ".json") else {
+            continue;
+        };
+        let reference = match read_artifact_reference(&entry.path()) {
+            Ok(reference) => reference,
+            Err(error) => {
+                // The edge itself is reconstructible cache state. Remove it
+                // under namespace EX, but abort this sweep so objects are not
+                // collected in the same pass. A later record hit republishes
+                // the exact edge; otherwise a later pass reclaims its orphaned
+                // objects and that record becomes a clean rebuild miss.
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    error = %error,
+                    "removing invalid artifact reference and deferring content sweep",
+                );
+                remove_if_present(&entry.path())?;
+                return Ok(false);
+            }
+        };
+        if format!("{:016x}", reference.owner) != owner {
+            tracing::warn!(
+                path = %entry.path().display(),
+                "removing mismatched artifact reference and deferring content sweep",
+            );
+            remove_if_present(&entry.path())?;
+            return Ok(false);
+        }
+        let record_path =
+            PathBuf::from(std::ffi::OsString::from_vec(reference.record_path.clone()));
+        match open_cache_record(
+            &record_path,
+            "artifact record referenced by global CAS edge",
+        ) {
+            Ok(Some((_record, _))) => {
+                globally_retained.extend(reference.objects);
+            }
+            Ok(None) => {
+                // Publication orders ref before record while namespace SH is
+                // held; under this EX gate, a missing record is therefore a
+                // crash leftover or an eviction whose record was hidden first.
+                remove_if_present(&entry.path())?;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %record_path.display(),
+                    error = %error,
+                    "skipping content sweep because a referenced artifact record cannot be checked",
+                );
+                return Ok(false);
+            }
+        }
+    }
+
+    let retained_hashes = globally_retained
+        .iter()
+        .map(|(content_hash, _)| *content_hash)
+        .collect::<BTreeSet<_>>();
+    let object_dir = root.join(CONTENT_OBJECT_DIR);
+    for entry in std::fs::read_dir(&object_dir)
+        .with_context(|| format!("scan content objects {}", object_dir.display()))?
+    {
+        let entry = entry.context("read content object entry")?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if let Some(key) = parse_cache_key(name, "", ".object") {
+            let content_hash = u64::from_str_radix(&key, 16)
+                .with_context(|| format!("parse content object key {key}"))?;
+            if retained_hashes.contains(&content_hash) {
+                continue;
+            }
+            try_remove_coordinated_pair(
+                &namespace_gate,
+                &lock_dir.join(format!("object-{key}.lock")),
+                &entry.path(),
+            )?;
+            continue;
+        }
+
+        let Some(rest) = name.strip_prefix(".content-object-") else {
+            continue;
+        };
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("stat temporary content object {}", entry.path().display()))?;
+        if !metadata.is_file() || !cache_entry_is_old(&metadata, now, CONTENT_ORPHAN_TEMP_GRACE) {
+            continue;
+        }
+        let keyed = rest
+            .get(..16)
+            .filter(|key| key.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .filter(|_| rest.as_bytes().get(16) == Some(&b'-'));
+        let Some(key) = keyed else {
+            // Unkeyed temporaries belong to a protocol which has no per-key
+            // coordination inode. They cannot be proven dead, so current
+            // collectors deliberately ignore them instead of carrying a
+            // mixed-version compatibility rail into the deletion protocol.
+            continue;
+        };
+        try_remove_temporary_object(
+            &namespace_gate,
+            &lock_dir.join(format!("object-{key}.lock")),
+            &entry.path(),
+        )?;
+    }
+    Ok(true)
+}
+
+fn read_artifact_reference(path: &Path) -> Result<ArtifactContentReference> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("stat artifact content reference {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() <= ARTIFACT_REFERENCE_MAX_BYTES,
+        "artifact content reference has invalid size/type: {}",
+        path.display()
+    );
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("read artifact content reference {}", path.display()))?;
+    let reference: ArtifactContentReference = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse artifact content reference {}", path.display()))?;
+    validate_artifact_reference(&reference)?;
+    Ok(reference)
 }
 
 fn maybe_gc_content_cache(root: &Path) -> Result<()> {
@@ -899,6 +1185,64 @@ impl ContentNamespaceLease {
         let path = content_object_path(&self.root, content_hash);
         Ok(open_content_object_at(&path, expected_len)?.map(|file| (file, path)))
     }
+
+    /// Publish the global reachability edge for one artifact-tree record.
+    ///
+    /// Callers hold this namespace SH lease from object publication through
+    /// this reference and then local-record publication. A content-EX sweep
+    /// can therefore observe either no objects, or the complete global edge,
+    /// but never sweep the pre-record publication window.
+    pub(super) fn publish_artifact_reference(
+        &self,
+        record_path: &Path,
+        identity: u64,
+        objects: &BTreeSet<(u64, u64)>,
+    ) -> Result<()> {
+        let record_path = absolute_cache_path(record_path)?;
+        let owner = artifact_reference_owner(&record_path, identity);
+        let mut reference = ArtifactContentReference {
+            version: ARTIFACT_REFERENCE_SCHEMA,
+            owner,
+            identity,
+            record_path: record_path.as_os_str().as_bytes().to_vec(),
+            objects: objects.iter().copied().collect(),
+            integrity_ahash: 0,
+        };
+        reference.integrity_ahash = artifact_reference_integrity(&reference);
+        validate_artifact_reference(&reference)?;
+
+        let directory = self.root.join(ARTIFACT_REFERENCE_DIR);
+        let final_path = directory.join(format!("{owner:016x}.json"));
+        let mut temporary = tempfile::Builder::new()
+            .prefix(&format!(".artifact-reference-{owner:016x}-"))
+            .tempfile_in(&directory)
+            .with_context(|| {
+                format!(
+                    "create artifact content-reference temporary in {}",
+                    directory.display()
+                )
+            })?;
+        serde_json::to_writer(temporary.as_file_mut(), &reference)
+            .context("serialize artifact content reference")?;
+        temporary
+            .as_file_mut()
+            .flush()
+            .context("flush artifact content reference")?;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o444))
+            .context("seal artifact content reference")?;
+        temporary
+            .persist(&final_path)
+            .map_err(|error| error.error)
+            .with_context(|| {
+                format!(
+                    "publish artifact content reference {}",
+                    final_path.display()
+                )
+            })?;
+        Ok(())
+    }
 }
 
 /// Prevent content GC from unlinking any object pathname until this owner is
@@ -983,7 +1327,7 @@ fn publish_content_object(
     );
 
     let mut temporary = tempfile::Builder::new()
-        .prefix(".content-object-")
+        .prefix(&format!(".content-object-{expected_hash:016x}-"))
         .tempfile_in(parent)
         .context("create content object temp")?;
     match crate::reflink::ficlone(temporary.as_file(), source) {
@@ -1420,6 +1764,79 @@ mod tests {
         assert!(
             lock_dir.join(FILE_DIGEST_NAMESPACE_GATE).exists(),
             "the namespace gate itself is never a GC candidate"
+        );
+    }
+
+    #[test]
+    fn closure_gc_marks_reachable_objects_and_skips_live_object_leases() {
+        let root = tempfile::TempDir::new().unwrap();
+        ensure_content_dirs(root.path()).unwrap();
+        let retained_hash = 0x1111_2222_3333_4444;
+        let live_hash = 0x5555_6666_7777_8888;
+        let retained_path = content_object_path(root.path(), retained_hash);
+        let live_path = content_object_path(root.path(), live_hash);
+        std::fs::write(&retained_path, b"retained").unwrap();
+        std::fs::write(&live_path, b"live").unwrap();
+        for path in [&retained_path, &live_path] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let live = lease_content_object_at_root(root.path(), live_hash, 4)
+            .unwrap()
+            .expect("lease live content object");
+        let retained = BTreeSet::from([(retained_hash, 8)]);
+
+        collect_unreachable_content_objects_at_root(
+            root.path(),
+            &retained,
+            SystemTime::now(),
+            false,
+        )
+        .unwrap();
+        assert!(
+            retained_path.exists(),
+            "marked closure object was collected"
+        );
+        assert!(
+            live_path.exists(),
+            "an active non-artifact object lease must make collection skip"
+        );
+
+        drop(live);
+        collect_unreachable_content_objects_at_root(
+            root.path(),
+            &retained,
+            SystemTime::now(),
+            false,
+        )
+        .unwrap();
+        assert!(retained_path.exists());
+        assert!(
+            !live_path.exists(),
+            "unmarked inactive object was not collected"
+        );
+    }
+
+    #[test]
+    fn closure_gc_ignores_legacy_unkeyed_content_temporaries() {
+        let root = tempfile::TempDir::new().unwrap();
+        ensure_content_dirs(root.path()).unwrap();
+        let temporary = root
+            .path()
+            .join(CONTENT_OBJECT_DIR)
+            .join(".content-object-legacy-publisher");
+        std::fs::write(&temporary, b"possibly-live legacy publisher").unwrap();
+
+        collect_unreachable_content_objects_at_root(
+            root.path(),
+            &BTreeSet::new(),
+            SystemTime::now() + CONTENT_ORPHAN_TEMP_GRACE + Duration::from_secs(1),
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            temporary.exists(),
+            "uncoordinated legacy temporaries cannot be proven dead by the current protocol",
         );
     }
 

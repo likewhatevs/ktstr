@@ -803,12 +803,10 @@ fn tracked_acquired_drop_keeps_its_registry_namespace_across_threads() {
     let wrong_cpu_prefix = format!("{}/cpu-", wrong.path().display());
     let wrong_registry = wrong.path().join("ktstr-acquire-registry-v14");
     std::fs::create_dir_all(&wrong_registry).expect("create wrong registry directory");
-    let wrong_registry_lock = crate::flock::try_flock(
-        wrong_registry.join("registry.lock"),
-        FlockMode::Exclusive,
-    )
-    .expect("open wrong registry lock")
-    .expect("hold wrong registry EX");
+    let wrong_registry_lock =
+        crate::flock::try_flock(wrong_registry.join("registry.lock"), FlockMode::Exclusive)
+            .expect("open wrong registry lock")
+            .expect("hold wrong registry EX");
 
     let (dropped_tx, dropped_rx) = std::sync::mpsc::sync_channel(1);
     let dropper = TestServiceThread::spawn(move || {

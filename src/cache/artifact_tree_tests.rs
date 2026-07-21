@@ -427,6 +427,8 @@ fn stale_materialization_gc_observes_cross_process_liveness_lock() {
     gc_stale_materializations(temp.path(), future).unwrap();
     assert!(!stale.exists());
     assert!(live.exists());
+    rustix::fs::flock(&live_file, rustix::fs::FlockOperation::Unlock)
+        .expect("release materialization liveness lock");
     drop(live_file);
     gc_stale_materializations(
         temp.path(),
@@ -665,6 +667,11 @@ fn stable_cargo_output_is_hashed_once_before_sealing_changes_ctime() {
     let stable_output = stable_parent
         .join(format!("{identity:016x}"))
         .join("target/debug/deps/harness");
+    assert_ne!(
+        std::fs::metadata(&stable_output).unwrap().ino(),
+        pinned_identity.ino,
+        "stable output must be atomically replaced by a reflink from its canonical CAS object",
+    );
     assert_eq!(
         std::fs::metadata(&stable_output)
             .unwrap()
@@ -677,6 +684,162 @@ fn stable_cargo_output_is_hashed_once_before_sealing_changes_ctime() {
     assert_eq!(
         std::fs::read(tree.root().join("target/debug/deps/harness")).unwrap(),
         vec![0x5a; 4 << 20],
+    );
+}
+
+#[test]
+fn lifecycle_reserves_before_closure_ex_and_does_not_invert_waiter_order() {
+    let _environment = lock_env();
+    let temp = tempfile::tempdir().unwrap();
+    let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, temp.path().join("cas"));
+    let record_root = temp.path().join("records");
+    let cache = ArtifactTreeCache::new(&record_root);
+    let identity = 0x11fe_c0ff_ee00_0001;
+    let mut producer = cache.acquire_closure(identity).unwrap();
+
+    // A miss drops SH before capacity collection. The runtime assertion in
+    // reserve_cold_build_space makes this ordering deterministic rather than
+    // relying on a rare cross-process deadlock to expose a regression.
+    producer.release();
+    let reservation = cache.reserve_cold_build_space(&producer).unwrap();
+
+    let lifecycle_root = producer.lifecycle_root.clone();
+    let (global_held_tx, global_held_rx) = std::sync::mpsc::channel();
+    let (waiter_done_tx, waiter_done_rx) = std::sync::mpsc::channel();
+    let waiter = producer
+        .with_exclusive_rebuild(|_| {
+            let waiter = std::thread::spawn(move || {
+                let global = crate::flock::block_flock(
+                    lifecycle_gate_path(&lifecycle_root),
+                    crate::flock::FlockMode::Shared,
+                )
+                .unwrap();
+                global_held_tx.send(()).unwrap();
+                let closure = crate::flock::block_flock(
+                    lifecycle_closure_lock_path(&lifecycle_root, identity),
+                    crate::flock::FlockMode::Shared,
+                )
+                .unwrap();
+                drop(global);
+                drop(closure);
+                waiter_done_tx.send(()).unwrap();
+            });
+            global_held_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("waiter did not hold global SH");
+            // Returning releases closure EX without acquiring the global gate;
+            // the waiter can therefore finish instead of forming ABBA.
+            Ok(waiter)
+        })
+        .unwrap();
+    waiter_done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("closure waiter deadlocked behind producer");
+    waiter.join().unwrap();
+    drop(reservation);
+}
+
+#[test]
+fn lifecycle_rebuilder_never_holds_global_gate_while_waiting_for_an_owner() {
+    let _environment = lock_env();
+    let temp = tempfile::tempdir().unwrap();
+    let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, temp.path().join("cas"));
+    let cache = ArtifactTreeCache::new(temp.path().join("records"));
+    let first_identity = 0xabba_0000_0000_0001;
+    let second_identity = 0xabba_0000_0000_0002;
+    let first_owner = cache.acquire_closure(first_identity).unwrap();
+    let lifecycle_root = first_owner.lifecycle_root.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (rebuilt_tx, rebuilt_rx) = std::sync::mpsc::channel();
+    let rebuilder = std::thread::spawn(move || {
+        let mut lease = ArtifactClosureLease {
+            lock: None,
+            lifecycle_root,
+            identity: first_identity,
+        };
+        started_tx.send(()).unwrap();
+        lease.with_exclusive_rebuild(|_| Ok(())).unwrap();
+        rebuilt_tx.send(()).unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    let second_cache = ArtifactTreeCache::new(temp.path().join("records"));
+    let (second_tx, second_rx) = std::sync::mpsc::channel();
+    let second = std::thread::spawn(move || {
+        second_tx
+            .send(second_cache.acquire_closure(second_identity))
+            .unwrap();
+    });
+    let second_owner = match second_rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(result) => result.expect("acquire independent closure while first is live"),
+        Err(error) => {
+            drop(first_owner);
+            rebuilder.join().unwrap();
+            second.join().unwrap();
+            panic!("rebuilder held global EX while waiting for closure SH owner: {error}");
+        }
+    };
+    drop(second_owner);
+    drop(first_owner);
+    rebuilt_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("rebuilder did not finish after first owner released");
+    rebuilder.join().unwrap();
+    second.join().unwrap();
+}
+
+#[test]
+fn lifecycle_gc_throttles_a_contended_content_sweep() {
+    let _environment = lock_env();
+    let temp = tempfile::tempdir().unwrap();
+    let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, temp.path().join("cas"));
+    let cache = ArtifactTreeCache::new(temp.path().join("records"));
+    let lifecycle_root = cache.lifecycle_root();
+    let content_lease = super::super::content::lease_content_namespace().unwrap();
+
+    collect_artifact_cache(&lifecycle_root, None, None, true).unwrap();
+
+    assert!(
+        lifecycle_directory(&lifecycle_root)
+            .join(LIFECYCLE_GC_STAMP)
+            .is_file(),
+        "content contention must not make every subsequent artifact lookup repeat lifecycle GC",
+    );
+    drop(content_lease);
+}
+
+#[test]
+fn build_reservation_ignores_stale_same_process_name_and_unlinks_on_drop() {
+    let _environment = lock_env();
+    let temp = tempfile::tempdir().unwrap();
+    let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, temp.path().join("cas"));
+    let cache = ArtifactTreeCache::new(temp.path().join("records"));
+    let identity = 0x5ace_0000_0000_0001;
+    let mut closure = cache.acquire_closure(identity).unwrap();
+    closure.release();
+    let reservation_dir =
+        lifecycle_directory(&closure.lifecycle_root).join(LIFECYCLE_RESERVATION_DIR);
+    let stale = reservation_dir.join(format!(
+        "{identity:016x}-{}-0000000000000000.reserve",
+        std::process::id()
+    ));
+    std::fs::write(&stale, b"8589934592\n").unwrap();
+
+    let reservation = cache.reserve_cold_build_space(&closure).unwrap();
+    let live = reservation._temporary.path().to_path_buf();
+    assert_ne!(
+        live, stale,
+        "a crash leftover collided with a new reservation"
+    );
+    assert!(live.exists());
+    assert!(
+        !stale.exists(),
+        "unlocked stale reservation was not collected"
+    );
+    drop(reservation);
+    assert!(
+        !live.exists(),
+        "live reservation pathname survived normal Drop"
     );
 }
 
@@ -811,6 +974,129 @@ fn stable_cargo_record_recovers_from_absent_and_incomplete_output_anchor() {
 }
 
 #[test]
+fn stable_cargo_hit_rebuilds_after_recorded_target_file_is_deleted() {
+    let _environment = lock_env();
+    let temp = tempfile::tempdir().unwrap();
+    let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, temp.path().join("cas"));
+    let records = temp.path().join("records");
+    let stable_parent = temp.path().join("stable");
+    let materializations = temp.path().join("materializations");
+    let identity = 0x5ea1_de1e_7ed0_0001;
+    let builds = AtomicUsize::new(0);
+    let build = |stable: &StableCargoBuild| -> Result<ArtifactTreeSource> {
+        builds.fetch_add(1, Ordering::SeqCst);
+        let output = stable.target_directory.join("debug/deps/harness");
+        std::fs::create_dir_all(output.parent().unwrap())?;
+        std::fs::write(&output, b"recorded-target")?;
+        let mut source = ArtifactTreeSource::new();
+        source.insert_file("target/debug/deps/harness", output)?;
+        Ok(source)
+    };
+    let cache = ArtifactTreeCache::new(&records);
+    let first = cache
+        .load_or_build_with_stable_cargo_output(
+            identity,
+            &stable_parent,
+            &materializations,
+            "stable-cargo-deleted-entry",
+            || Ok(true),
+            || false,
+            |stable| build(stable),
+        )
+        .unwrap();
+    drop(first);
+    let stable_root = stable_parent.join(format!("{identity:016x}"));
+    let output = stable_root.join("target/debug/deps/harness");
+    let (record, _, _) = cache_paths(&records, identity);
+    assert!(stable_root.join(STABLE_BUILD_MARKER).is_file());
+    assert!(record.is_file());
+    std::fs::remove_file(&output).unwrap();
+
+    let rebuilt = cache
+        .load_or_build_with_stable_cargo_output(
+            identity,
+            &stable_parent,
+            &materializations,
+            "stable-cargo-deleted-entry",
+            || Ok(true),
+            || false,
+            |stable| build(stable),
+        )
+        .expect("post-marker partial deletion must be a reconstructible miss");
+    assert!(!rebuilt.cache_hit());
+    assert_eq!(builds.load(Ordering::SeqCst), 2);
+    assert_eq!(std::fs::read(output).unwrap(), b"recorded-target");
+}
+
+#[test]
+fn stable_cargo_hit_rejects_intermediate_symlink_without_touching_target() {
+    let _environment = lock_env();
+    let temp = tempfile::tempdir().unwrap();
+    let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, temp.path().join("cas"));
+    let records = temp.path().join("records");
+    let stable_parent = temp.path().join("stable");
+    let materializations = temp.path().join("materializations");
+    let identity = 0x5ea1_5a1e_1eaf_0002;
+    let builds = AtomicUsize::new(0);
+    let build = |stable: &StableCargoBuild| -> Result<ArtifactTreeSource> {
+        builds.fetch_add(1, Ordering::SeqCst);
+        let output = stable.target_directory.join("debug/deps/harness");
+        std::fs::create_dir_all(output.parent().unwrap())?;
+        std::fs::write(&output, b"trusted-target")?;
+        let mut source = ArtifactTreeSource::new();
+        source.insert_file("target/debug/deps/harness", output)?;
+        Ok(source)
+    };
+    let cache = ArtifactTreeCache::new(&records);
+    let first = cache
+        .load_or_build_with_stable_cargo_output(
+            identity,
+            &stable_parent,
+            &materializations,
+            "stable-cargo-symlink-entry",
+            || Ok(true),
+            || false,
+            |stable| build(stable),
+        )
+        .unwrap();
+    drop(first);
+
+    let stable_root = stable_parent.join(format!("{identity:016x}"));
+    let debug = stable_root.join("target/debug");
+    std::fs::remove_dir_all(&debug).unwrap();
+    let outside = temp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let sentinel = outside.join("sentinel");
+    std::fs::write(&sentinel, b"outside-owned").unwrap();
+    std::os::unix::fs::symlink(&outside, &debug).unwrap();
+
+    let rebuilt = cache
+        .load_or_build_with_stable_cargo_output(
+            identity,
+            &stable_parent,
+            &materializations,
+            "stable-cargo-symlink-entry",
+            || Ok(true),
+            || false,
+            |stable| build(stable),
+        )
+        .expect("intermediate symlink must be a reconstructible miss");
+    assert!(!rebuilt.cache_hit());
+    assert_eq!(builds.load(Ordering::SeqCst), 2);
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside-owned");
+    assert!(
+        !std::fs::symlink_metadata(&debug)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::read(stable_root.join("target/debug/deps/harness")).unwrap(),
+        b"trusted-target"
+    );
+}
+
+#[test]
 fn stable_cargo_distillation_preserves_exact_closure_without_following_outside_links() {
     let _environment = lock_env();
     let temp = tempfile::tempdir().unwrap();
@@ -936,11 +1222,19 @@ fn stable_cargo_sealing_is_recursive_and_does_not_follow_symlinks() {
     )
     .unwrap();
 
-    for path in [&root, &target, &nested, &first, &second] {
+    for path in [&first, &second] {
         assert_eq!(
             std::fs::metadata(path).unwrap().permissions().mode() & 0o222,
             0,
-            "stable Cargo node remained writable: {}",
+            "stable Cargo file remained writable: {}",
+            path.display(),
+        );
+    }
+    for path in [&root, &target, &nested] {
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o300,
+            0o300,
+            "stable Cargo directory is not owner-removable: {}",
             path.display(),
         );
     }
@@ -959,7 +1253,8 @@ fn stable_cargo_sealing_is_recursive_and_does_not_follow_symlinks() {
         std::fs::read_to_string(root.join(STABLE_BUILD_MARKER)).unwrap(),
         "00000000005ea1ed\n",
     );
-    remove_stable_tree(&root).unwrap();
+    std::fs::remove_dir_all(&root)
+        .expect("ordinary same-user recursive removal must delete a sealed stable Cargo tree");
 }
 
 #[test]
@@ -1014,6 +1309,213 @@ fn stable_tree_survives_owner_drop_and_is_immutable_on_reuse() {
         .unwrap();
     assert!(second.cache_hit());
     assert_eq!(second.root(), root);
+    drop(second);
+    std::fs::remove_dir_all(&root)
+        .expect("ordinary same-user recursive removal must delete a stable source tree");
+}
+
+#[test]
+fn stable_source_hit_rematerializes_after_recorded_file_is_deleted() {
+    let _environment = lock_env();
+    let temp = tempfile::tempdir().unwrap();
+    let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, temp.path().join("cas"));
+    let input = temp.path().join("input");
+    std::fs::write(&input, b"stable-source-rebuild").unwrap();
+    let records = temp.path().join("records");
+    let stable_parent = temp.path().join("stable");
+    let identity = 0x0057_ab1e_de1e_7ed0;
+    let builds = AtomicUsize::new(0);
+    let cache = ArtifactTreeCache::new(&records);
+    let build = || -> Result<ArtifactTreeSource> {
+        builds.fetch_add(1, Ordering::SeqCst);
+        let mut source = ArtifactTreeSource::new();
+        source.insert_immutable_path("source/file", &input)?;
+        Ok(source)
+    };
+    let first = cache
+        .load_or_build_stable(
+            identity,
+            &stable_parent,
+            "stable-source-deleted-entry",
+            || Ok(true),
+            || false,
+            build,
+        )
+        .unwrap();
+    let stable_root = first.root().to_path_buf();
+    drop(first);
+    let (record, _, _) = cache_paths(&records, identity);
+    assert!(stable_root.join(STABLE_TREE_MARKER).is_file());
+    assert!(record.is_file());
+    std::fs::remove_file(stable_root.join("source/file")).unwrap();
+
+    let rebuilt = cache
+        .load_or_build_stable(
+            identity,
+            &stable_parent,
+            "stable-source-deleted-entry",
+            || Ok(true),
+            || false,
+            build,
+        )
+        .expect("post-marker stable-source deletion must rebuild");
+    assert!(rebuilt.cache_hit());
+    assert_eq!(
+        builds.load(Ordering::SeqCst),
+        1,
+        "an intact record/CAS should heal the stable tree without rebuilding its source",
+    );
+    assert_eq!(
+        std::fs::read(rebuilt.root().join("source/file")).unwrap(),
+        b"stable-source-rebuild"
+    );
+}
+
+const STABLE_COLD_CHILD_TEST: &str = "cache::artifact_tree::tests::stable_tree_cold_miss_child";
+const STABLE_COLD_CHILD_ROOT: &str = "KTSTR_STABLE_COLD_CHILD_ROOT";
+
+#[test]
+fn stable_tree_cold_miss_child() {
+    let Some(root) = std::env::var_os(STABLE_COLD_CHILD_ROOT).map(PathBuf::from) else {
+        return;
+    };
+    // SAFETY: the subprocess executes one exact test with one libtest thread.
+    unsafe {
+        std::env::set_var(crate::KTSTR_CACHE_DIR_ENV, root.join("cas"));
+    }
+    std::fs::create_dir_all(&root).unwrap();
+    let input = root.join("input");
+    std::fs::write(&input, b"cold-stable-source").unwrap();
+    let cache = ArtifactTreeCache::new(root.join("records"));
+    let tree = cache
+        .load_or_build_stable(
+            0xc01d_57ab_1e00_0001,
+            &root.join("stable"),
+            "stable-cold-miss-regression",
+            || Ok(true),
+            || false,
+            || {
+                let mut source = ArtifactTreeSource::new();
+                source.insert_immutable_path("source/file", &input)?;
+                Ok(source)
+            },
+        )
+        .expect("cold stable-tree miss must complete");
+    assert_eq!(
+        std::fs::read(tree.root().join("source/file")).unwrap(),
+        b"cold-stable-source"
+    );
+    assert!(
+        tree._closure.lock.is_some(),
+        "StableArtifactTree did not retain its inner closure SH lease"
+    );
+}
+
+#[test]
+fn stable_tree_cold_miss_does_not_self_deadlock() {
+    let temp = tempfile::tempdir().unwrap();
+    let executable = std::env::current_exe().expect("current test executable");
+    let mut child = std::process::Command::new(executable)
+        .arg("--exact")
+        .arg(STABLE_COLD_CHILD_TEST)
+        .arg("--nocapture")
+        .arg("--test-threads=1")
+        .env(STABLE_COLD_CHILD_ROOT, temp.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("spawn cold stable-tree regression child");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "cold stable-tree child failed: {status}");
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("cold stable-tree miss self-deadlocked for 10 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn stable_installer_contender_drops_closure_before_waiting_for_turn() {
+    let _environment = lock_env();
+    let temp = tempfile::tempdir().unwrap();
+    let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, temp.path().join("cas"));
+    let records = temp.path().join("records");
+    let stable = temp.path().join("stable");
+    let input = temp.path().join("input");
+    std::fs::write(&input, b"installer-contender").unwrap();
+    let identity = 0x57ab_1e00_0000_0002;
+    let installer_dir = records.join(".stable-materialization-locks-v1");
+    std::fs::create_dir_all(&installer_dir).unwrap();
+    let installer = crate::flock::block_flock(
+        installer_dir.join(format!("{identity:016x}.lock")),
+        crate::flock::FlockMode::Exclusive,
+    )
+    .unwrap();
+
+    let contender_records = records.clone();
+    let contender_stable = stable.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let contender = std::thread::spawn(move || {
+        let result = ArtifactTreeCache::new(contender_records).load_or_build_stable(
+            identity,
+            &contender_stable,
+            "stable-installer-contender",
+            || Ok(true),
+            || false,
+            || {
+                let mut source = ArtifactTreeSource::new();
+                source.insert_immutable_path("source/file", &input)?;
+                Ok(source)
+            },
+        );
+        done_tx.send(result.map(drop)).unwrap();
+    });
+
+    let lifecycle_root = records.parent().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let closure = loop {
+        if !lifecycle_directory(lifecycle_root)
+            .join(LIFECYCLE_CLOSURE_LOCK_DIR)
+            .is_dir()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "stable installer contender did not initialize lifecycle directories"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        if let Some(lock) = crate::flock::try_flock(
+            lifecycle_closure_lock_path(lifecycle_root, identity),
+            crate::flock::FlockMode::Exclusive,
+        )
+        .unwrap()
+        {
+            break lock;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stable installer contender retained closure SH while blocked"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(installer);
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "contender bypassed the deliberately held closure EX"
+    );
+    drop(closure);
+    done_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("stable installer contender remained blocked")
+        .unwrap();
+    contender.join().unwrap();
 }
 
 #[test]
@@ -1214,8 +1716,31 @@ fn artifact_tree_cache_elects_one_cross_process_builder() {
         std::thread::yield_now();
     }
     rustix::fs::flock(&start, rustix::fs::FlockOperation::Unlock).unwrap();
-    for child in &mut children {
-        assert!(child.wait().unwrap().success());
+    let completion_deadline = Instant::now() + Duration::from_secs(15);
+    let mut completed = vec![false; CHILDREN];
+    while completed.iter().any(|done| !done) {
+        for (index, child) in children.iter_mut().enumerate() {
+            if completed[index] {
+                continue;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "artifact cache child {index} failed: {status}"
+                );
+                completed[index] = true;
+            }
+        }
+        if Instant::now() >= completion_deadline {
+            for (index, child) in children.iter_mut().enumerate() {
+                if !completed[index] {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+            panic!("artifact cache children did not complete within 15 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
     let attempts = std::fs::read_to_string(counter).expect("read build attempts");
     assert_eq!(attempts.lines().count(), 1);
