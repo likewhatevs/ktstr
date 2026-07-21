@@ -2017,6 +2017,118 @@ fn cooperative_permits_admit_four_host_width_claims_and_reject_a_fifth() {
 }
 
 #[test]
+fn preparation_private_working_set_uses_two_chunks_and_preserves_conversion_headroom() {
+    assert_eq!(MEMORY_PERMIT_CHUNK_MIB, 256);
+    assert_eq!(PREPARATION_PRIVATE_WORKING_SET_MIB, 512);
+    assert_eq!(preparation_memory_chunks(), 2);
+
+    // Match the 376 GiB CI hosts which exposed the old 2 GiB-per-process
+    // preparation bottleneck. Host reserve policy leaves 1,353 memory chunks;
+    // a quarter can fund 169 two-chunk preparation owners instead of only 42
+    // eight-chunk owners. CPU capacity remains a separate upper bound.
+    let possible_width = 192usize;
+    let (usable_mib, memory_chunks) = memory_capacity_from_total(376 * 1024);
+    assert_eq!(usable_mib, 346_521);
+    assert_eq!(memory_chunks, 1_353);
+    let cpu_chunks = AdmissionPermitPool::for_host(possible_width).len();
+    let slots = preparation_slot_capacity(memory_chunks, cpu_chunks, possible_width);
+    assert_eq!(slots, 169);
+
+    let preparation_chunks = slots * preparation_memory_chunks();
+    assert!(
+        preparation_chunks <= memory_chunks / PREPARATION_MEMORY_FRACTION,
+        "a full preparation wave must never consume more than its quarter",
+    );
+    assert!(
+        memory_chunks - preparation_chunks >= memory_chunks * 3 / 4,
+        "at least three quarters of memory permits remain for guest conversion",
+    );
+}
+
+#[test]
+fn computed_guest_memory_replaces_fixed_preparation_weight() {
+    let cpu = AdmissionPermitPool::for_host(1);
+    let memory = MemoryPermitPool {
+        permits: (100..108).collect(),
+        usable_mib: 8 * MEMORY_PERMIT_CHUNK_MIB,
+    };
+    let preparation_owned = std::collections::BTreeSet::from([100usize, 101usize]);
+    let preferred_memory = preparation_owned.iter().copied().collect::<Vec<_>>();
+    let candidate_ready = |candidate: &admission_protocol::ClaimSet,
+                           externally_blocked: Option<usize>| {
+        let Some(external) = claim_without_owned_permits(candidate, &preparation_owned) else {
+            return Ok(true);
+        };
+        Ok(externally_blocked.is_none_or(|permit| !external.permits.contains(&permit)))
+    };
+
+    // A 256 MiB guest needs one chunk, not both chunks in the fixed
+    // preparation estimate. The surplus preparation OFD must not leak into
+    // the run reservation.
+    let small = select_vm_permits(
+        PermitAdmission::Cooperative,
+        &cpu,
+        Some(&memory),
+        1,
+        1,
+        memory.required_chunks(256).expect("256 MiB demand"),
+        0,
+        0,
+        &[],
+        &preferred_memory,
+        |candidate| candidate_ready(candidate, None),
+    )
+    .expect("select 256 MiB guest permits")
+    .expect("256 MiB guest must fit");
+    assert_eq!(small.memory_permits, vec![100]);
+
+    // Conversely, a 2 GiB guest must acquire all eight actual chunks. Owning
+    // the two preparation chunks is not permission to allocate the larger
+    // guest: one unavailable external chunk keeps the conversion pending.
+    let full_demand = memory.required_chunks(2048).expect("2 GiB demand");
+    assert_eq!(full_demand, 8);
+    assert!(
+        select_vm_permits(
+            PermitAdmission::Cooperative,
+            &cpu,
+            Some(&memory),
+            1,
+            1,
+            full_demand,
+            0,
+            0,
+            &[],
+            &preferred_memory,
+            |candidate| candidate_ready(candidate, Some(107)),
+        )
+        .expect("probe partially available 2 GiB demand")
+        .is_none(),
+        "fixed preparation ownership cannot authorize an under-reserved guest",
+    );
+
+    let large = select_vm_permits(
+        PermitAdmission::Cooperative,
+        &cpu,
+        Some(&memory),
+        1,
+        1,
+        full_demand,
+        0,
+        0,
+        &[],
+        &preferred_memory,
+        |candidate| candidate_ready(candidate, None),
+    )
+    .expect("select fully available 2 GiB demand")
+    .expect("2 GiB guest must fit once every actual chunk is available");
+    assert_eq!(large.memory_permits.len(), full_demand);
+    assert!(
+        preparation_owned.is_subset(&large.memory_permits.iter().copied().collect()),
+        "the atomic conversion should reuse preparation OFDs where possible",
+    );
+}
+
+#[test]
 fn owned_or_absent_permits_never_issue_an_empty_registry_query() {
     let pool = AdmissionPermitPool::for_host(1);
     let callback_count = std::cell::Cell::new(0usize);

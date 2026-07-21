@@ -3350,7 +3350,17 @@ const BUILD_RESERVED_PERCENT: usize = 30;
 const MEMORY_PERMIT_CHUNK_MIB: usize = 256;
 const HOST_MEMORY_RESERVE_MIB: usize = 4 * 1024;
 const HOST_MEMORY_RESERVE_PERCENT: usize = 10;
-const PREPARATION_WORKING_SET_MIB: usize = 2 * 1024;
+/// Conservative private/COW working set charged to a process while it builds
+/// and maps immutable inputs, before guest memory exists.
+///
+/// File-backed test text, the content-addressed initramfs suffix, and KVM's
+/// eventual guest mapping are shared/COW and therefore do not each require a
+/// private copy of their apparent RSS. Two permit chunks leave one chunk for
+/// the ordinary 256 MiB process footprint and one for transient dirtied pages
+/// without mistaking a future guest's (possibly much larger) allocation for
+/// preparation memory. Run admission replaces this fixed charge with the
+/// computed guest-memory demand before KVM allocates that guest memory.
+const PREPARATION_PRIVATE_WORKING_SET_MIB: usize = 2 * MEMORY_PERMIT_CHUNK_MIB;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PermitAdmission {
@@ -3476,10 +3486,11 @@ impl MemoryPermitPool {
 }
 
 /// Capacity held while a test process prepares immutable artifacts and waits
-/// for its exact run placement.  Preparation is deliberately expressed in the
-/// same abstract CPU and memory permit namespaces as a running VM: otherwise a
-/// storm could consume one complete RAM budget in prepared test processes and
-/// a second complete budget in guests.
+/// for its exact run placement. Preparation is deliberately expressed in the
+/// same abstract CPU and memory permit namespaces as a running VM. A complete
+/// preparation wave can therefore consume only its one-quarter private/COW
+/// budget, and activation replaces that estimate with the computed guest
+/// demand in the same admission transaction before guest allocation.
 pub(super) struct PreparationPermit {
     pub(super) index: usize,
     pub(super) token_permit: usize,
@@ -3727,27 +3738,48 @@ fn set_process_thread_affinity(cpus: &[usize]) -> Result<()> {
 const PREPARATION_MEMORY_FRACTION: usize = 4;
 const PREPARATION_CPU_PERMITS: usize = COOPERATIVE_OVERSUBSCRIPTION;
 
+fn preparation_memory_chunks() -> usize {
+    PREPARATION_PRIVATE_WORKING_SET_MIB.div_ceil(MEMORY_PERMIT_CHUNK_MIB)
+}
+
+fn preparation_slot_capacity(
+    memory_permit_count: usize,
+    cpu_permit_count: usize,
+    possible_width: usize,
+) -> usize {
+    let memory_per_slot = preparation_memory_chunks();
+    if memory_per_slot == 0 {
+        return 0;
+    }
+
+    // Preparation can consume at most one quarter of the common memory
+    // namespace. The uncharged three quarters remain available while every
+    // preparation token is occupied, so a prepared process can replace its
+    // fixed private/COW charge with its actual computed guest demand rather
+    // than deadlocking behind a second complete preparation wave.
+    let preparation_memory_budget = memory_permit_count / PREPARATION_MEMORY_FRACTION;
+    let memory_slots = preparation_memory_budget / memory_per_slot;
+    let cpu_slots = cpu_permit_count / PREPARATION_CPU_PERMITS;
+    memory_slots
+        .min(cpu_slots)
+        .min(possible_width.saturating_mul(2))
+}
+
 fn preparation_token_range() -> Result<std::ops::Range<usize>> {
     let possible_width = possible_cpu_width();
     let cpu = AdmissionPermitPool::for_host(possible_width);
     let memory = MemoryPermitPool::for_host()?;
-    let memory_per_slot = PREPARATION_WORKING_SET_MIB.div_ceil(MEMORY_PERMIT_CHUNK_MIB);
+    let memory_per_slot = preparation_memory_chunks();
     anyhow::ensure!(
         memory_per_slot > 0,
         "preparation memory weight resolved to zero"
     );
 
-    // At most one quarter of the common memory-permit namespace can be tied
-    // up by preparation.  The remaining three quarters guarantee conversion
-    // headroom for READY work even when every preparation slot is occupied.
-    let memory_slots = memory.permits.len() / PREPARATION_MEMORY_FRACTION / memory_per_slot;
-    let cpu_slots = cpu.len() / PREPARATION_CPU_PERMITS;
-    let slots = memory_slots
-        .min(cpu_slots)
-        .min(possible_width.saturating_mul(2));
+    let slots = preparation_slot_capacity(memory.permits.len(), cpu.len(), possible_width);
     anyhow::ensure!(
         slots > 0,
-        "host admission capacity cannot fund one {PREPARATION_WORKING_SET_MIB}MiB preparation slot"
+        "host admission capacity cannot fund one \
+         {PREPARATION_PRIVATE_WORKING_SET_MIB}MiB preparation slot"
     );
 
     let base = memory.permits.last().copied().map_or_else(
@@ -3856,7 +3888,7 @@ fn try_acquire_preparation_permit(
 ) -> Result<PreparationPermitAttempt> {
     let cpu = AdmissionPermitPool::for_host(possible_cpu_width());
     let memory = MemoryPermitPool::for_host()?;
-    let memory_required = PREPARATION_WORKING_SET_MIB.div_ceil(MEMORY_PERMIT_CHUNK_MIB);
+    let memory_required = preparation_memory_chunks();
     let mut permit_fds = Vec::with_capacity(1 + PREPARATION_CPU_PERMITS + memory_required);
 
     let acquire_one = |permit| -> Result<Option<std::os::fd::OwnedFd>> {
@@ -4068,7 +4100,7 @@ pub(super) fn validate_preparation_permit(
         "inherited preparation permit has the wrong CPU weight"
     );
     anyhow::ensure!(
-        memory_permits.len() == PREPARATION_WORKING_SET_MIB.div_ceil(MEMORY_PERMIT_CHUNK_MIB),
+        memory_permits.len() == preparation_memory_chunks(),
         "inherited preparation permit has the wrong memory weight"
     );
     anyhow::ensure!(
