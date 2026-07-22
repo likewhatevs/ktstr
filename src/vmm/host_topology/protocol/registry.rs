@@ -6951,8 +6951,17 @@ pub(super) fn exercise_intrascan_fence_epoch_for_tests() -> Result<(bool, bool, 
             })
         },
     )?;
-    let completion_accepted_for_revalidation =
-        matches!(result, GrantResult::Requeued) && later.state(None)? == State::Waiting;
+    // This fixture owns a synthetic coordinator without its production
+    // heartbeat loop. Inspect the callback result without `Ticket::state`,
+    // whose deliberately mutating liveness recovery may elect this waiter if
+    // an overloaded test process is descheduled beyond the coordinator lease.
+    let completion_accepted_for_revalidation = matches!(result, GrantResult::Requeued) && {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.record(later.slot)?.is_some_and(|record| {
+            record.ticket == later.ticket && record.state == STATE_WAITING
+        })
+    };
 
     later.finish(None)?;
     earlier.finish(None)?;
@@ -10522,7 +10531,17 @@ pub(super) fn exercise_stale_acquired_release_order_for_tests()
         },
     )?;
     let lost_grant = matches!(result, GrantResult::LostGrant);
-    let regrant_revoked = waiter.state(None)? == State::Waiting;
+    // Do not turn this assertion into an unrelated coordinator-liveness
+    // operation. The synthetic coordinator has no heartbeat loop, and an ARM
+    // CI deschedule longer than the lease can otherwise elect this correctly
+    // revoked waiter while `Ticket::state` is only trying to observe it.
+    let regrant_revoked = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.record(waiter.slot)?.is_some_and(|record| {
+            record.ticket == waiter.ticket && record.state == STATE_WAITING
+        })
+    };
     let payload_dropped = payload_dropped.get();
     let registry_unlocked_at_drop = registry_unlocked_at_drop.get();
     let dropped_at_notify = dropped_at_notify.get();
