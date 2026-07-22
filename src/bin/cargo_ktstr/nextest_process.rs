@@ -158,9 +158,11 @@ pub(crate) fn prepare(command: &mut Command) {
 pub(crate) fn run_status(mut command: Command) -> io::Result<ExitStatus> {
     prepare(&mut command);
     // Nextest already owns an interactive progress bar. Adding periodic lines
-    // underneath it would only make the terminal flicker; the heartbeat is
-    // for line-buffered CI logs where that bar is absent.
-    if io::stderr().is_terminal() {
+    // underneath it would only make the terminal flicker. GitHub's self-hosted
+    // runner can present stderr through a pseudo-terminal while its web log is
+    // still line-oriented, so GITHUB_ACTIONS explicitly selects heartbeats.
+    let github_actions = std::env::var_os("GITHUB_ACTIONS").is_some();
+    if !should_emit_heartbeat(io::stderr().is_terminal(), github_actions) {
         crate::interrupt::run_status(command)
     } else {
         crate::interrupt::run_status_observed(
@@ -168,6 +170,10 @@ pub(crate) fn run_status(mut command: Command) -> io::Result<ExitStatus> {
             NextestRunProgress::new(NEXTEST_PROGRESS_INTERVAL),
         )
     }
+}
+
+fn should_emit_heartbeat(stderr_is_terminal: bool, github_actions: bool) -> bool {
+    !stderr_is_terminal || github_actions
 }
 
 #[cfg(test)]
@@ -315,5 +321,12 @@ mod tests {
             nextest_heartbeat_line(Duration::from_secs(75)),
             "cargo ktstr: nextest run still active; elapsed=1m 15s",
         );
+    }
+
+    #[test]
+    fn github_actions_keeps_heartbeats_on_a_pseudoterminal() {
+        assert!(should_emit_heartbeat(false, false));
+        assert!(!should_emit_heartbeat(true, false));
+        assert!(should_emit_heartbeat(true, true));
     }
 }
