@@ -168,11 +168,18 @@ const H_REPLAN_HORIZON: usize = 208;
 /// WAITING.  The last completion promotes the batch's deferred claim changes
 /// into one authoritative rescan and one global wake.
 const H_REPLAN_OUTSTANDING: usize = 216;
+/// Monotonic start and deadline of the currently published finite REPLAN
+/// wave. A callback which survives past the bounded lease is quarantined so
+/// one stopped planner cannot hold completed replacements behind it forever.
+const H_REPLAN_WAVE_STARTED_NS: usize = 224;
+const H_REPLAN_WAVE_DEADLINE_NS: usize = 232;
 const _: () = assert!(H_AGGREGATE_DIRTY.is_multiple_of(std::mem::align_of::<AtomicU64>()));
 const _: () = assert!(H_GENERATION_WAKE.is_multiple_of(std::mem::align_of::<AtomicU32>()));
 const _: () = assert!(H_REPLAN_CURSOR.is_multiple_of(std::mem::align_of::<u64>()));
 const _: () = assert!(H_REPLAN_HORIZON.is_multiple_of(std::mem::align_of::<u64>()));
 const _: () = assert!(H_REPLAN_OUTSTANDING.is_multiple_of(std::mem::align_of::<u64>()));
+const _: () = assert!(H_REPLAN_WAVE_STARTED_NS.is_multiple_of(std::mem::align_of::<u64>()));
+const _: () = assert!(H_REPLAN_WAVE_DEADLINE_NS.is_multiple_of(std::mem::align_of::<u64>()));
 
 const R_STATE: usize = 0;
 const R_WAKE: usize = 4;
@@ -251,6 +258,11 @@ const STATE_PENDING: u32 = 7;
 /// fence until that ticket acknowledges the revocation, then acknowledgement
 /// atomically publishes WAITING + PENDING_RESCAN.
 const STATE_REVOKED: u32 = 8;
+/// A speculative callback which outlived its finite wave lease. Expiration
+/// drains the wave without converting the stale callback into an ordinary
+/// waiter. Its owner must acknowledge this state before the ticket may be
+/// scanned again, and the old callback publication is rejected on return.
+const STATE_REPLAN_EXPIRED: u32 = 9;
 
 const BLOCK_NONE: u32 = 0;
 const BLOCK_CPU: u32 = 1;
@@ -322,6 +334,7 @@ const COORDINATOR_LEASE_NS: u64 = 120_000_000_000;
 /// the interval expires, no replacement conflicts are issued and at most one
 /// capacity wave remains to drain before the head runs.
 const BACKFILL_MAX_AGE_NS: u64 = COORDINATOR_LEASE_NS;
+const REPLAN_WAVE_LEASE_NS: u64 = COORDINATOR_LEASE_NS;
 
 #[cfg(test)]
 thread_local! {
@@ -1858,16 +1871,19 @@ impl Ticket {
             .record(self.slot)?
             .filter(|record| record.ticket == self.ticket)
             .ok_or_else(|| anyhow::anyhow!("live queue ticket {} disappeared", self.ticket))?;
-        let acknowledged = if record.state == STATE_REVOKED {
-            table.acknowledge_revoked(self.slot, self.ticket, None)?;
+        let acknowledged = match record.state {
+            STATE_REVOKED => table.acknowledge_revoked(self.slot, self.ticket, None)?,
+            STATE_REPLAN_EXPIRED => {
+                table.acknowledge_expired_replan(self.slot, self.ticket, None)?
+            }
+            _ => false,
+        };
+        if acknowledged {
             record = table
                 .record(self.slot)?
                 .filter(|record| record.ticket == self.ticket)
                 .ok_or_else(|| anyhow::anyhow!("live queue ticket {} disappeared", self.ticket))?;
-            true
-        } else {
-            false
-        };
+        }
         let state = match record.state {
             STATE_WAITING => State::Waiting,
             STATE_GRANTED => State::Granted,
@@ -1913,14 +1929,20 @@ impl Ticket {
             STATE_REPLAN => State::Replan,
             STATE_COORDINATOR => State::Coordinator,
             STATE_COORDINATOR_STANDBY => State::CoordinatorStandby,
-            // A revoked grant needs one EX acknowledgement before it can
-            // become an ordinary waiter and allow a successor scan to omit
-            // its old prefix fence.
-            STATE_REVOKED => return Ok(None),
+            // Revoked and expired callback publications need one EX
+            // acknowledgement before becoming ordinary waiters. REVOKED
+            // retires an exact fence; EXPIRED retires a stale planner token.
+            STATE_REVOKED | STATE_REPLAN_EXPIRED => return Ok(None),
             state => anyhow::bail!("queue ticket {} has invalid state {state}", self.ticket),
         };
         if check_coordinator_liveness && matches!(state, State::Waiting | State::CoordinatorStandby)
         {
+            let now = monotonic_now_ns()?;
+            if replan_wave_requires_recovery_from_header(header, now) {
+                #[cfg(test)]
+                SHARED_STATE_RECOVERY_UPGRADES.with(|upgrades| upgrades.set(upgrades.get() + 1));
+                return Ok(None);
+            }
             let coordinator = read_u64(header, H_COORDINATOR);
             let coordinator_slot = read_u64(header, H_COORDINATOR_SLOT);
             let progress_is_live = if coordinator == 0 {
@@ -1929,7 +1951,7 @@ impl Ticket {
                 coordinator_slot != NONE_SLOT
                     && coordinator_slot < next_slot
                     && ticket_is_live(coordinator_slot, coordinator)?
-                    && coordinator_activity_is_fresh(header, monotonic_now_ns()?)
+                    && coordinator_activity_is_fresh(header, now)
             };
             if !progress_is_live {
                 // Drop the SH lock before the caller takes the rare EX
@@ -2021,12 +2043,22 @@ impl Ticket {
             let _lock = lock_registry_interruptible_existing(cancelled)?;
             let mut table = Table::open_existing()?;
             table.repair_consistency_if_needed()?;
+            if table.expire_replan_wave_if_due()? {
+                notify_coordinator();
+            }
             let mut record = table
                 .record(self.slot)?
                 .filter(|record| record.ticket == self.ticket)
                 .ok_or_else(|| anyhow::anyhow!("live queue ticket {} disappeared", self.ticket))?;
             if record.state == STATE_REVOKED {
                 table.acknowledge_revoked(self.slot, self.ticket, None)?;
+                drop(table);
+                drop(_lock);
+                notify_coordinator();
+                return Ok(GrantResult::LostGrant);
+            }
+            if record.state == STATE_REPLAN_EXPIRED {
+                table.acknowledge_expired_replan(self.slot, self.ticket, None)?;
                 drop(table);
                 drop(_lock);
                 notify_coordinator();
@@ -2154,10 +2186,75 @@ impl Ticket {
         let lock = lock_registry_interruptible_existing(cancelled)?;
         let mut table = Table::open_existing()?;
         table.repair_consistency_if_needed()?;
+        if table.expire_replan_wave_if_due()? {
+            notify_coordinator();
+        }
         let mut record = table
             .record(self.slot)?
             .filter(|record| record.ticket == self.ticket)
             .ok_or_else(|| anyhow::anyhow!("live queue ticket {} disappeared", self.ticket))?;
+        if record.state == STATE_REPLAN_EXPIRED {
+            let blocked = if result.acquired.is_none() {
+                if let Some(evidence) = result.contention.as_ref() {
+                    validate_contention_within_watch(&[evidence.marker()], &watch)?;
+                }
+                let evidence = result
+                    .contention
+                    .as_ref()
+                    .or(result.preparation_contention.as_ref());
+                if let Some(evidence) = evidence {
+                    let marker = evidence.marker();
+                    let serial = table.blocker_serial(marker.blocker, marker.mode)?;
+                    Some((marker, serial, callback_snapshot_serial.max(serial)))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if result.acquired.is_some() {
+                // A non-acquiring REPLAN callback must never return physical
+                // ownership. Keep this defensive path ordered anyway: make
+                // the footprint unknown before dropping opaque caller state,
+                // then acknowledge only after those OFDs are gone.
+                let released_claim = result.preparation_claim.as_ref().unwrap_or(&designated);
+                table.begin_transaction()?;
+                table.mark_unknown(
+                    &released_claim.cpus,
+                    &released_claim.llcs,
+                    &released_claim.permits,
+                )?;
+                table.bump_generation()?;
+                table.finish_transaction()?;
+                drop(table);
+                drop(lock);
+                drop(result);
+
+                let ack_lock = lock_registry_existing(FlockMode::Exclusive)?;
+                let mut table = Table::open_existing()?;
+                table.repair_consistency_if_needed()?;
+                let acknowledged =
+                    table.acknowledge_expired_replan(self.slot, self.ticket, None)?;
+                drop(table);
+                drop(ack_lock);
+                if acknowledged {
+                    notify_coordinator();
+                }
+            } else {
+                // Publish the negative witness before dropping it. The ticket
+                // becomes WAITING only after this late callback is known to be
+                // unable to publish its stale replacement.
+                let acknowledged =
+                    table.acknowledge_expired_replan(self.slot, self.ticket, blocked)?;
+                drop(table);
+                drop(lock);
+                drop(result);
+                if acknowledged {
+                    notify_coordinator();
+                }
+            }
+            return Ok(GrantResult::LostGrant);
+        }
         let batch_deferred_grant = acquisition_allowed
             && table.min_changed_ticket() < record.ticket
             && callback_epoch != table.claim_epoch()
@@ -2607,7 +2704,7 @@ impl Ticket {
         if let Some(delay) = reconcile_liveness_after {
             table.request_liveness_reconciliation(delay)?;
         }
-        let liveness_due_in = table.perform_liveness_sweep_if_due(force_liveness_maintenance)?;
+        table.perform_liveness_sweep_if_due(force_liveness_maintenance)?;
         let record = table
             .record(self.slot)?
             .filter(|record| record.ticket == self.ticket)
@@ -2696,7 +2793,7 @@ impl Ticket {
             },
             should_step: coordinator_prefix_changed,
             observation,
-            liveness_due_in,
+            liveness_due_in: table.liveness_due_in()?,
         })
     }
 
@@ -2749,6 +2846,9 @@ impl Ticket {
             let lock = lock_registry_interruptible_existing(cancelled)?;
             let mut table = Table::open_existing()?;
             table.repair_consistency_if_needed()?;
+            if table.expire_replan_wave_if_due()? {
+                notify_coordinator();
+            }
             let record = table
                 .record(self.slot)?
                 .filter(|record| record.ticket == self.ticket)
@@ -2800,6 +2900,7 @@ impl Ticket {
         let heartbeat = read_u64(header, H_COORDINATOR_HEARTBEAT_NS);
         if atomic_u64(header, H_AGGREGATE_DIRTY).load(Ordering::SeqCst) != 0
             || read_u64(header, H_PENDING_FLAGS) != 0
+            || replan_wave_requires_recovery_from_header(header, now)
             || read_u64(header, H_COORDINATOR) != self.ticket
             || read_u64(header, H_COORDINATOR_SLOT) != self.slot
             || heartbeat == 0
@@ -3945,7 +4046,8 @@ fn bounded_wait_diagnostic(bucket: u64, unix_secs: u64) -> Result<Option<WaitDia
             "bucket={bucket}\ncaptured_unix_secs={unix_secs}\nregistry_version={VERSION} \
          coordinator={} coordinator_slot={} coordinator_epoch={} coordinator_heartbeat_ns={} \
          last_progress_ns={} stalled_ns={} generation={} claim_epoch={} min_changed_ticket={} \
-         pending_flags={:#x} replan_outstanding={} global_serial={} grant_scans={} next_slot={} active_tail={} \
+         pending_flags={:#x} replan_outstanding={} replan_wave_started_ns={} replan_wave_deadline_ns={} \
+         global_serial={} grant_scans={} next_slot={} active_tail={} \
          active_records={} records_rendered={} records_truncated={}\n{}\n",
             table.coordinator_ticket(),
             table.coordinator_slot()?,
@@ -3958,6 +4060,8 @@ fn bounded_wait_diagnostic(bucket: u64, unix_secs: u64) -> Result<Option<WaitDia
             table.min_changed_ticket(),
             table.pending_flags(),
             table.replan_outstanding(),
+            read_u64(&table.header, H_REPLAN_WAVE_STARTED_NS),
+            read_u64(&table.header, H_REPLAN_WAVE_DEADLINE_NS),
             table.global_serial(),
             read_u64(&table.header, H_GRANT_SCANS),
             next_slot,
@@ -3980,6 +4084,7 @@ fn record_state_name(state: u32) -> &'static str {
         STATE_COORDINATOR => "coordinator",
         STATE_COORDINATOR_STANDBY => "coordinator-standby",
         STATE_REPLAN => "replan",
+        STATE_REPLAN_EXPIRED => "replan-expired",
         STATE_HELD => "held",
         STATE_FREE => "free",
         _ => "invalid",
@@ -4041,6 +4146,7 @@ pub(super) fn diagnostics_for_tests() -> Result<String> {
             STATE_COORDINATOR => "coordinator",
             STATE_COORDINATOR_STANDBY => "coordinator-standby",
             STATE_REPLAN => "replan",
+            STATE_REPLAN_EXPIRED => "replan-expired",
             STATE_HELD => "held",
             STATE_FREE => "free",
             _ => "invalid",
@@ -5856,6 +5962,23 @@ pub(crate) struct ReplanChangedBatchOutcome {
 }
 
 #[cfg(test)]
+pub(crate) struct ReplanWaveExpiryOutcome {
+    pub(crate) ordinary_wave_not_expired_early: bool,
+    pub(crate) completed_replacement_preserved: bool,
+    pub(crate) stragglers_quarantined: bool,
+    pub(crate) wave_drained_and_clock_cleared: bool,
+    pub(crate) expiration_single_generation_edge: bool,
+    pub(crate) completed_replacement_granted: bool,
+    pub(crate) expired_tickets_not_reissued: bool,
+    pub(crate) late_completion_rejected: bool,
+    pub(crate) late_replacement_rejected: bool,
+    pub(crate) completion_acknowledged_waiting: bool,
+    pub(crate) entry_callback_suppressed: bool,
+    pub(crate) entry_acknowledged_waiting: bool,
+    pub(crate) acknowledgement_rescan_edge: bool,
+}
+
+#[cfg(test)]
 pub(crate) struct ReplanBatchBarrierOutcome {
     pub(crate) granted_entry_callback_suppressed: bool,
     pub(crate) granted_completion_payload_dropped: bool,
@@ -6936,6 +7059,300 @@ pub(super) fn exercise_changed_replan_batch_for_tests(
         authoritative_flags_clear,
         replacements_preserved,
     })
+}
+
+/// Drive a finite wave across its lease boundary without sleeping. One
+/// callback publishes a completed replacement, one returns after the wave was
+/// quarantined, and one has not entered yet. This covers both acknowledgement
+/// paths while proving that expiration unblocks the completed work first.
+#[cfg(test)]
+pub(super) fn exercise_replan_wave_expiry_for_tests() -> Result<ReplanWaveExpiryOutcome> {
+    let coordinator_cpu = 1_300usize;
+    let designated_cpus = [1_301usize, 1_303, 1_305];
+    let replacement_cpus = [1_302usize, 1_304, 1_306];
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [coordinator_cpu], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let mut callbacks = Vec::new();
+    for (&designated_cpu, &replacement_cpu) in designated_cpus.iter().zip(replacement_cpus.iter()) {
+        let designated = ClaimSet::new(std::iter::empty(), [designated_cpu], FlockMode::Exclusive);
+        let replacement =
+            ClaimSet::new(std::iter::empty(), [replacement_cpu], FlockMode::Exclusive);
+        let watch = ClaimSet::new(
+            std::iter::empty(),
+            [designated_cpu, replacement_cpu],
+            FlockMode::Exclusive,
+        );
+        callbacks.push((
+            Ticket::register(designated.clone(), watch, None)?,
+            designated,
+            replacement,
+        ));
+    }
+
+    let wave_started_ns = monotonic_now_ns()?.max(1);
+    let wave_deadline_ns = wave_started_ns.saturating_add(REPLAN_WAVE_LEASE_NS);
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, coordinator_cpu, false)?;
+        for cpu in designated_cpus.into_iter().chain(replacement_cpus) {
+            set_cpu_free_for_tests(&mut table, cpu, false)?;
+        }
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(wave_started_ns)?;
+        anyhow::ensure!(
+            table.replan_outstanding() == callbacks.len() as u64
+                && table.replan_wave_started_ns() == wave_started_ns
+                && table.replan_wave_deadline_ns() == wave_deadline_ns
+                && callbacks.iter().all(|(ticket, _, _)| {
+                    table
+                        .record(ticket.slot)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|record| record.state == STATE_REPLAN)
+                }),
+            "expiry fixture did not publish one coherent finite REPLAN wave",
+        );
+    }
+
+    let completed_designated = callbacks[0].1.clone();
+    let completed_replacement = callbacks[0].2.clone();
+    let completed = callbacks[0].0.run_granted(
+        None,
+        |current, _watch, acquisition_allowed, _predecessors, _availability| {
+            anyhow::ensure!(
+                !acquisition_allowed && current == &completed_designated,
+                "completed expiry callback received the wrong publication",
+            );
+            Ok(GrantAttempt::<()> {
+                acquired: None,
+                preparation_claim: None,
+                preparation_contention: None,
+                next_claim: completed_replacement.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    anyhow::ensure!(
+        matches!(completed, GrantResult::Requeued),
+        "completed expiry callback did not return to WAITING",
+    );
+
+    let mut ordinary_wave_not_expired_early = false;
+    let mut completed_replacement_preserved = false;
+    let mut stragglers_quarantined = false;
+    let mut wave_drained_and_clock_cleared = false;
+    let mut expiration_single_generation_edge = false;
+    let mut completed_replacement_granted = false;
+    let mut expired_tickets_not_reissued = false;
+    let mut generation_after_expiration_scan = 0u32;
+    let completed_slot = callbacks[0].0.slot;
+    let late_slot = callbacks[1].0.slot;
+    let entry_slot = callbacks[2].0.slot;
+    let straggler_slots = [late_slot, entry_slot];
+    let completed_replacement_for_check = callbacks[0].2.clone();
+    let late_designated = callbacks[1].1.clone();
+    let late_replacement = callbacks[1].2.clone();
+    let late_completion = callbacks[1].0.run_granted(
+        None,
+        |current, _watch, acquisition_allowed, _predecessors, _availability| {
+            anyhow::ensure!(
+                !acquisition_allowed && current == &late_designated,
+                "late expiry callback received the wrong publication",
+            );
+            let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+            let mut table = Table::open_existing()?;
+            let generation_before_expiration = table.generation_wake();
+            let expired_early =
+                table.expire_replan_wave_if_due_at(wave_deadline_ns.saturating_sub(1))?;
+            ordinary_wave_not_expired_early = !expired_early
+                && table.replan_outstanding() == 2
+                && straggler_slots.iter().all(|slot| {
+                    table
+                        .record(*slot)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|record| record.state == STATE_REPLAN)
+                });
+
+            anyhow::ensure!(
+                table.expire_replan_wave_if_due_at(wave_deadline_ns)?,
+                "due REPLAN wave did not expire",
+            );
+            let completed_record = table
+                .record(completed_slot)?
+                .ok_or_else(|| anyhow::anyhow!("completed replacement disappeared"))?;
+            completed_replacement_preserved = completed_record.state == STATE_WAITING
+                && completed_record.claim == completed_replacement_for_check;
+            stragglers_quarantined = straggler_slots.iter().all(|slot| {
+                table
+                    .record(*slot)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.state == STATE_REPLAN_EXPIRED)
+            });
+            wave_drained_and_clock_cleared = table.replan_outstanding() == 0
+                && table.replan_wave_started_ns() == 0
+                && table.replan_wave_deadline_ns() == 0
+                && table.pending_flags() & PENDING_REPLAN_BATCH == 0
+                && table.pending_flags() & PENDING_RESCAN != 0;
+            expiration_single_generation_edge = table
+                .generation_wake()
+                .wrapping_sub(generation_before_expiration)
+                == 1;
+
+            set_cpu_free_for_tests(&mut table, replacement_cpus[0], true)?;
+            table.grant_compatible_at(wave_deadline_ns)?;
+            completed_replacement_granted = table.record(completed_slot)?.is_some_and(|record| {
+                record.state == STATE_GRANTED && record.claim == completed_replacement_for_check
+            });
+            expired_tickets_not_reissued = straggler_slots.iter().all(|slot| {
+                table
+                    .record(*slot)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.state == STATE_REPLAN_EXPIRED)
+            });
+            generation_after_expiration_scan = table.generation_wake();
+            Ok(GrantAttempt::<()> {
+                acquired: None,
+                preparation_claim: None,
+                preparation_contention: None,
+                next_claim: late_replacement.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    let late_completion_rejected = matches!(late_completion, GrantResult::LostGrant);
+
+    let (late_replacement_rejected, completion_acknowledged_waiting) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let record = table
+            .record(callbacks[1].0.slot)?
+            .ok_or_else(|| anyhow::anyhow!("late callback ticket disappeared after ack"))?;
+        (
+            record.claim == callbacks[1].1 && record.claim != callbacks[1].2,
+            record.state == STATE_WAITING && record.prefix_epoch == 0,
+        )
+    };
+
+    let mut entry_callback_ran = false;
+    let entry_result = callbacks[2].0.run_granted(
+        None,
+        |_current,
+         _watch,
+         _acquisition_allowed,
+         _predecessors,
+         _availability|
+         -> Result<GrantAttempt<()>> {
+            entry_callback_ran = true;
+            anyhow::bail!("expired REPLAN callback entered stale user code")
+        },
+    )?;
+    let entry_callback_suppressed =
+        matches!(entry_result, GrantResult::LostGrant) && !entry_callback_ran;
+    let (entry_acknowledged_waiting, acknowledgement_rescan_edge) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let record = table
+            .record(callbacks[2].0.slot)?
+            .ok_or_else(|| anyhow::anyhow!("unentered callback ticket disappeared after ack"))?;
+        (
+            record.state == STATE_WAITING && record.prefix_epoch == 0,
+            table.pending_flags() & PENDING_RESCAN != 0
+                && table
+                    .generation_wake()
+                    .wrapping_sub(generation_after_expiration_scan)
+                    == 2,
+        )
+    };
+
+    for (ticket, _, _) in callbacks.iter_mut().rev() {
+        ticket.finish(None)?;
+    }
+    coordinator.finish(None)?;
+    Ok(ReplanWaveExpiryOutcome {
+        ordinary_wave_not_expired_early,
+        completed_replacement_preserved,
+        stragglers_quarantined,
+        wave_drained_and_clock_cleared,
+        expiration_single_generation_edge,
+        completed_replacement_granted,
+        expired_tickets_not_reissued,
+        late_completion_rejected,
+        late_replacement_rejected,
+        completion_acknowledged_waiting,
+        entry_callback_suppressed,
+        entry_acknowledged_waiting,
+        acknowledgement_rescan_edge,
+    })
+}
+
+/// Model a writer dying after decrementing the final outstanding count but
+/// before publishing the corresponding record state. The retained deadline
+/// must let dirty repair recognize and quarantine the still-REPLAN record.
+#[cfg(test)]
+pub(super) fn exercise_replan_expiry_publication_crash_for_tests() -> Result<bool> {
+    let coordinator_cpu = 1_310usize;
+    let callback_cpu = 1_311usize;
+    let alternative_cpu = 1_312usize;
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [coordinator_cpu], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let callback_claim = ClaimSet::new(std::iter::empty(), [callback_cpu], FlockMode::Exclusive);
+    let callback_watch = ClaimSet::new(
+        std::iter::empty(),
+        [callback_cpu, alternative_cpu],
+        FlockMode::Exclusive,
+    );
+    let mut callback = Ticket::register(callback_claim, callback_watch, None)?;
+
+    let publication_torn_with_deadline = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, coordinator_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, callback_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, alternative_cpu, false)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1))?;
+        anyhow::ensure!(
+            table
+                .record(callback.slot)?
+                .is_some_and(|record| record.state == STATE_REPLAN)
+                && table.replan_outstanding() == 1,
+            "crash-order fixture did not publish its REPLAN callback",
+        );
+
+        table.begin_transaction()?;
+        write_u64(&mut table.header, H_REPLAN_WAVE_STARTED_NS, 1);
+        write_u64(&mut table.header, H_REPLAN_WAVE_DEADLINE_NS, 1);
+        table.transition_replan_state(STATE_REPLAN, STATE_REPLAN_EXPIRED)?;
+        table.replan_outstanding() == 0
+            && table.replan_wave_deadline_ns() == 1
+            && table
+                .record(callback.slot)?
+                .is_some_and(|record| record.state == STATE_REPLAN)
+            && atomic_u64(&table.header, H_AGGREGATE_DIRTY).load(Ordering::SeqCst) != 0
+    };
+
+    let repaired_to_expired = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.repair_consistency_if_needed()?;
+        table
+            .record(callback.slot)?
+            .is_some_and(|record| record.state == STATE_REPLAN_EXPIRED)
+            && table.replan_outstanding() == 0
+            && table.replan_wave_started_ns() == 0
+            && table.replan_wave_deadline_ns() == 0
+            && atomic_u64(&table.header, H_AGGREGATE_DIRTY).load(Ordering::SeqCst) == 0
+    };
+
+    callback.finish(None)?;
+    coordinator.finish(None)?;
+    Ok(publication_torn_with_deadline && repaired_to_expired)
 }
 
 /// Exercise both sides of the batch-only priority barrier.  A later GRANTED
@@ -10305,6 +10722,41 @@ impl Table {
         read_u64(&self.header, H_REPLAN_OUTSTANDING)
     }
 
+    fn replan_wave_started_ns(&self) -> u64 {
+        read_u64(&self.header, H_REPLAN_WAVE_STARTED_NS)
+    }
+
+    fn replan_wave_deadline_ns(&self) -> u64 {
+        read_u64(&self.header, H_REPLAN_WAVE_DEADLINE_NS)
+    }
+
+    fn arm_replan_wave_at(&mut self, now: u64) {
+        let started = now.max(1);
+        write_u64(&mut self.header, H_REPLAN_WAVE_STARTED_NS, started);
+        write_u64(
+            &mut self.header,
+            H_REPLAN_WAVE_DEADLINE_NS,
+            started.saturating_add(REPLAN_WAVE_LEASE_NS),
+        );
+    }
+
+    fn clear_replan_wave_clock(&mut self) {
+        write_u64(&mut self.header, H_REPLAN_WAVE_STARTED_NS, 0);
+        write_u64(&mut self.header, H_REPLAN_WAVE_DEADLINE_NS, 0);
+    }
+
+    fn replan_wave_clock_valid_at(&self, now: u64) -> bool {
+        let started = self.replan_wave_started_ns();
+        let deadline = self.replan_wave_deadline_ns();
+        started != 0 && started <= now && deadline >= started
+    }
+
+    fn replan_wave_due_at(&self, now: u64) -> bool {
+        self.replan_outstanding() != 0
+            && self.replan_wave_clock_valid_at(now)
+            && self.replan_wave_deadline_ns() <= now
+    }
+
     fn transition_replan_state(&mut self, old: u32, new: u32) -> Result<()> {
         if (old == STATE_REPLAN) == (new == STATE_REPLAN) {
             return Ok(());
@@ -10323,12 +10775,27 @@ impl Table {
         Ok(())
     }
 
+    fn finish_replan_state_publication(&mut self, old: u32, new: u32) {
+        if old == STATE_REPLAN && new != STATE_REPLAN && self.replan_outstanding() == 0 {
+            // Keep the deadline until after the last record state is durable.
+            // Dirty repair can then distinguish a crash in the count-to-state
+            // gap and quarantine a due callback instead of republishing it.
+            self.clear_replan_wave_clock();
+        }
+    }
+
     /// Complete the finite speculative batch while its final state transition
     /// is still covered by the same dirty transaction. This closes the crash
     /// gap where the last callback could otherwise publish outstanding=0 and
     /// die before making the deferred authoritative scan visible.
     fn promote_replan_batch_if_drained_in_transaction(&mut self) -> Result<bool> {
-        if self.replan_outstanding() != 0 || self.pending_flags() & PENDING_REPLAN_BATCH == 0 {
+        if self.replan_outstanding() != 0 {
+            return Ok(false);
+        }
+        // State transitions normally clear this pair. Keep the drained path
+        // self-healing if a torn transaction left only stale bookkeeping.
+        self.clear_replan_wave_clock();
+        if self.pending_flags() & PENDING_REPLAN_BATCH == 0 {
             return Ok(false);
         }
         self.clear_pending_flag(PENDING_REPLAN_BATCH);
@@ -10336,6 +10803,82 @@ impl Table {
         self.elect_coordinator_in_transaction()?;
         self.bump_generation()?;
         Ok(true)
+    }
+
+    /// Quarantine every callback which survived past the finite wave lease.
+    /// Completed WAITING replacements are deliberately untouched. The single
+    /// transaction drains the derived count, converts the private batch bit
+    /// into one public rescan edge, and wakes each stale callback owner so it
+    /// can acknowledge before this ticket is eligible again.
+    fn expire_replan_wave_if_due_at(&mut self, now: u64) -> Result<bool> {
+        let now = now.max(1);
+        if self.replan_outstanding() == 0 {
+            if self.replan_wave_started_ns() != 0 || self.replan_wave_deadline_ns() != 0 {
+                self.begin_transaction()?;
+                if self.replan_outstanding() == 0 {
+                    self.clear_replan_wave_clock();
+                }
+                self.finish_transaction()?;
+            }
+            return Ok(false);
+        }
+        if !self.replan_wave_clock_valid_at(now) {
+            // Monotonic time can move backwards only across boot. A torn
+            // clock also cannot justify immediate quarantine, so give the
+            // surviving live wave one complete lease from this observation.
+            self.begin_transaction()?;
+            if self.replan_outstanding() != 0 && !self.replan_wave_clock_valid_at(now) {
+                self.arm_replan_wave_at(now);
+            }
+            self.finish_transaction()?;
+            return Ok(false);
+        }
+        if !self.replan_wave_due_at(now) {
+            return Ok(false);
+        }
+
+        self.begin_transaction()?;
+        if !self.replan_wave_due_at(now) {
+            self.finish_transaction()?;
+            return Ok(false);
+        }
+        let expected = self.replan_outstanding();
+        let records = self.scan_records()?;
+        let mut expired = 0u64;
+        for record in records.iter().filter(|record| record.state == STATE_REPLAN) {
+            self.set_record_state(record.slot, STATE_REPLAN_EXPIRED)?;
+            self.clear_record_blocked(record.slot)?;
+            self.invalidate_record_prefix(record.slot)?;
+            self.wake_slot(record.slot)?;
+            expired = expired
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("queue registry expired callback count overflow"))?;
+        }
+        anyhow::ensure!(
+            expired == expected && self.replan_outstanding() == 0,
+            "queue registry REPLAN wave count mismatch during expiration: header={expected}, records={expired}",
+        );
+        self.clear_replan_wave_clock();
+        self.clear_pending_flag(PENDING_REPLAN_BATCH);
+        self.set_pending_flag(PENDING_RESCAN);
+        let generation = self.generation();
+        self.elect_coordinator_in_transaction()?;
+        if self.generation() == generation {
+            self.bump_generation()?;
+        }
+        self.note_queue_progress()?;
+        self.finish_transaction()?;
+        Ok(true)
+    }
+
+    fn expire_replan_wave_if_due(&mut self) -> Result<bool> {
+        if self.replan_outstanding() == 0
+            && self.replan_wave_started_ns() == 0
+            && self.replan_wave_deadline_ns() == 0
+        {
+            return Ok(false);
+        }
+        self.expire_replan_wave_if_due_at(monotonic_now_ns()?)
     }
 
     fn set_pending_flag(&mut self, flag: u64) {
@@ -10775,6 +11318,7 @@ impl Table {
                 | STATE_COORDINATOR_STANDBY
                 | STATE_PENDING
                 | STATE_REVOKED
+                | STATE_REPLAN_EXPIRED
         ) {
             anyhow::bail!("queue registry v{VERSION} slot {slot} has invalid state {state}");
         }
@@ -10815,6 +11359,7 @@ impl Table {
                 | STATE_COORDINATOR_STANDBY
                 | STATE_PENDING
                 | STATE_REVOKED
+                | STATE_REPLAN_EXPIRED
         ) {
             anyhow::bail!("queue registry v{VERSION} slot {slot} has invalid state {state}");
         }
@@ -11337,6 +11882,7 @@ impl Table {
             .record_bytes_mut(slot)?
             .ok_or_else(|| anyhow::anyhow!("queue slot {slot} disappeared"))?;
         write_u32(bytes, R_STATE, publish_state);
+        self.finish_replan_state_publication(prior.state, publish_state);
         // Existing-ticket claim changes invalidate only grants at or after
         // this ticket. The coordinator's next O(N) pass revalidates that
         // suffix; earlier granted waiters refresh their epoch in O(1).
@@ -11589,6 +12135,7 @@ impl Table {
         write_u64(bytes, R_TICKET, 0);
         write_u64(bytes, R_NEXT_FREE, free_head);
         write_u64(&mut self.header, H_FREE_HEAD, record.slot);
+        self.finish_replan_state_publication(record.state, STATE_FREE);
         Ok(())
     }
 
@@ -11602,6 +12149,7 @@ impl Table {
             anyhow::anyhow!("queue slot {slot} disappeared during state publication")
         })?;
         write_u32(bytes, R_STATE, state);
+        self.finish_replan_state_publication(old, state);
         Ok(())
     }
 
@@ -11653,6 +12201,49 @@ impl Table {
         self.set_pending_flag(PENDING_RESCAN);
         self.bump_generation()?;
         self.elect_coordinator_in_transaction()?;
+        self.finish_transaction()?;
+        Ok(true)
+    }
+
+    /// Make one expired speculative ticket eligible only after its owner has
+    /// observed the quarantine. Expiration is non-fencing, so unlike REVOKED
+    /// acknowledgement this does not publish a claim change. Invalidating the
+    /// ticket's own callback token plus one rescan edge is sufficient to make
+    /// it reconsider the complete immutable watch without perturbing later
+    /// predecessor prefixes.
+    fn acknowledge_expired_replan(
+        &mut self,
+        slot: u64,
+        ticket: u64,
+        blocked: Option<(ContentionMarker, u64, u64)>,
+    ) -> Result<bool> {
+        let Some(record) = self.record(slot)?.filter(|record| record.ticket == ticket) else {
+            return Ok(false);
+        };
+        if record.state != STATE_REPLAN_EXPIRED {
+            return Ok(false);
+        }
+        self.begin_transaction()?;
+        let record = self
+            .record(slot)?
+            .filter(|record| record.ticket == ticket && record.state == STATE_REPLAN_EXPIRED)
+            .ok_or_else(|| {
+                anyhow::anyhow!("expired REPLAN queue ticket {ticket} changed during ack")
+            })?;
+        self.set_record_state(record.slot, STATE_WAITING)?;
+        self.clear_record_blocked(record.slot)?;
+        self.invalidate_record_prefix(record.slot)?;
+        if let Some((marker, serial, consumed_serial)) = blocked {
+            self.set_record_blocked(record.slot, marker, serial)?;
+            self.set_record_issue_serial(record.slot, consumed_serial)?;
+            self.mark_blocker_unknown(marker)?;
+        }
+        self.set_pending_flag(PENDING_RESCAN);
+        let generation = self.generation();
+        self.elect_coordinator_in_transaction()?;
+        if self.generation() == generation {
+            self.bump_generation()?;
+        }
         self.finish_transaction()?;
         Ok(true)
     }
@@ -11847,6 +12438,11 @@ impl Table {
         self.begin_transaction()?;
         let records = self.scan_records()?;
         let backfill_now_ns = backfill_now_ns.max(1);
+        if self.replan_outstanding() != 0 && !self.replan_wave_clock_valid_at(backfill_now_ns) {
+            self.arm_replan_wave_at(backfill_now_ns);
+        } else if self.replan_outstanding() == 0 {
+            self.clear_replan_wave_clock();
+        }
         let mut cpu_any = vec![0u64; self.layout.words];
         let mut cpu_exclusive = vec![0u64; self.layout.words];
         let mut llc_any = vec![0u64; self.layout.words];
@@ -11871,6 +12467,17 @@ impl Table {
         self.bump_grant_scans();
 
         for record in records {
+            // An expired planner callback is quarantined until its own owner
+            // acknowledges it. It contributes neither a predecessor fence
+            // nor coordinator/progress ownership and cannot be republished by
+            // an intervening authoritative scan.
+            if record.state == STATE_REPLAN_EXPIRED {
+                if record.backfill_started_ns != 0 {
+                    self.set_record_backfill_started_ns(record.slot, 0)?;
+                    changed = true;
+                }
+                continue;
+            }
             // PENDING does not participate in coordinator election, but its
             // bounded preparation footprint is a real predecessor claim.
             // REVOKED likewise remains an exact predecessor fence until its
@@ -12116,6 +12723,7 @@ impl Table {
                             // callback publication. Dirty repair invalidates all
                             // flexible waiters after any torn point in this wave.
                             write_u64(&mut self.header, H_REPLAN_HORIZON, next_round_horizon);
+                            self.arm_replan_wave_at(backfill_now_ns);
                             replan_wave_started = true;
                         }
                         self.publish_prefix_words(
@@ -12320,6 +12928,12 @@ impl Table {
     }
 
     fn recover_coordinator_if_dead(&mut self) -> Result<()> {
+        if self.expire_replan_wave_if_due()? {
+            // Fallback recovery may run in an ordinary ticket after a timed
+            // futex wait. Wake the coordinator's real inotify transport as
+            // well as the registry futexes published by expiration.
+            notify_coordinator();
+        }
         let mut coordinator = self.coordinator_ticket();
         let mut slot = self.coordinator_slot()?;
         if coordinator == 0 {
@@ -13700,6 +14314,13 @@ impl Table {
 
     fn repair_consistency(&mut self) -> Result<()> {
         atomic_u64(&self.header, H_AGGREGATE_DIRTY).store(1, Ordering::SeqCst);
+        let repair_now = monotonic_now_ns()?.max(1);
+        let replan_wave_started = self.replan_wave_started_ns();
+        let replan_wave_deadline = self.replan_wave_deadline_ns();
+        let expire_replan_wave = replan_wave_started != 0
+            && replan_wave_started <= repair_now
+            && replan_wave_deadline >= replan_wave_started
+            && replan_wave_deadline <= repair_now;
         let next_slot = self.next_slot()?;
         let mut records = Vec::new();
         let mut tickets = BTreeSet::new();
@@ -13826,12 +14447,16 @@ impl Table {
             .find(|record| {
                 record.ticket == previous
                     && !matches!(record.state, STATE_HELD | STATE_PENDING | STATE_REVOKED)
+                    && record.state != STATE_REPLAN_EXPIRED
+                    && !(expire_replan_wave && record.state == STATE_REPLAN)
             })
             .or_else(|| {
                 records
                     .iter()
                     .filter(|record| {
                         !matches!(record.state, STATE_HELD | STATE_PENDING | STATE_REVOKED)
+                            && record.state != STATE_REPLAN_EXPIRED
+                            && !(expire_replan_wave && record.state == STATE_REPLAN)
                     })
                     .min_by_key(|record| record.ticket)
             });
@@ -13843,6 +14468,14 @@ impl Table {
         let mut prefix = AggregateSnapshot::empty(self.layout);
         let prefix_bits = prefix.bits;
         for record in &records {
+            if record.state == STATE_REPLAN_EXPIRED
+                || (expire_replan_wave && record.state == STATE_REPLAN)
+            {
+                self.set_record_state(record.slot, STATE_REPLAN_EXPIRED)?;
+                self.clear_record_blocked(record.slot)?;
+                self.invalidate_record_prefix(record.slot)?;
+                continue;
+            }
             if matches!(record.state, STATE_PENDING | STATE_REVOKED) {
                 self.set_record_state(record.slot, record.state)?;
                 self.clear_record_blocked(record.slot)?;
@@ -13908,6 +14541,7 @@ impl Table {
             self.replan_outstanding() == 0,
             "queue repair left speculative callbacks outstanding after demotion",
         );
+        self.clear_replan_wave_clock();
         // Any interrupted mutation invalidates outstanding grants. They were
         // demoted above; a fresh coordinator pass will stamp the new epoch.
         self.finish_claim_scan();
@@ -13925,6 +14559,12 @@ impl Table {
             .iter()
             .filter(|record| record.state == STATE_REVOKED)
         {
+            self.wake_slot(record.slot)?;
+        }
+        for record in records.iter().filter(|record| {
+            record.state == STATE_REPLAN_EXPIRED
+                || (expire_replan_wave && record.state == STATE_REPLAN)
+        }) {
             self.wake_slot(record.slot)?;
         }
         if let Some(record) = records.iter().find(|record| record.ticket == coordinator) {
@@ -14016,6 +14656,8 @@ fn initialize_header_file(path: &PathBuf, layout: HeaderLayout) -> Result<File> 
         write_u64(&mut header, H_REPLAN_CURSOR, 0);
         write_u64(&mut header, H_REPLAN_HORIZON, 0);
         write_u64(&mut header, H_REPLAN_OUTSTANDING, 0);
+        write_u64(&mut header, H_REPLAN_WAVE_STARTED_NS, 0);
+        write_u64(&mut header, H_REPLAN_WAVE_DEADLINE_NS, 0);
         write_u64(&mut header, H_LAST_PROGRESS_NS, monotonic_now_ns()?);
         // Magic is published last in an inode nobody else can name. The
         // registry path changes only after the complete mapping is flushed.
@@ -14858,13 +15500,34 @@ fn liveness_due_in_from_last(last: u64, now: u64) -> Duration {
     Duration::from_nanos(LIVENESS_SWEEP_INTERVAL_NS.saturating_sub(now - last))
 }
 
+fn replan_wave_due_in_from_header(header: &[u8], now: u64) -> Option<Duration> {
+    if read_u64(header, H_REPLAN_OUTSTANDING) == 0 {
+        return None;
+    }
+    let started = read_u64(header, H_REPLAN_WAVE_STARTED_NS);
+    let deadline = read_u64(header, H_REPLAN_WAVE_DEADLINE_NS);
+    if started == 0 || started > now || deadline < started {
+        return Some(Duration::ZERO);
+    }
+    Some(Duration::from_nanos(deadline.saturating_sub(now)))
+}
+
+fn replan_wave_requires_recovery_from_header(header: &[u8], now: u64) -> bool {
+    replan_wave_due_in_from_header(header, now).is_some_and(|duration| duration.is_zero())
+}
+
 fn liveness_due_in_from_header(header: &[u8], now: u64) -> Duration {
     let periodic = liveness_due_in_from_last(read_u64(header, H_LAST_LIVENESS_SWEEP_NS), now);
     let reconcile_by = read_u64(header, H_LIVENESS_RECONCILE_BY_NS);
-    if reconcile_by == 0 {
+    let liveness = if reconcile_by == 0 {
         periodic
     } else {
         periodic.min(Duration::from_nanos(reconcile_by.saturating_sub(now)))
+    };
+    if let Some(replan) = replan_wave_due_in_from_header(header, now) {
+        liveness.min(replan)
+    } else {
+        liveness
     }
 }
 

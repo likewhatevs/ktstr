@@ -1933,6 +1933,16 @@ pub(crate) fn exercise_changed_replan_batch_for_tests(
 }
 
 #[cfg(test)]
+pub(crate) fn exercise_replan_wave_expiry_for_tests() -> Result<registry::ReplanWaveExpiryOutcome> {
+    registry::exercise_replan_wave_expiry_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_replan_expiry_publication_crash_for_tests() -> Result<bool> {
+    registry::exercise_replan_expiry_publication_crash_for_tests()
+}
+
+#[cfg(test)]
 pub(crate) fn exercise_replan_batch_barriers_for_tests()
 -> Result<registry::ReplanBatchBarrierOutcome> {
     registry::exercise_replan_batch_barriers_for_tests()

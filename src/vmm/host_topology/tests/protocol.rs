@@ -4063,6 +4063,55 @@ fn changed_replan_wave_defers_one_authoritative_scan_until_every_callback_return
 }
 
 #[test]
+fn expired_replan_wave_quarantines_stragglers_without_blocking_completed_work() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_replan_wave_expiry_for_tests()
+        .expect("exercise bounded speculative callback wave");
+    assert!(
+        outcome.ordinary_wave_not_expired_early,
+        "an ordinary finite wave must retain every callback until its exact deadline",
+    );
+    assert!(
+        outcome.completed_replacement_preserved
+            && outcome.stragglers_quarantined
+            && outcome.wave_drained_and_clock_cleared,
+        "deadline recovery must preserve completed replacements while atomically quarantining and draining only live stragglers",
+    );
+    assert!(
+        outcome.expiration_single_generation_edge,
+        "one expired wave must publish exactly one global generation edge",
+    );
+    assert!(
+        outcome.completed_replacement_granted && outcome.expired_tickets_not_reissued,
+        "the first post-expiration scan must admit completed work without republishing an unacknowledged callback",
+    );
+    assert!(
+        outcome.late_completion_rejected
+            && outcome.late_replacement_rejected
+            && outcome.completion_acknowledged_waiting,
+        "a callback returning after expiration must lose its token, discard its stale replacement, and acknowledge back to WAITING",
+    );
+    assert!(
+        outcome.entry_callback_suppressed && outcome.entry_acknowledged_waiting,
+        "a callback which had not entered at expiration must acknowledge without running stale user code",
+    );
+    assert!(
+        outcome.acknowledgement_rescan_edge,
+        "each expired owner acknowledgement must publish one bounded rescan/generation edge",
+    );
+}
+
+#[test]
+fn replan_expiry_repair_preserves_deadline_across_count_to_state_crash() {
+    let _prefixes = LockPrefixesGuard::new();
+    assert!(
+        protocol::exercise_replan_expiry_publication_crash_for_tests()
+            .expect("repair torn final REPLAN expiration publication"),
+        "dirty repair must retain the due wave deadline across the final count decrement and quarantine the record whose state publication was torn",
+    );
+}
+
+#[test]
 fn changed_replan_batch_parks_later_grants_and_coordinator_commits_without_scanning() {
     let _prefixes = LockPrefixesGuard::new();
     let outcome = protocol::exercise_replan_batch_barriers_for_tests()
