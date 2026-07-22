@@ -221,9 +221,12 @@ fn shell_exec_echo() {
         eprintln!("skipping shell_exec_echo: no cached kernel");
         return;
     }
+    // The shell's own --exec timeout bounds guest execution after admission.
+    // Do not add a parent-process timeout here: under cargo-ktstr the child is
+    // an ordinary late queue participant, and nextest owns the intentionally
+    // admission-inclusive process deadline for this test.
     let output = ktstr()
         .args(["shell", "--exec", "echo hello-from-guest"])
-        .timeout(std::time::Duration::from_secs(120))
         .output()
         .expect("failed to run ktstr shell");
     let stderr = String::from_utf8_lossy(&output.stderr);
