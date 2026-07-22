@@ -15,6 +15,7 @@ use super::{
 use crate::flock::{FlockMode, InterruptibleFlockWaiter, block_flock, try_flock};
 use anyhow::{Context, Result};
 use memmap2::{Mmap, MmapMut};
+use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
@@ -411,6 +412,8 @@ thread_local! {
     static ENCODED_WATCH_SERIAL_WALKS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     static SCAN_EXACT_WORD_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static SCAN_CLAIM_HEAP_SPILLS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     static FULL_PREFIX_SNAPSHOT_PUBLISHES: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -914,6 +917,156 @@ struct EncodedWatchSerialBlockedOn {
     serial: u64,
 }
 
+/// Read-only resource view shared by the authoritative [`ClaimSet`] and the
+/// allocation-free common case used by grant scans.
+///
+/// Full record decode retains `BTreeSet` semantics for every mutation and
+/// repair boundary. A grant scan only needs sorted iteration, membership, and
+/// cardinality, so rebuilding one tree node per resource for every record in
+/// every scan is pure allocator traffic.
+trait ClaimView {
+    fn llcs(&self) -> impl Iterator<Item = usize> + '_;
+    fn cpus(&self) -> impl Iterator<Item = usize> + '_;
+    fn permits(&self) -> impl Iterator<Item = usize> + '_;
+    fn llc_len(&self) -> usize;
+    fn cpu_len(&self) -> usize;
+    fn permit_len(&self) -> usize;
+    fn contains_llc(&self, llc: usize) -> bool;
+    fn contains_cpu(&self, cpu: usize) -> bool;
+    fn contains_permit(&self, permit: usize) -> bool;
+    fn llc_mode(&self) -> ClaimMode;
+    fn cpu_mode(&self) -> ClaimMode;
+    fn permit_mode(&self) -> ClaimMode;
+    fn admission_class(&self) -> AdmissionClass;
+}
+
+impl ClaimView for ClaimSet {
+    fn llcs(&self) -> impl Iterator<Item = usize> + '_ {
+        self.llcs.iter().copied()
+    }
+
+    fn cpus(&self) -> impl Iterator<Item = usize> + '_ {
+        self.cpus.iter().copied()
+    }
+
+    fn permits(&self) -> impl Iterator<Item = usize> + '_ {
+        self.permits.iter().copied()
+    }
+
+    fn llc_len(&self) -> usize {
+        self.llcs.len()
+    }
+
+    fn cpu_len(&self) -> usize {
+        self.cpus.len()
+    }
+
+    fn permit_len(&self) -> usize {
+        self.permits.len()
+    }
+
+    fn contains_llc(&self, llc: usize) -> bool {
+        self.llcs.contains(&llc)
+    }
+
+    fn contains_cpu(&self, cpu: usize) -> bool {
+        self.cpus.contains(&cpu)
+    }
+
+    fn contains_permit(&self, permit: usize) -> bool {
+        self.permits.contains(&permit)
+    }
+
+    fn llc_mode(&self) -> ClaimMode {
+        self.llc_mode
+    }
+
+    fn cpu_mode(&self) -> ClaimMode {
+        self.cpu_mode
+    }
+
+    fn permit_mode(&self) -> ClaimMode {
+        self.permit_mode
+    }
+
+    fn admission_class(&self) -> AdmissionClass {
+        self.admission_class
+    }
+}
+
+const SCAN_INLINE_RESOURCES: usize = 8;
+
+#[derive(Debug, Clone)]
+struct ScanClaim {
+    llcs: SmallVec<[usize; SCAN_INLINE_RESOURCES]>,
+    cpus: SmallVec<[usize; SCAN_INLINE_RESOURCES]>,
+    permits: SmallVec<[usize; SCAN_INLINE_RESOURCES]>,
+    llc_mode: ClaimMode,
+    cpu_mode: ClaimMode,
+    permit_mode: ClaimMode,
+    admission_class: AdmissionClass,
+}
+
+impl ScanClaim {
+    fn is_empty(&self) -> bool {
+        self.llcs.is_empty() && self.cpus.is_empty() && self.permits.is_empty()
+    }
+}
+
+impl ClaimView for ScanClaim {
+    fn llcs(&self) -> impl Iterator<Item = usize> + '_ {
+        self.llcs.iter().copied()
+    }
+
+    fn cpus(&self) -> impl Iterator<Item = usize> + '_ {
+        self.cpus.iter().copied()
+    }
+
+    fn permits(&self) -> impl Iterator<Item = usize> + '_ {
+        self.permits.iter().copied()
+    }
+
+    fn llc_len(&self) -> usize {
+        self.llcs.len()
+    }
+
+    fn cpu_len(&self) -> usize {
+        self.cpus.len()
+    }
+
+    fn permit_len(&self) -> usize {
+        self.permits.len()
+    }
+
+    fn contains_llc(&self, llc: usize) -> bool {
+        self.llcs.contains(&llc)
+    }
+
+    fn contains_cpu(&self, cpu: usize) -> bool {
+        self.cpus.contains(&cpu)
+    }
+
+    fn contains_permit(&self, permit: usize) -> bool {
+        self.permits.contains(&permit)
+    }
+
+    fn llc_mode(&self) -> ClaimMode {
+        self.llc_mode
+    }
+
+    fn cpu_mode(&self) -> ClaimMode {
+        self.cpu_mode
+    }
+
+    fn permit_mode(&self) -> ClaimMode {
+        self.permit_mode
+    }
+
+    fn admission_class(&self) -> AdmissionClass {
+        self.admission_class
+    }
+}
+
 impl EncodedWatchSerialBlockedOn {
     fn new(blocked: BlockedOn) -> Self {
         let (kind, index) = match blocked.key {
@@ -957,7 +1110,7 @@ struct ScanRecord {
     slot: u64,
     state: u32,
     ticket: u64,
-    claim: ClaimSet,
+    claim: ScanClaim,
     watch_modes: EncodedWatchModes,
     watch_identity: u64,
     flexible: bool,
@@ -7250,6 +7403,7 @@ pub(crate) struct ReplanTokenWaveOutcome {
     pub(crate) memo_identical_serial_walks: usize,
     pub(crate) memo_identical_layout_words: usize,
     pub(crate) memo_identical_exact_word_reads: usize,
+    pub(crate) memo_identical_claim_heap_spills: usize,
     pub(crate) memo_mixed_waiters: usize,
     pub(crate) memo_mixed_replans: usize,
     pub(crate) memo_mixed_serial_walks: usize,
@@ -7295,6 +7449,7 @@ struct EncodedWatchSerialMemoCaseOutcome {
     initial_serial_walks: usize,
     layout_words: usize,
     initial_exact_word_reads: usize,
+    initial_claim_heap_spills: usize,
     saturated_replans: usize,
     saturated_serial_walks: usize,
     closed_replans: usize,
@@ -7386,6 +7541,7 @@ fn exercise_encoded_watch_serial_memo_case_for_tests(
         table.set_pending_flag(PENDING_RESCAN);
         let walks_before = ENCODED_WATCH_SERIAL_WALKS.with(std::cell::Cell::get);
         let exact_reads_before = SCAN_EXACT_WORD_READS.with(std::cell::Cell::get);
+        let heap_spills_before = SCAN_CLAIM_HEAP_SPILLS.with(std::cell::Cell::get);
         table.grant_compatible()?;
         let initial_serial_walks = ENCODED_WATCH_SERIAL_WALKS
             .with(std::cell::Cell::get)
@@ -7393,6 +7549,9 @@ fn exercise_encoded_watch_serial_memo_case_for_tests(
         let initial_exact_word_reads = SCAN_EXACT_WORD_READS
             .with(std::cell::Cell::get)
             .saturating_sub(exact_reads_before);
+        let initial_claim_heap_spills = SCAN_CLAIM_HEAP_SPILLS
+            .with(std::cell::Cell::get)
+            .saturating_sub(heap_spills_before);
         let count_replans = |table: &mut Table| -> Result<usize> {
             waiters.iter().try_fold(0usize, |count, (ticket, _)| {
                 Ok(count
@@ -7447,6 +7606,7 @@ fn exercise_encoded_watch_serial_memo_case_for_tests(
             initial_serial_walks,
             layout_words: table.layout.words,
             initial_exact_word_reads,
+            initial_claim_heap_spills,
             saturated_replans,
             saturated_serial_walks,
             closed_replans,
@@ -8638,6 +8798,7 @@ pub(super) fn exercise_replan_token_wave_for_tests(
     let memo_identical_serial_walks = memo_identical.initial_serial_walks;
     let memo_identical_layout_words = memo_identical.layout_words;
     let memo_identical_exact_word_reads = memo_identical.initial_exact_word_reads;
+    let memo_identical_claim_heap_spills = memo_identical.initial_claim_heap_spills;
     let memo_mixed_waiters = 8usize;
     let memo_mixed = exercise_encoded_watch_serial_memo_case_for_tests(
         memo_mixed_waiters,
@@ -8667,6 +8828,7 @@ pub(super) fn exercise_replan_token_wave_for_tests(
         memo_identical_serial_walks,
         memo_identical_layout_words,
         memo_identical_exact_word_reads,
+        memo_identical_claim_heap_spills,
         memo_mixed_waiters,
         memo_mixed_replans,
         memo_mixed_serial_walks,
@@ -15246,7 +15408,7 @@ impl Table {
 
     fn grant_compatible_at(&mut self, backfill_now_ns: u64) -> Result<(ClaimSet, bool)> {
         struct BackfillHead {
-            claim: ClaimSet,
+            claim: ScanClaim,
             available: u32,
             admission_open: bool,
         }
@@ -16148,12 +16310,12 @@ impl Table {
         Ok(serial)
     }
 
-    fn claim_availability_compatible(&self, claim: &ClaimSet) -> Result<bool> {
-        for &cpu in &claim.cpus {
+    fn claim_availability_compatible(&self, claim: &impl ClaimView) -> Result<bool> {
+        for cpu in claim.cpus() {
             if !self.bitmap_bit(B_CPU_KNOWN, cpu)? {
                 return Ok(false);
             }
-            let available = match claim.cpu_mode {
+            let available = match claim.cpu_mode() {
                 ClaimMode::Shared => self.bitmap_bit(B_CPU_SH_AVAILABLE, cpu)?,
                 ClaimMode::Exclusive => self.bitmap_bit(B_CPU_EX_AVAILABLE, cpu)?,
             };
@@ -16161,12 +16323,12 @@ impl Table {
                 return Ok(false);
             }
         }
-        for &permit in &claim.permits {
+        for permit in claim.permits() {
             let index = permit_resource_index(permit)?;
             if !self.bitmap_bit(B_CPU_KNOWN, index)? {
                 return Ok(false);
             }
-            let available = match claim.permit_mode {
+            let available = match claim.permit_mode() {
                 ClaimMode::Shared => self.bitmap_bit(B_CPU_SH_AVAILABLE, index)?,
                 ClaimMode::Exclusive => self.bitmap_bit(B_CPU_EX_AVAILABLE, index)?,
             };
@@ -16174,11 +16336,11 @@ impl Table {
                 return Ok(false);
             }
         }
-        for &llc in &claim.llcs {
+        for llc in claim.llcs() {
             if !self.bitmap_bit(B_LLC_KNOWN, llc)? {
                 return Ok(false);
             }
-            let available = match claim.llc_mode {
+            let available = match claim.llc_mode() {
                 ClaimMode::Shared => self.bitmap_bit(B_LLC_SH_AVAILABLE, llc)?,
                 ClaimMode::Exclusive => self.bitmap_bit(B_LLC_EX_AVAILABLE, llc)?,
             };
@@ -16322,24 +16484,24 @@ impl Table {
         }
     }
 
-    fn max_watch_serial(&self, watch: &ClaimSet) -> Result<u64> {
+    fn max_watch_serial(&self, watch: &impl ClaimView) -> Result<u64> {
         let mut serial = 0;
-        for &cpu in &watch.cpus {
+        for cpu in watch.cpus() {
             serial = serial.max(self.resource_serial(S_CPU_SH, cpu)?);
-            if watch.cpu_mode == ClaimMode::Exclusive {
+            if watch.cpu_mode() == ClaimMode::Exclusive {
                 serial = serial.max(self.resource_serial(S_CPU_EX, cpu)?);
             }
         }
-        for &llc in &watch.llcs {
+        for llc in watch.llcs() {
             serial = serial.max(self.resource_serial(S_LLC_SH, llc)?);
-            if watch.llc_mode == ClaimMode::Exclusive {
+            if watch.llc_mode() == ClaimMode::Exclusive {
                 serial = serial.max(self.resource_serial(S_LLC_EX, llc)?);
             }
         }
-        for &permit in &watch.permits {
+        for permit in watch.permits() {
             let index = permit_resource_index(permit)?;
             serial = serial.max(self.resource_serial(S_CPU_SH, index)?);
-            if watch.permit_mode == ClaimMode::Exclusive {
+            if watch.permit_mode() == ClaimMode::Exclusive {
                 serial = serial.max(self.resource_serial(S_CPU_EX, index)?);
             }
         }
@@ -17948,28 +18110,32 @@ struct ScanMetadata {
     claim_identity: u64,
 }
 
-fn fixed_claim_identity(claim: &ClaimSet) -> u64 {
+fn fixed_claim_identity(claim: &impl ClaimView) -> u64 {
     fn hash_u64(hasher: &mut ahash::AHasher, value: u64) {
         hasher.write(&value.to_le_bytes());
     }
 
-    fn hash_indices(hasher: &mut ahash::AHasher, indices: &BTreeSet<usize>) {
-        hash_u64(hasher, indices.len() as u64);
-        for &index in indices {
+    fn hash_indices(
+        hasher: &mut ahash::AHasher,
+        len: usize,
+        indices: impl Iterator<Item = usize>,
+    ) {
+        hash_u64(hasher, len as u64);
+        for index in indices {
             hash_u64(hasher, index as u64);
         }
     }
 
     let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
-    hash_indices(&mut hasher, &claim.cpus);
-    hash_indices(&mut hasher, &claim.llcs);
-    hash_indices(&mut hasher, &claim.permits);
+    hash_indices(&mut hasher, claim.cpu_len(), claim.cpus());
+    hash_indices(&mut hasher, claim.llc_len(), claim.llcs());
+    hash_indices(&mut hasher, claim.permit_len(), claim.permits());
     hasher.write(&[
-        u8::from(claim.cpu_mode == ClaimMode::Exclusive),
-        u8::from(claim.llc_mode == ClaimMode::Exclusive),
-        u8::from(claim.permit_mode == ClaimMode::Exclusive),
+        u8::from(claim.cpu_mode() == ClaimMode::Exclusive),
+        u8::from(claim.llc_mode() == ClaimMode::Exclusive),
+        u8::from(claim.permit_mode() == ClaimMode::Exclusive),
     ]);
-    hasher.write(&encode_admission_class(claim.admission_class).to_le_bytes());
+    hasher.write(&encode_admission_class(claim.admission_class()).to_le_bytes());
     hasher.finish()
 }
 
@@ -18154,9 +18320,9 @@ fn decode_bitset_span(
     span: BitsetWordSpan,
     slot: u64,
     class: &str,
-) -> Result<BTreeSet<usize>> {
+) -> Result<SmallVec<[usize; SCAN_INLINE_RESOURCES]>> {
     span.validate(layout, slot, class)?;
-    let mut out = BTreeSet::new();
+    let mut out = SmallVec::new();
     let start = usize::from(span.start);
     let end = usize::from(span.end);
     let offset = record_bitset_offset(layout, which);
@@ -18171,7 +18337,7 @@ fn decode_bitset_span(
         }
         while word != 0 {
             let bit = word.trailing_zeros() as usize;
-            out.insert(word_index * 64 + bit);
+            out.push(word_index * 64 + bit);
             word &= word - 1;
         }
     }
@@ -18210,36 +18376,55 @@ fn decode_scan_record(bytes: &[u8], layout: HeaderLayout, slot: u64) -> Result<S
     let watch_permit_mode = decode_mode(bytes, R_WATCH_PERMIT_MODE, slot, "permit watch")?;
     let claim_class = decode_admission_class(bytes, R_CLAIM_CLASS, slot, "exact claim")?;
     let metadata = ScanMetadata::read(bytes, layout, slot)?;
-    let claim = ClaimSet::with_all_claim_modes(
-        decode_bitset_span(
-            bytes,
-            layout,
-            RB_CLAIM_LLCS,
-            metadata.claim_llc_span,
-            slot,
-            "LLC",
-        )?,
-        decode_bitset_span(
-            bytes,
-            layout,
-            RB_CLAIM_CPUS,
-            metadata.claim_cpu_span,
-            slot,
-            "CPU",
-        )?,
-        decode_bitset_span(
-            bytes,
-            layout,
-            RB_CLAIM_PERMITS,
-            metadata.claim_permit_span,
-            slot,
-            "permit",
-        )?,
-        claim_llc_mode,
-        claim_cpu_mode,
-        claim_permit_mode,
-    )
-    .with_admission_class(claim_class);
+    let llcs = decode_bitset_span(
+        bytes,
+        layout,
+        RB_CLAIM_LLCS,
+        metadata.claim_llc_span,
+        slot,
+        "LLC",
+    )?;
+    let cpus = decode_bitset_span(
+        bytes,
+        layout,
+        RB_CLAIM_CPUS,
+        metadata.claim_cpu_span,
+        slot,
+        "CPU",
+    )?;
+    let permits = decode_bitset_span(
+        bytes,
+        layout,
+        RB_CLAIM_PERMITS,
+        metadata.claim_permit_span,
+        slot,
+        "permit",
+    )?;
+    let claim = ScanClaim {
+        llc_mode: if llcs.is_empty() {
+            ClaimMode::Exclusive
+        } else {
+            claim_llc_mode
+        },
+        cpu_mode: if cpus.is_empty() {
+            ClaimMode::Exclusive
+        } else {
+            claim_cpu_mode
+        },
+        permit_mode: if permits.is_empty() {
+            ClaimMode::Exclusive
+        } else {
+            claim_permit_mode
+        },
+        llcs,
+        cpus,
+        permits,
+        admission_class: claim_class,
+    };
+    #[cfg(test)]
+    if claim.llcs.spilled() || claim.cpus.spilled() || claim.permits.spilled() {
+        SCAN_CLAIM_HEAP_SPILLS.with(|spills| spills.set(spills.get().saturating_add(1)));
+    }
     if fixed_claim_identity(&claim) != metadata.claim_identity {
         anyhow::bail!(
             "queue registry v{VERSION} slot {slot} sparse exact claim does not match its persisted identity"
@@ -18531,19 +18716,19 @@ fn header_bitmap_bit(header: &[u8], layout: HeaderLayout, which: usize, index: u
 }
 
 fn claim_conflicts_bits(
-    claim: &ClaimSet,
+    claim: &impl ClaimView,
     cpu_any: &[u64],
     cpu_exclusive: &[u64],
     llc_any: &[u64],
     llc_exclusive: &[u64],
     bits: usize,
 ) -> Result<bool> {
-    let cpu_fence = if claim.cpu_mode == ClaimMode::Exclusive {
+    let cpu_fence = if claim.cpu_mode() == ClaimMode::Exclusive {
         cpu_any
     } else {
         cpu_exclusive
     };
-    for &cpu in &claim.cpus {
+    for cpu in claim.cpus() {
         if cpu >= bits {
             anyhow::bail!("CPU index {cpu} exceeds queue registry capacity");
         }
@@ -18551,12 +18736,12 @@ fn claim_conflicts_bits(
             return Ok(true);
         }
     }
-    let permit_fence = if claim.permit_mode == ClaimMode::Exclusive {
+    let permit_fence = if claim.permit_mode() == ClaimMode::Exclusive {
         cpu_any
     } else {
         cpu_exclusive
     };
-    for &permit in &claim.permits {
+    for permit in claim.permits() {
         let index = permit_resource_index(permit)?;
         if index >= bits {
             anyhow::bail!("permit index {permit} exceeds queue registry capacity");
@@ -18565,12 +18750,12 @@ fn claim_conflicts_bits(
             return Ok(true);
         }
     }
-    let llc_fence = if claim.llc_mode == ClaimMode::Exclusive {
+    let llc_fence = if claim.llc_mode() == ClaimMode::Exclusive {
         llc_any
     } else {
         llc_exclusive
     };
-    for &llc in &claim.llcs {
+    for llc in claim.llcs() {
         if llc >= bits {
             anyhow::bail!("LLC index {llc} exceeds queue registry capacity");
         }
@@ -18581,14 +18766,14 @@ fn claim_conflicts_bits(
     Ok(false)
 }
 
-fn claims_conflict(a: &ClaimSet, b: &ClaimSet) -> bool {
+fn claims_conflict(a: &impl ClaimView, b: &impl ClaimView) -> bool {
     let incompatible = |a_mode: ClaimMode, b_mode: ClaimMode| {
         a_mode == ClaimMode::Exclusive || b_mode == ClaimMode::Exclusive
     };
-    (incompatible(a.cpu_mode, b.cpu_mode) && a.cpus.iter().any(|cpu| b.cpus.contains(cpu)))
-        || (incompatible(a.permit_mode, b.permit_mode)
-            && a.permits.iter().any(|permit| b.permits.contains(permit)))
-        || (incompatible(a.llc_mode, b.llc_mode) && a.llcs.iter().any(|llc| b.llcs.contains(llc)))
+    (incompatible(a.cpu_mode(), b.cpu_mode()) && a.cpus().any(|cpu| b.contains_cpu(cpu)))
+        || (incompatible(a.permit_mode(), b.permit_mode())
+            && a.permits().any(|permit| b.contains_permit(permit)))
+        || (incompatible(a.llc_mode(), b.llc_mode()) && a.llcs().any(|llc| b.contains_llc(llc)))
 }
 
 /// Measure one backfill wave in the same CPU-permit units that bound
@@ -18603,10 +18788,13 @@ fn backfill_capacity_for_watch(watch: &ClaimSet) -> u32 {
     u32::try_from(permit_units.max(physical_units)).unwrap_or(u32::MAX)
 }
 
-fn backfill_cost_for_claim(claim: &ClaimSet) -> u32 {
+fn backfill_cost_for_claim(claim: &impl ClaimView) -> u32 {
     let cooperative_end = super::super::cooperative_cpu_permit_end();
-    let permit_units = claim.permits.range(..cooperative_end).count();
-    let physical_units = claim.cpus.len().max(claim.llcs.len()).max(1);
+    let permit_units = claim
+        .permits()
+        .filter(|permit| *permit < cooperative_end)
+        .count();
+    let physical_units = claim.cpu_len().max(claim.llc_len()).max(1);
     u32::try_from(if permit_units == 0 {
         physical_units
     } else {
@@ -18616,38 +18804,38 @@ fn backfill_cost_for_claim(claim: &ClaimSet) -> u32 {
 }
 
 fn add_claim_bits(
-    claim: &ClaimSet,
+    claim: &impl ClaimView,
     cpu_any: &mut [u64],
     cpu_exclusive: &mut [u64],
     llc_any: &mut [u64],
     llc_exclusive: &mut [u64],
     bits: usize,
 ) -> Result<()> {
-    for &cpu in &claim.cpus {
+    for cpu in claim.cpus() {
         if cpu >= bits {
             anyhow::bail!("CPU index {cpu} exceeds queue registry capacity");
         }
         cpu_any[cpu / 64] |= 1u64 << (cpu % 64);
-        if claim.cpu_mode == ClaimMode::Exclusive {
+        if claim.cpu_mode() == ClaimMode::Exclusive {
             cpu_exclusive[cpu / 64] |= 1u64 << (cpu % 64);
         }
     }
-    for &permit in &claim.permits {
+    for permit in claim.permits() {
         let index = permit_resource_index(permit)?;
         if index >= bits {
             anyhow::bail!("permit index {permit} exceeds queue registry capacity");
         }
         cpu_any[index / 64] |= 1u64 << (index % 64);
-        if claim.permit_mode == ClaimMode::Exclusive {
+        if claim.permit_mode() == ClaimMode::Exclusive {
             cpu_exclusive[index / 64] |= 1u64 << (index % 64);
         }
     }
-    for &llc in &claim.llcs {
+    for llc in claim.llcs() {
         if llc >= bits {
             anyhow::bail!("LLC index {llc} exceeds queue registry capacity");
         }
         llc_any[llc / 64] |= 1u64 << (llc % 64);
-        if claim.llc_mode == ClaimMode::Exclusive {
+        if claim.llc_mode() == ClaimMode::Exclusive {
             llc_exclusive[llc / 64] |= 1u64 << (llc % 64);
         }
     }

@@ -4683,6 +4683,10 @@ fn common_watch_replan_wave_is_work_conserving_and_finite() {
         "one grant scan must read one nonzero exact CPU word per sparse waiter plus its coordinator, not three complete registry-width bitsets per record",
     );
     assert_eq!(
+        outcome.memo_identical_claim_heap_spills, 0,
+        "ordinary sparse exact claims must stay inline instead of rebuilding heap-allocated trees during every grant scan",
+    );
+    assert_eq!(
         (outcome.memo_mixed_replans, outcome.memo_mixed_serial_walks),
         (outcome.memo_mixed_waiters, 4),
         "fixed watch identity and blocker identity must form four memo keys: shared watch, distinct watch, and two distinct blockers",
