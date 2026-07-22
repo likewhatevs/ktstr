@@ -1066,8 +1066,8 @@ fn uncontended_fast_fence_does_not_create_registry_metadata() {
     let protocol_dir = std::path::Path::new(&cpu_path)
         .parent()
         .expect("resource lock parent");
-    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v18");
-    let event_dir = protocol_dir.join("ktstr-acquire-events-v18");
+    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v19");
+    let event_dir = protocol_dir.join("ktstr-acquire-events-v19");
     assert!(!registry_dir.exists());
     assert!(!event_dir.exists());
 
@@ -1239,7 +1239,7 @@ fn tracked_acquired_drop_keeps_its_registry_namespace_across_threads() {
     let wrong = tempfile::TempDir::new().expect("wrong-namespace tempdir");
     let wrong_llc_prefix = format!("{}/llc-", wrong.path().display());
     let wrong_cpu_prefix = format!("{}/cpu-", wrong.path().display());
-    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v18");
+    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v19");
     std::fs::create_dir_all(&wrong_registry).expect("create wrong registry directory");
     let wrong_registry_lock =
         crate::flock::try_flock(wrong_registry.join("registry.lock"), FlockMode::Exclusive)
@@ -3796,7 +3796,7 @@ fn dirty_repair_preserves_exact_and_watch_cpu_modes() {
         protocol::exercise_cpu_mode_repair_for_tests().expect("exercise dirty CPU-mode repair");
     assert!(
         flexible_preserved && flexible_still_flexible,
-        "repair must retain a CPU SH exact claim under its CPU EX watch and mark it REPLAN",
+        "repair must retain a CPU SH exact claim under its CPU EX watch as an invalidated WAITING ticket",
     );
     assert!(
         fixed_preserved && fixed_still_fixed,
@@ -3805,20 +3805,302 @@ fn dirty_repair_preserves_exact_and_watch_cpu_modes() {
 }
 
 #[test]
-fn granted_callbacks_read_one_cached_prefix_without_walking_the_queue() {
+fn common_watch_replan_token_is_single_and_advances_without_starvation() {
     let _prefixes = LockPrefixesGuard::new();
-    let waiters = 128usize;
-    let (callbacks, prefix_reads, active_list_reads) =
-        protocol::exercise_prefix_callback_scaling_for_tests(waiters)
-            .expect("exercise cached predecessor prefixes");
-    assert_eq!(callbacks, waiters, "each REPLAN ticket must run once");
-    assert_eq!(
-        prefix_reads, waiters,
-        "each callback must copy only its own cached prefix record",
+    let waiters = 1_000usize;
+    let outcome = protocol::exercise_replan_token_wave_for_tests(waiters)
+        .expect("exercise finite REPLAN token waves");
+    let expected_exact_grants = (0..waiters).step_by(16).count();
+    assert!(
+        outcome.registration_waiting,
+        "flexible registration must not publish speculative callbacks directly",
     );
     assert_eq!(
-        active_list_reads, 0,
-        "callback admission must be independent of active queue depth",
+        outcome.exact_grants, expected_exact_grants,
+        "one scan must still drain every exact viable disjoint grant",
+    );
+    assert_eq!(
+        outcome.initial_replans, 1,
+        "a common-watch storm must publish exactly one speculative callback",
+    );
+    assert_eq!(
+        outcome.initial_wakes,
+        expected_exact_grants + 1,
+        "the first scan may wake exact grants plus only one REPLAN owner",
+    );
+    assert_eq!(
+        outcome.initial_prefix_comparisons, 1,
+        "the scan may validate its one live coordinator publication, but must not reread the 1,000 flexible WAITING prefixes",
+    );
+    assert!(
+        outcome.live_token_exact_granted && outcome.live_token_exact_woken,
+        "new exact capacity must still grant and wake while a speculative token is live",
+    );
+    assert_eq!(
+        (outcome.live_token_replans, outcome.live_token_replan_wakes),
+        (1, 0),
+        "an exact grant scan must preserve the sole live REPLAN token without waking it again",
+    );
+    assert_eq!(
+        outcome.callback_prefix_reads, 1,
+        "the selected callback must copy only its own cached prefix record",
+    );
+    assert_eq!(
+        outcome.callback_active_reads, 0,
+        "callback admission must remain independent of active queue depth",
+    );
+    assert!(
+        outcome.successive_token_advanced && outcome.third_token_advanced,
+        "repeated common-resource improvements must advance through tickets before wrapping",
+    );
+    assert_eq!(
+        (outcome.successive_replans, outcome.successive_wakes),
+        (1, 1),
+        "the second wave must publish and wake one REPLAN owner",
+    );
+    assert_eq!(
+        (outcome.third_replans, outcome.third_wakes),
+        (1, 1),
+        "the third wave must publish and wake one REPLAN owner",
+    );
+    assert!(
+        outcome.dead_owner_token_advanced,
+        "removing the cursor owner must advance directly to a live successor",
+    );
+    assert_eq!(
+        (outcome.dead_owner_replans, outcome.dead_owner_wakes),
+        (1, 1),
+        "owner-death recovery must publish only one successor token",
+    );
+    assert!(
+        outcome.removed_cursor_slot_recycled,
+        "the regression must exercise a new ticket reusing the removed cursor owner's slot",
+    );
+    assert!(
+        outcome.removed_cursor_wrapped,
+        "a frozen round horizon must wrap to old eligible work before post-horizon arrivals",
+    );
+    assert_eq!(
+        (outcome.wrapped_replans, outcome.wrapped_wakes),
+        (1, 1),
+        "round wrap must still publish and wake exactly one speculative owner",
+    );
+}
+
+#[test]
+fn replan_cursor_crash_repair_preserves_one_forward_moving_token() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_replan_crash_repair_for_tests()
+        .expect("repair torn REPLAN cursor publication");
+    assert!(
+        outcome.dirty_repair_completed && outcome.torn_token_demoted,
+        "dirty recovery must demote an ambiguously delivered REPLAN publication to invalidated WAITING",
+    );
+    assert!(
+        outcome.repair_generation_advanced && outcome.repair_generation_woke,
+        "dirty repair must publish a generation change and wake every pending registrant",
+    );
+    assert!(
+        outcome.cursor_preserved && outcome.horizon_preserved,
+        "recovery must retain a coherent finite-round cursor and horizon",
+    );
+    assert!(
+        outcome.successor_selected,
+        "the repaired round must advance beyond the torn token owner",
+    );
+    assert_eq!(
+        (outcome.recovered_replans, outcome.recovered_wakes),
+        (1, 1),
+        "recovery must publish and wake exactly one successor REPLAN token",
+    );
+    assert_eq!(
+        (outcome.repeated_replans, outcome.repeated_wakes),
+        (1, 0),
+        "a live recovered token must suppress duplicate token publication and wake",
+    );
+}
+
+#[test]
+fn intrascan_fence_activation_refreshes_live_replan_epoch() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (earlier_granted, publication_changed, stale_completion_rejected) =
+        protocol::exercise_intrascan_fence_epoch_for_tests()
+            .expect("exercise intra-scan predecessor-fence activation");
+    assert!(
+        earlier_granted,
+        "the earlier fixed waiter must become GRANTED"
+    );
+    assert!(
+        publication_changed,
+        "activating its fence must refresh the later live REPLAN with a fresh epoch",
+    );
+    assert!(
+        stale_completion_rejected,
+        "the already-running REPLAN callback must not commit from its stale predecessor snapshot",
+    );
+}
+
+#[test]
+fn scanner_death_after_earlier_grant_demotes_stale_later_grant() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (stale_later_rejected, later_demoted, earlier_regranted) =
+        protocol::exercise_grant_scan_crash_fence_for_tests()
+            .expect("repair scanner death between an earlier grant and later revocation");
+    assert!(
+        stale_later_rejected,
+        "a later conflicting GRANTED publication must not enter its stale callback after scanner death",
+    );
+    assert!(
+        later_demoted,
+        "dirty repair must demote the unvisited later grant before exposing a clean registry",
+    );
+    assert!(
+        earlier_regranted,
+        "a fresh authoritative scan must restore forward progress for the earlier ticket",
+    );
+}
+
+#[test]
+fn callback_tokens_change_only_when_their_exact_prefix_or_watch_changes() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_granular_prefix_invalidation_for_tests()
+        .expect("exercise granular callback invalidation");
+    assert!(
+        outcome.coordinator_preserved,
+        "later claim epochs must not rewrite the coordinator's unchanged empty prefix",
+    );
+    assert!(
+        outcome.granted_preserved && outcome.replan_preserved && outcome.waiting_preserved,
+        "duplicate predecessor churn with identical aggregate prefix, watch serial, and blocker \
+         viability must preserve GRANTED, REPLAN, and WAITING publications",
+    );
+    assert!(
+        outcome.granted_refreshed && outcome.replan_refreshed && outcome.waiting_replanned,
+        "a real newly-added predecessor bit must refresh or replan every affected callback state",
+    );
+    assert!(
+        outcome.entry_unchanged_reconciled && outcome.entry_changed_refreshed,
+        "callback entry must run one authoritative dirty-suffix scan, preserving identical tokens \
+         and exposing a real changed prefix before planner code runs",
+    );
+    assert!(
+        outcome.completion_unchanged_kept && outcome.completion_changed_rejected,
+        "callback completion must keep expensive work across an identical reconciled prefix but \
+         reject work whose predecessor inputs really changed",
+    );
+    assert!(
+        outcome.coordinator_completion_unchanged_kept
+            && outcome.coordinator_completion_changed_rejected,
+        "coordinator commit must likewise retain physical success across aggregate-equivalent \
+         predecessor churn and reject it after a real prefix change",
+    );
+}
+
+#[test]
+fn live_callbacks_ignore_resource_serial_churn_until_waiting_again() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (alternatives_kept, designated_kept, physical_commit_kept, herd_kept) =
+        protocol::exercise_granted_serial_scope_for_tests()
+            .expect("exercise exact grant resource-serial scope");
+    assert!(
+        alternatives_kept && designated_kept,
+        "resource-improvement serials must not rewrite a live exact grant; its physical probe is \
+         the authoritative availability result",
+    );
+    assert!(
+        physical_commit_kept,
+        "an unrelated alternative improvement during an exact physical acquisition must not \
+         discard the acquired payload",
+    );
+    assert!(
+        herd_kept,
+        "repeated unrelated improvements must preserve every live GRANTED/REPLAN publication in \
+         a herd",
+    );
+}
+
+#[test]
+fn revoked_grants_keep_their_fence_until_the_callback_acknowledges() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_revocation_ack_for_tests()
+        .expect("exercise revoked grant acknowledgement");
+    assert!(
+        outcome.before_entry_acked && outcome.during_callback_acked,
+        "revocation must be acknowledged both before callback entry and after an in-flight \
+         callback drops its result",
+    );
+    assert!(
+        outcome.later_publication_preserved,
+        "the revocation scan must retain the old exact predecessor fence and must not mutate a \
+         later callback publication",
+    );
+    assert!(
+        outcome.successor_rescan_published,
+        "REVOKED acknowledgement must atomically publish WAITING plus the successor rescan",
+    );
+}
+
+#[test]
+fn revoked_owner_death_retires_fence_and_wakes_successor() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (live_fence_preserved, dead_record_removed, successor_granted, successor_woken) =
+        protocol::exercise_revoked_owner_death_for_tests()
+            .expect("exercise REVOKED owner liveness pruning");
+    assert!(
+        live_fence_preserved,
+        "a live REVOKED owner must retain its predecessor fence even after capacity returns",
+    );
+    assert!(
+        dead_record_removed,
+        "the same fence must be removed once its authoritative liveness owner dies",
+    );
+    assert!(
+        successor_granted && successor_woken,
+        "pruning the dead REVOKED fence must immediately grant and wake its successor",
+    );
+}
+
+#[test]
+fn revoke_before_wake_crash_repair_wakes_ack_and_successor() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (preserved, owner_woken, acked_without_callback, successor_progressed) =
+        protocol::exercise_revoke_crash_repair_for_tests()
+            .expect("repair a torn GRANTED-to-REVOKED publication");
+    assert!(
+        preserved,
+        "dirty repair must preserve the ambiguous REVOKED predecessor fence",
+    );
+    assert!(
+        owner_woken,
+        "repair must replay the targeted wake which the crashed scanner may have missed",
+    );
+    assert!(
+        acked_without_callback,
+        "the woken owner must acknowledge REVOKED without entering stale planner code",
+    );
+    assert!(
+        successor_progressed,
+        "retiring the acknowledged owner must let its successor advance",
+    );
+}
+
+#[test]
+fn free_observation_wakes_clean_waiting_queue_without_an_initial_scan() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (waiting_without_scan, observation_scheduled, granted, futex_woken) =
+        protocol::exercise_waiting_release_wake_for_tests()
+            .expect("exercise no-initial-scan WAITING wake");
+    assert!(
+        waiting_without_scan,
+        "the appended ticket must begin WAITING before any compatibility scan has run",
+    );
+    assert!(
+        observation_scheduled,
+        "a free observation must durably request the WAITING ticket's first compatibility scan",
+    );
+    assert!(
+        granted && futex_woken,
+        "that scan must grant and directly wake the clean WAITING ticket",
     );
 }
 
@@ -3939,12 +4221,12 @@ fn predecessor_prefixes_preserve_modes_order_and_dirty_repair() {
 #[test]
 fn predecessor_release_refreshes_an_already_runnable_replan_prefix() {
     let _prefixes = LockPrefixesGuard::new();
-    let (prefix_refreshed, serial_refreshed, candidate_ready, replacement_committed) =
+    let (prefix_refreshed, publication_refreshed, candidate_ready, replacement_committed) =
         protocol::exercise_prefix_refresh_after_predecessor_release_for_tests()
             .expect("exercise acquired-predecessor prefix refresh");
     assert!(
-        prefix_refreshed && serial_refreshed,
-        "a holder-release improvement must refresh both the cached predecessor prefix and its issue serial",
+        prefix_refreshed && publication_refreshed,
+        "a holder release must publish one coherent refreshed predecessor snapshot",
     );
     assert!(
         candidate_ready && replacement_committed,
@@ -3979,16 +4261,18 @@ fn waiting_publication_preserves_consumed_predecessor_release_progress() {
 #[test]
 fn callback_cannot_consume_an_improvement_it_did_not_observe() {
     let _prefixes = LockPrefixesGuard::new();
-    let (stale_rejected, fresh_seen, replacement_committed, serial_consumed_by_fresh) =
+    let (stale_published_once, fresh_seen, replacement_revalidated, serial_consumed_by_fresh) =
         protocol::exercise_issue_serial_race_for_tests()
             .expect("exercise callback issue-serial race");
     assert!(
-        stale_rejected,
-        "a callback whose availability snapshot predates an improvement must lose its issuance",
+        stale_published_once,
+        "a REPLAN callback may publish its old choice once, but WAITING must retain the unseen \
+         improvement as immediate replan work",
     );
     assert!(
-        fresh_seen && replacement_committed && serial_consumed_by_fresh,
-        "the already-runnable ticket must immediately use a refreshed snapshot before consuming the improvement serial",
+        fresh_seen && replacement_revalidated && serial_consumed_by_fresh,
+        "the already-runnable ticket must use the refreshed snapshot once, then keep a selected \
+         claim WAITING when the successor scan finds it unavailable",
     );
 }
 
@@ -5888,7 +6172,7 @@ fn invalidated_inflight_grant_drops_its_acquired_payload_before_commit() {
             coordinator.assert_running("later in-flight grant revocation");
             earlier.assert_running("later in-flight grant revocation");
             later.assert_running("later in-flight grant revocation");
-            Ok(protocol::ticket_is_waiting_for_tests(later.pid)
+            Ok(protocol::ticket_is_revoked_for_tests(later.pid)
                 .expect("read later ticket state")
                 .then_some(()))
         },
@@ -5945,7 +6229,7 @@ fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
     let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .expect("re-block waiter after epoch transition");
-    // Leave the replacement as an external, unregistered flock. A current-v18
+    // Leave the replacement as an external, unregistered flock. A current-v19
     // HELD publication would authoritatively revoke the in-flight grant before
     // its callback returned, bypassing the stale-negative-evidence path this
     // test is meant to pin.
@@ -6193,7 +6477,7 @@ fn remove_crash_after_counts_before_free_is_repaired() {
     let markers = tempfile::TempDir::new().expect("marker dir");
     let removing =
         TicketChild::spawn_crashing(markers.path(), "removing", "1", "remove_counts_before_free");
-    // The v18 HELD lifecycle removes its registry record only after the
+    // The v19 HELD lifecycle removes its registry record only after the
     // physical reservation is released. Let the helper pass its normal
     // release barrier so the injected crash observes that production ordering.
     std::fs::write(&removing.release, b"release").expect("release crash-test reservation");
@@ -6279,6 +6563,43 @@ fn grant_crash_after_state_before_wake_still_makes_progress() {
     waiter.wait_for_acquired();
     waiter.release_and_wait();
     drop(blocker);
+}
+
+#[test]
+fn replan_cursor_crash_before_wake_recovers_across_processes() {
+    let _prefixes = LockPrefixesGuard::new();
+    let markers = tempfile::TempDir::new().expect("marker dir");
+    let blocker_one = crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Exclusive)
+        .unwrap()
+        .unwrap();
+    let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
+        .unwrap()
+        .unwrap();
+    let blocker_three =
+        crate::flock::try_flock(cpu_lock_path(3), crate::flock::FlockMode::Exclusive)
+            .unwrap()
+            .unwrap();
+    let coordinator = TicketChild::spawn_crashing(
+        markers.path(),
+        "replan-crashing-coordinator",
+        "1",
+        "replan_state_and_cursor_before_wake",
+    );
+    wait_for_ticket_pids(&[coordinator.pid]);
+    let waiter = TicketChild::spawn(markers.path(), "replan-waiter", "2;3", false);
+    coordinator.wait_for_injected_crash();
+
+    // A new registrant acquires the abandoned EX flock, repairs the torn
+    // cursor/state transaction, and proves disjoint work still progresses.
+    let recovery = TicketChild::spawn(markers.path(), "replan-recovery", "4", false);
+    recovery.wait_for_acquired();
+    recovery.release_and_wait();
+
+    drop(blocker_three);
+    drop(blocker_two);
+    waiter.wait_for_acquired();
+    waiter.release_and_wait();
+    drop(blocker_one);
 }
 
 #[test]

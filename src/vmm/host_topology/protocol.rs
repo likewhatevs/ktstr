@@ -1,6 +1,6 @@
 //! Cross-process host-resource admission under nextest.
 //!
-//! Every ktstr process sharing a lock directory participates in one v18
+//! Every ktstr process sharing a lock directory participates in one v19
 //! fixed-record mmap registry. A ticket publishes one exact, non-empty CPU/LLC
 //! reservation claim plus the resources its planner may watch. Claims preserve
 //! the resource-lock semantics exactly: CPU and LLC claims independently use
@@ -1901,10 +1901,57 @@ pub(crate) fn exercise_cpu_mode_repair_for_tests() -> Result<(bool, bool, bool, 
 }
 
 #[cfg(test)]
-pub(crate) fn exercise_prefix_callback_scaling_for_tests(
+pub(crate) fn exercise_replan_token_wave_for_tests(
     waiters: usize,
-) -> Result<(usize, usize, usize)> {
-    registry::exercise_prefix_callback_scaling_for_tests(waiters)
+) -> Result<registry::ReplanTokenWaveOutcome> {
+    registry::exercise_replan_token_wave_for_tests(waiters)
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_replan_crash_repair_for_tests() -> Result<registry::ReplanCrashRepairOutcome>
+{
+    registry::exercise_replan_crash_repair_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_intrascan_fence_epoch_for_tests() -> Result<(bool, bool, bool)> {
+    registry::exercise_intrascan_fence_epoch_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_grant_scan_crash_fence_for_tests() -> Result<(bool, bool, bool)> {
+    registry::exercise_grant_scan_crash_fence_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_granular_prefix_invalidation_for_tests()
+-> Result<registry::GranularPrefixInvalidationOutcome> {
+    registry::exercise_granular_prefix_invalidation_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_granted_serial_scope_for_tests() -> Result<(bool, bool, bool, bool)> {
+    registry::exercise_granted_serial_scope_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_revocation_ack_for_tests() -> Result<registry::RevocationAckOutcome> {
+    registry::exercise_revocation_ack_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_revoked_owner_death_for_tests() -> Result<(bool, bool, bool, bool)> {
+    registry::exercise_revoked_owner_death_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_revoke_crash_repair_for_tests() -> Result<(bool, bool, bool, bool)> {
+    registry::exercise_revoke_crash_repair_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_waiting_release_wake_for_tests() -> Result<(bool, bool, bool, bool)> {
+    registry::exercise_waiting_release_wake_for_tests()
 }
 
 #[cfg(test)]
@@ -2153,6 +2200,11 @@ pub(crate) fn ticket_blocked_at_current_serial_for_tests(pid: u32) -> Result<boo
 #[cfg(test)]
 pub(crate) fn ticket_is_waiting_for_tests(pid: u32) -> Result<bool> {
     registry::ticket_is_waiting_for_tests(pid)
+}
+
+#[cfg(test)]
+pub(crate) fn ticket_is_revoked_for_tests(pid: u32) -> Result<bool> {
+    registry::ticket_is_revoked_for_tests(pid)
 }
 
 #[cfg(test)]
