@@ -2195,12 +2195,17 @@ impl Ticket {
             let (prefix_epoch, predecessors) = table.cached_prefix(record.slot)?;
             if prefix_epoch == 0 || prefix_epoch != state_epoch {
                 table.begin_transaction()?;
-                if record.state == STATE_REPLAN {
+                let replan_completion = record.state == STATE_REPLAN;
+                if replan_completion {
                     table.mark_suffix_dirty(record.ticket);
                 }
                 table.set_record_state(self.slot, STATE_WAITING)?;
                 table.clear_record_blocked(self.slot)?;
-                let notify = table.schedule_rescan_edge_in_transaction()?;
+                let notify = if replan_completion {
+                    table.schedule_replan_completion_edge_in_transaction()?
+                } else {
+                    table.schedule_rescan_edge_in_transaction()?
+                };
                 table.finish_transaction()?;
                 drop(table);
                 drop(_lock);
@@ -2641,9 +2646,11 @@ impl Ticket {
             callback_snapshot_serial.max(serial)
         });
         // Every callback completion publishes a coalesced rescan edge in the
-        // same transaction as REPLAN -> WAITING. Other live REPLAN callbacks
-        // remain private planner work; they neither fence this replacement nor
-        // delay its next authoritative viability scan.
+        // same transaction as REPLAN -> WAITING. A live REPLAN wave batches
+        // only the targeted transport notification: its coordinator heartbeat
+        // consumes a partial batch within one second, while the final callback
+        // wakes it immediately. The edge and suffix fence remain authoritative
+        // throughout.
         let notify_now;
         if changed {
             if acquisition_allowed {
@@ -2696,7 +2703,11 @@ impl Ticket {
             }
             table.set_record_state(self.slot, STATE_WAITING)?;
             table.set_record_issue_serial(self.slot, consumed_serial)?;
-            notify_now = table.schedule_rescan_edge_in_transaction()?;
+            notify_now = if acquisition_allowed {
+                table.schedule_rescan_edge_in_transaction()?
+            } else {
+                table.schedule_replan_completion_edge_in_transaction()?
+            };
             table.finish_transaction()?;
         }
 
@@ -6802,10 +6813,12 @@ pub(crate) struct ReplanTokenWaveOutcome {
 #[cfg(test)]
 pub(crate) struct ReplanChangedWaveOutcome {
     pub(crate) callbacks: usize,
+    pub(crate) intermediate_notify_delta: u64,
     pub(crate) intermediate_scan_delta: u64,
     pub(crate) intermediate_generation_wake_delta: u32,
     pub(crate) intermediate_rescan_coalesced: bool,
     pub(crate) final_scan_delta_before_authoritative: u64,
+    pub(crate) final_notify_delta: u64,
     pub(crate) final_generation_wake_delta: u32,
     pub(crate) final_rescan_edge: bool,
     pub(crate) authoritative_scan_delta: u64,
@@ -8004,7 +8017,7 @@ pub(super) fn exercise_changed_replan_wave_completions_for_tests(
         ));
     }
 
-    let (scans_before, generation_wake_before) = {
+    let (scans_before, generation_wake_before, notify_before) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
         table.set_replan_capacity_for_tests(callback_count)?;
@@ -8033,6 +8046,7 @@ pub(super) fn exercise_changed_replan_wave_completions_for_tests(
         (
             read_u64(&table.header, H_GRANT_SCANS),
             table.generation_wake(),
+            NOTIFY_CALLS.with(std::cell::Cell::get),
         )
     };
 
@@ -8062,6 +8076,7 @@ pub(super) fn exercise_changed_replan_wave_completions_for_tests(
     }
 
     let (
+        intermediate_notify_delta,
         intermediate_scan_delta,
         intermediate_generation_wake_delta,
         intermediate_rescan_coalesced,
@@ -8069,6 +8084,9 @@ pub(super) fn exercise_changed_replan_wave_completions_for_tests(
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let table = Table::open_existing()?;
         (
+            NOTIFY_CALLS
+                .with(std::cell::Cell::get)
+                .wrapping_sub(notify_before),
             read_u64(&table.header, H_GRANT_SCANS).wrapping_sub(scans_before),
             table.generation_wake().wrapping_sub(generation_wake_before),
             table.replan_outstanding() == 1 && table.pending_flags() & PENDING_RESCAN != 0,
@@ -8101,6 +8119,7 @@ pub(super) fn exercise_changed_replan_wave_completions_for_tests(
 
     let (
         final_scan_delta_before_authoritative,
+        final_notify_delta,
         final_generation_wake_delta,
         final_rescan_edge,
         authoritative_scan_delta,
@@ -8111,6 +8130,9 @@ pub(super) fn exercise_changed_replan_wave_completions_for_tests(
         let mut table = Table::open_existing()?;
         let final_scan_delta_before_authoritative =
             read_u64(&table.header, H_GRANT_SCANS).wrapping_sub(scans_before);
+        let final_notify_delta = NOTIFY_CALLS
+            .with(std::cell::Cell::get)
+            .wrapping_sub(notify_before);
         let final_generation_wake_delta =
             table.generation_wake().wrapping_sub(generation_wake_before);
         let final_rescan_edge =
@@ -8128,6 +8150,7 @@ pub(super) fn exercise_changed_replan_wave_completions_for_tests(
         });
         (
             final_scan_delta_before_authoritative,
+            final_notify_delta,
             final_generation_wake_delta,
             final_rescan_edge,
             authoritative_scan_delta,
@@ -8142,10 +8165,12 @@ pub(super) fn exercise_changed_replan_wave_completions_for_tests(
     coordinator.finish(None)?;
     Ok(ReplanChangedWaveOutcome {
         callbacks: callback_count,
+        intermediate_notify_delta,
         intermediate_scan_delta,
         intermediate_generation_wake_delta,
         intermediate_rescan_coalesced,
         final_scan_delta_before_authoritative,
+        final_notify_delta,
         final_generation_wake_delta,
         final_rescan_edge,
         authoritative_scan_delta,
@@ -12502,6 +12527,19 @@ impl Table {
         Ok(new_edge || coordinator_elected)
     }
 
+    /// Publish the authoritative scan edge for one REPLAN -> WAITING
+    /// completion without waking the same live coordinator once per callback.
+    /// The coordinator's one-second heartbeat observes a pending partial wave;
+    /// draining the wave or electing a missing coordinator remains an immediate
+    /// targeted wake even when another completion already set the edge.
+    fn schedule_replan_completion_edge_in_transaction(&mut self) -> Result<bool> {
+        let coordinator_before = self.coordinator_ticket();
+        self.schedule_rescan_edge_in_transaction()?;
+        let coordinator_elected =
+            coordinator_before == 0 && self.coordinator_ticket() != 0;
+        Ok(self.replan_outstanding() == 0 || coordinator_elected)
+    }
+
     fn observation_request_serial(&self) -> u64 {
         read_u64(&self.header, H_OBSERVATION_REQUEST).max(1)
     }
@@ -13370,9 +13408,9 @@ impl Table {
     }
 
     /// Publish a replacement selected by one non-acquiring REPLAN callback.
-    /// Both the old REPLAN and new WAITING record are non-fencing. Publish a
-    /// coalesced rescan edge immediately so this completed replacement can run
-    /// while unrelated planner callbacks remain outstanding.
+    /// Both the old REPLAN and new WAITING record are non-fencing. Publish the
+    /// rescan edge atomically, while batching its transport notification with
+    /// the rest of the live speculative wave.
     #[expect(
         clippy::too_many_arguments,
         reason = "speculative replacement carries the complete record transition"
@@ -13401,7 +13439,7 @@ impl Table {
         )?;
         // Publish WAITING before election so a completion which outlived its
         // coordinator is itself eligible to take over immediately.
-        let notify = self.schedule_rescan_edge_in_transaction()?;
+        let notify = self.schedule_replan_completion_edge_in_transaction()?;
         self.finish_transaction()?;
         Ok(notify)
     }

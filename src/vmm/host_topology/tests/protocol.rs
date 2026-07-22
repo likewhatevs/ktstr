@@ -4604,6 +4604,10 @@ fn changed_replan_completions_coalesce_one_authoritative_scan() {
         .expect("exercise changed speculative callback wave");
     assert_eq!(outcome.callbacks, callbacks);
     assert_eq!(
+        outcome.intermediate_notify_delta, 0,
+        "the first N-1 completions must leave transport batching to the live coordinator heartbeat",
+    );
+    assert_eq!(
         (
             outcome.intermediate_scan_delta,
             outcome.intermediate_generation_wake_delta,
@@ -4618,6 +4622,10 @@ fn changed_replan_completions_coalesce_one_authoritative_scan() {
     assert_eq!(
         outcome.final_scan_delta_before_authoritative, 0,
         "the final callback must publish, but must not execute, the authoritative scan",
+    );
+    assert_eq!(
+        outcome.final_notify_delta, 1,
+        "draining the final speculative callback must emit exactly one immediate coordinator notification",
     );
     assert_eq!(
         outcome.final_generation_wake_delta, 0,
