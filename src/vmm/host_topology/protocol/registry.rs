@@ -6120,8 +6120,8 @@ pub(crate) struct ReplanStragglerProgressOutcome {
     pub(crate) callback_scan_delta: u64,
     pub(crate) callback_generation_wake_delta: u32,
     pub(crate) edge_coalesced_with_straggler: bool,
-    pub(crate) dirty_later_grant_suppressed: bool,
-    pub(crate) later_disjoint_grant_remained_current: bool,
+    pub(crate) later_grant_fenced_until_scan: bool,
+    pub(crate) later_disjoint_grant_regranted_after_scan: bool,
     pub(crate) authoritative_scan_delta: u64,
     pub(crate) completed_replacement_granted: bool,
     pub(crate) straggler_still_replan: bool,
@@ -7353,7 +7353,7 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
             })
         },
     )?;
-    let dirty_later_grant_suppressed =
+    let later_grant_fenced_until_scan =
         !dirty_later_callback_ran && matches!(dirty_later_result, GrantResult::LostGrant);
 
     let (
@@ -7419,7 +7419,7 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
             })
         },
     )?;
-    let later_disjoint_grant_remained_current =
+    let later_disjoint_grant_regranted_after_scan =
         later_callback_ran && matches!(later_result, GrantResult::Requeued);
 
     later_grant.finish(None)?;
@@ -7431,8 +7431,8 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
         callback_scan_delta,
         callback_generation_wake_delta,
         edge_coalesced_with_straggler,
-        dirty_later_grant_suppressed,
-        later_disjoint_grant_remained_current,
+        later_grant_fenced_until_scan,
+        later_disjoint_grant_regranted_after_scan,
         authoritative_scan_delta,
         completed_replacement_granted,
         straggler_still_replan,
@@ -7450,8 +7450,7 @@ fn exercise_pending_replan_grant_race_case(
     let conflicting_cpu = offset + 2;
     let coordinator_claim =
         ClaimSet::new(std::iter::empty(), [coordinator_cpu], FlockMode::Exclusive);
-    let mut coordinator =
-        Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
     let earlier_designated = ClaimSet::new(
         std::iter::empty(),
         [earlier_designated_cpu],
@@ -7465,8 +7464,7 @@ fn exercise_pending_replan_grant_race_case(
         FlockMode::Exclusive,
     );
     let mut earlier = Ticket::register(earlier_designated.clone(), earlier_watch, None)?;
-    let later_claim =
-        ClaimSet::new(std::iter::empty(), [conflicting_cpu], FlockMode::Exclusive);
+    let later_claim = ClaimSet::new(std::iter::empty(), [conflicting_cpu], FlockMode::Exclusive);
     let mut later = Ticket::register(later_claim.clone(), later_claim.clone(), None)?;
 
     let scans_before = {
@@ -7490,9 +7488,9 @@ fn exercise_pending_replan_grant_race_case(
     };
 
     let mut callback_entered = false;
-    let mut earlier_completed = false;
-    let later_result = if complete_during_callback {
-        later.run_granted(
+    let (later_result, earlier_completed) = if complete_during_callback {
+        let mut earlier_completed = false;
+        let later_result = later.run_granted(
             None,
             |current, _watch, acquisition_allowed, _predecessors, _availability| {
                 callback_entered = true;
@@ -7525,7 +7523,8 @@ fn exercise_pending_replan_grant_race_case(
                     contention: None,
                 })
             },
-        )?
+        )?;
+        (later_result, earlier_completed)
     } else {
         let result = earlier.run_granted(
             None,
@@ -7543,8 +7542,8 @@ fn exercise_pending_replan_grant_race_case(
                 })
             },
         )?;
-        earlier_completed = matches!(result, GrantResult::Requeued);
-        later.run_granted(
+        let earlier_completed = matches!(result, GrantResult::Requeued);
+        let later_result = later.run_granted(
             None,
             |current, _watch, acquisition_allowed, _predecessors, _availability| {
                 callback_entered = true;
@@ -7560,7 +7559,8 @@ fn exercise_pending_replan_grant_race_case(
                     contention: None,
                 })
             },
-        )?
+        )?;
+        (later_result, earlier_completed)
     };
     let rejected = match later_result {
         GrantResult::LostGrant => true,
@@ -8473,8 +8473,7 @@ fn exercise_coordinator_pending_replan_case(
 
     let coordinator_claim =
         ClaimSet::new(std::iter::empty(), [coordinator_cpu], FlockMode::Exclusive);
-    let mut coordinator =
-        Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
     let earlier_designated = ClaimSet::new(
         std::iter::empty(),
         [earlier_designated_cpu],
@@ -8488,11 +8487,13 @@ fn exercise_coordinator_pending_replan_case(
         FlockMode::Exclusive,
     );
     let mut earlier = Ticket::register(earlier_designated.clone(), earlier_watch, None)?;
-    let selected_final =
-        ClaimSet::new(std::iter::empty(), [selected_final_cpu], FlockMode::Exclusive);
+    let selected_final = ClaimSet::new(
+        std::iter::empty(),
+        [selected_final_cpu],
+        FlockMode::Exclusive,
+    );
     let mut target = Ticket::register(selected_final.clone(), selected_final.clone(), None)?;
-    let preparation =
-        ClaimSet::new(std::iter::empty(), [preparation_cpu], FlockMode::Exclusive);
+    let preparation = ClaimSet::new(std::iter::empty(), [preparation_cpu], FlockMode::Exclusive);
 
     {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;

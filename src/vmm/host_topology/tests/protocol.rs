@@ -4391,7 +4391,7 @@ fn completed_replan_replacement_grants_before_straggler_wave_drains() {
         "a callback completion must publish O(1) state without scanning or globally waking a live coordinator",
     );
     assert!(
-        outcome.edge_coalesced_with_straggler && outcome.dirty_later_grant_suppressed,
+        outcome.edge_coalesced_with_straggler && outcome.later_grant_fenced_until_scan,
         "the completion must publish one rescan edge and conservatively suppress a later grant until that edge is consumed",
     );
     assert_eq!(
@@ -4400,7 +4400,7 @@ fn completed_replan_replacement_grants_before_straggler_wave_drains() {
     );
     assert!(
         outcome.completed_replacement_granted
-            && outcome.later_disjoint_grant_remained_current
+            && outcome.later_disjoint_grant_regranted_after_scan
             && outcome.straggler_still_replan
             && outcome.wave_deadline_not_reached,
         "the authoritative scan must grant completed compatible work and restore the disjoint later grant before the unrelated callback returns or its finite-wave lease expires",
