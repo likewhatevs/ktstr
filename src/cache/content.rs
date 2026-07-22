@@ -289,7 +289,45 @@ fn open_content_cache_dirs(root: &Path) -> Result<ContentCacheDirs> {
         references,
     };
     validate_content_cache_dirs_reachable(&dirs)?;
+    #[cfg(test)]
+    record_test_content_cache_dir_open(&requested_root);
     Ok(dirs)
+}
+
+#[cfg(test)]
+fn test_content_cache_dir_opens()
+-> &'static std::sync::Mutex<std::collections::BTreeMap<PathBuf, usize>> {
+    static OPENS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<PathBuf, usize>>,
+    > = std::sync::OnceLock::new();
+    OPENS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn record_test_content_cache_dir_open(root: &Path) {
+    *test_content_cache_dir_opens()
+        .lock()
+        .expect("content cache directory open counter poisoned")
+        .entry(root.to_path_buf())
+        .or_default() += 1;
+}
+
+#[cfg(test)]
+fn reset_test_content_cache_dir_open_count(root: &Path) {
+    test_content_cache_dir_opens()
+        .lock()
+        .expect("content cache directory open counter poisoned")
+        .remove(root);
+}
+
+#[cfg(test)]
+fn test_content_cache_dir_open_count(root: &Path) -> usize {
+    test_content_cache_dir_opens()
+        .lock()
+        .expect("content cache directory open counter poisoned")
+        .get(root)
+        .copied()
+        .unwrap_or_default()
 }
 
 fn same_content_cache_inode(left: &rustix::fs::Stat, right: &rustix::fs::Stat) -> bool {
@@ -1727,6 +1765,18 @@ pub(crate) fn cached_file_digest_at_root(
     let dirs = open_content_cache_dirs(root)?;
     maybe_gc_content_cache_in(&dirs)?;
 
+    cached_file_digest_in(&dirs, file, identity)
+}
+
+/// Digest one pinned revision while reusing an already-opened content-cache
+/// namespace. Large source snapshots contain thousands of files; reopening
+/// the root and every descriptor-relative subdirectory for each file turns a
+/// metadata-only cache hit into thousands of avoidable namespace walks.
+fn cached_file_digest_in(
+    dirs: &ContentCacheDirs,
+    file: &File,
+    identity: StableFileIdentity,
+) -> Result<u64> {
     let identity_key = file_digest_identity_key(identity);
     let record_name = OsString::from(format!("{identity_key:016x}.digest"));
     let record_path = dirs
@@ -1876,6 +1926,33 @@ pub(super) struct ContentNamespaceLease {
 }
 
 impl ContentNamespaceLease {
+    /// Digest one exact source inode through this already-pinned namespace.
+    /// The caller still receives the same per-inode cross-process memo and
+    /// before/after revision validation as [`cached_file_digest`].
+    pub(super) fn digest_file(&self, source: &File, identity: StableFileIdentity) -> Result<u64> {
+        cached_file_digest_in(&self.dirs, source, identity)
+    }
+
+    /// Publish one exact source inode into the content CAS while retaining
+    /// this tree-wide namespace lease. A separate per-object lease would be
+    /// redundant: the namespace gate already prevents object and election
+    /// pathnames from being reclaimed until the complete tree record is
+    /// published.
+    pub(super) fn digest_and_publish_file(
+        &self,
+        source: &File,
+        identity: StableFileIdentity,
+    ) -> Result<(u64, u64)> {
+        let content_hash = self.digest_file(source, identity)?;
+        drop(open_or_publish_content_object_in(
+            &self.dirs,
+            content_hash,
+            source,
+            identity,
+        )?);
+        Ok((content_hash, identity.size))
+    }
+
     /// Open and validate one immutable object while the namespace remains
     /// protected from garbage collection. The returned descriptor pins the
     /// exact inode even if another valid publisher replaces its pathname.
@@ -2384,6 +2461,62 @@ mod tests {
         writer.write_all(replacement).unwrap();
         writer.sync_all().unwrap();
         restore_original_mtime(&writer, identity);
+    }
+
+    #[test]
+    fn namespace_session_batches_digest_and_object_publication_without_reopening_dirs() {
+        let root = tempfile::TempDir::new().unwrap();
+        let sources = tempfile::TempDir::new().unwrap();
+        let first_path = sources.path().join("first");
+        let second_path = sources.path().join("second");
+        std::fs::write(&first_path, b"first immutable source revision").unwrap();
+        std::fs::write(&second_path, b"second immutable source revision").unwrap();
+        let (first, first_identity) = open_pinned_file(&first_path).unwrap();
+        let (second, second_identity) = open_pinned_file(&second_path).unwrap();
+        reset_test_content_hash_read_count(first_identity);
+        reset_test_content_hash_read_count(second_identity);
+        reset_test_content_cache_dir_open_count(root.path());
+
+        let lease = lease_content_namespace_at_root(root.path()).unwrap();
+        let (first_hash, first_len) = lease
+            .digest_and_publish_file(&first, first_identity)
+            .unwrap();
+        assert_eq!(
+            lease.digest_file(&first, first_identity).unwrap(),
+            first_hash
+        );
+        let (second_hash, second_len) = lease
+            .digest_and_publish_file(&second, second_identity)
+            .unwrap();
+
+        assert_eq!(first_len, first_identity.size);
+        assert_eq!(second_len, second_identity.size);
+        assert_ne!(first_hash, second_hash);
+        assert_eq!(test_content_hash_read_count(first_identity), 1);
+        assert_eq!(test_content_hash_read_count(second_identity), 1);
+        assert_eq!(
+            test_content_cache_dir_open_count(root.path()),
+            1,
+            "the namespace lease must pin one directory set for the complete batch",
+        );
+
+        let (_, first_object) = lease
+            .open_object(first_hash, first_len)
+            .unwrap()
+            .expect("published first object");
+        let (_, second_object) = lease
+            .open_object(second_hash, second_len)
+            .unwrap()
+            .expect("published second object");
+        assert_eq!(
+            std::fs::read(first_object).unwrap(),
+            b"first immutable source revision"
+        );
+        assert_eq!(
+            std::fs::read(second_object).unwrap(),
+            b"second immutable source revision"
+        );
+        assert_eq!(test_content_cache_dir_open_count(root.path()), 1);
     }
 
     #[test]

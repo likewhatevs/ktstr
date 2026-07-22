@@ -401,16 +401,16 @@ impl ArtifactTreeSource {
             pending.push((path, pinned));
         }
 
+        let namespace = self
+            .content_namespace
+            .as_ref()
+            .expect("artifact publication initialized its content namespace");
         let published = parallel_indexed(pending, |(path, pinned)| {
-            let snapshot = super::snapshot_pinned_artifact_file(pinned)
+            let (source, identity, _) = pinned.into_parts();
+            let (content_hash, len) = namespace
+                .digest_and_publish_file(&source, identity)
                 .with_context(|| format!("publish artifact-tree file {}", path.display()))?;
-            Ok((
-                path,
-                SourceFile::Published {
-                    content_hash: snapshot.content_hash(),
-                    len: snapshot.len(),
-                },
-            ))
+            Ok((path, SourceFile::Published { content_hash, len }))
         })?;
         for (path, published) in published {
             let SourceEntry::File { file, .. } =

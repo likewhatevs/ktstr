@@ -940,6 +940,7 @@ fn git_metadata_semantic_digest(
     files: &BTreeMap<PathBuf, PathBuf>,
     config: &[u8],
     index_digest: u64,
+    digests: &ktstr::cache::ContentFileDigestSession,
 ) -> Result<u64, String> {
     let mut hasher = fixed_hasher();
     hash_bytes(&mut hasher, b"ktstr-stable-git-metadata");
@@ -978,7 +979,7 @@ fn git_metadata_semantic_digest(
             hash_bytes(&mut hasher, target.as_os_str().as_bytes());
         } else {
             hasher.write_u64(
-                ktstr::cache::content_file_digest(source).map_err(|error| {
+                digests.digest(source).map_err(|error| {
                     format!("digest Git metadata {}: {error:#}", source.display())
                 })?,
             );
@@ -1009,6 +1010,7 @@ fn git_index_semantic_digest(index: &gix::index::State) -> u64 {
 fn plan_git_metadata(
     repository: &gix::Repository,
     index: &gix::index::State,
+    digests: &ktstr::cache::ContentFileDigestSession,
 ) -> Result<GitMetadataPlan, String> {
     let git_dir = repository.git_dir();
     let common_dir = repository.common_dir();
@@ -1027,7 +1029,7 @@ fn plan_git_metadata(
     }
     let config = synthesized_git_config(repository);
     let semantic_digest =
-        git_metadata_semantic_digest(&files, &config, git_index_semantic_digest(index))?;
+        git_metadata_semantic_digest(&files, &config, git_index_semantic_digest(index), digests)?;
     Ok(GitMetadataPlan {
         files,
         config,
@@ -1035,7 +1037,10 @@ fn plan_git_metadata(
     })
 }
 
-fn git_source_input_paths(root: &Path) -> Result<GitSourceInputs, String> {
+fn git_source_input_paths_with_digests(
+    root: &Path,
+    digests: &ktstr::cache::ContentFileDigestSession,
+) -> Result<GitSourceInputs, String> {
     use gix::bstr::BString;
 
     let repository = gix::open(root)
@@ -1047,7 +1052,7 @@ fn git_source_input_paths(root: &Path) -> Result<GitSourceInputs, String> {
         )
     })?;
     let mut inputs = GitSourceInputs {
-        metadata: Some(plan_git_metadata(&repository, &index)?),
+        metadata: Some(plan_git_metadata(&repository, &index, digests)?),
         ..GitSourceInputs::default()
     };
     for entry in index.entries() {
@@ -1104,6 +1109,13 @@ fn git_source_input_paths(root: &Path) -> Result<GitSourceInputs, String> {
     Ok(inputs)
 }
 
+#[cfg(test)]
+fn git_source_input_paths(root: &Path) -> Result<GitSourceInputs, String> {
+    let digests = ktstr::cache::ContentFileDigestSession::open()
+        .map_err(|error| format!("open source digest session: {error:#}"))?;
+    git_source_input_paths_with_digests(root, &digests)
+}
+
 fn non_git_source_input_paths(
     root: &Path,
     outputs: &[PathBuf],
@@ -1134,10 +1146,11 @@ fn non_git_source_input_paths(
     Ok(paths)
 }
 
-fn source_tree_digest(
+fn source_tree_digest_with_digests(
     root: &Path,
     input_paths: &BTreeSet<PathBuf>,
     gitlinks: &BTreeMap<PathBuf, String>,
+    digests: &ktstr::cache::ContentFileDigestSession,
 ) -> Result<u64, String> {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -1177,7 +1190,7 @@ fn source_tree_digest(
             hasher.write_u8(b'f');
             hasher.write_u8(u8::from(metadata.permissions().mode() & 0o111 != 0));
             hasher.write_u64(metadata.len());
-            hasher.write_u64(ktstr::cache::content_file_digest(&path).map_err(|error| {
+            hasher.write_u64(digests.digest(&path).map_err(|error| {
                 format!("digest Cargo source input {}: {error:#}", path.display())
             })?);
         } else if metadata.is_dir() {
@@ -1193,6 +1206,17 @@ fn source_tree_digest(
         }
     }
     Ok(hasher.finish())
+}
+
+#[cfg(test)]
+fn source_tree_digest(
+    root: &Path,
+    input_paths: &BTreeSet<PathBuf>,
+    gitlinks: &BTreeMap<PathBuf, String>,
+) -> Result<u64, String> {
+    let digests = ktstr::cache::ContentFileDigestSession::open()
+        .map_err(|error| format!("open source digest session: {error:#}"))?;
+    source_tree_digest_with_digests(root, input_paths, gitlinks, &digests)
 }
 
 #[derive(Debug, Clone)]
@@ -1885,6 +1909,12 @@ fn plan_source_layout(
             non_git.push(package_root.clone());
         }
     }
+    // One pinned content-cache namespace serves the complete source plan.
+    // Per-file digest memos still coordinate independently across processes,
+    // but thousands of tracked inputs no longer reopen the root and all of
+    // its descriptor-relative subdirectories one path at a time.
+    let digests = ktstr::cache::ContentFileDigestSession::open()
+        .map_err(|error| format!("open source digest session: {error:#}"))?;
     let mut git_inputs = BTreeMap::<PathBuf, GitSourceInputs>::new();
     let mut pending_git = root_kinds
         .iter()
@@ -1894,7 +1924,7 @@ fn plan_source_layout(
         if git_inputs.contains_key(&root) {
             continue;
         }
-        let inputs = git_source_input_paths(&root)?;
+        let inputs = git_source_input_paths_with_digests(&root, &digests)?;
         for relative in inputs.gitlinks.keys() {
             let nested = root.join(relative);
             let workdir = discover_git_workdir(&nested).ok_or_else(|| {
@@ -2100,7 +2130,7 @@ fn plan_source_layout(
                 input_paths.remove(relative);
             }
         }
-        let digest = source_tree_digest(&root, &input_paths, &gitlinks)?;
+        let digest = source_tree_digest_with_digests(&root, &input_paths, &gitlinks, &digests)?;
         let git_head = is_git.then(|| git_head(&root)).flatten();
         planned.push(SourceRootPlan {
             semantic_name: virtual_path.to_string_lossy().into_owned(),
@@ -2311,9 +2341,11 @@ fn recompute_source_identity(layout: &SourceLayout) -> Result<u64, String> {
     hasher.write_u32(SOURCE_IDENTITY_SCHEMA);
     hash_bytes(&mut hasher, b"invocation-relative-to-workspace");
     hash_path_relation(&mut hasher, &layout.invocation_relation);
+    let digests = ktstr::cache::ContentFileDigestSession::open()
+        .map_err(|error| format!("open source revalidation digest session: {error:#}"))?;
     for root in &layout.roots {
         let (mut input_paths, gitlinks, git_status_semantics, git_metadata) = if root.is_git {
-            let inputs = git_source_input_paths(&root.source)?;
+            let inputs = git_source_input_paths_with_digests(&root.source, &digests)?;
             (
                 inputs.paths,
                 inputs.gitlinks,
@@ -2350,7 +2382,12 @@ fn recompute_source_identity(layout: &SourceLayout) -> Result<u64, String> {
             }
         }
         hash_bytes(&mut hasher, root.semantic_name.as_bytes());
-        hasher.write_u64(source_tree_digest(&root.source, &input_paths, &gitlinks)?);
+        hasher.write_u64(source_tree_digest_with_digests(
+            &root.source,
+            &input_paths,
+            &gitlinks,
+            &digests,
+        )?);
         hash_bytes(
             &mut hasher,
             git_head(&root.source)
@@ -3326,7 +3363,9 @@ mod tests {
 
     #[test]
     fn source_digest_is_checkout_root_independent_and_tracks_content() {
+        let _environment = lock_env();
         let temp = tempfile::tempdir().unwrap();
+        let _cache = EnvVarGuard::set(ktstr::KTSTR_CACHE_DIR_ENV, temp.path().join("cache"));
         let first = temp.path().join("first");
         let second = temp.path().join("second");
         for root in [&first, &second] {
@@ -3342,16 +3381,21 @@ mod tests {
         }
         let first_paths = non_git_source_input_paths(&first, &[first.join("target")]).unwrap();
         let second_paths = non_git_source_input_paths(&second, &[second.join("target")]).unwrap();
-        let first_digest = source_tree_digest(&first, &first_paths, &BTreeMap::new()).unwrap();
+        let digests = ktstr::cache::ContentFileDigestSession::open().unwrap();
+        let first_digest =
+            source_tree_digest_with_digests(&first, &first_paths, &BTreeMap::new(), &digests)
+                .unwrap();
         assert_eq!(
             first_digest,
-            source_tree_digest(&second, &second_paths, &BTreeMap::new()).unwrap()
+            source_tree_digest_with_digests(&second, &second_paths, &BTreeMap::new(), &digests,)
+                .unwrap()
         );
         std::fs::write(second.join("src/lib.rs"), b"pub fn changed() {}\n").unwrap();
         let changed_paths = non_git_source_input_paths(&second, &[second.join("target")]).unwrap();
         assert_ne!(
             first_digest,
-            source_tree_digest(&second, &changed_paths, &BTreeMap::new()).unwrap()
+            source_tree_digest_with_digests(&second, &changed_paths, &BTreeMap::new(), &digests,)
+                .unwrap()
         );
     }
 
@@ -4137,6 +4181,7 @@ rustflags = ['-C', 'target-cpu=x86-64-v3']\n",
 
     #[test]
     fn git_metadata_identity_distinguishes_shallow_and_deep_object_sets() {
+        let digests = ktstr::cache::ContentFileDigestSession::open().unwrap();
         let shallow = BTreeMap::from([(
             PathBuf::from("objects/aa/11111111111111111111111111111111111111"),
             PathBuf::from("/object-content-is-addressed-by-name"),
@@ -4147,8 +4192,8 @@ rustflags = ['-C', 'target-cpu=x86-64-v3']\n",
             PathBuf::from("/object-content-is-addressed-by-name"),
         );
         assert_ne!(
-            git_metadata_semantic_digest(&shallow, b"", 0).unwrap(),
-            git_metadata_semantic_digest(&deep, b"", 0).unwrap(),
+            git_metadata_semantic_digest(&shallow, b"", 0, &digests).unwrap(),
+            git_metadata_semantic_digest(&deep, b"", 0, &digests).unwrap(),
         );
     }
 

@@ -215,6 +215,30 @@ pub fn content_file_digest(path: impl AsRef<std::path::Path>) -> anyhow::Result<
     content::cached_file_digest(pinned.source(), pinned.identity)
 }
 
+/// Scoped file-digest client for large immutable source snapshots.
+///
+/// A session pins the machine content-cache namespace and its descriptor-
+/// relative subdirectories once. Every file retains the same exact-inode,
+/// cross-process memo validation as [`content_file_digest`], without reopening
+/// the complete cache namespace for every path in a source tree.
+#[doc(hidden)]
+pub struct ContentFileDigestSession {
+    namespace: content::ContentNamespaceLease,
+}
+
+impl ContentFileDigestSession {
+    pub fn open() -> anyhow::Result<Self> {
+        Ok(Self {
+            namespace: content::lease_content_namespace()?,
+        })
+    }
+
+    pub fn digest(&self, path: impl AsRef<std::path::Path>) -> anyhow::Result<u64> {
+        let pinned = pin_content_file(path)?;
+        self.namespace.digest_file(pinned.source(), pinned.identity)
+    }
+}
+
 /// One immutable, content-addressed snapshot of an input file.
 ///
 /// The original file descriptor and the shared CAS lease remain live until
