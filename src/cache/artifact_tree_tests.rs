@@ -4,6 +4,177 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
 
+const TEST_PROGRESS_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+const TEST_PROGRESS_HARD_TIMEOUT: Duration = Duration::from_secs(120);
+const TEST_PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Bounded test-only deadlock detector which distinguishes one fixed wall
+/// deadline from a genuinely stalled protocol phase. Every observed phase
+/// edge resets the stall clock; the independent hard cap guarantees that a
+/// broken test still terminates even if it keeps manufacturing irrelevant
+/// progress.
+struct TestProgressWatchdog {
+    started: Instant,
+    last_progress: Instant,
+    stall_timeout: Duration,
+    hard_timeout: Duration,
+    progress_events: usize,
+}
+
+impl TestProgressWatchdog {
+    fn new() -> Self {
+        Self::with_timeouts(TEST_PROGRESS_STALL_TIMEOUT, TEST_PROGRESS_HARD_TIMEOUT)
+    }
+
+    fn with_timeouts(stall_timeout: Duration, hard_timeout: Duration) -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            last_progress: now,
+            stall_timeout,
+            hard_timeout,
+            progress_events: 0,
+        }
+    }
+
+    fn progress(&mut self) {
+        self.progress_at(Instant::now());
+    }
+
+    fn progress_at(&mut self, now: Instant) {
+        self.last_progress = now;
+        self.progress_events = self.progress_events.saturating_add(1);
+    }
+
+    fn check(&self, context: &str) -> Result<()> {
+        self.check_at(context, Instant::now())
+    }
+
+    fn check_at(&self, context: &str, now: Instant) -> Result<()> {
+        let total = now.saturating_duration_since(self.started);
+        if total >= self.hard_timeout {
+            anyhow::bail!(
+                "{context} exceeded the {:?} hard test watchdog after {} progress event(s)",
+                self.hard_timeout,
+                self.progress_events,
+            );
+        }
+        let stalled = now.saturating_duration_since(self.last_progress);
+        if stalled >= self.stall_timeout {
+            anyhow::bail!(
+                "{context} made no protocol progress for {:?} after {} progress event(s)",
+                self.stall_timeout,
+                self.progress_events,
+            );
+        }
+        Ok(())
+    }
+}
+
+fn recv_with_progress<T>(
+    receiver: &std::sync::mpsc::Receiver<T>,
+    watchdog: &mut TestProgressWatchdog,
+    context: &str,
+) -> Result<T> {
+    loop {
+        match receiver.try_recv() {
+            Ok(value) => {
+                watchdog.progress();
+                return Ok(value);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                anyhow::bail!("{context}: channel disconnected before publication")
+            }
+        }
+        watchdog.check(context)?;
+        std::thread::sleep(TEST_PROGRESS_POLL_INTERVAL);
+    }
+}
+
+fn publish_child_progress(path: &Path, phase: &str) {
+    use std::io::Write as _;
+
+    let mut progress = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap_or_else(|error| panic!("open child progress {}: {error}", path.display()));
+    writeln!(progress, "{phase}")
+        .unwrap_or_else(|error| panic!("publish child progress {}: {error}", path.display()));
+}
+
+fn directory_progress_bytes(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|metadata| metadata.len().saturating_add(1))
+        .sum()
+}
+
+struct ReapedTestChild {
+    child: std::process::Child,
+}
+
+impl ReapedTestChild {
+    fn new(child: std::process::Child) -> Self {
+        Self { child }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+}
+
+impl Drop for ReapedTestChild {
+    fn drop(&mut self) {
+        match self.child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+}
+
+#[test]
+fn test_progress_watchdog_resets_stall_but_not_hard_cap() {
+    let stall = Duration::from_secs(10);
+    let hard = Duration::from_secs(30);
+    let mut watchdog = TestProgressWatchdog::with_timeouts(stall, hard);
+    let started = watchdog.started;
+
+    watchdog
+        .check_at("fixture", started + Duration::from_secs(9))
+        .expect("pre-stall interval remains live");
+    watchdog.progress_at(started + Duration::from_secs(9));
+    watchdog
+        .check_at("fixture", started + Duration::from_secs(18))
+        .expect("progress resets the stall interval");
+    assert!(
+        watchdog
+            .check_at("fixture", started + Duration::from_secs(20))
+            .unwrap_err()
+            .to_string()
+            .contains("no protocol progress"),
+        "the reset stall interval must still diagnose a real stall",
+    );
+
+    watchdog.progress_at(started + Duration::from_secs(29));
+    assert!(
+        watchdog
+            .check_at("fixture", started + hard)
+            .unwrap_err()
+            .to_string()
+            .contains("hard test watchdog"),
+        "progress must not extend the independent hard cap",
+    );
+}
+
 fn write_fixture_tree(root: &Path, payload: &[u8]) {
     let bin = root.join("target/debug/deps");
     std::fs::create_dir_all(&bin).expect("create fixture target tree");
@@ -804,6 +975,7 @@ fn lifecycle_reserves_before_closure_ex_and_does_not_invert_waiter_order() {
     let lifecycle_root = producer.lifecycle_root.clone();
     let (global_held_tx, global_held_rx) = std::sync::mpsc::channel();
     let (waiter_done_tx, waiter_done_rx) = std::sync::mpsc::channel();
+    let mut watchdog = TestProgressWatchdog::new();
     let waiter = producer
         .with_exclusive_rebuild(|_| {
             let waiter = std::thread::spawn(move || {
@@ -822,17 +994,22 @@ fn lifecycle_reserves_before_closure_ex_and_does_not_invert_waiter_order() {
                 drop(closure);
                 waiter_done_tx.send(()).unwrap();
             });
-            global_held_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("waiter did not hold global SH");
+            recv_with_progress(
+                &global_held_rx,
+                &mut watchdog,
+                "waiter did not publish global SH ownership",
+            )?;
             // Returning releases closure EX without acquiring the global gate;
             // the waiter can therefore finish instead of forming ABBA.
             Ok(waiter)
         })
         .unwrap();
-    waiter_done_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("closure waiter deadlocked behind producer");
+    recv_with_progress(
+        &waiter_done_rx,
+        &mut watchdog,
+        "closure waiter deadlocked behind producer",
+    )
+    .unwrap();
     waiter.join().unwrap();
     drop(reservation);
 }
@@ -849,6 +1026,7 @@ fn lifecycle_rebuilder_never_holds_global_gate_while_waiting_for_an_owner() {
     let lifecycle_root = first_owner.lifecycle_root.clone();
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (rebuilt_tx, rebuilt_rx) = std::sync::mpsc::channel();
+    let mut watchdog = TestProgressWatchdog::new();
     let rebuilder = std::thread::spawn(move || {
         let mut lease = ArtifactClosureLease {
             lock: None,
@@ -859,7 +1037,7 @@ fn lifecycle_rebuilder_never_holds_global_gate_while_waiting_for_an_owner() {
         lease.with_exclusive_rebuild(|_| Ok(())).unwrap();
         rebuilt_tx.send(()).unwrap();
     });
-    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    recv_with_progress(&started_rx, &mut watchdog, "rebuilder thread did not start").unwrap();
 
     let second_cache = ArtifactTreeCache::new(temp.path().join("records"));
     let (second_tx, second_rx) = std::sync::mpsc::channel();
@@ -868,7 +1046,11 @@ fn lifecycle_rebuilder_never_holds_global_gate_while_waiting_for_an_owner() {
             .send(second_cache.acquire_closure(second_identity))
             .unwrap();
     });
-    let second_owner = match second_rx.recv_timeout(Duration::from_secs(2)) {
+    let second_owner = match recv_with_progress(
+        &second_rx,
+        &mut watchdog,
+        "acquire independent closure while first owner is live",
+    ) {
         Ok(result) => result.expect("acquire independent closure while first is live"),
         Err(error) => {
             drop(first_owner);
@@ -879,9 +1061,12 @@ fn lifecycle_rebuilder_never_holds_global_gate_while_waiting_for_an_owner() {
     };
     drop(second_owner);
     drop(first_owner);
-    rebuilt_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("rebuilder did not finish after first owner released");
+    recv_with_progress(
+        &rebuilt_rx,
+        &mut watchdog,
+        "rebuilder did not finish after first owner released",
+    )
+    .unwrap();
     rebuilder.join().unwrap();
     second.join().unwrap();
 }
@@ -1471,12 +1656,17 @@ fn stable_source_hit_rematerializes_after_recorded_file_is_deleted() {
 
 const STABLE_COLD_CHILD_TEST: &str = "cache::artifact_tree::tests::stable_tree_cold_miss_child";
 const STABLE_COLD_CHILD_ROOT: &str = "KTSTR_STABLE_COLD_CHILD_ROOT";
+const STABLE_COLD_CHILD_PROGRESS: &str = "KTSTR_STABLE_COLD_CHILD_PROGRESS";
 
 #[test]
 fn stable_tree_cold_miss_child() {
     let Some(root) = std::env::var_os(STABLE_COLD_CHILD_ROOT).map(PathBuf::from) else {
         return;
     };
+    let progress = PathBuf::from(
+        std::env::var_os(STABLE_COLD_CHILD_PROGRESS).expect("cold child progress path"),
+    );
+    publish_child_progress(&progress, "started");
     // SAFETY: the subprocess executes one exact test with one libtest thread.
     unsafe {
         std::env::set_var(crate::KTSTR_CACHE_DIR_ENV, root.join("cas"));
@@ -1484,6 +1674,7 @@ fn stable_tree_cold_miss_child() {
     std::fs::create_dir_all(&root).unwrap();
     let input = root.join("input");
     std::fs::write(&input, b"cold-stable-source").unwrap();
+    publish_child_progress(&progress, "input-ready");
     let cache = ArtifactTreeCache::new(root.join("records"));
     let tree = cache
         .load_or_build_stable(
@@ -1493,12 +1684,15 @@ fn stable_tree_cold_miss_child() {
             || Ok(true),
             || false,
             || {
+                publish_child_progress(&progress, "build-entered");
                 let mut source = ArtifactTreeSource::new();
                 source.insert_immutable_path("source/file", &input)?;
+                publish_child_progress(&progress, "source-captured");
                 Ok(source)
             },
         )
         .expect("cold stable-tree miss must complete");
+    publish_child_progress(&progress, "tree-loaded");
     assert_eq!(
         std::fs::read(tree.root().join("source/file")).unwrap(),
         b"cold-stable-source"
@@ -1512,29 +1706,39 @@ fn stable_tree_cold_miss_child() {
 #[test]
 fn stable_tree_cold_miss_does_not_self_deadlock() {
     let temp = tempfile::tempdir().unwrap();
+    let progress = temp.path().join("progress");
     let executable = std::env::current_exe().expect("current test executable");
-    let mut child = std::process::Command::new(executable)
+    let child = std::process::Command::new(executable)
         .arg("--exact")
         .arg(STABLE_COLD_CHILD_TEST)
         .arg("--nocapture")
         .arg("--test-threads=1")
         .env(STABLE_COLD_CHILD_ROOT, temp.path())
+        .env(STABLE_COLD_CHILD_PROGRESS, &progress)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit())
         .spawn()
         .expect("spawn cold stable-tree regression child");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut child = ReapedTestChild::new(child);
+    let mut watchdog = TestProgressWatchdog::new();
+    let mut observed_progress = 0;
     loop {
         if let Some(status) = child.try_wait().unwrap() {
+            watchdog.progress();
             assert!(status.success(), "cold stable-tree child failed: {status}");
             break;
         }
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            let _ = child.wait();
-            panic!("cold stable-tree miss self-deadlocked for 10 seconds");
+        let current_progress = std::fs::metadata(&progress)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if current_progress != observed_progress {
+            observed_progress = current_progress;
+            watchdog.progress();
         }
-        std::thread::sleep(Duration::from_millis(10));
+        watchdog
+            .check("cold stable-tree miss self-deadlocked")
+            .unwrap();
+        std::thread::sleep(TEST_PROGRESS_POLL_INTERVAL);
     }
 }
 
@@ -1580,18 +1784,22 @@ fn stable_installer_contender_drops_closure_before_waiting_for_turn() {
     });
 
     let lifecycle_root = records.parent().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut watchdog = TestProgressWatchdog::new();
+    let mut saw_lifecycle_directory = false;
     let closure = loop {
         if !lifecycle_directory(lifecycle_root)
             .join(LIFECYCLE_CLOSURE_LOCK_DIR)
             .is_dir()
         {
-            assert!(
-                Instant::now() < deadline,
-                "stable installer contender did not initialize lifecycle directories"
-            );
-            std::thread::sleep(Duration::from_millis(10));
+            watchdog
+                .check("stable installer contender did not initialize lifecycle directories")
+                .unwrap();
+            std::thread::sleep(TEST_PROGRESS_POLL_INTERVAL);
             continue;
+        }
+        if !saw_lifecycle_directory {
+            saw_lifecycle_directory = true;
+            watchdog.progress();
         }
         if let Some(lock) = crate::flock::try_flock(
             lifecycle_closure_lock_path(lifecycle_root, identity),
@@ -1599,13 +1807,13 @@ fn stable_installer_contender_drops_closure_before_waiting_for_turn() {
         )
         .unwrap()
         {
+            watchdog.progress();
             break lock;
         }
-        assert!(
-            Instant::now() < deadline,
-            "stable installer contender retained closure SH while blocked"
-        );
-        std::thread::sleep(Duration::from_millis(10));
+        watchdog
+            .check("stable installer contender retained closure SH while blocked")
+            .unwrap();
+        std::thread::sleep(TEST_PROGRESS_POLL_INTERVAL);
     };
     drop(installer);
     match build_started_rx.recv_timeout(Duration::from_millis(100)) {
@@ -1616,9 +1824,12 @@ fn stable_installer_contender_drops_closure_before_waiting_for_turn() {
         }
     }
     drop(closure);
-    build_started_rx
-        .recv_timeout(Duration::from_secs(3))
-        .expect("stable installer contender remained blocked before build-closure entry");
+    recv_with_progress(
+        &build_started_rx,
+        &mut watchdog,
+        "stable installer contender remained blocked before build-closure entry",
+    )
+    .unwrap();
     contender.join().unwrap().unwrap();
 }
 
@@ -1712,6 +1923,7 @@ const CHILD_READY: &str = "KTSTR_ARTIFACT_TREE_CHILD_READY";
 const CHILD_START: &str = "KTSTR_ARTIFACT_TREE_CHILD_START";
 const CHILD_COUNTER: &str = "KTSTR_ARTIFACT_TREE_CHILD_COUNTER";
 const CHILD_RESULTS: &str = "KTSTR_ARTIFACT_TREE_CHILD_RESULTS";
+const CHILD_PROGRESS: &str = "KTSTR_ARTIFACT_TREE_CHILD_PROGRESS";
 
 #[test]
 fn artifact_tree_cache_cross_process_child() {
@@ -1726,17 +1938,24 @@ fn artifact_tree_cache_cross_process_child() {
     let start = PathBuf::from(std::env::var_os(CHILD_START).expect("child start lock"));
     let counter = PathBuf::from(std::env::var_os(CHILD_COUNTER).expect("child counter"));
     let results = PathBuf::from(std::env::var_os(CHILD_RESULTS).expect("child results"));
+    let progress =
+        PathBuf::from(std::env::var_os(CHILD_PROGRESS).expect("child progress directory"))
+            .join(index.to_string());
+    publish_child_progress(&progress, "started");
     // SAFETY: this subprocess runs one exact test with one libtest thread.
     unsafe {
         std::env::set_var(crate::KTSTR_CACHE_DIR_ENV, root.join("cache"));
     }
     let start = std::fs::File::open(start).expect("open child start barrier");
     std::fs::write(ready.join(index.to_string()), b"ready").expect("publish child ready");
+    publish_child_progress(&progress, "ready");
     rustix::fs::flock(&start, rustix::fs::FlockOperation::LockShared)
         .expect("wait for child start");
+    publish_child_progress(&progress, "barrier-released");
 
     let source_root = root.join(format!("source-{index}"));
     write_fixture_tree(&source_root, b"one-cross-process-tree");
+    publish_child_progress(&progress, "fixture-ready");
     let cache_root = super::super::cargo_artifact_tree_cache_root()
         .expect("resolve shared artifact-tree cache root");
     let tree = ArtifactTreeCache::new(&cache_root)
@@ -1747,6 +1966,7 @@ fn artifact_tree_cache_cross_process_child() {
             || Ok(true),
             || false,
             || {
+                publish_child_progress(&progress, "builder-elected");
                 let mut attempts = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -1758,11 +1978,13 @@ fn artifact_tree_cache_cross_process_child() {
             },
         )
         .expect("cross-process artifact tree");
+    publish_child_progress(&progress, "tree-loaded");
     std::fs::write(
         results.join(index.to_string()),
         std::fs::read(tree.root().join("target/debug/deps/harness-current")).unwrap(),
     )
     .expect("write child result");
+    publish_child_progress(&progress, "result-written");
 }
 
 #[test]
@@ -1773,9 +1995,11 @@ fn artifact_tree_cache_elects_one_cross_process_builder() {
     let root = temp.path().join("shared");
     let ready = temp.path().join("ready");
     let results = temp.path().join("results");
+    let progress = temp.path().join("progress");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::create_dir(&ready).unwrap();
     std::fs::create_dir(&results).unwrap();
+    std::fs::create_dir(&progress).unwrap();
     let start_path = temp.path().join("start");
     let start = std::fs::OpenOptions::new()
         .create(true)
@@ -1800,28 +2024,46 @@ fn artifact_tree_cache_elects_one_cross_process_builder() {
                 .env(CHILD_START, &start_path)
                 .env(CHILD_COUNTER, &counter)
                 .env(CHILD_RESULTS, &results)
+                .env(CHILD_PROGRESS, &progress)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::inherit())
                 .spawn()
+                .map(ReapedTestChild::new)
                 .expect("spawn artifact cache child")
         })
         .collect::<Vec<_>>();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while std::fs::read_dir(&ready).unwrap().count() != CHILDREN {
+    let mut watchdog = TestProgressWatchdog::new();
+    let mut observed_ready = 0;
+    let mut observed_child_progress = 0;
+    loop {
+        let ready_count = std::fs::read_dir(&ready).unwrap().count();
+        if ready_count != observed_ready {
+            observed_ready = ready_count;
+            watchdog.progress();
+        }
+        let child_progress = directory_progress_bytes(&progress);
+        if child_progress != observed_child_progress {
+            observed_child_progress = child_progress;
+            watchdog.progress();
+        }
+        if ready_count == CHILDREN {
+            break;
+        }
         for child in &mut children {
             if let Some(status) = child.try_wait().unwrap() {
                 panic!("artifact cache child exited before barrier: {status}");
             }
         }
-        assert!(
-            Instant::now() < deadline,
-            "artifact cache children did not reach barrier"
-        );
-        std::thread::yield_now();
+        watchdog
+            .check("artifact cache children did not reach barrier")
+            .unwrap();
+        std::thread::sleep(TEST_PROGRESS_POLL_INTERVAL);
     }
     rustix::fs::flock(&start, rustix::fs::FlockOperation::Unlock).unwrap();
-    let completion_deadline = Instant::now() + Duration::from_secs(15);
+    watchdog.progress();
     let mut completed = [false; CHILDREN];
+    let mut observed_results = 0;
+    let mut observed_counter_bytes = 0;
     while completed.iter().any(|done| !done) {
         for (index, child) in children.iter_mut().enumerate() {
             if completed[index] {
@@ -1833,18 +2075,30 @@ fn artifact_tree_cache_elects_one_cross_process_builder() {
                     "artifact cache child {index} failed: {status}"
                 );
                 completed[index] = true;
+                watchdog.progress();
             }
         }
-        if Instant::now() >= completion_deadline {
-            for (index, child) in children.iter_mut().enumerate() {
-                if !completed[index] {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-            }
-            panic!("artifact cache children did not complete within 15 seconds");
+        let child_progress = directory_progress_bytes(&progress);
+        if child_progress != observed_child_progress {
+            observed_child_progress = child_progress;
+            watchdog.progress();
         }
-        std::thread::sleep(Duration::from_millis(10));
+        let result_count = std::fs::read_dir(&results).unwrap().count();
+        if result_count != observed_results {
+            observed_results = result_count;
+            watchdog.progress();
+        }
+        let counter_bytes = std::fs::metadata(&counter)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if counter_bytes != observed_counter_bytes {
+            observed_counter_bytes = counter_bytes;
+            watchdog.progress();
+        }
+        watchdog
+            .check("artifact cache children did not complete")
+            .unwrap();
+        std::thread::sleep(TEST_PROGRESS_POLL_INTERVAL);
     }
     let attempts = std::fs::read_to_string(counter).expect("read build attempts");
     assert_eq!(attempts.lines().count(), 1);
