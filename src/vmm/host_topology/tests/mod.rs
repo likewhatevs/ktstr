@@ -363,6 +363,119 @@ fn synth_host_topo(groups: &[(Vec<usize>, usize)]) -> HostTopology {
     HostTopology::new_for_tests(groups)
 }
 
+// ─── PRODUCTION-ADMISSION MISCLASSIFICATION GUARD ────────────
+//
+// `production_lock_dir` aborts when a test that resolves the run's
+// shared lock dir (VM boot, resource locks, build reservations) was
+// spawned by nextest into the CPU-bounded `host-tests` group instead
+// of `@global`; see that function's doc for the second-scheduler
+// rationale and the sealed-reference discriminator. Every case drives
+// NEXTEST_TEST_GROUP, KTSTR_LOCK_DIR, and the sealed reference
+// KTSTR_PRODUCTION_LOCK_DIR explicitly — never touching the real
+// default dir — so the outcome is independent of the ambient CI env
+// (which always sets all three).
+
+/// A `host-tests`-classified test that resolves the sealed reference
+/// dir (no lock-prefix override) must abort, naming itself, the group,
+/// and the resource selector.
+#[test]
+#[cfg(panic = "unwind")]
+fn production_admission_guard_aborts_host_tests_group_resource_user() {
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let _lock = lock_env();
+    let _group = EnvVarGuard::set(NEXTEST_TEST_GROUP_ENV, crate::NEXTEST_HOST_TESTS_GROUP);
+    let _name = EnvVarGuard::set(NEXTEST_TEST_NAME_ENV, "vmm::some_future_resource_user");
+    let _dir = EnvVarGuard::set(crate::KTSTR_LOCK_DIR_ENV, tmp.path());
+    let _reference = EnvVarGuard::set(crate::KTSTR_PRODUCTION_LOCK_DIR_ENV, tmp.path());
+    let panic = std::panic::catch_unwind(llc_lock_prefix)
+        .expect_err("a host-tests-classified resource user must abort");
+    let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(
+        message.contains("vmm::some_future_resource_user")
+            && message.contains("host-tests")
+            && message.contains("@global")
+            && message.contains(".config/nextest.toml"),
+        "guard must name the test, the misclassifying group, the required \
+         @global group, and the resource selector; got: {message:?}",
+    );
+}
+
+/// Isolation, not misclassification: a `host-tests` test that redirects
+/// `KTSTR_LOCK_DIR` to a private namespace resolves a dir that differs
+/// from the sealed reference, so the guard must proceed. This is the
+/// re-exec'd build-reservation tests' CI shape.
+#[test]
+fn production_admission_guard_permits_isolated_namespace_mismatch() {
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+    let isolated = tempfile::TempDir::new().expect("isolated tempdir");
+    let reference = tempfile::TempDir::new().expect("reference tempdir");
+    let _lock = lock_env();
+    let _group = EnvVarGuard::set(NEXTEST_TEST_GROUP_ENV, crate::NEXTEST_HOST_TESTS_GROUP);
+    let _name = EnvVarGuard::set(NEXTEST_TEST_NAME_ENV, "vmm::isolated_reservation");
+    let _dir = EnvVarGuard::set(crate::KTSTR_LOCK_DIR_ENV, isolated.path());
+    let _reference = EnvVarGuard::set(crate::KTSTR_PRODUCTION_LOCK_DIR_ENV, reference.path());
+    let prefix = llc_lock_prefix();
+    assert!(
+        prefix.starts_with(&isolated.path().display().to_string())
+            && prefix.ends_with("/ktstr-llc-"),
+        "an isolated namespace must resolve its own dir without aborting; got: {prefix}",
+    );
+}
+
+/// No reference (an ad-hoc `cargo nextest run` not launched by
+/// cargo-ktstr) disarms the guard even in `host-tests`.
+#[test]
+fn production_admission_guard_permits_absent_reference() {
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let _lock = lock_env();
+    let _group = EnvVarGuard::set(NEXTEST_TEST_GROUP_ENV, crate::NEXTEST_HOST_TESTS_GROUP);
+    let _name = EnvVarGuard::set(NEXTEST_TEST_NAME_ENV, "vmm::ad_hoc_run");
+    let _dir = EnvVarGuard::set(crate::KTSTR_LOCK_DIR_ENV, tmp.path());
+    let _reference = EnvVarGuard::remove(crate::KTSTR_PRODUCTION_LOCK_DIR_ENV);
+    assert!(llc_lock_prefix().ends_with("/ktstr-llc-"));
+}
+
+/// A temp-path registry installs the lock-prefix override, so the
+/// acquire path never resolves the production lock dir — the guard is
+/// bypassed entirely, even with the group and a matching reference set.
+/// This is what the protocol/locking unit tests rely on.
+#[test]
+fn production_admission_guard_ignores_temp_path_registry() {
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+    let _lock = lock_env();
+    let _group = EnvVarGuard::set(NEXTEST_TEST_GROUP_ENV, crate::NEXTEST_HOST_TESTS_GROUP);
+    let _name = EnvVarGuard::set(NEXTEST_TEST_NAME_ENV, "vmm::protocol_temp_registry");
+    let _prefix = LlcLockPrefixGuard::new();
+    let llc = llc_lock_path(0);
+    assert!(
+        llc.ends_with("/llc-0.lock") && !llc.contains("ktstr-llc-"),
+        "override must route to the per-test tempdir, bypassing the guard; got: {llc}",
+    );
+}
+
+/// The ungrouped `@global` value, and an absent group, both proceed
+/// normally — only the literal `host-tests` arms the guard.
+#[test]
+fn production_admission_guard_permits_global_and_ungoverned() {
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let _lock = lock_env();
+    let _dir = EnvVarGuard::set(crate::KTSTR_LOCK_DIR_ENV, tmp.path());
+    let _reference = EnvVarGuard::set(crate::KTSTR_PRODUCTION_LOCK_DIR_ENV, tmp.path());
+    {
+        let _group = EnvVarGuard::set(NEXTEST_TEST_GROUP_ENV, "@global");
+        let _name = EnvVarGuard::set(NEXTEST_TEST_NAME_ENV, "vmm::tests::boot_kernel");
+        assert!(llc_lock_prefix().ends_with("/ktstr-llc-"));
+    }
+    {
+        let _group = EnvVarGuard::remove(NEXTEST_TEST_GROUP_ENV);
+        let _name = EnvVarGuard::remove(NEXTEST_TEST_NAME_ENV);
+        assert!(llc_lock_prefix().ends_with("/ktstr-llc-"));
+    }
+}
+
 // Test groups extracted from the original flat tests.rs; the helper fns
 // and RAII scaffolding structs above stay here so every group reaches
 // them as a child module via `use super::*`.

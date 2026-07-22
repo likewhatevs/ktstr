@@ -154,8 +154,26 @@ pub(crate) fn prepare(command: &mut Command) {
     }
 }
 
+/// Stamp the production lock-dir reference onto a nextest run command.
+///
+/// Resolved in this cargo-ktstr parent process and inherited by every
+/// nextest test process (and any child it re-execs), it is the sealed
+/// reference the library's misclassification guard compares against:
+/// only a test that resolves this exact shared namespace — not one
+/// redirected into an isolated temp dir — is a misclassified resource
+/// user. Every nextest frontend spawns through [`run_status`], so
+/// stamping here covers the ordinary test, coverage, verifier, and
+/// replay paths in one place.
+pub(crate) fn stamp_production_lock_dir(command: &mut Command) {
+    command.env(
+        ktstr::KTSTR_PRODUCTION_LOCK_DIR_ENV,
+        ktstr::resolve_production_lock_dir(),
+    );
+}
+
 /// Run one nextest frontend through the shared signal-aware process owner.
 pub(crate) fn run_status(mut command: Command) -> io::Result<ExitStatus> {
+    stamp_production_lock_dir(&mut command);
     prepare(&mut command);
     // Nextest already owns an interactive progress bar. Adding periodic lines
     // underneath it would only make the terminal flicker. GitHub's self-hosted
@@ -215,6 +233,23 @@ mod tests {
             environment.get(OsStr::new("SCHEDULER_FIXTURE_MODE")),
             Some(&Some(OsString::from("semantic"))),
             "arbitrary build-script inputs must remain visible to the producer",
+        );
+    }
+
+    #[test]
+    fn run_command_carries_production_lock_dir_reference() {
+        let mut command = Command::new("cargo");
+        stamp_production_lock_dir(&mut command);
+        let stamped = command
+            .get_envs()
+            .find(|(name, _)| *name == OsStr::new(ktstr::KTSTR_PRODUCTION_LOCK_DIR_ENV))
+            .and_then(|(_, value)| value)
+            .map(OsStr::to_owned);
+        assert_eq!(
+            stamped,
+            Some(ktstr::resolve_production_lock_dir().into_os_string()),
+            "every nextest run must export the parent-resolved shared lock dir \
+             so the misclassification guard can seal against it",
         );
     }
 

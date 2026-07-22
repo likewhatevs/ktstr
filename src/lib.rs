@@ -1412,6 +1412,37 @@ pub const KTSTR_CACHE_DIR_ENV: &str = "KTSTR_CACHE_DIR";
 /// tests + CI environments that need isolated lock-dirs.
 pub const KTSTR_LOCK_DIR_ENV: &str = "KTSTR_LOCK_DIR";
 
+/// The nextest test-group name for ordinary CPU-bounded host tests,
+/// as spelled in `.config/nextest.toml`. Resource users (tests that
+/// enter production host-resource admission) belong in the
+/// effectively-unbounded `@global` group instead; the fail-closed
+/// guard in `crate::vmm::host_topology` aborts when a test that takes
+/// real admission was classified into this group. This literal is the
+/// group name (matched against nextest's `NEXTEST_TEST_GROUP`), not a
+/// value read from config; `nextest_host_tests_group_matches_config`
+/// pins it equal to the checked-in `.config/nextest.toml` spelling.
+pub const NEXTEST_HOST_TESTS_GROUP: &str = "host-tests";
+
+/// Name of the environment variable cargo-ktstr stamps onto every
+/// nextest run command with the lock/registry directory it resolved
+/// in the parent process. Test processes (and their children) inherit
+/// it; the misclassification guard in `crate::vmm::host_topology`
+/// consumes it as a sealed reference — the "namespace the real
+/// scheduler is using this run" — so a `host-tests`-classified test is
+/// aborted only when it resolves THIS exact dir, not when it redirected
+/// its locks into an isolated temp namespace (which legitimately runs
+/// in `host-tests`). Absent (e.g. an ad-hoc `cargo nextest run` not
+/// launched by cargo-ktstr) disarms the guard entirely.
+pub const KTSTR_PRODUCTION_LOCK_DIR_ENV: &str = "KTSTR_PRODUCTION_LOCK_DIR";
+
+/// Resolve the shared lock/registry directory to stamp into
+/// [`KTSTR_PRODUCTION_LOCK_DIR_ENV`] when cargo-ktstr spawns nextest.
+/// Identical resolution to every production admission path, so a test
+/// process resolving the same env/default lands on a byte-equal path.
+pub fn resolve_production_lock_dir() -> std::path::PathBuf {
+    crate::cache::resolve_lock_dir()
+}
+
 /// Name of the environment variable that triggers verbose logging
 /// in the VMM setup phase. Strict `v == "1"` semantics (only the
 /// literal `"1"` enables; unset / empty / any other value —

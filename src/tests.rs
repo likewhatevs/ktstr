@@ -458,6 +458,26 @@ fn ktstr_env_constants_are_their_literals() {
     assert_eq!(KTSTR_LOG_PASSES_ENV, "KTSTR_LOG_PASSES");
 }
 
+/// The production-admission guard matches nextest's group by the
+/// [`crate::NEXTEST_HOST_TESTS_GROUP`] literal instead of parsing
+/// config; this pins that literal to the group name the checked-in
+/// `.config/nextest.toml` assigns ordinary host tests, so renaming the
+/// group in config without updating the constant fails here rather than
+/// silently disarming the guard. The bin-side `nextest_config` code
+/// cannot host the constant — test binaries do not link it — so the
+/// two are kept in sync from the library crate the tests do link.
+#[test]
+fn nextest_host_tests_group_matches_config() {
+    const CONFIG: &str = include_str!("../.config/nextest.toml");
+    let assignment = format!("test-group = \"{}\"", super::NEXTEST_HOST_TESTS_GROUP);
+    assert!(
+        CONFIG.contains(&assignment),
+        "`.config/nextest.toml` must assign ordinary host tests to the `{}` \
+         group the admission guard keys on",
+        super::NEXTEST_HOST_TESTS_GROUP,
+    );
+}
+
 // -- extra_kconfig_hash + cache_key_suffix_with_extra --
 //
 // The two-segment cache-key suffix underpins cargo-ktstr's

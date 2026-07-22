@@ -1961,24 +1961,82 @@ pub(crate) fn resource_claim_with_permits(
     .with_admission_class(admission_class)
 }
 
+/// Nextest exports this to every test process: the custom test-group
+/// name, or the literal `@global` for ungrouped tests. A process not
+/// spawned by nextest has neither this nor `NEXTEST_TEST_NAME`.
+const NEXTEST_TEST_GROUP_ENV: &str = "NEXTEST_TEST_GROUP";
+const NEXTEST_TEST_NAME_ENV: &str = "NEXTEST_TEST_NAME";
+
+/// Resolve the production lock directory for a real host-resource
+/// claim, first tripping the fail-closed nextest-misclassification
+/// guard.
+///
+/// ktstr admits every VM boot, resource lock, and build reservation
+/// through its cross-process registry, which lives under this
+/// directory. Nextest is only a spawner: `.config/nextest.toml` must
+/// place resource users in the effectively-unbounded `@global` group
+/// so they reach that registry, and ordinary host tests in the
+/// CPU-sized `host-tests` group. That allowlist is hand-maintained,
+/// so a new test entering production admission without being added
+/// would silently run inside `host-tests` — booting a second
+/// scheduler outside ktstr's admission with green CI. Rather than let
+/// that misclassification stand, abort loudly the moment such a test
+/// resolves the production lock dir.
+///
+/// The nextest group alone is not a sufficient discriminator: a
+/// `host-tests` test may legitimately take real locks in an ISOLATED
+/// namespace (e.g. the re-exec'd build-reservation tests point
+/// `KTSTR_LOCK_DIR` at a private tempdir), and CI itself always sets
+/// `KTSTR_LOCK_DIR` ambiently, so neither the group nor "is
+/// `KTSTR_LOCK_DIR` set" can tell isolation from misclassification. The
+/// seal is [`crate::KTSTR_PRODUCTION_LOCK_DIR_ENV`]: cargo-ktstr stamps
+/// it with the dir IT resolved when spawning nextest, so a fire
+/// requires the test to resolve that exact shared namespace — the one
+/// the real scheduler is using this run. A test redirected elsewhere
+/// (mismatch) or an ad-hoc run with no reference (absent) proceeds.
+///
+/// Temp-path unit tests that use the thread-local lock-prefix override
+/// never reach this at all: the override short-circuits every
+/// `*_lock_prefix` caller before it runs.
+fn production_lock_dir() -> std::path::PathBuf {
+    let resolved = crate::cache::resolve_lock_dir();
+    if let Ok(group) = std::env::var(NEXTEST_TEST_GROUP_ENV) {
+        if group == crate::NEXTEST_HOST_TESTS_GROUP {
+            if let Some(reference) = std::env::var_os(crate::KTSTR_PRODUCTION_LOCK_DIR_ENV) {
+                if std::path::Path::new(&reference) == resolved.as_path() {
+                    let test = std::env::var(NEXTEST_TEST_NAME_ENV)
+                        .unwrap_or_else(|_| "<unknown>".to_string());
+                    panic!(
+                        "test `{test}` takes production host-resource admission but was \
+                         classified into the CPU-bounded `{group}` nextest group. \
+                         Resource users must run in `@global` so ktstr's cross-process \
+                         registry admits them; running here boots a second scheduler \
+                         outside admission. Add this test to the resource selector in \
+                         .config/nextest.toml (the profile.default `@global` override, \
+                         mirrored as its `host-tests` complement)."
+                    );
+                }
+            }
+        }
+    }
+    resolved
+}
+
 /// Compose the LLC lockfile prefix from the resolved lock directory.
 /// Returns `{lock_dir}/ktstr-llc-`.
 fn llc_lock_prefix() -> String {
-    format!("{}/ktstr-llc-", crate::cache::resolve_lock_dir().display())
+    format!("{}/ktstr-llc-", production_lock_dir().display())
 }
 
 /// Compose the per-CPU lockfile prefix from the resolved lock directory.
 /// Returns `{lock_dir}/ktstr-cpu-`.
 fn cpu_lock_prefix() -> String {
-    format!("{}/ktstr-cpu-", crate::cache::resolve_lock_dir().display())
+    format!("{}/ktstr-cpu-", production_lock_dir().display())
 }
 
 /// Compose the weighted admission-permit lockfile prefix.
 fn permit_lock_prefix() -> String {
-    format!(
-        "{}/ktstr-permit-",
-        crate::cache::resolve_lock_dir().display()
-    )
+    format!("{}/ktstr-permit-", production_lock_dir().display())
 }
 
 #[cfg(test)]
