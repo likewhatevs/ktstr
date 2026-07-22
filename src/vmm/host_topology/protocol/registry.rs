@@ -372,6 +372,11 @@ const COORDINATOR_HEARTBEAT_INTERVAL_NS: u64 = 1_000_000_000;
 pub(super) const COORDINATOR_HEARTBEAT_INTERVAL: Duration =
     Duration::from_nanos(COORDINATOR_HEARTBEAT_INTERVAL_NS);
 const DEFERRED_RESCAN_INTERVAL_NS: u64 = 1_000_000_000;
+/// A published GRANTED batch probes outside registry EX. Its negative
+/// completions tend to return together, so give the batch one short,
+/// non-renewing drain interval instead of letting the coordinator reacquire
+/// EX and run an O(N) scan between individual callback publications.
+const GRANT_COMPLETION_RESCAN_INTERVAL_NS: u64 = 10_000_000;
 /// Eight missed one-second heartbeats are enough to transfer progress to the
 /// oldest waiter. The displaced live coordinator is parked, so a false
 /// positive under extreme descheduling is safe and does not weaken physical
@@ -2437,7 +2442,7 @@ impl Ticket {
                 table.begin_transaction()?;
                 table.set_record_state(self.slot, STATE_WAITING)?;
                 table.clear_record_blocked(self.slot)?;
-                let notify = table.schedule_rescan_edge_in_transaction()?;
+                let notify = table.schedule_grant_completion_edge_in_transaction()?;
                 table.finish_transaction()?;
                 drop(table);
                 drop(_lock);
@@ -2463,7 +2468,7 @@ impl Ticket {
                 let notify = if replan_completion {
                     table.schedule_replan_completion_edge_in_transaction()?
                 } else {
-                    table.schedule_rescan_edge_in_transaction()?
+                    table.schedule_grant_completion_edge_in_transaction()?
                 };
                 table.finish_transaction()?;
                 drop(table);
@@ -2631,7 +2636,7 @@ impl Ticket {
                 table.set_record_issue_serial(self.slot, consumed_serial)?;
                 table.mark_blocker_unknown(marker)?;
             }
-            let notify = table.schedule_rescan_edge_in_transaction()?;
+            let notify = table.schedule_grant_completion_edge_in_transaction()?;
             table.finish_transaction()?;
             drop(table);
             drop(lock);
@@ -2788,7 +2793,7 @@ impl Ticket {
                     &released_claim.llcs,
                     &released_claim.permits,
                 )?;
-                notify_now = table.schedule_rescan_edge_in_transaction()?;
+                notify_now = table.schedule_grant_completion_edge_in_transaction()?;
                 table.finish_transaction()?;
             }
             // Keep the resource unavailable across the registry unlock, then
@@ -2848,7 +2853,7 @@ impl Ticket {
                             &preparation_claim.llcs,
                             &preparation_claim.permits,
                         )?;
-                        table.schedule_rescan_edge_in_transaction()?;
+                        table.schedule_grant_completion_edge_in_transaction()?;
                         table.finish_transaction()?;
                         drop(table);
                         drop(lock);
@@ -2914,7 +2919,8 @@ impl Ticket {
         if changed {
             if acquisition_allowed {
                 table.begin_transaction()?;
-                let rescan_was_pending = table.pending_flags() & PENDING_RESCAN != 0;
+                let rescan_was_pending =
+                    table.pending_flags() & (PENDING_RESCAN | PENDING_REPLAN_RESCAN) != 0;
                 table.replace_claim_in_transaction(
                     self.slot,
                     record.ticket,
@@ -2926,7 +2932,7 @@ impl Ticket {
                     false,
                     ReplacementFenceEffect::ChangesPredecessorPrefix,
                 )?;
-                let schedule_notify = table.schedule_rescan_edge_in_transaction()?;
+                let schedule_notify = table.schedule_grant_completion_edge_in_transaction()?;
                 notify_now = !rescan_was_pending || schedule_notify;
                 table.finish_transaction()?;
             } else {
@@ -2963,7 +2969,7 @@ impl Ticket {
             table.set_record_state(self.slot, STATE_WAITING)?;
             table.set_record_issue_serial(self.slot, consumed_serial)?;
             notify_now = if acquisition_allowed {
-                table.schedule_rescan_edge_in_transaction()?
+                table.schedule_grant_completion_edge_in_transaction()?
             } else {
                 table.schedule_replan_completion_edge_in_transaction()?
             };
@@ -7670,6 +7676,16 @@ pub(crate) struct DeferredRescanPolicyOutcome {
 }
 
 #[cfg(test)]
+pub(crate) struct GrantCompletionBatchOutcome {
+    pub(crate) first_completion_notified: bool,
+    pub(crate) later_deferred_deadline_shortened: bool,
+    pub(crate) second_completion_coalesced: bool,
+    pub(crate) deadline_was_not_renewed: bool,
+    pub(crate) no_scan_before_deadline: bool,
+    pub(crate) one_scan_at_deadline: bool,
+}
+
+#[cfg(test)]
 pub(crate) struct BoundedReplanWindowOutcome {
     pub(crate) capacity: usize,
     pub(crate) peak_outstanding: usize,
@@ -9075,6 +9091,136 @@ pub(super) fn exercise_changed_replan_wave_completions_for_tests(
         authoritative_scan_delta,
         authoritative_flags_clear,
         replacements_preserved,
+    })
+}
+
+/// Prove that a physical GRANTED callback batch publishes one short absolute
+/// rescan deadline instead of handing registry EX back to the coordinator
+/// between individual negative completions.
+#[cfg(test)]
+pub(super) fn exercise_grant_completion_batch_for_tests() -> Result<GrantCompletionBatchOutcome> {
+    let coordinator_claim = ClaimSet::new(std::iter::empty(), [1_750usize], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        for cpu in [1_750usize, 1_751, 1_752] {
+            set_cpu_free_for_tests(&mut table, cpu, true)?;
+        }
+    }
+    let first_claim = ClaimSet::new(std::iter::empty(), [1_751usize], FlockMode::Exclusive);
+    let second_claim = ClaimSet::new(std::iter::empty(), [1_752usize], FlockMode::Exclusive);
+    let mut first = Ticket::register(first_claim.clone(), first_claim.clone(), None)?;
+    let mut second = Ticket::register(second_claim.clone(), second_claim.clone(), None)?;
+    let notify_before = NOTIFY_CALLS.with(std::cell::Cell::get);
+    let (scans_before, speculative_deadline) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        anyhow::ensure!(
+            table.replan_outstanding() == 0
+                && table
+                    .record(first.slot)?
+                    .is_some_and(|record| record.state == STATE_GRANTED)
+                && table
+                    .record(second.slot)?
+                    .is_some_and(|record| record.state == STATE_GRANTED),
+            "grant-completion fixture did not publish both exact callbacks",
+        );
+        let speculative_deadline = monotonic_now_ns()?
+            .max(1)
+            .saturating_add(DEFERRED_RESCAN_INTERVAL_NS);
+        table.begin_transaction()?;
+        table.set_pending_flag(PENDING_REPLAN_RESCAN);
+        write_u64(
+            &mut table.header,
+            H_DEFERRED_RESCAN_DEADLINE_NS,
+            speculative_deadline,
+        );
+        table.finish_transaction()?;
+        (read_u64(&table.header, H_GRANT_SCANS), speculative_deadline)
+    };
+
+    let mut first_deadline = 0;
+    let mut first_completion_notified = false;
+    let mut later_deferred_deadline_shortened = false;
+    for (index, (ticket, expected)) in [(&mut first, &first_claim), (&mut second, &second_claim)]
+        .into_iter()
+        .enumerate()
+    {
+        let result = ticket.run_granted(
+            None,
+            |designated, _watch, acquisition_allowed, _predecessors, _availability| {
+                anyhow::ensure!(
+                    acquisition_allowed && designated == expected,
+                    "grant-completion fixture received the wrong callback publication",
+                );
+                Ok(GrantAttempt::<()> {
+                    acquired: None,
+                    preparation_claim: None,
+                    preparation_contention: None,
+                    next_claim: designated.clone(),
+                    contention: None,
+                })
+            },
+        )?;
+        anyhow::ensure!(
+            matches!(result, GrantResult::Requeued),
+            "negative exact callback did not return to WAITING",
+        );
+        if index == 0 {
+            let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+            let table = Table::open_existing()?;
+            first_deadline = table.deferred_rescan_deadline_ns();
+            first_completion_notified = first_deadline != 0
+                && NOTIFY_CALLS
+                    .with(std::cell::Cell::get)
+                    .wrapping_sub(notify_before)
+                    == 1;
+            later_deferred_deadline_shortened = first_deadline < speculative_deadline;
+        }
+    }
+
+    let (
+        second_completion_coalesced,
+        deadline_was_not_renewed,
+        no_scan_before_deadline,
+        one_scan_at_deadline,
+    ) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let deadline = table.deferred_rescan_deadline_ns();
+        let notify_delta = NOTIFY_CALLS
+            .with(std::cell::Cell::get)
+            .wrapping_sub(notify_before);
+        let pending = table.pending_flags() & PENDING_REPLAN_RESCAN != 0
+            && table.pending_flags() & PENDING_RESCAN == 0
+            && deadline != 0;
+        let before = !table.prepare_grant_scan_at(deadline.saturating_sub(1))?
+            && read_u64(&table.header, H_GRANT_SCANS) == scans_before;
+        let due = table.prepare_grant_scan_at(deadline)?;
+        if due {
+            table.grant_compatible_at(deadline)?;
+        }
+        let scan_delta = read_u64(&table.header, H_GRANT_SCANS).wrapping_sub(scans_before);
+        (
+            pending && notify_delta == 1,
+            pending && deadline == first_deadline,
+            before,
+            due && scan_delta == 1
+                && table.pending_flags() & (PENDING_RESCAN | PENDING_REPLAN_RESCAN) == 0,
+        )
+    };
+
+    second.finish(None)?;
+    first.finish(None)?;
+    coordinator.finish(None)?;
+    Ok(GrantCompletionBatchOutcome {
+        first_completion_notified,
+        later_deferred_deadline_shortened,
+        second_completion_coalesced,
+        deadline_was_not_renewed,
+        no_scan_before_deadline,
+        one_scan_at_deadline,
     })
 }
 
@@ -13723,9 +13869,7 @@ impl Table {
         if self.pending_flags() & PENDING_RESCAN != 0 {
             return Ok(true);
         }
-        if self.pending_flags() & PENDING_REPLAN_RESCAN == 0
-            || (self.replan_outstanding() != 0 && !self.deferred_rescan_due_at(now))
-        {
+        if self.pending_flags() & PENDING_REPLAN_RESCAN == 0 || !self.deferred_rescan_due_at(now) {
             return Ok(false);
         }
 
@@ -13817,6 +13961,34 @@ impl Table {
         // the final callback is the drop-order boundary which guarantees its
         // payload/proof OFDs have closed before the coordinator samples them.
         Ok(drained || notify)
+    }
+
+    /// Batch GRANTED -> WAITING callback completions behind one short absolute
+    /// deadline. Unlike speculative REPLAN batching, the first completion is
+    /// transported immediately so an idle coordinator installs the timer;
+    /// subsequent completions join the same edge without renewing it.
+    fn schedule_grant_completion_edge_in_transaction(&mut self) -> Result<bool> {
+        if self.coordinator_ticket() == 0 {
+            return self.schedule_rescan_edge_in_transaction();
+        }
+        if self.pending_flags() & PENDING_RESCAN != 0 {
+            return Ok(false);
+        }
+        let now = monotonic_now_ns()?.max(1);
+        let deadline = now.saturating_add(GRANT_COMPLETION_RESCAN_INTERVAL_NS);
+        if self.pending_flags() & PENDING_REPLAN_RESCAN != 0 {
+            let current = self.deferred_rescan_deadline_ns();
+            if current == 0 || deadline < current {
+                write_u64(&mut self.header, H_DEFERRED_RESCAN_DEADLINE_NS, deadline);
+                // A speculative partial wave may have omitted transport for
+                // its later deadline. Publish the shortened hard boundary.
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        self.set_pending_flag(PENDING_REPLAN_RESCAN);
+        write_u64(&mut self.header, H_DEFERRED_RESCAN_DEADLINE_NS, deadline);
+        Ok(true)
     }
 
     fn observation_request_serial(&self) -> u64 {

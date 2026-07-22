@@ -2178,6 +2178,12 @@ pub(crate) fn exercise_deferred_rescan_policy_for_tests()
 }
 
 #[cfg(test)]
+pub(crate) fn exercise_grant_completion_batch_for_tests()
+-> Result<registry::GrantCompletionBatchOutcome> {
+    registry::exercise_grant_completion_batch_for_tests()
+}
+
+#[cfg(test)]
 pub(crate) fn exercise_replan_straggler_progress_for_tests()
 -> Result<registry::ReplanStragglerProgressOutcome> {
     registry::exercise_replan_straggler_progress_for_tests()

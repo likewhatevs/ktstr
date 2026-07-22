@@ -974,9 +974,10 @@ fn pending_exec_descriptor_accepts_matching_memory_and_wprof_contract() {
         .expect("prepared memory may exceed an otherwise identical metadata-v3 contract");
 }
 
-/// Performance admission must publish every exact whole-LLC placement, not
-/// freeze an all-busy storm onto the builder's first slot. The order is
-/// process-rotated, so compare the set.
+/// Performance admission must publish every eligible exact whole-LLC
+/// placement, not freeze an all-busy storm onto the builder's first slot.
+/// The physical build/default reserve is deliberately ineligible. Candidate
+/// order is process-rotated, so compare the set.
 #[test]
 fn performance_run_candidates_cover_every_equivalent_exclusive_slot() {
     let host = host_topology::HostTopology::new_for_tests(&[
@@ -992,7 +993,17 @@ fn performance_run_candidates_cover_every_equivalent_exclusive_slot() {
         .map(|candidate| candidate.plan.llc_indices.clone())
         .collect();
     llcs.sort();
-    assert_eq!(llcs, vec![vec![0], vec![1], vec![2]]);
+    assert_eq!(llcs, vec![vec![1], vec![2]]);
+    let reserved = host.performance_reserved_cpus(&[0, 1, 2, 3, 4, 5]);
+    assert_eq!(reserved, [0, 1].into_iter().collect());
+    assert!(candidates.iter().all(|candidate| {
+        candidate
+            .plan
+            .llc_indices
+            .iter()
+            .flat_map(|llc| host.llc_groups[*llc].cpus.iter())
+            .all(|cpu| !reserved.contains(cpu))
+    }));
     assert!(
         candidates
             .iter()

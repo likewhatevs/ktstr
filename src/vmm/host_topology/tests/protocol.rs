@@ -4962,6 +4962,37 @@ fn changed_replan_completions_coalesce_one_authoritative_scan() {
 }
 
 #[test]
+fn negative_grant_callbacks_batch_one_authoritative_rescan() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_grant_completion_batch_for_tests()
+        .expect("exercise negative grant callback batching");
+    assert!(
+        outcome.first_completion_notified,
+        "the first negative grant completion must transport its absolute deadline",
+    );
+    assert!(
+        outcome.later_deferred_deadline_shortened,
+        "a negative grant completion must shorten and transport a later speculative deadline",
+    );
+    assert!(
+        outcome.second_completion_coalesced,
+        "later grant completions must join the same coordinator edge",
+    );
+    assert!(
+        outcome.deadline_was_not_renewed,
+        "continuous callback completions must not postpone the first deadline",
+    );
+    assert!(
+        outcome.no_scan_before_deadline,
+        "ordinary coordinator turns must not consume a partial grant batch early",
+    );
+    assert!(
+        outcome.one_scan_at_deadline,
+        "one authoritative scan must consume the complete negative callback batch",
+    );
+}
+
+#[test]
 fn deferred_replan_rescans_survive_event_storms_and_flush_at_hard_boundaries() {
     let _prefixes = LockPrefixesGuard::new();
     let outcome = protocol::exercise_deferred_rescan_policy_for_tests()
