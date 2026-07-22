@@ -3743,6 +3743,9 @@ pub(crate) fn load_or_build_nextest_artifacts(
         &identity_surface,
         output_roots,
     )?;
+    let shared_build_dir =
+        crate::nextest_artifact_cache::shared_build_scratch_dir(plan.build_bucket)?;
+    gc_stale_shared_build_scratch(std::time::SystemTime::now());
     plan.load_or_build(cli_label, |stable, stable_build| {
         let stable_invocation_dir = stable.invocation_root.clone();
         let build_args = stable.remap_cargo_args(build_args);
@@ -3760,7 +3763,15 @@ pub(crate) fn load_or_build_nextest_artifacts(
             &stable.workspace_root,
         );
         let output_target = &stable_build.target_directory;
-        let output_build = stable_build.root.join("build");
+        // Cargo builds dependency objects, fingerprints, and build-script
+        // OUT_DIRs into a persistent directory shared across source digests of
+        // the same non-source bucket, so unchanged dependencies are not
+        // recompiled and OUT_DIR stays stable for sccache. Final artifacts still
+        // land in the per-source, sealed target directory. `capture_source`
+        // snapshots this build directory into the per-source materialized tree
+        // (under the build-dir lease held below), so nextest's build-dir-remap
+        // still resolves each test binary's OUT_DIR at execution time.
+        let output_build = shared_build_dir.clone();
         let build_args = remap_nextest_store_output(
             &build_args,
             &stable.workspace_root,
@@ -3795,6 +3806,14 @@ pub(crate) fn load_or_build_nextest_artifacts(
             release,
             &environment,
         );
+        // Serialize every same-bucket producer on the shared build directory,
+        // then purge workspace members so this digest recompiles its own members
+        // (never stale-reusing another digest's), and hold the lease through the
+        // capture below which snapshots the shared directory. Acquisition order
+        // is always build-dir lease then target-dir lease (inside the call), so
+        // it composes with Cargo's own build-dir lock without deadlock.
+        let _shared_build_lease = acquire_cargo_build_output_lease(&shared_build_dir, cli_label)?;
+        purge_shared_build_dir_workspace_members(&shared_build_dir, metadata)?;
         run_reserved_build_output_pair_under_lease(
             command,
             metadata_command,
@@ -5286,6 +5305,265 @@ fn canonical_cargo_target_dir(target_dir: &std::path::Path) -> Result<PathBuf, S
             target_dir.display()
         )
     })
+}
+
+/// Remove every workspace-member and path-dependency product from the shared,
+/// non-source-keyed Cargo build directory before a build.
+///
+/// Exactness is load-bearing. The shared build directory is reused across source
+/// digests that differ only in workspace-member source content, and Cargo's
+/// per-member metadata hash is source-path- and content-independent while its
+/// freshness is mtime-based. If any member's fingerprint or output survives
+/// here, a later digest whose materialized source mtime does not strictly exceed
+/// the surviving fingerprint stale-reuses the earlier digest's member and
+/// publishes the wrong bytes under the new identity. Registry dependencies
+/// (`source != None`) are intentionally retained: they are byte-identical within
+/// a bucket and are exactly the reuse this mechanism exists to keep. Over-purging
+/// (e.g. a registry crate that happens to share a member's stem) only costs a
+/// recompile and stays correct; under-purging is a silent stale-reuse bug, so the
+/// match anchors on the Cargo `<stem>-<metadata-hash>` separator and never on a
+/// bare prefix.
+///
+/// Must run while the caller holds the build-directory lease, immediately before
+/// the Cargo invocation, so no concurrent same-bucket builder observes a
+/// half-purged directory.
+pub(crate) fn purge_shared_build_dir_workspace_members(
+    build_dir: &std::path::Path,
+    metadata: &cargo_metadata::Metadata,
+) -> Result<(), String> {
+    // Cargo does not spell a package's file stem consistently: `deps/` and
+    // `incremental/` use the underscored crate name (`libktstr_macros-<hash>`),
+    // while `.fingerprint/` and `build/` keep the original dashed package name
+    // (`ktstr-macros-<hash>`). Matching only one form silently leaves the other
+    // alive — the dashed `.fingerprint`/`build` entries hold the build-script
+    // run fingerprint and its `OUT_DIR`, so missing them lets a later digest
+    // keep an earlier digest's generated `OUT_DIR` (e.g. a stale BPF skeleton).
+    // Purge both forms.
+    let variants: std::collections::BTreeSet<String> = metadata
+        .packages
+        .iter()
+        .filter(|package| package.source.is_none())
+        .flat_map(|package| [package.name.clone(), package.name.replace('-', "_")])
+        .collect();
+    if variants.is_empty() {
+        return Ok(());
+    }
+    // Cargo lays intermediates out per profile: <build_dir>/<profile>/{deps,
+    // .fingerprint,build,incremental}. Custom profiles use their own name, so
+    // scan every profile subdirectory rather than assuming release/debug.
+    let profiles = match std::fs::read_dir(build_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "scan shared build directory {} for member purge: {error}",
+                build_dir.display()
+            ));
+        }
+    };
+    for profile in profiles {
+        let profile = profile.map_err(|error| {
+            format!(
+                "read shared build directory entry under {}: {error}",
+                build_dir.display()
+            )
+        })?;
+        if !profile
+            .file_type()
+            .map(|kind| kind.is_dir())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let profile_dir = profile.path();
+        for subdir in ["deps", ".fingerprint", "build", "incremental"] {
+            purge_member_products_in(&profile_dir.join(subdir), &variants)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether a Cargo intermediate filename is a product of a workspace member.
+///
+/// Cargo names products `<stem>-<metadata-hash>` (with an optional `lib` prefix
+/// and file extension in `deps/`). `variants` holds every member's dashed and
+/// underscored stem. A name matches when, after optionally dropping a `lib`
+/// prefix, it begins `<variant>-` and the following hash segment (up to the
+/// first `.`) is a non-empty run of hex digits. Anchoring on the `-<hash>`
+/// boundary and requiring a hex hash means a member stem can never partial-match
+/// a longer dependency stem that merely shares its prefix (e.g. member
+/// `ktstr` never matches `ktstr-macros-<hash>`, whose residual `macros-<hash>`
+/// is not hex).
+fn name_is_member_product(name: &str, variants: &std::collections::BTreeSet<String>) -> bool {
+    for core in [name, name.strip_prefix("lib").unwrap_or(name)] {
+        for variant in variants {
+            let Some(rest) = core.strip_prefix(variant) else {
+                continue;
+            };
+            let Some(hash) = rest.strip_prefix('-') else {
+                continue;
+            };
+            let hash = hash.split('.').next().unwrap_or(hash);
+            if !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Unlink every entry in one Cargo intermediate subdirectory that belongs to a
+/// workspace member (see [`name_is_member_product`]).
+fn purge_member_products_in(
+    directory: &std::path::Path,
+    variants: &std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "scan Cargo intermediate directory {}: {error}",
+                directory.display()
+            ));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "read Cargo intermediate entry under {}: {error}",
+                directory.display()
+            )
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name_is_member_product(name, variants) {
+            continue;
+        }
+        let path = entry.path();
+        let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+        let removal = if is_dir {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if let Err(error) = removal
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(format!(
+                "purge stale workspace-member product {}: {error}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Idle age after which an unused shared build-scratch bucket may be reclaimed.
+const SHARED_BUILD_SCRATCH_MAX_IDLE: std::time::Duration =
+    std::time::Duration::from_secs(14 * 24 * 60 * 60);
+
+/// Reclaim shared, non-source-keyed Cargo build-scratch buckets that no builder
+/// is using and that have been idle past [`SHARED_BUILD_SCRATCH_MAX_IDLE`].
+///
+/// Buckets are keyed by build configuration (features, profile, resolved
+/// dependency set, toolchain, environment), not by source revision, so they are
+/// few and long-lived; this reclaims only buckets left behind by a dependency,
+/// toolchain, or feature change. It is lease-safe: each candidate is removed
+/// only while this process holds that bucket's exclusive build-output lease
+/// (the same lock builders take), so it never deletes a directory under an
+/// active builder. A builder that races in afterwards simply re-creates the
+/// bucket and does one cold build.
+///
+/// Best-effort: any per-bucket error is logged and skipped so cleanup never
+/// fails a build.
+pub(crate) fn gc_stale_shared_build_scratch(now: std::time::SystemTime) {
+    let Ok(parent) = crate::nextest_artifact_cache::shared_build_scratch_dir(0)
+        .map(|bucket_zero| bucket_zero.parent().map(std::path::Path::to_path_buf))
+    else {
+        return;
+    };
+    let Some(parent) = parent else {
+        return;
+    };
+    let lock_root = match ktstr::cache::cargo_build_output_lock_root() {
+        Ok(root) => root,
+        Err(_) => return,
+    };
+    gc_stale_shared_build_scratch_in(&parent, &lock_root, now);
+}
+
+fn gc_stale_shared_build_scratch_in(
+    parent: &std::path::Path,
+    lock_root: &std::path::Path,
+    now: std::time::SystemTime,
+) {
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let bucket = entry.path();
+        if !shared_build_scratch_bucket_is_idle(&bucket, now) {
+            continue;
+        }
+        let Ok(canonical) = std::fs::canonicalize(&bucket) else {
+            continue;
+        };
+        let lock_path = cargo_build_output_lock_path(lock_root, &canonical);
+        // Non-blocking: a live builder holding this lease keeps its bucket.
+        let Ok(Some(_lease)) =
+            ktstr::flock::try_flock(&lock_path, ktstr::flock::FlockMode::Exclusive)
+        else {
+            continue;
+        };
+        // Re-check idleness under the lease: a builder may have run between the
+        // first stat and acquiring the lock.
+        if !shared_build_scratch_bucket_is_idle(&bucket, now) {
+            continue;
+        }
+        if let Err(error) = std::fs::remove_dir_all(&bucket)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                bucket = %bucket.display(),
+                error = %error,
+                "could not reclaim idle shared build-scratch bucket",
+            );
+        }
+    }
+}
+
+/// Whether every recorded timestamp under a bucket is older than the idle
+/// threshold. Uses the newest mtime of the bucket root and its immediate
+/// children (Cargo touches the per-profile subdirectories on every build), so
+/// an in-progress or recently completed build keeps the bucket.
+fn shared_build_scratch_bucket_is_idle(
+    bucket: &std::path::Path,
+    now: std::time::SystemTime,
+) -> bool {
+    let mut newest = std::fs::symlink_metadata(bucket)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok());
+    if let Ok(children) = std::fs::read_dir(bucket) {
+        for child in children.flatten() {
+            if let Ok(modified) = child.metadata().and_then(|metadata| metadata.modified()) {
+                newest = Some(newest.map_or(modified, |current| current.max(modified)));
+            }
+        }
+    }
+    match newest {
+        Some(newest) => now
+            .duration_since(newest)
+            .map(|idle| idle >= SHARED_BUILD_SCRATCH_MAX_IDLE)
+            .unwrap_or(false),
+        None => false,
+    }
 }
 
 pub(crate) fn acquire_cargo_build_output_lease(
@@ -6830,13 +7108,156 @@ pub(crate) fn run_llvm_cov(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
     use crate::test_env::{ChildEnv, is_reexec_case, reexec_current_test};
 
     fn v(s: &str) -> Version {
         Version::parse(s).expect("test version literal is valid semver")
+    }
+
+    /// Guards the whole shared-build-dir mechanism: a workspace member that
+    /// survives the purge is a silent stale-reuse of another source digest's
+    /// member. Every member product must be removed across `deps/` (underscored,
+    /// `lib`-prefixed) AND `.fingerprint/`/`build/` (dashed) — missing the dashed
+    /// build-script/`OUT_DIR` entries would keep a stale generated skeleton.
+    /// Registry dependencies must be kept (they are the reuse we want), and a
+    /// member stem must never partial-match a longer dependency stem.
+    #[test]
+    fn purge_removes_every_member_product_but_keeps_dependencies() {
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let profile = profile.path();
+        let write_file = |sub: &str, name: &str| {
+            let dir = profile.join(sub);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(name), b"x").unwrap();
+        };
+        let write_dir = |sub: &str, name: &str| {
+            let dir = profile.join(sub).join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("marker"), b"x").unwrap();
+        };
+        // Member `scx-ktstr`: underscored in deps/incremental, dashed in
+        // .fingerprint/build (mirrors real Cargo naming).
+        write_file("deps", "libscx_ktstr-0123456789abcdef.rlib");
+        write_file("deps", "libscx_ktstr-0123456789abcdef.rmeta");
+        write_file("deps", "scx_ktstr-0123456789abcdef.d");
+        write_dir("incremental", "scx_ktstr-0123456789abcdef");
+        write_dir(".fingerprint", "scx-ktstr-0123456789abcdef");
+        write_dir(".fingerprint", "scx-ktstr-fedcba9876543210"); // build-script run
+        write_dir("build", "scx-ktstr-0123456789abcdef");
+        // A registry dependency that must be retained.
+        write_file("deps", "libserde-fedcba9876543210.rlib");
+        write_dir(".fingerprint", "serde-fedcba9876543210");
+        write_dir("build", "serde-fedcba9876543210");
+        // Dependencies whose stems share a member's prefix — anchoring on the
+        // `<stem>-<hex-hash>` boundary must keep them.
+        write_file("deps", "libscx_ktstr_helper-aaaaaaaaaaaaaaaa.rlib");
+        write_dir(".fingerprint", "scx-ktstr-helper-aaaaaaaaaaaaaaaa");
+
+        // Real member set for this workspace includes another dashed member and
+        // a prefix member to exercise disambiguation.
+        let variants = BTreeSet::from([
+            "scx-ktstr".to_string(),
+            "scx_ktstr".to_string(),
+            "ktstr".to_string(),
+        ]);
+        for sub in ["deps", ".fingerprint", "build", "incremental"] {
+            purge_member_products_in(&profile.join(sub), &variants).expect("purge subdir");
+        }
+
+        // Every member product gone, including the dashed build/fingerprint ones.
+        assert!(
+            !profile
+                .join("deps/libscx_ktstr-0123456789abcdef.rlib")
+                .exists()
+        );
+        assert!(
+            !profile
+                .join("deps/libscx_ktstr-0123456789abcdef.rmeta")
+                .exists()
+        );
+        assert!(!profile.join("deps/scx_ktstr-0123456789abcdef.d").exists());
+        assert!(
+            !profile
+                .join("incremental/scx_ktstr-0123456789abcdef")
+                .exists()
+        );
+        assert!(
+            !profile
+                .join(".fingerprint/scx-ktstr-0123456789abcdef")
+                .exists(),
+            "dashed member fingerprint must be purged",
+        );
+        assert!(
+            !profile
+                .join(".fingerprint/scx-ktstr-fedcba9876543210")
+                .exists()
+        );
+        assert!(
+            !profile.join("build/scx-ktstr-0123456789abcdef").exists(),
+            "dashed member build-script OUT_DIR must be purged",
+        );
+        // Dependencies retained.
+        assert!(profile.join("deps/libserde-fedcba9876543210.rlib").exists());
+        assert!(profile.join(".fingerprint/serde-fedcba9876543210").exists());
+        assert!(profile.join("build/serde-fedcba9876543210").exists());
+        // Prefix-sharing dependencies retained (no partial match).
+        assert!(
+            profile
+                .join("deps/libscx_ktstr_helper-aaaaaaaaaaaaaaaa.rlib")
+                .exists(),
+            "a member stem must not partial-match a longer dependency stem",
+        );
+        assert!(
+            profile
+                .join(".fingerprint/scx-ktstr-helper-aaaaaaaaaaaaaaaa")
+                .exists(),
+            "member `scx-ktstr` must not match dependency `scx-ktstr-helper`",
+        );
+    }
+
+    #[test]
+    fn gc_reclaims_idle_shared_build_buckets_but_never_leased_or_recent_ones() {
+        let temp = tempfile::tempdir().expect("scratch parent");
+        let parent = temp.path().join("shared-build-scratch-v1");
+        let lock_root = temp.path().join("locks");
+        std::fs::create_dir_all(&lock_root).unwrap();
+        let make_bucket = |name: &str| {
+            let bucket = parent.join(name);
+            std::fs::create_dir_all(bucket.join("release/deps")).unwrap();
+            bucket
+        };
+        let idle = make_bucket("aaaaaaaaaaaaaaaa");
+        let recent = make_bucket("bbbbbbbbbbbbbbbb");
+        let leased = make_bucket("cccccccccccccccc");
+
+        // A recent build keeps every bucket: nothing is older than the idle
+        // window relative to "now".
+        gc_stale_shared_build_scratch_in(&parent, &lock_root, std::time::SystemTime::now());
+        assert!(idle.exists() && recent.exists() && leased.exists());
+
+        // Fast-forward past the idle window. Hold the build-output lease on
+        // `leased`; it must survive even though it is idle.
+        let far_future = std::time::SystemTime::now()
+            + SHARED_BUILD_SCRATCH_MAX_IDLE
+            + std::time::Duration::from_secs(60);
+        let canonical_leased = std::fs::canonicalize(&leased).unwrap();
+        let lock_path = cargo_build_output_lock_path(&lock_root, &canonical_leased);
+        let _held = ktstr::flock::try_flock(&lock_path, ktstr::flock::FlockMode::Exclusive)
+            .unwrap()
+            .expect("acquire bucket lease for the test");
+        gc_stale_shared_build_scratch_in(&parent, &lock_root, far_future);
+        assert!(!idle.exists(), "idle unleased bucket must be reclaimed");
+        assert!(
+            !recent.exists(),
+            "the second idle unleased bucket must be reclaimed"
+        );
+        assert!(
+            leased.exists(),
+            "a bucket under an active build-output lease must never be deleted",
+        );
     }
 
     fn llvm_cov_feature_metadata() -> cargo_metadata::Metadata {

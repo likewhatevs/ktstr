@@ -608,10 +608,14 @@ where
                     // execute the convenient `artifacts/<package>` alias.
                     source.insert_immutable_path(stable_relative, &stable_path)?;
                 }
-                let stable_build_directory = stable.root.join("build");
-                if stable_build_directory.is_dir() {
-                    source.insert_immutable_tree("build", &stable_build_directory)?;
-                }
+                // The build closure (dependency objects and build-script
+                // OUT_DIRs) is deliberately not sealed here. Cargo now writes it
+                // to a persistent, non-source-keyed directory shared across
+                // digests for dependency and OUT_DIR reuse, and no scheduler
+                // consumer reads it: production snapshots the `artifacts/<pkg>`
+                // alias into the machine content CAS and executes from there.
+                // scx-ktstr's only OUT_DIR use is a compile-time `include!`, so
+                // nothing resolves the build closure at runtime.
                 Ok(source)
             },
         )
@@ -1035,8 +1039,21 @@ mod tests {
         assert_eq!(builds.load(Ordering::SeqCst), 1);
     }
 
+    /// The sealed per-source tree preserves the scheduler binary at both the
+    /// convenient `artifacts/<pkg>` alias and its exact Cargo output pathname,
+    /// but deliberately does **not** preserve the Cargo build closure
+    /// (dependency objects, build-script `OUT_DIR`s).
+    ///
+    /// Production consumes only the `artifacts/<pkg>` alias — it snapshots that
+    /// executable into the machine content CAS and executes from there, never
+    /// resolving the build closure at runtime (scx-ktstr's sole `OUT_DIR` use is
+    /// a compile-time `include!`). The build closure now lives in a persistent,
+    /// non-source-keyed directory shared across source digests so Cargo reuses
+    /// unchanged dependencies; sealing a per-source copy of it would be dead
+    /// weight. Even when the producer writes an `OUT_DIR` payload under the
+    /// stable root, distillation retains only `target/`.
     #[test]
-    fn stable_scheduler_workspace_preserves_original_target_and_build_closure() {
+    fn stable_scheduler_workspace_seals_target_alias_but_not_build_closure() {
         use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
 
         let _environment = lock_env();
@@ -1085,9 +1102,10 @@ mod tests {
             std::fs::read(cached.tree.root().join("target/release/scx_stable_cache")).unwrap(),
             b"stable scheduler",
         );
-        assert_eq!(
-            std::fs::read(cached.tree.root().join("build/scx-stable/out/generated"),).unwrap(),
-            b"embedded OUT_DIR payload",
+        // The build closure is intentionally not part of the sealed tree.
+        assert!(
+            !cached.tree.root().join("build").exists(),
+            "the build closure must not be preserved in the materialized tree",
         );
         let stable_root = cache_root
             .join("stable-builds-v1")
@@ -1097,7 +1115,12 @@ mod tests {
                 .join("target/release/scx_stable_cache")
                 .is_file()
         );
-        assert!(stable_root.join("build/scx-stable/out/generated").is_file());
+        // Distillation retains only `target/`; any `build/` the producer wrote
+        // under the stable root is discarded, along with unrecorded deps.
+        assert!(
+            !stable_root.join("build").exists(),
+            "distillation must not seal the build closure under the stable root",
+        );
         assert!(!stable_root.join("target/release/deps/unrecorded").exists());
     }
 }

@@ -2604,6 +2604,8 @@ fn tool_fingerprints(mode: &str, workspace: &Path) -> Result<Vec<(String, Vec<u8
 
 pub(crate) struct IdentityPlan {
     pub identity: u64,
+    /// Non-source key for the shared Cargo build scratch directory.
+    pub build_bucket: u64,
     pub components: serde_json::Value,
     source: SourceLayout,
 }
@@ -2637,7 +2639,7 @@ impl StableCargoSource {
         build_surface: &[String],
         output_roots: &[PathBuf],
         invocation: &Path,
-    ) -> Result<Option<u64>, String> {
+    ) -> Result<Option<(u64, u64)>, String> {
         let owned_root = canonical_or_lexical(self._tree.root());
         let is_owned = |path: &Path| canonical_or_lexical(path).starts_with(&owned_root);
         if !is_owned(metadata.workspace_root.as_std_path())
@@ -2728,14 +2730,22 @@ impl StableCargoSource {
             })
             .collect::<BTreeSet<_>>();
         let tools = tool_fingerprints(mode, &workspace)?;
-        Ok(Some(artifact_identity(
+        let identity = artifact_identity(
             mode,
             self._tree.identity(),
             &normalized_args,
             &external_packages,
             &environment,
             &tools,
-        )))
+        );
+        let build_bucket = build_scratch_bucket(
+            mode,
+            &normalized_args,
+            &external_packages,
+            &environment,
+            &tools,
+        );
+        Ok(Some((identity, build_bucket)))
     }
 
     fn execution_source_root_remaps(&self) -> Vec<(PathBuf, PathBuf)> {
@@ -2990,6 +3000,67 @@ fn artifact_identity(
     hasher.finish()
 }
 
+/// Non-source key for the shared Cargo build scratch directory.
+///
+/// This deliberately hashes the same surface as [`artifact_identity`] **minus**
+/// `source_identity`: every source revision that shares the workspace, feature
+/// selection, profile, resolved registry dependency set, environment, and tool
+/// fingerprints maps to one persistent Cargo `build-dir` (dependency objects,
+/// `.fingerprint` state, and build-script `OUT_DIR`s). Sharing that directory
+/// across source digests lets Cargo reuse unchanged dependency compilations and
+/// keeps `OUT_DIR` stable so sccache hits, instead of recompiling the whole
+/// dependency graph into a fresh per-digest directory on every push.
+///
+/// Workspace members and path dependencies are the one thing this bucket cannot
+/// safely share, because Cargo's per-package metadata hash is source-path- and
+/// content-independent and its freshness is mtime-based; a shared member
+/// fingerprint slot would let a later digest stale-reuse an earlier digest's
+/// member. Callers therefore purge every workspace member from the bucket under
+/// the build-dir lease before each Cargo invocation (see
+/// `purge_shared_build_dir_workspace_members`).
+fn build_scratch_bucket(
+    mode: &str,
+    normalized_args: &[Vec<u8>],
+    external_packages: &BTreeSet<String>,
+    environment: &[(std::ffi::OsString, Vec<u8>)],
+    tools: &[(String, Vec<u8>)],
+) -> u64 {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut hasher = fixed_hasher();
+    hash_bytes(&mut hasher, b"ktstr-cargo-build-scratch-bucket");
+    hasher.write_u32(IDENTITY_SCHEMA);
+    hash_bytes(&mut hasher, mode.as_bytes());
+    for argument in normalized_args {
+        hash_bytes(&mut hasher, argument);
+    }
+    for package in external_packages {
+        hash_bytes(&mut hasher, package.as_bytes());
+    }
+    for (name, value) in environment {
+        hash_bytes(&mut hasher, name.as_os_str().as_bytes());
+        hash_bytes(&mut hasher, value);
+    }
+    for (name, fingerprint) in tools {
+        hash_bytes(&mut hasher, name.as_bytes());
+        hash_bytes(&mut hasher, fingerprint);
+    }
+    hasher.finish()
+}
+
+/// Persistent, non-source-keyed Cargo build scratch directory for one bucket.
+///
+/// Shared across source digests within the same [`build_scratch_bucket`]; the
+/// producer holds an exclusive lease on this path for the purge → build →
+/// capture critical section.
+pub(crate) fn shared_build_scratch_dir(build_bucket: u64) -> Result<PathBuf, String> {
+    let root = ktstr::cache::cargo_artifact_tree_cache_root()
+        .map_err(|error| format!("resolve Cargo artifact tree cache root: {error:#}"))?;
+    Ok(root
+        .join("shared-build-scratch-v1")
+        .join(format!("{build_bucket:016x}")))
+}
+
 pub(crate) fn identity_plan(
     metadata: &cargo_metadata::Metadata,
     mode: &str,
@@ -3042,6 +3113,13 @@ pub(crate) fn identity_plan_for_invocation(
         &environment,
         &tools,
     );
+    let build_bucket = build_scratch_bucket(
+        mode,
+        &normalized_args,
+        &external_packages,
+        &environment,
+        &tools,
+    );
     let normalized_build_args = normalized_args
         .iter()
         .map(|value| String::from_utf8_lossy(value))
@@ -3084,6 +3162,7 @@ pub(crate) fn identity_plan_for_invocation(
     let environment_components = environment_diagnostic_components(&environment);
     Ok(IdentityPlan {
         identity,
+        build_bucket,
         components: serde_json::json!({
             "schema": IDENTITY_SCHEMA,
             "mode": mode,
@@ -3444,6 +3523,7 @@ mod tests {
         source.identity = recompute_source_identity(&source).unwrap();
         let plan = IdentityPlan {
             identity: 0x51ab_1e5a,
+            build_bucket: 0x51ab_b0c4,
             components: serde_json::json!({"fixture": "stable-snapshot-publication"}),
             source,
         };

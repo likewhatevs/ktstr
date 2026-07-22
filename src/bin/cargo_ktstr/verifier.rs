@@ -1717,10 +1717,11 @@ fn build_scheduler_workspace(
         .transpose()?
         .flatten();
     let mut owned_stable_source = None;
-    let (identity, stable_source, source_is_already_stable) =
-        if let Some(identity) = reused_identity {
+    let (identity, build_bucket, stable_source, source_is_already_stable) =
+        if let Some((identity, build_bucket)) = reused_identity {
             (
                 identity,
+                build_bucket,
                 containing_source.expect("reused identity has a containing source"),
                 true,
             )
@@ -1733,15 +1734,23 @@ fn build_scheduler_workspace(
                 &group.root,
             )?;
             let identity = identity_plan.identity;
+            let build_bucket = identity_plan.build_bucket;
             owned_stable_source = Some(identity_plan.stable_source(cli_label)?);
             (
                 identity,
+                build_bucket,
                 owned_stable_source
                     .as_ref()
                     .expect("stable scheduler source materialized above"),
                 false,
             )
         };
+    // Cargo builds dependency objects and build-script OUT_DIRs into a
+    // persistent directory shared across source digests of the same non-source
+    // bucket (dependency and OUT_DIR reuse); final scheduler binaries still land
+    // in the per-source sealed target directory.
+    let shared_build_dir = crate::nextest_artifact_cache::shared_build_scratch_dir(build_bucket)?;
+    crate::run_cargo::gc_stale_shared_build_scratch(std::time::SystemTime::now());
     let stable_build_options = stable_source.remap_cargo_args(build_options);
     let (build_args, _identity_target_dir) =
         scheduler_workspace_execution(group, profile, &stable_build_options);
@@ -1769,16 +1778,25 @@ fn build_scheduler_workspace(
                 )
             };
             let mut command = Command::new("cargo");
-            let stable_build_dir = stable_build.root.join("build");
             command
                 .current_dir(stable_workspace_root)
                 .args(force_scheduler_stable_target(
                     build_args.clone(),
                     &stable_build.target_directory,
                 ))
-                .env("CARGO_BUILD_BUILD_DIR", &stable_build_dir)
+                .env("CARGO_BUILD_BUILD_DIR", &shared_build_dir)
                 .env("GIT_OPTIONAL_LOCKS", "0");
             sanitize_scheduler_build_child_environment(&mut command);
+            // Serialize every same-bucket producer on the shared build directory
+            // and purge workspace members so this digest recompiles its own
+            // members rather than stale-reusing another digest's. Acquisition
+            // order is build-dir lease then target-dir lease (inside the call).
+            let _shared_build_lease =
+                crate::run_cargo::acquire_cargo_build_output_lease(&shared_build_dir, cli_label)?;
+            crate::run_cargo::purge_shared_build_dir_workspace_members(
+                &shared_build_dir,
+                metadata,
+            )?;
             crate::run_cargo::run_reserved_build_output_under_lease(
                 command,
                 cli_label,
