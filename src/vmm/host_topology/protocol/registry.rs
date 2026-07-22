@@ -6820,10 +6820,10 @@ pub(super) fn exercise_changed_replan_batch_for_tests(
         )
     };
 
-    for index in 0..callback_count - 1 {
-        let designated = callbacks[index].1.clone();
-        let replacement = callbacks[index].2.clone();
-        let result = callbacks[index].0.run_granted(
+    for (ticket, designated, replacement) in callbacks.iter_mut().take(callback_count - 1) {
+        let designated = designated.clone();
+        let replacement = replacement.clone();
+        let result = ticket.run_granted(
             None,
             |current, _watch, acquisition_allowed, _predecessors, _availability| {
                 anyhow::ensure!(
@@ -11182,6 +11182,34 @@ impl Table {
         clippy::too_many_arguments,
         reason = "claim replacement carries the complete transactional record transition"
     )]
+    #[cfg(test)]
+    fn replace_claim(
+        &mut self,
+        slot: u64,
+        ticket: u64,
+        old: &ClaimSet,
+        new: &ClaimSet,
+        publish_state: u32,
+        issue_serial: u64,
+        blocked: Option<(ContentionMarker, u64)>,
+        persist_blocker: bool,
+    ) -> Result<()> {
+        self.begin_transaction()?;
+        self.replace_claim_in_transaction(
+            slot,
+            ticket,
+            old,
+            new,
+            publish_state,
+            issue_serial,
+            blocked,
+            persist_blocker,
+            false,
+        )?;
+        self.finish_transaction()?;
+        Ok(())
+    }
+
     /// Publish a replacement selected by one non-acquiring REPLAN callback.
     /// Both the old REPLAN and new WAITING record are non-fencing, so the
     /// replacement changes aggregate intent counts but cannot invalidate any
