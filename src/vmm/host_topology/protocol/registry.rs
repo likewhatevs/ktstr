@@ -18115,11 +18115,7 @@ fn fixed_claim_identity(claim: &impl ClaimView) -> u64 {
         hasher.write(&value.to_le_bytes());
     }
 
-    fn hash_indices(
-        hasher: &mut ahash::AHasher,
-        len: usize,
-        indices: impl Iterator<Item = usize>,
-    ) {
+    fn hash_indices(hasher: &mut ahash::AHasher, len: usize, indices: impl Iterator<Item = usize>) {
         hash_u64(hasher, len as u64);
         for index in indices {
             hash_u64(hasher, index as u64);
