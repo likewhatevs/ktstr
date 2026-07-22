@@ -3832,6 +3832,18 @@ fn common_watch_replan_token_is_single_and_advances_without_starvation() {
         outcome.initial_prefix_comparisons, 1,
         "the scan may validate its one live coordinator publication, but must not reread the 1,000 flexible WAITING prefixes",
     );
+    assert_eq!(
+        outcome.initial_full_watch_materializations, 0,
+        "the authoritative scan must not expand any ticket's encoded alternative watch into BTree nodes",
+    );
+    assert_eq!(
+        outcome.initial_encoded_watch_serial_walks, 1,
+        "the global serial filter must walk only the selected REPLAN candidate's encoded watch",
+    );
+    assert_eq!(
+        outcome.initial_full_prefix_snapshot_publishes, 0,
+        "the scan must publish predecessor words directly without allocating unused host-sized holder vectors",
+    );
     assert!(
         outcome.live_token_exact_granted && outcome.live_token_exact_woken,
         "new exact capacity must still grant and wake while a speculative token is live",
@@ -4037,6 +4049,11 @@ fn revoked_grants_keep_their_fence_until_the_callback_acknowledges() {
     assert!(
         outcome.successor_rescan_published,
         "REVOKED acknowledgement must atomically publish WAITING plus the successor rescan",
+    );
+    assert!(
+        outcome.flexible_replanned_without_serial_churn,
+        "a flexible revoked grant must reconsider an already-free alternative after ACK without \
+         waiting for unrelated resource-serial churn",
     );
 }
 

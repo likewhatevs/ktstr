@@ -324,6 +324,12 @@ thread_local! {
         const { std::cell::Cell::new(0) };
     static PREFIX_COMPARE_RECORD_READS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static FULL_WATCH_MATERIALIZATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static ENCODED_WATCH_SERIAL_WALKS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static FULL_PREFIX_SNAPSHOT_PUBLISHES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
     static ACTIVE_LIST_RECORD_READS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     static COORDINATOR_ELECTION_RECORD_READS: std::cell::Cell<usize> =
@@ -740,6 +746,62 @@ struct Record {
     backfill_started_ns: u64,
     prev_active: u64,
     next_active: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EncodedWatchModes {
+    cpu: ClaimMode,
+    llc: ClaimMode,
+    permit: ClaimMode,
+}
+
+/// The grant scan needs every exact claim, but almost never needs to
+/// materialize a ticket's potentially host-wide alternative watch. Keep the
+/// scan representation small and retain only the encoded-watch facts needed
+/// for selection. Full [`Record`] decoding remains the validation path for
+/// callbacks, repair, removal, and diagnostics.
+#[derive(Debug, Clone)]
+struct ScanRecord {
+    slot: u64,
+    state: u32,
+    ticket: u64,
+    claim: ClaimSet,
+    watch_modes: EncodedWatchModes,
+    flexible: bool,
+    blocked_on: Option<BlockedOn>,
+    external_blocker: Option<ContentionMarker>,
+    issue_serial: u64,
+    replan_claim_epoch: u64,
+    grant_epoch: u64,
+    prefix_epoch: u64,
+    backfill_capacity: u32,
+    backfill_started_ns: u64,
+    prev_active: u64,
+    next_active: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PrefixWords {
+    cpu_any: Vec<u64>,
+    cpu_exclusive: Vec<u64>,
+    llc_any: Vec<u64>,
+    llc_exclusive: Vec<u64>,
+}
+
+impl PrefixWords {
+    fn copy_from(
+        cpu_any: &[u64],
+        cpu_exclusive: &[u64],
+        llc_any: &[u64],
+        llc_exclusive: &[u64],
+    ) -> Self {
+        Self {
+            cpu_any: cpu_any.to_vec(),
+            cpu_exclusive: cpu_exclusive.to_vec(),
+            llc_any: llc_any.to_vec(),
+            llc_exclusive: llc_exclusive.to_vec(),
+        }
+    }
 }
 
 pub(super) struct Ticket {
@@ -5245,6 +5307,9 @@ pub(crate) struct ReplanTokenWaveOutcome {
     pub(crate) initial_replans: usize,
     pub(crate) initial_wakes: usize,
     pub(crate) initial_prefix_comparisons: usize,
+    pub(crate) initial_full_watch_materializations: usize,
+    pub(crate) initial_encoded_watch_serial_walks: usize,
+    pub(crate) initial_full_prefix_snapshot_publishes: usize,
     pub(crate) live_token_exact_granted: bool,
     pub(crate) live_token_exact_woken: bool,
     pub(crate) live_token_replans: usize,
@@ -5671,6 +5736,9 @@ pub(super) fn exercise_replan_token_wave_for_tests(
         initial_replans,
         initial_wakes,
         initial_prefix_comparisons,
+        initial_full_watch_materializations,
+        initial_encoded_watch_serial_walks,
+        initial_full_prefix_snapshot_publishes,
         first_token,
     ) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
@@ -5705,9 +5773,24 @@ pub(super) fn exercise_replan_token_wave_for_tests(
         table.stamp_resource_improvement(S_CPU_EX, common_cpu)?;
         table.set_pending_flag(PENDING_RESCAN);
         let prefix_comparisons_before = PREFIX_COMPARE_RECORD_READS.with(std::cell::Cell::get);
+        let full_watch_materializations_before =
+            FULL_WATCH_MATERIALIZATIONS.with(std::cell::Cell::get);
+        let encoded_watch_serial_walks_before =
+            ENCODED_WATCH_SERIAL_WALKS.with(std::cell::Cell::get);
+        let full_prefix_snapshot_publishes_before =
+            FULL_PREFIX_SNAPSHOT_PUBLISHES.with(std::cell::Cell::get);
         table.grant_compatible()?;
         let initial_prefix_comparisons =
             PREFIX_COMPARE_RECORD_READS.with(std::cell::Cell::get) - prefix_comparisons_before;
+        let initial_full_watch_materializations = FULL_WATCH_MATERIALIZATIONS
+            .with(std::cell::Cell::get)
+            - full_watch_materializations_before;
+        let initial_encoded_watch_serial_walks = ENCODED_WATCH_SERIAL_WALKS
+            .with(std::cell::Cell::get)
+            - encoded_watch_serial_walks_before;
+        let initial_full_prefix_snapshot_publishes = FULL_PREFIX_SNAPSHOT_PUBLISHES
+            .with(std::cell::Cell::get)
+            - full_prefix_snapshot_publishes_before;
         let records = waiters
             .iter()
             .map(|(ticket, _)| {
@@ -5741,6 +5824,9 @@ pub(super) fn exercise_replan_token_wave_for_tests(
             replans.len(),
             initial_wakes,
             initial_prefix_comparisons,
+            initial_full_watch_materializations,
+            initial_encoded_watch_serial_walks,
+            initial_full_prefix_snapshot_publishes,
             replans.first().copied(),
         )
     };
@@ -6159,6 +6245,9 @@ pub(super) fn exercise_replan_token_wave_for_tests(
         initial_replans,
         initial_wakes,
         initial_prefix_comparisons,
+        initial_full_watch_materializations,
+        initial_encoded_watch_serial_walks,
+        initial_full_prefix_snapshot_publishes,
         live_token_exact_granted,
         live_token_exact_woken,
         live_token_replans,
@@ -6875,6 +6964,7 @@ pub(crate) struct RevocationAckOutcome {
     pub(crate) during_callback_acked: bool,
     pub(crate) later_publication_preserved: bool,
     pub(crate) successor_rescan_published: bool,
+    pub(crate) flexible_replanned_without_serial_churn: bool,
 }
 
 #[cfg(test)]
@@ -6976,14 +7066,112 @@ fn exercise_revocation_ack_case(
 }
 
 #[cfg(test)]
+fn exercise_flexible_revocation_replan_case(offset: usize) -> Result<bool> {
+    let coordinator_claim = ClaimSet::new(std::iter::empty(), [offset], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let exact = ClaimSet::new(std::iter::empty(), [offset + 1], FlockMode::Exclusive);
+    let watch = ClaimSet::new(
+        std::iter::empty(),
+        [offset + 1, offset + 2],
+        FlockMode::Exclusive,
+    );
+    let mut target = Ticket::register(exact, watch, None)?;
+
+    let (issue_serial, global_serial) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, offset, true)?;
+        set_cpu_free_for_tests(&mut table, offset + 1, true)?;
+        set_cpu_free_for_tests(&mut table, offset + 2, true)?;
+        table.set_record_state(target.slot, STATE_WAITING)?;
+        table.clear_record_blocked(target.slot)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible()?;
+        let issue_serial = table
+            .record(target.slot)?
+            .filter(|record| record.state == STATE_GRANTED)
+            .ok_or_else(|| anyhow::anyhow!("flexible revocation target was not granted"))?
+            .issue_serial;
+        let global_serial = table.global_serial();
+
+        // This is a deterioration of only the exact designation. It must not
+        // synthesize the improvement serial that the regression is meant to
+        // avoid relying on; the already-free alternative remains unchanged.
+        set_cpu_free_for_tests(&mut table, offset + 1, false)?;
+        anyhow::ensure!(
+            table.global_serial() == global_serial,
+            "making the exact designation unavailable changed the global improvement serial",
+        );
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible()?;
+        anyhow::ensure!(
+            table
+                .record(target.slot)?
+                .is_some_and(|record| record.state == STATE_REVOKED),
+            "unavailable exact designation did not revoke its flexible grant",
+        );
+        anyhow::ensure!(
+            table.global_serial() == global_serial,
+            "revoking the exact designation changed the global improvement serial",
+        );
+        (issue_serial, global_serial)
+    };
+
+    anyhow::ensure!(
+        target.state(None)? == State::Waiting,
+        "flexible revoked target did not acknowledge to WAITING",
+    );
+    let replanned_without_serial_churn = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let acknowledged = table
+            .record(target.slot)?
+            .filter(|record| record.state == STATE_WAITING)
+            .ok_or_else(|| anyhow::anyhow!("flexible revoked target disappeared after ACK"))?;
+        anyhow::ensure!(
+            acknowledged.prefix_epoch == 0,
+            "flexible revoked target retained its stale GRANTED prefix after ACK",
+        );
+        anyhow::ensure!(
+            acknowledged.issue_serial == issue_serial
+                && table.global_serial() == global_serial
+                && !table.bitmap_bit(B_CPU_EX_AVAILABLE, offset + 1)?
+                && table.bitmap_bit(B_CPU_EX_AVAILABLE, offset + 2)?,
+            "flexible revoked target's no-churn test inputs changed before rescan",
+        );
+        let wake_before = target
+            .wake
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("flexible revoked target wake mapping disappeared"))?
+            .expected();
+        table.grant_compatible()?;
+        let wake_after = target
+            .wake
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("flexible revoked target wake mapping disappeared"))?
+            .expected();
+        table.record(target.slot)?.is_some_and(|record| {
+            record.state == STATE_REPLAN && record.issue_serial == issue_serial
+        }) && table.global_serial() == global_serial
+            && wake_after == wake_before.wrapping_add(1)
+    };
+
+    target.finish(None)?;
+    coordinator.finish(None)?;
+    Ok(replanned_without_serial_churn)
+}
+
+#[cfg(test)]
 pub(super) fn exercise_revocation_ack_for_tests() -> Result<RevocationAckOutcome> {
     let before = exercise_revocation_ack_case(1000, false)?;
     let during = exercise_revocation_ack_case(1010, true)?;
+    let flexible_replanned_without_serial_churn = exercise_flexible_revocation_replan_case(1020)?;
     Ok(RevocationAckOutcome {
         before_entry_acked: before.0,
         during_callback_acked: during.0,
         later_publication_preserved: before.1 && during.1,
         successor_rescan_published: before.2 && during.2,
+        flexible_replanned_without_serial_churn,
     })
 }
 
@@ -9441,6 +9629,95 @@ impl Table {
         Ok(Some(record))
     }
 
+    fn scan_record(&mut self, slot: u64) -> Result<Option<ScanRecord>> {
+        let layout = self.layout;
+        let Some(bytes) = self.record_bytes(slot)? else {
+            return Ok(None);
+        };
+        let state = read_u32(bytes, R_STATE);
+        if state == STATE_FREE {
+            return Ok(None);
+        }
+        if !matches!(
+            state,
+            STATE_WAITING
+                | STATE_GRANTED
+                | STATE_REPLAN
+                | STATE_COORDINATOR
+                | STATE_HELD
+                | STATE_COORDINATOR_STANDBY
+                | STATE_PENDING
+                | STATE_REVOKED
+        ) {
+            anyhow::bail!("queue registry v{VERSION} slot {slot} has invalid state {state}");
+        }
+        let record = decode_scan_record(bytes, layout, slot)?;
+        if record.ticket == 0 || record.claim.is_empty() {
+            anyhow::bail!(
+                "queue registry v{VERSION} slot {slot} is active with ticket {} and an empty claim",
+                record.ticket,
+            );
+        }
+        Ok(Some(record))
+    }
+
+    /// Traverse the authoritative active list without expanding every
+    /// alternative watch into thousands of BTree nodes. Strict ticket order
+    /// already proves uniqueness, so this also avoids a redundant ticket set.
+    fn scan_records(&mut self) -> Result<Vec<ScanRecord>> {
+        let mut records = Vec::new();
+        let next_slot = self.next_slot()?;
+        let head = read_u64(&self.header, H_ACTIVE_HEAD);
+        let tail = read_u64(&self.header, H_ACTIVE_TAIL);
+        if (head == NONE_SLOT) != (tail == NONE_SLOT) {
+            anyhow::bail!(
+                "queue registry v{VERSION} active-list endpoints are incomplete: head={head}, tail={tail}"
+            );
+        }
+        let mut slot = head;
+        let mut previous = NONE_SLOT;
+        let mut previous_ticket = 0;
+        while slot != NONE_SLOT {
+            if records.len() >= usize::try_from(next_slot).unwrap_or(usize::MAX) {
+                anyhow::bail!("queue registry v{VERSION} active list contains a cycle");
+            }
+            #[cfg(test)]
+            ACTIVE_LIST_RECORD_READS.with(|reads| reads.set(reads.get() + 1));
+            let record = self.scan_record(slot)?.ok_or_else(|| {
+                anyhow::anyhow!("queue registry v{VERSION} active slot {slot} is free")
+            })?;
+            if record.prev_active != previous {
+                anyhow::bail!(
+                    "queue registry v{VERSION} active slot {slot} has prev={}, expected {previous}",
+                    record.prev_active
+                );
+            }
+            if record.ticket <= previous_ticket {
+                anyhow::bail!(
+                    "queue registry v{VERSION} active tickets are not strictly increasing at {}",
+                    record.ticket
+                );
+            }
+            previous = slot;
+            previous_ticket = record.ticket;
+            slot = record.next_active;
+            records.push(record);
+        }
+        if previous != tail {
+            anyhow::bail!(
+                "queue registry v{VERSION} active-list tail is {tail}, traversal ended at {previous}"
+            );
+        }
+        Ok(records)
+    }
+
+    fn record_identity_is(&mut self, slot: u64, ticket: u64, state: u32) -> Result<bool> {
+        let Some(bytes) = self.record_bytes(slot)? else {
+            return Ok(false);
+        };
+        Ok(read_u64(bytes, R_TICKET) == ticket && read_u32(bytes, R_STATE) == state)
+    }
+
     fn records(&mut self) -> Result<Vec<Record>> {
         let mut records = Vec::new();
         let mut tickets = BTreeSet::new();
@@ -9674,6 +9951,42 @@ impl Table {
         if epoch == 0 || prefix.bits != self.layout.bits {
             anyhow::bail!("invalid queue prefix publication epoch or layout");
         }
+        #[cfg(test)]
+        FULL_PREFIX_SNAPSHOT_PUBLISHES.with(|count| count.set(count.get().saturating_add(1)));
+        self.publish_prefix_words(
+            slot,
+            &prefix.cpu_any,
+            &prefix.cpu_exclusive,
+            &prefix.llc_any,
+            &prefix.llc_exclusive,
+            state_epoch_offset,
+            epoch,
+            issue_serial,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "prefix publication writes four encoded predecessor sets and one callback token"
+    )]
+    fn publish_prefix_words(
+        &mut self,
+        slot: u64,
+        cpu_any: &[u64],
+        cpu_exclusive: &[u64],
+        llc_any: &[u64],
+        llc_exclusive: &[u64],
+        state_epoch_offset: usize,
+        epoch: u64,
+        issue_serial: u64,
+    ) -> Result<()> {
+        if epoch == 0
+            || [cpu_any, cpu_exclusive, llc_any, llc_exclusive]
+                .iter()
+                .any(|words| words.len() != self.layout.words)
+        {
+            anyhow::bail!("invalid queue prefix publication epoch or layout");
+        }
         let layout = self.layout;
         let bytes = self.record_bytes_mut(slot)?.ok_or_else(|| {
             anyhow::anyhow!("queue slot {slot} disappeared during prefix publish")
@@ -9681,10 +9994,10 @@ impl Table {
         write_u64(bytes, R_PREFIX_EPOCH, 0);
         crash_at_for_tests("prefix_invalidated_before_copy");
         for (which, words) in [
-            (RB_PREFIX_CPU_ANY, prefix.cpu_any.as_slice()),
-            (RB_PREFIX_CPU_EXCLUSIVE, prefix.cpu_exclusive.as_slice()),
-            (RB_PREFIX_LLC_ANY, prefix.llc_any.as_slice()),
-            (RB_PREFIX_LLC_EXCLUSIVE, prefix.llc_exclusive.as_slice()),
+            (RB_PREFIX_CPU_ANY, cpu_any),
+            (RB_PREFIX_CPU_EXCLUSIVE, cpu_exclusive),
+            (RB_PREFIX_LLC_ANY, llc_any),
+            (RB_PREFIX_LLC_EXCLUSIVE, llc_exclusive),
         ] {
             let offset = record_bitset_offset(layout, which);
             for (word, value) in words.iter().copied().enumerate() {
@@ -10087,6 +10400,15 @@ impl Table {
             .ok_or_else(|| anyhow::anyhow!("revoked queue ticket {ticket} changed during ack"))?;
         self.set_record_state(record.slot, STATE_WAITING)?;
         self.clear_record_blocked(record.slot)?;
+        if claim_is_flexible(&record.claim, &record.watch) {
+            // Revocation can represent a deterioration of only this exact
+            // designation, which deliberately does not advance an
+            // improvement serial. The old GRANTED predecessor cache may
+            // still match after its fence is acknowledged. Force the fresh
+            // WAITING ticket to reconsider an already-available alternative
+            // without requiring unrelated queue or resource churn.
+            self.invalidate_record_prefix(record.slot)?;
+        }
         if let Some((marker, serial, consumed_serial)) = blocked {
             self.set_record_blocked(record.slot, marker, serial)?;
             self.set_record_issue_serial(record.slot, consumed_serial)?;
@@ -10127,6 +10449,27 @@ impl Table {
         if owns_transaction {
             self.finish_transaction()?;
         }
+        Ok(())
+    }
+
+    /// Grant scans already decoded whether the blocker contributes a separate
+    /// event-watch reference. Clear it without expanding the record's full
+    /// immutable watch a second time.
+    fn clear_record_blocked_known(
+        &mut self,
+        slot: u64,
+        external: Option<ContentionMarker>,
+    ) -> Result<()> {
+        if let Some(marker) = external {
+            self.adjust_external_event_watch(marker, false)?;
+        }
+        let bytes = self.record_bytes_mut(slot)?.ok_or_else(|| {
+            anyhow::anyhow!("queue slot {slot} disappeared during blocker update")
+        })?;
+        write_u64(bytes, R_BLOCKED_SERIAL, 0);
+        write_u32(bytes, R_BLOCK_KIND, BLOCK_NONE);
+        write_u32(bytes, R_BLOCK_MODE, 0);
+        write_u64(bytes, R_BLOCK_INDEX, 0);
         Ok(())
     }
 
@@ -10286,8 +10629,9 @@ impl Table {
         struct ReplanCandidate {
             slot: u64,
             ticket: u64,
-            prefix: AggregateSnapshot,
+            prefix: PrefixWords,
             issue_serial: u64,
+            external_blocker: Option<ContentionMarker>,
         }
 
         // The scan publishes a mutually dependent set of prefix caches,
@@ -10297,7 +10641,7 @@ impl Table {
         // clean snapshot. Dirty recovery conservatively demotes every
         // uncommitted callback publication before any successor can enter it.
         self.begin_transaction()?;
-        let records = self.records()?;
+        let records = self.scan_records()?;
         let backfill_now_ns = backfill_now_ns.max(1);
         let mut cpu_any = vec![0u64; self.layout.words];
         let mut cpu_exclusive = vec![0u64; self.layout.words];
@@ -10359,22 +10703,17 @@ impl Table {
                 &llc_exclusive,
                 self.layout.bits,
             )?;
-            let flexible = claim_is_flexible(&record.claim, &record.watch);
+            let flexible = record.flexible;
             let availability_compatible = self.claim_availability_compatible(&record.claim)?;
             let blocker_ready = match record.blocked_on {
                 None => true,
                 Some(blocked) => {
-                    let marker = ContentionMarker {
-                        blocker: blocked.key,
-                        mode: blocked.mode,
-                    };
                     let still_designated = match blocked.key {
                         ResourceKey::Cpu(index) => record.claim.cpus.contains(&index),
                         ResourceKey::Llc(index) => record.claim.llcs.contains(&index),
                         ResourceKey::Permit(index) => record.claim.permits.contains(&index),
                     };
-                    let external_preparation =
-                        !contention_marker_within_watch(marker, &record.watch);
+                    let external_preparation = record.external_blocker.is_some();
                     (!still_designated && !external_preparation)
                         || self.blocker_serial(blocked.key, blocked.mode)? > blocked.serial
                 }
@@ -10453,21 +10792,17 @@ impl Table {
                 // prefixes. In particular, a predecessor that commits and
                 // later releases must disappear from this cache before the
                 // coordinator can retry the formerly-conflicting target.
-                let prefix = aggregate_from_words(
-                    self.layout.bits,
-                    &cpu_any,
-                    &cpu_exclusive,
-                    &llc_any,
-                    &llc_exclusive,
-                );
                 if prefix_invalid || !published_prefix_matches {
                     if !published_prefix_matches && scan_publication_epoch == claim_epoch {
                         scan_publication_epoch = self.advance_claim_epoch()?;
                     }
                     coordinator_prefix_changed |= !published_prefix_matches;
-                    self.publish_prefix(
+                    self.publish_prefix_words(
                         record.slot,
-                        &prefix,
+                        &cpu_any,
+                        &cpu_exclusive,
+                        &llc_any,
+                        &llc_exclusive,
                         R_GRANT_EPOCH,
                         scan_publication_epoch,
                         record.issue_serial,
@@ -10486,16 +10821,12 @@ impl Table {
                 // live REPLAN: it publishes one WAITING choice, whose next
                 // scan validates exact viability and consumes any unseen
                 // alternative improvement.
-                let prefix = aggregate_from_words(
-                    self.layout.bits,
+                self.publish_prefix_words(
+                    record.slot,
                     &cpu_any,
                     &cpu_exclusive,
                     &llc_any,
                     &llc_exclusive,
-                );
-                self.publish_prefix(
-                    record.slot,
-                    &prefix,
                     R_REPLAN_CLAIM_EPOCH,
                     scan_publication_epoch,
                     record.issue_serial,
@@ -10507,7 +10838,7 @@ impl Table {
                 // issued. Revoke the stale grant before it can race into the
                 // real flock probe.
                 self.set_record_state(record.slot, STATE_REVOKED)?;
-                self.clear_record_blocked(record.slot)?;
+                self.clear_record_blocked_known(record.slot, record.external_blocker)?;
                 crash_at_for_tests("revoke_state_before_wake");
                 self.wake_slot(record.slot)?;
                 changed = true;
@@ -10527,22 +10858,18 @@ impl Table {
                     debug_assert!(head.admission_open && cost <= head.available);
                     head.available -= cost;
                 }
-                let prefix = aggregate_from_words(
-                    self.layout.bits,
+                self.publish_prefix_words(
+                    record.slot,
                     &cpu_any,
                     &cpu_exclusive,
                     &llc_any,
                     &llc_exclusive,
-                );
-                self.publish_prefix(
-                    record.slot,
-                    &prefix,
                     R_GRANT_EPOCH,
                     scan_publication_epoch,
                     self.max_watch_serial(&record.claim)?,
                 )?;
                 self.set_record_state(record.slot, STATE_GRANTED)?;
-                self.clear_record_blocked(record.slot)?;
+                self.clear_record_blocked_known(record.slot, record.external_blocker)?;
                 crash_at_for_tests("grant_state_before_wake");
                 self.wake_slot(record.slot)?;
                 changed = true;
@@ -10558,7 +10885,11 @@ impl Table {
                 // one eligible ticket consumes the token, later flexible
                 // waiters skip both the watch walk and callback publication.
                 let waiting_serial = if global_serial > record.issue_serial {
-                    self.max_callback_serial(&record, false)?
+                    self.max_encoded_watch_serial(
+                        record.slot,
+                        record.watch_modes,
+                        record.blocked_on,
+                    )?
                 } else {
                     record.issue_serial
                 };
@@ -10575,18 +10906,14 @@ impl Table {
                     true
                 };
                 if relevant_resource_change || prefix_invalid || !waiting_prefix_matches {
-                    let prefix = aggregate_from_words(
-                        self.layout.bits,
-                        &cpu_any,
-                        &cpu_exclusive,
-                        &llc_any,
-                        &llc_exclusive,
-                    );
+                    let prefix =
+                        PrefixWords::copy_from(&cpu_any, &cpu_exclusive, &llc_any, &llc_exclusive);
                     let candidate = ReplanCandidate {
                         slot: record.slot,
                         ticket: record.ticket,
                         prefix,
                         issue_serial: waiting_serial,
+                        external_blocker: record.external_blocker,
                     };
                     if earliest_replan.is_none() {
                         earliest_replan = Some(ReplanCandidate {
@@ -10594,6 +10921,7 @@ impl Table {
                             ticket: candidate.ticket,
                             prefix: candidate.prefix.clone(),
                             issue_serial: candidate.issue_serial,
+                            external_blocker: candidate.external_blocker,
                         });
                     }
                     if in_current_replan_round && replan_in_round.is_none() {
@@ -10608,16 +10936,12 @@ impl Table {
                 // This grant remains valid, but its callback must observe each
                 // real predecessor-prefix change. Resource improvements cannot
                 // invalidate the authoritative physical exact probe.
-                let prefix = aggregate_from_words(
-                    self.layout.bits,
+                self.publish_prefix_words(
+                    record.slot,
                     &cpu_any,
                     &cpu_exclusive,
                     &llc_any,
                     &llc_exclusive,
-                );
-                self.publish_prefix(
-                    record.slot,
-                    &prefix,
                     R_GRANT_EPOCH,
                     scan_publication_epoch,
                     record.issue_serial,
@@ -10692,32 +11016,31 @@ impl Table {
             // crash-recoverable unit. Dirty repair demotes a torn publication
             // to invalidated WAITING, after which the cursor simply resumes
             // at the next live ticket (or wraps if its owner was removed).
-            let current = self
-                .record(candidate.slot)?
-                .filter(|record| record.ticket == candidate.ticket && record.state == STATE_WAITING)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "REPLAN candidate ticket {} changed during its scan",
-                        candidate.ticket
-                    )
-                })?;
-            self.publish_prefix(
-                current.slot,
-                &candidate.prefix,
+            anyhow::ensure!(
+                self.record_identity_is(candidate.slot, candidate.ticket, STATE_WAITING)?,
+                "REPLAN candidate ticket {} changed during its scan",
+                candidate.ticket,
+            );
+            self.publish_prefix_words(
+                candidate.slot,
+                &candidate.prefix.cpu_any,
+                &candidate.prefix.cpu_exclusive,
+                &candidate.prefix.llc_any,
+                &candidate.prefix.llc_exclusive,
                 R_REPLAN_CLAIM_EPOCH,
                 scan_publication_epoch,
                 candidate.issue_serial,
             )?;
-            self.set_record_state(current.slot, STATE_REPLAN)?;
-            self.clear_record_blocked(current.slot)?;
+            self.set_record_state(candidate.slot, STATE_REPLAN)?;
+            self.clear_record_blocked_known(candidate.slot, candidate.external_blocker)?;
             // Publish the new round high-water first. If the process dies
             // before the cursor store, dirty repair sees a conservative older
             // cursor under the new finite horizon. The complete transaction
             // then advances both with the callback state and wake.
             write_u64(&mut self.header, H_REPLAN_HORIZON, publish_horizon);
-            write_u64(&mut self.header, H_REPLAN_CURSOR, current.ticket);
+            write_u64(&mut self.header, H_REPLAN_CURSOR, candidate.ticket);
             crash_at_for_tests("replan_state_and_cursor_before_wake");
-            self.wake_slot(current.slot)?;
+            self.wake_slot(candidate.slot)?;
             changed = true;
         }
         if changed {
@@ -10968,11 +11291,8 @@ impl Table {
                 "queue registry v{VERSION} cannot publish an empty coordinator ticket with slot {slot}"
             );
         } else {
-            let record = self.record(slot)?;
             anyhow::ensure!(
-                record.as_ref().is_some_and(|record| {
-                    record.ticket == coordinator && record.state == STATE_COORDINATOR
-                }),
+                self.record_identity_is(slot, coordinator, STATE_COORDINATOR)?,
                 "queue registry v{VERSION} cannot publish coordinator header ticket={coordinator}, \
                  slot={slot} without its coordinator record"
             );
@@ -11234,6 +11554,76 @@ impl Table {
             if watch.permit_mode == ClaimMode::Exclusive {
                 serial = serial.max(self.resource_serial(S_CPU_EX, index)?);
             }
+        }
+        Ok(serial)
+    }
+
+    /// Walk one selected ticket's encoded alternative watch without building
+    /// BTreeSets. The global serial rejects the other queue records before
+    /// this is called, so a storm pays this host-width cost once rather than
+    /// once per waiter.
+    fn max_encoded_watch_serial(
+        &mut self,
+        slot: u64,
+        modes: EncodedWatchModes,
+        blocked_on: Option<BlockedOn>,
+    ) -> Result<u64> {
+        #[cfg(test)]
+        ENCODED_WATCH_SERIAL_WALKS.with(|count| count.set(count.get().saturating_add(1)));
+        let layout = self.layout;
+        let (cpu_words, llc_words, permit_words) = {
+            let bytes = self.record_bytes(slot)?.ok_or_else(|| {
+                anyhow::anyhow!("queue slot {slot} disappeared during encoded watch scan")
+            })?;
+            let copy_words = |which| {
+                let offset = record_bitset_offset(layout, which);
+                (0..layout.words)
+                    .map(|word| read_u64(bytes, offset + word * std::mem::size_of::<u64>()))
+                    .collect::<Vec<_>>()
+            };
+            (
+                copy_words(RB_WATCH_CPUS),
+                copy_words(RB_WATCH_LLCS),
+                copy_words(RB_WATCH_PERMITS),
+            )
+        };
+        let mut serial = 0u64;
+        for (word_index, mut word) in cpu_words.into_iter().enumerate() {
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                let index = word_index * 64 + bit;
+                serial = serial.max(self.resource_serial(S_CPU_SH, index)?);
+                if modes.cpu == ClaimMode::Exclusive {
+                    serial = serial.max(self.resource_serial(S_CPU_EX, index)?);
+                }
+                word &= word - 1;
+            }
+        }
+        for (word_index, mut word) in llc_words.into_iter().enumerate() {
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                let index = word_index * 64 + bit;
+                serial = serial.max(self.resource_serial(S_LLC_SH, index)?);
+                if modes.llc == ClaimMode::Exclusive {
+                    serial = serial.max(self.resource_serial(S_LLC_EX, index)?);
+                }
+                word &= word - 1;
+            }
+        }
+        for (word_index, mut word) in permit_words.into_iter().enumerate() {
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                let permit = word_index * 64 + bit;
+                let index = permit_resource_index(permit)?;
+                serial = serial.max(self.resource_serial(S_CPU_SH, index)?);
+                if modes.permit == ClaimMode::Exclusive {
+                    serial = serial.max(self.resource_serial(S_CPU_EX, index)?);
+                }
+                word &= word - 1;
+            }
+        }
+        if let Some(blocked) = blocked_on {
+            serial = serial.max(self.blocker_serial(blocked.key, blocked.mode)?);
         }
         Ok(serial)
     }
@@ -12641,6 +13031,202 @@ fn decode_admission_class(
     }
 }
 
+fn decode_blocked_on(bytes: &[u8], slot: u64) -> Result<Option<BlockedOn>> {
+    match read_u32(bytes, R_BLOCK_KIND) {
+        BLOCK_NONE => Ok(None),
+        kind @ (BLOCK_CPU | BLOCK_LLC | BLOCK_PERMIT) => {
+            let index = usize::try_from(read_u64(bytes, R_BLOCK_INDEX))
+                .context("blocked resource index does not fit this process")?;
+            let key = match kind {
+                BLOCK_CPU => ResourceKey::Cpu(index),
+                BLOCK_LLC => ResourceKey::Llc(index),
+                BLOCK_PERMIT => ResourceKey::Permit(index),
+                _ => unreachable!("block kind matched above"),
+            };
+            let mode = match read_u32(bytes, R_BLOCK_MODE) {
+                0 => FlockMode::Shared,
+                1 => FlockMode::Exclusive,
+                mode => anyhow::bail!(
+                    "queue registry v{VERSION} slot {slot} has invalid blocker mode {mode}"
+                ),
+            };
+            Ok(Some(BlockedOn {
+                key,
+                mode,
+                serial: read_u64(bytes, R_BLOCKED_SERIAL),
+            }))
+        }
+        kind => {
+            anyhow::bail!("queue registry v{VERSION} slot {slot} has invalid blocker kind {kind}")
+        }
+    }
+}
+
+fn encoded_bitset_equal_and_count(
+    bytes: &[u8],
+    layout: HeaderLayout,
+    left: usize,
+    right: usize,
+) -> (bool, usize) {
+    let left = record_bitset_offset(layout, left);
+    let right = record_bitset_offset(layout, right);
+    let mut equal = true;
+    let mut count = 0usize;
+    for word in 0..layout.words {
+        let offset = word * std::mem::size_of::<u64>();
+        let left_word = read_u64(bytes, left + offset);
+        let right_word = read_u64(bytes, right + offset);
+        equal &= left_word == right_word;
+        count = count.saturating_add(right_word.count_ones() as usize);
+    }
+    (equal, count)
+}
+
+fn encoded_bitset_prefix_count(
+    bytes: &[u8],
+    layout: HeaderLayout,
+    which: usize,
+    end: usize,
+) -> usize {
+    let end = end.min(layout.bits);
+    let offset = record_bitset_offset(layout, which);
+    let mut count = 0usize;
+    for word in 0..end.div_ceil(64) {
+        let mut value = read_u64(bytes, offset + word * std::mem::size_of::<u64>());
+        let remaining = end.saturating_sub(word * 64);
+        if remaining < 64 {
+            value &= (1u64 << remaining) - 1;
+        }
+        count = count.saturating_add(value.count_ones() as usize);
+    }
+    count
+}
+
+fn encoded_bitset_contains(bytes: &[u8], layout: HeaderLayout, which: usize, index: usize) -> bool {
+    if index >= layout.bits {
+        return false;
+    }
+    let offset = record_bitset_offset(layout, which) + index / 64 * std::mem::size_of::<u64>();
+    read_u64(bytes, offset) & (1u64 << (index % 64)) != 0
+}
+
+fn contention_marker_within_encoded_watch(
+    marker: ContentionMarker,
+    bytes: &[u8],
+    layout: HeaderLayout,
+    modes: EncodedWatchModes,
+) -> bool {
+    let (which, index, mode) = match marker.blocker {
+        ResourceKey::Cpu(index) => (RB_WATCH_CPUS, index, modes.cpu),
+        ResourceKey::Llc(index) => (RB_WATCH_LLCS, index, modes.llc),
+        ResourceKey::Permit(index) => (RB_WATCH_PERMITS, index, modes.permit),
+    };
+    encoded_bitset_contains(bytes, layout, which, index)
+        && (mode == ClaimMode::Exclusive || ClaimMode::from(marker.mode) == mode)
+}
+
+fn decode_scan_record(bytes: &[u8], layout: HeaderLayout, slot: u64) -> Result<ScanRecord> {
+    let claim_llc_mode = decode_mode(bytes, R_CLAIM_LLC_MODE, slot, "exact LLC claim")?;
+    let claim_cpu_mode = decode_mode(bytes, R_CLAIM_CPU_MODE, slot, "exact CPU claim")?;
+    let claim_permit_mode = decode_mode(bytes, R_CLAIM_PERMIT_MODE, slot, "exact permit claim")?;
+    let watch_llc_mode = decode_mode(bytes, R_WATCH_LLC_MODE, slot, "LLC watch")?;
+    let watch_cpu_mode = decode_mode(bytes, R_WATCH_CPU_MODE, slot, "CPU watch")?;
+    let watch_permit_mode = decode_mode(bytes, R_WATCH_PERMIT_MODE, slot, "permit watch")?;
+    let claim_class = decode_admission_class(bytes, R_CLAIM_CLASS, slot, "exact claim")?;
+    let watch_class = decode_admission_class(bytes, R_WATCH_CLASS, slot, "watch")?;
+    let claim = ClaimSet::with_all_claim_modes(
+        decode_bitset(bytes, record_bitset_offset(layout, RB_CLAIM_LLCS), layout)?,
+        decode_bitset(bytes, record_bitset_offset(layout, RB_CLAIM_CPUS), layout)?,
+        decode_bitset(
+            bytes,
+            record_bitset_offset(layout, RB_CLAIM_PERMITS),
+            layout,
+        )?,
+        claim_llc_mode,
+        claim_cpu_mode,
+        claim_permit_mode,
+    )
+    .with_admission_class(claim_class);
+
+    let (cpus_equal, watch_cpus) =
+        encoded_bitset_equal_and_count(bytes, layout, RB_CLAIM_CPUS, RB_WATCH_CPUS);
+    let (llcs_equal, watch_llcs) =
+        encoded_bitset_equal_and_count(bytes, layout, RB_CLAIM_LLCS, RB_WATCH_LLCS);
+    let (permits_equal, watch_permits) =
+        encoded_bitset_equal_and_count(bytes, layout, RB_CLAIM_PERMITS, RB_WATCH_PERMITS);
+    let watch_modes = EncodedWatchModes {
+        cpu: if watch_cpus == 0 {
+            ClaimMode::Exclusive
+        } else {
+            watch_cpu_mode
+        },
+        llc: if watch_llcs == 0 {
+            ClaimMode::Exclusive
+        } else {
+            watch_llc_mode
+        },
+        permit: if watch_permits == 0 {
+            ClaimMode::Exclusive
+        } else {
+            watch_permit_mode
+        },
+    };
+    let flexible = !cpus_equal
+        || !llcs_equal
+        || !permits_equal
+        || claim.cpu_mode != watch_modes.cpu
+        || claim.llc_mode != watch_modes.llc
+        || claim.permit_mode != watch_modes.permit
+        || claim.admission_class != watch_class;
+    let watch_empty = watch_cpus == 0 && watch_llcs == 0 && watch_permits == 0;
+    if read_u32(bytes, R_STATE) == STATE_PENDING && watch_empty {
+        anyhow::bail!("queue registry v{VERSION} slot {slot} is PENDING with an empty watch");
+    }
+    let cooperative_permits = encoded_bitset_prefix_count(
+        bytes,
+        layout,
+        RB_WATCH_PERMITS,
+        super::super::cooperative_cpu_permit_end(),
+    );
+    let maximum_backfill_capacity =
+        u32::try_from(cooperative_permits.max(watch_cpus.max(watch_llcs).max(1)))
+            .unwrap_or(u32::MAX);
+    let backfill_capacity = read_u32(bytes, R_BACKFILL_CAPACITY);
+    if backfill_capacity > maximum_backfill_capacity {
+        anyhow::bail!(
+            "queue registry v{VERSION} slot {slot} has invalid backfill capacity \
+             {backfill_capacity} > {maximum_backfill_capacity}"
+        );
+    }
+    let blocked_on = decode_blocked_on(bytes, slot)?;
+    let external_blocker = blocked_on.and_then(|blocked| {
+        let marker = ContentionMarker {
+            blocker: blocked.key,
+            mode: blocked.mode,
+        };
+        (!contention_marker_within_encoded_watch(marker, bytes, layout, watch_modes))
+            .then_some(marker)
+    });
+    Ok(ScanRecord {
+        slot,
+        state: read_u32(bytes, R_STATE),
+        ticket: read_u64(bytes, R_TICKET),
+        claim,
+        watch_modes,
+        flexible,
+        blocked_on,
+        external_blocker,
+        issue_serial: read_u64(bytes, R_ISSUE_SERIAL),
+        replan_claim_epoch: read_u64(bytes, R_REPLAN_CLAIM_EPOCH),
+        grant_epoch: read_u64(bytes, R_GRANT_EPOCH),
+        prefix_epoch: read_u64(bytes, R_PREFIX_EPOCH),
+        backfill_capacity,
+        backfill_started_ns: read_u64(bytes, R_BACKFILL_STARTED_NS),
+        prev_active: read_u64(bytes, R_PREV_ACTIVE),
+        next_active: read_u64(bytes, R_NEXT_ACTIVE),
+    })
+}
+
 fn decode_record(bytes: &[u8], layout: HeaderLayout, slot: u64) -> Result<Record> {
     let watch_llc_mode = decode_mode(bytes, R_WATCH_LLC_MODE, slot, "LLC watch")?;
     let claim_llc_mode = decode_mode(bytes, R_CLAIM_LLC_MODE, slot, "exact LLC claim")?;
@@ -12666,6 +13252,8 @@ fn decode_record(bytes: &[u8], layout: HeaderLayout, slot: u64) -> Result<Record
         slot,
         "exact claim",
     )?);
+    #[cfg(test)]
+    FULL_WATCH_MATERIALIZATIONS.with(|count| count.set(count.get().saturating_add(1)));
     let watch = ClaimSet::with_all_claim_modes(
         decode_bitset(bytes, record_bitset_offset(layout, RB_WATCH_LLCS), layout)?,
         decode_bitset(bytes, record_bitset_offset(layout, RB_WATCH_CPUS), layout)?,
@@ -12679,34 +13267,7 @@ fn decode_record(bytes: &[u8], layout: HeaderLayout, slot: u64) -> Result<Record
         watch_permit_mode,
     )
     .with_admission_class(decode_admission_class(bytes, R_WATCH_CLASS, slot, "watch")?);
-    let blocked_on = match read_u32(bytes, R_BLOCK_KIND) {
-        BLOCK_NONE => None,
-        kind @ (BLOCK_CPU | BLOCK_LLC | BLOCK_PERMIT) => {
-            let index = usize::try_from(read_u64(bytes, R_BLOCK_INDEX))
-                .context("blocked resource index does not fit this process")?;
-            let key = match kind {
-                BLOCK_CPU => ResourceKey::Cpu(index),
-                BLOCK_LLC => ResourceKey::Llc(index),
-                BLOCK_PERMIT => ResourceKey::Permit(index),
-                _ => unreachable!("block kind matched above"),
-            };
-            let mode = match read_u32(bytes, R_BLOCK_MODE) {
-                0 => FlockMode::Shared,
-                1 => FlockMode::Exclusive,
-                mode => anyhow::bail!(
-                    "queue registry v{VERSION} slot {slot} has invalid blocker mode {mode}"
-                ),
-            };
-            Some(BlockedOn {
-                key,
-                mode,
-                serial: read_u64(bytes, R_BLOCKED_SERIAL),
-            })
-        }
-        kind => {
-            anyhow::bail!("queue registry v{VERSION} slot {slot} has invalid blocker kind {kind}")
-        }
-    };
+    let blocked_on = decode_blocked_on(bytes, slot)?;
     let backfill_capacity = read_u32(bytes, R_BACKFILL_CAPACITY);
     let maximum_backfill_capacity = backfill_capacity_for_watch(&watch);
     if backfill_capacity > maximum_backfill_capacity {
@@ -12961,27 +13522,6 @@ fn backfill_cost_for_claim(claim: &ClaimSet) -> u32 {
         permit_units
     })
     .unwrap_or(u32::MAX)
-}
-
-fn aggregate_from_words(
-    bits: usize,
-    cpu_any: &[u64],
-    cpu_exclusive: &[u64],
-    llc_any: &[u64],
-    llc_exclusive: &[u64],
-) -> AggregateSnapshot {
-    AggregateSnapshot {
-        bits,
-        cpu_any: cpu_any.to_vec(),
-        cpu_exclusive: cpu_exclusive.to_vec(),
-        llc_any: llc_any.to_vec(),
-        llc_exclusive: llc_exclusive.to_vec(),
-        cpu_shared_holders: vec![0; bits],
-        cpu_exclusive_holders: vec![0; bits],
-        llc_shared_holders: vec![0; bits],
-        llc_exclusive_holders: vec![0; bits],
-        build_cpu_claims: vec![0; bits],
-    }
 }
 
 fn add_claim_bits(
