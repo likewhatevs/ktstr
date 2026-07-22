@@ -4933,6 +4933,17 @@ fn expired_and_revoked_payloads_notify_after_drop_when_rescan_is_already_pending
 }
 
 #[test]
+fn held_teardown_publishes_one_coordinator_notification() {
+    let _prefixes = LockPrefixesGuard::new();
+    assert_eq!(
+        protocol::exercise_held_teardown_notify_count_for_tests()
+            .expect("exercise HELD teardown notification count"),
+        1,
+        "one HELD teardown must publish exactly one targeted coordinator edge",
+    );
+}
+
+#[test]
 fn coordinator_rejections_notify_after_complete_and_prepare_payloads_drop() {
     let _prefixes = LockPrefixesGuard::new();
     let outcome = protocol::exercise_coordinator_payload_notify_order_for_tests()

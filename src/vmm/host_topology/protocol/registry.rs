@@ -157,20 +157,22 @@ const H_LAST_PROGRESS_NS: usize = 184;
 /// u64 diagnostic/epoch while waiters sleep on this non-overlapping u32 word.
 const H_GENERATION_WAKE: usize = 192;
 /// Ticket which most recently received a speculative REPLAN callback. This is
-/// retained as a crash-repair diagnostic; the authoritative scan publishes
-/// every eligible callback from its already-frozen active-list snapshot.
+/// retained as a crash-repair diagnostic; it is not an admission cursor.
 const H_REPLAN_CURSOR: usize = 200;
-/// Inclusive ticket high-water of the most recently published finite REPLAN
-/// wave. Registration is excluded by the registry writer lock while that
-/// active-list snapshot is scanned.
+/// Inclusive ticket high-water admitted under the current non-renewing REPLAN
+/// lease. Each registry-writer scan observes a finite active-list snapshot,
+/// but later scans may extend this diagnostic high-water while older callbacks
+/// remain live. It is not an admission horizon.
 const H_REPLAN_HORIZON: usize = 208;
 /// Number of published speculative callbacks which have not yet returned to
-/// WAITING. This is quarantine and finite-wave accounting only: each callback
-/// completion independently publishes a coalesced coordinator rescan edge.
+/// WAITING. This is exact record-state/quarantine accounting only: each
+/// callback completion independently publishes a coalesced coordinator rescan
+/// edge, and later callbacks may join without waiting for this count to drain.
 const H_REPLAN_OUTSTANDING: usize = 216;
-/// Monotonic start and deadline of the currently published finite REPLAN
-/// wave. A callback which survives past the bounded lease is quarantined so
-/// one stopped planner cannot hold completed replacements behind it forever.
+/// Monotonic start and deadline of the current REPLAN lease. The first live
+/// callback arms it; incremental publications never renew it. Every callback
+/// still live at the original deadline is quarantined so continuous arrivals
+/// cannot keep a stopped planner alive forever.
 const H_REPLAN_WAVE_STARTED_NS: usize = 224;
 const H_REPLAN_WAVE_DEADLINE_NS: usize = 232;
 const _: () = assert!(H_AGGREGATE_DIRTY.is_multiple_of(std::mem::align_of::<AtomicU64>()));
@@ -380,6 +382,8 @@ thread_local! {
     #[cfg(test)]
     static NOTIFY_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static NOTIFY_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -926,7 +930,6 @@ impl HeldClaim {
         }
         drop(table);
         drop(_lock);
-        notify_coordinator();
         Ok(())
     }
 
@@ -1056,6 +1059,17 @@ pub(super) fn set_held_drop_hook_for_tests(hook: impl FnOnce() + 'static) {
         );
         *slot.borrow_mut() = Some(Box::new(hook));
     });
+}
+
+#[cfg(test)]
+pub(super) fn exercise_held_teardown_notify_count_for_tests() -> Result<u64> {
+    let claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+    let held = publish_acquired(&claim)?;
+    let before = NOTIFY_CALLS.with(std::cell::Cell::get);
+    drop(held);
+    Ok(NOTIFY_CALLS
+        .with(std::cell::Cell::get)
+        .wrapping_sub(before))
 }
 
 #[cfg(test)]
@@ -11387,6 +11401,8 @@ fn lock_registry_interruptible_existing(cancelled: Option<&AtomicBool>) -> Resul
 
 fn notify_coordinator() {
     #[cfg(test)]
+    NOTIFY_CALLS.with(|calls| calls.set(calls.get().wrapping_add(1)));
+    #[cfg(test)]
     if let Some(hook) = NOTIFY_HOOK.with(|slot| slot.borrow_mut().take()) {
         hook();
     }
@@ -13493,13 +13509,19 @@ impl Table {
         let coordinator_ticket = self.coordinator_ticket();
         let global_serial = self.global_serial();
         // REPLAN is a speculative planner callback, not a resource claim.
-        // Publish every eligible callback in the current finite round as one
-        // work-conserving wave. Their exact replacements still return to
-        // WAITING and require a fresh authoritative scan before acquisition,
-        // so this parallelizes planning without weakening queue fences.
+        // Publish every eligible callback in this finite writer-locked
+        // snapshot. Later scans may publish more while older callbacks remain
+        // live: their exact replacements still return to WAITING and require
+        // a fresh authoritative scan before acquisition, so incremental
+        // planning cannot weaken queue fences.
         let next_round_horizon = read_u64(&self.header, H_NEXT_TICKET).saturating_sub(1);
-        let replan_wave_in_flight = self.replan_outstanding() != 0;
-        let mut replan_wave_started = false;
+        let replan_lease_active = self.replan_outstanding() != 0;
+        // Production entry expires a due lease before this scan. Preserve the
+        // boundary if the clock crosses its deadline between those two
+        // monotonic samples instead of publishing immediately-expired work.
+        let replan_publication_open =
+            !replan_lease_active || !self.replan_wave_due_at(backfill_now_ns);
+        let mut replan_batch_started = false;
         let mut replan_wake_slots = Vec::new();
         let mut changed = false;
         let mut coordinator_prefix_changed = false;
@@ -13751,19 +13773,24 @@ impl Table {
                     true
                 };
                 if (relevant_resource_change || prefix_invalid || !waiting_prefix_matches)
-                    && !replan_wave_in_flight
+                    && replan_publication_open
                 {
-                    // Keep each publication snapshot finite. A waiter which
-                    // still needs speculative planning joins a later wave;
-                    // every callback exit publishes the rescan edge which
-                    // eventually starts that wave.
-                    if !replan_wave_started {
-                        // Freeze the diagnostic high-water before the first
-                        // callback publication. Dirty repair invalidates all
-                        // flexible waiters after any torn point in this wave.
-                        write_u64(&mut self.header, H_REPLAN_HORIZON, next_round_horizon);
-                        self.arm_replan_wave_at(backfill_now_ns);
-                        replan_wave_started = true;
+                    if !replan_batch_started {
+                        // Extend only the diagnostic high-water. Never gate a
+                        // later arrival on this value, and never renew a live
+                        // lease: its original deadline bounds both an old
+                        // straggler and all incrementally published work.
+                        let horizon = if replan_lease_active {
+                            read_u64(&self.header, H_REPLAN_HORIZON)
+                                .max(next_round_horizon)
+                        } else {
+                            next_round_horizon
+                        };
+                        write_u64(&mut self.header, H_REPLAN_HORIZON, horizon);
+                        if !replan_lease_active {
+                            self.arm_replan_wave_at(backfill_now_ns);
+                        }
+                        replan_batch_started = true;
                     }
                     self.publish_prefix_words(
                         record.slot,
@@ -13861,12 +13888,12 @@ impl Table {
                 changed = true;
             }
         }
-        // Publish the complete wave before making its workers runnable. This
-        // keeps awakened planners from convoying on the writer while it is
-        // still copying later prefixes. A crash anywhere before the clean
-        // marker leaves the transaction dirty; repair demotes the entire
-        // ambiguously delivered wave before any completion can commit.
-        if replan_wave_started {
+        // Publish the complete scan batch before making its workers runnable.
+        // This keeps awakened planners from convoying on the writer while it
+        // is still copying later prefixes. A crash anywhere before the clean
+        // marker leaves the transaction dirty; repair demotes every
+        // ambiguously delivered callback before any completion can commit.
+        if replan_batch_started {
             crash_at_for_tests("replan_wave_published_before_wake");
         }
         for slot in replan_wake_slots {

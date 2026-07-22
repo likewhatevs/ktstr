@@ -2101,6 +2101,11 @@ pub(crate) fn exercise_acknowledgement_payload_notify_order_for_tests()
 }
 
 #[cfg(test)]
+pub(crate) fn exercise_held_teardown_notify_count_for_tests() -> Result<u64> {
+    registry::exercise_held_teardown_notify_count_for_tests()
+}
+
+#[cfg(test)]
 pub(crate) struct CoordinatorPayloadNotifyCase {
     pub(crate) commit_terminated: bool,
     pub(crate) rescan_was_already_pending: bool,
