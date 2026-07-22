@@ -6975,9 +6975,9 @@ pub(super) fn exercise_intrascan_fence_epoch_for_tests() -> Result<(bool, bool, 
     let completion_accepted_for_revalidation = matches!(result, GrantResult::Requeued) && {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
-        table.record(later.slot)?.is_some_and(|record| {
-            record.ticket == later.ticket && record.state == STATE_WAITING
-        })
+        table
+            .record(later.slot)?
+            .is_some_and(|record| record.ticket == later.ticket && record.state == STATE_WAITING)
     };
 
     later.finish(None)?;
@@ -10567,9 +10567,9 @@ pub(super) fn exercise_stale_acquired_release_order_for_tests()
     let regrant_revoked = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
-        table.record(waiter.slot)?.is_some_and(|record| {
-            record.ticket == waiter.ticket && record.state == STATE_WAITING
-        })
+        table
+            .record(waiter.slot)?
+            .is_some_and(|record| record.ticket == waiter.ticket && record.state == STATE_WAITING)
     };
     let payload_dropped = payload_dropped.get();
     let registry_unlocked_at_drop = registry_unlocked_at_drop.get();

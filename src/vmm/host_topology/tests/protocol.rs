@@ -4988,10 +4988,7 @@ fn stale_coordinator_retry_retains_preparation_token_until_terminal_exit() {
     let _prefixes = LockPrefixesGuard::new();
     let outcome = protocol::exercise_stale_coordinator_preparation_retention_for_tests()
         .expect("exercise stale coordinator preparation-token retention");
-    for (label, case) in [
-        ("Complete", outcome.complete),
-        ("Prepare", outcome.prepare),
-    ] {
+    for (label, case) in [("Complete", outcome.complete), ("Prepare", outcome.prepare)] {
         assert!(
             case.token_retained_on_retry,
             "a stale {label} attempt must retain the prepared-process token for its forced fresh planner turn",

@@ -2369,8 +2369,7 @@ fn exercise_stale_coordinator_preparation_case(
             });
         }
         let reusable = held.clone_reusable_permits()?;
-        token_retained_on_retry =
-            reusable.len() == 1 && reusable[0].0 == retained_token;
+        token_retained_on_retry = reusable.len() == 1 && reusable[0].0 == retained_token;
         if matches!(attempt, StaleCoordinatorAttempt::Prepare) {
             let released = crate::flock::try_flock(&attempt_path, FlockMode::Exclusive)?;
             attempt_released_on_retry = released.is_some();
