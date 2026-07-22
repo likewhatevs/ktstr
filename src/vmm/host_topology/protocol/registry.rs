@@ -4228,6 +4228,23 @@ pub(crate) struct CoordinatorHeartbeatDeadlineOutcome {
 }
 
 #[cfg(test)]
+pub(crate) struct RepeatedCoordinatorTakeoverOutcome {
+    pub(crate) first_header_transferred: bool,
+    pub(crate) first_states_coherent: bool,
+    pub(crate) first_epoch_advanced: bool,
+    pub(crate) first_targeted_wakes: bool,
+    pub(crate) first_scan_cleared_suffix: bool,
+    pub(crate) second_header_returned: bool,
+    pub(crate) second_states_coherent: bool,
+    pub(crate) second_epoch_advanced: bool,
+    pub(crate) second_targeted_wakes: bool,
+    pub(crate) second_watermark_starts_at_older: bool,
+    pub(crate) intervening_grant_callback_suppressed: bool,
+    pub(crate) intervening_grant_waiting_before_scan: bool,
+    pub(crate) intervening_grant_regranted_after_scan: bool,
+}
+
+#[cfg(test)]
 pub(super) fn exercise_coordinator_heartbeat_deadline_for_tests()
 -> Result<CoordinatorHeartbeatDeadlineOutcome> {
     let claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
@@ -4322,6 +4339,208 @@ pub(super) fn exercise_coordinator_heartbeat_deadline_for_tests()
             && heartbeat_after == second_tick_at
             && heartbeat_after != heartbeat_before,
         heartbeat_tick_preserved_protocol_state: signature_after_tick == signature_before_tick,
+    })
+}
+
+/// Exercise two consecutive live-coordinator lease transfers. Ticket C is
+/// deliberately registered between A and B and kept GRANTED: B -> A must
+/// dirty the suffix from the older successor A, not merely from the displaced
+/// B, or C could enter with a predecessor snapshot from the previous lease.
+#[cfg(test)]
+pub(super) fn exercise_repeated_coordinator_takeover_for_tests()
+-> Result<RepeatedCoordinatorTakeoverOutcome> {
+    let coordinator_a_claim =
+        ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+    let mut coordinator_a = Ticket::register(
+        coordinator_a_claim.clone(),
+        coordinator_a_claim,
+        None,
+    )?;
+    let intervening_claim =
+        ClaimSet::new(std::iter::empty(), [2usize], FlockMode::Exclusive);
+    let mut intervening =
+        Ticket::register(intervening_claim.clone(), intervening_claim.clone(), None)?;
+    let coordinator_b_claim =
+        ClaimSet::new(std::iter::empty(), [3usize], FlockMode::Exclusive);
+    let mut coordinator_b = Ticket::register(
+        coordinator_b_claim.clone(),
+        coordinator_b_claim,
+        None,
+    )?;
+
+    let (initial_epoch, wake_a_before, wake_b_before) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.repair_consistency_if_needed()?;
+        set_cpu_free_for_tests(&mut table, 1, false)?;
+        set_cpu_free_for_tests(&mut table, 2, true)?;
+        set_cpu_free_for_tests(&mut table, 3, false)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible()?;
+        anyhow::ensure!(
+            table.coordinator_ticket() == coordinator_a.ticket
+                && table.coordinator_slot()? == coordinator_a.slot
+                && table.record(coordinator_a.slot)?.is_some_and(|record| {
+                    record.ticket == coordinator_a.ticket && record.state == STATE_COORDINATOR
+                })
+                && table.record(intervening.slot)?.is_some_and(|record| {
+                    record.ticket == intervening.ticket && record.state == STATE_GRANTED
+                })
+                && table.record(coordinator_b.slot)?.is_some_and(|record| {
+                    record.ticket == coordinator_b.ticket && record.state == STATE_WAITING
+                }),
+            "repeated-takeover fixture did not stage A coordinator, intervening C grant, and B waiter",
+        );
+        let wake_a = coordinator_a
+            .shared
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("coordinator A wake mapping disappeared"))?
+            .expected();
+        let wake_b = coordinator_b
+            .shared
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("coordinator B wake mapping disappeared"))?
+            .expected();
+        (table.coordinator_epoch(), wake_a, wake_b)
+    };
+
+    let first_now = monotonic_now_ns()?.max(COORDINATOR_HEARTBEAT_LEASE_NS);
+    let (first_header_transferred, first_states_coherent, first_epoch, first_suffix_clear) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        write_u64(&mut table.header, H_COORDINATOR_HEARTBEAT_NS, 0);
+        write_u64(&mut table.header, H_LAST_PROGRESS_NS, 0);
+        table.recover_coordinator_if_dead_at(first_now)?;
+        let first_header_transferred = table.coordinator_ticket() == coordinator_b.ticket
+            && table.coordinator_slot()? == coordinator_b.slot;
+        let first_states_coherent = table.record(coordinator_a.slot)?.is_some_and(|record| {
+            record.ticket == coordinator_a.ticket && record.state == STATE_COORDINATOR_STANDBY
+        }) && table.record(coordinator_b.slot)?.is_some_and(|record| {
+            record.ticket == coordinator_b.ticket && record.state == STATE_COORDINATOR
+        }) && table.record(intervening.slot)?.is_some_and(|record| {
+            record.ticket == intervening.ticket && record.state == STATE_GRANTED
+        });
+        let first_epoch = table.coordinator_epoch();
+
+        // Clear the first transfer's suffix edge and refresh C's grant token.
+        // The second transfer must independently dirty C from A's older ticket.
+        set_cpu_free_for_tests(&mut table, 2, true)?;
+        table.grant_compatible()?;
+        let first_suffix_clear = table.min_changed_ticket() == u64::MAX
+            && table.pending_flags() & PENDING_RESCAN == 0
+            && table.record(intervening.slot)?.is_some_and(|record| {
+                record.ticket == intervening.ticket && record.state == STATE_GRANTED
+            });
+        (
+            first_header_transferred,
+            first_states_coherent,
+            first_epoch,
+            first_suffix_clear,
+        )
+    };
+    let wake_a_after_first = coordinator_a
+        .shared
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("parked coordinator A wake mapping disappeared"))?
+        .expected();
+    let wake_b_after_first = coordinator_b
+        .shared
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("promoted coordinator B wake mapping disappeared"))?
+        .expected();
+
+    let second_now = first_now.saturating_add(COORDINATOR_HEARTBEAT_LEASE_NS);
+    let (
+        second_header_returned,
+        second_states_coherent,
+        second_epoch,
+        second_watermark_starts_at_older,
+    ) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        write_u64(&mut table.header, H_COORDINATOR_HEARTBEAT_NS, 0);
+        write_u64(&mut table.header, H_LAST_PROGRESS_NS, 0);
+        table.recover_coordinator_if_dead_at(second_now)?;
+        (
+            table.coordinator_ticket() == coordinator_a.ticket
+                && table.coordinator_slot()? == coordinator_a.slot,
+            table.record(coordinator_a.slot)?.is_some_and(|record| {
+                record.ticket == coordinator_a.ticket && record.state == STATE_COORDINATOR
+            }) && table.record(coordinator_b.slot)?.is_some_and(|record| {
+                record.ticket == coordinator_b.ticket
+                    && record.state == STATE_COORDINATOR_STANDBY
+            }) && table.record(intervening.slot)?.is_some_and(|record| {
+                record.ticket == intervening.ticket && record.state == STATE_GRANTED
+            }),
+            table.coordinator_epoch(),
+            table.min_changed_ticket() == coordinator_a.ticket
+                && table.pending_flags() & PENDING_RESCAN != 0,
+        )
+    };
+    let wake_a_after_second = coordinator_a
+        .shared
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("restored coordinator A wake mapping disappeared"))?
+        .expected();
+    let wake_b_after_second = coordinator_b
+        .shared
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("parked coordinator B wake mapping disappeared"))?
+        .expected();
+
+    let mut intervening_callback_ran = false;
+    let intervening_result = intervening.run_granted(
+        None,
+        |current, _watch, acquisition_allowed, _predecessors, _availability| {
+            intervening_callback_ran = true;
+            anyhow::ensure!(
+                acquisition_allowed && current == &intervening_claim,
+                "intervening grant received the wrong repeated-takeover publication",
+            );
+            Ok(GrantAttempt::<()> {
+                acquired: None,
+                preparation_claim: None,
+                preparation_contention: None,
+                next_claim: current.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    let intervening_grant_callback_suppressed =
+        !intervening_callback_ran && matches!(intervening_result, GrantResult::LostGrant);
+    let (intervening_grant_waiting_before_scan, intervening_grant_regranted_after_scan) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let waiting = table.record(intervening.slot)?.is_some_and(|record| {
+            record.ticket == intervening.ticket && record.state == STATE_WAITING
+        });
+        set_cpu_free_for_tests(&mut table, 2, true)?;
+        table.grant_compatible()?;
+        let regranted = table.record(intervening.slot)?.is_some_and(|record| {
+            record.ticket == intervening.ticket && record.state == STATE_GRANTED
+        });
+        (waiting, regranted)
+    };
+
+    coordinator_b.finish(None)?;
+    intervening.finish(None)?;
+    coordinator_a.finish(None)?;
+    Ok(RepeatedCoordinatorTakeoverOutcome {
+        first_header_transferred,
+        first_states_coherent,
+        first_epoch_advanced: first_epoch > initial_epoch,
+        first_targeted_wakes: wake_a_after_first != wake_a_before
+            && wake_b_after_first != wake_b_before,
+        first_scan_cleared_suffix: first_suffix_clear,
+        second_header_returned,
+        second_states_coherent,
+        second_epoch_advanced: second_epoch > first_epoch,
+        second_targeted_wakes: wake_a_after_second != wake_a_after_first
+            && wake_b_after_second != wake_b_after_first,
+        second_watermark_starts_at_older,
+        intervening_grant_callback_suppressed,
+        intervening_grant_waiting_before_scan,
+        intervening_grant_regranted_after_scan,
     })
 }
 

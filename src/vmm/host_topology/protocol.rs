@@ -1803,6 +1803,12 @@ pub(crate) fn exercise_coordinator_heartbeat_deadline_for_tests()
 }
 
 #[cfg(test)]
+pub(crate) fn exercise_repeated_coordinator_takeover_for_tests()
+-> Result<registry::RepeatedCoordinatorTakeoverOutcome> {
+    registry::exercise_repeated_coordinator_takeover_for_tests()
+}
+
+#[cfg(test)]
 pub(crate) fn expire_coordinator_lease_for_tests() -> Result<()> {
     registry::expire_coordinator_lease_for_tests()
 }

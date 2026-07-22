@@ -1571,6 +1571,39 @@ fn coordinator_heartbeat_has_an_exact_lightweight_takeover_deadline() {
 }
 
 #[test]
+fn repeated_coordinator_lease_takeover_fences_the_complete_older_suffix() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_repeated_coordinator_takeover_for_tests()
+        .expect("exercise repeated live-coordinator lease takeover");
+    assert!(
+        outcome.first_header_transferred
+            && outcome.first_states_coherent
+            && outcome.first_epoch_advanced,
+        "the first expired lease must atomically transfer A to standby and promote B under a newer coordinator epoch",
+    );
+    assert!(
+        outcome.first_targeted_wakes && outcome.first_scan_cleared_suffix,
+        "the first transfer must target both participants and leave a clean baseline after its authoritative scan",
+    );
+    assert!(
+        outcome.second_header_returned
+            && outcome.second_states_coherent
+            && outcome.second_epoch_advanced,
+        "the second expired lease must atomically return ownership to standby A, park B, and advance the epoch again",
+    );
+    assert!(
+        outcome.second_targeted_wakes && outcome.second_watermark_starts_at_older,
+        "the reverse transfer must target both participants and dirty the suffix from older successor A rather than displaced B",
+    );
+    assert!(
+        outcome.intervening_grant_callback_suppressed
+            && outcome.intervening_grant_waiting_before_scan
+            && outcome.intervening_grant_regranted_after_scan,
+        "the intervening C grant must not enter on its previous-lease token and may become current again only after the authoritative scan",
+    );
+}
+
+#[test]
 fn stalled_takeover_wakes_and_parks_the_displaced_coordinator() {
     let _prefixes = LockPrefixesGuard::new();
     let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
