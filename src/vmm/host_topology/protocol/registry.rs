@@ -13514,12 +13514,32 @@ impl Table {
         if coordinator_activity_is_fresh(&self.header, now) {
             return Ok(());
         }
-        let Some(successor) = self
-            .records()?
-            .into_iter()
-            .filter(|candidate| candidate.state == STATE_WAITING)
-            .min_by_key(|candidate| candidate.ticket)
-        else {
+        let mut candidates = self.records()?;
+        candidates.retain(|candidate| {
+            matches!(
+                candidate.state,
+                STATE_WAITING | STATE_COORDINATOR_STANDBY
+            )
+        });
+        // Drain never-tried waiters before recycling a coordinator which
+        // already missed its lease. Once no WAITING ticket remains, the
+        // oldest standby is the progress fallback instead of a terminal
+        // two-ticket wedge.
+        candidates.sort_by_key(|candidate| {
+            (candidate.state != STATE_WAITING, candidate.ticket)
+        });
+        let mut successor = None;
+        for candidate in candidates {
+            // Do not spend another bounded lease and repair turn transferring
+            // the header to an identity whose liveness OFD is already gone.
+            // A death after this probe remains covered by ordinary coordinator
+            // recovery on the next waiter tick.
+            if ticket_is_live(candidate.slot, candidate.ticket)? {
+                successor = Some(candidate);
+                break;
+            }
+        }
+        let Some(successor) = successor else {
             return Ok(());
         };
 
@@ -13542,18 +13562,27 @@ impl Table {
         let successor = self
             .record(successor.slot)?
             .filter(|candidate| {
-                candidate.ticket == successor.ticket && candidate.state == STATE_WAITING
+                candidate.ticket == successor.ticket
+                    && matches!(
+                        candidate.state,
+                        STATE_WAITING | STATE_COORDINATOR_STANDBY
+                    )
             })
             .ok_or_else(|| anyhow::anyhow!("queue takeover successor changed during recovery"))?;
         if coordinator_activity_is_fresh(&self.header, now) {
             self.finish_transaction()?;
             return Ok(());
         }
+        let changed_suffix = current.ticket.min(successor.ticket);
         self.set_record_state(current.slot, STATE_COORDINATOR_STANDBY)?;
         self.set_coordinator(successor.ticket, successor.slot)?;
         self.set_record_state(successor.slot, STATE_COORDINATOR)?;
         self.clear_record_blocked(successor.slot)?;
-        self.mark_claim_changed(current.ticket)?;
+        // Transfer removes the displaced coordinator's potential fence and
+        // adds the successor's. A repeated takeover can promote an older
+        // standby ticket, so dirty from the earlier identity rather than
+        // assuming every successor lies later in queue order.
+        self.mark_claim_changed(changed_suffix)?;
         self.bump_generation()?;
         self.wake_slot(current.slot)?;
         self.wake_slot(successor.slot)?;
