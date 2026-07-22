@@ -12535,8 +12535,7 @@ impl Table {
     fn schedule_replan_completion_edge_in_transaction(&mut self) -> Result<bool> {
         let coordinator_before = self.coordinator_ticket();
         self.schedule_rescan_edge_in_transaction()?;
-        let coordinator_elected =
-            coordinator_before == 0 && self.coordinator_ticket() != 0;
+        let coordinator_elected = coordinator_before == 0 && self.coordinator_ticket() != 0;
         Ok(self.replan_outstanding() == 0 || coordinator_elected)
     }
 
