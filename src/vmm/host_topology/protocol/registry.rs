@@ -4405,6 +4405,23 @@ pub(super) fn exercise_fresh_waiting_coordinator_takeover_for_tests()
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
         table.repair_consistency_if_needed()?;
+        // Registration exercises real liveness recovery. On a heavily
+        // descheduled test process, more than one coordinator lease may pass
+        // while B and C are being registered, so transactionally restore the
+        // synthetic A -> B -> C starting point before testing explicit lease
+        // boundaries below. Do not make fixture setup depend on wall time.
+        table.begin_transaction()?;
+        for ticket in [&coordinator_a, &coordinator_b, &coordinator_c] {
+            let record = table
+                .record(ticket.slot)?
+                .filter(|record| record.ticket == ticket.ticket)
+                .ok_or_else(|| anyhow::anyhow!("fresh-waiter fixture ticket disappeared"))?;
+            table.set_record_state(record.slot, STATE_WAITING)?;
+            table.clear_record_blocked(record.slot)?;
+        }
+        table.set_coordinator(0, NONE_SLOT)?;
+        table.elect_coordinator_in_transaction()?;
+        table.finish_transaction()?;
         anyhow::ensure!(
             table.coordinator_ticket() == coordinator_a.ticket
                 && table.coordinator_slot()? == coordinator_a.slot
