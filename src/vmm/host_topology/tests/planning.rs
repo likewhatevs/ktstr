@@ -2282,6 +2282,112 @@ fn build_permits_are_bounded_but_never_blocked_by_live_default_borrowers() {
 }
 
 #[test]
+fn elastic_build_falls_back_to_one_cpu_when_every_build_permit_is_busy() {
+    let pool = AdmissionPermitPool::for_build_host(4).expect("construct build-only namespace");
+    let busy = pool.all().collect::<std::collections::BTreeSet<_>>();
+    let selection = select_plan_permits(
+        PermitAdmission::Build,
+        LlcPlanSizing::Elastic,
+        &pool,
+        None,
+        4,
+        0,
+        0,
+        0,
+        &[],
+        &[],
+        |candidate| Ok(candidate.permits.is_disjoint(&busy)),
+    )
+    .expect("select an elastic build shape")
+    .expect("busy build permits must retain serial forward progress");
+
+    assert_eq!(selection.cpu_width, 1);
+    assert!(
+        selection.permits.all_permits().is_empty(),
+        "the serial fallback must not queue behind the saturated permit pool",
+    );
+    assert_eq!(
+        selection.permits.admission_class,
+        admission_protocol::AdmissionClass::Build,
+    );
+}
+
+#[test]
+fn elastic_build_uses_the_one_free_build_permit_before_serial_fallback() {
+    let pool = AdmissionPermitPool::for_build_host(4).expect("construct build-only namespace");
+    let free = pool.all().next().expect("build pool is non-empty");
+    let busy = pool
+        .all()
+        .filter(|permit| *permit != free)
+        .collect::<std::collections::BTreeSet<_>>();
+    let selection = select_plan_permits(
+        PermitAdmission::Build,
+        LlcPlanSizing::Elastic,
+        &pool,
+        None,
+        4,
+        0,
+        0,
+        0,
+        &[],
+        &[],
+        |candidate| Ok(candidate.permits.is_disjoint(&busy)),
+    )
+    .expect("select an elastic build shape")
+    .expect("one free build permit must remain usable");
+
+    assert_eq!(selection.cpu_width, 1);
+    assert_eq!(selection.permits.cpu_permits, vec![free]);
+    assert_eq!(selection.permits.all_permits(), vec![free]);
+}
+
+#[test]
+fn elastic_build_acquires_serial_shared_plan_while_build_permits_are_saturated() {
+    let _prefixes = LockPrefixesGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3]);
+    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(4, 1);
+    let build_pool =
+        AdmissionPermitPool::for_build_host(4).expect("construct build-only namespace");
+    let busy_permits = build_pool.all().collect::<Vec<_>>();
+    let busy_claim = resource_claim_with_permits(
+        &[],
+        LlcLockMode::Shared,
+        &[],
+        FlockMode::Shared,
+        &busy_permits,
+        admission_protocol::AdmissionClass::Build,
+    );
+    let busy_locks = busy_permits
+        .iter()
+        .map(|permit| {
+            try_flock(permit_lock_path(*permit), FlockMode::Exclusive)
+                .expect("open build-permit lock")
+                .expect("reserve build permit")
+        })
+        .collect::<Vec<_>>();
+    let busy_holder = admission_protocol::publish_acquired(&busy_claim, busy_locks)
+        .expect("publish saturated build-permit pool");
+
+    let plan =
+        acquire_elastic_build_llc_plan(&topo, &test_topo, Some(CpuCap::new(4).unwrap()), None)
+            .expect("soft build permits must not block SH-compatible serial progress");
+
+    assert_eq!(plan.cpus.len(), 1);
+    assert_eq!(plan.locked_llcs.len(), 1);
+    assert!(plan.permits.is_empty());
+    assert_eq!(make_jobs_for_plan(&plan), 1);
+    assert_eq!(
+        plan.locks.len(),
+        plan.locked_llcs.len() + plan.cpus.len(),
+        "the fallback retains only its physical shared ownership",
+    );
+
+    drop(plan);
+    drop(busy_holder);
+}
+
+#[test]
 fn cooperative_selection_borrows_reserved_capacity_when_general_capacity_is_exhausted() {
     let pool = AdmissionPermitPool::for_host(8);
     assert!(!pool.general.is_empty() && !pool.reserved.is_empty());

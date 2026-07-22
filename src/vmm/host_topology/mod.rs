@@ -4907,6 +4907,95 @@ impl LlcPlanSizing {
     }
 }
 
+/// Permit selection plus the CPU width that the selected admission capacity
+/// can fund. Build permits are a preferred parallelism budget for elastic
+/// scheduler builds, not a second hard ownership fence: when the build-only
+/// namespace is saturated, one SH-compatible CPU may still run a serial
+/// build. Performance CPU/LLC EX ownership remains the hard admission fence.
+struct PlanPermitSelection {
+    permits: VmPermitSelection,
+    cpu_width: usize,
+}
+
+#[allow(clippy::too_many_arguments)] // Preserve every admission axis at the shared planning seam.
+fn select_plan_permits(
+    kind: PermitAdmission,
+    sizing: LlcPlanSizing,
+    cpu_pool: &AdmissionPermitPool,
+    memory_pool: Option<&MemoryPermitPool>,
+    maximum_cpus: usize,
+    required_memory: usize,
+    cpu_rotation: usize,
+    memory_rotation: usize,
+    preferred_cpu: &[usize],
+    preferred_memory: &[usize],
+    ready: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
+) -> Result<Option<PlanPermitSelection>> {
+    let minimum_cpus = match sizing {
+        LlcPlanSizing::Exact => maximum_cpus,
+        LlcPlanSizing::Elastic => 1,
+    };
+    if let Some(permits) = select_vm_permits(
+        kind,
+        cpu_pool,
+        memory_pool,
+        maximum_cpus,
+        minimum_cpus,
+        required_memory,
+        cpu_rotation,
+        memory_rotation,
+        preferred_cpu,
+        preferred_memory,
+        ready,
+    )? {
+        let cpu_width = match (sizing, kind) {
+            (LlcPlanSizing::Elastic, PermitAdmission::Cooperative | PermitAdmission::Build) => {
+                permits.cpu_permits.len()
+            }
+            (LlcPlanSizing::Exact, _) | (LlcPlanSizing::Elastic, PermitAdmission::None) => {
+                maximum_cpus
+            }
+        };
+        return Ok(Some(PlanPermitSelection { permits, cpu_width }));
+    }
+
+    if sizing == LlcPlanSizing::Elastic
+        && kind == PermitAdmission::Build
+        && memory_pool.is_none()
+        && maximum_cpus > 0
+    {
+        return Ok(Some(PlanPermitSelection {
+            permits: VmPermitSelection {
+                cpu_permits: Vec::new(),
+                memory_permits: Vec::new(),
+                admission_class: protocol::AdmissionClass::Build,
+            },
+            cpu_width: 1,
+        }));
+    }
+
+    Ok(None)
+}
+
+fn apply_plan_permit_width(
+    sizing: LlcPlanSizing,
+    selection: &PlanPermitSelection,
+    topo: &HostTopology,
+    selected_llcs: &mut Vec<usize>,
+    selected_cpus: &mut Vec<usize>,
+) {
+    if sizing != LlcPlanSizing::Elastic || selection.cpu_width >= selected_cpus.len() {
+        return;
+    }
+    selected_cpus.truncate(selection.cpu_width);
+    selected_llcs.retain(|llc| {
+        topo.llc_groups[*llc]
+            .cpus
+            .iter()
+            .any(|cpu| selected_cpus.contains(cpu))
+    });
+}
+
 struct LlcPlanAcquireRequest<'a> {
     topo: &'a HostTopology,
     test_topo: &'a crate::topology::TestTopology,
@@ -5361,11 +5450,14 @@ where
             .into());
         }
         let (mut selected_cpus, mut selected_mems) = selected_materialized.unwrap_or_default();
-        let permit_selection = if permit_admission == PermitAdmission::None {
-            Some(VmPermitSelection {
-                cpu_permits: Vec::new(),
-                memory_permits: Vec::new(),
-                admission_class: protocol::AdmissionClass::Ordinary,
+        let plan_permit_selection = if permit_admission == PermitAdmission::None {
+            Some(PlanPermitSelection {
+                permits: VmPermitSelection {
+                    cpu_permits: Vec::new(),
+                    memory_permits: Vec::new(),
+                    admission_class: protocol::AdmissionClass::Ordinary,
+                },
+                cpu_width: selected_cpus.len(),
             })
         } else {
             let watch_class = match permit_admission {
@@ -5394,17 +5486,12 @@ where
                 .chain(&preferred_memory_permits)
                 .copied()
                 .collect::<std::collections::BTreeSet<_>>();
-            let minimum = if sizing == LlcPlanSizing::Elastic {
-                1
-            } else {
-                selected_cpus.len()
-            };
-            select_vm_permits(
+            select_plan_permits(
                 permit_admission,
+                sizing,
                 &permit_pool,
                 memory_pool.as_ref(),
                 selected_cpus.len(),
-                minimum,
                 memory_required,
                 permit_rotation,
                 memory_rotation,
@@ -5423,19 +5510,11 @@ where
                 },
             )?
         };
-        if sizing == LlcPlanSizing::Elastic
-            && let Some(selection) = permit_selection.as_ref()
-            && selection.cpu_permits.len() < selected_cpus.len()
-        {
-            selected_cpus.truncate(selection.cpu_permits.len());
-            selected.retain(|llc| {
-                topo.llc_groups[*llc]
-                    .cpus
-                    .iter()
-                    .any(|cpu| selected_cpus.contains(cpu))
-            });
+        if let Some(selection) = plan_permit_selection.as_ref() {
+            apply_plan_permit_width(sizing, selection, topo, &mut selected, &mut selected_cpus);
             selected_mems = plan_mems(&selected_cpus, topo);
         }
+        let permit_selection = plan_permit_selection.map(|selection| selection.permits);
         if !wait && let Some(pending) = pending.take() {
             let activated = protocol::try_activate_pending_once(pending, |probe| {
                 let Some(permit_selection) = permit_selection.as_ref() else {
@@ -5732,7 +5811,7 @@ where
         &queued_cpu_states,
     )
     .expect("a statically valid queued designation must have CPU capacity");
-    let queued_selected = plan_from_snapshots_with_fresh_rotation(
+    let mut queued_selected = plan_from_snapshots_with_fresh_rotation(
         &queued_snapshots,
         queued_capacity.target,
         topo,
@@ -5765,27 +5844,59 @@ where
         }
         .into());
     };
-    let queued_permits = select_vm_permits(
+    // Exact queue designations intentionally name a complete canonical permit
+    // set even while it is busy. Elastic build permits are only a preferred
+    // parallelism budget, so seed their designation from live registry state
+    // and use the serial fallback instead of queuing behind a saturated pool.
+    let queued_permit_snapshot =
+        if sizing == LlcPlanSizing::Elastic && permit_admission == PermitAdmission::Build {
+            let watch = resource_claim_with_permits(
+                &[],
+                LlcLockMode::Shared,
+                &[],
+                FlockMode::Shared,
+                &permit_pool.all().collect::<Vec<_>>(),
+                protocol::AdmissionClass::Build,
+            );
+            Some(protocol::registered_claim_snapshot(&watch)?)
+        } else {
+            None
+        };
+    let preparation_owned = preferred_cpu_permits
+        .iter()
+        .chain(&preferred_memory_permits)
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let queued_plan_permits = select_plan_permits(
         permit_admission,
+        sizing,
         &permit_pool,
         memory_pool.as_ref(),
         queued_cpus.len(),
-        if sizing == LlcPlanSizing::Elastic {
-            1
-        } else {
-            queued_cpus.len()
-        },
         memory_required,
         permit_rotation,
         memory_rotation,
         &preferred_cpu_permits,
         &preferred_memory_permits,
-        |_| Ok(true),
+        |candidate| {
+            let Some(snapshot) = queued_permit_snapshot.as_ref() else {
+                return Ok(true);
+            };
+            let Some(external) = claim_without_owned_permits(candidate, &preparation_owned) else {
+                return Ok(true);
+            };
+            snapshot.conflicts(&external).map(|busy| !busy)
+        },
     )?
     .expect("a non-empty host permit pool must seed a queued designation");
-    if sizing == LlcPlanSizing::Elastic {
-        queued_cpus.truncate(queued_permits.cpu_permits.len());
-    }
+    apply_plan_permit_width(
+        sizing,
+        &queued_plan_permits,
+        topo,
+        &mut queued_selected,
+        &mut queued_cpus,
+    );
+    let queued_permits = queued_plan_permits.permits;
     let queued_all_permits = queued_permits.all_permits();
     let queued_claim = resource_claim_with_permits(
         &queued_selected,
@@ -5961,7 +6072,7 @@ where
             // needed while the live/registry snapshot exposes zero capacity.
             return Ok(None);
         };
-        let next_selected = plan_from_snapshots_with_fresh_rotation(
+        let mut next_selected = plan_from_snapshots_with_fresh_rotation(
             &snapshots,
             live_capacity.target,
             topo,
@@ -5989,16 +6100,12 @@ where
             // This is transient contention, not a malformed static topology.
             return Ok(None);
         };
-        let Some(next_permits) = select_vm_permits(
+        let Some(next_plan_permits) = select_plan_permits(
             permit_admission,
+            sizing,
             &permit_pool,
             memory_pool.as_ref(),
             next_cpus.len(),
-            if sizing == LlcPlanSizing::Elastic {
-                1
-            } else {
-                next_cpus.len()
-            },
             memory_required,
             permit_rotation,
             memory_rotation,
@@ -6009,18 +6116,14 @@ where
         else {
             return Ok(None);
         };
-        if sizing == LlcPlanSizing::Elastic {
-            next_cpus.truncate(next_permits.cpu_permits.len());
-        }
-        let next_selected = next_selected
-            .into_iter()
-            .filter(|llc| {
-                topo.llc_groups[*llc]
-                    .cpus
-                    .iter()
-                    .any(|cpu| next_cpus.contains(cpu))
-            })
-            .collect::<Vec<_>>();
+        apply_plan_permit_width(
+            sizing,
+            &next_plan_permits,
+            topo,
+            &mut next_selected,
+            &mut next_cpus,
+        );
+        let next_permits = next_plan_permits.permits;
         let next_all_permits = next_permits.all_permits();
         let next_claim = resource_claim_with_permits(
             &next_selected,
@@ -6207,16 +6310,12 @@ where
                 &cpu_states,
                 live_capacity.target,
                 cpu_policy,
-            ) && let Some(permits) = select_vm_permits(
+            ) && let Some(plan_permits) = select_plan_permits(
                 permit_admission,
+                sizing,
                 &permit_pool,
                 memory_pool.as_ref(),
                 cpus.len(),
-                if sizing == LlcPlanSizing::Elastic {
-                    1
-                } else {
-                    cpus.len()
-                },
                 memory_required,
                 permit_rotation,
                 memory_rotation,
@@ -6224,15 +6323,8 @@ where
                 &preferred_memory_permits,
                 |candidate| held.candidate_ready(candidate),
             )? {
-                if sizing == LlcPlanSizing::Elastic {
-                    cpus.truncate(permits.cpu_permits.len());
-                    selected.retain(|llc| {
-                        topo.llc_groups[*llc]
-                            .cpus
-                            .iter()
-                            .any(|cpu| cpus.contains(cpu))
-                    });
-                }
+                apply_plan_permit_width(sizing, &plan_permits, topo, &mut selected, &mut cpus);
+                let permits = plan_permits.permits;
                 let all_permits = permits.all_permits();
                 coordinator_claim = resource_claim_with_permits(
                     &selected,
