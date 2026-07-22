@@ -2377,6 +2377,7 @@ pub(crate) fn run_verifier(
     let blob_envs = crate::run_cargo::prebuilt_blob_bin_envs(
         std::env::var_os(ktstr::KTSTR_BUSYBOX_PATH_ENV),
         std::env::var_os("KTSTR_WPROF_PATH"),
+        verifier_metadata.as_ref(),
     );
     for (var, val) in &blob_envs {
         cmd.env(var, val);

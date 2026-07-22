@@ -668,8 +668,32 @@ pub(crate) fn profraw_inject_for(
     Some(dir.join("default-%p-%m.profraw"))
 }
 
+/// Whether the exact resolved Cargo graph needs the `ktstr` `wprof` feature.
+///
+/// `None` metadata, or metadata without a resolve graph, is inconclusive and
+/// therefore conservatively returns true. Once Cargo has supplied a resolve
+/// graph, however, the node feature lists are authoritative: `wprof` is needed
+/// iff at least one resolved package named `ktstr` has that feature active.
+/// Looking at package manifest feature declarations would be wrong here -- it
+/// says what *can* be enabled, not what this selected invocation built.
+fn resolved_metadata_needs_wprof(metadata: Option<&cargo_metadata::Metadata>) -> bool {
+    let Some(metadata) = metadata else {
+        return true;
+    };
+    let Some(resolve) = metadata.resolve.as_ref() else {
+        return true;
+    };
+    resolve.nodes.iter().any(|node| {
+        node.features.iter().any(|feature| feature == "wprof")
+            && metadata
+                .packages
+                .iter()
+                .any(|package| package.id == node.id && package.name == "ktstr")
+    })
+}
+
 /// Build-time env vars handing `cargo-ktstr`'s already-extracted
-/// busybox / wprof binaries to the child build, so the downstream
+/// busybox / required wprof binaries to the child build, so the downstream
 /// `ktstr` `build.rs` copies them into `$OUT_DIR` instead of
 /// re-fetching + recompiling (see `install_prebuilt_blob` in
 /// `build_helpers.rs`). `cargo-ktstr` exported `KTSTR_BUSYBOX_PATH` /
@@ -679,8 +703,13 @@ pub(crate) fn profraw_inject_for(
 /// reads. A path var is present only when the embedded blob was
 /// non-empty, so an absent var (cargo-ktstr built without that blob)
 /// yields no pair and the child build falls back to its fetch path.
-/// Pure with respect to its args so a unit test can drive every
-/// present/absent combination. `pub(crate)` because the verifier
+/// Busybox is unconditional. Wprof is handed over only when the exact resolved
+/// metadata says a `ktstr` node has feature `wprof`; unavailable metadata keeps
+/// the conservative historical handoff. That prevents a disabled optional
+/// tool path from splitting the reusable Cargo artifact identity while keeping
+/// metadata-failure behavior safe. Pure with respect to its args so a unit
+/// test can drive every present/absent/metadata combination. `pub(crate)`
+/// because the verifier
 /// dispatcher's reserved warm-up (`verifier.rs`) applies the same
 /// pairs so its pre-build and combined run share one build
 /// fingerprint (`build.rs` watches `KTSTR_BUSYBOX_BIN` /
@@ -688,12 +717,15 @@ pub(crate) fn profraw_inject_for(
 pub(crate) fn prebuilt_blob_bin_envs(
     busybox_path: Option<std::ffi::OsString>,
     wprof_path: Option<std::ffi::OsString>,
+    metadata: Option<&cargo_metadata::Metadata>,
 ) -> Vec<(&'static str, std::ffi::OsString)> {
     let mut pairs = Vec::new();
     if let Some(p) = busybox_path {
         pairs.push(("KTSTR_BUSYBOX_BIN", p));
     }
-    if let Some(p) = wprof_path {
+    if resolved_metadata_needs_wprof(metadata)
+        && let Some(p) = wprof_path
+    {
         pairs.push(("KTSTR_WPROF_BIN", p));
     }
     pairs
@@ -4256,6 +4288,7 @@ fn run_cargo_sub(
     let blob_envs = prebuilt_blob_bin_envs(
         std::env::var_os(ktstr::KTSTR_BUSYBOX_PATH_ENV),
         std::env::var_os("KTSTR_WPROF_PATH"),
+        nextest_metadata.as_ref(),
     );
     for (var, val) in &blob_envs {
         cmd.env(var, val);
@@ -9548,15 +9581,38 @@ path = "junit.xml"
     //
     // cargo-ktstr re-exports its extracted busybox / wprof paths to the
     // child build as KTSTR_*_BIN so build.rs copies them instead of
-    // re-fetching. A pair is emitted only for a present source path.
+    // re-fetching. Busybox is emitted whenever its source path is present;
+    // wprof additionally requires the exact resolved ktstr feature.
+
+    fn blob_feature_metadata(active_ktstr_features: &[&str]) -> cargo_metadata::Metadata {
+        let ktstr = "ktstr 0.42.0 (path+file:///w/ktstr)";
+        let features = serde_json::to_string(active_ktstr_features).expect("serialize features");
+        let json = format!(
+            r#"{{
+              "packages":[{package}],
+              "workspace_members":["{ktstr}"],
+              "resolve":{{
+                "root":"{ktstr}",
+                "nodes":[{{"id":"{ktstr}","deps":[],"dependencies":[],"features":{features}}}]
+              }},
+              "workspace_root":"/w/ktstr",
+              "target_directory":"/w/ktstr/target",
+              "version":1
+            }}"#,
+            package = pkg_json("ktstr", "0.42.0", ktstr, "null"),
+        );
+        serde_json::from_str(&json).expect("blob feature metadata deserializes")
+    }
 
     /// Both paths present → both `KTSTR_*_BIN` pairs, busybox first,
     /// carrying the exact path values.
     #[test]
     fn prebuilt_blob_bin_envs_sets_present_paths() {
+        let metadata = blob_feature_metadata(&["default", "wprof"]);
         let pairs = prebuilt_blob_bin_envs(
             Some(std::ffi::OsString::from("/run/bb")),
             Some(std::ffi::OsString::from("/run/wp")),
+            Some(&metadata),
         );
         assert_eq!(
             pairs,
@@ -9573,13 +9629,62 @@ path = "junit.xml"
     #[test]
     fn prebuilt_blob_bin_envs_omits_absent_paths() {
         assert!(
-            prebuilt_blob_bin_envs(None, None).is_empty(),
+            prebuilt_blob_bin_envs(None, None, None).is_empty(),
             "no source paths → no env pairs",
         );
         assert_eq!(
-            prebuilt_blob_bin_envs(Some(std::ffi::OsString::from("/run/bb")), None),
+            prebuilt_blob_bin_envs(Some(std::ffi::OsString::from("/run/bb")), None, None,),
             vec![("KTSTR_BUSYBOX_BIN", std::ffi::OsString::from("/run/bb"))],
             "busybox present, wprof absent → only the busybox pair",
+        );
+    }
+
+    /// Available resolved metadata is authoritative: a ktstr node without the
+    /// `wprof` feature omits only that optional handoff while busybox remains
+    /// byte-for-byte unchanged.
+    #[test]
+    fn prebuilt_blob_bin_envs_omits_wprof_when_resolved_feature_is_disabled() {
+        let metadata = blob_feature_metadata(&["default"]);
+        assert_eq!(
+            prebuilt_blob_bin_envs(
+                Some(std::ffi::OsString::from("/run/bb")),
+                Some(std::ffi::OsString::from("/run/wp")),
+                Some(&metadata),
+            ),
+            vec![("KTSTR_BUSYBOX_BIN", std::ffi::OsString::from("/run/bb"))],
+        );
+    }
+
+    /// Metadata failure must never make a wprof-enabled child rebuild fetch
+    /// the tool: retaining the historical handoff is the conservative path.
+    #[test]
+    fn prebuilt_blob_bin_envs_retains_wprof_when_metadata_is_unavailable() {
+        assert_eq!(
+            prebuilt_blob_bin_envs(
+                Some(std::ffi::OsString::from("/run/bb")),
+                Some(std::ffi::OsString::from("/run/wp")),
+                None,
+            ),
+            vec![
+                ("KTSTR_BUSYBOX_BIN", std::ffi::OsString::from("/run/bb")),
+                ("KTSTR_WPROF_BIN", std::ffi::OsString::from("/run/wp")),
+            ],
+        );
+    }
+
+    /// A metadata value without Cargo's resolve graph is just as
+    /// inconclusive as a failed query and therefore keeps wprof.
+    #[test]
+    fn prebuilt_blob_bin_envs_retains_wprof_when_resolve_graph_is_unavailable() {
+        let mut metadata = blob_feature_metadata(&[]);
+        metadata.resolve = None;
+        assert_eq!(
+            prebuilt_blob_bin_envs(
+                None,
+                Some(std::ffi::OsString::from("/run/wp")),
+                Some(&metadata),
+            ),
+            vec![("KTSTR_WPROF_BIN", std::ffi::OsString::from("/run/wp"))],
         );
     }
 
