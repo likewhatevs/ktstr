@@ -1807,7 +1807,21 @@ pub(crate) struct PreparationContinuityForTests {
 
 #[cfg(test)]
 pub(crate) fn exercise_preparation_continuity_for_tests() -> Result<PreparationContinuityForTests> {
-    let (preparation, active) = super::acquire_preparation_permit(0)?;
+    let allowed = super::host_allowed_cpus();
+    anyhow::ensure!(
+        !allowed.is_empty(),
+        "could not determine allowed CPU set for preparation continuity test",
+    );
+    let probe =
+        super::try_preparation_candidates_once_waiting(0, &allowed, |preparation, active| {
+            Ok(super::PreparationCandidateDecision::Accepted((
+                preparation,
+                active,
+            )))
+        })?;
+    let super::PreparationProbe::Acquired((preparation, active)) = probe else {
+        anyhow::bail!("isolated preparation continuity test found no runnable tuple")
+    };
     let affinity_cpu = preparation.affinity_cpu;
     let cpu_permits = preparation.cpu_permits.clone();
     let memory_permits = preparation.memory_permits.clone();
