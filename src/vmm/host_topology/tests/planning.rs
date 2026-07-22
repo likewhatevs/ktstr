@@ -3969,3 +3969,147 @@ fn build_and_runtime_entry_points_return_identical_claim_sets() {
         .collect::<Vec<_>>();
     assert_eq!(build, runtime);
 }
+
+#[test]
+fn physical_performance_reserve_is_deterministic_and_numa_balanced() {
+    let host = synth_host_topo(&[((0..32).collect(), 0), ((32..64).collect(), 1)]);
+    let allowed = (0..64).collect::<Vec<_>>();
+    let first = host.performance_reserved_cpus(&allowed);
+    let second = host.performance_reserved_cpus(&allowed);
+
+    assert_eq!(
+        first, second,
+        "the reserve cannot rotate by process or call"
+    );
+    assert_eq!(first.len(), 20, "30% of 64 CPUs rounds up to 20");
+    let per_node = first.iter().fold([0usize; 2], |mut counts, cpu| {
+        counts[host.cpu_to_node[cpu]] += 1;
+        counts
+    });
+    assert_eq!(
+        per_node,
+        [10, 10],
+        "CPU-grain reserve selection must round-robin NUMA nodes",
+    );
+}
+
+#[test]
+fn physical_performance_reserve_keeps_modest_llcs_indivisible() {
+    let host = synth_host_topo(&[
+        ((0..4).collect(), 0),
+        ((4..8).collect(), 1),
+        ((8..12).collect(), 0),
+        ((12..16).collect(), 1),
+    ]);
+    let allowed = (0..16).collect::<Vec<_>>();
+    let reserved = host.performance_reserved_cpus(&allowed);
+
+    assert_eq!(reserved.len(), 8, "whole-LLC rounding may exceed 30%");
+    for group in &host.llc_groups {
+        let selected = group
+            .cpus
+            .iter()
+            .filter(|cpu| reserved.contains(cpu))
+            .count();
+        assert!(
+            selected == 0 || selected == group.cpus.len(),
+            "a modest LLC reserve must contain either all or none of its CPUs",
+        );
+    }
+    let node0 = reserved
+        .iter()
+        .filter(|cpu| host.cpu_to_node[cpu] == 0)
+        .count();
+    let node1 = reserved.len() - node0;
+    assert_eq!((node0, node1), (4, 4));
+}
+
+#[test]
+fn every_performance_claim_mode_preserves_one_physical_reserve() {
+    // Ordering the huge LLC first makes the 30% reserve a CPU-grain subset of
+    // that domain. Small-LLC candidates remain whole-EX while huge-LLC
+    // candidates remain SH+CPU-EX, exercising both final footprint shapes.
+    let host = synth_host_topo(&[
+        ((0..64).collect(), 0),
+        ((64..72).collect(), 0),
+        ((72..80).collect(), 0),
+        ((80..88).collect(), 0),
+        ((88..96).collect(), 0),
+    ]);
+    let allowed = (0..96).collect::<Vec<_>>();
+    let reserved = host.performance_reserved_cpus(&allowed);
+    let candidates = host
+        .performance_pinning_candidates_for_cpus(&Topology::new(1, 1, 2, 1), &allowed)
+        .expect("both whole-LLC and grain performance placements must remain");
+
+    assert_eq!(reserved.len(), 29);
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.llc_mode == LlcLockMode::Shared),
+        "the huge LLC must expose CPU-grain performance candidates",
+    );
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.llc_mode == LlcLockMode::Exclusive),
+        "the modest LLCs must expose whole-domain performance candidates",
+    );
+    assert!(candidates.iter().all(|candidate| {
+        candidate
+            .cpu_reservations
+            .iter()
+            .all(|cpu| !reserved.contains(cpu))
+    }));
+
+    let defaults = host
+        .default_pinning_candidates_for_cpus(&Topology::new(1, 1, 1, 1), &allowed)
+        .expect("default pinning still sees the complete allowed host");
+    assert!(
+        defaults.iter().any(|candidate| {
+            candidate
+                .cpu_reservations
+                .iter()
+                .any(|cpu| reserved.contains(cpu))
+        }),
+        "the reserve is retained from performance, not forbidden to default work",
+    );
+}
+
+#[test]
+fn indivisible_small_host_preserves_performance_instead_of_reserving_it_all() {
+    let host = synth_host_topo(&[((0..4).collect(), 0)]);
+    let allowed = (0..4).collect::<Vec<_>>();
+    assert!(host.performance_reserved_cpus(&allowed).is_empty());
+    assert!(
+        host.performance_pinning_candidates_for_cpus(&Topology::new(1, 1, 2, 1), &allowed)
+            .is_ok(),
+        "an indivisible host LLC must retain its existing performance semantics",
+    );
+}
+
+#[test]
+fn performance_permit_pool_cannot_select_the_reserved_suffix() {
+    let ordinary = AdmissionPermitPool::for_host(8);
+    let performance = AdmissionPermitPool::for_performance_host(8);
+    assert!(!ordinary.reserved.is_empty());
+    assert_eq!(performance.general, ordinary.general);
+    assert!(performance.reserved.is_empty());
+
+    let selection = select_admission_permits(
+        PermitAdmission::Cooperative,
+        &performance,
+        performance.general.len(),
+        1,
+        0,
+        &ordinary.reserved,
+        |_| Ok(true),
+    )
+    .unwrap()
+    .expect("general performance permits remain selectable");
+    assert_eq!(selection.permits, performance.general);
+    assert_eq!(
+        selection.admission_class,
+        admission_protocol::AdmissionClass::Ordinary,
+    );
+}

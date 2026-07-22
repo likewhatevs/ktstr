@@ -634,7 +634,102 @@ impl HostTopology {
         &self,
         topo: &super::topology::Topology,
     ) -> Result<Vec<PerformancePinningCandidate>> {
-        self.performance_pinning_candidates_for_cpus(topo, &self.online_cpus)
+        self.topology_pinning_candidates(topo, PinningKind::Performance, &self.online_cpus, None)
+    }
+
+    /// Physical CPUs retained for build, default, and no-perf progress while
+    /// performance-mode cells are active.
+    ///
+    /// This is a deterministic topology partition, not a rotating admission
+    /// preference. Every process with the same allowed CPU set derives the
+    /// same reserve. Modest LLCs are indivisible because a performance claim
+    /// on any CPU in one expands to whole-LLC exclusion. Genuinely huge LLCs
+    /// already support CPU-grain performance claims, so their reserve is
+    /// selected one CPU at a time. Selection advances once per NUMA node per
+    /// round to avoid concentrating the retained capacity on one socket.
+    ///
+    /// At least two allowed CPUs remain available to performance mode. If an
+    /// indivisible LLC is the whole small host, reserving it would leave no
+    /// usable performance placement, so that host deliberately has an empty
+    /// physical reserve rather than silently disabling performance mode.
+    pub(crate) fn performance_reserved_cpus(
+        &self,
+        allowed_cpus: &[usize],
+    ) -> std::collections::BTreeSet<usize> {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let allowed = allowed_cpus.iter().copied().collect::<BTreeSet<_>>();
+        let mut units_by_node = BTreeMap::<usize, Vec<Vec<usize>>>::new();
+        let mut physical_allowed = 0usize;
+        for (llc, group) in self.llc_groups.iter().enumerate() {
+            let mut cpus = group
+                .cpus
+                .iter()
+                .copied()
+                .filter(|cpu| allowed.contains(cpu))
+                .collect::<Vec<_>>();
+            cpus.sort_unstable();
+            cpus.dedup();
+            physical_allowed = physical_allowed.saturating_add(cpus.len());
+            if cpus.is_empty() {
+                continue;
+            }
+            if group.cpus.len() < PERF_GRAIN_LLC_MIN_CPUS {
+                units_by_node
+                    .entry(self.llc_numa_node(llc))
+                    .or_default()
+                    .push(cpus);
+            } else {
+                for cpu in cpus {
+                    let node = self
+                        .cpu_to_node
+                        .get(&cpu)
+                        .copied()
+                        .unwrap_or_else(|| self.llc_numa_node(llc));
+                    units_by_node.entry(node).or_default().push(vec![cpu]);
+                }
+            }
+        }
+
+        let maximum = physical_allowed.saturating_sub(2);
+        let target = physical_allowed
+            .saturating_mul(BUILD_RESERVED_PERCENT)
+            .div_ceil(100)
+            .min(maximum);
+        if target == 0 {
+            return BTreeSet::new();
+        }
+
+        let mut next_by_node = units_by_node
+            .keys()
+            .copied()
+            .map(|node| (node, 0usize))
+            .collect::<BTreeMap<_, _>>();
+        let mut reserved = BTreeSet::new();
+        while reserved.len() < target {
+            let mut advanced = false;
+            for (&node, units) in &units_by_node {
+                let next = next_by_node
+                    .get_mut(&node)
+                    .expect("reserve cursor exists for every NUMA node");
+                while let Some(unit) = units.get(*next) {
+                    *next += 1;
+                    if reserved.len().saturating_add(unit.len()) > maximum {
+                        continue;
+                    }
+                    reserved.extend(unit.iter().copied());
+                    advanced = true;
+                    break;
+                }
+                if reserved.len() >= target {
+                    break;
+                }
+            }
+            if !advanced {
+                break;
+            }
+        }
+        reserved
     }
 
     /// Enumerate performance placements using only CPUs allowed by the
@@ -645,7 +740,34 @@ impl HostTopology {
         topo: &super::topology::Topology,
         allowed_cpus: &[usize],
     ) -> Result<Vec<PerformancePinningCandidate>> {
-        self.topology_pinning_candidates(topo, PinningKind::Performance, allowed_cpus, None)
+        let reserved = self.performance_reserved_cpus(allowed_cpus);
+        let performance_cpus = allowed_cpus
+            .iter()
+            .copied()
+            .filter(|cpu| !reserved.contains(cpu))
+            .collect::<Vec<_>>();
+        let mut candidates = self.topology_pinning_candidates(
+            topo,
+            PinningKind::Performance,
+            &performance_cpus,
+            None,
+        )?;
+        // A whole-LLC EX claim expands beyond the CPUs used to construct the
+        // plan. Filter the final physical lock footprint, not merely its vCPU
+        // assignments, so whole-LLC and CPU-grain claims preserve one shared
+        // reserve invariant.
+        candidates.retain(|candidate| {
+            candidate
+                .cpu_reservations
+                .iter()
+                .all(|cpu| !reserved.contains(cpu))
+        });
+        if candidates.is_empty() {
+            return Err(anyhow::Error::new(TopologyInsufficient {
+                reason: "no performance placement preserves reserved host capacity".into(),
+            }));
+        }
+        Ok(candidates)
     }
 
     /// Enumerate opportunistic default 1:1 placements using the same mapper as
@@ -3484,6 +3606,16 @@ impl AdmissionPermitPool {
         self.general.len() + self.reserved.len()
     }
 
+    /// Performance already owns a disjoint physical placement and must not
+    /// borrow the cooperative suffix retained for build/default progress.
+    fn for_performance_host(cpu_count: usize) -> Self {
+        let ordinary = Self::for_host(cpu_count);
+        Self {
+            general: ordinary.general,
+            reserved: Vec::new(),
+        }
+    }
+
     /// Build concurrency is bounded independently from cooperative VM CPU
     /// accounting. Default VMs may occupy the cooperative reserved suffix, but
     /// that ownership is deliberately soft: a build never waits for those
@@ -4710,6 +4842,25 @@ impl VmPermitPool {
         pending: Option<&protocol::PendingAdmission>,
     ) -> Result<Self> {
         let cpu = AdmissionPermitPool::for_host(allowed_cpu_count);
+        Self::with_cpu_pool(cpu, cpu_required, memory_mib, pending)
+    }
+
+    pub(crate) fn new_performance_with_preparation(
+        allowed_cpu_count: usize,
+        cpu_required: usize,
+        memory_mib: u32,
+        pending: Option<&protocol::PendingAdmission>,
+    ) -> Result<Self> {
+        let cpu = AdmissionPermitPool::for_performance_host(allowed_cpu_count);
+        Self::with_cpu_pool(cpu, cpu_required, memory_mib, pending)
+    }
+
+    fn with_cpu_pool(
+        cpu: AdmissionPermitPool,
+        cpu_required: usize,
+        memory_mib: u32,
+        pending: Option<&protocol::PendingAdmission>,
+    ) -> Result<Self> {
         let memory = MemoryPermitPool::for_host()?;
         let memory_required = memory.required_chunks(memory_mib)?;
         Ok(Self {

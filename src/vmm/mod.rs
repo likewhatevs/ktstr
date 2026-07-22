@@ -2259,7 +2259,7 @@ impl KtstrVm {
 
         let cpu_required = candidates[0].plan.assignments.len()
             + usize::from(candidates[0].plan.service_cpu.is_some());
-        let permit_pool = host_topology::VmPermitPool::new_with_preparation(
+        let permit_pool = host_topology::VmPermitPool::new_performance_with_preparation(
             allowed.len(),
             cpu_required,
             memory_mib,
